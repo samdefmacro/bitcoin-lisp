@@ -1,0 +1,48 @@
+# Common Lisp
+*.fasl
+*.fas
+*.lib
+*.o
+*.obj
+*.dx64fsl
+*.lx64fsl
+*.x86f
+*.dfsl
+*.pfsl
+*.d64fsl
+*.p64fsl
+*.lx32fsl
+*.dx32fsl
+*.fx64fsl
+*.fx32fsl
+*.sx64fsl
+*.sx32fsl
+*.wx64fsl
+*.wx32fsl
+
+# SBCL
+*.core
+
+# Quicklisp
+quicklisp/
+
+# Build artifacts
+build/
+bin/
+
+# Data directories
+data/
+blocks/
+
+# Editor backups
+*~
+\#*\#
+.\#*
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+*.iml
+.vscode/
