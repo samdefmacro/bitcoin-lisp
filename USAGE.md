@@ -15,8 +15,191 @@ A Bitcoin full node implementation in Common Lisp (SBCL).
 brew install sbcl
 brew install secp256k1
 
-# On Ubuntu/Debian
+# On Ubuntu/Debian (see detailed instructions below)
 sudo apt-get install sbcl libsecp256k1-dev
+```
+
+## Ubuntu/Linux Setup
+
+### Step 1: Install SBCL
+
+```bash
+# Update package list
+sudo apt update
+
+# Install SBCL
+sudo apt install sbcl
+```
+
+Verify installation:
+```bash
+sbcl --version
+# Should output something like: SBCL 2.3.0
+```
+
+### Step 2: Install libsecp256k1
+
+```bash
+# Install the development library
+sudo apt install libsecp256k1-dev
+
+# Verify the library is installed
+ldconfig -p | grep secp256k1
+# Should output: libsecp256k1.so.2 (or similar)
+```
+
+### Step 3: Install Quicklisp
+
+Quicklisp is the package manager for Common Lisp:
+
+```bash
+# Check if Quicklisp is already installed
+ls ~/quicklisp/setup.lisp 2>/dev/null && echo "Quicklisp already installed!"
+```
+
+**If not installed:**
+```bash
+# Download Quicklisp installer
+curl -O https://beta.quicklisp.org/quicklisp.lisp
+
+# Install Quicklisp
+sbcl --load quicklisp.lisp \
+     --eval '(quicklisp-quickstart:install)' \
+     --eval '(ql:add-to-init-file)' \
+     --quit
+```
+
+**If already installed**, just ensure it loads on SBCL startup:
+```bash
+sbcl --eval '(load "~/quicklisp/setup.lisp")' \
+     --eval '(ql:add-to-init-file)' \
+     --quit
+```
+
+This installs Quicklisp to `~/quicklisp/` and configures SBCL to load it on startup.
+
+### Step 4: Clone and Load bitcoin-lisp
+
+```bash
+# Clone the repository to Quicklisp's local-projects
+cd ~/quicklisp/local-projects
+git clone <repository-url> bitcoin-lisp
+
+# Or create a symlink if you have it elsewhere
+ln -s /path/to/bitcoin-lisp ~/quicklisp/local-projects/bitcoin-lisp
+```
+
+Now start SBCL and load the system:
+
+```bash
+sbcl
+```
+
+```lisp
+;; Load dependencies and the system
+(ql:quickload "bitcoin-lisp")
+
+;; Start the node
+(bitcoin-lisp:start-node)
+
+;; Check status
+(bitcoin-lisp:node-status)
+```
+
+### Step 5: Running as a Background Service (Optional)
+
+Create a systemd service file for running the node:
+
+```bash
+sudo nano /etc/systemd/system/bitcoin-lisp.service
+```
+
+```ini
+[Unit]
+Description=Bitcoin-Lisp Node
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/quicklisp/local-projects/bitcoin-lisp
+ExecStart=/usr/bin/sbcl --load /home/YOUR_USERNAME/quicklisp/setup.lisp \
+    --eval '(ql:quickload "bitcoin-lisp")' \
+    --eval '(bitcoin-lisp:start-node :sync t)' \
+    --eval '(loop (sleep 3600))'
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable bitcoin-lisp
+sudo systemctl start bitcoin-lisp
+
+# Check status
+sudo systemctl status bitcoin-lisp
+```
+
+### Ubuntu Troubleshooting
+
+#### libsecp256k1 not found
+
+If you get an error about libsecp256k1 not being found:
+
+```bash
+# Check if library is installed
+dpkg -l | grep secp256k1
+
+# Check library path
+find /usr -name "libsecp256k1*" 2>/dev/null
+
+# If library exists but not found, update library cache
+sudo ldconfig
+```
+
+#### SBCL memory issues
+
+For large blockchain sync, you may need to increase SBCL's heap size:
+
+```bash
+sbcl --dynamic-space-size 4096  # 4GB heap
+```
+
+#### DNS resolution fails
+
+If peer discovery fails, check your network:
+
+```bash
+# Test DNS resolution
+nslookup seed.testnet.bitcoin.sprovoost.nl
+
+# Check firewall isn't blocking outbound connections
+sudo ufw status
+```
+
+## macOS Setup
+
+### Using Homebrew
+
+```bash
+# Install SBCL
+brew install sbcl
+
+# Install libsecp256k1
+brew install secp256k1
+```
+
+### Install Quicklisp
+
+```bash
+curl -O https://beta.quicklisp.org/quicklisp.lisp
+sbcl --load quicklisp.lisp \
+     --eval '(quicklisp-quickstart:install)' \
+     --eval '(ql:add-to-init-file)' \
+     --quit
 ```
 
 ### Loading the System
@@ -213,15 +396,50 @@ By default, `start-node` connects to peers and begins syncing:
 - Check network connectivity
 - DNS seeds may be temporarily unavailable
 - Try running with `:log-level :debug` for more info
+- On Ubuntu, check firewall: `sudo ufw status`
 
 ### Slow synchronization
 - Bitcoin blockchain sync takes time, especially on testnet
 - Consider running with `:max-peers 8` for more connections
+- Increase heap size: `sbcl --dynamic-space-size 4096`
 
 ### libsecp256k1 not found
-- Ensure the library is installed system-wide
-- On macOS: `brew install secp256k1`
-- On Linux: `apt-get install libsecp256k1-dev`
+
+**On Ubuntu/Debian:**
+```bash
+sudo apt install libsecp256k1-dev
+sudo ldconfig
+```
+
+**On macOS:**
+```bash
+brew install secp256k1
+```
+
+If still not found, check the library path:
+```lisp
+;; In SBCL, check where CFFI is looking
+(cffi:foreign-library-pathname 'bitcoin-lisp.crypto::libsecp256k1)
+```
+
+### SBCL crashes with memory errors
+Increase the dynamic space size:
+```bash
+sbcl --dynamic-space-size 8192  # 8GB heap
+```
+
+### Quicklisp can't find bitcoin-lisp
+Ensure the project is in Quicklisp's local-projects:
+```bash
+ls ~/quicklisp/local-projects/bitcoin-lisp/
+# Should show bitcoin-lisp.asd
+```
+
+Or register it manually in SBCL:
+```lisp
+(push #P"/path/to/bitcoin-lisp/" asdf:*central-registry*)
+(asdf:load-system "bitcoin-lisp")
+```
 
 ## Architecture
 
