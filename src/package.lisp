@@ -241,6 +241,7 @@
   (:use #:bitcoin-lisp.storage)
   (:use #:bitcoin-lisp.validation)
   (:use #:bitcoin-lisp.networking)
+  (:local-nicknames (#:bt #:bordeaux-threads))
   (:export
    ;; Network parameters
    #:*network*
@@ -262,5 +263,11 @@
    #:log-debug
    #:log-info
    #:log-warn
-   #:log-error))
+   #:log-error
+   #:show-logs
+   #:clear-logs
+   #:enable-console-logging
+   #:disable-console-logging
+   #:start-file-logging
+   #:stop-file-logging))
 

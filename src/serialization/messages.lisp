@@ -43,7 +43,8 @@
   (magic (copy-seq +testnet-magic+) :type (simple-array (unsigned-byte 8) (4)))
   (command "" :type string)
   (payload-length 0 :type (unsigned-byte 32))
-  (checksum #(0 0 0 0) :type (simple-array (unsigned-byte 8) (4))))
+  (checksum (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)
+            :type (simple-array (unsigned-byte 8) (4))))
 
 (defun command-to-bytes (command)
   "Convert command string to 12-byte null-padded array."
@@ -85,7 +86,8 @@
 (defstruct net-addr
   "Network address structure."
   (services 0 :type (unsigned-byte 64))
-  (ip #(0 0 0 0 0 0 0 0 0 0 #xFF #xFF 127 0 0 1)
+  (ip (make-array 16 :element-type '(unsigned-byte 8)
+                     :initial-contents '(0 0 0 0 0 0 0 0 0 0 #xFF #xFF 127 0 0 1))
       :type (simple-array (unsigned-byte 8) (16)))
   (port 0 :type (unsigned-byte 16)))
 

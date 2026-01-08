@@ -42,38 +42,80 @@
   (utxo-set nil)
   (peers '() :type list)
   (running nil :type boolean)
-  (log-level :info :type keyword))
+  (log-level :info :type keyword)
+  (sync-thread nil :type (or null bt:thread))
+  (syncing nil :type boolean)
+  (lock (bt:make-lock "node-lock")))
 
 (defvar *node* nil
   "Current running node instance.")
 
 ;;;; Logging
 
-(defvar *log-stream* *standard-output*
-  "Stream for log output.")
+(defvar *log-stream* nil
+  "Stream for log output. NIL means logs only go to buffer.")
+
+(defvar *log-file-stream* nil
+  "File stream for log output, if logging to file.")
 
 (defvar *log-levels*
   '(:debug 0 :info 1 :warn 2 :error 3)
   "Log level priority values.")
 
+(defconstant +log-buffer-size+ 500
+  "Maximum number of log entries to keep in memory.")
+
+(defvar *log-buffer* (make-array +log-buffer-size+ :initial-element nil)
+  "Ring buffer for recent log messages.")
+
+(defvar *log-buffer-index* 0
+  "Current write position in log buffer.")
+
+(defvar *log-buffer-count* 0
+  "Number of entries in log buffer.")
+
+(defvar *log-buffer-lock* (bt:make-lock "log-buffer-lock")
+  "Lock for thread-safe log buffer access.")
+
 (defun log-level-value (level)
   "Get numeric value for log LEVEL."
   (getf *log-levels* level 1))
+
+(defun format-log-entry (level format-string args)
+  "Format a log entry and return the string."
+  (let ((timestamp (multiple-value-bind (sec min hour day month year)
+                       (get-decoded-time)
+                     (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D"
+                             year month day hour min sec))))
+    (format nil "[~A] ~A: ~?"
+            timestamp
+            (string-upcase (symbol-name level))
+            format-string args)))
+
+(defun add-to-log-buffer (entry)
+  "Add a log entry to the ring buffer."
+  (bt:with-lock-held (*log-buffer-lock*)
+    (setf (aref *log-buffer* *log-buffer-index*) entry)
+    (setf *log-buffer-index* (mod (1+ *log-buffer-index*) +log-buffer-size+))
+    (when (< *log-buffer-count* +log-buffer-size+)
+      (incf *log-buffer-count*))))
 
 (defun node-log (level format-string &rest args)
   "Log a message at LEVEL."
   (when (and *node*
              (>= (log-level-value level)
                  (log-level-value (node-log-level *node*))))
-    (let ((timestamp (multiple-value-bind (sec min hour day month year)
-                         (get-decoded-time)
-                       (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D"
-                               year month day hour min sec))))
-      (format *log-stream* "[~A] ~A: ~?~%"
-              timestamp
-              (string-upcase (symbol-name level))
-              format-string args)
-      (finish-output *log-stream*))))
+    (let ((entry (format-log-entry level format-string args)))
+      ;; Always add to buffer
+      (add-to-log-buffer entry)
+      ;; Write to console if *log-stream* is set
+      (when *log-stream*
+        (format *log-stream* "~A~%" entry)
+        (finish-output *log-stream*))
+      ;; Write to file if logging to file
+      (when *log-file-stream*
+        (format *log-file-stream* "~A~%" entry)
+        (finish-output *log-file-stream*)))))
 
 (defmacro log-debug (format-string &rest args)
   `(node-log :debug ,format-string ,@args))
@@ -86,6 +128,75 @@
 
 (defmacro log-error (format-string &rest args)
   `(node-log :error ,format-string ,@args))
+
+(defun show-logs (&key (n 20) (level :debug))
+  "Show the last N log entries at or above LEVEL.
+LEVEL can be :debug, :info, :warn, or :error."
+  (let ((entries '())
+        (min-level (log-level-value level)))
+    (bt:with-lock-held (*log-buffer-lock*)
+      (let ((start (if (< *log-buffer-count* +log-buffer-size+)
+                       0
+                       *log-buffer-index*)))
+        (dotimes (i *log-buffer-count*)
+          (let* ((idx (mod (+ start i) +log-buffer-size+))
+                 (entry (aref *log-buffer* idx)))
+            (when entry
+              (push entry entries))))))
+    ;; entries is now oldest-first after reverse
+    (setf entries (nreverse entries))
+    ;; Filter by level and take last n
+    (let ((filtered (remove-if-not
+                     (lambda (entry)
+                       (let ((level-str (and (> (length entry) 22)
+                                             (subseq entry 22 (position #\: entry :start 22)))))
+                         (when level-str
+                           (let ((entry-level (find-symbol (string-upcase (string-trim " " level-str)) :keyword)))
+                             (and entry-level
+                                  (>= (log-level-value entry-level) min-level))))))
+                     entries)))
+      (let ((to-show (last filtered n)))
+        (format t "~%=== Last ~D Log Entries ===~%" (length to-show))
+        (dolist (entry to-show)
+          (format t "~A~%" entry))
+        (format t "~%")
+        (length to-show)))))
+
+(defun clear-logs ()
+  "Clear the log buffer."
+  (bt:with-lock-held (*log-buffer-lock*)
+    (dotimes (i +log-buffer-size+)
+      (setf (aref *log-buffer* i) nil))
+    (setf *log-buffer-index* 0)
+    (setf *log-buffer-count* 0))
+  t)
+
+(defun enable-console-logging ()
+  "Enable logging to the console (REPL)."
+  (setf *log-stream* *standard-output*)
+  t)
+
+(defun disable-console-logging ()
+  "Disable logging to the console. Logs still go to buffer and file."
+  (setf *log-stream* nil)
+  t)
+
+(defun start-file-logging (path)
+  "Start logging to a file at PATH."
+  (when *log-file-stream*
+    (close *log-file-stream*))
+  (setf *log-file-stream* (open path :direction :output
+                                     :if-exists :append
+                                     :if-does-not-exist :create))
+  (format t "Logging to file: ~A~%" path)
+  path)
+
+(defun stop-file-logging ()
+  "Stop logging to file."
+  (when *log-file-stream*
+    (close *log-file-stream*)
+    (setf *log-file-stream* nil))
+  t)
 
 ;;;; Startup Sequence
 
@@ -152,11 +263,22 @@ Returns the node instance."
 
   (setf (node-running *node*) t)
 
-  ;; Connect to peers and sync if requested
+  ;; Connect to peers and sync if requested (in background thread)
   (when sync
-    (connect-to-peers *node* max-peers)
-    (when (node-peers *node*)
-      (sync-blockchain *node*)))
+    (setf (node-sync-thread *node*)
+          (bt:make-thread
+           (lambda ()
+             (handler-case
+                 (progn
+                   (connect-to-peers *node* max-peers)
+                   (when (node-peers *node*)
+                     (setf (node-syncing *node*) t)
+                     (unwind-protect
+                          (sync-blockchain *node*)
+                       (setf (node-syncing *node*) nil))))
+               (error (c)
+                 (log-error "Sync thread error: ~A" c))))
+           :name "bitcoin-sync-thread")))
 
   (log-info "Node started successfully")
   *node*)
@@ -167,6 +289,23 @@ Returns the node instance."
     (return-from stop-node nil))
 
   (log-info "Stopping node...")
+
+  ;; Signal the node to stop
+  (setf (node-running *node*) nil)
+
+  ;; Wait for sync thread to finish (with timeout)
+  (when (and (node-sync-thread *node*)
+             (bt:thread-alive-p (node-sync-thread *node*)))
+    (log-info "Waiting for sync thread to stop...")
+    (let ((deadline (+ (get-internal-real-time)
+                       (* 5 internal-time-units-per-second))))
+      (loop while (and (bt:thread-alive-p (node-sync-thread *node*))
+                       (< (get-internal-real-time) deadline))
+            do (sleep 0.1))
+      (when (bt:thread-alive-p (node-sync-thread *node*))
+        (log-warn "Sync thread did not stop gracefully, destroying...")
+        (bt:destroy-thread (node-sync-thread *node*)))))
+  (setf (node-sync-thread *node*) nil)
 
   ;; Disconnect all peers
   (log-info "Disconnecting peers...")
@@ -185,7 +324,6 @@ Returns the node instance."
   ;; Cleanup secp256k1
   (bitcoin-lisp.crypto:cleanup-secp256k1)
 
-  (setf (node-running *node*) nil)
   (log-info "Node stopped")
 
   (setf *node* nil)
@@ -310,6 +448,10 @@ Downloads up to MAX-BLOCKS."
   (format t "~%=== Bitcoin-Lisp Node Status ===~%")
   (format t "Network: ~A~%" (node-network *node*))
   (format t "Running: ~A~%" (if (node-running *node*) "Yes" "No"))
+  (format t "Syncing: ~A~%" (if (node-syncing *node*) "Yes" "No"))
+  (when (node-sync-thread *node*)
+    (format t "Sync thread: ~A~%"
+            (if (bt:thread-alive-p (node-sync-thread *node*)) "Active" "Stopped")))
   (format t "Data directory: ~A~%" (node-data-directory *node*))
   (format t "~%Chain State:~%")
   (when (node-chain-state *node*)
