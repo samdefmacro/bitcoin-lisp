@@ -4,7 +4,8 @@
 
 (test sha256-empty-input
   "SHA256 of empty input should match known hash."
-  (let ((result (bitcoin-lisp.crypto:sha256 #())))
+  (let ((result (bitcoin-lisp.crypto:sha256
+                 (make-array 0 :element-type '(unsigned-byte 8)))))
     (is (equalp result
                 (ironclad:hex-string-to-byte-array
                  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")))))
