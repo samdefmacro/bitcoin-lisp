@@ -120,7 +120,10 @@
    #:read-bitcoin-block
    #:serialize-transaction
    #:coinbase-input-p
-   #:get-unix-time))
+   #:get-unix-time
+   #:read-net-addr
+   #:read-hash256
+   #:write-hash256))
 
 (defpackage #:bitcoin-lisp.storage
   (:use #:cl)
@@ -194,6 +197,7 @@
   (:export
    ;; Connection
    #:connection
+   #:connection-connected
    #:make-tcp-connection
    #:close-connection
    #:send-bytes
@@ -206,6 +210,7 @@
    #:peer-services
    #:peer-start-height
    #:peer-user-agent
+   #:peer-ping-latency
    #:connect-peer
    #:disconnect-peer
    #:send-message
@@ -225,7 +230,9 @@
    #:*testnet-port*
    #:*mainnet-port*
    #:*current-port*
-   #:*dns-seeds*))
+   #:*dns-seeds*
+   #:*testnet-dns-seeds*
+   #:*mainnet-dns-seeds*))
 
 (defpackage #:bitcoin-lisp
   (:use #:cl)
@@ -243,9 +250,17 @@
    #:network-port
    #:network-dns-seeds
    ;; Node
+   #:node
+   #:*node*
    #:start-node
-   #:stop-node))
+   #:stop-node
+   #:node-status
+   #:sync-blockchain
+   ;; Logging
+   #:*log-stream*
+   #:node-log
+   #:log-debug
+   #:log-info
+   #:log-warn
+   #:log-error))
 
-(defpackage #:bitcoin-lisp.tests
-  (:use #:cl #:fiveam)
-  (:export #:run-tests))

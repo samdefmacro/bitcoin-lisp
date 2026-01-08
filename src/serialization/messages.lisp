@@ -10,10 +10,25 @@
 ;;; - Variable: Payload
 
 ;;;; Network magic bytes
+;;; Using alexandria:define-constant for arrays to handle SBCL reloading
 
-(defconstant +mainnet-magic+ #(#x F9 #xBE #xB4 #xD9))
-(defconstant +testnet-magic+ #(#x0B #x11 #x09 #x07))
-(defconstant +regtest-magic+ #(#xFA #xBF #xB5 #xDA))
+(alexandria:define-constant +mainnet-magic+
+  (make-array 4 :element-type '(unsigned-byte 8)
+                :initial-contents '(#xF9 #xBE #xB4 #xD9))
+  :test #'equalp
+  :documentation "Mainnet network magic bytes.")
+
+(alexandria:define-constant +testnet-magic+
+  (make-array 4 :element-type '(unsigned-byte 8)
+                :initial-contents '(#x0B #x11 #x09 #x07))
+  :test #'equalp
+  :documentation "Testnet network magic bytes.")
+
+(alexandria:define-constant +regtest-magic+
+  (make-array 4 :element-type '(unsigned-byte 8)
+                :initial-contents '(#xFA #xBF #xB5 #xDA))
+  :test #'equalp
+  :documentation "Regtest network magic bytes.")
 
 (defvar *network-magic* +testnet-magic+
   "Current network magic bytes.")
