@@ -9,7 +9,10 @@
 ;;; libsecp256k1 must be installed on the system.
 
 (cffi:define-foreign-library libsecp256k1
-  (:darwin (:or "libsecp256k1.dylib" "libsecp256k1.1.dylib"))
+  (:darwin (:or "/opt/homebrew/lib/libsecp256k1.dylib"
+                "/usr/local/lib/libsecp256k1.dylib"
+                "libsecp256k1.dylib"
+                "libsecp256k1.1.dylib"))
   (:unix (:or "libsecp256k1.so.1" "libsecp256k1.so"))
   (t (:default "libsecp256k1")))
 

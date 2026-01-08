@@ -7,7 +7,8 @@
                "cffi"
                "usocket"
                "flexi-streams"
-               "alexandria")
+               "alexandria"
+               "bordeaux-threads")
   :serial t
   :components ((:module "src"
                 :components

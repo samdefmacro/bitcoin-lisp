@@ -42,8 +42,8 @@ Returns T if valid, NIL if invalid."
     (loop while (> (length level) 1)
           do (let ((next-level '()))
                (loop while level
-                     do (let ((a (pop level))
-                              (b (or (pop level) a)))  ; Duplicate last if odd
+                     do (let* ((a (pop level))
+                               (b (or (pop level) a)))  ; Duplicate last if odd
                           (push (hash-pair a b) next-level)))
                (setf level (nreverse next-level))))
     (first level)))
