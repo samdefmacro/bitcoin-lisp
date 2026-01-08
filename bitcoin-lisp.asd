@@ -30,7 +30,8 @@
                  (:module "networking"
                   :components ((:file "connection")
                                (:file "peer")
-                               (:file "protocol"))))))
+                               (:file "protocol")))
+                 (:file "node"))))
   :in-order-to ((test-op (test-op "bitcoin-lisp/tests"))))
 
 (defsystem "bitcoin-lisp/tests"
@@ -39,6 +40,9 @@
   :components ((:module "tests"
                 :components ((:file "package")
                              (:file "crypto-tests")
-                             (:file "serialization-tests"))))
+                             (:file "serialization-tests")
+                             (:file "storage-tests")
+                             (:file "validation-tests")
+                             (:file "integration-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

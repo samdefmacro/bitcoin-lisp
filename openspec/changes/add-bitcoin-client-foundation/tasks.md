@@ -48,7 +48,7 @@ Implementation checklist for the foundational Bitcoin client architecture.
 - [x] 3.5 Implement UTXO add/remove/query operations
 - [x] 3.6 Implement chain state tracking (best block, height, chainwork)
 - [x] 3.7 Implement state persistence (save/load on shutdown/startup)
-- [ ] 3.8 Write tests for storage operations
+- [x] 3.8 Write tests for storage operations
 
 ## 4. Validation Capability
 *Dependency: Crypto, Serialization, Storage*
@@ -67,7 +67,7 @@ Implementation checklist for the foundational Bitcoin client architecture.
 - [x] 4.12 Implement coinbase maturity checks
 - [x] 4.13 Implement chain selection (most work)
 - [x] 4.14 Implement chain reorganization logic
-- [ ] 4.15 Write comprehensive validation tests with known valid/invalid blocks
+- [x] 4.15 Write comprehensive validation tests with known valid/invalid blocks
 
 ## 5. Networking Capability
 *Dependency: Serialization, Validation, Storage*
@@ -83,17 +83,17 @@ Implementation checklist for the foundational Bitcoin client architecture.
 - [x] 5.9 Implement inv/getdata request/response flow
 - [x] 5.10 Implement block download (getblocks, getheaders, getdata)
 - [x] 5.11 Implement initial block download (IBD) coordination
-- [ ] 5.12 Write integration tests with testnet
+- [x] 5.12 Write integration tests with testnet
 
 ## 6. Integration
 *Dependency: All above*
 
-- [ ] 6.1 Create main node entry point
-- [ ] 6.2 Implement startup sequence (load state, connect to peers)
-- [ ] 6.3 Implement shutdown sequence (save state, disconnect peers)
-- [ ] 6.4 Implement basic logging
-- [ ] 6.5 Test full IBD on testnet (sync at least 1000 blocks)
-- [ ] 6.6 Document usage and configuration
+- [x] 6.1 Create main node entry point
+- [x] 6.2 Implement startup sequence (load state, connect to peers)
+- [x] 6.3 Implement shutdown sequence (save state, disconnect peers)
+- [x] 6.4 Implement basic logging
+- [x] 6.5 Test full IBD on testnet (sync at least 1000 blocks)
+- [x] 6.6 Document usage and configuration
 
 ## Notes
 

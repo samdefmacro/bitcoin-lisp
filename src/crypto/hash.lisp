@@ -11,8 +11,12 @@
 (defun sha256 (data)
   "Compute SHA-256 hash of DATA (a byte vector).
 Returns a 32-byte vector."
-  (let ((digest (ironclad:make-digest :sha256)))
-    (ironclad:update-digest digest data)
+  (let ((digest (ironclad:make-digest :sha256))
+        ;; Coerce to simple array if needed
+        (input (if (typep data '(simple-array (unsigned-byte 8) (*)))
+                   data
+                   (coerce data '(simple-array (unsigned-byte 8) (*))))))
+    (ironclad:update-digest digest input)
     (ironclad:produce-digest digest)))
 
 (defun hash256 (data)
