@@ -1,0 +1,1918 @@
+;;;; Typed Bitcoin Script Interpreter
+;;;;
+;;;; This module provides a statically-typed Bitcoin script interpreter
+;;;; using Coalton. All stack operations, opcodes, and execution contexts
+;;;; are type-safe, catching errors at compile time rather than runtime.
+
+(in-package #:bitcoin-lisp.coalton.script)
+
+(named-readtables:in-readtable coalton:coalton)
+
+(coalton-toplevel
+
+  ;;; ============================================================
+  ;;; Core Types
+  ;;; ============================================================
+
+  ;;;; ScriptNum - Script numeric values
+  ;;;;
+  ;;;; Bitcoin script numbers are signed integers with a maximum of 4 bytes
+  ;;;; for arithmetic operations. They use a special little-endian encoding
+  ;;;; with a sign bit in the most significant byte.
+
+  (define-type ScriptNum
+    "A Bitcoin script number (signed, variable-length, max 4 bytes for arithmetic)."
+    (ScriptNum Integer))
+
+  (declare make-script-num (Integer -> ScriptNum))
+  (define (make-script-num n)
+    "Create a ScriptNum from an Integer."
+    (ScriptNum n))
+
+  (declare script-num-value (ScriptNum -> Integer))
+  (define (script-num-value sn)
+    "Extract the Integer value from a ScriptNum."
+    (match sn
+      ((ScriptNum n) n)))
+
+  ;;;; ScriptError - Error types for script execution
+
+  (define-type ScriptError
+    "Errors that can occur during script execution."
+    SE-StackUnderflow          ; Attempted to pop from empty stack
+    SE-StackOverflow           ; Stack exceeded maximum size (1000)
+    SE-InvalidNumber           ; Invalid numeric encoding
+    SE-VerifyFailed            ; OP_VERIFY failed
+    SE-OpReturn                ; OP_RETURN encountered
+    SE-DisabledOpcode          ; Disabled opcode executed
+    SE-UnknownOpcode           ; Unknown opcode
+    SE-ScriptTooLarge          ; Script exceeds 10,000 bytes
+    SE-TooManyOps              ; More than 201 non-push operations
+    SE-InvalidStackOperation   ; Invalid stack operation (e.g., bad index)
+    SE-UnbalancedConditional   ; Unbalanced IF/ELSE/ENDIF
+    SE-InvalidPushData)        ; Invalid push data size
+
+  ;;;; ScriptResult - Result type for script operations
+
+  (define-type (ScriptResult :a)
+    "Result of a script operation - either success with value or failure with error."
+    (ScriptOk :a)
+    (ScriptErr ScriptError))
+
+  (declare script-ok (:a -> (ScriptResult :a)))
+  (define (script-ok x)
+    "Wrap a successful result."
+    (ScriptOk x))
+
+  (declare script-err (ScriptError -> (ScriptResult :a)))
+  (define (script-err e)
+    "Wrap an error result."
+    (ScriptErr e))
+
+  ;;; ============================================================
+  ;;; Opcode Definitions
+  ;;; ============================================================
+
+  (define-type Opcode
+    "Bitcoin script opcodes as an algebraic data type.
+     Pattern matching ensures exhaustive handling of all opcodes."
+
+    ;; Constants
+    OP-0                      ; 0x00 - Push empty byte vector (false)
+    OP-1NEGATE                ; 0x4f - Push -1
+    OP-1                      ; 0x51 - Push 1
+    OP-2                      ; 0x52 - Push 2
+    OP-3                      ; 0x53 - Push 3
+    OP-4                      ; 0x54 - Push 4
+    OP-5                      ; 0x55 - Push 5
+    OP-6                      ; 0x56 - Push 6
+    OP-7                      ; 0x57 - Push 7
+    OP-8                      ; 0x58 - Push 8
+    OP-9                      ; 0x59 - Push 9
+    OP-10                     ; 0x5a - Push 10
+    OP-11                     ; 0x5b - Push 11
+    OP-12                     ; 0x5c - Push 12
+    OP-13                     ; 0x5d - Push 13
+    OP-14                     ; 0x5e - Push 14
+    OP-15                     ; 0x5f - Push 15
+    OP-16                     ; 0x60 - Push 16
+
+    ;; Push data
+    (OP-PUSHBYTES U8)         ; 0x01-0x4b - Push N bytes directly
+    OP-PUSHDATA1              ; 0x4c - Next byte is length, then data
+    OP-PUSHDATA2              ; 0x4d - Next 2 bytes are length (LE)
+    OP-PUSHDATA4              ; 0x4e - Next 4 bytes are length (LE)
+
+    ;; Flow control
+    OP-NOP                    ; 0x61 - No operation
+    OP-IF                     ; 0x63 - Execute if top is true
+    OP-NOTIF                  ; 0x64 - Execute if top is false
+    OP-ELSE                   ; 0x67 - Else branch
+    OP-ENDIF                  ; 0x68 - End if block
+    OP-VERIFY                 ; 0x69 - Fail if top is false
+    OP-RETURN                 ; 0x6a - Fail immediately
+
+    ;; Stack operations
+    OP-TOALTSTACK             ; 0x6b - Move to alt stack
+    OP-FROMALTSTACK           ; 0x6c - Move from alt stack
+    OP-2DROP                  ; 0x6d - Drop top 2 items
+    OP-2DUP                   ; 0x6e - Duplicate top 2 items
+    OP-3DUP                   ; 0x6f - Duplicate top 3 items
+    OP-2OVER                  ; 0x70 - Copy 3rd and 4th items to top
+    OP-2ROT                   ; 0x71 - Rotate top 6 items
+    OP-2SWAP                  ; 0x72 - Swap top 2 pairs
+    OP-IFDUP                  ; 0x73 - Duplicate if non-zero
+    OP-DEPTH                  ; 0x74 - Push stack depth
+    OP-DROP                   ; 0x75 - Drop top item
+    OP-DUP                    ; 0x76 - Duplicate top item
+    OP-NIP                    ; 0x77 - Remove second item
+    OP-OVER                   ; 0x78 - Copy second item to top
+    OP-PICK                   ; 0x79 - Copy nth item to top
+    OP-ROLL                   ; 0x7a - Move nth item to top
+    OP-ROT                    ; 0x7b - Rotate top 3 items
+    OP-SWAP                   ; 0x7c - Swap top 2 items
+    OP-TUCK                   ; 0x7d - Copy top item before second
+
+    ;; Comparison
+    OP-EQUAL                  ; 0x87 - Push true if equal
+    OP-EQUALVERIFY            ; 0x88 - Fail if not equal
+
+    ;; Arithmetic
+    OP-1ADD                   ; 0x8b - Add 1
+    OP-1SUB                   ; 0x8c - Subtract 1
+    OP-NEGATE                 ; 0x8f - Negate
+    OP-ABS                    ; 0x90 - Absolute value
+    OP-NOT                    ; 0x91 - Logical not
+    OP-0NOTEQUAL              ; 0x92 - True if not 0
+    OP-ADD                    ; 0x93 - Add
+    OP-SUB                    ; 0x94 - Subtract
+    OP-BOOLAND                ; 0x9a - Logical and
+    OP-BOOLOR                 ; 0x9b - Logical or
+    OP-NUMEQUAL               ; 0x9c - Numeric equal
+    OP-NUMEQUALVERIFY         ; 0x9d - Fail if not numerically equal
+    OP-NUMNOTEQUAL            ; 0x9e - Numeric not equal
+    OP-LESSTHAN               ; 0x9f - Less than
+    OP-GREATERTHAN            ; 0xa0 - Greater than
+    OP-LESSTHANOREQUAL        ; 0xa1 - Less than or equal
+    OP-GREATERTHANOREQUAL     ; 0xa2 - Greater than or equal
+    OP-MIN                    ; 0xa3 - Minimum
+    OP-MAX                    ; 0xa4 - Maximum
+    OP-WITHIN                 ; 0xa5 - Value within range
+
+    ;; Crypto
+    OP-RIPEMD160              ; 0xa6 - RIPEMD160 hash
+    OP-SHA1                   ; 0xa7 - SHA1 hash
+    OP-SHA256                 ; 0xa8 - SHA256 hash
+    OP-HASH160                ; 0xa9 - RIPEMD160(SHA256(x))
+    OP-HASH256                ; 0xaa - SHA256(SHA256(x))
+    OP-CODESEPARATOR          ; 0xab - Mark for signature
+    OP-CHECKSIG               ; 0xac - Verify signature
+    OP-CHECKSIGVERIFY         ; 0xad - Verify and fail if invalid
+    OP-CHECKMULTISIG          ; 0xae - Multi-signature verify
+    OP-CHECKMULTISIGVERIFY    ; 0xaf - Multi-sig verify and fail
+
+    ;; Timelocks
+    OP-NOP1                   ; 0xb0 - NOP (reserved)
+    OP-CHECKLOCKTIMEVERIFY    ; 0xb1 - Check locktime
+    OP-CHECKSEQUENCEVERIFY    ; 0xb2 - Check sequence
+    OP-NOP4                   ; 0xb3 - NOP (reserved)
+    OP-NOP5                   ; 0xb4 - NOP (reserved)
+    OP-NOP6                   ; 0xb5 - NOP (reserved)
+    OP-NOP7                   ; 0xb6 - NOP (reserved)
+    OP-NOP8                   ; 0xb7 - NOP (reserved)
+    OP-NOP9                   ; 0xb8 - NOP (reserved)
+    OP-NOP10                  ; 0xb9 - NOP (reserved)
+
+    ;; Disabled/Unknown
+    (OP-DISABLED U8)          ; Disabled opcodes (OP_CAT, OP_SUBSTR, etc.)
+    (OP-UNKNOWN U8))          ; Unknown/reserved opcodes
+
+  ;; Alias for OP-0
+  (declare op-false (Unit -> Opcode))
+  (define (op-false)
+    "OP_FALSE is an alias for OP_0."
+    OP-0)
+
+  ;;; ============================================================
+  ;;; Opcode Conversions
+  ;;; ============================================================
+
+  (declare opcode-to-byte (Opcode -> U8))
+  (define (opcode-to-byte op)
+    "Convert an Opcode to its byte representation."
+    (match op
+      ((OP-0) 0)
+      ((OP-PUSHBYTES n) n)
+      ((OP-PUSHDATA1) #x4c)
+      ((OP-PUSHDATA2) #x4d)
+      ((OP-PUSHDATA4) #x4e)
+      ((OP-1NEGATE) #x4f)
+      ((OP-1) #x51)
+      ((OP-2) #x52)
+      ((OP-3) #x53)
+      ((OP-4) #x54)
+      ((OP-5) #x55)
+      ((OP-6) #x56)
+      ((OP-7) #x57)
+      ((OP-8) #x58)
+      ((OP-9) #x59)
+      ((OP-10) #x5a)
+      ((OP-11) #x5b)
+      ((OP-12) #x5c)
+      ((OP-13) #x5d)
+      ((OP-14) #x5e)
+      ((OP-15) #x5f)
+      ((OP-16) #x60)
+      ((OP-NOP) #x61)
+      ((OP-IF) #x63)
+      ((OP-NOTIF) #x64)
+      ((OP-ELSE) #x67)
+      ((OP-ENDIF) #x68)
+      ((OP-VERIFY) #x69)
+      ((OP-RETURN) #x6a)
+      ((OP-TOALTSTACK) #x6b)
+      ((OP-FROMALTSTACK) #x6c)
+      ((OP-2DROP) #x6d)
+      ((OP-2DUP) #x6e)
+      ((OP-3DUP) #x6f)
+      ((OP-2OVER) #x70)
+      ((OP-2ROT) #x71)
+      ((OP-2SWAP) #x72)
+      ((OP-IFDUP) #x73)
+      ((OP-DEPTH) #x74)
+      ((OP-DROP) #x75)
+      ((OP-DUP) #x76)
+      ((OP-NIP) #x77)
+      ((OP-OVER) #x78)
+      ((OP-PICK) #x79)
+      ((OP-ROLL) #x7a)
+      ((OP-ROT) #x7b)
+      ((OP-SWAP) #x7c)
+      ((OP-TUCK) #x7d)
+      ((OP-EQUAL) #x87)
+      ((OP-EQUALVERIFY) #x88)
+      ((OP-1ADD) #x8b)
+      ((OP-1SUB) #x8c)
+      ((OP-NEGATE) #x8f)
+      ((OP-ABS) #x90)
+      ((OP-NOT) #x91)
+      ((OP-0NOTEQUAL) #x92)
+      ((OP-ADD) #x93)
+      ((OP-SUB) #x94)
+      ((OP-BOOLAND) #x9a)
+      ((OP-BOOLOR) #x9b)
+      ((OP-NUMEQUAL) #x9c)
+      ((OP-NUMEQUALVERIFY) #x9d)
+      ((OP-NUMNOTEQUAL) #x9e)
+      ((OP-LESSTHAN) #x9f)
+      ((OP-GREATERTHAN) #xa0)
+      ((OP-LESSTHANOREQUAL) #xa1)
+      ((OP-GREATERTHANOREQUAL) #xa2)
+      ((OP-MIN) #xa3)
+      ((OP-MAX) #xa4)
+      ((OP-WITHIN) #xa5)
+      ((OP-RIPEMD160) #xa6)
+      ((OP-SHA1) #xa7)
+      ((OP-SHA256) #xa8)
+      ((OP-HASH160) #xa9)
+      ((OP-HASH256) #xaa)
+      ((OP-CODESEPARATOR) #xab)
+      ((OP-CHECKSIG) #xac)
+      ((OP-CHECKSIGVERIFY) #xad)
+      ((OP-CHECKMULTISIG) #xae)
+      ((OP-CHECKMULTISIGVERIFY) #xaf)
+      ((OP-NOP1) #xb0)
+      ((OP-CHECKLOCKTIMEVERIFY) #xb1)
+      ((OP-CHECKSEQUENCEVERIFY) #xb2)
+      ((OP-NOP4) #xb3)
+      ((OP-NOP5) #xb4)
+      ((OP-NOP6) #xb5)
+      ((OP-NOP7) #xb6)
+      ((OP-NOP8) #xb7)
+      ((OP-NOP9) #xb8)
+      ((OP-NOP10) #xb9)
+      ((OP-DISABLED n) n)
+      ((OP-UNKNOWN n) n)))
+
+  (declare byte-to-opcode (U8 -> Opcode))
+  (define (byte-to-opcode b)
+    "Convert a byte to an Opcode."
+    (cond
+      ;; OP_0 / OP_FALSE
+      ((== b 0) OP-0)
+      ;; Push 1-75 bytes directly
+      ((and (>= b 1) (<= b 75)) (OP-PUSHBYTES b))
+      ;; Push data opcodes
+      ((== b #x4c) OP-PUSHDATA1)
+      ((== b #x4d) OP-PUSHDATA2)
+      ((== b #x4e) OP-PUSHDATA4)
+      ;; OP_1NEGATE
+      ((== b #x4f) OP-1NEGATE)
+      ;; Reserved (OP_RESERVED)
+      ((== b #x50) (OP-UNKNOWN b))
+      ;; OP_1 through OP_16
+      ((== b #x51) OP-1)
+      ((== b #x52) OP-2)
+      ((== b #x53) OP-3)
+      ((== b #x54) OP-4)
+      ((== b #x55) OP-5)
+      ((== b #x56) OP-6)
+      ((== b #x57) OP-7)
+      ((== b #x58) OP-8)
+      ((== b #x59) OP-9)
+      ((== b #x5a) OP-10)
+      ((== b #x5b) OP-11)
+      ((== b #x5c) OP-12)
+      ((== b #x5d) OP-13)
+      ((== b #x5e) OP-14)
+      ((== b #x5f) OP-15)
+      ((== b #x60) OP-16)
+      ;; Flow control
+      ((== b #x61) OP-NOP)
+      ((== b #x63) OP-IF)
+      ((== b #x64) OP-NOTIF)
+      ((== b #x67) OP-ELSE)
+      ((== b #x68) OP-ENDIF)
+      ((== b #x69) OP-VERIFY)
+      ((== b #x6a) OP-RETURN)
+      ;; Stack
+      ((== b #x6b) OP-TOALTSTACK)
+      ((== b #x6c) OP-FROMALTSTACK)
+      ((== b #x6d) OP-2DROP)
+      ((== b #x6e) OP-2DUP)
+      ((== b #x6f) OP-3DUP)
+      ((== b #x70) OP-2OVER)
+      ((== b #x71) OP-2ROT)
+      ((== b #x72) OP-2SWAP)
+      ((== b #x73) OP-IFDUP)
+      ((== b #x74) OP-DEPTH)
+      ((== b #x75) OP-DROP)
+      ((== b #x76) OP-DUP)
+      ((== b #x77) OP-NIP)
+      ((== b #x78) OP-OVER)
+      ((== b #x79) OP-PICK)
+      ((== b #x7a) OP-ROLL)
+      ((== b #x7b) OP-ROT)
+      ((== b #x7c) OP-SWAP)
+      ((== b #x7d) OP-TUCK)
+      ;; Splice (disabled)
+      ((and (>= b #x7e) (<= b #x81)) (OP-DISABLED b))
+      ;; Bitwise (disabled)
+      ((and (>= b #x82) (<= b #x86)) (OP-DISABLED b))
+      ;; Comparison
+      ((== b #x87) OP-EQUAL)
+      ((== b #x88) OP-EQUALVERIFY)
+      ;; Reserved
+      ((and (>= b #x89) (<= b #x8a)) (OP-UNKNOWN b))
+      ;; Arithmetic
+      ((== b #x8b) OP-1ADD)
+      ((== b #x8c) OP-1SUB)
+      ;; Disabled arithmetic
+      ((and (>= b #x8d) (<= b #x8e)) (OP-DISABLED b))
+      ((== b #x8f) OP-NEGATE)
+      ((== b #x90) OP-ABS)
+      ((== b #x91) OP-NOT)
+      ((== b #x92) OP-0NOTEQUAL)
+      ((== b #x93) OP-ADD)
+      ((== b #x94) OP-SUB)
+      ;; Disabled arithmetic
+      ((and (>= b #x95) (<= b #x99)) (OP-DISABLED b))
+      ((== b #x9a) OP-BOOLAND)
+      ((== b #x9b) OP-BOOLOR)
+      ((== b #x9c) OP-NUMEQUAL)
+      ((== b #x9d) OP-NUMEQUALVERIFY)
+      ((== b #x9e) OP-NUMNOTEQUAL)
+      ((== b #x9f) OP-LESSTHAN)
+      ((== b #xa0) OP-GREATERTHAN)
+      ((== b #xa1) OP-LESSTHANOREQUAL)
+      ((== b #xa2) OP-GREATERTHANOREQUAL)
+      ((== b #xa3) OP-MIN)
+      ((== b #xa4) OP-MAX)
+      ((== b #xa5) OP-WITHIN)
+      ;; Crypto
+      ((== b #xa6) OP-RIPEMD160)
+      ((== b #xa7) OP-SHA1)
+      ((== b #xa8) OP-SHA256)
+      ((== b #xa9) OP-HASH160)
+      ((== b #xaa) OP-HASH256)
+      ((== b #xab) OP-CODESEPARATOR)
+      ((== b #xac) OP-CHECKSIG)
+      ((== b #xad) OP-CHECKSIGVERIFY)
+      ((== b #xae) OP-CHECKMULTISIG)
+      ((== b #xaf) OP-CHECKMULTISIGVERIFY)
+      ;; Timelocks and NOP1-10
+      ((== b #xb0) OP-NOP1)
+      ((== b #xb1) OP-CHECKLOCKTIMEVERIFY)
+      ((== b #xb2) OP-CHECKSEQUENCEVERIFY)
+      ((== b #xb3) OP-NOP4)
+      ((== b #xb4) OP-NOP5)
+      ((== b #xb5) OP-NOP6)
+      ((== b #xb6) OP-NOP7)
+      ((== b #xb7) OP-NOP8)
+      ((== b #xb8) OP-NOP9)
+      ((== b #xb9) OP-NOP10)
+      ;; Everything else
+      (True (OP-UNKNOWN b))))
+
+  ;;;; Opcode predicates
+
+  (declare is-push-op (Opcode -> Boolean))
+  (define (is-push-op op)
+    "Return True if this opcode pushes data onto the stack."
+    (match op
+      ((OP-0) True)
+      ((OP-PUSHBYTES n) True)
+      ((OP-PUSHDATA1) True)
+      ((OP-PUSHDATA2) True)
+      ((OP-PUSHDATA4) True)
+      ((OP-1NEGATE) True)
+      ((OP-1) True)
+      ((OP-2) True)
+      ((OP-3) True)
+      ((OP-4) True)
+      ((OP-5) True)
+      ((OP-6) True)
+      ((OP-7) True)
+      ((OP-8) True)
+      ((OP-9) True)
+      ((OP-10) True)
+      ((OP-11) True)
+      ((OP-12) True)
+      ((OP-13) True)
+      ((OP-14) True)
+      ((OP-15) True)
+      ((OP-16) True)
+      (_other False)))
+
+  (declare is-disabled-op (Opcode -> Boolean))
+  (define (is-disabled-op op)
+    "Return True if this opcode is disabled."
+    (match op
+      ((OP-DISABLED n) True)
+      (other False)))
+
+  (declare is-conditional-op (Opcode -> Boolean))
+  (define (is-conditional-op op)
+    "Return True if this opcode is a conditional flow control opcode."
+    (match op
+      ((OP-IF) True)
+      ((OP-NOTIF) True)
+      ((OP-ELSE) True)
+      ((OP-ENDIF) True)
+      (_other False)))
+
+  ;;; ============================================================
+  ;;; Value Conversions
+  ;;; ============================================================
+
+  (declare bytes-to-script-num ((Vector U8) -> (ScriptResult ScriptNum)))
+  (define (bytes-to-script-num bytes)
+    "Convert script bytes to a ScriptNum.
+     Uses little-endian encoding with sign bit in MSB."
+    (let ((len (the UFix (coalton-library/vector:length bytes))))
+      (if (== len 0)
+          (ScriptOk (ScriptNum 0))
+          (lisp (ScriptResult ScriptNum) (bytes len)
+            (cl:let* ((negative (cl:logbitp 7 (cl:aref bytes (cl:1- len))))
+                      (abs-value
+                        (cl:loop :for i :from 0 :below len
+                                 :sum (cl:ash (cl:logand
+                                                (cl:aref bytes i)
+                                                (cl:if (cl:= i (cl:1- len))
+                                                       #x7F
+                                                       #xFF))
+                                              (cl:* i 8)))))
+              (ScriptOk (ScriptNum (cl:if negative (cl:- abs-value) abs-value))))))))
+
+  (declare script-num-to-bytes (ScriptNum -> (Vector U8)))
+  (define (script-num-to-bytes sn)
+    "Convert a ScriptNum to minimally-encoded bytes.
+     Uses little-endian encoding with sign bit in MSB."
+    (let ((n (script-num-value sn)))
+      (if (== n 0)
+          (lisp (Vector U8) () (cl:vector))
+          (lisp (Vector U8) (n)
+            (cl:let* ((negative (cl:minusp n))
+                      (abs-num (cl:abs n))
+                      (bytes-list (cl:loop :for val = abs-num :then (cl:ash val -8)
+                                           :while (cl:plusp val)
+                                           :collect (cl:logand val #xFF)))
+                      (result (cl:coerce bytes-list 'cl:vector))
+                      (last-idx (cl:1- (cl:length result))))
+              ;; If high bit is set, we need an extra byte for sign
+              (cl:when (cl:logbitp 7 (cl:aref result last-idx))
+                (cl:setf result (cl:concatenate 'cl:vector result
+                                                (cl:if negative #(#x80) #(#x00))))
+                (cl:setf last-idx (cl:1- (cl:length result))))
+              ;; Set sign bit if negative
+              (cl:when (cl:and negative (cl:> (cl:length result) 0))
+                (cl:setf (cl:aref result (cl:1- (cl:length result)))
+                         (cl:logior (cl:aref result (cl:1- (cl:length result))) #x80)))
+              result)))))
+
+  (declare cast-to-bool ((Vector U8) -> Boolean))
+  (define (cast-to-bool bytes)
+    "Convert script bytes to boolean.
+     Returns False for empty vector, all zeros, or negative zero (0x80)."
+    (lisp Boolean (bytes)
+      (cl:not (cl:or (cl:zerop (cl:length bytes))
+                     (cl:every #'cl:zerop bytes)
+                     (cl:and (cl:= (cl:length bytes) 1)
+                             (cl:= (cl:aref bytes 0) #x80))))))
+
+  (declare script-num-in-range (ScriptNum -> Boolean))
+  (define (script-num-in-range sn)
+    "Check if a ScriptNum is within the 4-byte arithmetic range.
+     Bitcoin script arithmetic is limited to signed 32-bit values."
+    (let ((n (script-num-value sn)))
+      (and (>= n -2147483647) (<= n 2147483647))))
+
+  (declare require-minimal-encoding ((Vector U8) -> (ScriptResult Unit)))
+  (define (require-minimal-encoding bytes)
+    "Validate that bytes use minimal encoding for script numbers.
+     Rejects unnecessary leading zero bytes."
+    (let ((len (the UFix (coalton-library/vector:length bytes))))
+      (cond
+        ;; Empty is valid
+        ((== len 0) (ScriptOk Unit))
+        ;; Single byte is always minimal
+        ((== len 1) (ScriptOk Unit))
+        ;; Check for non-minimal encoding
+        (True
+         (lisp (ScriptResult Unit) (bytes len)
+           (cl:let ((last-byte (cl:aref bytes (cl:1- len)))
+                    (second-last (cl:aref bytes (cl:- len 2))))
+             ;; Non-minimal if last byte is 0x00 or 0x80 and second-last
+             ;; doesn't have high bit set
+             (cl:if (cl:and (cl:or (cl:= last-byte 0)
+                                   (cl:= last-byte #x80))
+                            (cl:not (cl:logbitp 7 second-last)))
+                    (ScriptErr SE-InvalidNumber)
+                    (ScriptOk Unit))))))))
+
+  ;;; ============================================================
+  ;;; Stack Operations
+  ;;; ============================================================
+
+  ;; Stack is a list of byte vectors (top of stack is head of list)
+  (define-type-alias ScriptStack (List (Vector U8)))
+
+  (declare empty-stack (Unit -> ScriptStack))
+  (define (empty-stack)
+    "Return an empty script stack."
+    Nil)
+
+  (declare stack-push ((Vector U8) -> ScriptStack -> ScriptStack))
+  (define (stack-push value stack)
+    "Push a value onto the stack."
+    (Cons value stack))
+
+  (declare stack-pop (ScriptStack -> (Optional (Tuple (Vector U8) ScriptStack))))
+  (define (stack-pop stack)
+    "Pop a value from the stack. Returns None if stack is empty."
+    (match stack
+      ((Nil) None)
+      ((Cons top rest) (Some (Tuple top rest)))))
+
+  (declare stack-top (ScriptStack -> (Optional (Vector U8))))
+  (define (stack-top stack)
+    "Peek at the top value without removing it."
+    (match stack
+      ((Nil) None)
+      ((Cons top _) (Some top))))
+
+  (declare stack-depth (ScriptStack -> UFix))
+  (define (stack-depth stack)
+    "Return the number of items on the stack."
+    (lisp UFix (stack)
+      (cl:length stack)))
+
+  (declare stack-pick (UFix -> ScriptStack -> (Optional (Vector U8))))
+  (define (stack-pick n stack)
+    "Get the nth item from the stack (0 = top)."
+    (lisp (Optional (Vector U8)) (n stack)
+      (cl:if (cl:>= n (cl:length stack))
+             None
+             (Some (cl:nth n stack)))))
+
+  (declare stack-roll (UFix -> ScriptStack -> (Optional ScriptStack)))
+  (define (stack-roll n stack)
+    "Move the nth item to the top of the stack."
+    (lisp (Optional ScriptStack) (n stack)
+      (cl:if (cl:>= n (cl:length stack))
+             None
+             (cl:let* ((item (cl:nth n stack))
+                       (before (cl:subseq stack 0 n))
+                       (after (cl:nthcdr (cl:1+ n) stack)))
+               (Some (cl:cons item (cl:append before after)))))))
+
+  ;;;; Multi-element stack operations
+
+  (declare stack-2dup (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-2dup stack)
+    "Duplicate the top 2 items: [a b ...] -> [a b a b ...]"
+    (match stack
+      ((Cons a (Cons b rest))
+       (Some (Cons a (Cons b (Cons a (Cons b rest))))))
+      (_other None)))
+
+  (declare stack-2drop (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-2drop stack)
+    "Drop the top 2 items."
+    (match stack
+      ((Cons _ (Cons _ rest)) (Some rest))
+      (_other None)))
+
+  (declare stack-2swap (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-2swap stack)
+    "Swap the top 2 pairs: [a b c d ...] -> [c d a b ...]"
+    (match stack
+      ((Cons a (Cons b (Cons c (Cons d rest))))
+       (Some (Cons c (Cons d (Cons a (Cons b rest))))))
+      (_other None)))
+
+  (declare stack-2over (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-2over stack)
+    "Copy 3rd and 4th items to top: [a b c d ...] -> [c d a b c d ...]"
+    (match stack
+      ((Cons a (Cons b (Cons c (Cons d rest))))
+       (Some (Cons c (Cons d (Cons a (Cons b (Cons c (Cons d rest))))))))
+      (_other None)))
+
+  (declare stack-2rot (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-2rot stack)
+    "Rotate top 6 items: [a b c d e f ...] -> [e f a b c d ...]"
+    (match stack
+      ((Cons a (Cons b (Cons c (Cons d (Cons e (Cons f rest))))))
+       (Some (Cons e (Cons f (Cons a (Cons b (Cons c (Cons d rest))))))))
+      (_other None)))
+
+  (declare stack-3dup (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-3dup stack)
+    "Duplicate the top 3 items."
+    (match stack
+      ((Cons a (Cons b (Cons c rest)))
+       (Some (Cons a (Cons b (Cons c (Cons a (Cons b (Cons c rest))))))))
+      (_other None)))
+
+  (declare stack-rot (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-rot stack)
+    "Rotate top 3 items: [a b c ...] -> [c a b ...]"
+    (match stack
+      ((Cons a (Cons b (Cons c rest)))
+       (Some (Cons c (Cons a (Cons b rest)))))
+      (_other None)))
+
+  (declare stack-over (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-over stack)
+    "Copy second item to top: [a b ...] -> [b a b ...]"
+    (match stack
+      ((Cons a (Cons b rest))
+       (Some (Cons b (Cons a (Cons b rest)))))
+      (_other None)))
+
+  (declare stack-nip (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-nip stack)
+    "Remove second item: [a b ...] -> [a ...]"
+    (match stack
+      ((Cons a (Cons _ rest))
+       (Some (Cons a rest)))
+      (_other None)))
+
+  (declare stack-tuck (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-tuck stack)
+    "Copy top before second: [a b ...] -> [a b a ...]"
+    (match stack
+      ((Cons a (Cons b rest))
+       (Some (Cons a (Cons b (Cons a rest)))))
+      (_other None)))
+
+  (declare stack-swap (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-swap stack)
+    "Swap top 2 items: [a b ...] -> [b a ...]"
+    (match stack
+      ((Cons a (Cons b rest))
+       (Some (Cons b (Cons a rest))))
+      (_other None)))
+
+  (declare stack-ifdup (ScriptStack -> (Optional ScriptStack)))
+  (define (stack-ifdup stack)
+    "Duplicate top if non-zero."
+    (match stack
+      ((Cons top rest)
+       (if (cast-to-bool top)
+           (Some (Cons top (Cons top rest)))
+           (Some stack)))
+      (_other None)))
+
+  ;;; ============================================================
+  ;;; Execution Context
+  ;;; ============================================================
+
+  ;; Script limits (as UFix for comparison with vector lengths)
+  (declare +max-script-size+ UFix)
+  (define +max-script-size+ 10000)
+  (declare +max-stack-size+ UFix)
+  (define +max-stack-size+ 1000)
+  (declare +max-ops-per-script+ UFix)
+  (define +max-ops-per-script+ 201)
+
+  (define-type ScriptContext
+    "Execution context for script validation.
+     Fields: main-stack, alt-stack, script, position, condition-stack,
+             executing, op-count, codesep-pos"
+    (ScriptContext
+     ScriptStack      ; main-stack
+     ScriptStack      ; alt-stack
+     (Vector U8)      ; script
+     UFix             ; position
+     (List Boolean)   ; condition-stack (for IF/ELSE nesting)
+     Boolean          ; executing (False in unexecuted IF branch)
+     UFix             ; op-count (for 201 limit)
+     UFix))           ; codesep-pos (for CHECKSIG)
+
+  (declare make-script-context ((Vector U8) -> ScriptContext))
+  (define (make-script-context script)
+    "Create a new script execution context."
+    (ScriptContext
+     (empty-stack)      ; main-stack
+     (empty-stack)      ; alt-stack
+     script             ; script
+     0                  ; position
+     Nil                ; condition-stack
+     True               ; executing
+     0                  ; op-count
+     0))                ; codesep-pos
+
+  ;; Context accessors
+  (declare context-main-stack (ScriptContext -> ScriptStack))
+  (define (context-main-stack ctx)
+    (match ctx ((ScriptContext s _ _ _ _ _ _ _) s)))
+
+  (declare context-alt-stack (ScriptContext -> ScriptStack))
+  (define (context-alt-stack ctx)
+    (match ctx ((ScriptContext _ a _ _ _ _ _ _) a)))
+
+  (declare context-script (ScriptContext -> (Vector U8)))
+  (define (context-script ctx)
+    (match ctx ((ScriptContext _ _ s _ _ _ _ _) s)))
+
+  (declare context-position (ScriptContext -> UFix))
+  (define (context-position ctx)
+    (match ctx ((ScriptContext _ _ _ p _ _ _ _) p)))
+
+  (declare context-condition-stack (ScriptContext -> (List Boolean)))
+  (define (context-condition-stack ctx)
+    (match ctx ((ScriptContext _ _ _ _ c _ _ _) c)))
+
+  (declare context-executing (ScriptContext -> Boolean))
+  (define (context-executing ctx)
+    (match ctx ((ScriptContext _ _ _ _ _ e _ _) e)))
+
+  (declare context-op-count (ScriptContext -> UFix))
+  (define (context-op-count ctx)
+    (match ctx ((ScriptContext _ _ _ _ _ _ o _) o)))
+
+  (declare context-codesep-pos (ScriptContext -> UFix))
+  (define (context-codesep-pos ctx)
+    (match ctx ((ScriptContext _ _ _ _ _ _ _ c) c)))
+
+  ;; Context update helpers
+  (declare context-with-main-stack (ScriptStack -> ScriptContext -> ScriptContext))
+  (define (context-with-main-stack stack ctx)
+    (match ctx
+      ((ScriptContext _ alt script pos cond exec ops codesep)
+       (ScriptContext stack alt script pos cond exec ops codesep))))
+
+  (declare context-with-alt-stack (ScriptStack -> ScriptContext -> ScriptContext))
+  (define (context-with-alt-stack alt ctx)
+    (match ctx
+      ((ScriptContext main _ script pos cond exec ops codesep)
+       (ScriptContext main alt script pos cond exec ops codesep))))
+
+  (declare context-with-position (UFix -> ScriptContext -> ScriptContext))
+  (define (context-with-position pos ctx)
+    (match ctx
+      ((ScriptContext main alt script _ cond exec ops codesep)
+       (ScriptContext main alt script pos cond exec ops codesep))))
+
+  (declare context-with-condition-stack ((List Boolean) -> ScriptContext -> ScriptContext))
+  (define (context-with-condition-stack cond ctx)
+    (match ctx
+      ((ScriptContext main alt script pos _ exec ops codesep)
+       (ScriptContext main alt script pos cond exec ops codesep))))
+
+  (declare context-with-executing (Boolean -> ScriptContext -> ScriptContext))
+  (define (context-with-executing exec ctx)
+    (match ctx
+      ((ScriptContext main alt script pos cond _ ops codesep)
+       (ScriptContext main alt script pos cond exec ops codesep))))
+
+  (declare context-with-op-count (UFix -> ScriptContext -> ScriptContext))
+  (define (context-with-op-count ops ctx)
+    (match ctx
+      ((ScriptContext main alt script pos cond exec _ codesep)
+       (ScriptContext main alt script pos cond exec ops codesep))))
+
+  (declare context-with-codesep-pos (UFix -> ScriptContext -> ScriptContext))
+  (define (context-with-codesep-pos codesep ctx)
+    (match ctx
+      ((ScriptContext main alt script pos cond exec ops _)
+       (ScriptContext main alt script pos cond exec ops codesep))))
+
+  (declare advance-position (UFix -> ScriptContext -> ScriptContext))
+  (define (advance-position n ctx)
+    "Advance the script position by n bytes."
+    (context-with-position (+ (context-position ctx) n) ctx))
+
+  (declare increment-op-count (ScriptContext -> ScriptContext))
+  (define (increment-op-count ctx)
+    "Increment the non-push operation count."
+    (context-with-op-count (+ (context-op-count ctx) 1) ctx))
+
+  ;;; ============================================================
+  ;;; Conditional Execution Helpers
+  ;;; ============================================================
+
+  (declare all-true ((List Boolean) -> Boolean))
+  (define (all-true lst)
+    "Return True if all elements are True (or list is empty)."
+    (match lst
+      ((Nil) True)
+      ((Cons x xs) (if x (all-true xs) False))))
+
+  (declare update-executing-flag ((List Boolean) -> ScriptContext -> ScriptContext))
+  (define (update-executing-flag cond-stack ctx)
+    "Update both condition-stack and executing flag."
+    (let ((new-exec (all-true cond-stack)))
+      (context-with-executing new-exec
+                              (context-with-condition-stack cond-stack ctx))))
+
+  (declare push-condition (Boolean -> ScriptContext -> ScriptContext))
+  (define (push-condition cond ctx)
+    "Push a condition onto the condition stack and update executing."
+    (let ((new-stack (Cons cond (context-condition-stack ctx))))
+      (update-executing-flag new-stack ctx)))
+
+  (declare pop-condition (ScriptContext -> (Optional ScriptContext)))
+  (define (pop-condition ctx)
+    "Pop a condition from the stack, return None if empty."
+    (match (context-condition-stack ctx)
+      ((Nil) None)
+      ((Cons _ rest)
+       (Some (update-executing-flag rest ctx)))))
+
+  (declare toggle-top-condition (ScriptContext -> (Optional ScriptContext)))
+  (define (toggle-top-condition ctx)
+    "Toggle the top condition (for ELSE), return None if empty."
+    (match (context-condition-stack ctx)
+      ((Nil) None)
+      ((Cons top rest)
+       (let ((new-stack (Cons (not top) rest)))
+         (Some (update-executing-flag new-stack ctx))))))
+
+  (declare is-control-flow-op (Opcode -> Boolean))
+  (define (is-control-flow-op op)
+    "Return True if opcode is a control flow opcode that must always be processed."
+    (match op
+      ((OP-IF) True)
+      ((OP-NOTIF) True)
+      ((OP-ELSE) True)
+      ((OP-ENDIF) True)
+      (_other False)))
+
+  ;;; ============================================================
+  ;;; Script Reading Helpers
+  ;;; ============================================================
+
+  (declare read-script-byte (ScriptContext -> (ScriptResult (Tuple U8 ScriptContext))))
+  (define (read-script-byte ctx)
+    "Read a single byte from the script at current position."
+    (let ((pos (context-position ctx))
+          (script (context-script ctx)))
+      (if (>= pos (the UFix (coalton-library/vector:length script)))
+          (ScriptErr SE-InvalidPushData)
+          (let ((byte (lisp U8 (script pos) (cl:aref script pos))))
+            (ScriptOk (Tuple byte (advance-position 1 ctx)))))))
+
+  (declare read-script-bytes (UFix -> ScriptContext -> (ScriptResult (Tuple (Vector U8) ScriptContext))))
+  (define (read-script-bytes n ctx)
+    "Read n bytes from the script at current position."
+    (let ((pos (context-position ctx))
+          (script (context-script ctx)))
+      (if (> (+ pos n) (the UFix (coalton-library/vector:length script)))
+          (ScriptErr SE-InvalidPushData)
+          (let ((bytes (lisp (Vector U8) (script pos n)
+                         (cl:subseq script pos (cl:+ pos n)))))
+            (ScriptOk (Tuple bytes (advance-position n ctx)))))))
+
+  ;;; ============================================================
+  ;;; Opcode Execution
+  ;;; ============================================================
+
+  ;; Helper to push result onto stack in context
+  (declare context-push ((Vector U8) -> ScriptContext -> ScriptContext))
+  (define (context-push value ctx)
+    (context-with-main-stack (stack-push value (context-main-stack ctx)) ctx))
+
+  ;; Helper to get true/false bytes
+  (declare true-bytes (Unit -> (Vector U8)))
+  (define (true-bytes)
+    (lisp (Vector U8) () #(1)))
+
+  (declare false-bytes (Unit -> (Vector U8)))
+  (define (false-bytes)
+    (lisp (Vector U8) () #()))
+
+  ;; Execute a single opcode
+  (declare execute-opcode (Opcode -> ScriptContext -> (ScriptResult ScriptContext)))
+  (define (execute-opcode op ctx)
+    "Execute a single opcode and return the updated context."
+    (match op
+      ;; OP_0 / OP_FALSE - push empty vector
+      ((OP-0)
+       (ScriptOk (context-push (false-bytes) ctx)))
+
+      ;; OP_1NEGATE - push -1
+      ((OP-1NEGATE)
+       (ScriptOk (context-push (script-num-to-bytes (ScriptNum -1)) ctx)))
+
+      ;; OP_1 through OP_16
+      ((OP-1) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 1)) ctx)))
+      ((OP-2) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 2)) ctx)))
+      ((OP-3) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 3)) ctx)))
+      ((OP-4) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 4)) ctx)))
+      ((OP-5) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 5)) ctx)))
+      ((OP-6) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 6)) ctx)))
+      ((OP-7) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 7)) ctx)))
+      ((OP-8) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 8)) ctx)))
+      ((OP-9) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 9)) ctx)))
+      ((OP-10) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 10)) ctx)))
+      ((OP-11) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 11)) ctx)))
+      ((OP-12) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 12)) ctx)))
+      ((OP-13) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 13)) ctx)))
+      ((OP-14) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 14)) ctx)))
+      ((OP-15) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 15)) ctx)))
+      ((OP-16) (ScriptOk (context-push (script-num-to-bytes (ScriptNum 16)) ctx)))
+
+      ;; OP_NOP - no operation
+      ((OP-NOP) (ScriptOk ctx))
+
+      ;; OP_VERIFY - fail if top is false
+      ((OP-VERIFY)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple top new-stack))
+          (if (cast-to-bool top)
+              (ScriptOk (context-with-main-stack new-stack ctx))
+              (ScriptErr SE-VerifyFailed)))))
+
+      ;; OP_RETURN - immediate failure
+      ((OP-RETURN) (ScriptErr SE-OpReturn))
+
+      ;; OP_DUP - duplicate top
+      ((OP-DUP)
+       (match (stack-top (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some top)
+          (ScriptOk (context-push top ctx)))))
+
+      ;; OP_DROP - drop top
+      ((OP-DROP)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple _ new-stack))
+          (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_SWAP - swap top 2
+      ((OP-SWAP)
+       (match (stack-swap (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_ROT - rotate top 3
+      ((OP-ROT)
+       (match (stack-rot (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_OVER - copy second to top
+      ((OP-OVER)
+       (match (stack-over (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_NIP - remove second
+      ((OP-NIP)
+       (match (stack-nip (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_TUCK - copy top before second
+      ((OP-TUCK)
+       (match (stack-tuck (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_2DROP
+      ((OP-2DROP)
+       (match (stack-2drop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_2DUP
+      ((OP-2DUP)
+       (match (stack-2dup (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_3DUP
+      ((OP-3DUP)
+       (match (stack-3dup (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_2SWAP
+      ((OP-2SWAP)
+       (match (stack-2swap (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_2OVER
+      ((OP-2OVER)
+       (match (stack-2over (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_2ROT
+      ((OP-2ROT)
+       (match (stack-2rot (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_IFDUP
+      ((OP-IFDUP)
+       (match (stack-ifdup (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some new-stack) (ScriptOk (context-with-main-stack new-stack ctx)))))
+
+      ;; OP_DEPTH - push stack depth
+      ((OP-DEPTH)
+       (let ((depth (stack-depth (context-main-stack ctx))))
+         (ScriptOk (context-push (script-num-to-bytes (ScriptNum (lisp Integer (depth) depth))) ctx))))
+
+      ;; OP_PICK - copy nth item to top
+      ((OP-PICK)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple n-bytes new-stack))
+          (match (bytes-to-script-num n-bytes)
+            ((ScriptErr e) (ScriptErr e))
+            ((ScriptOk sn)
+             (let ((sn-val (script-num-value sn)))
+               (let ((n (lisp UFix (sn-val) (cl:max 0 sn-val))))
+                 (match (stack-pick n new-stack)
+                   ((None) (ScriptErr SE-InvalidStackOperation))
+                   ((Some value)
+                    (ScriptOk (context-with-main-stack (stack-push value new-stack) ctx)))))))))))
+
+      ;; OP_ROLL - move nth item to top
+      ((OP-ROLL)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple n-bytes new-stack))
+          (match (bytes-to-script-num n-bytes)
+            ((ScriptErr e) (ScriptErr e))
+            ((ScriptOk sn)
+             (let ((sn-val (script-num-value sn)))
+               (let ((n (lisp UFix (sn-val) (cl:max 0 sn-val))))
+                 (match (stack-roll n new-stack)
+                   ((None) (ScriptErr SE-InvalidStackOperation))
+                   ((Some rolled-stack)
+                    (ScriptOk (context-with-main-stack rolled-stack ctx)))))))))))
+
+      ;; OP_TOALTSTACK
+      ((OP-TOALTSTACK)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple value new-main))
+          (ScriptOk (context-with-alt-stack
+                     (stack-push value (context-alt-stack ctx))
+                     (context-with-main-stack new-main ctx))))))
+
+      ;; OP_FROMALTSTACK
+      ((OP-FROMALTSTACK)
+       (match (stack-pop (context-alt-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple value new-alt))
+          (ScriptOk (context-with-main-stack
+                     (stack-push value (context-main-stack ctx))
+                     (context-with-alt-stack new-alt ctx))))))
+
+      ;; OP_EQUAL - push true if equal
+      ((OP-EQUAL)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b new-stack))
+             (let ((equal (lisp Boolean (a b) (cl:equalp a b))))
+               (ScriptOk (context-with-main-stack
+                          (stack-push (if equal (true-bytes) (false-bytes)) new-stack)
+                          ctx))))))))
+
+      ;; OP_EQUALVERIFY - fail if not equal
+      ((OP-EQUALVERIFY)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b new-stack))
+             (let ((equal (lisp Boolean (a b) (cl:equalp a b))))
+               (if equal
+                   (ScriptOk (context-with-main-stack new-stack ctx))
+                   (ScriptErr SE-VerifyFailed))))))))
+
+      ;; OP_HASH160 - RIPEMD160(SHA256(x))
+      ((OP-HASH160)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple data new-stack))
+          (let ((hash (compute-hash160 data)))
+            (ScriptOk (context-with-main-stack
+                       (stack-push (hash160-bytes hash) new-stack)
+                       ctx))))))
+
+      ;; OP_HASH256 - SHA256(SHA256(x))
+      ((OP-HASH256)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple data new-stack))
+          (let ((hash (compute-hash256 data)))
+            (ScriptOk (context-with-main-stack
+                       (stack-push (hash256-bytes hash) new-stack)
+                       ctx))))))
+
+      ;; OP_SHA256
+      ((OP-SHA256)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple data new-stack))
+          (let ((hash (compute-sha256 data)))
+            (ScriptOk (context-with-main-stack
+                       (stack-push (hash256-bytes hash) new-stack)
+                       ctx))))))
+
+      ;; OP_RIPEMD160
+      ((OP-RIPEMD160)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple data new-stack))
+          (let ((hash (compute-ripemd160 data)))
+            (ScriptOk (context-with-main-stack
+                       (stack-push (hash160-bytes hash) new-stack)
+                       ctx))))))
+
+      ;; Arithmetic operations
+
+      ;; OP_1ADD
+      ((OP-1ADD)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple bytes new-stack))
+          (match (bytes-to-script-num bytes)
+            ((ScriptErr e) (ScriptErr e))
+            ((ScriptOk sn)
+             (ScriptOk (context-with-main-stack
+                        (stack-push (script-num-to-bytes (ScriptNum (+ (script-num-value sn) 1))) new-stack)
+                        ctx)))))))
+
+      ;; OP_1SUB
+      ((OP-1SUB)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple bytes new-stack))
+          (match (bytes-to-script-num bytes)
+            ((ScriptErr e) (ScriptErr e))
+            ((ScriptOk sn)
+             (ScriptOk (context-with-main-stack
+                        (stack-push (script-num-to-bytes (ScriptNum (- (script-num-value sn) 1))) new-stack)
+                        ctx)))))))
+
+      ;; OP_NEGATE
+      ((OP-NEGATE)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple bytes new-stack))
+          (match (bytes-to-script-num bytes)
+            ((ScriptErr e) (ScriptErr e))
+            ((ScriptOk sn)
+             (ScriptOk (context-with-main-stack
+                        (stack-push (script-num-to-bytes (ScriptNum (negate (script-num-value sn)))) new-stack)
+                        ctx)))))))
+
+      ;; OP_ABS
+      ((OP-ABS)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple bytes new-stack))
+          (match (bytes-to-script-num bytes)
+            ((ScriptErr e) (ScriptErr e))
+            ((ScriptOk sn)
+             (ScriptOk (context-with-main-stack
+                        (stack-push (script-num-to-bytes (ScriptNum (abs (script-num-value sn)))) new-stack)
+                        ctx)))))))
+
+      ;; OP_NOT - logical not (0 -> 1, non-zero -> 0)
+      ((OP-NOT)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple bytes new-stack))
+          (match (bytes-to-script-num bytes)
+            ((ScriptErr e) (ScriptErr e))
+            ((ScriptOk sn)
+             (let ((result (if (== (script-num-value sn) 0) 1 0)))
+               (ScriptOk (context-with-main-stack
+                          (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                          ctx))))))))
+
+      ;; OP_0NOTEQUAL
+      ((OP-0NOTEQUAL)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple bytes new-stack))
+          (match (bytes-to-script-num bytes)
+            ((ScriptErr e) (ScriptErr e))
+            ((ScriptOk sn)
+             (let ((result (if (/= (script-num-value sn) 0) 1 0)))
+               (ScriptOk (context-with-main-stack
+                          (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                          ctx))))))))
+
+      ;; OP_ADD
+      ((OP-ADD)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (ScriptOk (context-with-main-stack
+                              (stack-push (script-num-to-bytes
+                                           (ScriptNum (+ (script-num-value b) (script-num-value a))))
+                                          new-stack)
+                              ctx)))))))))))
+
+      ;; OP_SUB
+      ((OP-SUB)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (ScriptOk (context-with-main-stack
+                              (stack-push (script-num-to-bytes
+                                           (ScriptNum (- (script-num-value b) (script-num-value a))))
+                                          new-stack)
+                              ctx)))))))))))
+
+      ;; OP_BOOLAND
+      ((OP-BOOLAND)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (if (and (/= (script-num-value a) 0)
+                                          (/= (script-num-value b) 0))
+                                     1 0)))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_BOOLOR
+      ((OP-BOOLOR)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (if (or (/= (script-num-value a) 0)
+                                         (/= (script-num-value b) 0))
+                                     1 0)))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_NUMEQUAL
+      ((OP-NUMEQUAL)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (if (== (script-num-value a) (script-num-value b)) 1 0)))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_NUMEQUALVERIFY
+      ((OP-NUMEQUALVERIFY)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (if (== (script-num-value a) (script-num-value b))
+                       (ScriptOk (context-with-main-stack new-stack ctx))
+                       (ScriptErr SE-VerifyFailed)))))))))))
+
+      ;; OP_NUMNOTEQUAL
+      ((OP-NUMNOTEQUAL)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (if (/= (script-num-value a) (script-num-value b)) 1 0)))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_LESSTHAN
+      ((OP-LESSTHAN)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (if (< (script-num-value b) (script-num-value a)) 1 0)))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_GREATERTHAN
+      ((OP-GREATERTHAN)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (if (> (script-num-value b) (script-num-value a)) 1 0)))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_LESSTHANOREQUAL
+      ((OP-LESSTHANOREQUAL)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (if (<= (script-num-value b) (script-num-value a)) 1 0)))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_GREATERTHANOREQUAL
+      ((OP-GREATERTHANOREQUAL)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (if (>= (script-num-value b) (script-num-value a)) 1 0)))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_MIN
+      ((OP-MIN)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (min (script-num-value a) (script-num-value b))))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_MAX
+      ((OP-MAX)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple a-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple b-bytes new-stack))
+             (match (bytes-to-script-num a-bytes)
+               ((ScriptErr e) (ScriptErr e))
+               ((ScriptOk a)
+                (match (bytes-to-script-num b-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk b)
+                   (let ((result (max (script-num-value a) (script-num-value b))))
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (script-num-to-bytes (ScriptNum result)) new-stack)
+                                ctx))))))))))))
+
+      ;; OP_WITHIN - check if x is in [min, max)
+      ((OP-WITHIN)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple max-bytes stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple min-bytes stack2))
+             (match (stack-pop stack2)
+               ((None) (ScriptErr SE-StackUnderflow))
+               ((Some (Tuple x-bytes new-stack))
+                (match (bytes-to-script-num max-bytes)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk max-val)
+                   (match (bytes-to-script-num min-bytes)
+                     ((ScriptErr e) (ScriptErr e))
+                     ((ScriptOk min-val)
+                      (match (bytes-to-script-num x-bytes)
+                        ((ScriptErr e) (ScriptErr e))
+                        ((ScriptOk x)
+                         (let ((in-range (and (>= (script-num-value x) (script-num-value min-val))
+                                              (< (script-num-value x) (script-num-value max-val)))))
+                           (ScriptOk (context-with-main-stack
+                                      (stack-push (if in-range (true-bytes) (false-bytes)) new-stack)
+                                      ctx))))))))))))))))
+
+      ;; OP_CODESEPARATOR - mark position for CHECKSIG
+      ((OP-CODESEPARATOR)
+       (ScriptOk (context-with-codesep-pos (context-position ctx) ctx)))
+
+      ;; Disabled opcodes
+      ((OP-DISABLED opcode) (ScriptErr SE-DisabledOpcode))
+
+      ;; Unknown opcodes
+      ((OP-UNKNOWN opcode) (ScriptErr SE-UnknownOpcode))
+
+      ;; Push data operations - these are handled by the execution loop
+      ;; because they need to read additional bytes from the script
+      ((OP-PUSHBYTES opcode) (ScriptErr SE-InvalidPushData))
+      ((OP-PUSHDATA1) (ScriptErr SE-InvalidPushData))
+      ((OP-PUSHDATA2) (ScriptErr SE-InvalidPushData))
+      ((OP-PUSHDATA4) (ScriptErr SE-InvalidPushData))
+
+      ;; Flow control - IF/NOTIF/ELSE/ENDIF
+      ((OP-IF)
+       ;; If currently executing, pop and evaluate condition
+       ;; If not executing, push False onto condition stack
+       (if (context-executing ctx)
+           (match (stack-pop (context-main-stack ctx))
+             ((None) (ScriptErr SE-StackUnderflow))
+             ((Some (Tuple top new-stack))
+              (let ((cond-val (cast-to-bool top)))
+                (ScriptOk (push-condition cond-val
+                                          (context-with-main-stack new-stack ctx))))))
+           ;; Not executing - just track nesting
+           (ScriptOk (push-condition False ctx))))
+
+      ((OP-NOTIF)
+       ;; Same as IF but inverted
+       (if (context-executing ctx)
+           (match (stack-pop (context-main-stack ctx))
+             ((None) (ScriptErr SE-StackUnderflow))
+             ((Some (Tuple top new-stack))
+              (let ((cond-val (not (cast-to-bool top))))
+                (ScriptOk (push-condition cond-val
+                                          (context-with-main-stack new-stack ctx))))))
+           ;; Not executing - just track nesting
+           (ScriptOk (push-condition False ctx))))
+
+      ((OP-ELSE)
+       ;; Toggle the current condition
+       (match (toggle-top-condition ctx)
+         ((None) (ScriptErr SE-UnbalancedConditional))
+         ((Some new-ctx) (ScriptOk new-ctx))))
+
+      ((OP-ENDIF)
+       ;; Pop a condition from the stack
+       (match (pop-condition ctx)
+         ((None) (ScriptErr SE-UnbalancedConditional))
+         ((Some new-ctx) (ScriptOk new-ctx))))
+
+      ;; Signature operations - placeholder implementations
+      ((OP-SHA1)
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple data new-stack))
+          ;; SHA1 using Ironclad - convert types properly
+          (let ((hash (lisp (Vector U8) (data)
+                        (cl:let* ((cl-data (cl:coerce data '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                  (result (ironclad:digest-sequence :sha1 cl-data)))
+                          (cl:map 'cl:vector #'cl:identity result)))))
+            (ScriptOk (context-with-main-stack
+                       (stack-push hash new-stack)
+                       ctx))))))
+
+      ((OP-CHECKSIG)
+       ;; Pop pubkey and sig, verify signature using test transaction format
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple pubkey stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple sig new-stack))
+             ;; Call into CL to verify signature using test transaction format
+             ;; Uses verify-checksig-for-script which tracks STRICTENC errors
+             (let ((valid (lisp Boolean (sig pubkey ctx)
+                            (cl:let* ((script (context-script ctx))
+                                      (codesep-pos (context-codesep-pos ctx))
+                                      (subscript (cl:subseq script codesep-pos))
+                                      (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                      (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                      (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
+                              (cl:funcall fn sig-arr pk-arr subscript)))))
+               ;; Check for STRICTENC validation error (bad sighash type or pubkey format)
+               (let ((strictenc-error (lisp Boolean ()
+                                        (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
+                 (if strictenc-error
+                     (ScriptErr SE-VerifyFailed)
+                     (ScriptOk (context-with-main-stack
+                                (stack-push (if valid (true-bytes) (false-bytes)) new-stack)
+                                ctx))))))))))
+
+      ((OP-CHECKSIGVERIFY)
+       ;; CHECKSIG then VERIFY - verify signature and fail if invalid
+       (match (stack-pop (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some (Tuple pubkey stack1))
+          (match (stack-pop stack1)
+            ((None) (ScriptErr SE-StackUnderflow))
+            ((Some (Tuple sig new-stack))
+             ;; Call into CL to verify signature
+             ;; Uses verify-checksig-for-script which tracks STRICTENC errors
+             (let ((valid (lisp Boolean (sig pubkey ctx)
+                            (cl:let* ((script (context-script ctx))
+                                      (codesep-pos (context-codesep-pos ctx))
+                                      (subscript (cl:subseq script codesep-pos))
+                                      (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                      (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                      (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
+                              (cl:funcall fn sig-arr pk-arr subscript)))))
+               ;; Check for STRICTENC validation error
+               (let ((strictenc-error (lisp Boolean ()
+                                        (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
+                 (if strictenc-error
+                     (ScriptErr SE-VerifyFailed)
+                     (if valid
+                         (ScriptOk (context-with-main-stack new-stack ctx))
+                         (ScriptErr SE-VerifyFailed))))))))))
+
+      ((OP-CHECKMULTISIG)
+       ;; Placeholder - complex operation
+       (ScriptErr SE-UnknownOpcode))
+
+      ((OP-CHECKMULTISIGVERIFY)
+       (ScriptErr SE-UnknownOpcode))
+
+      ;; Timelocks and NOP1-10
+      ;; NOP1 and NOP4-10 are true no-ops
+      ((OP-NOP1) (ScriptOk ctx))
+      ((OP-NOP4) (ScriptOk ctx))
+      ((OP-NOP5) (ScriptOk ctx))
+      ((OP-NOP6) (ScriptOk ctx))
+      ((OP-NOP7) (ScriptOk ctx))
+      ((OP-NOP8) (ScriptOk ctx))
+      ((OP-NOP9) (ScriptOk ctx))
+      ((OP-NOP10) (ScriptOk ctx))
+
+      ;; CHECKLOCKTIMEVERIFY (BIP 65)
+      ;; Without transaction context, check if disabled via bit 31
+      ((OP-CHECKLOCKTIMEVERIFY)
+       (match (stack-top (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some top)
+          ;; Check if disabled (bit 31 set means disabled, pass)
+          ;; Script number: if top byte >= 0x80 and length is 5, bit 31 is set
+          (let ((len (lisp UFix (top) (cl:length top))))
+            (if (and (== len 5)
+                     (>= (lisp U8 (top) (cl:aref top 4)) #x80))
+                ;; Disabled flag set - pass
+                (ScriptOk ctx)
+                ;; Not disabled - for now pass without tx context check
+                ;; In production, would verify against nLockTime
+                (ScriptOk ctx))))))
+
+      ;; CHECKSEQUENCEVERIFY (BIP 112) - simplified for now
+      ((OP-CHECKSEQUENCEVERIFY)
+       (match (stack-top (context-main-stack ctx))
+         ((None) (ScriptErr SE-StackUnderflow))
+         ((Some top) (ScriptOk ctx))))))
+
+  ;;; ============================================================
+  ;;; Script Execution
+  ;;; ============================================================
+
+  (declare execute-script ((Vector U8) -> (ScriptResult ScriptStack)))
+  (define (execute-script script)
+    "Execute a script and return the final stack.
+     Returns ScriptErr on failure or ScriptOk with final stack on success."
+    (let ((len (the UFix (coalton-library/vector:length script))))
+      ;; Check script size limit
+      (if (> len +max-script-size+)
+          (ScriptErr SE-ScriptTooLarge)
+          (execute-script-loop (make-script-context script)))))
+
+  (declare execute-script-loop (ScriptContext -> (ScriptResult ScriptStack)))
+  (define (execute-script-loop ctx)
+    "Main execution loop for script processing."
+    (let ((pos (context-position ctx))
+          (script (context-script ctx))
+          (len (the UFix (coalton-library/vector:length script)))
+          (exec (context-executing ctx)))
+      (if (>= pos len)
+          ;; Script finished - check for unbalanced conditionals
+          (match (context-condition-stack ctx)
+            ((Nil) (ScriptOk (context-main-stack ctx)))
+            (_other (ScriptErr SE-UnbalancedConditional)))
+          ;; Read and execute next opcode
+          (match (read-script-byte ctx)
+            ((ScriptErr e) (ScriptErr e))
+            ((ScriptOk (Tuple byte new-ctx))
+             (let ((op (byte-to-opcode byte)))
+               ;; Check op count limit for non-push ops (only when executing)
+               (let ((ctx-with-count
+                       (if (or (is-push-op op) (not exec))
+                           new-ctx
+                           (let ((new-count (+ (context-op-count new-ctx) 1)))
+                             (if (> new-count +max-ops-per-script+)
+                                 new-ctx  ; Will be checked below
+                                 (context-with-op-count new-count new-ctx))))))
+                 ;; Check if we exceeded op count
+                 (if (and exec (> (context-op-count ctx-with-count) +max-ops-per-script+))
+                     (ScriptErr SE-TooManyOps)
+                     ;; Handle push operations specially
+                     (match op
+                       ;; Direct push (1-75 bytes)
+                       ((OP-PUSHBYTES n)
+                        (match (read-script-bytes (lisp UFix (n) n) ctx-with-count)
+                          ((ScriptErr e) (ScriptErr e))
+                          ((ScriptOk (Tuple data next-ctx))
+                           ;; Only push if executing
+                           (if exec
+                               (execute-script-loop (context-push data next-ctx))
+                               (execute-script-loop next-ctx)))))
+
+                       ;; OP_PUSHDATA1 - 1 byte length prefix
+                       ((OP-PUSHDATA1)
+                        (match (read-script-byte ctx-with-count)
+                          ((ScriptErr e) (ScriptErr e))
+                          ((ScriptOk (Tuple len-byte len-ctx))
+                           (match (read-script-bytes (lisp UFix (len-byte) len-byte) len-ctx)
+                             ((ScriptErr e) (ScriptErr e))
+                             ((ScriptOk (Tuple data next-ctx))
+                              (if exec
+                                  (execute-script-loop (context-push data next-ctx))
+                                  (execute-script-loop next-ctx)))))))
+
+                       ;; OP_PUSHDATA2 - 2 byte length prefix (little endian)
+                       ((OP-PUSHDATA2)
+                        (match (read-script-bytes 2 ctx-with-count)
+                          ((ScriptErr e) (ScriptErr e))
+                          ((ScriptOk (Tuple len-bytes len-ctx))
+                           (let ((data-len (lisp UFix (len-bytes)
+                                             (cl:+ (cl:aref len-bytes 0)
+                                                   (cl:ash (cl:aref len-bytes 1) 8)))))
+                             (match (read-script-bytes data-len len-ctx)
+                               ((ScriptErr e) (ScriptErr e))
+                               ((ScriptOk (Tuple data next-ctx))
+                                (if exec
+                                    (execute-script-loop (context-push data next-ctx))
+                                    (execute-script-loop next-ctx))))))))
+
+                       ;; OP_PUSHDATA4 - 4 byte length prefix (little endian)
+                       ((OP-PUSHDATA4)
+                        (match (read-script-bytes 4 ctx-with-count)
+                          ((ScriptErr e) (ScriptErr e))
+                          ((ScriptOk (Tuple len-bytes len-ctx))
+                           (let ((data-len (lisp UFix (len-bytes)
+                                             (cl:+ (cl:aref len-bytes 0)
+                                                   (cl:ash (cl:aref len-bytes 1) 8)
+                                                   (cl:ash (cl:aref len-bytes 2) 16)
+                                                   (cl:ash (cl:aref len-bytes 3) 24)))))
+                             (match (read-script-bytes data-len len-ctx)
+                               ((ScriptErr e) (ScriptErr e))
+                               ((ScriptOk (Tuple data next-ctx))
+                                (if exec
+                                    (execute-script-loop (context-push data next-ctx))
+                                    (execute-script-loop next-ctx))))))))
+
+                       ;; All other opcodes
+                       (_
+                        ;; Execute if: currently executing OR it's a control flow opcode
+                        (if (or exec (is-control-flow-op op))
+                            (match (execute-opcode op ctx-with-count)
+                              ((ScriptErr e) (ScriptErr e))
+                              ((ScriptOk next-ctx)
+                               ;; Check stack size limit
+                               (if (> (stack-depth (context-main-stack next-ctx)) +max-stack-size+)
+                                   (ScriptErr SE-StackOverflow)
+                                   (execute-script-loop next-ctx))))
+                            ;; Not executing and not control flow - skip the opcode
+                            (execute-script-loop ctx-with-count))))))))))))
+
+  ;;; ============================================================
+  ;;; Extended Execution Functions
+  ;;; ============================================================
+
+  (declare execute-script-with-stack ((Vector U8) -> ScriptStack -> (ScriptResult ScriptStack)))
+  (define (execute-script-with-stack script initial-stack)
+    "Execute a script with an initial stack.
+     Used for scriptPubKey execution after scriptSig."
+    (let ((len (the UFix (coalton-library/vector:length script))))
+      (if (> len +max-script-size+)
+          (ScriptErr SE-ScriptTooLarge)
+          (execute-script-loop (make-script-context-with-stack script initial-stack)))))
+
+  (declare make-script-context-with-stack ((Vector U8) -> ScriptStack -> ScriptContext))
+  (define (make-script-context-with-stack script initial-stack)
+    "Create a script context with a pre-populated stack."
+    (ScriptContext initial-stack (empty-stack) script 0 Nil True 0 0))
+
+  ;;; P2SH Support
+
+  (declare is-p2sh-script ((Vector U8) -> Boolean))
+  (define (is-p2sh-script script)
+    "Check if script matches P2SH pattern: OP_HASH160 <20 bytes> OP_EQUAL"
+    (and (== (coalton-library/vector:length script) 23)
+         (== (coalton-library/vector:index-unsafe 0 script) #xa9)   ; OP_HASH160
+         (== (coalton-library/vector:index-unsafe 1 script) #x14)   ; Push 20 bytes
+         (== (coalton-library/vector:index-unsafe 22 script) #x87))) ; OP_EQUAL
+
+  (declare get-p2sh-hash ((Vector U8) -> (Vector U8)))
+  (define (get-p2sh-hash script)
+    "Extract the 20-byte hash from a P2SH scriptPubKey."
+    (lisp (Vector U8) (script)
+      (cl:subseq script 2 22)))
+
+  (declare validate-p2sh (ScriptStack -> (Vector U8) -> (ScriptResult ScriptStack)))
+  (define (validate-p2sh stack script-pubkey)
+    "Validate P2SH: pop redeem script, check hash, execute redeem script."
+    (match (stack-pop stack)
+      ((None) (ScriptErr SE-StackUnderflow))
+      ((Some (Tuple redeem-script remaining-stack))
+       ;; Hash the redeem script
+       (let ((redeem-hash (compute-hash160 redeem-script)))
+         ;; Compare with expected hash in scriptPubKey
+         (let ((expected-hash (get-p2sh-hash script-pubkey)))
+           (if (lisp Boolean (redeem-hash expected-hash)
+                 (cl:equalp (hash160-bytes redeem-hash) expected-hash))
+               ;; Hash matches - execute redeem script with remaining stack
+               (execute-script-with-stack redeem-script remaining-stack)
+               ;; Hash mismatch
+               (ScriptErr SE-VerifyFailed)))))))
+
+  (declare execute-scripts ((Vector U8) -> (Vector U8) -> Boolean -> (ScriptResult ScriptStack)))
+  (define (execute-scripts script-sig script-pubkey p2sh-enabled)
+    "Execute scriptSig then scriptPubKey, with optional P2SH support."
+    ;; First execute scriptSig
+    (match (execute-script script-sig)
+      ((ScriptErr e) (ScriptErr e))
+      ((ScriptOk sig-stack)
+       ;; Then execute scriptPubKey with the resulting stack
+       (match (execute-script-with-stack script-pubkey sig-stack)
+         ((ScriptErr e) (ScriptErr e))
+         ((ScriptOk final-stack)
+          ;; Check if we need to do P2SH
+          (if (and p2sh-enabled (is-p2sh-script script-pubkey))
+              ;; For P2SH, use the stack after scriptSig (before scriptPubKey consumed it)
+              ;; Actually we need the original sig-stack with redeem script on top
+              (validate-p2sh sig-stack script-pubkey)
+              ;; Not P2SH - just return the result
+              (ScriptOk final-stack)))))))
+
+  ;;; ============================================================
+  ;;; Helper functions for CL interop
+  ;;; ============================================================
+
+  (declare script-result-ok-p ((ScriptResult :a) -> Boolean))
+  (define (script-result-ok-p result)
+    "Return True if the result is ScriptOk."
+    (match result
+      ((ScriptOk val) True)
+      ((ScriptErr err) False)))
+
+  (declare script-result-err-p ((ScriptResult :a) -> Boolean))
+  (define (script-result-err-p result)
+    "Return True if the result is ScriptErr."
+    (match result
+      ((ScriptOk val) False)
+      ((ScriptErr err) True)))
+
+  (declare script-result-stack ((ScriptResult ScriptStack) -> (Optional ScriptStack)))
+  (define (script-result-stack result)
+    "Extract the stack from a successful result."
+    (match result
+      ((ScriptOk stack) (Some stack))
+      ((ScriptErr err) None)))
+
+  (declare script-result-error ((ScriptResult :a) -> (Optional ScriptError)))
+  (define (script-result-error result)
+    "Extract the error from a failed result."
+    (match result
+      ((ScriptOk val) None)
+      ((ScriptErr e) (Some e))))
+
+  ;; Direct accessors for CL interop (avoid Optional unwrapping in CL)
+  (declare get-ok-stack ((ScriptResult ScriptStack) -> ScriptStack))
+  (define (get-ok-stack result)
+    "Get stack from ScriptOk, or empty-stack if error. For CL interop."
+    (match result
+      ((ScriptOk stack) stack)
+      ((ScriptErr err) (empty-stack))))
+
+) ; end coalton-toplevel
