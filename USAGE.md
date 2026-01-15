@@ -9,6 +9,7 @@ A Bitcoin full node implementation in Common Lisp (SBCL).
 1. **SBCL** (Steel Bank Common Lisp) installed
 2. **Quicklisp** for package management
 3. **libsecp256k1** system library for ECDSA operations
+4. **Coalton** (included as git submodule) for static type support
 
 ```bash
 # On macOS
@@ -17,6 +18,11 @@ brew install secp256k1
 
 # On Ubuntu/Debian (see detailed instructions below)
 sudo apt-get install sbcl libsecp256k1-dev
+
+# Clone with submodules to get Coalton
+git clone --recurse-submodules <repository-url>
+# Or if already cloned:
+git submodule update --init --recursive
 ```
 
 ## Ubuntu/Linux Setup
@@ -463,6 +469,75 @@ Or register it manually in SBCL:
 │  │  (SHA256, RIPEMD, secp256k1)│                       │
 │  └─────────────────────────────┘                       │
 └────────────────────────────────────────────────────────┘
+```
+
+## Coalton Static Types
+
+Bitcoin-lisp uses [Coalton](https://github.com/coalton-lang/coalton) to provide compile-time type safety for consensus-critical code. This catches type errors at compile time rather than runtime.
+
+### Type-Safe Bitcoin Types
+
+The following domain-specific types prevent common errors:
+
+| Type | Description | Prevents |
+|------|-------------|----------|
+| `Hash256` | 32-byte double-SHA256 hash | Mixing hash sizes |
+| `Hash160` | 20-byte RIPEMD160(SHA256) hash | Using wrong hash for addresses |
+| `Satoshi` | Bitcoin amount in satoshis | Confusing amounts with other integers |
+| `BlockHeight` | Block height in chain | Confusing heights with other values |
+
+### Using Typed Functions
+
+```lisp
+;; In Coalton code, hash functions return typed values
+(coalton-toplevel
+  (in-package #:bitcoin-lisp.coalton.crypto)
+
+  ;; sha256 returns Hash256, not raw bytes
+  (let ((hash (sha256 my-data)))
+    ;; This would be a compile error:
+    ;; (some-function-expecting-hash160 hash)
+    hash))
+```
+
+### Protocol Structure Types
+
+Bitcoin protocol structures are defined as algebraic data types:
+
+```lisp
+;; Transaction structure with typed fields
+(define-type Transaction
+  (Transaction IFix32           ; version
+               (List TxIn)      ; inputs
+               (List TxOut)     ; outputs
+               UFix32))         ; lock-time
+
+;; Pattern matching ensures exhaustive handling
+(match tx
+  ((Transaction version inputs outputs lock-time)
+   ...))
+```
+
+### CL Interoperability
+
+The typed Coalton code interoperates with existing Common Lisp code:
+
+```lisp
+;; Call Coalton functions from CL
+(coalton (bitcoin-lisp.coalton.crypto:hash256 my-bytes))
+
+;; Convert between CL structs and Coalton types
+(coalton (bitcoin-lisp.coalton.serialization:transaction-from-cl cl-tx))
+```
+
+### Running Coalton Tests
+
+```lisp
+;; Load and run all tests including Coalton tests
+(asdf:test-system "bitcoin-lisp")
+
+;; Coalton tests are part of the main test suite
+(bitcoin-lisp.tests:run-tests)
 ```
 
 ## License

@@ -1,3 +1,6 @@
 [submodule "bitcoin"]
 	path = bitcoin
 	url = https://github.com/bitcoin/bitcoin.git
+[submodule "coalton"]
+	path = coalton
+	url = https://github.com/coalton-lang/coalton.git
