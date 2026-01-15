@@ -203,7 +203,8 @@
           (bitcoin-lisp.validation:validate-transaction-contextual tx utxo-set 100)
         (is (eq t valid))
         (is (null error))
-        (is (= 1000000 fee))))))  ; 10M - 9M = 1M fee
+        ;; Fee is now a Satoshi type - unwrap to compare
+        (is (= 1000000 (bitcoin-lisp.coalton.interop:unwrap-satoshi fee)))))))  ; 10M - 9M = 1M fee
 
 (test transaction-insufficient-funds
   "Transaction with outputs exceeding inputs should fail."
