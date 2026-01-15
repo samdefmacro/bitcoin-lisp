@@ -38,7 +38,10 @@
   (run! :crypto-tests)
   (run! :serialization-tests)
   (run! :storage-tests)
-  (run! :validation-tests))
+  (run! :validation-tests)
+  ;; Coalton tests are run as part of coalton-tests suite
+  ;; which is a child of bitcoin-lisp-tests
+  )
 
 (defun run-integration-tests ()
   "Run integration tests only (requires network)."

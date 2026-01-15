@@ -3,14 +3,27 @@
 ;;; Transaction Validation
 ;;;
 ;;; This module validates Bitcoin transactions according to consensus rules.
+;;; Uses Coalton Satoshi type for amount calculations to ensure type safety.
+
+;;;; Imports for typed operations
+(defun wrap-satoshi (v) (bitcoin-lisp.coalton.interop:wrap-satoshi v))
+(defun unwrap-satoshi (s) (bitcoin-lisp.coalton.interop:unwrap-satoshi s))
+(defun satoshi+ (a b) (bitcoin-lisp.coalton.interop:satoshi+ a b))
+(defun satoshi> (a b) (bitcoin-lisp.coalton.interop:satoshi> a b))
 
 ;;;; Constants
-
 (defconstant +max-money+ 2100000000000000)  ; 21 million BTC in satoshis
 (defconstant +coin+ 100000000)               ; 1 BTC in satoshis
 (defconstant +max-block-size+ 1000000)       ; 1 MB
 (defconstant +max-tx-size+ 100000)           ; Max transaction size
 (defconstant +coinbase-maturity+ 100)        ; Blocks before coinbase spendable
+
+;; Typed constant for max money
+(defvar *max-money-satoshi* nil)
+(defun max-money-satoshi ()
+  "Return +max-money+ as a Satoshi type (lazy initialization)."
+  (or *max-money-satoshi*
+      (setf *max-money-satoshi* (wrap-satoshi +max-money+))))
 
 ;;;; Structure validation (context-free)
 
@@ -41,8 +54,8 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
               (values nil :duplicate-inputs)))
           (setf (gethash key seen-outpoints) t))))
 
-    ;; Validate outputs
-    (let ((total-output 0))
+    ;; Validate outputs using typed Satoshi arithmetic
+    (let ((total-output (wrap-satoshi 0)))
       (dolist (output outputs)
         (let ((value (bitcoin-lisp.serialization:tx-out-value output)))
           ;; Output value must be non-negative
@@ -53,9 +66,10 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
           (when (> value +max-money+)
             (return-from validate-transaction-structure
               (values nil :output-too-large)))
-          (incf total-output value)))
+          ;; Use typed addition
+          (setf total-output (satoshi+ total-output (wrap-satoshi value)))))
       ;; Total output must not exceed max money
-      (when (> total-output +max-money+)
+      (when (satoshi> total-output (max-money-satoshi))
         (return-from validate-transaction-structure
           (values nil :total-output-too-large))))
 
@@ -71,11 +85,12 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
 (defun validate-transaction-contextual (tx utxo-set current-height &key is-coinbase)
   "Validate a transaction in the context of the current UTXO set.
-Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure."
+Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure.
+FEE is returned as a Satoshi type."
   (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
-        (total-input 0)
-        (total-output 0))
+        (total-input (wrap-satoshi 0))
+        (total-output (wrap-satoshi 0)))
 
     ;; Skip input validation for coinbase
     (unless is-coinbase
@@ -98,19 +113,25 @@ Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure
                 (return-from validate-transaction-contextual
                   (values nil :coinbase-not-mature nil)))))
 
-          (incf total-input (bitcoin-lisp.storage:utxo-entry-value utxo)))))
+          ;; Use typed addition for input sum
+          (setf total-input
+                (satoshi+ total-input
+                          (wrap-satoshi (bitcoin-lisp.storage:utxo-entry-value utxo)))))))
 
-    ;; Sum outputs
+    ;; Sum outputs with typed addition
     (dolist (output outputs)
-      (incf total-output (bitcoin-lisp.serialization:tx-out-value output)))
+      (setf total-output
+            (satoshi+ total-output
+                      (wrap-satoshi (bitcoin-lisp.serialization:tx-out-value output)))))
 
     ;; For non-coinbase, inputs must cover outputs
     (unless is-coinbase
-      (when (> total-output total-input)
+      (when (satoshi> total-output total-input)
         (return-from validate-transaction-contextual
           (values nil :insufficient-funds nil))))
 
-    (values t nil (- total-input total-output))))
+    ;; Return fee as Satoshi type
+    (values t nil (bitcoin-lisp.coalton.interop:satoshi- total-input total-output))))
 
 ;;;; Script validation
 

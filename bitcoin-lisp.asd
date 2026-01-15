@@ -1,3 +1,12 @@
+;;; Ensure local coalton submodule is found by ASDF
+;;; Use *load-pathname* since system isn't defined yet
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (let* ((this-file (or *compile-file-pathname* *load-pathname*))
+         (coalton-path (when this-file
+                         (merge-pathnames "coalton/" (make-pathname :directory (pathname-directory this-file))))))
+    (when (and coalton-path (probe-file coalton-path))
+      (pushnew coalton-path asdf:*central-registry* :test #'equal))))
+
 (defsystem "bitcoin-lisp"
   :version "0.1.0"
   :author "samdefmacro"
@@ -8,11 +17,19 @@
                "usocket"
                "flexi-streams"
                "alexandria"
-               "bordeaux-threads")
+               "bordeaux-threads"
+               "coalton")
   :serial t
   :components ((:module "src"
                 :components
                 ((:file "package")
+                 (:module "coalton"
+                  :components ((:file "package")
+                               (:file "types")
+                               (:file "crypto")
+                               (:file "binary")
+                               (:file "serialization")
+                               (:file "interop")))
                  (:module "crypto"
                   :components ((:file "hash")
                                (:file "secp256k1")))
@@ -44,6 +61,12 @@
                              (:file "serialization-tests")
                              (:file "storage-tests")
                              (:file "validation-tests")
-                             (:file "integration-tests"))))
+                             (:file "integration-tests")
+                             ;; Coalton tests
+                             (:file "coalton-package")
+                             (:file "coalton-types-tests")
+                             (:file "coalton-crypto-tests")
+                             (:file "coalton-serialization-tests")
+                             (:file "coalton-binary-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

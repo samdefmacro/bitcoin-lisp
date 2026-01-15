@@ -3,6 +3,11 @@
 ;;; Block Validation
 ;;;
 ;;; This module validates Bitcoin blocks according to consensus rules.
+;;; Uses Coalton types for amounts (Satoshi) and heights (BlockHeight).
+
+;;;; Imports for typed operations (reuse from transaction.lisp, add BlockHeight)
+(defun wrap-block-height (h) (bitcoin-lisp.coalton.interop:wrap-block-height h))
+(defun unwrap-block-height (bh) (bitcoin-lisp.coalton.interop:unwrap-block-height bh))
 
 ;;;; Constants
 
@@ -114,8 +119,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
         (return-from validate-block
           (values nil :bad-merkle-root nil))))
 
-    ;; Validate each transaction and collect fees
-    (let ((total-fees 0))
+    ;; Validate each transaction and collect fees (using Satoshi type)
+    (let ((total-fees (wrap-satoshi 0)))
       ;; Validate coinbase structure (skip input validation)
       (multiple-value-bind (valid error)
           (validate-transaction-structure (first transactions))
@@ -132,7 +137,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                    (validate-transaction-contextual tx utxo-set current-height)
                  (unless valid
                    (return-from validate-block (values nil error nil)))
-                 (incf total-fees fee)))
+                 ;; fee is now a Satoshi type, use typed addition
+                 (setf total-fees (satoshi+ total-fees fee))))
 
       ;; Validate coinbase value
       (let* ((coinbase-tx (first transactions))
@@ -140,11 +146,13 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
                        :key #'bitcoin-lisp.serialization:tx-out-value))
              (block-subsidy (calculate-block-subsidy current-height))
-             (max-coinbase-value (+ block-subsidy total-fees)))
+             ;; Convert total-fees to integer for comparison
+             (max-coinbase-value (+ block-subsidy (unwrap-satoshi total-fees))))
         (when (> coinbase-output-total max-coinbase-value)
           (return-from validate-block
             (values nil :coinbase-too-large nil))))
 
+      ;; Return total-fees as Satoshi type
       (values t nil total-fees))))
 
 ;;;; Helper functions
