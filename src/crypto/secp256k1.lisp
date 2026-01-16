@@ -101,45 +101,158 @@ Returns an internal public key structure, or NIL if invalid."
   "Check if PUBKEY-BYTES represents a valid secp256k1 public key."
   (not (null (parse-public-key pubkey-bytes))))
 
+;;; Lax DER signature parsing
+;;;
+;;; Bitcoin's pre-DERSIG signatures could have various encoding issues:
+;;; - Extra padding bytes in R or S
+;;; - Missing leading zeros for negative numbers
+;;; - Wrong length indicators
+;;;
+;;; This lax parser extracts R and S values tolerantly and re-encodes them.
+
+(defun parse-der-integer-lax (bytes pos)
+  "Parse an integer from DER-ish encoding, starting at POS.
+   Returns (values integer new-pos) or (values nil nil) on error.
+   Tolerates extra padding and missing sign bytes."
+  (when (>= pos (length bytes))
+    (return-from parse-der-integer-lax (values nil nil)))
+  ;; Expect 0x02 (INTEGER tag)
+  (unless (= (aref bytes pos) #x02)
+    (return-from parse-der-integer-lax (values nil nil)))
+  (incf pos)
+  (when (>= pos (length bytes))
+    (return-from parse-der-integer-lax (values nil nil)))
+  ;; Get length
+  (let ((len (aref bytes pos)))
+    (incf pos)
+    (when (or (zerop len) (> (+ pos len) (length bytes)))
+      (return-from parse-der-integer-lax (values nil nil)))
+    ;; Extract bytes, stripping leading zeros (but keep at least 1 byte)
+    (let ((start pos)
+          (end (+ pos len)))
+      ;; Skip leading zeros (except the last byte)
+      (loop while (and (< start (1- end))
+                       (zerop (aref bytes start))
+                       ;; But keep a zero if next byte has high bit set
+                       (zerop (logand (aref bytes (1+ start)) #x80)))
+            do (incf start))
+      ;; Convert to integer
+      (let ((result 0))
+        (loop for i from start below end
+              do (setf result (logior (ash result 8) (aref bytes i))))
+        (values result end)))))
+
+(defun integer-to-bytes-be (n byte-count)
+  "Convert integer N to big-endian byte array of BYTE-COUNT bytes."
+  (let ((result (make-array byte-count :element-type '(unsigned-byte 8) :initial-element 0)))
+    (loop for i from (1- byte-count) downto 0
+          for shift from 0 by 8
+          do (setf (aref result i) (logand (ash n (- shift)) #xff)))
+    result))
+
+(defun normalize-signature-lax (der-sig)
+  "Parse a lax DER signature and return a 64-byte compact signature (r||s).
+   Returns NIL if parsing fails."
+  (when (< (length der-sig) 8)
+    (return-from normalize-signature-lax nil))
+  ;; Expect SEQUENCE tag
+  (unless (= (aref der-sig 0) #x30)
+    (return-from normalize-signature-lax nil))
+  ;; Get sequence length (may not match actual content in lax mode)
+  (let ((pos 2))  ; Skip tag and length
+    ;; Handle extended length encoding
+    (when (> (aref der-sig 1) #x80)
+      (let ((len-bytes (logand (aref der-sig 1) #x7f)))
+        (setf pos (+ 2 len-bytes))))
+    ;; Parse R
+    (multiple-value-bind (r new-pos)
+        (parse-der-integer-lax der-sig pos)
+      (unless r
+        (return-from normalize-signature-lax nil))
+      ;; Parse S
+      (multiple-value-bind (s final-pos)
+          (parse-der-integer-lax der-sig new-pos)
+        (declare (ignore final-pos))
+        (unless s
+          (return-from normalize-signature-lax nil))
+        ;; Convert R and S to 32-byte big-endian
+        (let ((r-bytes (integer-to-bytes-be r 32))
+              (s-bytes (integer-to-bytes-be s 32)))
+          ;; Concatenate for 64-byte compact format
+          (let ((result (make-array 64 :element-type '(unsigned-byte 8))))
+            (loop for i from 0 below 32
+                  do (setf (aref result i) (aref r-bytes i))
+                  do (setf (aref result (+ i 32)) (aref s-bytes i)))
+            result))))))
+
+;;; Compact signature parsing (for secp256k1)
+
+(cffi:defcfun ("secp256k1_ecdsa_signature_parse_compact" secp256k1-ecdsa-signature-parse-compact) :int
+  (ctx :pointer)
+  (sig :pointer)
+  (input64 :pointer))
+
 ;;; Signature verification
 
-(defun verify-signature (message-hash signature pubkey-bytes)
+(defun verify-signature (message-hash signature pubkey-bytes &key strict)
   "Verify an ECDSA signature.
 MESSAGE-HASH: 32-byte hash of the message
 SIGNATURE: DER-encoded signature bytes
 PUBKEY-BYTES: 33 or 65 byte public key
-Returns T if valid, NIL otherwise."
+STRICT: if T, use strict DER parsing (for DERSIG flag); otherwise use lax parsing
+Returns (values result parse-ok) where:
+  - result is T if valid, NIL if verification failed
+  - parse-ok is T if signature parsed successfully, NIL if DER parsing failed
+When strict=T and DER parsing fails, returns (values nil nil).
+When strict=NIL, parse-ok is always T (lax mode never fails on format)."
   (ensure-secp256k1-loaded)
   (unless (= (length message-hash) 32)
-    (return-from verify-signature nil))
+    (return-from verify-signature (values nil t)))  ; parse ok, verification failed
   (let ((parsed-pubkey (parse-public-key pubkey-bytes)))
     (unless parsed-pubkey
-      (return-from verify-signature nil))
+      (return-from verify-signature (values nil t)))  ; parse ok, verification failed
     (cffi:with-foreign-objects ((sig :uint8 +secp256k1-signature-size+)
                                  (msghash :uint8 32)
                                  (pubkey :uint8 +secp256k1-pubkey-size+)
-                                 (der-sig :uint8 (length signature)))
+                                 (sig-input :uint8 (max 64 (length signature))))
       ;; Copy message hash
       (loop for i from 0 below 32
             do (setf (cffi:mem-aref msghash :uint8 i) (aref message-hash i)))
       ;; Copy parsed pubkey
       (loop for i from 0 below +secp256k1-pubkey-size+
             do (setf (cffi:mem-aref pubkey :uint8 i) (aref parsed-pubkey i)))
-      ;; Copy DER signature
-      (loop for i from 0 below (length signature)
-            do (setf (cffi:mem-aref der-sig :uint8 i) (aref signature i)))
-      ;; Parse DER signature
-      (let ((parse-result (secp256k1-ecdsa-signature-parse-der
+
+      ;; Parse signature
+      (let ((parse-result
+              (if strict
+                  ;; Strict DER parsing
+                  (progn
+                    (loop for i from 0 below (length signature)
+                          do (setf (cffi:mem-aref sig-input :uint8 i) (aref signature i)))
+                    (secp256k1-ecdsa-signature-parse-der
+                     *secp256k1-context*
+                     sig
+                     sig-input
+                     (length signature)))
+                  ;; Lax parsing - normalize then use compact format
+                  (let ((compact (normalize-signature-lax signature)))
+                    (if compact
+                        (progn
+                          (loop for i from 0 below 64
+                                do (setf (cffi:mem-aref sig-input :uint8 i) (aref compact i)))
+                          (secp256k1-ecdsa-signature-parse-compact
                            *secp256k1-context*
                            sig
-                           der-sig
-                           (length signature))))
+                           sig-input))
+                        0)))))  ; Return 0 (failure) if lax parse failed
         (unless (= parse-result 1)
-          (return-from verify-signature nil))
+          ;; Signature parsing failed
+          ;; In strict mode, report DER parse failure; in lax mode, just verification failure
+          (return-from verify-signature (values nil (not strict))))
         ;; Verify
         (let ((verify-result (secp256k1-ecdsa-verify
                               *secp256k1-context*
                               sig
                               msghash
                               pubkey)))
-          (= verify-result 1))))))
+          (values (= verify-result 1) t))))))

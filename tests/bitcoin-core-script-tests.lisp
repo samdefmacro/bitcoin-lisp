@@ -337,7 +337,8 @@
 
 (defun run-script-test (script-sig-asm script-pubkey-asm flags)
   "Run a script test and return (values success-p error-or-nil).
-   Executes scriptSig, then scriptPubKey on the resulting stack."
+   Executes scriptSig, then scriptPubKey on the resulting stack.
+   Success requires: no errors AND non-empty stack AND top is truthy."
   (handler-case
       (let* ((sig-bytes (assemble-script script-sig-asm))
              (pubkey-bytes (assemble-script script-pubkey-asm))
@@ -350,11 +351,11 @@
                 (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
                  sig-bytes pubkey-bytes p2sh-enabled)
               (if success
-                  ;; Check if stack has items
-                  (let ((depth (bitcoin-lisp.coalton.script:stack-depth stack-or-error)))
-                    (if (> depth 0)
-                        (values t nil)
-                        (values t nil)))  ; Empty stack is ok after VERIFY
+                  ;; Script executed without error - now check the result
+                  ;; Bitcoin requires: stack non-empty AND top element is truthy
+                  (if (bitcoin-lisp.coalton.interop:stack-top-truthy-p stack-or-error)
+                      (values t nil)
+                      (values nil :eval-false))
                   (values nil stack-or-error)))
           ;; Clear flags after test
           (bitcoin-lisp.coalton.interop:set-script-flags nil)))
@@ -392,9 +393,9 @@
          (failed-cleanstack 0)
          (failed-minimaldata 0)
          (failed-other 0)
-         (skipped-checksig 0)
          (skipped-witness 0)
-         (errors '()))
+         (errors '())
+         (minimaldata-errors '()))
 
     (loop for test in all-tests
           for i from 0
@@ -408,11 +409,7 @@
                        ((or witness (flags-include-p flags "WITNESS"))
                         (incf skipped-witness))
 
-                       ;; Skip CHECKMULTISIG tests (not implemented yet)
-                       ;; CHECKSIG is now implemented and will be tested
-                       ((or (search "CHECKMULTISIG" pubkey)
-                            (search "CHECKMULTISIG" sig))
-                        (incf skipped-checksig))
+                       ;; CHECKSIG and CHECKMULTISIG are now implemented and will be tested
 
                        (t
                         (multiple-value-bind (success err)
@@ -427,7 +424,15 @@
                                   ((flags-include-p flags "CLEANSTACK")
                                    (incf failed-cleanstack))
                                   ((flags-include-p flags "MINIMALDATA")
-                                   (incf failed-minimaldata))
+                                   (incf failed-minimaldata)
+                                   (push (list :index i
+                                               :sig sig
+                                               :pubkey pubkey
+                                               :flags flags
+                                               :expected expected
+                                               :got (if success "OK" err)
+                                               :comment comment)
+                                         minimaldata-errors))
                                   (t
                                    (incf failed-other)
                                    (push (list :index i
@@ -454,7 +459,6 @@
       (format t "  Failed (CLEANSTACK): ~D~%" failed-cleanstack)
       (format t "  Failed (MINIMALDATA): ~D~%" failed-minimaldata)
       (format t "  Failed (Other):      ~D~%" failed-other)
-      (format t "  Skipped (CHECKSIG):  ~D~%" skipped-checksig)
       (format t "  Skipped (WITNESS):   ~D~%" skipped-witness)
       (format t "  Total run: ~D~%" (+ passed total-failed))
       (format t "  Pass rate (excl. P2SH/CLEANSTACK/MINIMALDATA): ~,1F%~%"
@@ -462,9 +466,14 @@
                   0.0
                   (* 100.0 (/ passed (+ passed failed-other)))))
 
+      (when minimaldata-errors
+        (format t "~%MINIMALDATA failures (first 10):~%")
+        (loop for err in (subseq minimaldata-errors 0 (min 10 (length minimaldata-errors)))
+              do (format t "  ~A~%" err)))
+
       (when errors
-        (format t "~%Other failures (first 10):~%")
-        (loop for err in (subseq errors 0 (min 10 (length errors)))
+        (format t "~%Other failures (all ~D):~%" (length errors))
+        (loop for err in errors
               do (format t "  ~A~%" err)))
 
       ;; Pass if "other" failures are zero or very low

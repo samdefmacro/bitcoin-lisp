@@ -29,6 +29,7 @@
                                (:file "crypto")
                                (:file "binary")
                                (:file "serialization")
+                               (:file "script")
                                (:file "interop")))
                  (:module "crypto"
                   :components ((:file "hash")
@@ -54,7 +55,8 @@
 
 (defsystem "bitcoin-lisp/tests"
   :depends-on ("bitcoin-lisp"
-               "fiveam")
+               "fiveam"
+               "yason")
   :components ((:module "tests"
                 :components ((:file "package")
                              (:file "crypto-tests")
@@ -67,6 +69,9 @@
                              (:file "coalton-types-tests")
                              (:file "coalton-crypto-tests")
                              (:file "coalton-serialization-tests")
-                             (:file "coalton-binary-tests"))))
+                             (:file "coalton-binary-tests")
+                             (:file "coalton-script-tests")
+                             ;; Bitcoin Core compatibility tests
+                             (:file "bitcoin-core-script-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

@@ -50,7 +50,8 @@
     SE-TooManyOps              ; More than 201 non-push operations
     SE-InvalidStackOperation   ; Invalid stack operation (e.g., bad index)
     SE-UnbalancedConditional   ; Unbalanced IF/ELSE/ENDIF
-    SE-InvalidPushData)        ; Invalid push data size
+    SE-InvalidPushData         ; Invalid push data size
+    SE-MinimalData)            ; Non-minimal data encoding (MINIMALDATA flag)
 
   ;;;; ScriptResult - Result type for script operations
 
@@ -468,11 +469,19 @@
   (declare bytes-to-script-num ((Vector U8) -> (ScriptResult ScriptNum)))
   (define (bytes-to-script-num bytes)
     "Convert script bytes to a ScriptNum.
-     Uses little-endian encoding with sign bit in MSB."
+     Uses little-endian encoding with sign bit in MSB.
+     When MINIMALDATA flag is enabled, validates minimal encoding."
     (let ((len (the UFix (coalton-library/vector:length bytes))))
       (if (== len 0)
           (ScriptOk (ScriptNum 0))
           (lisp (ScriptResult ScriptNum) (bytes len)
+            ;; Check MINIMALDATA validation if flag is enabled
+            (cl:let* ((flag-fn (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP")))
+                      (minimal-fn (cl:fdefinition (cl:intern "MINIMAL-NUMBER-ENCODING-P" "BITCOIN-LISP.COALTON.INTEROP"))))
+              (cl:when (cl:and (cl:funcall flag-fn "MINIMALDATA")
+                               (cl:not (cl:funcall minimal-fn bytes)))
+                (cl:return-from bytes-to-script-num (ScriptErr SE-MinimalData))))
+            ;; Convert to number
             (cl:let* ((negative (cl:logbitp 7 (cl:aref bytes (cl:1- len))))
                       (abs-value
                         (cl:loop :for i :from 0 :below len
@@ -549,6 +558,19 @@
                             (cl:not (cl:logbitp 7 second-last)))
                     (ScriptErr SE-InvalidNumber)
                     (ScriptOk Unit))))))))
+
+  (declare check-minimal-push (U8 -> (Vector U8) -> (ScriptResult Unit)))
+  (define (check-minimal-push opcode data)
+    "Check if a push operation uses minimal encoding.
+     Returns ScriptErr SE-MinimalData if MINIMALDATA flag is enabled and push is non-minimal.
+     OPCODE is the push opcode byte."
+    (lisp (ScriptResult Unit) (opcode data)
+      (cl:let* ((flag-fn (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP")))
+                (minimal-fn (cl:fdefinition (cl:intern "MINIMAL-PUSH-ENCODING-P" "BITCOIN-LISP.COALTON.INTEROP"))))
+        (cl:if (cl:and (cl:funcall flag-fn "MINIMALDATA")
+                       (cl:not (cl:funcall minimal-fn opcode (cl:length data) data)))
+               (ScriptErr SE-MinimalData)
+               (ScriptOk Unit)))))
 
   ;;; ============================================================
   ;;; Stack Operations
@@ -1653,11 +1675,67 @@
                          (ScriptErr SE-VerifyFailed))))))))))
 
       ((OP-CHECKMULTISIG)
-       ;; Placeholder - complex operation
-       (ScriptErr SE-UnknownOpcode))
+       ;; m-of-n multisig verification
+       ;; Stack: ... dummy sig1..sigM M pubkey1..pubkeyN N
+       ;; Pops all, pushes true/false
+       (let ((result (lisp (Tuple UFix ScriptStack) (ctx)
+                       (cl:let* ((stack (context-main-stack ctx))
+                                 (script (context-script ctx))
+                                 (codesep-pos (context-codesep-pos ctx))
+                                 (subscript (cl:subseq script codesep-pos))
+                                 (fn (cl:fdefinition (cl:intern "DO-CHECKMULTISIG-STACK-OP" "BITCOIN-LISP.COALTON.INTEROP"))))
+                         (cl:multiple-value-bind (status new-stack)
+                             (cl:funcall fn stack subscript)
+                           (cl:case status
+                             (:ok (Tuple 0 new-stack))        ; success
+                             (:fail (Tuple 1 new-stack))      ; verify failed, push false
+                             (:error (Tuple 2 stack))         ; STRICTENC/NULLDUMMY error
+                             (:underflow (Tuple 3 stack))     ; stack underflow
+                             (:pubkey-count (Tuple 4 stack))  ; invalid pubkey count
+                             (:sig-count (Tuple 5 stack))     ; invalid sig count
+                             (cl:otherwise (Tuple 6 stack)))))))) ; unknown error
+         (match result
+           ((Tuple 0 new-stack)
+            (ScriptOk (context-with-main-stack new-stack ctx)))
+           ((Tuple 1 new-stack)
+            (ScriptOk (context-with-main-stack new-stack ctx)))
+           ((Tuple 2 _) (ScriptErr SE-VerifyFailed))
+           ((Tuple 3 _) (ScriptErr SE-StackUnderflow))
+           ((Tuple 4 _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
+           ((Tuple 5 _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
+           (_ (ScriptErr SE-UnknownOpcode)))))
 
       ((OP-CHECKMULTISIGVERIFY)
-       (ScriptErr SE-UnknownOpcode))
+       ;; CHECKMULTISIG then VERIFY - fail if result is false
+       (let ((result (lisp (Tuple UFix ScriptStack) (ctx)
+                       (cl:let* ((stack (context-main-stack ctx))
+                                 (script (context-script ctx))
+                                 (codesep-pos (context-codesep-pos ctx))
+                                 (subscript (cl:subseq script codesep-pos))
+                                 (fn (cl:fdefinition (cl:intern "DO-CHECKMULTISIG-STACK-OP" "BITCOIN-LISP.COALTON.INTEROP"))))
+                         (cl:multiple-value-bind (status new-stack)
+                             (cl:funcall fn stack subscript)
+                           (cl:case status
+                             (:ok (Tuple 0 new-stack))
+                             (:fail (Tuple 1 new-stack))
+                             (:error (Tuple 2 stack))
+                             (:underflow (Tuple 3 stack))
+                             (:pubkey-count (Tuple 4 stack))
+                             (:sig-count (Tuple 5 stack))
+                             (cl:otherwise (Tuple 6 stack))))))))
+         (match result
+           ((Tuple 0 new-stack)
+            ;; Success - pop the true value that was pushed and continue
+            (match (stack-pop new-stack)
+              ((None) (ScriptErr SE-StackUnderflow))
+              ((Some (Tuple _ final-stack))
+               (ScriptOk (context-with-main-stack final-stack ctx)))))
+           ((Tuple 1 _) (ScriptErr SE-VerifyFailed))  ; multisig failed
+           ((Tuple 2 _) (ScriptErr SE-VerifyFailed))  ; STRICTENC/NULLDUMMY error
+           ((Tuple 3 _) (ScriptErr SE-StackUnderflow))
+           ((Tuple 4 _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
+           ((Tuple 5 _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
+           (_ (ScriptErr SE-UnknownOpcode)))))
 
       ;; Timelocks and NOP1-10
       ;; NOP1 and NOP4-10 are true no-ops
@@ -1691,7 +1769,11 @@
       ((OP-CHECKSEQUENCEVERIFY)
        (match (stack-top (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
-         ((Some top) (ScriptOk ctx))))))
+         ((Some top)
+          ;; MINIMALDATA: validate that stack top is minimally encoded
+          (match (bytes-to-script-num top)
+            ((ScriptErr e) (ScriptErr e))  ; MINIMALDATA fails here
+            ((ScriptOk _) (ScriptOk ctx))))))))
 
   ;;; ============================================================
   ;;; Script Execution
@@ -1744,7 +1826,11 @@
                           ((ScriptOk (Tuple data next-ctx))
                            ;; Only push if executing
                            (if exec
-                               (execute-script-loop (context-push data next-ctx))
+                               ;; MINIMALDATA: check if push encoding is minimal
+                               (match (check-minimal-push n data)
+                                 ((ScriptErr e) (ScriptErr e))
+                                 ((ScriptOk _)
+                                  (execute-script-loop (context-push data next-ctx))))
                                (execute-script-loop next-ctx)))))
 
                        ;; OP_PUSHDATA1 - 1 byte length prefix
@@ -1756,7 +1842,11 @@
                              ((ScriptErr e) (ScriptErr e))
                              ((ScriptOk (Tuple data next-ctx))
                               (if exec
-                                  (execute-script-loop (context-push data next-ctx))
+                                  ;; MINIMALDATA: check if PUSHDATA1 encoding is minimal
+                                  (match (check-minimal-push #x4c data)
+                                    ((ScriptErr e) (ScriptErr e))
+                                    ((ScriptOk _)
+                                     (execute-script-loop (context-push data next-ctx))))
                                   (execute-script-loop next-ctx)))))))
 
                        ;; OP_PUSHDATA2 - 2 byte length prefix (little endian)
@@ -1771,7 +1861,11 @@
                                ((ScriptErr e) (ScriptErr e))
                                ((ScriptOk (Tuple data next-ctx))
                                 (if exec
-                                    (execute-script-loop (context-push data next-ctx))
+                                    ;; MINIMALDATA: check if PUSHDATA2 encoding is minimal
+                                    (match (check-minimal-push #x4d data)
+                                      ((ScriptErr e) (ScriptErr e))
+                                      ((ScriptOk _)
+                                       (execute-script-loop (context-push data next-ctx))))
                                     (execute-script-loop next-ctx))))))))
 
                        ;; OP_PUSHDATA4 - 4 byte length prefix (little endian)
@@ -1788,7 +1882,11 @@
                                ((ScriptErr e) (ScriptErr e))
                                ((ScriptOk (Tuple data next-ctx))
                                 (if exec
-                                    (execute-script-loop (context-push data next-ctx))
+                                    ;; MINIMALDATA: check if PUSHDATA4 encoding is minimal
+                                    (match (check-minimal-push #x4e data)
+                                      ((ScriptErr e) (ScriptErr e))
+                                      ((ScriptOk _)
+                                       (execute-script-loop (context-push data next-ctx))))
                                     (execute-script-loop next-ctx))))))))
 
                        ;; All other opcodes
