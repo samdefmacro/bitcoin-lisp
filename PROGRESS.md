@@ -1,18 +1,16 @@
 # Bitcoin-Lisp Script Interpreter Progress
 
-*Last updated: 2026-01-15*
+*Last updated: 2026-01-16*
 
 ## Current Status
 
-**Test Results:** 847 passed / 1079 total run
+**Test Results:** 1042 passed / 1190 total run (88% pass rate)
 
 | Category | Count |
 |----------|-------|
-| Passed | 847 |
-| Failed (P2SH) | 129 |
-| Failed (MINIMALDATA) | 71 |
-| Failed (Other) | 32 |
-| Skipped (CHECKMULTISIG) | 111 |
+| Passed | 1042 |
+| Failed (P2SH) | 127 |
+| Failed (Other) | 21 |
 | Skipped (WITNESS) | 23 |
 
 ## Todo List
@@ -20,11 +18,14 @@
 - [x] Fix script.lisp compilation issue
 - [x] Implement CHECKSIG with transaction context
 - [x] Implement STRICTENC validation for signatures
-- [ ] **Implement CHECKMULTISIG** (111 tests skipped - HIGH PRIORITY)
-- [ ] **Implement MINIMALDATA validation** (71 failures)
+- [x] Implement CHECKMULTISIG
+- [x] **Implement MINIMALDATA validation** (0 failures)
+- [x] **Fix EVAL_FALSE detection** (stack top truthiness check)
+- [x] **Implement lax DER signature parsing** (for non-DERSIG mode)
+- [x] **Implement strict DER validation** (for DERSIG flag)
+- [ ] Implement NULLFAIL validation
+- [ ] Fix remaining CHECKMULTISIG edge cases
 - [ ] Implement SIGPUSHONLY validation
-- [ ] Investigate 32 "other" failures
-- [ ] Run final verification tests
 
 ## Completed Work
 
@@ -40,6 +41,46 @@
 - Added `valid-pubkey-format-p` - rejects hybrid pubkeys (0x06, 0x07 prefix)
 - `verify-checksig-for-script` wrapper tracks STRICTENC errors
 - `last-checksig-had-strictenc-error-p` lets Coalton detect errors
+
+### CHECKMULTISIG Implementation
+- Location: `src/coalton/interop.lisp` functions `verify-checkmultisig`, `do-checkmultisig-stack-op`
+- Location: `src/coalton/script.lisp` lines 1655-1716
+- Implements m-of-n multisig verification with proper signature ordering
+- Handles Bitcoin's off-by-one bug (dummy element pop)
+- NULLDUMMY flag validation for the dummy element
+- Uses `coalton-vec-to-array` for Coalton/CL type conversion
+
+### MINIMALDATA Validation
+- Location: `src/coalton/interop.lisp` functions `minimal-push-encoding-p`, `minimal-number-encoding-p`
+- Location: `src/coalton/script.lisp` function `check-minimal-push`, modified `bytes-to-script-num`
+- **Push encoding validation**: Checks that push opcodes use minimal encoding
+  - Direct push (1-75 bytes) checked for OP_N equivalents
+  - PUSHDATA1/2/4 checked for minimal size usage
+- **Number encoding validation**: Checks that stack numbers are minimally encoded
+  - Zero must be empty (not 0x00 or 0x80)
+  - No unnecessary leading zero bytes
+- Added validation to CHECKMULTISIG for n/m values
+- Added validation to CHECKSEQUENCEVERIFY for stack top
+
+### EVAL_FALSE Detection (Stack Top Truthiness)
+- Location: `src/coalton/interop.lisp` function `stack-top-truthy-p`
+- Location: `tests/bitcoin-core-script-tests.lisp` updated `run-script-test`
+- **Problem**: Script result was not checking if stack top is TRUE, only if execution succeeded
+- **Fix**: Added `stack-top-truthy-p` to check if stack is non-empty AND top is truthy
+- Fixes tests where CHECKSIG pushes FALSE but script should fail with EVAL_FALSE
+
+### Lax and Strict DER Signature Parsing
+- Location: `src/crypto/secp256k1.lisp` functions `normalize-signature-lax`, `check-der-signature-format`
+- Location: `src/coalton/interop.lisp` function `check-der-integer-encoding`
+- **Lax parsing** (default): Tolerates padding issues in DER signatures
+  - Extracts R and S values tolerantly
+  - Normalizes to compact 64-byte format for secp256k1
+- **Strict parsing** (with DERSIG flag): Full BIP66 validation
+  - Rejects signatures > 73 bytes
+  - Validates INTEGER encoding (no unnecessary padding)
+  - Rejects negative R/S values (high bit without 0x00 prefix)
+  - Returns `:sig-der` error on invalid format
+- `verify-signature` now accepts `:strict` keyword
 
 ### Key Technical Details
 
@@ -57,28 +98,26 @@ Project requires this flag due to Coalton warnings:
   (asdf:load-system :bitcoin-lisp))
 ```
 
-## Next Steps
+## Remaining Failures (21)
 
-### 1. CHECKMULTISIG (High Priority)
-- Unlocks 111 currently skipped tests
-- Requires implementing multi-signature verification loop
-- Pattern: pop n pubkeys, pop m signatures, verify m-of-n
-- Watch for off-by-one bug (Bitcoin's original bug)
+### By Category:
+- **CHECKMULTISIG edge cases** (8 tests): Signature counting and empty signature handling
+- **NULLFAIL** (3 tests): Not yet implemented
+- **DERSIG edge cases** (5 tests): Complex BIP66 validation scenarios
+- **STRICTENC + CHECKMULTISIG** (3 tests): Validation error propagation in multisig
+- **Other** (2 tests): Miscellaneous
 
-### 2. MINIMALDATA (Medium Priority)
-- Would fix 71 failing tests
-- Validate that push operations use minimal encoding
-- e.g., pushing 1 should use OP_1, not OP_PUSHDATA1 0x01 0x01
-
-### 3. Investigate "Other" Failures
-- 32 tests failing for unknown reasons
-- May reveal edge cases or bugs
+### Next Steps:
+1. Implement NULLFAIL validation (signature must be empty if verification fails)
+2. Fix CHECKMULTISIG signature counting edge cases
+3. Implement SIGPUSHONLY validation
 
 ## Files Modified
 
-- `src/coalton/interop.lisp` - CL interop layer, STRICTENC functions
+- `src/coalton/interop.lisp` - CL interop layer, STRICTENC functions, DER validation
 - `src/coalton/script.lisp` - Main script interpreter, CHECKSIG/CHECKSIGVERIFY
-- `tests/bitcoin-core-script-tests.lisp` - Test harness (exports added)
+- `src/crypto/secp256k1.lisp` - Signature verification with lax/strict modes
+- `tests/bitcoin-core-script-tests.lisp` - Test harness, stack truthiness check
 
 ## Running Tests
 
