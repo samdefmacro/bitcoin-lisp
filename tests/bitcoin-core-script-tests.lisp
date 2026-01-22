@@ -335,32 +335,137 @@
            (search (concatenate 'string "," flag) flags-str)
            (search (concatenate 'string flag ",") flags-str))))
 
-(defun run-script-test (script-sig-asm script-pubkey-asm flags)
+(defun parse-witness-stack (witness-data)
+  "Parse witness data from test format into list of byte arrays.
+   WITNESS-DATA is a list of hex strings."
+  (when witness-data
+    (mapcar (lambda (hex-str)
+              (if (and (stringp hex-str) (> (length hex-str) 0))
+                  (let* ((len (/ (length hex-str) 2))
+                         (result (make-array len :element-type '(unsigned-byte 8))))
+                    (loop for i from 0 below len
+                          for pos = (* i 2)
+                          do (setf (aref result i)
+                                   (parse-integer (subseq hex-str pos (+ pos 2)) :radix 16)))
+                    result)
+                  (make-array 0 :element-type '(unsigned-byte 8))))
+            witness-data)))
+
+(defun run-script-test (script-sig-asm script-pubkey-asm flags &optional witness-data amount)
   "Run a script test and return (values success-p error-or-nil).
    Executes scriptSig, then scriptPubKey on the resulting stack.
+   For witness inputs, validates witness program with BIP 143 sighash.
    Success requires: no errors AND non-empty stack AND top is truthy."
   (handler-case
       (let* ((sig-bytes (assemble-script script-sig-asm))
              (pubkey-bytes (assemble-script script-pubkey-asm))
-             (p2sh-enabled (flags-include-p flags "P2SH")))
+             (p2sh-enabled (flags-include-p flags "P2SH"))
+             (witness-enabled (flags-include-p flags "WITNESS"))
+             (is-p2sh-script (and p2sh-enabled
+                                  (bitcoin-lisp.coalton.interop:is-p2sh-script-p pubkey-bytes)))
+             (is-witness-program (bitcoin-lisp.coalton.interop:is-witness-program-p pubkey-bytes))
+             (witness-stack (parse-witness-stack witness-data))
+             (input-amount (or amount 0)))
         ;; Set script flags for STRICTENC validation
         (bitcoin-lisp.coalton.interop:set-script-flags flags)
+        ;; Set witness input amount for BIP 143 sighash
+        (setf bitcoin-lisp.coalton.interop:*witness-input-amount* input-amount)
         (unwind-protect
-            ;; Use the CL interop wrapper for P2SH support
-            (multiple-value-bind (success stack-or-error)
-                (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
-                 sig-bytes pubkey-bytes p2sh-enabled)
-              (if success
-                  ;; Script executed without error - now check the result
-                  ;; Bitcoin requires: stack non-empty AND top element is truthy
-                  (if (bitcoin-lisp.coalton.interop:stack-top-truthy-p stack-or-error)
-                      (values t nil)
-                      (values nil :eval-false))
-                  (values nil stack-or-error)))
+            (progn
+              ;; SIGPUSHONLY: validate that scriptSig contains only push operations
+              (when (and (flags-include-p flags "SIGPUSHONLY")
+                         (not (bitcoin-lisp.coalton.interop:script-is-push-only-p sig-bytes)))
+                (return-from run-script-test (values nil :sig-pushonly)))
+
+              ;; P2SH requires push-only scriptSig (BIP 16) even without SIGPUSHONLY flag
+              (when (and is-p2sh-script
+                         (not (bitcoin-lisp.coalton.interop:script-is-push-only-p sig-bytes)))
+                (return-from run-script-test (values nil :sig-pushonly)))
+
+              ;; Handle witness programs
+              (when (and witness-enabled is-witness-program)
+                ;; Native witness: scriptSig must be empty
+                (when (plusp (length sig-bytes))
+                  (return-from run-script-test (values nil :witness-malleated)))
+                ;; Validate the witness program
+                (multiple-value-bind (success err)
+                    (bitcoin-lisp.coalton.interop:validate-witness-program
+                     pubkey-bytes witness-stack input-amount sig-bytes)
+                  (if success
+                      ;; CLEANSTACK is implicit for witness (stack is consumed)
+                      (return-from run-script-test (values t nil))
+                      (return-from run-script-test (values nil err)))))
+
+              ;; Handle P2SH-wrapped witness programs
+              (when (and witness-enabled is-p2sh-script witness-stack)
+                ;; For P2SH-witness, scriptSig must be a single push of the witness program
+                ;; The pushed data becomes the witness program to validate
+                (let* ((redeem-script (extract-p2sh-redeem-script sig-bytes)))
+                  (when (and redeem-script
+                             (bitcoin-lisp.coalton.interop:is-witness-program-p redeem-script))
+                    ;; Validate the wrapped witness program
+                    (multiple-value-bind (success err)
+                        (bitcoin-lisp.coalton.interop:validate-witness-program
+                         redeem-script witness-stack input-amount nil)
+                      (if success
+                          (return-from run-script-test (values t nil))
+                          (return-from run-script-test (values nil err)))))))
+
+              ;; Legacy script execution
+              (multiple-value-bind (success stack-or-error)
+                  (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
+                   sig-bytes pubkey-bytes p2sh-enabled)
+                (if success
+                    ;; Script executed without error - now check the result
+                    ;; Bitcoin requires: stack non-empty AND top element is truthy
+                    (if (bitcoin-lisp.coalton.interop:stack-top-truthy-p stack-or-error)
+                        ;; CLEANSTACK: stack must have exactly 1 element
+                        (if (and (flags-include-p flags "CLEANSTACK")
+                                 (> (length stack-or-error) 1))
+                            (values nil :cleanstack)
+                            (values t nil))
+                        (values nil :eval-false))
+                    (values nil stack-or-error))))
           ;; Clear flags after test
-          (bitcoin-lisp.coalton.interop:set-script-flags nil)))
+          (bitcoin-lisp.coalton.interop:set-script-flags nil)
+          (setf bitcoin-lisp.coalton.interop:*witness-input-amount* 0)))
     (error (e)
       (values nil e))))
+
+(defun extract-p2sh-redeem-script (script-sig)
+  "Extract the redeem script from a P2SH scriptSig.
+   For P2SH-P2WPKH/P2SH-P2WSH, this is the last push which should be the witness program."
+  (let ((len (length script-sig)))
+    (when (> len 0)
+      ;; Find the last push data
+      (let ((pos 0)
+            (last-push nil))
+        (loop while (< pos len)
+              do (let ((op (aref script-sig pos)))
+                   (cond
+                     ;; Direct push 1-75 bytes
+                     ((and (>= op 1) (<= op #x4b))
+                      (let ((data-len op))
+                        (when (> (+ pos 1 data-len) len)
+                          (return))
+                        (setf last-push (subseq script-sig (1+ pos) (+ pos 1 data-len)))
+                        (incf pos (1+ data-len))))
+                     ;; OP_PUSHDATA1
+                     ((= op #x4c)
+                      (when (>= (1+ pos) len) (return))
+                      (let ((data-len (aref script-sig (1+ pos))))
+                        (when (> (+ pos 2 data-len) len) (return))
+                        (setf last-push (subseq script-sig (+ pos 2) (+ pos 2 data-len)))
+                        (incf pos (+ 2 data-len))))
+                     ;; OP_0 through OP_16
+                     ((or (zerop op) (and (>= op #x51) (<= op #x60)))
+                      (incf pos))
+                     ;; OP_1NEGATE
+                     ((= op #x4f)
+                      (incf pos))
+                     ;; Other opcodes (should not appear in P2SH scriptSig)
+                     (t (incf pos)))))
+        last-push))))
 
 ;;; ============================================================
 ;;; Test Suite
@@ -392,57 +497,60 @@
          (failed-p2sh 0)
          (failed-cleanstack 0)
          (failed-minimaldata 0)
+         (failed-witness 0)
          (failed-other 0)
-         (skipped-witness 0)
          (errors '())
-         (minimaldata-errors '()))
+         (minimaldata-errors '())
+         (witness-errors '()))
 
     (loop for test in all-tests
           for i from 0
           when (< i *max-tests-to-run*)
-          do (multiple-value-bind (sig pubkey flags expected comment witness)
+          do (multiple-value-bind (sig pubkey flags expected comment witness amount)
                  (parse-test-case test)
                (when sig  ; Skip comment lines
                  (handler-case
-                     (cond
-                       ;; Skip witness tests
-                       ((or witness (flags-include-p flags "WITNESS"))
-                        (incf skipped-witness))
-
-                       ;; CHECKSIG and CHECKMULTISIG are now implemented and will be tested
-
-                       (t
-                        (multiple-value-bind (success err)
-                            (run-script-test sig pubkey flags)
-                          (let ((expected-ok (string= expected "OK")))
-                            (if (eq success expected-ok)
-                                (incf passed)
-                                ;; Categorize failures
-                                (cond
-                                  ((flags-include-p flags "P2SH")
-                                   (incf failed-p2sh))
-                                  ((flags-include-p flags "CLEANSTACK")
-                                   (incf failed-cleanstack))
-                                  ((flags-include-p flags "MINIMALDATA")
-                                   (incf failed-minimaldata)
-                                   (push (list :index i
-                                               :sig sig
-                                               :pubkey pubkey
-                                               :flags flags
-                                               :expected expected
-                                               :got (if success "OK" err)
-                                               :comment comment)
-                                         minimaldata-errors))
-                                  (t
-                                   (incf failed-other)
-                                   (push (list :index i
-                                               :sig sig
-                                               :pubkey pubkey
-                                               :flags flags
-                                               :expected expected
-                                               :got (if success "OK" err)
-                                               :comment comment)
-                                         errors))))))))
+                     (multiple-value-bind (success err)
+                         (run-script-test sig pubkey flags witness amount)
+                       (let ((expected-ok (string= expected "OK")))
+                         (if (eq success expected-ok)
+                             (incf passed)
+                             ;; Categorize failures
+                             (cond
+                               ((or witness (flags-include-p flags "WITNESS"))
+                                (incf failed-witness)
+                                (push (list :index i
+                                            :sig sig
+                                            :pubkey pubkey
+                                            :flags flags
+                                            :expected expected
+                                            :got (if success "OK" err)
+                                            :comment comment)
+                                      witness-errors))
+                               ((flags-include-p flags "P2SH")
+                                (incf failed-p2sh))
+                               ((flags-include-p flags "CLEANSTACK")
+                                (incf failed-cleanstack))
+                               ((flags-include-p flags "MINIMALDATA")
+                                (incf failed-minimaldata)
+                                (push (list :index i
+                                            :sig sig
+                                            :pubkey pubkey
+                                            :flags flags
+                                            :expected expected
+                                            :got (if success "OK" err)
+                                            :comment comment)
+                                      minimaldata-errors))
+                               (t
+                                (incf failed-other)
+                                (push (list :index i
+                                            :sig sig
+                                            :pubkey pubkey
+                                            :flags flags
+                                            :expected expected
+                                            :got (if success "OK" err)
+                                            :comment comment)
+                                      errors))))))
                    (error (e)
                      (incf failed-other)
                      (push (list :index i
@@ -452,19 +560,24 @@
                            errors))))))
 
     ;; Report results
-    (let ((total-failed (+ failed-p2sh failed-cleanstack failed-minimaldata failed-other)))
+    (let ((total-failed (+ failed-p2sh failed-cleanstack failed-minimaldata failed-witness failed-other)))
       (format t "~%Bitcoin Core Script Tests Results:~%")
       (format t "  Passed:  ~D~%" passed)
       (format t "  Failed (P2SH):       ~D~%" failed-p2sh)
       (format t "  Failed (CLEANSTACK): ~D~%" failed-cleanstack)
       (format t "  Failed (MINIMALDATA): ~D~%" failed-minimaldata)
+      (format t "  Failed (WITNESS):    ~D~%" failed-witness)
       (format t "  Failed (Other):      ~D~%" failed-other)
-      (format t "  Skipped (WITNESS):   ~D~%" skipped-witness)
       (format t "  Total run: ~D~%" (+ passed total-failed))
-      (format t "  Pass rate (excl. P2SH/CLEANSTACK/MINIMALDATA): ~,1F%~%"
-              (if (zerop (+ passed failed-other))
+      (format t "  Pass rate: ~,1F%~%"
+              (if (zerop (+ passed total-failed))
                   0.0
-                  (* 100.0 (/ passed (+ passed failed-other)))))
+                  (* 100.0 (/ passed (+ passed total-failed)))))
+
+      (when witness-errors
+        (format t "~%WITNESS failures (first 10):~%")
+        (loop for err in (subseq witness-errors 0 (min 10 (length witness-errors)))
+              do (format t "  ~A~%" err)))
 
       (when minimaldata-errors
         (format t "~%MINIMALDATA failures (first 10):~%")

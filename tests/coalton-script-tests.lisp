@@ -400,3 +400,355 @@
   (let ((result (call-execute-script #(1 42 #xa6))))  ; Push 1 byte, OP_RIPEMD160
     (is-true (script-ok-p result))
     (is (= 1 (get-stack-depth (get-result-stack result))))))
+
+;;; ============================================================
+;;; Witness Program Detection Tests (SegWit BIP 141)
+;;; ============================================================
+
+;; Test vectors:
+;; P2WPKH: OP_0 <20-byte-keyhash> = 0x00 0x14 <20 bytes> (22 bytes total)
+;; P2WSH:  OP_0 <32-byte-scripthash> = 0x00 0x20 <32 bytes> (34 bytes total)
+
+(defun make-p2wpkh-script (keyhash)
+  "Create a P2WPKH scriptPubKey: OP_0 <20-byte-keyhash>"
+  (let ((script (make-array 22 :element-type '(unsigned-byte 8))))
+    (setf (aref script 0) #x00)  ; OP_0 (version 0)
+    (setf (aref script 1) #x14)  ; Push 20 bytes
+    (loop for i from 0 below 20
+          do (setf (aref script (+ 2 i)) (aref keyhash i)))
+    script))
+
+(defun make-p2wsh-script (scripthash)
+  "Create a P2WSH scriptPubKey: OP_0 <32-byte-scripthash>"
+  (let ((script (make-array 34 :element-type '(unsigned-byte 8))))
+    (setf (aref script 0) #x00)  ; OP_0 (version 0)
+    (setf (aref script 1) #x20)  ; Push 32 bytes
+    (loop for i from 0 below 32
+          do (setf (aref script (+ 2 i)) (aref scripthash i)))
+    script))
+
+(test is-witness-program-p2wpkh
+  "P2WPKH (OP_0 + 20 bytes) is a witness program."
+  (let* ((keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (script (make-p2wpkh-script keyhash)))
+    (is-true (bitcoin-lisp.coalton.interop:is-witness-program-p script))))
+
+(test is-witness-program-p2wsh
+  "P2WSH (OP_0 + 32 bytes) is a witness program."
+  (let* ((scripthash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xcd))
+         (script (make-p2wsh-script scripthash)))
+    (is-true (bitcoin-lisp.coalton.interop:is-witness-program-p script))))
+
+(test is-witness-program-version-1
+  "OP_1 + program is a witness v1 program (Taproot)."
+  (let ((script (make-array 34 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref script 0) #x51)  ; OP_1 (version 1)
+    (setf (aref script 1) #x20)  ; Push 32 bytes
+    (is-true (bitcoin-lisp.coalton.interop:is-witness-program-p script))))
+
+(test is-witness-program-too-short
+  "Script with only 3 bytes is not a witness program."
+  (let ((script #(#x00 #x01 #xab)))  ; Too short
+    (is-false (bitcoin-lisp.coalton.interop:is-witness-program-p script))))
+
+(test is-witness-program-too-long
+  "Script with 43 bytes is not a witness program."
+  (let ((script (make-array 43 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref script 0) #x00)   ; OP_0
+    (setf (aref script 1) #x29)   ; Push 41 bytes (too many)
+    (is-false (bitcoin-lisp.coalton.interop:is-witness-program-p script))))
+
+(test is-witness-program-invalid-version
+  "OP_RESERVED (0x50) is not a valid witness version."
+  (let ((script (make-array 22 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref script 0) #x50)   ; OP_RESERVED - not valid version
+    (setf (aref script 1) #x14)   ; Push 20 bytes
+    (is-false (bitcoin-lisp.coalton.interop:is-witness-program-p script))))
+
+(test is-witness-program-mismatched-length
+  "Push length must match actual remaining bytes."
+  (let ((script (make-array 22 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref script 0) #x00)   ; OP_0
+    (setf (aref script 1) #x20)   ; Push 32 bytes (but only 20 follow)
+    (is-false (bitcoin-lisp.coalton.interop:is-witness-program-p script))))
+
+(test is-witness-program-not-p2sh
+  "P2SH script is not a witness program."
+  ;; P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+  (let ((script (make-array 23 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref script 0) #xa9)   ; OP_HASH160
+    (setf (aref script 1) #x14)   ; Push 20 bytes
+    (setf (aref script 22) #x87)  ; OP_EQUAL
+    (is-false (bitcoin-lisp.coalton.interop:is-witness-program-p script))))
+
+(test get-witness-version-v0
+  "Witness version 0 is extracted correctly."
+  (let* ((keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (script (make-p2wpkh-script keyhash)))
+    (is (= 0 (bitcoin-lisp.coalton.interop:get-witness-version script)))))
+
+(test get-witness-version-v1
+  "Witness version 1 (Taproot) is extracted correctly."
+  (let ((script (make-array 34 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref script 0) #x51)  ; OP_1
+    (setf (aref script 1) #x20)  ; Push 32 bytes
+    (is (= 1 (bitcoin-lisp.coalton.interop:get-witness-version script)))))
+
+(test get-witness-version-v16
+  "Witness version 16 is extracted correctly."
+  (let ((script (make-array 34 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref script 0) #x60)  ; OP_16
+    (setf (aref script 1) #x20)  ; Push 32 bytes
+    (is (= 16 (bitcoin-lisp.coalton.interop:get-witness-version script)))))
+
+(test get-witness-version-not-witness
+  "Non-witness script returns NIL for version."
+  (let ((script #(#x76 #xa9)))  ; OP_DUP OP_HASH160
+    (is (null (bitcoin-lisp.coalton.interop:get-witness-version script)))))
+
+(test get-witness-program-bytes-p2wpkh
+  "P2WPKH program bytes are extracted correctly."
+  (let* ((keyhash (make-array 20 :element-type '(unsigned-byte 8)))
+         (script nil))
+    ;; Fill with distinct values
+    (loop for i from 0 below 20 do (setf (aref keyhash i) (+ i 100)))
+    (setf script (make-p2wpkh-script keyhash))
+    (let ((program (bitcoin-lisp.coalton.interop:get-witness-program-bytes script)))
+      (is (= 20 (length program)))
+      (is (equalp keyhash program)))))
+
+(test get-witness-program-bytes-p2wsh
+  "P2WSH program bytes are extracted correctly."
+  (let* ((scripthash (make-array 32 :element-type '(unsigned-byte 8)))
+         (script nil))
+    ;; Fill with distinct values
+    (loop for i from 0 below 32 do (setf (aref scripthash i) (+ i 50)))
+    (setf script (make-p2wsh-script scripthash))
+    (let ((program (bitcoin-lisp.coalton.interop:get-witness-program-bytes script)))
+      (is (= 32 (length program)))
+      (is (equalp scripthash program)))))
+
+;;; ============================================================
+;;; Coalton Witness Program Type Tests
+;;; ============================================================
+;;;
+;;; These tests verify the Coalton is-p2wpkh-program and is-p2wsh-program
+;;; functions work correctly. Since these functions expect Coalton vectors,
+;;; we test them indirectly through consistent behavior with the CL wrappers.
+
+(test is-p2wpkh-not-p2wsh
+  "P2WPKH script (22 bytes) is not detected as P2WSH."
+  (let* ((keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (script (make-p2wpkh-script keyhash)))
+    ;; P2WPKH is a witness program with 20-byte program
+    (is-true (bitcoin-lisp.coalton.interop:is-witness-program-p script))
+    (is (= 0 (bitcoin-lisp.coalton.interop:get-witness-version script)))
+    (is (= 20 (length (bitcoin-lisp.coalton.interop:get-witness-program-bytes script))))))
+
+(test is-p2wsh-not-p2wpkh
+  "P2WSH script (34 bytes) is not detected as P2WPKH."
+  (let* ((scripthash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xcd))
+         (script (make-p2wsh-script scripthash)))
+    ;; P2WSH is a witness program with 32-byte program
+    (is-true (bitcoin-lisp.coalton.interop:is-witness-program-p script))
+    (is (= 0 (bitcoin-lisp.coalton.interop:get-witness-version script)))
+    (is (= 32 (length (bitcoin-lisp.coalton.interop:get-witness-program-bytes script))))))
+
+(test p2wpkh-vs-p2wsh-length-difference
+  "P2WPKH (20 bytes) and P2WSH (32 bytes) are distinguished by program length."
+  (let* ((keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element #x11))
+         (scripthash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x22))
+         (p2wpkh (make-p2wpkh-script keyhash))
+         (p2wsh (make-p2wsh-script scripthash)))
+    ;; Both are witness programs
+    (is-true (bitcoin-lisp.coalton.interop:is-witness-program-p p2wpkh))
+    (is-true (bitcoin-lisp.coalton.interop:is-witness-program-p p2wsh))
+    ;; But with different program lengths
+    (is (= 20 (length (bitcoin-lisp.coalton.interop:get-witness-program-bytes p2wpkh))))
+    (is (= 32 (length (bitcoin-lisp.coalton.interop:get-witness-program-bytes p2wsh))))))
+
+;;; ============================================================
+;;; BIP 143 Sighash Tests
+;;; ============================================================
+
+(test make-p2pkh-script-code
+  "P2PKH script code is constructed correctly for BIP 143."
+  (let* ((keyhash (make-array 20 :element-type '(unsigned-byte 8)))
+         (script-code nil))
+    ;; Fill keyhash with test pattern
+    (loop for i from 0 below 20 do (setf (aref keyhash i) (+ i 1)))
+    (setf script-code (bitcoin-lisp.coalton.interop:make-p2pkh-script-code keyhash))
+    ;; Should be: OP_DUP OP_HASH160 <push 20> <keyhash> OP_EQUALVERIFY OP_CHECKSIG
+    (is (= 25 (length script-code)))
+    (is (= #x76 (aref script-code 0)))   ; OP_DUP
+    (is (= #xa9 (aref script-code 1)))   ; OP_HASH160
+    (is (= #x14 (aref script-code 2)))   ; Push 20 bytes
+    ;; Keyhash bytes 3-22
+    (loop for i from 0 below 20
+          do (is (= (+ i 1) (aref script-code (+ 3 i)))))
+    (is (= #x88 (aref script-code 23)))  ; OP_EQUALVERIFY
+    (is (= #xac (aref script-code 24))))) ; OP_CHECKSIG
+
+(test bip143-sighash-produces-32-bytes
+  "BIP 143 sighash computation produces 32-byte hash."
+  (let* ((script-code (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x00))
+         (amount 100000000)  ; 1 BTC in satoshis
+         (sighash-type 1))   ; SIGHASH_ALL
+    ;; Set up a minimal script code
+    (setf (aref script-code 0) #x76)   ; OP_DUP
+    (setf (aref script-code 1) #xa9)   ; OP_HASH160
+    (setf (aref script-code 2) #x14)   ; Push 20
+    (setf (aref script-code 23) #x88)  ; OP_EQUALVERIFY
+    (setf (aref script-code 24) #xac)  ; OP_CHECKSIG
+    ;; Need to set up original script pubkey for the function
+    (let ((bitcoin-lisp.coalton.interop:*original-script-pubkey*
+            (make-array 22 :element-type '(unsigned-byte 8) :initial-element #x00)))
+      (setf (aref bitcoin-lisp.coalton.interop:*original-script-pubkey* 0) #x00)
+      (setf (aref bitcoin-lisp.coalton.interop:*original-script-pubkey* 1) #x14)
+      (let ((sighash (bitcoin-lisp.coalton.interop:compute-bip143-sighash
+                      script-code amount sighash-type)))
+        (is (= 32 (length sighash)))))))
+
+(test bip143-sighash-deterministic
+  "BIP 143 sighash is deterministic (same inputs = same output)."
+  (let* ((script-code (make-array 25 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (amount 50000)
+         (sighash-type 1))
+    (let ((bitcoin-lisp.coalton.interop:*original-script-pubkey*
+            (make-array 22 :element-type '(unsigned-byte 8) :initial-element #x00)))
+      (let ((hash1 (bitcoin-lisp.coalton.interop:compute-bip143-sighash
+                    script-code amount sighash-type))
+            (hash2 (bitcoin-lisp.coalton.interop:compute-bip143-sighash
+                    script-code amount sighash-type)))
+        (is (equalp hash1 hash2))))))
+
+(test bip143-sighash-different-amounts
+  "BIP 143 sighash differs for different input amounts."
+  (let* ((script-code (make-array 25 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (sighash-type 1))
+    (let ((bitcoin-lisp.coalton.interop:*original-script-pubkey*
+            (make-array 22 :element-type '(unsigned-byte 8) :initial-element #x00)))
+      (let ((hash1 (bitcoin-lisp.coalton.interop:compute-bip143-sighash
+                    script-code 100000 sighash-type))
+            (hash2 (bitcoin-lisp.coalton.interop:compute-bip143-sighash
+                    script-code 200000 sighash-type)))
+        (is (not (equalp hash1 hash2)))))))
+
+(test bip143-sighash-different-types
+  "BIP 143 sighash differs for different sighash types."
+  (let* ((script-code (make-array 25 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (amount 100000))
+    (let ((bitcoin-lisp.coalton.interop:*original-script-pubkey*
+            (make-array 22 :element-type '(unsigned-byte 8) :initial-element #x00)))
+      (let ((hash-all (bitcoin-lisp.coalton.interop:compute-bip143-sighash
+                       script-code amount 1))   ; SIGHASH_ALL
+            (hash-none (bitcoin-lisp.coalton.interop:compute-bip143-sighash
+                        script-code amount 2))  ; SIGHASH_NONE
+            (hash-single (bitcoin-lisp.coalton.interop:compute-bip143-sighash
+                          script-code amount 3))) ; SIGHASH_SINGLE
+        (is (not (equalp hash-all hash-none)))
+        (is (not (equalp hash-all hash-single)))
+        (is (not (equalp hash-none hash-single)))))))
+
+;;; ============================================================
+;;; P2WPKH/P2WSH Validation Tests
+;;; ============================================================
+
+(test is-compressed-pubkey-valid
+  "33-byte pubkey starting with 0x02 is compressed."
+  (let ((pubkey (make-array 33 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref pubkey 0) #x02)
+    (is-true (bitcoin-lisp.coalton.interop:is-compressed-pubkey-p pubkey))))
+
+(test is-compressed-pubkey-valid-03
+  "33-byte pubkey starting with 0x03 is compressed."
+  (let ((pubkey (make-array 33 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref pubkey 0) #x03)
+    (is-true (bitcoin-lisp.coalton.interop:is-compressed-pubkey-p pubkey))))
+
+(test is-compressed-pubkey-uncompressed
+  "65-byte pubkey is not compressed."
+  (let ((pubkey (make-array 65 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref pubkey 0) #x04)
+    (is-false (bitcoin-lisp.coalton.interop:is-compressed-pubkey-p pubkey))))
+
+(test is-compressed-pubkey-wrong-length
+  "32-byte data is not a compressed pubkey."
+  (let ((data (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x02)))
+    (is-false (bitcoin-lisp.coalton.interop:is-compressed-pubkey-p data))))
+
+(test is-compressed-pubkey-wrong-prefix
+  "33-byte with 0x04 prefix is not compressed."
+  (let ((pubkey (make-array 33 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (setf (aref pubkey 0) #x04)
+    (is-false (bitcoin-lisp.coalton.interop:is-compressed-pubkey-p pubkey))))
+
+(test validate-witness-program-empty-witness
+  "Witness program validation fails with empty witness."
+  (let* ((keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (script (make-p2wpkh-script keyhash))
+         (witness nil)  ; Empty witness
+         (amount 100000))
+    (multiple-value-bind (success err)
+        (bitcoin-lisp.coalton.interop:validate-witness-program script witness amount nil)
+      (is-false success)
+      (is (eq err :witness-program-witness-empty)))))
+
+(test validate-witness-program-malleated
+  "Native witness program fails if scriptSig is non-empty."
+  (let* ((keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (script (make-p2wpkh-script keyhash))
+         (witness (list (make-array 0 :element-type '(unsigned-byte 8))
+                        (make-array 33 :element-type '(unsigned-byte 8) :initial-element #x02)))
+         (amount 100000)
+         (script-sig #(#x00)))  ; Non-empty scriptSig
+    (multiple-value-bind (success err)
+        (bitcoin-lisp.coalton.interop:validate-witness-program script witness amount script-sig)
+      (is-false success)
+      (is (eq err :witness-malleated)))))
+
+(test validate-p2wpkh-wrong-witness-count
+  "P2WPKH fails with wrong number of witness elements."
+  (let* ((program (make-array 20 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (witness (list (make-array 10 :element-type '(unsigned-byte 8))))  ; Only 1 element
+         (amount 100000))
+    (multiple-value-bind (success err)
+        (bitcoin-lisp.coalton.interop:validate-p2wpkh witness program amount)
+      (is-false success)
+      (is (eq err :witness-program-witness-empty)))))
+
+(test validate-p2wsh-empty-witness
+  "P2WSH fails with empty witness."
+  (let* ((program (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xcd))
+         (witness nil)
+         (amount 100000))
+    (multiple-value-bind (success err)
+        (bitcoin-lisp.coalton.interop:validate-p2wsh witness program amount)
+      (is-false success)
+      (is (eq err :witness-program-witness-empty)))))
+
+(test validate-p2wsh-hash-mismatch
+  "P2WSH fails when witness script hash doesn't match program."
+  (let* ((program (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xcd))
+         (wrong-script (make-array 10 :element-type '(unsigned-byte 8) :initial-element #xff))
+         (witness (list wrong-script))  ; Script that won't hash to program
+         (amount 100000))
+    (multiple-value-bind (success err)
+        (bitcoin-lisp.coalton.interop:validate-p2wsh witness program amount)
+      (is-false success)
+      (is (eq err :witness-program-mismatch)))))
+
+;;; ============================================================
+;;; Witness Error Types Tests
+;;; ============================================================
+
+(test witness-error-types-exist
+  "All witness error types are defined."
+  ;; Just verify the symbols exist and are of the right type
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-WitnessProgramWrongLength))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-WitnessProgramWitnessEmpty))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-WitnessProgramMismatch))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-WitnessUnexpected))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-WitnessMalleated))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-WitnessPubkeyType))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-DiscourageUpgradableWitnessProgram)))
