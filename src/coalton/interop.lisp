@@ -69,7 +69,18 @@
    #:is-witness-program-p
    #:get-witness-version
    #:get-witness-program-bytes
-   #:is-compressed-pubkey-p))
+   #:is-compressed-pubkey-p
+   ;; Taproot / BIP 341
+   #:is-taproot-program-p
+   #:validate-taproot
+   #:validate-taproot-key-path
+   #:validate-taproot-script-path
+   #:compute-bip341-sighash
+   #:compute-taproot-tweak
+   #:compute-tweaked-pubkey
+   #:verify-taproot-tweak
+   #:parse-control-block
+   #:compute-merkle-root-from-path))
 
 (in-package #:bitcoin-lisp.coalton.interop)
 
@@ -1207,9 +1218,295 @@
            (t
             (values nil :witness-program-wrong-length)))))
 
-      ;; Unknown version
+      ;; Version 1 (Taproot)
+      ((= version 1)
+       (let ((prog-len (length program)))
+         (if (= prog-len 32)
+             (validate-taproot witness program amount)
+             (values nil :witness-program-wrong-length))))
+
+      ;; Unknown version (v2+)
       (t
        (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM")
            (values nil :discourage-upgradable-witness-program)
            ;; Anyone-can-spend for unknown versions
            (values t nil))))))
+
+;;; ============================================================
+;;; Taproot Validation (BIP 341)
+;;; ============================================================
+
+(defun is-taproot-program-p (script)
+  "Check if SCRIPT is a Taproot (SegWit v1) program."
+  (and (is-witness-program-p script)
+       (= (get-witness-version script) 1)
+       (= (length (get-witness-program-bytes script)) 32)))
+
+(defun compute-taproot-tweak (internal-pubkey32 &optional merkle-root)
+  "Compute the Taproot tweak: tagged_hash('TapTweak', internal_key || merkle_root).
+   Returns the 32-byte tweak."
+  (bitcoin-lisp.crypto:tap-tweak-hash internal-pubkey32 merkle-root))
+
+(defun compute-tweaked-pubkey (internal-pubkey32 &optional merkle-root)
+  "Compute the tweaked public key for Taproot output.
+   Returns (values tweaked-pubkey32 parity) or (values nil nil) on failure."
+  (let ((tweak (compute-taproot-tweak internal-pubkey32 merkle-root)))
+    (bitcoin-lisp.crypto:tweak-xonly-pubkey internal-pubkey32 tweak)))
+
+(defun verify-taproot-tweak (output-pubkey32 output-parity internal-pubkey32 merkle-root)
+  "Verify that output-pubkey32 is the correctly tweaked internal key.
+   Returns T if valid, NIL otherwise."
+  (let ((tweak (compute-taproot-tweak internal-pubkey32 merkle-root)))
+    (bitcoin-lisp.crypto:verify-xonly-tweak output-pubkey32 output-parity
+                                             internal-pubkey32 tweak)))
+
+(defun parse-control-block (control-block)
+  "Parse a Taproot control block.
+   Returns (values leaf-version internal-pubkey32 merkle-path) or NIL on error.
+   Control block format: <leaf-version|parity> <32-byte-internal-key> [<32-byte-hash>...]"
+  ;; Minimum length: 1 (version) + 32 (key) = 33
+  ;; Must be 33 + 32*n
+  (let ((len (length control-block)))
+    (when (or (< len 33)
+              (/= (mod (- len 33) 32) 0))
+      (return-from parse-control-block nil))
+    (let* ((first-byte (aref control-block 0))
+           (leaf-version (logand first-byte #xfe))  ; Clear parity bit
+           (output-parity (logand first-byte #x01))
+           (internal-pubkey (subseq control-block 1 33))
+           (path-len (/ (- len 33) 32))
+           (merkle-path (loop for i from 0 below path-len
+                              collect (subseq control-block
+                                              (+ 33 (* i 32))
+                                              (+ 33 (* (1+ i) 32))))))
+      (values leaf-version output-parity internal-pubkey merkle-path))))
+
+(defun compute-merkle-root-from-path (leaf-hash merkle-path)
+  "Compute the Merkle root from a leaf hash and Merkle path.
+   Each step: hash = TapBranch(sorted(current, sibling))"
+  (reduce (lambda (current-hash sibling-hash)
+            (bitcoin-lisp.crypto:tap-branch-hash current-hash sibling-hash))
+          merkle-path
+          :initial-value leaf-hash))
+
+(defun validate-taproot-key-path (witness output-pubkey32 amount)
+  "Validate a Taproot key path spend.
+   Witness format: [signature] (64 or 65 bytes)
+   Returns (values success error-keyword)."
+  ;; Key path: witness has exactly 1 element (the signature)
+  (unless (= (length witness) 1)
+    (return-from validate-taproot-key-path (values nil nil)))  ; Not a key path
+
+  (let* ((sig (first witness))
+         (sig-len (length sig)))
+    ;; Signature must be 64 bytes (default sighash) or 65 bytes (explicit sighash)
+    (unless (or (= sig-len 64) (= sig-len 65))
+      (return-from validate-taproot-key-path (values nil :schnorr-signature-size)))
+
+    (let* ((sighash-type (if (= sig-len 65)
+                             (aref sig 64)
+                             #x00))  ; SIGHASH_DEFAULT
+           (sig64 (if (= sig-len 64) sig (subseq sig 0 64))))
+
+      ;; Validate sighash type for Taproot
+      (unless (valid-taproot-sighash-type-p sighash-type)
+        (return-from validate-taproot-key-path (values nil :sig-hashtype)))
+
+      ;; Compute BIP 341 sighash
+      (let ((sighash (compute-bip341-sighash amount sighash-type nil nil)))
+        ;; Verify Schnorr signature
+        (if (bitcoin-lisp.crypto:verify-schnorr-signature sighash sig64 output-pubkey32)
+            (values t nil)
+            (values nil :taproot-invalid-signature))))))
+
+(defun validate-taproot-script-path (witness output-pubkey32 amount)
+  "Validate a Taproot script path spend.
+   Witness format: [script-inputs...] <script> <control-block>
+   Returns (values success error-keyword)."
+  ;; Script path: witness has at least 2 elements (script + control block)
+  (when (< (length witness) 2)
+    (return-from validate-taproot-script-path (values nil :witness-program-witness-empty)))
+
+  (let* ((witness-rev (reverse witness))
+         (control-block (first witness-rev))
+         (script (second witness-rev))
+         (script-inputs (reverse (cddr witness-rev))))
+
+    ;; Parse control block
+    (multiple-value-bind (leaf-version output-parity internal-pubkey merkle-path)
+        (parse-control-block control-block)
+      (unless leaf-version
+        (return-from validate-taproot-script-path (values nil :taproot-invalid-control-block)))
+
+      ;; Compute leaf hash
+      (let ((leaf-hash (bitcoin-lisp.crypto:tap-leaf-hash leaf-version script)))
+        ;; Compute Merkle root from path
+        (let ((merkle-root (if merkle-path
+                               (compute-merkle-root-from-path leaf-hash merkle-path)
+                               leaf-hash)))
+          ;; Verify the tweaked pubkey matches the output
+          (unless (verify-taproot-tweak output-pubkey32 output-parity internal-pubkey merkle-root)
+            (return-from validate-taproot-script-path (values nil :taproot-merkle-mismatch)))
+
+          ;; Execute the script in Tapscript mode
+          ;; For now, if leaf version is 0xc0 (Tapscript), execute
+          (if (= leaf-version #xc0)
+              ;; TODO: Full Tapscript execution with BIP 342 rules
+              ;; For now, return success as placeholder
+              (values t nil)
+              ;; Unknown leaf version - anyone can spend if DISCOURAGE flag not set
+              (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION")
+                  (values nil :discourage-upgradable-witness-program)
+                  (values t nil))))))))
+
+(defun validate-taproot (witness output-pubkey32 amount)
+  "Validate a Taproot (SegWit v1) spend.
+   Determines key path vs script path and delegates.
+   Returns (values success error-keyword)."
+  ;; Empty witness is an error
+  (when (or (null witness) (zerop (length witness)))
+    (return-from validate-taproot (values nil :witness-program-witness-empty)))
+
+  ;; Check for annex (BIP 341: first byte 0x50)
+  ;; Annex is for future extensions, for now we just detect and skip
+  (let ((maybe-annex (car (last witness))))
+    (when (and (plusp (length maybe-annex))
+               (= (aref maybe-annex 0) #x50)
+               (> (length witness) 1))
+      ;; Has annex, remove it for processing
+      (setf witness (butlast witness))))
+
+  ;; Key path: single stack element
+  ;; Script path: 2+ elements (script inputs + script + control block)
+  (if (= (length witness) 1)
+      (validate-taproot-key-path witness output-pubkey32 amount)
+      (validate-taproot-script-path witness output-pubkey32 amount)))
+
+(defun valid-taproot-sighash-type-p (sighash-type)
+  "Check if sighash type is valid for Taproot (BIP 341).
+   Valid types: 0x00 (DEFAULT), 0x01 (ALL), 0x02 (NONE), 0x03 (SINGLE),
+   with optional 0x80 (ANYONECANPAY) flag."
+  (let ((base-type (logand sighash-type #x7f)))
+    (and (member base-type '(#x00 #x01 #x02 #x03))
+         ;; No flags other than ANYONECANPAY
+         (zerop (logand sighash-type #x60)))))
+
+(defun compute-bip341-sighash (amount sighash-type &optional tapleaf-hash key-version)
+  "Compute BIP 341 signature hash for Taproot.
+   This implements the SigMsg serialization from BIP 341 Annex G.
+   TAPLEAF-HASH and KEY-VERSION are used for script path spending."
+  (let* ((base-type (logand sighash-type #x1f))
+         (anyonecanpay (plusp (logand sighash-type #x80)))
+         ;; Compute credit txid for outpoint (same as BIP 143)
+         (credit-script (or *original-script-pubkey*
+                            (make-array 0 :element-type '(unsigned-byte 8))))
+         (credit-tx-data
+           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+             (write-u32-le 1 s)
+             (write-varint 1 s)
+             (loop repeat 32 do (write-byte 0 s))
+             (write-u32-le #xffffffff s)
+             (write-varint 2 s)
+             (write-byte 0 s) (write-byte 0 s)
+             (write-u32-le #xffffffff s)
+             (write-varint 1 s)
+             (write-u64-le 0 s)
+             (write-varint (length credit-script) s)
+             (loop for b across credit-script do (write-byte b s))
+             (write-u32-le 0 s)))
+         (credit-txid (bitcoin-lisp.crypto:hash256 credit-tx-data))
+         ;; Compute hash components
+         (hash-prevouts (if anyonecanpay
+                            nil
+                            (bitcoin-lisp.crypto:sha256
+                             (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                               (loop for b across credit-txid do (write-byte b s))
+                               (write-u32-le 0 s)))))
+         (hash-amounts (if anyonecanpay
+                           nil
+                           (bitcoin-lisp.crypto:sha256
+                            (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                              (write-u64-le amount s)))))
+         (hash-script-pubkeys (if anyonecanpay
+                                   nil
+                                   (bitcoin-lisp.crypto:sha256
+                                    (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                                      (write-varint (length credit-script) s)
+                                      (loop for b across credit-script do (write-byte b s))))))
+         (hash-sequences (if anyonecanpay
+                             nil
+                             (bitcoin-lisp.crypto:sha256
+                              (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                                (write-u32-le #xffffffff s)))))
+         (hash-outputs (cond
+                         ((= base-type 2) nil)  ; SIGHASH_NONE
+                         ((= base-type 3)       ; SIGHASH_SINGLE
+                          (bitcoin-lisp.crypto:sha256
+                           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                             (write-u64-le 0 s)
+                             (write-varint 0 s))))
+                         (t (bitcoin-lisp.crypto:sha256
+                             (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                               (write-u64-le 0 s)
+                               (write-varint 0 s))))))
+         ;; Spend type: ext_flag (1 if script path) | (has-annex ? 1 : 0)
+         (ext-flag (if tapleaf-hash 1 0))
+         (spend-type (ash ext-flag 1)))  ; No annex support yet
+
+    ;; Build the SigMsg preimage
+    (let ((preimage
+            (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+              ;; Epoch (0x00)
+              (write-byte 0 s)
+              ;; hash_type (1 byte)
+              (write-byte sighash-type s)
+              ;; nVersion (4 bytes)
+              (write-u32-le 1 s)
+              ;; nLockTime (4 bytes)
+              (write-u32-le 0 s)
+              ;; If not ANYONECANPAY:
+              (unless anyonecanpay
+                ;; sha_prevouts (32 bytes)
+                (loop for b across hash-prevouts do (write-byte b s))
+                ;; sha_amounts (32 bytes)
+                (loop for b across hash-amounts do (write-byte b s))
+                ;; sha_scriptpubkeys (32 bytes)
+                (loop for b across hash-script-pubkeys do (write-byte b s))
+                ;; sha_sequences (32 bytes)
+                (loop for b across hash-sequences do (write-byte b s)))
+              ;; If SIGHASH_ALL or SIGHASH_DEFAULT:
+              (when (or (= base-type 0) (= base-type 1))
+                ;; sha_outputs (32 bytes)
+                (loop for b across hash-outputs do (write-byte b s)))
+              ;; spend_type (1 byte)
+              (write-byte spend-type s)
+              ;; If ANYONECANPAY:
+              (if anyonecanpay
+                  (progn
+                    ;; outpoint (36 bytes)
+                    (loop for b across credit-txid do (write-byte b s))
+                    (write-u32-le 0 s)
+                    ;; amount (8 bytes)
+                    (write-u64-le amount s)
+                    ;; scriptPubKey
+                    (write-varint (length credit-script) s)
+                    (loop for b across credit-script do (write-byte b s))
+                    ;; nSequence (4 bytes)
+                    (write-u32-le #xffffffff s))
+                  (progn
+                    ;; input_index (4 bytes)
+                    (write-u32-le 0 s)))
+              ;; If SIGHASH_SINGLE:
+              (when (= base-type 3)
+                ;; sha_single_output (32 bytes)
+                (loop for b across hash-outputs do (write-byte b s)))
+              ;; If ext_flag = 1 (script path):
+              (when tapleaf-hash
+                ;; tapleaf_hash (32 bytes)
+                (loop for b across tapleaf-hash do (write-byte b s))
+                ;; key_version (1 byte)
+                (write-byte (or key-version 0) s)
+                ;; codesep_pos (4 bytes, 0xffffffff = no CODESEPARATOR)
+                (write-u32-le #xffffffff s)))))
+      ;; Return TapSighash
+      (bitcoin-lisp.crypto:tagged-hash "TapSighash" preimage))))
