@@ -49,7 +49,8 @@
                  (:module "networking"
                   :components ((:file "connection")
                                (:file "peer")
-                               (:file "protocol")))
+                               (:file "protocol")
+                               (:file "ibd")))
                  (:file "node"))))
   :in-order-to ((test-op (test-op "bitcoin-lisp/tests"))))
 
@@ -72,6 +73,8 @@
                              (:file "coalton-binary-tests")
                              (:file "coalton-script-tests")
                              ;; Bitcoin Core compatibility tests
-                             (:file "bitcoin-core-script-tests"))))
+                             (:file "bitcoin-core-script-tests")
+                             ;; IBD tests
+                             (:file "ibd-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
