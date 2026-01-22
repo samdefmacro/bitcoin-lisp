@@ -68,14 +68,22 @@ Returns a byte vector or NIL on failure/timeout."
   (handler-case
       (let ((socket (connection-socket conn)))
         (when socket
-          (when (usocket:wait-for-input socket :timeout timeout :ready-only t)
-            (let* ((stream (connection-stream conn))
-                   (buffer (make-array count :element-type '(unsigned-byte 8)))
-                   (read-count (read-sequence buffer stream)))
-              (when (= read-count count)
-                (incf (connection-bytes-received conn) count)
-                (setf (connection-last-activity conn) (get-universal-time))
-                buffer)))))
+          ;; Set socket timeout for the read operation
+          (setf (usocket:socket-option socket :receive-timeout) timeout)
+          (let* ((stream (connection-stream conn))
+                 (buffer (make-array count :element-type '(unsigned-byte 8)))
+                 (total-read 0))
+            ;; Read until we have all bytes or timeout
+            (loop while (< total-read count)
+                  do (let ((n (read-sequence buffer stream :start total-read)))
+                       (when (= n total-read)
+                         ;; No progress, likely EOF or error
+                         (return-from receive-bytes nil))
+                       (setf total-read n)))
+            (when (= total-read count)
+              (incf (connection-bytes-received conn) count)
+              (setf (connection-last-activity conn) (get-universal-time))
+              buffer))))
     (error ()
       (setf (connection-connected conn) nil)
       nil)))
