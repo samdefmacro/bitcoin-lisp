@@ -752,3 +752,168 @@
   (is (symbolp 'bitcoin-lisp.coalton.script:SE-WitnessMalleated))
   (is (symbolp 'bitcoin-lisp.coalton.script:SE-WitnessPubkeyType))
   (is (symbolp 'bitcoin-lisp.coalton.script:SE-DiscourageUpgradableWitnessProgram)))
+
+;;; ============================================================
+;;; Taproot Tests (BIP 340/341/342)
+;;; ============================================================
+
+(test taproot-error-types-exist
+  "All Taproot error types are defined."
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-TaprootInvalidSignature))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-TaprootInvalidControlBlock))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-TaprootMerkleMismatch))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-TapscriptInvalidOpcode))
+  (is (symbolp 'bitcoin-lisp.coalton.script:SE-SchnorrSignatureSize)))
+
+(test is-taproot-program-valid
+  "OP_1 + 32-byte push is a valid Taproot program."
+  (let ((script (make-array 34 :element-type '(unsigned-byte 8) :initial-element #xab)))
+    (setf (aref script 0) #x51)  ; OP_1 (version 1)
+    (setf (aref script 1) #x20)  ; Push 32 bytes
+    (is-true (bitcoin-lisp.coalton.interop:is-taproot-program-p script))))
+
+(test is-taproot-program-wrong-version
+  "OP_0 + 32-byte push is NOT a Taproot program (wrong version)."
+  (let ((script (make-array 34 :element-type '(unsigned-byte 8) :initial-element #xab)))
+    (setf (aref script 0) #x00)  ; OP_0 (version 0)
+    (setf (aref script 1) #x20)  ; Push 32 bytes
+    (is-false (bitcoin-lisp.coalton.interop:is-taproot-program-p script))))
+
+(test is-taproot-program-wrong-length
+  "OP_1 + 20-byte push is NOT a Taproot program (wrong length)."
+  (let ((script (make-array 22 :element-type '(unsigned-byte 8) :initial-element #xab)))
+    (setf (aref script 0) #x51)  ; OP_1 (version 1)
+    (setf (aref script 1) #x14)  ; Push 20 bytes
+    (is-false (bitcoin-lisp.coalton.interop:is-taproot-program-p script))))
+
+(test parse-control-block-minimal
+  "Parse a minimal control block (33 bytes: version + internal key)."
+  (let ((cb (make-array 33 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    ;; Set leaf version 0xc0 (Tapscript) with even parity
+    (setf (aref cb 0) #xc0)
+    ;; Set internal key bytes
+    (loop for i from 1 below 33 do (setf (aref cb i) i))
+    (multiple-value-bind (leaf-version parity internal-key path)
+        (bitcoin-lisp.coalton.interop:parse-control-block cb)
+      (is (= leaf-version #xc0))
+      (is (= parity 0))
+      (is (= (length internal-key) 32))
+      (is (null path)))))
+
+(test parse-control-block-with-path
+  "Parse a control block with one Merkle path element (65 bytes)."
+  (let ((cb (make-array 65 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    ;; Set leaf version 0xc0 with odd parity
+    (setf (aref cb 0) #xc1)
+    ;; Set internal key
+    (loop for i from 1 below 33 do (setf (aref cb i) i))
+    ;; Set path element
+    (loop for i from 33 below 65 do (setf (aref cb i) (- i 33)))
+    (multiple-value-bind (leaf-version parity internal-key path)
+        (bitcoin-lisp.coalton.interop:parse-control-block cb)
+      (is (= leaf-version #xc0))
+      (is (= parity 1))
+      (is (= (length internal-key) 32))
+      (is (= (length path) 1))
+      (is (= (length (first path)) 32)))))
+
+(test parse-control-block-invalid-length
+  "Control block with invalid length returns NIL."
+  ;; 34 bytes is invalid (must be 33 + 32*n)
+  (let ((cb (make-array 34 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (is (null (bitcoin-lisp.coalton.interop:parse-control-block cb)))))
+
+(test parse-control-block-too-short
+  "Control block under 33 bytes returns NIL."
+  (let ((cb (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    (is (null (bitcoin-lisp.coalton.interop:parse-control-block cb)))))
+
+(test validate-taproot-empty-witness
+  "Taproot fails with empty witness."
+  (let* ((program (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xab))
+         (witness nil)
+         (amount 100000))
+    (multiple-value-bind (success err)
+        (bitcoin-lisp.coalton.interop:validate-taproot witness program amount)
+      (is-false success)
+      (is (eq err :witness-program-witness-empty)))))
+
+(test validate-taproot-key-path-wrong-sig-size
+  "Taproot key path fails with wrong signature size."
+  (let* ((program (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xab))
+         ;; Signature must be 64 or 65 bytes, not 63
+         (witness (list (make-array 63 :element-type '(unsigned-byte 8) :initial-element #x00)))
+         (amount 100000))
+    (multiple-value-bind (success err)
+        (bitcoin-lisp.coalton.interop:validate-taproot-key-path witness program amount)
+      (is-false success)
+      (is (eq err :schnorr-signature-size)))))
+
+(test taproot-tweak-hash-produces-32-bytes
+  "Taproot tweak computation produces 32-byte hash."
+  (let ((internal-key (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xab)))
+    (let ((tweak (bitcoin-lisp.coalton.interop:compute-taproot-tweak internal-key)))
+      (is (= 32 (length tweak))))))
+
+(test taproot-tweak-with-merkle-root
+  "Taproot tweak with Merkle root differs from without."
+  (let ((internal-key (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xab))
+        (merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xcd)))
+    (let ((tweak-without (bitcoin-lisp.coalton.interop:compute-taproot-tweak internal-key))
+          (tweak-with (bitcoin-lisp.coalton.interop:compute-taproot-tweak internal-key merkle-root)))
+      (is (not (equalp tweak-without tweak-with))))))
+
+(test merkle-root-from-empty-path
+  "Merkle root from empty path equals the leaf hash."
+  (let ((leaf-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xab)))
+    (let ((root (bitcoin-lisp.coalton.interop:compute-merkle-root-from-path leaf-hash nil)))
+      (is (equalp root leaf-hash)))))
+
+(test valid-taproot-sighash-types
+  "Valid Taproot sighash types are accepted."
+  ;; SIGHASH_DEFAULT (0x00), ALL (0x01), NONE (0x02), SINGLE (0x03)
+  ;; plus ANYONECANPAY (0x80) combinations
+  (let ((valid-types '(#x00 #x01 #x02 #x03 #x81 #x82 #x83)))
+    (dolist (sht valid-types)
+      (is-true (bitcoin-lisp.coalton.interop::valid-taproot-sighash-type-p sht)
+               (format nil "Expected sighash type ~2,'0X to be valid" sht)))))
+
+(test invalid-taproot-sighash-types
+  "Invalid Taproot sighash types are rejected."
+  ;; Invalid: non-standard base types, weird flags
+  (let ((invalid-types '(#x04 #x05 #x40 #x20)))
+    (dolist (sht invalid-types)
+      (is-false (bitcoin-lisp.coalton.interop::valid-taproot-sighash-type-p sht)
+                (format nil "Expected sighash type ~2,'0X to be invalid" sht)))))
+
+;;; ============================================================
+;;; Tagged Hash Tests (BIP 340)
+;;; ============================================================
+
+(test tagged-hash-produces-32-bytes
+  "Tagged hash produces 32-byte output."
+  (let ((data (make-array 10 :element-type '(unsigned-byte 8) :initial-element #xab)))
+    (let ((hash (bitcoin-lisp.crypto:tagged-hash "TapLeaf" data)))
+      (is (= 32 (length hash))))))
+
+(test tagged-hash-differs-by-tag
+  "Different tags produce different hashes."
+  (let ((data (make-array 10 :element-type '(unsigned-byte 8) :initial-element #xab)))
+    (let ((hash1 (bitcoin-lisp.crypto:tagged-hash "TapLeaf" data))
+          (hash2 (bitcoin-lisp.crypto:tagged-hash "TapBranch" data)))
+      (is (not (equalp hash1 hash2))))))
+
+(test tap-leaf-hash-format
+  "TapLeaf hash includes leaf version and script."
+  (let ((script (make-array 5 :element-type '(unsigned-byte 8) :initial-element #x51)))
+    (let ((hash (bitcoin-lisp.crypto:tap-leaf-hash #xc0 script)))
+      (is (= 32 (length hash))))))
+
+(test tap-branch-hash-sorted
+  "TapBranch hash sorts inputs lexicographically."
+  (let ((left (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xff))
+        (right (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x00)))
+    ;; TapBranch should produce same result regardless of argument order
+    (let ((hash1 (bitcoin-lisp.crypto:tap-branch-hash left right))
+          (hash2 (bitcoin-lisp.crypto:tap-branch-hash right left)))
+      (is (equalp hash1 hash2)))))

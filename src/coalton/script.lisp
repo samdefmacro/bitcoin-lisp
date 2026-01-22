@@ -64,7 +64,13 @@
     SE-WitnessUnexpected           ; Witness for non-witness input
     SE-WitnessMalleated            ; Non-empty scriptSig for native witness
     SE-WitnessPubkeyType           ; Uncompressed pubkey in witness
-    SE-DiscourageUpgradableWitnessProgram) ; Unknown witness version when flag set
+    SE-DiscourageUpgradableWitnessProgram ; Unknown witness version when flag set
+    ;; Taproot errors (BIP 341/342)
+    SE-TaprootInvalidSignature     ; Schnorr signature verification failed
+    SE-TaprootInvalidControlBlock  ; Malformed control block
+    SE-TaprootMerkleMismatch       ; Merkle proof doesn't match output key
+    SE-TapscriptInvalidOpcode      ; Disabled opcode in Tapscript context
+    SE-SchnorrSignatureSize)       ; Signature not 64 or 65 bytes
 
   ;;;; ScriptResult - Result type for script operations
 
@@ -185,6 +191,9 @@
     OP-CHECKSIGVERIFY         ; 0xad - Verify and fail if invalid
     OP-CHECKMULTISIG          ; 0xae - Multi-signature verify
     OP-CHECKMULTISIGVERIFY    ; 0xaf - Multi-sig verify and fail
+
+    ;; Tapscript (BIP 342)
+    OP-CHECKSIGADD            ; 0xba - Tapscript signature counting
 
     ;; Timelocks
     OP-NOP1                   ; 0xb0 - NOP (reserved)
@@ -307,6 +316,7 @@
       ((OP-NOP8) #xb7)
       ((OP-NOP9) #xb8)
       ((OP-NOP10) #xb9)
+      ((OP-CHECKSIGADD) #xba)
       ((OP-DISABLED n) n)
       ((OP-UNKNOWN n) n)))
 
@@ -429,6 +439,8 @@
       ((== b #xb7) OP-NOP8)
       ((== b #xb8) OP-NOP9)
       ((== b #xb9) OP-NOP10)
+      ;; Tapscript opcode
+      ((== b #xba) OP-CHECKSIGADD)
       ;; Everything else
       (True (OP-UNKNOWN b))))
 
@@ -439,7 +451,7 @@
     "Return True if this opcode pushes data onto the stack."
     (match op
       ((OP-0) True)
-      ((OP-PUSHBYTES n) True)
+      ((OP-PUSHBYTES _n) True)
       ((OP-PUSHDATA1) True)
       ((OP-PUSHDATA2) True)
       ((OP-PUSHDATA4) True)
@@ -460,14 +472,14 @@
       ((OP-14) True)
       ((OP-15) True)
       ((OP-16) True)
-      (_other False)))
+      (_ False)))
 
   (declare is-disabled-op (Opcode -> Boolean))
   (define (is-disabled-op op)
     "Return True if this opcode is disabled."
     (match op
-      ((OP-DISABLED n) True)
-      (other False)))
+      ((OP-DISABLED _n) True)
+      (_ False)))
 
   (declare is-conditional-op (Opcode -> Boolean))
   (define (is-conditional-op op)
@@ -1621,14 +1633,14 @@
        (ScriptOk (context-with-codesep-pos (context-position ctx) ctx)))
 
       ;; Disabled opcodes
-      ((OP-DISABLED opcode) (ScriptErr SE-DisabledOpcode))
+      ((OP-DISABLED _opcode) (ScriptErr SE-DisabledOpcode))
 
       ;; Unknown opcodes
-      ((OP-UNKNOWN opcode) (ScriptErr SE-UnknownOpcode))
+      ((OP-UNKNOWN _opcode) (ScriptErr SE-UnknownOpcode))
 
       ;; Push data operations - these are handled by the execution loop
       ;; because they need to read additional bytes from the script
-      ((OP-PUSHBYTES opcode) (ScriptErr SE-InvalidPushData))
+      ((OP-PUSHBYTES _opcode) (ScriptErr SE-InvalidPushData))
       ((OP-PUSHDATA1) (ScriptErr SE-InvalidPushData))
       ((OP-PUSHDATA2) (ScriptErr SE-InvalidPushData))
       ((OP-PUSHDATA4) (ScriptErr SE-InvalidPushData))
@@ -1818,6 +1830,13 @@
            ((Tuple3 4 _ _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
            ((Tuple3 5 _ _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
            (_ (ScriptErr SE-UnknownOpcode)))))
+
+      ;; OP_CHECKSIGADD (BIP 342) - only valid in Tapscript context
+      ;; In legacy/SegWit v0 context, this opcode is invalid (was OP_SUCCESS)
+      ((OP-CHECKSIGADD)
+       ;; In non-Tapscript context, OP_CHECKSIGADD (0xba) is treated as unknown
+       ;; Full Tapscript execution would handle this differently
+       (ScriptErr SE-UnknownOpcode))
 
       ;; Timelocks and NOP1-10
       ;; NOP1 and NOP4-10 are true no-ops unless DISCOURAGE_UPGRADABLE_NOPS flag is set
@@ -2208,6 +2227,20 @@
            ((Some v) (== v 0)))
          (== (coalton-library/vector:length script) 34))) ; OP_0 + push(32) + 32 bytes
 
+  ;;; ============================================================
+  ;;; Taproot Support (BIP 341)
+  ;;; ============================================================
+
+  (declare is-taproot-program ((Vector U8) -> Boolean))
+  (define (is-taproot-program script)
+    "Check if scriptPubKey is a Taproot (SegWit v1) program.
+     Taproot: OP_1 (0x51) <32-byte-key>"
+    (and (is-witness-program script)
+         (match (get-witness-version script)
+           ((None) False)
+           ((Some v) (== v 1)))
+         (== (coalton-library/vector:length script) 34))) ; OP_1 + push(32) + 32 bytes
+
   (declare execute-scripts ((Vector U8) -> (Vector U8) -> Boolean -> (ScriptResult ScriptStack)))
   (define (execute-scripts script-sig script-pubkey p2sh-enabled)
     "Execute scriptSig then scriptPubKey, with optional P2SH support."
@@ -2235,28 +2268,28 @@
   (define (script-result-ok-p result)
     "Return True if the result is ScriptOk."
     (match result
-      ((ScriptOk val) True)
-      ((ScriptErr err) False)))
+      ((ScriptOk _val) True)
+      ((ScriptErr _e) False)))
 
   (declare script-result-err-p ((ScriptResult :a) -> Boolean))
   (define (script-result-err-p result)
     "Return True if the result is ScriptErr."
     (match result
-      ((ScriptOk val) False)
-      ((ScriptErr err) True)))
+      ((ScriptOk _val) False)
+      ((ScriptErr _e) True)))
 
   (declare script-result-stack ((ScriptResult ScriptStack) -> (Optional ScriptStack)))
   (define (script-result-stack result)
     "Extract the stack from a successful result."
     (match result
       ((ScriptOk stack) (Some stack))
-      ((ScriptErr err) None)))
+      ((ScriptErr _e) None)))
 
   (declare script-result-error ((ScriptResult :a) -> (Optional ScriptError)))
   (define (script-result-error result)
     "Extract the error from a failed result."
     (match result
-      ((ScriptOk val) None)
+      ((ScriptOk _val) None)
       ((ScriptErr e) (Some e))))
 
   ;; Direct accessors for CL interop (avoid Optional unwrapping in CL)
@@ -2265,6 +2298,6 @@
     "Get stack from ScriptOk, or empty-stack if error. For CL interop."
     (match result
       ((ScriptOk stack) stack)
-      ((ScriptErr err) (empty-stack))))
+      ((ScriptErr _e) (empty-stack))))
 
 ) ; end coalton-toplevel
