@@ -246,6 +246,21 @@
    ;; P2SH support
    #:is-p2sh-script
    #:validate-p2sh
+   ;; SegWit support
+   #:is-witness-program
+   #:get-witness-version
+   #:get-witness-program
+   #:is-valid-v0-witness-program-length
+   #:is-p2wpkh-program
+   #:is-p2wsh-program
+   ;; SegWit errors
+   #:SE-WitnessProgramWrongLength
+   #:SE-WitnessProgramWitnessEmpty
+   #:SE-WitnessProgramMismatch
+   #:SE-WitnessUnexpected
+   #:SE-WitnessMalleated
+   #:SE-WitnessPubkeyType
+   #:SE-DiscourageUpgradableWitnessProgram
    ;; Result helpers (for CL interop)
    #:script-result-ok-p
    #:script-result-err-p
