@@ -244,6 +244,21 @@ Returns the node instance."
   (log-info "Loading chain state...")
   (setf (node-chain-state *node*)
         (bitcoin-lisp.storage:init-chain-state (node-data-directory *node*)))
+
+  ;; Add genesis block to block index (needed for header validation)
+  (let ((genesis-hash (bitcoin-lisp.storage::chain-state-genesis-hash
+                       (node-chain-state *node*))))
+    (unless (bitcoin-lisp.storage:get-block-index-entry
+             (node-chain-state *node*) genesis-hash)
+      (bitcoin-lisp.storage:add-block-index-entry
+       (node-chain-state *node*)
+       (bitcoin-lisp.storage:make-block-index-entry
+        :hash genesis-hash
+        :height 0
+        :prev-entry nil
+        :chain-work 0
+        :status :valid))))
+
   (when (bitcoin-lisp.storage:load-state (node-chain-state *node*))
     (log-info "Loaded existing chain state: height ~D"
               (bitcoin-lisp.storage:current-height (node-chain-state *node*))))

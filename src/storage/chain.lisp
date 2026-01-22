@@ -24,10 +24,10 @@
   (genesis-hash nil)
   (base-path nil :type (or null pathname)))
 
-;;; Testnet genesis block hash
+;;; Testnet genesis block hash (little-endian, as on wire)
 (defvar *testnet-genesis-hash*
   (bitcoin-lisp.crypto:hex-to-bytes
-   "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"))
+   "43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000"))
 
 (defun init-chain-state (base-path &key genesis-hash)
   "Initialize chain state at BASE-PATH."
@@ -144,9 +144,14 @@ with exponentially increasing gaps."
              (when (> count 10)
                (setf step (* step 2)))
              ;; Move back 'step' blocks
-             (loop repeat step
-                   while (block-index-entry-prev-entry entry)
-                   do (setf entry (block-index-entry-prev-entry entry))))
+             (let ((moved nil))
+               (loop repeat step
+                     while (block-index-entry-prev-entry entry)
+                     do (setf entry (block-index-entry-prev-entry entry))
+                        (setf moved t))
+               ;; If we couldn't move back, we're at genesis - exit
+               (unless moved
+                 (return))))
     ;; Always include genesis
     (when (chain-state-genesis-hash state)
       (pushnew (chain-state-genesis-hash state) locator :test 'equalp))

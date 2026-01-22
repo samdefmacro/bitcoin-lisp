@@ -66,10 +66,12 @@
   "Testnet checkpoints as (height . hex-hash) pairs.")
 
 (defun get-checkpoint-hash (height)
-  "Get the checkpoint hash for HEIGHT, or NIL if no checkpoint exists."
+  "Get the checkpoint hash for HEIGHT, or NIL if no checkpoint exists.
+Returns the hash in wire format (little-endian)."
   (let ((entry (assoc height *testnet-checkpoints*)))
     (when entry
-      (bitcoin-lisp.crypto:hex-to-bytes (cdr entry)))))
+      ;; Checkpoints are stored in display format (big-endian), reverse for wire format
+      (reverse (bitcoin-lisp.crypto:hex-to-bytes (cdr entry))))))
 
 (defun last-checkpoint-height ()
   "Get the height of the last checkpoint."
@@ -104,7 +106,8 @@ Returns (VALUES valid-headers error-message).
 VALID-HEADERS is a list of headers that passed validation (may be fewer than input)."
   (let ((valid-headers '())
         (prev-hash nil)
-        (prev-entry nil))
+        (prev-entry nil)
+        (prev-height -1))  ; Track height of previous header in this batch
     (dolist (header headers)
       (block continue
         (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
@@ -112,14 +115,21 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
 
           ;; Check if we already have this header
           (when (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
-            (setf prev-hash hash)
-            (setf prev-entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash))
+            (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+              (setf prev-hash hash)
+              (setf prev-entry entry)
+              (setf prev-height (bitcoin-lisp.storage:block-index-entry-height entry)))
             (return-from continue))
 
-          ;; Check chain linkage
-          (let ((parent (or prev-entry
-                            (bitcoin-lisp.storage:get-block-index-entry
-                             chain-state header-prev-hash))))
+          ;; Check chain linkage - use previous header from this batch if it matches
+          (let ((parent (cond
+                          ;; Previous header in this batch is the parent
+                          ((and prev-hash (equalp header-prev-hash prev-hash))
+                           prev-entry)
+                          ;; Look up in chain-state
+                          (t
+                           (bitcoin-lisp.storage:get-block-index-entry
+                            chain-state header-prev-hash)))))
             (unless parent
               ;; No parent found, stop here
               (return-from validate-header-chain
@@ -134,16 +144,27 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                         "Invalid proof-of-work")))
 
             ;; Calculate new height and validate checkpoint
-            (let ((new-height (1+ (bitcoin-lisp.storage:block-index-entry-height parent))))
+            (let* ((parent-height (if (eq parent prev-entry)
+                                      prev-height
+                                      (bitcoin-lisp.storage:block-index-entry-height parent)))
+                   (new-height (1+ parent-height)))
               (unless (validate-checkpoint hash new-height)
                 (return-from validate-header-chain
                   (values (nreverse valid-headers)
                           (format nil "Checkpoint mismatch at height ~D" new-height))))
 
-              ;; Header is valid
+              ;; Header is valid - create temp entry for chain linkage of next header
               (push header valid-headers)
               (setf prev-hash hash)
-              (setf prev-entry nil))))))  ; Will look up in chain-state next iteration
+              (setf prev-height new-height)
+              (setf prev-entry
+                    (bitcoin-lisp.storage:make-block-index-entry
+                     :hash hash
+                     :height new-height
+                     :header header
+                     :prev-entry parent
+                     :chain-work 0  ; Don't need accurate chain work for validation
+                     :status :header-valid)))))))
 
     (values (nreverse valid-headers) nil)))
 
@@ -153,7 +174,8 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
   "Process validated headers and add to block index.
 Returns the number of new headers added."
   (let ((added 0)
-        (best-height (bitcoin-lisp.storage:current-height chain-state)))
+        (best-height (bitcoin-lisp.storage:current-height chain-state))
+        (best-hash (bitcoin-lisp.storage::chain-state-best-block-hash chain-state)))
     (dolist (header headers)
       (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
              (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
@@ -177,9 +199,13 @@ Returns the number of new headers added."
                              :status :header-valid)))
                 (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
                 (incf added)
-                ;; Update best height if this extends our chain
+                ;; Update best height/hash if this extends our chain
                 (when (> new-height best-height)
-                  (setf best-height new-height))))))))
+                  (setf best-height new-height)
+                  (setf best-hash hash))))))))
+    ;; Update chain tip if we extended the chain
+    (when (> best-height (bitcoin-lisp.storage:current-height chain-state))
+      (bitcoin-lisp.storage:update-chain-tip chain-state best-hash best-height))
     added))
 
 ;;;; Download Queue Management
