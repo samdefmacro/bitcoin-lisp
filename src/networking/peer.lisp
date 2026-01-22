@@ -133,15 +133,20 @@ Returns T on success, NIL on failure."
   (unless (send-message peer (bitcoin-lisp.serialization:make-verack-message))
     (return-from perform-handshake nil))
 
-  ;; Receive verack
-  (multiple-value-bind (command payload)
-      (receive-message peer :timeout 30)
-    (declare (ignore payload))
-    (unless (string= command "verack")
-      (return-from perform-handshake nil)))
+  ;; Receive verack (may receive other messages first like wtxidrelay, sendaddrv2)
+  (loop repeat 10  ; Max 10 messages before giving up
+        do (multiple-value-bind (command payload)
+               (receive-message peer :timeout 30)
+             (declare (ignore payload))
+             (unless command
+               (return-from perform-handshake nil))
+             (when (string= command "verack")
+               (setf (peer-state peer) :ready)
+               (return-from perform-handshake t))
+             ;; Ignore other handshake-phase messages (wtxidrelay, sendaddrv2, etc.)
+             ))
 
-  (setf (peer-state peer) :ready)
-  t)
+  nil)  ; Didn't receive verack
 
 ;;; Ping/Pong
 
