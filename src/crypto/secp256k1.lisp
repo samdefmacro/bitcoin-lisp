@@ -192,19 +192,30 @@ Returns an internal public key structure, or NIL if invalid."
   (sig :pointer)
   (input64 :pointer))
 
+;;; Signature normalization (convert high-S to low-S)
+;;; libsecp256k1's verify function requires normalized (low-S) signatures.
+;;; Bitcoin Core normalizes signatures internally during verification.
+
+(cffi:defcfun ("secp256k1_ecdsa_signature_normalize" secp256k1-ecdsa-signature-normalize) :int
+  (ctx :pointer)
+  (sigout :pointer)
+  (sigin :pointer))
+
 ;;; Signature verification
 
-(defun verify-signature (message-hash signature pubkey-bytes &key strict)
+(defun verify-signature (message-hash signature pubkey-bytes &key strict low-s)
   "Verify an ECDSA signature.
 MESSAGE-HASH: 32-byte hash of the message
 SIGNATURE: DER-encoded signature bytes
 PUBKEY-BYTES: 33 or 65 byte public key
 STRICT: if T, use strict DER parsing (for DERSIG flag); otherwise use lax parsing
-Returns (values result parse-ok) where:
+LOW-S: if T, reject high-S signatures (return :high-s as second value)
+Returns (values result status) where:
   - result is T if valid, NIL if verification failed
-  - parse-ok is T if signature parsed successfully, NIL if DER parsing failed
+  - status is T if OK, NIL if DER parsing failed, :HIGH-S if signature has high-S and LOW-S is set
 When strict=T and DER parsing fails, returns (values nil nil).
-When strict=NIL, parse-ok is always T (lax mode never fails on format)."
+When strict=NIL, parse-ok is always T (lax mode never fails on format).
+When low-s=T and signature has high-S, returns (values nil :high-s)."
   (ensure-secp256k1-loaded)
   (unless (= (length message-hash) 32)
     (return-from verify-signature (values nil t)))  ; parse ok, verification failed
@@ -249,10 +260,18 @@ When strict=NIL, parse-ok is always T (lax mode never fails on format)."
           ;; Signature parsing failed
           ;; In strict mode, report DER parse failure; in lax mode, just verification failure
           (return-from verify-signature (values nil (not strict))))
-        ;; Verify
-        (let ((verify-result (secp256k1-ecdsa-verify
-                              *secp256k1-context*
-                              sig
-                              msghash
-                              pubkey)))
-          (values (= verify-result 1) t))))))
+        ;; Normalize signature (convert high-S to low-S if needed)
+        ;; libsecp256k1's verify function requires normalized signatures.
+        ;; Note: sigout can be same as sigin for in-place normalization.
+        ;; Returns 1 if signature was modified (had high-S), 0 if already low-S.
+        (let ((was-high-s (= 1 (secp256k1-ecdsa-signature-normalize *secp256k1-context* sig sig))))
+          ;; If LOW_S flag is set and signature had high-S, reject it
+          (when (and low-s was-high-s)
+            (return-from verify-signature (values nil :high-s)))
+          ;; Verify
+          (let ((verify-result (secp256k1-ecdsa-verify
+                                *secp256k1-context*
+                                sig
+                                msghash
+                                pubkey)))
+            (values (= verify-result 1) t)))))))
