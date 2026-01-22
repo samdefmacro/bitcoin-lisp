@@ -66,13 +66,14 @@ Returns a 20-byte vector."
                          tag-hash tag-hash data))))
 
 ;; Pre-defined tag constants for Taproot
-(defconstant +tag-bip340-challenge+ "BIP0340/challenge")
-(defconstant +tag-bip340-aux+ "BIP0340/aux")
-(defconstant +tag-bip340-nonce+ "BIP0340/nonce")
-(defconstant +tag-tap-leaf+ "TapLeaf")
-(defconstant +tag-tap-branch+ "TapBranch")
-(defconstant +tag-tap-tweak+ "TapTweak")
-(defconstant +tag-tap-sighash+ "TapSighash")
+;; Use alexandria:define-constant for SBCL reload compatibility
+(alexandria:define-constant +tag-bip340-challenge+ "BIP0340/challenge" :test #'equal)
+(alexandria:define-constant +tag-bip340-aux+ "BIP0340/aux" :test #'equal)
+(alexandria:define-constant +tag-bip340-nonce+ "BIP0340/nonce" :test #'equal)
+(alexandria:define-constant +tag-tap-leaf+ "TapLeaf" :test #'equal)
+(alexandria:define-constant +tag-tap-branch+ "TapBranch" :test #'equal)
+(alexandria:define-constant +tag-tap-tweak+ "TapTweak" :test #'equal)
+(alexandria:define-constant +tag-tap-sighash+ "TapSighash" :test #'equal)
 
 ;; Convenience functions for common tagged hashes
 (defun tap-leaf-hash (leaf-version script)
