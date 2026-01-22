@@ -6,16 +6,33 @@
    #:hash256
    #:ripemd160
    #:hash160
+   ;; Tagged hashes (BIP 340)
+   #:tagged-hash
+   #:tap-leaf-hash
+   #:tap-branch-hash
+   #:tap-tweak-hash
+   #:+tag-bip340-challenge+
+   #:+tag-bip340-aux+
+   #:+tag-tap-leaf+
+   #:+tag-tap-branch+
+   #:+tag-tap-tweak+
+   #:+tag-tap-sighash+
    ;; Utilities
    #:bytes-to-hex
    #:hex-to-bytes
    #:reverse-bytes
-   ;; secp256k1
+   ;; secp256k1 ECDSA
    #:verify-signature
    #:parse-public-key
    #:public-key-valid-p
    #:ensure-secp256k1-loaded
-   #:cleanup-secp256k1))
+   #:cleanup-secp256k1
+   ;; Schnorr / x-only pubkeys (BIP 340)
+   #:verify-schnorr-signature
+   #:parse-xonly-pubkey
+   #:xonly-pubkey-valid-p
+   #:tweak-xonly-pubkey
+   #:verify-xonly-tweak))
 
 (defpackage #:bitcoin-lisp.serialization
   (:use #:cl)

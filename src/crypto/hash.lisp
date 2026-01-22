@@ -38,6 +38,88 @@ Used for Bitcoin public key hashes and script hashes.
 Returns a 20-byte vector."
   (ripemd160 (sha256 data)))
 
+;;; ============================================================
+;;; Tagged Hashes (BIP 340)
+;;; ============================================================
+;;;
+;;; BIP 340 defines tagged hashes to prevent cross-protocol attacks:
+;;; tagged_hash(tag, msg) = SHA256(SHA256(tag) || SHA256(tag) || msg)
+;;;
+;;; Pre-computed tag hashes are cached for efficiency.
+
+(defvar *tagged-hash-cache* (make-hash-table :test 'equal)
+  "Cache for pre-computed SHA256(tag) values.")
+
+(defun get-tag-hash (tag)
+  "Get or compute SHA256(tag) for a given tag string."
+  (or (gethash tag *tagged-hash-cache*)
+      (setf (gethash tag *tagged-hash-cache*)
+            (sha256 (flexi-streams:string-to-octets tag :external-format :utf-8)))))
+
+(defun tagged-hash (tag data)
+  "Compute BIP 340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || data).
+   TAG is a string (e.g., \"BIP0340/challenge\", \"TapLeaf\").
+   DATA is a byte vector.
+   Returns a 32-byte hash."
+  (let ((tag-hash (get-tag-hash tag)))
+    (sha256 (concatenate '(vector (unsigned-byte 8))
+                         tag-hash tag-hash data))))
+
+;; Pre-defined tag constants for Taproot
+(defconstant +tag-bip340-challenge+ "BIP0340/challenge")
+(defconstant +tag-bip340-aux+ "BIP0340/aux")
+(defconstant +tag-bip340-nonce+ "BIP0340/nonce")
+(defconstant +tag-tap-leaf+ "TapLeaf")
+(defconstant +tag-tap-branch+ "TapBranch")
+(defconstant +tag-tap-tweak+ "TapTweak")
+(defconstant +tag-tap-sighash+ "TapSighash")
+
+;; Convenience functions for common tagged hashes
+(defun tap-leaf-hash (leaf-version script)
+  "Compute TapLeaf hash: tagged_hash('TapLeaf', leaf_version || compact_size(script) || script).
+   LEAF-VERSION is a byte (typically 0xc0 for Tapscript).
+   SCRIPT is the script bytes."
+  (let ((preimage (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                    (write-byte leaf-version s)
+                    ;; Compact size encoding of script length
+                    (let ((len (length script)))
+                      (cond
+                        ((< len #xfd)
+                         (write-byte len s))
+                        ((< len #x10000)
+                         (write-byte #xfd s)
+                         (write-byte (logand len #xff) s)
+                         (write-byte (ash len -8) s))
+                        (t
+                         (write-byte #xfe s)
+                         (write-byte (logand len #xff) s)
+                         (write-byte (logand (ash len -8) #xff) s)
+                         (write-byte (logand (ash len -16) #xff) s)
+                         (write-byte (ash len -24) s))))
+                    (loop for b across script do (write-byte b s)))))
+    (tagged-hash +tag-tap-leaf+ preimage)))
+
+(defun tap-branch-hash (left-hash right-hash)
+  "Compute TapBranch hash: tagged_hash('TapBranch', sorted(left || right)).
+   Hashes are sorted lexicographically before concatenation."
+  (let ((sorted (if (loop for i from 0 below 32
+                          for l = (aref left-hash i)
+                          for r = (aref right-hash i)
+                          thereis (< l r))
+                    (concatenate '(vector (unsigned-byte 8)) left-hash right-hash)
+                    (concatenate '(vector (unsigned-byte 8)) right-hash left-hash))))
+    (tagged-hash +tag-tap-branch+ sorted)))
+
+(defun tap-tweak-hash (internal-pubkey32 &optional merkle-root)
+  "Compute TapTweak hash: tagged_hash('TapTweak', pubkey || merkle_root).
+   INTERNAL-PUBKEY32 is the 32-byte x-only internal public key.
+   MERKLE-ROOT is the optional 32-byte Merkle root (nil for key-path only)."
+  (let ((preimage (if merkle-root
+                      (concatenate '(vector (unsigned-byte 8))
+                                   internal-pubkey32 merkle-root)
+                      internal-pubkey32)))
+    (tagged-hash +tag-tap-tweak+ preimage)))
+
 ;;; Utility functions
 
 (defun bytes-to-hex (bytes)

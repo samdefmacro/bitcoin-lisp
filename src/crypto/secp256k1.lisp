@@ -201,7 +201,207 @@ Returns an internal public key structure, or NIL if invalid."
   (sigout :pointer)
   (sigin :pointer))
 
-;;; Signature verification
+;;; ============================================================
+;;; Schnorr Signatures (BIP 340)
+;;; ============================================================
+
+;;; Constants for x-only pubkeys
+(defconstant +secp256k1-xonly-pubkey-size+ 64
+  "Internal size of an x-only pubkey structure (same as regular pubkey).")
+
+;;; Foreign function definitions for Schnorr
+
+(cffi:defcfun ("secp256k1_xonly_pubkey_parse" secp256k1-xonly-pubkey-parse) :int
+  "Parse a 32-byte x-only public key.
+   Returns 1 on success, 0 on failure."
+  (ctx :pointer)
+  (pubkey :pointer)     ; Output: internal pubkey structure (64 bytes)
+  (input32 :pointer))   ; Input: 32 bytes x-coordinate
+
+(cffi:defcfun ("secp256k1_xonly_pubkey_serialize" secp256k1-xonly-pubkey-serialize) :int
+  "Serialize an x-only pubkey to 32 bytes.
+   Returns 1 always."
+  (ctx :pointer)
+  (output32 :pointer)   ; Output: 32 bytes
+  (pubkey :pointer))    ; Input: internal pubkey structure
+
+(cffi:defcfun ("secp256k1_xonly_pubkey_from_pubkey" secp256k1-xonly-pubkey-from-pubkey) :int
+  "Convert a regular pubkey to an x-only pubkey.
+   Returns 1 always. pk_parity is set to the parity of the Y coordinate."
+  (ctx :pointer)
+  (xonly_pubkey :pointer)  ; Output: x-only pubkey structure
+  (pk_parity :pointer)     ; Output: int* for Y parity (0=even, 1=odd), can be NULL
+  (pubkey :pointer))       ; Input: regular pubkey structure
+
+(cffi:defcfun ("secp256k1_xonly_pubkey_tweak_add" secp256k1-xonly-pubkey-tweak-add) :int
+  "Tweak an x-only public key by adding tweak*G.
+   Returns 1 on success, 0 if the tweak is invalid."
+  (ctx :pointer)
+  (output_pubkey :pointer)    ; Output: regular pubkey structure (tweaked key may have odd Y)
+  (internal_pubkey :pointer)  ; Input: x-only pubkey to tweak
+  (tweak32 :pointer))         ; Input: 32-byte tweak
+
+(cffi:defcfun ("secp256k1_xonly_pubkey_tweak_add_check" secp256k1-xonly-pubkey-tweak-add-check) :int
+  "Verify that output_pubkey = x-only(internal_pubkey + tweak*G) with expected parity.
+   Returns 1 if valid, 0 otherwise."
+  (ctx :pointer)
+  (tweaked_pubkey32 :pointer)   ; Input: 32-byte serialized tweaked pubkey
+  (tweaked_pk_parity :int)      ; Input: expected parity (0 or 1)
+  (internal_pubkey :pointer)    ; Input: x-only pubkey structure
+  (tweak32 :pointer))           ; Input: 32-byte tweak
+
+(cffi:defcfun ("secp256k1_schnorrsig_verify" secp256k1-schnorrsig-verify) :int
+  "Verify a Schnorr signature (BIP 340).
+   Returns 1 if valid, 0 if invalid."
+  (ctx :pointer)
+  (sig64 :pointer)      ; 64-byte signature
+  (msg :pointer)        ; Message bytes
+  (msglen :size)        ; Message length (typically 32 for hash)
+  (pubkey :pointer))    ; x-only pubkey structure
+
+;;; X-only public key operations
+
+(defun parse-xonly-pubkey (pubkey32)
+  "Parse a 32-byte x-only public key.
+   Returns internal pubkey structure (64 bytes), or NIL if invalid."
+  (ensure-secp256k1-loaded)
+  (unless (= (length pubkey32) 32)
+    (return-from parse-xonly-pubkey nil))
+  (cffi:with-foreign-objects ((pubkey :uint8 +secp256k1-xonly-pubkey-size+)
+                               (input :uint8 32))
+    ;; Copy input bytes
+    (loop for i from 0 below 32
+          do (setf (cffi:mem-aref input :uint8 i) (aref pubkey32 i)))
+    ;; Parse
+    (let ((result (secp256k1-xonly-pubkey-parse *secp256k1-context* pubkey input)))
+      (when (= result 1)
+        ;; Return copy of parsed pubkey structure
+        (let ((parsed (make-array +secp256k1-xonly-pubkey-size+
+                                  :element-type '(unsigned-byte 8))))
+          (loop for i from 0 below +secp256k1-xonly-pubkey-size+
+                do (setf (aref parsed i) (cffi:mem-aref pubkey :uint8 i)))
+          parsed)))))
+
+(defun xonly-pubkey-valid-p (pubkey32)
+  "Check if 32 bytes represent a valid x-only public key (point on curve)."
+  (not (null (parse-xonly-pubkey pubkey32))))
+
+(defun tweak-xonly-pubkey (xonly-pubkey32 tweak32)
+  "Tweak an x-only public key: output = internal_pubkey + tweak*G.
+   Returns (values tweaked-pubkey32 parity) where:
+   - tweaked-pubkey32 is the 32-byte x-coordinate of the result
+   - parity is 0 if Y is even, 1 if Y is odd
+   Returns (values nil nil) on failure."
+  (ensure-secp256k1-loaded)
+  (let ((internal-pubkey (parse-xonly-pubkey xonly-pubkey32)))
+    (unless internal-pubkey
+      (return-from tweak-xonly-pubkey (values nil nil))))
+  (cffi:with-foreign-objects ((output-pubkey :uint8 +secp256k1-pubkey-size+)
+                               (internal :uint8 +secp256k1-xonly-pubkey-size+)
+                               (tweak :uint8 32)
+                               (output32 :uint8 32)
+                               (parity :int))
+    ;; Copy internal pubkey
+    (let ((parsed (parse-xonly-pubkey xonly-pubkey32)))
+      (loop for i from 0 below +secp256k1-xonly-pubkey-size+
+            do (setf (cffi:mem-aref internal :uint8 i) (aref parsed i))))
+    ;; Copy tweak
+    (loop for i from 0 below 32
+          do (setf (cffi:mem-aref tweak :uint8 i) (aref tweak32 i)))
+    ;; Perform tweak
+    (let ((result (secp256k1-xonly-pubkey-tweak-add
+                   *secp256k1-context*
+                   output-pubkey
+                   internal
+                   tweak)))
+      (unless (= result 1)
+        (return-from tweak-xonly-pubkey (values nil nil)))
+      ;; Convert output to x-only and serialize
+      (cffi:with-foreign-objects ((output-xonly :uint8 +secp256k1-xonly-pubkey-size+))
+        (secp256k1-xonly-pubkey-from-pubkey
+         *secp256k1-context*
+         output-xonly
+         parity
+         output-pubkey)
+        (secp256k1-xonly-pubkey-serialize
+         *secp256k1-context*
+         output32
+         output-xonly)
+        ;; Copy result
+        (let ((result-bytes (make-array 32 :element-type '(unsigned-byte 8))))
+          (loop for i from 0 below 32
+                do (setf (aref result-bytes i) (cffi:mem-aref output32 :uint8 i)))
+          (values result-bytes (cffi:mem-ref parity :int)))))))
+
+(defun verify-xonly-tweak (tweaked-pubkey32 tweaked-parity internal-pubkey32 tweak32)
+  "Verify that tweaked-pubkey32 = x-only(internal-pubkey32 + tweak32*G).
+   Returns T if valid, NIL otherwise."
+  (ensure-secp256k1-loaded)
+  (let ((internal-parsed (parse-xonly-pubkey internal-pubkey32)))
+    (unless internal-parsed
+      (return-from verify-xonly-tweak nil)))
+  (cffi:with-foreign-objects ((tweaked :uint8 32)
+                               (internal :uint8 +secp256k1-xonly-pubkey-size+)
+                               (tweak :uint8 32))
+    ;; Copy tweaked pubkey
+    (loop for i from 0 below 32
+          do (setf (cffi:mem-aref tweaked :uint8 i) (aref tweaked-pubkey32 i)))
+    ;; Copy internal pubkey
+    (let ((parsed (parse-xonly-pubkey internal-pubkey32)))
+      (loop for i from 0 below +secp256k1-xonly-pubkey-size+
+            do (setf (cffi:mem-aref internal :uint8 i) (aref parsed i))))
+    ;; Copy tweak
+    (loop for i from 0 below 32
+          do (setf (cffi:mem-aref tweak :uint8 i) (aref tweak32 i)))
+    ;; Verify
+    (= 1 (secp256k1-xonly-pubkey-tweak-add-check
+          *secp256k1-context*
+          tweaked
+          tweaked-parity
+          internal
+          tweak))))
+
+;;; Schnorr signature verification
+
+(defun verify-schnorr-signature (message-hash signature64 xonly-pubkey32)
+  "Verify a BIP 340 Schnorr signature.
+   MESSAGE-HASH: 32-byte hash of the message
+   SIGNATURE64: 64-byte Schnorr signature (r || s)
+   XONLY-PUBKEY32: 32-byte x-only public key
+   Returns T if valid, NIL if invalid."
+  (ensure-secp256k1-loaded)
+  ;; Validate sizes
+  (unless (= (length message-hash) 32)
+    (return-from verify-schnorr-signature nil))
+  (unless (= (length signature64) 64)
+    (return-from verify-schnorr-signature nil))
+  (unless (= (length xonly-pubkey32) 32)
+    (return-from verify-schnorr-signature nil))
+  ;; Parse the x-only pubkey
+  (let ((parsed-pubkey (parse-xonly-pubkey xonly-pubkey32)))
+    (unless parsed-pubkey
+      (return-from verify-schnorr-signature nil))
+    (cffi:with-foreign-objects ((sig :uint8 64)
+                                 (msg :uint8 32)
+                                 (pubkey :uint8 +secp256k1-xonly-pubkey-size+))
+      ;; Copy signature
+      (loop for i from 0 below 64
+            do (setf (cffi:mem-aref sig :uint8 i) (aref signature64 i)))
+      ;; Copy message hash
+      (loop for i from 0 below 32
+            do (setf (cffi:mem-aref msg :uint8 i) (aref message-hash i)))
+      ;; Copy parsed pubkey
+      (loop for i from 0 below +secp256k1-xonly-pubkey-size+
+            do (setf (cffi:mem-aref pubkey :uint8 i) (aref parsed-pubkey i)))
+      ;; Verify
+      (= 1 (secp256k1-schnorrsig-verify
+            *secp256k1-context*
+            sig
+            msg
+            32  ; message length
+            pubkey)))))
+
+;;; Signature verification (ECDSA)
 
 (defun verify-signature (message-hash signature pubkey-bytes &key strict low-s)
   "Verify an ECDSA signature.

@@ -261,6 +261,15 @@
    #:SE-WitnessMalleated
    #:SE-WitnessPubkeyType
    #:SE-DiscourageUpgradableWitnessProgram
+   ;; Taproot errors (BIP 341/342)
+   #:SE-TaprootInvalidSignature
+   #:SE-TaprootInvalidControlBlock
+   #:SE-TaprootMerkleMismatch
+   #:SE-TapscriptInvalidOpcode
+   #:SE-SchnorrSignatureSize
+   ;; Taproot support (BIP 341)
+   #:is-taproot-program
+   #:OP-CHECKSIGADD
    ;; Result helpers (for CL interop)
    #:script-result-ok-p
    #:script-result-err-p
