@@ -1,31 +1,32 @@
 # Bitcoin-Lisp Script Interpreter Progress
 
-*Last updated: 2026-01-16*
+*Last updated: 2026-01-27*
 
 ## Current Status
 
-**Test Results:** 1042 passed / 1190 total run (88% pass rate)
+**Test Results:** 1213 passed / 1213 total run (100% pass rate)
 
 | Category | Count |
 |----------|-------|
-| Passed | 1042 |
-| Failed (P2SH) | 127 |
-| Failed (Other) | 21 |
-| Skipped (WITNESS) | 23 |
+| Passed | 1213 |
+| Failed | 0 |
 
-## Todo List
+## Completed Features
 
 - [x] Fix script.lisp compilation issue
 - [x] Implement CHECKSIG with transaction context
 - [x] Implement STRICTENC validation for signatures
 - [x] Implement CHECKMULTISIG
-- [x] **Implement MINIMALDATA validation** (0 failures)
-- [x] **Fix EVAL_FALSE detection** (stack top truthiness check)
-- [x] **Implement lax DER signature parsing** (for non-DERSIG mode)
-- [x] **Implement strict DER validation** (for DERSIG flag)
-- [ ] Implement NULLFAIL validation
-- [ ] Fix remaining CHECKMULTISIG edge cases
-- [ ] Implement SIGPUSHONLY validation
+- [x] Implement MINIMALDATA validation
+- [x] Fix EVAL_FALSE detection (stack top truthiness check)
+- [x] Implement lax DER signature parsing (for non-DERSIG mode)
+- [x] Implement strict DER validation (for DERSIG flag)
+- [x] Implement NULLFAIL validation
+- [x] Fix CHECKMULTISIG edge cases
+- [x] Implement SIGPUSHONLY validation
+- [x] Implement SegWit (BIP 141/143)
+- [x] Implement Taproot (BIP 340-342)
+- [x] Implement Initial Block Download (IBD)
 
 ## Completed Work
 
@@ -82,6 +83,16 @@
   - Returns `:sig-der` error on invalid format
 - `verify-signature` now accepts `:strict` keyword
 
+### Tapscript (BIP 342) Implementation
+- Location: `src/coalton/script.lisp`, `src/coalton/interop.lisp`
+- **Error types added**: `SE-TapscriptMinimalIf`, `SE-TapscriptCheckmultisig`, `SE-TapscriptInvalidSig`
+- **OP_SUCCESS pre-scan**: Scripts with OP_SUCCESS opcodes succeed immediately
+- **MINIMALIF rule**: In Tapscript, IF/NOTIF arguments must be empty or `[0x01]`
+- **CHECKMULTISIG disabled**: Returns `SE-TapscriptCheckmultisig` in Tapscript context
+- **CHECKSIG/CHECKSIGVERIFY**: Uses Schnorr verification in Tapscript, ECDSA in legacy
+- **OP_CHECKSIGADD**: New opcode for Tapscript multi-sig (sig n pubkey -> n+valid)
+- **Signature verification**: Invalid non-empty signatures fail immediately in Tapscript
+
 ### Key Technical Details
 
 **Coalton-CL Interop Pattern:**
@@ -98,19 +109,9 @@ Project requires this flag due to Coalton warnings:
   (asdf:load-system :bitcoin-lisp))
 ```
 
-## Remaining Failures (21)
+## All Tests Passing
 
-### By Category:
-- **CHECKMULTISIG edge cases** (8 tests): Signature counting and empty signature handling
-- **NULLFAIL** (3 tests): Not yet implemented
-- **DERSIG edge cases** (5 tests): Complex BIP66 validation scenarios
-- **STRICTENC + CHECKMULTISIG** (3 tests): Validation error propagation in multisig
-- **Other** (2 tests): Miscellaneous
-
-### Next Steps:
-1. Implement NULLFAIL validation (signature must be empty if verification fails)
-2. Fix CHECKMULTISIG signature counting edge cases
-3. Implement SIGPUSHONLY validation
+All Bitcoin Core script_tests.json tests now pass (1213/1213 = 100%).
 
 ## Files Modified
 

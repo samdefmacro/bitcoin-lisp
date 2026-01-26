@@ -70,7 +70,11 @@
     SE-TaprootInvalidControlBlock  ; Malformed control block
     SE-TaprootMerkleMismatch       ; Merkle proof doesn't match output key
     SE-TapscriptInvalidOpcode      ; Disabled opcode in Tapscript context
-    SE-SchnorrSignatureSize)       ; Signature not 64 or 65 bytes
+    SE-SchnorrSignatureSize        ; Signature not 64 or 65 bytes
+    ;; Tapscript-specific errors (BIP 342)
+    SE-TapscriptMinimalIf          ; IF/NOTIF argument not empty or [0x01]
+    SE-TapscriptCheckmultisig      ; CHECKMULTISIG used in Tapscript (disabled)
+    SE-TapscriptInvalidSig)        ; Non-empty invalid signature in Tapscript
 
   ;;;; ScriptResult - Result type for script operations
 
@@ -1653,9 +1657,31 @@
            (match (stack-pop (context-main-stack ctx))
              ((None) (ScriptErr SE-StackUnderflow))
              ((Some (Tuple top new-stack))
-              (let ((cond-val (cast-to-bool top)))
-                (ScriptOk (push-condition cond-val
-                                          (context-with-main-stack new-stack ctx))))))
+              ;; BIP 342: In Tapscript, IF/NOTIF argument must be empty or [0x01]
+              (let ((is-tapscript (lisp Boolean ()
+                                    (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
+                                                "TAPSCRIPT"))))
+                (if is-tapscript
+                    ;; Tapscript: strict MINIMALIF - only empty or [0x01]
+                    (let ((len (lisp UFix (top) (cl:length top))))
+                      (cond
+                        ;; Empty = false
+                        ((== len 0)
+                         (ScriptOk (push-condition False
+                                                   (context-with-main-stack new-stack ctx))))
+                        ;; [0x01] = true
+                        ((== len 1)
+                         (let ((b (lisp U8 (top) (cl:aref top 0))))
+                           (if (== b 1)
+                               (ScriptOk (push-condition True
+                                                         (context-with-main-stack new-stack ctx)))
+                               (ScriptErr SE-TapscriptMinimalIf))))
+                        ;; Anything else is invalid
+                        (True (ScriptErr SE-TapscriptMinimalIf))))
+                    ;; Legacy: normal bool cast
+                    (let ((cond-val (cast-to-bool top)))
+                      (ScriptOk (push-condition cond-val
+                                                (context-with-main-stack new-stack ctx))))))))
            ;; Not executing - just track nesting
            (ScriptOk (push-condition False ctx))))
 
@@ -1665,9 +1691,31 @@
            (match (stack-pop (context-main-stack ctx))
              ((None) (ScriptErr SE-StackUnderflow))
              ((Some (Tuple top new-stack))
-              (let ((cond-val (not (cast-to-bool top))))
-                (ScriptOk (push-condition cond-val
-                                          (context-with-main-stack new-stack ctx))))))
+              ;; BIP 342: In Tapscript, IF/NOTIF argument must be empty or [0x01]
+              (let ((is-tapscript (lisp Boolean ()
+                                    (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
+                                                "TAPSCRIPT"))))
+                (if is-tapscript
+                    ;; Tapscript: strict MINIMALIF - only empty or [0x01]
+                    (let ((len (lisp UFix (top) (cl:length top))))
+                      (cond
+                        ;; Empty = true (inverted)
+                        ((== len 0)
+                         (ScriptOk (push-condition True
+                                                   (context-with-main-stack new-stack ctx))))
+                        ;; [0x01] = false (inverted)
+                        ((== len 1)
+                         (let ((b (lisp U8 (top) (cl:aref top 0))))
+                           (if (== b 1)
+                               (ScriptOk (push-condition False
+                                                         (context-with-main-stack new-stack ctx)))
+                               (ScriptErr SE-TapscriptMinimalIf))))
+                        ;; Anything else is invalid
+                        (True (ScriptErr SE-TapscriptMinimalIf))))
+                    ;; Legacy: normal bool cast (inverted)
+                    (let ((cond-val (not (cast-to-bool top))))
+                      (ScriptOk (push-condition cond-val
+                                                (context-with-main-stack new-stack ctx))))))))
            ;; Not executing - just track nesting
            (ScriptOk (push-condition False ctx))))
 
@@ -1698,65 +1746,115 @@
                        ctx))))))
 
       ((OP-CHECKSIG)
-       ;; Pop pubkey and sig, verify signature using test transaction format
-       (match (stack-pop (context-main-stack ctx))
-         ((None) (ScriptErr SE-StackUnderflow))
-         ((Some (Tuple pubkey stack1))
-          (match (stack-pop stack1)
-            ((None) (ScriptErr SE-StackUnderflow))
-            ((Some (Tuple sig new-stack))
-             ;; Call into CL to verify signature using test transaction format
-             ;; Uses verify-checksig-for-script which tracks STRICTENC errors
-             (let ((valid (lisp Boolean (sig pubkey ctx)
-                            (cl:let* ((script (context-script ctx))
-                                      (codesep-pos (context-codesep-pos ctx))
-                                      (subscript (cl:subseq script codesep-pos))
-                                      (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                      (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                      (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
-                              (cl:funcall fn sig-arr pk-arr subscript)))))
-               ;; Check for STRICTENC validation error (bad sighash type or pubkey format)
-               (let ((strictenc-error (lisp Boolean ()
-                                        (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
-                 (if strictenc-error
-                     (ScriptErr SE-VerifyFailed)
-                     (ScriptOk (context-with-main-stack
-                                (stack-push (if valid (true-bytes) (false-bytes)) new-stack)
-                                ctx))))))))))
+       ;; Pop pubkey and sig, verify signature
+       (let ((is-tapscript (lisp Boolean ()
+                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
+                                         "TAPSCRIPT"))))
+         (match (stack-pop (context-main-stack ctx))
+           ((None) (ScriptErr SE-StackUnderflow))
+           ((Some (Tuple pubkey stack1))
+            (match (stack-pop stack1)
+              ((None) (ScriptErr SE-StackUnderflow))
+              ((Some (Tuple sig new-stack))
+               (if is-tapscript
+                   ;; Tapscript: Use Schnorr verification, fail on invalid non-empty sig
+                   (let ((result (lisp UFix (sig pubkey)
+                                   (cl:let* ((sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                             (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                             (verify-fn (cl:fdefinition (cl:intern "VERIFY-TAPSCRIPT-SIGNATURE" "BITCOIN-LISP.COALTON.INTEROP"))))
+                                     (cl:multiple-value-bind (status valid)
+                                         (cl:funcall verify-fn sig-arr pk-arr)
+                                       (cl:cond
+                                         ((cl:eq status :empty-sig) 0)
+                                         ((cl:and (cl:eq status :ok) valid) 1)
+                                         (cl:t 2)))))))
+                     (cond
+                       ((== result 0)
+                        (ScriptOk (context-with-main-stack
+                                   (stack-push (false-bytes) new-stack)
+                                   ctx)))
+                       ((== result 1)
+                        (ScriptOk (context-with-main-stack
+                                   (stack-push (true-bytes) new-stack)
+                                   ctx)))
+                       (True
+                        (ScriptErr SE-TapscriptInvalidSig))))
+                   ;; Legacy/SegWit v0: Use ECDSA verification
+                   (let ((valid (lisp Boolean (sig pubkey ctx)
+                                  (cl:let* ((script (context-script ctx))
+                                            (codesep-pos (context-codesep-pos ctx))
+                                            (subscript (cl:subseq script codesep-pos))
+                                            (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                            (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                            (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
+                                    (cl:funcall fn sig-arr pk-arr subscript)))))
+                     (let ((strictenc-error (lisp Boolean ()
+                                              (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
+                       (if strictenc-error
+                           (ScriptErr SE-VerifyFailed)
+                           (ScriptOk (context-with-main-stack
+                                      (stack-push (if valid (true-bytes) (false-bytes)) new-stack)
+                                      ctx))))))))))))
 
       ((OP-CHECKSIGVERIFY)
        ;; CHECKSIG then VERIFY - verify signature and fail if invalid
-       (match (stack-pop (context-main-stack ctx))
-         ((None) (ScriptErr SE-StackUnderflow))
-         ((Some (Tuple pubkey stack1))
-          (match (stack-pop stack1)
-            ((None) (ScriptErr SE-StackUnderflow))
-            ((Some (Tuple sig new-stack))
-             ;; Call into CL to verify signature
-             ;; Uses verify-checksig-for-script which tracks STRICTENC errors
-             (let ((valid (lisp Boolean (sig pubkey ctx)
-                            (cl:let* ((script (context-script ctx))
-                                      (codesep-pos (context-codesep-pos ctx))
-                                      (subscript (cl:subseq script codesep-pos))
-                                      (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                      (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
-                                      (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
-                              (cl:funcall fn sig-arr pk-arr subscript)))))
-               ;; Check for STRICTENC validation error
-               (let ((strictenc-error (lisp Boolean ()
-                                        (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
-                 (if strictenc-error
-                     (ScriptErr SE-VerifyFailed)
-                     (if valid
-                         (ScriptOk (context-with-main-stack new-stack ctx))
-                         (ScriptErr SE-VerifyFailed))))))))))
+       (let ((is-tapscript (lisp Boolean ()
+                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
+                                         "TAPSCRIPT"))))
+         (match (stack-pop (context-main-stack ctx))
+           ((None) (ScriptErr SE-StackUnderflow))
+           ((Some (Tuple pubkey stack1))
+            (match (stack-pop stack1)
+              ((None) (ScriptErr SE-StackUnderflow))
+              ((Some (Tuple sig new-stack))
+               (if is-tapscript
+                   ;; Tapscript: Use Schnorr verification
+                   (let ((result (lisp UFix (sig pubkey)
+                                   (cl:let* ((sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                             (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                             (verify-fn (cl:fdefinition (cl:intern "VERIFY-TAPSCRIPT-SIGNATURE" "BITCOIN-LISP.COALTON.INTEROP"))))
+                                     (cl:multiple-value-bind (status valid)
+                                         (cl:funcall verify-fn sig-arr pk-arr)
+                                       (cl:cond
+                                         ((cl:eq status :empty-sig) 0)
+                                         ((cl:and (cl:eq status :ok) valid) 1)
+                                         (cl:t 2)))))))
+                     (cond
+                       ((== result 0)
+                        (ScriptErr SE-VerifyFailed))
+                       ((== result 1)
+                        (ScriptOk (context-with-main-stack new-stack ctx)))
+                       (True
+                        (ScriptErr SE-TapscriptInvalidSig))))
+                   ;; Legacy/SegWit v0: Use ECDSA verification
+                   (let ((valid (lisp Boolean (sig pubkey ctx)
+                                  (cl:let* ((script (context-script ctx))
+                                            (codesep-pos (context-codesep-pos ctx))
+                                            (subscript (cl:subseq script codesep-pos))
+                                            (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                            (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                            (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
+                                    (cl:funcall fn sig-arr pk-arr subscript)))))
+                     (let ((strictenc-error (lisp Boolean ()
+                                              (cl:funcall (cl:fdefinition (cl:intern "LAST-CHECKSIG-HAD-STRICTENC-ERROR-P" "BITCOIN-LISP.COALTON.INTEROP"))))))
+                       (if strictenc-error
+                           (ScriptErr SE-VerifyFailed)
+                           (if valid
+                               (ScriptOk (context-with-main-stack new-stack ctx))
+                               (ScriptErr SE-VerifyFailed))))))))))))
 
       ((OP-CHECKMULTISIG)
        ;; m-of-n multisig verification
        ;; Stack: ... dummy sig1..sigM M pubkey1..pubkeyN N
        ;; Pops all, pushes true/false
        ;; Note: CHECKMULTISIG adds pubkey_count to op count for limit checking
-       (let ((result (lisp (Tuple3 UFix ScriptStack UFix) (ctx)
+       ;; BIP 342: Disabled in Tapscript context
+       (let ((is-tapscript (lisp Boolean ()
+                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
+                                         "TAPSCRIPT"))))
+         (if is-tapscript
+             (ScriptErr SE-TapscriptCheckmultisig)
+             (let ((result (lisp (Tuple3 UFix ScriptStack UFix) (ctx)
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
@@ -1791,12 +1889,18 @@
            ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
            ((Tuple3 4 _ _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
            ((Tuple3 5 _ _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
-           (_ (ScriptErr SE-UnknownOpcode)))))
+           (_ (ScriptErr SE-UnknownOpcode)))))))
 
       ((OP-CHECKMULTISIGVERIFY)
        ;; CHECKMULTISIG then VERIFY - fail if result is false
        ;; Note: CHECKMULTISIGVERIFY adds pubkey_count to op count for limit checking
-       (let ((result (lisp (Tuple3 UFix ScriptStack UFix) (ctx)
+       ;; BIP 342: Disabled in Tapscript context
+       (let ((is-tapscript (lisp Boolean ()
+                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
+                                         "TAPSCRIPT"))))
+         (if is-tapscript
+             (ScriptErr SE-TapscriptCheckmultisig)
+             (let ((result (lisp (Tuple3 UFix ScriptStack UFix) (ctx)
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
@@ -1829,14 +1933,54 @@
            ((Tuple3 3 _ _) (ScriptErr SE-StackUnderflow))
            ((Tuple3 4 _ _) (ScriptErr SE-VerifyFailed))  ; invalid pubkey count
            ((Tuple3 5 _ _) (ScriptErr SE-VerifyFailed))  ; invalid sig count
-           (_ (ScriptErr SE-UnknownOpcode)))))
+           (_ (ScriptErr SE-UnknownOpcode)))))))
 
       ;; OP_CHECKSIGADD (BIP 342) - only valid in Tapscript context
-      ;; In legacy/SegWit v0 context, this opcode is invalid (was OP_SUCCESS)
+      ;; Stack: sig n pubkey -> n' (n+1 if valid, n if empty sig, fail if invalid)
       ((OP-CHECKSIGADD)
-       ;; In non-Tapscript context, OP_CHECKSIGADD (0xba) is treated as unknown
-       ;; Full Tapscript execution would handle this differently
-       (ScriptErr SE-UnknownOpcode))
+       (let ((is-tapscript (lisp Boolean ()
+                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
+                                         "TAPSCRIPT"))))
+         (if (not is-tapscript)
+             ;; In non-Tapscript context, this is an unknown opcode
+             (ScriptErr SE-UnknownOpcode)
+             ;; Tapscript: Pop pubkey, n, sig; verify; push n+valid
+             (match (stack-pop (context-main-stack ctx))
+               ((None) (ScriptErr SE-StackUnderflow))
+               ((Some (Tuple pubkey stack1))
+                (match (stack-pop stack1)
+                  ((None) (ScriptErr SE-StackUnderflow))
+                  ((Some (Tuple n-bytes stack2))
+                   (match (stack-pop stack2)
+                     ((None) (ScriptErr SE-StackUnderflow))
+                     ((Some (Tuple sig new-stack))
+                      ;; Verify signature and compute result
+                      (let ((result (lisp UFix (sig pubkey)
+                                      (cl:let* ((sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                                (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
+                                                (verify-fn (cl:fdefinition (cl:intern "VERIFY-TAPSCRIPT-SIGNATURE" "BITCOIN-LISP.COALTON.INTEROP"))))
+                                        (cl:multiple-value-bind (status valid)
+                                            (cl:funcall verify-fn sig-arr pk-arr)
+                                          (cl:cond
+                                            ((cl:eq status :empty-sig) 0)
+                                            ((cl:and (cl:eq status :ok) valid) 1)
+                                            (cl:t 2)))))))
+                        (cond
+                          ;; Empty sig: push n unchanged
+                          ((== result 0)
+                           (ScriptOk (context-with-main-stack
+                                      (stack-push n-bytes new-stack)
+                                      ctx)))
+                          ;; Valid sig: push n+1 (increment the script number)
+                          ((== result 1)
+                           (let ((n-plus-1 (lisp (Vector U8) (n-bytes)
+                                             (cl:funcall (cl:fdefinition (cl:intern "INCREMENT-SCRIPT-NUMBER" "BITCOIN-LISP.COALTON.INTEROP")) n-bytes))))
+                             (ScriptOk (context-with-main-stack
+                                        (stack-push n-plus-1 new-stack)
+                                        ctx))))
+                          ;; Invalid non-empty sig: fail
+                          (True
+                           (ScriptErr SE-TapscriptInvalidSig)))))))))))))
 
       ;; Timelocks and NOP1-10
       ;; NOP1 and NOP4-10 are true no-ops unless DISCOURAGE_UPGRADABLE_NOPS flag is set

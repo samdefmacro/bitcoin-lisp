@@ -80,7 +80,15 @@
    #:compute-tweaked-pubkey
    #:verify-taproot-tweak
    #:parse-control-block
-   #:compute-merkle-root-from-path))
+   #:compute-merkle-root-from-path
+   ;; Tapscript / BIP 342
+   #:*tapscript-leaf-hash*
+   #:*tapscript-amount*
+   #:verify-tapscript-signature
+   #:is-op-success-p
+   #:scan-for-op-success
+   #:run-tapscript
+   #:increment-script-number))
 
 (in-package #:bitcoin-lisp.coalton.interop)
 
@@ -257,6 +265,226 @@
            (search flag *script-flags*)
            (search (concatenate 'string "," flag) *script-flags*)
            (search (concatenate 'string flag ",") *script-flags*))))
+
+;;; ============================================================
+;;; Tapscript OP_SUCCESS Detection (BIP 342)
+;;; ============================================================
+
+(defun is-op-success-p (byte)
+  "Check if a byte is an OP_SUCCESS opcode per BIP 342.
+   These opcodes cause immediate script success in Tapscript."
+  (or (= byte #x50)                          ; OP_RESERVED
+      (= byte #x62)                          ; OP_VER
+      (and (>= byte #x7e) (<= byte #x81))    ; OP_CAT..OP_LEFT (126-129)
+      (and (>= byte #x83) (<= byte #x86))    ; OP_INVERT..OP_XOR (131-134)
+      (and (>= byte #x89) (<= byte #x8a))    ; OP_2MUL, OP_2DIV (137-138)
+      (and (>= byte #x8d) (<= byte #x8e))    ; OP_MUL, OP_DIV (141-142)
+      (and (>= byte #x95) (<= byte #x99))    ; (149-153)
+      (and (>= byte #xbb) (<= byte #xfe))))  ; 187-254
+
+(defun scan-for-op-success (script-bytes)
+  "Pre-scan a Tapscript for OP_SUCCESS opcodes.
+   Per BIP 342, if any OP_SUCCESS is found (even in unexecuted branches),
+   the entire script succeeds immediately.
+   Returns T if OP_SUCCESS found, NIL otherwise."
+  (let ((len (length script-bytes))
+        (pos 0))
+    (loop while (< pos len)
+          do (let ((op (aref script-bytes pos)))
+               (cond
+                 ;; Check for OP_SUCCESS first
+                 ((is-op-success-p op)
+                  (return-from scan-for-op-success t))
+                 ;; OP_0 (0x00) - no data
+                 ((= op 0)
+                  (incf pos))
+                 ;; Direct push 1-75 bytes (0x01-0x4b)
+                 ((and (>= op 1) (<= op #x4b))
+                  (incf pos (1+ op))  ; op + data
+                  (when (> pos len)
+                    (return-from scan-for-op-success nil)))
+                 ;; OP_PUSHDATA1 (0x4c)
+                 ((= op #x4c)
+                  (when (>= (1+ pos) len)
+                    (return-from scan-for-op-success nil))
+                  (let ((data-len (aref script-bytes (1+ pos))))
+                    (incf pos (+ 2 data-len))
+                    (when (> pos len)
+                      (return-from scan-for-op-success nil))))
+                 ;; OP_PUSHDATA2 (0x4d)
+                 ((= op #x4d)
+                  (when (>= (+ pos 2) len)
+                    (return-from scan-for-op-success nil))
+                  (let ((data-len (+ (aref script-bytes (+ pos 1))
+                                     (ash (aref script-bytes (+ pos 2)) 8))))
+                    (incf pos (+ 3 data-len))
+                    (when (> pos len)
+                      (return-from scan-for-op-success nil))))
+                 ;; OP_PUSHDATA4 (0x4e)
+                 ((= op #x4e)
+                  (when (>= (+ pos 4) len)
+                    (return-from scan-for-op-success nil))
+                  (let ((data-len (+ (aref script-bytes (+ pos 1))
+                                     (ash (aref script-bytes (+ pos 2)) 8)
+                                     (ash (aref script-bytes (+ pos 3)) 16)
+                                     (ash (aref script-bytes (+ pos 4)) 24))))
+                    (incf pos (+ 5 data-len))
+                    (when (> pos len)
+                      (return-from scan-for-op-success nil))))
+                 ;; Any other opcode - just skip
+                 (t (incf pos)))))
+    nil))
+
+;;; ============================================================
+;;; Tapscript Context Variables (BIP 342)
+;;; ============================================================
+
+(defvar *tapscript-leaf-hash* nil
+  "The tapleaf hash for Tapscript script path spending.
+   Set when executing a Tapscript, used for BIP 341 sighash computation.")
+
+(defvar *tapscript-amount* 0
+  "The input amount for Tapscript script path spending.
+   Set when executing a Tapscript, used for BIP 341 sighash computation.")
+
+(defvar *tapscript-internal-pubkey* nil
+  "The internal public key for Tapscript script path spending.
+   Set when executing a Tapscript.")
+
+(defun verify-tapscript-signature (sig-bytes pubkey-bytes)
+  "Verify a Tapscript signature (BIP 342 rules).
+   SIG-BYTES: signature (64 bytes for default sighash, 65 bytes with explicit type)
+   PUBKEY-BYTES: 32-byte x-only public key
+   Returns (values status result) where:
+     status: :ok, :empty-sig, :invalid-sig, :invalid-pubkey, :bad-sighash-type
+     result: T if valid, NIL otherwise"
+  ;; Empty signature is treated specially (for OP_CHECKSIGADD)
+  (when (zerop (length sig-bytes))
+    (return-from verify-tapscript-signature (values :empty-sig nil)))
+
+  ;; Signature must be 64 or 65 bytes
+  (let ((sig-len (length sig-bytes)))
+    (unless (or (= sig-len 64) (= sig-len 65))
+      (return-from verify-tapscript-signature (values :invalid-sig nil))))
+
+  ;; Public key must be 32 bytes (x-only)
+  (unless (= (length pubkey-bytes) 32)
+    (return-from verify-tapscript-signature (values :invalid-pubkey nil)))
+
+  (let* ((sig-len (length sig-bytes))
+         (sighash-type (if (= sig-len 65)
+                           (aref sig-bytes 64)
+                           #x00))  ; SIGHASH_DEFAULT
+         (sig64 (if (= sig-len 64) sig-bytes (subseq sig-bytes 0 64))))
+
+    ;; Validate sighash type
+    (unless (valid-taproot-sighash-type-p sighash-type)
+      (return-from verify-tapscript-signature (values :bad-sighash-type nil)))
+
+    ;; Compute BIP 341 sighash with tapleaf extension
+    (let ((sighash (compute-bip341-sighash *tapscript-amount* sighash-type
+                                            *tapscript-leaf-hash* 0)))
+      ;; Verify Schnorr signature
+      (if (bitcoin-lisp.crypto:verify-schnorr-signature sighash sig64 pubkey-bytes)
+          (values :ok t)
+          (values :invalid-sig nil)))))
+
+(defun increment-script-number (bytes)
+  "Increment a Bitcoin Script number by 1.
+   Script numbers are variable-length little-endian integers with sign bit.
+   Returns a new vector with the incremented value."
+  (let* ((len (length bytes)))
+    (if (= len 0)
+        ;; Empty (0) -> 1
+        #(1)
+        ;; Non-empty: decode, increment, encode
+        (let* (;; Decode script number
+               (negative (and (> len 0)
+                             (not (zerop (logand (aref bytes (1- len)) #x80)))))
+               ;; Build magnitude (little-endian)
+               (magnitude 0))
+          ;; Extract magnitude
+          (loop for i from 0 below len
+                for byte = (aref bytes i)
+                for effective-byte = (if (= i (1- len))
+                                        (logand byte #x7f)  ; Clear sign bit
+                                        byte)
+                do (setf magnitude (logior magnitude (ash effective-byte (* i 8)))))
+          ;; Compute new value
+          (let* ((value (if negative (- magnitude) magnitude))
+                 (new-value (1+ value)))
+            ;; Encode as script number
+            (script-number-to-bytes new-value))))))
+
+(defun script-number-to-bytes (n)
+  "Encode an integer as a Bitcoin Script number (minimally encoded little-endian)."
+  (cond
+    ((= n 0) #())
+    (t (let* ((negative (< n 0))
+              (magnitude (abs n))
+              (bytes '()))
+         ;; Build byte list (little-endian)
+         (loop while (> magnitude 0)
+               do (push (logand magnitude #xff) bytes)
+                  (setf magnitude (ash magnitude -8)))
+         (setf bytes (nreverse bytes))
+         ;; Handle sign bit
+         (if (> (logand (car (last bytes)) #x80) 0)
+             ;; Need extra byte for sign
+             (if negative
+                 (setf bytes (append bytes (list #x80)))
+                 (setf bytes (append bytes (list #x00))))
+             ;; Can fit sign in existing high bit
+             (when negative
+               (setf (car (last bytes))
+                     (logior (car (last bytes)) #x80))))
+         (coerce bytes '(vector (unsigned-byte 8)))))))
+
+(defun run-tapscript (script script-inputs leaf-hash amount internal-pubkey)
+  "Execute a Tapscript with BIP 342 rules.
+   SCRIPT: The script bytes to execute
+   SCRIPT-INPUTS: List of witness elements to use as initial stack
+   LEAF-HASH: The tapleaf hash for sighash computation
+   AMOUNT: The input value in satoshis
+   INTERNAL-PUBKEY: The internal public key (32 bytes)
+   Returns (values success error-keyword)."
+  ;; Set up Tapscript context
+  (let* ((old-flags *script-flags*)
+         (old-leaf-hash *tapscript-leaf-hash*)
+         (old-amount *tapscript-amount*)
+         (old-internal-pubkey *tapscript-internal-pubkey*)
+         ;; Add TAPSCRIPT flag
+         (new-flags (if old-flags
+                        (concatenate 'string old-flags ",TAPSCRIPT")
+                        "TAPSCRIPT")))
+    (unwind-protect
+         (progn
+           ;; Set Tapscript context
+           (setf *script-flags* new-flags)
+           (setf *tapscript-leaf-hash* leaf-hash)
+           (setf *tapscript-amount* amount)
+           (setf *tapscript-internal-pubkey* internal-pubkey)
+
+           ;; Convert script-inputs to Coalton stack (list of vectors)
+           ;; Script-inputs is a list of byte arrays, Coalton stack is a list of vectors
+           (let* ((script-vec (cl-array-to-coalton-vector script))
+                  (initial-stack (mapcar #'cl-array-to-coalton-vector script-inputs))
+                  (result (bitcoin-lisp.coalton.script:execute-script-with-stack
+                           script-vec
+                           initial-stack)))
+             ;; Check result
+             (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
+                 (let ((final-stack (bitcoin-lisp.coalton.script:get-ok-stack result)))
+                   ;; Script succeeded, check if top of stack is truthy
+                   (if (stack-top-truthy-p final-stack)
+                       (values t nil)
+                       (values nil :script-eval-false)))
+                 (values nil :script-error))))
+      ;; Restore context
+      (setf *script-flags* old-flags)
+      (setf *tapscript-leaf-hash* old-leaf-hash)
+      (setf *tapscript-amount* old-amount)
+      (setf *tapscript-internal-pubkey* old-internal-pubkey))))
 
 ;;; ============================================================
 ;;; SIGPUSHONLY Validation
@@ -1349,11 +1577,16 @@
             (return-from validate-taproot-script-path (values nil :taproot-merkle-mismatch)))
 
           ;; Execute the script in Tapscript mode
-          ;; For now, if leaf version is 0xc0 (Tapscript), execute
           (if (= leaf-version #xc0)
-              ;; TODO: Full Tapscript execution with BIP 342 rules
-              ;; For now, return success as placeholder
-              (values t nil)
+              ;; Leaf version 0xc0 = Tapscript (BIP 342)
+              (progn
+                ;; 1. Pre-scan for OP_SUCCESS
+                ;; If any OP_SUCCESS opcode is found, script succeeds immediately
+                (when (scan-for-op-success script)
+                  (return-from validate-taproot-script-path (values t nil)))
+
+                ;; 2. Execute the Tapscript with witness inputs as stack
+                (run-tapscript script script-inputs leaf-hash amount internal-pubkey))
               ;; Unknown leaf version - anyone can spend if DISCOURAGE flag not set
               (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION")
                   (values nil :discourage-upgradable-witness-program)
