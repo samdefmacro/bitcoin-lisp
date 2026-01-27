@@ -40,12 +40,15 @@
   (chain-state nil)
   (block-store nil)
   (utxo-set nil)
+  (mempool nil)
   (peers '() :type list)
   (running nil :type boolean)
   (log-level :info :type keyword)
   (sync-thread nil :type (or null bt:thread))
   (syncing nil :type boolean)
-  (lock (bt:make-lock "node-lock")))
+  (lock (bt:make-lock "node-lock"))
+  (known-addresses '() :type list)
+  (max-peers 8 :type (unsigned-byte 8)))
 
 (defvar *node* nil
   "Current running node instance.")
@@ -236,6 +239,7 @@ Returns the node instance."
 
   ;; Initialize node
   (setf *node* (init-node data-directory :network network :log-level log-level))
+  (setf (node-max-peers *node*) max-peers)
   (log-info "Bitcoin-Lisp Node v0.1.0")
   (log-info "Network: ~A" network)
   (log-info "Data directory: ~A" data-directory)
@@ -271,6 +275,24 @@ Returns the node instance."
   ;; Initialize UTXO set
   (log-info "Initializing UTXO set...")
   (setf (node-utxo-set *node*) (bitcoin-lisp.storage:make-utxo-set))
+
+  ;; Load persisted UTXO set if available
+  (let ((utxo-path (bitcoin-lisp.storage:utxo-set-file-path
+                    (node-data-directory *node*))))
+    (when (bitcoin-lisp.storage:load-utxo-set (node-utxo-set *node*) utxo-path)
+      (log-info "Loaded persisted UTXO set: ~D entries"
+                (bitcoin-lisp.storage:utxo-count (node-utxo-set *node*)))))
+
+  ;; Load persisted header index if available
+  (when (bitcoin-lisp.storage:load-header-index (node-chain-state *node*))
+    (log-info "Loaded persisted header index: ~D entries"
+              (hash-table-count
+               (bitcoin-lisp.storage::chain-state-block-index
+                (node-chain-state *node*)))))
+
+  ;; Initialize mempool
+  (log-info "Initializing mempool...")
+  (setf (node-mempool *node*) (bitcoin-lisp.mempool:make-mempool))
 
   ;; Initialize secp256k1
   (log-info "Initializing cryptographic context...")
@@ -336,6 +358,18 @@ Returns the node instance."
   (when (node-chain-state *node*)
     (bitcoin-lisp.storage:save-state (node-chain-state *node*)))
 
+  ;; Save UTXO set
+  (log-info "Saving UTXO set...")
+  (when (node-utxo-set *node*)
+    (bitcoin-lisp.storage:save-utxo-set
+     (node-utxo-set *node*)
+     (bitcoin-lisp.storage:utxo-set-file-path (node-data-directory *node*))))
+
+  ;; Save header index
+  (log-info "Saving header index...")
+  (when (node-chain-state *node*)
+    (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
+
   ;; Cleanup secp256k1
   (bitcoin-lisp.crypto:cleanup-secp256k1)
 
@@ -352,8 +386,11 @@ Returns the node instance."
   (let ((addresses (bitcoin-lisp.networking:discover-peers)))
     (log-info "Found ~D potential peers" (length addresses))
 
+    ;; Store discovered addresses for reconnection
+    (setf (node-known-addresses node) (alexandria:shuffle (copy-list addresses)))
+
     (let ((connected 0))
-      (dolist (addr (alexandria:shuffle (copy-list addresses)))
+      (dolist (addr (node-known-addresses node))
         (when (>= connected max-peers)
           (return))
 
@@ -362,6 +399,7 @@ Returns the node instance."
             (let ((peer (bitcoin-lisp.networking:connect-peer
                          addr (network-port (node-network node)))))
               (when peer
+                (setf (bitcoin-lisp.networking:peer-address peer) addr)
                 (log-info "Connected to ~A" addr)
                 ;; Perform handshake
                 (when (bitcoin-lisp.networking:perform-handshake peer)
@@ -378,6 +416,69 @@ Returns the node instance."
 
       (log-info "Connected to ~D peer~:P" connected)
       connected)))
+
+;;;; Peer Health and Reconnection
+
+(defun check-peers-health (node)
+  "Check health of all peers. Disconnect unresponsive ones."
+  (let ((to-disconnect '()))
+    (dolist (peer (node-peers node))
+      (let ((status (bitcoin-lisp.networking:check-peer-health peer)))
+        (when (eq status :disconnect)
+          (push peer to-disconnect))))
+    (dolist (peer to-disconnect)
+      (log-warn "Disconnecting unresponsive peer ~A"
+                (bitcoin-lisp.networking:peer-address peer))
+      (handler-case
+          (bitcoin-lisp.networking:disconnect-peer peer)
+        (error (c) (declare (ignore c))))
+      (setf (node-peers node) (remove peer (node-peers node))))
+    (length to-disconnect)))
+
+(defun replace-disconnected-peers (node)
+  "Replace disconnected peers to maintain target peer count.
+Returns the number of new peers connected."
+  (let* ((active-peers (remove-if-not
+                        (lambda (p)
+                          (eq (bitcoin-lisp.networking:peer-state p) :ready))
+                        (node-peers node)))
+         (needed (- (node-max-peers node) (length active-peers))))
+    (when (<= needed 0)
+      (return-from replace-disconnected-peers 0))
+
+    ;; Remove disconnected peers from list
+    (setf (node-peers node)
+          (remove-if (lambda (p)
+                       (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
+                     (node-peers node)))
+
+    ;; Get addresses already in use
+    (let ((used-addrs (mapcar #'bitcoin-lisp.networking:peer-address
+                              (node-peers node)))
+          (connected 0))
+      (dolist (addr (node-known-addresses node))
+        (when (>= connected needed)
+          (return))
+        (unless (member addr used-addrs :test #'string=)
+          (handler-case
+              (let ((peer (bitcoin-lisp.networking:connect-peer
+                           addr (network-port (node-network node)))))
+                (when peer
+                  (setf (bitcoin-lisp.networking:peer-address peer) addr)
+                  (when (bitcoin-lisp.networking:perform-handshake peer)
+                    (log-info "Replacement peer connected: ~A" addr)
+                    (push peer (node-peers node))
+                    (incf connected))
+                  (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
+                    (bitcoin-lisp.networking:disconnect-peer peer))))
+            (error (c)
+              (declare (ignore c))))))
+      connected)))
+
+(defun maintain-peers (node)
+  "Run periodic peer maintenance: health checks and reconnection."
+  (check-peers-health node)
+  (replace-disconnected-peers node))
 
 ;;;; Blockchain Synchronization
 
@@ -409,29 +510,67 @@ Downloads up to MAX-BLOCKS."
       (bitcoin-lisp.networking:request-headers best-peer (node-chain-state node))
 
       (let ((blocks-synced 0)
-            (last-progress-report 0))
+            (last-progress-report 0)
+            (blocks-since-flush 0)
+            (last-peer-check-time (get-internal-real-time))
+            (peer-check-interval (* 60 internal-time-units-per-second))
+            (current-peer best-peer))
         (loop while (and (node-running node)
                          (< blocks-synced max-blocks)
                          (< (+ start-height blocks-synced) peer-height))
               do (multiple-value-bind (command payload)
-                     (bitcoin-lisp.networking:receive-message best-peer :timeout 120)
-                   (unless command
-                     (log-warn "Timeout waiting for message")
-                     (return))
-                   (bitcoin-lisp.networking:handle-message
-                    best-peer command payload
-                    (node-chain-state node)
-                    (node-utxo-set node)
-                    (node-block-store node))
-                   (when (string= command "block")
-                     (incf blocks-synced)
-                     ;; Progress report every 100 blocks
-                     (when (>= (- blocks-synced last-progress-report) 100)
-                       (log-info "Synced ~D blocks, current height ~D"
-                                 blocks-synced
-                                 (bitcoin-lisp.storage:current-height
-                                  (node-chain-state node)))
-                       (setf last-progress-report blocks-synced)))))
+                     (bitcoin-lisp.networking:receive-message current-peer :timeout 120)
+                   ;; Handle peer failure with failover
+                   (cond
+                     ((null command)
+                      (log-warn "Timeout/disconnect from sync peer, attempting failover...")
+                      (maintain-peers node)
+                      (let ((new-peer (find-best-peer node)))
+                        (unless new-peer
+                          (log-warn "No peers available for failover")
+                          (return))
+                        (setf current-peer new-peer)
+                        (log-info "Failover to peer ~A"
+                                  (bitcoin-lisp.networking:peer-address new-peer))
+                        ;; Re-request headers from new peer
+                        (bitcoin-lisp.networking:request-headers
+                         current-peer (node-chain-state node))))
+                     (t
+                      (bitcoin-lisp.networking:handle-message
+                       current-peer command payload
+                       (node-chain-state node)
+                       (node-utxo-set node)
+                       (node-block-store node)
+                       :mempool (node-mempool node)
+                       :peers (node-peers node))
+                      (when (string= command "block")
+                        (incf blocks-synced)
+                        (incf blocks-since-flush)
+                        ;; Periodic flush every 1000 blocks
+                        (when (>= blocks-since-flush 1000)
+                          (log-info "Periodic flush at height ~D"
+                                    (bitcoin-lisp.storage:current-height
+                                     (node-chain-state node)))
+                          (bitcoin-lisp.storage:save-state (node-chain-state node))
+                          (bitcoin-lisp.storage:save-utxo-set
+                           (node-utxo-set node)
+                           (bitcoin-lisp.storage:utxo-set-file-path
+                            (node-data-directory node)))
+                          (bitcoin-lisp.storage:save-header-index
+                           (node-chain-state node))
+                          (setf blocks-since-flush 0))
+                        ;; Progress report every 100 blocks
+                        (when (>= (- blocks-synced last-progress-report) 100)
+                          (log-info "Synced ~D blocks, current height ~D"
+                                    blocks-synced
+                                    (bitcoin-lisp.storage:current-height
+                                     (node-chain-state node)))
+                          (setf last-progress-report blocks-synced)))))
+                   ;; Periodic peer health check and reconnection
+                   (let ((now (get-internal-real-time)))
+                     (when (> (- now last-peer-check-time) peer-check-interval)
+                       (maintain-peers node)
+                       (setf last-peer-check-time now)))))
 
         (log-info "Sync complete: ~D blocks downloaded, height now ~D"
                   blocks-synced
@@ -479,6 +618,12 @@ Downloads up to MAX-BLOCKS."
   (when (node-utxo-set *node*)
     (format t "  UTXOs: ~D~%"
             (bitcoin-lisp.storage:utxo-count (node-utxo-set *node*))))
+  (format t "~%Mempool:~%")
+  (when (node-mempool *node*)
+    (format t "  Transactions: ~D~%"
+            (bitcoin-lisp.mempool:mempool-count (node-mempool *node*)))
+    (format t "  Size: ~:D bytes~%"
+            (bitcoin-lisp.mempool:mempool-total-size (node-mempool *node*))))
   (format t "~%Peers:~%")
   (if (node-peers *node*)
       (dolist (peer (node-peers *node*))

@@ -18,7 +18,15 @@
   (ping-nonce nil)
   (last-ping-time 0 :type integer)
   (ping-latency 0 :type integer)
-  (send-queue '() :type list))
+  (send-queue '() :type list)
+  ;; Set of txids announced to this peer (hash-table of txid -> t)
+  (announced-txs (make-hash-table :test 'equalp) :type hash-table)
+  ;; Health monitoring
+  (consecutive-ping-failures 0 :type (unsigned-byte 8))
+  (last-health-check 0 :type integer)
+  ;; Block request timeout tracking
+  (block-timeout-count 0 :type (unsigned-byte 8))
+  (address "" :type string))
 
 ;;; Network parameters
 
@@ -167,4 +175,46 @@ Returns T on success, NIL on failure."
              (= nonce (peer-ping-nonce peer)))
     (setf (peer-ping-latency peer)
           (- (get-internal-real-time) (peer-last-ping-time peer)))
-    (setf (peer-ping-nonce peer) nil)))
+    (setf (peer-ping-nonce peer) nil)
+    ;; Reset failure count on successful pong
+    (setf (peer-consecutive-ping-failures peer) 0)))
+
+;;; Peer Health Monitoring
+
+(defconstant +ping-interval-seconds+ 60)
+(defconstant +ping-timeout-seconds+ 30)
+(defconstant +max-ping-failures+ 3)
+(defconstant +max-block-timeouts+ 3)
+
+(defun check-peer-health (peer)
+  "Check health of a single peer. Returns :ok, :ping-sent, or :disconnect.
+Should be called periodically (every ~60s)."
+  (unless (eq (peer-state peer) :ready)
+    (return-from check-peer-health :ok))
+
+  (let ((now (get-internal-real-time))
+        (interval-ticks (* +ping-interval-seconds+ internal-time-units-per-second))
+        (timeout-ticks (* +ping-timeout-seconds+ internal-time-units-per-second)))
+
+    ;; Check if a ping is outstanding and has timed out
+    (when (peer-ping-nonce peer)
+      (when (> (- now (peer-last-ping-time peer)) timeout-ticks)
+        ;; Ping timed out
+        (incf (peer-consecutive-ping-failures peer))
+        (setf (peer-ping-nonce peer) nil)
+        (when (>= (peer-consecutive-ping-failures peer) +max-ping-failures+)
+          (return-from check-peer-health :disconnect))))
+
+    ;; Send a new ping if enough time has passed
+    (when (> (- now (peer-last-health-check peer)) interval-ticks)
+      (setf (peer-last-health-check peer) now)
+      (send-ping peer)
+      (return-from check-peer-health :ping-sent))
+
+    :ok))
+
+(defun record-block-timeout (peer)
+  "Record a block request timeout for PEER.
+Returns T if the peer should be disconnected."
+  (incf (peer-block-timeout-count peer))
+  (>= (peer-block-timeout-count peer) +max-block-timeouts+))

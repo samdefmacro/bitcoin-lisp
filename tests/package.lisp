@@ -25,6 +25,14 @@
   :description "Tests for validation operations"
   :in :bitcoin-lisp-tests)
 
+(def-suite :mempool-tests
+  :description "Tests for mempool operations"
+  :in :bitcoin-lisp-tests)
+
+(def-suite :persistence-tests
+  :description "Tests for persistence, peer health, reorg operations"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :integration-tests
   :description "Integration tests with testnet"
   :in :bitcoin-lisp-tests)

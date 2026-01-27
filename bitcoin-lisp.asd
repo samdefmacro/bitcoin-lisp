@@ -46,6 +46,8 @@
                   :components ((:file "script")
                                (:file "transaction")
                                (:file "block")))
+                 (:module "mempool"
+                  :components ((:file "mempool")))
                  (:module "networking"
                   :components ((:file "connection")
                                (:file "peer")
@@ -75,6 +77,10 @@
                              ;; Bitcoin Core compatibility tests
                              (:file "bitcoin-core-script-tests")
                              ;; IBD tests
-                             (:file "ibd-tests"))))
+                             (:file "ibd-tests")
+                             ;; Mempool tests
+                             (:file "mempool-tests")
+                             ;; Persistence, peer health, reorg tests
+                             (:file "persistence-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
