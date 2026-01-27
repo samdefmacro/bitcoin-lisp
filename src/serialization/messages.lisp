@@ -291,6 +291,18 @@ STOP-HASH is the hash to stop at (or zeros to get maximum blocks)."
                      (write-inv-vector stream inv)))))
     (serialize-message "inv" payload)))
 
+;;;; Transaction message
+
+(defun make-tx-message (tx)
+  "Create a serialized tx message from a transaction."
+  (let ((payload (serialize-transaction tx)))
+    (serialize-message "tx" payload)))
+
+(defun parse-tx-payload (payload)
+  "Parse a tx message payload into a transaction."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (read-transaction stream)))
+
 ;;;; Message parsing
 
 (defun parse-inv-payload (payload)

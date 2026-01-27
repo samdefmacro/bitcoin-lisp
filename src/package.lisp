@@ -121,6 +121,8 @@
    #:make-getheaders-message
    #:make-getdata-message
    #:make-inv-message
+   #:make-tx-message
+   #:parse-tx-payload
    ;; Inventory
    #:inv-vector
    #:make-inv-vector
@@ -166,6 +168,7 @@
    #:utxo-exists-p
    #:utxo-count
    #:apply-block-to-utxo-set
+   #:disconnect-block-from-utxo-set
    ;; Chain state
    #:chain-state
    #:make-chain-state
@@ -187,7 +190,43 @@
    #:bits-to-target
    #:calculate-chain-work
    #:save-state
-   #:load-state))
+   #:load-state
+   ;; UTXO persistence
+   #:save-utxo-set
+   #:load-utxo-set
+   #:utxo-set-file-path
+   #:utxo-set-dirty
+   ;; Header index persistence
+   #:save-header-index
+   #:load-header-index
+   #:append-header-entry))
+
+(defpackage #:bitcoin-lisp.mempool
+  (:use #:cl)
+  (:export
+   ;; Constants
+   #:+default-max-mempool-bytes+
+   #:+default-min-relay-fee-rate+
+   ;; Mempool entry
+   #:mempool-entry
+   #:make-mempool-entry
+   #:mempool-entry-transaction
+   #:mempool-entry-fee
+   #:mempool-entry-size
+   #:mempool-entry-entry-time
+   #:mempool-entry-fee-rate
+   ;; Mempool
+   #:mempool
+   #:make-mempool
+   #:mempool-has
+   #:mempool-get
+   #:mempool-add
+   #:mempool-remove
+   #:mempool-count
+   #:mempool-total-size
+   #:mempool-check-conflict
+   #:mempool-remove-for-block
+   #:mempool-get-transactions))
 
 (defpackage #:bitcoin-lisp.validation
   (:use #:cl)
@@ -196,6 +235,7 @@
    #:validate-transaction-structure
    #:validate-transaction-contextual
    #:validate-transaction-scripts
+   #:validate-transaction-for-mempool
    ;; Script execution
    #:validate-script
    #:execute-script
@@ -205,6 +245,8 @@
    #:check-proof-of-work
    #:compute-merkle-root
    #:connect-block
+   #:find-fork-point
+   #:perform-reorg
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+))
@@ -243,6 +285,16 @@
    #:request-headers
    #:request-blocks
    #:sync-with-peer
+   #:relay-transaction
+   #:peer-announced-txs
+   ;; Peer health
+   #:check-peer-health
+   #:record-block-timeout
+   #:peer-consecutive-ping-failures
+   #:peer-block-timeout-count
+   #:peer-address
+   #:+max-ping-failures+
+   #:+max-block-timeouts+
    ;; Network params
    #:*testnet-port*
    #:*mainnet-port*

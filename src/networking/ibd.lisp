@@ -278,11 +278,28 @@ Walks the header chain and adds block hashes to the pending queue."
              in-flight)
     timed-out))
 
-(defun retry-timed-out-requests ()
-  "Remove timed out requests from in-flight so they can be retried."
-  (let ((timed-out (get-timed-out-requests)))
+(defun retry-timed-out-requests (&optional peers)
+  "Remove timed out requests from in-flight so they can be retried.
+When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
+  (let ((timed-out (get-timed-out-requests))
+        (peers-to-disconnect '()))
     (dolist (hash timed-out)
-      (remhash hash (ibd-context-in-flight *ibd-context*)))
+      (let* ((peer-time (gethash hash (ibd-context-in-flight *ibd-context*)))
+             (peer (car peer-time)))
+        ;; Track timeout for this peer
+        (when (and peer peers)
+          (when (record-block-timeout peer)
+            (pushnew peer peers-to-disconnect)))
+        ;; Remove from in-flight so it can be retried from a different peer
+        (remhash hash (ibd-context-in-flight *ibd-context*))))
+    ;; Disconnect peers that hit the timeout limit
+    (dolist (peer peers-to-disconnect)
+      (when bitcoin-lisp:*node*
+        (bitcoin-lisp:log-warn "Disconnecting slow peer ~A (3 block timeouts)"
+                               (peer-address peer)))
+      (handler-case
+          (disconnect-peer peer)
+        (error () nil)))
     (length timed-out)))
 
 ;;;; Multi-Peer Request Distribution
@@ -292,8 +309,8 @@ Walks the header chain and adds block hashes to the pending queue."
   (unless (and *ibd-context* peers)
     (return-from request-blocks-from-peers 0))
 
-  ;; First, handle any timed out requests
-  (let ((retried (retry-timed-out-requests)))
+  ;; First, handle any timed out requests (with peer tracking)
+  (let ((retried (retry-timed-out-requests peers)))
     (when (> retried 0)
       (bitcoin-lisp:log-warn "Retrying ~D timed out block requests" retried)))
 
@@ -499,7 +516,8 @@ Returns the number of blocks downloaded."
     received-count))
 
 (defun process-received-block (block chain-state utxo-set block-store)
-  "Process a received block - validate and connect to chain."
+  "Process a received block - validate and connect to chain.
+After connecting, drains the queue of any children that can now be connected."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (hash (bitcoin-lisp.serialization:block-header-hash header))
          (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
@@ -523,6 +541,8 @@ Returns the number of blocks downloaded."
                   (progn
                     (bitcoin-lisp.validation:connect-block
                      block chain-state block-store utxo-set)
+                    ;; Drain queued blocks whose parent is now connected
+                    (drain-block-queue chain-state utxo-set block-store)
                     t)
                   (progn
                     (bitcoin-lisp:log-error "Block ~D validation failed: ~A" height error)
@@ -536,3 +556,35 @@ Returns the number of blocks downloaded."
             (when *ibd-context*
               (push (cons height block) (ibd-context-block-queue *ibd-context*)))
             nil)))))
+
+(defun drain-block-queue (chain-state utxo-set block-store)
+  "Process queued blocks whose parents are now connected.
+Repeats until no more queued blocks can be connected."
+  (unless *ibd-context*
+    (return-from drain-block-queue 0))
+  (let ((drained 0))
+    (loop
+      (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
+             (next-height (1+ current-height))
+             (queue (ibd-context-block-queue *ibd-context*))
+             (match (find next-height queue :key #'car)))
+        (unless match
+          (return drained))
+        ;; Remove from queue
+        (setf (ibd-context-block-queue *ibd-context*)
+              (remove match queue :count 1))
+        ;; Try to connect
+        (let* ((block (cdr match))
+               (current-time (bitcoin-lisp.serialization:get-unix-time)))
+          (multiple-value-bind (valid error)
+              (bitcoin-lisp.validation:validate-block
+               block chain-state utxo-set next-height current-time)
+            (if valid
+                (progn
+                  (bitcoin-lisp.validation:connect-block
+                   block chain-state block-store utxo-set)
+                  (incf drained)
+                  (bitcoin-lisp:log-debug "Drained queued block at height ~D" next-height))
+                (progn
+                  (bitcoin-lisp:log-error "Queued block ~D validation failed: ~A"
+                                          next-height error)))))))))

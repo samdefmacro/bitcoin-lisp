@@ -37,8 +37,10 @@ Returns a list of IP address strings."
 
 ;;; Message handling
 
-(defun handle-message (peer command payload chain-state utxo-set block-store)
+(defun handle-message (peer command payload chain-state utxo-set block-store
+                       &key mempool peers)
   "Handle an incoming message from a peer.
+MEMPOOL and PEERS are optional; when provided, transaction relay is enabled.
 Returns T if message was handled, NIL otherwise."
   (cond
     ((string= command "ping")
@@ -54,7 +56,7 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "inv")
-     (handle-inv peer payload chain-state)
+     (handle-inv peer payload chain-state mempool)
      t)
 
     ((string= command "headers")
@@ -62,7 +64,16 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "block")
-     (handle-block peer payload chain-state utxo-set block-store)
+     (handle-block peer payload chain-state utxo-set block-store mempool)
+     t)
+
+    ((string= command "tx")
+     (when mempool
+       (handle-tx peer payload utxo-set mempool chain-state peers))
+     t)
+
+    ((string= command "getdata")
+     (handle-getdata peer payload chain-state mempool)
      t)
 
     ((string= command "addr")
@@ -73,7 +84,7 @@ Returns T if message was handled, NIL otherwise."
 
 ;;; Inventory handling
 
-(defun handle-inv (peer payload chain-state)
+(defun handle-inv (peer payload chain-state &optional mempool)
   "Handle an inv message."
   (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
         (wanted '()))
@@ -87,10 +98,12 @@ Returns T if message was handled, NIL otherwise."
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
            (unless (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
              (push inv wanted)))
-          ;; Transaction inventory (skip for now)
+          ;; Transaction inventory
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
-           nil))))
+           (when (and mempool
+                      (not (bitcoin-lisp.mempool:mempool-has mempool hash)))
+             (push inv wanted))))))
     ;; Request wanted items
     (when wanted
       (send-message peer
@@ -131,7 +144,8 @@ Returns T if message was handled, NIL otherwise."
 
 ;;; Block handling
 
-(defun handle-block (peer payload chain-state utxo-set block-store)
+(defun handle-block (peer payload chain-state utxo-set block-store
+                     &optional mempool)
   "Handle a block message."
   (declare (ignore peer))
   (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
@@ -145,8 +159,12 @@ Returns T if message was handled, NIL otherwise."
             (bitcoin-lisp.validation:validate-block
              block chain-state utxo-set (1+ current-height) current-time)
           (if valid
-              (bitcoin-lisp.validation:connect-block
-               block chain-state block-store utxo-set)
+              (progn
+                (bitcoin-lisp.validation:connect-block
+                 block chain-state block-store utxo-set)
+                ;; Remove confirmed transactions from mempool
+                (when mempool
+                  (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
               (format t "Block ~A rejected: ~A~%"
                       (bitcoin-lisp.crypto:bytes-to-hex hash) error)))))))
 
@@ -161,6 +179,77 @@ Returns T if message was handled, NIL otherwise."
       (loop repeat (min count 1000)  ; Limit to prevent abuse
             collect (bitcoin-lisp.serialization:read-net-addr stream
                                                               :with-timestamp t)))))
+
+;;; Transaction handling
+
+(defun handle-tx (peer payload utxo-set mempool chain-state peers)
+  "Handle a tx message. Validate, add to mempool, and relay."
+  (handler-case
+      (let ((tx (bitcoin-lisp.serialization:parse-tx-payload payload)))
+        (when tx
+          (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+                (current-height (bitcoin-lisp.storage:current-height chain-state)))
+            ;; Mark as announced by this peer
+            (setf (gethash txid (peer-announced-txs peer)) t)
+            ;; Validate for mempool
+            (multiple-value-bind (valid error fee)
+                (bitcoin-lisp.validation:validate-transaction-for-mempool
+                 tx utxo-set mempool current-height)
+              (when valid
+                ;; Add to mempool
+                (let ((tx-size (length (bitcoin-lisp.serialization:serialize-transaction tx)))
+                      (entry-time (bitcoin-lisp.serialization:get-unix-time)))
+                  (let ((result (bitcoin-lisp.mempool:mempool-add
+                                 mempool txid
+                                 (bitcoin-lisp.mempool:make-mempool-entry
+                                  :transaction tx
+                                  :fee fee
+                                  :size tx-size
+                                  :entry-time entry-time))))
+                    (when (eq result :ok)
+                      ;; Relay to other peers
+                      (when peers
+                        (relay-transaction txid peer peers))))))))))
+    (error (c)
+      (declare (ignore c))
+      nil)))
+
+(defun handle-getdata (peer payload chain-state &optional mempool)
+  "Handle a getdata message. Respond with requested transactions or blocks."
+  (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload)))
+    (dolist (inv inv-vectors)
+      (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
+            (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
+        (cond
+          ;; Transaction request
+          ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
+               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
+           (when mempool
+             (let ((entry (bitcoin-lisp.mempool:mempool-get mempool hash)))
+               (when entry
+                 (send-message peer
+                               (bitcoin-lisp.serialization:make-tx-message
+                                (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
+          ;; Block requests are not handled here (handled by IBD/sync)
+          )))))
+
+;;; Transaction relay
+
+(defun relay-transaction (txid source-peer peers)
+  "Relay a transaction to all connected peers except SOURCE-PEER.
+Sends inv messages and tracks announcements to avoid duplicates."
+  (let ((inv-msg (bitcoin-lisp.serialization:make-inv-message
+                  (list (bitcoin-lisp.serialization:make-inv-vector
+                         :type bitcoin-lisp.serialization:+inv-type-tx+
+                         :hash txid)))))
+    (dolist (peer peers)
+      ;; Skip the source peer and disconnected peers
+      (when (and (not (eq peer source-peer))
+                 (eq (peer-state peer) :ready)
+                 ;; Skip if already announced to this peer
+                 (not (gethash txid (peer-announced-txs peer))))
+        (setf (gethash txid (peer-announced-txs peer)) t)
+        (send-message peer inv-msg)))))
 
 ;;; Sync operations
 
