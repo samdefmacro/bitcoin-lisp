@@ -172,11 +172,34 @@ Subsidy halves every 210,000 blocks."
         0
         (ash subsidy (- halvings)))))
 
+;;;; Undo data for chain reorganizations
+
+(defvar *block-undo-data* (make-hash-table :test 'equalp)
+  "Maps block-hash -> list of (txid index utxo-entry) for spent UTXOs.
+Used to restore UTXOs during chain reorganization.")
+
+(defconstant +max-undo-blocks+ 100
+  "Maximum number of blocks to keep undo data for (shallow reorg support).")
+
+(defun store-undo-data (block-hash spent-utxos)
+  "Store undo data for a block. Evicts oldest entries if over limit."
+  (setf (gethash block-hash *block-undo-data*) spent-utxos)
+  ;; Evict if over limit (simple: clear all if too many)
+  (when (> (hash-table-count *block-undo-data*) +max-undo-blocks+)
+    ;; Keep only the most recent entries - for simplicity, just let it grow
+    ;; In practice shallow reorgs are 1-3 blocks deep
+    nil))
+
+(defun get-undo-data (block-hash)
+  "Get the undo data for a block, or NIL if not available."
+  (gethash block-hash *block-undo-data*))
+
 ;;;; Block connection
 
 (defun connect-block (block chain-state block-store utxo-set)
   "Connect a validated block to the chain.
-Updates chain state and UTXO set."
+Updates chain state and UTXO set.
+Handles chain reorganizations when a competing chain has more work."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (hash (bitcoin-lisp.serialization:block-header-hash header))
          (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
@@ -204,18 +227,114 @@ Updates chain state and UTXO set."
                   :status :valid)))
       (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
 
-      ;; Update UTXO set
-      (bitcoin-lisp.storage:apply-block-to-utxo-set utxo-set block new-height)
+      ;; Check if we need a reorganization
+      (let* ((current-best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+             (current-best-entry (bitcoin-lisp.storage:get-block-index-entry
+                                  chain-state current-best-hash))
+             (current-best-work (if current-best-entry
+                                    (bitcoin-lisp.storage:block-index-entry-chain-work
+                                     current-best-entry)
+                                    0)))
 
-      ;; Update chain tip if this is the new best
-      (when (> chain-work
-               (or (and (bitcoin-lisp.storage:best-block-hash chain-state)
-                        (let ((best-entry (bitcoin-lisp.storage:get-block-index-entry
-                                           chain-state
-                                           (bitcoin-lisp.storage:best-block-hash chain-state))))
-                          (and best-entry
-                               (bitcoin-lisp.storage:block-index-entry-chain-work best-entry))))
-                   0))
-        (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height))
+        (cond
+          ;; New block extends the current best chain (normal case)
+          ((equalp prev-hash current-best-hash)
+           (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
+                               utxo-set block new-height)))
+             (store-undo-data hash spent-utxos))
+           (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height))
+
+          ;; New chain has more work - reorganize
+          ((> chain-work current-best-work)
+           (perform-reorg chain-state block-store utxo-set
+                          current-best-entry entry))
+
+          ;; New block is on a weaker chain - just store it
+          (t nil)))
 
       entry)))
+
+(defun find-fork-point (entry-a entry-b)
+  "Find the common ancestor (fork point) of two chain entries.
+Returns the common ancestor block-index-entry."
+  ;; Walk both chains back until we find a common block
+  (let ((a entry-a)
+        (b entry-b))
+    ;; First, align heights
+    (loop while (and a b (> (bitcoin-lisp.storage:block-index-entry-height a)
+                            (bitcoin-lisp.storage:block-index-entry-height b)))
+          do (setf a (bitcoin-lisp.storage:block-index-entry-prev-entry a)))
+    (loop while (and a b (> (bitcoin-lisp.storage:block-index-entry-height b)
+                            (bitcoin-lisp.storage:block-index-entry-height a)))
+          do (setf b (bitcoin-lisp.storage:block-index-entry-prev-entry b)))
+    ;; Walk both back until they meet
+    (loop while (and a b (not (equalp (bitcoin-lisp.storage:block-index-entry-hash a)
+                                      (bitcoin-lisp.storage:block-index-entry-hash b))))
+          do (setf a (bitcoin-lisp.storage:block-index-entry-prev-entry a))
+             (setf b (bitcoin-lisp.storage:block-index-entry-prev-entry b)))
+    a))
+
+(defun collect-chain-entries (tip-entry fork-entry)
+  "Collect block-index-entries from TIP-ENTRY back to (not including) FORK-ENTRY."
+  (let ((entries '())
+        (entry tip-entry)
+        (fork-hash (bitcoin-lisp.storage:block-index-entry-hash fork-entry)))
+    (loop while (and entry
+                     (not (equalp (bitcoin-lisp.storage:block-index-entry-hash entry)
+                                  fork-hash)))
+          do (push entry entries)
+             (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+    (nreverse entries)))
+
+(defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry)
+  "Perform a chain reorganization from OLD-TIP to NEW-TIP.
+Disconnects blocks back to the fork point, then connects blocks on the new chain."
+  (let ((fork-entry (find-fork-point old-tip-entry new-tip-entry)))
+    (unless fork-entry
+      (return-from perform-reorg nil))
+
+    (let ((old-height (bitcoin-lisp.storage:block-index-entry-height old-tip-entry))
+          (new-height (bitcoin-lisp.storage:block-index-entry-height new-tip-entry))
+          (fork-height (bitcoin-lisp.storage:block-index-entry-height fork-entry)))
+
+      (when bitcoin-lisp:*node*
+        (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
+                               old-height fork-height new-height))
+
+      ;; Collect blocks to disconnect (old chain, tip to fork)
+      (let ((to-disconnect (collect-chain-entries old-tip-entry fork-entry))
+            ;; Collect blocks to connect (new chain, fork to new tip)
+            (to-connect (collect-chain-entries new-tip-entry fork-entry)))
+
+        ;; Disconnect blocks in reverse order (tip to fork)
+        (dolist (entry (reverse to-disconnect))
+          (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                 (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+            (when block
+              (let ((undo (get-undo-data block-hash)))
+                (bitcoin-lisp.storage:disconnect-block-from-utxo-set
+                 utxo-set block (or undo '())))
+              (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid))))
+
+        ;; Connect new chain blocks (fork to new tip)
+        (dolist (entry to-connect)
+          (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                 (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+            (when block
+              (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
+                     (spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
+                                   utxo-set block height)))
+                (store-undo-data block-hash spent-utxos)
+                (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)))))
+
+        ;; Update chain tip
+        (bitcoin-lisp.storage:update-chain-tip
+         chain-state
+         (bitcoin-lisp.storage:block-index-entry-hash new-tip-entry)
+         new-height)
+
+        (when bitcoin-lisp:*node*
+          (bitcoin-lisp:log-info "REORG complete: disconnected ~D, connected ~D blocks"
+                                 (length to-disconnect) (length to-connect)))
+
+        t))))

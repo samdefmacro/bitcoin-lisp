@@ -127,6 +127,177 @@ Work = 2^256 / (target + 1)"
                 (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))))
       t)))
 
+;;; Header Index Persistence
+
+(defun header-index-file-path (state)
+  "Get the path to the header index file."
+  (merge-pathnames "headerindex.dat" (chain-state-base-path state)))
+
+(defun serialize-chainwork (stream value)
+  "Write a big integer chain-work as 32 bytes (big-endian)."
+  (let ((bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (loop for i from 0 below 32
+          do (setf (aref bytes (- 31 i))
+                   (logand (ash value (* -8 i)) #xFF)))
+    (write-sequence bytes stream)))
+
+(defun deserialize-chainwork (stream)
+  "Read a 32-byte big-endian integer for chain-work."
+  (let ((bytes (make-array 32 :element-type '(unsigned-byte 8))))
+    (read-sequence bytes stream)
+    (let ((value 0))
+      (loop for i from 0 below 32
+            do (setf value (logior (ash value 8) (aref bytes i))))
+      value)))
+
+(defun write-uint32-le-chain (stream value)
+  "Write 4-byte little-endian uint32."
+  (write-byte (logand value #xFF) stream)
+  (write-byte (logand (ash value -8) #xFF) stream)
+  (write-byte (logand (ash value -16) #xFF) stream)
+  (write-byte (logand (ash value -24) #xFF) stream))
+
+(defun read-uint32-le-chain (stream)
+  "Read 4-byte little-endian uint32."
+  (logior (read-byte stream)
+          (ash (read-byte stream) 8)
+          (ash (read-byte stream) 16)
+          (ash (read-byte stream) 24)))
+
+(defun serialize-header-bytes (stream header)
+  "Serialize the 80-byte block header to stream."
+  (let* ((header-bytes (bitcoin-lisp.serialization::serialize-block-header header))
+         (len (length header-bytes)))
+    (write-sequence header-bytes stream)
+    ;; Pad to 80 bytes if needed
+    (when (< len 80)
+      (loop repeat (- 80 len)
+            do (write-byte 0 stream)))))
+
+(defun save-header-index (state)
+  "Save the block index to a binary file.
+Each entry: 32-byte hash, 4-byte height, 80-byte header, 32-byte chainwork, 1-byte status, 32-byte prev-hash."
+  (let ((path (header-index-file-path state)))
+    (ensure-directories-exist path)
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :supersede
+                            :element-type '(unsigned-byte 8))
+      ;; Write entry count
+      (let ((count (hash-table-count (chain-state-block-index state))))
+        (write-uint32-le-chain stream count))
+      ;; Write each entry
+      (maphash (lambda (hash entry)
+                 (declare (ignore hash))
+                 (write-single-header-entry stream entry))
+               (chain-state-block-index state)))
+    t))
+
+(defun load-header-index (state)
+  "Load the block index from a binary file.
+Returns T if loaded, NIL if no file exists."
+  (let ((path (header-index-file-path state)))
+    (unless (probe-file path)
+      (return-from load-header-index nil))
+    (with-open-file (stream path
+                            :direction :input
+                            :element-type '(unsigned-byte 8))
+      (let ((count (read-uint32-le-chain stream))
+            (entries-by-hash (make-hash-table :test 'equalp))
+            (prev-hash-map (make-hash-table :test 'equalp)))
+        ;; First pass: read all entries, store prev-hash mapping
+        (dotimes (i count)
+          (let ((hash (make-array 32 :element-type '(unsigned-byte 8))))
+            (read-sequence hash stream)
+            (let* ((height (read-uint32-le-chain stream))
+                   (header-bytes (make-array 80 :element-type '(unsigned-byte 8))))
+              (read-sequence header-bytes stream)
+              (let* ((chainwork (deserialize-chainwork stream))
+                     (status-byte (read-byte stream))
+                     (status (ecase status-byte
+                               (0 :unknown) (1 :header-valid) (2 :valid) (3 :invalid)))
+                     (prev-hash (make-array 32 :element-type '(unsigned-byte 8))))
+                (read-sequence prev-hash stream)
+                ;; Parse header from bytes
+                (let ((header (handler-case
+                                  (flexi-streams:with-input-from-sequence (hs header-bytes)
+                                    (bitcoin-lisp.serialization::read-block-header hs))
+                                (error () nil))))
+                  (let ((entry (make-block-index-entry
+                                :hash hash
+                                :height height
+                                :header header
+                                :prev-entry nil  ; Link later
+                                :chain-work chainwork
+                                :status status)))
+                    (setf (gethash hash entries-by-hash) entry)
+                    ;; Store prev-hash for linkage
+                    (unless (every #'zerop prev-hash)
+                      (setf (gethash hash prev-hash-map) (copy-seq prev-hash)))))))))
+        ;; Second pass: link prev-entry pointers
+        (maphash (lambda (hash prev-hash)
+                   (let ((entry (gethash hash entries-by-hash))
+                         (prev-entry (gethash prev-hash entries-by-hash)))
+                     (when (and entry prev-entry)
+                       (setf (block-index-entry-prev-entry entry) prev-entry))))
+                 prev-hash-map)
+        ;; Replace block index
+        (setf (chain-state-block-index state) entries-by-hash)))
+    t))
+
+(defun append-header-entry (state entry)
+  "Append a single block-index-entry to the header index file.
+Updates the entry count in the file header."
+  (let ((path (header-index-file-path state)))
+    (if (probe-file path)
+        ;; Append to existing file
+        (with-open-file (stream path
+                                :direction :output
+                                :if-exists :append
+                                :element-type '(unsigned-byte 8))
+          (write-single-header-entry stream entry))
+      ;; Create new file with count=1
+      (progn
+        (ensure-directories-exist path)
+        (with-open-file (stream path
+                                :direction :output
+                                :if-does-not-exist :create
+                                :element-type '(unsigned-byte 8))
+          (write-uint32-le-chain stream 0)  ; placeholder count
+          (write-single-header-entry stream entry))))
+    ;; Update the count at the beginning of the file
+    (with-open-file (stream path
+                            :direction :output
+                            :if-exists :overwrite
+                            :element-type '(unsigned-byte 8))
+      (let ((count (hash-table-count (chain-state-block-index state))))
+        (write-uint32-le-chain stream count)))
+    t))
+
+(defun write-single-header-entry (stream entry)
+  "Write a single block-index-entry to STREAM."
+  ;; 32-byte block hash
+  (write-sequence (block-index-entry-hash entry) stream)
+  ;; 4-byte height
+  (write-uint32-le-chain stream (block-index-entry-height entry))
+  ;; 80-byte header (or zeros if no header)
+  (if (block-index-entry-header entry)
+      (serialize-header-bytes stream (block-index-entry-header entry))
+      (loop repeat 80 do (write-byte 0 stream)))
+  ;; 32-byte chainwork
+  (serialize-chainwork stream (block-index-entry-chain-work entry))
+  ;; 1-byte status
+  (write-byte (ecase (block-index-entry-status entry)
+                (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3))
+              stream)
+  ;; 32-byte previous block hash (or zeros)
+  (let ((prev (block-index-entry-prev-entry entry)))
+    (if prev
+        (write-sequence (block-index-entry-hash prev) stream)
+        (write-sequence (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)
+                        stream))))
+
 ;;; Block locator for syncing
 
 (defun build-block-locator (state)
