@@ -32,7 +32,26 @@
    #:parse-xonly-pubkey
    #:xonly-pubkey-valid-p
    #:tweak-xonly-pubkey
-   #:verify-xonly-tweak))
+   #:verify-xonly-tweak
+   ;; Address encoding/decoding
+   #:base58-encode
+   #:base58-decode
+   #:base58check-encode
+   #:base58check-decode
+   #:bech32-encode
+   #:bech32-decode
+   #:segwit-address-encode
+   #:segwit-address-decode
+   #:decode-address
+   #:encode-p2pkh-address
+   #:encode-p2sh-address
+   #:encode-p2wpkh-address
+   #:encode-p2wsh-address
+   #:encode-p2tr-address
+   #:+p2pkh-version-mainnet+
+   #:+p2pkh-version-testnet+
+   #:+p2sh-version-mainnet+
+   #:+p2sh-version-testnet+))
 
 (defpackage #:bitcoin-lisp.serialization
   (:use #:cl)
@@ -247,6 +266,10 @@
    ;; Script execution
    #:validate-script
    #:execute-script
+   ;; Script disassembly and classification
+   #:disassemble-script
+   #:classify-script
+   #:script-type-to-string
    ;; Block validation
    #:validate-block-header
    #:validate-block

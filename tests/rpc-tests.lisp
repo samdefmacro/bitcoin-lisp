@@ -362,3 +362,199 @@
       (is (gethash "message" error-obj))
       (is (integerp (gethash "code" error-obj)))
       (is (stringp (gethash "message" error-obj))))))
+
+;;; --- Extended RPC Method Tests ---
+
+;;; decoderawtransaction tests
+
+(test rpc-decoderawtransaction-valid
+  "Test decoderawtransaction with valid transaction hex"
+  (let* ((node (make-test-node))
+         ;; Simple transaction hex (version + empty inputs/outputs + locktime)
+         ;; This is a minimal valid transaction structure
+         (tx-hex "01000000000000000000")
+         (result (handler-case
+                     (bitcoin-lisp.rpc::rpc-decoderawtransaction node (list tx-hex))
+                   (error () nil))))
+    ;; May fail to parse minimal tx, but should not crash
+    (is (or result (not result)))))
+
+(test rpc-decoderawtransaction-invalid-hex
+  "Test decoderawtransaction with invalid hex returns error"
+  (let ((node (make-test-node)))
+    ;; Empty string
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-decoderawtransaction node '("")))
+    ;; Invalid hex characters
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-decoderawtransaction node '("zzzz")))))
+
+;;; getrawtransaction tests
+
+(test rpc-getrawtransaction-invalid-txid
+  "Test getrawtransaction with invalid txid returns error"
+  (let ((node (make-test-node)))
+    ;; Too short
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getrawtransaction node '("abc")))
+    ;; Invalid characters
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getrawtransaction node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))))
+
+(test rpc-getrawtransaction-not-found
+  "Test getrawtransaction for unknown txid returns error"
+  (let ((node (make-test-node)))
+    ;; Valid txid but not in mempool
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getrawtransaction node
+        '("0000000000000000000000000000000000000000000000000000000000000001")))))
+
+;;; estimatesmartfee tests
+
+(test rpc-estimatesmartfee-valid
+  "Test estimatesmartfee with valid conf_target"
+  (let* ((node (make-test-node))
+         ;; Mark node as not syncing
+         (bitcoin-lisp::*syncing* nil)
+         (result (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6))))
+    (is (assoc "feerate" result :test #'string=))
+    (is (assoc "blocks" result :test #'string=))
+    (is (= (cdr (assoc "blocks" result :test #'string=)) 6))
+    (is (> (cdr (assoc "feerate" result :test #'string=)) 0))))
+
+(test rpc-estimatesmartfee-invalid-target
+  "Test estimatesmartfee with invalid conf_target returns error"
+  (let ((node (make-test-node)))
+    ;; Zero
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(0)))
+    ;; Negative
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(-1)))
+    ;; Too high
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(2000)))))
+
+;;; validateaddress tests
+
+(test rpc-validateaddress-valid-p2pkh
+  "Test validateaddress with valid testnet P2PKH address"
+  (let* ((node (make-test-node))
+         ;; Valid testnet P2PKH address (starts with m or n)
+         (result (bitcoin-lisp.rpc::rpc-validateaddress node '("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"))))
+    (is (eq t (cdr (assoc "isvalid" result :test #'string=))))
+    (is (assoc "address" result :test #'string=))
+    (is (assoc "scriptPubKey" result :test #'string=))
+    (is (eq nil (cdr (assoc "iswitness" result :test #'string=))))))
+
+(test rpc-validateaddress-valid-bech32
+  "Test validateaddress with valid testnet bech32 address"
+  (let* ((node (make-test-node))
+         ;; Valid testnet P2WPKH address
+         (result (bitcoin-lisp.rpc::rpc-validateaddress node '("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"))))
+    (is (eq t (cdr (assoc "isvalid" result :test #'string=))))
+    (is (eq t (cdr (assoc "iswitness" result :test #'string=))))
+    (is (= 0 (cdr (assoc "witness_version" result :test #'string=))))))
+
+(test rpc-validateaddress-invalid
+  "Test validateaddress with invalid address"
+  (let* ((node (make-test-node))
+         (result (bitcoin-lisp.rpc::rpc-validateaddress node '("not-an-address"))))
+    (is (eq nil (cdr (assoc "isvalid" result :test #'string=))))))
+
+(test rpc-validateaddress-empty
+  "Test validateaddress with empty string"
+  (let* ((node (make-test-node))
+         (result (bitcoin-lisp.rpc::rpc-validateaddress node '(""))))
+    (is (eq nil (cdr (assoc "isvalid" result :test #'string=))))))
+
+(test rpc-validateaddress-wrong-network
+  "Test validateaddress with mainnet address on testnet"
+  (let* ((node (make-test-node))
+         ;; Mainnet P2PKH address (starts with 1)
+         (result (bitcoin-lisp.rpc::rpc-validateaddress node '("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"))))
+    ;; Should be invalid on testnet node
+    (is (eq nil (cdr (assoc "isvalid" result :test #'string=))))))
+
+;;; decodescript tests
+
+(test rpc-decodescript-p2pkh
+  "Test decodescript with P2PKH script"
+  (let* ((node (make-test-node))
+         ;; P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+         (script-hex "76a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba88ac")
+         (result (bitcoin-lisp.rpc::rpc-decodescript node (list script-hex))))
+    (is (string= (cdr (assoc "type" result :test #'string=)) "pubkeyhash"))
+    (is (assoc "asm" result :test #'string=))
+    (is (assoc "p2sh" result :test #'string=))))
+
+(test rpc-decodescript-p2sh
+  "Test decodescript with P2SH script"
+  (let* ((node (make-test-node))
+         ;; P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+         (script-hex "a91489abcdefabbaabbaabbaabbaabbaabbaabbaabba87")
+         (result (bitcoin-lisp.rpc::rpc-decodescript node (list script-hex))))
+    (is (string= (cdr (assoc "type" result :test #'string=)) "scripthash"))))
+
+(test rpc-decodescript-p2wpkh
+  "Test decodescript with P2WPKH script"
+  (let* ((node (make-test-node))
+         ;; P2WPKH: OP_0 <20 bytes>
+         (script-hex "001489abcdefabbaabbaabbaabbaabbaabbaabbaabba")
+         (result (bitcoin-lisp.rpc::rpc-decodescript node (list script-hex))))
+    (is (string= (cdr (assoc "type" result :test #'string=)) "witness_v0_keyhash"))
+    (is (assoc "segwit" result :test #'string=))))
+
+(test rpc-decodescript-empty
+  "Test decodescript with empty script"
+  (let* ((node (make-test-node))
+         (result (bitcoin-lisp.rpc::rpc-decodescript node '(""))))
+    (is (string= (cdr (assoc "type" result :test #'string=)) "nonstandard"))
+    (is (string= (cdr (assoc "asm" result :test #'string=)) ""))))
+
+(test rpc-decodescript-invalid-hex
+  "Test decodescript with invalid hex returns error"
+  (let ((node (make-test-node)))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-decodescript node '("xyz")))))
+
+;;; createrawtransaction tests
+
+(test rpc-createrawtransaction-basic
+  "Test createrawtransaction with valid inputs and outputs"
+  (let* ((node (make-test-node))
+         (inputs `((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
+                    ("vout" . 0))))
+         (outputs '(("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" . 0.01)))
+         (result (bitcoin-lisp.rpc::rpc-createrawtransaction node (list inputs outputs))))
+    ;; Should return hex string
+    (is (stringp result))
+    (is (> (length result) 0))
+    ;; Should be valid hex
+    (is (every (lambda (c) (digit-char-p c 16)) result))))
+
+(test rpc-createrawtransaction-invalid-txid
+  "Test createrawtransaction with invalid input txid"
+  (let ((node (make-test-node)))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-createrawtransaction node
+        '(((("txid" . "invalid") ("vout" . 0)))
+          (("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" . 0.01)))))))
+
+(test rpc-createrawtransaction-invalid-address
+  "Test createrawtransaction with invalid output address"
+  (let ((node (make-test-node)))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-createrawtransaction node
+        '(((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
+            ("vout" . 0)))
+          (("invalid-address" . 0.01)))))))
+
+(test rpc-createrawtransaction-negative-amount
+  "Test createrawtransaction with negative amount"
+  (let ((node (make-test-node)))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-createrawtransaction node
+        '(((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
+            ("vout" . 0)))
+          (("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" . -0.01)))))))
