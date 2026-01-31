@@ -361,3 +361,290 @@ Returns T if validation succeeds."
                     :tx tx
                     :input-index input-index
                     :initial-stack (script-context-stack ctx))))
+
+;;; ============================================================
+;;; Script Disassembly
+;;; ============================================================
+
+(defparameter *opcode-names*
+  (let ((table (make-hash-table)))
+    ;; Push values
+    (setf (gethash #x00 table) "OP_0")
+    (setf (gethash #x4c table) "OP_PUSHDATA1")
+    (setf (gethash #x4d table) "OP_PUSHDATA2")
+    (setf (gethash #x4e table) "OP_PUSHDATA4")
+    (setf (gethash #x4f table) "OP_1NEGATE")
+    (loop for i from #x51 to #x60
+          do (setf (gethash i table) (format nil "OP_~D" (- i #x50))))
+    ;; Flow control
+    (setf (gethash #x61 table) "OP_NOP")
+    (setf (gethash #x63 table) "OP_IF")
+    (setf (gethash #x64 table) "OP_NOTIF")
+    (setf (gethash #x67 table) "OP_ELSE")
+    (setf (gethash #x68 table) "OP_ENDIF")
+    (setf (gethash #x69 table) "OP_VERIFY")
+    (setf (gethash #x6a table) "OP_RETURN")
+    ;; Stack
+    (setf (gethash #x6b table) "OP_TOALTSTACK")
+    (setf (gethash #x6c table) "OP_FROMALTSTACK")
+    (setf (gethash #x6d table) "OP_2DROP")
+    (setf (gethash #x6e table) "OP_2DUP")
+    (setf (gethash #x6f table) "OP_3DUP")
+    (setf (gethash #x70 table) "OP_2OVER")
+    (setf (gethash #x71 table) "OP_2ROT")
+    (setf (gethash #x72 table) "OP_2SWAP")
+    (setf (gethash #x73 table) "OP_IFDUP")
+    (setf (gethash #x74 table) "OP_DEPTH")
+    (setf (gethash #x75 table) "OP_DROP")
+    (setf (gethash #x76 table) "OP_DUP")
+    (setf (gethash #x77 table) "OP_NIP")
+    (setf (gethash #x78 table) "OP_OVER")
+    (setf (gethash #x79 table) "OP_PICK")
+    (setf (gethash #x7a table) "OP_ROLL")
+    (setf (gethash #x7b table) "OP_ROT")
+    (setf (gethash #x7c table) "OP_SWAP")
+    (setf (gethash #x7d table) "OP_TUCK")
+    ;; Splice (disabled)
+    (setf (gethash #x7e table) "OP_CAT")
+    (setf (gethash #x7f table) "OP_SUBSTR")
+    (setf (gethash #x80 table) "OP_LEFT")
+    (setf (gethash #x81 table) "OP_RIGHT")
+    (setf (gethash #x82 table) "OP_SIZE")
+    ;; Bitwise (some disabled)
+    (setf (gethash #x83 table) "OP_INVERT")
+    (setf (gethash #x84 table) "OP_AND")
+    (setf (gethash #x85 table) "OP_OR")
+    (setf (gethash #x86 table) "OP_XOR")
+    (setf (gethash #x87 table) "OP_EQUAL")
+    (setf (gethash #x88 table) "OP_EQUALVERIFY")
+    ;; Arithmetic
+    (setf (gethash #x8b table) "OP_1ADD")
+    (setf (gethash #x8c table) "OP_1SUB")
+    (setf (gethash #x8d table) "OP_2MUL")
+    (setf (gethash #x8e table) "OP_2DIV")
+    (setf (gethash #x8f table) "OP_NEGATE")
+    (setf (gethash #x90 table) "OP_ABS")
+    (setf (gethash #x91 table) "OP_NOT")
+    (setf (gethash #x92 table) "OP_0NOTEQUAL")
+    (setf (gethash #x93 table) "OP_ADD")
+    (setf (gethash #x94 table) "OP_SUB")
+    (setf (gethash #x95 table) "OP_MUL")
+    (setf (gethash #x96 table) "OP_DIV")
+    (setf (gethash #x97 table) "OP_MOD")
+    (setf (gethash #x98 table) "OP_LSHIFT")
+    (setf (gethash #x99 table) "OP_RSHIFT")
+    (setf (gethash #x9a table) "OP_BOOLAND")
+    (setf (gethash #x9b table) "OP_BOOLOR")
+    (setf (gethash #x9c table) "OP_NUMEQUAL")
+    (setf (gethash #x9d table) "OP_NUMEQUALVERIFY")
+    (setf (gethash #x9e table) "OP_NUMNOTEQUAL")
+    (setf (gethash #x9f table) "OP_LESSTHAN")
+    (setf (gethash #xa0 table) "OP_GREATERTHAN")
+    (setf (gethash #xa1 table) "OP_LESSTHANOREQUAL")
+    (setf (gethash #xa2 table) "OP_GREATERTHANOREQUAL")
+    (setf (gethash #xa3 table) "OP_MIN")
+    (setf (gethash #xa4 table) "OP_MAX")
+    (setf (gethash #xa5 table) "OP_WITHIN")
+    ;; Crypto
+    (setf (gethash #xa6 table) "OP_RIPEMD160")
+    (setf (gethash #xa7 table) "OP_SHA1")
+    (setf (gethash #xa8 table) "OP_SHA256")
+    (setf (gethash #xa9 table) "OP_HASH160")
+    (setf (gethash #xaa table) "OP_HASH256")
+    (setf (gethash #xab table) "OP_CODESEPARATOR")
+    (setf (gethash #xac table) "OP_CHECKSIG")
+    (setf (gethash #xad table) "OP_CHECKSIGVERIFY")
+    (setf (gethash #xae table) "OP_CHECKMULTISIG")
+    (setf (gethash #xaf table) "OP_CHECKMULTISIGVERIFY")
+    ;; Expansion
+    (setf (gethash #xb0 table) "OP_NOP1")
+    (setf (gethash #xb1 table) "OP_CHECKLOCKTIMEVERIFY")
+    (setf (gethash #xb2 table) "OP_CHECKSEQUENCEVERIFY")
+    (setf (gethash #xb3 table) "OP_NOP4")
+    (setf (gethash #xb4 table) "OP_NOP5")
+    (setf (gethash #xb5 table) "OP_NOP6")
+    (setf (gethash #xb6 table) "OP_NOP7")
+    (setf (gethash #xb7 table) "OP_NOP8")
+    (setf (gethash #xb8 table) "OP_NOP9")
+    (setf (gethash #xb9 table) "OP_NOP10")
+    ;; Taproot
+    (setf (gethash #xba table) "OP_CHECKSIGADD")
+    table)
+  "Mapping from opcode byte to name string.")
+
+(defun disassemble-script (script)
+  "Disassemble a script to human-readable ASM string.
+SCRIPT is a byte vector. Returns a string like 'OP_DUP OP_HASH160 <hex> OP_EQUALVERIFY OP_CHECKSIG'."
+  (when (zerop (length script))
+    (return-from disassemble-script ""))
+  (let ((parts '())
+        (pos 0)
+        (len (length script)))
+    (loop while (< pos len)
+          do (let ((opcode (aref script pos)))
+               (incf pos)
+               (cond
+                 ;; Direct push (1-75 bytes)
+                 ((<= 1 opcode 75)
+                  (if (<= (+ pos opcode) len)
+                      (let ((data (subseq script pos (+ pos opcode))))
+                        (push (bitcoin-lisp.crypto:bytes-to-hex data) parts)
+                        (incf pos opcode))
+                      (progn (push "[error]" parts) (setf pos len))))
+                 ;; OP_PUSHDATA1
+                 ((= opcode #x4c)
+                  (when (< pos len)
+                    (let ((n (aref script pos)))
+                      (incf pos)
+                      (if (<= (+ pos n) len)
+                          (let ((data (subseq script pos (+ pos n))))
+                            (push (bitcoin-lisp.crypto:bytes-to-hex data) parts)
+                            (incf pos n))
+                          (progn (push "[error]" parts) (setf pos len))))))
+                 ;; OP_PUSHDATA2
+                 ((= opcode #x4d)
+                  (when (<= (+ pos 2) len)
+                    (let ((n (+ (aref script pos) (ash (aref script (1+ pos)) 8))))
+                      (incf pos 2)
+                      (if (<= (+ pos n) len)
+                          (let ((data (subseq script pos (+ pos n))))
+                            (push (bitcoin-lisp.crypto:bytes-to-hex data) parts)
+                            (incf pos n))
+                          (progn (push "[error]" parts) (setf pos len))))))
+                 ;; OP_PUSHDATA4
+                 ((= opcode #x4e)
+                  (when (<= (+ pos 4) len)
+                    (let ((n (+ (aref script pos)
+                                (ash (aref script (+ pos 1)) 8)
+                                (ash (aref script (+ pos 2)) 16)
+                                (ash (aref script (+ pos 3)) 24))))
+                      (incf pos 4)
+                      (if (<= (+ pos n) len)
+                          (let ((data (subseq script pos (+ pos n))))
+                            (push (bitcoin-lisp.crypto:bytes-to-hex data) parts)
+                            (incf pos n))
+                          (progn (push "[error]" parts) (setf pos len))))))
+                 ;; Named opcode
+                 (t
+                  (let ((name (gethash opcode *opcode-names*)))
+                    (push (or name (format nil "OP_UNKNOWN[~2,'0x]" opcode)) parts))))))
+    (format nil "~{~A~^ ~}" (nreverse parts))))
+
+;;; ============================================================
+;;; Script Type Classification
+;;; ============================================================
+
+(defun classify-script (script)
+  "Classify a script and extract relevant data.
+Returns (VALUES type extracted-data) where:
+- type is one of: :pubkeyhash, :scripthash, :witness-v0-keyhash, :witness-v0-scripthash,
+                  :witness-v1-taproot, :multisig, :nulldata, :pubkey, :nonstandard
+- extracted-data is a plist with keys like :hash, :pubkey, :pubkeys, :m, :n, :data, :witness-version, :witness-program"
+  (let ((len (length script)))
+    (cond
+      ;; Empty script
+      ((zerop len)
+       (values :nonstandard nil))
+
+      ;; P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+      ((and (= len 25)
+            (= (aref script 0) #x76)   ; OP_DUP
+            (= (aref script 1) #xa9)   ; OP_HASH160
+            (= (aref script 2) #x14)   ; Push 20 bytes
+            (= (aref script 23) #x88)  ; OP_EQUALVERIFY
+            (= (aref script 24) #xac)) ; OP_CHECKSIG
+       (values :pubkeyhash (list :hash (subseq script 3 23))))
+
+      ;; P2SH: OP_HASH160 <20 bytes> OP_EQUAL
+      ((and (= len 23)
+            (= (aref script 0) #xa9)   ; OP_HASH160
+            (= (aref script 1) #x14)   ; Push 20 bytes
+            (= (aref script 22) #x87)) ; OP_EQUAL
+       (values :scripthash (list :hash (subseq script 2 22))))
+
+      ;; Witness v0 keyhash (P2WPKH): OP_0 <20 bytes>
+      ((and (= len 22)
+            (= (aref script 0) #x00)   ; OP_0
+            (= (aref script 1) #x14))  ; Push 20 bytes
+       (values :witness-v0-keyhash
+               (list :witness-version 0
+                     :witness-program (subseq script 2 22))))
+
+      ;; Witness v0 scripthash (P2WSH): OP_0 <32 bytes>
+      ((and (= len 34)
+            (= (aref script 0) #x00)   ; OP_0
+            (= (aref script 1) #x20))  ; Push 32 bytes
+       (values :witness-v0-scripthash
+               (list :witness-version 0
+                     :witness-program (subseq script 2 34))))
+
+      ;; Witness v1 taproot (P2TR): OP_1 <32 bytes>
+      ((and (= len 34)
+            (= (aref script 0) #x51)   ; OP_1
+            (= (aref script 1) #x20))  ; Push 32 bytes
+       (values :witness-v1-taproot
+               (list :witness-version 1
+                     :witness-program (subseq script 2 34))))
+
+      ;; General witness program: OP_n <2-40 bytes> where n in 0-16
+      ((and (>= len 4) (<= len 42)
+            (or (= (aref script 0) #x00)  ; OP_0
+                (<= #x51 (aref script 0) #x60))  ; OP_1 to OP_16
+            (= (aref script 1) (- len 2))
+            (<= 2 (aref script 1) 40))
+       (let ((version (if (= (aref script 0) #x00) 0 (- (aref script 0) #x50))))
+         (values :witness-unknown
+                 (list :witness-version version
+                       :witness-program (subseq script 2)))))
+
+      ;; OP_RETURN (nulldata): OP_RETURN [data]
+      ((and (>= len 1)
+            (= (aref script 0) #x6a))  ; OP_RETURN
+       (values :nulldata
+               (list :data (if (> len 1) (subseq script 1) #()))))
+
+      ;; P2PK (pay to pubkey): <33 or 65 bytes pubkey> OP_CHECKSIG
+      ((and (or (= len 35) (= len 67))  ; 33+1+1 or 65+1+1
+            (= (aref script (- len 1)) #xac)  ; OP_CHECKSIG
+            (= (aref script 0) (- len 2)))    ; Push length
+       (values :pubkey (list :pubkey (subseq script 1 (- len 1)))))
+
+      ;; Bare multisig: OP_m <pubkeys> OP_n OP_CHECKMULTISIG
+      ((and (>= len 37)  ; Minimum: OP_1 <33-byte pubkey> OP_1 OP_CHECKMULTISIG
+            (= (aref script (- len 1)) #xae)  ; OP_CHECKMULTISIG
+            (<= #x51 (aref script 0) #x60)    ; OP_1 to OP_16 (m)
+            (<= #x51 (aref script (- len 2)) #x60))  ; OP_1 to OP_16 (n)
+       (let ((m (- (aref script 0) #x50))
+             (n (- (aref script (- len 2)) #x50))
+             (pubkeys '())
+             (pos 1))
+         ;; Parse pubkeys
+         (loop while (and (< pos (- len 2))
+                          (< (length pubkeys) n))
+               do (let ((push-len (aref script pos)))
+                    (when (or (= push-len 33) (= push-len 65))
+                      (incf pos)
+                      (when (<= (+ pos push-len) (- len 2))
+                        (push (subseq script pos (+ pos push-len)) pubkeys)
+                        (incf pos push-len)))))
+         (if (= (length pubkeys) n)
+             (values :multisig (list :m m :n n :pubkeys (nreverse pubkeys)))
+             (values :nonstandard nil))))
+
+      ;; Nonstandard
+      (t (values :nonstandard nil)))))
+
+(defun script-type-to-string (type)
+  "Convert script type keyword to Bitcoin Core compatible string."
+  (case type
+    (:pubkeyhash "pubkeyhash")
+    (:scripthash "scripthash")
+    (:witness-v0-keyhash "witness_v0_keyhash")
+    (:witness-v0-scripthash "witness_v0_scripthash")
+    (:witness-v1-taproot "witness_v1_taproot")
+    (:witness-unknown "witness_unknown")
+    (:multisig "multisig")
+    (:nulldata "nulldata")
+    (:pubkey "pubkey")
+    (:nonstandard "nonstandard")
+    (otherwise "nonstandard")))
