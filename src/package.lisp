@@ -188,6 +188,7 @@
    #:block-index-entry-status
    #:get-block-index-entry
    #:add-block-index-entry
+   #:get-block-at-height
    #:best-block-hash
    #:current-height
    #:update-chain-tip

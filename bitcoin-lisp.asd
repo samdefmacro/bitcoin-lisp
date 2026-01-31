@@ -18,7 +18,10 @@
                "flexi-streams"
                "alexandria"
                "bordeaux-threads"
-               "coalton")
+               "coalton"
+               "hunchentoot"
+               "yason"
+               "cl-base64")
   :serial t
   :components ((:module "src"
                 :components
@@ -54,6 +57,11 @@
                                (:file "peer")
                                (:file "protocol")
                                (:file "ibd")))
+                 (:module "rpc"
+                  :components ((:file "package")
+                               (:file "accessors")
+                               (:file "methods")
+                               (:file "server")))
                  (:file "node"))))
   :in-order-to ((test-op (test-op "bitcoin-lisp/tests"))))
 
@@ -82,6 +90,8 @@
                              ;; Mempool tests
                              (:file "mempool-tests")
                              ;; Persistence, peer health, reorg tests
-                             (:file "persistence-tests"))))
+                             (:file "persistence-tests")
+                             ;; RPC tests
+                             (:file "rpc-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
