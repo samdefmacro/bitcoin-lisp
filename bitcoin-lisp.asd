@@ -37,7 +37,8 @@
                                (:file "interop")))
                  (:module "crypto"
                   :components ((:file "hash")
-                               (:file "secp256k1")))
+                               (:file "secp256k1")
+                               (:file "address")))
                  (:module "serialization"
                   :components ((:file "binary")
                                (:file "types")

@@ -324,3 +324,201 @@
       (error (e)
         (error 'rpc-error :code +rpc-misc-error+
                           :message (format nil "TX decode failed: ~A" e))))))
+
+;;; --- Extended RPC Methods ---
+
+(defconstant +rpc-deserialization-error+ -22
+  "RPC error code for deserialization/hex decode errors.")
+
+(defconstant +rpc-invalid-address-or-key+ -5
+  "RPC error code for invalid address or key.")
+
+(defconstant +rpc-invalid-amount+ -3
+  "RPC error code for invalid amount.")
+
+(defun rpc-decoderawtransaction (node params)
+  "Decode a raw transaction hex string to JSON."
+  (declare (ignore node))
+  (let ((hex-str (first params)))
+    (unless (and (stringp hex-str) (> (length hex-str) 0))
+      (error 'rpc-error :code +rpc-deserialization-error+
+                        :message "Invalid transaction hex"))
+    (handler-case
+        (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes hex-str))
+               (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
+                     (bitcoin-lisp.serialization:read-transaction stream))))
+          (tx-to-json tx))
+      (error (e)
+        (error 'rpc-error :code +rpc-deserialization-error+
+                          :message (format nil "TX decode failed: ~A" e))))))
+
+(defun rpc-getrawtransaction (node params)
+  "Get raw transaction data by txid.
+Phase 1: Mempool-only lookup. Returns error for confirmed transactions."
+  (let ((txid-str (first params))
+        (verbose (second params)))
+    (unless (valid-hex-hash-p txid-str)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Invalid transaction id"))
+    (let* ((txid-bytes (parse-hex-hash txid-str))
+           (mempool (rpc-get-mempool node))
+           (entry (when mempool
+                    (bitcoin-lisp.mempool:mempool-get mempool txid-bytes))))
+      (unless entry
+        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                          :message "Transaction not found in mempool (blockchain lookup not implemented)"))
+      (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+        (if verbose
+            (tx-to-json tx)
+            (bitcoin-lisp.crypto:bytes-to-hex
+             (bitcoin-lisp.serialization:serialize tx)))))))
+
+(defun rpc-estimatesmartfee (node params)
+  "Estimate fee rate for confirmation in conf_target blocks.
+Phase 1: Returns conservative fixed estimate."
+  (let ((conf-target (first params)))
+    (unless (and (integerp conf-target) (>= conf-target 1) (<= conf-target 1008))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Invalid conf_target (must be 1-1008)"))
+    ;; Check if still syncing
+    (when (rpc-is-syncing node)
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "Insufficient data (node still syncing)"))
+    ;; Return conservative fixed estimate for testnet
+    ;; 0.00001 BTC/kvB = 1 sat/vB
+    `(("feerate" . 0.00001)
+      ("blocks" . ,conf-target))))
+
+(defun rpc-validateaddress (node params)
+  "Validate a Bitcoin address and return metadata."
+  (let ((address (first params))
+        (network (rpc-get-network node)))
+    (unless (and (stringp address) (> (length address) 0))
+      (return-from rpc-validateaddress `(("isvalid" . nil))))
+    (multiple-value-bind (type script-pubkey wit-ver wit-prog)
+        (bitcoin-lisp.crypto:decode-address address network)
+      (if type
+          (let ((result `(("isvalid" . t)
+                          ("address" . ,address)
+                          ("scriptPubKey" . ,(bitcoin-lisp.crypto:bytes-to-hex script-pubkey))
+                          ("isscript" . ,(member type '(:p2sh :p2wsh :witness-v0-scripthash)))
+                          ("iswitness" . ,(not (null wit-ver))))))
+            (when wit-ver
+              (setf result (append result
+                                   `(("witness_version" . ,wit-ver)
+                                     ("witness_program" . ,(bitcoin-lisp.crypto:bytes-to-hex wit-prog))))))
+            result)
+          `(("isvalid" . nil))))))
+
+(defun rpc-decodescript (node params)
+  "Decode a hex-encoded script."
+  (let ((hex-str (first params))
+        (network (rpc-get-network node)))
+    (unless (stringp hex-str)
+      (error 'rpc-error :code +rpc-deserialization-error+
+                        :message "Invalid script hex"))
+    ;; Handle empty script
+    (when (zerop (length hex-str))
+      (return-from rpc-decodescript
+        `(("asm" . "")
+          ("type" . "nonstandard"))))
+    (handler-case
+        (let ((script (bitcoin-lisp.crypto:hex-to-bytes hex-str)))
+          (multiple-value-bind (type data)
+              (bitcoin-lisp.validation:classify-script script)
+            (let ((result `(("asm" . ,(bitcoin-lisp.validation:disassemble-script script))
+                            ("type" . ,(bitcoin-lisp.validation:script-type-to-string type)))))
+              ;; Add type-specific fields
+              (case type
+                (:multisig
+                 (setf result (append result
+                                      `(("reqSigs" . ,(getf data :m))
+                                        ("addresses" . ())))))  ; Would need pubkey-to-address
+                ((:pubkeyhash :scripthash)
+                 (let* ((hash (getf data :hash))
+                        (addr (if (eq type :pubkeyhash)
+                                  (bitcoin-lisp.crypto:encode-p2pkh-address hash network)
+                                  (bitcoin-lisp.crypto:encode-p2sh-address hash network))))
+                   (setf result (append result `(("addresses" . (,addr)))))))
+                ((:witness-v0-keyhash :witness-v0-scripthash :witness-v1-taproot)
+                 (let* ((prog (getf data :witness-program))
+                        (ver (getf data :witness-version))
+                        (hrp (if (eq network :testnet) "tb" "bc"))
+                        (addr (bitcoin-lisp.crypto:segwit-address-encode hrp ver prog)))
+                   (setf result (append result `(("segwit" . (("address" . ,addr)))))))))
+              ;; Add p2sh address (script wrapped in P2SH)
+              (let* ((script-hash (bitcoin-lisp.crypto:hash160 script))
+                     (p2sh-addr (bitcoin-lisp.crypto:encode-p2sh-address script-hash network)))
+                (setf result (append result `(("p2sh" . ,p2sh-addr)))))
+              result)))
+      (error (e)
+        (error 'rpc-error :code +rpc-deserialization-error+
+                          :message (format nil "Script decode failed: ~A" e))))))
+
+(defun rpc-createrawtransaction (node params)
+  "Create an unsigned raw transaction."
+  (let ((inputs (first params))
+        (outputs (second params))
+        (locktime (or (third params) 0))
+        (network (rpc-get-network node)))
+    ;; Validate inputs
+    (unless (and (listp inputs) (> (length inputs) 0))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Invalid inputs"))
+    ;; Validate locktime
+    (unless (and (integerp locktime) (>= locktime 0))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Invalid locktime"))
+    ;; Build transaction inputs
+    (let ((tx-inputs
+            (loop for inp in inputs
+                  for txid-str = (cdr (assoc "txid" inp :test #'string=))
+                  for vout = (cdr (assoc "vout" inp :test #'string=))
+                  for sequence = (or (cdr (assoc "sequence" inp :test #'string=)) #xffffffff)
+                  do (unless (valid-hex-hash-p txid-str)
+                       (error 'rpc-error :code +rpc-invalid-parameter+
+                                         :message "Invalid input txid"))
+                     (unless (and (integerp vout) (>= vout 0))
+                       (error 'rpc-error :code +rpc-invalid-parameter+
+                                         :message "Invalid input vout"))
+                  collect (bitcoin-lisp.serialization:make-tx-in
+                           :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                             :hash (parse-hex-hash txid-str)
+                                             :index vout)
+                           :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                           :sequence sequence)))
+          (tx-outputs '()))
+      ;; Build transaction outputs
+      (cond
+        ;; Object format: {"address": amount, ...}
+        ((and (listp outputs) (every #'consp outputs))
+         (loop for (addr . amount) in outputs
+               do (unless (and (stringp addr) (numberp amount))
+                    (error 'rpc-error :code +rpc-invalid-parameter+
+                                      :message "Invalid output format"))
+                  (when (< amount 0)
+                    (error 'rpc-error :code +rpc-invalid-amount+
+                                      :message "Invalid amount (negative)"))
+                  (when (> amount 21000000)
+                    (error 'rpc-error :code +rpc-invalid-amount+
+                                      :message "Invalid amount (exceeds max)"))
+                  (multiple-value-bind (type script-pubkey)
+                      (bitcoin-lisp.crypto:decode-address addr network)
+                    (unless type
+                      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                        :message (format nil "Invalid address: ~A" addr)))
+                    (push (bitcoin-lisp.serialization:make-tx-out
+                           :value (round (* amount 100000000))  ; BTC to satoshis
+                           :script-pubkey script-pubkey)
+                          tx-outputs))))
+        (t
+         (error 'rpc-error :code +rpc-invalid-parameter+
+                           :message "Invalid outputs format")))
+      ;; Create transaction
+      (let ((tx (bitcoin-lisp.serialization:make-transaction
+                 :version 2
+                 :inputs tx-inputs
+                 :outputs (nreverse tx-outputs)
+                 :lock-time locktime)))
+        (bitcoin-lisp.crypto:bytes-to-hex
+         (bitcoin-lisp.serialization:serialize tx))))))
