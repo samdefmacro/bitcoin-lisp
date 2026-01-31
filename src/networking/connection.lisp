@@ -68,18 +68,31 @@ Returns a byte vector or NIL on failure/timeout."
   (handler-case
       (let ((socket (connection-socket conn)))
         (when socket
-          ;; Set socket timeout for the read operation
-          (setf (usocket:socket-option socket :receive-timeout) timeout)
           (let* ((stream (connection-stream conn))
                  (buffer (make-array count :element-type '(unsigned-byte 8)))
-                 (total-read 0))
+                 (total-read 0)
+                 (deadline (+ (get-internal-real-time)
+                              (* timeout internal-time-units-per-second))))
             ;; Read until we have all bytes or timeout
             (loop while (< total-read count)
-                  do (let ((n (read-sequence buffer stream :start total-read)))
-                       (when (= n total-read)
-                         ;; No progress, likely EOF or error
+                  do (let ((time-left (/ (- deadline (get-internal-real-time))
+                                         internal-time-units-per-second)))
+                       (when (<= time-left 0)
                          (return-from receive-bytes nil))
-                       (setf total-read n)))
+                       ;; Wait for data with timeout
+                       (let ((ready (usocket:wait-for-input socket
+                                                            :timeout (max 0.1 (min time-left 5.0))
+                                                            :ready-only t)))
+                         (unless ready
+                           ;; Timeout - no data available
+                           (return-from receive-bytes nil))
+                         ;; Socket claims to be ready - read what we can
+                         (let ((n (read-sequence buffer stream :start total-read)))
+                           (when (= n total-read)
+                             ;; No progress despite socket being ready - connection closed/error
+                             (setf (connection-connected conn) nil)
+                             (return-from receive-bytes nil))
+                           (setf total-read n)))))
             (when (= total-read count)
               (incf (connection-bytes-received conn) count)
               (setf (connection-last-activity conn) (get-universal-time))

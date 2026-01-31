@@ -58,6 +58,12 @@
    #:minimal-number-encoding-p
    ;; SIGPUSHONLY validation
    #:script-is-push-only-p
+   ;; Transaction context for block validation
+   #:*current-tx*
+   #:*current-input-index*
+   #:*debug-checksig*
+   #:*current-script-code*
+   #:compute-legacy-sighash
    ;; SegWit / BIP 143
    #:*witness-input-amount*
    #:*original-script-pubkey*
@@ -207,6 +213,24 @@
     (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
         (values t (bitcoin-lisp.coalton.script:get-ok-stack result))
         (values nil :error))))
+
+;;; Transaction context for real block validation
+;;; When validating blocks, these are bound to the actual transaction data.
+;;; For unit tests (script_tests), these remain NIL and compute-test-sighash is used.
+
+(defvar *current-tx* nil
+  "The transaction currently being validated. When bound, verify-checksig will
+   compute the real sighash from this transaction instead of using test format.")
+
+(defvar *debug-checksig* nil
+  "When non-nil, print debug information for signature verification.")
+
+(defvar *current-input-index* 0
+  "The index of the input currently being validated (0-based).")
+
+(defvar *current-script-code* nil
+  "The script code to use for sighash computation. For P2SH this is the redeemScript,
+   for legacy this is the scriptPubKey with OP_CODESEPARATOR handled.")
 
 (defvar *original-script-pubkey* nil
   "The original scriptPubKey being executed. Used for sighash computation in P2SH.
@@ -664,6 +688,114 @@
         (bitcoin-lisp.crypto:hash256 preimage)))))
 
 ;;; ============================================================
+;;; Legacy Sighash for Real Block Validation
+;;; ============================================================
+;;;
+;;; When validating real blocks, we need to compute the sighash from
+;;; the actual transaction data, not the test format.
+
+(defun compute-legacy-sighash (tx input-index subscript sighash-type)
+  "Compute legacy sighash from actual transaction data.
+   TX is a transaction structure from bitcoin-lisp.serialization.
+   INPUT-INDEX is the index of the input being signed.
+   SUBSCRIPT is the scriptCode (scriptPubKey or redeemScript).
+   SIGHASH-TYPE is the sighash type byte (last byte of signature).
+
+   This implements BIP 66 / original Bitcoin sighash algorithm."
+  (let* ((base-type (logand sighash-type #x1f))
+         (anyone-can-pay (not (zerop (logand sighash-type #x80))))
+         (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
+         (num-inputs (length inputs))
+         (num-outputs (length outputs)))
+
+    ;; Special case: SIGHASH_SINGLE with input-index >= num-outputs
+    ;; Returns hash of all 1s (Bitcoin's bug/feature)
+    (when (and (= base-type 3) (>= input-index num-outputs))
+      (return-from compute-legacy-sighash
+        (make-array 32 :element-type '(unsigned-byte 8)
+                       :initial-contents '(1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+                                           0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0))))
+
+    (let ((preimage
+            (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+              ;; Version
+              (write-u32-le (bitcoin-lisp.serialization:transaction-version tx) s)
+
+              ;; Inputs
+              (if anyone-can-pay
+                  ;; ANYONECANPAY: only include the input being signed
+                  (progn
+                    (write-varint 1 s)
+                    (let ((inp (nth input-index inputs)))
+                      (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output inp)))
+                        ;; Outpoint
+                        (loop for b across (bitcoin-lisp.serialization:outpoint-hash prevout)
+                              do (write-byte b s))
+                        (write-u32-le (bitcoin-lisp.serialization:outpoint-index prevout) s))
+                      ;; Script (subscript for signing input)
+                      (write-varint (length subscript) s)
+                      (loop for b across subscript do (write-byte b s))
+                      ;; Sequence
+                      (write-u32-le (bitcoin-lisp.serialization:tx-in-sequence inp) s)))
+                  ;; Normal: include all inputs
+                  (progn
+                    (write-varint num-inputs s)
+                    (loop for inp in inputs
+                          for i from 0
+                          do (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output inp)))
+                               ;; Outpoint
+                               (loop for b across (bitcoin-lisp.serialization:outpoint-hash prevout)
+                                     do (write-byte b s))
+                               (write-u32-le (bitcoin-lisp.serialization:outpoint-index prevout) s))
+                             ;; Script: subscript for signing input, empty for others
+                             (if (= i input-index)
+                                 (progn
+                                   (write-varint (length subscript) s)
+                                   (loop for b across subscript do (write-byte b s)))
+                                 (write-varint 0 s))
+                             ;; Sequence: 0 for others in NONE/SINGLE mode
+                             (if (and (or (= base-type 2) (= base-type 3))
+                                      (/= i input-index))
+                                 (write-u32-le 0 s)
+                                 (write-u32-le (bitcoin-lisp.serialization:tx-in-sequence inp) s)))))
+
+              ;; Outputs
+              (cond
+                ;; SIGHASH_NONE: no outputs
+                ((= base-type 2)
+                 (write-varint 0 s))
+                ;; SIGHASH_SINGLE: only output at same index
+                ((= base-type 3)
+                 (write-varint (1+ input-index) s)
+                 (loop for i from 0 below input-index
+                       do ;; Empty outputs before the matching one
+                          (write-u64-le #xffffffffffffffff s)  ; -1 value
+                          (write-varint 0 s))                   ; empty script
+                 ;; The actual output at input-index
+                 (let ((out (nth input-index outputs)))
+                   (write-u64-le (bitcoin-lisp.serialization:tx-out-value out) s)
+                   (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+                     (write-varint (length script) s)
+                     (loop for b across script do (write-byte b s)))))
+                ;; SIGHASH_ALL: all outputs
+                (t
+                 (write-varint num-outputs s)
+                 (loop for out in outputs
+                       do (write-u64-le (bitcoin-lisp.serialization:tx-out-value out) s)
+                          (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+                            (write-varint (length script) s)
+                            (loop for b across script do (write-byte b s))))))
+
+              ;; Locktime
+              (write-u32-le (bitcoin-lisp.serialization:transaction-lock-time tx) s)
+
+              ;; Sighash type (4 bytes LE)
+              (write-u32-le sighash-type s))))
+
+      (bitcoin-lisp.crypto:hash256 preimage))))
+
+;;; ============================================================
 ;;; BIP 143 Sighash (SegWit)
 ;;; ============================================================
 ;;;
@@ -941,12 +1073,38 @@
     ;; Compute sighash and verify
     ;; Use strict DER parsing when DERSIG flag is set
     ;; Reject high-S when LOW_S flag is set
-    (let ((sighash (compute-test-sighash script-pubkey sighash-type))
-          (require-low-s (flag-enabled-p "LOW_S")))
+    ;; When *current-tx* is bound (real block validation), use legacy sighash.
+    ;; Otherwise (unit tests), use test transaction format.
+    (let* ((subscript-for-hash (or *current-script-code* script-pubkey))
+           (sighash (if *current-tx*
+                        (compute-legacy-sighash *current-tx*
+                                                *current-input-index*
+                                                subscript-for-hash
+                                                sighash-type)
+                        (compute-test-sighash script-pubkey sighash-type)))
+           (require-low-s (flag-enabled-p "LOW_S")))
+      ;; Debug output before verification
+      (when (and *debug-checksig* *current-tx*)
+        (format t "~%[CHECKSIG DEBUG] input=~D sighash-type=~D~%"
+                *current-input-index* sighash-type)
+        (format t "  subscript len=~D: ~A~%"
+                (length subscript-for-hash)
+                (bitcoin-lisp.crypto:bytes-to-hex subscript-for-hash))
+        (format t "  sighash: ~A~%"
+                (bitcoin-lisp.crypto:bytes-to-hex sighash))
+        (format t "  sig len=~D: ~A~%"
+                (length der-sig)
+                (bitcoin-lisp.crypto:bytes-to-hex der-sig))
+        (format t "  pubkey len=~D: ~A~%"
+                (length pubkey-bytes)
+                (bitcoin-lisp.crypto:bytes-to-hex pubkey-bytes)))
       (multiple-value-bind (result status)
           (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey-bytes
                                                 :strict strict-der
                                                 :low-s require-low-s)
+        ;; Debug output after verification
+        (when (and *debug-checksig* *current-tx* (not result))
+          (format t "  VERIFICATION FAILED! status=~A~%" status))
         (cond
           ;; If LOW_S flag and signature had high-S, return :sig-high-s error
           ((eq status :high-s)

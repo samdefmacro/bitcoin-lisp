@@ -23,6 +23,7 @@
   :components ((:module "src"
                 :components
                 ((:file "package")
+                 (:file "logging")
                  (:module "coalton"
                   :components ((:file "package")
                                (:file "types")

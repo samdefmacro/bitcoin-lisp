@@ -301,3 +301,272 @@
   (let ((merkle-root (bitcoin-lisp.validation:compute-merkle-root nil)))
     (is (every #'zerop merkle-root))))
 
+;;;; BIP 34 Coinbase Height Tests
+
+(test decode-coinbase-height-small
+  "decode-coinbase-height should handle small heights encoded with OP_n."
+  ;; OP_0 -> height 0
+  (is (= 0 (bitcoin-lisp.validation:decode-coinbase-height
+             (make-array 1 :element-type '(unsigned-byte 8) :initial-contents '(0)))))
+  ;; OP_1 (0x51) -> height 1
+  (is (= 1 (bitcoin-lisp.validation:decode-coinbase-height
+             (make-array 1 :element-type '(unsigned-byte 8) :initial-contents '(#x51)))))
+  ;; OP_16 (0x60) -> height 16
+  (is (= 16 (bitcoin-lisp.validation:decode-coinbase-height
+              (make-array 1 :element-type '(unsigned-byte 8) :initial-contents '(#x60))))))
+
+(test decode-coinbase-height-push-bytes
+  "decode-coinbase-height should handle heights encoded as byte pushes."
+  ;; push1 100 -> height 100
+  (is (= 100 (bitcoin-lisp.validation:decode-coinbase-height
+               (make-array 2 :element-type '(unsigned-byte 8) :initial-contents '(1 100)))))
+  ;; push2 0x00 0x01 -> height 256
+  (is (= 256 (bitcoin-lisp.validation:decode-coinbase-height
+               (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(2 0 1)))))
+  ;; push3 for height 21111 = 0x5277 -> bytes: push3 #x77 #x52 #x00
+  (is (= 21111 (bitcoin-lisp.validation:decode-coinbase-height
+                 (make-array 4 :element-type '(unsigned-byte 8)
+                               :initial-contents '(3 #x77 #x52 #x00))))))
+
+(test decode-coinbase-height-empty-script
+  "decode-coinbase-height should return NIL for empty scriptSig."
+  (is (null (bitcoin-lisp.validation:decode-coinbase-height
+              (make-array 0 :element-type '(unsigned-byte 8))))))
+
+;;;; Witness Commitment Tests
+
+(test find-witness-commitment-present
+  "Should find the witness commitment in a coinbase with OP_RETURN output."
+  (let* ((commitment-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xBB))
+         ;; OP_RETURN push36 0xaa21a9ed <32-byte hash>
+         (script (make-array 38 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref script 0) #x6a   ; OP_RETURN
+          (aref script 1) #x24   ; push 36 bytes
+          (aref script 2) #xaa   ; commitment header
+          (aref script 3) #x21
+          (aref script 4) #xa9
+          (aref script 5) #xed)
+    (replace script commitment-hash :start1 6)
+    (let* ((output (bitcoin-lisp.serialization:make-tx-out
+                    :value 0 :script-pubkey script))
+           (coinbase (bitcoin-lisp.serialization:make-transaction
+                      :version 1
+                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                       :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                         :initial-element 0)
+                                                       :index #xFFFFFFFF)
+                                     :script-sig (make-array 4 :element-type '(unsigned-byte 8)
+                                                               :initial-element 1)))
+                      :outputs (list (bitcoin-lisp.serialization:make-tx-out :value 5000000000
+                                      :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                    :initial-element #x76))
+                                     output)
+                      :lock-time 0)))
+      (let ((found (bitcoin-lisp.validation:find-witness-commitment coinbase)))
+        (is (not (null found)))
+        (is (equalp commitment-hash found))))))
+
+(test find-witness-commitment-absent
+  "Should return NIL when no witness commitment exists."
+  (let ((coinbase (make-coinbase-transaction :value 5000000000 :height 1)))
+    (is (null (bitcoin-lisp.validation:find-witness-commitment coinbase)))))
+
+;;;; Block Script Validation Tests
+
+(test validate-block-scripts-called
+  "validate-block should call script validation and reject invalid scripts."
+  ;; Create a block with a spending tx that has an empty scriptSig
+  ;; spending a P2PKH output. The script should fail because the
+  ;; empty scriptSig can't satisfy P2PKH.
+  (let* ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (prev-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA))
+         ;; P2PKH scriptPubKey: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+         (p2pkh-script (make-array 25 :element-type '(unsigned-byte 8)
+                                      :initial-contents
+                                      (list #x76 #xa9 #x14  ; OP_DUP OP_HASH160 push20
+                                            1 2 3 4 5 6 7 8 9 10
+                                            11 12 13 14 15 16 17 18 19 20
+                                            #x88 #xac)))  ; OP_EQUALVERIFY OP_CHECKSIG
+         ;; Empty scriptSig - will fail validation
+         (empty-script (make-array 0 :element-type '(unsigned-byte 8))))
+    ;; Add UTXO with P2PKH script
+    (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 1000000 p2pkh-script 5)
+    ;; Build block with spending tx that has empty scriptSig
+    (let* ((coinbase-tx (make-coinbase-transaction :value 5000000000 :height 10))
+           (spending-tx (bitcoin-lisp.serialization:make-transaction
+                         :version 1
+                         :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                        :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                          :hash prev-txid :index 0)
+                                        :script-sig empty-script
+                                        :sequence #xFFFFFFFF))
+                         :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                         :value 900000
+                                         :script-pubkey p2pkh-script))
+                         :lock-time 0))
+           (block (bitcoin-lisp.serialization:make-bitcoin-block
+                   :header (make-test-block-header)
+                   :transactions (list coinbase-tx spending-tx))))
+      ;; validate-block-scripts should reject this block
+      (multiple-value-bind (valid error)
+          (bitcoin-lisp.validation:validate-block-scripts block utxo-set)
+        (is (null valid))
+        (is (eq :script-failed error))))))
+
+;;;; Witness Validation Tests
+
+(defun make-witness-p2wpkh-script ()
+  "Create a P2WPKH scriptPubKey: OP_0 <20-byte-hash>."
+  (let ((script (make-array 22 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref script 0) #x00   ; OP_0 (witness version 0)
+          (aref script 1) #x14)  ; push 20 bytes
+    ;; Fill with a fake hash
+    (loop for i from 2 below 22 do (setf (aref script i) (mod i 256)))
+    script))
+
+(test block-has-witness-data-detects-witness
+  "block-has-witness-data-p should return T when transactions have witness data."
+  (let* ((coinbase (bitcoin-lisp.serialization:make-transaction
+                    :version 1
+                    :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                   :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                       :initial-element 0)
+                                                     :index #xFFFFFFFF)
+                                   :script-sig (make-array 4 :element-type '(unsigned-byte 8)
+                                                             :initial-element 1)))
+                    :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                    :value 5000000000
+                                    :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                               :initial-element #x76)))
+                    :lock-time 0))
+         ;; Witness transaction
+         (witness-tx (bitcoin-lisp.serialization:make-transaction
+                      :version 2
+                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                       :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                         :initial-element #x11)
+                                                       :index 0)
+                                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
+                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                      :value 49000
+                                      :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                 :initial-element #x76)))
+                      :lock-time 0
+                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                                                         :initial-element #xAA)
+                                          (make-array 33 :element-type '(unsigned-byte 8)
+                                                         :initial-element #xBB)))))
+         (block (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header (make-test-block-header)
+                 :transactions (list coinbase witness-tx))))
+    ;; Block with witness tx should be detected
+    (is (bitcoin-lisp.validation::block-has-witness-data-p block))))
+
+(test block-without-witness-data
+  "block-has-witness-data-p should return NIL for legacy blocks."
+  (let* ((coinbase (make-coinbase-transaction :value 5000000000 :height 1))
+         (block (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header (make-test-block-header)
+                 :transactions (list coinbase))))
+    (is (not (bitcoin-lisp.validation::block-has-witness-data-p block)))))
+
+(test witness-merkle-root-computation
+  "Witness merkle root should use wtxids (coinbase wtxid = zeros)."
+  (let* ((coinbase (make-coinbase-transaction :value 5000000000 :height 1))
+         (regular-tx (make-test-transaction :inputs 1 :outputs 1 :value 1000000))
+         (transactions (list coinbase regular-tx)))
+    ;; Compute witness merkle root
+    (let ((witness-root (bitcoin-lisp.validation:compute-witness-merkle-root transactions)))
+      ;; The root should be hash of coinbase-wtxid(zeros) || regular-tx-wtxid
+      (let* ((cb-wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+             (tx-wtxid (bitcoin-lisp.serialization:transaction-wtxid regular-tx))
+             (combined (make-array 64 :element-type '(unsigned-byte 8))))
+        (replace combined cb-wtxid :start1 0)
+        (replace combined tx-wtxid :start1 32)
+        (let ((expected (bitcoin-lisp.crypto:hash256 combined)))
+          (is (equalp witness-root expected)))))))
+
+(test witness-commitment-validation-matching
+  "validate-witness-commitment should pass when commitment matches."
+  (let* ((coinbase-tx (make-coinbase-transaction :value 5000000000 :height 1))
+         ;; A witness tx (with dummy witness data)
+         (witness-tx (bitcoin-lisp.serialization:make-transaction
+                      :version 2
+                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                       :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                         :initial-element #x22)
+                                                       :index 0)
+                                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
+                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                      :value 49000
+                                      :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                 :initial-element #x76)))
+                      :lock-time 0
+                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                                                         :initial-element #xCC)))))
+         (transactions (list coinbase-tx witness-tx)))
+    ;; Compute what the correct commitment should be
+    (let* ((witness-root (bitcoin-lisp.validation:compute-witness-merkle-root transactions))
+           ;; Default witness reserved value: 32 zero bytes
+           (witness-reserved (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+           (combined (make-array 64 :element-type '(unsigned-byte 8))))
+      (replace combined witness-root :start1 0)
+      (replace combined witness-reserved :start1 32)
+      (let ((commitment (bitcoin-lisp.crypto:hash256 combined)))
+        ;; Build OP_RETURN script with correct commitment
+        (let ((script (make-array 38 :element-type '(unsigned-byte 8) :initial-element 0)))
+          (setf (aref script 0) #x6a   ; OP_RETURN
+                (aref script 1) #x24   ; push 36 bytes
+                (aref script 2) #xaa   ; commitment header
+                (aref script 3) #x21
+                (aref script 4) #xa9
+                (aref script 5) #xed)
+          (replace script commitment :start1 6)
+          ;; Add commitment output and witness reserved to coinbase
+          (let* ((updated-coinbase
+                   (bitcoin-lisp.serialization:make-transaction
+                    :version 1
+                    :inputs (bitcoin-lisp.serialization:transaction-inputs coinbase-tx)
+                    :outputs (append (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
+                                     (list (bitcoin-lisp.serialization:make-tx-out
+                                            :value 0 :script-pubkey script)))
+                    :lock-time 0
+                    :witness (list (list witness-reserved))))  ; coinbase witness
+                 (block (bitcoin-lisp.serialization:make-bitcoin-block
+                         :header (make-test-block-header)
+                         :transactions (list updated-coinbase witness-tx))))
+            (multiple-value-bind (valid error)
+                (bitcoin-lisp.validation:validate-witness-commitment block)
+              (is (eq t valid))
+              (is (null error)))))))))
+
+(test witness-commitment-validation-missing
+  "validate-witness-commitment should fail when witness data exists but no commitment."
+  (let* ((coinbase (make-coinbase-transaction :value 5000000000 :height 1))
+         (witness-tx (bitcoin-lisp.serialization:make-transaction
+                      :version 2
+                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                       :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                         :initial-element #x33)
+                                                       :index 0)
+                                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
+                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                      :value 49000
+                                      :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                 :initial-element #x76)))
+                      :lock-time 0
+                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                                                         :initial-element #xDD)))))
+         (block (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header (make-test-block-header)
+                 :transactions (list coinbase witness-tx))))
+    (multiple-value-bind (valid error)
+        (bitcoin-lisp.validation:validate-witness-commitment block)
+      (is (null valid))
+      (is (eq :missing-witness-commitment error)))))
+

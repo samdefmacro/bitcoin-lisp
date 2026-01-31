@@ -14,6 +14,21 @@
 (defconstant +max-block-sigops+ 20000)
 (defconstant +max-future-block-time+ 7200)  ; 2 hours in seconds
 
+;;; BIP 16 (P2SH) exception block hash for testnet3
+;;; This block predates proper BIP 16 enforcement and must skip script validation
+;;; See Bitcoin Core's chainparams.cpp: consensus.script_flag_exceptions
+;;; Note: Block hashes are displayed in big-endian but stored in little-endian (reversed)
+(defvar *bip16-exception-testnet*
+  (bitcoin-lisp.crypto:reverse-bytes
+   (bitcoin-lisp.crypto:hex-to-bytes "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"))
+  "Block hash that is exempted from BIP 16 script verification on testnet3 (little-endian).")
+
+;;; BIP 16 (P2SH) exception block hash for mainnet
+(defvar *bip16-exception-mainnet*
+  (bitcoin-lisp.crypto:reverse-bytes
+   (bitcoin-lisp.crypto:hex-to-bytes "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"))
+  "Block hash that is exempted from BIP 16 script verification on mainnet (little-endian).")
+
 ;;;; Proof of Work validation
 
 (defun check-proof-of-work (header)
@@ -22,10 +37,10 @@ Returns T if valid, NIL if invalid."
   (let* ((bits (bitcoin-lisp.serialization:block-header-bits header))
          (target (bitcoin-lisp.storage:bits-to-target bits))
          (hash (bitcoin-lisp.serialization:block-header-hash header))
-         ;; Convert hash to integer (little-endian)
-         (hash-value (loop for i from 31 downto 0
+         ;; Convert hash to integer (little-endian: byte 0 is least significant)
+         (hash-value (loop for i from 0 below 32
                            for byte = (aref hash i)
-                           sum (ash byte (* 8 (- 31 i))))))
+                           sum (ash byte (* 8 i)))))
     (<= hash-value target)))
 
 ;;;; Merkle root calculation
@@ -79,6 +94,198 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
   (values t nil))
 
+;;;; Block script validation
+
+(defun script-is-witness-program-p (script-pubkey)
+  "Check if SCRIPT-PUBKEY is a witness program (SegWit v0 or Taproot).
+Witness programs: OP_n <2-40 bytes> where n is 0-16."
+  (let ((len (length script-pubkey)))
+    (and (>= len 4) (<= len 42)
+         (let ((version-byte (aref script-pubkey 0))
+               (push-len (aref script-pubkey 1)))
+           (and (or (zerop version-byte)              ; OP_0
+                    (<= #x51 version-byte #x60))      ; OP_1..OP_16
+                (<= 2 push-len 40)
+                (= len (+ 2 push-len)))))))
+
+(defun get-input-witness (tx input-idx)
+  "Get the witness stack for input INPUT-IDX of TX.
+Returns a list of byte vectors, or NIL if no witness data."
+  (let ((witness (bitcoin-lisp.serialization:transaction-witness tx)))
+    (when (and witness (< input-idx (length witness)))
+      (nth input-idx witness))))
+
+(defun block-is-bip16-exception-p (block)
+  "Check if this block is a BIP 16 exception that should skip script validation."
+  (let ((block-hash (bitcoin-lisp.serialization:block-header-hash
+                     (bitcoin-lisp.serialization:bitcoin-block-header block))))
+    (or (equalp block-hash *bip16-exception-testnet*)
+        (equalp block-hash *bip16-exception-mainnet*))))
+
+(defun validate-block-scripts (block utxo-set)
+  "Validate all non-coinbase transaction scripts in BLOCK via Coalton interop.
+Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
+Legacy and P2SH scripts are validated via run-scripts-with-p2sh.
+Witness programs are validated via validate-witness-program when witness data
+is available.
+Blocks matching BIP 16 exception hashes skip all script validation."
+  ;; Check for BIP 16 exception block - skip ALL script validation
+  (when (block-is-bip16-exception-p block)
+    (return-from validate-block-scripts (values t nil)))
+
+  (let ((transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+    (loop for tx in (rest transactions)  ; skip coinbase
+          for tx-idx from 1
+          do (loop for input in (bitcoin-lisp.serialization:transaction-inputs tx)
+                   for input-idx from 0
+                   do (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                             (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
+                             (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+                             (utxo (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)))
+                        (when utxo
+                          (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input))
+                                (script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
+                                (amount (bitcoin-lisp.storage:utxo-entry-value utxo)))
+                            (if (script-is-witness-program-p script-pubkey)
+                                ;; Witness program: validate with witness stack
+                                (let ((witness (get-input-witness tx input-idx)))
+                                  (when witness
+                                    (multiple-value-bind (success error)
+                                        (bitcoin-lisp.coalton.interop:validate-witness-program
+                                         script-pubkey witness amount script-sig)
+                                      (declare (ignore error))
+                                      (unless success
+                                        (return-from validate-block-scripts
+                                          (values nil :script-failed))))))
+                                ;; Legacy/P2SH: validate via Coalton interop
+                                ;; Bind transaction context for sighash computation.
+                                ;; Note: *current-script-code* left nil so verify-checksig uses
+                                ;; its script-pubkey parameter, which is the redeemScript for P2SH.
+                                (let ((bitcoin-lisp.coalton.interop:*current-tx* tx)
+                                      (bitcoin-lisp.coalton.interop:*current-input-index* input-idx))
+                                  (multiple-value-bind (success error)
+                                      (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
+                                       script-sig script-pubkey t)
+                                    (declare (ignore error))
+                                    (unless success
+                                      (return-from validate-block-scripts
+                                        (values nil :script-failed)))))))))))
+    (values t nil)))
+
+;;;; Witness commitment validation (BIP 141)
+
+(defvar *witness-commitment-header*
+  (make-array 4 :element-type '(unsigned-byte 8)
+                :initial-contents '(#xaa #x21 #xa9 #xed))
+  "4-byte commitment header for witness data in coinbase OP_RETURN.")
+
+(defun find-witness-commitment (coinbase-tx)
+  "Find the witness commitment in a coinbase transaction's outputs.
+BIP 141: The commitment is in the last OP_RETURN output matching the
+header 0xaa21a9ed. Returns the 32-byte commitment hash or NIL."
+  (let ((outputs (bitcoin-lisp.serialization:transaction-outputs coinbase-tx))
+        (commitment nil))
+    ;; Scan all outputs; use the last matching one (per BIP 141)
+    (dolist (output outputs)
+      (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+        (when (and (>= (length script) 38)   ; OP_RETURN + push36 + 4-byte header + 32-byte hash
+                   (= (aref script 0) #x6a)  ; OP_RETURN
+                   (= (aref script 1) #x24)  ; push 36 bytes
+                   (equalp (subseq script 2 6) *witness-commitment-header*))
+          (setf commitment (subseq script 6 38)))))
+    commitment))
+
+(defun block-has-witness-data-p (block)
+  "Check if any transaction in the block has witness data."
+  (some #'bitcoin-lisp.serialization:transaction-has-witness-p
+        (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+
+(defun compute-witness-merkle-root (transactions)
+  "Compute the witness merkle root from a list of transactions.
+Uses wtxids for all transactions. The coinbase wtxid is 32 zero bytes (per BIP 141)."
+  (let ((wtxids (mapcar #'bitcoin-lisp.serialization:transaction-wtxid transactions)))
+    (compute-merkle-root wtxids)))
+
+(defun validate-witness-commitment (block)
+  "Validate the witness commitment in a block's coinbase (BIP 141).
+Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
+If the block has no witness data, the commitment is not required."
+  (when (block-has-witness-data-p block)
+    (let* ((transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+           (coinbase-tx (first transactions))
+           (commitment (find-witness-commitment coinbase-tx)))
+      (unless commitment
+        (return-from validate-witness-commitment
+          (values nil :missing-witness-commitment)))
+      ;; Compute witness merkle root and verify against commitment
+      ;; The commitment is: SHA256(SHA256(witness_merkle_root || witness_reserved_value))
+      ;; The witness reserved value is in the coinbase's witness stack (first item)
+      (let ((witness-root (compute-witness-merkle-root transactions))
+            (witness-reserved (let ((cb-witness (bitcoin-lisp.serialization:transaction-witness coinbase-tx)))
+                                (if (and cb-witness (first cb-witness) (first (first cb-witness)))
+                                    (first (first cb-witness))
+                                    (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))))
+        ;; Commitment = hash256(witness_root || witness_reserved)
+        (let* ((combined (make-array 64 :element-type '(unsigned-byte 8)))
+               (_ (replace combined witness-root :start1 0))
+               (_2 (replace combined witness-reserved :start1 32))
+               (computed-commitment (bitcoin-lisp.crypto:hash256 combined)))
+          (declare (ignore _ _2))
+          (unless (equalp computed-commitment commitment)
+            (return-from validate-witness-commitment
+              (values nil :bad-witness-commitment)))))))
+  (values t nil))
+
+;;;; BIP 34 Coinbase Height Validation
+
+(defconstant +bip34-activation-height-testnet+ 21111
+  "BIP 34 activation height on testnet.")
+
+(defconstant +bip34-activation-height-mainnet+ 227931
+  "BIP 34 activation height on mainnet.")
+
+(defun decode-coinbase-height (script-sig)
+  "Decode the block height from a BIP 34 coinbase scriptSig.
+The height is encoded as a CScriptNum push at the start of the scriptSig.
+Returns the height as an integer, or NIL if the encoding is invalid."
+  (when (zerop (length script-sig))
+    (return-from decode-coinbase-height nil))
+  (let ((push-len (aref script-sig 0)))
+    (cond
+      ;; OP_0: height = 0
+      ((zerop push-len) 0)
+      ;; OP_1 through OP_16: height = 1-16
+      ((<= #x51 push-len #x60)
+       (1+ (- push-len #x51)))
+      ;; Direct push (1-75 bytes): read little-endian integer
+      ((<= 1 push-len 75)
+       (when (< (length script-sig) (1+ push-len))
+         (return-from decode-coinbase-height nil))
+       (let ((height 0))
+         (loop for i from 1 to push-len
+               do (setf height (logior height (ash (aref script-sig i) (* 8 (1- i))))))
+         height))
+      ;; Other encodings not valid for BIP 34
+      (t nil))))
+
+(defun validate-coinbase-height (block current-height)
+  "Validate BIP 34 coinbase height encoding.
+Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
+Only enforced at or above the activation height."
+  ;; Use testnet activation height (lower of the two)
+  (when (< current-height +bip34-activation-height-testnet+)
+    (return-from validate-coinbase-height (values t nil)))
+  (let* ((coinbase-tx (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+         (first-input (first (bitcoin-lisp.serialization:transaction-inputs coinbase-tx)))
+         (script-sig (bitcoin-lisp.serialization:tx-in-script-sig first-input))
+         (encoded-height (decode-coinbase-height script-sig)))
+    (cond
+      ((null encoded-height)
+       (values nil :bad-coinbase-height))
+      ((/= encoded-height current-height)
+       (values nil :bad-coinbase-height))
+      (t (values t nil)))))
+
 ;;;; Full block validation
 
 (defun validate-block (block chain-state utxo-set current-height current-time)
@@ -120,12 +327,25 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
           (values nil :bad-merkle-root nil))))
 
     ;; Validate each transaction and collect fees (using Satoshi type)
-    (let ((total-fees (wrap-satoshi 0)))
+    ;; Track outputs from earlier transactions for intra-block spending
+    (let ((total-fees (wrap-satoshi 0))
+          (pending-utxos (make-hash-table :test 'equalp)))
       ;; Validate coinbase structure (skip input validation)
-      (multiple-value-bind (valid error)
-          (validate-transaction-structure (first transactions))
-        (unless valid
-          (return-from validate-block (values nil error nil))))
+      (let ((coinbase-tx (first transactions)))
+        (multiple-value-bind (valid error)
+            (validate-transaction-structure coinbase-tx)
+          (unless valid
+            (return-from validate-block (values nil error nil))))
+        ;; Add coinbase outputs to pending (for intra-block spending)
+        (let ((txid (bitcoin-lisp.serialization:transaction-hash coinbase-tx)))
+          (loop for output in (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
+                for idx from 0
+                do (setf (gethash (cons txid idx) pending-utxos)
+                         (bitcoin-lisp.storage::make-utxo-entry
+                          :value (bitcoin-lisp.serialization:tx-out-value output)
+                          :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                          :height current-height
+                          :coinbase t)))))
 
       ;; Validate other transactions
       (loop for tx in (rest transactions)
@@ -134,11 +354,40 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                  (unless valid
                    (return-from validate-block (values nil error nil))))
                (multiple-value-bind (valid error fee)
-                   (validate-transaction-contextual tx utxo-set current-height)
+                   (validate-transaction-contextual tx utxo-set current-height
+                                                    :pending-utxos pending-utxos)
                  (unless valid
                    (return-from validate-block (values nil error nil)))
                  ;; fee is now a Satoshi type, use typed addition
-                 (setf total-fees (satoshi+ total-fees fee))))
+                 (setf total-fees (satoshi+ total-fees fee)))
+               ;; Add this transaction's outputs to pending for subsequent txs
+               (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+                 (loop for output in (bitcoin-lisp.serialization:transaction-outputs tx)
+                       for idx from 0
+                       do (setf (gethash (cons txid idx) pending-utxos)
+                                (bitcoin-lisp.storage::make-utxo-entry
+                                 :value (bitcoin-lisp.serialization:tx-out-value output)
+                                 :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                                 :height current-height
+                                 :coinbase nil)))))
+
+      ;; Validate transaction scripts via Coalton interop
+      (multiple-value-bind (valid error)
+          (validate-block-scripts block utxo-set)
+        (unless valid
+          (return-from validate-block (values nil error nil))))
+
+      ;; Validate witness commitment (BIP 141)
+      (multiple-value-bind (valid error)
+          (validate-witness-commitment block)
+        (unless valid
+          (return-from validate-block (values nil error nil))))
+
+      ;; Validate BIP 34 coinbase height
+      (multiple-value-bind (valid error)
+          (validate-coinbase-height block current-height)
+        (unless valid
+          (return-from validate-block (values nil error nil))))
 
       ;; Validate coinbase value
       (let* ((coinbase-tx (first transactions))
@@ -297,9 +546,8 @@ Disconnects blocks back to the fork point, then connects blocks on the new chain
           (new-height (bitcoin-lisp.storage:block-index-entry-height new-tip-entry))
           (fork-height (bitcoin-lisp.storage:block-index-entry-height fork-entry)))
 
-      (when bitcoin-lisp:*node*
-        (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
-                               old-height fork-height new-height))
+      (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
+                             old-height fork-height new-height)
 
       ;; Collect blocks to disconnect (old chain, tip to fork)
       (let ((to-disconnect (collect-chain-entries old-tip-entry fork-entry))
@@ -333,8 +581,7 @@ Disconnects blocks back to the fork point, then connects blocks on the new chain
          (bitcoin-lisp.storage:block-index-entry-hash new-tip-entry)
          new-height)
 
-        (when bitcoin-lisp:*node*
-          (bitcoin-lisp:log-info "REORG complete: disconnected ~D, connected ~D blocks"
-                                 (length to-disconnect) (length to-connect)))
+        (bitcoin-lisp:log-info "REORG complete: disconnected ~D, connected ~D blocks"
+                               (length to-disconnect) (length to-connect))
 
         t))))

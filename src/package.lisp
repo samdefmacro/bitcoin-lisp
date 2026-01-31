@@ -77,6 +77,10 @@
    #:transaction-outputs
    #:transaction-lock-time
    #:transaction-hash
+   #:transaction-witness
+   #:transaction-wtxid
+   #:transaction-has-witness-p
+   #:serialize-witness-transaction
    #:block-header
    #:make-block-header
    #:block-header-version
@@ -137,6 +141,7 @@
    #:parse-headers-payload
    #:parse-block-payload
    #:read-bitcoin-block
+   #:read-transaction
    #:serialize-transaction
    #:coinbase-input-p
    #:get-unix-time
@@ -199,7 +204,9 @@
    ;; Header index persistence
    #:save-header-index
    #:load-header-index
-   #:append-header-entry))
+   #:append-header-entry
+   ;; Integrity utilities
+   #:compute-crc32))
 
 (defpackage #:bitcoin-lisp.mempool
   (:use #:cl)
@@ -242,11 +249,16 @@
    ;; Block validation
    #:validate-block-header
    #:validate-block
+   #:validate-block-scripts
+   #:find-witness-commitment
+   #:validate-witness-commitment
+   #:compute-witness-merkle-root
    #:check-proof-of-work
    #:compute-merkle-root
    #:connect-block
    #:find-fork-point
    #:perform-reorg
+   #:decode-coinbase-height
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+))
@@ -295,6 +307,14 @@
    #:peer-address
    #:+max-ping-failures+
    #:+max-block-timeouts+
+   ;; Misbehavior and banning
+   #:record-misbehavior
+   #:ban-peer
+   #:peer-banned-p
+   #:clear-ban-list
+   #:peer-misbehavior-score
+   #:+misbehavior-ban-threshold+
+   #:*banned-peers*
    ;; Network params
    #:*testnet-port*
    #:*mainnet-port*
@@ -328,6 +348,7 @@
    #:sync-blockchain
    ;; Logging
    #:*log-stream*
+   #:*current-log-level*
    #:node-log
    #:log-debug
    #:log-info
