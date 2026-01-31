@@ -51,6 +51,18 @@
   "Return the hash of the best (tip) block."
   (chain-state-best-block-hash state))
 
+(defun get-block-at-height (state target-height)
+  "Get the block index entry at TARGET-HEIGHT by walking back from tip."
+  (let ((current-height (chain-state-best-height state)))
+    (when (> target-height current-height)
+      (return-from get-block-at-height nil))
+    (let ((entry (get-block-index-entry state (chain-state-best-block-hash state))))
+      ;; Walk back from tip to target height
+      (loop while (and entry (> (block-index-entry-height entry) target-height))
+            do (setf entry (block-index-entry-prev-entry entry)))
+      (when (and entry (= (block-index-entry-height entry) target-height))
+        entry))))
+
 (defun current-height (state)
   "Return the height of the best block."
   (chain-state-best-height state))

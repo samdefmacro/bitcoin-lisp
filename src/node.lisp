@@ -146,7 +146,11 @@ LEVEL can be :debug, :info, :warn, or :error."
                         (network :testnet)
                         (log-level :info)
                         (max-peers 8)
-                        (sync t))
+                        (sync t)
+                        (rpc-port nil)
+                        (rpc-bind "127.0.0.1")
+                        (rpc-user nil)
+                        (rpc-password nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data
@@ -154,6 +158,10 @@ NETWORK: :testnet or :mainnet
 LOG-LEVEL: :debug, :info, :warn, or :error
 MAX-PEERS: Maximum number of peer connections
 SYNC: If T, start syncing immediately
+RPC-PORT: Port for RPC server (nil = no RPC, default 18332 for testnet)
+RPC-BIND: Address to bind RPC server (default 127.0.0.1)
+RPC-USER: RPC authentication username (nil = no auth)
+RPC-PASSWORD: RPC authentication password
 
 Returns the node instance."
   (when *node*
@@ -224,6 +232,14 @@ Returns the node instance."
 
   (setf (node-running *node*) t)
 
+  ;; Start RPC server if port specified
+  (when rpc-port
+    (bitcoin-lisp.rpc:start-rpc-server *node*
+                                        :port rpc-port
+                                        :bind rpc-bind
+                                        :user rpc-user
+                                        :password rpc-password))
+
   ;; Connect to peers and sync if requested (in background thread)
   (when sync
     (setf (node-sync-thread *node*)
@@ -252,6 +268,9 @@ Returns the node instance."
     (return-from stop-node nil))
 
   (log-info "Stopping node...")
+
+  ;; Stop RPC server first
+  (bitcoin-lisp.rpc:stop-rpc-server)
 
   ;; Signal the node to stop
   (setf (node-running *node*) nil)
