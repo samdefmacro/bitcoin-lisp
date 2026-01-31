@@ -83,8 +83,11 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
 ;;;; Contextual validation (requires chain state)
 
-(defun validate-transaction-contextual (tx utxo-set current-height &key is-coinbase)
+(defun validate-transaction-contextual (tx utxo-set current-height
+                                        &key is-coinbase pending-utxos)
   "Validate a transaction in the context of the current UTXO set.
+PENDING-UTXOS is an optional hash table of (txid . index) -> utxo-entry
+for outputs created by earlier transactions in the same block.
 Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure.
 FEE is returned as a Satoshi type."
   (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
@@ -98,7 +101,10 @@ FEE is returned as a Satoshi type."
         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
                (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
-               (utxo (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)))
+               (utxo (or (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)
+                         ;; Check intra-block pending UTXOs
+                         (when pending-utxos
+                           (gethash (cons prev-txid prev-index) pending-utxos)))))
 
           ;; Input must reference an existing UTXO
           (unless utxo

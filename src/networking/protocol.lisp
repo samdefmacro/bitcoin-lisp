@@ -98,12 +98,15 @@ Returns T if message was handled, NIL otherwise."
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
            (unless (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
              (push inv wanted)))
-          ;; Transaction inventory
+          ;; Transaction inventory - request with witness flag
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
            (when (and mempool
                       (not (bitcoin-lisp.mempool:mempool-has mempool hash)))
-             (push inv wanted))))))
+             (push (bitcoin-lisp.serialization:make-inv-vector
+                    :type bitcoin-lisp.serialization:+inv-type-witness-tx+
+                    :hash hash)
+                   wanted))))))
     ;; Request wanted items
     (when wanted
       (send-message peer
@@ -147,7 +150,6 @@ Returns T if message was handled, NIL otherwise."
 (defun handle-block (peer payload chain-state utxo-set block-store
                      &optional mempool)
   "Handle a block message."
-  (declare (ignore peer))
   (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
     (when block
       (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
@@ -165,8 +167,11 @@ Returns T if message was handled, NIL otherwise."
                 ;; Remove confirmed transactions from mempool
                 (when mempool
                   (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
-              (format t "Block ~A rejected: ~A~%"
-                      (bitcoin-lisp.crypto:bytes-to-hex hash) error)))))))
+              (progn
+                (format t "Block ~A rejected: ~A~%"
+                        (bitcoin-lisp.crypto:bytes-to-hex hash) error)
+                ;; Record misbehavior for invalid block
+                (record-misbehavior peer 100))))))))
 
 ;;; Address handling
 
@@ -195,6 +200,13 @@ Returns T if message was handled, NIL otherwise."
             (multiple-value-bind (valid error fee)
                 (bitcoin-lisp.validation:validate-transaction-for-mempool
                  tx utxo-set mempool current-height)
+              (unless valid
+                ;; Record misbehavior for invalid transactions
+                ;; (policy violations like :insufficient-fee are not penalized)
+                (when (member error '(:script-failed :no-inputs :no-outputs
+                                      :duplicate-inputs :negative-output
+                                      :output-too-large :total-output-too-large))
+                  (record-misbehavior peer 10)))
               (when valid
                 ;; Add to mempool
                 (let ((tx-size (length (bitcoin-lisp.serialization:serialize-transaction tx)))
@@ -260,10 +272,11 @@ Sends inv messages and tracks announcements to avoid duplicates."
                   (bitcoin-lisp.serialization:make-getheaders-message locator))))
 
 (defun request-blocks (peer block-hashes)
-  "Request specific blocks from a peer."
+  "Request specific blocks from a peer using MSG_WITNESS_BLOCK
+so peers include witness data in the response."
   (let ((inv-vectors (mapcar (lambda (hash)
                                (bitcoin-lisp.serialization:make-inv-vector
-                                :type bitcoin-lisp.serialization:+inv-type-block+
+                                :type bitcoin-lisp.serialization:+inv-type-witness-block+
                                 :hash hash))
                              block-hashes)))
     (send-message peer

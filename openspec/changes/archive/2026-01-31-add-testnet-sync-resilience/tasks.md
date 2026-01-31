@@ -39,6 +39,6 @@
 - [x] 7.5 Write tests for shallow reorg (1-3 blocks deep)
 
 ## 8. Integration Validation
-- [ ] 8.1 Manual testnet sync test: connect to real testnet, sync at least 1000 blocks, verify UTXO set consistency
-- [ ] 8.2 Verify sync resume: stop node mid-sync, restart, confirm it resumes from persisted state
-- [ ] 8.3 Verify peer reconnection: disconnect a peer during sync, confirm replacement connects
+- [x] 8.1 Manual testnet sync test: connect to real testnet, sync at least 1000 blocks, verify UTXO set consistency
+- [x] 8.2 Verify sync resume: stop node mid-sync, restart, confirm it resumes from persisted state
+- [x] 8.3 Verify peer reconnection: disconnect a peer during sync, confirm replacement connects

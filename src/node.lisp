@@ -53,84 +53,7 @@
 (defvar *node* nil
   "Current running node instance.")
 
-;;;; Logging
-
-(defvar *log-stream* nil
-  "Stream for log output. NIL means logs only go to buffer.")
-
-(defvar *log-file-stream* nil
-  "File stream for log output, if logging to file.")
-
-(defvar *log-levels*
-  '(:debug 0 :info 1 :warn 2 :error 3)
-  "Log level priority values.")
-
-(defconstant +log-buffer-size+ 500
-  "Maximum number of log entries to keep in memory.")
-
-(defvar *log-buffer* (make-array +log-buffer-size+ :initial-element nil)
-  "Ring buffer for recent log messages.")
-
-(defvar *log-buffer-index* 0
-  "Current write position in log buffer.")
-
-(defvar *log-buffer-count* 0
-  "Number of entries in log buffer.")
-
-(defvar *log-buffer-lock* (bt:make-lock "log-buffer-lock")
-  "Lock for thread-safe log buffer access.")
-
-(defun log-level-value (level)
-  "Get numeric value for log LEVEL."
-  (getf *log-levels* level 1))
-
-(defun format-log-entry (level format-string args)
-  "Format a log entry and return the string."
-  (let ((timestamp (multiple-value-bind (sec min hour day month year)
-                       (get-decoded-time)
-                     (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D"
-                             year month day hour min sec))))
-    (format nil "[~A] ~A: ~?"
-            timestamp
-            (string-upcase (symbol-name level))
-            format-string args)))
-
-(defun add-to-log-buffer (entry)
-  "Add a log entry to the ring buffer."
-  (bt:with-lock-held (*log-buffer-lock*)
-    (setf (aref *log-buffer* *log-buffer-index*) entry)
-    (setf *log-buffer-index* (mod (1+ *log-buffer-index*) +log-buffer-size+))
-    (when (< *log-buffer-count* +log-buffer-size+)
-      (incf *log-buffer-count*))))
-
-(defun node-log (level format-string &rest args)
-  "Log a message at LEVEL."
-  (when (and *node*
-             (>= (log-level-value level)
-                 (log-level-value (node-log-level *node*))))
-    (let ((entry (format-log-entry level format-string args)))
-      ;; Always add to buffer
-      (add-to-log-buffer entry)
-      ;; Write to console if *log-stream* is set
-      (when *log-stream*
-        (format *log-stream* "~A~%" entry)
-        (finish-output *log-stream*))
-      ;; Write to file if logging to file
-      (when *log-file-stream*
-        (format *log-file-stream* "~A~%" entry)
-        (finish-output *log-file-stream*)))))
-
-(defmacro log-debug (format-string &rest args)
-  `(node-log :debug ,format-string ,@args))
-
-(defmacro log-info (format-string &rest args)
-  `(node-log :info ,format-string ,@args))
-
-(defmacro log-warn (format-string &rest args)
-  `(node-log :warn ,format-string ,@args))
-
-(defmacro log-error (format-string &rest args)
-  `(node-log :error ,format-string ,@args))
+;;;; Logging (macros and core functions defined in logging.lisp)
 
 (defun show-logs (&key (n 20) (level :debug))
   "Show the last N log entries at or above LEVEL.
@@ -240,6 +163,7 @@ Returns the node instance."
   ;; Initialize node
   (setf *node* (init-node data-directory :network network :log-level log-level))
   (setf (node-max-peers *node*) max-peers)
+  (setf *current-log-level* log-level)
   (log-info "Bitcoin-Lisp Node v0.1.0")
   (log-info "Network: ~A" network)
   (log-info "Data directory: ~A" data-directory)
@@ -307,8 +231,10 @@ Returns the node instance."
            (lambda ()
              (handler-case
                  (progn
-                   (connect-to-peers *node* max-peers)
-                   (when (node-peers *node*)
+                   ;; Connect to at least 2 peers within 60 seconds before syncing
+                   ;; This helps avoid getting stuck with a single unresponsive peer
+                   (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
+                   (when (>= (length (node-peers *node*)) 1)
                      (setf (node-syncing *node*) t)
                      (unwind-protect
                           (sync-blockchain *node*)
@@ -380,8 +306,12 @@ Returns the node instance."
 
 ;;;; Peer Management
 
-(defun connect-to-peers (node max-peers)
-  "Connect to Bitcoin network peers."
+(defun connect-to-peers (node max-peers &key (timeout 60) (min-peers 1))
+  "Connect to Bitcoin network peers.
+MAX-PEERS: Target number of peers to connect
+TIMEOUT: Maximum seconds to spend connecting (default 60)
+MIN-PEERS: Return early once we have at least this many peers (default 1)
+Returns the number of peers connected."
   (log-info "Discovering peers from DNS seeds...")
   (let ((addresses (bitcoin-lisp.networking:discover-peers)))
     (log-info "Found ~D potential peers" (length addresses))
@@ -389,9 +319,18 @@ Returns the node instance."
     ;; Store discovered addresses for reconnection
     (setf (node-known-addresses node) (alexandria:shuffle (copy-list addresses)))
 
-    (let ((connected 0))
+    (let ((connected 0)
+          (start-time (get-internal-real-time))
+          (timeout-ticks (* timeout internal-time-units-per-second)))
       (dolist (addr (node-known-addresses node))
+        ;; Stop if we have enough peers
         (when (>= connected max-peers)
+          (return))
+
+        ;; Check timeout - but only exit early if we have minimum peers
+        (when (and (>= connected min-peers)
+                   (> (- (get-internal-real-time) start-time) timeout-ticks))
+          (log-info "Connection timeout reached with ~D peers" connected)
           (return))
 
         (log-debug "Trying to connect to ~A..." addr)
@@ -484,102 +423,29 @@ Returns the number of new peers connected."
 
 (defun sync-blockchain (node &key (max-blocks 1000))
   "Synchronize the blockchain with connected peers.
-Downloads up to MAX-BLOCKS."
+Downloads up to MAX-BLOCKS using the IBD system."
   (unless (node-peers node)
     (log-warn "No peers connected, cannot sync")
     (return-from sync-blockchain 0))
 
-  (let ((best-peer (find-best-peer node)))
-    (unless best-peer
-      (log-warn "No suitable peer for sync")
+  (let ((start-height (bitcoin-lisp.storage:current-height (node-chain-state node)))
+        (peer-height (bitcoin-lisp.networking:peer-start-height (find-best-peer node))))
+
+    (log-info "Starting sync: local height ~D, peer height ~D" start-height peer-height)
+
+    (when (>= start-height peer-height)
+      (log-info "Already synced to peer height")
       (return-from sync-blockchain 0))
 
-    (let ((start-height (bitcoin-lisp.storage:current-height
-                         (node-chain-state node)))
-          (peer-height (bitcoin-lisp.networking:peer-start-height best-peer)))
+    ;; Use IBD system for sync
+    (let ((target (min (+ start-height max-blocks) peer-height)))
+      (bitcoin-lisp.networking::start-ibd
+       (node-peers node)
+       (node-chain-state node)
+       (node-utxo-set node)
+       (node-block-store node)
+       target))))
 
-      (log-info "Starting sync: local height ~D, peer height ~D"
-                start-height peer-height)
-
-      (when (>= start-height peer-height)
-        (log-info "Already synced to peer height")
-        (return-from sync-blockchain 0))
-
-      ;; Request headers first
-      (log-info "Requesting headers...")
-      (bitcoin-lisp.networking:request-headers best-peer (node-chain-state node))
-
-      (let ((blocks-synced 0)
-            (last-progress-report 0)
-            (blocks-since-flush 0)
-            (last-peer-check-time (get-internal-real-time))
-            (peer-check-interval (* 60 internal-time-units-per-second))
-            (current-peer best-peer))
-        (loop while (and (node-running node)
-                         (< blocks-synced max-blocks)
-                         (< (+ start-height blocks-synced) peer-height))
-              do (multiple-value-bind (command payload)
-                     (bitcoin-lisp.networking:receive-message current-peer :timeout 120)
-                   ;; Handle peer failure with failover
-                   (cond
-                     ((null command)
-                      (log-warn "Timeout/disconnect from sync peer, attempting failover...")
-                      (maintain-peers node)
-                      (let ((new-peer (find-best-peer node)))
-                        (unless new-peer
-                          (log-warn "No peers available for failover")
-                          (return))
-                        (setf current-peer new-peer)
-                        (log-info "Failover to peer ~A"
-                                  (bitcoin-lisp.networking:peer-address new-peer))
-                        ;; Re-request headers from new peer
-                        (bitcoin-lisp.networking:request-headers
-                         current-peer (node-chain-state node))))
-                     (t
-                      (bitcoin-lisp.networking:handle-message
-                       current-peer command payload
-                       (node-chain-state node)
-                       (node-utxo-set node)
-                       (node-block-store node)
-                       :mempool (node-mempool node)
-                       :peers (node-peers node))
-                      (when (string= command "block")
-                        (incf blocks-synced)
-                        (incf blocks-since-flush)
-                        ;; Periodic flush every 1000 blocks
-                        (when (>= blocks-since-flush 1000)
-                          (log-info "Periodic flush at height ~D"
-                                    (bitcoin-lisp.storage:current-height
-                                     (node-chain-state node)))
-                          (bitcoin-lisp.storage:save-state (node-chain-state node))
-                          (bitcoin-lisp.storage:save-utxo-set
-                           (node-utxo-set node)
-                           (bitcoin-lisp.storage:utxo-set-file-path
-                            (node-data-directory node)))
-                          (bitcoin-lisp.storage:save-header-index
-                           (node-chain-state node))
-                          (setf blocks-since-flush 0))
-                        ;; Progress report every 100 blocks
-                        (when (>= (- blocks-synced last-progress-report) 100)
-                          (log-info "Synced ~D blocks, current height ~D"
-                                    blocks-synced
-                                    (bitcoin-lisp.storage:current-height
-                                     (node-chain-state node)))
-                          (setf last-progress-report blocks-synced)))))
-                   ;; Periodic peer health check and reconnection
-                   (let ((now (get-internal-real-time)))
-                     (when (> (- now last-peer-check-time) peer-check-interval)
-                       (maintain-peers node)
-                       (setf last-peer-check-time now)))))
-
-        (log-info "Sync complete: ~D blocks downloaded, height now ~D"
-                  blocks-synced
-                  (bitcoin-lisp.storage:current-height (node-chain-state node)))
-
-        ;; Save state after sync
-        (bitcoin-lisp.storage:save-state (node-chain-state node))
-
-        blocks-synced))))
 
 (defun find-best-peer (node)
   "Find the best peer for syncing (highest block height)."

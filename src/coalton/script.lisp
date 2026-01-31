@@ -1783,7 +1783,9 @@
                    (let ((valid (lisp Boolean (sig pubkey ctx)
                                   (cl:let* ((script (context-script ctx))
                                             (codesep-pos (context-codesep-pos ctx))
-                                            (subscript (cl:subseq script codesep-pos))
+                                            (subscript-raw (cl:subseq script codesep-pos))
+                                            ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
+                                            (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                             (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                             (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                             (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
@@ -1830,7 +1832,9 @@
                    (let ((valid (lisp Boolean (sig pubkey ctx)
                                   (cl:let* ((script (context-script ctx))
                                             (codesep-pos (context-codesep-pos ctx))
-                                            (subscript (cl:subseq script codesep-pos))
+                                            (subscript-raw (cl:subseq script codesep-pos))
+                                            ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
+                                            (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                             (sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                             (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                             (fn (cl:fdefinition (cl:intern "VERIFY-CHECKSIG-FOR-SCRIPT" "BITCOIN-LISP.COALTON.INTEROP"))))
@@ -1858,7 +1862,9 @@
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
-                                 (subscript (cl:subseq script codesep-pos))
+                                 (subscript-raw (cl:subseq script codesep-pos))
+                                 ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
+                                 (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                  (fn (cl:fdefinition (cl:intern "DO-CHECKMULTISIG-STACK-OP" "BITCOIN-LISP.COALTON.INTEROP"))))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
                              (cl:funcall fn stack subscript)
@@ -1904,7 +1910,9 @@
                        (cl:let* ((stack (context-main-stack ctx))
                                  (script (context-script ctx))
                                  (codesep-pos (context-codesep-pos ctx))
-                                 (subscript (cl:subseq script codesep-pos))
+                                 (subscript-raw (cl:subseq script codesep-pos))
+                                 ;; Ensure subscript is properly typed as (unsigned-byte 8) vector
+                                 (subscript (cl:coerce subscript-raw '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                                  (fn (cl:fdefinition (cl:intern "DO-CHECKMULTISIG-STACK-OP" "BITCOIN-LISP.COALTON.INTEROP"))))
                          (cl:multiple-value-bind (status new-stack pubkey-count)
                              (cl:funcall fn stack subscript)

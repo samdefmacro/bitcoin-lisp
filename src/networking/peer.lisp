@@ -26,7 +26,9 @@
   (last-health-check 0 :type integer)
   ;; Block request timeout tracking
   (block-timeout-count 0 :type (unsigned-byte 8))
-  (address "" :type string))
+  (address "" :type string)
+  ;; Misbehavior scoring
+  (misbehavior-score 0 :type (unsigned-byte 32)))
 
 ;;; Network parameters
 
@@ -53,11 +55,15 @@
 
 (defun connect-peer (host &optional (port *current-port*))
   "Connect to a peer at HOST:PORT.
-Returns a peer structure or NIL on failure."
+Returns a peer structure or NIL on failure.
+Returns NIL if the host is banned."
+  (when (peer-banned-p host)
+    (return-from connect-peer nil))
   (let ((conn (make-tcp-connection host port)))
     (when conn
       (make-peer :connection conn
-                 :state :connected))))
+                 :state :connected
+                 :address host))))
 
 (defun disconnect-peer (peer)
   "Disconnect from a peer."
@@ -218,3 +224,50 @@ Should be called periodically (every ~60s)."
 Returns T if the peer should be disconnected."
   (incf (peer-block-timeout-count peer))
   (>= (peer-block-timeout-count peer) +max-block-timeouts+))
+
+;;; Misbehavior Scoring and Banning
+
+(defconstant +misbehavior-ban-threshold+ 100
+  "Misbehavior score at which a peer gets banned.")
+
+(defconstant +ban-duration-seconds+ (* 24 60 60)
+  "Ban duration: 24 hours.")
+
+(defvar *banned-peers* (make-hash-table :test 'equal)
+  "Hash table mapping peer address (string) -> ban-expiry-time (universal-time).")
+
+(defun record-misbehavior (peer score-increment)
+  "Increment PEER's misbehavior score by SCORE-INCREMENT.
+If the score reaches the ban threshold, the peer is banned and disconnected.
+Returns T if the peer was banned."
+  (incf (peer-misbehavior-score peer) score-increment)
+  (when (>= (peer-misbehavior-score peer) +misbehavior-ban-threshold+)
+    (ban-peer peer)
+    t))
+
+(defun ban-peer (peer)
+  "Ban a peer. Sets state to :banned and records ban expiry."
+  (setf (peer-state peer) :banned)
+  (let ((address (peer-address peer)))
+    (when (and address (plusp (length address)))
+      (setf (gethash address *banned-peers*)
+            (+ (get-universal-time) +ban-duration-seconds+))))
+  (when (peer-connection peer)
+    (close-connection (peer-connection peer))
+    (setf (peer-connection peer) nil)))
+
+(defun peer-banned-p (address)
+  "Check if ADDRESS is currently banned.
+Returns T if banned, NIL otherwise. Expired bans are cleaned up."
+  (let ((expiry (gethash address *banned-peers*)))
+    (cond
+      ((null expiry) nil)
+      ((> (get-universal-time) expiry)
+       ;; Ban expired, remove it
+       (remhash address *banned-peers*)
+       nil)
+      (t t))))
+
+(defun clear-ban-list ()
+  "Clear all bans."
+  (clrhash *banned-peers*))
