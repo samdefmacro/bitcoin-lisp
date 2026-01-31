@@ -138,6 +138,154 @@
       (when (probe-file path)
         (delete-file path)))))
 
+;;;; Persistence Integrity Tests
+
+(test utxo-detect-truncated-file
+  "Loading a truncated UTXO file should fail (CRC mismatch)."
+  (let ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+        (path (merge-pathnames "test-truncated-utxo.dat"
+                               (ensure-directories-exist
+                                (merge-pathnames "test-persist/"
+                                                 (uiop:temporary-directory)))))
+        (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+        (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+    ;; Save a valid file
+    (bitcoin-lisp.storage:add-utxo utxo-set txid 0 50000000 script 100 :coinbase t)
+    (bitcoin-lisp.storage:save-utxo-set utxo-set path)
+    ;; Truncate the file (remove last 10 bytes)
+    (let* ((file-bytes (with-open-file (s path :direction :input
+                                              :element-type '(unsigned-byte 8))
+                         (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                           (read-sequence b s) b)))
+           (truncated (subseq file-bytes 0 (max 0 (- (length file-bytes) 10)))))
+      (with-open-file (s path :direction :output :if-exists :supersede
+                              :element-type '(unsigned-byte 8))
+        (write-sequence truncated s)))
+    ;; Loading should fail
+    (let ((fresh-set (bitcoin-lisp.storage:make-utxo-set)))
+      (is (null (bitcoin-lisp.storage:load-utxo-set fresh-set path))))
+    (when (probe-file path) (delete-file path))))
+
+(test utxo-detect-corrupted-file
+  "Loading a UTXO file with flipped bits should fail (CRC mismatch)."
+  (let ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+        (path (merge-pathnames "test-corrupt-utxo.dat"
+                               (ensure-directories-exist
+                                (merge-pathnames "test-persist/"
+                                                 (uiop:temporary-directory)))))
+        (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+        (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+    (bitcoin-lisp.storage:add-utxo utxo-set txid 0 50000000 script 100 :coinbase t)
+    (bitcoin-lisp.storage:save-utxo-set utxo-set path)
+    ;; Flip a byte in the middle
+    (let ((file-bytes (with-open-file (s path :direction :input
+                                              :element-type '(unsigned-byte 8))
+                        (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                          (read-sequence b s) b))))
+      (setf (aref file-bytes (floor (length file-bytes) 2))
+            (logxor (aref file-bytes (floor (length file-bytes) 2)) #xFF))
+      (with-open-file (s path :direction :output :if-exists :supersede
+                              :element-type '(unsigned-byte 8))
+        (write-sequence file-bytes s)))
+    (let ((fresh-set (bitcoin-lisp.storage:make-utxo-set)))
+      (is (null (bitcoin-lisp.storage:load-utxo-set fresh-set path))))
+    (when (probe-file path) (delete-file path))))
+
+(test utxo-reject-unknown-version
+  "Loading a UTXO file with wrong version should fail."
+  (let ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+        (path (merge-pathnames "test-badver-utxo.dat"
+                               (ensure-directories-exist
+                                (merge-pathnames "test-persist/"
+                                                 (uiop:temporary-directory)))))
+        (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+        (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+    (bitcoin-lisp.storage:add-utxo utxo-set txid 0 50000000 script 100 :coinbase t)
+    (bitcoin-lisp.storage:save-utxo-set utxo-set path)
+    ;; Change version byte (byte 4) to 99 and recompute CRC
+    (let ((file-bytes (with-open-file (s path :direction :input
+                                              :element-type '(unsigned-byte 8))
+                        (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                          (read-sequence b s) b))))
+      ;; Version is at offset 4 (after 4 magic bytes)
+      (setf (aref file-bytes 4) 99)
+      ;; Recompute CRC for the modified data
+      (let* ((data-bytes (subseq file-bytes 0 (- (length file-bytes) 4)))
+             (new-crc (bitcoin-lisp.storage:compute-crc32 data-bytes)))
+        (replace file-bytes new-crc :start1 (- (length file-bytes) 4)))
+      (with-open-file (s path :direction :output :if-exists :supersede
+                              :element-type '(unsigned-byte 8))
+        (write-sequence file-bytes s)))
+    (let ((fresh-set (bitcoin-lisp.storage:make-utxo-set)))
+      (is (null (bitcoin-lisp.storage:load-utxo-set fresh-set path))))
+    (when (probe-file path) (delete-file path))))
+
+(test utxo-backward-compat-old-format
+  "Loading an old-format UTXO file (no magic) should succeed."
+  (let ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+        (path (merge-pathnames "test-oldfmt-utxo.dat"
+                               (ensure-directories-exist
+                                (merge-pathnames "test-persist/"
+                                                 (uiop:temporary-directory)))))
+        (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+        (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+    ;; Write old format manually: count(4) + entries (no magic, no CRC)
+    (with-open-file (s path :direction :output :if-exists :supersede
+                            :element-type '(unsigned-byte 8))
+      ;; Count = 1
+      (write-byte 1 s) (write-byte 0 s) (write-byte 0 s) (write-byte 0 s)
+      ;; 36-byte key (txid + output-index)
+      (write-sequence txid s)
+      (write-byte 0 s) (write-byte 0 s) (write-byte 0 s) (write-byte 0 s)
+      ;; 8-byte value = 1000000
+      (write-byte #x40 s) (write-byte #x42 s) (write-byte #x0F s) (write-byte 0 s)
+      (write-byte 0 s) (write-byte 0 s) (write-byte 0 s) (write-byte 0 s)
+      ;; 4-byte height = 10
+      (write-byte 10 s) (write-byte 0 s) (write-byte 0 s) (write-byte 0 s)
+      ;; 1-byte coinbase = 0
+      (write-byte 0 s)
+      ;; 4-byte script-len = 25
+      (write-byte 25 s) (write-byte 0 s) (write-byte 0 s) (write-byte 0 s)
+      ;; 25-byte script
+      (write-sequence script s))
+    (let ((loaded (bitcoin-lisp.storage:make-utxo-set)))
+      (is (bitcoin-lisp.storage:load-utxo-set loaded path))
+      (is (= 1 (bitcoin-lisp.storage:utxo-count loaded)))
+      (let ((entry (bitcoin-lisp.storage:get-utxo loaded txid 0)))
+        (is (not (null entry)))
+        (is (= 1000000 (bitcoin-lisp.storage:utxo-entry-value entry)))))
+    (when (probe-file path) (delete-file path))))
+
+(test header-index-detect-corrupted
+  "Loading a corrupted header index file should fail (CRC mismatch)."
+  (let* ((base-path (ensure-directories-exist
+                     (merge-pathnames "test-corrupt-headers/"
+                                      (uiop:temporary-directory))))
+         (state (bitcoin-lisp.storage:init-chain-state base-path))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash state)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state
+     (bitcoin-lisp.storage:make-block-index-entry
+      :hash genesis-hash :height 0 :chain-work 0 :status :valid))
+    (bitcoin-lisp.storage:save-header-index state)
+    ;; Corrupt the file
+    (let* ((path (merge-pathnames "headerindex.dat" base-path))
+           (file-bytes (with-open-file (s path :direction :input
+                                               :element-type '(unsigned-byte 8))
+                         (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                           (read-sequence b s) b))))
+      (setf (aref file-bytes (floor (length file-bytes) 2))
+            (logxor (aref file-bytes (floor (length file-bytes) 2)) #xFF))
+      (with-open-file (s path :direction :output :if-exists :supersede
+                              :element-type '(unsigned-byte 8))
+        (write-sequence file-bytes s)))
+    ;; Loading should fail
+    (let ((state2 (bitcoin-lisp.storage:init-chain-state base-path)))
+      (is (null (bitcoin-lisp.storage:load-header-index state2))))
+    ;; Cleanup
+    (let ((path (merge-pathnames "headerindex.dat" base-path)))
+      (when (probe-file path) (delete-file path)))))
+
 ;;;; Peer Health Monitoring Tests
 
 (test peer-health-consecutive-failures
@@ -164,6 +312,49 @@
     (bitcoin-lisp.networking::handle-pong peer 12345)
     ;; Failures should be reset
     (is (= 0 (bitcoin-lisp.networking:peer-consecutive-ping-failures peer)))))
+
+;;;; Misbehavior Scoring Tests
+
+(test peer-misbehavior-ban-threshold
+  "Peer should be banned when misbehavior score reaches threshold."
+  (let ((peer (bitcoin-lisp.networking:make-peer)))
+    (setf (bitcoin-lisp.networking:peer-state peer) :ready)
+    (setf (bitcoin-lisp.networking:peer-address peer) "192.0.2.99")
+    ;; Score below threshold
+    (is (not (bitcoin-lisp.networking:record-misbehavior peer 50)))
+    (is (= 50 (bitcoin-lisp.networking:peer-misbehavior-score peer)))
+    (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))
+    ;; Score reaches threshold
+    (is (bitcoin-lisp.networking:record-misbehavior peer 50))
+    (is (eq :banned (bitcoin-lisp.networking:peer-state peer)))
+    ;; Address should be in ban list
+    (is (bitcoin-lisp.networking:peer-banned-p "192.0.2.99"))
+    ;; Cleanup
+    (bitcoin-lisp.networking:clear-ban-list)))
+
+(test peer-banned-p-check
+  "peer-banned-p should return T for banned addresses, NIL for others."
+  (bitcoin-lisp.networking:clear-ban-list)
+  (is (not (bitcoin-lisp.networking:peer-banned-p "192.0.2.1")))
+  ;; Manually ban an address
+  (setf (gethash "192.0.2.1" bitcoin-lisp.networking:*banned-peers*)
+        (+ (get-universal-time) 3600))  ; 1 hour from now
+  (is (bitcoin-lisp.networking:peer-banned-p "192.0.2.1"))
+  ;; Expired ban
+  (setf (gethash "192.0.2.2" bitcoin-lisp.networking:*banned-peers*)
+        (- (get-universal-time) 1))  ; 1 second ago
+  (is (not (bitcoin-lisp.networking:peer-banned-p "192.0.2.2")))
+  (bitcoin-lisp.networking:clear-ban-list))
+
+(test peer-invalid-block-immediate-ban
+  "Sending an invalid block should result in immediate ban (+100)."
+  (let ((peer (bitcoin-lisp.networking:make-peer)))
+    (setf (bitcoin-lisp.networking:peer-state peer) :ready)
+    (setf (bitcoin-lisp.networking:peer-address peer) "192.0.2.100")
+    ;; One invalid block = +100 = immediate ban
+    (is (bitcoin-lisp.networking:record-misbehavior peer 100))
+    (is (eq :banned (bitcoin-lisp.networking:peer-state peer)))
+    (bitcoin-lisp.networking:clear-ban-list)))
 
 ;;;; Block Timeout Peer Rotation Tests
 
@@ -418,6 +609,240 @@
       (let ((path (merge-pathnames file base-path)))
         (when (probe-file path)
           (delete-file path))))))
+
+;;;; Reorg and Persistence Edge-Case Tests
+
+(defun make-reorg-test-block (prev-hash block-hash height &key (value 5000000000))
+  "Create a minimal test block for reorg tests."
+  (let* ((coinbase-tx (bitcoin-lisp.serialization:make-transaction
+                       :version 1
+                       :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                      :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                          :initial-element 0)
+                                                        :index #xFFFFFFFF)
+                                      :script-sig (make-array 4 :element-type '(unsigned-byte 8)
+                                                                :initial-element 1)))
+                       :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                       :value value
+                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                  :initial-element #x76)))
+                       :lock-time 0
+                       :cached-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                                         :initial-element 0)))
+                                      ;; Make txid unique per block using full block-hash info
+                                      (setf (aref h 0) (aref block-hash 0))
+                                      (setf (aref h 1) (aref block-hash 1))
+                                      (setf (aref h 2) #xBB)
+                                      h)))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1
+                  :prev-block prev-hash
+                  :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                  :timestamp (+ 1231006505 (* height 600))
+                  :bits #x1d00ffff
+                  :nonce 0
+                  :cached-hash block-hash)))
+    (bitcoin-lisp.serialization:make-bitcoin-block
+     :header header
+     :transactions (list coinbase-tx))))
+
+(defun make-test-chain-hashes (prefix count)
+  "Generate COUNT unique 32-byte hashes with PREFIX byte for chain identification."
+  (loop for i from 1 to count
+        collect (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                  (setf (aref h 0) prefix)
+                  (setf (aref h 1) i)
+                  h)))
+
+(test multi-block-reorg-3-deep
+  "A reorg of 3+ blocks should correctly switch chains."
+  (let* ((base-path (ensure-directories-exist
+                     (merge-pathnames "test-reorg-deep/"
+                                      (uiop:temporary-directory))))
+         (chain-state (bitcoin-lisp.storage:init-chain-state base-path))
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (block-store (bitcoin-lisp.storage:init-block-store base-path))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+    ;; Clear undo data
+    (clrhash bitcoin-lisp.validation::*block-undo-data*)
+    ;; Add genesis index entry
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state
+     (bitcoin-lisp.storage:make-block-index-entry
+      :hash genesis-hash :height 0 :chain-work 1 :status :valid))
+    ;; Build chain A: genesis -> A1 -> A2 -> A3 (3 blocks, lower work)
+    (let ((chain-a-hashes (make-test-chain-hashes #xA0 3)))
+      (let ((prev-hash genesis-hash))
+        (loop for h from 1 to 3
+              for block-hash in chain-a-hashes
+              do (let ((block (make-reorg-test-block prev-hash block-hash h)))
+                   (bitcoin-lisp.validation:connect-block
+                    block chain-state block-store utxo-set)
+                   (setf prev-hash block-hash))))
+      ;; Verify chain A is current
+      (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+      (is (equalp (third chain-a-hashes)
+                  (bitcoin-lisp.storage:best-block-hash chain-state)))
+      ;; Count UTXOs from chain A (3 coinbase outputs)
+      (is (= 3 (bitcoin-lisp.storage:utxo-count utxo-set)))
+      ;; Build chain B: genesis -> B1 -> B2 -> B3 -> B4 (4 blocks, more work)
+      (let ((chain-b-hashes (make-test-chain-hashes #xB0 4)))
+        (let ((prev-hash genesis-hash))
+          (loop for h from 1 to 4
+                for block-hash in chain-b-hashes
+                do (let ((block (make-reorg-test-block prev-hash block-hash h)))
+                     (bitcoin-lisp.validation:connect-block
+                      block chain-state block-store utxo-set)
+                     (setf prev-hash block-hash))))
+        ;; After reorg: chain B should be active (4 blocks, more work)
+        (is (= 4 (bitcoin-lisp.storage:current-height chain-state)))
+        (is (equalp (fourth chain-b-hashes)
+                    (bitcoin-lisp.storage:best-block-hash chain-state)))
+        ;; UTXOs: chain A's 3 coinbase outputs disconnected, chain B's 4 connected
+        (is (= 4 (bitcoin-lisp.storage:utxo-count utxo-set)))))
+    ;; Cleanup
+    (clrhash bitcoin-lisp.validation::*block-undo-data*)))
+
+(test reorg-missing-undo-data-graceful
+  "Reorg with missing undo data should not corrupt the UTXO set or crash."
+  (let* ((base-path (ensure-directories-exist
+                     (merge-pathnames "test-reorg-noundo/"
+                                      (uiop:temporary-directory))))
+         (chain-state (bitcoin-lisp.storage:init-chain-state base-path))
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (block-store (bitcoin-lisp.storage:init-block-store base-path))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+    (clrhash bitcoin-lisp.validation::*block-undo-data*)
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state
+     (bitcoin-lisp.storage:make-block-index-entry
+      :hash genesis-hash :height 0 :chain-work 1 :status :valid))
+    ;; Build chain A: genesis -> A1 -> A2
+    (let ((chain-a-hashes (make-test-chain-hashes #xC0 2)))
+      (let ((prev-hash genesis-hash))
+        (loop for h from 1 to 2
+              for block-hash in chain-a-hashes
+              do (let ((block (make-reorg-test-block prev-hash block-hash h)))
+                   (bitcoin-lisp.validation:connect-block
+                    block chain-state block-store utxo-set)
+                   (setf prev-hash block-hash))))
+      ;; Deliberately clear undo data to simulate missing undo
+      (clrhash bitcoin-lisp.validation::*block-undo-data*)
+      ;; Now build chain B with more work: genesis -> B1 -> B2 -> B3
+      (let ((chain-b-hashes (make-test-chain-hashes #xD0 3)))
+        (let ((prev-hash genesis-hash))
+          (loop for h from 1 to 3
+                for block-hash in chain-b-hashes
+                do (let ((block (make-reorg-test-block prev-hash block-hash h)))
+                     (bitcoin-lisp.validation:connect-block
+                      block chain-state block-store utxo-set)
+                     (setf prev-hash block-hash))))
+        ;; Should not crash; chain tip should be updated to chain B
+        (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+        (is (equalp (third chain-b-hashes)
+                    (bitcoin-lisp.storage:best-block-hash chain-state)))))
+    (clrhash bitcoin-lisp.validation::*block-undo-data*)))
+
+(test persistence-round-trip-after-reorg
+  "Chain state and UTXO set should be consistent after save/load following a reorg."
+  (let* ((base-path (ensure-directories-exist
+                     (merge-pathnames "test-reorg-persist/"
+                                      (uiop:temporary-directory))))
+         (chain-state (bitcoin-lisp.storage:init-chain-state base-path))
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (block-store (bitcoin-lisp.storage:init-block-store base-path))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+    (clrhash bitcoin-lisp.validation::*block-undo-data*)
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state
+     (bitcoin-lisp.storage:make-block-index-entry
+      :hash genesis-hash :height 0 :chain-work 1 :status :valid))
+    ;; Build chain A (2 blocks)
+    (let ((chain-a-hashes (make-test-chain-hashes #xE0 2)))
+      (let ((prev-hash genesis-hash))
+        (loop for h from 1 to 2
+              for block-hash in chain-a-hashes
+              do (let ((block (make-reorg-test-block prev-hash block-hash h)))
+                   (bitcoin-lisp.validation:connect-block
+                    block chain-state block-store utxo-set)
+                   (setf prev-hash block-hash)))))
+    ;; Build chain B (3 blocks, triggers reorg)
+    (let ((chain-b-hashes (make-test-chain-hashes #xF0 3)))
+      (let ((prev-hash genesis-hash))
+        (loop for h from 1 to 3
+              for block-hash in chain-b-hashes
+              do (let ((block (make-reorg-test-block prev-hash block-hash h)))
+                   (bitcoin-lisp.validation:connect-block
+                    block chain-state block-store utxo-set)
+                   (setf prev-hash block-hash))))
+      ;; After reorg: chain B is active
+      (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+      (let ((utxo-count-before (bitcoin-lisp.storage:utxo-count utxo-set)))
+        ;; Save state
+        (bitcoin-lisp.storage:save-state chain-state)
+        (bitcoin-lisp.storage:save-utxo-set utxo-set
+                                             (bitcoin-lisp.storage:utxo-set-file-path base-path))
+        (bitcoin-lisp.storage:save-header-index chain-state)
+        ;; Load into fresh state
+        (let ((state2 (bitcoin-lisp.storage:init-chain-state base-path))
+              (utxo2 (bitcoin-lisp.storage:make-utxo-set)))
+          (bitcoin-lisp.storage:load-state state2)
+          (bitcoin-lisp.storage:load-utxo-set utxo2
+                                               (bitcoin-lisp.storage:utxo-set-file-path base-path))
+          (bitcoin-lisp.storage:load-header-index state2)
+          ;; Verify chain state matches
+          (is (= 3 (bitcoin-lisp.storage:current-height state2)))
+          (is (equalp (third chain-b-hashes)
+                      (bitcoin-lisp.storage:best-block-hash state2)))
+          ;; Verify UTXO count matches
+          (is (= utxo-count-before (bitcoin-lisp.storage:utxo-count utxo2)))
+          ;; Verify header index has entries from both chains
+          (let ((tip-entry (bitcoin-lisp.storage:get-block-index-entry
+                            state2 (third chain-b-hashes))))
+            (is (not (null tip-entry)))
+            (is (= 3 (bitcoin-lisp.storage:block-index-entry-height tip-entry)))))))
+    ;; Cleanup
+    (clrhash bitcoin-lisp.validation::*block-undo-data*)
+    (dolist (file '("chainstate.dat" "utxoset.dat" "headerindex.dat"))
+      (let ((path (merge-pathnames file base-path)))
+        (when (probe-file path) (delete-file path))))))
+
+(test utxo-consistency-save-load-during-sync
+  "UTXO set should remain consistent through save/load cycles during block processing."
+  (let* ((base-path (ensure-directories-exist
+                     (merge-pathnames "test-utxo-sync/"
+                                      (uiop:temporary-directory))))
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (utxo-path (bitcoin-lisp.storage:utxo-set-file-path base-path))
+         (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+    ;; Simulate syncing several blocks with save/load between them
+    ;; Block 1: add coinbase UTXO
+    (let ((txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11)))
+      (bitcoin-lisp.storage:add-utxo utxo-set txid1 0 5000000000 script 1 :coinbase t)
+      ;; Save and reload (simulating periodic checkpoint)
+      (bitcoin-lisp.storage:save-utxo-set utxo-set utxo-path)
+      (let ((reloaded (bitcoin-lisp.storage:make-utxo-set)))
+        (is (bitcoin-lisp.storage:load-utxo-set reloaded utxo-path))
+        (is (= 1 (bitcoin-lisp.storage:utxo-count reloaded)))
+        (is (bitcoin-lisp.storage:utxo-exists-p reloaded txid1 0))
+        ;; Continue syncing on reloaded set
+        ;; Block 2: add another UTXO, spend first one
+        (let ((txid2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x22)))
+          (bitcoin-lisp.storage:add-utxo reloaded txid2 0 4999000000 script 2)
+          (bitcoin-lisp.storage:remove-utxo reloaded txid1 0)
+          ;; Save and reload again
+          (bitcoin-lisp.storage:save-utxo-set reloaded utxo-path)
+          (let ((reloaded2 (bitcoin-lisp.storage:make-utxo-set)))
+            (is (bitcoin-lisp.storage:load-utxo-set reloaded2 utxo-path))
+            (is (= 1 (bitcoin-lisp.storage:utxo-count reloaded2)))
+            (is (not (bitcoin-lisp.storage:utxo-exists-p reloaded2 txid1 0)))
+            (is (bitcoin-lisp.storage:utxo-exists-p reloaded2 txid2 0))
+            ;; Verify value preserved
+            (let ((entry (bitcoin-lisp.storage:get-utxo reloaded2 txid2 0)))
+              (is (= 4999000000 (bitcoin-lisp.storage:utxo-entry-value entry))))))))
+    ;; Cleanup
+    (when (probe-file utxo-path) (delete-file utxo-path))))
 
 ;;;; Out-of-Order Block Queue Tests
 

@@ -24,13 +24,16 @@ Checks include:
 - **THEN** validation fails with "negative output" error
 
 ### Requirement: Script Validation
-The system SHALL execute Bitcoin scripts to validate transaction authorization.
+The system SHALL execute Bitcoin scripts to validate transaction authorization, including witness programs.
 
 The script interpreter SHALL support:
 - Stack operations (OP_DUP, OP_DROP, OP_SWAP, etc.)
 - Crypto operations (OP_HASH160, OP_HASH256, OP_CHECKSIG, etc.)
 - Flow control (OP_IF, OP_ELSE, OP_ENDIF, OP_VERIFY)
 - Arithmetic operations (OP_ADD, OP_SUB, OP_EQUAL, etc.)
+- Witness program validation (P2WPKH, P2WSH, P2TR) using deserialized witness stacks
+
+For witness program inputs, the system SHALL pass the witness stack from the transaction's serialized witness data to the Coalton `validate-witness-program` function.
 
 #### Scenario: Validate P2PKH transaction
 - **GIVEN** a transaction spending a P2PKH output with valid signature
@@ -41,6 +44,16 @@ The script interpreter SHALL support:
 - **GIVEN** a transaction with an invalid ECDSA signature
 - **WHEN** executing OP_CHECKSIG
 - **THEN** the script fails and validation rejects the transaction
+
+#### Scenario: Validate P2WPKH witness input
+- **GIVEN** a transaction spending a P2WPKH output with witness data containing a valid signature and public key
+- **WHEN** validating the witness program
+- **THEN** the witness stack is passed to the Coalton validator and validation succeeds
+
+#### Scenario: Reject witness input with invalid signature
+- **GIVEN** a transaction spending a witness program output with an invalid witness stack
+- **WHEN** validating the witness program
+- **THEN** validation fails with a script error
 
 ### Requirement: Block Header Validation
 The system SHALL validate block headers against consensus rules.
@@ -67,9 +80,32 @@ The system SHALL validate complete blocks against consensus rules.
 Checks include:
 - First transaction is coinbase, no others are
 - Coinbase value doesn't exceed block reward + fees
-- All transactions are valid
+- All transactions have valid structure and contextual rules (UTXO existence, fees)
+- All non-coinbase transaction scripts are executed and validated via the Coalton interop engine
 - Merkle root matches transaction hashes
 - Block size within limits
+- Witness commitment matches witness merkle root (for blocks with witness data)
+- Coinbase scriptSig encodes the block height (BIP 34, for blocks at/above activation height)
+
+#### Scenario: Validate transaction scripts during block connection
+- **GIVEN** a block containing transactions with signatures
+- **WHEN** validating the block
+- **THEN** all non-coinbase transaction scripts are executed via the Coalton interop engine and must pass
+
+#### Scenario: Reject block with invalid signature
+- **GIVEN** a block containing a transaction with an invalid ECDSA or Schnorr signature
+- **WHEN** validating the block
+- **THEN** validation fails and the block is rejected
+
+#### Scenario: Validate SegWit scripts during block connection
+- **GIVEN** a block containing P2WPKH or P2WSH transactions
+- **WHEN** validating the block
+- **THEN** witness programs are validated via `validate-witness-program` with BIP 143 sighash
+
+#### Scenario: Validate Taproot scripts during block connection
+- **GIVEN** a block containing P2TR transactions
+- **WHEN** validating the block
+- **THEN** Taproot key-path or script-path spending is validated via `validate-taproot`
 
 #### Scenario: Validate merkle root
 - **GIVEN** a block with transactions
@@ -80,6 +116,26 @@ Checks include:
 - **GIVEN** a block where coinbase output exceeds (subsidy + fees)
 - **WHEN** validating the block
 - **THEN** validation fails with "coinbase value too high" error
+
+#### Scenario: Validate witness commitment
+- **GIVEN** a block containing SegWit transactions with witness data
+- **WHEN** validating the block
+- **THEN** the witness merkle root commitment in the coinbase OP_RETURN output is verified
+
+#### Scenario: Reject invalid witness commitment
+- **GIVEN** a block with witness data but incorrect witness commitment hash
+- **WHEN** validating the block
+- **THEN** validation fails with "bad witness commitment" error
+
+#### Scenario: Validate BIP 34 coinbase height
+- **GIVEN** a block at height >= 21111 (testnet) or 227931 (mainnet)
+- **WHEN** validating the coinbase transaction
+- **THEN** the coinbase scriptSig starts with a push of the block height
+
+#### Scenario: Reject wrong coinbase height
+- **GIVEN** a block at height >= activation with coinbase encoding a different height
+- **WHEN** validating the block
+- **THEN** validation fails with "bad coinbase height" error
 
 ### Requirement: Contextual Validation
 The system SHALL validate transactions and blocks in the context of the current chain state.
@@ -207,4 +263,19 @@ These policies are stricter than consensus rules and may reject transactions tha
 - **GIVEN** a transaction with standard scripts and sufficient fee-rate
 - **WHEN** validating for mempool acceptance
 - **THEN** policy validation passes
+
+### Requirement: Reorg Resilience
+The system SHALL handle chain reorganization edge cases gracefully.
+
+When undo data is unavailable for a block being disconnected, the reorg SHALL fail with an explicit error rather than silently corrupting the UTXO set.
+
+#### Scenario: Fail reorg when undo data missing
+- **GIVEN** a chain reorganization requiring disconnection of a block
+- **WHEN** the undo data for that block is not available
+- **THEN** the reorg fails with an explicit error and the chain state is unchanged
+
+#### Scenario: Multi-block reorg
+- **GIVEN** a competing chain that is 3+ blocks longer than the current chain
+- **WHEN** the competing chain has more accumulated work
+- **THEN** the node reorganizes by disconnecting old blocks and connecting new blocks in order
 

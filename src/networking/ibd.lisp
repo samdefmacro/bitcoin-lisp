@@ -19,6 +19,8 @@
   (target-height 0 :type (unsigned-byte 32))
   (headers-received 0 :type (unsigned-byte 32))
   (blocks-received 0 :type (unsigned-byte 32))
+  ;; Header tip (separate from validated block tip in chain-state)
+  (header-tip-height 0 :type (unsigned-byte 32))
   ;; Download queue
   (pending-blocks (make-hash-table :test 'equalp) :type hash-table)  ; hash -> height
   (in-flight (make-hash-table :test 'equalp) :type hash-table)       ; hash -> (peer . timestamp)
@@ -49,9 +51,7 @@
     (let ((old-state (ibd-context-state *ibd-context*)))
       (unless (eq old-state new-state)
         (setf (ibd-context-state *ibd-context*) new-state)
-        ;; Only log if node is running (log-info requires *node*)
-        (when bitcoin-lisp:*node*
-          (bitcoin-lisp:log-info "IBD state: ~A -> ~A" old-state new-state))))))
+        (bitcoin-lisp:log-info "IBD state: ~A -> ~A" old-state new-state)))))
 
 ;;;; Testnet Checkpoints
 
@@ -172,10 +172,14 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
 
 (defun process-headers (headers chain-state)
   "Process validated headers and add to block index.
+Adds headers to the index but does NOT update the chain tip (best-height),
+since headers are not yet validated as full blocks.
+The header tip is tracked in the IBD context for download coordination.
 Returns the number of new headers added."
   (let ((added 0)
-        (best-height (bitcoin-lisp.storage:current-height chain-state))
-        (best-hash (bitcoin-lisp.storage::chain-state-best-block-hash chain-state)))
+        (best-header-height (if *ibd-context*
+                                (ibd-context-header-tip-height *ibd-context*)
+                                0)))
     (dolist (header headers)
       (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
              (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
@@ -199,13 +203,12 @@ Returns the number of new headers added."
                              :status :header-valid)))
                 (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
                 (incf added)
-                ;; Update best height/hash if this extends our chain
-                (when (> new-height best-height)
-                  (setf best-height new-height)
-                  (setf best-hash hash))))))))
-    ;; Update chain tip if we extended the chain
-    (when (> best-height (bitcoin-lisp.storage:current-height chain-state))
-      (bitcoin-lisp.storage:update-chain-tip chain-state best-hash best-height))
+                ;; Track header tip height in IBD context
+                (when (> new-height best-header-height)
+                  (setf best-header-height new-height))))))))
+    ;; Update header tip in IBD context (not the chain-state best-height)
+    (when *ibd-context*
+      (setf (ibd-context-header-tip-height *ibd-context*) best-header-height))
     added))
 
 ;;;; Download Queue Management
@@ -258,9 +261,10 @@ Walks the header chain and adds block hashes to the pending queue."
 (defun mark-block-received (hash)
   "Mark a block as received, removing it from pending and in-flight."
   (when *ibd-context*
-    (remhash hash (ibd-context-pending-blocks *ibd-context*))
-    (remhash hash (ibd-context-in-flight *ibd-context*))
-    (incf (ibd-context-blocks-received *ibd-context*))))
+    (when (gethash hash (ibd-context-pending-blocks *ibd-context*))
+      (remhash hash (ibd-context-pending-blocks *ibd-context*))
+      (incf (ibd-context-blocks-received *ibd-context*)))
+    (remhash hash (ibd-context-in-flight *ibd-context*))))
 
 (defun get-timed-out-requests ()
   "Get list of block hashes that have timed out."
@@ -292,14 +296,14 @@ When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
             (pushnew peer peers-to-disconnect)))
         ;; Remove from in-flight so it can be retried from a different peer
         (remhash hash (ibd-context-in-flight *ibd-context*))))
-    ;; Disconnect peers that hit the timeout limit
+    ;; Disconnect peers that hit the timeout limit (only if still connected)
     (dolist (peer peers-to-disconnect)
-      (when bitcoin-lisp:*node*
+      (when (eq (peer-state peer) :ready)
         (bitcoin-lisp:log-warn "Disconnecting slow peer ~A (3 block timeouts)"
-                               (peer-address peer)))
-      (handler-case
-          (disconnect-peer peer)
-        (error () nil)))
+                               (peer-address peer))
+        (handler-case
+            (disconnect-peer peer)
+          (error () nil))))
     (length timed-out)))
 
 ;;;; Multi-Peer Request Distribution
@@ -329,35 +333,32 @@ When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
       (when (or (null to-request) (null ready-peers))
         (return-from request-blocks-from-peers 0))
 
-      ;; Distribute requests across peers
+      ;; Distribute NEW requests across peers, grouped by peer
       (let ((requests-made 0)
             (peer-index 0)
-            (num-peers (length ready-peers)))
+            (num-peers (length ready-peers))
+            (peer-requests (make-hash-table :test 'eq)))
         (dolist (hash to-request)
           (let ((peer (nth (mod peer-index num-peers) ready-peers)))
             (mark-block-in-flight hash peer)
+            (push hash (gethash peer peer-requests))
             (incf peer-index)
             (incf requests-made)))
 
-        ;; Now send the actual requests, grouped by peer
-        (let ((peer-requests (make-hash-table :test 'eq)))
-          (maphash (lambda (hash peer-time)
-                     (let ((peer (car peer-time)))
-                       (push hash (gethash peer peer-requests))))
-                   (ibd-context-in-flight *ibd-context*))
-
-          ;; Send batch request to each peer
-          (maphash (lambda (peer hashes)
-                     (when hashes
-                       (let ((inv-vectors (mapcar (lambda (h)
-                                                    (bitcoin-lisp.serialization:make-inv-vector
-                                                     :type bitcoin-lisp.serialization:+inv-type-block+
-                                                     :hash h))
-                                                  hashes)))
-                         (send-message peer
-                                       (bitcoin-lisp.serialization:make-getdata-message
-                                        inv-vectors)))))
-                   peer-requests))
+        ;; Send batch request to each peer (only NEW blocks)
+        (maphash (lambda (peer hashes)
+                   (when hashes
+                     (handler-case
+                         (let ((inv-vectors (mapcar (lambda (h)
+                                                      (bitcoin-lisp.serialization:make-inv-vector
+                                                       :type bitcoin-lisp.serialization:+inv-type-witness-block+
+                                                       :hash h))
+                                                    hashes)))
+                           (send-message peer
+                                         (bitcoin-lisp.serialization:make-getdata-message
+                                          inv-vectors)))
+                       (error () nil))))
+                 peer-requests)
 
         requests-made))))
 
@@ -418,6 +419,16 @@ Returns the number of blocks downloaded."
   (let ((ctx *ibd-context*)
         (start-height (bitcoin-lisp.storage:current-height chain-state)))
 
+    ;; Initialize header-tip-height from existing chain state
+    ;; This ensures we know about existing headers even if header sync fails
+    (let ((best-header-height 0))
+      (maphash (lambda (hash entry)
+                 (declare (ignore hash))
+                 (when (> (bitcoin-lisp.storage:block-index-entry-height entry) best-header-height)
+                   (setf best-header-height (bitcoin-lisp.storage:block-index-entry-height entry))))
+               (bitcoin-lisp.storage::chain-state-block-index chain-state))
+      (setf (ibd-context-header-tip-height ctx) best-header-height))
+
     ;; Phase 1: Download headers
     (set-ibd-state :syncing-headers)
     (let ((best-peer (first (sort (copy-list peers) #'>
@@ -430,7 +441,7 @@ Returns the number of blocks downloaded."
     (set-ibd-state :syncing-blocks)
 
     ;; Queue all blocks from current height to header tip
-    (let ((header-tip (bitcoin-lisp.storage:current-height chain-state)))
+    (let ((header-tip (ibd-context-header-tip-height ctx)))
       (queue-blocks-for-download chain-state (1+ start-height) header-tip))
 
     ;; Download blocks
@@ -474,43 +485,119 @@ Returns the number of blocks downloaded."
     (set-ibd-state :synced)
     (ibd-context-blocks-received ctx)))
 
+(defun build-header-locator (chain-state)
+  "Build a block locator starting from the highest header in the index.
+Used during IBD when the validated block tip lags behind the header tip."
+  (let ((best-entry nil)
+        (best-height 0))
+    ;; Find the highest header-valid entry
+    (maphash (lambda (hash entry)
+               (declare (ignore hash))
+               (when (> (bitcoin-lisp.storage:block-index-entry-height entry) best-height)
+                 (setf best-height (bitcoin-lisp.storage:block-index-entry-height entry))
+                 (setf best-entry entry)))
+             (bitcoin-lisp.storage::chain-state-block-index chain-state))
+    (if best-entry
+        ;; Walk back through prev-entry links
+        (let ((locator '())
+              (entry best-entry)
+              (step 1)
+              (count 0))
+          (loop while entry
+                do (push (bitcoin-lisp.storage:block-index-entry-hash entry) locator)
+                   (incf count)
+                   (when (> count 10)
+                     (setf step (* step 2)))
+                   (let ((moved nil))
+                     (loop repeat step
+                           while (bitcoin-lisp.storage:block-index-entry-prev-entry entry)
+                           do (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
+                              (setf moved t))
+                     (unless moved
+                       (return))))
+          (nreverse locator))
+        ;; No entries - use genesis
+        (bitcoin-lisp.storage:build-block-locator chain-state))))
+
+(defun request-headers-for-ibd (peer chain-state)
+  "Request headers using a locator built from the header tip, not the validated block tip."
+  (let ((locator (build-header-locator chain-state)))
+    (bitcoin-lisp.networking:send-message
+     peer
+     (bitcoin-lisp.serialization:make-getheaders-message locator))))
+
 (defun sync-headers (peer chain-state)
   "Download all headers from a peer."
   (let ((received-count 0)
-        (done nil))
+        (done nil)
+        (requests-sent 0)
+        (max-requests 100))
+    ;; First, drain any pending messages from peer (sendcmpct, sendheaders, etc.)
+    (loop repeat 10
+          do (multiple-value-bind (command payload)
+                 (receive-message peer :timeout 1)
+               (when command
+                 (bitcoin-lisp:log-debug "Pre-sync: received ~A" command)
+                 (handler-case
+                     (handle-message peer command payload chain-state nil nil)
+                   (error () nil)))
+               (unless command (return))))
+
     (loop until done
           do (progn
-               ;; Request headers
-               (request-headers peer chain-state)
+               ;; Request headers using header-tip-aware locator
+               (request-headers-for-ibd peer chain-state)
+               (incf requests-sent)
+               (when (> requests-sent max-requests)
+                 (bitcoin-lisp:log-warn "Header sync: hit max requests (~D)" max-requests)
+                 (return))
 
-               ;; Wait for response
-               (multiple-value-bind (command payload)
-                   (receive-message peer :timeout 60)
-                 (unless (and command (string= command "headers"))
-                   (bitcoin-lisp:log-warn "Expected headers, got ~A" command)
-                   (setf done t)
-                   (return))
+               ;; Wait for headers response, handling other messages
+               (let ((got-headers nil)
+                     (attempts 0))
+                 (loop while (and (not got-headers) (< attempts 30))
+                       do (multiple-value-bind (command payload)
+                              (receive-message peer :timeout 5)
+                            (incf attempts)
+                            (cond
+                              ((null command)
+                               (when (> attempts 10)
+                                 (bitcoin-lisp:log-warn "Timeout waiting for headers")
+                                 (setf done t)
+                                 (setf got-headers t)))
 
-                 (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-                   (when (null headers)
-                     (setf done t)
-                     (return))
+                              ((string= command "headers")
+                               (setf got-headers t)
+                               (handler-case
+                                   (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
+                                     (when (null headers)
+                                       (setf done t))
+                                     ;; Validate and add headers
+                                     (multiple-value-bind (valid-headers error)
+                                         (validate-header-chain headers chain-state)
+                                       (when error
+                                         (bitcoin-lisp:log-warn "Header validation error: ~A" error))
 
-                   ;; Validate and add headers
-                   (multiple-value-bind (valid-headers error)
-                       (validate-header-chain headers chain-state)
-                     (when error
-                       (bitcoin-lisp:log-warn "Header validation error: ~A" error))
+                                       (let ((added (process-headers valid-headers chain-state)))
+                                         (incf received-count added)
 
-                     (let ((added (process-headers valid-headers chain-state)))
-                       (incf received-count added)
+                                         ;; If we got less than 2000, we're done
+                                         (when (< (length headers) 2000)
+                                           (setf done t))
 
-                       ;; If we got less than 2000, we're done
-                       (when (< (length headers) 2000)
-                         (setf done t))
+                                         (when (> added 0)
+                                           (bitcoin-lisp:log-info "Received ~D headers, ~D new, total ~D"
+                                                                  (length headers) added received-count)))))
+                                 (error (e)
+                                   (bitcoin-lisp:log-error "Error parsing headers: ~A" e)
+                                   (setf done t))))
 
-                       (bitcoin-lisp:log-debug "Received ~D headers, ~D new, total ~D"
-                                               (length headers) added received-count)))))))
+                              (t
+                               ;; Handle other messages (ping, sendcmpct, etc.)
+                               (bitcoin-lisp:log-debug "Header sync: received ~A" command)
+                               (handler-case
+                                   (handle-message peer command payload chain-state nil nil)
+                                 (error () nil)))))))))
 
     (bitcoin-lisp:log-info "Header sync complete: ~D headers received" received-count)
     received-count))
@@ -529,6 +616,10 @@ After connecting, drains the queue of any children that can now be connected."
 
     (let ((height (bitcoin-lisp.storage:block-index-entry-height entry))
           (current-height (bitcoin-lisp.storage:current-height chain-state)))
+
+      ;; Skip blocks already connected (duplicates from multiple peers)
+      (when (<= height current-height)
+        (return-from process-received-block nil))
 
       ;; Check if this is the next block we need
       (if (= height (1+ current-height))
@@ -552,9 +643,10 @@ After connecting, drains the queue of any children that can now be connected."
           (progn
             (bitcoin-lisp:log-debug "Block ~D received out of order (current: ~D)"
                                     height current-height)
-            ;; Store in queue for later processing
+            ;; Store in queue for later processing (avoid duplicates)
             (when *ibd-context*
-              (push (cons height block) (ibd-context-block-queue *ibd-context*)))
+              (unless (find height (ibd-context-block-queue *ibd-context*) :key #'car)
+                (push (cons height block) (ibd-context-block-queue *ibd-context*))))
             nil)))))
 
 (defun drain-block-queue (chain-state utxo-set block-store)
