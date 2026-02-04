@@ -41,8 +41,14 @@ A Bitcoin full node implementation in Common Lisp. The goal is to create a fully
 ## Important Constraints
 - Consensus-critical code must match Bitcoin Core behavior exactly
 - No wallet functionality in initial scope
-- Testnet only initially (no mainnet)
+- Transaction relay disabled by default on mainnet for safety
+
+## Supported Networks
+- **Testnet** (default): Test network for development, default port 18333, RPC 18332
+- **Mainnet**: Production Bitcoin network, default port 8333, RPC 8332
+  - Requires ~600GB+ storage for full blockchain
+  - Transaction relay disabled by default (set `*mainnet-relay-enabled*` to enable)
 
 ## External Dependencies
 - libsecp256k1: System library required for ECDSA operations
-- Bitcoin testnet: External network for testing
+- Bitcoin network: Testnet or mainnet for synchronization

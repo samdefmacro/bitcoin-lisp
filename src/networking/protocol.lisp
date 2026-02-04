@@ -229,16 +229,17 @@ Returns T if message was handled, NIL otherwise."
       nil)))
 
 (defun handle-getdata (peer payload chain-state &optional mempool)
-  "Handle a getdata message. Respond with requested transactions or blocks."
+  "Handle a getdata message. Respond with requested transactions or blocks.
+Does not respond to transaction requests when relay is disabled (mainnet default)."
   (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload)))
     (dolist (inv inv-vectors)
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
         (cond
-          ;; Transaction request
+          ;; Transaction request - only respond if relay is enabled
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
-           (when mempool
+           (when (and mempool (relay-enabled-p))
              (let ((entry (bitcoin-lisp.mempool:mempool-get mempool hash)))
                (when entry
                  (send-message peer
@@ -249,9 +250,18 @@ Returns T if message was handled, NIL otherwise."
 
 ;;; Transaction relay
 
+(defun relay-enabled-p ()
+  "Check if transaction relay is enabled for the current network.
+Relay is always enabled on testnet, but disabled by default on mainnet for safety."
+  (or (eq bitcoin-lisp:*network* :testnet)
+      bitcoin-lisp:*mainnet-relay-enabled*))
+
 (defun relay-transaction (txid source-peer peers)
   "Relay a transaction to all connected peers except SOURCE-PEER.
-Sends inv messages and tracks announcements to avoid duplicates."
+Sends inv messages and tracks announcements to avoid duplicates.
+Does nothing if relay is disabled for the current network."
+  (unless (relay-enabled-p)
+    (return-from relay-transaction nil))
   (let ((inv-msg (bitcoin-lisp.serialization:make-inv-message
                   (list (bitcoin-lisp.serialization:make-inv-vector
                          :type bitcoin-lisp.serialization:+inv-type-tx+

@@ -53,31 +53,56 @@
         (setf (ibd-context-state *ibd-context*) new-state)
         (bitcoin-lisp:log-info "IBD state: ~A -> ~A" old-state new-state)))))
 
-;;;; Testnet Checkpoints
+;;;; Network Checkpoints
 
 (defvar *testnet-checkpoints*
   '((546 . "000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70")
     (100000 . "00000000009e2958c15ff9290d571bf9459e93b19765c6801ddeccadbb160a1e")
-    (200000 . "0000000000287bffd321963ef05feab753ber7dcf93e7f002f0fd1c21d2ee6")  ; Placeholder
     (500000 . "000000000001a7c0aaa2630fbb2c0e476aafffc60f82177375b2aaa22209f606")
     (1000000 . "0000000000478e259a3eda2fafbeeb0106626f946347955e99278fe6cc848414")
     (1500000 . "00000000000000a33e21d6d82fe7cef5b35dfe75af01baafa5df7c11e69cf099")
     (2000000 . "0000000000000795a6501e606e3fd3b3f51c6d9e47d3a1ba83c3fb1e84d50b7a"))
   "Testnet checkpoints as (height . hex-hash) pairs.")
 
+(defvar *mainnet-checkpoints*
+  '((11111 . "0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d")
+    (33333 . "000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6")
+    (74000 . "0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20")
+    (105000 . "00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97")
+    (134444 . "00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe")
+    (168000 . "000000000000099e61ea72015e79632f216fe6cb33d7899acb35b75c8303b763")
+    (193000 . "000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317")
+    (210000 . "000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e")
+    (250000 . "000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214")
+    (295000 . "00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983")
+    (420000 . "000000000000000002cce816c0ab2c5c269cb081896b7dcb34b8422d6b74f112")
+    (630000 . "000000000000000000024bead8df69990852c202db0e0097c1a12ea637d7e96d")
+    (840000 . "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"))
+  "Mainnet checkpoints as (height . hex-hash) pairs.
+Verified against Bitcoin Core chainparams.cpp.")
+
+(defun network-checkpoints (network)
+  "Return the checkpoint list for NETWORK."
+  (ecase network
+    (:testnet *testnet-checkpoints*)
+    (:mainnet *mainnet-checkpoints*)))
+
 (defun get-checkpoint-hash (height)
   "Get the checkpoint hash for HEIGHT, or NIL if no checkpoint exists.
-Returns the hash in wire format (little-endian)."
-  (let ((entry (assoc height *testnet-checkpoints*)))
+Returns the hash in wire format (little-endian).
+Uses the current network from bitcoin-lisp:*network*."
+  (let* ((checkpoints (network-checkpoints bitcoin-lisp:*network*))
+         (entry (assoc height checkpoints)))
     (when entry
       ;; Checkpoints are stored in display format (big-endian), reverse for wire format
       (reverse (bitcoin-lisp.crypto:hex-to-bytes (cdr entry))))))
 
 (defun last-checkpoint-height ()
-  "Get the height of the last checkpoint."
-  (if *testnet-checkpoints*
-      (caar (last *testnet-checkpoints*))
-      0))
+  "Get the height of the last checkpoint for the current network."
+  (let ((checkpoints (network-checkpoints bitcoin-lisp:*network*)))
+    (if checkpoints
+        (caar (last checkpoints))
+        0)))
 
 (defun validate-checkpoint (hash height)
   "Validate that HASH at HEIGHT matches any applicable checkpoint.
