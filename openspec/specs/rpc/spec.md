@@ -137,14 +137,31 @@ Methods:
 The system SHALL provide methods to query and interact with the mempool.
 
 Methods:
-- `getmempoolinfo`: Returns mempool statistics (size, bytes, usage)
+- `getmempoolinfo`: Returns mempool statistics (size, bytes, usage, fee thresholds)
 - `getrawmempool [verbose]`: Returns txids or detailed tx info
 - `sendrawtransaction <hex>`: Submits raw transaction to mempool
+
+For `getmempoolinfo`, returns:
+- `loaded`: Boolean indicating mempool is fully loaded
+- `size`: Number of transactions in mempool
+- `bytes`: Total size of mempool in bytes
+- `mempoolminfee`: Minimum fee rate (BTC/kvB) to enter mempool
+- `minrelaytxfee`: Configured minimum relay fee rate (BTC/kvB)
 
 #### Scenario: getmempoolinfo
 - **GIVEN** mempool has 5 transactions totaling 2000 bytes
 - **WHEN** getmempoolinfo is called
 - **THEN** response includes size 5 and bytes 2000
+
+#### Scenario: getmempoolinfo returns fee fields
+- **GIVEN** a running node with mempool
+- **WHEN** getmempoolinfo is called
+- **THEN** response includes mempoolminfee and minrelaytxfee fields
+
+#### Scenario: mempoolminfee reflects eviction threshold
+- **GIVEN** mempool is at capacity with transactions
+- **WHEN** getmempoolinfo is called
+- **THEN** mempoolminfee reflects the minimum fee rate that would be accepted
 
 #### Scenario: getrawmempool non-verbose
 - **GIVEN** mempool has transactions with txids T1, T2, T3
@@ -211,14 +228,16 @@ The system SHALL integrate RPC server with node lifecycle.
 The system SHALL provide methods to fetch and decode raw transactions.
 
 Methods:
-- `getrawtransaction <txid> [verbose]`: Returns raw transaction data
+- `getrawtransaction <txid> [verbose] [blockhash]`: Returns raw transaction data
 - `decoderawtransaction <hex>`: Decodes hex transaction to JSON
 
 For `getrawtransaction`:
 - If `verbose=false` (default), returns hex-encoded transaction
 - If `verbose=true`, returns JSON with transaction details
 - Searches mempool for unconfirmed transactions
-- Returns error if transaction not found in mempool (blockchain lookup requires transaction index, not implemented in Phase 1)
+- When txindex is enabled, searches confirmed transactions by txid
+- Optional `blockhash` parameter provides direct block lookup hint
+- Returns `blockhash`, `confirmations`, `time`, `blocktime` for confirmed transactions
 
 For `decoderawtransaction`:
 - Parses hex string as serialized transaction
@@ -230,15 +249,30 @@ For `decoderawtransaction`:
 - **WHEN** getrawtransaction(T.txid, false) is called
 - **THEN** response is hex-encoded transaction bytes
 
-#### Scenario: getrawtransaction verbose
+#### Scenario: getrawtransaction verbose from mempool
 - **GIVEN** transaction T is in the mempool
 - **WHEN** getrawtransaction(T.txid, true) is called
-- **THEN** response is JSON with txid, version, vin, vout, locktime
+- **THEN** response is JSON with txid, version, vin, vout, locktime (no blockhash)
 
-#### Scenario: getrawtransaction not found
-- **GIVEN** txid T does not exist in mempool
+#### Scenario: getrawtransaction confirmed with txindex
+- **GIVEN** txindex is enabled AND transaction T is confirmed in block B
+- **WHEN** getrawtransaction(T.txid, true) is called
+- **THEN** response includes txid, version, vin, vout, locktime, blockhash, confirmations, time, blocktime
+
+#### Scenario: getrawtransaction with blockhash hint
+- **GIVEN** transaction T is in block B
+- **WHEN** getrawtransaction(T.txid, true, B.hash) is called
+- **THEN** transaction is found directly in block B without txindex lookup
+
+#### Scenario: getrawtransaction not found without txindex
+- **GIVEN** txindex is disabled AND txid T is not in mempool
 - **WHEN** getrawtransaction(T) is called
-- **THEN** error code -5 is returned indicating transaction not found
+- **THEN** error code -5 with message indicating txindex needed
+
+#### Scenario: getrawtransaction not found with txindex
+- **GIVEN** txindex is enabled AND txid T does not exist
+- **WHEN** getrawtransaction(T) is called
+- **THEN** error code -5 "No such transaction"
 
 #### Scenario: decoderawtransaction valid
 - **GIVEN** valid hex-encoded transaction H
@@ -309,25 +343,45 @@ Supported address formats for outputs:
 - **THEN** error code -3 (Invalid amount) is returned
 
 ### Requirement: Fee Estimation
-The system SHALL provide a method to estimate transaction fees.
+The system SHALL provide a method to estimate transaction fees based on historical block data.
 
 Method:
 - `estimatesmartfee <conf_target> [estimate_mode]`
 
 Parameters:
 - `conf_target`: Number of blocks for confirmation target (1-1008)
-- `estimate_mode`: Optional, ignored (for API compatibility)
+- `estimate_mode`: "conservative" (default) or "economical"
 
 Returns:
 - `feerate`: Estimated fee rate in BTC/kvB (1000 virtual bytes)
-- `blocks`: The conf_target value
+- `blocks`: The conf_target value (may be adjusted if insufficient data)
+- `errors`: Array of warning messages (optional, present when data is limited)
 
-Implementation note: Phase 1 returns a conservative fixed estimate. Proper fee estimation based on historical block data is deferred to Phase 2.
+The estimate is computed from historical fee rates in confirmed blocks:
+- Conservative mode uses higher percentiles for more reliable confirmation
+- Economical mode uses lower percentiles for cost savings with longer wait
 
-#### Scenario: estimatesmartfee normal
-- **GIVEN** node has completed initial block download
+When insufficient historical data exists (fewer than 6 blocks), returns the minimum relay fee with a warning.
+
+#### Scenario: estimatesmartfee with sufficient data
+- **GIVEN** node has processed at least 6 blocks with fee data
 - **WHEN** estimatesmartfee(6) is called
-- **THEN** response includes feerate (positive number) and blocks=6
+- **THEN** response includes computed feerate based on historical data
+
+#### Scenario: estimatesmartfee conservative mode
+- **GIVEN** node has sufficient fee history
+- **WHEN** estimatesmartfee(6, "conservative") is called
+- **THEN** response feerate uses higher percentile for reliable confirmation
+
+#### Scenario: estimatesmartfee economical mode
+- **GIVEN** node has sufficient fee history
+- **WHEN** estimatesmartfee(6, "economical") is called
+- **THEN** response feerate is lower than conservative mode for same target
+
+#### Scenario: estimatesmartfee insufficient data
+- **GIVEN** node has fewer than 6 blocks of fee history
+- **WHEN** estimatesmartfee is called
+- **THEN** response includes minimum fee with errors array containing warning
 
 #### Scenario: estimatesmartfee during IBD
 - **GIVEN** node is still performing initial block download
@@ -344,8 +398,8 @@ Implementation note: Phase 1 returns a conservative fixed estimate. Proper fee e
 - **WHEN** estimatesmartfee is called
 - **THEN** error code -8 (Invalid parameter) is returned
 
-#### Scenario: estimatesmartfee target too high
-- **GIVEN** conf_target is > 1008
+#### Scenario: estimatesmartfee invalid target too high
+- **GIVEN** conf_target is greater than 1008
 - **WHEN** estimatesmartfee is called
 - **THEN** error code -8 (Invalid parameter) is returned
 
@@ -477,4 +531,100 @@ Returns:
 - **GIVEN** script that doesn't match any standard pattern
 - **WHEN** decodescript is called
 - **THEN** type="nonstandard", asm shows opcodes/data
+
+### Requirement: UTXO Set Statistics
+The system SHALL provide a method to query UTXO set statistics.
+
+Method:
+- `gettxoutsetinfo [hash_type]`
+
+Parameters:
+- `hash_type`: Optional, one of "hash_serialized_3" (default), "none"
+
+Returns:
+- `height`: Current block height
+- `bestblock`: Hash of the current tip
+- `transactions`: Number of transactions with unspent outputs
+- `txouts`: Total number of unspent transaction outputs
+- `total_amount`: Total BTC value in UTXO set
+- `hash_serialized_3`: UTXO set hash (if hash_type != "none")
+
+The UTXO set hash uses Bitcoin Core's `hash_serialized_3` format:
+- UTXOs ordered by (txid, vout) ascending
+- Each UTXO serialized as: txid || vout || height || coinbase || value || scriptPubKey
+- Final hash is SHA256 of concatenated serializations
+
+#### Scenario: gettxoutsetinfo basic
+- **GIVEN** UTXO set has 1000 outputs from 500 transactions totaling 50000 BTC
+- **WHEN** gettxoutsetinfo() is called
+- **THEN** response has txouts=1000, transactions=500, total_amount=50000
+
+#### Scenario: gettxoutsetinfo with hash
+- **GIVEN** UTXO set state is deterministic
+- **WHEN** gettxoutsetinfo("hash_serialized_3") is called
+- **THEN** response includes hash_serialized_3 matching expected value
+
+#### Scenario: gettxoutsetinfo without hash
+- **GIVEN** node is running
+- **WHEN** gettxoutsetinfo("none") is called
+- **THEN** response omits hash_serialized_3 field (faster)
+
+#### Scenario: gettxoutsetinfo during IBD
+- **GIVEN** node is still performing initial block download
+- **WHEN** gettxoutsetinfo() is called
+- **THEN** response reflects current (incomplete) UTXO set state
+
+### Requirement: Block Statistics
+The system SHALL provide a method to query per-block statistics.
+
+Method:
+- `getblockstats <hash_or_height> [stats]`
+
+Parameters:
+- `hash_or_height`: Block hash (string) or height (integer)
+- `stats`: Optional array of stat names to return (returns all if omitted)
+
+Returns object with:
+- `avgtxsize`: Average transaction size in bytes
+- `blockhash`: Block hash
+- `height`: Block height
+- `ins`: Total inputs (excluding coinbase)
+- `outs`: Total outputs
+- `subsidy`: Block subsidy in satoshis
+- `time`: Block timestamp
+- `total_out`: Total output value in satoshis
+- `total_size`: Total block size in bytes
+- `txs`: Number of transactions
+
+Note: Fee statistics (`avgfee`, `totalfee`, `avgfeerate`) require input values from historical UTXO state and are deferred to a future phase.
+
+#### Scenario: getblockstats by height
+- **GIVEN** block at height 100 exists
+- **WHEN** getblockstats(100) is called
+- **THEN** response contains statistics for block at height 100
+
+#### Scenario: getblockstats by hash
+- **GIVEN** block with hash H exists
+- **WHEN** getblockstats(H) is called
+- **THEN** response contains statistics for block H
+
+#### Scenario: getblockstats filtered
+- **GIVEN** block at height 100 exists
+- **WHEN** getblockstats(100, ["txs", "total_size"]) is called
+- **THEN** response contains only txs and total_size fields
+
+#### Scenario: getblockstats invalid height
+- **GIVEN** chain height is 100
+- **WHEN** getblockstats(200) is called
+- **THEN** error code -8 "Block not found"
+
+#### Scenario: getblockstats invalid hash
+- **GIVEN** hash H does not exist
+- **WHEN** getblockstats(H) is called
+- **THEN** error code -5 "Block not found"
+
+#### Scenario: getblockstats genesis block
+- **GIVEN** genesis block (height 0)
+- **WHEN** getblockstats(0) is called
+- **THEN** response shows txs=1, ins=0 (coinbase only)
 

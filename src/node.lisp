@@ -41,6 +41,8 @@
   (block-store nil)
   (utxo-set nil)
   (mempool nil)
+  (tx-index nil)  ; Transaction index (optional, for getrawtransaction)
+  (fee-estimator nil)  ; Fee rate estimator for estimatesmartfee
   (peers '() :type list)
   (running nil :type boolean)
   (log-level :info :type keyword)
@@ -147,6 +149,7 @@ LEVEL can be :debug, :info, :warn, or :error."
                         (log-level :info)
                         (max-peers 8)
                         (sync t)
+                        (txindex nil)
                         (rpc-port nil)
                         (rpc-bind "127.0.0.1")
                         (rpc-user nil)
@@ -158,6 +161,7 @@ NETWORK: :testnet or :mainnet
 LOG-LEVEL: :debug, :info, :warn, or :error
 MAX-PEERS: Maximum number of peer connections
 SYNC: If T, start syncing immediately
+TXINDEX: If T, enable transaction index for getrawtransaction lookups
 RPC-PORT: Port for RPC server (nil = no RPC, default 18332 for testnet)
 RPC-BIND: Address to bind RPC server (default 127.0.0.1)
 RPC-USER: RPC authentication username (nil = no auth)
@@ -225,6 +229,23 @@ Returns the node instance."
   ;; Initialize mempool
   (log-info "Initializing mempool...")
   (setf (node-mempool *node*) (bitcoin-lisp.mempool:make-mempool))
+
+  ;; Initialize fee estimator
+  (log-info "Initializing fee estimator...")
+  (setf (node-fee-estimator *node*)
+        (bitcoin-lisp.mempool:make-fee-estimator
+         :data-directory (node-data-directory *node*)))
+  ;; Load persisted fee stats
+  (bitcoin-lisp.mempool:load-fee-stats (node-fee-estimator *node*))
+
+  ;; Initialize transaction index (optional)
+  (when txindex
+    (log-info "Initializing transaction index...")
+    (setf (node-tx-index *node*)
+          (bitcoin-lisp.storage:init-tx-index (node-data-directory *node*)
+                                               :enabled t))
+    (log-info "Transaction index loaded: ~D entries"
+              (bitcoin-lisp.storage:txindex-count (node-tx-index *node*))))
 
   ;; Initialize secp256k1
   (log-info "Initializing cryptographic context...")
@@ -310,10 +331,20 @@ Returns the node instance."
      (node-utxo-set *node*)
      (bitcoin-lisp.storage:utxo-set-file-path (node-data-directory *node*))))
 
+  ;; Save fee statistics
+  (when (node-fee-estimator *node*)
+    (log-info "Saving fee statistics...")
+    (bitcoin-lisp.mempool:save-fee-stats (node-fee-estimator *node*)))
+
   ;; Save header index
   (log-info "Saving header index...")
   (when (node-chain-state *node*)
     (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
+
+  ;; Close transaction index
+  (when (node-tx-index *node*)
+    (log-info "Closing transaction index...")
+    (bitcoin-lisp.storage:close-tx-index (node-tx-index *node*)))
 
   ;; Cleanup secp256k1
   (bitcoin-lisp.crypto:cleanup-secp256k1)
@@ -463,7 +494,8 @@ Downloads up to MAX-BLOCKS using the IBD system."
        (node-chain-state node)
        (node-utxo-set node)
        (node-block-store node)
-       target))))
+       target
+       :fee-estimator (node-fee-estimator node)))))
 
 
 (defun find-best-peer (node)

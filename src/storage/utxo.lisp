@@ -320,3 +320,90 @@ Returns T if loaded, NIL if file does not exist or is corrupted."
 (defun utxo-set-file-path (base-path)
   "Get the UTXO set file path from a base data directory."
   (merge-pathnames "utxoset.dat" (pathname base-path)))
+
+;;; UTXO Set Iteration and Statistics
+
+(defun utxo-set-iterate (utxo-set callback)
+  "Iterate over all UTXOs in deterministic order.
+Order is (txid, vout) ascending.
+CALLBACK is called with (txid vout entry) for each UTXO."
+  (let ((keys '()))
+    ;; Collect all keys
+    (maphash (lambda (key entry)
+               (declare (ignore entry))
+               (push key keys))
+             (utxo-set-entries utxo-set))
+    ;; Sort keys lexicographically (this gives us txid order, then vout order)
+    (setf keys (sort keys #'key-less-than))
+    ;; Iterate in order
+    (dolist (key keys)
+      (let ((entry (gethash key (utxo-set-entries utxo-set))))
+        (when entry
+          ;; Extract txid and vout from key
+          (let ((txid (subseq key 0 32))
+                (vout (logior (aref key 32)
+                              (ash (aref key 33) 8)
+                              (ash (aref key 34) 16)
+                              (ash (aref key 35) 24))))
+            (funcall callback txid vout entry)))))))
+
+(defun key-less-than (a b)
+  "Compare two 36-byte UTXO keys lexicographically."
+  (loop for i from 0 below 36
+        do (cond
+             ((< (aref a i) (aref b i)) (return t))
+             ((> (aref a i) (aref b i)) (return nil))))
+  nil)
+
+(defun utxo-set-total-amount (utxo-set)
+  "Calculate total satoshis in the UTXO set."
+  (let ((total 0))
+    (maphash (lambda (key entry)
+               (declare (ignore key))
+               (incf total (utxo-entry-value entry)))
+             (utxo-set-entries utxo-set))
+    total))
+
+(defun utxo-set-distinct-txids (utxo-set)
+  "Count distinct transaction IDs with unspent outputs."
+  (let ((txids (make-hash-table :test 'equalp)))
+    (maphash (lambda (key entry)
+               (declare (ignore entry))
+               (let ((txid (subseq key 0 32)))
+                 (setf (gethash txid txids) t)))
+             (utxo-set-entries utxo-set))
+    (hash-table-count txids)))
+
+(defun compute-utxo-set-hash (utxo-set)
+  "Compute the hash_serialized_3 UTXO set hash.
+This matches Bitcoin Core's format for UTXO set verification.
+Returns a 32-byte hash."
+  (let ((data (flexi-streams:with-output-to-sequence (out)
+                (utxo-set-iterate
+                 utxo-set
+                 (lambda (txid vout entry)
+                   ;; Serialize: txid || vout || height || coinbase || value || scriptPubKey
+                   (write-sequence txid out)
+                   ;; vout as 4-byte little-endian
+                   (write-byte (logand vout #xFF) out)
+                   (write-byte (logand (ash vout -8) #xFF) out)
+                   (write-byte (logand (ash vout -16) #xFF) out)
+                   (write-byte (logand (ash vout -24) #xFF) out)
+                   ;; height as 4-byte little-endian
+                   (let ((h (utxo-entry-height entry)))
+                     (write-byte (logand h #xFF) out)
+                     (write-byte (logand (ash h -8) #xFF) out)
+                     (write-byte (logand (ash h -16) #xFF) out)
+                     (write-byte (logand (ash h -24) #xFF) out))
+                   ;; coinbase flag as 1 byte
+                   (write-byte (if (utxo-entry-coinbase entry) 1 0) out)
+                   ;; value as 8-byte little-endian
+                   (let ((v (utxo-entry-value entry)))
+                     (loop for i from 0 below 8
+                           do (write-byte (logand (ash v (* -8 i)) #xFF) out)))
+                   ;; scriptPubKey with length prefix (varint)
+                   (let ((script (utxo-entry-script-pubkey entry)))
+                     (bitcoin-lisp.serialization:write-compact-size out (length script))
+                     (write-sequence script out)))))))
+    ;; Return SHA256 of concatenated serializations
+    (bitcoin-lisp.crypto:sha256 (coerce data '(simple-array (unsigned-byte 8) (*))))))
