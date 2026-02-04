@@ -139,3 +139,151 @@ Bitcoin often displays hashes in reverse byte order."
     (loop for i from 0 below len
           do (setf (aref result i) (aref bytes (- len 1 i))))
     result))
+
+;;; ============================================================
+;;; SipHash-2-4 (BIP 152)
+;;; ============================================================
+;;;
+;;; SipHash is a fast, secure pseudorandom function used in BIP 152
+;;; for computing short transaction IDs in compact blocks.
+;;; We implement SipHash-2-4: 2 compression rounds, 4 finalization rounds.
+
+(declaim (inline siphash-rotl64))
+(defun siphash-rotl64 (x n)
+  "Rotate 64-bit integer X left by N bits."
+  (declare (type (unsigned-byte 64) x)
+           (type (integer 0 63) n)
+           (optimize (speed 3) (safety 0)))
+  (logand #xFFFFFFFFFFFFFFFF
+          (logior (ash x n)
+                  (ash x (- n 64)))))
+
+(defun siphash-2-4 (k0 k1 data)
+  "Compute SipHash-2-4 of DATA using keys K0 and K1.
+   K0 and K1 are 64-bit unsigned integers.
+   DATA is a byte vector.
+   Returns a 64-bit unsigned integer."
+  (declare (type (unsigned-byte 64) k0 k1)
+           (optimize (speed 3)))
+  (let ((v0 (logxor k0 #x736f6d6570736575))
+        (v1 (logxor k1 #x646f72616e646f6d))
+        (v2 (logxor k0 #x6c7967656e657261))
+        (v3 (logxor k1 #x7465646279746573))
+        (len (length data))
+        (b 0))
+    (declare (type (unsigned-byte 64) v0 v1 v2 v3 b))
+    ;; Set length byte in high byte of b
+    (setf b (ash (logand len #xff) 56))
+
+    ;; Process 8-byte blocks
+    (let ((blocks (floor len 8)))
+      (dotimes (i blocks)
+        (let ((m 0))
+          (declare (type (unsigned-byte 64) m))
+          ;; Read 8 bytes little-endian
+          (dotimes (j 8)
+            (setf m (logior m (ash (aref data (+ (* i 8) j)) (* j 8)))))
+          (setf v3 (logxor v3 m))
+          ;; 2 compression rounds
+          (dotimes (round 2)
+            (declare (ignore round))
+            (setf v0 (logand #xFFFFFFFFFFFFFFFF (+ v0 v1)))
+            (setf v1 (siphash-rotl64 v1 13))
+            (setf v1 (logxor v1 v0))
+            (setf v0 (siphash-rotl64 v0 32))
+            (setf v2 (logand #xFFFFFFFFFFFFFFFF (+ v2 v3)))
+            (setf v3 (siphash-rotl64 v3 16))
+            (setf v3 (logxor v3 v2))
+            (setf v0 (logand #xFFFFFFFFFFFFFFFF (+ v0 v3)))
+            (setf v3 (siphash-rotl64 v3 21))
+            (setf v3 (logxor v3 v0))
+            (setf v2 (logand #xFFFFFFFFFFFFFFFF (+ v2 v1)))
+            (setf v1 (siphash-rotl64 v1 17))
+            (setf v1 (logxor v1 v2))
+            (setf v2 (siphash-rotl64 v2 32)))
+          (setf v0 (logxor v0 m)))))
+
+    ;; Process remaining bytes (< 8)
+    (let ((remaining (mod len 8))
+          (start (* (floor len 8) 8)))
+      (dotimes (i remaining)
+        (setf b (logior b (ash (aref data (+ start i)) (* i 8))))))
+
+    ;; Final block
+    (setf v3 (logxor v3 b))
+    ;; 2 compression rounds
+    (dotimes (round 2)
+      (declare (ignore round))
+      (setf v0 (logand #xFFFFFFFFFFFFFFFF (+ v0 v1)))
+      (setf v1 (siphash-rotl64 v1 13))
+      (setf v1 (logxor v1 v0))
+      (setf v0 (siphash-rotl64 v0 32))
+      (setf v2 (logand #xFFFFFFFFFFFFFFFF (+ v2 v3)))
+      (setf v3 (siphash-rotl64 v3 16))
+      (setf v3 (logxor v3 v2))
+      (setf v0 (logand #xFFFFFFFFFFFFFFFF (+ v0 v3)))
+      (setf v3 (siphash-rotl64 v3 21))
+      (setf v3 (logxor v3 v0))
+      (setf v2 (logand #xFFFFFFFFFFFFFFFF (+ v2 v1)))
+      (setf v1 (siphash-rotl64 v1 17))
+      (setf v1 (logxor v1 v2))
+      (setf v2 (siphash-rotl64 v2 32)))
+    (setf v0 (logxor v0 b))
+
+    ;; Finalization
+    (setf v2 (logxor v2 #xff))
+    ;; 4 finalization rounds
+    (dotimes (round 4)
+      (declare (ignore round))
+      (setf v0 (logand #xFFFFFFFFFFFFFFFF (+ v0 v1)))
+      (setf v1 (siphash-rotl64 v1 13))
+      (setf v1 (logxor v1 v0))
+      (setf v0 (siphash-rotl64 v0 32))
+      (setf v2 (logand #xFFFFFFFFFFFFFFFF (+ v2 v3)))
+      (setf v3 (siphash-rotl64 v3 16))
+      (setf v3 (logxor v3 v2))
+      (setf v0 (logand #xFFFFFFFFFFFFFFFF (+ v0 v3)))
+      (setf v3 (siphash-rotl64 v3 21))
+      (setf v3 (logxor v3 v0))
+      (setf v2 (logand #xFFFFFFFFFFFFFFFF (+ v2 v1)))
+      (setf v1 (siphash-rotl64 v1 17))
+      (setf v1 (logxor v1 v2))
+      (setf v2 (siphash-rotl64 v2 32)))
+
+    ;; Return final hash
+    (logxor v0 v1 v2 v3)))
+
+(defun bytes-to-uint64-le (bytes &optional (offset 0))
+  "Read a 64-bit little-endian unsigned integer from BYTES at OFFSET."
+  (let ((result 0))
+    (dotimes (i 8)
+      (setf result (logior result (ash (aref bytes (+ offset i)) (* i 8)))))
+    result))
+
+(defun uint64-to-bytes-le (value)
+  "Convert a 64-bit unsigned integer to 8 bytes in little-endian order."
+  (let ((bytes (make-array 8 :element-type '(unsigned-byte 8))))
+    (dotimes (i 8)
+      (setf (aref bytes i) (logand (ash value (- (* i 8))) #xff)))
+    bytes))
+
+(defun compute-siphash-key (header-bytes nonce)
+  "Compute SipHash keys from block header bytes and nonce.
+   HEADER-BYTES is the serialized 80-byte block header.
+   NONCE is a 64-bit unsigned integer.
+   Returns (VALUES k0 k1) as two 64-bit integers."
+  (let* ((nonce-bytes (uint64-to-bytes-le nonce))
+         (data (concatenate '(vector (unsigned-byte 8)) header-bytes nonce-bytes))
+         (hash (sha256 data)))
+    ;; First 8 bytes = k0, next 8 bytes = k1 (little-endian)
+    (values (bytes-to-uint64-le hash 0)
+            (bytes-to-uint64-le hash 8))))
+
+(defun compute-short-txid (k0 k1 txid)
+  "Compute 6-byte short transaction ID using SipHash-2-4.
+   K0 and K1 are the SipHash keys.
+   TXID is a 32-byte transaction ID (or wtxid for version 2).
+   Returns a 48-bit unsigned integer (6 bytes)."
+  (let ((hash (siphash-2-4 k0 k1 txid)))
+    ;; Take lower 6 bytes (drop 2 MSB)
+    (logand hash #xFFFFFFFFFFFF)))

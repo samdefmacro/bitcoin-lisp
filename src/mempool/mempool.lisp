@@ -210,3 +210,8 @@ Also removes any transactions that conflict with block transactions."
                (push (mempool-entry-transaction entry) txs))
              (mempool-entries mempool))
     txs))
+
+(defun mempool-for-each (mempool fn)
+  "Call FN with (txid entry) for each transaction in the mempool.
+   Used for building short ID maps in compact block reconstruction."
+  (maphash fn (mempool-entries mempool)))

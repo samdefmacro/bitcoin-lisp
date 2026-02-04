@@ -17,6 +17,12 @@
    #:+tag-tap-branch+
    #:+tag-tap-tweak+
    #:+tag-tap-sighash+
+   ;; SipHash (BIP 152)
+   #:siphash-2-4
+   #:compute-siphash-key
+   #:compute-short-txid
+   #:bytes-to-uint64-le
+   #:uint64-to-bytes-le
    ;; Utilities
    #:bytes-to-hex
    #:hex-to-bytes
@@ -110,6 +116,7 @@
    #:block-header-bits
    #:block-header-nonce
    #:block-header-hash
+   #:serialize-block-header
    #:bitcoin-block
    #:make-bitcoin-block
    #:bitcoin-block-header
@@ -156,6 +163,7 @@
    #:+inv-type-block+
    #:+inv-type-witness-tx+
    #:+inv-type-witness-block+
+   #:+inv-type-cmpct-block+
    ;; Parsing
    #:parse-inv-payload
    #:parse-headers-payload
@@ -167,7 +175,34 @@
    #:get-unix-time
    #:read-net-addr
    #:read-hash256
-   #:write-hash256))
+   #:write-hash256
+   ;; Compact block (BIP 152)
+   #:compact-block
+   #:make-compact-block
+   #:compact-block-header
+   #:compact-block-nonce
+   #:compact-block-short-ids
+   #:compact-block-prefilled-txs
+   #:prefilled-tx
+   #:make-prefilled-tx
+   #:prefilled-tx-index
+   #:prefilled-tx-transaction
+   #:block-txn-request
+   #:make-block-txn-request
+   #:block-txn-request-block-hash
+   #:block-txn-request-indexes
+   #:block-txn-response
+   #:make-block-txn-response
+   #:block-txn-response-block-hash
+   #:block-txn-response-transactions
+   #:parse-sendcmpct-payload
+   #:make-sendcmpct-message
+   #:parse-cmpctblock-payload
+   #:make-getblocktxn-message
+   #:parse-getblocktxn-payload
+   #:parse-blocktxn-payload
+   #:read-compact-block
+   #:write-compact-block))
 
 (defpackage #:bitcoin-lisp.storage
   (:use #:cl)
@@ -286,6 +321,7 @@
    #:mempool-check-conflict
    #:mempool-remove-for-block
    #:mempool-get-transactions
+   #:mempool-for-each
    ;; Block fee stats
    #:block-fee-stats
    #:make-block-fee-stats
@@ -372,6 +408,18 @@
    #:receive-message
    #:perform-handshake
    #:send-ping
+   ;; Compact block peer state (BIP 152)
+   #:peer-compact-block-version
+   #:peer-compact-block-high-bandwidth
+   #:peer-pending-compact-block
+   #:pending-compact-block
+   #:make-pending-compact-block
+   #:pending-compact-block-block-hash
+   #:pending-compact-block-header
+   #:pending-compact-block-transactions
+   #:pending-compact-block-missing-indexes
+   #:pending-compact-block-request-time
+   #:pending-compact-block-use-wtxid
    ;; Peer manager
    #:peer-manager
    #:make-peer-manager
@@ -383,6 +431,12 @@
    #:sync-with-peer
    #:relay-transaction
    #:peer-announced-txs
+   ;; Compact block relay (BIP 152)
+   #:send-compact-block-negotiation
+   #:should-use-compact-blocks-p
+   #:check-compact-block-timeout
+   #:clear-pending-compact-block
+   #:compact-block-stats
    ;; Peer health
    #:check-peer-health
    #:record-block-timeout

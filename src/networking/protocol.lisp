@@ -81,6 +81,23 @@ Returns T if message was handled, NIL otherwise."
      (handle-addr peer payload)
      t)
 
+    ;; Compact block messages (BIP 152)
+    ((string= command "sendcmpct")
+     (handle-sendcmpct peer payload)
+     t)
+
+    ((string= command "cmpctblock")
+     (when mempool
+       (handle-cmpctblock peer payload chain-state utxo-set block-store mempool
+                          fee-estimator))
+     t)
+
+    ((string= command "blocktxn")
+     (when mempool
+       (handle-blocktxn peer payload chain-state utxo-set block-store mempool
+                        fee-estimator))
+     t)
+
     (t nil)))  ; Unknown message
 
 ;;; Inventory handling
@@ -88,17 +105,23 @@ Returns T if message was handled, NIL otherwise."
 (defun handle-inv (peer payload chain-state &optional mempool)
   "Handle an inv message."
   (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
-        (wanted '()))
+        (wanted '())
+        (use-compact (should-use-compact-blocks-p peer)))
     ;; Check which items we want
     (dolist (inv inv-vectors)
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
         (cond
-          ;; Block inventory
+          ;; Block inventory - use compact blocks when available
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
            (unless (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
-             (push inv wanted)))
+             (push (bitcoin-lisp.serialization:make-inv-vector
+                    :type (if use-compact
+                              bitcoin-lisp.serialization:+inv-type-cmpct-block+
+                              bitcoin-lisp.serialization:+inv-type-witness-block+)
+                    :hash hash)
+                   wanted)))
           ;; Transaction inventory - request with witness flag
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
@@ -317,3 +340,340 @@ Downloads headers and blocks up to MAX-BLOCKS."
                (when (string= command "block")
                  (incf blocks-received))))
     blocks-received))
+
+;;;; ============================================================
+;;;; Compact Block Relay (BIP 152)
+;;;; ============================================================
+
+;;; Timeout for pending compact block reconstructions
+(defconstant +compact-block-timeout-seconds+ 10)
+
+;;; Compact block reconstruction metrics (thread-safe)
+(defvar *compact-block-metrics-lock* (bt:make-lock "compact-block-metrics"))
+(defvar *compact-block-success-count* 0)
+(defvar *compact-block-failure-count* 0)
+(defvar *compact-block-collision-count* 0)
+
+(defun increment-compact-block-success ()
+  "Thread-safe increment of success counter."
+  (bt:with-lock-held (*compact-block-metrics-lock*)
+    (incf *compact-block-success-count*)))
+
+(defun increment-compact-block-failure ()
+  "Thread-safe increment of failure counter."
+  (bt:with-lock-held (*compact-block-metrics-lock*)
+    (incf *compact-block-failure-count*)))
+
+(defun increment-compact-block-collision ()
+  "Thread-safe increment of collision counter."
+  (bt:with-lock-held (*compact-block-metrics-lock*)
+    (incf *compact-block-collision-count*)))
+
+;;; Protocol negotiation
+
+(defun send-compact-block-negotiation (peer)
+  "Send sendcmpct messages to advertise compact block support.
+   Sends version 2 first (preferred for SegWit), then version 1."
+  ;; Send version 2 (wtxid-based) first
+  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message nil 2))
+  ;; Then version 1 (txid-based) as fallback
+  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message nil 1)))
+
+(defun handle-sendcmpct (peer payload)
+  "Handle a sendcmpct message from a peer.
+   Updates peer's compact block capabilities."
+  (multiple-value-bind (high-bandwidth version)
+      (bitcoin-lisp.serialization:parse-sendcmpct-payload payload)
+    ;; Accept the highest version we mutually support (1 or 2)
+    (when (and (> version 0) (<= version 2))
+      ;; Take the higher of current and new version
+      (when (> version (peer-compact-block-version peer))
+        (setf (peer-compact-block-version peer) version))
+      ;; Track high-bandwidth mode preference
+      (when high-bandwidth
+        (setf (peer-compact-block-high-bandwidth peer) t)))
+    (bitcoin-lisp:log-debug "Peer ~A supports compact blocks v~D (high-bw: ~A)"
+                            (peer-address peer) version high-bandwidth)))
+
+;;; IBD check
+
+(defun should-use-compact-blocks-p (peer)
+  "Return T if we should request compact blocks from PEER.
+   Returns NIL during IBD or if peer doesn't support compact blocks."
+  (and (> (peer-compact-block-version peer) 0)  ; Peer supports CB
+       (not (eq (ibd-state) :syncing-blocks))   ; Not downloading blocks in IBD
+       (not (eq (ibd-state) :syncing-headers)))) ; Not syncing headers
+
+;;; Short ID map building
+
+(defun build-shortid-map (mempool k0 k1 use-wtxid)
+  "Build hash table mapping short IDs to (tx . expected-id) pairs.
+   USE-WTXID is true for compact block version 2.
+   Returns (VALUES map collision-detected).
+   The map stores cons cells of (transaction . full-txid-or-wtxid) for verification."
+  (let ((map (make-hash-table :test 'eql))
+        (collision nil))
+    (bitcoin-lisp.mempool:mempool-for-each
+     mempool
+     (lambda (txid entry)
+       (let* ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry))
+              (id (if use-wtxid
+                      (bitcoin-lisp.serialization:transaction-wtxid tx)
+                      txid))
+              (short-id (bitcoin-lisp.crypto:compute-short-txid k0 k1 id)))
+         ;; Detect collisions within mempool
+         (when (gethash short-id map)
+           (setf collision t))
+         ;; Store tx with its full ID for later verification
+         (setf (gethash short-id map) (cons tx id)))))
+    (values map collision)))
+
+;;; Block reconstruction
+
+(defun reconstruct-compact-block (compact-block mempool use-wtxid)
+  "Attempt to reconstruct full block from compact block and mempool.
+   Returns (VALUES block missing-indexes partial-transactions) where:
+   - On success: block is the full block, missing-indexes is NIL
+   - On missing txs: block is NIL, missing-indexes is list of needed indexes,
+     partial-transactions is array with found txs filled in
+   - On collision: block is NIL, missing-indexes is :collision"
+  (let* ((header (bitcoin-lisp.serialization:compact-block-header compact-block))
+         (nonce (bitcoin-lisp.serialization:compact-block-nonce compact-block))
+         (short-ids-list (bitcoin-lisp.serialization:compact-block-short-ids compact-block))
+         (prefilled (bitcoin-lisp.serialization:compact-block-prefilled-txs compact-block))
+         (tx-count (+ (length short-ids-list) (length prefilled)))
+         (header-bytes (bitcoin-lisp.serialization:serialize-block-header header))
+         ;; Convert short-ids list to vector for O(1) access
+         (short-ids (coerce short-ids-list 'vector)))
+
+    ;; Validate tx-count is reasonable (prevent DoS)
+    (when (or (zerop tx-count) (> tx-count 100000))
+      (bitcoin-lisp:log-warn "Invalid compact block tx count: ~D" tx-count)
+      (return-from reconstruct-compact-block (values nil :collision)))
+
+    ;; Compute SipHash keys
+    (multiple-value-bind (k0 k1)
+        (bitcoin-lisp.crypto:compute-siphash-key header-bytes nonce)
+
+      ;; Build short ID map from mempool
+      (multiple-value-bind (shortid-map collision)
+          (build-shortid-map mempool k0 k1 use-wtxid)
+
+        ;; Check for collision within mempool
+        (when collision
+          (increment-compact-block-collision)
+          (bitcoin-lisp:log-warn "Short ID collision detected in mempool, falling back to full block")
+          (return-from reconstruct-compact-block (values nil :collision nil)))
+
+        (let ((transactions (make-array tx-count :initial-element nil))
+              (missing-indexes '())
+              (short-id-idx 0))
+
+          ;; Place prefilled transactions at their absolute indexes
+          ;; with bounds checking
+          (dolist (ptx prefilled)
+            (let ((idx (bitcoin-lisp.serialization:prefilled-tx-index ptx)))
+              (if (and (>= idx 0) (< idx tx-count))
+                  (setf (aref transactions idx)
+                        (bitcoin-lisp.serialization:prefilled-tx-transaction ptx))
+                  (progn
+                    (bitcoin-lisp:log-warn "Prefilled tx index out of bounds: ~D (max ~D)"
+                                           idx (1- tx-count))
+                    (return-from reconstruct-compact-block (values nil :collision nil))))))
+
+          ;; Fill remaining slots with mempool transactions matched by short ID
+          (dotimes (i tx-count)
+            (when (null (aref transactions i))
+              ;; This slot needs a transaction from short IDs
+              (when (>= short-id-idx (length short-ids))
+                ;; More empty slots than short IDs - malformed message
+                (bitcoin-lisp:log-warn "Short ID count mismatch")
+                (return-from reconstruct-compact-block (values nil :collision nil)))
+              (let* ((short-id (aref short-ids short-id-idx))
+                     (tx-pair (gethash short-id shortid-map)))
+                (if tx-pair
+                    (let ((tx (car tx-pair))
+                          (full-id (cdr tx-pair)))
+                      ;; Verify the matched tx produces the expected short ID
+                      ;; (guards against hash collisions between mempool and block)
+                      (let ((computed-short-id (bitcoin-lisp.crypto:compute-short-txid
+                                                k0 k1 full-id)))
+                        (if (= computed-short-id short-id)
+                            (setf (aref transactions i) tx)
+                            ;; Collision between different transactions
+                            (push i missing-indexes))))
+                    (push i missing-indexes))
+                (incf short-id-idx))))
+
+          (if missing-indexes
+              (values nil (nreverse missing-indexes) transactions)
+              (values (bitcoin-lisp.serialization:make-bitcoin-block
+                       :header header
+                       :transactions (coerce transactions 'list))
+                      nil nil)))))))
+
+;;; Compact block message handling
+
+(defun handle-cmpctblock (peer payload chain-state utxo-set block-store mempool
+                          &optional fee-estimator)
+  "Handle a cmpctblock message. Attempt reconstruction from mempool."
+  (let* ((compact-block (bitcoin-lisp.serialization:parse-cmpctblock-payload payload))
+         (header (bitcoin-lisp.serialization:compact-block-header compact-block))
+         (block-hash (bitcoin-lisp.serialization:block-header-hash header))
+         (use-wtxid (= (peer-compact-block-version peer) 2)))
+
+    ;; Clear any old pending reconstruction for different block
+    (when (peer-pending-compact-block peer)
+      (let ((pending-hash (pending-compact-block-block-hash
+                           (peer-pending-compact-block peer))))
+        (unless (equalp pending-hash block-hash)
+          (setf (peer-pending-compact-block peer) nil))))
+
+    ;; Skip if we already have this block connected
+    (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+      (when (and entry
+                 (eq (bitcoin-lisp.storage:block-index-entry-status entry) :connected))
+        (return-from handle-cmpctblock nil)))
+
+    ;; Attempt reconstruction
+    (multiple-value-bind (block missing-indexes partial-transactions)
+        (reconstruct-compact-block compact-block mempool use-wtxid)
+
+      (cond
+        ;; Successful reconstruction
+        (block
+         (increment-compact-block-success)
+         (bitcoin-lisp:log-debug "Compact block reconstructed successfully")
+         ;; Process like a normal block
+         (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
+                (current-time (bitcoin-lisp.serialization:get-unix-time)))
+           (multiple-value-bind (valid error)
+               (bitcoin-lisp.validation:validate-block
+                block chain-state utxo-set (1+ current-height) current-time)
+             (if valid
+                 (progn
+                   (bitcoin-lisp.validation:connect-block
+                    block chain-state block-store utxo-set
+                    :fee-estimator fee-estimator)
+                   (when mempool
+                     (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+                 (progn
+                   (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
+                   (record-misbehavior peer 100))))))
+
+        ;; Collision or malformed - fall back to full block
+        ((eq missing-indexes :collision)
+         (increment-compact-block-failure)
+         (request-full-block peer block-hash))
+
+        ;; Missing transactions - request them
+        (missing-indexes
+         (bitcoin-lisp:log-debug "Compact block missing ~D transactions, requesting"
+                                 (length missing-indexes))
+         ;; Store pending state using the partial transactions from reconstruction
+         (setf (peer-pending-compact-block peer)
+               (make-pending-compact-block
+                :block-hash block-hash
+                :header header
+                :transactions partial-transactions
+                :missing-indexes missing-indexes
+                :request-time (get-internal-real-time)
+                :use-wtxid use-wtxid))
+         ;; Send getblocktxn request
+         (send-message peer
+                       (bitcoin-lisp.serialization:make-getblocktxn-message
+                        block-hash missing-indexes)))))))
+
+(defun handle-blocktxn (peer payload chain-state utxo-set block-store mempool
+                        &optional fee-estimator)
+  "Handle a blocktxn message. Complete pending block reconstruction."
+  (let ((response (bitcoin-lisp.serialization:parse-blocktxn-payload payload))
+        (pending (peer-pending-compact-block peer)))
+
+    (unless pending
+      (bitcoin-lisp:log-debug "Received blocktxn but no pending reconstruction")
+      (return-from handle-blocktxn nil))
+
+    (let ((block-hash (bitcoin-lisp.serialization:block-txn-response-block-hash response))
+          (txs (bitcoin-lisp.serialization:block-txn-response-transactions response)))
+
+      ;; Verify block hash matches
+      (unless (equalp block-hash (pending-compact-block-block-hash pending))
+        (bitcoin-lisp:log-warn "blocktxn hash mismatch")
+        (return-from handle-blocktxn nil))
+
+      ;; Insert missing transactions
+      (let ((transactions (pending-compact-block-transactions pending))
+            (missing-indexes (pending-compact-block-missing-indexes pending)))
+        (when (/= (length txs) (length missing-indexes))
+          (bitcoin-lisp:log-warn "blocktxn transaction count mismatch")
+          (setf (peer-pending-compact-block peer) nil)
+          (request-full-block peer block-hash)
+          (return-from handle-blocktxn nil))
+
+        (loop for tx in txs
+              for idx in missing-indexes
+              do (setf (aref transactions idx) tx))
+
+        ;; Build complete block
+        (let ((block (bitcoin-lisp.serialization:make-bitcoin-block
+                      :header (pending-compact-block-header pending)
+                      :transactions (coerce transactions 'list))))
+          ;; Clear pending state
+          (setf (peer-pending-compact-block peer) nil)
+
+          ;; Validate and connect
+          (increment-compact-block-success)
+          (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
+                 (current-time (bitcoin-lisp.serialization:get-unix-time)))
+            (multiple-value-bind (valid error)
+                (bitcoin-lisp.validation:validate-block
+                 block chain-state utxo-set (1+ current-height) current-time)
+              (if valid
+                  (progn
+                    (bitcoin-lisp.validation:connect-block
+                     block chain-state block-store utxo-set
+                     :fee-estimator fee-estimator)
+                    (when mempool
+                      (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+                  (progn
+                    (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
+                    (record-misbehavior peer 100))))))))))
+
+(defun request-full-block (peer block-hash)
+  "Request a full block (fallback from compact block)."
+  (increment-compact-block-failure)
+  (send-message peer
+                (bitcoin-lisp.serialization:make-getdata-message
+                 (list (bitcoin-lisp.serialization:make-inv-vector
+                        :type bitcoin-lisp.serialization:+inv-type-witness-block+
+                        :hash block-hash)))))
+
+;;; Timeout handling
+
+(defun check-compact-block-timeout (peer)
+  "Check if pending compact block reconstruction has timed out.
+   If so, clear state and request full block."
+  (let ((pending (peer-pending-compact-block peer)))
+    (when pending
+      (let* ((now (get-internal-real-time))
+             (elapsed-secs (/ (- now (pending-compact-block-request-time pending))
+                              internal-time-units-per-second)))
+        (when (> elapsed-secs +compact-block-timeout-seconds+)
+          (bitcoin-lisp:log-warn "Compact block reconstruction timed out")
+          (let ((block-hash (pending-compact-block-block-hash pending)))
+            (setf (peer-pending-compact-block peer) nil)
+            (request-full-block peer block-hash)))))))
+
+(defun clear-pending-compact-block (peer)
+  "Clear any pending compact block reconstruction for PEER."
+  (setf (peer-pending-compact-block peer) nil))
+
+;;; Compact block metrics
+
+(defun compact-block-stats ()
+  "Return compact block reconstruction statistics (thread-safe read)."
+  (bt:with-lock-held (*compact-block-metrics-lock*)
+    (list :successes *compact-block-success-count*
+          :failures *compact-block-failure-count*
+          :collisions *compact-block-collision-count*)))

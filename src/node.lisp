@@ -426,6 +426,8 @@ Returns the number of peers connected."
                             addr
                             (bitcoin-lisp.networking:peer-user-agent peer)
                             (bitcoin-lisp.networking:peer-start-height peer))
+                  ;; Send compact block negotiation (BIP 152)
+                  (bitcoin-lisp.networking:send-compact-block-negotiation peer)
                   (push peer (node-peers node))
                   (incf connected))
                 (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
@@ -439,9 +441,13 @@ Returns the number of peers connected."
 ;;;; Peer Health and Reconnection
 
 (defun check-peers-health (node)
-  "Check health of all peers. Disconnect unresponsive ones."
+  "Check health of all peers. Disconnect unresponsive ones.
+Also checks compact block reconstruction timeouts (BIP 152)."
   (let ((to-disconnect '()))
     (dolist (peer (node-peers node))
+      ;; Check compact block timeout
+      (bitcoin-lisp.networking:check-compact-block-timeout peer)
+      ;; Check ping/pong health
       (let ((status (bitcoin-lisp.networking:check-peer-health peer)))
         (when (eq status :disconnect)
           (push peer to-disconnect))))
@@ -486,6 +492,8 @@ Returns the number of new peers connected."
                   (setf (bitcoin-lisp.networking:peer-address peer) addr)
                   (when (bitcoin-lisp.networking:perform-handshake peer)
                     (log-info "Replacement peer connected: ~A" addr)
+                    ;; Send compact block negotiation (BIP 152)
+                    (bitcoin-lisp.networking:send-compact-block-negotiation peer)
                     (push peer (node-peers node))
                     (incf connected))
                   (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
