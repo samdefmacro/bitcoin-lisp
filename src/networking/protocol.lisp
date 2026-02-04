@@ -38,9 +38,10 @@ Returns a list of IP address strings."
 ;;; Message handling
 
 (defun handle-message (peer command payload chain-state utxo-set block-store
-                       &key mempool peers)
+                       &key mempool peers fee-estimator)
   "Handle an incoming message from a peer.
 MEMPOOL and PEERS are optional; when provided, transaction relay is enabled.
+FEE-ESTIMATOR is optional; when provided, fee stats are recorded for blocks.
 Returns T if message was handled, NIL otherwise."
   (cond
     ((string= command "ping")
@@ -64,7 +65,7 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "block")
-     (handle-block peer payload chain-state utxo-set block-store mempool)
+     (handle-block peer payload chain-state utxo-set block-store mempool fee-estimator)
      t)
 
     ((string= command "tx")
@@ -148,7 +149,7 @@ Returns T if message was handled, NIL otherwise."
 ;;; Block handling
 
 (defun handle-block (peer payload chain-state utxo-set block-store
-                     &optional mempool)
+                     &optional mempool fee-estimator)
   "Handle a block message."
   (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
     (when block
@@ -163,7 +164,8 @@ Returns T if message was handled, NIL otherwise."
           (if valid
               (progn
                 (bitcoin-lisp.validation:connect-block
-                 block chain-state block-store utxo-set)
+                 block chain-state block-store utxo-set
+                 :fee-estimator fee-estimator)
                 ;; Remove confirmed transactions from mempool
                 (when mempool
                   (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
@@ -284,7 +286,7 @@ so peers include witness data in the response."
 
 ;;; Main sync loop
 
-(defun sync-with-peer (peer chain-state utxo-set block-store &key (max-blocks 500))
+(defun sync-with-peer (peer chain-state utxo-set block-store &key (max-blocks 500) fee-estimator)
   "Synchronize blockchain with a peer.
 Downloads headers and blocks up to MAX-BLOCKS."
   (unless (eq (peer-state peer) :ready)
@@ -300,7 +302,8 @@ Downloads headers and blocks up to MAX-BLOCKS."
                (unless command
                  (return-from sync-with-peer blocks-received))
                (handle-message peer command payload
-                               chain-state utxo-set block-store)
+                               chain-state utxo-set block-store
+                               :fee-estimator fee-estimator)
                (when (string= command "block")
                  (incf blocks-received))))
     blocks-received))

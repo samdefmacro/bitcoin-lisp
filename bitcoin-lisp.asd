@@ -46,13 +46,15 @@
                  (:module "storage"
                   :components ((:file "blocks")
                                (:file "utxo")
-                               (:file "chain")))
+                               (:file "chain")
+                               (:file "txindex")))
                  (:module "validation"
                   :components ((:file "script")
                                (:file "transaction")
                                (:file "block")))
                  (:module "mempool"
-                  :components ((:file "mempool")))
+                  :components ((:file "mempool")
+                               (:file "fee-estimator")))
                  (:module "networking"
                   :components ((:file "connection")
                                (:file "peer")

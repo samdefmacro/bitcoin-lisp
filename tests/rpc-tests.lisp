@@ -558,3 +558,97 @@
         '(((("txid" . "0000000000000000000000000000000000000000000000000000000000000001")
             ("vout" . 0)))
           (("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" . -0.01)))))))
+
+;;; --- gettxoutsetinfo Tests ---
+
+(test rpc-gettxoutsetinfo-empty-utxo-set
+  "Test gettxoutsetinfo with empty UTXO set"
+  (let* ((node (make-test-node))
+         (result (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node nil)))
+    ;; Check required fields exist
+    (is (assoc "height" result :test #'string=))
+    (is (assoc "bestblock" result :test #'string=))
+    (is (assoc "txouts" result :test #'string=))
+    (is (assoc "total_amount" result :test #'string=))
+    (is (assoc "transactions" result :test #'string=))
+    (is (assoc "hash_serialized_3" result :test #'string=))
+    ;; Empty UTXO set should have 0 txouts
+    (is (= (cdr (assoc "txouts" result :test #'string=)) 0))
+    (is (= (cdr (assoc "total_amount" result :test #'string=)) 0))
+    (is (= (cdr (assoc "transactions" result :test #'string=)) 0))))
+
+(test rpc-gettxoutsetinfo-with-utxos
+  "Test gettxoutsetinfo with UTXOs in set"
+  (let* ((node (make-test-node))
+         (utxo-set (bitcoin-lisp::node-utxo-set node))
+         (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (txid2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
+         (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element 0)))
+    ;; Add some UTXOs
+    (bitcoin-lisp.storage:add-utxo utxo-set txid1 0 100000000 script 1) ; 1 BTC
+    (bitcoin-lisp.storage:add-utxo utxo-set txid1 1 50000000 script 1)  ; 0.5 BTC
+    (bitcoin-lisp.storage:add-utxo utxo-set txid2 0 25000000 script 2)  ; 0.25 BTC
+    (let ((result (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node nil)))
+      ;; Should have 3 UTXOs from 2 transactions
+      (is (= (cdr (assoc "txouts" result :test #'string=)) 3))
+      (is (= (cdr (assoc "transactions" result :test #'string=)) 2))
+      ;; Total should be 1.75 BTC (returned in BTC, not satoshis)
+      (is (= (cdr (assoc "total_amount" result :test #'string=)) 1.75))
+      ;; hash_serialized_3 should be a 64-char hex string
+      (let ((hash (cdr (assoc "hash_serialized_3" result :test #'string=))))
+        (is (stringp hash))
+        (is (= (length hash) 64))))))
+
+;;; --- getblockstats Tests ---
+
+(test rpc-getblockstats-invalid-params
+  "Test getblockstats with invalid parameters"
+  (let ((node (make-test-node)))
+    ;; Missing parameter
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node nil))
+    ;; Invalid hash format
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node '("invalid")))
+    ;; Negative height
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node '(-1)))))
+
+(test rpc-getblockstats-block-not-found
+  "Test getblockstats with non-existent block"
+  (let ((node (make-test-node)))
+    ;; Valid hash format but block doesn't exist
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node
+        '("0000000000000000000000000000000000000000000000000000000000000001")))))
+
+(test rpc-calculate-block-subsidy
+  "Test block subsidy calculation"
+  ;; Initial subsidy: 50 BTC = 5000000000 satoshis
+  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 0) 5000000000))
+  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 209999) 5000000000))
+  ;; First halving at 210000
+  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 210000) 2500000000))
+  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 419999) 2500000000))
+  ;; Second halving
+  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 420000) 1250000000))
+  ;; Third halving
+  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 630000) 625000000)))
+
+;;; --- Extended getrawtransaction Tests ---
+
+(test rpc-getrawtransaction-with-blockhash-invalid
+  "Test getrawtransaction with invalid blockhash parameter"
+  (let ((node (make-test-node)))
+    ;; Valid txid but invalid blockhash format
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getrawtransaction node
+        '("0000000000000000000000000000000000000000000000000000000000000001" nil "invalid-hash")))))
+
+(test rpc-getrawtransaction-txindex-disabled
+  "Test getrawtransaction returns error when txindex needed but disabled"
+  (let ((node (make-test-node)))
+    ;; Node has no txindex, looking for non-mempool tx should fail
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getrawtransaction node
+        '("0000000000000000000000000000000000000000000000000000000000000001")))))

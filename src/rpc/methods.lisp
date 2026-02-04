@@ -260,14 +260,22 @@
   (declare (ignore params))
   (let ((mempool (rpc-get-mempool node)))
     (if mempool
-        `(("loaded" . t)
-          ("size" . ,(bitcoin-lisp.mempool:mempool-count mempool))
-          ("bytes" . ,(bitcoin-lisp.mempool:mempool-total-size mempool))
-          ("usage" . 0))
+        ;; Convert sat/vB to BTC/kvB: sat/vB * 1000 / 100000000
+        (let* ((min-fee-sat-vb (bitcoin-lisp.mempool:mempool-min-fee-rate mempool))
+               (min-fee-btc-kvb (/ (* min-fee-sat-vb 1000) 100000000.0d0))
+               (relay-fee-btc-kvb (/ (* bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 1000) 100000000.0d0)))
+          `(("loaded" . t)
+            ("size" . ,(bitcoin-lisp.mempool:mempool-count mempool))
+            ("bytes" . ,(bitcoin-lisp.mempool:mempool-total-size mempool))
+            ("usage" . 0)
+            ("mempoolminfee" . ,min-fee-btc-kvb)
+            ("minrelaytxfee" . ,relay-fee-btc-kvb)))
         `(("loaded" . nil)
           ("size" . 0)
           ("bytes" . 0)
-          ("usage" . 0)))))
+          ("usage" . 0)
+          ("mempoolminfee" . 0.00001)
+          ("minrelaytxfee" . 0.00001)))))
 
 (defun rpc-getrawmempool (node params)
   "Return mempool transaction IDs or details."
@@ -354,40 +362,138 @@
 
 (defun rpc-getrawtransaction (node params)
   "Get raw transaction data by txid.
-Phase 1: Mempool-only lookup. Returns error for confirmed transactions."
+Searches mempool first, then txindex (if enabled), then blockhash hint."
   (let ((txid-str (first params))
-        (verbose (second params)))
+        (verbose (second params))
+        (blockhash-hint (third params)))
     (unless (valid-hex-hash-p txid-str)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid transaction id"))
+    (when (and blockhash-hint (not (valid-hex-hash-p blockhash-hint)))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Invalid blockhash"))
     (let* ((txid-bytes (parse-hex-hash txid-str))
            (mempool (rpc-get-mempool node))
-           (entry (when mempool
-                    (bitcoin-lisp.mempool:mempool-get mempool txid-bytes))))
-      (unless entry
-        (error 'rpc-error :code +rpc-invalid-address-or-key+
-                          :message "Transaction not found in mempool (blockchain lookup not implemented)"))
-      (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
-        (if verbose
-            (tx-to-json tx)
-            (bitcoin-lisp.crypto:bytes-to-hex
-             (bitcoin-lisp.serialization:serialize tx)))))))
+           (mempool-entry (when mempool
+                            (bitcoin-lisp.mempool:mempool-get mempool txid-bytes))))
+      ;; Check mempool first
+      (when mempool-entry
+        (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction mempool-entry)))
+          (return-from rpc-getrawtransaction
+            (if verbose
+                (tx-to-json tx)
+                (bitcoin-lisp.crypto:bytes-to-hex
+                 (bitcoin-lisp.serialization:serialize tx))))))
+
+      ;; Try blockhash hint if provided
+      (when blockhash-hint
+        (let* ((block-hash-bytes (parse-hex-hash blockhash-hint))
+               (block-store (rpc-get-block-store node))
+               (block (bitcoin-lisp.storage:get-block block-store block-hash-bytes)))
+          (when block
+            (let ((found-tx (find-tx-in-block block txid-bytes)))
+              (when found-tx
+                (return-from rpc-getrawtransaction
+                  (if verbose
+                      (tx-to-json-confirmed found-tx node block-hash-bytes)
+                      (bitcoin-lisp.crypto:bytes-to-hex
+                       (bitcoin-lisp.serialization:serialize found-tx)))))))))
+
+      ;; Try txindex if enabled
+      (let ((tx-index (rpc-get-tx-index node)))
+        (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
+          (let ((location (bitcoin-lisp.storage:txindex-lookup tx-index txid-bytes)))
+            (when location
+              (let* ((block-hash (bitcoin-lisp.storage:tx-location-block-hash location))
+                     (block-store (rpc-get-block-store node))
+                     (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+                (when block
+                  (let ((found-tx (find-tx-in-block block txid-bytes)))
+                    (when found-tx
+                      (return-from rpc-getrawtransaction
+                        (if verbose
+                            (tx-to-json-confirmed found-tx node block-hash)
+                            (bitcoin-lisp.crypto:bytes-to-hex
+                             (bitcoin-lisp.serialization:serialize found-tx))))))))))))
+
+      ;; Not found
+      (let ((tx-index (rpc-get-tx-index node)))
+        (if (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
+            (error 'rpc-error :code +rpc-invalid-address-or-key+
+                              :message "No such mempool or blockchain transaction")
+            (error 'rpc-error :code +rpc-invalid-address-or-key+
+                              :message "No such mempool transaction. Use -txindex or provide a blockhash"))))))
+
+(defun find-tx-in-block (block txid)
+  "Find a transaction in a block by txid. Returns the transaction or NIL."
+  (let ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+    (find-if (lambda (tx)
+               (equalp txid (bitcoin-lisp.serialization:transaction-hash tx)))
+             txs)))
+
+(defun tx-to-json-confirmed (tx node block-hash)
+  "Convert a confirmed transaction to JSON with block info."
+  (let* ((chain-state (rpc-get-chain-state node))
+         (block-entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
+         (current-height (bitcoin-lisp.storage:current-height chain-state))
+         (block-height (if block-entry
+                           (bitcoin-lisp.storage:block-index-entry-height block-entry)
+                           0))
+         (confirmations (if block-entry
+                            (1+ (- current-height block-height))
+                            0))
+         (header (when block-entry
+                   (bitcoin-lisp.storage:block-index-entry-header block-entry)))
+         (block-time (when header
+                       (bitcoin-lisp.serialization:block-header-timestamp header)))
+         (base-json (tx-to-json tx)))
+    ;; Add confirmed transaction fields
+    (append base-json
+            `(("blockhash" . ,(hash-to-hex block-hash))
+              ("confirmations" . ,confirmations)
+              ("time" . ,block-time)
+              ("blocktime" . ,block-time)))))
 
 (defun rpc-estimatesmartfee (node params)
   "Estimate fee rate for confirmation in conf_target blocks.
-Phase 1: Returns conservative fixed estimate."
-  (let ((conf-target (first params)))
+PARAMS: [conf_target, estimate_mode]
+- conf_target: Number of blocks (1-1008)
+- estimate_mode: Optional, 'economical' or 'conservative' (default)
+Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
+  (let* ((conf-target (first params))
+         (mode-str (second params))
+         (mode (cond
+                 ((null mode-str) :conservative)
+                 ((string-equal mode-str "economical") :economical)
+                 ((string-equal mode-str "conservative") :conservative)
+                 (t (error 'rpc-error :code +rpc-invalid-parameter+
+                                      :message "Invalid estimate_mode (must be 'economical' or 'conservative')")))))
     (unless (and (integerp conf-target) (>= conf-target 1) (<= conf-target 1008))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid conf_target (must be 1-1008)"))
     ;; Check if still syncing
     (when (rpc-is-syncing node)
-      (error 'rpc-error :code +rpc-misc-error+
-                        :message "Insufficient data (node still syncing)"))
-    ;; Return conservative fixed estimate for testnet
-    ;; 0.00001 BTC/kvB = 1 sat/vB
-    `(("feerate" . 0.00001)
-      ("blocks" . ,conf-target))))
+      (return-from rpc-estimatesmartfee
+        `(("blocks" . ,conf-target)
+          ("errors" . #("Insufficient data (node still syncing)")))))
+    ;; Get fee estimate
+    (let ((fee-estimator (bitcoin-lisp:node-fee-estimator node)))
+      (if (and fee-estimator (bitcoin-lisp.mempool:fee-estimator-ready-p fee-estimator))
+          ;; Use fee estimator
+          (multiple-value-bind (rate-sat-vb error-msg)
+              (bitcoin-lisp.mempool:estimate-fee-rate fee-estimator conf-target :mode mode)
+            ;; Convert sat/vB to BTC/kvB: sat/vB * 1000 / 100000000
+            (let ((rate-btc-kvb (/ (* rate-sat-vb 1000) 100000000.0d0)))
+              (if error-msg
+                  `(("feerate" . ,rate-btc-kvb)
+                    ("blocks" . ,conf-target)
+                    ("errors" . ,(vector error-msg)))
+                  `(("feerate" . ,rate-btc-kvb)
+                    ("blocks" . ,conf-target)))))
+          ;; Not enough data - return fallback
+          `(("feerate" . 0.00001)  ; 1 sat/vB fallback
+            ("blocks" . ,conf-target)
+            ("errors" . #("Insufficient data for reliable fee estimation")))))))
 
 (defun rpc-validateaddress (node params)
   "Validate a Bitcoin address and return metadata."
@@ -522,3 +628,116 @@ Phase 1: Returns conservative fixed estimate."
                  :lock-time locktime)))
         (bitcoin-lisp.crypto:bytes-to-hex
          (bitcoin-lisp.serialization:serialize tx))))))
+
+;;; --- UTXO Set Statistics ---
+
+(defun rpc-gettxoutsetinfo (node params)
+  "Return statistics about the UTXO set."
+  (let ((hash-type (or (first params) "hash_serialized_3"))
+        (utxo-set (rpc-get-utxo-set node))
+        (chain-state (rpc-get-chain-state node)))
+    (unless (member hash-type '("hash_serialized_3" "none") :test #'string=)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Invalid hash_type (must be 'hash_serialized_3' or 'none')"))
+    (let* ((height (bitcoin-lisp.storage:current-height chain-state))
+           (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+           (txout-count (bitcoin-lisp.storage:utxo-count utxo-set))
+           (tx-count (bitcoin-lisp.storage:utxo-set-distinct-txids utxo-set))
+           (total-satoshis (bitcoin-lisp.storage:utxo-set-total-amount utxo-set))
+           (total-btc (/ total-satoshis 100000000.0))
+           (result `(("height" . ,height)
+                     ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
+                     ("transactions" . ,tx-count)
+                     ("txouts" . ,txout-count)
+                     ("total_amount" . ,total-btc))))
+      ;; Add hash if requested
+      (when (string= hash-type "hash_serialized_3")
+        (let ((utxo-hash (bitcoin-lisp.storage:compute-utxo-set-hash utxo-set)))
+          (setf result (append result
+                               `(("hash_serialized_3" . ,(hash-to-hex utxo-hash)))))))
+      result)))
+
+;;; --- Block Statistics ---
+
+(defun rpc-getblockstats (node params)
+  "Return statistics about a block."
+  (let ((hash-or-height (first params))
+        (stats-filter (second params)))
+    (unless hash-or-height
+      (error 'rpc-error :code +rpc-invalid-params+
+                        :message "Missing required parameter hash_or_height"))
+    ;; Resolve block hash
+    (let* ((chain-state (rpc-get-chain-state node))
+           (block-store (rpc-get-block-store node)))
+      (unless block-store
+        (error 'rpc-error :code +rpc-misc-error+
+                          :message "Block data not available"))
+      (let* ((block-hash
+               (cond
+                 ;; Height provided
+                 ((integerp hash-or-height)
+                  (let ((entry (bitcoin-lisp.storage:get-block-at-height
+                                chain-state hash-or-height)))
+                    (unless entry
+                      (error 'rpc-error :code +rpc-invalid-parameter+
+                                        :message "Block height out of range"))
+                    (bitcoin-lisp.storage:block-index-entry-hash entry)))
+                 ;; Hash string provided
+                 ((valid-hex-hash-p hash-or-height)
+                  (parse-hex-hash hash-or-height))
+                 (t
+                  (error 'rpc-error :code +rpc-invalid-parameter+
+                                    :message "Invalid hash_or_height parameter"))))
+             (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+      (unless block
+        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                          :message "Block not found"))
+      (let* ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
+             (height (if entry
+                         (bitcoin-lisp.storage:block-index-entry-height entry)
+                         0))
+             (header (bitcoin-lisp.serialization:bitcoin-block-header block))
+             (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+             (ntx (length txs))
+             ;; Calculate stats
+             (total-size (length (bitcoin-lisp.serialization:serialize block)))
+             (total-ins 0)
+             (total-outs 0)
+             (total-out-value 0))
+        ;; Count inputs/outputs
+        (loop for tx in txs
+              for tx-idx from 0
+              do (unless (zerop tx-idx)  ; Skip coinbase inputs
+                   (incf total-ins (length (bitcoin-lisp.serialization:transaction-inputs tx))))
+                 (incf total-outs (length (bitcoin-lisp.serialization:transaction-outputs tx)))
+                 (dolist (out (bitcoin-lisp.serialization:transaction-outputs tx))
+                   (incf total-out-value (bitcoin-lisp.serialization:tx-out-value out))))
+        ;; Calculate subsidy
+        (let* ((subsidy (calculate-block-subsidy height))
+               (avg-tx-size (if (> ntx 0)
+                                (round (/ total-size ntx))
+                                0))
+               (all-stats `(("avgtxsize" . ,avg-tx-size)
+                            ("blockhash" . ,(hash-to-hex block-hash))
+                            ("height" . ,height)
+                            ("ins" . ,total-ins)
+                            ("outs" . ,total-outs)
+                            ("subsidy" . ,subsidy)
+                            ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
+                            ("total_out" . ,total-out-value)
+                            ("total_size" . ,total-size)
+                            ("txs" . ,ntx))))
+          ;; Filter stats if requested
+          (if (and stats-filter (listp stats-filter))
+              (remove-if-not (lambda (pair)
+                               (member (car pair) stats-filter :test #'string=))
+                             all-stats)
+              all-stats)))))))
+
+(defun calculate-block-subsidy (height)
+  "Calculate block subsidy in satoshis for a given height."
+  (let* ((halvings (floor height 210000))
+         (initial-subsidy 5000000000))  ; 50 BTC in satoshis
+    (if (>= halvings 64)
+        0
+        (ash initial-subsidy (- halvings)))))

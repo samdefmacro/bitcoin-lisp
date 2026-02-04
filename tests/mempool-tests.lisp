@@ -327,3 +327,114 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
   "Arbitrary scripts are non-standard."
   (let ((script (make-array 10 :element-type '(unsigned-byte 8) :initial-element #xFF)))
     (is (not (bitcoin-lisp.validation::standard-output-script-p script)))))
+
+;;;; Fee estimation tests
+
+(test fee-estimator-creation
+  "Fee estimator is created with correct defaults."
+  (let ((estimator (bitcoin-lisp.mempool:make-fee-estimator)))
+    (is (= 0 (bitcoin-lisp.mempool:fee-estimator-entry-count estimator)))
+    (is (not (bitcoin-lisp.mempool:fee-estimator-ready-p estimator)))))
+
+(test fee-estimator-add-stats
+  "Adding fee statistics increments the entry count."
+  (let ((estimator (bitcoin-lisp.mempool:make-fee-estimator))
+        (stats (bitcoin-lisp.mempool:make-block-fee-stats
+                :height 100
+                :median-rate 50
+                :low-rate 10
+                :high-rate 100
+                :tx-count 200)))
+    (bitcoin-lisp.mempool:fee-estimator-add-stats estimator stats)
+    (is (= 1 (bitcoin-lisp.mempool:fee-estimator-entry-count estimator)))))
+
+(test fee-estimator-ready-after-min-blocks
+  "Fee estimator becomes ready after minimum blocks are added."
+  (let ((estimator (bitcoin-lisp.mempool:make-fee-estimator)))
+    ;; Add enough blocks to meet the threshold (6 by default)
+    (dotimes (i 6)
+      (let ((stats (bitcoin-lisp.mempool:make-block-fee-stats
+                    :height (+ 100 i)
+                    :median-rate (+ 10 i)
+                    :low-rate 5
+                    :high-rate 50
+                    :tx-count 100)))
+        (bitcoin-lisp.mempool:fee-estimator-add-stats estimator stats)))
+    (is (bitcoin-lisp.mempool:fee-estimator-ready-p estimator))))
+
+(test fee-estimation-basic
+  "Fee estimation returns reasonable values."
+  (let ((estimator (bitcoin-lisp.mempool:make-fee-estimator)))
+    ;; Add test data with varying fee rates
+    (dotimes (i 10)
+      (let ((stats (bitcoin-lisp.mempool:make-block-fee-stats
+                    :height (+ 100 i)
+                    :median-rate (+ 10 (* i 5))  ; 10, 15, 20, ...55
+                    :low-rate 5
+                    :high-rate 100
+                    :tx-count 200)))
+        (bitcoin-lisp.mempool:fee-estimator-add-stats estimator stats)))
+    ;; Test estimation
+    (multiple-value-bind (rate error)
+        (bitcoin-lisp.mempool:estimate-fee-rate estimator 6)
+      (declare (ignore error))
+      (is (> rate 0))
+      (is (<= rate 100)))))
+
+(test fee-estimation-conservative-vs-economical
+  "Conservative mode returns higher fee than economical."
+  (let ((estimator (bitcoin-lisp.mempool:make-fee-estimator)))
+    ;; Add test data
+    (dotimes (i 15)
+      (let ((stats (bitcoin-lisp.mempool:make-block-fee-stats
+                    :height (+ 100 i)
+                    :median-rate (+ 10 (* i 3))
+                    :low-rate 5
+                    :high-rate 100
+                    :tx-count 200)))
+        (bitcoin-lisp.mempool:fee-estimator-add-stats estimator stats)))
+    (multiple-value-bind (conservative-rate c-error)
+        (bitcoin-lisp.mempool:estimate-fee-rate estimator 6 :mode :conservative)
+      (declare (ignore c-error))
+      (multiple-value-bind (economical-rate e-error)
+          (bitcoin-lisp.mempool:estimate-fee-rate estimator 6 :mode :economical)
+        (declare (ignore e-error))
+        (is (>= conservative-rate economical-rate))))))
+
+(test fee-estimation-longer-target-lower-fee
+  "Longer confirmation targets tend to have lower fee estimates."
+  (let ((estimator (bitcoin-lisp.mempool:make-fee-estimator)))
+    ;; Add test data
+    (dotimes (i 20)
+      (let ((stats (bitcoin-lisp.mempool:make-block-fee-stats
+                    :height (+ 100 i)
+                    :median-rate (+ 10 (* i 2))
+                    :low-rate 5
+                    :high-rate 100
+                    :tx-count 200)))
+        (bitcoin-lisp.mempool:fee-estimator-add-stats estimator stats)))
+    (multiple-value-bind (short-rate s-error)
+        (bitcoin-lisp.mempool:estimate-fee-rate estimator 2)
+      (declare (ignore s-error))
+      (multiple-value-bind (long-rate l-error)
+          (bitcoin-lisp.mempool:estimate-fee-rate estimator 25)
+        (declare (ignore l-error))
+        ;; Short target should have higher or equal fee
+        (is (>= short-rate long-rate))))))
+
+(test fee-estimation-insufficient-data
+  "Fee estimation returns error when data is insufficient."
+  (let ((estimator (bitcoin-lisp.mempool:make-fee-estimator)))
+    ;; Only add 2 blocks (less than minimum of 6)
+    (dotimes (i 2)
+      (let ((stats (bitcoin-lisp.mempool:make-block-fee-stats
+                    :height (+ 100 i)
+                    :median-rate 20
+                    :low-rate 10
+                    :high-rate 50
+                    :tx-count 100)))
+        (bitcoin-lisp.mempool:fee-estimator-add-stats estimator stats)))
+    (multiple-value-bind (rate error)
+        (bitcoin-lisp.mempool:estimate-fee-rate estimator 6)
+      (is (= rate 1))  ; Fallback minimum
+      (is (not (null error))))))

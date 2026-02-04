@@ -99,6 +99,7 @@
    #:transaction-witness
    #:transaction-wtxid
    #:transaction-has-witness-p
+   #:transaction-vsize
    #:serialize-witness-transaction
    #:block-header
    #:make-block-header
@@ -221,12 +222,36 @@
    #:load-utxo-set
    #:utxo-set-file-path
    #:utxo-set-dirty
+   ;; UTXO iteration and statistics
+   #:utxo-set-iterate
+   #:utxo-set-total-amount
+   #:utxo-set-distinct-txids
+   #:compute-utxo-set-hash
    ;; Header index persistence
    #:save-header-index
    #:load-header-index
    #:append-header-entry
    ;; Integrity utilities
-   #:compute-crc32))
+   #:compute-crc32
+   ;; Transaction index
+   #:tx-index
+   #:make-tx-index
+   #:tx-index-enabled
+   #:tx-location
+   #:make-tx-location
+   #:tx-location-block-hash
+   #:tx-location-tx-position
+   #:init-tx-index
+   #:close-tx-index
+   #:txindex-add
+   #:txindex-lookup
+   #:txindex-remove
+   #:txindex-contains-p
+   #:txindex-count
+   #:load-tx-index
+   #:txindex-add-block
+   #:txindex-remove-block
+   #:build-tx-index))
 
 (defpackage #:bitcoin-lisp.mempool
   (:use #:cl)
@@ -234,6 +259,9 @@
    ;; Constants
    #:+default-max-mempool-bytes+
    #:+default-min-relay-fee-rate+
+   #:+fee-history-size+
+   #:+min-blocks-for-estimate+
+   #:+fee-stats-flush-interval+
    ;; Mempool entry
    #:mempool-entry
    #:make-mempool-entry
@@ -251,9 +279,35 @@
    #:mempool-remove
    #:mempool-count
    #:mempool-total-size
+   #:mempool-min-fee-rate
    #:mempool-check-conflict
    #:mempool-remove-for-block
-   #:mempool-get-transactions))
+   #:mempool-get-transactions
+   ;; Block fee stats
+   #:block-fee-stats
+   #:make-block-fee-stats
+   #:block-fee-stats-height
+   #:block-fee-stats-median-rate
+   #:block-fee-stats-low-rate
+   #:block-fee-stats-high-rate
+   #:block-fee-stats-tx-count
+   ;; Fee estimator
+   #:fee-estimator
+   #:make-fee-estimator
+   #:fee-estimator-entry-count
+   #:fee-estimator-data-directory
+   #:fee-estimator-blocks-since-flush
+   #:fee-estimator-add-stats
+   #:fee-estimator-ready-p
+   #:fee-estimator-get-history
+   #:calculate-tx-fee-rate
+   #:compute-block-fee-stats
+   ;; Fee stats persistence
+   #:save-fee-stats
+   #:load-fee-stats
+   #:maybe-flush-fee-stats
+   ;; Fee estimation
+   #:estimate-fee-rate))
 
 (defpackage #:bitcoin-lisp.validation
   (:use #:cl)
@@ -369,6 +423,7 @@
    #:start-node
    #:stop-node
    #:node-status
+   #:node-fee-estimator
    #:sync-blockchain
    ;; Logging
    #:*log-stream*
