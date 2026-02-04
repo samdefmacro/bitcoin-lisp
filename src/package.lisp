@@ -198,6 +198,9 @@
    #:chain-state
    #:make-chain-state
    #:init-chain-state
+   #:network-genesis-hash
+   #:*testnet-genesis-hash*
+   #:*mainnet-genesis-hash*
    #:block-index-entry
    #:make-block-index-entry
    #:block-index-entry-hash
@@ -337,9 +340,12 @@
    #:find-fork-point
    #:perform-reorg
    #:decode-coinbase-height
+   #:get-bip34-activation-height
    ;; Constants
    #:+coinbase-maturity+
-   #:+max-money+))
+   #:+max-money+
+   #:+bip34-activation-height-testnet+
+   #:+bip34-activation-height-mainnet+))
 
 (defpackage #:bitcoin-lisp.networking
   (:use #:cl)
@@ -399,7 +405,14 @@
    #:*current-port*
    #:*dns-seeds*
    #:*testnet-dns-seeds*
-   #:*mainnet-dns-seeds*))
+   #:*mainnet-dns-seeds*
+   ;; Checkpoints
+   #:*testnet-checkpoints*
+   #:*mainnet-checkpoints*
+   #:network-checkpoints
+   #:get-checkpoint-hash
+   #:last-checkpoint-height
+   #:relay-enabled-p))
 
 (defpackage #:bitcoin-lisp
   (:use #:cl)
@@ -417,6 +430,8 @@
    #:network-magic
    #:network-port
    #:network-dns-seeds
+   #:network-rpc-port
+   #:*mainnet-relay-enabled*
    ;; Node
    #:node
    #:*node*

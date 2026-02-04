@@ -95,6 +95,8 @@
                              ;; Persistence, peer health, reorg tests
                              (:file "persistence-tests")
                              ;; RPC tests
-                             (:file "rpc-tests"))))
+                             (:file "rpc-tests")
+                             ;; Mainnet support tests
+                             (:file "mainnet-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

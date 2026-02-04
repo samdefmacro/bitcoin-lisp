@@ -31,6 +31,15 @@
     (:testnet bitcoin-lisp.networking:*testnet-dns-seeds*)
     (:mainnet bitcoin-lisp.networking:*mainnet-dns-seeds*)))
 
+(defun network-rpc-port (network)
+  "Return the default RPC port for NETWORK."
+  (ecase network
+    (:testnet 18332)
+    (:mainnet 8332)))
+
+(defvar *mainnet-relay-enabled* nil
+  "Whether transaction relay is enabled on mainnet. Default NIL for safety.")
+
 ;;;; Node State
 
 (defstruct node
@@ -129,8 +138,21 @@ LEVEL can be :debug, :info, :warn, or :error."
 ;;;; Startup Sequence
 
 (defun init-node (data-directory &key (network :testnet) (log-level :info))
-  "Initialize a new node with the given data directory and network."
-  (let ((data-path (pathname data-directory)))
+  "Initialize a new node with the given data directory and network.
+For mainnet, data is stored in a 'mainnet' subdirectory.
+For testnet, data stays at the base directory (backward compatible)."
+  ;; Validate network parameter
+  (unless (member network '(:testnet :mainnet))
+    (error "Invalid network: ~A. Must be :testnet or :mainnet." network))
+
+  ;; Set global network variable
+  (setf *network* network)
+
+  ;; Calculate data path - mainnet uses subdirectory, testnet stays at root
+  (let* ((base-path (pathname data-directory))
+         (data-path (if (eq network :mainnet)
+                        (merge-pathnames "mainnet/" base-path)
+                        base-path)))
     ;; Ensure data directory exists
     (ensure-directories-exist (merge-pathnames "dummy" data-path))
 
@@ -156,13 +178,13 @@ LEVEL can be :debug, :info, :warn, or :error."
                         (rpc-password nil))
   "Start the Bitcoin node.
 
-DATA-DIRECTORY: Path to store blockchain data
+DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
 NETWORK: :testnet or :mainnet
 LOG-LEVEL: :debug, :info, :warn, or :error
 MAX-PEERS: Maximum number of peer connections
 SYNC: If T, start syncing immediately
 TXINDEX: If T, enable transaction index for getrawtransaction lookups
-RPC-PORT: Port for RPC server (nil = no RPC, default 18332 for testnet)
+RPC-PORT: Port for RPC server (nil = no RPC, default 18332 testnet / 8332 mainnet)
 RPC-BIND: Address to bind RPC server (default 127.0.0.1)
 RPC-USER: RPC authentication username (nil = no auth)
 RPC-PASSWORD: RPC authentication password
@@ -178,7 +200,15 @@ Returns the node instance."
   (setf *current-log-level* log-level)
   (log-info "Bitcoin-Lisp Node v0.1.0")
   (log-info "Network: ~A" network)
-  (log-info "Data directory: ~A" data-directory)
+  (log-info "Data directory: ~A" (node-data-directory *node*))
+
+  ;; Mainnet warnings
+  (when (eq network :mainnet)
+    (log-warn "*** MAINNET MODE ***")
+    (log-warn "You are connecting to the production Bitcoin network.")
+    (if *mainnet-relay-enabled*
+        (log-info "Transaction relay: ENABLED")
+        (log-info "Transaction relay: DISABLED (safety default)")))
 
   ;; Initialize chain state
   (log-info "Loading chain state...")
