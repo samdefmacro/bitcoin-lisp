@@ -244,6 +244,12 @@ If the block has no witness data, the commitment is not required."
 (defconstant +bip34-activation-height-mainnet+ 227931
   "BIP 34 activation height on mainnet.")
 
+(defun get-bip34-activation-height (network)
+  "Return the BIP 34 activation height for NETWORK."
+  (ecase network
+    (:testnet +bip34-activation-height-testnet+)
+    (:mainnet +bip34-activation-height-mainnet+)))
+
 (defun decode-coinbase-height (script-sig)
   "Decode the block height from a BIP 34 coinbase scriptSig.
 The height is encoded as a CScriptNum push at the start of the scriptSig.
@@ -271,10 +277,10 @@ Returns the height as an integer, or NIL if the encoding is invalid."
 (defun validate-coinbase-height (block current-height)
   "Validate BIP 34 coinbase height encoding.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
-Only enforced at or above the activation height."
-  ;; Use testnet activation height (lower of the two)
-  (when (< current-height +bip34-activation-height-testnet+)
-    (return-from validate-coinbase-height (values t nil)))
+Only enforced at or above the network-specific activation height."
+  (let ((activation-height (get-bip34-activation-height bitcoin-lisp:*network*)))
+    (when (< current-height activation-height)
+      (return-from validate-coinbase-height (values t nil))))
   (let* ((coinbase-tx (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
          (first-input (first (bitcoin-lisp.serialization:transaction-inputs coinbase-tx)))
          (script-sig (bitcoin-lisp.serialization:tx-in-script-sig first-input))

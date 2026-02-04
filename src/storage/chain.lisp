@@ -29,13 +29,26 @@
   (bitcoin-lisp.crypto:hex-to-bytes
    "43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000"))
 
-(defun init-chain-state (base-path &key genesis-hash)
-  "Initialize chain state at BASE-PATH."
-  (make-chain-state
-   :base-path (pathname base-path)
-   :genesis-hash (or genesis-hash *testnet-genesis-hash*)
-   :best-block-hash (or genesis-hash *testnet-genesis-hash*)
-   :best-height 0))
+;;; Mainnet genesis block hash (little-endian, as on wire)
+(defvar *mainnet-genesis-hash*
+  (bitcoin-lisp.crypto:hex-to-bytes
+   "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000"))
+
+(defun network-genesis-hash (network)
+  "Return the genesis block hash for NETWORK."
+  (ecase network
+    (:testnet *testnet-genesis-hash*)
+    (:mainnet *mainnet-genesis-hash*)))
+
+(defun init-chain-state (base-path &key genesis-hash network)
+  "Initialize chain state at BASE-PATH.
+NETWORK defaults to bitcoin-lisp:*network* if not specified."
+  (let ((net (or network bitcoin-lisp:*network*)))
+    (make-chain-state
+     :base-path (pathname base-path)
+     :genesis-hash (or genesis-hash (network-genesis-hash net))
+     :best-block-hash (or genesis-hash (network-genesis-hash net))
+     :best-height 0)))
 
 (defun get-block-index-entry (state hash)
   "Get the block index entry for HASH."

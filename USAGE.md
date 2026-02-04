@@ -251,6 +251,12 @@ sbcl --load quicklisp.lisp \
 (bitcoin-lisp:start-node :network :mainnet)
 ```
 
+**Important notes about mainnet:**
+- Mainnet requires approximately **600GB+ of storage** for the full blockchain
+- Transaction relay is **disabled by default** on mainnet for safety
+- A warning is logged at startup when running on mainnet
+- To enable mainnet relay: `(setf bitcoin-lisp:*mainnet-relay-enabled* t)`
+
 ### Data Directory
 
 The data directory stores blockchain data, chain state, and configuration:
@@ -265,8 +271,16 @@ Directory structure:
 ```
 ~/.bitcoin-lisp/
 ├── blocks/          # Block files (*.blk)
-└── chainstate.dat   # Chain state persistence
+├── chainstate.dat   # Chain state persistence
+├── utxo.dat         # UTXO set
+├── headerindex.dat  # Block header index
+└── mainnet/         # Mainnet data (when running mainnet)
+    ├── blocks/
+    ├── chainstate.dat
+    └── utxo.dat
 ```
+
+Note: Testnet data stays at the root directory for backward compatibility. Mainnet data is stored in a `mainnet/` subdirectory.
 
 ### Log Levels
 
@@ -366,6 +380,16 @@ By default, `start-node` connects to peers and begins syncing:
 | `*node*` | Current running node instance |
 | `*network*` | Current network (:testnet or :mainnet) |
 | `*log-stream*` | Output stream for logs |
+| `*mainnet-relay-enabled*` | Enable transaction relay on mainnet (default: nil) |
+
+### Network Parameter Functions
+
+| Function | Description |
+|----------|-------------|
+| `network-magic` | Network magic bytes for message framing |
+| `network-port` | Default P2P port (8333 mainnet, 18333 testnet) |
+| `network-rpc-port` | Default RPC port (8332 mainnet, 18332 testnet) |
+| `network-dns-seeds` | DNS seed hostnames for peer discovery |
 
 ## Examples
 

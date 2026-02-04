@@ -252,41 +252,43 @@
         (setf (hunchentoot:return-code*) hunchentoot:+http-method-not-allowed+)
         "")))
 
-(defun start-rpc-server (node &key (port 18332) (bind "127.0.0.1")
+(defun start-rpc-server (node &key port (bind "127.0.0.1")
                                    user password)
-  "Start the RPC server."
-  (when *rpc-server*
-    (bitcoin-lisp::node-log :warn "RPC server already running")
-    (return-from start-rpc-server nil))
+  "Start the RPC server.
+PORT defaults to 18332 for testnet, 8332 for mainnet."
+  (let ((port (or port (bitcoin-lisp:network-rpc-port bitcoin-lisp:*network*))))
+    (when *rpc-server*
+      (bitcoin-lisp::node-log :warn "RPC server already running")
+      (return-from start-rpc-server nil))
 
-  ;; Register methods
-  (register-all-methods)
+    ;; Register methods
+    (register-all-methods)
 
-  ;; Set globals for handler
-  (setf *rpc-node* node)
-  (setf *rpc-user* user)
-  (setf *rpc-password* password)
+    ;; Set globals for handler
+    (setf *rpc-node* node)
+    (setf *rpc-user* user)
+    (setf *rpc-password* password)
 
-  ;; Create and start server
-  (handler-case
-      (let ((acceptor (make-instance 'hunchentoot:easy-acceptor
-                                     :port port
-                                     :address bind)))
-        ;; Create and save dispatcher for cleanup
-        (let ((dispatcher (hunchentoot:create-prefix-dispatcher "/" 'rpc-dispatch-handler)))
-          (setf *rpc-dispatcher* dispatcher)
-          (push dispatcher hunchentoot:*dispatch-table*))
+    ;; Create and start server
+    (handler-case
+        (let ((acceptor (make-instance 'hunchentoot:easy-acceptor
+                                       :port port
+                                       :address bind)))
+          ;; Create and save dispatcher for cleanup
+          (let ((dispatcher (hunchentoot:create-prefix-dispatcher "/" 'rpc-dispatch-handler)))
+            (setf *rpc-dispatcher* dispatcher)
+            (push dispatcher hunchentoot:*dispatch-table*))
 
-        (hunchentoot:start acceptor)
-        (setf *rpc-server* acceptor)
-        (bitcoin-lisp::node-log :info "RPC server started on ~A:~A" bind port)
-        acceptor)
-    (usocket:address-in-use-error ()
-      (bitcoin-lisp::node-log :error "RPC port ~A already in use, continuing without RPC" port)
-      nil)
-    (error (e)
-      (bitcoin-lisp::node-log :error "Failed to start RPC server: ~A" e)
-      nil)))
+          (hunchentoot:start acceptor)
+          (setf *rpc-server* acceptor)
+          (bitcoin-lisp::node-log :info "RPC server started on ~A:~A" bind port)
+          acceptor)
+      (usocket:address-in-use-error ()
+        (bitcoin-lisp::node-log :error "RPC port ~A already in use, continuing without RPC" port)
+        nil)
+      (error (e)
+        (bitcoin-lisp::node-log :error "Failed to start RPC server: ~A" e)
+        nil))))
 
 (defun stop-rpc-server ()
   "Stop the RPC server."
