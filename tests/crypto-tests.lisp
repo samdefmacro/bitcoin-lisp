@@ -138,3 +138,83 @@
   (is (null (bitcoin-lisp.crypto:decode-address "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2" :testnet)))
   ;; Testnet address on mainnet
   (is (null (bitcoin-lisp.crypto:decode-address "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" :mainnet))))
+
+;;; --- SipHash-2-4 Tests (BIP 152) ---
+
+(test siphash-empty-input
+  "SipHash-2-4 of empty input with zero keys."
+  (let ((result (bitcoin-lisp.crypto:siphash-2-4 0 0 #())))
+    (is (integerp result))
+    (is (<= 0 result (1- (expt 2 64))))))
+
+(test siphash-deterministic
+  "SipHash-2-4 is deterministic."
+  (let ((data #(1 2 3 4 5 6 7 8))
+        (k0 #x0706050403020100)
+        (k1 #x0f0e0d0c0b0a0908))
+    (is (= (bitcoin-lisp.crypto:siphash-2-4 k0 k1 data)
+           (bitcoin-lisp.crypto:siphash-2-4 k0 k1 data)))))
+
+(test siphash-different-keys
+  "SipHash-2-4 produces different results for different keys."
+  (let ((data #(1 2 3 4 5 6 7 8)))
+    (is (not (= (bitcoin-lisp.crypto:siphash-2-4 0 0 data)
+                (bitcoin-lisp.crypto:siphash-2-4 1 0 data))))))
+
+(test siphash-different-data
+  "SipHash-2-4 produces different results for different data."
+  (let ((k0 #x0706050403020100)
+        (k1 #x0f0e0d0c0b0a0908))
+    (is (not (= (bitcoin-lisp.crypto:siphash-2-4 k0 k1 #(1 2 3))
+                (bitcoin-lisp.crypto:siphash-2-4 k0 k1 #(1 2 4)))))))
+
+(test siphash-test-vector
+  "SipHash-2-4 test vector from reference implementation."
+  ;; Test vector: 15-byte input with standard test keys
+  (let* ((k0 #x0706050403020100)
+         (k1 #x0f0e0d0c0b0a0908)
+         (data (make-array 15 :element-type '(unsigned-byte 8)
+                           :initial-contents '(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14)))
+         (result (bitcoin-lisp.crypto:siphash-2-4 k0 k1 data)))
+    ;; Expected value from SipHash reference implementation
+    (is (= result #xa129ca6149be45e5))))
+
+(test compute-siphash-key-deterministic
+  "compute-siphash-key is deterministic."
+  (let ((header (make-array 80 :element-type '(unsigned-byte 8) :initial-element 0))
+        (nonce #x123456789abcdef0))
+    (multiple-value-bind (k0a k1a)
+        (bitcoin-lisp.crypto:compute-siphash-key header nonce)
+      (multiple-value-bind (k0b k1b)
+          (bitcoin-lisp.crypto:compute-siphash-key header nonce)
+        (is (= k0a k0b))
+        (is (= k1a k1b))))))
+
+(test compute-siphash-key-different-nonce
+  "compute-siphash-key produces different keys for different nonces."
+  (let ((header (make-array 80 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (multiple-value-bind (k0a k1a)
+        (bitcoin-lisp.crypto:compute-siphash-key header 0)
+      (multiple-value-bind (k0b k1b)
+          (bitcoin-lisp.crypto:compute-siphash-key header 1)
+        (is (or (not (= k0a k0b))
+                (not (= k1a k1b))))))))
+
+(test compute-short-txid-truncation
+  "compute-short-txid returns 48-bit value."
+  (let ((k0 #x0706050403020100)
+        (k1 #x0f0e0d0c0b0a0908)
+        (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xab)))
+    (let ((short-id (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid)))
+      (is (integerp short-id))
+      (is (<= 0 short-id #xffffffffffff))  ; 6 bytes max
+      (is (< short-id (expt 2 48))))))
+
+(test compute-short-txid-different-txids
+  "compute-short-txid produces different IDs for different transactions."
+  (let ((k0 #x0706050403020100)
+        (k1 #x0f0e0d0c0b0a0908)
+        (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x00))
+        (txid2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xff)))
+    (is (not (= (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid1)
+                (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid2))))))

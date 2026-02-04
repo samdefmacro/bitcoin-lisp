@@ -324,3 +324,187 @@ STOP-HASH is the hash to stop at (or zeros to get maximum blocks)."
   "Parse a block message payload into a bitcoin-block."
   (flexi-streams:with-input-from-sequence (stream payload)
     (read-bitcoin-block stream)))
+
+;;;; ============================================================
+;;;; Compact Block Messages (BIP 152)
+;;;; ============================================================
+
+;;; MSG_CMPCT_BLOCK inventory type for getdata
+(defconstant +inv-type-cmpct-block+ 4)
+
+;;; Prefilled transaction in a compact block
+(defstruct prefilled-tx
+  "A prefilled transaction in a compact block (index + full tx)."
+  (index 0 :type (unsigned-byte 32))  ; Absolute index (decoded from differential)
+  (transaction nil))
+
+;;; Compact block (HeaderAndShortIDs)
+(defstruct compact-block
+  "BIP 152 compact block (HeaderAndShortIDs)."
+  (header nil)                        ; Block header
+  (nonce 0 :type (unsigned-byte 64))  ; Random nonce for short ID generation
+  (short-ids '() :type list)          ; List of 6-byte short txids (as integers)
+  (prefilled-txs '() :type list))     ; List of prefilled-tx structs
+
+;;; Block transactions request (getblocktxn)
+(defstruct block-txn-request
+  "BIP 152 block transactions request."
+  (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+              :type (simple-array (unsigned-byte 8) (32)))
+  (indexes '() :type list))  ; List of absolute indexes
+
+;;; Block transactions response (blocktxn)
+(defstruct block-txn-response
+  "BIP 152 block transactions response."
+  (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+              :type (simple-array (unsigned-byte 8) (32)))
+  (transactions '() :type list))  ; List of full transactions
+
+;;; Read/write 6-byte short txid (little-endian)
+(defun read-short-txid (stream)
+  "Read a 6-byte short transaction ID from STREAM as a 48-bit integer."
+  (let ((result 0))
+    (dotimes (i 6)
+      (setf result (logior result (ash (read-byte stream) (* i 8)))))
+    result))
+
+(defun write-short-txid (stream short-id)
+  "Write a 6-byte short transaction ID to STREAM."
+  (dotimes (i 6)
+    (write-byte (logand (ash short-id (- (* i 8))) #xff) stream)))
+
+;;; Parse sendcmpct message
+(defun parse-sendcmpct-payload (payload)
+  "Parse a sendcmpct message payload.
+   Returns (VALUES announce-flag version)."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (let ((announce (read-byte stream))
+          (version (read-uint64-le stream)))
+      (values (= announce 1) version))))
+
+;;; Make sendcmpct message
+(defun make-sendcmpct-message (high-bandwidth version)
+  "Create a sendcmpct message.
+   HIGH-BANDWIDTH is T for high-bandwidth mode, NIL for low-bandwidth.
+   VERSION is 1 or 2."
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-byte (if high-bandwidth 1 0) stream)
+                   (write-uint64-le stream version))))
+    (serialize-message "sendcmpct" payload)))
+
+;;; Read compact block
+(defun read-compact-block (stream)
+  "Read a compact block (HeaderAndShortIDs) from STREAM."
+  (let* ((header (read-block-header stream))
+         (nonce (read-uint64-le stream))
+         (shortids-count (read-compact-size stream))
+         (short-ids (loop repeat shortids-count
+                          collect (read-short-txid stream)))
+         (prefilled-count (read-compact-size stream))
+         (prefilled-txs '())
+         (last-index -1))
+    ;; Read prefilled transactions with differential index encoding
+    (dotimes (i prefilled-count)
+      (let* ((diff-index (read-compact-size stream))
+             (abs-index (+ last-index diff-index 1))
+             (tx (read-transaction stream)))
+        (push (make-prefilled-tx :index abs-index :transaction tx)
+              prefilled-txs)
+        (setf last-index abs-index)))
+    (make-compact-block :header header
+                        :nonce nonce
+                        :short-ids short-ids
+                        :prefilled-txs (nreverse prefilled-txs))))
+
+;;; Write compact block
+(defun write-compact-block (stream cb)
+  "Write a compact block to STREAM."
+  (write-block-header stream (compact-block-header cb))
+  (write-uint64-le stream (compact-block-nonce cb))
+  (write-compact-size stream (length (compact-block-short-ids cb)))
+  (dolist (sid (compact-block-short-ids cb))
+    (write-short-txid stream sid))
+  (let ((prefilled (compact-block-prefilled-txs cb)))
+    (write-compact-size stream (length prefilled))
+    (let ((last-index -1))
+      (dolist (ptx prefilled)
+        (let ((abs-index (prefilled-tx-index ptx)))
+          ;; Write differential index
+          (write-compact-size stream (- abs-index last-index 1))
+          (write-transaction stream (prefilled-tx-transaction ptx))
+          (setf last-index abs-index))))))
+
+;;; Parse cmpctblock payload
+(defun parse-cmpctblock-payload (payload)
+  "Parse a cmpctblock message payload into a compact-block."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (read-compact-block stream)))
+
+;;; Read block transactions request
+(defun read-block-txn-request (stream)
+  "Read a block transactions request (getblocktxn) from STREAM."
+  (let* ((block-hash (read-hash256 stream))
+         (count (read-compact-size stream))
+         (indexes '())
+         (last-index -1))
+    ;; Read differentially encoded indexes
+    (dotimes (i count)
+      (let* ((diff (read-compact-size stream))
+             (abs-index (+ last-index diff 1)))
+        (push abs-index indexes)
+        (setf last-index abs-index)))
+    (make-block-txn-request :block-hash block-hash
+                            :indexes (nreverse indexes))))
+
+;;; Write block transactions request
+(defun write-block-txn-request (stream req)
+  "Write a block transactions request to STREAM."
+  (write-hash256 stream (block-txn-request-block-hash req))
+  (let ((indexes (block-txn-request-indexes req)))
+    (write-compact-size stream (length indexes))
+    (let ((last-index -1))
+      (dolist (idx indexes)
+        (write-compact-size stream (- idx last-index 1))
+        (setf last-index idx)))))
+
+;;; Make getblocktxn message
+(defun make-getblocktxn-message (block-hash indexes)
+  "Create a getblocktxn message.
+   BLOCK-HASH is the 32-byte block hash.
+   INDEXES is a list of absolute transaction indexes to request."
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-block-txn-request
+                    stream
+                    (make-block-txn-request :block-hash block-hash
+                                            :indexes indexes)))))
+    (serialize-message "getblocktxn" payload)))
+
+;;; Parse getblocktxn payload
+(defun parse-getblocktxn-payload (payload)
+  "Parse a getblocktxn message payload."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (read-block-txn-request stream)))
+
+;;; Read block transactions response
+(defun read-block-txn-response (stream)
+  "Read a block transactions response (blocktxn) from STREAM."
+  (let* ((block-hash (read-hash256 stream))
+         (count (read-compact-size stream))
+         (txs (loop repeat count collect (read-transaction stream))))
+    (make-block-txn-response :block-hash block-hash
+                             :transactions txs)))
+
+;;; Write block transactions response
+(defun write-block-txn-response (stream resp)
+  "Write a block transactions response to STREAM."
+  (write-hash256 stream (block-txn-response-block-hash resp))
+  (let ((txs (block-txn-response-transactions resp)))
+    (write-compact-size stream (length txs))
+    (dolist (tx txs)
+      (write-transaction stream tx))))
+
+;;; Parse blocktxn payload
+(defun parse-blocktxn-payload (payload)
+  "Parse a blocktxn message payload."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (read-block-txn-response stream)))

@@ -337,6 +337,51 @@ By default, `start-node` connects to peers and begins syncing:
   (bitcoin-lisp::node-chain-state bitcoin-lisp:*node*))
 ```
 
+## Compact Block Relay (BIP 152)
+
+The node supports [BIP 152](https://github.com/bitcoin/bips/blob/master/bip-0152.mediawiki) Compact Block Relay for efficient block propagation. This significantly reduces bandwidth usage during normal block propagation by transmitting only short transaction identifiers instead of full transactions.
+
+### How It Works
+
+When a new block is announced, rather than downloading the entire block:
+
+1. The node receives a compact block containing block header + 6-byte short transaction IDs
+2. The node attempts to reconstruct the full block using transactions already in its mempool
+3. If any transactions are missing, it requests only those specific transactions
+4. On successful reconstruction, the block is validated normally
+
+### Automatic Negotiation
+
+Compact block support is negotiated automatically with peers after the protocol handshake. The node supports both version 1 (txid-based) and version 2 (wtxid-based for SegWit).
+
+### Monitoring
+
+You can check compact block statistics:
+
+```lisp
+;; Get compact block reconstruction metrics
+(bitcoin-lisp.networking:compact-block-stats)
+;; Returns: (:SUCCESSES n :FAILURES n :COLLISIONS n)
+```
+
+### Conditions for Use
+
+Compact blocks are used when:
+
+- The peer has negotiated compact block support (version 1 or 2)
+- The node is not in Initial Block Download (IBD) mode
+- The block being requested is recent (near chain tip)
+
+During IBD, the node uses traditional full block downloads for efficiency since mempool is empty.
+
+### Short ID Collisions
+
+In rare cases, two different transactions may have the same 6-byte short ID. When a collision is detected:
+
+1. The node requests the full block from the peer
+2. A collision counter is incremented (visible in stats)
+3. This is normal and handled transparently
+
 ## Running Tests
 
 ```lisp

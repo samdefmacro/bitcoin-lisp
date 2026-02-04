@@ -28,7 +28,21 @@
   (block-timeout-count 0 :type (unsigned-byte 8))
   (address "" :type string)
   ;; Misbehavior scoring
-  (misbehavior-score 0 :type (unsigned-byte 32)))
+  (misbehavior-score 0 :type (unsigned-byte 32))
+  ;; Compact block support (BIP 152)
+  (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
+  (compact-block-high-bandwidth nil :type boolean)    ; High-bandwidth mode enabled
+  (pending-compact-block nil))                        ; Pending reconstruction state
+
+;;; Pending compact block reconstruction state
+(defstruct pending-compact-block
+  "State for in-progress compact block reconstruction."
+  (block-hash nil)           ; Hash of block being reconstructed
+  (header nil)               ; Block header
+  (transactions nil)         ; Partial transaction array (with nils for missing)
+  (missing-indexes nil)      ; List of indexes still needed
+  (request-time 0)           ; When getblocktxn was sent (internal-real-time)
+  (use-wtxid nil))           ; Version 2 uses wtxid
 
 ;;; Network parameters
 
