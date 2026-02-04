@@ -69,7 +69,11 @@
   ;; Utility methods
   (register-rpc-method "estimatesmartfee" #'rpc-estimatesmartfee)
   (register-rpc-method "validateaddress" #'rpc-validateaddress)
-  (register-rpc-method "decodescript" #'rpc-decodescript))
+  (register-rpc-method "decodescript" #'rpc-decodescript)
+  ;; UTXO set statistics
+  (register-rpc-method "gettxoutsetinfo" #'rpc-gettxoutsetinfo)
+  ;; Block statistics
+  (register-rpc-method "getblockstats" #'rpc-getblockstats))
 
 ;;; --- JSON-RPC Request/Response Handling ---
 

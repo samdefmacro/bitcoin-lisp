@@ -39,3 +39,8 @@
   "Check if node is currently syncing."
   (bt:with-lock-held ((bitcoin-lisp::node-lock node))
     (bitcoin-lisp::node-syncing node)))
+
+(defun rpc-get-tx-index (node)
+  "Get tx-index with lock protection."
+  (bt:with-lock-held ((bitcoin-lisp::node-lock node))
+    (bitcoin-lisp::node-tx-index node)))

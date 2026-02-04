@@ -232,6 +232,17 @@ For legacy transactions without witness, wtxid equals txid."
     ;; No witness: wtxid = txid
     (t (transaction-hash tx))))
 
+(defun transaction-vsize (tx)
+  "Calculate the virtual size (vsize) of a transaction in vbytes.
+For SegWit transactions: vsize = (3 * base_size + total_size) / 4 (rounded up).
+For legacy transactions: vsize = total_size.
+This is the metric used for fee rate calculation."
+  (if (transaction-has-witness-p tx)
+      (let* ((base-size (length (serialize-transaction tx)))      ; Without witness
+             (total-size (length (serialize-witness-transaction tx)))) ; With witness
+        (ceiling (+ (* 3 base-size) total-size) 4))
+      (length (serialize-transaction tx))))
+
 ;;;; Block Header
 
 (defstruct block-header

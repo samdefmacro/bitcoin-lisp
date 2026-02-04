@@ -445,9 +445,11 @@ Used to restore UTXOs during chain reorganization.")
 
 ;;;; Block connection
 
-(defun connect-block (block chain-state block-store utxo-set)
+(defun connect-block (block chain-state block-store utxo-set &key tx-index fee-estimator)
   "Connect a validated block to the chain.
 Updates chain state and UTXO set.
+Optionally updates TX-INDEX if provided and enabled.
+Optionally updates FEE-ESTIMATOR with block fee statistics.
 Handles chain reorganizations when a competing chain has more work."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (hash (bitcoin-lisp.serialization:block-header-hash header))
@@ -490,13 +492,25 @@ Handles chain reorganizations when a competing chain has more work."
           ((equalp prev-hash current-best-hash)
            (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                utxo-set block new-height)))
-             (store-undo-data hash spent-utxos))
+             (store-undo-data hash spent-utxos)
+             ;; Record fee statistics for fee estimation
+             (when fee-estimator
+               (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
+                             block spent-utxos new-height)))
+                 (when stats
+                   (bitcoin-lisp.mempool:fee-estimator-add-stats fee-estimator stats)
+                   (bitcoin-lisp.mempool:maybe-flush-fee-stats fee-estimator)))))
+           ;; Update transaction index if enabled
+           (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
+             (bitcoin-lisp.storage:txindex-add-block tx-index block hash))
            (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height))
 
           ;; New chain has more work - reorganize
           ((> chain-work current-best-work)
            (perform-reorg chain-state block-store utxo-set
-                          current-best-entry entry))
+                          current-best-entry entry
+                          :tx-index tx-index
+                          :fee-estimator fee-estimator))
 
           ;; New block is on a weaker chain - just store it
           (t nil)))
@@ -535,9 +549,12 @@ Returns the common ancestor block-index-entry."
              (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
     (nreverse entries)))
 
-(defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry)
+(defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
+                      &key tx-index fee-estimator)
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
-Disconnects blocks back to the fork point, then connects blocks on the new chain."
+Disconnects blocks back to the fork point, then connects blocks on the new chain.
+Optionally updates TX-INDEX if provided and enabled.
+Optionally updates FEE-ESTIMATOR with block fee statistics."
   (let ((fork-entry (find-fork-point old-tip-entry new-tip-entry)))
     (unless fork-entry
       (return-from perform-reorg nil))
@@ -562,6 +579,9 @@ Disconnects blocks back to the fork point, then connects blocks on the new chain
               (let ((undo (get-undo-data block-hash)))
                 (bitcoin-lisp.storage:disconnect-block-from-utxo-set
                  utxo-set block (or undo '())))
+              ;; Remove from txindex during reorg disconnect
+              (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
+                (bitcoin-lisp.storage:txindex-remove-block tx-index block))
               (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid))))
 
         ;; Connect new chain blocks (fork to new tip)
@@ -573,6 +593,15 @@ Disconnects blocks back to the fork point, then connects blocks on the new chain
                      (spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                    utxo-set block height)))
                 (store-undo-data block-hash spent-utxos)
+                ;; Record fee statistics for fee estimation
+                (when fee-estimator
+                  (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
+                                block spent-utxos height)))
+                    (when stats
+                      (bitcoin-lisp.mempool:fee-estimator-add-stats fee-estimator stats))))
+                ;; Add to txindex during reorg connect
+                (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
+                  (bitcoin-lisp.storage:txindex-add-block tx-index block block-hash))
                 (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)))))
 
         ;; Update chain tip

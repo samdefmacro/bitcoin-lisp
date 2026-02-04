@@ -14,6 +14,7 @@
    #:rpc-get-peers
    #:rpc-get-mempool
    #:rpc-get-block-store
+   #:rpc-get-tx-index
 
    ;; Method registry
    #:register-rpc-method
