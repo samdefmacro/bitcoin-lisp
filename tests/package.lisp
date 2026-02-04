@@ -33,6 +33,10 @@
   :description "Tests for persistence, peer health, reorg operations"
   :in :bitcoin-lisp-tests)
 
+(def-suite :compact-block-tests
+  :description "Tests for Compact Block Relay (BIP 152)"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :integration-tests
   :description "Integration tests with testnet"
   :in :bitcoin-lisp-tests)

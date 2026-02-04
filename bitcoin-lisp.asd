@@ -97,6 +97,8 @@
                              ;; RPC tests
                              (:file "rpc-tests")
                              ;; Mainnet support tests
-                             (:file "mainnet-tests"))))
+                             (:file "mainnet-tests")
+                             ;; Compact block relay tests (BIP 152)
+                             (:file "compact-block-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
