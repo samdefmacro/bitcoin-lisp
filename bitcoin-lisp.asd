@@ -105,6 +105,8 @@
                              ;; Peer database tests
                              (:file "peerdb-tests")
                              ;; Compact block relay tests (BIP 152)
-                             (:file "compact-block-tests"))))
+                             (:file "compact-block-tests")
+                             ;; ADDRv2 tests (BIP 155)
+                             (:file "addrv2-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

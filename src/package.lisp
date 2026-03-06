@@ -179,6 +179,7 @@
    #:get-unix-time
    #:read-net-addr
    #:net-addr
+   #:make-net-addr
    #:net-addr-services
    #:net-addr-ip
    #:net-addr-port
@@ -210,7 +211,22 @@
    #:parse-getblocktxn-payload
    #:parse-blocktxn-payload
    #:read-compact-block
-   #:write-compact-block))
+   #:write-compact-block
+   ;; Addr message
+   #:make-addr-message
+   ;; ADDRv2 (BIP 155)
+   #:+addrv2-net-ipv4+
+   #:+addrv2-net-ipv6+
+   #:+addrv2-net-torv2+
+   #:+addrv2-net-torv3+
+   #:+addrv2-net-i2p+
+   #:+addrv2-net-cjdns+
+   #:*addrv2-addr-sizes*
+   #:read-net-addr-v2
+   #:write-net-addr-v2
+   #:make-sendaddrv2-message
+   #:make-addrv2-message
+   #:parse-addrv2-payload))
 
 (defpackage #:bitcoin-lisp.storage
   (:use #:cl)
@@ -483,6 +499,9 @@
    #:ipv4-to-mapped-ipv6
    #:ip-bytes-to-string
    #:string-to-ip-bytes
+   ;; ADDRv2 support (BIP 155)
+   #:peer-wants-addrv2
+   #:handle-addrv2
    ;; Misbehavior and banning
    #:record-misbehavior
    #:ban-peer

@@ -45,6 +45,10 @@
   :description "Tests for Compact Block Relay (BIP 152)"
   :in :bitcoin-lisp-tests)
 
+(def-suite :addrv2-tests
+  :description "Tests for ADDRv2 (BIP 155) support"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :integration-tests
   :description "Integration tests with testnet"
   :in :bitcoin-lisp-tests)

@@ -513,3 +513,138 @@ STOP-HASH is the hash to stop at (or zeros to get maximum blocks)."
   "Parse a blocktxn message payload."
   (flexi-streams:with-input-from-sequence (stream payload)
     (read-block-txn-response stream)))
+
+;;; Addr (v1) message building
+
+(defun make-addr-message (addrs-with-timestamps)
+  "Create a serialized addr (v1) message from ADDRS-WITH-TIMESTAMPS.
+Each entry is a list (net-addr timestamp)."
+  (let ((payload
+          (flexi-streams:with-output-to-sequence (stream)
+            (write-compact-size stream (length addrs-with-timestamps))
+            (dolist (entry addrs-with-timestamps)
+              (destructuring-bind (addr timestamp) entry
+                (write-net-addr stream addr :with-timestamp t :timestamp timestamp))))))
+    (serialize-message "addr" payload)))
+
+;;;; ============================================================
+;;;; ADDRv2 (BIP 155)
+;;;; ============================================================
+
+;;; Network ID constants
+(defconstant +addrv2-net-ipv4+  1)
+(defconstant +addrv2-net-ipv6+  2)
+(defconstant +addrv2-net-torv2+ 3)  ; deprecated
+(defconstant +addrv2-net-torv3+ 4)
+(defconstant +addrv2-net-i2p+   5)
+(defconstant +addrv2-net-cjdns+ 6)
+
+;;; Expected address sizes for each known network ID
+(defparameter *addrv2-addr-sizes*
+  (let ((ht (make-hash-table)))
+    (setf (gethash +addrv2-net-ipv4+  ht) 4)
+    (setf (gethash +addrv2-net-ipv6+  ht) 16)
+    (setf (gethash +addrv2-net-torv2+ ht) 10)
+    (setf (gethash +addrv2-net-torv3+ ht) 32)
+    (setf (gethash +addrv2-net-i2p+   ht) 32)
+    (setf (gethash +addrv2-net-cjdns+ ht) 16)
+    ht)
+  "Map of BIP 155 network ID to expected address byte length.")
+
+;;; Deserialization
+
+(defun read-net-addr-v2 (stream)
+  "Read a single addrv2 entry from STREAM.
+Returns (VALUES net-addr timestamp network-id) for IPv4/IPv6 entries with
+correct address length. Returns NIL for unknown networks, deprecated TorV2,
+or entries with mismatched address lengths (bytes are consumed but skipped)."
+  (let* ((timestamp (read-uint32-le stream))
+         (services (read-compact-size stream))
+         (network-id (read-uint8 stream))
+         (addr-len (read-compact-size stream)))
+    ;; Read address bytes regardless (to advance stream position)
+    (let ((addr-bytes (read-bytes stream addr-len))
+          (port-high (read-byte stream))
+          (port-low (read-byte stream))
+          (expected-len (gethash network-id *addrv2-addr-sizes*)))
+      ;; Skip if unknown network, wrong length, or deprecated TorV2
+      (when (or (null expected-len)
+                (/= addr-len expected-len)
+                (= network-id +addrv2-net-torv2+))
+        (return-from read-net-addr-v2 nil))
+      ;; Build net-addr with 16-byte IP for IPv4/IPv6
+      (let ((ip (cond
+                  ((= network-id +addrv2-net-ipv4+)
+                   ;; Convert 4-byte IPv4 to IPv4-mapped IPv6
+                   (let ((mapped (make-array 16 :element-type '(unsigned-byte 8)
+                                                :initial-element 0)))
+                     (setf (aref mapped 10) #xFF)
+                     (setf (aref mapped 11) #xFF)
+                     (replace mapped addr-bytes :start1 12)
+                     mapped))
+                  ((= network-id +addrv2-net-ipv6+)
+                   addr-bytes)
+                  (t
+                   ;; TorV3, I2P, CJDNS — valid parse but not storable in net-addr
+                   (return-from read-net-addr-v2 nil)))))
+        (values (make-net-addr :services services
+                               :ip ip
+                               :port (logior (ash port-high 8) port-low))
+                timestamp
+                network-id)))))
+
+;;; Serialization
+
+(defun write-net-addr-v2 (stream addr network-id timestamp)
+  "Write a single addrv2 entry to STREAM.
+ADDR is a net-addr, NETWORK-ID is the BIP 155 network type,
+TIMESTAMP is the uint32 last-seen time."
+  ;; Timestamp
+  (write-uint32-le stream timestamp)
+  ;; Services (compact-size)
+  (write-compact-size stream (net-addr-services addr))
+  ;; Network ID
+  (write-uint8 stream network-id)
+  ;; Address bytes (network-dependent)
+  (cond
+    ((= network-id +addrv2-net-ipv4+)
+     ;; Extract 4-byte IPv4 from IPv4-mapped IPv6
+     (write-compact-size stream 4)
+     (write-bytes stream (subseq (net-addr-ip addr) 12 16)))
+    ((= network-id +addrv2-net-ipv6+)
+     (write-compact-size stream 16)
+     (write-bytes stream (net-addr-ip addr)))
+    (t
+     (error "write-net-addr-v2: unsupported network ID ~D (only IPv4 and IPv6 are supported)" network-id)))
+  ;; Port (big-endian)
+  (write-byte (ash (net-addr-port addr) -8) stream)
+  (write-byte (logand (net-addr-port addr) #xFF) stream))
+
+(defun make-sendaddrv2-message ()
+  "Create a serialized sendaddrv2 message (empty payload)."
+  (serialize-message "sendaddrv2" #()))
+
+(defun make-addrv2-message (entries)
+  "Create a serialized addrv2 message from ENTRIES.
+Each entry is a list (net-addr network-id timestamp)."
+  (let ((payload
+          (flexi-streams:with-output-to-sequence (stream)
+            (write-compact-size stream (length entries))
+            (dolist (entry entries)
+              (destructuring-bind (addr network-id timestamp) entry
+                (write-net-addr-v2 stream addr network-id timestamp))))))
+    (serialize-message "addrv2" payload)))
+
+(defun parse-addrv2-payload (payload)
+  "Parse an addrv2 message payload.
+Returns a list of (VALUES net-addr timestamp network-id) for valid IPv4/IPv6 entries.
+Skips unknown or unsupported network types."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (let ((count (read-compact-size stream))
+          (results '()))
+      (loop repeat (min count 1000)
+            do (multiple-value-bind (addr timestamp network-id)
+                   (read-net-addr-v2 stream)
+                 (when addr
+                   (push (list addr timestamp network-id) results))))
+      (nreverse results))))
