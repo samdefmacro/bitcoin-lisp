@@ -137,6 +137,10 @@
    #:*network-magic*
    #:+testnet-magic+
    #:+mainnet-magic+
+   ;; Service bit constants
+   #:+node-network+
+   #:+node-witness+
+   #:+node-network-limited+
    ;; Version message
    #:version-message
    #:make-version-message-bytes
@@ -174,6 +178,10 @@
    #:coinbase-input-p
    #:get-unix-time
    #:read-net-addr
+   #:net-addr
+   #:net-addr-services
+   #:net-addr-ip
+   #:net-addr-port
    #:read-hash256
    #:write-hash256
    ;; Compact block (BIP 152)
@@ -214,6 +222,11 @@
    #:store-block
    #:get-block
    #:block-exists-p
+   ;; Block pruning
+   #:prune-block
+   #:block-storage-size-mib
+   #:prune-old-blocks
+   #:prune-blocks-to-height
    ;; UTXO set
    #:utxo-set
    #:make-utxo-set
@@ -255,6 +268,7 @@
    #:calculate-chain-work
    #:save-state
    #:load-state
+   #:chain-state-pruned-height
    ;; UTXO persistence
    #:save-utxo-set
    #:load-utxo-set
@@ -445,6 +459,30 @@
    #:peer-address
    #:+max-ping-failures+
    #:+max-block-timeouts+
+   ;; Peer database (peer-address struct shares symbol with peer accessor above)
+   #:make-peer-address
+   #:peer-address-ip
+   #:peer-address-port
+   #:peer-address-services
+   #:peer-address-last-seen
+   #:peer-address-last-attempt
+   #:peer-address-successes
+   #:peer-address-failures
+   #:address-book
+   #:make-address-book
+   #:address-book-add
+   #:address-book-lookup
+   #:address-book-count
+   #:address-book-sorted-peers
+   #:address-book-record-success
+   #:address-book-record-failure
+   #:compute-peer-score
+   #:save-address-book
+   #:load-address-book
+   #:peers-dat-path
+   #:ipv4-to-mapped-ipv6
+   #:ip-bytes-to-string
+   #:string-to-ip-bytes
    ;; Misbehavior and banning
    #:record-misbehavior
    #:ban-peer
@@ -486,6 +524,12 @@
    #:network-dns-seeds
    #:network-rpc-port
    #:*mainnet-relay-enabled*
+   ;; Pruning
+   #:*prune-target-mib*
+   #:*prune-after-height*
+   #:+min-blocks-to-keep+
+   #:pruning-enabled-p
+   #:automatic-pruning-p
    ;; Node
    #:node
    #:*node*

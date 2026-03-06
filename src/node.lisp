@@ -52,6 +52,7 @@
   (mempool nil)
   (tx-index nil)  ; Transaction index (optional, for getrawtransaction)
   (fee-estimator nil)  ; Fee rate estimator for estimatesmartfee
+  (address-book nil)  ; Persistent peer address database
   (peers '() :type list)
   (running nil :type boolean)
   (log-level :info :type keyword)
@@ -172,6 +173,7 @@ For testnet, data stays at the base directory (backward compatible)."
                         (max-peers 8)
                         (sync t)
                         (txindex nil)
+                        (prune nil)
                         (rpc-port nil)
                         (rpc-bind "127.0.0.1")
                         (rpc-user nil)
@@ -184,6 +186,7 @@ LOG-LEVEL: :debug, :info, :warn, or :error
 MAX-PEERS: Maximum number of peer connections
 SYNC: If T, start syncing immediately
 TXINDEX: If T, enable transaction index for getrawtransaction lookups
+PRUNE: Block pruning target in MiB (nil=off, 1=manual-only, >=550=automatic)
 RPC-PORT: Port for RPC server (nil = no RPC, default 18332 testnet / 8332 mainnet)
 RPC-BIND: Address to bind RPC server (default 127.0.0.1)
 RPC-USER: RPC authentication username (nil = no auth)
@@ -194,6 +197,14 @@ Returns the node instance."
     (log-warn "Node already running, stopping first")
     (stop-node))
 
+  ;; Validate and set pruning configuration
+  (setf *prune-target-mib* prune)
+  (when prune
+    (unless (or (= prune 1) (>= prune 550))
+      (error "Invalid prune target: ~A MiB. Must be 1 (manual-only) or >= 550." prune))
+    (when (and prune txindex)
+      (error "Cannot enable both pruning and txindex. Pruned blocks cannot be looked up.")))
+
   ;; Initialize node
   (setf *node* (init-node data-directory :network network :log-level log-level))
   (setf (node-max-peers *node*) max-peers)
@@ -201,6 +212,15 @@ Returns the node instance."
   (log-info "Bitcoin-Lisp Node v0.1.0")
   (log-info "Network: ~A" network)
   (log-info "Data directory: ~A" (node-data-directory *node*))
+
+  ;; Set prune-after-height for this network
+  (setf *prune-after-height* (prune-after-height network))
+
+  ;; Log pruning status
+  (when (pruning-enabled-p)
+    (if (automatic-pruning-p)
+        (log-info "Block pruning: AUTOMATIC (target ~D MiB)" *prune-target-mib*)
+        (log-info "Block pruning: MANUAL-ONLY (via pruneblockchain RPC)")))
 
   ;; Mainnet warnings
   (when (eq network :mainnet)
@@ -267,6 +287,14 @@ Returns the node instance."
          :data-directory (node-data-directory *node*)))
   ;; Load persisted fee stats
   (bitcoin-lisp.mempool:load-fee-stats (node-fee-estimator *node*))
+
+  ;; Initialize peer address book
+  (log-info "Loading peer address book...")
+  (setf (node-address-book *node*) (bitcoin-lisp.networking:make-address-book))
+  (let ((peers-path (bitcoin-lisp.networking:peers-dat-path (node-data-directory *node*))))
+    (when (bitcoin-lisp.networking:load-address-book (node-address-book *node*) peers-path)
+      (log-info "Loaded peer address book: ~D entries"
+                (bitcoin-lisp.networking:address-book-count (node-address-book *node*)))))
 
   ;; Initialize transaction index (optional)
   (when txindex
@@ -371,6 +399,13 @@ Returns the node instance."
   (when (node-chain-state *node*)
     (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
 
+  ;; Save peer address book
+  (when (node-address-book *node*)
+    (log-info "Saving peer address book...")
+    (bitcoin-lisp.networking:save-address-book
+     (node-address-book *node*)
+     (bitcoin-lisp.networking:peers-dat-path (node-data-directory *node*))))
+
   ;; Close transaction index
   (when (node-tx-index *node*)
     (log-info "Closing transaction index...")
@@ -388,16 +423,36 @@ Returns the node instance."
 
 (defun connect-to-peers (node max-peers &key (timeout 60) (min-peers 1))
   "Connect to Bitcoin network peers.
+Uses address book for warm starts, falls back to DNS seeds.
 MAX-PEERS: Target number of peers to connect
 TIMEOUT: Maximum seconds to spend connecting (default 60)
 MIN-PEERS: Return early once we have at least this many peers (default 1)
 Returns the number of peers connected."
-  (log-info "Discovering peers from DNS seeds...")
-  (let ((addresses (bitcoin-lisp.networking:discover-peers)))
-    (log-info "Found ~D potential peers" (length addresses))
+  (let ((address-book (node-address-book node))
+        (addresses '()))
+    ;; Warm start: prefer address book peers sorted by score
+    (when (and address-book
+               (>= (bitcoin-lisp.networking:address-book-count address-book) 8))
+      (log-info "Using peer address book (~D entries)..."
+                (bitcoin-lisp.networking:address-book-count address-book))
+      (let ((sorted (bitcoin-lisp.networking:address-book-sorted-peers address-book)))
+        (setf addresses
+              (mapcar (lambda (pa)
+                        (bitcoin-lisp.networking:ip-bytes-to-string
+                         (bitcoin-lisp.networking:peer-address-ip pa)))
+                      sorted))))
+    ;; Fall back to DNS seeds if not enough candidates
+    (when (< (length addresses) 8)
+      (log-info "Discovering peers from DNS seeds...")
+      (let ((dns-addrs (bitcoin-lisp.networking:discover-peers)))
+        (log-info "Found ~D potential peers from DNS" (length dns-addrs))
+        (setf addresses (append addresses dns-addrs))
+        (setf addresses (remove-duplicates addresses :test #'string=))))
+
+    (log-info "~D candidate peers available" (length addresses))
 
     ;; Store discovered addresses for reconnection
-    (setf (node-known-addresses node) (alexandria:shuffle (copy-list addresses)))
+    (setf (node-known-addresses node) addresses)
 
     (let ((connected 0)
           (start-time (get-internal-real-time))
@@ -426,6 +481,22 @@ Returns the number of peers connected."
                             addr
                             (bitcoin-lisp.networking:peer-user-agent peer)
                             (bitcoin-lisp.networking:peer-start-height peer))
+                  ;; Record success in address book (add if not present)
+                  (when address-book
+                    (let ((ip-bytes (bitcoin-lisp.networking:string-to-ip-bytes addr))
+                          (peer-port (network-port (node-network node))))
+                      (when ip-bytes
+                        (unless (bitcoin-lisp.networking:address-book-lookup
+                                 address-book ip-bytes peer-port)
+                          (bitcoin-lisp.networking:address-book-add
+                           address-book
+                           (bitcoin-lisp.networking:make-peer-address
+                            :ip ip-bytes
+                            :port peer-port
+                            :services (bitcoin-lisp.networking:peer-services peer)
+                            :last-seen (bitcoin-lisp.serialization:get-unix-time))))
+                        (bitcoin-lisp.networking:address-book-record-success
+                         address-book ip-bytes peer-port))))
                   ;; Send compact block negotiation (BIP 152)
                   (bitcoin-lisp.networking:send-compact-block-negotiation peer)
                   (push peer (node-peers node))
@@ -433,7 +504,22 @@ Returns the number of peers connected."
                 (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
                   (bitcoin-lisp.networking:disconnect-peer peer))))
           (error (c)
-            (log-debug "Failed to connect to ~A: ~A" addr c))))
+            (log-debug "Failed to connect to ~A: ~A" addr c)
+            ;; Record failure in address book (add if not present)
+            (when address-book
+              (let ((ip-bytes (bitcoin-lisp.networking:string-to-ip-bytes addr))
+                    (peer-port (network-port (node-network node))))
+                (when ip-bytes
+                  (unless (bitcoin-lisp.networking:address-book-lookup
+                           address-book ip-bytes peer-port)
+                    (bitcoin-lisp.networking:address-book-add
+                     address-book
+                     (bitcoin-lisp.networking:make-peer-address
+                      :ip ip-bytes
+                      :port peer-port
+                      :last-seen (bitcoin-lisp.serialization:get-unix-time))))
+                  (bitcoin-lisp.networking:address-book-record-failure
+                   address-book ip-bytes peer-port)))))))
 
       (log-info "Connected to ~D peer~:P" connected)
       connected)))

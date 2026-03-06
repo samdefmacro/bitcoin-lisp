@@ -27,6 +27,7 @@
                 :components
                 ((:file "package")
                  (:file "logging")
+                 (:file "config")
                  (:module "coalton"
                   :components ((:file "package")
                                (:file "types")
@@ -58,6 +59,7 @@
                  (:module "networking"
                   :components ((:file "connection")
                                (:file "peer")
+                               (:file "peerdb")
                                (:file "protocol")
                                (:file "ibd")))
                  (:module "rpc"
@@ -98,6 +100,10 @@
                              (:file "rpc-tests")
                              ;; Mainnet support tests
                              (:file "mainnet-tests")
+                             ;; Pruning tests
+                             (:file "pruning-tests")
+                             ;; Peer database tests
+                             (:file "peerdb-tests")
                              ;; Compact block relay tests (BIP 152)
                              (:file "compact-block-tests"))))
   :perform (test-op (op c)
