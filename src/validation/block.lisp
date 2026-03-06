@@ -509,7 +509,12 @@ Handles chain reorganizations when a competing chain has more work."
            ;; Update transaction index if enabled
            (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
              (bitcoin-lisp.storage:txindex-add-block tx-index block hash))
-           (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height))
+           (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height)
+           ;; Automatic block pruning after connecting a new block
+           (when (bitcoin-lisp:automatic-pruning-p)
+             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks block-store chain-state)))
+               (when (> pruned 0)
+                 (bitcoin-lisp:log-info "Pruned ~D old block~:P" pruned)))))
 
           ;; New chain has more work - reorganize
           ((> chain-work current-best-work)
@@ -568,6 +573,15 @@ Optionally updates FEE-ESTIMATOR with block fee statistics."
     (let ((old-height (bitcoin-lisp.storage:block-index-entry-height old-tip-entry))
           (new-height (bitcoin-lisp.storage:block-index-entry-height new-tip-entry))
           (fork-height (bitcoin-lisp.storage:block-index-entry-height fork-entry)))
+
+      ;; Check if reorg requires blocks that have been pruned
+      (when (bitcoin-lisp:pruning-enabled-p)
+        (let ((pruned-height (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+          (when (< fork-height pruned-height)
+            (bitcoin-lisp:log-error
+             "REORG IMPOSSIBLE: fork point ~D is below pruned height ~D. Node must re-sync."
+             fork-height pruned-height)
+            (return-from perform-reorg nil))))
 
       (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
                              old-height fork-height new-height)

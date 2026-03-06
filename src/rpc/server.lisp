@@ -73,7 +73,9 @@
   ;; UTXO set statistics
   (register-rpc-method "gettxoutsetinfo" #'rpc-gettxoutsetinfo)
   ;; Block statistics
-  (register-rpc-method "getblockstats" #'rpc-getblockstats))
+  (register-rpc-method "getblockstats" #'rpc-getblockstats)
+  ;; Pruning
+  (register-rpc-method "pruneblockchain" #'rpc-pruneblockchain))
 
 ;;; --- JSON-RPC Request/Response Handling ---
 

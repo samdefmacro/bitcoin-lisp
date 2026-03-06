@@ -77,3 +77,87 @@ Returns the bitcoin-block structure, or NIL if not found."
                  (hash (bitcoin-lisp.crypto:hex-to-bytes name)))
             (setf (gethash hash (block-store-index store)) file)))))
     store))
+
+;;; Block Pruning
+
+(defun prune-block (store hash)
+  "Delete a block file from disk by HASH.
+Returns the size in bytes of the deleted file, or NIL if the file didn't exist."
+  (let ((path (block-file-path store hash)))
+    (when (probe-file path)
+      (let ((size (with-open-file (s path :direction :input
+                                         :element-type '(unsigned-byte 8))
+                    (file-length s))))
+        (delete-file path)
+        (remhash hash (block-store-index store))
+        size))))
+
+(defun block-storage-size-mib (store)
+  "Calculate the total size of all block files in MiB."
+  (let ((total-bytes 0)
+        (blocks-dir (merge-pathnames "blocks/" (block-store-base-path store))))
+    (when (probe-file blocks-dir)
+      (dolist (file (directory (merge-pathnames "*.blk" blocks-dir)))
+        (let ((size (with-open-file (s file :direction :input
+                                           :element-type '(unsigned-byte 8))
+                      (file-length s))))
+          (incf total-bytes size))))
+    (/ total-bytes 1048576.0)))  ; 1024 * 1024
+
+(defun prune-old-blocks (store chain-state)
+  "Prune old blocks when storage exceeds target.
+Deletes oldest block files until storage is at or below *prune-target-mib*,
+respecting +min-blocks-to-keep+ and *prune-after-height*.
+Only runs in automatic pruning mode.
+Returns the number of blocks pruned."
+  (unless (bitcoin-lisp:automatic-pruning-p)
+    (return-from prune-old-blocks 0))
+  (let ((current-height (chain-state-best-height chain-state))
+        (prune-after (or bitcoin-lisp:*prune-after-height* 0)))
+    ;; Don't prune until chain reaches prune-after-height
+    (when (< current-height prune-after)
+      (return-from prune-old-blocks 0))
+    ;; Check if we exceed the target (scan once, then track via running total)
+    (let ((current-size (block-storage-size-mib store))
+          (target bitcoin-lisp:*prune-target-mib*))
+      (when (<= current-size target)
+        (return-from prune-old-blocks 0))
+      ;; Calculate the lowest height we're allowed to prune to
+      (let* ((min-keep-height (max 0 (- current-height bitcoin-lisp:+min-blocks-to-keep+)))
+             (pruned-height (chain-state-pruned-height chain-state))
+             (pruned 0))
+        ;; Walk from pruned-height+1 upward, deleting blocks
+        ;; Use running total to avoid rescanning all files each iteration
+        (loop for height from (1+ pruned-height) to min-keep-height
+              while (> current-size target)
+              do (let ((entry (get-block-at-height chain-state height)))
+                   (when entry
+                     (let* ((hash (block-index-entry-hash entry))
+                            (deleted-bytes (prune-block store hash)))
+                       (when deleted-bytes
+                         (decf current-size (/ deleted-bytes 1048576.0))
+                         (incf pruned)
+                         (setf (chain-state-pruned-height chain-state) height))))))
+        pruned))))
+
+(defun prune-blocks-to-height (store chain-state target-height)
+  "Prune all block files below TARGET-HEIGHT.
+Respects +min-blocks-to-keep+ retention.
+Returns the number of blocks pruned."
+  (unless (bitcoin-lisp:pruning-enabled-p)
+    (return-from prune-blocks-to-height 0))
+  (let* ((current-height (chain-state-best-height chain-state))
+         (max-prune-height (max 0 (- current-height bitcoin-lisp:+min-blocks-to-keep+)))
+         (effective-target (min target-height max-prune-height))
+         (pruned-height (chain-state-pruned-height chain-state))
+         (pruned 0))
+    (when (<= effective-target pruned-height)
+      (return-from prune-blocks-to-height 0))
+    (loop for height from (1+ pruned-height) below effective-target
+          do (let ((entry (get-block-at-height chain-state height)))
+               (when entry
+                 (let ((hash (block-index-entry-hash entry)))
+                   (when (prune-block store hash)
+                     (incf pruned)
+                     (setf (chain-state-pruned-height chain-state) height))))))
+    pruned))
