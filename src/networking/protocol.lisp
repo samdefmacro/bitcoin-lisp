@@ -82,6 +82,14 @@ Returns T if message was handled, NIL otherwise."
      (handle-addr peer payload address-book)
      t)
 
+    ((string= command "addrv2")
+     (handle-addrv2 peer payload address-book)
+     t)
+
+    ((string= command "sendaddrv2")
+     ;; No-op post-handshake (only meaningful during handshake)
+     t)
+
     ;; Compact block messages (BIP 152)
     ((string= command "sendcmpct")
      (handle-sendcmpct peer payload)
@@ -225,6 +233,34 @@ addresses (timestamp within last 3 hours) to the address book."
                      (incf added))))))
     (when (and address-book (> added 0))
       (bitcoin-lisp:log-debug "Added ~D peer addresses from addr message" added))
+    added))
+
+;;; ADDRv2 handling (BIP 155)
+
+(defun handle-addrv2 (peer payload &optional address-book)
+  "Handle an addrv2 message (BIP 155). When ADDRESS-BOOK is provided, add
+IPv4/IPv6 addresses with plausible timestamps (within 3 hours) to the address book.
+Other network types are silently skipped."
+  (declare (ignore peer))
+  (let ((now (bitcoin-lisp.serialization:get-unix-time))
+        (three-hours (* 3 3600))
+        (added 0)
+        (entries (bitcoin-lisp.serialization:parse-addrv2-payload payload)))
+    (dolist (entry entries)
+      (destructuring-bind (net-addr timestamp network-id) entry
+        (declare (ignore network-id))
+        (when (and address-book
+                   (<= (abs (- now timestamp)) three-hours))
+          (address-book-add
+           address-book
+           (make-peer-address
+            :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
+            :port (bitcoin-lisp.serialization:net-addr-port net-addr)
+            :services (bitcoin-lisp.serialization:net-addr-services net-addr)
+            :last-seen timestamp))
+          (incf added))))
+    (when (and address-book (> added 0))
+      (bitcoin-lisp:log-debug "Added ~D peer addresses from addrv2 message" added))
     added))
 
 ;;; Transaction handling

@@ -32,7 +32,9 @@
   ;; Compact block support (BIP 152)
   (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
   (compact-block-high-bandwidth nil :type boolean)    ; High-bandwidth mode enabled
-  (pending-compact-block nil))                        ; Pending reconstruction state
+  (pending-compact-block nil)                         ; Pending reconstruction state
+  ;; ADDRv2 support (BIP 155)
+  (wants-addrv2 nil :type boolean))                   ; Peer sent sendaddrv2
 
 ;;; Pending compact block reconstruction state
 (defstruct pending-compact-block
@@ -148,6 +150,9 @@ Returns T on success, NIL on failure."
     (unless (send-message peer version-msg)
       (return-from perform-handshake nil)))
 
+  ;; Send sendaddrv2 (BIP 155) — must be after VERSION, before VERACK
+  (send-message peer (bitcoin-lisp.serialization:make-sendaddrv2-message))
+
   ;; Receive version message
   (multiple-value-bind (command payload)
       (receive-message peer :timeout 30)
@@ -178,7 +183,10 @@ Returns T on success, NIL on failure."
              (when (string= command "verack")
                (setf (peer-state peer) :ready)
                (return-from perform-handshake t))
-             ;; Ignore other handshake-phase messages (wtxidrelay, sendaddrv2, etc.)
+             ;; BIP 155: Track peer's addrv2 capability
+             (when (string= command "sendaddrv2")
+               (setf (peer-wants-addrv2 peer) t))
+             ;; Ignore other handshake-phase messages (wtxidrelay, etc.)
              ))
 
   nil)  ; Didn't receive verack
