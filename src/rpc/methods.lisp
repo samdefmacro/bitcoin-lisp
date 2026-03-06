@@ -37,16 +37,30 @@
          (height (bitcoin-lisp.storage:current-height chain-state))
          (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
          (network (rpc-get-network node))
-         (syncing (rpc-is-syncing node)))
-    `(("chain" . ,(case network
-                    (:testnet "test")
-                    (:mainnet "main")
-                    (t "unknown")))
-      ("blocks" . ,height)
-      ("headers" . ,height)
-      ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
-      ("initialblockdownload" . ,syncing)
-      ("verificationprogress" . ,(if syncing 0.0 1.0)))))
+         (syncing (rpc-is-syncing node))
+         (result `(("chain" . ,(case network
+                                 (:testnet "test")
+                                 (:mainnet "main")
+                                 (t "unknown")))
+                   ("blocks" . ,height)
+                   ("headers" . ,height)
+                   ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
+                   ("initialblockdownload" . ,syncing)
+                   ("verificationprogress" . ,(if syncing 0.0 1.0))
+                   ("pruned" . ,(bitcoin-lisp:pruning-enabled-p)))))
+    ;; Add pruning-specific fields when pruning is enabled
+    (when (bitcoin-lisp:pruning-enabled-p)
+      (let ((pruned-height (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+        (setf result
+              (append result
+                      ;; pruneheight = first UNpruned block (Bitcoin Core convention).
+                      ;; Note: pruneblockchain RPC returns pruned-height (last pruned).
+                      `(("pruneheight" . ,(1+ pruned-height))
+                        ("automatic_pruning" . ,(bitcoin-lisp:automatic-pruning-p))
+                        ("prune_target_size" . ,(if (bitcoin-lisp:automatic-pruning-p)
+                                                    (* bitcoin-lisp:*prune-target-mib* 1048576)
+                                                    0)))))))
+    result))
 
 (defun rpc-getbestblockhash (node params)
   "Return the hash of the best (tip) block."
@@ -741,3 +755,26 @@ Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
     (if (>= halvings 64)
         0
         (ash initial-subsidy (- halvings)))))
+
+;;; --- Pruning Methods ---
+
+(defun rpc-pruneblockchain (node params)
+  "Prune the blockchain up to a given block height.
+PARAMS: [height]
+Returns the height of the last pruned block."
+  (unless (bitcoin-lisp:pruning-enabled-p)
+    (error 'rpc-error :code +rpc-misc-error+
+                      :message "Cannot prune: pruning is not enabled. Start with :prune 1 or :prune 550+"))
+  (let ((target-height (first params)))
+    (unless (and (integerp target-height) (>= target-height 0))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Invalid height parameter"))
+    (let* ((chain-state (rpc-get-chain-state node))
+           (block-store (rpc-get-block-store node))
+           (pruned (bitcoin-lisp.storage:prune-blocks-to-height
+                    block-store chain-state target-height)))
+      (bitcoin-lisp::node-log :info "RPC pruneblockchain: pruned ~D blocks to height ~D"
+                              pruned target-height)
+      ;; Return the last pruned block height (matching Bitcoin Core).
+      ;; Note: getblockchaininfo.pruneheight returns (1+ this) = first UNpruned block.
+      (bitcoin-lisp.storage:chain-state-pruned-height chain-state))))

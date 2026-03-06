@@ -133,7 +133,14 @@ Returns T on success, NIL on failure."
   (setf (peer-state peer) :handshaking)
 
   ;; Send version message
-  (let* ((version-payload (bitcoin-lisp.serialization:make-version-message-bytes
+  ;; BIP 159: Advertise NODE_NETWORK_LIMITED instead of NODE_NETWORK when pruning
+  (let* ((services (if (bitcoin-lisp:pruning-enabled-p)
+                       (logior bitcoin-lisp.serialization:+node-network-limited+
+                               bitcoin-lisp.serialization:+node-witness+)
+                       (logior bitcoin-lisp.serialization:+node-network+
+                               bitcoin-lisp.serialization:+node-witness+)))
+         (version-payload (bitcoin-lisp.serialization:make-version-message-bytes
+                           :services services
                            :start-height 0
                            :timestamp (bitcoin-lisp.serialization:get-unix-time)))
          (version-msg (bitcoin-lisp.serialization:serialize-message

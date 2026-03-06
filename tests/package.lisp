@@ -33,6 +33,14 @@
   :description "Tests for persistence, peer health, reorg operations"
   :in :bitcoin-lisp-tests)
 
+(def-suite :pruning-tests
+  :description "Tests for block pruning"
+  :in :bitcoin-lisp-tests)
+
+(def-suite :peerdb-tests
+  :description "Tests for persistent peer database"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :compact-block-tests
   :description "Tests for Compact Block Relay (BIP 152)"
   :in :bitcoin-lisp-tests)

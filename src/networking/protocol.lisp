@@ -38,10 +38,11 @@ Returns a list of IP address strings."
 ;;; Message handling
 
 (defun handle-message (peer command payload chain-state utxo-set block-store
-                       &key mempool peers fee-estimator)
+                       &key mempool peers fee-estimator address-book)
   "Handle an incoming message from a peer.
 MEMPOOL and PEERS are optional; when provided, transaction relay is enabled.
 FEE-ESTIMATOR is optional; when provided, fee stats are recorded for blocks.
+ADDRESS-BOOK is optional; when provided, addr messages update the peer database.
 Returns T if message was handled, NIL otherwise."
   (cond
     ((string= command "ping")
@@ -78,7 +79,7 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "addr")
-     (handle-addr peer payload)
+     (handle-addr peer payload address-book)
      t)
 
     ;; Compact block messages (BIP 152)
@@ -200,15 +201,31 @@ Returns T if message was handled, NIL otherwise."
 
 ;;; Address handling
 
-(defun handle-addr (peer payload)
-  "Handle an addr message."
+(defun handle-addr (peer payload &optional address-book)
+  "Handle an addr message. When ADDRESS-BOOK is provided, add plausible
+addresses (timestamp within last 3 hours) to the address book."
   (declare (ignore peer))
-  ;; Parse addresses (simplified)
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((count (bitcoin-lisp.serialization:read-compact-size stream)))
-      (loop repeat (min count 1000)  ; Limit to prevent abuse
-            collect (bitcoin-lisp.serialization:read-net-addr stream
-                                                              :with-timestamp t)))))
+  (let ((now (bitcoin-lisp.serialization:get-unix-time))
+        (three-hours (* 3 3600))
+        (added 0))
+    (flexi-streams:with-input-from-sequence (stream payload)
+      (let ((count (bitcoin-lisp.serialization:read-compact-size stream)))
+        (loop repeat (min count 1000)  ; Limit to prevent abuse
+              do (multiple-value-bind (net-addr timestamp)
+                     (bitcoin-lisp.serialization:read-net-addr stream :with-timestamp t)
+                   (when (and address-book timestamp
+                              (<= (abs (- now timestamp)) three-hours))
+                     (address-book-add
+                      address-book
+                      (make-peer-address
+                       :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
+                       :port (bitcoin-lisp.serialization:net-addr-port net-addr)
+                       :services (bitcoin-lisp.serialization:net-addr-services net-addr)
+                       :last-seen timestamp))
+                     (incf added))))))
+    (when (and address-book (> added 0))
+      (bitcoin-lisp:log-debug "Added ~D peer addresses from addr message" added))
+    added))
 
 ;;; Transaction handling
 

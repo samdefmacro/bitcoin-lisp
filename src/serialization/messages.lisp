@@ -93,16 +93,20 @@
 
 (defun read-net-addr (stream &key with-timestamp)
   "Read a network address from STREAM.
-If WITH-TIMESTAMP is true, read a 4-byte timestamp first (for addr messages)."
-  (when with-timestamp
-    (read-uint32-le stream))  ; timestamp, ignored for now
-  (let ((services (read-uint64-le stream))
-        (ip (read-bytes stream 16))
-        (port-high (read-byte stream))
-        (port-low (read-byte stream)))
-    (make-net-addr :services services
-                   :ip ip
-                   :port (logior (ash port-high 8) port-low))))
+If WITH-TIMESTAMP is true, read a 4-byte timestamp first (for addr messages).
+Returns (VALUES net-addr timestamp) when WITH-TIMESTAMP, otherwise just net-addr."
+  (let ((timestamp (when with-timestamp
+                     (read-uint32-le stream))))
+    (let ((services (read-uint64-le stream))
+          (ip (read-bytes stream 16))
+          (port-high (read-byte stream))
+          (port-low (read-byte stream)))
+      (let ((addr (make-net-addr :services services
+                                 :ip ip
+                                 :port (logior (ash port-high 8) port-low))))
+        (if with-timestamp
+            (values addr timestamp)
+            addr)))))
 
 (defun write-net-addr (stream addr &key with-timestamp timestamp)
   "Write a network address to STREAM."
@@ -123,6 +127,7 @@ If WITH-TIMESTAMP is true, read a 4-byte timestamp first (for addr messages)."
 (defconstant +protocol-version+ 70016)
 (defconstant +node-network+ 1)
 (defconstant +node-witness+ (ash 1 3))
+(defconstant +node-network-limited+ (ash 1 10))  ; BIP 159: pruned node
 
 (defstruct version-message
   "Version message payload."
