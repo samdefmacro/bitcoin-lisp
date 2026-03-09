@@ -299,7 +299,7 @@
 (defun load-script-tests ()
   "Load script_tests.json and return parsed test cases."
   (let ((path (merge-pathnames
-               "bitcoin/src/test/data/script_tests.json"
+               "refs/bitcoin/src/test/data/script_tests.json"
                (asdf:system-source-directory :bitcoin-lisp))))
     (with-open-file (stream path :direction :input)
       (yason:parse stream))))

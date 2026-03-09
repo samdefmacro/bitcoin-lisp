@@ -156,14 +156,14 @@ The system SHALL provide a test infrastructure for validating Coalton-typed code
 
 ### Requirement: Coalton Dependency Management
 
-The system SHALL use a git submodule for Coalton to ensure reproducible builds.
+The system SHALL use a local Coalton checkout in `refs/coalton/` for builds.
 
-#### Scenario: Coalton loads from local submodule
+#### Scenario: Coalton loads from local checkout
 - **WHEN** loading the `bitcoin-lisp` system
-- **THEN** Coalton SHALL be loaded from the `coalton/` submodule
+- **THEN** Coalton SHALL be loaded from `refs/coalton/` if present
 - **AND** no external Quicklisp fetch SHALL be required
 
-#### Scenario: Submodule version is pinned
-- **WHEN** cloning the repository with `--recurse-submodules`
-- **THEN** the exact Coalton version used SHALL be reproducible
+#### Scenario: Reference setup
+- **WHEN** cloning the repository
+- **THEN** the user SHALL clone Coalton into `refs/coalton/`
 

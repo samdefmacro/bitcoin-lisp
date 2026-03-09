@@ -9,7 +9,7 @@ A Bitcoin full node implementation in Common Lisp (SBCL).
 1. **SBCL** (Steel Bank Common Lisp) installed
 2. **Quicklisp** for package management
 3. **libsecp256k1** system library for ECDSA operations
-4. **Coalton** (included as git submodule) for static type support
+4. **Coalton** for static type support (see below)
 
 ```bash
 # On macOS
@@ -19,10 +19,13 @@ brew install secp256k1
 # On Ubuntu/Debian (see detailed instructions below)
 sudo apt-get install sbcl libsecp256k1-dev
 
-# Clone with submodules to get Coalton
-git clone --recurse-submodules <repository-url>
-# Or if already cloned:
-git submodule update --init --recursive
+# Clone the repository
+git clone <repository-url>
+
+# Set up reference repos (for Coalton dependency and Bitcoin Core test vectors)
+cd bitcoin-lisp
+git clone https://github.com/coalton-lang/coalton.git refs/coalton
+git clone --depth 1 https://github.com/bitcoin/bitcoin.git refs/bitcoin
 ```
 
 ## Ubuntu/Linux Setup

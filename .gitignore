@@ -39,6 +39,9 @@ blocks/
 \#*\#
 .\#*
 
+# Reference repos (optional, for reading upstream code)
+refs/
+
 # macOS
 .DS_Store
 
