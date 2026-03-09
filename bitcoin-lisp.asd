@@ -1,9 +1,9 @@
-;;; Ensure local coalton submodule is found by ASDF
+;;; Ensure local coalton checkout is found by ASDF
 ;;; Use *load-pathname* since system isn't defined yet
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (let* ((this-file (or *compile-file-pathname* *load-pathname*))
          (coalton-path (when this-file
-                         (merge-pathnames "coalton/" (make-pathname :directory (pathname-directory this-file))))))
+                         (merge-pathnames "refs/coalton/" (make-pathname :directory (pathname-directory this-file))))))
     (when (and coalton-path (probe-file coalton-path))
       (pushnew coalton-path asdf:*central-registry* :test #'equal))))
 
