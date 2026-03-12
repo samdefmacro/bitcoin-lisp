@@ -38,12 +38,19 @@ Returns a list of IP address strings."
 ;;; Message handling
 
 (defun handle-message (peer command payload chain-state utxo-set block-store
-                       &key mempool peers fee-estimator address-book)
+                       &key mempool peers fee-estimator address-book recent-rejects)
   "Handle an incoming message from a peer.
 MEMPOOL and PEERS are optional; when provided, transaction relay is enabled.
 FEE-ESTIMATOR is optional; when provided, fee stats are recorded for blocks.
 ADDRESS-BOOK is optional; when provided, addr messages update the peer database.
+RECENT-REJECTS is optional; when provided, recently rejected txs are cached.
 Returns T if message was handled, NIL otherwise."
+  ;; Check per-peer rate limit before processing
+  (unless (check-peer-rate-limit peer command)
+    (bitcoin-lisp:log-warn "Rate limit exceeded for peer ~A on ~A messages"
+                           (peer-address peer) command)
+    (disconnect-peer peer)
+    (return-from handle-message nil))
   (cond
     ((string= command "ping")
      (let ((nonce (flexi-streams:with-input-from-sequence (s payload)
@@ -58,7 +65,7 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "inv")
-     (handle-inv peer payload chain-state mempool)
+     (handle-inv peer payload chain-state mempool :recent-rejects recent-rejects)
      t)
 
     ((string= command "headers")
@@ -66,12 +73,14 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "block")
-     (handle-block peer payload chain-state utxo-set block-store mempool fee-estimator)
+     (handle-block peer payload chain-state utxo-set block-store mempool fee-estimator
+                   :recent-rejects recent-rejects)
      t)
 
     ((string= command "tx")
      (when mempool
-       (handle-tx peer payload utxo-set mempool chain-state peers))
+       (handle-tx peer payload utxo-set mempool chain-state peers
+                  :recent-rejects recent-rejects))
      t)
 
     ((string= command "getdata")
@@ -98,20 +107,20 @@ Returns T if message was handled, NIL otherwise."
     ((string= command "cmpctblock")
      (when mempool
        (handle-cmpctblock peer payload chain-state utxo-set block-store mempool
-                          fee-estimator))
+                          fee-estimator :recent-rejects recent-rejects))
      t)
 
     ((string= command "blocktxn")
      (when mempool
        (handle-blocktxn peer payload chain-state utxo-set block-store mempool
-                        fee-estimator))
+                        fee-estimator :recent-rejects recent-rejects))
      t)
 
     (t nil)))  ; Unknown message
 
 ;;; Inventory handling
 
-(defun handle-inv (peer payload chain-state &optional mempool)
+(defun handle-inv (peer payload chain-state &optional mempool &key recent-rejects)
   "Handle an inv message."
   (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
         (wanted '())
@@ -132,10 +141,12 @@ Returns T if message was handled, NIL otherwise."
                     :hash hash)
                    wanted)))
           ;; Transaction inventory - request with witness flag
+          ;; Skip if already in mempool or recently rejected
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
            (when (and mempool
-                      (not (bitcoin-lisp.mempool:mempool-has mempool hash)))
+                      (not (bitcoin-lisp.mempool:mempool-has mempool hash))
+                      (not (bitcoin-lisp:recent-reject-p recent-rejects hash)))
              (push (bitcoin-lisp.serialization:make-inv-vector
                     :type bitcoin-lisp.serialization:+inv-type-witness-tx+
                     :hash hash)
@@ -181,7 +192,7 @@ Returns T if message was handled, NIL otherwise."
 ;;; Block handling
 
 (defun handle-block (peer payload chain-state utxo-set block-store
-                     &optional mempool fee-estimator)
+                     &optional mempool fee-estimator &key recent-rejects)
   "Handle a block message."
   (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
     (when block
@@ -197,7 +208,8 @@ Returns T if message was handled, NIL otherwise."
               (progn
                 (bitcoin-lisp.validation:connect-block
                  block chain-state block-store utxo-set
-                 :fee-estimator fee-estimator)
+                 :fee-estimator fee-estimator
+                 :recent-rejects recent-rejects)
                 ;; Remove confirmed transactions from mempool
                 (when mempool
                   (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
@@ -265,8 +277,10 @@ Other network types are silently skipped."
 
 ;;; Transaction handling
 
-(defun handle-tx (peer payload utxo-set mempool chain-state peers)
-  "Handle a tx message. Validate, add to mempool, and relay."
+(defun handle-tx (peer payload utxo-set mempool chain-state peers
+                  &key recent-rejects)
+  "Handle a tx message. Validate, add to mempool, and relay.
+RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
   (handler-case
       (let ((tx (bitcoin-lisp.serialization:parse-tx-payload payload)))
         (when tx
@@ -274,11 +288,16 @@ Other network types are silently skipped."
                 (current-height (bitcoin-lisp.storage:current-height chain-state)))
             ;; Mark as announced by this peer
             (setf (gethash txid (peer-announced-txs peer)) t)
+            ;; Check recent rejects filter before expensive validation
+            (when (bitcoin-lisp:recent-reject-p recent-rejects txid)
+              (return-from handle-tx nil))
             ;; Validate for mempool
             (multiple-value-bind (valid error fee)
                 (bitcoin-lisp.validation:validate-transaction-for-mempool
                  tx utxo-set mempool current-height)
               (unless valid
+                ;; Add to recent rejects filter
+                (bitcoin-lisp:add-recent-reject recent-rejects txid)
                 ;; Record misbehavior for invalid transactions
                 ;; (policy violations like :insufficient-fee are not penalized)
                 (when (member error '(:script-failed :no-inputs :no-outputs
@@ -372,7 +391,8 @@ so peers include witness data in the response."
 
 ;;; Main sync loop
 
-(defun sync-with-peer (peer chain-state utxo-set block-store &key (max-blocks 500) fee-estimator)
+(defun sync-with-peer (peer chain-state utxo-set block-store
+                       &key (max-blocks 500) fee-estimator recent-rejects)
   "Synchronize blockchain with a peer.
 Downloads headers and blocks up to MAX-BLOCKS."
   (unless (eq (peer-state peer) :ready)
@@ -389,7 +409,8 @@ Downloads headers and blocks up to MAX-BLOCKS."
                  (return-from sync-with-peer blocks-received))
                (handle-message peer command payload
                                chain-state utxo-set block-store
-                               :fee-estimator fee-estimator)
+                               :fee-estimator fee-estimator
+                               :recent-rejects recent-rejects)
                (when (string= command "block")
                  (incf blocks-received))))
     blocks-received))
@@ -568,7 +589,7 @@ Downloads headers and blocks up to MAX-BLOCKS."
 ;;; Compact block message handling
 
 (defun handle-cmpctblock (peer payload chain-state utxo-set block-store mempool
-                          &optional fee-estimator)
+                          &optional fee-estimator &key recent-rejects)
   "Handle a cmpctblock message. Attempt reconstruction from mempool."
   (let* ((compact-block (bitcoin-lisp.serialization:parse-cmpctblock-payload payload))
          (header (bitcoin-lisp.serialization:compact-block-header compact-block))
@@ -607,7 +628,8 @@ Downloads headers and blocks up to MAX-BLOCKS."
                  (progn
                    (bitcoin-lisp.validation:connect-block
                     block chain-state block-store utxo-set
-                    :fee-estimator fee-estimator)
+                    :fee-estimator fee-estimator
+                    :recent-rejects recent-rejects)
                    (when mempool
                      (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
                  (progn
@@ -638,7 +660,7 @@ Downloads headers and blocks up to MAX-BLOCKS."
                         block-hash missing-indexes)))))))
 
 (defun handle-blocktxn (peer payload chain-state utxo-set block-store mempool
-                        &optional fee-estimator)
+                        &optional fee-estimator &key recent-rejects)
   "Handle a blocktxn message. Complete pending block reconstruction."
   (let ((response (bitcoin-lisp.serialization:parse-blocktxn-payload payload))
         (pending (peer-pending-compact-block peer)))
@@ -686,7 +708,8 @@ Downloads headers and blocks up to MAX-BLOCKS."
                   (progn
                     (bitcoin-lisp.validation:connect-block
                      block chain-state block-store utxo-set
-                     :fee-estimator fee-estimator)
+                     :fee-estimator fee-estimator
+                     :recent-rejects recent-rejects)
                     (when mempool
                       (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
                   (progn

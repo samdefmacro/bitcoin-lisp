@@ -53,6 +53,7 @@
   (tx-index nil)  ; Transaction index (optional, for getrawtransaction)
   (fee-estimator nil)  ; Fee rate estimator for estimatesmartfee
   (address-book nil)  ; Persistent peer address database
+  (recent-rejects nil)  ; Recently rejected transaction filter (DoS protection)
   (peers '() :type list)
   (running nil :type boolean)
   (log-level :info :type keyword)
@@ -275,6 +276,9 @@ Returns the node instance."
               (hash-table-count
                (bitcoin-lisp.storage::chain-state-block-index
                 (node-chain-state *node*)))))
+
+  ;; Initialize recent rejects filter (DoS protection)
+  (setf (node-recent-rejects *node*) (make-rejects-filter))
 
   ;; Initialize mempool
   (log-info "Initializing mempool...")
@@ -619,7 +623,8 @@ Downloads up to MAX-BLOCKS using the IBD system."
        (node-utxo-set node)
        (node-block-store node)
        target
-       :fee-estimator (node-fee-estimator node)))))
+       :fee-estimator (node-fee-estimator node)
+       :recent-rejects (node-recent-rejects node)))))
 
 
 (defun find-best-peer (node)
