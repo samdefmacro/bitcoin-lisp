@@ -2,6 +2,7 @@
 
 (defpackage #:bitcoin-lisp.rpc
   (:use #:cl)
+  (:local-nicknames (#:bt #:bordeaux-threads))
   (:export
    ;; Server control
    #:start-rpc-server

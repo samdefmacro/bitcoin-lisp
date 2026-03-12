@@ -34,7 +34,15 @@
   (compact-block-high-bandwidth nil :type boolean)    ; High-bandwidth mode enabled
   (pending-compact-block nil)                         ; Pending reconstruction state
   ;; ADDRv2 support (BIP 155)
-  (wants-addrv2 nil :type boolean))                   ; Peer sent sendaddrv2
+  (wants-addrv2 nil :type boolean)                    ; Peer sent sendaddrv2
+  ;; DoS protection: per-peer rate limiters
+  (rate-limit-inv nil)
+  (rate-limit-tx nil)
+  (rate-limit-addr nil)
+  (rate-limit-getdata nil)
+  (rate-limit-headers nil)
+  ;; Handshake timeout tracking
+  (connect-time 0 :type integer))                     ; internal-real-time at connection
 
 ;;; Pending compact block reconstruction state
 (defstruct pending-compact-block
@@ -69,6 +77,16 @@
 
 ;;; Peer connection
 
+(defun init-peer-rate-limiters (peer)
+  "Initialize per-peer rate limiters from global configuration."
+  (flet ((rl (config) (bitcoin-lisp:make-rate-limiter (car config) (cdr config))))
+    (setf (peer-rate-limit-inv peer) (rl bitcoin-lisp:*rate-limit-inv*))
+    (setf (peer-rate-limit-tx peer) (rl bitcoin-lisp:*rate-limit-tx*))
+    (setf (peer-rate-limit-addr peer) (rl bitcoin-lisp:*rate-limit-addr*))
+    (setf (peer-rate-limit-getdata peer) (rl bitcoin-lisp:*rate-limit-getdata*))
+    (setf (peer-rate-limit-headers peer) (rl bitcoin-lisp:*rate-limit-headers*)))
+  peer)
+
 (defun connect-peer (host &optional (port *current-port*))
   "Connect to a peer at HOST:PORT.
 Returns a peer structure or NIL on failure.
@@ -77,9 +95,12 @@ Returns NIL if the host is banned."
     (return-from connect-peer nil))
   (let ((conn (make-tcp-connection host port)))
     (when conn
-      (make-peer :connection conn
-                 :state :connected
-                 :address host))))
+      (let ((peer (make-peer :connection conn
+                             :state :connected
+                             :address host
+                             :connect-time (get-internal-real-time))))
+        (init-peer-rate-limiters peer)
+        peer))))
 
 (defun disconnect-peer (peer)
   "Disconnect from a peer."
@@ -112,20 +133,26 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
               (unless (equalp (bitcoin-lisp.serialization:message-header-magic header)
                               bitcoin-lisp.serialization:*network-magic*)
                 (return-from receive-message nil))
-              ;; Read payload
-              (let* ((payload-len (bitcoin-lisp.serialization:message-header-payload-length header))
-                     (payload (if (zerop payload-len)
-                                  #()
-                                  (receive-bytes conn payload-len :timeout timeout))))
-                (when (or (zerop payload-len) payload)
-                  ;; Verify checksum
-                  (let ((computed-checksum
-                          (bitcoin-lisp.serialization:compute-checksum
-                           (if (zerop payload-len) #() payload))))
-                    (when (equalp (subseq computed-checksum 0 4)
-                                  (bitcoin-lisp.serialization:message-header-checksum header))
-                      (values (bitcoin-lisp.serialization:message-header-command header)
-                              payload))))))))))))
+              ;; Validate payload size before allocating/reading
+              (let ((payload-len (bitcoin-lisp.serialization:message-header-payload-length header)))
+                (when (> payload-len bitcoin-lisp:+max-message-payload+)
+                  (bitcoin-lisp:log-warn "Oversized message from peer ~A: ~D bytes (max ~D), disconnecting"
+                                         (peer-address peer) payload-len bitcoin-lisp:+max-message-payload+)
+                  (disconnect-peer peer)
+                  (return-from receive-message nil)))
+                ;; Read payload
+                (let ((payload (if (zerop payload-len)
+                                   #()
+                                   (receive-bytes conn payload-len :timeout timeout))))
+                  (when (or (zerop payload-len) payload)
+                    ;; Verify checksum
+                    (let ((computed-checksum
+                            (bitcoin-lisp.serialization:compute-checksum
+                             (if (zerop payload-len) #() payload))))
+                      (when (equalp (subseq computed-checksum 0 4)
+                                    (bitcoin-lisp.serialization:message-header-checksum header))
+                        (values (bitcoin-lisp.serialization:message-header-command header)
+                                payload))))))))))))))
 
 ;;; Handshake
 
@@ -221,11 +248,27 @@ Returns T on success, NIL on failure."
 (defconstant +max-ping-failures+ 3)
 (defconstant +max-block-timeouts+ 3)
 
+(defun check-handshake-timeout (peer)
+  "Check if a peer has exceeded the handshake timeout.
+Returns :disconnect if the peer should be disconnected, :ok otherwise."
+  (when (and (member (peer-state peer) '(:connected :connecting :handshaking))
+             (> (peer-connect-time peer) 0))
+    (let* ((now (get-internal-real-time))
+           (elapsed-secs (/ (float (- now (peer-connect-time peer)))
+                            (float internal-time-units-per-second))))
+      (when (> elapsed-secs bitcoin-lisp:+handshake-timeout-seconds+)
+        (bitcoin-lisp:log-warn "Handshake timeout for peer ~A (~,1Fs elapsed)"
+                               (peer-address peer) elapsed-secs)
+        (return-from check-handshake-timeout :disconnect))))
+  :ok)
+
 (defun check-peer-health (peer)
   "Check health of a single peer. Returns :ok, :ping-sent, or :disconnect.
-Should be called periodically (every ~60s)."
+Should be called periodically (every ~60s).
+Also checks handshake timeout for peers that haven't completed handshake."
+  ;; Check handshake timeout for non-ready peers
   (unless (eq (peer-state peer) :ready)
-    (return-from check-peer-health :ok))
+    (return-from check-peer-health (check-handshake-timeout peer)))
 
   (let ((now (get-internal-real-time))
         (interval-ticks (* +ping-interval-seconds+ internal-time-units-per-second))
@@ -300,3 +343,20 @@ Returns T if banned, NIL otherwise. Expired bans are cleaned up."
 (defun clear-ban-list ()
   "Clear all bans."
   (clrhash *banned-peers*))
+
+;;; Per-Peer Rate Limiting
+
+(defun check-peer-rate-limit (peer command)
+  "Check if PEER is within rate limits for COMMAND.
+Returns T if allowed, NIL if rate limit exceeded."
+  (let ((bucket (cond
+                  ((string= command "inv") (peer-rate-limit-inv peer))
+                  ((string= command "tx") (peer-rate-limit-tx peer))
+                  ((string= command "addr") (peer-rate-limit-addr peer))
+                  ((string= command "addrv2") (peer-rate-limit-addr peer))
+                  ((string= command "getdata") (peer-rate-limit-getdata peer))
+                  ((string= command "headers") (peer-rate-limit-headers peer))
+                  (t nil))))  ; No rate limit for other message types
+    (if bucket
+        (bitcoin-lisp:token-bucket-allow-p bucket)
+        t)))

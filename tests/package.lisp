@@ -49,6 +49,10 @@
   :description "Tests for ADDRv2 (BIP 155) support"
   :in :bitcoin-lisp-tests)
 
+(def-suite :dos-protection-tests
+  :description "Tests for DoS protection (rate limiting, handshake timeout, rejects filter)"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :integration-tests
   :description "Integration tests with testnet"
   :in :bitcoin-lisp-tests)

@@ -179,6 +179,29 @@
 (defvar *rpc-dispatcher* nil
   "The RPC dispatcher function (for cleanup on stop).")
 
+;;; --- RPC Rate Limiting ---
+
+(defvar *rpc-rate-limiter* nil
+  "Global RPC rate limiter (token bucket). Thread-safe via *rpc-rate-limiter-lock*.")
+
+(defvar *rpc-rate-limiter-lock* (bt:make-lock "rpc-rate-limiter")
+  "Lock for thread-safe access to *rpc-rate-limiter*.")
+
+(defun init-rpc-rate-limiter ()
+  "Initialize the global RPC rate limiter from configuration."
+  (let ((config bitcoin-lisp:*rpc-rate-limit*))
+    (setf *rpc-rate-limiter*
+          (bitcoin-lisp:make-rate-limiter (car config) (cdr config)))))
+
+(defun rpc-rate-limit-check ()
+  "Check if the RPC request is within rate limits (thread-safe).
+Returns T if allowed, NIL if rate limited."
+  (when *rpc-rate-limiter*
+    (bt:with-lock-held (*rpc-rate-limiter-lock*)
+      (return-from rpc-rate-limit-check
+        (bitcoin-lisp:token-bucket-allow-p *rpc-rate-limiter*))))
+  t)
+
 (defun check-auth (request)
   "Check HTTP Basic authentication. Returns t if valid or auth disabled."
   (when (and *rpc-user* *rpc-password*)
@@ -201,6 +224,13 @@
         (error () nil))))
   t)
 
+(defun rpc-json-error (http-status code message)
+  "Return a JSON-RPC error response string with the given HTTP status."
+  (setf (hunchentoot:return-code*) http-status)
+  (setf (hunchentoot:content-type*) "application/json")
+  (with-output-to-string (s)
+    (yason:encode (make-rpc-error-response code message nil) s)))
+
 (defun rpc-handler ()
   "Handle incoming RPC requests."
   (let ((request hunchentoot:*request*))
@@ -209,6 +239,20 @@
       (setf (hunchentoot:return-code*) hunchentoot:+http-authorization-required+)
       (setf (hunchentoot:header-out :www-authenticate) "Basic realm=\"bitcoin-lisp\"")
       (return-from rpc-handler ""))
+
+    ;; Check rate limit
+    (unless (rpc-rate-limit-check)
+      (return-from rpc-handler
+        (rpc-json-error 429 +rpc-misc-error+ "Rate limit exceeded")))
+
+    ;; Check body size limit
+    (let* ((content-length-str (hunchentoot:header-in :content-length request))
+           (content-length (and content-length-str
+                                (parse-integer content-length-str :junk-allowed t))))
+      (when (and content-length
+                 (> content-length bitcoin-lisp:+max-rpc-body-size+))
+        (return-from rpc-handler
+          (rpc-json-error 413 +rpc-misc-error+ "Request body too large"))))
 
     ;; Check Content-Type
     (let ((content-type (hunchentoot:header-in :content-type request)))
@@ -221,6 +265,10 @@
     ;; Process request
     (setf (hunchentoot:content-type*) "application/json")
     (let ((body (hunchentoot:raw-post-data :force-text t)))
+      ;; Post-read body size check (in case Content-Length was absent or wrong)
+      (when (and body (> (length body) bitcoin-lisp:+max-rpc-body-size+))
+        (return-from rpc-handler
+          (rpc-json-error 413 +rpc-misc-error+ "Request body too large")))
       (handler-case
           (multiple-value-bind (request-type method-or-batch params id)
               (parse-json-rpc-request body)
@@ -266,6 +314,9 @@ PORT defaults to 18332 for testnet, 8332 for mainnet."
     ;; Register methods
     (register-all-methods)
 
+    ;; Initialize RPC rate limiter
+    (init-rpc-rate-limiter)
+
     ;; Set globals for handler
     (setf *rpc-node* node)
     (setf *rpc-user* user)
@@ -309,4 +360,5 @@ PORT defaults to 18332 for testnet, 8332 for mainnet."
     (setf *rpc-node* nil)
     (setf *rpc-user* nil)
     (setf *rpc-password* nil)
-    (setf *rpc-dispatcher* nil)))
+    (setf *rpc-dispatcher* nil)
+    (setf *rpc-rate-limiter* nil)))

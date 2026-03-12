@@ -515,6 +515,11 @@
    #:peer-misbehavior-score
    #:+misbehavior-ban-threshold+
    #:*banned-peers*
+   ;; DoS protection
+   #:check-peer-rate-limit
+   #:check-handshake-timeout
+   #:init-peer-rate-limiters
+   #:peer-connect-time
    ;; Network params
    #:*testnet-port*
    #:*mainnet-port*
@@ -554,6 +559,31 @@
    #:+min-blocks-to-keep+
    #:pruning-enabled-p
    #:automatic-pruning-p
+   ;; Token bucket rate limiter
+   #:token-bucket
+   #:make-token-bucket
+   #:make-rate-limiter
+   #:token-bucket-allow-p
+   #:token-bucket-rate
+   #:token-bucket-burst
+   #:token-bucket-tokens
+   ;; Recent rejects filter
+   #:recent-rejects
+   #:make-rejects-filter
+   #:recent-reject-p
+   #:add-recent-reject
+   #:clear-recent-rejects
+   ;; DoS protection configuration
+   #:*rate-limit-inv*
+   #:*rate-limit-tx*
+   #:*rate-limit-addr*
+   #:*rate-limit-getdata*
+   #:*rate-limit-headers*
+   #:*rpc-rate-limit*
+   #:+max-message-payload+
+   #:+max-rpc-body-size+
+   #:+handshake-timeout-seconds+
+   #:*recent-rejects-max-size*
    ;; Node
    #:node
    #:*node*
@@ -561,6 +591,7 @@
    #:stop-node
    #:node-status
    #:node-fee-estimator
+   #:node-recent-rejects
    #:sync-blockchain
    ;; Logging
    #:*log-stream*
