@@ -620,11 +620,13 @@ Used to restore UTXOs during chain reorganization.")
 
 ;;;; Block connection
 
-(defun connect-block (block chain-state block-store utxo-set &key tx-index fee-estimator)
+(defun connect-block (block chain-state block-store utxo-set
+                      &key tx-index fee-estimator recent-rejects)
   "Connect a validated block to the chain.
 Updates chain state and UTXO set.
 Optionally updates TX-INDEX if provided and enabled.
 Optionally updates FEE-ESTIMATOR with block fee statistics.
+Optionally clears RECENT-REJECTS on chain reorganization.
 Handles chain reorganizations when a competing chain has more work."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (hash (bitcoin-lisp.serialization:block-header-hash header))
@@ -690,7 +692,8 @@ Handles chain reorganizations when a competing chain has more work."
            (perform-reorg chain-state block-store utxo-set
                           current-best-entry entry
                           :tx-index tx-index
-                          :fee-estimator fee-estimator))
+                          :fee-estimator fee-estimator
+                          :recent-rejects recent-rejects))
 
           ;; New block is on a weaker chain - just store it
           (t nil)))
@@ -730,11 +733,12 @@ Returns the common ancestor block-index-entry."
     (nreverse entries)))
 
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
-                      &key tx-index fee-estimator)
+                      &key tx-index fee-estimator recent-rejects)
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
 Disconnects blocks back to the fork point, then connects blocks on the new chain.
 Optionally updates TX-INDEX if provided and enabled.
-Optionally updates FEE-ESTIMATOR with block fee statistics."
+Optionally updates FEE-ESTIMATOR with block fee statistics.
+Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
   (let ((fork-entry (find-fork-point old-tip-entry new-tip-entry)))
     (unless fork-entry
       (return-from perform-reorg nil))
@@ -772,6 +776,9 @@ Optionally updates FEE-ESTIMATOR with block fee statistics."
               (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
                 (bitcoin-lisp.storage:txindex-remove-block tx-index block))
               (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid))))
+
+        ;; Clear recent rejects filter (reorg may change tx validity)
+        (bitcoin-lisp:clear-recent-rejects recent-rejects)
 
         ;; Connect new chain blocks (fork to new tip)
         (dolist (entry to-connect)

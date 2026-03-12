@@ -107,6 +107,8 @@
                              ;; Compact block relay tests (BIP 152)
                              (:file "compact-block-tests")
                              ;; ADDRv2 tests (BIP 155)
-                             (:file "addrv2-tests"))))
+                             (:file "addrv2-tests")
+                             ;; DoS protection tests
+                             (:file "dos-protection-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

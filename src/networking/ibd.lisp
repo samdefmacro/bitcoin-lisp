@@ -429,17 +429,20 @@ When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
 
 ;;;; Main IBD Loop
 
-(defun start-ibd (peers chain-state utxo-set block-store target-height &key fee-estimator)
+(defun start-ibd (peers chain-state utxo-set block-store target-height
+                   &key fee-estimator recent-rejects)
   "Start Initial Block Download.
 Returns the number of blocks downloaded."
   (setf *ibd-context* (make-ibd))
   (setf (ibd-context-target-height *ibd-context*) target-height)
 
   (unwind-protect
-       (run-ibd peers chain-state utxo-set block-store :fee-estimator fee-estimator)
+       (run-ibd peers chain-state utxo-set block-store
+                :fee-estimator fee-estimator
+                :recent-rejects recent-rejects)
     (setf *ibd-context* nil)))
 
-(defun run-ibd (peers chain-state utxo-set block-store &key fee-estimator)
+(defun run-ibd (peers chain-state utxo-set block-store &key fee-estimator recent-rejects)
   "Main IBD loop."
   (let ((ctx *ibd-context*)
         (start-height (bitcoin-lisp.storage:current-height chain-state)))
@@ -460,7 +463,7 @@ Returns the number of blocks downloaded."
                                   :key #'peer-start-height))))
       (when best-peer
         (setf (ibd-context-header-sync-peer ctx) best-peer)
-        (sync-headers best-peer chain-state)))
+        (sync-headers best-peer chain-state :recent-rejects recent-rejects)))
 
     ;; Phase 2: Download and validate blocks
     (set-ibd-state :syncing-blocks)
@@ -491,7 +494,8 @@ Returns the number of blocks downloaded."
                                    (hash (bitcoin-lisp.serialization:block-header-hash header)))
                               (mark-block-received hash)
                               (process-received-block block chain-state utxo-set block-store
-                                                      :fee-estimator fee-estimator)))
+                                                      :fee-estimator fee-estimator
+                                                      :recent-rejects recent-rejects)))
 
                            ((string= command "headers")
                             (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
@@ -500,7 +504,8 @@ Returns the number of blocks downloaded."
 
                            (t (handle-message peer command payload
                                               chain-state utxo-set block-store
-                                              :fee-estimator fee-estimator)))))))
+                                              :fee-estimator fee-estimator
+                                              :recent-rejects recent-rejects)))))))
 
                  ;; Periodic progress report
                  (let ((now (get-internal-real-time)))
@@ -553,7 +558,7 @@ Used during IBD when the validated block tip lags behind the header tip."
      peer
      (bitcoin-lisp.serialization:make-getheaders-message locator))))
 
-(defun sync-headers (peer chain-state)
+(defun sync-headers (peer chain-state &key recent-rejects)
   "Download all headers from a peer."
   (let ((received-count 0)
         (done nil)
@@ -566,7 +571,8 @@ Used during IBD when the validated block tip lags behind the header tip."
                (when command
                  (bitcoin-lisp:log-debug "Pre-sync: received ~A" command)
                  (handler-case
-                     (handle-message peer command payload chain-state nil nil)
+                     (handle-message peer command payload chain-state nil nil
+                                     :recent-rejects recent-rejects)
                    (error () nil)))
                (unless command (return))))
 
@@ -623,13 +629,15 @@ Used during IBD when the validated block tip lags behind the header tip."
                                ;; Handle other messages (ping, sendcmpct, etc.)
                                (bitcoin-lisp:log-debug "Header sync: received ~A" command)
                                (handler-case
-                                   (handle-message peer command payload chain-state nil nil)
+                                   (handle-message peer command payload chain-state nil nil
+                                                   :recent-rejects recent-rejects)
                                  (error () nil)))))))))
 
     (bitcoin-lisp:log-info "Header sync complete: ~D headers received" received-count)
     received-count))
 
-(defun process-received-block (block chain-state utxo-set block-store &key fee-estimator)
+(defun process-received-block (block chain-state utxo-set block-store
+                                &key fee-estimator recent-rejects)
   "Process a received block - validate and connect to chain.
 After connecting, drains the queue of any children that can now be connected."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
@@ -659,10 +667,12 @@ After connecting, drains the queue of any children that can now be connected."
                   (progn
                     (bitcoin-lisp.validation:connect-block
                      block chain-state block-store utxo-set
-                     :fee-estimator fee-estimator)
+                     :fee-estimator fee-estimator
+                     :recent-rejects recent-rejects)
                     ;; Drain queued blocks whose parent is now connected
                     (drain-block-queue chain-state utxo-set block-store
-                                       :fee-estimator fee-estimator)
+                                       :fee-estimator fee-estimator
+                                       :recent-rejects recent-rejects)
                     t)
                   (progn
                     (bitcoin-lisp:log-error "Block ~D validation failed: ~A" height error)
@@ -678,7 +688,7 @@ After connecting, drains the queue of any children that can now be connected."
                 (push (cons height block) (ibd-context-block-queue *ibd-context*))))
             nil)))))
 
-(defun drain-block-queue (chain-state utxo-set block-store &key fee-estimator)
+(defun drain-block-queue (chain-state utxo-set block-store &key fee-estimator recent-rejects)
   "Process queued blocks whose parents are now connected.
 Repeats until no more queued blocks can be connected."
   (unless *ibd-context*
@@ -704,7 +714,8 @@ Repeats until no more queued blocks can be connected."
                 (progn
                   (bitcoin-lisp.validation:connect-block
                    block chain-state block-store utxo-set
-                   :fee-estimator fee-estimator)
+                   :fee-estimator fee-estimator
+                   :recent-rejects recent-rejects)
                   (incf drained)
                   (bitcoin-lisp:log-debug "Drained queued block at height ~D" next-height))
                 (progn
