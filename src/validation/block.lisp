@@ -14,6 +14,153 @@
 (defconstant +max-block-sigops+ 20000)
 (defconstant +max-future-block-time+ 7200)  ; 2 hours in seconds
 
+;;; Locktime activation heights (BIPs 65/68/112/113)
+
+(defconstant +bip65-activation-height-mainnet+ 388381
+  "BIP 65 (CLTV) activation height on mainnet.")
+(defconstant +bip65-activation-height-testnet+ 581885
+  "BIP 65 (CLTV) activation height on testnet.")
+
+(defconstant +csv-activation-height-mainnet+ 419328
+  "BIP 68/112/113 (CSV soft fork) activation height on mainnet.")
+(defconstant +csv-activation-height-testnet+ 770112
+  "BIP 68/112/113 (CSV soft fork) activation height on testnet.")
+
+(defconstant +locktime-threshold+ 500000000
+  "Threshold for height vs time-based locktime. Values below are block heights,
+values at or above are Unix timestamps.")
+
+(defconstant +sequence-disable-flag+ #x80000000
+  "BIP 68: If set, nSequence is not interpreted as relative locktime.")
+(defconstant +sequence-type-flag+ #x00400000
+  "BIP 68: If set, relative locktime is time-based (512-second units).")
+(defconstant +sequence-locktime-mask+ #x0000FFFF
+  "BIP 68: Mask for the relative locktime value.")
+(defconstant +sequence-locktime-granularity+ 512
+  "BIP 68: Time-based relative locktime granularity in seconds.")
+(defconstant +sequence-final+ #xFFFFFFFF
+  "Fully final sequence number (disables nLockTime for input).")
+
+;;;; Median-Time-Past (BIP 113)
+
+(defconstant +median-time-span+ 11
+  "Number of previous blocks used to compute median-time-past.")
+
+(defun compute-median-time-past (chain-state prev-hash)
+  "Compute the median-time-past for the block following PREV-HASH.
+Returns the median of up to 11 previous block timestamps."
+  (let ((timestamps '())
+        (hash prev-hash))
+    (dotimes (i +median-time-span+)
+      (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+        (unless entry (return))
+        (push (bitcoin-lisp.serialization:block-header-timestamp
+               (bitcoin-lisp.storage:block-index-entry-header entry))
+              timestamps)
+        (let ((prev (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+          (if prev
+              (setf hash (bitcoin-lisp.storage:block-index-entry-hash prev))
+              (return)))))
+    (if (null timestamps)
+        0
+        (let ((sorted (sort timestamps #'<)))
+          (nth (floor (length sorted) 2) sorted)))))
+
+;;;; Transaction finality check (IsFinalTx)
+
+(defun check-transaction-final (tx block-height block-time)
+  "Check if TX is final per consensus rules.
+A transaction is final if:
+- nLockTime is 0
+- All input sequences are SEQUENCE_FINAL (0xFFFFFFFF)
+- nLockTime < block-height (height-based) or nLockTime < block-time (time-based)
+Returns T if final, NIL if not."
+  (let ((locktime (bitcoin-lisp.serialization:transaction-lock-time tx)))
+    ;; nLockTime == 0 means always final
+    (when (zerop locktime)
+      (return-from check-transaction-final t))
+    ;; Check if locktime is satisfied
+    (let ((threshold (if (< locktime +locktime-threshold+)
+                         block-height    ; height-based
+                         block-time)))   ; time-based
+      (when (< locktime threshold)
+        (return-from check-transaction-final t)))
+    ;; If locktime not satisfied, tx is final only if ALL sequences are final
+    (every (lambda (input)
+             (= (bitcoin-lisp.serialization:tx-in-sequence input) +sequence-final+))
+           (bitcoin-lisp.serialization:transaction-inputs tx))))
+
+;;;; BIP 68 Sequence Lock Enforcement
+
+(defun check-sequence-locks (tx utxo-set current-height mtp chain-state
+                             &key pending-utxos)
+  "Check BIP 68 relative locktime for TX.
+For each input with version >= 2 and sequence not disabled (bit 31 clear):
+- Height-based: input UTXO must be at least N blocks deep
+- Time-based: MTP must be >= N*512 seconds after UTXO's MTP
+Returns T if all locks satisfied, NIL if any lock not yet matured."
+  ;; BIP 68 only applies to transaction version >= 2
+  (when (< (bitcoin-lisp.serialization:transaction-version tx) 2)
+    (return-from check-sequence-locks t))
+  (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx) t)
+    (let ((seq (bitcoin-lisp.serialization:tx-in-sequence input)))
+      ;; Skip if disable flag is set
+      (unless (logtest seq +sequence-disable-flag+)
+        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+               (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
+               (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+               (utxo (or (and pending-utxos
+                              (gethash (cons prev-txid prev-index) pending-utxos))
+                         (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index))))
+          (unless utxo
+            (return-from check-sequence-locks nil))
+          (let ((utxo-height (bitcoin-lisp.storage:utxo-entry-height utxo)))
+            (if (logtest seq +sequence-type-flag+)
+                ;; Time-based relative locktime
+                (let* ((required-time (* (logand seq +sequence-locktime-mask+)
+                                         +sequence-locktime-granularity+))
+                       ;; Compute MTP at the height the UTXO was confirmed
+                       ;; We need the block hash at utxo-height to get the prev-hash for MTP
+                       (utxo-entry (bitcoin-lisp.storage:get-block-at-height
+                                    chain-state utxo-height))
+                       (utxo-mtp (if utxo-entry
+                                     (compute-median-time-past
+                                      chain-state
+                                      (bitcoin-lisp.storage:block-index-entry-hash utxo-entry))
+                                     0)))
+                  (when (< (- mtp utxo-mtp) required-time)
+                    (return-from check-sequence-locks nil)))
+                ;; Height-based relative locktime
+                (let ((required-height (logand seq +sequence-locktime-mask+)))
+                  (when (< (- current-height utxo-height) required-height)
+                    (return-from check-sequence-locks nil))))))))))
+
+;;;; Script verification flags
+
+(defun get-bip65-activation-height (network)
+  "Return the BIP 65 (CLTV) activation height for NETWORK."
+  (ecase network
+    (:testnet +bip65-activation-height-testnet+)
+    (:mainnet +bip65-activation-height-mainnet+)))
+
+(defun get-csv-activation-height (network)
+  "Return the BIP 68/112/113 (CSV) activation height for NETWORK."
+  (ecase network
+    (:testnet +csv-activation-height-testnet+)
+    (:mainnet +csv-activation-height-mainnet+)))
+
+(defun compute-script-flags-for-height (height)
+  "Compute script verification flags string based on block HEIGHT.
+Returns a comma-separated string of enabled flags, or NIL if none."
+  (let ((flags '()))
+    (when (>= height (get-bip65-activation-height bitcoin-lisp:*network*))
+      (push "CHECKLOCKTIMEVERIFY" flags))
+    (when (>= height (get-csv-activation-height bitcoin-lisp:*network*))
+      (push "CHECKSEQUENCEVERIFY" flags))
+    (if flags
+        (format nil "~{~A~^,~}" flags)
+        nil)))
+
 ;;; BIP 16 (P2SH) exception block hash for testnet3
 ;;; This block predates proper BIP 16 enforcement and must skip script validation
 ;;; See Bitcoin Core's chainparams.cpp: consensus.script_flag_exceptions
@@ -122,18 +269,22 @@ Returns a list of byte vectors, or NIL if no witness data."
     (or (equalp block-hash *bip16-exception-testnet*)
         (equalp block-hash *bip16-exception-mainnet*))))
 
-(defun validate-block-scripts (block utxo-set)
+(defun validate-block-scripts (block utxo-set &key (height 0))
   "Validate all non-coinbase transaction scripts in BLOCK via Coalton interop.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
 Legacy and P2SH scripts are validated via run-scripts-with-p2sh.
 Witness programs are validated via validate-witness-program when witness data
 is available.
-Blocks matching BIP 16 exception hashes skip all script validation."
+Blocks matching BIP 16 exception hashes skip all script validation.
+HEIGHT is used to determine which script verification flags to enable."
   ;; Check for BIP 16 exception block - skip ALL script validation
   (when (block-is-bip16-exception-p block)
     (return-from validate-block-scripts (values t nil)))
 
-  (let ((transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+  ;; Set script verification flags based on block height
+  (let ((bitcoin-lisp.coalton.interop:*script-flags*
+          (compute-script-flags-for-height height))
+        (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
     (loop for tx in (rest transactions)  ; skip coinbase
           for tx-idx from 1
           do (loop for input in (bitcoin-lisp.serialization:transaction-inputs tx)
@@ -145,7 +296,10 @@ Blocks matching BIP 16 exception hashes skip all script validation."
                         (when utxo
                           (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input))
                                 (script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
-                                (amount (bitcoin-lisp.storage:utxo-entry-value utxo)))
+                                (amount (bitcoin-lisp.storage:utxo-entry-value utxo))
+                                ;; Bind transaction context for sighash and CLTV/CSV
+                                (bitcoin-lisp.coalton.interop:*current-tx* tx)
+                                (bitcoin-lisp.coalton.interop:*current-input-index* input-idx))
                             (if (script-is-witness-program-p script-pubkey)
                                 ;; Witness program: validate with witness stack
                                 (let ((witness (get-input-witness tx input-idx)))
@@ -158,18 +312,13 @@ Blocks matching BIP 16 exception hashes skip all script validation."
                                         (return-from validate-block-scripts
                                           (values nil :script-failed))))))
                                 ;; Legacy/P2SH: validate via Coalton interop
-                                ;; Bind transaction context for sighash computation.
-                                ;; Note: *current-script-code* left nil so verify-checksig uses
-                                ;; its script-pubkey parameter, which is the redeemScript for P2SH.
-                                (let ((bitcoin-lisp.coalton.interop:*current-tx* tx)
-                                      (bitcoin-lisp.coalton.interop:*current-input-index* input-idx))
-                                  (multiple-value-bind (success error)
-                                      (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
-                                       script-sig script-pubkey t)
-                                    (declare (ignore error))
-                                    (unless success
-                                      (return-from validate-block-scripts
-                                        (values nil :script-failed)))))))))))
+                                (multiple-value-bind (success error)
+                                    (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
+                                     script-sig script-pubkey t)
+                                  (declare (ignore error))
+                                  (unless success
+                                    (return-from validate-block-scripts
+                                      (values nil :script-failed))))))))))
     (values t nil)))
 
 ;;;; Witness commitment validation (BIP 141)
@@ -377,9 +526,29 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                                  :height current-height
                                  :coinbase nil)))))
 
+      ;; Transaction finality check (IsFinalTx) and BIP 68 sequence locks
+      (let* ((prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
+             (mtp (compute-median-time-past chain-state prev-hash))
+             (csv-height (get-csv-activation-height bitcoin-lisp:*network*))
+             (csv-active (>= current-height csv-height))
+             ;; For IsFinalTx: use MTP after BIP 113 activation, block timestamp before
+             (locktime-check-time (if csv-active
+                                      mtp
+                                      (bitcoin-lisp.serialization:block-header-timestamp header))))
+        ;; Check finality for all non-coinbase transactions
+        (loop for tx in (rest transactions)
+              unless (check-transaction-final tx current-height locktime-check-time)
+                do (return-from validate-block (values nil :non-final-tx nil)))
+        ;; BIP 68 sequence lock enforcement (only at or above CSV activation)
+        (when csv-active
+          (loop for tx in (rest transactions)
+                unless (check-sequence-locks tx utxo-set current-height mtp chain-state
+                                             :pending-utxos pending-utxos)
+                  do (return-from validate-block (values nil :bad-sequence-lock nil)))))
+
       ;; Validate transaction scripts via Coalton interop
       (multiple-value-bind (valid error)
-          (validate-block-scripts block utxo-set)
+          (validate-block-scripts block utxo-set :height current-height)
         (unless valid
           (return-from validate-block (values nil error nil))))
 

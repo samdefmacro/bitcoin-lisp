@@ -407,6 +407,11 @@
    #:perform-reorg
    #:decode-coinbase-height
    #:get-bip34-activation-height
+   ;; Locktime validation
+   #:check-transaction-final
+   #:compute-median-time-past
+   #:check-sequence-locks
+   #:compute-script-flags-for-height
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+
