@@ -184,6 +184,9 @@
    #:SE-TooManyOps
    #:SE-InvalidStackOperation
    #:SE-UnbalancedConditional
+   #:SE-NegativeLocktime
+   #:SE-UnsatisfiedLocktime
+   #:SE-DiscourageUpgradableNops
    #:ScriptResult
    #:script-ok
    #:script-err
@@ -234,14 +237,21 @@
    ;; Execution context
    #:ScriptContext
    #:make-script-context
+   #:make-script-context-with-tx
    #:context-main-stack
    #:context-alt-stack
    #:context-position
    #:context-executing
+   #:context-tx-locktime
+   #:context-tx-version
+   #:context-input-sequence
    ;; Execution
    #:execute-script
+   #:execute-script-with-tx
    #:execute-script-with-stack
+   #:execute-script-with-stack-tx
    #:execute-scripts
+   #:execute-scripts-with-tx
    #:execute-opcode
    ;; P2SH support
    #:is-p2sh-script

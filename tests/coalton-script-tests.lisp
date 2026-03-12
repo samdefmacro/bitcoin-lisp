@@ -917,3 +917,188 @@
     (let ((hash1 (bitcoin-lisp.crypto:tap-branch-hash left right))
           (hash2 (bitcoin-lisp.crypto:tap-branch-hash right left)))
       (is (equalp hash1 hash2)))))
+
+;;; ============================================================
+;;; CLTV (BIP 65) Tests
+;;; ============================================================
+
+;; Helper to execute a script with transaction context and flags
+(defun call-execute-script-with-tx (script-bytes locktime version sequence &optional (flags "CHECKLOCKTIMEVERIFY"))
+  "Execute a script with transaction context and script flags."
+  (let ((bitcoin-lisp.coalton.interop:*script-flags* flags))
+    (bitcoin-lisp.coalton.script:execute-script-with-tx script-bytes locktime version sequence)))
+
+;; Helper to build a script: <push value> <opcode>
+(defun make-push-then-opcode-script (value opcode)
+  "Build a script that pushes a script number VALUE then appends OPCODE."
+  (let ((num-bytes (bitcoin-lisp.coalton.script:script-num-to-bytes
+                    (bitcoin-lisp.coalton.script:make-script-num value))))
+    (let* ((num-len (length num-bytes))
+           (script (make-array (+ 1 num-len 1))))
+      (setf (aref script 0) num-len)
+      (loop for i from 0 below num-len
+            do (setf (aref script (1+ i)) (aref num-bytes i)))
+      (setf (aref script (+ 1 num-len)) opcode)
+      script)))
+
+(defun make-cltv-script (locktime-value)
+  "Build a script: <push locktime-value> OP_CHECKLOCKTIMEVERIFY."
+  (make-push-then-opcode-script locktime-value #xb1))
+
+(test cltv-valid-height-based
+  "CLTV succeeds when nLockTime (height) >= script value."
+  (let* ((script (make-cltv-script 400000))
+         (result (call-execute-script-with-tx script 400001 1 0)))
+    (is-true (script-ok-p result))))
+
+(test cltv-valid-time-based
+  "CLTV succeeds when nLockTime (time) >= script value."
+  (let* ((script (make-cltv-script 500000000))
+         (result (call-execute-script-with-tx script 500000001 1 0)))
+    (is-true (script-ok-p result))))
+
+(test cltv-exact-match
+  "CLTV succeeds when nLockTime == script value."
+  (let* ((script (make-cltv-script 400000))
+         (result (call-execute-script-with-tx script 400000 1 0)))
+    (is-true (script-ok-p result))))
+
+(test cltv-type-mismatch-height-vs-time
+  "CLTV fails when script is height-based but tx locktime is time-based."
+  (let* ((script (make-cltv-script 400000))  ; height-based (< 500M)
+         (result (call-execute-script-with-tx script 500000001 1 0))) ; time-based (>= 500M)
+    (is-true (script-err-p result))))
+
+(test cltv-type-mismatch-time-vs-height
+  "CLTV fails when script is time-based but tx locktime is height-based."
+  (let* ((script (make-cltv-script 500000000))  ; time-based
+         (result (call-execute-script-with-tx script 400000 1 0))) ; height-based
+    (is-true (script-err-p result))))
+
+(test cltv-negative-value
+  "CLTV fails with negative locktime value."
+  (let* ((script (make-cltv-script -1))
+         (result (call-execute-script-with-tx script 400000 1 0)))
+    (is-true (script-err-p result))))
+
+(test cltv-unsatisfied-locktime
+  "CLTV fails when nLockTime < script value."
+  (let* ((script (make-cltv-script 400000))
+         (result (call-execute-script-with-tx script 399999 1 0)))
+    (is-true (script-err-p result))))
+
+(test cltv-sequence-final-fails
+  "CLTV fails when input sequence is 0xFFFFFFFF (locktime disabled)."
+  (let* ((script (make-cltv-script 400000))
+         (result (call-execute-script-with-tx script 400001 1 #xFFFFFFFF)))
+    (is-true (script-err-p result))))
+
+(test cltv-no-flag-acts-as-nop
+  "CLTV acts as NOP when flag not set (pre-activation)."
+  (let* ((script (make-cltv-script 400000))
+         ;; No CHECKLOCKTIMEVERIFY flag
+         (result (call-execute-script-with-tx script 0 1 #xFFFFFFFF "")))
+    (is-true (script-ok-p result))))
+
+(test cltv-does-not-pop-stack
+  "CLTV does not pop the locktime value from the stack."
+  (let* ((script (make-cltv-script 400000))
+         (result (call-execute-script-with-tx script 400001 1 0)))
+    (is-true (script-ok-p result))
+    ;; Stack should still have the locktime value
+    (is (= 1 (get-stack-depth (get-result-stack result))))))
+
+(test cltv-5-byte-script-number
+  "CLTV accepts 5-byte script numbers."
+  ;; 4294967295 = 0xFFFFFFFF needs 5 bytes in script number encoding
+  ;; (4 bytes + sign byte since high bit is set)
+  (let* ((script (make-cltv-script 4294967295))
+         (result (call-execute-script-with-tx script 4294967295 1 0)))
+    (is-true (script-ok-p result))))
+
+;;; ============================================================
+;;; CSV (BIP 112) Tests
+;;; ============================================================
+
+(defun make-csv-script (sequence-value)
+  "Build a script: <push sequence-value> OP_CHECKSEQUENCEVERIFY."
+  (make-push-then-opcode-script sequence-value #xb2))
+
+(defun call-execute-csv (script-bytes locktime version sequence)
+  "Execute a script with CSV flag enabled."
+  (call-execute-script-with-tx script-bytes locktime version sequence "CHECKSEQUENCEVERIFY"))
+
+(test csv-valid-height-based
+  "CSV succeeds with height-based relative lock satisfied."
+  ;; Script value: 10 blocks (height-based, bit 22 clear)
+  ;; Input sequence: 20 blocks (> 10)
+  (let* ((script (make-csv-script 10))
+         (result (call-execute-csv script 0 2 20)))
+    (is-true (script-ok-p result))))
+
+(test csv-valid-time-based
+  "CSV succeeds with time-based relative lock satisfied."
+  ;; Script value: 0x400003 (time-based, 3 units = 1536 seconds)
+  ;; Input sequence: 0x400004 (time-based, 4 units = 2048 seconds)
+  (let* ((script (make-csv-script #x400003))
+         (result (call-execute-csv script 0 2 #x400004)))
+    (is-true (script-ok-p result))))
+
+(test csv-tx-version-1-fails
+  "CSV fails when tx version < 2."
+  (let* ((script (make-csv-script 10))
+         (result (call-execute-csv script 0 1 20)))
+    (is-true (script-err-p result))))
+
+(test csv-disabled-flag-passes
+  "CSV passes when script value has disable flag (bit 31) set."
+  ;; 0x80000000 = disable flag set, should pass as NOP
+  (let* ((script (make-csv-script #x80000001))
+         (result (call-execute-csv script 0 2 0)))
+    (is-true (script-ok-p result))))
+
+(test csv-input-sequence-disabled
+  "CSV fails when input nSequence has disable flag (bit 31) set."
+  (let* ((script (make-csv-script 10))
+         (result (call-execute-csv script 0 2 #x80000000)))
+    (is-true (script-err-p result))))
+
+(test csv-type-mismatch
+  "CSV fails when script type (height) != input type (time)."
+  ;; Script: height-based (bit 22 clear), Input: time-based (bit 22 set)
+  (let* ((script (make-csv-script 10))
+         (result (call-execute-csv script 0 2 #x400010)))
+    (is-true (script-err-p result))))
+
+(test csv-unsatisfied-height-lock
+  "CSV fails when input sequence is less than required."
+  (let* ((script (make-csv-script 20))
+         (result (call-execute-csv script 0 2 10)))
+    (is-true (script-err-p result))))
+
+(test csv-negative-value
+  "CSV fails with negative sequence value."
+  (let* ((script (make-csv-script -1))
+         (result (call-execute-csv script 0 2 10)))
+    (is-true (script-err-p result))))
+
+(test csv-no-flag-acts-as-nop
+  "CSV acts as NOP when flag not set (pre-activation)."
+  (let* ((script (make-csv-script 10))
+         ;; No CHECKSEQUENCEVERIFY flag
+         (result (call-execute-script-with-tx script 0 1 0 "")))
+    (is-true (script-ok-p result))))
+
+(test csv-does-not-pop-stack
+  "CSV does not pop the sequence value from the stack."
+  (let* ((script (make-csv-script 10))
+         (result (call-execute-csv script 0 2 20)))
+    (is-true (script-ok-p result))
+    (is (= 1 (get-stack-depth (get-result-stack result))))))
+
+(test csv-5-byte-script-number
+  "CSV accepts 5-byte script numbers with disable flag."
+  ;; A large number with bit 31 set (disable) - should pass as NOP
+  (let* ((script (make-csv-script #x80000001))
+         (result (call-execute-csv script 0 2 0)))
+    (is-true (script-ok-p result))))
