@@ -786,7 +786,8 @@
   (define-type ScriptContext
     "Execution context for script validation.
      Fields: main-stack, alt-stack, script, position, condition-stack,
-             executing, op-count, codesep-pos"
+             executing, op-count, codesep-pos, tx-locktime, tx-version,
+             input-sequence"
     (ScriptContext
      ScriptStack      ; main-stack
      ScriptStack      ; alt-stack
@@ -795,11 +796,19 @@
      (List Boolean)   ; condition-stack (for IF/ELSE nesting)
      Boolean          ; executing (False in unexecuted IF branch)
      UFix             ; op-count (for 201 limit)
-     UFix))           ; codesep-pos (for CHECKSIG)
+     UFix             ; codesep-pos (for CHECKSIG)
+     U32           ; tx-locktime (nLockTime for CLTV)
+     I32           ; tx-version (for CSV version >= 2 check)
+     U32))         ; input-sequence (nSequence for CSV)
 
   (declare make-script-context ((Vector U8) -> ScriptContext))
   (define (make-script-context script)
-    "Create a new script execution context."
+    "Create a new script execution context with default transaction values."
+    (make-script-context-with-tx script 0 1 #xFFFFFFFF))
+
+  (declare make-script-context-with-tx ((Vector U8) -> U32 -> I32 -> U32 -> ScriptContext))
+  (define (make-script-context-with-tx script locktime version sequence)
+    "Create a new script execution context with transaction context."
     (ScriptContext
      (empty-stack)      ; main-stack
      (empty-stack)      ; alt-stack
@@ -808,83 +817,98 @@
      Nil                ; condition-stack
      True               ; executing
      0                  ; op-count
-     0))                ; codesep-pos
+     0                  ; codesep-pos
+     locktime           ; tx-locktime
+     version            ; tx-version
+     sequence))         ; input-sequence
 
   ;; Context accessors
   (declare context-main-stack (ScriptContext -> ScriptStack))
   (define (context-main-stack ctx)
-    (match ctx ((ScriptContext s _ _ _ _ _ _ _) s)))
+    (match ctx ((ScriptContext s _ _ _ _ _ _ _ _ _ _) s)))
 
   (declare context-alt-stack (ScriptContext -> ScriptStack))
   (define (context-alt-stack ctx)
-    (match ctx ((ScriptContext _ a _ _ _ _ _ _) a)))
+    (match ctx ((ScriptContext _ a _ _ _ _ _ _ _ _ _) a)))
 
   (declare context-script (ScriptContext -> (Vector U8)))
   (define (context-script ctx)
-    (match ctx ((ScriptContext _ _ s _ _ _ _ _) s)))
+    (match ctx ((ScriptContext _ _ s _ _ _ _ _ _ _ _) s)))
 
   (declare context-position (ScriptContext -> UFix))
   (define (context-position ctx)
-    (match ctx ((ScriptContext _ _ _ p _ _ _ _) p)))
+    (match ctx ((ScriptContext _ _ _ p _ _ _ _ _ _ _) p)))
 
   (declare context-condition-stack (ScriptContext -> (List Boolean)))
   (define (context-condition-stack ctx)
-    (match ctx ((ScriptContext _ _ _ _ c _ _ _) c)))
+    (match ctx ((ScriptContext _ _ _ _ c _ _ _ _ _ _) c)))
 
   (declare context-executing (ScriptContext -> Boolean))
   (define (context-executing ctx)
-    (match ctx ((ScriptContext _ _ _ _ _ e _ _) e)))
+    (match ctx ((ScriptContext _ _ _ _ _ e _ _ _ _ _) e)))
 
   (declare context-op-count (ScriptContext -> UFix))
   (define (context-op-count ctx)
-    (match ctx ((ScriptContext _ _ _ _ _ _ o _) o)))
+    (match ctx ((ScriptContext _ _ _ _ _ _ o _ _ _ _) o)))
 
   (declare context-codesep-pos (ScriptContext -> UFix))
   (define (context-codesep-pos ctx)
-    (match ctx ((ScriptContext _ _ _ _ _ _ _ c) c)))
+    (match ctx ((ScriptContext _ _ _ _ _ _ _ c _ _ _) c)))
+
+  (declare context-tx-locktime (ScriptContext -> U32))
+  (define (context-tx-locktime ctx)
+    (match ctx ((ScriptContext _ _ _ _ _ _ _ _ locktime _ _) locktime)))
+
+  (declare context-tx-version (ScriptContext -> I32))
+  (define (context-tx-version ctx)
+    (match ctx ((ScriptContext _ _ _ _ _ _ _ _ _ ver _) ver)))
+
+  (declare context-input-sequence (ScriptContext -> U32))
+  (define (context-input-sequence ctx)
+    (match ctx ((ScriptContext _ _ _ _ _ _ _ _ _ _ sq) sq)))
 
   ;; Context update helpers
   (declare context-with-main-stack (ScriptStack -> ScriptContext -> ScriptContext))
   (define (context-with-main-stack stack ctx)
     (match ctx
-      ((ScriptContext _ alt script pos cond exec ops codesep)
-       (ScriptContext stack alt script pos cond exec ops codesep))))
+      ((ScriptContext _ alt script pos cond exec ops codesep locktime version seqnum)
+       (ScriptContext stack alt script pos cond exec ops codesep locktime version seqnum))))
 
   (declare context-with-alt-stack (ScriptStack -> ScriptContext -> ScriptContext))
   (define (context-with-alt-stack alt ctx)
     (match ctx
-      ((ScriptContext main _ script pos cond exec ops codesep)
-       (ScriptContext main alt script pos cond exec ops codesep))))
+      ((ScriptContext main _ script pos cond exec ops codesep locktime version seqnum)
+       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
 
   (declare context-with-position (UFix -> ScriptContext -> ScriptContext))
   (define (context-with-position pos ctx)
     (match ctx
-      ((ScriptContext main alt script _ cond exec ops codesep)
-       (ScriptContext main alt script pos cond exec ops codesep))))
+      ((ScriptContext main alt script _ cond exec ops codesep locktime version seqnum)
+       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
 
   (declare context-with-condition-stack ((List Boolean) -> ScriptContext -> ScriptContext))
   (define (context-with-condition-stack cond ctx)
     (match ctx
-      ((ScriptContext main alt script pos _ exec ops codesep)
-       (ScriptContext main alt script pos cond exec ops codesep))))
+      ((ScriptContext main alt script pos _ exec ops codesep locktime version seqnum)
+       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
 
   (declare context-with-executing (Boolean -> ScriptContext -> ScriptContext))
   (define (context-with-executing exec ctx)
     (match ctx
-      ((ScriptContext main alt script pos cond _ ops codesep)
-       (ScriptContext main alt script pos cond exec ops codesep))))
+      ((ScriptContext main alt script pos cond _ ops codesep locktime version seqnum)
+       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
 
   (declare context-with-op-count (UFix -> ScriptContext -> ScriptContext))
   (define (context-with-op-count ops ctx)
     (match ctx
-      ((ScriptContext main alt script pos cond exec _ codesep)
-       (ScriptContext main alt script pos cond exec ops codesep))))
+      ((ScriptContext main alt script pos cond exec _ codesep locktime version seqnum)
+       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
 
   (declare context-with-codesep-pos (UFix -> ScriptContext -> ScriptContext))
   (define (context-with-codesep-pos codesep ctx)
     (match ctx
-      ((ScriptContext main alt script pos cond exec ops _)
-       (ScriptContext main alt script pos cond exec ops codesep))))
+      ((ScriptContext main alt script pos cond exec ops _ locktime version seqnum)
+       (ScriptContext main alt script pos cond exec ops codesep locktime version seqnum))))
 
   (declare advance-position (UFix -> ScriptContext -> ScriptContext))
   (define (advance-position n ctx)
@@ -1008,6 +1032,25 @@
   (declare false-bytes (Unit -> (Vector U8)))
   (define (false-bytes)
     (lisp (Vector U8) () #()))
+
+  ;; Helper: check DISCOURAGE_UPGRADABLE_NOPS and return error or pass
+  (declare check-discouraged-nop (ScriptContext -> (ScriptResult ScriptContext)))
+  (define (check-discouraged-nop ctx)
+    "If DISCOURAGE_UPGRADABLE_NOPS flag is set, return error; otherwise pass."
+    (let ((discourage (lisp Boolean ()
+                        (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
+                                    "DISCOURAGE_UPGRADABLE_NOPS"))))
+      (if discourage
+          (ScriptErr SE-DiscourageUpgradableNops)
+          (ScriptOk ctx))))
+
+  ;; Helper: check if a script flag is enabled
+  (declare flag-enabled (String -> Boolean))
+  (define (flag-enabled flag-name)
+    "Check if a script verification flag is enabled."
+    (lisp Boolean (flag-name)
+      (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
+                  flag-name)))
 
   ;; Execute a single opcode
   (declare execute-opcode (Opcode -> ScriptContext -> (ScriptResult ScriptContext)))
@@ -1992,115 +2035,89 @@
 
       ;; Timelocks and NOP1-10
       ;; NOP1 and NOP4-10 are true no-ops unless DISCOURAGE_UPGRADABLE_NOPS flag is set
-      ((OP-NOP1)
-       (let ((discourage (lisp Boolean ()
-                           (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                       "DISCOURAGE_UPGRADABLE_NOPS"))))
-         (if discourage
-             (ScriptErr SE-DiscourageUpgradableNops)
-             (ScriptOk ctx))))
-      ((OP-NOP4)
-       (let ((discourage (lisp Boolean ()
-                           (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                       "DISCOURAGE_UPGRADABLE_NOPS"))))
-         (if discourage
-             (ScriptErr SE-DiscourageUpgradableNops)
-             (ScriptOk ctx))))
-      ((OP-NOP5)
-       (let ((discourage (lisp Boolean ()
-                           (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                       "DISCOURAGE_UPGRADABLE_NOPS"))))
-         (if discourage
-             (ScriptErr SE-DiscourageUpgradableNops)
-             (ScriptOk ctx))))
-      ((OP-NOP6)
-       (let ((discourage (lisp Boolean ()
-                           (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                       "DISCOURAGE_UPGRADABLE_NOPS"))))
-         (if discourage
-             (ScriptErr SE-DiscourageUpgradableNops)
-             (ScriptOk ctx))))
-      ((OP-NOP7)
-       (let ((discourage (lisp Boolean ()
-                           (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                       "DISCOURAGE_UPGRADABLE_NOPS"))))
-         (if discourage
-             (ScriptErr SE-DiscourageUpgradableNops)
-             (ScriptOk ctx))))
-      ((OP-NOP8)
-       (let ((discourage (lisp Boolean ()
-                           (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                       "DISCOURAGE_UPGRADABLE_NOPS"))))
-         (if discourage
-             (ScriptErr SE-DiscourageUpgradableNops)
-             (ScriptOk ctx))))
-      ((OP-NOP9)
-       (let ((discourage (lisp Boolean ()
-                           (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                       "DISCOURAGE_UPGRADABLE_NOPS"))))
-         (if discourage
-             (ScriptErr SE-DiscourageUpgradableNops)
-             (ScriptOk ctx))))
-      ((OP-NOP10)
-       (let ((discourage (lisp Boolean ()
-                           (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                       "DISCOURAGE_UPGRADABLE_NOPS"))))
-         (if discourage
-             (ScriptErr SE-DiscourageUpgradableNops)
-             (ScriptOk ctx))))
+      ((OP-NOP1) (check-discouraged-nop ctx))
+      ((OP-NOP4) (check-discouraged-nop ctx))
+      ((OP-NOP5) (check-discouraged-nop ctx))
+      ((OP-NOP6) (check-discouraged-nop ctx))
+      ((OP-NOP7) (check-discouraged-nop ctx))
+      ((OP-NOP8) (check-discouraged-nop ctx))
+      ((OP-NOP9) (check-discouraged-nop ctx))
+      ((OP-NOP10) (check-discouraged-nop ctx))
 
       ;; CHECKLOCKTIMEVERIFY (BIP 65)
-      ;; Only enforce when CHECKLOCKTIMEVERIFY flag is set
       ((OP-CHECKLOCKTIMEVERIFY)
-       (let ((cltv-enabled (lisp Boolean ()
-                             (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                         "CHECKLOCKTIMEVERIFY"))))
-         (if (not cltv-enabled)
-             ;; No CLTV flag - treat as NOP
-             (ScriptOk ctx)
-             ;; CLTV flag enabled - validate
+       (if (not (flag-enabled "CHECKLOCKTIMEVERIFY"))
+           ;; No CLTV flag - treat as NOP2
+           (check-discouraged-nop ctx)
+           ;; CLTV flag enabled - full BIP 65 validation
+             ;; Does NOT pop the stack value
              (match (stack-top (context-main-stack ctx))
                ((None) (ScriptErr SE-StackUnderflow))
                ((Some top)
-                ;; Check if disabled (bit 31 set means disabled, pass)
-                ;; Script number: if top byte >= 0x80 and length is 5, bit 31 is set
-                (let ((len (lisp UFix (top) (cl:length top))))
-                  (if (and (== len 5)
-                           (>= (lisp U8 (top) (cl:aref top 4)) #x80))
-                      ;; Disabled flag set - pass
-                      (ScriptOk ctx)
-                      ;; Not disabled - for now pass without tx context check
-                      ;; In production, would verify against nLockTime
-                      (ScriptOk ctx))))))))
-
-      ;; CHECKSEQUENCEVERIFY (BIP 112)
-      ((OP-CHECKSEQUENCEVERIFY)
-       ;; Only enforce when CHECKSEQUENCEVERIFY flag is set
-       (let ((csv-enabled (lisp Boolean ()
-                            (cl:funcall (cl:fdefinition (cl:intern "FLAG-ENABLED-P" "BITCOIN-LISP.COALTON.INTEROP"))
-                                        "CHECKSEQUENCEVERIFY"))))
-         (if (not csv-enabled)
-             ;; No CSV flag - treat as NOP
-             (ScriptOk ctx)
-             ;; CSV flag enabled - validate
-             (match (stack-top (context-main-stack ctx))
-               ((None) (ScriptErr SE-StackUnderflow))
-               ((Some top)
-                ;; MINIMALDATA: validate that stack top is minimally encoded
-                (match (bytes-to-script-num top)
+                ;; 5-byte script number (not the default 4-byte arithmetic limit)
+                (match (bytes-to-script-num-limited top 5)
                   ((ScriptErr e) (ScriptErr e))
                   ((ScriptOk sn)
                    (let ((n (script-num-value sn)))
-                     (cond
-                       ;; Negative locktime value fails
-                       ((< n 0) (ScriptErr SE-NegativeLocktime))
-                       ;; Bit 31 set = disabled, pass as NOP
-                       ((/= 0 (lisp Integer (n) (cl:logand n #x80000000)))
-                        (ScriptOk ctx))
-                       ;; Otherwise, in test context tx version is 1,
-                       ;; which is < 2, so CSV fails
-                       ;; (In production would check actual tx version and nSequence)
-                       (True (ScriptErr SE-UnsatisfiedLocktime)))))))))))))
+                     ;; Must be non-negative
+                     (if (< n 0)
+                         (ScriptErr SE-NegativeLocktime)
+                         (let ((tx-lt (the Integer (into (context-tx-locktime ctx)))))
+                           ;; Type match: both height-based or both time-based
+                           ;; Height: < 500,000,000. Time: >= 500,000,000
+                           (if (lisp Boolean (n tx-lt)
+                                 (cl:not (cl:or (cl:and (cl:< n 500000000) (cl:< tx-lt 500000000))
+                                                (cl:and (cl:>= n 500000000) (cl:>= tx-lt 500000000)))))
+                               (ScriptErr SE-UnsatisfiedLocktime)
+                               ;; Stack top must be <= nLockTime
+                               (if (> n tx-lt)
+                                   (ScriptErr SE-UnsatisfiedLocktime)
+                                   ;; Input nSequence must not be 0xFFFFFFFF (locktime disabled)
+                                   (if (== (context-input-sequence ctx) #xFFFFFFFF)
+                                       (ScriptErr SE-UnsatisfiedLocktime)
+                                       (ScriptOk ctx)))))))))))))
+
+      ;; CHECKSEQUENCEVERIFY (BIP 112)
+      ((OP-CHECKSEQUENCEVERIFY)
+       (if (not (flag-enabled "CHECKSEQUENCEVERIFY"))
+           ;; No CSV flag - treat as NOP3
+           (check-discouraged-nop ctx)
+           ;; CSV flag enabled - full BIP 112 validation
+             ;; Does NOT pop the stack value
+             (match (stack-top (context-main-stack ctx))
+               ((None) (ScriptErr SE-StackUnderflow))
+               ((Some top)
+                ;; 5-byte script number (not the default 4-byte arithmetic limit)
+                (match (bytes-to-script-num-limited top 5)
+                  ((ScriptErr e) (ScriptErr e))
+                  ((ScriptOk sn)
+                   (let ((n (script-num-value sn)))
+                     ;; Must be non-negative
+                     (if (< n 0)
+                         (ScriptErr SE-NegativeLocktime)
+                         ;; If bit 31 (disable flag) is set on stack value, pass as NOP
+                         (if (/= 0 (lisp Integer (n) (cl:logand n #x80000000)))
+                             (ScriptOk ctx)
+                             ;; Transaction version must be >= 2
+                             (if (< (context-tx-version ctx) 2)
+                                 (ScriptErr SE-UnsatisfiedLocktime)
+                                 ;; Input nSequence bit 31 must not be set (disable flag)
+                                 (let ((input-seq (the Integer (into (context-input-sequence ctx)))))
+                                   (if (/= 0 (lisp Integer (input-seq) (cl:logand input-seq #x80000000)))
+                                       (ScriptErr SE-UnsatisfiedLocktime)
+                                       ;; Mask both with 0x0040FFFF and compare
+                                       (let ((n-masked (lisp Integer (n) (cl:logand n #x0040FFFF)))
+                                             (seq-masked (lisp Integer (input-seq) (cl:logand input-seq #x0040FFFF))))
+                                         ;; Type flags (bit 22) must match
+                                         (if (lisp Boolean (n-masked seq-masked)
+                                               (cl:not (cl:or
+                                                        (cl:and (cl:< n-masked #x00400000) (cl:< seq-masked #x00400000))
+                                                        (cl:and (cl:>= n-masked #x00400000) (cl:>= seq-masked #x00400000)))))
+                                             (ScriptErr SE-UnsatisfiedLocktime)
+                                             ;; Stack top masked value must be <= nSequence masked value
+                                             (if (> n-masked seq-masked)
+                                                 (ScriptErr SE-UnsatisfiedLocktime)
+                                                 (ScriptOk ctx))))))))))))))))))
 
   ;;; ============================================================
   ;;; Script Execution
@@ -2108,13 +2125,18 @@
 
   (declare execute-script ((Vector U8) -> (ScriptResult ScriptStack)))
   (define (execute-script script)
-    "Execute a script and return the final stack.
+    "Execute a script and return the final stack (default tx context)."
+    (execute-script-with-tx script 0 1 #xFFFFFFFF))
+
+  (declare execute-script-with-tx ((Vector U8) -> U32 -> I32 -> U32 -> (ScriptResult ScriptStack)))
+  (define (execute-script-with-tx script locktime version sequence)
+    "Execute a script with transaction context.
      Returns ScriptErr on failure or ScriptOk with final stack on success."
     (let ((len (the UFix (coalton-library/vector:length script))))
       ;; Check script size limit
       (if (> len +max-script-size+)
           (ScriptErr SE-ScriptTooLarge)
-          (execute-script-loop (make-script-context script)))))
+          (execute-script-loop (make-script-context-with-tx script locktime version sequence)))))
 
   (declare execute-script-loop (ScriptContext -> (ScriptResult ScriptStack)))
   (define (execute-script-loop ctx)
@@ -2250,17 +2272,21 @@
 
   (declare execute-script-with-stack ((Vector U8) -> ScriptStack -> (ScriptResult ScriptStack)))
   (define (execute-script-with-stack script initial-stack)
-    "Execute a script with an initial stack.
-     Used for scriptPubKey execution after scriptSig."
+    "Execute a script with an initial stack (default tx context)."
+    (execute-script-with-stack-tx script initial-stack 0 1 #xFFFFFFFF))
+
+  (declare execute-script-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> (ScriptResult ScriptStack)))
+  (define (execute-script-with-stack-tx script initial-stack locktime version sequence)
+    "Execute a script with an initial stack and transaction context."
     (let ((len (the UFix (coalton-library/vector:length script))))
       (if (> len +max-script-size+)
           (ScriptErr SE-ScriptTooLarge)
-          (execute-script-loop (make-script-context-with-stack script initial-stack)))))
+          (execute-script-loop (make-script-context-with-stack-tx script initial-stack locktime version sequence)))))
 
-  (declare make-script-context-with-stack ((Vector U8) -> ScriptStack -> ScriptContext))
-  (define (make-script-context-with-stack script initial-stack)
-    "Create a script context with a pre-populated stack."
-    (ScriptContext initial-stack (empty-stack) script 0 Nil True 0 0))
+  (declare make-script-context-with-stack-tx ((Vector U8) -> ScriptStack -> U32 -> I32 -> U32 -> ScriptContext))
+  (define (make-script-context-with-stack-tx script initial-stack locktime version sequence)
+    "Create a script context with a pre-populated stack and transaction context."
+    (ScriptContext initial-stack (empty-stack) script 0 Nil True 0 0 locktime version sequence))
 
   ;;; P2SH Support
 
@@ -2281,6 +2307,11 @@
   (declare validate-p2sh (ScriptStack -> (Vector U8) -> (ScriptResult ScriptStack)))
   (define (validate-p2sh stack script-pubkey)
     "Validate P2SH: pop redeem script, check hash, execute redeem script."
+    (validate-p2sh-with-tx stack script-pubkey 0 1 #xFFFFFFFF))
+
+  (declare validate-p2sh-with-tx (ScriptStack -> (Vector U8) -> U32 -> I32 -> U32 -> (ScriptResult ScriptStack)))
+  (define (validate-p2sh-with-tx stack script-pubkey locktime version sequence)
+    "Validate P2SH with transaction context."
     (match (stack-pop stack)
       ((None) (ScriptErr SE-StackUnderflow))
       ((Some (Tuple redeem-script remaining-stack))
@@ -2291,7 +2322,7 @@
            (if (lisp Boolean (redeem-hash expected-hash)
                  (cl:equalp (hash160-bytes redeem-hash) expected-hash))
                ;; Hash matches - execute redeem script with remaining stack
-               (execute-script-with-stack redeem-script remaining-stack)
+               (execute-script-with-stack-tx redeem-script remaining-stack locktime version sequence)
                ;; Hash mismatch
                (ScriptErr SE-VerifyFailed)))))))
 
@@ -2395,20 +2426,24 @@
 
   (declare execute-scripts ((Vector U8) -> (Vector U8) -> Boolean -> (ScriptResult ScriptStack)))
   (define (execute-scripts script-sig script-pubkey p2sh-enabled)
-    "Execute scriptSig then scriptPubKey, with optional P2SH support."
+    "Execute scriptSig then scriptPubKey, with optional P2SH support (default tx context)."
+    (execute-scripts-with-tx script-sig script-pubkey p2sh-enabled 0 1 #xFFFFFFFF))
+
+  (declare execute-scripts-with-tx ((Vector U8) -> (Vector U8) -> Boolean -> U32 -> I32 -> U32 -> (ScriptResult ScriptStack)))
+  (define (execute-scripts-with-tx script-sig script-pubkey p2sh-enabled locktime version sequence)
+    "Execute scriptSig then scriptPubKey, with optional P2SH support and transaction context."
     ;; First execute scriptSig
-    (match (execute-script script-sig)
+    (match (execute-script-with-tx script-sig locktime version sequence)
       ((ScriptErr e) (ScriptErr e))
       ((ScriptOk sig-stack)
        ;; Then execute scriptPubKey with the resulting stack
-       (match (execute-script-with-stack script-pubkey sig-stack)
+       (match (execute-script-with-stack-tx script-pubkey sig-stack locktime version sequence)
          ((ScriptErr e) (ScriptErr e))
          ((ScriptOk final-stack)
           ;; Check if we need to do P2SH
           (if (and p2sh-enabled (is-p2sh-script script-pubkey))
               ;; For P2SH, use the stack after scriptSig (before scriptPubKey consumed it)
-              ;; Actually we need the original sig-stack with redeem script on top
-              (validate-p2sh sig-stack script-pubkey)
+              (validate-p2sh-with-tx sig-stack script-pubkey locktime version sequence)
               ;; Not P2SH - just return the result
               (ScriptOk final-stack)))))))
 

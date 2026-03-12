@@ -570,3 +570,67 @@
       (is (null valid))
       (is (eq :missing-witness-commitment error)))))
 
+;;; ============================================================
+;;; Transaction Finality (IsFinalTx) Tests
+;;; ============================================================
+
+(defun make-tx-with-locktime (locktime &key (version 1) (sequence #xFFFFFFFF))
+  "Create a test transaction with specified nLockTime and input sequence."
+  (bitcoin-lisp.serialization:make-transaction
+   :version version
+   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                  :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                    :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                      :initial-element 1)
+                                    :index 0)
+                  :script-sig (make-array 10 :element-type '(unsigned-byte 8)
+                                          :initial-element #x00)
+                  :sequence sequence))
+   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                   :value 50000000
+                   :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                              :initial-element #x76)))
+   :lock-time locktime))
+
+(test is-final-locktime-zero
+  "Transaction with nLockTime=0 is always final."
+  (let ((tx (make-tx-with-locktime 0 :sequence 0)))
+    (is-true (bitcoin-lisp.validation:check-transaction-final tx 100 1600000000))))
+
+(test is-final-all-sequences-final
+  "Transaction with all SEQUENCE_FINAL inputs is final regardless of locktime."
+  (let ((tx (make-tx-with-locktime 500000 :sequence #xFFFFFFFF)))
+    (is-true (bitcoin-lisp.validation:check-transaction-final tx 100 1600000000))))
+
+(test is-final-height-based-satisfied
+  "Height-based locktime satisfied when block height > nLockTime."
+  (let ((tx (make-tx-with-locktime 400000 :sequence 0)))
+    (is-true (bitcoin-lisp.validation:check-transaction-final tx 400001 1600000000))))
+
+(test is-final-height-based-not-satisfied
+  "Height-based locktime NOT satisfied when block height <= nLockTime."
+  (let ((tx (make-tx-with-locktime 400000 :sequence 0)))
+    (is-false (bitcoin-lisp.validation:check-transaction-final tx 399999 1600000000))))
+
+(test is-final-time-based-satisfied
+  "Time-based locktime satisfied when block time > nLockTime."
+  (let ((tx (make-tx-with-locktime 1600000000 :sequence 0)))
+    (is-true (bitcoin-lisp.validation:check-transaction-final tx 500000 1600000001))))
+
+(test is-final-time-based-not-satisfied
+  "Time-based locktime NOT satisfied when block time <= nLockTime."
+  (let ((tx (make-tx-with-locktime 1600000000 :sequence 0)))
+    (is-false (bitcoin-lisp.validation:check-transaction-final tx 500000 1599999999))))
+
+(test is-final-height-locktime-boundary
+  "nLockTime at 499999999 is height-based (< 500000000 threshold)."
+  (let ((tx (make-tx-with-locktime 499999999 :sequence 0)))
+    ;; Block height exceeds locktime
+    (is-true (bitcoin-lisp.validation:check-transaction-final tx 500000000 0))))
+
+(test is-final-time-locktime-boundary
+  "nLockTime at 500000000 is time-based (>= threshold)."
+  (let ((tx (make-tx-with-locktime 500000000 :sequence 0)))
+    ;; Block time exceeds locktime
+    (is-true (bitcoin-lisp.validation:check-transaction-final tx 0 500000001))))
+

@@ -42,6 +42,7 @@
    #:is-p2sh-script-p
    #:stack-top-truthy-p
    ;; Script flags
+   #:*script-flags*
    #:set-script-flags
    #:flag-enabled-p
    ;; Signature verification
@@ -237,17 +238,36 @@
    For P2SH, the credit transaction must use the P2SH scriptPubKey (OP_HASH160 <hash> OP_EQUAL),
    while the sighash scriptCode uses the redeemScript.")
 
+(defun current-input-sequence ()
+  "Extract nSequence for the current input from *current-tx*, or #xFFFFFFFF if unavailable."
+  (if (and *current-tx* (bitcoin-lisp.serialization:transaction-inputs *current-tx*))
+      (let ((inputs (bitcoin-lisp.serialization:transaction-inputs *current-tx*)))
+        (if (< *current-input-index* (length inputs))
+            (bitcoin-lisp.serialization:tx-in-sequence (nth *current-input-index* inputs))
+            #xFFFFFFFF))
+      #xFFFFFFFF))
+
 (defun run-scripts-with-p2sh (script-sig script-pubkey p2sh-enabled)
   "Execute scriptSig then scriptPubKey with optional P2SH.
+   Extracts transaction context from *current-tx* and *current-input-index*.
    Returns (values success stack-or-error)."
   (let* ((sig-vec (cl-array-to-coalton-vector script-sig))
          (pubkey-vec (cl-array-to-coalton-vector script-pubkey))
          ;; Store original scriptPubKey for sighash computation
          (*original-script-pubkey* script-pubkey)
-         (result (bitcoin-lisp.coalton.script:execute-scripts
+         ;; Extract transaction context
+         (locktime (if *current-tx*
+                       (bitcoin-lisp.serialization:transaction-lock-time *current-tx*)
+                       0))
+         (version (if *current-tx*
+                      (bitcoin-lisp.serialization:transaction-version *current-tx*)
+                      1))
+         (sequence (current-input-sequence))
+         (result (bitcoin-lisp.coalton.script:execute-scripts-with-tx
                   sig-vec
                   pubkey-vec
-                  (if p2sh-enabled coalton:True coalton:False))))
+                  (if p2sh-enabled coalton:True coalton:False)
+                  locktime version sequence)))
     (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
         (values t (bitcoin-lisp.coalton.script:get-ok-stack result))
         (values nil :error))))
