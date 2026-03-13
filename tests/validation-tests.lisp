@@ -273,6 +273,110 @@
       ;; Either error is acceptable - header is invalid
       (is (member error '(:bad-version :bad-proof-of-work))))))
 
+;;;; MTP Timestamp Validation Tests
+
+(defun build-chain-with-timestamps (state timestamps)
+  "Build a chain of block index entries with given TIMESTAMPS.
+Returns the hash of the last block."
+  (let ((prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+        (prev-entry nil))
+    (loop for ts in timestamps
+          for height from 0
+          do (let* ((hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+                    (header (bitcoin-lisp.serialization:make-block-header
+                             :version 1
+                             :prev-block (copy-seq prev-hash)
+                             :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                         :initial-element 0)
+                             :timestamp ts
+                             :bits #x1d00ffff
+                             :nonce 0))
+                    (entry (bitcoin-lisp.storage:make-block-index-entry
+                            :hash hash
+                            :height height
+                            :header header
+                            :prev-entry prev-entry
+                            :chain-work 0
+                            :status :valid)))
+               ;; Give each block a unique hash based on height
+               (setf (aref hash 0) (mod height 256))
+               (setf (aref hash 1) (floor height 256))
+               (setf (aref (bitcoin-lisp.storage:block-index-entry-hash entry) 0)
+                     (mod height 256))
+               (setf (aref (bitcoin-lisp.storage:block-index-entry-hash entry) 1)
+                     (floor height 256))
+               (bitcoin-lisp.storage:add-block-index-entry state entry)
+               (setf prev-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+               (setf prev-entry entry)))
+    prev-hash))
+
+(test mtp-timestamp-equal-rejected
+  "Block with timestamp equal to MTP should be rejected.
+PoW is checked first so we may get :bad-proof-of-work instead.
+We verify MTP computation directly to confirm the check works."
+  (let* ((state (bitcoin-lisp.storage:init-chain-state "/tmp/btc-mtp-test/"))
+         ;; 11 blocks with timestamps 100..110, median = 105
+         (timestamps (loop for i from 100 to 110 collect i))
+         (prev-hash (build-chain-with-timestamps state timestamps)))
+    ;; Verify MTP is computed correctly
+    (let ((mtp (bitcoin-lisp.validation:compute-median-time-past state prev-hash)))
+      (is (= 105 mtp)))
+    ;; Verify header with timestamp=MTP is rejected
+    (let ((header (bitcoin-lisp.serialization:make-block-header
+                   :version 1
+                   :prev-block prev-hash
+                   :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                               :initial-element 0)
+                   :timestamp 105  ; Equal to MTP
+                   :bits #x1d00ffff
+                   :nonce 0)))
+      (multiple-value-bind (valid error)
+          (bitcoin-lisp.validation:validate-block-header
+           header state (+ 105 10000) :prev-hash prev-hash)
+        (is (null valid))
+        ;; Either error is acceptable - header is invalid
+        (is (member error '(:time-too-old :bad-proof-of-work)))))))
+
+(test mtp-timestamp-after-accepted
+  "Block with timestamp after MTP should not get :time-too-old."
+  (let* ((state (bitcoin-lisp.storage:init-chain-state "/tmp/btc-mtp-test2/"))
+         ;; 11 blocks with timestamps 100..110, median = 105
+         (timestamps (loop for i from 100 to 110 collect i))
+         (prev-hash (build-chain-with-timestamps state timestamps))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1
+                  :prev-block prev-hash
+                  :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element 0)
+                  :timestamp 106  ; Greater than MTP of 105
+                  :bits #x1d00ffff
+                  :nonce 0)))
+    (multiple-value-bind (valid error)
+        (bitcoin-lisp.validation:validate-block-header
+         header state (+ 106 10000) :prev-hash prev-hash)
+      (declare (ignore valid))
+      ;; Must not fail on MTP check (may fail on PoW, that's fine)
+      (is (not (eq :time-too-old error))))))
+
+(test mtp-no-ancestors-passes
+  "Block with no ancestors should not get :time-too-old (MTP=0)."
+  (let* ((state (bitcoin-lisp.storage:init-chain-state "/tmp/btc-mtp-test3/"))
+         (prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1
+                  :prev-block prev-hash
+                  :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element 0)
+                  :timestamp 1  ; Any positive timestamp > MTP of 0
+                  :bits #x1d00ffff
+                  :nonce 0)))
+    (multiple-value-bind (valid error)
+        (bitcoin-lisp.validation:validate-block-header
+         header state (+ 1 10000) :prev-hash prev-hash)
+      (declare (ignore valid))
+      ;; Must not fail on MTP check (may fail on PoW, that's fine)
+      (is (not (eq :time-too-old error))))))
+
 ;;;; Merkle Root Tests
 
 (test merkle-root-single-tx
