@@ -181,6 +181,16 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                                       prev-height
                                       (bitcoin-lisp.storage:block-index-entry-height parent)))
                    (new-height (1+ parent-height)))
+
+              ;; Validate difficulty adjustment
+              (multiple-value-bind (valid error)
+                  (bitcoin-lisp.validation:validate-difficulty
+                   header new-height parent)
+                (declare (ignore error))
+                (unless valid
+                  (return-from validate-header-chain
+                    (values (nreverse valid-headers)
+                            (format nil "Bad difficulty at height ~D" new-height)))))
               (unless (validate-checkpoint hash new-height)
                 (return-from validate-header-chain
                   (values (nreverse valid-headers)

@@ -109,6 +109,8 @@
                              ;; ADDRv2 tests (BIP 155)
                              (:file "addrv2-tests")
                              ;; DoS protection tests
-                             (:file "dos-protection-tests"))))
+                             (:file "dos-protection-tests")
+                             ;; Difficulty adjustment tests
+                             (:file "difficulty-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
