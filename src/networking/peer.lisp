@@ -139,7 +139,7 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
                   (bitcoin-lisp:log-warn "Oversized message from peer ~A: ~D bytes (max ~D), disconnecting"
                                          (peer-address peer) payload-len bitcoin-lisp:+max-message-payload+)
                   (disconnect-peer peer)
-                  (return-from receive-message nil)))
+                  (return-from receive-message nil))
                 ;; Read payload
                 (let ((payload (if (zerop payload-len)
                                    #()
@@ -152,7 +152,7 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
                       (when (equalp (subseq computed-checksum 0 4)
                                     (bitcoin-lisp.serialization:message-header-checksum header))
                         (values (bitcoin-lisp.serialization:message-header-command header)
-                                payload))))))))))))))
+                                payload)))))))))))))
 
 ;;; Handshake
 
@@ -252,7 +252,7 @@ Returns T on success, NIL on failure."
   "Check if a peer has exceeded the handshake timeout.
 Returns :disconnect if the peer should be disconnected, :ok otherwise."
   (when (and (member (peer-state peer) '(:connected :connecting :handshaking))
-             (> (peer-connect-time peer) 0))
+             (not (zerop (peer-connect-time peer))))
     (let* ((now (get-internal-real-time))
            (elapsed-secs (/ (float (- now (peer-connect-time peer)))
                             (float internal-time-units-per-second))))
