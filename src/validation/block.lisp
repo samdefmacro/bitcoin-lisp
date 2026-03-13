@@ -176,6 +176,114 @@ Returns a comma-separated string of enabled flags, or NIL if none."
    (bitcoin-lisp.crypto:hex-to-bytes "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"))
   "Block hash that is exempted from BIP 16 script verification on mainnet (little-endian).")
 
+;;;; Difficulty adjustment validation
+
+(defconstant +testnet-min-difficulty-spacing+ 1200
+  "Seconds (20 minutes) after which testnet allows min-difficulty blocks.")
+
+(defun testnet-min-difficulty-allowed-p (block-timestamp prev-timestamp)
+  "Check if a testnet block is allowed to use minimum difficulty.
+Returns T if more than 20 minutes have elapsed since the previous block."
+  (> block-timestamp (+ prev-timestamp +testnet-min-difficulty-spacing+)))
+
+(defun testnet-walk-back-bits (entry)
+  "Walk back through the chain from ENTRY to find the last non-min-difficulty bits.
+Stops at a block that either sits at a retarget boundary (height % 2016 == 0)
+or does not have min-difficulty bits. Returns that block's bits value."
+  (let ((current entry))
+    (loop while (and current
+                     (bitcoin-lisp.storage:block-index-entry-prev-entry current)
+                     (/= 0 (mod (bitcoin-lisp.storage:block-index-entry-height current)
+                                 bitcoin-lisp.storage:+difficulty-adjustment-interval+))
+                     (= (bitcoin-lisp.serialization:block-header-bits
+                         (bitcoin-lisp.storage:block-index-entry-header current))
+                        bitcoin-lisp.storage:+pow-limit-bits+))
+          do (setf current (bitcoin-lisp.storage:block-index-entry-prev-entry current)))
+    (if (and current (bitcoin-lisp.storage:block-index-entry-header current))
+        (bitcoin-lisp.serialization:block-header-bits
+         (bitcoin-lisp.storage:block-index-entry-header current))
+        bitcoin-lisp.storage:+pow-limit-bits+)))
+
+(defun get-retarget-ancestor (entry)
+  "Walk back from ENTRY to the block at the start of its retarget period.
+For a block at height H, this returns the entry at height H - (H mod 2016).
+Bitcoin Core's off-by-one: the timespan is measured from this block to ENTRY."
+  (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
+         (interval bitcoin-lisp.storage:+difficulty-adjustment-interval+)
+         (blocks-back (mod height interval))
+         (current entry))
+    (dotimes (i blocks-back)
+      (let ((prev (bitcoin-lisp.storage:block-index-entry-prev-entry current)))
+        (unless prev (return))
+        (setf current prev)))
+    current))
+
+(defun get-expected-bits (height prev-entry)
+  "Compute the expected bits for a block at HEIGHT with previous block PREV-ENTRY.
+Handles: first retarget period, retarget boundaries, non-boundaries,
+and testnet min-difficulty exception."
+  (let ((interval bitcoin-lisp.storage:+difficulty-adjustment-interval+))
+    (cond
+      ;; Genesis block or no previous entry
+      ((or (zerop height) (null prev-entry))
+       bitcoin-lisp.storage:+pow-limit-bits+)
+
+      ;; Retarget boundary (height is a multiple of 2016)
+      ((zerop (mod height interval))
+       (let* ((last-retarget-entry (get-retarget-ancestor prev-entry))
+              (last-retarget-time
+                (bitcoin-lisp.serialization:block-header-timestamp
+                 (bitcoin-lisp.storage:block-index-entry-header last-retarget-entry)))
+              (last-block-time
+                (bitcoin-lisp.serialization:block-header-timestamp
+                 (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+              (prev-bits
+                (bitcoin-lisp.serialization:block-header-bits
+                 (bitcoin-lisp.storage:block-index-entry-header prev-entry))))
+         (bitcoin-lisp.storage:calculate-next-work-required
+          last-retarget-time last-block-time prev-bits)))
+
+      ;; Non-boundary: mainnet just inherits previous bits
+      ((eq bitcoin-lisp:*network* :mainnet)
+       (bitcoin-lisp.serialization:block-header-bits
+        (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+
+      ;; Non-boundary on testnet: return nil to indicate caller must check
+      ;; timestamp-based min-difficulty or walk-back
+      (t nil))))
+
+(defun validate-difficulty (header height prev-entry)
+  "Validate that HEADER's bits field matches expected difficulty at HEIGHT.
+PREV-ENTRY is the block-index-entry for the previous block.
+Returns (VALUES T NIL) on success, (VALUES NIL :bad-difficulty) on failure."
+  (let ((block-bits (bitcoin-lisp.serialization:block-header-bits header))
+        (expected (get-expected-bits height prev-entry)))
+    (cond
+      ;; Got a definitive expected value (mainnet, retarget boundary, or first period)
+      (expected
+       (if (= block-bits expected)
+           (values t nil)
+           (values nil :bad-difficulty)))
+
+      ;; Testnet non-boundary: check min-difficulty or walk-back
+      ((eq bitcoin-lisp:*network* :testnet)
+       (let* ((prev-header (bitcoin-lisp.storage:block-index-entry-header prev-entry))
+              (prev-timestamp (bitcoin-lisp.serialization:block-header-timestamp prev-header))
+              (block-timestamp (bitcoin-lisp.serialization:block-header-timestamp header))
+              (min-diff-allowed (testnet-min-difficulty-allowed-p
+                                 block-timestamp prev-timestamp)))
+         ;; >20 min gap: accept min-difficulty bits directly
+         (if (and min-diff-allowed (= block-bits bitcoin-lisp.storage:+pow-limit-bits+))
+             (values t nil)
+             ;; Otherwise (<=20 min, or >20 min with non-min bits): must match walk-back
+             (let ((walk-back-bits (testnet-walk-back-bits prev-entry)))
+               (if (= block-bits walk-back-bits)
+                   (values t nil)
+                   (values nil :bad-difficulty))))))
+
+      ;; Shouldn't reach here, but reject if we do
+      (t (values nil :bad-difficulty)))))
+
 ;;;; Proof of Work validation
 
 (defun check-proof-of-work (header)
@@ -218,9 +326,10 @@ Returns T if valid, NIL if invalid."
 ;;;; Block header validation
 
 (defun validate-block-header (header chain-state current-time
-                               &key prev-hash)
+                               &key prev-hash height prev-entry)
   "Validate a block header.
 PREV-HASH is the hash of the previous block (for MTP calculation).
+HEIGHT and PREV-ENTRY are optional; when provided, difficulty adjustment is validated.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
   ;; Check proof of work
@@ -246,6 +355,14 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
     (when (or (< version 1) (> version #x3FFFFFFF))
       (return-from validate-block-header
         (values nil :bad-version))))
+
+  ;; Validate difficulty adjustment
+  (when (and height prev-entry)
+    (multiple-value-bind (valid error)
+        (validate-difficulty header height prev-entry)
+      (unless valid
+        (return-from validate-block-header
+          (values nil error)))))
 
   (values t nil))
 
@@ -457,12 +574,16 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
 
-    ;; Validate header
-    (multiple-value-bind (valid error)
-        (validate-block-header header chain-state current-time
-                               :prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
-      (unless valid
-        (return-from validate-block (values nil error nil))))
+    ;; Validate header (with difficulty check when prev-entry is available)
+    (let ((prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
+      (multiple-value-bind (valid error)
+          (validate-block-header header chain-state current-time
+                                 :prev-hash prev-hash
+                                 :height current-height
+                                 :prev-entry (bitcoin-lisp.storage:get-block-index-entry
+                                              chain-state prev-hash))
+        (unless valid
+          (return-from validate-block (values nil error nil)))))
 
     ;; Must have at least one transaction (coinbase)
     (when (null transactions)
