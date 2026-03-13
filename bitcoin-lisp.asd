@@ -113,6 +113,8 @@
                              ;; Difficulty adjustment tests
                              (:file "difficulty-tests")
                              ;; Block weight tests (BIP 141)
-                             (:file "weight-tests"))))
+                             (:file "weight-tests")
+                             ;; Sigops validation tests
+                             (:file "sigops-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

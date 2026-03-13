@@ -11,8 +11,9 @@
 
 ;;;; Constants
 
-(defconstant +max-block-sigops+ 20000)
-(defconstant +max-block-weight+ 4000000)    ; BIP 141: max block weight in weight units
+(defconstant +max-block-sigops-cost+ 80000)  ; BIP 141: max weighted sigops cost
+(defconstant +witness-scale-factor+ 4)       ; BIP 141: legacy sigops weight multiplier
+(defconstant +max-block-weight+ 4000000)     ; BIP 141: max block weight in weight units
 (defconstant +max-future-block-time+ 7200)  ; 2 hours in seconds
 
 ;;; Locktime activation heights (BIPs 65/68/112/113)
@@ -572,6 +573,126 @@ Only enforced at or above the network-specific activation height."
   (loop for tx in transactions
         sum (bitcoin-lisp.serialization:transaction-weight tx)))
 
+;;;; Sigops cost calculation
+
+(defun script-is-p2sh-p (script)
+  "Check if SCRIPT is a P2SH scriptPubKey: OP_HASH160 <20 bytes> OP_EQUAL."
+  (and (= (length script) 23)
+       (= (aref script 0) +op-hash160+)
+       (= (aref script 1) 20)       ; Push 20 bytes
+       (= (aref script 22) +op-equal+)))
+
+(defun extract-last-push (script)
+  "Extract the data from the last push operation in SCRIPT.
+Used to get the redeemScript from a P2SH scriptSig.
+Tracks indices and allocates only once at the end."
+  (let ((len (length script))
+        (i 0)
+        (last-start nil)
+        (last-end nil))
+    (loop while (< i len)
+          do (let ((opcode (aref script i)))
+               (cond
+                 ((<= 1 opcode 75)
+                  (let ((end (min (+ i 1 opcode) len)))
+                    (setf last-start (1+ i) last-end end i end)))
+                 ((= opcode +op-pushdata1+)
+                  (if (< (1+ i) len)
+                      (let* ((size (aref script (1+ i)))
+                             (end (min (+ i 2 size) len)))
+                        (setf last-start (+ i 2) last-end end i end))
+                      (return)))
+                 ((= opcode +op-pushdata2+)
+                  (if (< (+ i 2) len)
+                      (let* ((size (logior (aref script (1+ i))
+                                           (ash (aref script (+ i 2)) 8)))
+                             (end (min (+ i 3 size) len)))
+                        (setf last-start (+ i 3) last-end end i end))
+                      (return)))
+                 ((= opcode +op-pushdata4+)
+                  (if (< (+ i 4) len)
+                      (let* ((size (logior (aref script (1+ i))
+                                           (ash (aref script (+ i 2)) 8)
+                                           (ash (aref script (+ i 3)) 16)
+                                           (ash (aref script (+ i 4)) 24)))
+                             (end (min (+ i 5 size) len)))
+                        (setf last-start (+ i 5) last-end end i end))
+                      (return)))
+                 (t (incf i)))))
+    (when (and last-start last-end)
+      (subseq script last-start last-end))))
+
+(defun count-legacy-sigops (tx)
+  "Count legacy (inaccurate) sigops across all scriptSigs and scriptPubKeys of TX."
+  (let ((count 0))
+    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+      (incf count (count-script-sigops
+                   (bitcoin-lisp.serialization:tx-in-script-sig input))))
+    (dolist (output (bitcoin-lisp.serialization:transaction-outputs tx))
+      (incf count (count-script-sigops
+                   (bitcoin-lisp.serialization:tx-out-script-pubkey output))))
+    count))
+
+(defun count-witness-sigops-for-input (script-pubkey witness)
+  "Count witness sigops for a single input given its spent SCRIPT-PUBKEY and WITNESS.
+Returns 1 for P2WPKH, counts from witness script for P2WSH."
+  (let ((len (length script-pubkey)))
+    (cond
+      ;; P2WPKH: OP_0 <20 bytes>
+      ((and (= len 22) (= (aref script-pubkey 0) +op-0+) (= (aref script-pubkey 1) 20))
+       1)
+      ;; P2WSH: OP_0 <32 bytes>
+      ((and (= len 34) (= (aref script-pubkey 0) +op-0+) (= (aref script-pubkey 1) 32))
+       (if witness
+           (let ((witness-script (car (last witness))))
+             (if witness-script
+                 (count-script-sigops witness-script :accurate t)
+                 0))
+           0))
+      (t 0))))
+
+(defun count-p2sh-and-witness-sigops (tx get-spent-script)
+  "Count P2SH and witness sigops in a single pass over TX inputs.
+Returns (VALUES p2sh-count witness-count).
+GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
+  (let ((p2sh-count 0)
+        (witness-count 0))
+    (loop for input in (bitcoin-lisp.serialization:transaction-inputs tx)
+          for input-idx from 0
+          do (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                    (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
+                    (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+                    (script-pubkey (funcall get-spent-script prev-txid prev-index)))
+               (when script-pubkey
+                 (cond
+                   ;; Native witness program
+                   ((script-is-witness-program-p script-pubkey)
+                    (let ((witness (get-input-witness tx input-idx)))
+                      (incf witness-count (count-witness-sigops-for-input
+                                           script-pubkey witness))))
+                   ;; P2SH input
+                   ((script-is-p2sh-p script-pubkey)
+                    (let ((redeem-script (extract-last-push
+                                          (bitcoin-lisp.serialization:tx-in-script-sig input))))
+                      (when redeem-script
+                        ;; P2SH sigops from redeemScript
+                        (incf p2sh-count (count-script-sigops redeem-script :accurate t))
+                        ;; P2SH-wrapped witness program
+                        (when (script-is-witness-program-p redeem-script)
+                          (let ((witness (get-input-witness tx input-idx)))
+                            (incf witness-count (count-witness-sigops-for-input
+                                                 redeem-script witness)))))))))))
+    (values p2sh-count witness-count)))
+
+(defun count-transaction-sigops-cost (tx get-spent-script)
+  "Calculate the weighted sigops cost for TX (BIP 141).
+Cost = (legacy + p2sh) * WITNESS_SCALE_FACTOR + witness.
+GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
+  (let ((legacy (count-legacy-sigops tx)))
+    (multiple-value-bind (p2sh witness)
+        (count-p2sh-and-witness-sigops tx get-spent-script)
+      (+ (* (+ legacy p2sh) +witness-scale-factor+) witness))))
+
 ;;;; Full block validation
 
 (defun validate-block (block chain-state utxo-set current-height current-time)
@@ -626,47 +747,64 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
     ;; Validate each transaction and collect fees (using Satoshi type)
     ;; Track outputs from earlier transactions for intra-block spending
     (let ((total-fees (wrap-satoshi 0))
+          (total-sigops-cost 0)
           (pending-utxos (make-hash-table :test 'equalp)))
-      ;; Validate coinbase structure (skip input validation)
-      (let ((coinbase-tx (first transactions)))
-        (multiple-value-bind (valid error)
-            (validate-transaction-structure coinbase-tx)
-          (unless valid
-            (return-from validate-block (values nil error nil))))
-        ;; Add coinbase outputs to pending (for intra-block spending)
-        (let ((txid (bitcoin-lisp.serialization:transaction-hash coinbase-tx)))
-          (loop for output in (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
-                for idx from 0
-                do (setf (gethash (cons txid idx) pending-utxos)
-                         (bitcoin-lisp.storage::make-utxo-entry
-                          :value (bitcoin-lisp.serialization:tx-out-value output)
-                          :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
-                          :height current-height
-                          :coinbase t)))))
 
-      ;; Validate other transactions
-      (loop for tx in (rest transactions)
-            do (multiple-value-bind (valid error)
-                   (validate-transaction-structure tx)
-                 (unless valid
-                   (return-from validate-block (values nil error nil))))
-               (multiple-value-bind (valid error fee)
-                   (validate-transaction-contextual tx utxo-set current-height
-                                                    :pending-utxos pending-utxos)
-                 (unless valid
-                   (return-from validate-block (values nil error nil)))
-                 ;; fee is now a Satoshi type, use typed addition
-                 (setf total-fees (satoshi+ total-fees fee)))
-               ;; Add this transaction's outputs to pending for subsequent txs
-               (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-                 (loop for output in (bitcoin-lisp.serialization:transaction-outputs tx)
-                       for idx from 0
-                       do (setf (gethash (cons txid idx) pending-utxos)
-                                (bitcoin-lisp.storage::make-utxo-entry
-                                 :value (bitcoin-lisp.serialization:tx-out-value output)
-                                 :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
-                                 :height current-height
-                                 :coinbase nil)))))
+      ;; UTXO lookup function for sigops counting
+      (flet ((get-spent-script (txid index)
+               (let ((utxo (or (gethash (cons txid index) pending-utxos)
+                               (bitcoin-lisp.storage:get-utxo utxo-set txid index))))
+                 (when utxo
+                   (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)))))
+
+        ;; Validate coinbase structure (skip input validation)
+        (let ((coinbase-tx (first transactions)))
+          (multiple-value-bind (valid error)
+              (validate-transaction-structure coinbase-tx)
+            (unless valid
+              (return-from validate-block (values nil error nil))))
+          ;; Coinbase sigops: legacy only (no inputs to look up), scaled by witness factor
+          (incf total-sigops-cost (* (count-legacy-sigops coinbase-tx) +witness-scale-factor+))
+          ;; Add coinbase outputs to pending (for intra-block spending)
+          (let ((txid (bitcoin-lisp.serialization:transaction-hash coinbase-tx)))
+            (loop for output in (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
+                  for idx from 0
+                  do (setf (gethash (cons txid idx) pending-utxos)
+                           (bitcoin-lisp.storage::make-utxo-entry
+                            :value (bitcoin-lisp.serialization:tx-out-value output)
+                            :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                            :height current-height
+                            :coinbase t)))))
+
+        ;; Validate other transactions
+        (loop for tx in (rest transactions)
+              do (multiple-value-bind (valid error)
+                     (validate-transaction-structure tx)
+                   (unless valid
+                     (return-from validate-block (values nil error nil))))
+                 (multiple-value-bind (valid error fee)
+                     (validate-transaction-contextual tx utxo-set current-height
+                                                      :pending-utxos pending-utxos)
+                   (unless valid
+                     (return-from validate-block (values nil error nil)))
+                   ;; fee is now a Satoshi type, use typed addition
+                   (setf total-fees (satoshi+ total-fees fee)))
+                 ;; Accumulate sigops cost and check limit (early exit for DoS protection)
+                 (incf total-sigops-cost
+                       (count-transaction-sigops-cost tx #'get-spent-script))
+                 (when (> total-sigops-cost +max-block-sigops-cost+)
+                   (return-from validate-block
+                     (values nil :too-many-sigops nil)))
+                 ;; Add this transaction's outputs to pending for subsequent txs
+                 (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+                   (loop for output in (bitcoin-lisp.serialization:transaction-outputs tx)
+                         for idx from 0
+                         do (setf (gethash (cons txid idx) pending-utxos)
+                                  (bitcoin-lisp.storage::make-utxo-entry
+                                   :value (bitcoin-lisp.serialization:tx-out-value output)
+                                   :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                                   :height current-height
+                                   :coinbase nil))))))
 
       ;; Transaction finality check (IsFinalTx) and BIP 68 sequence locks
       (let* ((prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
