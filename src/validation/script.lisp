@@ -87,6 +87,64 @@
 (defconstant +op-equal+ #x87)
 (defconstant +op-equalverify+ #x88)
 
+;;;; Sigops counting
+
+(defconstant +max-pubkeys-per-multisig+ 20
+  "Maximum number of public keys in a multisig. Used as inaccurate sigops count.")
+
+(defun count-script-sigops (script &key accurate)
+  "Count signature operations in a raw script byte vector.
+When ACCURATE is NIL (legacy counting), OP_CHECKMULTISIG(VERIFY) counts as 20.
+When ACCURATE is T (P2SH/witness counting), uses the preceding small-integer
+opcode (OP_1..OP_16) as the key count, or 20 if not present."
+  (let ((len (length script))
+        (i 0)
+        (count 0)
+        (last-opcode 0))
+    (loop while (< i len)
+          do (let ((opcode (aref script i)))
+               (cond
+                 ;; Push data: skip over pushed bytes
+                 ((<= 1 opcode 75)
+                  (setf last-opcode opcode)
+                  (incf i (1+ opcode)))
+                 ((= opcode +op-pushdata1+)
+                  (setf last-opcode opcode)
+                  (if (< (1+ i) len)
+                      (incf i (+ 2 (aref script (1+ i))))
+                      (return)))
+                 ((= opcode +op-pushdata2+)
+                  (setf last-opcode opcode)
+                  (if (< (+ i 2) len)
+                      (incf i (+ 3 (logior (aref script (1+ i))
+                                           (ash (aref script (+ i 2)) 8))))
+                      (return)))
+                 ((= opcode +op-pushdata4+)
+                  (setf last-opcode opcode)
+                  (if (< (+ i 4) len)
+                      (incf i (+ 5 (logior (aref script (1+ i))
+                                           (ash (aref script (+ i 2)) 8)
+                                           (ash (aref script (+ i 3)) 16)
+                                           (ash (aref script (+ i 4)) 24))))
+                      (return)))
+                 ;; OP_CHECKSIG / OP_CHECKSIGVERIFY
+                 ((or (= opcode +op-checksig+) (= opcode +op-checksigverify+))
+                  (incf count)
+                  (setf last-opcode opcode)
+                  (incf i))
+                 ;; OP_CHECKMULTISIG / OP_CHECKMULTISIGVERIFY
+                 ((or (= opcode +op-checkmultisig+) (= opcode +op-checkmultisigverify+))
+                  (if (and accurate (<= +op-1+ last-opcode +op-16+))
+                      (incf count (1+ (- last-opcode +op-1+)))
+                      (incf count +max-pubkeys-per-multisig+))
+                  (setf last-opcode opcode)
+                  (incf i))
+                 ;; All other opcodes
+                 (t
+                  (setf last-opcode opcode)
+                  (incf i)))))
+    count))
+
 ;;;; Script execution context
 
 (defstruct script-context
