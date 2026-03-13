@@ -427,6 +427,11 @@
    ;; Block weight
    #:calculate-block-weight
    #:+max-block-weight+
+   ;; Sigops validation
+   #:count-script-sigops
+   #:count-transaction-sigops-cost
+   #:+max-block-sigops-cost+
+   #:+witness-scale-factor+
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+

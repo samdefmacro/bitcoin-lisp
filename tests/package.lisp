@@ -61,6 +61,10 @@
   :description "Tests for block weight validation (BIP 141)"
   :in :bitcoin-lisp-tests)
 
+(def-suite :sigops-tests
+  :description "Tests for signature operations cost validation (BIP 141)"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :integration-tests
   :description "Integration tests with testnet"
   :in :bitcoin-lisp-tests)
