@@ -12,6 +12,7 @@
 ;;;; Constants
 
 (defconstant +max-block-sigops+ 20000)
+(defconstant +max-block-weight+ 4000000)    ; BIP 141: max block weight in weight units
 (defconstant +max-future-block-time+ 7200)  ; 2 hours in seconds
 
 ;;; Locktime activation heights (BIPs 65/68/112/113)
@@ -566,6 +567,11 @@ Only enforced at or above the network-specific activation height."
        (values nil :bad-coinbase-height))
       (t (values t nil)))))
 
+(defun calculate-block-weight (transactions)
+  "Calculate total block weight as sum of all transaction weights."
+  (loop for tx in transactions
+        sum (bitcoin-lisp.serialization:transaction-weight tx)))
+
 ;;;; Full block validation
 
 (defun validate-block (block chain-state utxo-set current-height current-time)
@@ -610,6 +616,12 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
       (unless (equalp computed-root header-root)
         (return-from validate-block
           (values nil :bad-merkle-root nil))))
+
+    ;; Validate block weight (BIP 141)
+    (let ((weight (calculate-block-weight transactions)))
+      (when (> weight +max-block-weight+)
+        (return-from validate-block
+          (values nil :block-too-heavy nil))))
 
     ;; Validate each transaction and collect fees (using Satoshi type)
     ;; Track outputs from earlier transactions for intra-block spending

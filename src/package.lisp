@@ -106,6 +106,7 @@
    #:transaction-wtxid
    #:transaction-has-witness-p
    #:transaction-vsize
+   #:transaction-weight
    #:serialize-witness-transaction
    #:block-header
    #:make-block-header
@@ -423,6 +424,9 @@
    #:get-expected-bits
    #:testnet-min-difficulty-allowed-p
    #:testnet-walk-back-bits
+   ;; Block weight
+   #:calculate-block-weight
+   #:+max-block-weight+
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+
