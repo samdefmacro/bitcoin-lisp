@@ -281,7 +281,13 @@
    #:update-chain-tip
    #:build-block-locator
    #:bits-to-target
+   #:target-to-bits
    #:calculate-chain-work
+   #:calculate-next-work-required
+   ;; Difficulty constants
+   #:+difficulty-adjustment-interval+
+   #:+pow-target-timespan+
+   #:+pow-limit-bits+
    #:save-state
    #:load-state
    #:chain-state-pruned-height
@@ -412,6 +418,11 @@
    #:compute-median-time-past
    #:check-sequence-locks
    #:compute-script-flags-for-height
+   ;; Difficulty validation
+   #:validate-difficulty
+   #:get-expected-bits
+   #:testnet-min-difficulty-allowed-p
+   #:testnet-walk-back-bits
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+

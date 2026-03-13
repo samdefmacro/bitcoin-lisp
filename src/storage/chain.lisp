@@ -86,7 +86,20 @@ NETWORK defaults to bitcoin-lisp:*network* if not specified."
   (setf (chain-state-best-block-hash state) hash)
   (setf (chain-state-best-height state) height))
 
+;;; Difficulty adjustment constants
+
+(defconstant +difficulty-adjustment-interval+ 2016
+  "Number of blocks between difficulty retargets.")
+
+(defconstant +pow-target-timespan+ 1209600
+  "Target time for one retarget period in seconds (2 weeks = 14 * 24 * 60 * 60).")
+
+(defconstant +pow-limit-bits+ #x1d00ffff
+  "Minimum difficulty (maximum target) in compact bits format.
+Same for mainnet and testnet.")
+
 ;;; Chain work calculations
+;;; Note: +pow-limit-target+ is defined after bits-to-target below.
 
 (defun bits-to-target (bits)
   "Convert compact 'bits' representation to full 256-bit target."
@@ -95,6 +108,9 @@ NETWORK defaults to bitcoin-lisp:*network* if not specified."
     (if (<= exponent 3)
         (ash mantissa (* 8 (- 3 exponent)))
         (ash mantissa (* 8 (- exponent 3))))))
+
+(defvar +pow-limit-target+ (bits-to-target +pow-limit-bits+)
+  "The full 256-bit PoW limit target (precomputed from +pow-limit-bits+).")
 
 (defun target-to-work (target)
   "Convert a target to the amount of work required.
@@ -108,6 +124,43 @@ Work = 2^256 / (target + 1)"
   (let* ((target (bits-to-target bits))
          (work (target-to-work target)))
     (+ prev-work work)))
+
+(defun target-to-bits (target)
+  "Convert a full 256-bit target to compact 'bits' representation.
+Inverse of bits-to-target. Matches Bitcoin Core's GetCompact()."
+  (if (zerop target)
+      0
+      ;; Count how many bytes are needed to represent the target
+      (let* ((size (ceiling (integer-length target) 8))
+             ;; Extract the 3 most significant bytes
+             ;; ash handles both left (size<3) and right (size>3) shifts
+             (compact (ash target (* 8 (- 3 size)))))
+        ;; If the high bit of the mantissa is set, shift right by 8
+        ;; to avoid it being interpreted as negative
+        (when (logtest compact #x800000)
+          (setf compact (ash compact -8))
+          (incf size))
+        (logior (ash size 24) (logand compact #x7FFFFF)))))
+
+(defun calculate-next-work-required (last-retarget-time last-block-time prev-bits)
+  "Calculate the new difficulty bits for a retarget boundary.
+LAST-RETARGET-TIME is the timestamp of the block at height H-2016.
+LAST-BLOCK-TIME is the timestamp of block at height H-1.
+PREV-BITS is the bits field of the previous period.
+Returns the new compact bits value.
+Matches Bitcoin Core's CalculateNextWorkRequired() including the
+off-by-one (2015 intervals, not 2016)."
+  (let* ((actual-timespan (- last-block-time last-retarget-time))
+         ;; Clamp to [timespan/4, timespan*4]
+         (min-timespan (floor +pow-target-timespan+ 4))
+         (max-timespan (* +pow-target-timespan+ 4))
+         (actual-timespan (max min-timespan (min max-timespan actual-timespan)))
+         ;; new_target = old_target * actual_timespan / target_timespan
+         (old-target (bits-to-target prev-bits))
+         (new-target (floor (* old-target actual-timespan) +pow-target-timespan+))
+         ;; Cap at PoW limit (precomputed)
+         (new-target (min new-target +pow-limit-target+)))
+    (target-to-bits new-target)))
 
 ;;; State persistence
 

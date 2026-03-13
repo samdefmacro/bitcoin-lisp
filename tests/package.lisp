@@ -53,6 +53,10 @@
   :description "Tests for DoS protection (rate limiting, handshake timeout, rejects filter)"
   :in :bitcoin-lisp-tests)
 
+(def-suite :difficulty-tests
+  :description "Tests for difficulty adjustment validation"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :integration-tests
   :description "Integration tests with testnet"
   :in :bitcoin-lisp-tests)
