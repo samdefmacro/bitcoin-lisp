@@ -217,10 +217,11 @@ Returns T if valid, NIL if invalid."
 
 ;;;; Block header validation
 
-(defun validate-block-header (header chain-state current-time)
+(defun validate-block-header (header chain-state current-time
+                               &key prev-hash)
   "Validate a block header.
+PREV-HASH is the hash of the previous block (for MTP calculation).
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
-  (declare (ignore chain-state))
 
   ;; Check proof of work
   (unless (check-proof-of-work header)
@@ -231,7 +232,14 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
   (let ((timestamp (bitcoin-lisp.serialization:block-header-timestamp header)))
     (when (> timestamp (+ current-time +max-future-block-time+))
       (return-from validate-block-header
-        (values nil :time-too-new))))
+        (values nil :time-too-new)))
+
+    ;; Check timestamp > median-time-past of previous 11 blocks
+    (when (and chain-state prev-hash)
+      (let ((mtp (compute-median-time-past chain-state prev-hash)))
+        (when (<= timestamp mtp)
+          (return-from validate-block-header
+            (values nil :time-too-old))))))
 
   ;; Version check (allow versions 1-4 for now)
   (let ((version (bitcoin-lisp.serialization:block-header-version header)))
@@ -451,7 +459,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
     ;; Validate header
     (multiple-value-bind (valid error)
-        (validate-block-header header chain-state current-time)
+        (validate-block-header header chain-state current-time
+                               :prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
       (unless valid
         (return-from validate-block (values nil error nil))))
 
