@@ -111,6 +111,8 @@
                              ;; DoS protection tests
                              (:file "dos-protection-tests")
                              ;; Difficulty adjustment tests
-                             (:file "difficulty-tests"))))
+                             (:file "difficulty-tests")
+                             ;; Block weight tests (BIP 141)
+                             (:file "weight-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
