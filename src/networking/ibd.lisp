@@ -677,10 +677,14 @@ After connecting, drains the queue of any children that can now be connected."
       ;; Check if this is the next block we need
       (if (= height (1+ current-height))
           ;; Validate and connect
-          (let ((current-time (bitcoin-lisp.serialization:get-unix-time)))
+          ;; Skip script validation for blocks at or below the last checkpoint
+          ;; (matches Bitcoin Core behavior during IBD)
+          (let ((current-time (bitcoin-lisp.serialization:get-unix-time))
+                (skip-scripts (<= height (last-checkpoint-height))))
             (multiple-value-bind (valid error)
                 (bitcoin-lisp.validation:validate-block
-                 block chain-state utxo-set height current-time)
+                 block chain-state utxo-set height current-time
+                 :skip-scripts skip-scripts)
               (if valid
                   (progn
                     (bitcoin-lisp.validation:connect-block
@@ -711,7 +715,8 @@ After connecting, drains the queue of any children that can now be connected."
 Repeats until no more queued blocks can be connected."
   (unless *ibd-context*
     (return-from drain-block-queue 0))
-  (let ((drained 0))
+  (let ((drained 0)
+        (checkpoint-height (last-checkpoint-height)))
     (loop
       (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
              (next-height (1+ current-height))
@@ -724,10 +729,12 @@ Repeats until no more queued blocks can be connected."
               (remove match queue :count 1))
         ;; Try to connect
         (let* ((block (cdr match))
-               (current-time (bitcoin-lisp.serialization:get-unix-time)))
+               (current-time (bitcoin-lisp.serialization:get-unix-time))
+               (skip-scripts (<= next-height checkpoint-height)))
           (multiple-value-bind (valid error)
               (bitcoin-lisp.validation:validate-block
-               block chain-state utxo-set next-height current-time)
+               block chain-state utxo-set next-height current-time
+               :skip-scripts skip-scripts)
             (if valid
                 (progn
                   (bitcoin-lisp.validation:connect-block
