@@ -66,6 +66,7 @@
    #:*current-script-code*
    #:compute-legacy-sighash
    ;; SegWit / BIP 143
+   #:*witness-v0-mode*
    #:*witness-input-amount*
    #:*original-script-pubkey*
    #:compute-bip143-sighash
@@ -237,6 +238,10 @@
   "The original scriptPubKey being executed. Used for sighash computation in P2SH.
    For P2SH, the credit transaction must use the P2SH scriptPubKey (OP_HASH160 <hash> OP_EQUAL),
    while the sighash scriptCode uses the redeemScript.")
+
+(defvar *witness-v0-mode* nil
+  "When non-nil, verify-checksig uses BIP 143 sighash instead of legacy.
+   Set during P2WSH witness script execution.")
 
 (defun current-input-sequence ()
   "Extract nSequence for the current input from *current-tx*, or #xFFFFFFFF if unavailable."
@@ -1093,15 +1098,25 @@
     ;; Compute sighash and verify
     ;; Use strict DER parsing when DERSIG flag is set
     ;; Reject high-S when LOW_S flag is set
-    ;; When *current-tx* is bound (real block validation), use legacy sighash.
-    ;; Otherwise (unit tests), use test transaction format.
+    ;; Dispatch based on context:
+    ;;   *witness-v0-mode* + *current-tx* → BIP 143 sighash (P2WSH)
+    ;;   *current-tx*                     → legacy sighash (P2PKH, P2SH)
+    ;;   otherwise                        → test transaction format
     (let* ((subscript-for-hash (or *current-script-code* script-pubkey))
-           (sighash (if *current-tx*
-                        (compute-legacy-sighash *current-tx*
-                                                *current-input-index*
-                                                subscript-for-hash
-                                                sighash-type)
-                        (compute-test-sighash script-pubkey sighash-type)))
+           (sighash (cond
+                      ;; P2WSH: BIP 143 sighash with witness script as scriptCode
+                      ((and *witness-v0-mode* *current-tx*)
+                       (compute-bip143-sighash subscript-for-hash
+                                               *witness-input-amount*
+                                               sighash-type))
+                      ;; Legacy/P2SH: legacy sighash
+                      (*current-tx*
+                       (compute-legacy-sighash *current-tx*
+                                               *current-input-index*
+                                               subscript-for-hash
+                                               sighash-type))
+                      ;; Unit tests: test transaction format
+                      (t (compute-test-sighash script-pubkey sighash-type))))
            (require-low-s (flag-enabled-p "LOW_S")))
       ;; Debug output before verification
       (when (and *debug-checksig* *current-tx*)
@@ -1587,9 +1602,22 @@
       (unless (equalp script-hash program)
         (return-from validate-p2wsh (values nil :witness-program-mismatch))))
 
-    ;; Execute the witness script with remaining witness items as stack
-    ;; For now, return success as placeholder - full script execution integration needed
-    (values t nil)))
+    ;; Execute the witness script with remaining witness items as initial stack
+    ;; Uses BIP 143 sighash for any CHECKSIG/CHECKMULTISIG operations
+    (let* ((*witness-v0-mode* t)
+           (*witness-input-amount* amount)
+           (*current-script-code* witness-script)
+           (stack-items (butlast witness))
+           (script-vec (cl-array-to-coalton-vector witness-script))
+           (initial-stack (mapcar #'cl-array-to-coalton-vector stack-items))
+           (result (bitcoin-lisp.coalton.script:execute-script-with-stack
+                    script-vec initial-stack)))
+      (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
+          (let ((final-stack (bitcoin-lisp.coalton.script:get-ok-stack result)))
+            (if (stack-top-truthy-p final-stack)
+                (values t nil)
+                (values nil :script-eval-false)))
+          (values nil :script-error)))))
 
 (defun validate-witness-program (script-pubkey witness amount &optional script-sig)
   "Validate a witness program.
