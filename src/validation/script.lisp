@@ -354,28 +354,22 @@ opcode (OP_1..OP_16) as the key count, or 20 if not present."
 
 (defun verify-signature-for-tx (ctx sig pubkey)
   "Verify a signature against the transaction being validated.
-This is a simplified implementation - full implementation would need
-proper sighash computation."
+Delegates to compute-legacy-sighash from the Coalton interop layer for
+proper SIGHASH_ALL/NONE/SINGLE/ANYONECANPAY computation."
   (when (and (> (length sig) 0)
              (> (length pubkey) 0)
              (script-context-tx ctx))
     ;; Extract sighash type from last byte of signature
     (let* ((sighash-type (aref sig (1- (length sig))))
            (der-sig (subseq sig 0 (1- (length sig))))
-           ;; Compute signature hash (simplified - needs proper implementation)
-           (sighash (compute-sighash (script-context-tx ctx)
-                                     (script-context-input-index ctx)
-                                     sighash-type)))
+           ;; The subscript is the currently executing script (scriptPubKey)
+           (subscript (script-context-script ctx))
+           (sighash (bitcoin-lisp.coalton.interop:compute-legacy-sighash
+                     (script-context-tx ctx)
+                     (script-context-input-index ctx)
+                     subscript
+                     sighash-type)))
       (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey))))
-
-(defun compute-sighash (tx input-index sighash-type)
-  "Compute the signature hash for a transaction input.
-This is a simplified placeholder - full implementation needed."
-  (declare (ignore sighash-type))
-  ;; Simplified: just hash the serialized transaction
-  ;; Real implementation needs proper SIGHASH algorithm
-  (bitcoin-lisp.crypto:hash256
-   (bitcoin-lisp.serialization:serialize-transaction tx)))
 
 ;;;; Main script execution
 
@@ -399,26 +393,54 @@ Returns NIL if script fails."
       (values (and top (cast-to-bool top))
               nil))))
 
-(defun validate-script (script-sig script-pubkey &key tx input-index)
-  "Validate a transaction input by executing scriptSig + scriptPubKey.
-Returns T if validation succeeds."
-  ;; Execute scriptSig
-  (multiple-value-bind (success error)
-      (execute-script script-sig :tx tx :input-index input-index)
-    (declare (ignore success))
-    (when error
-      (return-from validate-script (values nil error))))
-  ;; Get stack from scriptSig execution and use for scriptPubKey
-  (let ((ctx (make-script-context :script script-sig)))
-    (loop while (< (script-context-position ctx)
-                   (length script-sig))
-          do (let ((opcode (read-script-byte ctx)))
-               (execute-opcode ctx opcode)))
-    ;; Execute scriptPubKey with scriptSig's stack
-    (execute-script script-pubkey
-                    :tx tx
-                    :input-index input-index
-                    :initial-stack (script-context-stack ctx))))
+;;;; Witness and script type helpers (shared by transaction and block validation)
+
+(defun script-is-witness-program-p (script-pubkey)
+  "Check if SCRIPT-PUBKEY is a witness program (SegWit v0 or Taproot).
+Witness programs: OP_n <2-40 bytes> where n is 0-16."
+  (let ((len (length script-pubkey)))
+    (and (>= len 4) (<= len 42)
+         (let ((version-byte (aref script-pubkey 0))
+               (push-len (aref script-pubkey 1)))
+           (and (or (zerop version-byte)              ; OP_0
+                    (<= #x51 version-byte #x60))      ; OP_1..OP_16
+                (<= 2 push-len 40)
+                (= len (+ 2 push-len)))))))
+
+(defun get-input-witness (tx input-idx)
+  "Get the witness stack for input INPUT-IDX of TX.
+Returns a list of byte vectors, or NIL if no witness data."
+  (let ((witness (bitcoin-lisp.serialization:transaction-witness tx)))
+    (when (and witness (< input-idx (length witness)))
+      (nth input-idx witness))))
+
+(defun validate-input-script (tx input-idx utxo)
+  "Validate a single transaction input's script against its spent UTXO.
+Dispatches to the Coalton interop path for both legacy/P2SH and witness scripts.
+Binds *current-tx* and *current-input-index* for sighash computation.
+Returns T on success, NIL on failure."
+  (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig
+                     (nth input-idx (bitcoin-lisp.serialization:transaction-inputs tx))))
+        (script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
+        (amount (bitcoin-lisp.storage:utxo-entry-value utxo))
+        (bitcoin-lisp.coalton.interop:*current-tx* tx)
+        (bitcoin-lisp.coalton.interop:*current-input-index* input-idx))
+    (if (script-is-witness-program-p script-pubkey)
+        ;; Witness program: validate with witness stack
+        (let ((witness (get-input-witness tx input-idx)))
+          (if witness
+              (multiple-value-bind (success error)
+                  (bitcoin-lisp.coalton.interop:validate-witness-program
+                   script-pubkey witness amount script-sig)
+                (declare (ignore error))
+                success)
+              t))  ; no witness data = pass (matches validate-block-scripts behavior)
+        ;; Legacy/P2SH: validate via Coalton interop
+        (multiple-value-bind (success error)
+            (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
+             script-sig script-pubkey t)
+          (declare (ignore error))
+          success))))
 
 ;;; ============================================================
 ;;; Script Disassembly
