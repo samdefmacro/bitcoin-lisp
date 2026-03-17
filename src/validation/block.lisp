@@ -695,8 +695,11 @@ GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
 
 ;;;; Full block validation
 
-(defun validate-block (block chain-state utxo-set current-height current-time)
+(defun validate-block (block chain-state utxo-set current-height current-time
+                        &key skip-scripts)
   "Fully validate a block including all transactions.
+When SKIP-SCRIPTS is true, script validation is skipped (used during IBD for
+blocks below the last checkpoint, matching Bitcoin Core behavior).
 Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
@@ -827,10 +830,12 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                   do (return-from validate-block (values nil :bad-sequence-lock nil)))))
 
       ;; Validate transaction scripts via Coalton interop
-      (multiple-value-bind (valid error)
-          (validate-block-scripts block utxo-set :height current-height)
-        (unless valid
-          (return-from validate-block (values nil error nil))))
+      ;; Skip during IBD for blocks below the last checkpoint (performance optimization)
+      (unless skip-scripts
+        (multiple-value-bind (valid error)
+            (validate-block-scripts block utxo-set :height current-height)
+          (unless valid
+            (return-from validate-block (values nil error nil)))))
 
       ;; Validate witness commitment (BIP 141)
       (multiple-value-bind (valid error)
