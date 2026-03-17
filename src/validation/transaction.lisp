@@ -254,7 +254,8 @@ FEE is returned as an integer (satoshis)."
 
       ;; Script validation (consensus)
       (multiple-value-bind (scripts-valid failed-input)
-          (validate-transaction-scripts tx utxo-set)
+          (validate-transaction-scripts tx utxo-set :height current-height)
+        (declare (ignore failed-input))
         (unless scripts-valid
           (return-from validate-transaction-for-mempool
             (values nil :script-failed nil))))
@@ -263,21 +264,22 @@ FEE is returned as an integer (satoshis)."
 
 ;;;; Script validation
 
-(defun validate-transaction-scripts (tx utxo-set)
-  "Validate all input scripts for a transaction.
+(defun validate-transaction-scripts (tx utxo-set &key (height 0))
+  "Validate all input scripts for a transaction via Coalton interop.
+Uses validate-input-script for each input (same path as block validation).
+HEIGHT determines which script verification flags are active.
 Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
-  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
+  (let ((bitcoin-lisp.coalton.interop:*script-flags*
+          (compute-script-flags-for-height height))
+        (inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
     (loop for input in inputs
-          for i from 0
+          for input-idx from 0
           do (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                     (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
                     (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
                     (utxo (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)))
                (when utxo
-                 (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input))
-                       (script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)))
-                   (unless (validate-script script-sig script-pubkey
-                                            :tx tx :input-index i)
-                     (return-from validate-transaction-scripts
-                       (values nil i)))))))
+                 (unless (validate-input-script tx input-idx utxo)
+                   (return-from validate-transaction-scripts
+                     (values nil input-idx))))))
     (values t nil)))

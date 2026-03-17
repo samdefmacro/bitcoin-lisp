@@ -393,9 +393,11 @@
    #:validate-transaction-contextual
    #:validate-transaction-scripts
    #:validate-transaction-for-mempool
-   ;; Script execution
-   #:validate-script
+   ;; Script execution and input validation
    #:execute-script
+   #:script-is-witness-program-p
+   #:get-input-witness
+   #:validate-input-script
    ;; Script disassembly and classification
    #:disassemble-script
    #:classify-script
