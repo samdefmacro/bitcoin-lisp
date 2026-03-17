@@ -370,25 +370,6 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
 ;;;; Block script validation
 
-(defun script-is-witness-program-p (script-pubkey)
-  "Check if SCRIPT-PUBKEY is a witness program (SegWit v0 or Taproot).
-Witness programs: OP_n <2-40 bytes> where n is 0-16."
-  (let ((len (length script-pubkey)))
-    (and (>= len 4) (<= len 42)
-         (let ((version-byte (aref script-pubkey 0))
-               (push-len (aref script-pubkey 1)))
-           (and (or (zerop version-byte)              ; OP_0
-                    (<= #x51 version-byte #x60))      ; OP_1..OP_16
-                (<= 2 push-len 40)
-                (= len (+ 2 push-len)))))))
-
-(defun get-input-witness (tx input-idx)
-  "Get the witness stack for input INPUT-IDX of TX.
-Returns a list of byte vectors, or NIL if no witness data."
-  (let ((witness (bitcoin-lisp.serialization:transaction-witness tx)))
-    (when (and witness (< input-idx (length witness)))
-      (nth input-idx witness))))
-
 (defun block-is-bip16-exception-p (block)
   "Check if this block is a BIP 16 exception that should skip script validation."
   (let ((block-hash (bitcoin-lisp.serialization:block-header-hash
@@ -399,9 +380,7 @@ Returns a list of byte vectors, or NIL if no witness data."
 (defun validate-block-scripts (block utxo-set &key (height 0))
   "Validate all non-coinbase transaction scripts in BLOCK via Coalton interop.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
-Legacy and P2SH scripts are validated via run-scripts-with-p2sh.
-Witness programs are validated via validate-witness-program when witness data
-is available.
+Uses validate-input-script for each input (shared with transaction validation).
 Blocks matching BIP 16 exception hashes skip all script validation.
 HEIGHT is used to determine which script verification flags to enable."
   ;; Check for BIP 16 exception block - skip ALL script validation
@@ -421,31 +400,9 @@ HEIGHT is used to determine which script verification flags to enable."
                              (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
                              (utxo (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)))
                         (when utxo
-                          (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input))
-                                (script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
-                                (amount (bitcoin-lisp.storage:utxo-entry-value utxo))
-                                ;; Bind transaction context for sighash and CLTV/CSV
-                                (bitcoin-lisp.coalton.interop:*current-tx* tx)
-                                (bitcoin-lisp.coalton.interop:*current-input-index* input-idx))
-                            (if (script-is-witness-program-p script-pubkey)
-                                ;; Witness program: validate with witness stack
-                                (let ((witness (get-input-witness tx input-idx)))
-                                  (when witness
-                                    (multiple-value-bind (success error)
-                                        (bitcoin-lisp.coalton.interop:validate-witness-program
-                                         script-pubkey witness amount script-sig)
-                                      (declare (ignore error))
-                                      (unless success
-                                        (return-from validate-block-scripts
-                                          (values nil :script-failed))))))
-                                ;; Legacy/P2SH: validate via Coalton interop
-                                (multiple-value-bind (success error)
-                                    (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
-                                     script-sig script-pubkey t)
-                                  (declare (ignore error))
-                                  (unless success
-                                    (return-from validate-block-scripts
-                                      (values nil :script-failed))))))))))
+                          (unless (validate-input-script tx input-idx utxo)
+                            (return-from validate-block-scripts
+                              (values nil :script-failed)))))))
     (values t nil)))
 
 ;;;; Witness commitment validation (BIP 141)
