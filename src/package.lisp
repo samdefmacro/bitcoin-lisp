@@ -314,6 +314,10 @@
    #:load-header-index
    ;; Integrity utilities
    #:compute-crc32
+   #:save-file-with-crc32
+   #:load-file-with-crc32
+   #:write-utxo-entry-fields
+   #:read-utxo-entry-fields
    ;; Transaction index
    #:tx-index
    #:make-tx-index
