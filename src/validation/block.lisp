@@ -737,6 +737,17 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
         (return-from validate-block
           (values nil :block-too-heavy nil))))
 
+    ;; Legacy block size limit (non-witness serialization must fit in 1 MB)
+    (let ((base-size (+ 80  ; header
+                        (bitcoin-lisp.serialization:compact-size-length
+                         (length transactions))
+                        (loop for tx in transactions
+                              sum (length
+                                   (bitcoin-lisp.serialization:serialize-transaction tx))))))
+      (when (> base-size +max-block-size+)
+        (return-from validate-block
+          (values nil :block-too-large nil))))
+
     ;; BIP 30: Check for duplicate txids (unspent outputs with same txid)
     ;; Only needed before BIP 34 activation (height-in-coinbase guarantees uniqueness after)
     (when (< current-height (get-bip34-activation-height bitcoin-lisp:*network*))
