@@ -628,6 +628,11 @@ TIMESTAMP is the uint32 last-seen time."
   "Create a serialized sendheaders message (BIP 130, empty payload)."
   (serialize-message "sendheaders" #()))
 
+(defun make-wtxidrelay-message ()
+  "Create a serialized wtxidrelay message (BIP 339, empty payload).
+Must be sent between VERSION and VERACK."
+  (serialize-message "wtxidrelay" #()))
+
 (defun parse-feefilter-payload (payload)
   "Parse a feefilter message payload (BIP 133). Returns fee rate as uint64 (sat/kB)."
   (flexi-streams:with-input-from-sequence (stream payload)
