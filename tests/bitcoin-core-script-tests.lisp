@@ -490,8 +490,8 @@
   (is (equalp #(#x51 #x76) (assemble-script "1 DUP")))
   (is (equalp #(#x51 #x52 #x93) (assemble-script "1 2 ADD"))))
 
-(test script-tests-json-subset
-  "Run a subset of Bitcoin Core script tests."
+(test script-tests-json-full
+  "Run all Bitcoin Core script_tests.json vectors with strict pass/fail."
   (let* ((all-tests (load-script-tests))
          (passed 0)
          (failed-p2sh 0)
@@ -589,6 +589,7 @@
         (loop for err in errors
               do (format t "  ~A~%" err)))
 
-      ;; Pass if "other" failures are zero or very low
-      (is (<= failed-other 10)
-          "Should have very few 'other' failures. Got: ~D" failed-other))))
+      ;; Strict: zero failures across all categories
+      (is (zerop (+ failed-p2sh failed-cleanstack failed-minimaldata failed-witness failed-other))
+          "All script tests must pass. Failures: P2SH=~D CLEANSTACK=~D MINIMALDATA=~D WITNESS=~D Other=~D"
+          failed-p2sh failed-cleanstack failed-minimaldata failed-witness failed-other))))
