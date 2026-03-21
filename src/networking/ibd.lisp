@@ -309,6 +309,17 @@ Walks the header chain and adds block hashes to the pending queue."
       (incf (ibd-context-blocks-received *ibd-context*)))
     (remhash hash (ibd-context-in-flight *ibd-context*))))
 
+(defun compute-block-download-timeout (num-downloading-peers)
+  "Compute block download timeout in seconds based on number of peers.
+Matches Bitcoin Core's formula (net_processing.cpp:6113-6122):
+  timeout = block_interval * (BASE + PER_PEER * other_peers)
+With BASE=1, PER_PEER=0.5, block_interval=600s (10 min)."
+  (let* ((block-interval 600)  ; 10 minutes
+         (base 1.0)
+         (per-peer 0.5)
+         (other-peers (max 0 (1- num-downloading-peers))))
+    (round (* block-interval (+ base (* per-peer other-peers))))))
+
 (defun get-timed-out-requests ()
   "Get list of block hashes that have timed out."
   (unless *ibd-context*
@@ -342,7 +353,7 @@ When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
     ;; Disconnect peers that hit the timeout limit (only if still connected)
     (dolist (peer peers-to-disconnect)
       (when (eq (peer-state peer) :ready)
-        (bitcoin-lisp:log-warn "Disconnecting slow peer ~A (3 block timeouts)"
+        (bitcoin-lisp:log-warn "Disconnecting stalling peer ~A"
                                (peer-address peer))
         (handler-case
             (disconnect-peer peer)
@@ -351,8 +362,21 @@ When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
 
 ;;;; Multi-Peer Request Distribution
 
+(defun count-peer-in-flight (peer)
+  "Count in-flight block requests assigned to PEER."
+  (let ((count 0))
+    (when *ibd-context*
+      (maphash (lambda (hash peer-time)
+                 (declare (ignore hash))
+                 (when (eq (car peer-time) peer)
+                   (incf count)))
+               (ibd-context-in-flight *ibd-context*)))
+    count))
+
 (defun request-blocks-from-peers (peers chain-state)
-  "Request blocks from multiple peers, distributing the load."
+  "Request blocks from multiple peers, distributing the load.
+Enforces per-peer in-flight limits (like Bitcoin Core's
+MAX_BLOCKS_IN_TRANSIT_PER_PEER) rather than a single global limit."
   (unless (and *ibd-context* peers)
     (return-from request-blocks-from-peers 0))
 
@@ -361,34 +385,48 @@ When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
     (when (> retried 0)
       (bitcoin-lisp:log-warn "Retrying ~D timed out block requests" retried)))
 
-  ;; Calculate how many more requests we can make
-  (let* ((in-flight-count (hash-table-count (ibd-context-in-flight *ibd-context*)))
-         (max-in-flight (ibd-context-max-in-flight *ibd-context*))
-         (can-request (- max-in-flight in-flight-count)))
+  (let* ((max-per-peer (ibd-context-max-in-flight *ibd-context*))
+         (ready-peers (remove-if-not (lambda (p) (eq (peer-state p) :ready)) peers))
+         ;; Calculate total budget across all peers
+         (total-budget (loop for peer in ready-peers
+                             sum (max 0 (- max-per-peer (count-peer-in-flight peer))))))
 
-    (when (<= can-request 0)
+    (when (or (null ready-peers) (zerop total-budget))
       (return-from request-blocks-from-peers 0))
 
-    ;; Get blocks to request
-    (let ((to-request (get-next-blocks-to-request can-request))
-          (ready-peers (remove-if-not (lambda (p) (eq (peer-state p) :ready)) peers)))
-
-      (when (or (null to-request) (null ready-peers))
+    ;; Get blocks to request (up to total budget)
+    (let ((to-request (get-next-blocks-to-request total-budget)))
+      (when (null to-request)
         (return-from request-blocks-from-peers 0))
 
-      ;; Distribute NEW requests across peers, grouped by peer
+      ;; Distribute requests across peers, respecting per-peer limits
       (let ((requests-made 0)
-            (peer-index 0)
-            (num-peers (length ready-peers))
-            (peer-requests (make-hash-table :test 'eq)))
-        (dolist (hash to-request)
-          (let ((peer (nth (mod peer-index num-peers) ready-peers)))
-            (mark-block-in-flight hash peer)
-            (push hash (gethash peer peer-requests))
-            (incf peer-index)
-            (incf requests-made)))
+            (peer-requests (make-hash-table :test 'eq))
+            (peer-counts (make-hash-table :test 'eq)))
+        ;; Initialize per-peer counts
+        (dolist (peer ready-peers)
+          (setf (gethash peer peer-counts) (count-peer-in-flight peer)))
 
-        ;; Send batch request to each peer (only NEW blocks)
+        ;; Assign blocks round-robin, skipping peers at their limit
+        (let ((peer-index 0)
+              (num-peers (length ready-peers)))
+          (dolist (hash to-request)
+            ;; Find next peer with budget
+            (let ((found nil))
+              (dotimes (attempts num-peers)
+                (let* ((peer (nth (mod (+ peer-index attempts) num-peers) ready-peers))
+                       (current (gethash peer peer-counts 0)))
+                  (when (< current max-per-peer)
+                    (mark-block-in-flight hash peer)
+                    (push hash (gethash peer peer-requests))
+                    (setf (gethash peer peer-counts) (1+ current))
+                    (setf peer-index (1+ (mod (+ peer-index attempts) num-peers)))
+                    (incf requests-made)
+                    (setf found t)
+                    (return))))
+              (unless found (return)))))
+
+        ;; Send batch request to each peer
         (maphash (lambda (peer hashes)
                    (when hashes
                      (handler-case
@@ -453,6 +491,9 @@ When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
 Returns the number of blocks downloaded."
   (setf *ibd-context* (make-ibd))
   (setf (ibd-context-target-height *ibd-context*) target-height)
+  ;; Set adaptive timeout based on number of peers
+  (setf (ibd-context-request-timeout *ibd-context*)
+        (compute-block-download-timeout (length peers)))
 
   (unwind-protect
        (run-ibd peers chain-state utxo-set block-store
@@ -492,12 +533,29 @@ Returns the number of blocks downloaded."
 
     ;; Download blocks
     (let ((last-report-time (get-internal-real-time))
-          (report-interval (* 10 internal-time-units-per-second)))  ; Every 10 seconds
+          (report-interval (* 10 internal-time-units-per-second))  ; Every 10 seconds
+          (no-peer-cycles 0))
 
       (loop while (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
             do (progn
+                 ;; Prune disconnected peers from the list
+                 (setf peers (remove-if-not
+                              (lambda (p) (eq (peer-state p) :ready))
+                              peers))
+
+                 ;; Handle no-peer condition: exit after a few seconds
+                 ;; (caller is responsible for reconnecting and retrying)
+                 (when (null peers)
+                   (incf no-peer-cycles)
+                   (when (> no-peer-cycles 5)
+                     (bitcoin-lisp:log-warn "No peers available, pausing block download")
+                     (return))
+                   (sleep 1))
+
                  ;; Request more blocks if needed
-                 (request-blocks-from-peers peers chain-state)
+                 (when peers
+                   (setf no-peer-cycles 0)
+                   (request-blocks-from-peers peers chain-state))
 
                  ;; Receive and process messages from all peers
                  (dolist (peer peers)
