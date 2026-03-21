@@ -119,6 +119,8 @@
                              ;; Bitcoin Core comparison feature tests
                              (:file "new-features-tests")
                              ;; Bitcoin Core sighash test vectors
-                             (:file "bitcoin-core-sighash-tests"))))
+                             (:file "bitcoin-core-sighash-tests")
+                             ;; Bitcoin Core BIP 341 taproot test vectors
+                             (:file "bitcoin-core-bip341-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
