@@ -24,8 +24,9 @@
   ;; Health monitoring
   (consecutive-ping-failures 0 :type (unsigned-byte 8))
   (last-health-check 0 :type integer)
-  ;; Block request timeout tracking
+  ;; Block delivery tracking
   (block-timeout-count 0 :type (unsigned-byte 8))
+  (last-block-received-time 0 :type integer)  ; internal-real-time of last block from this peer
   (address "" :type string)
   ;; Misbehavior scoring
   (misbehavior-score 0 :type (unsigned-byte 32))
@@ -296,6 +297,30 @@ Also checks handshake timeout for peers that haven't completed handshake."
 Returns T if the peer should be disconnected."
   (incf (peer-block-timeout-count peer))
   (>= (peer-block-timeout-count peer) +max-block-timeouts+))
+
+(defun record-block-received-from-peer (peer)
+  "Record that we received a block from PEER. Resets stalling state."
+  (setf (peer-last-block-received-time peer) (get-internal-real-time))
+  (setf (peer-block-timeout-count peer) 0))
+
+(defun peer-stalling-p (peer &key (timeout-seconds 30))
+  "Check if PEER is stalling block download.
+A peer is stalling if it has been connected and we haven't received a block
+from it in TIMEOUT-SECONDS despite having in-flight requests.
+Returns T if the peer appears to be stalling."
+  (and (eq (peer-state peer) :ready)
+       (not (zerop (peer-last-block-received-time peer)))
+       (> (/ (float (- (get-internal-real-time) (peer-last-block-received-time peer)))
+             (float internal-time-units-per-second))
+          timeout-seconds)))
+
+(defun consider-peer-eviction (peer our-height)
+  "Check if PEER should be evicted based on chain quality.
+Peers whose advertised height is significantly behind our validated tip
+are likely unproductive. Returns T if the peer should be disconnected."
+  (and (eq (peer-state peer) :ready)
+       ;; Peer claims a height far behind ours (>1000 blocks)
+       (> our-height (+ (peer-start-height peer) 1000))))
 
 ;;; Misbehavior Scoring and Banning
 
