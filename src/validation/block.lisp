@@ -737,6 +737,15 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
         (return-from validate-block
           (values nil :block-too-heavy nil))))
 
+    ;; BIP 30: Check for duplicate txids (unspent outputs with same txid)
+    ;; Only needed before BIP 34 activation (height-in-coinbase guarantees uniqueness after)
+    (when (< current-height (get-bip34-activation-height bitcoin-lisp:*network*))
+      (dolist (tx transactions)
+        (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+          (when (bitcoin-lisp.storage:any-utxo-for-txid-p utxo-set txid)
+            (return-from validate-block
+              (values nil :duplicate-txid nil))))))
+
     ;; Validate each transaction and collect fees (using Satoshi type)
     ;; Track outputs from earlier transactions for intra-block spending
     (let ((total-fees (wrap-satoshi 0))
