@@ -365,20 +365,42 @@ Returns the node instance."
                                         :password rpc-password))
 
   ;; Connect to peers and sync if requested (in background thread)
+  ;; Reconnects and retries when peers are lost, similar to Bitcoin Core's
+  ;; CheckForStaleTipAndEvictPeers (net_processing.cpp:5460)
   (when sync
     (setf (node-sync-thread *node*)
           (bt:make-thread
            (lambda ()
              (handler-case
                  (progn
-                   ;; Connect to at least 2 peers within 60 seconds before syncing
-                   ;; This helps avoid getting stuck with a single unresponsive peer
+                   ;; Initial connection
                    (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
-                   (when (>= (length (node-peers *node*)) 1)
-                     (setf (node-syncing *node*) t)
-                     (unwind-protect
-                          (sync-blockchain *node*)
-                       (setf (node-syncing *node*) nil))))
+                   (loop while (node-running *node*)
+                         do (if (>= (length (node-peers *node*)) 1)
+                                (progn
+                                  (setf (node-syncing *node*) t)
+                                  (unwind-protect
+                                       (sync-blockchain *node*)
+                                    (setf (node-syncing *node*) nil))
+                                  ;; Check if we've caught up
+                                  (let* ((best-peer (find-best-peer *node*))
+                                         (peer-height (if best-peer
+                                                          (bitcoin-lisp.networking:peer-start-height
+                                                           best-peer)
+                                                          0))
+                                         (our-height (bitcoin-lisp.storage:current-height
+                                                      (node-chain-state *node*))))
+                                    (when (>= our-height peer-height)
+                                      (log-info "Sync complete at height ~D" our-height)
+                                      (return)))
+                                  ;; Replace any peers lost during sync
+                                  (replace-disconnected-peers *node*))
+                                ;; No peers, try full reconnection
+                                (progn
+                                  (log-warn "No peers available, reconnecting in 5s...")
+                                  (sleep 5)
+                                  (connect-to-peers *node* max-peers
+                                                    :timeout 30 :min-peers 1)))))
                (error (c)
                  (log-error "Sync thread error: ~A" c))))
            :name "bitcoin-sync-thread")))
