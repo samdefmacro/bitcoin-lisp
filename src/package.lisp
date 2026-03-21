@@ -252,6 +252,7 @@
    #:make-utxo-set
    #:utxo-entry
    #:make-utxo-entry
+   #:any-utxo-for-txid-p
    #:utxo-entry-value
    #:utxo-entry-script-pubkey
    #:utxo-entry-height
