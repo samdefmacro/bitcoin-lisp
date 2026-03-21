@@ -133,40 +133,80 @@ PREVIOUS-UTXOS should be a list of (txid index entry) for restored UTXOs."
 ;;; Each entry: 36-byte key, 8-byte value, 4-byte height, 1-byte coinbase,
 ;;;             4-byte script-len, N-byte script.
 
+;;; Shared UTXO entry serialization helpers
+
+(defun write-utxo-entry-fields (stream entry)
+  "Write the fields of a utxo-entry to STREAM: value, height, coinbase, script."
+  (bitcoin-lisp.serialization:write-int64-le stream (utxo-entry-value entry))
+  (bitcoin-lisp.serialization:write-uint32-le stream (utxo-entry-height entry))
+  (write-byte (if (utxo-entry-coinbase entry) 1 0) stream)
+  (let ((script (utxo-entry-script-pubkey entry)))
+    (bitcoin-lisp.serialization:write-uint32-le stream (length script))
+    (write-sequence script stream)))
+
+(defun read-utxo-entry-fields (stream)
+  "Read utxo-entry fields from STREAM. Returns a utxo-entry."
+  (let* ((value (bitcoin-lisp.serialization:read-int64-le stream))
+         (height (bitcoin-lisp.serialization:read-uint32-le stream))
+         (coinbase (= (read-byte stream) 1))
+         (script-len (bitcoin-lisp.serialization:read-uint32-le stream))
+         (script (make-array script-len :element-type '(unsigned-byte 8))))
+    (read-sequence script stream)
+    (make-utxo-entry :value value
+                     :script-pubkey script
+                     :height height
+                     :coinbase coinbase)))
+
+;;; Atomic file I/O with CRC32 integrity
+
+(defun save-file-with-crc32 (path write-fn)
+  "Write data to PATH atomically with CRC32 integrity.
+WRITE-FN receives a stream and writes the payload (including magic/version/count).
+Uses temp file + rename for atomicity."
+  (ensure-directories-exist path)
+  (let ((tmp-path (make-pathname :defaults path
+                                 :type (concatenate 'string
+                                                    (or (pathname-type path) "dat")
+                                                    ".tmp"))))
+    (let ((all-bytes (flexi-streams:with-output-to-sequence (stream)
+                       (funcall write-fn stream))))
+      (with-open-file (out tmp-path
+                           :direction :output
+                           :if-exists :supersede
+                           :element-type '(unsigned-byte 8))
+        (write-sequence all-bytes out)
+        (write-sequence (compute-crc32 all-bytes) out))
+      (rename-file tmp-path path))))
+
+(defun load-file-with-crc32 (path min-size)
+  "Load and verify a CRC32-protected file at PATH.
+MIN-SIZE is the minimum valid file size (header + crc).
+Returns the file bytes (without CRC) on success, NIL on failure."
+  (handler-case
+      (with-open-file (in path :direction :input
+                               :element-type '(unsigned-byte 8)
+                               :if-does-not-exist nil)
+        (when in
+          (let* ((file-len (file-length in))
+                 (data (make-array file-len :element-type '(unsigned-byte 8))))
+            (read-sequence data in)
+            (when (< file-len min-size)
+              (return-from load-file-with-crc32 nil))
+            (let* ((payload (subseq data 0 (- file-len 4)))
+                   (stored-crc (subseq data (- file-len 4)))
+                   (computed-crc (compute-crc32 payload)))
+              (if (equalp stored-crc computed-crc)
+                  data
+                  nil)))))
+    (error () nil)))
+
+;;; UTXO Set Persistence
+
 (defvar *utxo-magic* (map '(vector (unsigned-byte 8)) #'char-code "UTXO")
   "Magic bytes identifying a UTXO set file.")
 
 (defconstant +utxo-format-version+ 1
   "Current UTXO persistence format version.")
-
-(defun write-uint32-le (stream value)
-  "Write a 32-bit unsigned integer in little-endian format."
-  (write-byte (logand value #xFF) stream)
-  (write-byte (logand (ash value -8) #xFF) stream)
-  (write-byte (logand (ash value -16) #xFF) stream)
-  (write-byte (logand (ash value -24) #xFF) stream))
-
-(defun read-uint32-le (stream)
-  "Read a 32-bit unsigned integer in little-endian format."
-  (logior (read-byte stream)
-          (ash (read-byte stream) 8)
-          (ash (read-byte stream) 16)
-          (ash (read-byte stream) 24)))
-
-(defun write-uint64-le (stream value)
-  "Write a 64-bit unsigned integer in little-endian format."
-  (loop for i from 0 below 8
-        do (write-byte (logand (ash value (* -8 i)) #xFF) stream)))
-
-(defun read-int64-le (stream)
-  "Read a 64-bit signed integer in little-endian format."
-  (let ((val 0))
-    (loop for i from 0 below 8
-          do (setf val (logior val (ash (read-byte stream) (* 8 i)))))
-    ;; Sign extension
-    (if (logbitp 63 val)
-        (- val (expt 2 64))
-        val)))
 
 (defun compute-crc32 (data)
   "Compute CRC32 checksum of byte vector DATA. Returns 4-byte vector."
@@ -180,46 +220,17 @@ PREVIOUS-UTXOS should be a list of (txid index entry) for restored UTXOs."
 (defun save-utxo-set (utxo-set path)
   "Save the UTXO set to a binary file at PATH with integrity checks.
 Uses atomic write: writes to temporary file, then renames."
-  (ensure-directories-exist path)
-  (let ((tmp-path (make-pathname :defaults path
-                                 :type (concatenate 'string
-                                                    (or (pathname-type path) "dat")
-                                                    ".tmp"))))
-    ;; Write to temporary file
-    (let ((all-bytes
-            (coerce (flexi-streams:with-output-to-sequence (stream)
-              ;; Magic
-              (write-sequence *utxo-magic* stream)
-              ;; Version
-              (write-uint32-le stream +utxo-format-version+)
-              ;; Entry count
-              (write-uint32-le stream (hash-table-count (utxo-set-entries utxo-set)))
-              ;; Entries
-              (maphash (lambda (key entry)
-                         ;; 36-byte key
-                         (write-sequence key stream)
-                         ;; 8-byte value (signed)
-                         (let ((val (utxo-entry-value entry)))
-                           (write-uint64-le stream (if (< val 0) (+ val (expt 2 64)) val)))
-                         ;; 4-byte height
-                         (write-uint32-le stream (utxo-entry-height entry))
-                         ;; 1-byte coinbase flag
-                         (write-byte (if (utxo-entry-coinbase entry) 1 0) stream)
-                         ;; 4-byte script length + script bytes
-                         (let ((script (utxo-entry-script-pubkey entry)))
-                           (write-uint32-le stream (length script))
-                           (write-sequence script stream)))
-                       (utxo-set-entries utxo-set)))
-                    '(simple-array (unsigned-byte 8) (*)))))
-      ;; Write data + CRC32 to temp file
-      (with-open-file (out tmp-path
-                           :direction :output
-                           :if-exists :supersede
-                           :element-type '(unsigned-byte 8))
-        (write-sequence all-bytes out)
-        (write-sequence (compute-crc32 all-bytes) out)))
-    ;; Atomic rename
-    (rename-file tmp-path path))
+  (save-file-with-crc32
+   path
+   (lambda (stream)
+     (write-sequence *utxo-magic* stream)
+     (bitcoin-lisp.serialization:write-uint32-le stream +utxo-format-version+)
+     (bitcoin-lisp.serialization:write-uint32-le stream
+                                                  (hash-table-count (utxo-set-entries utxo-set)))
+     (maphash (lambda (key entry)
+                (write-sequence key stream)
+                (write-utxo-entry-fields stream entry))
+              (utxo-set-entries utxo-set))))
   (setf (utxo-set-dirty utxo-set) nil)
   t)
 
@@ -262,23 +273,13 @@ Returns T if loaded, NIL if file does not exist or is corrupted."
 (defun load-utxo-set-legacy (utxo-set file-bytes)
   "Load UTXO set from old format (no magic, no checksum)."
   (flexi-streams:with-input-from-sequence (stream file-bytes)
-    (let ((count (read-uint32-le stream))
+    (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
           (entries (utxo-set-entries utxo-set)))
       (clrhash entries)
       (dotimes (i count)
         (let ((key (make-array 36 :element-type '(unsigned-byte 8))))
           (read-sequence key stream)
-          (let* ((value (read-int64-le stream))
-                 (height (read-uint32-le stream))
-                 (coinbase (= 1 (read-byte stream)))
-                 (script-len (read-uint32-le stream))
-                 (script (make-array script-len :element-type '(unsigned-byte 8))))
-            (read-sequence script stream)
-            (setf (gethash key entries)
-                  (make-utxo-entry :value value
-                                   :script-pubkey script
-                                   :height height
-                                   :coinbase coinbase)))))))
+          (setf (gethash key entries) (read-utxo-entry-fields stream))))))
   (setf (utxo-set-dirty utxo-set) nil)
   t)
 
@@ -302,29 +303,19 @@ Returns T if loaded, NIL if file does not exist or is corrupted."
     (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
       (read-sequence magic stream))
     ;; Check version
-    (let ((version (read-uint32-le stream)))
+    (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
       (unless (= version +utxo-format-version+)
         (format *error-output* "WARNING: UTXO file version ~D not supported (expected ~D)~%"
                 version +utxo-format-version+)
         (return-from load-utxo-set-v1 nil)))
     ;; Read entries
-    (let ((count (read-uint32-le stream))
+    (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
           (entries (utxo-set-entries utxo-set)))
       (clrhash entries)
       (dotimes (i count)
         (let ((key (make-array 36 :element-type '(unsigned-byte 8))))
           (read-sequence key stream)
-          (let* ((value (read-int64-le stream))
-                 (height (read-uint32-le stream))
-                 (coinbase (= 1 (read-byte stream)))
-                 (script-len (read-uint32-le stream))
-                 (script (make-array script-len :element-type '(unsigned-byte 8))))
-            (read-sequence script stream)
-            (setf (gethash key entries)
-                  (make-utxo-entry :value value
-                                   :script-pubkey script
-                                   :height height
-                                   :coinbase coinbase)))))))
+          (setf (gethash key entries) (read-utxo-entry-fields stream))))))
   (setf (utxo-set-dirty utxo-set) nil)
   t)
 
