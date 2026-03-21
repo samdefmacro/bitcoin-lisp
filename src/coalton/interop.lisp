@@ -1721,10 +1721,13 @@
 
       ;; Version 1 (Taproot)
       ((= version 1)
-       (let ((prog-len (length program)))
-         (if (= prog-len 32)
-             (validate-taproot witness program amount)
-             (values nil :witness-program-wrong-length))))
+       (if (flag-enabled-p "TAPROOT")
+           (let ((prog-len (length program)))
+             (if (= prog-len 32)
+                 (validate-taproot witness program amount)
+                 (values nil :witness-program-wrong-length)))
+           ;; Pre-activation: anyone-can-spend
+           (values t nil)))
 
       ;; Unknown version (v2+)
       (t
