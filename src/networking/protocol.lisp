@@ -109,6 +109,11 @@ Returns T if message was handled, NIL otherwise."
      ;; No-op post-handshake (only meaningful during handshake)
      t)
 
+    ((string= command "sendheaders")
+     ;; BIP 130: Peer prefers header announcements over inv
+     (setf (peer-prefers-headers peer) t)
+     t)
+
     ;; Compact block messages (BIP 152)
     ((string= command "sendcmpct")
      (handle-sendcmpct peer payload)

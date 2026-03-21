@@ -36,6 +36,8 @@
   (pending-compact-block nil)                         ; Pending reconstruction state
   ;; ADDRv2 support (BIP 155)
   (wants-addrv2 nil :type boolean)                    ; Peer sent sendaddrv2
+  ;; BIP 130 sendheaders support
+  (prefers-headers nil :type boolean)                  ; Peer sent sendheaders
   ;; DoS protection: per-peer rate limiters
   (rate-limit-inv nil)
   (rate-limit-tx nil)
@@ -214,10 +216,19 @@ Returns T on success, NIL on failure."
              ;; BIP 155: Track peer's addrv2 capability
              (when (string= command "sendaddrv2")
                (setf (peer-wants-addrv2 peer) t))
+             ;; BIP 130: Track peer's sendheaders preference
+             (when (string= command "sendheaders")
+               (setf (peer-prefers-headers peer) t))
              ;; Ignore other handshake-phase messages (wtxidrelay, etc.)
              ))
 
-  nil)  ; Didn't receive verack
+  ;; Didn't receive verack
+  nil)
+
+(defun send-post-handshake-messages (peer)
+  "Send feature negotiation messages after handshake completes."
+  ;; BIP 130: Request header announcements
+  (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message)))
 
 ;;; Ping/Pong
 
