@@ -77,6 +77,7 @@
    #:write-int64-le
    #:read-compact-size
    #:write-compact-size
+   #:compact-size-length
    #:read-bytes
    #:write-bytes
    #:read-var-bytes
