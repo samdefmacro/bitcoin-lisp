@@ -492,11 +492,15 @@ Downloads headers and blocks up to MAX-BLOCKS."
 
 (defun send-compact-block-negotiation (peer)
   "Send sendcmpct messages to advertise compact block support.
-   Sends version 2 first (preferred for SegWit), then version 1."
-  ;; Send version 2 (wtxid-based) first
-  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message nil 2))
-  ;; Then version 1 (txid-based) as fallback
-  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message nil 1)))
+Sends version 2 first (preferred for SegWit), then version 1.
+Requests high-bandwidth mode when not in IBD (peer will send us
+unsolicited compact blocks for faster relay)."
+  (let ((high-bw (not (or (eq (ibd-state) :syncing-blocks)
+                           (eq (ibd-state) :syncing-headers)))))
+    ;; Send version 2 (wtxid-based) first
+    (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message high-bw 2))
+    ;; Then version 1 (txid-based) as fallback
+    (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message high-bw 1))))
 
 (defun handle-sendcmpct (peer payload)
   "Handle a sendcmpct message from a peer.
