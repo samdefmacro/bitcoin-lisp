@@ -786,6 +786,13 @@
 ;;; When validating real blocks, we need to compute the sighash from
 ;;; the actual transaction data, not the test format.
 
+(defun remove-codeseparator (script)
+  "Remove all OP_CODESEPARATOR (0xab) bytes from SCRIPT for sighash computation."
+  (let ((result (remove #xab script)))
+    (if (typep result '(simple-array (unsigned-byte 8) (*)))
+        result
+        (coerce result '(simple-array (unsigned-byte 8) (*))))))
+
 (defun compute-legacy-sighash (tx input-index subscript sighash-type)
   "Compute legacy sighash from actual transaction data.
    TX is a transaction structure from bitcoin-lisp.serialization.
@@ -794,7 +801,8 @@
    SIGHASH-TYPE is the sighash type byte (last byte of signature).
 
    This implements BIP 66 / original Bitcoin sighash algorithm."
-  (let* ((base-type (logand sighash-type #x1f))
+  (let* ((subscript (remove-codeseparator subscript))
+         (base-type (logand sighash-type #x1f))
          (anyone-can-pay (not (zerop (logand sighash-type #x80))))
          (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
          (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
