@@ -861,24 +861,151 @@ Subsidy halves every 210,000 blocks."
 ;;;; Undo data for chain reorganizations
 
 (defvar *block-undo-data* (make-hash-table :test 'equalp)
-  "Maps block-hash -> list of (txid index utxo-entry) for spent UTXOs.
-Used to restore UTXOs during chain reorganization.")
+  "In-memory cache: maps block-hash -> list of (txid index utxo-entry).")
 
-(defconstant +max-undo-blocks+ 100
-  "Maximum number of blocks to keep undo data for (shallow reorg support).")
+(defvar *undo-base-path* nil
+  "Base directory for undo data files. Set during node startup.")
 
-(defun store-undo-data (block-hash spent-utxos)
-  "Store undo data for a block. Evicts oldest entries if over limit."
+(defconstant +max-undo-cache+ 100
+  "Maximum number of blocks to keep in the in-memory undo cache.")
+
+(defvar *undo-cache-heights* (make-hash-table :test 'equalp)
+  "Maps block-hash -> height for cache eviction ordering.")
+
+(defvar *undo-magic* (map '(vector (unsigned-byte 8)) #'char-code "UNDO")
+  "Magic bytes identifying an undo data file.")
+
+(defconstant +undo-format-version+ 1
+  "Current undo data file format version.")
+
+(defun initialize-undo-storage (base-path)
+  "Initialize undo data persistence with BASE-PATH as the storage directory."
+  (ensure-directories-exist base-path)
+  (setf *undo-base-path* base-path))
+
+(defun undo-file-path (block-hash)
+  "Return the path for an undo data file given BLOCK-HASH."
+  (when *undo-base-path*
+    (merge-pathnames
+     (make-pathname :name (bitcoin-lisp.crypto:bytes-to-hex block-hash)
+                    :type "dat")
+     *undo-base-path*)))
+
+(defun save-undo-data-to-disk (block-hash spent-utxos)
+  "Serialize spent-utxos to an undo file using atomic temp+rename with CRC32."
+  (let ((path (undo-file-path block-hash)))
+    (when path
+      (let ((tmp-path (make-pathname :defaults path
+                                     :type "dat.tmp")))
+        (let ((all-bytes
+                (flexi-streams:with-output-to-sequence (stream)
+                  (write-sequence *undo-magic* stream)
+                  (bitcoin-lisp.serialization:write-uint32-le stream +undo-format-version+)
+                  (bitcoin-lisp.serialization:write-uint32-le stream (length spent-utxos))
+                  (dolist (entry spent-utxos)
+                    (destructuring-bind (txid index utxo) entry
+                      (write-sequence txid stream)
+                      (bitcoin-lisp.serialization:write-uint32-le stream index)
+                      (bitcoin-lisp.serialization:write-int64-le
+                       stream (bitcoin-lisp.storage:utxo-entry-value utxo))
+                      (bitcoin-lisp.serialization:write-uint32-le
+                       stream (bitcoin-lisp.storage:utxo-entry-height utxo))
+                      (write-byte (if (bitcoin-lisp.storage:utxo-entry-coinbase utxo) 1 0)
+                                  stream)
+                      (let ((script (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)))
+                        (bitcoin-lisp.serialization:write-uint32-le stream (length script))
+                        (write-sequence script stream)))))))
+          (let ((crc (bitcoin-lisp.storage:compute-crc32 all-bytes)))
+            (with-open-file (out tmp-path
+                                 :direction :output
+                                 :if-exists :supersede
+                                 :element-type '(unsigned-byte 8))
+              (write-sequence all-bytes out)
+              (write-sequence crc out)))
+          (rename-file tmp-path path))))))
+
+(defun load-undo-data-from-disk (block-hash)
+  "Load and verify undo data from disk. Returns list of (txid index utxo-entry) or NIL."
+  (let ((path (undo-file-path block-hash)))
+    (when path
+      (handler-case
+          (with-open-file (in path :direction :input
+                                   :element-type '(unsigned-byte 8)
+                                   :if-does-not-exist nil)
+            (when in
+              (let* ((file-len (file-length in))
+                     (data (make-array file-len :element-type '(unsigned-byte 8))))
+                (read-sequence data in)
+                (when (< file-len 16)
+                  (return-from load-undo-data-from-disk nil))
+                (let* ((payload (subseq data 0 (- file-len 4)))
+                       (stored-crc (subseq data (- file-len 4)))
+                       (computed-crc (bitcoin-lisp.storage:compute-crc32 payload)))
+                  (unless (equalp stored-crc computed-crc)
+                    (bitcoin-lisp:log-warn "Undo data CRC mismatch for ~A"
+                                           (bitcoin-lisp.crypto:bytes-to-hex block-hash))
+                    (return-from load-undo-data-from-disk nil)))
+                (flexi-streams:with-input-from-sequence (stream data)
+                  (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
+                    (read-sequence magic stream)
+                    (unless (equalp magic *undo-magic*)
+                      (return-from load-undo-data-from-disk nil)))
+                  (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
+                    (unless (= version +undo-format-version+)
+                      (return-from load-undo-data-from-disk nil)))
+                  (let* ((count (bitcoin-lisp.serialization:read-uint32-le stream))
+                         (entries '()))
+                    (dotimes (i count)
+                      (let* ((txid (make-array 32 :element-type '(unsigned-byte 8)))
+                             (_ (read-sequence txid stream))
+                             (index (bitcoin-lisp.serialization:read-uint32-le stream))
+                             (value (bitcoin-lisp.serialization:read-int64-le stream))
+                             (height (bitcoin-lisp.serialization:read-uint32-le stream))
+                             (coinbase (= (read-byte stream) 1))
+                             (script-len (bitcoin-lisp.serialization:read-uint32-le stream))
+                             (script (make-array script-len
+                                                :element-type '(unsigned-byte 8))))
+                        (declare (ignore _))
+                        (read-sequence script stream)
+                        (push (list txid index
+                                    (bitcoin-lisp.storage:make-utxo-entry
+                                     :value value
+                                     :script-pubkey script
+                                     :height height
+                                     :coinbase coinbase))
+                              entries)))
+                    (nreverse entries))))))
+        (error (c)
+          (bitcoin-lisp:log-warn "Failed to load undo data: ~A" c)
+          nil)))))
+
+(defun evict-undo-cache ()
+  "Evict the oldest half of cache entries by height (they remain on disk)."
+  (let ((entries '()))
+    (maphash (lambda (hash height)
+               (push (cons hash height) entries))
+             *undo-cache-heights*)
+    (setf entries (sort entries #'< :key #'cdr))
+    (let ((to-evict (subseq entries 0 (floor (length entries) 2))))
+      (dolist (pair to-evict)
+        (remhash (car pair) *block-undo-data*)
+        (remhash (car pair) *undo-cache-heights*)))))
+
+(defun store-undo-data (block-hash spent-utxos height)
+  "Store undo data for a block to disk and in-memory cache."
+  (save-undo-data-to-disk block-hash spent-utxos)
   (setf (gethash block-hash *block-undo-data*) spent-utxos)
-  ;; Evict if over limit (simple: clear all if too many)
-  (when (> (hash-table-count *block-undo-data*) +max-undo-blocks+)
-    ;; Keep only the most recent entries - for simplicity, just let it grow
-    ;; In practice shallow reorgs are 1-3 blocks deep
-    nil))
+  (setf (gethash block-hash *undo-cache-heights*) height)
+  (when (> (hash-table-count *block-undo-data*) +max-undo-cache+)
+    (evict-undo-cache)))
 
 (defun get-undo-data (block-hash)
-  "Get the undo data for a block, or NIL if not available."
-  (gethash block-hash *block-undo-data*))
+  "Get undo data for a block. Checks in-memory cache first, then disk."
+  (or (gethash block-hash *block-undo-data*)
+      (let ((loaded (load-undo-data-from-disk block-hash)))
+        (when loaded
+          (setf (gethash block-hash *block-undo-data*) loaded))
+        loaded)))
 
 ;;;; Block connection
 
@@ -931,7 +1058,7 @@ Handles chain reorganizations when a competing chain has more work."
           ((equalp prev-hash current-best-hash)
            (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                utxo-set block new-height)))
-             (store-undo-data hash spent-utxos)
+             (store-undo-data hash spent-utxos new-height)
              ;; Record fee statistics for fee estimation
              (when fee-estimator
                (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
@@ -1050,7 +1177,7 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
               (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
                      (spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                    utxo-set block height)))
-                (store-undo-data block-hash spent-utxos)
+                (store-undo-data block-hash spent-utxos height)
                 ;; Record fee statistics for fee estimation
                 (when fee-estimator
                   (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
