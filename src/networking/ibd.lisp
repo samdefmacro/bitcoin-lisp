@@ -386,7 +386,10 @@ MAX_BLOCKS_IN_TRANSIT_PER_PEER) rather than a single global limit."
       (bitcoin-lisp:log-warn "Retrying ~D timed out block requests" retried)))
 
   (let* ((max-per-peer (ibd-context-max-in-flight *ibd-context*))
-         (ready-peers (remove-if-not (lambda (p) (eq (peer-state p) :ready)) peers))
+         (ready-peers (sort (remove-if-not (lambda (p) (eq (peer-state p) :ready)) peers)
+                            #'< :key (lambda (p)
+                                       (let ((lat (peer-ping-latency p)))
+                                         (if (plusp lat) lat most-positive-fixnum)))))
          ;; Calculate total budget across all peers
          (total-budget (loop for peer in ready-peers
                              sum (max 0 (- max-per-peer (count-peer-in-flight peer))))))
