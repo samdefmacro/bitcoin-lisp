@@ -109,6 +109,10 @@ Returns T if message was handled, NIL otherwise."
      ;; No-op post-handshake (only meaningful during handshake)
      t)
 
+    ((string= command "wtxidrelay")
+     ;; BIP 339: No-op post-handshake (only meaningful during handshake)
+     t)
+
     ((string= command "sendheaders")
      ;; BIP 130: Peer prefers header announcements over inv
      (setf (peer-prefers-headers peer) t)
@@ -344,7 +348,8 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                           (relay-transaction txid peer peers
                                             :fee-rate (if (plusp tx-size)
                                                           (floor fee tx-size)
-                                                          0))))))))))))
+                                                          0)
+                                            :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))))))))))))
     (error (c)
       (declare (ignore c))
       nil)))
@@ -377,17 +382,23 @@ Relay is always enabled on testnet, but disabled by default on mainnet for safet
   (or (eq bitcoin-lisp:*network* :testnet)
       bitcoin-lisp:*mainnet-relay-enabled*))
 
-(defun relay-transaction (txid source-peer peers &key fee-rate)
+(defun relay-transaction (txid source-peer peers &key fee-rate wtxid)
   "Relay a transaction to all connected peers except SOURCE-PEER.
 Sends inv messages and tracks announcements to avoid duplicates.
 FEE-RATE is the transaction fee rate in sat/byte (used for BIP 133 feefilter).
+WTXID is the witness txid (used for BIP 339 wtxidrelay peers).
 Does nothing if relay is disabled for the current network."
   (unless (relay-enabled-p)
     (return-from relay-transaction nil))
-  (let ((inv-msg (bitcoin-lisp.serialization:make-inv-message
-                  (list (bitcoin-lisp.serialization:make-inv-vector
-                         :type bitcoin-lisp.serialization:+inv-type-tx+
-                         :hash txid))))
+  (let ((txid-inv-msg (bitcoin-lisp.serialization:make-inv-message
+                       (list (bitcoin-lisp.serialization:make-inv-vector
+                              :type bitcoin-lisp.serialization:+inv-type-tx+
+                              :hash txid))))
+        (wtxid-inv-msg (when wtxid
+                         (bitcoin-lisp.serialization:make-inv-message
+                          (list (bitcoin-lisp.serialization:make-inv-vector
+                                 :type bitcoin-lisp.serialization:+inv-type-witness-tx+
+                                 :hash wtxid)))))
         (fee-rate-per-kb (if fee-rate (* fee-rate 1000) 0)))
     (dolist (peer peers)
       ;; Skip the source peer and disconnected peers
@@ -399,7 +410,10 @@ Does nothing if relay is disabled for the current network."
                  (or (zerop (peer-feefilter-rate peer))
                      (>= fee-rate-per-kb (peer-feefilter-rate peer))))
         (setf (gethash txid (peer-announced-txs peer)) t)
-        (send-message peer inv-msg)))))
+        ;; BIP 339: Use wtxid-based inv for peers that support it
+        (if (and (peer-wtxid-relay peer) wtxid-inv-msg)
+            (send-message peer wtxid-inv-msg)
+            (send-message peer txid-inv-msg))))))
 
 ;;; Sync operations
 
