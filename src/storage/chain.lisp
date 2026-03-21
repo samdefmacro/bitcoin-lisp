@@ -252,20 +252,6 @@ Backward compatible: old files without pruned-height default to 0."
             do (setf value (logior (ash value 8) (aref bytes i))))
       value)))
 
-(defun write-uint32-le-chain (stream value)
-  "Write 4-byte little-endian uint32."
-  (write-byte (logand value #xFF) stream)
-  (write-byte (logand (ash value -8) #xFF) stream)
-  (write-byte (logand (ash value -16) #xFF) stream)
-  (write-byte (logand (ash value -24) #xFF) stream))
-
-(defun read-uint32-le-chain (stream)
-  "Read 4-byte little-endian uint32."
-  (logior (read-byte stream)
-          (ash (read-byte stream) 8)
-          (ash (read-byte stream) 16)
-          (ash (read-byte stream) 24)))
-
 (defun serialize-header-bytes (stream header)
   "Serialize the 80-byte block header to stream."
   (let* ((header-bytes (bitcoin-lisp.serialization::serialize-block-header header))
@@ -286,10 +272,10 @@ Format: magic(4) + version(4) + count(4) + entries + CRC32(4)."
                       ;; Magic
                       (write-sequence *header-index-magic* stream)
                       ;; Version
-                      (write-uint32-le-chain stream +header-index-format-version+)
+                      (bitcoin-lisp.serialization:write-uint32-le stream +header-index-format-version+)
                       ;; Entry count
                       (let ((count (hash-table-count (chain-state-block-index state))))
-                        (write-uint32-le-chain stream count))
+                        (bitcoin-lisp.serialization:write-uint32-le stream count))
                       ;; Write each entry
                       (maphash (lambda (hash entry)
                                  (declare (ignore hash))
@@ -327,7 +313,7 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
 (defun load-header-index-legacy (state file-bytes)
   "Load header index from old format (no magic, no checksum)."
   (flexi-streams:with-input-from-sequence (stream file-bytes)
-    (let ((count (read-uint32-le-chain stream))
+    (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
           (entries-by-hash (make-hash-table :test 'equalp))
           (prev-hash-map (make-hash-table :test 'equalp)))
       (dotimes (i count)
@@ -356,13 +342,13 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
     (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
       (read-sequence magic stream))
     ;; Check version
-    (let ((version (read-uint32-le-chain stream)))
+    (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
       (unless (= version +header-index-format-version+)
         (format *error-output* "WARNING: Header index version ~D not supported (expected ~D)~%"
                 version +header-index-format-version+)
         (return-from load-header-index-v1 nil)))
     ;; Read entries
-    (let ((count (read-uint32-le-chain stream))
+    (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
           (entries-by-hash (make-hash-table :test 'equalp))
           (prev-hash-map (make-hash-table :test 'equalp)))
       (dotimes (i count)
@@ -375,7 +361,7 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
   "Read a single header entry from STREAM into ENTRIES-BY-HASH."
   (let ((hash (make-array 32 :element-type '(unsigned-byte 8))))
     (read-sequence hash stream)
-    (let* ((height (read-uint32-le-chain stream))
+    (let* ((height (bitcoin-lisp.serialization:read-uint32-le stream))
            (header-bytes (make-array 80 :element-type '(unsigned-byte 8))))
       (read-sequence header-bytes stream)
       (let* ((chainwork (deserialize-chainwork stream))
@@ -413,7 +399,7 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
   ;; 32-byte block hash
   (write-sequence (block-index-entry-hash entry) stream)
   ;; 4-byte height
-  (write-uint32-le-chain stream (block-index-entry-height entry))
+  (bitcoin-lisp.serialization:write-uint32-le stream (block-index-entry-height entry))
   ;; 80-byte header (or zeros if no header)
   (if (block-index-entry-header entry)
       (serialize-header-bytes stream (block-index-entry-header entry))
