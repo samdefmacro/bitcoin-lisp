@@ -61,6 +61,17 @@ The set maps (txid, output-index) -> utxo-entry."
   "Return the number of UTXOs in the set."
   (hash-table-count (utxo-set-entries utxo-set)))
 
+(defun any-utxo-for-txid-p (utxo-set txid)
+  "Check if any unspent output exists for TXID (BIP 30 duplicate check).
+Scans UTXO keys whose first 32 bytes match TXID."
+  (maphash (lambda (key entry)
+             (declare (ignore entry))
+             (when (and (>= (length key) 32)
+                        (equalp (subseq key 0 32) txid))
+               (return-from any-utxo-for-txid-p t)))
+           (utxo-set-entries utxo-set))
+  nil)
+
 (defun apply-block-to-utxo-set (utxo-set block height)
   "Apply a block's transactions to the UTXO set.
 Adds new outputs and removes spent outputs.
