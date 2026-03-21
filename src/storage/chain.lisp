@@ -426,7 +426,7 @@ Updates the entry count in the file header."
                                 :direction :output
                                 :if-does-not-exist :create
                                 :element-type '(unsigned-byte 8))
-          (write-uint32-le-chain stream 0)  ; placeholder count
+          (write-uint32-le-chain stream 0)  ; initial count, updated below
           (write-single-header-entry stream entry))))
     ;; Update the count at the beginning of the file
     (with-open-file (stream path

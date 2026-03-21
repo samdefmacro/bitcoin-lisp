@@ -1774,7 +1774,7 @@
          ((None) (ScriptErr SE-UnbalancedConditional))
          ((Some new-ctx) (ScriptOk new-ctx))))
 
-      ;; Signature operations - placeholder implementations
+      ;; Crypto and signature operations
       ((OP-SHA1)
        (match (stack-pop (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
