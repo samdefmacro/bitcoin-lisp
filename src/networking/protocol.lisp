@@ -114,6 +114,12 @@ Returns T if message was handled, NIL otherwise."
      (setf (peer-prefers-headers peer) t)
      t)
 
+    ((string= command "feefilter")
+     ;; BIP 133: Peer's minimum fee rate for tx relay
+     (let ((rate (bitcoin-lisp.serialization:parse-feefilter-payload payload)))
+       (setf (peer-feefilter-rate peer) rate))
+     t)
+
     ;; Compact block messages (BIP 152)
     ((string= command "sendcmpct")
      (handle-sendcmpct peer payload)
@@ -335,7 +341,10 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                       (when (eq result :ok)
                         ;; Relay to other peers
                         (when peers
-                          (relay-transaction txid peer peers)))))))))))
+                          (relay-transaction txid peer peers
+                                            :fee-rate (if (plusp tx-size)
+                                                          (floor fee tx-size)
+                                                          0))))))))))))
     (error (c)
       (declare (ignore c))
       nil)))
@@ -368,22 +377,27 @@ Relay is always enabled on testnet, but disabled by default on mainnet for safet
   (or (eq bitcoin-lisp:*network* :testnet)
       bitcoin-lisp:*mainnet-relay-enabled*))
 
-(defun relay-transaction (txid source-peer peers)
+(defun relay-transaction (txid source-peer peers &key fee-rate)
   "Relay a transaction to all connected peers except SOURCE-PEER.
 Sends inv messages and tracks announcements to avoid duplicates.
+FEE-RATE is the transaction fee rate in sat/byte (used for BIP 133 feefilter).
 Does nothing if relay is disabled for the current network."
   (unless (relay-enabled-p)
     (return-from relay-transaction nil))
   (let ((inv-msg (bitcoin-lisp.serialization:make-inv-message
                   (list (bitcoin-lisp.serialization:make-inv-vector
                          :type bitcoin-lisp.serialization:+inv-type-tx+
-                         :hash txid)))))
+                         :hash txid))))
+        (fee-rate-per-kb (if fee-rate (* fee-rate 1000) 0)))
     (dolist (peer peers)
       ;; Skip the source peer and disconnected peers
       (when (and (not (eq peer source-peer))
                  (eq (peer-state peer) :ready)
                  ;; Skip if already announced to this peer
-                 (not (gethash txid (peer-announced-txs peer))))
+                 (not (gethash txid (peer-announced-txs peer)))
+                 ;; BIP 133: Skip if tx fee rate below peer's feefilter
+                 (or (zerop (peer-feefilter-rate peer))
+                     (>= fee-rate-per-kb (peer-feefilter-rate peer))))
         (setf (gethash txid (peer-announced-txs peer)) t)
         (send-message peer inv-msg)))))
 
