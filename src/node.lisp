@@ -137,6 +137,35 @@ LEVEL can be :debug, :info, :warn, or :error."
     (setf *log-file-stream* nil))
   t)
 
+;;;; Genesis block headers
+;;; Genesis parameters from Bitcoin Core chainparams.cpp
+
+(defvar *genesis-merkle-root*
+  (bitcoin-lisp.crypto:hex-to-bytes
+   "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a")
+  "Genesis block merkle root (little-endian). Same for mainnet and testnet.")
+
+(defun make-genesis-header (network)
+  "Construct the genesis block header for NETWORK."
+  (let ((prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (ecase network
+      (:testnet
+       (bitcoin-lisp.serialization:make-block-header
+        :version 1
+        :prev-block prev-block
+        :merkle-root (copy-seq *genesis-merkle-root*)
+        :timestamp 1296688602
+        :bits #x1d00ffff
+        :nonce 414098458))
+      (:mainnet
+       (bitcoin-lisp.serialization:make-block-header
+        :version 1
+        :prev-block prev-block
+        :merkle-root (copy-seq *genesis-merkle-root*)
+        :timestamp 1231006505
+        :bits #x1d00ffff
+        :nonce 2083236893)))))
+
 ;;;; Startup Sequence
 
 (defun init-node (data-directory &key (network :testnet) (log-level :info))
@@ -236,19 +265,7 @@ Returns the node instance."
   (setf (node-chain-state *node*)
         (bitcoin-lisp.storage:init-chain-state (node-data-directory *node*)))
 
-  ;; Add genesis block to block index (needed for header validation)
-  (let ((genesis-hash (bitcoin-lisp.storage::chain-state-genesis-hash
-                       (node-chain-state *node*))))
-    (unless (bitcoin-lisp.storage:get-block-index-entry
-             (node-chain-state *node*) genesis-hash)
-      (bitcoin-lisp.storage:add-block-index-entry
-       (node-chain-state *node*)
-       (bitcoin-lisp.storage:make-block-index-entry
-        :hash genesis-hash
-        :height 0
-        :prev-entry nil
-        :chain-work 0
-        :status :valid))))
+  ;; Genesis block index entry is ensured after load-header-index below
 
   (when (bitcoin-lisp.storage:load-state (node-chain-state *node*))
     (log-info "Loaded existing chain state: height ~D"
@@ -276,6 +293,30 @@ Returns the node instance."
               (hash-table-count
                (bitcoin-lisp.storage::chain-state-block-index
                 (node-chain-state *node*)))))
+
+  ;; Ensure genesis block is in the index with a proper header
+  ;; (needed for difficulty walk-back on testnet)
+  (let* ((genesis-hash (bitcoin-lisp.storage:network-genesis-hash network))
+         (genesis-entry (bitcoin-lisp.storage:get-block-index-entry
+                         (node-chain-state *node*) genesis-hash))
+         (genesis-header (make-genesis-header network)))
+    (if genesis-entry
+        ;; Fix existing entry if it has a missing or zeroed header
+        (when (or (null (bitcoin-lisp.storage:block-index-entry-header genesis-entry))
+                  (zerop (bitcoin-lisp.serialization:block-header-bits
+                          (bitcoin-lisp.storage:block-index-entry-header genesis-entry))))
+          (setf (bitcoin-lisp.storage:block-index-entry-header genesis-entry)
+                genesis-header))
+        ;; Create new genesis entry
+        (bitcoin-lisp.storage:add-block-index-entry
+         (node-chain-state *node*)
+         (bitcoin-lisp.storage:make-block-index-entry
+          :hash genesis-hash
+          :height 0
+          :header genesis-header
+          :prev-entry nil
+          :chain-work 0
+          :status :valid))))
 
   ;; Initialize recent rejects filter (DoS protection)
   (setf (node-recent-rejects *node*) (make-rejects-filter))
