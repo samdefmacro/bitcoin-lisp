@@ -115,6 +115,8 @@
                              ;; Block weight tests (BIP 141)
                              (:file "weight-tests")
                              ;; Sigops validation tests
-                             (:file "sigops-tests"))))
+                             (:file "sigops-tests")
+                             ;; Bitcoin Core comparison feature tests
+                             (:file "new-features-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
