@@ -553,6 +553,8 @@ Returns the number of peers connected."
                             addr
                             (bitcoin-lisp.networking:peer-user-agent peer)
                             (bitcoin-lisp.networking:peer-start-height peer))
+                  ;; Send feature negotiation messages
+                  (bitcoin-lisp.networking:send-post-handshake-messages peer)
                   ;; Record success in address book (add if not present)
                   (when address-book
                     (let ((ip-bytes (bitcoin-lisp.networking:string-to-ip-bytes addr))
@@ -650,6 +652,8 @@ Returns the number of new peers connected."
                   (setf (bitcoin-lisp.networking:peer-address peer) addr)
                   (when (bitcoin-lisp.networking:perform-handshake peer)
                     (log-info "Replacement peer connected: ~A" addr)
+                    ;; Send feature negotiation messages
+                    (bitcoin-lisp.networking:send-post-handshake-messages peer)
                     ;; Send compact block negotiation (BIP 152)
                     (bitcoin-lisp.networking:send-compact-block-negotiation peer)
                     (push peer (node-peers node))

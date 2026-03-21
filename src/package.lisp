@@ -226,6 +226,7 @@
    #:read-net-addr-v2
    #:write-net-addr-v2
    #:make-sendaddrv2-message
+   #:make-sendheaders-message
    #:make-addrv2-message
    #:parse-addrv2-payload))
 
@@ -467,6 +468,7 @@
    #:send-message
    #:receive-message
    #:perform-handshake
+   #:send-post-handshake-messages
    #:send-ping
    ;; Compact block peer state (BIP 152)
    #:peer-compact-block-version
@@ -535,6 +537,7 @@
    #:string-to-ip-bytes
    ;; ADDRv2 support (BIP 155)
    #:peer-wants-addrv2
+   #:peer-prefers-headers
    #:handle-addrv2
    ;; Misbehavior and banning
    #:record-misbehavior
