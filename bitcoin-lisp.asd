@@ -117,6 +117,8 @@
                              ;; Sigops validation tests
                              (:file "sigops-tests")
                              ;; Bitcoin Core comparison feature tests
-                             (:file "new-features-tests"))))
+                             (:file "new-features-tests")
+                             ;; Bitcoin Core sighash test vectors
+                             (:file "bitcoin-core-sighash-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
