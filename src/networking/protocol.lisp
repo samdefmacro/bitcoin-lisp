@@ -4,6 +4,16 @@
 ;;;
 ;;; Higher-level protocol operations for syncing and message handling.
 
+(defmacro with-node-lock (&body body)
+  "Execute BODY while holding the node lock for thread-safe state access.
+Guards shared state (chain-state, UTXO set, mempool, peer list) against
+concurrent access from RPC and sync threads."
+  `(let ((node bitcoin-lisp::*node*))
+     (if (and node (bitcoin-lisp::node-lock node))
+         (bt:with-lock-held ((bitcoin-lisp::node-lock node))
+           ,@body)
+         (progn ,@body))))
+
 (defstruct peer-manager
   "Manages connections to multiple peers."
   (peers '() :type list)
@@ -196,28 +206,29 @@ Returns T if message was handled, NIL otherwise."
   "Handle a block message."
   (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
     (when block
-      (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-             (hash (bitcoin-lisp.serialization:block-header-hash header))
-             (current-height (bitcoin-lisp.storage:current-height chain-state))
-             (current-time (bitcoin-lisp.serialization:get-unix-time)))
-        ;; Validate and connect block
-        (multiple-value-bind (valid error)
-            (bitcoin-lisp.validation:validate-block
-             block chain-state utxo-set (1+ current-height) current-time)
-          (if valid
-              (progn
-                (bitcoin-lisp.validation:connect-block
-                 block chain-state block-store utxo-set
-                 :fee-estimator fee-estimator
-                 :recent-rejects recent-rejects)
-                ;; Remove confirmed transactions from mempool
-                (when mempool
-                  (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
-              (progn
-                (format t "Block ~A rejected: ~A~%"
-                        (bitcoin-lisp.crypto:bytes-to-hex hash) error)
-                ;; Record misbehavior for invalid block
-                (record-misbehavior peer 100))))))))
+      (with-node-lock
+        (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+               (hash (bitcoin-lisp.serialization:block-header-hash header))
+               (current-height (bitcoin-lisp.storage:current-height chain-state))
+               (current-time (bitcoin-lisp.serialization:get-unix-time)))
+          ;; Validate and connect block
+          (multiple-value-bind (valid error)
+              (bitcoin-lisp.validation:validate-block
+               block chain-state utxo-set (1+ current-height) current-time)
+            (if valid
+                (progn
+                  (bitcoin-lisp.validation:connect-block
+                   block chain-state block-store utxo-set
+                   :fee-estimator fee-estimator
+                   :recent-rejects recent-rejects)
+                  ;; Remove confirmed transactions from mempool
+                  (when mempool
+                    (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+                (progn
+                  (format t "Block ~A rejected: ~A~%"
+                          (bitcoin-lisp.crypto:bytes-to-hex hash) error)
+                  ;; Record misbehavior for invalid block
+                  (record-misbehavior peer 100)))))))))
 
 ;;; Address handling
 
@@ -284,41 +295,42 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
   (handler-case
       (let ((tx (bitcoin-lisp.serialization:parse-tx-payload payload)))
         (when tx
-          (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-                (current-height (bitcoin-lisp.storage:current-height chain-state)))
-            ;; Mark as announced by this peer
-            (setf (gethash txid (peer-announced-txs peer)) t)
-            ;; Check recent rejects filter before expensive validation
-            (when (bitcoin-lisp:recent-reject-p recent-rejects txid)
-              (return-from handle-tx nil))
-            ;; Validate for mempool
-            (multiple-value-bind (valid error fee)
-                (bitcoin-lisp.validation:validate-transaction-for-mempool
-                 tx utxo-set mempool current-height)
-              (unless valid
-                ;; Add to recent rejects filter
-                (bitcoin-lisp:add-recent-reject recent-rejects txid)
-                ;; Record misbehavior for invalid transactions
-                ;; (policy violations like :insufficient-fee are not penalized)
-                (when (member error '(:script-failed :no-inputs :no-outputs
-                                      :duplicate-inputs :negative-output
-                                      :output-too-large :total-output-too-large))
-                  (record-misbehavior peer 10)))
-              (when valid
-                ;; Add to mempool
-                (let ((tx-size (length (bitcoin-lisp.serialization:serialize-transaction tx)))
-                      (entry-time (bitcoin-lisp.serialization:get-unix-time)))
-                  (let ((result (bitcoin-lisp.mempool:mempool-add
-                                 mempool txid
-                                 (bitcoin-lisp.mempool:make-mempool-entry
-                                  :transaction tx
-                                  :fee fee
-                                  :size tx-size
-                                  :entry-time entry-time))))
-                    (when (eq result :ok)
-                      ;; Relay to other peers
-                      (when peers
-                        (relay-transaction txid peer peers))))))))))
+          (with-node-lock
+            (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+                  (current-height (bitcoin-lisp.storage:current-height chain-state)))
+              ;; Mark as announced by this peer
+              (setf (gethash txid (peer-announced-txs peer)) t)
+              ;; Check recent rejects filter before expensive validation
+              (when (bitcoin-lisp:recent-reject-p recent-rejects txid)
+                (return-from handle-tx nil))
+              ;; Validate for mempool
+              (multiple-value-bind (valid error fee)
+                  (bitcoin-lisp.validation:validate-transaction-for-mempool
+                   tx utxo-set mempool current-height)
+                (unless valid
+                  ;; Add to recent rejects filter
+                  (bitcoin-lisp:add-recent-reject recent-rejects txid)
+                  ;; Record misbehavior for invalid transactions
+                  ;; (policy violations like :insufficient-fee are not penalized)
+                  (when (member error '(:script-failed :no-inputs :no-outputs
+                                        :duplicate-inputs :negative-output
+                                        :output-too-large :total-output-too-large))
+                    (record-misbehavior peer 10)))
+                (when valid
+                  ;; Add to mempool
+                  (let ((tx-size (length (bitcoin-lisp.serialization:serialize-transaction tx)))
+                        (entry-time (bitcoin-lisp.serialization:get-unix-time)))
+                    (let ((result (bitcoin-lisp.mempool:mempool-add
+                                   mempool txid
+                                   (bitcoin-lisp.mempool:make-mempool-entry
+                                    :transaction tx
+                                    :fee fee
+                                    :size tx-size
+                                    :entry-time entry-time))))
+                      (when (eq result :ok)
+                        ;; Relay to other peers
+                        (when peers
+                          (relay-transaction txid peer peers)))))))))))
     (error (c)
       (declare (ignore c))
       nil)))
@@ -619,22 +631,23 @@ Downloads headers and blocks up to MAX-BLOCKS."
          (increment-compact-block-success)
          (bitcoin-lisp:log-debug "Compact block reconstructed successfully")
          ;; Process like a normal block
-         (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
-                (current-time (bitcoin-lisp.serialization:get-unix-time)))
-           (multiple-value-bind (valid error)
-               (bitcoin-lisp.validation:validate-block
-                block chain-state utxo-set (1+ current-height) current-time)
-             (if valid
-                 (progn
-                   (bitcoin-lisp.validation:connect-block
-                    block chain-state block-store utxo-set
-                    :fee-estimator fee-estimator
-                    :recent-rejects recent-rejects)
-                   (when mempool
-                     (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
-                 (progn
-                   (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
-                   (record-misbehavior peer 100))))))
+         (with-node-lock
+           (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
+                  (current-time (bitcoin-lisp.serialization:get-unix-time)))
+             (multiple-value-bind (valid error)
+                 (bitcoin-lisp.validation:validate-block
+                  block chain-state utxo-set (1+ current-height) current-time)
+               (if valid
+                   (progn
+                     (bitcoin-lisp.validation:connect-block
+                      block chain-state block-store utxo-set
+                      :fee-estimator fee-estimator
+                      :recent-rejects recent-rejects)
+                     (when mempool
+                       (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+                   (progn
+                     (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
+                     (record-misbehavior peer 100)))))))
 
         ;; Collision or malformed - fall back to full block
         ((eq missing-indexes :collision)
@@ -699,22 +712,23 @@ Downloads headers and blocks up to MAX-BLOCKS."
 
           ;; Validate and connect
           (increment-compact-block-success)
-          (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
-                 (current-time (bitcoin-lisp.serialization:get-unix-time)))
-            (multiple-value-bind (valid error)
-                (bitcoin-lisp.validation:validate-block
-                 block chain-state utxo-set (1+ current-height) current-time)
-              (if valid
-                  (progn
-                    (bitcoin-lisp.validation:connect-block
-                     block chain-state block-store utxo-set
-                     :fee-estimator fee-estimator
-                     :recent-rejects recent-rejects)
-                    (when mempool
-                      (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
-                  (progn
-                    (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
-                    (record-misbehavior peer 100))))))))))
+          (with-node-lock
+            (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
+                   (current-time (bitcoin-lisp.serialization:get-unix-time)))
+              (multiple-value-bind (valid error)
+                  (bitcoin-lisp.validation:validate-block
+                   block chain-state utxo-set (1+ current-height) current-time)
+                (if valid
+                    (progn
+                      (bitcoin-lisp.validation:connect-block
+                       block chain-state block-store utxo-set
+                       :fee-estimator fee-estimator
+                       :recent-rejects recent-rejects)
+                      (when mempool
+                        (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+                    (progn
+                      (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
+                      (record-misbehavior peer 100)))))))))))
 
 (defun request-full-block (peer block-hash)
   "Request a full block (fallback from compact block)."
