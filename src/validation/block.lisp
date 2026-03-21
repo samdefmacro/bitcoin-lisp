@@ -33,6 +33,11 @@
 (defconstant +csv-activation-height-testnet+ 770112
   "BIP 68/112/113 (CSV soft fork) activation height on testnet.")
 
+(defconstant +taproot-activation-height-mainnet+ 709632
+  "BIP 341 (Taproot) activation height on mainnet.")
+(defconstant +taproot-activation-height-testnet+ 2346882
+  "BIP 341 (Taproot) activation height on testnet.")
+
 (defconstant +locktime-threshold+ 500000000
   "Threshold for height vs time-based locktime. Values below are block heights,
 values at or above are Unix timestamps.")
@@ -162,6 +167,12 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
     (:testnet +csv-activation-height-testnet+)
     (:mainnet +csv-activation-height-mainnet+)))
 
+(defun get-taproot-activation-height (network)
+  "Return the BIP 341 (Taproot) activation height for NETWORK."
+  (ecase network
+    (:testnet +taproot-activation-height-testnet+)
+    (:mainnet +taproot-activation-height-mainnet+)))
+
 (defun compute-script-flags-for-height (height)
   "Compute script verification flags string based on block HEIGHT.
 Returns a comma-separated string of enabled flags, or NIL if none."
@@ -170,6 +181,8 @@ Returns a comma-separated string of enabled flags, or NIL if none."
       (push "CHECKLOCKTIMEVERIFY" flags))
     (when (>= height (get-csv-activation-height bitcoin-lisp:*network*))
       (push "CHECKSEQUENCEVERIFY" flags))
+    (when (>= height (get-taproot-activation-height bitcoin-lisp:*network*))
+      (push "TAPROOT" flags))
     (if flags
         (format nil "~{~A~^,~}" flags)
         nil)))
