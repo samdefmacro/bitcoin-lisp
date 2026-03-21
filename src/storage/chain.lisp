@@ -408,35 +408,6 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
                  (setf (block-index-entry-prev-entry entry) prev-entry))))
            prev-hash-map))
 
-(defun append-header-entry (state entry)
-  "Append a single block-index-entry to the header index file.
-Updates the entry count in the file header."
-  (let ((path (header-index-file-path state)))
-    (if (probe-file path)
-        ;; Append to existing file
-        (with-open-file (stream path
-                                :direction :output
-                                :if-exists :append
-                                :element-type '(unsigned-byte 8))
-          (write-single-header-entry stream entry))
-      ;; Create new file with count=1
-      (progn
-        (ensure-directories-exist path)
-        (with-open-file (stream path
-                                :direction :output
-                                :if-does-not-exist :create
-                                :element-type '(unsigned-byte 8))
-          (write-uint32-le-chain stream 0)  ; initial count, updated below
-          (write-single-header-entry stream entry))))
-    ;; Update the count at the beginning of the file
-    (with-open-file (stream path
-                            :direction :output
-                            :if-exists :overwrite
-                            :element-type '(unsigned-byte 8))
-      (let ((count (hash-table-count (chain-state-block-index state))))
-        (write-uint32-le-chain stream count)))
-    t))
-
 (defun write-single-header-entry (stream entry)
   "Write a single block-index-entry to STREAM."
   ;; 32-byte block hash
