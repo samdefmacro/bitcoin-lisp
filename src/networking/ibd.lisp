@@ -569,6 +569,7 @@ Returns the number of blocks downloaded."
                                    (header (bitcoin-lisp.serialization:bitcoin-block-header block))
                                    (hash (bitcoin-lisp.serialization:block-header-hash header)))
                               (mark-block-received hash)
+                              (record-block-received-from-peer peer)
                               (process-received-block block chain-state utxo-set block-store
                                                       :fee-estimator fee-estimator
                                                       :recent-rejects recent-rejects)))
@@ -582,6 +583,21 @@ Returns the number of blocks downloaded."
                                               chain-state utxo-set block-store
                                               :fee-estimator fee-estimator
                                               :recent-rejects recent-rejects)))))))
+
+                 ;; Evict stalling peers and peers with bad chains
+                 (let ((our-height (bitcoin-lisp.storage:current-height chain-state)))
+                   (dolist (peer (copy-list peers))
+                     (when (and (eq (peer-state peer) :ready)
+                                (> (count-peer-in-flight peer) 0)
+                                (peer-stalling-p peer :timeout-seconds 30))
+                       (bitcoin-lisp:log-warn "Disconnecting stalling peer ~A (no blocks in 30s)"
+                                              (peer-address peer))
+                       (handler-case (disconnect-peer peer) (error () nil)))
+                     (when (consider-peer-eviction peer our-height)
+                       (bitcoin-lisp:log-warn "Evicting peer ~A (height ~D behind our ~D)"
+                                              (peer-address peer)
+                                              (peer-start-height peer) our-height)
+                       (handler-case (disconnect-peer peer) (error () nil)))))
 
                  ;; Periodic progress report
                  (let ((now (get-internal-real-time)))
