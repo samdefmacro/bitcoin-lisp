@@ -40,6 +40,8 @@
   (prefers-headers nil :type boolean)                  ; Peer sent sendheaders
   ;; BIP 133 feefilter support
   (feefilter-rate 0 :type (unsigned-byte 64))          ; Peer's minimum fee rate (sat/kB)
+  ;; BIP 339 wtxidrelay support
+  (wtxid-relay nil :type boolean)                      ; Peer supports wtxid-based tx relay
   ;; DoS protection: per-peer rate limiters
   (rate-limit-inv nil)
   (rate-limit-tx nil)
@@ -182,6 +184,8 @@ Returns T on success, NIL on failure."
     (unless (send-message peer version-msg)
       (return-from perform-handshake nil)))
 
+  ;; Send wtxidrelay (BIP 339) — must be after VERSION, before VERACK
+  (send-message peer (bitcoin-lisp.serialization:make-wtxidrelay-message))
   ;; Send sendaddrv2 (BIP 155) — must be after VERSION, before VERACK
   (send-message peer (bitcoin-lisp.serialization:make-sendaddrv2-message))
 
@@ -221,7 +225,10 @@ Returns T on success, NIL on failure."
              ;; BIP 130: Track peer's sendheaders preference
              (when (string= command "sendheaders")
                (setf (peer-prefers-headers peer) t))
-             ;; Ignore other handshake-phase messages (wtxidrelay, etc.)
+             ;; BIP 339: Track peer's wtxidrelay support
+             (when (string= command "wtxidrelay")
+               (setf (peer-wtxid-relay peer) t))
+             ;; Ignore other handshake-phase messages
              ))
 
   ;; Didn't receive verack
