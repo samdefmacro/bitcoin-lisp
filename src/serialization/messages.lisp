@@ -624,6 +624,10 @@ TIMESTAMP is the uint32 last-seen time."
   "Create a serialized sendaddrv2 message (empty payload)."
   (serialize-message "sendaddrv2" #()))
 
+(defun make-sendheaders-message ()
+  "Create a serialized sendheaders message (BIP 130, empty payload)."
+  (serialize-message "sendheaders" #()))
+
 (defun make-addrv2-message (entries)
   "Create a serialized addrv2 message from ENTRIES.
 Each entry is a list (net-addr network-id timestamp)."
