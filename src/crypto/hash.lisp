@@ -103,12 +103,14 @@ Returns a 20-byte vector."
 (defun tap-branch-hash (left-hash right-hash)
   "Compute TapBranch hash: tagged_hash('TapBranch', sorted(left || right)).
    Hashes are sorted lexicographically before concatenation."
-  (let ((sorted (if (loop for i from 0 below 32
-                          for l = (aref left-hash i)
-                          for r = (aref right-hash i)
-                          thereis (< l r))
-                    (concatenate '(vector (unsigned-byte 8)) left-hash right-hash)
-                    (concatenate '(vector (unsigned-byte 8)) right-hash left-hash))))
+  (let* ((left-smaller (loop for i from 0 below 32
+                              for l = (aref left-hash i)
+                              for r = (aref right-hash i)
+                              when (/= l r)
+                                return (< l r)))
+         (sorted (if left-smaller
+                     (concatenate '(vector (unsigned-byte 8)) left-hash right-hash)
+                     (concatenate '(vector (unsigned-byte 8)) right-hash left-hash))))
     (tagged-hash +tag-tap-branch+ sorted)))
 
 (defun tap-tweak-hash (internal-pubkey32 &optional merkle-root)
