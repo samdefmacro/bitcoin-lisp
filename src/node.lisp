@@ -318,6 +318,11 @@ Returns the node instance."
           :chain-work 0
           :status :valid))))
 
+  ;; Initialize undo data persistence
+  (let ((undo-path (merge-pathnames "undo/" (node-data-directory *node*))))
+    (bitcoin-lisp.validation:initialize-undo-storage undo-path)
+    (log-info "Undo data directory: ~A" undo-path))
+
   ;; Initialize recent rejects filter (DoS protection)
   (setf (node-recent-rejects *node*) (make-rejects-filter))
 

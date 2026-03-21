@@ -248,6 +248,7 @@
    #:utxo-set
    #:make-utxo-set
    #:utxo-entry
+   #:make-utxo-entry
    #:utxo-entry-value
    #:utxo-entry-script-pubkey
    #:utxo-entry-height
@@ -416,6 +417,7 @@
    #:perform-reorg
    #:decode-coinbase-height
    #:get-bip34-activation-height
+   #:initialize-undo-storage
    ;; Locktime validation
    #:check-transaction-final
    #:compute-median-time-past
