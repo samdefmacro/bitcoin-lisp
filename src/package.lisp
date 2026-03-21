@@ -306,7 +306,6 @@
    ;; Header index persistence
    #:save-header-index
    #:load-header-index
-   #:append-header-entry
    ;; Integrity utilities
    #:compute-crc32
    ;; Transaction index
