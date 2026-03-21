@@ -438,7 +438,9 @@
    #:+coinbase-maturity+
    #:+max-money+
    #:+bip34-activation-height-testnet+
-   #:+bip34-activation-height-mainnet+))
+   #:+bip34-activation-height-mainnet+
+   #:+bip66-activation-height-testnet+
+   #:+bip66-activation-height-mainnet+))
 
 (defpackage #:bitcoin-lisp.networking
   (:use #:cl)

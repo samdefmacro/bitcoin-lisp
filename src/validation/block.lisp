@@ -18,6 +18,11 @@
 
 ;;; Locktime activation heights (BIPs 65/68/112/113)
 
+(defconstant +bip66-activation-height-mainnet+ 363725
+  "BIP 66 (DERSIG/strict DER) activation height on mainnet.")
+(defconstant +bip66-activation-height-testnet+ 330776
+  "BIP 66 (DERSIG/strict DER) activation height on testnet.")
+
 (defconstant +bip65-activation-height-mainnet+ 388381
   "BIP 65 (CLTV) activation height on mainnet.")
 (defconstant +bip65-activation-height-testnet+ 581885
@@ -138,6 +143,12 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
                     (return-from check-sequence-locks nil))))))))))
 
 ;;;; Script verification flags
+
+(defun get-bip66-activation-height (network)
+  "Return the BIP 66 (DERSIG) activation height for NETWORK."
+  (ecase network
+    (:testnet +bip66-activation-height-testnet+)
+    (:mainnet +bip66-activation-height-mainnet+)))
 
 (defun get-bip65-activation-height (network)
   "Return the BIP 65 (CLTV) activation height for NETWORK."
@@ -352,9 +363,18 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
           (return-from validate-block-header
             (values nil :time-too-old))))))
 
-  ;; Version check (allow versions 1-4 for now)
+  ;; Version check: enforce minimum version after softfork activation
+  ;; Matches Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4145-4147)
   (let ((version (bitcoin-lisp.serialization:block-header-version header)))
-    (when (or (< version 1) (> version #x3FFFFFFF))
+    (when (or (< version 1)
+              (> version #x3FFFFFFF)
+              (and height
+                   (or (and (< version 2)
+                            (>= height (get-bip34-activation-height bitcoin-lisp:*network*)))
+                       (and (< version 3)
+                            (>= height (get-bip66-activation-height bitcoin-lisp:*network*)))
+                       (and (< version 4)
+                            (>= height (get-bip65-activation-height bitcoin-lisp:*network*))))))
       (return-from validate-block-header
         (values nil :bad-version))))
 
