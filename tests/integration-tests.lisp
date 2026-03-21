@@ -26,8 +26,19 @@
 
 (test version-message-creation
   "Version message should be properly formatted."
-  ;; Skip this test for now - requires internal net-addr structure setup
-  (pass "Version message creation test skipped (requires network address setup)"))
+  (let ((version-bytes (bitcoin-lisp.serialization:make-version-message-bytes
+                        :start-height 100
+                        :timestamp 1234567890)))
+    ;; Version payload should be non-empty (header fields + net-addrs + user-agent + ...)
+    ;; Minimum: 4(version) + 8(services) + 8(timestamp) + 26(addr-recv) + 26(addr-from)
+    ;;          + 8(nonce) + 1+(user-agent varint+string) + 4(start-height) + 1(relay)
+    (is (> (length version-bytes) 80))
+    ;; Parse it back to verify round-trip
+    (let ((parsed (flexi-streams:with-input-from-sequence (stream version-bytes)
+                    (bitcoin-lisp.serialization:read-version-message stream))))
+      (is (= 70016 (bitcoin-lisp.serialization:version-message-version parsed)))
+      (is (= 100 (bitcoin-lisp.serialization:version-message-start-height parsed)))
+      (is (stringp (bitcoin-lisp.serialization:version-message-user-agent parsed))))))
 
 (test verack-message-creation
   "Verack message should be properly formatted."
