@@ -32,6 +32,17 @@
    #:block-height=
    #:zero-block-height
    #:next-block-height
+   ;; Struct ↔ Coalton vector converters
+   #:outpoint-to-coalton
+   #:outpoint-from-coalton
+   #:tx-in-to-coalton
+   #:tx-in-from-coalton
+   #:tx-out-to-coalton
+   #:tx-out-from-coalton
+   #:transaction-to-coalton
+   #:transaction-from-coalton
+   #:block-header-to-coalton
+   #:block-header-from-coalton
    ;; Constants
    #:+max-money+
    #:+coin+
@@ -109,6 +120,62 @@
 (defun coalton-vector-to-cl-array (vec)
   "Convert a Coalton vector to a CL byte array."
   (coerce vec '(simple-array (unsigned-byte 8) (*))))
+
+;;; Struct ↔ Coalton vector converters
+;;; Serialize CL structs to Coalton-compatible byte vectors and back.
+
+(defun outpoint-to-coalton (outpoint)
+  "Serialize a CL outpoint struct to a Coalton byte vector."
+  (cl-array-to-coalton-vector
+   (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+     (bitcoin-lisp.serialization::write-outpoint s outpoint))))
+
+(defun outpoint-from-coalton (vec)
+  "Deserialize a Coalton byte vector to a CL outpoint struct."
+  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
+    (bitcoin-lisp.serialization::read-outpoint s)))
+
+(defun tx-in-to-coalton (tx-in)
+  "Serialize a CL tx-in struct to a Coalton byte vector."
+  (cl-array-to-coalton-vector
+   (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+     (bitcoin-lisp.serialization::write-tx-in s tx-in))))
+
+(defun tx-in-from-coalton (vec)
+  "Deserialize a Coalton byte vector to a CL tx-in struct."
+  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
+    (bitcoin-lisp.serialization::read-tx-in s)))
+
+(defun tx-out-to-coalton (tx-out)
+  "Serialize a CL tx-out struct to a Coalton byte vector."
+  (cl-array-to-coalton-vector
+   (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+     (bitcoin-lisp.serialization::write-tx-out s tx-out))))
+
+(defun tx-out-from-coalton (vec)
+  "Deserialize a Coalton byte vector to a CL tx-out struct."
+  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
+    (bitcoin-lisp.serialization::read-tx-out s)))
+
+(defun transaction-to-coalton (tx)
+  "Serialize a CL transaction struct to a Coalton byte vector."
+  (cl-array-to-coalton-vector
+   (bitcoin-lisp.serialization:serialize-transaction tx)))
+
+(defun transaction-from-coalton (vec)
+  "Deserialize a Coalton byte vector to a CL transaction struct."
+  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
+    (bitcoin-lisp.serialization:read-transaction s)))
+
+(defun block-header-to-coalton (header)
+  "Serialize a CL block-header struct to a Coalton byte vector."
+  (cl-array-to-coalton-vector
+   (bitcoin-lisp.serialization:serialize-block-header header)))
+
+(defun block-header-from-coalton (vec)
+  "Deserialize a Coalton byte vector to a CL block-header struct."
+  (flexi-streams:with-input-from-sequence (s (coalton-vector-to-cl-array vec))
+    (bitcoin-lisp.serialization::read-block-header s)))
 
 ;;; Bitcoin constants
 (defconstant +coin+ 100000000
