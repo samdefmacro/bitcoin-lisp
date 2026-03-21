@@ -928,89 +928,46 @@ Subsidy halves every 210,000 blocks."
   "Serialize spent-utxos to an undo file using atomic temp+rename with CRC32."
   (let ((path (undo-file-path block-hash)))
     (when path
-      (let ((tmp-path (make-pathname :defaults path
-                                     :type "dat.tmp")))
-        (let ((all-bytes
-                (flexi-streams:with-output-to-sequence (stream)
-                  (write-sequence *undo-magic* stream)
-                  (bitcoin-lisp.serialization:write-uint32-le stream +undo-format-version+)
-                  (bitcoin-lisp.serialization:write-uint32-le stream (length spent-utxos))
-                  (dolist (entry spent-utxos)
-                    (destructuring-bind (txid index utxo) entry
-                      (write-sequence txid stream)
-                      (bitcoin-lisp.serialization:write-uint32-le stream index)
-                      (bitcoin-lisp.serialization:write-int64-le
-                       stream (bitcoin-lisp.storage:utxo-entry-value utxo))
-                      (bitcoin-lisp.serialization:write-uint32-le
-                       stream (bitcoin-lisp.storage:utxo-entry-height utxo))
-                      (write-byte (if (bitcoin-lisp.storage:utxo-entry-coinbase utxo) 1 0)
-                                  stream)
-                      (let ((script (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)))
-                        (bitcoin-lisp.serialization:write-uint32-le stream (length script))
-                        (write-sequence script stream)))))))
-          (let ((crc (bitcoin-lisp.storage:compute-crc32 all-bytes)))
-            (with-open-file (out tmp-path
-                                 :direction :output
-                                 :if-exists :supersede
-                                 :element-type '(unsigned-byte 8))
-              (write-sequence all-bytes out)
-              (write-sequence crc out)))
-          (rename-file tmp-path path))))))
+      (bitcoin-lisp.storage:save-file-with-crc32
+       path
+       (lambda (stream)
+         (write-sequence *undo-magic* stream)
+         (bitcoin-lisp.serialization:write-uint32-le stream +undo-format-version+)
+         (bitcoin-lisp.serialization:write-uint32-le stream (length spent-utxos))
+         (dolist (entry spent-utxos)
+           (destructuring-bind (txid index utxo) entry
+             (write-sequence txid stream)
+             (bitcoin-lisp.serialization:write-uint32-le stream index)
+             (bitcoin-lisp.storage:write-utxo-entry-fields stream utxo))))))))
 
 (defun load-undo-data-from-disk (block-hash)
   "Load and verify undo data from disk. Returns list of (txid index utxo-entry) or NIL."
   (let ((path (undo-file-path block-hash)))
     (when path
-      (handler-case
-          (with-open-file (in path :direction :input
-                                   :element-type '(unsigned-byte 8)
-                                   :if-does-not-exist nil)
-            (when in
-              (let* ((file-len (file-length in))
-                     (data (make-array file-len :element-type '(unsigned-byte 8))))
-                (read-sequence data in)
-                (when (< file-len 16)
-                  (return-from load-undo-data-from-disk nil))
-                (let* ((payload (subseq data 0 (- file-len 4)))
-                       (stored-crc (subseq data (- file-len 4)))
-                       (computed-crc (bitcoin-lisp.storage:compute-crc32 payload)))
-                  (unless (equalp stored-crc computed-crc)
-                    (bitcoin-lisp:log-warn "Undo data CRC mismatch for ~A"
-                                           (bitcoin-lisp.crypto:bytes-to-hex block-hash))
+      (let ((data (bitcoin-lisp.storage:load-file-with-crc32 path 16)))
+        (when data
+          (handler-case
+              (flexi-streams:with-input-from-sequence (stream data)
+                (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
+                  (read-sequence magic stream)
+                  (unless (equalp magic *undo-magic*)
                     (return-from load-undo-data-from-disk nil)))
-                (flexi-streams:with-input-from-sequence (stream data)
-                  (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
-                    (read-sequence magic stream)
-                    (unless (equalp magic *undo-magic*)
-                      (return-from load-undo-data-from-disk nil)))
-                  (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
-                    (unless (= version +undo-format-version+)
-                      (return-from load-undo-data-from-disk nil)))
-                  (let* ((count (bitcoin-lisp.serialization:read-uint32-le stream))
-                         (entries '()))
-                    (dotimes (i count)
-                      (let* ((txid (make-array 32 :element-type '(unsigned-byte 8)))
-                             (_ (read-sequence txid stream))
-                             (index (bitcoin-lisp.serialization:read-uint32-le stream))
-                             (value (bitcoin-lisp.serialization:read-int64-le stream))
-                             (height (bitcoin-lisp.serialization:read-uint32-le stream))
-                             (coinbase (= (read-byte stream) 1))
-                             (script-len (bitcoin-lisp.serialization:read-uint32-le stream))
-                             (script (make-array script-len
-                                                :element-type '(unsigned-byte 8))))
-                        (declare (ignore _))
-                        (read-sequence script stream)
-                        (push (list txid index
-                                    (bitcoin-lisp.storage:make-utxo-entry
-                                     :value value
-                                     :script-pubkey script
-                                     :height height
-                                     :coinbase coinbase))
-                              entries)))
-                    (nreverse entries))))))
-        (error (c)
-          (bitcoin-lisp:log-warn "Failed to load undo data: ~A" c)
-          nil)))))
+                (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
+                  (unless (= version +undo-format-version+)
+                    (return-from load-undo-data-from-disk nil)))
+                (let* ((count (bitcoin-lisp.serialization:read-uint32-le stream))
+                       (entries '()))
+                  (dotimes (i count)
+                    (let* ((txid (make-array 32 :element-type '(unsigned-byte 8)))
+                           (_ (read-sequence txid stream))
+                           (index (bitcoin-lisp.serialization:read-uint32-le stream))
+                           (utxo (bitcoin-lisp.storage:read-utxo-entry-fields stream)))
+                      (declare (ignore _))
+                      (push (list txid index utxo) entries)))
+                  (nreverse entries)))
+            (error (c)
+              (bitcoin-lisp:log-warn "Failed to load undo data: ~A" c)
+              nil)))))))
 
 (defun evict-undo-cache ()
   "Evict the oldest half of cache entries by height (they remain on disk)."
