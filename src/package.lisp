@@ -227,6 +227,8 @@
    #:write-net-addr-v2
    #:make-sendaddrv2-message
    #:make-sendheaders-message
+   #:parse-feefilter-payload
+   #:make-feefilter-message
    #:make-addrv2-message
    #:parse-addrv2-payload))
 
@@ -538,6 +540,7 @@
    ;; ADDRv2 support (BIP 155)
    #:peer-wants-addrv2
    #:peer-prefers-headers
+   #:peer-feefilter-rate
    #:handle-addrv2
    ;; Misbehavior and banning
    #:record-misbehavior

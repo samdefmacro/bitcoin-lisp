@@ -628,6 +628,17 @@ TIMESTAMP is the uint32 last-seen time."
   "Create a serialized sendheaders message (BIP 130, empty payload)."
   (serialize-message "sendheaders" #()))
 
+(defun parse-feefilter-payload (payload)
+  "Parse a feefilter message payload (BIP 133). Returns fee rate as uint64 (sat/kB)."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (read-uint64-le stream)))
+
+(defun make-feefilter-message (fee-rate)
+  "Create a feefilter message with FEE-RATE in satoshis per 1000 bytes (BIP 133)."
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-uint64-le stream fee-rate))))
+    (serialize-message "feefilter" payload)))
+
 (defun make-addrv2-message (entries)
   "Create a serialized addrv2 message from ENTRIES.
 Each entry is a list (net-addr network-id timestamp)."

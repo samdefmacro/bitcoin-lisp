@@ -38,6 +38,8 @@
   (wants-addrv2 nil :type boolean)                    ; Peer sent sendaddrv2
   ;; BIP 130 sendheaders support
   (prefers-headers nil :type boolean)                  ; Peer sent sendheaders
+  ;; BIP 133 feefilter support
+  (feefilter-rate 0 :type (unsigned-byte 64))          ; Peer's minimum fee rate (sat/kB)
   ;; DoS protection: per-peer rate limiters
   (rate-limit-inv nil)
   (rate-limit-tx nil)
@@ -228,7 +230,9 @@ Returns T on success, NIL on failure."
 (defun send-post-handshake-messages (peer)
   "Send feature negotiation messages after handshake completes."
   ;; BIP 130: Request header announcements
-  (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message)))
+  (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message))
+  ;; BIP 133: Announce our minimum relay fee rate (1000 sat/kB = 1 sat/byte)
+  (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000)))
 
 ;;; Ping/Pong
 
