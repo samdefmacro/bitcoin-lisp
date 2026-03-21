@@ -228,6 +228,7 @@
    #:write-net-addr-v2
    #:make-sendaddrv2-message
    #:make-sendheaders-message
+   #:make-wtxidrelay-message
    #:parse-feefilter-payload
    #:make-feefilter-message
    #:make-addrv2-message
@@ -543,6 +544,7 @@
    #:peer-wants-addrv2
    #:peer-prefers-headers
    #:peer-feefilter-rate
+   #:peer-wtxid-relay
    #:handle-addrv2
    ;; Misbehavior and banning
    #:record-misbehavior
