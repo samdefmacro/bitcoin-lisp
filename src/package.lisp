@@ -499,8 +499,12 @@
    ;; Peer health
    #:check-peer-health
    #:record-block-timeout
+   #:record-block-received-from-peer
+   #:peer-stalling-p
+   #:consider-peer-eviction
    #:peer-consecutive-ping-failures
    #:peer-block-timeout-count
+   #:peer-last-block-received-time
    #:peer-address
    #:+max-ping-failures+
    #:+max-block-timeouts+
