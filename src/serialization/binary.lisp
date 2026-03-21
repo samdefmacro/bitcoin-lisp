@@ -113,6 +113,14 @@
      (write-byte 255 stream)
      (write-uint64-le stream value))))
 
+(defun compact-size-length (value)
+  "Return the byte length of VALUE encoded as a CompactSize."
+  (cond
+    ((< value 253) 1)
+    ((<= value #xFFFF) 3)
+    ((<= value #xFFFFFFFF) 5)
+    (t 9)))
+
 ;;;; Byte vector operations
 
 (defun read-bytes (stream count)
