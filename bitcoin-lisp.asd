@@ -120,6 +120,8 @@
                              (:file "new-features-tests")
                              ;; Bitcoin Core sighash test vectors
                              (:file "bitcoin-core-sighash-tests")
+                             ;; Bitcoin Core tx_valid/tx_invalid test vectors
+                             (:file "bitcoin-core-tx-tests")
                              ;; Merkle tree edge case tests
                              (:file "merkle-tests")
                              ;; Bitcoin Core BIP 341 taproot test vectors
