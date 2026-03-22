@@ -120,6 +120,8 @@
                              (:file "new-features-tests")
                              ;; Bitcoin Core sighash test vectors
                              (:file "bitcoin-core-sighash-tests")
+                             ;; Chain reorganization tests
+                             (:file "reorg-tests")
                              ;; Block validation end-to-end tests
                              (:file "block-e2e-tests")
                              ;; Bitcoin Core tx_valid/tx_invalid test vectors
