@@ -276,7 +276,7 @@ Returns (VALUES type script-pubkey witness-version witness-program) or NIL.
 TYPE is :p2pkh, :p2sh, :p2wpkh, :p2wsh, or :p2tr.
 SCRIPT-PUBKEY is the corresponding scriptPubKey bytes.
 NETWORK is :testnet or :mainnet."
-  (let ((expected-hrp (if (eq network :testnet) "tb" "bc")))
+  (let ((expected-hrp (if (member network '(:testnet :testnet4 :signet)) "tb" "bc")))
     ;; Try SegWit (Bech32/Bech32m) first
     (multiple-value-bind (hrp wit-ver wit-prog) (segwit-address-decode address)
       (when (and hrp (string= hrp expected-hrp))
@@ -296,7 +296,11 @@ NETWORK is :testnet or :mainnet."
     (multiple-value-bind (version payload) (base58check-decode address)
       (when version
         (multiple-value-bind (type addr-network) (address-version-to-type version)
-          (when (and type (eq addr-network network) (= (length payload) 20))
+          (when (and type
+                     ;; Testnet4/signet use same address versions as testnet3
+                     (or (eq addr-network network)
+                         (and (eq addr-network :testnet) (test-network-p network)))
+                     (= (length payload) 20))
             (let ((script-pubkey
                     (case type
                       (:p2pkh
@@ -311,31 +315,35 @@ NETWORK is :testnet or :mainnet."
                 (values type script-pubkey nil payload)))))))
     nil))
 
+(defun test-network-p (network)
+  "Return T if NETWORK is a test network (testnet3, testnet4, or signet)."
+  (member network '(:testnet :testnet4 :signet)))
+
 (defun encode-p2pkh-address (pubkey-hash network)
   "Encode a 20-byte pubkey hash as P2PKH address."
-  (let ((version (if (eq network :testnet)
+  (let ((version (if (test-network-p network)
                      +p2pkh-version-testnet+
                      +p2pkh-version-mainnet+)))
     (base58check-encode version pubkey-hash)))
 
 (defun encode-p2sh-address (script-hash network)
   "Encode a 20-byte script hash as P2SH address."
-  (let ((version (if (eq network :testnet)
+  (let ((version (if (test-network-p network)
                      +p2sh-version-testnet+
                      +p2sh-version-mainnet+)))
     (base58check-encode version script-hash)))
 
 (defun encode-p2wpkh-address (pubkey-hash network)
   "Encode a 20-byte pubkey hash as P2WPKH address."
-  (let ((hrp (if (eq network :testnet) "tb" "bc")))
+  (let ((hrp (if (test-network-p network) "tb" "bc")))
     (segwit-address-encode hrp 0 pubkey-hash)))
 
 (defun encode-p2wsh-address (script-hash network)
   "Encode a 32-byte script hash as P2WSH address."
-  (let ((hrp (if (eq network :testnet) "tb" "bc")))
+  (let ((hrp (if (test-network-p network) "tb" "bc")))
     (segwit-address-encode hrp 0 script-hash)))
 
 (defun encode-p2tr-address (output-key network)
   "Encode a 32-byte output key as P2TR address."
-  (let ((hrp (if (eq network :testnet) "tb" "bc")))
+  (let ((hrp (if (test-network-p network) "tb" "bc")))
     (segwit-address-encode hrp 1 output-key)))
