@@ -166,5 +166,5 @@
               (declare (ignore e))
               (incf passed))))))
     (format t "~%tx_invalid.json: ~D passed, ~D failed~%" passed failed)
-    ;; 7 remaining: P2SH/WITNESS edge cases (5), FindAndDelete CONST_SCRIPTCODE (2)
-    (is (<= failed 8))))
+    ;; 4 remaining: P2SH FindAndDelete edge cases (2), CONST_SCRIPTCODE FindAndDelete (2)
+    (is (<= failed 5))))

@@ -1217,7 +1217,7 @@
           (format t "  VERIFICATION FAILED! status=~A~%" status))
         (cond
           ;; If LOW_S flag and signature had high-S, return :sig-high-s error
-          ((eq status :high-s)
+          ((and (eq status :high-s) require-low-s)
            (values nil :sig-high-s))
           ;; If DERSIG is set and DER parsing failed, return :sig-der error
           ((and strict-der (not status))
@@ -1677,6 +1677,11 @@
       (unless (equalp script-hash program)
         (return-from validate-p2wsh (values nil :witness-program-mismatch))))
 
+    ;; Check witness item sizes (max 520 bytes per BIP 141)
+    (dolist (item (butlast witness))
+      (when (> (length item) 520)
+        (return-from validate-p2wsh (values nil :push-size))))
+
     ;; Execute the witness script with remaining witness items as initial stack
     ;; Uses BIP 143 sighash for any CHECKSIG/CHECKMULTISIG operations
     (let* ((*witness-v0-mode* t)
@@ -1689,9 +1694,14 @@
                     script-vec initial-stack)))
       (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
           (let ((final-stack (bitcoin-lisp.coalton.script:get-ok-stack result)))
-            (if (stack-top-truthy-p final-stack)
-                (values t nil)
-                (values nil :script-eval-false)))
+            (cond
+              ;; Must have truthy top
+              ((not (stack-top-truthy-p final-stack))
+               (values nil :script-eval-false))
+              ;; CLEANSTACK: P2WSH always requires exactly 1 stack element
+              ((and (consp final-stack) (consp (cdr final-stack)))
+               (values nil :cleanstack))
+              (t (values t nil))))
           (values nil :script-error)))))
 
 (defun validate-witness-program (script-pubkey witness amount &optional script-sig)
