@@ -787,11 +787,82 @@
 ;;; the actual transaction data, not the test format.
 
 (defun remove-codeseparator (script)
-  "Remove all OP_CODESEPARATOR (0xab) bytes from SCRIPT for sighash computation."
-  (let ((result (remove #xab script)))
-    (if (typep result '(simple-array (unsigned-byte 8) (*)))
-        result
-        (coerce result '(simple-array (unsigned-byte 8) (*))))))
+  "Remove OP_CODESEPARATOR opcodes from SCRIPT for sighash computation.
+Walks the script properly, skipping push data to avoid removing 0xab
+bytes that appear as data rather than opcodes."
+  (let ((len (length script))
+        (result (make-array (length script) :element-type '(unsigned-byte 8)
+                                            :fill-pointer 0)))
+    (let ((i 0))
+      (loop while (< i len)
+            do (let ((op (aref script i)))
+                 (cond
+                   ;; OP_CODESEPARATOR — skip it
+                   ((= op #xab)
+                    (incf i))
+                   ;; Push 1-75 bytes
+                   ((and (>= op 1) (<= op 75))
+                    (let ((end (min len (+ i 1 op))))
+                      (loop for j from i below end
+                            do (vector-push (aref script j) result))
+                      (setf i end)))
+                   ;; OP_PUSHDATA1
+                   ((= op 76)
+                    (if (< (1+ i) len)
+                        (let* ((data-len (aref script (1+ i)))
+                               (end (min len (+ i 2 data-len))))
+                          (loop for j from i below end
+                                do (vector-push (aref script j) result))
+                          (setf i end))
+                        (progn (vector-push op result) (incf i))))
+                   ;; OP_PUSHDATA2
+                   ((= op 77)
+                    (if (< (+ i 2) len)
+                        (let* ((data-len (+ (aref script (1+ i))
+                                            (ash (aref script (+ i 2)) 8)))
+                               (end (min len (+ i 3 data-len))))
+                          (loop for j from i below end
+                                do (vector-push (aref script j) result))
+                          (setf i end))
+                        (progn (vector-push op result) (incf i))))
+                   ;; OP_PUSHDATA4
+                   ((= op 78)
+                    (if (< (+ i 4) len)
+                        (let* ((data-len (+ (aref script (1+ i))
+                                            (ash (aref script (+ i 2)) 8)
+                                            (ash (aref script (+ i 3)) 16)
+                                            (ash (aref script (+ i 4)) 24)))
+                               (end (min len (+ i 5 data-len))))
+                          (loop for j from i below end
+                                do (vector-push (aref script j) result))
+                          (setf i end))
+                        (progn (vector-push op result) (incf i))))
+                   ;; Any other opcode — keep it
+                   (t
+                    (vector-push op result)
+                    (incf i))))))
+    (coerce (subseq result 0 (fill-pointer result))
+            '(simple-array (unsigned-byte 8) (*)))))
+
+(defun find-and-delete (script pattern)
+  "Remove all occurrences of PATTERN from SCRIPT (Bitcoin Core's FindAndDelete).
+Used to remove the signature being verified from the scriptCode before sighash."
+  (if (or (zerop (length pattern)) (> (length pattern) (length script)))
+      script
+      (let ((result (make-array (length script) :element-type '(unsigned-byte 8)
+                                                :fill-pointer 0))
+            (slen (length script))
+            (plen (length pattern))
+            (i 0))
+        (loop while (< i slen)
+              do (if (and (<= (+ i plen) slen)
+                          (equalp (subseq script i (+ i plen)) pattern))
+                     (incf i plen)  ; Skip the pattern
+                     (progn
+                       (vector-push (aref script i) result)
+                       (incf i))))
+        (coerce (subseq result 0 (fill-pointer result))
+                '(simple-array (unsigned-byte 8) (*))))))
 
 (defun compute-legacy-sighash (tx input-index subscript sighash-type)
   "Compute legacy sighash from actual transaction data.
@@ -1170,14 +1241,43 @@
       (unless (valid-pubkey-format-p pubkey-bytes)
         (return-from verify-checksig (values nil :pubkeytype))))
 
-    ;; CONST_SCRIPTCODE: reject if scriptCode contains OP_CODESEPARATOR
+    ;; CONST_SCRIPTCODE: reject if scriptCode contains OP_CODESEPARATOR as an opcode
+    ;; Also reject if FindAndDelete would modify the scriptCode (sig found in scriptCode)
     (when (flag-enabled-p "CONST_SCRIPTCODE")
       (let ((sc (or *current-script-code* script-pubkey)))
-        (when (position #xab sc)
-          (return-from verify-checksig (values nil :op-codeseparator)))))
+        ;; Check for OP_CODESEPARATOR opcodes (walking script properly)
+        (let ((i 0) (slen (length sc)))
+          (loop while (< i slen)
+                do (let ((op (aref sc i)))
+                     (when (= op #xab)
+                       (return-from verify-checksig (values nil :op-codeseparator)))
+                     (cond
+                       ((and (>= op 1) (<= op 75)) (incf i (1+ op)))
+                       ((= op 76) (if (< (1+ i) slen) (incf i (+ 2 (aref sc (1+ i)))) (incf i)))
+                       ((= op 77) (if (< (+ i 2) slen)
+                                      (incf i (+ 3 (aref sc (1+ i)) (ash (aref sc (+ i 2)) 8)))
+                                      (incf i)))
+                       (t (incf i)))))))
+      ;; Check if FindAndDelete would modify the scriptCode
+      (let* ((sc (or *current-script-code* script-pubkey))
+             (siglen (length sig-bytes))
+             (pattern (when (<= siglen 75)
+                        (concatenate '(vector (unsigned-byte 8))
+                                     (vector siglen) sig-bytes))))
+        (when (and pattern (search pattern sc))
+          (return-from verify-checksig (values nil :sig-findanddelete)))))
 
     ;; Compute sighash and verify
-    (let* ((subscript-for-hash (or *current-script-code* script-pubkey))
+    ;; Apply FindAndDelete: remove the signature being verified from scriptCode
+    (let* ((subscript-raw (or *current-script-code* script-pubkey))
+           ;; Build the serialized signature push pattern: <len> <sig-bytes>
+           (sig-push-pattern (let ((siglen (length sig-bytes)))
+                               (cond
+                                 ((<= siglen 75)
+                                  (concatenate '(vector (unsigned-byte 8))
+                                               (vector siglen) sig-bytes))
+                                 (t sig-bytes))))  ; shouldn't happen for normal sigs
+           (subscript-for-hash (find-and-delete subscript-raw sig-push-pattern))
            (sighash (cond
                       ;; P2WSH: BIP 143 sighash with witness script as scriptCode
                       ((and *witness-v0-mode* *current-tx*)
