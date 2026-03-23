@@ -116,7 +116,7 @@
 (test decode-address-p2pkh-testnet
   "Test decode-address for testnet P2PKH."
   (multiple-value-bind (type script-pubkey wit-ver wit-prog)
-      (bitcoin-lisp.crypto:decode-address "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" :testnet)
+      (bitcoin-lisp.crypto:decode-address "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" :testnet3)
     (is (eq type :p2pkh))
     (is (vectorp script-pubkey))
     (is (null wit-ver))
@@ -126,7 +126,7 @@
 (test decode-address-p2wpkh-testnet
   "Test decode-address for testnet P2WPKH."
   (multiple-value-bind (type script-pubkey wit-ver wit-prog)
-      (bitcoin-lisp.crypto:decode-address "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" :testnet)
+      (bitcoin-lisp.crypto:decode-address "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx" :testnet3)
     (is (eq type :p2wpkh))
     (is (vectorp script-pubkey))
     (is (= wit-ver 0))
@@ -135,7 +135,7 @@
 (test decode-address-wrong-network
   "Test decode-address returns nil for wrong network."
   ;; Mainnet address on testnet
-  (is (null (bitcoin-lisp.crypto:decode-address "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2" :testnet)))
+  (is (null (bitcoin-lisp.crypto:decode-address "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2" :testnet3)))
   ;; Testnet address on mainnet
   (is (null (bitcoin-lisp.crypto:decode-address "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn" :mainnet))))
 
