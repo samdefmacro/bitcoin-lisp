@@ -75,10 +75,21 @@
          (is-witness-program (bitcoin-lisp.coalton.interop:is-witness-program-p pubkey-bytes))
          (is-p2sh (and has-p2sh-flag
                        (bitcoin-lisp.coalton.interop:is-p2sh-script-p pubkey-bytes))))
-    ;; CONST_SCRIPTCODE: reject if scriptPubKey contains OP_CODESEPARATOR (0xab)
-    (when (and (search "CONST_SCRIPTCODE" (or flags ""))
-               (position #xab pubkey-bytes))
-      (return-from validate-single-tx-input (values nil :op-codeseparator)))
+    ;; CONST_SCRIPTCODE: reject if scriptPubKey contains OP_CODESEPARATOR as an opcode
+    ;; Must check here before Coalton engine strips OP_CODESEPARATOR during execution
+    (when (search "CONST_SCRIPTCODE" (or flags ""))
+      (let ((j 0) (slen (length pubkey-bytes)))
+        (loop while (< j slen)
+              do (let ((op (aref pubkey-bytes j)))
+                   (when (= op #xab)
+                     (return-from validate-single-tx-input (values nil :op-codeseparator)))
+                   (cond
+                     ((and (>= op 1) (<= op 75)) (incf j (1+ op)))
+                     ((= op 76) (if (< (1+ j) slen) (incf j (+ 2 (aref pubkey-bytes (1+ j)))) (incf j)))
+                     ((= op 77) (if (< (+ j 2) slen)
+                                    (incf j (+ 3 (aref pubkey-bytes (1+ j)) (ash (aref pubkey-bytes (+ j 2)) 8)))
+                                    (incf j)))
+                     (t (incf j)))))))
 
     (bitcoin-lisp.coalton.interop:set-script-flags flags)
     (unwind-protect
@@ -135,8 +146,7 @@
               (declare (ignore e))
               (incf failed))))))
     (format t "~%tx_valid.json: ~D passed, ~D failed~%" passed failed)
-    ;; 2 remaining: V9 (witness edge case), V20 (CHECKMULTISIG empty result)
-    (is (<= failed 3))))
+    (is (zerop failed))))
 
 (test tx-invalid-json
   "Run Bitcoin Core tx_invalid.json test vectors."
@@ -166,5 +176,4 @@
               (declare (ignore e))
               (incf passed))))))
     (format t "~%tx_invalid.json: ~D passed, ~D failed~%" passed failed)
-    ;; 4 remaining: P2SH FindAndDelete edge cases (2), CONST_SCRIPTCODE FindAndDelete (2)
-    (is (<= failed 5))))
+    (is (zerop failed))))
