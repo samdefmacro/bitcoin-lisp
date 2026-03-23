@@ -7,18 +7,18 @@
 
 ;;;; Network Configuration
 
-(defconstant +testnet+ :testnet)
+(defconstant +testnet3+ :testnet3)
 (defconstant +testnet4+ :testnet4)
 (defconstant +signet+ :signet)
 (defconstant +mainnet+ :mainnet)
 
 (defvar *network* +testnet4+
-  "Current network mode (:testnet, :testnet4, :signet, or :mainnet).")
+  "Current network mode (:testnet3, :testnet4, :signet, or :mainnet).")
 
 (defun network-magic (network)
   "Return the network magic bytes for NETWORK."
   (ecase network
-    (:testnet bitcoin-lisp.serialization:+testnet-magic+)
+    (:testnet3 bitcoin-lisp.serialization:+testnet3-magic+)
     (:testnet4 bitcoin-lisp.serialization:+testnet4-magic+)
     (:signet bitcoin-lisp.serialization:+signet-magic+)
     (:mainnet bitcoin-lisp.serialization:+mainnet-magic+)))
@@ -26,7 +26,7 @@
 (defun network-port (network)
   "Return the default port for NETWORK."
   (ecase network
-    (:testnet 18333)
+    (:testnet3 18333)
     (:testnet4 48333)
     (:signet 38333)
     (:mainnet 8333)))
@@ -34,7 +34,7 @@
 (defun network-dns-seeds (network)
   "Return the DNS seeds for NETWORK."
   (ecase network
-    (:testnet bitcoin-lisp.networking:*testnet-dns-seeds*)
+    (:testnet3 bitcoin-lisp.networking:*testnet3-dns-seeds*)
     (:testnet4 bitcoin-lisp.networking:*testnet4-dns-seeds*)
     (:signet bitcoin-lisp.networking:*signet-dns-seeds*)
     (:mainnet bitcoin-lisp.networking:*mainnet-dns-seeds*)))
@@ -42,7 +42,7 @@
 (defun network-rpc-port (network)
   "Return the default RPC port for NETWORK."
   (ecase network
-    (:testnet 18332)
+    (:testnet3 18332)
     (:testnet4 48332)
     (:signet 38332)
     (:mainnet 8332)))
@@ -54,7 +54,7 @@
 
 (defstruct node
   "Bitcoin node state."
-  (network :testnet :type keyword)
+  (network :testnet3 :type keyword)
   (data-directory nil :type (or null pathname))
   (chain-state nil)
   (block-store nil)
@@ -159,7 +159,7 @@ LEVEL can be :debug, :info, :warn, or :error."
   "Construct the genesis block header for NETWORK."
   (let ((prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
     (ecase network
-      (:testnet
+      (:testnet3
        (bitcoin-lisp.serialization:make-block-header
         :version 1 :prev-block prev-block
         :merkle-root (copy-seq *genesis-merkle-root*)
@@ -182,13 +182,13 @@ LEVEL can be :debug, :info, :warn, or :error."
 
 ;;;; Startup Sequence
 
-(defun init-node (data-directory &key (network :testnet) (log-level :info))
+(defun init-node (data-directory &key (network :testnet3) (log-level :info))
   "Initialize a new node with the given data directory and network.
 For mainnet, data is stored in a 'mainnet' subdirectory.
 For testnet, data stays at the base directory (backward compatible)."
   ;; Validate network parameter
-  (unless (member network '(:testnet :testnet4 :signet :mainnet))
-    (error "Invalid network: ~A. Must be :testnet, :testnet4, :signet, or :mainnet." network))
+  (unless (member network '(:testnet3 :testnet4 :signet :mainnet))
+    (error "Invalid network: ~A. Must be :testnet3, :testnet4, :signet, or :mainnet." network))
 
   ;; Set global network variable
   (setf *network* network)
@@ -196,7 +196,7 @@ For testnet, data stays at the base directory (backward compatible)."
   ;; Calculate data path - each network uses its own subdirectory
   (let* ((base-path (pathname data-directory))
          (data-path (ecase network
-                      (:testnet base-path)
+                      (:testnet3 base-path)
                       (:testnet4 (merge-pathnames "testnet4/" base-path))
                       (:signet (merge-pathnames "signet/" base-path))
                       (:mainnet (merge-pathnames "mainnet/" base-path)))))
@@ -214,7 +214,7 @@ For testnet, data stays at the base directory (backward compatible)."
                :log-level log-level)))
 
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
-                        (network :testnet)
+                        (network :testnet3)
                         (log-level :info)
                         (max-peers 8)
                         (sync t)
@@ -227,7 +227,7 @@ For testnet, data stays at the base directory (backward compatible)."
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
-NETWORK: :testnet or :mainnet
+NETWORK: :testnet3 or :mainnet
 LOG-LEVEL: :debug, :info, :warn, or :error
 MAX-PEERS: Maximum number of peer connections
 SYNC: If T, start syncing immediately

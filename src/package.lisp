@@ -137,7 +137,7 @@
    #:serialize-message
    #:compute-checksum
    #:*network-magic*
-   #:+testnet-magic+
+   #:+testnet3-magic+
    #:+testnet4-magic+
    #:+signet-magic+
    #:+mainnet-magic+
@@ -273,7 +273,7 @@
    #:make-chain-state
    #:init-chain-state
    #:network-genesis-hash
-   #:*testnet-genesis-hash*
+   #:*testnet3-genesis-hash*
    #:*testnet4-genesis-hash*
    #:*signet-genesis-hash*
    #:*mainnet-genesis-hash*
@@ -452,9 +452,9 @@
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+
-   #:+bip34-activation-height-testnet+
+   #:+bip34-activation-height-testnet3+
    #:+bip34-activation-height-mainnet+
-   #:+bip66-activation-height-testnet+
+   #:+bip66-activation-height-testnet3+
    #:+bip66-activation-height-mainnet+))
 
 (defpackage #:bitcoin-lisp.networking
@@ -568,18 +568,18 @@
    #:init-peer-rate-limiters
    #:peer-connect-time
    ;; Network params
-   #:*testnet-port*
+   #:*testnet3-port*
    #:*testnet4-port*
    #:*signet-port*
    #:*mainnet-port*
    #:*current-port*
    #:*dns-seeds*
-   #:*testnet-dns-seeds*
+   #:*testnet3-dns-seeds*
    #:*testnet4-dns-seeds*
    #:*signet-dns-seeds*
    #:*mainnet-dns-seeds*
    ;; Checkpoints
-   #:*testnet-checkpoints*
+   #:*testnet3-checkpoints*
    #:*testnet4-checkpoints*
    #:*signet-checkpoints*
    #:*mainnet-checkpoints*
@@ -599,7 +599,7 @@
   (:export
    ;; Network parameters
    #:*network*
-   #:+testnet+
+   #:+testnet3+
    #:+testnet4+
    #:+signet+
    #:+mainnet+

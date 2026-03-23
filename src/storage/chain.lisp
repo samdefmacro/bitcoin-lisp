@@ -26,7 +26,7 @@
   (pruned-height 0 :type (unsigned-byte 32)))
 
 ;;; Testnet genesis block hash (little-endian, as on wire)
-(defvar *testnet-genesis-hash*
+(defvar *testnet3-genesis-hash*
   (bitcoin-lisp.crypto:hex-to-bytes
    "43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000"))
 
@@ -46,7 +46,7 @@
 (defun network-genesis-hash (network)
   "Return the genesis block hash for NETWORK."
   (ecase network
-    (:testnet *testnet-genesis-hash*)
+    (:testnet3 \*testnet3-genesis-hash*)
     (:testnet4 *testnet4-genesis-hash*)
     (:signet *signet-genesis-hash*)
     (:mainnet *mainnet-genesis-hash*)))

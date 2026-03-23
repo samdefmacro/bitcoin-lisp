@@ -55,7 +55,7 @@
 
 ;;;; Network Checkpoints
 
-(defvar *testnet-checkpoints*
+(defvar *testnet3-checkpoints*
   '((546 . "000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70")
     (100000 . "00000000009e2958c15ff9290d571bf9459e93b19765c6801ddeccadbb160a1e")
     (500000 . "000000000001a7c0aaa2630fbb2c0e476aafffc60f82177375b2aaa22209f606")
@@ -91,7 +91,7 @@ Verified against Bitcoin Core chainparams.cpp.")
 (defun network-checkpoints (network)
   "Return the checkpoint list for NETWORK."
   (ecase network
-    (:testnet *testnet-checkpoints*)
+    (:testnet3 \*testnet3-checkpoints*)
     (:testnet4 *testnet4-checkpoints*)
     (:signet *signet-checkpoints*)
     (:mainnet *mainnet-checkpoints*)))

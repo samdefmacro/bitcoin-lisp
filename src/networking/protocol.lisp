@@ -379,7 +379,7 @@ Does not respond to transaction requests when relay is disabled (mainnet default
 (defun relay-enabled-p ()
   "Check if transaction relay is enabled for the current network.
 Relay is always enabled on test networks, disabled by default on mainnet for safety."
-  (or (member bitcoin-lisp:*network* '(:testnet :testnet4 :signet))
+  (or (member bitcoin-lisp:*network* '(:testnet3 :testnet4 :signet))
       bitcoin-lisp:*mainnet-relay-enabled*))
 
 (defun relay-transaction (txid source-peer peers &key fee-rate wtxid)
