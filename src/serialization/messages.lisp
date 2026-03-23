@@ -18,7 +18,7 @@
   :test #'equalp
   :documentation "Mainnet network magic bytes.")
 
-(alexandria:define-constant +testnet-magic+
+(alexandria:define-constant +testnet3-magic+
   (make-array 4 :element-type '(unsigned-byte 8)
                 :initial-contents '(#x0B #x11 #x09 #x07))
   :test #'equalp
@@ -42,7 +42,7 @@
   :test #'equalp
   :documentation "Regtest network magic bytes.")
 
-(defvar *network-magic* +testnet-magic+
+(defvar *network-magic* +testnet3-magic+
   "Current network magic bytes.")
 
 ;;;; Message header
@@ -52,7 +52,7 @@
 
 (defstruct message-header
   "P2P message header."
-  (magic (copy-seq +testnet-magic+) :type (simple-array (unsigned-byte 8) (4)))
+  (magic (copy-seq +testnet3-magic+) :type (simple-array (unsigned-byte 8) (4)))
   (command "" :type string)
   (payload-length 0 :type (unsigned-byte 32))
   (checksum (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)

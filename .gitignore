@@ -53,3 +53,4 @@ refs/
 # Manual/debug test scripts
 tests/manual-sync-test.lisp
 tests/quick-debug-test.lisp
+.claude/

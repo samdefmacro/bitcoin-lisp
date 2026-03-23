@@ -39,7 +39,7 @@
          (network (rpc-get-network node))
          (syncing (rpc-is-syncing node))
          (result `(("chain" . ,(case network
-                                 (:testnet "test")
+                                 (:testnet3 "test")
                                  (:testnet4 "testnet4")
                                  (:signet "signet")
                                  (:mainnet "main")
@@ -258,7 +258,7 @@
       ("protocolversion" . 70016)
       ("connections" . ,(length peers))
       ("networks" . ((("name" . ,(case network
-                                   (:testnet "testnet")
+                                   (:testnet3 "testnet")
                                    (:testnet4 "testnet4")
                                    (:signet "signet")
                                    (:mainnet "mainnet")
@@ -567,7 +567,7 @@ Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
                 ((:witness-v0-keyhash :witness-v0-scripthash :witness-v1-taproot)
                  (let* ((prog (getf data :witness-program))
                         (ver (getf data :witness-version))
-                        (hrp (if (eq network :testnet) "tb" "bc"))
+                        (hrp (if (eq network :testnet3) "tb" "bc"))
                         (addr (bitcoin-lisp.crypto:segwit-address-encode hrp ver prog)))
                    (setf result (append result `(("segwit" . (("address" . ,addr)))))))))
               ;; Add p2sh address (script wrapped in P2SH)

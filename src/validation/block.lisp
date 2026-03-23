@@ -20,22 +20,22 @@
 
 (defconstant +bip66-activation-height-mainnet+ 363725
   "BIP 66 (DERSIG/strict DER) activation height on mainnet.")
-(defconstant +bip66-activation-height-testnet+ 330776
+(defconstant +bip66-activation-height-testnet3+ 330776
   "BIP 66 (DERSIG/strict DER) activation height on testnet.")
 
 (defconstant +bip65-activation-height-mainnet+ 388381
   "BIP 65 (CLTV) activation height on mainnet.")
-(defconstant +bip65-activation-height-testnet+ 581885
+(defconstant +bip65-activation-height-testnet3+ 581885
   "BIP 65 (CLTV) activation height on testnet.")
 
 (defconstant +csv-activation-height-mainnet+ 419328
   "BIP 68/112/113 (CSV soft fork) activation height on mainnet.")
-(defconstant +csv-activation-height-testnet+ 770112
+(defconstant +csv-activation-height-testnet3+ 770112
   "BIP 68/112/113 (CSV soft fork) activation height on testnet.")
 
 (defconstant +taproot-activation-height-mainnet+ 709632
   "BIP 341 (Taproot) activation height on mainnet.")
-(defconstant +taproot-activation-height-testnet+ 2346882
+(defconstant +taproot-activation-height-testnet3+ 2346882
   "BIP 341 (Taproot) activation height on testnet.")
 
 (defconstant +locktime-threshold+ 500000000
@@ -152,28 +152,28 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
 (defun get-bip66-activation-height (network)
   "Return the BIP 66 (DERSIG) activation height for NETWORK."
   (ecase network
-    (:testnet +bip66-activation-height-testnet+)
+    (:testnet3 +bip66-activation-height-testnet3+)
     ((:testnet4 :signet) 1)
     (:mainnet +bip66-activation-height-mainnet+)))
 
 (defun get-bip65-activation-height (network)
   "Return the BIP 65 (CLTV) activation height for NETWORK."
   (ecase network
-    (:testnet +bip65-activation-height-testnet+)
+    (:testnet3 +bip65-activation-height-testnet3+)
     ((:testnet4 :signet) 1)
     (:mainnet +bip65-activation-height-mainnet+)))
 
 (defun get-csv-activation-height (network)
   "Return the BIP 68/112/113 (CSV) activation height for NETWORK."
   (ecase network
-    (:testnet +csv-activation-height-testnet+)
+    (:testnet3 +csv-activation-height-testnet3+)
     ((:testnet4 :signet) 1)
     (:mainnet +csv-activation-height-mainnet+)))
 
 (defun get-taproot-activation-height (network)
   "Return the BIP 341 (Taproot) activation height for NETWORK."
   (ecase network
-    (:testnet +taproot-activation-height-testnet+)
+    (:testnet3 +taproot-activation-height-testnet3+)
     ((:testnet4 :signet) 1)
     (:mainnet +taproot-activation-height-mainnet+)))
 
@@ -297,7 +297,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL :bad-difficulty) on failure."
 
       ;; Testnet non-boundary: check min-difficulty or walk-back
       ;; Applies to testnet3 and testnet4 (fPowAllowMinDifficultyBlocks=true)
-      ((member bitcoin-lisp:*network* '(:testnet :testnet4))
+      ((member bitcoin-lisp:*network* '(:testnet3 :testnet4))
        (let* ((prev-header (bitcoin-lisp.storage:block-index-entry-header prev-entry))
               (prev-timestamp (bitcoin-lisp.serialization:block-header-timestamp prev-header))
               (block-timestamp (bitcoin-lisp.serialization:block-header-timestamp header))
@@ -509,7 +509,7 @@ If the block has no witness data, the commitment is not required."
 
 ;;;; BIP 34 Coinbase Height Validation
 
-(defconstant +bip34-activation-height-testnet+ 21111
+(defconstant +bip34-activation-height-testnet3+ 21111
   "BIP 34 activation height on testnet.")
 
 (defconstant +bip34-activation-height-mainnet+ 227931
@@ -518,7 +518,7 @@ If the block has no witness data, the commitment is not required."
 (defun get-bip34-activation-height (network)
   "Return the BIP 34 activation height for NETWORK."
   (ecase network
-    (:testnet +bip34-activation-height-testnet+)
+    (:testnet3 +bip34-activation-height-testnet3+)
     ((:testnet4 :signet) 1)
     (:mainnet +bip34-activation-height-mainnet+)))
 
