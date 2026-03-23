@@ -153,24 +153,28 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
   "Return the BIP 66 (DERSIG) activation height for NETWORK."
   (ecase network
     (:testnet +bip66-activation-height-testnet+)
+    ((:testnet4 :signet) 1)
     (:mainnet +bip66-activation-height-mainnet+)))
 
 (defun get-bip65-activation-height (network)
   "Return the BIP 65 (CLTV) activation height for NETWORK."
   (ecase network
     (:testnet +bip65-activation-height-testnet+)
+    ((:testnet4 :signet) 1)
     (:mainnet +bip65-activation-height-mainnet+)))
 
 (defun get-csv-activation-height (network)
   "Return the BIP 68/112/113 (CSV) activation height for NETWORK."
   (ecase network
     (:testnet +csv-activation-height-testnet+)
+    ((:testnet4 :signet) 1)
     (:mainnet +csv-activation-height-mainnet+)))
 
 (defun get-taproot-activation-height (network)
   "Return the BIP 341 (Taproot) activation height for NETWORK."
   (ecase network
     (:testnet +taproot-activation-height-testnet+)
+    ((:testnet4 :signet) 1)
     (:mainnet +taproot-activation-height-mainnet+)))
 
 (defun compute-script-flags-for-height (height)
@@ -292,7 +296,8 @@ Returns (VALUES T NIL) on success, (VALUES NIL :bad-difficulty) on failure."
            (values nil :bad-difficulty)))
 
       ;; Testnet non-boundary: check min-difficulty or walk-back
-      ((eq bitcoin-lisp:*network* :testnet)
+      ;; Applies to testnet3 and testnet4 (fPowAllowMinDifficultyBlocks=true)
+      ((member bitcoin-lisp:*network* '(:testnet :testnet4))
        (let* ((prev-header (bitcoin-lisp.storage:block-index-entry-header prev-entry))
               (prev-timestamp (bitcoin-lisp.serialization:block-header-timestamp prev-header))
               (block-timestamp (bitcoin-lisp.serialization:block-header-timestamp header))
@@ -514,6 +519,7 @@ If the block has no witness data, the commitment is not required."
   "Return the BIP 34 activation height for NETWORK."
   (ecase network
     (:testnet +bip34-activation-height-testnet+)
+    ((:testnet4 :signet) 1)
     (:mainnet +bip34-activation-height-mainnet+)))
 
 (defun decode-coinbase-height (script-sig)

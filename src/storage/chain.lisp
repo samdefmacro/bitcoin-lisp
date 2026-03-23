@@ -30,6 +30,14 @@
   (bitcoin-lisp.crypto:hex-to-bytes
    "43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000"))
 
+(defvar *testnet4-genesis-hash*
+  (bitcoin-lisp.crypto:hex-to-bytes
+   "43f08bdab050e35b567c864b91f47f50ae725ae2de53bcfbbaf284da00000000"))
+
+(defvar *signet-genesis-hash*
+  (bitcoin-lisp.crypto:hex-to-bytes
+   "f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000"))
+
 ;;; Mainnet genesis block hash (little-endian, as on wire)
 (defvar *mainnet-genesis-hash*
   (bitcoin-lisp.crypto:hex-to-bytes
@@ -39,6 +47,8 @@
   "Return the genesis block hash for NETWORK."
   (ecase network
     (:testnet *testnet-genesis-hash*)
+    (:testnet4 *testnet4-genesis-hash*)
+    (:signet *signet-genesis-hash*)
     (:mainnet *mainnet-genesis-hash*)))
 
 (defun init-chain-state (base-path &key genesis-hash network)
