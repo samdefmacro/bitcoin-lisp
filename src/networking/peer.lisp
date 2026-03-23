@@ -64,14 +64,24 @@
 ;;; Network parameters
 
 (defvar *testnet-port* 18333)
+(defvar *testnet4-port* 48333)
+(defvar *signet-port* 38333)
 (defvar *mainnet-port* 8333)
-(defvar *current-port* *testnet-port*)
+(defvar *current-port* *testnet4-port*)
 
 (defvar *testnet-dns-seeds*
   '("testnet-seed.bitcoin.jonasschnelli.ch"
     "seed.tbtc.petertodd.org"
     "seed.testnet.bitcoin.sprovoost.nl"
     "testnet-seed.bluematt.me"))
+
+(defvar *testnet4-dns-seeds*
+  '("seed.testnet4.bitcoin.sprovoost.nl"
+    "seed.testnet4.wiz.biz"))
+
+(defvar *signet-dns-seeds*
+  '("seed.signet.bitcoin.sprovoost.nl"
+    "seed.signet.achownodes.xyz"))
 
 (defvar *mainnet-dns-seeds*
   '("seed.bitcoin.sipa.be"
@@ -80,7 +90,7 @@
     "seed.bitcoinstats.com"
     "seed.bitcoin.jonasschnelli.ch"))
 
-(defvar *dns-seeds* *testnet-dns-seeds*)
+(defvar *dns-seeds* *testnet4-dns-seeds*)
 
 ;;; Peer connection
 
