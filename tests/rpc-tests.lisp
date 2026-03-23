@@ -107,7 +107,7 @@
 
 (defun make-test-node ()
   "Create a node with minimal initialized state for testing."
-  (let ((node (bitcoin-lisp::make-node :network :testnet)))
+  (let ((node (bitcoin-lisp::make-node :network :testnet3)))
     ;; Initialize chain-state
     (setf (bitcoin-lisp::node-chain-state node)
           (bitcoin-lisp.storage:make-chain-state))

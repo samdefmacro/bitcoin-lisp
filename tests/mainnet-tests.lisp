@@ -8,11 +8,11 @@
 ;;; Task 7.1: network-genesis-hash tests
 
 (test network-genesis-hash-testnet
-  "network-genesis-hash should return testnet genesis for :testnet."
-  (let ((genesis (bitcoin-lisp.storage:network-genesis-hash :testnet)))
+  "network-genesis-hash should return testnet genesis for :testnet3"
+  (let ((genesis (bitcoin-lisp.storage:network-genesis-hash :testnet3)))
     (is (= 32 (length genesis)))
     ;; Testnet genesis hash (little-endian)
-    (is (equalp genesis bitcoin-lisp.storage:*testnet-genesis-hash*))))
+    (is (equalp genesis bitcoin-lisp.storage:\*testnet3-genesis-hash\*))))
 
 (test network-genesis-hash-mainnet
   "network-genesis-hash should return mainnet genesis for :mainnet."
@@ -21,7 +21,7 @@
     ;; Mainnet genesis hash (little-endian)
     (is (equalp genesis bitcoin-lisp.storage:*mainnet-genesis-hash*))
     ;; Verify it's different from testnet
-    (is (not (equalp genesis bitcoin-lisp.storage:*testnet-genesis-hash*)))))
+    (is (not (equalp genesis bitcoin-lisp.storage:\*testnet3-genesis-hash\*)))))
 
 (test mainnet-genesis-hash-value
   "Mainnet genesis hash should match known value."
@@ -35,7 +35,7 @@
 
 (test get-checkpoint-hash-testnet
   "get-checkpoint-hash should return testnet checkpoints when on testnet."
-  (let ((bitcoin-lisp:*network* :testnet))
+  (let ((bitcoin-lisp:*network* :testnet3))
     ;; Height 546 is a testnet checkpoint
     (let ((hash (bitcoin-lisp.networking:get-checkpoint-hash 546)))
       (is-true hash "Testnet checkpoint at 546 should exist")
@@ -57,7 +57,7 @@
 
 (test last-checkpoint-height-testnet
   "last-checkpoint-height should return testnet's last checkpoint when on testnet."
-  (let ((bitcoin-lisp:*network* :testnet))
+  (let ((bitcoin-lisp:*network* :testnet3))
     (let ((height (bitcoin-lisp.networking:last-checkpoint-height)))
       ;; Testnet's last checkpoint is at 2000000
       (is (= 2000000 height)))))
@@ -73,7 +73,7 @@
 
 (test get-bip34-activation-height-testnet
   "get-bip34-activation-height should return 21111 for testnet."
-  (is (= 21111 (bitcoin-lisp.validation:get-bip34-activation-height :testnet))))
+  (is (= 21111 (bitcoin-lisp.validation:get-bip34-activation-height :testnet3))))
 
 (test get-bip34-activation-height-mainnet
   "get-bip34-activation-height should return 227931 for mainnet."
@@ -83,7 +83,7 @@
 
 (test network-rpc-port-testnet
   "network-rpc-port should return 18332 for testnet."
-  (is (= 18332 (bitcoin-lisp:network-rpc-port :testnet))))
+  (is (= 18332 (bitcoin-lisp:network-rpc-port :testnet3))))
 
 (test network-rpc-port-mainnet
   "network-rpc-port should return 8332 for mainnet."
@@ -102,7 +102,7 @@
 
 (test relay-enabled-testnet
   "Relay should always be enabled on testnet."
-  (let ((bitcoin-lisp:*network* :testnet)
+  (let ((bitcoin-lisp:*network* :testnet3)
         (bitcoin-lisp:*mainnet-relay-enabled* nil))
     (is-true (bitcoin-lisp.networking:relay-enabled-p))))
 
@@ -122,7 +122,7 @@
 
 (test network-parameters-consistent
   "All network parameter functions should work for both networks."
-  (dolist (network '(:testnet :mainnet))
+  (dolist (network '(:testnet3 :mainnet))
     ;; All these should return valid values without error
     (is-true (bitcoin-lisp:network-magic network))
     (is-true (bitcoin-lisp:network-port network))

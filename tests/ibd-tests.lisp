@@ -9,16 +9,16 @@
 
 (test checkpoint-data-exists
   "Test that testnet checkpoint data is defined."
-  (is (not (null bitcoin-lisp.networking::*testnet-checkpoints*)))
-  (is (listp bitcoin-lisp.networking::*testnet-checkpoints*))
+  (is (not (null bitcoin-lisp.networking::\*testnet3-checkpoints\*)))
+  (is (listp bitcoin-lisp.networking::\*testnet3-checkpoints\*))
   ;; Check first checkpoint at height 546
-  (let ((first (first bitcoin-lisp.networking::*testnet-checkpoints*)))
+  (let ((first (first bitcoin-lisp.networking::\*testnet3-checkpoints\*)))
     (is (= 546 (car first)))
     (is (stringp (cdr first)))))
 
 (test get-checkpoint-hash
   "Test checkpoint hash retrieval."
-  (let ((bitcoin-lisp:*network* :testnet))
+  (let ((bitcoin-lisp:*network* :testnet3))
     ;; Known testnet3 checkpoint should return a hash
     (let ((hash (bitcoin-lisp.networking::get-checkpoint-hash 546)))
       (is (not (null hash)))
@@ -28,20 +28,20 @@
 
 (test last-checkpoint-height
   "Test getting the last checkpoint height."
-  (let ((bitcoin-lisp:*network* :testnet))
+  (let ((bitcoin-lisp:*network* :testnet3))
     (let ((height (bitcoin-lisp.networking::last-checkpoint-height)))
       (is (integerp height))
       (is (> height 0)))))
 
 (test validate-checkpoint-match
   "Test checkpoint validation when hash matches."
-  (let ((bitcoin-lisp:*network* :testnet))
+  (let ((bitcoin-lisp:*network* :testnet3))
     (let ((hash (bitcoin-lisp.networking::get-checkpoint-hash 546)))
       (is (bitcoin-lisp.networking::validate-checkpoint hash 546)))))
 
 (test validate-checkpoint-mismatch
   "Test checkpoint validation when hash doesn't match."
-  (let ((bitcoin-lisp:*network* :testnet))
+  (let ((bitcoin-lisp:*network* :testnet3))
     (let ((bad-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
       (is (not (bitcoin-lisp.networking::validate-checkpoint bad-hash 546))))))
 
@@ -246,7 +246,7 @@
   ;; Create a minimal block with an invalid script that would normally fail.
   ;; With :skip-scripts t, it should still pass script validation.
   ;; Without :skip-scripts, it should fail with :script-failed.
-  (let* ((bitcoin-lisp:*network* :testnet)
+  (let* ((bitcoin-lisp:*network* :testnet3)
          (state (bitcoin-lisp.storage:init-chain-state
                  (merge-pathnames "test-skip-scripts/" (uiop:temporary-directory))))
          (utxo-set (bitcoin-lisp.storage:make-utxo-set))

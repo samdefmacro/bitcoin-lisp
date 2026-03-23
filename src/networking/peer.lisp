@@ -63,13 +63,13 @@
 
 ;;; Network parameters
 
-(defvar *testnet-port* 18333)
+(defvar *testnet3-port* 18333)
 (defvar *testnet4-port* 48333)
 (defvar *signet-port* 38333)
 (defvar *mainnet-port* 8333)
 (defvar *current-port* *testnet4-port*)
 
-(defvar *testnet-dns-seeds*
+(defvar *testnet3-dns-seeds*
   '("testnet-seed.bitcoin.jonasschnelli.ch"
     "seed.tbtc.petertodd.org"
     "seed.testnet.bitcoin.sprovoost.nl"

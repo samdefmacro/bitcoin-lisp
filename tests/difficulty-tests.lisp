@@ -263,7 +263,7 @@ Returns a list of entries from genesis (index 0) to tip."
 
 (test validate-difficulty-testnet-min-difficulty
   "validate-difficulty accepts min-difficulty on testnet with >20 min gap."
-  (let ((bitcoin-lisp:*network* :testnet))
+  (let ((bitcoin-lisp:*network* :testnet3))
     (multiple-value-bind (entries chain-state)
         (build-mock-chain 10 :start-time 1000000 :interval 600
                           :bits-fn (lambda (h) (declare (ignore h)) #x1b04864c))
@@ -281,7 +281,7 @@ Returns a list of entries from genesis (index 0) to tip."
 
 (test validate-difficulty-testnet-walk-back
   "validate-difficulty uses walk-back bits on testnet with <=20 min gap."
-  (let ((bitcoin-lisp:*network* :testnet)
+  (let ((bitcoin-lisp:*network* :testnet3)
         (real-bits #x1b04864c))
     (multiple-value-bind (entries chain-state)
         (build-mock-chain 10 :start-time 1000000 :interval 600

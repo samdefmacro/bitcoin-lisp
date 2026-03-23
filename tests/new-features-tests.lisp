@@ -148,14 +148,14 @@
 
 (test taproot-flag-below-activation
   "TAPROOT flag should not be present below activation height."
-  (let ((bitcoin-lisp:*network* :testnet))
+  (let ((bitcoin-lisp:*network* :testnet3))
     (let ((flags (bitcoin-lisp.validation:compute-script-flags-for-height 100)))
       (is (or (null flags)
               (not (search "TAPROOT" flags)))))))
 
 (test taproot-flag-at-activation
   "TAPROOT flag should be present at activation height."
-  (let ((bitcoin-lisp:*network* :testnet))
+  (let ((bitcoin-lisp:*network* :testnet3))
     (let ((flags (bitcoin-lisp.validation:compute-script-flags-for-height 2346882)))
       (is (not (null flags)))
       (is (search "TAPROOT" flags)))))
