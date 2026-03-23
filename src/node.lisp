@@ -8,33 +8,43 @@
 ;;;; Network Configuration
 
 (defconstant +testnet+ :testnet)
+(defconstant +testnet4+ :testnet4)
+(defconstant +signet+ :signet)
 (defconstant +mainnet+ :mainnet)
 
-(defvar *network* +testnet+
-  "Current network mode (:testnet or :mainnet).")
+(defvar *network* +testnet4+
+  "Current network mode (:testnet, :testnet4, :signet, or :mainnet).")
 
 (defun network-magic (network)
   "Return the network magic bytes for NETWORK."
   (ecase network
     (:testnet bitcoin-lisp.serialization:+testnet-magic+)
+    (:testnet4 bitcoin-lisp.serialization:+testnet4-magic+)
+    (:signet bitcoin-lisp.serialization:+signet-magic+)
     (:mainnet bitcoin-lisp.serialization:+mainnet-magic+)))
 
 (defun network-port (network)
   "Return the default port for NETWORK."
   (ecase network
     (:testnet 18333)
+    (:testnet4 48333)
+    (:signet 38333)
     (:mainnet 8333)))
 
 (defun network-dns-seeds (network)
   "Return the DNS seeds for NETWORK."
   (ecase network
     (:testnet bitcoin-lisp.networking:*testnet-dns-seeds*)
+    (:testnet4 bitcoin-lisp.networking:*testnet4-dns-seeds*)
+    (:signet bitcoin-lisp.networking:*signet-dns-seeds*)
     (:mainnet bitcoin-lisp.networking:*mainnet-dns-seeds*)))
 
 (defun network-rpc-port (network)
   "Return the default RPC port for NETWORK."
   (ecase network
     (:testnet 18332)
+    (:testnet4 48332)
+    (:signet 38332)
     (:mainnet 8332)))
 
 (defvar *mainnet-relay-enabled* nil
@@ -151,20 +161,24 @@ LEVEL can be :debug, :info, :warn, or :error."
     (ecase network
       (:testnet
        (bitcoin-lisp.serialization:make-block-header
-        :version 1
-        :prev-block prev-block
+        :version 1 :prev-block prev-block
         :merkle-root (copy-seq *genesis-merkle-root*)
-        :timestamp 1296688602
-        :bits #x1d00ffff
-        :nonce 414098458))
+        :timestamp 1296688602 :bits #x1d00ffff :nonce 414098458))
+      (:testnet4
+       (bitcoin-lisp.serialization:make-block-header
+        :version 1 :prev-block prev-block
+        :merkle-root (copy-seq *genesis-merkle-root*)
+        :timestamp 1714777860 :bits #x1d00ffff :nonce 393743547))
+      (:signet
+       (bitcoin-lisp.serialization:make-block-header
+        :version 1 :prev-block prev-block
+        :merkle-root (copy-seq *genesis-merkle-root*)
+        :timestamp 1598918400 :bits #x1e0377ae :nonce 52613770))
       (:mainnet
        (bitcoin-lisp.serialization:make-block-header
-        :version 1
-        :prev-block prev-block
+        :version 1 :prev-block prev-block
         :merkle-root (copy-seq *genesis-merkle-root*)
-        :timestamp 1231006505
-        :bits #x1d00ffff
-        :nonce 2083236893)))))
+        :timestamp 1231006505 :bits #x1d00ffff :nonce 2083236893)))))
 
 ;;;; Startup Sequence
 
@@ -173,17 +187,19 @@ LEVEL can be :debug, :info, :warn, or :error."
 For mainnet, data is stored in a 'mainnet' subdirectory.
 For testnet, data stays at the base directory (backward compatible)."
   ;; Validate network parameter
-  (unless (member network '(:testnet :mainnet))
-    (error "Invalid network: ~A. Must be :testnet or :mainnet." network))
+  (unless (member network '(:testnet :testnet4 :signet :mainnet))
+    (error "Invalid network: ~A. Must be :testnet, :testnet4, :signet, or :mainnet." network))
 
   ;; Set global network variable
   (setf *network* network)
 
-  ;; Calculate data path - mainnet uses subdirectory, testnet stays at root
+  ;; Calculate data path - each network uses its own subdirectory
   (let* ((base-path (pathname data-directory))
-         (data-path (if (eq network :mainnet)
-                        (merge-pathnames "mainnet/" base-path)
-                        base-path)))
+         (data-path (ecase network
+                      (:testnet base-path)
+                      (:testnet4 (merge-pathnames "testnet4/" base-path))
+                      (:signet (merge-pathnames "signet/" base-path))
+                      (:mainnet (merge-pathnames "mainnet/" base-path)))))
     ;; Ensure data directory exists
     (ensure-directories-exist (merge-pathnames "dummy" data-path))
 

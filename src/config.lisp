@@ -34,7 +34,7 @@ Set automatically based on network: 100000 for mainnet, 1000 for testnet.")
   "Return the minimum chain height before pruning begins for NETWORK."
   (ecase network
     (:mainnet 100000)
-    (:testnet 1000)))
+    ((:testnet :testnet4 :signet) 1000)))
 
 ;;;; Token Bucket Rate Limiter
 

@@ -138,6 +138,8 @@
    #:compute-checksum
    #:*network-magic*
    #:+testnet-magic+
+   #:+testnet4-magic+
+   #:+signet-magic+
    #:+mainnet-magic+
    ;; Service bit constants
    #:+node-network+
@@ -272,6 +274,8 @@
    #:init-chain-state
    #:network-genesis-hash
    #:*testnet-genesis-hash*
+   #:*testnet4-genesis-hash*
+   #:*signet-genesis-hash*
    #:*mainnet-genesis-hash*
    #:block-index-entry
    #:make-block-index-entry
@@ -565,13 +569,19 @@
    #:peer-connect-time
    ;; Network params
    #:*testnet-port*
+   #:*testnet4-port*
+   #:*signet-port*
    #:*mainnet-port*
    #:*current-port*
    #:*dns-seeds*
    #:*testnet-dns-seeds*
+   #:*testnet4-dns-seeds*
+   #:*signet-dns-seeds*
    #:*mainnet-dns-seeds*
    ;; Checkpoints
    #:*testnet-checkpoints*
+   #:*testnet4-checkpoints*
+   #:*signet-checkpoints*
    #:*mainnet-checkpoints*
    #:network-checkpoints
    #:get-checkpoint-hash
@@ -590,6 +600,8 @@
    ;; Network parameters
    #:*network*
    #:+testnet+
+   #:+testnet4+
+   #:+signet+
    #:+mainnet+
    #:network-magic
    #:network-port
