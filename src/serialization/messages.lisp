@@ -24,6 +24,18 @@
   :test #'equalp
   :documentation "Testnet network magic bytes.")
 
+(alexandria:define-constant +testnet4-magic+
+  (make-array 4 :element-type '(unsigned-byte 8)
+                :initial-contents '(#x1C #x16 #x3F #x28))
+  :test #'equalp
+  :documentation "Testnet4 network magic bytes.")
+
+(alexandria:define-constant +signet-magic+
+  (make-array 4 :element-type '(unsigned-byte 8)
+                :initial-contents '(#x0A #x03 #xCF #x40))
+  :test #'equalp
+  :documentation "Default signet network magic bytes.")
+
 (alexandria:define-constant +regtest-magic+
   (make-array 4 :element-type '(unsigned-byte 8)
                 :initial-contents '(#xFA #xBF #xB5 #xDA))

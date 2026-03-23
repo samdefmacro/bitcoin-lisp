@@ -40,6 +40,8 @@
          (syncing (rpc-is-syncing node))
          (result `(("chain" . ,(case network
                                  (:testnet "test")
+                                 (:testnet4 "testnet4")
+                                 (:signet "signet")
                                  (:mainnet "main")
                                  (t "unknown")))
                    ("blocks" . ,height)
@@ -257,6 +259,8 @@
       ("connections" . ,(length peers))
       ("networks" . ((("name" . ,(case network
                                    (:testnet "testnet")
+                                   (:testnet4 "testnet4")
+                                   (:signet "signet")
                                    (:mainnet "mainnet")
                                    (t "unknown")))
                       ("reachable" . t))))
