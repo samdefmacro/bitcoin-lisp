@@ -73,6 +73,26 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
         (return-from validate-transaction-structure
           (values nil :total-output-too-large))))
 
+    ;; Coinbase-specific checks
+    (let* ((first-input (first inputs))
+           (is-coinbase (bitcoin-lisp.serialization:coinbase-input-p first-input)))
+      (if is-coinbase
+          ;; Coinbase: scriptSig must be 2-100 bytes
+          (let ((sig-len (length (bitcoin-lisp.serialization:tx-in-script-sig first-input))))
+            (when (or (< sig-len 2) (> sig-len 100))
+              (return-from validate-transaction-structure
+                (values nil :bad-coinbase-length)))
+            ;; All other inputs must also be coinbase (shouldn't mix)
+            (dolist (inp (rest inputs))
+              (unless (bitcoin-lisp.serialization:coinbase-input-p inp)
+                (return-from validate-transaction-structure
+                  (values nil :bad-coinbase-mixed)))))
+          ;; Non-coinbase: no input may be coinbase
+          (dolist (inp (rest inputs))
+            (when (bitcoin-lisp.serialization:coinbase-input-p inp)
+              (return-from validate-transaction-structure
+                (values nil :bad-coinbase-mixed))))))
+
     ;; Check transaction size
     (let ((serialized (bitcoin-lisp.serialization:serialize-transaction tx)))
       (when (> (length serialized) +max-tx-size+)
