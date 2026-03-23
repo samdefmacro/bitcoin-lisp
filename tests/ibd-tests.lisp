@@ -18,28 +18,32 @@
 
 (test get-checkpoint-hash
   "Test checkpoint hash retrieval."
-  ;; Known checkpoint should return a hash
-  (let ((hash (bitcoin-lisp.networking::get-checkpoint-hash 546)))
-    (is (not (null hash)))
-    (is (= 32 (length hash))))
-  ;; Non-checkpoint height should return NIL
-  (is (null (bitcoin-lisp.networking::get-checkpoint-hash 547))))
+  (let ((bitcoin-lisp:*network* :testnet))
+    ;; Known testnet3 checkpoint should return a hash
+    (let ((hash (bitcoin-lisp.networking::get-checkpoint-hash 546)))
+      (is (not (null hash)))
+      (is (= 32 (length hash))))
+    ;; Non-checkpoint height should return NIL
+    (is (null (bitcoin-lisp.networking::get-checkpoint-hash 547)))))
 
 (test last-checkpoint-height
   "Test getting the last checkpoint height."
-  (let ((height (bitcoin-lisp.networking::last-checkpoint-height)))
-    (is (integerp height))
-    (is (> height 0))))
+  (let ((bitcoin-lisp:*network* :testnet))
+    (let ((height (bitcoin-lisp.networking::last-checkpoint-height)))
+      (is (integerp height))
+      (is (> height 0)))))
 
 (test validate-checkpoint-match
   "Test checkpoint validation when hash matches."
-  (let ((hash (bitcoin-lisp.networking::get-checkpoint-hash 546)))
-    (is (bitcoin-lisp.networking::validate-checkpoint hash 546))))
+  (let ((bitcoin-lisp:*network* :testnet))
+    (let ((hash (bitcoin-lisp.networking::get-checkpoint-hash 546)))
+      (is (bitcoin-lisp.networking::validate-checkpoint hash 546)))))
 
 (test validate-checkpoint-mismatch
   "Test checkpoint validation when hash doesn't match."
-  (let ((bad-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (is (not (bitcoin-lisp.networking::validate-checkpoint bad-hash 546)))))
+  (let ((bitcoin-lisp:*network* :testnet))
+    (let ((bad-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (is (not (bitcoin-lisp.networking::validate-checkpoint bad-hash 546))))))
 
 (test validate-checkpoint-no-checkpoint
   "Test checkpoint validation at non-checkpoint height."
@@ -242,7 +246,8 @@
   ;; Create a minimal block with an invalid script that would normally fail.
   ;; With :skip-scripts t, it should still pass script validation.
   ;; Without :skip-scripts, it should fail with :script-failed.
-  (let* ((state (bitcoin-lisp.storage:init-chain-state
+  (let* ((bitcoin-lisp:*network* :testnet)
+         (state (bitcoin-lisp.storage:init-chain-state
                  (merge-pathnames "test-skip-scripts/" (uiop:temporary-directory))))
          (utxo-set (bitcoin-lisp.storage:make-utxo-set))
          (genesis-hash (bitcoin-lisp.storage:network-genesis-hash bitcoin-lisp:*network*))

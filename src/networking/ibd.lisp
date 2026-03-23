@@ -81,10 +81,19 @@
   "Mainnet checkpoints as (height . hex-hash) pairs.
 Verified against Bitcoin Core chainparams.cpp.")
 
+;; Testnet4 and signet: no checkpoints yet (new networks)
+(defvar *testnet4-checkpoints* '()
+  "Testnet4 checkpoints.")
+
+(defvar *signet-checkpoints* '()
+  "Signet checkpoints.")
+
 (defun network-checkpoints (network)
   "Return the checkpoint list for NETWORK."
   (ecase network
     (:testnet *testnet-checkpoints*)
+    (:testnet4 *testnet4-checkpoints*)
+    (:signet *signet-checkpoints*)
     (:mainnet *mainnet-checkpoints*)))
 
 (defun get-checkpoint-hash (height)
