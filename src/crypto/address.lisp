@@ -108,9 +108,9 @@ Returns (VALUES version payload) or NIL if invalid."
 Returns (VALUES type network) or NIL."
   (case version
     (#x00 (values :p2pkh :mainnet))
-    (#x6f (values :p2pkh :testnet))
+    (#x6f (values :p2pkh :testnet3))
     (#x05 (values :p2sh :mainnet))
-    (#xc4 (values :p2sh :testnet))
+    (#xc4 (values :p2sh :testnet3))
     (otherwise nil)))
 
 ;;; ============================================================
@@ -275,8 +275,8 @@ Returns (VALUES hrp witness-version witness-program) or NIL."
 Returns (VALUES type script-pubkey witness-version witness-program) or NIL.
 TYPE is :p2pkh, :p2sh, :p2wpkh, :p2wsh, or :p2tr.
 SCRIPT-PUBKEY is the corresponding scriptPubKey bytes.
-NETWORK is :testnet or :mainnet."
-  (let ((expected-hrp (if (member network '(:testnet :testnet4 :signet)) "tb" "bc")))
+NETWORK is :testnet3, :testnet4, :signet, or :mainnet."
+  (let ((expected-hrp (if (member network '(:testnet3 :testnet4 :signet)) "tb" "bc")))
     ;; Try SegWit (Bech32/Bech32m) first
     (multiple-value-bind (hrp wit-ver wit-prog) (segwit-address-decode address)
       (when (and hrp (string= hrp expected-hrp))
@@ -299,7 +299,7 @@ NETWORK is :testnet or :mainnet."
           (when (and type
                      ;; Testnet4/signet use same address versions as testnet3
                      (or (eq addr-network network)
-                         (and (eq addr-network :testnet) (test-network-p network)))
+                         (and (eq addr-network :testnet3) (test-network-p network)))
                      (= (length payload) 20))
             (let ((script-pubkey
                     (case type
@@ -317,7 +317,7 @@ NETWORK is :testnet or :mainnet."
 
 (defun test-network-p (network)
   "Return T if NETWORK is a test network (testnet3, testnet4, or signet)."
-  (member network '(:testnet :testnet4 :signet)))
+  (member network '(:testnet3 :testnet4 :signet)))
 
 (defun encode-p2pkh-address (pubkey-hash network)
   "Encode a 20-byte pubkey hash as P2PKH address."
