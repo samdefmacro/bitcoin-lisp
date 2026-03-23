@@ -1170,13 +1170,13 @@
       (unless (valid-pubkey-format-p pubkey-bytes)
         (return-from verify-checksig (values nil :pubkeytype))))
 
+    ;; CONST_SCRIPTCODE: reject if scriptCode contains OP_CODESEPARATOR
+    (when (flag-enabled-p "CONST_SCRIPTCODE")
+      (let ((sc (or *current-script-code* script-pubkey)))
+        (when (position #xab sc)
+          (return-from verify-checksig (values nil :op-codeseparator)))))
+
     ;; Compute sighash and verify
-    ;; Use strict DER parsing when DERSIG flag is set
-    ;; Reject high-S when LOW_S flag is set
-    ;; Dispatch based on context:
-    ;;   *witness-v0-mode* + *current-tx* → BIP 143 sighash (P2WSH)
-    ;;   *current-tx*                     → legacy sighash (P2PKH, P2SH)
-    ;;   otherwise                        → test transaction format
     (let* ((subscript-for-hash (or *current-script-code* script-pubkey))
            (sighash (cond
                       ;; P2WSH: BIP 143 sighash with witness script as scriptCode
