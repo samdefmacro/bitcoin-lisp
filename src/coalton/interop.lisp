@@ -375,12 +375,15 @@
   (setf *script-flags* flags-string))
 
 (defun flag-enabled-p (flag)
-  "Check if a flag is enabled in *script-flags*."
-  (and *script-flags*
-       (or (string= *script-flags* flag)
-           (search flag *script-flags*)
-           (search (concatenate 'string "," flag) *script-flags*)
-           (search (concatenate 'string flag ",") *script-flags*))))
+  "Check if a flag is enabled in *script-flags*.
+Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
+  (if (and *script-flags*
+           (or (string= *script-flags* flag)
+               (search flag *script-flags*)
+               (search (concatenate 'string "," flag) *script-flags*)
+               (search (concatenate 'string flag ",") *script-flags*)))
+      t
+      nil))
 
 ;;; ============================================================
 ;;; Tapscript OP_SUCCESS Detection (BIP 342)
