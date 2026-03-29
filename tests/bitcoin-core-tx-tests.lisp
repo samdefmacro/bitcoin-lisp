@@ -59,7 +59,8 @@
             ""))))
 
 (defun validate-single-tx-input (tx input-index prevout-data flags)
-  "Validate a single input of TX at INPUT-INDEX against PREVOUT-DATA."
+  "Validate a single input of TX at INPUT-INDEX against PREVOUT-DATA.
+Uses verify-script which follows Bitcoin Core's VerifyScript flow."
   (let* ((script-pubkey-asm (third prevout-data))
          (amount (if (>= (length prevout-data) 4) (fourth prevout-data) 0))
          (input (nth input-index (bitcoin-lisp.serialization:transaction-inputs tx)))
@@ -69,49 +70,13 @@
                           (nth input-index (bitcoin-lisp.serialization:transaction-witness tx))))
          (bitcoin-lisp.coalton.interop:*current-tx* tx)
          (bitcoin-lisp.coalton.interop:*current-input-index* input-index)
-         (bitcoin-lisp.coalton.interop:*witness-input-amount* (or amount 0))
-         (has-witness-flag (and flags (search "WITNESS" flags)))
-         (has-p2sh-flag (and flags (search "P2SH" flags)))
-         (is-witness-program (bitcoin-lisp.coalton.interop:is-witness-program-p pubkey-bytes))
-         (is-p2sh (and has-p2sh-flag
-                       (bitcoin-lisp.coalton.interop:is-p2sh-script-p pubkey-bytes))))
-    ;; CONST_SCRIPTCODE: reject if scriptPubKey contains OP_CODESEPARATOR as an opcode
-    ;; Must check here before Coalton engine strips OP_CODESEPARATOR during execution
-    (when (search "CONST_SCRIPTCODE" (or flags ""))
-      (let ((j 0) (slen (length pubkey-bytes)))
-        (loop while (< j slen)
-              do (let ((op (aref pubkey-bytes j)))
-                   (when (= op #xab)
-                     (return-from validate-single-tx-input (values nil :op-codeseparator)))
-                   (cond
-                     ((and (>= op 1) (<= op 75)) (incf j (1+ op)))
-                     ((= op 76) (if (< (1+ j) slen) (incf j (+ 2 (aref pubkey-bytes (1+ j)))) (incf j)))
-                     ((= op 77) (if (< (+ j 2) slen)
-                                    (incf j (+ 3 (aref pubkey-bytes (1+ j)) (ash (aref pubkey-bytes (+ j 2)) 8)))
-                                    (incf j)))
-                     (t (incf j)))))))
-
+         (bitcoin-lisp.coalton.interop:*witness-input-amount* (or amount 0)))
     (bitcoin-lisp.coalton.interop:set-script-flags flags)
     (unwind-protect
-         (progn
-           (when (and has-witness-flag is-witness-program)
-             (return-from validate-single-tx-input
-               (bitcoin-lisp.coalton.interop:validate-witness-program
-                pubkey-bytes witness-stack (or amount 0) sig-bytes)))
-           (when (and has-witness-flag is-p2sh witness-stack)
-             (let ((redeem-script (extract-p2sh-redeem-script sig-bytes)))
-               (when (and redeem-script
-                          (bitcoin-lisp.coalton.interop:is-witness-program-p redeem-script))
-                 (return-from validate-single-tx-input
-                   (bitcoin-lisp.coalton.interop:validate-witness-program
-                    redeem-script witness-stack (or amount 0) nil)))))
-           (multiple-value-bind (success stack-or-error)
-               (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
-                sig-bytes pubkey-bytes (and has-p2sh-flag t))
-             (if (and success
-                      (bitcoin-lisp.coalton.interop:stack-top-truthy-p stack-or-error))
-                 (values t nil)
-                 (values nil (or stack-or-error :eval-false)))))
+         (bitcoin-lisp.coalton.interop:verify-script
+          sig-bytes pubkey-bytes
+          :witness witness-stack
+          :amount (or amount 0))
       (bitcoin-lisp.coalton.interop:set-script-flags nil))))
 
 (defun validate-tx-inputs (tx prevouts flags)

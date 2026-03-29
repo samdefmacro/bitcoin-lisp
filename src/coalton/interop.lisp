@@ -57,6 +57,7 @@
    #:set-script-flags
    #:flag-enabled-p
    ;; Signature verification
+   #:verify-script
    #:verify-checksig
    #:verify-checksig-for-script
    #:last-checksig-had-strictenc-error-p
@@ -343,6 +344,123 @@
     (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
         (values t (bitcoin-lisp.coalton.script:get-ok-stack result))
         (values nil :error))))
+
+(defun verify-script (script-sig script-pubkey &key witness amount)
+  "Verify a script following Bitcoin Core's VerifyScript flow exactly.
+SCRIPT-SIG and SCRIPT-PUBKEY are byte arrays.
+WITNESS is an optional list of byte arrays (witness stack).
+AMOUNT is the input value in satoshis (required for witness).
+Uses *current-tx*, *current-input-index*, and *script-flags* from dynamic scope.
+Returns (values success error-keyword)."
+  (let ((*original-script-pubkey* script-pubkey)
+        (had-witness nil))
+
+    ;; Step 0a: CONST_SCRIPTCODE pre-check on scriptPubKey
+    ;; Must check before Coalton engine executes and strips OP_CODESEPARATOR
+    (when (flag-enabled-p "CONST_SCRIPTCODE")
+      (let ((i 0) (slen (length script-pubkey)))
+        (loop while (< i slen)
+              do (let ((op (aref script-pubkey i)))
+                   (when (= op #xab)
+                     (return-from verify-script (values nil :op-codeseparator)))
+                   (cond
+                     ((and (>= op 1) (<= op 75)) (incf i (1+ op)))
+                     ((= op 76) (if (< (1+ i) slen) (incf i (+ 2 (aref script-pubkey (1+ i)))) (incf i)))
+                     ((= op 77) (if (< (+ i 2) slen)
+                                    (incf i (+ 3 (aref script-pubkey (1+ i))
+                                                (ash (aref script-pubkey (+ i 2)) 8)))
+                                    (incf i)))
+                     (t (incf i)))))))
+
+    ;; Step 0b: SIGPUSHONLY check on scriptSig (before execution)
+    (when (flag-enabled-p "SIGPUSHONLY")
+      (unless (script-is-push-only-p script-sig)
+        (return-from verify-script (values nil :sig-pushonly))))
+
+    ;; Step 1-3: Execute scriptSig + scriptPubKey (+ P2SH if enabled)
+    (let ((p2sh-enabled (and (flag-enabled-p "P2SH")
+                             (is-p2sh-script-p script-pubkey))))
+      ;; P2SH requires push-only scriptSig (BIP 16)
+      (when p2sh-enabled
+        (unless (script-is-push-only-p script-sig)
+          (return-from verify-script (values nil :sig-pushonly))))
+
+      (multiple-value-bind (ok stack)
+          (run-scripts-with-p2sh script-sig script-pubkey p2sh-enabled)
+        (unless ok
+          (return-from verify-script (values nil stack)))
+
+        ;; Step 4: Verify script result (non-empty stack, truthy top)
+        (unless (stack-top-truthy-p stack)
+          (return-from verify-script (values nil :eval-false)))
+
+        ;; Step 5: Bare witness program handling
+        (when (flag-enabled-p "WITNESS")
+          (when (is-witness-program-p script-pubkey)
+            (setf had-witness t)
+            ;; Native witness: scriptSig must be empty
+            (when (plusp (length script-sig))
+              (return-from verify-script (values nil :witness-malleated)))
+            (multiple-value-bind (wok werr)
+                (validate-witness-program
+                 script-pubkey (or witness '()) (or amount 0) script-sig)
+              (unless wok
+                (return-from verify-script (values nil werr))))))
+
+        ;; Step 6: P2SH-wrapped witness handling
+        (when (and (flag-enabled-p "WITNESS") p2sh-enabled (not had-witness))
+          (let ((redeem-script (extract-last-push-data script-sig)))
+            (when (and redeem-script (is-witness-program-p redeem-script))
+              (setf had-witness t)
+              ;; P2SH-witness: scriptSig must be EXACTLY a single push of the witness program
+              ;; (validated implicitly by P2SH execution succeeding)
+              (multiple-value-bind (wok werr)
+                  (validate-witness-program
+                   redeem-script (or witness '()) (or amount 0) nil)
+                (unless wok
+                  (return-from verify-script (values nil werr)))))))
+
+        ;; Step 7: CLEANSTACK enforcement
+        (when (and (flag-enabled-p "CLEANSTACK") (not had-witness))
+          (when (and (consp stack) (consp (cdr stack)))
+            (return-from verify-script (values nil :cleanstack))))
+
+        ;; Step 8: WITNESS_UNEXPECTED check
+        (when (flag-enabled-p "WITNESS")
+          (when (and (not had-witness) witness (plusp (length witness)))
+            ;; Check if witness has actual data (not all empty)
+            (when (some (lambda (w) (plusp (length w))) witness)
+              (return-from verify-script (values nil :witness-unexpected)))))
+
+        ;; Success
+        (values t nil)))))
+
+(defun extract-last-push-data (script)
+  "Extract the data from the last push operation in a script.
+Used to get the redeem script from a P2SH scriptSig."
+  (let ((len (length script)) (pos 0) (last-push nil))
+    (loop while (< pos len)
+          do (let ((op (aref script pos)))
+               (cond
+                 ((and (>= op 1) (<= op 75))
+                  (let ((end (min len (+ pos 1 op))))
+                    (setf last-push (subseq script (1+ pos) end))
+                    (setf pos end)))
+                 ((= op 76) ;; OP_PUSHDATA1
+                  (when (< (1+ pos) len)
+                    (let* ((data-len (aref script (1+ pos)))
+                           (end (min len (+ pos 2 data-len))))
+                      (setf last-push (subseq script (+ pos 2) end))
+                      (setf pos end))))
+                 ((= op 77) ;; OP_PUSHDATA2
+                  (when (< (+ pos 2) len)
+                    (let* ((data-len (+ (aref script (1+ pos))
+                                        (ash (aref script (+ pos 2)) 8)))
+                           (end (min len (+ pos 3 data-len))))
+                      (setf last-push (subseq script (+ pos 3) end))
+                      (setf pos end))))
+                 (t (incf pos)))))
+    last-push))
 
 (defun is-p2sh-script-p (script-bytes)
   "Check if script matches P2SH pattern."
