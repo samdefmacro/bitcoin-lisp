@@ -1399,11 +1399,17 @@ Used to remove the signature being verified from the scriptCode before sighash."
           ((and strict-der (not status))
            (values nil :sig-der))
           ;; NULLFAIL: if sig is non-empty and verification failed, error
+          ;; Suppressed during CHECKMULTISIG (handled at algorithm level)
           ((and (not result)
+                (not *in-checkmultisig*)
                 (flag-enabled-p "NULLFAIL"))
            (values nil :nullfail))
           ;; Normal result
           (t (values result nil)))))))
+
+(defvar *in-checkmultisig* nil
+  "When T, suppress per-signature NULLFAIL in verify-checksig.
+CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 
 (defvar *last-checksig-error* nil
   "Set to error keyword (:sig-hashtype, :pubkeytype, :sig-der) if validation failed.")
@@ -1514,11 +1520,12 @@ Used to remove the signature being verified from the scriptCode before sighash."
     (setf *last-checkmultisig-error* :nulldummy)
     (return-from verify-checkmultisig-for-script nil))
 
-  (multiple-value-bind (result error-type)
-      (verify-checkmultisig sigs pubkeys script-pubkey)
-    (when error-type
-      (setf *last-checkmultisig-error* error-type))
-    result))
+  (let ((*in-checkmultisig* t))
+    (multiple-value-bind (result error-type)
+        (verify-checkmultisig sigs pubkeys script-pubkey)
+      (when error-type
+        (setf *last-checkmultisig-error* error-type))
+      result)))
 
 (defun last-checkmultisig-had-error-p ()
   "Returns T if the last CHECKMULTISIG had a validation error."
@@ -1796,7 +1803,12 @@ Used to remove the signature being verified from the scriptCode before sighash."
         (return-from verify-checksig-witness (values nil :pubkeytype))))
 
     ;; Compute BIP 143 sighash
-    (let ((sighash (compute-bip143-sighash script-code amount sighash-type))
+    ;; For witness scripts, use *current-script-code* (updated by OP_CODESEPARATOR)
+    ;; and remove remaining OP_CODESEPARATOR bytes
+    (let* ((effective-script-code (if *current-script-code*
+                                      (remove-codeseparator *current-script-code*)
+                                      (remove-codeseparator script-code)))
+           (sighash (compute-bip143-sighash effective-script-code amount sighash-type))
           (require-low-s (flag-enabled-p "LOW_S")))
       (multiple-value-bind (result status)
           (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey-bytes
@@ -1866,8 +1878,23 @@ Used to remove the signature being verified from the scriptCode before sighash."
            (stack-items (butlast witness))
            (script-vec (cl-array-to-coalton-vector witness-script))
            (initial-stack (mapcar #'cl-array-to-coalton-vector stack-items))
-           (result (bitcoin-lisp.coalton.script:execute-script-with-stack
-                    script-vec initial-stack)))
+           ;; Use real transaction context for CLTV/CSV checks
+           (locktime (if *current-tx*
+                         (bitcoin-lisp.serialization:transaction-lock-time *current-tx*)
+                         0))
+           (version (if *current-tx*
+                        (bitcoin-lisp.serialization:transaction-version *current-tx*)
+                        1))
+           (sequence (if (and *current-tx*
+                              (bitcoin-lisp.serialization:transaction-inputs *current-tx*)
+                              (< *current-input-index*
+                                 (length (bitcoin-lisp.serialization:transaction-inputs *current-tx*))))
+                         (bitcoin-lisp.serialization:tx-in-sequence
+                          (nth *current-input-index*
+                               (bitcoin-lisp.serialization:transaction-inputs *current-tx*)))
+                         #xFFFFFFFF))
+           (result (bitcoin-lisp.coalton.script:execute-script-with-stack-tx
+                    script-vec initial-stack locktime version sequence)))
       (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
           (let ((final-stack (bitcoin-lisp.coalton.script:get-ok-stack result)))
             (cond
@@ -1894,9 +1921,14 @@ Used to remove the signature being verified from the scriptCode before sighash."
     (when (and script-sig (plusp (length script-sig)))
       (return-from validate-witness-program (values nil :witness-malleated)))
 
-    ;; Empty witness is an error
+    ;; Empty witness is an error for v0/v1, but unknown versions are anyone-can-spend
     (when (or (null witness) (zerop (length witness)))
-      (return-from validate-witness-program (values nil :witness-program-witness-empty)))
+      (if (> version 1)
+          ;; Unknown version with empty witness: anyone-can-spend (unless discouraged)
+          (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM")
+              (return-from validate-witness-program (values nil :discourage-upgradable-witness-program))
+              (return-from validate-witness-program (values t nil)))
+          (return-from validate-witness-program (values nil :witness-program-witness-empty))))
 
     (cond
       ;; Version 0

@@ -1677,7 +1677,18 @@
 
       ;; OP_CODESEPARATOR - mark position for CHECKSIG
       ((OP-CODESEPARATOR)
-       (ScriptOk (context-with-codesep-pos (context-position ctx) ctx)))
+       ;; Update CL *current-script-code* for BIP 143 sighash in witness scripts
+       (progn
+         (lisp Unit (ctx)
+           (cl:let* ((pos (context-position ctx))
+                     (script (context-script ctx))
+                     (sym (cl:find-symbol "*CURRENT-SCRIPT-CODE*" "BITCOIN-LISP.COALTON.INTEROP")))
+             (cl:when (cl:and sym (cl:boundp sym) (cl:symbol-value sym))
+               (cl:setf (cl:symbol-value sym)
+                        (cl:coerce (cl:subseq script pos)
+                                   '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))))
+           Unit)
+         (ScriptOk (context-with-codesep-pos (context-position ctx) ctx))))
 
       ;; Disabled opcodes
       ((OP-DISABLED _opcode) (ScriptErr SE-DisabledOpcode))
