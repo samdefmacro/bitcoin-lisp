@@ -1044,7 +1044,95 @@ Used to remove the signature being verified from the scriptCode before sighash."
   "Compute BIP 143 signature hash for SegWit transactions.
    SCRIPT-CODE is the script to use (P2PKH for P2WPKH, witness script for P2WSH).
    AMOUNT is the value in satoshis of the input being spent.
-   SIGHASH-TYPE is the signature hash type."
+   SIGHASH-TYPE is the signature hash type.
+   Uses *current-tx* and *current-input-index* for real transaction context,
+   or falls back to synthetic credit transaction for script_tests.json format."
+  (if *current-tx*
+      (compute-bip143-sighash-real script-code amount sighash-type)
+      (compute-bip143-sighash-test script-code amount sighash-type)))
+
+(defun compute-bip143-sighash-real (script-code amount sighash-type)
+  "Compute BIP 143 sighash using real transaction data from *current-tx*."
+  (let* ((tx *current-tx*)
+         (input-index *current-input-index*)
+         (base-type (logand sighash-type #x1f))
+         (anyonecanpay (plusp (logand sighash-type #x80)))
+         (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
+         (current-input (nth input-index inputs))
+         (current-prevout (bitcoin-lisp.serialization:tx-in-previous-output current-input))
+         ;; 2. hashPrevouts
+         (hash-prevouts
+           (if anyonecanpay
+               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+               (bitcoin-lisp.crypto:hash256
+                (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                  (dolist (inp inputs)
+                    (let ((prev (bitcoin-lisp.serialization:tx-in-previous-output inp)))
+                      (loop for b across (bitcoin-lisp.serialization:outpoint-hash prev)
+                            do (write-byte b s))
+                      (write-u32-le (bitcoin-lisp.serialization:outpoint-index prev) s)))))))
+         ;; 3. hashSequence
+         (hash-sequence
+           (if (or anyonecanpay (= base-type 2) (= base-type 3))
+               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+               (bitcoin-lisp.crypto:hash256
+                (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                  (dolist (inp inputs)
+                    (write-u32-le (bitcoin-lisp.serialization:tx-in-sequence inp) s))))))
+         ;; 8. hashOutputs
+         (hash-outputs
+           (cond
+             ((= base-type 2) ; SIGHASH_NONE
+              (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+             ((and (= base-type 3) (< input-index (length outputs))) ; SIGHASH_SINGLE
+              (bitcoin-lisp.crypto:hash256
+               (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                 (let ((out (nth input-index outputs)))
+                   (write-u64-le (bitcoin-lisp.serialization:tx-out-value out) s)
+                   (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+                     (write-varint (length script) s)
+                     (loop for b across script do (write-byte b s)))))))
+             ((and (= base-type 3) (>= input-index (length outputs))) ; SIGHASH_SINGLE out of range
+              (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+             (t ; SIGHASH_ALL
+              (bitcoin-lisp.crypto:hash256
+               (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                 (dolist (out outputs)
+                   (write-u64-le (bitcoin-lisp.serialization:tx-out-value out) s)
+                   (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+                     (write-varint (length script) s)
+                     (loop for b across script do (write-byte b s))))))))))
+    ;; Build BIP 143 preimage
+    (let ((preimage
+            (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+              ;; 1. nVersion
+              (write-u32-le (bitcoin-lisp.serialization:transaction-version tx) s)
+              ;; 2. hashPrevouts
+              (loop for b across hash-prevouts do (write-byte b s))
+              ;; 3. hashSequence
+              (loop for b across hash-sequence do (write-byte b s))
+              ;; 4. outpoint (txid + vout)
+              (loop for b across (bitcoin-lisp.serialization:outpoint-hash current-prevout)
+                    do (write-byte b s))
+              (write-u32-le (bitcoin-lisp.serialization:outpoint-index current-prevout) s)
+              ;; 5. scriptCode
+              (write-varint (length script-code) s)
+              (loop for b across script-code do (write-byte b s))
+              ;; 6. value
+              (write-u64-le amount s)
+              ;; 7. nSequence
+              (write-u32-le (bitcoin-lisp.serialization:tx-in-sequence current-input) s)
+              ;; 8. hashOutputs
+              (loop for b across hash-outputs do (write-byte b s))
+              ;; 9. nLockTime
+              (write-u32-le (bitcoin-lisp.serialization:transaction-lock-time tx) s)
+              ;; 10. sighash type
+              (write-u32-le sighash-type s))))
+      (bitcoin-lisp.crypto:hash256 preimage))))
+
+(defun compute-bip143-sighash-test (script-code amount sighash-type)
+  "Compute BIP 143 sighash using synthetic credit transaction (script_tests.json format)."
   (let* ((base-type (logand sighash-type #x1f))
          (anyonecanpay (plusp (logand sighash-type #x80)))
          ;; Compute credit txid for outpoint
@@ -1065,46 +1153,31 @@ Used to remove the signature being verified from the scriptCode before sighash."
              (loop for b across credit-script do (write-byte b s))
              (write-u32-le 0 s)))
          (credit-txid (bitcoin-lisp.crypto:hash256 credit-tx-data))
-         ;; Compute hash components based on sighash type
          (hash-prevouts (if anyonecanpay
                             (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                             (compute-hash-prevouts)))
-         (hash-sequence (if (or anyonecanpay
-                                (= base-type 2)   ; SIGHASH_NONE
-                                (= base-type 3))  ; SIGHASH_SINGLE
+         (hash-sequence (if (or anyonecanpay (= base-type 2) (= base-type 3))
                             (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
                             (compute-hash-sequence)))
          (hash-outputs (cond
-                         ((= base-type 2)  ; SIGHASH_NONE
+                         ((= base-type 2)
                           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-                         ((= base-type 3)  ; SIGHASH_SINGLE
-                          ;; For input index 0, hash output 0
+                         ((= base-type 3)
                           (compute-hash-outputs))
                          (t (compute-hash-outputs)))))
-    ;; Build the preimage
     (let ((preimage
             (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-              ;; 1. nVersion (4 bytes)
               (write-u32-le 1 s)
-              ;; 2. hashPrevouts (32 bytes)
               (loop for b across hash-prevouts do (write-byte b s))
-              ;; 3. hashSequence (32 bytes)
               (loop for b across hash-sequence do (write-byte b s))
-              ;; 4. outpoint (36 bytes): txid + vout
               (loop for b across credit-txid do (write-byte b s))
               (write-u32-le 0 s)
-              ;; 5. scriptCode (varlen)
               (write-varint (length script-code) s)
               (loop for b across script-code do (write-byte b s))
-              ;; 6. value (8 bytes)
               (write-u64-le amount s)
-              ;; 7. nSequence (4 bytes)
               (write-u32-le #xffffffff s)
-              ;; 8. hashOutputs (32 bytes)
               (loop for b across hash-outputs do (write-byte b s))
-              ;; 9. nLockTime (4 bytes)
               (write-u32-le 0 s)
-              ;; 10. sighash type (4 bytes)
               (write-u32-le sighash-type s))))
       (bitcoin-lisp.crypto:hash256 preimage))))
 
