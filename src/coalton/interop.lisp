@@ -1344,28 +1344,28 @@ Used to remove the signature being verified from the scriptCode before sighash."
           (return-from verify-checksig (values nil :sig-findanddelete)))))
 
     ;; Compute sighash and verify
-    ;; Apply FindAndDelete: remove the signature being verified from scriptCode
     (let* ((subscript-raw (or *current-script-code* script-pubkey))
-           ;; Build the serialized signature push pattern: <len> <sig-bytes>
-           (sig-push-pattern (let ((siglen (length sig-bytes)))
-                               (cond
-                                 ((<= siglen 75)
-                                  (concatenate '(vector (unsigned-byte 8))
-                                               (vector siglen) sig-bytes))
-                                 (t sig-bytes))))  ; shouldn't happen for normal sigs
-           (subscript-for-hash (find-and-delete subscript-raw sig-push-pattern))
            (sighash (cond
-                      ;; P2WSH: BIP 143 sighash with witness script as scriptCode
+                      ;; P2WSH: BIP 143 sighash — no FindAndDelete (BIP 143 spec)
+                      ;; Use *current-script-code* with OP_CODESEPARATOR bytes removed
                       ((and *witness-v0-mode* *current-tx*)
-                       (compute-bip143-sighash subscript-for-hash
-                                               *witness-input-amount*
-                                               sighash-type))
-                      ;; Legacy/P2SH: legacy sighash
+                       (let ((effective-script-code (remove-codeseparator subscript-raw)))
+                         (compute-bip143-sighash effective-script-code
+                                                 *witness-input-amount*
+                                                 sighash-type)))
+                      ;; Legacy/P2SH: legacy sighash with FindAndDelete
                       (*current-tx*
-                       (compute-legacy-sighash *current-tx*
-                                               *current-input-index*
-                                               subscript-for-hash
-                                               sighash-type))
+                       (let* ((sig-push-pattern
+                                (let ((siglen (length sig-bytes)))
+                                  (if (<= siglen 75)
+                                      (concatenate '(vector (unsigned-byte 8))
+                                                   (vector siglen) sig-bytes)
+                                      sig-bytes)))
+                              (subscript-for-hash (find-and-delete subscript-raw sig-push-pattern)))
+                         (compute-legacy-sighash *current-tx*
+                                                 *current-input-index*
+                                                 subscript-for-hash
+                                                 sighash-type)))
                       ;; Unit tests: test transaction format
                       (t (compute-test-sighash script-pubkey sighash-type))))
            (require-low-s (flag-enabled-p "LOW_S")))
@@ -1803,12 +1803,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
         (return-from verify-checksig-witness (values nil :pubkeytype))))
 
     ;; Compute BIP 143 sighash
-    ;; For witness scripts, use *current-script-code* (updated by OP_CODESEPARATOR)
-    ;; and remove remaining OP_CODESEPARATOR bytes
-    (let* ((effective-script-code (if *current-script-code*
-                                      (remove-codeseparator *current-script-code*)
-                                      (remove-codeseparator script-code)))
-           (sighash (compute-bip143-sighash effective-script-code amount sighash-type))
+    (let* ((sighash (compute-bip143-sighash (remove-codeseparator script-code) amount sighash-type))
           (require-low-s (flag-enabled-p "LOW_S")))
       (multiple-value-bind (result status)
           (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey-bytes
@@ -1877,7 +1872,8 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
            (*current-script-code* witness-script)
            (stack-items (butlast witness))
            (script-vec (cl-array-to-coalton-vector witness-script))
-           (initial-stack (mapcar #'cl-array-to-coalton-vector stack-items))
+           ;; Witness items are ordered bottom-to-top; Coalton stack is top-first
+           (initial-stack (mapcar #'cl-array-to-coalton-vector (reverse stack-items)))
            ;; Use real transaction context for CLTV/CSV checks
            (locktime (if *current-tx*
                          (bitcoin-lisp.serialization:transaction-lock-time *current-tx*)
