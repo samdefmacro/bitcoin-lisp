@@ -495,13 +495,11 @@ Used to get the redeem script from a P2SH scriptSig."
 (defun flag-enabled-p (flag)
   "Check if a flag is enabled in *script-flags*.
 Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
-  (if (and *script-flags*
-           (or (string= *script-flags* flag)
-               (search flag *script-flags*)
-               (search (concatenate 'string "," flag) *script-flags*)
-               (search (concatenate 'string flag ",") *script-flags*)))
-      t
-      nil))
+  (when *script-flags*
+    (let ((flags-list (uiop:split-string *script-flags* :separator ",")))
+      (if (member flag flags-list :test #'string=)
+          t
+          nil))))
 
 ;;; ============================================================
 ;;; Tapscript OP_SUCCESS Detection (BIP 342)
@@ -588,6 +586,26 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
   "The internal public key for Tapscript script path spending.
    Set when executing a Tapscript.")
 
+(defvar *tapscript-validation-weight-left* nil
+  "Remaining validation weight for Tapscript sigop budget (BIP 342).
+   Initialized to witness_serialization_size + VALIDATION_WEIGHT_OFFSET (50).
+   Decremented by VALIDATION_WEIGHT_PER_SIGOP_PASSED (50) per signature check.")
+
+(defconstant +validation-weight-per-sigop-passed+ 50
+  "BIP 342: Weight cost per signature operation in Tapscript.")
+
+(defconstant +validation-weight-offset+ 50
+  "BIP 342: Initial weight offset added to witness serialization size.")
+
+(defun compute-witness-serialization-size (witness-items)
+  "Compute the serialization size of a witness stack.
+   Format: compact_size(num_items) + for each item: compact_size(len) + data.
+   This matches Bitcoin Core's GetSerializeSize(witness.stack)."
+  (let ((total (bitcoin-lisp.serialization:compact-size-length (length witness-items))))
+    (dolist (item witness-items total)
+      (let ((len (length item)))
+        (incf total (+ (bitcoin-lisp.serialization:compact-size-length len) len))))))
+
 (defun verify-tapscript-signature (sig-bytes pubkey-bytes)
   "Verify a Tapscript signature (BIP 342 rules).
    SIG-BYTES: signature (64 bytes for default sighash, 65 bytes with explicit type)
@@ -604,9 +622,24 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
     (unless (or (= sig-len 64) (= sig-len 65))
       (return-from verify-tapscript-signature (values :invalid-sig nil))))
 
-  ;; Public key must be 32 bytes (x-only)
+  ;; BIP 342: Decrement validation weight for non-empty signatures.
+  ;; This applies to all pubkey types (including upgradable).
+  (when *tapscript-validation-weight-left*
+    (decf *tapscript-validation-weight-left* +validation-weight-per-sigop-passed+)
+    (when (< *tapscript-validation-weight-left* 0)
+      (return-from verify-tapscript-signature (values :validation-weight-exceeded nil))))
+
+  ;; Empty pubkey is always an error (BIP 342)
+  (when (zerop (length pubkey-bytes))
+    (return-from verify-tapscript-signature (values :empty-pubkey nil)))
+
+  ;; Non-32-byte, non-empty pubkey = upgradable type (BIP 342 forward compatibility)
+  ;; These are treated as successful signature checks (anyone-can-spend for that key type)
+  ;; but still cost validation weight. Only rejected if DISCOURAGE flag is set.
   (unless (= (length pubkey-bytes) 32)
-    (return-from verify-tapscript-signature (values :invalid-pubkey nil)))
+    (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
+        (return-from verify-tapscript-signature (values :discourage-upgradable-pubkeytype nil))
+        (return-from verify-tapscript-signature (values :upgradable-pubkey t))))
 
   (let* ((sig-len (length sig-bytes))
          (sighash-type (if (= sig-len 65)
@@ -690,6 +723,7 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
          (old-leaf-hash *tapscript-leaf-hash*)
          (old-amount *tapscript-amount*)
          (old-internal-pubkey *tapscript-internal-pubkey*)
+         (old-validation-weight *tapscript-validation-weight-left*)
          ;; Add TAPSCRIPT flag
          (new-flags (if old-flags
                         (concatenate 'string old-flags ",TAPSCRIPT")
@@ -721,7 +755,8 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
       (setf *script-flags* old-flags)
       (setf *tapscript-leaf-hash* old-leaf-hash)
       (setf *tapscript-amount* old-amount)
-      (setf *tapscript-internal-pubkey* old-internal-pubkey))))
+      (setf *tapscript-internal-pubkey* old-internal-pubkey)
+      (setf *tapscript-validation-weight-left* old-validation-weight))))
 
 ;;; ============================================================
 ;;; SIGPUSHONLY Validation
@@ -1412,11 +1447,13 @@ Used to remove the signature being verified from the scriptCode before sighash."
   ;; Extract sighash type from signature (last byte)
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
          (der-sig (subseq sig-bytes 0 (1- (length sig-bytes))))
-         ;; Both DERSIG and STRICTENC require DER signature validation
+         ;; DERSIG, STRICTENC, or LOW_S all require DER signature validation
+         ;; (Bitcoin Core: CheckSignatureEncoding checks all three flags)
          (strict-der (or (flag-enabled-p "DERSIG")
-                         (flag-enabled-p "STRICTENC"))))
+                         (flag-enabled-p "STRICTENC")
+                         (flag-enabled-p "LOW_S"))))
 
-    ;; DERSIG/STRICTENC: Check DER format BEFORE anything else
+    ;; DERSIG/STRICTENC/LOW_S: Check DER format BEFORE anything else
     ;; This ensures we error on bad DER even with empty pubkey
     (when strict-der
       (unless (check-der-signature-format der-sig)
@@ -1434,6 +1471,12 @@ Used to remove the signature being verified from the scriptCode before sighash."
         (return-from verify-checksig (values nil :sig-hashtype)))
       (unless (valid-pubkey-format-p pubkey-bytes)
         (return-from verify-checksig (values nil :pubkeytype))))
+
+    ;; WITNESS_PUBKEYTYPE: witness v0 requires compressed pubkeys
+    ;; (Bitcoin Core: CheckPubKeyEncoding in EvalChecksigPreTapscript)
+    (when (and *witness-v0-mode* (flag-enabled-p "WITNESS_PUBKEYTYPE"))
+      (unless (is-compressed-pubkey-p pubkey-bytes)
+        (return-from verify-checksig (values nil :witness-pubkeytype))))
 
     ;; CONST_SCRIPTCODE: reject if scriptCode contains OP_CODESEPARATOR as an opcode
     ;; Also reject if FindAndDelete would modify the scriptCode (sig found in scriptCode)
@@ -1894,8 +1937,10 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
          (der-sig (subseq sig-bytes 0 (1- (length sig-bytes))))
+         ;; DERSIG, STRICTENC, or LOW_S all require DER signature validation
          (strict-der (or (flag-enabled-p "DERSIG")
-                         (flag-enabled-p "STRICTENC"))))
+                         (flag-enabled-p "STRICTENC")
+                         (flag-enabled-p "LOW_S"))))
 
     ;; DER format check
     (when strict-der
@@ -2201,7 +2246,14 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
                 (when (scan-for-op-success script)
                   (return-from validate-taproot-script-path (values t nil)))
 
-                ;; 2. Execute the Tapscript with witness inputs as stack
+                ;; 2. Initialize validation weight budget (BIP 342)
+                ;; Budget = serialization_size(witness_stack) + VALIDATION_WEIGHT_OFFSET
+                ;; Uses full witness (including script + control block) as in Bitcoin Core
+                (setf *tapscript-validation-weight-left*
+                      (+ (compute-witness-serialization-size witness)
+                         +validation-weight-offset+))
+
+                ;; 3. Execute the Tapscript with witness inputs as stack
                 (run-tapscript script script-inputs leaf-hash amount internal-pubkey))
               ;; Unknown leaf version - anyone can spend if DISCOURAGE flag not set
               (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION")
