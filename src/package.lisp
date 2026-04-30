@@ -436,6 +436,8 @@
    #:compute-median-time-past
    #:check-sequence-locks
    #:compute-script-flags-for-height
+   #:compute-standard-script-flags-for-height
+   #:get-segwit-activation-height
    ;; Difficulty validation
    #:validate-difficulty
    #:get-expected-bits
