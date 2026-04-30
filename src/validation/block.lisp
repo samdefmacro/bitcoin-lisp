@@ -33,10 +33,18 @@
 (defconstant +csv-activation-height-testnet3+ 770112
   "BIP 68/112/113 (CSV soft fork) activation height on testnet.")
 
+(defconstant +segwit-activation-height-mainnet+ 481824
+  "BIP 141 (SegWit) activation height on mainnet.")
+(defconstant +segwit-activation-height-testnet3+ 834624
+  "BIP 141 (SegWit) activation height on testnet3.")
+
 (defconstant +taproot-activation-height-mainnet+ 709632
   "BIP 341 (Taproot) activation height on mainnet.")
 (defconstant +taproot-activation-height-testnet3+ 2346882
-  "BIP 341 (Taproot) activation height on testnet.")
+  "BIP 341 (Taproot) activation height on testnet3.")
+
+;;; P2SH is active from block 173805 (mainnet) but enforced from genesis on testnet.
+;;; BIP 66 (DERSIG) and BIP 147 (NULLDUMMY) activate with SegWit on most networks.
 
 (defconstant +locktime-threshold+ 500000000
   "Threshold for height vs time-based locktime. Values below are block heights,
@@ -177,19 +185,56 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
     ((:testnet4 :signet) 1)
     (:mainnet +taproot-activation-height-mainnet+)))
 
-(defun compute-script-flags-for-height (height)
-  "Compute script verification flags string based on block HEIGHT.
-Returns a comma-separated string of enabled flags, or NIL if none."
-  (let ((flags '()))
-    (when (>= height (get-bip65-activation-height bitcoin-lisp:*network*))
+(defun get-segwit-activation-height (network)
+  "Return the BIP 141 (SegWit) activation height for NETWORK."
+  (ecase network
+    (:testnet3 +segwit-activation-height-testnet3+)
+    ((:testnet4 :signet) 1)
+    (:mainnet +segwit-activation-height-mainnet+)))
+
+;;; Policy vs Consensus Flag Separation
+;;;
+;;; Bitcoin Core distinguishes MANDATORY (consensus) flags from STANDARD (policy) flags.
+;;; Mandatory flags are required for block validation. Standard flags add policy
+;;; restrictions for mempool acceptance and transaction relay.
+
+(defparameter +standard-policy-flags+
+  '("STRICTENC" "MINIMALDATA" "DISCOURAGE_UPGRADABLE_NOPS"
+    "CLEANSTACK" "MINIMALIF" "NULLFAIL" "LOW_S"
+    "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" "WITNESS_PUBKEYTYPE"
+    "CONST_SCRIPTCODE" "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+    "DISCOURAGE_OP_SUCCESS" "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
+  "Policy flags layered on top of mandatory consensus flags for mempool acceptance.")
+
+(defun mandatory-script-flags-list (height)
+  "Mandatory consensus flags active at HEIGHT, as a list of strings.
+   P2SH is included unconditionally; DERSIG/CLTV/CSV/WITNESS/NULLDUMMY/TAPROOT
+   gate on their activation heights for the current network."
+  (let ((flags (list "P2SH"))
+        (network bitcoin-lisp:*network*))
+    (when (>= height (get-bip66-activation-height network))
+      (push "DERSIG" flags))
+    (when (>= height (get-bip65-activation-height network))
       (push "CHECKLOCKTIMEVERIFY" flags))
-    (when (>= height (get-csv-activation-height bitcoin-lisp:*network*))
+    (when (>= height (get-csv-activation-height network))
       (push "CHECKSEQUENCEVERIFY" flags))
-    (when (>= height (get-taproot-activation-height bitcoin-lisp:*network*))
+    (when (>= height (get-segwit-activation-height network))
+      (push "WITNESS" flags)
+      (push "NULLDUMMY" flags))
+    (when (>= height (get-taproot-activation-height network))
       (push "TAPROOT" flags))
-    (if flags
-        (format nil "~{~A~^,~}" flags)
-        nil)))
+    (nreverse flags)))
+
+(defun compute-script-flags-for-height (height)
+  "Comma-separated MANDATORY script verification flags for block validation at HEIGHT
+   (Bitcoin Core: MANDATORY_SCRIPT_VERIFY_FLAGS)."
+  (format nil "~{~A~^,~}" (mandatory-script-flags-list height)))
+
+(defun compute-standard-script-flags-for-height (height)
+  "Comma-separated STANDARD script verification flags for mempool acceptance at HEIGHT
+   (Bitcoin Core: STANDARD_SCRIPT_VERIFY_FLAGS = mandatory + policy)."
+  (format nil "~{~A~^,~}"
+          (append (mandatory-script-flags-list height) +standard-policy-flags+)))
 
 ;;; BIP 16 (P2SH) exception block hash for testnet3
 ;;; This block predates proper BIP 16 enforcement and must skip script validation
@@ -431,16 +476,18 @@ HEIGHT is used to determine which script verification flags to enable."
         (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
     (loop for tx in (rest transactions)  ; skip coinbase
           for tx-idx from 1
-          do (loop for input in (bitcoin-lisp.serialization:transaction-inputs tx)
-                   for input-idx from 0
-                   do (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                             (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-                             (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
-                             (utxo (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)))
-                        (when utxo
-                          (unless (validate-input-script tx input-idx utxo)
-                            (return-from validate-block-scripts
-                              (values nil :script-failed)))))))
+          do (let ((bitcoin-lisp.coalton.interop:*precomputed-sighash*
+                     (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx)))
+               (loop for input in (bitcoin-lisp.serialization:transaction-inputs tx)
+                     for input-idx from 0
+                     do (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                               (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
+                               (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+                               (utxo (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)))
+                          (when utxo
+                            (unless (validate-input-script tx input-idx utxo)
+                              (return-from validate-block-scripts
+                                (values nil :script-failed))))))))
     (values t nil)))
 
 ;;;; Witness commitment validation (BIP 141)

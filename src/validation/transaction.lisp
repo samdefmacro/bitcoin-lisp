@@ -291,6 +291,8 @@ HEIGHT determines which script verification flags are active.
 Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
   (let ((bitcoin-lisp.coalton.interop:*script-flags*
           (compute-script-flags-for-height height))
+        (bitcoin-lisp.coalton.interop:*precomputed-sighash*
+          (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx))
         (inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
     (loop for input in inputs
           for input-idx from 0

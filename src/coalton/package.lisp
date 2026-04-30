@@ -277,6 +277,12 @@
    #:SE-TaprootMerkleMismatch
    #:SE-TapscriptInvalidOpcode
    #:SE-SchnorrSignatureSize
+   #:SE-TapscriptMinimalIf
+   #:SE-TapscriptCheckmultisig
+   #:SE-TapscriptInvalidSig
+   #:SE-TapscriptValidationWeight
+   #:SE-MinimalIf
+   #:SE-DiscourageUpgradablePubkeyType
    ;; Taproot support (BIP 341)
    #:is-taproot-program
    #:OP-CHECKSIGADD
