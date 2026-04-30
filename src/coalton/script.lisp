@@ -57,6 +57,7 @@
     SE-DiscourageUpgradableNops ; NOP1/NOP4-10 when DISCOURAGE_UPGRADABLE_NOPS flag set
     SE-PushSize                ; Push data exceeds 520 bytes
     SE-NumberOverflow          ; Arithmetic operand exceeds 4 bytes
+    SE-MinimalIf               ; IF/NOTIF argument not minimal (witness v0, MINIMALIF flag)
     ;; Witness errors (SegWit BIP 141)
     SE-WitnessProgramWrongLength   ; Witness program not 20 or 32 bytes for v0
     SE-WitnessProgramWitnessEmpty  ; Empty witness for witness program
@@ -76,7 +77,6 @@
     SE-TapscriptCheckmultisig      ; CHECKMULTISIG used in Tapscript (disabled)
     SE-TapscriptInvalidSig         ; Non-empty invalid signature in Tapscript
     SE-TapscriptValidationWeight   ; Exceeded sigop weight budget (BIP 342)
-    SE-MinimalIf                   ; IF/NOTIF argument not minimal (witness v0, MINIMALIF flag)
     SE-DiscourageUpgradablePubkeyType) ; Unknown pubkey type in Tapscript when DISCOURAGE flag set
 
   ;;;; ScriptResult - Result type for script operations
