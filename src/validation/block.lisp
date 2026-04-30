@@ -312,11 +312,18 @@ and testnet min-difficulty exception."
               (last-block-time
                 (bitcoin-lisp.serialization:block-header-timestamp
                  (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
-              (prev-bits
+              ;; BIP 94 (testnet4): the new target is computed from the FIRST block
+              ;; of the just-ended retarget period rather than the last block. This
+              ;; preserves the real difficulty across periods even when the 20-min
+              ;; min-difficulty exception was used near a retarget boundary.
+              (basis-entry (if (eq bitcoin-lisp:*network* :testnet4)
+                               last-retarget-entry
+                               prev-entry))
+              (basis-bits
                 (bitcoin-lisp.serialization:block-header-bits
-                 (bitcoin-lisp.storage:block-index-entry-header prev-entry))))
+                 (bitcoin-lisp.storage:block-index-entry-header basis-entry))))
          (bitcoin-lisp.storage:calculate-next-work-required
-          last-retarget-time last-block-time prev-bits)))
+          last-retarget-time last-block-time basis-bits)))
 
       ;; Non-boundary: mainnet just inherits previous bits
       ((eq bitcoin-lisp:*network* :mainnet)
