@@ -77,6 +77,14 @@
    #:*debug-checksig*
    #:*current-script-code*
    #:compute-legacy-sighash
+   ;; Sighash precomputation
+   #:*precomputed-sighash*
+   #:init-precomputed-sighash
+   #:precomputed-sighash-data
+   ;; Signature cache
+   #:*signature-cache*
+   #:*signature-cache-enabled*
+   #:clear-signature-cache
    ;; SegWit / BIP 143
    #:*witness-v0-mode*
    #:*witness-input-amount*
@@ -307,9 +315,120 @@
    For P2SH, the credit transaction must use the P2SH scriptPubKey (OP_HASH160 <hash> OP_EQUAL),
    while the sighash scriptCode uses the redeemScript.")
 
+;;; Precomputed sighash data (Bitcoin Core: PrecomputedTransactionData)
+;;; Caches hash components shared across all inputs of a transaction.
+
+(defstruct precomputed-sighash-data
+  (hash-prevouts nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (hash-sequence nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (hash-outputs-all nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+
+(defvar *precomputed-sighash* nil
+  "Per-transaction precomputed sighash data. Bound once before validating inputs.")
+
+(defun serialize-all-prevouts (inputs stream)
+  (dolist (inp inputs)
+    (let ((prev (bitcoin-lisp.serialization:tx-in-previous-output inp)))
+      (loop for b across (bitcoin-lisp.serialization:outpoint-hash prev)
+            do (write-byte b stream))
+      (write-u32-le (bitcoin-lisp.serialization:outpoint-index prev) stream))))
+
+(defun serialize-all-sequences (inputs stream)
+  (dolist (inp inputs)
+    (write-u32-le (bitcoin-lisp.serialization:tx-in-sequence inp) stream)))
+
+(defun serialize-all-outputs (outputs stream)
+  (dolist (out outputs)
+    (write-u64-le (bitcoin-lisp.serialization:tx-out-value out) stream)
+    (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+      (write-varint (length script) stream)
+      (loop for b across script do (write-byte b stream)))))
+
+(defun init-precomputed-sighash (tx)
+  "Initialize precomputed sighash data for TX. Call once per transaction."
+  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+        (outputs (bitcoin-lisp.serialization:transaction-outputs tx)))
+    (make-precomputed-sighash-data
+     :hash-prevouts
+       (bitcoin-lisp.crypto:hash256
+        (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+          (serialize-all-prevouts inputs s)))
+     :hash-sequence
+       (bitcoin-lisp.crypto:hash256
+        (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+          (serialize-all-sequences inputs s)))
+     :hash-outputs-all
+       (bitcoin-lisp.crypto:hash256
+        (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+          (serialize-all-outputs outputs s))))))
+
 (defvar *witness-v0-mode* nil
   "When non-nil, verify-checksig uses BIP 143 sighash instead of legacy.
    Set during P2WSH witness script execution.")
+
+;;; Signature verification cache
+;;; Caches successful ECDSA and Schnorr verifications to avoid re-verification
+;;; when the same signature is checked during mempool acceptance and block validation.
+
+(defparameter +signature-cache-max-entries+ 65536
+  "Maximum entries in *signature-cache* before it is cleared.
+   Bitcoin Core caps the equivalent CuckooCache at ~32 MiB; this is the analogue.")
+
+(defvar *signature-cache* (make-hash-table :test 'equalp :size 65536)
+  "Cache of verified signatures. Key = SHA256(...), Value = T.")
+
+(defvar *signature-cache-enabled* t
+  "When T, cache signature verification results.")
+
+(defun make-sig-cache-key (type-byte sighash pubkey sig)
+  "Compute cache key over fixed-layout fields with length prefixes so variable-
+   length pubkey/sig cannot produce key collisions across different splits."
+  (bitcoin-lisp.crypto:sha256
+   (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+     (write-byte type-byte s)
+     (let ((flags-len (if *script-flags* (length *script-flags*) 0)))
+       (write-u16-le flags-len s)
+       (when *script-flags*
+         (loop for c across *script-flags* do (write-byte (char-code c) s))))
+     (loop for b across sighash do (write-byte b s))
+     (write-byte (length pubkey) s)
+     (loop for b across pubkey do (write-byte b s))
+     (write-u16-le (length sig) s)
+     (loop for b across sig do (write-byte b s)))))
+
+(defun sig-cache-store (key)
+  (when (>= (hash-table-count *signature-cache*) +signature-cache-max-entries+)
+    (clrhash *signature-cache*))
+  (setf (gethash key *signature-cache*) t))
+
+(defun cached-verify-ecdsa (sighash der-sig pubkey-bytes &key strict low-s)
+  "Verify ECDSA signature with caching. Returns same values as crypto:verify-signature."
+  (let ((cache-key (when *signature-cache-enabled*
+                     (make-sig-cache-key #x45 sighash der-sig pubkey-bytes))))
+    (when (and cache-key (gethash cache-key *signature-cache*))
+      (return-from cached-verify-ecdsa (values t nil)))
+    (multiple-value-bind (result status)
+        (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey-bytes
+                                              :strict strict :low-s low-s)
+      (when (and result cache-key)
+        (sig-cache-store cache-key))
+      (values result status))))
+
+(defun cached-verify-schnorr (sighash sig64 pubkey-bytes)
+  "Verify Schnorr signature with caching. Returns T/NIL."
+  (let ((cache-key (when *signature-cache-enabled*
+                     (make-sig-cache-key #x53 sighash sig64 pubkey-bytes))))
+    (when (and cache-key (gethash cache-key *signature-cache*))
+      (return-from cached-verify-schnorr t))
+    (let ((result (bitcoin-lisp.crypto:verify-schnorr-signature
+                   sighash sig64 pubkey-bytes)))
+      (when (and result cache-key)
+        (sig-cache-store cache-key))
+      result)))
+
+(defun clear-signature-cache ()
+  "Clear the signature verification cache."
+  (clrhash *signature-cache*))
 
 (defun current-input-sequence ()
   "Extract nSequence for the current input from *current-tx*, or #xFFFFFFFF if unavailable."
@@ -495,13 +614,11 @@ Used to get the redeem script from a P2SH scriptSig."
 (defun flag-enabled-p (flag)
   "Check if a flag is enabled in *script-flags*.
 Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
-  (if (and *script-flags*
-           (or (string= *script-flags* flag)
-               (search flag *script-flags*)
-               (search (concatenate 'string "," flag) *script-flags*)
-               (search (concatenate 'string flag ",") *script-flags*)))
-      t
-      nil))
+  (when *script-flags*
+    (let ((flags-list (uiop:split-string *script-flags* :separator ",")))
+      (if (member flag flags-list :test #'string=)
+          t
+          nil))))
 
 ;;; ============================================================
 ;;; Tapscript OP_SUCCESS Detection (BIP 342)
@@ -588,6 +705,26 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
   "The internal public key for Tapscript script path spending.
    Set when executing a Tapscript.")
 
+(defvar *tapscript-validation-weight-left* nil
+  "Remaining validation weight for Tapscript sigop budget (BIP 342).
+   Initialized to witness_serialization_size + VALIDATION_WEIGHT_OFFSET (50).
+   Decremented by VALIDATION_WEIGHT_PER_SIGOP_PASSED (50) per signature check.")
+
+(defconstant +validation-weight-per-sigop-passed+ 50
+  "BIP 342: Weight cost per signature operation in Tapscript.")
+
+(defconstant +validation-weight-offset+ 50
+  "BIP 342: Initial weight offset added to witness serialization size.")
+
+(defun compute-witness-serialization-size (witness-items)
+  "Compute the serialization size of a witness stack.
+   Format: compact_size(num_items) + for each item: compact_size(len) + data.
+   This matches Bitcoin Core's GetSerializeSize(witness.stack)."
+  (let ((total (bitcoin-lisp.serialization:compact-size-length (length witness-items))))
+    (dolist (item witness-items total)
+      (let ((len (length item)))
+        (incf total (+ (bitcoin-lisp.serialization:compact-size-length len) len))))))
+
 (defun verify-tapscript-signature (sig-bytes pubkey-bytes)
   "Verify a Tapscript signature (BIP 342 rules).
    SIG-BYTES: signature (64 bytes for default sighash, 65 bytes with explicit type)
@@ -604,9 +741,24 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
     (unless (or (= sig-len 64) (= sig-len 65))
       (return-from verify-tapscript-signature (values :invalid-sig nil))))
 
-  ;; Public key must be 32 bytes (x-only)
+  ;; BIP 342: Decrement validation weight for non-empty signatures.
+  ;; This applies to all pubkey types (including upgradable).
+  (when *tapscript-validation-weight-left*
+    (decf *tapscript-validation-weight-left* +validation-weight-per-sigop-passed+)
+    (when (< *tapscript-validation-weight-left* 0)
+      (return-from verify-tapscript-signature (values :validation-weight-exceeded nil))))
+
+  ;; Empty pubkey is always an error (BIP 342)
+  (when (zerop (length pubkey-bytes))
+    (return-from verify-tapscript-signature (values :empty-pubkey nil)))
+
+  ;; Non-32-byte, non-empty pubkey = upgradable type (BIP 342 forward compatibility)
+  ;; These are treated as successful signature checks (anyone-can-spend for that key type)
+  ;; but still cost validation weight. Only rejected if DISCOURAGE flag is set.
   (unless (= (length pubkey-bytes) 32)
-    (return-from verify-tapscript-signature (values :invalid-pubkey nil)))
+    (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
+        (return-from verify-tapscript-signature (values :discourage-upgradable-pubkeytype nil))
+        (return-from verify-tapscript-signature (values :upgradable-pubkey t))))
 
   (let* ((sig-len (length sig-bytes))
          (sighash-type (if (= sig-len 65)
@@ -622,7 +774,7 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
     (let ((sighash (compute-bip341-sighash *tapscript-amount* sighash-type
                                             *tapscript-leaf-hash* 0)))
       ;; Verify Schnorr signature
-      (if (bitcoin-lisp.crypto:verify-schnorr-signature sighash sig64 pubkey-bytes)
+      (if (cached-verify-schnorr sighash sig64 pubkey-bytes)
           (values :ok t)
           (values :invalid-sig nil)))))
 
@@ -690,6 +842,7 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
          (old-leaf-hash *tapscript-leaf-hash*)
          (old-amount *tapscript-amount*)
          (old-internal-pubkey *tapscript-internal-pubkey*)
+         (old-validation-weight *tapscript-validation-weight-left*)
          ;; Add TAPSCRIPT flag
          (new-flags (if old-flags
                         (concatenate 'string old-flags ",TAPSCRIPT")
@@ -721,7 +874,8 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
       (setf *script-flags* old-flags)
       (setf *tapscript-leaf-hash* old-leaf-hash)
       (setf *tapscript-amount* old-amount)
-      (setf *tapscript-internal-pubkey* old-internal-pubkey))))
+      (setf *tapscript-internal-pubkey* old-internal-pubkey)
+      (setf *tapscript-validation-weight-left* old-validation-weight))))
 
 ;;; ============================================================
 ;;; SIGPUSHONLY Validation
@@ -810,6 +964,11 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
 ;;; - Spend tx: spends that output with scriptSig
 ;;;
 ;;; The sighash is computed per BIP 143 for SegWit, or legacy for pre-SegWit.
+
+(defun write-u16-le (value stream)
+  "Write a 16-bit unsigned integer in little-endian."
+  (write-byte (logand value #xff) stream)
+  (write-byte (logand (ash value -8) #xff) stream))
 
 (defun write-u32-le (value stream)
   "Write a 32-bit unsigned integer in little-endian."
@@ -1179,48 +1338,27 @@ Used to remove the signature being verified from the scriptCode before sighash."
          (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
          (current-input (nth input-index inputs))
          (current-prevout (bitcoin-lisp.serialization:tx-in-previous-output current-input))
-         ;; 2. hashPrevouts
+         (precomp (or *precomputed-sighash* (init-precomputed-sighash tx)))
+         (zero32 (load-time-value
+                  (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                  t))
          (hash-prevouts
            (if anyonecanpay
-               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-               (bitcoin-lisp.crypto:hash256
-                (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-                  (dolist (inp inputs)
-                    (let ((prev (bitcoin-lisp.serialization:tx-in-previous-output inp)))
-                      (loop for b across (bitcoin-lisp.serialization:outpoint-hash prev)
-                            do (write-byte b s))
-                      (write-u32-le (bitcoin-lisp.serialization:outpoint-index prev) s)))))))
-         ;; 3. hashSequence
+               zero32
+               (precomputed-sighash-data-hash-prevouts precomp)))
          (hash-sequence
            (if (or anyonecanpay (= base-type 2) (= base-type 3))
-               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
-               (bitcoin-lisp.crypto:hash256
-                (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-                  (dolist (inp inputs)
-                    (write-u32-le (bitcoin-lisp.serialization:tx-in-sequence inp) s))))))
-         ;; 8. hashOutputs
+               zero32
+               (precomputed-sighash-data-hash-sequence precomp)))
          (hash-outputs
            (cond
-             ((= base-type 2) ; SIGHASH_NONE
-              (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+             ((= base-type 2) zero32)                           ; SIGHASH_NONE
              ((and (= base-type 3) (< input-index (length outputs))) ; SIGHASH_SINGLE
               (bitcoin-lisp.crypto:hash256
                (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-                 (let ((out (nth input-index outputs)))
-                   (write-u64-le (bitcoin-lisp.serialization:tx-out-value out) s)
-                   (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
-                     (write-varint (length script) s)
-                     (loop for b across script do (write-byte b s)))))))
-             ((and (= base-type 3) (>= input-index (length outputs))) ; SIGHASH_SINGLE out of range
-              (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-             (t ; SIGHASH_ALL
-              (bitcoin-lisp.crypto:hash256
-               (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-                 (dolist (out outputs)
-                   (write-u64-le (bitcoin-lisp.serialization:tx-out-value out) s)
-                   (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
-                     (write-varint (length script) s)
-                     (loop for b across script do (write-byte b s))))))))))
+                 (serialize-all-outputs (list (nth input-index outputs)) s))))
+             ((= base-type 3) zero32)                           ; SIGHASH_SINGLE out of range
+             (t (precomputed-sighash-data-hash-outputs-all precomp)))))
     ;; Build BIP 143 preimage
     (let ((preimage
             (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
@@ -1412,11 +1550,13 @@ Used to remove the signature being verified from the scriptCode before sighash."
   ;; Extract sighash type from signature (last byte)
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
          (der-sig (subseq sig-bytes 0 (1- (length sig-bytes))))
-         ;; Both DERSIG and STRICTENC require DER signature validation
+         ;; DERSIG, STRICTENC, or LOW_S all require DER signature validation
+         ;; (Bitcoin Core: CheckSignatureEncoding checks all three flags)
          (strict-der (or (flag-enabled-p "DERSIG")
-                         (flag-enabled-p "STRICTENC"))))
+                         (flag-enabled-p "STRICTENC")
+                         (flag-enabled-p "LOW_S"))))
 
-    ;; DERSIG/STRICTENC: Check DER format BEFORE anything else
+    ;; DERSIG/STRICTENC/LOW_S: Check DER format BEFORE anything else
     ;; This ensures we error on bad DER even with empty pubkey
     (when strict-der
       (unless (check-der-signature-format der-sig)
@@ -1434,6 +1574,12 @@ Used to remove the signature being verified from the scriptCode before sighash."
         (return-from verify-checksig (values nil :sig-hashtype)))
       (unless (valid-pubkey-format-p pubkey-bytes)
         (return-from verify-checksig (values nil :pubkeytype))))
+
+    ;; WITNESS_PUBKEYTYPE: witness v0 requires compressed pubkeys
+    ;; (Bitcoin Core: CheckPubKeyEncoding in EvalChecksigPreTapscript)
+    (when (and *witness-v0-mode* (flag-enabled-p "WITNESS_PUBKEYTYPE"))
+      (unless (is-compressed-pubkey-p pubkey-bytes)
+        (return-from verify-checksig (values nil :witness-pubkeytype))))
 
     ;; CONST_SCRIPTCODE: reject if scriptCode contains OP_CODESEPARATOR as an opcode
     ;; Also reject if FindAndDelete would modify the scriptCode (sig found in scriptCode)
@@ -1503,7 +1649,7 @@ Used to remove the signature being verified from the scriptCode before sighash."
                 (length pubkey-bytes)
                 (bitcoin-lisp.crypto:bytes-to-hex pubkey-bytes)))
       (multiple-value-bind (result status)
-          (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey-bytes
+          (cached-verify-ecdsa sighash der-sig pubkey-bytes
                                                 :strict strict-der
                                                 :low-s require-low-s)
         ;; Debug output after verification
@@ -1894,8 +2040,10 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 
   (let* ((sighash-type (aref sig-bytes (1- (length sig-bytes))))
          (der-sig (subseq sig-bytes 0 (1- (length sig-bytes))))
+         ;; DERSIG, STRICTENC, or LOW_S all require DER signature validation
          (strict-der (or (flag-enabled-p "DERSIG")
-                         (flag-enabled-p "STRICTENC"))))
+                         (flag-enabled-p "STRICTENC")
+                         (flag-enabled-p "LOW_S"))))
 
     ;; DER format check
     (when strict-der
@@ -1924,7 +2072,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
     (let* ((sighash (compute-bip143-sighash (remove-codeseparator script-code) amount sighash-type))
           (require-low-s (flag-enabled-p "LOW_S")))
       (multiple-value-bind (result status)
-          (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey-bytes
+          (cached-verify-ecdsa sighash der-sig pubkey-bytes
                                                 :strict strict-der
                                                 :low-s require-low-s)
         (cond
@@ -2059,15 +2207,24 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
            (t
             (values nil :witness-program-wrong-length)))))
 
-      ;; Version 1 (Taproot)
+      ;; Version 1 (Taproot / P2A)
       ((= version 1)
-       (if (flag-enabled-p "TAPROOT")
-           (let ((prog-len (length program)))
-             (if (= prog-len 32)
-                 (validate-taproot witness program amount)
-                 (values nil :witness-program-wrong-length)))
-           ;; Pre-activation: anyone-can-spend
-           (values t nil)))
+       (let ((prog-len (length program)))
+         (cond
+           ;; P2A (Pay-to-Anchor): v1 with 2-byte program 0x4e73
+           ;; Always anyone-can-spend (Bitcoin Core: IsPayToAnchor)
+           ((and (= prog-len 2)
+                 (= (aref program 0) #x4e)
+                 (= (aref program 1) #x73))
+            (values t nil))
+           ;; Taproot: v1 with 32-byte program
+           ((and (flag-enabled-p "TAPROOT") (= prog-len 32))
+            (validate-taproot witness program amount))
+           ;; Pre-Taproot activation: anyone-can-spend
+           ((not (flag-enabled-p "TAPROOT"))
+            (values t nil))
+           ;; Invalid program length for v1 with Taproot active
+           (t (values nil :witness-program-wrong-length)))))
 
       ;; Unknown version (v2+)
       (t
@@ -2159,7 +2316,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
       ;; Compute BIP 341 sighash
       (let ((sighash (compute-bip341-sighash amount sighash-type nil nil)))
         ;; Verify Schnorr signature
-        (if (bitcoin-lisp.crypto:verify-schnorr-signature sighash sig64 output-pubkey32)
+        (if (cached-verify-schnorr sighash sig64 output-pubkey32)
             (values t nil)
             (values nil :taproot-invalid-signature))))))
 
@@ -2201,7 +2358,14 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
                 (when (scan-for-op-success script)
                   (return-from validate-taproot-script-path (values t nil)))
 
-                ;; 2. Execute the Tapscript with witness inputs as stack
+                ;; 2. Initialize validation weight budget (BIP 342)
+                ;; Budget = serialization_size(witness_stack) + VALIDATION_WEIGHT_OFFSET
+                ;; Uses full witness (including script + control block) as in Bitcoin Core
+                (setf *tapscript-validation-weight-left*
+                      (+ (compute-witness-serialization-size witness)
+                         +validation-weight-offset+))
+
+                ;; 3. Execute the Tapscript with witness inputs as stack
                 (run-tapscript script script-inputs leaf-hash amount internal-pubkey))
               ;; Unknown leaf version - anyone can spend if DISCOURAGE flag not set
               (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION")
