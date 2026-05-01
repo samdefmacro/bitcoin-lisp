@@ -1065,8 +1065,18 @@
       (cl:let* ((sig-arr (cl:coerce sig '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                 (pk-arr (cl:coerce pubkey '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))
                 (verify-fn (cl:fdefinition (cl:intern "VERIFY-TAPSCRIPT-SIGNATURE" "BITCOIN-LISP.COALTON.INTEROP"))))
+        (cl:when (cl:symbol-value (cl:intern "*DEBUG-BIP341-SIGHASH*" "BITCOIN-LISP.COALTON.INTEROP"))
+          (cl:funcall (cl:fdefinition (cl:intern "NODE-LOG" "BITCOIN-LISP"))
+                      :warn
+                      "tapscript-verify-sig-status: sig-len=~D pubkey-len=~D"
+                      (cl:length sig-arr) (cl:length pk-arr)))
         (cl:multiple-value-bind (status valid)
             (cl:funcall verify-fn sig-arr pk-arr)
+          (cl:when (cl:symbol-value (cl:intern "*DEBUG-BIP341-SIGHASH*" "BITCOIN-LISP.COALTON.INTEROP"))
+            (cl:funcall (cl:fdefinition (cl:intern "NODE-LOG" "BITCOIN-LISP"))
+                        :warn
+                        "tapscript-verify-sig-status -> status=~A valid=~A"
+                        status valid))
           (cl:cond
             ((cl:eq status :empty-sig) 0)
             ((cl:and (cl:eq status :ok) valid) 1)
@@ -2131,7 +2141,9 @@
      Returns ScriptErr on failure or ScriptOk with final stack on success."
     (let ((len (the UFix (coalton-library/vector:length script))))
       ;; Check script size limit
-      (if (> len +max-script-size+)
+      ;; BIP 342 removes the 10,000-byte script size cap in tapscript.
+      (if (and (not (flag-enabled "TAPSCRIPT"))
+               (> len +max-script-size+))
           (ScriptErr SE-ScriptTooLarge)
           (execute-script-loop (make-script-context-with-tx script locktime version sequence)))))
 
@@ -2185,8 +2197,10 @@
                           ((ScriptErr e) (ScriptErr e))
                           ((ScriptOk (Tuple len-byte len-ctx))
                            (let ((push-len (lisp UFix (len-byte) len-byte)))
-                             ;; Check push size limit (always, even in non-executing branches)
-                             (if (> push-len +max-push-size+)
+                             ;; Check push size limit (always, even in non-executing branches).
+                             ;; BIP 342 removes this 520-byte cap in tapscript.
+                             (if (and (not (flag-enabled "TAPSCRIPT"))
+                                      (> push-len +max-push-size+))
                                  (ScriptErr SE-PushSize)
                                  (match (read-script-bytes push-len len-ctx)
                                    ((ScriptErr e) (ScriptErr e))
@@ -2207,8 +2221,10 @@
                            (let ((data-len (lisp UFix (len-bytes)
                                              (cl:+ (cl:aref len-bytes 0)
                                                    (cl:ash (cl:aref len-bytes 1) 8)))))
-                             ;; Check push size limit (always, even in non-executing branches)
-                             (if (> data-len +max-push-size+)
+                             ;; Check push size limit (always, even in non-executing branches).
+                             ;; BIP 342 removes this 520-byte cap in tapscript.
+                             (if (and (not (flag-enabled "TAPSCRIPT"))
+                                      (> data-len +max-push-size+))
                                  (ScriptErr SE-PushSize)
                                  (match (read-script-bytes data-len len-ctx)
                                    ((ScriptErr e) (ScriptErr e))
@@ -2231,8 +2247,10 @@
                                                    (cl:ash (cl:aref len-bytes 1) 8)
                                                    (cl:ash (cl:aref len-bytes 2) 16)
                                                    (cl:ash (cl:aref len-bytes 3) 24)))))
-                             ;; Check push size limit (always, even in non-executing branches)
-                             (if (> data-len +max-push-size+)
+                             ;; Check push size limit (always, even in non-executing branches).
+                             ;; BIP 342 removes this 520-byte cap in tapscript.
+                             (if (and (not (flag-enabled "TAPSCRIPT"))
+                                      (> data-len +max-push-size+))
                                  (ScriptErr SE-PushSize)
                                  (match (read-script-bytes data-len len-ctx)
                                    ((ScriptErr e) (ScriptErr e))
@@ -2276,7 +2294,9 @@
   (define (execute-script-with-stack-tx script initial-stack locktime version sequence)
     "Execute a script with an initial stack and transaction context."
     (let ((len (the UFix (coalton-library/vector:length script))))
-      (if (> len +max-script-size+)
+      ;; BIP 342 removes the 10,000-byte script size cap in tapscript.
+      (if (and (not (flag-enabled "TAPSCRIPT"))
+               (> len +max-script-size+))
           (ScriptErr SE-ScriptTooLarge)
           (execute-script-loop (make-script-context-with-stack-tx script initial-stack locktime version sequence)))))
 

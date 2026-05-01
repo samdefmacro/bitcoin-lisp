@@ -12,6 +12,15 @@
   "States for Initial Block Download."
   '(member :idle :syncing-headers :syncing-blocks :synced))
 
+(defparameter +max-block-queue-size+ 4000
+  "Maximum number of out-of-order blocks held in the IBD block-queue.
+   Cap exists because each entry holds a fully-deserialized block, which
+   on testnet4 stress blocks can be multi-MB. When the cap is hit, newly
+   arrived out-of-order blocks are re-added to pending-blocks for later
+   re-download instead of being held in memory. 4000 × ~80KB worst-case ≈
+   320MB — fits comfortably in the 8GB heap budget. Smaller caps caused
+   re-download thrashing (peers redeliver dropped blocks immediately).")
+
 (defstruct ibd-context
   "Context for managing Initial Block Download."
   (state :idle :type keyword)
@@ -24,7 +33,7 @@
   ;; Download queue
   (pending-blocks (make-hash-table :test 'equalp) :type hash-table)  ; hash -> height
   (in-flight (make-hash-table :test 'equalp) :type hash-table)       ; hash -> (peer . timestamp)
-  (block-queue '() :type list)  ; blocks received out-of-order, sorted by height
+  (block-queue (make-hash-table :test 'eql) :type hash-table)  ; height -> block, out-of-order
   ;; Configuration
   (max-in-flight 16 :type (unsigned-byte 8))
   (request-timeout 60 :type (unsigned-byte 16))  ; seconds
@@ -320,14 +329,17 @@ Walks the header chain and adds block hashes to the pending queue."
 
 (defun compute-block-download-timeout (num-downloading-peers)
   "Compute block download timeout in seconds based on number of peers.
-Matches Bitcoin Core's formula (net_processing.cpp:6113-6122):
-  timeout = block_interval * (BASE + PER_PEER * other_peers)
-With BASE=1, PER_PEER=0.5, block_interval=600s (10 min)."
-  (let* ((block-interval 600)  ; 10 minutes
-         (base 1.0)
-         (per-peer 0.5)
+Matches Bitcoin Core's actual constants from net_processing.cpp:
+  BLOCK_DOWNLOAD_TIMEOUT_BASE = 30 s
+  BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 5 s
+  timeout = base + per_peer * other_peers
+With 8 peers ≈ 65s. The previous formula used a 600s block_interval scale,
+giving 2700s — far too long, so timed-out in-flight blocks would never retry
+and IBD would stall whenever a peer dropped a request."
+  (let* ((base 30)
+         (per-peer 5)
          (other-peers (max 0 (1- num-downloading-peers))))
-    (round (* block-interval (+ base (* per-peer other-peers))))))
+    (+ base (* per-peer other-peers))))
 
 (defun get-timed-out-requests ()
   "Get list of block hashes that have timed out."
@@ -385,14 +397,29 @@ When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
 (defun request-blocks-from-peers (peers chain-state)
   "Request blocks from multiple peers, distributing the load.
 Enforces per-peer in-flight limits (like Bitcoin Core's
-MAX_BLOCKS_IN_TRANSIT_PER_PEER) rather than a single global limit."
+MAX_BLOCKS_IN_TRANSIT_PER_PEER) rather than a single global limit.
+
+Applies backpressure: when the out-of-order block-queue is at capacity,
+new requests are paused so peers do not deliver blocks we'd just drop +
+re-request, which causes duplicate-delivery thrash and wasted bandwidth."
   (unless (and *ibd-context* peers)
     (return-from request-blocks-from-peers 0))
 
-  ;; First, handle any timed out requests (with peer tracking)
+  ;; Always retry timed-out requests first — even under backpressure. Otherwise
+  ;; in-flight requests that timed out (peer dropped, request lost) stay stuck
+  ;; forever once the queue fills, including the very block we need to advance.
   (let ((retried (retry-timed-out-requests peers)))
     (when (> retried 0)
       (bitcoin-lisp:log-warn "Retrying ~D timed out block requests" retried)))
+
+  ;; Backpressure: cap NEW requests so block-queue + in-flight never exceeds the
+  ;; cap. This means blocks already in-flight always fit in the queue when they
+  ;; arrive — no drops, no re-add-to-pending. Validation drains the queue;
+  ;; new requests resume as soon as headroom opens.
+  (let ((queue-load (+ (hash-table-count (ibd-context-block-queue *ibd-context*))
+                       (hash-table-count (ibd-context-in-flight *ibd-context*)))))
+    (when (>= queue-load +max-block-queue-size+)
+      (return-from request-blocks-from-peers 0)))
 
   (let* ((max-per-peer (ibd-context-max-in-flight *ibd-context*))
          (ready-peers (sort (remove-if-not (lambda (p) (eq (peer-state p) :ready)) peers)
@@ -457,38 +484,46 @@ MAX_BLOCKS_IN_TRANSIT_PER_PEER) rather than a single global limit."
 
 ;;;; Progress Reporting
 
-(defun ibd-progress ()
-  "Return a plist with current IBD progress."
+(defun ibd-progress (&optional chain-state)
+  "Return a plist with current IBD progress.
+   When CHAIN-STATE is given, the headline progress is reported as
+   current-validated-height / target, which is what users care about and
+   stays meaningful across process restarts. Without it, falls back to the
+   per-session blocks-received counter, which resets to 0 each restart."
   (unless *ibd-context*
     (return-from ibd-progress nil))
 
   (let* ((ctx *ibd-context*)
          (elapsed-secs (/ (- (get-internal-real-time) (ibd-context-start-time ctx))
                           internal-time-units-per-second))
-         (blocks (ibd-context-blocks-received ctx))
+         (received (ibd-context-blocks-received ctx))
          (target (ibd-context-target-height ctx))
+         (current-height (if chain-state
+                             (bitcoin-lisp.storage:current-height chain-state)
+                             received))
          (pending (hash-table-count (ibd-context-pending-blocks ctx)))
          (in-flight (hash-table-count (ibd-context-in-flight ctx))))
     (list :state (ibd-context-state ctx)
           :headers-received (ibd-context-headers-received ctx)
-          :blocks-received blocks
+          :blocks-received received
+          :current-height current-height
           :target-height target
           :pending-blocks pending
           :in-flight-blocks in-flight
           :elapsed-seconds (round elapsed-secs)
           :blocks-per-second (if (> elapsed-secs 0)
-                                 (/ blocks elapsed-secs)
+                                 (/ received elapsed-secs)
                                  0)
           :progress-percent (if (> target 0)
-                                (* 100.0 (/ blocks target))
+                                (* 100.0 (/ current-height target))
                                 0))))
 
-(defun report-ibd-progress ()
+(defun report-ibd-progress (&optional chain-state)
   "Log current IBD progress."
-  (let ((progress (ibd-progress)))
+  (let ((progress (ibd-progress chain-state)))
     (when progress
       (bitcoin-lisp:log-info "IBD Progress: ~D/~D blocks (~,1F%), ~,1F blocks/sec, ~D pending, ~D in-flight"
-                             (getf progress :blocks-received)
+                             (getf progress :current-height)
                              (getf progress :target-height)
                              (getf progress :progress-percent)
                              (getf progress :blocks-per-second)
@@ -541,6 +576,9 @@ Returns the number of blocks downloaded."
 
     ;; Queue all blocks from current height to header tip
     (let ((header-tip (ibd-context-header-tip-height ctx)))
+      ;; Reflect the real chain tip in the progress reporter — `target-height`
+      ;; was previously set to the small `max-blocks` cap from sync-blockchain.
+      (setf (ibd-context-target-height ctx) header-tip)
       (queue-blocks-for-download chain-state (1+ start-height) header-tip))
 
     ;; Download blocks
@@ -614,7 +652,7 @@ Returns the number of blocks downloaded."
                  ;; Periodic progress report
                  (let ((now (get-internal-real-time)))
                    (when (> (- now last-report-time) report-interval)
-                     (report-ibd-progress)
+                     (report-ibd-progress chain-state)
                      (setf last-report-time now))))))
 
     ;; Done
@@ -786,14 +824,16 @@ After connecting, drains the queue of any children that can now be connected."
                     (bitcoin-lisp:log-error "Block ~D validation failed: ~A" height error)
                     nil))))
 
-          ;; Out of order - queue for later
+          ;; Out of order - queue for later. Backpressure on the request side
+          ;; ensures (queue + in-flight) never exceeds +max-block-queue-size+,
+          ;; so we always have room for an in-flight block to land here.
           (progn
             (bitcoin-lisp:log-debug "Block ~D received out of order (current: ~D)"
                                     height current-height)
-            ;; Store in queue for later processing (avoid duplicates)
             (when *ibd-context*
-              (unless (find height (ibd-context-block-queue *ibd-context*) :key #'car)
-                (push (cons height block) (ibd-context-block-queue *ibd-context*))))
+              (let ((queue (ibd-context-block-queue *ibd-context*)))
+                (unless (gethash height queue)  ; skip duplicates
+                  (setf (gethash height queue) block))))
             nil)))))
 
 (defun drain-block-queue (chain-state utxo-set block-store &key fee-estimator recent-rejects)
@@ -807,15 +847,12 @@ Repeats until no more queued blocks can be connected."
       (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
              (next-height (1+ current-height))
              (queue (ibd-context-block-queue *ibd-context*))
-             (match (find next-height queue :key #'car)))
-        (unless match
+             (block (gethash next-height queue)))
+        (unless block
           (return drained))
-        ;; Remove from queue
-        (setf (ibd-context-block-queue *ibd-context*)
-              (remove match queue :count 1))
+        (remhash next-height queue)
         ;; Try to connect
-        (let* ((block (cdr match))
-               (current-time (bitcoin-lisp.serialization:get-unix-time))
+        (let* ((current-time (bitcoin-lisp.serialization:get-unix-time))
                (skip-scripts (<= next-height checkpoint-height)))
           (multiple-value-bind (valid error)
               (bitcoin-lisp.validation:validate-block

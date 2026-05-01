@@ -393,7 +393,17 @@ Returns the node instance."
           (bt:make-thread
            (lambda ()
              (handler-case
-                 (progn
+                 (handler-bind
+                     ((error
+                        (lambda (c)
+                          ;; handler-bind keeps the stack live; backtrace here
+                          ;; points at the actual error site. handler-case
+                          ;; (outer) then unwinds.
+                          (log-error "Sync thread error: ~A" c)
+                          #+sbcl
+                          (let ((bt (with-output-to-string (s)
+                                      (sb-debug:print-backtrace :stream s :count 50))))
+                            (log-error "Sync thread backtrace:~%~A" bt)))))
                    ;; Initial connection
                    (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
                    (loop while (node-running *node*)
@@ -403,15 +413,19 @@ Returns the node instance."
                                   (unwind-protect
                                        (sync-blockchain *node*)
                                     (setf (node-syncing *node*) nil))
-                                  ;; Check if we've caught up
+                                  ;; Check if we've caught up. Only declare
+                                  ;; "complete" when we actually have a peer to
+                                  ;; compare heights with — otherwise all peers
+                                  ;; may have just disconnected (stalling under
+                                  ;; slow validation), and the bare height test
+                                  ;; would falsely conclude we're synced.
                                   (let* ((best-peer (find-best-peer *node*))
-                                         (peer-height (if best-peer
-                                                          (bitcoin-lisp.networking:peer-start-height
-                                                           best-peer)
-                                                          0))
                                          (our-height (bitcoin-lisp.storage:current-height
                                                       (node-chain-state *node*))))
-                                    (when (>= our-height peer-height)
+                                    (when (and best-peer
+                                               (>= our-height
+                                                   (bitcoin-lisp.networking:peer-start-height
+                                                    best-peer)))
                                       (log-info "Sync complete at height ~D" our-height)
                                       (return)))
                                   ;; Replace any peers lost during sync
@@ -422,12 +436,40 @@ Returns the node instance."
                                   (sleep 5)
                                   (connect-to-peers *node* max-peers
                                                     :timeout 30 :min-peers 1)))))
-               (error (c)
-                 (log-error "Sync thread error: ~A" c))))
+               (error () nil)))
            :name "bitcoin-sync-thread")))
 
+  (install-shutdown-handler)
   (log-info "Node started successfully")
   *node*)
+
+(defun install-shutdown-handler ()
+  "Trap SIGTERM and SIGINT so kill <pid> / Ctrl-C calls stop-node and persists
+   chain state and UTXO set before exit. Without this, SIGKILL is the only way
+   to stop a long-running node and IBD must restart from genesis on next boot.
+
+   Also installs a fail-fast debugger hook: any unhandled error (including
+   heap-exhausted) logs a stack and exits non-zero rather than dropping into
+   LDB on a tty no one is reading."
+  #+sbcl
+  (let ((handler
+          (lambda (&rest _)
+            (declare (ignore _))
+            (format *error-output* "~&[shutdown] caught signal — saving state~%")
+            (ignore-errors (stop-node))
+            (sb-ext:exit :code 0))))
+    (sb-sys:enable-interrupt sb-unix:sigterm handler)
+    (sb-sys:enable-interrupt sb-unix:sigint handler))
+  #+sbcl
+  (setf sb-ext:*invoke-debugger-hook*
+        (lambda (condition hook)
+          (declare (ignore hook))
+          (ignore-errors
+            (log-error "Fatal: ~A" condition)
+            (let ((bt (with-output-to-string (s)
+                        (sb-debug:print-backtrace :stream s :count 30))))
+              (log-error "Backtrace:~%~A" bt)))
+          (sb-ext:exit :code 1))))
 
 (defun stop-node ()
   "Stop the running Bitcoin node."
@@ -447,7 +489,7 @@ Returns the node instance."
              (bt:thread-alive-p (node-sync-thread *node*)))
     (log-info "Waiting for sync thread to stop...")
     (let ((deadline (+ (get-internal-real-time)
-                       (* 5 internal-time-units-per-second))))
+                       (* 30 internal-time-units-per-second))))
       (loop while (and (bt:thread-alive-p (node-sync-thread *node*))
                        (< (get-internal-real-time) deadline))
             do (sleep 0.1))
