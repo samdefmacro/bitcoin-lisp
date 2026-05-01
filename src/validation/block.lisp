@@ -483,19 +483,40 @@ HEIGHT is used to determine which script verification flags to enable."
         (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
     (loop for tx in (rest transactions)  ; skip coinbase
           for tx-idx from 1
-          do (let ((bitcoin-lisp.coalton.interop:*precomputed-sighash*
-                     (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx)))
-               (loop for input in (bitcoin-lisp.serialization:transaction-inputs tx)
+          do (let* ((tx-inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+                    (spent-utxos (collect-spent-utxos tx-inputs utxo-set))
+                    (bitcoin-lisp.coalton.interop:*precomputed-sighash*
+                      (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
+                    (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
+               (loop for input in tx-inputs
                      for input-idx from 0
-                     do (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                               (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-                               (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
-                               (utxo (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)))
-                          (when utxo
-                            (unless (validate-input-script tx input-idx utxo)
-                              (return-from validate-block-scripts
-                                (values nil :script-failed))))))))
+                     for utxo = (and spent-utxos (aref spent-utxos input-idx))
+                     when utxo
+                       do (unless (validate-input-script tx input-idx utxo)
+                            ;; Re-run with BIP 341 SigMsg debug to capture preimage
+                            (let ((bitcoin-lisp.coalton.interop:*debug-bip341-sighash* t))
+                              (validate-input-script tx input-idx utxo))
+                            (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                                  (witness (nth input-idx
+                                                (bitcoin-lisp.serialization:transaction-witness tx))))
+                              (bitcoin-lisp:log-warn
+                               "SCRIPT-FAILED: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D scriptpubkey=~A scriptsig=~A witness-items=~D witness=~A flags=~A"
+                               height tx-idx input-idx
+                               (bitcoin-lisp.crypto:bytes-to-hex
+                                (bitcoin-lisp.serialization:outpoint-hash prevout))
+                               (bitcoin-lisp.serialization:outpoint-index prevout)
+                               (bitcoin-lisp.crypto:bytes-to-hex
+                                (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
+                               (bitcoin-lisp.crypto:bytes-to-hex
+                                (bitcoin-lisp.serialization:tx-in-script-sig input))
+                               (length witness)
+                               (format nil "[~{~A~^,~}]"
+                                       (mapcar #'bitcoin-lisp.crypto:bytes-to-hex witness))
+                               bitcoin-lisp.coalton.interop:*script-flags*))
+                            (return-from validate-block-scripts
+                              (values nil :script-failed))))))
     (values t nil)))
+
 
 ;;;; Witness commitment validation (BIP 141)
 

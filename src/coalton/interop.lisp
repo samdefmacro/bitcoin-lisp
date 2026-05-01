@@ -73,6 +73,8 @@
    #:script-is-push-only-p
    ;; Transaction context for block validation
    #:*current-tx*
+   #:*current-spent-utxos*
+   #:*debug-bip341-sighash*
    #:*current-input-index*
    #:*debug-checksig*
    #:*current-script-code*
@@ -306,6 +308,15 @@
 (defvar *current-input-index* 0
   "The index of the input currently being validated (0-based).")
 
+(defvar *current-spent-utxos* nil
+  "Vector of utxo-entry for every input of *current-tx*, in input order.
+   Required for BIP 341 (Taproot) sighash, which hashes spent amounts and
+   spent scriptPubKeys across all inputs. NIL for unit-test paths that use
+   the synthetic credit transaction.")
+
+(defvar *debug-bip341-sighash* nil
+  "When non-NIL, log every BIP 341 SigMsg preimage to compare with reference.")
+
 (defvar *current-script-code* nil
   "The script code to use for sighash computation. For P2SH this is the redeemScript,
    for legacy this is the scriptPubKey with OP_CODESEPARATOR handled.")
@@ -319,9 +330,17 @@
 ;;; Caches hash components shared across all inputs of a transaction.
 
 (defstruct precomputed-sighash-data
+  ;; BIP 143 (SegWit v0): double-SHA256 of all prevouts/sequences/outputs.
   (hash-prevouts nil :type (or null (simple-array (unsigned-byte 8) (*))))
   (hash-sequence nil :type (or null (simple-array (unsigned-byte 8) (*))))
-  (hash-outputs-all nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+  (hash-outputs-all nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  ;; BIP 341 (Taproot): single-SHA256 of the same data plus spent-amounts and
+  ;; spent-scriptPubKeys. Populated only when spent UTXOs are available.
+  (sha-prevouts nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (sha-sequences nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (sha-outputs nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (sha-amounts nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (sha-script-pubkeys nil :type (or null (simple-array (unsigned-byte 8) (*)))))
 
 (defvar *precomputed-sighash* nil
   "Per-transaction precomputed sighash data. Bound once before validating inputs.")
@@ -344,23 +363,46 @@
       (write-varint (length script) stream)
       (loop for b across script do (write-byte b stream)))))
 
-(defun init-precomputed-sighash (tx)
-  "Initialize precomputed sighash data for TX. Call once per transaction."
-  (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-        (outputs (bitcoin-lisp.serialization:transaction-outputs tx)))
+(defun init-precomputed-sighash (tx &optional spent-utxos)
+  "Initialize precomputed sighash data for TX. Call once per transaction.
+   When SPENT-UTXOS (vector of utxo-entry) is provided, also populate the
+   BIP 341 single-SHA256 fields including sha-amounts and sha-script-pubkeys
+   which are needed for Taproot validation."
+  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
+         (prevouts-bytes
+           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+             (serialize-all-prevouts inputs s)))
+         (sequences-bytes
+           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+             (serialize-all-sequences inputs s)))
+         (outputs-bytes
+           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+             (serialize-all-outputs outputs s)))
+         (sha-prevouts (bitcoin-lisp.crypto:sha256 prevouts-bytes))
+         (sha-sequences (bitcoin-lisp.crypto:sha256 sequences-bytes))
+         (sha-outputs (bitcoin-lisp.crypto:sha256 outputs-bytes)))
     (make-precomputed-sighash-data
-     :hash-prevouts
-       (bitcoin-lisp.crypto:hash256
-        (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-          (serialize-all-prevouts inputs s)))
-     :hash-sequence
-       (bitcoin-lisp.crypto:hash256
-        (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-          (serialize-all-sequences inputs s)))
-     :hash-outputs-all
-       (bitcoin-lisp.crypto:hash256
-        (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-          (serialize-all-outputs outputs s))))))
+     :hash-prevouts (bitcoin-lisp.crypto:sha256 sha-prevouts)
+     :hash-sequence (bitcoin-lisp.crypto:sha256 sha-sequences)
+     :hash-outputs-all (bitcoin-lisp.crypto:sha256 sha-outputs)
+     :sha-prevouts sha-prevouts
+     :sha-sequences sha-sequences
+     :sha-outputs sha-outputs
+     :sha-amounts
+       (when spent-utxos
+         (bitcoin-lisp.crypto:sha256
+          (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+            (loop for utxo across spent-utxos
+                  do (write-u64-le (bitcoin-lisp.storage:utxo-entry-value utxo) s)))))
+     :sha-script-pubkeys
+       (when spent-utxos
+         (bitcoin-lisp.crypto:sha256
+          (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+            (loop for utxo across spent-utxos
+                  for script = (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)
+                  do (write-varint (length script) s)
+                     (loop for b across script do (write-byte b s)))))))))
 
 (defvar *witness-v0-mode* nil
   "When non-nil, verify-checksig uses BIP 143 sighash instead of legacy.
@@ -462,7 +504,9 @@
                   locktime version sequence)))
     (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
         (values t (bitcoin-lisp.coalton.script:get-ok-stack result))
-        (values nil :error))))
+        (let ((err (bitcoin-lisp.coalton.script:script-result-error result)))
+          (bitcoin-lisp:log-warn "run-scripts-with-p2sh ScriptErr: ~A" err)
+          (values nil :error)))))
 
 (defun verify-script (script-sig script-pubkey &key witness amount)
   "Verify a script following Bitcoin Core's VerifyScript flow exactly.
@@ -773,6 +817,13 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
     ;; Compute BIP 341 sighash with tapleaf extension
     (let ((sighash (compute-bip341-sighash *tapscript-amount* sighash-type
                                             *tapscript-leaf-hash* 0)))
+      (when *debug-bip341-sighash*
+        (bitcoin-lisp:log-warn "TAPSCRIPT-CHECKSIG: sighash=~A sig=~A pubkey=~A current-tx-bound=~A spent-utxos-bound=~A"
+                               (bitcoin-lisp.crypto:bytes-to-hex sighash)
+                               (bitcoin-lisp.crypto:bytes-to-hex sig64)
+                               (bitcoin-lisp.crypto:bytes-to-hex pubkey-bytes)
+                               (if *current-tx* "yes" "NO")
+                               (if *current-spent-utxos* "yes" "NO")))
       ;; Verify Schnorr signature
       (if (cached-verify-schnorr sighash sig64 pubkey-bytes)
           (values :ok t)
@@ -827,7 +878,9 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
              (when negative
                (setf (car (last bytes))
                      (logior (car (last bytes)) #x80))))
-         (coerce bytes '(vector (unsigned-byte 8)))))))
+         ;; General vector (VECTOR T), not (VECTOR (UNSIGNED-BYTE 8)) — the
+         ;; result is consumed by Coalton via (Vector U8) which expects VECTOR T.
+         (coerce bytes 'vector)))))
 
 (defun run-tapscript (script script-inputs leaf-hash amount internal-pubkey)
   "Execute a Tapscript with BIP 342 rules.
@@ -856,12 +909,27 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
            (setf *tapscript-internal-pubkey* internal-pubkey)
 
            ;; Convert script-inputs to Coalton stack (list of vectors)
-           ;; Script-inputs is a list of byte arrays, Coalton stack is a list of vectors
+           ;; Script-inputs is a list of byte arrays, Coalton stack is a list of vectors.
+           ;; Pass real tx context so CLTV/CSV inside tapscript see the actual
+           ;; nLockTime/version/nSequence rather than the no-tx defaults.
            (let* ((script-vec (cl-array-to-coalton-vector script))
                   (initial-stack (mapcar #'cl-array-to-coalton-vector script-inputs))
-                  (result (bitcoin-lisp.coalton.script:execute-script-with-stack
-                           script-vec
-                           initial-stack)))
+                  (locktime (if *current-tx*
+                                (bitcoin-lisp.serialization:transaction-lock-time *current-tx*)
+                                0))
+                  (version (if *current-tx*
+                               (bitcoin-lisp.serialization:transaction-version *current-tx*)
+                               1))
+                  (sequence (if (and *current-tx*
+                                     (bitcoin-lisp.serialization:transaction-inputs *current-tx*)
+                                     (< *current-input-index*
+                                        (length (bitcoin-lisp.serialization:transaction-inputs *current-tx*))))
+                                (bitcoin-lisp.serialization:tx-in-sequence
+                                 (nth *current-input-index*
+                                      (bitcoin-lisp.serialization:transaction-inputs *current-tx*)))
+                                #xFFFFFFFF))
+                  (result (bitcoin-lisp.coalton.script:execute-script-with-stack-tx
+                           script-vec initial-stack locktime version sequence)))
              ;; Check result
              (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
                  (let ((final-stack (bitcoin-lisp.coalton.script:get-ok-stack result)))
@@ -869,7 +937,10 @@ Returns T or NIL (not an integer position) for Coalton Boolean compatibility."
                    (if (stack-top-truthy-p final-stack)
                        (values t nil)
                        (values nil :script-eval-false)))
-                 (values nil :script-error))))
+                 (let ((err (bitcoin-lisp.coalton.script:script-result-error result)))
+                   (when *debug-bip341-sighash*
+                     (bitcoin-lisp:log-warn "run-tapscript ScriptErr: ~A" err))
+                   (values nil :script-error)))))
       ;; Restore context
       (setf *script-flags* old-flags)
       (setf *tapscript-leaf-hash* old-leaf-hash)
@@ -2331,7 +2402,12 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
   (let* ((witness-rev (reverse witness))
          (control-block (first witness-rev))
          (script (second witness-rev))
-         (script-inputs (reverse (cddr witness-rev))))
+         ;; script-inputs is consumed by run-tapscript as the initial Coalton
+         ;; stack. Coalton stack uses Cons semantics — head of list = stack top.
+         ;; Witness item N (last before script) must be on top of stack;
+         ;; item 1 must be at bottom. cddr of the REVERSED witness already
+         ;; gives last-witness-first order; do NOT reverse it again.
+         (script-inputs (cddr witness-rev)))
 
     ;; Parse control block
     (multiple-value-bind (leaf-version output-parity internal-pubkey merkle-path)
@@ -2406,8 +2482,96 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 
 (defun compute-bip341-sighash (amount sighash-type &optional tapleaf-hash key-version)
   "Compute BIP 341 signature hash for Taproot.
-   This implements the SigMsg serialization from BIP 341 Annex G.
-   TAPLEAF-HASH and KEY-VERSION are used for script path spending."
+   Dispatches to -real when validating a real transaction (*current-tx* bound),
+   or -test when running script_tests.json fixtures."
+  (if (and *current-tx* *current-spent-utxos*)
+      (compute-bip341-sighash-real sighash-type tapleaf-hash key-version)
+      (compute-bip341-sighash-test amount sighash-type tapleaf-hash key-version)))
+
+(defun compute-bip341-sighash-real (sighash-type tapleaf-hash key-version)
+  "Compute BIP 341 sighash from real transaction data.
+   Uses *current-tx*, *current-input-index*, *current-spent-utxos*.
+   Implements BIP 341 SigMsg per Annex G; tapleaf-hash + key-version trigger
+   the script-path tail. ANYONECANPAY and SIGHASH_NONE/SINGLE per spec."
+  (let* ((tx *current-tx*)
+         (input-index *current-input-index*)
+         (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
+         (spent-utxos *current-spent-utxos*)
+         (base-type (logand sighash-type #x1f))
+         (anyonecanpay (plusp (logand sighash-type #x80)))
+         (current-input (nth input-index inputs))
+         (current-prevout (bitcoin-lisp.serialization:tx-in-previous-output current-input))
+         (current-spent (aref spent-utxos input-index))
+         (precomp (or *precomputed-sighash* (init-precomputed-sighash tx spent-utxos)))
+         (hash-prevouts
+           (unless anyonecanpay
+             (precomputed-sighash-data-sha-prevouts precomp)))
+         (hash-amounts
+           (unless anyonecanpay
+             (precomputed-sighash-data-sha-amounts precomp)))
+         (hash-script-pubkeys
+           (unless anyonecanpay
+             (precomputed-sighash-data-sha-script-pubkeys precomp)))
+         (hash-sequences
+           (unless anyonecanpay
+             (precomputed-sighash-data-sha-sequences precomp)))
+         (hash-outputs
+           (when (or (= base-type 0) (= base-type 1))  ; SIGHASH_DEFAULT or SIGHASH_ALL
+             (precomputed-sighash-data-sha-outputs precomp)))
+         (single-output-hash
+           (when (and (= base-type 3) (< input-index (length outputs)))
+             (bitcoin-lisp.crypto:sha256
+              (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+                (serialize-all-outputs (list (nth input-index outputs)) s)))))
+         (ext-flag (if tapleaf-hash 1 0))
+         (spend-type (ash ext-flag 1)))  ; annex bit 0 not yet supported
+    (let ((preimage
+            (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
+              (write-byte 0 s)                                                ; epoch
+              (write-byte sighash-type s)                                     ; hash_type
+              (write-u32-le (bitcoin-lisp.serialization:transaction-version tx) s)
+              (write-u32-le (bitcoin-lisp.serialization:transaction-lock-time tx) s)
+              (unless anyonecanpay
+                (loop for b across hash-prevouts do (write-byte b s))
+                (loop for b across hash-amounts do (write-byte b s))
+                (loop for b across hash-script-pubkeys do (write-byte b s))
+                (loop for b across hash-sequences do (write-byte b s)))
+              (when hash-outputs
+                (loop for b across hash-outputs do (write-byte b s)))
+              (write-byte spend-type s)
+              (cond
+                (anyonecanpay
+                 (loop for b across (bitcoin-lisp.serialization:outpoint-hash current-prevout)
+                       do (write-byte b s))
+                 (write-u32-le (bitcoin-lisp.serialization:outpoint-index current-prevout) s)
+                 (write-u64-le (bitcoin-lisp.storage:utxo-entry-value current-spent) s)
+                 (let ((script (bitcoin-lisp.storage:utxo-entry-script-pubkey current-spent)))
+                   (write-varint (length script) s)
+                   (loop for b across script do (write-byte b s)))
+                 (write-u32-le (bitcoin-lisp.serialization:tx-in-sequence current-input) s))
+                (t
+                 (write-u32-le input-index s)))
+              (when single-output-hash
+                (loop for b across single-output-hash do (write-byte b s)))
+              (when tapleaf-hash
+                (loop for b across tapleaf-hash do (write-byte b s))
+                (write-byte (or key-version 0) s)
+                (write-u32-le #xffffffff s)))))
+      (when *debug-bip341-sighash*
+        (bitcoin-lisp:log-warn "BIP341-SIGMSG: hashtype=~2,'0X tapleaf=~A preimage(~D)=~A"
+                               sighash-type
+                               (if tapleaf-hash
+                                   (bitcoin-lisp.crypto:bytes-to-hex tapleaf-hash)
+                                   "nil")
+                               (length preimage)
+                               (bitcoin-lisp.crypto:bytes-to-hex preimage)))
+      (bitcoin-lisp.crypto:tagged-hash "TapSighash" preimage))))
+
+(defun compute-bip341-sighash-test (amount sighash-type &optional tapleaf-hash key-version)
+  "Compute BIP 341 signature hash using a synthetic credit transaction.
+   Used by script_tests.json fixtures where there is no real *current-tx*.
+   This implements the SigMsg serialization from BIP 341 Annex G."
   (let* ((base-type (logand sighash-type #x1f))
          (anyonecanpay (plusp (logand sighash-type #x80)))
          ;; Compute credit txid for outpoint (same as BIP 143)
