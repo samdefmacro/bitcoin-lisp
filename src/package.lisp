@@ -663,5 +663,6 @@
    #:enable-console-logging
    #:disable-console-logging
    #:start-file-logging
-   #:stop-file-logging))
+   #:stop-file-logging
+   #:maybe-periodic-flush))
 

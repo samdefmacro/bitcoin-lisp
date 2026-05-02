@@ -159,10 +159,21 @@ PREVIOUS-UTXOS should be a list of (txid index entry) for restored UTXOs."
 
 ;;; Atomic file I/O with CRC32 integrity
 
+(defun fsync-file (path)
+  "Force the OS to flush PATH's data to durable storage. Without this,
+   a temp+rename atomic write can still leave the destination empty after
+   a crash because the kernel hadn't flushed the buffered writes yet."
+  #+sbcl
+  (handler-case
+      (with-open-file (s path :direction :input
+                              :element-type '(unsigned-byte 8))
+        (sb-posix:fsync (sb-sys:fd-stream-fd s)))
+    (error () nil)))
+
 (defun save-file-with-crc32 (path write-fn)
   "Write data to PATH atomically with CRC32 integrity.
 WRITE-FN receives a stream and writes the payload (including magic/version/count).
-Uses temp file + rename for atomicity."
+Uses temp file + fsync + rename for crash-safe atomicity."
   (ensure-directories-exist path)
   (let ((tmp-path (make-pathname :defaults path
                                  :type (concatenate 'string
@@ -175,7 +186,11 @@ Uses temp file + rename for atomicity."
                            :if-exists :supersede
                            :element-type '(unsigned-byte 8))
         (write-sequence all-bytes out)
-        (write-sequence (compute-crc32 all-bytes) out))
+        (write-sequence (compute-crc32 all-bytes) out)
+        (finish-output out))
+      ;; fsync the data before rename — guarantees the new file is on disk
+      ;; before any other process (or our crash) sees the rename.
+      (fsync-file tmp-path)
       (rename-file tmp-path path))))
 
 (defun load-file-with-crc32 (path min-size)

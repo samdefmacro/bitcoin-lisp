@@ -307,6 +307,22 @@ Returns the node instance."
       (log-info "Loaded persisted UTXO set: ~D entries"
                 (bitcoin-lisp.storage:utxo-count (node-utxo-set *node*)))))
 
+  ;; Consistency check: chainstate height > 0 but UTXO set empty/tiny means
+  ;; chainstate.dat survived but utxoset.dat didn't (e.g. crash mid-save). Any
+  ;; subsequent block validation will MISSING-INPUT on the very next tx. Reset
+  ;; to genesis so normal sync replays cleanly. Bitcoin Core's equivalent is
+  ;; "-reindex-chainstate" which rebuilds UTXOs from blocks; we punt to a
+  ;; full re-sync, but at least we detect and recover automatically.
+  (let ((cs-height (bitcoin-lisp.storage:current-height (node-chain-state *node*)))
+        (utxos (bitcoin-lisp.storage:utxo-count (node-utxo-set *node*))))
+    (when (and (> cs-height 100)
+               (< utxos (max 100 (floor cs-height 100))))  ; sanity threshold
+      (log-warn "Chainstate (height ~D) inconsistent with UTXO set (~D entries) — resetting to genesis"
+                cs-height utxos)
+      (let ((genesis-hash (bitcoin-lisp.storage:network-genesis-hash network)))
+        (bitcoin-lisp.storage:update-chain-tip (node-chain-state *node*) genesis-hash 0))
+      (clrhash (bitcoin-lisp.storage::utxo-set-entries (node-utxo-set *node*)))))
+
   ;; Load persisted header index if available
   (when (bitcoin-lisp.storage:load-header-index (node-chain-state *node*))
     (log-info "Loaded persisted header index: ~D entries"
@@ -446,6 +462,33 @@ Returns the node instance."
   (install-shutdown-handler)
   (log-info "Node started successfully")
   *node*)
+
+(defparameter +flush-every-n-blocks+ 1000
+  "Periodically flush chainstate + UTXO set to disk every N connected blocks
+   so a hard crash loses at most N blocks of work, not the whole sync session.
+   Bitcoin Core does the same in FlushStateToDisk (validation.cpp).")
+
+(defvar *blocks-since-flush* 0
+  "Counter incremented per connected block; reset to 0 when a flush runs.")
+
+(defun maybe-periodic-flush ()
+  "Flush chainstate, UTXO set, and header index to disk if N blocks have been
+   connected since last flush. Called from connect-block. Cheap if no flush
+   needed; durable if it does flush (atomic temp+fsync+rename inside save-*)."
+  (when (and *node* (>= (incf *blocks-since-flush*) +flush-every-n-blocks+))
+    (setf *blocks-since-flush* 0)
+    (handler-case
+        (#+sbcl sb-sys:without-interrupts
+         #-sbcl progn
+          (when (node-chain-state *node*)
+            (bitcoin-lisp.storage:save-state (node-chain-state *node*))
+            (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
+          (when (node-utxo-set *node*)
+            (bitcoin-lisp.storage:save-utxo-set
+             (node-utxo-set *node*)
+             (bitcoin-lisp.storage:utxo-set-file-path (node-data-directory *node*)))))
+      (error (c)
+        (log-warn "Periodic flush failed: ~A" c)))))
 
 (defun install-shutdown-handler ()
   "Trap SIGTERM and SIGINT so kill <pid> / Ctrl-C calls stop-node and persists

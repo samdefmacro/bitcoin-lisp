@@ -1146,6 +1146,7 @@ Handles chain reorganizations when a competing chain has more work."
            (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
              (bitcoin-lisp.storage:txindex-add-block tx-index block hash))
            (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height))
+           (bitcoin-lisp:maybe-periodic-flush)
            ;; Automatic block pruning after connecting a new block
            (when (bitcoin-lisp:automatic-pruning-p)
              (let ((pruned (bitcoin-lisp.storage:prune-old-blocks block-store chain-state)))

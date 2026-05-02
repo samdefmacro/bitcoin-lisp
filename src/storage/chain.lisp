@@ -179,59 +179,67 @@ off-by-one (2015 intervals, not 2016)."
   (merge-pathnames "chainstate.dat" (chain-state-base-path state)))
 
 (defun save-state (state)
-  "Save chain state to disk.
-Format: best-block-hash(32) + best-height(4) + pruned-height(4)."
+  "Save chain state to disk atomically with fsync.
+Format: best-block-hash(32) + best-height(4) + pruned-height(4) + CRC32.
+Uses temp + fsync + rename so a crash mid-write never leaves a torn file."
   (let ((path (state-file-path state)))
-    (ensure-directories-exist path)
-    (with-open-file (stream path
-                            :direction :output
-                            :if-exists :supersede
-                            :element-type '(unsigned-byte 8))
-      ;; Write best block hash
-      (write-sequence (chain-state-best-block-hash state) stream)
-      ;; Write best height as 4 bytes
-      (let ((height (chain-state-best-height state)))
-        (write-byte (logand height #xFF) stream)
-        (write-byte (logand (ash height -8) #xFF) stream)
-        (write-byte (logand (ash height -16) #xFF) stream)
-        (write-byte (logand (ash height -24) #xFF) stream))
-      ;; Write pruned height as 4 bytes
-      (let ((pruned-height (chain-state-pruned-height state)))
-        (write-byte (logand pruned-height #xFF) stream)
-        (write-byte (logand (ash pruned-height -8) #xFF) stream)
-        (write-byte (logand (ash pruned-height -16) #xFF) stream)
-        (write-byte (logand (ash pruned-height -24) #xFF) stream)))
+    (save-file-with-crc32
+     path
+     (lambda (stream)
+       (write-sequence (chain-state-best-block-hash state) stream)
+       (let ((height (chain-state-best-height state)))
+         (write-byte (logand height #xFF) stream)
+         (write-byte (logand (ash height -8) #xFF) stream)
+         (write-byte (logand (ash height -16) #xFF) stream)
+         (write-byte (logand (ash height -24) #xFF) stream))
+       (let ((pruned-height (chain-state-pruned-height state)))
+         (write-byte (logand pruned-height #xFF) stream)
+         (write-byte (logand (ash pruned-height -8) #xFF) stream)
+         (write-byte (logand (ash pruned-height -16) #xFF) stream)
+         (write-byte (logand (ash pruned-height -24) #xFF) stream))))
     t))
 
 (defun load-state (state)
-  "Load chain state from disk. Returns T if loaded, NIL if no state exists.
-Backward compatible: old files without pruned-height default to 0."
+  "Load chain state from disk. Returns T if loaded, NIL if no state exists
+or the file failed CRC verification (caller may then rebuild from blocks).
+
+Format on disk now: payload(40 bytes) + CRC32(4 bytes) = 44 bytes.
+Tolerates old 36/40-byte legacy files (no CRC) — falls back to direct read."
   (let ((path (state-file-path state)))
-    (when (probe-file path)
-      (with-open-file (stream path
-                              :direction :input
-                              :element-type '(unsigned-byte 8))
-        (let ((file-size (file-length stream)))
-          ;; Read best block hash
+    (unless (probe-file path)
+      (return-from load-state nil))
+    ;; Try CRC-protected format first.
+    (let ((data (load-file-with-crc32 path 44)))  ; 32+4+4+4
+      (when data
+        (let ((payload (subseq data 0 (- (length data) 4))))
+          (setf (chain-state-best-block-hash state) (subseq payload 0 32))
+          (let ((b0 (aref payload 32)) (b1 (aref payload 33))
+                (b2 (aref payload 34)) (b3 (aref payload 35)))
+            (setf (chain-state-best-height state)
+                  (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
+          (when (>= (length payload) 40)
+            (let ((b0 (aref payload 36)) (b1 (aref payload 37))
+                  (b2 (aref payload 38)) (b3 (aref payload 39)))
+              (setf (chain-state-pruned-height state)
+                    (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))))
+          (return-from load-state t))))
+    ;; Legacy fallback: pre-CRC format (36 or 40 bytes total).
+    (with-open-file (stream path :direction :input :element-type '(unsigned-byte 8))
+      (let ((file-size (file-length stream)))
+        (when (or (= file-size 36) (= file-size 40))
           (let ((hash (make-array 32 :element-type '(unsigned-byte 8))))
             (read-sequence hash stream)
             (setf (chain-state-best-block-hash state) hash))
-          ;; Read best height
-          (let ((b0 (read-byte stream))
-                (b1 (read-byte stream))
-                (b2 (read-byte stream))
-                (b3 (read-byte stream)))
+          (let ((b0 (read-byte stream)) (b1 (read-byte stream))
+                (b2 (read-byte stream)) (b3 (read-byte stream)))
             (setf (chain-state-best-height state)
                   (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
-          ;; Read pruned height if present (backward compat: old files are 36 bytes)
-          (when (>= file-size 40)  ; 32 + 4 + 4
-            (let ((b0 (read-byte stream))
-                  (b1 (read-byte stream))
-                  (b2 (read-byte stream))
-                  (b3 (read-byte stream)))
+          (when (= file-size 40)
+            (let ((b0 (read-byte stream)) (b1 (read-byte stream))
+                  (b2 (read-byte stream)) (b3 (read-byte stream)))
               (setf (chain-state-pruned-height state)
-                    (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))))))
-      t)))
+                    (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))))
+          t)))))
 
 ;;; Header Index Persistence
 
