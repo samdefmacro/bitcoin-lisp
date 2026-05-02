@@ -1,5 +1,9 @@
 (in-package #:bitcoin-lisp)
 
+#+sbcl
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-sprof))
+
 ;;; Bitcoin Node
 ;;;
 ;;; Main entry point for the Bitcoin full node.
@@ -460,6 +464,39 @@ Returns the node instance."
             (sb-ext:exit :code 0))))
     (sb-sys:enable-interrupt sb-unix:sigterm handler)
     (sb-sys:enable-interrupt sb-unix:sigint handler))
+  ;; SIGUSR1 toggles sb-sprof profiling. First USR1: start sampling. Second
+  ;; USR1: stop, write graph + flat report to /data/bitcoin-lisp/logs/profile.txt.
+  ;; Use to identify the hot path during live validation: kill -USR1 <pid> to
+  ;; arm, wait through a heavy block, kill -USR1 <pid> again, then read report.
+  #+sbcl
+  (let ((profiling nil))
+    (sb-sys:enable-interrupt
+     sb-unix:sigusr1
+     (lambda (&rest _)
+       (declare (ignore _))
+       (cond
+         ((not profiling)
+          (sb-sprof:reset)
+          (sb-sprof:start-profiling :max-samples 200000
+                                    :sample-interval 0.001
+                                    :mode :cpu
+                                    :threads :all)
+          (setf profiling t)
+          (log-info "[sprof] profiling started"))
+         (t
+          (sb-sprof:stop-profiling)
+          (with-open-file (s "/data/bitcoin-lisp/logs/profile.txt"
+                             :direction :output
+                             :if-exists :supersede
+                             :if-does-not-exist :create)
+            (let ((*standard-output* s))
+              (format s "=== sb-sprof flat report ===~%")
+              (sb-sprof:report :type :flat :max 60)
+              (format s "~%~%=== sb-sprof graph report ===~%")
+              (sb-sprof:report :type :graph :max 50)))
+          (setf profiling nil)
+          (log-info "[sprof] profile written to /data/bitcoin-lisp/logs/profile.txt")))))
+    (log-info "SIGUSR1 toggles sb-sprof profiling"))
   #+sbcl
   (setf sb-ext:*invoke-debugger-hook*
         (lambda (condition hook)
@@ -489,7 +526,12 @@ Returns the node instance."
              (bt:thread-alive-p (node-sync-thread *node*)))
     (log-info "Waiting for sync thread to stop...")
     (let ((deadline (+ (get-internal-real-time)
-                       (* 30 internal-time-units-per-second))))
+                       ;; 10 minutes — long enough that a single heavy block's
+                       ;; validation finishes and connect-block updates UTXO set
+                       ;; + chain tip atomically, so destroy-thread fallback
+                       ;; (which can corrupt mid-update state) is virtually
+                       ;; never needed.
+                       (* 600 internal-time-units-per-second))))
       (loop while (and (bt:thread-alive-p (node-sync-thread *node*))
                        (< (get-internal-real-time) deadline))
             do (sleep 0.1))
