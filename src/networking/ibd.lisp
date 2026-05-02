@@ -12,6 +12,12 @@
   "States for Initial Block Download."
   '(member :idle :syncing-headers :syncing-blocks :synced))
 
+(defparameter +block-stalling-timeout+ 30
+  "Seconds the next-needed block can be in-flight at one peer before we
+   conclude THAT peer is the bottleneck and disconnect it. Bitcoin Core
+   uses 2s here; we use 30s because testnet4 stress blocks can be
+   multi-MB and take seconds just to transit the wire.")
+
 (defparameter +max-messages-per-peer-per-cycle+ 32
   "How many messages to drain from each peer in one IBD loop iteration.
    Reading just one used to let kernel TCP buffers fill (multi-MB) whenever
@@ -389,6 +395,22 @@ When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
 
 ;;;; Multi-Peer Request Distribution
 
+(defun find-peer-blocking-progress (next-height chain-state)
+  "Return the peer that holds the in-flight request for NEXT-HEIGHT, if any.
+   This is the one peer whose delivery would unblock chain progress; Bitcoin
+   Core's stalling-peer detection focuses solely on this peer."
+  (declare (ignore chain-state))
+  (when *ibd-context*
+    (let ((found nil))
+      (maphash (lambda (hash peer-time)
+                 (declare (ignore hash))
+                 (let* ((entry-height (gethash hash
+                                               (ibd-context-pending-blocks *ibd-context*))))
+                   (when (and entry-height (= entry-height next-height))
+                     (setf found (car peer-time)))))
+               (ibd-context-in-flight *ibd-context*))
+      found)))
+
 (defun count-peer-in-flight (peer)
   "Count in-flight block requests assigned to PEER."
   (let ((count 0))
@@ -658,15 +680,25 @@ Returns the number of blocks downloaded."
                                                    :fee-estimator fee-estimator
                                                    :recent-rejects recent-rejects))))))
 
-                 ;; Evict stalling peers and peers with bad chains
-                 (let ((our-height (bitcoin-lisp.storage:current-height chain-state)))
+                 ;; Stalling detection — Bitcoin Core net_processing.cpp pattern:
+                 ;; Only disconnect the ONE peer whose in-flight request is for
+                 ;; the next-needed block (the "stalling peer") when the chain
+                 ;; hasn't advanced for `+block-stalling-timeout+` seconds. This
+                 ;; correctly distinguishes a peer-side stall from our own
+                 ;; validation slowness. Other peers are left alone.
+                 (let* ((our-height (bitcoin-lisp.storage:current-height chain-state))
+                        (next-height (1+ our-height))
+                        (stalling-peer (find-peer-blocking-progress next-height chain-state)))
+                   (when (and stalling-peer
+                              (eq (peer-state stalling-peer) :ready)
+                              (peer-stalling-p stalling-peer
+                                               :timeout-seconds +block-stalling-timeout+))
+                     (bitcoin-lisp:log-warn
+                      "Disconnecting stalling peer ~A — held block ~D for >~Ds with no progress"
+                      (peer-address stalling-peer) next-height +block-stalling-timeout+)
+                     (handler-case (disconnect-peer stalling-peer) (error () nil)))
+                   ;; Bad-chain peers (height significantly behind us)
                    (dolist (peer (copy-list peers))
-                     (when (and (eq (peer-state peer) :ready)
-                                (> (count-peer-in-flight peer) 0)
-                                (peer-stalling-p peer :timeout-seconds 120))
-                       (bitcoin-lisp:log-warn "Disconnecting stalling peer ~A (no blocks in 120s)"
-                                              (peer-address peer))
-                       (handler-case (disconnect-peer peer) (error () nil)))
                      (when (consider-peer-eviction peer our-height)
                        (bitcoin-lisp:log-warn "Evicting peer ~A (height ~D behind our ~D)"
                                               (peer-address peer)
