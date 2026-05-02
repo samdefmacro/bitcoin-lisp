@@ -1125,8 +1125,13 @@ Handles chain reorganizations when a competing chain has more work."
                                     0)))
 
         (cond
-          ;; New block extends the current best chain (normal case)
+          ;; New block extends the current best chain (normal case).
+          ;; Apply UTXO updates and advance chain tip atomically — without-
+          ;; interrupts defers any pending bt:destroy-thread / SIGTERM until
+          ;; this critical section completes, so saved state on disk is never
+          ;; "chain advanced but UTXOs not applied" or vice versa.
           ((equalp prev-hash current-best-hash)
+           #+sbcl (sb-sys:without-interrupts
            (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                utxo-set block new-height)))
              (store-undo-data hash spent-utxos new-height)
@@ -1140,7 +1145,7 @@ Handles chain reorganizations when a competing chain has more work."
            ;; Update transaction index if enabled
            (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
              (bitcoin-lisp.storage:txindex-add-block tx-index block hash))
-           (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height)
+           (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height))
            ;; Automatic block pruning after connecting a new block
            (when (bitcoin-lisp:automatic-pruning-p)
              (let ((pruned (bitcoin-lisp.storage:prune-old-blocks block-store chain-state)))

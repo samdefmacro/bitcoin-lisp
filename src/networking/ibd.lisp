@@ -12,6 +12,12 @@
   "States for Initial Block Download."
   '(member :idle :syncing-headers :syncing-blocks :synced))
 
+(defparameter +max-messages-per-peer-per-cycle+ 32
+  "How many messages to drain from each peer in one IBD loop iteration.
+   Reading just one used to let kernel TCP buffers fill (multi-MB) whenever
+   validation took a few seconds, then the stalling-peer check would evict
+   peers for OUR slowness. Drain in batches to keep buffers shallow.")
+
 (defparameter +max-block-queue-size+ 4000
   "Maximum number of out-of-order blocks held in the IBD block-queue.
    Cap exists because each entry holds a fully-deserialized block, which
@@ -412,13 +418,18 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
     (when (> retried 0)
       (bitcoin-lisp:log-warn "Retrying ~D timed out block requests" retried)))
 
-  ;; Backpressure: cap NEW requests so block-queue + in-flight never exceeds the
-  ;; cap. This means blocks already in-flight always fit in the queue when they
-  ;; arrive — no drops, no re-add-to-pending. Validation drains the queue;
-  ;; new requests resume as soon as headroom opens.
-  (let ((queue-load (+ (hash-table-count (ibd-context-block-queue *ibd-context*))
-                       (hash-table-count (ibd-context-in-flight *ibd-context*)))))
-    (when (>= queue-load +max-block-queue-size+)
+  ;; Backpressure: cap NEW requests so block-queue + in-flight stays bounded.
+  ;; BUT: always allow requesting the next-needed block, even when at cap.
+  ;; Without this, a single missing block in the queue (lost during a peer
+  ;; retry cycle) deadlocks IBD — validation can't drain the queue past the
+  ;; gap, and backpressure blocks the very re-request that would fill it.
+  (let* ((queue (ibd-context-block-queue *ibd-context*))
+         (queue-load (+ (hash-table-count queue)
+                        (hash-table-count (ibd-context-in-flight *ibd-context*))))
+         (next-needed (1+ (bitcoin-lisp.storage:current-height chain-state)))
+         (gap-block-missing (not (gethash next-needed queue))))
+    (when (and (>= queue-load +max-block-queue-size+)
+               (not gap-block-missing))
       (return-from request-blocks-from-peers 0)))
 
   (let* ((max-per-peer (ibd-context-max-in-flight *ibd-context*))
@@ -607,40 +618,53 @@ Returns the number of blocks downloaded."
                    (setf no-peer-cycles 0)
                    (request-blocks-from-peers peers chain-state))
 
-                 ;; Receive and process messages from all peers
+                 ;; Receive and process messages from all peers. Drain up to
+                 ;; +max-messages-per-peer-per-cycle+ messages per peer per
+                 ;; outer-loop iteration so kernel TCP buffers don't fill up
+                 ;; while we're busy validating an earlier (heavy) block.
                  (dolist (peer peers)
                    (when (eq (peer-state peer) :ready)
-                     (multiple-value-bind (command payload)
-                         (receive-message peer :timeout 1)  ; Short timeout for polling
-                       (when command
-                         (cond
-                           ((string= command "block")
-                            (let* ((block (bitcoin-lisp.serialization:parse-block-payload payload))
-                                   (header (bitcoin-lisp.serialization:bitcoin-block-header block))
-                                   (hash (bitcoin-lisp.serialization:block-header-hash header)))
-                              (mark-block-received hash)
-                              (record-block-received-from-peer peer)
-                              (process-received-block block chain-state utxo-set block-store
-                                                      :fee-estimator fee-estimator
-                                                      :recent-rejects recent-rejects)))
+                     ;; Drain only as long as the socket actually has data ready
+                     ;; (usocket:wait-for-input :timeout 0 is non-blocking). This
+                     ;; lets us pull all queued messages in the batch without
+                     ;; ever timing out mid-payload, then exit immediately when
+                     ;; nothing is left to read.
+                     (loop repeat +max-messages-per-peer-per-cycle+
+                           while (usocket:wait-for-input
+                                  (bitcoin-lisp.networking::connection-socket
+                                   (peer-connection peer))
+                                  :timeout 0 :ready-only t)
+                           for (command payload) = (multiple-value-list
+                                                     (receive-message peer :timeout 5))
+                           while command
+                           do (cond
+                                ((string= command "block")
+                                 (let* ((block (bitcoin-lisp.serialization:parse-block-payload payload))
+                                        (header (bitcoin-lisp.serialization:bitcoin-block-header block))
+                                        (hash (bitcoin-lisp.serialization:block-header-hash header)))
+                                   (mark-block-received hash)
+                                   (record-block-received-from-peer peer)
+                                   (process-received-block block chain-state utxo-set block-store
+                                                           :fee-estimator fee-estimator
+                                                           :recent-rejects recent-rejects)))
 
-                           ((string= command "headers")
-                            (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-                              (process-headers headers chain-state)
-                              (incf (ibd-context-headers-received ctx) (length headers))))
+                                ((string= command "headers")
+                                 (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
+                                   (process-headers headers chain-state)
+                                   (incf (ibd-context-headers-received ctx) (length headers))))
 
-                           (t (handle-message peer command payload
-                                              chain-state utxo-set block-store
-                                              :fee-estimator fee-estimator
-                                              :recent-rejects recent-rejects)))))))
+                                (t (handle-message peer command payload
+                                                   chain-state utxo-set block-store
+                                                   :fee-estimator fee-estimator
+                                                   :recent-rejects recent-rejects))))))
 
                  ;; Evict stalling peers and peers with bad chains
                  (let ((our-height (bitcoin-lisp.storage:current-height chain-state)))
                    (dolist (peer (copy-list peers))
                      (when (and (eq (peer-state peer) :ready)
                                 (> (count-peer-in-flight peer) 0)
-                                (peer-stalling-p peer :timeout-seconds 30))
-                       (bitcoin-lisp:log-warn "Disconnecting stalling peer ~A (no blocks in 30s)"
+                                (peer-stalling-p peer :timeout-seconds 120))
+                       (bitcoin-lisp:log-warn "Disconnecting stalling peer ~A (no blocks in 120s)"
                                               (peer-address peer))
                        (handler-case (disconnect-peer peer) (error () nil)))
                      (when (consider-peer-eviction peer our-height)
@@ -655,8 +679,14 @@ Returns the number of blocks downloaded."
                      (report-ibd-progress chain-state)
                      (setf last-report-time now))))))
 
-    ;; Done
-    (set-ibd-state :synced)
+    ;; Done — but distinguish "actually finished" from "paused due to no peers".
+    ;; If pending is empty AND nothing in-flight, we drained the queue. Otherwise
+    ;; we paused; the caller (sync-blockchain) will reconnect and resume.
+    (let ((pending (hash-table-count (ibd-context-pending-blocks ctx)))
+          (in-flight (hash-table-count (ibd-context-in-flight ctx))))
+      (if (and (zerop pending) (zerop in-flight))
+          (set-ibd-state :synced)
+          (set-ibd-state :idle)))
     (ibd-context-blocks-received ctx)))
 
 (defun build-header-locator (chain-state)
