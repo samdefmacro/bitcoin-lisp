@@ -136,17 +136,20 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
             (return-from check-sequence-locks nil))
           (let ((utxo-height (bitcoin-lisp.storage:utxo-entry-height utxo)))
             (if (logtest seq +sequence-type-flag+)
-                ;; Time-based relative locktime
+                ;; Time-based relative locktime.
+                ;; Bitcoin Core uses block.GetAncestor(max(nCoinHeight-1, 0))->GetMedianTimePast()
+                ;; — the MTP of the block PRIOR to the input's confirmation block, not the
+                ;; confirmation block itself (consensus/tx_verify.cpp:74).
                 (let* ((required-time (* (logand seq +sequence-locktime-mask+)
                                          +sequence-locktime-granularity+))
-                       ;; Compute MTP at the height the UTXO was confirmed
-                       ;; We need the block hash at utxo-height to get the prev-hash for MTP
-                       (utxo-entry (bitcoin-lisp.storage:get-block-at-height
-                                    chain-state utxo-height))
-                       (utxo-mtp (if utxo-entry
+                       (utxo-prev-height (max 0 (1- utxo-height)))
+                       (utxo-prev-entry (bitcoin-lisp.storage:get-block-at-height
+                                         chain-state utxo-prev-height))
+                       (utxo-mtp (if utxo-prev-entry
                                      (compute-median-time-past
                                       chain-state
-                                      (bitcoin-lisp.storage:block-index-entry-hash utxo-entry))
+                                      (bitcoin-lisp.storage:block-index-entry-hash
+                                       utxo-prev-entry))
                                      0)))
                   (when (< (- mtp utxo-mtp) required-time)
                     (return-from check-sequence-locks nil)))

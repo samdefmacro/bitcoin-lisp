@@ -444,11 +444,14 @@
   (setf (gethash key *signature-cache*) t))
 
 (defun cached-verify-ecdsa (sighash der-sig pubkey-bytes &key strict low-s)
-  "Verify ECDSA signature with caching. Returns same values as crypto:verify-signature."
+  "Verify ECDSA signature with caching. Returns same values as crypto:verify-signature.
+   On cache hit, returns (values t t) — result=t, status=t means parse OK and verify success.
+   Returning (t nil) here would falsely trip the strict-der + (not status) branch in callers
+   and surface as :sig-der when CHECKMULTISIG re-checks duplicate sig/pubkey pairs."
   (let ((cache-key (when *signature-cache-enabled*
                      (make-sig-cache-key #x45 sighash der-sig pubkey-bytes))))
     (when (and cache-key (gethash cache-key *signature-cache*))
-      (return-from cached-verify-ecdsa (values t nil)))
+      (return-from cached-verify-ecdsa (values t t)))
     (multiple-value-bind (result status)
         (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey-bytes
                                               :strict strict :low-s low-s)
@@ -1830,8 +1833,10 @@ Used to remove the signature being verified from the scriptCode before sighash."
           ;; If LOW_S flag and signature had high-S, return :sig-high-s error
           ((and (eq status :high-s) require-low-s)
            (values nil :sig-high-s))
-          ;; If DERSIG is set and DER parsing failed, return :sig-der error
-          ((and strict-der (not status))
+          ;; If DERSIG is set and DER parsing failed, return :sig-der error.
+          ;; Both checks required: a successful verify (result=T) must never
+          ;; be reported as :sig-der even if status is somehow nil.
+          ((and strict-der (not result) (not status))
            (values nil :sig-der))
           ;; NULLFAIL: if sig is non-empty and verification failed, error
           ;; Suppressed during CHECKMULTISIG (handled at algorithm level)
@@ -1959,7 +1964,12 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
     (multiple-value-bind (result error-type)
         (verify-checkmultisig sigs pubkeys script-pubkey)
       (when error-type
-        (setf *last-checkmultisig-error* error-type))
+        (setf *last-checkmultisig-error* error-type)
+        (bitcoin-lisp:log-warn
+         "CHECKMULTISIG-ERROR: ~A sigs=~D pubkeys=~D first-sig-len=~D first-pk-len=~D"
+         error-type (length sigs) (length pubkeys)
+         (if sigs (length (first sigs)) 0)
+         (if pubkeys (length (first pubkeys)) 0)))
       result)))
 
 (defun last-checkmultisig-had-error-p ()
@@ -2249,7 +2259,7 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
         (cond
           ((eq status :high-s)
            (values nil :sig-high-s))
-          ((and strict-der (not status))
+          ((and strict-der (not result) (not status))
            (values nil :sig-der))
           ((and (not result) (flag-enabled-p "NULLFAIL"))
            (values nil :nullfail))

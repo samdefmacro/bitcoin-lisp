@@ -159,12 +159,30 @@ where the input count would normally be."
                             :lock-time lock-time)))))
 
 (defun decode-compact-size-from-first-byte (first-byte stream)
-  "Decode a CompactSize integer given that FIRST-BYTE has already been read."
-  (cond
-    ((< first-byte 253) first-byte)
-    ((= first-byte 253) (read-uint16-le stream))
-    ((= first-byte 254) (read-uint32-le stream))
-    (t (read-uint64-le stream))))
+  "Decode a CompactSize integer given that FIRST-BYTE has already been read.
+Enforces non-canonical rejection and the MAX_SIZE cap, mirroring
+read-compact-size and Bitcoin Core's ReadCompactSize (serialize.h:330-360)."
+  (let ((value (cond
+                 ((< first-byte 253) first-byte)
+                 ((= first-byte 253)
+                  (let ((v (read-uint16-le stream)))
+                    (when (< v 253)
+                      (error "non-canonical ReadCompactSize"))
+                    v))
+                 ((= first-byte 254)
+                  (let ((v (read-uint32-le stream)))
+                    (when (< v #x10000)
+                      (error "non-canonical ReadCompactSize"))
+                    v))
+                 (t
+                  (let ((v (read-uint64-le stream)))
+                    (when (< v #x100000000)
+                      (error "non-canonical ReadCompactSize"))
+                    v)))))
+    (when (> value +max-compact-size+)
+      (error "ReadCompactSize: size too large (~D > ~D)"
+             value +max-compact-size+))
+    value))
 
 (defun write-transaction (stream tx)
   "Write a transaction to STREAM in legacy format (no witness).

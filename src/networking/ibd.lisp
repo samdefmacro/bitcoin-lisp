@@ -24,14 +24,25 @@
    validation took a few seconds, then the stalling-peer check would evict
    peers for OUR slowness. Drain in batches to keep buffers shallow.")
 
-(defparameter +max-block-queue-size+ 4000
-  "Maximum number of out-of-order blocks held in the IBD block-queue.
-   Cap exists because each entry holds a fully-deserialized block, which
-   on testnet4 stress blocks can be multi-MB. When the cap is hit, newly
-   arrived out-of-order blocks are re-added to pending-blocks for later
-   re-download instead of being held in memory. 4000 × ~80KB worst-case ≈
-   320MB — fits comfortably in the 8GB heap budget. Smaller caps caused
-   re-download thrashing (peers redeliver dropped blocks immediately).")
+(defparameter +max-block-queue-size+ 1024
+  "Maximum number of out-of-order blocks held in the IBD block-queue,
+   matching Bitcoin Core's BLOCK_DOWNLOAD_WINDOW (net_processing.cpp:146).
+   Each entry holds a fully-deserialized block (multi-MB on testnet4
+   stress blocks); 1024 × ~80KB worst-case ≈ 80MB fits comfortably below
+   the 8GB heap budget. The earlier 4000-cap commentary about
+   re-download thrashing assumed an unbounded receive path: with the
+   receive-side cap in process-received-block + the gap-only request
+   clamp, peers no longer redeliver dropped blocks because we stop
+   asking once at cap.")
+
+(defparameter +stuck-tip-halt-seconds+ 300
+  "If the connect-tip fails to advance for this many seconds AND the
+   block-queue is at cap, IBD halts. Mirrors the spirit of Bitcoin Core's
+   TipMayBeStale check (net_processing.cpp:1332-1340) which uses
+   nPowTargetSpacing*3 (≈30 min) before connecting an extra peer — we are
+   stricter because for our node a long stall almost always means a
+   consensus bug in the validator, not a network issue. Halting + logging
+   beats spinning until the heap exhausts.")
 
 (defstruct ibd-context
   "Context for managing Initial Block Download."
@@ -51,10 +62,73 @@
   (request-timeout 60 :type (unsigned-byte 16))  ; seconds
   ;; Progress tracking
   (start-time 0 :type integer)
-  (last-progress-time 0 :type integer))
+  (last-progress-time 0 :type integer)
+  ;; Wall-clock seconds (get-universal-time) at the last connect-tip advance.
+  ;; Used by the stuck-tip detector to halt IBD when validation can't drain
+  ;; the queue (vs Core's TipMayBeStale, net_processing.cpp:1332-1340).
+  (last-tip-advance-time 0 :type integer)
+  (last-tip-height 0 :type (unsigned-byte 32)))
 
 (defvar *ibd-context* nil
   "Current IBD context.")
+
+(defvar *ibd-gap-only-mode* nil
+  "Set by request-blocks-from-peers when the queue is at cap and the
+   next-needed block is missing. In this mode the block-request budget
+   is clamped to 1 (the gap block only) so the request flood that
+   previously filled the heap cannot reoccur.")
+
+(defun note-tip-advanced (chain-state)
+  "Record that the connect-tip just advanced. Resets the stuck-tip timer."
+  (when *ibd-context*
+    (setf (ibd-context-last-tip-advance-time *ibd-context*) (get-universal-time)
+          (ibd-context-last-tip-height *ibd-context*)
+          (bitcoin-lisp.storage:current-height chain-state))))
+
+(defun handle-validation-failure (block height error chain-state)
+  "Handle a block-validation failure during IBD.
+
+Re-adds the block hash to pending-blocks so it can be re-requested from
+a different peer (the failure may be peer-side data corruption rather
+than a real consensus violation). The stuck-tip detector in the main IBD
+loop is the backstop if the same block keeps failing.
+
+Bitcoin Core punishes the source peer in MaybePunishNodeForBlock
+(net_processing.cpp:1908-1951) on BLOCK_CONSENSUS / BLOCK_MUTATED but
+does not re-request — Core trusts its own validator. Our validator is
+less battle-tested, so we re-request once-or-twice before halting."
+  (declare (ignore error))
+  (when *ibd-context*
+    (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+           (hash (bitcoin-lisp.serialization:block-header-hash header))
+           (pending (ibd-context-pending-blocks *ibd-context*))
+           (in-flight (ibd-context-in-flight *ibd-context*)))
+      ;; Drop any stale in-flight entry for this hash so it can be retried.
+      (remhash hash in-flight)
+      ;; Re-add to pending if not already there.
+      (unless (gethash hash pending)
+        (setf (gethash hash pending) height)))))
+
+(defun check-stuck-tip ()
+  "Halt IBD if the connect-tip has not advanced for longer than
++stuck-tip-halt-seconds+. Returns T if we should halt.
+
+This is the backstop that prevents the failure mode observed at testnet4
+height 70700 (May 2 16:32 crash): a permanently-failing connect-tip
+block, no advance for 1h 40m, queue grew unbounded until heap exhaustion.
+With this check, we halt cleanly instead of OOM-ing."
+  (when *ibd-context*
+    (let* ((last-time (ibd-context-last-tip-advance-time *ibd-context*))
+           (queue-size (hash-table-count
+                        (ibd-context-block-queue *ibd-context*))))
+      (when (and (plusp last-time)
+                 (plusp queue-size)
+                 (> (- (get-universal-time) last-time)
+                    +stuck-tip-halt-seconds+))
+        (bitcoin-lisp:log-error
+         "STUCK TIP: connect-tip has not advanced in ~D seconds; ~D blocks queued. Halting IBD to avoid OOM. Investigate validator."
+         (- (get-universal-time) last-time) queue-size)
+        t))))
 
 (defun make-ibd ()
   "Create a new IBD context."
@@ -441,27 +515,40 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
       (bitcoin-lisp:log-warn "Retrying ~D timed out block requests" retried)))
 
   ;; Backpressure: cap NEW requests so block-queue + in-flight stays bounded.
-  ;; BUT: always allow requesting the next-needed block, even when at cap.
-  ;; Without this, a single missing block in the queue (lost during a peer
-  ;; retry cycle) deadlocks IBD — validation can't drain the queue past the
-  ;; gap, and backpressure blocks the very re-request that would fill it.
+  ;; When at cap and the next-needed block is missing, only allow ONE request
+  ;; (the gap-block) — not the full per-peer budget. The previous override
+  ;; lifted backpressure entirely; if connect-tip stalled (e.g. validation
+  ;; bug), peers kept delivering blocks above the gap, the queue grew past
+  ;; cap on the receive side (no cap there pre-fix), and the heap exhausted.
+  ;; Bitcoin Core never has this issue because FindNextBlocksToDownload
+  ;; (net_processing.cpp:1437-1440) only walks within BLOCK_DOWNLOAD_WINDOW
+  ;; from the LastCommonBlock, which advances only when blocks connect.
   (let* ((queue (ibd-context-block-queue *ibd-context*))
          (queue-load (+ (hash-table-count queue)
                         (hash-table-count (ibd-context-in-flight *ibd-context*))))
          (next-needed (1+ (bitcoin-lisp.storage:current-height chain-state)))
-         (gap-block-missing (not (gethash next-needed queue))))
-    (when (and (>= queue-load +max-block-queue-size+)
-               (not gap-block-missing))
-      (return-from request-blocks-from-peers 0)))
+         (gap-block-missing (not (gethash next-needed queue)))
+         (over-cap (>= queue-load +max-block-queue-size+)))
+    (when (and over-cap (not gap-block-missing))
+      (return-from request-blocks-from-peers 0))
+    ;; over-cap AND gap missing: fall through, but the request budget is
+    ;; clamped to 1 below to avoid the unbounded-flood failure mode.
+    (when over-cap
+      (setf *ibd-gap-only-mode* t)))
 
   (let* ((max-per-peer (ibd-context-max-in-flight *ibd-context*))
          (ready-peers (sort (remove-if-not (lambda (p) (eq (peer-state p) :ready)) peers)
                             #'< :key (lambda (p)
                                        (let ((lat (peer-ping-latency p)))
                                          (if (plusp lat) lat most-positive-fixnum)))))
-         ;; Calculate total budget across all peers
-         (total-budget (loop for peer in ready-peers
-                             sum (max 0 (- max-per-peer (count-peer-in-flight peer))))))
+         ;; Calculate total budget across all peers. When the queue is at cap
+         ;; and we're only allowed to request the gap block, clamp to 1.
+         (raw-budget (loop for peer in ready-peers
+                           sum (max 0 (- max-per-peer (count-peer-in-flight peer)))))
+         (total-budget (if *ibd-gap-only-mode* (min 1 raw-budget) raw-budget)))
+
+    ;; Reset for next caller; the gate already gave us the budget we need.
+    (setf *ibd-gap-only-mode* nil)
 
     (when (or (null ready-peers) (zerop total-budget))
       (return-from request-blocks-from-peers 0))
@@ -614,6 +701,11 @@ Returns the number of blocks downloaded."
       (setf (ibd-context-target-height ctx) header-tip)
       (queue-blocks-for-download chain-state (1+ start-height) header-tip))
 
+    ;; Initialize stuck-tip tracking — start the timer at IBD entry so the
+    ;; first stall is detected even if no block ever connects.
+    (setf (ibd-context-last-tip-advance-time ctx) (get-universal-time)
+          (ibd-context-last-tip-height ctx) start-height)
+
     ;; Download blocks
     (let ((last-report-time (get-internal-real-time))
           (report-interval (* 10 internal-time-units-per-second))  ; Every 10 seconds
@@ -621,6 +713,12 @@ Returns the number of blocks downloaded."
 
       (loop while (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
             do (progn
+                 ;; Stuck-tip backstop: if connect-tip hasn't advanced for
+                 ;; +stuck-tip-halt-seconds+ AND blocks are queued, halt
+                 ;; cleanly instead of growing the queue until OOM.
+                 (when (check-stuck-tip)
+                   (return))
+
                  ;; Prune disconnected peers from the list
                  (setf peers (remove-if-not
                               (lambda (p) (eq (peer-state p) :ready))
@@ -680,24 +778,15 @@ Returns the number of blocks downloaded."
                                                    :fee-estimator fee-estimator
                                                    :recent-rejects recent-rejects))))))
 
-                 ;; Stalling detection — Bitcoin Core net_processing.cpp pattern:
-                 ;; Only disconnect the ONE peer whose in-flight request is for
-                 ;; the next-needed block (the "stalling peer") when the chain
-                 ;; hasn't advanced for `+block-stalling-timeout+` seconds. This
-                 ;; correctly distinguishes a peer-side stall from our own
-                 ;; validation slowness. Other peers are left alone.
-                 (let* ((our-height (bitcoin-lisp.storage:current-height chain-state))
-                        (next-height (1+ our-height))
-                        (stalling-peer (find-peer-blocking-progress next-height chain-state)))
-                   (when (and stalling-peer
-                              (eq (peer-state stalling-peer) :ready)
-                              (peer-stalling-p stalling-peer
-                                               :timeout-seconds +block-stalling-timeout+))
-                     (bitcoin-lisp:log-warn
-                      "Disconnecting stalling peer ~A — held block ~D for >~Ds with no progress"
-                      (peer-address stalling-peer) next-height +block-stalling-timeout+)
-                     (handler-case (disconnect-peer stalling-peer) (error () nil)))
-                   ;; Bad-chain peers (height significantly behind us)
+                 ;; Per-block request timeout retries (retry-timed-out-requests
+                 ;; in request-blocks-from-peers) is our peer-disconnect path:
+                 ;; if a specific peer fails to deliver multiple requested
+                 ;; blocks within the request-timeout, record-block-timeout
+                 ;; eventually drops them. The previous secondary "no blocks
+                 ;; in 30s" check duplicated this and fired wrongly when our
+                 ;; backpressure was the actual reason peers looked idle.
+                 ;; Bad-chain peers only:
+                 (let ((our-height (bitcoin-lisp.storage:current-height chain-state)))
                    (dolist (peer (copy-list peers))
                      (when (consider-peer-eviction peer our-height)
                        (bitcoin-lisp:log-warn "Evicting peer ~A (height ~D behind our ~D)"
@@ -877,6 +966,7 @@ After connecting, drains the queue of any children that can now be connected."
                      block chain-state block-store utxo-set
                      :fee-estimator fee-estimator
                      :recent-rejects recent-rejects)
+                    (note-tip-advanced chain-state)
                     ;; Drain queued blocks whose parent is now connected
                     (drain-block-queue chain-state utxo-set block-store
                                        :fee-estimator fee-estimator
@@ -884,18 +974,35 @@ After connecting, drains the queue of any children that can now be connected."
                     t)
                   (progn
                     (bitcoin-lisp:log-error "Block ~D validation failed: ~A" height error)
+                    (handle-validation-failure block height error chain-state)
                     nil))))
 
-          ;; Out of order - queue for later. Backpressure on the request side
-          ;; ensures (queue + in-flight) never exceeds +max-block-queue-size+,
-          ;; so we always have room for an in-flight block to land here.
+          ;; Out of order - queue for later, with a HARD receive-side cap.
+          ;; Bitcoin Core only ever requests blocks within BLOCK_DOWNLOAD_WINDOW
+          ;; of tip (net_processing.cpp:1437-1440) so peers shouldn't deliver
+          ;; beyond that window. If they do (due to in-flight retries or our
+          ;; gap-block override), drop to bound memory. Without this cap, a
+          ;; permanently-failing connect-tip block lets the queue grow until
+          ;; the heap exhausts (observed: testnet4 height 70700 stall, 16:32
+          ;; node.log crash inside READ-WITNESS-STACK).
           (progn
             (bitcoin-lisp:log-debug "Block ~D received out of order (current: ~D)"
                                     height current-height)
             (when *ibd-context*
               (let ((queue (ibd-context-block-queue *ibd-context*)))
-                (unless (gethash height queue)  ; skip duplicates
-                  (setf (gethash height queue) block))))
+                (cond
+                  ((gethash height queue)
+                   nil)  ; duplicate
+                  ((>= (hash-table-count queue) +max-block-queue-size+)
+                   (bitcoin-lisp:log-warn
+                    "Dropping out-of-order block at height ~D: queue at cap (~D, tip ~D)"
+                    height (hash-table-count queue) current-height))
+                  ((> (- height current-height) +max-block-queue-size+)
+                   (bitcoin-lisp:log-warn
+                    "Dropping out-of-order block at height ~D: too far ahead of tip ~D"
+                    height current-height))
+                  (t
+                   (setf (gethash height queue) block)))))
             nil)))))
 
 (defun drain-block-queue (chain-state utxo-set block-store &key fee-estimator recent-rejects)
@@ -926,8 +1033,14 @@ Repeats until no more queued blocks can be connected."
                    block chain-state block-store utxo-set
                    :fee-estimator fee-estimator
                    :recent-rejects recent-rejects)
+                  (note-tip-advanced chain-state)
                   (incf drained)
                   (bitcoin-lisp:log-debug "Drained queued block at height ~D" next-height))
                 (progn
                   (bitcoin-lisp:log-error "Queued block ~D validation failed: ~A"
-                                          next-height error)))))))))
+                                          next-height error)
+                  (handle-validation-failure block next-height error chain-state)
+                  ;; Stop draining after a failure — the block is now back in
+                  ;; pending and will be re-requested. Returning here also
+                  ;; prevents tight-looping on a permanently-failing block.
+                  (return drained)))))))))
