@@ -89,14 +89,38 @@
 ;;; - 65536-4294967295: 5 bytes (0xFE followed by uint32)
 ;;; - Larger: 9 bytes (0xFF followed by uint64)
 
-(defun read-compact-size (stream)
-  "Read a CompactSize-encoded integer from STREAM."
-  (let ((first-byte (read-byte stream)))
-    (cond
-      ((< first-byte 253) first-byte)
-      ((= first-byte 253) (read-uint16-le stream))
-      ((= first-byte 254) (read-uint32-le stream))
-      ((= first-byte 255) (read-uint64-le stream)))))
+(defconstant +max-compact-size+ #x02000000
+  "Bitcoin Core MAX_SIZE (serialize.h:32): 32 MiB upper bound on any
+   ReadCompactSize. Caps allocations driven by attacker-controlled length
+   prefixes during transaction/block deserialization.")
+
+(defun read-compact-size (stream &key (range-check t))
+  "Read a CompactSize-encoded integer from STREAM.
+Mirrors Bitcoin Core's ReadCompactSize (serialize.h:330-360):
+- Rejects non-canonical encodings (e.g., 200 must use the 1-byte form).
+- Caps the value at +max-compact-size+ when range-check is true."
+  (let* ((first-byte (read-byte stream))
+         (value (cond
+                  ((< first-byte 253) first-byte)
+                  ((= first-byte 253)
+                   (let ((v (read-uint16-le stream)))
+                     (when (< v 253)
+                       (error "non-canonical ReadCompactSize"))
+                     v))
+                  ((= first-byte 254)
+                   (let ((v (read-uint32-le stream)))
+                     (when (< v #x10000)
+                       (error "non-canonical ReadCompactSize"))
+                     v))
+                  ((= first-byte 255)
+                   (let ((v (read-uint64-le stream)))
+                     (when (< v #x100000000)
+                       (error "non-canonical ReadCompactSize"))
+                     v)))))
+    (when (and range-check (> value +max-compact-size+))
+      (error "ReadCompactSize: size too large (~D > ~D)"
+             value +max-compact-size+))
+    value))
 
 (defun write-compact-size (stream value)
   "Write a CompactSize-encoded integer to STREAM."
