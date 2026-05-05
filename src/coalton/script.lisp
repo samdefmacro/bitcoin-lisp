@@ -2165,15 +2165,23 @@
             ((ScriptOk (Tuple byte new-ctx))
              (let ((op (byte-to-opcode byte)))
                ;; Check op count limit: only opcodes > OP_16 (0x60) count towards limit
-               ;; This includes all ops except push data ops (0x00-0x4e), OP_1NEGATE (0x4f),
-               ;; OP_RESERVED (0x50), and OP_1-OP_16 (0x51-0x60)
+               ;; (push opcodes 0x00-0x4e, OP_1NEGATE 0x4f, OP_RESERVED 0x50, and
+               ;; OP_1-OP_16 0x51-0x60 are exempt).
+               ;; BIP 342: in tapscript, MAX_OPS_PER_SCRIPT is removed entirely —
+               ;; only the per-input sigops budget applies. Bitcoin Core gates the
+               ;; check on sigversion == BASE || WITNESS_V0 (interpreter.cpp:450-455).
+               ;; Without this gate, complex tapscripts (e.g., testnet4 block 70924
+               ;; tx-1, 139-item witness with repeating tapleaf body) hit the legacy
+               ;; 201-op cap and falsely fail with SE-TooManyOps.
                (let ((ctx-with-count
-                       (if (<= byte #x60)
+                       (if (or (<= byte #x60)
+                               (flag-enabled "TAPSCRIPT"))
                            new-ctx
                            ;; Always increment count (even past limit) so check can detect it
                            (context-with-op-count (+ (context-op-count new-ctx) 1) new-ctx))))
-                 ;; Check if we exceeded op count (always, even in non-executing branches)
-                 (if (> (context-op-count ctx-with-count) +max-ops-per-script+)
+                 ;; Check if we exceeded op count (always, even in non-executing branches).
+                 (if (and (not (flag-enabled "TAPSCRIPT"))
+                          (> (context-op-count ctx-with-count) +max-ops-per-script+))
                      (ScriptErr SE-TooManyOps)
                      ;; Handle push operations specially
                      (match op
