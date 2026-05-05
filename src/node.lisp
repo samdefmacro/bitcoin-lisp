@@ -220,6 +220,8 @@ For testnet, data stays at the base directory (backward compatible)."
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
                         (log-level :info)
+                        (log-file nil)
+                        (console-log t)
                         (max-peers 8)
                         (sync t)
                         (txindex nil)
@@ -233,6 +235,8 @@ For testnet, data stays at the base directory (backward compatible)."
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
 NETWORK: :testnet3 or :mainnet
 LOG-LEVEL: :debug, :info, :warn, or :error
+LOG-FILE: If non-nil, also append node logs to this path (in addition to console)
+CONSOLE-LOG: If T (default), mirror logs to *standard-output* / REPL
 MAX-PEERS: Maximum number of peer connections
 SYNC: If T, start syncing immediately
 TXINDEX: If T, enable transaction index for getrawtransaction lookups
@@ -246,6 +250,14 @@ Returns the node instance."
   (when *node*
     (log-warn "Node already running, stopping first")
     (stop-node))
+
+  ;; Wire up logging BEFORE init-node so its log-info calls go somewhere.
+  ;; Without these, the node runs silently — the May 5 restart had this
+  ;; failure mode (no node.log entries since May 2 16:32 crash).
+  (when console-log
+    (enable-console-logging))
+  (when log-file
+    (start-file-logging log-file))
 
   ;; Validate and set pruning configuration
   (setf *prune-target-mib* prune)
@@ -464,31 +476,69 @@ Returns the node instance."
   *node*)
 
 (defparameter +flush-every-n-blocks+ 1000
-  "Periodically flush chainstate + UTXO set to disk every N connected blocks
-   so a hard crash loses at most N blocks of work, not the whole sync session.
-   Bitcoin Core does the same in FlushStateToDisk (validation.cpp).")
+  "Flush chainstate + UTXO set to disk every N connected blocks so a hard
+   crash loses at most N blocks of work. Mirrors Bitcoin Core's
+   nMinBlocksToKeep / FlushStateToDisk cadence (validation.cpp).")
+
+(defparameter +flush-every-n-seconds+ 600
+  "Time-based flush trigger (10 min): flush if at least N seconds have
+   elapsed since the last flush, regardless of block count. Without this,
+   a slow sync window (~2 b/s on testnet4 stress regions) takes ~8 min
+   to accumulate 1000 blocks, and a connect-tip stall halts flushes
+   entirely (May 2 crash: stuck at h=70700 for 1h40m, last save was at
+   h=70000 at 14:34, lost 700 blocks of progress + caused full re-sync
+   from genesis on restart). Bitcoin Core uses DATABASE_WRITE_INTERVAL
+   = 1h (validation.cpp:DATABASE_WRITE_INTERVAL) — we use 10 min because
+   our re-validation from a checkpoint is much slower than Core's.")
 
 (defvar *blocks-since-flush* 0
   "Counter incremented per connected block; reset to 0 when a flush runs.")
 
+(defvar *last-flush-universal-time* 0
+  "Wall-clock time (get-universal-time) of the last successful periodic
+   flush. Used by the time-based trigger.")
+
+(defun do-flush ()
+  "Synchronously flush chainstate + header-index + UTXO set. Inner helper
+   used by both the per-block trigger and the time-based trigger."
+  (handler-case
+      (#+sbcl sb-sys:without-interrupts
+       #-sbcl progn
+        (when (node-chain-state *node*)
+          (bitcoin-lisp.storage:save-state (node-chain-state *node*))
+          (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
+        (when (node-utxo-set *node*)
+          (bitcoin-lisp.storage:save-utxo-set
+           (node-utxo-set *node*)
+           (bitcoin-lisp.storage:utxo-set-file-path (node-data-directory *node*))))
+        (setf *last-flush-universal-time* (get-universal-time)
+              *blocks-since-flush* 0)
+        (log-info "Periodic flush: chainstate at height ~D"
+                  (and (node-chain-state *node*)
+                       (bitcoin-lisp.storage:current-height
+                        (node-chain-state *node*)))))
+    (error (c)
+      ;; Was log-warn before — surfaced silently. Bumped to log-error so
+      ;; persistence failures are obvious in the log instead of getting
+      ;; lost between progress lines.
+      (log-error "Periodic flush FAILED: ~A" c))))
+
 (defun maybe-periodic-flush ()
-  "Flush chainstate, UTXO set, and header index to disk if N blocks have been
-   connected since last flush. Called from connect-block. Cheap if no flush
-   needed; durable if it does flush (atomic temp+fsync+rename inside save-*)."
-  (when (and *node* (>= (incf *blocks-since-flush*) +flush-every-n-blocks+))
-    (setf *blocks-since-flush* 0)
-    (handler-case
-        (#+sbcl sb-sys:without-interrupts
-         #-sbcl progn
-          (when (node-chain-state *node*)
-            (bitcoin-lisp.storage:save-state (node-chain-state *node*))
-            (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
-          (when (node-utxo-set *node*)
-            (bitcoin-lisp.storage:save-utxo-set
-             (node-utxo-set *node*)
-             (bitcoin-lisp.storage:utxo-set-file-path (node-data-directory *node*)))))
-      (error (c)
-        (log-warn "Periodic flush failed: ~A" c)))))
+  "Flush chainstate, UTXO set, and header index to disk if either:
+- N blocks have been connected since the last flush, OR
+- N seconds have elapsed since the last flush (catches slow-sync regions
+  where 1000 blocks would take many minutes to accumulate).
+
+Called from connect-block. Cheap if no flush needed; durable if it does
+flush (atomic temp+fsync+rename inside save-*)."
+  (unless *node* (return-from maybe-periodic-flush))
+  (incf *blocks-since-flush*)
+  (when (zerop *last-flush-universal-time*)
+    (setf *last-flush-universal-time* (get-universal-time)))
+  (when (or (>= *blocks-since-flush* +flush-every-n-blocks+)
+            (>= (- (get-universal-time) *last-flush-universal-time*)
+                +flush-every-n-seconds+))
+    (do-flush)))
 
 (defun install-shutdown-handler ()
   "Trap SIGTERM and SIGINT so kill <pid> / Ctrl-C calls stop-node and persists
