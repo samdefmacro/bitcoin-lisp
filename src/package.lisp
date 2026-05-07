@@ -82,6 +82,20 @@
    #:write-bytes
    #:read-var-bytes
    #:write-var-bytes
+   ;; Auto-growing byte buffer (faster than flexi-streams in hot paths)
+   #:byte-buf
+   #:make-byte-buf
+   #:bb-pos
+   #:bb-data
+   #:bb-write-u8
+   #:bb-write-u16-le
+   #:bb-write-u32-le
+   #:bb-write-u64-le
+   #:bb-write-i32-le
+   #:bb-write-i64-le
+   #:bb-write-bytes
+   #:bb-write-varint
+   #:bb-finish
    ;; Types
    #:outpoint
    #:make-outpoint
@@ -319,6 +333,7 @@
    ;; Integrity utilities
    #:compute-crc32
    #:save-file-with-crc32
+   #:save-file-with-crc32-bb
    #:load-file-with-crc32
    #:write-utxo-entry-fields
    #:read-utxo-entry-fields

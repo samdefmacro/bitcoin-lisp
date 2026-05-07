@@ -144,6 +144,17 @@ PREVIOUS-UTXOS should be a list of (txid index entry) for restored UTXOs."
     (bitcoin-lisp.serialization:write-uint32-le stream (length script))
     (write-sequence script stream)))
 
+(declaim (inline bb-write-utxo-entry-fields))
+(defun bb-write-utxo-entry-fields (bb entry)
+  "Write utxo-entry fields directly into byte-buf BB. Hot path: called
+1.2M+ times during save-utxo-set."
+  (bitcoin-lisp.serialization:bb-write-i64-le bb (utxo-entry-value entry))
+  (bitcoin-lisp.serialization:bb-write-u32-le bb (utxo-entry-height entry))
+  (bitcoin-lisp.serialization:bb-write-u8 bb (if (utxo-entry-coinbase entry) 1 0))
+  (let ((script (utxo-entry-script-pubkey entry)))
+    (bitcoin-lisp.serialization:bb-write-u32-le bb (length script))
+    (bitcoin-lisp.serialization:bb-write-bytes bb script)))
+
 (defun read-utxo-entry-fields (stream)
   "Read utxo-entry fields from STREAM. Returns a utxo-entry."
   (let* ((value (bitcoin-lisp.serialization:read-int64-le stream))
@@ -173,7 +184,11 @@ PREVIOUS-UTXOS should be a list of (txid index entry) for restored UTXOs."
 (defun save-file-with-crc32 (path write-fn)
   "Write data to PATH atomically with CRC32 integrity.
 WRITE-FN receives a stream and writes the payload (including magic/version/count).
-Uses temp file + fsync + rename for crash-safe atomicity."
+Uses temp file + fsync + rename for crash-safe atomicity.
+
+Stream-based variant. For hot-path saves (save-utxo-set), prefer
+SAVE-FILE-WITH-CRC32-BB which avoids flexi-streams' per-byte CLOS
+dispatch — was 18% of total CPU on the May 2 testnet4 profile."
   (ensure-directories-exist path)
   (let ((tmp-path (make-pathname :defaults path
                                  :type (concatenate 'string
@@ -190,6 +205,29 @@ Uses temp file + fsync + rename for crash-safe atomicity."
         (finish-output out))
       ;; fsync the data before rename — guarantees the new file is on disk
       ;; before any other process (or our crash) sees the rename.
+      (fsync-file tmp-path)
+      (rename-file tmp-path path))))
+
+(defun save-file-with-crc32-bb (path bb-fn)
+  "Like SAVE-FILE-WITH-CRC32 but BB-FN receives a byte-buf and writes
+into it directly. Avoids the flexi-streams + Gray-stream CLOS dispatch
+that dominated CPU on UTXO/state flushes."
+  (ensure-directories-exist path)
+  (let ((tmp-path (make-pathname :defaults path
+                                 :type (concatenate 'string
+                                                    (or (pathname-type path) "dat")
+                                                    ".tmp"))))
+    (let* ((bb (bitcoin-lisp.serialization:make-byte-buf))
+           (_ (funcall bb-fn bb))
+           (all-bytes (bitcoin-lisp.serialization:bb-finish bb)))
+      (declare (ignore _))
+      (with-open-file (out tmp-path
+                           :direction :output
+                           :if-exists :supersede
+                           :element-type '(unsigned-byte 8))
+        (write-sequence all-bytes out)
+        (write-sequence (compute-crc32 all-bytes) out)
+        (finish-output out))
       (fsync-file tmp-path)
       (rename-file tmp-path path))))
 
@@ -234,17 +272,21 @@ Returns the file bytes (without CRC) on success, NIL on failure."
 
 (defun save-utxo-set (utxo-set path)
   "Save the UTXO set to a binary file at PATH with integrity checks.
-Uses atomic write: writes to temporary file, then renames."
-  (save-file-with-crc32
+Uses atomic write: writes to temporary file, then renames.
+
+Hottest persistence path (1.2M+ entries × ~75 bytes ≈ 90MB on testnet4).
+Uses save-file-with-crc32-bb to avoid flexi-streams' per-byte CLOS
+dispatch."
+  (save-file-with-crc32-bb
    path
-   (lambda (stream)
-     (write-sequence *utxo-magic* stream)
-     (bitcoin-lisp.serialization:write-uint32-le stream +utxo-format-version+)
-     (bitcoin-lisp.serialization:write-uint32-le stream
-                                                  (hash-table-count (utxo-set-entries utxo-set)))
+   (lambda (bb)
+     (bitcoin-lisp.serialization:bb-write-bytes bb *utxo-magic*)
+     (bitcoin-lisp.serialization:bb-write-u32-le bb +utxo-format-version+)
+     (bitcoin-lisp.serialization:bb-write-u32-le
+      bb (hash-table-count (utxo-set-entries utxo-set)))
      (maphash (lambda (key entry)
-                (write-sequence key stream)
-                (write-utxo-entry-fields stream entry))
+                (bitcoin-lisp.serialization:bb-write-bytes bb key)
+                (bb-write-utxo-entry-fields bb entry))
               (utxo-set-entries utxo-set))))
   (setf (utxo-set-dirty utxo-set) nil)
   t)

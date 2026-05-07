@@ -177,3 +177,134 @@ Mirrors Bitcoin Core's ReadCompactSize (serialize.h:330-360):
   "Write a 256-bit hash (32 bytes) to STREAM."
   (assert (= (length hash) 32))
   (write-bytes stream hash))
+
+;;;; Auto-growing byte buffer
+;;;
+;;; Drop-in replacement for flexi-streams:with-output-to-sequence in hot
+;;; paths. flexi-streams routes every write-byte through Gray-stream CLOS
+;;; dispatch, which the May 2 testnet4 profile pinned at ~50% of CPU.
+;;; A direct simple-array + index pair with doubling growth gives
+;;; ~10-100x speedup on per-byte-heavy workloads (sighash, txid, etc.).
+
+(defstruct (byte-buf (:conc-name bb-))
+  (data (make-array 1024 :element-type '(unsigned-byte 8))
+        :type (simple-array (unsigned-byte 8) (*)))
+  (pos 0 :type fixnum))
+
+(declaim (inline bb-ensure bb-write-u8 bb-write-u16-le bb-write-u32-le
+                 bb-write-u64-le bb-write-i32-le bb-write-i64-le
+                 bb-write-bytes bb-write-varint bb-finish))
+
+(defun bb-ensure (buf needed-pos)
+  "Ensure DATA has room to write up to NEEDED-POS. Doubles on overflow."
+  (declare (type byte-buf buf) (type fixnum needed-pos)
+           (optimize (speed 3) (safety 1)))
+  (let ((cur (length (bb-data buf))))
+    (declare (type fixnum cur))
+    (when (> needed-pos cur)
+      (let ((new-size cur))
+        (declare (type fixnum new-size))
+        (loop while (< new-size needed-pos)
+              do (setf new-size (the fixnum (* new-size 2))))
+        (let ((new-data (make-array new-size :element-type '(unsigned-byte 8))))
+          (declare (type (simple-array (unsigned-byte 8) (*)) new-data))
+          (replace new-data (bb-data buf) :end2 (bb-pos buf))
+          (setf (bb-data buf) new-data))))))
+
+(defun bb-write-u8 (buf v)
+  (declare (type byte-buf buf) (type (unsigned-byte 8) v)
+           (optimize (speed 3) (safety 1)))
+  (let ((p (bb-pos buf)))
+    (declare (type fixnum p))
+    (bb-ensure buf (the fixnum (1+ p)))
+    (setf (aref (bb-data buf) p) v)
+    (setf (bb-pos buf) (the fixnum (1+ p)))))
+
+;; bb-write-u{16,32,64}-le accept any integer and mask with logand —
+;; signed-int32 fields like transaction-version are valid input.
+
+(defun bb-write-u16-le (buf v)
+  (declare (type byte-buf buf) (type integer v)
+           (optimize (speed 3) (safety 1)))
+  (let ((p (bb-pos buf))
+        (mv (logand v #xffff)))
+    (declare (type fixnum p) (type (unsigned-byte 16) mv))
+    (bb-ensure buf (the fixnum (+ p 2)))
+    (let ((d (bb-data buf)))
+      (setf (aref d p) (logand mv #xff))
+      (setf (aref d (the fixnum (+ p 1))) (logand (ash mv -8) #xff)))
+    (setf (bb-pos buf) (the fixnum (+ p 2)))))
+
+(defun bb-write-u32-le (buf v)
+  (declare (type byte-buf buf) (type integer v)
+           (optimize (speed 3) (safety 1)))
+  (let ((p (bb-pos buf))
+        (mv (logand v #xffffffff)))
+    (declare (type fixnum p) (type (unsigned-byte 32) mv))
+    (bb-ensure buf (the fixnum (+ p 4)))
+    (let ((d (bb-data buf)))
+      (setf (aref d p)                       (logand mv #xff))
+      (setf (aref d (the fixnum (+ p 1)))    (logand (ash mv  -8) #xff))
+      (setf (aref d (the fixnum (+ p 2)))    (logand (ash mv -16) #xff))
+      (setf (aref d (the fixnum (+ p 3)))    (logand (ash mv -24) #xff)))
+    (setf (bb-pos buf) (the fixnum (+ p 4)))))
+
+(defun bb-write-u64-le (buf v)
+  (declare (type byte-buf buf) (type integer v)
+           (optimize (speed 3) (safety 1)))
+  (let ((p (bb-pos buf))
+        (mv (logand v #xffffffffffffffff)))
+    (declare (type fixnum p) (type (unsigned-byte 64) mv))
+    (bb-ensure buf (the fixnum (+ p 8)))
+    (let ((d (bb-data buf)))
+      (setf (aref d p)                       (logand mv #xff))
+      (setf (aref d (the fixnum (+ p 1)))    (logand (ash mv  -8) #xff))
+      (setf (aref d (the fixnum (+ p 2)))    (logand (ash mv -16) #xff))
+      (setf (aref d (the fixnum (+ p 3)))    (logand (ash mv -24) #xff))
+      (setf (aref d (the fixnum (+ p 4)))    (logand (ash mv -32) #xff))
+      (setf (aref d (the fixnum (+ p 5)))    (logand (ash mv -40) #xff))
+      (setf (aref d (the fixnum (+ p 6)))    (logand (ash mv -48) #xff))
+      (setf (aref d (the fixnum (+ p 7)))    (logand (ash mv -56) #xff)))
+    (setf (bb-pos buf) (the fixnum (+ p 8)))))
+
+(defun bb-write-i32-le (buf v)
+  (bb-write-u32-le buf v))
+
+(defun bb-write-i64-le (buf v)
+  (bb-write-u64-le buf v))
+
+(defun bb-write-bytes (buf src)
+  (declare (type byte-buf buf) (type vector src)
+           (optimize (speed 3) (safety 1)))
+  (let ((p (bb-pos buf))
+        (n (length src)))
+    (declare (type fixnum p n))
+    (bb-ensure buf (the fixnum (+ p n)))
+    (replace (bb-data buf) src :start1 p)
+    (setf (bb-pos buf) (the fixnum (+ p n)))))
+
+(defun bb-write-varint (buf v)
+  "CompactSize varint write into BUF."
+  (declare (type byte-buf buf) (type (unsigned-byte 64) v)
+           (optimize (speed 3) (safety 1)))
+  (cond
+    ((< v 253)
+     (bb-write-u8 buf v))
+    ((< v #x10000)
+     (bb-write-u8 buf 253)
+     (bb-write-u16-le buf v))
+    ((< v #x100000000)
+     (bb-write-u8 buf 254)
+     (bb-write-u32-le buf v))
+    (t
+     (bb-write-u8 buf 255)
+     (bb-write-u64-le buf v))))
+
+(defun bb-finish (buf)
+  "Return a fresh simple-array containing exactly the written bytes."
+  (declare (type byte-buf buf) (optimize (speed 3) (safety 1)))
+  (let* ((n (bb-pos buf))
+         (out (make-array n :element-type '(unsigned-byte 8))))
+    (declare (type fixnum n))
+    (replace out (bb-data buf) :end2 n)
+    out))
