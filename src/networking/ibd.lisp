@@ -382,17 +382,31 @@ Walks the header chain and adds block hashes to the pending queue."
              (bitcoin-lisp.storage::chain-state-block-index chain-state))
     queued))
 
-(defun get-next-blocks-to-request (n)
-  "Get up to N block hashes to request, sorted by height."
+(defun get-next-blocks-to-request (n &optional tip-height)
+  "Get up to N block hashes to request, sorted by height.
+
+When TIP-HEIGHT is supplied, filters out blocks more than
++max-block-queue-size+ ahead of it — Bitcoin Core's BLOCK_DOWNLOAD_WINDOW
+(net_processing.cpp:146). Without this filter, peers serve blocks far
+ahead of tip that we then drop in the receive path AND lose from pending
+(mark-block-received already removed them), producing the failure mode
+observed at h=1027 on May 7 where 53k blocks were dropped and the gap
+above the tip became permanent.
+
+If TIP-HEIGHT is NIL, the height filter is skipped (used by unit tests
+that don't construct a chain-state)."
   (unless *ibd-context*
     (return-from get-next-blocks-to-request nil))
 
-  (let ((pending (ibd-context-pending-blocks *ibd-context*))
-        (in-flight (ibd-context-in-flight *ibd-context*))
-        (available '()))
-    ;; Collect blocks that are pending but not in-flight
+  (let* ((max-request-height (when tip-height (+ tip-height +max-block-queue-size+)))
+         (pending (ibd-context-pending-blocks *ibd-context*))
+         (in-flight (ibd-context-in-flight *ibd-context*))
+         (available '()))
+    ;; Collect blocks that are pending, not in-flight, and within the window.
     (maphash (lambda (hash height)
-               (unless (gethash hash in-flight)
+               (when (and (not (gethash hash in-flight))
+                          (or (null max-request-height)
+                              (<= height max-request-height)))
                  (push (cons hash height) available)))
              pending)
     ;; Sort by height and take first N
@@ -553,8 +567,11 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
     (when (or (null ready-peers) (zerop total-budget))
       (return-from request-blocks-from-peers 0))
 
-    ;; Get blocks to request (up to total budget)
-    (let ((to-request (get-next-blocks-to-request total-budget)))
+    ;; Get blocks to request (up to total budget, filtered to within the
+    ;; download window of current tip).
+    (let ((to-request (get-next-blocks-to-request
+                       total-budget
+                       (bitcoin-lisp.storage:current-height chain-state))))
       (when (null to-request)
         (return-from request-blocks-from-peers 0))
 
@@ -979,28 +996,32 @@ After connecting, drains the queue of any children that can now be connected."
 
           ;; Out of order - queue for later, with a HARD receive-side cap.
           ;; Bitcoin Core only ever requests blocks within BLOCK_DOWNLOAD_WINDOW
-          ;; of tip (net_processing.cpp:1437-1440) so peers shouldn't deliver
-          ;; beyond that window. If they do (due to in-flight retries or our
-          ;; gap-block override), drop to bound memory. Without this cap, a
-          ;; permanently-failing connect-tip block lets the queue grow until
-          ;; the heap exhausts (observed: testnet4 height 70700 stall, 16:32
-          ;; node.log crash inside READ-WITNESS-STACK).
+          ;; of tip (net_processing.cpp:1437-1440); the request-side filter in
+          ;; get-next-blocks-to-request enforces the same window for us.
+          ;; Drops here are belt-and-suspenders for in-flight retries that
+          ;; landed late; we re-add to pending so the block isn't lost from
+          ;; our system (mark-block-received already removed it). Without
+          ;; this re-add, dropped blocks become permanent gaps — observed
+          ;; May 7 at h=1027 with 53k drops and a stuck tip.
           (progn
             (bitcoin-lisp:log-debug "Block ~D received out of order (current: ~D)"
                                     height current-height)
             (when *ibd-context*
-              (let ((queue (ibd-context-block-queue *ibd-context*)))
+              (let ((queue (ibd-context-block-queue *ibd-context*))
+                    (pending (ibd-context-pending-blocks *ibd-context*)))
                 (cond
                   ((gethash height queue)
                    nil)  ; duplicate
                   ((>= (hash-table-count queue) +max-block-queue-size+)
                    (bitcoin-lisp:log-warn
-                    "Dropping out-of-order block at height ~D: queue at cap (~D, tip ~D)"
-                    height (hash-table-count queue) current-height))
+                    "Dropping out-of-order block at height ~D: queue at cap (~D, tip ~D); re-queuing for later"
+                    height (hash-table-count queue) current-height)
+                   (setf (gethash hash pending) height))
                   ((> (- height current-height) +max-block-queue-size+)
                    (bitcoin-lisp:log-warn
-                    "Dropping out-of-order block at height ~D: too far ahead of tip ~D"
-                    height current-height))
+                    "Dropping out-of-order block at height ~D: too far ahead of tip ~D; re-queuing for later"
+                    height current-height)
+                   (setf (gethash hash pending) height))
                   (t
                    (setf (gethash height queue) block)))))
             nil)))))
