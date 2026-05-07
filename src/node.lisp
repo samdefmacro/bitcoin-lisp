@@ -498,9 +498,50 @@ Returns the node instance."
   "Wall-clock time (get-universal-time) of the last successful periodic
    flush. Used by the time-based trigger.")
 
+(defun log-memory-snapshot (label)
+  "Log a snapshot of the major in-memory caches plus SBCL heap usage.
+Used to diagnose memory growth — call before/after flush so we can
+correlate cache sizes with the heap watermark.
+
+The May 5 OOM at h=72814 had heap at 8.55 GB but the explainable
+state (UTXO 600MB + headers 30MB + sig-cache 5MB + queues 80MB) only
+accounts for ~700 MB. This logger surfaces the gap."
+  #+sbcl
+  (let* ((utxo-count (and (node-utxo-set *node*)
+                          (bitcoin-lisp.storage:utxo-count
+                           (node-utxo-set *node*))))
+         (header-count (and (node-chain-state *node*)
+                            (hash-table-count
+                             (bitcoin-lisp.storage::chain-state-block-index
+                              (node-chain-state *node*)))))
+         (sig-cache-count
+           (hash-table-count bitcoin-lisp.coalton.interop:*signature-cache*))
+         (ibd-pending
+           (and bitcoin-lisp.networking::*ibd-context*
+                (hash-table-count
+                 (bitcoin-lisp.networking::ibd-context-pending-blocks
+                  bitcoin-lisp.networking::*ibd-context*))))
+         (ibd-queue
+           (and bitcoin-lisp.networking::*ibd-context*
+                (hash-table-count
+                 (bitcoin-lisp.networking::ibd-context-block-queue
+                  bitcoin-lisp.networking::*ibd-context*))))
+         (ibd-in-flight
+           (and bitcoin-lisp.networking::*ibd-context*
+                (hash-table-count
+                 (bitcoin-lisp.networking::ibd-context-in-flight
+                  bitcoin-lisp.networking::*ibd-context*))))
+         (dyn-bytes (sb-ext:dynamic-space-size))
+         (used-bytes (sb-kernel:dynamic-usage)))
+    (log-info "MEM[~A]: utxo=~D headers=~D sigcache=~D ibd-pend=~A queue=~A inflight=~A heap-used=~,1FMB heap-cap=~,1FMB"
+              label utxo-count header-count sig-cache-count
+              ibd-pending ibd-queue ibd-in-flight
+              (/ used-bytes 1048576.0) (/ dyn-bytes 1048576.0))))
+
 (defun do-flush ()
   "Synchronously flush chainstate + header-index + UTXO set. Inner helper
    used by both the per-block trigger and the time-based trigger."
+  (log-memory-snapshot "pre-flush")
   (handler-case
       (#+sbcl sb-sys:without-interrupts
        #-sbcl progn
@@ -521,7 +562,13 @@ Returns the node instance."
       ;; Was log-warn before — surfaced silently. Bumped to log-error so
       ;; persistence failures are obvious in the log instead of getting
       ;; lost between progress lines.
-      (log-error "Periodic flush FAILED: ~A" c))))
+      (log-error "Periodic flush FAILED: ~A" c)))
+  ;; After flush, request a major GC so reachable post-flush memory is the
+  ;; only thing in the old generations next time we measure. This is the
+  ;; same pattern as Bitcoin Core's CCoinsViewCache::Flush returning bytes
+  ;; freed to the system allocator.
+  #+sbcl (sb-ext:gc :full t)
+  (log-memory-snapshot "post-flush"))
 
 (defun maybe-periodic-flush ()
   "Flush chainstate, UTXO set, and header index to disk if either:
