@@ -308,3 +308,132 @@ Mirrors Bitcoin Core's ReadCompactSize (serialize.h:330-360):
     (declare (type fixnum n))
     (replace out (bb-data buf) :end2 n)
     out))
+
+;;;; Byte-reader (zero-copy index-based input)
+;;;
+;;; Mirror of byte-buf for the input direction. Wraps a source
+;;; (simple-array (unsigned-byte 8) (*)) plus an index counter. Each
+;;; reader bumps the index and reads via aref directly, avoiding
+;;; flexi-streams:with-input-from-sequence + Gray-stream read-byte
+;;; dispatch on every byte.
+
+(defstruct (byte-reader (:conc-name br-))
+  (data #() :type (simple-array (unsigned-byte 8) (*)))
+  (pos 0 :type fixnum))
+
+(declaim (inline make-byte-reader-from
+                 br-read-u8 br-read-u16-le br-read-u32-le
+                 br-read-u64-le br-read-i32-le br-read-i64-le
+                 br-read-bytes br-read-compact-size br-read-var-bytes
+                 br-eof-p))
+
+(defun make-byte-reader-from (bytes)
+  "Wrap a byte-vector in a fresh byte-reader at position 0."
+  (declare (type vector bytes))
+  (make-byte-reader
+   :data (if (typep bytes '(simple-array (unsigned-byte 8) (*)))
+             bytes
+             (coerce bytes '(simple-array (unsigned-byte 8) (*))))))
+
+(defun br-eof-p (br)
+  (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
+  (>= (br-pos br) (length (br-data br))))
+
+(defun br-read-u8 (br)
+  (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
+  (let ((p (br-pos br)))
+    (declare (type fixnum p))
+    (prog1 (aref (br-data br) p)
+      (setf (br-pos br) (the fixnum (1+ p))))))
+
+(defun br-read-u16-le (br)
+  (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
+  (let ((p (br-pos br))
+        (d (br-data br)))
+    (declare (type fixnum p))
+    (prog1 (logior (aref d p)
+                   (ash (aref d (the fixnum (+ p 1))) 8))
+      (setf (br-pos br) (the fixnum (+ p 2))))))
+
+(defun br-read-u32-le (br)
+  (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
+  (let ((p (br-pos br))
+        (d (br-data br)))
+    (declare (type fixnum p))
+    (prog1 (logior (aref d p)
+                   (ash (aref d (the fixnum (+ p 1)))  8)
+                   (ash (aref d (the fixnum (+ p 2))) 16)
+                   (ash (aref d (the fixnum (+ p 3))) 24))
+      (setf (br-pos br) (the fixnum (+ p 4))))))
+
+(defun br-read-u64-le (br)
+  (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
+  (let ((p (br-pos br))
+        (d (br-data br)))
+    (declare (type fixnum p))
+    (prog1 (logior (aref d p)
+                   (ash (aref d (the fixnum (+ p 1)))  8)
+                   (ash (aref d (the fixnum (+ p 2))) 16)
+                   (ash (aref d (the fixnum (+ p 3))) 24)
+                   (ash (aref d (the fixnum (+ p 4))) 32)
+                   (ash (aref d (the fixnum (+ p 5))) 40)
+                   (ash (aref d (the fixnum (+ p 6))) 48)
+                   (ash (aref d (the fixnum (+ p 7))) 56))
+      (setf (br-pos br) (the fixnum (+ p 8))))))
+
+(defun br-read-i32-le (br)
+  "Read a 32-bit signed little-endian integer."
+  (let ((u (br-read-u32-le br)))
+    (declare (type (unsigned-byte 32) u))
+    (if (>= u #x80000000) (- u #x100000000) u)))
+
+(defun br-read-i64-le (br)
+  "Read a 64-bit signed little-endian integer."
+  (let ((u (br-read-u64-le br)))
+    (declare (type (unsigned-byte 64) u))
+    (if (>= u #x8000000000000000) (- u #x10000000000000000) u)))
+
+(defun br-read-bytes (br n)
+  "Read N bytes, returning a fresh simple-array (unsigned-byte 8)."
+  (declare (type byte-reader br) (type fixnum n)
+           (optimize (speed 3) (safety 1)))
+  (let* ((p (br-pos br))
+         (out (make-array n :element-type '(unsigned-byte 8))))
+    (declare (type fixnum p)
+             (type (simple-array (unsigned-byte 8) (*)) out))
+    (replace out (br-data br) :start2 p :end2 (the fixnum (+ p n)))
+    (setf (br-pos br) (the fixnum (+ p n)))
+    out))
+
+(defun br-read-compact-size (br)
+  "Read a CompactSize. Mirrors read-compact-size — non-canonical
+encodings rejected and value capped at +max-compact-size+."
+  (declare (type byte-reader br) (optimize (speed 3) (safety 1)))
+  (let* ((first (br-read-u8 br))
+         (value
+           (cond
+             ((< first 253) first)
+             ((= first 253)
+              (let ((v (br-read-u16-le br)))
+                (when (< v 253)
+                  (error "non-canonical ReadCompactSize"))
+                v))
+             ((= first 254)
+              (let ((v (br-read-u32-le br)))
+                (when (< v #x10000)
+                  (error "non-canonical ReadCompactSize"))
+                v))
+             (t
+              (let ((v (br-read-u64-le br)))
+                (when (< v #x100000000)
+                  (error "non-canonical ReadCompactSize"))
+                v)))))
+    (when (> value +max-compact-size+)
+      (error "ReadCompactSize: size too large (~D > ~D)"
+             value +max-compact-size+))
+    value))
+
+(defun br-read-var-bytes (br)
+  "Read a length-prefixed byte vector."
+  (let ((len (br-read-compact-size br)))
+    (br-read-bytes br len)))
