@@ -96,6 +96,22 @@
    #:bb-write-bytes
    #:bb-write-varint
    #:bb-finish
+   ;; Byte-reader (zero-copy index-based input)
+   #:byte-reader
+   #:make-byte-reader
+   #:make-byte-reader-from
+   #:br-data
+   #:br-pos
+   #:br-eof-p
+   #:br-read-u8
+   #:br-read-u16-le
+   #:br-read-u32-le
+   #:br-read-u64-le
+   #:br-read-i32-le
+   #:br-read-i64-le
+   #:br-read-bytes
+   #:br-read-compact-size
+   #:br-read-var-bytes
    ;; Types
    #:outpoint
    #:make-outpoint

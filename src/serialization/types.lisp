@@ -36,6 +36,12 @@ INDEX is the output index within that transaction."
   (bb-write-bytes bb (outpoint-hash outpoint))
   (bb-write-u32-le bb (outpoint-index outpoint)))
 
+(declaim (inline br-read-outpoint))
+(defun br-read-outpoint (br)
+  "Read an outpoint from a byte-reader (32-byte hash + 4-byte LE index)."
+  (make-outpoint :hash (br-read-bytes br 32)
+                 :index (br-read-u32-le br)))
+
 (defun null-outpoint-p (outpoint)
   "Check if OUTPOINT is null (references no previous output)."
   (and (every #'zerop (outpoint-hash outpoint))
@@ -73,6 +79,13 @@ SEQUENCE: Sequence number for replacement/locktime."
     (bb-write-bytes bb script))
   (bb-write-u32-le bb (tx-in-sequence tx-in)))
 
+(declaim (inline br-read-tx-in))
+(defun br-read-tx-in (br)
+  "Read a transaction input from a byte-reader."
+  (make-tx-in :previous-output (br-read-outpoint br)
+              :script-sig (br-read-var-bytes br)
+              :sequence (br-read-u32-le br)))
+
 (defun coinbase-input-p (tx-in)
   "Check if TX-IN is a coinbase input."
   (null-outpoint-p (tx-in-previous-output tx-in)))
@@ -103,6 +116,12 @@ SCRIPT-PUBKEY: Locking script."
   (let ((script (tx-out-script-pubkey tx-out)))
     (bb-write-varint bb (length script))
     (bb-write-bytes bb script)))
+
+(declaim (inline br-read-tx-out))
+(defun br-read-tx-out (br)
+  "Read a transaction output from a byte-reader."
+  (make-tx-out :value (br-read-i64-le br)
+               :script-pubkey (br-read-var-bytes br)))
 
 ;;;; Transaction
 
@@ -144,6 +163,63 @@ Returns a list of byte vectors."
   (write-compact-size stream (length stack))
   (dolist (item stack)
     (write-var-bytes stream item)))
+
+(defun br-read-witness-stack (br)
+  "Read a single witness stack (one input's worth) from a byte-reader."
+  (let ((item-count (br-read-compact-size br)))
+    (loop repeat item-count
+          collect (br-read-var-bytes br))))
+
+(defun br-read-transaction (br)
+  "Read a transaction from a byte-reader. Auto-detects BIP 144 witness
+format by checking for marker byte 0x00 where the input count would be.
+Hot path: called per tx during block parsing — index-based reads avoid
+flexi-streams' Gray-stream input dispatch."
+  (let* ((version (br-read-i32-le br))
+         (marker (br-read-u8 br)))
+    (if (zerop marker)
+        ;; Witness format: marker=0x00, flag=0x01
+        (let ((flag (br-read-u8 br)))
+          (unless (= flag 1)
+            (error "Invalid witness flag byte: ~D" flag))
+          (let* ((input-count (br-read-compact-size br))
+                 (inputs (loop repeat input-count collect (br-read-tx-in br)))
+                 (output-count (br-read-compact-size br))
+                 (outputs (loop repeat output-count collect (br-read-tx-out br)))
+                 (witness (loop repeat input-count
+                                collect (br-read-witness-stack br)))
+                 (lock-time (br-read-u32-le br)))
+            (make-transaction :version version
+                              :inputs inputs
+                              :outputs outputs
+                              :lock-time lock-time
+                              :witness witness)))
+        ;; Legacy format: marker was the first byte of input-count.
+        (let* ((input-count
+                 (cond ((< marker 253) marker)
+                       ((= marker 253)
+                        (let ((v (br-read-u16-le br)))
+                          (when (< v 253)
+                            (error "non-canonical ReadCompactSize"))
+                          v))
+                       ((= marker 254)
+                        (let ((v (br-read-u32-le br)))
+                          (when (< v #x10000)
+                            (error "non-canonical ReadCompactSize"))
+                          v))
+                       (t
+                        (let ((v (br-read-u64-le br)))
+                          (when (< v #x100000000)
+                            (error "non-canonical ReadCompactSize"))
+                          v))))
+               (inputs (loop repeat input-count collect (br-read-tx-in br)))
+               (output-count (br-read-compact-size br))
+               (outputs (loop repeat output-count collect (br-read-tx-out br)))
+               (lock-time (br-read-u32-le br)))
+          (make-transaction :version version
+                            :inputs inputs
+                            :outputs outputs
+                            :lock-time lock-time)))))
 
 (defun read-transaction (stream)
   "Read a transaction from STREAM.
@@ -366,6 +442,16 @@ NONCE: Proof-of-work nonce."
                      :bits (read-uint32-le stream)
                      :nonce (read-uint32-le stream)))
 
+(declaim (inline br-read-block-header))
+(defun br-read-block-header (br)
+  "Read a block header from a byte-reader (80 bytes)."
+  (make-block-header :version (br-read-i32-le br)
+                     :prev-block (br-read-bytes br 32)
+                     :merkle-root (br-read-bytes br 32)
+                     :timestamp (br-read-u32-le br)
+                     :bits (br-read-u32-le br)
+                     :nonce (br-read-u32-le br)))
+
 (defun write-block-header (stream header)
   "Write a block header to STREAM."
   (write-int32-le stream (block-header-version header))
@@ -416,6 +502,14 @@ TRANSACTIONS: List of transactions in the block."
   (let* ((header (read-block-header stream))
          (tx-count (read-compact-size stream))
          (transactions (loop repeat tx-count collect (read-transaction stream))))
+    (make-bitcoin-block :header header
+                        :transactions transactions)))
+
+(defun br-read-bitcoin-block (br)
+  "Read a complete block from a byte-reader. Hot path (per inbound block)."
+  (let* ((header (br-read-block-header br))
+         (tx-count (br-read-compact-size br))
+         (transactions (loop repeat tx-count collect (br-read-transaction br))))
     (make-bitcoin-block :header header
                         :transactions transactions)))
 
