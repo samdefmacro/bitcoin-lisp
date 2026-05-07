@@ -416,8 +416,14 @@
   "Maximum entries in *signature-cache* before it is cleared.
    Bitcoin Core caps the equivalent CuckooCache at ~32 MiB; this is the analogue.")
 
-(defvar *signature-cache* (make-hash-table :test 'equalp :size 65536)
-  "Cache of verified signatures. Key = SHA256(...), Value = T.")
+(defvar *signature-cache*
+  (make-hash-table :test 'equalp :size 65536
+                   #+sbcl :synchronized #+sbcl t)
+  "Cache of verified signatures. Key = SHA256(...), Value = T.
+SBCL :synchronized hash-tables use a per-table mutex on every gethash/
+setf — needed because Phase 3 parallel script verification has
+multiple worker threads concurrently doing both lookups and stores.
+The mutex cost is small relative to the parallel speedup.")
 
 (defvar *signature-cache-enabled* t
   "When T, cache signature verification results.")
