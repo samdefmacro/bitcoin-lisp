@@ -51,6 +51,18 @@
   (msghash32 :pointer)
   (pubkey :pointer))
 
+;; BIP 340 tagged hash: hash32 = SHA256(SHA256(tag) || SHA256(tag) || msg).
+;; Internally caches/reuses the SHA256 midstate after feeding the tag prefix
+;; once, so repeated calls with the same tag avoid the 64-byte tag-prefix
+;; compression. Public symbol; preferred over hand-rolled tagged-hash.
+(cffi:defcfun ("secp256k1_tagged_sha256" secp256k1-tagged-sha256) :int
+  (ctx :pointer)
+  (hash32 :pointer)
+  (tag :pointer)
+  (taglen :size)
+  (msg :pointer)
+  (msglen :size))
+
 ;;; Context management
 
 (defun ensure-secp256k1-loaded ()
@@ -60,6 +72,37 @@
     (setf *secp256k1-context*
           (secp256k1-context-create +secp256k1-context-verify+)))
   *secp256k1-context*)
+
+;; Override hash.lisp's tagged-hash with a libsecp256k1-backed version.
+;; libsecp's secp256k1_tagged_sha256 keeps the SHA256 midstate after feeding
+;; the tag prefix internally, so repeated calls with the same tag skip a
+;; full 64-byte tag-prefix compression — meaningful for Taproot hot paths
+;; (TapLeaf, TapSighash, TapBranch, TapTweak) called per-input on every
+;; tapscript spend.
+(defun tagged-hash (tag data)
+  "Compute BIP 340 tagged hash via libsecp256k1's secp256k1_tagged_sha256.
+   TAG is a string; DATA is a byte vector. Returns a 32-byte vector."
+  (declare (type string tag)
+           (optimize (speed 3) (safety 1)))
+  (ensure-secp256k1-loaded)
+  (let* ((tag-octets (flexi-streams:string-to-octets tag :external-format :utf-8))
+         (data-octets (if (typep data '(simple-array (unsigned-byte 8) (*)))
+                          data
+                          (coerce data '(simple-array (unsigned-byte 8) (*)))))
+         (taglen (length tag-octets))
+         (msglen (length data-octets))
+         (out (make-array 32 :element-type '(unsigned-byte 8))))
+    (declare (type (simple-array (unsigned-byte 8) (*)) tag-octets data-octets)
+             (type (simple-array (unsigned-byte 8) (32)) out))
+    (cffi:with-pointer-to-vector-data (tag-ptr tag-octets)
+      (cffi:with-pointer-to-vector-data (msg-ptr data-octets)
+        (cffi:with-pointer-to-vector-data (out-ptr out)
+          (let ((rc (secp256k1-tagged-sha256
+                     *secp256k1-context*
+                     out-ptr tag-ptr taglen msg-ptr msglen)))
+            (unless (= rc 1)
+              (error "secp256k1_tagged_sha256 returned ~A" rc))))))
+    out))
 
 (defun cleanup-secp256k1 ()
   "Clean up secp256k1 context. Call on shutdown."
