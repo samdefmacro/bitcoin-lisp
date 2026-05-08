@@ -779,6 +779,25 @@ Returns the number of blocks downloaded."
                                  (let* ((block (bitcoin-lisp.serialization:parse-block-payload payload))
                                         (header (bitcoin-lisp.serialization:bitcoin-block-header block))
                                         (hash (bitcoin-lisp.serialization:block-header-hash header)))
+                                   ;; Forensic raw-payload capture: dump the
+                                   ;; wire-format (witness-included) bytes to
+                                   ;; a side dir before parse loses witness
+                                   ;; data. Triggered only when
+                                   ;; *forensic-store-from-height* is set.
+                                   (when *forensic-store-from-height*
+                                     (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                                                   chain-state hash)))
+                                       (when (and entry
+                                                  (>= (bitcoin-lisp.storage:block-index-entry-height entry)
+                                                      *forensic-store-from-height*))
+                                         (let* ((dir "/data/bitcoin-lisp/forensic-blocks/")
+                                                (path (format nil "~A~A.raw" dir
+                                                              (bitcoin-lisp.crypto:bytes-to-hex hash))))
+                                           (ignore-errors (ensure-directories-exist dir))
+                                           (with-open-file (s path :direction :output
+                                                                   :if-exists :supersede
+                                                                   :element-type '(unsigned-byte 8))
+                                             (write-sequence payload s))))))
                                    (mark-block-received hash)
                                    (record-block-received-from-peer peer)
                                    (process-received-block block chain-state utxo-set block-store
@@ -946,6 +965,12 @@ Used during IBD when the validated block tip lags behind the header tip."
     (bitcoin-lisp:log-info "Header sync complete: ~D headers received" received-count)
     received-count))
 
+(defvar *forensic-store-from-height* nil
+  "Debug: when set to an integer N, store every received block at
+   height >= N to disk BEFORE validation, so failed-validation blocks
+   are still available for analysis. Use to capture blocks our
+   validator rejects so we can compare against Bitcoin Core.")
+
 (defun process-received-block (block chain-state utxo-set block-store
                                 &key fee-estimator recent-rejects)
   "Process a received block - validate and connect to chain.
@@ -961,6 +986,17 @@ After connecting, drains the queue of any children that can now be connected."
 
     (let ((height (bitcoin-lisp.storage:block-index-entry-height entry))
           (current-height (bitcoin-lisp.storage:current-height chain-state)))
+
+      ;; Forensic capture: store the block to disk BEFORE validation if
+      ;; *forensic-store-from-height* is set and we're at-or-above that
+      ;; height. Lets us analyze blocks our validator rejects.
+      (when (and *forensic-store-from-height*
+                 (>= height *forensic-store-from-height*))
+        (handler-case
+            (bitcoin-lisp.storage:store-block block-store block)
+          (error (e)
+            (bitcoin-lisp:log-warn "Forensic store failed for block ~D: ~A"
+                                   height e))))
 
       ;; Skip blocks already connected (duplicates from multiple peers)
       (when (<= height current-height)

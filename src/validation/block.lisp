@@ -536,22 +536,29 @@ safe concurrent access."
          (failure-flag (cons nil nil))   ; mutable shared cell
          (failure-lock (bt:make-lock "block-script-failure"))
          (threads '()))
-    (dotimes (worker-id n-workers)
-      (push (bt:make-thread
-             (lambda ()
-               (loop for i from worker-id below n-txs by n-workers
-                     do (when (car failure-flag) (return))
-                        (let ((tx (aref tx-vec i))
-                              ;; tx-idx is 1-based to match the original
-                              ;; (rest transactions) iteration which started at 1.
-                              (tx-idx (1+ i)))
-                          (unless (validate-tx-scripts tx tx-idx utxo-set
-                                                       script-flags height)
-                            (bt:with-lock-held (failure-lock)
-                              (setf (car failure-flag) t))
-                            (return)))))
-             :name (format nil "script-check-~D" worker-id))
-            threads))
+    ;; Spawn workers via LOOP, which fresh-binds the iteration variable
+    ;; each iteration. SBCL's dotimes shares one binding across iterations
+    ;; (verified empirically), so closures captured inside dotimes all
+    ;; see the FINAL value — every worker thread would loop the same
+    ;; index range and fail to partition work. Replacing dotimes with
+    ;; loop fixes the partitioning so each thread gets distinct txs.
+    (loop for worker-id below n-workers
+          do (push (bt:make-thread
+                    (let ((wid worker-id))   ; defensive freeze
+                      (lambda ()
+                        (loop for i from wid below n-txs by n-workers
+                              do (when (car failure-flag) (return))
+                                 (let ((tx (aref tx-vec i))
+                                       ;; tx-idx is 1-based to match
+                                       ;; original (rest transactions).
+                                       (tx-idx (1+ i)))
+                                   (unless (validate-tx-scripts tx tx-idx utxo-set
+                                                                script-flags height)
+                                     (bt:with-lock-held (failure-lock)
+                                       (setf (car failure-flag) t))
+                                     (return))))))
+                    :name (format nil "script-check-~D" worker-id))
+                   threads))
     (dolist (th threads)
       (bt:join-thread th))
     (not (car failure-flag))))
