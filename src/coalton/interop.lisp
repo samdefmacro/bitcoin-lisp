@@ -430,14 +430,38 @@
   "Maximum entries in *signature-cache* before it is cleared.
    Bitcoin Core caps the equivalent CuckooCache at ~32 MiB; this is the analogue.")
 
+(declaim (inline sig-cache-hash))
+(defun sig-cache-hash (key)
+  "Custom :hash-function for *signature-cache*. Keys are 32-byte SHA256
+outputs which are already uniformly random, so we just take the first 8
+bytes as a little-endian uint64 and mask to fixnum width — far cheaper
+than SBCL's generic data-vector-hash, which iterates all 32 bytes per
+lookup. Equalp test still resolves any collisions exactly."
+  (declare (type (simple-array (unsigned-byte 8) (*)) key)
+           (optimize (speed 3) (safety 0)))
+  (logand (logior (aref key 0)
+                  (ash (aref key 1) 8)
+                  (ash (aref key 2) 16)
+                  (ash (aref key 3) 24)
+                  (ash (aref key 4) 32)
+                  (ash (aref key 5) 40)
+                  (ash (aref key 6) 48)
+                  (ash (aref key 7) 56))
+          most-positive-fixnum))
+
 (defvar *signature-cache*
   (make-hash-table :test 'equalp :size 65536
+                   #+sbcl :hash-function #+sbcl 'sig-cache-hash
                    #+sbcl :synchronized #+sbcl t)
   "Cache of verified signatures. Key = SHA256(...), Value = T.
 SBCL :synchronized hash-tables use a per-table mutex on every gethash/
 setf — needed because Phase 3 parallel script verification has
 multiple worker threads concurrently doing both lookups and stores.
-The mutex cost is small relative to the parallel speedup.")
+The mutex cost is small relative to the parallel speedup.
+
+Custom :hash-function (sig-cache-hash) skips data-vector-hash on the
+32-byte key since SHA256 output is already random — see profile note
+in Phase B.4 of the speed plan.")
 
 (defvar *signature-cache-enabled* t
   "When T, cache signature verification results.")
