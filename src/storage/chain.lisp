@@ -178,10 +178,40 @@ off-by-one (2015 intervals, not 2016)."
   "Get the path to the chain state file."
   (merge-pathnames "chainstate.dat" (chain-state-base-path state)))
 
-(defun save-state (state)
+;;; Persistence format v3: adds in-transition flag (mirrors Bitcoin Core's
+;;; DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).
+;;;
+;;; do-flush performs a 3-phase commit:
+;;;   Phase 1: save-state with in-transition=1 (chainstate.dat marked unsafe)
+;;;   Phase 2: save-utxo-set (90 MB write + atomic temp+rename)
+;;;   Phase 3: save-state with in-transition=0 (commits the new chainstate)
+;;;
+;;; On load, an in-transition=1 flag means the previous flush was interrupted
+;;; mid-write (process killed between Phase 1 and Phase 3). The on-disk
+;;; chainstate.dat may be ahead of utxoset.dat or vice versa. We refuse to
+;;; load — caller must re-sync. Same model as Bitcoin Core's
+;;; "-reindex-chainstate" requirement.
+;;;
+;;; Format:
+;;;   v3 payload = best-block-hash(32) + best-height(4) + pruned-height(4) +
+;;;                flags(1) = 41 bytes; file = payload + CRC(4) = 45 bytes
+;;;   v2 payload = same without flags byte (40 bytes); file = 44 bytes
+;;;   v1 payload = 36 bytes (no pruned-height, no CRC)
+;;;
+;;; flags byte: bit 0 = in-transition (1 = unsafe, 0 = consistent)
+
+(defconstant +flag-in-transition+ #x01
+  "Chainstate flags byte bit 0: marker for an in-progress flush.")
+
+(defun save-state (state &key in-transition)
   "Save chain state to disk atomically with fsync.
-Format: best-block-hash(32) + best-height(4) + pruned-height(4) + CRC32.
-Uses temp + fsync + rename so a crash mid-write never leaves a torn file."
+v3 format: best-block-hash(32) + best-height(4) + pruned-height(4) + flags(1) + CRC32.
+Uses temp + fsync + rename so a crash mid-write never leaves a torn file.
+
+When IN-TRANSITION is non-nil, sets the in-transition flag — the saved
+file is a Phase-1 transition marker, not a final commit. do-flush should
+call this twice per flush: once with :in-transition t before writing the
+UTXO set, then with :in-transition nil after to complete the commit."
   (let ((path (state-file-path state)))
     (save-file-with-crc32
      path
@@ -196,32 +226,55 @@ Uses temp + fsync + rename so a crash mid-write never leaves a torn file."
          (write-byte (logand pruned-height #xFF) stream)
          (write-byte (logand (ash pruned-height -8) #xFF) stream)
          (write-byte (logand (ash pruned-height -16) #xFF) stream)
-         (write-byte (logand (ash pruned-height -24) #xFF) stream))))
+         (write-byte (logand (ash pruned-height -24) #xFF) stream))
+       ;; v3 flags byte
+       (write-byte (if in-transition +flag-in-transition+ 0) stream)))
     t))
 
 (defun load-state (state)
-  "Load chain state from disk. Returns T if loaded, NIL if no state exists
-or the file failed CRC verification (caller may then rebuild from blocks).
+  "Load chain state from disk. Returns:
+  T              — loaded successfully, state is consistent with utxoset.dat
+  :inconsistent  — chainstate has the in-transition flag set; the previous
+                   flush was interrupted between Phase 1 and Phase 3.
+                   Caller must abort and require re-sync.
+  NIL            — no chainstate exists or the file failed CRC verification.
 
-Format on disk now: payload(40 bytes) + CRC32(4 bytes) = 44 bytes.
-Tolerates old 36/40-byte legacy files (no CRC) — falls back to direct read."
+v3 (45 bytes): payload(41) + CRC(4)
+v2 (44 bytes): payload(40) + CRC(4) — pre-flag fallback
+v1 (36/40 bytes): no CRC — legacy fallback"
   (let ((path (state-file-path state)))
     (unless (probe-file path)
       (return-from load-state nil))
-    ;; Try CRC-protected format first.
-    (let ((data (load-file-with-crc32 path 44)))  ; 32+4+4+4
-      (when data
-        (let ((payload (subseq data 0 (- (length data) 4))))
+    ;; Try v3 first (45 bytes).
+    (let ((data (load-file-with-crc32 path 45)))
+      (when (and data (= (length data) 45))
+        (let ((payload (subseq data 0 41)))
           (setf (chain-state-best-block-hash state) (subseq payload 0 32))
           (let ((b0 (aref payload 32)) (b1 (aref payload 33))
                 (b2 (aref payload 34)) (b3 (aref payload 35)))
             (setf (chain-state-best-height state)
                   (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
-          (when (>= (length payload) 40)
-            (let ((b0 (aref payload 36)) (b1 (aref payload 37))
-                  (b2 (aref payload 38)) (b3 (aref payload 39)))
-              (setf (chain-state-pruned-height state)
-                    (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))))
+          (let ((b0 (aref payload 36)) (b1 (aref payload 37))
+                (b2 (aref payload 38)) (b3 (aref payload 39)))
+            (setf (chain-state-pruned-height state)
+                  (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
+          (let ((flags (aref payload 40)))
+            (when (logtest flags +flag-in-transition+)
+              (return-from load-state :inconsistent)))
+          (return-from load-state t))))
+    ;; Fallback to v2 (44 bytes) — no flag byte, treat as committed.
+    (let ((data (load-file-with-crc32 path 44)))
+      (when (and data (= (length data) 44))
+        (let ((payload (subseq data 0 40)))
+          (setf (chain-state-best-block-hash state) (subseq payload 0 32))
+          (let ((b0 (aref payload 32)) (b1 (aref payload 33))
+                (b2 (aref payload 34)) (b3 (aref payload 35)))
+            (setf (chain-state-best-height state)
+                  (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
+          (let ((b0 (aref payload 36)) (b1 (aref payload 37))
+                (b2 (aref payload 38)) (b3 (aref payload 39)))
+            (setf (chain-state-pruned-height state)
+                  (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
           (return-from load-state t))))
     ;; Legacy fallback: pre-CRC format (36 or 40 bytes total).
     (with-open-file (stream path :direction :input :element-type '(unsigned-byte 8))
