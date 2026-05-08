@@ -931,63 +931,59 @@ Used to get the redeem script from a P2SH scriptSig."
    AMOUNT: The input value in satoshis
    INTERNAL-PUBKEY: The internal public key (32 bytes)
    Returns (values success error-keyword)."
-  ;; Set up Tapscript context
+  ;; Set up Tapscript context via DYNAMIC LET-BINDINGS rather than
+  ;; setf-then-restore on the globals. The earlier pattern mutated the
+  ;; process-global value visible to other threads during execution and
+  ;; relied on unwind-protect to restore — racy across workers and a
+  ;; suspected source of the intermittent h=67100-67105 tapscript bug
+  ;; (Task #22). With dynamic let, each thread gets its own binding
+  ;; stack and globals are never observably mutated.
+  ;; *tapscript-validation-weight-left* is bound by the caller
+  ;; (validate-taproot-script-path); we don't rebind it here so decf
+  ;; from verify-tapscript-signature mutates the caller's binding.
   (let* ((old-flags *script-flags*)
-         (old-leaf-hash *tapscript-leaf-hash*)
-         (old-amount *tapscript-amount*)
-         (old-internal-pubkey *tapscript-internal-pubkey*)
-         (old-validation-weight *tapscript-validation-weight-left*)
-         ;; Add TAPSCRIPT flag
          (new-flags (if old-flags
                         (concatenate 'string old-flags ",TAPSCRIPT")
-                        "TAPSCRIPT")))
-    (unwind-protect
-         (progn
-           ;; Set Tapscript context
-           (setf *script-flags* new-flags)
-           (setf *tapscript-leaf-hash* leaf-hash)
-           (setf *tapscript-amount* amount)
-           (setf *tapscript-internal-pubkey* internal-pubkey)
-
-           ;; Convert script-inputs to Coalton stack (list of vectors)
-           ;; Script-inputs is a list of byte arrays, Coalton stack is a list of vectors.
-           ;; Pass real tx context so CLTV/CSV inside tapscript see the actual
-           ;; nLockTime/version/nSequence rather than the no-tx defaults.
-           (let* ((script-vec (cl-array-to-coalton-vector script))
-                  (initial-stack (mapcar #'cl-array-to-coalton-vector script-inputs))
-                  (locktime (if *current-tx*
-                                (bitcoin-lisp.serialization:transaction-lock-time *current-tx*)
-                                0))
-                  (version (if *current-tx*
-                               (bitcoin-lisp.serialization:transaction-version *current-tx*)
-                               1))
-                  (sequence (if (and *current-tx*
-                                     (bitcoin-lisp.serialization:transaction-inputs *current-tx*)
-                                     (< *current-input-index*
-                                        (length (bitcoin-lisp.serialization:transaction-inputs *current-tx*))))
-                                (bitcoin-lisp.serialization:tx-in-sequence
-                                 (nth *current-input-index*
-                                      (bitcoin-lisp.serialization:transaction-inputs *current-tx*)))
-                                #xFFFFFFFF))
-                  (result (bitcoin-lisp.coalton.script:execute-script-with-stack-tx
-                           script-vec initial-stack locktime version sequence)))
-             ;; Check result
-             (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
-                 (let ((final-stack (bitcoin-lisp.coalton.script:get-ok-stack result)))
-                   ;; Script succeeded, check if top of stack is truthy
-                   (if (stack-top-truthy-p final-stack)
-                       (values t nil)
-                       (values nil :script-eval-false)))
-                 (let ((err (bitcoin-lisp.coalton.script:script-result-error result)))
-                   (when *debug-bip341-sighash*
-                     (bitcoin-lisp:log-warn "run-tapscript ScriptErr: ~A" err))
-                   (values nil :script-error)))))
-      ;; Restore context
-      (setf *script-flags* old-flags)
-      (setf *tapscript-leaf-hash* old-leaf-hash)
-      (setf *tapscript-amount* old-amount)
-      (setf *tapscript-internal-pubkey* old-internal-pubkey)
-      (setf *tapscript-validation-weight-left* old-validation-weight))))
+                        "TAPSCRIPT"))
+         (*script-flags* new-flags)
+         (*tapscript-leaf-hash* leaf-hash)
+         (*tapscript-amount* amount)
+         (*tapscript-internal-pubkey* internal-pubkey))
+    (declare (ignorable *tapscript-leaf-hash* *tapscript-amount*
+                        *tapscript-internal-pubkey*))
+    ;; Convert script-inputs to Coalton stack (list of vectors)
+    ;; Script-inputs is a list of byte arrays, Coalton stack is a list of vectors.
+    ;; Pass real tx context so CLTV/CSV inside tapscript see the actual
+    ;; nLockTime/version/nSequence rather than the no-tx defaults.
+    (let* ((script-vec (cl-array-to-coalton-vector script))
+           (initial-stack (mapcar #'cl-array-to-coalton-vector script-inputs))
+           (locktime (if *current-tx*
+                         (bitcoin-lisp.serialization:transaction-lock-time *current-tx*)
+                         0))
+           (version (if *current-tx*
+                        (bitcoin-lisp.serialization:transaction-version *current-tx*)
+                        1))
+           (sequence (if (and *current-tx*
+                              (bitcoin-lisp.serialization:transaction-inputs *current-tx*)
+                              (< *current-input-index*
+                                 (length (bitcoin-lisp.serialization:transaction-inputs *current-tx*))))
+                         (bitcoin-lisp.serialization:tx-in-sequence
+                          (nth *current-input-index*
+                               (bitcoin-lisp.serialization:transaction-inputs *current-tx*)))
+                         #xFFFFFFFF))
+           (result (bitcoin-lisp.coalton.script:execute-script-with-stack-tx
+                    script-vec initial-stack locktime version sequence)))
+      ;; Check result
+      (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
+          (let ((final-stack (bitcoin-lisp.coalton.script:get-ok-stack result)))
+            ;; Script succeeded, check if top of stack is truthy
+            (if (stack-top-truthy-p final-stack)
+                (values t nil)
+                (values nil :script-eval-false)))
+          (let ((err (bitcoin-lisp.coalton.script:script-result-error result)))
+            (when *debug-bip341-sighash*
+              (bitcoin-lisp:log-warn "run-tapscript ScriptErr: ~A" err))
+            (values nil :script-error))))))
 
 ;;; ============================================================
 ;;; SIGPUSHONLY Validation
@@ -2672,15 +2668,18 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
                 (when (scan-for-op-success script)
                   (return-from validate-taproot-script-path (values t nil)))
 
-                ;; 2. Initialize validation weight budget (BIP 342)
-                ;; Budget = serialization_size(witness_stack) + VALIDATION_WEIGHT_OFFSET
-                ;; Uses full witness (including script + control block) as in Bitcoin Core
-                (setf *tapscript-validation-weight-left*
-                      (+ (compute-witness-serialization-size witness)
-                         +validation-weight-offset+))
-
-                ;; 3. Execute the Tapscript with witness inputs as stack
-                (run-tapscript script script-inputs leaf-hash amount internal-pubkey))
+                ;; 2. Initialize validation weight budget (BIP 342) AND
+                ;; execute the Tapscript inside a dynamic let-binding for
+                ;; *tapscript-validation-weight-left*. The earlier code
+                ;; used setf on the global (no rebind) and relied on
+                ;; run-tapscript's unwind-protect to restore — racy
+                ;; across worker threads and a suspected cause of the
+                ;; intermittent h=67100-67105 tapscript bug (Task #22).
+                (let ((*tapscript-validation-weight-left*
+                        (+ (compute-witness-serialization-size witness)
+                           +validation-weight-offset+)))
+                  ;; 3. Execute the Tapscript with witness inputs as stack
+                  (run-tapscript script script-inputs leaf-hash amount internal-pubkey)))
               ;; Unknown leaf version - anyone can spend if DISCOURAGE flag not set
               (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION")
                   (values nil :discourage-upgradable-witness-program)
