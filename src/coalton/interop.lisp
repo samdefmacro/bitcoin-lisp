@@ -345,64 +345,78 @@
 (defvar *precomputed-sighash* nil
   "Per-transaction precomputed sighash data. Bound once before validating inputs.")
 
-(defun serialize-all-prevouts (inputs stream)
+(defun bb-write-all-prevouts (bb inputs)
+  "Write each input's outpoint (32-byte hash + 4-byte LE index) into BB."
   (dolist (inp inputs)
     (let ((prev (bitcoin-lisp.serialization:tx-in-previous-output inp)))
-      (loop for b across (bitcoin-lisp.serialization:outpoint-hash prev)
-            do (write-byte b stream))
-      (write-u32-le (bitcoin-lisp.serialization:outpoint-index prev) stream))))
+      (bitcoin-lisp.serialization:bb-write-bytes
+       bb (bitcoin-lisp.serialization:outpoint-hash prev))
+      (bitcoin-lisp.serialization:bb-write-u32-le
+       bb (bitcoin-lisp.serialization:outpoint-index prev)))))
 
-(defun serialize-all-sequences (inputs stream)
+(defun bb-write-all-sequences (bb inputs)
   (dolist (inp inputs)
-    (write-u32-le (bitcoin-lisp.serialization:tx-in-sequence inp) stream)))
+    (bitcoin-lisp.serialization:bb-write-u32-le
+     bb (bitcoin-lisp.serialization:tx-in-sequence inp))))
 
-(defun serialize-all-outputs (outputs stream)
+(defun bb-write-all-outputs (bb outputs)
   (dolist (out outputs)
-    (write-u64-le (bitcoin-lisp.serialization:tx-out-value out) stream)
+    (bitcoin-lisp.serialization:bb-write-i64-le
+     bb (bitcoin-lisp.serialization:tx-out-value out))
     (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
-      (write-varint (length script) stream)
-      (loop for b across script do (write-byte b stream)))))
+      (bitcoin-lisp.serialization:bb-write-varint bb (length script))
+      (bitcoin-lisp.serialization:bb-write-bytes bb script))))
 
 (defun init-precomputed-sighash (tx &optional spent-utxos)
   "Initialize precomputed sighash data for TX. Call once per transaction.
    When SPENT-UTXOS (vector of utxo-entry) is provided, also populate the
    BIP 341 single-SHA256 fields including sha-amounts and sha-script-pubkeys
-   which are needed for Taproot validation."
+   which are needed for Taproot validation.
+
+   Hot path: called once per non-coinbase tx during validate-block-scripts.
+   Direct byte-buf writes replace the previous flexi-streams + Gray-stream
+   loop-write-byte, mirroring the Phase 1 byte-buf migration in
+   serialize-{transaction,block-header,block} and save-utxo-set. The May 8
+   profile flagged the residual flexi-streams paths here as ~10% of CPU
+   even after libcrypto SHA256 made hashing cheap."
   (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
          (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
-         (prevouts-bytes
-           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-             (serialize-all-prevouts inputs s)))
-         (sequences-bytes
-           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-             (serialize-all-sequences inputs s)))
-         (outputs-bytes
-           (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-             (serialize-all-outputs outputs s)))
-         (sha-prevouts (bitcoin-lisp.crypto:sha256 prevouts-bytes))
-         (sha-sequences (bitcoin-lisp.crypto:sha256 sequences-bytes))
-         (sha-outputs (bitcoin-lisp.crypto:sha256 outputs-bytes)))
-    (make-precomputed-sighash-data
-     :hash-prevouts (bitcoin-lisp.crypto:sha256 sha-prevouts)
-     :hash-sequence (bitcoin-lisp.crypto:sha256 sha-sequences)
-     :hash-outputs-all (bitcoin-lisp.crypto:sha256 sha-outputs)
-     :sha-prevouts sha-prevouts
-     :sha-sequences sha-sequences
-     :sha-outputs sha-outputs
-     :sha-amounts
+         (prevouts-bb (bitcoin-lisp.serialization:make-byte-buf))
+         (sequences-bb (bitcoin-lisp.serialization:make-byte-buf))
+         (outputs-bb (bitcoin-lisp.serialization:make-byte-buf)))
+    (bb-write-all-prevouts prevouts-bb inputs)
+    (bb-write-all-sequences sequences-bb inputs)
+    (bb-write-all-outputs outputs-bb outputs)
+    (let* ((prevouts-bytes (bitcoin-lisp.serialization:bb-finish prevouts-bb))
+           (sequences-bytes (bitcoin-lisp.serialization:bb-finish sequences-bb))
+           (outputs-bytes (bitcoin-lisp.serialization:bb-finish outputs-bb))
+           (sha-prevouts (bitcoin-lisp.crypto:sha256 prevouts-bytes))
+           (sha-sequences (bitcoin-lisp.crypto:sha256 sequences-bytes))
+           (sha-outputs (bitcoin-lisp.crypto:sha256 outputs-bytes)))
+      (make-precomputed-sighash-data
+       :hash-prevouts (bitcoin-lisp.crypto:sha256 sha-prevouts)
+       :hash-sequence (bitcoin-lisp.crypto:sha256 sha-sequences)
+       :hash-outputs-all (bitcoin-lisp.crypto:sha256 sha-outputs)
+       :sha-prevouts sha-prevouts
+       :sha-sequences sha-sequences
+       :sha-outputs sha-outputs
+       :sha-amounts
        (when spent-utxos
-         (bitcoin-lisp.crypto:sha256
-          (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-            (loop for utxo across spent-utxos
-                  do (write-u64-le (bitcoin-lisp.storage:utxo-entry-value utxo) s)))))
-     :sha-script-pubkeys
+         (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+           (loop for utxo across spent-utxos
+                 do (bitcoin-lisp.serialization:bb-write-i64-le
+                     bb (bitcoin-lisp.storage:utxo-entry-value utxo)))
+           (bitcoin-lisp.crypto:sha256
+            (bitcoin-lisp.serialization:bb-finish bb))))
+       :sha-script-pubkeys
        (when spent-utxos
-         (bitcoin-lisp.crypto:sha256
-          (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-            (loop for utxo across spent-utxos
-                  for script = (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)
-                  do (write-varint (length script) s)
-                     (loop for b across script do (write-byte b s)))))))))
+         (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+           (loop for utxo across spent-utxos
+                 for script = (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)
+                 do (bitcoin-lisp.serialization:bb-write-varint bb (length script))
+                    (bitcoin-lisp.serialization:bb-write-bytes bb script))
+           (bitcoin-lisp.crypto:sha256
+            (bitcoin-lisp.serialization:bb-finish bb))))))))
 
 (defvar *witness-v0-mode* nil
   "When non-nil, verify-checksig uses BIP 143 sighash instead of legacy.
@@ -1651,9 +1665,10 @@ Used to remove the signature being verified from the scriptCode before sighash."
            (cond
              ((= base-type 2) zero32)                           ; SIGHASH_NONE
              ((and (= base-type 3) (< input-index (length outputs))) ; SIGHASH_SINGLE
-              (bitcoin-lisp.crypto:hash256
-               (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-                 (serialize-all-outputs (list (nth input-index outputs)) s))))
+              (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+                (bb-write-all-outputs bb (list (nth input-index outputs)))
+                (bitcoin-lisp.crypto:hash256
+                 (bitcoin-lisp.serialization:bb-finish bb))))
              ((= base-type 3) zero32)                           ; SIGHASH_SINGLE out of range
              (t (precomputed-sighash-data-hash-outputs-all precomp)))))
     ;; Build BIP 143 preimage with direct buffer writes — see buf-set-* helpers
@@ -2758,9 +2773,10 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
              (precomputed-sighash-data-sha-outputs precomp)))
          (single-output-hash
            (when (and (= base-type 3) (< input-index (length outputs)))
-             (bitcoin-lisp.crypto:sha256
-              (flexi-streams:with-output-to-sequence (s :element-type '(unsigned-byte 8))
-                (serialize-all-outputs (list (nth input-index outputs)) s)))))
+             (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+               (bb-write-all-outputs bb (list (nth input-index outputs)))
+               (bitcoin-lisp.crypto:sha256
+                (bitcoin-lisp.serialization:bb-finish bb)))))
          (ext-flag (if tapleaf-hash 1 0))
          (spend-type (ash ext-flag 1)))  ; annex bit 0 not yet supported
     ;; Build SigMsg with direct buffer writes — see buf-set-* helpers above.
