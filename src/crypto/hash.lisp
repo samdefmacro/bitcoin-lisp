@@ -8,16 +8,87 @@
 ;;; - RIPEMD160: Used in combination with SHA256 for addresses
 ;;; - Hash160: RIPEMD160(SHA256(x)), used for public key hashes
 
-(defun sha256 (data)
-  "Compute SHA-256 hash of DATA (a byte vector).
-Returns a 32-byte vector."
+;;; ============================================================
+;;; SHA256 via libcrypto (OpenSSL) — Phase C.2
+;;; ============================================================
+;;;
+;;; sb-sprof on testnet4 stress sync showed ~51% of CPU was inside
+;;; ironclad's pure-Lisp SHA256 (UPDATE-SHA256-BLOCK + COMPRESS).
+;;; OpenSSL's libcrypto SHA256 uses SHA-NI / vectorized assembly when
+;;; available, ~5-10x faster than ironclad on per-byte cost. We bind
+;;; the one-shot `SHA256(data, len, md)` function which has been
+;;; stable since OpenSSL 0.9.x and is still the fast path in 3.x.
+
+(cffi:define-foreign-library libcrypto
+  (:darwin (:or "/opt/homebrew/lib/libcrypto.dylib"
+                "/usr/local/lib/libcrypto.dylib"
+                "libcrypto.dylib"))
+  (:unix (:or "libcrypto.so.3" "libcrypto.so.1.1" "libcrypto.so"))
+  (t (:default "libcrypto")))
+
+(defvar *libcrypto-loaded-p* :unknown
+  "Tristate: :unknown (not yet attempted), :loaded (libcrypto OK; sha256
+   routes through it), or :failed (libcrypto missing; we fell back to
+   ironclad and stay there for the rest of the process — no retry on
+   each sha256 call).")
+
+(defun ensure-libcrypto-loaded ()
+  "Attempt to load libcrypto exactly once per process. Returns T if it
+loaded (now or earlier), NIL if it has been determined unavailable."
+  (case *libcrypto-loaded-p*
+    (:loaded t)
+    (:failed nil)
+    (t
+     (handler-case
+         (progn (cffi:load-foreign-library 'libcrypto)
+                (setf *libcrypto-loaded-p* :loaded)
+                t)
+       (error ()
+         (setf *libcrypto-loaded-p* :failed)
+         nil)))))
+
+;; OpenSSL one-shot SHA256: void *SHA256(const unsigned char *d, size_t n,
+;;                                       unsigned char *md);
+;; Returns a pointer to MD on success.
+(cffi:defcfun ("SHA256" %openssl-sha256) :pointer
+  (data :pointer)
+  (len :size)
+  (md :pointer))
+
+(declaim (inline sha256-libcrypto))
+(defun sha256-libcrypto (data)
+  "Compute SHA-256 via libcrypto. DATA must be a (simple-array
+   (unsigned-byte 8) (*)). Returns a fresh 32-byte simple-array."
+  (declare (type (simple-array (unsigned-byte 8) (*)) data)
+           (optimize (speed 3) (safety 1)))
+  (let ((len (length data))
+        (out (make-array 32 :element-type '(unsigned-byte 8))))
+    (declare (type fixnum len)
+             (type (simple-array (unsigned-byte 8) (32)) out))
+    (cffi:with-pointer-to-vector-data (in-ptr data)
+      (cffi:with-pointer-to-vector-data (out-ptr out)
+        (%openssl-sha256 in-ptr len out-ptr)))
+    out))
+
+(defun sha256-ironclad (data)
+  "Pure-Lisp SHA-256 fallback via ironclad."
   (let ((digest (ironclad:make-digest :sha256))
-        ;; Coerce to simple array if needed
         (input (if (typep data '(simple-array (unsigned-byte 8) (*)))
                    data
                    (coerce data '(simple-array (unsigned-byte 8) (*))))))
     (ironclad:update-digest digest input)
     (ironclad:produce-digest digest)))
+
+(defun sha256 (data)
+  "Compute SHA-256 hash of DATA (a byte vector).
+Returns a 32-byte vector. Uses libcrypto when available (~5-10x
+faster than ironclad), falls back to pure-Lisp ironclad otherwise."
+  (if (ensure-libcrypto-loaded)
+      (sha256-libcrypto
+       (if (typep data '(simple-array (unsigned-byte 8) (*)))
+           data
+           (coerce data '(simple-array (unsigned-byte 8) (*)))))
+      (sha256-ironclad data)))
 
 (defun hash256 (data)
   "Compute double SHA-256 hash of DATA (a byte vector).
