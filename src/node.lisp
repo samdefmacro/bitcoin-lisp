@@ -299,9 +299,16 @@ Returns the node instance."
 
   ;; Genesis block index entry is ensured after load-header-index below
 
-  (when (bitcoin-lisp.storage:load-state (node-chain-state *node*))
-    (log-info "Loaded existing chain state: height ~D"
-              (bitcoin-lisp.storage:current-height (node-chain-state *node*))))
+  (let ((load-result (bitcoin-lisp.storage:load-state (node-chain-state *node*))))
+    (case load-result
+      ((:inconsistent)
+       (log-error "Chainstate is in-transition (a previous flush was interrupted between writing chainstate.dat and utxoset.dat). On-disk pair is inconsistent. Please move ~A aside and re-sync from genesis."
+                  (node-data-directory *node*))
+       (error "chainstate inconsistent: re-sync required"))
+      ((t)
+       (log-info "Loaded existing chain state: height ~D"
+                 (bitcoin-lisp.storage:current-height (node-chain-state *node*))))
+      ((nil) nil)))
 
   ;; Initialize block store
   (log-info "Initializing block storage...")
@@ -539,19 +546,42 @@ accounts for ~700 MB. This logger surfaces the gap."
               (/ used-bytes 1048576.0) (/ dyn-bytes 1048576.0))))
 
 (defun do-flush ()
-  "Synchronously flush chainstate + header-index + UTXO set. Inner helper
-   used by both the per-block trigger and the time-based trigger."
+  "Synchronously flush chainstate + header-index + UTXO set with 3-phase
+commit (mirrors Bitcoin Core's DB_HEAD_BLOCKS marker pattern in
+txdb.cpp::CCoinsViewDB::BatchWrite):
+
+  Phase 1: save-state with in-transition=1 — chainstate.dat marked unsafe.
+           If we crash anywhere from here through Phase 3, on restart
+           load-state returns :inconsistent and the caller refuses to
+           start (must re-sync).
+  Phase 2: save-utxo-set — the slow 90-MB write. Uses temp + fsync +
+           rename internally so the file itself is atomic, but it might
+           be old-or-new depending on whether the rename completed.
+  Phase 3: save-state with in-transition=0 — commits the new chainstate.
+
+The previous non-atomic flush ordered chainstate-then-utxo. If
+interrupted between, on-disk best-height was ahead of the saved UTXO
+entries, which then cascaded into MISSING-INPUT validation failures on
+restart (observed at testnet4 h=70541 — block 70514 tx-2's outputs
+were nowhere in utxoset.dat despite chainstate showing h=70540)."
   (log-memory-snapshot "pre-flush")
   (handler-case
       (#+sbcl sb-sys:without-interrupts
        #-sbcl progn
+        ;; Phase 1: mark the chainstate as in-transition.
         (when (node-chain-state *node*)
-          (bitcoin-lisp.storage:save-state (node-chain-state *node*))
+          (bitcoin-lisp.storage:save-state
+           (node-chain-state *node*) :in-transition t)
           (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
+        ;; Phase 2: write the UTXO set (large + slow + atomic per-file).
         (when (node-utxo-set *node*)
           (bitcoin-lisp.storage:save-utxo-set
            (node-utxo-set *node*)
            (bitcoin-lisp.storage:utxo-set-file-path (node-data-directory *node*))))
+        ;; Phase 3: commit by re-saving chainstate without the marker.
+        (when (node-chain-state *node*)
+          (bitcoin-lisp.storage:save-state
+           (node-chain-state *node*) :in-transition nil))
         (setf *last-flush-universal-time* (get-universal-time)
               *blocks-since-flush* 0)
         (log-info "Periodic flush: chainstate at height ~D"
