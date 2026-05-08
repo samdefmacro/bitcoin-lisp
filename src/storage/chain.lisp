@@ -314,6 +314,18 @@ v1 (36/40 bytes): no CRC — legacy fallback"
                    (logand (ash value (* -8 i)) #xFF)))
     (write-sequence bytes stream)))
 
+(declaim (inline bb-write-chainwork))
+(defun bb-write-chainwork (bb value)
+  "byte-buf variant of serialize-chainwork: 32 big-endian bytes."
+  (declare (type bitcoin-lisp.serialization::byte-buf bb)
+           (optimize (speed 3) (safety 1)))
+  (let ((bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (declare (type (simple-array (unsigned-byte 8) (32)) bytes))
+    (loop for i fixnum from 0 below 32
+          do (setf (aref bytes (- 31 i))
+                   (logand (ash value (the fixnum (* -8 i))) #xFF)))
+    (bitcoin-lisp.serialization:bb-write-bytes bb bytes)))
+
 (defun deserialize-chainwork (stream)
   "Read a 32-byte big-endian integer for chain-work."
   (let ((bytes (make-array 32 :element-type '(unsigned-byte 8))))
@@ -323,42 +335,51 @@ v1 (36/40 bytes): no CRC — legacy fallback"
             do (setf value (logior (ash value 8) (aref bytes i))))
       value)))
 
-(defun serialize-header-bytes (stream header)
-  "Serialize the 80-byte block header to stream."
-  (let* ((header-bytes (bitcoin-lisp.serialization::serialize-block-header header))
-         (len (length header-bytes)))
-    (write-sequence header-bytes stream)
-    ;; Pad to 80 bytes if needed
-    (when (< len 80)
-      (loop repeat (- 80 len)
-            do (write-byte 0 stream)))))
+(declaim (inline bb-write-header-bytes bb-write-single-header-entry))
+(defun bb-write-header-bytes (bb header)
+  "byte-buf variant: write 80-byte block header (zero-padded if short)."
+  (declare (optimize (speed 3) (safety 1)))
+  (if header
+      (let* ((header-bytes (bitcoin-lisp.serialization::serialize-block-header header))
+             (len (length header-bytes)))
+        (declare (type fixnum len))
+        (bitcoin-lisp.serialization:bb-write-bytes bb header-bytes)
+        (loop repeat (- 80 len)
+              do (bitcoin-lisp.serialization:bb-write-u8 bb 0)))
+      (loop repeat 80 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))))
+
+(defun bb-write-single-header-entry (bb entry)
+  "byte-buf variant of write-single-header-entry. Writes 181 bytes:
+hash(32) + height(4) + header(80) + chainwork(32) + status(1) + prev-hash(32)."
+  (declare (optimize (speed 3) (safety 1)))
+  (bitcoin-lisp.serialization:bb-write-bytes bb (block-index-entry-hash entry))
+  (bitcoin-lisp.serialization:bb-write-u32-le bb (block-index-entry-height entry))
+  (bb-write-header-bytes bb (block-index-entry-header entry))
+  (bb-write-chainwork bb (block-index-entry-chain-work entry))
+  (bitcoin-lisp.serialization:bb-write-u8 bb
+   (ecase (block-index-entry-status entry)
+     (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3)))
+  (let ((prev-entry (block-index-entry-prev-entry entry)))
+    (if prev-entry
+        (bitcoin-lisp.serialization:bb-write-bytes bb (block-index-entry-hash prev-entry))
+        (loop repeat 32 do (bitcoin-lisp.serialization:bb-write-u8 bb 0)))))
 
 (defun save-header-index (state)
   "Save the block index to a binary file with integrity checks.
-Format: magic(4) + version(4) + count(4) + entries + CRC32(4)."
+Format: magic(4) + version(4) + count(4) + entries + CRC32(4).
+Atomic temp + fsync + rename via save-file-with-crc32-bb."
   (let ((path (header-index-file-path state)))
-    (ensure-directories-exist path)
-    (let ((all-bytes
-            (coerce (flexi-streams:with-output-to-sequence (stream)
-                      ;; Magic
-                      (write-sequence *header-index-magic* stream)
-                      ;; Version
-                      (bitcoin-lisp.serialization:write-uint32-le stream +header-index-format-version+)
-                      ;; Entry count
-                      (let ((count (hash-table-count (chain-state-block-index state))))
-                        (bitcoin-lisp.serialization:write-uint32-le stream count))
-                      ;; Write each entry
-                      (maphash (lambda (hash entry)
-                                 (declare (ignore hash))
-                                 (write-single-header-entry stream entry))
-                               (chain-state-block-index state)))
-                    '(simple-array (unsigned-byte 8) (*)))))
-      (with-open-file (stream path
-                              :direction :output
-                              :if-exists :supersede
-                              :element-type '(unsigned-byte 8))
-        (write-sequence all-bytes stream)
-        (write-sequence (compute-crc32 all-bytes) stream)))
+    (bitcoin-lisp.storage:save-file-with-crc32-bb
+     path
+     (lambda (bb)
+       (bitcoin-lisp.serialization:bb-write-bytes bb *header-index-magic*)
+       (bitcoin-lisp.serialization:bb-write-u32-le bb +header-index-format-version+)
+       (bitcoin-lisp.serialization:bb-write-u32-le
+        bb (hash-table-count (chain-state-block-index state)))
+       (maphash (lambda (hash entry)
+                  (declare (ignore hash))
+                  (bb-write-single-header-entry bb entry))
+                (chain-state-block-index state))))
     t))
 
 (defun load-header-index (state)
@@ -464,30 +485,6 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
                (when (and entry prev-entry)
                  (setf (block-index-entry-prev-entry entry) prev-entry))))
            prev-hash-map))
-
-(defun write-single-header-entry (stream entry)
-  "Write a single block-index-entry to STREAM."
-  ;; 32-byte block hash
-  (write-sequence (block-index-entry-hash entry) stream)
-  ;; 4-byte height
-  (bitcoin-lisp.serialization:write-uint32-le stream (block-index-entry-height entry))
-  ;; 80-byte header (or zeros if no header)
-  (if (block-index-entry-header entry)
-      (serialize-header-bytes stream (block-index-entry-header entry))
-      (loop repeat 80 do (write-byte 0 stream)))
-  ;; 32-byte chainwork
-  (serialize-chainwork stream (block-index-entry-chain-work entry))
-  ;; 1-byte status
-  (write-byte (ecase (block-index-entry-status entry)
-                (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3))
-              stream)
-  ;; 32-byte previous block hash (or zeros)
-  (let ((prev (block-index-entry-prev-entry entry)))
-    (if prev
-        (write-sequence (block-index-entry-hash prev) stream)
-        (write-sequence (make-array 32 :element-type '(unsigned-byte 8)
-                                       :initial-element 0)
-                        stream))))
 
 ;;; Block locator for syncing
 
