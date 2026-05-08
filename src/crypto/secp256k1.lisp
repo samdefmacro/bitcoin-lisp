@@ -459,59 +459,34 @@ When low-s=T and signature has high-S, returns (values nil :high-s)."
   (ensure-secp256k1-loaded)
   (unless (= (length message-hash) 32)
     (return-from verify-signature (values nil t)))  ; parse ok, verification failed
-  (let ((parsed-pubkey (parse-public-key pubkey-bytes)))
-    (unless parsed-pubkey
-      (return-from verify-signature (values nil t)))  ; parse ok, verification failed
-    (cffi:with-foreign-objects ((sig :uint8 +secp256k1-signature-size+)
-                                 (msghash :uint8 32)
-                                 (pubkey :uint8 +secp256k1-pubkey-size+)
-                                 (sig-input :uint8 (max 64 (length signature))))
-      ;; Copy message hash
-      (loop for i from 0 below 32
-            do (setf (cffi:mem-aref msghash :uint8 i) (aref message-hash i)))
-      ;; Copy parsed pubkey
-      (loop for i from 0 below +secp256k1-pubkey-size+
-            do (setf (cffi:mem-aref pubkey :uint8 i) (aref parsed-pubkey i)))
-
-      ;; Parse signature
-      (let ((parse-result
-              (if strict
-                  ;; Strict DER parsing
-                  (progn
-                    (loop for i from 0 below (length signature)
-                          do (setf (cffi:mem-aref sig-input :uint8 i) (aref signature i)))
-                    (secp256k1-ecdsa-signature-parse-der
-                     *secp256k1-context*
-                     sig
-                     sig-input
-                     (length signature)))
-                  ;; Lax parsing - normalize then use compact format
-                  (let ((compact (normalize-signature-lax signature)))
-                    (if compact
-                        (progn
-                          (loop for i from 0 below 64
-                                do (setf (cffi:mem-aref sig-input :uint8 i) (aref compact i)))
-                          (secp256k1-ecdsa-signature-parse-compact
-                           *secp256k1-context*
-                           sig
-                           sig-input))
-                        0)))))  ; Return 0 (failure) if lax parse failed
-        (unless (= parse-result 1)
-          ;; Signature parsing failed
-          ;; In strict mode, report DER parse failure; in lax mode, just verification failure
-          (return-from verify-signature (values nil (not strict))))
-        ;; Normalize signature (convert high-S to low-S if needed)
-        ;; libsecp256k1's verify function requires normalized signatures.
-        ;; Note: sigout can be same as sigin for in-place normalization.
-        ;; Returns 1 if signature was modified (had high-S), 0 if already low-S.
-        (let ((was-high-s (= 1 (secp256k1-ecdsa-signature-normalize *secp256k1-context* sig sig))))
-          ;; If LOW_S flag is set and signature had high-S, reject it
-          (when (and low-s was-high-s)
-            (return-from verify-signature (values nil :high-s)))
-          ;; Verify
-          (let ((verify-result (secp256k1-ecdsa-verify
-                                *secp256k1-context*
-                                sig
-                                msghash
-                                pubkey)))
-            (values (= verify-result 1) t)))))))
+  (let ((pk-len (length pubkey-bytes)))
+    (unless (or (= pk-len 33) (= pk-len 65))
+      (return-from verify-signature (values nil t))))
+  (cffi:with-foreign-objects ((sig :uint8 +secp256k1-signature-size+)
+                               (pubkey :uint8 +secp256k1-pubkey-size+))
+    ;; Parse pubkey directly into foreign buffer (no Lisp round-trip).
+    (cffi:with-pointer-to-vector-data (pk-input pubkey-bytes)
+      (when (zerop (secp256k1-ec-pubkey-parse
+                    *secp256k1-context* pubkey pk-input (length pubkey-bytes)))
+        (return-from verify-signature (values nil t))))
+    ;; Parse signature: strict (DER over pinned input) or lax (compact after Lisp-side normalization).
+    (let ((parse-result
+            (if strict
+                (cffi:with-pointer-to-vector-data (sig-input signature)
+                  (secp256k1-ecdsa-signature-parse-der
+                   *secp256k1-context* sig sig-input (length signature)))
+                (let ((compact (normalize-signature-lax signature)))
+                  (if compact
+                      (cffi:with-pointer-to-vector-data (sig-input compact)
+                        (secp256k1-ecdsa-signature-parse-compact
+                         *secp256k1-context* sig sig-input))
+                      0)))))
+      (unless (= parse-result 1)
+        ;; In strict mode, report DER parse failure; in lax mode, just verification failure.
+        (return-from verify-signature (values nil (not strict))))
+      (let ((was-high-s (= 1 (secp256k1-ecdsa-signature-normalize *secp256k1-context* sig sig))))
+        (when (and low-s was-high-s)
+          (return-from verify-signature (values nil :high-s)))
+        (cffi:with-pointer-to-vector-data (msg-ptr message-hash)
+          (values (= 1 (secp256k1-ecdsa-verify *secp256k1-context* sig msg-ptr pubkey))
+                  t))))))
