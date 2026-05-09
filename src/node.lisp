@@ -1,5 +1,9 @@
 (in-package #:bitcoin-lisp)
 
+#+sbcl
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-sprof))
+
 ;;; Bitcoin Node
 ;;;
 ;;; Main entry point for the Bitcoin full node.
@@ -216,6 +220,8 @@ For testnet, data stays at the base directory (backward compatible)."
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
                         (log-level :info)
+                        (log-file nil)
+                        (console-log t)
                         (max-peers 8)
                         (sync t)
                         (txindex nil)
@@ -229,6 +235,8 @@ For testnet, data stays at the base directory (backward compatible)."
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
 NETWORK: :testnet3 or :mainnet
 LOG-LEVEL: :debug, :info, :warn, or :error
+LOG-FILE: If non-nil, also append node logs to this path (in addition to console)
+CONSOLE-LOG: If T (default), mirror logs to *standard-output* / REPL
 MAX-PEERS: Maximum number of peer connections
 SYNC: If T, start syncing immediately
 TXINDEX: If T, enable transaction index for getrawtransaction lookups
@@ -242,6 +250,14 @@ Returns the node instance."
   (when *node*
     (log-warn "Node already running, stopping first")
     (stop-node))
+
+  ;; Wire up logging BEFORE init-node so its log-info calls go somewhere.
+  ;; Without these, the node runs silently — the May 5 restart had this
+  ;; failure mode (no node.log entries since May 2 16:32 crash).
+  (when console-log
+    (enable-console-logging))
+  (when log-file
+    (start-file-logging log-file))
 
   ;; Validate and set pruning configuration
   (setf *prune-target-mib* prune)
@@ -283,9 +299,16 @@ Returns the node instance."
 
   ;; Genesis block index entry is ensured after load-header-index below
 
-  (when (bitcoin-lisp.storage:load-state (node-chain-state *node*))
-    (log-info "Loaded existing chain state: height ~D"
-              (bitcoin-lisp.storage:current-height (node-chain-state *node*))))
+  (let ((load-result (bitcoin-lisp.storage:load-state (node-chain-state *node*))))
+    (case load-result
+      ((:inconsistent)
+       (log-error "Chainstate is in-transition (a previous flush was interrupted between writing chainstate.dat and utxoset.dat). On-disk pair is inconsistent. Please move ~A aside and re-sync from genesis."
+                  (node-data-directory *node*))
+       (error "chainstate inconsistent: re-sync required"))
+      ((t)
+       (log-info "Loaded existing chain state: height ~D"
+                 (bitcoin-lisp.storage:current-height (node-chain-state *node*))))
+      ((nil) nil)))
 
   ;; Initialize block store
   (log-info "Initializing block storage...")
@@ -302,6 +325,22 @@ Returns the node instance."
     (when (bitcoin-lisp.storage:load-utxo-set (node-utxo-set *node*) utxo-path)
       (log-info "Loaded persisted UTXO set: ~D entries"
                 (bitcoin-lisp.storage:utxo-count (node-utxo-set *node*)))))
+
+  ;; Consistency check: chainstate height > 0 but UTXO set empty/tiny means
+  ;; chainstate.dat survived but utxoset.dat didn't (e.g. crash mid-save). Any
+  ;; subsequent block validation will MISSING-INPUT on the very next tx. Reset
+  ;; to genesis so normal sync replays cleanly. Bitcoin Core's equivalent is
+  ;; "-reindex-chainstate" which rebuilds UTXOs from blocks; we punt to a
+  ;; full re-sync, but at least we detect and recover automatically.
+  (let ((cs-height (bitcoin-lisp.storage:current-height (node-chain-state *node*)))
+        (utxos (bitcoin-lisp.storage:utxo-count (node-utxo-set *node*))))
+    (when (and (> cs-height 100)
+               (< utxos (max 100 (floor cs-height 100))))  ; sanity threshold
+      (log-warn "Chainstate (height ~D) inconsistent with UTXO set (~D entries) — resetting to genesis"
+                cs-height utxos)
+      (let ((genesis-hash (bitcoin-lisp.storage:network-genesis-hash network)))
+        (bitcoin-lisp.storage:update-chain-tip (node-chain-state *node*) genesis-hash 0))
+      (clrhash (bitcoin-lisp.storage::utxo-set-entries (node-utxo-set *node*)))))
 
   ;; Load persisted header index if available
   (when (bitcoin-lisp.storage:load-header-index (node-chain-state *node*))
@@ -393,7 +432,17 @@ Returns the node instance."
           (bt:make-thread
            (lambda ()
              (handler-case
-                 (progn
+                 (handler-bind
+                     ((error
+                        (lambda (c)
+                          ;; handler-bind keeps the stack live; backtrace here
+                          ;; points at the actual error site. handler-case
+                          ;; (outer) then unwinds.
+                          (log-error "Sync thread error: ~A" c)
+                          #+sbcl
+                          (let ((bt (with-output-to-string (s)
+                                      (sb-debug:print-backtrace :stream s :count 50))))
+                            (log-error "Sync thread backtrace:~%~A" bt)))))
                    ;; Initial connection
                    (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
                    (loop while (node-running *node*)
@@ -403,15 +452,19 @@ Returns the node instance."
                                   (unwind-protect
                                        (sync-blockchain *node*)
                                     (setf (node-syncing *node*) nil))
-                                  ;; Check if we've caught up
+                                  ;; Check if we've caught up. Only declare
+                                  ;; "complete" when we actually have a peer to
+                                  ;; compare heights with — otherwise all peers
+                                  ;; may have just disconnected (stalling under
+                                  ;; slow validation), and the bare height test
+                                  ;; would falsely conclude we're synced.
                                   (let* ((best-peer (find-best-peer *node*))
-                                         (peer-height (if best-peer
-                                                          (bitcoin-lisp.networking:peer-start-height
-                                                           best-peer)
-                                                          0))
                                          (our-height (bitcoin-lisp.storage:current-height
                                                       (node-chain-state *node*))))
-                                    (when (>= our-height peer-height)
+                                    (when (and best-peer
+                                               (>= our-height
+                                                   (bitcoin-lisp.networking:peer-start-height
+                                                    best-peer)))
                                       (log-info "Sync complete at height ~D" our-height)
                                       (return)))
                                   ;; Replace any peers lost during sync
@@ -422,12 +475,208 @@ Returns the node instance."
                                   (sleep 5)
                                   (connect-to-peers *node* max-peers
                                                     :timeout 30 :min-peers 1)))))
-               (error (c)
-                 (log-error "Sync thread error: ~A" c))))
+               (error () nil)))
            :name "bitcoin-sync-thread")))
 
+  (install-shutdown-handler)
   (log-info "Node started successfully")
   *node*)
+
+(defparameter +flush-every-n-blocks+ 1000
+  "Flush chainstate + UTXO set to disk every N connected blocks so a hard
+   crash loses at most N blocks of work. Mirrors Bitcoin Core's
+   nMinBlocksToKeep / FlushStateToDisk cadence (validation.cpp).")
+
+(defparameter +flush-every-n-seconds+ 600
+  "Time-based flush trigger (10 min): flush if at least N seconds have
+   elapsed since the last flush, regardless of block count. Without this,
+   a slow sync window (~2 b/s on testnet4 stress regions) takes ~8 min
+   to accumulate 1000 blocks, and a connect-tip stall halts flushes
+   entirely (May 2 crash: stuck at h=70700 for 1h40m, last save was at
+   h=70000 at 14:34, lost 700 blocks of progress + caused full re-sync
+   from genesis on restart). Bitcoin Core uses DATABASE_WRITE_INTERVAL
+   = 1h (validation.cpp:DATABASE_WRITE_INTERVAL) — we use 10 min because
+   our re-validation from a checkpoint is much slower than Core's.")
+
+(defvar *blocks-since-flush* 0
+  "Counter incremented per connected block; reset to 0 when a flush runs.")
+
+(defvar *last-flush-universal-time* 0
+  "Wall-clock time (get-universal-time) of the last successful periodic
+   flush. Used by the time-based trigger.")
+
+(defun log-memory-snapshot (label)
+  "Log a snapshot of the major in-memory caches plus SBCL heap usage.
+Used to diagnose memory growth — call before/after flush so we can
+correlate cache sizes with the heap watermark.
+
+The May 5 OOM at h=72814 had heap at 8.55 GB but the explainable
+state (UTXO 600MB + headers 30MB + sig-cache 5MB + queues 80MB) only
+accounts for ~700 MB. This logger surfaces the gap."
+  #+sbcl
+  (let* ((utxo-count (and (node-utxo-set *node*)
+                          (bitcoin-lisp.storage:utxo-count
+                           (node-utxo-set *node*))))
+         (header-count (and (node-chain-state *node*)
+                            (hash-table-count
+                             (bitcoin-lisp.storage::chain-state-block-index
+                              (node-chain-state *node*)))))
+         (sig-cache-count
+           (hash-table-count bitcoin-lisp.coalton.interop:*signature-cache*))
+         (ibd-pending
+           (and bitcoin-lisp.networking::*ibd-context*
+                (hash-table-count
+                 (bitcoin-lisp.networking::ibd-context-pending-blocks
+                  bitcoin-lisp.networking::*ibd-context*))))
+         (ibd-queue
+           (and bitcoin-lisp.networking::*ibd-context*
+                (hash-table-count
+                 (bitcoin-lisp.networking::ibd-context-block-queue
+                  bitcoin-lisp.networking::*ibd-context*))))
+         (ibd-in-flight
+           (and bitcoin-lisp.networking::*ibd-context*
+                (hash-table-count
+                 (bitcoin-lisp.networking::ibd-context-in-flight
+                  bitcoin-lisp.networking::*ibd-context*))))
+         (dyn-bytes (sb-ext:dynamic-space-size))
+         (used-bytes (sb-kernel:dynamic-usage)))
+    (log-info "MEM[~A]: utxo=~D headers=~D sigcache=~D ibd-pend=~A queue=~A inflight=~A heap-used=~,1FMB heap-cap=~,1FMB"
+              label utxo-count header-count sig-cache-count
+              ibd-pending ibd-queue ibd-in-flight
+              (/ used-bytes 1048576.0) (/ dyn-bytes 1048576.0))))
+
+(defun do-flush ()
+  "Synchronously flush chainstate + header-index + UTXO set with 3-phase
+commit (mirrors Bitcoin Core's DB_HEAD_BLOCKS marker pattern in
+txdb.cpp::CCoinsViewDB::BatchWrite):
+
+  Phase 1: save-state with in-transition=1 — chainstate.dat marked unsafe.
+           If we crash anywhere from here through Phase 3, on restart
+           load-state returns :inconsistent and the caller refuses to
+           start (must re-sync).
+  Phase 2: save-utxo-set — the slow 90-MB write. Uses temp + fsync +
+           rename internally so the file itself is atomic, but it might
+           be old-or-new depending on whether the rename completed.
+  Phase 3: save-state with in-transition=0 — commits the new chainstate.
+
+The previous non-atomic flush ordered chainstate-then-utxo. If
+interrupted between, on-disk best-height was ahead of the saved UTXO
+entries, which then cascaded into MISSING-INPUT validation failures on
+restart (observed at testnet4 h=70541 — block 70514 tx-2's outputs
+were nowhere in utxoset.dat despite chainstate showing h=70540)."
+  (log-memory-snapshot "pre-flush")
+  (handler-case
+      (#+sbcl sb-sys:without-interrupts
+       #-sbcl progn
+        ;; Phase 1: mark the chainstate as in-transition.
+        (when (node-chain-state *node*)
+          (bitcoin-lisp.storage:save-state
+           (node-chain-state *node*) :in-transition t)
+          (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
+        ;; Phase 2: write the UTXO set (large + slow + atomic per-file).
+        (when (node-utxo-set *node*)
+          (bitcoin-lisp.storage:save-utxo-set
+           (node-utxo-set *node*)
+           (bitcoin-lisp.storage:utxo-set-file-path (node-data-directory *node*))))
+        ;; Phase 3: commit by re-saving chainstate without the marker.
+        (when (node-chain-state *node*)
+          (bitcoin-lisp.storage:save-state
+           (node-chain-state *node*) :in-transition nil))
+        (setf *last-flush-universal-time* (get-universal-time)
+              *blocks-since-flush* 0)
+        (log-info "Periodic flush: chainstate at height ~D"
+                  (and (node-chain-state *node*)
+                       (bitcoin-lisp.storage:current-height
+                        (node-chain-state *node*)))))
+    (error (c)
+      ;; Was log-warn before — surfaced silently. Bumped to log-error so
+      ;; persistence failures are obvious in the log instead of getting
+      ;; lost between progress lines.
+      (log-error "Periodic flush FAILED: ~A" c)))
+  ;; After flush, request a major GC so reachable post-flush memory is the
+  ;; only thing in the old generations next time we measure. This is the
+  ;; same pattern as Bitcoin Core's CCoinsViewCache::Flush returning bytes
+  ;; freed to the system allocator.
+  #+sbcl (sb-ext:gc :full t)
+  (log-memory-snapshot "post-flush"))
+
+(defun maybe-periodic-flush ()
+  "Flush chainstate, UTXO set, and header index to disk if either:
+- N blocks have been connected since the last flush, OR
+- N seconds have elapsed since the last flush (catches slow-sync regions
+  where 1000 blocks would take many minutes to accumulate).
+
+Called from connect-block. Cheap if no flush needed; durable if it does
+flush (atomic temp+fsync+rename inside save-*)."
+  (unless *node* (return-from maybe-periodic-flush))
+  (incf *blocks-since-flush*)
+  (when (zerop *last-flush-universal-time*)
+    (setf *last-flush-universal-time* (get-universal-time)))
+  (when (or (>= *blocks-since-flush* +flush-every-n-blocks+)
+            (>= (- (get-universal-time) *last-flush-universal-time*)
+                +flush-every-n-seconds+))
+    (do-flush)))
+
+(defun install-shutdown-handler ()
+  "Trap SIGTERM and SIGINT so kill <pid> / Ctrl-C calls stop-node and persists
+   chain state and UTXO set before exit. Without this, SIGKILL is the only way
+   to stop a long-running node and IBD must restart from genesis on next boot.
+
+   Also installs a fail-fast debugger hook: any unhandled error (including
+   heap-exhausted) logs a stack and exits non-zero rather than dropping into
+   LDB on a tty no one is reading."
+  #+sbcl
+  (let ((handler
+          (lambda (&rest _)
+            (declare (ignore _))
+            (format *error-output* "~&[shutdown] caught signal — saving state~%")
+            (ignore-errors (stop-node))
+            (sb-ext:exit :code 0))))
+    (sb-sys:enable-interrupt sb-unix:sigterm handler)
+    (sb-sys:enable-interrupt sb-unix:sigint handler))
+  ;; SIGUSR1 toggles sb-sprof profiling. First USR1: start sampling. Second
+  ;; USR1: stop, write graph + flat report to /data/bitcoin-lisp/logs/profile.txt.
+  ;; Use to identify the hot path during live validation: kill -USR1 <pid> to
+  ;; arm, wait through a heavy block, kill -USR1 <pid> again, then read report.
+  #+sbcl
+  (let ((profiling nil))
+    (sb-sys:enable-interrupt
+     sb-unix:sigusr1
+     (lambda (&rest _)
+       (declare (ignore _))
+       (cond
+         ((not profiling)
+          (sb-sprof:reset)
+          (sb-sprof:start-profiling :max-samples 200000
+                                    :sample-interval 0.001
+                                    :mode :cpu
+                                    :threads :all)
+          (setf profiling t)
+          (log-info "[sprof] profiling started"))
+         (t
+          (sb-sprof:stop-profiling)
+          (with-open-file (s "/data/bitcoin-lisp/logs/profile.txt"
+                             :direction :output
+                             :if-exists :supersede
+                             :if-does-not-exist :create)
+            (let ((*standard-output* s))
+              (format s "=== sb-sprof flat report ===~%")
+              (sb-sprof:report :type :flat :max 60)
+              (format s "~%~%=== sb-sprof graph report ===~%")
+              (sb-sprof:report :type :graph :max 50)))
+          (setf profiling nil)
+          (log-info "[sprof] profile written to /data/bitcoin-lisp/logs/profile.txt")))))
+    (log-info "SIGUSR1 toggles sb-sprof profiling"))
+  #+sbcl
+  (setf sb-ext:*invoke-debugger-hook*
+        (lambda (condition hook)
+          (declare (ignore hook))
+          (ignore-errors
+            (log-error "Fatal: ~A" condition)
+            (let ((bt (with-output-to-string (s)
+                        (sb-debug:print-backtrace :stream s :count 30))))
+              (log-error "Backtrace:~%~A" bt)))
+          (sb-ext:exit :code 1))))
 
 (defun stop-node ()
   "Stop the running Bitcoin node."
@@ -447,7 +696,12 @@ Returns the node instance."
              (bt:thread-alive-p (node-sync-thread *node*)))
     (log-info "Waiting for sync thread to stop...")
     (let ((deadline (+ (get-internal-real-time)
-                       (* 5 internal-time-units-per-second))))
+                       ;; 10 minutes — long enough that a single heavy block's
+                       ;; validation finishes and connect-block updates UTXO set
+                       ;; + chain tip atomically, so destroy-thread fallback
+                       ;; (which can corrupt mid-update state) is virtually
+                       ;; never needed.
+                       (* 600 internal-time-units-per-second))))
       (loop while (and (bt:thread-alive-p (node-sync-thread *node*))
                        (< (get-internal-real-time) deadline))
             do (sleep 0.1))

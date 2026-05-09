@@ -30,6 +30,18 @@ INDEX is the output index within that transaction."
   (write-hash256 stream (outpoint-hash outpoint))
   (write-uint32-le stream (outpoint-index outpoint)))
 
+(declaim (inline bb-write-outpoint))
+(defun bb-write-outpoint (bb outpoint)
+  "Write an outpoint into byte-buf BB (32-byte hash + 4-byte LE index)."
+  (bb-write-bytes bb (outpoint-hash outpoint))
+  (bb-write-u32-le bb (outpoint-index outpoint)))
+
+(declaim (inline br-read-outpoint))
+(defun br-read-outpoint (br)
+  "Read an outpoint from a byte-reader (32-byte hash + 4-byte LE index)."
+  (make-outpoint :hash (br-read-bytes br 32)
+                 :index (br-read-u32-le br)))
+
 (defun null-outpoint-p (outpoint)
   "Check if OUTPOINT is null (references no previous output)."
   (and (every #'zerop (outpoint-hash outpoint))
@@ -58,6 +70,22 @@ SEQUENCE: Sequence number for replacement/locktime."
   (write-var-bytes stream (tx-in-script-sig tx-in))
   (write-uint32-le stream (tx-in-sequence tx-in)))
 
+(declaim (inline bb-write-tx-in))
+(defun bb-write-tx-in (bb tx-in)
+  "Write a transaction input into byte-buf BB."
+  (bb-write-outpoint bb (tx-in-previous-output tx-in))
+  (let ((script (tx-in-script-sig tx-in)))
+    (bb-write-varint bb (length script))
+    (bb-write-bytes bb script))
+  (bb-write-u32-le bb (tx-in-sequence tx-in)))
+
+(declaim (inline br-read-tx-in))
+(defun br-read-tx-in (br)
+  "Read a transaction input from a byte-reader."
+  (make-tx-in :previous-output (br-read-outpoint br)
+              :script-sig (br-read-var-bytes br)
+              :sequence (br-read-u32-le br)))
+
 (defun coinbase-input-p (tx-in)
   "Check if TX-IN is a coinbase input."
   (null-outpoint-p (tx-in-previous-output tx-in)))
@@ -81,6 +109,20 @@ SCRIPT-PUBKEY: Locking script."
   (write-int64-le stream (tx-out-value tx-out))
   (write-var-bytes stream (tx-out-script-pubkey tx-out)))
 
+(declaim (inline bb-write-tx-out))
+(defun bb-write-tx-out (bb tx-out)
+  "Write a transaction output into byte-buf BB."
+  (bb-write-i64-le bb (tx-out-value tx-out))
+  (let ((script (tx-out-script-pubkey tx-out)))
+    (bb-write-varint bb (length script))
+    (bb-write-bytes bb script)))
+
+(declaim (inline br-read-tx-out))
+(defun br-read-tx-out (br)
+  "Read a transaction output from a byte-reader."
+  (make-tx-out :value (br-read-i64-le br)
+               :script-pubkey (br-read-var-bytes br)))
+
 ;;;; Transaction
 
 (defstruct transaction
@@ -97,7 +139,11 @@ WITNESS: List of witness stacks, one per input. Each stack is a list of
   (lock-time 0 :type (unsigned-byte 32))
   (witness nil :type list)
   ;; Cached hash (computed lazily)
-  (cached-hash nil))
+  (cached-hash nil)
+  ;; Cached weight (BIP 141). transaction-weight requires two full re-
+  ;; serializations of the tx; profiling showed this was ~16% of CPU on
+  ;; testnet4 stress blocks. Compute once, reuse forever.
+  (cached-weight nil))
 
 (defun transaction-has-witness-p (tx)
   "Check if TX has witness data."
@@ -117,6 +163,63 @@ Returns a list of byte vectors."
   (write-compact-size stream (length stack))
   (dolist (item stack)
     (write-var-bytes stream item)))
+
+(defun br-read-witness-stack (br)
+  "Read a single witness stack (one input's worth) from a byte-reader."
+  (let ((item-count (br-read-compact-size br)))
+    (loop repeat item-count
+          collect (br-read-var-bytes br))))
+
+(defun br-read-transaction (br)
+  "Read a transaction from a byte-reader. Auto-detects BIP 144 witness
+format by checking for marker byte 0x00 where the input count would be.
+Hot path: called per tx during block parsing — index-based reads avoid
+flexi-streams' Gray-stream input dispatch."
+  (let* ((version (br-read-i32-le br))
+         (marker (br-read-u8 br)))
+    (if (zerop marker)
+        ;; Witness format: marker=0x00, flag=0x01
+        (let ((flag (br-read-u8 br)))
+          (unless (= flag 1)
+            (error "Invalid witness flag byte: ~D" flag))
+          (let* ((input-count (br-read-compact-size br))
+                 (inputs (loop repeat input-count collect (br-read-tx-in br)))
+                 (output-count (br-read-compact-size br))
+                 (outputs (loop repeat output-count collect (br-read-tx-out br)))
+                 (witness (loop repeat input-count
+                                collect (br-read-witness-stack br)))
+                 (lock-time (br-read-u32-le br)))
+            (make-transaction :version version
+                              :inputs inputs
+                              :outputs outputs
+                              :lock-time lock-time
+                              :witness witness)))
+        ;; Legacy format: marker was the first byte of input-count.
+        (let* ((input-count
+                 (cond ((< marker 253) marker)
+                       ((= marker 253)
+                        (let ((v (br-read-u16-le br)))
+                          (when (< v 253)
+                            (error "non-canonical ReadCompactSize"))
+                          v))
+                       ((= marker 254)
+                        (let ((v (br-read-u32-le br)))
+                          (when (< v #x10000)
+                            (error "non-canonical ReadCompactSize"))
+                          v))
+                       (t
+                        (let ((v (br-read-u64-le br)))
+                          (when (< v #x100000000)
+                            (error "non-canonical ReadCompactSize"))
+                          v))))
+               (inputs (loop repeat input-count collect (br-read-tx-in br)))
+               (output-count (br-read-compact-size br))
+               (outputs (loop repeat output-count collect (br-read-tx-out br)))
+               (lock-time (br-read-u32-le br)))
+          (make-transaction :version version
+                            :inputs inputs
+                            :outputs outputs
+                            :lock-time lock-time)))))
 
 (defun read-transaction (stream)
   "Read a transaction from STREAM.
@@ -155,12 +258,30 @@ where the input count would normally be."
                             :lock-time lock-time)))))
 
 (defun decode-compact-size-from-first-byte (first-byte stream)
-  "Decode a CompactSize integer given that FIRST-BYTE has already been read."
-  (cond
-    ((< first-byte 253) first-byte)
-    ((= first-byte 253) (read-uint16-le stream))
-    ((= first-byte 254) (read-uint32-le stream))
-    (t (read-uint64-le stream))))
+  "Decode a CompactSize integer given that FIRST-BYTE has already been read.
+Enforces non-canonical rejection and the MAX_SIZE cap, mirroring
+read-compact-size and Bitcoin Core's ReadCompactSize (serialize.h:330-360)."
+  (let ((value (cond
+                 ((< first-byte 253) first-byte)
+                 ((= first-byte 253)
+                  (let ((v (read-uint16-le stream)))
+                    (when (< v 253)
+                      (error "non-canonical ReadCompactSize"))
+                    v))
+                 ((= first-byte 254)
+                  (let ((v (read-uint32-le stream)))
+                    (when (< v #x10000)
+                      (error "non-canonical ReadCompactSize"))
+                    v))
+                 (t
+                  (let ((v (read-uint64-le stream)))
+                    (when (< v #x100000000)
+                      (error "non-canonical ReadCompactSize"))
+                    v)))))
+    (when (> value +max-compact-size+)
+      (error "ReadCompactSize: size too large (~D > ~D)"
+             value +max-compact-size+))
+    value))
 
 (defun write-transaction (stream tx)
   "Write a transaction to STREAM in legacy format (no witness).
@@ -198,15 +319,57 @@ Used for txid computation."
   ;; Lock time
   (write-uint32-le stream (transaction-lock-time tx)))
 
+(defun bb-write-transaction-legacy (bb tx)
+  "Write transaction TX into byte-buf BB in legacy format (no witness)."
+  (bb-write-i32-le bb (transaction-version tx))
+  (let ((inputs (transaction-inputs tx)))
+    (bb-write-varint bb (length inputs))
+    (dolist (input inputs)
+      (bb-write-tx-in bb input)))
+  (let ((outputs (transaction-outputs tx)))
+    (bb-write-varint bb (length outputs))
+    (dolist (output outputs)
+      (bb-write-tx-out bb output)))
+  (bb-write-u32-le bb (transaction-lock-time tx)))
+
 (defun serialize-transaction (tx)
-  "Serialize transaction TX to a byte vector in legacy format (for txid)."
-  (flexi-streams:with-output-to-sequence (stream)
-    (write-transaction stream tx)))
+  "Serialize transaction TX to a byte vector in legacy format (for txid).
+
+Hot path: called from transaction-hash on every tx, and twice from
+transaction-weight (legacy + witness sizes). Direct byte-buf writes
+replace flexi-streams' per-byte CLOS dispatch — May 2 profile pinned
+flexi-streams at ~50% of CPU during validation."
+  (let ((bb (make-byte-buf)))
+    (bb-write-transaction-legacy bb tx)
+    (bb-finish bb)))
 
 (defun serialize-witness-transaction (tx)
   "Serialize transaction TX to a byte vector in BIP 144 witness format."
-  (flexi-streams:with-output-to-sequence (stream)
-    (write-witness-transaction stream tx)))
+  (let ((bb (make-byte-buf))
+        (inputs (transaction-inputs tx))
+        (outputs (transaction-outputs tx))
+        (witness (transaction-witness tx)))
+    (bb-write-i32-le bb (transaction-version tx))
+    ;; Marker + flag
+    (bb-write-u8 bb #x00)
+    (bb-write-u8 bb #x01)
+    (bb-write-varint bb (length inputs))
+    (dolist (input inputs)
+      (bb-write-tx-in bb input))
+    (bb-write-varint bb (length outputs))
+    (dolist (output outputs)
+      (bb-write-tx-out bb output))
+    ;; Witness stacks (one per input)
+    (loop for i below (length inputs)
+          for stack = (if (and witness (< i (length witness)))
+                          (nth i witness)
+                          '())
+          do (bb-write-varint bb (length stack))
+             (dolist (item stack)
+               (bb-write-varint bb (length item))
+               (bb-write-bytes bb item)))
+    (bb-write-u32-le bb (transaction-lock-time tx))
+    (bb-finish bb)))
 
 (defun transaction-hash (tx)
   "Compute the transaction hash (txid).
@@ -235,12 +398,14 @@ For legacy transactions without witness, wtxid equals txid."
 (defun transaction-weight (tx)
   "Calculate the weight of a transaction in weight units (BIP 141).
 Weight = (base_size * 3) + total_size, where base_size excludes witness data.
-For legacy transactions: weight = total_size * 4."
-  (if (transaction-has-witness-p tx)
-      (let* ((base-size (length (serialize-transaction tx)))
-             (total-size (length (serialize-witness-transaction tx))))
-        (+ (* 3 base-size) total-size))
-      (* 4 (length (serialize-transaction tx)))))
+For legacy transactions: weight = total_size * 4. Cached on the tx struct."
+  (or (transaction-cached-weight tx)
+      (setf (transaction-cached-weight tx)
+            (if (transaction-has-witness-p tx)
+                (let* ((base-size (length (serialize-transaction tx)))
+                       (total-size (length (serialize-witness-transaction tx))))
+                  (+ (* 3 base-size) total-size))
+                (* 4 (length (serialize-transaction tx)))))))
 
 (defun transaction-vsize (tx)
   "Calculate the virtual size (vsize) of a transaction in vbytes.
@@ -277,6 +442,16 @@ NONCE: Proof-of-work nonce."
                      :bits (read-uint32-le stream)
                      :nonce (read-uint32-le stream)))
 
+(declaim (inline br-read-block-header))
+(defun br-read-block-header (br)
+  "Read a block header from a byte-reader (80 bytes)."
+  (make-block-header :version (br-read-i32-le br)
+                     :prev-block (br-read-bytes br 32)
+                     :merkle-root (br-read-bytes br 32)
+                     :timestamp (br-read-u32-le br)
+                     :bits (br-read-u32-le br)
+                     :nonce (br-read-u32-le br)))
+
 (defun write-block-header (stream header)
   "Write a block header to STREAM."
   (write-int32-le stream (block-header-version header))
@@ -286,10 +461,24 @@ NONCE: Proof-of-work nonce."
   (write-uint32-le stream (block-header-bits header))
   (write-uint32-le stream (block-header-nonce header)))
 
+(declaim (inline bb-write-block-header))
+(defun bb-write-block-header (bb header)
+  "Write an 80-byte block header into byte-buf BB."
+  (bb-write-i32-le bb (block-header-version header))
+  (bb-write-bytes bb (block-header-prev-block header))
+  (bb-write-bytes bb (block-header-merkle-root header))
+  (bb-write-u32-le bb (block-header-timestamp header))
+  (bb-write-u32-le bb (block-header-bits header))
+  (bb-write-u32-le bb (block-header-nonce header)))
+
 (defun serialize-block-header (header)
-  "Serialize block header to a byte vector (80 bytes)."
-  (flexi-streams:with-output-to-sequence (stream)
-    (write-block-header stream header)))
+  "Serialize block header to a byte vector (80 bytes).
+Hot path: called on every block-header-hash. Direct buffer writes to
+avoid flexi-streams CLOS dispatch — the 80-byte cost is small but it
+fires once per block on the IBD validation path."
+  (let ((bb (make-byte-buf)))
+    (bb-write-block-header bb header)
+    (bb-finish bb)))
 
 (defun block-header-hash (header)
   "Compute the block hash from the header.
@@ -316,6 +505,14 @@ TRANSACTIONS: List of transactions in the block."
     (make-bitcoin-block :header header
                         :transactions transactions)))
 
+(defun br-read-bitcoin-block (br)
+  "Read a complete block from a byte-reader. Hot path (per inbound block)."
+  (let* ((header (br-read-block-header br))
+         (tx-count (br-read-compact-size br))
+         (transactions (loop repeat tx-count collect (br-read-transaction br))))
+    (make-bitcoin-block :header header
+                        :transactions transactions)))
+
 (defun write-bitcoin-block (stream block)
   "Write a complete block to STREAM."
   (write-block-header stream (bitcoin-block-header block))
@@ -338,5 +535,14 @@ TRANSACTIONS: List of transactions in the block."
   (serialize-block-header header))
 
 (defmethod serialize ((block bitcoin-block))
-  (flexi-streams:with-output-to-sequence (stream)
-    (write-bitcoin-block stream block)))
+  ;; Hot path: called from store-block + save-undo-data per block.
+  ;; Build into a byte-buf, writing each tx in-place to avoid the
+  ;; per-tx intermediate byte-vector allocation that bb-write-bytes
+  ;; (serialize-transaction tx) would do.
+  (let ((bb (make-byte-buf))
+        (txs (bitcoin-block-transactions block)))
+    (bb-write-block-header bb (bitcoin-block-header block))
+    (bb-write-varint bb (length txs))
+    (dolist (tx txs)
+      (bb-write-transaction-legacy bb tx))
+    (bb-finish bb)))

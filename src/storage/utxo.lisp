@@ -144,6 +144,17 @@ PREVIOUS-UTXOS should be a list of (txid index entry) for restored UTXOs."
     (bitcoin-lisp.serialization:write-uint32-le stream (length script))
     (write-sequence script stream)))
 
+(declaim (inline bb-write-utxo-entry-fields))
+(defun bb-write-utxo-entry-fields (bb entry)
+  "Write utxo-entry fields directly into byte-buf BB. Hot path: called
+1.2M+ times during save-utxo-set."
+  (bitcoin-lisp.serialization:bb-write-i64-le bb (utxo-entry-value entry))
+  (bitcoin-lisp.serialization:bb-write-u32-le bb (utxo-entry-height entry))
+  (bitcoin-lisp.serialization:bb-write-u8 bb (if (utxo-entry-coinbase entry) 1 0))
+  (let ((script (utxo-entry-script-pubkey entry)))
+    (bitcoin-lisp.serialization:bb-write-u32-le bb (length script))
+    (bitcoin-lisp.serialization:bb-write-bytes bb script)))
+
 (defun read-utxo-entry-fields (stream)
   "Read utxo-entry fields from STREAM. Returns a utxo-entry."
   (let* ((value (bitcoin-lisp.serialization:read-int64-le stream))
@@ -159,10 +170,25 @@ PREVIOUS-UTXOS should be a list of (txid index entry) for restored UTXOs."
 
 ;;; Atomic file I/O with CRC32 integrity
 
+(defun fsync-file (path)
+  "Force the OS to flush PATH's data to durable storage. Without this,
+   a temp+rename atomic write can still leave the destination empty after
+   a crash because the kernel hadn't flushed the buffered writes yet."
+  #+sbcl
+  (handler-case
+      (with-open-file (s path :direction :input
+                              :element-type '(unsigned-byte 8))
+        (sb-posix:fsync (sb-sys:fd-stream-fd s)))
+    (error () nil)))
+
 (defun save-file-with-crc32 (path write-fn)
   "Write data to PATH atomically with CRC32 integrity.
 WRITE-FN receives a stream and writes the payload (including magic/version/count).
-Uses temp file + rename for atomicity."
+Uses temp file + fsync + rename for crash-safe atomicity.
+
+Stream-based variant. For hot-path saves (save-utxo-set), prefer
+SAVE-FILE-WITH-CRC32-BB which avoids flexi-streams' per-byte CLOS
+dispatch — was 18% of total CPU on the May 2 testnet4 profile."
   (ensure-directories-exist path)
   (let ((tmp-path (make-pathname :defaults path
                                  :type (concatenate 'string
@@ -175,7 +201,76 @@ Uses temp file + rename for atomicity."
                            :if-exists :supersede
                            :element-type '(unsigned-byte 8))
         (write-sequence all-bytes out)
-        (write-sequence (compute-crc32 all-bytes) out))
+        (write-sequence (compute-crc32 all-bytes) out)
+        (finish-output out))
+      ;; fsync the data before rename — guarantees the new file is on disk
+      ;; before any other process (or our crash) sees the rename.
+      (fsync-file tmp-path)
+      (rename-file tmp-path path))))
+
+(defun save-file-with-crc32-streaming-bb (path bb-fn &key (flush-threshold (* 4 1024 1024)))
+  "Streaming variant of save-file-with-crc32-bb. BB-FN receives
+(byte-buf flush-fn); calling flush-fn writes the current contents of
+the byte-buf to disk, advances the running CRC, and resets bb-pos to
+0 so the same buffer can keep growing.
+
+Used for very large payloads (UTXO at 10M+ entries) where buffering
+the entire serialization in memory exhausts the heap — observed at
+testnet4 h≈70k where a 322MB single-buffer allocation overran the
+remaining contiguous heap. The CRC32 still covers the full payload
+exactly as if it had been one byte vector.
+
+FLUSH-THRESHOLD is a soft hint: BB-FN may call flush-fn whenever
+bb-pos exceeds it. The final flush + CRC append are automatic; bb-fn
+must NOT call bb-finish."
+  (declare (ignore flush-threshold))
+  (ensure-directories-exist path)
+  (let ((tmp-path (make-pathname :defaults path
+                                 :type (concatenate 'string
+                                                    (or (pathname-type path) "dat")
+                                                    ".tmp"))))
+    (with-open-file (out tmp-path
+                         :direction :output
+                         :if-exists :supersede
+                         :element-type '(unsigned-byte 8))
+      (let* ((bb (bitcoin-lisp.serialization:make-byte-buf))
+             (digest (ironclad:make-digest :crc32))
+             (flush-fn
+               (lambda ()
+                 (let ((n (bitcoin-lisp.serialization:bb-pos bb)))
+                   (when (> n 0)
+                     (let ((data (bitcoin-lisp.serialization:bb-data bb)))
+                       (ironclad:update-digest digest data :end n)
+                       (write-sequence data out :end n)
+                       (setf (bitcoin-lisp.serialization:bb-pos bb) 0)))))))
+        (funcall bb-fn bb flush-fn)
+        (funcall flush-fn)
+        (write-sequence (ironclad:produce-digest digest) out)
+        (finish-output out)))
+    (fsync-file tmp-path)
+    (rename-file tmp-path path)))
+
+(defun save-file-with-crc32-bb (path bb-fn)
+  "Like SAVE-FILE-WITH-CRC32 but BB-FN receives a byte-buf and writes
+into it directly. Avoids the flexi-streams + Gray-stream CLOS dispatch
+that dominated CPU on UTXO/state flushes."
+  (ensure-directories-exist path)
+  (let ((tmp-path (make-pathname :defaults path
+                                 :type (concatenate 'string
+                                                    (or (pathname-type path) "dat")
+                                                    ".tmp"))))
+    (let* ((bb (bitcoin-lisp.serialization:make-byte-buf))
+           (_ (funcall bb-fn bb))
+           (all-bytes (bitcoin-lisp.serialization:bb-finish bb)))
+      (declare (ignore _))
+      (with-open-file (out tmp-path
+                           :direction :output
+                           :if-exists :supersede
+                           :element-type '(unsigned-byte 8))
+        (write-sequence all-bytes out)
+        (write-sequence (compute-crc32 all-bytes) out)
+        (finish-output out))
+      (fsync-file tmp-path)
       (rename-file tmp-path path))))
 
 (defun load-file-with-crc32 (path min-size)
@@ -217,19 +312,33 @@ Returns the file bytes (without CRC) on success, NIL on failure."
     (ironclad:update-digest digest simple-data)
     (ironclad:produce-digest digest)))
 
+(defparameter +utxo-save-flush-threshold+ (* 4 1024 1024)
+  "Bytes to accumulate in the byte-buf before flushing to disk during
+save-utxo-set. Caps peak save-time memory at ~4MB regardless of UTXO
+set size, which matters at testnet4 h>~70k (10M+ entries → ~800MB
+serialized). Set lower if heap pressure shows up earlier.")
+
 (defun save-utxo-set (utxo-set path)
   "Save the UTXO set to a binary file at PATH with integrity checks.
-Uses atomic write: writes to temporary file, then renames."
-  (save-file-with-crc32
+Uses atomic write: writes to temporary file, then renames.
+
+Streaming: byte-buf is flushed to disk whenever bb-pos exceeds
++utxo-save-flush-threshold+. Required at testnet4 h>~70k where the
+serialized image is hundreds of MB and the previous one-shot byte-buf
+exhausted the heap during a single contiguous allocation."
+  (save-file-with-crc32-streaming-bb
    path
-   (lambda (stream)
-     (write-sequence *utxo-magic* stream)
-     (bitcoin-lisp.serialization:write-uint32-le stream +utxo-format-version+)
-     (bitcoin-lisp.serialization:write-uint32-le stream
-                                                  (hash-table-count (utxo-set-entries utxo-set)))
+   (lambda (bb flush-fn)
+     (bitcoin-lisp.serialization:bb-write-bytes bb *utxo-magic*)
+     (bitcoin-lisp.serialization:bb-write-u32-le bb +utxo-format-version+)
+     (bitcoin-lisp.serialization:bb-write-u32-le
+      bb (hash-table-count (utxo-set-entries utxo-set)))
      (maphash (lambda (key entry)
-                (write-sequence key stream)
-                (write-utxo-entry-fields stream entry))
+                (bitcoin-lisp.serialization:bb-write-bytes bb key)
+                (bb-write-utxo-entry-fields bb entry)
+                (when (>= (bitcoin-lisp.serialization:bb-pos bb)
+                          +utxo-save-flush-threshold+)
+                  (funcall flush-fn)))
               (utxo-set-entries utxo-set))))
   (setf (utxo-set-dirty utxo-set) nil)
   t)

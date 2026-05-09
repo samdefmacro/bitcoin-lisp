@@ -82,6 +82,36 @@
    #:write-bytes
    #:read-var-bytes
    #:write-var-bytes
+   ;; Auto-growing byte buffer (faster than flexi-streams in hot paths)
+   #:byte-buf
+   #:make-byte-buf
+   #:bb-pos
+   #:bb-data
+   #:bb-write-u8
+   #:bb-write-u16-le
+   #:bb-write-u32-le
+   #:bb-write-u64-le
+   #:bb-write-i32-le
+   #:bb-write-i64-le
+   #:bb-write-bytes
+   #:bb-write-varint
+   #:bb-finish
+   ;; Byte-reader (zero-copy index-based input)
+   #:byte-reader
+   #:make-byte-reader
+   #:make-byte-reader-from
+   #:br-data
+   #:br-pos
+   #:br-eof-p
+   #:br-read-u8
+   #:br-read-u16-le
+   #:br-read-u32-le
+   #:br-read-u64-le
+   #:br-read-i32-le
+   #:br-read-i64-le
+   #:br-read-bytes
+   #:br-read-compact-size
+   #:br-read-var-bytes
    ;; Types
    #:outpoint
    #:make-outpoint
@@ -319,6 +349,7 @@
    ;; Integrity utilities
    #:compute-crc32
    #:save-file-with-crc32
+   #:save-file-with-crc32-bb
    #:load-file-with-crc32
    #:write-utxo-entry-fields
    #:read-utxo-entry-fields
@@ -663,5 +694,6 @@
    #:enable-console-logging
    #:disable-console-logging
    #:start-file-logging
-   #:stop-file-logging))
+   #:stop-file-logging
+   #:maybe-periodic-flush))
 

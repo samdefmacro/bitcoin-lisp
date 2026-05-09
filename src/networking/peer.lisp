@@ -279,7 +279,19 @@ Returns T on success, NIL on failure."
 (defconstant +ping-interval-seconds+ 60)
 (defconstant +ping-timeout-seconds+ 30)
 (defconstant +max-ping-failures+ 3)
-(defconstant +max-block-timeouts+ 3)
+
+(defconstant +max-block-timeouts+ 15
+  "Per-peer block-request timeout count threshold before disconnect.
+The previous value (3) caused a death-spiral in the testnet4 stress
+region (h=51k-67k): a single 3MB stress block transits the wire in
+30-90s, but the request-timeout fires per in-flight request. With
+multiple in-flight requests to the same peer, all of them time out
+within seconds of each other before any can be reset by a successful
+receive — count rolled past 3 in one tick and the peer was
+disconnected mid-transfer. Raised to 15: tolerates a normal stalled
+batch without evicting peers who are simply mid-transit on big
+blocks. record-block-received-from-peer still resets the count to
+zero on any successful block.")
 
 (defun check-handshake-timeout (peer)
   "Check if a peer has exceeded the handshake timeout.
