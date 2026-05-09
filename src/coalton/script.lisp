@@ -2276,7 +2276,21 @@
                         ;; Execute if: currently executing OR it's a control flow opcode
                         (if (or exec (is-control-flow-op op))
                             (match (execute-opcode op ctx-with-count)
-                              ((ScriptErr e) (ScriptErr e))
+                              ((ScriptErr e)
+                               (progn
+                                 (lisp Unit (op ctx-with-count e)
+                                   (cl:let ((sym (cl:find-symbol
+                                                  "*SCRIPT-FAIL-TRACE*"
+                                                  "BITCOIN-LISP.COALTON.INTEROP")))
+                                     (cl:when (cl:and sym (cl:boundp sym)
+                                                      (cl:symbol-value sym))
+                                       (cl:format cl:*error-output*
+                                                  "[script-fail] pos=~D op=0x~X err=~A~%"
+                                                  (context-position ctx-with-count)
+                                                  op
+                                                  (cl:format cl:nil "~A" e))))
+                                   Unit)
+                                 (ScriptErr e)))
                               ((ScriptOk next-ctx)
                                ;; Check combined stack + altstack size limit
                                (let ((total-stack-size (+ (stack-depth (context-main-stack next-ctx))

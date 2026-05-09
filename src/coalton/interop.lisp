@@ -305,6 +305,11 @@
 (defvar *debug-checksig* nil
   "When non-nil, print debug information for signature verification.")
 
+(defvar *script-fail-trace* nil
+  "When non-nil, the Coalton script engine prints (pos, opcode, error) to
+*error-output* on any opcode failure. Diagnostic-only — leave NIL during
+normal validation; the per-failure formatting cost is non-trivial.")
+
 (defvar *current-input-index* 0
   "The index of the input currently being validated (0-based).")
 
