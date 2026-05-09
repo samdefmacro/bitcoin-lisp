@@ -1951,23 +1951,29 @@ Used to remove the signature being verified from the scriptCode before sighash."
 
     ;; Compute sighash and verify
     (let* ((subscript-raw (or *current-script-code* script-pubkey))
+           ;; The script bytes that actually feed the sighash. Lifted to
+           ;; the outer let* so the *debug-checksig* print site can see it
+           ;; for both legacy and witness paths (and for the test path,
+           ;; where it stays NIL).
+           (subscript-for-hash nil)
            (sighash (cond
                       ;; P2WSH: BIP 143 sighash — no FindAndDelete (BIP 143 spec)
                       ;; Use *current-script-code* with OP_CODESEPARATOR bytes removed
                       ((and *witness-v0-mode* *current-tx*)
-                       (let ((effective-script-code (remove-codeseparator subscript-raw)))
-                         (compute-bip143-sighash effective-script-code
-                                                 *witness-input-amount*
-                                                 sighash-type)))
+                       (setf subscript-for-hash (remove-codeseparator subscript-raw))
+                       (compute-bip143-sighash subscript-for-hash
+                                               *witness-input-amount*
+                                               sighash-type))
                       ;; Legacy/P2SH: legacy sighash with FindAndDelete
                       (*current-tx*
-                       (let* ((sig-push-pattern
-                                (let ((siglen (length sig-bytes)))
-                                  (if (<= siglen 75)
-                                      (concatenate '(vector (unsigned-byte 8))
-                                                   (vector siglen) sig-bytes)
-                                      sig-bytes)))
-                              (subscript-for-hash (find-and-delete subscript-raw sig-push-pattern)))
+                       (let ((sig-push-pattern
+                               (let ((siglen (length sig-bytes)))
+                                 (if (<= siglen 75)
+                                     (concatenate '(vector (unsigned-byte 8))
+                                                  (vector siglen) sig-bytes)
+                                     sig-bytes))))
+                         (setf subscript-for-hash
+                               (find-and-delete subscript-raw sig-push-pattern))
                          (compute-legacy-sighash *current-tx*
                                                  *current-input-index*
                                                  subscript-for-hash
@@ -1979,9 +1985,10 @@ Used to remove the signature being verified from the scriptCode before sighash."
       (when (and *debug-checksig* *current-tx*)
         (format t "~%[CHECKSIG DEBUG] input=~D sighash-type=~D~%"
                 *current-input-index* sighash-type)
-        (format t "  subscript len=~D: ~A~%"
-                (length subscript-for-hash)
-                (bitcoin-lisp.crypto:bytes-to-hex subscript-for-hash))
+        (when subscript-for-hash
+          (format t "  subscript len=~D: ~A~%"
+                  (length subscript-for-hash)
+                  (bitcoin-lisp.crypto:bytes-to-hex subscript-for-hash)))
         (format t "  sighash: ~A~%"
                 (bitcoin-lisp.crypto:bytes-to-hex sighash))
         (format t "  sig len=~D: ~A~%"
@@ -2174,6 +2181,38 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
   "Convert a Coalton vector to a CL simple-array."
   (coerce vec '(simple-array (unsigned-byte 8) (*))))
 
+(defun strip-sigs-from-script-code (script-code sigs)
+  "FindAndDelete each sig (with its push-encoding) from SCRIPT-CODE.
+Returns (values cleaned-script any-found-p) where ANY-FOUND-P is T if
+any sig was actually found and removed. Used by CHECKMULTISIG to
+mirror Bitcoin Core's per-sig FindAndDelete loop
+(interpreter.cpp:1142-1150)."
+  (let ((script script-code)
+        (any-found nil))
+    (dolist (sig sigs)
+      (let* ((siglen (length sig))
+             (pattern
+               (cond
+                 ((zerop siglen) nil)
+                 ((<= siglen 75)
+                  (concatenate '(vector (unsigned-byte 8))
+                               (vector siglen) sig))
+                 ((<= siglen 255)
+                  (concatenate '(vector (unsigned-byte 8))
+                               (vector #x4c siglen) sig))
+                 (t
+                  (concatenate '(vector (unsigned-byte 8))
+                               (vector #x4d
+                                       (logand siglen #xff)
+                                       (logand (ash siglen -8) #xff))
+                               sig)))))
+        (when pattern
+          (let ((after (find-and-delete script pattern)))
+            (when (< (length after) (length script))
+              (setf any-found t))
+            (setf script after)))))
+    (values script any-found)))
+
 (defun do-checkmultisig-stack-op (stack script-pubkey)
   "Perform the full CHECKMULTISIG stack operation.
    Returns (values status new-stack pubkey-count) where:
@@ -2238,21 +2277,37 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
               (let ((dummy (coalton-vec-to-array (car stack)))
                     (stack (cdr stack)))
 
-                ;; Verify the multisig
-                (let ((result (verify-checkmultisig-for-script sigs pubkeys script-pubkey dummy)))
-                  ;; Check if there was a validation error (STRICTENC/NULLDUMMY)
-                  (if *last-checkmultisig-error*
-                      (values :error nil n)
-                      ;; Push result: true (1) or false (empty)
-                      ;; Convert to Coalton vector format for the stack
-                      (let ((result-vec (if result
-                                            (cl-array-to-coalton-vector
-                                             (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1))
-                                            (cl-array-to-coalton-vector
-                                             (make-array 0 :element-type '(unsigned-byte 8))))))
-                        (values (if result :ok :fail)
-                                (cons result-vec stack)
-                                n))))))))))))
+                ;; Pre-strip all sigs from scriptCode (mirrors Bitcoin Core
+                ;; interpreter.cpp:1142-1150). If any sig was actually found
+                ;; in scriptCode AND CONST_SCRIPTCODE flag is set, that's a
+                ;; SIG_FINDANDDELETE error. Without the pre-strip, embedded
+                ;; fake-sig byte patterns in the scriptCode (observed at
+                ;; testnet4 h=118555 tx-3 input-1) cause the per-sig
+                ;; FindAndDelete inside verify-checksig to leave those
+                ;; patterns in place — producing a sighash that differs
+                ;; from Core's and ECDSA verify rejects the real sig.
+                (multiple-value-bind (cleaned-script-pubkey any-found)
+                    (strip-sigs-from-script-code script-pubkey sigs)
+                  (cond
+                    ((and any-found (flag-enabled-p "CONST_SCRIPTCODE"))
+                     (setf *last-checkmultisig-error* :sig-findanddelete)
+                     (values :error nil n))
+                    (t
+                     (let ((result (verify-checkmultisig-for-script
+                                    sigs pubkeys cleaned-script-pubkey dummy)))
+                       (cond
+                         (*last-checkmultisig-error*
+                          (values :error nil n))
+                         (t
+                          (let ((result-vec
+                                  (if result
+                                      (cl-array-to-coalton-vector
+                                       (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1))
+                                      (cl-array-to-coalton-vector
+                                       (make-array 0 :element-type '(unsigned-byte 8))))))
+                            (values (if result :ok :fail)
+                                    (cons result-vec stack)
+                                    n))))))))))))))))
 
 ;;; ============================================================
 ;;; MINIMALDATA Validation
