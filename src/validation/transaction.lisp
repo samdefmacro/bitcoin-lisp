@@ -15,7 +15,6 @@
 (defconstant +max-money+ 2100000000000000)  ; 21 million BTC in satoshis
 (defconstant +coin+ 100000000)               ; 1 BTC in satoshis
 (defconstant +max-block-size+ 1000000)       ; 1 MB
-(defconstant +max-tx-size+ 100000)           ; Max transaction size
 (defconstant +coinbase-maturity+ 100)        ; Blocks before coinbase spendable
 
 ;; Typed constant for max money
@@ -93,11 +92,10 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
               (return-from validate-transaction-structure
                 (values nil :bad-coinbase-mixed))))))
 
-    ;; Check transaction size
-    (let ((serialized (bitcoin-lisp.serialization:serialize-transaction tx)))
-      (when (> (length serialized) +max-tx-size+)
-        (return-from validate-transaction-structure
-          (values nil :tx-too-large))))
+    ;; Note: there is no consensus-level transaction size limit independent of
+    ;; the block weight limit (4M weight units). Bitcoin Core only enforces
+    ;; MAX_STANDARD_TX_WEIGHT (400,000 wu) as mempool policy, not consensus.
+    ;; The block-weight ceiling is checked at block validation time.
 
     (values t nil)))
 
@@ -128,6 +126,15 @@ FEE is returned as a Satoshi type."
 
           ;; Input must reference an existing UTXO
           (unless utxo
+            (bitcoin-lisp:log-warn
+             "MISSING-INPUT: height=~D prev-txid=~A:~D in-pending=~A pending-size=~D"
+             current-height
+             (bitcoin-lisp.crypto:bytes-to-hex prev-txid)
+             prev-index
+             (and pending-utxos
+                  (if (gethash (cons prev-txid prev-index) pending-utxos)
+                      "yes" "no"))
+             (if pending-utxos (hash-table-count pending-utxos) -1))
             (return-from validate-transaction-contextual
               (values nil :missing-input nil)))
 
@@ -284,24 +291,40 @@ FEE is returned as an integer (satoshis)."
 
 ;;;; Script validation
 
+(defun collect-spent-utxos (inputs utxo-set)
+  "Return a vector of utxo-entry for INPUTS, or NIL if any UTXO is missing.
+   Required for BIP 341 sighash, which hashes spent amounts/scripts across
+   all inputs of a tx; without complete coverage, the Taproot sighash would
+   be wrong, so callers should fall back when this returns NIL."
+  (let ((result (make-array (length inputs))))
+    (loop for input in inputs
+          for i from 0
+          for prevout = (bitcoin-lisp.serialization:tx-in-previous-output input)
+          for utxo = (bitcoin-lisp.storage:get-utxo
+                      utxo-set
+                      (bitcoin-lisp.serialization:outpoint-hash prevout)
+                      (bitcoin-lisp.serialization:outpoint-index prevout))
+          unless utxo do (return-from collect-spent-utxos nil)
+          do (setf (aref result i) utxo))
+    result))
+
 (defun validate-transaction-scripts (tx utxo-set &key (height 0))
   "Validate all input scripts for a transaction via Coalton interop.
 Uses validate-input-script for each input (same path as block validation).
 HEIGHT determines which script verification flags are active.
 Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
-  (let ((bitcoin-lisp.coalton.interop:*script-flags*
-          (compute-script-flags-for-height height))
-        (bitcoin-lisp.coalton.interop:*precomputed-sighash*
-          (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx))
-        (inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
+  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+         (spent-utxos (collect-spent-utxos inputs utxo-set))
+         (bitcoin-lisp.coalton.interop:*script-flags*
+           (compute-script-flags-for-height height))
+         (bitcoin-lisp.coalton.interop:*precomputed-sighash*
+           (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
+         (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
     (loop for input in inputs
           for input-idx from 0
-          do (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                    (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-                    (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
-                    (utxo (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)))
-               (when utxo
-                 (unless (validate-input-script tx input-idx utxo)
-                   (return-from validate-transaction-scripts
-                     (values nil input-idx))))))
+          for utxo = (and spent-utxos (aref spent-utxos input-idx))
+          when utxo
+            do (unless (validate-input-script tx input-idx utxo)
+                 (return-from validate-transaction-scripts
+                   (values nil input-idx))))
     (values t nil)))

@@ -338,9 +338,12 @@ STOP-HASH is the hash to stop at (or zeros to get maximum blocks)."
                       (read-compact-size stream))))))
 
 (defun parse-block-payload (payload)
-  "Parse a block message payload into a bitcoin-block."
-  (flexi-streams:with-input-from-sequence (stream payload)
-    (read-bitcoin-block stream)))
+  "Parse a block message payload into a bitcoin-block.
+
+Hot path: called once per block message received from peers (potentially
+thousands per minute during IBD). Uses byte-reader for direct index-based
+reads instead of flexi-streams' Gray-stream input dispatch."
+  (br-read-bitcoin-block (make-byte-reader-from payload)))
 
 ;;;; ============================================================
 ;;;; Compact Block Messages (BIP 152)

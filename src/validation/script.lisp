@@ -432,14 +432,20 @@ Returns T on success, NIL on failure."
               (multiple-value-bind (success error)
                   (bitcoin-lisp.coalton.interop:validate-witness-program
                    script-pubkey witness amount script-sig)
-                (declare (ignore error))
+                (unless success
+                  (bitcoin-lisp:log-warn
+                   "validate-input-script witness program failed: input-idx=~D error=~A"
+                   input-idx error))
                 success)
               t))  ; no witness data = pass (matches validate-block-scripts behavior)
         ;; Legacy/P2SH: validate via Coalton interop
         (multiple-value-bind (success error)
             (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
              script-sig script-pubkey t)
-          (declare (ignore error))
+          (unless success
+            (bitcoin-lisp:log-warn
+             "validate-input-script legacy/P2SH failed: input-idx=~D error=~A"
+             input-idx error))
           success))))
 
 ;;; ============================================================
