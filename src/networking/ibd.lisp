@@ -63,11 +63,22 @@
   ;; Progress tracking
   (start-time 0 :type integer)
   (last-progress-time 0 :type integer)
+  ;; Sliding-window rate samples: list of (internal-real-time . height)
+  ;; pairs, most recent first. Trimmed in report-ibd-progress to drop
+  ;; entries older than +recent-rate-window-seconds+. The cumulative
+  ;; rate (received/elapsed since session start) hides recent stalls in
+  ;; long sessions; this gives a real-time view alongside.
+  (recent-samples nil :type list)
   ;; Wall-clock seconds (get-universal-time) at the last connect-tip advance.
   ;; Used by the stuck-tip detector to halt IBD when validation can't drain
   ;; the queue (vs Core's TipMayBeStale, net_processing.cpp:1332-1340).
   (last-tip-advance-time 0 :type integer)
   (last-tip-height 0 :type (unsigned-byte 32)))
+
+(defparameter +recent-rate-window-seconds+ 60
+  "Window for the recent-rate metric in IBD Progress logs. 60s gives a
+useful real-time view of throughput swings (peer disconnects, stress
+regions) that the cumulative session-average smooths over.")
 
 (defvar *ibd-context* nil
   "Current IBD context.")
@@ -638,7 +649,8 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
     (return-from ibd-progress nil))
 
   (let* ((ctx *ibd-context*)
-         (elapsed-secs (/ (- (get-internal-real-time) (ibd-context-start-time ctx))
+         (now (get-internal-real-time))
+         (elapsed-secs (/ (- now (ibd-context-start-time ctx))
                           internal-time-units-per-second))
          (received (ibd-context-blocks-received ctx))
          (target (ibd-context-target-height ctx))
@@ -646,7 +658,23 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
                              (bitcoin-lisp.storage:current-height chain-state)
                              received))
          (pending (hash-table-count (ibd-context-pending-blocks ctx)))
-         (in-flight (hash-table-count (ibd-context-in-flight ctx))))
+         (in-flight (hash-table-count (ibd-context-in-flight ctx)))
+         ;; Push current sample, trim entries older than the window.
+         (window-ticks (* +recent-rate-window-seconds+
+                          internal-time-units-per-second))
+         (cutoff (- now window-ticks))
+         (samples (cons (cons now current-height)
+                        (delete-if (lambda (s) (< (car s) cutoff))
+                                   (ibd-context-recent-samples ctx))))
+         ;; Recent rate: oldest sample still in window vs current.
+         (oldest (car (last samples)))
+         (recent-secs (/ (- now (car oldest))
+                         internal-time-units-per-second))
+         (recent-blocks (- current-height (cdr oldest)))
+         (recent-rate (if (> recent-secs 0)
+                          (/ recent-blocks recent-secs)
+                          0)))
+    (setf (ibd-context-recent-samples ctx) samples)
     (list :state (ibd-context-state ctx)
           :headers-received (ibd-context-headers-received ctx)
           :blocks-received received
@@ -658,6 +686,7 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
           :blocks-per-second (if (> elapsed-secs 0)
                                  (/ received elapsed-secs)
                                  0)
+          :recent-blocks-per-second recent-rate
           :progress-percent (if (> target 0)
                                 (* 100.0 (/ current-height target))
                                 0))))
@@ -666,13 +695,15 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
   "Log current IBD progress."
   (let ((progress (ibd-progress chain-state)))
     (when progress
-      (bitcoin-lisp:log-info "IBD Progress: ~D/~D blocks (~,1F%), ~,1F blocks/sec, ~D pending, ~D in-flight"
-                             (getf progress :current-height)
-                             (getf progress :target-height)
-                             (getf progress :progress-percent)
-                             (getf progress :blocks-per-second)
-                             (getf progress :pending-blocks)
-                             (getf progress :in-flight-blocks)))))
+      (bitcoin-lisp:log-info
+       "IBD Progress: ~D/~D blocks (~,1F%), ~,1F b/s avg / ~,1F b/s recent, ~D pending, ~D in-flight"
+       (getf progress :current-height)
+       (getf progress :target-height)
+       (getf progress :progress-percent)
+       (getf progress :blocks-per-second)
+       (getf progress :recent-blocks-per-second)
+       (getf progress :pending-blocks)
+       (getf progress :in-flight-blocks)))))
 
 ;;;; Main IBD Loop
 
