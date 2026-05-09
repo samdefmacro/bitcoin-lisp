@@ -208,6 +208,48 @@ dispatch — was 18% of total CPU on the May 2 testnet4 profile."
       (fsync-file tmp-path)
       (rename-file tmp-path path))))
 
+(defun save-file-with-crc32-streaming-bb (path bb-fn &key (flush-threshold (* 4 1024 1024)))
+  "Streaming variant of save-file-with-crc32-bb. BB-FN receives
+(byte-buf flush-fn); calling flush-fn writes the current contents of
+the byte-buf to disk, advances the running CRC, and resets bb-pos to
+0 so the same buffer can keep growing.
+
+Used for very large payloads (UTXO at 10M+ entries) where buffering
+the entire serialization in memory exhausts the heap — observed at
+testnet4 h≈70k where a 322MB single-buffer allocation overran the
+remaining contiguous heap. The CRC32 still covers the full payload
+exactly as if it had been one byte vector.
+
+FLUSH-THRESHOLD is a soft hint: BB-FN may call flush-fn whenever
+bb-pos exceeds it. The final flush + CRC append are automatic; bb-fn
+must NOT call bb-finish."
+  (declare (ignore flush-threshold))
+  (ensure-directories-exist path)
+  (let ((tmp-path (make-pathname :defaults path
+                                 :type (concatenate 'string
+                                                    (or (pathname-type path) "dat")
+                                                    ".tmp"))))
+    (with-open-file (out tmp-path
+                         :direction :output
+                         :if-exists :supersede
+                         :element-type '(unsigned-byte 8))
+      (let* ((bb (bitcoin-lisp.serialization:make-byte-buf))
+             (digest (ironclad:make-digest :crc32))
+             (flush-fn
+               (lambda ()
+                 (let ((n (bitcoin-lisp.serialization:bb-pos bb)))
+                   (when (> n 0)
+                     (let ((data (bitcoin-lisp.serialization:bb-data bb)))
+                       (ironclad:update-digest digest data :end n)
+                       (write-sequence data out :end n)
+                       (setf (bitcoin-lisp.serialization:bb-pos bb) 0)))))))
+        (funcall bb-fn bb flush-fn)
+        (funcall flush-fn)
+        (write-sequence (ironclad:produce-digest digest) out)
+        (finish-output out)))
+    (fsync-file tmp-path)
+    (rename-file tmp-path path)))
+
 (defun save-file-with-crc32-bb (path bb-fn)
   "Like SAVE-FILE-WITH-CRC32 but BB-FN receives a byte-buf and writes
 into it directly. Avoids the flexi-streams + Gray-stream CLOS dispatch
@@ -270,23 +312,33 @@ Returns the file bytes (without CRC) on success, NIL on failure."
     (ironclad:update-digest digest simple-data)
     (ironclad:produce-digest digest)))
 
+(defparameter +utxo-save-flush-threshold+ (* 4 1024 1024)
+  "Bytes to accumulate in the byte-buf before flushing to disk during
+save-utxo-set. Caps peak save-time memory at ~4MB regardless of UTXO
+set size, which matters at testnet4 h>~70k (10M+ entries → ~800MB
+serialized). Set lower if heap pressure shows up earlier.")
+
 (defun save-utxo-set (utxo-set path)
   "Save the UTXO set to a binary file at PATH with integrity checks.
 Uses atomic write: writes to temporary file, then renames.
 
-Hottest persistence path (1.2M+ entries × ~75 bytes ≈ 90MB on testnet4).
-Uses save-file-with-crc32-bb to avoid flexi-streams' per-byte CLOS
-dispatch."
-  (save-file-with-crc32-bb
+Streaming: byte-buf is flushed to disk whenever bb-pos exceeds
++utxo-save-flush-threshold+. Required at testnet4 h>~70k where the
+serialized image is hundreds of MB and the previous one-shot byte-buf
+exhausted the heap during a single contiguous allocation."
+  (save-file-with-crc32-streaming-bb
    path
-   (lambda (bb)
+   (lambda (bb flush-fn)
      (bitcoin-lisp.serialization:bb-write-bytes bb *utxo-magic*)
      (bitcoin-lisp.serialization:bb-write-u32-le bb +utxo-format-version+)
      (bitcoin-lisp.serialization:bb-write-u32-le
       bb (hash-table-count (utxo-set-entries utxo-set)))
      (maphash (lambda (key entry)
                 (bitcoin-lisp.serialization:bb-write-bytes bb key)
-                (bb-write-utxo-entry-fields bb entry))
+                (bb-write-utxo-entry-fields bb entry)
+                (when (>= (bitcoin-lisp.serialization:bb-pos bb)
+                          +utxo-save-flush-threshold+)
+                  (funcall flush-fn)))
               (utxo-set-entries utxo-set))))
   (setf (utxo-set-dirty utxo-set) nil)
   t)

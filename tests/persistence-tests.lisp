@@ -359,18 +359,17 @@
 ;;;; Block Timeout Peer Rotation Tests
 
 (test block-timeout-count-tracking
-  "Block timeouts should be tracked per peer."
-  (let ((peer (bitcoin-lisp.networking:make-peer)))
+  "Block timeouts should be tracked per peer; disconnect at +max-block-timeouts+."
+  (let ((peer (bitcoin-lisp.networking:make-peer))
+        (threshold bitcoin-lisp.networking:+max-block-timeouts+))
     (is (= 0 (bitcoin-lisp.networking:peer-block-timeout-count peer)))
-    ;; First timeout - not yet disconnect
-    (is (not (bitcoin-lisp.networking:record-block-timeout peer)))
-    (is (= 1 (bitcoin-lisp.networking:peer-block-timeout-count peer)))
-    ;; Second timeout
-    (is (not (bitcoin-lisp.networking:record-block-timeout peer)))
-    (is (= 2 (bitcoin-lisp.networking:peer-block-timeout-count peer)))
-    ;; Third timeout - should disconnect
+    ;; First (threshold - 1) timeouts: counter increments but no disconnect.
+    (loop for i from 1 below threshold do
+      (is (not (bitcoin-lisp.networking:record-block-timeout peer)))
+      (is (= i (bitcoin-lisp.networking:peer-block-timeout-count peer))))
+    ;; Threshold-th timeout: counter hits threshold, returns T (disconnect).
     (is (bitcoin-lisp.networking:record-block-timeout peer))
-    (is (= 3 (bitcoin-lisp.networking:peer-block-timeout-count peer)))))
+    (is (= threshold (bitcoin-lisp.networking:peer-block-timeout-count peer)))))
 
 ;;;; Chain Reorganization Tests
 

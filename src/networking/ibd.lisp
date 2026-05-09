@@ -429,14 +429,21 @@ that don't construct a chain-state)."
 
 (defun compute-block-download-timeout (num-downloading-peers)
   "Compute block download timeout in seconds based on number of peers.
-Matches Bitcoin Core's actual constants from net_processing.cpp:
-  BLOCK_DOWNLOAD_TIMEOUT_BASE = 30 s
+Mirrors Bitcoin Core's net_processing.cpp shape but with a longer base
+(90s vs Core's 30s) because testnet4 stress-region blocks (h=51k-67k)
+are multi-MB and routinely take 60-90s wire transit even on healthy
+links. With 30s, every in-flight request to a slow-but-functional peer
+times out before delivery, fires the per-peer record-block-timeout
+counter, and combined with the old +max-block-timeouts+=3 produced a
+mass-eviction death spiral on the stress region. 90s + per-peer 5s
+gives ≈125s with 8 peers — wide enough that a peer mid-transfer
+isn't punished for slow-but-progressing delivery, narrow enough that
+a genuinely dead peer is still cleared in 2 minutes.
+
+  BLOCK_DOWNLOAD_TIMEOUT_BASE = 90 s
   BLOCK_DOWNLOAD_TIMEOUT_PER_PEER = 5 s
-  timeout = base + per_peer * other_peers
-With 8 peers ≈ 65s. The previous formula used a 600s block_interval scale,
-giving 2700s — far too long, so timed-out in-flight blocks would never retry
-and IBD would stall whenever a peer dropped a request."
-  (let* ((base 30)
+  timeout = base + per_peer * other_peers"
+  (let* ((base 90)
          (per-peer 5)
          (other-peers (max 0 (1- num-downloading-peers))))
     (+ base (* per-peer other-peers))))
