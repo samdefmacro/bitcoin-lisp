@@ -611,6 +611,7 @@
    #:*dns-seeds*
    #:*testnet3-dns-seeds*
    #:*testnet4-dns-seeds*
+   #:*testnet4-fixed-seeds*
    #:*signet-dns-seeds*
    #:*mainnet-dns-seeds*
    ;; Checkpoints
