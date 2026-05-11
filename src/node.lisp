@@ -631,7 +631,18 @@ flush (atomic temp+fsync+rename inside save-*)."
             (declare (ignore _))
             (format *error-output* "~&[shutdown] caught signal — saving state~%")
             (ignore-errors (stop-node))
-            (sb-ext:exit :code 0))))
+            ;; Per-block script-check worker threads (bt:make-thread :name
+            ;; "script-check-N" in validate-block.lisp) are non-daemon and
+            ;; can outlive stop-node if validation was in progress when the
+            ;; sync thread was destroyed. Without a timeout, sb-ext:exit
+            ;; blocks forever waiting for them (incident 2026-05-11: node
+            ;; logged "Node stopped" but SBCL process hung 6+ minutes,
+            ;; eventually needed SIGKILL). Give 5 seconds for any in-flight
+            ;; worker to finish naturally, then force-exit. Bitcoin Core's
+            ;; CCheckQueue (checkqueue.h:206-225) has an explicit stop flag
+            ;; + condvar to join workers; we use a coarser timeout because
+            ;; our workers are ephemeral per-block, not a persistent pool.
+            (sb-ext:exit :code 0 :timeout 5))))
     (sb-sys:enable-interrupt sb-unix:sigterm handler)
     (sb-sys:enable-interrupt sb-unix:sigint handler))
   ;; SIGUSR1 toggles sb-sprof profiling. First USR1: start sampling. Second
