@@ -799,58 +799,73 @@ Returns the number of blocks downloaded."
                  ;; while we're busy validating an earlier (heavy) block.
                  (dolist (peer peers)
                    (when (eq (peer-state peer) :ready)
-                     ;; Drain only as long as the socket actually has data ready
-                     ;; (usocket:wait-for-input :timeout 0 is non-blocking). This
-                     ;; lets us pull all queued messages in the batch without
-                     ;; ever timing out mid-payload, then exit immediately when
-                     ;; nothing is left to read.
-                     (loop repeat +max-messages-per-peer-per-cycle+
-                           while (usocket:wait-for-input
-                                  (bitcoin-lisp.networking::connection-socket
-                                   (peer-connection peer))
-                                  :timeout 0 :ready-only t)
-                           for (command payload) = (multiple-value-list
-                                                     (receive-message peer :timeout 5))
-                           while command
-                           do (cond
-                                ((string= command "block")
-                                 (let* ((block (bitcoin-lisp.serialization:parse-block-payload payload))
-                                        (header (bitcoin-lisp.serialization:bitcoin-block-header block))
-                                        (hash (bitcoin-lisp.serialization:block-header-hash header)))
-                                   ;; Forensic raw-payload capture: dump the
-                                   ;; wire-format (witness-included) bytes to
-                                   ;; a side dir before parse loses witness
-                                   ;; data. Triggered only when
-                                   ;; *forensic-store-from-height* is set.
-                                   (when *forensic-store-from-height*
-                                     (let ((entry (bitcoin-lisp.storage:get-block-index-entry
-                                                   chain-state hash)))
-                                       (when (and entry
-                                                  (>= (bitcoin-lisp.storage:block-index-entry-height entry)
-                                                      *forensic-store-from-height*))
-                                         (let* ((dir "/data/bitcoin-lisp/forensic-blocks/")
-                                                (path (format nil "~A~A.raw" dir
-                                                              (bitcoin-lisp.crypto:bytes-to-hex hash))))
-                                           (ignore-errors (ensure-directories-exist dir))
-                                           (with-open-file (s path :direction :output
-                                                                   :if-exists :supersede
-                                                                   :element-type '(unsigned-byte 8))
-                                             (write-sequence payload s))))))
-                                   (mark-block-received hash)
-                                   (record-block-received-from-peer peer)
-                                   (process-received-block block chain-state utxo-set block-store
-                                                           :fee-estimator fee-estimator
-                                                           :recent-rejects recent-rejects)))
+                     ;; Per-peer I/O boundary: a dead socket can cause LISTEN
+                     ;; (inside usocket:wait-for-input) or read-sequence (inside
+                     ;; receive-message) to raise SIMPLE-STREAM-ERROR. Bitcoin
+                     ;; Core handles the same failure mode in
+                     ;; CConnman::SocketHandlerConnected (net.cpp:2204-2214):
+                     ;; per-peer recv errors set pnode->fDisconnect and the
+                     ;; outer loop continues iterating other peers. Without
+                     ;; this handler the error escaped run-ibd and killed the
+                     ;; whole sync thread (incident 2026-05-09).
+                     (handler-case
+                         ;; Drain only as long as the socket actually has data ready
+                         ;; (usocket:wait-for-input :timeout 0 is non-blocking). This
+                         ;; lets us pull all queued messages in the batch without
+                         ;; ever timing out mid-payload, then exit immediately when
+                         ;; nothing is left to read.
+                         (loop repeat +max-messages-per-peer-per-cycle+
+                               while (usocket:wait-for-input
+                                      (bitcoin-lisp.networking::connection-socket
+                                       (peer-connection peer))
+                                      :timeout 0 :ready-only t)
+                               for (command payload) = (multiple-value-list
+                                                         (receive-message peer :timeout 5))
+                               while command
+                               do (cond
+                                    ((string= command "block")
+                                     (let* ((block (bitcoin-lisp.serialization:parse-block-payload payload))
+                                            (header (bitcoin-lisp.serialization:bitcoin-block-header block))
+                                            (hash (bitcoin-lisp.serialization:block-header-hash header)))
+                                       ;; Forensic raw-payload capture: dump the
+                                       ;; wire-format (witness-included) bytes to
+                                       ;; a side dir before parse loses witness
+                                       ;; data. Triggered only when
+                                       ;; *forensic-store-from-height* is set.
+                                       (when *forensic-store-from-height*
+                                         (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                                                       chain-state hash)))
+                                           (when (and entry
+                                                      (>= (bitcoin-lisp.storage:block-index-entry-height entry)
+                                                          *forensic-store-from-height*))
+                                             (let* ((dir "/data/bitcoin-lisp/forensic-blocks/")
+                                                    (path (format nil "~A~A.raw" dir
+                                                                  (bitcoin-lisp.crypto:bytes-to-hex hash))))
+                                               (ignore-errors (ensure-directories-exist dir))
+                                               (with-open-file (s path :direction :output
+                                                                       :if-exists :supersede
+                                                                       :element-type '(unsigned-byte 8))
+                                                 (write-sequence payload s))))))
+                                       (mark-block-received hash)
+                                       (record-block-received-from-peer peer)
+                                       (process-received-block block chain-state utxo-set block-store
+                                                               :fee-estimator fee-estimator
+                                                               :recent-rejects recent-rejects)))
 
-                                ((string= command "headers")
-                                 (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-                                   (process-headers headers chain-state)
-                                   (incf (ibd-context-headers-received ctx) (length headers))))
+                                    ((string= command "headers")
+                                     (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
+                                       (process-headers headers chain-state)
+                                       (incf (ibd-context-headers-received ctx) (length headers))))
 
-                                (t (handle-message peer command payload
-                                                   chain-state utxo-set block-store
-                                                   :fee-estimator fee-estimator
-                                                   :recent-rejects recent-rejects))))))
+                                    (t (handle-message peer command payload
+                                                       chain-state utxo-set block-store
+                                                       :fee-estimator fee-estimator
+                                                       :recent-rejects recent-rejects))))
+                       ((or stream-error usocket:socket-condition end-of-file) (c)
+                         (bitcoin-lisp:log-warn
+                          "Peer ~A I/O error during message drain — disconnecting: ~A"
+                          (peer-address peer) c)
+                         (handler-case (disconnect-peer peer) (error () nil))))))
 
                  ;; Per-block request timeout retries (retry-timed-out-requests
                  ;; in request-blocks-from-peers) is our peer-disconnect path:
