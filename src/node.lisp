@@ -802,6 +802,28 @@ Returns the number of peers connected."
         (setf addresses (append addresses dns-addrs))
         (setf addresses (remove-duplicates addresses :test #'string=))))
 
+    ;; Fixed-seed fallback for testnet4: even after DNS, the candidate pool
+    ;; may have only one /16 group (sprovoost.nl seed has been dark since
+    ;; ~2026-05; wiz.biz returns its own /24 cluster only). Mirrors Bitcoin
+    ;; Core's vFixedSeeds population in chainparams.cpp — used as a
+    ;; last-resort source so we always have netgroup diversity available.
+    (when (and (eq (node-network node) :testnet4)
+               (let ((groups (remove-duplicates
+                              (remove nil (mapcar #'bitcoin-lisp.networking:ip-netgroup
+                                                  addresses))
+                              :test #'string=)))
+                 (< (length groups) 8)))
+      (log-info "Merging testnet4 fixed-seed list (~D peers, ~D /16 groups)"
+                (length bitcoin-lisp.networking:*testnet4-fixed-seeds*)
+                (length (remove-duplicates
+                         (mapcar #'bitcoin-lisp.networking:ip-netgroup
+                                 bitcoin-lisp.networking:*testnet4-fixed-seeds*)
+                         :test #'string=)))
+      (setf addresses
+            (remove-duplicates
+             (append addresses bitcoin-lisp.networking:*testnet4-fixed-seeds*)
+             :test #'string=)))
+
     ;; Diversify by /16 netgroup so the first 8 connection attempts spread
     ;; across distinct operators (incident 2026-05-11: 8-of-8 peers were
     ;; from 103.165.192.x wiz.biz nodes — one stall stalled the whole
