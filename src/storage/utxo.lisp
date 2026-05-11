@@ -13,10 +13,34 @@
   (height 0 :type (unsigned-byte 32))
   (coinbase nil :type boolean))
 
+(declaim (inline utxo-key-hash))
+(defun utxo-key-hash (key)
+  "Custom :hash-function for the UTXO entries hash-table. Keys are
+36-byte vectors (32-byte txid + 4-byte LE output-index, see
+make-utxo-key). The first 8 bytes of the txid are SHA256 output and
+already uniformly random, so we take them as a little-endian uint64
+masked to fixnum width — far cheaper than SBCL's data-vector-hash,
+which iterates all 36 bytes per lookup. Equalp test resolves any
+collisions exactly. Same pattern as sig-cache-hash; tapscript-region
+profile (May 2026) showed DATA-VECTOR-HASH on UTXO keys at ~7% of CPU."
+  (declare (type (simple-array (unsigned-byte 8) (*)) key)
+           (optimize (speed 3) (safety 0)))
+  (logand (logior (aref key 0)
+                  (ash (aref key 1) 8)
+                  (ash (aref key 2) 16)
+                  (ash (aref key 3) 24)
+                  (ash (aref key 4) 32)
+                  (ash (aref key 5) 40)
+                  (ash (aref key 6) 48)
+                  (ash (aref key 7) 56))
+          most-positive-fixnum))
+
 (defstruct utxo-set
   "In-memory UTXO set.
 The set maps (txid, output-index) -> utxo-entry."
-  (entries (make-hash-table :test 'equalp) :type hash-table)
+  (entries (make-hash-table :test 'equalp
+                            #+sbcl :hash-function #+sbcl 'utxo-key-hash)
+   :type hash-table)
   (dirty nil :type boolean))
 
 (defun make-utxo-key (txid output-index)
