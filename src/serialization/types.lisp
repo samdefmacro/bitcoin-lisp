@@ -143,7 +143,12 @@ WITNESS: List of witness stacks, one per input. Each stack is a list of
   ;; Cached weight (BIP 141). transaction-weight requires two full re-
   ;; serializations of the tx; profiling showed this was ~16% of CPU on
   ;; testnet4 stress blocks. Compute once, reuse forever.
-  (cached-weight nil))
+  (cached-weight nil)
+  ;; Cached wtxid (BIP 141). transaction-wtxid re-serializes the witness
+  ;; tx on every call; May 2026 stress-region profile pinned it at ~2% of
+  ;; CPU (called per-tx from compute-witness-merkle-root and wtxid relay).
+  ;; Same shape as cached-weight: compute once, reuse forever.
+  (cached-wtxid nil))
 
 (defun transaction-has-witness-p (tx)
   "Check if TX has witness data."
@@ -383,17 +388,19 @@ This is the double-SHA256 of the legacy serialized transaction (no witness)."
   "Compute the witness transaction ID (wtxid).
 For transactions with witness data, this is the double-SHA256 of the
 witness-serialized transaction. For coinbase transactions, returns 32 zero bytes.
-For legacy transactions without witness, wtxid equals txid."
-  (cond
-    ;; Coinbase: wtxid is all zeros
-    ((and (transaction-inputs tx)
-          (coinbase-input-p (first (transaction-inputs tx))))
-     (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-    ;; Has witness: hash the witness serialization
-    ((transaction-has-witness-p tx)
-     (bitcoin-lisp.crypto:hash256 (serialize-witness-transaction tx)))
-    ;; No witness: wtxid = txid
-    (t (transaction-hash tx))))
+For legacy transactions without witness, wtxid equals txid. Cached on the tx."
+  (or (transaction-cached-wtxid tx)
+      (setf (transaction-cached-wtxid tx)
+            (cond
+              ;; Coinbase: wtxid is all zeros
+              ((and (transaction-inputs tx)
+                    (coinbase-input-p (first (transaction-inputs tx))))
+               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+              ;; Has witness: hash the witness serialization
+              ((transaction-has-witness-p tx)
+               (bitcoin-lisp.crypto:hash256 (serialize-witness-transaction tx)))
+              ;; No witness: wtxid = txid
+              (t (transaction-hash tx))))))
 
 (defun transaction-weight (tx)
   "Calculate the weight of a transaction in weight units (BIP 141).
