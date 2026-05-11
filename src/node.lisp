@@ -802,6 +802,13 @@ Returns the number of peers connected."
         (setf addresses (append addresses dns-addrs))
         (setf addresses (remove-duplicates addresses :test #'string=))))
 
+    ;; Diversify by /16 netgroup so the first 8 connection attempts spread
+    ;; across distinct operators (incident 2026-05-11: 8-of-8 peers were
+    ;; from 103.165.192.x wiz.biz nodes — one stall stalled the whole
+    ;; sync). Mirrors Bitcoin Core's addrman netgroup bucket selection
+    ;; (netaddress.cpp CNetAddr::GetGroup).
+    (setf addresses (bitcoin-lisp.networking:diversify-by-netgroup addresses))
+
     (log-info "~D candidate peers available" (length addresses))
 
     ;; Store discovered addresses for reconnection
