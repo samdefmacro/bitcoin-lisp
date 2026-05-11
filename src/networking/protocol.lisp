@@ -35,15 +35,68 @@ concurrent access from RPC and sync threads."
       nil
     (error () nil)))
 
+(defun ip-netgroup (addr)
+  "Return the /16 group key for an IPv4 dotted-quad string, NIL otherwise.
+Mirrors Bitcoin Core's CNetAddr::GetGroup() for routable IPv4: groups
+addresses by the first two octets so addrman's bucket selection
+prefers connections from distinct operators / netgroups. Without
+this, DNS seeds that dump many IPs from one /24 (e.g. wiz.biz's
+testnet4 nodes at 103.165.192.x) cause an 8-of-8 single-operator
+peer set, which becomes a single point of stall."
+  (let ((dots 0)
+        (end nil))
+    (dotimes (i (length addr))
+      (when (char= (char addr i) #\.)
+        (incf dots)
+        (when (= dots 2)
+          (setf end i)
+          (return))))
+    (when end
+      (subseq addr 0 end))))
+
+(defun diversify-by-netgroup (addresses)
+  "Reorder ADDRESSES so consecutive entries come from distinct /16
+netgroups when possible. Round-robins across groups: caller (which
+connects to the first N entries) gets the broadest spread for free
+without needing per-group caps. Stable within each group so the DNS-
+returned ordering acts as the within-group tiebreaker."
+  (let ((groups (make-hash-table :test 'equal))
+        (group-keys '()))
+    ;; Bucket by group, preserve within-group order.
+    (dolist (addr addresses)
+      (let ((g (or (ip-netgroup addr) "_nogroup")))
+        (unless (gethash g groups)
+          (push g group-keys))
+        (setf (gethash g groups) (nconc (gethash g groups) (list addr)))))
+    (setf group-keys (nreverse group-keys))
+    ;; Round-robin pull from each group until all are drained.
+    (let ((result '()))
+      (loop while group-keys do
+            (let ((next-keys '()))
+              (dolist (g group-keys)
+                (let ((bucket (gethash g groups)))
+                  (when bucket
+                    (push (first bucket) result)
+                    (setf (gethash g groups) (rest bucket))
+                    (when (rest bucket)
+                      (push g next-keys)))))
+              (setf group-keys (nreverse next-keys))))
+      (nreverse result))))
+
 (defun discover-peers (&optional (seeds *dns-seeds*))
   "Discover peers from DNS seeds.
-Returns a list of IP address strings."
+Returns a list of IP address strings, ordered so the first N entries
+span as many distinct /16 netgroups as possible (see diversify-by-
+netgroup). The caller iterates this list and connects to the first
+peers that succeed; round-robin ordering prevents a single operator's
+DNS-clustered nodes from monopolizing our 8-peer outbound budget."
   (let ((addresses '()))
     (dolist (seed seeds)
       (let ((resolved (resolve-dns-seed seed)))
         (when resolved
           (setf addresses (nconc addresses resolved)))))
-    (remove-duplicates addresses :test #'string=)))
+    (diversify-by-netgroup
+     (remove-duplicates addresses :test #'string=))))
 
 ;;; Message handling
 

@@ -532,6 +532,8 @@
    #:peer-manager
    #:make-peer-manager
    #:discover-peers
+   #:diversify-by-netgroup
+   #:ip-netgroup
    ;; Protocol
    #:handle-message
    #:request-headers
