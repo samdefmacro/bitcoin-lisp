@@ -13,45 +13,125 @@
   (height 0 :type (unsigned-byte 32))
   (coinbase nil :type boolean))
 
-(declaim (inline utxo-key-hash))
-(defun utxo-key-hash (key)
-  "Custom :hash-function for the UTXO entries hash-table. Keys are
-36-byte vectors (32-byte txid + 4-byte LE output-index, see
-make-utxo-key). The first 8 bytes of the txid are SHA256 output and
-already uniformly random, so we take them as a little-endian uint64
-masked to fixnum width — far cheaper than SBCL's data-vector-hash,
-which iterates all 36 bytes per lookup. Equalp test resolves any
-collisions exactly. Same pattern as sig-cache-hash; tapscript-region
-profile (May 2026) showed DATA-VECTOR-HASH on UTXO keys at ~7% of CPU."
-  (declare (type (simple-array (unsigned-byte 8) (*)) key)
+;;; UTXO-KEY — the per-output identity used as the hash-table key.
+;;;
+;;; Pack the 32-byte txid as four (unsigned-byte 64) words (LE-interpreted)
+;;; plus the (unsigned-byte 32) vout. SBCL inlines = on fixnums to a
+;;; single CMP, so utxo-key= is ~5 instructions; the previous
+;;; byte-vector-with-equalp key dispatched to SB-IMPL::ARRAY-EQUALP and
+;;; looped through 36 bytes via DATA-VECTOR-REF — ~72% of stress-region
+;;; CPU per the May 2026 profile, mirroring Core's COutPoint operator==
+;;; which compiles to an inlined memcmp(32) + uint32 compare
+;;; (primitives/transaction.h:49).
+
+(defstruct (utxo-key (:conc-name uk-)
+                     (:constructor %make-utxo-key (a b c d vout))
+                     (:copier nil)
+                     (:predicate nil))
+  (a 0 :type (unsigned-byte 64) :read-only t)
+  (b 0 :type (unsigned-byte 64) :read-only t)
+  (c 0 :type (unsigned-byte 64) :read-only t)
+  (d 0 :type (unsigned-byte 64) :read-only t)
+  (vout 0 :type (unsigned-byte 32) :read-only t))
+
+(declaim (inline txid-bytes->u64-le))
+(defun txid-bytes->u64-le (bytes offset)
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
+           (type (unsigned-byte 32) offset)
            (optimize (speed 3) (safety 0)))
-  (logand (logior (aref key 0)
-                  (ash (aref key 1) 8)
-                  (ash (aref key 2) 16)
-                  (ash (aref key 3) 24)
-                  (ash (aref key 4) 32)
-                  (ash (aref key 5) 40)
-                  (ash (aref key 6) 48)
-                  (ash (aref key 7) 56))
-          most-positive-fixnum))
+  (logior (aref bytes offset)
+          (ash (aref bytes (+ offset 1)) 8)
+          (ash (aref bytes (+ offset 2)) 16)
+          (ash (aref bytes (+ offset 3)) 24)
+          (ash (aref bytes (+ offset 4)) 32)
+          (ash (aref bytes (+ offset 5)) 40)
+          (ash (aref bytes (+ offset 6)) 48)
+          (ash (aref bytes (+ offset 7)) 56)))
+
+(declaim (inline make-utxo-key))
+(defun make-utxo-key (txid output-index)
+  "Pack TXID (32 bytes, treated as four LE uint64 words) and OUTPUT-INDEX
+into a utxo-key struct."
+  (declare (type (simple-array (unsigned-byte 8) (*)) txid)
+           (type (unsigned-byte 32) output-index)
+           (optimize (speed 3) (safety 0)))
+  (%make-utxo-key (txid-bytes->u64-le txid 0)
+                  (txid-bytes->u64-le txid 8)
+                  (txid-bytes->u64-le txid 16)
+                  (txid-bytes->u64-le txid 24)
+                  output-index))
+
+(declaim (inline utxo-key=))
+(defun utxo-key= (x y)
+  (declare (type utxo-key x y) (optimize (speed 3) (safety 0)))
+  (and (= (uk-vout x) (uk-vout y))
+       (= (uk-a x) (uk-a y))
+       (= (uk-b x) (uk-b y))
+       (= (uk-c x) (uk-c y))
+       (= (uk-d x) (uk-d y))))
+
+(declaim (inline utxo-key-hash))
+(defun utxo-key-hash (k)
+  "Custom :hash-function. The first 8 bytes of the txid are SHA256 output
+and already uniformly random — return them as a fixnum-masked uint64.
+Same pattern as the previous byte-vector-keyed table; this just reads
+the pre-extracted slot."
+  (declare (type utxo-key k) (optimize (speed 3) (safety 0)))
+  (logand (uk-a k) most-positive-fixnum))
+
+#+sbcl (sb-ext:define-hash-table-test utxo-key= utxo-key-hash)
 
 (defstruct utxo-set
   "In-memory UTXO set.
 The set maps (txid, output-index) -> utxo-entry."
-  (entries (make-hash-table :test 'equalp
-                            #+sbcl :hash-function #+sbcl 'utxo-key-hash)
+  (entries (make-hash-table #+sbcl :test #+sbcl 'utxo-key=
+                            #-sbcl :test #-sbcl 'equalp)
    :type hash-table)
   (dirty nil :type boolean))
 
-(defun make-utxo-key (txid output-index)
-  "Create a key for the UTXO set from TXID and OUTPUT-INDEX."
-  (let ((key (make-array 36 :element-type '(unsigned-byte 8))))
-    (replace key txid)
-    (setf (aref key 32) (logand output-index #xFF))
-    (setf (aref key 33) (logand (ash output-index -8) #xFF))
-    (setf (aref key 34) (logand (ash output-index -16) #xFF))
-    (setf (aref key 35) (logand (ash output-index -24) #xFF))
-    key))
+(declaim (inline write-u64-le-into))
+(defun write-u64-le-into (bytes offset v)
+  "Write 64-bit V into BYTES at OFFSET as 8 LE bytes. Inverse of
+txid-bytes->u64-le."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
+           (type (unsigned-byte 32) offset)
+           (type (unsigned-byte 64) v)
+           (optimize (speed 3) (safety 0)))
+  (setf (aref bytes offset)        (logand v #xFF)
+        (aref bytes (+ offset 1))  (logand (ash v -8) #xFF)
+        (aref bytes (+ offset 2))  (logand (ash v -16) #xFF)
+        (aref bytes (+ offset 3))  (logand (ash v -24) #xFF)
+        (aref bytes (+ offset 4))  (logand (ash v -32) #xFF)
+        (aref bytes (+ offset 5))  (logand (ash v -40) #xFF)
+        (aref bytes (+ offset 6))  (logand (ash v -48) #xFF)
+        (aref bytes (+ offset 7))  (logand (ash v -56) #xFF)))
+
+(defun utxo-key-bytes (k)
+  "Reconstruct the 36-byte on-disk form (32-byte txid || 4-byte LE vout)
+from a utxo-key. Used by save-utxo-set, utxo-set-iterate, and
+hash_serialized_3 — never on the inv/validate hot path."
+  (declare (type utxo-key k))
+  (let ((bytes (make-array 36 :element-type '(unsigned-byte 8))))
+    (write-u64-le-into bytes 0 (uk-a k))
+    (write-u64-le-into bytes 8 (uk-b k))
+    (write-u64-le-into bytes 16 (uk-c k))
+    (write-u64-le-into bytes 24 (uk-d k))
+    (let ((v (uk-vout k)))
+      (setf (aref bytes 32) (logand v #xFF)
+            (aref bytes 33) (logand (ash v -8) #xFF)
+            (aref bytes 34) (logand (ash v -16) #xFF)
+            (aref bytes 35) (logand (ash v -24) #xFF)))
+    bytes))
+
+(defun utxo-key-txid (k)
+  "Extract the 32-byte txid from a utxo-key as a fresh byte vector."
+  (declare (type utxo-key k))
+  (let ((bytes (make-array 32 :element-type '(unsigned-byte 8))))
+    (write-u64-le-into bytes 0 (uk-a k))
+    (write-u64-le-into bytes 8 (uk-b k))
+    (write-u64-le-into bytes 16 (uk-c k))
+    (write-u64-le-into bytes 24 (uk-d k))
+    bytes))
 
 (defun add-utxo (utxo-set txid output-index value script-pubkey height &key coinbase)
   "Add a UTXO to the set."
@@ -87,13 +167,19 @@ The set maps (txid, output-index) -> utxo-entry."
 
 (defun any-utxo-for-txid-p (utxo-set txid)
   "Check if any unspent output exists for TXID (BIP 30 duplicate check).
-Scans UTXO keys whose first 32 bytes match TXID."
-  (maphash (lambda (key entry)
-             (declare (ignore entry))
-             (when (and (>= (length key) 32)
-                        (equalp (subseq key 0 32) txid))
-               (return-from any-utxo-for-txid-p t)))
-           (utxo-set-entries utxo-set))
+Scans UTXO keys whose txid portion matches TXID."
+  (declare (type (simple-array (unsigned-byte 8) (*)) txid))
+  (let ((a (txid-bytes->u64-le txid 0))
+        (b (txid-bytes->u64-le txid 8))
+        (c (txid-bytes->u64-le txid 16))
+        (d (txid-bytes->u64-le txid 24)))
+    (declare (type (unsigned-byte 64) a b c d))
+    (maphash (lambda (key entry)
+               (declare (ignore entry) (type utxo-key key))
+               (when (and (= (uk-a key) a) (= (uk-b key) b)
+                          (= (uk-c key) c) (= (uk-d key) d))
+                 (return-from any-utxo-for-txid-p t)))
+             (utxo-set-entries utxo-set)))
   nil)
 
 (defun apply-block-to-utxo-set (utxo-set block height)
@@ -358,7 +444,12 @@ exhausted the heap during a single contiguous allocation."
      (bitcoin-lisp.serialization:bb-write-u32-le
       bb (hash-table-count (utxo-set-entries utxo-set)))
      (maphash (lambda (key entry)
-                (bitcoin-lisp.serialization:bb-write-bytes bb key)
+                (declare (type utxo-key key))
+                (bitcoin-lisp.serialization:bb-write-u64-le bb (uk-a key))
+                (bitcoin-lisp.serialization:bb-write-u64-le bb (uk-b key))
+                (bitcoin-lisp.serialization:bb-write-u64-le bb (uk-c key))
+                (bitcoin-lisp.serialization:bb-write-u64-le bb (uk-d key))
+                (bitcoin-lisp.serialization:bb-write-u32-le bb (uk-vout key))
                 (bb-write-utxo-entry-fields bb entry)
                 (when (>= (bitcoin-lisp.serialization:bb-pos bb)
                           +utxo-save-flush-threshold+)
@@ -407,11 +498,13 @@ Returns T if loaded, NIL if file does not exist or is corrupted."
   "Load UTXO set from old format (no magic, no checksum)."
   (flexi-streams:with-input-from-sequence (stream file-bytes)
     (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
-          (entries (utxo-set-entries utxo-set)))
+          (entries (utxo-set-entries utxo-set))
+          (txid-buf (make-array 32 :element-type '(unsigned-byte 8))))
       (clrhash entries)
       (dotimes (i count)
-        (let ((key (make-array 36 :element-type '(unsigned-byte 8))))
-          (read-sequence key stream)
+        (read-sequence txid-buf stream)
+        (let* ((vout (bitcoin-lisp.serialization:read-uint32-le stream))
+               (key (make-utxo-key txid-buf vout)))
           (setf (gethash key entries) (read-utxo-entry-fields stream))))))
   (setf (utxo-set-dirty utxo-set) nil)
   t)
@@ -443,11 +536,13 @@ Returns T if loaded, NIL if file does not exist or is corrupted."
         (return-from load-utxo-set-v1 nil)))
     ;; Read entries
     (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
-          (entries (utxo-set-entries utxo-set)))
+          (entries (utxo-set-entries utxo-set))
+          (txid-buf (make-array 32 :element-type '(unsigned-byte 8))))
       (clrhash entries)
       (dotimes (i count)
-        (let ((key (make-array 36 :element-type '(unsigned-byte 8))))
-          (read-sequence key stream)
+        (read-sequence txid-buf stream)
+        (let* ((vout (bitcoin-lisp.serialization:read-uint32-le stream))
+               (key (make-utxo-key txid-buf vout)))
           (setf (gethash key entries) (read-utxo-entry-fields stream))))))
   (setf (utxo-set-dirty utxo-set) nil)
   t)
@@ -460,30 +555,23 @@ Returns T if loaded, NIL if file does not exist or is corrupted."
 
 (defun utxo-set-iterate (utxo-set callback)
   "Iterate over all UTXOs in deterministic order.
-Order is (txid, vout) ascending.
+Order is the on-disk 36-byte (txid || LE vout) lexicographic order, matching
+the input to Bitcoin Core's hash_serialized_3 computation.
 CALLBACK is called with (txid vout entry) for each UTXO."
   (let ((keys '()))
-    ;; Collect all keys
     (maphash (lambda (key entry)
                (declare (ignore entry))
-               (push key keys))
+               (push (cons (utxo-key-bytes key) key) keys))
              (utxo-set-entries utxo-set))
-    ;; Sort keys lexicographically (this gives us txid order, then vout order)
-    (setf keys (sort keys #'key-less-than))
-    ;; Iterate in order
-    (dolist (key keys)
-      (let ((entry (gethash key (utxo-set-entries utxo-set))))
+    (setf keys (sort keys #'key-bytes-less-than :key #'car))
+    (dolist (pair keys)
+      (let* ((key (cdr pair))
+             (entry (gethash key (utxo-set-entries utxo-set))))
         (when entry
-          ;; Extract txid and vout from key
-          (let ((txid (subseq key 0 32))
-                (vout (logior (aref key 32)
-                              (ash (aref key 33) 8)
-                              (ash (aref key 34) 16)
-                              (ash (aref key 35) 24))))
-            (funcall callback txid vout entry)))))))
+          (funcall callback (utxo-key-txid key) (uk-vout key) entry))))))
 
-(defun key-less-than (a b)
-  "Compare two 36-byte UTXO keys lexicographically."
+(defun key-bytes-less-than (a b)
+  "Compare two 36-byte UTXO key vectors lexicographically."
   (loop for i from 0 below 36
         do (cond
              ((< (aref a i) (aref b i)) (return t))
@@ -501,11 +589,12 @@ CALLBACK is called with (txid vout entry) for each UTXO."
 
 (defun utxo-set-distinct-txids (utxo-set)
   "Count distinct transaction IDs with unspent outputs."
-  (let ((txids (make-hash-table :test 'equalp)))
+  (let ((txids (make-hash-table :test 'equal)))
     (maphash (lambda (key entry)
-               (declare (ignore entry))
-               (let ((txid (subseq key 0 32)))
-                 (setf (gethash txid txids) t)))
+               (declare (ignore entry) (type utxo-key key))
+               (setf (gethash (list (uk-a key) (uk-b key) (uk-c key) (uk-d key))
+                              txids)
+                     t))
              (utxo-set-entries utxo-set))
     (hash-table-count txids)))
 
