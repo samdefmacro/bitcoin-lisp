@@ -95,7 +95,7 @@
  (lambda ()
    (handler-case
        (progn
-         (bitcoin-lisp::sync-blockchain bitcoin-lisp:*node* :max-blocks *target-blocks*)
+         (bitcoin-lisp::sync-blockchain bitcoin-lisp:*node*)
          (setf *sync-complete* t))
      (error (e)
        (setf *sync-error* e)

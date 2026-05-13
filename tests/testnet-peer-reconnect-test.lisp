@@ -58,7 +58,7 @@
   (sb-thread:make-thread
    (lambda ()
      (handler-case
-         (bitcoin-lisp::sync-blockchain bitcoin-lisp:*node* :max-blocks 300)
+         (bitcoin-lisp::sync-blockchain bitcoin-lisp:*node*)
        (error (e)
          (format t "Sync error: ~A~%" e))))
    :name "sync-thread"))
