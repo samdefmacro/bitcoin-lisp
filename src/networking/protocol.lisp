@@ -199,27 +199,29 @@ Returns T if message was handled, NIL otherwise."
 ;;; Inventory handling
 
 (defun handle-inv (peer payload chain-state &optional mempool &key recent-rejects)
-  "Handle an inv message."
+  "Handle an inv message.
+
+For block invs we DO NOT request the block directly via getdata — under
+headers-first sync (BIP 130 era), an unknown block hash means we are
+missing the header chain that reaches it, so a getdata would race the
+header that defines the block's parent and `process-received-block`
+would drop it with WARN: Received unknown block. Instead, on the first
+unknown block hash we send a getheaders sourced from our header tip;
+once headers connect, the IBD/follow-tip path issues the actual getdata.
+
+Mirrors Bitcoin Core net_processing.cpp:4153-4211 (best_block tracking
+plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
   (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
         (wanted '())
-        (use-compact (should-use-compact-blocks-p peer)))
-    ;; Check which items we want
+        (unknown-block-hash nil))
     (dolist (inv inv-vectors)
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
         (cond
-          ;; Block inventory - use compact blocks when available
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
            (unless (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
-             (push (bitcoin-lisp.serialization:make-inv-vector
-                    :type (if use-compact
-                              bitcoin-lisp.serialization:+inv-type-cmpct-block+
-                              bitcoin-lisp.serialization:+inv-type-witness-block+)
-                    :hash hash)
-                   wanted)))
-          ;; Transaction inventory - request with witness flag
-          ;; Skip if already in mempool or recently rejected
+             (setf unknown-block-hash hash)))
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
            (when (and mempool
@@ -229,7 +231,11 @@ Returns T if message was handled, NIL otherwise."
                     :type bitcoin-lisp.serialization:+inv-type-witness-tx+
                     :hash hash)
                    wanted))))))
-    ;; Request wanted items
+    (when unknown-block-hash
+      (bitcoin-lisp:log-debug "inv: unknown block ~A from peer ~A — sending getheaders"
+                              (bitcoin-lisp.crypto:bytes-to-hex unknown-block-hash)
+                              (peer-address peer))
+      (request-headers-for-ibd peer chain-state))
     (when wanted
       (send-message peer
                     (bitcoin-lisp.serialization:make-getdata-message

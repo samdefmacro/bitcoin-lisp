@@ -445,36 +445,26 @@ Returns the node instance."
                             (log-error "Sync thread backtrace:~%~A" bt)))))
                    ;; Initial connection
                    (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
+                   ;; Sync + follow-tip loop runs until node shutdown. The
+                   ;; previous early-return on "sync complete" exited the only
+                   ;; thread reading from peer sockets, so live tip
+                   ;; announcements after IBD were never processed. Peers push
+                   ;; new tips via sendheaders (BIP 130); this 30s poll is the
+                   ;; backstop for inv-only peers and missed announcements.
                    (loop while (node-running *node*)
-                         do (if (>= (length (node-peers *node*)) 1)
-                                (progn
-                                  (setf (node-syncing *node*) t)
-                                  (unwind-protect
-                                       (sync-blockchain *node*)
-                                    (setf (node-syncing *node*) nil))
-                                  ;; Check if we've caught up. Only declare
-                                  ;; "complete" when we actually have a peer to
-                                  ;; compare heights with — otherwise all peers
-                                  ;; may have just disconnected (stalling under
-                                  ;; slow validation), and the bare height test
-                                  ;; would falsely conclude we're synced.
-                                  (let* ((best-peer (find-best-peer *node*))
-                                         (our-height (bitcoin-lisp.storage:current-height
-                                                      (node-chain-state *node*))))
-                                    (when (and best-peer
-                                               (>= our-height
-                                                   (bitcoin-lisp.networking:peer-start-height
-                                                    best-peer)))
-                                      (log-info "Sync complete at height ~D" our-height)
-                                      (return)))
-                                  ;; Replace any peers lost during sync
-                                  (replace-disconnected-peers *node*))
-                                ;; No peers, try full reconnection
-                                (progn
-                                  (log-warn "No peers available, reconnecting in 5s...")
-                                  (sleep 5)
-                                  (connect-to-peers *node* max-peers
-                                                    :timeout 30 :min-peers 1)))))
+                         do (cond
+                              ((>= (length (node-peers *node*)) 1)
+                               (setf (node-syncing *node*) t)
+                               (unwind-protect
+                                    (sync-blockchain *node*)
+                                 (setf (node-syncing *node*) nil))
+                               (replace-disconnected-peers *node*)
+                               (sleep 30))
+                              (t
+                               (log-warn "No peers available, reconnecting in 5s...")
+                               (sleep 5)
+                               (connect-to-peers *node* max-peers
+                                                 :timeout 30 :min-peers 1)))))
                (error () nil)))
            :name "bitcoin-sync-thread")))
 
@@ -981,32 +971,29 @@ Returns the number of new peers connected."
 
 ;;;; Blockchain Synchronization
 
-(defun sync-blockchain (node &key (max-blocks 1000))
-  "Synchronize the blockchain with connected peers.
-Downloads up to MAX-BLOCKS using the IBD system."
+(defun sync-blockchain (node)
+  "Run one IBD/follow-tip cycle against connected peers.
+
+Doesn't short-circuit on `peer-start-height` since that value is frozen
+at handshake and goes stale once the chain advances — start-ibd's
+header-sync phase is what discovers new tips, and its block-download
+phase exits quickly when there's nothing new to fetch."
   (unless (node-peers node)
     (log-warn "No peers connected, cannot sync")
     (return-from sync-blockchain 0))
 
-  (let ((start-height (bitcoin-lisp.storage:current-height (node-chain-state node)))
-        (peer-height (bitcoin-lisp.networking:peer-start-height (find-best-peer node))))
-
-    (log-info "Starting sync: local height ~D, peer height ~D" start-height peer-height)
-
-    (when (>= start-height peer-height)
-      (log-info "Already synced to peer height")
-      (return-from sync-blockchain 0))
-
-    ;; Use IBD system for sync
-    (let ((target (min (+ start-height max-blocks) peer-height)))
-      (bitcoin-lisp.networking::start-ibd
-       (node-peers node)
-       (node-chain-state node)
-       (node-utxo-set node)
-       (node-block-store node)
-       target
-       :fee-estimator (node-fee-estimator node)
-       :recent-rejects (node-recent-rejects node)))))
+  (let ((peer-height (bitcoin-lisp.networking:peer-start-height (find-best-peer node))))
+    (log-debug "Sync cycle: local height ~D, peer-start height ~D"
+               (bitcoin-lisp.storage:current-height (node-chain-state node))
+               peer-height)
+    (bitcoin-lisp.networking::start-ibd
+     (node-peers node)
+     (node-chain-state node)
+     (node-utxo-set node)
+     (node-block-store node)
+     peer-height
+     :fee-estimator (node-fee-estimator node)
+     :recent-rejects (node-recent-rejects node))))
 
 
 (defun find-best-peer (node)
