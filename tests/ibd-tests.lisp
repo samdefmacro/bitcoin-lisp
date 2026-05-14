@@ -144,7 +144,7 @@
     ;; Add to pending and in-flight
     (setf (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
                          bitcoin-lisp.networking::*ibd-context*)) 100)
-    (bitcoin-lisp.networking::mark-block-in-flight hash :peer)
+    (bitcoin-lisp.networking::mark-block-in-flight hash (bitcoin-lisp.networking::make-peer))
 
     ;; Initial blocks received count
     (is (= 0 (bitcoin-lisp.networking::ibd-context-blocks-received

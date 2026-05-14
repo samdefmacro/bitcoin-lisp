@@ -73,12 +73,24 @@
   ;; Used by the stuck-tip detector to halt IBD when validation can't drain
   ;; the queue (vs Core's TipMayBeStale, net_processing.cpp:1332-1340).
   (last-tip-advance-time 0 :type integer)
-  (last-tip-height 0 :type (unsigned-byte 32)))
+  (last-tip-height 0 :type (unsigned-byte 32))
+  ;; Per-block delivery samples: (timestamp peer-address latency-ms) most
+  ;; recent first. Trimmed in report-ibd-progress to +recent-rate-window-seconds+.
+  ;; Lets us see whether slow IBD is peer-side (some peers deliver in 30s+)
+  ;; or pipeline-side (peers fast but we don't request enough).
+  (delivery-samples nil :type list))
 
 (defparameter +recent-rate-window-seconds+ 60
   "Window for the recent-rate metric in IBD Progress logs. 60s gives a
 useful real-time view of throughput swings (peer disconnects, stress
 regions) that the cumulative session-average smooths over.")
+
+(declaim (inline trim-samples-older-than))
+(defun trim-samples-older-than (samples cutoff-ticks)
+  "Drop entries whose head (timestamp in internal-time units) is older
+than CUTOFF-TICKS. Works on both `recent-samples` (time . height) cons
+cells and `delivery-samples` (time peer-address latency-ms) lists."
+  (delete-if (lambda (s) (< (first s) cutoff-ticks)) samples))
 
 (defvar *ibd-context* nil
   "Current IBD context.")
@@ -431,11 +443,22 @@ that don't construct a chain-state)."
           (cons peer (get-internal-real-time)))))
 
 (defun mark-block-received (hash)
-  "Mark a block as received, removing it from pending and in-flight."
+  "Mark a block as received, removing it from pending and in-flight.
+Records delivery latency (now - request-time) for the corresponding
+in-flight entry so report-ibd-progress can surface p50/p95."
   (when *ibd-context*
     (when (gethash hash (ibd-context-pending-blocks *ibd-context*))
       (remhash hash (ibd-context-pending-blocks *ibd-context*))
       (incf (ibd-context-blocks-received *ibd-context*)))
+    (let ((entry (gethash hash (ibd-context-in-flight *ibd-context*))))
+      (when entry
+        (let* ((peer (car entry))
+               (sent-at (cdr entry))
+               (now (get-internal-real-time))
+               (latency-ms (round (* 1000 (- now sent-at))
+                                  internal-time-units-per-second)))
+          (push (list now (peer-address peer) latency-ms)
+                (ibd-context-delivery-samples *ibd-context*)))))
     (remhash hash (ibd-context-in-flight *ibd-context*))))
 
 (defun compute-block-download-timeout (num-downloading-peers)
@@ -659,13 +682,11 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
                              received))
          (pending (hash-table-count (ibd-context-pending-blocks ctx)))
          (in-flight (hash-table-count (ibd-context-in-flight ctx)))
-         ;; Push current sample, trim entries older than the window.
-         (window-ticks (* +recent-rate-window-seconds+
-                          internal-time-units-per-second))
-         (cutoff (- now window-ticks))
+         (cutoff (- now (* +recent-rate-window-seconds+
+                           internal-time-units-per-second)))
          (samples (cons (cons now current-height)
-                        (delete-if (lambda (s) (< (car s) cutoff))
-                                   (ibd-context-recent-samples ctx))))
+                        (trim-samples-older-than
+                         (ibd-context-recent-samples ctx) cutoff)))
          ;; Recent rate: oldest sample still in window vs current.
          (oldest (car (last samples)))
          (recent-secs (/ (- now (car oldest))
@@ -703,7 +724,37 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
        (getf progress :blocks-per-second)
        (getf progress :recent-blocks-per-second)
        (getf progress :pending-blocks)
-       (getf progress :in-flight-blocks)))))
+       (getf progress :in-flight-blocks))
+      (report-delivery-latency))))
+
+(defun report-delivery-latency ()
+  "Log p50/p95 block-delivery latency and per-peer counts over the recent
+window. Trims delivery-samples to drop entries older than the window."
+  (when *ibd-context*
+    (let* ((ctx *ibd-context*)
+           (cutoff (- (get-internal-real-time)
+                      (* +recent-rate-window-seconds+
+                         internal-time-units-per-second)))
+           (samples (trim-samples-older-than
+                     (ibd-context-delivery-samples ctx) cutoff)))
+      (setf (ibd-context-delivery-samples ctx) samples)
+      (when samples
+        (let* ((latencies (sort (mapcar #'third samples) #'<))
+               (n (length latencies))
+               ;; nearest-rank-below semantics, clamped so percentile
+               ;; index is always in [0, n-1].
+               (p50 (nth (min (1- n) (floor (* n 0.50))) latencies))
+               (p95 (nth (min (1- n) (floor (* n 0.95))) latencies))
+               (per-peer (make-hash-table :test 'equal)))
+          (dolist (s samples)
+            (incf (gethash (second s) per-peer 0)))
+          (bitcoin-lisp:log-info
+           "Block-latency p50/p95: ~Dms / ~Dms over ~D samples; per-peer: ~{~A~^, ~}"
+           p50 p95 n
+           (sort (loop for k being each hash-key of per-peer
+                       using (hash-value v)
+                       collect (format nil "~A=~D" k v))
+                 #'string<)))))))
 
 ;;;; Main IBD Loop
 
