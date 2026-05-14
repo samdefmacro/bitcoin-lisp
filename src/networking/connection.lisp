@@ -14,6 +14,19 @@
   (bytes-sent 0 :type integer)
   (bytes-received 0 :type integer))
 
+(defun set-tcp-nodelay (usocket-socket)
+  "Disable Nagle's algorithm on USOCKET-SOCKET. Bitcoin's wire protocol
+sends small request messages followed by long silence while awaiting
+blocks — exactly the workload where Nagle's 200ms hold hurts throughput.
+Mirrors Bitcoin Core net.cpp:1794."
+  #+sbcl
+  (let ((underlying (usocket:socket usocket-socket)))
+    (when (typep underlying 'sb-bsd-sockets:inet-socket)
+      (ignore-errors
+        (setf (sb-bsd-sockets:sockopt-tcp-nodelay underlying) t))))
+  #-sbcl
+  (declare (ignore usocket-socket)))
+
 (defun make-tcp-connection (host port &key (timeout 10))
   "Create a TCP connection to HOST:PORT.
 Returns a connection structure or NIL on failure."
@@ -21,6 +34,7 @@ Returns a connection structure or NIL on failure."
       (let ((socket (usocket:socket-connect host port
                                             :element-type '(unsigned-byte 8)
                                             :timeout timeout)))
+        (set-tcp-nodelay socket)
         (make-connection :socket socket
                          :host host
                          :port port
