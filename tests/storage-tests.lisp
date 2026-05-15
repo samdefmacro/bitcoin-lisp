@@ -1088,3 +1088,95 @@ same undo data shape and end-state on utxo-set vs coins-view-cache."
       (is (bitcoin-lisp.storage:any-utxo-for-txid-p cache txid))
       (is (not (bitcoin-lisp.storage:any-utxo-for-txid-p set   other)))
       (is (not (bitcoin-lisp.storage:any-utxo-for-txid-p cache other))))))
+
+;;;; Polymorphic iteration + statistics
+;;;;
+;;;; utxo-set-iterate / utxo-set-total-amount / utxo-set-distinct-txids /
+;;;; compute-utxo-set-hash now dispatch on view type. For
+;;;; coins-view-cache, they flush first then walk the LevelDB base via
+;;;; iterator. These tests confirm parity with the utxo-set branch.
+
+(defun %seed-three-coins (view)
+  "Populate VIEW with three coins: (txidA, 0), (txidA, 1), (txidB, 0).
+Returns the txids and the value+script used so a caller can assert on
+the totals."
+  (let ((txid-a (%sample-txid #xAA))
+        (txid-b (%sample-txid #xBB))
+        (script (%sample-script)))
+    (bitcoin-lisp.storage:add-utxo view txid-a 0 100 script 1)
+    (bitcoin-lisp.storage:add-utxo view txid-a 1 200 script 1)
+    (bitcoin-lisp.storage:add-utxo view txid-b 0 300 script 1)
+    (values txid-a txid-b script)))
+
+(test polymorphic-utxo-set-iterate-parity
+  "utxo-set-iterate emits the same (txid, vout, entry) sequence on
+both views for the same seed data."
+  (%with-tmp-cache (cache)
+    (let ((set (bitcoin-lisp.storage:make-utxo-set))
+          (set-emits '())
+          (cache-emits '()))
+      (%seed-three-coins set)
+      (%seed-three-coins cache)
+      (bitcoin-lisp.storage:utxo-set-iterate
+       set
+       (lambda (txid vout entry)
+         (push (list (copy-seq txid) vout (bitcoin-lisp.storage:utxo-entry-value entry))
+               set-emits)))
+      (bitcoin-lisp.storage:utxo-set-iterate
+       cache
+       (lambda (txid vout entry)
+         (push (list (copy-seq txid) vout (bitcoin-lisp.storage:utxo-entry-value entry))
+               cache-emits)))
+      (is (= 3 (length set-emits)))
+      (is (= 3 (length cache-emits)))
+      (is (equalp (nreverse set-emits) (nreverse cache-emits))))))
+
+(test polymorphic-utxo-set-total-amount-parity
+  (%with-tmp-cache (cache)
+    (let ((set (bitcoin-lisp.storage:make-utxo-set)))
+      (%seed-three-coins set)
+      (%seed-three-coins cache)
+      (is (= 600 (bitcoin-lisp.storage:utxo-set-total-amount set)))
+      (is (= 600 (bitcoin-lisp.storage:utxo-set-total-amount cache))))))
+
+(test polymorphic-utxo-set-distinct-txids-parity
+  "Two outputs of txid-a + one of txid-b = 2 distinct txids."
+  (%with-tmp-cache (cache)
+    (let ((set (bitcoin-lisp.storage:make-utxo-set)))
+      (%seed-three-coins set)
+      (%seed-three-coins cache)
+      (is (= 2 (bitcoin-lisp.storage:utxo-set-distinct-txids set)))
+      (is (= 2 (bitcoin-lisp.storage:utxo-set-distinct-txids cache))))))
+
+(test polymorphic-compute-utxo-set-hash-parity
+  "The hash_serialized_3 digest is byte-identical across views."
+  (%with-tmp-cache (cache)
+    (let ((set (bitcoin-lisp.storage:make-utxo-set)))
+      (%seed-three-coins set)
+      (%seed-three-coins cache)
+      (is (equalp (bitcoin-lisp.storage:compute-utxo-set-hash set)
+                  (bitcoin-lisp.storage:compute-utxo-set-hash cache))))))
+
+(test polymorphic-iterate-cache-flushes-first
+  "Iterating a coins-view-cache flushes it as a side-effect — after
+the call, cvc-entries is empty and the data is in the base."
+  (%with-tmp-cache (cache)
+    (%seed-three-coins cache)
+    (is (= 3 (hash-table-count
+              (bitcoin-lisp.storage::cvc-entries cache))))
+    (bitcoin-lisp.storage:utxo-set-iterate
+     cache (lambda (txid vout entry)
+             (declare (ignore txid vout entry))))
+    (is (zerop (hash-table-count
+                (bitcoin-lisp.storage::cvc-entries cache))))))
+
+(test polymorphic-iterate-cache-merges-flushed-base-and-recent-adds
+  "After a partial flush, the next iterate still sees everything —
+because iterate itself flushes again before walking the base."
+  (%with-tmp-cache (cache)
+    ;; First batch — flush manually.
+    (bitcoin-lisp.storage:add-utxo cache (%sample-txid 1) 0 10 (%sample-script) 1)
+    (bitcoin-lisp.storage:coins-view-cache-flush cache)
+    ;; Second batch — leave dirty.
+    (bitcoin-lisp.storage:add-utxo cache (%sample-txid 2) 0 20 (%sample-script) 2)
+    (is (= 30 (bitcoin-lisp.storage:utxo-set-total-amount cache)))))
