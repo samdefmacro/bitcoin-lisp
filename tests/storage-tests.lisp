@@ -777,3 +777,242 @@ the LevelDB via coins-view-db-get."
                       dat-path ldb-path :batch-size 32)))
         (is (= 250 written))))
     (is (eq t (bitcoin-lisp.storage:leveldb-utxo-migration-complete-p ldb-path)))))
+
+;;;; LevelDB iterator tests
+
+(test leveldb-iterator-seek-to-first-walks-in-order
+  "After put of three keys in arbitrary order, seek-to-first + repeated
+next visits them in lexicographic order."
+  (%with-tmp-leveldb (db)
+    (let ((k1 (make-array 2 :element-type '(unsigned-byte 8) :initial-contents #(1 1)))
+          (k2 (make-array 2 :element-type '(unsigned-byte 8) :initial-contents #(1 2)))
+          (k3 (make-array 2 :element-type '(unsigned-byte 8) :initial-contents #(1 3)))
+          (v  (make-array 1 :element-type '(unsigned-byte 8) :initial-element 9)))
+      ;; Insert out of order; LevelDB sorts internally.
+      (bitcoin-lisp.storage:leveldb-put db k3 v)
+      (bitcoin-lisp.storage:leveldb-put db k1 v)
+      (bitcoin-lisp.storage:leveldb-put db k2 v)
+      (bitcoin-lisp.storage:with-leveldb-iterator (it db)
+        (bitcoin-lisp.storage:leveldb-iter-seek-to-first it)
+        (is (bitcoin-lisp.storage:leveldb-iter-valid-p it))
+        (is (equalp k1 (bitcoin-lisp.storage:leveldb-iter-key it)))
+        (bitcoin-lisp.storage:leveldb-iter-next it)
+        (is (equalp k2 (bitcoin-lisp.storage:leveldb-iter-key it)))
+        (bitcoin-lisp.storage:leveldb-iter-next it)
+        (is (equalp k3 (bitcoin-lisp.storage:leveldb-iter-key it)))
+        (bitcoin-lisp.storage:leveldb-iter-next it)
+        (is (not (bitcoin-lisp.storage:leveldb-iter-valid-p it)))))))
+
+(test leveldb-iterator-seek-prefix-scan
+  "Seek to a prefix; iterator stops emitting once keys leave the prefix.
+This is the BIP30-style scan: 'all keys starting with C+txid'."
+  (%with-tmp-leveldb (db)
+    (let ((ka (make-array 2 :element-type '(unsigned-byte 8) :initial-contents #(1 0)))
+          (kb (make-array 2 :element-type '(unsigned-byte 8) :initial-contents #(2 0)))
+          (kc (make-array 2 :element-type '(unsigned-byte 8) :initial-contents #(2 5)))
+          (kd (make-array 2 :element-type '(unsigned-byte 8) :initial-contents #(3 0)))
+          (v  (make-array 1 :element-type '(unsigned-byte 8) :initial-element 9))
+          (prefix (make-array 1 :element-type '(unsigned-byte 8) :initial-element 2)))
+      (dolist (k (list ka kb kc kd))
+        (bitcoin-lisp.storage:leveldb-put db k v))
+      (bitcoin-lisp.storage:with-leveldb-iterator (it db)
+        (bitcoin-lisp.storage:leveldb-iter-seek it prefix)
+        ;; First hit is kb (#(2 0)).
+        (is (bitcoin-lisp.storage:leveldb-iter-valid-p it))
+        (is (equalp kb (bitcoin-lisp.storage:leveldb-iter-key it)))
+        (bitcoin-lisp.storage:leveldb-iter-next it)
+        (is (equalp kc (bitcoin-lisp.storage:leveldb-iter-key it)))
+        (bitcoin-lisp.storage:leveldb-iter-next it)
+        ;; Next key is kd which leaves the prefix — caller is responsible
+        ;; for stopping; the iterator itself remains valid.
+        (is (equalp kd (bitcoin-lisp.storage:leveldb-iter-key it)))))))
+
+(test leveldb-iterator-empty-db
+  "Seek-to-first on an empty DB yields an invalid iterator immediately."
+  (%with-tmp-leveldb (db)
+    (bitcoin-lisp.storage:with-leveldb-iterator (it db)
+      (bitcoin-lisp.storage:leveldb-iter-seek-to-first it)
+      (is (not (bitcoin-lisp.storage:leveldb-iter-valid-p it))))))
+
+(test leveldb-iterator-value-copy-out
+  "Iterator key and value bytes are owned by the caller (survive next)."
+  (%with-tmp-leveldb (db)
+    (let ((k1 (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1))
+          (k2 (make-array 1 :element-type '(unsigned-byte 8) :initial-element 2))
+          (v1 (make-array 3 :element-type '(unsigned-byte 8) :initial-contents #(10 11 12)))
+          (v2 (make-array 3 :element-type '(unsigned-byte 8) :initial-contents #(20 21 22))))
+      (bitcoin-lisp.storage:leveldb-put db k1 v1)
+      (bitcoin-lisp.storage:leveldb-put db k2 v2)
+      (bitcoin-lisp.storage:with-leveldb-iterator (it db)
+        (bitcoin-lisp.storage:leveldb-iter-seek-to-first it)
+        (let ((k-copy (bitcoin-lisp.storage:leveldb-iter-key it))
+              (v-copy (bitcoin-lisp.storage:leveldb-iter-value it)))
+          (bitcoin-lisp.storage:leveldb-iter-next it)
+          ;; After advancing, the previously copied buffers must still
+          ;; hold the original bytes — they're caller-owned.
+          (is (equalp k1 k-copy))
+          (is (equalp v1 v-copy)))))))
+
+;;;; coin-view-* convenience wrapper tests
+;;;;
+;;;; These should behave identically to the legacy utxo-set add-/get-/
+;;;; remove-utxo on a fresh cache (no base content). The cache-vs-base
+;;;; semantics are exercised more thoroughly in the coins-view-cache-*
+;;;; tests above; here we just verify the txid+vout dispatch path.
+
+(defun %sample-txid (&optional (element 1))
+  (make-array 32 :element-type '(unsigned-byte 8) :initial-element element))
+
+(defun %sample-script ()
+  (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76))
+
+(test coin-view-add-get-round-trip
+  (%with-tmp-cache (cache)
+    (let ((txid (%sample-txid 7)))
+      (bitcoin-lisp.storage:coin-view-add cache txid 0
+                                          12345 (%sample-script) 99)
+      (let ((got (bitcoin-lisp.storage:coin-view-get cache txid 0)))
+        (is (not (null got)))
+        (is (= 12345 (bitcoin-lisp.storage:utxo-entry-value got)))
+        (is (= 99 (bitcoin-lisp.storage:utxo-entry-height got)))))))
+
+(test coin-view-has-p-reflects-spend
+  (%with-tmp-cache (cache)
+    (let ((txid (%sample-txid 8)))
+      (bitcoin-lisp.storage:coin-view-add cache txid 0
+                                          1 (%sample-script) 1)
+      (is (bitcoin-lisp.storage:coin-view-has-p cache txid 0))
+      (let ((prev (bitcoin-lisp.storage:coin-view-spend cache txid 0)))
+        (is (not (null prev)))
+        (is (= 1 (bitcoin-lisp.storage:utxo-entry-value prev))))
+      (is (not (bitcoin-lisp.storage:coin-view-has-p cache txid 0)))
+      (is (null (bitcoin-lisp.storage:coin-view-spend cache txid 0))))))
+
+(test coin-view-any-utxo-for-txid-p-cache-hit
+  "Returns T when only the cache has unspent outputs for TXID."
+  (%with-tmp-cache (cache)
+    (let ((txid (%sample-txid 9)))
+      (bitcoin-lisp.storage:coin-view-add cache txid 0
+                                          1 (%sample-script) 1)
+      (is (bitcoin-lisp.storage:coin-view-any-utxo-for-txid-p cache txid)))))
+
+(test coin-view-any-utxo-for-txid-p-base-hit
+  "Returns T when only the base has unspent outputs for TXID — iterator
+discovers them through the empty cache."
+  (%with-tmp-leveldb-path (path)
+    (let ((txid (%sample-txid 10)))
+      ;; Pre-populate the base directly.
+      (bitcoin-lisp.storage:with-coins-view-db (view path)
+        (bitcoin-lisp.storage:coins-view-db-put
+         view (bitcoin-lisp.storage::make-utxo-key txid 0) (%sample-utxo-entry)))
+      (bitcoin-lisp.storage:with-coins-view-db (view path)
+        (let ((cache (bitcoin-lisp.storage:make-coins-view-cache view)))
+          (is (bitcoin-lisp.storage:coin-view-any-utxo-for-txid-p cache txid))
+          ;; A different txid should miss.
+          (is (not (bitcoin-lisp.storage:coin-view-any-utxo-for-txid-p
+                    cache (%sample-txid 11)))))))))
+
+(test coin-view-any-utxo-for-txid-p-cache-tombstone-supersedes-base
+  "Base has the coin, but the cache tombstones it — must report absent."
+  (%with-tmp-leveldb-path (path)
+    (let ((txid (%sample-txid 12)))
+      (bitcoin-lisp.storage:with-coins-view-db (view path)
+        (bitcoin-lisp.storage:coins-view-db-put
+         view (bitcoin-lisp.storage::make-utxo-key txid 0) (%sample-utxo-entry)))
+      (bitcoin-lisp.storage:with-coins-view-db (view path)
+        (let ((cache (bitcoin-lisp.storage:make-coins-view-cache view)))
+          ;; Spend pulls the coin through cache then tombstones it.
+          (is (not (null (bitcoin-lisp.storage:coin-view-spend cache txid 0))))
+          (is (not (bitcoin-lisp.storage:coin-view-any-utxo-for-txid-p
+                    cache txid))))))))
+
+;;;; coin-view-apply-block / coin-view-disconnect-block round-trip
+
+(defun %make-test-block (transactions)
+  "Wrap TRANSACTIONS in a bitcoin-block with a stub header."
+  (bitcoin-lisp.serialization:make-bitcoin-block
+   :header (bitcoin-lisp.serialization:make-block-header
+            :version 1
+            :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+            :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+            :timestamp 0 :bits 0 :nonce 0
+            :cached-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element #xBB))
+   :transactions transactions))
+
+(defun %make-coinbase-tx (txid value script)
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                  :previous-output
+                  (bitcoin-lisp.serialization:make-outpoint
+                   :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)
+                   :index #xFFFFFFFF)
+                  :script-sig (make-array 4 :element-type '(unsigned-byte 8)
+                                            :initial-element 1)))
+   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                   :value value :script-pubkey script))
+   :lock-time 0
+   :cached-hash txid))
+
+(defun %make-spending-tx (txid prev-txid prev-index value script)
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                  :previous-output
+                  (bitcoin-lisp.serialization:make-outpoint
+                   :hash prev-txid :index prev-index)
+                  :script-sig (make-array 4 :element-type '(unsigned-byte 8)
+                                            :initial-element 2)))
+   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                   :value value :script-pubkey script))
+   :lock-time 0
+   :cached-hash txid))
+
+(test coin-view-apply-block-then-disconnect-restores-state
+  "coin-view-apply-block + coin-view-disconnect-block round-trip leaves
+the cache equivalent to its pre-apply state."
+  (%with-tmp-cache (cache)
+    (let* ((script (%sample-script))
+           (prev-txid (%sample-txid #xDD))
+           (cb-txid (%sample-txid #x01))
+           (spend-txid (%sample-txid #x02)))
+      ;; Seed: one pre-existing UTXO which the block will spend.
+      (bitcoin-lisp.storage:coin-view-add cache prev-txid 0
+                                          9000000 script 5)
+      (let* ((block (%make-test-block
+                     (list (%make-coinbase-tx cb-txid 500000000 script)
+                           (%make-spending-tx spend-txid prev-txid 0
+                                              8000000 script))))
+             (spent (bitcoin-lisp.storage:coin-view-apply-block cache block 10)))
+        ;; Undo data captured the spent UTXO.
+        (is (= 1 (length spent)))
+        (is (equalp prev-txid (first (first spent))))
+        (is (= 0 (second (first spent))))
+        (is (= 9000000 (bitcoin-lisp.storage:utxo-entry-value
+                        (third (first spent)))))
+        ;; After apply: coinbase output + spending output present,
+        ;; prev-txid:0 absent.
+        (is (bitcoin-lisp.storage:coin-view-has-p cache cb-txid 0))
+        (is (bitcoin-lisp.storage:coin-view-has-p cache spend-txid 0))
+        (is (not (bitcoin-lisp.storage:coin-view-has-p cache prev-txid 0)))
+        ;; Disconnect: undoes the block.
+        (bitcoin-lisp.storage:coin-view-disconnect-block cache block spent)
+        (is (not (bitcoin-lisp.storage:coin-view-has-p cache cb-txid 0)))
+        (is (not (bitcoin-lisp.storage:coin-view-has-p cache spend-txid 0)))
+        (let ((restored (bitcoin-lisp.storage:coin-view-get cache prev-txid 0)))
+          (is (not (null restored)))
+          (is (= 9000000 (bitcoin-lisp.storage:utxo-entry-value restored)))
+          (is (= 5 (bitcoin-lisp.storage:utxo-entry-height restored))))))))
+
+(test coin-view-apply-block-coinbase-only
+  "A block with just a coinbase produces no undo data."
+  (%with-tmp-cache (cache)
+    (let* ((script (%sample-script))
+           (cb-txid (%sample-txid #x03))
+           (block (%make-test-block
+                   (list (%make-coinbase-tx cb-txid 500000000 script)))))
+      (let ((spent (bitcoin-lisp.storage:coin-view-apply-block cache block 1)))
+        (is (null spent))
+        (is (bitcoin-lisp.storage:coin-view-has-p cache cb-txid 0))))))
