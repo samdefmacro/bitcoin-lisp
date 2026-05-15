@@ -338,6 +338,24 @@
    #:load-utxo-set
    #:utxo-set-file-path
    #:utxo-set-dirty
+   ;; LevelDB CFFI bindings
+   #:ensure-libleveldb-loaded
+   #:leveldb-make-options
+   #:leveldb-destroy-options
+   #:leveldb-open
+   #:leveldb-close
+   #:leveldb-destroy-db
+   #:with-leveldb
+   #:leveldb-put
+   #:leveldb-get
+   #:leveldb-delete
+   #:leveldb-write
+   #:leveldb-make-writebatch
+   #:leveldb-destroy-writebatch
+   #:leveldb-writebatch-clear
+   #:leveldb-writebatch-put
+   #:leveldb-writebatch-delete
+   #:with-leveldb-writebatch
    ;; UTXO iteration and statistics
    #:utxo-set-iterate
    #:utxo-set-total-amount

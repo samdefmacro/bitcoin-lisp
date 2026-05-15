@@ -47,6 +47,7 @@
                  (:module "storage"
                   :components ((:file "blocks")
                                (:file "utxo")
+                               (:file "leveldb")
                                (:file "chain")
                                (:file "txindex")))
                  (:module "validation"

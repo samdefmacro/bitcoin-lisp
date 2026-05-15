@@ -9,15 +9,17 @@ A Bitcoin full node implementation in Common Lisp (SBCL).
 1. **SBCL** (Steel Bank Common Lisp) installed
 2. **Quicklisp** for package management
 3. **libsecp256k1** system library for ECDSA operations
-4. **Coalton** for static type support (see below)
+4. **libleveldb** system library for UTXO persistence (mirrors Bitcoin Core)
+5. **Coalton** for static type support (see below)
 
 ```bash
 # On macOS
 brew install sbcl
 brew install secp256k1
+brew install leveldb
 
 # On Ubuntu/Debian (see detailed instructions below)
-sudo apt-get install sbcl libsecp256k1-dev
+sudo apt-get install sbcl libsecp256k1-dev libleveldb-dev
 
 # Clone the repository
 git clone <repository-url>
@@ -57,7 +59,19 @@ ldconfig -p | grep secp256k1
 # Should output: libsecp256k1.so.2 (or similar)
 ```
 
-### Step 3: Install Quicklisp
+### Step 3: Install libleveldb
+
+The UTXO persistence layer uses LevelDB (same as Bitcoin Core).
+
+```bash
+sudo apt install libleveldb-dev
+
+# Verify
+ldconfig -p | grep leveldb
+# Should output: libleveldb.so.1 (or similar)
+```
+
+### Step 4: Install Quicklisp
 
 Quicklisp is the package manager for Common Lisp:
 
