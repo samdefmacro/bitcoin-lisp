@@ -50,6 +50,13 @@
   (dirty-count 0 :type fixnum)
   (fresh-count 0 :type fixnum))
 
+(declaim (inline coins-view-cache-base))
+(defun coins-view-cache-base (cache)
+  "Return the underlying coins-view-db backing CACHE. Callers that own
+the cache's lifecycle (e.g. the node) use this to close the LevelDB
+on shutdown."
+  (cvc-base cache))
+
 ;;;; Internal: fetch a coin into the cache. Mirrors Core's FetchCoin
 ;;;; (coins.cpp:68): if the key isn't in the cache, try the base view;
 ;;;; on hit, populate; on miss, leave the cache untouched (no negative
@@ -335,3 +342,149 @@ then restore the spends recorded in PREVIOUS-UTXOS."
     (destructuring-bind (txid index entry) prev
       (coins-view-cache-add cache (make-utxo-key txid index) entry
                             :allow-overwrite t))))
+
+;;;; Polymorphic dispatch for the legacy UTXO API.
+;;;;
+;;;; The legacy add-utxo / get-utxo / remove-utxo / etc. functions in
+;;;; utxo.lisp took a utxo-set. Production now uses a coins-view-cache
+;;;; backed by LevelDB; lots of tests still construct utxo-set directly.
+;;;; Rather than fork into utxo-set-* and coin-view-* parallel call
+;;;; trees, we redefine the legacy names to dispatch on view type via
+;;;; etypecase. Tag check compiles to a single CMP on SBCL — negligible
+;;;; vs. the hash-table or LevelDB lookup that follows.
+;;;;
+;;;; Redefining functions defined in utxo.lisp produces a STYLE-WARNING
+;;;; at compile time. That's intentional; the new definitions are
+;;;; strictly more general (handle utxo-set as before, plus
+;;;; coins-view-cache).
+
+(declaim (inline get-utxo utxo-exists-p))
+
+(defun get-utxo (view txid output-index)
+  "Polymorphic UTXO read. Returns the utxo-entry or NIL."
+  (etypecase view
+    (utxo-set
+     (gethash (make-utxo-key txid output-index) (utxo-set-entries view)))
+    (coins-view-cache
+     (coin-view-get view txid output-index))))
+
+(defun utxo-exists-p (view txid output-index)
+  (etypecase view
+    (utxo-set
+     (not (null (gethash (make-utxo-key txid output-index)
+                         (utxo-set-entries view)))))
+    (coins-view-cache
+     (not (null (coin-view-has-p view txid output-index))))))
+
+(defun add-utxo (view txid output-index value script-pubkey height
+                 &key coinbase)
+  "Polymorphic UTXO add. For coins-view-cache, passes :allow-overwrite=T
+to match legacy utxo-set semantics (which silently clobbers); strict
+overwrite checking lives only on the direct coins-view-cache-add path."
+  (etypecase view
+    (utxo-set
+     (let ((key (make-utxo-key txid output-index))
+           (entry (make-utxo-entry :value value
+                                   :script-pubkey script-pubkey
+                                   :height height
+                                   :coinbase coinbase)))
+       (setf (gethash key (utxo-set-entries view)) entry)
+       (setf (utxo-set-dirty view) t)
+       entry))
+    (coins-view-cache
+     (coin-view-add view txid output-index value script-pubkey height
+                    :coinbase coinbase :allow-overwrite t))))
+
+(defun remove-utxo (view txid output-index)
+  "Polymorphic UTXO removal. Returns the prior entry or NIL."
+  (etypecase view
+    (utxo-set
+     (let ((key (make-utxo-key txid output-index)))
+       (prog1
+           (gethash key (utxo-set-entries view))
+         (remhash key (utxo-set-entries view))
+         (setf (utxo-set-dirty view) t))))
+    (coins-view-cache
+     (coin-view-spend view txid output-index))))
+
+(defun any-utxo-for-txid-p (view txid)
+  "Polymorphic BIP30 scan: T if any unspent UTXO exists for TXID."
+  (declare (type (simple-array (unsigned-byte 8) (*)) txid))
+  (etypecase view
+    (utxo-set
+     (let ((a (txid-bytes->u64-le txid 0))
+           (b (txid-bytes->u64-le txid 8))
+           (c (txid-bytes->u64-le txid 16))
+           (d (txid-bytes->u64-le txid 24)))
+       (declare (type (unsigned-byte 64) a b c d))
+       (maphash (lambda (key entry)
+                  (declare (ignore entry) (type utxo-key key))
+                  (when (and (= (uk-a key) a) (= (uk-b key) b)
+                             (= (uk-c key) c) (= (uk-d key) d))
+                    (return-from any-utxo-for-txid-p t)))
+                (utxo-set-entries view)))
+     nil)
+    (coins-view-cache
+     (coin-view-any-utxo-for-txid-p view txid))))
+
+(defun apply-block-to-utxo-set (view block height)
+  "Polymorphic block-apply: spends inputs, adds outputs. Returns undo
+data — (txid index entry) for each spent UTXO, in apply order."
+  (etypecase view
+    (utxo-set
+     ;; Inlined from the legacy utxo-set body. Kept here so the
+     ;; redefinition in this file fully shadows the utxo.lisp version.
+     (let ((spent '()))
+       (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+             for tx-index from 0
+             for is-coinbase = (zerop tx-index)
+             do (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+                  (unless is-coinbase
+                    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+                      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                             (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
+                             (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+                             (key (make-utxo-key prev-txid prev-index))
+                             (entry (gethash key (utxo-set-entries view))))
+                        (when entry
+                          (push (list prev-txid prev-index entry) spent))
+                        (remhash key (utxo-set-entries view))
+                        (setf (utxo-set-dirty view) t))))
+                  (loop for output in (bitcoin-lisp.serialization:transaction-outputs tx)
+                        for out-idx from 0
+                        do (let ((key (make-utxo-key txid out-idx))
+                                 (entry (make-utxo-entry
+                                         :value (bitcoin-lisp.serialization:tx-out-value output)
+                                         :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                                         :height height
+                                         :coinbase is-coinbase)))
+                             (setf (gethash key (utxo-set-entries view)) entry)
+                             (setf (utxo-set-dirty view) t)))))
+       (nreverse spent)))
+    (coins-view-cache
+     (coin-view-apply-block view block height))))
+
+(defun utxo-count (view)
+  "Polymorphic UTXO count. For utxo-set, exact. For coins-view-cache,
+returns ONLY the in-memory entries — base count requires an O(N)
+LevelDB scan and is left to future work. Callers that need an exact
+count for a LevelDB-backed view must compute it themselves."
+  (etypecase view
+    (utxo-set (hash-table-count (utxo-set-entries view)))
+    (coins-view-cache (hash-table-count (cvc-entries view)))))
+
+(defun disconnect-block-from-utxo-set (view block previous-utxos)
+  (etypecase view
+    (utxo-set
+     (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+       (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+         (loop for out-idx from 0
+               below (length (bitcoin-lisp.serialization:transaction-outputs tx))
+               do (remhash (make-utxo-key txid out-idx)
+                           (utxo-set-entries view)))))
+     (dolist (prev previous-utxos)
+       (destructuring-bind (txid index entry) prev
+         (setf (gethash (make-utxo-key txid index) (utxo-set-entries view))
+               entry))))
+    (coins-view-cache
+     (coin-view-disconnect-block view block previous-utxos))))
