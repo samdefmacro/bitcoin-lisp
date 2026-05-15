@@ -356,6 +356,16 @@
    #:leveldb-writebatch-put
    #:leveldb-writebatch-delete
    #:with-leveldb-writebatch
+   ;; Coins-view (LevelDB-backed CCoinsViewDB equivalent)
+   #:coins-view-db
+   #:open-coins-view-db
+   #:close-coins-view-db
+   #:with-coins-view-db
+   #:coins-view-db-get
+   #:coins-view-db-put
+   #:coins-view-db-erase
+   #:coins-view-db-has-p
+   #:coins-view-db-write-batch
    ;; UTXO iteration and statistics
    #:utxo-set-iterate
    #:utxo-set-total-amount

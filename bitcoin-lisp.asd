@@ -48,6 +48,7 @@
                   :components ((:file "blocks")
                                (:file "utxo")
                                (:file "leveldb")
+                               (:file "coins-view")
                                (:file "chain")
                                (:file "txindex")))
                  (:module "validation"
