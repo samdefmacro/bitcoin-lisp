@@ -1016,3 +1016,75 @@ the cache equivalent to its pre-apply state."
       (let ((spent (bitcoin-lisp.storage:coin-view-apply-block cache block 1)))
         (is (null spent))
         (is (bitcoin-lisp.storage:coin-view-has-p cache cb-txid 0))))))
+
+;;;; Polymorphic-dispatch parity tests
+;;;;
+;;;; The legacy add-utxo / get-utxo / remove-utxo / apply-block-to-utxo-set
+;;;; / disconnect-block-from-utxo-set / any-utxo-for-txid-p functions
+;;;; now dispatch on view type. Production passes a coins-view-cache;
+;;;; many tests still pass utxo-set. These tests confirm that both
+;;;; types reach the same observable end-state for the same operations.
+
+(test polymorphic-add-get-utxo-set-and-cache-parity
+  "add-utxo + get-utxo behave the same on utxo-set and coins-view-cache."
+  (%with-tmp-cache (cache)
+    (let ((set (bitcoin-lisp.storage:make-utxo-set))
+          (txid (%sample-txid 42))
+          (script (%sample-script)))
+      ;; Same operation on both views.
+      (bitcoin-lisp.storage:add-utxo set   txid 0 12345 script 99)
+      (bitcoin-lisp.storage:add-utxo cache txid 0 12345 script 99)
+      ;; Same observable result.
+      (let ((from-set   (bitcoin-lisp.storage:get-utxo set   txid 0))
+            (from-cache (bitcoin-lisp.storage:get-utxo cache txid 0)))
+        (is (not (null from-set)))
+        (is (not (null from-cache)))
+        (is (= 12345 (bitcoin-lisp.storage:utxo-entry-value from-set)))
+        (is (= 12345 (bitcoin-lisp.storage:utxo-entry-value from-cache)))))))
+
+(test polymorphic-apply-block-utxo-set-and-cache-parity
+  "apply-block-to-utxo-set / disconnect-block-from-utxo-set produce the
+same undo data shape and end-state on utxo-set vs coins-view-cache."
+  (%with-tmp-cache (cache)
+    (let* ((set (bitcoin-lisp.storage:make-utxo-set))
+           (script (%sample-script))
+           (prev-txid (%sample-txid #xDD))
+           (cb-txid (%sample-txid #x01))
+           (spend-txid (%sample-txid #x02))
+           (block (%make-test-block
+                   (list (%make-coinbase-tx cb-txid 500000000 script)
+                         (%make-spending-tx spend-txid prev-txid 0
+                                            8000000 script)))))
+      ;; Seed both views with the same prev UTXO.
+      (bitcoin-lisp.storage:add-utxo set   prev-txid 0 9000000 script 5)
+      (bitcoin-lisp.storage:add-utxo cache prev-txid 0 9000000 script 5)
+      (let ((spent-set   (bitcoin-lisp.storage:apply-block-to-utxo-set set   block 10))
+            (spent-cache (bitcoin-lisp.storage:apply-block-to-utxo-set cache block 10)))
+        (is (= 1 (length spent-set)))
+        (is (= 1 (length spent-cache)))
+        ;; Undo data shape is identical (txid index entry).
+        (is (equalp (first (first spent-set)) (first (first spent-cache))))
+        (is (= (second (first spent-set)) (second (first spent-cache))))
+        ;; End-state: outputs present, prev absent.
+        (is (bitcoin-lisp.storage:utxo-exists-p set   cb-txid 0))
+        (is (bitcoin-lisp.storage:utxo-exists-p cache cb-txid 0))
+        (is (not (bitcoin-lisp.storage:utxo-exists-p set   prev-txid 0)))
+        (is (not (bitcoin-lisp.storage:utxo-exists-p cache prev-txid 0)))
+        ;; Round-trip back via disconnect.
+        (bitcoin-lisp.storage:disconnect-block-from-utxo-set set   block spent-set)
+        (bitcoin-lisp.storage:disconnect-block-from-utxo-set cache block spent-cache)
+        (is (bitcoin-lisp.storage:utxo-exists-p set   prev-txid 0))
+        (is (bitcoin-lisp.storage:utxo-exists-p cache prev-txid 0))))))
+
+(test polymorphic-any-utxo-for-txid-p-parity
+  (%with-tmp-cache (cache)
+    (let ((set (bitcoin-lisp.storage:make-utxo-set))
+          (txid (%sample-txid 7))
+          (other (%sample-txid 8))
+          (script (%sample-script)))
+      (bitcoin-lisp.storage:add-utxo set   txid 0 1 script 1)
+      (bitcoin-lisp.storage:add-utxo cache txid 0 1 script 1)
+      (is (bitcoin-lisp.storage:any-utxo-for-txid-p set   txid))
+      (is (bitcoin-lisp.storage:any-utxo-for-txid-p cache txid))
+      (is (not (bitcoin-lisp.storage:any-utxo-for-txid-p set   other)))
+      (is (not (bitcoin-lisp.storage:any-utxo-for-txid-p cache other))))))

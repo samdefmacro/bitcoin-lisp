@@ -315,32 +315,32 @@ Returns the node instance."
   (setf (node-block-store *node*)
         (bitcoin-lisp.storage:init-block-store (node-data-directory *node*)))
 
-  ;; Initialize UTXO set
-  (log-info "Initializing UTXO set...")
-  (setf (node-utxo-set *node*) (bitcoin-lisp.storage:make-utxo-set))
-
-  ;; Load persisted UTXO set if available
-  (let ((utxo-path (bitcoin-lisp.storage:utxo-set-file-path
-                    (node-data-directory *node*))))
-    (when (bitcoin-lisp.storage:load-utxo-set (node-utxo-set *node*) utxo-path)
-      (log-info "Loaded persisted UTXO set: ~D entries"
-                (bitcoin-lisp.storage:utxo-count (node-utxo-set *node*)))))
-
-  ;; Consistency check: chainstate height > 0 but UTXO set empty/tiny means
-  ;; chainstate.dat survived but utxoset.dat didn't (e.g. crash mid-save). Any
-  ;; subsequent block validation will MISSING-INPUT on the very next tx. Reset
-  ;; to genesis so normal sync replays cleanly. Bitcoin Core's equivalent is
-  ;; "-reindex-chainstate" which rebuilds UTXOs from blocks; we punt to a
-  ;; full re-sync, but at least we detect and recover automatically.
-  (let ((cs-height (bitcoin-lisp.storage:current-height (node-chain-state *node*)))
-        (utxos (bitcoin-lisp.storage:utxo-count (node-utxo-set *node*))))
-    (when (and (> cs-height 100)
-               (< utxos (max 100 (floor cs-height 100))))  ; sanity threshold
-      (log-warn "Chainstate (height ~D) inconsistent with UTXO set (~D entries) — resetting to genesis"
-                cs-height utxos)
-      (let ((genesis-hash (bitcoin-lisp.storage:network-genesis-hash network)))
-        (bitcoin-lisp.storage:update-chain-tip (node-chain-state *node*) genesis-hash 0))
-      (clrhash (bitcoin-lisp.storage::utxo-set-entries (node-utxo-set *node*)))))
+  ;; Initialize UTXO storage: LevelDB-backed coins-view-cache.
+  ;;
+  ;; The cache wraps a coins-view-db (LevelDB at <data-dir>/chainstate/).
+  ;; Reads pull through from the base on miss; writes accumulate in the
+  ;; cache and flush to disk via Phase 2 of do-flush.
+  ;;
+  ;; First-startup migration: a populated utxoset.dat from a previous
+  ;; flat-file version is imported into LevelDB before opening the
+  ;; cache. The migration writes a durable marker; once present, we
+  ;; never re-migrate (the marker is idempotent and crash-safe).
+  (log-info "Initializing UTXO storage (LevelDB-backed)...")
+  (let* ((data-dir (node-data-directory *node*))
+         (chainstate-path (namestring (merge-pathnames "chainstate/" data-dir)))
+         (utxoset-dat (bitcoin-lisp.storage:utxo-set-file-path data-dir))
+         (migrated-p (bitcoin-lisp.storage:leveldb-utxo-migration-complete-p
+                      chainstate-path)))
+    (when (and (not migrated-p) (probe-file utxoset-dat))
+      (log-info "Found legacy utxoset.dat; migrating into LevelDB at ~A ..."
+                chainstate-path)
+      (bitcoin-lisp.storage:migrate-utxoset-dat-to-leveldb
+       utxoset-dat chainstate-path)
+      (log-info "Migration complete; LevelDB is now the canonical UTXO store"))
+    (let ((view (bitcoin-lisp.storage:open-coins-view-db chainstate-path)))
+      (setf (node-utxo-set *node*)
+            (bitcoin-lisp.storage:make-coins-view-cache view))
+      (log-info "UTXO cache opened (base: ~A)" chainstate-path)))
 
   ;; Load persisted header index if available
   (when (bitcoin-lisp.storage:load-header-index (node-chain-state *node*))
@@ -563,11 +563,13 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
           (bitcoin-lisp.storage:save-state
            (node-chain-state *node*) :in-transition t)
           (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
-        ;; Phase 2: write the UTXO set (large + slow + atomic per-file).
+        ;; Phase 2: flush cache → LevelDB. Per-flush work is proportional
+        ;; to dirty entries (typically a few thousand at the tip), not
+        ;; the full ~17M-entry set — replaces the ~13s utxoset.dat
+        ;; rewrite that previously froze the sync thread.
         (when (node-utxo-set *node*)
-          (bitcoin-lisp.storage:save-utxo-set
-           (node-utxo-set *node*)
-           (bitcoin-lisp.storage:utxo-set-file-path (node-data-directory *node*))))
+          (bitcoin-lisp.storage:coins-view-cache-flush
+           (node-utxo-set *node*)))
         ;; Phase 3: commit by re-saving chainstate without the marker.
         (when (node-chain-state *node*)
           (bitcoin-lisp.storage:save-state
@@ -725,12 +727,15 @@ flush (atomic temp+fsync+rename inside save-*)."
   (when (node-chain-state *node*)
     (bitcoin-lisp.storage:save-state (node-chain-state *node*)))
 
-  ;; Save UTXO set
-  (log-info "Saving UTXO set...")
+  ;; Flush UTXO cache to LevelDB and close the underlying DB.
+  (log-info "Flushing UTXO cache...")
   (when (node-utxo-set *node*)
-    (bitcoin-lisp.storage:save-utxo-set
-     (node-utxo-set *node*)
-     (bitcoin-lisp.storage:utxo-set-file-path (node-data-directory *node*))))
+    (bitcoin-lisp.storage:coins-view-cache-flush
+     (node-utxo-set *node*) :sync t)
+    (let ((base (bitcoin-lisp.storage:coins-view-cache-base
+                 (node-utxo-set *node*))))
+      (when base
+        (bitcoin-lisp.storage:close-coins-view-db base))))
 
   ;; Save fee statistics
   (when (node-fee-estimator *node*)
