@@ -81,12 +81,19 @@ the pre-extracted slot."
 
 #+sbcl (sb-ext:define-hash-table-test utxo-key= utxo-key-hash)
 
+(declaim (inline make-utxo-key-hash-table))
+(defun make-utxo-key-hash-table (&optional (size 16))
+  "Allocate a hash-table keyed by utxo-key. Under SBCL this uses the
+custom utxo-key= test (inlined fixnum compares); falls back to equalp
+on other implementations. Shared by utxo-set and coins-view-cache."
+  (make-hash-table #+sbcl :test #+sbcl 'utxo-key=
+                   #-sbcl :test #-sbcl 'equalp
+                   :size size))
+
 (defstruct utxo-set
   "In-memory UTXO set.
 The set maps (txid, output-index) -> utxo-entry."
-  (entries (make-hash-table #+sbcl :test #+sbcl 'utxo-key=
-                            #-sbcl :test #-sbcl 'equalp)
-   :type hash-table)
+  (entries (make-utxo-key-hash-table) :type hash-table)
   (dirty nil :type boolean))
 
 (declaim (inline write-u64-le-into write-u32-le-into))

@@ -542,3 +542,134 @@ delete-directory-tree as belt-and-braces cleanup."
         (let ((got (bitcoin-lisp.storage:coins-view-db-get view k)))
           (is (not (null got)))
           (is (= 999 (bitcoin-lisp.storage:utxo-entry-value got))))))))
+
+;;;; coins-view-cache tests
+;;;;
+;;;; The cache is layered over a coins-view-db. Each test creates a
+;;;; fresh tmp db + cache. We exercise the dirty-tracking + FRESH
+;;;; semantics, then verify post-flush state via the underlying base.
+
+(defmacro %with-tmp-cache ((cache-var) &body body)
+  "Open a fresh coins-view-db + layered cache. Belt-and-braces cleanup."
+  (let ((path-var (gensym "PATH-"))
+        (base-var (gensym "BASE-")))
+    `(%with-tmp-leveldb-path (,path-var)
+       (bitcoin-lisp.storage:with-coins-view-db (,base-var ,path-var)
+         (let ((,cache-var (bitcoin-lisp.storage:make-coins-view-cache ,base-var)))
+           ,@body)))))
+
+(test coins-view-cache-add-then-get
+  "Add via cache; subsequent get returns the entry."
+  (%with-tmp-cache (cache)
+    (let ((k (%sample-utxo-key 1 0))
+          (e (%sample-utxo-entry 42 7)))
+      (bitcoin-lisp.storage:coins-view-cache-add cache k e)
+      (let ((got (bitcoin-lisp.storage:coins-view-cache-get cache k)))
+        (is (not (null got)))
+        (is (= 42 (bitcoin-lisp.storage:utxo-entry-value got)))))))
+
+(test coins-view-cache-pulls-from-base
+  "Get on a key absent from cache but present in base falls through to base."
+  (%with-tmp-leveldb-path (path)
+    (let ((k (%sample-utxo-key 2 0))
+          (e (%sample-utxo-entry 999 10)))
+      ;; First, populate the base view directly.
+      (bitcoin-lisp.storage:with-coins-view-db (base path)
+        (bitcoin-lisp.storage:coins-view-db-put base k e))
+      ;; New cache over same base — should see the base entry.
+      (bitcoin-lisp.storage:with-coins-view-db (base path)
+        (let ((cache (bitcoin-lisp.storage:make-coins-view-cache base)))
+          (let ((got (bitcoin-lisp.storage:coins-view-cache-get cache k)))
+            (is (not (null got)))
+            (is (= 999 (bitcoin-lisp.storage:utxo-entry-value got)))))))))
+
+(test coins-view-cache-spend-marks-spent
+  "Spend on a cached unspent coin returns T; subsequent get returns NIL."
+  (%with-tmp-cache (cache)
+    (let ((k (%sample-utxo-key 3 0))
+          (e (%sample-utxo-entry)))
+      (bitcoin-lisp.storage:coins-view-cache-add cache k e)
+      (is (eq t (bitcoin-lisp.storage:coins-view-cache-spend cache k)))
+      (is (null (bitcoin-lisp.storage:coins-view-cache-get cache k)))
+      (is (null (bitcoin-lisp.storage:coins-view-cache-has-p cache k))))))
+
+(test coins-view-cache-spend-fresh-drops-entry
+  "Spending a FRESH (add-then-spend, never flushed) coin drops the
+cache entry entirely — flush has nothing to do."
+  (%with-tmp-cache (cache)
+    (let ((k (%sample-utxo-key 4 0))
+          (e (%sample-utxo-entry)))
+      (bitcoin-lisp.storage:coins-view-cache-add cache k e)
+      (is (= 1 (bitcoin-lisp.storage::cvc-fresh-count cache)))
+      (is (= 1 (bitcoin-lisp.storage::cvc-dirty-count cache)))
+      (bitcoin-lisp.storage:coins-view-cache-spend cache k)
+      (is (= 0 (bitcoin-lisp.storage::cvc-fresh-count cache)))
+      (is (= 0 (bitcoin-lisp.storage::cvc-dirty-count cache)))
+      (is (= 0 (hash-table-count (bitcoin-lisp.storage::cvc-entries cache)))))))
+
+(test coins-view-cache-spend-non-fresh-keeps-tombstone
+  "Spending a coin that came from base leaves a NIL tombstone in
+cache (so flush issues the erase). FRESH-count stays zero."
+  (%with-tmp-leveldb-path (path)
+    (let ((k (%sample-utxo-key 5 0))
+          (e (%sample-utxo-entry)))
+      (bitcoin-lisp.storage:with-coins-view-db (base path)
+        (bitcoin-lisp.storage:coins-view-db-put base k e))
+      (bitcoin-lisp.storage:with-coins-view-db (base path)
+        (let ((cache (bitcoin-lisp.storage:make-coins-view-cache base)))
+          (bitcoin-lisp.storage:coins-view-cache-spend cache k)
+          (is (= 1 (bitcoin-lisp.storage::cvc-dirty-count cache)))
+          (is (= 0 (bitcoin-lisp.storage::cvc-fresh-count cache)))
+          (is (= 1 (hash-table-count (bitcoin-lisp.storage::cvc-entries cache)))))))))
+
+(test coins-view-cache-flush-writes-and-clears
+  "Flush writes dirty entries to base, then clears the cache."
+  (%with-tmp-leveldb-path (path)
+    (let ((k1 (%sample-utxo-key 6 0))
+          (k2 (%sample-utxo-key 7 0))
+          (e1 (%sample-utxo-entry 100 1))
+          (e2 (%sample-utxo-entry 200 2)))
+      (bitcoin-lisp.storage:with-coins-view-db (base path)
+        (let ((cache (bitcoin-lisp.storage:make-coins-view-cache base)))
+          (bitcoin-lisp.storage:coins-view-cache-add cache k1 e1)
+          (bitcoin-lisp.storage:coins-view-cache-add cache k2 e2)
+          (let ((written (bitcoin-lisp.storage:coins-view-cache-flush cache)))
+            (is (= 2 written)))
+          ;; Cache is empty after flush.
+          (is (= 0 (hash-table-count (bitcoin-lisp.storage::cvc-entries cache))))
+          ;; Base now has both entries.
+          (is (not (null (bitcoin-lisp.storage:coins-view-db-get base k1))))
+          (is (not (null (bitcoin-lisp.storage:coins-view-db-get base k2)))))))))
+
+(test coins-view-cache-flush-issues-erase
+  "Flushing a spent (NIL) entry erases it from base."
+  (%with-tmp-leveldb-path (path)
+    (let ((k (%sample-utxo-key 8 0))
+          (e (%sample-utxo-entry)))
+      (bitcoin-lisp.storage:with-coins-view-db (base path)
+        (bitcoin-lisp.storage:coins-view-db-put base k e))
+      (bitcoin-lisp.storage:with-coins-view-db (base path)
+        (let ((cache (bitcoin-lisp.storage:make-coins-view-cache base)))
+          (bitcoin-lisp.storage:coins-view-cache-spend cache k)
+          (bitcoin-lisp.storage:coins-view-cache-flush cache)
+          (is (null (bitcoin-lisp.storage:coins-view-db-get base k))))))))
+
+(test coins-view-cache-add-overwrite-error
+  "Adding to an already-unspent key without :allow-overwrite signals."
+  (%with-tmp-cache (cache)
+    (let ((k (%sample-utxo-key 9 0))
+          (e (%sample-utxo-entry)))
+      (bitcoin-lisp.storage:coins-view-cache-add cache k e)
+      (signals error
+        (bitcoin-lisp.storage:coins-view-cache-add cache k e)))))
+
+(test coins-view-cache-add-overwrite-allowed
+  ":allow-overwrite T silently overwrites (coinbase rewrite case)."
+  (%with-tmp-cache (cache)
+    (let ((k (%sample-utxo-key 10 0))
+          (e1 (%sample-utxo-entry 100 1))
+          (e2 (%sample-utxo-entry 200 2)))
+      (bitcoin-lisp.storage:coins-view-cache-add cache k e1)
+      (bitcoin-lisp.storage:coins-view-cache-add cache k e2 :allow-overwrite t)
+      (is (= 200 (bitcoin-lisp.storage:utxo-entry-value
+                  (bitcoin-lisp.storage:coins-view-cache-get cache k)))))))

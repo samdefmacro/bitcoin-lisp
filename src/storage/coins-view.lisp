@@ -163,19 +163,48 @@ coins-view-db-write-batch for multi-op atomicity."
 ;;;; for each input/output), then commit them atomically. Core's
 ;;;; CCoinsViewCache::BatchWrite drives this via CDBBatch under the hood.
 
+;;;; Low-level batch API. BATCH is a libleveldb writebatch handle;
+;;;; coins-view-batch-put / -erase encode the key/value and append to it.
+;;;; Used by coins-view-cache-flush to avoid materializing an
+;;;; intermediate ops list.
+
+(defmacro with-coins-view-batch ((batch view &key sync) &body body)
+  "Bind BATCH to a fresh writebatch on VIEW's underlying LevelDB. BODY
+accumulates ops via coins-view-batch-put / -erase. On normal exit the
+batch is committed atomically; on non-local exit the cleanup forms of
+multiple-value-prog1 are skipped, so nothing is written. SYNC=T forces
+fsync on commit."
+  (let ((view-sym (gensym "VIEW"))
+        (sync-sym (gensym "SYNC")))
+    `(let ((,view-sym ,view)
+           (,sync-sym ,sync))
+       (with-leveldb-writebatch (,batch)
+         (multiple-value-prog1 (progn ,@body)
+           (leveldb-write (cvdb-db ,view-sym) ,batch :sync ,sync-sym))))))
+
+(declaim (inline coins-view-batch-put coins-view-batch-erase))
+
+(defun coins-view-batch-put (batch utxo-key entry)
+  "Stage a put of ENTRY under UTXO-KEY in BATCH."
+  (declare (type utxo-key utxo-key) (type utxo-entry entry))
+  (leveldb-writebatch-put batch
+                          (encode-coin-key utxo-key)
+                          (encode-coin-value entry)))
+
+(defun coins-view-batch-erase (batch utxo-key)
+  "Stage an erase of UTXO-KEY in BATCH."
+  (declare (type utxo-key utxo-key))
+  (leveldb-writebatch-delete batch (encode-coin-key utxo-key)))
+
 (defun coins-view-db-write-batch (view ops &key sync)
   "Atomically apply OPS to VIEW. Each op is either
   (:put utxo-key utxo-entry) or (:erase utxo-key).
-SYNC=T forces fsync (used during the chainstate atomic-flush)."
+Convenience wrapper over with-coins-view-batch for callers that
+naturally produce an ops list (tests, ad-hoc bulk loads). Hot-path
+callers should use with-coins-view-batch directly."
   (declare (type coins-view-db view))
-  (with-leveldb-writebatch (batch)
+  (with-coins-view-batch (batch view :sync sync)
     (dolist (op ops)
       (ecase (first op)
-        (:put
-         (leveldb-writebatch-put batch
-                                 (encode-coin-key (second op))
-                                 (encode-coin-value (third op))))
-        (:erase
-         (leveldb-writebatch-delete batch
-                                    (encode-coin-key (second op))))))
-    (leveldb-write (cvdb-db view) batch :sync sync)))
+        (:put   (coins-view-batch-put batch (second op) (third op)))
+        (:erase (coins-view-batch-erase batch (second op)))))))
