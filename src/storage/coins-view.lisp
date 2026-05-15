@@ -20,10 +20,16 @@
 ;;; a future optimization PR — it's domain-specific compression that
 ;;; doesn't affect correctness, just disk footprint.
 
-(defconstant +db-prefix-coin+ #x43          ; 'C' — same as Core's DB_COIN
-  "1-byte namespacing prefix for coin entries in the LevelDB. Distinct
-prefixes will be added later for DB_BEST_BLOCK ('B') and DB_HEAD_BLOCKS
-('H') when those move into the same LevelDB.")
+(defconstant +db-prefix-coin+ #x43             ; 'C' — same as Core's DB_COIN
+  "1-byte namespacing prefix for coin entries in the LevelDB.")
+
+(defconstant +db-prefix-migration-marker+ #x4D ; 'M'
+  "1-byte namespacing prefix for the utxoset.dat → LevelDB migration
+marker. coins-view-migration.lisp writes this as its last step so an
+interrupted migration is detectable on the next startup.")
+
+;; Future prefixes for DB_BEST_BLOCK ('B') and DB_HEAD_BLOCKS ('H')
+;; will land here when those move into the same LevelDB.
 
 (defconstant +coin-key-bytes+ 37
   "LevelDB key size: 1 prefix + 32 txid + 4 vout.")

@@ -673,3 +673,107 @@ cache (so flush issues the erase). FRESH-count stays zero."
       (bitcoin-lisp.storage:coins-view-cache-add cache k e2 :allow-overwrite t)
       (is (= 200 (bitcoin-lisp.storage:utxo-entry-value
                   (bitcoin-lisp.storage:coins-view-cache-get cache k)))))))
+
+;;;; Migration: utxoset.dat → LevelDB tests
+;;;;
+;;;; Strategy: build an in-memory utxo-set with known entries, save it
+;;;; to a temp utxoset.dat, run the migration into a temp LevelDB,
+;;;; verify the LevelDB-backed view contains every entry with the same
+;;;; values. Also verify the migration-complete marker is set, and that
+;;;; an interrupted migration is detectable (marker absent).
+
+(defun %tmp-dat-path ()
+  (namestring
+   (merge-pathnames (format nil "bitcoin-lisp-migration-test-~D-~D.dat"
+                            (get-universal-time) (random 100000))
+                    (uiop:temporary-directory))))
+
+(defmacro %with-tmp-dat-and-leveldb ((dat-var ldb-var) &body body)
+  "Bind DAT-VAR to a fresh tmp utxoset.dat path and LDB-VAR to a fresh
+tmp LevelDB path. Both are cleaned up on exit."
+  `(let ((,dat-var (%tmp-dat-path)))
+     (unwind-protect
+          (%with-tmp-leveldb-path (,ldb-var)
+            ,@body)
+       (ignore-errors (delete-file ,dat-var)))))
+
+(defun %populated-utxo-set (count)
+  "Build an in-memory utxo-set with COUNT distinct entries. Keys vary
+in their txid first-byte to give a mix; values vary in amount/height."
+  (let ((set (bitcoin-lisp.storage:make-utxo-set)))
+    (dotimes (i count)
+      (let ((txid (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element (mod i 256)))
+            (script (make-array 25 :element-type '(unsigned-byte 8)
+                                   :initial-element #x76)))
+        (bitcoin-lisp.storage:add-utxo set txid (mod i 4)
+                                       (* 1000 (1+ i)) script (1+ i))))
+    set))
+
+(test migration-empty-set
+  "Migrating an empty utxo-set yields an empty LevelDB but still marks complete."
+  (%with-tmp-dat-and-leveldb (dat-path ldb-path)
+    (let ((empty-set (bitcoin-lisp.storage:make-utxo-set)))
+      (bitcoin-lisp.storage::save-utxo-set empty-set dat-path))
+    (let ((written (bitcoin-lisp.storage:migrate-utxoset-dat-to-leveldb
+                    dat-path ldb-path)))
+      (is (= 0 written)))
+    (is (eq t (bitcoin-lisp.storage:leveldb-utxo-migration-complete-p ldb-path)))))
+
+(test migration-round-trip
+  "After migration, every entry in the source set is retrievable from
+the LevelDB via coins-view-db-get."
+  (%with-tmp-dat-and-leveldb (dat-path ldb-path)
+    (let* ((source (%populated-utxo-set 50)))
+      (bitcoin-lisp.storage::save-utxo-set source dat-path)
+      (let ((written (bitcoin-lisp.storage:migrate-utxoset-dat-to-leveldb
+                      dat-path ldb-path)))
+        (is (= 50 written)))
+      ;; Verify equivalence: every (key, entry) in source is in LevelDB.
+      (bitcoin-lisp.storage:with-coins-view-db (view ldb-path)
+        (maphash (lambda (key src-entry)
+                   (let ((dst-entry (bitcoin-lisp.storage:coins-view-db-get view key)))
+                     (is (not (null dst-entry)))
+                     (is (= (bitcoin-lisp.storage:utxo-entry-value src-entry)
+                            (bitcoin-lisp.storage:utxo-entry-value dst-entry)))
+                     (is (= (bitcoin-lisp.storage:utxo-entry-height src-entry)
+                            (bitcoin-lisp.storage:utxo-entry-height dst-entry)))
+                     (is (equalp (bitcoin-lisp.storage:utxo-entry-script-pubkey src-entry)
+                                 (bitcoin-lisp.storage:utxo-entry-script-pubkey dst-entry)))))
+                 (bitcoin-lisp.storage::utxo-set-entries source))))))
+
+(test migration-marker-detection
+  "leveldb-utxo-migration-complete-p returns NIL for an empty LevelDB
+(never migrated) and T after a successful migration."
+  (%with-tmp-leveldb-path (ldb-path)
+    ;; Empty LevelDB — marker absent.
+    (bitcoin-lisp.storage:with-leveldb (db ldb-path) db)
+    (is (null (bitcoin-lisp.storage:leveldb-utxo-migration-complete-p ldb-path)))
+    ;; Migrate an empty set; marker should now be present.
+    (let ((dat-path (%tmp-dat-path)))
+      (unwind-protect
+           (progn
+             (bitcoin-lisp.storage::save-utxo-set
+              (bitcoin-lisp.storage:make-utxo-set) dat-path)
+             (bitcoin-lisp.storage:migrate-utxoset-dat-to-leveldb dat-path ldb-path)
+             (is (eq t (bitcoin-lisp.storage:leveldb-utxo-migration-complete-p
+                        ldb-path))))
+        (ignore-errors (delete-file dat-path))))))
+
+(test migration-missing-source-signals
+  "Migrating from a non-existent source path signals an error."
+  (%with-tmp-leveldb-path (ldb-path)
+    (signals error
+      (bitcoin-lisp.storage:migrate-utxoset-dat-to-leveldb
+       "/tmp/this-file-does-not-exist-12345.dat" ldb-path))))
+
+(test migration-larger-set
+  "Migration handles a multi-batch set (batch-size smaller than total)."
+  (%with-tmp-dat-and-leveldb (dat-path ldb-path)
+    (let ((source (%populated-utxo-set 250)))
+      (bitcoin-lisp.storage::save-utxo-set source dat-path)
+      ;; Force several batches by using a small batch-size.
+      (let ((written (bitcoin-lisp.storage:migrate-utxoset-dat-to-leveldb
+                      dat-path ldb-path :batch-size 32)))
+        (is (= 250 written))))
+    (is (eq t (bitcoin-lisp.storage:leveldb-utxo-migration-complete-p ldb-path)))))
