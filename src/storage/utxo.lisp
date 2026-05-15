@@ -89,7 +89,7 @@ The set maps (txid, output-index) -> utxo-entry."
    :type hash-table)
   (dirty nil :type boolean))
 
-(declaim (inline write-u64-le-into))
+(declaim (inline write-u64-le-into write-u32-le-into))
 (defun write-u64-le-into (bytes offset v)
   "Write 64-bit V into BYTES at OFFSET as 8 LE bytes. Inverse of
 txid-bytes->u64-le."
@@ -106,6 +106,17 @@ txid-bytes->u64-le."
         (aref bytes (+ offset 6))  (logand (ash v -48) #xFF)
         (aref bytes (+ offset 7))  (logand (ash v -56) #xFF)))
 
+(defun write-u32-le-into (bytes offset v)
+  "Write 32-bit V into BYTES at OFFSET as 4 LE bytes."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bytes)
+           (type (unsigned-byte 32) offset)
+           (type (unsigned-byte 32) v)
+           (optimize (speed 3) (safety 0)))
+  (setf (aref bytes offset)        (logand v #xFF)
+        (aref bytes (+ offset 1))  (logand (ash v -8) #xFF)
+        (aref bytes (+ offset 2))  (logand (ash v -16) #xFF)
+        (aref bytes (+ offset 3))  (logand (ash v -24) #xFF)))
+
 (defun utxo-key-bytes (k)
   "Reconstruct the 36-byte on-disk form (32-byte txid || 4-byte LE vout)
 from a utxo-key. Used by save-utxo-set, utxo-set-iterate, and
@@ -116,11 +127,7 @@ hash_serialized_3 — never on the inv/validate hot path."
     (write-u64-le-into bytes 8 (uk-b k))
     (write-u64-le-into bytes 16 (uk-c k))
     (write-u64-le-into bytes 24 (uk-d k))
-    (let ((v (uk-vout k)))
-      (setf (aref bytes 32) (logand v #xFF)
-            (aref bytes 33) (logand (ash v -8) #xFF)
-            (aref bytes 34) (logand (ash v -16) #xFF)
-            (aref bytes 35) (logand (ash v -24) #xFF)))
+    (write-u32-le-into bytes 32 (uk-vout k))
     bytes))
 
 (defun utxo-key-txid (k)

@@ -364,20 +364,23 @@
                             (get-universal-time) (random 100000))
                     (uiop:temporary-directory))))
 
+(defmacro %with-tmp-leveldb-path ((path-var) &body body)
+  "Bind PATH-VAR to a fresh tmp leveldb path. On unwind, destroy-db +
+delete-directory-tree as belt-and-braces cleanup."
+  `(let ((,path-var (%tmp-leveldb-path)))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (bitcoin-lisp.storage:leveldb-destroy-db ,path-var))
+       (ignore-errors
+         (uiop:delete-directory-tree (pathname ,path-var)
+                                     :validate t
+                                     :if-does-not-exist :ignore)))))
+
 (defmacro %with-tmp-leveldb ((db-var) &body body)
-  "Create a fresh LevelDB at a tmp path, bind DB-VAR to the handle.
-Belt-and-braces cleanup: leveldb-destroy-db first, then a
-delete-directory-tree fallback so a body error doesn't leak the tree."
+  "Open a fresh LevelDB at a tmp path; bind DB-VAR to the handle."
   (let ((path-var (gensym "PATH-")))
-    `(let ((,path-var (%tmp-leveldb-path)))
-       (unwind-protect
-            (bitcoin-lisp.storage:with-leveldb (,db-var ,path-var)
-              ,@body)
-         (ignore-errors (bitcoin-lisp.storage:leveldb-destroy-db ,path-var))
-         (ignore-errors
-           (uiop:delete-directory-tree (pathname ,path-var)
-                                       :validate t
-                                       :if-does-not-exist :ignore))))))
+    `(%with-tmp-leveldb-path (,path-var)
+       (bitcoin-lisp.storage:with-leveldb (,db-var ,path-var)
+         ,@body))))
 
 (test leveldb-put-get-round-trip
   "PUT then GET returns the value bytes verbatim."
@@ -429,15 +432,113 @@ delete-directory-tree fallback so a body error doesn't leak the tree."
 
 (test leveldb-persistence-across-open-close
   "Data written in one open survives close + reopen."
-  (let ((path (%tmp-leveldb-path))
-        (k (make-array 4 :element-type '(unsigned-byte 8)
-                         :initial-contents #(7 7 7 7)))
-        (v (make-array 4 :element-type '(unsigned-byte 8)
-                         :initial-contents #(8 8 8 8))))
-    (unwind-protect
-         (progn
-           (bitcoin-lisp.storage:with-leveldb (db path)
-             (bitcoin-lisp.storage:leveldb-put db k v))
-           (bitcoin-lisp.storage:with-leveldb (db path)
-             (is (equalp v (bitcoin-lisp.storage:leveldb-get db k)))))
-      (ignore-errors (bitcoin-lisp.storage:leveldb-destroy-db path)))))
+  (%with-tmp-leveldb-path (path)
+    (let ((k (make-array 4 :element-type '(unsigned-byte 8)
+                           :initial-contents #(7 7 7 7)))
+          (v (make-array 4 :element-type '(unsigned-byte 8)
+                           :initial-contents #(8 8 8 8))))
+      (bitcoin-lisp.storage:with-leveldb (db path)
+        (bitcoin-lisp.storage:leveldb-put db k v))
+      (bitcoin-lisp.storage:with-leveldb (db path)
+        (is (equalp v (bitcoin-lisp.storage:leveldb-get db k)))))))
+
+;;;; coins-view-db tests
+
+(defmacro %with-tmp-coins-view ((view-var) &body body)
+  "Open a fresh coins-view-db at a tmp path; bind VIEW-VAR."
+  (let ((path-var (gensym "PATH-")))
+    `(%with-tmp-leveldb-path (,path-var)
+       (bitcoin-lisp.storage:with-coins-view-db (,view-var ,path-var)
+         ,@body))))
+
+(defun %sample-utxo-entry (&optional (value 50000000) (height 100))
+  (bitcoin-lisp.storage:make-utxo-entry
+   :value value
+   :height height
+   :coinbase nil
+   :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                 :initial-element #x76)))
+
+(defun %sample-utxo-key (&optional (txid-element 1) (vout 0))
+  (bitcoin-lisp.storage::make-utxo-key
+   (make-array 32 :element-type '(unsigned-byte 8) :initial-element txid-element)
+   vout))
+
+(test coins-view-db-put-get-round-trip
+  "Putting then getting a coin returns an equivalent utxo-entry."
+  (%with-tmp-coins-view (view)
+    (let ((k (%sample-utxo-key 1 5))
+          (e (%sample-utxo-entry 12345 99)))
+      (bitcoin-lisp.storage:coins-view-db-put view k e)
+      (let ((got (bitcoin-lisp.storage:coins-view-db-get view k)))
+        (is (not (null got)))
+        (is (= 12345 (bitcoin-lisp.storage:utxo-entry-value got)))
+        (is (= 99 (bitcoin-lisp.storage:utxo-entry-height got)))
+        (is (null (bitcoin-lisp.storage:utxo-entry-coinbase got)))
+        (is (equalp (bitcoin-lisp.storage:utxo-entry-script-pubkey e)
+                    (bitcoin-lisp.storage:utxo-entry-script-pubkey got)))))))
+
+(test coins-view-db-get-missing
+  "Getting an absent key returns NIL."
+  (%with-tmp-coins-view (view)
+    (is (null (bitcoin-lisp.storage:coins-view-db-get
+               view (%sample-utxo-key 99 0))))))
+
+(test coins-view-db-has-p
+  "has-p reflects present/absent state."
+  (%with-tmp-coins-view (view)
+    (let ((k (%sample-utxo-key 7 0)))
+      (is (null (bitcoin-lisp.storage:coins-view-db-has-p view k)))
+      (bitcoin-lisp.storage:coins-view-db-put view k (%sample-utxo-entry))
+      (is (not (null (bitcoin-lisp.storage:coins-view-db-has-p view k)))))))
+
+(test coins-view-db-erase
+  "erase removes a previously-put coin."
+  (%with-tmp-coins-view (view)
+    (let ((k (%sample-utxo-key 3 1))
+          (e (%sample-utxo-entry)))
+      (bitcoin-lisp.storage:coins-view-db-put view k e)
+      (is (not (null (bitcoin-lisp.storage:coins-view-db-get view k))))
+      (bitcoin-lisp.storage:coins-view-db-erase view k)
+      (is (null (bitcoin-lisp.storage:coins-view-db-get view k))))))
+
+(test coins-view-db-coinbase-flag-preserved
+  "coinbase boolean round-trips correctly."
+  (%with-tmp-coins-view (view)
+    (let ((k (%sample-utxo-key 11 0))
+          (e (bitcoin-lisp.storage:make-utxo-entry
+              :value 5000000000
+              :height 1
+              :coinbase t
+              :script-pubkey (make-array 0 :element-type '(unsigned-byte 8)))))
+      (bitcoin-lisp.storage:coins-view-db-put view k e)
+      (let ((got (bitcoin-lisp.storage:coins-view-db-get view k)))
+        (is (eq t (bitcoin-lisp.storage:utxo-entry-coinbase got)))))))
+
+(test coins-view-db-write-batch
+  "A batch of put + erase ops applies atomically."
+  (%with-tmp-coins-view (view)
+    (let ((k1 (%sample-utxo-key 1 0))
+          (k2 (%sample-utxo-key 2 0))
+          (e1 (%sample-utxo-entry 100 10))
+          (e2 (%sample-utxo-entry 200 20)))
+      ;; Seed k1; then a batch erases k1 and adds k2.
+      (bitcoin-lisp.storage:coins-view-db-put view k1 e1)
+      (bitcoin-lisp.storage:coins-view-db-write-batch
+       view (list (list :erase k1) (list :put k2 e2)))
+      (is (null (bitcoin-lisp.storage:coins-view-db-get view k1)))
+      (let ((got (bitcoin-lisp.storage:coins-view-db-get view k2)))
+        (is (not (null got)))
+        (is (= 200 (bitcoin-lisp.storage:utxo-entry-value got)))))))
+
+(test coins-view-db-persistence-across-open-close
+  "Coins written then closed are visible on reopen."
+  (%with-tmp-leveldb-path (path)
+    (let ((k (%sample-utxo-key 5 7))
+          (e (%sample-utxo-entry 999 42)))
+      (bitcoin-lisp.storage:with-coins-view-db (view path)
+        (bitcoin-lisp.storage:coins-view-db-put view k e))
+      (bitcoin-lisp.storage:with-coins-view-db (view path)
+        (let ((got (bitcoin-lisp.storage:coins-view-db-get view k)))
+          (is (not (null got)))
+          (is (= 999 (bitcoin-lisp.storage:utxo-entry-value got))))))))
