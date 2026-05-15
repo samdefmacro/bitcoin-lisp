@@ -95,6 +95,29 @@
   (batch :pointer)
   (key :pointer) (keylen :size))
 
+;; Iterators. Used for ranged scans (e.g., BIP30's "any UTXO under this
+;; txid" check, which seeks to the prefix 'C' + txid + 0 and walks
+;; forward as long as keys share the txid prefix).
+
+(cffi:defcfun ("leveldb_create_iterator" %leveldb-create-iterator) :pointer
+  (db :pointer) (options :pointer))
+(cffi:defcfun ("leveldb_iter_destroy" %leveldb-iter-destroy) :void
+  (iter :pointer))
+(cffi:defcfun ("leveldb_iter_valid" %leveldb-iter-valid) :uint8
+  (iter :pointer))
+(cffi:defcfun ("leveldb_iter_seek_to_first" %leveldb-iter-seek-to-first) :void
+  (iter :pointer))
+(cffi:defcfun ("leveldb_iter_seek" %leveldb-iter-seek) :void
+  (iter :pointer) (key :pointer) (keylen :size))
+(cffi:defcfun ("leveldb_iter_next" %leveldb-iter-next) :void
+  (iter :pointer))
+(cffi:defcfun ("leveldb_iter_key" %leveldb-iter-key) :pointer
+  (iter :pointer) (keylen :pointer))
+(cffi:defcfun ("leveldb_iter_value" %leveldb-iter-value) :pointer
+  (iter :pointer) (vallen :pointer))
+(cffi:defcfun ("leveldb_iter_get_error" %leveldb-iter-get-error) :void
+  (iter :pointer) (errptr :pointer))
+
 ;; libc bindings — LevelDB returns malloc'd buffers from leveldb_get and
 ;; errptr, which we copy out then free. memcpy is the fast bulk-copy
 ;; primitive for value buffers.
@@ -285,3 +308,60 @@ destroy on unwind."
   `(let ((,var (leveldb-make-writebatch)))
      (unwind-protect (progn ,@body)
        (leveldb-destroy-writebatch ,var))))
+
+;;;; Iterators
+;;;;
+;;;; LevelDB iterators expose ordered key traversal. We need this for
+;;;; prefix scans — primarily BIP30 ("any UTXO under txid?") and the
+;;;; hash_serialized_3 ordered UTXO dump. The C API returns `Slice`-
+;;;; style key/value pointers that are only valid until the next iter
+;;;; operation, so callers must copy out the bytes before advancing.
+
+(defmacro with-leveldb-iterator ((iter db) &body body)
+  "Bind ITER to a fresh LevelDB iterator over DB, destroy on unwind.
+Use leveldb-iter-* for traversal. The iterator's exposed key/value
+pointers are valid only until the next leveldb-iter-* call."
+  (let ((ropts (gensym "ROPTS")))
+    `(let* ((,ropts (%leveldb-readoptions-create))
+            (,iter (%leveldb-create-iterator ,db ,ropts)))
+       (unwind-protect (progn ,@body)
+         (%leveldb-iter-destroy ,iter)
+         (%leveldb-readoptions-destroy ,ropts)))))
+
+(declaim (inline leveldb-iter-valid-p))
+(defun leveldb-iter-valid-p (iter)
+  "T if ITER points at a valid key/value; NIL once it has walked past
+the end or before the start."
+  (not (zerop (%leveldb-iter-valid iter))))
+
+(declaim (inline leveldb-iter-seek-to-first leveldb-iter-next))
+(defun leveldb-iter-seek-to-first (iter) (%leveldb-iter-seek-to-first iter))
+(defun leveldb-iter-next (iter) (%leveldb-iter-next iter))
+
+(defun leveldb-iter-seek (iter key)
+  "Position ITER at the first key ≥ KEY (a byte vector)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) key))
+  (cffi:with-pointer-to-vector-data (kptr key)
+    (%leveldb-iter-seek iter kptr (length key))))
+
+(defun leveldb-iter-key (iter)
+  "Copy out the current iterator key as a fresh byte vector. Only call
+when leveldb-iter-valid-p is T."
+  (cffi:with-foreign-object (klen :size)
+    (let ((kptr (%leveldb-iter-key iter klen)))
+      (let* ((n (cffi:mem-ref klen :size))
+             (out (make-array n :element-type '(unsigned-byte 8))))
+        (cffi:with-pointer-to-vector-data (out-ptr out)
+          (%libc-memcpy out-ptr kptr n))
+        out))))
+
+(defun leveldb-iter-value (iter)
+  "Copy out the current iterator value as a fresh byte vector. Only
+call when leveldb-iter-valid-p is T."
+  (cffi:with-foreign-object (vlen :size)
+    (let ((vptr (%leveldb-iter-value iter vlen)))
+      (let* ((n (cffi:mem-ref vlen :size))
+             (out (make-array n :element-type '(unsigned-byte 8))))
+        (cffi:with-pointer-to-vector-data (out-ptr out)
+          (%libc-memcpy out-ptr vptr n))
+        out))))

@@ -169,3 +169,169 @@ entries written (puts + erases)."
     (setf (cvc-dirty-count cache) 0
           (cvc-fresh-count cache) 0)
     count))
+
+;;;; coin-view-* convenience API
+;;;;
+;;;; The cache's native interface takes a pre-built utxo-key. Most
+;;;; callers in validation/RPC have a (txid bytes, vout int) pair from
+;;;; the wire format. These wrappers do the make-utxo-key construction
+;;;; inline so the signatures mirror the legacy get-utxo / add-utxo /
+;;;; remove-utxo functions on utxo-set. They keep call-site churn small
+;;;; when the wire-in PR swaps utxo-set → coins-view-cache.
+
+(declaim (inline coin-view-get coin-view-has-p))
+
+(defun coin-view-get (cache txid vout)
+  "Read the unspent utxo-entry for (TXID, VOUT), or NIL if absent."
+  (declare (type coins-view-cache cache)
+           (type (simple-array (unsigned-byte 8) (*)) txid)
+           (type (unsigned-byte 32) vout))
+  (coins-view-cache-get cache (make-utxo-key txid vout)))
+
+(defun coin-view-has-p (cache txid vout)
+  "Truthy iff (TXID, VOUT) currently maps to an unspent coin."
+  (declare (type coins-view-cache cache)
+           (type (simple-array (unsigned-byte 8) (*)) txid)
+           (type (unsigned-byte 32) vout))
+  (coins-view-cache-has-p cache (make-utxo-key txid vout)))
+
+(defun coin-view-add (cache txid vout value script-pubkey height
+                      &key coinbase allow-overwrite)
+  "Add a UTXO. Mirrors add-utxo's signature on utxo-set."
+  (declare (type coins-view-cache cache)
+           (type (simple-array (unsigned-byte 8) (*)) txid script-pubkey)
+           (type (unsigned-byte 32) vout))
+  (let ((entry (make-utxo-entry :value value
+                                :script-pubkey script-pubkey
+                                :height height
+                                :coinbase coinbase)))
+    (coins-view-cache-add cache (make-utxo-key txid vout) entry
+                          :allow-overwrite allow-overwrite)
+    entry))
+
+(defun coin-view-spend (cache txid vout)
+  "Spend a UTXO. Returns the prior utxo-entry (for undo data) or NIL
+if the coin was already spent / never existed. Mirrors remove-utxo's
+contract on utxo-set."
+  (declare (type coins-view-cache cache)
+           (type (simple-array (unsigned-byte 8) (*)) txid)
+           (type (unsigned-byte 32) vout))
+  (let* ((key (make-utxo-key txid vout))
+         (entry (coins-view-cache-get cache key)))
+    (when entry
+      (coins-view-cache-spend cache key)
+      entry)))
+
+;;;; BIP30: any-utxo-for-txid-p over (cache + base).
+;;;;
+;;;; The check fires when a new block contains a tx whose hash matches
+;;;; a previous tx with at least one unspent output (forbidden post-
+;;;; BIP30). We have to scan both the cache (for recently-touched
+;;;; outputs, possibly tombstoned by an in-cache spend) and the base
+;;;; (via a LevelDB iterator over keys with prefix 'C' + txid).
+;;;;
+;;;; A base hit only counts as "unspent" if the cache doesn't have a
+;;;; tombstone (entry=NIL) for that exact key — otherwise the in-cache
+;;;; spend supersedes the base.
+
+(defun %txid-matches-key-p (key txid)
+  "T if the 32 txid bytes at KEY[1..33] equal the 32 bytes of TXID."
+  (declare (type (simple-array (unsigned-byte 8) (*)) key txid))
+  (and (>= (length key) 33)
+       (= (aref key 0) +db-prefix-coin+)
+       (loop for i from 0 below 32
+             always (= (aref key (1+ i)) (aref txid i)))))
+
+(defun coin-view-any-utxo-for-txid-p (cache txid)
+  "T if any UTXO for TXID is currently unspent in CACHE or its base.
+Mirrors any-utxo-for-txid-p on utxo-set; used for the BIP30 duplicate-
+txid check."
+  (declare (type coins-view-cache cache)
+           (type (simple-array (unsigned-byte 8) (*)) txid))
+  ;; Cache scan: any in-cache unspent entry with matching txid wins.
+  (let ((a (txid-bytes->u64-le txid 0))
+        (b (txid-bytes->u64-le txid 8))
+        (c (txid-bytes->u64-le txid 16))
+        (d (txid-bytes->u64-le txid 24)))
+    (maphash (lambda (key ce)
+               (declare (type utxo-key key))
+               (when (and (ce-entry ce)
+                          (= (uk-a key) a) (= (uk-b key) b)
+                          (= (uk-c key) c) (= (uk-d key) d))
+                 (return-from coin-view-any-utxo-for-txid-p t)))
+             (cvc-entries cache)))
+  ;; Base scan via iterator, skipping keys tombstoned in cache.
+  (let ((prefix (make-array 33 :element-type '(unsigned-byte 8))))
+    (setf (aref prefix 0) +db-prefix-coin+)
+    (replace prefix txid :start1 1)
+    (with-leveldb-iterator (iter (cvdb-db (cvc-base cache)))
+      (leveldb-iter-seek iter prefix)
+      (loop
+        (unless (leveldb-iter-valid-p iter) (return))
+        (let ((k (leveldb-iter-key iter)))
+          (unless (%txid-matches-key-p k txid) (return))
+          (let* ((vout (logior (aref k 33)
+                               (ash (aref k 34) 8)
+                               (ash (aref k 35) 16)
+                               (ash (aref k 36) 24)))
+                 (uk (make-utxo-key txid vout))
+                 (ce (gethash uk (cvc-entries cache))))
+            ;; Base says this output exists. The cache supersedes iff
+            ;; it has a tombstone (entry=NIL); otherwise it's unspent.
+            (unless (and ce (null (ce-entry ce)))
+              (return-from coin-view-any-utxo-for-txid-p t)))
+          (leveldb-iter-next iter)))))
+  nil)
+
+;;;; Block apply / disconnect over the coin view.
+;;;;
+;;;; These mirror apply-block-to-utxo-set / disconnect-block-from-utxo-set
+;;;; on utxo-set, but operate on a coins-view-cache and return undo
+;;;; data in the same (txid index entry) shape so the rest of the
+;;;; validator (which records / replays undo lists) doesn't have to
+;;;; change when the wire-in PR swaps storage backends.
+
+(defun coin-view-apply-block (cache block height)
+  "Spend a block's inputs and add its outputs in CACHE. Returns the
+undo list — (txid index entry) for every spent UTXO, in apply order."
+  (declare (type coins-view-cache cache))
+  (let ((spent '()))
+    (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+          for tx-index from 0
+          for is-coinbase = (zerop tx-index)
+          do (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+               (unless is-coinbase
+                 (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+                   (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                          (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
+                          (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
+                          (entry (coin-view-spend cache prev-txid prev-index)))
+                     (when entry
+                       (push (list prev-txid prev-index entry) spent)))))
+               (loop for output in (bitcoin-lisp.serialization:transaction-outputs tx)
+                     for out-idx from 0
+                     do (coin-view-add cache txid out-idx
+                                       (bitcoin-lisp.serialization:tx-out-value output)
+                                       (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                                       height
+                                       :coinbase is-coinbase
+                                       ;; Coinbase tx outputs at a pre-BIP30 height
+                                       ;; can clobber an earlier coinbase with the
+                                       ;; same hash; the caller is responsible for
+                                       ;; passing the right flag via this path.
+                                       :allow-overwrite is-coinbase))))
+    (nreverse spent)))
+
+(defun coin-view-disconnect-block (cache block previous-utxos)
+  "Reverse coin-view-apply-block for reorg: remove the block's outputs
+then restore the spends recorded in PREVIOUS-UTXOS."
+  (declare (type coins-view-cache cache))
+  (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+    (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+      (loop for out-idx from 0
+            below (length (bitcoin-lisp.serialization:transaction-outputs tx))
+            do (coin-view-spend cache txid out-idx))))
+  (dolist (prev previous-utxos)
+    (destructuring-bind (txid index entry) prev
+      (coins-view-cache-add cache (make-utxo-key txid index) entry
+                            :allow-overwrite t))))
