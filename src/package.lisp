@@ -384,6 +384,7 @@
    #:coins-view-cache-add
    #:coins-view-cache-spend
    #:coins-view-cache-flush
+   #:coins-view-cache-base
    ;; coin-view-* (txid+vout signatures mirroring legacy utxo-set API)
    #:coin-view-get
    #:coin-view-has-p
