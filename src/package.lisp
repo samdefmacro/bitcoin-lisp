@@ -366,6 +366,17 @@
    #:coins-view-db-erase
    #:coins-view-db-has-p
    #:coins-view-db-write-batch
+   #:with-coins-view-batch
+   #:coins-view-batch-put
+   #:coins-view-batch-erase
+   ;; Coins-view-cache (in-memory dirty-tracking layer)
+   #:coins-view-cache
+   #:make-coins-view-cache
+   #:coins-view-cache-get
+   #:coins-view-cache-has-p
+   #:coins-view-cache-add
+   #:coins-view-cache-spend
+   #:coins-view-cache-flush
    ;; UTXO iteration and statistics
    #:utxo-set-iterate
    #:utxo-set-total-amount

@@ -49,6 +49,7 @@
                                (:file "utxo")
                                (:file "leveldb")
                                (:file "coins-view")
+                               (:file "coins-view-cache")
                                (:file "chain")
                                (:file "txindex")))
                  (:module "validation"
