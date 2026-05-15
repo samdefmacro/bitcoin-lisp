@@ -475,81 +475,16 @@ Returns T if loaded, NIL if file does not exist or is corrupted."
 
 ;;; UTXO Set Iteration and Statistics
 
-(defun utxo-set-iterate (utxo-set callback)
-  "Iterate over all UTXOs in deterministic order.
-Order is the on-disk 36-byte (txid || LE vout) lexicographic order, matching
-the input to Bitcoin Core's hash_serialized_3 computation.
-CALLBACK is called with (txid vout entry) for each UTXO."
-  (let ((keys '()))
-    (maphash (lambda (key entry)
-               (declare (ignore entry))
-               (push (cons (utxo-key-bytes key) key) keys))
-             (utxo-set-entries utxo-set))
-    (setf keys (sort keys #'key-bytes-less-than :key #'car))
-    (dolist (pair keys)
-      (let* ((key (cdr pair))
-             (entry (gethash key (utxo-set-entries utxo-set))))
-        (when entry
-          (funcall callback (utxo-key-txid key) (uk-vout key) entry))))))
-
 (defun key-bytes-less-than (a b)
-  "Compare two 36-byte UTXO key vectors lexicographically."
-  (loop for i from 0 below 36
-        do (cond
-             ((< (aref a i) (aref b i)) (return t))
-             ((> (aref a i) (aref b i)) (return nil))))
-  nil)
+  "Compare two 36-byte UTXO key vectors lexicographically. Strict
+less-than: T iff A < B byte-by-byte; NIL if equal or A > B."
+  (declare (type (simple-array (unsigned-byte 8) (*)) a b))
+  (dotimes (i 36 nil)
+    (let ((ai (aref a i))
+          (bi (aref b i)))
+      (cond ((< ai bi) (return-from key-bytes-less-than t))
+            ((> ai bi) (return-from key-bytes-less-than nil))))))
 
-(defun utxo-set-total-amount (utxo-set)
-  "Calculate total satoshis in the UTXO set."
-  (let ((total 0))
-    (maphash (lambda (key entry)
-               (declare (ignore key))
-               (incf total (utxo-entry-value entry)))
-             (utxo-set-entries utxo-set))
-    total))
-
-(defun utxo-set-distinct-txids (utxo-set)
-  "Count distinct transaction IDs with unspent outputs."
-  (let ((txids (make-hash-table :test 'equal)))
-    (maphash (lambda (key entry)
-               (declare (ignore entry) (type utxo-key key))
-               (setf (gethash (list (uk-a key) (uk-b key) (uk-c key) (uk-d key))
-                              txids)
-                     t))
-             (utxo-set-entries utxo-set))
-    (hash-table-count txids)))
-
-(defun compute-utxo-set-hash (utxo-set)
-  "Compute the hash_serialized_3 UTXO set hash.
-This matches Bitcoin Core's format for UTXO set verification.
-Returns a 32-byte hash."
-  (let ((data (flexi-streams:with-output-to-sequence (out)
-                (utxo-set-iterate
-                 utxo-set
-                 (lambda (txid vout entry)
-                   ;; Serialize: txid || vout || height || coinbase || value || scriptPubKey
-                   (write-sequence txid out)
-                   ;; vout as 4-byte little-endian
-                   (write-byte (logand vout #xFF) out)
-                   (write-byte (logand (ash vout -8) #xFF) out)
-                   (write-byte (logand (ash vout -16) #xFF) out)
-                   (write-byte (logand (ash vout -24) #xFF) out)
-                   ;; height as 4-byte little-endian
-                   (let ((h (utxo-entry-height entry)))
-                     (write-byte (logand h #xFF) out)
-                     (write-byte (logand (ash h -8) #xFF) out)
-                     (write-byte (logand (ash h -16) #xFF) out)
-                     (write-byte (logand (ash h -24) #xFF) out))
-                   ;; coinbase flag as 1 byte
-                   (write-byte (if (utxo-entry-coinbase entry) 1 0) out)
-                   ;; value as 8-byte little-endian
-                   (let ((v (utxo-entry-value entry)))
-                     (loop for i from 0 below 8
-                           do (write-byte (logand (ash v (* -8 i)) #xFF) out)))
-                   ;; scriptPubKey with length prefix (varint)
-                   (let ((script (utxo-entry-script-pubkey entry)))
-                     (bitcoin-lisp.serialization:write-compact-size out (length script))
-                     (write-sequence script out)))))))
-    ;; Return SHA256 of concatenated serializations
-    (bitcoin-lisp.crypto:sha256 (coerce data '(simple-array (unsigned-byte 8) (*))))))
+;; utxo-set-iterate / utxo-set-total-amount / utxo-set-distinct-txids /
+;; compute-utxo-set-hash live in coins-view-cache.lisp where they
+;; dispatch on view type (utxo-set or coins-view-cache).
