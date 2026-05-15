@@ -356,6 +356,13 @@
    #:leveldb-writebatch-put
    #:leveldb-writebatch-delete
    #:with-leveldb-writebatch
+   #:with-leveldb-iterator
+   #:leveldb-iter-valid-p
+   #:leveldb-iter-seek-to-first
+   #:leveldb-iter-seek
+   #:leveldb-iter-next
+   #:leveldb-iter-key
+   #:leveldb-iter-value
    ;; Coins-view (LevelDB-backed CCoinsViewDB equivalent)
    #:coins-view-db
    #:open-coins-view-db
@@ -377,6 +384,14 @@
    #:coins-view-cache-add
    #:coins-view-cache-spend
    #:coins-view-cache-flush
+   ;; coin-view-* (txid+vout signatures mirroring legacy utxo-set API)
+   #:coin-view-get
+   #:coin-view-has-p
+   #:coin-view-add
+   #:coin-view-spend
+   #:coin-view-any-utxo-for-txid-p
+   #:coin-view-apply-block
+   #:coin-view-disconnect-block
    ;; Migration: utxoset.dat → LevelDB
    #:migrate-utxoset-dat-to-leveldb
    #:leveldb-utxo-migration-complete-p
