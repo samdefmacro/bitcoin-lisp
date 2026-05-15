@@ -50,6 +50,7 @@
                                (:file "leveldb")
                                (:file "coins-view")
                                (:file "coins-view-cache")
+                               (:file "coins-view-migration")
                                (:file "chain")
                                (:file "txindex")))
                  (:module "validation"

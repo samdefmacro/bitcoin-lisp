@@ -377,6 +377,9 @@
    #:coins-view-cache-add
    #:coins-view-cache-spend
    #:coins-view-cache-flush
+   ;; Migration: utxoset.dat → LevelDB
+   #:migrate-utxoset-dat-to-leveldb
+   #:leveldb-utxo-migration-complete-p
    ;; UTXO iteration and statistics
    #:utxo-set-iterate
    #:utxo-set-total-amount
