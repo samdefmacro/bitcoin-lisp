@@ -355,3 +355,89 @@
       (bitcoin-lisp.storage:close-tx-index txindex)
       (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir))))))
 
+
+;;;; LevelDB CFFI binding tests
+
+(defun %tmp-leveldb-path ()
+  (namestring
+   (merge-pathnames (format nil "bitcoin-lisp-leveldb-test-~D-~D/"
+                            (get-universal-time) (random 100000))
+                    (uiop:temporary-directory))))
+
+(defmacro %with-tmp-leveldb ((db-var) &body body)
+  "Create a fresh LevelDB at a tmp path, bind DB-VAR to the handle.
+Belt-and-braces cleanup: leveldb-destroy-db first, then a
+delete-directory-tree fallback so a body error doesn't leak the tree."
+  (let ((path-var (gensym "PATH-")))
+    `(let ((,path-var (%tmp-leveldb-path)))
+       (unwind-protect
+            (bitcoin-lisp.storage:with-leveldb (,db-var ,path-var)
+              ,@body)
+         (ignore-errors (bitcoin-lisp.storage:leveldb-destroy-db ,path-var))
+         (ignore-errors
+           (uiop:delete-directory-tree (pathname ,path-var)
+                                       :validate t
+                                       :if-does-not-exist :ignore))))))
+
+(test leveldb-put-get-round-trip
+  "PUT then GET returns the value bytes verbatim."
+  (%with-tmp-leveldb (db)
+    (let ((k (make-array 3 :element-type '(unsigned-byte 8)
+                           :initial-contents #(1 2 3)))
+          (v (make-array 5 :element-type '(unsigned-byte 8)
+                           :initial-contents #(10 20 30 40 50))))
+      (bitcoin-lisp.storage:leveldb-put db k v)
+      (is (equalp v (bitcoin-lisp.storage:leveldb-get db k))))))
+
+(test leveldb-get-missing
+  "GET on an absent key returns NIL (not an error)."
+  (%with-tmp-leveldb (db)
+    (is (null (bitcoin-lisp.storage:leveldb-get
+               db (make-array 1 :element-type '(unsigned-byte 8)
+                                :initial-contents #(99)))))))
+
+(test leveldb-delete
+  "DELETE removes a previously put key."
+  (%with-tmp-leveldb (db)
+    (let ((k (make-array 2 :element-type '(unsigned-byte 8)
+                           :initial-contents #(1 1)))
+          (v (make-array 1 :element-type '(unsigned-byte 8)
+                           :initial-contents #(42))))
+      (bitcoin-lisp.storage:leveldb-put db k v)
+      (is (equalp v (bitcoin-lisp.storage:leveldb-get db k)))
+      (bitcoin-lisp.storage:leveldb-delete db k)
+      (is (null (bitcoin-lisp.storage:leveldb-get db k))))))
+
+(test leveldb-writebatch-atomic
+  "A WriteBatch applies put + delete atomically."
+  (%with-tmp-leveldb (db)
+    (let ((k1 (make-array 1 :element-type '(unsigned-byte 8)
+                            :initial-contents #(1)))
+          (k2 (make-array 1 :element-type '(unsigned-byte 8)
+                            :initial-contents #(2)))
+          (v1 (make-array 1 :element-type '(unsigned-byte 8)
+                            :initial-contents #(11)))
+          (v2 (make-array 1 :element-type '(unsigned-byte 8)
+                            :initial-contents #(22))))
+      (bitcoin-lisp.storage:leveldb-put db k1 v1)
+      (bitcoin-lisp.storage:with-leveldb-writebatch (b)
+        (bitcoin-lisp.storage:leveldb-writebatch-delete b k1)
+        (bitcoin-lisp.storage:leveldb-writebatch-put b k2 v2)
+        (bitcoin-lisp.storage:leveldb-write db b))
+      (is (null (bitcoin-lisp.storage:leveldb-get db k1)))
+      (is (equalp v2 (bitcoin-lisp.storage:leveldb-get db k2))))))
+
+(test leveldb-persistence-across-open-close
+  "Data written in one open survives close + reopen."
+  (let ((path (%tmp-leveldb-path))
+        (k (make-array 4 :element-type '(unsigned-byte 8)
+                         :initial-contents #(7 7 7 7)))
+        (v (make-array 4 :element-type '(unsigned-byte 8)
+                         :initial-contents #(8 8 8 8))))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp.storage:with-leveldb (db path)
+             (bitcoin-lisp.storage:leveldb-put db k v))
+           (bitcoin-lisp.storage:with-leveldb (db path)
+             (is (equalp v (bitcoin-lisp.storage:leveldb-get db k)))))
+      (ignore-errors (bitcoin-lisp.storage:leveldb-destroy-db path)))))
