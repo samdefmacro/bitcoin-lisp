@@ -147,103 +147,11 @@ hash_serialized_3 — never on the inv/validate hot path."
     (write-u64-le-into bytes 24 (uk-d k))
     bytes))
 
-(defun add-utxo (utxo-set txid output-index value script-pubkey height &key coinbase)
-  "Add a UTXO to the set."
-  (let ((key (make-utxo-key txid output-index))
-        (entry (make-utxo-entry :value value
-                                :script-pubkey script-pubkey
-                                :height height
-                                :coinbase coinbase)))
-    (setf (gethash key (utxo-set-entries utxo-set)) entry)
-    (setf (utxo-set-dirty utxo-set) t)
-    entry))
-
-(defun remove-utxo (utxo-set txid output-index)
-  "Remove a UTXO from the set. Returns the removed entry or NIL."
-  (let ((key (make-utxo-key txid output-index)))
-    (prog1
-        (gethash key (utxo-set-entries utxo-set))
-      (remhash key (utxo-set-entries utxo-set))
-      (setf (utxo-set-dirty utxo-set) t))))
-
-(defun get-utxo (utxo-set txid output-index)
-  "Look up a UTXO in the set. Returns the entry or NIL."
-  (let ((key (make-utxo-key txid output-index)))
-    (gethash key (utxo-set-entries utxo-set))))
-
-(defun utxo-exists-p (utxo-set txid output-index)
-  "Check if a UTXO exists in the set."
-  (not (null (get-utxo utxo-set txid output-index))))
-
-(defun utxo-count (utxo-set)
-  "Return the number of UTXOs in the set."
-  (hash-table-count (utxo-set-entries utxo-set)))
-
-(defun any-utxo-for-txid-p (utxo-set txid)
-  "Check if any unspent output exists for TXID (BIP 30 duplicate check).
-Scans UTXO keys whose txid portion matches TXID."
-  (declare (type (simple-array (unsigned-byte 8) (*)) txid))
-  (let ((a (txid-bytes->u64-le txid 0))
-        (b (txid-bytes->u64-le txid 8))
-        (c (txid-bytes->u64-le txid 16))
-        (d (txid-bytes->u64-le txid 24)))
-    (declare (type (unsigned-byte 64) a b c d))
-    (maphash (lambda (key entry)
-               (declare (ignore entry) (type utxo-key key))
-               (when (and (= (uk-a key) a) (= (uk-b key) b)
-                          (= (uk-c key) c) (= (uk-d key) d))
-                 (return-from any-utxo-for-txid-p t)))
-             (utxo-set-entries utxo-set)))
-  nil)
-
-(defun apply-block-to-utxo-set (utxo-set block height)
-  "Apply a block's transactions to the UTXO set.
-Adds new outputs and removes spent outputs.
-Returns a list of (txid index entry) for all spent UTXOs (undo data for reorgs)."
-  (let ((transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-        (spent-utxos '()))
-    (loop for tx in transactions
-          for tx-index from 0
-          do
-             (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-                   (is-coinbase (zerop tx-index)))
-               ;; Remove spent UTXOs (skip for coinbase inputs)
-               (unless is-coinbase
-                 (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
-                   (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                          (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-                          (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
-                          ;; Capture the entry before removing (for undo)
-                          (entry (get-utxo utxo-set prev-txid prev-index)))
-                     (when entry
-                       (push (list prev-txid prev-index entry) spent-utxos))
-                     (remove-utxo utxo-set prev-txid prev-index))))
-               ;; Add new UTXOs
-               (loop for output in (bitcoin-lisp.serialization:transaction-outputs tx)
-                     for output-index from 0
-                     do (add-utxo utxo-set
-                                  txid
-                                  output-index
-                                  (bitcoin-lisp.serialization:tx-out-value output)
-                                  (bitcoin-lisp.serialization:tx-out-script-pubkey output)
-                                  height
-                                  :coinbase is-coinbase))))
-    (nreverse spent-utxos)))
-
-(defun disconnect-block-from-utxo-set (utxo-set block previous-utxos)
-  "Disconnect a block from the UTXO set (for reorgs).
-PREVIOUS-UTXOS should be a list of (txid index entry) for restored UTXOs."
-  ;; Remove outputs created by this block
-  (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-    (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-      (loop for output-index from 0
-            below (length (bitcoin-lisp.serialization:transaction-outputs tx))
-            do (remove-utxo utxo-set txid output-index))))
-  ;; Restore previously spent UTXOs
-  (dolist (prev previous-utxos)
-    (destructuring-bind (txid index entry) prev
-      (setf (gethash (make-utxo-key txid index) (utxo-set-entries utxo-set))
-            entry))))
+;; Public add/get/remove/utxo-count/any-utxo-for-txid-p/apply-block-to-utxo-set
+;; /disconnect-block-from-utxo-set used to live here. They moved to
+;; coins-view-cache.lisp where they dispatch on view type (utxo-set or
+;; coins-view-cache) — the utxo-set branch is the same logic that lived
+;; here before; the cache branch delegates to coin-view-*.
 
 ;;; UTXO Set Persistence
 ;;;
