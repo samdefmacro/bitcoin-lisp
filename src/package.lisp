@@ -515,6 +515,7 @@
    #:check-proof-of-work
    #:compute-merkle-root
    #:connect-block
+   #:activate-block
    #:find-fork-point
    #:perform-reorg
    #:decode-coinbase-height

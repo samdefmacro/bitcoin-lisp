@@ -1298,13 +1298,27 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
              fork-height pruned-height)
             (return-from perform-reorg nil))))
 
-      (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
-                             old-height fork-height new-height)
-
       ;; Collect blocks to disconnect (old chain, tip to fork)
       (let ((to-disconnect (collect-chain-entries old-tip-entry fork-entry))
             ;; Collect blocks to connect (new chain, fork to new tip)
             (to-connect (collect-chain-entries new-tip-entry fork-entry)))
+
+        ;; Precondition: every block on BOTH sides must be in the
+        ;; block-store. If anything is missing, refuse the reorg without
+        ;; mutating any state — better to defer than to leave the chain
+        ;; half-disconnected and corrupt. activate-block's caller will
+        ;; see :reorg-refused and the missing block can be requested.
+        (dolist (entry (append to-disconnect to-connect))
+          (let ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+            (unless (bitcoin-lisp.storage:get-block block-store block-hash)
+              (bitcoin-lisp:log-warn
+               "REORG REFUSED: block ~A (height ~D) missing from store"
+               (bitcoin-lisp.crypto:bytes-to-hex block-hash)
+               (bitcoin-lisp.storage:block-index-entry-height entry))
+              (return-from perform-reorg nil))))
+
+        (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
+                               old-height fork-height new-height)
 
         ;; Disconnect blocks in reverse order (tip to fork)
         (dolist (entry (reverse to-disconnect))
@@ -1352,3 +1366,131 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
                                (length to-disconnect) (length to-connect))
 
         t))))
+
+;;;; Activate block — validate + connect with reorg awareness.
+;;;;
+;;;; The validate-then-connect dance in process-received-block does
+;;;; validation against the current UTXO set, which is wrong when the
+;;;; incoming block sits on a competing fork: its inputs reference
+;;;; outputs that exist only on that fork. Validation fails MISSING-INPUT
+;;;; before connect-block's chain-work comparison can dispatch to reorg.
+;;;;
+;;;; activate-block fixes the order: it looks at the incoming block's
+;;;; parent and decides whether to extend the current tip, pre-reorg to
+;;;; the parent's chain, or just store the block on a weaker side chain.
+;;;; Mirrors Bitcoin Core's ActivateBestChainStep in validation.cpp,
+;;;; particularly the disconnect/connect interaction before block
+;;;; activation.
+
+(defun activate-block (block chain-state block-store utxo-set
+                       &key current-time skip-scripts tx-index fee-estimator
+                            recent-rejects)
+  "Validate and activate BLOCK. Three cases:
+
+  1. BLOCK's parent IS the current best tip — validate then connect
+     (normal chain extension).
+  2. BLOCK's parent is in the index but on a competing fork that, with
+     this block added, has strictly more chain-work than our current
+     best — pre-reorg to the parent's chain, then validate + connect.
+     This is the case the old validate-then-connect order fumbled.
+  3. BLOCK's parent is on a weaker chain or unknown — store the block
+     for later use without activating it.
+
+Returns (VALUES T NIL) on activation,
+        (VALUES NIL ERROR-KEYWORD) on validation failure or
+        non-activation. The :weaker-chain return is informational —
+        the block was stored safely, just not made active."
+  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
+         (current-best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (now (or current-time (bitcoin-lisp.serialization:get-unix-time))))
+    (cond
+      ;; Case 1: extends current tip — normal path.
+      ((equalp prev-hash current-best-hash)
+       (let ((height (1+ (bitcoin-lisp.storage:current-height chain-state))))
+         (multiple-value-bind (valid error)
+             (validate-block block chain-state utxo-set height now
+                             :skip-scripts skip-scripts)
+           (if valid
+               (progn
+                 (connect-block block chain-state block-store utxo-set
+                                :tx-index tx-index
+                                :fee-estimator fee-estimator
+                                :recent-rejects recent-rejects)
+                 (values t nil))
+               (values nil error)))))
+
+      (t
+       ;; Cases 2 and 3: prev != current best.
+       (let* ((prev-entry (bitcoin-lisp.storage:get-block-index-entry
+                           chain-state prev-hash))
+              (current-best-entry (bitcoin-lisp.storage:get-block-index-entry
+                                   chain-state current-best-hash))
+              (this-bits (bitcoin-lisp.serialization:block-header-bits header))
+              (prev-work (and prev-entry
+                              (bitcoin-lisp.storage:block-index-entry-chain-work
+                               prev-entry)))
+              (new-chain-work (and prev-work
+                                   (bitcoin-lisp.storage:calculate-chain-work
+                                    this-bits prev-work)))
+              (current-best-work (and current-best-entry
+                                      (bitcoin-lisp.storage:block-index-entry-chain-work
+                                       current-best-entry))))
+         (cond
+           ;; Parent unknown — caller should queue and request its parent.
+           ((null prev-entry)
+            (values nil :unknown-parent))
+
+           ;; Case 2: competing fork with strictly more work — pre-reorg.
+           ;;
+           ;; perform-reorg disconnects our chain back to the common
+           ;; ancestor and connects the fork up to (but not including)
+           ;; the incoming block. After it returns T, chain-state's tip
+           ;; equals prev-entry and the UTXO set reflects that fork's
+           ;; state — so validate-block now sees the correct inputs.
+           ((and new-chain-work
+                 current-best-work
+                 (> new-chain-work current-best-work))
+            (let ((reorg-ok (perform-reorg chain-state block-store utxo-set
+                                           current-best-entry prev-entry
+                                           :tx-index tx-index
+                                           :fee-estimator fee-estimator
+                                           :recent-rejects recent-rejects)))
+              (cond
+                ((null reorg-ok)
+                 ;; Reorg refused (missing fork blocks, fork below pruned
+                 ;; height, no common ancestor, ...). chain-state and
+                 ;; utxo-set are unchanged — perform-reorg either
+                 ;; succeeds fully or no-ops.
+                 (values nil :reorg-refused))
+                (t
+                 (let ((new-height (1+ (bitcoin-lisp.storage:current-height
+                                        chain-state))))
+                   (multiple-value-bind (valid error)
+                       (validate-block block chain-state utxo-set new-height now
+                                       :skip-scripts skip-scripts)
+                     (if valid
+                         (progn
+                           (connect-block block chain-state block-store utxo-set
+                                          :tx-index tx-index
+                                          :fee-estimator fee-estimator
+                                          :recent-rejects recent-rejects)
+                           (values t nil))
+                         (progn
+                           ;; Validation failed AFTER we reorganized.
+                           ;; The chain is now on the fork; the
+                           ;; incoming block is rejected but the side
+                           ;; effects of the reorg remain. Future PR
+                           ;; should roll back; for now, log and
+                           ;; surface the error.
+                           (bitcoin-lisp:log-error
+                            "Block on reorged fork failed validation post-reorg: ~A"
+                            error)
+                           (values nil error)))))))))
+
+           ;; Case 3: weaker / equal chain — store the block, don't
+           ;; activate. Bitcoin Core does the same: blocks on weaker
+           ;; tips sit in the block-store until their chain catches up.
+           (t
+            (bitcoin-lisp.storage:store-block block-store block)
+            (values nil :weaker-chain))))))))
