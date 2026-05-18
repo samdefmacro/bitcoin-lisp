@@ -612,32 +612,44 @@
 ;;;; Reorg and Persistence Edge-Case Tests
 
 (defun make-reorg-test-block (prev-hash block-hash height &key (value 5000000000))
-  "Create a minimal test block for reorg tests."
-  (let* ((coinbase-tx (bitcoin-lisp.serialization:make-transaction
+  "Create a minimal test block for reorg tests.
+
+The coinbase's script-sig is derived from BLOCK-HASH so each block's
+coinbase tx SERIALIZES uniquely. Without that, every coinbase produced
+by this helper would serialize to identical bytes and hash to the same
+real txid after a block round-trips through the store (which
+serializes then deserializes, dropping any cached tx hash). The
+collapsed-txid bug let reorg tests pass by coincidence: A's outputs
+were never disconnected (stored under cached-hash keys, looked up
+under real-hash keys) and B's collapsed to one entry, so the final
+count happened to equal the number-of-B-blocks the test expected.
+
+We still set cached-hash on the coinbase as a small optimization for
+tests that compare txids before any disk round-trip — it must match
+the real hash256(serialize-tx) which it now does, since the unique
+script-sig makes the serialization deterministic per block."
+  (let* ((script-sig (let ((s (make-array 4 :element-type '(unsigned-byte 8))))
+                       (replace s block-hash :start2 0 :end2 4)
+                       s))
+         (coinbase-tx (bitcoin-lisp.serialization:make-transaction
                        :version 1
                        :inputs (list (bitcoin-lisp.serialization:make-tx-in
                                       :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                         :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                           :initial-element 0)
                                                         :index #xFFFFFFFF)
-                                      :script-sig (make-array 4 :element-type '(unsigned-byte 8)
-                                                                :initial-element 1)))
+                                      :script-sig script-sig))
                        :outputs (list (bitcoin-lisp.serialization:make-tx-out
                                        :value value
                                        :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                   :initial-element #x76)))
-                       :lock-time 0
-                       :cached-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8)
-                                                         :initial-element 0)))
-                                      ;; Make txid unique per block using full block-hash info
-                                      (setf (aref h 0) (aref block-hash 0))
-                                      (setf (aref h 1) (aref block-hash 1))
-                                      (setf (aref h 2) #xBB)
-                                      h)))
+                       :lock-time 0))
+         (merkle-root (bitcoin-lisp.validation:compute-merkle-root
+                       (list (bitcoin-lisp.serialization:transaction-hash coinbase-tx))))
          (header (bitcoin-lisp.serialization:make-block-header
                   :version 1
                   :prev-block prev-hash
-                  :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                  :merkle-root merkle-root
                   :timestamp (+ 1231006505 (* height 600))
                   :bits #x1d00ffff
                   :nonce 0
