@@ -160,3 +160,254 @@ Returns the tip entry. If CHAIN-STATE provided, entries are added to it."
           ;; Original state restored
           (is (= initial-count (bitcoin-lisp.storage:utxo-count utxo-set)))
           (is (bitcoin-lisp.storage:utxo-exists-p utxo-set txid1 0)))))))
+
+;;;; activate-block dispatch tests
+;;;;
+;;;; activate-block is the consensus-correct entry point that replaces
+;;;; the (validate-block → if-valid-then-connect-block) dance in
+;;;; process-received-block. The bug it fixes: when a received block
+;;;; sits on a competing fork with more work, the OLD order ran
+;;;; validate-block against the CURRENT (wrong-fork) UTXO state and
+;;;; failed MISSING-INPUT before connect-block's reorg branch could
+;;;; fire. activate-block reorders: detect competing-fork case first,
+;;;; pre-reorg, THEN validate against the corrected UTXO state.
+;;;;
+;;;; These tests use coinbase-only blocks (via make-reorg-test-block),
+;;;; which pass validate-block trivially regardless of UTXO state. They
+;;;; verify the dispatch decision is correct: which case fires for
+;;;; which input. The deeper "validate runs against post-reorg state"
+;;;; assertion is implicit — after activate-block returns T for a
+;;;; competing-fork block, chain-state's tip and the UTXO set reflect
+;;;; the new fork, which means perform-reorg ran before validate.
+
+(defun %use-activate-block-test-base-path (suffix)
+  (ensure-directories-exist
+   (merge-pathnames (format nil "test-activate-block-~A/" suffix)
+                    (uiop:temporary-directory))))
+
+(defmacro %with-mainnet-network (&body body)
+  "Bind *network* to :mainnet so version-1 test blocks pass the
+BIP34 activation check (testnet4 activates BIP34 at h=1, which would
+otherwise reject the synthetic make-reorg-test-block blocks)."
+  `(let ((bitcoin-lisp:*network* :mainnet))
+     ,@body))
+
+(defun %make-activate-test-block (prev-hash block-hash height)
+  "Build a coinbase-only test block with a CORRECT merkle root and a
+caller-supplied cached block hash.
+
+The coinbase's script-sig encodes the BLOCK-HASH so each block's
+coinbase tx serializes uniquely — without that, all coinbases would
+hash to the same value when the block round-trips through the
+block-store (which serializes and deserializes, dropping the cached
+tx hash). The legacy make-reorg-test-block has a constant script-sig
+that causes UTXO collisions in reorg paths; this helper avoids it."
+  (let* ((script-sig (let ((s (make-array 4 :element-type '(unsigned-byte 8))))
+                       ;; Use the first 4 bytes of BLOCK-HASH to make
+                       ;; each coinbase serialization unique.
+                       (replace s block-hash :start2 0 :end2 4)
+                       s))
+         (coinbase (bitcoin-lisp.serialization:make-transaction
+                    :version 1
+                    :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                   :previous-output
+                                   (bitcoin-lisp.serialization:make-outpoint
+                                    :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                         :initial-element 0)
+                                    :index #xFFFFFFFF)
+                                   :script-sig script-sig
+                                   :sequence #xFFFFFFFF))
+                    :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                    :value 5000000000
+                                    :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                 :initial-element #x76)))
+                    :lock-time 0))
+         (tx-hashes (list (bitcoin-lisp.serialization:transaction-hash coinbase)))
+         (merkle-root (bitcoin-lisp.validation:compute-merkle-root tx-hashes))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1
+                  :prev-block prev-hash
+                  :merkle-root merkle-root
+                  :timestamp (+ 1231006505 (* height 600))
+                  :bits #x1d00ffff
+                  :nonce 0
+                  :cached-hash block-hash)))
+    (bitcoin-lisp.serialization:make-bitcoin-block
+     :header header
+     :transactions (list coinbase))))
+
+(defun %make-activate-block-fixture (suffix)
+  "Returns (values chain-state utxo-set block-store genesis-hash). The
+genesis index entry has a dummy header so validate-block's MTP walk
+doesn't trip on a NIL header."
+  (let* ((base-path (%use-activate-block-test-base-path suffix))
+         (chain-state (bitcoin-lisp.storage:init-chain-state base-path))
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (block-store (bitcoin-lisp.storage:init-block-store base-path))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (genesis-header
+           (bitcoin-lisp.serialization:make-block-header
+            :version 1
+            :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)
+            :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element 0)
+            :timestamp 1231006505 :bits #x1d00ffff :nonce 0
+            :cached-hash genesis-hash)))
+    (clrhash bitcoin-lisp.validation::*block-undo-data*)
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state
+     (bitcoin-lisp.storage:make-block-index-entry
+      :hash genesis-hash :height 0 :chain-work 1 :status :valid
+      :header genesis-header))
+    (values chain-state utxo-set block-store genesis-hash)))
+
+(defun %build-and-connect (chain-state block-store utxo-set genesis-hash hashes)
+  "Build a chain of coinbase-only blocks from GENESIS-HASH using HASHES,
+connecting each via connect-block. Returns the list of (block . index-entry)
+pairs in connect order."
+  (let ((prev-hash genesis-hash)
+        (results '()))
+    (loop for h from 1
+          for block-hash in hashes
+          do (let ((block (%make-activate-test-block prev-hash block-hash h)))
+               (bitcoin-lisp.validation:connect-block
+                block chain-state block-store utxo-set)
+               (push (cons block (bitcoin-lisp.storage:get-block-index-entry
+                                  chain-state block-hash))
+                     results)
+               (setf prev-hash block-hash)))
+    (nreverse results)))
+
+(test activate-block-extends-current-tip
+  "When the incoming block's parent IS the current tip, activate-block
+should extend the chain normally."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "extends-tip")
+    ;; Build chain A: genesis → A1 → A2.
+    (%build-and-connect chain-state block-store utxo-set genesis-hash
+                        (make-test-chain-hashes #xA0 2))
+    (is (= 2 (bitcoin-lisp.storage:current-height chain-state)))
+    ;; Build A3 extending the tip; receive it via activate-block.
+    (let* ((a2-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+           (a3-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (setf (aref h 0) #xA0) (setf (aref h 1) 3) h))
+           (a3-block (%make-activate-test-block a2-hash a3-hash 3)))
+      (multiple-value-bind (activated error)
+          (bitcoin-lisp.validation:activate-block
+           a3-block chain-state block-store utxo-set :skip-scripts t)
+        (is (eq t activated))
+        (is (null error))
+        (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+        (is (equalp a3-hash (bitcoin-lisp.storage:best-block-hash chain-state)))))
+    (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test activate-block-pre-reorgs-on-stronger-fork
+  "When the incoming block's parent sits on a competing fork that, with
+this block added, has strictly more chain-work than current tip,
+activate-block should pre-reorg to the new fork and then activate the
+block. Chain tip should land on the new fork's tip."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "stronger-fork")
+    ;; Chain A: genesis → A1 → A2. Active.
+    (%build-and-connect chain-state block-store utxo-set genesis-hash
+                        (make-test-chain-hashes #xA0 2))
+    (let ((a-tip-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+      ;; Pre-build chain B: genesis → B1 → B2 (both stored + indexed but
+      ;; NOT applied to UTXO). Each B-block's chain-work matches the
+      ;; corresponding A-block's, so chain B reaches A's work at h=2 and
+      ;; will overtake at h=3.
+      (let ((b-hashes (make-test-chain-hashes #xB0 2))
+            (prev-hash genesis-hash))
+        (loop for h from 1 to 2
+              for block-hash in b-hashes
+              do (let ((block (%make-activate-test-block prev-hash block-hash h)))
+                   (bitcoin-lisp.storage:store-block block-store block)
+                   ;; connect-block on a non-extending block stores it
+                   ;; with the appropriate :valid status + chain-work.
+                   (bitcoin-lisp.validation:connect-block
+                    block chain-state block-store utxo-set)
+                   (setf prev-hash block-hash)))
+        ;; After both forks have 2 blocks each, A is still tip (race-pick
+        ;; — first-seen wins on equal-work).
+        (is (equalp a-tip-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+        (is (= 2 (bitcoin-lisp.storage:current-height chain-state))))
+
+      ;; Now receive B3, which extends B2. B3 has more chain-work than
+      ;; A2, so activate-block must pre-reorg from A2 → B2 then connect.
+      (let* ((b2-hash (second (make-test-chain-hashes #xB0 2)))
+             (b3-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                        (setf (aref h 0) #xB0) (setf (aref h 1) 3) h))
+             (b3-block (%make-activate-test-block b2-hash b3-hash 3)))
+        (multiple-value-bind (activated error)
+            (bitcoin-lisp.validation:activate-block
+             b3-block chain-state block-store utxo-set :skip-scripts t)
+          (is (eq t activated))
+          (is (null error))
+          ;; Chain tip is now B3.
+          (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+          (is (equalp b3-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+          ;; UTXO set reflects B chain: B1, B2, B3 coinbase outputs
+          ;; present; A1, A2 absent. (Each coinbase txid is unique per
+          ;; make-reorg-test-block, derived from block-hash.)
+          (is (= 3 (bitcoin-lisp.storage:utxo-count utxo-set))))))
+    (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test activate-block-stores-weaker-fork-without-activating
+  "When the incoming block's parent sits on a competing fork whose
+total work doesn't exceed current tip's, activate-block returns
+:weaker-chain and stores the block in the block-store but doesn't
+update the chain tip."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "weaker-fork")
+    ;; Chain A has 3 blocks.
+    (%build-and-connect chain-state block-store utxo-set genesis-hash
+                        (make-test-chain-hashes #xA0 3))
+    (let ((a-tip-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+      (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+      ;; Pre-store B1 on a competing fork (1 block, weaker than A's 3).
+      (let* ((b1-hash (first (make-test-chain-hashes #xB0 1)))
+             (b1-block (%make-activate-test-block genesis-hash b1-hash 1)))
+        (bitcoin-lisp.validation:connect-block b1-block chain-state block-store utxo-set)
+        ;; Now receive B2 extending B1. Total work for B = 2, still less
+        ;; than A's 3. activate-block should NOT reorg.
+        (let* ((b2-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                          (setf (aref h 0) #xB0) (setf (aref h 1) 2) h))
+               (b2-block (%make-activate-test-block b1-hash b2-hash 2)))
+          (multiple-value-bind (activated error)
+              (bitcoin-lisp.validation:activate-block
+               b2-block chain-state block-store utxo-set :skip-scripts t)
+            (is (null activated))
+            (is (eq error :weaker-chain))
+            ;; Chain tip unchanged.
+            (is (equalp a-tip-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+            (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+            ;; B2 IS in the block store for future reorg consideration.
+            (is (not (null (bitcoin-lisp.storage:get-block block-store b2-hash))))))))
+    (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test activate-block-unknown-parent
+  "When the incoming block's parent isn't in the chain index,
+activate-block returns :unknown-parent without doing anything."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "unknown-parent")
+    (declare (ignore genesis-hash))
+    (%build-and-connect chain-state block-store utxo-set
+                        (bitcoin-lisp.storage:best-block-hash chain-state)
+                        (make-test-chain-hashes #xA0 1))
+    (let* ((mystery-prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC))
+           (orphan-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                          (setf (aref h 0) #xCC) (setf (aref h 1) 1) h))
+           (orphan (%make-activate-test-block mystery-prev orphan-hash 5)))
+      (multiple-value-bind (activated error)
+          (bitcoin-lisp.validation:activate-block
+           orphan chain-state block-store utxo-set :skip-scripts t)
+        (is (null activated))
+        (is (eq error :unknown-parent))
+        ;; Chain unchanged.
+        (is (= 1 (bitcoin-lisp.storage:current-height chain-state)))))
+    (clrhash bitcoin-lisp.validation::*block-undo-data*))))

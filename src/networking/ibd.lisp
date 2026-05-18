@@ -345,11 +345,20 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
 Adds headers to the index but does NOT update the chain tip (best-height),
 since headers are not yet validated as full blocks.
 The header tip is tracked in the IBD context for download coordination.
+
+Side-effect: queues each newly-added HEADER-VALID entry for block
+download in the IBD context. Without this, headers arriving during
+tip-tracking (e.g. for a competing fork) never had their blocks fetched
+— queue-blocks-for-download only ran once at IBD entry. The result was
+that near-tip reorgs got stuck: we had the canonical fork's headers
+but never the blocks, so perform-reorg couldn't apply them.
+
 Returns the number of new headers added."
   (let ((added 0)
         (best-header-height (if *ibd-context*
                                 (ibd-context-header-tip-height *ibd-context*)
-                                0)))
+                                0))
+        (newly-added '()))
     (dolist (header headers)
       (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
              (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
@@ -372,13 +381,25 @@ Returns the number of new headers added."
                                           bits prev-work)
                              :status :header-valid)))
                 (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
+                (push (cons hash new-height) newly-added)
                 (incf added)
                 ;; Track header tip height in IBD context
                 (when (> new-height best-header-height)
                   (setf best-header-height new-height))))))))
     ;; Update header tip in IBD context (not the chain-state best-height)
     (when *ibd-context*
-      (setf (ibd-context-header-tip-height *ibd-context*) best-header-height))
+      (setf (ibd-context-header-tip-height *ibd-context*) best-header-height)
+      ;; Queue each newly-added header's block for download (unless it's
+      ;; already pending or in-flight). This is what makes near-tip-reorg
+      ;; fork chains downloadable — headers for the competing fork at
+      ;; heights ≤ current-height would otherwise sit in the index
+      ;; forever without a corresponding block ever being requested.
+      (let ((pending (ibd-context-pending-blocks *ibd-context*))
+            (in-flight (ibd-context-in-flight *ibd-context*)))
+        (dolist (cell newly-added)
+          (let ((hash (car cell)) (height (cdr cell)))
+            (unless (or (gethash hash pending) (gethash hash in-flight))
+              (setf (gethash hash pending) height))))))
     added))
 
 ;;;; Download Queue Management
@@ -1102,37 +1123,75 @@ After connecting, drains the queue of any children that can now be connected."
             (bitcoin-lisp:log-warn "Forensic store failed for block ~D: ~A"
                                    height e))))
 
-      ;; Skip blocks already connected (duplicates from multiple peers)
-      (when (<= height current-height)
+      ;; Skip blocks we already applied (duplicates from multiple peers).
+      ;; Distinct from competing-fork blocks at h ≤ current-height: those
+      ;; still have status :header-valid and we need to STORE them so a
+      ;; future reorg can use them. Only :valid means "already on our
+      ;; active chain."
+      (when (and (<= height current-height)
+                 (eq (bitcoin-lisp.storage:block-index-entry-status entry) :valid))
         (return-from process-received-block nil))
+
+      ;; A competing-fork block (h ≤ current, status :header-valid):
+      ;; store it and dispatch to activate-block. activate-block will
+      ;; recognize the weaker-chain case and return :weaker-chain
+      ;; without changing our active tip. A later block that pushes the
+      ;; fork past our tip will then trigger the reorg.
+      (when (<= height current-height)
+        (bitcoin-lisp.storage:store-block block-store block)
+        (multiple-value-bind (activated error)
+            (bitcoin-lisp.validation:activate-block
+             block chain-state block-store utxo-set
+             :skip-scripts (<= height (last-checkpoint-height))
+             :fee-estimator fee-estimator
+             :recent-rejects recent-rejects)
+          (declare (ignore activated))
+          ;; :weaker-chain is the expected outcome here; any other
+          ;; error is worth logging at debug level for now.
+          (unless (eq error :weaker-chain)
+            (bitcoin-lisp:log-debug "Competing-fork block ~D activate result: ~A"
+                                    height error))
+          (return-from process-received-block nil)))
 
       ;; Check if this is the next block we need
       (if (= height (1+ current-height))
-          ;; Validate and connect
-          ;; Skip script validation for blocks at or below the last checkpoint
-          ;; (matches Bitcoin Core behavior during IBD)
+          ;; activate-block handles three cases uniformly:
+          ;;   (a) prev == current best tip → validate then connect.
+          ;;   (b) prev is on a competing fork with strictly more
+          ;;       chain-work than our tip → pre-reorg first, then
+          ;;       validate + connect. This is the path the old
+          ;;       validate-then-connect order couldn't reach because
+          ;;       validation against the wrong-fork UTXO state
+          ;;       short-circuited with MISSING-INPUT.
+          ;;   (c) prev is on a weaker chain → store, don't activate.
+          ;; Skip script validation for blocks at or below the last
+          ;; checkpoint (matches Bitcoin Core IBD behavior).
           (let ((current-time (bitcoin-lisp.serialization:get-unix-time))
                 (skip-scripts (<= height (last-checkpoint-height))))
-            (multiple-value-bind (valid error)
-                (bitcoin-lisp.validation:validate-block
-                 block chain-state utxo-set height current-time
-                 :skip-scripts skip-scripts)
-              (if valid
-                  (progn
-                    (bitcoin-lisp.validation:connect-block
-                     block chain-state block-store utxo-set
-                     :fee-estimator fee-estimator
-                     :recent-rejects recent-rejects)
-                    (note-tip-advanced chain-state)
-                    ;; Drain queued blocks whose parent is now connected
-                    (drain-block-queue chain-state utxo-set block-store
-                                       :fee-estimator fee-estimator
-                                       :recent-rejects recent-rejects)
-                    t)
-                  (progn
-                    (bitcoin-lisp:log-error "Block ~D validation failed: ~A" height error)
-                    (handle-validation-failure block height error chain-state)
-                    nil))))
+            (multiple-value-bind (activated error)
+                (bitcoin-lisp.validation:activate-block
+                 block chain-state block-store utxo-set
+                 :current-time current-time
+                 :skip-scripts skip-scripts
+                 :fee-estimator fee-estimator
+                 :recent-rejects recent-rejects)
+              (cond
+                (activated
+                 (note-tip-advanced chain-state)
+                 ;; Drain queued blocks whose parent is now connected
+                 (drain-block-queue chain-state utxo-set block-store
+                                    :fee-estimator fee-estimator
+                                    :recent-rejects recent-rejects)
+                 t)
+                ;; :weaker-chain isn't an error — block stored, no
+                ;; activation needed.
+                ((eq error :weaker-chain)
+                 nil)
+                (t
+                 (bitcoin-lisp:log-error "Block ~D validation failed: ~A"
+                                         height error)
+                 (handle-validation-failure block height error chain-state)
+                 nil))))
 
           ;; Out of order - queue for later, with a HARD receive-side cap.
           ;; Bitcoin Core only ever requests blocks within BLOCK_DOWNLOAD_WINDOW
@@ -1181,27 +1240,32 @@ Repeats until no more queued blocks can be connected."
         (unless block
           (return drained))
         (remhash next-height queue)
-        ;; Try to connect
+        ;; Try to activate. activate-block dispatches to either direct
+        ;; tip-extend, pre-reorg+activate, or store-only based on the
+        ;; incoming block's parent vs. our current tip.
         (let* ((current-time (bitcoin-lisp.serialization:get-unix-time))
                (skip-scripts (<= next-height checkpoint-height)))
-          (multiple-value-bind (valid error)
-              (bitcoin-lisp.validation:validate-block
-               block chain-state utxo-set next-height current-time
-               :skip-scripts skip-scripts)
-            (if valid
-                (progn
-                  (bitcoin-lisp.validation:connect-block
-                   block chain-state block-store utxo-set
-                   :fee-estimator fee-estimator
-                   :recent-rejects recent-rejects)
-                  (note-tip-advanced chain-state)
-                  (incf drained)
-                  (bitcoin-lisp:log-debug "Drained queued block at height ~D" next-height))
-                (progn
-                  (bitcoin-lisp:log-error "Queued block ~D validation failed: ~A"
-                                          next-height error)
-                  (handle-validation-failure block next-height error chain-state)
-                  ;; Stop draining after a failure — the block is now back in
-                  ;; pending and will be re-requested. Returning here also
-                  ;; prevents tight-looping on a permanently-failing block.
-                  (return drained)))))))))
+          (multiple-value-bind (activated error)
+              (bitcoin-lisp.validation:activate-block
+               block chain-state block-store utxo-set
+               :current-time current-time
+               :skip-scripts skip-scripts
+               :fee-estimator fee-estimator
+               :recent-rejects recent-rejects)
+            (cond
+              (activated
+               (note-tip-advanced chain-state)
+               (incf drained)
+               (bitcoin-lisp:log-debug "Drained queued block at height ~D" next-height))
+              ((eq error :weaker-chain)
+               ;; Stored but not active — nothing to drain further on
+               ;; this height. Continue trying queued blocks.
+               nil)
+              (t
+               (bitcoin-lisp:log-error "Queued block ~D validation failed: ~A"
+                                       next-height error)
+               (handle-validation-failure block next-height error chain-state)
+               ;; Stop draining after a failure — the block is now back in
+               ;; pending and will be re-requested. Returning here also
+               ;; prevents tight-looping on a permanently-failing block.
+               (return drained)))))))))
