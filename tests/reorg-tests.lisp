@@ -192,49 +192,11 @@ otherwise reject the synthetic make-reorg-test-block blocks)."
   `(let ((bitcoin-lisp:*network* :mainnet))
      ,@body))
 
-(defun %make-activate-test-block (prev-hash block-hash height)
-  "Build a coinbase-only test block with a CORRECT merkle root and a
-caller-supplied cached block hash.
-
-The coinbase's script-sig encodes the BLOCK-HASH so each block's
-coinbase tx serializes uniquely — without that, all coinbases would
-hash to the same value when the block round-trips through the
-block-store (which serializes and deserializes, dropping the cached
-tx hash). The legacy make-reorg-test-block has a constant script-sig
-that causes UTXO collisions in reorg paths; this helper avoids it."
-  (let* ((script-sig (let ((s (make-array 4 :element-type '(unsigned-byte 8))))
-                       ;; Use the first 4 bytes of BLOCK-HASH to make
-                       ;; each coinbase serialization unique.
-                       (replace s block-hash :start2 0 :end2 4)
-                       s))
-         (coinbase (bitcoin-lisp.serialization:make-transaction
-                    :version 1
-                    :inputs (list (bitcoin-lisp.serialization:make-tx-in
-                                   :previous-output
-                                   (bitcoin-lisp.serialization:make-outpoint
-                                    :hash (make-array 32 :element-type '(unsigned-byte 8)
-                                                         :initial-element 0)
-                                    :index #xFFFFFFFF)
-                                   :script-sig script-sig
-                                   :sequence #xFFFFFFFF))
-                    :outputs (list (bitcoin-lisp.serialization:make-tx-out
-                                    :value 5000000000
-                                    :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
-                                                                 :initial-element #x76)))
-                    :lock-time 0))
-         (tx-hashes (list (bitcoin-lisp.serialization:transaction-hash coinbase)))
-         (merkle-root (bitcoin-lisp.validation:compute-merkle-root tx-hashes))
-         (header (bitcoin-lisp.serialization:make-block-header
-                  :version 1
-                  :prev-block prev-hash
-                  :merkle-root merkle-root
-                  :timestamp (+ 1231006505 (* height 600))
-                  :bits #x1d00ffff
-                  :nonce 0
-                  :cached-hash block-hash)))
-    (bitcoin-lisp.serialization:make-bitcoin-block
-     :header header
-     :transactions (list coinbase))))
+;; make-reorg-test-block was replaced by the unified make-reorg-test-block
+;; (persistence-tests.lisp) — that helper now derives script-sig from
+;; block-hash and computes a real merkle root, so it satisfies both the
+;; direct-connect-block path (older tests) and the activate-block / full
+;; validate-block path (these tests) without per-test duplication.
 
 (defun %make-activate-block-fixture (suffix)
   "Returns (values chain-state utxo-set block-store genesis-hash). The
@@ -270,7 +232,7 @@ pairs in connect order."
         (results '()))
     (loop for h from 1
           for block-hash in hashes
-          do (let ((block (%make-activate-test-block prev-hash block-hash h)))
+          do (let ((block (make-reorg-test-block prev-hash block-hash h)))
                (bitcoin-lisp.validation:connect-block
                 block chain-state block-store utxo-set)
                (push (cons block (bitcoin-lisp.storage:get-block-index-entry
@@ -293,7 +255,7 @@ should extend the chain normally."
     (let* ((a2-hash (bitcoin-lisp.storage:best-block-hash chain-state))
            (a3-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                       (setf (aref h 0) #xA0) (setf (aref h 1) 3) h))
-           (a3-block (%make-activate-test-block a2-hash a3-hash 3)))
+           (a3-block (make-reorg-test-block a2-hash a3-hash 3)))
       (multiple-value-bind (activated error)
           (bitcoin-lisp.validation:activate-block
            a3-block chain-state block-store utxo-set :skip-scripts t)
@@ -323,7 +285,7 @@ block. Chain tip should land on the new fork's tip."
             (prev-hash genesis-hash))
         (loop for h from 1 to 2
               for block-hash in b-hashes
-              do (let ((block (%make-activate-test-block prev-hash block-hash h)))
+              do (let ((block (make-reorg-test-block prev-hash block-hash h)))
                    (bitcoin-lisp.storage:store-block block-store block)
                    ;; connect-block on a non-extending block stores it
                    ;; with the appropriate :valid status + chain-work.
@@ -340,7 +302,7 @@ block. Chain tip should land on the new fork's tip."
       (let* ((b2-hash (second (make-test-chain-hashes #xB0 2)))
              (b3-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                         (setf (aref h 0) #xB0) (setf (aref h 1) 3) h))
-             (b3-block (%make-activate-test-block b2-hash b3-hash 3)))
+             (b3-block (make-reorg-test-block b2-hash b3-hash 3)))
         (multiple-value-bind (activated error)
             (bitcoin-lisp.validation:activate-block
              b3-block chain-state block-store utxo-set :skip-scripts t)
@@ -370,13 +332,13 @@ update the chain tip."
       (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
       ;; Pre-store B1 on a competing fork (1 block, weaker than A's 3).
       (let* ((b1-hash (first (make-test-chain-hashes #xB0 1)))
-             (b1-block (%make-activate-test-block genesis-hash b1-hash 1)))
+             (b1-block (make-reorg-test-block genesis-hash b1-hash 1)))
         (bitcoin-lisp.validation:connect-block b1-block chain-state block-store utxo-set)
         ;; Now receive B2 extending B1. Total work for B = 2, still less
         ;; than A's 3. activate-block should NOT reorg.
         (let* ((b2-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                           (setf (aref h 0) #xB0) (setf (aref h 1) 2) h))
-               (b2-block (%make-activate-test-block b1-hash b2-hash 2)))
+               (b2-block (make-reorg-test-block b1-hash b2-hash 2)))
           (multiple-value-bind (activated error)
               (bitcoin-lisp.validation:activate-block
                b2-block chain-state block-store utxo-set :skip-scripts t)
@@ -402,7 +364,7 @@ activate-block returns :unknown-parent without doing anything."
     (let* ((mystery-prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC))
            (orphan-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                           (setf (aref h 0) #xCC) (setf (aref h 1) 1) h))
-           (orphan (%make-activate-test-block mystery-prev orphan-hash 5)))
+           (orphan (make-reorg-test-block mystery-prev orphan-hash 5)))
       (multiple-value-bind (activated error)
           (bitcoin-lisp.validation:activate-block
            orphan chain-state block-store utxo-set :skip-scripts t)

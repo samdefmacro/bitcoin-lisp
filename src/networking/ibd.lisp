@@ -57,6 +57,12 @@
   (pending-blocks (make-hash-table :test 'equalp) :type hash-table)  ; hash -> height
   (in-flight (make-hash-table :test 'equalp) :type hash-table)       ; hash -> (peer . timestamp)
   (block-queue (make-hash-table :test 'eql) :type hash-table)  ; height -> block, out-of-order
+  ;; Per-pending-hash timeout count. retry-timed-out-requests bumps the
+  ;; counter each time a request for this hash times out; after
+  ;; +max-block-request-timeouts+, the block is dropped from pending
+  ;; (it's likely a competing-fork block that peers won't serve).
+  ;; hash -> integer.
+  (request-timeouts (make-hash-table :test 'equalp) :type hash-table)
   ;; Configuration
   (max-in-flight 16 :type (unsigned-byte 8))
   (request-timeout 60 :type (unsigned-byte 16))  ; seconds
@@ -84,6 +90,15 @@
   "Window for the recent-rate metric in IBD Progress logs. 60s gives a
 useful real-time view of throughput swings (peer disconnects, stress
 regions) that the cumulative session-average smooths over.")
+
+(defparameter +max-block-request-timeouts+ 5
+  "Drop a block from the pending queue after this many request timeouts.
+Competing-fork-block headers get auto-queued by process-headers; most
+peers don't serve blocks on chains they don't follow, so requests time
+out indefinitely. After N timeouts we give up — if the fork later
+catches up, the activate-block path will request the block again on
+demand. Mirrors Bitcoin Core's MAX_HEADERS_RESULTS retry caps in
+net_processing.cpp.")
 
 (declaim (inline trim-samples-older-than))
 (defun trim-samples-older-than (samples cutoff-ticks)
@@ -480,7 +495,10 @@ in-flight entry so report-ibd-progress can surface p50/p95."
                                   internal-time-units-per-second)))
           (push (list now (peer-address peer) latency-ms)
                 (ibd-context-delivery-samples *ibd-context*)))))
-    (remhash hash (ibd-context-in-flight *ibd-context*))))
+    (remhash hash (ibd-context-in-flight *ibd-context*))
+    ;; Clear the per-hash timeout counter so a future re-request of
+    ;; this hash (e.g. on a reorg) starts with a fresh budget.
+    (remhash hash (ibd-context-request-timeouts *ibd-context*))))
 
 (defun compute-block-download-timeout (num-downloading-peers)
   "Compute block download timeout in seconds based on number of peers.
@@ -521,18 +539,37 @@ a genuinely dead peer is still cleared in 2 minutes.
 
 (defun retry-timed-out-requests (&optional peers)
   "Remove timed out requests from in-flight so they can be retried.
-When PEERS is provided, tracks per-peer timeouts and disconnects slow peers."
+When PEERS is provided, tracks per-peer timeouts and disconnects slow
+peers. After a block has timed out +MAX-BLOCK-REQUEST-TIMEOUTS+ times
+it's also dropped from PENDING — competing-fork blocks that peers
+won't serve would otherwise loop forever, blocking IBD termination."
   (let ((timed-out (get-timed-out-requests))
-        (peers-to-disconnect '()))
+        (peers-to-disconnect '())
+        (dropped 0))
     (dolist (hash timed-out)
       (let* ((peer-time (gethash hash (ibd-context-in-flight *ibd-context*)))
-             (peer (car peer-time)))
+             (peer (car peer-time))
+             (timeouts (gethash hash (ibd-context-request-timeouts *ibd-context*) 0)))
         ;; Track timeout for this peer
         (when (and peer peers)
           (when (record-block-timeout peer)
             (pushnew peer peers-to-disconnect)))
-        ;; Remove from in-flight so it can be retried from a different peer
-        (remhash hash (ibd-context-in-flight *ibd-context*))))
+        ;; Bump the per-hash timeout count.
+        (setf (gethash hash (ibd-context-request-timeouts *ibd-context*))
+              (1+ timeouts))
+        ;; Remove from in-flight so it can be retried from a different peer.
+        (remhash hash (ibd-context-in-flight *ibd-context*))
+        ;; After repeated timeouts, drop from pending entirely. Peers
+        ;; aren't serving this block — likely a side-chain header that
+        ;; got auto-queued by process-headers. activate-block will
+        ;; re-request on demand if a future block makes this fork win.
+        (when (>= (1+ timeouts) +max-block-request-timeouts+)
+          (remhash hash (ibd-context-pending-blocks *ibd-context*))
+          (remhash hash (ibd-context-request-timeouts *ibd-context*))
+          (incf dropped))))
+    (when (plusp dropped)
+      (bitcoin-lisp:log-debug "Dropped ~D pending blocks after ~D timeouts each"
+                              dropped +max-block-request-timeouts+))
     ;; Disconnect peers that hit the timeout limit (only if still connected)
     (dolist (peer peers-to-disconnect)
       (when (eq (peer-state peer) :ready)
@@ -838,7 +875,15 @@ Returns the number of blocks downloaded."
           (report-interval (* 10 internal-time-units-per-second))  ; Every 10 seconds
           (no-peer-cycles 0))
 
-      (loop while (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
+      ;; Loop until either (a) the pending queue is empty, or (b) we've
+      ;; reached the header tip — in which case any remaining pending
+      ;; entries are competing-fork blocks that don't move the active
+      ;; chain forward. Without the header-tip exit, fork-block headers
+      ;; auto-queued by process-headers can pin the loop forever (peers
+      ;; don't typically serve side-chain blocks).
+      (loop while (and (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
+                       (< (bitcoin-lisp.storage:current-height chain-state)
+                          (ibd-context-header-tip-height ctx)))
             do (progn
                  ;; Stuck-tip backstop: if connect-tip hasn't advanced for
                  ;; +stuck-tip-halt-seconds+ AND blocks are queued, halt
@@ -961,12 +1006,16 @@ Returns the number of blocks downloaded."
                      (report-ibd-progress chain-state)
                      (setf last-report-time now))))))
 
-    ;; Done — but distinguish "actually finished" from "paused due to no peers".
-    ;; If pending is empty AND nothing in-flight, we drained the queue. Otherwise
-    ;; we paused; the caller (sync-blockchain) will reconnect and resume.
-    (let ((pending (hash-table-count (ibd-context-pending-blocks ctx)))
-          (in-flight (hash-table-count (ibd-context-in-flight ctx))))
-      (if (and (zerop pending) (zerop in-flight))
+    ;; Done — distinguish "actually finished" from "paused due to no peers".
+    ;; Either: pending+in-flight both zero (we drained), OR
+    ;; current-height ≥ header-tip-height (we caught up; any leftover
+    ;; pending is fork-blocks waiting for a real reorg trigger).
+    (let* ((pending (hash-table-count (ibd-context-pending-blocks ctx)))
+           (in-flight (hash-table-count (ibd-context-in-flight ctx)))
+           (at-tip (>= (bitcoin-lisp.storage:current-height chain-state)
+                       (ibd-context-header-tip-height ctx))))
+      (if (or (and (zerop pending) (zerop in-flight))
+              at-tip)
           (set-ibd-state :synced)
           (set-ibd-state :idle)))
     (ibd-context-blocks-received ctx)))
