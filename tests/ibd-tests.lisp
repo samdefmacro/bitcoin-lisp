@@ -212,6 +212,56 @@
       (is (= 1 (hash-table-count (bitcoin-lisp.networking::ibd-context-pending-blocks
                                   bitcoin-lisp.networking::*ibd-context*)))))))
 
+(test retry-timed-out-requests-drops-after-N-attempts
+  "After +max-block-request-timeouts+ retries, a block is dropped from
+the pending queue. Without this, competing-fork blocks that peers
+won't serve would keep IBD's main loop spinning forever."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
+    (setf (bitcoin-lisp.networking::ibd-context-request-timeout
+           bitcoin-lisp.networking::*ibd-context*) 1)
+    (setf (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
+                         bitcoin-lisp.networking::*ibd-context*)) 100)
+    ;; Simulate N timeouts. Each iteration: put the request back
+    ;; in-flight with an old timestamp, then retry — retry-timed-out-
+    ;; requests removes it from in-flight and bumps the counter.
+    (let ((old-time (- (get-internal-real-time)
+                       (* 2 internal-time-units-per-second))))
+      (loop repeat (1- bitcoin-lisp.networking::+max-block-request-timeouts+)
+            do (setf (gethash hash (bitcoin-lisp.networking::ibd-context-in-flight
+                                     bitcoin-lisp.networking::*ibd-context*))
+                     (cons :peer old-time))
+               (bitcoin-lisp.networking::retry-timed-out-requests)))
+    ;; After N-1 timeouts, still in pending.
+    (is (= 1 (hash-table-count
+              (bitcoin-lisp.networking::ibd-context-pending-blocks
+               bitcoin-lisp.networking::*ibd-context*))))
+    ;; One more timeout should drop it from pending.
+    (let ((old-time (- (get-internal-real-time)
+                       (* 2 internal-time-units-per-second))))
+      (setf (gethash hash (bitcoin-lisp.networking::ibd-context-in-flight
+                           bitcoin-lisp.networking::*ibd-context*))
+            (cons :peer old-time)))
+    (bitcoin-lisp.networking::retry-timed-out-requests)
+    (is (= 0 (hash-table-count
+              (bitcoin-lisp.networking::ibd-context-pending-blocks
+               bitcoin-lisp.networking::*ibd-context*))))))
+
+(test mark-block-received-clears-timeout-counter
+  "A successful receive clears the per-hash timeout counter so a future
+re-request (e.g. after a reorg) starts fresh."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    ;; Plant a non-zero counter directly.
+    (setf (gethash hash (bitcoin-lisp.networking::ibd-context-request-timeouts
+                         bitcoin-lisp.networking::*ibd-context*)) 3)
+    (setf (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
+                         bitcoin-lisp.networking::*ibd-context*)) 100)
+    (bitcoin-lisp.networking::mark-block-received hash)
+    (is (= 0 (hash-table-count
+              (bitcoin-lisp.networking::ibd-context-request-timeouts
+               bitcoin-lisp.networking::*ibd-context*))))))
+
 ;;;; Progress Reporting Tests
 
 (test ibd-progress-reporting
