@@ -300,6 +300,33 @@ witness-capability gating (we always want full blocks)."
                        collected)))))
           (nreverse collected))))))
 
+(defun queue-missing-fork-blocks (missing-blocks)
+  "MISSING-BLOCKS is a list of (hash . height) cons cells, returned by
+perform-reorg when it refused due to blocks missing from the store.
+Add each to the pending queue and reset its timeout counter so the
+existing download scheduler asks peers for them again. Without this,
+perform-reorg refuses on the same missing block forever — the
+deferred-reorg loop bug (project_per_peer_block_tracking.md)."
+  (unless (and *ibd-context* missing-blocks)
+    (return-from queue-missing-fork-blocks 0))
+  (let ((pending (ibd-context-pending-blocks *ibd-context*))
+        (in-flight (ibd-context-in-flight *ibd-context*))
+        (timeouts (ibd-context-request-timeouts *ibd-context*))
+        (queued 0))
+    (dolist (cell missing-blocks)
+      (let ((hash (car cell)) (height (cdr cell)))
+        ;; Only queue if not already pending or in-flight.
+        (unless (or (gethash hash pending) (gethash hash in-flight))
+          (setf (gethash hash pending) height)
+          ;; Reset timeout counter so retry-timed-out-requests gives
+          ;; this hash a fresh +max-block-request-timeouts+ budget.
+          (remhash hash timeouts)
+          (incf queued))))
+    (when (plusp queued)
+      (bitcoin-lisp:log-warn "Re-queued ~D missing fork blocks for download"
+                             queued))
+    queued))
+
 (defun handle-validation-failure (block height error chain-state)
   "Handle a block-validation failure during IBD.
 
@@ -1412,7 +1439,7 @@ After connecting, drains the queue of any children that can now be connected."
           ;; checkpoint (matches Bitcoin Core IBD behavior).
           (let ((current-time (bitcoin-lisp.serialization:get-unix-time))
                 (skip-scripts (<= height (last-checkpoint-height))))
-            (multiple-value-bind (activated error)
+            (multiple-value-bind (activated error missing-blocks)
                 (bitcoin-lisp.validation:activate-block
                  block chain-state block-store utxo-set
                  :current-time current-time
@@ -1430,6 +1457,18 @@ After connecting, drains the queue of any children that can now be connected."
                 ;; :weaker-chain isn't an error — block stored, no
                 ;; activation needed.
                 ((eq error :weaker-chain)
+                 nil)
+                ;; :reorg-refused — the new block sits on a stronger
+                ;; fork but we don't have the intermediate fork blocks.
+                ;; Re-queue the missing ones for download (with timeout
+                ;; counters reset) and DON'T re-queue the incoming
+                ;; block — otherwise we'd retry the same unprocessable
+                ;; tip forever. When the fork blocks finally arrive
+                ;; through normal download, the next tip announcement
+                ;; will trigger another reorg attempt, this time with
+                ;; everything in store.
+                ((eq error :reorg-refused)
+                 (queue-missing-fork-blocks missing-blocks)
                  nil)
                 (t
                  (bitcoin-lisp:log-error "Block ~D validation failed: ~A"
@@ -1489,7 +1528,7 @@ Repeats until no more queued blocks can be connected."
         ;; incoming block's parent vs. our current tip.
         (let* ((current-time (bitcoin-lisp.serialization:get-unix-time))
                (skip-scripts (<= next-height checkpoint-height)))
-          (multiple-value-bind (activated error)
+          (multiple-value-bind (activated error missing-blocks)
               (bitcoin-lisp.validation:activate-block
                block chain-state block-store utxo-set
                :current-time current-time
@@ -1505,6 +1544,11 @@ Repeats until no more queued blocks can be connected."
                ;; Stored but not active — nothing to drain further on
                ;; this height. Continue trying queued blocks.
                nil)
+              ((eq error :reorg-refused)
+               ;; Re-queue missing fork blocks; don't tight-loop on
+               ;; this queued block.
+               (queue-missing-fork-blocks missing-blocks)
+               (return drained))
               (t
                (bitcoin-lisp:log-error "Queued block ~D validation failed: ~A"
                                        next-height error)

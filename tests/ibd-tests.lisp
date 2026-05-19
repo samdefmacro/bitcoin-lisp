@@ -428,6 +428,36 @@ with our chain, walk from fork-point to peer's tip collecting blocks."
         (is (equalp b3-hash (car (third results))))
         (is (= 3 (cdr (third results))))))))
 
+(test queue-missing-fork-blocks-adds-with-reset-timeout
+  "queue-missing-fork-blocks adds each hash to pending and clears its
+timeout counter so the existing scheduler retries with a fresh budget."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+        (h1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+        (h2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+    ;; Plant a stale timeout count for h1 to ensure it gets reset.
+    (setf (gethash h1 (bitcoin-lisp.networking::ibd-context-request-timeouts
+                       bitcoin-lisp.networking::*ibd-context*)) 7)
+    (let ((queued (bitcoin-lisp.networking::queue-missing-fork-blocks
+                   (list (cons h1 100) (cons h2 101)))))
+      (is (= 2 queued))
+      (is (= 2 (hash-table-count
+                (bitcoin-lisp.networking::ibd-context-pending-blocks
+                 bitcoin-lisp.networking::*ibd-context*))))
+      ;; Timeout counter for h1 was reset.
+      (is (= 0 (hash-table-count
+                (bitcoin-lisp.networking::ibd-context-request-timeouts
+                 bitcoin-lisp.networking::*ibd-context*)))))))
+
+(test queue-missing-fork-blocks-skips-already-queued
+  "If a hash is already in pending or in-flight, queue-missing-fork-blocks
+doesn't add it again."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+        (h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (setf (gethash h (bitcoin-lisp.networking::ibd-context-pending-blocks
+                      bitcoin-lisp.networking::*ibd-context*)) 50)
+    (is (= 0 (bitcoin-lisp.networking::queue-missing-fork-blocks
+              (list (cons h 50)))))))
+
 (test find-next-blocks-nil-when-peer-has-nothing
   "Peer with NIL best-known returns NIL — we don't know what to ask for."
   (let* ((state (bitcoin-lisp.storage:make-chain-state))
