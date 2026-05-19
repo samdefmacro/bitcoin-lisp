@@ -786,57 +786,14 @@ won't serve would otherwise loop forever, blocking IBD termination."
                (ibd-context-in-flight *ibd-context*)))
     count))
 
-(defun request-blocks-per-peer (peers chain-state block-store)
-  "Per-peer block scheduler — for each peer, ask only for blocks IT has
-on its chain (via find-next-blocks-to-download). Returns the number of
-new in-flight requests issued.
-
-Mirrors the per-peer loop inside Bitcoin Core's SendMessages
-(net_processing.cpp ~6170) where FindNextBlocksToDownload is called
-PER peer with their own budget."
-  (unless (and *ibd-context* peers block-store)
-    (return-from request-blocks-per-peer 0))
-  (let ((max-per-peer (ibd-context-max-in-flight *ibd-context*))
-        (requests-made 0)
-        (ready-peers (remove-if-not (lambda (p) (eq (peer-state p) :ready))
-                                    peers)))
-    (dolist (peer ready-peers)
-      (let* ((in-flight-count (count-peer-in-flight peer))
-             (budget (max 0 (- max-per-peer in-flight-count))))
-        (when (plusp budget)
-          (let ((to-request (find-next-blocks-to-download
-                             peer budget chain-state block-store)))
-            (when to-request
-              (let ((hashes '()))
-                (dolist (cell to-request)
-                  (let ((hash (car cell)) (height (cdr cell)))
-                    (setf (gethash hash (ibd-context-pending-blocks *ibd-context*))
-                          height)
-                    (mark-block-in-flight hash peer)
-                    (push hash hashes)))
-                (let ((inv-vectors (mapcar (lambda (h)
-                                              (bitcoin-lisp.serialization:make-inv-vector
-                                               :type bitcoin-lisp.serialization:+inv-type-witness-block+
-                                               :hash h))
-                                            (nreverse hashes))))
-                  (send-message peer
-                                (bitcoin-lisp.serialization:make-getdata-message inv-vectors)))
-                (incf requests-made (length to-request))))))))
-    requests-made))
-
-(defun request-blocks-from-peers (peers chain-state &optional block-store)
+(defun request-blocks-from-peers (peers chain-state)
   "Request blocks from multiple peers, distributing the load.
 Enforces per-peer in-flight limits (like Bitcoin Core's
 MAX_BLOCKS_IN_TRANSIT_PER_PEER) rather than a single global limit.
 
 Applies backpressure: when the out-of-order block-queue is at capacity,
 new requests are paused so peers do not deliver blocks we'd just drop +
-re-request, which causes duplicate-delivery thrash and wasted bandwidth.
-
-When BLOCK-STORE is provided, tries the per-peer scheduler first
-(request-blocks-per-peer) which only asks peers for blocks on their
-chain. Falls back to the global pending-queue scheduler if per-peer
-yielded nothing (e.g. peers haven't announced enough chain yet)."
+re-request, which causes duplicate-delivery thrash and wasted bandwidth."
   (unless (and *ibd-context* peers)
     (return-from request-blocks-from-peers 0))
 
@@ -846,14 +803,6 @@ yielded nothing (e.g. peers haven't announced enough chain yet)."
   (let ((retried (retry-timed-out-requests peers)))
     (when (> retried 0)
       (bitcoin-lisp:log-warn "Retrying ~D timed out block requests" retried)))
-
-  ;; Per-peer scheduler first (the Bitcoin Core design).
-  (when block-store
-    (let ((per-peer-made (request-blocks-per-peer peers chain-state block-store)))
-      (when (plusp per-peer-made)
-        ;; If per-peer scheduling already filled some budget, we're done
-        ;; this tick. Avoid double-requesting via the global queue.
-        (return-from request-blocks-from-peers per-peer-made))))
 
   ;; Backpressure: cap NEW requests so block-queue + in-flight stays bounded.
   ;; When at cap and the next-needed block is missing, only allow ONE request
@@ -1136,7 +1085,7 @@ Returns the number of blocks downloaded."
                  ;; Request more blocks if needed
                  (when peers
                    (setf no-peer-cycles 0)
-                   (request-blocks-from-peers peers chain-state block-store))
+                   (request-blocks-from-peers peers chain-state))
 
                  ;; Receive and process messages from all peers. Drain up to
                  ;; +max-messages-per-peer-per-cycle+ messages per peer per
