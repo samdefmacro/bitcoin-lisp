@@ -123,6 +123,210 @@ cells and `delivery-samples` (time peer-address latency-ms) lists."
           (ibd-context-last-tip-height *ibd-context*)
           (bitcoin-lisp.storage:current-height chain-state))))
 
+;;;; Per-peer block-availability tracking
+;;;;
+;;;; Mirrors Bitcoin Core's ProcessBlockAvailability / UpdateBlockAvailability
+;;;; (net_processing.cpp:1361-1392). The key invariant: a peer's
+;;;; best-known-block-hash points to a block-index-entry whose chain
+;;;; ancestor relation determines which blocks we can ask THIS peer for.
+;;;;
+;;;; Hook points:
+;;;;   - inv "block": update with the announced hash.
+;;;;   - headers: update with the last header in the batch (peer's tip).
+;;;;   - block: update with the block's hash (proof peer had it).
+;;;;
+;;;; The hash-last-unknown-block slot stages a hash we received in inv
+;;;; before we had a chain-state entry for it. Once the corresponding
+;;;; header arrives, the next process-block-availability call resolves
+;;;; it to a proper best-known-block.
+
+(defun better-or-equal-work-p (a b)
+  "T if entry A is at least as good as entry B (in chain-work terms).
+B may be NIL, in which case A is trivially better — A is a known
+entry, B is the absence of one. A NIL → NIL (caller shouldn't update
+to nothing). Matches Bitcoin Core's `state->pindexBestKnownBlock ==
+nullptr || pindex->nChainWork >= state->pindexBestKnownBlock->nChainWork`
+shape in net_processing.cpp:1368."
+  (when a
+    (or (null b)
+        (>= (bitcoin-lisp.storage:block-index-entry-chain-work a)
+            (bitcoin-lisp.storage:block-index-entry-chain-work b)))))
+
+(defun process-block-availability (peer chain-state)
+  "Resolve PEER's hash-last-unknown-block to a chain-state entry if we
+now have one for it. Promotes to best-known-block-hash when the staged
+hash has at least as much chain-work as the current best-known."
+  (let ((staged (peer-hash-last-unknown-block peer)))
+    (when staged
+      (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state staged)))
+        (when (and entry
+                   (plusp (bitcoin-lisp.storage:block-index-entry-chain-work entry)))
+          (let ((current (and (peer-best-known-block-hash peer)
+                              (bitcoin-lisp.storage:get-block-index-entry
+                               chain-state (peer-best-known-block-hash peer)))))
+            (when (better-or-equal-work-p entry current)
+              (setf (peer-best-known-block-hash peer) staged)))
+          (setf (peer-hash-last-unknown-block peer) nil))))))
+
+(defun update-block-availability (peer chain-state hash)
+  "PEER announced (via inv / headers / block) that it has HASH. Update
+its best-known-block-hash if HASH is in our index AND has at least as
+much work as the current best-known; otherwise stage HASH for later
+resolution (the header may arrive in a subsequent message)."
+  (process-block-availability peer chain-state)
+  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+    (cond
+      ((and entry
+            (plusp (bitcoin-lisp.storage:block-index-entry-chain-work entry)))
+       (let ((current (and (peer-best-known-block-hash peer)
+                           (bitcoin-lisp.storage:get-block-index-entry
+                            chain-state (peer-best-known-block-hash peer)))))
+         (when (better-or-equal-work-p entry current)
+           (setf (peer-best-known-block-hash peer) hash))))
+      (t
+       ;; Unknown block — assume the latest one is best until we learn
+       ;; otherwise. Mirrors Core's hashLastUnknownBlock fallback
+       ;; (net_processing.cpp:1390).
+       (setf (peer-hash-last-unknown-block peer) hash)))))
+
+;;;; Per-peer block download scheduler
+;;;;
+;;;; Mirrors Bitcoin Core's FindNextBlocksToDownload (net_processing.cpp:1395).
+;;;; For each peer, walk from last-common-block toward best-known-block,
+;;;; collecting blocks we don't have. The key invariant: we only ever
+;;;; ask THIS peer for blocks it has on its chain. A fork-block won't be
+;;;; requested from a peer that doesn't follow that fork, so the
+;;;; previous timeout-and-drop loop can't happen.
+
+(defun walk-chain-forward-by-count (from-entry to-entry max-count)
+  "Return a list of block-index-entries from FROM-ENTRY (EXCLUSIVE)
+toward TO-ENTRY (inclusive), walking via prev-entry links and reversing.
+At most MAX-COUNT entries returned; on overflow, returns the entries
+closest to FROM-ENTRY (i.e., earliest heights) so we make forward
+progress per call."
+  (let ((entries '())
+        (cursor to-entry)
+        (from-hash (bitcoin-lisp.storage:block-index-entry-hash from-entry)))
+    (loop while (and cursor
+                     (not (equalp (bitcoin-lisp.storage:block-index-entry-hash cursor)
+                                  from-hash)))
+          do (push cursor entries)
+             (setf cursor (bitcoin-lisp.storage:block-index-entry-prev-entry cursor)))
+    ;; entries is already from-first → to-last after the push loop.
+    (if (<= (length entries) max-count)
+        entries
+        (subseq entries 0 max-count))))
+
+(defun find-next-blocks-to-download (peer count chain-state block-store)
+  "Find up to COUNT block hashes that PEER has but we don't, walking
+peer's chain from last-common-block toward best-known-block. Returns
+a list of cons (hash . height), height ascending.
+
+Mirrors Bitcoin Core's FindNextBlocksToDownload (net_processing.cpp:1395)
+in shape. Simplified: no node-staller tracking, no AssumeUtxo, no
+witness-capability gating (we always want full blocks)."
+  (when (or (zerop count) (null (peer-best-known-block-hash peer)))
+    (return-from find-next-blocks-to-download nil))
+
+  (process-block-availability peer chain-state)
+
+  (let* ((best-known (bitcoin-lisp.storage:get-block-index-entry
+                      chain-state (peer-best-known-block-hash peer)))
+         (our-tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (our-tip (and our-tip-hash
+                       (bitcoin-lisp.storage:get-block-index-entry
+                        chain-state our-tip-hash)))
+         (our-tip-work (and our-tip
+                            (bitcoin-lisp.storage:block-index-entry-chain-work
+                             our-tip))))
+    (when (or (null best-known)
+              (and our-tip-work
+                   (< (bitcoin-lisp.storage:block-index-entry-chain-work best-known)
+                      our-tip-work)))
+      ;; Peer has nothing better than our tip.
+      (return-from find-next-blocks-to-download nil))
+
+    ;; Update peer's last-common-block: keep the strongest known common
+    ;; ancestor. New fork-point is our tip ∩ peer's best-known.
+    (let* ((fork-entry (bitcoin-lisp.validation:find-fork-point best-known our-tip))
+           (current-common (and (peer-last-common-block-hash peer)
+                                (bitcoin-lisp.storage:get-block-index-entry
+                                 chain-state (peer-last-common-block-hash peer)))))
+      (when (or (null current-common)
+                (and fork-entry
+                     (> (bitcoin-lisp.storage:block-index-entry-chain-work fork-entry)
+                        (bitcoin-lisp.storage:block-index-entry-chain-work current-common))))
+        (when fork-entry
+          (setf (peer-last-common-block-hash peer)
+                (bitcoin-lisp.storage:block-index-entry-hash fork-entry))))
+
+      (let ((last-common (and (peer-last-common-block-hash peer)
+                              (bitcoin-lisp.storage:get-block-index-entry
+                               chain-state (peer-last-common-block-hash peer)))))
+        (when (or (null last-common)
+                  (equalp (bitcoin-lisp.storage:block-index-entry-hash last-common)
+                          (bitcoin-lisp.storage:block-index-entry-hash best-known)))
+          ;; Peer has nothing new (or we can't even find the fork point).
+          (return-from find-next-blocks-to-download nil))
+
+        ;; Walk forward, collect downloadable blocks within the window.
+        (let* ((walked (walk-chain-forward-by-count
+                        last-common best-known
+                        (+ count +max-block-queue-size+)))
+               (in-flight (and *ibd-context*
+                               (ibd-context-in-flight *ibd-context*)))
+               (window-end (+ (bitcoin-lisp.storage:block-index-entry-height
+                                last-common)
+                              +max-block-queue-size+))
+               (collected '()))
+          (dolist (entry walked)
+            (when (>= (length collected) count)
+              (return))
+            (when (> (bitcoin-lisp.storage:block-index-entry-height entry)
+                     window-end)
+              (return))
+            (let ((hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+              (cond
+                ;; Block already in store — advance last-common.
+                ((bitcoin-lisp.storage:get-block block-store hash)
+                 (setf (peer-last-common-block-hash peer) hash))
+                ;; In-flight from some peer — skip.
+                ((and in-flight (gethash hash in-flight))
+                 nil)
+                ;; We need this block.
+                (t
+                 (push (cons hash
+                             (bitcoin-lisp.storage:block-index-entry-height entry))
+                       collected)))))
+          (nreverse collected))))))
+
+(defun queue-missing-fork-blocks (missing-blocks)
+  "MISSING-BLOCKS is a list of (hash . height) cons cells, returned by
+perform-reorg when it refused due to blocks missing from the store.
+Add each to the pending queue and reset its timeout counter so the
+existing download scheduler asks peers for them again. Without this,
+perform-reorg refuses on the same missing block forever — the
+deferred-reorg loop bug (project_per_peer_block_tracking.md)."
+  (unless (and *ibd-context* missing-blocks)
+    (return-from queue-missing-fork-blocks 0))
+  (let ((pending (ibd-context-pending-blocks *ibd-context*))
+        (in-flight (ibd-context-in-flight *ibd-context*))
+        (timeouts (ibd-context-request-timeouts *ibd-context*))
+        (queued 0))
+    (dolist (cell missing-blocks)
+      (let ((hash (car cell)) (height (cdr cell)))
+        ;; Only queue if not already pending or in-flight.
+        (unless (or (gethash hash pending) (gethash hash in-flight))
+          (setf (gethash hash pending) height)
+          ;; Reset timeout counter so retry-timed-out-requests gives
+          ;; this hash a fresh +max-block-request-timeouts+ budget.
+          (remhash hash timeouts)
+          (incf queued))))
+    (when (plusp queued)
+      (bitcoin-lisp:log-warn "Re-queued ~D missing fork blocks for download"
+                             queued))
+    queued))
+
 (defun handle-validation-failure (block height error chain-state)
   "Handle a block-validation failure during IBD.
 
@@ -963,6 +1167,9 @@ Returns the number of blocks downloaded."
                                                                        :if-exists :supersede
                                                                        :element-type '(unsigned-byte 8))
                                                  (write-sequence payload s))))))
+                                       ;; Per-peer availability: receiving a block
+                                       ;; proves peer had it.
+                                       (update-block-availability peer chain-state hash)
                                        (mark-block-received hash)
                                        (record-block-received-from-peer peer)
                                        (process-received-block block chain-state utxo-set block-store
@@ -972,7 +1179,14 @@ Returns the number of blocks downloaded."
                                     ((string= command "headers")
                                      (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
                                        (process-headers headers chain-state)
-                                       (incf (ibd-context-headers-received ctx) (length headers))))
+                                       (incf (ibd-context-headers-received ctx) (length headers))
+                                       ;; Per-peer availability: peer's tip is
+                                       ;; the last header in the batch.
+                                       (let ((last (car (last headers))))
+                                         (when last
+                                           (update-block-availability
+                                            peer chain-state
+                                            (bitcoin-lisp.serialization:block-header-hash last))))))
 
                                     (t (handle-message peer command payload
                                                        chain-state utxo-set block-store
@@ -1121,6 +1335,14 @@ Used during IBD when the validated block tip lags behind the header tip."
                                          (when (< (length headers) 2000)
                                            (setf done t))
 
+                                         ;; Per-peer availability: peer's tip is
+                                         ;; the last header in this batch.
+                                         (let ((last (car (last valid-headers))))
+                                           (when last
+                                             (update-block-availability
+                                              peer chain-state
+                                              (bitcoin-lisp.serialization:block-header-hash last))))
+
                                          (when (> added 0)
                                            (bitcoin-lisp:log-info "Received ~D headers, ~D new, total ~D"
                                                                   (length headers) added received-count)))))
@@ -1217,7 +1439,7 @@ After connecting, drains the queue of any children that can now be connected."
           ;; checkpoint (matches Bitcoin Core IBD behavior).
           (let ((current-time (bitcoin-lisp.serialization:get-unix-time))
                 (skip-scripts (<= height (last-checkpoint-height))))
-            (multiple-value-bind (activated error)
+            (multiple-value-bind (activated error missing-blocks)
                 (bitcoin-lisp.validation:activate-block
                  block chain-state block-store utxo-set
                  :current-time current-time
@@ -1235,6 +1457,18 @@ After connecting, drains the queue of any children that can now be connected."
                 ;; :weaker-chain isn't an error — block stored, no
                 ;; activation needed.
                 ((eq error :weaker-chain)
+                 nil)
+                ;; :reorg-refused — the new block sits on a stronger
+                ;; fork but we don't have the intermediate fork blocks.
+                ;; Re-queue the missing ones for download (with timeout
+                ;; counters reset) and DON'T re-queue the incoming
+                ;; block — otherwise we'd retry the same unprocessable
+                ;; tip forever. When the fork blocks finally arrive
+                ;; through normal download, the next tip announcement
+                ;; will trigger another reorg attempt, this time with
+                ;; everything in store.
+                ((eq error :reorg-refused)
+                 (queue-missing-fork-blocks missing-blocks)
                  nil)
                 (t
                  (bitcoin-lisp:log-error "Block ~D validation failed: ~A"
@@ -1294,7 +1528,7 @@ Repeats until no more queued blocks can be connected."
         ;; incoming block's parent vs. our current tip.
         (let* ((current-time (bitcoin-lisp.serialization:get-unix-time))
                (skip-scripts (<= next-height checkpoint-height)))
-          (multiple-value-bind (activated error)
+          (multiple-value-bind (activated error missing-blocks)
               (bitcoin-lisp.validation:activate-block
                block chain-state block-store utxo-set
                :current-time current-time
@@ -1310,6 +1544,11 @@ Repeats until no more queued blocks can be connected."
                ;; Stored but not active — nothing to drain further on
                ;; this height. Continue trying queued blocks.
                nil)
+              ((eq error :reorg-refused)
+               ;; Re-queue missing fork blocks; don't tight-loop on
+               ;; this queued block.
+               (queue-missing-fork-blocks missing-blocks)
+               (return drained))
               (t
                (bitcoin-lisp:log-error "Queued block ~D validation failed: ~A"
                                        next-height error)

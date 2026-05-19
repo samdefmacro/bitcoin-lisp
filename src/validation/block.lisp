@@ -1306,16 +1306,22 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
         ;; Precondition: every block on BOTH sides must be in the
         ;; block-store. If anything is missing, refuse the reorg without
         ;; mutating any state — better to defer than to leave the chain
-        ;; half-disconnected and corrupt. activate-block's caller will
-        ;; see :reorg-refused and the missing block can be requested.
-        (dolist (entry (append to-disconnect to-connect))
-          (let ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
-            (unless (bitcoin-lisp.storage:get-block block-store block-hash)
-              (bitcoin-lisp:log-warn
-               "REORG REFUSED: block ~A (height ~D) missing from store"
-               (bitcoin-lisp.crypto:bytes-to-hex block-hash)
-               (bitcoin-lisp.storage:block-index-entry-height entry))
-              (return-from perform-reorg nil))))
+        ;; half-disconnected and corrupt. Return the missing list so
+        ;; activate-block's caller can re-queue those blocks for
+        ;; download instead of looping forever on the unprocessable
+        ;; incoming tip.
+        (let ((missing '()))
+          (dolist (entry (append to-disconnect to-connect))
+            (let ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+              (unless (bitcoin-lisp.storage:get-block block-store block-hash)
+                (push (cons block-hash
+                            (bitcoin-lisp.storage:block-index-entry-height entry))
+                      missing))))
+          (when missing
+            (bitcoin-lisp:log-warn
+             "REORG REFUSED: ~D blocks missing from store (first: height ~D)"
+             (length missing) (cdr (first missing)))
+            (return-from perform-reorg (values nil missing))))
 
         (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
                                old-height fork-height new-height)
@@ -1451,18 +1457,23 @@ Returns (VALUES T NIL) on activation,
            ((and new-chain-work
                  current-best-work
                  (> new-chain-work current-best-work))
-            (let ((reorg-ok (perform-reorg chain-state block-store utxo-set
-                                           current-best-entry prev-entry
-                                           :tx-index tx-index
-                                           :fee-estimator fee-estimator
-                                           :recent-rejects recent-rejects)))
+            (multiple-value-bind (reorg-ok missing-blocks)
+                (perform-reorg chain-state block-store utxo-set
+                               current-best-entry prev-entry
+                               :tx-index tx-index
+                               :fee-estimator fee-estimator
+                               :recent-rejects recent-rejects)
               (cond
                 ((null reorg-ok)
                  ;; Reorg refused (missing fork blocks, fork below pruned
                  ;; height, no common ancestor, ...). chain-state and
                  ;; utxo-set are unchanged — perform-reorg either
-                 ;; succeeds fully or no-ops.
-                 (values nil :reorg-refused))
+                 ;; succeeds fully or no-ops. Pass MISSING-BLOCKS up so
+                 ;; the caller (process-received-block) can re-queue
+                 ;; them for download. Without this, perform-reorg
+                 ;; refuses on the same missing block forever and the
+                 ;; incoming tip is retried indefinitely.
+                 (values nil :reorg-refused missing-blocks))
                 (t
                  (let ((new-height (1+ (bitcoin-lisp.storage:current-height
                                         chain-state))))
