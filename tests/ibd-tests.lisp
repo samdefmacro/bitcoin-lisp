@@ -340,6 +340,101 @@ sending us an old announcement; we keep the strongest claim)."
     (is (equalp strong-hash
                 (bitcoin-lisp.networking::peer-best-known-block-hash peer)))))
 
+;;;; find-next-blocks-to-download
+;;;;
+;;;; Per-peer download walker. Tests cover the key dispatch paths:
+;;;; peer has nothing better than our tip (skip), peer is on a stronger
+;;;; chain (walk + collect missing), already-in-store blocks advance
+;;;; last-common-block.
+
+(defun %make-test-chain-entries (chain-state hashes &key prev-entry start-work)
+  "Build N block-index-entries chained via prev-entry, increasing height
+by 1 and chain-work by 100. Return the tip entry."
+  (let ((prev prev-entry)
+        (work (or start-work 0))
+        (height (if prev-entry
+                    (bitcoin-lisp.storage:block-index-entry-height prev-entry)
+                    -1)))
+    (dolist (hash hashes)
+      (incf height)
+      (incf work 100)
+      (let ((entry (bitcoin-lisp.storage:make-block-index-entry
+                    :hash hash :height height :prev-entry prev
+                    :chain-work work :status :header-valid)))
+        (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
+        (setf prev entry)))
+    prev))
+
+(test find-next-blocks-skips-peer-with-weaker-chain
+  "If peer's best-known has less chain-work than our tip, return NIL."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (block-store (bitcoin-lisp.storage:init-block-store
+                       (ensure-directories-exist
+                        (merge-pathnames (format nil "ibd-find-test-~D/" (random 100000))
+                                         (uiop:temporary-directory)))))
+         (peer (%make-peer-with-state :ready))
+         (our-hashes (loop for i from 1 to 5
+                           collect (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                                          :initial-element 0)))
+                                     (setf (aref h 0) #xA0) (setf (aref h 1) i) h)))
+         (peer-hashes (loop for i from 1 to 3
+                            collect (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element 0)))
+                                      (setf (aref h 0) #xB0) (setf (aref h 1) i) h))))
+    (let ((our-tip (%make-test-chain-entries state our-hashes :start-work 0)))
+      (setf (bitcoin-lisp.storage::chain-state-best-block-hash state)
+            (bitcoin-lisp.storage:block-index-entry-hash our-tip)))
+    (%make-test-chain-entries state peer-hashes :start-work 0)
+    (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer)
+          (car (last peer-hashes)))
+    (is (null (bitcoin-lisp.networking::find-next-blocks-to-download
+               peer 10 state block-store)))))
+
+(test find-next-blocks-returns-fork-blocks-peer-knows
+  "When peer's best-known is on a stronger fork that shares an ancestor
+with our chain, walk from fork-point to peer's tip collecting blocks."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (block-store (bitcoin-lisp.storage:init-block-store
+                       (ensure-directories-exist
+                        (merge-pathnames (format nil "ibd-find-test-~D/" (random 100000))
+                                         (uiop:temporary-directory)))))
+         (peer (%make-peer-with-state :ready))
+         (genesis-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (genesis-entry
+           (bitcoin-lisp.storage:make-block-index-entry
+            :hash genesis-hash :height 0 :chain-work 1 :status :valid)))
+    (bitcoin-lisp.storage:add-block-index-entry state genesis-entry)
+    (setf (bitcoin-lisp.storage::chain-state-best-block-hash state) genesis-hash)
+    ;; Build a chain B1 → B2 → B3 (chain-work 101 → 201 → 301)
+    (let* ((b1-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (setf (aref h 0) #xB0) (setf (aref h 1) 1) h))
+           (b2-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (setf (aref h 0) #xB0) (setf (aref h 1) 2) h))
+           (b3-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (setf (aref h 0) #xB0) (setf (aref h 1) 3) h))
+           (peer-tip (%make-test-chain-entries state
+                                                (list b1-hash b2-hash b3-hash)
+                                                :prev-entry genesis-entry
+                                                :start-work 1)))
+      (declare (ignore peer-tip))
+      (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer) b3-hash)
+      ;; find-next-blocks-to-download walks from fork-point (genesis) → b3.
+      (let ((results (bitcoin-lisp.networking::find-next-blocks-to-download
+                      peer 10 state block-store)))
+        (is (= 3 (length results)))
+        ;; Ordered by height ascending: b1 first.
+        (is (equalp b1-hash (car (first results))))
+        (is (= 1 (cdr (first results))))
+        (is (equalp b3-hash (car (third results))))
+        (is (= 3 (cdr (third results))))))))
+
+(test find-next-blocks-nil-when-peer-has-nothing
+  "Peer with NIL best-known returns NIL — we don't know what to ask for."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready)))
+    (is (null (bitcoin-lisp.networking::find-next-blocks-to-download
+               peer 10 state nil)))))
+
 ;;;; Progress Reporting Tests
 
 (test ibd-progress-reporting
