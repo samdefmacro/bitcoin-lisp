@@ -220,6 +220,10 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
         (cond
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
+           ;; Per-peer availability: announcing a block hash counts as
+           ;; "peer has it" — update best-known-block (or stage
+           ;; hash-last-unknown if we don't have the header yet).
+           (bitcoin-lisp.networking::update-block-availability peer chain-state hash)
            (unless (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
              (setf unknown-block-hash hash)))
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
@@ -245,11 +249,12 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
 
 (defun handle-headers (peer payload chain-state)
   "Handle a headers message."
-  (declare (ignore peer))
-  (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
+  (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload))
+        (last-header-hash nil))
     (dolist (header headers)
       (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
              (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
+        (setf last-header-hash hash)
         ;; Check if we already have this header
         (unless (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
           ;; Check if we have the previous block
@@ -271,7 +276,13 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
                   :chain-work (bitcoin-lisp.storage:calculate-chain-work
                                (bitcoin-lisp.serialization:block-header-bits header)
                                prev-work)
-                  :status :header-valid))))))))))
+                  :status :header-valid))))))))
+    ;; Per-peer availability: the last header in the batch is the peer's
+    ;; advertised tip on this announcement. Mirrors Core's UpdateBlockAvailability
+    ;; called per-header in ProcessMessage (net_processing.cpp ~3500).
+    (when last-header-hash
+      (bitcoin-lisp.networking::update-block-availability
+       peer chain-state last-header-hash))))
 
 ;;; Block handling
 
