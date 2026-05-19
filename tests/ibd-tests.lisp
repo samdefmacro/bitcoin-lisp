@@ -262,6 +262,209 @@ re-request (e.g. after a reorg) starts fresh."
               (bitcoin-lisp.networking::ibd-context-request-timeouts
                bitcoin-lisp.networking::*ibd-context*))))))
 
+;;;; Per-peer block-availability tracking
+;;;;
+;;;; Mirrors Bitcoin Core's ProcessBlockAvailability / UpdateBlockAvailability
+;;;; (net_processing.cpp:1361-1392). These tests cover the state
+;;;; machine: known hash → best-known set; unknown hash → staged;
+;;;; staged hash resolves once index catches up.
+
+(defun %make-peer-with-state (state-key)
+  "Construct a minimal peer struct for availability tests, with the
+:state slot set so callers can pretend it's :ready."
+  (let ((p (bitcoin-lisp.networking::make-peer :address "test")))
+    (setf (bitcoin-lisp.networking::peer-state p) state-key)
+    p))
+
+(test update-block-availability-known-hash
+  "When the announced hash is already in the index with positive
+chain-work, peer's best-known-block-hash is set to it."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash hash :height 5 :chain-work 100 :status :header-valid))
+    (bitcoin-lisp.networking::update-block-availability peer state hash)
+    (is (equalp hash (bitcoin-lisp.networking::peer-best-known-block-hash peer)))
+    (is (null (bitcoin-lisp.networking::peer-hash-last-unknown-block peer)))))
+
+(test update-block-availability-unknown-hash-staged
+  "When the announced hash isn't in the index yet, it's staged in
+hash-last-unknown-block for later resolution."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (mystery-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC)))
+    (bitcoin-lisp.networking::update-block-availability peer state mystery-hash)
+    (is (null (bitcoin-lisp.networking::peer-best-known-block-hash peer)))
+    (is (equalp mystery-hash
+                (bitcoin-lisp.networking::peer-hash-last-unknown-block peer)))))
+
+(test process-block-availability-resolves-staged
+  "Once the staged hash gets a block-index entry, the next
+process-block-availability promotes it to best-known."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8)))
+    ;; Stage hash before the index has it.
+    (bitcoin-lisp.networking::update-block-availability peer state hash)
+    (is (equalp hash (bitcoin-lisp.networking::peer-hash-last-unknown-block peer)))
+    ;; Index catches up.
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash hash :height 10 :chain-work 200 :status :header-valid))
+    ;; Process resolves the staged hash.
+    (bitcoin-lisp.networking::process-block-availability peer state)
+    (is (equalp hash (bitcoin-lisp.networking::peer-best-known-block-hash peer)))
+    (is (null (bitcoin-lisp.networking::peer-hash-last-unknown-block peer)))))
+
+(test update-block-availability-does-not-downgrade
+  "If best-known is at chain-work N and we announce a block with
+chain-work < N, best-known stays put (this peer might be temporarily
+sending us an old announcement; we keep the strongest claim)."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (strong-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (weak-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash strong-hash :height 100 :chain-work 5000 :status :valid))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash weak-hash :height 50 :chain-work 1000 :status :header-valid))
+    (bitcoin-lisp.networking::update-block-availability peer state strong-hash)
+    (is (equalp strong-hash
+                (bitcoin-lisp.networking::peer-best-known-block-hash peer)))
+    (bitcoin-lisp.networking::update-block-availability peer state weak-hash)
+    ;; best-known should still be the strong one.
+    (is (equalp strong-hash
+                (bitcoin-lisp.networking::peer-best-known-block-hash peer)))))
+
+;;;; find-next-blocks-to-download
+;;;;
+;;;; Per-peer download walker. Tests cover the key dispatch paths:
+;;;; peer has nothing better than our tip (skip), peer is on a stronger
+;;;; chain (walk + collect missing), already-in-store blocks advance
+;;;; last-common-block.
+
+(defun %make-test-chain-entries (chain-state hashes &key prev-entry start-work)
+  "Build N block-index-entries chained via prev-entry, increasing height
+by 1 and chain-work by 100. Return the tip entry."
+  (let ((prev prev-entry)
+        (work (or start-work 0))
+        (height (if prev-entry
+                    (bitcoin-lisp.storage:block-index-entry-height prev-entry)
+                    -1)))
+    (dolist (hash hashes)
+      (incf height)
+      (incf work 100)
+      (let ((entry (bitcoin-lisp.storage:make-block-index-entry
+                    :hash hash :height height :prev-entry prev
+                    :chain-work work :status :header-valid)))
+        (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
+        (setf prev entry)))
+    prev))
+
+(test find-next-blocks-skips-peer-with-weaker-chain
+  "If peer's best-known has less chain-work than our tip, return NIL."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (block-store (bitcoin-lisp.storage:init-block-store
+                       (ensure-directories-exist
+                        (merge-pathnames (format nil "ibd-find-test-~D/" (random 100000))
+                                         (uiop:temporary-directory)))))
+         (peer (%make-peer-with-state :ready))
+         (our-hashes (loop for i from 1 to 5
+                           collect (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                                          :initial-element 0)))
+                                     (setf (aref h 0) #xA0) (setf (aref h 1) i) h)))
+         (peer-hashes (loop for i from 1 to 3
+                            collect (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element 0)))
+                                      (setf (aref h 0) #xB0) (setf (aref h 1) i) h))))
+    (let ((our-tip (%make-test-chain-entries state our-hashes :start-work 0)))
+      (setf (bitcoin-lisp.storage::chain-state-best-block-hash state)
+            (bitcoin-lisp.storage:block-index-entry-hash our-tip)))
+    (%make-test-chain-entries state peer-hashes :start-work 0)
+    (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer)
+          (car (last peer-hashes)))
+    (is (null (bitcoin-lisp.networking::find-next-blocks-to-download
+               peer 10 state block-store)))))
+
+(test find-next-blocks-returns-fork-blocks-peer-knows
+  "When peer's best-known is on a stronger fork that shares an ancestor
+with our chain, walk from fork-point to peer's tip collecting blocks."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (block-store (bitcoin-lisp.storage:init-block-store
+                       (ensure-directories-exist
+                        (merge-pathnames (format nil "ibd-find-test-~D/" (random 100000))
+                                         (uiop:temporary-directory)))))
+         (peer (%make-peer-with-state :ready))
+         (genesis-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (genesis-entry
+           (bitcoin-lisp.storage:make-block-index-entry
+            :hash genesis-hash :height 0 :chain-work 1 :status :valid)))
+    (bitcoin-lisp.storage:add-block-index-entry state genesis-entry)
+    (setf (bitcoin-lisp.storage::chain-state-best-block-hash state) genesis-hash)
+    ;; Build a chain B1 → B2 → B3 (chain-work 101 → 201 → 301)
+    (let* ((b1-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (setf (aref h 0) #xB0) (setf (aref h 1) 1) h))
+           (b2-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (setf (aref h 0) #xB0) (setf (aref h 1) 2) h))
+           (b3-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                      (setf (aref h 0) #xB0) (setf (aref h 1) 3) h))
+           (peer-tip (%make-test-chain-entries state
+                                                (list b1-hash b2-hash b3-hash)
+                                                :prev-entry genesis-entry
+                                                :start-work 1)))
+      (declare (ignore peer-tip))
+      (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer) b3-hash)
+      ;; find-next-blocks-to-download walks from fork-point (genesis) → b3.
+      (let ((results (bitcoin-lisp.networking::find-next-blocks-to-download
+                      peer 10 state block-store)))
+        (is (= 3 (length results)))
+        ;; Ordered by height ascending: b1 first.
+        (is (equalp b1-hash (car (first results))))
+        (is (= 1 (cdr (first results))))
+        (is (equalp b3-hash (car (third results))))
+        (is (= 3 (cdr (third results))))))))
+
+(test queue-missing-fork-blocks-adds-with-reset-timeout
+  "queue-missing-fork-blocks adds each hash to pending and clears its
+timeout counter so the existing scheduler retries with a fresh budget."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+        (h1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+        (h2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+    ;; Plant a stale timeout count for h1 to ensure it gets reset.
+    (setf (gethash h1 (bitcoin-lisp.networking::ibd-context-request-timeouts
+                       bitcoin-lisp.networking::*ibd-context*)) 7)
+    (let ((queued (bitcoin-lisp.networking::queue-missing-fork-blocks
+                   (list (cons h1 100) (cons h2 101)))))
+      (is (= 2 queued))
+      (is (= 2 (hash-table-count
+                (bitcoin-lisp.networking::ibd-context-pending-blocks
+                 bitcoin-lisp.networking::*ibd-context*))))
+      ;; Timeout counter for h1 was reset.
+      (is (= 0 (hash-table-count
+                (bitcoin-lisp.networking::ibd-context-request-timeouts
+                 bitcoin-lisp.networking::*ibd-context*)))))))
+
+(test queue-missing-fork-blocks-skips-already-queued
+  "If a hash is already in pending or in-flight, queue-missing-fork-blocks
+doesn't add it again."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+        (h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (setf (gethash h (bitcoin-lisp.networking::ibd-context-pending-blocks
+                      bitcoin-lisp.networking::*ibd-context*)) 50)
+    (is (= 0 (bitcoin-lisp.networking::queue-missing-fork-blocks
+              (list (cons h 50)))))))
+
+(test find-next-blocks-nil-when-peer-has-nothing
+  "Peer with NIL best-known returns NIL — we don't know what to ask for."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready)))
+    (is (null (bitcoin-lisp.networking::find-next-blocks-to-download
+               peer 10 state nil)))))
+
 ;;;; Progress Reporting Tests
 
 (test ibd-progress-reporting
