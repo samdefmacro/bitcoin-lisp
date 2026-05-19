@@ -189,6 +189,117 @@ resolution (the header may arrive in a subsequent message)."
        ;; (net_processing.cpp:1390).
        (setf (peer-hash-last-unknown-block peer) hash)))))
 
+;;;; Per-peer block download scheduler
+;;;;
+;;;; Mirrors Bitcoin Core's FindNextBlocksToDownload (net_processing.cpp:1395).
+;;;; For each peer, walk from last-common-block toward best-known-block,
+;;;; collecting blocks we don't have. The key invariant: we only ever
+;;;; ask THIS peer for blocks it has on its chain. A fork-block won't be
+;;;; requested from a peer that doesn't follow that fork, so the
+;;;; previous timeout-and-drop loop can't happen.
+
+(defun walk-chain-forward-by-count (from-entry to-entry max-count)
+  "Return a list of block-index-entries from FROM-ENTRY (EXCLUSIVE)
+toward TO-ENTRY (inclusive), walking via prev-entry links and reversing.
+At most MAX-COUNT entries returned; on overflow, returns the entries
+closest to FROM-ENTRY (i.e., earliest heights) so we make forward
+progress per call."
+  (let ((entries '())
+        (cursor to-entry)
+        (from-hash (bitcoin-lisp.storage:block-index-entry-hash from-entry)))
+    (loop while (and cursor
+                     (not (equalp (bitcoin-lisp.storage:block-index-entry-hash cursor)
+                                  from-hash)))
+          do (push cursor entries)
+             (setf cursor (bitcoin-lisp.storage:block-index-entry-prev-entry cursor)))
+    ;; entries is already from-first → to-last after the push loop.
+    (if (<= (length entries) max-count)
+        entries
+        (subseq entries 0 max-count))))
+
+(defun find-next-blocks-to-download (peer count chain-state block-store)
+  "Find up to COUNT block hashes that PEER has but we don't, walking
+peer's chain from last-common-block toward best-known-block. Returns
+a list of cons (hash . height), height ascending.
+
+Mirrors Bitcoin Core's FindNextBlocksToDownload (net_processing.cpp:1395)
+in shape. Simplified: no node-staller tracking, no AssumeUtxo, no
+witness-capability gating (we always want full blocks)."
+  (when (or (zerop count) (null (peer-best-known-block-hash peer)))
+    (return-from find-next-blocks-to-download nil))
+
+  (process-block-availability peer chain-state)
+
+  (let* ((best-known (bitcoin-lisp.storage:get-block-index-entry
+                      chain-state (peer-best-known-block-hash peer)))
+         (our-tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (our-tip (and our-tip-hash
+                       (bitcoin-lisp.storage:get-block-index-entry
+                        chain-state our-tip-hash)))
+         (our-tip-work (and our-tip
+                            (bitcoin-lisp.storage:block-index-entry-chain-work
+                             our-tip))))
+    (when (or (null best-known)
+              (and our-tip-work
+                   (< (bitcoin-lisp.storage:block-index-entry-chain-work best-known)
+                      our-tip-work)))
+      ;; Peer has nothing better than our tip.
+      (return-from find-next-blocks-to-download nil))
+
+    ;; Update peer's last-common-block: keep the strongest known common
+    ;; ancestor. New fork-point is our tip ∩ peer's best-known.
+    (let* ((fork-entry (bitcoin-lisp.validation:find-fork-point best-known our-tip))
+           (current-common (and (peer-last-common-block-hash peer)
+                                (bitcoin-lisp.storage:get-block-index-entry
+                                 chain-state (peer-last-common-block-hash peer)))))
+      (when (or (null current-common)
+                (and fork-entry
+                     (> (bitcoin-lisp.storage:block-index-entry-chain-work fork-entry)
+                        (bitcoin-lisp.storage:block-index-entry-chain-work current-common))))
+        (when fork-entry
+          (setf (peer-last-common-block-hash peer)
+                (bitcoin-lisp.storage:block-index-entry-hash fork-entry))))
+
+      (let ((last-common (and (peer-last-common-block-hash peer)
+                              (bitcoin-lisp.storage:get-block-index-entry
+                               chain-state (peer-last-common-block-hash peer)))))
+        (when (or (null last-common)
+                  (equalp (bitcoin-lisp.storage:block-index-entry-hash last-common)
+                          (bitcoin-lisp.storage:block-index-entry-hash best-known)))
+          ;; Peer has nothing new (or we can't even find the fork point).
+          (return-from find-next-blocks-to-download nil))
+
+        ;; Walk forward, collect downloadable blocks within the window.
+        (let* ((walked (walk-chain-forward-by-count
+                        last-common best-known
+                        (+ count +max-block-queue-size+)))
+               (in-flight (and *ibd-context*
+                               (ibd-context-in-flight *ibd-context*)))
+               (window-end (+ (bitcoin-lisp.storage:block-index-entry-height
+                                last-common)
+                              +max-block-queue-size+))
+               (collected '()))
+          (dolist (entry walked)
+            (when (>= (length collected) count)
+              (return))
+            (when (> (bitcoin-lisp.storage:block-index-entry-height entry)
+                     window-end)
+              (return))
+            (let ((hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+              (cond
+                ;; Block already in store — advance last-common.
+                ((bitcoin-lisp.storage:get-block block-store hash)
+                 (setf (peer-last-common-block-hash peer) hash))
+                ;; In-flight from some peer — skip.
+                ((and in-flight (gethash hash in-flight))
+                 nil)
+                ;; We need this block.
+                (t
+                 (push (cons hash
+                             (bitcoin-lisp.storage:block-index-entry-height entry))
+                       collected)))))
+          (nreverse collected))))))
+
 (defun handle-validation-failure (block height error chain-state)
   "Handle a block-validation failure during IBD.
 
