@@ -262,6 +262,84 @@ re-request (e.g. after a reorg) starts fresh."
               (bitcoin-lisp.networking::ibd-context-request-timeouts
                bitcoin-lisp.networking::*ibd-context*))))))
 
+;;;; Per-peer block-availability tracking
+;;;;
+;;;; Mirrors Bitcoin Core's ProcessBlockAvailability / UpdateBlockAvailability
+;;;; (net_processing.cpp:1361-1392). These tests cover the state
+;;;; machine: known hash → best-known set; unknown hash → staged;
+;;;; staged hash resolves once index catches up.
+
+(defun %make-peer-with-state (state-key)
+  "Construct a minimal peer struct for availability tests, with the
+:state slot set so callers can pretend it's :ready."
+  (let ((p (bitcoin-lisp.networking::make-peer :address "test")))
+    (setf (bitcoin-lisp.networking::peer-state p) state-key)
+    p))
+
+(test update-block-availability-known-hash
+  "When the announced hash is already in the index with positive
+chain-work, peer's best-known-block-hash is set to it."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash hash :height 5 :chain-work 100 :status :header-valid))
+    (bitcoin-lisp.networking::update-block-availability peer state hash)
+    (is (equalp hash (bitcoin-lisp.networking::peer-best-known-block-hash peer)))
+    (is (null (bitcoin-lisp.networking::peer-hash-last-unknown-block peer)))))
+
+(test update-block-availability-unknown-hash-staged
+  "When the announced hash isn't in the index yet, it's staged in
+hash-last-unknown-block for later resolution."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (mystery-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC)))
+    (bitcoin-lisp.networking::update-block-availability peer state mystery-hash)
+    (is (null (bitcoin-lisp.networking::peer-best-known-block-hash peer)))
+    (is (equalp mystery-hash
+                (bitcoin-lisp.networking::peer-hash-last-unknown-block peer)))))
+
+(test process-block-availability-resolves-staged
+  "Once the staged hash gets a block-index entry, the next
+process-block-availability promotes it to best-known."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8)))
+    ;; Stage hash before the index has it.
+    (bitcoin-lisp.networking::update-block-availability peer state hash)
+    (is (equalp hash (bitcoin-lisp.networking::peer-hash-last-unknown-block peer)))
+    ;; Index catches up.
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash hash :height 10 :chain-work 200 :status :header-valid))
+    ;; Process resolves the staged hash.
+    (bitcoin-lisp.networking::process-block-availability peer state)
+    (is (equalp hash (bitcoin-lisp.networking::peer-best-known-block-hash peer)))
+    (is (null (bitcoin-lisp.networking::peer-hash-last-unknown-block peer)))))
+
+(test update-block-availability-does-not-downgrade
+  "If best-known is at chain-work N and we announce a block with
+chain-work < N, best-known stays put (this peer might be temporarily
+sending us an old announcement; we keep the strongest claim)."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (strong-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (weak-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash strong-hash :height 100 :chain-work 5000 :status :valid))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash weak-hash :height 50 :chain-work 1000 :status :header-valid))
+    (bitcoin-lisp.networking::update-block-availability peer state strong-hash)
+    (is (equalp strong-hash
+                (bitcoin-lisp.networking::peer-best-known-block-hash peer)))
+    (bitcoin-lisp.networking::update-block-availability peer state weak-hash)
+    ;; best-known should still be the strong one.
+    (is (equalp strong-hash
+                (bitcoin-lisp.networking::peer-best-known-block-hash peer)))))
+
 ;;;; Progress Reporting Tests
 
 (test ibd-progress-reporting

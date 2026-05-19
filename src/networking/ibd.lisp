@@ -123,6 +123,72 @@ cells and `delivery-samples` (time peer-address latency-ms) lists."
           (ibd-context-last-tip-height *ibd-context*)
           (bitcoin-lisp.storage:current-height chain-state))))
 
+;;;; Per-peer block-availability tracking
+;;;;
+;;;; Mirrors Bitcoin Core's ProcessBlockAvailability / UpdateBlockAvailability
+;;;; (net_processing.cpp:1361-1392). The key invariant: a peer's
+;;;; best-known-block-hash points to a block-index-entry whose chain
+;;;; ancestor relation determines which blocks we can ask THIS peer for.
+;;;;
+;;;; Hook points:
+;;;;   - inv "block": update with the announced hash.
+;;;;   - headers: update with the last header in the batch (peer's tip).
+;;;;   - block: update with the block's hash (proof peer had it).
+;;;;
+;;;; The hash-last-unknown-block slot stages a hash we received in inv
+;;;; before we had a chain-state entry for it. Once the corresponding
+;;;; header arrives, the next process-block-availability call resolves
+;;;; it to a proper best-known-block.
+
+(defun better-or-equal-work-p (a b)
+  "T if entry A is at least as good as entry B (in chain-work terms).
+B may be NIL, in which case A is trivially better — A is a known
+entry, B is the absence of one. A NIL → NIL (caller shouldn't update
+to nothing). Matches Bitcoin Core's `state->pindexBestKnownBlock ==
+nullptr || pindex->nChainWork >= state->pindexBestKnownBlock->nChainWork`
+shape in net_processing.cpp:1368."
+  (when a
+    (or (null b)
+        (>= (bitcoin-lisp.storage:block-index-entry-chain-work a)
+            (bitcoin-lisp.storage:block-index-entry-chain-work b)))))
+
+(defun process-block-availability (peer chain-state)
+  "Resolve PEER's hash-last-unknown-block to a chain-state entry if we
+now have one for it. Promotes to best-known-block-hash when the staged
+hash has at least as much chain-work as the current best-known."
+  (let ((staged (peer-hash-last-unknown-block peer)))
+    (when staged
+      (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state staged)))
+        (when (and entry
+                   (plusp (bitcoin-lisp.storage:block-index-entry-chain-work entry)))
+          (let ((current (and (peer-best-known-block-hash peer)
+                              (bitcoin-lisp.storage:get-block-index-entry
+                               chain-state (peer-best-known-block-hash peer)))))
+            (when (better-or-equal-work-p entry current)
+              (setf (peer-best-known-block-hash peer) staged)))
+          (setf (peer-hash-last-unknown-block peer) nil))))))
+
+(defun update-block-availability (peer chain-state hash)
+  "PEER announced (via inv / headers / block) that it has HASH. Update
+its best-known-block-hash if HASH is in our index AND has at least as
+much work as the current best-known; otherwise stage HASH for later
+resolution (the header may arrive in a subsequent message)."
+  (process-block-availability peer chain-state)
+  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+    (cond
+      ((and entry
+            (plusp (bitcoin-lisp.storage:block-index-entry-chain-work entry)))
+       (let ((current (and (peer-best-known-block-hash peer)
+                           (bitcoin-lisp.storage:get-block-index-entry
+                            chain-state (peer-best-known-block-hash peer)))))
+         (when (better-or-equal-work-p entry current)
+           (setf (peer-best-known-block-hash peer) hash))))
+      (t
+       ;; Unknown block — assume the latest one is best until we learn
+       ;; otherwise. Mirrors Core's hashLastUnknownBlock fallback
+       ;; (net_processing.cpp:1390).
+       (setf (peer-hash-last-unknown-block peer) hash)))))
+
 (defun handle-validation-failure (block height error chain-state)
   "Handle a block-validation failure during IBD.
 
@@ -963,6 +1029,9 @@ Returns the number of blocks downloaded."
                                                                        :if-exists :supersede
                                                                        :element-type '(unsigned-byte 8))
                                                  (write-sequence payload s))))))
+                                       ;; Per-peer availability: receiving a block
+                                       ;; proves peer had it.
+                                       (update-block-availability peer chain-state hash)
                                        (mark-block-received hash)
                                        (record-block-received-from-peer peer)
                                        (process-received-block block chain-state utxo-set block-store
@@ -972,7 +1041,14 @@ Returns the number of blocks downloaded."
                                     ((string= command "headers")
                                      (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
                                        (process-headers headers chain-state)
-                                       (incf (ibd-context-headers-received ctx) (length headers))))
+                                       (incf (ibd-context-headers-received ctx) (length headers))
+                                       ;; Per-peer availability: peer's tip is
+                                       ;; the last header in the batch.
+                                       (let ((last (car (last headers))))
+                                         (when last
+                                           (update-block-availability
+                                            peer chain-state
+                                            (bitcoin-lisp.serialization:block-header-hash last))))))
 
                                     (t (handle-message peer command payload
                                                        chain-state utxo-set block-store
@@ -1120,6 +1196,14 @@ Used during IBD when the validated block tip lags behind the header tip."
                                          ;; If we got less than 2000, we're done
                                          (when (< (length headers) 2000)
                                            (setf done t))
+
+                                         ;; Per-peer availability: peer's tip is
+                                         ;; the last header in this batch.
+                                         (let ((last (car (last valid-headers))))
+                                           (when last
+                                             (update-block-availability
+                                              peer chain-state
+                                              (bitcoin-lisp.serialization:block-header-hash last))))
 
                                          (when (> added 0)
                                            (bitcoin-lisp:log-info "Received ~D headers, ~D new, total ~D"

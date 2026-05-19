@@ -49,7 +49,24 @@
   (rate-limit-getdata nil)
   (rate-limit-headers nil)
   ;; Handshake timeout tracking
-  (connect-time 0 :type integer))                     ; internal-real-time at connection
+  (connect-time 0 :type integer)                     ; internal-real-time at connection
+  ;; Per-peer block-availability tracking (BIP 130 / Core's CNodeState).
+  ;; Mirrors net_processing.cpp:445-449. Used by FindNextBlocksToDownload
+  ;; to ask each peer only for blocks it has on its chain — without
+  ;; this, fork blocks get requested from peers that aren't on that fork
+  ;; and the deferred-reorg loop bug (project_per_peer_block_tracking.md)
+  ;; fires repeatedly.
+  ;;
+  ;;   best-known-block-hash — peer's best advertised tip (from inv,
+  ;;     headers, or block messages). NIL until we learn something.
+  ;;   last-common-block-hash — last block both this peer and our
+  ;;     active chain have. NIL until we walk the chains.
+  ;;   hash-last-unknown-block — staging slot for inv hashes we don't
+  ;;     have an index entry for yet; resolved on next call to
+  ;;     process-block-availability once headers catch up.
+  (best-known-block-hash nil)
+  (last-common-block-hash nil)
+  (hash-last-unknown-block nil))
 
 ;;; Pending compact block reconstruction state
 (defstruct pending-compact-block
