@@ -107,6 +107,24 @@ purely from cache state; see the file header for the caller contract."
            (type utxo-entry entry))
   (let ((existing (gethash key (cvc-entries cache))))
     (when (and existing (ce-entry existing) (not allow-overwrite))
+      (let* ((existing-entry (ce-entry existing))
+             (txid-hex (bitcoin-lisp.crypto:bytes-to-hex
+                         (let ((b (make-array 32 :element-type '(unsigned-byte 8))))
+                           (write-u64-le-into b 0 (uk-a key))
+                           (write-u64-le-into b 8 (uk-b key))
+                           (write-u64-le-into b 16 (uk-c key))
+                           (write-u64-le-into b 24 (uk-d key))
+                           b))))
+        (bitcoin-lisp:log-error
+         "REFUSE-OVERWRITE DIAG: txid=~A:~D existing(value=~D height=~D coinbase=~A fresh=~A dirty=~A) new(value=~D height=~D coinbase=~A)"
+         txid-hex (uk-vout key)
+         (utxo-entry-value existing-entry)
+         (utxo-entry-height existing-entry)
+         (utxo-entry-coinbase existing-entry)
+         (ce-fresh existing) (ce-dirty existing)
+         (utxo-entry-value entry)
+         (utxo-entry-height entry)
+         (utxo-entry-coinbase entry)))
       (error "coins-view-cache-add: refusing to overwrite unspent coin"))
     (cond
       ;; Reuse the existing struct: mutate slots, fix the counts to
