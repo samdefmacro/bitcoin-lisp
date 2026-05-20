@@ -285,14 +285,16 @@ or does not have min-difficulty bits. Returns that block's bits value."
 (defun get-retarget-ancestor (entry)
   "Walk back from ENTRY to the block at the start of its retarget period.
 For a block at height H, this returns the entry at height H - (H mod 2016).
-Bitcoin Core's off-by-one: the timespan is measured from this block to ENTRY.
-
-Uses the skip-list ancestor walk so the jump is O(log depth) instead of
-~2016 linear hops per call (this runs on every connect-block)."
+Bitcoin Core's off-by-one: the timespan is measured from this block to ENTRY."
   (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
          (interval bitcoin-lisp.storage:+difficulty-adjustment-interval+)
-         (target-height (- height (mod height interval))))
-    (or (bitcoin-lisp.storage:get-ancestor entry target-height) entry)))
+         (blocks-back (mod height interval))
+         (current entry))
+    (dotimes (i blocks-back)
+      (let ((prev (bitcoin-lisp.storage:block-index-entry-prev-entry current)))
+        (unless prev (return))
+        (setf current prev)))
+    current))
 
 (defun get-expected-bits (height prev-entry)
   "Compute the expected bits for a block at HEIGHT with previous block PREV-ENTRY.
@@ -1242,20 +1244,22 @@ Handles chain reorganizations when a competing chain has more work."
 
 (defun find-fork-point (entry-a entry-b)
   "Find the common ancestor (fork point) of two chain entries.
-
-Uses the skip-list ancestor walk to align heights in O(log depth)
-instead of O(depth). Once heights match, walks both prev-entry chains
-in lockstep until they meet — that inner walk is bounded by the
-fork depth, typically a handful of blocks for natural reorgs."
-  (let* ((min-height (min (bitcoin-lisp.storage:block-index-entry-height entry-a)
-                          (bitcoin-lisp.storage:block-index-entry-height entry-b)))
-         (a (bitcoin-lisp.storage:get-ancestor entry-a min-height))
-         (b (bitcoin-lisp.storage:get-ancestor entry-b min-height)))
-    (loop while (and a b
-                     (not (equalp (bitcoin-lisp.storage:block-index-entry-hash a)
-                                  (bitcoin-lisp.storage:block-index-entry-hash b))))
-          do (setf a (bitcoin-lisp.storage:block-index-entry-prev-entry a)
-                   b (bitcoin-lisp.storage:block-index-entry-prev-entry b)))
+Returns the common ancestor block-index-entry."
+  ;; Walk both chains back until we find a common block
+  (let ((a entry-a)
+        (b entry-b))
+    ;; First, align heights
+    (loop while (and a b (> (bitcoin-lisp.storage:block-index-entry-height a)
+                            (bitcoin-lisp.storage:block-index-entry-height b)))
+          do (setf a (bitcoin-lisp.storage:block-index-entry-prev-entry a)))
+    (loop while (and a b (> (bitcoin-lisp.storage:block-index-entry-height b)
+                            (bitcoin-lisp.storage:block-index-entry-height a)))
+          do (setf b (bitcoin-lisp.storage:block-index-entry-prev-entry b)))
+    ;; Walk both back until they meet
+    (loop while (and a b (not (equalp (bitcoin-lisp.storage:block-index-entry-hash a)
+                                      (bitcoin-lisp.storage:block-index-entry-hash b))))
+          do (setf a (bitcoin-lisp.storage:block-index-entry-prev-entry a))
+             (setf b (bitcoin-lisp.storage:block-index-entry-prev-entry b)))
     a))
 
 (defun collect-chain-entries (tip-entry fork-entry)
