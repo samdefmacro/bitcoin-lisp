@@ -313,11 +313,15 @@
    #:block-index-entry-height
    #:block-index-entry-header
    #:block-index-entry-prev-entry
+   #:block-index-entry-skip-entry
    #:block-index-entry-chain-work
    #:block-index-entry-status
    #:get-block-index-entry
    #:add-block-index-entry
    #:get-block-at-height
+   #:get-ancestor
+   #:get-skip-height
+   #:build-skip-pointer
    #:best-block-hash
    #:current-height
    #:update-chain-tip
