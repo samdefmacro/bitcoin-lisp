@@ -8,13 +8,91 @@
 ;;; - Chain work calculations
 
 (defstruct block-index-entry
-  "Metadata for an indexed block."
+  "Metadata for an indexed block.
+
+SKIP-ENTRY points to an earlier ancestor at GET-SKIP-HEIGHT(height) so
+GET-ANCESTOR runs in O(log depth) instead of O(depth). Built by
+BUILD-SKIP-POINTER once PREV-ENTRY is set. Not serialized; rebuilt on
+load by REBUILD-SKIP-POINTERS. Mirrors Bitcoin Core's CBlockIndex::pskip
+(chain.h:103)."
   (hash nil :type (or null (simple-array (unsigned-byte 8) (32))))
   (height 0 :type (unsigned-byte 32))
   (header nil)
   (prev-entry nil)
+  (skip-entry nil)
   (chain-work 0 :type integer)
   (status :unknown :type keyword))  ; :unknown, :header-valid, :valid, :invalid
+
+;;;; Skip-list ancestor support
+;;;;
+;;;; Mirrors Bitcoin Core's GetSkipHeight + GetAncestor + BuildSkip
+;;;; (refs/bitcoin/src/chain.cpp:69-119). Replaces the previous O(depth)
+;;;; prev-entry walks for ancestor lookups; skip pointers form a sparse
+;;;; index so any ancestor is reached in O(log depth).
+
+(declaim (inline invert-lowest-one get-skip-height))
+
+(defun invert-lowest-one (n)
+  "Turn the lowest '1' bit in N's binary representation into a '0'.
+N must be a non-negative integer."
+  (declare (type (unsigned-byte 32) n))
+  (logand n (1- n)))
+
+(defun get-skip-height (height)
+  "Height the pskip pointer at HEIGHT should reference. Any value
+strictly less than HEIGHT would be correct; this expression matches
+Bitcoin Core's choice (chain.cpp:73-81) — empirically ≤110 hops to
+reach any ancestor within 2^18 blocks."
+  (declare (type (unsigned-byte 32) height))
+  (cond
+    ((< height 2) 0)
+    ((oddp height)
+     (1+ (invert-lowest-one (invert-lowest-one (1- height)))))
+    (t (invert-lowest-one height))))
+
+(defun get-ancestor (entry target-height)
+  "Return the ancestor of ENTRY at TARGET-HEIGHT in O(log depth), or
+NIL if TARGET-HEIGHT is negative or above ENTRY's own height.
+
+Mirrors CBlockIndex::GetAncestor (chain.cpp:83-108). Uses SKIP-ENTRY
+when the skip lands on or strictly closer to the target than the
+alternate prev->prev->...->skip path; falls back to PREV-ENTRY
+otherwise."
+  (declare (type block-index-entry entry)
+           (type (unsigned-byte 32) target-height))
+  (let ((walk entry)
+        (walk-height (block-index-entry-height entry)))
+    (when (> target-height walk-height)
+      (return-from get-ancestor nil))
+    (loop while (> walk-height target-height)
+          do (let ((skip-height (get-skip-height walk-height))
+                   (skip-prev-height (get-skip-height (1- walk-height)))
+                   (skip (block-index-entry-skip-entry walk)))
+               (cond
+                 ;; Skip pointer is valid AND (lands exactly on target,
+                 ;; OR overshoots target without sliding past what
+                 ;; (prev → skip) would reach).
+                 ((and skip
+                       (or (= skip-height target-height)
+                           (and (> skip-height target-height)
+                                (not (and (< skip-prev-height (- skip-height 2))
+                                          (>= skip-prev-height target-height))))))
+                  (setf walk skip
+                        walk-height skip-height))
+                 (t
+                  (setf walk (block-index-entry-prev-entry walk))
+                  (decf walk-height)))))
+    walk))
+
+(defun build-skip-pointer (entry)
+  "Set ENTRY's SKIP-ENTRY based on its current PREV-ENTRY. Idempotent.
+Mirrors CBlockIndex::BuildSkip (chain.cpp:115-119)."
+  (declare (type block-index-entry entry))
+  (let ((prev (block-index-entry-prev-entry entry)))
+    (when prev
+      (setf (block-index-entry-skip-entry entry)
+            (get-ancestor prev (get-skip-height
+                                (block-index-entry-height entry)))))))
 
 (defstruct chain-state
   "Current blockchain state."
@@ -66,26 +144,25 @@ NETWORK defaults to bitcoin-lisp:*network* if not specified."
   (gethash hash (chain-state-block-index state)))
 
 (defun add-block-index-entry (state entry)
-  "Add a block index entry to the chain state."
+  "Add a block index entry to the chain state. Builds the skip pointer
+if PREV-ENTRY is already linked (callers that link prev-entry after
+construction should call BUILD-SKIP-POINTER themselves)."
   (setf (gethash (block-index-entry-hash entry)
                  (chain-state-block-index state))
-        entry))
+        entry)
+  (build-skip-pointer entry)
+  entry)
 
 (defun best-block-hash (state)
   "Return the hash of the best (tip) block."
   (chain-state-best-block-hash state))
 
 (defun get-block-at-height (state target-height)
-  "Get the block index entry at TARGET-HEIGHT by walking back from tip."
-  (let ((current-height (chain-state-best-height state)))
-    (when (> target-height current-height)
-      (return-from get-block-at-height nil))
-    (let ((entry (get-block-index-entry state (chain-state-best-block-hash state))))
-      ;; Walk back from tip to target height
-      (loop while (and entry (> (block-index-entry-height entry) target-height))
-            do (setf entry (block-index-entry-prev-entry entry)))
-      (when (and entry (= (block-index-entry-height entry) target-height))
-        entry))))
+  "Get the block index entry at TARGET-HEIGHT on the active chain.
+Uses the skip-list ancestor walk so the cost is O(log depth) rather
+than O(depth)."
+  (let ((tip (get-block-index-entry state (chain-state-best-block-hash state))))
+    (when tip (get-ancestor tip target-height))))
 
 (defun current-height (state)
   "Return the height of the best block."
@@ -478,13 +555,21 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
               (setf (gethash hash prev-hash-map) (copy-seq prev-hash)))))))))
 
 (defun link-header-entries (entries-by-hash prev-hash-map)
-  "Link prev-entry pointers in the block index."
+  "Link prev-entry pointers in the block index. Then rebuild skip
+pointers in height ascending order so each entry's skip target is
+already populated when consulted by deeper entries."
   (maphash (lambda (hash prev-hash)
              (let ((entry (gethash hash entries-by-hash))
                    (prev-entry (gethash prev-hash entries-by-hash)))
                (when (and entry prev-entry)
                  (setf (block-index-entry-prev-entry entry) prev-entry))))
-           prev-hash-map))
+           prev-hash-map)
+  (let ((entries '()))
+    (maphash (lambda (hash entry) (declare (ignore hash))
+                                  (push entry entries))
+             entries-by-hash)
+    (dolist (entry (sort entries #'< :key #'block-index-entry-height))
+      (build-skip-pointer entry))))
 
 ;;; Block locator for syncing
 
