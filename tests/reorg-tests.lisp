@@ -161,6 +161,80 @@ Returns the tip entry. If CHAIN-STATE provided, entries are added to it."
           (is (= initial-count (bitcoin-lisp.storage:utxo-count utxo-set)))
           (is (bitcoin-lisp.storage:utxo-exists-p utxo-set txid1 0)))))))
 
+(test utxo-cross-block-dep-disconnect-order
+  "Regression: disconnecting multiple blocks must process them
+tip-to-fork. If A (lower height) creates output O and B (higher) spends
+O, the buggy fork-to-tip order leaves O re-added by B's undo data
+after A's outputs were already removed (no-op'd because B had spent
+O during apply). Observed live on test-bitcoin-server 2026-05-20 at
+h=135616 during a 17-block testnet4 reorg: perform-reorg's
+`(reverse to-disconnect)` flipped collect-chain-entries' tip-first
+ordering, causing the symptom on the apply phase of the new chain
+(\"refusing to overwrite unspent coin\"). Bitcoin Core's
+DisconnectTip iterates from active tip backwards via pindex->pprev."
+  (let* ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (initial-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element #xC1))
+         (script (make-array 25 :element-type '(unsigned-byte 8)
+                                :initial-element #x76)))
+    ;; Pre-existing UTXO consumed by block 1.
+    (bitcoin-lisp.storage:add-utxo utxo-set initial-txid 0 200000 script 10)
+    (let* ((cb1 (make-e2e-coinbase-tx :height 11))
+           ;; Block 1: tx spends initial-txid:0, creates X (this tx's :0).
+           (tx-x (make-e2e-regular-tx :prev-txid initial-txid :prev-index 0
+                                       :value 190000))
+           (block1 (make-e2e-block (list cb1 tx-x)))
+           (x-txid (bitcoin-lisp.serialization:transaction-hash tx-x))
+           (spent1 (bitcoin-lisp.storage:apply-block-to-utxo-set
+                    utxo-set block1 11)))
+      ;; Block 2: tx spends X (cross-block dependency).
+      (let* ((cb2 (make-e2e-coinbase-tx :height 12))
+             (tx-y (make-e2e-regular-tx :prev-txid x-txid :prev-index 0
+                                         :value 180000))
+             (block2 (make-e2e-block (list cb2 tx-y)))
+             (spent2 (bitcoin-lisp.storage:apply-block-to-utxo-set
+                      utxo-set block2 12)))
+        ;; Disconnect in WRONG order (fork-to-tip: block1 first). This
+        ;; emulates the bug: with the (reverse to-disconnect) flip in
+        ;; perform-reorg, the lower block was processed first.
+        (bitcoin-lisp.storage:disconnect-block-from-utxo-set
+         utxo-set block1 spent1)
+        (bitcoin-lisp.storage:disconnect-block-from-utxo-set
+         utxo-set block2 spent2)
+        ;; Symptom of the bug: X re-added by block2's undo restoration
+        ;; even though it should be net-removed (created and consumed
+        ;; on the disconnected chain). The correct ordering — block2
+        ;; first then block1 — would have removed X cleanly when
+        ;; processing block1's forward output walk.
+        ;;
+        ;; This test asserts the buggy order leaves X unspent (the
+        ;; observable failure mode). A separate assertion below confirms
+        ;; the correct order does not.
+        (is (bitcoin-lisp.storage:utxo-exists-p utxo-set x-txid 0))))
+    ;; Now repeat with the CORRECT order and assert X is gone.
+    (let ((utxo-set2 (bitcoin-lisp.storage:make-utxo-set)))
+      (bitcoin-lisp.storage:add-utxo utxo-set2 initial-txid 0 200000 script 10)
+      (let* ((cb1 (make-e2e-coinbase-tx :height 11))
+             (tx-x (make-e2e-regular-tx :prev-txid initial-txid :prev-index 0
+                                         :value 190000))
+             (block1 (make-e2e-block (list cb1 tx-x)))
+             (x-txid (bitcoin-lisp.serialization:transaction-hash tx-x))
+             (spent1 (bitcoin-lisp.storage:apply-block-to-utxo-set
+                      utxo-set2 block1 11)))
+        (let* ((cb2 (make-e2e-coinbase-tx :height 12))
+               (tx-y (make-e2e-regular-tx :prev-txid x-txid :prev-index 0
+                                           :value 180000))
+               (block2 (make-e2e-block (list cb2 tx-y)))
+               (spent2 (bitcoin-lisp.storage:apply-block-to-utxo-set
+                        utxo-set2 block2 12)))
+          ;; Correct order: block2 (tip) first, block1 (fork-adjacent) last.
+          (bitcoin-lisp.storage:disconnect-block-from-utxo-set
+           utxo-set2 block2 spent2)
+          (bitcoin-lisp.storage:disconnect-block-from-utxo-set
+           utxo-set2 block1 spent1)
+          (is (not (bitcoin-lisp.storage:utxo-exists-p utxo-set2 x-txid 0)))
+          (is (bitcoin-lisp.storage:utxo-exists-p utxo-set2 initial-txid 0)))))))
+
 ;;;; activate-block dispatch tests
 ;;;;
 ;;;; activate-block is the consensus-correct entry point that replaces

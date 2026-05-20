@@ -1017,6 +1017,50 @@ the cache equivalent to its pre-apply state."
         (is (null spent))
         (is (bitcoin-lisp.storage:coin-view-has-p cache cb-txid 0))))))
 
+(test coin-view-disconnect-intra-block-dep-leaves-clean-state
+  "Regression: a block with intra-block tx dependencies (tx N spends
+output created by tx M in the same block) must disconnect cleanly —
+no stale UTXOs left in cache.
+
+This is the bug observed live on test-bitcoin-server 2026-05-19 at
+h=135597: the old forward-order disconnect (remove all outputs THEN
+restore inputs) left an intra-block-spent output incorrectly restored
+in the cache. Re-applying the block (e.g., same tx in a competing
+fork) then refused with 'overwrite unspent coin'. Bitcoin Core's
+DisconnectBlock processes txs in reverse order with per-tx (remove
+outputs THEN restore inputs); our flat-undo-data equivalent restores
+ALL inputs first then walks forward removing outputs, achieving the
+same final cache state."
+  (%with-tmp-cache (cache)
+    (let* ((script (%sample-script))
+           (cb-txid (%sample-txid #x77))
+           (intra-txid (%sample-txid #x78))
+           ;; tx M (the coinbase) creates output cb-txid:0 (value=5e9).
+           (coinbase (%make-coinbase-tx cb-txid 5000000000 script))
+           ;; tx N spends coinbase output, creates intra-txid:0
+           ;; (this is the intra-block dependency).
+           (spending (%make-spending-tx intra-txid cb-txid 0 4000000000 script))
+           (block (%make-test-block (list coinbase spending))))
+      ;; Apply: cb-txid:0 is created then immediately spent in the same
+      ;; block. intra-txid:0 is created.
+      (let ((spent (bitcoin-lisp.storage:coin-view-apply-block cache block 100)))
+        (is (= 1 (length spent)))
+        ;; After apply: cb-txid:0 is gone (spent intra-block).
+        ;; intra-txid:0 is unspent.
+        (is (not (bitcoin-lisp.storage:coin-view-has-p cache cb-txid 0)))
+        (is (bitcoin-lisp.storage:coin-view-has-p cache intra-txid 0))
+        ;; Now disconnect. After the fix, the cache must be empty
+        ;; (no stale unspent entries).
+        (bitcoin-lisp.storage:coin-view-disconnect-block cache block spent)
+        (is (not (bitcoin-lisp.storage:coin-view-has-p cache cb-txid 0)))
+        (is (not (bitcoin-lisp.storage:coin-view-has-p cache intra-txid 0)))
+        ;; Critical: re-applying the same block must succeed. With the
+        ;; old buggy order, cb-txid:0 was left in the cache as
+        ;; unspent, so this would raise "refusing to overwrite unspent
+        ;; coin" via the bip30 guard on coins-view-cache-add.
+        (let ((spent2 (bitcoin-lisp.storage:coin-view-apply-block cache block 100)))
+          (is (= 1 (length spent2))))))))
+
 ;;;; Polymorphic-dispatch parity tests
 ;;;;
 ;;;; The legacy add-utxo / get-utxo / remove-utxo / apply-block-to-utxo-set

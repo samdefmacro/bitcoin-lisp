@@ -1326,8 +1326,12 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
         (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
                                old-height fork-height new-height)
 
-        ;; Disconnect blocks in reverse order (tip to fork)
-        (dolist (entry (reverse to-disconnect))
+        ;; Disconnect blocks tip-to-fork. collect-chain-entries returns
+        ;; tip-first; iterate as-is. Order matters across blocks: if A
+        ;; (lower) creates output O and B (higher) spends O, disconnecting
+        ;; A first leaves O re-added by B's undo data — see
+        ;; coin-view-disconnect-block for the analogous within-block case.
+        (dolist (entry to-disconnect)
           (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
                  (block (bitcoin-lisp.storage:get-block block-store block-hash)))
             (when block
