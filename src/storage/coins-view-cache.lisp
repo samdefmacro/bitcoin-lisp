@@ -330,18 +330,44 @@ undo list — (txid index entry) for every spent UTXO, in apply order."
     (nreverse spent)))
 
 (defun coin-view-disconnect-block (cache block previous-utxos)
-  "Reverse coin-view-apply-block for reorg: remove the block's outputs
-then restore the spends recorded in PREVIOUS-UTXOS."
+  "Reverse coin-view-apply-block for reorg.
+
+Order matters when a block contains intra-block dependencies — tx N
+spends an output O created by tx M (M < N) in the same block. After
+apply, M's output O was created then immediately spent within the
+block; the cache has M:0 in a spent/removed state.
+
+Bitcoin Core's DisconnectBlock (refs/bitcoin/src/validation.cpp ~1640)
+processes transactions in REVERSE order, doing (remove outputs THEN
+restore inputs) per-tx. That guarantees M's output is removed AFTER
+N's undo data restores it — net cache state is correctly empty for
+M:0.
+
+Our undo data is a flat list (not per-tx), so we achieve the same
+end-state with a simpler equivalent: restore ALL inputs first, then
+walk transactions forward to remove their outputs. The restoration
+re-adds M:0 to the cache; the forward walk then removes M:0 along
+with N:0. Net result is the same as Bitcoin Core's reverse iteration.
+
+The old forward order (remove outputs first, then restore inputs)
+silently failed for intra-block deps: M:0's removal was a no-op
+(already gone via N's spend), then M:0 got restored via N's undo data,
+and stayed in the cache as falsely unspent. Subsequent re-apply (e.g.
+the same tx in a competing fork's block) would then trip the
+\"refusing to overwrite unspent coin\" guard. Observed live on
+test-bitcoin-server 2026-05-19 at h=135597."
   (declare (type coins-view-cache cache))
+  ;; Restore inputs first (from undo data).
+  (dolist (prev previous-utxos)
+    (destructuring-bind (txid index entry) prev
+      (coins-view-cache-add cache (make-utxo-key txid index) entry
+                            :allow-overwrite t)))
+  ;; Then walk transactions forward, removing their outputs.
   (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
     (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
       (loop for out-idx from 0
             below (length (bitcoin-lisp.serialization:transaction-outputs tx))
-            do (coin-view-spend cache txid out-idx))))
-  (dolist (prev previous-utxos)
-    (destructuring-bind (txid index entry) prev
-      (coins-view-cache-add cache (make-utxo-key txid index) entry
-                            :allow-overwrite t))))
+            do (coin-view-spend cache txid out-idx)))))
 
 ;;;; Polymorphic dispatch for the legacy UTXO API.
 ;;;;
@@ -476,16 +502,23 @@ count for a LevelDB-backed view must compute it themselves."
 (defun disconnect-block-from-utxo-set (view block previous-utxos)
   (etypecase view
     (utxo-set
+     ;; Same intra-block-deps reasoning as coin-view-disconnect-block:
+     ;; restore inputs FIRST, then remove outputs. Without this order
+     ;; the in-block-spent-output gets restored after its remhash pass
+     ;; runs as a no-op, leaving stale entries. The utxo-set hash table
+     ;; doesn't fail on overwrite (no allow-overwrite check), so this
+     ;; bug was silent here — but the cache surface caught it on
+     ;; testnet4 at h=135597. Fix both for state consistency.
+     (dolist (prev previous-utxos)
+       (destructuring-bind (txid index entry) prev
+         (setf (gethash (make-utxo-key txid index) (utxo-set-entries view))
+               entry)))
      (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
        (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
          (loop for out-idx from 0
                below (length (bitcoin-lisp.serialization:transaction-outputs tx))
                do (remhash (make-utxo-key txid out-idx)
-                           (utxo-set-entries view)))))
-     (dolist (prev previous-utxos)
-       (destructuring-bind (txid index entry) prev
-         (setf (gethash (make-utxo-key txid index) (utxo-set-entries view))
-               entry))))
+                           (utxo-set-entries view))))))
     (coins-view-cache
      (coin-view-disconnect-block view block previous-utxos))))
 
