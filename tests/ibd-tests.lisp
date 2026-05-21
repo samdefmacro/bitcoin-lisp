@@ -162,6 +162,63 @@
     (is (= 1 (bitcoin-lisp.networking::ibd-context-blocks-received
               bitcoin-lisp.networking::*ibd-context*)))))
 
+;;;; STUCK TIP detection
+;;;;
+;;;; check-stuck-tip is the OOM-prevention backstop. It must fire when
+;;;; the queue is genuinely growing toward cap (validator wedged) but
+;;;; NOT during ordinary fork-recovery where the queue holds a handful
+;;;; of fork blocks waiting on missing intermediates.
+
+(test stuck-tip-fires-when-queue-near-cap
+  "When queue >= 90% of cap and tip hasn't advanced in
++stuck-tip-halt-seconds+, check-stuck-tip returns T."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd))
+         (bitcoin-lisp.networking::*ibd-context* ctx)
+         (cap bitcoin-lisp.networking::+max-block-queue-size+)
+         (threshold (floor (* cap 9/10))))
+    ;; Plant queue at threshold
+    (let ((q (bitcoin-lisp.networking::ibd-context-block-queue ctx)))
+      (loop for i from 0 below threshold
+            do (setf (gethash i q) i)))
+    ;; Set last-tip-advance well in the past
+    (setf (bitcoin-lisp.networking::ibd-context-last-tip-advance-time ctx)
+          (- (get-universal-time)
+             (1+ bitcoin-lisp.networking::+stuck-tip-halt-seconds+)))
+    (is (eq t (bitcoin-lisp.networking::check-stuck-tip)))))
+
+(test stuck-tip-does-not-fire-for-small-fork-queue
+  "Regression: when the queue has a handful of fork blocks (1-15)
+waiting on missing intermediates, check-stuck-tip must NOT fire even
+if tip has been stalled past +stuck-tip-halt-seconds+. Test-bitcoin-
+server 2026-05-21 06:46–07:07 hit this 3 times in 21 min before a
+13-block reorg completed; the OOM backstop fired and forced peer
+rotation each cycle, slowing recovery."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd))
+         (bitcoin-lisp.networking::*ibd-context* ctx))
+    ;; Plant 14 fork blocks (well below cap of 1024)
+    (let ((q (bitcoin-lisp.networking::ibd-context-block-queue ctx)))
+      (loop for i from 0 below 14
+            do (setf (gethash i q) i)))
+    ;; Tip stalled for 10 minutes (2x the threshold)
+    (setf (bitcoin-lisp.networking::ibd-context-last-tip-advance-time ctx)
+          (- (get-universal-time) 600))
+    (is (null (bitcoin-lisp.networking::check-stuck-tip)))))
+
+(test stuck-tip-does-not-fire-when-tip-fresh
+  "If tip advanced recently, check-stuck-tip never fires regardless of
+queue size."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd))
+         (bitcoin-lisp.networking::*ibd-context* ctx)
+         (cap bitcoin-lisp.networking::+max-block-queue-size+))
+    ;; Plant queue at cap
+    (let ((q (bitcoin-lisp.networking::ibd-context-block-queue ctx)))
+      (loop for i from 0 below cap
+            do (setf (gethash i q) i)))
+    ;; Tip advanced just now
+    (setf (bitcoin-lisp.networking::ibd-context-last-tip-advance-time ctx)
+          (get-universal-time))
+    (is (null (bitcoin-lisp.networking::check-stuck-tip)))))
+
 ;;;; Timeout Tests
 
 (test timeout-detection
