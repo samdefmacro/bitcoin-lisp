@@ -242,23 +242,33 @@ less battle-tested, so we re-request once-or-twice before halting."
 
 (defun check-stuck-tip ()
   "Halt IBD if the connect-tip has not advanced for longer than
-+stuck-tip-halt-seconds+. Returns T if we should halt.
++stuck-tip-halt-seconds+ AND the block-queue is near its cap. Returns
+T if we should halt.
 
 This is the backstop that prevents the failure mode observed at testnet4
 height 70700 (May 2 16:32 crash): a permanently-failing connect-tip
 block, no advance for 1h 40m, queue grew unbounded until heap exhaustion.
-With this check, we halt cleanly instead of OOM-ing."
+With this check, we halt cleanly instead of OOM-ing.
+
+The queue-near-cap guard avoids false positives during fork-recovery,
+where we have a handful of fork blocks in the queue waiting for missing
+intermediates to arrive. In that scenario the queue stays small (1-15
+blocks) and is no OOM risk — but the old `(plusp queue-size)` check
+fired the 5-minute timeout repeatedly, causing peer-rotation churn that
+made the recovery slower (test-bitcoin-server 2026-05-21 06:46–07:07
+saw 3 STUCK TIP cycles before a 13-block reorg finally completed)."
   (when *ibd-context*
     (let* ((last-time (ibd-context-last-tip-advance-time *ibd-context*))
            (queue-size (hash-table-count
-                        (ibd-context-block-queue *ibd-context*))))
+                        (ibd-context-block-queue *ibd-context*)))
+           (near-cap-threshold (floor (* +max-block-queue-size+ 9/10))))
       (when (and (plusp last-time)
-                 (plusp queue-size)
+                 (>= queue-size near-cap-threshold)
                  (> (- (get-universal-time) last-time)
                     +stuck-tip-halt-seconds+))
         (bitcoin-lisp:log-error
-         "STUCK TIP: connect-tip has not advanced in ~D seconds; ~D blocks queued. Halting IBD to avoid OOM. Investigate validator."
-         (- (get-universal-time) last-time) queue-size)
+         "STUCK TIP: connect-tip has not advanced in ~D seconds; ~D blocks queued (cap ~D). Halting IBD to avoid OOM. Investigate validator."
+         (- (get-universal-time) last-time) queue-size +max-block-queue-size+)
         t))))
 
 (defun make-ibd ()
