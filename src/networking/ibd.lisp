@@ -919,6 +919,26 @@ window. Trims delivery-samples to drop entries older than the window."
 
 ;;;; Main IBD Loop
 
+(defun handle-peer-fin (peer)
+  "Reap a peer whose connection has been flagged dead. receive-bytes
+flips connection-connected to NIL on a zero-progress read (Linux
+POLLHUP after peer FIN) and on any send-bytes/receive-bytes error.
+Without this propagation peer-state stays :ready, the outer drain
+prune keeps the zombie, and replace-disconnected-peers (which only
+counts non-:ready slots as needing replacement) never reconnects.
+Result: sockets pile up in CLOSE-WAIT, IBD spins on an empty header
+poll forever (incident 2026-05-22: all 7 testnet4 peers stuck in
+CLOSE-WAIT after 48h, sync gap from h=135,913 vs network tip).
+Mirrors Bitcoin Core's SocketHandlerConnected: recv()==0 or send
+error sets pnode->fDisconnect (net.cpp:2204). Returns T iff the peer
+was disconnected (handler-case yielded successfully)."
+  (when (and (peer-connection peer)
+             (not (connection-connected (peer-connection peer))))
+    (bitcoin-lisp:log-warn "Peer ~A connection dead — disconnecting"
+                           (peer-address peer))
+    (handler-case (progn (disconnect-peer peer) t)
+      (error () nil))))
+
 (defun start-ibd (peers chain-state utxo-set block-store target-height
                    &key fee-estimator recent-rejects)
   "Start Initial Block Download.
@@ -1095,7 +1115,8 @@ Returns the number of blocks downloaded."
                          (bitcoin-lisp:log-warn
                           "Peer ~A I/O error during message drain — disconnecting: ~A"
                           (peer-address peer) c)
-                         (handler-case (disconnect-peer peer) (error () nil))))))
+                         (handler-case (disconnect-peer peer) (error () nil))))
+                     (handle-peer-fin peer)))
 
                  ;; Per-block request timeout retries (retry-timed-out-requests
                  ;; in request-blocks-from-peers) is our peer-disconnect path:
