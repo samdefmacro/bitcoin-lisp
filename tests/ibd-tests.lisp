@@ -219,6 +219,44 @@ queue size."
           (get-universal-time))
     (is (null (bitcoin-lisp.networking::check-stuck-tip)))))
 
+;;;; Peer FIN handling
+;;;;
+;;;; receive-bytes flips connection-connected NIL when a ready socket
+;;;; yields zero progress (Linux POLLHUP after peer FIN). handle-peer-fin
+;;;; must propagate this into peer-state so the outer drain + replace-
+;;;; disconnected-peers can reap. Regression for 2026-05-22 incident:
+;;;; 7 testnet4 peers stuck in CLOSE-WAIT for 48h, sync gap from
+;;;; h=135,913 to network tip.
+
+(test handle-peer-fin-disconnects-on-dead-connection
+  "When connection-connected is NIL, handle-peer-fin disconnects the
+peer and returns T."
+  (let* ((conn (bitcoin-lisp.networking::make-connection
+                :host "10.0.0.1" :port 48333 :connected nil))
+         (peer (bitcoin-lisp.networking:make-peer
+                :connection conn :state :ready :address "10.0.0.1")))
+    (is (eq t (bitcoin-lisp.networking::handle-peer-fin peer)))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+    (is (null (bitcoin-lisp.networking::peer-connection peer)))))
+
+(test handle-peer-fin-noop-on-healthy-connection
+  "When connection-connected is T (no FIN seen), handle-peer-fin leaves
+the peer untouched and returns NIL."
+  (let* ((conn (bitcoin-lisp.networking::make-connection
+                :host "10.0.0.2" :port 48333 :connected t))
+         (peer (bitcoin-lisp.networking:make-peer
+                :connection conn :state :ready :address "10.0.0.2")))
+    (is (null (bitcoin-lisp.networking::handle-peer-fin peer)))
+    (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))
+    (is (eq conn (bitcoin-lisp.networking::peer-connection peer)))))
+
+(test handle-peer-fin-noop-when-no-connection
+  "Already-disconnected peers (peer-connection NIL) are a no-op — no
+crash, return NIL."
+  (let ((peer (bitcoin-lisp.networking:make-peer
+               :connection nil :state :disconnected :address "10.0.0.3")))
+    (is (null (bitcoin-lisp.networking::handle-peer-fin peer)))))
+
 ;;;; Timeout Tests
 
 (test timeout-detection
