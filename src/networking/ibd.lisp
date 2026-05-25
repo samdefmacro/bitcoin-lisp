@@ -695,6 +695,32 @@ a genuinely dead peer is still cleared in 2 minutes.
              in-flight)
     timed-out))
 
+(defun release-orphaned-in-flight ()
+  "Release in-flight block requests held by peers that are no longer
+:ready (disconnected). The block stays in PENDING, so the next
+get-next-blocks-to-request reassigns it to a live peer this same cycle
+rather than waiting out the ~125s per-hash request timeout. Returns the
+number released.
+
+Mirrors Bitcoin Core's PeerManagerImpl::FinalizeNode, which drops a
+disconnected node's mapBlocksInFlight entries so FindNextBlocksToDownload
+reassigns them immediately. Without this, a peer that FIN'd while holding
+a critical-path block stalls the tip for up to the full request timeout
+(per the 2026-05-24 close-wait follow-up). The per-hash timeout counter
+is deliberately left untouched — the peer dying is not the block's fault,
+so it keeps its full retry budget on reassignment."
+  (if (null *ibd-context*)
+      0
+      (let ((in-flight (ibd-context-in-flight *ibd-context*))
+            (orphaned '()))
+        (maphash (lambda (hash peer-time)
+                   (unless (eq (peer-state (car peer-time)) :ready)
+                     (push hash orphaned)))
+                 in-flight)
+        (dolist (hash orphaned)
+          (remhash hash in-flight))
+        (length orphaned))))
+
 (defun retry-timed-out-requests (&optional peers)
   "Remove timed out requests from in-flight so they can be retried.
 When PEERS is provided, tracks per-peer timeouts and disconnects slow
@@ -813,9 +839,15 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
   (unless (and *ibd-context* peers)
     (return-from request-blocks-from-peers 0))
 
-  ;; Always retry timed-out requests first — even under backpressure. Otherwise
-  ;; in-flight requests that timed out (peer dropped, request lost) stay stuck
-  ;; forever once the queue fills, including the very block we need to advance.
+  ;; Reassign blocks held by peers that have since disconnected — they'd
+  ;; otherwise sit in-flight until the per-hash timeout before any live
+  ;; peer could be asked. Then retry timed-out requests — even under
+  ;; backpressure — so in-flight requests that were lost (peer dropped,
+  ;; request lost) don't stay stuck once the queue fills, including the
+  ;; very block we need to advance.
+  (let ((orphaned (release-orphaned-in-flight)))
+    (when (> orphaned 0)
+      (bitcoin-lisp:log-warn "Released ~D in-flight blocks from disconnected peers" orphaned)))
   (let ((retried (retry-timed-out-requests peers)))
     (when (> retried 0)
       (bitcoin-lisp:log-warn "Retrying ~D timed out block requests" retried)))
