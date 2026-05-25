@@ -495,6 +495,91 @@ doesn't add it again."
     (is (= 0 (bitcoin-lisp.networking::queue-missing-fork-blocks
               (list (cons h 50)))))))
 
+;;;; notfound handling + availability-aware request routing
+;;;;
+;;;; Regression for the 2026-05-25 fork-recovery stall: 6 fork blocks
+;;;; needed for a reorg were requested round-robin from peers that didn't
+;;;; have them, perpetually timed out, and the reorg never completed.
+;;;; notfound lets a peer tell us it lacks a block; the scheduler then
+;;;; stops asking it, and drops the block once ALL peers have disclaimed.
+
+(test note-block-not-available-records-and-releases-in-flight
+  "note-block-not-available records the disclaim and, if the block was
+in-flight to THIS peer, releases it for immediate retry elsewhere."
+  (let* ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+         (peer (%make-peer-with-state :ready))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)))
+    (setf (gethash hash (bitcoin-lisp.networking::ibd-context-in-flight
+                         bitcoin-lisp.networking::*ibd-context*))
+          (cons peer (get-internal-real-time)))
+    (bitcoin-lisp.networking::note-block-not-available peer hash)
+    (is (bitcoin-lisp.networking::peer-disclaimed-block-p peer hash))
+    (is (null (gethash hash (bitcoin-lisp.networking::ibd-context-in-flight
+                             bitcoin-lisp.networking::*ibd-context*))))))
+
+(test note-block-not-available-keeps-in-flight-held-by-other-peer
+  "A notfound from peer A must not release an in-flight request that
+peer B is still servicing."
+  (let* ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+         (peer-a (%make-peer-with-state :ready))
+         (peer-b (%make-peer-with-state :ready))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4)))
+    (setf (gethash hash (bitcoin-lisp.networking::ibd-context-in-flight
+                         bitcoin-lisp.networking::*ibd-context*))
+          (cons peer-b (get-internal-real-time)))
+    (bitcoin-lisp.networking::note-block-not-available peer-a hash)
+    (is (bitcoin-lisp.networking::peer-disclaimed-block-p peer-a hash))
+    ;; B's request is untouched.
+    (let ((entry (gethash hash (bitcoin-lisp.networking::ibd-context-in-flight
+                                bitcoin-lisp.networking::*ibd-context*))))
+      (is (eq peer-b (car entry))))))
+
+(test peer-best-known-height-resolves-from-index
+  "peer-best-known-height returns the height of the peer's best-known
+block when in the index, and NIL when availability is unknown."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 6)))
+    (is (null (bitcoin-lisp.networking::peer-best-known-height peer state)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash hash :height 42 :chain-work 100 :status :header-valid))
+    (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer) hash)
+    (is (= 42 (bitcoin-lisp.networking::peer-best-known-height peer state)))))
+
+(test request-blocks-drops-block-when-all-peers-disclaim
+  "When every ready peer has answered notfound for a pending block, the
+scheduler drops it from pending — a stale fork no peer can serve — so
+IBD stops retrying it forever."
+  (let* ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (peer-a (%make-peer-with-state :ready))
+         (peer-b (%make-peer-with-state :ready))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5)))
+    ;; Block is pending at a height within the download window of tip 0.
+    (setf (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
+                         bitcoin-lisp.networking::*ibd-context*)) 5)
+    ;; Both peers have disclaimed it.
+    (bitcoin-lisp.networking::note-block-not-available peer-a hash)
+    (bitcoin-lisp.networking::note-block-not-available peer-b hash)
+    (bitcoin-lisp.networking::request-blocks-from-peers (list peer-a peer-b) state)
+    (is (null (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
+                             bitcoin-lisp.networking::*ibd-context*))))))
+
+(test handle-notfound-marks-block-disclaimed
+  "An incoming notfound message for a block marks it disclaimed on the
+peer (wire-path coverage of the parse + dispatch)."
+  (let* ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+         (peer (%make-peer-with-state :ready))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
+         (inv (bitcoin-lisp.serialization:make-inv-vector
+               :type bitcoin-lisp.serialization:+inv-type-witness-block+ :hash hash))
+         (payload (flexi-streams:with-output-to-sequence (s)
+                    (bitcoin-lisp.serialization::write-compact-size s 1)
+                    (bitcoin-lisp.serialization::write-inv-vector s inv))))
+    (bitcoin-lisp.networking::handle-notfound peer payload)
+    (is (bitcoin-lisp.networking::peer-disclaimed-block-p peer hash))))
+
 ;;;; Progress Reporting Tests
 
 (test ibd-progress-reporting
