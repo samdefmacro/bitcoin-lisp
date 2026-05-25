@@ -257,6 +257,36 @@ crash, return NIL."
                :connection nil :state :disconnected :address "10.0.0.3")))
     (is (null (bitcoin-lisp.networking::handle-peer-fin peer)))))
 
+;;;; At-tip FIN reap (drain-and-reap-peer)
+;;;;
+;;;; The block-download loop is gated on (< current-height
+;;;; header-tip-height) and never runs at tip, so its per-peer
+;;;; drain+handle-peer-fin is skipped there. run-ibd now also calls
+;;;; drain-and-reap-peer unconditionally each cycle. Regression for the
+;;;; 2026-05-24 recurrence: a peer that FIN'd at tip (connection-connected
+;;;; already NIL) must be reaped without touching its dead/closed socket.
+
+(test drain-and-reap-peer-reaps-dead-connection-at-tip
+  "A :ready peer whose connection-connected is already NIL is reaped —
+the drain loop is skipped (no socket I/O on a dead connection) and
+handle-peer-fin disconnects it so replace-disconnected-peers can refill."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd))
+         (conn (bitcoin-lisp.networking::make-connection
+                :host "10.0.0.4" :port 48333 :connected nil :socket nil))
+         (peer (bitcoin-lisp.networking:make-peer
+                :connection conn :state :ready :address "10.0.0.4")))
+    (bitcoin-lisp.networking::drain-and-reap-peer peer nil nil nil ctx)
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+    (is (null (bitcoin-lisp.networking::peer-connection peer)))))
+
+(test drain-and-reap-peer-noop-when-no-connection
+  "A peer with peer-connection NIL is a no-op — no crash, state untouched."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd))
+         (peer (bitcoin-lisp.networking:make-peer
+                :connection nil :state :disconnected :address "10.0.0.5")))
+    (bitcoin-lisp.networking::drain-and-reap-peer peer nil nil nil ctx)
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))))
+
 ;;;; Timeout Tests
 
 (test timeout-detection
