@@ -580,6 +580,35 @@ peer (wire-path coverage of the parse + dispatch)."
     (bitcoin-lisp.networking::handle-notfound peer payload)
     (is (bitcoin-lisp.networking::peer-disclaimed-block-p peer hash))))
 
+;;;; In-flight orphan reassignment
+;;;;
+;;;; When a peer disconnects, the blocks it held in-flight must be freed
+;;;; for immediate reassignment (Bitcoin Core's FinalizeNode), not left
+;;;; until the ~125s per-hash timeout. The block stays in pending, so the
+;;;; next get-next-blocks-to-request picks it up.
+
+(test release-orphaned-in-flight-reclaims-disconnected-peer-blocks
+  "Releases in-flight blocks held by a non-:ready peer (still in pending),
+leaving a live peer's in-flight untouched."
+  (let* ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+         (ctx bitcoin-lisp.networking::*ibd-context*)
+         (live (%make-peer-with-state :ready))
+         (dead (%make-peer-with-state :disconnected))
+         (live-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (dead-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+    (setf (gethash live-hash (bitcoin-lisp.networking::ibd-context-pending-blocks ctx)) 10
+          (gethash dead-hash (bitcoin-lisp.networking::ibd-context-pending-blocks ctx)) 11)
+    (setf (gethash live-hash (bitcoin-lisp.networking::ibd-context-in-flight ctx))
+          (cons live (get-internal-real-time))
+          (gethash dead-hash (bitcoin-lisp.networking::ibd-context-in-flight ctx))
+          (cons dead (get-internal-real-time)))
+    (is (= 1 (bitcoin-lisp.networking::release-orphaned-in-flight)))
+    ;; Dead peer's block freed from in-flight but kept in pending.
+    (is (null (gethash dead-hash (bitcoin-lisp.networking::ibd-context-in-flight ctx))))
+    (is (= 11 (gethash dead-hash (bitcoin-lisp.networking::ibd-context-pending-blocks ctx))))
+    ;; Live peer's in-flight is untouched.
+    (is (eq live (car (gethash live-hash (bitcoin-lisp.networking::ibd-context-in-flight ctx)))))))
+
 ;;;; Progress Reporting Tests
 
 (test ibd-progress-reporting
