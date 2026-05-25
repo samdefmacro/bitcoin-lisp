@@ -63,6 +63,13 @@
   ;; (it's likely a competing-fork block that peers won't serve).
   ;; hash -> integer.
   (request-timeouts (make-hash-table :test 'equalp) :type hash-table)
+  ;; Peers that answered `notfound` for a pending block. hash -> list of
+  ;; peers. The scheduler won't re-request a block from a peer that has
+  ;; disclaimed it, and drops the block once every ready peer has. Scoped
+  ;; to the block's pending lifecycle: cleared when the block is received,
+  ;; re-queued (a fresh download attempt), or dropped — so a peer is never
+  ;; permanently excluded from a block it may later receive.
+  (block-disclaims (make-hash-table :test 'equalp) :type hash-table)
   ;; Configuration
   (max-in-flight 16 :type (unsigned-byte 8))
   (request-timeout 60 :type (unsigned-byte 16))  ; seconds
@@ -189,6 +196,51 @@ resolution (the header may arrive in a subsequent message)."
        ;; (net_processing.cpp:1390).
        (setf (peer-hash-last-unknown-block peer) hash)))))
 
+(defun peer-best-known-height (peer chain-state)
+  "PEER's best-advertised block height, or NIL if we have no availability
+info for it yet. Used as a cheap routing proxy for Bitcoin Core's
+FindNextBlocksToDownload ancestor test (net_processing.cpp:1437): a peer
+whose best-known tip is below a block's height cannot have that block.
+Deliberately height-only — no chain ancestor walk — because the
+skip-list ancestor index was reverted for a live regression (PR #71)."
+  (let ((bk (peer-best-known-block-hash peer)))
+    (when bk
+      (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state bk)))
+        (when entry
+          (bitcoin-lisp.storage:block-index-entry-height entry))))))
+
+(defun peer-disclaimed-block-p (peer hash)
+  "T if PEER has answered `notfound` for block HASH in the current
+download attempt (see ibd-context-block-disclaims)."
+  (and *ibd-context*
+       (member peer (gethash hash (ibd-context-block-disclaims *ibd-context*))
+               :test #'eq)
+       t))
+
+(defun drop-pending-block (hash)
+  "Remove HASH from the pending queue and all per-hash bookkeeping
+(timeout counters, notfound disclaims). Used both when a block has
+timed out too many times and when every peer has disclaimed it."
+  (when *ibd-context*
+    (remhash hash (ibd-context-pending-blocks *ibd-context*))
+    (remhash hash (ibd-context-request-timeouts *ibd-context*))
+    (remhash hash (ibd-context-block-disclaims *ibd-context*))))
+
+(defun note-block-not-available (peer hash)
+  "Record that PEER answered `notfound` for block HASH and release the
+block from in-flight (if this peer held it) so it can be re-requested
+from a different peer immediately, rather than waiting out the full
+request timeout. The scheduler skips disclaiming peers and drops the
+block entirely once all peers have disclaimed it. Mirrors Bitcoin
+Core's MSG NOTFOUND handling, which clears the peer's block request."
+  (when *ibd-context*
+    (pushnew peer (gethash hash (ibd-context-block-disclaims *ibd-context*))
+             :test #'eq)
+    (let* ((in-flight (ibd-context-in-flight *ibd-context*))
+           (entry (gethash hash in-flight)))
+      (when (and entry (eq (car entry) peer))
+        (remhash hash in-flight)))))
+
 (defun queue-missing-fork-blocks (missing-blocks)
   "MISSING-BLOCKS is a list of (hash . height) cons cells, returned by
 perform-reorg when it refused due to blocks missing from the store.
@@ -207,9 +259,11 @@ deferred-reorg loop bug (project_per_peer_block_tracking.md)."
         ;; Only queue if not already pending or in-flight.
         (unless (or (gethash hash pending) (gethash hash in-flight))
           (setf (gethash hash pending) height)
-          ;; Reset timeout counter so retry-timed-out-requests gives
-          ;; this hash a fresh +max-block-request-timeouts+ budget.
+          ;; Reset timeout counter and notfound disclaims so this is a
+          ;; fresh download attempt — peers that disclaimed it on a prior
+          ;; attempt may have received it since.
           (remhash hash timeouts)
+          (remhash hash (ibd-context-block-disclaims *ibd-context*))
           (incf queued))))
     (when (plusp queued)
       (bitcoin-lisp:log-warn "Re-queued ~D missing fork blocks for download"
@@ -599,9 +653,10 @@ in-flight entry so report-ibd-progress can surface p50/p95."
           (push (list now (peer-address peer) latency-ms)
                 (ibd-context-delivery-samples *ibd-context*)))))
     (remhash hash (ibd-context-in-flight *ibd-context*))
-    ;; Clear the per-hash timeout counter so a future re-request of
-    ;; this hash (e.g. on a reorg) starts with a fresh budget.
-    (remhash hash (ibd-context-request-timeouts *ibd-context*))))
+    ;; Clear the per-hash timeout counter and any notfound disclaims so a
+    ;; future re-request of this hash (e.g. on a reorg) starts fresh.
+    (remhash hash (ibd-context-request-timeouts *ibd-context*))
+    (remhash hash (ibd-context-block-disclaims *ibd-context*))))
 
 (defun compute-block-download-timeout (num-downloading-peers)
   "Compute block download timeout in seconds based on number of peers.
@@ -667,8 +722,7 @@ won't serve would otherwise loop forever, blocking IBD termination."
         ;; got auto-queued by process-headers. activate-block will
         ;; re-request on demand if a future block makes this fork win.
         (when (>= (1+ timeouts) +max-block-request-timeouts+)
-          (remhash hash (ibd-context-pending-blocks *ibd-context*))
-          (remhash hash (ibd-context-request-timeouts *ibd-context*))
+          (drop-pending-block hash)
           (incf dropped))))
     (when (plusp dropped)
       (bitcoin-lisp:log-debug "Dropped ~D pending blocks after ~D timeouts each"
@@ -711,6 +765,42 @@ won't serve would otherwise loop forever, blocking IBD termination."
                    (incf count)))
                (ibd-context-in-flight *ibd-context*)))
     count))
+
+(defun select-peer-for-block (hash height ready-peers peer-counts bk-heights max-per-peer)
+  "Pick the best ready peer to request block HASH (at HEIGHT) from, and
+count how many ready peers have disclaimed it. Returns (values peer
+disclaimed-count). Candidate preference mirrors Bitcoin Core's
+FindNextBlocksToDownload, which only asks peers whose best-known chain
+reaches the block:
+  tier 1 — peer's best-known height >= HEIGHT,
+  tier 2 — peer with no availability info yet (worth trying),
+  tier 3 — peer whose info says too-short (our info may be stale, so a
+           fallback rather than a hard exclusion).
+Within a tier, the peer with the fewest in-flight requests wins (load
+balancing; READY-PEERS is latency-sorted so ties favor the faster peer).
+Peers that answered `notfound` are always skipped and counted instead.
+PEER-COUNTS and BK-HEIGHTS are precomputed once per call by the caller."
+  (let ((disclaimed 0)
+        (best nil)
+        (best-tier most-positive-fixnum)
+        (best-count 0))
+    (dolist (peer ready-peers)
+      (let ((count (gethash peer peer-counts 0)))
+        (cond
+          ((peer-disclaimed-block-p peer hash)
+           (incf disclaimed))
+          ((>= count max-per-peer)
+           nil)  ; at per-peer limit this cycle
+          (t
+           (let* ((bk-height (gethash peer bk-heights))
+                  (tier (cond ((null bk-height) 2)
+                              ((and height (>= bk-height height)) 1)
+                              (t 3))))
+             (when (or (null best)
+                       (< tier best-tier)
+                       (and (= tier best-tier) (< count best-count)))
+               (setf best-tier tier best-count count best peer)))))))
+    (values best disclaimed)))
 
 (defun request-blocks-from-peers (peers chain-state)
   "Request blocks from multiple peers, distributing the load.
@@ -777,32 +867,38 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
       (when (null to-request)
         (return-from request-blocks-from-peers 0))
 
-      ;; Distribute requests across peers, respecting per-peer limits
+      ;; Distribute requests across peers, respecting per-peer limits.
+      ;; peer-counts (in-flight per peer) and bk-heights (each peer's
+      ;; best-known block height) are computed once per call here and read
+      ;; by select-peer-for-block, rather than re-derived per (block,peer).
       (let ((requests-made 0)
             (peer-requests (make-hash-table :test 'eq))
-            (peer-counts (make-hash-table :test 'eq)))
-        ;; Initialize per-peer counts
+            (peer-counts (make-hash-table :test 'eq))
+            (bk-heights (make-hash-table :test 'eq))
+            (pending (ibd-context-pending-blocks *ibd-context*))
+            (num-ready (length ready-peers)))
         (dolist (peer ready-peers)
-          (setf (gethash peer peer-counts) (count-peer-in-flight peer)))
+          (setf (gethash peer peer-counts) (count-peer-in-flight peer))
+          (setf (gethash peer bk-heights) (peer-best-known-height peer chain-state)))
 
-        ;; Assign blocks round-robin, skipping peers at their limit
-        (let ((peer-index 0)
-              (num-peers (length ready-peers)))
-          (dolist (hash to-request)
-            ;; Find next peer with budget
-            (let ((found nil))
-              (dotimes (attempts num-peers)
-                (let* ((peer (nth (mod (+ peer-index attempts) num-peers) ready-peers))
-                       (current (gethash peer peer-counts 0)))
-                  (when (< current max-per-peer)
-                    (mark-block-in-flight hash peer)
-                    (push hash (gethash peer peer-requests))
-                    (setf (gethash peer peer-counts) (1+ current))
-                    (setf peer-index (1+ (mod (+ peer-index attempts) num-peers)))
-                    (incf requests-made)
-                    (setf found t)
-                    (return))))
-              (unless found (return)))))
+        (dolist (hash to-request)
+          (multiple-value-bind (best disclaimed)
+              (select-peer-for-block hash (gethash hash pending)
+                                     ready-peers peer-counts bk-heights max-per-peer)
+            (cond
+              (best
+               (mark-block-in-flight hash best)
+               (push hash (gethash best peer-requests))
+               (setf (gethash best peer-counts) (1+ (gethash best peer-counts 0)))
+               (incf requests-made))
+              ;; No peer can serve it and every ready peer has disclaimed
+              ;; it (a stale fork) — drop it so IBD stops retrying forever
+              ;; instead of completing the reorg.
+              ((and (plusp num-ready) (>= disclaimed num-ready))
+               (drop-pending-block hash)
+               (bitcoin-lisp:log-warn
+                "Dropping block ~A — all ~D peers report notfound (stale fork)"
+                (bitcoin-lisp.crypto:bytes-to-hex hash) num-ready)))))
 
         ;; Send batch request to each peer
         (maphash (lambda (peer hashes)

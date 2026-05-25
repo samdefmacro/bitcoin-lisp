@@ -150,6 +150,10 @@ Returns T if message was handled, NIL otherwise."
      (handle-getdata peer payload chain-state mempool)
      t)
 
+    ((string= command "notfound")
+     (handle-notfound peer payload)
+     t)
+
     ((string= command "addr")
      (handle-addr peer payload address-book)
      t)
@@ -198,6 +202,11 @@ Returns T if message was handled, NIL otherwise."
 
 ;;; Inventory handling
 
+(defun block-inv-type-p (inv-type)
+  "T if INV-TYPE is a block inventory type (plain or witness, BIP 144)."
+  (or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
+      (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+)))
+
 (defun handle-inv (peer payload chain-state &optional mempool &key recent-rejects)
   "Handle an inv message.
 
@@ -218,8 +227,7 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
         (cond
-          ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
+          ((block-inv-type-p inv-type)
            ;; Per-peer availability: announcing a block hash counts as
            ;; "peer has it" — update best-known-block (or stage
            ;; hash-last-unknown if we don't have the header yet).
@@ -244,6 +252,20 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
       (send-message peer
                     (bitcoin-lisp.serialization:make-getdata-message
                      (nreverse wanted))))))
+
+;;; Notfound handling
+
+(defun handle-notfound (peer payload)
+  "Handle a notfound message: the peer is telling us it lacks one or
+more items we requested via getdata. For block items, record the
+disclaim so the IBD scheduler stops asking this peer for the block and
+releases it from in-flight for immediate retry elsewhere (see
+note-block-not-available). Without this we burn the full block-request
+timeout on every peer that lacks a stale-fork block before giving up.
+Mirrors Bitcoin Core's MSG NOTFOUND handling (net_processing.cpp)."
+  (dolist (inv (bitcoin-lisp.serialization:parse-inv-payload payload))
+    (when (block-inv-type-p (bitcoin-lisp.serialization:inv-vector-type inv))
+      (note-block-not-available peer (bitcoin-lisp.serialization:inv-vector-hash inv)))))
 
 ;;; Headers handling
 
