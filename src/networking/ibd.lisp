@@ -939,6 +939,110 @@ was disconnected (handler-case yielded successfully)."
     (handler-case (progn (disconnect-peer peer) t)
       (error () nil))))
 
+(defun dispatch-ibd-message (peer command payload chain-state utxo-set block-store ctx
+                             &key fee-estimator recent-rejects)
+  "Process one wire message from PEER during IBD: connect a received
+block, ingest announced headers, or hand anything else to the generic
+handler. Shared by the block-download drain and the at-tip reap pass."
+  (cond
+    ((string= command "block")
+     (let* ((block (bitcoin-lisp.serialization:parse-block-payload payload))
+            (header (bitcoin-lisp.serialization:bitcoin-block-header block))
+            (hash (bitcoin-lisp.serialization:block-header-hash header)))
+       ;; Forensic raw-payload capture: dump the wire-format
+       ;; (witness-included) bytes to a side dir before parse loses
+       ;; witness data. Triggered only when *forensic-store-from-height*
+       ;; is set.
+       (when *forensic-store-from-height*
+         (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                       chain-state hash)))
+           (when (and entry
+                      (>= (bitcoin-lisp.storage:block-index-entry-height entry)
+                          *forensic-store-from-height*))
+             (let* ((dir "/data/bitcoin-lisp/forensic-blocks/")
+                    (path (format nil "~A~A.raw" dir
+                                  (bitcoin-lisp.crypto:bytes-to-hex hash))))
+               (ignore-errors (ensure-directories-exist dir))
+               (with-open-file (s path :direction :output
+                                       :if-exists :supersede
+                                       :element-type '(unsigned-byte 8))
+                 (write-sequence payload s))))))
+       ;; Per-peer availability: receiving a block proves peer had it.
+       (update-block-availability peer chain-state hash)
+       (mark-block-received hash)
+       (record-block-received-from-peer peer)
+       (process-received-block block chain-state utxo-set block-store
+                               :fee-estimator fee-estimator
+                               :recent-rejects recent-rejects)))
+
+    ((string= command "headers")
+     (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
+       (process-headers headers chain-state)
+       (incf (ibd-context-headers-received ctx) (length headers))
+       ;; Per-peer availability: peer's tip is the last header in the batch.
+       (let ((last (car (last headers))))
+         (when last
+           (update-block-availability
+            peer chain-state
+            (bitcoin-lisp.serialization:block-header-hash last))))))
+
+    (t (handle-message peer command payload
+                       chain-state utxo-set block-store
+                       :fee-estimator fee-estimator
+                       :recent-rejects recent-rejects))))
+
+(defun drain-and-reap-peer (peer chain-state utxo-set block-store ctx
+                            &key fee-estimator recent-rejects)
+  "Pump every currently-readable message from PEER, then reap it if its
+connection has gone dead. Mirrors the per-peer branch of Bitcoin Core's
+CConnman::SocketHandlerConnected (net.cpp:2204): drain readable data,
+and on recv()==0 / send error mark the peer for disconnect.
+
+A dead socket can make usocket:wait-for-input or read-sequence (inside
+receive-message) raise SIMPLE-STREAM-ERROR; the handler-case keeps that
+per-peer so the outer loop keeps iterating other peers (without it the
+error escaped run-ibd and killed the sync thread — incident 2026-05-09).
+
+Draining a peer whose remote has FIN'd eventually hits a zero-progress
+read, which flips connection-connected to NIL; handle-peer-fin then
+disconnects it so replace-disconnected-peers can refill the slot."
+  (when (and (eq (peer-state peer) :ready)
+             ;; A prior in-loop disconnect (rate-limit, oversized payload)
+             ;; NILs peer-connection; guard so connection-socket below
+             ;; doesn't raise TYPE-ERROR (which the handler-case below does
+             ;; not catch) and kill the sync thread.
+             (peer-connection peer)
+             ;; Only drain a connection still believed live. If a previous
+             ;; read already flipped connection-connected to NIL (and may
+             ;; have NILed the socket), skip straight to handle-peer-fin —
+             ;; no point waiting for input on a dead/closed socket.
+             (connection-connected (peer-connection peer)))
+    (handler-case
+        ;; Drain only as long as the socket actually has data ready
+        ;; (usocket:wait-for-input :timeout 0 is non-blocking). This lets us
+        ;; pull all queued messages in the batch without ever timing out
+        ;; mid-payload, then exit immediately when nothing is left to read.
+        (loop repeat +max-messages-per-peer-per-cycle+
+              ;; Re-check liveness every iteration: a mid-drain dispatch can
+              ;; disconnect the peer (rate-limit, oversized payload), NILing
+              ;; the connection or flipping connection-connected — both of
+              ;; which data-available-p folds in (non-blocking, :timeout 0).
+              while (and (peer-connection peer)
+                         (data-available-p (peer-connection peer)))
+              for (command payload) = (multiple-value-list
+                                       (receive-message peer :timeout 5))
+              while command
+              do (dispatch-ibd-message peer command payload chain-state
+                                       utxo-set block-store ctx
+                                       :fee-estimator fee-estimator
+                                       :recent-rejects recent-rejects))
+      ((or stream-error usocket:socket-condition end-of-file) (c)
+        (bitcoin-lisp:log-warn
+         "Peer ~A I/O error during message drain — disconnecting: ~A"
+         (peer-address peer) c)
+        (handler-case (disconnect-peer peer) (error () nil)))))
+  (handle-peer-fin peer))
+
 (defun start-ibd (peers chain-state utxo-set block-store target-height
                    &key fee-estimator recent-rejects)
   "Start Initial Block Download.
@@ -1038,85 +1142,9 @@ Returns the number of blocks downloaded."
                  ;; outer-loop iteration so kernel TCP buffers don't fill up
                  ;; while we're busy validating an earlier (heavy) block.
                  (dolist (peer peers)
-                   (when (eq (peer-state peer) :ready)
-                     ;; Per-peer I/O boundary: a dead socket can cause LISTEN
-                     ;; (inside usocket:wait-for-input) or read-sequence (inside
-                     ;; receive-message) to raise SIMPLE-STREAM-ERROR. Bitcoin
-                     ;; Core handles the same failure mode in
-                     ;; CConnman::SocketHandlerConnected (net.cpp:2204-2214):
-                     ;; per-peer recv errors set pnode->fDisconnect and the
-                     ;; outer loop continues iterating other peers. Without
-                     ;; this handler the error escaped run-ibd and killed the
-                     ;; whole sync thread (incident 2026-05-09).
-                     (handler-case
-                         ;; Drain only as long as the socket actually has data ready
-                         ;; (usocket:wait-for-input :timeout 0 is non-blocking). This
-                         ;; lets us pull all queued messages in the batch without
-                         ;; ever timing out mid-payload, then exit immediately when
-                         ;; nothing is left to read.
-                         (loop repeat +max-messages-per-peer-per-cycle+
-                               while (usocket:wait-for-input
-                                      (bitcoin-lisp.networking::connection-socket
-                                       (peer-connection peer))
-                                      :timeout 0 :ready-only t)
-                               for (command payload) = (multiple-value-list
-                                                         (receive-message peer :timeout 5))
-                               while command
-                               do (cond
-                                    ((string= command "block")
-                                     (let* ((block (bitcoin-lisp.serialization:parse-block-payload payload))
-                                            (header (bitcoin-lisp.serialization:bitcoin-block-header block))
-                                            (hash (bitcoin-lisp.serialization:block-header-hash header)))
-                                       ;; Forensic raw-payload capture: dump the
-                                       ;; wire-format (witness-included) bytes to
-                                       ;; a side dir before parse loses witness
-                                       ;; data. Triggered only when
-                                       ;; *forensic-store-from-height* is set.
-                                       (when *forensic-store-from-height*
-                                         (let ((entry (bitcoin-lisp.storage:get-block-index-entry
-                                                       chain-state hash)))
-                                           (when (and entry
-                                                      (>= (bitcoin-lisp.storage:block-index-entry-height entry)
-                                                          *forensic-store-from-height*))
-                                             (let* ((dir "/data/bitcoin-lisp/forensic-blocks/")
-                                                    (path (format nil "~A~A.raw" dir
-                                                                  (bitcoin-lisp.crypto:bytes-to-hex hash))))
-                                               (ignore-errors (ensure-directories-exist dir))
-                                               (with-open-file (s path :direction :output
-                                                                       :if-exists :supersede
-                                                                       :element-type '(unsigned-byte 8))
-                                                 (write-sequence payload s))))))
-                                       ;; Per-peer availability: receiving a block
-                                       ;; proves peer had it.
-                                       (update-block-availability peer chain-state hash)
-                                       (mark-block-received hash)
-                                       (record-block-received-from-peer peer)
-                                       (process-received-block block chain-state utxo-set block-store
-                                                               :fee-estimator fee-estimator
-                                                               :recent-rejects recent-rejects)))
-
-                                    ((string= command "headers")
-                                     (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-                                       (process-headers headers chain-state)
-                                       (incf (ibd-context-headers-received ctx) (length headers))
-                                       ;; Per-peer availability: peer's tip is
-                                       ;; the last header in the batch.
-                                       (let ((last (car (last headers))))
-                                         (when last
-                                           (update-block-availability
-                                            peer chain-state
-                                            (bitcoin-lisp.serialization:block-header-hash last))))))
-
-                                    (t (handle-message peer command payload
-                                                       chain-state utxo-set block-store
-                                                       :fee-estimator fee-estimator
-                                                       :recent-rejects recent-rejects))))
-                       ((or stream-error usocket:socket-condition end-of-file) (c)
-                         (bitcoin-lisp:log-warn
-                          "Peer ~A I/O error during message drain — disconnecting: ~A"
-                          (peer-address peer) c)
-                         (handler-case (disconnect-peer peer) (error () nil))))
-                     (handle-peer-fin peer)))
+                   (drain-and-reap-peer peer chain-state utxo-set block-store ctx
+                                        :fee-estimator fee-estimator
+                                        :recent-rejects recent-rejects))
 
                  ;; Per-block request timeout retries (retry-timed-out-requests
                  ;; in request-blocks-from-peers) is our peer-disconnect path:
@@ -1139,6 +1167,25 @@ Returns the number of blocks downloaded."
                    (when (> (- now last-report-time) report-interval)
                      (report-ibd-progress chain-state)
                      (setf last-report-time now))))))
+
+    ;; At-tip FIN reap: the block-download loop above is gated on
+    ;; (< current-height header-tip-height), so once we reach the tip it
+    ;; never runs — and neither does its per-peer drain+handle-peer-fin.
+    ;; But peers that FIN during a fork-recovery window do so precisely at
+    ;; tip, leaving sockets in CLOSE-WAIT with peer-state stuck :ready and
+    ;; the node spinning the empty header poll forever (incident 2026-05-22;
+    ;; recurred 2026-05-24 because PR #73 wired the reap only into the
+    ;; block-download loop). Pump every peer's readable socket once per
+    ;; run-ibd invocation — i.e. once per outer 30s sync poll
+    ;; (node.lisp:454-462) — so a dead connection surfaces (zero-progress
+    ;; read flips connection-connected) and gets reaped; the subsequent
+    ;; replace-disconnected-peers (node.lisp) then refills the slot. Mirrors
+    ;; Bitcoin Core's SocketHandlerConnected running on every event-loop
+    ;; pass, not only during block download (net.cpp:2204).
+    (dolist (peer peers)
+      (drain-and-reap-peer peer chain-state utxo-set block-store ctx
+                           :fee-estimator fee-estimator
+                           :recent-rejects recent-rejects))
 
     ;; Done — distinguish "actually finished" from "paused due to no peers".
     ;; Either: pending+in-flight both zero (we drained), OR
