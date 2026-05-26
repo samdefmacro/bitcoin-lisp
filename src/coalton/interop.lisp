@@ -1023,10 +1023,17 @@ Used to get the redeem script from a P2SH scriptSig."
       ;; Check result
       (if (bitcoin-lisp.coalton.script:script-result-ok-p result)
           (let ((final-stack (bitcoin-lisp.coalton.script:get-ok-stack result)))
-            ;; Script succeeded, check if top of stack is truthy
-            (if (stack-top-truthy-p final-stack)
-                (values t nil)
-                (values nil :script-eval-false)))
+            (cond
+              ;; Top of stack must be truthy.
+              ((not (stack-top-truthy-p final-stack))
+               (values nil :script-eval-false))
+              ;; CLEANSTACK: witness-script execution requires EXACTLY one
+              ;; element left on the stack — unconditionally, not gated on
+              ;; the (policy) CLEANSTACK flag. Mirrors ExecuteWitnessScript
+              ;; (interpreter.cpp:1867). The P2WSH path enforces the same.
+              ((and (consp final-stack) (consp (cdr final-stack)))
+               (values nil :cleanstack))
+              (t (values t nil))))
           (let ((err (bitcoin-lisp.coalton.script:script-result-error result)))
             (when *debug-bip341-sighash*
               (bitcoin-lisp:log-warn "run-tapscript ScriptErr: ~A" err))
