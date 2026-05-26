@@ -182,11 +182,11 @@ values (the scriptPubKey section above only covers address derivation)."
         (bitcoin-lisp.coalton.interop:set-script-flags nil)))))
 
 (test taproot-spend-vectors-baseline
-  "Taproot key-path (DEFAULT, ALL|ANYONECANPAY), key-path with annex, and
-script-path CHECKSIG spends verify successfully. (The OP_CODESEPARATOR
-record is asserted once tapscript codesep-position sighash support lands.)"
+  "All generated taproot spends verify: key-path (DEFAULT, ALL|ANYONECANPAY),
+key-path with annex, script-path CHECKSIG, and script-path with
+OP_CODESEPARATOR after a push (exercises the BIP 341 sighash annex +
+codeseparator-opcode-position commitments)."
   (dolist (rec (load-taproot-spend-vectors))
     (let ((comment (gethash "comment" rec)))
-      (unless (search "codesep=True" comment)
-        (multiple-value-bind (ok err) (run-taproot-spend-vector rec)
-          (is (eq t ok) "taproot vector [~A] failed: ~A" comment err))))))
+      (multiple-value-bind (ok err) (run-taproot-spend-vector rec)
+        (is (eq t ok) "taproot vector [~A] failed: ~A" comment err)))))

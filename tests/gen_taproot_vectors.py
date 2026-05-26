@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "refs", "bitcoin", "test", "function
 
 from test_framework.script import (
     CScript, taproot_construct, TaprootSignatureHash,
-    OP_CHECKSIG, OP_CODESEPARATOR, OP_1,
+    OP_CHECKSIG, OP_CODESEPARATOR, OP_DROP, OP_1,
     LEAF_VERSION_TAPSCRIPT, SIGHASH_DEFAULT, SIGHASH_ALL, SIGHASH_ANYONECANPAY,
 )
 from test_framework.key import (
@@ -83,8 +83,11 @@ def scriptpath(codesep=False):
     priv = generate_privkey()
     pub, _ = compute_xonly_pubkey(priv)
     if codesep:
-        leaf = CScript([OP_CODESEPARATOR, pub, OP_CHECKSIG])
-        codeseparator_pos = 0
+        # OP_CODESEPARATOR after a 10-byte push + OP_DROP: opcode index 2,
+        # but byte offset 12 — so this vector only verifies if the sighash
+        # commits the OPCODE INDEX (not the byte offset).
+        leaf = CScript([bytes(10), OP_DROP, OP_CODESEPARATOR, pub, OP_CHECKSIG])
+        codeseparator_pos = 2
     else:
         leaf = CScript([pub, OP_CHECKSIG])
         codeseparator_pos = 0xFFFFFFFF
