@@ -2147,6 +2147,21 @@
           (ScriptErr SE-ScriptTooLarge)
           (execute-script-loop (make-script-context-with-tx script locktime version sequence)))))
 
+  (declare push-and-continue ((Vector U8) -> ScriptContext -> (ScriptResult ScriptStack)))
+  (define (push-and-continue data ctx)
+    "Push DATA onto the main stack, enforce the combined main+alt stack
+size limit, then continue the loop. Bitcoin Core checks MAX_STACK_SIZE
+after EVERY opcode including pushes (interpreter.cpp:1221-1223); without
+the post-push check a push-only script could grow the stack past 1000
+items (well within the 10000-byte script cap) and be wrongly accepted —
+a consensus split."
+    (let ((next (context-push data ctx)))
+      (if (> (+ (stack-depth (context-main-stack next))
+                (stack-depth (context-alt-stack next)))
+             +max-stack-size+)
+          (ScriptErr SE-StackOverflow)
+          (execute-script-loop next))))
+
   (declare execute-script-loop (ScriptContext -> (ScriptResult ScriptStack)))
   (define (execute-script-loop ctx)
     "Main execution loop for script processing."
@@ -2196,7 +2211,7 @@
                                (match (check-minimal-push n data)
                                  ((ScriptErr e) (ScriptErr e))
                                  ((ScriptOk _)
-                                  (execute-script-loop (context-push data next-ctx))))
+                                  (push-and-continue data next-ctx)))
                                (execute-script-loop next-ctx)))))
 
                        ;; OP_PUSHDATA1 - 1 byte length prefix
@@ -2218,7 +2233,7 @@
                                         (match (check-minimal-push #x4c data)
                                           ((ScriptErr e) (ScriptErr e))
                                           ((ScriptOk _)
-                                           (execute-script-loop (context-push data next-ctx))))
+                                           (push-and-continue data next-ctx)))
                                         (execute-script-loop next-ctx)))))))))
 
                        ;; OP_PUSHDATA2 - 2 byte length prefix (little endian)
@@ -2242,7 +2257,7 @@
                                         (match (check-minimal-push #x4d data)
                                           ((ScriptErr e) (ScriptErr e))
                                           ((ScriptOk _)
-                                           (execute-script-loop (context-push data next-ctx))))
+                                           (push-and-continue data next-ctx)))
                                         (execute-script-loop next-ctx)))))))))
 
                        ;; OP_PUSHDATA4 - 4 byte length prefix (little endian)
@@ -2268,7 +2283,7 @@
                                         (match (check-minimal-push #x4e data)
                                           ((ScriptErr e) (ScriptErr e))
                                           ((ScriptOk _)
-                                           (execute-script-loop (context-push data next-ctx))))
+                                           (push-and-continue data next-ctx)))
                                         (execute-script-loop next-ctx)))))))))
 
                        ;; All other opcodes
