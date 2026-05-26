@@ -1132,3 +1132,27 @@ the limit is checked after every push, not only after non-push opcodes."
     (is-true (bitcoin-lisp.coalton.interop::valid-taproot-sighash-type-p ok)))
   (dolist (bad '(#x80 #x04 #x05 #x84 #x7f #xff))
     (is-false (bitcoin-lisp.coalton.interop::valid-taproot-sighash-type-p bad))))
+
+;;;; Tapscript CLEANSTACK: witness execution requires exactly one stack
+;;;; element (BIP 342 / ExecuteWitnessScript, interpreter.cpp:1867).
+
+(test run-tapscript-cleanstack-rejects-extra-elements
+  "A tapscript leaving more than one element fails :cleanstack even with a
+truthy top (OP_1 OP_1 -> [1,1])."
+  (multiple-value-bind (ok err)
+      (bitcoin-lisp.coalton.interop::run-tapscript
+       (coerce #(#x51 #x51) 'vector) '()
+       (make-array 32 :initial-element 0) 100000
+       (make-array 32 :initial-element 2))
+    (is (null ok))
+    (is (eq :cleanstack err))))
+
+(test run-tapscript-single-element-ok
+  "A tapscript leaving exactly one truthy element succeeds (OP_1)."
+  (multiple-value-bind (ok err)
+      (bitcoin-lisp.coalton.interop::run-tapscript
+       (coerce #(#x51) 'vector) '()
+       (make-array 32 :initial-element 0) 100000
+       (make-array 32 :initial-element 2))
+    (declare (ignore err))
+    (is (eq t ok))))
