@@ -15,6 +15,11 @@
 (defconstant +witness-scale-factor+ 4)       ; BIP 141: legacy sigops weight multiplier
 (defconstant +max-block-weight+ 4000000)     ; BIP 141: max block weight in weight units
 (defconstant +max-future-block-time+ 7200)  ; 2 hours in seconds
+(defconstant +max-timewarp+ 600
+  "BIP 94 timewarp-attack mitigation: on networks that enforce BIP 94
+(testnet4), the first block of each difficulty-adjustment period may not
+be timestamped more than this many seconds before the previous block.
+Bitcoin Core MAX_TIMEWARP (consensus/consensus.h:35).")
 
 ;;; Locktime activation heights (BIPs 65/68/112/113)
 
@@ -411,6 +416,22 @@ Returns T if valid, NIL if invalid."
 
 ;;;; Block header validation
 
+(defun bip94-timewarp-violation-p (header height prev-entry)
+  "T if HEADER violates the BIP 94 timewarp-attack rule: on testnet4, the
+first block of each difficulty-adjustment period (HEIGHT a nonzero
+multiple of the adjustment interval) must be timestamped no more than
++max-timewarp+ seconds before its predecessor's ACTUAL time (not MTP).
+enforce_BIP94 is true only on testnet4 among our networks. Genesis is
+excluded — it satisfies the modulo but has no predecessor. Mirrors
+Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4129-4136)."
+  (and (eq bitcoin-lisp:*network* :testnet4)
+       height prev-entry (plusp height)
+       (zerop (mod height bitcoin-lisp.storage:+difficulty-adjustment-interval+))
+       (< (bitcoin-lisp.serialization:block-header-timestamp header)
+          (- (bitcoin-lisp.serialization:block-header-timestamp
+              (bitcoin-lisp.storage:block-index-entry-header prev-entry))
+             +max-timewarp+))))
+
 (defun validate-block-header (header chain-state current-time
                                &key prev-hash height prev-entry)
   "Validate a block header.
@@ -434,7 +455,12 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
       (let ((mtp (compute-median-time-past chain-state prev-hash)))
         (when (<= timestamp mtp)
           (return-from validate-block-header
-            (values nil :time-too-old))))))
+            (values nil :time-too-old)))))
+
+    ;; BIP 94 timewarp-attack mitigation (see bip94-timewarp-violation-p).
+    (when (bip94-timewarp-violation-p header height prev-entry)
+      (return-from validate-block-header
+        (values nil :time-timewarp-attack))))
 
   ;; Version check: enforce minimum version after softfork activation
   ;; Matches Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4145-4147)
