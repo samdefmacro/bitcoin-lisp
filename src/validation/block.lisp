@@ -716,6 +716,36 @@ rejected, and the no-commitment+witness case is :unexpected-witness
     ((:testnet4 :signet) 1)
     (:mainnet +bip34-activation-height-mainnet+)))
 
+(defconstant +bip34-implies-bip30-limit+ 1983702
+  "BIP 30 is re-enforced unconditionally at this height and above: past
+this point the BIP 34 height-in-coinbase guarantee can no longer rule
+out duplicate coinbases (pre-BIP34 blocks exist with indicated heights
+above it), so the optimization of skipping BIP 30 after BIP 34 is
+dropped. Bitcoin Core BIP34_IMPLIES_BIP30_LIMIT (validation.cpp:2427).")
+
+(defun bip30-repeat-block-p (height)
+  "T for the two grandfathered mainnet blocks (91842, 91880) that contain
+duplicate coinbases predating BIP 30 enforcement; BIP 30 must NOT be
+enforced on them or they would be wrongly rejected. Bitcoin Core
+IsBIP30Repeat (validation.cpp:6208). Only mainnet has these. (We match on
+height only, not the block hash Core also checks — forging a pre-BIP34
+mainnet fork to these heights is infeasible, and no other network has
+repeat blocks.)"
+  (and (eq bitcoin-lisp:*network* :mainnet)
+       (or (= height 91842) (= height 91880))))
+
+(defun bip30-enforced-p (height)
+  "Whether the BIP 30 duplicate-coinbase check must run for a block at
+HEIGHT: enforced below BIP 34 activation (except the grandfathered repeat
+blocks), and again unconditionally at or above +bip34-implies-bip30-limit+.
+Mirrors Bitcoin Core ConnectBlock (validation.cpp:2399-2464). Note: we
+approximate Core's BIP34Hash-ancestor test with a height comparison,
+omitting only the extra enforcement Core applies on a non-canonical fork
+past the BIP 34 height — infeasible to exploit given the PoW required."
+  (or (and (not (bip30-repeat-block-p height))
+           (< height (get-bip34-activation-height bitcoin-lisp:*network*)))
+      (>= height +bip34-implies-bip30-limit+)))
+
 (defun decode-coinbase-height (script-sig)
   "Decode the block height from a BIP 34 coinbase scriptSig.
 The height is encoded as a CScriptNum push at the start of the scriptSig.
@@ -948,9 +978,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
         (return-from validate-block
           (values nil :block-too-large nil))))
 
-    ;; BIP 30: Check for duplicate txids (unspent outputs with same txid)
-    ;; Only needed before BIP 34 activation (height-in-coinbase guarantees uniqueness after)
-    (when (< current-height (get-bip34-activation-height bitcoin-lisp:*network*))
+    ;; BIP 30: reject a block that re-creates a still-unspent txid.
+    (when (bip30-enforced-p current-height)
       (dolist (tx transactions)
         (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
           (when (bitcoin-lisp.storage:any-utxo-for-txid-p utxo-set txid)
