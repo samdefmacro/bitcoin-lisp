@@ -746,10 +746,43 @@ past the BIP 34 height — infeasible to exploit given the PoW required."
            (< height (get-bip34-activation-height bitcoin-lisp:*network*)))
       (>= height +bip34-implies-bip30-limit+)))
 
+(defun encode-bip34-height (height)
+  "The exact coinbase scriptSig prefix Bitcoin Core requires for a BIP 34
+block at HEIGHT: the bytes of `CScript() << height`. Heights 0 and 1..16
+use the minimal OP_0 / OP_1..OP_16 single opcodes; larger heights use a
+minimally-encoded (positive) CScriptNum pushed as data. Returns a byte
+vector. Mirrors validation.cpp:4186."
+  (cond
+    ((zerop height)
+     (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x00))  ; OP_0
+    ((<= 1 height 16)
+     (make-array 1 :element-type '(unsigned-byte 8)
+                 :initial-element (+ #x50 height)))                          ; OP_1..OP_16
+    (t
+     ;; Minimal little-endian CScriptNum bytes, with a trailing 0x00 sign
+     ;; byte if the top byte would otherwise look negative; pushed as data
+     ;; (opcode == byte length, always <= 75 for any real height).
+     (let ((le '())
+           (n height))
+       (loop while (plusp n)
+             do (push (logand n #xff) le)
+                (setf n (ash n -8)))
+       (setf le (nreverse le))
+       (when (logbitp 7 (car (last le)))
+         (setf le (append le (list 0))))
+       (let* ((data-len (length le))
+              (result (make-array (1+ data-len) :element-type '(unsigned-byte 8))))
+         (setf (aref result 0) data-len)
+         (loop for b in le for i from 1 do (setf (aref result i) b))
+         result)))))
+
 (defun decode-coinbase-height (script-sig)
-  "Decode the block height from a BIP 34 coinbase scriptSig.
-The height is encoded as a CScriptNum push at the start of the scriptSig.
-Returns the height as an integer, or NIL if the encoding is invalid."
+  "Decode the claimed block height from a coinbase scriptSig, for
+inspection/display only (RPC, logging). NOT the consensus check — BIP 34
+validation is an exact serialized-prefix match against
+`encode-bip34-height` (see validate-coinbase-height), because Core
+compares bytes rather than numeric value, rejecting non-minimal encodings.
+Returns the decoded height, or NIL if the leading push is malformed."
   (when (zerop (length script-sig))
     (return-from decode-coinbase-height nil))
   (let ((push-len (aref script-sig 0)))
@@ -771,22 +804,24 @@ Returns the height as an integer, or NIL if the encoding is invalid."
       (t nil))))
 
 (defun validate-coinbase-height (block current-height)
-  "Validate BIP 34 coinbase height encoding.
-Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
-Only enforced at or above the network-specific activation height."
+  "Validate BIP 34: at/above the network activation height, the coinbase
+scriptSig must START WITH the exact serialized block height (the byte
+prefix of `CScript() << height`). This is a byte-prefix match, not a
+numeric decode, so non-minimal or wrong-form encodings are rejected even
+when they would decode to the right number. Mirrors validation.cpp:4183-4191.
+Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
   (let ((activation-height (get-bip34-activation-height bitcoin-lisp:*network*)))
     (when (< current-height activation-height)
       (return-from validate-coinbase-height (values t nil))))
   (let* ((coinbase-tx (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
          (first-input (first (bitcoin-lisp.serialization:transaction-inputs coinbase-tx)))
          (script-sig (bitcoin-lisp.serialization:tx-in-script-sig first-input))
-         (encoded-height (decode-coinbase-height script-sig)))
-    (cond
-      ((null encoded-height)
-       (values nil :bad-coinbase-height))
-      ((/= encoded-height current-height)
-       (values nil :bad-coinbase-height))
-      (t (values t nil)))))
+         (expect (encode-bip34-height current-height)))
+    (if (and (>= (length script-sig) (length expect))
+             (loop for i below (length expect)
+                   always (= (aref script-sig i) (aref expect i))))
+        (values t nil)
+        (values nil :bad-coinbase-height))))
 
 (defun calculate-block-weight (transactions)
   "Calculate total block weight as sum of all transaction weights."
