@@ -56,6 +56,26 @@
    consensus bug in the validator, not a network issue. Halting + logging
    beats spinning until the heap exhausts.")
 
+(declaim (inline block-hash-key-hash))
+(defun block-hash-key-hash (k)
+  "Custom :hash-function for the IBD block-hash-keyed tables (pending,
+in-flight, request-timeouts, block-disclaims). Keys are 32-byte SHA256d
+block hashes (already uniformly random), so read the first 8 bytes as a
+fixnum-masked uint64 instead of equalp's full 32-byte data-vector-hash.
+:test stays 'equalp for exact collision resolution. Mirrors utxo-key-hash;
+profile (fresh testnet4 IBD) showed this hashing dominating IBD CPU."
+  (declare (optimize (speed 3)))
+  (if (and (vectorp k) (>= (length k) 8))
+      (logand (+ (aref k 0) (ash (aref k 1) 8) (ash (aref k 2) 16) (ash (aref k 3) 24)
+                 (ash (aref k 4) 32) (ash (aref k 5) 40) (ash (aref k 6) 48) (ash (aref k 7) 56))
+              most-positive-fixnum)
+      (sxhash k)))
+
+(defun make-block-hash-table ()
+  "An equalp hash-table for 32-byte block-hash keys, using the fast
+block-hash-key-hash. Falls back to plain equalp off SBCL."
+  (make-hash-table :test 'equalp #+sbcl :hash-function #+sbcl #'block-hash-key-hash))
+
 (defstruct ibd-context
   "Context for managing Initial Block Download."
   (state :idle :type keyword)
@@ -66,22 +86,22 @@
   ;; Header tip (separate from validated block tip in chain-state)
   (header-tip-height 0 :type (unsigned-byte 32))
   ;; Download queue
-  (pending-blocks (make-hash-table :test 'equalp) :type hash-table)  ; hash -> height
-  (in-flight (make-hash-table :test 'equalp) :type hash-table)       ; hash -> (peer . timestamp)
+  (pending-blocks (make-block-hash-table) :type hash-table)  ; hash -> height
+  (in-flight (make-block-hash-table) :type hash-table)       ; hash -> (peer . timestamp)
   (block-queue (make-hash-table :test 'eql) :type hash-table)  ; height -> block, out-of-order
   ;; Per-pending-hash timeout count. retry-timed-out-requests bumps the
   ;; counter each time a request for this hash times out; after
   ;; +max-block-request-timeouts+, the block is dropped from pending
   ;; (it's likely a competing-fork block that peers won't serve).
   ;; hash -> integer.
-  (request-timeouts (make-hash-table :test 'equalp) :type hash-table)
+  (request-timeouts (make-block-hash-table) :type hash-table)
   ;; Peers that answered `notfound` for a pending block. hash -> list of
   ;; peers. The scheduler won't re-request a block from a peer that has
   ;; disclaimed it, and drops the block once every ready peer has. Scoped
   ;; to the block's pending lifecycle: cleared when the block is received,
   ;; re-queued (a fresh download attempt), or dropped — so a peer is never
   ;; permanently excluded from a block it may later receive.
-  (block-disclaims (make-hash-table :test 'equalp) :type hash-table)
+  (block-disclaims (make-block-hash-table) :type hash-table)
   ;; Configuration
   (max-in-flight 16 :type (unsigned-byte 8))
   (request-timeout 60 :type (unsigned-byte 16))  ; seconds
@@ -630,11 +650,17 @@ that don't construct a chain-state)."
          (pending (ibd-context-pending-blocks *ibd-context*))
          (in-flight (ibd-context-in-flight *ibd-context*))
          (available '()))
-    ;; Collect blocks that are pending, not in-flight, and within the window.
+    ;; Collect blocks that are within the window AND not in-flight. Check
+    ;; the cheap height filter FIRST: during early IBD pending holds the
+    ;; whole chain (130k+ entries), almost all far ABOVE the window, so
+    ;; testing the window before the (equalp) in-flight gethash skips the
+    ;; hash for the vast majority. Profile (fresh testnet4 IBD h~5k-22k)
+    ;; showed the old order — gethash on every pending block per cycle — at
+    ;; ~35% of CPU (data-vector-hash on the 32-byte key).
     (maphash (lambda (hash height)
-               (when (and (not (gethash hash in-flight))
-                          (or (null max-request-height)
-                              (<= height max-request-height)))
+               (when (and (or (null max-request-height)
+                              (<= height max-request-height))
+                          (not (gethash hash in-flight)))
                  (push (cons hash height) available)))
              pending)
     ;; Sort by height and take first N
