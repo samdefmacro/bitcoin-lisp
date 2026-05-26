@@ -298,3 +298,55 @@ Returns a list of entries from genesis (index 0) to tip."
             (bitcoin-lisp.validation:validate-difficulty header 10 prev-entry)
           (is (eq t valid))
           (is (null error)))))))
+
+;;;; BIP 94 timewarp-attack mitigation (testnet4)
+;;;;
+;;;; The first block of each difficulty-adjustment period must not be
+;;;; timestamped more than MAX_TIMEWARP (600s) before its predecessor's
+;;;; actual time. Enforced only on testnet4 (Bitcoin Core enforce_BIP94),
+;;;; mirroring ContextualCheckBlockHeader (validation.cpp:4129-4136).
+
+(defun %timewarp-entry (height timestamp)
+  "A mock block-index-entry at HEIGHT whose header has timestamp TIMESTAMP."
+  (bitcoin-lisp.storage:make-block-index-entry
+   :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+   :height height
+   :header (make-mock-header :timestamp timestamp)
+   :status :valid))
+
+(test bip94-timewarp-rejected-on-testnet4-boundary
+  "A period-boundary block >600s earlier than its predecessor violates BIP 94."
+  (let ((bitcoin-lisp:*network* :testnet4)
+        (prev (%timewarp-entry 2015 100000)))
+    (is (bitcoin-lisp.validation::bip94-timewarp-violation-p
+         (make-mock-header :timestamp (- 100000 601)) 2016 prev))))
+
+(test bip94-timewarp-allowed-within-tolerance
+  "Exactly 600s early is allowed (strict <), and so is a later timestamp."
+  (let ((bitcoin-lisp:*network* :testnet4)
+        (prev (%timewarp-entry 2015 100000)))
+    (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+               (make-mock-header :timestamp (- 100000 600)) 2016 prev)))
+    (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+               (make-mock-header :timestamp 100000) 2016 prev)))))
+
+(test bip94-timewarp-only-at-period-boundary
+  "Non-boundary heights are exempt even with a wildly early timestamp."
+  (let ((bitcoin-lisp:*network* :testnet4)
+        (prev (%timewarp-entry 2014 100000)))
+    (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+               (make-mock-header :timestamp (- 100000 5000)) 2015 prev)))))
+
+(test bip94-timewarp-not-enforced-off-testnet4
+  "enforce_BIP94 is false on mainnet/testnet3: the timewarp check is skipped."
+  (dolist (net '(:mainnet :testnet3))
+    (let ((bitcoin-lisp:*network* net)
+          (prev (%timewarp-entry 2015 100000)))
+      (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+                 (make-mock-header :timestamp (- 100000 601)) 2016 prev))))))
+
+(test bip94-timewarp-excludes-genesis
+  "Height 0 satisfies the modulo but is excluded (no predecessor)."
+  (let ((bitcoin-lisp:*network* :testnet4))
+    (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
+               (make-mock-header :timestamp 0) 0 nil)))))
