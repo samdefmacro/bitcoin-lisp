@@ -1765,7 +1765,15 @@
              (cl:when (cl:and sym (cl:boundp sym) (cl:symbol-value sym))
                (cl:setf (cl:symbol-value sym)
                         (cl:coerce (cl:subseq script pos)
-                                   '(cl:simple-array (cl:unsigned-byte 8) (cl:*))))))
+                                   '(cl:simple-array (cl:unsigned-byte 8) (cl:*)))))
+             ;; BIP 342: record this OP_CODESEPARATOR's opcode index (not its
+             ;; byte offset) for the tapscript sighash. POS is the byte after
+             ;; the codeseparator, so its byte start is (1- POS).
+             (cl:let ((cs (cl:find-symbol "*TAPSCRIPT-CODESEP-POS*" "BITCOIN-LISP.COALTON.INTEROP"))
+                      (cfn (cl:find-symbol "COUNT-OPCODES-BEFORE" "BITCOIN-LISP.COALTON.INTEROP")))
+               (cl:when (cl:and cs (cl:boundp cs) cfn (cl:fboundp cfn))
+                 (cl:setf (cl:symbol-value cs)
+                          (cl:funcall cfn script (cl:max 0 (cl:1- pos)))))))
            Unit)
          (ScriptOk (context-with-codesep-pos (context-position ctx) ctx))))
 

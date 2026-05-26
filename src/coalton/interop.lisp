@@ -325,6 +325,40 @@ normal validation; the per-failure formatting cost is non-trivial.")
    annex from the witness; consumed by compute-bip341-sighash-real, which
    sets the spend_type annex bit and commits sha256(ser_string(annex)).")
 
+(defvar *tapscript-codesep-pos* #xFFFFFFFF
+  "BIP 342 codeseparator position for the tapscript currently executing:
+   the opcode index of the last executed OP_CODESEPARATOR, or #xFFFFFFFF if
+   none. Set by the OP_CODESEPARATOR handler (src/coalton/script.lisp) and
+   committed in the BIP 341 sighash tail (Core's execdata.m_codeseparator_pos).
+   run-tapscript rebinds it to #xFFFFFFFF per execution; the default matches
+   the no-codeseparator value, so non-codesep sighashes are unchanged.")
+
+(defun count-opcodes-before (script target-byte)
+  "Number of opcodes in SCRIPT that start strictly before TARGET-BYTE —
+i.e. the 0-based opcode index of the opcode starting at TARGET-BYTE. Turns
+an OP_CODESEPARATOR's byte offset into the opcode position BIP 342 commits
+to the sighash. Skips pushdata payloads; a truncated trailing push counts
+as one opcode and ends the walk."
+  (let ((i 0) (idx 0) (len (length script)))
+    (loop while (< i target-byte)
+          do (let ((op (aref script i)))
+               (cond
+                 ((<= 1 op 75) (incf i (+ 1 op)))
+                 ((= op 76) (incf i (+ 2 (if (< (1+ i) len) (aref script (1+ i)) 0))))
+                 ((= op 77) (incf i (+ 3 (if (< (+ i 2) len)
+                                             (logior (aref script (1+ i))
+                                                     (ash (aref script (+ i 2)) 8))
+                                             0))))
+                 ((= op 78) (incf i (+ 5 (if (< (+ i 4) len)
+                                             (logior (aref script (1+ i))
+                                                     (ash (aref script (+ i 2)) 8)
+                                                     (ash (aref script (+ i 3)) 16)
+                                                     (ash (aref script (+ i 4)) 24))
+                                             0))))
+                 (t (incf i)))
+               (incf idx)))
+    idx))
+
 (defvar *debug-bip341-sighash* nil
   "When non-NIL, log every BIP 341 SigMsg preimage to compare with reference.")
 
@@ -1001,7 +1035,9 @@ Used to get the redeem script from a P2SH scriptSig."
          (*script-flags* new-flags)
          (*tapscript-leaf-hash* leaf-hash)
          (*tapscript-amount* amount)
-         (*tapscript-internal-pubkey* internal-pubkey))
+         (*tapscript-internal-pubkey* internal-pubkey)
+         ;; Fresh per tapscript execution; OP_CODESEPARATOR overwrites it.
+         (*tapscript-codesep-pos* #xFFFFFFFF))
     (declare (ignorable *tapscript-leaf-hash* *tapscript-amount*
                         *tapscript-internal-pubkey*))
     ;; Convert script-inputs to Coalton stack (list of vectors)
@@ -2953,7 +2989,9 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
       (when tapleaf-hash
         (setf pos (buf-set-bytes preimage pos tapleaf-hash))
         (setf pos (buf-set-u8 preimage pos (or key-version 0)))
-        (setf pos (buf-set-u32-le preimage pos #xffffffff)))
+        ;; BIP 342 codeseparator position: opcode index of the last executed
+        ;; OP_CODESEPARATOR, or #xFFFFFFFF if none (the default).
+        (setf pos (buf-set-u32-le preimage pos *tapscript-codesep-pos*)))
       (when *debug-bip341-sighash*
         (bitcoin-lisp:log-warn "BIP341-SIGMSG: hashtype=~2,'0X tapleaf=~A preimage(~D)=~A"
                                sighash-type
