@@ -894,7 +894,11 @@ Used to get the redeem script from a P2SH scriptSig."
                            #x00))  ; SIGHASH_DEFAULT
          (sig64 (if (= sig-len 64) sig-bytes (subseq sig-bytes 0 64))))
 
-    ;; Validate sighash type
+    ;; A 65-byte sig's explicit sighash byte must not be SIGHASH_DEFAULT
+    ;; (0x00); and the byte must be in the valid Schnorr set. Mirrors
+    ;; CheckSchnorrSignature (interpreter.cpp:1731-1734).
+    (when (and (= sig-len 65) (zerop (aref sig-bytes 64)))
+      (return-from verify-tapscript-signature (values :bad-sighash-type nil)))
     (unless (valid-taproot-sighash-type-p sighash-type)
       (return-from verify-tapscript-signature (values :bad-sighash-type nil)))
 
@@ -2708,6 +2712,12 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
     (unless (or (= sig-len 64) (= sig-len 65))
       (return-from validate-taproot-key-path (values nil :schnorr-signature-size)))
 
+    ;; A 65-byte sig carries an EXPLICIT sighash byte that must not be
+    ;; SIGHASH_DEFAULT (0x00) — that form must use the 64-byte encoding.
+    ;; Mirrors CheckSchnorrSignature (interpreter.cpp:1731-1734).
+    (when (and (= sig-len 65) (zerop (aref sig 64)))
+      (return-from validate-taproot-key-path (values nil :sig-hashtype)))
+
     (let* ((sighash-type (if (= sig-len 65)
                              (aref sig 64)
                              #x00))  ; SIGHASH_DEFAULT
@@ -2808,13 +2818,13 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
       (validate-taproot-script-path witness output-pubkey32 amount)))
 
 (defun valid-taproot-sighash-type-p (sighash-type)
-  "Check if sighash type is valid for Taproot (BIP 341).
-   Valid types: 0x00 (DEFAULT), 0x01 (ALL), 0x02 (NONE), 0x03 (SINGLE),
-   with optional 0x80 (ANYONECANPAY) flag."
-  (let ((base-type (logand sighash-type #x7f)))
-    (and (member base-type '(#x00 #x01 #x02 #x03))
-         ;; No flags other than ANYONECANPAY
-         (zerop (logand sighash-type #x60)))))
+  "Check if SIGHASH-TYPE is a valid Schnorr/Taproot sighash byte. Mirrors
+the accept set in Bitcoin Core SignatureHashSchnorr (interpreter.cpp:1514):
+exactly {0x00 (DEFAULT), 0x01 (ALL), 0x02 (NONE), 0x03 (SINGLE)} and the
+ANYONECANPAY variants {0x81, 0x82, 0x83}. Note 0x80 (ANYONECANPAY on
+DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
+  (or (<= sighash-type #x03)
+      (<= #x81 sighash-type #x83)))
 
 (defun compute-bip341-sighash (amount sighash-type &optional tapleaf-hash key-version)
   "Compute BIP 341 signature hash for Taproot.
