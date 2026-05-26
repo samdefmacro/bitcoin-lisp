@@ -1102,3 +1102,24 @@
   (let* ((script (make-csv-script #x80000001))
          (result (call-execute-csv script 0 2 0)))
     (is-true (script-ok-p result))))
+
+;;;; MAX_STACK_SIZE enforced after PUSH ops (Core interpreter.cpp:1221)
+
+(defun %n-pushes-script (n)
+  "A script of N two-byte data pushes (0x02 0x11 0x11) — each minimal,
+non-counting toward the op limit — so only the stack-size limit is in play."
+  (let ((script (make-array (* 3 n))))   ; simple-vector (VECTOR T), as execute-script expects
+    (loop for i from 0 below n
+          do (setf (aref script (* 3 i)) #x02
+                   (aref script (+ 1 (* 3 i))) #x11
+                   (aref script (+ 2 (* 3 i))) #x11))
+    script))
+
+(test execute-script-stack-overflow-via-pushes
+  "Pushing more than MAX_STACK_SIZE (1000) items via data pushes fails —
+the limit is checked after every push, not only after non-push opcodes."
+  (is (script-err-p (call-execute-script (%n-pushes-script 1001)))))
+
+(test execute-script-stack-at-limit-ok
+  "Exactly MAX_STACK_SIZE (1000) pushed items is allowed."
+  (is (script-ok-p (call-execute-script (%n-pushes-script 1000)))))
