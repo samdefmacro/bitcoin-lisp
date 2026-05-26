@@ -893,3 +893,88 @@ normal heights until the 1,983,702 re-enable."
   (let ((bitcoin-lisp:*network* :testnet4))
     (is (not (bitcoin-lisp.validation::bip30-enforced-p 136459)))
     (is (not (bitcoin-lisp.validation::bip30-enforced-p 500000)))))
+
+;;; ============================================================
+;;; BIP 34 exact-prefix coinbase height (encode-bip34-height /
+;;; validate-coinbase-height) — Core compares serialized bytes, not value.
+;;; ============================================================
+
+(defun %bytes (&rest bs)
+  (make-array (length bs) :element-type '(unsigned-byte 8) :initial-contents bs))
+
+(defun %block-with-coinbase-scriptsig (script-sig)
+  "A block whose coinbase input-0 has the given SCRIPT-SIG."
+  (let ((coinbase
+          (bitcoin-lisp.serialization:make-transaction
+           :version 1
+           :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                          :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                            :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                              :initial-element 0)
+                                            :index #xFFFFFFFF)
+                          :script-sig script-sig
+                          :sequence #xFFFFFFFF))
+           :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                           :value 5000000000
+                           :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                      :initial-element #x76)))
+           :lock-time 0)))
+    (bitcoin-lisp.serialization:make-bitcoin-block
+     :header (make-test-block-header)
+     :transactions (list coinbase))))
+
+(test encode-bip34-height-forms
+  "encode-bip34-height matches Core's CScript() << height: OP_0/OP_N for
+0..16, minimal CScriptNum data push otherwise (incl. sign byte)."
+  (is (equalp (%bytes #x00) (bitcoin-lisp.validation::encode-bip34-height 0)))
+  (is (equalp (%bytes #x51) (bitcoin-lisp.validation::encode-bip34-height 1)))
+  (is (equalp (%bytes #x60) (bitcoin-lisp.validation::encode-bip34-height 16)))
+  (is (equalp (%bytes #x01 #x11) (bitcoin-lisp.validation::encode-bip34-height 17)))
+  ;; 21111 = 0x5277 -> LE 0x77 0x52
+  (is (equalp (%bytes #x02 #x77 #x52) (bitcoin-lisp.validation::encode-bip34-height 21111)))
+  ;; 227931 = 0x037A5B -> LE 0x5b 0x7a 0x03
+  (is (equalp (%bytes #x03 #x5b #x7a #x03) (bitcoin-lisp.validation::encode-bip34-height 227931)))
+  ;; 128 = 0x80 -> needs 0x00 sign byte
+  (is (equalp (%bytes #x02 #x80 #x00) (bitcoin-lisp.validation::encode-bip34-height 128))))
+
+(test validate-coinbase-height-accepts-exact-prefix
+  "A coinbase whose scriptSig starts with the exact serialized height
+passes (extra trailing bytes are fine)."
+  (let ((bitcoin-lisp:*network* :testnet4))   ; BIP34 active from height 1
+    (let ((block (%block-with-coinbase-scriptsig
+                  ;; height 21111 prefix + arbitrary extra-nonce bytes
+                  (concatenate '(vector (unsigned-byte 8))
+                               (%bytes #x02 #x77 #x52) (%bytes #xab #xcd)))))
+      (multiple-value-bind (valid error)
+          (bitcoin-lisp.validation::validate-coinbase-height block 21111)
+        (is (eq t valid))
+        (is (null error))))))
+
+(test validate-coinbase-height-rejects-nonminimal
+  "A non-minimal encoding that decodes to the right number is rejected
+(Core compares the exact minimal prefix)."
+  (let ((bitcoin-lisp:*network* :testnet4))
+    ;; height 17 padded to 2 bytes: 0x02 0x11 0x00 decodes to 17 but the
+    ;; minimal form is 0x01 0x11.
+    (let ((block (%block-with-coinbase-scriptsig (%bytes #x02 #x11 #x00))))
+      (multiple-value-bind (valid error)
+          (bitcoin-lisp.validation::validate-coinbase-height block 17)
+        (is (null valid))
+        (is (eq :bad-coinbase-height error))))))
+
+(test validate-coinbase-height-rejects-wrong-and-short
+  "Wrong height and a too-short scriptSig are both rejected."
+  (let ((bitcoin-lisp:*network* :testnet4))
+    ;; scriptSig encodes height 100, block claims 101
+    (let ((block (%block-with-coinbase-scriptsig (%bytes #x01 #x64))))
+      (is (null (bitcoin-lisp.validation::validate-coinbase-height block 101))))
+    ;; empty scriptSig at an enforced height
+    (let ((block (%block-with-coinbase-scriptsig
+                  (make-array 0 :element-type '(unsigned-byte 8)))))
+      (is (null (bitcoin-lisp.validation::validate-coinbase-height block 17))))))
+
+(test validate-coinbase-height-skipped-below-activation
+  "Below the network BIP 34 activation height, the check is skipped."
+  (let ((bitcoin-lisp:*network* :testnet3))   ; activation 21111
+    (let ((block (%block-with-coinbase-scriptsig (%bytes #xde #xad #xbe #xef))))
+      (is (eq t (bitcoin-lisp.validation::validate-coinbase-height block 100))))))
