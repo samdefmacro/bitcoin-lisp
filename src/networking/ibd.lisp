@@ -13,10 +13,22 @@
   '(member :idle :syncing-headers :syncing-blocks :synced))
 
 (defparameter +block-stalling-timeout+ 30
-  "Seconds the next-needed block can be in-flight at one peer before we
-   conclude THAT peer is the bottleneck and disconnect it. Bitcoin Core
-   uses 2s here; we use 30s because testnet4 stress blocks can be
-   multi-MB and take seconds just to transit the wire.")
+  "Shorter per-block request timeout applied only NEAR THE TIP (within
+   +stalling-near-tip-margin+ of the header tip). There, blocks are recent
+   and small, so a block in-flight this long means a silent/unresponsive
+   peer — retry it elsewhere fast instead of waiting out the full
+   compute-block-download-timeout (~125s). This is what cuts silent-peer
+   fork-recovery latency from ~max-block-request-timeouts x 125s (~10 min)
+   to ~max x 30s (~2.5 min), with the same retry+eviction path.")
+
+(defparameter +stalling-near-tip-margin+ 144
+  "How close (in blocks) the validated tip must be to the header tip for
+   the shorter +block-stalling-timeout+ to apply. Far below this (bulk
+   IBD — notably the testnet4 multi-MB stress region at h=51k-67k, ~70k
+   below tip) the full per-block timeout stands, so a slow legitimate
+   transfer is never mistaken for a stall (the 2026-05 eviction
+   death-spiral). 144 blocks is firmly in the at-tip zone for any chain
+   whose heavy region isn't within a day of the tip.")
 
 (defparameter +max-messages-per-peer-per-cycle+ 32
   "How many messages to drain from each peer in one IBD loop iteration.
@@ -679,13 +691,16 @@ a genuinely dead peer is still cleared in 2 minutes.
          (other-peers (max 0 (1- num-downloading-peers))))
     (+ base (* per-peer other-peers))))
 
-(defun get-timed-out-requests ()
-  "Get list of block hashes that have timed out."
+(defun get-timed-out-requests (&optional timeout-seconds)
+  "Get list of block hashes whose in-flight request has exceeded
+TIMEOUT-SECONDS (default: the adaptive per-peer request timeout). Callers
+pass a shorter timeout near the tip — see request-blocks-from-peers."
   (unless *ibd-context*
     (return-from get-timed-out-requests nil))
 
   (let ((in-flight (ibd-context-in-flight *ibd-context*))
-        (timeout-ticks (* (ibd-context-request-timeout *ibd-context*)
+        (timeout-ticks (* (or timeout-seconds
+                              (ibd-context-request-timeout *ibd-context*))
                           internal-time-units-per-second))
         (now (get-internal-real-time))
         (timed-out '()))
@@ -721,13 +736,14 @@ so it keeps its full retry budget on reassignment."
           (remhash hash in-flight))
         (length orphaned))))
 
-(defun retry-timed-out-requests (&optional peers)
+(defun retry-timed-out-requests (&optional peers timeout-seconds)
   "Remove timed out requests from in-flight so they can be retried.
 When PEERS is provided, tracks per-peer timeouts and disconnects slow
 peers. After a block has timed out +MAX-BLOCK-REQUEST-TIMEOUTS+ times
 it's also dropped from PENDING — competing-fork blocks that peers
-won't serve would otherwise loop forever, blocking IBD termination."
-  (let ((timed-out (get-timed-out-requests))
+won't serve would otherwise loop forever, blocking IBD termination.
+TIMEOUT-SECONDS overrides the per-block timeout (shorter near the tip)."
+  (let ((timed-out (get-timed-out-requests timeout-seconds))
         (peers-to-disconnect '())
         (dropped 0))
     (dolist (hash timed-out)
@@ -848,9 +864,17 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
   (let ((orphaned (release-orphaned-in-flight)))
     (when (> orphaned 0)
       (bitcoin-lisp:log-warn "Released ~D in-flight blocks from disconnected peers" orphaned)))
-  (let ((retried (retry-timed-out-requests peers)))
+  ;; Near the tip (fork-recovery zone), use the shorter +block-stalling-timeout+
+  ;; so a silent peer's block is retried elsewhere in ~30s instead of ~125s.
+  ;; Far from tip (bulk IBD), the full adaptive timeout stands.
+  (let* ((near-tip (<= (- (ibd-context-header-tip-height *ibd-context*)
+                          (bitcoin-lisp.storage:current-height chain-state))
+                       +stalling-near-tip-margin+))
+         (timeout (and near-tip +block-stalling-timeout+))
+         (retried (retry-timed-out-requests peers timeout)))
     (when (> retried 0)
-      (bitcoin-lisp:log-warn "Retrying ~D timed out block requests" retried)))
+      (bitcoin-lisp:log-warn "Retrying ~D timed out block requests~:[~; (near-tip)~]"
+                             retried near-tip)))
 
   ;; Backpressure: cap NEW requests so block-queue + in-flight stays bounded.
   ;; When at cap and the next-needed block is missing, only allow ONE request

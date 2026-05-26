@@ -310,6 +310,26 @@ handle-peer-fin disconnects it so replace-disconnected-peers can refill."
       (is (= 1 (length timed-out)))
       (is (equalp hash (first timed-out))))))
 
+(test get-timed-out-requests-near-tip-shorter-timeout
+  "A block in-flight ~40s is timed out under the near-tip
++block-stalling-timeout+ (30s) but NOT under the full per-block timeout
+(120s) — so near the tip a silent peer's block is retried elsewhere fast."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+        (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (setf (bitcoin-lisp.networking::ibd-context-request-timeout
+           bitcoin-lisp.networking::*ibd-context*) 120)
+    (setf (gethash hash (bitcoin-lisp.networking::ibd-context-in-flight
+                         bitcoin-lisp.networking::*ibd-context*))
+          (cons :peer (- (get-internal-real-time)
+                         (* 40 internal-time-units-per-second))))  ; 40s ago
+    ;; Default (full 120s) timeout: not yet timed out.
+    (is (null (bitcoin-lisp.networking::get-timed-out-requests)))
+    ;; Near-tip 30s timeout: timed out.
+    (let ((timed-out (bitcoin-lisp.networking::get-timed-out-requests
+                      bitcoin-lisp.networking::+block-stalling-timeout+)))
+      (is (= 1 (length timed-out)))
+      (is (equalp hash (first timed-out))))))
+
 (test retry-timed-out-requests
   "Test retrying timed out requests."
   (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
