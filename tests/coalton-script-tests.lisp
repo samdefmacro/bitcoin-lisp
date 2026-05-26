@@ -1156,3 +1156,23 @@ truthy top (OP_1 OP_1 -> [1,1])."
        (make-array 32 :initial-element 2))
     (declare (ignore err))
     (is (eq t ok))))
+
+;;;; Taproot control-block size bounds (BIP 341): 33 + 32*m, 0<=m<=128
+;;;; (TAPROOT_CONTROL_MAX_SIZE = 4129; interpreter.cpp:1970).
+
+(test parse-control-block-size-bounds
+  "Length must be 33 + 32*m with m in 0..128; outside that returns NIL."
+  ;; valid: m=0 (33), m=1 (65), m=128 (4129)
+  (is-true (bitcoin-lisp.coalton.interop::parse-control-block
+            (make-array 33 :initial-element #xc0)))
+  (is-true (bitcoin-lisp.coalton.interop::parse-control-block
+            (make-array 65 :initial-element #xc0)))
+  (is-true (bitcoin-lisp.coalton.interop::parse-control-block
+            (make-array (+ 33 (* 32 128)) :initial-element #xc0)))
+  ;; invalid: too short, wrong modulus, and one node too many (m=129)
+  (is-false (bitcoin-lisp.coalton.interop::parse-control-block
+             (make-array 32 :initial-element #xc0)))
+  (is-false (bitcoin-lisp.coalton.interop::parse-control-block
+             (make-array 34 :initial-element #xc0)))
+  (is-false (bitcoin-lisp.coalton.interop::parse-control-block
+             (make-array (+ 33 (* 32 129)) :initial-element #xc0))))
