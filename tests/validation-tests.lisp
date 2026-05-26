@@ -978,3 +978,75 @@ passes (extra trailing bytes are fine)."
   (let ((bitcoin-lisp:*network* :testnet3))   ; activation 21111
     (let ((block (%block-with-coinbase-scriptsig (%bytes #xde #xad #xbe #xef))))
       (is (eq t (bitcoin-lisp.validation::validate-coinbase-height block 100))))))
+
+;;; ============================================================
+;;; Coinbase classification (Core CheckTransaction / IsCoinBase):
+;;; coinbase IFF exactly one input with a null prevout; non-coinbase txs
+;;; may not contain any null prevout (:bad-prevout-null).
+;;; ============================================================
+
+(defun %null-input (&optional (sig-len 5))
+  (bitcoin-lisp.serialization:make-tx-in
+   :previous-output (bitcoin-lisp.serialization:make-outpoint
+                     :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                     :index #xFFFFFFFF)
+   :script-sig (make-array sig-len :element-type '(unsigned-byte 8) :initial-element 0)
+   :sequence #xFFFFFFFF))
+
+(defun %normal-input (seed)
+  (bitcoin-lisp.serialization:make-tx-in
+   :previous-output (bitcoin-lisp.serialization:make-outpoint
+                     :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
+                     :index 0)
+   :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+   :sequence #xFFFFFFFF))
+
+(defun %tx-with-inputs (inputs)
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1 :inputs inputs
+   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                   :value 1000
+                   :script-pubkey (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+   :lock-time 0))
+
+(test coinbase-single-null-input-valid
+  "Exactly one null input with a 2..100-byte scriptSig is a valid coinbase."
+  (multiple-value-bind (valid error)
+      (bitcoin-lisp.validation:validate-transaction-structure
+       (%tx-with-inputs (list (%null-input 5))))
+    (is (eq t valid))
+    (is (null error))))
+
+(test coinbase-bad-scriptsig-length
+  "Coinbase scriptSig outside 2..100 bytes is rejected."
+  (is (eq :bad-coinbase-length
+          (nth-value 1 (bitcoin-lisp.validation:validate-transaction-structure
+                        (%tx-with-inputs (list (%null-input 1)))))))
+  (is (eq :bad-coinbase-length
+          (nth-value 1 (bitcoin-lisp.validation:validate-transaction-structure
+                        (%tx-with-inputs (list (%null-input 101))))))))
+
+(test noncoinbase-with-leading-null-prevout-rejected
+  "Two inputs with the FIRST null is not a coinbase (size != 1) and is
+rejected as :bad-prevout-null, matching Core (not our old :bad-coinbase-mixed)."
+  (multiple-value-bind (valid error)
+      (bitcoin-lisp.validation:validate-transaction-structure
+       (%tx-with-inputs (list (%null-input 5) (%normal-input 9))))
+    (is (null valid))
+    (is (eq :bad-prevout-null error))))
+
+(test noncoinbase-with-trailing-null-prevout-rejected
+  "A later null prevout in a multi-input tx is rejected."
+  (multiple-value-bind (valid error)
+      (bitcoin-lisp.validation:validate-transaction-structure
+       (%tx-with-inputs (list (%normal-input 9) (%null-input 5))))
+    (is (null valid))
+    (is (eq :bad-prevout-null error))))
+
+(test noncoinbase-all-nonnull-passes
+  "A normal multi-input tx with no null prevouts passes structure validation."
+  (multiple-value-bind (valid error)
+      (bitcoin-lisp.validation:validate-transaction-structure
+       (%tx-with-inputs (list (%normal-input 9) (%normal-input 10))))
+    (is (eq t valid))
+    (is (null error))))

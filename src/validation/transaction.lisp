@@ -72,25 +72,22 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
         (return-from validate-transaction-structure
           (values nil :total-output-too-large))))
 
-    ;; Coinbase-specific checks
-    (let* ((first-input (first inputs))
-           (is-coinbase (bitcoin-lisp.serialization:coinbase-input-p first-input)))
-      (if is-coinbase
-          ;; Coinbase: scriptSig must be 2-100 bytes
-          (let ((sig-len (length (bitcoin-lisp.serialization:tx-in-script-sig first-input))))
-            (when (or (< sig-len 2) (> sig-len 100))
-              (return-from validate-transaction-structure
-                (values nil :bad-coinbase-length)))
-            ;; All other inputs must also be coinbase (shouldn't mix)
-            (dolist (inp (rest inputs))
-              (unless (bitcoin-lisp.serialization:coinbase-input-p inp)
-                (return-from validate-transaction-structure
-                  (values nil :bad-coinbase-mixed)))))
-          ;; Non-coinbase: no input may be coinbase
-          (dolist (inp (rest inputs))
-            (when (bitcoin-lisp.serialization:coinbase-input-p inp)
-              (return-from validate-transaction-structure
-                (values nil :bad-coinbase-mixed))))))
+    ;; Coinbase vs non-coinbase, matching Core CheckTransaction
+    ;; (tx_check.cpp:47-57) and IsCoinBase (primitives/transaction.h:341):
+    ;; a tx is coinbase IFF it has exactly one input whose prevout is null.
+    ;; Coinbase → scriptSig must be 2..100 bytes; non-coinbase → no input
+    ;; may have a null prevout (bad-txns-prevout-null).
+    (if (and (= (length inputs) 1)
+             (bitcoin-lisp.serialization:coinbase-input-p (first inputs)))
+        (let ((sig-len (length (bitcoin-lisp.serialization:tx-in-script-sig
+                                (first inputs)))))
+          (when (or (< sig-len 2) (> sig-len 100))
+            (return-from validate-transaction-structure
+              (values nil :bad-coinbase-length))))
+        (dolist (inp inputs)
+          (when (bitcoin-lisp.serialization:coinbase-input-p inp)
+            (return-from validate-transaction-structure
+              (values nil :bad-prevout-null)))))
 
     ;; Note: there is no consensus-level transaction size limit independent of
     ;; the block weight limit (4M weight units). Bitcoin Core only enforces
