@@ -350,3 +350,42 @@ Returns a list of entries from genesis (index 0) to tip."
   (let ((bitcoin-lisp:*network* :testnet4))
     (is (null (bitcoin-lisp.validation::bip94-timewarp-violation-p
                (make-mock-header :timestamp 0) 0 nil)))))
+
+;;;; nBits range validation (derive-target / check-proof-of-work)
+;;;; Mirrors Core DeriveTarget + SetCompact (pow.cpp:146-159): reject
+;;;; negative (sign bit), zero, overflow, and target > powLimit.
+
+(test derive-target-valid-within-limit
+  "A normal compact target decodes; pow-limit bits decode to exactly the
+pow-limit target."
+  (is (= bitcoin-lisp.storage::+pow-limit-target+
+         (bitcoin-lisp.storage:derive-target #x1d00ffff)))
+  ;; a harder (smaller) historical target is valid and below the limit
+  (let ((tgt (bitcoin-lisp.storage:derive-target #x1b0404cb)))
+    (is (not (null tgt)))
+    (is (< tgt bitcoin-lisp.storage::+pow-limit-target+))))
+
+(test derive-target-rejects-negative
+  "Sign bit (0x00800000) set on a non-zero mantissa => negative => NIL."
+  (is (null (bitcoin-lisp.storage:derive-target #x1d80ffff))))
+
+(test derive-target-rejects-zero
+  "Zero mantissa => zero target => NIL."
+  (is (null (bitcoin-lisp.storage:derive-target #x03000000))))
+
+(test derive-target-rejects-overflow
+  "Exponent/size > 34 with non-zero mantissa => overflow => NIL."
+  (is (null (bitcoin-lisp.storage:derive-target #x23000001))))
+
+(test derive-target-rejects-above-powlimit
+  "A target larger than the PoW limit (bigger exponent) => NIL."
+  (is (null (bitcoin-lisp.storage:derive-target #x1e00ffff))))
+
+(test check-proof-of-work-rejects-out-of-range-bits
+  "check-proof-of-work returns NIL for nBits out of range, regardless of
+the hash (negative / above-limit), and is not fooled by the old
+24-bit-mantissa decode."
+  (is (null (bitcoin-lisp.validation::check-proof-of-work
+             (make-mock-header :bits #x1d80ffff))))   ; negative
+  (is (null (bitcoin-lisp.validation::check-proof-of-work
+             (make-mock-header :bits #x1e00ffff)))))  ; above pow limit

@@ -323,6 +323,7 @@
    #:update-chain-tip
    #:build-block-locator
    #:bits-to-target
+   #:derive-target
    #:target-to-bits
    #:calculate-chain-work
    #:calculate-next-work-required
