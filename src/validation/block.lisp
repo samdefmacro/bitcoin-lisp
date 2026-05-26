@@ -378,16 +378,19 @@ Returns (VALUES T NIL) on success, (VALUES NIL :bad-difficulty) on failure."
 ;;;; Proof of Work validation
 
 (defun check-proof-of-work (header)
-  "Verify that the block hash meets the difficulty target.
-Returns T if valid, NIL if invalid."
-  (let* ((bits (bitcoin-lisp.serialization:block-header-bits header))
-         (target (bitcoin-lisp.storage:bits-to-target bits))
-         (hash (bitcoin-lisp.serialization:block-header-hash header))
-         ;; Convert hash to integer (little-endian: byte 0 is least significant)
-         (hash-value (loop for i from 0 below 32
-                           for byte = (aref hash i)
-                           sum (ash byte (* 8 i)))))
-    (<= hash-value target)))
+  "Verify the block hash meets the claimed target. Mirrors Bitcoin Core
+CheckProofOfWork (pow.cpp:161-171): reject nBits whose target is
+negative, zero, overflowing, or above the PoW limit (derive-target
+returns NIL), then require hash <= target. Returns T if valid."
+  (let ((target (bitcoin-lisp.storage:derive-target
+                 (bitcoin-lisp.serialization:block-header-bits header))))
+    (when target
+      (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
+             ;; little-endian: byte 0 is least significant
+             (hash-value (loop for i from 0 below 32
+                               for byte = (aref hash i)
+                               sum (ash byte (* 8 i)))))
+        (<= hash-value target)))))
 
 ;;;; Merkle root calculation
 
