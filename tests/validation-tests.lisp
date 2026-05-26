@@ -842,3 +842,54 @@ is not exactly one 32-byte item: :bad-witness-nonce-size."
     ;; Block time exceeds locktime
     (is-true (bitcoin-lisp.validation:check-transaction-final tx 0 500000001))))
 
+
+;;; ============================================================
+;;; BIP 30 enforcement window (bip30-enforced-p)
+;;; ============================================================
+;;; Mirrors Bitcoin Core ConnectBlock (validation.cpp:2399-2464): enforced
+;;; below BIP 34 activation (except the grandfathered mainnet repeat
+;;; blocks), and again unconditionally at height >= 1,983,702.
+
+(test bip30-enforced-below-bip34-activation
+  "Below BIP 34 activation, BIP 30 is enforced."
+  (let ((bitcoin-lisp:*network* :mainnet))
+    ;; mainnet BIP34 activation = 227931
+    (is (bitcoin-lisp.validation::bip30-enforced-p 100000))
+    (is (bitcoin-lisp.validation::bip30-enforced-p 227930)))
+  (let ((bitcoin-lisp:*network* :testnet3))
+    (is (bitcoin-lisp.validation::bip30-enforced-p 20000))))
+
+(test bip30-skipped-between-bip34-and-limit
+  "Between BIP 34 activation and the 1,983,702 re-enable limit, BIP 30 is
+skipped (BIP 34 height-in-coinbase guarantees coinbase uniqueness)."
+  (let ((bitcoin-lisp:*network* :mainnet))
+    (is (not (bitcoin-lisp.validation::bip30-enforced-p 227931)))
+    (is (not (bitcoin-lisp.validation::bip30-enforced-p 500000)))
+    (is (not (bitcoin-lisp.validation::bip30-enforced-p 1983701)))))
+
+(test bip30-reenabled-at-limit
+  "At or above height 1,983,702, BIP 30 is re-enforced unconditionally."
+  (dolist (net '(:mainnet :testnet3 :testnet4))
+    (let ((bitcoin-lisp:*network* net))
+      (is (bitcoin-lisp.validation::bip30-enforced-p 1983702))
+      (is (bitcoin-lisp.validation::bip30-enforced-p 3000000)))))
+
+(test bip30-grandfathered-repeat-blocks-exempt
+  "The two mainnet repeat blocks (91842, 91880) are NOT BIP 30-enforced,
+so their historical duplicate coinbases aren't wrongly rejected."
+  (let ((bitcoin-lisp:*network* :mainnet))
+    (is (not (bitcoin-lisp.validation::bip30-enforced-p 91842)))
+    (is (not (bitcoin-lisp.validation::bip30-enforced-p 91880)))
+    ;; A neighbouring height is still enforced.
+    (is (bitcoin-lisp.validation::bip30-enforced-p 91841)))
+  ;; The exemption is mainnet-specific — no other network treats those
+  ;; heights as repeat blocks.
+  (let ((bitcoin-lisp:*network* :testnet3))
+    (is (not (bitcoin-lisp.validation::bip30-repeat-block-p 91842)))))
+
+(test bip30-testnet4-not-enforced-at-current-heights
+  "testnet4 has BIP 34 active from height 1, so BIP 30 is skipped for all
+normal heights until the 1,983,702 re-enable."
+  (let ((bitcoin-lisp:*network* :testnet4))
+    (is (not (bitcoin-lisp.validation::bip30-enforced-p 136459)))
+    (is (not (bitcoin-lisp.validation::bip30-enforced-p 500000)))))
