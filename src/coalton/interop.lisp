@@ -2680,10 +2680,13 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
   "Parse a Taproot control block.
    Returns (values leaf-version internal-pubkey32 merkle-path) or NIL on error.
    Control block format: <leaf-version|parity> <32-byte-internal-key> [<32-byte-hash>...]"
-  ;; Minimum length: 1 (version) + 32 (key) = 33
-  ;; Must be 33 + 32*n
+  ;; Length must be 33 + 32*m with 0 <= m <= 128 (the Merkle path depth).
+  ;; Min 33 (1 version + 32 key); max TAPROOT_CONTROL_MAX_SIZE = 33 + 32*128
+  ;; = 4129 (interpreter.h:243-246). Bitcoin Core rejects anything outside
+  ;; this with SCRIPT_ERR_TAPROOT_WRONG_CONTROL_SIZE (interpreter.cpp:1970).
   (let ((len (length control-block)))
     (when (or (< len 33)
+              (> len (+ 33 (* 32 128)))
               (/= (mod (- len 33) 32) 0))
       (return-from parse-control-block nil))
     (let* ((first-byte (aref control-block 0))
