@@ -319,6 +319,12 @@ normal validation; the per-failure formatting cost is non-trivial.")
    spent scriptPubKeys across all inputs. NIL for unit-test paths that use
    the synthetic credit transaction.")
 
+(defvar *current-annex* nil
+  "The BIP 341 annex bytes (including the 0x50 prefix) for the input being
+   validated, or NIL if none. Bound by validate-taproot after stripping the
+   annex from the witness; consumed by compute-bip341-sighash-real, which
+   sets the spend_type annex bit and commits sha256(ser_string(annex)).")
+
 (defvar *debug-bip341-sighash* nil
   "When non-NIL, log every BIP 341 SigMsg preimage to compare with reference.")
 
@@ -2812,20 +2818,22 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
   (when (or (null witness) (zerop (length witness)))
     (return-from validate-taproot (values nil :witness-program-witness-empty)))
 
-  ;; Check for annex (BIP 341: first byte 0x50)
-  ;; Annex is for future extensions, for now we just detect and skip
-  (let ((maybe-annex (car (last witness))))
+  ;; Check for annex (BIP 341: a final witness element starting with 0x50,
+  ;; present only when the stack has >1 element). Strip it from the witness
+  ;; but keep it: it is committed to the sighash (spend_type bit 0 +
+  ;; sha256(ser_string(annex))) via *current-annex*.
+  (let ((annex nil)
+        (maybe-annex (car (last witness))))
     (when (and (plusp (length maybe-annex))
                (= (aref maybe-annex 0) #x50)
                (> (length witness) 1))
-      ;; Has annex, remove it for processing
-      (setf witness (butlast witness))))
-
-  ;; Key path: single stack element
-  ;; Script path: 2+ elements (script inputs + script + control block)
-  (if (= (length witness) 1)
-      (validate-taproot-key-path witness output-pubkey32 amount)
-      (validate-taproot-script-path witness output-pubkey32 amount)))
+      (setf annex maybe-annex
+            witness (butlast witness)))
+    ;; Key path: single stack element. Script path: 2+ elements.
+    (let ((*current-annex* annex))
+      (if (= (length witness) 1)
+          (validate-taproot-key-path witness output-pubkey32 amount)
+          (validate-taproot-script-path witness output-pubkey32 amount)))))
 
 (defun valid-taproot-sighash-type-p (sighash-type)
   "Check if SIGHASH-TYPE is a valid Schnorr/Taproot sighash byte. Mirrors
@@ -2882,7 +2890,16 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
                (bitcoin-lisp.crypto:sha256
                 (bitcoin-lisp.serialization:bb-finish bb)))))
          (ext-flag (if tapleaf-hash 1 0))
-         (spend-type (ash ext-flag 1)))  ; annex bit 0 not yet supported
+         ;; spend_type = (ext_flag << 1) | annex_present  (BIP 341)
+         (spend-type (logior (ash ext-flag 1) (if *current-annex* 1 0)))
+         ;; sha256(ser_string(annex)) committed after the input section.
+         (annex-hash
+           (when *current-annex*
+             (let* ((a *current-annex*)
+                    (tmp (make-array (+ 9 (length a)) :element-type '(unsigned-byte 8)))
+                    (p (buf-set-varint tmp 0 (length a))))
+               (setf p (buf-set-bytes tmp p a))
+               (bitcoin-lisp.crypto:sha256 (subseq tmp 0 p))))))
     ;; Build SigMsg with direct buffer writes — see buf-set-* helpers above.
     ;; Max preimage size: 1+1+4+4+128+32+1+(36+8+9+520+4)+32+37 ≈ 820 bytes.
     ;; ANYONECANPAY adds spent scriptPubKey which can be large; use spent
@@ -2893,6 +2910,7 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
                                     (if anyonecanpay
                                         (+ 36 8 9 (length spent-script) 4)
                                         4)
+                                    32 ; annex commitment (max)
                                     32 ; SIGHASH_SINGLE single-output (max)
                                     37) ; tapleaf tail
                                  :element-type '(unsigned-byte 8)))
@@ -2927,6 +2945,9 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
                                    (bitcoin-lisp.serialization:tx-in-sequence current-input))))
         (t
          (setf pos (buf-set-u32-le preimage pos input-index))))
+      ;; Annex commitment (after the input section, before SINGLE output).
+      (when annex-hash
+        (setf pos (buf-set-bytes preimage pos annex-hash)))
       (when single-output-hash
         (setf pos (buf-set-bytes preimage pos single-output-hash)))
       (when tapleaf-hash
