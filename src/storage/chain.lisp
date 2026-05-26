@@ -112,15 +112,36 @@ Same for mainnet and testnet.")
 ;;; Note: +pow-limit-target+ is defined after bits-to-target below.
 
 (defun bits-to-target (bits)
-  "Convert compact 'bits' representation to full 256-bit target."
+  "Decode compact 'bits' (nBits) to a 256-bit target magnitude — the
+arith_uint256::SetCompact value. Uses the 23-bit mantissa; the
+0x00800000 sign bit and overflow are handled by DERIVE-TARGET, not here.
+For exponents <= 3 the mantissa is right-shifted (matching SetCompact's
+nWord >>= 8*(3-nSize)); real difficulty values always have exponent > 3."
   (let* ((exponent (ash bits -24))
-         (mantissa (logand bits #xFFFFFF)))
+         (mantissa (logand bits #x7FFFFF)))
     (if (<= exponent 3)
-        (ash mantissa (* 8 (- 3 exponent)))
+        (ash mantissa (- (* 8 (- 3 exponent))))
         (ash mantissa (* 8 (- exponent 3))))))
 
 (defvar +pow-limit-target+ (bits-to-target +pow-limit-bits+)
   "The full 256-bit PoW limit target (precomputed from +pow-limit-bits+).")
+
+(defun derive-target (bits)
+  "Decode nBits to a target, returning NIL if it is out of range — i.e.
+negative (the 0x00800000 sign bit set on a non-zero mantissa), zero,
+overflowing, or greater than the PoW limit. Mirrors Bitcoin Core's
+DeriveTarget + arith_uint256::SetCompact (pow.cpp:146-159)."
+  (let* ((size (ash bits -24))
+         (word (logand bits #x7FFFFF))
+         (negative (and (/= word 0) (/= (logand bits #x800000) 0)))
+         (overflow (and (/= word 0)
+                        (or (> size 34)
+                            (and (> word #xff) (> size 33))
+                            (and (> word #xffff) (> size 32)))))
+         (target (bits-to-target bits)))
+    (if (or negative (zerop target) overflow (> target +pow-limit-target+))
+        nil
+        target)))
 
 (defun target-to-work (target)
   "Convert a target to the amount of work required.
