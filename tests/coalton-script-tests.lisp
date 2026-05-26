@@ -1123,3 +1123,12 @@ the limit is checked after every push, not only after non-push opcodes."
 (test execute-script-stack-at-limit-ok
   "Exactly MAX_STACK_SIZE (1000) pushed items is allowed."
   (is (script-ok-p (call-execute-script (%n-pushes-script 1000)))))
+
+;;;; Schnorr/Taproot sighash byte validity (BIP 341, interpreter.cpp:1514)
+
+(test taproot-sighash-type-valid-set
+  "Exactly {0x00,0x01,0x02,0x03,0x81,0x82,0x83} are valid Schnorr sighash bytes."
+  (dolist (ok '(#x00 #x01 #x02 #x03 #x81 #x82 #x83))
+    (is-true (bitcoin-lisp.coalton.interop::valid-taproot-sighash-type-p ok)))
+  (dolist (bad '(#x80 #x04 #x05 #x84 #x7f #xff))
+    (is-false (bitcoin-lisp.coalton.interop::valid-taproot-sighash-type-p bad))))
