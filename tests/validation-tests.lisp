@@ -644,12 +644,15 @@ We verify MTP computation directly to confirm the check works."
                          :header (make-test-block-header)
                          :transactions (list updated-coinbase witness-tx))))
             (multiple-value-bind (valid error)
-                (bitcoin-lisp.validation:validate-witness-commitment block)
+                (bitcoin-lisp.validation:validate-witness-commitment block t)
               (is (eq t valid))
               (is (null error)))))))))
 
 (test witness-commitment-validation-missing
-  "validate-witness-commitment should fail when witness data exists but no commitment."
+  "Segwit active + witness data present but coinbase has NO commitment
+output: rejected as :unexpected-witness (Core's CheckWitnessMalleation
+has no separate missing-commitment error — it falls through to the
+no-witness-allowed scan)."
   (let* ((coinbase (make-coinbase-transaction :value 5000000000 :height 1))
          (witness-tx (bitcoin-lisp.serialization:make-transaction
                       :version 2
@@ -670,9 +673,110 @@ We verify MTP computation directly to confirm the check works."
                  :header (make-test-block-header)
                  :transactions (list coinbase witness-tx))))
     (multiple-value-bind (valid error)
-        (bitcoin-lisp.validation:validate-witness-commitment block)
+        (bitcoin-lisp.validation:validate-witness-commitment block t)
       (is (null valid))
-      (is (eq :missing-witness-commitment error)))))
+      (is (eq :unexpected-witness error)))))
+
+(test witness-unexpected-when-segwit-inactive
+  "Pre-segwit block carrying witness data is rejected (:unexpected-witness)."
+  (let* ((coinbase (make-coinbase-transaction :value 5000000000 :height 1))
+         (witness-tx (bitcoin-lisp.serialization:make-transaction
+                      :version 2
+                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                       :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                         :initial-element #x44)
+                                                       :index 0)
+                                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
+                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                      :value 49000
+                                      :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                 :initial-element #x76)))
+                      :lock-time 0
+                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                                                         :initial-element #xEE)))))
+         (block (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header (make-test-block-header)
+                 :transactions (list coinbase witness-tx))))
+    (multiple-value-bind (valid error)
+        (bitcoin-lisp.validation:validate-witness-commitment block nil)
+      (is (null valid))
+      (is (eq :unexpected-witness error)))))
+
+(test witness-legacy-block-passes-both-gates
+  "A purely-legacy block (no witness data, no commitment) passes whether
+or not segwit is active."
+  (let* ((coinbase (make-coinbase-transaction :value 5000000000 :height 1))
+         (legacy-tx (bitcoin-lisp.serialization:make-transaction
+                     :version 1
+                     :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                        :initial-element #x55)
+                                                      :index 0)
+                                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
+                     :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                     :value 49000
+                                     :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                :initial-element #x76)))
+                     :lock-time 0))
+         (block (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header (make-test-block-header)
+                 :transactions (list coinbase legacy-tx))))
+    (is (eq t (bitcoin-lisp.validation:validate-witness-commitment block nil)))
+    (is (eq t (bitcoin-lisp.validation:validate-witness-commitment block t)))))
+
+(test witness-commitment-bad-nonce-size
+  "Segwit active + commitment present but coinbase witness reserved value
+is not exactly one 32-byte item: :bad-witness-nonce-size."
+  (let* ((coinbase-tx (make-coinbase-transaction :value 5000000000 :height 1))
+         (witness-tx (bitcoin-lisp.serialization:make-transaction
+                      :version 2
+                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                       :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                         :initial-element #x66)
+                                                       :index 0)
+                                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
+                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                      :value 49000
+                                      :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                 :initial-element #x76)))
+                      :lock-time 0
+                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                                                         :initial-element #xCC)))))
+         (transactions (list coinbase-tx witness-tx))
+         ;; Build a commitment that would match a 32-zero reserved value,
+         ;; but give the coinbase a WRONG-sized (16-byte) witness item.
+         (witness-root (bitcoin-lisp.validation:compute-witness-merkle-root transactions))
+         (reserved (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (combined (make-array 64 :element-type '(unsigned-byte 8))))
+    (replace combined witness-root :start1 0)
+    (replace combined reserved :start1 32)
+    (let ((commitment (bitcoin-lisp.crypto:hash256 combined))
+          (script (make-array 38 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (setf (aref script 0) #x6a (aref script 1) #x24
+            (aref script 2) #xaa (aref script 3) #x21
+            (aref script 4) #xa9 (aref script 5) #xed)
+      (replace script commitment :start1 6)
+      (let* ((bad-coinbase
+               (bitcoin-lisp.serialization:make-transaction
+                :version 1
+                :inputs (bitcoin-lisp.serialization:transaction-inputs coinbase-tx)
+                :outputs (append (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
+                                 (list (bitcoin-lisp.serialization:make-tx-out
+                                        :value 0 :script-pubkey script)))
+                :lock-time 0
+                ;; 16-byte reserved value instead of 32 — wrong size.
+                :witness (list (list (make-array 16 :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)))))
+             (block (bitcoin-lisp.serialization:make-bitcoin-block
+                     :header (make-test-block-header)
+                     :transactions (list bad-coinbase witness-tx))))
+        (multiple-value-bind (valid error)
+            (bitcoin-lisp.validation:validate-witness-commitment block t)
+          (is (null valid))
+          (is (eq :bad-witness-nonce-size error)))))))
 
 ;;; ============================================================
 ;;; Transaction Finality (IsFinalTx) Tests

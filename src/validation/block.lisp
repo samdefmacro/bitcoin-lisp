@@ -654,35 +654,52 @@ Uses wtxids for all transactions. The coinbase wtxid is 32 zero bytes (per BIP 1
   (let ((wtxids (mapcar #'bitcoin-lisp.serialization:transaction-wtxid transactions)))
     (compute-merkle-root wtxids)))
 
-(defun validate-witness-commitment (block)
-  "Validate the witness commitment in a block's coinbase (BIP 141).
-Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
-If the block has no witness data, the commitment is not required."
-  (when (block-has-witness-data-p block)
-    (let* ((transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-           (coinbase-tx (first transactions))
-           (commitment (find-witness-commitment coinbase-tx)))
-      (unless commitment
+(defun validate-witness-commitment (block segwit-active)
+  "BIP 141 witness-malleation check. Mirrors Bitcoin Core's
+CheckWitnessMalleation (validation.cpp:3902-3948).
+
+SEGWIT-ACTIVE is whether the segwit deployment is active for this block
+(Core's expect_witness_commitment). When active and the coinbase carries
+a witness commitment output, the coinbase witness stack must be exactly
+one 32-byte reserved value (:bad-witness-nonce-size) and the commitment
+must equal hash256(witness-merkle-root || reserved-value)
+(:bad-witness-merkle-match). Otherwise — segwit inactive, or active with
+no commitment present — no transaction may carry witness data at all
+(:unexpected-witness). Returns (VALUES T NIL) on success.
+
+Note: the gate is segwit activation, NOT whether the block happens to
+carry witness data — a pre-segwit block with witness data must be
+rejected, and the no-commitment+witness case is :unexpected-witness
+(Core has no separate \"missing commitment\" error here)."
+  (let ((transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+    (when segwit-active
+      (let* ((coinbase-tx (first transactions))
+             (commitment (find-witness-commitment coinbase-tx)))
+        (when commitment
+          ;; Coinbase input-0 witness stack must be exactly one 32-byte item.
+          (let ((cb-stack (first (bitcoin-lisp.serialization:transaction-witness
+                                  coinbase-tx))))
+            (unless (and (= (length cb-stack) 1)
+                         (= (length (first cb-stack)) 32))
+              (return-from validate-witness-commitment
+                (values nil :bad-witness-nonce-size)))
+            (let* ((reserved (first cb-stack))
+                   (witness-root (compute-witness-merkle-root transactions))
+                   (combined (make-array 64 :element-type '(unsigned-byte 8))))
+              (replace combined witness-root :start1 0)
+              (replace combined reserved :start1 32)
+              (unless (equalp (bitcoin-lisp.crypto:hash256 combined) commitment)
+                (return-from validate-witness-commitment
+                  (values nil :bad-witness-merkle-match)))))
+          ;; Valid commitment — accept without the unexpected-witness scan.
+          (return-from validate-witness-commitment (values t nil)))))
+    ;; Segwit inactive, or active with no commitment output: no transaction
+    ;; may carry witness data.
+    (dolist (tx transactions)
+      (when (bitcoin-lisp.serialization:transaction-has-witness-p tx)
         (return-from validate-witness-commitment
-          (values nil :missing-witness-commitment)))
-      ;; Compute witness merkle root and verify against commitment
-      ;; The commitment is: SHA256(SHA256(witness_merkle_root || witness_reserved_value))
-      ;; The witness reserved value is in the coinbase's witness stack (first item)
-      (let ((witness-root (compute-witness-merkle-root transactions))
-            (witness-reserved (let ((cb-witness (bitcoin-lisp.serialization:transaction-witness coinbase-tx)))
-                                (if (and cb-witness (first cb-witness) (first (first cb-witness)))
-                                    (first (first cb-witness))
-                                    (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))))
-        ;; Commitment = hash256(witness_root || witness_reserved)
-        (let* ((combined (make-array 64 :element-type '(unsigned-byte 8)))
-               (_ (replace combined witness-root :start1 0))
-               (_2 (replace combined witness-reserved :start1 32))
-               (computed-commitment (bitcoin-lisp.crypto:hash256 combined)))
-          (declare (ignore _ _2))
-          (unless (equalp computed-commitment commitment)
-            (return-from validate-witness-commitment
-              (values nil :bad-witness-commitment)))))))
-  (values t nil))
+          (values nil :unexpected-witness))))
+    (values t nil)))
 
 ;;;; BIP 34 Coinbase Height Validation
 
@@ -1030,9 +1047,14 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
           (unless valid
             (return-from validate-block (values nil error nil)))))
 
-      ;; Validate witness commitment (BIP 141)
+      ;; Validate witness commitment / malleation (BIP 141). Gated on
+      ;; segwit activation for this height, matching Core's
+      ;; expect_witness_commitment = DeploymentActiveAfter(prev, SEGWIT).
       (multiple-value-bind (valid error)
-          (validate-witness-commitment block)
+          (validate-witness-commitment
+           block
+           (>= current-height
+               (get-segwit-activation-height bitcoin-lisp:*network*)))
         (unless valid
           (return-from validate-block (values nil error nil))))
 
