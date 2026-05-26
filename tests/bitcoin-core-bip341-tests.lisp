@@ -103,3 +103,38 @@ or a branch (list of two subtrees)."
 
     (is (zerop failed)
         "All BIP 341 wallet vectors must pass. ~D failed." failed)))
+
+(test bip341-keypath-sighash-vectors
+  "BIP 341 keyPathSpending: compute-bip341-sighash-real must match the
+intermediary.sigHash for every (txinIndex, hashType) in the wallet
+vectors. Validates our taproot key-path sighash against Core's known-good
+values (the scriptPubKey section above only covers address derivation)."
+  (let* ((data (load-bip341-vectors))
+         (kps (first (gethash "keyPathSpending" data)))
+         (given (gethash "given" kps))
+         (raw-tx (bitcoin-lisp.crypto:hex-to-bytes (gethash "rawUnsignedTx" given)))
+         (tx (flexi-streams:with-input-from-sequence (s raw-tx)
+               (bitcoin-lisp.serialization:read-transaction s)))
+         (utxos-spent (gethash "utxosSpent" given))
+         (spent-vec (make-array (length utxos-spent))))
+    (loop for u in utxos-spent for i from 0
+          do (setf (aref spent-vec i)
+                   (bitcoin-lisp.storage:make-utxo-entry
+                    :value (gethash "amountSats" u)
+                    :script-pubkey (bitcoin-lisp.crypto:hex-to-bytes
+                                    (gethash "scriptPubKey" u)))))
+    (let ((bitcoin-lisp.coalton.interop::*current-tx* tx)
+          (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-vec)
+          (bitcoin-lisp.coalton.interop::*precomputed-sighash* nil))
+      (dolist (entry (gethash "inputSpending" kps))
+        (let* ((g (gethash "given" entry))
+               (inter (gethash "intermediary" entry))
+               (idx (gethash "txinIndex" g))
+               (hash-type (gethash "hashType" g))
+               (expected (gethash "sigHash" inter)))
+          (let ((bitcoin-lisp.coalton.interop::*current-input-index* idx))
+            (let ((got (bitcoin-lisp.crypto:bytes-to-hex
+                        (bitcoin-lisp.coalton.interop::compute-bip341-sighash-real
+                         hash-type nil nil))))
+              (is (string-equal expected got)
+                  "input ~D hashType ~D: expected ~A got ~A" idx hash-type expected got))))))))
