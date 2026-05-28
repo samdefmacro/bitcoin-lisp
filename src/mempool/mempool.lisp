@@ -91,7 +91,10 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
   ;; Maximum allowed size in bytes
   (max-size +default-max-mempool-bytes+ :type integer)
   ;; Minimum relay fee rate
-  (min-fee-rate +default-min-relay-fee-rate+ :type integer))
+  (min-fee-rate +default-min-relay-fee-rate+ :type integer)
+  ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
+  ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
+  (orphan-pool (make-orphan-pool) :type orphan-pool))
 
 ;;;; Outpoint key helper
 

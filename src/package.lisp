@@ -469,6 +469,18 @@
    #:mempool-ancestor-fee-rate
    #:mempool-descendant-fee-rate
    #:mempool-remove-recursive
+   #:mempool-orphan-pool
+   ;; Orphan pool
+   #:make-orphan-pool
+   #:orphan-pool-count
+   #:orphan-entry-transaction
+   #:orphan-entry-from-peer
+   #:orphan-add
+   #:orphan-remove
+   #:orphan-tx
+   #:orphans-depending-on
+   #:orphan-erase-for-peer
+   #:orphan-expire
    #:tx-signals-rbf-p
    #:find-rbf-conflicts
    #:check-rbf-rules

@@ -58,7 +58,8 @@
                                (:file "transaction")
                                (:file "block")))
                  (:module "mempool"
-                  :components ((:file "mempool")
+                  :components ((:file "orphan")
+                               (:file "mempool")
                                (:file "fee-estimator")))
                  (:module "networking"
                   :components ((:file "connection")
