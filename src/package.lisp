@@ -467,6 +467,10 @@
    #:mempool-ancestor-stats
    #:mempool-descendant-stats
    #:mempool-remove-recursive
+   #:tx-signals-rbf-p
+   #:find-rbf-conflicts
+   #:check-rbf-rules
+   #:*mempool-full-rbf*
    #:mempool-has
    #:mempool-get
    #:mempool-add

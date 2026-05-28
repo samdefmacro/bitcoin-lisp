@@ -397,12 +397,15 @@
                (chain-state (rpc-get-chain-state node))
                (current-height (bitcoin-lisp.storage:current-height chain-state)))
           ;; Validate transaction for mempool
-          (multiple-value-bind (valid error fee)
+          (multiple-value-bind (valid error fee replaced)
               (bitcoin-lisp.validation:validate-transaction-for-mempool
                tx utxo-set mempool current-height)
             (unless valid
               (error 'rpc-error :code +rpc-misc-error+
                                 :message (format nil "Transaction rejected: ~A" error)))
+            ;; BIP125: evict replaced transactions before adding.
+            (dolist (rt replaced)
+              (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
             ;; Add to mempool
             (let* ((entry (bitcoin-lisp.mempool:make-entry-from-tx
                            tx (or fee 0) current-height

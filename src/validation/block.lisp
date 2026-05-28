@@ -1420,10 +1420,12 @@ dropped. Mirrors Bitcoin Core re-adding disconnected-block txs after a reorg."
   (when (and mempool txs)
     (dolist (tx txs)
       (handler-case
-          (multiple-value-bind (valid error fee)
+          (multiple-value-bind (valid error fee replaced)
               (validate-transaction-for-mempool tx utxo-set mempool height)
             (declare (ignore error))
             (when valid
+              (dolist (rt replaced)
+                (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
               (bitcoin-lisp.mempool:mempool-add
                mempool (bitcoin-lisp.serialization:transaction-hash tx)
                (bitcoin-lisp.mempool:make-entry-from-tx
