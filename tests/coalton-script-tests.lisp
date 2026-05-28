@@ -1176,3 +1176,63 @@ truthy top (OP_1 OP_1 -> [1,1])."
              (make-array 34 :initial-element #xc0)))
   (is-false (bitcoin-lisp.coalton.interop::parse-control-block
              (make-array (+ 33 (* 32 129)) :initial-element #xc0))))
+
+;;;; CHECKMULTISIG consensus-parity regressions (vs Bitcoin Core interpreter.cpp)
+
+(test checkmultisig-operand-4-byte-bound
+  "CHECKMULTISIG key/sig count operands are bounded to 4 bytes, like Core's
+CScriptNum(.., 4) — independent of MINIMALDATA (interpreter.cpp:1116,1130)."
+  (let ((bitcoin-lisp.coalton.interop:*script-flags* nil))   ; MINIMALDATA off
+    ;; <=4 bytes accepted
+    (multiple-value-bind (val ok)
+        (bitcoin-lisp.coalton.interop::script-number-to-int-validated
+         (make-array 1 :element-type '(unsigned-byte 8) :initial-contents '(20)))
+      (is-true ok)
+      (is (= val 20)))
+    (multiple-value-bind (val ok)
+        (bitcoin-lisp.coalton.interop::script-number-to-int-validated
+         (make-array 4 :element-type '(unsigned-byte 8) :initial-element 1))
+      (declare (ignore val))
+      (is-true ok))
+    ;; 5 bytes exceeds the CScriptNum bound -> rejected
+    (multiple-value-bind (val ok)
+        (bitcoin-lisp.coalton.interop::script-number-to-int-validated
+         (make-array 5 :element-type '(unsigned-byte 8) :initial-element 1))
+      (declare (ignore val))
+      (is-false ok))))
+
+(test checkmultisig-empty-sig-checks-pubkey-encoding
+  "An empty signature in CHECKMULTISIG still runs CheckPubKeyEncoding on the
+paired pubkey under STRICTENC, so a malformed pubkey is rejected even when no
+real signature is provided (interpreter.cpp:1161)."
+  (let ((bitcoin-lisp.coalton.interop:*script-flags* "STRICTENC"))
+    (let ((empty-sig (make-array 0 :element-type '(unsigned-byte 8)))
+          (bad-pk (make-array 10 :element-type '(unsigned-byte 8) :initial-element 2))
+          (good-pk (let ((pk (make-array 33 :element-type '(unsigned-byte 8) :initial-element 0)))
+                     (setf (aref pk 0) #x02) pk)))
+      ;; empty sig + malformed pubkey -> :pubkeytype
+      (multiple-value-bind (ok err)
+          (bitcoin-lisp.coalton.interop::verify-checkmultisig
+           (list empty-sig) (list bad-pk)
+           (make-array 0 :element-type '(unsigned-byte 8)))
+        (is-false ok)
+        (is (eq err :pubkeytype)))
+      ;; empty sig + well-formed pubkey -> no encoding error (just fails to match)
+      (multiple-value-bind (ok err)
+          (bitcoin-lisp.coalton.interop::verify-checkmultisig
+           (list empty-sig) (list good-pk)
+           (make-array 0 :element-type '(unsigned-byte 8)))
+        (is-false ok)
+        (is (null err))))))
+
+(test check-pubkey-encoding-strictenc
+  "check-pubkey-encoding flags malformed pubkeys only under STRICTENC."
+  (let ((good-pk (let ((pk (make-array 33 :element-type '(unsigned-byte 8) :initial-element 0)))
+                   (setf (aref pk 0) #x03) pk))
+        (bad-pk (make-array 12 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (let ((bitcoin-lisp.coalton.interop:*script-flags* "STRICTENC"))
+      (is (eq :pubkeytype (bitcoin-lisp.coalton.interop::check-pubkey-encoding bad-pk)))
+      (is (null (bitcoin-lisp.coalton.interop::check-pubkey-encoding good-pk))))
+    ;; without STRICTENC, no pubkey-encoding error
+    (let ((bitcoin-lisp.coalton.interop:*script-flags* nil))
+      (is (null (bitcoin-lisp.coalton.interop::check-pubkey-encoding bad-pk))))))

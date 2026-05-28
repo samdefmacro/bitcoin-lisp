@@ -1963,18 +1963,17 @@ Used to remove the signature being verified from the scriptCode before sighash."
           (return-from verify-checksig (values nil :pubkeytype))
           (return-from verify-checksig (values nil nil))))
 
-    ;; STRICTENC validation when flag is enabled
-    (when (flag-enabled-p "STRICTENC")
-      (unless (valid-sighash-type-p sighash-type)
-        (return-from verify-checksig (values nil :sig-hashtype)))
-      (unless (valid-pubkey-format-p pubkey-bytes)
-        (return-from verify-checksig (values nil :pubkeytype))))
+    ;; STRICTENC: signature hashtype byte must be valid (part of Bitcoin Core's
+    ;; CheckSignatureEncoding; pubkey encoding is checked just below).
+    (when (and (flag-enabled-p "STRICTENC")
+               (not (valid-sighash-type-p sighash-type)))
+      (return-from verify-checksig (values nil :sig-hashtype)))
 
-    ;; WITNESS_PUBKEYTYPE: witness v0 requires compressed pubkeys
-    ;; (Bitcoin Core: CheckPubKeyEncoding in EvalChecksigPreTapscript)
-    (when (and *witness-v0-mode* (flag-enabled-p "WITNESS_PUBKEYTYPE"))
-      (unless (is-compressed-pubkey-p pubkey-bytes)
-        (return-from verify-checksig (values nil :witness-pubkeytype))))
+    ;; Pubkey encoding (STRICTENC / WITNESS_PUBKEYTYPE) — Bitcoin Core
+    ;; CheckPubKeyEncoding. Shared with the CHECKMULTISIG path.
+    (let ((pk-err (check-pubkey-encoding pubkey-bytes)))
+      (when pk-err
+        (return-from verify-checksig (values nil pk-err))))
 
     ;; CONST_SCRIPTCODE: reject if scriptCode contains OP_CODESEPARATOR as an opcode
     ;; Also reject if FindAndDelete would modify the scriptCode (sig found in scriptCode)
@@ -2101,6 +2100,22 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
 ;;; CHECKMULTISIG Support
 ;;; ============================================================
 
+(defun check-pubkey-encoding (pubkey-bytes)
+  "Mirror Bitcoin Core CheckPubKeyEncoding (interpreter.cpp): under STRICTENC
+the pubkey must be a valid compressed/uncompressed encoding; under
+WITNESS_PUBKEYTYPE in a witness-v0 context it must be compressed. Returns an
+error keyword (:pubkeytype / :witness-pubkeytype) or NIL when the encoding is
+acceptable (or the flags are off)."
+  (cond
+    ((and (flag-enabled-p "STRICTENC")
+          (not (valid-pubkey-format-p pubkey-bytes)))
+     :pubkeytype)
+    ((and *witness-v0-mode*
+          (flag-enabled-p "WITNESS_PUBKEYTYPE")
+          (not (is-compressed-pubkey-p pubkey-bytes)))
+     :witness-pubkeytype)
+    (t nil)))
+
 (defun verify-checkmultisig (sigs pubkeys script-pubkey)
   "Verify m-of-n multisig. SIGS and PUBKEYS are lists of byte arrays.
    Returns (values success error-type).
@@ -2136,10 +2151,16 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
              (let ((sig (nth sig-index sigs)))
                (cond
                  ;; Empty signature - can never match, just consume pubkeys
-                 ;; until we run out (checked at top of loop)
+                 ;; until we run out (checked at top of loop). Core still runs
+                 ;; CheckPubKeyEncoding on the paired pubkey every iteration,
+                 ;; even for an empty sig (interpreter.cpp:1161), so a
+                 ;; bad-encoding pubkey is rejected under STRICTENC/
+                 ;; WITNESS_PUBKEYTYPE before being consumed.
                  ((zerop (length sig))
-                  ;; Empty sig doesn't advance, just consume a pubkey
-                  (incf pubkey-index))
+                  (let ((pk-err (check-pubkey-encoding (nth pubkey-index pubkeys))))
+                    (if pk-err
+                        (progn (setf error-result pk-err) (return))
+                        (incf pubkey-index))))
 
                  ;; Non-empty signature - try to verify with current pubkey
                  (t
@@ -2222,9 +2243,18 @@ CHECKMULTISIG handles NULLFAIL at the algorithm level after all attempts.")
               do (setf result (logior result (ash (aref bytes i) (* i 8)))))
         (if negative (- result) result))))
 
-(defun script-number-to-int-validated (bytes)
-  "Convert script number bytes to integer, validating MINIMALDATA if enabled.
-   Returns (values integer success-p). Second value is NIL if MINIMALDATA validation fails."
+(defun script-number-to-int-validated (bytes &optional (max-bytes 4))
+  "Convert script number bytes to integer for a CHECKMULTISIG key/sig count.
+   Returns (values integer success-p); success-p is NIL when the operand is
+   rejected.
+
+   Enforces the CScriptNum size bound (MAX-BYTES, default 4 = Bitcoin Core's
+   default nMaxNumSize) UNCONDITIONALLY — Core constructs CScriptNum(.., 4) for
+   nKeysCount/nSigsCount, which throws on a >4-byte operand regardless of the
+   minimal-encoding flag (interpreter.cpp:1116,1130). Also enforces MINIMALDATA
+   when that flag is set."
+  (when (> (length bytes) max-bytes)
+    (return-from script-number-to-int-validated (values 0 nil)))
   (when (and (flag-enabled-p "MINIMALDATA")
              (not (minimal-number-encoding-p bytes)))
     (return-from script-number-to-int-validated (values 0 nil)))
