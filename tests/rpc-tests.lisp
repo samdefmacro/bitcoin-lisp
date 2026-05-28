@@ -207,10 +207,27 @@
 ;;; --- Network Query Method Tests (5.4) ---
 
 (test rpc-getpeerinfo
-  "Test getpeerinfo returns list"
+  "getpeerinfo returns a numeric protocol version and encodes through yason.
+Regression: peer-version holds the version *message* struct, and getpeerinfo
+used to emit it verbatim, which yason cannot encode."
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)))
-    (is (listp result))))
+         (vmsg (bitcoin-lisp.serialization::make-version-message
+                :version 70016 :start-height 42 :user-agent "/test/"))
+         (peer (bitcoin-lisp::make-peer :address "1.2.3.4:48333"
+                                        :version vmsg
+                                        :user-agent "/test/"
+                                        :start-height 42)))
+    (setf (bitcoin-lisp::node-peers node) (list peer))
+    (let* ((result (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+           (entry (first result)))
+      (is (listp result))
+      (is (= (length result) 1))
+      ;; version must be the numeric protocol version, not the struct
+      (is (integerp (cdr (assoc "version" entry :test #'string=))))
+      (is (= (cdr (assoc "version" entry :test #'string=)) 70016))
+      ;; full result must serialize without error
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id")))
+        (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-getnetworkinfo
   "Test getnetworkinfo returns expected fields"

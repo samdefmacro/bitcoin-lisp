@@ -303,11 +303,17 @@
   (declare (ignore params))
   (let ((peers (rpc-get-peers node)))
     (mapcar (lambda (peer)
-              `(("addr" . ,(bitcoin-lisp::peer-address peer))
-                ("version" . ,(or (bitcoin-lisp::peer-version peer) 0))
-                ("subver" . ,(or (bitcoin-lisp::peer-user-agent peer) ""))
-                ("inbound" . nil)
-                ("startingheight" . ,(or (bitcoin-lisp::peer-start-height peer) 0))))
+              ;; peer-version holds the received version *message* struct, not a
+              ;; number — pull the numeric protocol version out of it.
+              (let ((vmsg (bitcoin-lisp::peer-version peer)))
+                `(("addr" . ,(bitcoin-lisp::peer-address peer))
+                  ("version" . ,(if vmsg
+                                    (bitcoin-lisp.serialization:version-message-version vmsg)
+                                    0))
+                  ("subver" . ,(or (bitcoin-lisp::peer-user-agent peer) ""))
+                  ("services" . ,(bitcoin-lisp::peer-services peer))
+                  ("inbound" . nil)
+                  ("startingheight" . ,(or (bitcoin-lisp::peer-start-height peer) 0)))))
             peers)))
 
 (defun rpc-getnetworkinfo (node params)
