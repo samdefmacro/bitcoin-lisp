@@ -168,8 +168,83 @@ FEE is returned as a Satoshi type."
 (defconstant +min-relay-fee-rate+ 1
   "Minimum relay fee rate in satoshis per virtual byte.")
 
-(defconstant +max-standard-tx-size+ 100000
-  "Maximum size of a standard transaction for relay (100KB).")
+(defconstant +max-standard-tx-weight+ 400000
+  "Maximum weight of a standard transaction for relay (Bitcoin Core
+MAX_STANDARD_TX_WEIGHT).")
+
+(defconstant +min-standard-tx-version+ 1
+  "Minimum standard transaction version (Bitcoin Core TX_MIN_STANDARD_VERSION).")
+
+(defconstant +max-standard-tx-version+ 3
+  "Maximum standard transaction version (Bitcoin Core TX_MAX_STANDARD_VERSION).")
+
+(defconstant +dust-relay-fee-rate+ 3000
+  "Dust relay fee rate in satoshis per kvB (Bitcoin Core DUST_RELAY_TX_FEE).
+An output is dust when spending it would cost more than 1/3 its value at
+this rate (~546 sat for P2PKH, ~294 sat for P2WPKH).")
+
+(defconstant +max-standard-scriptsig-size+ 1650
+  "Maximum scriptSig size for a standard input (Bitcoin Core
+MAX_STANDARD_SCRIPTSIG_SIZE) — fits a 15-of-15 P2SH redeem.")
+
+(defconstant +max-standard-tx-sigops-cost+ 80000
+  "Maximum weighted sigop cost for a standard tx (MAX_BLOCK_SIGOPS_COST / 5).")
+
+(defconstant +max-standard-p2sh-sigops+ 15
+  "Maximum sigops in a standard P2SH redeemScript (Bitcoin Core MAX_P2SH_SIGOPS).")
+
+(defun output-witness-program-p (script-pubkey)
+  "True if SCRIPT-PUBKEY is a witness program: a version byte (OP_0, or
+OP_1..OP_16) followed by a single push of 2-40 bytes that consumes the rest
+of the script."
+  (let ((len (length script-pubkey)))
+    (and (>= len 4) (<= len 42)
+         (let ((v (aref script-pubkey 0)))
+           (or (= v #x00) (<= #x51 v #x60)))   ; OP_0 or OP_1..OP_16
+         (let ((push (aref script-pubkey 1)))
+           (and (<= 2 push 40) (= len (+ 2 push)))))))
+
+(defun dust-threshold (script-pubkey)
+  "Minimum non-dust value for an output paying to SCRIPT-PUBKEY (Bitcoin Core
+GetDustThreshold). Unspendable (OP_RETURN) outputs return 0 — never dust."
+  (if (and (plusp (length script-pubkey))
+           (= (aref script-pubkey 0) #x6a))   ; OP_RETURN — unspendable
+      0
+      (let* ((spk-len (length script-pubkey))
+             ;; serialized output: 8-byte value + varint(scriptlen) + script
+             (output-size (+ 8 (if (< spk-len #xfd) 1 3) spk-len))
+             ;; assumed cost to spend the output (witness gets the discount)
+             (spend-overhead (if (output-witness-program-p script-pubkey)
+                                 (+ 32 4 1 (floor 107 4) 4)   ; 67
+                                 (+ 32 4 1 107 4)))           ; 148
+             (nsize (+ output-size spend-overhead)))
+        (floor (* nsize +dust-relay-fee-rate+) 1000))))
+
+(defun scriptsig-push-only-p (script-sig)
+  "True if SCRIPT-SIG contains only push opcodes (every opcode <= OP_16),
+walking past pushed data. Bitcoin Core CScript::IsPushOnly."
+  (let ((len (length script-sig)) (i 0))
+    (loop while (< i len)
+          do (let ((op (aref script-sig i)))
+               (when (> op #x60)        ; > OP_16 → not push-only
+                 (return-from scriptsig-push-only-p nil))
+               (cond
+                 ((<= 1 op 75) (incf i (1+ op)))
+                 ((= op #x4c) (if (< (1+ i) len)
+                                  (incf i (+ 2 (aref script-sig (1+ i))))
+                                  (return-from scriptsig-push-only-p nil)))
+                 ((= op #x4d) (if (< (+ i 2) len)
+                                  (incf i (+ 3 (logior (aref script-sig (1+ i))
+                                                       (ash (aref script-sig (+ i 2)) 8))))
+                                  (return-from scriptsig-push-only-p nil)))
+                 ((= op #x4e) (if (< (+ i 4) len)
+                                  (incf i (+ 5 (logior (aref script-sig (1+ i))
+                                                       (ash (aref script-sig (+ i 2)) 8)
+                                                       (ash (aref script-sig (+ i 3)) 16)
+                                                       (ash (aref script-sig (+ i 4)) 24))))
+                                  (return-from scriptsig-push-only-p nil)))
+                 (t (incf i)))))         ; OP_0, OP_1NEGATE, OP_1..OP_16
+    t))
 
 (defun standard-output-script-p (script-pubkey)
   "Check if SCRIPT-PUBKEY is a standard output script type.
@@ -224,18 +299,38 @@ FEE is returned as an integer (satoshis)."
       (return-from validate-transaction-for-mempool
         (values nil error nil))))
 
-  ;; Policy: max standard transaction size
-  (let ((serialized (bitcoin-lisp.serialization:serialize-transaction tx)))
-    (when (> (length serialized) +max-standard-tx-size+)
+  ;; Policy: standard transaction version
+  (let ((version (bitcoin-lisp.serialization:transaction-version tx)))
+    (unless (<= +min-standard-tx-version+ version +max-standard-tx-version+)
       (return-from validate-transaction-for-mempool
-        (values nil :tx-too-large nil))))
+        (values nil :version-non-standard nil))))
 
-  ;; Policy: all outputs must be standard script types
+  ;; Policy: max standard transaction weight (Bitcoin Core's only size limit;
+  ;; the old serialized-size cap was removed upstream).
+  (when (> (bitcoin-lisp.serialization:transaction-weight tx) +max-standard-tx-weight+)
+    (return-from validate-transaction-for-mempool
+      (values nil :tx-weight-too-large nil)))
+
+  ;; Policy: scriptSig must be push-only and within the size limit
+  (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input)))
+      (when (> (length script-sig) +max-standard-scriptsig-size+)
+        (return-from validate-transaction-for-mempool
+          (values nil :scriptsig-too-large nil)))
+      (unless (scriptsig-push-only-p script-sig)
+        (return-from validate-transaction-for-mempool
+          (values nil :scriptsig-not-pushonly nil)))))
+
+  ;; Policy: all outputs must be standard script types, and none dust
   (dolist (output (bitcoin-lisp.serialization:transaction-outputs tx))
-    (unless (standard-output-script-p
-             (bitcoin-lisp.serialization:tx-out-script-pubkey output))
-      (return-from validate-transaction-for-mempool
-        (values nil :non-standard-output nil))))
+    (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+      (unless (standard-output-script-p spk)
+        (return-from validate-transaction-for-mempool
+          (values nil :non-standard-output nil)))
+      (when (< (bitcoin-lisp.serialization:tx-out-value output)
+               (dust-threshold spk))
+        (return-from validate-transaction-for-mempool
+          (values nil :dust nil)))))
 
   ;; Check for duplicate in mempool
   (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
@@ -259,6 +354,29 @@ FEE is returned as an integer (satoshis)."
         (return-from validate-transaction-for-mempool
           (values nil :missing-input nil)))))
 
+  ;; Policy: bounded sigop cost (now that spent scripts are available).
+  (flet ((spent-script (txid index)
+           (let ((u (bitcoin-lisp.storage:get-utxo utxo-set txid index)))
+             (when u (bitcoin-lisp.storage:utxo-entry-script-pubkey u)))))
+    ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
+    (when (> (count-transaction-sigops-cost tx #'spent-script)
+             +max-standard-tx-sigops-cost+)
+      (return-from validate-transaction-for-mempool
+        (values nil :too-many-sigops nil)))
+    ;; Per-input P2SH redeemScript sigops <= MAX_P2SH_SIGOPS.
+    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+             (spk (spent-script (bitcoin-lisp.serialization:outpoint-hash prevout)
+                                (bitcoin-lisp.serialization:outpoint-index prevout))))
+        (when (and spk (script-is-p2sh-p spk))
+          (let ((redeem (extract-last-push
+                         (bitcoin-lisp.serialization:tx-in-script-sig input))))
+            (when (and redeem
+                       (> (count-script-sigops redeem :accurate t)
+                          +max-standard-p2sh-sigops+))
+              (return-from validate-transaction-for-mempool
+                (values nil :too-many-sigops nil))))))))
+
   ;; Contextual validation (consensus): UTXO existence, coinbase maturity, fee calculation
   (multiple-value-bind (valid error fee)
       (validate-transaction-contextual tx utxo-set current-height)
@@ -266,10 +384,10 @@ FEE is returned as an integer (satoshis)."
       (return-from validate-transaction-for-mempool
         (values nil error nil)))
 
-    ;; Convert typed fee to integer
+    ;; Convert typed fee to integer; fee-rate is per virtual byte (BIP141).
     (let* ((fee-value (unwrap-satoshi fee))
-           (tx-size (length (bitcoin-lisp.serialization:serialize-transaction tx)))
-           (fee-rate (if (zerop tx-size) 0 (floor fee-value tx-size))))
+           (vsize (bitcoin-lisp.serialization:transaction-vsize tx))
+           (fee-rate (if (zerop vsize) 0 (floor fee-value vsize))))
 
       ;; Policy: minimum relay fee rate
       (when (< fee-rate +min-relay-fee-rate+)
