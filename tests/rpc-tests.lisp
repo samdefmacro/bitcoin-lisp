@@ -266,11 +266,26 @@ used to emit it verbatim, which yason cannot encode."
     (is (listp result))))
 
 (test rpc-getrawmempool-verbose
-  "Test getrawmempool verbose returns hash-table"
+  "getrawmempool verbose returns a per-tx detail alist (txid -> fields) that the
+RPC layer normalizes into a JSON object."
   (let* ((node (make-test-node))
-         (result (bitcoin-lisp.rpc::rpc-getrawmempool node '(t))))
-    ;; Should return a hash table
-    (is (hash-table-p result))))
+         (mempool (bitcoin-lisp::node-mempool node))
+         (tx (make-mempool-test-tx :input-id 200))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+    ;; Empty mempool -> empty.
+    (is (null (bitcoin-lisp.rpc::rpc-getrawmempool node '(t))))
+    ;; Populate and check the entry + a couple of fields.
+    (bitcoin-lisp.mempool:mempool-add
+     mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))
+    (let* ((result (bitcoin-lisp.rpc::rpc-getrawmempool node '(t)))
+           (entry (cdr (assoc (bitcoin-lisp.rpc::hash-to-hex txid) result :test #'string=))))
+      (is (listp result))
+      (is (not (null entry)))
+      (is (assoc "vsize" entry :test #'string=))
+      (is (= 1 (cdr (assoc "ancestorcount" entry :test #'string=))))
+      ;; serializes cleanly through the RPC response normalizer
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id")))
+        (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-sendrawtransaction-invalid
   "Test sendrawtransaction with invalid hex returns error"

@@ -466,6 +466,8 @@
    #:mempool-descendants
    #:mempool-ancestor-stats
    #:mempool-descendant-stats
+   #:mempool-ancestor-fee-rate
+   #:mempool-descendant-fee-rate
    #:mempool-remove-recursive
    #:tx-signals-rbf-p
    #:find-rbf-conflicts
