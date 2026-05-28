@@ -280,6 +280,30 @@ Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
           (<= len 83)
           (= (aref script-pubkey 0) #x6a))))) ; OP_RETURN
 
+(defun mempool-extra-coins (tx utxo-set mempool)
+  "Build a (txid . index) -> utxo-entry table for TX inputs that spend
+unconfirmed in-mempool outputs (chained spends). Returns (values table ok-p);
+OK-P is NIL if some input references neither a confirmed UTXO nor an in-mempool
+output (a genuinely missing input)."
+  (let ((extra (make-hash-table :test 'equalp)))
+    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx) (values extra t))
+      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+             (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
+             (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))
+        (unless (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)
+          (let* ((pe (bitcoin-lisp.mempool:mempool-get mempool ptxid))
+                 (ptx (and pe (bitcoin-lisp.mempool:mempool-entry-transaction pe)))
+                 (outs (and ptx (bitcoin-lisp.serialization:transaction-outputs ptx))))
+            (if (and outs (< pidx (length outs)))
+                (let ((out (nth pidx outs)))
+                  (setf (gethash (cons ptxid pidx) extra)
+                        (bitcoin-lisp.storage::make-utxo-entry
+                         :value (bitcoin-lisp.serialization:tx-out-value out)
+                         :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+                         :height (bitcoin-lisp.mempool:mempool-entry-height pe)
+                         :coinbase nil)))
+                (return-from mempool-extra-coins (values nil nil)))))))))
+
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height)
   "Validate a transaction for mempool acceptance.
 Performs consensus checks plus policy checks.
@@ -344,70 +368,75 @@ FEE is returned as an integer (satoshis)."
       (return-from validate-transaction-for-mempool
         (values nil :mempool-conflict nil))))
 
-  ;; Check inputs: must reference UTXOs not already spent by mempool
-  (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
-    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-           (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
-           (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
-           (utxo (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)))
-      (unless utxo
-        (return-from validate-transaction-for-mempool
-          (values nil :missing-input nil)))))
-
-  ;; Policy: bounded sigop cost (now that spent scripts are available).
-  (flet ((spent-script (txid index)
-           (let ((u (bitcoin-lisp.storage:get-utxo utxo-set txid index)))
-             (when u (bitcoin-lisp.storage:utxo-entry-script-pubkey u)))))
-    ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
-    (when (> (count-transaction-sigops-cost tx #'spent-script)
-             +max-standard-tx-sigops-cost+)
+  ;; Check inputs: each must reference a confirmed UTXO or an unconfirmed
+  ;; in-mempool output (chained spend). EXTRA-COINS carries the latter.
+  (multiple-value-bind (extra-coins inputs-ok)
+      (mempool-extra-coins tx utxo-set mempool)
+    (unless inputs-ok
       (return-from validate-transaction-for-mempool
-        (values nil :too-many-sigops nil)))
-    ;; Per-input P2SH redeemScript sigops <= MAX_P2SH_SIGOPS.
-    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
-      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-             (spk (spent-script (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                (bitcoin-lisp.serialization:outpoint-index prevout))))
-        (when (and spk (script-is-p2sh-p spk))
-          (let ((redeem (extract-last-push
-                         (bitcoin-lisp.serialization:tx-in-script-sig input))))
-            (when (and redeem
-                       (> (count-script-sigops redeem :accurate t)
-                          +max-standard-p2sh-sigops+))
-              (return-from validate-transaction-for-mempool
-                (values nil :too-many-sigops nil))))))))
+        (values nil :missing-input nil)))
 
-  ;; Contextual validation (consensus): UTXO existence, coinbase maturity, fee calculation
-  (multiple-value-bind (valid error fee)
-      (validate-transaction-contextual tx utxo-set current-height)
-    (unless valid
-      (return-from validate-transaction-for-mempool
-        (values nil error nil)))
-
-    ;; Convert typed fee to integer; fee-rate is per virtual byte (BIP141).
-    (let* ((fee-value (unwrap-satoshi fee))
-           (vsize (bitcoin-lisp.serialization:transaction-vsize tx))
-           (fee-rate (if (zerop vsize) 0 (floor fee-value vsize))))
-
-      ;; Policy: minimum relay fee rate
-      (when (< fee-rate +min-relay-fee-rate+)
+    ;; Policy: bounded sigop cost (now that spent scripts are available).
+    (flet ((spent-script (txid index)
+             (let ((u (or (bitcoin-lisp.storage:get-utxo utxo-set txid index)
+                          (gethash (cons txid index) extra-coins))))
+               (when u (bitcoin-lisp.storage:utxo-entry-script-pubkey u)))))
+      ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
+      (when (> (count-transaction-sigops-cost tx #'spent-script)
+               +max-standard-tx-sigops-cost+)
         (return-from validate-transaction-for-mempool
-          (values nil :insufficient-fee nil)))
+          (values nil :too-many-sigops nil)))
+      ;; Per-input P2SH redeemScript sigops <= MAX_P2SH_SIGOPS.
+      (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+               (spk (spent-script (bitcoin-lisp.serialization:outpoint-hash prevout)
+                                  (bitcoin-lisp.serialization:outpoint-index prevout))))
+          (when (and spk (script-is-p2sh-p spk))
+            (let ((redeem (extract-last-push
+                           (bitcoin-lisp.serialization:tx-in-script-sig input))))
+              (when (and redeem
+                         (> (count-script-sigops redeem :accurate t)
+                            +max-standard-p2sh-sigops+))
+                (return-from validate-transaction-for-mempool
+                  (values nil :too-many-sigops nil))))))))
 
-      ;; Script validation (consensus)
-      (multiple-value-bind (scripts-valid failed-input)
-          (validate-transaction-scripts tx utxo-set :height current-height)
-        (declare (ignore failed-input))
-        (unless scripts-valid
+    ;; Contextual validation (consensus): coinbase maturity, fee calculation.
+    ;; EXTRA-COINS is passed as pending-utxos so chained-spend inputs resolve.
+    (multiple-value-bind (valid error fee)
+        (validate-transaction-contextual tx utxo-set current-height
+                                         :pending-utxos extra-coins)
+      (unless valid
+        (return-from validate-transaction-for-mempool
+          (values nil error nil)))
+
+      ;; Convert typed fee to integer; fee-rate is per virtual byte (BIP141).
+      (let* ((fee-value (unwrap-satoshi fee))
+             (vsize (bitcoin-lisp.serialization:transaction-vsize tx))
+             (fee-rate (if (zerop vsize) 0 (floor fee-value vsize))))
+
+        ;; Policy: minimum relay fee rate
+        (when (< fee-rate +min-relay-fee-rate+)
           (return-from validate-transaction-for-mempool
-            (values nil :script-failed nil))))
+            (values nil :insufficient-fee nil)))
 
-      (values t nil fee-value))))
+        ;; Script validation (consensus)
+        (multiple-value-bind (scripts-valid failed-input)
+            (validate-transaction-scripts tx utxo-set :height current-height
+                                          :extra-coins extra-coins)
+          (declare (ignore failed-input))
+          (unless scripts-valid
+            (return-from validate-transaction-for-mempool
+              (values nil :script-failed nil))))
+
+        (values t nil fee-value)))))
 
 ;;;; Script validation
 
-(defun collect-spent-utxos (inputs utxo-set)
+(defun collect-spent-utxos (inputs utxo-set &optional extra-coins)
   "Return a vector of utxo-entry for INPUTS, or NIL if any UTXO is missing.
+   EXTRA-COINS is an optional (txid . index) -> utxo-entry table consulted as a
+   fallback (used for chained mempool spends, where a parent's output isn't in
+   the confirmed UTXO set yet).
    Required for BIP 341 sighash, which hashes spent amounts/scripts across
    all inputs of a tx; without complete coverage, the Taproot sighash would
    be wrong, so callers should fall back when this returns NIL."
@@ -415,21 +444,27 @@ FEE is returned as an integer (satoshis)."
     (loop for input in inputs
           for i from 0
           for prevout = (bitcoin-lisp.serialization:tx-in-previous-output input)
-          for utxo = (bitcoin-lisp.storage:get-utxo
-                      utxo-set
-                      (bitcoin-lisp.serialization:outpoint-hash prevout)
-                      (bitcoin-lisp.serialization:outpoint-index prevout))
+          for utxo = (or (bitcoin-lisp.storage:get-utxo
+                          utxo-set
+                          (bitcoin-lisp.serialization:outpoint-hash prevout)
+                          (bitcoin-lisp.serialization:outpoint-index prevout))
+                         (and extra-coins
+                              (gethash (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
+                                             (bitcoin-lisp.serialization:outpoint-index prevout))
+                                       extra-coins)))
           unless utxo do (return-from collect-spent-utxos nil)
           do (setf (aref result i) utxo))
     result))
 
-(defun validate-transaction-scripts (tx utxo-set &key (height 0))
+(defun validate-transaction-scripts (tx utxo-set &key (height 0) extra-coins)
   "Validate all input scripts for a transaction via Coalton interop.
 Uses validate-input-script for each input (same path as block validation).
 HEIGHT determines which script verification flags are active.
+EXTRA-COINS supplies spent outputs not in the confirmed UTXO set (chained
+mempool spends).
 Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
   (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-         (spent-utxos (collect-spent-utxos inputs utxo-set))
+         (spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
          (bitcoin-lisp.coalton.interop:*script-flags*
            (compute-script-flags-for-height height))
          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
