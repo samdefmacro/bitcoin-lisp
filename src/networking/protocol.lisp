@@ -409,7 +409,7 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
               (when (bitcoin-lisp:recent-reject-p recent-rejects txid)
                 (return-from handle-tx nil))
               ;; Validate for mempool
-              (multiple-value-bind (valid error fee)
+              (multiple-value-bind (valid error fee replaced)
                   (bitcoin-lisp.validation:validate-transaction-for-mempool
                    tx utxo-set mempool current-height)
                 (unless valid
@@ -422,6 +422,9 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                                         :output-too-large :total-output-too-large))
                     (record-misbehavior peer 10)))
                 (when valid
+                  ;; BIP125: evict the transactions this one replaces first.
+                  (dolist (rt replaced)
+                    (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
                   ;; Add to mempool
                   (let* ((entry (bitcoin-lisp.mempool:make-entry-from-tx
                                  tx fee current-height

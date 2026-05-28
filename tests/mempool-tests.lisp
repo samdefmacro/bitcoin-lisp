@@ -634,3 +634,75 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
     (is (not (bitcoin-lisp.mempool:mempool-has mempool atxid)))
     (is (not (bitcoin-lisp.mempool:mempool-has mempool btxid)))
     (is (bitcoin-lisp.mempool:mempool-has mempool ctxid))))
+
+;;;; PR4 RBF (BIP125)
+
+(defun %rbf-tx (input-id &key (sequence #xfffffffd) (value 50000000))
+  "A tx spending outpoint (INPUT-ID-hash, 0) with the given input SEQUENCE."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                  :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                    :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                      :initial-element input-id)
+                                    :index 0)
+                  :script-sig (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)
+                  :sequence sequence))
+   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                   :value value
+                   :script-pubkey (let ((s (make-array 25 :element-type '(unsigned-byte 8)
+                                                       :initial-element 0)))
+                                    (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
+                                          (aref s 23) #x88 (aref s 24) #xac) s)))
+   :lock-time 0))
+
+(test rbf-signaling-detection
+  "tx-signals-rbf-p reads the BIP125 opt-in sequence."
+  (is-true (bitcoin-lisp.mempool:tx-signals-rbf-p (%rbf-tx 1 :sequence #xfffffffd)))
+  (is-false (bitcoin-lisp.mempool:tx-signals-rbf-p (%rbf-tx 1 :sequence #xffffffff))))
+
+(test rbf-find-conflicts
+  "find-rbf-conflicts returns every mempool tx spending a shared outpoint."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 100))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig)))
+    (%add-tx mempool orig :fee 1000)
+    (is (equal (list orig-txid)
+               (bitcoin-lisp.mempool:find-rbf-conflicts mempool (%rbf-tx 100 :value 40000000))))))
+
+(test rbf-rules-fee-and-signaling
+  "BIP125 rules: higher fee replaces; lower fee and non-signaling are rejected."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 100 :sequence #xfffffffd))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig))
+         (repl (%rbf-tx 100 :sequence #xfffffffd :value 40000000))
+         (rvsize (bitcoin-lisp.serialization:transaction-vsize repl)))
+    (%add-tx mempool orig :fee 1000)
+    ;; Rule 3/4 pass: a clearly higher fee.
+    (multiple-value-bind (ok reason replaced)
+        (bitcoin-lisp.mempool:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
+      (declare (ignore reason))
+      (is-true ok)
+      (is (not (null (gethash orig-txid replaced)))))
+    ;; Rule 3 fail: fee below the original's.
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-rbf-rules mempool repl 500 rvsize (list orig-txid))
+      (is-false ok)
+      (is (eq reason :insufficient-fee)))))
+
+(test rbf-requires-signaling-unless-full-rbf
+  "Rule 1 rejects replacing a non-signaling tx, unless *mempool-full-rbf*."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 101 :sequence #xffffffff))   ; non-signaling
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig))
+         (repl (%rbf-tx 101 :sequence #xfffffffd))
+         (rvsize (bitcoin-lisp.serialization:transaction-vsize repl)))
+    (%add-tx mempool orig :fee 1000)
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
+      (is-false ok)
+      (is (eq reason :txn-mempool-conflict)))
+    (let ((bitcoin-lisp.mempool:*mempool-full-rbf* t))
+      (multiple-value-bind (ok)
+          (bitcoin-lisp.mempool:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
+        (is-true ok)))))
