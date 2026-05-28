@@ -364,22 +364,52 @@
           ("minrelaytxfee" . 0.00001)))))
 
 (defun rpc-getrawmempool (node params)
-  "Return mempool transaction IDs or details."
-  (let ((verbose (first params)))
-    (let ((mempool (rpc-get-mempool node)))
-      (if mempool
-          (let ((txs (bitcoin-lisp.mempool:mempool-get-transactions mempool))
-                (result (if verbose (make-hash-table :test 'equal) nil)))
-            (dolist (tx txs)
-              (let ((txid-hex (hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx))))
-                (if verbose
-                    (setf (gethash txid-hex result)
-                          `(("size" . 0)
-                            ("fee" . 0)
-                            ("time" . ,(get-universal-time))))
-                    (push txid-hex result))))
-            (if verbose result (nreverse result)))
-          (if verbose (make-hash-table :test 'equal) nil)))))
+  "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
+  (let ((verbose (first params))
+        (mempool (rpc-get-mempool node)))
+    (cond
+      ((null mempool) (if verbose '() '()))
+      ((not verbose)
+       (let ((ids '()))
+         (bitcoin-lisp.mempool:mempool-for-each
+          mempool (lambda (txid entry)
+                    (declare (ignore entry))
+                    (push (hash-to-hex txid) ids)))
+         (nreverse ids)))
+      (t
+       ;; Verbose: an alist (txid -> field-alist); the RPC normalizer turns it
+       ;; into nested JSON objects.
+       (let ((result '()))
+         (bitcoin-lisp.mempool:mempool-for-each
+          mempool
+          (lambda (txid entry)
+            (multiple-value-bind (acount asize afees)
+                (bitcoin-lisp.mempool:mempool-ancestor-stats mempool txid)
+              (multiple-value-bind (dcount dsize dfees)
+                  (bitcoin-lisp.mempool:mempool-descendant-stats mempool txid)
+                (push
+                 (cons (hash-to-hex txid)
+                       `(("vsize" . ,(bitcoin-lisp.mempool:mempool-entry-vsize entry))
+                         ("weight" . ,(bitcoin-lisp.serialization:transaction-weight
+                                       (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+                         ("time" . ,(bitcoin-lisp.mempool:mempool-entry-entry-time entry))
+                         ("height" . ,(bitcoin-lisp.mempool:mempool-entry-height entry))
+                         ("fees" . (("base" . ,(/ (bitcoin-lisp.mempool:mempool-entry-fee entry)
+                                                  100000000.0d0))
+                                    ("ancestor" . ,(/ afees 100000000.0d0))
+                                    ("descendant" . ,(/ dfees 100000000.0d0))))
+                         ("ancestorcount" . ,acount)
+                         ("ancestorsize" . ,asize)
+                         ("descendantcount" . ,dcount)
+                         ("descendantsize" . ,dsize)
+                         ("wtxid" . ,(hash-to-hex (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
+                         ("depends" . ,(let ((deps '()))
+                                         (maphash (lambda (p v) (declare (ignore v))
+                                                    (push (hash-to-hex p) deps))
+                                                  (bitcoin-lisp.mempool:mempool-entry-parents entry))
+                                         deps))))
+                 result)))))
+         result)))))
 
 (defun rpc-sendrawtransaction (node params)
   "Submit a raw transaction to the mempool."

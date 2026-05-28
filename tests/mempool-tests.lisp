@@ -706,3 +706,28 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
       (multiple-value-bind (ok)
           (bitcoin-lisp.mempool:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
         (is-true ok)))))
+
+;;;; PR5 CPFP eviction
+
+(test mempool-cpfp-eviction-protects-parent
+  "Eviction ranks by descendant-package fee-rate: a high-fee child protects its
+low-fee parent, so a cheaper standalone tx is evicted first."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 300))
+         (s (make-mempool-test-tx :input-id 110))        ; standalone, low fee
+         (stxid (bitcoin-lisp.serialization:transaction-hash s))
+         (p (make-mempool-test-tx :input-id 111))        ; parent, low fee
+         (ptxid (bitcoin-lisp.serialization:transaction-hash p))
+         (c (%mp-spending-tx ptxid))                     ; child, high fee (CPFP)
+         (ctxid (bitcoin-lisp.serialization:transaction-hash c))
+         (n (make-mempool-test-tx :input-id 112))        ; incoming, medium fee
+         (ntxid (bitcoin-lisp.serialization:transaction-hash n)))
+    (is (eq :ok (%add-tx mempool s :fee 100)))
+    (is (eq :ok (%add-tx mempool p :fee 100)))
+    (is (eq :ok (%add-tx mempool c :fee 50000)))
+    ;; Adding N forces eviction; the cheapest package (standalone S) is dropped,
+    ;; while the CPFP'd P<-C package survives despite P's low individual fee.
+    (%add-tx mempool n :fee 10000)
+    (is (not (bitcoin-lisp.mempool:mempool-has mempool stxid)))
+    (is (bitcoin-lisp.mempool:mempool-has mempool ptxid))
+    (is (bitcoin-lisp.mempool:mempool-has mempool ctxid))
+    (is (bitcoin-lisp.mempool:mempool-has mempool ntxid))))
