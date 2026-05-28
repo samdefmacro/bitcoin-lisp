@@ -28,6 +28,10 @@ DEFAULT_DESCENDANT_LIMIT).")
 (defconstant +default-descendant-size-limit+ 101000
   "Max total vsize of a tx + its descendants, in vbytes (Core 101 kvB).")
 
+(defconstant +default-mempool-expiry-hours+ 336
+  "Drop mempool txs older than this (14 days) — Bitcoin Core
+DEFAULT_MEMPOOL_EXPIRY_HOURS.")
+
 ;;;; Mempool entry
 
 (defstruct mempool-entry
@@ -517,6 +521,28 @@ fee-rate is below NEW-ENTRY-FEE-RATE. Returns T if enough space was freed."
               (mempool-remove-recursive mempool (car pair))
               (incf freed (- before (mempool-total-size mempool))))))
         (>= freed to-free)))))
+
+;;;; Expiry and periodic trim
+
+(defun mempool-expire (mempool &optional (now (bitcoin-lisp.serialization:get-unix-time)))
+  "Remove transactions (and their descendants) older than the expiry window.
+Returns the number of transactions removed."
+  (let ((cutoff (- now (* +default-mempool-expiry-hours+ 3600)))
+        (stale '())
+        (removed 0))
+    (maphash (lambda (txid entry)
+               (when (< (mempool-entry-entry-time entry) cutoff)
+                 (push txid stale)))
+             (mempool-entries mempool))
+    (dolist (txid stale removed)
+      ;; A stale tx may already be gone (removed as a descendant of another).
+      (when (mempool-has mempool txid)
+        (incf removed (mempool-remove-recursive mempool txid))))))
+
+(defun mempool-trim (mempool)
+  "Evict lowest-package-feerate transactions until the mempool is within its
+size cap. Returns T (no-op when already under the cap)."
+  (mempool-evict-for-size mempool 0 most-positive-fixnum))
 
 ;;;; Block interaction
 

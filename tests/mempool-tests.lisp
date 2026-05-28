@@ -557,7 +557,8 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
 (defun %add-tx (mempool tx &key (fee 10000))
   (bitcoin-lisp.mempool:mempool-add
    mempool (bitcoin-lisp.serialization:transaction-hash tx)
-   (bitcoin-lisp.mempool:make-entry-from-tx tx fee 0)))
+   (bitcoin-lisp.mempool:make-entry-from-tx
+    tx fee 0 :entry-time (bitcoin-lisp.serialization:get-unix-time))))
 
 (test mempool-ancestor-descendant-chain
   "An A->B->C chain reports correct ancestor/descendant sets and stats."
@@ -779,3 +780,23 @@ low-fee parent, so a cheaper standalone tx is evicted first."
     (is (= 2 (bitcoin-lisp.mempool:orphan-pool-count pool)))
     (is (= 1 (bitcoin-lisp.mempool:orphan-erase-for-peer pool peer-a)))
     (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))))
+
+;;;; PR7 mempool expiry
+
+(test mempool-expire-old-entries
+  "mempool-expire removes entries older than the expiry window (with descendants)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (a (make-mempool-test-tx :input-id 120))
+         (atxid (bitcoin-lisp.serialization:transaction-hash a))
+         (b (%mp-spending-tx atxid)))
+    (%add-tx mempool a)
+    (%add-tx mempool b)
+    (is (= 2 (bitcoin-lisp.mempool:mempool-count mempool)))
+    ;; Nothing expires "now".
+    (is (= 0 (bitcoin-lisp.mempool:mempool-expire mempool)))
+    ;; With a far-future 'now', the aged parent expires and drags its child.
+    (is (= 2 (bitcoin-lisp.mempool:mempool-expire
+              mempool (+ (bitcoin-lisp.serialization:get-unix-time)
+                         (* bitcoin-lisp.mempool::+default-mempool-expiry-hours+ 3600)
+                         1))))
+    (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))))
