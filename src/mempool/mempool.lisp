@@ -211,6 +211,21 @@ they are reachable from each other). Bounded by the ancestor/descendant limits."
         (%stats-over mempool (mempool-descendants mempool txid) entry)
         (values 0 0 0))))
 
+(defun mempool-ancestor-fee-rate (mempool txid)
+  "Ancestor-package fee rate (the mining score): ancestor-fees / ancestor-vsize.
+A low-fee tx with a high-fee unconfirmed parent chain scores higher here."
+  (multiple-value-bind (count vsize fees) (mempool-ancestor-stats mempool txid)
+    (declare (ignore count))
+    (if (zerop vsize) 0 (/ fees vsize))))
+
+(defun mempool-descendant-fee-rate (mempool txid)
+  "Descendant-package fee rate (the eviction score): descendant-fees /
+descendant-vsize. A low-fee parent with a high-fee child (CPFP) scores higher
+and is evicted later."
+  (multiple-value-bind (count vsize fees) (mempool-descendant-stats mempool txid)
+    (declare (ignore count))
+    (if (zerop vsize) 0 (/ fees vsize))))
+
 (defun check-ancestor-descendant-limits (mempool parent-txids new-vsize)
   "Check that adding a new tx of NEW-VSIZE with the given in-mempool PARENT-TXIDS
 keeps it within ancestor and descendant limits. Returns (values ok-p reason)."
@@ -469,33 +484,30 @@ all txids that would be evicted (the conflicts plus their descendants)."
 ;;;; Eviction
 
 (defun mempool-evict-for-size (mempool needed-bytes new-entry-fee-rate)
-  "Evict lowest fee-rate entries to free NEEDED-BYTES of space.
-Only evicts entries with fee-rate lower than NEW-ENTRY-FEE-RATE.
-Returns T if enough space was freed, NIL otherwise."
+  "Evict transactions to free NEEDED-BYTES of space, lowest descendant-package
+fee-rate first (so a high-fee child protects its low-fee parent — CPFP), and
+remove each evictee together with its descendants. Only evicts packages whose
+fee-rate is below NEW-ENTRY-FEE-RATE. Returns T if enough space was freed."
   (let ((to-free (- (+ (mempool-total-size mempool) needed-bytes)
                      (mempool-max-size mempool))))
     (when (<= to-free 0)
       (return-from mempool-evict-for-size t))
 
-    ;; Collect entries sorted by fee-rate (ascending)
-    (let ((sorted-entries '()))
+    ;; Rank every entry by its descendant-package fee-rate, ascending.
+    (let ((ranked '()))
       (maphash (lambda (txid entry)
-                 (when (< (mempool-entry-fee-rate entry) new-entry-fee-rate)
-                   (push (cons txid entry) sorted-entries)))
+                 (declare (ignore entry))
+                 (push (cons txid (mempool-descendant-fee-rate mempool txid)) ranked))
                (mempool-entries mempool))
-      (setf sorted-entries
-            (sort sorted-entries #'<
-                  :key (lambda (pair) (mempool-entry-fee-rate (cdr pair)))))
+      (setf ranked (sort ranked #'< :key #'cdr))
 
-      ;; Evict lowest fee-rate entries until enough space is freed. Remove
-      ;; each evictee together with its descendants (a child spends the
-      ;; parent's unconfirmed output, so it can't survive its parent) and
-      ;; count freed bytes from the total-size delta. PR5 will refine this to
-      ;; evict by descendant-package fee-rate.
       (let ((freed 0))
-        (dolist (pair sorted-entries)
+        (dolist (pair ranked)
           (when (>= freed to-free)
             (return-from mempool-evict-for-size t))
+          ;; Never evict a package that pays at least as much as the incoming tx.
+          (when (>= (cdr pair) new-entry-fee-rate)
+            (return-from mempool-evict-for-size (>= freed to-free)))
           ;; May already be gone if removed as a descendant of an earlier evictee.
           (when (mempool-has mempool (car pair))
             (let ((before (mempool-total-size mempool)))
