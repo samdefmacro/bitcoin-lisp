@@ -33,13 +33,8 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
      :lock-time 0)))
 
 (defun make-mempool-entry-for-tx (tx &key (fee 10000))
-  "Create a mempool entry for a test transaction."
-  (let ((serialized (bitcoin-lisp.serialization:serialize-transaction tx)))
-    (bitcoin-lisp.mempool:make-mempool-entry
-     :transaction tx
-     :fee fee
-     :size (length serialized)
-     :entry-time 1000000)))
+  "Create a mempool entry for a test transaction (computes size/vsize/wtxid)."
+  (bitcoin-lisp.mempool:make-entry-from-tx tx fee 0 :entry-time 1000000))
 
 ;;;; Mempool core tests
 
@@ -262,12 +257,12 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
 ;;;; Fee rate tests
 
 (test mempool-entry-fee-rate-calculation
-  "Fee rate is correctly computed as fee/size."
+  "Fee rate is correctly computed as fee/vsize."
   (let* ((tx (make-mempool-test-tx :input-id 40))
          (entry (bitcoin-lisp.mempool:make-mempool-entry
                  :transaction tx
                  :fee 1000
-                 :size 200
+                 :vsize 200
                  :entry-time 0)))
     (is (= 5 (bitcoin-lisp.mempool:mempool-entry-fee-rate entry)))))
 
@@ -438,3 +433,33 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
         (bitcoin-lisp.mempool:estimate-fee-rate estimator 6)
       (is (= rate 1))  ; Fallback minimum
       (is (not (null error))))))
+
+;;;; PR1 foundation: entry enrichment, wtxid index, vsize fee-rate
+
+(test mempool-entry-from-tx-fields
+  "make-entry-from-tx populates size, vsize, wtxid, height."
+  (let* ((tx (make-mempool-test-tx :input-id 70))
+         (entry (bitcoin-lisp.mempool:make-entry-from-tx tx 1234 555)))
+    (is (= 1234 (bitcoin-lisp.mempool:mempool-entry-fee entry)))
+    (is (= 555 (bitcoin-lisp.mempool:mempool-entry-height entry)))
+    (is (plusp (bitcoin-lisp.mempool:mempool-entry-size entry)))
+    ;; legacy tx: vsize equals serialized size
+    (is (= (bitcoin-lisp.serialization:transaction-vsize tx)
+           (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
+    (is (equalp (bitcoin-lisp.serialization:transaction-wtxid tx)
+                (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
+    ;; fee-rate uses vsize
+    (is (= (/ 1234 (bitcoin-lisp.mempool:mempool-entry-vsize entry))
+           (bitcoin-lisp.mempool:mempool-entry-fee-rate entry)))))
+
+(test mempool-wtxid-index
+  "Adding/removing a tx maintains the by-wtxid index."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 71))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
+         (entry (bitcoin-lisp.mempool:make-entry-from-tx tx 10000 0)))
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add mempool txid entry)))
+    (is (equalp txid (gethash wtxid (bitcoin-lisp.mempool:mempool-by-wtxid mempool))))
+    (bitcoin-lisp.mempool:mempool-remove mempool txid)
+    (is (null (gethash wtxid (bitcoin-lisp.mempool:mempool-by-wtxid mempool))))))

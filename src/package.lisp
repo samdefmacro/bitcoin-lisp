@@ -444,14 +444,20 @@
    ;; Mempool entry
    #:mempool-entry
    #:make-mempool-entry
+   #:make-entry-from-tx
    #:mempool-entry-transaction
    #:mempool-entry-fee
    #:mempool-entry-size
+   #:mempool-entry-vsize
+   #:mempool-entry-wtxid
+   #:mempool-entry-sigops
+   #:mempool-entry-height
    #:mempool-entry-entry-time
    #:mempool-entry-fee-rate
    ;; Mempool
    #:mempool
    #:make-mempool
+   #:mempool-by-wtxid
    #:mempool-has
    #:mempool-get
    #:mempool-add

@@ -998,7 +998,8 @@ phase exits quickly when there's nothing new to fetch."
      (node-block-store node)
      peer-height
      :fee-estimator (node-fee-estimator node)
-     :recent-rejects (node-recent-rejects node))))
+     :recent-rejects (node-recent-rejects node)
+     :mempool (node-mempool node))))
 
 
 (defun find-best-peer (node)

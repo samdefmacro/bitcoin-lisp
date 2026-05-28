@@ -23,11 +23,7 @@
             (tx (cdr pair)))
         (bitcoin-lisp.mempool:mempool-add
          mempool txid
-         (bitcoin-lisp.mempool:make-mempool-entry
-          :transaction tx
-          :fee 1000
-          :size 200
-          :entry-time 0))))
+         (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))))
     mempool))
 
 (defun make-simple-tx (id-byte)
