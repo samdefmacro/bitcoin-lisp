@@ -731,3 +731,51 @@ low-fee parent, so a cheaper standalone tx is evicted first."
     (is (bitcoin-lisp.mempool:mempool-has mempool ptxid))
     (is (bitcoin-lisp.mempool:mempool-has mempool ctxid))
     (is (bitcoin-lisp.mempool:mempool-has mempool ntxid))))
+
+;;;; PR6 orphan pool
+
+(defun %txid-array (n)
+  (make-array 32 :element-type '(unsigned-byte 8) :initial-element n))
+
+(test orphan-add-depend-remove
+  "Orphans are indexed by parent txid; remove clears the index."
+  (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
+         (parent (%txid-array 50))
+         (o (%mp-spending-tx parent))
+         (otxid (bitcoin-lisp.serialization:transaction-hash o)))
+    (is-true (bitcoin-lisp.mempool:orphan-add pool o nil))
+    (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))
+    (is (member otxid (bitcoin-lisp.mempool:orphans-depending-on pool parent) :test #'equalp))
+    (is (bitcoin-lisp.mempool:orphan-remove pool otxid))
+    (is (= 0 (bitcoin-lisp.mempool:orphan-pool-count pool)))
+    (is (null (bitcoin-lisp.mempool:orphans-depending-on pool parent)))))
+
+(test orphan-expiry
+  "orphan-expire drops entries older than the expiry window."
+  (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
+         (o (%mp-spending-tx (%txid-array 51))))
+    (bitcoin-lisp.mempool:orphan-add pool o nil)
+    (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))
+    (is (= 1 (bitcoin-lisp.mempool:orphan-expire
+              pool (+ (bitcoin-lisp.serialization:get-unix-time)
+                      bitcoin-lisp.mempool::+orphan-expire-seconds+ 1))))
+    (is (= 0 (bitcoin-lisp.mempool:orphan-pool-count pool)))))
+
+(test orphan-cap
+  "The orphan pool is bounded by +max-orphan-transactions+."
+  (let ((pool (bitcoin-lisp.mempool:make-orphan-pool)))
+    (dotimes (i 110)
+      (bitcoin-lisp.mempool:orphan-add pool (%mp-spending-tx (%txid-array i)) nil))
+    (is (<= (bitcoin-lisp.mempool:orphan-pool-count pool)
+            bitcoin-lisp.mempool::+max-orphan-transactions+))))
+
+(test orphan-erase-for-peer
+  "orphan-erase-for-peer drops only the given peer's orphans."
+  (let ((pool (bitcoin-lisp.mempool:make-orphan-pool))
+        (peer-a (list :a))
+        (peer-b (list :b)))
+    (bitcoin-lisp.mempool:orphan-add pool (%mp-spending-tx (%txid-array 60)) peer-a)
+    (bitcoin-lisp.mempool:orphan-add pool (%mp-spending-tx (%txid-array 61)) peer-b)
+    (is (= 2 (bitcoin-lisp.mempool:orphan-pool-count pool)))
+    (is (= 1 (bitcoin-lisp.mempool:orphan-erase-for-peer pool peer-a)))
+    (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))))
