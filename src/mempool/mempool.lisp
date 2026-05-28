@@ -20,15 +20,42 @@
   "An entry in the mempool."
   (transaction nil :type bitcoin-lisp.serialization:transaction)
   (fee 0 :type (unsigned-byte 64))
+  ;; Serialized (witness) byte length — used for the byte-based mempool size cap.
   (size 0 :type (unsigned-byte 32))
+  ;; BIP141 virtual size — the basis for fee-rate (Core computes fee-rate on vsize).
+  (vsize 0 :type (unsigned-byte 32))
+  ;; Witness txid (BIP339); 32 bytes once populated.
+  (wtxid nil :type (or null (simple-array (unsigned-byte 8) (32))))
+  ;; Weighted sigop cost (populated at acceptance once inputs are known).
+  (sigops 0 :type (unsigned-byte 32))
+  ;; Chain height at the time of acceptance.
+  (height 0 :type (unsigned-byte 32))
   (entry-time 0 :type (unsigned-byte 64)))
 
+(defun make-entry-from-tx (tx fee height &key (sigops 0) (entry-time 0))
+  "Build a mempool-entry from TX, computing the derived size/vsize/wtxid fields.
+Centralizes entry construction so every acceptance path records the same
+fields (handle-tx, sendrawtransaction, reorg re-add)."
+  (make-mempool-entry
+   :transaction tx
+   :fee fee
+   ;; Wire-serialized byte length (witness form only when the tx has witness
+   ;; data, so legacy txs aren't charged phantom marker/flag bytes).
+   :size (length (if (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+                     (bitcoin-lisp.serialization:serialize-witness-transaction tx)
+                     (bitcoin-lisp.serialization:serialize-transaction tx)))
+   :vsize (bitcoin-lisp.serialization:transaction-vsize tx)
+   :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)
+   :sigops sigops
+   :height height
+   :entry-time entry-time))
+
 (defun mempool-entry-fee-rate (entry)
-  "Compute the fee rate (satoshis per byte) for a mempool entry."
-  (let ((size (mempool-entry-size entry)))
-    (if (zerop size)
+  "Compute the fee rate (satoshis per virtual byte) for a mempool entry."
+  (let ((vsize (mempool-entry-vsize entry)))
+    (if (zerop vsize)
         0
-        (/ (mempool-entry-fee entry) size))))
+        (/ (mempool-entry-fee entry) vsize))))
 
 ;;;; Mempool
 
@@ -36,6 +63,8 @@
   "In-memory transaction pool."
   ;; txid (byte vector) -> mempool-entry
   (entries (make-hash-table :test 'equalp) :type hash-table)
+  ;; wtxid (byte vector) -> txid  (BIP339 witness-txid lookup for getdata)
+  (by-wtxid (make-hash-table :test 'equalp) :type hash-table)
   ;; outpoint-key (byte vector) -> txid that spends it
   (spent-outpoints (make-hash-table :test 'equalp) :type hash-table)
   ;; Total serialized size of all transactions
@@ -109,6 +138,11 @@ Returns :ok on success, or a keyword indicating the rejection reason."
   ;; Add to entries table
   (setf (gethash txid (mempool-entries mempool)) entry)
 
+  ;; Index by wtxid (BIP339)
+  (let ((wtxid (mempool-entry-wtxid entry)))
+    (when wtxid
+      (setf (gethash wtxid (mempool-by-wtxid mempool)) txid)))
+
   ;; Index spent outpoints
   (dolist (input (bitcoin-lisp.serialization:transaction-inputs
                   (mempool-entry-transaction entry)))
@@ -136,6 +170,10 @@ Returns the removed entry, or NIL if not found."
                      (bitcoin-lisp.serialization:outpoint-hash prevout)
                      (bitcoin-lisp.serialization:outpoint-index prevout))))
           (remhash key (mempool-spent-outpoints mempool))))
+      ;; Remove wtxid index
+      (let ((wtxid (mempool-entry-wtxid entry)))
+        (when wtxid
+          (remhash wtxid (mempool-by-wtxid mempool))))
       ;; Remove from entries
       (remhash txid (mempool-entries mempool))
       ;; Update total size
