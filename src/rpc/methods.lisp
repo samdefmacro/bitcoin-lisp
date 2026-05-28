@@ -206,6 +206,68 @@
       ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
       ("confirmations" . 1))))
 
+(defun chaintip-status (entry on-active best-hash hash block-store)
+  "Bitcoin Core getchaintips status for a tip ENTRY."
+  (cond
+    ((and on-active (equalp hash best-hash)) "active")
+    (t (case (bitcoin-lisp.storage:block-index-entry-status entry)
+         (:valid "valid-fork")
+         (:invalid "invalid")
+         (t (if (bitcoin-lisp.storage:get-block block-store hash)
+                "valid-headers"
+                "headers-only"))))))
+
+(defun rpc-getchaintips (node params)
+  "Return information about all known chain tips (active and side branches)."
+  (declare (ignore params))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (block-store (rpc-get-block-store node))
+         (index (bitcoin-lisp.storage::chain-state-block-index chain-state))
+         (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (has-child (make-hash-table :test 'equalp))
+         (active (make-hash-table :test 'equalp))
+         (tips '()))
+    ;; Any block referenced as a parent has a child, so it is not a tip.
+    (maphash (lambda (h entry)
+               (declare (ignore h))
+               (let ((prev (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+                 (when prev
+                   (setf (gethash (bitcoin-lisp.storage:block-index-entry-hash prev)
+                                  has-child)
+                         t))))
+             index)
+    ;; Active-chain hash set (tip back to genesis) for O(1) membership tests.
+    (loop for e = (and best-hash
+                       (bitcoin-lisp.storage:get-block-index-entry chain-state best-hash))
+            then (bitcoin-lisp.storage:block-index-entry-prev-entry e)
+          while e
+          do (setf (gethash (bitcoin-lisp.storage:block-index-entry-hash e) active) t))
+    (maphash
+     (lambda (h entry)
+       (unless (gethash h has-child)
+         (let ((on-active (gethash h active))
+               (branchlen 0))
+           ;; branchlen = blocks from this tip back to the active chain.
+           (unless on-active
+             (loop for e = entry
+                     then (bitcoin-lisp.storage:block-index-entry-prev-entry e)
+                   while (and e (not (gethash (bitcoin-lisp.storage:block-index-entry-hash e)
+                                              active)))
+                   do (incf branchlen)))
+           (push `(("height" . ,(bitcoin-lisp.storage:block-index-entry-height entry))
+                   ("hash" . ,(hash-to-hex h))
+                   ("branchlen" . ,branchlen)
+                   ("status" . ,(chaintip-status entry on-active best-hash h block-store)))
+                 tips))))
+     index)
+    ;; Active tip first, then by descending height. A numeric sort key keeps
+    ;; this a total order (the active tip gets the maximum key).
+    (stable-sort tips #'>
+                 :key (lambda (tip)
+                        (if (string= (cdr (assoc "status" tip :test #'string=)) "active")
+                            most-positive-fixnum
+                            (cdr (assoc "height" tip :test #'string=)))))))
+
 ;;; --- UTXO Query Methods ---
 
 (defun rpc-gettxout (node params)
