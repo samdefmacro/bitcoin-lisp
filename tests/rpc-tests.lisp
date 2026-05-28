@@ -652,3 +652,85 @@
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getrawtransaction node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
+
+;;; --- JSON Result Normalization (regression) ---
+
+(test rpc-result->json-shapes
+  "rpc-result->json converts object-alists to hash-tables, leaves arrays as lists."
+  ;; object-alist -> hash-table
+  (let ((obj (bitcoin-lisp.rpc::rpc-result->json (list (cons "a" 1) (cons "b" "x")))))
+    (is (hash-table-p obj))
+    (is (= (gethash "a" obj) 1))
+    (is (string= (gethash "b" obj) "x")))
+  ;; array of objects -> list of hash-tables
+  (let ((arr (bitcoin-lisp.rpc::rpc-result->json
+              (list (list (cons "k" 1)) (list (cons "k" 2))))))
+    (is (listp arr))
+    (is (= (length arr) 2))
+    (is (hash-table-p (first arr)))
+    (is (= (gethash "k" (first arr)) 1)))
+  ;; nested object value
+  (let ((obj (bitcoin-lisp.rpc::rpc-result->json
+              (list (cons "outer" (list (cons "inner" 7)))))))
+    (is (hash-table-p (gethash "outer" obj)))
+    (is (= (gethash "inner" (gethash "outer" obj)) 7)))
+  ;; array of strings is unchanged; atoms pass through
+  (is (equal (bitcoin-lisp.rpc::rpc-result->json (list "a" "b")) (list "a" "b")))
+  (is (= (bitcoin-lisp.rpc::rpc-result->json 42) 42)))
+
+(test rpc-object-results-encode-to-json
+  "Object-returning RPC results must serialize through yason without error.
+Regression: handlers build alists, but yason's default list encoder treated
+them as arrays and choked on the dotted pairs, so every object RPC errored."
+  (let ((node (make-test-node)))
+    (dolist (result (list (bitcoin-lisp.rpc::rpc-getblockchaininfo node nil)
+                          (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
+                          (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)
+                          (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)))
+      (let* ((response (bitcoin-lisp.rpc::make-rpc-response result "id"))
+             (json (with-output-to-string (s) (yason:encode response s)))
+             (parsed (yason:parse json)))
+        (is (hash-table-p parsed))
+        (is (string= (gethash "jsonrpc" parsed) "2.0"))
+        (is-true (nth-value 1 (gethash "result" parsed)))))))
+
+;;; --- getchaintips ---
+
+(defun make-32-byte-hash (n)
+  (make-array 32 :element-type '(unsigned-byte 8) :initial-element n))
+
+(test rpc-getchaintips
+  "getchaintips reports the active tip (branchlen 0) and side branches."
+  (let* ((node (make-test-node))
+         (chain-state (bitcoin-lisp::node-chain-state node))
+         (g-hash (make-32-byte-hash 0))
+         (a-hash (make-32-byte-hash 1))
+         (b-hash (make-32-byte-hash 2))
+         (genesis (bitcoin-lisp.storage:make-block-index-entry
+                   :hash g-hash :height 0 :status :valid))
+         (a (bitcoin-lisp.storage:make-block-index-entry
+             :hash a-hash :height 1 :prev-entry genesis :status :valid))
+         (b (bitcoin-lisp.storage:make-block-index-entry
+             :hash b-hash :height 1 :prev-entry genesis :status :valid)))
+    (bitcoin-lisp.storage:add-block-index-entry chain-state genesis)
+    (bitcoin-lisp.storage:add-block-index-entry chain-state a)
+    (bitcoin-lisp.storage:add-block-index-entry chain-state b)
+    (bitcoin-lisp.storage:update-chain-tip chain-state a-hash 1)
+    (let* ((tips (bitcoin-lisp.rpc::rpc-getchaintips node nil))
+           (active (find "active" tips
+                         :key (lambda (tip) (cdr (assoc "status" tip :test #'string=)))
+                         :test #'string=))
+           (fork (find "valid-fork" tips
+                       :key (lambda (tip) (cdr (assoc "status" tip :test #'string=)))
+                       :test #'string=)))
+      ;; genesis has a child, so only A and B are tips.
+      (is (= (length tips) 2))
+      ;; active tip is A at height 1, branchlen 0, listed first.
+      (is (string= (cdr (assoc "status" (first tips) :test #'string=)) "active"))
+      (is (= (cdr (assoc "branchlen" active :test #'string=)) 0))
+      (is (= (cdr (assoc "height" active :test #'string=)) 1))
+      ;; B is a side branch one block off the active chain.
+      (is (= (cdr (assoc "branchlen" fork :test #'string=)) 1))
+      ;; full result serializes cleanly.
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response tips "id")))
+        (finishes (with-output-to-string (s) (yason:encode response s)))))))
