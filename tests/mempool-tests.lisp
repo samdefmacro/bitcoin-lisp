@@ -463,3 +463,74 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
     (is (equalp txid (gethash wtxid (bitcoin-lisp.mempool:mempool-by-wtxid mempool))))
     (bitcoin-lisp.mempool:mempool-remove mempool txid)
     (is (null (gethash wtxid (bitcoin-lisp.mempool:mempool-by-wtxid mempool))))))
+
+;;;; PR2 standardness policy
+
+(test policy-dust-threshold-values
+  "dust-threshold matches Bitcoin Core: ~546 P2PKH, ~294 P2WPKH, 0 for OP_RETURN."
+  (let ((p2pkh (let ((s (make-array 25 :element-type '(unsigned-byte 8) :initial-element 0)))
+                 (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
+                       (aref s 23) #x88 (aref s 24) #xac) s))
+        (p2wpkh (let ((s (make-array 22 :element-type '(unsigned-byte 8) :initial-element 0)))
+                  (setf (aref s 0) #x00 (aref s 1) #x14) s))
+        (opret (let ((s (make-array 10 :element-type '(unsigned-byte 8) :initial-element 0)))
+                 (setf (aref s 0) #x6a) s)))
+    (is (= 546 (bitcoin-lisp.validation::dust-threshold p2pkh)))
+    (is (= 294 (bitcoin-lisp.validation::dust-threshold p2wpkh)))
+    (is (= 0 (bitcoin-lisp.validation::dust-threshold opret)))
+    (is-true (bitcoin-lisp.validation::output-witness-program-p p2wpkh))
+    (is-false (bitcoin-lisp.validation::output-witness-program-p p2pkh))))
+
+(test policy-scriptsig-push-only
+  "scriptsig-push-only-p accepts push opcodes and rejects ops > OP_16."
+  ;; push 2 bytes, then OP_1..OP_16
+  (is-true (bitcoin-lisp.validation::scriptsig-push-only-p
+            (make-array 3 :element-type '(unsigned-byte 8) :initial-contents '(2 #xaa #x51))))
+  ;; OP_CHECKSIG (0xac) is not a push
+  (is-false (bitcoin-lisp.validation::scriptsig-push-only-p
+             (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xac))))
+
+(test mempool-rejects-nonstandard-version
+  "A tx with version outside [1,3] is rejected as non-standard."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (base (make-mempool-test-tx :input-id 80))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 4
+              :inputs (bitcoin-lisp.serialization:transaction-inputs base)
+              :outputs (bitcoin-lisp.serialization:transaction-outputs base)
+              :lock-time 0)))
+    (multiple-value-bind (valid err)
+        (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
+      (is (null valid))
+      (is (eq err :version-non-standard)))))
+
+(test mempool-rejects-dust-output
+  "A tx with a dust-value output is rejected."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (tx (make-mempool-test-tx :input-id 81 :value 1)))  ; 1 sat < 546 dust
+    (multiple-value-bind (valid err)
+        (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
+      (is (null valid))
+      (is (eq err :dust)))))
+
+(test mempool-rejects-nonpushonly-scriptsig
+  "A tx whose scriptSig contains a non-push opcode is rejected."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (base (make-mempool-test-tx :input-id 82))
+         (bad-input (bitcoin-lisp.serialization:make-tx-in
+                     :previous-output (bitcoin-lisp.serialization:tx-in-previous-output
+                                       (first (bitcoin-lisp.serialization:transaction-inputs base)))
+                     :script-sig (make-array 1 :element-type '(unsigned-byte 8)
+                                             :initial-element #xac)  ; OP_CHECKSIG
+                     :sequence #xFFFFFFFF))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 1 :inputs (list bad-input)
+              :outputs (bitcoin-lisp.serialization:transaction-outputs base)
+              :lock-time 0)))
+    (multiple-value-bind (valid err)
+        (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
+      (is (null valid))
+      (is (eq err :scriptsig-not-pushonly)))))
