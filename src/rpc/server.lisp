@@ -52,6 +52,7 @@
   (register-rpc-method "getblockhash" #'rpc-getblockhash)
   (register-rpc-method "getblock" #'rpc-getblock)
   (register-rpc-method "getblockheader" #'rpc-getblockheader)
+  (register-rpc-method "getchaintips" #'rpc-getchaintips)
   ;; UTXO
   (register-rpc-method "gettxout" #'rpc-gettxout)
   ;; Network
@@ -108,11 +109,40 @@
       (error 'rpc-error :code +rpc-parse-error+
                         :message "Parse error"))))
 
+(defun rpc-proper-list-p (x)
+  "True if X is a proper (nil-terminated) list."
+  (loop for tail = x then (cdr tail)
+        while (consp tail)
+        finally (return (null tail))))
+
+(defun rpc-object-alist-p (x)
+  "True if X is a non-empty proper list whose every element is a (string-key . value)
+cons — i.e. an alist that should serialize as a JSON object. A list whose elements
+are themselves lists/alists (e.g. an array of objects) is NOT an object-alist."
+  (and (consp x)
+       (rpc-proper-list-p x)
+       (every (lambda (e) (and (consp e) (stringp (car e)))) x)))
+
+(defun rpc-result->json (x)
+  "Normalize an RPC handler result for yason: object-alists become hash-tables
+(JSON objects), other proper lists become arrays (recursing into elements), and
+atoms pass through unchanged. RPC methods build results as alists, but yason's
+default list encoder treats every list as an array and chokes on the dotted
+pairs — so without this every object-returning RPC errors out."
+  (cond
+    ((rpc-object-alist-p x)
+     (let ((ht (make-hash-table :test 'equal)))
+       (dolist (pair x ht)
+         (setf (gethash (car pair) ht) (rpc-result->json (cdr pair))))))
+    ((and (consp x) (rpc-proper-list-p x))
+     (mapcar #'rpc-result->json x))
+    (t x)))
+
 (defun make-rpc-response (result id)
   "Create a successful JSON-RPC response."
   (let ((response (make-hash-table :test 'equal)))
     (setf (gethash "jsonrpc" response) "2.0")
-    (setf (gethash "result" response) result)
+    (setf (gethash "result" response) (rpc-result->json result))
     (setf (gethash "id" response) id)
     response))
 
@@ -123,7 +153,7 @@
     (setf (gethash "code" error-obj) code)
     (setf (gethash "message" error-obj) message)
     (when data
-      (setf (gethash "data" error-obj) data))
+      (setf (gethash "data" error-obj) (rpc-result->json data)))
     (setf (gethash "jsonrpc" response) "2.0")
     (setf (gethash "error" response) error-obj)
     (setf (gethash "id" response) id)
