@@ -534,3 +534,103 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
         (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
       (is (null valid))
       (is (eq err :scriptsig-not-pushonly)))))
+
+;;;; PR3 ancestor/descendant tracking + chained spends
+
+(defun %mp-spending-tx (parent-txid &key (vout 0) (value 40000000))
+  "A tx spending PARENT-TXID's output VOUT, paying a standard P2PKH output."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                  :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                    :hash parent-txid :index vout)
+                  :script-sig (make-array 10 :element-type '(unsigned-byte 8) :initial-element 0)
+                  :sequence #xFFFFFFFF))
+   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                   :value value
+                   :script-pubkey (let ((s (make-array 25 :element-type '(unsigned-byte 8)
+                                                       :initial-element 0)))
+                                    (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
+                                          (aref s 23) #x88 (aref s 24) #xac) s)))
+   :lock-time 0))
+
+(defun %add-tx (mempool tx &key (fee 10000))
+  (bitcoin-lisp.mempool:mempool-add
+   mempool (bitcoin-lisp.serialization:transaction-hash tx)
+   (bitcoin-lisp.mempool:make-entry-from-tx tx fee 0)))
+
+(test mempool-ancestor-descendant-chain
+  "An A->B->C chain reports correct ancestor/descendant sets and stats."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (a (make-mempool-test-tx :input-id 90))
+         (atxid (bitcoin-lisp.serialization:transaction-hash a))
+         (b (%mp-spending-tx atxid))
+         (btxid (bitcoin-lisp.serialization:transaction-hash b))
+         (c (%mp-spending-tx btxid))
+         (ctxid (bitcoin-lisp.serialization:transaction-hash c)))
+    (is (eq :ok (%add-tx mempool a)))
+    (is (eq :ok (%add-tx mempool b)))
+    (is (eq :ok (%add-tx mempool c)))
+    (is (= 2 (hash-table-count (bitcoin-lisp.mempool:mempool-ancestors mempool ctxid))))
+    (is (= 3 (nth-value 0 (bitcoin-lisp.mempool:mempool-ancestor-stats mempool ctxid))))
+    (is (= 2 (hash-table-count (bitcoin-lisp.mempool:mempool-descendants mempool atxid))))
+    (is (= 3 (nth-value 0 (bitcoin-lisp.mempool:mempool-descendant-stats mempool atxid))))))
+
+(test mempool-ancestor-descendant-limit
+  "A chain longer than the 25-tx package limit is rejected."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (root (make-mempool-test-tx :input-id 91))
+         (prev-txid (bitcoin-lisp.serialization:transaction-hash root))
+         (last-result (%add-tx mempool root)))
+    (loop for i from 1 to 30
+          while (eq last-result :ok)
+          do (let ((child (%mp-spending-tx prev-txid)))
+               (setf last-result (%add-tx mempool child))
+               (when (eq last-result :ok)
+                 (setf prev-txid (bitcoin-lisp.serialization:transaction-hash child)))))
+    (is (eq last-result :too-long-mempool-chain))))
+
+(test mempool-remove-recursive-test
+  "Removing a tx removes all of its descendants."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (a (make-mempool-test-tx :input-id 92))
+         (atxid (bitcoin-lisp.serialization:transaction-hash a))
+         (b (%mp-spending-tx atxid))
+         (btxid (bitcoin-lisp.serialization:transaction-hash b))
+         (c (%mp-spending-tx btxid)))
+    (%add-tx mempool a) (%add-tx mempool b) (%add-tx mempool c)
+    (is (= 3 (bitcoin-lisp.mempool:mempool-count mempool)))
+    (is (= 3 (bitcoin-lisp.mempool:mempool-remove-recursive mempool atxid)))
+    (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))))
+
+(test mempool-chained-spend-coins
+  "mempool-extra-coins resolves an input spending an unconfirmed parent output."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (a (make-mempool-test-tx :input-id 93))
+         (atxid (bitcoin-lisp.serialization:transaction-hash a))
+         (b (%mp-spending-tx atxid)))
+    (%add-tx mempool a)
+    (multiple-value-bind (coins ok)
+        (bitcoin-lisp.validation::mempool-extra-coins b utxo mempool)
+      (is-true ok)
+      (is (not (null (gethash (cons atxid 0) coins)))))))
+
+(test mempool-eviction-removes-descendants
+  "Evicting a low-fee parent also removes its in-mempool child (no orphan)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 260))
+         (a (make-mempool-test-tx :input-id 95))
+         (atxid (bitcoin-lisp.serialization:transaction-hash a))
+         (b (%mp-spending-tx atxid))
+         (btxid (bitcoin-lisp.serialization:transaction-hash b))
+         (c (make-mempool-test-tx :input-id 96))
+         (ctxid (bitcoin-lisp.serialization:transaction-hash c)))
+    ;; A has the lowest fee-rate so eviction targets it first; child B has a
+    ;; higher fee-rate but must still be removed together with its parent.
+    (is (eq :ok (%add-tx mempool a :fee 100)))
+    (is (eq :ok (%add-tx mempool b :fee 5000)))
+    ;; High-fee C forces eviction; A is evicted and takes child B recursively.
+    (%add-tx mempool c :fee 100000)
+    (is (not (bitcoin-lisp.mempool:mempool-has mempool atxid)))
+    (is (not (bitcoin-lisp.mempool:mempool-has mempool btxid)))
+    (is (bitcoin-lisp.mempool:mempool-has mempool ctxid))))

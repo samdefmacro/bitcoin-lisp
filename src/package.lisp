@@ -454,10 +454,19 @@
    #:mempool-entry-height
    #:mempool-entry-entry-time
    #:mempool-entry-fee-rate
+   ;; Mempool entry links
+   #:mempool-entry-parents
+   #:mempool-entry-children
    ;; Mempool
    #:mempool
    #:make-mempool
    #:mempool-by-wtxid
+   #:mempool-find-parents
+   #:mempool-ancestors
+   #:mempool-descendants
+   #:mempool-ancestor-stats
+   #:mempool-descendant-stats
+   #:mempool-remove-recursive
    #:mempool-has
    #:mempool-get
    #:mempool-add

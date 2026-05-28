@@ -14,6 +14,20 @@
 (defconstant +default-min-relay-fee-rate+ 1
   "Default minimum relay fee rate in satoshis per virtual byte.")
 
+(defconstant +default-ancestor-limit+ 25
+  "Max number of in-mempool ancestors (incl. self) for a tx (Bitcoin Core
+DEFAULT_ANCESTOR_LIMIT).")
+
+(defconstant +default-descendant-limit+ 25
+  "Max number of in-mempool descendants (incl. self) for a tx (Bitcoin Core
+DEFAULT_DESCENDANT_LIMIT).")
+
+(defconstant +default-ancestor-size-limit+ 101000
+  "Max total vsize of a tx + its ancestors, in vbytes (Core 101 kvB).")
+
+(defconstant +default-descendant-size-limit+ 101000
+  "Max total vsize of a tx + its descendants, in vbytes (Core 101 kvB).")
+
 ;;;; Mempool entry
 
 (defstruct mempool-entry
@@ -30,7 +44,12 @@
   (sigops 0 :type (unsigned-byte 32))
   ;; Chain height at the time of acceptance.
   (height 0 :type (unsigned-byte 32))
-  (entry-time 0 :type (unsigned-byte 64)))
+  (entry-time 0 :type (unsigned-byte 64))
+  ;; In-mempool dependency links (txid -> t). Ancestor/descendant aggregates
+  ;; are derived on demand by walking these (bounded by the 25/25 limits), so
+  ;; there are no cached totals to drift out of sync.
+  (parents (make-hash-table :test 'equalp) :type hash-table)
+  (children (make-hash-table :test 'equalp) :type hash-table))
 
 (defun make-entry-from-tx (tx fee height &key (sigops 0) (entry-time 0))
   "Build a mempool-entry from TX, computing the derived size/vsize/wtxid fields.
@@ -113,6 +132,130 @@ Returns the txid of the conflicting transaction, or NIL if no conflict."
         (return-from mempool-check-conflict spending-txid))))
   nil)
 
+;;;; Ancestor / descendant graph (derived on demand from parent/child links)
+
+(defun mempool-find-parents (mempool tx)
+  "Return the distinct txids of TX's inputs that are themselves in the mempool."
+  (let ((seen (make-hash-table :test 'equalp))
+        (result '()))
+    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+      (let ((ptxid (bitcoin-lisp.serialization:outpoint-hash
+                    (bitcoin-lisp.serialization:tx-in-previous-output input))))
+        (when (and (mempool-has mempool ptxid) (not (gethash ptxid seen)))
+          (setf (gethash ptxid seen) t)
+          (push ptxid result))))
+    result))
+
+(defun %walk-mempool-graph (mempool seed-txids link-accessor)
+  "BFS from SEED-TXIDS following LINK-ACCESSOR (parents or children of an entry).
+Returns a hash-set (txid -> t) of all reached txids (excluding the seeds unless
+they are reachable from each other). Bounded by the ancestor/descendant limits."
+  (let ((found (make-hash-table :test 'equalp))
+        (queue (copy-list seed-txids)))
+    (loop while queue
+          do (let ((txid (pop queue)))
+               (unless (gethash txid found)
+                 (let ((entry (mempool-get mempool txid)))
+                   (when entry
+                     (setf (gethash txid found) t)
+                     (maphash (lambda (k v) (declare (ignore v)) (push k queue))
+                              (funcall link-accessor entry)))))))
+    found))
+
+(defun mempool-ancestors (mempool txid)
+  "Hash-set of all in-mempool ancestor txids of TXID (excluding TXID itself)."
+  (let ((entry (mempool-get mempool txid)))
+    (if entry
+        (%walk-mempool-graph mempool
+                             (loop for k being the hash-keys of (mempool-entry-parents entry)
+                                   collect k)
+                             #'mempool-entry-parents)
+        (make-hash-table :test 'equalp))))
+
+(defun mempool-descendants (mempool txid)
+  "Hash-set of all in-mempool descendant txids of TXID (excluding TXID itself)."
+  (let ((entry (mempool-get mempool txid)))
+    (if entry
+        (%walk-mempool-graph mempool
+                             (loop for k being the hash-keys of (mempool-entry-children entry)
+                                   collect k)
+                             #'mempool-entry-children)
+        (make-hash-table :test 'equalp))))
+
+(defun %stats-over (mempool txid-set seed-entry)
+  "Return (values count vsize fees) over SEED-ENTRY plus every entry in TXID-SET."
+  (let ((count 1)
+        (vsize (mempool-entry-vsize seed-entry))
+        (fees (mempool-entry-fee seed-entry)))
+    (maphash (lambda (txid v)
+               (declare (ignore v))
+               (let ((e (mempool-get mempool txid)))
+                 (when e
+                   (incf count)
+                   (incf vsize (mempool-entry-vsize e))
+                   (incf fees (mempool-entry-fee e)))))
+             txid-set)
+    (values count vsize fees)))
+
+(defun mempool-ancestor-stats (mempool txid)
+  "(values count vsize fees) over TXID and all its ancestors (incl. self)."
+  (let ((entry (mempool-get mempool txid)))
+    (if entry
+        (%stats-over mempool (mempool-ancestors mempool txid) entry)
+        (values 0 0 0))))
+
+(defun mempool-descendant-stats (mempool txid)
+  "(values count vsize fees) over TXID and all its descendants (incl. self)."
+  (let ((entry (mempool-get mempool txid)))
+    (if entry
+        (%stats-over mempool (mempool-descendants mempool txid) entry)
+        (values 0 0 0))))
+
+(defun check-ancestor-descendant-limits (mempool parent-txids new-vsize)
+  "Check that adding a new tx of NEW-VSIZE with the given in-mempool PARENT-TXIDS
+keeps it within ancestor and descendant limits. Returns (values ok-p reason)."
+  ;; Ancestors of the new tx = its parents plus all of their ancestors.
+  (let* ((ancestors (%walk-mempool-graph mempool (copy-list parent-txids)
+                                         #'mempool-entry-parents))
+         (acount 1) (avsize new-vsize))     ; include the new tx itself
+    (maphash (lambda (a v) (declare (ignore v))
+               (let ((e (mempool-get mempool a)))
+                 (when e (incf acount) (incf avsize (mempool-entry-vsize e)))))
+             ancestors)
+    (cond
+      ((> acount +default-ancestor-limit+) (values nil :too-long-mempool-chain))
+      ((> avsize +default-ancestor-size-limit+) (values nil :too-long-mempool-chain))
+      (t
+       ;; Adding the new tx adds one descendant (+new-vsize) to each ancestor.
+       (let ((result-ok t) (result-reason nil))
+         (block scan
+           (maphash (lambda (a v) (declare (ignore v))
+                      (multiple-value-bind (dcount dvsize) (mempool-descendant-stats mempool a)
+                        (when (or (> (1+ dcount) +default-descendant-limit+)
+                                  (> (+ dvsize new-vsize) +default-descendant-size-limit+))
+                          (setf result-ok nil result-reason :too-long-mempool-chain)
+                          (return-from scan))))
+                    ancestors))
+         (values result-ok result-reason))))))
+
+(defun %link-entry-parents (mempool txid entry parent-txids)
+  "Wire up the parent/child links between ENTRY (TXID) and its in-mempool parents."
+  (dolist (p parent-txids)
+    (setf (gethash p (mempool-entry-parents entry)) t)
+    (let ((pe (mempool-get mempool p)))
+      (when pe (setf (gethash txid (mempool-entry-children pe)) t)))))
+
+(defun %unlink-entry (mempool txid entry)
+  "Drop ENTRY (TXID) from its parents' children sets and its children's parents."
+  (maphash (lambda (p v) (declare (ignore v))
+             (let ((pe (mempool-get mempool p)))
+               (when pe (remhash txid (mempool-entry-children pe)))))
+           (mempool-entry-parents entry))
+  (maphash (lambda (c v) (declare (ignore v))
+             (let ((ce (mempool-get mempool c)))
+               (when ce (remhash txid (mempool-entry-parents ce)))))
+           (mempool-entry-children entry)))
+
 (defun mempool-add (mempool txid entry)
   "Add a transaction to the mempool.
 Returns :ok on success, or a keyword indicating the rejection reason."
@@ -126,6 +269,15 @@ Returns :ok on success, or a keyword indicating the rejection reason."
     (when conflict
       (return-from mempool-add :conflict)))
 
+  ;; Ancestor/descendant package limits.
+  (let ((parent-txids (mempool-find-parents
+                       mempool (mempool-entry-transaction entry))))
+    (multiple-value-bind (ok reason)
+        (check-ancestor-descendant-limits mempool parent-txids
+                                          (mempool-entry-vsize entry))
+      (unless ok
+        (return-from mempool-add reason)))
+
   ;; Evict if needed to make room
   (let ((tx-size (mempool-entry-size entry)))
     (when (> (+ (mempool-total-size mempool) tx-size)
@@ -137,6 +289,9 @@ Returns :ok on success, or a keyword indicating the rejection reason."
 
   ;; Add to entries table
   (setf (gethash txid (mempool-entries mempool)) entry)
+
+  ;; Wire up ancestor/descendant links to in-mempool parents.
+  (%link-entry-parents mempool txid entry parent-txids)
 
   ;; Index by wtxid (BIP339)
   (let ((wtxid (mempool-entry-wtxid entry)))
@@ -155,7 +310,7 @@ Returns :ok on success, or a keyword indicating the rejection reason."
   ;; Update total size
   (incf (mempool-total-size mempool) (mempool-entry-size entry))
 
-  :ok)
+  :ok))
 
 (defun mempool-remove (mempool txid)
   "Remove a transaction from the mempool by txid.
@@ -174,11 +329,25 @@ Returns the removed entry, or NIL if not found."
       (let ((wtxid (mempool-entry-wtxid entry)))
         (when wtxid
           (remhash wtxid (mempool-by-wtxid mempool))))
+      ;; Drop ancestor/descendant links to/from this entry
+      (%unlink-entry mempool txid entry)
       ;; Remove from entries
       (remhash txid (mempool-entries mempool))
       ;; Update total size
       (decf (mempool-total-size mempool) (mempool-entry-size entry))
       entry)))
+
+(defun mempool-remove-recursive (mempool txid)
+  "Remove TXID and all of its in-mempool descendants. Returns the number of
+transactions removed. Used by RBF replacement, eviction, and expiry so a
+removed tx never leaves dangling children behind."
+  (let ((targets (mempool-descendants mempool txid))
+        (removed 0))
+    (setf (gethash txid targets) t)        ; include self
+    (maphash (lambda (t2 v) (declare (ignore v))
+               (when (mempool-remove mempool t2) (incf removed)))
+             targets)
+    removed))
 
 ;;;; Eviction
 
@@ -201,14 +370,20 @@ Returns T if enough space was freed, NIL otherwise."
             (sort sorted-entries #'<
                   :key (lambda (pair) (mempool-entry-fee-rate (cdr pair)))))
 
-      ;; Evict lowest fee-rate entries until enough space is freed
+      ;; Evict lowest fee-rate entries until enough space is freed. Remove
+      ;; each evictee together with its descendants (a child spends the
+      ;; parent's unconfirmed output, so it can't survive its parent) and
+      ;; count freed bytes from the total-size delta. PR5 will refine this to
+      ;; evict by descendant-package fee-rate.
       (let ((freed 0))
         (dolist (pair sorted-entries)
           (when (>= freed to-free)
             (return-from mempool-evict-for-size t))
-          (let ((evicted (mempool-remove mempool (car pair))))
-            (when evicted
-              (incf freed (mempool-entry-size evicted)))))
+          ;; May already be gone if removed as a descendant of an earlier evictee.
+          (when (mempool-has mempool (car pair))
+            (let ((before (mempool-total-size mempool)))
+              (mempool-remove-recursive mempool (car pair))
+              (incf freed (- before (mempool-total-size mempool))))))
         (>= freed to-free)))))
 
 ;;;; Block interaction
