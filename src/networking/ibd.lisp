@@ -123,7 +123,11 @@ block-hash-key-hash. Falls back to plain equalp off SBCL."
   ;; recent first. Trimmed in report-ibd-progress to +recent-rate-window-seconds+.
   ;; Lets us see whether slow IBD is peer-side (some peers deliver in 30s+)
   ;; or pipeline-side (peers fast but we don't request enough).
-  (delivery-samples nil :type list))
+  (delivery-samples nil :type list)
+  ;; Node mempool, so the block-activation path can remove confirmed txs and
+  ;; re-add reorg-disconnected ones. Threaded in once at run-ibd entry rather
+  ;; than through every networking function.
+  (mempool nil))
 
 (defparameter +recent-rate-window-seconds+ 60
   "Window for the recent-rate metric in IBD Progress logs. 60s gives a
@@ -1222,7 +1226,7 @@ disconnects it so replace-disconnected-peers can refill the slot."
   (handle-peer-fin peer))
 
 (defun start-ibd (peers chain-state utxo-set block-store target-height
-                   &key fee-estimator recent-rejects)
+                   &key fee-estimator recent-rejects mempool)
   "Start Initial Block Download.
 Returns the number of blocks downloaded."
   (setf *ibd-context* (make-ibd))
@@ -1234,13 +1238,19 @@ Returns the number of blocks downloaded."
   (unwind-protect
        (run-ibd peers chain-state utxo-set block-store
                 :fee-estimator fee-estimator
-                :recent-rejects recent-rejects)
+                :recent-rejects recent-rejects
+                :mempool mempool)
     (setf *ibd-context* nil)))
 
-(defun run-ibd (peers chain-state utxo-set block-store &key fee-estimator recent-rejects)
+(defun run-ibd (peers chain-state utxo-set block-store
+                &key fee-estimator recent-rejects mempool)
   "Main IBD loop."
   (let ((ctx *ibd-context*)
         (start-height (bitcoin-lisp.storage:current-height chain-state)))
+    ;; Make the mempool reachable from the block-activation path (which reads
+    ;; it off *ibd-context*) so confirmed txs are removed during IBD/tip advance.
+    (when ctx
+      (setf (ibd-context-mempool ctx) mempool))
 
     ;; Initialize header-tip-height from existing chain state
     ;; This ensures we know about existing headers even if header sync fails
@@ -1518,7 +1528,8 @@ Used during IBD when the validated block tip lags behind the header tip."
 After connecting, drains the queue of any children that can now be connected."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (hash (bitcoin-lisp.serialization:block-header-hash header))
-         (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+         (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash))
+         (mempool (and *ibd-context* (ibd-context-mempool *ibd-context*))))
 
     (unless entry
       (bitcoin-lisp:log-warn "Received unknown block ~A"
@@ -1560,7 +1571,8 @@ After connecting, drains the queue of any children that can now be connected."
              block chain-state block-store utxo-set
              :skip-scripts (<= height (last-checkpoint-height))
              :fee-estimator fee-estimator
-             :recent-rejects recent-rejects)
+             :recent-rejects recent-rejects
+             :mempool mempool)
           (declare (ignore activated))
           ;; :weaker-chain is the expected outcome here; any other
           ;; error is worth logging at debug level for now.
@@ -1590,7 +1602,8 @@ After connecting, drains the queue of any children that can now be connected."
                  :current-time current-time
                  :skip-scripts skip-scripts
                  :fee-estimator fee-estimator
-                 :recent-rejects recent-rejects)
+                 :recent-rejects recent-rejects
+                 :mempool mempool)
               (cond
                 (activated
                  (note-tip-advanced chain-state)
@@ -1659,7 +1672,8 @@ Repeats until no more queued blocks can be connected."
   (unless *ibd-context*
     (return-from drain-block-queue 0))
   (let ((drained 0)
-        (checkpoint-height (last-checkpoint-height)))
+        (checkpoint-height (last-checkpoint-height))
+        (mempool (ibd-context-mempool *ibd-context*)))
     (loop
       (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
              (next-height (1+ current-height))
@@ -1679,7 +1693,8 @@ Repeats until no more queued blocks can be connected."
                :current-time current-time
                :skip-scripts skip-scripts
                :fee-estimator fee-estimator
-               :recent-rejects recent-rejects)
+               :recent-rejects recent-rejects
+               :mempool mempool)
             (cond
               (activated
                (note-tip-advanced chain-state)
