@@ -393,6 +393,43 @@ Other network types are silently skipped."
 
 ;;; Transaction handling
 
+(defun process-orphans (accepted-txid utxo-set mempool chain-state peers
+                        &key recent-rejects)
+  "De-orphan cascade: after ACCEPTED-TXID enters the mempool, re-validate the
+orphans that depend on it; accept+relay any now valid, drop those now invalid,
+and recurse on newly-accepted txs so a parent can unblock a whole chain."
+  (let ((pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool))
+        (work (list accepted-txid)))
+    (loop while work do
+      (let ((ptxid (pop work)))
+        (dolist (otxid (bitcoin-lisp.mempool:orphans-depending-on pool ptxid))
+          (let ((otx (bitcoin-lisp.mempool:orphan-tx pool otxid)))
+            (when otx
+              (let ((current-height (bitcoin-lisp.storage:current-height chain-state)))
+                (multiple-value-bind (valid error fee replaced)
+                    (bitcoin-lisp.validation:validate-transaction-for-mempool
+                     otx utxo-set mempool current-height)
+                  (cond
+                    (valid
+                     (dolist (rt replaced)
+                       (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
+                     (let* ((entry (bitcoin-lisp.mempool:make-entry-from-tx
+                                    otx fee current-height
+                                    :entry-time (bitcoin-lisp.serialization:get-unix-time)))
+                            (vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
+                       (when (eq :ok (bitcoin-lisp.mempool:mempool-add mempool otxid entry))
+                         (bitcoin-lisp.mempool:orphan-remove pool otxid)
+                         (when peers
+                           (relay-transaction
+                            otxid nil peers
+                            :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                            :wtxid (bitcoin-lisp.serialization:transaction-wtxid otx)))
+                         (push otxid work))))   ; cascade to this tx's dependents
+                    ((eq error :missing-input) nil)   ; still missing another parent
+                    (t (bitcoin-lisp.mempool:orphan-remove pool otxid)  ; now invalid
+                       (when recent-rejects
+                         (bitcoin-lisp:add-recent-reject recent-rejects otxid)))))))))))))
+
 (defun handle-tx (peer payload utxo-set mempool chain-state peers
                   &key recent-rejects)
   "Handle a tx message. Validate, add to mempool, and relay.
@@ -413,14 +450,21 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                   (bitcoin-lisp.validation:validate-transaction-for-mempool
                    tx utxo-set mempool current-height)
                 (unless valid
-                  ;; Add to recent rejects filter
-                  (bitcoin-lisp:add-recent-reject recent-rejects txid)
-                  ;; Record misbehavior for invalid transactions
-                  ;; (policy violations like :insufficient-fee are not penalized)
-                  (when (member error '(:script-failed :no-inputs :no-outputs
-                                        :duplicate-inputs :negative-output
-                                        :output-too-large :total-output-too-large))
-                    (record-misbehavior peer 10)))
+                  (cond
+                    ;; Missing inputs => hold as an orphan (not a real reject);
+                    ;; a later parent will trigger re-evaluation.
+                    ((eq error :missing-input)
+                     (bitcoin-lisp.mempool:orphan-add
+                      (bitcoin-lisp.mempool:mempool-orphan-pool mempool) tx peer))
+                    (t
+                     ;; Add to recent rejects filter
+                     (bitcoin-lisp:add-recent-reject recent-rejects txid)
+                     ;; Record misbehavior for invalid transactions
+                     ;; (policy violations like :insufficient-fee are not penalized)
+                     (when (member error '(:script-failed :no-inputs :no-outputs
+                                           :duplicate-inputs :negative-output
+                                           :output-too-large :total-output-too-large))
+                       (record-misbehavior peer 10)))))
                 (when valid
                   ;; BIP125: evict the transactions this one replaces first.
                   (dolist (rt replaced)
@@ -438,7 +482,10 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                                            :fee-rate (if (plusp vsize)
                                                          (floor fee vsize)
                                                          0)
-                                           :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))))))))))
+                                           :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+                      ;; De-orphan: this tx may unblock waiting children.
+                      (process-orphans txid utxo-set mempool chain-state peers
+                                       :recent-rejects recent-rejects)))))))))
     (error (c)
       (declare (ignore c))
       nil)))
