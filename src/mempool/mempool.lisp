@@ -349,6 +349,123 @@ removed tx never leaves dangling children behind."
              targets)
     removed))
 
+;;;; Replace-by-fee (BIP125)
+
+(defparameter +max-bip125-rbf-sequence+ #xfffffffd
+  "An input signals opt-in RBF when its nSequence is <= this value.")
+
+(defparameter +max-rbf-replacement-candidates+ 100
+  "BIP125 rule 5: a replacement may evict at most this many transactions.")
+
+(defparameter +incremental-relay-fee-rate+ 100
+  "Incremental relay fee in satoshis per kvB for BIP125 rule 4 (Bitcoin Core
+DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB = 0.1 sat/vB).")
+
+(defvar *mempool-full-rbf* nil
+  "When true, treat every mempool tx as replaceable regardless of signaling
+(Bitcoin Core -mempoolfullrbf). When nil, enforce BIP125 opt-in signaling.")
+
+(defun tx-signals-rbf-p (tx)
+  "True if TX opts in to replacement (any input nSequence <= 0xfffffffd)."
+  (some (lambda (in)
+          (<= (bitcoin-lisp.serialization:tx-in-sequence in)
+              +max-bip125-rbf-sequence+))
+        (bitcoin-lisp.serialization:transaction-inputs tx)))
+
+(defun mempool-tx-or-ancestor-signals-rbf-p (mempool txid)
+  "True if the mempool tx TXID, or any of its in-mempool ancestors, signals RBF."
+  (let ((e (mempool-get mempool txid)))
+    (when e
+      (or (tx-signals-rbf-p (mempool-entry-transaction e))
+          (block found
+            (maphash (lambda (a v) (declare (ignore v))
+                       (let ((ae (mempool-get mempool a)))
+                         (when (and ae (tx-signals-rbf-p (mempool-entry-transaction ae)))
+                           (return-from found t))))
+                     (mempool-ancestors mempool txid))
+            nil)))))
+
+(defun find-rbf-conflicts (mempool tx)
+  "Distinct txids of mempool txs that directly conflict with TX (spend a common
+outpoint). Generalizes mempool-check-conflict, which returns only the first."
+  (let ((seen (make-hash-table :test 'equalp)) (result '()))
+    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx) result)
+      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+             (key (make-outpoint-key
+                   (bitcoin-lisp.serialization:outpoint-hash prevout)
+                   (bitcoin-lisp.serialization:outpoint-index prevout)))
+             (sp (gethash key (mempool-spent-outpoints mempool))))
+        (when (and sp (not (gethash sp seen)))
+          (setf (gethash sp seen) t)
+          (push sp result))))))
+
+(defun check-rbf-rules (mempool tx new-fee new-vsize direct-conflicts)
+  "Apply the BIP125 replacement rules for TX (paying NEW-FEE over NEW-VSIZE)
+against DIRECT-CONFLICTS (a list of directly-conflicting mempool txids).
+Returns (values ok-p reason replaced-set), where REPLACED-SET is a hash-set of
+all txids that would be evicted (the conflicts plus their descendants)."
+  ;; Build the full set to be replaced: each conflict and all its descendants.
+  (let ((replaced (make-hash-table :test 'equalp))
+        (orig-fees 0))
+    (dolist (ctxid direct-conflicts)
+      (setf (gethash ctxid replaced) t)
+      (maphash (lambda (d v) (declare (ignore v)) (setf (gethash d replaced) t))
+               (mempool-descendants mempool ctxid)))
+    ;; Rule 5: bounded number of replacements.
+    (when (> (hash-table-count replaced) +max-rbf-replacement-candidates+)
+      (return-from check-rbf-rules (values nil :too-many-replacements nil)))
+    ;; A replacement must not spend an output of any tx it replaces (Core
+    ;; EntriesAndTxidsDisjoint) — that would leave a dangling input after the
+    ;; replaced set is evicted.
+    (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+      (when (gethash (bitcoin-lisp.serialization:outpoint-hash
+                      (bitcoin-lisp.serialization:tx-in-previous-output in))
+                     replaced)
+        (return-from check-rbf-rules (values nil :replacement-adds-unconfirmed nil))))
+    ;; Rule 1: every directly-conflicting tx must be replaceable (signaling,
+    ;; directly or via an ancestor) — unless full-RBF is enabled.
+    (unless *mempool-full-rbf*
+      (dolist (ctxid direct-conflicts)
+        (unless (mempool-tx-or-ancestor-signals-rbf-p mempool ctxid)
+          (return-from check-rbf-rules (values nil :txn-mempool-conflict nil)))))
+    ;; Rule 2: the replacement may only spend an unconfirmed output if that exact
+    ;; outpoint was already spent by one of the original transactions.
+    (let ((orig-inputs (make-hash-table :test 'equalp)))
+      (dolist (ctxid direct-conflicts)
+        (let ((ce (mempool-get mempool ctxid)))
+          (when ce
+            (dolist (in (bitcoin-lisp.serialization:transaction-inputs
+                         (mempool-entry-transaction ce)))
+              (let ((p (bitcoin-lisp.serialization:tx-in-previous-output in)))
+                (setf (gethash (make-outpoint-key
+                                (bitcoin-lisp.serialization:outpoint-hash p)
+                                (bitcoin-lisp.serialization:outpoint-index p))
+                               orig-inputs)
+                      t))))))
+      (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+        (let* ((p (bitcoin-lisp.serialization:tx-in-previous-output in))
+               (ptxid (bitcoin-lisp.serialization:outpoint-hash p)))
+          (when (and (mempool-has mempool ptxid)
+                     (not (gethash (make-outpoint-key
+                                    ptxid (bitcoin-lisp.serialization:outpoint-index p))
+                                   orig-inputs)))
+            (return-from check-rbf-rules
+              (values nil :replacement-adds-unconfirmed nil))))))
+    ;; Sum the fees of everything being replaced.
+    (maphash (lambda (txid v) (declare (ignore v))
+               (let ((e (mempool-get mempool txid)))
+                 (when e (incf orig-fees (mempool-entry-fee e)))))
+             replaced)
+    ;; Rule 3: pay at least the total fee of the replaced transactions.
+    (when (< new-fee orig-fees)
+      (return-from check-rbf-rules (values nil :insufficient-fee nil)))
+    ;; Rule 4: pay for the replacement's own bandwidth on top, at the
+    ;; incremental relay fee rate (0.1 sat/vB), not the 1 sat/vB relay floor.
+    (when (< (- new-fee orig-fees)
+             (ceiling (* new-vsize +incremental-relay-fee-rate+) 1000))
+      (return-from check-rbf-rules (values nil :insufficient-fee nil)))
+    (values t nil replaced)))
+
 ;;;; Eviction
 
 (defun mempool-evict-for-size (mempool needed-bytes new-entry-fee-rate)

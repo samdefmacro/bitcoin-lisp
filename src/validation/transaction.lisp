@@ -362,11 +362,8 @@ FEE is returned as an integer (satoshis)."
       (return-from validate-transaction-for-mempool
         (values nil :already-in-mempool nil))))
 
-  ;; Check for conflicts with existing mempool entries
-  (let ((conflict (bitcoin-lisp.mempool:mempool-check-conflict mempool tx)))
-    (when conflict
-      (return-from validate-transaction-for-mempool
-        (values nil :mempool-conflict nil))))
+  ;; Conflicts with existing mempool entries are handled by BIP125 RBF after
+  ;; the fee is known (see the fee section below).
 
   ;; Check inputs: each must reference a confirmed UTXO or an unconfirmed
   ;; in-mempool output (chained spend). EXTRA-COINS carries the latter.
@@ -412,12 +409,25 @@ FEE is returned as an integer (satoshis)."
       ;; Convert typed fee to integer; fee-rate is per virtual byte (BIP141).
       (let* ((fee-value (unwrap-satoshi fee))
              (vsize (bitcoin-lisp.serialization:transaction-vsize tx))
-             (fee-rate (if (zerop vsize) 0 (floor fee-value vsize))))
+             (fee-rate (if (zerop vsize) 0 (floor fee-value vsize)))
+             (direct-conflicts (bitcoin-lisp.mempool:find-rbf-conflicts mempool tx))
+             (replaced-set nil))
 
         ;; Policy: minimum relay fee rate
         (when (< fee-rate +min-relay-fee-rate+)
           (return-from validate-transaction-for-mempool
             (values nil :insufficient-fee nil)))
+
+        ;; BIP125 replace-by-fee: if this tx conflicts with mempool entries it
+        ;; must satisfy the replacement rules; the set it replaces is returned
+        ;; to the caller (4th value) to evict before adding.
+        (when direct-conflicts
+          (multiple-value-bind (ok reason rset)
+              (bitcoin-lisp.mempool:check-rbf-rules mempool tx fee-value vsize
+                                                    direct-conflicts)
+            (unless ok
+              (return-from validate-transaction-for-mempool (values nil reason nil)))
+            (setf replaced-set rset)))
 
         ;; Script validation (consensus)
         (multiple-value-bind (scripts-valid failed-input)
@@ -428,7 +438,9 @@ FEE is returned as an integer (satoshis)."
             (return-from validate-transaction-for-mempool
               (values nil :script-failed nil))))
 
-        (values t nil fee-value)))))
+        (values t nil fee-value
+                (when replaced-set
+                  (loop for k being the hash-keys of replaced-set collect k)))))))
 
 ;;;; Script validation
 
