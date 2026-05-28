@@ -279,6 +279,35 @@
     ;; Cost = (0 + 3) * 4 + 0 = 12
     (is (= 12 (bitcoin-lisp.validation:count-transaction-sigops-cost tx get-spent)))))
 
+(test sigops-cost-gates-on-activation
+  "P2SH/witness sigops are only counted when their flags are active, mirroring
+Bitcoin Core's GetTransactionSigOpCost honoring SCRIPT_VERIFY_P2SH/_WITNESS."
+  ;; Native P2WPKH input: witness sigops = 1, legacy from P2PKH output = 1.
+  (let* ((spent (make-p2wpkh-script (make-dummy-hash #xaa 20)))
+         (tx (make-sigops-test-tx
+              :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+              :script-pubkey (make-p2pkh-script (make-dummy-hash #xbb 20))
+              :witness (list (make-dummy-hash #xcc 72))))
+         (get-spent (lambda (txid index) (declare (ignore txid index)) spent)))
+    ;; witness active: (1+0)*4 + 1 = 5 ; witness inactive: (1+0)*4 + 0 = 4
+    (is (= 5 (bitcoin-lisp.validation:count-transaction-sigops-cost
+              tx get-spent :count-witness t)))
+    (is (= 4 (bitcoin-lisp.validation:count-transaction-sigops-cost
+              tx get-spent :count-witness nil))))
+  ;; P2SH input whose redeemScript is a bare OP_CHECKSIG (accurate p2sh sigops = 1).
+  (let* ((redeem (make-script #xac))                 ; OP_CHECKSIG
+         (script-sig (make-script #x01 #xac))        ; push the 1-byte redeemScript
+         (spent (make-p2sh-script (make-dummy-hash #xbb 20)))
+         (tx (make-sigops-test-tx
+              :script-sig script-sig
+              :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
+         (get-spent (lambda (txid index) (declare (ignore txid index)) spent)))
+    ;; p2sh active: (0+1)*4 + 0 = 4 ; p2sh inactive: (0+0)*4 + 0 = 0
+    (is (= 4 (bitcoin-lisp.validation:count-transaction-sigops-cost
+              tx get-spent :count-p2sh t)))
+    (is (= 0 (bitcoin-lisp.validation:count-transaction-sigops-cost
+              tx get-spent :count-p2sh nil)))))
+
 (test witness-scale-factor-constant
   "Witness scale factor is 4."
   (is (= 4 bitcoin-lisp.validation:+witness-scale-factor+)))
