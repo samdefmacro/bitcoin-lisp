@@ -469,6 +469,8 @@
    #:mempool-ancestor-fee-rate
    #:mempool-descendant-fee-rate
    #:mempool-remove-recursive
+   #:mempool-expire
+   #:mempool-trim
    #:mempool-orphan-pool
    ;; Orphan pool
    #:make-orphan-pool
