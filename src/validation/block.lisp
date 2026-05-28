@@ -942,14 +942,22 @@ GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
                                                  redeem-script witness)))))))))))
     (values p2sh-count witness-count)))
 
-(defun count-transaction-sigops-cost (tx get-spent-script)
+(defun count-transaction-sigops-cost (tx get-spent-script &key (count-p2sh t) (count-witness t))
   "Calculate the weighted sigops cost for TX (BIP 141).
 Cost = (legacy + p2sh) * WITNESS_SCALE_FACTOR + witness.
-GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
+GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey.
+
+COUNT-P2SH / COUNT-WITNESS gate the P2SH and witness sigops on their activation,
+mirroring Bitcoin Core's GetTransactionSigOpCost, which only adds P2SH sigops
+when SCRIPT_VERIFY_P2SH is set and witness sigops when SCRIPT_VERIFY_WITNESS is
+set (tx_verify.cpp). Legacy sigops are always counted."
   (let ((legacy (count-legacy-sigops tx)))
-    (multiple-value-bind (p2sh witness)
-        (count-p2sh-and-witness-sigops tx get-spent-script)
-      (+ (* (+ legacy p2sh) +witness-scale-factor+) witness))))
+    (if (or count-p2sh count-witness)
+        (multiple-value-bind (p2sh witness)
+            (count-p2sh-and-witness-sigops tx get-spent-script)
+          (+ (* (+ legacy (if count-p2sh p2sh 0)) +witness-scale-factor+)
+             (if count-witness witness 0)))
+        (* legacy +witness-scale-factor+))))
 
 ;;;; Full block validation
 
@@ -1026,9 +1034,15 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
     ;; Validate each transaction and collect fees (using Satoshi type)
     ;; Track outputs from earlier transactions for intra-block spending
-    (let ((total-fees (wrap-satoshi 0))
-          (total-sigops-cost 0)
-          (pending-utxos (make-hash-table :test 'equalp)))
+    (let* ((total-fees (wrap-satoshi 0))
+           (total-sigops-cost 0)
+           (pending-utxos (make-hash-table :test 'equalp))
+           ;; Gate P2SH/witness sigop counting on the block's active flags,
+           ;; exactly as Bitcoin Core passes GetBlockScriptFlags into
+           ;; GetTransactionSigOpCost. Same source of truth as script validation.
+           (active-flags (mandatory-script-flags-list current-height))
+           (count-p2sh (and (member "P2SH" active-flags :test #'string=) t))
+           (count-witness (and (member "WITNESS" active-flags :test #'string=) t)))
 
       ;; UTXO lookup function for sigops counting
       (flet ((get-spent-script (txid index)
@@ -1071,7 +1085,9 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                    (setf total-fees (satoshi+ total-fees fee)))
                  ;; Accumulate sigops cost and check limit (early exit for DoS protection)
                  (incf total-sigops-cost
-                       (count-transaction-sigops-cost tx #'get-spent-script))
+                       (count-transaction-sigops-cost tx #'get-spent-script
+                                                      :count-p2sh count-p2sh
+                                                      :count-witness count-witness))
                  (when (> total-sigops-cost +max-block-sigops-cost+)
                    (return-from validate-block
                      (values nil :too-many-sigops nil)))
