@@ -1359,6 +1359,12 @@ Handles chain reorganizations when a competing chain has more work."
            ;; inside the same critical section as the tip update.
            (when mempool
              (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+           ;; Expire stale mempool/orphan entries once per block (outside the
+           ;; critical section), matching Bitcoin Core's expire-on-block.
+           (when mempool
+             (bitcoin-lisp.mempool:mempool-expire mempool)
+             (bitcoin-lisp.mempool:orphan-expire
+              (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
            (bitcoin-lisp:maybe-periodic-flush)
            ;; Automatic block pruning after connecting a new block
            (when (bitcoin-lisp:automatic-pruning-p)
