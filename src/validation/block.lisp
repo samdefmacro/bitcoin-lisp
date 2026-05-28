@@ -1288,12 +1288,14 @@ Subsidy halves every 210,000 blocks."
 ;;;; Block connection
 
 (defun connect-block (block chain-state block-store utxo-set
-                      &key tx-index fee-estimator recent-rejects)
+                      &key tx-index fee-estimator recent-rejects mempool)
   "Connect a validated block to the chain.
 Updates chain state and UTXO set.
 Optionally updates TX-INDEX if provided and enabled.
 Optionally updates FEE-ESTIMATOR with block fee statistics.
 Optionally clears RECENT-REJECTS on chain reorganization.
+When MEMPOOL is provided, removes the block's confirmed/conflicting txs from it
+(the single removal chokepoint — every connect path, IBD or relay, goes here).
 Handles chain reorganizations when a competing chain has more work."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (hash (bitcoin-lisp.serialization:block-header-hash header))
@@ -1352,7 +1354,11 @@ Handles chain reorganizations when a competing chain has more work."
            ;; Update transaction index if enabled
            (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
              (bitcoin-lisp.storage:txindex-add-block tx-index block hash))
-           (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height))
+           (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height)
+           ;; Remove now-confirmed (and conflicting) txs from the mempool,
+           ;; inside the same critical section as the tip update.
+           (when mempool
+             (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
            (bitcoin-lisp:maybe-periodic-flush)
            ;; Automatic block pruning after connecting a new block
            (when (bitcoin-lisp:automatic-pruning-p)
@@ -1366,7 +1372,8 @@ Handles chain reorganizations when a competing chain has more work."
                           current-best-entry entry
                           :tx-index tx-index
                           :fee-estimator fee-estimator
-                          :recent-rejects recent-rejects))
+                          :recent-rejects recent-rejects
+                          :mempool mempool))
 
           ;; New block is on a weaker chain - just store it
           (t nil)))
@@ -1405,13 +1412,34 @@ Returns the common ancestor block-index-entry."
              (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
     (nreverse entries)))
 
+(defun readd-disconnected-txs-to-mempool (mempool txs utxo-set height)
+  "Best-effort re-add of TXS from reorg-disconnected blocks into the mempool.
+Each tx is re-validated against the post-reorg chain state; txs that are no
+longer valid (inputs spent on the new chain, or re-confirmed by it) are silently
+dropped. Mirrors Bitcoin Core re-adding disconnected-block txs after a reorg."
+  (when (and mempool txs)
+    (dolist (tx txs)
+      (handler-case
+          (multiple-value-bind (valid error fee)
+              (validate-transaction-for-mempool tx utxo-set mempool height)
+            (declare (ignore error))
+            (when valid
+              (bitcoin-lisp.mempool:mempool-add
+               mempool (bitcoin-lisp.serialization:transaction-hash tx)
+               (bitcoin-lisp.mempool:make-entry-from-tx
+                tx (or fee 0) height
+                :entry-time (bitcoin-lisp.serialization:get-unix-time)))))
+        (error () nil)))))
+
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
-                      &key tx-index fee-estimator recent-rejects)
+                      &key tx-index fee-estimator recent-rejects mempool)
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
 Disconnects blocks back to the fork point, then connects blocks on the new chain.
 Optionally updates TX-INDEX if provided and enabled.
 Optionally updates FEE-ESTIMATOR with block fee statistics.
-Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
+Clears RECENT-REJECTS if provided (reorg may change transaction validity).
+When MEMPOOL is provided, removes connected blocks' txs from it and re-adds the
+disconnected blocks' txs (best-effort, re-validated against the new tip)."
   (let ((fork-entry (find-fork-point old-tip-entry new-tip-entry)))
     (unless fork-entry
       (return-from perform-reorg nil))
@@ -1432,7 +1460,13 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
       ;; Collect blocks to disconnect (old chain, tip to fork)
       (let ((to-disconnect (collect-chain-entries old-tip-entry fork-entry))
             ;; Collect blocks to connect (new chain, fork to new tip)
-            (to-connect (collect-chain-entries new-tip-entry fork-entry)))
+            (to-connect (collect-chain-entries new-tip-entry fork-entry))
+            ;; Per-disconnected-block non-coinbase tx lists, re-added to the
+            ;; mempool after the reorg. Pushed during the tip-first disconnect
+            ;; loop, so the list ends up oldest-block-first — flattening then
+            ;; re-adds parents before children (a child can only spend a parent
+            ;; in an equal-or-lower block).
+            (disconnected-block-txs '()))
 
         ;; Precondition: every block on BOTH sides must be in the
         ;; block-store. If anything is missing, refuse the reorg without
@@ -1469,6 +1503,12 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
               (let ((undo (get-undo-data block-hash)))
                 (bitcoin-lisp.storage:disconnect-block-from-utxo-set
                  utxo-set block (or undo '())))
+              ;; Collect this block's non-coinbase txs (in original order) for
+              ;; mempool re-add. Pushing whole per-block lists during the
+              ;; tip-first loop leaves disconnected-block-txs oldest-first.
+              (when mempool
+                (push (rest (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+                      disconnected-block-txs))
               ;; Remove from txindex during reorg disconnect
               (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
                 (bitcoin-lisp.storage:txindex-remove-block tx-index block))
@@ -1495,6 +1535,9 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
                 ;; Add to txindex during reorg connect
                 (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
                   (bitcoin-lisp.storage:txindex-add-block tx-index block block-hash))
+                ;; Remove this connected block's txs from the mempool.
+                (when mempool
+                  (bitcoin-lisp.mempool:mempool-remove-for-block mempool block))
                 (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)))))
 
         ;; Update chain tip
@@ -1502,6 +1545,13 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
          chain-state
          (bitcoin-lisp.storage:block-index-entry-hash new-tip-entry)
          new-height)
+
+        ;; Re-add disconnected-block txs to the mempool (best-effort, against
+        ;; the new tip), parents before children. Txs re-confirmed or
+        ;; invalidated by the new chain are dropped by re-validation.
+        (readd-disconnected-txs-to-mempool
+         mempool (loop for txs in disconnected-block-txs append txs)
+         utxo-set new-height)
 
         (bitcoin-lisp:log-info "REORG complete: disconnected ~D, connected ~D blocks"
                                (length to-disconnect) (length to-connect))
@@ -1525,7 +1575,7 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity)."
 
 (defun activate-block (block chain-state block-store utxo-set
                        &key current-time skip-scripts tx-index fee-estimator
-                            recent-rejects)
+                            recent-rejects mempool)
   "Validate and activate BLOCK. Three cases:
 
   1. BLOCK's parent IS the current best tip — validate then connect
@@ -1557,7 +1607,8 @@ Returns (VALUES T NIL) on activation,
                  (connect-block block chain-state block-store utxo-set
                                 :tx-index tx-index
                                 :fee-estimator fee-estimator
-                                :recent-rejects recent-rejects)
+                                :recent-rejects recent-rejects
+                                :mempool mempool)
                  (values t nil))
                (values nil error)))))
 
@@ -1597,7 +1648,8 @@ Returns (VALUES T NIL) on activation,
                                current-best-entry prev-entry
                                :tx-index tx-index
                                :fee-estimator fee-estimator
-                               :recent-rejects recent-rejects)
+                               :recent-rejects recent-rejects
+                               :mempool mempool)
               (cond
                 ((null reorg-ok)
                  ;; Reorg refused (missing fork blocks, fork below pruned
@@ -1620,7 +1672,8 @@ Returns (VALUES T NIL) on activation,
                            (connect-block block chain-state block-store utxo-set
                                           :tx-index tx-index
                                           :fee-estimator fee-estimator
-                                          :recent-rejects recent-rejects)
+                                          :recent-rejects recent-rejects
+                                          :mempool mempool)
                            (values t nil))
                          (progn
                            ;; Validation failed AFTER we reorganized.

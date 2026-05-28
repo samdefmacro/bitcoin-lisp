@@ -404,12 +404,9 @@
               (error 'rpc-error :code +rpc-misc-error+
                                 :message (format nil "Transaction rejected: ~A" error)))
             ;; Add to mempool
-            (let* ((tx-size (length tx-bytes))
-                   (entry (bitcoin-lisp.mempool:make-mempool-entry
-                           :transaction tx
-                           :fee (or fee 0)
-                           :size tx-size
-                           :entry-time (get-universal-time)))
+            (let* ((entry (bitcoin-lisp.mempool:make-entry-from-tx
+                           tx (or fee 0) current-height
+                           :entry-time (bitcoin-lisp.serialization:get-unix-time)))
                    (add-result (bitcoin-lisp.mempool:mempool-add mempool txid entry)))
               (unless (eq add-result :ok)
                 (error 'rpc-error :code +rpc-misc-error+

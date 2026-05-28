@@ -327,10 +327,8 @@ Mirrors Bitcoin Core's MSG NOTFOUND handling (net_processing.cpp)."
                   (bitcoin-lisp.validation:connect-block
                    block chain-state block-store utxo-set
                    :fee-estimator fee-estimator
-                   :recent-rejects recent-rejects)
-                  ;; Remove confirmed transactions from mempool
-                  (when mempool
-                    (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+                   :recent-rejects recent-rejects
+                   :mempool mempool))
                 (progn
                   (format t "Block ~A rejected: ~A~%"
                           (bitcoin-lisp.crypto:bytes-to-hex hash) error)
@@ -425,23 +423,19 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                     (record-misbehavior peer 10)))
                 (when valid
                   ;; Add to mempool
-                  (let ((tx-size (length (bitcoin-lisp.serialization:serialize-transaction tx)))
-                        (entry-time (bitcoin-lisp.serialization:get-unix-time)))
-                    (let ((result (bitcoin-lisp.mempool:mempool-add
-                                   mempool txid
-                                   (bitcoin-lisp.mempool:make-mempool-entry
-                                    :transaction tx
-                                    :fee fee
-                                    :size tx-size
-                                    :entry-time entry-time))))
-                      (when (eq result :ok)
-                        ;; Relay to other peers
-                        (when peers
-                          (relay-transaction txid peer peers
-                                            :fee-rate (if (plusp tx-size)
-                                                          (floor fee tx-size)
-                                                          0)
-                                            :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))))))))))))
+                  (let* ((entry (bitcoin-lisp.mempool:make-entry-from-tx
+                                 tx fee current-height
+                                 :entry-time (bitcoin-lisp.serialization:get-unix-time)))
+                         (vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry))
+                         (result (bitcoin-lisp.mempool:mempool-add mempool txid entry)))
+                    (when (eq result :ok)
+                      ;; Relay to other peers
+                      (when peers
+                        (relay-transaction txid peer peers
+                                           :fee-rate (if (plusp vsize)
+                                                         (floor fee vsize)
+                                                         0)
+                                           :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))))))))))
     (error (c)
       (declare (ignore c))
       nil)))
@@ -771,9 +765,8 @@ unsolicited compact blocks for faster relay)."
                      (bitcoin-lisp.validation:connect-block
                       block chain-state block-store utxo-set
                       :fee-estimator fee-estimator
-                      :recent-rejects recent-rejects)
-                     (when mempool
-                       (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+                      :recent-rejects recent-rejects
+                      :mempool mempool))
                    (progn
                      (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
                      (record-misbehavior peer 100)))))))
@@ -852,9 +845,8 @@ unsolicited compact blocks for faster relay)."
                       (bitcoin-lisp.validation:connect-block
                        block chain-state block-store utxo-set
                        :fee-estimator fee-estimator
-                       :recent-rejects recent-rejects)
-                      (when mempool
-                        (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
+                       :recent-rejects recent-rejects
+                       :mempool mempool))
                     (progn
                       (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
                       (record-misbehavior peer 100)))))))))))
