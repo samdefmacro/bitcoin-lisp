@@ -69,6 +69,41 @@
     (bitcoin-lisp.serialization::parse-headers-payload
      (%bytes #xfd #xd1 #x07))))       ; 2001 = 0x07d1
 
+;;;; Block-relay message count caps (compact block / getblocktxn / blocktxn)
+
+;; compact-size for 50001 (just over +max-block-tx-count+): 0xfe + LE32 0x0000c351
+(defparameter +over-block-tx-count-cs+ (%bytes #xfe #x51 #xc3 0 0))
+
+(test compact-block-rejects-oversized-shortids
+  ;; 80-byte header + 8-byte nonce + an over-limit short-ids count.
+  (signals error
+    (flexi-streams:with-input-from-sequence
+        (s (%concat-bytes (make-array 88 :element-type '(unsigned-byte 8) :initial-element 0)
+                          +over-block-tx-count-cs+))
+      (bitcoin-lisp.serialization:read-compact-block s))))
+
+(test getblocktxn-rejects-oversized-count
+  ;; 32-byte block hash + an over-limit index count.
+  (signals error
+    (flexi-streams:with-input-from-sequence
+        (s (%concat-bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                          +over-block-tx-count-cs+))
+      (bitcoin-lisp.serialization::read-block-txn-request s))))
+
+(test blocktxn-rejects-oversized-count
+  (signals error
+    (flexi-streams:with-input-from-sequence
+        (s (%concat-bytes (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                          +over-block-tx-count-cs+))
+      (bitcoin-lisp.serialization::read-block-txn-response s))))
+
+(test addrv2-rejects-oversized-count
+  ;; addrv2 now rejects (not silently truncates) above MAX_ADDR_TO_SEND (1000).
+  ;; compact-size 1001 = 0xfd + LE16 0x07e9... (1001 = 0x03e9 -> bytes e9 03).
+  (signals error
+    (bitcoin-lisp.serialization:parse-addrv2-payload
+     (%bytes #xfd #xe9 #x03))))
+
 ;;;; Fuzz: random/truncated input must terminate with a handled error
 
 (defun %random-bytes (n state)
