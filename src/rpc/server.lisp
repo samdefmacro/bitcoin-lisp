@@ -65,6 +65,9 @@
   (register-rpc-method "sendrawtransaction" #'rpc-sendrawtransaction)
   (register-rpc-method "testmempoolaccept" #'rpc-testmempoolaccept)
   (register-rpc-method "submitpackage" #'rpc-submitpackage)
+  ;; Mining methods
+  (register-rpc-method "getblocktemplate" #'rpc-getblocktemplate)
+  (register-rpc-method "getmininginfo" #'rpc-getmininginfo)
   ;; Raw transaction methods
   (register-rpc-method "decoderawtransaction" #'rpc-decoderawtransaction)
   (register-rpc-method "getrawtransaction" #'rpc-getrawtransaction)
