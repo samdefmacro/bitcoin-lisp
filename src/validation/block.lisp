@@ -1672,6 +1672,38 @@ reorganize to the best valid chain if it now outweighs the active tip. Returns
                              :recent-rejects recent-rejects :mempool mempool)))
           (values t nil)))))
 
+(defun precious-block (chain-state block-store utxo-set block-hash
+                       &key tx-index fee-estimator recent-rejects mempool)
+  "Treat BLOCK-HASH as preferred (Bitcoin Core preciousblock): if its chain has at
+least as much work as the active tip and it isn't already the tip, reorganize to
+it. Fork choice here is strict greater-than on chain-work, so an equal-work
+competitor that arrives later cannot displace it — which is exactly what
+preciousblock guarantees, with no persistent sequence-id needed (unlike Core's
+candidate-set model). Returns (values t nil) on success (including the no-ops
+where the block is already the tip or weaker), (values nil reason) on failure."
+  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+    (cond
+      ((null entry) (values nil :block-not-found))
+      (t
+       (let ((tip (bitcoin-lisp.storage:get-block-index-entry
+                   chain-state (bitcoin-lisp.storage:best-block-hash chain-state))))
+         (cond
+           ;; Already the tip, or weaker than it — nothing to do.
+           ((or (null tip)
+                (eq entry tip)
+                (< (bitcoin-lisp.storage:block-index-entry-chain-work entry)
+                   (bitcoin-lisp.storage:block-index-entry-chain-work tip)))
+            (values t nil))
+           ;; Can only reorg to a block whose data is present.
+           ((not (bitcoin-lisp.storage:block-exists-p block-store block-hash))
+            (values nil :block-missing))
+           (t
+            (if (perform-reorg chain-state block-store utxo-set tip entry
+                               :tx-index tx-index :fee-estimator fee-estimator
+                               :recent-rejects recent-rejects :mempool mempool)
+                (values t nil)
+                (values nil :reorg-failed)))))))))
+
 ;;;; Activate block — validate + connect with reorg awareness.
 ;;;;
 ;;;; The validate-then-connect dance in process-received-block does
