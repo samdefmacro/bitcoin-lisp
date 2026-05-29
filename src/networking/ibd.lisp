@@ -420,6 +420,7 @@ Verified against Bitcoin Core chainparams.cpp.")
     (:testnet3 \*testnet3-checkpoints*)
     (:testnet4 *testnet4-checkpoints*)
     (:signet *signet-checkpoints*)
+    (:regtest nil)                       ; regtest has no checkpoints
     (:mainnet *mainnet-checkpoints*)))
 
 (defun get-checkpoint-hash (height)
