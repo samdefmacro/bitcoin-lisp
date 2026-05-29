@@ -49,6 +49,10 @@
   :description "Per-flag SCRIPT_VERIFY gating matrix (flag toggles its rule)"
   :in :bitcoin-lisp-tests)
 
+(def-suite :inbound-listening-tests
+  :description "Inbound peer listening + inbound version handshake"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :persistence-tests
   :description "Tests for persistence, peer health, reorg operations"
   :in :bitcoin-lisp-tests)
