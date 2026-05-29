@@ -669,6 +669,78 @@ implicit default mode is supported (no longpoll / proposal). Fields mirror Core.
       ("chain" . ,(%chain-name (bitcoin-lisp::node-network node)))
       ("warnings" . ""))))
 
+(defun %activate-submitted-block (node block)
+  "Validate+activate BLOCK through the consensus path. Returns the activate-block
+(values ok reason)."
+  (bitcoin-lisp.validation:activate-block
+   block
+   (rpc-get-chain-state node)
+   (rpc-get-block-store node)
+   (rpc-get-utxo-set node)
+   :mempool (rpc-get-mempool node)
+   :tx-index (rpc-get-tx-index node)))
+
+(defun rpc-submitblock (node params)
+  "Submit a mined block (Bitcoin Core submitblock). PARAMS: (block-hex). Returns
+JSON null on acceptance, \"duplicate\" if already known, or a BIP22 reject reason
+string. Routes through the same activate-block consensus path as network blocks."
+  (let ((hex (first params)))
+    (unless (and (stringp hex) (plusp (length hex)))
+      (error 'rpc-error :code +rpc-misc-error+ :message "Block decode failed: empty"))
+    (let ((block (handler-case
+                     (let ((bytes (bitcoin-lisp.crypto:hex-to-bytes hex)))
+                       (flexi-streams:with-input-from-sequence (s bytes)
+                         (bitcoin-lisp.serialization:read-bitcoin-block s)))
+                   (error (e)
+                     (error 'rpc-error :code +rpc-misc-error+
+                                       :message (format nil "Block decode failed: ~A" e)))))
+          (chain-state (rpc-get-chain-state node)))
+      (let ((hash (bitcoin-lisp.serialization:block-header-hash
+                   (bitcoin-lisp.serialization:bitcoin-block-header block))))
+        ;; Already in the block index → duplicate.
+        (when (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
+          (return-from rpc-submitblock "duplicate"))
+        (multiple-value-bind (ok reason) (%activate-submitted-block node block)
+          (cond
+            (ok nil)                        ; accepted → JSON null (BIP22 success)
+            ;; A valid block stored on a weaker side chain is still accepted.
+            ((eq reason :weaker-chain) nil)
+            (t (string-downcase (symbol-name reason)))))))))
+
+(defun rpc-generatetoaddress (node params)
+  "Mine NBLOCKS blocks paying to ADDRESS and add them to the chain (Bitcoin Core
+generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
+[maxtries]). Returns an array of the mined block hashes (hex)."
+  (let ((nblocks (first params))
+        (address (second params))
+        (maxtries (or (third params) 1000000))
+        (network (bitcoin-lisp::node-network node)))
+    (unless (and (integerp nblocks) (plusp nblocks))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "nblocks must be a positive integer"))
+    (unless (stringp address)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "address must be a string"))
+    (multiple-value-bind (type script-pubkey) (bitcoin-lisp.crypto:decode-address address network)
+      (declare (ignore type))
+      (unless script-pubkey
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "Invalid address for ~A" network)))
+      (let ((chain-state (rpc-get-chain-state node))
+            (mempool (rpc-get-mempool node))
+            (hashes '()))
+        (dotimes (i nblocks (nreverse hashes))
+          (let ((block (bitcoin-lisp.mining:assemble-full-block
+                        chain-state mempool :coinbase-script-pubkey script-pubkey)))
+            (unless (bitcoin-lisp.mining:mine-block block :max-tries maxtries)
+              (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
+            (multiple-value-bind (ok reason) (%activate-submitted-block node block)
+              (unless ok
+                (error 'rpc-error :code +rpc-misc-error+
+                                  :message (format nil "Mined block rejected: ~A" reason)))
+              (push (hash-to-hex (bitcoin-lisp.serialization:block-header-hash
+                                  (bitcoin-lisp.serialization:bitcoin-block-header block)))
+                    hashes))))))))
+
 ;;; --- Extended RPC Methods ---
 
 (defconstant +rpc-deserialization-error+ -22

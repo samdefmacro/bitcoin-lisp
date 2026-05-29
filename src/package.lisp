@@ -147,6 +147,7 @@
    #:block-header-timestamp
    #:block-header-bits
    #:block-header-nonce
+   #:block-header-cached-hash
    #:block-header-hash
    #:serialize-block-header
    #:bitcoin-block
@@ -208,6 +209,7 @@
    #:parse-headers-payload
    #:parse-block-payload
    #:read-bitcoin-block
+   #:serialize-witness-block
    #:read-transaction
    #:serialize-transaction
    #:coinbase-input-p
@@ -617,6 +619,10 @@
    #:next-block-required-bits
    #:build-witness-commitment-script
    #:*last-block-template*
+   ;; block construction + mining (builder.lisp)
+   #:build-coinbase-transaction
+   #:assemble-full-block
+   #:mine-block
    ;; block-template struct + accessors
    #:block-template
    #:block-template-height

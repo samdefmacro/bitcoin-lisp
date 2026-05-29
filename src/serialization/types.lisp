@@ -527,6 +527,19 @@ TRANSACTIONS: List of transactions in the block."
   (dolist (tx (bitcoin-block-transactions block))
     (write-transaction stream tx)))
 
+(defun serialize-witness-block (block)
+  "Serialize a complete BLOCK to bytes in BIP 144 form: each transaction is
+witness-serialized when it carries witness data (legacy otherwise). This is the
+wire/`submitblock` form and the inverse of read-bitcoin-block (read-transaction
+auto-detects the per-tx witness marker)."
+  (flexi-streams:with-output-to-sequence (s)
+    (write-block-header s (bitcoin-block-header block))
+    (write-compact-size s (length (bitcoin-block-transactions block)))
+    (dolist (tx (bitcoin-block-transactions block))
+      (if (transaction-has-witness-p tx)
+          (write-witness-transaction s tx)
+          (write-transaction s tx)))))
+
 ;;;; Generic serialization interface
 
 (defgeneric serialize (object)
