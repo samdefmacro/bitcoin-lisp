@@ -86,6 +86,9 @@
 (defvar *node* nil
   "Current running node instance.")
 
+(defvar *node-start-time* nil
+  "Unix time the node was started (set by start-node); basis for the uptime RPC.")
+
 ;;;; Logging (macros and core functions defined in logging.lisp)
 
 (defun show-logs (&key (n 20) (level :debug))
@@ -269,6 +272,8 @@ Returns the node instance."
   (when *node*
     (log-warn "Node already running, stopping first")
     (stop-node))
+
+  (setf *node-start-time* (bitcoin-lisp.serialization:get-unix-time))
 
   ;; Wire up logging BEFORE init-node so its log-info calls go somewhere.
   ;; Without these, the node runs silently — the May 5 restart had this
