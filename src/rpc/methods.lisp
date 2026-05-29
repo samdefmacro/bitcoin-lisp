@@ -379,33 +379,112 @@
          (bitcoin-lisp.mempool:mempool-for-each
           mempool
           (lambda (txid entry)
-            (multiple-value-bind (acount asize afees)
-                (bitcoin-lisp.mempool:mempool-ancestor-stats mempool txid)
-              (multiple-value-bind (dcount dsize dfees)
-                  (bitcoin-lisp.mempool:mempool-descendant-stats mempool txid)
-                (push
-                 (cons (hash-to-hex txid)
-                       `(("vsize" . ,(bitcoin-lisp.mempool:mempool-entry-vsize entry))
-                         ("weight" . ,(bitcoin-lisp.serialization:transaction-weight
-                                       (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
-                         ("time" . ,(bitcoin-lisp.mempool:mempool-entry-entry-time entry))
-                         ("height" . ,(bitcoin-lisp.mempool:mempool-entry-height entry))
-                         ("fees" . (("base" . ,(/ (bitcoin-lisp.mempool:mempool-entry-fee entry)
-                                                  100000000.0d0))
-                                    ("ancestor" . ,(/ afees 100000000.0d0))
-                                    ("descendant" . ,(/ dfees 100000000.0d0))))
-                         ("ancestorcount" . ,acount)
-                         ("ancestorsize" . ,asize)
-                         ("descendantcount" . ,dcount)
-                         ("descendantsize" . ,dsize)
-                         ("wtxid" . ,(hash-to-hex (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
-                         ("depends" . ,(let ((deps '()))
-                                         (maphash (lambda (p v) (declare (ignore v))
-                                                    (push (hash-to-hex p) deps))
-                                                  (bitcoin-lisp.mempool:mempool-entry-parents entry))
-                                         deps))))
-                 result)))))
+            (push (cons (hash-to-hex txid) (%mempool-entry-fields mempool txid entry))
+                  result)))
          result)))))
+
+(defun %mempool-entry-fields (mempool txid entry)
+  "The verbose field alist for one mempool ENTRY (TXID) — vsize/weight/time/
+height/fees{base,ancestor,descendant}/ancestor+descendant counts/wtxid/depends.
+Shared by getrawmempool (verbose), getmempoolentry, getmempoolancestors, and
+getmempooldescendants."
+  (multiple-value-bind (acount asize afees)
+      (bitcoin-lisp.mempool:mempool-ancestor-stats mempool txid)
+    (multiple-value-bind (dcount dsize dfees)
+        (bitcoin-lisp.mempool:mempool-descendant-stats mempool txid)
+      `(("vsize" . ,(bitcoin-lisp.mempool:mempool-entry-vsize entry))
+        ("weight" . ,(bitcoin-lisp.serialization:transaction-weight
+                      (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+        ("time" . ,(bitcoin-lisp.mempool:mempool-entry-entry-time entry))
+        ("height" . ,(bitcoin-lisp.mempool:mempool-entry-height entry))
+        ("fees" . (("base" . ,(/ (bitcoin-lisp.mempool:mempool-entry-fee entry) 100000000.0d0))
+                   ("ancestor" . ,(/ afees 100000000.0d0))
+                   ("descendant" . ,(/ dfees 100000000.0d0))))
+        ("ancestorcount" . ,acount)
+        ("ancestorsize" . ,asize)
+        ("descendantcount" . ,dcount)
+        ("descendantsize" . ,dsize)
+        ("wtxid" . ,(hash-to-hex (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
+        ("depends" . ,(let ((deps '()))
+                        (maphash (lambda (p v) (declare (ignore v))
+                                   (push (hash-to-hex p) deps))
+                                 (bitcoin-lisp.mempool:mempool-entry-parents entry))
+                        deps))))))
+
+(defun %mempool-txid-arg (params mempool)
+  "Resolve the first param (a big-endian txid hex) to (values internal-txid
+entry), erroring if malformed or not in the mempool."
+  (let ((txid-hex (first params)))
+    (unless (stringp txid-hex)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "txid must be a hex string"))
+    (let ((txid (parse-hex-hash txid-hex)))
+      (unless txid
+        (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid txid"))
+      (let ((entry (and mempool (bitcoin-lisp.mempool:mempool-get mempool txid))))
+        (unless entry
+          (error 'rpc-error :code +rpc-misc-error+ :message "Transaction not in mempool"))
+        (values txid entry)))))
+
+(defun rpc-getmempoolentry (node params)
+  "Return mempool details for transaction TXID (Bitcoin Core getmempoolentry)."
+  (let ((mempool (rpc-get-mempool node)))
+    (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
+      (%mempool-entry-fields mempool txid entry))))
+
+(defun %mempool-set->result (mempool txid-set verbose)
+  "Format a hash-set of mempool txids as either an array of (big-endian) txid hex
+strings or, when VERBOSE, an alist of txid-hex -> entry fields."
+  (let ((result '()))
+    (maphash (lambda (txid v) (declare (ignore v))
+               (let ((entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
+                 (when entry
+                   (push (if verbose
+                             (cons (hash-to-hex txid) (%mempool-entry-fields mempool txid entry))
+                             (hash-to-hex txid))
+                         result))))
+             txid-set)
+    result))
+
+(defun rpc-getmempoolancestors (node params)
+  "Return the in-mempool ancestors of TXID (Bitcoin Core getmempoolancestors).
+PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
+  (let ((mempool (rpc-get-mempool node))
+        (verbose (second params)))
+    (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
+      (declare (ignore entry))
+      (%mempool-set->result mempool (bitcoin-lisp.mempool:mempool-ancestors mempool txid) verbose))))
+
+(defun rpc-getmempooldescendants (node params)
+  "Return the in-mempool descendants of TXID (Bitcoin Core getmempooldescendants).
+PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
+  (let ((mempool (rpc-get-mempool node))
+        (verbose (second params)))
+    (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
+      (declare (ignore entry))
+      (%mempool-set->result mempool (bitcoin-lisp.mempool:mempool-descendants mempool txid) verbose))))
+
+(defun rpc-gettxspendingprevout (node params)
+  "For each {txid, vout} outpoint in the array PARAM, report the mempool
+transaction spending it, if any (Bitcoin Core gettxspendingprevout). Returns an
+array of {txid, vout, spendingtxid?}."
+  (let ((outpoints (first params))
+        (mempool (rpc-get-mempool node)))
+    (unless (and (listp outpoints) outpoints)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "First parameter must be a non-empty array of outpoints"))
+    (mapcar
+     (lambda (op)
+       (let* ((txid-hex (and (hash-table-p op) (gethash "txid" op)))
+              (vout (and (hash-table-p op) (gethash "vout" op)))
+              (txid (and (stringp txid-hex) (parse-hex-hash txid-hex))))
+         (unless (and txid (integerp vout))
+           (error 'rpc-error :code +rpc-invalid-parameter+
+                             :message "Each outpoint needs a txid (hex) and vout (integer)"))
+         (let ((spender (and mempool (bitcoin-lisp.mempool:mempool-spending-tx mempool txid vout))))
+           `(("txid" . ,txid-hex)
+             ("vout" . ,vout)
+             ,@(when spender `(("spendingtxid" . ,(hash-to-hex spender))))))))
+     outpoints)))
 
 (defun rpc-testmempoolaccept (node params)
   "Dry-run mempool acceptance for one or more raw transactions (hex). Returns an

@@ -145,6 +145,11 @@ decayed rolling minimum if higher (Bitcoin Core CTxMemPool::GetMinFee)."
   "Return the number of transactions in the mempool."
   (hash-table-count (mempool-entries mempool)))
 
+(defun mempool-spending-tx (mempool txid vout)
+  "Return the txid of the mempool transaction that spends outpoint (TXID, VOUT),
+or NIL if no mempool tx spends it. Used by the gettxspendingprevout RPC."
+  (gethash (make-outpoint-key txid vout) (mempool-spent-outpoints mempool)))
+
 (defun mempool-check-conflict (mempool tx)
   "Check if TX conflicts with any existing mempool entry.
 Returns the txid of the conflicting transaction, or NIL if no conflict."
