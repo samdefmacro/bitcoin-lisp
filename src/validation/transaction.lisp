@@ -280,11 +280,13 @@ Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
           (<= len 83)
           (= (aref script-pubkey 0) #x6a))))) ; OP_RETURN
 
-(defun mempool-extra-coins (tx utxo-set mempool)
+(defun mempool-extra-coins (tx utxo-set mempool &optional package-coins)
   "Build a (txid . index) -> utxo-entry table for TX inputs that spend
-unconfirmed in-mempool outputs (chained spends). Returns (values table ok-p);
-OK-P is NIL if some input references neither a confirmed UTXO nor an in-mempool
-output (a genuinely missing input)."
+unconfirmed outputs — either an in-mempool tx (chained spends) or, as a final
+fallback, a sibling output supplied in PACKAGE-COINS (a package being validated
+together, before its members are in the mempool). Returns (values table ok-p);
+OK-P is NIL if some input references none of those nor a confirmed UTXO (a
+genuinely missing input)."
   (let ((extra (make-hash-table :test 'equalp)))
     (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx) (values extra t))
       (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
@@ -293,22 +295,34 @@ output (a genuinely missing input)."
         (unless (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)
           (let* ((pe (bitcoin-lisp.mempool:mempool-get mempool ptxid))
                  (ptx (and pe (bitcoin-lisp.mempool:mempool-entry-transaction pe)))
-                 (outs (and ptx (bitcoin-lisp.serialization:transaction-outputs ptx))))
-            (if (and outs (< pidx (length outs)))
-                (let ((out (nth pidx outs)))
-                  (setf (gethash (cons ptxid pidx) extra)
-                        (bitcoin-lisp.storage::make-utxo-entry
-                         :value (bitcoin-lisp.serialization:tx-out-value out)
-                         :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey out)
-                         :height (bitcoin-lisp.mempool:mempool-entry-height pe)
-                         :coinbase nil)))
-                (return-from mempool-extra-coins (values nil nil)))))))))
+                 (outs (and ptx (bitcoin-lisp.serialization:transaction-outputs ptx)))
+                 (pkg-coin (and package-coins (gethash (cons ptxid pidx) package-coins))))
+            (cond
+              ((and outs (< pidx (length outs)))
+               (let ((out (nth pidx outs)))
+                 (setf (gethash (cons ptxid pidx) extra)
+                       (bitcoin-lisp.storage:make-utxo-entry
+                        :value (bitcoin-lisp.serialization:tx-out-value out)
+                        :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+                        :height (bitcoin-lisp.mempool:mempool-entry-height pe)
+                        :coinbase nil))))
+              (pkg-coin
+               (setf (gethash (cons ptxid pidx) extra) pkg-coin))
+              (t
+               (return-from mempool-extra-coins (values nil nil))))))))))
 
-(defun validate-transaction-for-mempool (tx utxo-set mempool current-height)
+(defun validate-transaction-for-mempool (tx utxo-set mempool current-height
+                                         &key package-coins skip-fee-check)
   "Validate a transaction for mempool acceptance.
 Performs consensus checks plus policy checks.
 Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure.
-FEE is returned as an integer (satoshis)."
+FEE is returned as an integer (satoshis).
+
+PACKAGE-COINS, when supplied, is a (txid . index) -> utxo-entry table of outputs
+produced by sibling transactions in a package being validated together (so a
+child can spend a not-yet-in-mempool parent). SKIP-FEE-CHECK bypasses the per-tx
+minimum-fee floor, used when the package as a whole is evaluated at the package
+feerate (Bitcoin Core's package_feerates path)."
   ;; Must not be coinbase
   (when (and (= (length (bitcoin-lisp.serialization:transaction-inputs tx)) 1)
              (bitcoin-lisp.serialization:coinbase-input-p
@@ -368,7 +382,7 @@ FEE is returned as an integer (satoshis)."
   ;; Check inputs: each must reference a confirmed UTXO or an unconfirmed
   ;; in-mempool output (chained spend). EXTRA-COINS carries the latter.
   (multiple-value-bind (extra-coins inputs-ok)
-      (mempool-extra-coins tx utxo-set mempool)
+      (mempool-extra-coins tx utxo-set mempool package-coins)
     (unless inputs-ok
       (return-from validate-transaction-for-mempool
         (values nil :missing-input nil)))
@@ -414,8 +428,10 @@ FEE is returned as an integer (satoshis)."
              (replaced-set nil))
 
         ;; Policy: minimum relay fee rate (relay floor, or the higher rolling
-        ;; dynamic minimum when the mempool has been trimming).
-        (when (< fee-rate (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
+        ;; dynamic minimum when the mempool has been trimming). Skipped when this
+        ;; tx is part of a package evaluated at the package feerate.
+        (when (and (not skip-fee-check)
+                   (< fee-rate (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)))
           (return-from validate-transaction-for-mempool
             (values nil :insufficient-fee nil)))
 

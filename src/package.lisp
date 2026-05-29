@@ -533,6 +533,22 @@
    #:validate-transaction-contextual
    #:validate-transaction-scripts
    #:validate-transaction-for-mempool
+   ;; Package relay (submitpackage)
+   #:validate-package-for-mempool
+   #:package-well-formed
+   #:package-child-with-parents-tree-p
+   #:+max-package-count+
+   #:+max-package-weight+
+   #:package-tx-result
+   #:package-tx-result-txid
+   #:package-tx-result-wtxid
+   #:package-tx-result-status
+   #:package-tx-result-vsize
+   #:package-tx-result-fee
+   #:package-tx-result-effective-feerate
+   #:package-tx-result-effective-includes
+   #:package-tx-result-other-wtxid
+   #:package-tx-result-error
    ;; Script execution and input validation
    #:execute-script
    #:script-is-witness-program-p

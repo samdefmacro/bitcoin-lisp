@@ -488,6 +488,83 @@ anything to the mempool. Each tx is checked independently against current state
         (error 'rpc-error :code +rpc-misc-error+
                           :message (format nil "TX decode failed: ~A" e))))))
 
+(defun %package-tx-result-fields (r)
+  "Field alist for one package-tx-result, mirroring Bitcoin Core submitpackage's
+per-wtxid object. Status drives which fields are present."
+  (let ((status (bitcoin-lisp.validation:package-tx-result-status r))
+        (base (list (cons "txid" (hash-to-hex
+                                  (bitcoin-lisp.validation:package-tx-result-txid r))))))
+    (flet ((btc (sat) (/ (or sat 0) 100000000.0d0))
+           ;; sat/vB -> BTC/kvB, the unit Core reports feerates in.
+           (feerate-btc-kvb (rate) (/ (* (or rate 0) 1000) 100000000.0d0)))
+      (ecase status
+        (:valid
+         (append base
+                 `(("vsize" . ,(bitcoin-lisp.validation:package-tx-result-vsize r))
+                   ("fees" . (("base" . ,(btc (bitcoin-lisp.validation:package-tx-result-fee r)))
+                              ("effective-feerate"
+                               . ,(feerate-btc-kvb
+                                   (bitcoin-lisp.validation:package-tx-result-effective-feerate r)))
+                              ("effective-includes"
+                               . ,(mapcar #'hash-to-hex
+                                          (bitcoin-lisp.validation:package-tx-result-effective-includes r))))))))
+        (:mempool-entry
+         (append base
+                 `(("vsize" . ,(bitcoin-lisp.validation:package-tx-result-vsize r))
+                   ("fees" . (("base" . ,(btc (bitcoin-lisp.validation:package-tx-result-fee r))))))))
+        (:different-witness
+         (append base
+                 `(("other-wtxid"
+                    . ,(let ((ow (bitcoin-lisp.validation:package-tx-result-other-wtxid r)))
+                         (if ow (hash-to-hex ow) ""))))))
+        ((:invalid :not-validated)
+         (append base
+                 `(("error" . ,(let ((e (bitcoin-lisp.validation:package-tx-result-error r)))
+                                 (if e (string-downcase (symbol-name e)) "rejected"))))))))))
+
+(defun rpc-submitpackage (node params)
+  "Submit a package of raw transactions (a child with its unconfirmed parents)
+to the mempool. PARAMS: (package-hex-array [maxfeerate] [maxburnamount]). The
+array is topologically sorted with the child last. Mirrors Bitcoin Core's
+submitpackage: returns {package_msg, tx-results{wtxid -> {...}},
+replaced-transactions}. The maxfeerate/maxburnamount safety rails are accepted
+for API compatibility but not enforced (matching sendrawtransaction here)."
+  (let ((hexes (first params))
+        (utxo-set (rpc-get-utxo-set node))
+        (mempool (rpc-get-mempool node))
+        (chain-state (rpc-get-chain-state node)))
+    (unless (and (listp hexes) hexes)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "First parameter must be a non-empty array of tx hex"))
+    (when (> (length hexes) bitcoin-lisp.validation:+max-package-count+)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Array must contain between 1 and 25 transactions"))
+    (unless mempool
+      (error 'rpc-error :code +rpc-misc-error+ :message "Mempool unavailable"))
+    ;; Decode every tx up front; a single decode failure aborts the whole call.
+    (let ((package
+            (handler-case
+                (mapcar (lambda (hex)
+                          (let ((bytes (bitcoin-lisp.crypto:hex-to-bytes hex)))
+                            (flexi-streams:with-input-from-sequence (s bytes)
+                              (bitcoin-lisp.serialization:read-transaction s))))
+                        hexes)
+              (error (e)
+                (error 'rpc-error :code +rpc-misc-error+
+                                  :message (format nil "TX decode failed: ~A" e))))))
+      (multiple-value-bind (msg results replaced)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           package utxo-set mempool chain-state)
+        `(("package_msg" . ,(if (eq msg :success) "success"
+                                (string-downcase (symbol-name msg))))
+          ("tx-results"
+           . ,(mapcar (lambda (r)
+                        (cons (hash-to-hex (bitcoin-lisp.validation:package-tx-result-wtxid r))
+                              (%package-tx-result-fields r)))
+                      results))
+          ,@(when replaced
+              `(("replaced-transactions" . ,(mapcar #'hash-to-hex replaced)))))))))
+
 ;;; --- Extended RPC Methods ---
 
 (defconstant +rpc-deserialization-error+ -22
