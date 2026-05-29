@@ -1577,6 +1577,101 @@ disconnected blocks' txs (best-effort, re-validated against the new tip)."
 
         t))))
 
+;;;; Chain-control helpers (invalidateblock / reconsiderblock)
+;;;;
+;;;; These power the manual invalidateblock/reconsiderblock RPCs. They mutate
+;;;; block-index status and drive perform-reorg, and run ONLY when their RPC is
+;;;; called — the normal sync path is untouched. invalidate-block installs no
+;;;; chain-selection guard, so it won't fight a future stronger block extending
+;;;; the invalidated branch; that's acceptable for the manual/regtest use these
+;;;; RPCs target (Bitcoin Core's persistent BLOCK_FAILED_VALID is out of scope).
+
+(defun block-descends-from-p (entry ancestor-entry)
+  "True if ANCESTOR-ENTRY lies on ENTRY's ancestry (ENTRY is ANCESTOR-ENTRY or a
+descendant of it)."
+  (let ((target-height (bitcoin-lisp.storage:block-index-entry-height ancestor-entry))
+        (cur entry))
+    (loop while (and cur (> (bitcoin-lisp.storage:block-index-entry-height cur) target-height))
+          do (setf cur (bitcoin-lisp.storage:block-index-entry-prev-entry cur)))
+    (and cur (eq cur ancestor-entry))))
+
+(defun block-index-descendants (chain-state entry)
+  "All block-index entries that descend from ENTRY, including ENTRY itself."
+  (let ((result '()))
+    (maphash (lambda (h e) (declare (ignore h))
+               (when (block-descends-from-p e entry) (push e result)))
+             (bitcoin-lisp.storage::chain-state-block-index chain-state))
+    result))
+
+(defun best-valid-tip (chain-state block-store)
+  "The highest-chain-work block-index entry that is not :invalid AND whose block
+is present in BLOCK-STORE — the target the active chain can actually reorg to.
+The block-presence filter excludes header-only entries (status :header-valid with
+no downloaded block), which on a live node routinely outrank everything; without
+it best-valid-tip would name an unreachable header and the reorg would no-op."
+  (let ((best nil))
+    (maphash (lambda (h e) (declare (ignore h))
+               (when (and (not (eq (bitcoin-lisp.storage:block-index-entry-status e) :invalid))
+                          (bitcoin-lisp.storage:block-exists-p
+                           block-store (bitcoin-lisp.storage:block-index-entry-hash e))
+                          (or (null best)
+                              (> (bitcoin-lisp.storage:block-index-entry-chain-work e)
+                                 (bitcoin-lisp.storage:block-index-entry-chain-work best))))
+                 (setf best e)))
+             (bitcoin-lisp.storage::chain-state-block-index chain-state))
+    best))
+
+(defun invalidate-block (chain-state block-store utxo-set block-hash
+                         &key tx-index fee-estimator recent-rejects mempool)
+  "Mark BLOCK-HASH and all its descendants :invalid, reorganizing the active
+chain back to BLOCK-HASH's parent if the active chain contained it. Returns
+(values t nil) on success, (values nil reason-keyword) on failure."
+  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+    (cond
+      ((null entry) (values nil :block-not-found))
+      ((zerop (bitcoin-lisp.storage:block-index-entry-height entry))
+       (values nil :cannot-invalidate-genesis))
+      (t
+       (let ((tip (bitcoin-lisp.storage:get-block-index-entry
+                   chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+             (parent (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+         ;; If the active chain contains the invalidated block, reorg down to its
+         ;; parent first. perform-reorg downgrades the disconnected blocks to
+         ;; :header-valid, so we mark :invalid AFTER it, making invalidation stick.
+         (when (and tip parent (block-descends-from-p tip entry))
+           (perform-reorg chain-state block-store utxo-set tip parent
+                          :tx-index tx-index :fee-estimator fee-estimator
+                          :recent-rejects recent-rejects :mempool mempool))
+         (dolist (e (block-index-descendants chain-state entry))
+           (setf (bitcoin-lisp.storage:block-index-entry-status e) :invalid))
+         (values t nil))))))
+
+(defun reconsider-block (chain-state block-store utxo-set block-hash
+                         &key tx-index fee-estimator recent-rejects mempool)
+  "Clear :invalid from BLOCK-HASH plus its ancestors and descendants, then
+reorganize to the best valid chain if it now outweighs the active tip. Returns
+(values t nil) on success, (values nil reason-keyword) on failure."
+  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+    (if (null entry)
+        (values nil :block-not-found)
+        (progn
+          (maphash (lambda (h e) (declare (ignore h))
+                     (when (and (eq (bitcoin-lisp.storage:block-index-entry-status e) :invalid)
+                                (or (block-descends-from-p e entry)
+                                    (block-descends-from-p entry e)))
+                       (setf (bitcoin-lisp.storage:block-index-entry-status e) :header-valid)))
+                   (bitcoin-lisp.storage::chain-state-block-index chain-state))
+          (let ((tip (bitcoin-lisp.storage:get-block-index-entry
+                      chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+                (target (best-valid-tip chain-state block-store)))
+            (when (and target tip
+                       (> (bitcoin-lisp.storage:block-index-entry-chain-work target)
+                          (bitcoin-lisp.storage:block-index-entry-chain-work tip)))
+              (perform-reorg chain-state block-store utxo-set tip target
+                             :tx-index tx-index :fee-estimator fee-estimator
+                             :recent-rejects recent-rejects :mempool mempool)))
+          (values t nil)))))
+
 ;;;; Activate block — validate + connect with reorg awareness.
 ;;;;
 ;;;; The validate-then-connect dance in process-received-block does
