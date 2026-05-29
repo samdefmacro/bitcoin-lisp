@@ -38,12 +38,7 @@
          (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
          (network (rpc-get-network node))
          (syncing (rpc-is-syncing node))
-         (result `(("chain" . ,(case network
-                                 (:testnet3 "test")
-                                 (:testnet4 "testnet4")
-                                 (:signet "signet")
-                                 (:mainnet "main")
-                                 (t "unknown")))
+         (result `(("chain" . ,(%chain-name network))
                    ("blocks" . ,height)
                    ("headers" . ,height)
                    ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
@@ -564,6 +559,115 @@ for API compatibility but not enforced (matching sendrawtransaction here)."
                       results))
           ,@(when replaced
               `(("replaced-transactions" . ,(mapcar #'hash-to-hex replaced)))))))))
+
+;;; --- Mining RPCs ---
+
+(defun %bits-to-target-hex (bits)
+  "The 256-bit target for BITS as 64 lowercase hex chars (Core hashTarget.GetHex)."
+  (format nil "~(~64,'0x~)" (bitcoin-lisp.storage:bits-to-target bits)))
+
+(defun %bits-hex (bits)
+  "Compact BITS as 8 lowercase hex chars."
+  (format nil "~(~8,'0x~)" bits))
+
+(defun %difficulty-from-bits (bits)
+  "Difficulty ratio relative to difficulty-1 (bits 0x1d00ffff), like Core's
+GetDifficulty."
+  (let ((cur (bitcoin-lisp.storage:bits-to-target bits))
+        (one (bitcoin-lisp.storage:bits-to-target #x1d00ffff)))
+    (if (zerop cur) 0d0 (/ (float one 1d0) (float cur 1d0)))))
+
+(defun %chain-name (network)
+  "Bitcoin Core GetChainTypeString for NETWORK."
+  (ecase network
+    (:mainnet "main")
+    (:testnet3 "test")
+    (:testnet4 "testnet4")
+    (:signet "signet")
+    (:regtest "regtest")))
+
+(defun %gbt-transactions (template)
+  "The getblocktemplate `transactions` array for TEMPLATE: one object per
+selected tx with data/txid/hash/depends/fee/sigops/weight. `depends` holds the
+1-based indices of the in-template txs each tx spends from."
+  (let ((entries (bitcoin-lisp.mining:block-template-transactions template))
+        (index-of (make-hash-table :test 'equalp)))
+    ;; 1-based index of each selected txid (they are in parents-first order).
+    (loop for e in entries
+          for i from 1
+          do (setf (gethash (bitcoin-lisp.serialization:transaction-hash
+                             (bitcoin-lisp.mempool:mempool-entry-transaction e))
+                            index-of)
+                   i))
+    (loop for e in entries
+          for tx = (bitcoin-lisp.mempool:mempool-entry-transaction e)
+          for depends = (let ((ds '()))
+                          (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+                            (let ((idx (gethash (bitcoin-lisp.serialization:outpoint-hash
+                                                 (bitcoin-lisp.serialization:tx-in-previous-output in))
+                                                index-of)))
+                              (when idx (pushnew idx ds))))
+                          (sort ds #'<))
+          collect `(("data" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                (bitcoin-lisp.serialization:serialize-witness-transaction tx)))
+                    ("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
+                    ("hash" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
+                    ("depends" . ,depends)
+                    ("fee" . ,(bitcoin-lisp.mempool:mempool-entry-fee e))
+                    ("sigops" . ,(bitcoin-lisp.mempool:mempool-entry-sigops e))
+                    ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))))))
+
+(defun rpc-getblocktemplate (node params)
+  "Return a block template assembled from the mempool (Bitcoin Core
+getblocktemplate). The optional template-request object is accepted but only its
+implicit default mode is supported (no longpoll / proposal). Fields mirror Core."
+  (declare (ignore params))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (mempool (rpc-get-mempool node))
+         (template (bitcoin-lisp.mining:assemble-block-template chain-state mempool))
+         (bits (bitcoin-lisp.mining:block-template-bits template)))
+    `(("version" . ,(bitcoin-lisp.mining:block-template-version template))
+      ("previousblockhash" . ,(hash-to-hex (bitcoin-lisp.mining:block-template-prev-hash template)))
+      ("transactions" . ,(%gbt-transactions template))
+      ("coinbaseaux" . ,(make-hash-table :test 'equal))
+      ("coinbasevalue" . ,(bitcoin-lisp.mining:block-template-coinbase-value template))
+      ("target" . ,(%bits-to-target-hex bits))
+      ("mintime" . ,(bitcoin-lisp.mining:block-template-mintime template))
+      ("mutable" . ("time" "transactions" "prevblock"))
+      ("noncerange" . "00000000ffffffff")
+      ("sigoplimit" . ,bitcoin-lisp.validation:+max-block-sigops-cost+)
+      ("weightlimit" . ,bitcoin-lisp.validation:+max-block-weight+)
+      ("curtime" . ,(bitcoin-lisp.mining:block-template-curtime template))
+      ("bits" . ,(%bits-hex bits))
+      ("height" . ,(bitcoin-lisp.mining:block-template-height template))
+      ("default_witness_commitment"
+       . ,(bitcoin-lisp.crypto:bytes-to-hex
+           (bitcoin-lisp.mining:block-template-default-witness-commitment-script template))))))
+
+(defun rpc-getmininginfo (node params)
+  "Return mining-related state (Bitcoin Core getmininginfo)."
+  (declare (ignore params))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (mempool (rpc-get-mempool node))
+         (height (bitcoin-lisp.storage:current-height chain-state))
+         (tip (bitcoin-lisp.storage:get-block-index-entry
+               chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+         (bits (if tip
+                   (bitcoin-lisp.serialization:block-header-bits
+                    (bitcoin-lisp.storage:block-index-entry-header tip))
+                   #x1d00ffff))
+         ;; Report the last assembled template (Bitcoin Core m_last_block_*),
+         ;; rather than re-assembling on every status call.
+         (template bitcoin-lisp.mining:*last-block-template*))
+    `(("blocks" . ,height)
+      ("currentblockweight" . ,(if template (bitcoin-lisp.mining:block-template-total-weight template) 0))
+      ("currentblocktx" . ,(if template (length (bitcoin-lisp.mining:block-template-transactions template)) 0))
+      ("bits" . ,(%bits-hex bits))
+      ("difficulty" . ,(%difficulty-from-bits bits))
+      ("target" . ,(%bits-to-target-hex bits))
+      ("pooledtx" . ,(if mempool (bitcoin-lisp.mempool:mempool-count mempool) 0))
+      ("chain" . ,(%chain-name (bitcoin-lisp::node-network node)))
+      ("warnings" . ""))))
 
 ;;; --- Extended RPC Methods ---
 
