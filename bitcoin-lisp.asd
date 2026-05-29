@@ -102,6 +102,8 @@
                              (:file "mempool-tests")
                              ;; Package relay tests (submitpackage)
                              (:file "package-tests")
+                             ;; Mining / regtest tests
+                             (:file "mining-tests")
                              ;; Persistence, peer health, reorg tests
                              (:file "persistence-tests")
                              ;; RPC tests

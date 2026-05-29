@@ -33,6 +33,10 @@
   :description "Tests for package relay (submitpackage)"
   :in :bitcoin-lisp-tests)
 
+(def-suite :mining-tests
+  :description "Tests for regtest support and mining RPCs"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :persistence-tests
   :description "Tests for persistence, peer health, reorg operations"
   :in :bitcoin-lisp-tests)
