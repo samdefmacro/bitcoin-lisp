@@ -41,6 +41,10 @@
   :description "Malformed/adversarial-input robustness of the deserializers"
   :in :bitcoin-lisp-tests)
 
+(def-suite :roundtrip-tests
+  :description "serialize <-> deserialize round-trip property tests"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :persistence-tests
   :description "Tests for persistence, peer health, reorg operations"
   :in :bitcoin-lisp-tests)
