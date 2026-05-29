@@ -583,6 +583,10 @@
    #:perform-reorg
    #:decode-coinbase-height
    #:get-bip34-activation-height
+   #:get-bip66-activation-height
+   #:get-bip65-activation-height
+   #:get-csv-activation-height
+   #:get-taproot-activation-height
    #:initialize-undo-storage
    ;; Locktime validation
    #:check-transaction-final

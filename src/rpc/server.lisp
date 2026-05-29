@@ -66,6 +66,11 @@
   (register-rpc-method "getmempoolancestors" #'rpc-getmempoolancestors)
   (register-rpc-method "getmempooldescendants" #'rpc-getmempooldescendants)
   (register-rpc-method "gettxspendingprevout" #'rpc-gettxspendingprevout)
+  ;; Node / chain info methods
+  (register-rpc-method "getdifficulty" #'rpc-getdifficulty)
+  (register-rpc-method "uptime" #'rpc-uptime)
+  (register-rpc-method "getindexinfo" #'rpc-getindexinfo)
+  (register-rpc-method "getdeploymentinfo" #'rpc-getdeploymentinfo)
   (register-rpc-method "sendrawtransaction" #'rpc-sendrawtransaction)
   (register-rpc-method "testmempoolaccept" #'rpc-testmempoolaccept)
   (register-rpc-method "submitpackage" #'rpc-submitpackage)
