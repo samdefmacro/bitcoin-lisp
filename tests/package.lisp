@@ -53,6 +53,10 @@
   :description "Inbound peer listening + inbound version handshake"
   :in :bitcoin-lisp-tests)
 
+(def-suite :serve-requests-tests
+  :description "Serving getheaders/getblocks/getaddr requests to peers"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :persistence-tests
   :description "Tests for persistence, peer health, reorg operations"
   :in :bitcoin-lisp-tests)

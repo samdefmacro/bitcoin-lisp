@@ -115,6 +115,8 @@
                              (:file "script-flag-tests")
                              ;; Inbound listening + handshake
                              (:file "inbound-listening-tests")
+                             ;; Serving getheaders/getblocks/getaddr to peers
+                             (:file "serve-requests-tests")
                              ;; Persistence, peer health, reorg tests
                              (:file "persistence-tests")
                              ;; RPC tests
