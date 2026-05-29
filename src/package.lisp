@@ -190,6 +190,7 @@
    #:make-pong-message
    #:make-getblocks-message
    #:make-getheaders-message
+   #:make-headers-message
    #:make-getdata-message
    #:make-inv-message
    #:make-tx-message
@@ -207,8 +208,11 @@
    ;; Parsing
    #:parse-inv-payload
    #:parse-headers-payload
+   #:parse-block-locator-payload
    #:+max-inv-count+
    #:+max-headers-count+
+   #:+max-addr-count+
+   #:+max-locator-count+
    #:parse-block-payload
    #:read-bitcoin-block
    #:serialize-witness-block
@@ -327,6 +331,9 @@
    #:current-height
    #:update-chain-tip
    #:build-block-locator
+   #:entry-on-active-chain-p
+   #:find-fork-in-active-chain
+   #:active-chain-entries-from
    #:bits-to-target
    #:derive-target
    #:target-to-bits
@@ -676,6 +683,7 @@
    #:peer-user-agent
    #:peer-ping-latency
    #:peer-inbound
+   #:peer-getaddr-sent
    #:connect-peer
    #:disconnect-peer
    #:make-inbound-peer

@@ -30,6 +30,9 @@
   (address "" :type string)
   ;; T if the peer connected to us (inbound); NIL if we dialed out (outbound).
   (inbound nil :type boolean)
+  ;; T once we have answered this peer's getaddr (Bitcoin Core m_getaddr_recvd):
+  ;; one address response per connection, to limit address-stamping spam.
+  (getaddr-sent nil :type boolean)
   ;; Misbehavior scoring
   (misbehavior-score 0 :type (unsigned-byte 32))
   ;; Compact block support (BIP 152)

@@ -260,11 +260,17 @@ Returns T if loaded, NIL if file missing or corrupted."
 
 ;;;; IP String Conversion
 
+(defun ipv4-mapped-p (ip)
+  "T if a 16-byte IP is an IPv4-mapped IPv6 address (::ffff:a.b.c.d)."
+  (and (= (length ip) 16)
+       (loop for i below 10 always (zerop (aref ip i)))
+       (= (aref ip 10) #xFF)
+       (= (aref ip 11) #xFF)))
+
 (defun ip-bytes-to-string (ip)
   "Convert 16-byte IP address to a string.
 IPv4-mapped addresses (::ffff:a.b.c.d) are rendered as dotted quad."
-  (if (and (= (aref ip 10) #xFF) (= (aref ip 11) #xFF)
-           (every #'zerop (subseq ip 0 10)))
+  (if (ipv4-mapped-p ip)
       ;; IPv4-mapped
       (format nil "~D.~D.~D.~D" (aref ip 12) (aref ip 13) (aref ip 14) (aref ip 15))
       ;; Full IPv6

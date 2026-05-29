@@ -150,6 +150,18 @@ Returns T if message was handled, NIL otherwise."
      (handle-getdata peer payload chain-state mempool)
      t)
 
+    ((string= command "getheaders")
+     (handle-getheaders peer payload chain-state)
+     t)
+
+    ((string= command "getblocks")
+     (handle-getblocks peer payload chain-state)
+     t)
+
+    ((string= command "getaddr")
+     (handle-getaddr peer address-book)
+     t)
+
     ((string= command "notfound")
      (handle-notfound peer payload)
      t)
@@ -530,6 +542,142 @@ Does not respond to transaction requests when relay is disabled (mainnet default
                                 (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
           ;; Block requests are not handled here (handled by IBD/sync)
           )))))
+
+;;; Serving headers / blocks / addresses to peers
+;;;
+;;; The responder side of getheaders/getblocks/getaddr, mirroring Bitcoin Core's
+;;; net_processing handlers so other nodes can sync headers, blocks, and peer
+;;; addresses from us.
+
+(defconstant +getblocks-inv-limit+ 500
+  "Maximum block hashes returned in an inv answering a getblocks (Bitcoin Core).")
+
+(defun zero-hash-p (hash)
+  "T if HASH is the all-zero stop hash (meaning 'no stop, send the maximum')."
+  (every #'zerop hash))
+
+(defun truncate-entries-at-stop (entries stop-hash inclusivep)
+  "Truncate the ascending block-index-entry list ENTRIES at the entry whose hash
+equals STOP-HASH. When INCLUSIVEP the stop entry is kept (getheaders semantics),
+otherwise it is dropped (getblocks). A null/all-zero STOP-HASH means 'no stop',
+returning ENTRIES whole; a STOP-HASH not present in ENTRIES also returns all."
+  (if (or (null stop-hash) (zero-hash-p stop-hash))
+      entries
+      (let ((tail (member stop-hash entries
+                          :key #'bitcoin-lisp.storage:block-index-entry-hash
+                          :test #'equalp)))
+        (cond ((null tail) entries)
+              (inclusivep (ldiff entries (cdr tail)))
+              (t (ldiff entries tail))))))
+
+(defun getheaders-response-message (payload chain-state)
+  "Build the headers message answering a getheaders PAYLOAD: up to
++max-headers-count+ headers from our active chain just after the locator's fork
+point — or just the stop block's header when the locator is empty. Always
+returns a serialized headers message (empty when we have nothing to add).
+Mirrors Bitcoin Core's GETHEADERS handler."
+  (multiple-value-bind (locator-hashes stop-hash)
+      (bitcoin-lisp.serialization:parse-block-locator-payload payload)
+    (let ((headers
+            (if (null locator-hashes)
+                ;; Null locator: return only the stop block's header, if it is on
+                ;; our active chain.
+                (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                              chain-state stop-hash)))
+                  (when (and entry
+                             (bitcoin-lisp.storage:entry-on-active-chain-p
+                              chain-state entry))
+                    (list (bitcoin-lisp.storage:block-index-entry-header entry))))
+                ;; Walk forward from the fork point, stop hash inclusive.
+                (let* ((fork (bitcoin-lisp.storage:find-fork-in-active-chain
+                              chain-state locator-hashes))
+                       (entries (bitcoin-lisp.storage:active-chain-entries-from
+                                 chain-state
+                                 (1+ (bitcoin-lisp.storage:block-index-entry-height fork))
+                                 bitcoin-lisp.serialization:+max-headers-count+)))
+                  (mapcar #'bitcoin-lisp.storage:block-index-entry-header
+                          (truncate-entries-at-stop entries stop-hash t))))))
+      (bitcoin-lisp.serialization:make-headers-message headers))))
+
+(defun handle-getheaders (peer payload chain-state)
+  "Serve a peer's getheaders by sending the headers message built from PAYLOAD
+against our active chain (see getheaders-response-message)."
+  (send-message peer (getheaders-response-message payload chain-state)))
+
+(defun getblocks-response-message (payload chain-state)
+  "Build the inv message answering a getblocks PAYLOAD: up to
++getblocks-inv-limit+ block hashes from our active chain after the locator's
+fork point, stopping before the stop hash. Returns NIL when there is nothing to
+announce. Mirrors Bitcoin Core's GETBLOCKS handler (legacy blocks-first peers)."
+  (multiple-value-bind (locator-hashes stop-hash)
+      (bitcoin-lisp.serialization:parse-block-locator-payload payload)
+    (let* ((fork (bitcoin-lisp.storage:find-fork-in-active-chain
+                  chain-state locator-hashes))
+           (entries (bitcoin-lisp.storage:active-chain-entries-from
+                     chain-state
+                     (1+ (bitcoin-lisp.storage:block-index-entry-height fork))
+                     +getblocks-inv-limit+))
+           (chosen (truncate-entries-at-stop entries stop-hash nil)))
+      (when chosen
+        (bitcoin-lisp.serialization:make-inv-message
+         (mapcar (lambda (entry)
+                   (bitcoin-lisp.serialization:make-inv-vector
+                    :type bitcoin-lisp.serialization:+inv-type-block+
+                    :hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+                 chosen))))))
+
+(defun handle-getblocks (peer payload chain-state)
+  "Serve a peer's getblocks by sending the inv built from PAYLOAD, if any (see
+getblocks-response-message)."
+  (let ((msg (getblocks-response-message payload chain-state)))
+    (when msg
+      (send-message peer msg))))
+
+(defun peer-address->net-addr (peer-addr)
+  "Build a net-addr (wire address) from a stored PEER-ADDRESS record."
+  (bitcoin-lisp.serialization:make-net-addr
+   :services (peer-address-services peer-addr)
+   :ip (peer-address-ip peer-addr)
+   :port (peer-address-port peer-addr)))
+
+(defun build-addr-response (peer peer-addrs)
+  "Build an addr message (or addrv2 when PEER advertised sendaddrv2) announcing
+the PEER-ADDRESS records in PEER-ADDRS."
+  (if (peer-wants-addrv2 peer)
+      (bitcoin-lisp.serialization:make-addrv2-message
+       (mapcar (lambda (pa)
+                 (list (peer-address->net-addr pa)
+                       (if (ipv4-mapped-p (peer-address-ip pa))
+                           bitcoin-lisp.serialization:+addrv2-net-ipv4+
+                           bitcoin-lisp.serialization:+addrv2-net-ipv6+)
+                       (peer-address-last-seen pa)))
+               peer-addrs))
+      (bitcoin-lisp.serialization:make-addr-message
+       (mapcar (lambda (pa)
+                 (list (peer-address->net-addr pa) (peer-address-last-seen pa)))
+               peer-addrs))))
+
+(defun handle-getaddr (peer &optional address-book)
+  "Serve a peer's getaddr: reply once per connection, and only to inbound peers,
+with up to +max-addr-count+ known addresses from ADDRESS-BOOK (defaulting to the
+node's). The inbound-only + once-per-connection rules mirror Bitcoin Core's
+GETADDR handler (anti-fingerprinting and anti-spam) — the once flag latches as
+soon as the request arrives, before we build any response, so a peer can never
+elicit more than one reply regardless of whether we had addresses to send."
+  (when (and (peer-inbound peer)
+             (not (peer-getaddr-sent peer)))
+    (setf (peer-getaddr-sent peer) t)
+    (let ((book (or address-book
+                    (let ((node bitcoin-lisp::*node*))
+                      (and node (bitcoin-lisp::node-address-book node))))))
+      (when book
+        (let* ((sorted (address-book-sorted-peers book))
+               (addrs (if (> (length sorted)
+                             bitcoin-lisp.serialization:+max-addr-count+)
+                          (subseq sorted 0 bitcoin-lisp.serialization:+max-addr-count+)
+                          sorted)))
+          (when addrs
+            (send-message peer (build-addr-response peer addrs))))))))
 
 ;;; Transaction relay
 
