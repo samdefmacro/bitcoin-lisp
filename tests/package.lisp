@@ -37,6 +37,10 @@
   :description "Tests for regtest support and mining RPCs"
   :in :bitcoin-lisp-tests)
 
+(def-suite :robustness-tests
+  :description "Malformed/adversarial-input robustness of the deserializers"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :persistence-tests
   :description "Tests for persistence, peer health, reorg operations"
   :in :bitcoin-lisp-tests)

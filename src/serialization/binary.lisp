@@ -148,9 +148,14 @@ Mirrors Bitcoin Core's ReadCompactSize (serialize.h:330-360):
 ;;;; Byte vector operations
 
 (defun read-bytes (stream count)
-  "Read COUNT bytes from STREAM, returning a byte vector."
-  (let ((bytes (make-array count :element-type '(unsigned-byte 8))))
-    (read-sequence bytes stream)
+  "Read COUNT bytes from STREAM, returning a byte vector. Signals an error if
+the stream ends first, rather than silently returning a short, zero-padded
+vector — truncated peer/disk input must be rejected, not parsed as garbage."
+  (let* ((bytes (make-array count :element-type '(unsigned-byte 8)))
+         (got (read-sequence bytes stream)))
+    (unless (= got count)
+      (error "read-bytes: unexpected end of input (wanted ~D bytes, got ~D)"
+             count got))
     bytes))
 
 (defun write-bytes (stream bytes)
@@ -394,16 +399,21 @@ Mirrors Bitcoin Core's ReadCompactSize (serialize.h:330-360):
     (if (>= u #x8000000000000000) (- u #x10000000000000000) u)))
 
 (defun br-read-bytes (br n)
-  "Read N bytes, returning a fresh simple-array (unsigned-byte 8)."
+  "Read N bytes, returning a fresh simple-array (unsigned-byte 8). Bounds-checks
+BEFORE allocating, so a malicious length field can't force a large allocation
+ahead of an overrun error."
   (declare (type byte-reader br) (type fixnum n)
            (optimize (speed 3) (safety 1)))
-  (let* ((p (br-pos br))
-         (out (make-array n :element-type '(unsigned-byte 8))))
-    (declare (type fixnum p)
-             (type (simple-array (unsigned-byte 8) (*)) out))
-    (replace out (br-data br) :start2 p :end2 (the fixnum (+ p n)))
-    (setf (br-pos br) (the fixnum (+ p n)))
-    out))
+  (let ((p (br-pos br)))
+    (declare (type fixnum p))
+    (when (> (+ p n) (length (br-data br)))
+      (error "br-read-bytes: read past end of buffer (pos ~D + ~D > ~D)"
+             p n (length (br-data br))))
+    (let ((out (make-array n :element-type '(unsigned-byte 8))))
+      (declare (type (simple-array (unsigned-byte 8) (*)) out))
+      (replace out (br-data br) :start2 p :end2 (the fixnum (+ p n)))
+      (setf (br-pos br) (the fixnum (+ p n)))
+      out)))
 
 (defun br-read-compact-size (br)
   "Read a CompactSize. Mirrors read-compact-size — non-canonical
