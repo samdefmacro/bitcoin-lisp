@@ -329,20 +329,25 @@ that exceeds this is misbehaving; reject the whole message.")
 (defconstant +max-headers-count+ 2000
   "Maximum headers in a headers message (Bitcoin Core MAX_HEADERS_RESULTS).")
 
+(defconstant +max-addr-count+ 1000
+  "Maximum entries in an addr/addrv2 message (Bitcoin Core MAX_ADDR_TO_SEND).")
+
+(defconstant +max-block-tx-count+ 50000
+  "Upper bound on the number of transactions referenced by a single block in the
+compact-block / getblocktxn / blocktxn messages. A 4M-weight block holds at most
+~16.7k of the smallest possible transactions, so this never rejects a valid
+block while bounding the per-message allocation well below the compact-size cap.")
+
 (defun parse-inv-payload (payload)
   "Parse an inv or getdata message payload into a list of inv-vectors."
   (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((count (read-compact-size stream)))
-      (when (> count +max-inv-count+)
-        (error "inv/getdata count ~D exceeds maximum ~D" count +max-inv-count+))
+    (let ((count (read-bounded-count stream +max-inv-count+ "inv/getdata")))
       (loop repeat count collect (read-inv-vector stream)))))
 
 (defun parse-headers-payload (payload)
   "Parse a headers message payload into a list of block headers."
   (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((count (read-compact-size stream)))
-      (when (> count +max-headers-count+)
-        (error "headers count ~D exceeds maximum ~D" count +max-headers-count+))
+    (let ((count (read-bounded-count stream +max-headers-count+ "headers")))
       (loop repeat count
             collect (prog1 (read-block-header stream)
                       ;; Headers message includes tx count (always 0) after each header
@@ -428,10 +433,10 @@ reads instead of flexi-streams' Gray-stream input dispatch."
   "Read a compact block (HeaderAndShortIDs) from STREAM."
   (let* ((header (read-block-header stream))
          (nonce (read-uint64-le stream))
-         (shortids-count (read-compact-size stream))
+         (shortids-count (read-bounded-count stream +max-block-tx-count+ "compact-block short-ids"))
          (short-ids (loop repeat shortids-count
                           collect (read-short-txid stream)))
-         (prefilled-count (read-compact-size stream))
+         (prefilled-count (read-bounded-count stream +max-block-tx-count+ "compact-block prefilled"))
          (prefilled-txs '())
          (last-index -1))
     ;; Read prefilled transactions with differential index encoding
@@ -475,7 +480,7 @@ reads instead of flexi-streams' Gray-stream input dispatch."
 (defun read-block-txn-request (stream)
   "Read a block transactions request (getblocktxn) from STREAM."
   (let* ((block-hash (read-hash256 stream))
-         (count (read-compact-size stream))
+         (count (read-bounded-count stream +max-block-tx-count+ "getblocktxn indexes"))
          (indexes '())
          (last-index -1))
     ;; Read differentially encoded indexes
@@ -520,7 +525,7 @@ reads instead of flexi-streams' Gray-stream input dispatch."
 (defun read-block-txn-response (stream)
   "Read a block transactions response (blocktxn) from STREAM."
   (let* ((block-hash (read-hash256 stream))
-         (count (read-compact-size stream))
+         (count (read-bounded-count stream +max-block-tx-count+ "blocktxn transactions"))
          (txs (loop repeat count collect (read-transaction stream))))
     (make-block-txn-response :block-hash block-hash
                              :transactions txs)))
@@ -686,9 +691,9 @@ Each entry is a list (net-addr network-id timestamp)."
 Returns a list of (VALUES net-addr timestamp network-id) for valid IPv4/IPv6 entries.
 Skips unknown or unsupported network types."
   (flexi-streams:with-input-from-sequence (stream payload)
-    (let ((count (read-compact-size stream))
+    (let ((count (read-bounded-count stream +max-addr-count+ "addrv2"))
           (results '()))
-      (loop repeat (min count 1000)
+      (loop repeat count
             do (multiple-value-bind (addr timestamp network-id)
                    (read-net-addr-v2 stream)
                  (when addr
