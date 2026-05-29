@@ -19,6 +19,12 @@
   (is (= 18443 (bitcoin-lisp::network-rpc-port :regtest)))
   (is (null (bitcoin-lisp::network-dns-seeds :regtest))))
 
+(test regtest-startup-dispatchers-handle-regtest
+  ;; Per-network dispatchers reached during node startup / validation must
+  ;; handle :regtest (a missing ecase case crashed start-node).
+  (is (integerp (bitcoin-lisp::prune-after-height :regtest)))
+  (is (null (bitcoin-lisp.networking::network-checkpoints :regtest))))
+
 (test regtest-genesis-hash-matches-core
   ;; make-genesis-header must hash to Core's regtest genesis
   ;; 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206.

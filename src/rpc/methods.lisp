@@ -324,6 +324,7 @@
                                    (:testnet3 "testnet")
                                    (:testnet4 "testnet4")
                                    (:signet "signet")
+                                   (:regtest "regtest")
                                    (:mainnet "mainnet")
                                    (t "unknown")))
                       ("reachable" . t))))
