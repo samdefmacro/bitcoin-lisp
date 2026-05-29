@@ -135,6 +135,43 @@
     (is (= 400 done))
     (is (plusp errored))))
 
+;;;; End-to-end: a malformed message disconnects the peer, not the node
+
+(defun %fake-ready-peer ()
+  "A peer object in the :ready state with a socket-less (but 'connected')
+connection — enough to drive dispatch + disconnect without a real socket."
+  (let ((conn (bitcoin-lisp.networking::make-connection
+               :host "127.0.0.1" :port 48333 :connected t)))
+    (bitcoin-lisp.networking:make-peer
+     :connection conn :state :ready :address "127.0.0.1")))
+
+(test malformed-message-disconnects-peer
+  ;; Drive an oversized inv (count 50001 > MAX_INV_SZ) through the REAL per-peer
+  ;; dispatch isolation used by the drain loop (safely-dispatch-peer-message).
+  ;; The parse error must be caught and disconnect only this peer — never escape
+  ;; to the caller (which in production is the sync thread). Validates #109.
+  (let ((peer (%fake-ready-peer))
+        (ctx (bitcoin-lisp.networking::make-ibd)))
+    (let ((still-connected
+            (bitcoin-lisp.networking::safely-dispatch-peer-message
+             peer "inv" (%bytes #xfe #x51 #xc3 0 0) nil nil nil ctx)))
+      (is (null still-connected))
+      (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+      (is (null (bitcoin-lisp.networking::peer-connection peer))))))
+
+(test wellformed-message-keeps-peer-connected
+  ;; Control: a benign (unknown, ignored) message dispatches without error, so
+  ;; the peer stays connected — proving the isolation disconnects on FAILURE, not
+  ;; unconditionally.
+  (let ((peer (%fake-ready-peer))
+        (ctx (bitcoin-lisp.networking::make-ibd)))
+    (let ((still-connected
+            (bitcoin-lisp.networking::safely-dispatch-peer-message
+             peer "xyzzy" (%bytes) nil nil nil ctx)))
+      (is (eq t still-connected))
+      (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))
+      (is-true (bitcoin-lisp.networking::peer-connection peer)))))
+
 (test fuzz-message-vector-parsers-terminate
   ;; Random payloads to the inv/headers parsers must terminate (the count caps +
   ;; EOF errors bound them).
