@@ -675,6 +675,11 @@ it (Bitcoin Core invalidateblock). PARAMS: (blockhash). Returns null."
 (Bitcoin Core reconsiderblock). PARAMS: (blockhash). Returns null."
   (%chain-control-block node params #'bitcoin-lisp.validation:reconsider-block))
 
+(defun rpc-preciousblock (node params)
+  "Treat a block as preferred over equal-work competitors, reorganizing to it
+(Bitcoin Core preciousblock). PARAMS: (blockhash). Returns null."
+  (%chain-control-block node params #'bitcoin-lisp.validation:precious-block))
+
 ;;; --- Peer / address RPCs ---
 
 (defun rpc-getnodeaddresses (node params)
