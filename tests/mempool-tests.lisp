@@ -800,3 +800,19 @@ low-fee parent, so a cheaper standalone tx is evicted first."
                          (* bitcoin-lisp.mempool::+default-mempool-expiry-hours+ 3600)
                          1))))
     (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))))
+
+;;;; Mempool deferrals: dynamic rolling minimum fee
+
+(test mempool-effective-min-fee
+  "Effective min-fee is the relay floor, or the (decaying) rolling minimum."
+  (let ((mempool (bitcoin-lisp.mempool:make-mempool)))
+    ;; No rolling minimum set -> relay floor (1 sat/vB).
+    (is (= 1 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)))
+    ;; Set a fresh rolling minimum -> used as-is.
+    (setf (bitcoin-lisp.mempool::mempool-rolling-min-fee-rate mempool) 100
+          (bitcoin-lisp.mempool::mempool-rolling-min-fee-time mempool)
+          (bitcoin-lisp.serialization:get-unix-time))
+    (is (= 100 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)))
+    ;; Far in the future it decays back below the floor -> floor.
+    (is (= 1 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate
+              mempool (+ (bitcoin-lisp.serialization:get-unix-time) (* 100 86400)))))))

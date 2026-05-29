@@ -63,6 +63,7 @@
   (register-rpc-method "getmempoolinfo" #'rpc-getmempoolinfo)
   (register-rpc-method "getrawmempool" #'rpc-getrawmempool)
   (register-rpc-method "sendrawtransaction" #'rpc-sendrawtransaction)
+  (register-rpc-method "testmempoolaccept" #'rpc-testmempoolaccept)
   ;; Raw transaction methods
   (register-rpc-method "decoderawtransaction" #'rpc-decoderawtransaction)
   (register-rpc-method "getrawtransaction" #'rpc-getrawtransaction)

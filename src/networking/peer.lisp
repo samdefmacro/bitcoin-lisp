@@ -163,7 +163,13 @@ Returns NIL if the host is banned."
   (when (peer-connection peer)
     (close-connection (peer-connection peer)))
   (setf (peer-state peer) :disconnected)
-  (setf (peer-connection peer) nil))
+  (setf (peer-connection peer) nil)
+  ;; Drop any orphan transactions this peer contributed (DoS hygiene).
+  (let ((node bitcoin-lisp::*node*))
+    (when (and node (bitcoin-lisp::node-mempool node))
+      (bitcoin-lisp.mempool:orphan-erase-for-peer
+       (bitcoin-lisp.mempool:mempool-orphan-pool (bitcoin-lisp::node-mempool node))
+       peer))))
 
 ;;; Message I/O
 
