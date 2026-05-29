@@ -830,3 +830,34 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     (signals error
       (bitcoin-lisp.rpc::rpc-getmempoolentry
        node (list (bitcoin-lisp.rpc::hash-to-hex (%txid-array 201)))))))
+
+;;; --- Node / chain info RPCs ---
+
+(test rpc-node-info
+  (let* ((node (make-test-node))
+         (net (bitcoin-lisp::node-network node)))
+    ;; getdifficulty: a positive number (no tip -> fallback bits 0x1d00ffff -> 1.0)
+    (let ((d (bitcoin-lisp.rpc::rpc-getdifficulty node nil)))
+      (is (numberp d))
+      (is (plusp d)))
+    ;; uptime: 0 when start-time unset; >= elapsed when set
+    (let ((bitcoin-lisp::*node-start-time* nil))
+      (is (= 0 (bitcoin-lisp.rpc::rpc-uptime node nil))))
+    (let ((bitcoin-lisp::*node-start-time*
+            (- (bitcoin-lisp.serialization:get-unix-time) 5)))
+      (is (>= (bitcoin-lisp.rpc::rpc-uptime node nil) 5)))
+    ;; getindexinfo: no txindex -> empty JSON object (hash-table)
+    (is (hash-table-p (bitcoin-lisp.rpc::rpc-getindexinfo node nil)))
+    ;; getdeploymentinfo: buried deployments present; segwit reports the
+    ;; network's activation height and matches the active/height contract.
+    (let* ((r (bitcoin-lisp.rpc::rpc-getdeploymentinfo node nil))
+           (deps (cdr (assoc "deployments" r :test #'string=)))
+           (segwit (cdr (assoc "segwit" deps :test #'string=))))
+      (is (assoc "bip34" deps :test #'string=))
+      (is (assoc "taproot" deps :test #'string=))
+      (is (string= "buried" (cdr (assoc "type" segwit :test #'string=))))
+      (is (= (bitcoin-lisp.validation:get-segwit-activation-height net)
+             (cdr (assoc "height" segwit :test #'string=))))
+      ;; height 0 < testnet segwit activation -> not active
+      (is (eq (>= 0 (bitcoin-lisp.validation:get-segwit-activation-height net))
+              (cdr (assoc "active" segwit :test #'string=)))))))
