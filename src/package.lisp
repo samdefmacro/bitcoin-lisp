@@ -207,6 +207,8 @@
    ;; Parsing
    #:parse-inv-payload
    #:parse-headers-payload
+   #:+max-inv-count+
+   #:+max-headers-count+
    #:parse-block-payload
    #:read-bitcoin-block
    #:serialize-witness-block

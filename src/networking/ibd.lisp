@@ -1223,6 +1223,15 @@ disconnects it so replace-disconnected-peers can refill the slot."
         (bitcoin-lisp:log-warn
          "Peer ~A I/O error during message drain — disconnecting: ~A"
          (peer-address peer) c)
+        (handler-case (disconnect-peer peer) (error () nil)))
+      ;; A malformed/oversized message (bad count, truncated payload, decode
+      ;; failure) raises a non-I/O error. Treat the peer as misbehaving and
+      ;; disconnect only it — Bitcoin Core's posture — rather than letting the
+      ;; error escape and tear down the whole sync thread.
+      (error (c)
+        (bitcoin-lisp:log-warn
+         "Peer ~A sent a malformed message during drain — disconnecting: ~A"
+         (peer-address peer) c)
         (handler-case (disconnect-peer peer) (error () nil)))))
   (handle-peer-fin peer))
 
@@ -1487,8 +1496,10 @@ Used during IBD when the validated block tip lags behind the header tip."
                                        (let ((added (process-headers valid-headers chain-state)))
                                          (incf received-count added)
 
-                                         ;; If we got less than 2000, we're done
-                                         (when (< (length headers) 2000)
+                                         ;; A short batch (< the protocol max)
+                                         ;; means the peer has no more headers.
+                                         (when (< (length headers)
+                                                  bitcoin-lisp.serialization:+max-headers-count+)
                                            (setf done t))
 
                                          ;; Per-peer availability: peer's tip is

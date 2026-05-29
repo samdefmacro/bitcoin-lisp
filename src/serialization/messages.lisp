@@ -322,16 +322,27 @@ STOP-HASH is the hash to stop at (or zeros to get maximum blocks)."
 
 ;;;; Message parsing
 
+(defconstant +max-inv-count+ 50000
+  "Maximum entries in an inv/getdata message (Bitcoin Core MAX_INV_SZ). A peer
+that exceeds this is misbehaving; reject the whole message.")
+
+(defconstant +max-headers-count+ 2000
+  "Maximum headers in a headers message (Bitcoin Core MAX_HEADERS_RESULTS).")
+
 (defun parse-inv-payload (payload)
   "Parse an inv or getdata message payload into a list of inv-vectors."
   (flexi-streams:with-input-from-sequence (stream payload)
     (let ((count (read-compact-size stream)))
+      (when (> count +max-inv-count+)
+        (error "inv/getdata count ~D exceeds maximum ~D" count +max-inv-count+))
       (loop repeat count collect (read-inv-vector stream)))))
 
 (defun parse-headers-payload (payload)
   "Parse a headers message payload into a list of block headers."
   (flexi-streams:with-input-from-sequence (stream payload)
     (let ((count (read-compact-size stream)))
+      (when (> count +max-headers-count+)
+        (error "headers count ~D exceeds maximum ~D" count +max-headers-count+))
       (loop repeat count
             collect (prog1 (read-block-header stream)
                       ;; Headers message includes tx count (always 0) after each header
