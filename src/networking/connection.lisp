@@ -47,6 +47,41 @@ Returns a connection structure or NIL on failure."
       (declare (ignore e))
       nil)))
 
+(defun open-listener (bind port &key (backlog 16))
+  "Open a listening TCP server socket on BIND:PORT for inbound peers. Returns the
+usocket server socket, or NIL on failure (e.g. port already in use)."
+  (handler-case
+      (usocket:socket-listen bind port
+                             :element-type '(unsigned-byte 8)
+                             :reuse-address t
+                             :backlog backlog)
+    (error () nil)))
+
+(defun close-listener (server-socket)
+  "Close a listening server socket."
+  (when server-socket
+    (ignore-errors (usocket:socket-close server-socket))))
+
+(defun accept-connection (server-socket &key (timeout 1))
+  "Wait up to TIMEOUT seconds for an inbound connection on SERVER-SOCKET; on one,
+accept and wrap it in a connection. Returns the connection, or NIL on timeout or
+error. The timeout lets the accept loop poll a shutdown flag between waits."
+  (handler-case
+      (when (usocket:wait-for-input server-socket :timeout timeout :ready-only t)
+        (let ((client (usocket:socket-accept server-socket
+                                             :element-type '(unsigned-byte 8))))
+          (when client
+            (set-tcp-nodelay client)
+            (let ((host (handler-case
+                            (usocket:host-to-hostname (usocket:get-peer-address client))
+                          (error () "inbound"))))
+              (make-connection :socket client
+                               :host host
+                               :port 0
+                               :connected t
+                               :last-activity (get-universal-time))))))
+    (error () nil)))
+
 (defun close-connection (conn)
   "Close a connection."
   (when (connection-socket conn)

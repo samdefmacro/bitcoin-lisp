@@ -60,6 +60,10 @@
 (defvar *mainnet-relay-enabled* nil
   "Whether transaction relay is enabled on mainnet. Default NIL for safety.")
 
+(defconstant +max-inbound-peers+ 64
+  "Maximum number of inbound peers to keep (Bitcoin Core allows 125 by default;
+we cap lower). Excess inbound connections are disconnected at merge time.")
+
 ;;;; Node State
 
 (defstruct node
@@ -79,6 +83,13 @@
   (log-level :info :type keyword)
   (sync-thread nil :type (or null bt:thread))
   (syncing nil :type boolean)
+  ;; Inbound listening: server socket + accept thread, and a lock-guarded
+  ;; hand-off list. The listener thread pushes handshaked inbound peers onto
+  ;; pending-inbound-peers (under LOCK); the sync thread merges them into PEERS,
+  ;; keeping PEERS single-writer so the drain loop never races a push.
+  (listener-socket nil)
+  (listener-thread nil :type (or null bt:thread))
+  (pending-inbound-peers '() :type list)
   (lock (bt:make-lock "node-lock"))
   (known-addresses '() :type list)
   (max-peers 8 :type (unsigned-byte 8)))
@@ -239,6 +250,66 @@ For testnet, data stays at the base directory (backward compatible)."
                :data-directory data-path
                :log-level log-level)))
 
+;;;; Inbound listening
+
+(defun count-inbound-peers (node)
+  (count-if #'bitcoin-lisp.networking:peer-inbound (node-peers node)))
+
+(defun merge-inbound-peers (node)
+  "Move handshaked inbound peers from the lock-guarded hand-off list into the
+node's peer list (capped at +max-inbound-peers+; excess are disconnected). Called
+by the sync thread, so PEERS stays single-writer."
+  (let ((pending (bt:with-lock-held ((node-lock node))
+                   (prog1 (node-pending-inbound-peers node)
+                     (setf (node-pending-inbound-peers node) nil)))))
+    (dolist (peer pending)
+      (if (< (count-inbound-peers node) +max-inbound-peers+)
+          (push peer (node-peers node))
+          (progn
+            (log-info "Inbound peer cap reached; dropping ~A"
+                      (bitcoin-lisp.networking:peer-address peer))
+            (bitcoin-lisp.networking:disconnect-peer peer))))))
+
+(defun run-inbound-listener (node)
+  "Accept inbound connections, handshake each, and hand the ready peer to the
+sync thread via pending-inbound-peers. Runs until the node stops. The handshake
+runs inline (serial accept) with a short timeout, so a silent peer stalls the
+loop only briefly; a thread pool is a future refinement."
+  (loop while (node-running node)
+        do (handler-case
+               (let ((conn (bitcoin-lisp.networking:accept-connection
+                            (node-listener-socket node) :timeout 1)))
+                 (when conn
+                   (let ((peer (bitcoin-lisp.networking:make-inbound-peer
+                                conn (bitcoin-lisp.networking:connection-host conn))))
+                     (if (bitcoin-lisp.networking:perform-inbound-handshake peer)
+                         (progn
+                           (bitcoin-lisp.networking:send-post-handshake-messages peer)
+                           (bitcoin-lisp.networking:send-compact-block-negotiation peer)
+                           (bt:with-lock-held ((node-lock node))
+                             (push peer (node-pending-inbound-peers node)))
+                           (log-info "Inbound peer ~A (~A) handshake complete"
+                                     (bitcoin-lisp.networking:peer-address peer)
+                                     (bitcoin-lisp.networking:peer-user-agent peer)))
+                         (bitcoin-lisp.networking:disconnect-peer peer)))))
+             (error (c)
+               (log-debug "Inbound accept/handshake error: ~A" c)))))
+
+(defun start-inbound-listener (node bind)
+  "Open the listening socket and spawn the accept thread. No-op (logged) if the
+port can't be bound."
+  (let ((sock (bitcoin-lisp.networking:open-listener bind (network-port (node-network node)))))
+    (if (null sock)
+        (log-warn "Inbound listening disabled: could not bind ~A:~D"
+                  bind (network-port (node-network node)))
+        (progn
+          (setf (node-listener-socket node) sock)
+          (setf (node-listener-thread node)
+                (bt:make-thread (lambda () (run-inbound-listener node))
+                                :name "bitcoin-inbound-listener"))
+          (log-info "Listening for inbound peers on ~A:~D"
+                    bind (network-port (node-network node)))))))
+
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
                         (log-level :info)
@@ -251,7 +322,9 @@ For testnet, data stays at the base directory (backward compatible)."
                         (rpc-port nil)
                         (rpc-bind "127.0.0.1")
                         (rpc-user nil)
-                        (rpc-password nil))
+                        (rpc-password nil)
+                        (listen t)
+                        (listen-bind "0.0.0.0"))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -476,7 +549,8 @@ Returns the node instance."
                    ;; new tips via sendheaders (BIP 130); this 30s poll is the
                    ;; backstop for inv-only peers and missed announcements.
                    (loop while (node-running *node*)
-                         do (cond
+                         do (merge-inbound-peers *node*)
+                            (cond
                               ((>= (length (node-peers *node*)) 1)
                                (setf (node-syncing *node*) t)
                                (unwind-protect
@@ -491,6 +565,10 @@ Returns the node instance."
                                                  :timeout 30 :min-peers 1)))))
                (error () nil)))
            :name "bitcoin-sync-thread")))
+
+  ;; Inbound listening (depends on the sync thread to merge accepted peers).
+  (when (and sync listen)
+    (start-inbound-listener *node* listen-bind))
 
   (install-shutdown-handler)
   (log-info "Node started successfully")
@@ -717,6 +795,28 @@ flush (atomic temp+fsync+rename inside save-*)."
 
   ;; Signal the node to stop
   (setf (node-running *node*) nil)
+
+  ;; Stop the inbound listener: close the socket (unblocks accept) and let the
+  ;; accept thread observe node-running=nil and exit (its accept timeout is 1s).
+  (when (node-listener-socket *node*)
+    (bitcoin-lisp.networking:close-listener (node-listener-socket *node*))
+    (setf (node-listener-socket *node*) nil))
+  (when (and (node-listener-thread *node*)
+             (bt:thread-alive-p (node-listener-thread *node*)))
+    (let ((deadline (+ (get-internal-real-time) (* 5 internal-time-units-per-second))))
+      (loop while (and (bt:thread-alive-p (node-listener-thread *node*))
+                       (< (get-internal-real-time) deadline))
+            do (sleep 0.1))
+      (when (bt:thread-alive-p (node-listener-thread *node*))
+        (bt:destroy-thread (node-listener-thread *node*)))))
+  (setf (node-listener-thread *node*) nil)
+  ;; Disconnect any inbound peers not yet merged into the peer list. The listener
+  ;; thread is already joined above, but take the lock for consistency.
+  (let ((pending (bt:with-lock-held ((node-lock *node*))
+                   (prog1 (node-pending-inbound-peers *node*)
+                     (setf (node-pending-inbound-peers *node*) nil)))))
+    (dolist (peer pending)
+      (handler-case (bitcoin-lisp.networking:disconnect-peer peer) (error () nil))))
 
   ;; Wait for sync thread to finish (with timeout)
   (when (and (node-sync-thread *node*)
