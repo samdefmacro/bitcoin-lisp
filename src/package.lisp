@@ -657,10 +657,15 @@
    ;; Connection
    #:connection
    #:connection-connected
+   #:connection-host
    #:make-tcp-connection
    #:close-connection
    #:send-bytes
    #:receive-bytes
+   ;; Inbound listening
+   #:open-listener
+   #:close-listener
+   #:accept-connection
    ;; Peer
    #:peer
    #:make-peer
@@ -670,11 +675,14 @@
    #:peer-start-height
    #:peer-user-agent
    #:peer-ping-latency
+   #:peer-inbound
    #:connect-peer
    #:disconnect-peer
+   #:make-inbound-peer
    #:send-message
    #:receive-message
    #:perform-handshake
+   #:perform-inbound-handshake
    #:send-post-handshake-messages
    #:send-ping
    ;; Compact block peer state (BIP 152)

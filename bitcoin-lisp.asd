@@ -113,6 +113,8 @@
                              (:file "roundtrip-tests")
                              ;; Script SCRIPT_VERIFY flag-gating matrix
                              (:file "script-flag-tests")
+                             ;; Inbound listening + handshake
+                             (:file "inbound-listening-tests")
                              ;; Persistence, peer health, reorg tests
                              (:file "persistence-tests")
                              ;; RPC tests
