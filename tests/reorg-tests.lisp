@@ -484,3 +484,49 @@ reconsider-block clears the flags and reorgs back to the best valid chain."
          (bitcoin-lisp.validation:invalidate-block chain-state block-store utxo-set genesis-hash)
        (is (null ok)) (is (eq :cannot-invalidate-genesis reason)))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test precious-block
+  "preciousblock reorgs to a chosen block of >= the tip's work; equal-work
+competitors don't displace it (strict-> fork choice), and it can flip between
+equal-work forks."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "precious")
+     (let ((a-hashes (make-test-chain-hashes #xA0 1)))
+       (%build-and-connect chain-state block-store utxo-set genesis-hash a-hashes)
+       (let* ((a1-hash (first a-hashes))
+              (a1-entry (bitcoin-lisp.storage:get-block-index-entry chain-state a1-hash))
+              (genesis-entry (bitcoin-lisp.storage:get-block-index-entry chain-state genesis-hash))
+              (b1-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                         (setf (aref h 0) #xB0) (setf (aref h 1) 1) h))
+              (b1-block (make-reorg-test-block genesis-hash b1-hash 1)))
+         (is (equalp a1-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+         ;; Stand up an equal-work competing fork B1 (block + header-valid index
+         ;; entry, as header sync would in real operation).
+         (bitcoin-lisp.storage:store-block block-store b1-block)
+         (bitcoin-lisp.storage:add-block-index-entry
+          chain-state
+          (bitcoin-lisp.storage:make-block-index-entry
+           :hash b1-hash :height 1
+           :chain-work (bitcoin-lisp.storage:block-index-entry-chain-work a1-entry)
+           :status :header-valid
+           :header (bitcoin-lisp.serialization:bitcoin-block-header b1-block)
+           :prev-entry genesis-entry))
+         ;; precious the current tip -> no-op
+         (is (eq t (bitcoin-lisp.validation:precious-block chain-state block-store utxo-set a1-hash)))
+         (is (equalp a1-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+         ;; precious B1 -> reorg to the equal-work B1
+         (multiple-value-bind (ok reason)
+             (bitcoin-lisp.validation:precious-block chain-state block-store utxo-set b1-hash)
+           (is (eq t ok)) (is (null reason)))
+         (is (equalp b1-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+         ;; precious A1 -> flip back (both forks equal work)
+         (bitcoin-lisp.validation:precious-block chain-state block-store utxo-set a1-hash)
+         (is (equalp a1-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+         ;; unknown block -> error
+         (multiple-value-bind (ok reason)
+             (bitcoin-lisp.validation:precious-block
+              chain-state block-store utxo-set
+              (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xEE))
+           (is (null ok)) (is (eq :block-not-found reason)))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
