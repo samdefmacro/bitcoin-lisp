@@ -557,3 +557,55 @@ with exponentially increasing gaps."
     (when (chain-state-genesis-hash state)
       (pushnew (chain-state-genesis-hash state) locator :test 'equalp))
     (nreverse locator)))
+
+(defun entry-on-active-chain-p (state entry)
+  "T if ENTRY lies on the active chain — i.e. the active-chain block at ENTRY's
+height is ENTRY itself. Mirrors Bitcoin Core's CChain::Contains."
+  (let ((at-height (get-block-at-height state (block-index-entry-height entry))))
+    (and at-height
+         (equalp (block-index-entry-hash at-height)
+                 (block-index-entry-hash entry)))))
+
+(defun find-fork-in-active-chain (state locator-hashes)
+  "Return the block-index-entry for the highest active-chain block the peer
+claims to have — the highest active-chain entry whose hash is in LOCATOR-HASHES
+— or the genesis entry if none match. Mirrors Bitcoin Core's
+Chainstate::FindForkInGlobalIndex. Implemented as a single backward walk from
+the tip against a locator hash-set: O(tip - fork), independent of the locator
+length, rather than an O(height) active-chain probe per locator hash."
+  (let ((genesis (get-block-index-entry state (chain-state-genesis-hash state))))
+    (when (null locator-hashes)
+      (return-from find-fork-in-active-chain genesis))
+    (let ((want (make-hash-table :test 'equalp)))
+      (dolist (hash locator-hashes)
+        (setf (gethash hash want) t))
+      (loop with entry = (get-block-index-entry state (chain-state-best-block-hash state))
+            while entry
+            when (gethash (block-index-entry-hash entry) want)
+              do (return-from find-fork-in-active-chain entry)
+            do (setf entry (block-index-entry-prev-entry entry)))
+      genesis)))
+
+(defun active-chain-entries-from (state from-height limit)
+  "Return up to LIMIT block-index-entries on the active chain at consecutive
+heights starting at FROM-HEIGHT, in ascending-height order (empty when
+FROM-HEIGHT is above the tip). Answers getheaders/getblocks by replaying
+Bitcoin Core's forward ActiveChain().Next() walk, implemented as a single
+backward pass from the tip."
+  (let* ((tip (get-block-index-entry state (chain-state-best-block-hash state)))
+         (tip-height (and tip (block-index-entry-height tip))))
+    (when (or (null tip) (> from-height tip-height))
+      (return-from active-chain-entries-from nil))
+    ;; No forward (height->entry) index exists, so reach the window by walking
+    ;; back from the tip: first skip down to END-HEIGHT, then collect the
+    ;; [FROM-HEIGHT, END-HEIGHT] entries while continuing to descend — pushing
+    ;; each one yields the list in ascending-height order.
+    (let ((end-height (min tip-height (+ from-height (1- limit))))
+          (entry tip)
+          (entries '()))
+      (loop while (and entry (> (block-index-entry-height entry) end-height))
+            do (setf entry (block-index-entry-prev-entry entry)))
+      (loop while (and entry (>= (block-index-entry-height entry) from-height))
+            do (push entry entries)
+               (setf entry (block-index-entry-prev-entry entry)))
+      entries)))

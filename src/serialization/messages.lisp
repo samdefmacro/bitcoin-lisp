@@ -292,6 +292,18 @@ STOP-HASH is the hash to stop at (or zeros to get maximum blocks)."
                                                          :initial-element 0))))))
     (serialize-message "getheaders" payload)))
 
+(defun make-headers-message (headers)
+  "Create a headers message from a list of block headers.
+Each header is written as the 80-byte header followed by a compact-size 0
+transaction count — the on-wire format Bitcoin Core uses (a headers message
+serializes header-only CBlocks, which append nTx=0)."
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-compact-size stream (length headers))
+                   (dolist (header headers)
+                     (write-block-header stream header)
+                     (write-compact-size stream 0)))))
+    (serialize-message "headers" payload)))
+
 (defun make-getdata-message (inv-vectors)
   "Create a getdata message from a list of inv-vectors."
   (let ((payload (flexi-streams:with-output-to-sequence (stream)
@@ -332,6 +344,10 @@ that exceeds this is misbehaving; reject the whole message.")
 (defconstant +max-addr-count+ 1000
   "Maximum entries in an addr/addrv2 message (Bitcoin Core MAX_ADDR_TO_SEND).")
 
+(defconstant +max-locator-count+ 101
+  "Maximum block hashes in a getheaders/getblocks block locator (Bitcoin Core
+MAX_LOCATOR_SZ). A peer that exceeds this is misbehaving.")
+
 (defconstant +max-block-tx-count+ 50000
   "Upper bound on the number of transactions referenced by a single block in the
 compact-block / getblocktxn / blocktxn messages. A 4M-weight block holds at most
@@ -352,6 +368,18 @@ block while bounding the per-message allocation well below the compact-size cap.
             collect (prog1 (read-block-header stream)
                       ;; Headers message includes tx count (always 0) after each header
                       (read-compact-size stream))))))
+
+(defun parse-block-locator-payload (payload)
+  "Parse a getheaders or getblocks payload: a 4-byte protocol version, a
+bounded block-locator hash list (most-recent-first), and a 32-byte stop hash.
+Returns (VALUES locator-hashes stop-hash). A locator longer than
++max-locator-count+ signals an error (the caller disconnects the peer)."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (read-uint32-le stream)             ; protocol version (unused)
+    (let* ((count (read-bounded-count stream +max-locator-count+ "block locator"))
+           (hashes (loop repeat count collect (read-hash256 stream)))
+           (stop-hash (read-hash256 stream)))
+      (values hashes stop-hash))))
 
 (defun parse-block-payload (payload)
   "Parse a block message payload into a bitcoin-block.
