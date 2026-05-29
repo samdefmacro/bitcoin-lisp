@@ -107,6 +107,8 @@
                              (:file "package-tests")
                              ;; Mining / regtest tests
                              (:file "mining-tests")
+                             ;; Deserializer robustness / fuzz tests
+                             (:file "robustness-tests")
                              ;; Persistence, peer health, reorg tests
                              (:file "persistence-tests")
                              ;; RPC tests
