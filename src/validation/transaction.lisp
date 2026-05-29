@@ -413,8 +413,9 @@ FEE is returned as an integer (satoshis)."
              (direct-conflicts (bitcoin-lisp.mempool:find-rbf-conflicts mempool tx))
              (replaced-set nil))
 
-        ;; Policy: minimum relay fee rate
-        (when (< fee-rate +min-relay-fee-rate+)
+        ;; Policy: minimum relay fee rate (relay floor, or the higher rolling
+        ;; dynamic minimum when the mempool has been trimming).
+        (when (< fee-rate (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
           (return-from validate-transaction-for-mempool
             (values nil :insufficient-fee nil)))
 

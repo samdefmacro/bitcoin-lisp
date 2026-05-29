@@ -430,6 +430,25 @@ and recurse on newly-accepted txs so a parent can unblock a whole chain."
                        (when recent-rejects
                          (bitcoin-lisp:add-recent-reject recent-rejects otxid)))))))))))))
 
+(defun request-orphan-parents (peer tx utxo-set mempool)
+  "Send a getdata to PEER for TX's missing parents (inputs not in the UTXO set
+or the mempool), so an orphan can be resolved promptly."
+  (let ((seen (make-hash-table :test 'equalp))
+        (invs '()))
+    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+             (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
+             (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))
+        (unless (or (gethash ptxid seen)
+                    (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)
+                    (bitcoin-lisp.mempool:mempool-has mempool ptxid))
+          (setf (gethash ptxid seen) t)
+          (push (bitcoin-lisp.serialization:make-inv-vector
+                 :type bitcoin-lisp.serialization:+inv-type-tx+ :hash ptxid)
+                invs))))
+    (when invs
+      (send-message peer (bitcoin-lisp.serialization:make-getdata-message invs)))))
+
 (defun handle-tx (peer payload utxo-set mempool chain-state peers
                   &key recent-rejects)
   "Handle a tx message. Validate, add to mempool, and relay.
@@ -452,10 +471,12 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                 (unless valid
                   (cond
                     ;; Missing inputs => hold as an orphan (not a real reject);
-                    ;; a later parent will trigger re-evaluation.
+                    ;; a later parent will trigger re-evaluation. Request the
+                    ;; missing parents from this peer so they arrive sooner.
                     ((eq error :missing-input)
                      (bitcoin-lisp.mempool:orphan-add
-                      (bitcoin-lisp.mempool:mempool-orphan-pool mempool) tx peer))
+                      (bitcoin-lisp.mempool:mempool-orphan-pool mempool) tx peer)
+                     (request-orphan-parents peer tx utxo-set mempool))
                     (t
                      ;; Add to recent rejects filter
                      (bitcoin-lisp:add-recent-reject recent-rejects txid)

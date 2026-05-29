@@ -347,7 +347,7 @@
   (let ((mempool (rpc-get-mempool node)))
     (if mempool
         ;; Convert sat/vB to BTC/kvB: sat/vB * 1000 / 100000000
-        (let* ((min-fee-sat-vb (bitcoin-lisp.mempool:mempool-min-fee-rate mempool))
+        (let* ((min-fee-sat-vb (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
                (min-fee-btc-kvb (/ (* min-fee-sat-vb 1000) 100000000.0d0))
                (relay-fee-btc-kvb (/ (* bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 1000) 100000000.0d0)))
           `(("loaded" . t)
@@ -410,6 +410,45 @@
                                          deps))))
                  result)))))
          result)))))
+
+(defun rpc-testmempoolaccept (node params)
+  "Dry-run mempool acceptance for one or more raw transactions (hex). Returns an
+array of {txid, wtxid, allowed, reject-reason?, vsize, fees{base}} without adding
+anything to the mempool. Each tx is checked independently against current state
+(package interdependence is not modeled — that needs submitpackage)."
+  (let ((txs (first params))
+        (utxo-set (rpc-get-utxo-set node))
+        (mempool (rpc-get-mempool node))
+        (chain-state (rpc-get-chain-state node)))
+    (unless (listp txs)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "First parameter must be an array of tx hex"))
+    (let ((height (bitcoin-lisp.storage:current-height chain-state))
+          (results '()))
+      (dolist (hex-str txs (nreverse results))
+        (push
+         (handler-case
+             (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes hex-str))
+                    (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
+                          (bitcoin-lisp.serialization:read-transaction stream)))
+                    (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+               (multiple-value-bind (valid error fee)
+                   (bitcoin-lisp.validation:validate-transaction-for-mempool
+                    tx utxo-set mempool height)
+                 (if valid
+                     `(("txid" . ,(hash-to-hex txid))
+                       ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
+                       ("allowed" . t)
+                       ("vsize" . ,(bitcoin-lisp.serialization:transaction-vsize tx))
+                       ("fees" . (("base" . ,(/ (or fee 0) 100000000.0d0)))))
+                     `(("txid" . ,(hash-to-hex txid))
+                       ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
+                       ("allowed" . nil)
+                       ("reject-reason" . ,(string-downcase (symbol-name error)))))))
+           (error (e)
+             `(("allowed" . nil)
+               ("reject-reason" . ,(format nil "decode-failed: ~A" e)))))
+         results)))))
 
 (defun rpc-sendrawtransaction (node params)
   "Submit a raw transaction to the mempool."
