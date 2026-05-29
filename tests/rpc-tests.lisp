@@ -861,3 +861,30 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       ;; height 0 < testnet segwit activation -> not active
       (is (eq (>= 0 (bitcoin-lisp.validation:get-segwit-activation-height net))
               (cdr (assoc "active" segwit :test #'string=)))))))
+
+;;; --- Peer / address RPCs ---
+
+(test rpc-peer-address
+  (let ((node (make-test-node)))
+    ;; getnodeaddresses: seed the address book with one IPv4 entry
+    (let ((book (bitcoin-lisp.networking:make-address-book)))
+      (bitcoin-lisp.networking:address-book-add
+       book (bitcoin-lisp.networking:make-peer-address
+             :ip (bitcoin-lisp.networking::ipv4-to-mapped-ipv6 1 2 3 4)
+             :port 48333 :services 9 :last-seen 1700000000))
+      (setf (bitcoin-lisp::node-address-book node) book)
+      (let ((r (bitcoin-lisp.rpc::rpc-getnodeaddresses node (list 0))))  ; 0 = all
+        (is (= 1 (length r)))
+        (is (string= "1.2.3.4" (cdr (assoc "address" (first r) :test #'string=))))
+        (is (= 48333 (cdr (assoc "port" (first r) :test #'string=))))
+        (is (= 9 (cdr (assoc "services" (first r) :test #'string=))))))
+    ;; disconnectnode: a connected peer is disconnected by address
+    (let ((peer (bitcoin-lisp.networking:make-peer
+                 :connection (bitcoin-lisp.networking::make-connection
+                              :host "5.6.7.8" :port 48333 :connected t)
+                 :state :ready :address "5.6.7.8")))
+      (setf (bitcoin-lisp::node-peers node) (list peer))
+      (is (null (bitcoin-lisp.rpc::rpc-disconnectnode node (list "5.6.7.8"))))
+      (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+      ;; an unknown address errors
+      (signals error (bitcoin-lisp.rpc::rpc-disconnectnode node (list "9.9.9.9"))))))
