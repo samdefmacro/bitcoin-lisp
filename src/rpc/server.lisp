@@ -74,6 +74,9 @@
   ;; Peer / address methods
   (register-rpc-method "getnodeaddresses" #'rpc-getnodeaddresses)
   (register-rpc-method "disconnectnode" #'rpc-disconnectnode)
+  ;; Chain control methods
+  (register-rpc-method "invalidateblock" #'rpc-invalidateblock)
+  (register-rpc-method "reconsiderblock" #'rpc-reconsiderblock)
   (register-rpc-method "sendrawtransaction" #'rpc-sendrawtransaction)
   (register-rpc-method "testmempoolaccept" #'rpc-testmempoolaccept)
   (register-rpc-method "submitpackage" #'rpc-submitpackage)
