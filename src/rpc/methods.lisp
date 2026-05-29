@@ -640,6 +640,37 @@ for API compatibility but not enforced (matching sendrawtransaction here)."
           ,@(when replaced
               `(("replaced-transactions" . ,(mapcar #'hash-to-hex replaced)))))))))
 
+;;; --- Peer / address RPCs ---
+
+(defun rpc-getnodeaddresses (node params)
+  "Return known peer addresses from the address book (Bitcoin Core
+getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
+  (let* ((count (if (integerp (first params)) (first params) 1))
+         (book (bitcoin-lisp::node-address-book node))
+         (peers (and book (bitcoin-lisp.networking:address-book-sorted-peers book)))
+         (limited (if (plusp count) (subseq peers 0 (min count (length peers))) peers)))
+    (mapcar
+     (lambda (pa)
+       `(("time" . ,(bitcoin-lisp.networking:peer-address-last-seen pa))
+         ("services" . ,(bitcoin-lisp.networking:peer-address-services pa))
+         ("address" . ,(bitcoin-lisp.networking:ip-bytes-to-string
+                        (bitcoin-lisp.networking:peer-address-ip pa)))
+         ("port" . ,(bitcoin-lisp.networking:peer-address-port pa))))
+     limited)))
+
+(defun rpc-disconnectnode (node params)
+  "Disconnect a connected peer by ADDRESS (Bitcoin Core disconnectnode). Returns
+null on success; errors if no connected peer has that address."
+  (let ((address (first params)))
+    (unless (stringp address)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "address must be a string"))
+    (let ((target (find address (bitcoin-lisp::node-peers node)
+                        :key (lambda (p) (bitcoin-lisp::peer-address p)) :test #'string=)))
+      (unless target
+        (error 'rpc-error :code +rpc-misc-error+ :message "Node not found in connected peers"))
+      (bitcoin-lisp.networking:disconnect-peer target)
+      nil)))
+
 ;;; --- Node / chain info RPCs ---
 
 (defun rpc-getdifficulty (node params)
