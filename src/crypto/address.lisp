@@ -276,7 +276,9 @@ Returns (VALUES type script-pubkey witness-version witness-program) or NIL.
 TYPE is :p2pkh, :p2sh, :p2wpkh, :p2wsh, or :p2tr.
 SCRIPT-PUBKEY is the corresponding scriptPubKey bytes.
 NETWORK is :testnet3, :testnet4, :signet, or :mainnet."
-  (let ((expected-hrp (if (member network '(:testnet3 :testnet4 :signet)) "tb" "bc")))
+  (let ((expected-hrp (cond ((eq network :regtest) "bcrt")
+                            ((member network '(:testnet3 :testnet4 :signet)) "tb")
+                            (t "bc"))))
     ;; Try SegWit (Bech32/Bech32m) first
     (multiple-value-bind (hrp wit-ver wit-prog) (segwit-address-decode address)
       (when (and hrp (string= hrp expected-hrp))
@@ -316,8 +318,9 @@ NETWORK is :testnet3, :testnet4, :signet, or :mainnet."
     nil))
 
 (defun test-network-p (network)
-  "Return T if NETWORK is a test network (testnet3, testnet4, or signet)."
-  (member network '(:testnet3 :testnet4 :signet)))
+  "Return T if NETWORK is a test network (testnet3, testnet4, signet, or regtest).
+Regtest reuses testnet address versions (base58) like Bitcoin Core."
+  (member network '(:testnet3 :testnet4 :signet :regtest)))
 
 (defun encode-p2pkh-address (pubkey-hash network)
   "Encode a 20-byte pubkey hash as P2PKH address."

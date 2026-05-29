@@ -63,7 +63,8 @@
                                (:file "mempool")
                                (:file "fee-estimator")))
                  (:module "mining"
-                  :components ((:file "assembler")))
+                  :components ((:file "assembler")
+                               (:file "builder")))
                  (:module "networking"
                   :components ((:file "connection")
                                (:file "peer")
