@@ -1174,6 +1174,26 @@ handler. Shared by the block-download drain and the at-tip reap pass."
                        :fee-estimator fee-estimator
                        :recent-rejects recent-rejects))))
 
+(defun safely-dispatch-peer-message (peer command payload chain-state utxo-set
+                                     block-store ctx &key fee-estimator recent-rejects)
+  "Dispatch one already-read message from PEER, isolating failures: a
+malformed/oversized/unprocessable message raises an error that is caught here
+and disconnects only this peer (Bitcoin Core's misbehaving-peer posture), so one
+bad message can neither tear down the drain loop nor escape to the sync thread.
+Returns T if the peer is still connected afterward, NIL if it was disconnected."
+  (handler-case
+      (progn
+        (dispatch-ibd-message peer command payload chain-state utxo-set block-store ctx
+                              :fee-estimator fee-estimator
+                              :recent-rejects recent-rejects)
+        t)
+    (error (c)
+      (bitcoin-lisp:log-warn
+       "Peer ~A sent a malformed/unprocessable ~A message — disconnecting: ~A"
+       (peer-address peer) command c)
+      (handler-case (disconnect-peer peer) (error () nil))
+      nil)))
+
 (defun drain-and-reap-peer (peer chain-state utxo-set block-store ctx
                             &key fee-estimator recent-rejects)
   "Pump every currently-readable message from PEER, then reap it if its
@@ -1215,10 +1235,14 @@ disconnects it so replace-disconnected-peers can refill the slot."
               for (command payload) = (multiple-value-list
                                        (receive-message peer :timeout 5))
               while command
-              do (dispatch-ibd-message peer command payload chain-state
-                                       utxo-set block-store ctx
-                                       :fee-estimator fee-estimator
-                                       :recent-rejects recent-rejects))
+              ;; Per-message isolation: a malformed message disconnects only
+              ;; this peer (see safely-dispatch-peer-message); the next
+              ;; liveness check then ends the drain. The outer handler-case
+              ;; below remains the backstop for I/O errors from receive-message.
+              do (safely-dispatch-peer-message peer command payload chain-state
+                                               utxo-set block-store ctx
+                                               :fee-estimator fee-estimator
+                                               :recent-rejects recent-rejects))
       ((or stream-error usocket:socket-condition end-of-file) (c)
         (bitcoin-lisp:log-warn
          "Peer ~A I/O error during message drain — disconnecting: ~A"
