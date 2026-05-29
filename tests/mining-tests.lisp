@@ -153,3 +153,98 @@ Returns the txid."
           (is (string= "regtest" (cdr (assoc "chain" r :test #'string=))))
           (is (= 0 (cdr (assoc "pooledtx" r :test #'string=))))
           (is (stringp (cdr (assoc "bits" r :test #'string=)))))))))
+
+;;;; Block construction + CPU mining + submitblock (regtest, disk-backed)
+
+(defmacro %with-regtest (&body body)
+  "Bind *network* and the active PoW limit to regtest for BODY."
+  `(let ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp.storage:*pow-limit-target*
+           bitcoin-lisp.storage:+regtest-pow-limit-target+))
+     ,@body))
+
+(defun %regtest-node-fixture (suffix)
+  "(values node) — a regtest node at genesis with disk-backed chain-state /
+block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
+  (let* ((base (ensure-directories-exist
+                (merge-pathnames (format nil "test-regtest-mine-~A/" suffix)
+                                 (uiop:temporary-directory))))
+         (cs (bitcoin-lisp.storage:init-chain-state base :network :regtest))
+         (store (bitcoin-lisp.storage:init-block-store base))
+         (ghash (bitcoin-lisp.storage:best-block-hash cs))
+         (ghdr (bitcoin-lisp::make-genesis-header :regtest))
+         (node (bitcoin-lisp::make-node :network :regtest)))
+    (clrhash bitcoin-lisp.validation::*block-undo-data*)
+    (bitcoin-lisp.storage:add-block-index-entry
+     cs (bitcoin-lisp.storage:make-block-index-entry
+         :hash ghash :height 0 :chain-work 1 :status :valid :header ghdr))
+    (setf (bitcoin-lisp::node-chain-state node) cs
+          (bitcoin-lisp::node-utxo-set node) (bitcoin-lisp.storage:make-utxo-set)
+          (bitcoin-lisp::node-block-store node) store
+          (bitcoin-lisp::node-mempool node) (bitcoin-lisp.mempool:make-mempool))
+    node))
+
+(test build-coinbase-transaction-shape
+  (%with-regtest
+   (let* ((spk (%p2sh-optrue-spk))
+          (commit (bitcoin-lisp.mining:build-witness-commitment-script (%zeros 32)))
+          (cb (bitcoin-lisp.mining:build-coinbase-transaction
+               1 5000000000 :script-pubkey spk :witness-commitment-script commit)))
+     ;; one input, null prevout, BIP34 height-1 (OP_1) scriptSig >= 2 bytes
+     (let ((in (first (bitcoin-lisp.serialization:transaction-inputs cb))))
+       (is-true (bitcoin-lisp.serialization:coinbase-input-p in))
+       (is (>= (length (bitcoin-lisp.serialization:tx-in-script-sig in)) 2))
+       (is (= #x51 (aref (bitcoin-lisp.serialization:tx-in-script-sig in) 0))))
+     ;; payout + commitment outputs
+     (is (= 2 (length (bitcoin-lisp.serialization:transaction-outputs cb))))
+     (is (= 5000000000 (bitcoin-lisp.serialization:tx-out-value
+                        (first (bitcoin-lisp.serialization:transaction-outputs cb)))))
+     ;; reserved witness value present (so it serializes as a segwit tx)
+     (is-true (bitcoin-lisp.serialization:transaction-has-witness-p cb)))))
+
+(test mine-block-satisfies-pow
+  (%with-regtest
+   (let ((node (%regtest-node-fixture "mine")))
+     (let ((block (bitcoin-lisp.mining:assemble-full-block
+                   (bitcoin-lisp::node-chain-state node)
+                   (bitcoin-lisp::node-mempool node)
+                   :coinbase-script-pubkey (%p2sh-optrue-spk))))
+       (is-true (bitcoin-lisp.mining:mine-block block))
+       (is-true (bitcoin-lisp.validation:check-proof-of-work
+                 (bitcoin-lisp.serialization:bitcoin-block-header block)))))))
+
+(test submitblock-round-trip
+  ;; Build + mine a regtest block at the genesis tip, serialize it, submit the
+  ;; hex via the RPC — accepted (null), tip advances, resubmit → "duplicate".
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "submit"))
+          (block (bitcoin-lisp.mining:assemble-full-block
+                  (bitcoin-lisp::node-chain-state node)
+                  (bitcoin-lisp::node-mempool node)
+                  :coinbase-script-pubkey (%p2sh-optrue-spk))))
+     (bitcoin-lisp.mining:mine-block block)
+     (let ((hex (bitcoin-lisp.crypto:bytes-to-hex
+                 (bitcoin-lisp.serialization:serialize-witness-block block))))
+       ;; accepted → null
+       (is (null (bitcoin-lisp.rpc::rpc-submitblock node (list hex))))
+       (is (= 1 (bitcoin-lisp.storage:current-height
+                 (bitcoin-lisp::node-chain-state node))))
+       ;; resubmit the same block → duplicate
+       (is (string= "duplicate" (bitcoin-lisp.rpc::rpc-submitblock node (list hex))))))))
+
+(test generatetoaddress-advances-chain
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "gen"))
+          (addr (bitcoin-lisp.crypto:encode-p2pkh-address
+                 (make-array 20 :element-type '(unsigned-byte 8) :initial-element 3)
+                 :regtest))
+          (hashes (bitcoin-lisp.rpc::rpc-generatetoaddress node (list 3 addr))))
+     (is (= 3 (length hashes)))
+     (is (every #'stringp hashes))
+     (is (= 3 (bitcoin-lisp.storage:current-height
+               (bitcoin-lisp::node-chain-state node))))
+     ;; the tip is the last generated hash
+     (is (string= (car (last hashes))
+                  (bitcoin-lisp.rpc::hash-to-hex
+                   (bitcoin-lisp.storage:best-block-hash
+                    (bitcoin-lisp::node-chain-state node))))))))
