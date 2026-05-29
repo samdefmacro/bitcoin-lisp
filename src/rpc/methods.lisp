@@ -640,6 +640,67 @@ for API compatibility but not enforced (matching sendrawtransaction here)."
           ,@(when replaced
               `(("replaced-transactions" . ,(mapcar #'hash-to-hex replaced)))))))))
 
+;;; --- Node / chain info RPCs ---
+
+(defun rpc-getdifficulty (node params)
+  "Return the proof-of-work difficulty of the current best block (Bitcoin Core
+getdifficulty)."
+  (declare (ignore params))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (tip (bitcoin-lisp.storage:get-block-index-entry
+               chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+         (bits (if (and tip (bitcoin-lisp.storage:block-index-entry-header tip))
+                   (bitcoin-lisp.serialization:block-header-bits
+                    (bitcoin-lisp.storage:block-index-entry-header tip))
+                   #x1d00ffff)))
+    (%difficulty-from-bits bits)))
+
+(defun rpc-uptime (node params)
+  "Seconds the node has been running (Bitcoin Core uptime)."
+  (declare (ignore node params))
+  (if bitcoin-lisp::*node-start-time*
+      (max 0 (- (bitcoin-lisp.serialization:get-unix-time) bitcoin-lisp::*node-start-time*))
+      0))
+
+(defun rpc-getindexinfo (node params)
+  "Report the status of optional indexes (Bitcoin Core getindexinfo). Currently
+just txindex, when enabled."
+  (declare (ignore params))
+  (let ((tx-index (rpc-get-tx-index node))
+        (height (bitcoin-lisp.storage:current-height (rpc-get-chain-state node))))
+    (if (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
+        ;; The txindex is maintained inline as blocks connect, so it tracks the
+        ;; tip: report synced at the current best height.
+        `(("txindex" . (("synced" . t) ("best_block_height" . ,height))))
+        ;; No active indexes -> empty JSON object.
+        (make-hash-table :test 'equal))))
+
+(defun %buried-deployment (active-height tip-height)
+  "A buried-softfork deployment object: active once TIP-HEIGHT reaches
+ACTIVE-HEIGHT."
+  `(("type" . "buried")
+    ("active" . ,(>= tip-height active-height))
+    ("height" . ,active-height)))
+
+(defun rpc-getdeploymentinfo (node params)
+  "Report soft-fork deployment status at the tip (Bitcoin Core getdeploymentinfo).
+Reports the buried deployments (bip34/bip66/bip65/csv/segwit/taproot) using this
+node's per-network activation heights."
+  (declare (ignore params))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (network (bitcoin-lisp::node-network node))
+         (height (bitcoin-lisp.storage:current-height chain-state))
+         (best-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+    `(("hash" . ,(if best-hash (hash-to-hex best-hash) ""))
+      ("height" . ,height)
+      ("deployments"
+       . (("bip34" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip34-activation-height network) height))
+          ("bip66" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip66-activation-height network) height))
+          ("bip65" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip65-activation-height network) height))
+          ("csv" . ,(%buried-deployment (bitcoin-lisp.validation:get-csv-activation-height network) height))
+          ("segwit" . ,(%buried-deployment (bitcoin-lisp.validation:get-segwit-activation-height network) height))
+          ("taproot" . ,(%buried-deployment (bitcoin-lisp.validation:get-taproot-activation-height network) height)))))))
+
 ;;; --- Mining RPCs ---
 
 (defun %bits-to-target-hex (bits)
