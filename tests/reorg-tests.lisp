@@ -447,3 +447,40 @@ activate-block returns :unknown-parent without doing anything."
         ;; Chain unchanged.
         (is (= 1 (bitcoin-lisp.storage:current-height chain-state)))))
     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test invalidate-and-reconsider-block
+  "invalidate-block marks a block + descendants invalid and reorgs to its parent;
+reconsider-block clears the flags and reorgs back to the best valid chain."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "invalidate")
+     ;; genesis -> A1 -> A2 -> A3
+     (let ((hashes (make-test-chain-hashes #xA0 3)))
+       (%build-and-connect chain-state block-store utxo-set genesis-hash hashes)
+       (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+       (let ((a2-hash (second hashes)))
+         ;; invalidate A2 -> chain reorgs back to A1 (height 1); A2 + A3 invalid
+         (multiple-value-bind (ok reason)
+             (bitcoin-lisp.validation:invalidate-block
+              chain-state block-store utxo-set a2-hash)
+           (is (eq t ok))
+           (is (null reason)))
+         (is (= 1 (bitcoin-lisp.storage:current-height chain-state)))
+         (is (eq :invalid (bitcoin-lisp.storage:block-index-entry-status
+                           (bitcoin-lisp.storage:get-block-index-entry chain-state a2-hash))))
+         (is (eq :invalid (bitcoin-lisp.storage:block-index-entry-status
+                           (bitcoin-lisp.storage:get-block-index-entry chain-state (third hashes)))))
+         ;; reconsider A2 -> chain reorgs forward to A3 (height 3) again
+         (multiple-value-bind (ok reason)
+             (bitcoin-lisp.validation:reconsider-block
+              chain-state block-store utxo-set a2-hash)
+           (is (eq t ok))
+           (is (null reason)))
+         (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+         (is (not (eq :invalid (bitcoin-lisp.storage:block-index-entry-status
+                                (bitcoin-lisp.storage:get-block-index-entry chain-state a2-hash)))))))
+     ;; invalidating genesis is refused; unknown hash too
+     (multiple-value-bind (ok reason)
+         (bitcoin-lisp.validation:invalidate-block chain-state block-store utxo-set genesis-hash)
+       (is (null ok)) (is (eq :cannot-invalidate-genesis reason)))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))

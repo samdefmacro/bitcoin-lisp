@@ -640,6 +640,41 @@ for API compatibility but not enforced (matching sendrawtransaction here)."
           ,@(when replaced
               `(("replaced-transactions" . ,(mapcar #'hash-to-hex replaced)))))))))
 
+;;; --- Chain control RPCs ---
+
+(defun %chain-control-block (node params op)
+  "Shared driver for invalidateblock/reconsiderblock: resolve the blockhash param
+and invoke OP (invalidate-block or reconsider-block) with the node's chain
+context. Returns null on success; errors otherwise."
+  (let ((hash-hex (first params)))
+    (unless (stringp hash-hex)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash must be a hex string"))
+    (let ((hash (parse-hex-hash hash-hex)))
+      (unless hash
+        (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid block hash"))
+      (multiple-value-bind (ok reason)
+          (funcall op
+                   (rpc-get-chain-state node)
+                   (rpc-get-block-store node)
+                   (rpc-get-utxo-set node)
+                   hash
+                   :mempool (rpc-get-mempool node)
+                   :tx-index (rpc-get-tx-index node))
+        (unless ok
+          (error 'rpc-error :code +rpc-misc-error+
+                            :message (string-downcase (symbol-name reason))))
+        nil))))
+
+(defun rpc-invalidateblock (node params)
+  "Mark a block (and its descendants) invalid and reorg the active chain away from
+it (Bitcoin Core invalidateblock). PARAMS: (blockhash). Returns null."
+  (%chain-control-block node params #'bitcoin-lisp.validation:invalidate-block))
+
+(defun rpc-reconsiderblock (node params)
+  "Clear a previously-invalidated block's status and reconsider the best chain
+(Bitcoin Core reconsiderblock). PARAMS: (blockhash). Returns null."
+  (%chain-control-block node params #'bitcoin-lisp.validation:reconsider-block))
+
 ;;; --- Peer / address RPCs ---
 
 (defun rpc-getnodeaddresses (node params)
