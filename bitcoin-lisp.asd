@@ -109,6 +109,8 @@
                              (:file "mining-tests")
                              ;; Deserializer robustness / fuzz tests
                              (:file "robustness-tests")
+                             ;; Serialize<->deserialize round-trip property tests
+                             (:file "roundtrip-tests")
                              ;; Persistence, peer health, reorg tests
                              (:file "persistence-tests")
                              ;; RPC tests
