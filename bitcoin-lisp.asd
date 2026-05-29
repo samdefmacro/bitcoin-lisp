@@ -111,6 +111,8 @@
                              (:file "robustness-tests")
                              ;; Serialize<->deserialize round-trip property tests
                              (:file "roundtrip-tests")
+                             ;; Script SCRIPT_VERIFY flag-gating matrix
+                             (:file "script-flag-tests")
                              ;; Persistence, peer health, reorg tests
                              (:file "persistence-tests")
                              ;; RPC tests
