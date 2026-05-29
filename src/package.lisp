@@ -605,7 +605,35 @@
    #:+bip34-activation-height-testnet3+
    #:+bip34-activation-height-mainnet+
    #:+bip66-activation-height-testnet3+
-   #:+bip66-activation-height-mainnet+))
+   #:+bip66-activation-height-mainnet+
+   ;; Coinbase / subsidy (for the block assembler)
+   #:calculate-block-subsidy
+   #:encode-bip34-height))
+
+(defpackage #:bitcoin-lisp.mining
+  (:use #:cl)
+  (:export
+   #:assemble-block-template
+   #:next-block-required-bits
+   #:build-witness-commitment-script
+   #:*last-block-template*
+   ;; block-template struct + accessors
+   #:block-template
+   #:block-template-height
+   #:block-template-prev-hash
+   #:block-template-bits
+   #:block-template-version
+   #:block-template-curtime
+   #:block-template-mintime
+   #:block-template-transactions
+   #:block-template-total-fees
+   #:block-template-total-weight
+   #:block-template-total-sigops
+   #:block-template-coinbase-value
+   #:block-template-witness-commitment
+   #:block-template-default-witness-commitment-script
+   ;; constants
+   #:+block-reserved-weight+))
 
 (defpackage #:bitcoin-lisp.networking
   (:use #:cl)

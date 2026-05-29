@@ -62,6 +62,8 @@
                   :components ((:file "orphan")
                                (:file "mempool")
                                (:file "fee-estimator")))
+                 (:module "mining"
+                  :components ((:file "assembler")))
                  (:module "networking"
                   :components ((:file "connection")
                                (:file "peer")
