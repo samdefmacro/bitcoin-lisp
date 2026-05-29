@@ -16,8 +16,10 @@
 (defconstant +signet+ :signet)
 (defconstant +mainnet+ :mainnet)
 
+(defconstant +regtest+ :regtest)
+
 (defvar *network* +testnet4+
-  "Current network mode (:testnet3, :testnet4, :signet, or :mainnet).")
+  "Current network mode (:testnet3, :testnet4, :signet, :regtest, or :mainnet).")
 
 (defun network-magic (network)
   "Return the network magic bytes for NETWORK."
@@ -25,6 +27,7 @@
     (:testnet3 bitcoin-lisp.serialization:+testnet3-magic+)
     (:testnet4 bitcoin-lisp.serialization:+testnet4-magic+)
     (:signet bitcoin-lisp.serialization:+signet-magic+)
+    (:regtest bitcoin-lisp.serialization:+regtest-magic+)
     (:mainnet bitcoin-lisp.serialization:+mainnet-magic+)))
 
 (defun network-port (network)
@@ -33,6 +36,7 @@
     (:testnet3 18333)
     (:testnet4 48333)
     (:signet 38333)
+    (:regtest 18444)
     (:mainnet 8333)))
 
 (defun network-dns-seeds (network)
@@ -41,6 +45,7 @@
     (:testnet3 bitcoin-lisp.networking:*testnet3-dns-seeds*)
     (:testnet4 bitcoin-lisp.networking:*testnet4-dns-seeds*)
     (:signet bitcoin-lisp.networking:*signet-dns-seeds*)
+    (:regtest bitcoin-lisp.networking:*regtest-dns-seeds*)
     (:mainnet bitcoin-lisp.networking:*mainnet-dns-seeds*)))
 
 (defun network-rpc-port (network)
@@ -49,6 +54,7 @@
     (:testnet3 18332)
     (:testnet4 48332)
     (:signet 38332)
+    (:regtest 18443)
     (:mainnet 8332)))
 
 (defvar *mainnet-relay-enabled* nil
@@ -178,6 +184,11 @@ LEVEL can be :debug, :info, :warn, or :error."
         :version 1 :prev-block prev-block
         :merkle-root (copy-seq *genesis-merkle-root*)
         :timestamp 1598918400 :bits #x1e0377ae :nonce 52613770))
+      (:regtest
+       (bitcoin-lisp.serialization:make-block-header
+        :version 1 :prev-block prev-block
+        :merkle-root (copy-seq *genesis-merkle-root*)
+        :timestamp 1296688602 :bits #x207fffff :nonce 2))
       (:mainnet
        (bitcoin-lisp.serialization:make-block-header
         :version 1 :prev-block prev-block
@@ -191,11 +202,18 @@ LEVEL can be :debug, :info, :warn, or :error."
 For mainnet, data is stored in a 'mainnet' subdirectory.
 For testnet, data stays at the base directory (backward compatible)."
   ;; Validate network parameter
-  (unless (member network '(:testnet3 :testnet4 :signet :mainnet))
-    (error "Invalid network: ~A. Must be :testnet3, :testnet4, :signet, or :mainnet." network))
+  (unless (member network '(:testnet3 :testnet4 :signet :regtest :mainnet))
+    (error "Invalid network: ~A. Must be :testnet3, :testnet4, :signet, :regtest, or :mainnet." network))
 
   ;; Set global network variable
   (setf *network* network)
+
+  ;; Network-aware PoW limit: regtest's trivial limit, the standard limit
+  ;; otherwise. derive-target / check-proof-of-work reject targets above it.
+  (setf bitcoin-lisp.storage:*pow-limit-target*
+        (if (eq network :regtest)
+            bitcoin-lisp.storage:+regtest-pow-limit-target+
+            bitcoin-lisp.storage:+pow-limit-target+))
 
   ;; Calculate data path - each network uses its own subdirectory
   (let* ((base-path (pathname data-directory))
@@ -203,6 +221,7 @@ For testnet, data stays at the base directory (backward compatible)."
                       (:testnet3 base-path)
                       (:testnet4 (merge-pathnames "testnet4/" base-path))
                       (:signet (merge-pathnames "signet/" base-path))
+                      (:regtest (merge-pathnames "regtest/" base-path))
                       (:mainnet (merge-pathnames "mainnet/" base-path)))))
     ;; Ensure data directory exists
     (ensure-directories-exist (merge-pathnames "dummy" data-path))

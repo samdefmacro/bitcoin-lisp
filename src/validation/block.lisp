@@ -169,21 +169,21 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
   "Return the BIP 66 (DERSIG) activation height for NETWORK."
   (ecase network
     (:testnet3 +bip66-activation-height-testnet3+)
-    ((:testnet4 :signet) 1)
+    ((:testnet4 :signet :regtest) 1)
     (:mainnet +bip66-activation-height-mainnet+)))
 
 (defun get-bip65-activation-height (network)
   "Return the BIP 65 (CLTV) activation height for NETWORK."
   (ecase network
     (:testnet3 +bip65-activation-height-testnet3+)
-    ((:testnet4 :signet) 1)
+    ((:testnet4 :signet :regtest) 1)
     (:mainnet +bip65-activation-height-mainnet+)))
 
 (defun get-csv-activation-height (network)
   "Return the BIP 68/112/113 (CSV) activation height for NETWORK."
   (ecase network
     (:testnet3 +csv-activation-height-testnet3+)
-    ((:testnet4 :signet) 1)
+    ((:testnet4 :signet :regtest) 1)
     (:mainnet +csv-activation-height-mainnet+)))
 
 (defun get-taproot-activation-height (network)
@@ -191,6 +191,8 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
   (ecase network
     (:testnet3 +taproot-activation-height-testnet3+)
     ((:testnet4 :signet) 1)
+    ;; Regtest activates Taproot from genesis (Core ALWAYS_ACTIVE).
+    (:regtest 0)
     (:mainnet +taproot-activation-height-mainnet+)))
 
 (defun get-segwit-activation-height (network)
@@ -198,6 +200,8 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
   (ecase network
     (:testnet3 +segwit-activation-height-testnet3+)
     ((:testnet4 :signet) 1)
+    ;; Regtest activates SegWit from genesis (Core SegwitHeight = 0).
+    (:regtest 0)
     (:mainnet +segwit-activation-height-mainnet+)))
 
 ;;; Policy vs Consensus Flag Separation
@@ -310,6 +314,13 @@ and testnet min-difficulty exception."
       ;; Genesis block or no previous entry
       ((or (zerop height) (null prev-entry))
        bitcoin-lisp.storage:+pow-limit-bits+)
+
+      ;; Regtest never retargets (Bitcoin Core fPowNoRetargeting): every block
+      ;; inherits the previous block's bits, so difficulty stays at the trivial
+      ;; regtest pow-limit. Checked before the boundary case to skip retargeting.
+      ((eq bitcoin-lisp:*network* :regtest)
+       (bitcoin-lisp.serialization:block-header-bits
+        (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
 
       ;; Retarget boundary (height is a multiple of 2016)
       ((zerop (mod height interval))
@@ -716,7 +727,7 @@ rejected, and the no-commitment+witness case is :unexpected-witness
   "Return the BIP 34 activation height for NETWORK."
   (ecase network
     (:testnet3 +bip34-activation-height-testnet3+)
-    ((:testnet4 :signet) 1)
+    ((:testnet4 :signet :regtest) 1)
     (:mainnet +bip34-activation-height-mainnet+)))
 
 (defconstant +bip34-implies-bip30-limit+ 1983702

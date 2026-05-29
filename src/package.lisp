@@ -170,6 +170,7 @@
    #:+testnet3-magic+
    #:+testnet4-magic+
    #:+signet-magic+
+   #:+regtest-magic+
    #:+mainnet-magic+
    ;; Service bit constants
    #:+node-network+
@@ -331,6 +332,10 @@
    #:+difficulty-adjustment-interval+
    #:+pow-target-timespan+
    #:+pow-limit-bits+
+   #:+pow-limit-target+
+   #:+regtest-pow-limit-bits+
+   #:+regtest-pow-limit-target+
+   #:*pow-limit-target*
    #:save-state
    #:load-state
    #:chain-state-pruned-height
@@ -725,6 +730,7 @@
    #:*testnet4-dns-seeds*
    #:*testnet4-fixed-seeds*
    #:*signet-dns-seeds*
+   #:*regtest-dns-seeds*
    #:*mainnet-dns-seeds*
    ;; Checkpoints
    #:*testnet3-checkpoints*
