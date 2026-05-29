@@ -43,12 +43,19 @@
   (bitcoin-lisp.crypto:hex-to-bytes
    "6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000"))
 
+;;; Regtest genesis block hash (little-endian). Big-endian display:
+;;; 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
+(defvar *regtest-genesis-hash*
+  (bitcoin-lisp.crypto:hex-to-bytes
+   "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f"))
+
 (defun network-genesis-hash (network)
   "Return the genesis block hash for NETWORK."
   (ecase network
     (:testnet3 \*testnet3-genesis-hash*)
     (:testnet4 *testnet4-genesis-hash*)
     (:signet *signet-genesis-hash*)
+    (:regtest *regtest-genesis-hash*)
     (:mainnet *mainnet-genesis-hash*)))
 
 (defun init-chain-state (base-path &key genesis-hash network)
@@ -108,6 +115,11 @@ NETWORK defaults to bitcoin-lisp:*network* if not specified."
   "Minimum difficulty (maximum target) in compact bits format.
 Same for mainnet and testnet.")
 
+(defconstant +regtest-pow-limit-bits+ #x207fffff
+  "Regtest minimum difficulty (Bitcoin Core CRegTestParams powLimit). Trivial:
+the target is ~2^255, so a single hash usually satisfies it — blocks are
+CPU-mined on demand.")
+
 ;;; Chain work calculations
 ;;; Note: +pow-limit-target+ is defined after bits-to-target below.
 
@@ -126,6 +138,15 @@ nWord >>= 8*(3-nSize)); real difficulty values always have exponent > 3."
 (defvar +pow-limit-target+ (bits-to-target +pow-limit-bits+)
   "The full 256-bit PoW limit target (precomputed from +pow-limit-bits+).")
 
+(defvar +regtest-pow-limit-target+ (bits-to-target +regtest-pow-limit-bits+)
+  "The full 256-bit regtest PoW limit target.")
+
+(defvar *pow-limit-target* +pow-limit-target+
+  "The active PoW limit target — the maximum target a block's nBits may decode
+to. Defaults to the standard limit; init-node raises it to
++regtest-pow-limit-target+ on regtest. derive-target rejects any target above
+this, so it must be network-aware.")
+
 (defun derive-target (bits)
   "Decode nBits to a target, returning NIL if it is out of range — i.e.
 negative (the 0x00800000 sign bit set on a non-zero mantissa), zero,
@@ -139,7 +160,7 @@ DeriveTarget + arith_uint256::SetCompact (pow.cpp:146-159)."
                             (and (> word #xff) (> size 33))
                             (and (> word #xffff) (> size 32)))))
          (target (bits-to-target bits)))
-    (if (or negative (zerop target) overflow (> target +pow-limit-target+))
+    (if (or negative (zerop target) overflow (> target *pow-limit-target*))
         nil
         target)))
 

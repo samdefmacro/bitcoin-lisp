@@ -129,6 +129,9 @@ nodes_testnet4.txt source).")
     "seed.bitcoinstats.com"
     "seed.bitcoin.jonasschnelli.ch"))
 
+(defvar *regtest-dns-seeds* '()
+  "Regtest has no DNS seeds — it is an isolated local chain with no peers.")
+
 (defvar *dns-seeds* *testnet4-dns-seeds*)
 
 ;;; Peer connection
