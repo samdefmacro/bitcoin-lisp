@@ -766,3 +766,19 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       ;; full result serializes cleanly.
       (let ((response (bitcoin-lisp.rpc::make-rpc-response tips "id")))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
+
+(test rpc-testmempoolaccept-missing-input
+  "testmempoolaccept dry-runs validation without mutating the mempool."
+  (let* ((node (make-test-node))
+         (tx (make-mempool-test-tx :input-id 210))
+         (hex (bitcoin-lisp.crypto:bytes-to-hex
+               (bitcoin-lisp.serialization:serialize-transaction tx)))
+         (result (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list hex)))))
+    (is (listp result))
+    (is (= 1 (length result)))
+    (let ((r (first result)))
+      ;; Empty UTXO set => missing input => not allowed, with a reason.
+      (is (null (cdr (assoc "allowed" r :test #'string=))))
+      (is (string= "missing-input" (cdr (assoc "reject-reason" r :test #'string=)))))
+    ;; Nothing was added to the mempool.
+    (is (= 0 (bitcoin-lisp.mempool:mempool-count (bitcoin-lisp::node-mempool node))))))
