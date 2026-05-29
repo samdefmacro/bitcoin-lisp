@@ -499,6 +499,7 @@
    #:*mempool-full-rbf*
    #:mempool-has
    #:mempool-get
+   #:mempool-spending-tx
    #:mempool-add
    #:mempool-remove
    #:mempool-count
