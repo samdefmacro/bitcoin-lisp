@@ -71,6 +71,9 @@
   (register-rpc-method "uptime" #'rpc-uptime)
   (register-rpc-method "getindexinfo" #'rpc-getindexinfo)
   (register-rpc-method "getdeploymentinfo" #'rpc-getdeploymentinfo)
+  ;; Peer / address methods
+  (register-rpc-method "getnodeaddresses" #'rpc-getnodeaddresses)
+  (register-rpc-method "disconnectnode" #'rpc-disconnectnode)
   (register-rpc-method "sendrawtransaction" #'rpc-sendrawtransaction)
   (register-rpc-method "testmempoolaccept" #'rpc-testmempoolaccept)
   (register-rpc-method "submitpackage" #'rpc-submitpackage)
