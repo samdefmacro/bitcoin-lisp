@@ -581,6 +581,8 @@
    #:activate-block
    #:find-fork-point
    #:perform-reorg
+   #:invalidate-block
+   #:reconsider-block
    #:decode-coinbase-height
    #:get-bip34-activation-height
    #:get-bip66-activation-height

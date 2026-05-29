@@ -888,3 +888,15 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
       ;; an unknown address errors
       (signals error (bitcoin-lisp.rpc::rpc-disconnectnode node (list "9.9.9.9"))))))
+
+;;; --- Chain control RPCs (error paths; full reorg behavior in reorg-tests) ---
+
+(test rpc-chain-control-errors
+  (let ((node (make-test-node)))
+    ;; a well-formed but unknown block hash -> error
+    (signals error
+      (bitcoin-lisp.rpc::rpc-invalidateblock
+       node (list "00000000000000000000000000000000000000000000000000000000deadbeef")))
+    ;; a malformed hash -> error
+    (signals error
+      (bitcoin-lisp.rpc::rpc-reconsiderblock node (list "not-a-hash")))))
