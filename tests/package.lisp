@@ -29,6 +29,10 @@
   :description "Tests for mempool operations"
   :in :bitcoin-lisp-tests)
 
+(def-suite :package-tests
+  :description "Tests for package relay (submitpackage)"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :persistence-tests
   :description "Tests for persistence, peer health, reorg operations"
   :in :bitcoin-lisp-tests)

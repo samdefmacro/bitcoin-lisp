@@ -56,6 +56,7 @@
                  (:module "validation"
                   :components ((:file "script")
                                (:file "transaction")
+                               (:file "packages")
                                (:file "block")))
                  (:module "mempool"
                   :components ((:file "orphan")
@@ -99,6 +100,8 @@
                              (:file "ibd-tests")
                              ;; Mempool tests
                              (:file "mempool-tests")
+                             ;; Package relay tests (submitpackage)
+                             (:file "package-tests")
                              ;; Persistence, peer health, reorg tests
                              (:file "persistence-tests")
                              ;; RPC tests
