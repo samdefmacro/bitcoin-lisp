@@ -96,9 +96,28 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
   (max-size +default-max-mempool-bytes+ :type integer)
   ;; Minimum relay fee rate
   (min-fee-rate +default-min-relay-fee-rate+ :type integer)
+  ;; Rolling dynamic minimum fee rate (sat/vB), raised when the mempool is full
+  ;; and trims, decaying back toward the relay floor over time. Bitcoin Core's
+  ;; rolling minimum fee.
+  (rolling-min-fee-rate 0 :type integer)
+  (rolling-min-fee-time 0 :type integer)
   ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
   ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
   (orphan-pool (make-orphan-pool) :type orphan-pool))
+
+(defconstant +rolling-fee-halflife-seconds+ 43200
+  "Rolling minimum fee decays by half every 12 hours (Bitcoin Core default).")
+
+(defun mempool-effective-min-fee-rate (mempool &optional (now (bitcoin-lisp.serialization:get-unix-time)))
+  "Effective minimum fee rate to enter the mempool: the relay floor, or the
+decayed rolling minimum if higher (Bitcoin Core CTxMemPool::GetMinFee)."
+  (let ((rolling (mempool-rolling-min-fee-rate mempool)))
+    (if (<= rolling 0)
+        (mempool-min-fee-rate mempool)
+        (let* ((age (max 0 (- now (mempool-rolling-min-fee-time mempool))))
+               (decayed (floor (* rolling
+                                  (expt 0.5d0 (/ age +rolling-fee-halflife-seconds+))))))
+          (max (mempool-min-fee-rate mempool) decayed)))))
 
 ;;;; Outpoint key helper
 
@@ -508,18 +527,26 @@ fee-rate is below NEW-ENTRY-FEE-RATE. Returns T if enough space was freed."
                (mempool-entries mempool))
       (setf ranked (sort ranked #'< :key #'cdr))
 
-      (let ((freed 0))
+      (let ((freed 0) (max-evicted-rate 0) (done nil))
         (dolist (pair ranked)
-          (when (>= freed to-free)
-            (return-from mempool-evict-for-size t))
-          ;; Never evict a package that pays at least as much as the incoming tx.
-          (when (>= (cdr pair) new-entry-fee-rate)
-            (return-from mempool-evict-for-size (>= freed to-free)))
-          ;; May already be gone if removed as a descendant of an earlier evictee.
-          (when (mempool-has mempool (car pair))
-            (let ((before (mempool-total-size mempool)))
-              (mempool-remove-recursive mempool (car pair))
-              (incf freed (- before (mempool-total-size mempool))))))
+          (when (or done (>= freed to-free)) (return))
+          (cond
+            ;; Never evict a package that pays at least as much as the incoming tx.
+            ((>= (cdr pair) new-entry-fee-rate) (setf done t))
+            ;; May already be gone if removed as a descendant of an earlier evictee.
+            ((mempool-has mempool (car pair))
+             (let ((before (mempool-total-size mempool)))
+               (mempool-remove-recursive mempool (car pair))
+               (incf freed (- before (mempool-total-size mempool)))
+               (setf max-evicted-rate (max max-evicted-rate (cdr pair)))))))
+        ;; Raise the rolling minimum fee to just above the priciest evicted
+        ;; package, so newcomers must beat what was just trimmed.
+        (when (plusp max-evicted-rate)
+          (let ((floor-rate (1+ (ceiling max-evicted-rate))))
+            (when (> floor-rate (mempool-rolling-min-fee-rate mempool))
+              (setf (mempool-rolling-min-fee-rate mempool) floor-rate
+                    (mempool-rolling-min-fee-time mempool)
+                    (bitcoin-lisp.serialization:get-unix-time)))))
         (>= freed to-free)))))
 
 ;;;; Expiry and periodic trim

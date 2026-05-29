@@ -471,6 +471,7 @@
    #:mempool-remove-recursive
    #:mempool-expire
    #:mempool-trim
+   #:mempool-effective-min-fee-rate
    #:mempool-orphan-pool
    ;; Orphan pool
    #:make-orphan-pool
