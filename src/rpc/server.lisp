@@ -68,6 +68,8 @@
   ;; Mining methods
   (register-rpc-method "getblocktemplate" #'rpc-getblocktemplate)
   (register-rpc-method "getmininginfo" #'rpc-getmininginfo)
+  (register-rpc-method "submitblock" #'rpc-submitblock)
+  (register-rpc-method "generatetoaddress" #'rpc-generatetoaddress)
   ;; Raw transaction methods
   (register-rpc-method "decoderawtransaction" #'rpc-decoderawtransaction)
   (register-rpc-method "getrawtransaction" #'rpc-getrawtransaction)
