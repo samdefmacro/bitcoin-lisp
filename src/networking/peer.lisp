@@ -28,6 +28,8 @@
   (block-timeout-count 0 :type (unsigned-byte 8))
   (last-block-received-time 0 :type integer)  ; internal-real-time of last block from this peer
   (address "" :type string)
+  ;; T if the peer connected to us (inbound); NIL if we dialed out (outbound).
+  (inbound nil :type boolean)
   ;; Misbehavior scoring
   (misbehavior-score 0 :type (unsigned-byte 32))
   ;; Compact block support (BIP 152)
@@ -221,13 +223,11 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
 
 ;;; Handshake
 
-(defun perform-handshake (peer)
-  "Perform the Bitcoin version handshake.
-Returns T on success, NIL on failure."
-  (setf (peer-state peer) :handshaking)
-
-  ;; Send version message
-  ;; BIP 159: Advertise NODE_NETWORK_LIMITED instead of NODE_NETWORK when pruning
+(defun %send-version-and-capabilities (peer)
+  "Send our version message followed by the post-version capability messages
+(wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
+VERACK). Returns T if the version was sent."
+  ;; BIP 159: advertise NODE_NETWORK_LIMITED instead of NODE_NETWORK when pruning.
   (let* ((services (if (bitcoin-lisp:pruning-enabled-p)
                        (logior bitcoin-lisp.serialization:+node-network-limited+
                                bitcoin-lisp.serialization:+node-witness+)
@@ -239,58 +239,74 @@ Returns T on success, NIL on failure."
                            :timestamp (bitcoin-lisp.serialization:get-unix-time)))
          (version-msg (bitcoin-lisp.serialization:serialize-message
                        "version" version-payload)))
-    (unless (send-message peer version-msg)
-      (return-from perform-handshake nil)))
+    (when (send-message peer version-msg)
+      (send-message peer (bitcoin-lisp.serialization:make-wtxidrelay-message))
+      (send-message peer (bitcoin-lisp.serialization:make-sendaddrv2-message))
+      t)))
 
-  ;; Send wtxidrelay (BIP 339) — must be after VERSION, before VERACK
-  (send-message peer (bitcoin-lisp.serialization:make-wtxidrelay-message))
-  ;; Send sendaddrv2 (BIP 155) — must be after VERSION, before VERACK
-  (send-message peer (bitcoin-lisp.serialization:make-sendaddrv2-message))
+(defun %receive-and-store-version (peer &key (timeout 30))
+  "Receive the peer's version message and record its services/height/user-agent.
+Returns T on success, NIL if the first message wasn't a version."
+  (multiple-value-bind (command payload) (receive-message peer :timeout timeout)
+    (when (and command (string= command "version"))
+      (flexi-streams:with-input-from-sequence (stream payload)
+        (let ((version-msg (bitcoin-lisp.serialization:read-version-message stream)))
+          (setf (peer-version peer) version-msg
+                (peer-services peer)
+                (bitcoin-lisp.serialization:version-message-services version-msg)
+                (peer-start-height peer)
+                (bitcoin-lisp.serialization:version-message-start-height version-msg)
+                (peer-user-agent peer)
+                (bitcoin-lisp.serialization:version-message-user-agent version-msg))))
+      t)))
 
-  ;; Receive version message
-  (multiple-value-bind (command payload)
-      (receive-message peer :timeout 30)
-    (unless (string= command "version")
-      (return-from perform-handshake nil))
-    ;; Parse and store version info
-    (flexi-streams:with-input-from-sequence (stream payload)
-      (let ((version-msg (bitcoin-lisp.serialization:read-version-message stream)))
-        (setf (peer-version peer) version-msg)
-        (setf (peer-services peer)
-              (bitcoin-lisp.serialization:version-message-services version-msg))
-        (setf (peer-start-height peer)
-              (bitcoin-lisp.serialization:version-message-start-height version-msg))
-        (setf (peer-user-agent peer)
-              (bitcoin-lisp.serialization:version-message-user-agent version-msg)))))
-
-  ;; Send verack
-  (unless (send-message peer (bitcoin-lisp.serialization:make-verack-message))
-    (return-from perform-handshake nil))
-
-  ;; Receive verack (may receive other messages first like wtxidrelay, sendaddrv2)
-  (loop repeat 10  ; Max 10 messages before giving up
-        do (multiple-value-bind (command payload)
-               (receive-message peer :timeout 30)
+(defun %await-verack (peer &key (timeout 30))
+  "Read messages until VERACK arrives (tolerating interleaved wtxidrelay/
+sendaddrv2/sendheaders), tracking the peer's advertised capabilities. Sets the
+peer :ready and returns T on VERACK; NIL otherwise."
+  (loop repeat 10
+        do (multiple-value-bind (command payload) (receive-message peer :timeout timeout)
              (declare (ignore payload))
-             (unless command
-               (return-from perform-handshake nil))
-             (when (string= command "verack")
-               (setf (peer-state peer) :ready)
-               (return-from perform-handshake t))
-             ;; BIP 155: Track peer's addrv2 capability
-             (when (string= command "sendaddrv2")
-               (setf (peer-wants-addrv2 peer) t))
-             ;; BIP 130: Track peer's sendheaders preference
-             (when (string= command "sendheaders")
-               (setf (peer-prefers-headers peer) t))
-             ;; BIP 339: Track peer's wtxidrelay support
-             (when (string= command "wtxidrelay")
-               (setf (peer-wtxid-relay peer) t))
-             ;; Ignore other handshake-phase messages
-             ))
+             (unless command (return nil))
+             (cond
+               ((string= command "verack")
+                (setf (peer-state peer) :ready)
+                (return t))
+               ((string= command "sendaddrv2") (setf (peer-wants-addrv2 peer) t))
+               ((string= command "sendheaders") (setf (peer-prefers-headers peer) t))
+               ((string= command "wtxidrelay") (setf (peer-wtxid-relay peer) t))))
+        finally (return nil)))
 
-  ;; Didn't receive verack
-  nil)
+(defun perform-handshake (peer)
+  "Outbound version handshake (we initiate): send version+caps, receive the
+peer's version, send verack, await theirs. Returns T on success."
+  (setf (peer-state peer) :handshaking)
+  (and (%send-version-and-capabilities peer)
+       (%receive-and-store-version peer)
+       (send-message peer (bitcoin-lisp.serialization:make-verack-message))
+       (%await-verack peer)))
+
+(defun perform-inbound-handshake (peer &key (timeout 15))
+  "Inbound version handshake (the peer dialed us, so it sends VERSION first):
+receive their version, send ours+caps, send verack, await theirs. A shorter
+TIMEOUT than the outbound path bounds how long a silent inbound peer can stall.
+Returns T on success."
+  (setf (peer-state peer) :handshaking)
+  (and (%receive-and-store-version peer :timeout timeout)
+       (%send-version-and-capabilities peer)
+       (send-message peer (bitcoin-lisp.serialization:make-verack-message))
+       (%await-verack peer :timeout timeout)))
+
+(defun make-inbound-peer (connection address)
+  "Build a peer for an accepted inbound CONNECTION from ADDRESS (state :connected,
+inbound t, rate limiters initialized)."
+  (let ((peer (make-peer :connection connection
+                         :state :connected
+                         :address address
+                         :inbound t
+                         :connect-time (get-internal-real-time))))
+    (init-peer-rate-limiters peer)
+    peer))
 
 (defun send-post-handshake-messages (peer)
   "Send feature negotiation messages after handshake completes."
