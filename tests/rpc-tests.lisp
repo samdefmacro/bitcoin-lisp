@@ -782,3 +782,51 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       (is (string= "missing-input" (cdr (assoc "reject-reason" r :test #'string=)))))
     ;; Nothing was added to the mempool.
     (is (= 0 (bitcoin-lisp.mempool:mempool-count (bitcoin-lisp::node-mempool node))))))
+
+;;; --- Mempool introspection RPCs ---
+
+(test rpc-mempool-introspection
+  ;; A parent + chained child in the mempool exercise getmempoolentry,
+  ;; getmempoolancestors/descendants, and gettxspendingprevout.
+  (let* ((node (make-test-node))
+         (mempool (bitcoin-lisp::node-mempool node))
+         (funding (%txid-array 99))
+         (parent (%mp-spending-tx funding :vout 0 :value 50000000))
+         (pid (bitcoin-lisp.serialization:transaction-hash parent))
+         (child (%mp-spending-tx pid :vout 0 :value 40000000))
+         (cid (bitcoin-lisp.serialization:transaction-hash child))
+         (pid-hex (bitcoin-lisp.rpc::hash-to-hex pid))
+         (cid-hex (bitcoin-lisp.rpc::hash-to-hex cid)))
+    (%add-tx mempool parent :fee 1000)
+    (%add-tx mempool child :fee 2000)
+    ;; getmempoolentry: parent has 2 descendants (self+child), 1 ancestor (self)
+    (let ((r (bitcoin-lisp.rpc::rpc-getmempoolentry node (list pid-hex))))
+      (is (= 2 (cdr (assoc "descendantcount" r :test #'string=))))
+      (is (= 1 (cdr (assoc "ancestorcount" r :test #'string=)))))
+    ;; getmempoolancestors child -> [parent]
+    (let ((r (bitcoin-lisp.rpc::rpc-getmempoolancestors node (list cid-hex))))
+      (is (equal (list pid-hex) r)))
+    ;; getmempooldescendants parent -> [child]
+    (let ((r (bitcoin-lisp.rpc::rpc-getmempooldescendants node (list pid-hex))))
+      (is (equal (list cid-hex) r)))
+    ;; verbose form -> alist (txid-hex . fields)
+    (let ((r (bitcoin-lisp.rpc::rpc-getmempooldescendants node (list pid-hex t))))
+      (is (= 1 (length r)))
+      (is (string= cid-hex (car (first r))))
+      (is (assoc "vsize" (cdr (first r)) :test #'string=)))
+    ;; gettxspendingprevout: the funding outpoint is spent by the parent
+    (flet ((op (txid-hex vout)
+             (let ((h (make-hash-table :test 'equal)))
+               (setf (gethash "txid" h) txid-hex (gethash "vout" h) vout) h)))
+      (let ((r (bitcoin-lisp.rpc::rpc-gettxspendingprevout
+                node (list (list (op (bitcoin-lisp.rpc::hash-to-hex funding) 0))))))
+        (is (= 1 (length r)))
+        (is (string= pid-hex (cdr (assoc "spendingtxid" (first r) :test #'string=)))))
+      ;; an unspent outpoint -> no spendingtxid key
+      (let ((r (bitcoin-lisp.rpc::rpc-gettxspendingprevout
+                node (list (list (op (bitcoin-lisp.rpc::hash-to-hex (%txid-array 200)) 0))))))
+        (is (null (assoc "spendingtxid" (first r) :test #'string=)))))
+    ;; getmempoolentry for an absent tx -> error
+    (signals error
+      (bitcoin-lisp.rpc::rpc-getmempoolentry
+       node (list (bitcoin-lisp.rpc::hash-to-hex (%txid-array 201)))))))
