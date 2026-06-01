@@ -272,3 +272,33 @@
   (is (> bitcoin-lisp:+max-message-payload+ 0))
   (is (> bitcoin-lisp:+max-rpc-body-size+ 0))
   (is (> bitcoin-lisp:+handshake-timeout-seconds+ 0)))
+
+;;;; ============================================================
+;;;; Discouragement (soft-ban) Tests
+;;;; ============================================================
+
+(test discourage-and-check
+  "discourage-peer marks an address; peer-discouraged-p reports it."
+  (bitcoin-lisp.networking:clear-discouraged)
+  (is (not (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.7")))
+  (bitcoin-lisp.networking:discourage-peer "203.0.113.7")
+  (is (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.7"))
+  ;; Unrelated address is unaffected.
+  (is (not (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.8")))
+  (bitcoin-lisp.networking:clear-discouraged)
+  (is (not (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.7"))))
+
+(test discourage-ignores-empty-address
+  "Empty/blank addresses are never discouraged."
+  (bitcoin-lisp.networking:clear-discouraged)
+  (bitcoin-lisp.networking:discourage-peer "")
+  (is (not (bitcoin-lisp.networking:peer-discouraged-p ""))))
+
+(test connect-peer-refuses-discouraged
+  "connect-peer returns NIL for a discouraged host (never dial it)."
+  (bitcoin-lisp.networking:clear-discouraged)
+  (bitcoin-lisp.networking:discourage-peer "192.0.2.123")
+  ;; 192.0.2.0/24 (TEST-NET-1) never routes, so a non-discouraged dial here would
+  ;; fail at connect time anyway — but the discouraged guard returns NIL first.
+  (is (null (bitcoin-lisp.networking:connect-peer "192.0.2.123" 18333)))
+  (bitcoin-lisp.networking:clear-discouraged))
