@@ -858,6 +858,7 @@
    #:*rate-limit-addr*
    #:*rate-limit-getdata*
    #:*rate-limit-headers*
+   #:*rate-limit-serve*
    #:*rpc-rate-limit*
    #:+max-message-payload+
    #:+max-rpc-body-size+
