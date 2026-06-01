@@ -48,7 +48,30 @@
   (entries (make-utxo-key-hash-table) :type hash-table :read-only t)
   (base nil :type coins-view-db :read-only t)
   (dirty-count 0 :type fixnum)
-  (fresh-count 0 :type fixnum))
+  (fresh-count 0 :type fixnum)
+  ;; Estimated in-memory byte usage of the cached entries — Bitcoin Core's
+  ;; CCoinsViewCache::cachedCoinsUsage. Maintained incrementally at every entry
+  ;; mutation and reset on flush; drives the node's size-based flush so the cache
+  ;; stays bounded (Core dbcache). See cache-entry-mem-bytes.
+  (mem-bytes 0 :type fixnum))
+
+(defconstant +coins-cache-entry-overhead-bytes+ 200
+  "Fixed per-entry memory estimate for a cached coin (SBCL hash bucket +
+cache-entry + utxo-key + utxo-entry struct + byte-vector header), excluding the
+scriptPubKey bytes. Deliberately a round, slightly-high estimate so the size
+bound errs toward flushing early rather than under-counting toward OOM.")
+
+(declaim (inline entry-script-bytes cache-entry-mem-bytes))
+
+(defun entry-script-bytes (entry)
+  "Variable byte usage of a utxo-entry — its scriptPubKey length (Bitcoin Core
+Coin::DynamicMemoryUsage = DynamicUsage(scriptPubKey)). NIL (spent) is 0."
+  (if entry (length (utxo-entry-script-pubkey entry)) 0))
+
+(defun cache-entry-mem-bytes (ce)
+  "Estimated bytes a cache-entry occupies: fixed overhead + scriptPubKey length
+(0 script for a spent tombstone, which still holds the slot overhead)."
+  (+ +coins-cache-entry-overhead-bytes+ (entry-script-bytes (ce-entry ce))))
 
 (declaim (inline coins-view-cache-base))
 (defun coins-view-cache-base (cache)
@@ -71,8 +94,10 @@ Returns NIL only when both cache and base have nothing under KEY."
     (when present-p (return-from fetch-coin existing)))
   (let ((from-base (coins-view-db-get (cvc-base cache) key)))
     (when from-base
-      (setf (gethash key (cvc-entries cache))
-            (make-cache-entry :entry from-base :dirty nil :fresh nil)))))
+      (let ((ce (make-cache-entry :entry from-base :dirty nil :fresh nil)))
+        (setf (gethash key (cvc-entries cache)) ce)
+        (incf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce))
+        ce))))
 
 ;;;; Public reads.
 
@@ -114,6 +139,9 @@ purely from cache state; see the file header for the caller contract."
       (existing
        (when (ce-dirty existing) (decf (cvc-dirty-count cache)))
        (when (ce-fresh existing) (decf (cvc-fresh-count cache)))
+       ;; Overhead unchanged (same slot); adjust by the scriptPubKey delta.
+       (incf (cvc-mem-bytes cache)
+             (- (entry-script-bytes entry) (entry-script-bytes (ce-entry existing))))
        (let ((fresh (and (not (ce-entry existing))      ; was spent
                          (not (ce-dirty existing)))))   ; and already-flushed
          (setf (ce-entry existing) entry
@@ -125,8 +153,9 @@ purely from cache state; see the file header for the caller contract."
       ;; Brand-new slot. Per caller contract, base does not have KEY,
       ;; so the add can drop on spend without touching disk → FRESH=T.
       (t
-       (setf (gethash key (cvc-entries cache))
-             (make-cache-entry :entry entry :dirty t :fresh t))
+       (let ((ce (make-cache-entry :entry entry :dirty t :fresh t)))
+         (setf (gethash key (cvc-entries cache)) ce)
+         (incf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce)))
        (incf (cvc-dirty-count cache))
        (incf (cvc-fresh-count cache))))))
 
@@ -146,10 +175,14 @@ Mirrors CCoinsViewCache::SpendCoin (coins.cpp:153)."
       (return-from coins-view-cache-spend nil))
     (cond
       ((ce-fresh ce)
+       ;; Entry removed entirely: reclaim overhead + script bytes.
+       (decf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce))
        (remhash key (cvc-entries cache))
        (when (ce-dirty ce) (decf (cvc-dirty-count cache)))
        (decf (cvc-fresh-count cache)))
       (t
+       ;; Tombstone keeps the slot overhead; only the scriptPubKey is freed.
+       (decf (cvc-mem-bytes cache) (entry-script-bytes (ce-entry ce)))
        (unless (ce-dirty ce) (incf (cvc-dirty-count cache)))
        (setf (ce-entry ce) nil
              (ce-dirty ce) t)))
@@ -174,7 +207,8 @@ entries written (puts + erases)."
                (cvc-entries cache)))
     (clrhash (cvc-entries cache))
     (setf (cvc-dirty-count cache) 0
-          (cvc-fresh-count cache) 0)
+          (cvc-fresh-count cache) 0
+          (cvc-mem-bytes cache) 0)
     count))
 
 ;;;; coin-view-* convenience API
@@ -498,6 +532,15 @@ count for a LevelDB-backed view must compute it themselves."
   (etypecase view
     (utxo-set (hash-table-count (utxo-set-entries view)))
     (coins-view-cache (hash-table-count (cvc-entries view)))))
+
+(defun view-mem-bytes (view)
+  "Estimated in-memory byte usage of VIEW's coin cache, mirroring Bitcoin Core's
+CCoinsViewCache::DynamicMemoryUsage — drives the node's size-based flush. A
+utxo-set (test-only, fully in memory) returns 0: it is not the bounded
+production store, so the size trigger never fires for it."
+  (etypecase view
+    (utxo-set 0)
+    (coins-view-cache (cvc-mem-bytes view))))
 
 (defun disconnect-block-from-utxo-set (view block previous-utxos)
   (etypecase view
