@@ -871,7 +871,9 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       (bitcoin-lisp.networking:address-book-add
        book (bitcoin-lisp.networking:make-peer-address
              :ip (bitcoin-lisp.networking::ipv4-to-mapped-ipv6 1 2 3 4)
-             :port 48333 :services 9 :last-seen 1700000000))
+             :port 48333 :services 9
+             ;; recent so getnodeaddresses (GetAddr) doesn't filter it as terrible
+             :last-seen (bitcoin-lisp.serialization:get-unix-time)))
       (setf (bitcoin-lisp::node-address-book node) book)
       (let ((r (bitcoin-lisp.rpc::rpc-getnodeaddresses node (list 0))))  ; 0 = all
         (is (= 1 (length r)))
