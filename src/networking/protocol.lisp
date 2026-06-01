@@ -10,7 +10,7 @@ Guards shared state (chain-state, UTXO set, mempool, peer list) against
 concurrent access from RPC and sync threads."
   `(let ((node bitcoin-lisp::*node*))
      (if (and node (bitcoin-lisp::node-lock node))
-         (bt:with-lock-held ((bitcoin-lisp::node-lock node))
+         (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
            ,@body)
          (progn ,@body))))
 

@@ -705,12 +705,15 @@ null on success; errors if no connected peer has that address."
   (let ((address (first params)))
     (unless (stringp address)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "address must be a string"))
-    (let ((target (find address (bitcoin-lisp::node-peers node)
-                        :key (lambda (p) (bitcoin-lisp::peer-address p)) :test #'string=)))
-      (unless target
-        (error 'rpc-error :code +rpc-misc-error+ :message "Node not found in connected peers"))
-      (bitcoin-lisp.networking:disconnect-peer target)
-      nil)))
+    ;; Atomic against the sync thread's node-peers mutations: hold node-lock
+    ;; across the find + disconnect so we don't act on a peer mid-removal.
+    (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+      (let ((target (find address (bitcoin-lisp::node-peers node)
+                          :key (lambda (p) (bitcoin-lisp::peer-address p)) :test #'string=)))
+        (unless target
+          (error 'rpc-error :code +rpc-misc-error+ :message "Node not found in connected peers"))
+        (bitcoin-lisp.networking:disconnect-peer target)
+        nil))))
 
 ;;; --- Node / chain info RPCs ---
 
