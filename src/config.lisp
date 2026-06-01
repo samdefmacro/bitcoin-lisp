@@ -140,6 +140,14 @@ Returns T if added, NIL if already present."
 (defvar *rate-limit-headers* '(10.0 . 50.0)
   "Rate limit for HEADERS messages: (rate-per-sec . burst).")
 
+(defvar *rate-limit-serve* '(5.0 . 20.0)
+  "Rate limit for peer SERVE requests — getheaders/getblocks/getaddr, shared
+bucket: (rate-per-sec . burst). These answer a peer from our chain/address
+state; getheaders/getblocks each walk the active chain (O(tip-fork)), so a peer
+spamming them could load the sync thread. A normal syncing peer sends a
+getheaders per ~2000-block batch (well under this); a flood is throttled, then
+disconnected by handle-message's rate-limit gate.")
+
 (defvar *rpc-rate-limit* '(100.0 . 200.0)
   "Rate limit for RPC requests: (rate-per-sec . burst).")
 

@@ -53,6 +53,8 @@
   (rate-limit-addr nil)
   (rate-limit-getdata nil)
   (rate-limit-headers nil)
+  ;; Shared bucket for serve requests: getheaders/getblocks/getaddr.
+  (rate-limit-serve nil)
   ;; Handshake timeout tracking
   (connect-time 0 :type integer)                     ; internal-real-time at connection
   ;; Per-peer block-availability tracking. Mirrors a subset of Bitcoin
@@ -148,7 +150,8 @@ nodes_testnet4.txt source).")
     (setf (peer-rate-limit-tx peer) (rl bitcoin-lisp:*rate-limit-tx*))
     (setf (peer-rate-limit-addr peer) (rl bitcoin-lisp:*rate-limit-addr*))
     (setf (peer-rate-limit-getdata peer) (rl bitcoin-lisp:*rate-limit-getdata*))
-    (setf (peer-rate-limit-headers peer) (rl bitcoin-lisp:*rate-limit-headers*)))
+    (setf (peer-rate-limit-headers peer) (rl bitcoin-lisp:*rate-limit-headers*))
+    (setf (peer-rate-limit-serve peer) (rl bitcoin-lisp:*rate-limit-serve*)))
   peer)
 
 (defun connect-peer (host &optional (port *current-port*))
@@ -525,6 +528,11 @@ Returns T if allowed, NIL if rate limit exceeded."
                   ((string= command "addrv2") (peer-rate-limit-addr peer))
                   ((string= command "getdata") (peer-rate-limit-getdata peer))
                   ((string= command "headers") (peer-rate-limit-headers peer))
+                  ;; Serve requests share one bucket (getheaders/getblocks each
+                  ;; walk the active chain; bound the aggregate load).
+                  ((string= command "getheaders") (peer-rate-limit-serve peer))
+                  ((string= command "getblocks") (peer-rate-limit-serve peer))
+                  ((string= command "getaddr") (peer-rate-limit-serve peer))
                   (t nil))))  ; No rate limit for other message types
     (if bucket
         (bitcoin-lisp:token-bucket-allow-p bucket)
