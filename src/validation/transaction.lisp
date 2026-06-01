@@ -193,6 +193,33 @@ MAX_STANDARD_SCRIPTSIG_SIZE) — fits a 15-of-15 P2SH redeem.")
 (defconstant +max-standard-p2sh-sigops+ 15
   "Maximum sigops in a standard P2SH redeemScript (Bitcoin Core MAX_P2SH_SIGOPS).")
 
+(defconstant +min-standard-tx-nonwitness-size+ 65
+  "Minimum non-witness serialized size for a standard tx (Bitcoin Core
+MIN_STANDARD_TX_NONWITNESS_SIZE, one larger than 64). Rejects 64-byte
+transactions, which a 64-byte internal merkle node can be confused with
+(CVE-2017-12842).")
+
+(defconstant +max-standard-p2wsh-script-size+ 3600
+  "Maximum standard witnessScript size for a P2WSH spend (Bitcoin Core).")
+
+(defconstant +max-standard-p2wsh-stack-items+ 100
+  "Maximum standard witness stack items (excluding the witnessScript) for P2WSH.")
+
+(defconstant +max-standard-p2wsh-stack-item-size+ 80
+  "Maximum standard witness stack item size for a P2WSH spend (Bitcoin Core).")
+
+(defconstant +max-standard-tapscript-stack-item-size+ 80
+  "Maximum standard witness stack item size for a BIP 342 tapscript spend.")
+
+(defconstant +witness-annex-tag+ #x50
+  "First byte marking a Taproot witness annex (Bitcoin Core ANNEX_TAG).")
+
+(defconstant +taproot-leaf-mask+ #xfe
+  "Mask isolating the leaf version in a Taproot control block (Bitcoin Core).")
+
+(defconstant +taproot-leaf-tapscript+ #xc0
+  "BIP 342 tapscript leaf version (Bitcoin Core TAPROOT_LEAF_TAPSCRIPT).")
+
 (defun output-witness-program-p (script-pubkey)
   "True if SCRIPT-PUBKEY is a witness program: a version byte (OP_0, or
 OP_1..OP_16) followed by a single push of 2-40 bytes that consumes the rest
@@ -280,6 +307,87 @@ Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
           (<= len 83)
           (= (aref script-pubkey 0) #x6a))))) ; OP_RETURN
 
+(defun witness-program-parts (script)
+  "If SCRIPT is a witness program, return (VALUES version program-bytes);
+otherwise NIL. Version is 0 for OP_0, 1..16 for OP_1..OP_16."
+  (when (output-witness-program-p script)
+    (let ((v (aref script 0)))
+      (values (if (= v #x00) 0 (- v #x50))   ; OP_1 (#x51) -> version 1
+              (subseq script 2)))))
+
+(defun p2wsh-witness-standard-p (wstack)
+  "P2WSH limits: witnessScript (the last stack item) <=
++max-standard-p2wsh-script-size+, and the remaining items (the script's inputs)
+number <= +max-standard-p2wsh-stack-items+, each <= +max-standard-p2wsh-stack-item-size+."
+  (let ((stack-items (1- (length wstack))))   ; WSTACK is [...args, witnessScript]
+    (and (<= (length (car (last wstack))) +max-standard-p2wsh-script-size+)
+         (<= stack-items +max-standard-p2wsh-stack-items+)
+         (loop for j below stack-items
+               always (<= (length (nth j wstack)) +max-standard-p2wsh-stack-item-size+)))))
+
+(defun taproot-witness-standard-p (wstack)
+  "Taproot limits: no annex, and for a tapscript (leaf 0xc0) script-path spend
+each stack input <= +max-standard-tapscript-stack-item-size+. Key-path spends
+have no policy rules."
+  (let ((n (length wstack))
+        (last-item (car (last wstack))))
+    (cond
+      ;; Annex present (>=2 items, last non-empty, starts with the tag) ->
+      ;; nonstandard (no annex semantics are defined yet).
+      ((and (>= n 2) (plusp (length last-item))
+            (= (aref last-item 0) +witness-annex-tag+))
+       nil)
+      ;; Script-path spend: WSTACK is [...args, script, control-block].
+      ((>= n 2)
+       (cond
+         ((zerop (length last-item)) nil)           ; empty control block
+         ((= (logand (aref last-item 0) +taproot-leaf-mask+) +taproot-leaf-tapscript+)
+          ;; Drop the last two items (control block + script); the rest are args.
+          (loop for item in (butlast wstack 2)
+                always (<= (length item) +max-standard-tapscript-stack-item-size+)))
+         (t t)))                                     ; non-tapscript leaf: no item rule
+      ((= n 1) t)                                    ; key-path: no policy rules
+      (t nil))))                                     ; 0 items: invalid by consensus
+
+(defun input-witness-standard-p (wstack spk script-sig)
+  "Whether one input's witness WSTACK is standard for the output SPK it spends
+(SCRIPT-SIG is needed to unwrap a P2SH redeemScript)."
+  (let ((prev-script spk)
+        (p2sh nil))
+    ;; P2SH-wrapped: the redeemScript is the last push of the (push-only) scriptSig
+    ;; (Bitcoin Core extracts it by evaluating the scriptSig).
+    (when (script-is-p2sh-p spk)
+      (let ((redeem (extract-last-push script-sig)))
+        (unless redeem (return-from input-witness-standard-p nil))
+        (setf prev-script redeem p2sh t)))
+    (multiple-value-bind (version program) (witness-program-parts prev-script)
+      (cond
+        ;; A witness attached to a non-witness program is nonstandard.
+        ((null version) nil)
+        ((and (= version 0) (= (length program) 32)) (p2wsh-witness-standard-p wstack))
+        ((and (= version 1) (= (length program) 32) (not p2sh))
+         (taproot-witness-standard-p wstack))
+        ;; P2WPKH and other witness versions impose no extra standardness rules.
+        (t t)))))
+
+(defun is-witness-standard-p (tx spent-script-fn)
+  "Bitcoin Core IsWitnessStandard: every input carrying a witness must spend a
+standard witness program (P2WSH/Taproot stack & script limits, no annex).
+SPENT-SCRIPT-FN maps (txid index) to the spent output's scriptPubKey. Coinbase
+has no witness inputs to check."
+  (loop for input in (bitcoin-lisp.serialization:transaction-inputs tx)
+        for wstack in (bitcoin-lisp.serialization:transaction-witness tx)
+        ;; An input with no witness data imposes no witness-standardness rule.
+        always (or (null wstack)
+                   (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                          (spk (funcall spent-script-fn
+                                        (bitcoin-lisp.serialization:outpoint-hash prevout)
+                                        (bitcoin-lisp.serialization:outpoint-index prevout))))
+                     (and spk
+                          (input-witness-standard-p
+                           wstack spk
+                           (bitcoin-lisp.serialization:tx-in-script-sig input)))))))
+
 (defun mempool-extra-coins (tx utxo-set mempool &optional package-coins)
   "Build a (txid . index) -> utxo-entry table for TX inputs that spend
 unconfirmed outputs — either an in-mempool tx (chained spends) or, as a final
@@ -349,6 +457,14 @@ feerate (Bitcoin Core's package_feerates path)."
     (return-from validate-transaction-for-mempool
       (values nil :tx-weight-too-large nil)))
 
+  ;; Policy: minimum non-witness size (Bitcoin Core MIN_STANDARD_TX_NONWITNESS_SIZE).
+  ;; serialize-transaction emits the legacy (non-witness) encoding, so its length
+  ;; is the stripped size — rejecting 64-byte txs (CVE-2017-12842).
+  (when (< (length (bitcoin-lisp.serialization:serialize-transaction tx))
+           +min-standard-tx-nonwitness-size+)
+    (return-from validate-transaction-for-mempool
+      (values nil :tx-size-small nil)))
+
   ;; Policy: scriptSig must be push-only and within the size limit
   (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
     (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input)))
@@ -409,7 +525,14 @@ feerate (Bitcoin Core's package_feerates path)."
                          (> (count-script-sigops redeem :accurate t)
                             +max-standard-p2sh-sigops+))
                 (return-from validate-transaction-for-mempool
-                  (values nil :too-many-sigops nil))))))))
+                  (values nil :too-many-sigops nil)))))))
+
+      ;; Policy: witness must be standard (P2WSH/Taproot stack & script limits,
+      ;; no annex). Needs the spent scriptPubKeys, hence inside this flet.
+      (when (and (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+                 (not (is-witness-standard-p tx #'spent-script)))
+        (return-from validate-transaction-for-mempool
+          (values nil :bad-witness-nonstandard nil))))
 
     ;; Contextual validation (consensus): coinbase maturity, fee calculation.
     ;; EXTRA-COINS is passed as pending-utxos so chained-spend inputs resolve.
