@@ -69,6 +69,7 @@
                   :components ((:file "connection")
                                (:file "peer")
                                (:file "peerdb")
+                               (:file "addrman")
                                (:file "protocol")
                                (:file "ibd")))
                  (:module "rpc"
@@ -127,6 +128,8 @@
                              (:file "pruning-tests")
                              ;; Peer database tests
                              (:file "peerdb-tests")
+                             ;; Address manager (new/tried buckets) tests
+                             (:file "addrman-tests")
                              ;; Compact block relay tests (BIP 152)
                              (:file "compact-block-tests")
                              ;; ADDRv2 tests (BIP 155)
