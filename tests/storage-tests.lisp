@@ -1224,3 +1224,75 @@ because iterate itself flushes again before walking the base."
     ;; Second batch — leave dirty.
     (bitcoin-lisp.storage:add-utxo cache (%sample-txid 2) 0 20 (%sample-script) 2)
     (is (= 30 (bitcoin-lisp.storage:utxo-set-total-amount cache)))))
+
+;;;; Coins-cache memory accounting (Bitcoin Core dbcache byte bound)
+
+(defun %overhead () bitcoin-lisp.storage::+coins-cache-entry-overhead-bytes+)
+
+(test coins-cache-mem-bytes-fresh-zero
+  "A fresh cache reports 0 bytes; an empty utxo-set view also reports 0."
+  (%with-tmp-cache (cache)
+    (is (= 0 (bitcoin-lisp.storage:view-mem-bytes cache))))
+  (is (= 0 (bitcoin-lisp.storage:view-mem-bytes (bitcoin-lisp.storage:make-utxo-set)))))
+
+(test coins-cache-mem-bytes-add-rises
+  "Each add raises usage by overhead + scriptPubKey length."
+  (%with-tmp-cache (cache)
+    (bitcoin-lisp.storage:coins-view-cache-add cache (%sample-utxo-key 1 0)
+                                               (%sample-utxo-entry))     ; 25-byte script
+    (is (= (+ (%overhead) 25) (bitcoin-lisp.storage:view-mem-bytes cache)))
+    (bitcoin-lisp.storage:coins-view-cache-add cache (%sample-utxo-key 2 0)
+                                               (%sample-utxo-entry))
+    (is (= (* 2 (+ (%overhead) 25)) (bitcoin-lisp.storage:view-mem-bytes cache)))))
+
+(test coins-cache-mem-bytes-spend-fresh-drops
+  "Spending a fresh (in-cache-only) coin reclaims its full bytes."
+  (%with-tmp-cache (cache)
+    (let ((k (%sample-utxo-key 5 0)))
+      (bitcoin-lisp.storage:coins-view-cache-add cache k (%sample-utxo-entry))
+      (is (= (+ (%overhead) 25) (bitcoin-lisp.storage:view-mem-bytes cache)))
+      (bitcoin-lisp.storage:coins-view-cache-spend cache k)
+      (is (= 0 (bitcoin-lisp.storage:view-mem-bytes cache))))))
+
+(test coins-cache-mem-bytes-reuse-delta
+  "Overwriting an entry adjusts usage by the script-size delta, not double-count."
+  (%with-tmp-cache (cache)
+    (let ((k (%sample-utxo-key 6 0))
+          (small (bitcoin-lisp.storage:make-utxo-entry
+                  :value 1 :height 1 :coinbase nil
+                  :script-pubkey (make-array 10 :element-type '(unsigned-byte 8)))))
+      (bitcoin-lisp.storage:coins-view-cache-add cache k (%sample-utxo-entry)) ; 25
+      (bitcoin-lisp.storage:coins-view-cache-add cache k small :allow-overwrite t) ; 10
+      (is (= (+ (%overhead) 10) (bitcoin-lisp.storage:view-mem-bytes cache))))))
+
+(test coins-cache-mem-bytes-non-fresh-spend-keeps-overhead
+  "A non-fresh spend frees the script bytes but the tombstone keeps the overhead."
+  (%with-tmp-leveldb-path (path)
+    (let ((k (%sample-utxo-key 7 0)))
+      (bitcoin-lisp.storage:with-coins-view-db (base path)
+        (bitcoin-lisp.storage:coins-view-db-put base k (%sample-utxo-entry)))
+      (bitcoin-lisp.storage:with-coins-view-db (base path)
+        (let ((cache (bitcoin-lisp.storage:make-coins-view-cache base)))
+          ;; A read pulls the base coin into the cache (non-fresh).
+          (bitcoin-lisp.storage:coins-view-cache-get cache k)
+          (is (= (+ (%overhead) 25) (bitcoin-lisp.storage:view-mem-bytes cache)))
+          (bitcoin-lisp.storage:coins-view-cache-spend cache k)
+          (is (= (%overhead) (bitcoin-lisp.storage:view-mem-bytes cache))))))))
+
+(test coins-cache-mem-bytes-flush-resets
+  "Flush clears the cache and resets usage to 0."
+  (%with-tmp-cache (cache)
+    (dotimes (i 5)
+      (bitcoin-lisp.storage:coins-view-cache-add cache (%sample-utxo-key (1+ i) 0)
+                                                 (%sample-utxo-entry)))
+    (is (= (* 5 (+ (%overhead) 25)) (bitcoin-lisp.storage:view-mem-bytes cache)))
+    (bitcoin-lisp.storage:coins-view-cache-flush cache)
+    (is (= 0 (bitcoin-lisp.storage:view-mem-bytes cache)))))
+
+(test large-coins-cache-threshold-matches-core
+  "large-coins-cache-threshold = max(0.9*budget, budget-10MiB) (Core)."
+  (let ((mib (* 1024 1024)))
+    ;; 450 MiB budget: budget-10MiB (440) > 0.9*budget (405) -> 440 MiB.
+    (is (= (* 440 mib) (bitcoin-lisp::large-coins-cache-threshold (* 450 mib))))
+    ;; 100 MiB budget: both terms equal 90 MiB.
+    (is (= (* 90 mib) (bitcoin-lisp::large-coins-cache-threshold (* 100 mib))))))

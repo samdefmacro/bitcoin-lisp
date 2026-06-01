@@ -610,6 +610,19 @@ Returns the node instance."
    = 1h (validation.cpp:DATABASE_WRITE_INTERVAL) — we use 10 min because
    our re-validation from a checkpoint is much slower than Core's.")
 
+(defparameter +coins-cache-budget-bytes+ (* 450 1024 1024)
+  "Memory budget for the in-memory UTXO (coins) cache before a size-triggered
+flush. Mirrors Bitcoin Core's DEFAULT_DB_CACHE (kernel/caches.h, 450 MiB). The
+cache flushes-and-clears once its estimated usage reaches the LARGE threshold,
+bounding memory during IBD (the unbounded cache was the mainnet OOM blocker).")
+
+(defun large-coins-cache-threshold (budget)
+  "The coins-cache usage at which a periodic flush is due. Mirrors Bitcoin Core's
+LargeCoinsCacheThreshold (validation.h): flush once less than 10 MiB (or 10% of
+the budget, whichever is larger free margin) remains."
+  (max (floor (* budget 9) 10)
+       (- budget (* 10 1024 1024))))
+
 (defvar *blocks-since-flush* 0
   "Counter incremented per connected block; reset to 0 when a flush runs.")
 
@@ -629,6 +642,10 @@ accounts for ~700 MB. This logger surfaces the gap."
   (let* ((utxo-count (and (node-utxo-set *node*)
                           (bitcoin-lisp.storage:utxo-count
                            (node-utxo-set *node*))))
+         (coins-cache-mb (and (node-utxo-set *node*)
+                              (/ (bitcoin-lisp.storage:view-mem-bytes
+                                  (node-utxo-set *node*))
+                                 1048576.0)))
          (header-count (and (node-chain-state *node*)
                             (hash-table-count
                              (bitcoin-lisp.storage::chain-state-block-index
@@ -652,8 +669,8 @@ accounts for ~700 MB. This logger surfaces the gap."
                   bitcoin-lisp.networking::*ibd-context*))))
          (dyn-bytes (sb-ext:dynamic-space-size))
          (used-bytes (sb-kernel:dynamic-usage)))
-    (log-info "MEM[~A]: utxo=~D headers=~D sigcache=~D ibd-pend=~A queue=~A inflight=~A heap-used=~,1FMB heap-cap=~,1FMB"
-              label utxo-count header-count sig-cache-count
+    (log-info "MEM[~A]: utxo=~D coins-cache=~,1FMB headers=~D sigcache=~D ibd-pend=~A queue=~A inflight=~A heap-used=~,1FMB heap-cap=~,1FMB"
+              label utxo-count coins-cache-mb header-count sig-cache-count
               ibd-pending ibd-queue ibd-in-flight
               (/ used-bytes 1048576.0) (/ dyn-bytes 1048576.0))))
 
@@ -728,7 +745,13 @@ flush (atomic temp+fsync+rename inside save-*)."
     (setf *last-flush-universal-time* (get-universal-time)))
   (when (or (>= *blocks-since-flush* +flush-every-n-blocks+)
             (>= (- (get-universal-time) *last-flush-universal-time*)
-                +flush-every-n-seconds+))
+                +flush-every-n-seconds+)
+            ;; Size trigger (Bitcoin Core dbcache): flush once the coins cache
+            ;; reaches its memory budget, so it can't grow unbounded between the
+            ;; block-count / time flushes.
+            (and (node-utxo-set *node*)
+                 (>= (bitcoin-lisp.storage:view-mem-bytes (node-utxo-set *node*))
+                     (large-coins-cache-threshold +coins-cache-budget-bytes+))))
     (do-flush)))
 
 (defun install-shutdown-handler ()
