@@ -902,17 +902,24 @@ MIN-PEERS: Return early once we have at least this many peers (default 1)
 Returns the number of peers connected."
   (let ((address-book (node-address-book node))
         (addresses '()))
-    ;; Warm start: prefer address book peers sorted by score
+    ;; Warm start: select peers from the addrman (new/tried buckets,
+    ;; eclipse-resistant) rather than a single global score ranking.
     (when (and address-book
                (>= (bitcoin-lisp.networking:address-book-count address-book) 8))
+      (bitcoin-lisp.networking:resolve-tried-collisions address-book)
       (log-info "Using peer address book (~D entries)..."
                 (bitcoin-lisp.networking:address-book-count address-book))
-      (let ((sorted (bitcoin-lisp.networking:address-book-sorted-peers address-book)))
-        (setf addresses
-              (mapcar (lambda (pa)
-                        (bitcoin-lisp.networking:ip-bytes-to-string
-                         (bitcoin-lisp.networking:peer-address-ip pa)))
-                      sorted))))
+      (let ((seen (make-hash-table :test 'equal))
+            (picks '()))
+        (dotimes (i (* max-peers 8))
+          (let ((pa (bitcoin-lisp.networking:address-book-select address-book)))
+            (when pa
+              (let ((str (bitcoin-lisp.networking:ip-bytes-to-string
+                          (bitcoin-lisp.networking:peer-address-ip pa))))
+                (unless (gethash str seen)
+                  (setf (gethash str seen) t)
+                  (push str picks))))))
+        (setf addresses (nreverse picks))))
     ;; Fall back to DNS seeds if not enough candidates
     (when (< (length addresses) 8)
       (log-info "Discovering peers from DNS seeds...")
@@ -998,7 +1005,9 @@ Returns the number of peers connected."
                             :port peer-port
                             :services (bitcoin-lisp.networking:peer-services peer)
                             :last-seen (bitcoin-lisp.serialization:get-unix-time))))
-                        (bitcoin-lisp.networking:address-book-record-success
+                        (bitcoin-lisp.networking:address-book-good
+                         address-book ip-bytes peer-port)
+                        (bitcoin-lisp.networking:address-book-connected
                          address-book ip-bytes peer-port))))
                   ;; Send compact block negotiation (BIP 152)
                   (bitcoin-lisp.networking:send-compact-block-negotiation peer)
@@ -1021,8 +1030,8 @@ Returns the number of peers connected."
                       :ip ip-bytes
                       :port peer-port
                       :last-seen (bitcoin-lisp.serialization:get-unix-time))))
-                  (bitcoin-lisp.networking:address-book-record-failure
-                   address-book ip-bytes peer-port)))))))
+                  (bitcoin-lisp.networking:address-book-attempt
+                   address-book ip-bytes peer-port :count-failure t)))))))
 
       (log-info "Connected to ~D peer~:P" connected)
       connected)))

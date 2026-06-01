@@ -351,10 +351,11 @@ Mirrors Bitcoin Core's MSG NOTFOUND handling (net_processing.cpp)."
 
 (defun handle-addr (peer payload &optional address-book)
   "Handle an addr message. When ADDRESS-BOOK is provided, add plausible
-addresses (timestamp within last 3 hours) to the address book."
-  (declare (ignore peer))
+addresses (timestamp within last 3 hours) to the address book, keyed to the
+gossiping PEER as their source (addrman source-group spreading)."
   (let ((now (bitcoin-lisp.serialization:get-unix-time))
         (three-hours (* 3 3600))
+        (source-ip (when peer (string-to-ip-bytes (peer-address peer))))
         (added 0))
     (flexi-streams:with-input-from-sequence (stream payload)
       (let ((count (bitcoin-lisp.serialization:read-compact-size stream)))
@@ -369,7 +370,8 @@ addresses (timestamp within last 3 hours) to the address book."
                        :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
                        :port (bitcoin-lisp.serialization:net-addr-port net-addr)
                        :services (bitcoin-lisp.serialization:net-addr-services net-addr)
-                       :last-seen timestamp))
+                       :last-seen timestamp)
+                      source-ip)
                      (incf added))))))
     (when (and address-book (> added 0))
       (bitcoin-lisp:log-debug "Added ~D peer addresses from addr message" added))
@@ -381,9 +383,9 @@ addresses (timestamp within last 3 hours) to the address book."
   "Handle an addrv2 message (BIP 155). When ADDRESS-BOOK is provided, add
 IPv4/IPv6 addresses with plausible timestamps (within 3 hours) to the address book.
 Other network types are silently skipped."
-  (declare (ignore peer))
   (let ((now (bitcoin-lisp.serialization:get-unix-time))
         (three-hours (* 3 3600))
+        (source-ip (when peer (string-to-ip-bytes (peer-address peer))))
         (added 0)
         (entries (bitcoin-lisp.serialization:parse-addrv2-payload payload)))
     (dolist (entry entries)
@@ -397,7 +399,8 @@ Other network types are silently skipped."
             :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
             :port (bitcoin-lisp.serialization:net-addr-port net-addr)
             :services (bitcoin-lisp.serialization:net-addr-services net-addr)
-            :last-seen timestamp))
+            :last-seen timestamp)
+           source-ip)
           (incf added))))
     (when (and address-book (> added 0))
       (bitcoin-lisp:log-debug "Added ~D peer addresses from addrv2 message" added))
@@ -671,11 +674,8 @@ elicit more than one reply regardless of whether we had addresses to send."
                     (let ((node bitcoin-lisp::*node*))
                       (and node (bitcoin-lisp::node-address-book node))))))
       (when book
-        (let* ((sorted (address-book-sorted-peers book))
-               (addrs (if (> (length sorted)
-                             bitcoin-lisp.serialization:+max-addr-count+)
-                          (subseq sorted 0 bitcoin-lisp.serialization:+max-addr-count+)
-                          sorted)))
+        (let ((addrs (address-book-get-addr book :max +addrman-getaddr-max+
+                                                 :pct +addrman-getaddr-pct+)))
           (when addrs
             (send-message peer (build-addr-response peer addrs))))))))
 
