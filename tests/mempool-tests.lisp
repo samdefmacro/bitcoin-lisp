@@ -816,3 +816,100 @@ low-fee parent, so a cheaper standalone tx is evicted first."
     ;; Far in the future it decays back below the floor -> floor.
     (is (= 1 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate
               mempool (+ (bitcoin-lisp.serialization:get-unix-time) (* 100 86400)))))))
+
+;;;; Min non-witness size (65 B) + witness standardness
+
+(defun %zbytes (n &optional (fill 0))
+  (make-array n :element-type '(unsigned-byte 8) :initial-element fill))
+
+(test mempool-rejects-tiny-nonwitness-tx
+  "A transaction smaller than 65 non-witness bytes is rejected (CVE-2017-12842)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         ;; 1 non-coinbase input (empty scriptSig) + 1 empty-scriptPubKey output
+         ;; serializes to ~60 non-witness bytes.
+         (input (bitcoin-lisp.serialization:make-tx-in
+                 :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                   :hash (%zbytes 32 7) :index 0)
+                 :script-sig (%zbytes 0) :sequence #xFFFFFFFF))
+         (output (bitcoin-lisp.serialization:make-tx-out :value 1000 :script-pubkey (%zbytes 0)))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 1 :inputs (list input) :outputs (list output) :lock-time 0)))
+    (is (< (length (bitcoin-lisp.serialization:serialize-transaction tx)) 65))
+    (multiple-value-bind (valid err)
+        (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
+      (is (null valid))
+      (is (eq err :tx-size-small)))))
+
+(defun %witness-tx (witness-stack spk)
+  "Single-input tx carrying WITNESS-STACK (a list of byte vectors). Returns
+(VALUES tx spent-script-fn) where the spent output's scriptPubKey is SPK."
+  (let* ((input (bitcoin-lisp.serialization:make-tx-in
+                 :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                   :hash (%zbytes 32 9) :index 0)
+                 :script-sig (%zbytes 0) :sequence #xFFFFFFFF))
+         (output (bitcoin-lisp.serialization:make-tx-out :value 1000
+                                                         :script-pubkey (%zbytes 25)))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 2 :inputs (list input) :outputs (list output)
+              :lock-time 0 :witness (list witness-stack))))
+    (values tx (lambda (txid index) (declare (ignore txid index)) spk))))
+
+(defun %p2wsh-spk () (let ((s (%zbytes 34))) (setf (aref s 0) #x00 (aref s 1) #x20) s))
+(defun %taproot-spk () (let ((s (%zbytes 34))) (setf (aref s 0) #x51 (aref s 1) #x20) s))
+(defun %p2pkh-spk ()
+  (let ((s (%zbytes 25)))
+    (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14 (aref s 23) #x88 (aref s 24) #xac)
+    s))
+
+(defun %wit-std-p (stack spk)
+  (multiple-value-bind (tx fn) (%witness-tx stack spk)
+    (bitcoin-lisp.validation::is-witness-standard-p tx fn)))
+
+(test witness-standard-p2wsh-ok
+  "A P2WSH spend within the stack/script limits is standard."
+  (is-true (%wit-std-p (list (%zbytes 5) (%zbytes 10)) (%p2wsh-spk))))   ; 1 item + witnessScript
+
+(test witness-nonstandard-p2wsh-oversized-script
+  "A P2WSH witnessScript larger than 3600 bytes is nonstandard."
+  (is-false (%wit-std-p (list (%zbytes 5) (%zbytes 3601)) (%p2wsh-spk))))
+
+(test witness-nonstandard-p2wsh-oversized-item
+  "A P2WSH stack item larger than 80 bytes is nonstandard."
+  (is-false (%wit-std-p (list (%zbytes 81) (%zbytes 10)) (%p2wsh-spk))))
+
+(test witness-nonstandard-p2wsh-too-many-items
+  "A P2WSH spend with more than 100 stack items is nonstandard."
+  (let ((stack (append (loop repeat 101 collect (%zbytes 1)) (list (%zbytes 10)))))
+    (is-false (%wit-std-p stack (%p2wsh-spk)))))
+
+(test witness-standard-taproot-keypath
+  "A Taproot key-path spend (single witness element) is standard."
+  (is-true (%wit-std-p (list (%zbytes 64)) (%taproot-spk))))
+
+(test witness-nonstandard-taproot-annex
+  "A Taproot spend carrying an annex is nonstandard."
+  (let ((annex (%zbytes 3))) (setf (aref annex 0) #x50)   ; ANNEX_TAG
+    (is-false (%wit-std-p (list (%zbytes 64) annex) (%taproot-spk)))))
+
+(test witness-nonstandard-taproot-tapscript-oversized-item
+  "A Taproot tapscript spend with a stack item over 80 bytes is nonstandard."
+  (let ((control (%zbytes 33))) (setf (aref control 0) #xc0)   ; tapscript leaf version
+    ;; stack: [arg(81), script, control-block]
+    (is-false (%wit-std-p (list (%zbytes 81) (%zbytes 20) control) (%taproot-spk)))))
+
+(test witness-nonstandard-on-nonwitness-program
+  "A witness attached to a non-witness-program input is nonstandard."
+  (is-false (%wit-std-p (list (%zbytes 10)) (%p2pkh-spk))))
+
+(test witness-standard-p2wpkh
+  "A P2WPKH witness spend has no extra stack/script policy limits."
+  (let ((p2wpkh-spk (let ((s (%zbytes 22))) (setf (aref s 0) #x00 (aref s 1) #x14) s)))
+    (is-true (%wit-std-p (list (%zbytes 71) (%zbytes 33)) p2wpkh-spk))))
+
+(test witness-standard-taproot-tapscript-path
+  "A Taproot tapscript script-path spend with in-limit items is standard."
+  (let ((control (%zbytes 33)))
+    (setf (aref control 0) #xc0)   ; tapscript leaf version
+    ;; stack: [arg(<=80), script, control-block]
+    (is-true (%wit-std-p (list (%zbytes 50) (%zbytes 20) control) (%taproot-spk)))))
