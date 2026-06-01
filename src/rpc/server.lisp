@@ -74,6 +74,13 @@
   ;; Peer / address methods
   (register-rpc-method "getnodeaddresses" #'rpc-getnodeaddresses)
   (register-rpc-method "disconnectnode" #'rpc-disconnectnode)
+  (register-rpc-method "getnettotals" #'rpc-getnettotals)
+  ;; Manual ban management
+  (register-rpc-method "setban" #'rpc-setban)
+  (register-rpc-method "listbanned" #'rpc-listbanned)
+  (register-rpc-method "clearbanned" #'rpc-clearbanned)
+  ;; Chain verification
+  (register-rpc-method "verifychain" #'rpc-verifychain)
   ;; Chain control methods
   (register-rpc-method "invalidateblock" #'rpc-invalidateblock)
   (register-rpc-method "reconsiderblock" #'rpc-reconsiderblock)

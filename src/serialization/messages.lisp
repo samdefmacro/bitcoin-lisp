@@ -130,9 +130,12 @@ Returns (VALUES net-addr timestamp) when WITH-TIMESTAMP, otherwise just net-addr
   (write-byte (ash (net-addr-port addr) -8) stream)
   (write-byte (logand (net-addr-port addr) #xFF) stream))
 
+(defconstant +universal-unix-epoch-offset+ 2208988800
+  "Seconds between the CL universal-time epoch (1900) and the Unix epoch (1970).")
+
 (defun get-unix-time ()
   "Get current Unix timestamp."
-  (- (get-universal-time) 2208988800))  ; Difference between 1900 and 1970
+  (- (get-universal-time) +universal-unix-epoch-offset+))
 
 ;;;; Version message
 
