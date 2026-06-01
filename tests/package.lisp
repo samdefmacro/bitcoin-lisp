@@ -69,6 +69,10 @@
   :description "Tests for persistent peer database"
   :in :bitcoin-lisp-tests)
 
+(def-suite :addrman-tests
+  :description "Tests for the new/tried bucket address manager (addrman)"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :compact-block-tests
   :description "Tests for Compact Block Relay (BIP 152)"
   :in :bitcoin-lisp-tests)

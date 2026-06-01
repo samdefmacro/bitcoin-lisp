@@ -743,17 +743,23 @@
    #:peer-address-services
    #:peer-address-last-seen
    #:peer-address-last-attempt
-   #:peer-address-successes
-   #:peer-address-failures
+   #:peer-address-last-success
+   #:peer-address-n-attempts
+   #:peer-address-ref-count
+   #:peer-address-in-tried
    #:address-book
    #:make-address-book
    #:address-book-add
    #:address-book-lookup
    #:address-book-count
-   #:address-book-sorted-peers
-   #:address-book-record-success
-   #:address-book-record-failure
-   #:compute-peer-score
+   #:address-book-good
+   #:address-book-attempt
+   #:address-book-connected
+   #:address-book-select
+   #:address-book-get-addr
+   #:resolve-tried-collisions
+   #:addr-info-terrible-p
+   #:net-group-key
    #:save-address-book
    #:load-address-book
    #:peers-dat-path

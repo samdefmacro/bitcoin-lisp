@@ -687,8 +687,9 @@ it (Bitcoin Core invalidateblock). PARAMS: (blockhash). Returns null."
 getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
   (let* ((count (if (integerp (first params)) (first params) 1))
          (book (bitcoin-lisp::node-address-book node))
-         (peers (and book (bitcoin-lisp.networking:address-book-sorted-peers book)))
-         (limited (if (plusp count) (subseq peers 0 (min count (length peers))) peers)))
+         ;; count=0 => all known addresses; count>0 => up to that many.
+         (limited (and book (bitcoin-lisp.networking:address-book-get-addr
+                             book :max (max count 0) :pct 100))))
     (mapcar
      (lambda (pa)
        `(("time" . ,(bitcoin-lisp.networking:peer-address-last-seen pa))
