@@ -529,6 +529,36 @@ Returns T if banned, NIL otherwise. Expired bans are cleaned up."
   (bt:with-lock-held (*ban-lock*)
     (clrhash *banned-peers*)))
 
+(defun ban-address (address &optional (seconds +ban-duration-seconds+))
+  "Manually ban ADDRESS (string) for SECONDS from now (Bitcoin Core setban add).
+Returns T, NIL for an empty address."
+  (when (and (stringp address) (plusp (length address)))
+    (bt:with-lock-held (*ban-lock*)
+      (setf (gethash address *banned-peers*)
+            (+ (get-universal-time) seconds)))
+    t))
+
+(defun unban-address (address)
+  "Remove ADDRESS from the ban list (Bitcoin Core setban remove). Returns T if it
+was banned, NIL otherwise."
+  (bt:with-lock-held (*ban-lock*)
+    (remhash address *banned-peers*)))
+
+(defun list-bans ()
+  "Return a list of (address . banned-until-universal-time) for active bans,
+pruning any that have expired (Bitcoin Core listbanned)."
+  (let ((now (get-universal-time))
+        (result '())
+        (expired '()))
+    (bt:with-lock-held (*ban-lock*)
+      (maphash (lambda (addr expiry)
+                 (if (> now expiry)
+                     (push addr expired)
+                     (push (cons addr expiry) result)))
+               *banned-peers*)
+      (dolist (addr expired) (remhash addr *banned-peers*)))
+    result))
+
 ;;; Per-Peer Rate Limiting
 
 (defun check-peer-rate-limit (peer command)
