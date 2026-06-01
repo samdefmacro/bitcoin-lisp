@@ -461,20 +461,30 @@ Mirrors Bitcoin Core's BanMan discourage filter: auto-populated on misbehavior,
 never persisted, and bounded (FIFO eviction) so a peer cannot grow it without
 limit. Reuses the recent-rejects ring+hashtable structure.")
 
+(defvar *ban-lock* (bt:make-lock "ban-lock")
+  "Guards *banned-peers* and *discouraged-peers* (their hash-table / ring-buffer
+mutations are not thread-safe). These are sync-thread-only today, so this is
+future-proofing for a cross-thread writer (e.g. a setban RPC). Lock order is
+always node-lock -> ban-lock (the readers run standalone or already under
+node-lock), never the reverse, so it cannot deadlock against node-lock.")
+
 (defun discourage-peer (address)
   "Mark ADDRESS as discouraged (bounded rolling filter)."
   (when (and address (plusp (length address)))
-    (bitcoin-lisp:add-recent-reject *discouraged-peers* address)))
+    (bt:with-lock-held (*ban-lock*)
+      (bitcoin-lisp:add-recent-reject *discouraged-peers* address))))
 
 (defun peer-discouraged-p (address)
   "T if ADDRESS is currently discouraged."
   (and address (plusp (length address))
-       (bitcoin-lisp:recent-reject-p *discouraged-peers* address)
+       (bt:with-lock-held (*ban-lock*)
+         (bitcoin-lisp:recent-reject-p *discouraged-peers* address))
        t))
 
 (defun clear-discouraged ()
   "Clear the discourage filter."
-  (bitcoin-lisp:clear-recent-rejects *discouraged-peers*))
+  (bt:with-lock-held (*ban-lock*)
+    (bitcoin-lisp:clear-recent-rejects *discouraged-peers*)))
 
 (defun record-misbehavior (peer score-increment)
   "Increment PEER's misbehavior score by SCORE-INCREMENT. At the discourage
@@ -494,8 +504,9 @@ Core's Misbehaving -> Discourage). Returns T if the peer was discouraged."
   (setf (peer-state peer) :banned)
   (let ((address (peer-address peer)))
     (when (and address (plusp (length address)))
-      (setf (gethash address *banned-peers*)
-            (+ (get-universal-time) +ban-duration-seconds+))))
+      (bt:with-lock-held (*ban-lock*)
+        (setf (gethash address *banned-peers*)
+              (+ (get-universal-time) +ban-duration-seconds+)))))
   (when (peer-connection peer)
     (close-connection (peer-connection peer))
     (setf (peer-connection peer) nil)))
@@ -503,18 +514,20 @@ Core's Misbehaving -> Discourage). Returns T if the peer was discouraged."
 (defun peer-banned-p (address)
   "Check if ADDRESS is currently banned.
 Returns T if banned, NIL otherwise. Expired bans are cleaned up."
-  (let ((expiry (gethash address *banned-peers*)))
-    (cond
-      ((null expiry) nil)
-      ((> (get-universal-time) expiry)
-       ;; Ban expired, remove it
-       (remhash address *banned-peers*)
-       nil)
-      (t t))))
+  (bt:with-lock-held (*ban-lock*)
+    (let ((expiry (gethash address *banned-peers*)))
+      (cond
+        ((null expiry) nil)
+        ((> (get-universal-time) expiry)
+         ;; Ban expired, remove it
+         (remhash address *banned-peers*)
+         nil)
+        (t t)))))
 
 (defun clear-ban-list ()
   "Clear all bans."
-  (clrhash *banned-peers*))
+  (bt:with-lock-held (*ban-lock*)
+    (clrhash *banned-peers*)))
 
 ;;; Per-Peer Rate Limiting
 
