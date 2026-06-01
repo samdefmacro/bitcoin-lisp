@@ -302,3 +302,35 @@
   ;; fail at connect time anyway — but the discouraged guard returns NIL first.
   (is (null (bitcoin-lisp.networking:connect-peer "192.0.2.123" 18333)))
   (bitcoin-lisp.networking:clear-discouraged))
+
+;;;; ============================================================
+;;;; Serve-request rate limiting (getheaders/getblocks/getaddr)
+;;;; ============================================================
+
+(test rate-limit-serve-config-present
+  "The shared serve-request rate-limit config is a (rate . burst) pair."
+  (is (consp bitcoin-lisp:*rate-limit-serve*)))
+
+(test rate-limit-serve-throttles-getheaders-flood
+  "A flood of getheaders is throttled (eventually denied), and getblocks/getaddr
+share the same bucket — once it's drained, they are denied too."
+  (let ((peer (bitcoin-lisp.networking:make-peer)))
+    (bitcoin-lisp.networking::init-peer-rate-limiters peer)
+    ;; The first call is allowed (full burst); drive well past the burst rapidly.
+    (is-true (bitcoin-lisp.networking::check-peer-rate-limit peer "getheaders"))
+    (let ((denied nil))
+      (dotimes (i 100)
+        (unless (bitcoin-lisp.networking::check-peer-rate-limit peer "getheaders")
+          (setf denied t)))
+      (is-true denied))
+    ;; Bucket is shared: getblocks and getaddr are now denied as well.
+    (is-false (bitcoin-lisp.networking::check-peer-rate-limit peer "getblocks"))
+    (is-false (bitcoin-lisp.networking::check-peer-rate-limit peer "getaddr"))))
+
+(test rate-limit-unrelated-command-unaffected
+  "Draining the serve bucket does not throttle an unrelated command (ping)."
+  (let ((peer (bitcoin-lisp.networking:make-peer)))
+    (bitcoin-lisp.networking::init-peer-rate-limiters peer)
+    (dotimes (i 100) (bitcoin-lisp.networking::check-peer-rate-limit peer "getheaders"))
+    ;; ping has no bucket -> always allowed.
+    (is-true (bitcoin-lisp.networking::check-peer-rate-limit peer "ping"))))
