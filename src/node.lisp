@@ -90,7 +90,7 @@ we cap lower). Excess inbound connections are disconnected at merge time.")
   (listener-socket nil)
   (listener-thread nil :type (or null bt:thread))
   (pending-inbound-peers '() :type list)
-  (lock (bt:make-lock "node-lock"))
+  (lock (bt:make-recursive-lock "node-lock"))
   (known-addresses '() :type list)
   (max-peers 8 :type (unsigned-byte 8)))
 
@@ -259,36 +259,41 @@ For testnet, data stays at the base directory (backward compatible)."
   "Move handshaked inbound peers from the lock-guarded hand-off list into the
 node's peer list (capped at +max-inbound-peers+; excess are disconnected). Called
 by the sync thread, so PEERS stays single-writer."
-  (let ((pending (bt:with-lock-held ((node-lock node))
+  (let ((pending (bt:with-recursive-lock-held ((node-lock node))
                    (prog1 (node-pending-inbound-peers node)
                      (setf (node-pending-inbound-peers node) nil)))))
+    ;; node-peers is written only by the sync thread, but RPC threads read it
+    ;; under node-lock; hold the lock around the count + push so those reads see
+    ;; a consistent set. Recursive: evict-discouraged-inbound re-takes it.
     (dolist (peer pending)
-      (cond
-        ((< (count-inbound-peers node) +max-inbound-peers+)
-         (push peer (node-peers node)))
-        ;; At capacity: a discouraged existing inbound peer is preferred for
-        ;; eviction (Bitcoin Core), so make room for the newcomer if we can.
-        ((evict-discouraged-inbound node)
-         (push peer (node-peers node)))
-        (t
-         (log-info "Inbound peer cap reached; dropping ~A"
-                   (bitcoin-lisp.networking:peer-address peer))
-         (bitcoin-lisp.networking:disconnect-peer peer))))))
+      (bt:with-recursive-lock-held ((node-lock node))
+        (cond
+          ((< (count-inbound-peers node) +max-inbound-peers+)
+           (push peer (node-peers node)))
+          ;; At capacity: a discouraged existing inbound peer is preferred for
+          ;; eviction (Bitcoin Core), so make room for the newcomer if we can.
+          ((evict-discouraged-inbound node)
+           (push peer (node-peers node)))
+          (t
+           (log-info "Inbound peer cap reached; dropping ~A"
+                     (bitcoin-lisp.networking:peer-address peer))
+           (bitcoin-lisp.networking:disconnect-peer peer)))))))
 
 (defun evict-discouraged-inbound (node)
   "If any existing inbound peer is discouraged, disconnect it and return T so a
 new inbound connection can take its slot. NIL if none are discouraged."
-  (let ((victim (find-if (lambda (p)
-                           (and (bitcoin-lisp.networking:peer-inbound p)
-                                (bitcoin-lisp.networking:peer-discouraged-p
-                                 (bitcoin-lisp.networking:peer-address p))))
-                         (node-peers node))))
-    (when victim
-      (log-info "Evicting discouraged inbound peer ~A to admit a new connection"
-                (bitcoin-lisp.networking:peer-address victim))
-      (setf (node-peers node) (remove victim (node-peers node)))
-      (bitcoin-lisp.networking:disconnect-peer victim)
-      t)))
+  (bt:with-recursive-lock-held ((node-lock node))
+    (let ((victim (find-if (lambda (p)
+                             (and (bitcoin-lisp.networking:peer-inbound p)
+                                  (bitcoin-lisp.networking:peer-discouraged-p
+                                   (bitcoin-lisp.networking:peer-address p))))
+                           (node-peers node))))
+      (when victim
+        (log-info "Evicting discouraged inbound peer ~A to admit a new connection"
+                  (bitcoin-lisp.networking:peer-address victim))
+        (setf (node-peers node) (remove victim (node-peers node)))
+        (bitcoin-lisp.networking:disconnect-peer victim)
+        t))))
 
 (defun run-inbound-listener (node)
   "Accept inbound connections, handshake each, and hand the ready peer to the
@@ -306,7 +311,7 @@ loop only briefly; a thread pool is a future refinement."
                          (progn
                            (bitcoin-lisp.networking:send-post-handshake-messages peer)
                            (bitcoin-lisp.networking:send-compact-block-negotiation peer)
-                           (bt:with-lock-held ((node-lock node))
+                           (bt:with-recursive-lock-held ((node-lock node))
                              (push peer (node-pending-inbound-peers node)))
                            (log-info "Inbound peer ~A (~A) handshake complete"
                                      (bitcoin-lisp.networking:peer-address peer)
@@ -855,7 +860,7 @@ flush (atomic temp+fsync+rename inside save-*)."
   (setf (node-listener-thread *node*) nil)
   ;; Disconnect any inbound peers not yet merged into the peer list. The listener
   ;; thread is already joined above, but take the lock for consistency.
-  (let ((pending (bt:with-lock-held ((node-lock *node*))
+  (let ((pending (bt:with-recursive-lock-held ((node-lock *node*))
                    (prog1 (node-pending-inbound-peers *node*)
                      (setf (node-pending-inbound-peers *node*) nil)))))
     (dolist (peer pending)
@@ -887,7 +892,8 @@ flush (atomic temp+fsync+rename inside save-*)."
         (bitcoin-lisp.networking:disconnect-peer peer)
       (error (c)
         (log-warn "Error disconnecting peer: ~A" c))))
-  (setf (node-peers *node*) nil)
+  (bt:with-recursive-lock-held ((node-lock *node*))
+    (setf (node-peers *node*) nil))
 
   ;; Save chain state
   (log-info "Saving chain state...")
@@ -1054,7 +1060,8 @@ Returns the number of peers connected."
                          address-book ip-bytes peer-port))))
                   ;; Send compact block negotiation (BIP 152)
                   (bitcoin-lisp.networking:send-compact-block-negotiation peer)
-                  (push peer (node-peers node))
+                  (bt:with-recursive-lock-held ((node-lock node))
+                    (push peer (node-peers node)))
                   (incf connected))
                 (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
                   (bitcoin-lisp.networking:disconnect-peer peer))))
@@ -1098,7 +1105,8 @@ Also checks compact block reconstruction timeouts (BIP 152)."
       (handler-case
           (bitcoin-lisp.networking:disconnect-peer peer)
         (error (c) (declare (ignore c))))
-      (setf (node-peers node) (remove peer (node-peers node))))
+      (bt:with-recursive-lock-held ((node-lock node))
+        (setf (node-peers node) (remove peer (node-peers node)))))
     (length to-disconnect)))
 
 (defun replace-disconnected-peers (node)
@@ -1113,10 +1121,11 @@ Returns the number of new peers connected."
       (return-from replace-disconnected-peers 0))
 
     ;; Remove disconnected peers from list
-    (setf (node-peers node)
-          (remove-if (lambda (p)
-                       (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
-                     (node-peers node)))
+    (bt:with-recursive-lock-held ((node-lock node))
+      (setf (node-peers node)
+            (remove-if (lambda (p)
+                         (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
+                       (node-peers node))))
 
     ;; Get addresses already in use
     (let ((used-addrs (mapcar #'bitcoin-lisp.networking:peer-address
@@ -1137,7 +1146,8 @@ Returns the number of new peers connected."
                     (bitcoin-lisp.networking:send-post-handshake-messages peer)
                     ;; Send compact block negotiation (BIP 152)
                     (bitcoin-lisp.networking:send-compact-block-negotiation peer)
-                    (push peer (node-peers node))
+                    (bt:with-recursive-lock-held ((node-lock node))
+                      (push peer (node-peers node)))
                     (incf connected))
                   (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
                     (bitcoin-lisp.networking:disconnect-peer peer))))

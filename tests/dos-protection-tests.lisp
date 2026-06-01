@@ -334,3 +334,65 @@ share the same bucket — once it's drained, they are denied too."
     (dotimes (i 100) (bitcoin-lisp.networking::check-peer-rate-limit peer "getheaders"))
     ;; ping has no bucket -> always allowed.
     (is-true (bitcoin-lisp.networking::check-peer-rate-limit peer "ping"))))
+
+;;;; ============================================================
+;;;; Concurrency hardening (recursive node-lock, ban-lock, node-peers)
+;;;; ============================================================
+
+(test recursive-lock-nesting-works
+  "A recursive lock can be re-acquired by the same thread (the mechanism
+node-lock now uses); a non-recursive lock would deadlock here."
+  (let ((lock (bt:make-recursive-lock "test")))
+    (is (eq :ok (bt:with-recursive-lock-held (lock)
+                  (bt:with-recursive-lock-held (lock) :ok))))))
+
+(test node-lock-is-recursive
+  "node-lock is recursive: nested acquisition on the real node lock succeeds."
+  (let ((node (bitcoin-lisp::make-node)))
+    (is (eq :ok (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                  (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                    :ok))))))
+
+(test ban-lock-concurrent-stress
+  "Many threads hammering the discourage/ban globals do not crash or corrupt
+the shared structures (the *ban-lock* serializes their mutations)."
+  (bitcoin-lisp.networking:clear-discouraged)
+  (bitcoin-lisp.networking:clear-ban-list)
+  (let ((threads '()))
+    (dotimes (i 8)
+      (push (bt:make-thread
+             (lambda ()
+               (dotimes (j 2000)
+                 (let ((addr (format nil "10.0.~D.~D" (mod j 5) i)))
+                   (bitcoin-lisp.networking:discourage-peer addr)
+                   (bitcoin-lisp.networking:peer-discouraged-p addr)
+                   (bitcoin-lisp.networking:peer-banned-p addr)))))
+            threads))
+    (dolist (th threads) (bt:join-thread th))
+    ;; Still functional after the contention.
+    (bitcoin-lisp.networking:discourage-peer "203.0.113.50")
+    (is-true (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.50"))
+    (bitcoin-lisp.networking:clear-discouraged)))
+
+(test node-peers-concurrent-stress
+  "A writer mutating node-peers and a reader copy-listing it (both under
+node-lock) run concurrently without crashing or deadlocking."
+  (let ((node (bitcoin-lisp::make-node)))
+    (let ((writer (bt:make-thread
+                   (lambda ()
+                     (dotimes (i 3000)
+                       (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                         (push (bitcoin-lisp.networking:make-peer)
+                               (bitcoin-lisp::node-peers node)))
+                       (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                         (when (bitcoin-lisp::node-peers node)
+                           (setf (bitcoin-lisp::node-peers node)
+                                 (rest (bitcoin-lisp::node-peers node)))))))))
+          (reader (bt:make-thread
+                   (lambda ()
+                     (dotimes (i 3000)
+                       (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                         (length (copy-list (bitcoin-lisp::node-peers node)))))))))
+      (bt:join-thread writer)
+      (bt:join-thread reader)
+      (is-true t))))
