@@ -220,6 +220,7 @@
    #:serialize-transaction
    #:coinbase-input-p
    #:get-unix-time
+   #:+universal-unix-epoch-offset+
    #:read-net-addr
    #:net-addr
    #:make-net-addr
@@ -778,6 +779,11 @@
    #:ban-peer
    #:peer-banned-p
    #:clear-ban-list
+   #:ban-address
+   #:unban-address
+   #:list-bans
+   #:*total-bytes-sent*
+   #:*total-bytes-received*
    #:discourage-peer
    #:peer-discouraged-p
    #:clear-discouraged

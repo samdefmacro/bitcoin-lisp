@@ -14,6 +14,15 @@
   (bytes-sent 0 :type integer)
   (bytes-received 0 :type integer))
 
+;;; Node-wide cumulative byte counters (survive individual connection
+;;; lifetimes), for getnettotals. Bumped on every send/receive. Plain incf —
+;;; a lost update under thread contention only slightly under-counts a stat,
+;;; never corrupts.
+(defvar *total-bytes-sent* 0
+  "Total bytes written to all peer sockets since startup.")
+(defvar *total-bytes-received* 0
+  "Total bytes read from all peer sockets since startup.")
+
 (defun set-tcp-nodelay (usocket-socket)
   "Disable Nagle's algorithm on USOCKET-SOCKET. Bitcoin's wire protocol
 sends small request messages followed by long silence while awaiting
@@ -105,6 +114,7 @@ Returns the number of bytes sent or NIL on failure."
           (write-sequence bytes stream)
           (force-output stream)
           (incf (connection-bytes-sent conn) (length bytes))
+          (incf *total-bytes-sent* (length bytes))
           (setf (connection-last-activity conn) (get-universal-time))
           (length bytes)))
     (error ()
@@ -144,6 +154,7 @@ Returns a byte vector or NIL on failure/timeout."
                            (setf total-read n)))))
             (when (= total-read count)
               (incf (connection-bytes-received conn) count)
+              (incf *total-bytes-received* count)
               (setf (connection-last-activity conn) (get-universal-time))
               buffer))))
     (error ()

@@ -715,6 +715,105 @@ null on success; errors if no connected peer has that address."
         (bitcoin-lisp.networking:disconnect-peer target)
         nil))))
 
+;;; --- Manual ban management (Bitcoin Core setban/listbanned/clearbanned) ---
+;;;
+;;; The MANUAL ban list (*banned-peers*) is separate from the automatic,
+;;; ephemeral discouragement filter (see record-misbehavior); these RPCs only
+;;; touch manual bans. Addresses are matched exactly (no subnet/CIDR support).
+
+(defun rpc-setban (node params)
+  "Add or remove a manual ban (Bitcoin Core setban). PARAMS:
+(address command [bantime] [absolute]). COMMAND is \"add\" or \"remove\". For add,
+BANTIME is seconds from now (default 24h), or an absolute Unix time when ABSOLUTE
+is true. Returns null."
+  (declare (ignore node))
+  (let ((address (first params))
+        (command (second params))
+        (bantime (third params))
+        (absolute (fourth params)))
+    (unless (and (stringp address) (plusp (length address)))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "address required"))
+    (cond
+      ((equal command "add")
+       (cond
+         ((null bantime) (bitcoin-lisp.networking:ban-address address))
+         ((not (integerp bantime))
+          (error 'rpc-error :code +rpc-invalid-parameter+ :message "bantime must be an integer"))
+         (absolute
+          (bitcoin-lisp.networking:ban-address
+           address (max 0 (- bantime (bitcoin-lisp.serialization:get-unix-time)))))
+         (t (bitcoin-lisp.networking:ban-address address bantime)))
+       nil)
+      ((equal command "remove")
+       (unless (bitcoin-lisp.networking:unban-address address)
+         (error 'rpc-error :code +rpc-misc-error+
+                           :message "Unban failed: address is not banned"))
+       nil)
+      (t (error 'rpc-error :code +rpc-invalid-parameter+
+                           :message "command must be \"add\" or \"remove\"")))))
+
+(defun rpc-listbanned (node params)
+  "List active manual bans (Bitcoin Core listbanned)."
+  (declare (ignore node params))
+  (mapcar (lambda (ban)
+            `(("address" . ,(car ban))
+              ("banned_until" . ,(- (cdr ban)
+                                    bitcoin-lisp.serialization:+universal-unix-epoch-offset+))))
+          (bitcoin-lisp.networking:list-bans)))
+
+(defun rpc-clearbanned (node params)
+  "Clear all manual bans (Bitcoin Core clearbanned). Returns null."
+  (declare (ignore node params))
+  (bitcoin-lisp.networking:clear-ban-list)
+  nil)
+
+;;; --- Network totals (Bitcoin Core getnettotals) ---
+
+(defun rpc-getnettotals (node params)
+  "Cumulative network byte totals since startup (Bitcoin Core getnettotals)."
+  (declare (ignore node params))
+  `(("totalbytesrecv" . ,bitcoin-lisp.networking:*total-bytes-received*)
+    ("totalbytessent" . ,bitcoin-lisp.networking:*total-bytes-sent*)
+    ("timemillis" . ,(* (bitcoin-lisp.serialization:get-unix-time) 1000))
+    ;; No upload limit is enforced; report the disabled-target shape Core uses.
+    ("uploadtarget" . (("timeframe" . 86400)
+                       ("target" . 0)
+                       ("target_reached" . nil)
+                       ("serve_historical_blocks" . t)
+                       ("bytes_left_in_cycle" . 0)
+                       ("time_left_in_cycle" . 0)))))
+
+;;; --- Chain verification (Bitcoin Core verifychain) ---
+
+(defun rpc-verifychain (node params)
+  "Re-verify the last NBLOCKS blocks from the block store (Bitcoin Core
+verifychain). PARAMS: ([checklevel] [nblocks]). At checklevel >= 1 each block is
+re-read and its merkle root + proof-of-work re-checked; level 0 only confirms the
+block reads back. Returns T if all checks pass, NIL otherwise."
+  (let* ((checklevel (if (integerp (first params)) (first params) 3))
+         (nblocks (if (integerp (second params)) (second params) 6))
+         (chain-state (rpc-get-chain-state node))
+         (block-store (rpc-get-block-store node))
+         (tip (bitcoin-lisp.storage:current-height chain-state)))
+    (when (or (<= nblocks 0) (> nblocks (1+ tip)))
+      (setf nblocks (1+ tip)))
+    (loop for height from tip downto (max 0 (- tip (1- nblocks)))
+          do (let ((entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+               (unless entry (return-from rpc-verifychain nil))
+               (let ((block (bitcoin-lisp.storage:get-block
+                             block-store
+                             (bitcoin-lisp.storage:block-index-entry-hash entry))))
+                 (unless block (return-from rpc-verifychain nil))
+                 (when (>= checklevel 1)
+                   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+                          (txids (mapcar #'bitcoin-lisp.serialization:transaction-hash
+                                         (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
+                     (unless (and (equalp (bitcoin-lisp.validation:compute-merkle-root txids)
+                                          (bitcoin-lisp.serialization:block-header-merkle-root header))
+                                  (bitcoin-lisp.validation:check-proof-of-work header))
+                       (return-from rpc-verifychain nil)))))))
+    t))
+
 ;;; --- Node / chain info RPCs ---
 
 (defun rpc-getdifficulty (node params)
