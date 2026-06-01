@@ -530,3 +530,17 @@ equal-work forks."
               (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xEE))
            (is (null ok)) (is (eq :block-not-found reason)))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test rpc-verifychain-reads-stored-blocks
+  "verifychain (checklevel 0) confirms the last N stored blocks read back from
+the block store."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "verifychain")
+     (%build-and-connect chain-state block-store utxo-set genesis-hash
+                         (make-test-chain-hashes #x70 3))
+     (let ((node (bitcoin-lisp::make-node)))
+       (setf (bitcoin-lisp::node-chain-state node) chain-state)
+       (setf (bitcoin-lisp::node-block-store node) block-store)
+       (is (eq t (bitcoin-lisp.rpc::rpc-verifychain node (list 0 3)))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))

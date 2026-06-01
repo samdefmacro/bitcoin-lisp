@@ -902,3 +902,49 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     ;; a malformed hash -> error
     (signals error
       (bitcoin-lisp.rpc::rpc-reconsiderblock node (list "not-a-hash")))))
+
+;;; --- setban / listbanned / clearbanned / getnettotals / verifychain ---
+
+(test rpc-setban-add-list-remove-clear
+  "setban add/remove + listbanned + clearbanned manage the manual ban list."
+  (bitcoin-lisp.networking:clear-ban-list)
+  (let ((node (make-test-node)))
+    (is (null (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "add"))))
+    (is-true (bitcoin-lisp.networking:peer-banned-p "1.2.3.4"))
+    (let ((banned (bitcoin-lisp.rpc::rpc-listbanned node nil)))
+      (is (= 1 (length banned)))
+      (is (string= "1.2.3.4" (cdr (assoc "address" (first banned) :test #'string=))))
+      (is (integerp (cdr (assoc "banned_until" (first banned) :test #'string=)))))
+    (is (null (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "remove"))))
+    (is (not (bitcoin-lisp.networking:peer-banned-p "1.2.3.4")))
+    ;; remove a non-existent ban / bad command -> error
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-setban node (list "9.9.9.9" "remove")))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "bogus")))
+    ;; clearbanned empties the list
+    (bitcoin-lisp.rpc::rpc-setban node (list "5.6.7.8" "add"))
+    (is (null (bitcoin-lisp.rpc::rpc-clearbanned node nil)))
+    (is (= 0 (length (bitcoin-lisp.rpc::rpc-listbanned node nil))))))
+
+(test rpc-setban-absolute-bantime
+  "setban add with absolute=true sets banned_until to the given Unix time."
+  (bitcoin-lisp.networking:clear-ban-list)
+  (let ((node (make-test-node))
+        (future (+ (bitcoin-lisp.serialization:get-unix-time) 3600)))
+    (bitcoin-lisp.rpc::rpc-setban node (list "10.0.0.1" "add" future t))
+    (let ((banned (bitcoin-lisp.rpc::rpc-listbanned node nil)))
+      (is (<= (abs (- future (cdr (assoc "banned_until" (first banned) :test #'string=)))) 2)))
+    (bitcoin-lisp.networking:clear-ban-list)))
+
+(test rpc-getnettotals-fields
+  "getnettotals returns integer byte totals + timemillis + an uploadtarget object."
+  (let ((r (bitcoin-lisp.rpc::rpc-getnettotals (make-test-node) nil)))
+    (is (integerp (cdr (assoc "totalbytesrecv" r :test #'string=))))
+    (is (integerp (cdr (assoc "totalbytessent" r :test #'string=))))
+    (is (integerp (cdr (assoc "timemillis" r :test #'string=))))
+    (is (consp (cdr (assoc "uploadtarget" r :test #'string=))))))
+
+(test rpc-verifychain-empty-node-returns-nil
+  "verifychain on a node with no stored blocks returns NIL gracefully."
+  (is (null (bitcoin-lisp.rpc::rpc-verifychain (make-test-node) (list 0 1)))))
