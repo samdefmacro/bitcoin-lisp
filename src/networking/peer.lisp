@@ -154,8 +154,8 @@ nodes_testnet4.txt source).")
 (defun connect-peer (host &optional (port *current-port*))
   "Connect to a peer at HOST:PORT.
 Returns a peer structure or NIL on failure.
-Returns NIL if the host is banned."
-  (when (peer-banned-p host)
+Returns NIL if the host is banned or discouraged (never dial either)."
+  (when (or (peer-banned-p host) (peer-discouraged-p host))
     (return-from connect-peer nil))
   (let ((conn (make-tcp-connection host port)))
     (when conn
@@ -433,10 +433,18 @@ are likely unproductive. Returns T if the peer should be disconnected."
        ;; Peer claims a height far behind ours (>1000 blocks)
        (> our-height (+ (peer-start-height peer) 1000))))
 
-;;; Misbehavior Scoring and Banning
+;;; Misbehavior Scoring, Discouragement, and Banning
+;;;
+;;; Two distinct mechanisms, mirroring Bitcoin Core's BanMan:
+;;;  - Discouragement (automatic): a peer that accumulates misbehavior is added
+;;;    to a bounded, ephemeral rolling filter. We never dial it, prefer it for
+;;;    inbound eviction, and don't gossip it — but it is not hard-banned (which
+;;;    previously let a peer grow our banned map without bound).
+;;;  - Banning (manual): ban-peer / *banned-peers*, an explicit address ban with
+;;;    an expiry (e.g. for a future setban RPC). Unaffected by misbehavior.
 
-(defconstant +misbehavior-ban-threshold+ 100
-  "Misbehavior score at which a peer gets banned.")
+(defconstant +misbehavior-discourage-threshold+ 100
+  "Misbehavior score at which a peer is discouraged and disconnected.")
 
 (defconstant +ban-duration-seconds+ (* 24 60 60)
   "Ban duration: 24 hours.")
@@ -444,13 +452,38 @@ are likely unproductive. Returns T if the peer should be disconnected."
 (defvar *banned-peers* (make-hash-table :test 'equal)
   "Hash table mapping peer address (string) -> ban-expiry-time (universal-time).")
 
+(defvar *discouraged-peers* (bitcoin-lisp:make-rejects-filter)
+  "Bounded, ephemeral rolling set of discouraged peer addresses (strings).
+Mirrors Bitcoin Core's BanMan discourage filter: auto-populated on misbehavior,
+never persisted, and bounded (FIFO eviction) so a peer cannot grow it without
+limit. Reuses the recent-rejects ring+hashtable structure.")
+
+(defun discourage-peer (address)
+  "Mark ADDRESS as discouraged (bounded rolling filter)."
+  (when (and address (plusp (length address)))
+    (bitcoin-lisp:add-recent-reject *discouraged-peers* address)))
+
+(defun peer-discouraged-p (address)
+  "T if ADDRESS is currently discouraged."
+  (and address (plusp (length address))
+       (bitcoin-lisp:recent-reject-p *discouraged-peers* address)
+       t))
+
+(defun clear-discouraged ()
+  "Clear the discourage filter."
+  (bitcoin-lisp:clear-recent-rejects *discouraged-peers*))
+
 (defun record-misbehavior (peer score-increment)
-  "Increment PEER's misbehavior score by SCORE-INCREMENT.
-If the score reaches the ban threshold, the peer is banned and disconnected.
-Returns T if the peer was banned."
+  "Increment PEER's misbehavior score by SCORE-INCREMENT. At the discourage
+threshold, mark the peer's address as discouraged and disconnect it (Bitcoin
+Core's Misbehaving -> Discourage). Returns T if the peer was discouraged."
   (incf (peer-misbehavior-score peer) score-increment)
-  (when (>= (peer-misbehavior-score peer) +misbehavior-ban-threshold+)
-    (ban-peer peer)
+  (when (>= (peer-misbehavior-score peer) +misbehavior-discourage-threshold+)
+    (discourage-peer (peer-address peer))
+    (when (peer-connection peer)
+      (close-connection (peer-connection peer))
+      (setf (peer-connection peer) nil))
+    (setf (peer-state peer) :disconnected)
     t))
 
 (defun ban-peer (peer)

@@ -315,8 +315,9 @@
 
 ;;;; Misbehavior Scoring Tests
 
-(test peer-misbehavior-ban-threshold
-  "Peer should be banned when misbehavior score reaches threshold."
+(test peer-misbehavior-discourage-threshold
+  "Peer should be discouraged (not hard-banned) when misbehavior reaches threshold."
+  (bitcoin-lisp.networking:clear-discouraged)
   (let ((peer (bitcoin-lisp.networking:make-peer)))
     (setf (bitcoin-lisp.networking:peer-state peer) :ready)
     (setf (bitcoin-lisp.networking:peer-address peer) "192.0.2.99")
@@ -324,13 +325,14 @@
     (is (not (bitcoin-lisp.networking:record-misbehavior peer 50)))
     (is (= 50 (bitcoin-lisp.networking:peer-misbehavior-score peer)))
     (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))
-    ;; Score reaches threshold
+    (is (not (bitcoin-lisp.networking:peer-discouraged-p "192.0.2.99")))
+    ;; Score reaches threshold -> discouraged + disconnected
     (is (bitcoin-lisp.networking:record-misbehavior peer 50))
-    (is (eq :banned (bitcoin-lisp.networking:peer-state peer)))
-    ;; Address should be in ban list
-    (is (bitcoin-lisp.networking:peer-banned-p "192.0.2.99"))
-    ;; Cleanup
-    (bitcoin-lisp.networking:clear-ban-list)))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+    (is (bitcoin-lisp.networking:peer-discouraged-p "192.0.2.99"))
+    ;; Discouragement is NOT a hard ban.
+    (is (not (bitcoin-lisp.networking:peer-banned-p "192.0.2.99")))
+    (bitcoin-lisp.networking:clear-discouraged)))
 
 (test peer-banned-p-check
   "peer-banned-p should return T for banned addresses, NIL for others."
@@ -346,15 +348,17 @@
   (is (not (bitcoin-lisp.networking:peer-banned-p "192.0.2.2")))
   (bitcoin-lisp.networking:clear-ban-list))
 
-(test peer-invalid-block-immediate-ban
-  "Sending an invalid block should result in immediate ban (+100)."
+(test peer-invalid-block-immediate-discourage
+  "Sending an invalid block should immediately discourage (+100)."
+  (bitcoin-lisp.networking:clear-discouraged)
   (let ((peer (bitcoin-lisp.networking:make-peer)))
     (setf (bitcoin-lisp.networking:peer-state peer) :ready)
     (setf (bitcoin-lisp.networking:peer-address peer) "192.0.2.100")
-    ;; One invalid block = +100 = immediate ban
+    ;; One invalid block = +100 = immediate discouragement.
     (is (bitcoin-lisp.networking:record-misbehavior peer 100))
-    (is (eq :banned (bitcoin-lisp.networking:peer-state peer)))
-    (bitcoin-lisp.networking:clear-ban-list)))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+    (is (bitcoin-lisp.networking:peer-discouraged-p "192.0.2.100"))
+    (bitcoin-lisp.networking:clear-discouraged)))
 
 ;;;; Block Timeout Peer Rotation Tests
 

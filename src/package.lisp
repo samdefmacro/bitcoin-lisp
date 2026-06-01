@@ -777,8 +777,11 @@
    #:ban-peer
    #:peer-banned-p
    #:clear-ban-list
+   #:discourage-peer
+   #:peer-discouraged-p
+   #:clear-discouraged
    #:peer-misbehavior-score
-   #:+misbehavior-ban-threshold+
+   #:+misbehavior-discourage-threshold+
    #:*banned-peers*
    ;; DoS protection
    #:check-peer-rate-limit
