@@ -674,8 +674,12 @@ elicit more than one reply regardless of whether we had addresses to send."
                     (let ((node bitcoin-lisp::*node*))
                       (and node (bitcoin-lisp::node-address-book node))))))
       (when book
-        (let ((addrs (address-book-get-addr book :max +addrman-getaddr-max+
-                                                 :pct +addrman-getaddr-pct+)))
+        ;; Don't gossip discouraged addresses (Bitcoin Core skips them in relay).
+        (let ((addrs (remove-if
+                      (lambda (pa)
+                        (peer-discouraged-p (ip-bytes-to-string (peer-address-ip pa))))
+                      (address-book-get-addr book :max +addrman-getaddr-max+
+                                                  :pct +addrman-getaddr-pct+))))
           (when addrs
             (send-message peer (build-addr-response peer addrs))))))))
 

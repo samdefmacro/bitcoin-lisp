@@ -263,12 +263,32 @@ by the sync thread, so PEERS stays single-writer."
                    (prog1 (node-pending-inbound-peers node)
                      (setf (node-pending-inbound-peers node) nil)))))
     (dolist (peer pending)
-      (if (< (count-inbound-peers node) +max-inbound-peers+)
-          (push peer (node-peers node))
-          (progn
-            (log-info "Inbound peer cap reached; dropping ~A"
-                      (bitcoin-lisp.networking:peer-address peer))
-            (bitcoin-lisp.networking:disconnect-peer peer))))))
+      (cond
+        ((< (count-inbound-peers node) +max-inbound-peers+)
+         (push peer (node-peers node)))
+        ;; At capacity: a discouraged existing inbound peer is preferred for
+        ;; eviction (Bitcoin Core), so make room for the newcomer if we can.
+        ((evict-discouraged-inbound node)
+         (push peer (node-peers node)))
+        (t
+         (log-info "Inbound peer cap reached; dropping ~A"
+                   (bitcoin-lisp.networking:peer-address peer))
+         (bitcoin-lisp.networking:disconnect-peer peer))))))
+
+(defun evict-discouraged-inbound (node)
+  "If any existing inbound peer is discouraged, disconnect it and return T so a
+new inbound connection can take its slot. NIL if none are discouraged."
+  (let ((victim (find-if (lambda (p)
+                           (and (bitcoin-lisp.networking:peer-inbound p)
+                                (bitcoin-lisp.networking:peer-discouraged-p
+                                 (bitcoin-lisp.networking:peer-address p))))
+                         (node-peers node))))
+    (when victim
+      (log-info "Evicting discouraged inbound peer ~A to admit a new connection"
+                (bitcoin-lisp.networking:peer-address victim))
+      (setf (node-peers node) (remove victim (node-peers node)))
+      (bitcoin-lisp.networking:disconnect-peer victim)
+      t)))
 
 (defun run-inbound-listener (node)
   "Accept inbound connections, handshake each, and hand the ready peer to the
