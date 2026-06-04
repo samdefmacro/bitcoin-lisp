@@ -14,7 +14,11 @@
   (header nil)
   (prev-entry nil)
   (chain-work 0 :type integer)
-  (status :unknown :type keyword))  ; :unknown, :header-valid, :valid, :invalid
+  (status :unknown :type keyword)  ; :unknown, :header-valid, :valid, :invalid
+  ;; Number of transactions in this block (Bitcoin Core nTx). 0 = unknown —
+  ;; header-only entries, or an index persisted before this field existed
+  ;; (backfilled lazily from the block store by getchaintxstats).
+  (tx-count 0 :type (unsigned-byte 32)))
 
 (defstruct chain-state
   "Current blockchain state."
@@ -341,8 +345,10 @@ v1 (36/40 bytes): no CRC — legacy fallback"
 (defvar *header-index-magic* (map '(vector (unsigned-byte 8)) #'char-code "HIDX")
   "Magic bytes identifying a header index file.")
 
-(defconstant +header-index-format-version+ 1
-  "Current header index persistence format version.")
+(defconstant +header-index-format-version+ 2
+  "Current header index persistence format version.
+v2 appends a per-entry tx-count (4 bytes); v1 files still load (tx-count 0,
+backfilled lazily from the block store).")
 
 (defun header-index-file-path (state)
   "Get the path to the header index file."
@@ -391,8 +397,9 @@ v1 (36/40 bytes): no CRC — legacy fallback"
       (loop repeat 80 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))))
 
 (defun bb-write-single-header-entry (bb entry)
-  "byte-buf variant of write-single-header-entry. Writes 181 bytes:
-hash(32) + height(4) + header(80) + chainwork(32) + status(1) + prev-hash(32)."
+  "byte-buf variant of write-single-header-entry. Writes 185 bytes (v2):
+hash(32) + height(4) + header(80) + chainwork(32) + status(1) + prev-hash(32)
++ tx-count(4)."
   (declare (optimize (speed 3) (safety 1)))
   (bitcoin-lisp.serialization:bb-write-bytes bb (block-index-entry-hash entry))
   (bitcoin-lisp.serialization:bb-write-u32-le bb (block-index-entry-height entry))
@@ -404,7 +411,8 @@ hash(32) + height(4) + header(80) + chainwork(32) + status(1) + prev-hash(32)."
   (let ((prev-entry (block-index-entry-prev-entry entry)))
     (if prev-entry
         (bitcoin-lisp.serialization:bb-write-bytes bb (block-index-entry-hash prev-entry))
-        (loop repeat 32 do (bitcoin-lisp.serialization:bb-write-u8 bb 0)))))
+        (loop repeat 32 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))))
+  (bitcoin-lisp.serialization:bb-write-u32-le bb (block-index-entry-tx-count entry)))
 
 (defun save-header-index (state)
   "Save the block index to a binary file with integrity checks.
@@ -475,24 +483,29 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
     ;; Skip magic
     (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
       (read-sequence magic stream))
-    ;; Check version
+    ;; Check version: v1 entries lack the trailing tx-count (read as 0,
+    ;; backfilled lazily); v2 includes it.
     (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
-      (unless (= version +header-index-format-version+)
-        (format *error-output* "WARNING: Header index version ~D not supported (expected ~D)~%"
+      (unless (member version '(1 2))
+        (format *error-output* "WARNING: Header index version ~D not supported (expected <= ~D)~%"
                 version +header-index-format-version+)
-        (return-from load-header-index-v1 nil)))
-    ;; Read entries
-    (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
-          (entries-by-hash (make-hash-table :test 'equalp))
-          (prev-hash-map (make-hash-table :test 'equalp)))
-      (dotimes (i count)
-        (read-single-header-entry stream entries-by-hash prev-hash-map))
-      (link-header-entries entries-by-hash prev-hash-map)
-      (setf (chain-state-block-index state) entries-by-hash)))
+        (return-from load-header-index-v1 nil))
+      ;; Read entries
+      (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
+            (entries-by-hash (make-hash-table :test 'equalp))
+            (prev-hash-map (make-hash-table :test 'equalp))
+            (with-tx-count (>= version 2)))
+        (dotimes (i count)
+          (read-single-header-entry stream entries-by-hash prev-hash-map
+                                    with-tx-count))
+        (link-header-entries entries-by-hash prev-hash-map)
+        (setf (chain-state-block-index state) entries-by-hash))))
   t)
 
-(defun read-single-header-entry (stream entries-by-hash prev-hash-map)
-  "Read a single header entry from STREAM into ENTRIES-BY-HASH."
+(defun read-single-header-entry (stream entries-by-hash prev-hash-map
+                                 &optional with-tx-count)
+  "Read a single header entry from STREAM into ENTRIES-BY-HASH. WITH-TX-COUNT
+reads the trailing v2 tx-count field (v1/legacy entries default it to 0)."
   (let ((hash (make-array 32 :element-type '(unsigned-byte 8))))
     (read-sequence hash stream)
     (let* ((height (bitcoin-lisp.serialization:read-uint32-le stream))
@@ -504,7 +517,10 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
                        (0 :unknown) (1 :header-valid) (2 :valid) (3 :invalid)))
              (prev-hash (make-array 32 :element-type '(unsigned-byte 8))))
         (read-sequence prev-hash stream)
-        (let ((header (handler-case
+        (let ((tx-count (if with-tx-count
+                            (bitcoin-lisp.serialization:read-uint32-le stream)
+                            0))
+              (header (handler-case
                           (flexi-streams:with-input-from-sequence (hs header-bytes)
                             (bitcoin-lisp.serialization::read-block-header hs))
                         (error () nil))))
@@ -514,7 +530,8 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
                         :header header
                         :prev-entry nil
                         :chain-work chainwork
-                        :status status)))
+                        :status status
+                        :tx-count tx-count)))
             (setf (gethash hash entries-by-hash) entry)
             (unless (every #'zerop prev-hash)
               (setf (gethash hash prev-hash-map) (copy-seq prev-hash)))))))))
