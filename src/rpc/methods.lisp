@@ -814,6 +814,76 @@ block reads back. Returns T if all checks pass, NIL otherwise."
                        (return-from rpc-verifychain nil)))))))
     t))
 
+;;; --- waitfornewblock / dumptxoutset (Bitcoin Core rpc/blockchain.cpp) ---
+
+(defun rpc-waitfornewblock (node params)
+  "Wait until the chain tip changes, then return it (Bitcoin Core
+waitfornewblock). PARAMS: ([timeout-ms]) — 0 (the default) waits indefinitely.
+Returns the current tip on change, timeout, or node shutdown. Polls the tip on
+the RPC worker thread."
+  (let ((timeout (if (integerp (first params)) (first params) 0)))
+    (when (minusp timeout)
+      (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
+    (let* ((chain-state (rpc-get-chain-state node))
+           (start-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+           (deadline (when (plusp timeout)
+                       (+ (get-internal-real-time)
+                          (floor (* timeout internal-time-units-per-second) 1000)))))
+      (loop while (and (bitcoin-lisp::node-running node)
+                       (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                               start-hash)
+                       (or (null deadline)
+                           (< (get-internal-real-time) deadline)))
+            do (sleep 0.25))
+      (let ((hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+        `(("hash" . ,(if hash (hash-to-hex hash) ""))
+          ("height" . ,(bitcoin-lisp.storage:current-height chain-state)))))))
+
+(defun rpc-dumptxoutset (node params)
+  "Write the full UTXO set to a snapshot file (Bitcoin Core dumptxoutset's
+shape; the file uses our own versioned encoding, NOT Core's assumeutxo format —
+loadtxoutset is unsupported). Streams entries in on-disk key order; like
+gettxoutsetinfo this forces a coins-cache flush first. Errors if PATH exists."
+  (let ((path (first params)))
+    (unless (and (stringp path) (plusp (length path)))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
+    (when (probe-file path)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "~A already exists" path)))
+    (let* ((chain-state (rpc-get-chain-state node))
+           (utxo-set (rpc-get-utxo-set node))
+           (base-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+           (base-height (bitcoin-lisp.storage:current-height chain-state))
+           (count 0))
+      (with-open-file (out path :direction :output :if-exists :error
+                                :element-type '(unsigned-byte 8))
+        ;; Header: magic + version + base hash + height + count (count is
+        ;; back-patched after the streaming pass).
+        (write-sequence (map '(vector (unsigned-byte 8)) #'char-code "UTXS") out)
+        (bitcoin-lisp.serialization:write-uint32-le out 1)        ; format version
+        (write-sequence (or base-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 0))
+                        out)
+        (bitcoin-lisp.serialization:write-uint32-le out base-height)
+        (let ((count-pos (file-position out)))
+          (bitcoin-lisp.serialization:write-uint32-le out 0)      ; placeholder
+          (bitcoin-lisp.storage:utxo-set-iterate
+           utxo-set
+           (lambda (txid vout entry)
+             (write-sequence txid out)
+             (bitcoin-lisp.serialization:write-uint32-le out vout)
+             (let ((v (bitcoin-lisp.storage::encode-coin-value entry)))
+               (bitcoin-lisp.serialization:write-compact-size out (length v))
+               (write-sequence v out))
+             (incf count)))
+          ;; Back-patch the entry count.
+          (file-position out count-pos)
+          (bitcoin-lisp.serialization:write-uint32-le out count)))
+      `(("coins_written" . ,count)
+        ("base_hash" . ,(if base-hash (hash-to-hex base-hash) ""))
+        ("base_height" . ,base-height)
+        ("path" . ,(namestring (truename path)))))))
+
 ;;; --- Chain tx statistics (Bitcoin Core getchaintxstats) ---
 
 (defun %entry-tx-count (entry block-store)
