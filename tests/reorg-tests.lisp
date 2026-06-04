@@ -544,3 +544,32 @@ the block store."
        (setf (bitcoin-lisp::node-block-store node) block-store)
        (is (eq t (bitcoin-lisp.rpc::rpc-verifychain node (list 0 3)))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test rpc-getchaintxstats-window
+  "getchaintxstats computes window tx counts over connected blocks (coinbase-only
+test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "chaintxstats")
+     (%build-and-connect chain-state block-store utxo-set genesis-hash
+                         (make-test-chain-hashes #x71 3))
+     (let ((node (bitcoin-lisp::make-node)))
+       (setf (bitcoin-lisp::node-chain-state node) chain-state)
+       (setf (bitcoin-lisp::node-block-store node) block-store)
+       (let ((r (bitcoin-lisp.rpc::rpc-getchaintxstats node (list 2))))
+         (is (= 3 (cdr (assoc "window_final_block_height" r :test #'string=))))
+         (is (= 2 (cdr (assoc "window_block_count" r :test #'string=))))
+         (is (= 2 (cdr (assoc "window_tx_count" r :test #'string=))))
+         (is (integerp (cdr (assoc "window_interval" r :test #'string=)))))
+       ;; tx-count persists through the v2 header index.
+       (bitcoin-lisp.storage:save-header-index chain-state)
+       (let ((cs2 (bitcoin-lisp.storage:make-chain-state
+                   :base-path (bitcoin-lisp.storage::chain-state-base-path chain-state))))
+         (is-true (bitcoin-lisp.storage:load-header-index cs2))
+         (let ((tip (bitcoin-lisp.storage:get-block-index-entry
+                     cs2 (bitcoin-lisp.storage:best-block-hash chain-state))))
+           (is (= 1 (bitcoin-lisp.storage:block-index-entry-tx-count tip)))))
+       ;; blockcount >= height -> error (Core's bound).
+       (signals bitcoin-lisp.rpc::rpc-error
+         (bitcoin-lisp.rpc::rpc-getchaintxstats node (list 99))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))

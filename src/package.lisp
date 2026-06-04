@@ -325,6 +325,7 @@
    #:block-index-entry-prev-entry
    #:block-index-entry-chain-work
    #:block-index-entry-status
+   #:block-index-entry-tx-count
    #:get-block-index-entry
    #:add-block-index-entry
    #:get-block-at-height

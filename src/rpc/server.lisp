@@ -81,6 +81,7 @@
   (register-rpc-method "clearbanned" #'rpc-clearbanned)
   ;; Chain verification
   (register-rpc-method "verifychain" #'rpc-verifychain)
+  (register-rpc-method "getchaintxstats" #'rpc-getchaintxstats)
   ;; Chain control methods
   (register-rpc-method "invalidateblock" #'rpc-invalidateblock)
   (register-rpc-method "reconsiderblock" #'rpc-reconsiderblock)

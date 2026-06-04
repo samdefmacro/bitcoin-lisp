@@ -1332,7 +1332,9 @@ Handles chain reorganizations when a competing chain has more work."
                   :header header
                   :prev-entry prev-entry
                   :chain-work chain-work
-                  :status :valid)))
+                  :status :valid
+                  :tx-count (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+                                     block)))))
       (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
 
       ;; Check if we need a reorganization
