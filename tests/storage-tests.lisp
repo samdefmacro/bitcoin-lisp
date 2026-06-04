@@ -1296,3 +1296,51 @@ because iterate itself flushes again before walking the base."
     (is (= (* 440 mib) (bitcoin-lisp::large-coins-cache-threshold (* 450 mib))))
     ;; 100 MiB budget: both terms equal 90 MiB.
     (is (= (* 90 mib) (bitcoin-lisp::large-coins-cache-threshold (* 100 mib))))))
+
+(test header-index-v1-file-still-loads
+  "A v1-format header index (181-byte entries, no tx-count) still loads after
+the v2 format bump; its entries get tx-count 0 for lazy backfill. A v1-load
+regression would silently force a from-genesis resync on deploy."
+  (let* ((tmp-dir (merge-pathnames "test-hidx-v1/" (uiop:temporary-directory)))
+         (cs (bitcoin-lisp.storage:make-chain-state :base-path tmp-dir))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1
+                  :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element 0)
+                  :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element 1)
+                  :timestamp 1231006505 :bits #x1d00ffff :nonce 0))
+         (hash (bitcoin-lisp.serialization:block-header-hash header)))
+    (ensure-directories-exist (merge-pathnames "dummy" tmp-dir))
+    (unwind-protect
+         (progn
+           ;; Hand-assemble: magic + version 1 + count 1 + one v1 entry + CRC32.
+           (let* ((data (flexi-streams:with-output-to-sequence (s)
+                          (write-sequence
+                           (map '(vector (unsigned-byte 8)) #'char-code "HIDX") s)
+                          (bitcoin-lisp.serialization:write-uint32-le s 1) ; version
+                          (bitcoin-lisp.serialization:write-uint32-le s 1) ; count
+                          (write-sequence hash s)
+                          (bitcoin-lisp.serialization:write-uint32-le s 7) ; height
+                          (write-sequence
+                           (bitcoin-lisp.serialization:serialize-block-header header) s)
+                          (let ((cw (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)))
+                            (setf (aref cw 31) 42)                  ; chainwork 42 (BE)
+                            (write-sequence cw s))
+                          (write-byte 2 s)                          ; status :valid
+                          (write-sequence (make-array 32 :element-type '(unsigned-byte 8)
+                                                         :initial-element 0) s)))
+                  (bytes (coerce data '(simple-array (unsigned-byte 8) (*)))))
+             (with-open-file (out (bitcoin-lisp.storage::header-index-file-path cs)
+                                  :direction :output :if-exists :supersede
+                                  :element-type '(unsigned-byte 8))
+               (write-sequence bytes out)
+               (write-sequence (bitcoin-lisp.storage:compute-crc32 bytes) out)))
+           (is-true (bitcoin-lisp.storage:load-header-index cs))
+           (let ((entry (bitcoin-lisp.storage:get-block-index-entry cs hash)))
+             (is (not (null entry)))
+             (is (= 7 (bitcoin-lisp.storage:block-index-entry-height entry)))
+             (is (= 42 (bitcoin-lisp.storage:block-index-entry-chain-work entry)))
+             (is (= 0 (bitcoin-lisp.storage:block-index-entry-tx-count entry)))))
+      (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))

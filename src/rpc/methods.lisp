@@ -814,6 +814,96 @@ block reads back. Returns T if all checks pass, NIL otherwise."
                        (return-from rpc-verifychain nil)))))))
     t))
 
+;;; --- Chain tx statistics (Bitcoin Core getchaintxstats) ---
+
+(defun %entry-tx-count (entry block-store)
+  "Per-block tx count for ENTRY, lazily backfilled by reading the block from
+BLOCK-STORE when the index predates the v2 tx-count field. Returns NIL when
+unknown (header-only entry whose block isn't readable, e.g. pruned)."
+  (let ((n (bitcoin-lisp.storage:block-index-entry-tx-count entry)))
+    (if (plusp n)
+        n
+        (let ((block (and block-store
+                          (bitcoin-lisp.storage:get-block
+                           block-store
+                           (bitcoin-lisp.storage:block-index-entry-hash entry)))))
+          (when block
+            (setf (bitcoin-lisp.storage:block-index-entry-tx-count entry)
+                  (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+                           block))))))))
+
+(defun rpc-getchaintxstats (node params)
+  "Transaction count/rate statistics over a block window (Bitcoin Core
+getchaintxstats). PARAMS: ([nblocks] [blockhash]) — the window is the NBLOCKS
+blocks ending at BLOCKHASH (default one month of blocks ending at the tip); the
+interval uses median-time-past, matching Core. txcount/window_tx_count are
+omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
+  (let* ((chain-state (rpc-get-chain-state node))
+         (block-store (rpc-get-block-store node))
+         (final (if (stringp (second params))
+                    (let ((e (bitcoin-lisp.storage:get-block-index-entry
+                              chain-state (parse-hex-hash (second params)))))
+                      (unless e
+                        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                          :message "Block not found"))
+                      (unless (bitcoin-lisp.storage:entry-on-active-chain-p chain-state e)
+                        (error 'rpc-error :code +rpc-invalid-parameter+
+                                          :message "Block is not in main chain"))
+                      e)
+                    (bitcoin-lisp.storage:get-block-index-entry
+                     chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))))
+    (unless final
+      (error 'rpc-error :code +rpc-misc-error+ :message "Chain has no tip"))
+    (let* ((final-height (bitcoin-lisp.storage:block-index-entry-height final))
+           (blockcount
+             (if (integerp (first params))
+                 (let ((bc (first params)))
+                   (when (or (minusp bc) (and (plusp bc) (>= bc final-height)))
+                     (error 'rpc-error :code +rpc-invalid-parameter+
+                                       :message "Invalid block count: should be between 0 and the block's height - 1"))
+                   bc)
+                 ;; Core default: one month of blocks (600s spacing) bounded by height.
+                 (max 0 (min 4320 (1- final-height))))))
+      ;; One backward walk from FINAL to genesis: total txcount, the window sum
+      ;; over the first BLOCKCOUNT entries, and the window-start ancestor for
+      ;; the MTP interval.
+      (let ((txcount 0) (window-tx 0) (txcount-known t) (window-known t)
+            (past nil) (entry final) (i 0))
+        (loop while entry
+              do (let ((n (%entry-tx-count entry block-store)))
+                   (if n
+                       (progn (incf txcount n)
+                              (when (< i blockcount) (incf window-tx n)))
+                       (progn (setf txcount-known nil)
+                              (when (< i blockcount) (setf window-known nil)))))
+                 (incf i)
+                 (when (= i blockcount)
+                   (setf past (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+                 (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
+        (let ((result
+                `(("time" . ,(bitcoin-lisp.serialization:block-header-timestamp
+                              (bitcoin-lisp.storage:block-index-entry-header final)))
+                  ,@(when txcount-known `(("txcount" . ,txcount)))
+                  ("window_final_block_hash"
+                   . ,(hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash final)))
+                  ("window_final_block_height" . ,final-height)
+                  ("window_block_count" . ,blockcount))))
+          (when (and (plusp blockcount) past)
+            (let ((interval (- (bitcoin-lisp.validation:compute-median-time-past
+                                chain-state
+                                (bitcoin-lisp.storage:block-index-entry-hash final))
+                               (bitcoin-lisp.validation:compute-median-time-past
+                                chain-state
+                                (bitcoin-lisp.storage:block-index-entry-hash past)))))
+              (setf result (append result `(("window_interval" . ,interval))))
+              (when window-known
+                (setf result (append result `(("window_tx_count" . ,window-tx))))
+                (when (plusp interval)
+                  (setf result
+                        (append result
+                                `(("txrate" . ,(/ (float window-tx) interval)))))))))
+          result)))))
+
 ;;; --- Node / chain info RPCs ---
 
 (defun rpc-getdifficulty (node params)

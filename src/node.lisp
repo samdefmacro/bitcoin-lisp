@@ -493,7 +493,8 @@ Returns the node instance."
           :header genesis-header
           :prev-entry nil
           :chain-work 0
-          :status :valid))))
+          :status :valid
+          :tx-count 1))))   ; genesis carries exactly its coinbase
 
   ;; Initialize undo data persistence
   (let ((undo-path (merge-pathnames "undo/" (node-data-directory *node*))))
