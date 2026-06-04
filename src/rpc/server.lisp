@@ -82,6 +82,8 @@
   ;; Chain verification
   (register-rpc-method "verifychain" #'rpc-verifychain)
   (register-rpc-method "getchaintxstats" #'rpc-getchaintxstats)
+  (register-rpc-method "waitfornewblock" #'rpc-waitfornewblock)
+  (register-rpc-method "dumptxoutset" #'rpc-dumptxoutset)
   ;; Chain control methods
   (register-rpc-method "invalidateblock" #'rpc-invalidateblock)
   (register-rpc-method "reconsiderblock" #'rpc-reconsiderblock)
