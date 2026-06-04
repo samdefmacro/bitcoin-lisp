@@ -948,3 +948,48 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
 (test rpc-verifychain-empty-node-returns-nil
   "verifychain on a node with no stored blocks returns NIL gracefully."
   (is (null (bitcoin-lisp.rpc::rpc-verifychain (make-test-node) (list 0 1)))))
+
+;;; --- waitfornewblock / dumptxoutset ---
+
+(test rpc-waitfornewblock-timeout-and-change
+  "waitfornewblock returns on timeout, rejects negative timeouts, and returns
+early when the tip changes."
+  (let ((node (make-test-node)))
+    (setf (bitcoin-lisp::node-running node) t)
+    ;; Timeout path: the tip never changes; returns after ~300ms.
+    (let ((r (bitcoin-lisp.rpc::rpc-waitfornewblock node (list 300))))
+      (is (integerp (cdr (assoc "height" r :test #'string=)))))
+    ;; Negative timeout errors (Core).
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-waitfornewblock node (list -1)))
+    ;; Change path: a thread advances the tip; the wait returns the new height.
+    (let ((cs (bitcoin-lisp::node-chain-state node))
+          (new-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element 9)))
+      (bt:make-thread (lambda ()
+                        (sleep 0.3)
+                        (bitcoin-lisp.storage:update-chain-tip cs new-hash 7)))
+      (let ((r (bitcoin-lisp.rpc::rpc-waitfornewblock node (list 5000))))
+        (is (= 7 (cdr (assoc "height" r :test #'string=))))))))
+
+(test rpc-dumptxoutset-writes-snapshot
+  "dumptxoutset streams the UTXO set to a new file and refuses to overwrite."
+  (let* ((node (make-test-node))
+         (utxo (bitcoin-lisp::node-utxo-set node))
+         (path (namestring (merge-pathnames
+                            (format nil "txoutset-~D.dat" (get-universal-time))
+                            (uiop:temporary-directory)))))
+    (dotimes (i 3)
+      (bitcoin-lisp.storage:add-utxo
+       utxo
+       (make-array 32 :element-type '(unsigned-byte 8) :initial-element (1+ i))
+       0 1000 (make-array 25 :element-type '(unsigned-byte 8)) 1))
+    (unwind-protect
+         (progn
+           (let ((r (bitcoin-lisp.rpc::rpc-dumptxoutset node (list path))))
+             (is (= 3 (cdr (assoc "coins_written" r :test #'string=))))
+             (is (not (null (probe-file path)))))
+           ;; Existing path -> error (Core).
+           (signals bitcoin-lisp.rpc::rpc-error
+             (bitcoin-lisp.rpc::rpc-dumptxoutset node (list path))))
+      (ignore-errors (delete-file path)))))
