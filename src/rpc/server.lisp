@@ -66,6 +66,7 @@
   (register-rpc-method "getmempoolentry" #'rpc-getmempoolentry)
   (register-rpc-method "prioritisetransaction" #'rpc-prioritisetransaction)
   (register-rpc-method "getprioritisedtransactions" #'rpc-getprioritisedtransactions)
+  (register-rpc-method "savemempool" #'rpc-savemempool)
   (register-rpc-method "getmempoolancestors" #'rpc-getmempoolancestors)
   (register-rpc-method "getmempooldescendants" #'rpc-getmempooldescendants)
   (register-rpc-method "gettxspendingprevout" #'rpc-gettxspendingprevout)

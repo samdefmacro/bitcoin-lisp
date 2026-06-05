@@ -335,6 +335,51 @@ port can't be bound."
           (log-info "Listening for inbound peers on ~A:~D"
                     bind (network-port (node-network node)))))))
 
+(defun load-mempool-from-disk (node)
+  "Reload mempool.dat through the normal acceptance path (Core LoadMempool):
+prioritisation deltas first (so fee policy sees them), then per-tx validation
+against the current UTXO set — stale entries (spent inputs, reorged context)
+simply fail and are dropped. Entries are loaded regardless of age (no expiry
+filter, unlike Core): mempool-expire prunes old entries on the next block
+connection anyway. Residual deltas (txs not in the saved pool) are re-applied
+last. Corrupt or missing files are ignored."
+  (let ((path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory node))))
+    (when (and path (probe-file path))
+      (multiple-value-bind (entries residual ok)
+          (bitcoin-lisp.mempool:read-mempool-file path)
+        (unless ok
+          (log-warn "mempool.dat unreadable or corrupt — starting with empty mempool")
+          (return-from load-mempool-from-disk nil))
+        (let ((mempool (node-mempool node))
+              (utxo-set (node-utxo-set node))
+              (chain-state (node-chain-state node))
+              (accepted 0) (failed 0))
+          (dolist (rec entries)
+            (destructuring-bind (tx entry-time delta) rec
+              (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+                    (height (bitcoin-lisp.storage:current-height chain-state)))
+                (unless (zerop delta)
+                  (bitcoin-lisp.mempool:mempool-prioritise mempool txid delta))
+                (multiple-value-bind (valid error fee replaced)
+                    (bitcoin-lisp.validation:validate-transaction-for-mempool
+                     tx utxo-set mempool height)
+                  (declare (ignore error))
+                  (cond
+                    (valid
+                     (dolist (rt replaced)
+                       (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
+                     (if (eq :ok (bitcoin-lisp.mempool:mempool-add
+                                  mempool txid
+                                  (bitcoin-lisp.mempool:make-entry-from-tx
+                                   tx fee height :entry-time entry-time)))
+                         (incf accepted)
+                         (incf failed)))
+                    (t (incf failed)))))))
+          (dolist (pair residual)
+            (bitcoin-lisp.mempool:mempool-prioritise mempool (car pair) (cdr pair)))
+          (log-info "Imported mempool: ~D accepted, ~D failed, ~D residual deltas"
+                    accepted failed (length residual)))))))
+
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
                         (log-level :info)
@@ -515,6 +560,9 @@ Returns the node instance."
          :data-directory (node-data-directory *node*)))
   ;; Load persisted fee stats
   (bitcoin-lisp.mempool:load-fee-stats (node-fee-estimator *node*))
+
+  ;; Reload the persisted mempool through normal acceptance (Core LoadMempool)
+  (load-mempool-from-disk *node*)
 
   ;; Initialize peer address book
   (log-info "Loading peer address book...")
@@ -915,6 +963,12 @@ flush (atomic temp+fsync+rename inside save-*)."
   (when (node-fee-estimator *node*)
     (log-info "Saving fee statistics...")
     (bitcoin-lisp.mempool:save-fee-stats (node-fee-estimator *node*)))
+
+  ;; Save mempool (Core DumpMempool)
+  (let ((path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory *node*))))
+    (when (and path (node-mempool *node*))
+      (log-info "Saving mempool (~D entries)..."
+                (bitcoin-lisp.mempool:save-mempool-file (node-mempool *node*) path))))
 
   ;; Save header index
   (log-info "Saving header index...")

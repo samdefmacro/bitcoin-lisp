@@ -885,6 +885,20 @@ gettxoutsetinfo this forces a coins-cache flush first. Errors if PATH exists."
         ("base_height" . ,base-height)
         ("path" . ,(namestring (truename path)))))))
 
+;;; --- Mempool persistence (Bitcoin Core savemempool) ---
+
+(defun rpc-savemempool (node params)
+  "Dump the mempool to disk (Bitcoin Core savemempool). Returns the filename.
+The same dump runs automatically on graceful shutdown."
+  (declare (ignore params))
+  (let ((path (bitcoin-lisp.mempool:mempool-dat-path
+               (bitcoin-lisp::node-data-directory node))))
+    (unless path
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "Node has no data directory"))
+    (bitcoin-lisp.mempool:save-mempool-file (rpc-get-mempool node) path)
+    `(("filename" . ,(namestring path)))))
+
 ;;; --- Transaction prioritisation (Bitcoin Core prioritisetransaction) ---
 
 (defun rpc-prioritisetransaction (node params)
