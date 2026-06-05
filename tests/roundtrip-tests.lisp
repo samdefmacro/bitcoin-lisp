@@ -33,14 +33,16 @@ witness stack and the first is non-empty (so transaction-has-witness-p holds)."
                          :script-pubkey (%rt-rand-bytes (random 301 state) state)))))
     (bitcoin-lisp.serialization:make-transaction
      :version (1+ (random 3 state))
-     :inputs inputs :outputs outputs
+     :inputs (coerce inputs 'simple-vector)
+     :outputs (coerce outputs 'simple-vector)
      :lock-time (random #x100000000 state)
      :witness (when witness
-                (loop for k from 0 below nin collect
-                      (if (zerop k)
-                          (list (%rt-rand-bytes (1+ (random 40 state)) state))
-                          (loop repeat (random 3 state)
-                                collect (%rt-rand-bytes (random 40 state) state))))))))
+                (coerce (loop for k from 0 below nin collect
+                              (if (zerop k)
+                                  (list (%rt-rand-bytes (1+ (random 40 state)) state))
+                                  (loop repeat (random 3 state)
+                                        collect (%rt-rand-bytes (random 40 state) state))))
+                        'simple-vector)))))
 
 ;;;; CompactSize
 

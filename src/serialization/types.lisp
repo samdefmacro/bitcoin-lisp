@@ -128,16 +128,19 @@ SCRIPT-PUBKEY: Locking script."
 (defstruct transaction
   "A Bitcoin transaction.
 VERSION: Transaction version (currently 1 or 2).
-INPUTS: List of transaction inputs.
-OUTPUTS: List of transaction outputs.
+INPUTS: Simple-vector of transaction inputs.
+OUTPUTS: Simple-vector of transaction outputs.
 LOCK-TIME: Block height or timestamp for time-locked transactions.
-WITNESS: List of witness stacks, one per input. Each stack is a list of
-  byte vectors. NIL means no witness data (legacy transaction)."
+WITNESS: Simple-vector of witness stacks, one per input. Each stack is a
+  list of byte vectors. NIL (not #()) means no witness data (legacy
+  transaction) — truthiness selects the BIP 144 serialization format.
+Inputs/outputs are vectors so per-input consensus paths (sighash) index
+in O(1); they were lists, making large-input txs O(n^2) (B.1-vectorize)."
   (version 1 :type (signed-byte 32))
-  (inputs '() :type list)
-  (outputs '() :type list)
+  (inputs #() :type simple-vector)
+  (outputs #() :type simple-vector)
   (lock-time 0 :type (unsigned-byte 32))
-  (witness nil :type list)
+  (witness nil :type (or null simple-vector))
   ;; Cached hash (computed lazily)
   (cached-hash nil)
   ;; Cached weight (BIP 141). transaction-weight requires two full re-
@@ -155,6 +158,21 @@ WITNESS: List of witness stacks, one per input. Each stack is a list of
   (and (transaction-witness tx)
        (some (lambda (stack) (and stack (not (null stack))))
              (transaction-witness tx))))
+
+(defmacro dovector ((var vector &optional result) &body body)
+  "DOLIST-shaped iteration over a vector: bind VAR to each element of
+VECTOR, evaluate BODY, return RESULT. Exists so the many former dolist
+consumers of transaction-inputs/-outputs/-witness (now simple-vectors)
+keep their shape."
+  `(progn
+     (map nil (lambda (,var) ,@body) ,vector)
+     ,result))
+
+(defmacro %read-n-vector (count &body body)
+  "Evaluate BODY COUNT times, returning the results as a simple-vector.
+Reads item-by-item into a list first so a hostile COUNT from untrusted
+input fails fast on truncation instead of pre-allocating a huge vector."
+  `(coerce (loop repeat ,count collect (progn ,@body)) 'simple-vector))
 
 (defun read-witness-stack (stream)
   "Read a single witness stack (for one input) from STREAM.
@@ -188,11 +206,11 @@ flexi-streams' Gray-stream input dispatch."
           (unless (= flag 1)
             (error "Invalid witness flag byte: ~D" flag))
           (let* ((input-count (br-read-compact-size br))
-                 (inputs (loop repeat input-count collect (br-read-tx-in br)))
+                 (inputs (%read-n-vector input-count (br-read-tx-in br)))
                  (output-count (br-read-compact-size br))
-                 (outputs (loop repeat output-count collect (br-read-tx-out br)))
-                 (witness (loop repeat input-count
-                                collect (br-read-witness-stack br)))
+                 (outputs (%read-n-vector output-count (br-read-tx-out br)))
+                 (witness (%read-n-vector input-count
+                            (br-read-witness-stack br)))
                  (lock-time (br-read-u32-le br)))
             (make-transaction :version version
                               :inputs inputs
@@ -217,9 +235,9 @@ flexi-streams' Gray-stream input dispatch."
                           (when (< v #x100000000)
                             (error "non-canonical ReadCompactSize"))
                           v))))
-               (inputs (loop repeat input-count collect (br-read-tx-in br)))
+               (inputs (%read-n-vector input-count (br-read-tx-in br)))
                (output-count (br-read-compact-size br))
-               (outputs (loop repeat output-count collect (br-read-tx-out br)))
+               (outputs (%read-n-vector output-count (br-read-tx-out br)))
                (lock-time (br-read-u32-le br)))
           (make-transaction :version version
                             :inputs inputs
@@ -239,11 +257,11 @@ where the input count would normally be."
             (error "Invalid witness flag byte: ~D" flag))
           ;; Witness format: inputs, outputs, witness stacks, lock-time
           (let* ((input-count (read-compact-size stream))
-                 (inputs (loop repeat input-count collect (read-tx-in stream)))
+                 (inputs (%read-n-vector input-count (read-tx-in stream)))
                  (output-count (read-compact-size stream))
-                 (outputs (loop repeat output-count collect (read-tx-out stream)))
-                 (witness (loop repeat input-count
-                                collect (read-witness-stack stream)))
+                 (outputs (%read-n-vector output-count (read-tx-out stream)))
+                 (witness (%read-n-vector input-count
+                            (read-witness-stack stream)))
                  (lock-time (read-uint32-le stream)))
             (make-transaction :version version
                               :inputs inputs
@@ -253,9 +271,9 @@ where the input count would normally be."
         ;; Legacy format: marker was actually the first byte of input-count
         ;; Re-parse input count using marker as the compact-size value
         (let* ((input-count (decode-compact-size-from-first-byte marker stream))
-               (inputs (loop repeat input-count collect (read-tx-in stream)))
+               (inputs (%read-n-vector input-count (read-tx-in stream)))
                (output-count (read-compact-size stream))
-               (outputs (loop repeat output-count collect (read-tx-out stream)))
+               (outputs (%read-n-vector output-count (read-tx-out stream)))
                (lock-time (read-uint32-le stream)))
           (make-transaction :version version
                             :inputs inputs
@@ -293,11 +311,11 @@ read-compact-size and Bitcoin Core's ReadCompactSize (serialize.h:330-360)."
 Used for txid computation."
   (write-int32-le stream (transaction-version tx))
   (write-compact-size stream (length (transaction-inputs tx)))
-  (dolist (input (transaction-inputs tx))
-    (write-tx-in stream input))
+  (loop for input across (transaction-inputs tx)
+        do (write-tx-in stream input))
   (write-compact-size stream (length (transaction-outputs tx)))
-  (dolist (output (transaction-outputs tx))
-    (write-tx-out stream output))
+  (loop for output across (transaction-outputs tx)
+        do (write-tx-out stream output))
   (write-uint32-le stream (transaction-lock-time tx)))
 
 (defun write-witness-transaction (stream tx)
@@ -308,17 +326,17 @@ Used for txid computation."
   (write-uint8 stream #x01)
   ;; Inputs
   (write-compact-size stream (length (transaction-inputs tx)))
-  (dolist (input (transaction-inputs tx))
-    (write-tx-in stream input))
+  (loop for input across (transaction-inputs tx)
+        do (write-tx-in stream input))
   ;; Outputs
   (write-compact-size stream (length (transaction-outputs tx)))
-  (dolist (output (transaction-outputs tx))
-    (write-tx-out stream output))
+  (loop for output across (transaction-outputs tx)
+        do (write-tx-out stream output))
   ;; Witness stacks
   (let ((witness (transaction-witness tx)))
     (loop for i below (length (transaction-inputs tx))
           for stack = (if (and witness (< i (length witness)))
-                          (nth i witness)
+                          (svref witness i)
                           '())
           do (write-witness-stack stream stack)))
   ;; Lock time
@@ -329,12 +347,12 @@ Used for txid computation."
   (bb-write-i32-le bb (transaction-version tx))
   (let ((inputs (transaction-inputs tx)))
     (bb-write-varint bb (length inputs))
-    (dolist (input inputs)
-      (bb-write-tx-in bb input)))
+    (loop for input across inputs
+          do (bb-write-tx-in bb input)))
   (let ((outputs (transaction-outputs tx)))
     (bb-write-varint bb (length outputs))
-    (dolist (output outputs)
-      (bb-write-tx-out bb output)))
+    (loop for output across outputs
+          do (bb-write-tx-out bb output)))
   (bb-write-u32-le bb (transaction-lock-time tx)))
 
 (defun serialize-transaction (tx)
@@ -359,15 +377,15 @@ flexi-streams at ~50% of CPU during validation."
     (bb-write-u8 bb #x00)
     (bb-write-u8 bb #x01)
     (bb-write-varint bb (length inputs))
-    (dolist (input inputs)
-      (bb-write-tx-in bb input))
+    (loop for input across inputs
+          do (bb-write-tx-in bb input))
     (bb-write-varint bb (length outputs))
-    (dolist (output outputs)
-      (bb-write-tx-out bb output))
+    (loop for output across outputs
+          do (bb-write-tx-out bb output))
     ;; Witness stacks (one per input)
     (loop for i below (length inputs)
           for stack = (if (and witness (< i (length witness)))
-                          (nth i witness)
+                          (svref witness i)
                           '())
           do (bb-write-varint bb (length stack))
              (dolist (item stack)
@@ -393,8 +411,8 @@ For legacy transactions without witness, wtxid equals txid. Cached on the tx."
       (setf (transaction-cached-wtxid tx)
             (cond
               ;; Coinbase: wtxid is all zeros
-              ((and (transaction-inputs tx)
-                    (coinbase-input-p (first (transaction-inputs tx))))
+              ((and (plusp (length (transaction-inputs tx)))
+                    (coinbase-input-p (aref (transaction-inputs tx) 0)))
                (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
               ;; Has witness: hash the witness serialization
               ((transaction-has-witness-p tx)

@@ -28,8 +28,8 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
                                   s))))
     (bitcoin-lisp.serialization:make-transaction
      :version 1
-     :inputs (list input)
-     :outputs (list output)
+     :inputs (vector input)
+     :outputs (vector output)
      :lock-time 0)))
 
 (defun make-mempool-entry-for-tx (tx &key (fee 10000))
@@ -186,8 +186,8 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
                                                         :initial-element #x76)))
            (coinbase-tx (bitcoin-lisp.serialization:make-transaction
                          :version 1
-                         :inputs (list coinbase-input)
-                         :outputs (list coinbase-output)
+                         :inputs (vector coinbase-input)
+                         :outputs (vector coinbase-output)
                          :lock-time 0))
            (block-header (bitcoin-lisp.serialization:make-block-header
                           :version 1
@@ -234,8 +234,8 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
                                                         :initial-element #x76)))
            (coinbase-tx (bitcoin-lisp.serialization:make-transaction
                          :version 1
-                         :inputs (list coinbase-input)
-                         :outputs (list coinbase-output)
+                         :inputs (vector coinbase-input)
+                         :outputs (vector coinbase-output)
                          :lock-time 0))
            (block-header (bitcoin-lisp.serialization:make-block-header
                           :version 1
@@ -522,12 +522,12 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
          (base (make-mempool-test-tx :input-id 82))
          (bad-input (bitcoin-lisp.serialization:make-tx-in
                      :previous-output (bitcoin-lisp.serialization:tx-in-previous-output
-                                       (first (bitcoin-lisp.serialization:transaction-inputs base)))
+                                       (elt (bitcoin-lisp.serialization:transaction-inputs base) 0))
                      :script-sig (make-array 1 :element-type '(unsigned-byte 8)
                                              :initial-element #xac)  ; OP_CHECKSIG
                      :sequence #xFFFFFFFF))
          (tx (bitcoin-lisp.serialization:make-transaction
-              :version 1 :inputs (list bad-input)
+              :version 1 :inputs (vector bad-input)
               :outputs (bitcoin-lisp.serialization:transaction-outputs base)
               :lock-time 0)))
     (multiple-value-bind (valid err)
@@ -541,12 +541,12 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
   "A tx spending PARENT-TXID's output VOUT, paying a standard P2PKH output."
   (bitcoin-lisp.serialization:make-transaction
    :version 1
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output (bitcoin-lisp.serialization:make-outpoint
                                     :hash parent-txid :index vout)
                   :script-sig (make-array 10 :element-type '(unsigned-byte 8) :initial-element 0)
                   :sequence #xFFFFFFFF))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value value
                    :script-pubkey (let ((s (make-array 25 :element-type '(unsigned-byte 8)
                                                        :initial-element 0)))
@@ -642,14 +642,14 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
   "A tx spending outpoint (INPUT-ID-hash, 0) with the given input SEQUENCE."
   (bitcoin-lisp.serialization:make-transaction
    :version 1
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output (bitcoin-lisp.serialization:make-outpoint
                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                       :initial-element input-id)
                                     :index 0)
                   :script-sig (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)
                   :sequence sequence))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value value
                    :script-pubkey (let ((s (make-array 25 :element-type '(unsigned-byte 8)
                                                        :initial-element 0)))
@@ -834,7 +834,7 @@ low-fee parent, so a cheaper standalone tx is evicted first."
                  :script-sig (%zbytes 0) :sequence #xFFFFFFFF))
          (output (bitcoin-lisp.serialization:make-tx-out :value 1000 :script-pubkey (%zbytes 0)))
          (tx (bitcoin-lisp.serialization:make-transaction
-              :version 1 :inputs (list input) :outputs (list output) :lock-time 0)))
+              :version 1 :inputs (vector input) :outputs (vector output) :lock-time 0)))
     (is (< (length (bitcoin-lisp.serialization:serialize-transaction tx)) 65))
     (multiple-value-bind (valid err)
         (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
@@ -851,8 +851,8 @@ low-fee parent, so a cheaper standalone tx is evicted first."
          (output (bitcoin-lisp.serialization:make-tx-out :value 1000
                                                          :script-pubkey (%zbytes 25)))
          (tx (bitcoin-lisp.serialization:make-transaction
-              :version 2 :inputs (list input) :outputs (list output)
-              :lock-time 0 :witness (list witness-stack))))
+              :version 2 :inputs (vector input) :outputs (vector output)
+              :lock-time 0 :witness (vector witness-stack))))
     (values tx (lambda (txid index) (declare (ignore txid index)) spk))))
 
 (defun %p2wsh-spk () (let ((s (%zbytes 34))) (setf (aref s 0) #x00 (aref s 1) #x20) s))

@@ -113,6 +113,7 @@
    #:br-read-compact-size
    #:br-read-var-bytes
    ;; Types
+   #:dovector
    #:outpoint
    #:make-outpoint
    #:outpoint-hash

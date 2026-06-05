@@ -52,7 +52,7 @@ Returns the fee rate as an integer, or NIL if inputs cannot be resolved."
   (let ((total-input 0)
         (total-output 0))
     ;; Sum input values from spent UTXOs
-    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
       (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
              (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
              (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
@@ -61,7 +61,7 @@ Returns the fee rate as an integer, or NIL if inputs cannot be resolved."
           (return-from calculate-tx-fee-rate nil))
         (incf total-input (bitcoin-lisp.storage:utxo-entry-value utxo-entry))))
     ;; Sum output values
-    (dolist (output (bitcoin-lisp.serialization:transaction-outputs tx))
+    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
       (incf total-output (bitcoin-lisp.serialization:tx-out-value output)))
     ;; Calculate fee rate (fee / vsize)
     (let ((fee (- total-input total-output))

@@ -22,8 +22,8 @@
                                                               :initial-element #x76)))))
     (bitcoin-lisp.serialization:make-transaction
      :version 1
-     :inputs tx-inputs
-     :outputs tx-outputs
+     :inputs (coerce tx-inputs 'simple-vector)
+     :outputs (coerce tx-outputs 'simple-vector)
      :lock-time 0)))
 
 (defun make-coinbase-transaction (&key (value 5000000000) (height 0))
@@ -45,8 +45,8 @@
                                              :initial-element #x76))))
     (bitcoin-lisp.serialization:make-transaction
      :version 1
-     :inputs (list input)
-     :outputs (list output)
+     :inputs (vector input)
+     :outputs (vector output)
      :lock-time 0)))
 
 (test valid-transaction-structure
@@ -61,8 +61,8 @@
   "Transaction without inputs should fail validation."
   (let ((tx (bitcoin-lisp.serialization:make-transaction
              :version 1
-             :inputs '()
-             :outputs (list (bitcoin-lisp.serialization:make-tx-out
+             :inputs #()
+             :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                              :value 1000
                              :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
              :lock-time 0)))
@@ -75,14 +75,14 @@
   "Transaction without outputs should fail validation."
   (let ((tx (bitcoin-lisp.serialization:make-transaction
              :version 1
-             :inputs (list (bitcoin-lisp.serialization:make-tx-in
+             :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                             :previous-output (bitcoin-lisp.serialization:make-outpoint
                                               :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                 :initial-element 1)
                                               :index 0)
                             :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                             :sequence #xFFFFFFFF))
-             :outputs '()
+             :outputs #()
              :lock-time 0)))
     (multiple-value-bind (valid error)
         (bitcoin-lisp.validation:validate-transaction-structure tx)
@@ -98,7 +98,7 @@
          (empty-script (make-array 0 :element-type '(unsigned-byte 8)))
          (tx (bitcoin-lisp.serialization:make-transaction
               :version 1
-              :inputs (list (bitcoin-lisp.serialization:make-tx-in
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                              :previous-output same-outpoint
                              :script-sig empty-script
                              :sequence #xFFFFFFFF)
@@ -106,7 +106,7 @@
                              :previous-output same-outpoint
                              :script-sig empty-script
                              :sequence #xFFFFFFFF))
-              :outputs (list (bitcoin-lisp.serialization:make-tx-out
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                               :value 1000
                               :script-pubkey empty-script))
               :lock-time 0)))
@@ -120,14 +120,14 @@
   (let* ((empty-script (make-array 0 :element-type '(unsigned-byte 8)))
          (tx (bitcoin-lisp.serialization:make-transaction
               :version 1
-              :inputs (list (bitcoin-lisp.serialization:make-tx-in
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                              :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                  :initial-element 1)
                                                :index 0)
                              :script-sig empty-script
                              :sequence #xFFFFFFFF))
-              :outputs (list (bitcoin-lisp.serialization:make-tx-out
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                               :value -1000
                               :script-pubkey empty-script))
               :lock-time 0)))
@@ -168,8 +168,8 @@
                     :script-pubkey script))
            (tx (bitcoin-lisp.serialization:make-transaction
                 :version 1
-                :inputs (list input)
-                :outputs (list output)
+                :inputs (vector input)
+                :outputs (vector output)
                 :lock-time 0)))
       (multiple-value-bind (valid error fee)
           (bitcoin-lisp.validation:validate-transaction-contextual tx utxo-set 100)
@@ -196,8 +196,8 @@
                     :script-pubkey script))
            (tx (bitcoin-lisp.serialization:make-transaction
                 :version 1
-                :inputs (list input)
-                :outputs (list output)
+                :inputs (vector input)
+                :outputs (vector output)
                 :lock-time 0)))
       (multiple-value-bind (valid error fee)
           (bitcoin-lisp.validation:validate-transaction-contextual tx utxo-set 100)
@@ -224,8 +224,8 @@
                     :script-pubkey script))
            (tx (bitcoin-lisp.serialization:make-transaction
                 :version 1
-                :inputs (list input)
-                :outputs (list output)
+                :inputs (vector input)
+                :outputs (vector output)
                 :lock-time 0)))
       (multiple-value-bind (valid error fee)
           (bitcoin-lisp.validation:validate-transaction-contextual tx utxo-set 100)
@@ -455,14 +455,14 @@ We verify MTP computation directly to confirm the check works."
                     :value 0 :script-pubkey script))
            (coinbase (bitcoin-lisp.serialization:make-transaction
                       :version 1
-                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                      :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                      :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                          :initial-element 0)
                                                        :index #xFFFFFFFF)
                                      :script-sig (make-array 4 :element-type '(unsigned-byte 8)
                                                                :initial-element 1)))
-                      :outputs (list (bitcoin-lisp.serialization:make-tx-out :value 5000000000
+                      :outputs (vector (bitcoin-lisp.serialization:make-tx-out :value 5000000000
                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                     :initial-element #x76))
                                      output)
@@ -500,12 +500,12 @@ We verify MTP computation directly to confirm the check works."
     (let* ((coinbase-tx (make-coinbase-transaction :value 5000000000 :height 10))
            (spending-tx (bitcoin-lisp.serialization:make-transaction
                          :version 1
-                         :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                         :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                         :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                           :hash prev-txid :index 0)
                                         :script-sig empty-script
                                         :sequence #xFFFFFFFF))
-                         :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                         :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                          :value 900000
                                          :script-pubkey p2pkh-script))
                          :lock-time 0))
@@ -533,14 +533,14 @@ We verify MTP computation directly to confirm the check works."
   "block-has-witness-data-p should return T when transactions have witness data."
   (let* ((coinbase (bitcoin-lisp.serialization:make-transaction
                     :version 1
-                    :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                    :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                    :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                        :initial-element 0)
                                                      :index #xFFFFFFFF)
                                    :script-sig (make-array 4 :element-type '(unsigned-byte 8)
                                                              :initial-element 1)))
-                    :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                    :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                     :value 5000000000
                                     :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                :initial-element #x76)))
@@ -548,18 +548,18 @@ We verify MTP computation directly to confirm the check works."
          ;; Witness transaction
          (witness-tx (bitcoin-lisp.serialization:make-transaction
                       :version 2
-                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                      :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                      :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                          :initial-element #x11)
                                                        :index 0)
                                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
-                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                      :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                       :value 49000
                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                  :initial-element #x76)))
                       :lock-time 0
-                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                      :witness (vector (list (make-array 72 :element-type '(unsigned-byte 8)
                                                          :initial-element #xAA)
                                           (make-array 33 :element-type '(unsigned-byte 8)
                                                          :initial-element #xBB)))))
@@ -599,18 +599,18 @@ We verify MTP computation directly to confirm the check works."
          ;; A witness tx (with dummy witness data)
          (witness-tx (bitcoin-lisp.serialization:make-transaction
                       :version 2
-                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                      :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                      :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                          :initial-element #x22)
                                                        :index 0)
                                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
-                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                      :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                       :value 49000
                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                  :initial-element #x76)))
                       :lock-time 0
-                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                      :witness (vector (list (make-array 72 :element-type '(unsigned-byte 8)
                                                          :initial-element #xCC)))))
          (transactions (list coinbase-tx witness-tx)))
     ;; Compute what the correct commitment should be
@@ -635,11 +635,12 @@ We verify MTP computation directly to confirm the check works."
                    (bitcoin-lisp.serialization:make-transaction
                     :version 1
                     :inputs (bitcoin-lisp.serialization:transaction-inputs coinbase-tx)
-                    :outputs (append (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
-                                     (list (bitcoin-lisp.serialization:make-tx-out
-                                            :value 0 :script-pubkey script)))
+                    :outputs (concatenate 'simple-vector
+                                          (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
+                                          (list (bitcoin-lisp.serialization:make-tx-out
+                                                 :value 0 :script-pubkey script)))
                     :lock-time 0
-                    :witness (list (list witness-reserved))))  ; coinbase witness
+                    :witness (vector (list witness-reserved))))  ; coinbase witness
                  (block (bitcoin-lisp.serialization:make-bitcoin-block
                          :header (make-test-block-header)
                          :transactions (list updated-coinbase witness-tx))))
@@ -656,18 +657,18 @@ no-witness-allowed scan)."
   (let* ((coinbase (make-coinbase-transaction :value 5000000000 :height 1))
          (witness-tx (bitcoin-lisp.serialization:make-transaction
                       :version 2
-                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                      :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                      :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                          :initial-element #x33)
                                                        :index 0)
                                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
-                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                      :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                       :value 49000
                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                  :initial-element #x76)))
                       :lock-time 0
-                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                      :witness (vector (list (make-array 72 :element-type '(unsigned-byte 8)
                                                          :initial-element #xDD)))))
          (block (bitcoin-lisp.serialization:make-bitcoin-block
                  :header (make-test-block-header)
@@ -682,18 +683,18 @@ no-witness-allowed scan)."
   (let* ((coinbase (make-coinbase-transaction :value 5000000000 :height 1))
          (witness-tx (bitcoin-lisp.serialization:make-transaction
                       :version 2
-                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                      :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                      :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                          :initial-element #x44)
                                                        :index 0)
                                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
-                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                      :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                       :value 49000
                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                  :initial-element #x76)))
                       :lock-time 0
-                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                      :witness (vector (list (make-array 72 :element-type '(unsigned-byte 8)
                                                          :initial-element #xEE)))))
          (block (bitcoin-lisp.serialization:make-bitcoin-block
                  :header (make-test-block-header)
@@ -709,13 +710,13 @@ or not segwit is active."
   (let* ((coinbase (make-coinbase-transaction :value 5000000000 :height 1))
          (legacy-tx (bitcoin-lisp.serialization:make-transaction
                      :version 1
-                     :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                     :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                       :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                         :initial-element #x55)
                                                       :index 0)
                                     :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
-                     :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                     :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                      :value 49000
                                      :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                 :initial-element #x76)))
@@ -732,18 +733,18 @@ is not exactly one 32-byte item: :bad-witness-nonce-size."
   (let* ((coinbase-tx (make-coinbase-transaction :value 5000000000 :height 1))
          (witness-tx (bitcoin-lisp.serialization:make-transaction
                       :version 2
-                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                      :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                      :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                          :initial-element #x66)
                                                        :index 0)
                                      :script-sig (make-array 0 :element-type '(unsigned-byte 8))))
-                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                      :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                       :value 49000
                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                  :initial-element #x76)))
                       :lock-time 0
-                      :witness (list (list (make-array 72 :element-type '(unsigned-byte 8)
+                      :witness (vector (list (make-array 72 :element-type '(unsigned-byte 8)
                                                          :initial-element #xCC)))))
          (transactions (list coinbase-tx witness-tx))
          ;; Build a commitment that would match a 32-zero reserved value,
@@ -763,12 +764,13 @@ is not exactly one 32-byte item: :bad-witness-nonce-size."
                (bitcoin-lisp.serialization:make-transaction
                 :version 1
                 :inputs (bitcoin-lisp.serialization:transaction-inputs coinbase-tx)
-                :outputs (append (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
-                                 (list (bitcoin-lisp.serialization:make-tx-out
-                                        :value 0 :script-pubkey script)))
+                :outputs (concatenate 'simple-vector
+                                      (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
+                                      (list (bitcoin-lisp.serialization:make-tx-out
+                                             :value 0 :script-pubkey script)))
                 :lock-time 0
                 ;; 16-byte reserved value instead of 32 — wrong size.
-                :witness (list (list (make-array 16 :element-type '(unsigned-byte 8)
+                :witness (vector (list (make-array 16 :element-type '(unsigned-byte 8)
                                                    :initial-element 0)))))
              (block (bitcoin-lisp.serialization:make-bitcoin-block
                      :header (make-test-block-header)
@@ -786,7 +788,7 @@ is not exactly one 32-byte item: :bad-witness-nonce-size."
   "Create a test transaction with specified nLockTime and input sequence."
   (bitcoin-lisp.serialization:make-transaction
    :version version
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output (bitcoin-lisp.serialization:make-outpoint
                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                       :initial-element 1)
@@ -794,7 +796,7 @@ is not exactly one 32-byte item: :bad-witness-nonce-size."
                   :script-sig (make-array 10 :element-type '(unsigned-byte 8)
                                           :initial-element #x00)
                   :sequence sequence))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value 50000000
                    :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                               :initial-element #x76)))
@@ -907,14 +909,14 @@ normal heights until the 1,983,702 re-enable."
   (let ((coinbase
           (bitcoin-lisp.serialization:make-transaction
            :version 1
-           :inputs (list (bitcoin-lisp.serialization:make-tx-in
+           :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                           :previous-output (bitcoin-lisp.serialization:make-outpoint
                                             :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                               :initial-element 0)
                                             :index #xFFFFFFFF)
                           :script-sig script-sig
                           :sequence #xFFFFFFFF))
-           :outputs (list (bitcoin-lisp.serialization:make-tx-out
+           :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                            :value 5000000000
                            :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                       :initial-element #x76)))
@@ -1003,8 +1005,8 @@ passes (extra trailing bytes are fine)."
 
 (defun %tx-with-inputs (inputs)
   (bitcoin-lisp.serialization:make-transaction
-   :version 1 :inputs inputs
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :version 1 :inputs (coerce inputs 'simple-vector)
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value 1000
                    :script-pubkey (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
    :lock-time 0))

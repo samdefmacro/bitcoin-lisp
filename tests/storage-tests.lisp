@@ -943,7 +943,7 @@ discovers them through the empty cache."
 (defun %make-coinbase-tx (txid value script)
   (bitcoin-lisp.serialization:make-transaction
    :version 1
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output
                   (bitcoin-lisp.serialization:make-outpoint
                    :hash (make-array 32 :element-type '(unsigned-byte 8)
@@ -951,7 +951,7 @@ discovers them through the empty cache."
                    :index #xFFFFFFFF)
                   :script-sig (make-array 4 :element-type '(unsigned-byte 8)
                                             :initial-element 1)))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value value :script-pubkey script))
    :lock-time 0
    :cached-hash txid))
@@ -959,13 +959,13 @@ discovers them through the empty cache."
 (defun %make-spending-tx (txid prev-txid prev-index value script)
   (bitcoin-lisp.serialization:make-transaction
    :version 1
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output
                   (bitcoin-lisp.serialization:make-outpoint
                    :hash prev-txid :index prev-index)
                   :script-sig (make-array 4 :element-type '(unsigned-byte 8)
                                             :initial-element 2)))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value value :script-pubkey script))
    :lock-time 0
    :cached-hash txid))

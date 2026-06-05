@@ -18,14 +18,14 @@
                                          (logand (ash height -16) #xFF)))))
     (bitcoin-lisp.serialization:make-transaction
      :version 1
-     :inputs (list (bitcoin-lisp.serialization:make-tx-in
+     :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                     :previous-output (bitcoin-lisp.serialization:make-outpoint
                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                        :initial-element 0)
                                      :index #xFFFFFFFF)
                     :script-sig height-script
                     :sequence #xFFFFFFFF))
-     :outputs (list (bitcoin-lisp.serialization:make-tx-out
+     :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                      :value value
                      :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                 :initial-element #x76)))
@@ -37,14 +37,14 @@
   "Create a regular (non-coinbase) transaction."
   (bitcoin-lisp.serialization:make-transaction
    :version 1
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output (bitcoin-lisp.serialization:make-outpoint
                                    :hash prev-txid
                                    :index prev-index)
                   :script-sig (make-array 1 :element-type '(unsigned-byte 8)
                                           :initial-element #x51)
                   :sequence #xFFFFFFFF))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value value
                    :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                               :initial-element #x76)))

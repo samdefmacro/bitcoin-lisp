@@ -33,18 +33,18 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
         (outputs (bitcoin-lisp.serialization:transaction-outputs tx)))
 
     ;; Must have at least one input
-    (when (null inputs)
+    (when (zerop (length inputs))
       (return-from validate-transaction-structure
         (values nil :no-inputs)))
 
     ;; Must have at least one output
-    (when (null outputs)
+    (when (zerop (length outputs))
       (return-from validate-transaction-structure
         (values nil :no-outputs)))
 
     ;; Check for duplicate inputs
     (let ((seen-outpoints (make-hash-table :test 'equalp)))
-      (dolist (input inputs)
+      (bitcoin-lisp.serialization:dovector (input inputs)
         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                (key (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
                           (bitcoin-lisp.serialization:outpoint-index prevout))))
@@ -55,7 +55,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
     ;; Validate outputs using typed Satoshi arithmetic
     (let ((total-output (wrap-satoshi 0)))
-      (dolist (output outputs)
+      (bitcoin-lisp.serialization:dovector (output outputs)
         (let ((value (bitcoin-lisp.serialization:tx-out-value output)))
           ;; Output value must be non-negative
           (when (minusp value)
@@ -78,13 +78,13 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
     ;; Coinbase → scriptSig must be 2..100 bytes; non-coinbase → no input
     ;; may have a null prevout (bad-txns-prevout-null).
     (if (and (= (length inputs) 1)
-             (bitcoin-lisp.serialization:coinbase-input-p (first inputs)))
+             (bitcoin-lisp.serialization:coinbase-input-p (aref inputs 0)))
         (let ((sig-len (length (bitcoin-lisp.serialization:tx-in-script-sig
-                                (first inputs)))))
+                                (aref inputs 0)))))
           (when (or (< sig-len 2) (> sig-len 100))
             (return-from validate-transaction-structure
               (values nil :bad-coinbase-length))))
-        (dolist (inp inputs)
+        (bitcoin-lisp.serialization:dovector (inp inputs)
           (when (bitcoin-lisp.serialization:coinbase-input-p inp)
             (return-from validate-transaction-structure
               (values nil :bad-prevout-null)))))
@@ -112,7 +112,7 @@ FEE is returned as a Satoshi type."
 
     ;; Skip input validation for coinbase
     (unless is-coinbase
-      (dolist (input inputs)
+      (bitcoin-lisp.serialization:dovector (input inputs)
         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
                (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
@@ -149,7 +149,7 @@ FEE is returned as a Satoshi type."
                           (wrap-satoshi (bitcoin-lisp.storage:utxo-entry-value utxo)))))))
 
     ;; Sum outputs with typed addition
-    (dolist (output outputs)
+    (bitcoin-lisp.serialization:dovector (output outputs)
       (setf total-output
             (satoshi+ total-output
                       (wrap-satoshi (bitcoin-lisp.serialization:tx-out-value output)))))
@@ -374,9 +374,12 @@ have no policy rules."
   "Bitcoin Core IsWitnessStandard: every input carrying a witness must spend a
 standard witness program (P2WSH/Taproot stack & script limits, no annex).
 SPENT-SCRIPT-FN maps (txid index) to the spent output's scriptPubKey. Coinbase
-has no witness inputs to check."
-  (loop for input in (bitcoin-lisp.serialization:transaction-inputs tx)
-        for wstack in (bitcoin-lisp.serialization:transaction-witness tx)
+has no witness inputs to check. A tx with no witness at all is vacuously
+standard."
+  (let ((witness (bitcoin-lisp.serialization:transaction-witness tx)))
+    (or (null witness)
+        (loop for input across (bitcoin-lisp.serialization:transaction-inputs tx)
+        for wstack across witness
         ;; An input with no witness data imposes no witness-standardness rule.
         always (or (null wstack)
                    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
@@ -386,7 +389,7 @@ has no witness inputs to check."
                      (and spk
                           (input-witness-standard-p
                            wstack spk
-                           (bitcoin-lisp.serialization:tx-in-script-sig input)))))))
+                           (bitcoin-lisp.serialization:tx-in-script-sig input)))))))))
 
 (defun mempool-extra-coins (tx utxo-set mempool &optional package-coins)
   "Build a (txid . index) -> utxo-entry table for TX inputs that spend
@@ -396,7 +399,7 @@ together, before its members are in the mempool). Returns (values table ok-p);
 OK-P is NIL if some input references none of those nor a confirmed UTXO (a
 genuinely missing input)."
   (let ((extra (make-hash-table :test 'equalp)))
-    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx) (values extra t))
+    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx) (values extra t))
       (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
              (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
              (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))
@@ -407,7 +410,7 @@ genuinely missing input)."
                  (pkg-coin (and package-coins (gethash (cons ptxid pidx) package-coins))))
             (cond
               ((and outs (< pidx (length outs)))
-               (let ((out (nth pidx outs)))
+               (let ((out (aref outs pidx)))
                  (setf (gethash (cons ptxid pidx) extra)
                        (bitcoin-lisp.storage:make-utxo-entry
                         :value (bitcoin-lisp.serialization:tx-out-value out)
@@ -434,7 +437,7 @@ feerate (Bitcoin Core's package_feerates path)."
   ;; Must not be coinbase
   (when (and (= (length (bitcoin-lisp.serialization:transaction-inputs tx)) 1)
              (bitcoin-lisp.serialization:coinbase-input-p
-              (first (bitcoin-lisp.serialization:transaction-inputs tx))))
+              (aref (bitcoin-lisp.serialization:transaction-inputs tx) 0)))
     (return-from validate-transaction-for-mempool
       (values nil :coinbase-not-allowed nil)))
 
@@ -466,7 +469,7 @@ feerate (Bitcoin Core's package_feerates path)."
       (values nil :tx-size-small nil)))
 
   ;; Policy: scriptSig must be push-only and within the size limit
-  (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
     (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input)))
       (when (> (length script-sig) +max-standard-scriptsig-size+)
         (return-from validate-transaction-for-mempool
@@ -476,7 +479,7 @@ feerate (Bitcoin Core's package_feerates path)."
           (values nil :scriptsig-not-pushonly nil)))))
 
   ;; Policy: all outputs must be standard script types, and none dust
-  (dolist (output (bitcoin-lisp.serialization:transaction-outputs tx))
+  (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
     (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
       (unless (standard-output-script-p spk)
         (return-from validate-transaction-for-mempool
@@ -514,7 +517,7 @@ feerate (Bitcoin Core's package_feerates path)."
         (return-from validate-transaction-for-mempool
           (values nil :too-many-sigops nil)))
       ;; Per-input P2SH redeemScript sigops <= MAX_P2SH_SIGOPS.
-      (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+      (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                (spk (spent-script (bitcoin-lisp.serialization:outpoint-hash prevout)
                                   (bitcoin-lisp.serialization:outpoint-index prevout))))
@@ -593,7 +596,7 @@ feerate (Bitcoin Core's package_feerates path)."
    all inputs of a tx; without complete coverage, the Taproot sighash would
    be wrong, so callers should fall back when this returns NIL."
   (let ((result (make-array (length inputs))))
-    (loop for input in inputs
+    (loop for input across inputs
           for i from 0
           for prevout = (bitcoin-lisp.serialization:tx-in-previous-output input)
           for utxo = (or (bitcoin-lisp.storage:get-utxo
@@ -622,7 +625,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
            (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
          (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
-    (loop for input in inputs
+    (loop for input across inputs
           for input-idx from 0
           for utxo = (and spent-utxos (aref spent-utxos input-idx))
           when utxo

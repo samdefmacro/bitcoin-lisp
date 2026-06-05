@@ -64,22 +64,22 @@
     (is (= 1 (length (bitcoin-lisp.serialization:transaction-outputs tx))))
     (is (= 500000 (bitcoin-lisp.serialization:transaction-lock-time tx)))
     ;; Input details
-    (let ((input (first (bitcoin-lisp.serialization:transaction-inputs tx))))
+    (let ((input (elt (bitcoin-lisp.serialization:transaction-inputs tx) 0)))
       (is (every (lambda (b) (= b #x11))
                  (bitcoin-lisp.serialization:outpoint-hash
                   (bitcoin-lisp.serialization:tx-in-previous-output input))))
       (is (= 0 (length (bitcoin-lisp.serialization:tx-in-script-sig input))))
       (is (= #xFFFFFFFE (bitcoin-lisp.serialization:tx-in-sequence input))))
     ;; Output
-    (let ((output (first (bitcoin-lisp.serialization:transaction-outputs tx))))
+    (let ((output (elt (bitcoin-lisp.serialization:transaction-outputs tx) 0)))
       (is (= 49999 (bitcoin-lisp.serialization:tx-out-value output))))
     ;; Witness data
     (is (bitcoin-lisp.serialization:transaction-has-witness-p tx))
     (let ((witness (bitcoin-lisp.serialization:transaction-witness tx)))
       (is (= 1 (length witness)))       ; 1 input's witness
-      (is (= 2 (length (first witness)))) ; 2 stack items
-      (is (= 72 (length (first (first witness)))))  ; sig
-      (is (= 33 (length (second (first witness))))))))  ; pubkey
+      (is (= 2 (length (elt witness 0)))) ; 2 stack items
+      (is (= 72 (length (first (elt witness 0)))))  ; sig
+      (is (= 33 (length (second (elt witness 0))))))))  ; pubkey
 
 (test witness-transaction-round-trip
   "Serializing a witness transaction back should produce identical bytes."
@@ -143,7 +143,7 @@
     (is (= 1 (bitcoin-lisp.serialization:transaction-version tx)))
     (is (= 1 (length (bitcoin-lisp.serialization:transaction-inputs tx))))
     (is (= 10 (length (bitcoin-lisp.serialization:tx-in-script-sig
-                        (first (bitcoin-lisp.serialization:transaction-inputs tx))))))
+                        (elt (bitcoin-lisp.serialization:transaction-inputs tx) 0)))))
     (is (not (bitcoin-lisp.serialization:transaction-has-witness-p tx)))
     ;; Legacy round-trip
     (let ((re-serialized (bitcoin-lisp.serialization:serialize-transaction tx)))
@@ -153,14 +153,14 @@
   "Coinbase transaction wtxid should be 32 zero bytes."
   (let ((coinbase-tx (bitcoin-lisp.serialization:make-transaction
                       :version 1
-                      :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                      :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                      :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                          :initial-element 0)
                                                        :index #xFFFFFFFF)
                                      :script-sig (make-array 4 :element-type '(unsigned-byte 8)
                                                                :initial-element 1)))
-                      :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                      :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                       :value 5000000000
                                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                  :initial-element #x76)))
@@ -174,7 +174,7 @@
   (let* ((raw (make-witness-test-tx-bytes))
          (tx (flexi-streams:with-input-from-sequence (s raw)
                (bitcoin-lisp.serialization:read-transaction s)))
-         (stack (first (bitcoin-lisp.serialization:transaction-witness tx))))
+         (stack (elt (bitcoin-lisp.serialization:transaction-witness tx) 0)))
     ;; First item: 72 bytes of 0xAA
     (is (every (lambda (b) (= b #xAA)) (first stack)))
     ;; Second item: 33 bytes of 0xBB
@@ -230,14 +230,14 @@
   "Create a simple test transaction for compact block tests."
   (bitcoin-lisp.serialization:make-transaction
    :version 2
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output (bitcoin-lisp.serialization:make-outpoint
                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                       :initial-element #x33)
                                     :index 0)
                   :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                   :sequence #xffffffff))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value 50000
                    :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                               :initial-element #x76)))

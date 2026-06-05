@@ -39,10 +39,10 @@ carrying it is appended and the coinbase gets the BIP141 reserved witness value
                                    :script-pubkey witness-commitment-script)))))
     (bitcoin-lisp.serialization:make-transaction
      :version 1
-     :inputs (list in)
-     :outputs outputs
+     :inputs (vector in)
+     :outputs (coerce outputs 'simple-vector)
      ;; BIP141 reserved witness value (one 32-byte zero item).
-     :witness (when witness-commitment-script (list (list (%zeros32))))
+     :witness (when witness-commitment-script (vector (list (%zeros32))))
      :lock-time 0)))
 
 (defun assemble-full-block (chain-state mempool &key coinbase-script-pubkey block-time)

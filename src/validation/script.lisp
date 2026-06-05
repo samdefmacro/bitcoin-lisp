@@ -412,7 +412,7 @@ Witness programs: OP_n <2-40 bytes> where n is 0-16."
 Returns a list of byte vectors, or NIL if no witness data."
   (let ((witness (bitcoin-lisp.serialization:transaction-witness tx)))
     (when (and witness (< input-idx (length witness)))
-      (nth input-idx witness))))
+      (aref witness input-idx))))
 
 (defun validate-input-script (tx input-idx utxo)
   "Validate a single transaction input's script against its spent UTXO.
@@ -420,7 +420,7 @@ Dispatches to the Coalton interop path for both legacy/P2SH and witness scripts.
 Binds *current-tx* and *current-input-index* for sighash computation.
 Returns T on success, NIL on failure."
   (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig
-                     (nth input-idx (bitcoin-lisp.serialization:transaction-inputs tx))))
+                     (aref (bitcoin-lisp.serialization:transaction-inputs tx) input-idx)))
         (script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
         (amount (bitcoin-lisp.storage:utxo-entry-value utxo))
         (bitcoin-lisp.coalton.interop:*current-tx* tx)
