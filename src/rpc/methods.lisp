@@ -157,7 +157,7 @@ matching Bitcoin Core's uint256::GetHex."
 
 (defun output-to-json (output index)
   "Convert transaction output to JSON."
-  `(("value" . ,(/ (bitcoin-lisp.serialization:tx-out-value output) 100000000.0))
+  `(("value" . ,(/ (bitcoin-lisp.serialization:tx-out-value output) 100000000.0d0))
     ("n" . ,index)
     ("scriptPubKey" . (("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
                                   (bitcoin-lisp.serialization:tx-out-script-pubkey output)))))))
@@ -284,7 +284,7 @@ matching Bitcoin Core's uint256::GetHex."
                  (utxo-height (bitcoin-lisp.storage:utxo-entry-height entry)))
             `(("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
               ("confirmations" . ,(1+ (- height utxo-height)))
-              ("value" . ,(/ (bitcoin-lisp.storage:utxo-entry-value entry) 100000000.0))
+              ("value" . ,(/ (bitcoin-lisp.storage:utxo-entry-value entry) 100000000.0d0))
               ("scriptPubKey" . (("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
                                             (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))))
               ("coinbase" . ,(bitcoin-lisp.storage:utxo-entry-coinbase entry))))
@@ -1008,7 +1008,7 @@ another connection, mirroring Core."
                                  . ,(bitcoin-lisp.crypto:bytes-to-hex
                                      (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
                                 ("desc" . ,desc)
-                                ("amount" . ,(/ value 100000000.0))
+                                ("amount" . ,(/ value 100000000.0d0))
                                 ("coinbase" . ,(bitcoin-lisp.storage:utxo-entry-coinbase entry))
                                 ("height" . ,height)
                                 ,@(let ((hex (blockhash-at height)))
@@ -1020,7 +1020,7 @@ another connection, mirroring Core."
                     ("height" . ,tip-height)
                     ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
                     ("unspents" . ,(nreverse unspents))
-                    ("total_amount" . ,(/ total-amount 100000000.0)))))
+                    ("total_amount" . ,(/ total-amount 100000000.0d0)))))
            (%release-txoutset-scan))))
       (t
        (error 'rpc-error :code +rpc-invalid-parameter+
@@ -1673,7 +1673,7 @@ Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
            (txout-count (bitcoin-lisp.storage:utxo-count utxo-set))
            (tx-count (bitcoin-lisp.storage:utxo-set-distinct-txids utxo-set))
            (total-satoshis (bitcoin-lisp.storage:utxo-set-total-amount utxo-set))
-           (total-btc (/ total-satoshis 100000000.0))
+           (total-btc (/ total-satoshis 100000000.0d0))
            (result `(("height" . ,height)
                      ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
                      ("transactions" . ,tx-count)
