@@ -63,6 +63,32 @@
     (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash hex)))
     (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash (string-upcase hex))))))
 
+;;; --- Prioritisation RPC Tests ---
+
+(test rpc-prioritisetransaction-and-introspection
+  "prioritisetransaction adjusts the mempool delta map; getprioritisedtransactions
+reports fee_delta/in_mempool/modified_fee; getmempoolentry exposes fees.modified."
+  (let* ((node (make-test-node))
+         (mempool (bitcoin-lisp::node-mempool node))
+         (txid-hex (make-string 64 :initial-element #\a)))
+    ;; dummy must be 0/null; fee_delta must be an integer
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list txid-hex 1 1000)))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list txid-hex 0 "x")))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list "nothex" 0 1000)))
+    ;; Delta for a not-in-mempool tx is recorded and reported
+    (is (eq t (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list txid-hex 0 2500))))
+    (let* ((r (bitcoin-lisp.rpc::rpc-getprioritisedtransactions node nil))
+           (row (cdr (assoc txid-hex r :test #'string=))))
+      (is (= 2500 (cdr (assoc "fee_delta" row :test #'string=))))
+      (is (null (cdr (assoc "in_mempool" row :test #'string=)))))
+    ;; Net-zero clears it; empty map encodes as an object
+    (is (eq t (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list txid-hex nil -2500))))
+    (is (hash-table-p (bitcoin-lisp.rpc::rpc-getprioritisedtransactions node nil)))
+    (is (zerop (hash-table-count (bitcoin-lisp.mempool:mempool-deltas mempool))))))
+
 ;;; --- Output Descriptor Tests (scantxoutset) ---
 
 (test descriptor-checksum-core-vector
