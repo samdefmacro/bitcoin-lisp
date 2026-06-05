@@ -79,6 +79,57 @@ deltas stack, and a net-zero delta is dropped from the map."
     (is (null (bitcoin-lisp.mempool:mempool-get mempool txid)))
     (is (zerop (hash-table-count (bitcoin-lisp.mempool:mempool-deltas mempool))))))
 
+;;;; Persistence tests (mempool.dat)
+
+(test mempool-dat-round-trip
+  "save-mempool-file/read-mempool-file round-trips entries (parents first),
+per-entry deltas, and residual deltas; corrupt files read as not-ok."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (parent (make-mempool-test-tx :input-id 60))
+         (parent-txid (bitcoin-lisp.serialization:transaction-hash parent))
+         (child (%mp-spending-tx parent-txid))
+         (child-txid (bitcoin-lisp.serialization:transaction-hash child))
+         (absent-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element 99))
+         (path (merge-pathnames (format nil "mempool-test-~D.dat" (get-universal-time))
+                                (uiop:temporary-directory))))
+    ;; Child added after parent; insertion order child-last but save must be
+    ;; parents-first regardless of table order.
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                 mempool parent-txid (make-mempool-entry-for-tx parent :fee 5000))))
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                 mempool child-txid (make-mempool-entry-for-tx child :fee 7000))))
+    (bitcoin-lisp.mempool:mempool-prioritise mempool child-txid 1234)
+    (bitcoin-lisp.mempool:mempool-prioritise mempool absent-txid -555)
+    (unwind-protect
+         (progn
+           (is (= 2 (bitcoin-lisp.mempool:save-mempool-file mempool path)))
+           (multiple-value-bind (entries residual ok)
+               (bitcoin-lisp.mempool:read-mempool-file path)
+             (is-true ok)
+             (is (= 2 (length entries)))
+             ;; Parents-first: parent tx is the first record.
+             (destructuring-bind (tx1 time1 delta1) (first entries)
+               (is (equalp parent-txid (bitcoin-lisp.serialization:transaction-hash tx1)))
+               (is (= 1000000 time1))
+               (is (zerop delta1)))
+             (destructuring-bind (tx2 time2 delta2) (second entries)
+               (declare (ignore time2))
+               (is (equalp child-txid (bitcoin-lisp.serialization:transaction-hash tx2)))
+               (is (= 1234 delta2)))
+             ;; Residual: only the absent txid's delta.
+             (is (= 1 (length residual)))
+             (is (equalp absent-txid (car (first residual))))
+             (is (= -555 (cdr (first residual)))))
+           ;; Corrupt the file -> not ok.
+           (with-open-file (out path :direction :output :if-exists :overwrite
+                                     :element-type '(unsigned-byte 8))
+             (file-position out 20)
+             (write-byte 0 out)
+             (write-byte 255 out))
+           (is-false (nth-value 2 (bitcoin-lisp.mempool:read-mempool-file path))))
+      (ignore-errors (delete-file path)))))
+
 ;;;; Mempool core tests
 
 (test mempool-add-and-get
