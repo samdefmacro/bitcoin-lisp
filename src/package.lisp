@@ -112,6 +112,7 @@
    #:br-read-bytes
    #:br-read-compact-size
    #:br-read-var-bytes
+   #:br-read-transaction
    ;; Types
    #:dovector
    #:outpoint
@@ -470,6 +471,9 @@
    #:mempool-entry-modified-fee
    #:mempool-deltas
    #:mempool-prioritise
+   #:mempool-dat-path
+   #:save-mempool-file
+   #:read-mempool-file
    #:mempool-entry-size
    #:mempool-entry-vsize
    #:mempool-entry-wtxid

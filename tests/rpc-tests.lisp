@@ -63,6 +63,20 @@
     (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash hex)))
     (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash (string-upcase hex))))))
 
+;;; --- savemempool RPC Test ---
+
+(test rpc-savemempool-writes-file
+  "savemempool dumps the pool to mempool.dat under the data directory."
+  (let* ((dir (merge-pathnames (format nil "savemempool-test-~D/" (get-universal-time))
+                               (uiop:temporary-directory)))
+         (node (make-test-node)))
+    (setf (bitcoin-lisp::node-data-directory node) dir)
+    (unwind-protect
+         (let ((r (bitcoin-lisp.rpc::rpc-savemempool node nil)))
+           (is (stringp (cdr (assoc "filename" r :test #'string=))))
+           (is (not (null (probe-file (bitcoin-lisp.mempool:mempool-dat-path dir))))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
 ;;; --- Prioritisation RPC Tests ---
 
 (test rpc-prioritisetransaction-and-introspection
