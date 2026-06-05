@@ -684,8 +684,8 @@ leaving a live peer's in-flight untouched."
                                                         :initial-contents '(#x51))))  ; OP_TRUE
          (coinbase-tx (bitcoin-lisp.serialization:make-transaction
                        :version 1
-                       :inputs (list coinbase-input)
-                       :outputs (list coinbase-output)
+                       :inputs (vector coinbase-input)
+                       :outputs (vector coinbase-output)
                        :lock-time 0))
          ;; Build a valid-looking block header
          (header (bitcoin-lisp.serialization:make-block-header

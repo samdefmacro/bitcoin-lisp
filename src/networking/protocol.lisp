@@ -450,7 +450,7 @@ and recurse on newly-accepted txs so a parent can unblock a whole chain."
 or the mempool), so an orphan can be resolved promptly."
   (let ((seen (make-hash-table :test 'equalp))
         (invs '()))
-    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
       (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
              (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
              (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))

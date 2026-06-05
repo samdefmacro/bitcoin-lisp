@@ -30,14 +30,14 @@
   "Create a simple transaction with a unique identifier byte."
   (bitcoin-lisp.serialization:make-transaction
    :version 2
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output (bitcoin-lisp.serialization:make-outpoint
                                     :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                       :initial-element id-byte)
                                     :index 0)
                   :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                   :sequence #xffffffff))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value 50000
                    :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                               :initial-element #x76)))

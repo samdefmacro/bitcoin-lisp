@@ -136,10 +136,10 @@
                   :script-pubkey script-pubkey)))
     (bitcoin-lisp.serialization:make-transaction
      :version 1
-     :inputs (list input)
-     :outputs (list output)
+     :inputs (vector input)
+     :outputs (vector output)
      :lock-time 0
-     :witness (when witness (list witness)))))
+     :witness (when witness (vector witness)))))
 
 (test p2pkh-transaction-sigops-cost
   "P2PKH transaction: 1 OP_CHECKSIG in scriptPubKey => cost = 1 * 4 = 4."

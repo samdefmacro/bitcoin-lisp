@@ -116,8 +116,8 @@
                                                         :initial-contents '(#x41 #x04))))
          (coinbase-tx (bitcoin-lisp.serialization:make-transaction
                        :version 1
-                       :inputs (list coinbase-input)
-                       :outputs (list coinbase-output)
+                       :inputs (vector coinbase-input)
+                       :outputs (vector coinbase-output)
                        :lock-time 0))
          (block (bitcoin-lisp.serialization:make-bitcoin-block
                  :header header
@@ -159,8 +159,8 @@
                                                         :initial-contents '(#x76 #xa9 #x14))))
          (coinbase-tx (bitcoin-lisp.serialization:make-transaction
                        :version 1
-                       :inputs (list coinbase-input)
-                       :outputs (list coinbase-output)
+                       :inputs (vector coinbase-input)
+                       :outputs (vector coinbase-output)
                        :lock-time 0))
          (block (bitcoin-lisp.serialization:make-bitcoin-block
                  :header header

@@ -33,12 +33,12 @@
 OUT-VALUE to one P2SH(OP_TRUE) output."
   (bitcoin-lisp.serialization:make-transaction
    :version version
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output (bitcoin-lisp.serialization:make-outpoint
                                     :hash prev-txid :index prev-index)
                   :script-sig (%p2sh-optrue-scriptsig)
                   :sequence sequence))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value out-value
                    :script-pubkey (%p2sh-optrue-spk)))
    :lock-time 0))
@@ -147,7 +147,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
            ;; need the parents list {p1,p2} both spent by child.
            (child (bitcoin-lisp.serialization:make-transaction
                    :version 2
-                   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                   :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                     :hash p2id :index 0)
                                   :script-sig (%p2sh-optrue-scriptsig))
@@ -155,7 +155,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
                                   :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                     :hash p1id :index 0)
                                   :script-sig (%p2sh-optrue-scriptsig)))
-                   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                    :value 50000 :script-pubkey (%p2sh-optrue-spk)))
                    :lock-time 0)))
       (multiple-value-bind (ok reason)
