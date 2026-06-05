@@ -573,3 +573,27 @@ test blocks: 1 tx each), and tx-count round-trips through the v2 header index."
        (signals bitcoin-lisp.rpc::rpc-error
          (bitcoin-lisp.rpc::rpc-getchaintxstats node (list 99))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test rpc-getchaintxstats-genesis-backfill
+  "txcount stays known on a v1-upgraded index: genesis is never in the block
+store, so its zeroed tx-count is backfilled definitionally (exactly its
+coinbase) instead of being dropped as unreadable."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "chaintxstats-genesis")
+     (%build-and-connect chain-state block-store utxo-set genesis-hash
+                         (make-test-chain-hashes #x72 3))
+     ;; Simulate a v1-loaded index: genesis entry's tx-count is 0.
+     (let ((genesis-entry (bitcoin-lisp.storage:get-block-index-entry
+                           chain-state genesis-hash)))
+       (setf (bitcoin-lisp.storage:block-index-entry-tx-count genesis-entry) 0)
+       (let ((node (bitcoin-lisp::make-node)))
+         (setf (bitcoin-lisp::node-chain-state node) chain-state)
+         (setf (bitcoin-lisp::node-block-store node) block-store)
+         (let ((r (bitcoin-lisp.rpc::rpc-getchaintxstats node (list 2))))
+           ;; genesis (1) + three coinbase-only blocks.
+           (is (= 4 (cdr (assoc "txcount" r :test #'string=))))
+           (is (= 2 (cdr (assoc "window_tx_count" r :test #'string=))))))
+       ;; The definitional count is cached back onto the entry.
+       (is (= 1 (bitcoin-lisp.storage:block-index-entry-tx-count genesis-entry))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
