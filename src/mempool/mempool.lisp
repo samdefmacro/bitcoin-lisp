@@ -59,6 +59,13 @@ DEFAULT_MEMPOOL_EXPIRY_HOURS.")
   (parents (make-hash-table :test 'equalp) :type hash-table)
   (children (make-hash-table :test 'equalp) :type hash-table))
 
+(defun tx-wire-bytes (tx)
+  "TX in its wire encoding: witness form only when the tx has witness data,
+so legacy txs aren't charged phantom marker/flag bytes."
+  (if (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+      (bitcoin-lisp.serialization:serialize-witness-transaction tx)
+      (bitcoin-lisp.serialization:serialize-transaction tx)))
+
 (defun make-entry-from-tx (tx fee height &key (sigops 0) (entry-time 0))
   "Build a mempool-entry from TX, computing the derived size/vsize/wtxid fields.
 Centralizes entry construction so every acceptance path records the same
@@ -67,11 +74,7 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
    :transaction tx
    :fee fee
    :modified-fee fee
-   ;; Wire-serialized byte length (witness form only when the tx has witness
-   ;; data, so legacy txs aren't charged phantom marker/flag bytes).
-   :size (length (if (bitcoin-lisp.serialization:transaction-has-witness-p tx)
-                     (bitcoin-lisp.serialization:serialize-witness-transaction tx)
-                     (bitcoin-lisp.serialization:serialize-transaction tx)))
+   :size (length (tx-wire-bytes tx))
    :vsize (bitcoin-lisp.serialization:transaction-vsize tx)
    :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)
    :sigops sigops
@@ -542,6 +545,107 @@ all txids that would be evicted (the conflicts plus their descendants)."
              (ceiling (* new-vsize +incremental-relay-fee-rate+) 1000))
       (return-from check-rbf-rules (values nil :insufficient-fee nil)))
     (values t nil replaced)))
+
+;;;; Persistence (Bitcoin Core mempool.dat — node/mempool_persist.cpp)
+;;;;
+;;;; Own versioned format (like the UTXO snapshot, NOT Core's binary layout):
+;;;;   magic "MPL\x01" (u32) | version (u8) |
+;;;;   entry-count (u32) | entries: [tx-len u32 | tx bytes (witness form) |
+;;;;     entry-time u64 | fee-delta i64] |
+;;;;   residual-delta-count (u32) | [txid 32B | fee-delta i64]* | CRC32
+;;;; Entries are written parents-before-children (ascending in-mempool
+;;;; ancestor count) so reload through normal acceptance resolves chained
+;;;; spends, mirroring Core's sorted infoAll(). Per-entry deltas ride with
+;;;; their entry; deltas for txs not in the pool are the residual map.
+
+(defconstant +mempool-dat-magic+ #x4d504c01
+  "Magic identifying a mempool.dat file (\"MPL\" + 0x01).")
+
+(defconstant +mempool-dat-version+ 1)
+
+(defun mempool-dat-path (data-directory)
+  "Path of the mempool persistence file under DATA-DIRECTORY, or NIL."
+  (when data-directory
+    (merge-pathnames "mempool.dat" data-directory)))
+
+(defun %mempool-entries-parents-first (mempool)
+  "All (txid . entry) pairs ordered so every in-mempool parent precedes its
+children (ascending ancestor count; a child always counts more ancestors
+than any of its parents)."
+  ;; Decorate-sort-undecorate: ancestor counts are computed ONCE per entry
+  ;; (a sort :key would re-walk ancestors on every comparison).
+  (let ((pairs '()))
+    (maphash (lambda (txid entry)
+               (push (list txid entry
+                           (nth-value 0 (mempool-ancestor-stats mempool txid)))
+                     pairs))
+             (mempool-entries mempool))
+    (mapcar (lambda (triple) (cons (first triple) (second triple)))
+            (sort pairs #'< :key #'third))))
+
+(defun save-mempool-file (mempool path)
+  "Persist MEMPOOL (entries + prioritisation deltas) to PATH atomically.
+Returns the number of entries written."
+  (let ((ordered (%mempool-entries-parents-first mempool))
+        (residual '()))
+    (maphash (lambda (txid delta)
+               (unless (mempool-has mempool txid)
+                 (push (cons txid delta) residual)))
+             (mempool-deltas mempool))
+    (bitcoin-lisp.storage:save-file-with-crc32
+     path
+     (lambda (s)
+       (bitcoin-lisp.serialization:write-uint32-le s +mempool-dat-magic+)
+       (bitcoin-lisp.serialization:write-uint8 s +mempool-dat-version+)
+       (bitcoin-lisp.serialization:write-uint32-le s (length ordered))
+       (loop for (txid . entry) in ordered
+             for bytes = (tx-wire-bytes (mempool-entry-transaction entry))
+             do (bitcoin-lisp.serialization:write-uint32-le s (length bytes))
+                (write-sequence bytes s)
+                (bitcoin-lisp.serialization:write-uint64-le s (mempool-entry-entry-time entry))
+                (bitcoin-lisp.serialization:write-int64-le
+                 s (gethash txid (mempool-deltas mempool) 0)))
+       (bitcoin-lisp.serialization:write-uint32-le s (length residual))
+       (loop for (txid . delta) in residual
+             do (write-sequence txid s)
+                (bitcoin-lisp.serialization:write-int64-le s delta))))
+    (length ordered)))
+
+(defun read-mempool-file (path)
+  "Read a mempool.dat written by save-mempool-file. Returns
+(values entries residual-deltas ok-p) where ENTRIES is a list of
+(tx entry-time fee-delta) in file (parents-first) order and
+RESIDUAL-DELTAS is an alist of (txid . delta). OK-P is NIL when the file
+is missing, corrupt, or an unknown version — callers continue with an
+empty mempool, like Core."
+  (let ((data (bitcoin-lisp.storage:load-file-with-crc32 path 13)))
+    (unless data
+      (return-from read-mempool-file (values nil nil nil)))
+    (handler-case
+        ;; The byte-reader spans the full verified buffer; parsing reads
+        ;; exactly the declared counts, so the trailing CRC bytes (already
+        ;; checked by load-file-with-crc32) are simply never consumed.
+        (let ((br (bitcoin-lisp.serialization:make-byte-reader-from data)))
+          (unless (and (= (bitcoin-lisp.serialization:br-read-u32-le br) +mempool-dat-magic+)
+                       (= (bitcoin-lisp.serialization:br-read-u8 br) +mempool-dat-version+))
+            (return-from read-mempool-file (values nil nil nil)))
+          (let* ((count (bitcoin-lisp.serialization:br-read-u32-le br))
+                 (entries
+                   (loop repeat count
+                         collect
+                         (let* ((len (bitcoin-lisp.serialization:br-read-u32-le br))
+                                (bytes (bitcoin-lisp.serialization:br-read-bytes br len))
+                                (tx (bitcoin-lisp.serialization:br-read-transaction
+                                     (bitcoin-lisp.serialization:make-byte-reader-from bytes)))
+                                (entry-time (bitcoin-lisp.serialization:br-read-u64-le br))
+                                (delta (bitcoin-lisp.serialization:br-read-i64-le br)))
+                           (list tx entry-time delta))))
+                 (residual
+                   (loop repeat (bitcoin-lisp.serialization:br-read-u32-le br)
+                         collect (cons (bitcoin-lisp.serialization:br-read-bytes br 32)
+                                       (bitcoin-lisp.serialization:br-read-i64-le br)))))
+            (values entries residual t)))
+      (error () (values nil nil nil)))))
 
 ;;;; Eviction
 
