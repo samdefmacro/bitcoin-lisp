@@ -75,7 +75,7 @@ appears later), and no two txs spend the same prevout."
          (dolist (tx package)
            (setf (gethash (bitcoin-lisp.serialization:transaction-hash tx) later) t))
          (dolist (tx package)
-           (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+           (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
              (when (gethash (bitcoin-lisp.serialization:outpoint-hash
                              (bitcoin-lisp.serialization:tx-in-previous-output in))
                             later)
@@ -84,7 +84,7 @@ appears later), and no two txs spend the same prevout."
        ;; No two txs spend the same prevout.
        (let ((spent (make-hash-table :test 'equalp)))
          (dolist (tx package)
-           (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+           (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
              (let* ((p (bitcoin-lisp.serialization:tx-in-previous-output in))
                     (key (cons (bitcoin-lisp.serialization:outpoint-hash p)
                                (bitcoin-lisp.serialization:outpoint-index p))))
@@ -103,7 +103,7 @@ DAG). Returns (values ok-p reason)."
         (parent-txids (make-hash-table :test 'equalp))
         (child-spends (make-hash-table :test 'equalp)))
     ;; The txids the child spends from.
-    (dolist (in (bitcoin-lisp.serialization:transaction-inputs child))
+    (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs child))
       (setf (gethash (bitcoin-lisp.serialization:outpoint-hash
                       (bitcoin-lisp.serialization:tx-in-previous-output in))
                      child-spends)
@@ -117,7 +117,7 @@ DAG). Returns (values ok-p reason)."
             (values nil :package-not-child-with-parents)))))
     ;; No parent may depend on another parent.
     (dolist (tx parents)
-      (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+      (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
         (when (gethash (bitcoin-lisp.serialization:outpoint-hash
                         (bitcoin-lisp.serialization:tx-in-previous-output in))
                        parent-txids)
@@ -136,7 +136,7 @@ real mempool."
   (let ((coins (make-hash-table :test 'equalp)))
     (dolist (tx package coins)
       (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-        (loop for out in (bitcoin-lisp.serialization:transaction-outputs tx)
+        (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
               for idx from 0
               do (setf (gethash (cons txid idx) coins)
                        (bitcoin-lisp.storage:make-utxo-entry

@@ -34,7 +34,7 @@ DEFAULT_MAX_ORPHAN_TRANSACTIONS).")
 
 (defun %orphan-deindex (pool txid tx)
   "Remove TXID from every by-prev bucket of its input parents."
-  (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+  (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
     (let* ((ptxid (bitcoin-lisp.serialization:outpoint-hash
                    (bitcoin-lisp.serialization:tx-in-previous-output in)))
            (bucket (gethash ptxid (orphan-pool-by-prev pool))))
@@ -78,7 +78,7 @@ txid. Evicts the oldest orphan if the pool is at capacity. Returns T if added."
              :from-peer peer
              :entry-time (bitcoin-lisp.serialization:get-unix-time)))
       (incf (orphan-pool-count pool))
-      (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+      (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
         (let ((ptxid (bitcoin-lisp.serialization:outpoint-hash
                       (bitcoin-lisp.serialization:tx-in-previous-output in))))
           (pushnew txid (gethash ptxid (orphan-pool-by-prev pool)) :test #'equalp)))

@@ -63,11 +63,11 @@
 Uses verify-script which follows Bitcoin Core's VerifyScript flow."
   (let* ((script-pubkey-asm (third prevout-data))
          (amount (if (>= (length prevout-data) 4) (fourth prevout-data) 0))
-         (input (nth input-index (bitcoin-lisp.serialization:transaction-inputs tx)))
+         (input (elt (bitcoin-lisp.serialization:transaction-inputs tx) input-index))
          (pubkey-bytes (assemble-script (strip-op-prefix script-pubkey-asm)))
          (sig-bytes (bitcoin-lisp.serialization:tx-in-script-sig input))
          (witness-stack (when (bitcoin-lisp.serialization:transaction-witness tx)
-                          (nth input-index (bitcoin-lisp.serialization:transaction-witness tx))))
+                          (elt (bitcoin-lisp.serialization:transaction-witness tx) input-index)))
          (bitcoin-lisp.coalton.interop:*current-tx* tx)
          (bitcoin-lisp.coalton.interop:*current-input-index* input-index)
          (bitcoin-lisp.coalton.interop:*witness-input-amount* (or amount 0)))

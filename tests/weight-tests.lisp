@@ -22,8 +22,8 @@
                                                               :initial-element #x76)))))
     (bitcoin-lisp.serialization:make-transaction
      :version 1
-     :inputs tx-inputs
-     :outputs tx-outputs
+     :inputs (coerce tx-inputs 'simple-vector)
+     :outputs (coerce tx-outputs 'simple-vector)
      :lock-time 0)))
 
 (defun make-witness-test-tx (&key (inputs 1) (outputs 1) (script-sig-size 0)
@@ -48,10 +48,10 @@
                                                                    :initial-element #xAB)))))
     (bitcoin-lisp.serialization:make-transaction
      :version 1
-     :inputs tx-inputs
-     :outputs tx-outputs
+     :inputs (coerce tx-inputs 'simple-vector)
+     :outputs (coerce tx-outputs 'simple-vector)
      :lock-time 0
-     :witness witness)))
+     :witness (coerce witness 'simple-vector))))
 
 ;;; Task 4.1: Unit tests for transaction-weight
 

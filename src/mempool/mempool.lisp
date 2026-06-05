@@ -153,7 +153,7 @@ or NIL if no mempool tx spends it. Used by the gettxspendingprevout RPC."
 (defun mempool-check-conflict (mempool tx)
   "Check if TX conflicts with any existing mempool entry.
 Returns the txid of the conflicting transaction, or NIL if no conflict."
-  (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
     (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
            (key (make-outpoint-key
                  (bitcoin-lisp.serialization:outpoint-hash prevout)
@@ -169,7 +169,7 @@ Returns the txid of the conflicting transaction, or NIL if no conflict."
   "Return the distinct txids of TX's inputs that are themselves in the mempool."
   (let ((seen (make-hash-table :test 'equalp))
         (result '()))
-    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
       (let ((ptxid (bitcoin-lisp.serialization:outpoint-hash
                     (bitcoin-lisp.serialization:tx-in-previous-output input))))
         (when (and (mempool-has mempool ptxid) (not (gethash ptxid seen)))
@@ -345,7 +345,7 @@ Returns :ok on success, or a keyword indicating the rejection reason."
       (setf (gethash wtxid (mempool-by-wtxid mempool)) txid)))
 
   ;; Index spent outpoints
-  (dolist (input (bitcoin-lisp.serialization:transaction-inputs
+  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs
                   (mempool-entry-transaction entry)))
     (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
            (key (make-outpoint-key
@@ -364,7 +364,7 @@ Returns the removed entry, or NIL if not found."
   (let ((entry (gethash txid (mempool-entries mempool))))
     (when entry
       ;; Remove spent outpoint entries
-      (dolist (input (bitcoin-lisp.serialization:transaction-inputs
+      (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs
                       (mempool-entry-transaction entry)))
         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                (key (make-outpoint-key
@@ -435,7 +435,7 @@ DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB = 0.1 sat/vB).")
   "Distinct txids of mempool txs that directly conflict with TX (spend a common
 outpoint). Generalizes mempool-check-conflict, which returns only the first."
   (let ((seen (make-hash-table :test 'equalp)) (result '()))
-    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx) result)
+    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx) result)
       (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
              (key (make-outpoint-key
                    (bitcoin-lisp.serialization:outpoint-hash prevout)
@@ -463,7 +463,7 @@ all txids that would be evicted (the conflicts plus their descendants)."
     ;; A replacement must not spend an output of any tx it replaces (Core
     ;; EntriesAndTxidsDisjoint) — that would leave a dangling input after the
     ;; replaced set is evicted.
-    (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+    (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
       (when (gethash (bitcoin-lisp.serialization:outpoint-hash
                       (bitcoin-lisp.serialization:tx-in-previous-output in))
                      replaced)
@@ -480,7 +480,7 @@ all txids that would be evicted (the conflicts plus their descendants)."
       (dolist (ctxid direct-conflicts)
         (let ((ce (mempool-get mempool ctxid)))
           (when ce
-            (dolist (in (bitcoin-lisp.serialization:transaction-inputs
+            (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs
                          (mempool-entry-transaction ce)))
               (let ((p (bitcoin-lisp.serialization:tx-in-previous-output in)))
                 (setf (gethash (make-outpoint-key
@@ -488,7 +488,7 @@ all txids that would be evicted (the conflicts plus their descendants)."
                                 (bitcoin-lisp.serialization:outpoint-index p))
                                orig-inputs)
                       t))))))
-      (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+      (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
         (let* ((p (bitcoin-lisp.serialization:tx-in-previous-output in))
                (ptxid (bitcoin-lisp.serialization:outpoint-hash p)))
           (when (and (mempool-has mempool ptxid)
@@ -584,7 +584,7 @@ Also removes any transactions that conflict with block transactions."
   (let ((block-outpoints (make-hash-table :test 'equalp)))
     ;; Collect all outpoints spent by block transactions
     (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-      (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+      (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                (key (make-outpoint-key
                      (bitcoin-lisp.serialization:outpoint-hash prevout)
