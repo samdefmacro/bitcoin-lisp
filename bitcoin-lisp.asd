@@ -75,6 +75,7 @@
                  (:module "rpc"
                   :components ((:file "package")
                                (:file "accessors")
+                               (:file "descriptors")
                                (:file "methods")
                                (:file "server")))
                  (:file "node"))))

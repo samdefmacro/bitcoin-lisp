@@ -63,6 +63,120 @@
     (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash hex)))
     (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash (string-upcase hex))))))
 
+;;; --- Output Descriptor Tests (scantxoutset) ---
+
+(test descriptor-checksum-core-vector
+  "descriptor-checksum matches Bitcoin Core's documented example
+(descriptor.cpp's EXAMPLE_DESCRIPTOR_RAW), and validation round-trips."
+  (let ((body "raw(76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac)"))
+    (is (string= "fm24fxxy" (bitcoin-lisp.rpc::descriptor-checksum body)))
+    (is (string= (concatenate 'string body "#fm24fxxy")
+                 (bitcoin-lisp.rpc::descriptor-add-checksum body)))
+    ;; Correct checksum accepted, wrong checksum rejected.
+    (finishes (bitcoin-lisp.rpc::parse-output-descriptor
+               (concatenate 'string body "#fm24fxxy") :mainnet))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::parse-output-descriptor
+       (concatenate 'string body "#fm24fxxx") :mainnet))))
+
+(test descriptor-parse-forms
+  "Each supported descriptor form expands to the right scriptPubKey(s).
+Cross-checked against Core: addr(12cbQLTFMXRnSzktFkuoG3eHoMeFtpTu3S) is
+documented in descriptor.cpp as the address of the raw() example script."
+  (let* ((pubkey-hex "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+         (pubkey (bitcoin-lisp.crypto:hex-to-bytes pubkey-hex))
+         (keyhash (bitcoin-lisp.crypto:hash160 pubkey)))
+    ;; addr() == Core's raw() example script
+    (let ((pairs (bitcoin-lisp.rpc::parse-output-descriptor
+                  "addr(12cbQLTFMXRnSzktFkuoG3eHoMeFtpTu3S)" :mainnet)))
+      (is (= 1 (length pairs)))
+      (is (string= "76a91411b366edfc0a8b66feebae5c2e25a7b6a5d1cf3188ac"
+                   (bitcoin-lisp.crypto:bytes-to-hex (car (first pairs))))))
+    ;; raw() passes bytes through
+    (let ((pairs (bitcoin-lisp.rpc::parse-output-descriptor "raw(51)" :mainnet)))
+      (is (equalp #(#x51) (car (first pairs)))))
+    ;; pkh(): OP_DUP OP_HASH160 <h160> OP_EQUALVERIFY OP_CHECKSIG
+    (let ((script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+                               (format nil "pkh(~A)" pubkey-hex) :mainnet)))))
+      (is (= 25 (length script)))
+      (is (equalp keyhash (subseq script 3 23))))
+    ;; wpkh(): OP_0 <h160>
+    (let ((script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+                               (format nil "wpkh(~A)" pubkey-hex) :mainnet)))))
+      (is (= 22 (length script)))
+      (is (= #x00 (aref script 0)))
+      (is (equalp keyhash (subseq script 2))))
+    ;; sh(wpkh()): P2SH of the wpkh script
+    (let ((script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+                               (format nil "sh(wpkh(~A))" pubkey-hex) :mainnet)))))
+      (is (= 23 (length script)))
+      (is (= #xa9 (aref script 0))))
+    ;; combo(): 4 scripts for a compressed key, 2 for uncompressed
+    (is (= 4 (length (bitcoin-lisp.rpc::parse-output-descriptor
+                      (format nil "combo(~A)" pubkey-hex) :mainnet))))
+    ;; rawtr(): OP_1 <32-byte key as-is>
+    (let* ((xonly-hex (subseq pubkey-hex 2))
+           (script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+                                (format nil "rawtr(~A)" xonly-hex) :mainnet)))))
+      (is (= 34 (length script)))
+      (is (= #x51 (aref script 0)))
+      (is (equalp (bitcoin-lisp.crypto:hex-to-bytes xonly-hex)
+                  (subseq script 2))))
+    ;; tr(): tweaked output key differs from the internal key
+    (let* ((xonly-hex (subseq pubkey-hex 2))
+           (script (car (first (bitcoin-lisp.rpc::parse-output-descriptor
+                                (format nil "tr(~A)" xonly-hex) :mainnet)))))
+      (is (= 34 (length script)))
+      (is (= #x51 (aref script 0)))
+      (is (not (equalp (bitcoin-lisp.crypto:hex-to-bytes xonly-hex)
+                       (subseq script 2)))))
+    ;; Unsupported / invalid forms signal rpc-error
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::parse-output-descriptor "sh(multi(2,03aa,03bb))" :mainnet))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::parse-output-descriptor "addr(notanaddress)" :mainnet))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::parse-output-descriptor
+       (format nil "wpkh(04~A)" (subseq pubkey-hex 2)) :mainnet))))
+
+(test rpc-scantxoutset-start-status-abort
+  "scantxoutset start scans the UTXO set against descriptor needles;
+status with no scan running returns null; abort with no scan is a no-op."
+  (let* ((node (make-test-node))
+         (utxo (bitcoin-lisp::node-utxo-set node))
+         (keyhash (make-array 20 :element-type '(unsigned-byte 8)
+                                 :initial-element 7))
+         (address (bitcoin-lisp.crypto:encode-p2pkh-address keyhash :testnet3))
+         (p2pkh (concatenate '(vector (unsigned-byte 8))
+                             #(#x76 #xa9 #x14) keyhash #(#x88 #xac)))
+         (txid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (txid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
+         (txid-c (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)))
+    ;; Two matching coins (addr + raw needles) and one non-matching.
+    (bitcoin-lisp.storage:add-utxo utxo txid-a 0 150000000 p2pkh 0)
+    (bitcoin-lisp.storage:add-utxo utxo txid-b 1 50000000
+                                   (coerce #(#x51) '(vector (unsigned-byte 8))) 0)
+    (bitcoin-lisp.storage:add-utxo utxo txid-c 0 1000
+                                   (make-array 25 :element-type '(unsigned-byte 8)) 0)
+    (let ((r (bitcoin-lisp.rpc::rpc-scantxoutset
+              node (list "start" (list (format nil "addr(~A)" address) "raw(51)")))))
+      (is (eq t (cdr (assoc "success" r :test #'string=))))
+      (is (= 3 (cdr (assoc "txouts" r :test #'string=))))
+      (let ((unspents (cdr (assoc "unspents" r :test #'string=))))
+        (is (= 2 (length unspents)))
+        ;; Every unspent carries a canonical descriptor with checksum.
+        (is (every (lambda (u) (find #\# (cdr (assoc "desc" u :test #'string=))))
+                   unspents)))
+      (is (= 2.0 (cdr (assoc "total_amount" r :test #'string=)))))
+    ;; No scan running: status -> null, abort -> no-op null.
+    (is (null (bitcoin-lisp.rpc::rpc-scantxoutset node (list "status"))))
+    (is (null (bitcoin-lisp.rpc::rpc-scantxoutset node (list "abort"))))
+    ;; Bad action / missing scanobjects -> errors.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-scantxoutset node (list "frobnicate")))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-scantxoutset node (list "start")))))
+
 ;;; --- Response Formatting Tests ---
 
 (test json-rpc-response-success
