@@ -66,6 +66,44 @@
                (is-true (bitcoin-lisp.networking:peer-address-in-tried addr)))))
       (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
 
+(test save-and-load-multi-bucket-refs
+  "v3: an address referenced from several new buckets (added via multiple
+source groups) keeps all its placements and its ref-count across save/load
+(pre-v3, reload collapsed everything to a single bucket with ref-count 1)."
+  (let ((book (bitcoin-lisp.networking:make-address-book))
+        (tmp-dir (merge-pathnames "test-peerdb-multibucket/" (uiop:temporary-directory))))
+    (ensure-directories-exist (merge-pathnames "dummy" tmp-dir))
+    (unwind-protect
+         (let ((path (merge-pathnames "peers.dat" tmp-dir))
+               (ip (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 8 8 4 4)))
+           ;; Add the same address from many distinct source /16s. Extra
+           ;; placements are probabilistic (Core's 1/2^n gate), so loop until
+           ;; multiplicity >= 2 — P(never) over 64 sources is ~2^-64.
+           (loop for a from 1 to 64
+                 do (bitcoin-lisp.networking:address-book-add
+                     book
+                     (bitcoin-lisp.networking:make-peer-address
+                      :ip ip :port 8333 :services 1
+                      :last-seen (bitcoin-lisp.serialization:get-unix-time))
+                     (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 a 7 1 1))
+                 until (>= (bitcoin-lisp.networking:peer-address-ref-count
+                            (bitcoin-lisp.networking:address-book-lookup book ip 8333))
+                           2))
+           (let* ((before (bitcoin-lisp.networking:address-book-lookup book ip 8333))
+                  (refs (bitcoin-lisp.networking:peer-address-ref-count before)))
+             (is (>= refs 2))
+             (is (eq t (bitcoin-lisp.networking:save-address-book book path)))
+             (let ((book2 (bitcoin-lisp.networking:make-address-book)))
+               (is (eq t (bitcoin-lisp.networking:load-address-book book2 path)))
+               (let ((after (bitcoin-lisp.networking:address-book-lookup book2 ip 8333)))
+                 (is (not (null after)))
+                 ;; Multiplicity survives, and the live new-table agrees.
+                 (is (= refs (bitcoin-lisp.networking:peer-address-ref-count after)))
+                 (let ((buckets (gethash (bitcoin-lisp.networking::peer-address-id after)
+                                         (bitcoin-lisp.networking::%new-table-buckets book2))))
+                   (is (= refs (length buckets))))))))
+      (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
+
 (test reject-corrupted-file
   "A peers.dat with a bad CRC32 is rejected (and backed up to .bak)."
   (let ((book (bitcoin-lisp.networking:make-address-book))
