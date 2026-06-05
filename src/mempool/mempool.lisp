@@ -38,6 +38,10 @@ DEFAULT_MEMPOOL_EXPIRY_HOURS.")
   "An entry in the mempool."
   (transaction nil :type bitcoin-lisp.serialization:transaction)
   (fee 0 :type (unsigned-byte 64))
+  ;; Fee plus any prioritisetransaction delta (Core's GetModifiedFee). This is
+  ;; the value mining selection, eviction, and RBF scoring see; FEE stays the
+  ;; real paid fee (block reward accounting, fees.base). Can go negative.
+  (modified-fee 0 :type integer)
   ;; Serialized (witness) byte length — used for the byte-based mempool size cap.
   (size 0 :type (unsigned-byte 32))
   ;; BIP141 virtual size — the basis for fee-rate (Core computes fee-rate on vsize).
@@ -62,6 +66,7 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
   (make-mempool-entry
    :transaction tx
    :fee fee
+   :modified-fee fee
    ;; Wire-serialized byte length (witness form only when the tx has witness
    ;; data, so legacy txs aren't charged phantom marker/flag bytes).
    :size (length (if (bitcoin-lisp.serialization:transaction-has-witness-p tx)
@@ -73,12 +78,27 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
    :height height
    :entry-time entry-time))
 
+(defun mempool-prioritise (mempool txid fee-delta)
+  "Add FEE-DELTA satoshis to TXID's prioritisation (Core's
+PrioritiseTransaction). Deltas stack; a net-zero delta is dropped. Applies
+immediately to the in-mempool entry's modified fee when present. Returns the
+accumulated delta."
+  (let* ((delta (+ (gethash txid (mempool-deltas mempool) 0) fee-delta))
+         (entry (mempool-get mempool txid)))
+    (when entry
+      (incf (mempool-entry-modified-fee entry) fee-delta))
+    (if (zerop delta)
+        (remhash txid (mempool-deltas mempool))
+        (setf (gethash txid (mempool-deltas mempool)) delta))
+    delta))
+
 (defun mempool-entry-fee-rate (entry)
-  "Compute the fee rate (satoshis per virtual byte) for a mempool entry."
+  "Fee rate (satoshis per virtual byte) for a mempool entry, using the
+prioritisation-modified fee (Core scores mining/eviction on modified fees)."
   (let ((vsize (mempool-entry-vsize entry)))
     (if (zerop vsize)
         0
-        (/ (mempool-entry-fee entry) vsize))))
+        (/ (mempool-entry-modified-fee entry) vsize))))
 
 ;;;; Mempool
 
@@ -101,6 +121,9 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
   ;; rolling minimum fee.
   (rolling-min-fee-rate 0 :type integer)
   (rolling-min-fee-time 0 :type integer)
+  ;; txid -> satoshi fee delta from prioritisetransaction (Core's mapDeltas).
+  ;; Deltas may exist for txs not (yet) in the mempool; applied on acceptance.
+  (deltas (make-hash-table :test 'equalp) :type hash-table)
   ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
   ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
   (orphan-pool (make-orphan-pool) :type orphan-pool))
@@ -217,14 +240,14 @@ they are reachable from each other). Bounded by the ancestor/descendant limits."
   "Return (values count vsize fees) over SEED-ENTRY plus every entry in TXID-SET."
   (let ((count 1)
         (vsize (mempool-entry-vsize seed-entry))
-        (fees (mempool-entry-fee seed-entry)))
+        (fees (mempool-entry-modified-fee seed-entry)))
     (maphash (lambda (txid v)
                (declare (ignore v))
                (let ((e (mempool-get mempool txid)))
                  (when e
                    (incf count)
                    (incf vsize (mempool-entry-vsize e))
-                   (incf fees (mempool-entry-fee e)))))
+                   (incf fees (mempool-entry-modified-fee e)))))
              txid-set)
     (values count vsize fees)))
 
@@ -308,6 +331,12 @@ Returns :ok on success, or a keyword indicating the rejection reason."
   ;; Check for duplicate
   (when (mempool-has mempool txid)
     (return-from mempool-add :duplicate))
+
+  ;; Apply any pre-existing prioritisation delta (Core: ATMP ApplyDelta) so
+  ;; eviction scoring below and later mining selection see the modified fee.
+  (let ((delta (gethash txid (mempool-deltas mempool))))
+    (when delta
+      (incf (mempool-entry-modified-fee entry) delta)))
 
   ;; Check for conflicts
   (let ((conflict (mempool-check-conflict
@@ -446,7 +475,9 @@ outpoint). Generalizes mempool-check-conflict, which returns only the first."
           (push sp result))))))
 
 (defun check-rbf-rules (mempool tx new-fee new-vsize direct-conflicts)
-  "Apply the BIP125 replacement rules for TX (paying NEW-FEE over NEW-VSIZE)
+  "Apply the BIP125 replacement rules for TX (paying NEW-FEE — the
+prioritisation-MODIFIED fee, like the replaced entries' fees below — over
+NEW-VSIZE)
 against DIRECT-CONFLICTS (a list of directly-conflicting mempool txids).
 Returns (values ok-p reason replaced-set), where REPLACED-SET is a hash-set of
 all txids that would be evicted (the conflicts plus their descendants)."
@@ -500,7 +531,7 @@ all txids that would be evicted (the conflicts plus their descendants)."
     ;; Sum the fees of everything being replaced.
     (maphash (lambda (txid v) (declare (ignore v))
                (let ((e (mempool-get mempool txid)))
-                 (when e (incf orig-fees (mempool-entry-fee e)))))
+                 (when e (incf orig-fees (mempool-entry-modified-fee e)))))
              replaced)
     ;; Rule 3: pay at least the total fee of the replaced transactions.
     (when (< new-fee orig-fees)
@@ -591,9 +622,11 @@ Also removes any transactions that conflict with block transactions."
                      (bitcoin-lisp.serialization:outpoint-index prevout))))
           (setf (gethash key block-outpoints) t))))
 
-    ;; Remove confirmed transactions
+    ;; Remove confirmed transactions; a mined tx's prioritisation delta is
+    ;; spent ballast (Core removeForBlock -> ClearPrioritisation).
     (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
       (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+        (remhash txid (mempool-deltas mempool))
         (mempool-remove mempool txid)))
 
     ;; Remove conflicting transactions (mempool txs that spend same outpoints as block txs)

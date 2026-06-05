@@ -397,6 +397,8 @@ getmempooldescendants."
         ("time" . ,(bitcoin-lisp.mempool:mempool-entry-entry-time entry))
         ("height" . ,(bitcoin-lisp.mempool:mempool-entry-height entry))
         ("fees" . (("base" . ,(/ (bitcoin-lisp.mempool:mempool-entry-fee entry) 100000000.0d0))
+                   ("modified" . ,(/ (bitcoin-lisp.mempool:mempool-entry-modified-fee entry)
+                                     100000000.0d0))
                    ("ancestor" . ,(/ afees 100000000.0d0))
                    ("descendant" . ,(/ dfees 100000000.0d0))))
         ("ancestorcount" . ,acount)
@@ -882,6 +884,61 @@ gettxoutsetinfo this forces a coins-cache flush first. Errors if PATH exists."
         ("base_hash" . ,(if base-hash (hash-to-hex base-hash) ""))
         ("base_height" . ,base-height)
         ("path" . ,(namestring (truename path)))))))
+
+;;; --- Transaction prioritisation (Bitcoin Core prioritisetransaction) ---
+
+(defun rpc-prioritisetransaction (node params)
+  "Adjust TXID's effective fee for mining selection by FEE-DELTA satoshis
+(Bitcoin Core prioritisetransaction). PARAMS: (txid [dummy] fee-delta) —
+dummy must be 0 or null (legacy priority is gone). The delta also counts for
+mempool acceptance and RBF scoring; the fee is not actually paid. Returns T."
+  (let* ((txid-hex (first params))
+         (dummy (second params))
+         (fee-delta (third params))
+         (txid (and (stringp txid-hex) (parse-hex-hash txid-hex))))
+    (unless txid
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message "Invalid txid"))
+    (unless (or (null dummy) (and (numberp dummy) (zerop dummy)))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Priority is no longer supported, dummy argument to prioritisetransaction must be 0."))
+    (unless (integerp fee-delta)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Invalid fee_delta"))
+    (let* ((mempool (rpc-get-mempool node))
+           (entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
+      ;; Core: dust-output txs can't enter with a nonzero delta, so refuse to
+      ;; prioritise them after the fact too.
+      (when entry
+        (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+          (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
+                do (when (< (bitcoin-lisp.serialization:tx-out-value out)
+                            (bitcoin-lisp.validation::dust-threshold
+                             (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+                     (error 'rpc-error :code +rpc-invalid-parameter+
+                                       :message "Priority is not supported for transactions with dust outputs.")))))
+      (bitcoin-lisp.mempool:mempool-prioritise mempool txid fee-delta)
+      t)))
+
+(defun rpc-getprioritisedtransactions (node params)
+  "Map of all prioritisetransaction fee deltas by txid (Bitcoin Core
+getprioritisedtransactions): fee_delta, in_mempool, and modified_fee when the
+tx is currently in the mempool."
+  (declare (ignore params))
+  (let ((mempool (rpc-get-mempool node))
+        (result '()))
+    (maphash
+     (lambda (txid delta)
+       (let ((entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
+         (push
+          (cons (hash-to-hex txid)
+                `(("fee_delta" . ,delta)
+                  ("in_mempool" . ,(and entry t))
+                  ,@(when entry
+                      `(("modified_fee" . ,(bitcoin-lisp.mempool:mempool-entry-modified-fee entry))))))
+          result)))
+     (bitcoin-lisp.mempool:mempool-deltas mempool))
+    (or result (make-hash-table :test 'equal))))
 
 ;;; --- UTXO set scanning (Bitcoin Core scantxoutset) ---
 

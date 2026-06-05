@@ -36,6 +36,49 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
   "Create a mempool entry for a test transaction (computes size/vsize/wtxid)."
   (bitcoin-lisp.mempool:make-entry-from-tx tx fee 0 :entry-time 1000000))
 
+;;;; Prioritisation tests (Core PrioritiseTransaction / mapDeltas)
+
+(test mempool-prioritise-in-mempool
+  "Prioritising an in-mempool tx adjusts its modified fee and feerate scoring,
+deltas stack, and a net-zero delta is dropped from the map."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 1))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (entry (make-mempool-entry-for-tx tx :fee 10000)))
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add mempool txid entry)))
+    (is (= 10000 (bitcoin-lisp.mempool:mempool-entry-modified-fee entry)))
+    (bitcoin-lisp.mempool:mempool-prioritise mempool txid 5000)
+    (is (= 15000 (bitcoin-lisp.mempool:mempool-entry-modified-fee entry)))
+    (is (= 10000 (bitcoin-lisp.mempool:mempool-entry-fee entry)))   ; real fee untouched
+    (is (= (/ 15000 (bitcoin-lisp.mempool:mempool-entry-vsize entry))
+           (bitcoin-lisp.mempool:mempool-entry-fee-rate entry)))
+    ;; Stacking: -5000 brings the accumulated delta to zero -> map entry dropped.
+    (bitcoin-lisp.mempool:mempool-prioritise mempool txid -5000)
+    (is (= 10000 (bitcoin-lisp.mempool:mempool-entry-modified-fee entry)))
+    (is (zerop (hash-table-count (bitcoin-lisp.mempool:mempool-deltas mempool))))))
+
+(test mempool-prioritise-before-acceptance
+  "A delta set before the tx exists applies when the tx is later accepted
+(Core: ATMP ApplyDelta), and mining for a confirmed tx clears its delta."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 2))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+    (bitcoin-lisp.mempool:mempool-prioritise mempool txid 7000)
+    (let ((entry (make-mempool-entry-for-tx tx :fee 1000)))
+      (is (eq :ok (bitcoin-lisp.mempool:mempool-add mempool txid entry)))
+      (is (= 8000 (bitcoin-lisp.mempool:mempool-entry-modified-fee entry))))
+    ;; Mined in a block -> delta cleared (Core ClearPrioritisation).
+    (let ((block (bitcoin-lisp.serialization:make-bitcoin-block
+                  :header (bitcoin-lisp.serialization:make-block-header
+                           :version 1
+                           :prev-block (make-array 32 :element-type '(unsigned-byte 8))
+                           :merkle-root (make-array 32 :element-type '(unsigned-byte 8))
+                           :timestamp 0 :bits 0 :nonce 0)
+                  :transactions (list tx))))
+      (bitcoin-lisp.mempool:mempool-remove-for-block mempool block))
+    (is (null (bitcoin-lisp.mempool:mempool-get mempool txid)))
+    (is (zerop (hash-table-count (bitcoin-lisp.mempool:mempool-deltas mempool))))))
+
 ;;;; Mempool core tests
 
 (test mempool-add-and-get
@@ -262,6 +305,7 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
          (entry (bitcoin-lisp.mempool:make-mempool-entry
                  :transaction tx
                  :fee 1000
+                 :modified-fee 1000
                  :vsize 200
                  :entry-time 0)))
     (is (= 5 (bitcoin-lisp.mempool:mempool-entry-fee-rate entry)))))
