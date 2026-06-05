@@ -467,6 +467,9 @@
    #:make-entry-from-tx
    #:mempool-entry-transaction
    #:mempool-entry-fee
+   #:mempool-entry-modified-fee
+   #:mempool-deltas
+   #:mempool-prioritise
    #:mempool-entry-size
    #:mempool-entry-vsize
    #:mempool-entry-wtxid

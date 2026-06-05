@@ -547,9 +547,15 @@ feerate (Bitcoin Core's package_feerates path)."
           (values nil error nil)))
 
       ;; Convert typed fee to integer; fee-rate is per virtual byte (BIP141).
+      ;; Policy fee checks (floor, RBF) run on the prioritisation-modified fee
+      ;; (Core's ws.m_modified_fees); the real fee is what gets recorded.
       (let* ((fee-value (unwrap-satoshi fee))
+             (modified-fee-value
+               (+ fee-value
+                  (gethash (bitcoin-lisp.serialization:transaction-hash tx)
+                           (bitcoin-lisp.mempool:mempool-deltas mempool) 0)))
              (vsize (bitcoin-lisp.serialization:transaction-vsize tx))
-             (fee-rate (if (zerop vsize) 0 (floor fee-value vsize)))
+             (fee-rate (if (zerop vsize) 0 (floor modified-fee-value vsize)))
              (direct-conflicts (bitcoin-lisp.mempool:find-rbf-conflicts mempool tx))
              (replaced-set nil))
 
@@ -566,8 +572,8 @@ feerate (Bitcoin Core's package_feerates path)."
         ;; to the caller (4th value) to evict before adding.
         (when direct-conflicts
           (multiple-value-bind (ok reason rset)
-              (bitcoin-lisp.mempool:check-rbf-rules mempool tx fee-value vsize
-                                                    direct-conflicts)
+              (bitcoin-lisp.mempool:check-rbf-rules mempool tx modified-fee-value
+                                                    vsize direct-conflicts)
             (unless ok
               (return-from validate-transaction-for-mempool (values nil reason nil)))
             (setf replaced-set rset)))
