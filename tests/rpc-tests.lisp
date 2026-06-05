@@ -48,6 +48,21 @@
   (signals bitcoin-lisp.rpc::rpc-error
     (bitcoin-lisp.rpc::parse-json-rpc-request "{\"jsonrpc\":\"2.0\",\"id\":1}")))
 
+;;; --- Hash Hex Helper Tests ---
+
+(test hash-to-hex-lowercase-reversed
+  "hash-to-hex emits lowercase hex (Core's uint256::GetHex), byte-reversed."
+  (let* ((bytes (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-contents (loop for i from 0 below 32
+                                                       collect (+ #xe0 (mod i 16)))))
+         (hex (bitcoin-lisp.rpc::hash-to-hex bytes)))
+    (is (string= hex (string-downcase hex)))
+    ;; Reversed: last byte (#xef) prints first.
+    (is (string= "ef" (subseq hex 0 2)))
+    ;; Round-trips through parse-hex-hash, which accepts either case.
+    (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash hex)))
+    (is (equalp bytes (bitcoin-lisp.rpc::parse-hex-hash (string-upcase hex))))))
+
 ;;; --- Response Formatting Tests ---
 
 (test json-rpc-response-success

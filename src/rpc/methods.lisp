@@ -23,10 +23,9 @@
       bytes)))
 
 (defun hash-to-hex (bytes)
-  "Convert a 32-byte hash to hex string (reversed for display)."
-  (with-output-to-string (s)
-    (loop for i from 31 downto 0
-          do (format s "~2,'0x" (aref bytes i)))))
+  "Convert a 32-byte hash to lowercase hex string (reversed for display),
+matching Bitcoin Core's uint256::GetHex."
+  (bitcoin-lisp.crypto:bytes-to-hex (bitcoin-lisp.crypto:reverse-bytes bytes)))
 
 ;;; --- Blockchain Query Methods ---
 
@@ -891,16 +890,20 @@ gettxoutsetinfo this forces a coins-cache flush first. Errors if PATH exists."
 BLOCK-STORE when the index predates the v2 tx-count field. Returns NIL when
 unknown (header-only entry whose block isn't readable, e.g. pruned)."
   (let ((n (bitcoin-lisp.storage:block-index-entry-tx-count entry)))
-    (if (plusp n)
-        n
-        (let ((block (and block-store
-                          (bitcoin-lisp.storage:get-block
-                           block-store
-                           (bitcoin-lisp.storage:block-index-entry-hash entry)))))
-          (when block
-            (setf (bitcoin-lisp.storage:block-index-entry-tx-count entry)
-                  (length (bitcoin-lisp.serialization:bitcoin-block-transactions
-                           block))))))))
+    (cond ((plusp n) n)
+          ;; Genesis is never in the block store; it carries exactly its
+          ;; coinbase (a v1-loaded index leaves its entry at 0).
+          ((zerop (bitcoin-lisp.storage:block-index-entry-height entry))
+           (setf (bitcoin-lisp.storage:block-index-entry-tx-count entry) 1))
+          (t
+           (let ((block (and block-store
+                             (bitcoin-lisp.storage:get-block
+                              block-store
+                              (bitcoin-lisp.storage:block-index-entry-hash entry)))))
+             (when block
+               (setf (bitcoin-lisp.storage:block-index-entry-tx-count entry)
+                     (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+                              block)))))))))
 
 (defun rpc-getchaintxstats (node params)
   "Transaction count/rate statistics over a block window (Bitcoin Core
