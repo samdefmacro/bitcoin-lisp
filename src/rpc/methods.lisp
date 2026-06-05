@@ -883,6 +883,149 @@ gettxoutsetinfo this forces a coins-cache flush first. Errors if PATH exists."
         ("base_height" . ,base-height)
         ("path" . ,(namestring (truename path)))))))
 
+;;; --- UTXO set scanning (Bitcoin Core scantxoutset) ---
+
+(defvar *txoutset-scan-lock* (bt:make-lock "txoutset-scan")
+  "Guards the scan-reservation state below (Core's CoinsViewScanReserver).")
+(defvar *txoutset-scan-running* nil)
+(defvar *txoutset-scan-progress* 0)
+(defvar *txoutset-scan-abort* nil)
+
+(defun %reserve-txoutset-scan ()
+  "Reserve the single scan slot. Returns T if reserved, NIL if a scan is
+already running."
+  (bt:with-lock-held (*txoutset-scan-lock*)
+    (if *txoutset-scan-running*
+        nil
+        (setf *txoutset-scan-abort* nil
+              *txoutset-scan-progress* 0
+              *txoutset-scan-running* t))))
+
+(defun %release-txoutset-scan ()
+  (bt:with-lock-held (*txoutset-scan-lock*)
+    (setf *txoutset-scan-running* nil)))
+
+(defun %scanobject-descriptor (scanobject)
+  "The descriptor string of a scanobject: either a plain string or an
+object {\"desc\": ..., [\"range\": ...]}. Ranged descriptors are not
+supported (we have no derivable keys)."
+  (cond
+    ((stringp scanobject) scanobject)
+    ((hash-table-p scanobject)
+     (when (gethash "range" scanobject)
+       (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message "Ranged descriptors are not supported"))
+     (let ((desc (gethash "desc" scanobject)))
+       (unless (stringp desc)
+         (error 'rpc-error :code +rpc-invalid-parameter+
+                           :message "Descriptor needs to be provided in scan object"))
+       desc))
+    (t (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message "Invalid scan object"))))
+
+(defun rpc-scantxoutset (node params)
+  "Scan the UTXO set for outputs matching descriptors (Bitcoin Core
+scantxoutset). PARAMS: (action [scanobjects]) — action is \"start\",
+\"status\" or \"abort\". Supports the descriptor subset documented in
+descriptors.lisp (addr/raw/pk/pkh/wpkh/sh(wpkh)/combo/tr/rawtr). The scan
+runs synchronously on the calling RPC thread; status/abort act from
+another connection, mirroring Core."
+  (let ((action (first params)))
+    (cond
+      ((equal action "status")
+       (if (bt:with-lock-held (*txoutset-scan-lock*) *txoutset-scan-running*)
+           `(("progress" . ,*txoutset-scan-progress*))
+           nil))
+      ((equal action "abort")
+       (bt:with-lock-held (*txoutset-scan-lock*)
+         (when *txoutset-scan-running*
+           (setf *txoutset-scan-abort* t))))
+      ((equal action "start")
+       (let ((scanobjects (second params)))
+         (unless (and scanobjects (listp scanobjects))
+           (error 'rpc-error :code +rpc-misc-error+
+                             :message "scanobjects argument is required for the start action"))
+         (unless (%reserve-txoutset-scan)
+           (error 'rpc-error :code +rpc-invalid-parameter+
+                             :message "Scan already in progress, use action \"abort\" or \"status\""))
+         (unwind-protect
+              (let ((needles (make-hash-table :test 'equalp))
+                    (network (rpc-get-network node)))
+                ;; Expand every scanobject into needle scripts.
+                (dolist (scanobject scanobjects)
+                  (loop for (script . desc)
+                          in (parse-output-descriptor
+                              (%scanobject-descriptor scanobject) network)
+                        do (setf (gethash script needles) desc)))
+                (let* ((chain-state (rpc-get-chain-state node))
+                       (utxo-set (rpc-get-utxo-set node))
+                       (tip-height (bitcoin-lisp.storage:current-height chain-state))
+                       (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+                       (count 0) (total-amount 0) (unspents '())
+                       (height-hashes nil)
+                       (aborted nil))
+                  (flet ((blockhash-at (height)
+                           ;; get-block-at-height walks tip->height, so per-match
+                           ;; lookups would be O(matches * tip). One backward walk
+                           ;; on first use builds the whole height->hex table.
+                           (unless height-hashes
+                             (setf height-hashes (make-hash-table))
+                             (loop with e = (and best-hash
+                                                 (bitcoin-lisp.storage:get-block-index-entry
+                                                  chain-state best-hash))
+                                   while e
+                                   do (setf (gethash (bitcoin-lisp.storage:block-index-entry-height e)
+                                                     height-hashes)
+                                            (hash-to-hex
+                                             (bitcoin-lisp.storage:block-index-entry-hash e)))
+                                      (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e))))
+                           (gethash height height-hashes)))
+                  (block scan
+                    (bitcoin-lisp.storage:utxo-set-iterate
+                     utxo-set
+                     (lambda (txid vout entry)
+                       (when *txoutset-scan-abort*
+                         (setf aborted t)
+                         (return-from scan))
+                       (incf count)
+                       ;; Iteration is txid-lex-ordered (utxo-set-iterate's
+                       ;; documented contract): the txid prefix is the scan
+                       ;; position (Core's g_scan_progress).
+                       (setf *txoutset-scan-progress*
+                             (floor (* 100 (+ (* 256 (aref txid 0)) (aref txid 1)))
+                                    65536))
+                       (let ((desc (gethash
+                                    (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)
+                                    needles)))
+                         (when desc
+                           (let ((height (bitcoin-lisp.storage:utxo-entry-height entry))
+                                 (value (bitcoin-lisp.storage:utxo-entry-value entry)))
+                             (incf total-amount value)
+                             (push
+                              `(("txid" . ,(hash-to-hex txid))
+                                ("vout" . ,vout)
+                                ("scriptPubKey"
+                                 . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                     (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
+                                ("desc" . ,desc)
+                                ("amount" . ,(/ value 100000000.0))
+                                ("coinbase" . ,(bitcoin-lisp.storage:utxo-entry-coinbase entry))
+                                ("height" . ,height)
+                                ,@(let ((hex (blockhash-at height)))
+                                    (when hex `(("blockhash" . ,hex))))
+                                ("confirmations" . ,(1+ (- tip-height height))))
+                              unspents))))))))
+                  `(("success" . ,(not aborted))
+                    ("txouts" . ,count)
+                    ("height" . ,tip-height)
+                    ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
+                    ("unspents" . ,(nreverse unspents))
+                    ("total_amount" . ,(/ total-amount 100000000.0)))))
+           (%release-txoutset-scan))))
+      (t
+       (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message (format nil "Invalid action '~A'" action))))))
+
 ;;; --- Chain tx statistics (Bitcoin Core getchaintxstats) ---
 
 (defun %entry-tx-count (entry block-store)
