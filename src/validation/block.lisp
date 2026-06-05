@@ -127,7 +127,7 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
   ;; BIP 68 only applies to transaction version >= 2
   (when (< (bitcoin-lisp.serialization:transaction-version tx) 2)
     (return-from check-sequence-locks t))
-  (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx) t)
+  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx) t)
     (let ((seq (bitcoin-lisp.serialization:tx-in-sequence input)))
       ;; Skip if disable flag is set
       (unless (logtest seq +sequence-disable-flag+)
@@ -531,7 +531,7 @@ worker threads — binds all required specials locally."
          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
            (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
          (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
-    (loop for input in tx-inputs
+    (loop for input across tx-inputs
           for input-idx from 0
           for utxo = (and spent-utxos (aref spent-utxos input-idx))
           when utxo
@@ -539,9 +539,9 @@ worker threads — binds all required specials locally."
                  ;; Re-run with debug to capture the preimage for the log line
                  (let ((bitcoin-lisp.coalton.interop:*debug-bip341-sighash* t))
                    (validate-input-script tx input-idx utxo))
-                 (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                       (witness (nth input-idx
-                                     (bitcoin-lisp.serialization:transaction-witness tx))))
+                 (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                        (wvec (bitcoin-lisp.serialization:transaction-witness tx))
+                        (witness (and wvec (aref wvec input-idx))))
                    (bitcoin-lisp:log-warn
                     "SCRIPT-FAILED: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D scriptpubkey=~A scriptsig=~A witness-items=~D witness=~A flags=~A"
                     height tx-idx input-idx
@@ -648,7 +648,7 @@ header 0xaa21a9ed. Returns the 32-byte commitment hash or NIL."
   (let ((outputs (bitcoin-lisp.serialization:transaction-outputs coinbase-tx))
         (commitment nil))
     ;; Scan all outputs; use the last matching one (per BIP 141)
-    (dolist (output outputs)
+    (bitcoin-lisp.serialization:dovector (output outputs)
       (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
         (when (and (>= (length script) 38)   ; OP_RETURN + push36 + 4-byte header + 32-byte hash
                    (= (aref script 0) #x6a)  ; OP_RETURN
@@ -691,8 +691,10 @@ rejected, and the no-commitment+witness case is :unexpected-witness
              (commitment (find-witness-commitment coinbase-tx)))
         (when commitment
           ;; Coinbase input-0 witness stack must be exactly one 32-byte item.
-          (let ((cb-stack (first (bitcoin-lisp.serialization:transaction-witness
-                                  coinbase-tx))))
+          (let* ((cb-witness (bitcoin-lisp.serialization:transaction-witness
+                              coinbase-tx))
+                 (cb-stack (and cb-witness (plusp (length cb-witness))
+                                (aref cb-witness 0))))
             (unless (and (= (length cb-stack) 1)
                          (= (length (first cb-stack)) 32))
               (return-from validate-witness-commitment
@@ -828,7 +830,7 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
     (when (< current-height activation-height)
       (return-from validate-coinbase-height (values t nil))))
   (let* ((coinbase-tx (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
-         (first-input (first (bitcoin-lisp.serialization:transaction-inputs coinbase-tx)))
+         (first-input (aref (bitcoin-lisp.serialization:transaction-inputs coinbase-tx) 0))
          (script-sig (bitcoin-lisp.serialization:tx-in-script-sig first-input))
          (expect (encode-bip34-height current-height)))
     (if (and (>= (length script-sig) (length expect))
@@ -894,10 +896,10 @@ Tracks indices and allocates only once at the end."
 (defun count-legacy-sigops (tx)
   "Count legacy (inaccurate) sigops across all scriptSigs and scriptPubKeys of TX."
   (let ((count 0))
-    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
       (incf count (count-script-sigops
                    (bitcoin-lisp.serialization:tx-in-script-sig input))))
-    (dolist (output (bitcoin-lisp.serialization:transaction-outputs tx))
+    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
       (incf count (count-script-sigops
                    (bitcoin-lisp.serialization:tx-out-script-pubkey output))))
     count))
@@ -926,7 +928,7 @@ Returns (VALUES p2sh-count witness-count).
 GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
   (let ((p2sh-count 0)
         (witness-count 0))
-    (loop for input in (bitcoin-lisp.serialization:transaction-inputs tx)
+    (loop for input across (bitcoin-lisp.serialization:transaction-inputs tx)
           for input-idx from 0
           do (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                     (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
@@ -1072,7 +1074,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
           (incf total-sigops-cost (* (count-legacy-sigops coinbase-tx) +witness-scale-factor+))
           ;; Add coinbase outputs to pending (for intra-block spending)
           (let ((txid (bitcoin-lisp.serialization:transaction-hash coinbase-tx)))
-            (loop for output in (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
+            (loop for output across (bitcoin-lisp.serialization:transaction-outputs coinbase-tx)
                   for idx from 0
                   do (setf (gethash (cons txid idx) pending-utxos)
                            (bitcoin-lisp.storage::make-utxo-entry
@@ -1104,7 +1106,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                      (values nil :too-many-sigops nil)))
                  ;; Add this transaction's outputs to pending for subsequent txs
                  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-                   (loop for output in (bitcoin-lisp.serialization:transaction-outputs tx)
+                   (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
                          for idx from 0
                          do (setf (gethash (cons txid idx) pending-utxos)
                                   (bitcoin-lisp.storage::make-utxo-entry
@@ -1179,7 +1181,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
   "Check if TX is a coinbase transaction."
   (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx)))
     (and (= (length inputs) 1)
-         (bitcoin-lisp.serialization:coinbase-input-p (first inputs)))))
+         (bitcoin-lisp.serialization:coinbase-input-p (aref inputs 0)))))
 
 (defun calculate-block-subsidy (height)
   "Calculate the block subsidy for a given height.

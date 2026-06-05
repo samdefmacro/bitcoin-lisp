@@ -23,11 +23,11 @@ flag string), via the shared run-script-test harness."
 CLTV/CSV read."
   (bitcoin-lisp.serialization:make-transaction
    :version version
-   :inputs (list (bitcoin-lisp.serialization:make-tx-in
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                   :previous-output (bitcoin-lisp.serialization:make-outpoint)
                   :script-sig (make-array 0 :element-type '(unsigned-byte 8))
                   :sequence sequence))
-   :outputs (list (bitcoin-lisp.serialization:make-tx-out
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                    :value 0 :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
    :lock-time locktime))
 

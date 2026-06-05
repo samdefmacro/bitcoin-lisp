@@ -197,14 +197,14 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
           (cb (bitcoin-lisp.mining:build-coinbase-transaction
                1 5000000000 :script-pubkey spk :witness-commitment-script commit)))
      ;; one input, null prevout, BIP34 height-1 (OP_1) scriptSig >= 2 bytes
-     (let ((in (first (bitcoin-lisp.serialization:transaction-inputs cb))))
+     (let ((in (elt (bitcoin-lisp.serialization:transaction-inputs cb) 0)))
        (is-true (bitcoin-lisp.serialization:coinbase-input-p in))
        (is (>= (length (bitcoin-lisp.serialization:tx-in-script-sig in)) 2))
        (is (= #x51 (aref (bitcoin-lisp.serialization:tx-in-script-sig in) 0))))
      ;; payout + commitment outputs
      (is (= 2 (length (bitcoin-lisp.serialization:transaction-outputs cb))))
      (is (= 5000000000 (bitcoin-lisp.serialization:tx-out-value
-                        (first (bitcoin-lisp.serialization:transaction-outputs cb)))))
+                        (elt (bitcoin-lisp.serialization:transaction-outputs cb) 0))))
      ;; reserved witness value present (so it serializes as a segwit tx)
      (is-true (bitcoin-lisp.serialization:transaction-has-witness-p cb)))))
 

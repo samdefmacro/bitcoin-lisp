@@ -342,14 +342,14 @@ undo list — (txid index entry) for every spent UTXO, in apply order."
           for is-coinbase = (zerop tx-index)
           do (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
                (unless is-coinbase
-                 (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+                 (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
                    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                           (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
                           (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
                           (entry (coin-view-spend cache prev-txid prev-index)))
                      (when entry
                        (push (list prev-txid prev-index entry) spent)))))
-               (loop for output in (bitcoin-lisp.serialization:transaction-outputs tx)
+               (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
                      for out-idx from 0
                      do (coin-view-add cache txid out-idx
                                        (bitcoin-lisp.serialization:tx-out-value output)
@@ -500,7 +500,7 @@ data — (txid index entry) for each spent UTXO, in apply order."
              for is-coinbase = (zerop tx-index)
              do (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
                   (unless is-coinbase
-                    (dolist (input (bitcoin-lisp.serialization:transaction-inputs tx))
+                    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
                       (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                              (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
                              (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
@@ -510,7 +510,7 @@ data — (txid index entry) for each spent UTXO, in apply order."
                           (push (list prev-txid prev-index entry) spent))
                         (remhash key (utxo-set-entries view))
                         (setf (utxo-set-dirty view) t))))
-                  (loop for output in (bitcoin-lisp.serialization:transaction-outputs tx)
+                  (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
                         for out-idx from 0
                         do (let ((key (make-utxo-key txid out-idx))
                                  (entry (make-utxo-entry

@@ -391,26 +391,33 @@ as one opcode and ends the walk."
   "Per-transaction precomputed sighash data. Bound once before validating inputs.")
 
 (defun bb-write-all-prevouts (bb inputs)
-  "Write each input's outpoint (32-byte hash + 4-byte LE index) into BB."
-  (dolist (inp inputs)
-    (let ((prev (bitcoin-lisp.serialization:tx-in-previous-output inp)))
-      (bitcoin-lisp.serialization:bb-write-bytes
-       bb (bitcoin-lisp.serialization:outpoint-hash prev))
-      (bitcoin-lisp.serialization:bb-write-u32-le
-       bb (bitcoin-lisp.serialization:outpoint-index prev)))))
+  "Write each input's outpoint (32-byte hash + 4-byte LE index) into BB.
+INPUTS may be any sequence (struct field vector or an ad-hoc list)."
+  (map nil
+       (lambda (inp)
+         (let ((prev (bitcoin-lisp.serialization:tx-in-previous-output inp)))
+           (bitcoin-lisp.serialization:bb-write-bytes
+            bb (bitcoin-lisp.serialization:outpoint-hash prev))
+           (bitcoin-lisp.serialization:bb-write-u32-le
+            bb (bitcoin-lisp.serialization:outpoint-index prev))))
+       inputs))
 
 (defun bb-write-all-sequences (bb inputs)
-  (dolist (inp inputs)
-    (bitcoin-lisp.serialization:bb-write-u32-le
-     bb (bitcoin-lisp.serialization:tx-in-sequence inp))))
+  (map nil
+       (lambda (inp)
+         (bitcoin-lisp.serialization:bb-write-u32-le
+          bb (bitcoin-lisp.serialization:tx-in-sequence inp)))
+       inputs))
 
 (defun bb-write-all-outputs (bb outputs)
-  (dolist (out outputs)
-    (bitcoin-lisp.serialization:bb-write-i64-le
-     bb (bitcoin-lisp.serialization:tx-out-value out))
-    (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
-      (bitcoin-lisp.serialization:bb-write-varint bb (length script))
-      (bitcoin-lisp.serialization:bb-write-bytes bb script))))
+  (map nil
+       (lambda (out)
+         (bitcoin-lisp.serialization:bb-write-i64-le
+          bb (bitcoin-lisp.serialization:tx-out-value out))
+         (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+           (bitcoin-lisp.serialization:bb-write-varint bb (length script))
+           (bitcoin-lisp.serialization:bb-write-bytes bb script)))
+       outputs))
 
 (defun init-precomputed-sighash (tx &optional spent-utxos)
   "Initialize precomputed sighash data for TX. Call once per transaction.
@@ -584,7 +591,7 @@ dispatch."
   (if (and *current-tx* (bitcoin-lisp.serialization:transaction-inputs *current-tx*))
       (let ((inputs (bitcoin-lisp.serialization:transaction-inputs *current-tx*)))
         (if (< *current-input-index* (length inputs))
-            (bitcoin-lisp.serialization:tx-in-sequence (nth *current-input-index* inputs))
+            (bitcoin-lisp.serialization:tx-in-sequence (aref inputs *current-input-index*))
             #xFFFFFFFF))
       #xFFFFFFFF))
 
@@ -1057,8 +1064,8 @@ Used to get the redeem script from a P2SH scriptSig."
                               (< *current-input-index*
                                  (length (bitcoin-lisp.serialization:transaction-inputs *current-tx*))))
                          (bitcoin-lisp.serialization:tx-in-sequence
-                          (nth *current-input-index*
-                               (bitcoin-lisp.serialization:transaction-inputs *current-tx*)))
+                          (aref (bitcoin-lisp.serialization:transaction-inputs *current-tx*)
+                                *current-input-index*))
                          #xFFFFFFFF))
            (result (bitcoin-lisp.coalton.script:execute-script-with-stack-tx
                     script-vec initial-stack locktime version sequence)))
@@ -1572,7 +1579,7 @@ Used to remove the signature being verified from the scriptCode before sighash."
                    ;; ANYONECANPAY: only include the input being signed
                    (progn
                      (bb-write-varint bb 1)
-                     (let* ((inp (nth input-index inputs))
+                     (let* ((inp (aref inputs input-index))
                             (prevout (bitcoin-lisp.serialization:tx-in-previous-output inp)))
                        ;; Outpoint
                        (bb-write-bytes bb (bitcoin-lisp.serialization:outpoint-hash prevout))
@@ -1585,7 +1592,7 @@ Used to remove the signature being verified from the scriptCode before sighash."
                    ;; Normal: include all inputs
                    (progn
                      (bb-write-varint bb num-inputs)
-                     (loop for inp in inputs
+                     (loop for inp across inputs
                            for i from 0
                            do (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output inp)))
                                 ;; Outpoint
@@ -1616,7 +1623,7 @@ Used to remove the signature being verified from the scriptCode before sighash."
                            (bb-write-u64-le bb #xffffffffffffffff) ; -1 value
                            (bb-write-varint bb 0))                  ; empty script
                   ;; The actual output at input-index
-                  (let ((out (nth input-index outputs)))
+                  (let ((out (aref outputs input-index)))
                     (bb-write-u64-le bb (bitcoin-lisp.serialization:tx-out-value out))
                     (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
                       (bb-write-varint bb (length script))
@@ -1624,7 +1631,7 @@ Used to remove the signature being verified from the scriptCode before sighash."
                  ;; SIGHASH_ALL: all outputs
                  (t
                   (bb-write-varint bb num-outputs)
-                  (loop for out in outputs
+                  (loop for out across outputs
                         do (bb-write-u64-le bb (bitcoin-lisp.serialization:tx-out-value out))
                            (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
                              (bb-write-varint bb (length script))
@@ -1729,7 +1736,7 @@ Used to remove the signature being verified from the scriptCode before sighash."
          (anyonecanpay (plusp (logand sighash-type #x80)))
          (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
          (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
-         (current-input (nth input-index inputs))
+         (current-input (aref inputs input-index))
          (current-prevout (bitcoin-lisp.serialization:tx-in-previous-output current-input))
          (precomp (or *precomputed-sighash* (init-precomputed-sighash tx)))
          (zero32 (load-time-value
@@ -1748,7 +1755,7 @@ Used to remove the signature being verified from the scriptCode before sighash."
              ((= base-type 2) zero32)                           ; SIGHASH_NONE
              ((and (= base-type 3) (< input-index (length outputs))) ; SIGHASH_SINGLE
               (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
-                (bb-write-all-outputs bb (list (nth input-index outputs)))
+                (bb-write-all-outputs bb (list (aref outputs input-index)))
                 (bitcoin-lisp.crypto:hash256
                  (bitcoin-lisp.serialization:bb-finish bb))))
              ((= base-type 3) zero32)                           ; SIGHASH_SINGLE out of range
@@ -2639,8 +2646,8 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
                               (< *current-input-index*
                                  (length (bitcoin-lisp.serialization:transaction-inputs *current-tx*))))
                          (bitcoin-lisp.serialization:tx-in-sequence
-                          (nth *current-input-index*
-                               (bitcoin-lisp.serialization:transaction-inputs *current-tx*)))
+                          (aref (bitcoin-lisp.serialization:transaction-inputs *current-tx*)
+                                *current-input-index*))
                          #xFFFFFFFF))
            (result (bitcoin-lisp.coalton.script:execute-script-with-stack-tx
                     script-vec initial-stack locktime version sequence)))
@@ -2930,7 +2937,7 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
          (spent-utxos *current-spent-utxos*)
          (base-type (logand sighash-type #x1f))
          (anyonecanpay (plusp (logand sighash-type #x80)))
-         (current-input (nth input-index inputs))
+         (current-input (aref inputs input-index))
          (current-prevout (bitcoin-lisp.serialization:tx-in-previous-output current-input))
          (current-spent (aref spent-utxos input-index))
          (precomp (or *precomputed-sighash* (init-precomputed-sighash tx spent-utxos)))
@@ -2952,7 +2959,7 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
          (single-output-hash
            (when (and (= base-type 3) (< input-index (length outputs)))
              (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
-               (bb-write-all-outputs bb (list (nth input-index outputs)))
+               (bb-write-all-outputs bb (list (aref outputs input-index)))
                (bitcoin-lisp.crypto:sha256
                 (bitcoin-lisp.serialization:bb-finish bb)))))
          (ext-flag (if tapleaf-hash 1 0))

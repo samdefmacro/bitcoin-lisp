@@ -452,24 +452,24 @@
            (null-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
            (coinbase-tx (bitcoin-lisp.serialization:make-transaction
                          :version 1
-                         :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                         :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                         :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                           :hash null-hash :index #xFFFFFFFF)
                                         :script-sig (make-array 4 :element-type '(unsigned-byte 8)
                                                                   :initial-element 1)))
-                         :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                         :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                          :value 500000000
                                          :script-pubkey script))
                          :lock-time 0
                          :cached-hash coinbase-txid))
            (spending-tx (bitcoin-lisp.serialization:make-transaction
                          :version 1
-                         :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                         :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                         :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                           :hash prev-txid :index 0)
                                         :script-sig (make-array 4 :element-type '(unsigned-byte 8)
                                                                   :initial-element 2)))
-                         :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                         :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                          :value 8000000
                                          :script-pubkey script))
                          :lock-time 0
@@ -637,13 +637,13 @@ script-sig makes the serialization deterministic per block."
                        s))
          (coinbase-tx (bitcoin-lisp.serialization:make-transaction
                        :version 1
-                       :inputs (list (bitcoin-lisp.serialization:make-tx-in
+                       :inputs (vector (bitcoin-lisp.serialization:make-tx-in
                                       :previous-output (bitcoin-lisp.serialization:make-outpoint
                                                         :hash (make-array 32 :element-type '(unsigned-byte 8)
                                                                           :initial-element 0)
                                                         :index #xFFFFFFFF)
                                       :script-sig script-sig))
-                       :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                       :outputs (vector (bitcoin-lisp.serialization:make-tx-out
                                        :value value
                                        :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
                                                                   :initial-element #x76)))

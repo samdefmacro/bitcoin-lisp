@@ -141,8 +141,8 @@ matching Bitcoin Core's uint256::GetHex."
         (outputs (bitcoin-lisp.serialization:transaction-outputs tx)))
     `(("txid" . ,(tx-to-txid tx))
       ("version" . ,(bitcoin-lisp.serialization:transaction-version tx))
-      ("vin" . ,(mapcar #'input-to-json inputs))
-      ("vout" . ,(loop for out in outputs
+      ("vin" . ,(map 'list #'input-to-json inputs))
+      ("vout" . ,(loop for out across outputs
                        for i from 0
                        collect (output-to-json out i)))
       ("locktime" . ,(bitcoin-lisp.serialization:transaction-lock-time tx)))))
@@ -1080,7 +1080,7 @@ selected tx with data/txid/hash/depends/fee/sigops/weight. `depends` holds the
     (loop for e in entries
           for tx = (bitcoin-lisp.mempool:mempool-entry-transaction e)
           for depends = (let ((ds '()))
-                          (dolist (in (bitcoin-lisp.serialization:transaction-inputs tx))
+                          (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
                             (let ((idx (gethash (bitcoin-lisp.serialization:outpoint-hash
                                                  (bitcoin-lisp.serialization:tx-in-previous-output in))
                                                 index-of)))
@@ -1509,8 +1509,8 @@ Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
       ;; Create transaction
       (let ((tx (bitcoin-lisp.serialization:make-transaction
                  :version 2
-                 :inputs tx-inputs
-                 :outputs (nreverse tx-outputs)
+                 :inputs (coerce tx-inputs 'simple-vector)
+                 :outputs (coerce (nreverse tx-outputs) 'simple-vector)
                  :lock-time locktime)))
         (bitcoin-lisp.crypto:bytes-to-hex
          (bitcoin-lisp.serialization:serialize tx))))))
@@ -1596,7 +1596,7 @@ Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
               do (unless (zerop tx-idx)  ; Skip coinbase inputs
                    (incf total-ins (length (bitcoin-lisp.serialization:transaction-inputs tx))))
                  (incf total-outs (length (bitcoin-lisp.serialization:transaction-outputs tx)))
-                 (dolist (out (bitcoin-lisp.serialization:transaction-outputs tx))
+                 (bitcoin-lisp.serialization:dovector (out (bitcoin-lisp.serialization:transaction-outputs tx))
                    (incf total-out-value (bitcoin-lisp.serialization:tx-out-value out))))
         ;; Calculate subsidy
         (let* ((subsidy (calculate-block-subsidy height))
