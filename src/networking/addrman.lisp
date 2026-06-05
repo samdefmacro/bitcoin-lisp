@@ -466,7 +466,23 @@ challenger when the incumbent looks dead or the test window has elapsed."
 
 (defparameter +addrman-magic+ #(#x41 #x44 #x52 #x4D)  ; "ADRM"
   "Magic bytes for the bucket-format peers.dat.")
-(defconstant +addrman-format-version+ 2)
+(defconstant +addrman-format-version+ 3
+  "v3 appends each new-table entry's bucket numbers so multi-source
+placements (ref-count > 1) survive restart; v2 files still load, with
+each address reconstructed into the single bucket its source-group
+implies (the pre-v3 behavior).")
+
+(defun %new-table-buckets (book)
+  "Map id -> list of new-bucket numbers currently referencing it (one scan
+over the new table; an address added from several source groups appears in
+up to +addrman-new-buckets-per-address+ buckets)."
+  (let ((m (make-hash-table))
+        (nt (address-book-new-table book)))
+    (dotimes (slot (length nt))
+      (let ((id (aref nt slot)))
+        (when (>= id 0)
+          (push (floor slot +addrman-bucket-size+) (gethash id m)))))
+    m))
 
 (defun save-address-book (book path)
   "Persist BOOK to PATH (atomic write, CRC32-checked, bucket format)."
@@ -484,9 +500,9 @@ challenger when the incumbent looks dead or the test window has elapsed."
               (bitcoin-lisp.serialization:write-uint32-le s (address-book-n-tried book))
               (bitcoin-lisp.serialization:write-uint32-le
                s (hash-table-count (address-book-info book)))
+              (let ((id-buckets (%new-table-buckets book)))
               (maphash
                (lambda (id pa)
-                 (declare (ignore id))
                  (write-byte (if (peer-address-in-tried pa) 1 0) s)
                  (write-sequence (peer-address-ip pa) s)
                  (write-byte (ldb (byte 8 8) (peer-address-port pa)) s)
@@ -498,8 +514,13 @@ challenger when the incumbent looks dead or the test window has elapsed."
                  (bitcoin-lisp.serialization:write-uint32-le s (peer-address-n-attempts pa))
                  (let ((sg (or (peer-address-source-group pa) #())))
                    (write-byte (length sg) s)
-                   (write-sequence sg s)))
-               (address-book-info book)))
+                   (write-sequence sg s))
+                 ;; v3: this entry's new-bucket numbers (empty for tried).
+                 (let ((buckets (gethash id id-buckets)))
+                   (write-byte (length buckets) s)
+                   (dolist (b buckets)
+                     (bitcoin-lisp.serialization:write-uint16-le s b))))
+               (address-book-info book))))
             '(simple-array (unsigned-byte 8) (*)))))
     (with-open-file (out tmp-path :direction :output :if-exists :supersede
                                   :element-type '(unsigned-byte 8))
@@ -510,22 +531,32 @@ challenger when the incumbent looks dead or the test window has elapsed."
   t)
 
 (defun ab-load-entry (book tried-p ip port services last-seen last-attempt
-                      last-success n-attempts source-group)
-  "Reconstruct one saved entry into BOOK, preserving its stats."
+                      last-success n-attempts source-group
+                      &optional new-buckets)
+  "Reconstruct one saved entry into BOOK, preserving its stats. NEW-BUCKETS,
+when supplied (v3 files), is the saved list of new-bucket numbers — the entry
+is placed back into each, restoring multi-source ref-counts. Without it (v2),
+the single bucket implied by the source-group is used. Positions within
+buckets re-derive from the address-book key, which load-address-book reads
+before any entry; only bucket NUMBERS need persisting."
   (let ((pa (ab-create book ip port services last-seen
                        (if (plusp (length source-group)) source-group nil))))
     (incf (address-book-n-new book))
     (setf (peer-address-last-attempt pa) last-attempt
           (peer-address-last-success pa) last-success
           (peer-address-n-attempts pa) n-attempts)
-    ;; Place into its new bucket (deterministic from the saved key).
-    (let* ((sg (or (peer-address-source-group pa) (net-group-key ip)))
-           (b (new-bucket book pa sg))
-           (p (bucket-position book pa t b)))
-      (ab-clear-new book b p)
-      (setf (peer-address-ref-count pa) 1)
-      (setf (aref (address-book-new-table book) (bucket-slot b p))
-            (peer-address-id pa)))
+    ;; Place into new bucket(s); positions re-derive from the persisted key.
+    (let ((buckets (or (remove-duplicates new-buckets)
+                       (list (new-bucket book pa
+                                         (or (peer-address-source-group pa)
+                                             (net-group-key ip)))))))
+      (setf (peer-address-ref-count pa) 0)
+      (dolist (b buckets)
+        (let ((p (bucket-position book pa t b)))
+          (ab-clear-new book b p)
+          (incf (peer-address-ref-count pa))
+          (setf (aref (address-book-new-table book) (bucket-slot b p))
+                (peer-address-id pa)))))
     (when tried-p (ab-make-tried book pa))))
 
 (defun load-address-book (book path)
@@ -559,10 +590,10 @@ were loaded, NIL otherwise."
                     (bitcoin-lisp:log-warn "peers.dat unknown format; backing up to .bak")
                     (backup) (return-from load-address-book nil)))
                 (let ((version (bitcoin-lisp.serialization:read-uint32-le s)))
-                  (unless (= version +addrman-format-version+)
+                  (unless (member version '(2 3))
                     (bitcoin-lisp:log-warn "peers.dat version ~D unsupported; backing up to .bak"
                                            version)
-                    (backup) (return-from load-address-book nil)))
+                    (backup) (return-from load-address-book nil))
                 (read-sequence (address-book-key book) s)
                 (bitcoin-lisp.serialization:read-uint32-le s)  ; n-new (recomputed)
                 (bitcoin-lisp.serialization:read-uint32-le s)  ; n-tried (recomputed)
@@ -580,12 +611,17 @@ were loaded, NIL otherwise."
                              (sg-len (read-byte s))
                              (sg (make-array sg-len :element-type '(unsigned-byte 8))))
                         (read-sequence sg s)
-                        (ab-load-entry book tried-p ip port services last-seen
-                                       last-attempt last-success n-attempts sg))))
+                        (let ((new-buckets
+                                (when (>= version 3)
+                                  (loop repeat (read-byte s)
+                                        collect (bitcoin-lisp.serialization:read-uint16-le s)))))
+                          (ab-load-entry book tried-p ip port services last-seen
+                                         last-attempt last-success n-attempts sg
+                                         new-buckets)))))
                   (bitcoin-lisp:log-info "Loaded ~D peer addresses (~D tried) from peers.dat"
                                          (address-book-count book)
                                          (address-book-n-tried book))
-                  (> count 0))))))
+                  (> count 0)))))))
       (error (c)
         (bitcoin-lisp:log-warn "Failed to load peers.dat (~A); backing up to .bak" c)
         (backup)
