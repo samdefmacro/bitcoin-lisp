@@ -648,10 +648,14 @@ Returns the node instance."
   (log-info "Node started successfully")
   *node*)
 
-(defparameter +flush-every-n-blocks+ 1000
-  "Flush chainstate + UTXO set to disk every N connected blocks so a hard
-   crash loses at most N blocks of work. Mirrors Bitcoin Core's
-   nMinBlocksToKeep / FlushStateToDisk cadence (validation.cpp).")
+(defparameter +flush-every-n-blocks+ 25000
+  "Block-count flush backstop. The 600s time trigger and the 450MiB
+   coins-cache size trigger are the real guards; this count only caps the
+   redo window if both somehow fail to fire. Was 1000, which at mainnet
+   IBD speed (~30 b/s) meant a full header-index rewrite + CRC every
+   ~35s — ~6% of CPU by sb-sprof at h≈280k. A crash now redoes at most
+   ~10 min of validation (the time trigger), like Core's
+   DATABASE_WRITE_INTERVAL bounding work by time, not block count.")
 
 (defparameter +flush-every-n-seconds+ 600
   "Time-based flush trigger (10 min): flush if at least N seconds have
