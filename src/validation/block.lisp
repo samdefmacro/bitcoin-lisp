@@ -1233,20 +1233,23 @@ Subsidy halves every 210,000 blocks."
      *undo-base-path*)))
 
 (defun save-undo-data-to-disk (block-hash spent-utxos)
-  "Serialize spent-utxos to an undo file using atomic temp+rename with CRC32."
+  "Serialize spent-utxos to an undo file using atomic temp+rename with CRC32.
+Byte-buf writer: this runs once per connected block, and the previous
+flexi-streams path's Gray-stream dispatch was ~8% of mainnet-IBD CPU at
+h≈280k (sb-sprof) once blocks carried 500+ spent inputs each."
   (let ((path (undo-file-path block-hash)))
     (when path
-      (bitcoin-lisp.storage:save-file-with-crc32
+      (bitcoin-lisp.storage:save-file-with-crc32-bb
        path
-       (lambda (stream)
-         (write-sequence *undo-magic* stream)
-         (bitcoin-lisp.serialization:write-uint32-le stream +undo-format-version+)
-         (bitcoin-lisp.serialization:write-uint32-le stream (length spent-utxos))
+       (lambda (bb)
+         (bitcoin-lisp.serialization:bb-write-bytes bb *undo-magic*)
+         (bitcoin-lisp.serialization:bb-write-u32-le bb +undo-format-version+)
+         (bitcoin-lisp.serialization:bb-write-u32-le bb (length spent-utxos))
          (dolist (entry spent-utxos)
            (destructuring-bind (txid index utxo) entry
-             (write-sequence txid stream)
-             (bitcoin-lisp.serialization:write-uint32-le stream index)
-             (bitcoin-lisp.storage:write-utxo-entry-fields stream utxo))))))))
+             (bitcoin-lisp.serialization:bb-write-bytes bb txid)
+             (bitcoin-lisp.serialization:bb-write-u32-le bb index)
+             (bitcoin-lisp.storage:bb-write-utxo-entry-fields bb utxo))))))))
 
 (defun load-undo-data-from-disk (block-hash)
   "Load and verify undo data from disk. Returns list of (txid index utxo-entry) or NIL."
