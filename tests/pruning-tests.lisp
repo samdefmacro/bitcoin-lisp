@@ -410,6 +410,60 @@ and exclude NODE_NETWORK_LIMITED."
           (is (< size 1.0)))
       (cleanup-test-dir base-path))))
 
+;;;; Test: total-bytes running counter (O(1) size accounting)
+
+(test total-bytes-tracks-store-and-prune
+  "block-store-total-bytes should track store-block, overwrites, prune-block,
+and survive an init-block-store rescan."
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 5)
+    (declare (ignore chain-state))
+    (unwind-protect
+        (let ((total (bitcoin-lisp.storage:block-store-total-bytes block-store)))
+          ;; Counter is positive and matches the directory-scan value of a
+          ;; freshly initialized store
+          (is (> total 0))
+          (let ((store2 (bitcoin-lisp.storage:init-block-store base-path)))
+            (is (= total (bitcoin-lisp.storage:block-store-total-bytes store2))))
+          ;; Overwriting an existing block must not double-count
+          (let ((block (make-pruning-test-block (second block-hashes)
+                                                (third block-hashes) 2)))
+            (bitcoin-lisp.storage:store-block block-store block)
+            (is (= total (bitcoin-lisp.storage:block-store-total-bytes block-store))))
+          ;; Pruning decrements by the deleted size
+          (let ((deleted (bitcoin-lisp.storage:prune-block
+                          block-store (second block-hashes))))
+            (is (> deleted 0))
+            (is (= (- total deleted)
+                   (bitcoin-lisp.storage:block-store-total-bytes block-store)))))
+      (cleanup-test-dir base-path))))
+
+(test prune-old-blocks-prunes-down-to-keep-window
+  "When over target, prune-old-blocks should delete oldest blocks up to
+tip - min-blocks-to-keep in one call, advancing pruned-height."
+  ;; 300 blocks: min-keep-height = 300 - 288 = 12, so heights 1-12 are prunable
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 300)
+    (unwind-protect
+        (let ((bitcoin-lisp:*prune-target-mib* 550)
+              (bitcoin-lisp:*prune-after-height* 0))
+          ;; Fake an over-target counter (real test blocks are tiny); the
+          ;; prune loop should then delete everything it's allowed to
+          (setf (bitcoin-lisp.storage:block-store-total-bytes block-store)
+                (* 600 1048576))
+          (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+                         block-store chain-state)))
+            (is (= 12 pruned))
+            (is (= 12 (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+            ;; Heights 1 and 12 gone, 13 still present
+            (is (null (bitcoin-lisp.storage:block-exists-p
+                       block-store (nth 1 block-hashes))))
+            (is (null (bitcoin-lisp.storage:block-exists-p
+                       block-store (nth 12 block-hashes))))
+            (is (not (null (bitcoin-lisp.storage:block-exists-p
+                            block-store (nth 13 block-hashes)))))))
+      (cleanup-test-dir base-path))))
+
 ;;;; Test: prune-blocks-to-height respects min-blocks-to-keep
 
 (test prune-respects-min-blocks-retention
