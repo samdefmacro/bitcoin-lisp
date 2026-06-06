@@ -290,6 +290,7 @@
    #:block-exists-p
    ;; Block pruning
    #:prune-block
+   #:block-store-total-bytes
    #:block-storage-size-mib
    #:prune-old-blocks
    #:prune-blocks-to-height
