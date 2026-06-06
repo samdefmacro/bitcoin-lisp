@@ -1366,7 +1366,22 @@ Returns the number of blocks downloaded."
                  (dolist (peer peers)
                    (drain-and-reap-peer peer chain-state utxo-set block-store ctx
                                         :fee-estimator fee-estimator
-                                        :recent-rejects recent-rejects))
+                                        :recent-rejects recent-rejects)
+                   ;; Core-style pipeline top-up (SendMessages tops every
+                   ;; peer up to MAX_BLOCKS_IN_TRANSIT_PER_PEER on each
+                   ;; event-loop pass, net_processing.cpp:6164): re-feed
+                   ;; the fleet as soon as in-flight drops below half the
+                   ;; budget instead of once per outer iteration. One
+                   ;; peer's 32-block drain validates for seconds; without
+                   ;; this every OTHER peer sat idle for the whole pass —
+                   ;; observed live on mainnet IBD as in-flight sawtoothing
+                   ;; 48->0 and ~3 b/s at h~190k where ~80 b/s of peer
+                   ;; capacity existed.
+                   (when (< (hash-table-count (ibd-context-in-flight ctx))
+                            (ash (* (length peers)
+                                    (ibd-context-max-in-flight ctx))
+                                 -1))
+                     (request-blocks-from-peers peers chain-state)))
 
                  ;; Per-block request timeout retries (retry-timed-out-requests
                  ;; in request-blocks-from-peers) is our peer-disconnect path:
