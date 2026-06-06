@@ -1038,12 +1038,19 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
           (values nil :block-too-large nil))))
 
     ;; BIP 30: reject a block that re-creates a still-unspent txid.
+    ;; Per-output point lookups, exactly Core's HaveCoin loop
+    ;; (validation.cpp:2444): a duplicate txid implies an identical tx
+    ;; (the txid commits to the outputs), so probing the new tx's own
+    ;; output indexes is complete. The previous any-utxo-for-txid-p did a
+    ;; LevelDB prefix SCAN per tx — 85% of mainnet-IBD CPU at h~216k once
+    ;; the chainstate outgrew LevelDB's table cache (sb-sprof, 2026-06-06).
     (when (bip30-enforced-p current-height)
       (dolist (tx transactions)
         (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-          (when (bitcoin-lisp.storage:any-utxo-for-txid-p utxo-set txid)
-            (return-from validate-block
-              (values nil :duplicate-txid nil))))))
+          (dotimes (o (length (bitcoin-lisp.serialization:transaction-outputs tx)))
+            (when (bitcoin-lisp.storage:get-utxo utxo-set txid o)
+              (return-from validate-block
+                (values nil :duplicate-txid nil)))))))
 
     ;; Validate each transaction and collect fees (using Satoshi type)
     ;; Track outputs from earlier transactions for intra-block spending
