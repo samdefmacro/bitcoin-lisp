@@ -14,7 +14,16 @@
 (defstruct block-store
   "Block storage manager."
   (base-path nil :type (or null pathname))
-  (index (make-hash-table :test 'equalp) :type hash-table))
+  (index (make-hash-table :test 'equalp) :type hash-table)
+  ;; Running total of all .blk file sizes, maintained by store-block and
+  ;; prune-block and initialized by the init-block-store scan. Pruning
+  ;; consults this after EVERY connected block (validation/block.lisp), so
+  ;; it must be O(1) — re-scanning the blocks directory per block collapsed
+  ;; mainnet IBD from ~220 b/s to ~0.3 b/s the moment the chain crossed
+  ;; *prune-after-height*. Mirrors Bitcoin Core, which sums in-memory
+  ;; per-file stats (m_blockfile_info) in CalculateCurrentUsage() rather
+  ;; than touching the filesystem (validation.cpp).
+  (total-bytes 0 :type (integer 0)))
 
 (defun ensure-directories (store)
   "Ensure storage directories exist."
@@ -28,6 +37,20 @@
     (merge-pathnames (format nil "blocks/~A.blk" hash-hex)
                      (block-store-base-path store))))
 
+(defun file-size-bytes (path)
+  "Size of the file at PATH in bytes, or NIL if it doesn't exist.
+Uses stat on SBCL — one syscall, no file open."
+  #+sbcl
+  (handler-case
+      (sb-posix:stat-size (sb-posix:stat (namestring path)))
+    (error () nil))
+  #-sbcl
+  (handler-case
+      (with-open-file (s path :direction :input
+                              :element-type '(unsigned-byte 8))
+        (file-length s))
+    (error () nil)))
+
 (defun store-block (store block)
   "Store a block in the block store.
 BLOCK should be a bitcoin-block structure.
@@ -36,15 +59,20 @@ Returns the block hash."
   (let* ((hash (bitcoin-lisp.serialization:block-header-hash
                 (bitcoin-lisp.serialization:bitcoin-block-header block)))
          (path (block-file-path store hash))
-         (data (bitcoin-lisp.serialization:serialize block)))
+         (data (bitcoin-lisp.serialization:serialize block))
+         ;; If we're overwriting an already-stored block, its old size is
+         ;; in total-bytes and must be replaced, not added to.
+         (old-size (when (gethash hash (block-store-index store))
+                     (file-size-bytes path))))
     ;; Write block to file
     (with-open-file (stream path
                             :direction :output
                             :if-exists :supersede
                             :element-type '(unsigned-byte 8))
       (write-sequence data stream))
-    ;; Update index
+    ;; Update index and running storage total
     (setf (gethash hash (block-store-index store)) path)
+    (incf (block-store-total-bytes store) (- (length data) (or old-size 0)))
     hash))
 
 (defun get-block (store hash)
@@ -69,13 +97,17 @@ Returns the bitcoin-block structure, or NIL if not found."
   "Initialize a block store at BASE-PATH."
   (let ((store (make-block-store :base-path (pathname base-path))))
     (ensure-directories store)
-    ;; Scan for existing blocks
-    (let ((blocks-dir (merge-pathnames "blocks/" base-path)))
+    ;; Scan for existing blocks (the only full-directory scan — from here
+    ;; on, total-bytes is maintained incrementally)
+    (let ((blocks-dir (merge-pathnames "blocks/" base-path))
+          (total-bytes 0))
       (when (probe-file blocks-dir)
         (dolist (file (directory (merge-pathnames "*.blk" blocks-dir)))
           (let* ((name (pathname-name file))
                  (hash (bitcoin-lisp.crypto:hex-to-bytes name)))
-            (setf (gethash hash (block-store-index store)) file)))))
+            (setf (gethash hash (block-store-index store)) file)
+            (incf total-bytes (or (file-size-bytes file) 0)))))
+      (setf (block-store-total-bytes store) total-bytes))
     store))
 
 ;;; Block Pruning
@@ -83,26 +115,20 @@ Returns the bitcoin-block structure, or NIL if not found."
 (defun prune-block (store hash)
   "Delete a block file from disk by HASH.
 Returns the size in bytes of the deleted file, or NIL if the file didn't exist."
-  (let ((path (block-file-path store hash)))
-    (when (probe-file path)
-      (let ((size (with-open-file (s path :direction :input
-                                         :element-type '(unsigned-byte 8))
-                    (file-length s))))
-        (delete-file path)
-        (remhash hash (block-store-index store))
-        size))))
+  (let* ((path (block-file-path store hash))
+         ;; One stat serves both the existence check and the size — NIL
+         ;; means the file isn't there.
+         (size (file-size-bytes path)))
+    (when size
+      (delete-file path)
+      (remhash hash (block-store-index store))
+      (decf (block-store-total-bytes store) size)
+      size)))
 
 (defun block-storage-size-mib (store)
-  "Calculate the total size of all block files in MiB."
-  (let ((total-bytes 0)
-        (blocks-dir (merge-pathnames "blocks/" (block-store-base-path store))))
-    (when (probe-file blocks-dir)
-      (dolist (file (directory (merge-pathnames "*.blk" blocks-dir)))
-        (let ((size (with-open-file (s file :direction :input
-                                           :element-type '(unsigned-byte 8))
-                      (file-length s))))
-          (incf total-bytes size))))
-    (/ total-bytes 1048576.0)))  ; 1024 * 1024
+  "Total size of all block files in MiB. O(1) — reads the running counter
+maintained by store-block/prune-block (initialized by init-block-store)."
+  (/ (block-store-total-bytes store) 1048576.0))  ; 1024 * 1024
 
 (defun prune-old-blocks (store chain-state)
   "Prune old blocks when storage exceeds target.
@@ -117,27 +143,29 @@ Returns the number of blocks pruned."
     ;; Don't prune until chain reaches prune-after-height
     (when (< current-height prune-after)
       (return-from prune-old-blocks 0))
-    ;; Check if we exceed the target (scan once, then track via running total)
-    (let ((current-size (block-storage-size-mib store))
-          (target bitcoin-lisp:*prune-target-mib*))
-      (when (<= current-size target)
+    (let ((target-bytes (* bitcoin-lisp:*prune-target-mib* 1048576)))
+      (when (<= (block-store-total-bytes store) target-bytes)
         (return-from prune-old-blocks 0))
       ;; Calculate the lowest height we're allowed to prune to
       (let* ((min-keep-height (max 0 (- current-height bitcoin-lisp:+min-blocks-to-keep+)))
              (pruned-height (chain-state-pruned-height chain-state))
              (pruned 0))
-        ;; Walk from pruned-height+1 upward, deleting blocks
-        ;; Use running total to avoid rescanning all files each iteration
-        (loop for height from (1+ pruned-height) to min-keep-height
-              while (> current-size target)
-              do (let ((entry (get-block-at-height chain-state height)))
-                   (when entry
-                     (let* ((hash (block-index-entry-hash entry))
-                            (deleted-bytes (prune-block store hash)))
-                       (when deleted-bytes
-                         (decf current-size (/ deleted-bytes 1048576.0))
-                         (incf pruned)
-                         (setf (chain-state-pruned-height chain-state) height))))))
+        ;; Walk from pruned-height+1 upward, deleting blocks until the
+        ;; running total (maintained by prune-block) is back under target.
+        ;; One active-chain walk for the whole range — get-block-at-height
+        ;; per height would re-walk from the tip each time, quadratic for
+        ;; the initial catch-up prune that deletes a large range at once.
+        (loop for entry in (active-chain-entries-from
+                            chain-state (1+ pruned-height)
+                            (- min-keep-height pruned-height))
+              while (> (block-store-total-bytes store) target-bytes)
+              do (when (prune-block store (block-index-entry-hash entry))
+                   (incf pruned))
+                 ;; Advance even when the file was already gone — the block
+                 ;; is off disk either way, and a permanent gap would force
+                 ;; every later call to re-walk from the same height.
+                 (setf (chain-state-pruned-height chain-state)
+                       (block-index-entry-height entry)))
         pruned))))
 
 (defun prune-blocks-to-height (store chain-state target-height)
@@ -153,11 +181,11 @@ Returns the number of blocks pruned."
          (pruned 0))
     (when (<= effective-target pruned-height)
       (return-from prune-blocks-to-height 0))
-    (loop for height from (1+ pruned-height) below effective-target
-          do (let ((entry (get-block-at-height chain-state height)))
-               (when entry
-                 (let ((hash (block-index-entry-hash entry)))
-                   (when (prune-block store hash)
-                     (incf pruned)
-                     (setf (chain-state-pruned-height chain-state) height))))))
+    (dolist (entry (active-chain-entries-from
+                    chain-state (1+ pruned-height)
+                    (- effective-target pruned-height 1)))
+      (when (prune-block store (block-index-entry-hash entry))
+        (incf pruned))
+      (setf (chain-state-pruned-height chain-state)
+            (block-index-entry-height entry)))
     pruned))
