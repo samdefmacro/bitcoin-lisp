@@ -120,8 +120,18 @@ struct alloc on the per-block hot path."
 
 (defun open-coins-view-db (path)
   "Open or create the coins-view LevelDB at PATH. Caller must call
-close-coins-view-db. Use with-coins-view-db for RAII-style scope."
-  (make-coins-view-db :db (leveldb-open path)))
+close-coins-view-db. Use with-coins-view-db for RAII-style scope.
+
+max-open-files is raised far above leveldb's 64 default: the table cache
+holds one entry per .ldb file, and once the mainnet chainstate outgrew
+64 tables every point-Get churned Table::Open/mmap/munmap — ~12% of IBD
+CPU by sb-sprof at h≈280k. 4096 keeps every table of a ~8GB chainstate
+cached (one fd + index block each; Core instead pairs 64 with a large
+block cache, which the C API we bind doesn't expose)."
+  (let ((opts (leveldb-make-options :max-open-files 4096)))
+    (unwind-protect
+         (make-coins-view-db :db (leveldb-open path opts))
+      (leveldb-destroy-options opts))))
 
 (defun close-coins-view-db (view)
   (when (cvdb-db view)
