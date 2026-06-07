@@ -36,6 +36,14 @@
    validation took a few seconds, then the stalling-peer check would evict
    peers for OUR slowness. Drain in batches to keep buffers shallow.")
 
+(defparameter +max-block-queue-bytes+ (* 256 1024 1024)
+  "Byte cap (wire size) for the out-of-order block-queue. The 1024-COUNT
+cap alone was sized for testnet4's small blocks: with the tip stuck at
+mainnet h=544,085 (the bad-version consensus bug), peers filled the
+count window with 2018-era 1-1.5MB blocks — ~5GB once parsed — and the
+heap died before the stuck-tip halt could fire. 256MB wire ≈ ~1-1.5GB
+parsed, comfortably inside the 5GB dynamic space.")
+
 (defparameter +max-block-queue-size+ 1024
   "Maximum number of out-of-order blocks held in the IBD block-queue,
    matching Bitcoin Core's BLOCK_DOWNLOAD_WINDOW (net_processing.cpp:146).
@@ -88,7 +96,8 @@ block-hash-key-hash. Falls back to plain equalp off SBCL."
   ;; Download queue
   (pending-blocks (make-block-hash-table) :type hash-table)  ; hash -> height
   (in-flight (make-block-hash-table) :type hash-table)       ; hash -> (peer . timestamp)
-  (block-queue (make-hash-table :test 'eql) :type hash-table)  ; height -> block, out-of-order
+  (block-queue (make-hash-table :test 'eql) :type hash-table)  ; height -> (block . wire-bytes), out-of-order
+  (block-queue-bytes 0 :type integer)  ; sum of queued wire-bytes (see +max-block-queue-bytes+)
   ;; Per-pending-hash timeout count. retry-timed-out-requests bumps the
   ;; counter each time a request for this hash times out; after
   ;; +max-block-request-timeouts+, the block is dropped from pending
@@ -1156,7 +1165,8 @@ handler. Shared by the block-download drain and the at-tip reap pass."
        (record-block-received-from-peer peer)
        (process-received-block block chain-state utxo-set block-store
                                :fee-estimator fee-estimator
-                               :recent-rejects recent-rejects)))
+                               :recent-rejects recent-rejects
+                               :wire-size (length payload))))
 
     ((string= command "headers")
      (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
@@ -1574,7 +1584,8 @@ Used during IBD when the validated block tip lags behind the header tip."
    validator rejects so we can compare against Bitcoin Core.")
 
 (defun process-received-block (block chain-state utxo-set block-store
-                                &key fee-estimator recent-rejects)
+                                &key fee-estimator recent-rejects
+                                  (wire-size 0))
   "Process a received block - validate and connect to chain.
 After connecting, drains the queue of any children that can now be connected."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
@@ -1703,10 +1714,14 @@ After connecting, drains the queue of any children that can now be connected."
                 (cond
                   ((gethash height queue)
                    nil)  ; duplicate
-                  ((>= (hash-table-count queue) +max-block-queue-size+)
+                  ((or (>= (hash-table-count queue) +max-block-queue-size+)
+                       (>= (ibd-context-block-queue-bytes *ibd-context*)
+                           +max-block-queue-bytes+))
                    (bitcoin-lisp:log-warn
-                    "Dropping out-of-order block at height ~D: queue at cap (~D, tip ~D); re-queuing for later"
-                    height (hash-table-count queue) current-height)
+                    "Dropping out-of-order block at height ~D: queue at cap (~D blocks, ~DMB, tip ~D); re-queuing for later"
+                    height (hash-table-count queue)
+                    (floor (ibd-context-block-queue-bytes *ibd-context*) 1048576)
+                    current-height)
                    (setf (gethash hash pending) height))
                   ((> (- height current-height) +max-block-queue-size+)
                    (bitcoin-lisp:log-warn
@@ -1714,7 +1729,9 @@ After connecting, drains the queue of any children that can now be connected."
                     height current-height)
                    (setf (gethash hash pending) height))
                   (t
-                   (setf (gethash height queue) block)))))
+                   (setf (gethash height queue) (cons block wire-size))
+                   (incf (ibd-context-block-queue-bytes *ibd-context*)
+                         wire-size)))))
             nil)))))
 
 (defun drain-block-queue (chain-state utxo-set block-store &key fee-estimator recent-rejects)
@@ -1729,10 +1746,12 @@ Repeats until no more queued blocks can be connected."
       (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
              (next-height (1+ current-height))
              (queue (ibd-context-block-queue *ibd-context*))
-             (block (gethash next-height queue)))
+             (cell (gethash next-height queue))
+             (block (car cell)))
         (unless block
           (return drained))
         (remhash next-height queue)
+        (decf (ibd-context-block-queue-bytes *ibd-context*) (cdr cell))
         ;; Try to activate. activate-block dispatches to either direct
         ;; tip-extend, pre-reorg+activate, or store-only based on the
         ;; incoming block's parent vs. our current tip.
