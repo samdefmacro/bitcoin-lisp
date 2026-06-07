@@ -260,17 +260,34 @@
       ;; Either error is acceptable - header is invalid
       (is (member error '(:time-too-new :bad-proof-of-work))))))
 
-(test block-header-bad-version
-  "Block with invalid version should fail."
-  ;; Note: PoW validation runs first, so this tests that validation fails
-  ;; The actual error may be :bad-proof-of-work if PoW is checked first
+(test block-header-version-core-semantics
+  "Version enforcement matches Core exactly: only softfork minimums.
+High version-rolled values (overt AsicBoost) are NOT rejected — the old
+upper bound rejected real mainnet block 544,085 and halted IBD."
   (let* ((current-time (get-universal-time))
-         (header (make-test-block-header :version 0))  ; Invalid version
          (state (bitcoin-lisp.storage:init-chain-state "/tmp/btc-test/")))
+    ;; Version-rolled header far above the old #x3FFFFFFF bound: must not
+    ;; fail on version (PoW will still fail for a test header).
     (multiple-value-bind (valid error)
-        (bitcoin-lisp.validation:validate-block-header header state current-time)
+        (bitcoin-lisp.validation:validate-block-header
+         (make-test-block-header :version #x7FFFE000) state current-time)
+      (declare (ignore valid))
+      (is (not (eq error :bad-version))))
+    ;; Version 0 with no height context: no minimum applies (pre-BIP34
+    ;; semantics) — must not fail on version either.
+    (multiple-value-bind (valid error)
+        (bitcoin-lisp.validation:validate-block-header
+         (make-test-block-header :version 0) state current-time)
+      (declare (ignore valid))
+      (is (not (eq error :bad-version))))
+    ;; Below-minimum version at a post-activation height: rejected
+    ;; (PoW may shadow it depending on check order — accept either).
+    (multiple-value-bind (valid error)
+        (bitcoin-lisp.validation:validate-block-header
+         (make-test-block-header :version 1) state current-time
+         :height (+ 1 (bitcoin-lisp.validation::get-bip34-activation-height
+                       bitcoin-lisp:*network*)))
       (is (null valid))
-      ;; Either error is acceptable - header is invalid
       (is (member error '(:bad-version :bad-proof-of-work))))))
 
 ;;;; MTP Timestamp Validation Tests
