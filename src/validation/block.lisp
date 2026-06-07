@@ -1232,6 +1232,44 @@ Subsidy halves every 210,000 blocks."
                     :type "dat")
      *undo-base-path*)))
 
+(defun delete-undo-file (block-hash)
+  "Delete BLOCK-HASH's undo file if present. Pruned blocks can never be
+disconnected (no block data to reorg through), so their undo data is
+dead weight — Core deletes rev files together with blk files."
+  (let ((path (undo-file-path block-hash)))
+    (when (and path (probe-file path))
+      (ignore-errors (delete-file path))
+      (remhash block-hash *undo-cache-heights*)
+      t)))
+
+(defun prune-stale-undo-files (chain-state)
+  "One-time catch-up: delete undo files for blocks at or below the
+chain's pruned-height (they accumulated before undo pruning existed —
+53GB/500k files observed on the first mainnet run). Lists the undo
+directory and resolves each filename (a block-hash hex) against the
+in-memory index, so after the first sweep the directory only holds the
+unpruned window and subsequent startup sweeps are cheap. Returns the
+number of files deleted."
+  (let ((pruned-height (bitcoin-lisp.storage:chain-state-pruned-height chain-state))
+        (deleted 0))
+    (when (and *undo-base-path* (plusp pruned-height))
+      (dolist (file (directory (merge-pathnames "*.dat" *undo-base-path*)))
+        (let* ((hash (ignore-errors
+                      (bitcoin-lisp.crypto:hex-to-bytes (pathname-name file))))
+               (entry (and hash
+                           (= (length hash) 32)
+                           (bitcoin-lisp.storage:get-block-index-entry
+                            chain-state hash))))
+          ;; Delete when the block is at/below the pruned horizon, or when
+          ;; the hash is unknown to the index entirely (stale fork remnant).
+          (when (or (null entry)
+                    (<= (bitcoin-lisp.storage:block-index-entry-height entry)
+                        pruned-height))
+            (ignore-errors (delete-file file))
+            (when hash (remhash hash *undo-cache-heights*))
+            (incf deleted)))))
+    deleted))
+
 (defun save-undo-data-to-disk (block-hash spent-utxos)
   "Serialize spent-utxos to an undo file using atomic temp+rename with CRC32.
 Byte-buf writer: this runs once per connected block, and the previous
@@ -1391,9 +1429,12 @@ Handles chain reorganizations when a competing chain has more work."
              (bitcoin-lisp.mempool:orphan-expire
               (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
            (bitcoin-lisp:maybe-periodic-flush)
-           ;; Automatic block pruning after connecting a new block
+           ;; Automatic block pruning after connecting a new block; each
+           ;; pruned block's undo file goes with it.
            (when (bitcoin-lisp:automatic-pruning-p)
-             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks block-store chain-state)))
+             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+                            block-store chain-state
+                            :on-prune #'delete-undo-file)))
                (when (> pruned 0)
                  (bitcoin-lisp:log-info "Pruned ~D old block~:P" pruned)))))
 
