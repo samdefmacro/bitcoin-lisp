@@ -1858,7 +1858,8 @@ Returns the height of the last pruned block."
     (let* ((chain-state (rpc-get-chain-state node))
            (block-store (rpc-get-block-store node))
            (pruned (bitcoin-lisp.storage:prune-blocks-to-height
-                    block-store chain-state target-height)))
+                    block-store chain-state target-height
+                    :on-prune #'bitcoin-lisp.validation:delete-undo-file)))
       (bitcoin-lisp::node-log :info "RPC pruneblockchain: pruned ~D blocks to height ~D"
                               pruned target-height)
       ;; Return the last pruned block height (matching Bitcoin Core).

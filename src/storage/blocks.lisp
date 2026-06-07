@@ -130,7 +130,7 @@ Returns the size in bytes of the deleted file, or NIL if the file didn't exist."
 maintained by store-block/prune-block (initialized by init-block-store)."
   (/ (block-store-total-bytes store) 1048576.0))  ; 1024 * 1024
 
-(defun prune-old-blocks (store chain-state)
+(defun prune-old-blocks (store chain-state &key on-prune)
   "Prune old blocks when storage exceeds target.
 Deletes oldest block files until storage is at or below *prune-target-mib*,
 respecting +min-blocks-to-keep+ and *prune-after-height*.
@@ -161,6 +161,11 @@ Returns the number of blocks pruned."
               while (> (block-store-total-bytes store) target-bytes)
               do (when (prune-block store (block-index-entry-hash entry))
                    (incf pruned))
+                 ;; The undo file goes with the block (Core deletes rev
+                 ;; files alongside blk files): a pruned node can't reorg
+                 ;; below its window, so undo there is dead weight.
+                 (when on-prune
+                   (funcall on-prune (block-index-entry-hash entry)))
                  ;; Advance even when the file was already gone — the block
                  ;; is off disk either way, and a permanent gap would force
                  ;; every later call to re-walk from the same height.
@@ -168,7 +173,7 @@ Returns the number of blocks pruned."
                        (block-index-entry-height entry)))
         pruned))))
 
-(defun prune-blocks-to-height (store chain-state target-height)
+(defun prune-blocks-to-height (store chain-state target-height &key on-prune)
   "Prune all block files below TARGET-HEIGHT.
 Respects +min-blocks-to-keep+ retention.
 Returns the number of blocks pruned."
@@ -186,6 +191,8 @@ Returns the number of blocks pruned."
                     (- effective-target pruned-height 1)))
       (when (prune-block store (block-index-entry-hash entry))
         (incf pruned))
+      (when on-prune
+        (funcall on-prune (block-index-entry-hash entry)))
       (setf (chain-state-pruned-height chain-state)
             (block-index-entry-height entry)))
     pruned))

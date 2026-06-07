@@ -86,6 +86,47 @@ Returns (VALUES base-path block-store chain-state block-hashes)."
 
 ;;;; Test 5.1: prune-block deletes files and respects 288-block minimum
 
+(test prune-deletes-undo-files-and-stale-sweep
+  "Pruned blocks take their undo files with them (Core deletes rev with
+blk), and prune-stale-undo-files clears undo at/below the pruned horizon
+plus unknown-hash remnants."
+  ;; 300 blocks: tip - +min-blocks-to-keep+ (288) leaves heights 1..12 prunable.
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 300)
+    (let ((undo-dir (merge-pathnames "undo/" base-path))
+          (bitcoin-lisp:*prune-target-mib* 1)
+          (bitcoin-lisp:*prune-after-height* 0))
+      (unwind-protect
+           (progn
+             (bitcoin-lisp.validation:initialize-undo-storage undo-dir)
+             ;; Fabricate undo files for the first five blocks + garbage.
+             (dolist (hash (subseq block-hashes 1 6))
+               (bitcoin-lisp.validation::save-undo-data-to-disk hash '()))
+             (with-open-file (out (merge-pathnames "nothex.dat" undo-dir)
+                                  :direction :output
+                                  :element-type '(unsigned-byte 8))
+               (write-byte 0 out))
+             ;; Manual prune to height 3 deletes blocks 1..2 AND their undo.
+             (let ((pruned (bitcoin-lisp.storage:prune-blocks-to-height
+                            block-store chain-state 3
+                            :on-prune #'bitcoin-lisp.validation:delete-undo-file)))
+               (is (= 2 pruned)))
+             (let ((h1 (second block-hashes))
+                   (h5 (sixth block-hashes)))
+               (is (null (probe-file (bitcoin-lisp.validation::undo-file-path h1))))
+               (is (not (null (probe-file (bitcoin-lisp.validation::undo-file-path h5)))))
+               ;; Re-create one stale undo below the horizon (simulating the
+               ;; pre-undo-pruning backlog), then sweep: it and the garbage
+               ;; file go; the above-horizon file stays.
+               (bitcoin-lisp.validation::save-undo-data-to-disk h1 '())
+               (let ((swept (bitcoin-lisp.validation:prune-stale-undo-files chain-state)))
+                 (is (>= swept 2)))
+               (is (null (probe-file (bitcoin-lisp.validation::undo-file-path h1))))
+               (is (null (probe-file (merge-pathnames "nothex.dat" undo-dir))))
+               (is (not (null (probe-file (bitcoin-lisp.validation::undo-file-path h5)))))))
+        (setf bitcoin-lisp.validation::*undo-base-path* nil)
+        (uiop:delete-directory-tree base-path :validate t :if-does-not-exist :ignore)))))
+
 (test prune-block-deletes-file
   "prune-block should delete the block file and remove it from the index."
   (multiple-value-bind (base-path block-store chain-state block-hashes)
