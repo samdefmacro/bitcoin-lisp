@@ -546,6 +546,16 @@ Returns the node instance."
     (bitcoin-lisp.validation:initialize-undo-storage undo-path)
     (log-info "Undo data directory: ~A" undo-path))
 
+  ;; Catch-up sweep: drop undo files at/below the pruned horizon. They
+  ;; accumulated before undo pruning existed (53GB/500k files on the first
+  ;; mainnet run); after the first sweep the directory only holds the
+  ;; unpruned window, so this is cheap on every later start.
+  (when (pruning-enabled-p)
+    (let ((swept (bitcoin-lisp.validation:prune-stale-undo-files
+                  (node-chain-state *node*))))
+      (when (plusp swept)
+        (log-info "Pruned ~D stale undo file~:P below the prune horizon" swept))))
+
   ;; Initialize recent rejects filter (DoS protection)
   (setf (node-recent-rejects *node*) (make-rejects-filter))
 
