@@ -476,18 +476,22 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
       (return-from validate-block-header
         (values nil :time-timewarp-attack))))
 
-  ;; Version check: enforce minimum version after softfork activation
-  ;; Matches Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4145-4147)
+  ;; Version check: ONLY the softfork minimums, exactly Bitcoin Core
+  ;; ContextualCheckBlockHeader (validation.cpp:4144-4147). There is NO
+  ;; upper bound and no unconditional lower bound: post-BIP9 miners roll
+  ;; version bits freely (overt AsicBoost), producing mainnet blocks with
+  ;; versions above #x3FFFFFFF — the previous (> version #x3FFFFFFF)
+  ;; clause rejected real mainnet block 544,085 and halted the first
+  ;; mainnet IBD run. Negative versions (signed i32) fail the < 2 clause
+  ;; post-BIP34, matching Core's implicit behavior.
   (let ((version (bitcoin-lisp.serialization:block-header-version header)))
-    (when (or (< version 1)
-              (> version #x3FFFFFFF)
-              (and height
-                   (or (and (< version 2)
-                            (>= height (get-bip34-activation-height bitcoin-lisp:*network*)))
-                       (and (< version 3)
-                            (>= height (get-bip66-activation-height bitcoin-lisp:*network*)))
-                       (and (< version 4)
-                            (>= height (get-bip65-activation-height bitcoin-lisp:*network*))))))
+    (when (and height
+               (or (and (< version 2)
+                        (>= height (get-bip34-activation-height bitcoin-lisp:*network*)))
+                   (and (< version 3)
+                        (>= height (get-bip66-activation-height bitcoin-lisp:*network*)))
+                   (and (< version 4)
+                        (>= height (get-bip65-activation-height bitcoin-lisp:*network*)))))
       (return-from validate-block-header
         (values nil :bad-version))))
 
