@@ -611,6 +611,8 @@
    #:get-csv-activation-height
    #:get-taproot-activation-height
    #:initialize-undo-storage
+   #:delete-undo-file
+   #:prune-stale-undo-files
    ;; Locktime validation
    #:check-transaction-final
    #:compute-median-time-past
