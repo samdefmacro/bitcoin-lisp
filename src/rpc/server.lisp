@@ -56,6 +56,8 @@
   (register-rpc-method "scantxoutset" #'rpc-scantxoutset)
   (register-rpc-method "gettxoutproof" #'rpc-gettxoutproof)
   (register-rpc-method "verifytxoutproof" #'rpc-verifytxoutproof)
+  (register-rpc-method "getdescriptorinfo" #'rpc-getdescriptorinfo)
+  (register-rpc-method "deriveaddresses" #'rpc-deriveaddresses)
   ;; UTXO
   (register-rpc-method "gettxout" #'rpc-gettxout)
   ;; Network
