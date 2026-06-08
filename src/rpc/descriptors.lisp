@@ -200,3 +200,68 @@ multisig, and miniscript)."
          (one (%script-p2tr (%parse-desc-xonly (%inner-of body "rawtr" body) body))))
         (t
          (%desc-error "'~A': unsupported descriptor (supported: addr, raw, pk, pkh, wpkh, sh(wpkh), combo, tr, rawtr)" body))))))
+
+;;; --- Descriptor RPCs (getdescriptorinfo / deriveaddresses) ---
+
+(defun %script->address (script network)
+  "Address string for a standard scriptPubKey SCRIPT, or NIL if the script
+has no address representation (raw/pk/bare-multisig). Inverse of the
+encoders in crypto/address.lisp."
+  (let ((len (length script)))
+    (flet ((b (i) (aref script i)))
+      (cond
+        ;; P2PKH: OP_DUP OP_HASH160 14 <20> OP_EQUALVERIFY OP_CHECKSIG
+        ((and (= len 25) (= (b 0) #x76) (= (b 1) #xa9) (= (b 2) #x14)
+              (= (b 23) #x88) (= (b 24) #xac))
+         (bitcoin-lisp.crypto:encode-p2pkh-address (subseq script 3 23) network))
+        ;; P2SH: OP_HASH160 14 <20> OP_EQUAL
+        ((and (= len 23) (= (b 0) #xa9) (= (b 1) #x14) (= (b 22) #x87))
+         (bitcoin-lisp.crypto:encode-p2sh-address (subseq script 2 22) network))
+        ;; P2WPKH: OP_0 14 <20>
+        ((and (= len 22) (= (b 0) #x00) (= (b 1) #x14))
+         (bitcoin-lisp.crypto:encode-p2wpkh-address (subseq script 2 22) network))
+        ;; P2WSH: OP_0 20 <32>
+        ((and (= len 34) (= (b 0) #x00) (= (b 1) #x20))
+         (bitcoin-lisp.crypto:encode-p2wsh-address (subseq script 2 34) network))
+        ;; P2TR: OP_1 20 <32>
+        ((and (= len 34) (= (b 0) #x51) (= (b 1) #x20))
+         (bitcoin-lisp.crypto:encode-p2tr-address (subseq script 2 34) network))
+        (t nil)))))
+
+(defun rpc-getdescriptorinfo (node params)
+  "Validate a descriptor and report its canonical form + checksum (Bitcoin
+Core getdescriptorinfo). PARAMS: (descriptor). isrange/hasprivatekeys are
+always false here (no ranged/xpub descriptors, no wallet keys); issolvable
+is true for any descriptor we can expand."
+  (let ((desc (first params))
+        (network (rpc-get-network node)))
+    (unless (stringp desc)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
+    ;; parse-output-descriptor validates form + any provided checksum.
+    (parse-output-descriptor desc network)
+    (let ((body (%split-descriptor-checksum desc)))
+      `(("descriptor" . ,(descriptor-add-checksum body))
+        ("checksum" . ,(descriptor-checksum body))
+        ("isrange" . nil)
+        ("issolvable" . t)
+        ("hasprivatekeys" . nil)))))
+
+(defun rpc-deriveaddresses (node params)
+  "Derive the address(es) for a descriptor (Bitcoin Core deriveaddresses).
+PARAMS: (descriptor [range]). Ranged descriptors are unsupported here, so
+RANGE must be absent; the result is the address(es) the descriptor's
+scriptPubKey(s) encode to (combo() yields several). Errors if any expanded
+script has no address (raw/pk/bare-multisig)."
+  (let ((desc (first params))
+        (range (second params))
+        (network (rpc-get-network node)))
+    (unless (stringp desc)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
+    (when range
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Ranged descriptors are not supported"))
+    (mapcar (lambda (pair)
+              (or (%script->address (car pair) network)
+                  (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                    :message "Descriptor does not have a corresponding address")))
+            (parse-output-descriptor desc network))))
