@@ -871,3 +871,104 @@ script-sig makes the serialization deterministic per block."
           (block-store (bitcoin-lisp.storage:init-block-store
                         (merge-pathnames "test-drain/" (uiop:temporary-directory)))))
       (is (= 0 (bitcoin-lisp.networking::drain-block-queue state utxo-set block-store))))))
+
+;;;; Chainstate in-transition auto-recovery (mechanizes the manual rescue
+;;;; from the first mainnet run — see recover-inconsistent-chainstate).
+
+(defun %recovery-coinbase-block (prev-hash height)
+  "A coinbase-only block extending PREV-HASH; coinbase script-sig carries
+HEIGHT so each block's coinbase txid is unique."
+  (let* ((sig (let ((s (make-array 4 :element-type '(unsigned-byte 8) :initial-element 0)))
+                (setf (aref s 0) (logand height #xff)
+                      (aref s 1) (logand (ash height -8) #xff))
+                s))
+         (cb-in (bitcoin-lisp.serialization:make-tx-in
+                 :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                   :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element 0)
+                                   :index #xffffffff)
+                 :script-sig sig :sequence #xffffffff))
+         (cb-out (bitcoin-lisp.serialization:make-tx-out
+                  :value 5000000000
+                  :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                               :initial-element #x76)))
+         (cb (bitcoin-lisp.serialization:make-transaction
+              :version 1 :inputs (vector cb-in) :outputs (vector cb-out) :lock-time 0))
+         (hdr (bitcoin-lisp.serialization:make-block-header
+               :version 1 :prev-block prev-hash
+               :merkle-root (bitcoin-lisp.serialization:transaction-hash cb)
+               :timestamp (+ 1700000000 height) :bits #x207fffff :nonce 0)))
+    (bitcoin-lisp.serialization:make-bitcoin-block :header hdr :transactions (list cb))))
+
+(defun %recovery-fixture (committed-height)
+  "Build a node with genesis + blocks 1..3 in the store and header index,
+chainstate tip set to block 3 with the in-transition marker, and UTXO
+coins present only for coinbases up to COMMITTED-HEIGHT (simulating a
+LevelDB batch that committed through that height). Returns the node."
+  (let* ((base (ensure-directories-exist
+                (merge-pathnames (format nil "test-recovery-~D-~D/"
+                                         committed-height (get-universal-time))
+                                 (uiop:temporary-directory))))
+         (chain-state (bitcoin-lisp.storage:init-chain-state base))
+         (block-store (bitcoin-lisp.storage:init-block-store base))
+         (utxo (bitcoin-lisp.storage:make-coins-view-cache
+                (bitcoin-lisp.storage:open-coins-view-db
+                 (ensure-directories-exist (merge-pathnames "chainstate/" base)))))
+         (node (bitcoin-lisp::make-node))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+    (setf (bitcoin-lisp::node-chain-state node) chain-state
+          (bitcoin-lisp::node-block-store node) block-store
+          (bitcoin-lisp::node-utxo-set node) utxo)
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state (bitcoin-lisp.storage:make-block-index-entry
+                  :hash genesis-hash :height 0 :chain-work 0 :status :valid))
+    (let ((prev-hash genesis-hash)
+          (prev-entry (bitcoin-lisp.storage:get-block-index-entry chain-state genesis-hash)))
+      (loop for h from 1 to 3
+            for block = (%recovery-coinbase-block prev-hash h)
+            for hash = (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header block))
+            do (bitcoin-lisp.storage:store-block block-store block)
+               (let ((entry (bitcoin-lisp.storage:make-block-index-entry
+                             :hash hash :height h :prev-entry prev-entry
+                             :chain-work (* h 100) :status :valid)))
+                 (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
+                 (setf prev-entry entry prev-hash hash))
+               ;; Commit this block's coinbase coin only up to COMMITTED-HEIGHT.
+               (when (<= h committed-height)
+                 (let ((cb (first (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
+                   (bitcoin-lisp.storage:add-utxo
+                    utxo (bitcoin-lisp.serialization:transaction-hash cb) 0
+                    5000000000 (make-array 25 :element-type '(unsigned-byte 8)) h :coinbase t)))
+               ;; chainstate.dat records the NEW tip (block 3) with the marker.
+               (when (= h 3)
+                 (bitcoin-lisp.storage:update-chain-tip chain-state hash h)
+                 (bitcoin-lisp.storage:save-state chain-state :in-transition t))))
+    node))
+
+(test chainstate-recovery-utxo-at-tip
+  "Recovery when the LevelDB batch committed the recorded tip: just clears
+the marker, height unchanged, chainstate.dat reloads clean."
+  (let ((node (%recovery-fixture 3)))   ; coins present through block 3
+    (is (eq t (bitcoin-lisp::recover-inconsistent-chainstate node)))
+    (is (= 3 (bitcoin-lisp.storage:current-height
+              (bitcoin-lisp::node-chain-state node))))
+    ;; Marker cleared: a fresh load returns T, not :inconsistent.
+    (let ((reload (bitcoin-lisp.storage:init-chain-state
+                   (bitcoin-lisp.storage::chain-state-base-path
+                    (bitcoin-lisp::node-chain-state node)))))
+      (is (eq t (bitcoin-lisp.storage:load-state reload)))
+      (is (= 3 (bitcoin-lisp.storage:current-height reload))))))
+
+(test chainstate-recovery-utxo-behind
+  "Recovery when the batch did NOT commit the recorded tip: rewinds
+chainstate.dat to the highest ancestor whose coins ARE committed."
+  (let ((node (%recovery-fixture 2)))   ; coins present only through block 2
+    (is (eq t (bitcoin-lisp::recover-inconsistent-chainstate node)))
+    (is (= 2 (bitcoin-lisp.storage:current-height
+              (bitcoin-lisp::node-chain-state node))))
+    (let ((reload (bitcoin-lisp.storage:init-chain-state
+                   (bitcoin-lisp.storage::chain-state-base-path
+                    (bitcoin-lisp::node-chain-state node)))))
+      (is (eq t (bitcoin-lisp.storage:load-state reload)))
+      (is (= 2 (bitcoin-lisp.storage:current-height reload))))))
