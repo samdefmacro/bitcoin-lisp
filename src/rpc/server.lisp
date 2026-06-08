@@ -54,6 +54,8 @@
   (register-rpc-method "getblockheader" #'rpc-getblockheader)
   (register-rpc-method "getchaintips" #'rpc-getchaintips)
   (register-rpc-method "scantxoutset" #'rpc-scantxoutset)
+  (register-rpc-method "gettxoutproof" #'rpc-gettxoutproof)
+  (register-rpc-method "verifytxoutproof" #'rpc-verifytxoutproof)
   ;; UTXO
   (register-rpc-method "gettxout" #'rpc-gettxout)
   ;; Network
