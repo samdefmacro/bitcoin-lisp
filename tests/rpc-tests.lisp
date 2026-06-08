@@ -103,6 +103,63 @@ reports fee_delta/in_mempool/modified_fee; getmempoolentry exposes fees.modified
     (is (hash-table-p (bitcoin-lisp.rpc::rpc-getprioritisedtransactions node nil)))
     (is (zerop (hash-table-count (bitcoin-lisp.mempool:mempool-deltas mempool))))))
 
+(test rest-interface-routing-and-content-types
+  "REST router: content-type negotiation, JSON reuse of RPC bodies, and
+error mapping (400 bad request / 404 not found / unknown endpoint)."
+  (let ((node (make-test-node))
+        (hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+    (setf (bitcoin-lisp::node-block-store node)
+          (bitcoin-lisp.storage:init-block-store
+           (ensure-directories-exist
+            (merge-pathnames (format nil "rest-test-~D/" (get-universal-time))
+                             (uiop:temporary-directory)))))
+    (flet ((status () (hunchentoot:return-code*))
+           (ctype () (hunchentoot:content-type*)))
+      ;; chaininfo.json -> 200 application/json, parseable, reuses
+      ;; rpc-getblockchaininfo (so has its keys).
+      (let ((body (bitcoin-lisp.rpc::rest-handle node "/rest/chaininfo.json")))
+        (is (= 200 (status)))
+        (is (string= "application/json" (ctype)))
+        (let ((parsed (yason:parse body)))
+          (is (hash-table-p parsed))
+          (is (integerp (gethash "blocks" parsed)))))
+      ;; mempool/info.json -> 200 json
+      (is (= 200 (progn (bitcoin-lisp.rpc::rest-handle node "/rest/mempool/info.json")
+                        (status))))
+      ;; chaininfo only supports .json -> .hex is 400
+      (bitcoin-lisp.rpc::rest-handle node "/rest/chaininfo.hex")
+      (is (= 400 (status)))
+      ;; malformed block hash -> 400
+      (bitcoin-lisp.rpc::rest-handle node "/rest/block/nothex.json")
+      (is (= 400 (status)))
+      ;; well-formed but absent block -> 404
+      (bitcoin-lisp.rpc::rest-handle
+       node (format nil "/rest/block/~A.json" (make-string 64 :initial-element #\a)))
+      (is (= 404 (status)))
+      ;; absent tx -> 404
+      (bitcoin-lisp.rpc::rest-handle
+       node (format nil "/rest/tx/~A.hex" (make-string 64 :initial-element #\b)))
+      (is (= 404 (status)))
+      ;; unknown endpoint -> 404
+      (bitcoin-lisp.rpc::rest-handle node "/rest/frobnicate.json")
+      (is (= 404 (status)))
+      ;; getutxos with a bad outpoint -> 400
+      (bitcoin-lisp.rpc::rest-handle node "/rest/getutxos/notanoutpoint.json")
+      (is (= 400 (status))))))
+
+(test rest-getutxos-reports-absence
+  "getutxos returns found=false for an unknown outpoint (no error)."
+  (let ((node (make-test-node))
+        (hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+    (let* ((txid (make-string 64 :initial-element #\c))
+           (body (bitcoin-lisp.rpc::rest-handle
+                  node (format nil "/rest/getutxos/~A-0.json" txid)))
+           (parsed (yason:parse body)))
+      (is (= 200 (hunchentoot:return-code*)))
+      (let ((utxos (gethash "utxos" parsed)))
+        (is (= 1 (length utxos)))
+        (is (eq nil (gethash "found" (first utxos))))))))
+
 ;;; --- Output Descriptor Tests (scantxoutset) ---
 
 (test descriptor-checksum-core-vector
