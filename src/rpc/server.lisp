@@ -246,6 +246,9 @@ pairs — so without this every object-returning RPC errors out."
 (defvar *rpc-dispatcher* nil
   "The RPC dispatcher function (for cleanup on stop).")
 
+(defvar *rest-dispatcher* nil
+  "The REST /rest/ dispatcher function (for cleanup on stop).")
+
 ;;; --- RPC Rate Limiting ---
 
 (defvar *rpc-rate-limiter* nil
@@ -398,6 +401,12 @@ PORT defaults to 18332 for testnet, 8332 for mainnet."
           (let ((dispatcher (hunchentoot:create-prefix-dispatcher "/" 'rpc-dispatch-handler)))
             (setf *rpc-dispatcher* dispatcher)
             (push dispatcher hunchentoot:*dispatch-table*))
+          ;; REST GET surface under /rest/ — pushed AFTER the "/" dispatcher
+          ;; so it sits at the front of the list and matches first.
+          (let ((rest-dispatcher (hunchentoot:create-prefix-dispatcher
+                                  "/rest/" 'rest-dispatch-handler)))
+            (setf *rest-dispatcher* rest-dispatcher)
+            (push rest-dispatcher hunchentoot:*dispatch-table*))
 
           (hunchentoot:start acceptor)
           (setf *rpc-server* acceptor)
@@ -423,9 +432,13 @@ PORT defaults to 18332 for testnet, 8332 for mainnet."
     (when *rpc-dispatcher*
       (setf hunchentoot:*dispatch-table*
             (remove *rpc-dispatcher* hunchentoot:*dispatch-table*)))
+    (when *rest-dispatcher*
+      (setf hunchentoot:*dispatch-table*
+            (remove *rest-dispatcher* hunchentoot:*dispatch-table*)))
     (setf *rpc-server* nil)
     (setf *rpc-node* nil)
     (setf *rpc-user* nil)
     (setf *rpc-password* nil)
     (setf *rpc-dispatcher* nil)
+    (setf *rest-dispatcher* nil)
     (setf *rpc-rate-limiter* nil)))
