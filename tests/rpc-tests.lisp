@@ -160,6 +160,124 @@ error mapping (400 bad request / 404 not found / unknown endpoint)."
         (is (= 1 (length utxos)))
         (is (eq nil (gethash "found" (first utxos))))))))
 
+(defun %proof-hashes (n)
+  "N distinct 32-byte hashes for partial-merkle-tree tests."
+  (loop for i from 1 to n
+        collect (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                  (setf (aref h 0) (logand i #xff)
+                        (aref h 1) (logand (ash i -8) #xff))
+                  h)))
+
+(test txoutproof-build-extract-roundtrip
+  "Partial merkle tree build->extract recomputes the real merkle root and
+recovers exactly the matched leaves, across tree sizes and match sets."
+  (dolist (ntx '(1 2 3 4 5 7 8 16))
+    (let* ((txids (%proof-hashes ntx))
+           (txid-vec (coerce txids 'vector))
+           (root (bitcoin-lisp.validation:compute-merkle-root txids))
+           ;; Match the first and last leaf (and the middle for larger trees).
+           (want (remove-duplicates (list 0 (1- ntx) (floor ntx 2))))
+           (match (make-array ntx :initial-element nil)))
+      (dolist (i want) (setf (aref match i) t))
+      (multiple-value-bind (bits hashes)
+          (bitcoin-lisp.rpc::build-partial-merkle-tree txid-vec match)
+        (multiple-value-bind (xroot xmatched xindices)
+            (bitcoin-lisp.rpc::extract-partial-merkle-tree ntx bits hashes)
+          (is (equalp root xroot) "ntx=~D root mismatch" ntx)
+          (is (equal (sort (copy-list want) #'<) xindices) "ntx=~D indices" ntx)
+          (is (= (length want) (length xmatched)))
+          ;; Each matched hash is the txid at its reported index.
+          (loop for h in xmatched for idx in xindices
+                do (is (equalp (aref txid-vec idx) h))))))))
+
+(test txoutproof-serialize-roundtrip
+  "serialize-merkle-block / parse-merkle-block round-trip the proof fields."
+  (let* ((ntx 6)
+         (txids (%proof-hashes ntx))
+         (txid-vec (coerce txids 'vector))
+         (match (make-array ntx :initial-element nil)))
+    (setf (aref match 2) t)
+    (multiple-value-bind (bits hashes)
+        (bitcoin-lisp.rpc::build-partial-merkle-tree txid-vec match)
+      (let* ((header (make-array 80 :element-type '(unsigned-byte 8) :initial-element 7))
+             (bytes (bitcoin-lisp.rpc::serialize-merkle-block header ntx hashes bits)))
+        (multiple-value-bind (h2 ntx2 hashes2 bits2)
+            (bitcoin-lisp.rpc::parse-merkle-block bytes)
+          (is (equalp header h2))
+          (is (= ntx ntx2))
+          (is (equalp hashes hashes2))
+          ;; bits round-trip up to the byte padding zeros
+          (is (equal bits (subseq bits2 0 (length bits))))
+          ;; and re-extract gives the same root
+          (is (equalp (bitcoin-lisp.rpc::extract-partial-merkle-tree ntx bits hashes)
+                      (bitcoin-lisp.rpc::extract-partial-merkle-tree ntx2 bits2 hashes2))))))))
+
+(test txoutproof-tamper-detected
+  "Flipping a hash in the partial tree changes the recomputed root."
+  (let* ((ntx 8)
+         (txids (%proof-hashes ntx))
+         (txid-vec (coerce txids 'vector))
+         (root (bitcoin-lisp.validation:compute-merkle-root txids))
+         (match (make-array ntx :initial-element nil)))
+    (setf (aref match 3) t)
+    (multiple-value-bind (bits hashes)
+        (bitcoin-lisp.rpc::build-partial-merkle-tree txid-vec match)
+      (let ((tampered (mapcar #'copy-seq hashes)))
+        (setf (aref (first tampered) 0) (logxor (aref (first tampered) 0) #xff))
+        (is (not (equalp root (bitcoin-lisp.rpc::extract-partial-merkle-tree
+                               ntx bits tampered))))))))
+
+(test rpc-txoutproof-roundtrip
+  "gettxoutproof builds a proof a real block, verifytxoutproof confirms it
+when the block is on the active chain and rejects a root-mismatched proof."
+  (let* ((node (make-test-node))
+         (chain-state (bitcoin-lisp::node-chain-state node))
+         (dir (ensure-directories-exist
+               (merge-pathnames (format nil "txoutproof-~D/" (get-universal-time))
+                                (uiop:temporary-directory))))
+         (block-store (bitcoin-lisp.storage:init-block-store dir)))
+    (setf (bitcoin-lisp::node-block-store node) block-store)
+    ;; Build a 4-tx block (distinct coinbase-shaped txs).
+    (let* ((txs (loop for i from 0 below 4
+                      collect (bitcoin-lisp.serialization:make-transaction
+                               :version 1
+                               :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                                :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                                  :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                                                                  :index #xffffffff)
+                                                :script-sig (make-array 2 :element-type '(unsigned-byte 8) :initial-element i)
+                                                :sequence #xffffffff))
+                               :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                                 :value 1000 :script-pubkey (make-array 4 :element-type '(unsigned-byte 8) :initial-element #x6a)))
+                               :lock-time 0)))
+           (txids (mapcar #'bitcoin-lisp.serialization:transaction-hash txs))
+           (root (bitcoin-lisp.validation:compute-merkle-root txids))
+           (header (bitcoin-lisp.serialization:make-block-header
+                    :version 1
+                    :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                    :merkle-root root :timestamp 1700000000 :bits #x207fffff :nonce 0))
+           (block (bitcoin-lisp.serialization:make-bitcoin-block :header header :transactions txs))
+           (block-hash (bitcoin-lisp.serialization:block-header-hash header)))
+      (unwind-protect
+           (progn
+             (bitcoin-lisp.storage:store-block block-store block)
+             (bitcoin-lisp.storage:add-block-index-entry
+              chain-state (bitcoin-lisp.storage:make-block-index-entry
+                           :hash block-hash :height 0 :header header
+                           :chain-work 1 :status :valid))
+             (bitcoin-lisp.storage:update-chain-tip chain-state block-hash 0)
+             (let* ((target (bitcoin-lisp.rpc::hash-to-hex (second txids)))
+                    (proof (bitcoin-lisp.rpc::rpc-gettxoutproof
+                            node (list (list target) (bitcoin-lisp.rpc::hash-to-hex block-hash))))
+                    (verified (bitcoin-lisp.rpc::rpc-verifytxoutproof node (list proof))))
+               (is (stringp proof))
+               (is (equal (list target) verified))
+               ;; Corrupt the proof's last hex nibble -> root/parse mismatch -> error.
+               (signals bitcoin-lisp.rpc::rpc-error
+                 (bitcoin-lisp.rpc::rpc-verifytxoutproof
+                  node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))))
+        (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
+
 ;;; --- Output Descriptor Tests (scantxoutset) ---
 
 (test descriptor-checksum-core-vector
