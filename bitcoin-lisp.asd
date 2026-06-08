@@ -77,6 +77,7 @@
                                (:file "accessors")
                                (:file "descriptors")
                                (:file "methods")
+                               (:file "rest")
                                (:file "server")))
                  (:file "node"))))
   :in-order-to ((test-op (test-op "bitcoin-lisp/tests"))))
