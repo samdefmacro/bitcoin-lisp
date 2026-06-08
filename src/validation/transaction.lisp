@@ -302,10 +302,40 @@ Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
      (and (= len 34)
           (= (aref script-pubkey 0) #x51)   ; OP_1
           (= (aref script-pubkey 1) #x20))  ; push 32 bytes
-     ;; OP_RETURN data carrier (max 80 bytes data)
-     (and (>= len 1)
-          (<= len 83)
-          (= (aref script-pubkey 0) #x6a))))) ; OP_RETURN
+     ;; OP_RETURN data carrier — gated by -datacarrier, sized by
+     ;; -datacarriersize (mempool policy, not consensus).
+     (and bitcoin-lisp:*accept-datacarrier*
+          (>= len 1)
+          (<= len bitcoin-lisp:*max-datacarrier-bytes*)
+          (= (aref script-pubkey 0) #x6a))   ; OP_RETURN
+     ;; Bare (non-P2SH) multisig — standard only when -permitbaremultisig.
+     (and bitcoin-lisp:*permit-bare-multisig*
+          (bare-multisig-standard-p script-pubkey)))))
+
+(defun bare-multisig-standard-p (script)
+  "T if SCRIPT is a standard bare multisig: OP_m <pubkey>.. OP_n
+OP_CHECKMULTISIG with 1<=m<=n<=3 and each key a 33/65-byte push (Bitcoin
+Core's TX_MULTISIG standardness limit). Consensus allows up to 20 keys;
+standardness caps bare multisig at 3."
+  (let ((len (length script)))
+    (and (>= len 4)
+         (= (aref script (1- len)) #xae)         ; OP_CHECKMULTISIG
+         (<= #x51 (aref script 0) #x60)          ; OP_m (1..16)
+         (<= #x51 (aref script (- len 2)) #x60)  ; OP_n (1..16)
+         (let ((m (- (aref script 0) #x50))
+               (n (- (aref script (- len 2)) #x50)))
+           (and (<= 1 m n 3)
+                ;; Walk the n key pushes between OP_m and OP_n.
+                (let ((pos 1) (keys 0))
+                  (loop while (< pos (- len 2))
+                        do (let ((plen (aref script pos)))
+                             (unless (or (= plen 33) (= plen 65))
+                               (return-from bare-multisig-standard-p nil))
+                             (incf pos (1+ plen))
+                             (incf keys)
+                             (when (> keys n)
+                               (return-from bare-multisig-standard-p nil))))
+                  (and (= pos (- len 2)) (= keys n))))))))
 
 (defun witness-program-parts (script)
   "If SCRIPT is a witness program, return (VALUES version program-bytes);

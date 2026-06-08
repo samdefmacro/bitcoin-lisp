@@ -418,6 +418,47 @@ per-entry deltas, and residual deltas; corrupt files read as not-ok."
   (let ((script (make-array 10 :element-type '(unsigned-byte 8) :initial-element #xFF)))
     (is (not (bitcoin-lisp.validation::standard-output-script-p script)))))
 
+(defun %op-return-script (data-len)
+  "An OP_RETURN scriptPubKey carrying DATA-LEN data bytes (OP_RETURN +
+1-byte pushdata prefix + data)."
+  (let ((s (make-array (+ 2 data-len) :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref s 0) #x6a (aref s 1) data-len)
+    s))
+
+(test datacarrier-policy-knobs
+  "*accept-datacarrier* gates OP_RETURN standardness; *max-datacarrier-bytes*
+sizes it (-datacarrier / -datacarriersize)."
+  (let ((ok (%op-return-script 75))      ; 77 bytes total
+        (big (%op-return-script 82)))     ; 84 bytes total, over the 83 default
+    ;; default: accepted up to the size cap, rejected beyond it
+    (is (bitcoin-lisp.validation::standard-output-script-p ok))
+    (is (not (bitcoin-lisp.validation::standard-output-script-p big)))
+    ;; datacarrier disabled: even a small OP_RETURN is non-standard
+    (let ((bitcoin-lisp:*accept-datacarrier* nil))
+      (is (not (bitcoin-lisp.validation::standard-output-script-p ok))))
+    ;; raised size cap admits the larger script
+    (let ((bitcoin-lisp:*max-datacarrier-bytes* 100))
+      (is (bitcoin-lisp.validation::standard-output-script-p big)))))
+
+(test bare-multisig-policy-knob
+  "Bare multisig is non-standard by default and standard under
+*permit-bare-multisig* (1<=m<=n<=3, 33/65-byte keys)."
+  (let* ((k (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2))
+         ;; OP_1 <33-key> <33-key> OP_2 OP_CHECKMULTISIG  (1-of-2)
+         (ms (concatenate '(vector (unsigned-byte 8))
+                          (vector #x51 33) k (vector 33) k (vector #x52 #xae)))
+         ;; 1-of-4 exceeds the bare-multisig key cap (n>3) -> never standard
+         (ms4 (concatenate '(vector (unsigned-byte 8))
+                           (vector #x51 33) k (vector 33) k (vector 33) k (vector 33) k
+                           (vector #x54 #xae))))
+    (is (not (bitcoin-lisp.validation::standard-output-script-p ms)))
+    (let ((bitcoin-lisp:*permit-bare-multisig* t))
+      (is (bitcoin-lisp.validation::standard-output-script-p ms))
+      (is (not (bitcoin-lisp.validation::standard-output-script-p ms4)))
+      ;; a truncated/garbage multisig is rejected even when permitted
+      (is (not (bitcoin-lisp.validation::standard-output-script-p
+                (coerce #(#x51 #xae) '(vector (unsigned-byte 8)))))))))
+
 ;;;; Fee estimation tests
 
 (test fee-estimator-creation
