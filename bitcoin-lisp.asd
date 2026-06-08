@@ -77,6 +77,7 @@
                                (:file "accessors")
                                (:file "descriptors")
                                (:file "methods")
+                               (:file "merkleproof")
                                (:file "rest")
                                (:file "server")))
                  (:file "node"))))
