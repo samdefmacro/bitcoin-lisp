@@ -380,6 +380,82 @@ last. Corrupt or missing files are ignored."
           (log-info "Imported mempool: ~D accepted, ~D failed, ~D residual deltas"
                     accepted failed (length residual)))))))
 
+;;; --- Chainstate crash recovery -------------------------------------------
+;;;
+;;; do-flush is a 3-phase commit (see do-flush): Phase 1 marks chainstate.dat
+;;; in-transition, Phase 2 commits the UTXO LevelDB in ONE atomic writebatch,
+;;; Phase 3 clears the marker. A crash between Phase 1 and Phase 3 leaves the
+;;; marker set. Because Phase 2 is a single atomic batch, the on-disk UTXO set
+;;; is at EXACTLY the new tip (Phase 2 finished) or the previous committed tip
+;;; (Phase 2 hadn't run) — never a torn mix. We tell the two apart by probing
+;;; coinbase outputs and rewrite chainstate.dat to match the UTXO set, instead
+;;; of the old "move aside and re-sync from genesis" — mirrors Bitcoin Core
+;;; resolving its DB_HEAD_BLOCKS marker on startup rather than reindexing.
+
+(defvar *pending-chainstate-recovery* nil
+  "Set by start-node when load-state reports :inconsistent, so the recovery
+runs after the block store, UTXO cache, and header index are all open.")
+
+(defun %coinbase-committed-p (node block-hash)
+  "T iff BLOCK-HASH's coinbase output 0 is an unspent coin in the UTXO
+LevelDB. A coinbase is unspendable for +coinbase-maturity+ (100) blocks,
+so once its block is committed to the UTXO set the coin is necessarily
+present — and every block above the committed tip contributes no coins at
+all. That makes coinbase-presence a monotone probe for 'is the UTXO set at
+or past this block', with no false positives from later spends. Returns
+NIL if the block isn't on disk."
+  (let ((block (bitcoin-lisp.storage:get-block (node-block-store node) block-hash)))
+    (when block
+      (let* ((cb (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+             (txid (bitcoin-lisp.serialization:transaction-hash cb)))
+        (and (bitcoin-lisp.storage:get-utxo (node-utxo-set node) txid 0) t)))))
+
+(defun recover-inconsistent-chainstate (node)
+  "Resolve an in-transition chainstate without a from-genesis resync.
+Probes whether the recorded tip's coins were committed; if so just clears
+the marker, otherwise walks back to the highest ancestor whose coins ARE
+committed (the true UTXO tip) and rewrites chainstate.dat there so IBD
+re-validates only the gap. Returns T on success, NIL if the blocks needed
+to resolve it aren't on disk (caller then aborts for a resync)."
+  (let* ((chain-state (node-chain-state node))
+         (new-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (new-height (bitcoin-lisp.storage:current-height chain-state)))
+    (cond
+      ((null new-hash)
+       (log-error "Chainstate recovery: no recorded tip to recover from")
+       nil)
+      ;; Phase 2 committed the new tip — chainstate.dat already holds it,
+      ;; just drop the marker.
+      ((%coinbase-committed-p node new-hash)
+       (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
+       (log-info "Chainstate recovery: UTXO set already at recorded tip h=~D; marker cleared"
+                 new-height)
+       t)
+      ;; UTXO set is behind: find the real tip by walking back.
+      (t
+       (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state new-hash)))
+         (loop while entry
+               do (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
+               until (or (null entry)
+                         (%coinbase-committed-p
+                          node (bitcoin-lisp.storage:block-index-entry-hash entry))))
+         (cond
+           (entry
+            (let ((h (bitcoin-lisp.storage:block-index-entry-height entry))
+                  (hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+              ;; pruned-height is left as recorded — pruning is monotone and
+              ;; lags the tip by the whole block window, so it is far below
+              ;; this rewind point and those files are gone regardless.
+              (setf (bitcoin-lisp.storage::chain-state-best-block-hash chain-state) hash
+                    (bitcoin-lisp.storage::chain-state-best-height chain-state) h)
+              (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
+              (log-warn "Chainstate recovery: UTXO set at h=~D (recorded tip h=~D); rewound chainstate.dat ~D block~:P, will re-validate the gap"
+                        h new-height (- new-height h))
+              t))
+           (t
+            (log-error "Chainstate recovery: no committed ancestor found on disk (blocks pruned below the UTXO tip?); resync required")
+            nil)))))))
+
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
                         (log-level :info)
@@ -466,12 +542,15 @@ Returns the node instance."
 
   ;; Genesis block index entry is ensured after load-header-index below
 
+  (setf *pending-chainstate-recovery* nil)
   (let ((load-result (bitcoin-lisp.storage:load-state (node-chain-state *node*))))
     (case load-result
       ((:inconsistent)
-       (log-error "Chainstate is in-transition (a previous flush was interrupted between writing chainstate.dat and utxoset.dat). On-disk pair is inconsistent. Please move ~A aside and re-sync from genesis."
-                  (node-data-directory *node*))
-       (error "chainstate inconsistent: re-sync required"))
+       ;; A flush was interrupted mid-commit. Don't abort — defer recovery
+       ;; until the block store, UTXO cache, and header index are open
+       ;; (recover-inconsistent-chainstate needs all three).
+       (log-warn "Chainstate in-transition (flush interrupted); will attempt automatic recovery after storage init")
+       (setf *pending-chainstate-recovery* t))
       ((t)
        (log-info "Loaded existing chain state: height ~D"
                  (bitcoin-lisp.storage:current-height (node-chain-state *node*))))
@@ -540,6 +619,15 @@ Returns the node instance."
           :chain-work 0
           :status :valid
           :tx-count 1))))   ; genesis carries exactly its coinbase
+
+  ;; Resolve an interrupted-flush chainstate now that the block store, UTXO
+  ;; cache, and header index are all available. Only abort (resync) if the
+  ;; on-disk blocks needed to recover are gone.
+  (when *pending-chainstate-recovery*
+    (setf *pending-chainstate-recovery* nil)
+    (unless (recover-inconsistent-chainstate *node*)
+      (error "chainstate inconsistent and unrecoverable: move ~A aside and re-sync"
+             (node-data-directory *node*))))
 
   ;; Initialize undo data persistence
   (let ((undo-path (merge-pathnames "undo/" (node-data-directory *node*))))
