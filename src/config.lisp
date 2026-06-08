@@ -36,6 +36,22 @@ Set automatically based on network: 100000 for mainnet, 1000 for testnet.")
     (:mainnet 100000)
     ((:testnet3 :testnet4 :signet :regtest) 1000)))
 
+(defvar *accept-datacarrier* t
+  "Mempool policy: accept OP_RETURN data-carrier outputs as standard
+(Bitcoin Core -datacarrier, default true). When NIL, any OP_RETURN output
+is non-standard and the tx is rejected from the mempool.")
+
+(defvar *max-datacarrier-bytes* 83
+  "Mempool policy: maximum total size of a standard OP_RETURN scriptPubKey
+in bytes (Bitcoin Core -datacarriersize is the DATA size, 80; this is the
+whole script = OP_RETURN + pushdata prefix + 80 data = 83). Consensus is
+unaffected; this only gates mempool standardness.")
+
+(defvar *permit-bare-multisig* nil
+  "Mempool policy: treat bare (non-P2SH) multisig outputs as standard
+(Bitcoin Core -permitbaremultisig; default false in modern Core). When
+NIL, bare multisig is non-standard. Consensus is unaffected.")
+
 ;;;; Token Bucket Rate Limiter
 
 (defstruct token-bucket

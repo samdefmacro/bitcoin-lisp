@@ -855,6 +855,9 @@
    #:*prune-target-mib*
    #:*prune-after-height*
    #:+min-blocks-to-keep+
+   #:*accept-datacarrier*
+   #:*max-datacarrier-bytes*
+   #:*permit-bare-multisig*
    #:pruning-enabled-p
    #:automatic-pruning-p
    ;; Token bucket rate limiter
