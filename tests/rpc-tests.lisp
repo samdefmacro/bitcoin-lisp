@@ -329,6 +329,101 @@ when the block is on the active chain and rejects a root-mismatched proof."
                   node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))))
         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 
+(defun %loadtxoutset-node (dir tip-hash tip-height)
+  "A node backed by a fresh LevelDB chainstate at DIR, with genesis + a
+base entry (TIP-HASH at TIP-HEIGHT) in the header index. The chain tip is
+left at genesis (height 0) so loadtxoutset sees a valid fast-forward."
+  (let* ((chain-state (bitcoin-lisp.storage:init-chain-state dir))
+         (utxo (bitcoin-lisp.storage:make-coins-view-cache
+                (bitcoin-lisp.storage:open-coins-view-db
+                 (ensure-directories-exist (merge-pathnames "chainstate/" dir)))))
+         (node (make-test-node))
+         (genesis (bitcoin-lisp.storage:best-block-hash chain-state)))
+    (setf (bitcoin-lisp::node-chain-state node) chain-state
+          (bitcoin-lisp::node-utxo-set node) utxo
+          (bitcoin-lisp::node-block-store node)
+          (bitcoin-lisp.storage:init-block-store dir))
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state (bitcoin-lisp.storage:make-block-index-entry
+                  :hash genesis :height 0 :chain-work 0 :status :valid))
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state (bitcoin-lisp.storage:make-block-index-entry
+                  :hash tip-hash :height tip-height :chain-work (* tip-height 100)
+                  :status :valid))
+    node))
+
+(test rpc-loadtxoutset-roundtrip
+  "dumptxoutset -> loadtxoutset round-trips coins and fast-forwards the tip;
+the precondition checks (header present, not already at height) hold."
+  (let* ((tmp (uiop:temporary-directory))
+         (stamp (get-universal-time))
+         (src-dir (ensure-directories-exist
+                   (merge-pathnames (format nil "lts-src-~D/" stamp) tmp)))
+         (dst-dir (ensure-directories-exist
+                   (merge-pathnames (format nil "lts-dst-~D/" stamp) tmp)))
+         (snap (namestring (merge-pathnames (format nil "snap-~D.dat" stamp) tmp)))
+         (h5 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+         (txid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xA1))
+         (txid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xB2))
+         (spk (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76)))
+    (unwind-protect
+         (progn
+           ;; --- Source node at tip h5=5 with two coins; dump it. ---
+           (let ((src (%loadtxoutset-node src-dir h5 5)))
+             (bitcoin-lisp.storage:update-chain-tip
+              (bitcoin-lisp::node-chain-state src) h5 5)
+             (bitcoin-lisp.storage:add-utxo
+              (bitcoin-lisp::node-utxo-set src) txid-a 0 4200000000 spk 3 :coinbase t)
+             (bitcoin-lisp.storage:add-utxo
+              (bitcoin-lisp::node-utxo-set src) txid-b 1 999 spk 4)
+             (let ((r (bitcoin-lisp.rpc::rpc-dumptxoutset src (list snap))))
+               (is (= 2 (cdr (assoc "coins_written" r :test #'string=))))))
+           ;; --- Destination node knows the h5 header but is still at genesis. ---
+           (let ((dst (%loadtxoutset-node dst-dir h5 5)))
+             (is (= 0 (bitcoin-lisp.storage:current-height
+                       (bitcoin-lisp::node-chain-state dst))))
+             (let ((r (bitcoin-lisp.rpc::rpc-loadtxoutset dst (list snap))))
+               (is (= 2 (cdr (assoc "coins_loaded" r :test #'string=))))
+               (is (= 5 (cdr (assoc "tip_height" r :test #'string=)))))
+             ;; Tip fast-forwarded; coins present with correct values.
+             (is (= 5 (bitcoin-lisp.storage:current-height
+                       (bitcoin-lisp::node-chain-state dst))))
+             (is (equalp h5 (bitcoin-lisp.storage:best-block-hash
+                             (bitcoin-lisp::node-chain-state dst))))
+             (let ((a (bitcoin-lisp.storage:get-utxo (bitcoin-lisp::node-utxo-set dst) txid-a 0))
+                   (b (bitcoin-lisp.storage:get-utxo (bitcoin-lisp::node-utxo-set dst) txid-b 1)))
+               (is (and a (= 4200000000 (bitcoin-lisp.storage:utxo-entry-value a))))
+               (is (bitcoin-lisp.storage:utxo-entry-coinbase a))
+               (is (and b (= 999 (bitcoin-lisp.storage:utxo-entry-value b))))
+               (is (not (bitcoin-lisp.storage:utxo-entry-coinbase b))))
+             ;; Loading again now fails the "already at/past height" precondition.
+             (signals bitcoin-lisp.rpc::rpc-error
+               (bitcoin-lisp.rpc::rpc-loadtxoutset dst (list snap)))))
+      (ignore-errors (delete-file snap))
+      (uiop:delete-directory-tree src-dir :validate t :if-does-not-exist :ignore)
+      (uiop:delete-directory-tree dst-dir :validate t :if-does-not-exist :ignore))))
+
+(test rpc-loadtxoutset-precondition-errors
+  "loadtxoutset rejects a missing file, bad magic, and an unknown base block."
+  (let* ((tmp (uiop:temporary-directory))
+         (stamp (get-universal-time))
+         (dir (ensure-directories-exist (merge-pathnames (format nil "lts-pre-~D/" stamp) tmp)))
+         (h9 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+         (junk (namestring (merge-pathnames (format nil "junk-~D.dat" stamp) tmp))))
+    (unwind-protect
+         (let ((node (%loadtxoutset-node dir h9 9)))
+           ;; missing file
+           (signals bitcoin-lisp.rpc::rpc-error
+             (bitcoin-lisp.rpc::rpc-loadtxoutset node (list (namestring (merge-pathnames "nope.dat" tmp)))))
+           ;; bad magic
+           (with-open-file (o junk :direction :output :if-exists :supersede
+                                   :element-type '(unsigned-byte 8))
+             (write-sequence (make-array 64 :element-type '(unsigned-byte 8) :initial-element 0) o))
+           (signals bitcoin-lisp.rpc::rpc-error
+             (bitcoin-lisp.rpc::rpc-loadtxoutset node (list junk))))
+      (ignore-errors (delete-file junk))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
 ;;; --- Output Descriptor Tests (scantxoutset) ---
 
 (test descriptor-checksum-core-vector
