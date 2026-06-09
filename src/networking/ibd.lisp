@@ -1308,11 +1308,7 @@ Returns the number of blocks downloaded."
 
     ;; Phase 1: Download headers
     (set-ibd-state :syncing-headers)
-    (let ((best-peer (first (sort (copy-list peers) #'>
-                                  :key #'peer-start-height))))
-      (when best-peer
-        (setf (ibd-context-header-sync-peer ctx) best-peer)
-        (sync-headers best-peer chain-state :recent-rejects recent-rejects)))
+    (sync-headers-with-failover peers chain-state ctx :recent-rejects recent-rejects)
 
     ;; Phase 2: Download and validate blocks
     (set-ibd-state :syncing-blocks)
@@ -1490,9 +1486,12 @@ Used during IBD when the validated block tip lags behind the header tip."
      (bitcoin-lisp.serialization:make-getheaders-message locator))))
 
 (defun sync-headers (peer chain-state &key recent-rejects)
-  "Download all headers from a peer."
+  "Download all headers from PEER. Returns (values received-count stalled-p);
+STALLED-P is true when the peer went silent (a getheaders went unanswered),
+the signal run-ibd uses to rotate to another header-sync peer."
   (let ((received-count 0)
         (done nil)
+        (timed-out nil)
         (requests-sent 0)
         (max-requests 100))
     ;; First, drain any pending messages from peer (sendcmpct, sendheaders, etc.)
@@ -1528,7 +1527,8 @@ Used during IBD when the validated block tip lags behind the header tip."
                                (when (> attempts 10)
                                  (bitcoin-lisp:log-warn "Timeout waiting for headers")
                                  (setf done t)
-                                 (setf got-headers t)))
+                                 (setf got-headers t)
+                                 (setf timed-out t)))
 
                               ((string= command "headers")
                                (setf got-headers t)
@@ -1575,7 +1575,26 @@ Used during IBD when the validated block tip lags behind the header tip."
                                  (error () nil)))))))))
 
     (bitcoin-lisp:log-info "Header sync complete: ~D headers received" received-count)
-    received-count))
+    (values received-count timed-out)))
+
+(defun sync-headers-with-failover (peers chain-state ctx
+                                   &key recent-rejects (sync-fn #'sync-headers))
+  "Run header sync against ready PEERS in descending start-height order,
+rotating to the next peer whenever one STALLS (sync-fn's 2nd value true),
+and stopping at the first that answers. Returns the peer that responded, or
+NIL if every ready peer stalled / none were ready. SYNC-FN is injectable so
+the rotation logic is testable without network I/O.
+
+Fixes the single-peer header-sync freeze: run-ibd previously synced from one
+peer chosen by start-height (frozen at handshake), with no failover — a quiet
+or dead-fork peer was re-picked every cycle and pinned the tip for hours."
+  (dolist (peer (sort (copy-list peers) #'> :key #'peer-start-height) nil)
+    (when (eq (peer-state peer) :ready)
+      (setf (ibd-context-header-sync-peer ctx) peer)
+      (multiple-value-bind (count stalled)
+          (funcall sync-fn peer chain-state :recent-rejects recent-rejects)
+        (declare (ignore count))
+        (unless stalled (return peer))))))
 
 (defvar *forensic-store-from-height* nil
   "Debug: when set to an integer N, store every received block at
