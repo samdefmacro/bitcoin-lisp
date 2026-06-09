@@ -724,3 +724,59 @@ leaving a live peer's in-flight untouched."
         (bitcoin-lisp.networking::validate-header-chain '() state)
       (is (null valid-headers))
       (is (null error)))))
+
+;;;; Header-sync peer failover (the testnet4 at-tip stall fix)
+
+(test header-sync-failover-rotates-past-stalled-peers
+  "sync-headers-with-failover tries ready peers in descending start-height
+order and rotates past any that STALL, stopping at the first that answers."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd-context))
+         ;; Three ready peers; the two highest-start-height ones stall.
+         (p-hi  (bitcoin-lisp.networking:make-peer :state :ready :start-height 900))
+         (p-mid (bitcoin-lisp.networking:make-peer :state :ready :start-height 800))
+         (p-lo  (bitcoin-lisp.networking:make-peer :state :ready :start-height 700))
+         (tried '())
+         ;; Stub: p-hi and p-mid stall (values 0 t); p-lo answers (values 3 nil).
+         (sync-fn (lambda (peer chain-state &key recent-rejects)
+                    (declare (ignore chain-state recent-rejects))
+                    (push peer tried)
+                    (if (eq peer p-lo) (values 3 nil) (values 0 t)))))
+    (let ((winner (bitcoin-lisp.networking::sync-headers-with-failover
+                   (list p-lo p-hi p-mid) nil ctx :sync-fn sync-fn)))
+      ;; Stopped at the first non-stalled peer.
+      (is (eq p-lo winner))
+      ;; Tried in start-height order hi -> mid -> lo, then stopped.
+      (is (equal (list p-hi p-mid p-lo) (nreverse tried)))
+      ;; header-sync-peer left pointing at the peer that answered.
+      (is (eq p-lo (bitcoin-lisp.networking::ibd-context-header-sync-peer ctx))))))
+
+(test header-sync-failover-first-peer-answers
+  "When the highest-start-height peer answers, no rotation happens."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd-context))
+         (p-hi (bitcoin-lisp.networking:make-peer :state :ready :start-height 900))
+         (p-lo (bitcoin-lisp.networking:make-peer :state :ready :start-height 700))
+         (calls 0)
+         (sync-fn (lambda (peer chain-state &key recent-rejects)
+                    (declare (ignore peer chain-state recent-rejects))
+                    (incf calls) (values 10 nil))))
+    (is (eq p-hi (bitcoin-lisp.networking::sync-headers-with-failover
+                  (list p-lo p-hi) nil ctx :sync-fn sync-fn)))
+    (is (= 1 calls))))   ; stopped after the first peer
+
+(test header-sync-failover-all-stalled-and-skips-nonready
+  "All-stalled returns NIL; non-:ready peers are skipped entirely."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd-context))
+         (ready (bitcoin-lisp.networking:make-peer :state :ready :start-height 500))
+         (dead  (bitcoin-lisp.networking:make-peer :state :disconnected :start-height 999))
+         (tried '())
+         (sync-fn (lambda (peer chain-state &key recent-rejects)
+                    (declare (ignore chain-state recent-rejects))
+                    (push peer tried) (values 0 t))))
+    ;; All ready peers stall -> NIL.
+    (is (null (bitcoin-lisp.networking::sync-headers-with-failover
+               (list ready) nil ctx :sync-fn sync-fn)))
+    ;; The disconnected peer (higher start-height) is never tried.
+    (setf tried '())
+    (bitcoin-lisp.networking::sync-headers-with-failover
+     (list ready dead) nil ctx :sync-fn sync-fn)
+    (is (equal (list ready) (nreverse tried)))))
