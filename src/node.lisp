@@ -470,7 +470,8 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                         (rpc-user nil)
                         (rpc-password nil)
                         (listen t)
-                        (listen-bind "0.0.0.0"))
+                        (listen-bind "0.0.0.0")
+                        (dbcache-mib nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -501,6 +502,13 @@ Returns the node instance."
     (enable-console-logging))
   (when log-file
     (start-file-logging log-file))
+
+  ;; UTXO cache budget (Core -dbcache). Larger = fewer LevelDB disk reads.
+  (when dbcache-mib
+    (unless (and (integerp dbcache-mib) (>= dbcache-mib 4))
+      (error "Invalid dbcache-mib: ~A. Must be an integer >= 4." dbcache-mib))
+    (setf *coins-cache-budget-bytes* (* dbcache-mib 1024 1024))
+    (log-info "UTXO coins-cache budget: ~D MiB" dbcache-mib))
 
   ;; Validate and set pruning configuration
   (setf *prune-target-mib* prune)
@@ -766,11 +774,15 @@ Returns the node instance."
    = 1h (validation.cpp:DATABASE_WRITE_INTERVAL) — we use 10 min because
    our re-validation from a checkpoint is much slower than Core's.")
 
-(defparameter +coins-cache-budget-bytes+ (* 450 1024 1024)
+(defvar *coins-cache-budget-bytes* (* 450 1024 1024)
   "Memory budget for the in-memory UTXO (coins) cache before a size-triggered
-flush. Mirrors Bitcoin Core's DEFAULT_DB_CACHE (kernel/caches.h, 450 MiB). The
-cache flushes-and-clears once its estimated usage reaches the LARGE threshold,
-bounding memory during IBD (the unbounded cache was the mainnet OOM blocker).")
+flush. Default mirrors Bitcoin Core's DEFAULT_DB_CACHE (kernel/caches.h,
+450 MiB); start-node's :dbcache-mib raises it (Core's -dbcache). A larger
+budget keeps more of the UTXO set in RAM, cutting LevelDB disk reads during
+IBD — the dominant cost once the chainstate outgrows the LevelDB table cache
+(profiled I/O-wait-bound at mainnet h~828k). The cache flushes-and-clears at
+the LARGE threshold, so memory stays bounded (the unbounded cache was the
+original mainnet OOM blocker).")
 
 (defun large-coins-cache-threshold (budget)
   "The coins-cache usage at which a periodic flush is due. Mirrors Bitcoin Core's
@@ -907,7 +919,7 @@ flush (atomic temp+fsync+rename inside save-*)."
             ;; block-count / time flushes.
             (and (node-utxo-set *node*)
                  (>= (bitcoin-lisp.storage:view-mem-bytes (node-utxo-set *node*))
-                     (large-coins-cache-threshold +coins-cache-budget-bytes+))))
+                     (large-coins-cache-threshold *coins-cache-budget-bytes*))))
     (do-flush)))
 
 (defun install-shutdown-handler ()
