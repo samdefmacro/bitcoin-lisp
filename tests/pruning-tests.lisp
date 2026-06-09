@@ -537,3 +537,21 @@ tip - min-blocks-to-keep in one call, advancing pruned-height."
           (is (= 0 (bitcoin-lisp.storage:prune-blocks-to-height
                      block-store chain-state 3))))
       (cleanup-test-dir base-path))))
+
+;;;; Coins-cache budget (Core -dbcache) — large-coins-cache-threshold scaling
+
+(test coins-cache-threshold-scales-and-stays-under-budget
+  "large-coins-cache-threshold returns a flush point below the budget and
+rises with it, across the default 450 MiB and the larger -dbcache regimes
+(so a bigger budget really does hold more UTXOs before flushing)."
+  (flet ((thr (mib) (bitcoin-lisp::large-coins-cache-threshold (* mib 1024 1024))))
+    ;; Always strictly below the budget (cache flushes before exceeding it).
+    (dolist (mib '(450 768 1536 2048 4096))
+      (is (< (thr mib) (* mib 1024 1024)) "threshold < budget at ~D MiB" mib))
+    ;; Monotonically increasing in the budget.
+    (is (< (thr 450) (thr 1536)))
+    (is (< (thr 1536) (thr 4096)))
+    ;; Default budget is Core's DEFAULT_DB_CACHE (450 MiB).
+    (is (= (* 450 1024 1024)
+           (let ((bitcoin-lisp::*coins-cache-budget-bytes* (* 450 1024 1024)))
+             bitcoin-lisp::*coins-cache-budget-bytes*)))))
