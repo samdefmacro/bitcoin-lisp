@@ -844,7 +844,8 @@ the RPC worker thread."
   "Write the full UTXO set to a snapshot file (Bitcoin Core dumptxoutset's
 shape; the file uses our own versioned encoding, NOT Core's assumeutxo format —
 loadtxoutset is unsupported). Streams entries in on-disk key order; like
-gettxoutsetinfo this forces a coins-cache flush first. Errors if PATH exists."
+gettxoutsetinfo this forces a coins-cache flush first. Errors if PATH exists.
+(loadtxoutset reads this format back.)"
   (let ((path (first params)))
     (unless (and (stringp path) (plusp (length path)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
@@ -884,6 +885,74 @@ gettxoutsetinfo this forces a coins-cache flush first. Errors if PATH exists."
         ("base_hash" . ,(if base-hash (hash-to-hex base-hash) ""))
         ("base_height" . ,base-height)
         ("path" . ,(namestring (truename path)))))))
+
+(defun rpc-loadtxoutset (node params)
+  "Load a dumptxoutset snapshot: bulk-populate the UTXO set and fast-forward
+the chainstate tip to the snapshot's base. This TRUSTS the snapshot — it does
+not re-validate the coins — so it is a bootstrap tool for our own dumps, NOT
+Bitcoin Core's assumeutxo (no background validation, no commitment check).
+PARAMS: (path). Preconditions: the snapshot's base block must already be a
+known header at its recorded height (sync headers first), and the node must
+be behind that height. Returns coins_loaded / base_hash / base_height."
+  (let ((path (first params)))
+    (unless (and (stringp path) (plusp (length path)))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
+    (unless (probe-file path)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "~A not found" path)))
+    (let* ((chain-state (rpc-get-chain-state node))
+           (utxo-set (rpc-get-utxo-set node))
+           (base-db (bitcoin-lisp.storage:coins-view-cache-base utxo-set)))
+      (unless base-db
+        (error 'rpc-error :code +rpc-misc-error+ :message "UTXO store has no LevelDB base"))
+      (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+        (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
+          (read-sequence magic in)
+          (unless (equalp magic (map '(vector (unsigned-byte 8)) #'char-code "UTXS"))
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message "Not a UTXO snapshot (bad magic)")))
+        (unless (= (bitcoin-lisp.serialization:read-uint32-le in) 1)
+          (error 'rpc-error :code +rpc-invalid-parameter+
+                            :message "Unsupported snapshot version"))
+        (let* ((base-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8))))
+                            (read-sequence h in) h))
+               (base-height (bitcoin-lisp.serialization:read-uint32-le in))
+               (count (bitcoin-lisp.serialization:read-uint32-le in))
+               (entry (bitcoin-lisp.storage:get-block-index-entry chain-state base-hash)))
+          ;; Preconditions: structurally consistent + actually a fast-forward.
+          (unless (and entry
+                       (= (bitcoin-lisp.storage:block-index-entry-height entry) base-height))
+            (error 'rpc-error :code +rpc-invalid-address-or-key+
+                              :message "Snapshot base block not in the header index at its height; sync headers first"))
+          (when (>= (bitcoin-lisp.storage:current-height chain-state) base-height)
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message "Node is already at or past the snapshot height"))
+          ;; Flush any cached coins so the bulk load writes onto a clean base.
+          (bitcoin-lisp.storage:coins-view-cache-flush utxo-set)
+          ;; Stream coins in chunked write-batches to bound memory (the
+          ;; mainnet dump is ~24M entries).
+          (let ((loaded 0) (chunk 100000))
+            (loop while (< loaded count)
+                  do (bitcoin-lisp.storage:with-coins-view-batch (batch base-db)
+                       (loop repeat chunk
+                             while (< loaded count)
+                             do (let* ((txid (let ((tx (make-array 32 :element-type '(unsigned-byte 8))))
+                                               (read-sequence tx in) tx))
+                                       (vout (bitcoin-lisp.serialization:read-uint32-le in))
+                                       (vlen (bitcoin-lisp.serialization:read-compact-size in))
+                                       (vbytes (bitcoin-lisp.serialization:read-bytes in vlen)))
+                                  (bitcoin-lisp.storage:coins-view-batch-put
+                                   batch
+                                   (bitcoin-lisp.storage::make-utxo-key txid vout)
+                                   (bitcoin-lisp.storage::decode-coin-value vbytes))
+                                  (incf loaded)))))
+            ;; Fast-forward the tip to the snapshot base.
+            (bitcoin-lisp.storage:update-chain-tip chain-state base-hash base-height)
+            (bitcoin-lisp::node-log :info "RPC loadtxoutset: loaded ~D coins, tip -> h=~D" loaded base-height)
+            `(("coins_loaded" . ,loaded)
+              ("base_hash" . ,(hash-to-hex base-hash))
+              ("base_height" . ,base-height)
+              ("tip_height" . ,(bitcoin-lisp.storage:current-height chain-state)))))))))
 
 ;;; --- Mempool persistence (Bitcoin Core savemempool) ---
 
