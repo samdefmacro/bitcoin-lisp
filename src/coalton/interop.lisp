@@ -2016,10 +2016,18 @@ Used to remove the signature being verified from the scriptCode before sighash."
            ;; where it stays NIL).
            (subscript-for-hash nil)
            (sighash (cond
-                      ;; P2WSH: BIP 143 sighash — no FindAndDelete (BIP 143 spec)
-                      ;; Use *current-script-code* with OP_CODESEPARATOR bytes removed
+                      ;; P2WSH: BIP 143 sighash. scriptCode is the witnessScript
+                      ;; truncated at the last EXECUTED OP_CODESEPARATOR (the engine
+                      ;; rewrites *current-script-code* when it executes one) — and
+                      ;; NOTHING else: remaining 0xab bytes are kept. Stripping them
+                      ;; (legacy SerializeScriptCode behavior) computed a wrong
+                      ;; sighash for any witnessScript carrying a codeseparator in
+                      ;; an unexecuted branch — mainnet block 851,912 tx 1871 halted
+                      ;; the first IBD run on exactly this. Core: interpreter.cpp
+                      ;; FindAndDelete/codesep-skip are SigVersion::BASE only;
+                      ;; WITNESS_V0 serializes scriptCode as-is (BIP143).
                       ((and *witness-v0-mode* *current-tx*)
-                       (setf subscript-for-hash (remove-codeseparator subscript-raw))
+                       (setf subscript-for-hash subscript-raw)
                        (compute-bip143-sighash subscript-for-hash
                                                *witness-input-amount*
                                                sighash-type))
@@ -2562,8 +2570,10 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
       (unless (valid-pubkey-format-p pubkey-bytes)
         (return-from verify-checksig-witness (values nil :pubkeytype))))
 
-    ;; Compute BIP 143 sighash
-    (let* ((sighash (compute-bip143-sighash (remove-codeseparator script-code) amount sighash-type))
+    ;; Compute BIP 143 sighash. scriptCode as-is — v0 never strips
+    ;; codeseparator bytes (see verify-checksig's v0 branch); for the
+    ;; P2WPKH callers the constructed P2PKH scriptCode has none anyway.
+    (let* ((sighash (compute-bip143-sighash script-code amount sighash-type))
           (require-low-s (flag-enabled-p "LOW_S")))
       (multiple-value-bind (result status)
           (cached-verify-ecdsa sighash der-sig pubkey-bytes
