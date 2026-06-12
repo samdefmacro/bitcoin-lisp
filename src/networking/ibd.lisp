@@ -98,6 +98,11 @@ block-hash-key-hash. Falls back to plain equalp off SBCL."
   (in-flight (make-block-hash-table) :type hash-table)       ; hash -> (peer . timestamp)
   (block-queue (make-hash-table :test 'eql) :type hash-table)  ; height -> (block . wire-bytes), out-of-order
   (block-queue-bytes 0 :type integer)  ; sum of queued wire-bytes (see +max-block-queue-bytes+)
+  ;; Exponential moving average of received block wire sizes. Seeds at 1MB
+  ;; (safe both ways: modern blocks ~1-2MB; early-chain blocks correct it
+  ;; downward within seconds). Drives the byte-aware request window in
+  ;; get-next-blocks-to-request.
+  (avg-block-wire-bytes (* 1024 1024) :type integer)
   ;; Per-pending-hash timeout count. retry-timed-out-requests bumps the
   ;; counter each time a request for this hash times out; after
   ;; +max-block-request-timeouts+, the block is dropped from pending
@@ -660,7 +665,19 @@ that don't construct a chain-state)."
   (unless *ibd-context*
     (return-from get-next-blocks-to-request nil))
 
-  (let* ((max-request-height (when tip-height (+ tip-height +max-block-queue-size+)))
+  (let* (;; Byte-aware window: never request further ahead than the
+         ;; byte-capped queue can hold. With 2024-era ~1.5MB blocks the
+         ;; 256MB cap fits ~170 blocks, far below the 1024 count window —
+         ;; requesting the full count window stuffed peers' send queues
+         ;; with far-ahead blocks that were dropped at the cap on arrival,
+         ;; serializing the tip on multi-minute deliveries (observed live
+         ;; at h~851.7k post-restart: p50 latency 178s, ~1 block/min).
+         ;; Floor of 32 keeps the pipeline parallel even for huge blocks.
+         (window (min +max-block-queue-size+
+                      (max 32 (floor +max-block-queue-bytes+
+                                     (max 1 (ibd-context-avg-block-wire-bytes
+                                             *ibd-context*))))))
+         (max-request-height (when tip-height (+ tip-height window)))
          (pending (ibd-context-pending-blocks *ibd-context*))
          (in-flight (ibd-context-in-flight *ibd-context*))
          (available '()))
@@ -680,6 +697,13 @@ that don't construct a chain-state)."
     ;; Sort by height and take first N
     (let ((sorted (sort available #'< :key #'cdr)))
       (mapcar #'car (subseq sorted 0 (min n (length sorted)))))))
+
+(defun note-block-wire-size (ctx wire-size)
+  "Fold WIRE-SIZE into the context's moving average of block sizes
+(0.9 old + 0.1 new, integer EMA). Ignores zero (unknown) sizes."
+  (when (plusp wire-size)
+    (setf (ibd-context-avg-block-wire-bytes ctx)
+          (floor (+ (* 9 (ibd-context-avg-block-wire-bytes ctx)) wire-size) 10))))
 
 (defun mark-block-in-flight (hash peer)
   "Mark a block as being requested from PEER."
@@ -906,15 +930,21 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
       (bitcoin-lisp:log-warn "Released ~D in-flight blocks from disconnected peers" orphaned)))
   ;; Near the tip (fork-recovery zone), use the shorter +block-stalling-timeout+
   ;; so a silent peer's block is retried elsewhere in ~30s instead of ~125s.
-  ;; Far from tip (bulk IBD), the full adaptive timeout stands.
+  ;; Far from tip (bulk IBD), the full adaptive timeout stands — EXCEPT when
+  ;; the block queue is saturated: there progress is serialized on the few
+  ;; blocks just above the tip, so a slow peer holding one of them stalls
+  ;; everything (Core disconnects such a peer after BLOCK_STALLING_TIMEOUT,
+  ;; net_processing.cpp:5436). Use the short timeout to re-route fast.
   (let* ((near-tip (<= (- (ibd-context-header-tip-height *ibd-context*)
                           (bitcoin-lisp.storage:current-height chain-state))
                        +stalling-near-tip-margin+))
-         (timeout (and near-tip +block-stalling-timeout+))
+         (queue-saturated (>= (ibd-context-block-queue-bytes *ibd-context*)
+                              +max-block-queue-bytes+))
+         (timeout (and (or near-tip queue-saturated) +block-stalling-timeout+))
          (retried (retry-timed-out-requests peers timeout)))
     (when (> retried 0)
-      (bitcoin-lisp:log-warn "Retrying ~D timed out block requests~:[~; (near-tip)~]"
-                             retried near-tip)))
+      (bitcoin-lisp:log-warn "Retrying ~D timed out block requests~:[~; (short timeout)~]"
+                             retried timeout)))
 
   ;; Backpressure: cap NEW requests so block-queue + in-flight stays bounded.
   ;; When at cap and the next-needed block is missing, only allow ONE request
@@ -1611,6 +1641,8 @@ After connecting, drains the queue of any children that can now be connected."
          (hash (bitcoin-lisp.serialization:block-header-hash header))
          (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash))
          (mempool (and *ibd-context* (ibd-context-mempool *ibd-context*))))
+    (when *ibd-context*
+      (note-block-wire-size *ibd-context* wire-size))
 
     (unless entry
       (bitcoin-lisp:log-warn "Received unknown block ~A"
