@@ -162,6 +162,77 @@
     (is (= 1 (bitcoin-lisp.networking::ibd-context-blocks-received
               bitcoin-lisp.networking::*ibd-context*)))))
 
+;;;; Byte-aware request window
+;;;;
+;;;; The request lookahead must never exceed what the byte-capped block
+;;;; queue can hold (+max-block-queue-bytes+ / avg block wire size).
+;;;; Regression for 2026-06-12 mainnet h~851.7k: the 1024-count window
+;;;; vs the ~170-block byte capacity stuffed peers' send queues with
+;;;; far-ahead 2MB blocks that were dropped at the cap on arrival,
+;;;; serializing the tip on multi-minute deliveries (~1 block/min).
+
+(defun %plant-pending (heights)
+  "Add one pending block per height in HEIGHTS, hash derived from height."
+  (let ((pending (bitcoin-lisp.networking::ibd-context-pending-blocks
+                  bitcoin-lisp.networking::*ibd-context*)))
+    (dolist (h heights)
+      (let ((hash (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 0)))
+        (setf (aref hash 0) (ldb (byte 8 0) h)
+              (aref hash 1) (ldb (byte 8 8) h)
+              (aref hash 2) (ldb (byte 8 16) h))
+        (setf (gethash hash pending) h)))))
+
+(test request-window-clamped-by-byte-cap
+  "With the default 1MB avg block size, the window is byte-cap/1MB = 256
+blocks, far below the 1024 count window."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
+    (%plant-pending '(150 356 357 1100))
+    (let ((heights (mapcar (lambda (hash)
+                             (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
+                                            bitcoin-lisp.networking::*ibd-context*)))
+                           (bitcoin-lisp.networking::get-next-blocks-to-request 10 100))))
+      ;; tip 100 + window 256 = 356: heights 150 and 356 in, 357/1100 out
+      (is (equal '(150 356) (sort heights #'<))))))
+
+(test request-window-expands-for-small-blocks
+  "With tiny historic blocks the byte capacity exceeds 1024, so the
+count window is the binding limit again."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
+    (setf (bitcoin-lisp.networking::ibd-context-avg-block-wire-bytes
+           bitcoin-lisp.networking::*ibd-context*)
+          1024)                         ; 1KB blocks -> capacity 262144
+    (%plant-pending (list (+ 100 bitcoin-lisp.networking::+max-block-queue-size+)
+                          (+ 101 bitcoin-lisp.networking::+max-block-queue-size+)))
+    (is (= 1 (length (bitcoin-lisp.networking::get-next-blocks-to-request 10 100))))))
+
+(test request-window-floor-keeps-pipeline-alive
+  "Even with absurdly large blocks the window never shrinks below 32."
+  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
+    (setf (bitcoin-lisp.networking::ibd-context-avg-block-wire-bytes
+           bitcoin-lisp.networking::*ibd-context*)
+          (* 64 1024 1024))             ; 64MB avg -> raw capacity 4
+    (%plant-pending '(132 133))
+    (let ((heights (mapcar (lambda (hash)
+                             (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
+                                            bitcoin-lisp.networking::*ibd-context*)))
+                           (bitcoin-lisp.networking::get-next-blocks-to-request 10 100))))
+      ;; tip 100 + floor 32 = 132: height 132 in, 133 out
+      (is (equal '(132) heights)))))
+
+(test note-block-wire-size-ema
+  "note-block-wire-size folds sizes in as a 0.9/0.1 integer EMA and
+ignores zero (unknown) sizes."
+  (let ((ctx (bitcoin-lisp.networking::make-ibd)))
+    (is (= (* 1024 1024)
+           (bitcoin-lisp.networking::ibd-context-avg-block-wire-bytes ctx)))
+    (bitcoin-lisp.networking::note-block-wire-size ctx (* 2 1024 1024))
+    (is (= (floor (+ (* 9 1048576) 2097152) 10)
+           (bitcoin-lisp.networking::ibd-context-avg-block-wire-bytes ctx)))
+    (let ((before (bitcoin-lisp.networking::ibd-context-avg-block-wire-bytes ctx)))
+      (bitcoin-lisp.networking::note-block-wire-size ctx 0)
+      (is (= before (bitcoin-lisp.networking::ibd-context-avg-block-wire-bytes ctx))))))
+
 ;;;; STUCK TIP detection
 ;;;;
 ;;;; check-stuck-tip is the OOM-prevention backstop. It must fire when
