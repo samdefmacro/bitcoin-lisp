@@ -1069,3 +1069,30 @@ rejected as :bad-prevout-null, matching Core (not our old :bad-coinbase-mixed)."
        (%tx-with-inputs (list (%normal-input 9) (%normal-input 10))))
     (is (eq t valid))
     (is (null error))))
+
+;;;; BIP143 scriptCode with OP_CODESEPARATOR (mainnet block 851,912 regression)
+
+(test bip143-codeseparator-in-unexecuted-branch
+  "Real mainnet tx ba1f57..c525 (block 851,912, tx-idx 1871): P2WSH spend
+whose witnessScript carries an OP_CODESEPARATOR in the NOT-executed ELSE
+branch. BIP143's scriptCode is the witnessScript truncated only at the last
+EXECUTED codeseparator — remaining 0xab bytes are KEPT (no legacy-style
+stripping in WITNESS_V0; Core SignatureHash serializes scriptCode as-is).
+Our sighash stripped them, rejecting this block and halting the first
+mainnet IBD for two days. The full signed tx must validate."
+  (let* ((tx-hex "020000000001011e034f218450484dfc5878aace0a3294992e2af8423eb27a85f1ac1076bdeb6d0000000000510140000116f20000000000001600141c47dfb4fbdd0b086e47894869d0384203b2af8a0247304402201cd90e91b4218c03805ab659bc9564ebd0aef6abaef31e16443f36323287ab220220366baf4691f191984dc444c5eef66bcdf2af4d296d8f3469b9041107b5dd794e017a210325d1273fbb0409431d81cffcea2e7e5e56bae503924125a4225e3a125c79ae9c74528763ad03510140b267abad82014088a820996681beddd16d3b8d4a59f4f2e19cfccd96c1a990c5e62ebc333fb5528b983988210262c91ebb0a5e66f7577acbc84fcdf7f8b9a1e517cb3f02a01ae20300fb52827aac6800000000")
+         (tx (bitcoin-lisp.serialization:br-read-transaction
+              (bitcoin-lisp.serialization:make-byte-reader-from
+               (bitcoin-lisp.crypto:hex-to-bytes tx-hex))))
+         (prev-txid (bitcoin-lisp.serialization:outpoint-hash
+                     (bitcoin-lisp.serialization:tx-in-previous-output
+                      (aref (bitcoin-lisp.serialization:transaction-inputs tx) 0))))
+         (spk (bitcoin-lisp.crypto:hex-to-bytes
+               "0020bc3c8483b31b1431e42d886782a4b3e0c73a094f44260c42da1d41c003c95da7"))
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set)))
+    (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 63383 spk 851000)
+    (let ((bitcoin-lisp:*network* :mainnet))
+      (multiple-value-bind (ok failed-idx)
+          (bitcoin-lisp.validation:validate-transaction-scripts
+           tx utxo-set :height 851912)
+        (is (eq t ok) "input ~A failed script validation" failed-idx)))))
