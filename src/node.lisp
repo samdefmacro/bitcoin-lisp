@@ -366,12 +366,9 @@ last. Corrupt or missing files are ignored."
                   (declare (ignore error))
                   (cond
                     (valid
-                     (dolist (rt replaced)
-                       (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
-                     (if (eq :ok (bitcoin-lisp.mempool:mempool-add
-                                  mempool txid
-                                  (bitcoin-lisp.mempool:make-entry-from-tx
-                                   tx fee height :entry-time entry-time)))
+                     (if (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+                                  mempool txid tx fee height
+                                  :entry-time entry-time :replaced replaced))
                          (incf accepted)
                          (incf failed)))
                     (t (incf failed)))))))

@@ -159,14 +159,12 @@ real mempool."
         (package-tx-result-error res) reason))
 
 (defun %accept-into-mempool (tx txid fee height now mempool rset replaced)
-  "Evict any RBF-replaced txs in RSET (recording them in the REPLACED hash-set)
-then add TX to the mempool. Returns the mempool-add result keyword."
+  "Record the RBF-replaced txs in RSET into the REPLACED hash-set, then run
+the shared evict+add tail. Returns the mempool-add result keyword."
   (dolist (rt rset)
-    (setf (gethash rt replaced) t)
-    (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
-  (bitcoin-lisp.mempool:mempool-add
-   mempool txid
-   (bitcoin-lisp.mempool:make-entry-from-tx tx (or fee 0) height :entry-time now)))
+    (setf (gethash rt replaced) t))
+  (values (bitcoin-lisp.mempool:accept-validated-tx
+           mempool txid tx fee height :entry-time now :replaced rset)))
 
 (defun %results-not-validated (package reason)
   "A not-validated result for every tx in PACKAGE — used when a context-free
