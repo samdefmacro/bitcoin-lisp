@@ -167,6 +167,21 @@ cells and `delivery-samples` (time peer-address latency-ms) lists."
 (defvar *ibd-context* nil
   "Current IBD context.")
 
+(defvar *ibd-stop-requested* nil
+  "Set by stop-node (via request-ibd-stop) when the process is shutting
+down. The IBD inner loops poll it so a TERM exits the sync thread within
+seconds instead of running until the pending queue drains — both June
+2026 mainnet deploys hung in run-ibd after \"Stopping node...\" and
+needed a verified-safe SIGKILL.")
+
+(defun request-ibd-stop ()
+  "Ask the IBD loops to exit at the next check point."
+  (setf *ibd-stop-requested* t))
+
+(defun reset-ibd-stop ()
+  "Clear a previous stop request (called at node start)."
+  (setf *ibd-stop-requested* nil))
+
 (defvar *ibd-gap-only-mode* nil
   "Set by request-blocks-from-peers when the queue is at cap and the
    next-needed block is missing. In this mode the block-request budget
@@ -365,14 +380,24 @@ saw 3 STUCK TIP cycles before a 13-block reorg finally completed)."
     (let* ((last-time (ibd-context-last-tip-advance-time *ibd-context*))
            (queue-size (hash-table-count
                         (ibd-context-block-queue *ibd-context*)))
-           (near-cap-threshold (floor (* +max-block-queue-size+ 9/10))))
+           (queue-bytes (ibd-context-block-queue-bytes *ibd-context*))
+           ;; Near-cap on EITHER axis: the 256MB byte cap pins the count
+           ;; at ~170 modern 1.5MB blocks — far below 90% of the 1024
+           ;; count cap — so a count-only check never fired during the
+           ;; June 2026 two-day stall at h=851,912; the node retried
+           ;; forever instead of halting as designed.
+           (near-cap (or (>= queue-size
+                             (floor (* +max-block-queue-size+ 9/10)))
+                         (>= queue-bytes
+                             (floor (* +max-block-queue-bytes+ 9/10))))))
       (when (and (plusp last-time)
-                 (>= queue-size near-cap-threshold)
+                 near-cap
                  (> (- (get-universal-time) last-time)
                     +stuck-tip-halt-seconds+))
         (bitcoin-lisp:log-error
-         "STUCK TIP: connect-tip has not advanced in ~D seconds; ~D blocks queued (cap ~D). Halting IBD to avoid OOM. Investigate validator."
-         (- (get-universal-time) last-time) queue-size +max-block-queue-size+)
+         "STUCK TIP: connect-tip has not advanced in ~D seconds; ~D blocks / ~DMB queued. Halting IBD to avoid OOM. Investigate validator."
+         (- (get-universal-time) last-time) queue-size
+         (floor queue-bytes 1048576))
         t))))
 
 (defun make-ibd ()
@@ -1266,6 +1291,11 @@ disconnects it so replace-disconnected-peers can refill the slot."
         ;; pull all queued messages in the batch without ever timing out
         ;; mid-payload, then exit immediately when nothing is left to read.
         (loop repeat +max-messages-per-peer-per-cycle+
+              ;; Stop check per message, not just per outer-loop pass: a
+              ;; full drain is up to 32 messages x block validation each
+              ;; (~0.1-2s), so without this a TERM waits out the whole
+              ;; batch for every peer before run-ibd's check fires.
+              while (not *ibd-stop-requested*)
               ;; Re-check liveness every iteration: a mid-drain dispatch can
               ;; disconnect the peer (rate-limit, oversized payload), NILing
               ;; the connection or flipping connection-connected — both of
@@ -1370,6 +1400,9 @@ Returns the number of blocks downloaded."
                        (< (bitcoin-lisp.storage:current-height chain-state)
                           (ibd-context-header-tip-height ctx)))
             do (progn
+                 (when *ibd-stop-requested*
+                   (return))
+
                  ;; Stuck-tip backstop: if connect-tip hasn't advanced for
                  ;; +stuck-tip-halt-seconds+ AND blocks are queued, halt
                  ;; cleanly instead of growing the queue until OOM.
@@ -1536,7 +1569,7 @@ the signal run-ibd uses to rotate to another header-sync peer."
                    (error () nil)))
                (unless command (return))))
 
-    (loop until done
+    (loop until (or done *ibd-stop-requested*)
           do (progn
                ;; Request headers using header-tip-aware locator
                (request-headers-for-ibd peer chain-state)
@@ -1548,7 +1581,8 @@ the signal run-ibd uses to rotate to another header-sync peer."
                ;; Wait for headers response, handling other messages
                (let ((got-headers nil)
                      (attempts 0))
-                 (loop while (and (not got-headers) (< attempts 30))
+                 (loop while (and (not got-headers) (< attempts 30)
+                                  (not *ibd-stop-requested*))
                        do (multiple-value-bind (command payload)
                               (receive-message peer :timeout 5)
                             (incf attempts)
@@ -1619,6 +1653,8 @@ Fixes the single-peer header-sync freeze: run-ibd previously synced from one
 peer chosen by start-height (frozen at handshake), with no failover — a quiet
 or dead-fork peer was re-picked every cycle and pinned the tip for hours."
   (dolist (peer (sort (copy-list peers) #'> :key #'peer-start-height) nil)
+    (when *ibd-stop-requested*
+      (return nil))
     (when (eq (peer-state peer) :ready)
       (setf (ibd-context-header-sync-peer ctx) peer)
       (multiple-value-bind (count stalled)
@@ -1794,6 +1830,13 @@ Repeats until no more queued blocks can be connected."
         (checkpoint-height (last-checkpoint-height))
         (mempool (ibd-context-mempool *ibd-context*)))
     (loop
+      ;; A full cascade can connect the whole queued window (~170 blocks
+      ;; x ~0.1-2s validation) from one received block; poll the stop
+      ;; flag per connect so shutdown isn't held for the entire run.
+      ;; Stopping between connects is safe: activate-block updates UTXO
+      ;; set + tip atomically and the shutdown flush persists the tip.
+      (when *ibd-stop-requested*
+        (return drained))
       (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
              (next-height (1+ current-height))
              (queue (ibd-context-block-queue *ibd-context*))
