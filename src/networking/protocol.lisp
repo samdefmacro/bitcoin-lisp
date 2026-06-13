@@ -426,19 +426,17 @@ and recurse on newly-accepted txs so a parent can unblock a whole chain."
                      otx utxo-set mempool current-height)
                   (cond
                     (valid
-                     (dolist (rt replaced)
-                       (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
-                     (let* ((entry (bitcoin-lisp.mempool:make-entry-from-tx
-                                    otx fee current-height
-                                    :entry-time (bitcoin-lisp.serialization:get-unix-time)))
-                            (vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
-                       (when (eq :ok (bitcoin-lisp.mempool:mempool-add mempool otxid entry))
+                     (multiple-value-bind (result entry)
+                         (bitcoin-lisp.mempool:accept-validated-tx
+                          mempool otxid otx fee current-height :replaced replaced)
+                       (when (eq :ok result)
                          (bitcoin-lisp.mempool:orphan-remove pool otxid)
                          (when peers
-                           (relay-transaction
-                            otxid nil peers
-                            :fee-rate (if (plusp vsize) (floor fee vsize) 0)
-                            :wtxid (bitcoin-lisp.serialization:transaction-wtxid otx)))
+                           (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
+                             (relay-transaction
+                              otxid nil peers
+                              :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                              :wtxid (bitcoin-lisp.serialization:transaction-wtxid otx))))
                          (push otxid work))))   ; cascade to this tx's dependents
                     ((eq error :missing-input) nil)   ; still missing another parent
                     (t (bitcoin-lisp.mempool:orphan-remove pool otxid)  ; now invalid
@@ -502,23 +500,18 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                                            :output-too-large :total-output-too-large))
                        (record-misbehavior peer 10)))))
                 (when valid
-                  ;; BIP125: evict the transactions this one replaces first.
-                  (dolist (rt replaced)
-                    (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
-                  ;; Add to mempool
-                  (let* ((entry (bitcoin-lisp.mempool:make-entry-from-tx
-                                 tx fee current-height
-                                 :entry-time (bitcoin-lisp.serialization:get-unix-time)))
-                         (vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry))
-                         (result (bitcoin-lisp.mempool:mempool-add mempool txid entry)))
+                  (multiple-value-bind (result entry)
+                      (bitcoin-lisp.mempool:accept-validated-tx
+                       mempool txid tx fee current-height :replaced replaced)
                     (when (eq result :ok)
                       ;; Relay to other peers
                       (when peers
-                        (relay-transaction txid peer peers
-                                           :fee-rate (if (plusp vsize)
-                                                         (floor fee vsize)
-                                                         0)
-                                           :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+                        (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
+                          (relay-transaction txid peer peers
+                                             :fee-rate (if (plusp vsize)
+                                                           (floor fee vsize)
+                                                           0)
+                                             :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))))
                       ;; De-orphan: this tx may unblock waiting children.
                       (process-orphans txid utxo-set mempool chain-state peers
                                        :recent-rejects recent-rejects)))))))))

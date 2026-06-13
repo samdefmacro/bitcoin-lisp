@@ -548,14 +548,9 @@ anything to the mempool. Each tx is checked independently against current state
             (unless valid
               (error 'rpc-error :code +rpc-misc-error+
                                 :message (format nil "Transaction rejected: ~A" error)))
-            ;; BIP125: evict replaced transactions before adding.
-            (dolist (rt replaced)
-              (bitcoin-lisp.mempool:mempool-remove-recursive mempool rt))
-            ;; Add to mempool
-            (let* ((entry (bitcoin-lisp.mempool:make-entry-from-tx
-                           tx (or fee 0) current-height
-                           :entry-time (bitcoin-lisp.serialization:get-unix-time)))
-                   (add-result (bitcoin-lisp.mempool:mempool-add mempool txid entry)))
+            (let ((add-result (bitcoin-lisp.mempool:accept-validated-tx
+                               mempool txid tx fee current-height
+                               :replaced replaced)))
               (unless (eq add-result :ok)
                 (error 'rpc-error :code +rpc-misc-error+
                                   :message (format nil "Mempool rejection: ~A" add-result)))
