@@ -36,6 +36,43 @@ INPUT-ID controls the prev outpoint hash byte, creating distinct inputs."
   "Create a mempool entry for a test transaction (computes size/vsize/wtxid)."
   (bitcoin-lisp.mempool:make-entry-from-tx tx fee 0 :entry-time 1000000))
 
+;;;; Shared acceptance tail (accept-validated-tx)
+;;;;
+;;;; The evict-replaced + build-entry + mempool-add sequence used to be
+;;;; inlined at six call sites (peer tx handler, orphan cascade,
+;;;; sendrawtransaction, mempool.dat reload, reorg re-add, submitpackage)
+;;;; and had started to drift. accept-validated-tx is the single tail.
+
+(test accept-validated-tx-evicts-replaced-and-adds
+  "Accepting with :replaced evicts the RBF'd tx and adds the new one,
+returning (values :ok entry)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (old-tx (make-mempool-test-tx :input-id 1))
+         (old-txid (bitcoin-lisp.serialization:transaction-hash old-tx))
+         (new-tx (make-mempool-test-tx :input-id 2))
+         (new-txid (bitcoin-lisp.serialization:transaction-hash new-tx)))
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                 mempool old-txid (make-mempool-entry-for-tx old-tx))))
+    (multiple-value-bind (result entry)
+        (bitcoin-lisp.mempool:accept-validated-tx
+         mempool new-txid new-tx 15000 0
+         :entry-time 1000001 :replaced (list old-txid))
+      (is (eq :ok result))
+      (is (= 15000 (bitcoin-lisp.mempool:mempool-entry-fee entry)))
+      (is (= 1000001 (bitcoin-lisp.mempool:mempool-entry-entry-time entry))))
+    (is (null (bitcoin-lisp.mempool:mempool-get mempool old-txid)))
+    (is (bitcoin-lisp.mempool:mempool-get mempool new-txid))))
+
+(test accept-validated-tx-nil-fee-defaults-to-zero
+  "A NIL fee is folded to 0 rather than poisoning entry arithmetic."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 3))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+    (multiple-value-bind (result entry)
+        (bitcoin-lisp.mempool:accept-validated-tx mempool txid tx nil 0)
+      (is (eq :ok result))
+      (is (= 0 (bitcoin-lisp.mempool:mempool-entry-fee entry))))))
+
 ;;;; Prioritisation tests (Core PrioritiseTransaction / mapDeltas)
 
 (test mempool-prioritise-in-mempool

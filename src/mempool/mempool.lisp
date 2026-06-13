@@ -328,6 +328,20 @@ keeps it within ancestor and descendant limits. Returns (values ok-p reason)."
                (when ce (remhash txid (mempool-entry-parents ce)))))
            (mempool-entry-children entry)))
 
+(defun accept-validated-tx (mempool txid tx fee height
+                            &key (entry-time
+                                  (bitcoin-lisp.serialization:get-unix-time))
+                                 replaced)
+  "The shared tail of every mempool acceptance path (peer tx handler,
+orphan cascade, sendrawtransaction, mempool.dat reload, reorg re-add,
+submitpackage): evict the BIP125 REPLACED txids, build the entry for TX,
+add it. Caller has already run validate-transaction-for-mempool. Returns
+(values result entry) where RESULT is mempool-add's keyword."
+  (dolist (rt replaced)
+    (mempool-remove-recursive mempool rt))
+  (let ((entry (make-entry-from-tx tx (or fee 0) height :entry-time entry-time)))
+    (values (mempool-add mempool txid entry) entry)))
+
 (defun mempool-add (mempool txid entry)
   "Add a transaction to the mempool.
 Returns :ok on success, or a keyword indicating the rejection reason."
