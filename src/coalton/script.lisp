@@ -2029,24 +2029,37 @@
                 (match (stack-pop stack1)
                   ((None) (ScriptErr SE-StackUnderflow))
                   ((Some (Tuple n-bytes stack2))
-                   (match (stack-pop stack2)
-                     ((None) (ScriptErr SE-StackUnderflow))
-                     ((Some (Tuple sig new-stack))
-                      ;; Verify signature and compute result (BIP 342)
-                      (let ((result (tapscript-verify-sig-status sig pubkey)))
-                        (cond
-                          ((== result 0)
-                           (ScriptOk (context-with-main-stack
-                                      (stack-push n-bytes new-stack) ctx)))
-                          ((or (== result 1) (== result 3))
-                           (let ((n-plus-1 (lisp (Vector U8) (n-bytes)
-                                             (cl:funcall (cl:fdefinition (cl:intern "INCREMENT-SCRIPT-NUMBER" "BITCOIN-LISP.COALTON.INTEROP")) n-bytes))))
-                             (ScriptOk (context-with-main-stack
-                                        (stack-push n-plus-1 new-stack) ctx))))
-                          ((== result 4) (ScriptErr SE-VerifyFailed))
-                          ((== result 5) (ScriptErr SE-DiscourageUpgradablePubkeyType))
-                          ((== result 6) (ScriptErr SE-TapscriptValidationWeight))
-                          (True (ScriptErr SE-TapscriptInvalidSig)))))))))))))
+                   ;; The n operand is a CScriptNum: at most 4 bytes (and minimally
+                   ;; encoded under MINIMALDATA), exactly like Core's
+                   ;; CScriptNum(stacktop(-2), fRequireMinimal) which throws on a
+                   ;; >4-byte operand (interpreter.cpp:1093). Without this bound a
+                   ;; >4-byte n was accepted here but rejected by Core — a tapscript
+                   ;; consensus split.
+                   (match (bytes-to-script-num-limited n-bytes 4)
+                     ((ScriptErr e) (ScriptErr e))
+                     ((ScriptOk num)
+                      (match (stack-pop stack2)
+                        ((None) (ScriptErr SE-StackUnderflow))
+                        ((Some (Tuple sig new-stack))
+                         ;; Verify signature and compute result (BIP 342)
+                         (let ((result (tapscript-verify-sig-status sig pubkey)))
+                           (cond
+                             ;; Empty sig: push n unchanged (Core: num + 0),
+                             ;; minimally re-encoded like Core's num.getvch().
+                             ((== result 0)
+                              (ScriptOk (context-with-main-stack
+                                         (stack-push (script-num-to-bytes num) new-stack) ctx)))
+                             ;; Valid sig: push n + 1 (Core: num + 1).
+                             ((or (== result 1) (== result 3))
+                              (ScriptOk (context-with-main-stack
+                                         (stack-push (script-num-to-bytes
+                                                      (ScriptNum (+ (script-num-value num) 1)))
+                                                     new-stack)
+                                         ctx)))
+                             ((== result 4) (ScriptErr SE-VerifyFailed))
+                             ((== result 5) (ScriptErr SE-DiscourageUpgradablePubkeyType))
+                             ((== result 6) (ScriptErr SE-TapscriptValidationWeight))
+                             (True (ScriptErr SE-TapscriptInvalidSig)))))))))))))))
 
       ;; Timelocks and NOP1-10
       ;; NOP1 and NOP4-10 are true no-ops unless DISCOURAGE_UPGRADABLE_NOPS flag is set

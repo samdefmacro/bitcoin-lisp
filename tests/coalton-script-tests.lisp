@@ -183,6 +183,30 @@
   "Get the depth of a stack."
   (bitcoin-lisp.coalton.script:stack-depth stack))
 
+(test checksigadd-n-operand-4-byte-bound
+  "BIP342 OP_CHECKSIGADD's n operand is a CScriptNum: at most 4 bytes,
+matching Core's CScriptNum(stacktop(-2), fRequireMinimal) which throws on a
+>4-byte operand (a tapscript consensus split before this bound was added).
+The bound is checked before signature verification, so an empty sig + dummy
+x-only pubkey isolate it: a 5-byte n fails with SE-NumberOverflow."
+  (flet ((checksigadd-script (n-push)
+           ;; OP_0 (empty sig) ; <n-push> ; push 32-byte pubkey ; OP_CHECKSIGADD.
+           ;; Plain element-type-T vectors, as Coalton execute-script expects
+           ;; (Vector U8) and the other execute-script tests pass literal #(...).
+           (concatenate 'vector
+                        #(#x00)
+                        n-push
+                        (coerce (cons #x20 (make-list 32 :initial-element 2)) 'vector)
+                        #(#xba))))
+    (bitcoin-lisp.coalton.interop:set-script-flags "TAPSCRIPT")
+    (unwind-protect
+         ;; 5-byte n: rejected by the bound (SE-NumberOverflow, logged by the
+         ;; engine). script-err-p is the stable assertion; the error value is a
+         ;; Coalton enum instance, not a CL symbol, so we don't eq-compare it.
+         (is-true (script-err-p
+                   (call-execute-script (checksigadd-script #(#x05 1 2 3 4 5)))))
+      (bitcoin-lisp.coalton.interop:set-script-flags nil))))
+
 (test execute-script-op-0
   "OP_0 pushes empty vector."
   (let ((result (call-execute-script #(0))))
