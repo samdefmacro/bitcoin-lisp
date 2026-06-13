@@ -275,6 +275,24 @@ rotation each cycle, slowing recovery."
           (- (get-universal-time) 600))
     (is (null (bitcoin-lisp.networking::check-stuck-tip)))))
 
+(test stuck-tip-fires-on-byte-cap
+  "Regression for the June 2026 two-day stall at h=851,912: the byte cap
+pins the queue count at ~170 modern blocks, far below 90% of the 1024
+count cap, so a count-only near-cap check never fired. The halt must
+also trigger when queue BYTES are near +max-block-queue-bytes+."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd))
+         (bitcoin-lisp.networking::*ibd-context* ctx))
+    ;; Small count (150 entries), bytes at the cap
+    (let ((q (bitcoin-lisp.networking::ibd-context-block-queue ctx)))
+      (loop for i from 0 below 150
+            do (setf (gethash i q) i)))
+    (setf (bitcoin-lisp.networking::ibd-context-block-queue-bytes ctx)
+          bitcoin-lisp.networking::+max-block-queue-bytes+)
+    (setf (bitcoin-lisp.networking::ibd-context-last-tip-advance-time ctx)
+          (- (get-universal-time)
+             (1+ bitcoin-lisp.networking::+stuck-tip-halt-seconds+)))
+    (is (eq t (bitcoin-lisp.networking::check-stuck-tip)))))
+
 (test stuck-tip-does-not-fire-when-tip-fresh
   "If tip advanced recently, check-stuck-tip never fires regardless of
 queue size."
@@ -851,3 +869,40 @@ order and rotates past any that STALL, stopping at the first that answers."
     (bitcoin-lisp.networking::sync-headers-with-failover
      (list ready dead) nil ctx :sync-fn sync-fn)
     (is (equal (list ready) (nreverse tried)))))
+
+;;;; Shutdown stop flag
+;;;;
+;;;; Both June 2026 mainnet deploys hung after "Stopping node...": TERM
+;;;; flips node-running but run-ibd's inner loops never checked it and
+;;;; ran until SIGKILL. *ibd-stop-requested* (set by stop-node via
+;;;; request-ibd-stop) must make the IBD loops exit within seconds.
+
+(test header-sync-failover-honors-stop-request
+  "With a stop requested, the rotation exits before trying any peer."
+  (let* ((ctx (bitcoin-lisp.networking::make-ibd-context))
+         (ready (bitcoin-lisp.networking:make-peer :state :ready :start-height 500))
+         (calls 0)
+         (sync-fn (lambda (peer chain-state &key recent-rejects)
+                    (declare (ignore peer chain-state recent-rejects))
+                    (incf calls) (values 10 nil))))
+    (let ((bitcoin-lisp.networking::*ibd-stop-requested* t))
+      (is (null (bitcoin-lisp.networking::sync-headers-with-failover
+                 (list ready) nil ctx :sync-fn sync-fn))))
+    (is (= 0 calls))))
+
+(test run-ibd-honors-stop-request
+  "run-ibd with pending work and a stop requested returns immediately
+instead of cycling the no-peer grace (~6s) or downloading."
+  (let* ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    ;; A header-valid entry above the current tip gives run-ibd pending
+    ;; work and keeps its download-loop gate (height < header-tip) true.
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash hash :height 10 :chain-work 100 :status :header-valid))
+    (let ((bitcoin-lisp.networking::*ibd-stop-requested* t)
+          (start (get-internal-real-time)))
+      (bitcoin-lisp.networking::run-ibd '() state nil nil)
+      (is (< (- (get-internal-real-time) start)
+             (* 2 internal-time-units-per-second))))))
