@@ -615,6 +615,19 @@
 
 ;;;; Reorg and Persistence Edge-Case Tests
 
+(defun %genesis-index-header (genesis-hash)
+  "A minimal genesis block-header for test chain-state setup. Reorg paths now
+fully validate fork blocks, and validate-block's MTP walk
+(compute-median-time-past) reads the genesis entry's header — a NIL header
+there crashes the walk. In production the genesis index entry always carries a
+header; these synthetic fixtures must too."
+  (bitcoin-lisp.serialization:make-block-header
+   :version 1
+   :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+   :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+   :timestamp 1231006505 :bits #x1d00ffff :nonce 0
+   :cached-hash genesis-hash))
+
 (defun make-reorg-test-block (prev-hash block-hash height &key (value 5000000000))
   "Create a minimal test block for reorg tests.
 
@@ -672,7 +685,13 @@ script-sig makes the serialization deterministic per block."
 
 (test multi-block-reorg-3-deep
   "A reorg of 3+ blocks should correctly switch chains."
-  (let* ((base-path (ensure-directories-exist
+  (let* (;; testnet4 (the default network) activates BIP34 at h=1. perform-reorg
+         ;; now fully validates fork blocks, and the synthetic make-reorg-test-block
+         ;; coinbases carry no BIP34 height — bind mainnet so these low-height
+         ;; mechanics blocks skip that check (same reason reorg-tests uses
+         ;; %with-mainnet-network).
+         (bitcoin-lisp:*network* :mainnet)
+         (base-path (ensure-directories-exist
                      (merge-pathnames "test-reorg-deep/"
                                       (uiop:temporary-directory))))
          (chain-state (bitcoin-lisp.storage:init-chain-state base-path))
@@ -685,7 +704,8 @@ script-sig makes the serialization deterministic per block."
     (bitcoin-lisp.storage:add-block-index-entry
      chain-state
      (bitcoin-lisp.storage:make-block-index-entry
-      :hash genesis-hash :height 0 :chain-work 1 :status :valid))
+      :hash genesis-hash :height 0 :chain-work 1 :status :valid
+      :header (%genesis-index-header genesis-hash)))
     ;; Build chain A: genesis -> A1 -> A2 -> A3 (3 blocks, lower work)
     (let ((chain-a-hashes (make-test-chain-hashes #xA0 3)))
       (let ((prev-hash genesis-hash))
@@ -721,7 +741,10 @@ script-sig makes the serialization deterministic per block."
 
 (test reorg-missing-undo-data-graceful
   "Reorg with missing undo data should not corrupt the UTXO set or crash."
-  (let* ((base-path (ensure-directories-exist
+  (let* (;; mainnet so low-height synthetic fork blocks skip BIP34 (see
+         ;; multi-block-reorg-3-deep) now that reorg validates fork blocks.
+         (bitcoin-lisp:*network* :mainnet)
+         (base-path (ensure-directories-exist
                      (merge-pathnames "test-reorg-noundo/"
                                       (uiop:temporary-directory))))
          (chain-state (bitcoin-lisp.storage:init-chain-state base-path))
@@ -732,7 +755,8 @@ script-sig makes the serialization deterministic per block."
     (bitcoin-lisp.storage:add-block-index-entry
      chain-state
      (bitcoin-lisp.storage:make-block-index-entry
-      :hash genesis-hash :height 0 :chain-work 1 :status :valid))
+      :hash genesis-hash :height 0 :chain-work 1 :status :valid
+      :header (%genesis-index-header genesis-hash)))
     ;; Build chain A: genesis -> A1 -> A2
     (let ((chain-a-hashes (make-test-chain-hashes #xC0 2)))
       (let ((prev-hash genesis-hash))
@@ -761,7 +785,10 @@ script-sig makes the serialization deterministic per block."
 
 (test persistence-round-trip-after-reorg
   "Chain state and UTXO set should be consistent after save/load following a reorg."
-  (let* ((base-path (ensure-directories-exist
+  (let* (;; mainnet so low-height synthetic fork blocks skip BIP34 (see
+         ;; multi-block-reorg-3-deep) now that reorg validates fork blocks.
+         (bitcoin-lisp:*network* :mainnet)
+         (base-path (ensure-directories-exist
                      (merge-pathnames "test-reorg-persist/"
                                       (uiop:temporary-directory))))
          (chain-state (bitcoin-lisp.storage:init-chain-state base-path))
@@ -772,7 +799,8 @@ script-sig makes the serialization deterministic per block."
     (bitcoin-lisp.storage:add-block-index-entry
      chain-state
      (bitcoin-lisp.storage:make-block-index-entry
-      :hash genesis-hash :height 0 :chain-work 1 :status :valid))
+      :hash genesis-hash :height 0 :chain-work 1 :status :valid
+      :header (%genesis-index-header genesis-hash)))
     ;; Build chain A (2 blocks)
     (let ((chain-a-hashes (make-test-chain-hashes #xE0 2)))
       (let ((prev-hash genesis-hash))
