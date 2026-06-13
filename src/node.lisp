@@ -705,6 +705,7 @@ Returns the node instance."
   ;; Reconnects and retries when peers are lost, similar to Bitcoin Core's
   ;; CheckForStaleTipAndEvictPeers (net_processing.cpp:5460)
   (when sync
+    (bitcoin-lisp.networking:reset-ibd-stop)
     (setf (node-sync-thread *node*)
           (bt:make-thread
            (lambda ()
@@ -737,10 +738,12 @@ Returns the node instance."
                                     (sync-blockchain *node*)
                                  (setf (node-syncing *node*) nil))
                                (replace-disconnected-peers *node*)
-                               (sleep 30))
+                               (loop repeat 30 while (node-running *node*)
+                                     do (sleep 1)))
                               (t
                                (log-warn "No peers available, reconnecting in 5s...")
-                               (sleep 5)
+                               (loop repeat 5 while (node-running *node*)
+                                     do (sleep 1))
                                (connect-to-peers *node* max-peers
                                                  :timeout 30 :min-peers 1)))))
                (error () nil)))
@@ -1004,8 +1007,11 @@ flush (atomic temp+fsync+rename inside save-*)."
   ;; Stop RPC server first
   (bitcoin-lisp.rpc:stop-rpc-server)
 
-  ;; Signal the node to stop
+  ;; Signal the node to stop. request-ibd-stop reaches the IBD inner
+  ;; loops, which can otherwise run for hours after node-running flips
+  ;; (the outer sync loop only checks between run-ibd passes).
   (setf (node-running *node*) nil)
+  (bitcoin-lisp.networking:request-ibd-stop)
 
   ;; Stop the inbound listener: close the socket (unblocks accept) and let the
   ;; accept thread observe node-running=nil and exit (its accept timeout is 1s).
