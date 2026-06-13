@@ -688,6 +688,9 @@
    #:open-listener
    #:close-listener
    #:accept-connection
+   ;; Shutdown
+   #:request-ibd-stop
+   #:reset-ibd-stop
    ;; Peer
    #:peer
    #:make-peer
