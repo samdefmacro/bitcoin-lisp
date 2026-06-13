@@ -85,6 +85,7 @@
    #:precomputed-sighash-data
    ;; Signature cache
    #:*signature-cache*
+   #:*signature-cache-prev*
    #:*signature-cache-enabled*
    #:clear-signature-cache
    ;; SegWit / BIP 143
@@ -479,8 +480,13 @@ INPUTS may be any sequence (struct field vector or an ad-hoc list)."
 ;;; when the same signature is checked during mempool acceptance and block validation.
 
 (defparameter +signature-cache-max-entries+ 65536
-  "Maximum entries in *signature-cache* before it is cleared.
-   Bitcoin Core caps the equivalent CuckooCache at ~32 MiB; this is the analogue.")
+  "Maximum entries per signature-cache generation. When the current
+   generation fills, it becomes the previous generation and the oldest
+   is dropped (sig-cache-store), so total entries are bounded at 2x
+   this. Bitcoin Core caps the equivalent CuckooCache at ~32 MiB and
+   evicts incrementally; the generation rotate is the cheap analogue —
+   the old full clrhash dumped the entire hot working set at once and
+   forced a re-verification burst.")
 
 (declaim (inline sig-cache-hash))
 (defun sig-cache-hash (key)
@@ -501,11 +507,15 @@ lookup. Equalp test still resolves any collisions exactly."
                   (ash (aref key 7) 56))
           most-positive-fixnum))
 
-(defvar *signature-cache*
+(defun %make-sig-cache-table ()
   (make-hash-table :test 'equalp :size 65536
                    #+sbcl :hash-function #+sbcl 'sig-cache-hash
-                   #+sbcl :synchronized #+sbcl t)
-  "Cache of verified signatures. Key = SHA256(...), Value = T.
+                   #+sbcl :synchronized #+sbcl t))
+
+(defvar *signature-cache*
+  (%make-sig-cache-table)
+  "Current generation of verified-signature cache. Key = SHA256(...),
+Value = T. See *signature-cache-prev* for the rotation scheme.
 SBCL :synchronized hash-tables use a per-table mutex on every gethash/
 setf — needed because Phase 3 parallel script verification has
 multiple worker threads concurrently doing both lookups and stores.
@@ -514,6 +524,16 @@ The mutex cost is small relative to the parallel speedup.
 Custom :hash-function (sig-cache-hash) skips data-vector-hash on the
 32-byte key since SHA256 output is already random — see profile note
 in Phase B.4 of the speed plan.")
+
+(defvar *signature-cache-prev*
+  (%make-sig-cache-table)
+  "Previous generation. Lookups that miss the current generation probe
+this one and promote hits forward (sig-cache-hit-p), so entries in
+active use survive rotation. Rotation itself is a plain two-global
+swap, not atomic: a worker can race it and lose one store or probe a
+just-demoted table — harmless, since a cache miss only costs a
+re-verification and entries are added only after successful verifies
+(no false positives possible).")
 
 (defvar *signature-cache-enabled* t
   "When T, cache signature verification results.")
@@ -549,9 +569,17 @@ dispatch."
     (setf pos (buf-set-bytes buf pos sig))
     (bitcoin-lisp.crypto:sha256 buf)))
 
+(defun sig-cache-hit-p (key)
+  "T when KEY is cached in either generation; prev-generation hits are
+promoted into the current one."
+  (or (gethash key *signature-cache*)
+      (when (gethash key *signature-cache-prev*)
+        (setf (gethash key *signature-cache*) t))))
+
 (defun sig-cache-store (key)
   (when (>= (hash-table-count *signature-cache*) +signature-cache-max-entries+)
-    (clrhash *signature-cache*))
+    (setf *signature-cache-prev* *signature-cache*
+          *signature-cache* (%make-sig-cache-table)))
   (setf (gethash key *signature-cache*) t))
 
 (defun cached-verify-ecdsa (sighash der-sig pubkey-bytes &key strict low-s)
@@ -561,7 +589,7 @@ dispatch."
    and surface as :sig-der when CHECKMULTISIG re-checks duplicate sig/pubkey pairs."
   (let ((cache-key (when *signature-cache-enabled*
                      (make-sig-cache-key #x45 sighash der-sig pubkey-bytes))))
-    (when (and cache-key (gethash cache-key *signature-cache*))
+    (when (and cache-key (sig-cache-hit-p cache-key))
       (return-from cached-verify-ecdsa (values t t)))
     (multiple-value-bind (result status)
         (bitcoin-lisp.crypto:verify-signature sighash der-sig pubkey-bytes
@@ -574,7 +602,7 @@ dispatch."
   "Verify Schnorr signature with caching. Returns T/NIL."
   (let ((cache-key (when *signature-cache-enabled*
                      (make-sig-cache-key #x53 sighash sig64 pubkey-bytes))))
-    (when (and cache-key (gethash cache-key *signature-cache*))
+    (when (and cache-key (sig-cache-hit-p cache-key))
       (return-from cached-verify-schnorr t))
     (let ((result (bitcoin-lisp.crypto:verify-schnorr-signature
                    sighash sig64 pubkey-bytes)))
@@ -583,8 +611,9 @@ dispatch."
       result)))
 
 (defun clear-signature-cache ()
-  "Clear the signature verification cache."
-  (clrhash *signature-cache*))
+  "Clear both generations of the signature verification cache."
+  (clrhash *signature-cache*)
+  (clrhash *signature-cache-prev*))
 
 (defun current-input-sequence ()
   "Extract nSequence for the current input from *current-tx*, or #xFFFFFFFF if unavailable."
