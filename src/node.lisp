@@ -819,7 +819,8 @@ accounts for ~700 MB. This logger surfaces the gap."
                              (bitcoin-lisp.storage::chain-state-block-index
                               (node-chain-state *node*)))))
          (sig-cache-count
-           (hash-table-count bitcoin-lisp.coalton.interop:*signature-cache*))
+           (+ (hash-table-count bitcoin-lisp.coalton.interop:*signature-cache*)
+              (hash-table-count bitcoin-lisp.coalton.interop:*signature-cache-prev*)))
          (ibd-pending
            (and bitcoin-lisp.networking::*ibd-context*
                 (hash-table-count
