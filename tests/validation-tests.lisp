@@ -1096,3 +1096,51 @@ mainnet IBD for two days. The full signed tx must validate."
           (bitcoin-lisp.validation:validate-transaction-scripts
            tx utxo-set :height 851912)
         (is (eq t ok) "input ~A failed script validation" failed-idx)))))
+
+;;;; Signature-cache generation rotation
+;;;;
+;;;; sig-cache-store rotates generations at the cap (Core CuckooCache
+;;;; analogue) instead of the old clrhash, which dumped the whole hot
+;;;; working set and forced a re-verification burst. Entries used since
+;;;; the last rotation survive via promotion in sig-cache-hit-p.
+
+(defun %sig-key (n)
+  "Distinct 32-byte cache key."
+  (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref k 0) n)
+    k))
+
+(test sig-cache-rotation-preserves-active-entries
+  "At the cap the current generation becomes previous; entries hit since
+then are promoted and survive a second rotation, untouched ones age out."
+  (let ((bitcoin-lisp.coalton.interop:*signature-cache*
+          (bitcoin-lisp.coalton.interop::%make-sig-cache-table))
+        (bitcoin-lisp.coalton.interop:*signature-cache-prev*
+          (bitcoin-lisp.coalton.interop::%make-sig-cache-table))
+        (bitcoin-lisp.coalton.interop::+signature-cache-max-entries+ 4))
+    (loop for n from 1 to 4
+          do (bitcoin-lisp.coalton.interop::sig-cache-store (%sig-key n)))
+    ;; 5th store rotates: prev = {1..4}, cur = {5}
+    (bitcoin-lisp.coalton.interop::sig-cache-store (%sig-key 5))
+    (is (= 1 (hash-table-count bitcoin-lisp.coalton.interop:*signature-cache*)))
+    (is (= 4 (hash-table-count bitcoin-lisp.coalton.interop:*signature-cache-prev*)))
+    ;; Hit on key 1 promotes it into cur.
+    (is (bitcoin-lisp.coalton.interop::sig-cache-hit-p (%sig-key 1)))
+    ;; Fill cur to the cap and rotate again: prev = {5,1,6,7}, cur = {9}.
+    (loop for n from 6 to 7
+          do (bitcoin-lisp.coalton.interop::sig-cache-store (%sig-key n)))
+    (bitcoin-lisp.coalton.interop::sig-cache-store (%sig-key 9))
+    ;; Promoted key 1 survived both rotations; never-touched key 2 aged out.
+    (is (bitcoin-lisp.coalton.interop::sig-cache-hit-p (%sig-key 1)))
+    (is (not (bitcoin-lisp.coalton.interop::sig-cache-hit-p (%sig-key 2))))))
+
+(test sig-cache-clear-clears-both-generations
+  (let ((bitcoin-lisp.coalton.interop:*signature-cache*
+          (bitcoin-lisp.coalton.interop::%make-sig-cache-table))
+        (bitcoin-lisp.coalton.interop:*signature-cache-prev*
+          (bitcoin-lisp.coalton.interop::%make-sig-cache-table)))
+    (bitcoin-lisp.coalton.interop::sig-cache-store (%sig-key 1))
+    (setf (gethash (%sig-key 2) bitcoin-lisp.coalton.interop:*signature-cache-prev*) t)
+    (bitcoin-lisp.coalton.interop:clear-signature-cache)
+    (is (not (bitcoin-lisp.coalton.interop::sig-cache-hit-p (%sig-key 1))))
+    (is (not (bitcoin-lisp.coalton.interop::sig-cache-hit-p (%sig-key 2))))))
