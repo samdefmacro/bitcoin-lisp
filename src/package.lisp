@@ -521,6 +521,7 @@
    #:mempool-get
    #:mempool-spending-tx
    #:mempool-add
+   #:accept-validated-tx
    #:mempool-remove
    #:mempool-count
    #:mempool-total-size
