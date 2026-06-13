@@ -81,16 +81,32 @@ Root = hash256(hash256(h0||h1) || hash256(h2||h2))."
     (is (equalp h1 h1-copy))))
 
 (test cve-2012-2459-duplicate-merkle
-  "CVE-2012-2459: duplicating the last tx in an odd-count block produces
-the same merkle root as the original. This is the known vulnerability
-where two different transaction lists yield the same root."
+  "CVE-2012-2459: duplicating the last tx of an odd-count block yields the
+SAME merkle root, so a valid block can be malleated into a distinct one.
+compute-merkle-root returns the identical root for both but flags the mutated
+(duplicated) variant via its second value so validate-block can reject it
+(bad-txns-duplicate). The honest odd-count self-duplication is NOT flagged."
   (let* ((h0 (make-merkle-test-hash #x11))
          (h1 (make-merkle-test-hash #x22))
-         (h2 (make-merkle-test-hash #x33))
-         ;; Original: [h0, h1, h2] — h2 is duplicated internally
-         (root-original (bitcoin-lisp.validation:compute-merkle-root (list h0 h1 h2)))
-         ;; Mutated: [h0, h1, h2, h2] — explicitly duplicated
-         (root-mutated (bitcoin-lisp.validation:compute-merkle-root (list h0 h1 h2 h2))))
-    ;; Both produce the same merkle root — this IS the vulnerability
-    (is (equalp root-original root-mutated)
-        "Duplicate-last-tx attack should produce identical merkle root")))
+         (h2 (make-merkle-test-hash #x33)))
+    (multiple-value-bind (root-original mutated-original)
+        (bitcoin-lisp.validation:compute-merkle-root (list h0 h1 h2))
+      (multiple-value-bind (root-mutated mutated-flag)
+          ;; [h0 h1 h2 h2] — the attacker's explicit duplication of the last tx.
+          (bitcoin-lisp.validation:compute-merkle-root (list h0 h1 h2 h2))
+        ;; Same root — this IS the vulnerability.
+        (is (equalp root-original root-mutated)
+            "Duplicate-last-tx attack should produce identical merkle root")
+        ;; The mutated variant is flagged; the honest odd-count tree is not.
+        (is (null mutated-original))
+        (is (eq t mutated-flag))))))
+
+(test merkle-mutation-flag-honest-trees
+  "compute-merkle-root must NOT flag honest trees (no equal adjacent pair),
+including the odd-count self-duplication of the last element."
+  (dolist (n '(1 2 3 4 5 7 8))
+    (let ((hashes (loop for i from 1 to n collect (make-merkle-test-hash i))))
+      (multiple-value-bind (root mutated)
+          (bitcoin-lisp.validation:compute-merkle-root hashes)
+        (declare (ignore root))
+        (is (null mutated) "n=~D should not be flagged mutated" n)))))

@@ -413,20 +413,31 @@ returns NIL), then require hash <= target. Returns T if valid."
     (bitcoin-lisp.crypto:hash256 combined)))
 
 (defun compute-merkle-root (tx-hashes)
-  "Compute the Merkle root from a list of transaction hashes."
+  "Compute the Merkle root from a list of transaction hashes.
+Returns (VALUES root mutated). MUTATED is T when any level combines two
+identical adjacent siblings — the CVE-2012-2459 malleation: an attacker can
+pad a valid block's tx list (duplicating the last row) into a distinct block
+that hashes to the SAME merkle root. Mirrors Bitcoin Core ComputeMerkleRoot
+(consensus/merkle.cpp): the odd-count self-duplication of the last element is
+NOT a mutation, only genuine equal adjacent pairs are. Single-value callers
+(merkle-root match) are unaffected."
   (when (null tx-hashes)
     (return-from compute-merkle-root
-      (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (values (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0) nil)))
 
-  (let ((level (mapcar #'copy-seq tx-hashes)))
+  (let ((level (mapcar #'copy-seq tx-hashes))
+        (mutated nil))
     (loop while (> (length level) 1)
           do (let ((next-level '()))
                (loop while level
                      do (let* ((a (pop level))
-                               (b (or (pop level) a)))  ; Duplicate last if odd
+                               (real-b (pop level))       ; NIL when count is odd
+                               (b (or real-b a)))         ; duplicate last if odd
+                          (when (and real-b (equalp a real-b))
+                            (setf mutated t))
                           (push (hash-pair a b) next-level)))
                (setf level (nreverse next-level))))
-    (first level)))
+    (values (first level) mutated)))
 
 ;;;; Block header validation
 
@@ -1022,14 +1033,21 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
             do (return-from validate-block
                  (values nil :multiple-coinbase nil)))
 
-    ;; Validate merkle root
+    ;; Validate merkle root, then reject CVE-2012-2459 malleation. Order
+    ;; mirrors Bitcoin Core CheckBlock: a mutated block hashes to the SAME
+    ;; root as the original, so the root check passes and the mutated flag is
+    ;; what catches it (bad-txns-duplicate).
     (let* ((tx-hashes (mapcar #'bitcoin-lisp.serialization:transaction-hash
                               transactions))
-           (computed-root (compute-merkle-root tx-hashes))
            (header-root (bitcoin-lisp.serialization:block-header-merkle-root header)))
-      (unless (equalp computed-root header-root)
-        (return-from validate-block
-          (values nil :bad-merkle-root nil))))
+      (multiple-value-bind (computed-root mutated)
+          (compute-merkle-root tx-hashes)
+        (unless (equalp computed-root header-root)
+          (return-from validate-block
+            (values nil :bad-merkle-root nil)))
+        (when mutated
+          (return-from validate-block
+            (values nil :bad-txns-duplicate nil)))))
 
     ;; Validate block weight (BIP 141)
     (let ((weight (calculate-block-weight transactions)))
