@@ -391,6 +391,68 @@ block. Chain tip should land on the new fork's tip."
           (is (= 3 (bitcoin-lisp.storage:utxo-count utxo-set))))))
     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
 
+(test reorg-rejects-fork-carrying-invalid-block
+  "CC-1 regression. A competing fork with strictly more work but carrying an
+INVALID block (here B2 has an over-value coinbase) must be REJECTED during the
+reorg: the invalid block must never enter the UTXO set, and the node must roll
+back to its original valid chain. Before the fix, perform-reorg applied fork
+blocks with apply-block-to-utxo-set and NO validate-block — so a more-work fork
+(cheap to mine under testnet4's min-difficulty rule) could inject any invalid
+block into the chainstate."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "reorg-invalid-fork")
+    ;; Chain A: genesis -> A1 -> A2. Active and valid.
+    (%build-and-connect chain-state block-store utxo-set genesis-hash
+                        (make-test-chain-hashes #xA0 2))
+    (let ((a-tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+          (a-utxo-count (bitcoin-lisp.storage:utxo-count utxo-set)))
+      ;; Pre-build chain B: genesis -> B1 -> B2, where B2's coinbase pays
+      ;; 50.00000001 BTC — one satoshi over the 50 BTC subsidy, so B2 is
+      ;; invalid (:coinbase-too-large). Stored + indexed but not applied
+      ;; (equal work with A keeps A active by first-seen).
+      (let ((b-hashes (make-test-chain-hashes #xB0 2))
+            (prev-hash genesis-hash))
+        (loop for h from 1 to 2
+              for block-hash in b-hashes
+              do (let ((block (make-reorg-test-block
+                               prev-hash block-hash h
+                               :value (if (= h 2) 5000000001 5000000000))))
+                   (bitcoin-lisp.storage:store-block block-store block)
+                   (bitcoin-lisp.validation:connect-block
+                    block chain-state block-store utxo-set)
+                   (setf prev-hash block-hash)))
+        (is (equalp a-tip-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+        (is (= 2 (bitcoin-lisp.storage:current-height chain-state))))
+      ;; Receive B3 (extends B2): chain B now has more work than A2, so
+      ;; activate-block pre-reorgs A2 -> B2. perform-reorg validates B1 (ok)
+      ;; then B2 (over-value coinbase) -> fails -> rolls back to A.
+      (let* ((b2-hash (second (make-test-chain-hashes #xB0 2)))
+             (b3-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element 0)))
+                        (setf (aref h 0) #xB0) (setf (aref h 1) 3) h))
+             (b3-block (make-reorg-test-block b2-hash b3-hash 3)))
+        (multiple-value-bind (activated error)
+            (bitcoin-lisp.validation:activate-block
+             b3-block chain-state block-store utxo-set :skip-scripts t)
+          ;; Reorg rejected, surfacing the fork block's validation error.
+          (is (null activated))
+          (is (eq :coinbase-too-large error))
+          ;; Node rolled back to chain A — tip, height, and UTXO unchanged.
+          (is (equalp a-tip-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+          (is (= 2 (bitcoin-lisp.storage:current-height chain-state)))
+          (is (= a-utxo-count (bitcoin-lisp.storage:utxo-count utxo-set)))
+          ;; The invalid B2 coinbase never entered the UTXO set.
+          (is (null (bitcoin-lisp.storage:get-utxo
+                     utxo-set
+                     (bitcoin-lisp.serialization:transaction-hash
+                      (first (bitcoin-lisp.serialization:bitcoin-block-transactions
+                              (make-reorg-test-block
+                               (first (make-test-chain-hashes #xB0 2))
+                               b2-hash 2 :value 5000000001))))
+                     0)))))
+      (clrhash bitcoin-lisp.validation::*block-undo-data*)))))
+
 (test activate-block-stores-weaker-fork-without-activating
   "When the incoming block's parent sits on a competing fork whose
 total work doesn't exceed current tip's, activate-block returns
