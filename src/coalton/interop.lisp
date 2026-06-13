@@ -2013,7 +2013,12 @@ Used to remove the signature being verified from the scriptCode before sighash."
 
     ;; CONST_SCRIPTCODE: reject if scriptCode contains OP_CODESEPARATOR as an opcode
     ;; Also reject if FindAndDelete would modify the scriptCode (sig found in scriptCode)
-    (when (flag-enabled-p "CONST_SCRIPTCODE")
+    ;; LEGACY ONLY: Core gates both on sigversion == SigVersion::BASE
+    ;; (interpreter.cpp:475 codesep, :1042 FindAndDelete) — in witness v0
+    ;; scripts OP_CODESEPARATOR is legal and FindAndDelete never runs.
+    ;; tx_valid.json's segwit codeseparator vectors fail without this gate.
+    (when (and (flag-enabled-p "CONST_SCRIPTCODE")
+               (not *witness-v0-mode*))
       (let ((sc (or *current-script-code* script-pubkey)))
         ;; Check for OP_CODESEPARATOR opcodes (walking script properly)
         (let ((i 0) (slen (length sc)))
@@ -2414,7 +2419,13 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
                 ;; patterns in place — producing a sighash that differs
                 ;; from Core's and ECDSA verify rejects the real sig.
                 (multiple-value-bind (cleaned-script-pubkey any-found)
-                    (strip-sigs-from-script-code script-pubkey sigs)
+                    (if *witness-v0-mode*
+                        ;; BIP143 scriptCode is serialized untouched; Core's
+                        ;; FindAndDelete loop (interpreter.cpp:1142) runs only
+                        ;; for SigVersion::BASE, so neither strip nor the
+                        ;; CONST_SCRIPTCODE rejection applies in witness v0.
+                        (values script-pubkey nil)
+                        (strip-sigs-from-script-code script-pubkey sigs))
                   (cond
                     ((and any-found (flag-enabled-p "CONST_SCRIPTCODE"))
                      (setf *last-checkmultisig-error* :sig-findanddelete)

@@ -2113,8 +2113,13 @@
                          ;; If bit 31 (disable flag) is set on stack value, pass as NOP
                          (if (/= 0 (lisp Integer (n) (cl:logand n #x80000000)))
                              (ScriptOk ctx)
-                             ;; Transaction version must be >= 2
-                             (if (< (context-tx-version ctx) 2)
+                             ;; Transaction version must be >= 2, compared
+                             ;; UNSIGNED like Core (interpreter.cpp CheckSequence
+                             ;; casts to uint32_t), so a negative version such
+                             ;; as 0xffffffff (-1) satisfies the check.
+                             (if (let ((tx-ver (the Integer (into (context-tx-version ctx)))))
+                                   (lisp Boolean (tx-ver)
+                                     (cl:< (cl:logand tx-ver #xFFFFFFFF) 2)))
                                  (ScriptErr SE-UnsatisfiedLocktime)
                                  ;; Input nSequence bit 31 must not be set (disable flag)
                                  (let ((input-seq (the Integer (into (context-input-sequence ctx)))))

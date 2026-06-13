@@ -34,7 +34,11 @@
     result))
 
 (defvar *all-standard-flags*
-  "P2SH,DERSIG,STRICTENC,LOW_S,NULLDUMMY,SIGPUSHONLY,MINIMALDATA,DISCOURAGE_UPGRADABLE_NOPS,CLEANSTACK,CHECKLOCKTIMEVERIFY,CHECKSEQUENCEVERIFY,WITNESS,DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,NULLFAIL,CONST_SCRIPTCODE")
+  "P2SH,DERSIG,STRICTENC,LOW_S,NULLDUMMY,SIGPUSHONLY,MINIMALDATA,DISCOURAGE_UPGRADABLE_NOPS,CLEANSTACK,MINIMALIF,CHECKLOCKTIMEVERIFY,CHECKSEQUENCEVERIFY,WITNESS,DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,WITNESS_PUBKEYTYPE,NULLFAIL,CONST_SCRIPTCODE,TAPROOT"
+  "Core's mapFlagNames set (transaction_tests.cpp) as our engine names them.
+tx_valid.json's flags column lists EXCLUDED flags: each vector runs with
+this set minus its exclusions, so the broader this list, the stricter the
+test. Names the engine doesn't query are inert.")
 
 (defun split-flags (flags-string)
   "Split comma-separated flags string into a list."
@@ -93,7 +97,8 @@ Uses verify-script which follows Bitcoin Core's VerifyScript flow."
   "Run Bitcoin Core tx_valid.json test vectors."
   (let ((tests (load-tx-tests "tx_valid.json"))
         (passed 0)
-        (failed 0))
+        (failed 0)
+        (failures '()))
     (dolist (test-case tests)
       (multiple-value-bind (prevouts tx-hex flags)
           (parse-tx-test-case test-case)
@@ -101,16 +106,22 @@ Uses verify-script which follows Bitcoin Core's VerifyScript flow."
           (handler-case
               (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes tx-hex))
                      (tx (bitcoin-lisp.serialization:parse-tx-payload tx-bytes)))
-                ;; tx_valid.json flags are "excluded verifyFlags"
-                ;; Use empty flags (no enforcement) for now — all tests should pass
-                ;; with minimal verification, exercising signature/script correctness
-                (if (validate-tx-inputs tx prevouts "")
+                ;; tx_valid.json flags are EXCLUDED verifyFlags (Core
+                ;; transaction_tests.cpp): the vector must validate under
+                ;; every standard flag except the listed ones — the listed
+                ;; ones are exactly the rules the vector violates.
+                (if (validate-tx-inputs tx prevouts (compute-effective-flags flags))
                     (incf passed)
-                    (incf failed)))
+                    (progn (incf failed)
+                           (push (list tx-hex flags) failures))))
             (error (e)
               (declare (ignore e))
-              (incf failed))))))
+              (incf failed)
+              (push (list tx-hex flags) failures))))))
     (format t "~%tx_valid.json: ~D passed, ~D failed~%" passed failed)
+    (dolist (f failures)
+      (format t "  FAILED (excluded ~S): ~A~%" (second f)
+              (subseq (first f) 0 (min 80 (length (first f))))))
     (is (zerop failed))))
 
 (test tx-invalid-json
