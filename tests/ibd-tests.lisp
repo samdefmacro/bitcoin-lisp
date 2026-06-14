@@ -531,6 +531,50 @@ relay-off node never propagates blocks."
                 :timestamp 1700000000 :bits #x1d00ffff :nonce 0)
                nil (list (%make-peer-with-state :ready)))))))
 
+(test tx-request-tracker-dedups-and-records-announcers
+  "tx-request-wanted-p requests from the first announcer only; a second peer
+announcing the same txid is recorded as a failover candidate (no duplicate
+request). After the tx is received, a later announce requests again."
+  (bitcoin-lisp.networking::reset-tx-requests)
+  (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+        (p1 (%make-peer-with-state :ready))
+        (p2 (%make-peer-with-state :ready)))
+    (is (eq t (bitcoin-lisp.networking::tx-request-wanted-p txid p1)))
+    (is (null (bitcoin-lisp.networking::tx-request-wanted-p txid p2)))
+    (bitcoin-lisp.networking::tx-request-received txid)
+    (is (eq t (bitcoin-lisp.networking::tx-request-wanted-p txid p1)))
+    (bitcoin-lisp.networking::reset-tx-requests)))
+
+(test tx-request-retry-reroutes-to-next-announcer
+  "A timed-out tx request is re-routed to another ready announcer."
+  (bitcoin-lisp.networking::reset-tx-requests)
+  (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8))
+        (p1 (%make-peer-with-state :ready))
+        (p2 (%make-peer-with-state :ready)))
+    (bitcoin-lisp.networking::tx-request-wanted-p txid p1)
+    (bitcoin-lisp.networking::tx-request-wanted-p txid p2)
+    ;; backdate the in-flight timestamp by >timeout to force a re-route
+    ;; (internal-real-time is image-relative, so use a real elapsed delta)
+    (setf (gethash txid bitcoin-lisp.networking::*tx-in-flight*)
+          (cons p1 (- (get-internal-real-time)
+                      (* 120 internal-time-units-per-second))))
+    (is (= 1 (bitcoin-lisp.networking::retry-timed-out-tx-requests)))
+    (is (eq p2 (car (gethash txid bitcoin-lisp.networking::*tx-in-flight*))))
+    (bitcoin-lisp.networking::reset-tx-requests)))
+
+(test tx-request-retry-drops-when-no-other-announcer
+  "A timed-out tx request with no other announcer is dropped from tracking."
+  (bitcoin-lisp.networking::reset-tx-requests)
+  (let ((txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+        (p1 (%make-peer-with-state :ready)))
+    (bitcoin-lisp.networking::tx-request-wanted-p txid p1)
+    (setf (gethash txid bitcoin-lisp.networking::*tx-in-flight*)
+          (cons p1 (- (get-internal-real-time)
+                      (* 120 internal-time-units-per-second))))
+    (is (= 0 (bitcoin-lisp.networking::retry-timed-out-tx-requests)))
+    (is (null (gethash txid bitcoin-lisp.networking::*tx-in-flight*)))
+    (bitcoin-lisp.networking::reset-tx-requests)))
+
 (test update-block-availability-known-hash
   "When the announced hash is already in the index with positive
 chain-work, peer's best-known-block-hash is set to it."
