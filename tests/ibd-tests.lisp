@@ -766,10 +766,20 @@ a header extending the high-work tip is accepted."
          (state (bitcoin-lisp.storage:init-chain-state
                  (merge-pathnames "test-minwork/" (uiop:temporary-directory))))
          (genesis-hash (bitcoin-lisp.storage:best-block-hash state))
-         (genesis-entry (bitcoin-lisp.storage:get-block-index-entry state genesis-hash))
          (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         ;; init-chain-state sets the genesis hash but does not add an index
+         ;; entry; add one (low chain-work) so the fork header below resolves
+         ;; its prev-entry and is gated by the work floor, not skipped for a
+         ;; missing parent.
+         (genesis-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash genesis-hash :height 0 :chain-work 1 :status :valid
+                         :header (bitcoin-lisp.serialization:make-block-header
+                                  :version 1 :prev-block zeros :merkle-root zeros
+                                  :timestamp 1296688600 :bits #x207fffff :nonce 0
+                                  :cached-hash genesis-hash)))
          ;; Plant a high-chain-work tip so past-min-work is true.
          (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (bitcoin-lisp.storage:add-block-index-entry state genesis-entry)
     (bitcoin-lisp.storage:add-block-index-entry
      state (bitcoin-lisp.storage:make-block-index-entry
             :hash tip-hash :height 1 :prev-entry genesis-entry
