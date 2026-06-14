@@ -940,8 +940,13 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
         ;; the full ~17M-entry set — replaces the ~13s utxoset.dat
         ;; rewrite that previously froze the sync thread.
         (when (node-utxo-set *node*)
+          ;; :sync t fdatasyncs the LevelDB writebatch before we proceed, so a
+          ;; power loss after Phase 3 clears the marker cannot leave the coins
+          ;; un-durable while chainstate.dat says they are committed. (Was
+          ;; :sync nil — atomic but not durable; the shutdown flush already
+          ;; syncs, the periodic one now matches it.)
           (bitcoin-lisp.storage:coins-view-cache-flush
-           (node-utxo-set *node*)))
+           (node-utxo-set *node*) :sync t))
         ;; Phase 3: commit by re-saving chainstate without the marker.
         (when (node-chain-state *node*)
           (bitcoin-lisp.storage:save-state

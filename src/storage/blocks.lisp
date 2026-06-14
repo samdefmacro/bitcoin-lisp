@@ -64,12 +64,18 @@ Returns the block hash."
          ;; in total-bytes and must be replaced, not added to.
          (old-size (when (gethash hash (block-store-index store))
                      (file-size-bytes path))))
-    ;; Write block to file
+    ;; Write block to file and fsync it: connect-block stores the block before
+    ;; the periodic chainstate flush, so the block must be durable before the
+    ;; chainstate can reference it — otherwise a power loss can leave the
+    ;; chainstate (or its coinbase-probe recovery) pointing at a block file
+    ;; that never reached the platter.
     (with-open-file (stream path
                             :direction :output
                             :if-exists :supersede
                             :element-type '(unsigned-byte 8))
-      (write-sequence data stream))
+      (write-sequence data stream)
+      (finish-output stream)
+      #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd stream))))
     ;; Update index and running storage total
     (setf (gethash hash (block-store-index store)) path)
     (incf (block-store-total-bytes store) (- (length data) (or old-size 0)))
