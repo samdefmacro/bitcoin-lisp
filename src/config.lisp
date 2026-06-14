@@ -36,6 +36,26 @@ Set automatically based on network: 100000 for mainnet, 1000 for testnet.")
     (:mainnet 100000)
     ((:testnet3 :testnet4 :signet :regtest) 1000)))
 
+(defvar *minimum-chain-work-override* nil
+  "When non-NIL, overrides the per-network nMinimumChainWork. For tests (the
+real per-network floors are ~10^25 work, unreachable by synthetic chains).")
+
+(defun minimum-chain-work (network)
+  "Return NETWORK's nMinimumChainWork — the anti-DoS work floor below which a
+header chain is refused admission to the block index (Bitcoin Core
+consensus.nMinimumChainWork, kernel/chainparams.cpp). Values mirror Core
+exactly. 0 disables the gate (regtest / custom signet). A node already past
+this floor rejects any header whose chain would fall below it, blocking a peer
+from bloating the index with a long low-work fork; a node still below it (fresh
+genesis sync) accepts headers normally until it crosses the floor."
+  (or *minimum-chain-work-override*
+      (ecase network
+        (:mainnet  #x0000000000000000000000000000000000000001128750f82f4c366153a3a030)
+        (:testnet3 #x0000000000000000000000000000000000000000000017dde1c649f3708d14b6)
+        (:testnet4 #x0000000000000000000000000000000000000000000009a0fe15d0177d086304)
+        (:signet   #x00000000000000000000000000000000000000000000000000000b463ea0a4b8)
+        (:regtest  0))))
+
 (defvar *accept-datacarrier* t
   "Mempool policy: accept OP_RETURN data-carrier outputs as standard
 (Bitcoin Core -datacarrier, default true). When NIL, any OP_RETURN output
