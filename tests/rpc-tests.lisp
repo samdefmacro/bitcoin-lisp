@@ -1483,3 +1483,31 @@ early when the tip changes."
            (signals bitcoin-lisp.rpc::rpc-error
              (bitcoin-lisp.rpc::rpc-dumptxoutset node (list path))))
       (ignore-errors (delete-file path)))))
+
+;;;; RPC auth + JSON-RPC version (T3b: stock bitcoin-cli compatibility)
+
+(test rpc-accepts-jsonrpc-1.0-and-versionless
+  "parse-json-rpc-request accepts a 1.0 (and version-less) envelope — stock
+bitcoin-cli sends those; rejecting non-2.0 made it unusable."
+  (multiple-value-bind (kind method)
+      (bitcoin-lisp.rpc::parse-json-rpc-request
+       "{\"jsonrpc\":\"1.0\",\"method\":\"getblockcount\",\"params\":[],\"id\":1}")
+    (is (eq :single kind))
+    (is (string= "getblockcount" method)))
+  (multiple-value-bind (kind method)
+      (bitcoin-lisp.rpc::parse-json-rpc-request "{\"method\":\"uptime\",\"id\":1}")
+    (is (eq :single kind))
+    (is (string= "uptime" method))))
+
+(test rpc-basic-auth-and-cookie
+  "%basic-auth-matches-p accepts the configured user:pass and the cookie
+credential, and rejects a wrong password (fixing the prior mismatch bypass)."
+  (let ((bitcoin-lisp.rpc::*rpc-user* "u")
+        (bitcoin-lisp.rpc::*rpc-password* "p")
+        (bitcoin-lisp.rpc::*rpc-cookie-secret* "deadbeef"))
+    (flet ((basic (s) (concatenate 'string "Basic "
+                                   (cl-base64:string-to-base64-string s))))
+      (is (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "u:p")))
+      (is (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "__cookie__:deadbeef")))
+      (is (not (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "u:wrong"))))
+      (is (not (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "__cookie__:bad")))))))
