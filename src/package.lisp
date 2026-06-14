@@ -692,6 +692,11 @@
    ;; Shutdown
    #:request-ibd-stop
    #:reset-ibd-stop
+   ;; Tx-request tracking
+   #:retry-timed-out-tx-requests
+   #:reset-tx-requests
+   #:tx-request-wanted-p
+   #:tx-request-received
    ;; Peer
    #:peer
    #:make-peer

@@ -760,6 +760,7 @@ Returns the node instance."
   ;; CheckForStaleTipAndEvictPeers (net_processing.cpp:5460)
   (when sync
     (bitcoin-lisp.networking:reset-ibd-stop)
+    (bitcoin-lisp.networking:reset-tx-requests)
     (setf (node-sync-thread *node*)
           (bt:make-thread
            (lambda ()
@@ -792,6 +793,9 @@ Returns the node instance."
                                     (sync-blockchain *node*)
                                  (setf (node-syncing *node*) nil))
                                (replace-disconnected-peers *node*)
+                               ;; Re-route any tx getdata that timed out to
+                               ;; another announcer (TxRequestTracker).
+                               (bitcoin-lisp.networking:retry-timed-out-tx-requests)
                                (loop repeat 30 while (node-running *node*)
                                      do (sleep 1)))
                               (t

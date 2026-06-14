@@ -219,6 +219,82 @@ Returns T if message was handled, NIL otherwise."
   (or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
       (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+)))
 
+;;; --- Tx-request tracking (Core TxRequestTracker, simplified) ---
+;;;
+;;; handle-inv used to fire a getdata to the announcing peer with no in-flight
+;;; bookkeeping: the same tx could be requested from every peer that announced
+;;; it at once, and if the one peer we asked never delivered, the tx was lost
+;;; until re-announced. We keep at most one outstanding request per txid, record
+;;; the other announcers as failover candidates, and re-route to one of them if
+;;; the request times out.
+
+(defvar *tx-in-flight* (make-hash-table :test 'equalp)
+  "txid -> (peer . request-internal-real-time); at most one per txid.")
+(defvar *tx-announcers* (make-hash-table :test 'equalp)
+  "txid -> list of peers that announced it (failover candidates).")
+(defvar *tx-request-lock* (bt:make-lock "tx-request"))
+(defparameter +tx-request-timeout-seconds+ 60
+  "Re-route a tx getdata to another announcer after this long with no delivery
+(Bitcoin Core GETDATA_TX_INTERVAL is 60s for non-preferred peers).")
+
+(defun reset-tx-requests ()
+  "Clear all tx-request tracking (called at node start)."
+  (bt:with-lock-held (*tx-request-lock*)
+    (clrhash *tx-in-flight*)
+    (clrhash *tx-announcers*)))
+
+(defun tx-request-wanted-p (txid peer)
+  "Record PEER as an announcer of TXID and return T iff we should send a getdata
+to PEER now — i.e. no request for TXID is currently outstanding. NIL means a
+request is already in flight and PEER is retained only as a failover candidate."
+  (bt:with-lock-held (*tx-request-lock*)
+    (pushnew peer (gethash txid *tx-announcers*))
+    (cond ((gethash txid *tx-in-flight*) nil)
+          (t (setf (gethash txid *tx-in-flight*)
+                   (cons peer (get-internal-real-time)))
+             t))))
+
+(defun tx-request-received (txid)
+  "Clear tracking for TXID once the tx arrives (or is otherwise resolved)."
+  (bt:with-lock-held (*tx-request-lock*)
+    (remhash txid *tx-in-flight*)
+    (remhash txid *tx-announcers*)))
+
+(defun retry-timed-out-tx-requests ()
+  "Re-route each in-flight tx getdata outstanding longer than the timeout to the
+next ready announcer (other than the one that timed out); drop tracking for a
+tx with no other announcer. Returns the number re-requested."
+  (let ((now (get-internal-real-time))
+        (timeout-ticks (* +tx-request-timeout-seconds+ internal-time-units-per-second))
+        (reroutes '()))
+    (bt:with-lock-held (*tx-request-lock*)
+      (let ((timed-out '()))
+        (maphash (lambda (txid entry)
+                   (when (> (- now (cdr entry)) timeout-ticks)
+                     (push (cons txid entry) timed-out)))
+                 *tx-in-flight*)
+        (dolist (item timed-out)
+          (let* ((txid (car item))
+                 (old-peer (cadr item))
+                 (next (find-if (lambda (p) (and (not (eq p old-peer))
+                                                 (eq (peer-state p) :ready)))
+                                (gethash txid *tx-announcers*))))
+            (if next
+                (progn (setf (gethash txid *tx-in-flight*) (cons next now))
+                       (push (cons txid next) reroutes))
+                (progn (remhash txid *tx-in-flight*)
+                       (remhash txid *tx-announcers*)))))))
+    ;; Send getdata outside the lock.
+    (dolist (pair reroutes)
+      (handler-case
+          (send-message (cdr pair)
+                        (bitcoin-lisp.serialization:make-getdata-message
+                         (list (bitcoin-lisp.serialization:make-inv-vector
+                                :type bitcoin-lisp.serialization:+inv-type-witness-tx+
+                                :hash (car pair)))))
+        (error () nil)))
+    (length reroutes)))
+
 (defun handle-inv (peer payload chain-state &optional mempool &key recent-rejects)
   "Handle an inv message.
 
@@ -250,7 +326,10 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
            (when (and mempool
                       (not (bitcoin-lisp.mempool:mempool-has mempool hash))
-                      (not (bitcoin-lisp:recent-reject-p recent-rejects hash)))
+                      (not (bitcoin-lisp:recent-reject-p recent-rejects hash))
+                      ;; Records PEER as an announcer; T only if no request for
+                      ;; this txid is already outstanding (dedup across peers).
+                      (tx-request-wanted-p hash peer))
              (push (bitcoin-lisp.serialization:make-inv-vector
                     :type bitcoin-lisp.serialization:+inv-type-witness-tx+
                     :hash hash)
@@ -480,6 +559,8 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
           (with-node-lock
             (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
                   (current-height (bitcoin-lisp.storage:current-height chain-state)))
+              ;; The requested tx arrived — clear its in-flight/announcer tracking.
+              (tx-request-received txid)
               ;; Mark as announced by this peer
               (setf (gethash txid (peer-announced-txs peer)) t)
               ;; Check recent rejects filter before expensive validation
