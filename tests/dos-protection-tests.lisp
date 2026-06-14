@@ -358,6 +358,34 @@ node-lock now uses); a non-recursive lock would deadlock here."
    :address addr :inbound t :state :ready
    :ping-latency ping :connect-time connect-time))
 
+(test anchors-save-load-roundtrip
+  "save-anchors persists up to +max-anchors+ ready outbound peers; load-anchors
+restores them (in order) for priority reconnection. Inbound peers excluded."
+  (let* ((dir (ensure-directories-exist
+               (merge-pathnames "test-anchors/" (uiop:temporary-directory))))
+         (node (bitcoin-lisp::make-node)))
+    (setf (bitcoin-lisp::node-data-directory node) dir)
+    (setf (bitcoin-lisp::node-peers node)
+          (list (bitcoin-lisp.networking:make-peer :address "1.2.3.4" :inbound nil :state :ready)
+                (bitcoin-lisp.networking:make-peer :address "5.6.7.8" :inbound nil :state :ready)
+                (bitcoin-lisp.networking:make-peer :address "9.9.9.9" :inbound nil :state :ready)
+                (bitcoin-lisp.networking:make-peer :address "7.7.7.7" :inbound t   :state :ready)))
+    (bitcoin-lisp::save-anchors node)        ; saves the first 2 ready outbound
+    (let ((bitcoin-lisp::*pending-anchor-addresses* nil))
+      (bitcoin-lisp::load-anchors node)
+      (is (equal '("1.2.3.4" "5.6.7.8") bitcoin-lisp::*pending-anchor-addresses*)))))
+
+(test anchors-load-missing-file-noop
+  "load-anchors on a directory with no anchors.dat doesn't crash or set anchors."
+  (let* ((dir (ensure-directories-exist
+               (merge-pathnames "test-anchors-empty/" (uiop:temporary-directory))))
+         (node (bitcoin-lisp::make-node)))
+    (setf (bitcoin-lisp::node-data-directory node) dir)
+    (ignore-errors (delete-file (bitcoin-lisp::anchors-dat-path dir)))
+    (let ((bitcoin-lisp::*pending-anchor-addresses* nil))
+      (bitcoin-lisp::load-anchors node)
+      (is (null bitcoin-lisp::*pending-anchor-addresses*)))))
+
 (test evict-least-valuable-inbound-protects-best
   "evict-least-valuable-inbound shields the most valuable inbound peers (lowest
 ping, longest connected) and evicts an unprotected one — the youngest in the
