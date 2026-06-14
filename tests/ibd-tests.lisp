@@ -747,6 +747,57 @@ leaving a live peer's in-flight untouched."
                 (merge-pathnames "test-chain/" (uiop:temporary-directory)))))
     (is (= 0 (bitcoin-lisp.networking::process-headers '() state)))))
 
+(test minimum-chain-work-constants
+  "minimum-chain-work returns Core's exact nMinimumChainWork per network, and
+the override takes precedence (for tests / custom chains)."
+  (is (= #x0000000000000000000000000000000000000001128750f82f4c366153a3a030
+         (bitcoin-lisp:minimum-chain-work :mainnet)))
+  (is (= #x0000000000000000000000000000000000000000000009a0fe15d0177d086304
+         (bitcoin-lisp:minimum-chain-work :testnet4)))
+  (is (= 0 (bitcoin-lisp:minimum-chain-work :regtest)))
+  (let ((bitcoin-lisp::*minimum-chain-work-override* 42))
+    (is (= 42 (bitcoin-lisp:minimum-chain-work :mainnet)))))
+
+(test process-headers-minimum-chain-work-gate
+  "Once the active chain is past nMinimumChainWork, a header building a chain
+below the floor is refused index admission (anti-DoS low-work fork spam), while
+a header extending the high-work tip is accepted."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (state (bitcoin-lisp.storage:init-chain-state
+                 (merge-pathnames "test-minwork/" (uiop:temporary-directory))))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash state))
+         (genesis-entry (bitcoin-lisp.storage:get-block-index-entry state genesis-hash))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         ;; Plant a high-chain-work tip so past-min-work is true.
+         (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash tip-hash :height 1 :prev-entry genesis-entry
+            :chain-work 1000000000000 :status :valid
+            :header (bitcoin-lisp.serialization:make-block-header
+                     :version 1 :prev-block genesis-hash :merkle-root zeros
+                     :timestamp 1296688700 :bits #x207fffff :nonce 0
+                     :cached-hash tip-hash)))
+    (bitcoin-lisp.storage:update-chain-tip state tip-hash 1)
+    (let ((bitcoin-lisp::*minimum-chain-work-override* 500000000000))
+      ;; A header forking off genesis: chain-work ~= genesis + 1 regtest block,
+      ;; far below the 5e11 floor -> rejected.
+      (let* ((fork-hdr (bitcoin-lisp.serialization:make-block-header
+                        :version 1 :prev-block genesis-hash :merkle-root zeros
+                        :timestamp 1296688800 :bits #x207fffff :nonce 1))
+             (fork-hash (bitcoin-lisp.serialization:block-header-hash fork-hdr)))
+        (bitcoin-lisp.networking::process-headers (list fork-hdr) state)
+        (is (null (bitcoin-lisp.storage:get-block-index-entry state fork-hash))
+            "low-work fork header should be refused"))
+      ;; A header extending the high-work tip: chain-work > floor -> accepted.
+      (let* ((ext-hdr (bitcoin-lisp.serialization:make-block-header
+                       :version 1 :prev-block tip-hash :merkle-root zeros
+                       :timestamp 1296688900 :bits #x207fffff :nonce 2))
+             (ext-hash (bitcoin-lisp.serialization:block-header-hash ext-hdr)))
+        (bitcoin-lisp.networking::process-headers (list ext-hdr) state)
+        (is (not (null (bitcoin-lisp.storage:get-block-index-entry state ext-hash)))
+            "tip-extending header should be admitted")))))
+
 (test validate-block-skip-scripts
   "Test that validate-block with :skip-scripts t skips script validation."
   ;; Create a minimal block with an invalid script that would normally fail.

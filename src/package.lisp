@@ -864,6 +864,7 @@
    #:*permit-bare-multisig*
    #:pruning-enabled-p
    #:automatic-pruning-p
+   #:minimum-chain-work
    ;; Token bucket rate limiter
    #:token-bucket
    #:make-token-bucket
