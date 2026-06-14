@@ -1220,9 +1220,12 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
          (bitcoin-lisp.serialization:coinbase-input-p (aref inputs 0)))))
 
 (defun calculate-block-subsidy (height)
-  "Calculate the block subsidy for a given height.
-Subsidy halves every 210,000 blocks."
-  (let* ((halvings (floor height 210000))
+  "Calculate the block subsidy for a given height. Subsidy halves every
+halving interval — 210,000 blocks on mainnet/testnet/signet, 150 on regtest
+(Bitcoin Core CRegTestParams nSubsidyHalvingInterval). The previous hardcoded
+210,000 over-paid regtest coinbases past height 150 vs Core."
+  (let* ((interval (if (eq bitcoin-lisp:*network* :regtest) 150 210000))
+         (halvings (floor height interval))
          (subsidy (* 50 +coin+)))
     (if (>= halvings 64)
         0

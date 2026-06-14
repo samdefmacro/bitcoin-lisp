@@ -79,6 +79,12 @@
   (register-rpc-method "uptime" #'rpc-uptime)
   (register-rpc-method "getindexinfo" #'rpc-getindexinfo)
   (register-rpc-method "getdeploymentinfo" #'rpc-getdeploymentinfo)
+  ;; Operator / control methods
+  (register-rpc-method "stop" #'rpc-stop)
+  (register-rpc-method "help" #'rpc-help)
+  (register-rpc-method "getrpcinfo" #'rpc-getrpcinfo)
+  (register-rpc-method "getmemoryinfo" #'rpc-getmemoryinfo)
+  (register-rpc-method "getnetworkhashps" #'rpc-getnetworkhashps)
   ;; Peer / address methods
   (register-rpc-method "getnodeaddresses" #'rpc-getnodeaddresses)
   (register-rpc-method "disconnectnode" #'rpc-disconnectnode)
