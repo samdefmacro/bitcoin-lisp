@@ -606,7 +606,18 @@ Returns the number of new headers added."
         (best-header-height (if *ibd-context*
                                 (ibd-context-header-tip-height *ibd-context*)
                                 0))
-        (newly-added '()))
+        (newly-added '())
+        ;; nMinimumChainWork anti-DoS gate (Core AcceptBlockHeader min_pow_checked).
+        ;; Once our active chain is past the work floor, refuse any header whose
+        ;; chain would fall below it — a peer cannot bloat the index with a long
+        ;; low-work fork. During a fresh genesis sync (tip below the floor) the
+        ;; gate is off, so honest sync proceeds until it crosses the floor.
+        (min-work (bitcoin-lisp:minimum-chain-work bitcoin-lisp:*network*))
+        (past-min-work
+          (let ((tip (bitcoin-lisp.storage:get-block-index-entry
+                      chain-state (bitcoin-lisp.storage:best-block-hash chain-state))))
+            (and tip (>= (bitcoin-lisp.storage:block-index-entry-chain-work tip)
+                         (bitcoin-lisp:minimum-chain-work bitcoin-lisp:*network*))))))
     (dolist (header headers)
       (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
              (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
@@ -620,20 +631,26 @@ Returns the number of new headers added."
                      (prev-work (bitcoin-lisp.storage:block-index-entry-chain-work
                                  prev-entry))
                      (bits (bitcoin-lisp.serialization:block-header-bits header))
-                     (entry (bitcoin-lisp.storage:make-block-index-entry
-                             :hash hash
-                             :height new-height
-                             :header header
-                             :prev-entry prev-entry
-                             :chain-work (bitcoin-lisp.storage:calculate-chain-work
-                                          bits prev-work)
-                             :status :header-valid)))
-                (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
-                (push (cons hash new-height) newly-added)
-                (incf added)
-                ;; Track header tip height in IBD context
-                (when (> new-height best-header-height)
-                  (setf best-header-height new-height))))))))
+                     (new-work (bitcoin-lisp.storage:calculate-chain-work
+                                bits prev-work)))
+                ;; Anti-DoS: when already synced past the floor, drop headers
+                ;; whose chain is still below it (a fresh low-work fork an
+                ;; attacker is trying to plant). Legitimate near-tip forks have
+                ;; chain-work far above the floor and are unaffected.
+                (unless (and past-min-work (< new-work min-work))
+                  (let ((entry (bitcoin-lisp.storage:make-block-index-entry
+                                :hash hash
+                                :height new-height
+                                :header header
+                                :prev-entry prev-entry
+                                :chain-work new-work
+                                :status :header-valid)))
+                    (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
+                    (push (cons hash new-height) newly-added)
+                    (incf added)
+                    ;; Track header tip height in IBD context
+                    (when (> new-height best-header-height)
+                      (setf best-header-height new-height))))))))))
     ;; Update header tip in IBD context (not the chain-state best-height)
     (when *ibd-context*
       (setf (ibd-context-header-tip-height *ibd-context*) best-header-height)
