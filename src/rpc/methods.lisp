@@ -510,7 +510,7 @@ anything to the mempool. Each tx is checked independently against current state
                     (txid (bitcoin-lisp.serialization:transaction-hash tx)))
                (multiple-value-bind (valid error fee)
                    (bitcoin-lisp.validation:validate-transaction-for-mempool
-                    tx utxo-set mempool height)
+                    tx utxo-set mempool height :chain-state chain-state)
                  (if valid
                      `(("txid" . ,(hash-to-hex txid))
                        ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
@@ -544,7 +544,7 @@ anything to the mempool. Each tx is checked independently against current state
           ;; Validate transaction for mempool
           (multiple-value-bind (valid error fee replaced)
               (bitcoin-lisp.validation:validate-transaction-for-mempool
-               tx utxo-set mempool current-height)
+               tx utxo-set mempool current-height :chain-state chain-state)
             (unless valid
               (error 'rpc-error :code +rpc-misc-error+
                                 :message (format nil "Transaction rejected: ~A" error)))

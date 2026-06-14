@@ -453,7 +453,7 @@ genuinely missing input)."
                (return-from mempool-extra-coins (values nil nil))))))))))
 
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
-                                         &key package-coins skip-fee-check)
+                                         &key package-coins skip-fee-check chain-state)
   "Validate a transaction for mempool acceptance.
 Performs consensus checks plus policy checks.
 Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure.
@@ -463,7 +463,12 @@ PACKAGE-COINS, when supplied, is a (txid . index) -> utxo-entry table of outputs
 produced by sibling transactions in a package being validated together (so a
 child can spend a not-yet-in-mempool parent). SKIP-FEE-CHECK bypasses the per-tx
 minimum-fee floor, used when the package as a whole is evaluated at the package
-feerate (Bitcoin Core's package_feerates path)."
+feerate (Bitcoin Core's package_feerates path).
+
+CHAIN-STATE, when supplied, enables the relay finality + BIP68 sequence-lock
+checks (Core PreChecks: a tx that couldn't be mined into the NEXT block doesn't
+belong in the mempool). Omitted on paths re-adding already-confirmed txs (reorg
+re-add, mempool.dat reload) where those checks don't apply."
   ;; Must not be coinbase
   (when (and (= (length (bitcoin-lisp.serialization:transaction-inputs tx)) 1)
              (bitcoin-lisp.serialization:coinbase-input-p
@@ -535,6 +540,31 @@ feerate (Bitcoin Core's package_feerates path)."
     (unless inputs-ok
       (return-from validate-transaction-for-mempool
         (values nil :missing-input nil)))
+
+    ;; Relay finality + BIP68 sequence-locks, evaluated as if the tx were in
+    ;; the NEXT block (tip+1) with the tip's median-time-past (BIP113) —
+    ;; Bitcoin Core's PreChecks "non-final" / "non-BIP68-final". Without this
+    ;; the mempool accepts timelocked txs that can't yet be mined. Same helpers
+    ;; the block connect path uses; gated on CHAIN-STATE being supplied.
+    (when chain-state
+      (let* ((eval-height (1+ current-height))
+             (tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+             (mtp (compute-median-time-past chain-state tip-hash))
+             (csv-active (>= eval-height
+                             (get-csv-activation-height bitcoin-lisp:*network*)))
+             ;; BIP113: locktime compares against MTP once CSV is active
+             ;; (true on all our networks at tip); fall back to wall-clock
+             ;; for the pre-activation window.
+             (locktime-time (if csv-active mtp
+                                (bitcoin-lisp.serialization:get-unix-time))))
+        (unless (check-transaction-final tx eval-height locktime-time)
+          (return-from validate-transaction-for-mempool
+            (values nil :non-final nil)))
+        (when csv-active
+          (unless (check-sequence-locks tx utxo-set eval-height mtp chain-state
+                                        :pending-utxos extra-coins)
+            (return-from validate-transaction-for-mempool
+              (values nil :non-bip68-final nil))))))
 
     ;; Policy: bounded sigop cost (now that spent scripts are available).
     (flet ((spent-script (txid index)

@@ -708,6 +708,76 @@ sizes it (-datacarrier / -datacarriersize)."
       (is (null valid))
       (is (eq err :scriptsig-not-pushonly)))))
 
+(defun %mempool-final-fixture (suffix)
+  "Chain-state with a genesis + tip entry (both carrying headers so the MTP
+walk works) and a UTXO-set. Returns (values state utxo tip-height)."
+  (let* ((state (bitcoin-lisp.storage:init-chain-state
+                 (merge-pathnames suffix (uiop:temporary-directory))))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash state))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (genesis-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash genesis-hash :height 0 :chain-work 1 :status :valid
+                         :header (bitcoin-lisp.serialization:make-block-header
+                                  :version 1 :prev-block zeros :merkle-root zeros
+                                  :timestamp 1700000000 :bits #x207fffff :nonce 0
+                                  :cached-hash genesis-hash)))
+         (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (bitcoin-lisp.storage:add-block-index-entry state genesis-entry)
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash tip-hash :height 1 :prev-entry genesis-entry
+            :chain-work 3 :status :valid
+            :header (bitcoin-lisp.serialization:make-block-header
+                     :version 1 :prev-block genesis-hash :merkle-root zeros
+                     :timestamp 1700000600 :bits #x207fffff :nonce 0
+                     :cached-hash tip-hash)))
+    (bitcoin-lisp.storage:update-chain-tip state tip-hash 1)
+    (values state utxo 1)))
+
+(test mempool-rejects-non-final-tx
+  "With chain-state supplied, a tx whose height-based locktime is beyond the
+next block and whose sequences are non-final is rejected :non-final (Core
+PreChecks). Without chain-state the finality check is skipped."
+  (let ((bitcoin-lisp:*network* :regtest))
+    (multiple-value-bind (state utxo tip-height)
+        (%mempool-final-fixture "test-mp-final/")
+      (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+             (base (make-mempool-test-tx :input-id 90))
+             (prevout (bitcoin-lisp.serialization:tx-in-previous-output
+                       (elt (bitcoin-lisp.serialization:transaction-inputs base) 0)))
+             ;; non-final sequence + far-future height-based locktime
+             (tx (bitcoin-lisp.serialization:make-transaction
+                  :version 1
+                  :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                   :previous-output prevout
+                                   :script-sig (make-array 10 :element-type '(unsigned-byte 8)
+                                                           :initial-element 0)
+                                   :sequence 0))
+                  :outputs (bitcoin-lisp.serialization:transaction-outputs base)
+                  :lock-time 9999999)))
+        ;; Resolve the input so validation reaches the finality check.
+        (bitcoin-lisp.storage:add-utxo
+         utxo (bitcoin-lisp.serialization:outpoint-hash prevout)
+         (bitcoin-lisp.serialization:outpoint-index prevout)
+         100000000
+         (bitcoin-lisp.serialization:tx-out-script-pubkey
+          (elt (bitcoin-lisp.serialization:transaction-outputs base) 0))
+         0)
+        ;; With chain-state: rejected as non-final.
+        (multiple-value-bind (valid err)
+            (bitcoin-lisp.validation:validate-transaction-for-mempool
+             tx utxo mempool tip-height :chain-state state)
+          (is (null valid))
+          (is (eq err :non-final)))
+        ;; Without chain-state: the finality check is skipped (so it is not the
+        ;; reason for any rejection).
+        (multiple-value-bind (valid err)
+            (bitcoin-lisp.validation:validate-transaction-for-mempool
+             tx utxo mempool tip-height)
+          (declare (ignore valid))
+          (is (not (eq err :non-final))))))))
+
 ;;;; PR3 ancestor/descendant tracking + chained spends
 
 (defun %mp-spending-tx (parent-txid &key (vout 0) (value 40000000))
