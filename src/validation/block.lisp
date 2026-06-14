@@ -630,10 +630,15 @@ HEIGHT is used to determine which script verification flags to enable."
 
   (let ((script-flags (compute-script-flags-for-height height))
         (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
-    ;; For non-tiny blocks, parallelize tx-script validation across workers.
-    ;; Sequential path is kept for tiny blocks where thread-spawn overhead
-    ;; dominates the speedup.
-    (if (and (>= (length (rest transactions)) +parallel-validation-min-txs+)
+    ;; For non-tiny blocks, parallelize tx-script validation across workers
+    ;; — but ONLY when explicitly enabled. The per-block worker threads are
+    ;; off by default (bitcoin-lisp:*parallel-block-validation* nil) because at
+    ;; mainnet scale their concurrent libsecp CFFI corrupts SBCL's alien-type
+    ;; cache and crashes the node; see that var's docstring. Sequential path is
+    ;; the default and is also used for tiny blocks where thread-spawn overhead
+    ;; dominates any speedup.
+    (if (and bitcoin-lisp:*parallel-block-validation*
+             (>= (length (rest transactions)) +parallel-validation-min-txs+)
              (> +parallel-validation-workers+ 1))
         (if (validate-block-scripts-parallel transactions script-flags utxo-set height)
             (values t nil)

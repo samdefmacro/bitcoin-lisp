@@ -40,6 +40,22 @@ Set automatically based on network: 100000 for mainnet, 1000 for testnet.")
   "When non-NIL, overrides the per-network nMinimumChainWork. For tests (the
 real per-network floors are ~10^25 work, unreachable by synthetic chains).")
 
+(defvar *parallel-block-validation* nil
+  "When NIL (default), block-script validation runs single-threaded.
+
+The per-block worker-thread path is disabled by default after a production
+crash: at mainnet block scale the concurrent libsecp CFFI calls across the
+worker threads corrupt SBCL's global alien-type cache (SB-ALIEN::RECORD-TYPE=,
+an EQ hash-table mutated under a system lock), which then faults during an
+unrelated alien op — the sync thread's socket-connect (make-sockaddr-for) — and
+spirals into a \"maximum interrupt nesting depth exceeded\" fatal. testnet4's
+small blocks never crossed the threshold (3h+ stable), but mainnet crashed at
+tip within minutes. Serial validation removes the concurrent alien-cache writes.
+
+IBD was network/disk-bound (sig checks were never the top profile frames), so
+the speed cost is small. Set T to re-enable parallel validation on a low-volume
+chain where the speedup matters and the scale stays safe.")
+
 (defun minimum-chain-work (network)
   "Return NETWORK's nMinimumChainWork — the anti-DoS work floor below which a
 header chain is refused admission to the block index (Bitcoin Core
