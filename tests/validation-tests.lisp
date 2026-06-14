@@ -535,6 +535,60 @@ We verify MTP computation directly to confirm the check works."
         (is (null valid))
         (is (eq :script-failed error))))))
 
+(test validate-block-scripts-parallel-path
+  "The opt-in parallel validation path (bitcoin-lisp:*parallel-block-validation*
+bound T) must produce the same accept/reject result as the default serial path
+for a block large enough to cross +parallel-validation-min-txs+ (16 non-coinbase
+txs). Guards the worker-thread fan-out/join and the shared failure-flag against
+regressions: the path is OFF in production (it corrupts SBCL's alien-type cache
+at mainnet scale), so only this test exercises it."
+  (flet ((build-block (script-pubkey script-sig n)
+           ;; N spending txs (each spending its own UTXO of SCRIPT-PUBKEY with
+           ;; SCRIPT-SIG) plus a coinbase. Returns (values block utxo-set).
+           (let ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+                 (txs (list (make-coinbase-transaction :value 5000000000 :height 10))))
+             (dotimes (i n)
+               (let ((prev-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element (logand i #xFF))))
+                 (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 1000000 script-pubkey 5)
+                 (push (bitcoin-lisp.serialization:make-transaction
+                        :version 1
+                        :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                         :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                           :hash prev-txid :index 0)
+                                         :script-sig script-sig
+                                         :sequence #xFFFFFFFF))
+                        :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                          :value 900000
+                                          :script-pubkey script-pubkey))
+                        :lock-time 0)
+                       txs)))
+             (values (bitcoin-lisp.serialization:make-bitcoin-block
+                      :header (make-test-block-header)
+                      :transactions (nreverse txs))
+                     utxo-set))))
+    (let ((op-true (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+          (empty (make-array 0 :element-type '(unsigned-byte 8)))
+          ;; P2PKH with empty scriptSig — always fails consensus.
+          (p2pkh (make-array 25 :element-type '(unsigned-byte 8)
+                               :initial-contents
+                               (list #x76 #xa9 #x14 1 2 3 4 5 6 7 8 9 10
+                                     11 12 13 14 15 16 17 18 19 20 #x88 #xac))))
+      ;; 20 anyone-can-spend (OP_TRUE) outputs => ACCEPT on both paths.
+      (multiple-value-bind (blk utxo-set) (build-block op-true empty 20)
+        (let ((bitcoin-lisp:*parallel-block-validation* t))
+          (is (eq t (bitcoin-lisp.validation:validate-block-scripts blk utxo-set))))
+        (let ((bitcoin-lisp:*parallel-block-validation* nil))
+          (is (eq t (bitcoin-lisp.validation:validate-block-scripts blk utxo-set)))))
+      ;; 20 P2PKH outputs with empty scriptSig => REJECT on the parallel path
+      ;; too (worker detects the failure and the join reports it).
+      (multiple-value-bind (blk utxo-set) (build-block p2pkh empty 20)
+        (let ((bitcoin-lisp:*parallel-block-validation* t))
+          (multiple-value-bind (valid error)
+              (bitcoin-lisp.validation:validate-block-scripts blk utxo-set)
+            (is (null valid))
+            (is (eq :script-failed error))))))))
+
 ;;;; Witness Validation Tests
 
 (defun make-witness-p2wpkh-script ()
