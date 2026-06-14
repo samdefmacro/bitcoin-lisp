@@ -510,6 +510,27 @@ re-request (e.g. after a reorg) starts fresh."
     (setf (bitcoin-lisp.networking::peer-state p) state-key)
     p))
 
+(test block-relay-targets-skips-source-and-nonready
+  "block-relay-targets announces a new block to every ready peer except the
+source (which already has it); non-ready peers are excluded."
+  (let ((src (%make-peer-with-state :ready))
+        (ready (%make-peer-with-state :ready))
+        (dead (%make-peer-with-state :disconnected)))
+    (is (equal (list ready)
+               (bitcoin-lisp.networking::block-relay-targets src (list src ready dead))))))
+
+(test relay-block-noop-when-relay-disabled
+  "relay-block is a no-op when relay is disabled (mainnet default), so a
+relay-off node never propagates blocks."
+  (let ((bitcoin-lisp:*network* :mainnet)
+        (bitcoin-lisp:*mainnet-relay-enabled* nil)
+        (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (is (null (bitcoin-lisp.networking::relay-block
+               (bitcoin-lisp.serialization:make-block-header
+                :version 1 :prev-block zeros :merkle-root zeros
+                :timestamp 1700000000 :bits #x1d00ffff :nonce 0)
+               nil (list (%make-peer-with-state :ready)))))))
+
 (test update-block-availability-known-hash
   "When the announced hash is already in the index with positive
 chain-work, peer's best-known-block-hash is set to it."
