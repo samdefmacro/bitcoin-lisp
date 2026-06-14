@@ -111,12 +111,13 @@ matching Bitcoin Core's uint256::GetHex."
          (bitcoin-lisp.crypto:bytes-to-hex
           (bitcoin-lisp.serialization:serialize block)))
         (1 ;; Return JSON with txids only
-         (block-to-json block hash-str nil))
+         (block-to-json block hash-str nil (rpc-get-network node)))
         (2 ;; Return JSON with full tx details
-         (block-to-json block hash-str t))))))
+         (block-to-json block hash-str t (rpc-get-network node)))))))
 
-(defun block-to-json (block hash-str include-tx-details)
-  "Convert block to JSON representation."
+(defun block-to-json (block hash-str include-tx-details &optional network)
+  "Convert block to JSON representation. NETWORK enables output addresses in the
+full-tx-detail (verbosity 2) form."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
     `(("hash" . ,hash-str)
@@ -128,39 +129,93 @@ matching Bitcoin Core's uint256::GetHex."
       ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
       ("nTx" . ,(length txs))
       ("tx" . ,(if include-tx-details
-                   (mapcar #'tx-to-json txs)
+                   (mapcar (lambda (tx) (tx-to-json tx network)) txs)
                    (mapcar #'tx-to-txid txs))))))
 
 (defun tx-to-txid (tx)
   "Get transaction ID as hex string."
   (hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
 
-(defun tx-to-json (tx)
-  "Convert transaction to JSON representation."
+(defun %tx-wire-bytes (tx)
+  "TX in its wire encoding (witness form when it has witness data), for the
+size/hex fields. Mirrors the mempool's tx-wire-bytes."
+  (if (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+      (bitcoin-lisp.serialization:serialize-witness-transaction tx)
+      (bitcoin-lisp.serialization:serialize-transaction tx)))
+
+(defun %script-type (script)
+  "Bitcoin Core scriptPubKey 'type' name for a standard SCRIPT, else
+\"nonstandard\"."
+  (let ((len (length script)))
+    (flet ((b (i) (aref script i)))
+      (cond
+        ((and (= len 25) (= (b 0) #x76) (= (b 1) #xa9) (= (b 2) #x14)
+              (= (b 23) #x88) (= (b 24) #xac)) "pubkeyhash")
+        ((and (= len 23) (= (b 0) #xa9) (= (b 1) #x14) (= (b 22) #x87)) "scripthash")
+        ((and (= len 22) (= (b 0) #x00) (= (b 1) #x14)) "witness_v0_keyhash")
+        ((and (= len 34) (= (b 0) #x00) (= (b 1) #x20)) "witness_v0_scripthash")
+        ((and (= len 34) (= (b 0) #x51) (= (b 1) #x20)) "witness_v1_taproot")
+        ((and (>= len 1) (= (b 0) #x6a)) "nulldata")
+        ((and (or (= len 35) (= len 67)) (= (b (1- len)) #xac)) "pubkey")
+        (t "nonstandard")))))
+
+(defun %tx-input-witness (tx index)
+  "The witness stack (vector of byte vectors) for input INDEX of TX, or NIL."
+  (let ((w (bitcoin-lisp.serialization:transaction-witness tx)))
+    (when (and w (< index (length w)))
+      (elt w index))))
+
+(defun tx-to-json (tx &optional network)
+  "Convert transaction to JSON. When NETWORK is supplied, output addresses are
+derived. Includes the size/weight/hex fields explorers and fee tools expect."
   (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-        (outputs (bitcoin-lisp.serialization:transaction-outputs tx)))
+        (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
+        (wire (%tx-wire-bytes tx)))
     `(("txid" . ,(tx-to-txid tx))
+      ("hash" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
       ("version" . ,(bitcoin-lisp.serialization:transaction-version tx))
-      ("vin" . ,(map 'list #'input-to-json inputs))
+      ("size" . ,(length wire))
+      ("vsize" . ,(bitcoin-lisp.serialization:transaction-vsize tx))
+      ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))
+      ("locktime" . ,(bitcoin-lisp.serialization:transaction-lock-time tx))
+      ("vin" . ,(loop for input across inputs
+                      for i from 0
+                      collect (input-to-json input (%tx-input-witness tx i))))
       ("vout" . ,(loop for out across outputs
                        for i from 0
-                       collect (output-to-json out i)))
-      ("locktime" . ,(bitcoin-lisp.serialization:transaction-lock-time tx)))))
+                       collect (output-to-json out i network)))
+      ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex wire)))))
 
-(defun input-to-json (input)
-  "Convert transaction input to JSON."
-  (let ((outpoint (bitcoin-lisp.serialization:tx-in-previous-output input)))
-    `(("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:outpoint-hash outpoint)))
-      ("vout" . ,(bitcoin-lisp.serialization:outpoint-index outpoint))
-      ("scriptSig" . (("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                 (bitcoin-lisp.serialization:tx-in-script-sig input))))))))
+(defun input-to-json (input &optional witness-stack)
+  "Convert transaction input to JSON, including sequence and (when present) the
+witness stack; coinbase inputs emit a coinbase field instead of txid/vout."
+  (let ((base
+          (if (bitcoin-lisp.serialization:coinbase-input-p input)
+              `(("coinbase" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                (bitcoin-lisp.serialization:tx-in-script-sig input))))
+              (let ((outpoint (bitcoin-lisp.serialization:tx-in-previous-output input)))
+                `(("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:outpoint-hash outpoint)))
+                  ("vout" . ,(bitcoin-lisp.serialization:outpoint-index outpoint))
+                  ("scriptSig" . (("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                             (bitcoin-lisp.serialization:tx-in-script-sig input))))))))))
+    (when (and witness-stack (plusp (length witness-stack)))
+      (setf base (append base
+                         `(("txinwitness"
+                            . ,(map 'list #'bitcoin-lisp.crypto:bytes-to-hex witness-stack))))))
+    (append base `(("sequence" . ,(bitcoin-lisp.serialization:tx-in-sequence input))))))
 
-(defun output-to-json (output index)
-  "Convert transaction output to JSON."
-  `(("value" . ,(/ (bitcoin-lisp.serialization:tx-out-value output) 100000000.0d0))
-    ("n" . ,index)
-    ("scriptPubKey" . (("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                  (bitcoin-lisp.serialization:tx-out-script-pubkey output)))))))
+(defun output-to-json (output index &optional network)
+  "Convert transaction output to JSON, with scriptPubKey type and (when NETWORK
+is supplied and the script is addressable) address."
+  (let* ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output))
+         (addr (and network (%script->address spk network)))
+         (spk-json `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+                     ("type" . ,(%script-type spk)))))
+    (when addr
+      (setf spk-json (append spk-json `(("address" . ,addr)))))
+    `(("value" . ,(/ (bitcoin-lisp.serialization:tx-out-value output) 100000000.0d0))
+      ("n" . ,index)
+      ("scriptPubKey" . ,spk-json))))
 
 (defun rpc-getblockheader (node params)
   "Return block header data."
@@ -1536,7 +1591,6 @@ generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
 
 (defun rpc-decoderawtransaction (node params)
   "Decode a raw transaction hex string to JSON."
-  (declare (ignore node))
   (let ((hex-str (first params)))
     (unless (and (stringp hex-str) (> (length hex-str) 0))
       (error 'rpc-error :code +rpc-deserialization-error+
@@ -1545,7 +1599,7 @@ generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
         (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes hex-str))
                (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
                      (bitcoin-lisp.serialization:read-transaction stream))))
-          (tx-to-json tx))
+          (tx-to-json tx (rpc-get-network node)))
       (error (e)
         (error 'rpc-error :code +rpc-deserialization-error+
                           :message (format nil "TX decode failed: ~A" e))))))
@@ -1571,7 +1625,7 @@ Searches mempool first, then txindex (if enabled), then blockhash hint."
         (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction mempool-entry)))
           (return-from rpc-getrawtransaction
             (if verbose
-                (tx-to-json tx)
+                (tx-to-json tx (rpc-get-network node))
                 (bitcoin-lisp.crypto:bytes-to-hex
                  (bitcoin-lisp.serialization:serialize tx))))))
 
@@ -1636,7 +1690,7 @@ Searches mempool first, then txindex (if enabled), then blockhash hint."
                    (bitcoin-lisp.storage:block-index-entry-header block-entry)))
          (block-time (when header
                        (bitcoin-lisp.serialization:block-header-timestamp header)))
-         (base-json (tx-to-json tx)))
+         (base-json (tx-to-json tx (rpc-get-network node))))
     ;; Add confirmed transaction fields
     (append base-json
             `(("blockhash" . ,(hash-to-hex block-hash))

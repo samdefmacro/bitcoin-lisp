@@ -1511,3 +1511,21 @@ credential, and rejects a wrong password (fixing the prior mismatch bypass)."
       (is (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "__cookie__:deadbeef")))
       (is (not (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "u:wrong"))))
       (is (not (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "__cookie__:bad")))))))
+
+;;;; tx JSON field completeness (T3c)
+
+(test tx-to-json-includes-core-fields
+  "tx-to-json emits the size/weight/hex/wtxid fields and per-output type +
+address (with network), and per-input sequence — the fields explorers expect."
+  (let* ((tx (make-mempool-test-tx :input-id 50))
+         (j (bitcoin-lisp.rpc::tx-to-json tx :regtest)))
+    (is (stringp (cdr (assoc "hash" j :test #'string=))))
+    (is (integerp (cdr (assoc "vsize" j :test #'string=))))
+    (is (integerp (cdr (assoc "weight" j :test #'string=))))
+    (is (stringp (cdr (assoc "hex" j :test #'string=))))
+    (let* ((vout (first (cdr (assoc "vout" j :test #'string=))))
+           (spk (cdr (assoc "scriptPubKey" vout :test #'string=))))
+      (is (string= "pubkeyhash" (cdr (assoc "type" spk :test #'string=))))
+      (is (stringp (cdr (assoc "address" spk :test #'string=)))))
+    (let ((vin (first (cdr (assoc "vin" j :test #'string=)))))
+      (is (assoc "sequence" vin :test #'string=)))))
