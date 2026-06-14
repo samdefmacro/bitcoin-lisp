@@ -1373,6 +1373,21 @@ selected tx with data/txid/hash/depends/fee/sigops/weight. `depends` holds the
                     ("sigops" . ,(bitcoin-lisp.mempool:mempool-entry-sigops e))
                     ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))))))
 
+(defun %gbt-rules (height)
+  "Active versionbits soft-fork rule names for a block at HEIGHT, as Bitcoin
+Core's getblocktemplate \"rules\" array. segwit carries the \"!\" prefix
+(mandatory: a miner that doesn't understand it must not build the template),
+mirroring Core. Without this array, segwit/taproot-aware miners reject the
+template outright."
+  (let ((net bitcoin-lisp:*network*) (rules '()))
+    (when (>= height (bitcoin-lisp.validation:get-csv-activation-height net))
+      (push "csv" rules))
+    (when (>= height (bitcoin-lisp.validation:get-segwit-activation-height net))
+      (push "!segwit" rules))
+    (when (>= height (bitcoin-lisp.validation:get-taproot-activation-height net))
+      (push "taproot" rules))
+    (nreverse rules)))
+
 (defun rpc-getblocktemplate (node params)
   "Return a block template assembled from the mempool (Bitcoin Core
 getblocktemplate). The optional template-request object is accepted but only its
@@ -1398,7 +1413,18 @@ implicit default mode is supported (no longpoll / proposal). Fields mirror Core.
       ("height" . ,(bitcoin-lisp.mining:block-template-height template))
       ("default_witness_commitment"
        . ,(bitcoin-lisp.crypto:bytes-to-hex
-           (bitcoin-lisp.mining:block-template-default-witness-commitment-script template))))))
+           (bitcoin-lisp.mining:block-template-default-witness-commitment-script template)))
+      ;; Active soft-fork rules + versionbits signaling state. No BIP9
+      ;; deployment is currently pending on any of our networks, so
+      ;; vbavailable is empty and vbrequired is 0.
+      ("rules" . ,(%gbt-rules (bitcoin-lisp.mining:block-template-height template)))
+      ("vbavailable" . ,(make-hash-table :test 'equal))
+      ("vbrequired" . 0)
+      ;; longpoll id: miners poll with this; we don't block on it, but emit a
+      ;; tip-derived id so longpoll-aware miners are satisfied.
+      ("longpollid" . ,(format nil "~A~D"
+                               (hash-to-hex (bitcoin-lisp.mining:block-template-prev-hash template))
+                               (bitcoin-lisp.mining:block-template-height template))))))
 
 (defun rpc-getmininginfo (node params)
   "Return mining-related state (Bitcoin Core getmininginfo)."

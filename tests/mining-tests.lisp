@@ -146,7 +146,14 @@ Returns the txid."
           ;; 38-byte commitment script → 76 hex chars, 6a24aa21a9ed prefix
           (let ((dwc (cdr (assoc "default_witness_commitment" r :test #'string=))))
             (is (= 76 (length dwc)))
-            (is (string= "6a24aa21a9ed" (subseq dwc 0 12)))))))))
+            (is (string= "6a24aa21a9ed" (subseq dwc 0 12))))
+          ;; rules: regtest activates all soft forks by height 1.
+          (let ((rules (cdr (assoc "rules" r :test #'string=))))
+            (is (member "csv" rules :test #'string=))
+            (is (member "!segwit" rules :test #'string=))
+            (is (member "taproot" rules :test #'string=)))
+          (is (= 0 (cdr (assoc "vbrequired" r :test #'string=))))
+          (is (stringp (cdr (assoc "longpollid" r :test #'string=)))))))))
 
 (test rpc-getmininginfo-shape
   (let ((bitcoin-lisp:*network* :regtest))
