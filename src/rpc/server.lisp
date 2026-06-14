@@ -132,13 +132,12 @@
            (values :batch json))
           ;; Single request (object)
           ((hash-table-p json)
-           (let ((jsonrpc (gethash "jsonrpc" json))
-                 (method (gethash "method" json))
+           (let ((method (gethash "method" json))
                  (params (gethash "params" json))
                  (id (gethash "id" json)))
-             (unless (equal jsonrpc "2.0")
-               (error 'rpc-error :code +rpc-invalid-request+
-                                 :message "Invalid JSON-RPC version"))
+             ;; Accept any/absent "jsonrpc" version: bitcoin-cli sends 1.0 (or
+             ;; omits it) on older builds and 2.0 on newer; Core doesn't
+             ;; validate it. Rejecting non-2.0 made stock bitcoin-cli unusable.
              (unless (stringp method)
                (error 'rpc-error :code +rpc-invalid-request+
                                  :message "Missing or invalid method"))
@@ -243,10 +242,54 @@ pairs — so without this every object-returning RPC errors out."
   "The node instance for RPC handlers.")
 
 (defvar *rpc-user* nil
-  "RPC authentication username (nil = no auth).")
+  "RPC authentication username (nil = no configured user/password auth).")
 
 (defvar *rpc-password* nil
   "RPC authentication password.")
+
+(defparameter +rpc-cookie-user+ "__cookie__"
+  "Username in the .cookie file (Bitcoin Core convention).")
+
+(defvar *rpc-cookie-secret* nil
+  "Random secret written to .cookie when no rpcuser/password is configured, so
+stock bitcoin-cli (which always sends credentials) can authenticate.")
+
+(defun generate-rpc-cookie (data-directory)
+  "Write <data-directory>/.cookie as \"__cookie__:<random>\" and remember the
+secret. Mirrors Bitcoin Core's cookie auth for clients that need credentials."
+  (handler-case
+      (let* ((secret (ironclad:byte-array-to-hex-string (ironclad:random-data 32)))
+             (path (merge-pathnames ".cookie" data-directory)))
+        (setf *rpc-cookie-secret* secret)
+        (ensure-directories-exist path)
+        (with-open-file (s path :direction :output :if-exists :supersede
+                                :if-does-not-exist :create)
+          (format s "~A:~A" +rpc-cookie-user+ secret))
+        path)
+    (error (e)
+      (bitcoin-lisp::node-log :warn "Could not write RPC cookie: ~A" e)
+      nil)))
+
+(defun %basic-auth-matches-p (auth-header)
+  "T if the HTTP Basic AUTH-HEADER matches the configured user/password or the
+generated cookie credential."
+  (and (stringp auth-header)
+       (> (length auth-header) 6)
+       (string-equal (subseq auth-header 0 6) "Basic ")
+       (handler-case
+           (let* ((decoded (flexi-streams:octets-to-string
+                            (cl-base64:base64-string-to-usb8-array
+                             (subseq auth-header 6))))
+                  (colon-pos (position #\: decoded)))
+             (when colon-pos
+               (let ((user (subseq decoded 0 colon-pos))
+                     (pass (subseq decoded (1+ colon-pos))))
+                 (or (and *rpc-user* *rpc-password*
+                          (string= user *rpc-user*) (string= pass *rpc-password*))
+                     (and *rpc-cookie-secret*
+                          (string= user +rpc-cookie-user+)
+                          (string= pass *rpc-cookie-secret*))))))
+         (error () nil))))
 
 (defvar *rpc-dispatcher* nil
   "The RPC dispatcher function (for cleanup on stop).")
@@ -278,26 +321,17 @@ Returns T if allowed, NIL if rate limited."
   t)
 
 (defun check-auth (request)
-  "Check HTTP Basic authentication. Returns t if valid or auth disabled."
-  (when (and *rpc-user* *rpc-password*)
-    (let ((auth-header (hunchentoot:header-in :authorization request)))
-      (unless auth-header
-        (return-from check-auth nil))
-      (unless (and (> (length auth-header) 6)
-                   (string-equal (subseq auth-header 0 6) "Basic "))
-        (return-from check-auth nil))
-      (handler-case
-          (let* ((encoded (subseq auth-header 6))
-                 (decoded (flexi-streams:octets-to-string
-                           (cl-base64:base64-string-to-usb8-array encoded)))
-                 (colon-pos (position #\: decoded)))
-            (when colon-pos
-              (let ((user (subseq decoded 0 colon-pos))
-                    (pass (subseq decoded (1+ colon-pos))))
-                (and (string= user *rpc-user*)
-                     (string= pass *rpc-password*)))))
-        (error () nil))))
-  t)
+  "Authorize an RPC request.
+- With rpcuser/password configured, require a matching HTTP Basic credential
+  (or the cookie). This also fixes a prior bug where a *mismatched* credential
+  fell through and was accepted.
+- With nothing configured, allow open local RPC (our nodes bind 127.0.0.1) — a
+  .cookie is still written so stock bitcoin-cli, which always sends
+  credentials, authenticates; existing unauthenticated local clients keep
+  working."
+  (if (and *rpc-user* *rpc-password*)
+      (%basic-auth-matches-p (hunchentoot:header-in :authorization request))
+      t))
 
 (defun rpc-json-error (http-status code message)
   "Return a JSON-RPC error response string with the given HTTP status."
@@ -396,6 +430,13 @@ PORT defaults to 18332 for testnet, 8332 for mainnet."
     (setf *rpc-node* node)
     (setf *rpc-user* user)
     (setf *rpc-password* password)
+    ;; When no user/password is configured, write a .cookie so stock bitcoin-cli
+    ;; can authenticate (Bitcoin Core behavior). With a configured password,
+    ;; clients use that and no cookie is written.
+    (setf *rpc-cookie-secret* nil)
+    (unless (and user password)
+      (when (and node (bitcoin-lisp::node-data-directory node))
+        (generate-rpc-cookie (bitcoin-lisp::node-data-directory node))))
 
     ;; Create and start server
     (handler-case
