@@ -213,6 +213,19 @@ hash_serialized_3 — never on the inv/validate hot path."
         (sb-posix:fsync (sb-sys:fd-stream-fd s)))
     (error () nil)))
 
+(defun fsync-directory (path)
+  "fsync the directory containing PATH so a preceding rename into it is durable.
+POSIX does not guarantee a rename survives a crash until the parent directory is
+fsynced — without this, an atomic temp+fsync+rename can still revert to the old
+file (or vanish) after a power loss even though the new data was synced."
+  #+sbcl
+  (handler-case
+      (let* ((dir (directory-namestring path))
+             (fd (sb-posix:open (if (string= dir "") "." dir) sb-posix:o-rdonly)))
+        (unwind-protect (sb-posix:fsync fd)
+          (sb-posix:close fd)))
+    (error () nil)))
+
 (defun save-file-with-crc32 (path write-fn)
   "Write data to PATH atomically with CRC32 integrity.
 WRITE-FN receives a stream and writes the payload (including magic/version/count).
@@ -238,7 +251,8 @@ dispatch — was 18% of total CPU on the May 2 testnet4 profile."
       ;; fsync the data before rename — guarantees the new file is on disk
       ;; before any other process (or our crash) sees the rename.
       (fsync-file tmp-path)
-      (rename-file tmp-path path))))
+      (rename-file tmp-path path)
+      (fsync-directory path))))
 
 (defun save-file-with-crc32-streaming-bb (path bb-fn &key (flush-threshold (* 4 1024 1024)))
   "Streaming variant of save-file-with-crc32-bb. BB-FN receives
@@ -280,7 +294,8 @@ must NOT call bb-finish."
         (write-sequence (ironclad:produce-digest digest) out)
         (finish-output out)))
     (fsync-file tmp-path)
-    (rename-file tmp-path path)))
+    (rename-file tmp-path path)
+    (fsync-directory path)))
 
 (defun save-file-with-crc32-bb (path bb-fn)
   "Like SAVE-FILE-WITH-CRC32 but BB-FN receives a byte-buf and writes
@@ -303,7 +318,8 @@ that dominated CPU on UTXO/state flushes."
         (write-sequence (compute-crc32 all-bytes) out)
         (finish-output out))
       (fsync-file tmp-path)
-      (rename-file tmp-path path))))
+      (rename-file tmp-path path)
+      (fsync-directory path))))
 
 (defun load-file-with-crc32 (path min-size)
   "Load and verify a CRC32-protected file at PATH.
