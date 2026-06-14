@@ -353,6 +353,42 @@ node-lock now uses); a non-recursive lock would deadlock here."
                   (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
                     :ok))))))
 
+(defun %inbound-peer (addr ping connect-time)
+  (bitcoin-lisp.networking:make-peer
+   :address addr :inbound t :state :ready
+   :ping-latency ping :connect-time connect-time))
+
+(test evict-least-valuable-inbound-protects-best
+  "evict-least-valuable-inbound shields the most valuable inbound peers (lowest
+ping, longest connected) and evicts an unprotected one — the youngest in the
+most-represented netgroup — so inbound slots churn toward better peers instead
+of an attacker's cheap, sticky connections holding them."
+  (let ((node (bitcoin-lisp::make-node)))
+    ;; A-D: low ping + old (protected on both dimensions). E,F: high ping +
+    ;; young, same /16 netgroup (the eviction candidates).
+    (let ((a (%inbound-peer "1.1.1.1" 10 100))
+          (b (%inbound-peer "2.2.2.2" 20 200))
+          (c (%inbound-peer "3.3.3.3" 30 300))
+          (d (%inbound-peer "4.4.4.4" 40 400))
+          (e (%inbound-peer "10.0.0.1" 1000 5000))
+          (f (%inbound-peer "10.0.0.2" 2000 6000)))   ; youngest candidate
+      (setf (bitcoin-lisp::node-peers node) (list a b c d e f))
+      (is (eq t (bitcoin-lisp::evict-least-valuable-inbound node)))
+      ;; F (youngest in the populous netgroup) evicted; everyone else kept.
+      (let ((remaining (bitcoin-lisp::node-peers node)))
+        (is (not (member f remaining)))
+        (is (member e remaining))
+        (dolist (p (list a b c d)) (is (member p remaining)))))))
+
+(test evict-least-valuable-inbound-noop-when-all-protected
+  "With too few inbound peers (all protected), nothing is evicted."
+  (let ((node (bitcoin-lisp::make-node)))
+    (setf (bitcoin-lisp::node-peers node)
+          (list (%inbound-peer "1.1.1.1" 10 100)
+                (%inbound-peer "2.2.2.2" 20 200)))
+    (is (null (bitcoin-lisp::evict-least-valuable-inbound node)))
+    (is (= 2 (length (bitcoin-lisp::node-peers node))))))
+
 (test ban-lock-concurrent-stress
   "Many threads hammering the discourage/ban globals do not crash or corrupt
 the shared structures (the *ban-lock* serializes their mutations)."
