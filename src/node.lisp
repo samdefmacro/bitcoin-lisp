@@ -732,6 +732,9 @@ Returns the node instance."
       (log-info "Loaded peer address book: ~D entries"
                 (bitcoin-lisp.networking:address-book-count (node-address-book *node*)))))
 
+  ;; Load reconnection anchors (tried first, before DNS seeds — anti-eclipse).
+  (load-anchors *node*)
+
   ;; Initialize transaction index (optional)
   (when txindex
     (log-info "Initializing transaction index...")
@@ -1063,6 +1066,10 @@ flush (atomic temp+fsync+rename inside save-*)."
 
   (log-info "Stopping node...")
 
+  ;; Persist reconnection anchors while peers are still connected (before the
+  ;; teardown below disconnects them).
+  (save-anchors *node*)
+
   ;; Stop RPC server first
   (bitcoin-lisp.rpc:stop-rpc-server)
 
@@ -1176,6 +1183,79 @@ flush (atomic temp+fsync+rename inside save-*)."
 
 ;;;; Peer Management
 
+;;;; Anchor connections (Bitcoin Core anchors.dat)
+;;;;
+;;;; On shutdown we persist a couple of currently-connected outbound peers and
+;;;; reconnect to them first on the next start, BEFORE consulting DNS seeds.
+;;;; This closes the across-restart eclipse window: a freshly-started node that
+;;;; relied only on DNS seeds (or a poisoned addrman) could be fed an attacker's
+;;;; peer set, but a known-good anchor it was just connected to cannot be
+;;;; substituted by the attacker. (Core anchors are block-relay-only peers;
+;;;; dedicated block-relay-only outbound slots are a separate follow-up — these
+;;;; anchors are drawn from the regular outbound pool.)
+
+(defparameter +max-anchors+ 2
+  "How many outbound peers to persist as reconnection anchors (Core saves 2).")
+
+(defconstant +anchors-magic+ #x414e4331)  ; "ANC1"
+
+(defvar *pending-anchor-addresses* nil
+  "Anchor IP strings loaded at startup, consumed (and cleared) by the first
+connect-to-peers so they are attempted before DNS-seed candidates.")
+
+(defun anchors-dat-path (data-directory)
+  "Path to anchors.dat in DATA-DIRECTORY."
+  (merge-pathnames "anchors.dat" data-directory))
+
+(defun save-anchors (node)
+  "Persist up to +max-anchors+ currently-connected outbound peers' addresses to
+anchors.dat (crash-safe: temp + fsync + atomic rename, CRC32-protected)."
+  (let* ((outbound (remove-if #'bitcoin-lisp.networking:peer-inbound
+                              (node-peers node)))
+         (ready (remove-if-not (lambda (p)
+                                 (eq (bitcoin-lisp.networking:peer-state p) :ready))
+                               outbound))
+         (addrs (mapcar #'bitcoin-lisp.networking:peer-address
+                        (subseq ready 0 (min +max-anchors+ (length ready))))))
+    (when addrs
+      (handler-case
+          (bitcoin-lisp.storage:save-file-with-crc32
+           (anchors-dat-path (node-data-directory node))
+           (lambda (stream)
+             (write-byte (ldb (byte 8 24) +anchors-magic+) stream)
+             (write-byte (ldb (byte 8 16) +anchors-magic+) stream)
+             (write-byte (ldb (byte 8 8) +anchors-magic+) stream)
+             (write-byte (ldb (byte 8 0) +anchors-magic+) stream)
+             (write-byte (length addrs) stream)
+             (dolist (a addrs)
+               (let ((bytes (map '(vector (unsigned-byte 8)) #'char-code a)))
+                 (write-byte (min 255 (length bytes)) stream)
+                 (write-sequence bytes stream)))))
+        (error (e) (log-warn "Failed to save anchors: ~A" e)))
+      (log-info "Saved ~D anchor peer~:P" (length addrs)))))
+
+(defun load-anchors (node)
+  "Read anchors.dat into *pending-anchor-addresses* so the next connect attempts
+them first. Missing/corrupt file is ignored."
+  (let ((bytes (bitcoin-lisp.storage:load-file-with-crc32
+                (anchors-dat-path (node-data-directory node)) 6)))
+    (when (and bytes
+               (= +anchors-magic+
+                  (logior (ash (aref bytes 0) 24) (ash (aref bytes 1) 16)
+                          (ash (aref bytes 2) 8) (aref bytes 3))))
+      (let ((count (aref bytes 4)) (pos 5) (addrs '()))
+        (dotimes (i count)
+          (when (< pos (- (length bytes) 4))         ; stay inside payload (before CRC)
+            (let ((len (aref bytes pos)))
+              (incf pos)
+              (when (<= (+ pos len) (- (length bytes) 4))
+                (push (map 'string #'code-char (subseq bytes pos (+ pos len))) addrs)
+                (incf pos len)))))
+        (setf *pending-anchor-addresses* (nreverse addrs))
+        (when *pending-anchor-addresses*
+          (log-info "Loaded ~D anchor peer~:P for priority reconnection"
+                    (length *pending-anchor-addresses*)))))))
+
 (defun connect-to-peers (node max-peers &key (timeout 60) (min-peers 1))
   "Connect to Bitcoin network peers.
 Uses address book for warm starts, falls back to DNS seeds.
@@ -1239,6 +1319,14 @@ Returns the number of peers connected."
     ;; sync). Mirrors Bitcoin Core's addrman netgroup bucket selection
     ;; (netaddress.cpp CNetAddr::GetGroup).
     (setf addresses (bitcoin-lisp.networking:diversify-by-netgroup addresses))
+
+    ;; Anchors first (Core anchors.dat): reconnect to the peers we persisted at
+    ;; last shutdown before any DNS/addrman candidate, then consume them so
+    ;; later reconnect cycles use the normal pool.
+    (when *pending-anchor-addresses*
+      (setf addresses (remove-duplicates (append *pending-anchor-addresses* addresses)
+                                         :test #'string= :from-end t))
+      (setf *pending-anchor-addresses* nil))
 
     (log-info "~D candidate peers available" (length addresses))
 
