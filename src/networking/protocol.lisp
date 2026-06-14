@@ -423,7 +423,7 @@ and recurse on newly-accepted txs so a parent can unblock a whole chain."
               (let ((current-height (bitcoin-lisp.storage:current-height chain-state)))
                 (multiple-value-bind (valid error fee replaced)
                     (bitcoin-lisp.validation:validate-transaction-for-mempool
-                     otx utxo-set mempool current-height)
+                     otx utxo-set mempool current-height :chain-state chain-state)
                   (cond
                     (valid
                      (multiple-value-bind (result entry)
@@ -480,7 +480,7 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
               ;; Validate for mempool
               (multiple-value-bind (valid error fee replaced)
                   (bitcoin-lisp.validation:validate-transaction-for-mempool
-                   tx utxo-set mempool current-height)
+                   tx utxo-set mempool current-height :chain-state chain-state)
                 (unless valid
                   (cond
                     ;; Missing inputs => hold as an orphan (not a real reject);
