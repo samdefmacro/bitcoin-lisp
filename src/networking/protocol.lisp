@@ -137,7 +137,7 @@ Returns T if message was handled, NIL otherwise."
 
     ((string= command "block")
      (handle-block peer payload chain-state utxo-set block-store mempool fee-estimator
-                   :recent-rejects recent-rejects)
+                   :recent-rejects recent-rejects :peers peers)
      t)
 
     ((string= command "tx")
@@ -321,8 +321,10 @@ Mirrors Bitcoin Core's MSG NOTFOUND handling (net_processing.cpp)."
 ;;; Block handling
 
 (defun handle-block (peer payload chain-state utxo-set block-store
-                     &optional mempool fee-estimator &key recent-rejects)
-  "Handle a block message."
+                     &optional mempool fee-estimator &key recent-rejects peers)
+  "Handle a block message. When PEERS is supplied and the block becomes the new
+active tip, announce it onward (BIP 130 headers / inv), so the node propagates
+blocks instead of being a sink."
   (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
     (when block
       (with-node-lock
@@ -340,7 +342,13 @@ Mirrors Bitcoin Core's MSG NOTFOUND handling (net_processing.cpp)."
                    block chain-state block-store utxo-set
                    :fee-estimator fee-estimator
                    :recent-rejects recent-rejects
-                   :mempool mempool))
+                   :mempool mempool)
+                  ;; Announce onward only if this block is now the active tip
+                  ;; (connect-block may have stored a side block or reorged).
+                  (when (and peers
+                             (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                                     hash))
+                    (relay-block header peer peers)))
                 (progn
                   (format t "Block ~A rejected: ~A~%"
                           (bitcoin-lisp.crypto:bytes-to-hex hash) error)
@@ -716,6 +724,34 @@ Does nothing if relay is disabled for the current network."
         (if (and (peer-wtxid-relay peer) wtxid-inv-msg)
             (send-message peer wtxid-inv-msg)
             (send-message peer txid-inv-msg))))))
+
+(defun block-relay-targets (source-peer peers)
+  "The peers a newly-connected block is announced to: every ready peer except
+SOURCE-PEER (which already has it)."
+  (remove-if (lambda (p)
+               (or (eq p source-peer)
+                   (not (eq (peer-state p) :ready))))
+             peers))
+
+(defun relay-block (header source-peer peers)
+  "Announce a newly-connected best-tip block to PEERS except SOURCE-PEER.
+BIP 130: peers that sent sendheaders get a headers message (the cheaper
+announcement Core prefers); the rest get an inv. Gated on relay-enabled-p so a
+relay-disabled node (mainnet default) stays a non-participant. Without this the
+node validates blocks but never propagates them — a pure block sink."
+  (unless (relay-enabled-p)
+    (return-from relay-block nil))
+  (let ((headers-msg (bitcoin-lisp.serialization:make-headers-message (list header)))
+        (inv-msg (bitcoin-lisp.serialization:make-inv-message
+                  (list (bitcoin-lisp.serialization:make-inv-vector
+                         :type bitcoin-lisp.serialization:+inv-type-block+
+                         :hash (bitcoin-lisp.serialization:block-header-hash header))))))
+    (dolist (peer (block-relay-targets source-peer peers))
+      (handler-case
+          (if (peer-prefers-headers peer)
+              (send-message peer headers-msg)
+              (send-message peer inv-msg))
+        (error () nil)))))
 
 ;;; Sync operations
 
