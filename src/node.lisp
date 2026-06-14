@@ -274,6 +274,11 @@ by the sync thread, so PEERS stays single-writer."
           ;; eviction (Bitcoin Core), so make room for the newcomer if we can.
           ((evict-discouraged-inbound node)
            (push peer (node-peers node)))
+          ;; Otherwise evict the least valuable inbound peer (protecting the
+          ;; most valuable) so slots churn toward better peers instead of the
+          ;; newcomer always losing — Core's AttemptToEvictConnection.
+          ((evict-least-valuable-inbound node)
+           (push peer (node-peers node)))
           (t
            (log-info "Inbound peer cap reached; dropping ~A"
                      (bitcoin-lisp.networking:peer-address peer))
@@ -294,6 +299,58 @@ new inbound connection can take its slot. NIL if none are discouraged."
         (setf (node-peers node) (remove victim (node-peers node)))
         (bitcoin-lisp.networking:disconnect-peer victim)
         t))))
+
+(defparameter +inbound-eviction-protect-count+ 4
+  "Per protection dimension (lowest ping, longest connected), how many inbound
+peers to shield from eviction — the spirit of Bitcoin Core's
+AttemptToEvictConnection protected set.")
+
+(defun evict-least-valuable-inbound (node)
+  "At inbound capacity with no discouraged peer to drop, evict the least
+valuable inbound peer so a new connection can take the slot — stopping an
+attacker from filling inbound slots with cheap, sticky connections (the current
+behavior was to always drop the newcomer, which never churns toward better
+peers). Protects the most valuable inbound peers along two dimensions (lowest
+ping latency, longest connected); among the unprotected rest, evicts from the
+most-represented /16 netgroup, youngest first. Mirrors the intent of Core's
+AttemptToEvictConnection. Returns T if a peer was evicted."
+  (bt:with-recursive-lock-held ((node-lock node))
+    (let ((inbound (remove-if-not #'bitcoin-lisp.networking:peer-inbound
+                                  (node-peers node))))
+      (when (cdr inbound)               ; need >1 so something stays protected
+        (let* ((by-ping (stable-sort
+                         (copy-list inbound) #'<
+                         :key (lambda (p)
+                                (let ((l (bitcoin-lisp.networking:peer-ping-latency p)))
+                                  (if (plusp l) l most-positive-fixnum)))))
+               (by-age (stable-sort   ; oldest (smallest connect-time) first
+                        (copy-list inbound) #'<
+                        :key #'bitcoin-lisp.networking:peer-connect-time))
+               (n (min +inbound-eviction-protect-count+ (length inbound)))
+               (protected (union (subseq by-ping 0 n) (subseq by-age 0 n)))
+               (candidates (remove-if (lambda (p) (member p protected)) inbound)))
+          (when candidates
+            (let ((groups (make-hash-table :test 'equal)))
+              (flet ((grp (p) (or (bitcoin-lisp.networking:ip-netgroup
+                                   (bitcoin-lisp.networking:peer-address p))
+                                  "_")))
+                (dolist (p candidates) (incf (gethash (grp p) groups 0)))
+                (let ((victim (first (stable-sort
+                                      candidates
+                                      (lambda (a b)
+                                        (let ((ga (gethash (grp a) groups 0))
+                                              (gb (gethash (grp b) groups 0)))
+                                          (if (/= ga gb)
+                                              (> ga gb)  ; most-populous netgroup first
+                                              ;; then youngest (largest connect-time)
+                                              (> (bitcoin-lisp.networking:peer-connect-time a)
+                                                 (bitcoin-lisp.networking:peer-connect-time b)))))))))
+                  (when victim
+                    (log-info "Evicting least-valuable inbound peer ~A to admit a new connection"
+                              (bitcoin-lisp.networking:peer-address victim))
+                    (setf (node-peers node) (remove victim (node-peers node)))
+                    (bitcoin-lisp.networking:disconnect-peer victim)
+                    t))))))))))
 
 (defun run-inbound-listener (node)
   "Accept inbound connections, handshake each, and hand the ready peer to the
