@@ -1147,15 +1147,15 @@ RPC layer normalizes into a JSON object."
 (test rpc-calculate-block-subsidy
   "Test block subsidy calculation"
   ;; Initial subsidy: 50 BTC = 5000000000 satoshis
-  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 0) 5000000000))
-  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 209999) 5000000000))
+  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 0) 5000000000))
+  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 209999) 5000000000))
   ;; First halving at 210000
-  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 210000) 2500000000))
-  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 419999) 2500000000))
+  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 210000) 2500000000))
+  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 419999) 2500000000))
   ;; Second halving
-  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 420000) 1250000000))
+  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 420000) 1250000000))
   ;; Third halving
-  (is (= (bitcoin-lisp.rpc::calculate-block-subsidy 630000) 625000000)))
+  (is (= (bitcoin-lisp.validation:calculate-block-subsidy 630000) 625000000)))
 
 ;;; --- Extended getrawtransaction Tests ---
 
@@ -1529,3 +1529,36 @@ address (with network), and per-input sequence — the fields explorers expect."
       (is (stringp (cdr (assoc "address" spk :test #'string=)))))
     (let ((vin (first (cdr (assoc "vin" j :test #'string=)))))
       (is (assoc "sequence" vin :test #'string=)))))
+
+;;;; Operator RPCs + regtest subsidy halving (T3d)
+
+(test regtest-subsidy-halving-interval
+  "calculate-block-subsidy halves at 150 on regtest (Core), 210000 elsewhere."
+  (let ((bitcoin-lisp:*network* :regtest))
+    (is (= 5000000000 (bitcoin-lisp.validation:calculate-block-subsidy 149)))
+    (is (= 2500000000 (bitcoin-lisp.validation:calculate-block-subsidy 150))))
+  (let ((bitcoin-lisp:*network* :mainnet))
+    (is (= 5000000000 (bitcoin-lisp.validation:calculate-block-subsidy 150)))
+    (is (= 2500000000 (bitcoin-lisp.validation:calculate-block-subsidy 210000)))))
+
+(test rpc-help-lists-methods
+  "help with no argument lists registered methods, including the new ones."
+  (bitcoin-lisp.rpc::register-all-methods)
+  (let ((h (bitcoin-lisp.rpc::rpc-help nil nil)))
+    (is (stringp h))
+    (is (search "stop" h))
+    (is (search "getnetworkhashps" h)))
+  ;; A known method echoes its name; an unknown one reports so.
+  (is (string= "uptime" (bitcoin-lisp.rpc::rpc-help nil (list "uptime"))))
+  (is (search "unknown" (bitcoin-lisp.rpc::rpc-help nil (list "nope-xyz")))))
+
+(test rpc-getmemoryinfo-and-getrpcinfo-shape
+  "getmemoryinfo reports the heap under \"locked\"; getrpcinfo reports
+active_commands + logpath."
+  (let ((mi (bitcoin-lisp.rpc::rpc-getmemoryinfo nil nil)))
+    (is (assoc "locked" mi :test #'string=))
+    (is (integerp (cdr (assoc "total" (cdr (assoc "locked" mi :test #'string=))
+                              :test #'string=)))))
+  (let ((ri (bitcoin-lisp.rpc::rpc-getrpcinfo nil nil)))
+    (is (assoc "active_commands" ri :test #'string=))
+    (is (assoc "logpath" ri :test #'string=))))

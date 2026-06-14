@@ -1332,6 +1332,73 @@ getdifficulty)."
       (max 0 (- (bitcoin-lisp.serialization:get-unix-time) bitcoin-lisp::*node-start-time*))
       0))
 
+(defun rpc-stop (node params)
+  "Request a graceful node shutdown (Bitcoin Core stop). stop-node also stops the
+RPC server serving this request, so defer it to a short-lived thread and let
+this response flush first."
+  (declare (ignore node params))
+  (bt:make-thread (lambda () (sleep 0.3) (ignore-errors (bitcoin-lisp::stop-node)))
+                  :name "rpc-stop")
+  "Bitcoin-lisp server stopping")
+
+(defun rpc-getnetworkhashps (node params)
+  "Estimated network hashes/sec over the last N blocks (default 120), from the
+chain-work and time spanned (Bitcoin Core getnetworkhashps)."
+  (let* ((nblocks (let ((n (first params))) (if (and (integerp n) (> n 0)) n 120)))
+         (chain-state (rpc-get-chain-state node))
+         (height (bitcoin-lisp.storage:current-height chain-state))
+         (tip (bitcoin-lisp.storage:get-block-index-entry
+               chain-state (bitcoin-lisp.storage:best-block-hash chain-state))))
+    (if (or (null tip) (<= height 0))
+        0
+        (let* ((window (min nblocks height))
+               (start (bitcoin-lisp.storage:get-block-at-height chain-state (- height window))))
+          (if (null start)
+              0
+              (let ((dwork (- (bitcoin-lisp.storage:block-index-entry-chain-work tip)
+                              (bitcoin-lisp.storage:block-index-entry-chain-work start)))
+                    (dtime (- (bitcoin-lisp.serialization:block-header-timestamp
+                               (bitcoin-lisp.storage:block-index-entry-header tip))
+                              (bitcoin-lisp.serialization:block-header-timestamp
+                               (bitcoin-lisp.storage:block-index-entry-header start)))))
+                (if (<= dtime 0) 0 (round dwork dtime))))))))
+
+(defun rpc-getmemoryinfo (node params)
+  "Report process memory use (Bitcoin Core getmemoryinfo). Reports the SBCL heap
+under the \"locked\" object Core uses."
+  (declare (ignore node params))
+  (let ((used #+sbcl (sb-kernel:dynamic-usage) #-sbcl 0)
+        (total #+sbcl (sb-ext:dynamic-space-size) #-sbcl 0))
+    `(("locked" . (("used" . ,used)
+                   ("total" . ,total)
+                   ("free" . ,(max 0 (- total used)))
+                   ("locked" . 0)
+                   ("chunks_used" . 0)
+                   ("chunks_free" . 0))))))
+
+(defun rpc-getrpcinfo (node params)
+  "Report RPC server state (Bitcoin Core getrpcinfo): active commands (we don't
+track in-flight requests, so empty) and the log file path."
+  (declare (ignore node params))
+  `(("active_commands" . #())
+    ("logpath" . ,(or (and bitcoin-lisp::*log-file-stream*
+                           (ignore-errors
+                            (namestring (pathname bitcoin-lisp::*log-file-stream*))))
+                      ""))))
+
+(defun rpc-help (node params)
+  "List available RPC methods, or echo the name of a known one (Bitcoin Core
+help). A full per-method help text is out of scope."
+  (declare (ignore node))
+  (let ((method (first params)))
+    (if (and method (stringp method))
+        (if (gethash method *rpc-methods*)
+            method
+            (format nil "help: unknown command: ~A" method))
+        (let ((names '()))
+          (maphash (lambda (k v) (declare (ignore v)) (push k names)) *rpc-methods*)
+          (format nil "~{~A~^~%~}" (sort names #'string<))))))
+
 (defun rpc-getindexinfo (node params)
   "Report the status of optional indexes (Bitcoin Core getindexinfo). Currently
 just txindex, when enabled."
@@ -1957,7 +2024,7 @@ Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
                  (bitcoin-lisp.serialization:dovector (out (bitcoin-lisp.serialization:transaction-outputs tx))
                    (incf total-out-value (bitcoin-lisp.serialization:tx-out-value out))))
         ;; Calculate subsidy
-        (let* ((subsidy (calculate-block-subsidy height))
+        (let* ((subsidy (bitcoin-lisp.validation:calculate-block-subsidy height))
                (avg-tx-size (if (> ntx 0)
                                 (round (/ total-size ntx))
                                 0))
@@ -1978,13 +2045,9 @@ Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
                              all-stats)
               all-stats)))))))
 
-(defun calculate-block-subsidy (height)
-  "Calculate block subsidy in satoshis for a given height."
-  (let* ((halvings (floor height 210000))
-         (initial-subsidy 5000000000))  ; 50 BTC in satoshis
-    (if (>= halvings 64)
-        0
-        (ash initial-subsidy (- halvings)))))
+;; calculate-block-subsidy lives in bitcoin-lisp.validation (consensus, now
+;; network-aware incl. the regtest 150-block halving). The duplicate that lived
+;; here was removed; getblockstats above calls the consensus one directly.
 
 ;;; --- Pruning Methods ---
 
