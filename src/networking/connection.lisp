@@ -23,6 +23,22 @@
 (defvar *total-bytes-received* 0
   "Total bytes read from all peer sockets since startup.")
 
+;;; Shutdown coordination. Set by stop-node (via request-ibd-stop) when the
+;;; process is shutting down. It lives in this first-loaded networking file so
+;;; the low-level socket read (receive-bytes) can poll it: without that, a TERM
+;;; arriving while the sync thread is blocked in a peer read (a message wait OR a
+;;; handshake) hangs until the full :timeout elapses — which is what made
+;;; shutdown take minutes (the June-2026 mainnet hangs). The IBD loops (ibd.lisp)
+;;; and replace-disconnected-peers (node.lisp) poll it too.
+(defvar *ibd-stop-requested* nil
+  "T while the node is shutting down; polled by receive-bytes and the IBD/peer
+loops so the sync thread exits within seconds of a TERM instead of blocking on
+in-flight socket reads.")
+
+(defun ibd-stop-requested-p ()
+  "Return T if node shutdown has been requested (see *ibd-stop-requested*)."
+  *ibd-stop-requested*)
+
 (defun set-tcp-nodelay (usocket-socket)
   "Disable Nagle's algorithm on USOCKET-SOCKET. Bitcoin's wire protocol
 sends small request messages followed by long silence while awaiting
@@ -134,7 +150,14 @@ Returns a byte vector or NIL on failure/timeout."
                               (* timeout internal-time-units-per-second))))
             ;; Read until we have all bytes or timeout
             (loop while (< total-read count)
-                  do (let ((time-left (/ (- deadline (get-internal-real-time))
+                  ;; Bail promptly on shutdown: a blocked peer read (message wait
+                  ;; or handshake) must not pin the sync thread for the full
+                  ;; :timeout while stop-node waits to join it. Checked each
+                  ;; iteration (wait-for-input below is capped at 5s chunks), so
+                  ;; abort latency is <=5s instead of up to :timeout.
+                  do (when *ibd-stop-requested*
+                       (return-from receive-bytes nil))
+                     (let ((time-left (/ (- deadline (get-internal-real-time))
                                          internal-time-units-per-second)))
                        (when (<= time-left 0)
                          (return-from receive-bytes nil))
