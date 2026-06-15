@@ -692,6 +692,7 @@
    ;; Shutdown
    #:request-ibd-stop
    #:reset-ibd-stop
+   #:ibd-stop-requested-p
    ;; Tx-request tracking
    #:retry-timed-out-tx-requests
    #:reset-tx-requests
