@@ -167,13 +167,10 @@ cells and `delivery-samples` (time peer-address latency-ms) lists."
 (defvar *ibd-context* nil
   "Current IBD context.")
 
-(defvar *ibd-stop-requested* nil
-  "Set by stop-node (via request-ibd-stop) when the process is shutting
-down. The IBD inner loops poll it so a TERM exits the sync thread within
-seconds instead of running until the pending queue drains — both June
-2026 mainnet deploys hung in run-ibd after \"Stopping node...\" and
-needed a verified-safe SIGKILL.")
-
+;;; *ibd-stop-requested* is defined in connection.lisp (the first-loaded
+;;; networking file) so the low-level socket read can poll it; the IBD inner
+;;; loops below poll it so a TERM exits the sync thread within seconds instead
+;;; of running until the pending queue drains.
 (defun request-ibd-stop ()
   "Ask the IBD loops to exit at the next check point."
   (setf *ibd-stop-requested* t))

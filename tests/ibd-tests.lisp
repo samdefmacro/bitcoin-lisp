@@ -1032,3 +1032,34 @@ instead of cycling the no-peer grace (~6s) or downloading."
       (bitcoin-lisp.networking::run-ibd '() state nil nil)
       (is (< (- (get-internal-real-time) start)
              (* 2 internal-time-units-per-second))))))
+
+(test receive-bytes-honors-stop-request
+  "receive-bytes on an idle socket must return promptly when
+*ibd-stop-requested* is set, instead of blocking for the full :timeout. This is
+the socket-read leg of the shutdown path: a TERM arriving while the sync thread
+is blocked in a peer read (message wait OR handshake) must not pin it until the
+timeout while stop-node waits to join it. A real loopback socket is used so that
+WITHOUT the flag check the read would genuinely block (the test would then
+exceed the bound)."
+  (let ((server (usocket:socket-listen "127.0.0.1" 0 :reuse-address t
+                                       :element-type '(unsigned-byte 8))))
+    (unwind-protect
+         (let* ((port (usocket:get-local-port server))
+                (client (usocket:socket-connect "127.0.0.1" port
+                                                :element-type '(unsigned-byte 8)))
+                (conn (bitcoin-lisp.networking::make-connection
+                       :socket client :host "127.0.0.1" :port port
+                       :connected t :last-activity (get-universal-time))))
+           (unwind-protect
+                ;; No data is ever sent, so the read can only finish via the
+                ;; stop-request check (or the 30s timeout, which would fail the
+                ;; bound below).
+                (let ((bitcoin-lisp.networking::*ibd-stop-requested* t)
+                      (start (get-internal-real-time)))
+                  (let ((result (bitcoin-lisp.networking:receive-bytes
+                                 conn 8 :timeout 30)))
+                    (is (null result))
+                    (is (< (- (get-internal-real-time) start)
+                           (* 5 internal-time-units-per-second)))))
+             (usocket:socket-close client)))
+      (usocket:socket-close server))))

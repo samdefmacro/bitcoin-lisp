@@ -1459,7 +1459,11 @@ Returns the number of new peers connected."
                               (node-peers node)))
           (connected 0))
       (dolist (addr (node-known-addresses node))
-        (when (>= connected needed)
+        ;; Stop attempting new connect+handshake cycles the moment shutdown is
+        ;; requested — each one can otherwise block (connect timeout + handshake
+        ;; read) and delay the sync thread reaching its node-running checkpoint.
+        (when (or (>= connected needed)
+                  (bitcoin-lisp.networking:ibd-stop-requested-p))
           (return))
         (unless (member addr used-addrs :test #'string=)
           (handler-case
