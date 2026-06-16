@@ -1667,3 +1667,28 @@ pingtime (was hardcoded inbound nil with no byte/ping fields)."
       (is (= 99 (cdr (assoc "synced_blocks" e :test #'string=))))
       (is (assoc "bytessent" e :test #'string=))
       (is (assoc "pingtime" e :test #'string=)))))
+
+(test rpc-sign-verify-message
+  "signmessagewithprivkey + verifymessage round-trip: a message signed with a
+key's WIF verifies against that key's P2PKH address; a tampered message, a wrong
+address, and a malformed signature all fail. The signature is deterministic."
+  (let* ((node (make-test-node))   ; testnet3
+         (k1 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 1) k))
+         (wif (bitcoin-lisp.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
+         (msg "hello world")
+         (pub (bitcoin-lisp.crypto:derive-public-key k1))   ; compressed
+         (addr (bitcoin-lisp.crypto:encode-p2pkh-address
+                (bitcoin-lisp.crypto:hash160 pub) :testnet3))
+         (sig (bitcoin-lisp.rpc::rpc-signmessagewithprivkey node (list wif msg))))
+    (is (stringp sig))
+    (is (string= sig (bitcoin-lisp.rpc::rpc-signmessagewithprivkey node (list wif msg))))
+    (is (eq t (bitcoin-lisp.rpc::rpc-verifymessage node (list addr sig msg))))
+    (is (null (bitcoin-lisp.rpc::rpc-verifymessage node (list addr sig "tampered"))))
+    (let* ((k2 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                 (setf (aref k 31) 2) k))
+           (addr2 (bitcoin-lisp.crypto:encode-p2pkh-address
+                   (bitcoin-lisp.crypto:hash160 (bitcoin-lisp.crypto:derive-public-key k2))
+                   :testnet3)))
+      (is (null (bitcoin-lisp.rpc::rpc-verifymessage node (list addr2 sig msg)))))
+    (is (null (bitcoin-lisp.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg))))))
