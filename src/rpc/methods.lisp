@@ -336,12 +336,19 @@ is supplied and the script is addressable) address."
           (let* ((chain-state (rpc-get-chain-state node))
                  (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
                  (height (bitcoin-lisp.storage:current-height chain-state))
-                 (utxo-height (bitcoin-lisp.storage:utxo-entry-height entry)))
+                 (utxo-height (bitcoin-lisp.storage:utxo-entry-height entry))
+                 (spk (bitcoin-lisp.storage:utxo-entry-script-pubkey entry))
+                 (network (rpc-get-network node))
+                 (addr (%script->address spk network)))
             `(("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
               ("confirmations" . ,(1+ (- height utxo-height)))
               ("value" . ,(/ (bitcoin-lisp.storage:utxo-entry-value entry) 100000000.0d0))
-              ("scriptPubKey" . (("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                            (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))))
+              ;; Core's scriptPubKey shape: asm/hex/type plus address when the
+              ;; script encodes to one (previously only hex was returned).
+              ("scriptPubKey" . (("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
+                                 ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+                                 ("type" . ,(%script-type spk))
+                                 ,@(when addr `(("address" . ,addr)))))
               ("coinbase" . ,(bitcoin-lisp.storage:utxo-entry-coinbase entry))))
           nil)))) ; Return null for spent outputs
 
@@ -1903,9 +1910,16 @@ Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
               ;; Add type-specific fields
               (case type
                 (:multisig
+                 ;; Bare multisig: one P2PKH address per key (Core's classic
+                 ;; decodescript "addresses" array; classify-script gives :pubkeys).
                  (setf result (append result
                                       `(("reqSigs" . ,(getf data :m))
-                                        ("addresses" . ())))))  ; Would need pubkey-to-address
+                                        ("addresses"
+                                         . ,(mapcar
+                                             (lambda (pk)
+                                               (bitcoin-lisp.crypto:encode-p2pkh-address
+                                                (bitcoin-lisp.crypto:hash160 pk) network))
+                                             (getf data :pubkeys)))))))
                 ((:pubkeyhash :scripthash)
                  (let* ((hash (getf data :hash))
                         (addr (if (eq type :pubkeyhash)

@@ -1596,3 +1596,44 @@ returns the current tip; bad inputs error."
         (bitcoin-lisp.rpc::rpc-waitforblock node (list "not-a-valid-hash")))
       (signals bitcoin-lisp.rpc::rpc-error
         (bitcoin-lisp.rpc::rpc-waitforblockheight node (list -1))))))
+
+(test rpc-gettxout-scriptpubkey-fields
+  "gettxout's scriptPubKey now carries asm/hex/type and (for address-bearing
+scripts) address — previously only hex."
+  (let* ((node (make-test-node))   ; testnet3
+         (utxo-set (bitcoin-lisp.rpc::rpc-get-utxo-set node))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+         (keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element 7))
+         ;; P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+         (spk (concatenate '(vector (unsigned-byte 8))
+                           (vector #x76 #xa9 #x14) keyhash (vector #x88 #xac))))
+    (bitcoin-lisp.storage:add-utxo utxo-set txid 0 50000 spk 0)
+    (let* ((r (bitcoin-lisp.rpc::rpc-gettxout
+               node (list (bitcoin-lisp.rpc::hash-to-hex txid) 0)))
+           (sp (cdr (assoc "scriptPubKey" r :test #'string=))))
+      (is (string= "pubkeyhash" (cdr (assoc "type" sp :test #'string=))))
+      (is (string= (bitcoin-lisp.crypto:encode-p2pkh-address keyhash :testnet3)
+                   (cdr (assoc "address" sp :test #'string=))))
+      (is (assoc "asm" sp :test #'string=))
+      (is (assoc "hex" sp :test #'string=)))))
+
+(test rpc-decodescript-multisig-addresses
+  "decodescript fills the addresses array for bare multisig — one P2PKH address
+per key (previously empty)."
+  (let* ((node (make-test-node))
+         (pk1 (bitcoin-lisp.crypto:hex-to-bytes
+               "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
+         (pk2 (bitcoin-lisp.crypto:hex-to-bytes
+               "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"))
+         ;; 2-of-2 bare multisig: OP_2 <33pk1> <33pk2> OP_2 OP_CHECKMULTISIG
+         (script (concatenate '(vector (unsigned-byte 8))
+                              (vector #x52 #x21) pk1 (vector #x21) pk2 (vector #x52 #xae)))
+         (r (bitcoin-lisp.rpc::rpc-decodescript
+             node (list (bitcoin-lisp.crypto:bytes-to-hex script))))
+         (addrs (cdr (assoc "addresses" r :test #'string=))))
+    (is (string= "multisig" (cdr (assoc "type" r :test #'string=))))
+    (is (= 2 (cdr (assoc "reqSigs" r :test #'string=))))
+    (is (= 2 (length addrs)))
+    (is (string= (bitcoin-lisp.crypto:encode-p2pkh-address
+                  (bitcoin-lisp.crypto:hash160 pk1) :testnet3)
+                 (first addrs)))))
