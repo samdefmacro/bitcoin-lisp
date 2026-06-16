@@ -39,7 +39,8 @@
                  (:module "crypto"
                   :components ((:file "hash")
                                (:file "secp256k1")
-                               (:file "address")))
+                               (:file "address")
+                               (:file "bip32")))
                  (:module "serialization"
                   :components ((:file "binary")
                                (:file "types")
