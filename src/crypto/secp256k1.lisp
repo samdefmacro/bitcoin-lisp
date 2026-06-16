@@ -86,6 +86,36 @@
   (outputlen :pointer)
   (sig :pointer))
 
+;;; Recoverable signatures (BIP137 message signing) — libsecp recovery module.
+
+(cffi:defcfun ("secp256k1_ecdsa_sign_recoverable" secp256k1-ecdsa-sign-recoverable) :int
+  (ctx :pointer)
+  (sig :pointer)
+  (msghash32 :pointer)
+  (seckey :pointer)
+  (noncefp :pointer)
+  (ndata :pointer))
+
+(cffi:defcfun ("secp256k1_ecdsa_recoverable_signature_serialize_compact"
+               secp256k1-ecdsa-recoverable-signature-serialize-compact) :int
+  (ctx :pointer)
+  (output64 :pointer)
+  (recid :pointer)
+  (sig :pointer))
+
+(cffi:defcfun ("secp256k1_ecdsa_recoverable_signature_parse_compact"
+               secp256k1-ecdsa-recoverable-signature-parse-compact) :int
+  (ctx :pointer)
+  (sig :pointer)
+  (input64 :pointer)
+  (recid :int))
+
+(cffi:defcfun ("secp256k1_ecdsa_recover" secp256k1-ecdsa-recover) :int
+  (ctx :pointer)
+  (pubkey :pointer)
+  (sig :pointer)
+  (msghash32 :pointer))
+
 ;; BIP 340 tagged hash: hash32 = SHA256(SHA256(tag) || SHA256(tag) || msg).
 ;; Internally caches/reuses the SHA256 midstate after feeding the tag prefix
 ;; once, so repeated calls with the same tag avoid the 64-byte tag-prefix
@@ -243,6 +273,58 @@ Returns the DER signature bytes. Errors if PRIVKEY is invalid."
            (result (make-array n :element-type '(unsigned-byte 8))))
       (loop for i below n do (setf (aref result i) (cffi:mem-aref der :uint8 i)))
       result)))
+
+(defun sign-recoverable-compact (privkey hash32)
+  "Recoverable ECDSA signature of HASH32 under the 32-byte secret PRIVKEY (RFC6979
+nonce). Returns (VALUES compact-64-byte-vector recid) — the form used by Bitcoin
+message signing (the caller prepends the 27+recid[+4] header byte)."
+  (ensure-secp256k1-loaded)
+  (unless (= (length hash32) 32) (error "message hash must be 32 bytes"))
+  (unless (= (length privkey) 32) (error "private key must be 32 bytes"))
+  (cffi:with-foreign-objects ((sk :uint8 32)
+                              (msg :uint8 32)
+                              (rsig :uint8 65)
+                              (out :uint8 64)
+                              (recid :int))
+    (loop for i below 32 do (setf (cffi:mem-aref sk :uint8 i) (aref privkey i)))
+    (loop for i below 32 do (setf (cffi:mem-aref msg :uint8 i) (aref hash32 i)))
+    (unless (= 1 (secp256k1-ecdsa-sign-recoverable
+                  *secp256k1-context* rsig msg sk
+                  (cffi:null-pointer) (cffi:null-pointer)))
+      (error "recoverable ECDSA signing failed"))
+    (unless (= 1 (secp256k1-ecdsa-recoverable-signature-serialize-compact
+                  *secp256k1-context* out recid rsig))
+      (error "recoverable signature serialization failed"))
+    (let ((compact (make-array 64 :element-type '(unsigned-byte 8))))
+      (loop for i below 64 do (setf (aref compact i) (cffi:mem-aref out :uint8 i)))
+      (values compact (cffi:mem-ref recid :int)))))
+
+(defun recover-public-key (compact64 recid hash32 &key (compressed t))
+  "Recover the serialized public key that produced the COMPACT64 recoverable
+signature over HASH32 with the given RECID (0-3). Returns the pubkey bytes
+(33 compressed / 65 uncompressed), or NIL if recovery fails."
+  (ensure-secp256k1-loaded)
+  (when (and (= (length compact64) 64) (<= 0 recid 3) (= (length hash32) 32))
+    (cffi:with-foreign-objects ((in :uint8 64)
+                                (msg :uint8 32)
+                                (rsig :uint8 65)
+                                (pk :uint8 +secp256k1-pubkey-size+)
+                                (out :uint8 65)
+                                (outlen :size))
+      (loop for i below 64 do (setf (cffi:mem-aref in :uint8 i) (aref compact64 i)))
+      (loop for i below 32 do (setf (cffi:mem-aref msg :uint8 i) (aref hash32 i)))
+      (when (and (= 1 (secp256k1-ecdsa-recoverable-signature-parse-compact
+                       *secp256k1-context* rsig in recid))
+                 (= 1 (secp256k1-ecdsa-recover *secp256k1-context* pk rsig msg)))
+        (let ((len (if compressed 33 65)))
+          (setf (cffi:mem-ref outlen :size) len)
+          (when (= 1 (secp256k1-ec-pubkey-serialize
+                      *secp256k1-context* out outlen pk
+                      (if compressed +secp256k1-ec-compressed+ +secp256k1-ec-uncompressed+)))
+            (let* ((n (cffi:mem-ref outlen :size))
+                   (result (make-array n :element-type '(unsigned-byte 8))))
+              (loop for i below n do (setf (aref result i) (cffi:mem-aref out :uint8 i)))
+              result)))))))
 
 ;;; Lax DER signature parsing
 ;;;
