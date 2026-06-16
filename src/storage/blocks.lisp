@@ -59,7 +59,14 @@ Returns the block hash."
   (let* ((hash (bitcoin-lisp.serialization:block-header-hash
                 (bitcoin-lisp.serialization:bitcoin-block-header block)))
          (path (block-file-path store hash))
-         (data (bitcoin-lisp.serialization:serialize block))
+         ;; Persist blocks witness-complete (BIP144). The generic SERIALIZE
+         ;; writes transactions in legacy form, which DROPS witness data — that
+         ;; left on-disk blocks unservable to peers (a witness-stripped block
+         ;; fails segwit validation, so a peer answering a MSG_WITNESS_BLOCK with
+         ;; one gets rejected) and unusable for witness re-validation on reorg.
+         ;; serialize-witness-block writes each tx witness-serialized only when it
+         ;; carries witness, so non-segwit blocks are byte-identical to before.
+         (data (bitcoin-lisp.serialization:serialize-witness-block block))
          ;; If we're overwriting an already-stored block, its old size is
          ;; in total-bytes and must be replaced, not added to.
          (old-size (when (gethash hash (block-store-index store))

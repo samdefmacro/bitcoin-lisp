@@ -196,6 +196,7 @@
    #:make-getdata-message
    #:make-inv-message
    #:make-tx-message
+   #:make-block-message
    #:parse-tx-payload
    ;; Inventory
    #:inv-vector
