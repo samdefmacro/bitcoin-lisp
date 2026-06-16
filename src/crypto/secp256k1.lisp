@@ -511,6 +511,33 @@ signature over HASH32 with the given RECID (0-3). Returns the pubkey bytes
   (msglen :size)        ; Message length (typically 32 for hash)
   (pubkey :pointer))    ; x-only pubkey structure
 
+(defconstant +secp256k1-keypair-size+ 96
+  "Internal size of a secp256k1_keypair structure.")
+
+(cffi:defcfun ("secp256k1_keypair_create" secp256k1-keypair-create) :int
+  "Compute a keypair from a 32-byte secret key. Returns 1 on success, 0 if the
+   secret key is invalid."
+  (ctx :pointer)
+  (keypair :pointer)   ; Output: 96-byte keypair structure
+  (seckey32 :pointer)) ; Input: 32-byte secret key
+
+(cffi:defcfun ("secp256k1_keypair_xonly_pub" secp256k1-keypair-xonly-pub) :int
+  "Extract the x-only public key from a keypair. Returns 1 always."
+  (ctx :pointer)
+  (xonly_pubkey :pointer)  ; Output: x-only pubkey structure
+  (pk_parity :pointer)     ; Output: int* parity, can be NULL
+  (keypair :pointer))      ; Input: keypair structure
+
+(cffi:defcfun ("secp256k1_schnorrsig_sign32" secp256k1-schnorrsig-sign32) :int
+  "Create a BIP340 Schnorr signature of a 32-byte message. Returns 1 on success.
+   AUX_RAND32 may be NULL (BIP340 recommends 32 random bytes; deterministic if
+   zero/NULL)."
+  (ctx :pointer)
+  (sig64 :pointer)     ; Output: 64-byte signature
+  (msg32 :pointer)     ; Input: 32-byte message
+  (keypair :pointer)   ; Input: keypair structure
+  (aux_rand32 :pointer)) ; Input: 32-byte aux randomness, or NULL
+
 ;;; X-only public key operations
 
 (defun parse-xonly-pubkey (pubkey32)
@@ -649,6 +676,50 @@ for the verify call. ~10x reduction in CFFI overhead."
       (cffi:with-pointer-to-vector-data (msg-ptr message-hash)
         (= 1 (secp256k1-schnorrsig-verify
               *secp256k1-context* sig-ptr msg-ptr 32 pubkey))))))
+
+;;; Schnorr signing (BIP 340)
+
+(defun derive-xonly-pubkey (privkey)
+  "The 32-byte x-only (BIP340) public key for the 32-byte secret PRIVKEY. Errors
+if PRIVKEY is invalid."
+  (ensure-secp256k1-loaded)
+  (unless (= (length privkey) 32) (error "private key must be 32 bytes"))
+  (cffi:with-foreign-objects ((keypair :uint8 +secp256k1-keypair-size+)
+                              (xonly :uint8 +secp256k1-xonly-pubkey-size+)
+                              (out :uint8 32))
+    (cffi:with-pointer-to-vector-data (sk-ptr privkey)
+      (unless (= 1 (secp256k1-keypair-create *secp256k1-context* keypair sk-ptr))
+        (error "invalid private key")))
+    (secp256k1-keypair-xonly-pub *secp256k1-context* xonly (cffi:null-pointer) keypair)
+    (secp256k1-xonly-pubkey-serialize *secp256k1-context* out xonly)
+    (let ((result (make-array 32 :element-type '(unsigned-byte 8))))
+      (loop for i below 32 do (setf (aref result i) (cffi:mem-aref out :uint8 i)))
+      result)))
+
+(defun sign-schnorr (privkey hash32 &optional aux-rand32)
+  "64-byte BIP340 Schnorr signature of the 32-byte HASH32 under the 32-byte secret
+PRIVKEY. AUX-RAND32, if given, is 32 bytes of auxiliary randomness (BIP340
+recommends fresh randomness; omitting it signs with all-zero aux, which is
+deterministic and matches the BIP340 test vectors). Errors if PRIVKEY is invalid."
+  (ensure-secp256k1-loaded)
+  (unless (= (length privkey) 32) (error "private key must be 32 bytes"))
+  (unless (= (length hash32) 32) (error "message hash must be 32 bytes"))
+  (when (and aux-rand32 (/= (length aux-rand32) 32))
+    (error "aux randomness must be 32 bytes"))
+  (cffi:with-foreign-objects ((keypair :uint8 +secp256k1-keypair-size+)
+                              (sig :uint8 64)
+                              (aux :uint8 32))
+    (cffi:with-pointer-to-vector-data (sk-ptr privkey)
+      (unless (= 1 (secp256k1-keypair-create *secp256k1-context* keypair sk-ptr))
+        (error "invalid private key")))
+    (loop for i below 32
+          do (setf (cffi:mem-aref aux :uint8 i) (if aux-rand32 (aref aux-rand32 i) 0)))
+    (cffi:with-pointer-to-vector-data (msg-ptr hash32)
+      (unless (= 1 (secp256k1-schnorrsig-sign32 *secp256k1-context* sig msg-ptr keypair aux))
+        (error "schnorr signing failed")))
+    (let ((result (make-array 64 :element-type '(unsigned-byte 8))))
+      (loop for i below 64 do (setf (aref result i) (cffi:mem-aref sig :uint8 i)))
+      result)))
 
 ;;; Signature verification (ECDSA)
 
