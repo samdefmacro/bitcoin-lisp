@@ -40,6 +40,12 @@ Set automatically based on network: 100000 for mainnet, 1000 for testnet.")
   "When non-NIL, overrides the per-network nMinimumChainWork. For tests (the
 real per-network floors are ~10^25 work, unreachable by synthetic chains).")
 
+(defvar *assumevalid-override* :unset
+  "When not :UNSET, overrides the per-network defaultAssumeValid block hash: a
+32-byte WIRE-order hash forces that assumevalid point, or NIL disables the
+assumevalid script-skip entirely. :UNSET (the default) uses the built-in
+per-network value. For tests, and for operators who want to disable assumevalid.")
+
 (defvar *parallel-block-validation* nil
   "When NIL (default), block-script validation runs single-threaded.
 

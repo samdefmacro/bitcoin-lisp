@@ -874,6 +874,7 @@
    #:automatic-pruning-p
    #:minimum-chain-work
    #:*minimum-chain-work-override*
+   #:*assumevalid-override*
    #:*parallel-block-validation*
    ;; Token bucket rate limiter
    #:token-bucket
