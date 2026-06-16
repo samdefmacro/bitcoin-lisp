@@ -1637,3 +1637,33 @@ per key (previously empty)."
     (is (string= (bitcoin-lisp.crypto:encode-p2pkh-address
                   (bitcoin-lisp.crypto:hash160 pk1) :testnet3)
                  (first addrs)))))
+
+(test rpc-getnetworkinfo-completeness
+  "getnetworkinfo now reports localservices(+names), localrelay, relayfee,
+incrementalfee, connections_in/out, and warnings, and still yason-encodes."
+  (let* ((node (make-test-node))
+         (r (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)))
+    (is (= 16 (length (cdr (assoc "localservices" r :test #'string=)))))
+    (is (member "WITNESS" (cdr (assoc "localservicesnames" r :test #'string=))
+                :test #'string=))
+    (is (assoc "localrelay" r :test #'string=))
+    (is (floatp (cdr (assoc "relayfee" r :test #'string=))))
+    (is (floatp (cdr (assoc "incrementalfee" r :test #'string=))))
+    (is (integerp (cdr (assoc "connections_in" r :test #'string=))))
+    (is (integerp (cdr (assoc "connections_out" r :test #'string=))))
+    (is (assoc "warnings" r :test #'string=))
+    (let ((resp (bitcoin-lisp.rpc::make-rpc-response r "id")))
+      (finishes (with-output-to-string (s) (yason:encode resp s))))))
+
+(test rpc-getpeerinfo-fields
+  "getpeerinfo reports a real inbound flag plus synced_*/bytessent/bytesrecv/
+pingtime (was hardcoded inbound nil with no byte/ping fields)."
+  (let* ((node (make-test-node))
+         (peer (bitcoin-lisp::make-peer :address "1.2.3.4:8333"
+                                        :inbound t :start-height 99)))
+    (setf (bitcoin-lisp::node-peers node) (list peer))
+    (let ((e (first (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))))
+      (is (eq t (cdr (assoc "inbound" e :test #'string=))))
+      (is (= 99 (cdr (assoc "synced_blocks" e :test #'string=))))
+      (is (assoc "bytessent" e :test #'string=))
+      (is (assoc "pingtime" e :test #'string=)))))
