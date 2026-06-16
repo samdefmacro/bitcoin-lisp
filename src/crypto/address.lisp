@@ -95,6 +95,38 @@ Returns (VALUES version payload) or NIL if invalid."
           (values version payload))))))
 
 ;;; ============================================================
+;;; WIF (Wallet Import Format) private keys
+;;; ============================================================
+
+(defconstant +wif-version-mainnet+ #x80)
+(defconstant +wif-version-testnet+ #xef)  ; also regtest/signet
+
+(defun private-key-to-wif (privkey &key (network :mainnet) (compressed t))
+  "Encode a 32-byte secret PRIVKEY as a WIF string. NETWORK selects the version
+byte (mainnet #x80, otherwise #xef). COMPRESSED appends the 0x01 flag, meaning
+the matching public key is the 33-byte compressed form."
+  (assert (= (length privkey) 32) (privkey) "private key must be 32 bytes")
+  (let ((payload (if compressed
+                     (concatenate '(vector (unsigned-byte 8)) privkey (vector #x01))
+                     (coerce privkey '(vector (unsigned-byte 8))))))
+    (base58check-encode (if (eq network :mainnet)
+                            +wif-version-mainnet+
+                            +wif-version-testnet+)
+                        payload)))
+
+(defun wif-to-private-key (wif)
+  "Decode a WIF string to (VALUES privkey-32-bytes compressed-p network), or NIL
+if invalid. NETWORK is :mainnet for version #x80, else :testnet."
+  (multiple-value-bind (version payload) (base58check-decode wif)
+    (when (and version payload
+               (or (= version +wif-version-mainnet+) (= version +wif-version-testnet+))
+               (or (= (length payload) 32)
+                   (and (= (length payload) 33) (= (aref payload 32) #x01))))
+      (values (subseq payload 0 32)
+              (= (length payload) 33)
+              (if (= version +wif-version-mainnet+) :mainnet :testnet)))))
+
+;;; ============================================================
 ;;; Address Version Prefixes
 ;;; ============================================================
 

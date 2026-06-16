@@ -33,6 +33,12 @@
    #:public-key-valid-p
    #:ensure-secp256k1-loaded
    #:cleanup-secp256k1
+   ;; Signing (private key -> pubkey / signature) + WIF
+   #:valid-private-key-p
+   #:derive-public-key
+   #:sign-ecdsa
+   #:private-key-to-wif
+   #:wif-to-private-key
    ;; Schnorr / x-only pubkeys (BIP 340)
    #:verify-schnorr-signature
    #:parse-xonly-pubkey
