@@ -873,6 +873,48 @@ a header extending the high-work tip is accepted."
         (is (not (null (bitcoin-lisp.storage:get-block-index-entry state ext-hash)))
             "tip-extending header should be admitted")))))
 
+(test handle-headers-validates-before-admission
+  "CONSENSUS/anti-DoS (P0 fix 2026-06-16): announced headers must be validated
+(PoW / MTP / difficulty / checkpoint) before entering the block index. The
+generic message path (handle-headers, used by the IBD pre-sync drain and BIP130
+sendheaders) and the at-tip dispatch path both now route through
+validate-header-chain. Before the fix, handle-headers admitted any header with a
+known parent, unvalidated — letting a peer inflate chain-work with low-target
+headers and bypass checkpoints at admission. Uses a header whose timestamp is at
+the median-time-past, which fails the timestamp>MTP rule deterministically."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (state (bitcoin-lisp.storage:init-chain-state
+                 (merge-pathnames "test-hdr-validation/" (uiop:temporary-directory))))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash state))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (genesis-ts 1296688600)
+         (genesis-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash genesis-hash :height 0 :chain-work 1 :status :valid
+                         :header (bitcoin-lisp.serialization:make-block-header
+                                  :version 1 :prev-block zeros :merkle-root zeros
+                                  :timestamp genesis-ts :bits #x207fffff :nonce 0
+                                  :cached-hash genesis-hash))))
+    (bitcoin-lisp.storage:add-block-index-entry state genesis-entry)
+    ;; Child of genesis whose timestamp == genesis MTP -> invalid (<= MTP).
+    (let* ((bad-hdr (bitcoin-lisp.serialization:make-block-header
+                     :version 1 :prev-block genesis-hash :merkle-root zeros
+                     :timestamp genesis-ts :bits #x207fffff :nonce 1))
+           (bad-hash (bitcoin-lisp.serialization:block-header-hash bad-hdr)))
+      ;; (a) the shared validation gate rejects it.
+      (multiple-value-bind (valid-headers error)
+          (bitcoin-lisp.networking::validate-header-chain (list bad-hdr) state)
+        (is (null valid-headers) "invalid header must not pass validate-header-chain")
+        (is (not (null error))))
+      ;; (b) routing: handle-headers must not admit it to the index. (nil peer is
+      ;; safe — with no valid headers, update-block-availability is never called.)
+      (let ((payload (concatenate '(vector (unsigned-byte 8))
+                                  (vector 1)  ; header-count varint
+                                  (bitcoin-lisp.serialization:serialize-block-header bad-hdr)
+                                  (vector 0)))) ; per-header tx-count varint
+        (bitcoin-lisp.networking::handle-headers nil payload state)
+        (is (null (bitcoin-lisp.storage:get-block-index-entry state bad-hash))
+            "invalid header must not be admitted by handle-headers")))))
+
 (test validate-block-skip-scripts
   "Test that validate-block with :skip-scripts t skips script validation."
   ;; Create a minimal block with an invalid script that would normally fail.

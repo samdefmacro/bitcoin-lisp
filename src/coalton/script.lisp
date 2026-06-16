@@ -1285,7 +1285,11 @@
        (match (stack-pop (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
          ((Some (Tuple n-bytes new-stack))
-          (match (bytes-to-script-num n-bytes)
+          ;; Core (interpreter.cpp) reads the index as a default 4-byte
+          ;; CScriptNum; a >4-byte operand is a script-number overflow, not an
+          ;; in-range index. Use the 4-byte-bounded conversion (same as the
+          ;; arithmetic ops and OP_CHECKSIGADD) so we reject what Core rejects.
+          (match (bytes-to-script-num-limited n-bytes 4)
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk sn)
              (let ((sn-val (script-num-value sn)))
@@ -1303,7 +1307,8 @@
        (match (stack-pop (context-main-stack ctx))
          ((None) (ScriptErr SE-StackUnderflow))
          ((Some (Tuple n-bytes new-stack))
-          (match (bytes-to-script-num n-bytes)
+          ;; Same 4-byte bound as OP_PICK (see above) — match Core's CScriptNum.
+          (match (bytes-to-script-num-limited n-bytes 4)
             ((ScriptErr e) (ScriptErr e))
             ((ScriptOk sn)
              (let ((sn-val (script-num-value sn)))

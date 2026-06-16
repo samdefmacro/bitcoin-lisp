@@ -1239,14 +1239,24 @@ handler. Shared by the block-download drain and the at-tip reap pass."
 
     ((string= command "headers")
      (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-       (process-headers headers chain-state)
-       (incf (ibd-context-headers-received ctx) (length headers))
-       ;; Per-peer availability: peer's tip is the last header in the batch.
-       (let ((last (car (last headers))))
-         (when last
-           (update-block-availability
-            peer chain-state
-            (bitcoin-lisp.serialization:block-header-hash last))))))
+       ;; Validate (PoW / MTP / difficulty / checkpoint) BEFORE admitting to the
+       ;; index — exactly as the Phase-1 sync-headers path does. This is the
+       ;; at-tip / BIP130 sendheaders steady-state flow; admitting raw headers
+       ;; here let a peer pollute the block index and inflate chain-work with
+       ;; low-target headers lacking matching PoW (fork-choice / bandwidth DoS,
+       ;; and a checkpoint bypass at header admission).
+       (multiple-value-bind (valid-headers error)
+           (validate-header-chain headers chain-state)
+         (when error
+           (bitcoin-lisp:log-warn "Header validation error (at-tip): ~A" error))
+         (process-headers valid-headers chain-state)
+         (incf (ibd-context-headers-received ctx) (length valid-headers))
+         ;; Per-peer availability: peer's tip is the last VALID header.
+         (let ((last (car (last valid-headers))))
+           (when last
+             (update-block-availability
+              peer chain-state
+              (bitcoin-lisp.serialization:block-header-hash last)))))))
 
     (t (handle-message peer command payload
                        chain-state utxo-set block-store

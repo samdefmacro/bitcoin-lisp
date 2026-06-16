@@ -593,3 +593,62 @@
       (is (zerop (+ failed-p2sh failed-cleanstack failed-minimaldata failed-witness failed-other))
           "All script tests must pass. Failures: P2SH=~D CLEANSTACK=~D MINIMALDATA=~D WITNESS=~D Other=~D"
           failed-p2sh failed-cleanstack failed-minimaldata failed-witness failed-other))))
+
+;;;; Consensus-divergence regression guards (P0 fixes, 2026-06-16)
+
+(test op-pick-roll-reject-oversized-operand
+  "CONSENSUS: OP_PICK / OP_ROLL read the index as a 4-byte CScriptNum (Bitcoin
+Core interpreter.cpp). A >4-byte operand is a script-number overflow, not an
+in-range index, so the script must fail. Before the fix these used an unbounded
+conversion, so a 5-byte operand decoding to a valid index (here 0x0100000000 = 1)
+was accepted where Core rejects it."
+  ;; Raw opcode bytes (assemble-script keys small pushes/opcodes oddly): OP_1=0x51
+  ;; OP_2=0x52, OP_PICK=0x79, OP_ROLL=0x7a. Stack: <1> <2> <5-byte index> PICK/ROLL.
+  ;; 5-byte index operand -> must fail on both opcodes.
+  (multiple-value-bind (ok err)
+      (run-script-test "" "0x51 0x52 0x05 0x0100000000 0x79" "")
+    (declare (ignore err))
+    (is (null ok) "OP_PICK with a 5-byte index operand must fail"))
+  (multiple-value-bind (ok err)
+      (run-script-test "" "0x51 0x52 0x05 0x0100000000 0x7a" "")
+    (declare (ignore err))
+    (is (null ok) "OP_ROLL with a 5-byte index operand must fail"))
+  ;; Control: a valid 4-byte index (0x01000000 = 1) still works, so we only
+  ;; rejected the overflow rather than breaking the opcode.
+  (multiple-value-bind (ok err)
+      (run-script-test "" "0x51 0x52 0x04 0x01000000 0x79" "")
+    (declare (ignore err))
+    (is (eq ok t) "OP_PICK with a valid 4-byte index must still succeed")))
+
+(test p2sh-witness-rejects-malleated-scriptsig
+  "CONSENSUS (BIP141; WITNESS is a MANDATORY flag): a P2SH-wrapped witness spend
+requires the scriptSig to be EXACTLY a single canonical push of the witness
+program. An extra leading push (third-party malleability) must be rejected even
+though P2SH push-only accepts it — Core returns WITNESS_MALLEATED_P2SH. Before
+the fix, extract-last-push-data ignored the leading junk and the spend was
+accepted. Uses P2SH(P2WSH(OP_TRUE)) so the canonical case validates with a
+trivial witness (no signature needed)."
+  (let* ((witness-script (make-array 1 :element-type '(unsigned-byte 8)
+                                       :initial-element #x51)) ; OP_TRUE
+         (wsh (bitcoin-lisp.crypto:sha256 witness-script))     ; 32-byte program
+         (wp (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x20) wsh)) ; OP_0 push32
+         (p2sh-hash (bitcoin-lisp.crypto:hash160 wp))          ; 20 bytes
+         (spk (concatenate '(vector (unsigned-byte 8))
+                           (vector #xa9 #x14) p2sh-hash (vector #x87))) ; HASH160 <20> EQUAL
+         (canonical (concatenate '(vector (unsigned-byte 8)) (vector #x22) wp)) ; single push34
+         (malleated (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x22) wp)) ; OP_0 + push34
+         (witness (list witness-script)))   ; P2WSH witness stack = [witnessScript]
+    (bitcoin-lisp.coalton.interop:set-script-flags "P2SH,WITNESS")
+    (unwind-protect
+         (progn
+           (multiple-value-bind (ok err)
+               (bitcoin-lisp.coalton.interop:verify-script malleated spk
+                                                           :witness witness :amount 0)
+             (is (null ok))
+             (is (eq err :witness-malleated-p2sh)))
+           (multiple-value-bind (ok err)
+               (bitcoin-lisp.coalton.interop:verify-script canonical spk
+                                                           :witness witness :amount 0)
+             (declare (ignore err))
+             (is (eq ok t) "canonical single-push P2SH-witness spend must verify")))
+      (bitcoin-lisp.coalton.interop:set-script-flags nil))))

@@ -718,8 +718,23 @@ Returns (values success error-keyword)."
           (let ((redeem-script (extract-last-push-data script-sig)))
             (when (and redeem-script (is-witness-program-p redeem-script))
               (setf had-witness t)
-              ;; P2SH-witness: scriptSig must be EXACTLY a single push of the witness program
-              ;; (validated implicitly by P2SH execution succeeding)
+              ;; BIP141 (consensus — WITNESS is a MANDATORY flag): the scriptSig
+              ;; must be EXACTLY a single canonical push of the witness program.
+              ;; P2SH only requires push-ONLY (which permits extra leading
+              ;; pushes), and extract-last-push-data ignores anything before the
+              ;; final push — so we must compare the whole scriptSig to the
+              ;; canonical push ourselves, or third-party malleability slips
+              ;; through. Core interpreter.cpp returns WITNESS_MALLEATED_P2SH:
+              ;;   if (scriptSig != CScript() << redeemScript) -> reject
+              ;; A witness program is always <76 bytes, so its canonical push is
+              ;; [len][program] (no OP_PUSHDATA*); a non-minimal or multi-push
+              ;; scriptSig won't match and is rejected, matching Core.
+              (let* ((rlen (length redeem-script))
+                     (expected (make-array (1+ rlen) :element-type '(unsigned-byte 8))))
+                (setf (aref expected 0) rlen)
+                (replace expected redeem-script :start1 1)
+                (unless (equalp script-sig expected)
+                  (return-from verify-script (values nil :witness-malleated-p2sh))))
               (multiple-value-bind (wok werr)
                   (validate-witness-program
                    redeem-script (or witness '()) (or amount 0) nil)
