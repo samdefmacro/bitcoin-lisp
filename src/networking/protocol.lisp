@@ -147,7 +147,7 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "getdata")
-     (handle-getdata peer payload chain-state mempool)
+     (handle-getdata peer payload chain-state mempool block-store)
      t)
 
     ((string= command "getheaders")
@@ -594,10 +594,22 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
       (declare (ignore c))
       nil)))
 
-(defun handle-getdata (peer payload chain-state &optional mempool)
+(defconstant +max-blocks-served-per-getdata+ 500
+  "Cap on full blocks served from a single getdata message. A well-behaved peer
+requests at most ~16 blocks in flight (and up to 500 after a getblocks inv); this
+bounds the disk-read/serialize/send work a single message can demand, since a
+getdata can carry up to MAX_INV_SZ (50000) entries.")
+
+(defun handle-getdata (peer payload chain-state &optional mempool block-store)
   "Handle a getdata message. Respond with requested transactions or blocks.
-Does not respond to transaction requests when relay is disabled (mainnet default)."
-  (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload)))
+Does not respond to transaction requests when relay is disabled (mainnet default).
+Blocks are served from BLOCK-STORE — MSG_BLOCK legacy, MSG_WITNESS_BLOCK with
+witness — so the node is a serving peer, not just a leech. A requested block we
+do not have on disk (pruned or unknown) is silently skipped, like Bitcoin Core's
+handling of unavailable blocks."
+  (declare (ignore chain-state))
+  (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
+        (blocks-served 0))
     (dolist (inv inv-vectors)
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
@@ -611,8 +623,19 @@ Does not respond to transaction requests when relay is disabled (mainnet default
                  (send-message peer
                                (bitcoin-lisp.serialization:make-tx-message
                                 (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
-          ;; Block requests are not handled here (handled by IBD/sync)
-          )))))
+          ;; Block request - serve the full block from disk (witness-aware).
+          ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
+               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
+           (when (and block-store (< blocks-served +max-blocks-served-per-getdata+))
+             (let ((block (bitcoin-lisp.storage:get-block block-store hash)))
+               (when block
+                 (incf blocks-served)
+                 (send-message
+                  peer
+                  (bitcoin-lisp.serialization:make-block-message
+                   block
+                   :witness (= inv-type
+                               bitcoin-lisp.serialization:+inv-type-witness-block+))))))))))))
 
 ;;; Serving headers / blocks / addresses to peers
 ;;;
