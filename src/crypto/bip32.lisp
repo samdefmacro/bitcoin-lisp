@@ -184,3 +184,25 @@ hardened) or a list of integer indices."
   (reduce #'bip32-derive-child
           (if (listp path) path (%parse-bip32-path path))
           :initial-value k))
+
+;;; --- BIP341 taproot key tweak (signing side) ---
+;;; Lives here because it needs the mod-n helpers above; tap-tweak-hash itself
+;;; is in hash.lisp.
+
+(defun taproot-tweak-private-key (privkey &optional merkle-root)
+  "BIP341 output secret key for a key-path spend: the secret whose x-only public
+key is the tweaked output key Q = P + H_TapTweak(P||merkle_root)*G, where P is the
+internal key of the 32-byte PRIVKEY. MERKLE-ROOT is NIL for key-path-only outputs.
+Returns the 32-byte tweaked secret (feed to sign-schnorr). Errors on the negligible
+invalid cases (tweak >= n or zero result)."
+  (let* ((p-xonly (derive-xonly-pubkey privkey))
+         (full-pub (derive-public-key privkey :compressed t))
+         (d (%be->int privkey))
+         ;; BIP341: if the internal point P has odd Y, sign with n - d so the
+         ;; effective base point has even Y.
+         (d-even (if (= (aref full-pub 0) 2) d (- +secp256k1-order+ d)))
+         (tweak (%be->int (tap-tweak-hash p-xonly merkle-root))))
+    (when (>= tweak +secp256k1-order+) (error "invalid taproot tweak (>= n)"))
+    (let ((out (mod (+ d-even tweak) +secp256k1-order+)))
+      (when (zerop out) (error "invalid taproot output key (zero)"))
+      (%int->32be out))))
