@@ -586,6 +586,22 @@ reads instead of flexi-streams' Gray-stream input dispatch."
   (flexi-streams:with-input-from-sequence (stream payload)
     (read-block-txn-response stream)))
 
+;;; Make blocktxn message (BIP152 serve side)
+(defun make-blocktxn-message (block-hash txs &key witness)
+  "Create a blocktxn message answering a getblocktxn: BLOCK-HASH followed by the
+requested TXS (a list) in order. With :WITNESS, each tx that carries witness data
+is BIP144 witness-serialized — a witness compact-block reconstruction needs it;
+non-witness txs stay legacy either way, matching Core's TX_WITH_WITNESS. (The
+older write-block-txn-response is legacy-only and unsuitable for witness serving.)"
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-hash256 stream block-hash)
+                   (write-compact-size stream (length txs))
+                   (dolist (tx txs)
+                     (if (and witness (transaction-has-witness-p tx))
+                         (write-witness-transaction stream tx)
+                         (write-transaction stream tx))))))
+    (serialize-message "blocktxn" payload)))
+
 ;;; Addr (v1) message building
 
 (defun make-addr-message (addrs-with-timestamps)
