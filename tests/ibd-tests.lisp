@@ -1105,3 +1105,51 @@ exceed the bound)."
                            (* 5 internal-time-units-per-second)))))
              (usocket:socket-close client)))
       (usocket:socket-close server))))
+
+(test assumevalid-skip-height
+  "assumevalid lets IBD skip signature checks for ancestors of a known-good
+block. default-assumevalid yields a 32-byte WIRE-order hash for real networks
+(nil on regtest); assumevalid-skip-height returns the assumevalid block's height
+when its header is in the index, -1 when absent or disabled; script-skip-height
+is the max with the checkpoint height. Only sig checks are skipped — everything
+else is still validated."
+  ;; default-assumevalid presence + byte order (display ...51ba5ac -> wire 0xac..0x00)
+  (let ((bitcoin-lisp:*network* :mainnet))
+    (let ((av (bitcoin-lisp.networking::default-assumevalid)))
+      (is (= 32 (length av)))
+      (is (= #xac (aref av 0)))
+      (is (= #x00 (aref av 31)))))
+  (let ((bitcoin-lisp:*network* :regtest))
+    (is (null (bitcoin-lisp.networking::default-assumevalid))))
+  ;; skip-height logic on a synthetic regtest chain (checkpoint height = 0)
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (state (bitcoin-lisp.storage:init-chain-state
+                 (merge-pathnames "test-assumevalid/" (uiop:temporary-directory))))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash state))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (av-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+         (absent (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash genesis-hash :height 0 :chain-work 1 :status :valid
+            :header (bitcoin-lisp.serialization:make-block-header
+                     :version 1 :prev-block zeros :merkle-root zeros
+                     :timestamp 1296688600 :bits #x207fffff :nonce 0
+                     :cached-hash genesis-hash)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash av-hash :height 50 :chain-work 100 :status :header-valid
+            :header (bitcoin-lisp.serialization:make-block-header
+                     :version 1 :prev-block genesis-hash :merkle-root zeros
+                     :timestamp 1296688700 :bits #x207fffff :nonce 0
+                     :cached-hash av-hash)))
+    ;; assumevalid points at the in-index block -> its height; sigs skip <= 50.
+    (let ((bitcoin-lisp:*assumevalid-override* av-hash))
+      (is (= 50 (bitcoin-lisp.networking::assumevalid-skip-height state)))
+      (is (= 50 (bitcoin-lisp.networking::script-skip-height state))))
+    ;; assumevalid hash not in our index -> no skip.
+    (let ((bitcoin-lisp:*assumevalid-override* absent))
+      (is (= -1 (bitcoin-lisp.networking::assumevalid-skip-height state))))
+    ;; assumevalid explicitly disabled -> no skip.
+    (let ((bitcoin-lisp:*assumevalid-override* nil))
+      (is (= -1 (bitcoin-lisp.networking::assumevalid-skip-height state))))))

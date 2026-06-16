@@ -476,6 +476,48 @@ Uses the current network from bitcoin-lisp:*network*."
         (caar (last checkpoints))
         0)))
 
+(defun default-assumevalid ()
+  "The current network's defaultAssumeValid block hash in WIRE byte order (the
+form block-index keys use), or NIL when assumevalid is disabled. This is a
+recent known-good block shipped with the release; signature checks are skipped
+for its ancestors during IBD (Bitcoin Core consensus.defaultAssumeValid). Values
+mirror Core exactly (stored here as the display hash, reversed to wire order like
+get-checkpoint-hash). bitcoin-lisp:*assumevalid-override* (when not :UNSET) takes
+precedence — a wire-order hash to force, or NIL to disable."
+  (if (not (eq bitcoin-lisp:*assumevalid-override* :unset))
+      bitcoin-lisp:*assumevalid-override*
+      (let ((display (ecase bitcoin-lisp:*network*
+                       (:mainnet  "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac")
+                       (:testnet3 "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4")
+                       (:testnet4 "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a")
+                       (:signet   "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329")
+                       (:regtest  nil))))
+        (when display
+          (reverse (bitcoin-lisp.crypto:hex-to-bytes display))))))
+
+(defun assumevalid-skip-height (chain-state)
+  "Height of the hardcoded assumevalid block when its header is already in our
+index (i.e. we are syncing the chain that contains it), else -1. Blocks at or
+below this height may skip SIGNATURE checks: the assumevalid hash is unforgeable,
+so a block carrying it pins a known-good ancestor chain. Mirrors Bitcoin Core's
+-assumevalid (sigs skipped for ancestors of the assumed-valid block)."
+  (let ((av (default-assumevalid)))
+    (if (null av)
+        -1
+        (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state av)))
+          (if entry
+              (bitcoin-lisp.storage:block-index-entry-height entry)
+              -1)))))
+
+(defun script-skip-height (chain-state)
+  "Highest block height for which signature validation may be skipped during IBD:
+the greater of the last checkpoint height and the assumevalid block's height.
+Blocks at or below this height still get FULL structural / PoW / amount / sequence
+validation — only signature checks are skipped, exactly as Bitcoin Core does for
+ancestors of the last checkpoint and -assumevalid."
+  (max (last-checkpoint-height)
+       (assumevalid-skip-height chain-state)))
+
 (defun validate-checkpoint (hash height)
   "Validate that HASH at HEIGHT matches any applicable checkpoint.
 Returns T if valid or no checkpoint at that height, NIL if checkpoint mismatch."
@@ -1742,7 +1784,7 @@ After connecting, drains the queue of any children that can now be connected."
         (multiple-value-bind (activated error)
             (bitcoin-lisp.validation:activate-block
              block chain-state block-store utxo-set
-             :skip-scripts (<= height (last-checkpoint-height))
+             :skip-scripts (<= height (script-skip-height chain-state))
              :fee-estimator fee-estimator
              :recent-rejects recent-rejects
              :mempool mempool)
@@ -1765,10 +1807,11 @@ After connecting, drains the queue of any children that can now be connected."
           ;;       validation against the wrong-fork UTXO state
           ;;       short-circuited with MISSING-INPUT.
           ;;   (c) prev is on a weaker chain → store, don't activate.
-          ;; Skip script validation for blocks at or below the last
-          ;; checkpoint (matches Bitcoin Core IBD behavior).
+          ;; Skip signature validation for blocks at or below the last
+          ;; checkpoint or the assumevalid block (matches Bitcoin Core IBD;
+          ;; everything except sig checks is still validated).
           (let ((current-time (bitcoin-lisp.serialization:get-unix-time))
-                (skip-scripts (<= height (last-checkpoint-height))))
+                (skip-scripts (<= height (script-skip-height chain-state))))
             (multiple-value-bind (activated error missing-blocks)
                 (bitcoin-lisp.validation:activate-block
                  block chain-state block-store utxo-set
@@ -1851,7 +1894,7 @@ Repeats until no more queued blocks can be connected."
   (unless *ibd-context*
     (return-from drain-block-queue 0))
   (let ((drained 0)
-        (checkpoint-height (last-checkpoint-height))
+        (skip-height (script-skip-height chain-state))
         (mempool (ibd-context-mempool *ibd-context*)))
     (loop
       ;; A full cascade can connect the whole queued window (~170 blocks
@@ -1874,7 +1917,7 @@ Repeats until no more queued blocks can be connected."
         ;; tip-extend, pre-reorg+activate, or store-only based on the
         ;; incoming block's parent vs. our current tip.
         (let* ((current-time (bitcoin-lisp.serialization:get-unix-time))
-               (skip-scripts (<= next-height checkpoint-height)))
+               (skip-scripts (<= next-height skip-height)))
           (multiple-value-bind (activated error missing-blocks)
               (bitcoin-lisp.validation:activate-block
                block chain-state block-store utxo-set
