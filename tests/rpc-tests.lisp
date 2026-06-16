@@ -1692,3 +1692,69 @@ address, and a malformed signature all fail. The signature is deterministic."
                    :testnet3)))
       (is (null (bitcoin-lisp.rpc::rpc-verifymessage node (list addr2 sig msg)))))
     (is (null (bitcoin-lisp.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg))))))
+
+(test rpc-signrawtransactionwithkey-p2pkh-p2wpkh
+  "signrawtransactionwithkey signs a P2WPKH input (input 0) and a P2PKH input
+(input 1) with a supplied key; complete is T, and each produced signature
+verifies under the SAME sighash the validator computes (legacy + BIP143)."
+  (let* ((node (make-test-node))
+         (k1 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 1) k))
+         (wif (bitcoin-lisp.crypto:private-key-to-wif k1 :network :mainnet :compressed t))
+         (pub (bitcoin-lisp.crypto:derive-public-key k1))
+         (pkh (bitcoin-lisp.crypto:hash160 pub))
+         (p2wpkh (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x14) pkh))
+         (p2pkh (concatenate '(vector (unsigned-byte 8)) (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
+         (p2pkh-code (concatenate '(vector (unsigned-byte 8))
+                                  (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
+         (txid0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 10))
+         (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 11))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 2
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                 :hash txid0 :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff)
+                              (bitcoin-lisp.serialization:make-tx-in
+                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                 :hash txid1 :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 90000 :script-pubkey p2pkh))
+              :lock-time 0))
+         (tx-hex (bitcoin-lisp.crypto:bytes-to-hex
+                  (bitcoin-lisp.serialization:serialize-transaction tx)))
+         (prevtxs (list (list (cons "txid" (bitcoin-lisp.rpc::hash-to-hex txid0))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex p2wpkh))
+                              (cons "amount" 0.001d0))   ; 100000 sats
+                        (list (cons "txid" (bitcoin-lisp.rpc::hash-to-hex txid1))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex p2pkh)))))
+         (result (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+                  node (list tx-hex (list wif) prevtxs))))
+    (is (eq t (cdr (assoc "complete" result :test #'string=))))
+    (let* ((tx2 (bitcoin-lisp.serialization:parse-tx-payload
+                 (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
+           (ins (bitcoin-lisp.serialization:transaction-inputs tx2))
+           (wit (bitcoin-lisp.serialization:transaction-witness tx2)))
+      ;; Input 0 (P2WPKH): witness = [sig pubkey]; sig verifies under BIP143 sighash.
+      (let* ((stack (aref wit 0))
+             (sig (first stack))
+             (der (subseq sig 0 (1- (length sig))))
+             (sighash (let ((bitcoin-lisp.coalton.interop::*current-tx* tx2)
+                            (bitcoin-lisp.coalton.interop::*current-input-index* 0)
+                            (bitcoin-lisp.coalton.interop::*precomputed-sighash*
+                             (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx2)))
+                        (bitcoin-lisp.coalton.interop::compute-bip143-sighash p2pkh-code 100000 1))))
+        (is (equalp pub (second stack)))
+        (is-true (bitcoin-lisp.crypto:verify-signature sighash der pub)))
+      ;; Input 1 (P2PKH): scriptSig = push(sig) push(pubkey); sig verifies under legacy sighash.
+      (let* ((ss (bitcoin-lisp.serialization:tx-in-script-sig (aref ins 1)))
+             (siglen (aref ss 0))
+             (sig (subseq ss 1 (1+ siglen)))
+             (der (subseq sig 0 (1- (length sig))))
+             (sighash (bitcoin-lisp.coalton.interop::compute-legacy-sighash tx2 1 p2pkh 1)))
+        (is-true (bitcoin-lisp.crypto:verify-signature sighash der pub))))))

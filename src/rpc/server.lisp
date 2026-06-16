@@ -123,6 +123,7 @@
   (register-rpc-method "decodescript" #'rpc-decodescript)
   (register-rpc-method "signmessagewithprivkey" #'rpc-signmessagewithprivkey)
   (register-rpc-method "verifymessage" #'rpc-verifymessage)
+  (register-rpc-method "signrawtransactionwithkey" #'rpc-signrawtransactionwithkey)
   ;; UTXO set statistics
   (register-rpc-method "gettxoutsetinfo" #'rpc-gettxoutsetinfo)
   ;; Block statistics
