@@ -182,3 +182,21 @@ transaction retains witness data."
            (rtx (first (bitcoin-lisp.serialization:bitcoin-block-transactions blk2))))
       (is-true (bitcoin-lisp.serialization:transaction-has-witness-p rtx)
                "witness must survive the make-block-message round-trip"))))
+
+(test make-blocktxn-message-witness
+  "make-blocktxn-message :witness t serializes the requested txs witness-complete
+(BIP152 serve side) and round-trips via parse-blocktxn-payload, preserving order,
+block hash, and per-tx witness."
+  (let* ((state (sb-ext:seed-random-state 919))
+         (bh (%rt-rand-bytes 32 state))
+         (wtx (%rt-rand-tx state :witness t))
+         (ltx (%rt-rand-tx state :witness nil))
+         (msg (bitcoin-lisp.serialization:make-blocktxn-message bh (list wtx ltx) :witness t))
+         (resp (bitcoin-lisp.serialization:parse-blocktxn-payload (subseq msg 24)))
+         (rtxs (bitcoin-lisp.serialization:block-txn-response-transactions resp)))
+    (is (equalp bh (bitcoin-lisp.serialization:block-txn-response-block-hash resp)))
+    (is (= 2 (length rtxs)))
+    (is-true (bitcoin-lisp.serialization:transaction-has-witness-p (first rtxs))
+             "witness tx must round-trip with witness intact")
+    (is (equalp (bitcoin-lisp.serialization:serialize-witness-transaction wtx)
+                (bitcoin-lisp.serialization:serialize-witness-transaction (first rtxs))))))

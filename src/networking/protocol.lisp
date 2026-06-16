@@ -210,6 +210,10 @@ Returns T if message was handled, NIL otherwise."
                         fee-estimator :recent-rejects recent-rejects))
      t)
 
+    ((string= command "getblocktxn")
+     (handle-getblocktxn peer payload block-store)
+     t)
+
     (t nil)))  ; Unknown message
 
 ;;; Inventory handling
@@ -636,6 +640,30 @@ handling of unavailable blocks."
                    block
                    :witness (= inv-type
                                bitcoin-lisp.serialization:+inv-type-witness-block+))))))))))))
+
+(defun handle-getblocktxn (peer payload block-store)
+  "Serve a BIP152 getblocktxn: reply with a blocktxn carrying the requested
+transactions (by index, witness-serialized) from the named block. This is the
+serve side of compact-block relay — without it a peer reconstructing one of our
+compact blocks can't fetch the txs it's missing. Skipped if we don't have the
+block on disk (the peer falls back to a full getdata). An out-of-range index is
+a malformed request: record misbehavior and don't reply."
+  (when block-store
+    (let* ((req (bitcoin-lisp.serialization:parse-getblocktxn-payload payload))
+           (block-hash (bitcoin-lisp.serialization:block-txn-request-block-hash req))
+           (indexes (bitcoin-lisp.serialization:block-txn-request-indexes req))
+           (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+      (when block
+        (let* ((txs (coerce (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+                            'vector))
+               (n (length txs)))
+          (if (every (lambda (i) (and (>= i 0) (< i n))) indexes)
+              (send-message peer
+                            (bitcoin-lisp.serialization:make-blocktxn-message
+                             block-hash
+                             (mapcar (lambda (i) (aref txs i)) indexes)
+                             :witness t))
+              (record-misbehavior peer 100)))))))
 
 ;;; Serving headers / blocks / addresses to peers
 ;;;
