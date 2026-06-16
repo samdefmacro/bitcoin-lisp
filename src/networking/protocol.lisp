@@ -361,41 +361,27 @@ Mirrors Bitcoin Core's MSG NOTFOUND handling (net_processing.cpp)."
 ;;; Headers handling
 
 (defun handle-headers (peer payload chain-state)
-  "Handle a headers message."
-  (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload))
-        (last-header-hash nil))
-    (dolist (header headers)
-      (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
-             (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
-        (setf last-header-hash hash)
-        ;; Check if we already have this header
-        (unless (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
-          ;; Check if we have the previous block
-          (let ((prev-entry (bitcoin-lisp.storage:get-block-index-entry
-                             chain-state prev-hash)))
-            (when prev-entry
-              ;; Add header to index
-              (let ((new-height (1+ (bitcoin-lisp.storage:block-index-entry-height
-                                     prev-entry)))
-                    (prev-work (bitcoin-lisp.storage:block-index-entry-chain-work
-                                prev-entry)))
-                (bitcoin-lisp.storage:add-block-index-entry
-                 chain-state
-                 (bitcoin-lisp.storage:make-block-index-entry
-                  :hash hash
-                  :height new-height
-                  :header header
-                  :prev-entry prev-entry
-                  :chain-work (bitcoin-lisp.storage:calculate-chain-work
-                               (bitcoin-lisp.serialization:block-header-bits header)
-                               prev-work)
-                  :status :header-valid))))))))
-    ;; Per-peer availability: the last header in the batch is the peer's
-    ;; advertised tip on this announcement. Mirrors Core's UpdateBlockAvailability
-    ;; called per-header in ProcessMessage (net_processing.cpp ~3500).
-    (when last-header-hash
-      (bitcoin-lisp.networking::update-block-availability
-       peer chain-state last-header-hash))))
+  "Handle a headers message: validate the announced headers (PoW, MTP,
+difficulty, checkpoint) and admit only the valid ones to the block index,
+queueing them for block download. This is the generic message-loop path (the
+IBD pre-sync drain via handle-message, and BIP130 sendheaders announcements);
+like the Phase-1 sync-headers path it MUST validate before admission, or a peer
+could inject unchecked headers into the index — inflating chain-work with
+low-target headers lacking matching PoW and bypassing checkpoints at admission.
+Previously this admitted any header with a known parent, unvalidated."
+  (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
+    (multiple-value-bind (valid-headers error)
+        (validate-header-chain headers chain-state)
+      (when error
+        (bitcoin-lisp:log-warn "Header validation error: ~A" error))
+      (process-headers valid-headers chain-state)
+      ;; Per-peer availability: the peer's advertised tip is the last VALID
+      ;; header. Mirrors Core's UpdateBlockAvailability (net_processing.cpp).
+      (let ((last (car (last valid-headers))))
+        (when last
+          (update-block-availability
+           peer chain-state
+           (bitcoin-lisp.serialization:block-header-hash last)))))))
 
 ;;; Block handling
 
