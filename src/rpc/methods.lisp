@@ -2073,12 +2073,32 @@ with |ANYONECANPAY setting 0x80."
 [len][data]."
   (concatenate '(vector (unsigned-byte 8)) (vector (length data)) data))
 
+(defun %build-spent-utxos (inputs prevmap)
+  "Vector of storage:utxo-entry for every input (the spent outputs, needed for the
+BIP341/taproot sighash which commits to all input amounts + scriptPubKeys), or NIL
+if any input lacks a prevout-with-amount."
+  (let* ((n (length inputs))
+         (vec (make-array n)))
+    (dotimes (i n vec)
+      (let* ((in (aref inputs i))
+             (op (bitcoin-lisp.serialization:tx-in-previous-output in))
+             (prev (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
+                                  (bitcoin-lisp.serialization:outpoint-index op))
+                            prevmap)))
+        (unless (and prev (cdr prev))
+          (return-from %build-spent-utxos nil))
+        (setf (aref vec i)
+              (bitcoin-lisp.storage:make-utxo-entry
+               :value (cdr prev)
+               :script-pubkey (coerce (car prev) '(simple-array (unsigned-byte 8) (*)))))))))
+
 (defun rpc-signrawtransactionwithkey (node params)
   "Sign inputs of a raw transaction with the supplied WIF private keys (Bitcoin
-Core signrawtransactionwithkey). Supports P2PKH and P2WPKH inputs. PARAMS:
-(hexstring privkeys [prevtxs] [sighashtype]). Each prevtxs entry is
+Core signrawtransactionwithkey). Supports P2PKH, P2WPKH, and P2TR key-path inputs.
+PARAMS: (hexstring privkeys [prevtxs] [sighashtype]). Each prevtxs entry is
 {txid, vout, scriptPubKey, amount?} for an output being spent (amount, in BTC, is
-required for P2WPKH). Returns {hex, complete, errors?}."
+required for P2WPKH; P2TR requires amounts on ALL inputs). P2TR signs with
+SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
   (declare (ignore node))
   (let ((hexstring (first params))
         (wifs (second params))
@@ -2096,6 +2116,7 @@ required for P2WPKH). Returns {hex, complete, errors?}."
            (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
            (n (length inputs))
            (keymap (make-hash-table :test 'equalp))   ; hash160(pubkey) -> (privkey . pubkey)
+           (tr-keymap (make-hash-table :test 'equalp)) ; tweaked taproot output key (32B) -> privkey
            (prevmap (make-hash-table :test 'equalp))   ; (txid . vout) -> (scriptPubKey . amount-sats)
            (witness (make-array n :initial-element '()))
            (any-witness nil)
@@ -2106,7 +2127,11 @@ required for P2WPKH). Returns {hex, complete, errors?}."
           (unless sk
             (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid private key"))
           (let ((pub (bitcoin-lisp.crypto:derive-public-key sk :compressed compressed)))
-            (setf (gethash (bitcoin-lisp.crypto:hash160 pub) keymap) (cons sk pub)))))
+            (setf (gethash (bitcoin-lisp.crypto:hash160 pub) keymap) (cons sk pub)))
+          ;; Taproot key-path output key (P + H_TapTweak(P)*G) -> privkey.
+          (let ((qx (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey
+                     (bitcoin-lisp.crypto:derive-xonly-pubkey sk))))
+            (when qx (setf (gethash qx tr-keymap) sk)))))
       ;; Prevout map from prevtxs.
       (dolist (pt (and (listp prevtxs) prevtxs))
         (let ((txid (cdr (assoc "txid" pt :test #'string=)))
@@ -2117,9 +2142,13 @@ required for P2WPKH). Returns {hex, complete, errors?}."
             (setf (gethash (cons (parse-hex-hash txid) vout) prevmap)
                   (cons (bitcoin-lisp.crypto:hex-to-bytes spk-hex)
                         (when (numberp amount) (round (* amount 100000000))))))))
-      ;; Sign each input we can. BIP143 precompute is built once for the whole tx.
-      (let ((bitcoin-lisp.coalton.interop::*current-tx* tx)
-            (precomp (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx)))
+      ;; Sign each input we can. Precompute is built once for the whole tx; pass
+      ;; spent-utxos (all inputs' outputs) so the BIP341 amount/scriptPubKey
+      ;; commitments are available for taproot inputs.
+      (let* ((spent-utxos (%build-spent-utxos inputs prevmap))
+             (bitcoin-lisp.coalton.interop::*current-tx* tx)
+             (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-utxos)
+             (precomp (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx spent-utxos)))
         (dotimes (i n)
           (let* ((in (aref inputs i))
                  (op (bitcoin-lisp.serialization:tx-in-previous-output in))
@@ -2160,6 +2189,22 @@ required for P2WPKH). Returns {hex, complete, errors?}."
                                                    (bitcoin-lisp.crypto:sign-ecdsa (car entry) sighash)
                                                    (vector sighash-byte))))
                             (setf (aref witness i) (list sig (cdr entry)))
+                            (setf any-witness t))))))
+                    ((string= type "witness_v1_taproot")
+                     (let ((sk (gethash (subseq spk 2 34) tr-keymap)))
+                       (cond
+                         ((null sk) (push (format nil "Input ~D: no key for P2TR (key path)" i) errors))
+                         ((null spent-utxos)
+                          (push (format nil "Input ~D: P2TR requires prevtx amounts for all inputs" i) errors))
+                         (t
+                          (let* ((bitcoin-lisp.coalton.interop::*current-input-index* i)
+                                 (bitcoin-lisp.coalton.interop::*precomputed-sighash* precomp)
+                                 ;; SIGHASH_DEFAULT (0x00): 64-byte signature, no appended byte.
+                                 (sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
+                                           amount #x00 nil nil))
+                                 (tsk (bitcoin-lisp.crypto:taproot-tweak-private-key sk))
+                                 (sig (bitcoin-lisp.crypto:sign-schnorr tsk sighash)))
+                            (setf (aref witness i) (list sig))
                             (setf any-witness t))))))
                     (t (push (format nil "Input ~D: unsupported scriptPubKey type ~A" i type)
                              errors)))))))

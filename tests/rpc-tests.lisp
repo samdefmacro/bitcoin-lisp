@@ -1758,3 +1758,51 @@ verifies under the SAME sighash the validator computes (legacy + BIP143)."
              (der (subseq sig 0 (1- (length sig))))
              (sighash (bitcoin-lisp.coalton.interop::compute-legacy-sighash tx2 1 p2pkh 1)))
         (is-true (bitcoin-lisp.crypto:verify-signature sighash der pub))))))
+
+(test rpc-signrawtransactionwithkey-p2tr-keypath
+  "signrawtransactionwithkey signs a P2TR key-path input; complete=t, the witness
+is a single 64-byte Schnorr signature, and it passes the consensus taproot
+key-path verifier (validate-taproot-key-path) for the recomputed BIP341 sighash."
+  (let* ((node (make-test-node))
+         (sk (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 1) k))
+         (wif (bitcoin-lisp.crypto:private-key-to-wif sk :network :mainnet :compressed t))
+         (pxonly (bitcoin-lisp.crypto:derive-xonly-pubkey sk))
+         (qx (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey pxonly))
+         (p2tr (concatenate '(vector (unsigned-byte 8)) (vector #x51 #x20) qx))
+         (txid0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 2
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                 :hash txid0 :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 90000 :script-pubkey p2tr))
+              :lock-time 0))
+         (tx-hex (bitcoin-lisp.crypto:bytes-to-hex
+                  (bitcoin-lisp.serialization:serialize-transaction tx)))
+         (prevtxs (list (list (cons "txid" (bitcoin-lisp.rpc::hash-to-hex txid0))
+                              (cons "vout" 0)
+                              (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex p2tr))
+                              (cons "amount" 0.001d0))))   ; 100000 sats
+         (result (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+                  node (list tx-hex (list wif) prevtxs))))
+    (is (eq t (cdr (assoc "complete" result :test #'string=))))
+    (let* ((tx2 (bitcoin-lisp.serialization:parse-tx-payload
+                 (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
+           (stack (aref (bitcoin-lisp.serialization:transaction-witness tx2) 0))
+           (sig (first stack)))
+      (is (= 1 (length stack)))
+      (is (= 64 (length sig)))
+      ;; The consensus key-path verifier accepts the signature.
+      (let* ((spent (vector (bitcoin-lisp.storage:make-utxo-entry
+                             :value 100000
+                             :script-pubkey (coerce p2tr '(simple-array (unsigned-byte 8) (*))))))
+             (bitcoin-lisp.coalton.interop::*current-tx* tx2)
+             (bitcoin-lisp.coalton.interop::*current-input-index* 0)
+             (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent)
+             (bitcoin-lisp.coalton.interop::*precomputed-sighash*
+              (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx2 spent)))
+        (is-true (bitcoin-lisp.coalton.interop::validate-taproot-key-path stack qx 100000))))))
