@@ -62,6 +62,7 @@
    #:bip32-serialize
    #:bip32-parse
    #:+bip32-hardened+
+   #:taproot-tweak-private-key
    ;; Schnorr / x-only pubkeys (BIP 340)
    #:verify-schnorr-signature
    #:sign-schnorr
