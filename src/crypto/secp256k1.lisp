@@ -24,6 +24,9 @@
 (defconstant +secp256k1-context-sign+ #x0201)
 (defconstant +secp256k1-pubkey-size+ 64)
 (defconstant +secp256k1-signature-size+ 64)
+;; secp256k1_ec_pubkey_serialize flags
+(defconstant +secp256k1-ec-compressed+ #x0102)
+(defconstant +secp256k1-ec-uncompressed+ #x0002)
 
 ;;; Foreign function definitions
 
@@ -51,6 +54,38 @@
   (msghash32 :pointer)
   (pubkey :pointer))
 
+;;; Signing bindings (private key -> public key / signature)
+
+(cffi:defcfun ("secp256k1_ec_seckey_verify" secp256k1-ec-seckey-verify) :int
+  (ctx :pointer)
+  (seckey :pointer))
+
+(cffi:defcfun ("secp256k1_ec_pubkey_create" secp256k1-ec-pubkey-create) :int
+  (ctx :pointer)
+  (pubkey :pointer)
+  (seckey :pointer))
+
+(cffi:defcfun ("secp256k1_ec_pubkey_serialize" secp256k1-ec-pubkey-serialize) :int
+  (ctx :pointer)
+  (output :pointer)
+  (outputlen :pointer)
+  (pubkey :pointer)
+  (flags :uint))
+
+(cffi:defcfun ("secp256k1_ecdsa_sign" secp256k1-ecdsa-sign) :int
+  (ctx :pointer)
+  (sig :pointer)
+  (msghash32 :pointer)
+  (seckey :pointer)
+  (noncefp :pointer)
+  (ndata :pointer))
+
+(cffi:defcfun ("secp256k1_ecdsa_signature_serialize_der" secp256k1-ecdsa-signature-serialize-der) :int
+  (ctx :pointer)
+  (output :pointer)
+  (outputlen :pointer)
+  (sig :pointer))
+
 ;; BIP 340 tagged hash: hash32 = SHA256(SHA256(tag) || SHA256(tag) || msg).
 ;; Internally caches/reuses the SHA256 midstate after feeding the tag prefix
 ;; once, so repeated calls with the same tag avoid the 64-byte tag-prefix
@@ -69,8 +104,12 @@
   "Ensure libsecp256k1 is loaded and context is initialized."
   (unless *secp256k1-context*
     (cffi:load-foreign-library 'libsecp256k1)
+    ;; Both VERIFY and SIGN capabilities — modern libsecp256k1 treats these
+    ;; legacy flags as no-ops (one context does everything), but older builds
+    ;; need SIGN for secp256k1_ecdsa_sign / ec_pubkey_create.
     (setf *secp256k1-context*
-          (secp256k1-context-create +secp256k1-context-verify+)))
+          (secp256k1-context-create
+           (logior +secp256k1-context-verify+ +secp256k1-context-sign+))))
   *secp256k1-context*)
 
 ;; Override hash.lisp's tagged-hash with a libsecp256k1-backed version.
@@ -143,6 +182,67 @@ Returns an internal public key structure, or NIL if invalid."
 (defun public-key-valid-p (pubkey-bytes)
   "Check if PUBKEY-BYTES represents a valid secp256k1 public key."
   (not (null (parse-public-key pubkey-bytes))))
+
+;;; Signing operations (private key -> public key / signature)
+
+(defun valid-private-key-p (privkey)
+  "T if PRIVKEY is a 32-byte vector that is a valid secp256k1 secret key
+(in range [1, n-1])."
+  (ensure-secp256k1-loaded)
+  (and (= (length privkey) 32)
+       (cffi:with-foreign-object (sk :uint8 32)
+         (loop for i below 32 do (setf (cffi:mem-aref sk :uint8 i) (aref privkey i)))
+         (= 1 (secp256k1-ec-seckey-verify *secp256k1-context* sk)))))
+
+(defun derive-public-key (privkey &key (compressed t))
+  "Serialized public key for the 32-byte secret PRIVKEY: 33 bytes compressed
+(default) or 65 uncompressed. Errors if PRIVKEY is not a valid secret key."
+  (ensure-secp256k1-loaded)
+  (unless (= (length privkey) 32)
+    (error "private key must be 32 bytes"))
+  (cffi:with-foreign-objects ((sk :uint8 32)
+                              (pk :uint8 +secp256k1-pubkey-size+)
+                              (out :uint8 65)
+                              (outlen :size))
+    (loop for i below 32 do (setf (cffi:mem-aref sk :uint8 i) (aref privkey i)))
+    (unless (= 1 (secp256k1-ec-pubkey-create *secp256k1-context* pk sk))
+      (error "invalid private key"))
+    (let ((len (if compressed 33 65)))
+      (setf (cffi:mem-ref outlen :size) len)
+      (unless (= 1 (secp256k1-ec-pubkey-serialize
+                    *secp256k1-context* out outlen pk
+                    (if compressed +secp256k1-ec-compressed+ +secp256k1-ec-uncompressed+)))
+        (error "public key serialization failed"))
+      (let* ((n (cffi:mem-ref outlen :size))
+             (result (make-array n :element-type '(unsigned-byte 8))))
+        (loop for i below n do (setf (aref result i) (cffi:mem-aref out :uint8 i)))
+        result))))
+
+(defun sign-ecdsa (privkey hash32)
+  "DER-encoded ECDSA signature of the 32-byte HASH32 under the 32-byte secret
+PRIVKEY, using libsecp256k1's RFC6979 deterministic nonce (low-S, like Core).
+Returns the DER signature bytes. Errors if PRIVKEY is invalid."
+  (ensure-secp256k1-loaded)
+  (unless (= (length hash32) 32) (error "message hash must be 32 bytes"))
+  (unless (= (length privkey) 32) (error "private key must be 32 bytes"))
+  (cffi:with-foreign-objects ((sk :uint8 32)
+                              (msg :uint8 32)
+                              (sig :uint8 +secp256k1-signature-size+)
+                              (der :uint8 72)
+                              (derlen :size))
+    (loop for i below 32 do (setf (cffi:mem-aref sk :uint8 i) (aref privkey i)))
+    (loop for i below 32 do (setf (cffi:mem-aref msg :uint8 i) (aref hash32 i)))
+    (unless (= 1 (secp256k1-ecdsa-sign *secp256k1-context* sig msg sk
+                                       (cffi:null-pointer) (cffi:null-pointer)))
+      (error "ECDSA signing failed (invalid private key?)"))
+    (setf (cffi:mem-ref derlen :size) 72)
+    (unless (= 1 (secp256k1-ecdsa-signature-serialize-der
+                  *secp256k1-context* der derlen sig))
+      (error "DER signature serialization failed"))
+    (let* ((n (cffi:mem-ref derlen :size))
+           (result (make-array n :element-type '(unsigned-byte 8))))
+      (loop for i below n do (setf (aref result i) (cffi:mem-aref der :uint8 i)))
+      result)))
 
 ;;; Lax DER signature parsing
 ;;;
