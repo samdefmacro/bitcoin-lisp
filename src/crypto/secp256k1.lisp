@@ -116,6 +116,11 @@
   (sig :pointer)
   (msghash32 :pointer))
 
+(cffi:defcfun ("secp256k1_ec_pubkey_tweak_add" secp256k1-ec-pubkey-tweak-add) :int
+  (ctx :pointer)
+  (pubkey :pointer)
+  (tweak32 :pointer))
+
 ;; BIP 340 tagged hash: hash32 = SHA256(SHA256(tag) || SHA256(tag) || msg).
 ;; Internally caches/reuses the SHA256 midstate after feeding the tag prefix
 ;; once, so repeated calls with the same tag avoid the 64-byte tag-prefix
@@ -247,6 +252,28 @@ Returns an internal public key structure, or NIL if invalid."
              (result (make-array n :element-type '(unsigned-byte 8))))
         (loop for i below n do (setf (aref result i) (cffi:mem-aref out :uint8 i)))
         result))))
+
+(defun tweak-add-public-key (pubkey-bytes tweak32)
+  "EC point addition: PUBKEY-BYTES + TWEAK32*G, returned as a 33-byte compressed
+public key, or NIL if the result is invalid (point at infinity / tweak out of
+range). Used for BIP32 CKDpub (child pubkey = Kpar + IL*G)."
+  (ensure-secp256k1-loaded)
+  (let ((pk (parse-public-key pubkey-bytes)))
+    (when (and pk (= (length tweak32) 32))
+      (cffi:with-foreign-objects ((pkobj :uint8 +secp256k1-pubkey-size+)
+                                  (tw :uint8 32)
+                                  (out :uint8 65)
+                                  (outlen :size))
+        (loop for i below +secp256k1-pubkey-size+
+              do (setf (cffi:mem-aref pkobj :uint8 i) (aref pk i)))
+        (loop for i below 32 do (setf (cffi:mem-aref tw :uint8 i) (aref tweak32 i)))
+        (when (= 1 (secp256k1-ec-pubkey-tweak-add *secp256k1-context* pkobj tw))
+          (setf (cffi:mem-ref outlen :size) 33)
+          (when (= 1 (secp256k1-ec-pubkey-serialize
+                      *secp256k1-context* out outlen pkobj +secp256k1-ec-compressed+))
+            (let ((result (make-array 33 :element-type '(unsigned-byte 8))))
+              (loop for i below 33 do (setf (aref result i) (cffi:mem-aref out :uint8 i)))
+              result)))))))
 
 (defun sign-ecdsa (privkey hash32)
   "DER-encoded ECDSA signature of the 32-byte HASH32 under the 32-byte secret
