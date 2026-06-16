@@ -157,3 +157,28 @@ witness stack and the first is non-empty (so transaction-has-witness-p holds)."
                  (bitcoin-lisp.serialization:inv-vector-type b)))
           (is (equalp (bitcoin-lisp.serialization:inv-vector-hash a)
                       (bitcoin-lisp.serialization:inv-vector-hash b))))))))
+
+(test make-block-message-witness
+  "make-block-message :witness t wraps the witness-serialized block (the form
+served for a MSG_WITNESS_BLOCK getdata); :witness nil is legacy. For a segwit
+block the witness message is larger, and its payload round-trips to a block whose
+transaction retains witness data."
+  (let* ((state (sb-ext:seed-random-state 717))
+         (wtx (%rt-rand-tx state :witness t))
+         (hdr (bitcoin-lisp.serialization:make-block-header
+               :version 1 :prev-block (%rt-rand-bytes 32 state)
+               :merkle-root (%rt-rand-bytes 32 state)
+               :timestamp 1700000000 :bits #x207fffff :nonce 0))
+         (blk (bitcoin-lisp.serialization:make-bitcoin-block
+               :header hdr :transactions (list wtx)))
+         (wmsg (bitcoin-lisp.serialization:make-block-message blk :witness t))
+         (lmsg (bitcoin-lisp.serialization:make-block-message blk :witness nil)))
+    (is-true (bitcoin-lisp.serialization:transaction-has-witness-p wtx))
+    (is (> (length wmsg) (length lmsg))
+        "witness block message must be larger than the legacy one")
+    ;; Strip the 24-byte message header, parse the payload back to a block.
+    (let* ((payload (subseq wmsg 24))
+           (blk2 (bitcoin-lisp.serialization:parse-block-payload payload))
+           (rtx (first (bitcoin-lisp.serialization:bitcoin-block-transactions blk2))))
+      (is-true (bitcoin-lisp.serialization:transaction-has-witness-p rtx)
+               "witness must survive the make-block-message round-trip"))))
