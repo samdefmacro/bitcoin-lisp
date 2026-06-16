@@ -890,6 +890,61 @@ the RPC worker thread."
         `(("hash" . ,(if hash (hash-to-hex hash) ""))
           ("height" . ,(bitcoin-lisp.storage:current-height chain-state)))))))
 
+(defun %tip-result (chain-state)
+  "The {hash, height} alist Core's waitfor* RPCs return for the current tip."
+  (let ((hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+    `(("hash" . ,(if hash (hash-to-hex hash) ""))
+      ("height" . ,(bitcoin-lisp.storage:current-height chain-state)))))
+
+(defun %wait-deadline (timeout-ms)
+  "Internal-real-time deadline for a TIMEOUT-MS wait, or NIL for wait-forever."
+  (when (plusp timeout-ms)
+    (+ (get-internal-real-time)
+       (floor (* timeout-ms internal-time-units-per-second) 1000))))
+
+(defun rpc-waitforblock (node params)
+  "Wait until the given block hash becomes the chain tip (Bitcoin Core
+waitforblock). PARAMS: (blockhash [timeout-ms]); timeout 0 (default) waits
+indefinitely. Returns the tip on match, timeout, or node shutdown. Polls on the
+RPC worker thread."
+  (let ((hash-hex (first params))
+        (timeout (if (integerp (second params)) (second params) 0)))
+    (unless (stringp hash-hex)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash (hex string) required"))
+    (when (minusp timeout)
+      (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
+    (let ((target (parse-hex-hash hash-hex)))
+      (unless target
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "blockhash must be a 64-character hex string"))
+      (let* ((chain-state (rpc-get-chain-state node))
+             (deadline (%wait-deadline timeout)))
+        (loop while (and (bitcoin-lisp::node-running node)
+                         (not (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                                      target))
+                         (or (null deadline) (< (get-internal-real-time) deadline)))
+              do (sleep 0.25))
+        (%tip-result chain-state)))))
+
+(defun rpc-waitforblockheight (node params)
+  "Wait until the chain tip reaches at least HEIGHT (Bitcoin Core
+waitforblockheight). PARAMS: (height [timeout-ms]); timeout 0 (default) waits
+indefinitely. Returns the tip on reaching the height, timeout, or node shutdown."
+  (let ((height (first params))
+        (timeout (if (integerp (second params)) (second params) 0)))
+    (unless (and (integerp height) (>= height 0))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "height must be a non-negative integer"))
+    (when (minusp timeout)
+      (error 'rpc-error :code +rpc-misc-error+ :message "Negative timeout"))
+    (let* ((chain-state (rpc-get-chain-state node))
+           (deadline (%wait-deadline timeout)))
+      (loop while (and (bitcoin-lisp::node-running node)
+                       (< (bitcoin-lisp.storage:current-height chain-state) height)
+                       (or (null deadline) (< (get-internal-real-time) deadline)))
+            do (sleep 0.25))
+      (%tip-result chain-state))))
+
 (defun rpc-dumptxoutset (node params)
   "Write the full UTXO set to a snapshot file (Bitcoin Core dumptxoutset's
 shape; the file uses our own versioned encoding, NOT Core's assumeutxo format —

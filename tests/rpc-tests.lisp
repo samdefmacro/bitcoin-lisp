@@ -1562,3 +1562,37 @@ active_commands + logpath."
   (let ((ri (bitcoin-lisp.rpc::rpc-getrpcinfo nil nil)))
     (is (assoc "active_commands" ri :test #'string=))
     (is (assoc "logpath" ri :test #'string=))))
+
+(test rpc-waitforblock-and-height
+  "waitforblock returns immediately when the tip already matches the requested
+hash; waitforblockheight returns immediately when the tip is already at/above the
+target. Both return {hash,height}; an unreached height with a short timeout
+returns the current tip; bad inputs error."
+  (let* ((node (make-test-node))
+         (cs (bitcoin-lisp.rpc::rpc-get-chain-state node))
+         (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    ;; make-test-node's chain-state has no tip; plant one at height 5.
+    (bitcoin-lisp.storage:add-block-index-entry
+     cs (bitcoin-lisp.storage:make-block-index-entry
+         :hash tip-hash :height 5 :chain-work 100 :status :valid
+         :header (bitcoin-lisp.serialization:make-block-header
+                  :version 1 :prev-block zeros :merkle-root zeros
+                  :timestamp 1296688600 :bits #x207fffff :nonce 0 :cached-hash tip-hash)))
+    (bitcoin-lisp.storage:update-chain-tip cs tip-hash 5)
+    (let ((tip-hex (bitcoin-lisp.rpc::hash-to-hex tip-hash)))
+      ;; waitforblock with the current tip hash -> immediate match.
+      (let ((r (bitcoin-lisp.rpc::rpc-waitforblock node (list tip-hex))))
+        (is (string= tip-hex (cdr (assoc "hash" r :test #'string=))))
+        (is (= 5 (cdr (assoc "height" r :test #'string=)))))
+      ;; waitforblockheight at/below the tip -> immediate.
+      (let ((r (bitcoin-lisp.rpc::rpc-waitforblockheight node (list 5))))
+        (is (= 5 (cdr (assoc "height" r :test #'string=)))))
+      ;; unreached height + short timeout -> returns the current (lower) tip.
+      (let ((r (bitcoin-lisp.rpc::rpc-waitforblockheight node (list 1005 50))))
+        (is (= 5 (cdr (assoc "height" r :test #'string=)))))
+      ;; bad inputs error.
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-waitforblock node (list "not-a-valid-hash")))
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-waitforblockheight node (list -1))))))
