@@ -330,6 +330,16 @@ serializes header-only CBlocks, which append nTx=0)."
   (let ((payload (serialize-transaction tx)))
     (serialize-message "tx" payload)))
 
+(defun make-block-message (block &key witness)
+  "Create a serialized block message from BLOCK. With :WITNESS, the transactions
+are BIP144 witness-serialized (answering a MSG_WITNESS_BLOCK getdata); otherwise
+legacy (MSG_BLOCK). Witness serving requires the block to actually carry its
+witness data — see store-block, which persists blocks witness-complete."
+  (serialize-message "block"
+                     (if witness
+                         (serialize-witness-block block)
+                         (serialize block))))
+
 (defun parse-tx-payload (payload)
   "Parse a tx message payload into a transaction."
   (flexi-streams:with-input-from-sequence (stream payload)

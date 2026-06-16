@@ -2,6 +2,47 @@
 
 (in-suite :storage-tests)
 
+;;;; Block store
+
+(test store-block-preserves-witness
+  "store-block must persist witness data (BIP144) so blocks read back from disk
+are witness-complete — needed to serve MSG_WITNESS_BLOCK to peers (the
+serve-blocks fix) and to re-validate witness on reorg. Before the fix store-block
+used the legacy serializer, which dropped witness."
+  (let* ((dir (merge-pathnames "test-store-witness/" (uiop:temporary-directory)))
+         (store (bitcoin-lisp.storage:init-block-store dir))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (wtx (bitcoin-lisp.serialization:make-transaction
+               :version 2
+               :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                  :hash prev :index 0)
+                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                :sequence #xffffffff))
+               :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                 :value 1000
+                                 :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
+                                                            :initial-element #x51)))
+               :witness (vector (list (make-array 3 :element-type '(unsigned-byte 8)
+                                                  :initial-contents '(1 2 3))))
+               :lock-time 0))
+         (hdr (bitcoin-lisp.serialization:make-block-header
+               :version 1 :prev-block zeros :merkle-root zeros
+               :timestamp 1700000000 :bits #x207fffff :nonce 0))
+         (blk (bitcoin-lisp.serialization:make-bitcoin-block
+               :header hdr :transactions (list wtx))))
+    (is-true (bitcoin-lisp.serialization:transaction-has-witness-p wtx))
+    (let* ((hash (bitcoin-lisp.storage:store-block store blk))
+           (retrieved (bitcoin-lisp.storage:get-block store hash))
+           (rtx (first (bitcoin-lisp.serialization:bitcoin-block-transactions retrieved))))
+      (is-true (bitcoin-lisp.serialization:transaction-has-witness-p rtx)
+               "retrieved block tx must retain witness data")
+      (is (equalp (bitcoin-lisp.serialization:serialize-witness-transaction wtx)
+                  (bitcoin-lisp.serialization:serialize-witness-transaction rtx))
+          "round-tripped witness tx must be byte-identical"))
+    (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))
+
 ;;;; UTXO Set Tests
 
 (test utxo-set-add-and-get
