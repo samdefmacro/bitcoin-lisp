@@ -255,6 +255,7 @@
    #:make-sendcmpct-message
    #:parse-cmpctblock-payload
    #:make-getblocktxn-message
+   #:make-blocktxn-message
    #:parse-getblocktxn-payload
    #:parse-blocktxn-payload
    #:read-compact-block
