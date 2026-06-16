@@ -1806,3 +1806,118 @@ key-path verifier (validate-taproot-key-path) for the recomputed BIP341 sighash.
              (bitcoin-lisp.coalton.interop::*precomputed-sighash*
               (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx2 spent)))
         (is-true (bitcoin-lisp.coalton.interop::validate-taproot-key-path stack qx 100000))))))
+
+(defun %verify-tx-input (tx index spent-vec flags)
+  "Run the full consensus interpreter (verify-script) on input INDEX of TX, with
+SPENT-VEC supplying amounts/scriptPubKeys. Returns verify-script's result."
+  (let* ((utxo (aref spent-vec index))
+         (amount (bitcoin-lisp.storage:utxo-entry-value utxo))
+         (spk (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
+         (input (elt (bitcoin-lisp.serialization:transaction-inputs tx) index))
+         (sig-bytes (bitcoin-lisp.serialization:tx-in-script-sig input))
+         (wit (bitcoin-lisp.serialization:transaction-witness tx))
+         (witness-stack (when (and wit (< index (length wit))) (elt wit index)))
+         (bitcoin-lisp.coalton.interop:*current-tx* tx)
+         (bitcoin-lisp.coalton.interop:*current-input-index* index)
+         (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-vec)
+         (bitcoin-lisp.coalton.interop::*precomputed-sighash* nil)
+         (bitcoin-lisp.coalton.interop:*witness-input-amount* amount))
+    (bitcoin-lisp.coalton.interop:set-script-flags flags)
+    (unwind-protect
+         (bitcoin-lisp.coalton.interop:verify-script
+          sig-bytes spk :witness witness-stack :amount amount)
+      (bitcoin-lisp.coalton.interop:set-script-flags nil))))
+
+(defun %multisig-script (m pubs)
+  "OP_m <pub>... OP_n OP_CHECKMULTISIG for the list of compressed PUBS."
+  (apply #'concatenate '(vector (unsigned-byte 8))
+         (vector (+ #x50 m))
+         (append (mapcar (lambda (p) (concatenate '(vector (unsigned-byte 8))
+                                                  (vector (length p)) p))
+                         pubs)
+                 (list (vector (+ #x50 (length pubs)) #xae)))))
+
+(test rpc-signrawtransactionwithkey-p2sh-and-multisig
+  "signrawtransactionwithkey signs a tx mixing P2SH-P2WPKH, P2SH-multisig (legacy),
+P2WSH-multisig, P2SH-P2WSH-multisig, and bare multisig inputs; complete=t and EVERY
+input passes the full consensus interpreter (verify-script, P2SH+WITNESS+NULLDUMMY+
+DERSIG+LOW_S)."
+  (let* ((node (make-test-node))
+         (ka (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 1) k))
+         (kb (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+               (setf (aref k 31) 2) k))
+         (wa (bitcoin-lisp.crypto:private-key-to-wif ka :network :mainnet :compressed t))
+         (wb (bitcoin-lisp.crypto:private-key-to-wif kb :network :mainnet :compressed t))
+         (pa (bitcoin-lisp.crypto:derive-public-key ka))
+         (pb (bitcoin-lisp.crypto:derive-public-key kb))
+         (pkha (bitcoin-lisp.crypto:hash160 pa))
+         (ms22 (%multisig-script 2 (list pa pb)))    ; 2-of-2 A,B
+         (ms11 (%multisig-script 1 (list pa)))       ; 1-of-1 A
+         ;; redeem/witness + scriptPubKeys
+         (rd-p2wpkh (concatenate '(vector (unsigned-byte 8)) (vector #x00 #x14) pkha))
+         (rd-p2wsh (concatenate '(vector (unsigned-byte 8))
+                                (vector #x00 #x20) (bitcoin-lisp.crypto:sha256 ms22)))
+         (spk-sh-wpkh (concatenate '(vector (unsigned-byte 8))
+                                   (vector #xa9 #x14) (bitcoin-lisp.crypto:hash160 rd-p2wpkh) (vector #x87)))
+         (spk-sh-ms (concatenate '(vector (unsigned-byte 8))
+                                 (vector #xa9 #x14) (bitcoin-lisp.crypto:hash160 ms22) (vector #x87)))
+         (spk-wsh (concatenate '(vector (unsigned-byte 8))
+                               (vector #x00 #x20) (bitcoin-lisp.crypto:sha256 ms22)))
+         (spk-sh-wsh (concatenate '(vector (unsigned-byte 8))
+                                  (vector #xa9 #x14) (bitcoin-lisp.crypto:hash160 rd-p2wsh) (vector #x87)))
+         (spks (vector spk-sh-wpkh spk-sh-ms spk-wsh spk-sh-wsh ms11))
+         (inputs (loop for j below 5
+                       collect (bitcoin-lisp.serialization:make-tx-in
+                                :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                  :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                       :initial-element (+ 20 j))
+                                                  :index 0)
+                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                :sequence #xffffffff)))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 2 :inputs (coerce inputs 'vector)
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 400000 :script-pubkey spk-sh-wpkh))
+              :lock-time 0))
+         (tx-hex (bitcoin-lisp.crypto:bytes-to-hex
+                  (bitcoin-lisp.serialization:serialize-transaction tx)))
+         (h2 (lambda (j) (bitcoin-lisp.rpc::hash-to-hex
+                          (make-array 32 :element-type '(unsigned-byte 8) :initial-element (+ 20 j)))))
+         (prevtxs (list
+                   ;; 0 P2SH-P2WPKH
+                   (list (cons "txid" (funcall h2 0)) (cons "vout" 0)
+                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex spk-sh-wpkh))
+                         (cons "amount" 0.001d0)
+                         (cons "redeemScript" (bitcoin-lisp.crypto:bytes-to-hex rd-p2wpkh)))
+                   ;; 1 P2SH-multisig (legacy)
+                   (list (cons "txid" (funcall h2 1)) (cons "vout" 0)
+                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex spk-sh-ms))
+                         (cons "redeemScript" (bitcoin-lisp.crypto:bytes-to-hex ms22)))
+                   ;; 2 P2WSH-multisig
+                   (list (cons "txid" (funcall h2 2)) (cons "vout" 0)
+                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex spk-wsh))
+                         (cons "amount" 0.001d0)
+                         (cons "witnessScript" (bitcoin-lisp.crypto:bytes-to-hex ms22)))
+                   ;; 3 P2SH-P2WSH-multisig
+                   (list (cons "txid" (funcall h2 3)) (cons "vout" 0)
+                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex spk-sh-wsh))
+                         (cons "amount" 0.001d0)
+                         (cons "redeemScript" (bitcoin-lisp.crypto:bytes-to-hex rd-p2wsh))
+                         (cons "witnessScript" (bitcoin-lisp.crypto:bytes-to-hex ms22)))
+                   ;; 4 bare multisig 1-of-1
+                   (list (cons "txid" (funcall h2 4)) (cons "vout" 0)
+                         (cons "scriptPubKey" (bitcoin-lisp.crypto:bytes-to-hex ms11)))))
+         (result (bitcoin-lisp.rpc::rpc-signrawtransactionwithkey
+                  node (list tx-hex (list wa wb) prevtxs))))
+    (is (eq t (cdr (assoc "complete" result :test #'string=))))
+    (let* ((tx2 (bitcoin-lisp.serialization:parse-tx-payload
+                 (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" result :test #'string=)))))
+           (spent (make-array 5)))
+      (dotimes (j 5)
+        (setf (aref spent j)
+              (bitcoin-lisp.storage:make-utxo-entry
+               :value 100000
+               :script-pubkey (coerce (aref spks j) '(simple-array (unsigned-byte 8) (*))))))
+      (dotimes (j 5)
+        (is-true (%verify-tx-input tx2 j spent "P2SH,WITNESS,NULLDUMMY,DERSIG,LOW_S"))))))
