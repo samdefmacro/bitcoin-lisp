@@ -121,6 +121,8 @@
   (register-rpc-method "estimatesmartfee" #'rpc-estimatesmartfee)
   (register-rpc-method "validateaddress" #'rpc-validateaddress)
   (register-rpc-method "decodescript" #'rpc-decodescript)
+  (register-rpc-method "signmessagewithprivkey" #'rpc-signmessagewithprivkey)
+  (register-rpc-method "verifymessage" #'rpc-verifymessage)
   ;; UTXO set statistics
   (register-rpc-method "gettxoutsetinfo" #'rpc-gettxoutsetinfo)
   ;; Block statistics

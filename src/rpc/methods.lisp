@@ -1980,6 +1980,80 @@ Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
         (error 'rpc-error :code +rpc-deserialization-error+
                           :message (format nil "Script decode failed: ~A" e))))))
 
+;;; --- Message signing (non-wallet): signmessagewithprivkey / verifymessage ---
+
+(defun %bitcoin-message-hash (message)
+  "Double-SHA256 of the Bitcoin Signed Message preimage:
+compact-size(24) || \"Bitcoin Signed Message:\\n\" || compact-size(len) || message."
+  ;; Magic = "Bitcoin Signed Message:" (23 ASCII bytes) followed by a single
+  ;; newline (0x0A) — 24 bytes total, so its compact-size prefix is 0x18.
+  (let* ((magic (concatenate '(vector (unsigned-byte 8))
+                             (flexi-streams:string-to-octets "Bitcoin Signed Message:"
+                                                             :external-format :ascii)
+                             (vector 10)))
+         (msg (flexi-streams:string-to-octets message :external-format :utf-8))
+         (buf (flexi-streams:with-output-to-sequence (s)
+                (bitcoin-lisp.serialization:write-compact-size s (length magic))
+                (write-sequence magic s)
+                (bitcoin-lisp.serialization:write-compact-size s (length msg))
+                (write-sequence msg s))))
+    (bitcoin-lisp.crypto:hash256 buf)))
+
+(defun rpc-signmessagewithprivkey (node params)
+  "Sign MESSAGE with the WIF private key (Bitcoin Core signmessagewithprivkey).
+PARAMS: (privkey-wif message). Returns the base64 recoverable signature."
+  (declare (ignore node))
+  (let ((wif (first params))
+        (message (second params)))
+    (unless (and (stringp wif) (stringp message))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "privkey (WIF) and message are required"))
+    (multiple-value-bind (privkey compressed) (bitcoin-lisp.crypto:wif-to-private-key wif)
+      (unless privkey
+        (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid private key"))
+      (let ((hash (%bitcoin-message-hash message)))
+        (multiple-value-bind (compact recid)
+            (bitcoin-lisp.crypto:sign-recoverable-compact privkey hash)
+          (let ((sig65 (concatenate '(vector (unsigned-byte 8))
+                                    (vector (+ 27 recid (if compressed 4 0)))
+                                    compact)))
+            (cl-base64:usb8-array-to-base64-string sig65)))))))
+
+(defun rpc-verifymessage (node params)
+  "Verify a Bitcoin signed message (Bitcoin Core verifymessage). PARAMS:
+(address signature-base64 message). Recovers the signing pubkey and checks its
+P2PKH key-id matches ADDRESS. Returns T/NIL; a malformed signature returns NIL."
+  (declare (ignore node))
+  (let ((address (first params))
+        (sig-b64 (second params))
+        (message (third params)))
+    (unless (and (stringp address) (stringp sig-b64) (stringp message))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "address, signature and message are required"))
+    (handler-case
+        (let ((sig65 (cl-base64:base64-string-to-usb8-array sig-b64)))
+          (unless (= (length sig65) 65)
+            (return-from rpc-verifymessage nil))
+          (let ((header (aref sig65 0)))
+            (when (or (< header 27) (> header 34))
+              (return-from rpc-verifymessage nil))
+            (let* ((recid (logand (- header 27) 3))
+                   (compressed (>= (- header 27) 4))
+                   (compact (subseq sig65 1 65))
+                   (hash (%bitcoin-message-hash message))
+                   (pubkey (bitcoin-lisp.crypto:recover-public-key
+                            compact recid hash :compressed compressed)))
+              (when pubkey
+                ;; Compare the recovered key's P2PKH key-id (hash160) to the
+                ;; address's key-id — network-agnostic, like Core.
+                (multiple-value-bind (ver payload)
+                    (bitcoin-lisp.crypto:base58check-decode address)
+                  (declare (ignore ver))
+                  (and payload (= (length payload) 20)
+                       (equalp payload (bitcoin-lisp.crypto:hash160 pubkey))
+                       t))))))
+      (error () nil))))
+
 (defun rpc-createrawtransaction (node params)
   "Create an unsigned raw transaction."
   (let ((inputs (first params))

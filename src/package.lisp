@@ -37,6 +37,8 @@
    #:valid-private-key-p
    #:derive-public-key
    #:sign-ecdsa
+   #:sign-recoverable-compact
+   #:recover-public-key
    #:private-key-to-wif
    #:wif-to-private-key
    ;; Schnorr / x-only pubkeys (BIP 340)
