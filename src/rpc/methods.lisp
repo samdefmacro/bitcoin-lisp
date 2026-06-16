@@ -361,26 +361,62 @@ is supplied and the script is addressable) address."
     (mapcar (lambda (peer)
               ;; peer-version holds the received version *message* struct, not a
               ;; number — pull the numeric protocol version out of it.
-              (let ((vmsg (bitcoin-lisp::peer-version peer)))
+              (let* ((vmsg (bitcoin-lisp::peer-version peer))
+                     (conn (bitcoin-lisp.networking::peer-connection peer))
+                     (ping (bitcoin-lisp.networking::peer-ping-latency peer))
+                     (sh (or (bitcoin-lisp::peer-start-height peer) -1)))
                 `(("addr" . ,(bitcoin-lisp::peer-address peer))
                   ("version" . ,(if vmsg
                                     (bitcoin-lisp.serialization:version-message-version vmsg)
                                     0))
                   ("subver" . ,(or (bitcoin-lisp::peer-user-agent peer) ""))
                   ("services" . ,(bitcoin-lisp::peer-services peer))
-                  ("inbound" . nil)
-                  ("startingheight" . ,(or (bitcoin-lisp::peer-start-height peer) 0)))))
+                  ;; Real inbound/outbound flag (was hardcoded nil).
+                  ("inbound" . ,(bitcoin-lisp.networking::peer-inbound peer))
+                  ("startingheight" . ,sh)
+                  ;; Peer's advertised height as our best proxy for synced_*.
+                  ("synced_headers" . ,sh)
+                  ("synced_blocks" . ,sh)
+                  ("bytessent" . ,(if conn (bitcoin-lisp.networking::connection-bytes-sent conn) 0))
+                  ("bytesrecv" . ,(if conn (bitcoin-lisp.networking::connection-bytes-received conn) 0))
+                  ;; ping-latency is in internal-time units; report seconds (0 = unknown).
+                  ("pingtime" . ,(if (and ping (plusp ping))
+                                     (/ ping internal-time-units-per-second 1.0d0)
+                                     0)))))
             peers)))
 
 (defun rpc-getnetworkinfo (node params)
-  "Return network state information."
+  "Return network state information (Bitcoin Core getnetworkinfo)."
   (declare (ignore params))
-  (let ((network (rpc-get-network node))
-        (peers (rpc-get-peers node)))
+  (let* ((network (rpc-get-network node))
+         (peers (rpc-get-peers node))
+         (pruned (bitcoin-lisp:pruning-enabled-p))
+         ;; Service flags we advertise in our version message (peer.lisp):
+         ;; NODE_NETWORK[_LIMITED] | NODE_WITNESS.
+         (services (logior (if pruned
+                               bitcoin-lisp.serialization:+node-network-limited+
+                               bitcoin-lisp.serialization:+node-network+)
+                           bitcoin-lisp.serialization:+node-witness+))
+         (service-names (list (if pruned "NETWORK_LIMITED" "NETWORK") "WITNESS"))
+         (in (count-if #'bitcoin-lisp.networking::peer-inbound peers))
+         ;; sat/vB -> BTC/kvB (same conversion as getmempoolinfo).
+         (relayfee (/ (* bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 1000)
+                      100000000.0d0))
+         ;; +incremental-relay-fee-rate+ is sat/kvB -> BTC/kvB.
+         (incfee (/ bitcoin-lisp.mempool::+incremental-relay-fee-rate+ 100000000.0d0)))
     `(("version" . 10000)
       ("subversion" . "/bitcoin-lisp:0.1.0/")
       ("protocolversion" . 70016)
+      ("localservices" . ,(string-downcase (format nil "~16,'0X" services)))
+      ("localservicesnames" . ,service-names)
+      ;; relay-enabled-p returns a truthy list (member result), not a boolean —
+      ;; coerce so it serializes as JSON true/false.
+      ("localrelay" . ,(and (bitcoin-lisp.networking:relay-enabled-p) t))
+      ("timeoffset" . 0)
+      ("networkactive" . t)
       ("connections" . ,(length peers))
+      ("connections_in" . ,in)
+      ("connections_out" . ,(- (length peers) in))
       ("networks" . ((("name" . ,(case network
                                    (:testnet3 "testnet")
                                    (:testnet4 "testnet4")
@@ -389,7 +425,10 @@ is supplied and the script is addressable) address."
                                    (:mainnet "mainnet")
                                    (t "unknown")))
                       ("reachable" . t))))
-      ("networkactive" . t))))
+      ("relayfee" . ,relayfee)
+      ("incrementalfee" . ,incfee)
+      ("localaddresses" . ())
+      ("warnings" . ""))))
 
 (defun rpc-getconnectioncount (node params)
   "Return the number of connected peers."
