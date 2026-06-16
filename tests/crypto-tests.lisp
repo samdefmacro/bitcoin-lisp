@@ -266,3 +266,44 @@ public key (and rejects under a different key); RFC6979 makes it deterministic."
       (is (null comp))
       (is (eq :testnet net)))
     (is (null (bitcoin-lisp.crypto:wif-to-private-key "not-a-wif")))))
+
+(test bip32-test-vector-1
+  "BIP32 test vector 1 (seed 000102...0f): master + m/0' + m/0'/1 xprv/xpub all
+match the canonical strings; CKDpub (derive the normal child m/0'/1 from the
+neutered m/0' xpub) matches the private path; derive-path and parse round-trip."
+  (let* ((seed (bitcoin-lisp.crypto:hex-to-bytes "000102030405060708090a0b0c0d0e0f"))
+         (m (bitcoin-lisp.crypto:bip32-master-key seed :network :mainnet))
+         (m0h (bitcoin-lisp.crypto:bip32-derive-child
+               m (+ 0 bitcoin-lisp.crypto:+bip32-hardened+)))
+         (m0h1 (bitcoin-lisp.crypto:bip32-derive-child m0h 1)))
+    ;; master
+    (is (string= "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi"
+                 (bitcoin-lisp.crypto:bip32-serialize m)))
+    (is (string= "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8"
+                 (bitcoin-lisp.crypto:bip32-serialize (bitcoin-lisp.crypto:bip32-neuter m))))
+    ;; m/0' (hardened CKDpriv)
+    (is (string= "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7"
+                 (bitcoin-lisp.crypto:bip32-serialize m0h)))
+    (is (string= "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw"
+                 (bitcoin-lisp.crypto:bip32-serialize (bitcoin-lisp.crypto:bip32-neuter m0h))))
+    ;; m/0'/1 (normal CKDpriv)
+    (is (string= "xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs"
+                 (bitcoin-lisp.crypto:bip32-serialize m0h1)))
+    (is (string= "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ"
+                 (bitcoin-lisp.crypto:bip32-serialize (bitcoin-lisp.crypto:bip32-neuter m0h1))))
+    ;; CKDpub: deriving the same normal child from the neutered parent xpub
+    ;; (no private key) yields the identical xpub.
+    (is (string= "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ"
+                 (bitcoin-lisp.crypto:bip32-serialize
+                  (bitcoin-lisp.crypto:bip32-derive-child
+                   (bitcoin-lisp.crypto:bip32-neuter m0h) 1))))
+    ;; derive-path string form equals the step-by-step private derivation
+    (is (string= (bitcoin-lisp.crypto:bip32-serialize m0h1)
+                 (bitcoin-lisp.crypto:bip32-serialize
+                  (bitcoin-lisp.crypto:bip32-derive-path m "m/0'/1"))))
+    ;; parse round-trips
+    (let ((parsed (bitcoin-lisp.crypto:bip32-parse (bitcoin-lisp.crypto:bip32-serialize m0h))))
+      (is (bitcoin-lisp.crypto:ext-key-privatep parsed))
+      (is (string= (bitcoin-lisp.crypto:bip32-serialize m0h)
+                   (bitcoin-lisp.crypto:bip32-serialize parsed))))
+    (is (null (bitcoin-lisp.crypto:bip32-parse "not-an-xkey")))))

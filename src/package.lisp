@@ -41,6 +41,27 @@
    #:recover-public-key
    #:private-key-to-wif
    #:wif-to-private-key
+   #:tweak-add-public-key
+   ;; BIP32 hierarchical deterministic keys
+   #:hmac-sha512
+   #:ext-key
+   #:make-ext-key
+   #:ext-key-p
+   #:ext-key-version
+   #:ext-key-depth
+   #:ext-key-parent-fingerprint
+   #:ext-key-child-number
+   #:ext-key-chain-code
+   #:ext-key-key
+   #:ext-key-privatep
+   #:ext-key-public-bytes
+   #:bip32-master-key
+   #:bip32-derive-child
+   #:bip32-derive-path
+   #:bip32-neuter
+   #:bip32-serialize
+   #:bip32-parse
+   #:+bip32-hardened+
    ;; Schnorr / x-only pubkeys (BIP 340)
    #:verify-schnorr-signature
    #:parse-xonly-pubkey
