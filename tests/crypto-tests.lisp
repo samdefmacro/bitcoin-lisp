@@ -218,3 +218,51 @@
         (txid2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xff)))
     (is (not (= (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid1)
                 (bitcoin-lisp.crypto:compute-short-txid k0 k1 txid2))))))
+
+;;;; Signing primitives + WIF (signing foundation)
+
+(defun %secret-key (last-byte)
+  "32-byte secret key with the given low byte (the rest zero)."
+  (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref k 31) last-byte)
+    k))
+
+(test ecdsa-derive-public-key
+  "derive-public-key yields the generator point G (compressed + uncompressed) for
+secret key 1; valid-private-key-p accepts it and rejects the all-zero key."
+  (let ((k1 (%secret-key 1)))
+    (is-true (bitcoin-lisp.crypto:valid-private-key-p k1))
+    (is (null (bitcoin-lisp.crypto:valid-private-key-p
+               (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))))
+    ;; G compressed is well-known.
+    (is (string-equal
+         "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+         (bitcoin-lisp.crypto:bytes-to-hex (bitcoin-lisp.crypto:derive-public-key k1))))
+    (is (= 65 (length (bitcoin-lisp.crypto:derive-public-key k1 :compressed nil))))))
+
+(test ecdsa-sign-verify-roundtrip
+  "sign-ecdsa produces a DER signature verify-signature accepts under the derived
+public key (and rejects under a different key); RFC6979 makes it deterministic."
+  (let ((k1 (%secret-key 1))
+        (k2 (%secret-key 2))
+        (h  (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x42)))
+    (let ((sig (bitcoin-lisp.crypto:sign-ecdsa k1 h)))
+      (is-true (bitcoin-lisp.crypto:verify-signature
+                h sig (bitcoin-lisp.crypto:derive-public-key k1)))
+      (is (null (bitcoin-lisp.crypto:verify-signature
+                 h sig (bitcoin-lisp.crypto:derive-public-key k2))))
+      (is (equalp sig (bitcoin-lisp.crypto:sign-ecdsa k1 h))))))
+
+(test wif-roundtrip
+  "WIF encode/decode round-trips and matches the canonical WIF for secret key 1
+(compressed, mainnet)."
+  (let ((k1 (%secret-key 1)))
+    (is (string= "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn"
+                 (bitcoin-lisp.crypto:private-key-to-wif k1 :network :mainnet :compressed t)))
+    (multiple-value-bind (sk comp net)
+        (bitcoin-lisp.crypto:wif-to-private-key
+         (bitcoin-lisp.crypto:private-key-to-wif k1 :network :testnet :compressed nil))
+      (is (equalp k1 sk))
+      (is (null comp))
+      (is (eq :testnet net)))
+    (is (null (bitcoin-lisp.crypto:wif-to-private-key "not-a-wif")))))
