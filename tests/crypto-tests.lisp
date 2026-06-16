@@ -307,3 +307,36 @@ neutered m/0' xpub) matches the private path; derive-path and parse round-trip."
       (is (string= (bitcoin-lisp.crypto:bip32-serialize m0h)
                    (bitcoin-lisp.crypto:bip32-serialize parsed))))
     (is (null (bitcoin-lisp.crypto:bip32-parse "not-an-xkey")))))
+
+(test schnorr-sign-bip340-vector-0
+  "BIP340 test vector 0: secret key 3, message 0, aux 0 -> the canonical x-only
+pubkey and the exact known-answer 64-byte signature, which verifies."
+  (let* ((sk (bitcoin-lisp.crypto:hex-to-bytes
+              "0000000000000000000000000000000000000000000000000000000000000003"))
+         (msg (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (aux (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (pub (bitcoin-lisp.crypto:derive-xonly-pubkey sk))
+         (sig (bitcoin-lisp.crypto:sign-schnorr sk msg aux)))
+    (is (equalp (bitcoin-lisp.crypto:hex-to-bytes
+                 "F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9")
+                pub))
+    (is (equalp (bitcoin-lisp.crypto:hex-to-bytes
+                 "E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0")
+                sig))
+    (is-true (bitcoin-lisp.crypto:verify-schnorr-signature msg sig pub))))
+
+(test schnorr-sign-verify-roundtrip
+  "sign-schnorr produces a signature that verifies under the derived x-only key
+for an arbitrary key/message (default zero aux), and signing is deterministic."
+  (let* ((sk (%secret-key 7))
+         (msg (bitcoin-lisp.crypto:sha256
+               (flexi-streams:string-to-octets "bitcoin-lisp schnorr roundtrip")))
+         (pub (bitcoin-lisp.crypto:derive-xonly-pubkey sk))
+         (sig1 (bitcoin-lisp.crypto:sign-schnorr sk msg))
+         (sig2 (bitcoin-lisp.crypto:sign-schnorr sk msg)))
+    (is (= 64 (length sig1)))
+    (is (equalp sig1 sig2))                       ; deterministic (zero aux)
+    (is-true (bitcoin-lisp.crypto:verify-schnorr-signature msg sig1 pub))
+    ;; a different message must not verify against this signature
+    (is (null (bitcoin-lisp.crypto:verify-schnorr-signature
+               (%secret-key 9) sig1 pub)))))

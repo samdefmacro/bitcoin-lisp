@@ -64,6 +64,8 @@
    #:+bip32-hardened+
    ;; Schnorr / x-only pubkeys (BIP 340)
    #:verify-schnorr-signature
+   #:sign-schnorr
+   #:derive-xonly-pubkey
    #:parse-xonly-pubkey
    #:xonly-pubkey-valid-p
    #:tweak-xonly-pubkey
