@@ -46,48 +46,55 @@
 ;;;; Protocol Negotiation Tests
 
 (test sendcmpct-updates-peer-version
-  "handle-sendcmpct should update peer's compact block version."
+  "handle-sendcmpct accepts ONLY compact-block version 2 (witness), matching
+Bitcoin Core's CMPCTBLOCKS_VERSION gate. A v1 (non-witness) sendcmpct is ignored:
+a v1 compact block delivers a witness-stripped prefilled coinbase, so the
+reconstructed block fails BIP141 validation (bad-witness-nonce-size). Accepting v1
+is what wedged the testnet4 node ~1800 blocks behind the chain."
   (let ((peer (make-mock-peer)))
     ;; Initially no compact block support
     (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 0))
-    ;; Receive sendcmpct v1
+    ;; v1 is ignored — peer stays unsupported (we fall back to full witness blocks)
     (let ((payload (subseq (bitcoin-lisp.serialization:make-sendcmpct-message nil 1) 24)))
       (bitcoin-lisp.networking::handle-sendcmpct peer payload))
-    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 1))
-    ;; Receive sendcmpct v2 (should upgrade)
+    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 0))
+    ;; v2 is accepted
     (let ((payload (subseq (bitcoin-lisp.serialization:make-sendcmpct-message nil 2) 24)))
       (bitcoin-lisp.networking::handle-sendcmpct peer payload))
     (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 2))))
 
 (test sendcmpct-rejects-invalid-version
-  "handle-sendcmpct should ignore invalid versions."
+  "handle-sendcmpct ignores every version other than 2 — v1 and future/unknown
+versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
   (let ((peer (make-mock-peer)))
-    ;; Set to v1
-    (setf (bitcoin-lisp.networking:peer-compact-block-version peer) 1)
-    ;; Try to set v3 (invalid - max is 2)
+    ;; v3 (unknown/future) ignored
     (let ((payload (flexi-streams:with-output-to-sequence (s)
                      (write-byte 0 s)  ; low-bandwidth
                      (bitcoin-lisp.serialization:write-uint64-le s 3))))  ; version 3
       (bitcoin-lisp.networking::handle-sendcmpct peer payload))
-    ;; Should remain at v1
-    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 1))))
+    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 0))
+    ;; v1 ignored too
+    (let ((payload (subseq (bitcoin-lisp.serialization:make-sendcmpct-message nil 1) 24)))
+      (bitcoin-lisp.networking::handle-sendcmpct peer payload))
+    (is (= (bitcoin-lisp.networking:peer-compact-block-version peer) 0))))
 
 (test sendcmpct-tracks-high-bandwidth
-  "handle-sendcmpct should track high-bandwidth mode preference."
+  "handle-sendcmpct tracks the high-bandwidth preference from a (v2) sendcmpct."
   (let ((peer (make-mock-peer)))
     (is (null (bitcoin-lisp.networking:peer-compact-block-high-bandwidth peer)))
-    ;; Receive high-bandwidth request
-    (let ((payload (subseq (bitcoin-lisp.serialization:make-sendcmpct-message t 1) 24)))
+    ;; Receive high-bandwidth request (v2 — the only version we accept)
+    (let ((payload (subseq (bitcoin-lisp.serialization:make-sendcmpct-message t 2) 24)))
       (bitcoin-lisp.networking::handle-sendcmpct peer payload))
-    (is (bitcoin-lisp.networking:peer-compact-block-high-bandwidth peer))))
+    (is (bitcoin-lisp.networking:peer-compact-block-high-bandwidth peer))
+    (is (= 2 (bitcoin-lisp.networking:peer-compact-block-version peer)))))
 
 (test should-use-compact-blocks-checks-peer-support
   "should-use-compact-blocks-p should check if peer supports compact blocks."
   (let ((peer (make-mock-peer)))
     ;; No support
     (is (null (bitcoin-lisp.networking:should-use-compact-blocks-p peer)))
-    ;; Add support
-    (setf (bitcoin-lisp.networking:peer-compact-block-version peer) 1)
+    ;; Add support (v2 — the only version we negotiate)
+    (setf (bitcoin-lisp.networking:peer-compact-block-version peer) 2)
     ;; Now should be true (assuming not in IBD)
     (is (bitcoin-lisp.networking:should-use-compact-blocks-p peer))))
 

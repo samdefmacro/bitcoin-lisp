@@ -946,32 +946,38 @@ Downloads headers and blocks up to MAX-BLOCKS."
 
 ;;; Protocol negotiation
 
+(defconstant +compact-blocks-version+ 2
+  "The only BIP152 compact-block version we support: version 2 (wtxid-based,
+witness-carrying). Matches Bitcoin Core's CMPCTBLOCKS_VERSION
+(net_processing.cpp). Version 1 is non-witness — its prefilled coinbase is
+serialized without the 32-byte witness reserved value, so a block reconstructed
+from a v1 compact block fails BIP141 validation (bad-witness-nonce-size). We
+therefore never announce or accept v1; non-v2 peers fall back to full
+MSG_WITNESS_BLOCK downloads.")
+
 (defun send-compact-block-negotiation (peer)
-  "Send sendcmpct messages to advertise compact block support.
-Sends version 2 first (preferred for SegWit), then version 1.
-Requests high-bandwidth mode when not in IBD (peer will send us
+  "Advertise compact block support to PEER. We announce only version 2 (witness),
+matching Bitcoin Core — a v1 (non-witness) compact block would strip the coinbase
+witness nonce. Requests high-bandwidth mode when not in IBD (peer may then send us
 unsolicited compact blocks for faster relay)."
   (let ((high-bw (not (or (eq (ibd-state) :syncing-blocks)
-                           (eq (ibd-state) :syncing-headers)))))
-    ;; Send version 2 (wtxid-based) first
-    (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message high-bw 2))
-    ;; Then version 1 (txid-based) as fallback
-    (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message high-bw 1))))
+                          (eq (ibd-state) :syncing-headers)))))
+    (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
+                        high-bw +compact-blocks-version+))))
 
 (defun handle-sendcmpct (peer payload)
-  "Handle a sendcmpct message from a peer.
-   Updates peer's compact block capabilities."
+  "Handle a sendcmpct message from a peer. We support only compact block version 2;
+any other version is ignored entirely, mirroring Bitcoin Core
+(net_processing.cpp: `if (sendcmpct_version != CMPCTBLOCKS_VERSION) return;`). A
+v1 compact block would deliver a witness-stripped coinbase."
   (multiple-value-bind (high-bandwidth version)
       (bitcoin-lisp.serialization:parse-sendcmpct-payload payload)
-    ;; Accept the highest version we mutually support (1 or 2)
-    (when (and (> version 0) (<= version 2))
-      ;; Take the higher of current and new version
-      (when (> version (peer-compact-block-version peer))
-        (setf (peer-compact-block-version peer) version))
+    (when (= version +compact-blocks-version+)
+      (setf (peer-compact-block-version peer) version)
       ;; Track high-bandwidth mode preference
       (when high-bandwidth
         (setf (peer-compact-block-high-bandwidth peer) t)))
-    (bitcoin-lisp:log-debug "Peer ~A supports compact blocks v~D (high-bw: ~A)"
+    (bitcoin-lisp:log-debug "Peer ~A sendcmpct v~D (high-bw: ~A)"
                             (peer-address peer) version high-bandwidth)))
 
 ;;; IBD check
