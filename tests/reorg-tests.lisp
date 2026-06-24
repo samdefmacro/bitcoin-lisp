@@ -659,3 +659,86 @@ coinbase) instead of being dropped as unreadable."
        ;; The definitional count is cached back onto the entry.
        (is (= 1 (bitcoin-lisp.storage:block-index-entry-tx-count genesis-entry))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+;;;; Self-heal: prune a stored witness-stripped fork block during reorg
+
+(defun make-stripped-reorg-block (prev-hash block-hash height &key (value 5000000000))
+  "Like make-reorg-test-block, but the coinbase carries a witness-commitment
+output and NO coinbase witness — a witness-stripped block (block-witness-stripped-p
+=> T). Models a block stored via the old v1-compact :weaker-chain path."
+  (let* ((script-sig (let ((s (make-array 4 :element-type '(unsigned-byte 8))))
+                       (replace s block-hash :start2 0 :end2 4) s))
+         (commit (let ((c (make-array 38 :element-type '(unsigned-byte 8) :initial-element 0)))
+                   (setf (aref c 0) #x6a (aref c 1) #x24       ; OP_RETURN push36
+                         (aref c 2) #xaa (aref c 3) #x21       ; aa21a9ed
+                         (aref c 4) #xa9 (aref c 5) #xed)
+                   c))
+         (coinbase-tx (bitcoin-lisp.serialization:make-transaction
+                       :version 1
+                       :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                        :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                          :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                            :initial-element 0)
+                                                          :index #xFFFFFFFF)
+                                        :script-sig script-sig))
+                       :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                         :value value
+                                         :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                    :initial-element #x76))
+                                        (bitcoin-lisp.serialization:make-tx-out :value 0 :script-pubkey commit))
+                       :lock-time 0))
+         (merkle-root (bitcoin-lisp.validation:compute-merkle-root
+                       (list (bitcoin-lisp.serialization:transaction-hash coinbase-tx))))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1 :prev-block prev-hash :merkle-root merkle-root
+                  :timestamp (+ 1231006505 (* height 600)) :bits #x1d00ffff :nonce 0
+                  :cached-hash block-hash)))
+    (bitcoin-lisp.serialization:make-bitcoin-block :header header :transactions (list coinbase-tx))))
+
+(test perform-reorg-prunes-witness-stripped-fork-block
+  "A stored witness-stripped fork block (commitment but no coinbase nonce, e.g.
+from the old v1-compact :weaker-chain path) is pruned during the reorg precondition
+and returned as MISSING so it gets re-downloaded witness-complete — instead of
+failing the reorg forever and wedging the node (testnet4 stuck ~1800 blocks behind)."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "prune-stripped")
+     ;; Active chain A: genesis -> A1 -> A2.
+     (%build-and-connect chain-state block-store utxo-set genesis-hash
+                         (make-test-chain-hashes #xA0 2))
+     (let* ((a2-entry (bitcoin-lisp.storage:get-block-index-entry
+                       chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+            (genesis-entry (bitcoin-lisp.storage:get-block-index-entry chain-state genesis-hash))
+            (b-hashes (make-test-chain-hashes #xB0 2))
+            (b1-hash (first b-hashes))
+            (b2-hash (second b-hashes))
+            (b1-block (make-stripped-reorg-block genesis-hash b1-hash 1))   ; STRIPPED
+            (b2-block (make-reorg-test-block b1-hash b2-hash 2)))
+       (bitcoin-lisp.storage:store-block block-store b1-block)
+       (bitcoin-lisp.storage:store-block block-store b2-block)
+       (let ((b1-entry (bitcoin-lisp.storage:make-block-index-entry
+                        :hash b1-hash :height 1 :prev-entry genesis-entry
+                        :chain-work 100 :status :header-valid
+                        :header (bitcoin-lisp.serialization:bitcoin-block-header b1-block))))
+         (bitcoin-lisp.storage:add-block-index-entry chain-state b1-entry)
+         (let ((b2-entry (bitcoin-lisp.storage:make-block-index-entry
+                          :hash b2-hash :height 2 :prev-entry b1-entry
+                          :chain-work 200 :status :header-valid
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header b2-block))))
+           (bitcoin-lisp.storage:add-block-index-entry chain-state b2-entry)
+           ;; sanity: B1 is stored and detected as stripped
+           (is-true (bitcoin-lisp.validation:block-witness-stripped-p
+                     (bitcoin-lisp.storage:get-block block-store b1-hash)))
+           ;; Attempt reorg A2 -> B2.
+           (multiple-value-bind (ok missing)
+               (bitcoin-lisp.validation:perform-reorg
+                chain-state block-store utxo-set a2-entry b2-entry)
+             (is (null ok))                                            ; refused
+             (is (not (null missing)))                                 ; missing list returned
+             (is (null (bitcoin-lisp.storage:get-block block-store b1-hash)))   ; B1 pruned
+             (is (member b1-hash (mapcar #'car missing) :test #'equalp))
+             ;; tip unchanged — no mutation on a refused reorg
+             (is (= 2 (bitcoin-lisp.storage:current-height chain-state)))
+             (is (equalp (bitcoin-lisp.storage:block-index-entry-hash a2-entry)
+                         (bitcoin-lisp.storage:best-block-hash chain-state)))))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
