@@ -1648,13 +1648,34 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
             ;; in an equal-or-lower block).
             (disconnected-block-txs '()))
 
+        ;; Self-heal stored witness-stripped forward blocks. A fork block stored
+        ;; via the deferred-validation (:weaker-chain) path before the v2-only
+        ;; compact-block fix could land on disk witness-stripped (legacy coinbase
+        ;; carrying a witness commitment but no 32-byte reserved value). Such a
+        ;; block can NEVER pass BIP141, so it would fail this reorg on every
+        ;; attempt and wedge the node permanently (testnet4 stuck ~1800 blocks
+        ;; behind). Prune it here so the missing-precondition below re-queues it
+        ;; for a witness-complete re-download. Only the to-connect side is checked:
+        ;; to-disconnect blocks already validated when they were connected, and we
+        ;; still need their bodies for the UTXO disconnect.
+        (dolist (entry to-connect)
+          (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                 (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+            (when (and block (block-witness-stripped-p block))
+              (bitcoin-lisp:log-warn
+               "REORG: stored block at height ~D is witness-stripped; pruning for witness-complete re-download"
+               (bitcoin-lisp.storage:block-index-entry-height entry))
+              (bitcoin-lisp.storage:prune-block block-store block-hash)
+              ;; Header stays in the index; mark it needing a body so the normal
+              ;; download path re-fetches it.
+              (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid))))
+
         ;; Precondition: every block on BOTH sides must be in the
-        ;; block-store. If anything is missing, refuse the reorg without
-        ;; mutating any state — better to defer than to leave the chain
-        ;; half-disconnected and corrupt. Return the missing list so
-        ;; activate-block's caller can re-queue those blocks for
-        ;; download instead of looping forever on the unprocessable
-        ;; incoming tip.
+        ;; block-store. If anything is missing (including a stripped block just
+        ;; pruned above), refuse the reorg without mutating any state — better to
+        ;; defer than to leave the chain half-disconnected and corrupt. Return the
+        ;; missing list so activate-block's caller can re-queue those blocks for
+        ;; download instead of looping forever on the unprocessable incoming tip.
         (let ((missing '()))
           (dolist (entry (append to-disconnect to-connect))
             (let ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
