@@ -629,6 +629,7 @@
    #:validate-block-scripts
    #:find-witness-commitment
    #:validate-witness-commitment
+   #:block-witness-stripped-p
    #:compute-witness-merkle-root
    #:check-proof-of-work
    #:compute-merkle-root

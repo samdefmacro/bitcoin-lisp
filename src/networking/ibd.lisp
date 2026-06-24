@@ -332,29 +332,70 @@ deferred-reorg loop bug (project_per_peer_block_tracking.md)."
                              queued))
     queued))
 
-(defun handle-validation-failure (block height error chain-state)
-  "Handle a block-validation failure during IBD.
+(defparameter +max-block-revalidation-attempts+ 3
+  "Consecutive validation failures for the same block hash after which we stop
+re-requesting it in the tight receive->validate->re-request loop. The stuck-tip
+detector and normal header/tip sync remain the recovery path, so this is a PAUSE,
+not a permanent reject — a later witness-complete copy (same hash) can still be
+processed and connect. A single bad/witness-stripped block spun this loop
+indefinitely and spammed 6.5M log lines / 1.1GB on testnet4
+(project_cmpctblock_witness_wedge).")
 
-Re-adds the block hash to pending-blocks so it can be re-requested from
-a different peer (the failure may be peer-side data corruption rather
-than a real consensus violation). The stuck-tip detector in the main IBD
-loop is the backstop if the same block keeps failing.
+(defparameter +block-failure-counts-cap+ 4096
+  "Hard cap on the failure-count map; cleared wholesale on overflow (losing a few
+counts only grants a few extra retries — harmless).")
+
+(defvar *block-failure-counts* (make-hash-table :test 'equalp)
+  "block-hash -> consecutive validation-failure count (bounded anti-spam throttle).")
+
+(defun note-block-failure (hash)
+  "Increment and return the consecutive validation-failure count for HASH."
+  (when (>= (hash-table-count *block-failure-counts*) +block-failure-counts-cap+)
+    (clrhash *block-failure-counts*))
+  (setf (gethash hash *block-failure-counts*)
+        (1+ (gethash hash *block-failure-counts* 0))))
+
+(defun clear-block-failure (hash)
+  "Forget HASH's failure count — call when a block connects successfully so a
+later reorg/re-org through the same hash starts with a fresh retry budget."
+  (remhash hash *block-failure-counts*))
+
+(defun handle-validation-failure (block height error chain-state)
+  "Handle a block-validation failure during IBD, with a bounded retry budget.
+
+For the first +max-block-revalidation-attempts+ failures of a given block hash we
+re-add it to pending-blocks so it can be re-requested from another peer (the
+failure may be peer-side corruption rather than a real consensus violation) and
+log the error. Past the budget we STOP re-queuing it (and go silent) so one
+persistently-failing block cannot spin the tight receive->validate->re-request
+loop or spam the log — the stuck-tip detector + normal sync remain the recovery
+path. This is a pause keyed on the count, never a permanent reject of the hash, so
+a witness-complete copy with the same hash can still connect later.
 
 Bitcoin Core punishes the source peer in MaybePunishNodeForBlock
-(net_processing.cpp:1908-1951) on BLOCK_CONSENSUS / BLOCK_MUTATED but
-does not re-request — Core trusts its own validator. Our validator is
-less battle-tested, so we re-request once-or-twice before halting."
-  (declare (ignore error))
+(net_processing.cpp) on BLOCK_CONSENSUS / BLOCK_MUTATED but does not re-request —
+Core trusts its own validator. Ours is less battle-tested, so we re-request a few
+times before pausing."
+  (declare (ignore chain-state))
   (when *ibd-context*
     (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
            (hash (bitcoin-lisp.serialization:block-header-hash header))
            (pending (ibd-context-pending-blocks *ibd-context*))
-           (in-flight (ibd-context-in-flight *ibd-context*)))
-      ;; Drop any stale in-flight entry for this hash so it can be retried.
+           (in-flight (ibd-context-in-flight *ibd-context*))
+           (count (note-block-failure hash)))
+      ;; Always free the in-flight slot so a retry / another peer's copy can come.
       (remhash hash in-flight)
-      ;; Re-add to pending if not already there.
-      (unless (gethash hash pending)
-        (setf (gethash hash pending) height)))))
+      (cond
+        ((<= count +max-block-revalidation-attempts+)
+         (bitcoin-lisp:log-error "Block ~D validation failed: ~A (attempt ~D/~D)"
+                                 height error count +max-block-revalidation-attempts+)
+         (unless (gethash hash pending)
+           (setf (gethash hash pending) height)))
+        ((= count (1+ +max-block-revalidation-attempts+))
+         ;; Cross the budget exactly once, then go quiet.
+         (bitcoin-lisp:log-warn
+          "Block ~D (~A) failed validation ~D times; pausing tight re-request (stuck-tip detector + normal sync remain the recovery path)"
+          height (bitcoin-lisp.crypto:bytes-to-hex hash) count))))))
 
 (defun check-stuck-tip ()
   "Halt IBD if the connect-tip has not advanced for longer than
@@ -1780,21 +1821,31 @@ After connecting, drains the queue of any children that can now be connected."
       ;; without changing our active tip. A later block that pushes the
       ;; fork past our tip will then trigger the reorg.
       (when (<= height current-height)
-        (bitcoin-lisp.storage:store-block block-store block)
-        (multiple-value-bind (activated error)
-            (bitcoin-lisp.validation:activate-block
-             block chain-state block-store utxo-set
-             :skip-scripts (<= height (script-skip-height chain-state))
-             :fee-estimator fee-estimator
-             :recent-rejects recent-rejects
-             :mempool mempool)
-          (declare (ignore activated))
-          ;; :weaker-chain is the expected outcome here; any other
-          ;; error is worth logging at debug level for now.
-          (unless (eq error :weaker-chain)
-            (bitcoin-lisp:log-debug "Competing-fork block ~D activate result: ~A"
-                                    height error))
-          (return-from process-received-block nil)))
+        ;; Never PERSIST a witness-stripped competing-fork block: the
+        ;; :weaker-chain path stores before full validation (deferred until a
+        ;; reorg needs it), so a stripped block would land on disk and then fail
+        ;; every reorg attempt — exactly what wedged testnet4. Drop this copy; a
+        ;; witness-complete copy arrives via v2 compact blocks / full witness
+        ;; downloads if the fork ever becomes relevant.
+        (if (bitcoin-lisp.validation:block-witness-stripped-p block)
+            (bitcoin-lisp:log-debug
+             "Competing-fork block ~D arrived witness-stripped; not storing" height)
+            (progn
+              (bitcoin-lisp.storage:store-block block-store block)
+              (multiple-value-bind (activated error)
+                  (bitcoin-lisp.validation:activate-block
+                   block chain-state block-store utxo-set
+                   :skip-scripts (<= height (script-skip-height chain-state))
+                   :fee-estimator fee-estimator
+                   :recent-rejects recent-rejects
+                   :mempool mempool)
+                (declare (ignore activated))
+                ;; :weaker-chain is the expected outcome here; any other
+                ;; error is worth logging at debug level for now.
+                (unless (eq error :weaker-chain)
+                  (bitcoin-lisp:log-debug "Competing-fork block ~D activate result: ~A"
+                                          height error)))))
+        (return-from process-received-block nil))
 
       ;; Check if this is the next block we need
       (if (= height (1+ current-height))
@@ -1822,6 +1873,7 @@ After connecting, drains the queue of any children that can now be connected."
                  :mempool mempool)
               (cond
                 (activated
+                 (clear-block-failure hash)
                  (note-tip-advanced chain-state)
                  ;; Drain queued blocks whose parent is now connected
                  (drain-block-queue chain-state utxo-set block-store
@@ -1845,8 +1897,8 @@ After connecting, drains the queue of any children that can now be connected."
                  (queue-missing-fork-blocks missing-blocks)
                  nil)
                 (t
-                 (bitcoin-lisp:log-error "Block ~D validation failed: ~A"
-                                         height error)
+                 ;; handle-validation-failure logs (throttled by retry count) and
+                 ;; manages re-request budget.
                  (handle-validation-failure block height error chain-state)
                  nil))))
 
@@ -1941,10 +1993,7 @@ Repeats until no more queued blocks can be connected."
                (queue-missing-fork-blocks missing-blocks)
                (return drained))
               (t
-               (bitcoin-lisp:log-error "Queued block ~D validation failed: ~A"
-                                       next-height error)
+               ;; handle-validation-failure logs (throttled) + manages the bounded
+               ;; re-request budget. Stop draining after a failure.
                (handle-validation-failure block next-height error chain-state)
-               ;; Stop draining after a failure — the block is now back in
-               ;; pending and will be re-requested. Returning here also
-               ;; prevents tight-looping on a permanently-failing block.
                (return drained)))))))))
