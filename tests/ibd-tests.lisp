@@ -1153,3 +1153,25 @@ else is still validated."
     ;; assumevalid explicitly disabled -> no skip.
     (let ((bitcoin-lisp:*assumevalid-override* nil))
       (is (= -1 (bitcoin-lisp.networking::assumevalid-skip-height state))))))
+
+(test block-failure-count-throttle
+  "note-block-failure increments a per-hash counter, clear-block-failure resets
+it, and counts are independent per hash. This bounded counter backs the
+re-request budget in handle-validation-failure that stops a single
+persistently-failing block from spinning the receive->validate->re-request loop
+and spamming the log (the testnet4 wedge produced 6.5M lines / 1.1GB this way)."
+  (let ((h1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+        (h2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+    (clrhash bitcoin-lisp.networking::*block-failure-counts*)
+    ;; increments per hash
+    (is (= 1 (bitcoin-lisp.networking::note-block-failure h1)))
+    (is (= 2 (bitcoin-lisp.networking::note-block-failure h1)))
+    (is (= 3 (bitcoin-lisp.networking::note-block-failure h1)))
+    ;; independent per hash
+    (is (= 1 (bitcoin-lisp.networking::note-block-failure h2)))
+    (is (= 4 (bitcoin-lisp.networking::note-block-failure h1)))
+    ;; clear resets a single hash
+    (bitcoin-lisp.networking::clear-block-failure h1)
+    (is (= 1 (bitcoin-lisp.networking::note-block-failure h1)))
+    (is (= 2 (bitcoin-lisp.networking::note-block-failure h2)))  ; h2 untouched
+    (clrhash bitcoin-lisp.networking::*block-failure-counts*)))
