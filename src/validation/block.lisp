@@ -737,6 +737,28 @@ rejected, and the no-commitment+witness case is :unexpected-witness
           (values nil :unexpected-witness))))
     (values t nil)))
 
+(defun block-witness-stripped-p (block)
+  "T if BLOCK carries a witness commitment in its coinbase outputs but its coinbase
+witness is NOT exactly one 32-byte item — i.e. the block arrived witness-stripped
+(or is malformed). Such a block can never pass BIP141 validation
+(bad-witness-nonce-size), so it must not be persisted: a witness-stripped block
+stored on a competing fork failed every reorg attempt and wedged testnet4 (see
+project_cmpctblock_witness_wedge). Height/network-independent — a block that
+commits to witness data ALWAYS carries the 32-byte reserved value, so this never
+fires on a legitimate block.
+
+Note the block hash is identical for the stripped and witness-complete copies (the
+witness is not covered by the header/merkle root), so callers must treat this as
+\"don't persist THIS copy\", never as a permanent reject of the hash."
+  (let* ((txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+         (coinbase (first txs)))
+    (and coinbase
+         (find-witness-commitment coinbase)
+         (let* ((cb-witness (bitcoin-lisp.serialization:transaction-witness coinbase))
+                (cb-stack (and cb-witness (plusp (length cb-witness)) (aref cb-witness 0))))
+           (not (and (= (length cb-stack) 1)
+                     (= (length (first cb-stack)) 32)))))))
+
 ;;;; BIP 34 Coinbase Height Validation
 
 (defconstant +bip34-activation-height-testnet3+ 21111

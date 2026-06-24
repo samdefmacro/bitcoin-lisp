@@ -493,6 +493,52 @@ We verify MTP computation directly to confirm the check works."
   (let ((coinbase (make-coinbase-transaction :value 5000000000 :height 1)))
     (is (null (bitcoin-lisp.validation:find-witness-commitment coinbase)))))
 
+(defun %coinbase-with-commitment (cb-witness-stack)
+  "A coinbase tx carrying a witness-commitment OP_RETURN output, whose coinbase
+input witness stack is CB-WITNESS-STACK (a list of byte-vectors, or NIL for none)."
+  (let ((script (make-array 38 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref script 0) #x6a (aref script 1) #x24      ; OP_RETURN push36
+          (aref script 2) #xaa (aref script 3) #x21      ; commitment header aa21a9ed
+          (aref script 4) #xa9 (aref script 5) #xed)
+    (bitcoin-lisp.serialization:make-transaction
+     :version 1
+     :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                      :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                            :initial-element 0)
+                                        :index #xFFFFFFFF)
+                      :script-sig (make-array 4 :element-type '(unsigned-byte 8) :initial-element 1)))
+     :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                       :value 5000000000
+                       :script-pubkey (make-array 25 :element-type '(unsigned-byte 8) :initial-element #x76))
+                      (bitcoin-lisp.serialization:make-tx-out :value 0 :script-pubkey script))
+     :lock-time 0
+     :witness (vector cb-witness-stack))))
+
+(test block-witness-stripped-p-detects-missing-nonce
+  "block-witness-stripped-p is T when a block commits to witness but its coinbase
+witness is missing or not exactly one 32-byte item, and NIL for a witness-complete
+coinbase or one with no commitment. Guards the :weaker-chain store path so a
+witness-stripped block never persists (the testnet4 BAD-WITNESS-NONCE-SIZE wedge)."
+  (flet ((blk (coinbase)
+           (bitcoin-lisp.serialization:make-bitcoin-block
+            :header (make-test-block-header)
+            :transactions (list coinbase))))
+    ;; commitment + coinbase witness of exactly one 32-byte item -> complete
+    (let ((nonce (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (is (null (bitcoin-lisp.validation:block-witness-stripped-p
+                 (blk (%coinbase-with-commitment (list nonce)))))))
+    ;; commitment + EMPTY coinbase witness (stripped) -> T
+    (is-true (bitcoin-lisp.validation:block-witness-stripped-p
+              (blk (%coinbase-with-commitment '()))))
+    ;; commitment + wrong-size nonce (16 bytes) -> T
+    (let ((short (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (is-true (bitcoin-lisp.validation:block-witness-stripped-p
+                (blk (%coinbase-with-commitment (list short))))))
+    ;; no commitment -> never stripped
+    (is (null (bitcoin-lisp.validation:block-witness-stripped-p
+               (blk (make-coinbase-transaction :value 5000000000 :height 1)))))))
+
 ;;;; Block Script Validation Tests
 
 (test validate-block-scripts-called
