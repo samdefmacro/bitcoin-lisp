@@ -339,7 +339,7 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
                     :hash hash)
                    wanted))))))
     (when unknown-block-hash
-      (bitcoin-lisp:log-debug "inv: unknown block ~A from peer ~A — sending getheaders"
+      (bitcoin-lisp:log-cat "net" "inv: unknown block ~A from peer ~A — sending getheaders"
                               (bitcoin-lisp.crypto:bytes-to-hex unknown-block-hash)
                               (peer-address peer))
       (request-headers-for-ibd peer chain-state))
@@ -451,7 +451,7 @@ gossiping PEER as their source (addrman source-group spreading)."
                       source-ip)
                      (incf added))))))
     (when (and address-book (> added 0))
-      (bitcoin-lisp:log-debug "Added ~D peer addresses from addr message" added))
+      (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addr message" added))
     added))
 
 ;;; ADDRv2 handling (BIP 155)
@@ -480,7 +480,7 @@ Other network types are silently skipped."
            source-ip)
           (incf added))))
     (when (and address-book (> added 0))
-      (bitcoin-lisp:log-debug "Added ~D peer addresses from addrv2 message" added))
+      (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
     added))
 
 ;;; Transaction handling

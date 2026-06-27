@@ -1700,6 +1700,29 @@ under the \"locked\" object Core uses."
                    ("chunks_used" . 0)
                    ("chunks_free" . 0))))))
 
+(defun rpc-logging (node params)
+  "Get or set the active debug-logging categories (Bitcoin Core logging). PARAMS:
+([include] [exclude]) — arrays of category names to enable / disable; \"all\"
+(or \"1\") toggles every category. Returns an object mapping every category to
+whether it is currently enabled. Errors on an unknown category."
+  (declare (ignore node))
+  (let ((include (first params))
+        (exclude (second params)))
+    (when (and include (not (listp include)))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "include must be an array"))
+    (when (and exclude (not (listp exclude)))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "exclude must be an array"))
+    (dolist (cat include)
+      (unless (and (stringp cat) (bitcoin-lisp::enable-log-category cat))
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "unknown logging category ~A" cat))))
+    (dolist (cat exclude)
+      (unless (and (stringp cat) (bitcoin-lisp::disable-log-category cat))
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "unknown logging category ~A" cat))))
+    (mapcar (lambda (c) (cons c (bitcoin-lisp:log-category-enabled-p c)))
+            bitcoin-lisp::+log-categories+)))
+
 (defun rpc-getrpcinfo (node params)
   "Report RPC server state (Bitcoin Core getrpcinfo): active commands (we don't
 track in-flight requests, so empty) and the log file path."
