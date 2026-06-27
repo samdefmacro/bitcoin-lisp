@@ -2170,3 +2170,47 @@ all_networks aggregate; counts stay consistent with the address book."
     ;; missing state errors
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-setnetworkactive node '()))))
+
+;;; --- getchainstates ---
+
+(test rpc-getchainstates-single-chainstate
+  "getchainstates reports exactly one fully-validated chainstate with Core's
+field shape."
+  (let* ((node (make-test-node))
+         (r (bitcoin-lisp.rpc::rpc-getchainstates node nil))
+         (states (cdr (assoc "chainstates" r :test #'string=))))
+    (is (assoc "headers" r :test #'string=))
+    (is (= 1 (length states)))
+    (let ((cs (first states)))
+      (is (eq t (cdr (assoc "validated" cs :test #'string=))))
+      (is (integerp (cdr (assoc "blocks" cs :test #'string=))))
+      (is (numberp (cdr (assoc "difficulty" cs :test #'string=))))
+      ;; bits is 8 lowercase hex chars; target is 64.
+      (let ((bits (cdr (assoc "bits" cs :test #'string=)))
+            (target (cdr (assoc "target" cs :test #'string=))))
+        (is (= 8 (length bits)))
+        (is (string= bits (string-downcase bits)))
+        (is (= 64 (length target)))
+        (is (string= target (string-downcase target))))
+      (is (>= (cdr (assoc "coins_tip_cache_bytes" cs :test #'string=)) 0))
+      (is (assoc "coins_db_cache_bytes" cs :test #'string=)))))
+
+;;; --- importmempool ---
+
+(test rpc-importmempool-roundtrip-and-errors
+  "importmempool loads a saved mempool file and returns an empty object; a
+missing file or non-string path errors."
+  (let* ((node (make-test-node))
+         (path (merge-pathnames "bl-importmempool-test.dat" (uiop:temporary-directory))))
+    (bitcoin-lisp.mempool:save-mempool-file (bitcoin-lisp::node-mempool node) path)
+    (unwind-protect
+         (let ((r (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path)))))
+           (is (hash-table-p r))                 ; serializes as {}
+           (is (= 0 (hash-table-count r))))
+      (ignore-errors (delete-file path)))
+    ;; nonexistent file
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-importmempool node (list "/no/such/bl-mempool-file.dat")))
+    ;; non-string filepath
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-importmempool node (list 123)))))

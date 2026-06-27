@@ -404,20 +404,22 @@ port can't be bound."
           (log-info "Listening for inbound peers on ~A:~D"
                     bind (network-port (node-network node)))))))
 
-(defun load-mempool-from-disk (node)
-  "Reload mempool.dat through the normal acceptance path (Core LoadMempool):
-prioritisation deltas first (so fee policy sees them), then per-tx validation
-against the current UTXO set — stale entries (spent inputs, reorged context)
-simply fail and are dropped. Entries are loaded regardless of age (no expiry
-filter, unlike Core): mempool-expire prunes old entries on the next block
+(defun load-mempool-from-disk
+    (node &optional (path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory node))))
+  "Load a mempool.dat-format file through the normal acceptance path (Core
+LoadMempool): prioritisation deltas first (so fee policy sees them), then per-tx
+validation against the current UTXO set — stale entries (spent inputs, reorged
+context) simply fail and are dropped. Entries are loaded regardless of age (no
+expiry filter, unlike Core): mempool-expire prunes old entries on the next block
 connection anyway. Residual deltas (txs not in the saved pool) are re-applied
-last. Corrupt or missing files are ignored."
-  (let ((path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory node))))
-    (when (and path (probe-file path))
+last. PATH defaults to the node's mempool.dat; the importmempool RPC passes an
+arbitrary file. Returns (values accepted failed residual-count) on success, or
+NIL if the file is missing or corrupt."
+  (when (and path (probe-file path))
       (multiple-value-bind (entries residual ok)
           (bitcoin-lisp.mempool:read-mempool-file path)
         (unless ok
-          (log-warn "mempool.dat unreadable or corrupt — starting with empty mempool")
+          (log-warn "mempool file ~A unreadable or corrupt" path)
           (return-from load-mempool-from-disk nil))
         (let ((mempool (node-mempool node))
               (utxo-set (node-utxo-set node))
@@ -444,7 +446,8 @@ last. Corrupt or missing files are ignored."
           (dolist (pair residual)
             (bitcoin-lisp.mempool:mempool-prioritise mempool (car pair) (cdr pair)))
           (log-info "Imported mempool: ~D accepted, ~D failed, ~D residual deltas"
-                    accepted failed (length residual)))))))
+                    accepted failed (length residual))
+          (values accepted failed (length residual))))))
 
 ;;; --- Chainstate crash recovery -------------------------------------------
 ;;;
