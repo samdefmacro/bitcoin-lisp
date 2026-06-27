@@ -261,3 +261,63 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
                   (bitcoin-lisp.rpc::hash-to-hex
                    (bitcoin-lisp.storage:best-block-hash
                     (bitcoin-lisp::node-chain-state node))))))))
+
+(test generatetodescriptor-advances-chain
+  ;; Mine to a descriptor-derived coinbase script (raw(51) = OP_TRUE) and confirm
+  ;; the chain advances, mirroring generatetoaddress.
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "gendesc"))
+          (hashes (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 2 "raw(51)"))))
+     (is (= 2 (length hashes)))
+     (is (every #'stringp hashes))
+     (is (= 2 (bitcoin-lisp.storage:current-height
+               (bitcoin-lisp::node-chain-state node))))
+     (is (string= (car (last hashes))
+                  (bitcoin-lisp.rpc::hash-to-hex
+                   (bitcoin-lisp.storage:best-block-hash
+                    (bitcoin-lisp::node-chain-state node)))))
+     ;; bad descriptor + non-positive count error
+     (signals bitcoin-lisp.rpc::rpc-error
+       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 1 "frobnicate(03ab)")))
+     (signals bitcoin-lisp.rpc::rpc-error
+       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 0 "raw(51)"))))))
+
+(test submitheader-accepts-valid-rejects-orphan
+  ;; A mined header whose parent is known validates and is added to the index;
+  ;; a header with an unknown parent and malformed hex both error.
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "subhdr"))
+          (block (bitcoin-lisp.mining:assemble-full-block
+                  (bitcoin-lisp::node-chain-state node)
+                  (bitcoin-lisp::node-mempool node)
+                  :coinbase-script-pubkey (%p2sh-optrue-spk))))
+     (bitcoin-lisp.mining:mine-block block)
+     (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header block))
+            (hash (bitcoin-lisp.serialization:block-header-hash hdr))
+            (bytes (flexi-streams:with-output-to-sequence (s)
+                     (bitcoin-lisp.serialization::write-block-header s hdr)))
+            (hex (bitcoin-lisp.crypto:bytes-to-hex bytes)))
+       (is (= 80 (length bytes)))
+       (is (null (bitcoin-lisp.storage:get-block-index-entry
+                  (bitcoin-lisp::node-chain-state node) hash)))
+       ;; valid → null, now present
+       (is (null (bitcoin-lisp.rpc::rpc-submitheader node (list hex))))
+       (is-true (bitcoin-lisp.storage:get-block-index-entry
+                 (bitcoin-lisp::node-chain-state node) hash))
+       ;; already-known → still null
+       (is (null (bitcoin-lisp.rpc::rpc-submitheader node (list hex)))))
+     ;; header with an unknown parent → verify error
+     (let* ((orphan (bitcoin-lisp.serialization:make-block-header
+                     :version 1
+                     :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                :initial-element 7)
+                     :merkle-root (%zeros 32) :timestamp 1296688602
+                     :bits #x207fffff :nonce 0))
+            (obytes (flexi-streams:with-output-to-sequence (s)
+                      (bitcoin-lisp.serialization::write-block-header s orphan))))
+       (signals bitcoin-lisp.rpc::rpc-error
+         (bitcoin-lisp.rpc::rpc-submitheader
+          node (list (bitcoin-lisp.crypto:bytes-to-hex obytes)))))
+     ;; malformed hex → deserialization error
+     (signals bitcoin-lisp.rpc::rpc-error
+       (bitcoin-lisp.rpc::rpc-submitheader node (list "zz"))))))
