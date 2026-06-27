@@ -92,6 +92,15 @@ we cap lower). Excess inbound connections are disconnected at merge time.")
   (pending-inbound-peers '() :type list)
   (lock (bt:make-recursive-lock "node-lock"))
   (known-addresses '() :type list)
+  ;; setnetworkactive: when NIL, the node makes no new outbound connections and
+  ;; accepts no inbound ones (existing peers are dropped on toggle-off).
+  (network-active t :type boolean)
+  ;; addnode "add": manually-pinned peer specs ("host" or "host:port") that the
+  ;; maintenance loop keeps connected, independent of max-peers.
+  (added-nodes '() :type list)
+  ;; addnode "onetry": one-shot dial requests handed off to the sync thread so
+  ;; node-peers stays single-writer (only the sync thread pushes to it).
+  (pending-onetry '() :type list)
   (max-peers 8 :type (unsigned-byte 8)))
 
 (defvar *node* nil
@@ -359,6 +368,9 @@ runs inline (serial accept) with a short timeout, so a silent peer stalls the
 loop only briefly; a thread pool is a future refinement."
   (loop while (node-running node)
         do (handler-case
+               ;; setnetworkactive off: don't accept inbound connections.
+               (if (not (node-network-active node))
+                   (sleep 1)
                (let ((conn (bitcoin-lisp.networking:accept-connection
                             (node-listener-socket node) :timeout 1)))
                  (when conn
@@ -373,7 +385,7 @@ loop only briefly; a thread pool is a future refinement."
                            (log-info "Inbound peer ~A (~A) handshake complete"
                                      (bitcoin-lisp.networking:peer-address peer)
                                      (bitcoin-lisp.networking:peer-user-agent peer)))
-                         (bitcoin-lisp.networking:disconnect-peer peer)))))
+                         (bitcoin-lisp.networking:disconnect-peer peer))))))
              (error (c)
                (log-debug "Inbound accept/handshake error: ~A" c)))))
 
@@ -789,6 +801,8 @@ Returns the node instance."
                    ;; backstop for inv-only peers and missed announcements.
                    (loop while (node-running *node*)
                          do (merge-inbound-peers *node*)
+                            ;; Maintain manually-added peers each cycle (addnode).
+                            (connect-added-nodes *node*)
                             (cond
                               ((>= (length (node-peers *node*)) 1)
                                (setf (node-syncing *node*) t)
@@ -1268,6 +1282,9 @@ MAX-PEERS: Target number of peers to connect
 TIMEOUT: Maximum seconds to spend connecting (default 60)
 MIN-PEERS: Return early once we have at least this many peers (default 1)
 Returns the number of peers connected."
+  ;; setnetworkactive off: make no outbound connections.
+  (unless (node-network-active node)
+    (return-from connect-to-peers 0))
   (let ((address-book (node-address-book node))
         (addresses '()))
     ;; Warm start: select peers from the addrman (new/tried buckets,
@@ -1439,6 +1456,16 @@ Also checks compact block reconstruction timeouts (BIP 152)."
 (defun replace-disconnected-peers (node)
   "Replace disconnected peers to maintain target peer count.
 Returns the number of new peers connected."
+  ;; Reap disconnected peers first — this also cleans up peers that
+  ;; setnetworkactive dropped, even while networking stays disabled.
+  (bt:with-recursive-lock-held ((node-lock node))
+    (setf (node-peers node)
+          (remove-if (lambda (p)
+                       (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
+                     (node-peers node))))
+  ;; setnetworkactive off: don't dial replacements.
+  (unless (node-network-active node)
+    (return-from replace-disconnected-peers 0))
   (let* ((active-peers (remove-if-not
                         (lambda (p)
                           (eq (bitcoin-lisp.networking:peer-state p) :ready))
@@ -1446,13 +1473,6 @@ Returns the number of new peers connected."
          (needed (- (node-max-peers node) (length active-peers))))
     (when (<= needed 0)
       (return-from replace-disconnected-peers 0))
-
-    ;; Remove disconnected peers from list
-    (bt:with-recursive-lock-held ((node-lock node))
-      (setf (node-peers node)
-            (remove-if (lambda (p)
-                         (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
-                       (node-peers node))))
 
     ;; Get addresses already in use
     (let ((used-addrs (mapcar #'bitcoin-lisp.networking:peer-address
@@ -1486,9 +1506,88 @@ Returns the number of new peers connected."
               (declare (ignore c))))))
       connected)))
 
+;;;; Manually-added peers (addnode)
+
+(defun parse-node-endpoint (node spec)
+  "Split an addnode SPEC into (values host port). Accepts \"host\",
+\"host:port\", and \"[ipv6]:port\"; bare or bracketless addresses default to the
+network's P2P port. A trailing :port is only honored when it is all digits, so a
+bare IPv6 address (which contains colons) is treated as host-only."
+  (let ((default-port (network-port (node-network node))))
+    (cond
+      ;; [ipv6]:port  or  [ipv6]
+      ((and (plusp (length spec)) (char= (char spec 0) #\[))
+       (let ((close (position #\] spec)))
+         (if (null close)
+             (values spec default-port)
+             (let ((host (subseq spec 1 close))
+                   (rest (subseq spec (1+ close))))
+               (if (and (plusp (length rest)) (char= (char rest 0) #\:)
+                        (plusp (length (subseq rest 1)))
+                        (every #'digit-char-p (subseq rest 1)))
+                   (values host (parse-integer rest :start 1))
+                   (values host default-port))))))
+      (t
+       (let ((colon (position #\: spec :from-end t)))
+         (if (and colon
+                  (< (1+ colon) (length spec))
+                  (every #'digit-char-p (subseq spec (1+ colon)))
+                  ;; A single colon => host:port; multiple => bare IPv6.
+                  (= colon (position #\: spec)))
+             (values (subseq spec 0 colon) (parse-integer spec :start (1+ colon)))
+             (values spec default-port)))))))
+
+(defun peer-connected-to-host-p (node host)
+  "T if a peer with address HOST is currently in the node's peer list."
+  (bt:with-recursive-lock-held ((node-lock node))
+    (and (find host (node-peers node)
+               :key #'bitcoin-lisp.networking:peer-address :test #'string=)
+         t)))
+
+(defun establish-outbound-peer (node host port)
+  "Full outbound connect + handshake to HOST:PORT, pushing the ready peer onto
+node-peers. Returns the peer or NIL. MUST run on the sync thread so node-peers
+stays single-writer. No-op when networking is disabled."
+  (when (node-network-active node)
+    (handler-case
+        (let ((peer (bitcoin-lisp.networking:connect-peer host port)))
+          (when peer
+            (setf (bitcoin-lisp.networking:peer-address peer) host)
+            (if (bitcoin-lisp.networking:perform-handshake peer)
+                (progn
+                  (bitcoin-lisp.networking:send-post-handshake-messages peer)
+                  (bitcoin-lisp.networking:send-compact-block-negotiation peer)
+                  (bt:with-recursive-lock-held ((node-lock node))
+                    (push peer (node-peers node)))
+                  (log-info "Added-node peer connected: ~A" host)
+                  peer)
+                (progn (bitcoin-lisp.networking:disconnect-peer peer) nil))))
+      (error (c)
+        (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
+        nil))))
+
+(defun connect-added-nodes (node)
+  "Service addnode requests on the sync thread: drain one-shot \"onetry\" dials,
+then keep every \"add\" peer connected. Honors network-active."
+  (when (node-network-active node)
+    ;; One-shot onetry dials (Core addnode onetry).
+    (let ((onetry (bt:with-recursive-lock-held ((node-lock node))
+                    (prog1 (node-pending-onetry node)
+                      (setf (node-pending-onetry node) nil)))))
+      (dolist (spec onetry)
+        (multiple-value-bind (host port) (parse-node-endpoint node spec)
+          (unless (peer-connected-to-host-p node host)
+            (establish-outbound-peer node host port)))))
+    ;; Maintain persistent added-node connections.
+    (dolist (spec (node-added-nodes node))
+      (multiple-value-bind (host port) (parse-node-endpoint node spec)
+        (unless (peer-connected-to-host-p node host)
+          (establish-outbound-peer node host port))))))
+
 (defun maintain-peers (node)
   "Run periodic peer maintenance: health checks and reconnection."
   (check-peers-health node)
+  (connect-added-nodes node)
   (replace-disconnected-peers node))
 
 ;;;; Blockchain Synchronization

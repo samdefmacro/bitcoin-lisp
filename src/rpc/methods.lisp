@@ -413,7 +413,7 @@ is supplied and the script is addressable) address."
       ;; coerce so it serializes as JSON true/false.
       ("localrelay" . ,(and (bitcoin-lisp.networking:relay-enabled-p) t))
       ("timeoffset" . 0)
-      ("networkactive" . t)
+      ("networkactive" . ,(bitcoin-lisp::node-network-active node))
       ("connections" . ,(length peers))
       ("connections_in" . ,in)
       ("connections_out" . ,(- (length peers) in))
@@ -846,6 +846,84 @@ authoritative running counts."
             (nn (if book (bitcoin-lisp.networking::address-book-n-new book) 0))
             (nt (if book (bitcoin-lisp.networking::address-book-n-tried book) 0)))
         (append result (list (cons "all_networks" (entry nn nt))))))))
+
+(defun rpc-addnode (node params)
+  "Manage manually-added peers (Bitcoin Core addnode). PARAMS:
+(node command [v2transport]). COMMAND is \"add\" (remember the peer and keep it
+connected), \"remove\", or \"onetry\" (dial once now). The actual dialing is
+handed to the sync thread (via added-nodes / pending-onetry) so node-peers stays
+single-writer. Returns null. v2transport is accepted and ignored — BIP324 v2
+transport is not implemented."
+  (let ((spec (first params))
+        (command (second params)))
+    (unless (and (stringp spec) (plusp (length spec)))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
+    (unless (member command '("add" "remove" "onetry") :test #'equal)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "command must be \"add\", \"remove\", or \"onetry\""))
+    (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+      (cond
+        ((equal command "onetry")
+         (push spec (bitcoin-lisp::node-pending-onetry node)))
+        ((equal command "add")
+         (when (member spec (bitcoin-lisp::node-added-nodes node) :test #'string=)
+           (error 'rpc-error :code +rpc-client-node-already-added+
+                             :message "Error: Node already added"))
+         (setf (bitcoin-lisp::node-added-nodes node)
+               (append (bitcoin-lisp::node-added-nodes node) (list spec))))
+        ((equal command "remove")
+         (unless (member spec (bitcoin-lisp::node-added-nodes node) :test #'string=)
+           (error 'rpc-error :code +rpc-client-node-not-added+
+                             :message "Error: Node could not be removed. It has not been added previously."))
+         (setf (bitcoin-lisp::node-added-nodes node)
+               (remove spec (bitcoin-lisp::node-added-nodes node) :test #'string=)))))
+    nil))
+
+(defun rpc-getaddednodeinfo (node params)
+  "Report manually-added peers and their connection state (Bitcoin Core
+getaddednodeinfo). PARAMS: ([node]) — restrict to one added node (errors if it
+was never added). Returns an array of {addednode, connected, addresses}."
+  (let ((filter (first params)))
+    (when (and filter (not (stringp filter)))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "node must be a string"))
+    (let ((added (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                   (copy-list (bitcoin-lisp::node-added-nodes node)))))
+      (when filter
+        (unless (member filter added :test #'string=)
+          (error 'rpc-error :code +rpc-client-node-not-added+
+                            :message "Error: Node has not been added."))
+        (setf added (list filter)))
+      (mapcar
+       (lambda (spec)
+         (let* ((host (bitcoin-lisp::parse-node-endpoint node spec))
+                (peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                        (find host (bitcoin-lisp::node-peers node)
+                              :key #'bitcoin-lisp.networking:peer-address :test #'string=))))
+           `(("addednode" . ,spec)
+             ("connected" . ,(and peer t))
+             ;; List (not vector): rpc-result->json recurses into lists to
+             ;; normalize the nested address object; NIL renders as the empty set.
+             ("addresses" . ,(when peer
+                               (list `(("address" . ,(bitcoin-lisp.networking:peer-address peer))
+                                       ("connected" . ,(if (bitcoin-lisp.networking::peer-inbound peer)
+                                                           "inbound" "outbound")))))))))
+       added))))
+
+(defun rpc-setnetworkactive (node params)
+  "Enable or disable all P2P network activity (Bitcoin Core setnetworkactive).
+PARAMS: (state). Disabling drops all current peers and stops new inbound/outbound
+connections until re-enabled. Returns the new state."
+  (when (endp params)
+    (error 'rpc-error :code +rpc-invalid-parameter+ :message "state is required"))
+  (let ((state (and (first params) t)))
+    (setf (bitcoin-lisp::node-network-active node) state)
+    (unless state
+      ;; Mark current peers disconnected (close socket + set state). The sync
+      ;; thread reaps them from node-peers, keeping it single-writer.
+      (dolist (peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                      (copy-list (bitcoin-lisp::node-peers node))))
+        (ignore-errors (bitcoin-lisp.networking:disconnect-peer peer))))
+    state))
 
 (defun rpc-disconnectnode (node params)
   "Disconnect a connected peer by ADDRESS (Bitcoin Core disconnectnode). Returns
