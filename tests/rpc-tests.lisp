@@ -2261,3 +2261,52 @@ missing file or non-string path errors."
     ;; bad peer_id type → error
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getblockfrompeer node (list hash-hex "notanint")))))
+
+;;; --- logging (Bitcoin Core logging) ---
+
+(test rpc-logging-toggles-categories
+  "logging reports every category and enables/disables via include/exclude, with
+all/none and unknown-category handling."
+  (clrhash bitcoin-lisp::*debug-categories*)
+  (unwind-protect
+       (let ((node (make-test-node)))
+         ;; default: all categories present, none enabled
+         (let ((r (bitcoin-lisp.rpc::rpc-logging node nil)))
+           (is (= (length bitcoin-lisp::+log-categories+) (length r)))
+           (is (assoc "net" r :test #'string=))
+           (is (null (cdr (assoc "net" r :test #'string=)))))
+         ;; include enables, leaving others off
+         (let ((r (bitcoin-lisp.rpc::rpc-logging node (list (list "net") nil))))
+           (is (eq t (cdr (assoc "net" r :test #'string=))))
+           (is (null (cdr (assoc "mempool" r :test #'string=)))))
+         ;; exclude disables
+         (let ((r (bitcoin-lisp.rpc::rpc-logging node (list nil (list "net")))))
+           (is (null (cdr (assoc "net" r :test #'string=)))))
+         ;; "all" enables every category
+         (let ((r (bitcoin-lisp.rpc::rpc-logging node (list (list "all") nil))))
+           (is (every (lambda (pair) (eq t (cdr pair))) r)))
+         ;; exclude "all" disables every category
+         (let ((r (bitcoin-lisp.rpc::rpc-logging node (list nil (list "all")))))
+           (is (notany #'cdr r)))
+         ;; unknown category errors
+         (signals bitcoin-lisp.rpc::rpc-error
+           (bitcoin-lisp.rpc::rpc-logging node (list (list "boguscat") nil))))
+    (clrhash bitcoin-lisp::*debug-categories*)))
+
+(test log-cat-respects-category-state
+  "log-cat emits a debug line only when its category is enabled (independent of
+the global level threshold)."
+  (clrhash bitcoin-lisp::*debug-categories*)
+  (unwind-protect
+       (let ((s (make-string-output-stream)))
+         (let ((bitcoin-lisp::*log-stream* s)
+               (bitcoin-lisp::*current-log-level* :info))  ; debug normally hidden
+           (bitcoin-lisp:log-cat "net" "MARKER-DISABLED-~D" 1)   ; off -> nothing
+           (bitcoin-lisp::enable-log-category "net")
+           (bitcoin-lisp:log-cat "net" "MARKER-ENABLED-~D" 2)    ; on -> emitted
+           (bitcoin-lisp:log-cat "mempool" "MARKER-OTHER-~D" 3)) ; still off
+         (let ((out (get-output-stream-string s)))
+           (is (null (search "MARKER-DISABLED" out)))
+           (is (search "MARKER-ENABLED" out))
+           (is (null (search "MARKER-OTHER" out)))))
+    (clrhash bitcoin-lisp::*debug-categories*)))

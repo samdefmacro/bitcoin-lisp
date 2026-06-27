@@ -949,6 +949,8 @@
    #:*current-log-level*
    #:node-log
    #:log-debug
+   #:log-cat
+   #:log-category-enabled-p
    #:log-info
    #:log-warn
    #:log-error
