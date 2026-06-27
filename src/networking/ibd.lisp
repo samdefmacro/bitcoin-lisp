@@ -1669,7 +1669,7 @@ the signal run-ibd uses to rotate to another header-sync peer."
           do (multiple-value-bind (command payload)
                  (receive-message peer :timeout 1)
                (when command
-                 (bitcoin-lisp:log-debug "Pre-sync: received ~A" command)
+                 (bitcoin-lisp:log-cat "net" "Pre-sync: received ~A" command)
                  (handler-case
                      (handle-message peer command payload chain-state nil nil
                                      :recent-rejects recent-rejects)
@@ -1739,7 +1739,7 @@ the signal run-ibd uses to rotate to another header-sync peer."
 
                               (t
                                ;; Handle other messages (ping, sendcmpct, etc.)
-                               (bitcoin-lisp:log-debug "Header sync: received ~A" command)
+                               (bitcoin-lisp:log-cat "net" "Header sync: received ~A" command)
                                (handler-case
                                    (handle-message peer command payload chain-state nil nil
                                                    :recent-rejects recent-rejects)
