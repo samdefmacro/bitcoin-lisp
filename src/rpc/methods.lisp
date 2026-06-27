@@ -58,6 +58,39 @@ matching Bitcoin Core's uint256::GetHex."
                                                     0)))))))
     result))
 
+(defun rpc-getchainstates (node params)
+  "Report this node's chainstate(s) (Bitcoin Core getchainstates). We run a
+single, fully-validated chainstate (no assumeutxo snapshot/background chainstate),
+so `chainstates` always has exactly one entry. Fields mirror Core's
+RPCHelpForChainstate."
+  (declare (ignore params))
+  (let* ((chain-state (rpc-get-chain-state node))
+         (height (bitcoin-lisp.storage:current-height chain-state))
+         (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (syncing (rpc-is-syncing node))
+         (tip (and best-hash
+                   (bitcoin-lisp.storage:get-block-index-entry chain-state best-hash)))
+         (bits (if (and tip (bitcoin-lisp.storage:block-index-entry-header tip))
+                   (bitcoin-lisp.serialization:block-header-bits
+                    (bitcoin-lisp.storage:block-index-entry-header tip))
+                   #x1d00ffff))
+         (chainstate
+           `(("blocks" . ,height)
+             ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
+             ("bits" . ,(string-downcase (format nil "~8,'0x" bits)))
+             ("target" . ,(string-downcase
+                           (format nil "~64,'0x" (bitcoin-lisp.storage:bits-to-target bits))))
+             ("difficulty" . ,(%difficulty-from-bits bits))
+             ;; Consistent with getblockchaininfo: 1.0 at tip, 0.0 while syncing.
+             ("verificationprogress" . ,(if syncing 0.0d0 1.0d0))
+             ;; We don't split a coinsdb vs coinstip cache; report the in-memory
+             ;; coins-cache budget for the tip cache and 0 for the db cache.
+             ("coins_db_cache_bytes" . 0)
+             ("coins_tip_cache_bytes" . ,bitcoin-lisp::*coins-cache-budget-bytes*)
+             ("validated" . t))))
+    `(("headers" . ,height)
+      ("chainstates" . (,chainstate)))))
+
 (defun rpc-getbestblockhash (node params)
   "Return the hash of the best (tip) block."
   (declare (ignore params))
@@ -1247,6 +1280,26 @@ The same dump runs automatically on graceful shutdown."
                         :message "Node has no data directory"))
     (bitcoin-lisp.mempool:save-mempool-file (rpc-get-mempool node) path)
     `(("filename" . ,(namestring path)))))
+
+(defun rpc-importmempool (node params)
+  "Load transactions from a mempool.dat-format file at FILEPATH through the normal
+acceptance path (Bitcoin Core importmempool). PARAMS: (filepath [options]).
+Entries are validated against the current UTXO set; their prioritisation deltas
+are applied. Returns an empty object. The options object is accepted for
+compatibility but ignored — only the default import behavior is implemented
+(apply_fee_delta_priority/use_current_time/apply_unbroadcast_set are no-ops)."
+  (let ((filepath (first params)))
+    (unless (and (stringp filepath) (plusp (length filepath)))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "filepath must be a string"))
+    (let ((path (probe-file filepath)))
+      (unless path
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "Can't open mempool file ~A" filepath)))
+      (unless (bitcoin-lisp::load-mempool-from-disk node path)
+        (error 'rpc-error :code +rpc-misc-error+
+                          :message "Unable to import mempool file (unreadable or corrupt)")))
+    ;; Core returns an empty object; an empty hash-table serializes as {}.
+    (make-hash-table :test 'equal)))
 
 ;;; --- Transaction prioritisation (Bitcoin Core prioritisetransaction) ---
 

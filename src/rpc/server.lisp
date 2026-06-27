@@ -74,6 +74,7 @@
   (register-rpc-method "prioritisetransaction" #'rpc-prioritisetransaction)
   (register-rpc-method "getprioritisedtransactions" #'rpc-getprioritisedtransactions)
   (register-rpc-method "savemempool" #'rpc-savemempool)
+  (register-rpc-method "importmempool" #'rpc-importmempool)
   (register-rpc-method "getmempoolancestors" #'rpc-getmempoolancestors)
   (register-rpc-method "getmempooldescendants" #'rpc-getmempooldescendants)
   (register-rpc-method "gettxspendingprevout" #'rpc-gettxspendingprevout)
@@ -82,6 +83,7 @@
   (register-rpc-method "uptime" #'rpc-uptime)
   (register-rpc-method "getindexinfo" #'rpc-getindexinfo)
   (register-rpc-method "getdeploymentinfo" #'rpc-getdeploymentinfo)
+  (register-rpc-method "getchainstates" #'rpc-getchainstates)
   ;; Operator / control methods
   (register-rpc-method "stop" #'rpc-stop)
   (register-rpc-method "help" #'rpc-help)
