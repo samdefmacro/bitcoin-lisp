@@ -1894,6 +1894,61 @@ string. Routes through the same activate-block consensus path as network blocks.
             ((eq reason :weaker-chain) nil)
             (t (string-downcase (symbol-name reason)))))))))
 
+(defun rpc-submitheader (node params)
+  "Validate and add a block header to the header index (Bitcoin Core
+submitheader). PARAMS: (hexdata) — an 80-byte serialized header. The previous
+header must already be known. Returns null on success (including an already-known
+header); errors if the parent is missing or the header fails validation."
+  (let ((hex (first params)))
+    (unless (and (stringp hex) (plusp (length hex)))
+      (error 'rpc-error :code +rpc-deserialization-error+ :message "Block header decode failed"))
+    (let ((header (handler-case
+                      (let ((bytes (bitcoin-lisp.crypto:hex-to-bytes hex)))
+                        (flexi-streams:with-input-from-sequence (s bytes)
+                          (bitcoin-lisp.serialization::read-block-header s)))
+                    (error ()
+                      (error 'rpc-error :code +rpc-deserialization-error+
+                                        :message "Block header decode failed"))))
+          (chain-state (rpc-get-chain-state node)))
+      (let ((hash (bitcoin-lisp.serialization:block-header-hash header))
+            (prev (bitcoin-lisp.serialization:block-header-prev-block header)))
+        ;; Already known → success (Core returns null).
+        (when (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
+          (return-from rpc-submitheader nil))
+        ;; Parent must be present first (Core's LookupBlockIndex check).
+        (unless (bitcoin-lisp.storage:get-block-index-entry chain-state prev)
+          (error 'rpc-error :code +rpc-verify-error+
+                            :message (format nil "Must submit previous header (~A) first"
+                                             (hash-to-hex prev))))
+        ;; Validate (PoW/MTP/difficulty) then add to the index.
+        (multiple-value-bind (valid err)
+            (bitcoin-lisp.networking::validate-header-chain (list header) chain-state)
+          (unless valid
+            (error 'rpc-error :code +rpc-verify-error+
+                              :message (or err "header validation failed")))
+          (bitcoin-lisp.networking::process-headers valid chain-state))
+        nil))))
+
+(defun %generate-to-script-pubkey (node script-pubkey nblocks maxtries)
+  "Mine NBLOCKS blocks whose coinbase pays SCRIPT-PUBKEY, activating each through
+the normal consensus path. Returns the list of mined block hashes (hex). Shared
+by generatetoaddress and generatetodescriptor."
+  (let ((chain-state (rpc-get-chain-state node))
+        (mempool (rpc-get-mempool node))
+        (hashes '()))
+    (dotimes (i nblocks (nreverse hashes))
+      (let ((block (bitcoin-lisp.mining:assemble-full-block
+                    chain-state mempool :coinbase-script-pubkey script-pubkey)))
+        (unless (bitcoin-lisp.mining:mine-block block :max-tries maxtries)
+          (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
+        (multiple-value-bind (ok reason) (%activate-submitted-block node block)
+          (unless ok
+            (error 'rpc-error :code +rpc-misc-error+
+                              :message (format nil "Mined block rejected: ~A" reason)))
+          (push (hash-to-hex (bitcoin-lisp.serialization:block-header-hash
+                              (bitcoin-lisp.serialization:bitcoin-block-header block)))
+                hashes))))))
+
 (defun rpc-generatetoaddress (node params)
   "Mine NBLOCKS blocks paying to ADDRESS and add them to the chain (Bitcoin Core
 generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
@@ -1912,21 +1967,30 @@ generatetoaddress; CPU mining, intended for regtest). PARAMS: (nblocks address
       (unless script-pubkey
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "Invalid address for ~A" network)))
-      (let ((chain-state (rpc-get-chain-state node))
-            (mempool (rpc-get-mempool node))
-            (hashes '()))
-        (dotimes (i nblocks (nreverse hashes))
-          (let ((block (bitcoin-lisp.mining:assemble-full-block
-                        chain-state mempool :coinbase-script-pubkey script-pubkey)))
-            (unless (bitcoin-lisp.mining:mine-block block :max-tries maxtries)
-              (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
-            (multiple-value-bind (ok reason) (%activate-submitted-block node block)
-              (unless ok
-                (error 'rpc-error :code +rpc-misc-error+
-                                  :message (format nil "Mined block rejected: ~A" reason)))
-              (push (hash-to-hex (bitcoin-lisp.serialization:block-header-hash
-                                  (bitcoin-lisp.serialization:bitcoin-block-header block)))
-                    hashes))))))))
+      (%generate-to-script-pubkey node script-pubkey nblocks maxtries))))
+
+(defun rpc-generatetodescriptor (node params)
+  "Mine NUM-BLOCKS blocks whose coinbase pays the scriptPubKey of DESCRIPTOR
+(Bitcoin Core generatetodescriptor; CPU mining, intended for regtest). PARAMS:
+(num_blocks descriptor [maxtries]). The descriptor must expand to a single
+script. Returns an array of the mined block hashes (hex)."
+  (let ((nblocks (first params))
+        (descriptor (second params))
+        (maxtries (or (third params) 1000000))
+        (network (bitcoin-lisp::node-network node)))
+    (unless (and (integerp nblocks) (plusp nblocks))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "num_blocks must be a positive integer"))
+    (unless (stringp descriptor)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
+    ;; parse-output-descriptor signals rpc-error on a bad descriptor; take the
+    ;; first expanded script (Core's getScriptFromDescriptor).
+    (let* ((pairs (parse-output-descriptor descriptor network))
+           (script-pubkey (caar pairs)))
+      (unless script-pubkey
+        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                          :message "Descriptor does not expand to a script"))
+      (%generate-to-script-pubkey node script-pubkey nblocks maxtries))))
 
 ;;; --- Extended RPC Methods ---
 
