@@ -1921,3 +1921,162 @@ DERSIG+LOW_S)."
                :script-pubkey (coerce (aref spks j) '(simple-array (unsigned-byte 8) (*))))))
       (dotimes (j 5)
         (is-true (%verify-tx-input tx2 j spent "P2SH,WITNESS,NULLDUMMY,DERSIG,LOW_S"))))))
+
+;;; --- createmultisig (Bitcoin Core createmultisig) ---
+;;; Compressed key pair from Core's createmultisig help example.
+
+(defun %cms-keys ()
+  (values "03789ed0bb717d88f7d321a368d905e7430207ebbd82bd342cf11ae157a7ace5fd"
+          "03dbc6764b8884a92e871274b87583e6d5c2a58819473e17e107ef3f6aa5a61626"))
+
+(defun %valid-descriptor-checksum-p (descriptor)
+  "T if DESCRIPTOR ends in #<8 chars> matching descriptor-checksum of the body."
+  (let ((pos (position #\# descriptor)))
+    (and pos
+         (= 8 (- (length descriptor) pos 1))
+         (string= (subseq descriptor (1+ pos))
+                  (bitcoin-lisp.rpc::descriptor-checksum (subseq descriptor 0 pos))))))
+
+(test rpc-createmultisig-legacy-2of2
+  "createmultisig legacy: bare-multisig redeemScript + P2SH address round-trip."
+  (multiple-value-bind (k1 k2) (%cms-keys)
+    (let* ((node (make-test-node))
+           (r (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2))))
+           (redeem-hex (cdr (assoc "redeemScript" r :test #'string=)))
+           (address (cdr (assoc "address" r :test #'string=)))
+           (descriptor (cdr (assoc "descriptor" r :test #'string=))))
+      ;; OP_2 <push k1> <push k2> OP_2 OP_CHECKMULTISIG
+      (is (string= redeem-hex (format nil "5221~A21~A52ae" k1 k2)))
+      (is (eql 0 (search "sh(multi(2," descriptor)))
+      (is-true (%valid-descriptor-checksum-p descriptor))
+      ;; address decodes to P2SH(hash160(redeemScript))
+      (multiple-value-bind (type spk)
+          (bitcoin-lisp.crypto:decode-address address :testnet3)
+        (is (not (null type)))
+        (is (equalp (subseq spk 2 22)
+                    (bitcoin-lisp.crypto:hash160 (bitcoin-lisp.crypto:hex-to-bytes redeem-hex)))))
+      ;; compressed keys -> no warnings
+      (is (null (assoc "warnings" r :test #'string=))))))
+
+(test rpc-createmultisig-bech32-p2wsh
+  "createmultisig bech32: address is P2WSH(sha256(redeemScript))."
+  (multiple-value-bind (k1 k2) (%cms-keys)
+    (let* ((node (make-test-node))
+           (r (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2) "bech32")))
+           (redeem-hex (cdr (assoc "redeemScript" r :test #'string=)))
+           (address (cdr (assoc "address" r :test #'string=)))
+           (descriptor (cdr (assoc "descriptor" r :test #'string=))))
+      (is (eql 0 (search "wsh(multi(2," descriptor)))
+      (is-true (%valid-descriptor-checksum-p descriptor))
+      (multiple-value-bind (type spk)
+          (bitcoin-lisp.crypto:decode-address address :testnet3)
+        (is (not (null type)))
+        (is (equalp (subseq spk 2 34)
+                    (bitcoin-lisp.crypto:sha256 (bitcoin-lisp.crypto:hex-to-bytes redeem-hex))))))))
+
+(test rpc-createmultisig-p2sh-segwit
+  "createmultisig p2sh-segwit: address is P2SH(P2WSH(redeemScript))."
+  (multiple-value-bind (k1 k2) (%cms-keys)
+    (let* ((node (make-test-node))
+           (r (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2) "p2sh-segwit")))
+           (redeem-hex (cdr (assoc "redeemScript" r :test #'string=)))
+           (address (cdr (assoc "address" r :test #'string=)))
+           (descriptor (cdr (assoc "descriptor" r :test #'string=))))
+      (is (eql 0 (search "sh(wsh(multi(2," descriptor)))
+      (is-true (%valid-descriptor-checksum-p descriptor))
+      (multiple-value-bind (type spk)
+          (bitcoin-lisp.crypto:decode-address address :testnet3)
+        (is (not (null type)))
+        (let* ((redeem (bitcoin-lisp.crypto:hex-to-bytes redeem-hex))
+               (p2wsh (concatenate '(vector (unsigned-byte 8))
+                                   #(#x00 #x20) (bitcoin-lisp.crypto:sha256 redeem))))
+          (is (equalp (subseq spk 2 22) (bitcoin-lisp.crypto:hash160 p2wsh))))))))
+
+(test rpc-createmultisig-uncompressed-forces-legacy
+  "An uncompressed key forces legacy output + a warning when bech32 was asked."
+  (let* ((node (make-test-node))
+         ;; Uncompressed (65-byte, 0x04) form of the generator point G.
+         (kc "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+         (ku (concatenate 'string
+                          "04"
+                          "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                          "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8"))
+         (r (bitcoin-lisp.rpc::rpc-createmultisig node (list 1 (list kc ku) "bech32")))
+         (address (cdr (assoc "address" r :test #'string=)))
+         (warnings (cdr (assoc "warnings" r :test #'string=))))
+    ;; Forced to legacy -> P2SH address, and a warning is present.
+    (is (not (null warnings)))
+    (multiple-value-bind (type) (bitcoin-lisp.crypto:decode-address address :testnet3)
+      (is (not (null type))))))
+
+(test rpc-createmultisig-errors
+  "createmultisig parameter and key validation errors."
+  (multiple-value-bind (k1 k2) (%cms-keys)
+    (let ((node (make-test-node)))
+      ;; not enough keys for the threshold
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-createmultisig node (list 3 (list k1 k2))))
+      ;; nrequired < 1
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-createmultisig node (list 0 (list k1))))
+      ;; too many keys (> 20)
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-createmultisig node (list 1 (make-list 21 :initial-element k1))))
+      ;; bech32m explicitly rejected
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2) "bech32m")))
+      ;; unknown address type
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-createmultisig node (list 2 (list k1 k2) "p2tr")))
+      ;; invalid public key
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-createmultisig node (list 1 (list "00")))))))
+
+;;; --- ping (Bitcoin Core ping) ---
+
+(test rpc-ping-no-peers
+  "ping with no connected peers returns null and does not error."
+  (let ((node (make-test-node)))
+    (is (null (bitcoin-lisp.rpc::rpc-ping node nil)))))
+
+;;; --- getaddrmaninfo (Bitcoin Core getaddrmaninfo) ---
+
+(test rpc-getaddrmaninfo-empty
+  "getaddrmaninfo lists every standard network + all_networks, all zero when the
+node has no address book."
+  (let* ((node (make-test-node))
+         (r (bitcoin-lisp.rpc::rpc-getaddrmaninfo node nil)))
+    (dolist (n '("ipv4" "ipv6" "onion" "i2p" "cjdns" "all_networks"))
+      (let ((obj (cdr (assoc n r :test #'string=))))
+        (is (not (null obj)) "network ~A present" n)
+        (is (= 0 (cdr (assoc "new" obj :test #'string=))))
+        (is (= 0 (cdr (assoc "tried" obj :test #'string=))))
+        (is (= 0 (cdr (assoc "total" obj :test #'string=))))))))
+
+(test rpc-getaddrmaninfo-classifies-ipv4
+  "Added routable IPv4 addresses land in the ipv4 new table and the
+all_networks aggregate; counts stay consistent with the address book."
+  (let* ((node (make-test-node))
+         (book (bitcoin-lisp.networking::make-address-book)))
+    (setf (bitcoin-lisp::node-address-book node) book)
+    (bitcoin-lisp.networking::address-book-add
+     book (bitcoin-lisp.networking::make-peer-address
+           :ip (bitcoin-lisp.networking::string-to-ip-bytes "1.2.3.4") :port 8333))
+    (bitcoin-lisp.networking::address-book-add
+     book (bitcoin-lisp.networking::make-peer-address
+           :ip (bitcoin-lisp.networking::string-to-ip-bytes "5.6.7.8") :port 8333))
+    (let* ((n-new (bitcoin-lisp.networking::address-book-n-new book))
+           (r (bitcoin-lisp.rpc::rpc-getaddrmaninfo node nil))
+           (ipv4 (cdr (assoc "ipv4" r :test #'string=)))
+           (all (cdr (assoc "all_networks" r :test #'string=))))
+      (is (>= n-new 1))
+      ;; All added addresses are IPv4, so the ipv4 bucket captures exactly them.
+      (is (= n-new (cdr (assoc "new" ipv4 :test #'string=))))
+      (is (= 0 (cdr (assoc "tried" ipv4 :test #'string=))))
+      (is (= n-new (cdr (assoc "total" ipv4 :test #'string=))))
+      ;; all_networks mirrors the book's authoritative counts.
+      (is (= n-new (cdr (assoc "new" all :test #'string=))))
+      (is (= n-new (cdr (assoc "total" all :test #'string=))))
+      ;; Nothing classified as a non-IPv4 network.
+      (let ((ipv6 (cdr (assoc "ipv6" r :test #'string=))))
+        (is (= 0 (cdr (assoc "total" ipv6 :test #'string=))))))))
