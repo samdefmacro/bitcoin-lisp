@@ -2033,6 +2033,103 @@ script. Returns an array of the mined block hashes (hex)."
                           :message "Descriptor does not expand to a script"))
       (%generate-to-script-pubkey node script-pubkey nblocks maxtries))))
 
+(defun %resolve-coinbase-output-script (output network)
+  "scriptPubKey for generateblock's OUTPUT — a descriptor (tried first, like
+Core's getScriptFromDescriptor) or an address. Signals rpc-error if neither."
+  (or (handler-case (caar (parse-output-descriptor output network))
+        (rpc-error () nil))
+      (handler-case
+          (multiple-value-bind (type spk) (bitcoin-lisp.crypto:decode-address output network)
+            (and type spk))
+        (error () nil))
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message "Error: Invalid address or descriptor")))
+
+(defun %resolve-generateblock-tx (node s)
+  "Resolve a generateblock tx entry S: a 64-hex txid is looked up in the mempool,
+otherwise S is decoded as a raw transaction (Bitcoin Core generateblock)."
+  (unless (stringp s)
+    (error 'rpc-error :code +rpc-deserialization-error+ :message "Transaction must be a hex string"))
+  (if (valid-hex-hash-p s)
+      (let* ((mempool (rpc-get-mempool node))
+             (entry (and mempool (bitcoin-lisp.mempool:mempool-get
+                                  mempool (parse-hex-hash s)))))
+        (unless entry
+          (error 'rpc-error :code +rpc-invalid-address-or-key+
+                            :message (format nil "Transaction ~A not in mempool." s)))
+        (bitcoin-lisp.mempool:mempool-entry-transaction entry))
+      (handler-case
+          (bitcoin-lisp.serialization:parse-tx-payload (bitcoin-lisp.crypto:hex-to-bytes s))
+        (error ()
+          (error 'rpc-error :code +rpc-deserialization-error+
+                            :message (format nil "Transaction decode failed for ~A" s))))))
+
+(defun %witness-commitment-script-for-txs (txs)
+  "BIP141 witness-commitment scriptPubKey over a block whose coinbase wtxid is
+zero and whose remaining transactions are TXS (Core GenerateCoinbaseCommitment)."
+  (let* ((zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (wtxids (cons zeros (mapcar #'bitcoin-lisp.serialization:transaction-wtxid txs)))
+         (witness-root (bitcoin-lisp.validation:compute-merkle-root wtxids))
+         (combined (make-array 64 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (replace combined witness-root)
+    (bitcoin-lisp.mining:build-witness-commitment-script
+     (bitcoin-lisp.crypto:hash256 combined))))
+
+(defun rpc-generateblock (node params)
+  "Mine a single block containing exactly the given transactions (Bitcoin Core
+generateblock; CPU mining, intended for regtest). PARAMS: (output [tx,...]
+[submit]). OUTPUT is an address or descriptor for the coinbase, which is paid the
+block subsidy only (Core builds the template with use_mempool=false). Each tx is a
+64-hex mempool txid or a raw-tx hex. When SUBMIT (default true) the block is
+activated through the normal consensus path and {hash} is returned; otherwise it
+is returned as {hash, hex} WITHOUT validation (our validation is coupled to
+activation)."
+  (let ((output (first params))
+        (txs-arg (second params))
+        (submit (if (>= (length params) 3) (and (third params) t) t))
+        (network (bitcoin-lisp::node-network node)))
+    (unless (stringp output)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "output must be a string"))
+    (unless (listp txs-arg)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "transactions must be an array"))
+    (let* ((script-pubkey (%resolve-coinbase-output-script output network))
+           (txs (mapcar (lambda (s) (%resolve-generateblock-tx node s)) txs-arg))
+           (chain-state (rpc-get-chain-state node))
+           (mempool (rpc-get-mempool node))
+           ;; Reuse the assembler only for header fields (height/prev/bits/version/
+           ;; time); its tx selection and coinbase value are ignored.
+           (template (bitcoin-lisp.mining:assemble-block-template chain-state mempool))
+           (height (bitcoin-lisp.mining:block-template-height template))
+           (coinbase (bitcoin-lisp.mining:build-coinbase-transaction
+                      height
+                      (bitcoin-lisp.validation:calculate-block-subsidy height)
+                      :script-pubkey script-pubkey
+                      :witness-commitment-script (%witness-commitment-script-for-txs txs)))
+           (all-txs (cons coinbase txs))
+           (merkle (bitcoin-lisp.validation:compute-merkle-root
+                    (mapcar #'bitcoin-lisp.serialization:transaction-hash all-txs)))
+           (header (bitcoin-lisp.serialization:make-block-header
+                    :version (bitcoin-lisp.mining:block-template-version template)
+                    :prev-block (bitcoin-lisp.mining:block-template-prev-hash template)
+                    :merkle-root merkle
+                    :timestamp (bitcoin-lisp.mining:block-template-curtime template)
+                    :bits (bitcoin-lisp.mining:block-template-bits template)
+                    :nonce 0))
+           (block (bitcoin-lisp.serialization:make-bitcoin-block
+                   :header header :transactions all-txs)))
+      (unless (bitcoin-lisp.mining:mine-block block)
+        (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
+      (let ((hash-hex (hash-to-hex (bitcoin-lisp.serialization:block-header-hash header))))
+        (if submit
+            (multiple-value-bind (ok reason) (%activate-submitted-block node block)
+              (unless (or ok (eq reason :weaker-chain))
+                (error 'rpc-error :code +rpc-verify-error+
+                                  :message (format nil "TestBlockValidity failed: ~A" reason)))
+              `(("hash" . ,hash-hex)))
+            `(("hash" . ,hash-hex)
+              ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                         (bitcoin-lisp.serialization:serialize-witness-block block)))))))))
+
 ;;; --- Extended RPC Methods ---
 
 (defconstant +rpc-deserialization-error+ -22
