@@ -16,6 +16,7 @@
 (defconstant +rpc-invalid-parameter+ -8)
 (defconstant +rpc-client-node-already-added+ -23)
 (defconstant +rpc-client-node-not-added+ -24)
+(defconstant +rpc-verify-error+ -25)
 
 ;;; --- RPC Error Condition ---
 
@@ -121,7 +122,9 @@
   (register-rpc-method "getblocktemplate" #'rpc-getblocktemplate)
   (register-rpc-method "getmininginfo" #'rpc-getmininginfo)
   (register-rpc-method "submitblock" #'rpc-submitblock)
+  (register-rpc-method "submitheader" #'rpc-submitheader)
   (register-rpc-method "generatetoaddress" #'rpc-generatetoaddress)
+  (register-rpc-method "generatetodescriptor" #'rpc-generatetodescriptor)
   ;; Raw transaction methods
   (register-rpc-method "decoderawtransaction" #'rpc-decoderawtransaction)
   (register-rpc-method "getrawtransaction" #'rpc-getrawtransaction)
