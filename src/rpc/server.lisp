@@ -97,6 +97,7 @@
   (register-rpc-method "addnode" #'rpc-addnode)
   (register-rpc-method "getaddednodeinfo" #'rpc-getaddednodeinfo)
   (register-rpc-method "setnetworkactive" #'rpc-setnetworkactive)
+  (register-rpc-method "getblockfrompeer" #'rpc-getblockfrompeer)
   (register-rpc-method "disconnectnode" #'rpc-disconnectnode)
   (register-rpc-method "getnettotals" #'rpc-getnettotals)
   ;; Manual ban management

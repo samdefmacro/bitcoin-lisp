@@ -2214,3 +2214,50 @@ missing file or non-string path errors."
     ;; non-string filepath
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-importmempool node (list 123)))))
+
+;;; --- peer id (getpeerinfo) + getblockfrompeer ---
+
+(test rpc-getpeerinfo-includes-id
+  "getpeerinfo exposes a numeric peer id (Bitcoin Core's CNode::id)."
+  (let ((node (make-test-node)))
+    (push (%rpc-fake-peer "1.2.3.4") (bitcoin-lisp::node-peers node))
+    (let ((info (first (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))))
+      (is (integerp (cdr (assoc "id" info :test #'string=)))))))
+
+(test rpc-getblockfrompeer-paths
+  "getblockfrompeer validates header/peer and dispatches a witness-block getdata."
+  (let* ((bitcoin-lisp::*prune-target-mib* nil)   ; deterministic: pruning off
+         (node (make-test-node))
+         (cs (bitcoin-lisp::node-chain-state node))
+         (store-dir (ensure-directories-exist
+                     (merge-pathnames "bl-gbfp-test/" (uiop:temporary-directory))))
+         (store (bitcoin-lisp.storage:init-block-store store-dir))
+         (hdr (bitcoin-lisp.serialization:make-block-header
+               :version 1
+               :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+               :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+               :timestamp 1 :bits #x1d00ffff :nonce 0))
+         (hash (bitcoin-lisp.serialization:block-header-hash hdr))
+         (hash-hex (bitcoin-lisp.rpc::hash-to-hex hash)))
+    (setf (bitcoin-lisp::node-block-store node) store)
+    ;; header not in index yet → "Block header missing"
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockfrompeer node (list hash-hex 1)))
+    ;; register the header
+    (bitcoin-lisp.storage:add-block-index-entry
+     cs (bitcoin-lisp.storage:make-block-index-entry
+         :hash hash :height 1 :header hdr :status :header-valid :chain-work 1))
+    ;; no peer with that id → "Peer does not exist"
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockfrompeer node (list hash-hex 999999)))
+    ;; connected peer by id → returns {} (empty hash-table); send is a no-op on
+    ;; the fake peer's nil connection.
+    (let ((peer (%rpc-fake-peer "1.2.3.4")))
+      (push peer (bitcoin-lisp::node-peers node))
+      (let ((r (bitcoin-lisp.rpc::rpc-getblockfrompeer
+                node (list hash-hex (bitcoin-lisp.networking::peer-id peer)))))
+        (is (hash-table-p r))
+        (is (= 0 (hash-table-count r)))))
+    ;; bad peer_id type → error
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockfrompeer node (list hash-hex "notanint")))))

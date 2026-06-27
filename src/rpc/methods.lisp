@@ -398,7 +398,8 @@ is supplied and the script is addressable) address."
                      (conn (bitcoin-lisp.networking::peer-connection peer))
                      (ping (bitcoin-lisp.networking::peer-ping-latency peer))
                      (sh (or (bitcoin-lisp::peer-start-height peer) -1)))
-                `(("addr" . ,(bitcoin-lisp::peer-address peer))
+                `(("id" . ,(bitcoin-lisp.networking::peer-id peer))
+                  ("addr" . ,(bitcoin-lisp::peer-address peer))
                   ("version" . ,(if vmsg
                                     (bitcoin-lisp.serialization:version-message-version vmsg)
                                     0))
@@ -957,6 +958,46 @@ connections until re-enabled. Returns the new state."
                       (copy-list (bitcoin-lisp::node-peers node))))
         (ignore-errors (bitcoin-lisp.networking:disconnect-peer peer))))
     state))
+
+(defun rpc-getblockfrompeer (node params)
+  "Request block BLOCKHASH from the connected peer with id PEER-ID (Bitcoin Core
+getblockfrompeer). PARAMS: (blockhash peer_id). We must already have the header,
+the block must not already be downloaded, and the peer must be connected. Sends a
+getdata(MSG_WITNESS_BLOCK) to that peer; the block arrives through the normal
+block-processing path. Returns an empty object. The per-connection send lock makes
+the cross-thread send safe."
+  (let ((blockhash-hex (first params))
+        (peer-id (second params)))
+    (unless (and (stringp blockhash-hex) (valid-hex-hash-p blockhash-hex))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "blockhash must be a hex string"))
+    (unless (integerp peer-id)
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "peer_id must be an integer"))
+    (let* ((hash (parse-hex-hash blockhash-hex))
+           (chain-state (rpc-get-chain-state node))
+           (block-store (rpc-get-block-store node))
+           (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+      (unless entry
+        (error 'rpc-error :code +rpc-misc-error+ :message "Block header missing"))
+      (when (and (bitcoin-lisp:pruning-enabled-p)
+                 (> (bitcoin-lisp.storage:block-index-entry-height entry)
+                    (bitcoin-lisp.storage:current-height chain-state)))
+        (error 'rpc-error :code +rpc-misc-error+
+                          :message "In prune mode, only blocks that the node has already synced previously can be fetched from a peer"))
+      (when (and block-store (bitcoin-lisp.storage:block-exists-p block-store hash))
+        (error 'rpc-error :code +rpc-misc-error+ :message "Block already downloaded"))
+      (let ((peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                    (find peer-id (bitcoin-lisp::node-peers node)
+                          :key #'bitcoin-lisp.networking::peer-id))))
+        (unless peer
+          (error 'rpc-error :code +rpc-misc-error+ :message "Peer does not exist"))
+        (bitcoin-lisp.networking:send-message
+         peer
+         (bitcoin-lisp.serialization:make-getdata-message
+          (list (bitcoin-lisp.serialization:make-inv-vector
+                 :type bitcoin-lisp.serialization:+inv-type-witness-block+
+                 :hash hash)))))
+      ;; Core returns an empty object; an empty hash-table serializes as {}.
+      (make-hash-table :test 'equal))))
 
 (defun rpc-disconnectnode (node params)
   "Disconnect a connected peer by ADDRESS (Bitcoin Core disconnectnode). Returns
