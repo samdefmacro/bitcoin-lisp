@@ -12,7 +12,11 @@
   (connected nil :type boolean)
   (last-activity 0 :type integer)
   (bytes-sent 0 :type integer)
-  (bytes-received 0 :type integer))
+  (bytes-received 0 :type integer)
+  ;; Serializes writes to this socket: the sync thread and RPC-thread senders
+  ;; (ping, getblockfrompeer) can both call send-bytes, and interleaved
+  ;; write-sequence calls would corrupt the wire framing.
+  (send-lock (bt:make-lock "conn-send")))
 
 ;;; Node-wide cumulative byte counters (survive individual connection
 ;;; lifetimes), for getnettotals. Bumped on every send/receive. Plain incf —
@@ -127,8 +131,10 @@ Returns the number of bytes sent or NIL on failure."
   (handler-case
       (let ((stream (connection-stream conn)))
         (when stream
-          (write-sequence bytes stream)
-          (force-output stream)
+          ;; One writer at a time: a whole message must hit the socket atomically.
+          (bt:with-lock-held ((connection-send-lock conn))
+            (write-sequence bytes stream)
+            (force-output stream))
           (incf (connection-bytes-sent conn) (length bytes))
           (incf *total-bytes-sent* (length bytes))
           (setf (connection-last-activity conn) (get-universal-time))
