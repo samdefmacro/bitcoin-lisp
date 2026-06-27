@@ -64,6 +64,7 @@
   (register-rpc-method "getpeerinfo" #'rpc-getpeerinfo)
   (register-rpc-method "getnetworkinfo" #'rpc-getnetworkinfo)
   (register-rpc-method "getconnectioncount" #'rpc-getconnectioncount)
+  (register-rpc-method "ping" #'rpc-ping)
   ;; Mempool
   (register-rpc-method "getmempoolinfo" #'rpc-getmempoolinfo)
   (register-rpc-method "getrawmempool" #'rpc-getrawmempool)
@@ -87,6 +88,7 @@
   (register-rpc-method "getnetworkhashps" #'rpc-getnetworkhashps)
   ;; Peer / address methods
   (register-rpc-method "getnodeaddresses" #'rpc-getnodeaddresses)
+  (register-rpc-method "getaddrmaninfo" #'rpc-getaddrmaninfo)
   (register-rpc-method "disconnectnode" #'rpc-disconnectnode)
   (register-rpc-method "getnettotals" #'rpc-getnettotals)
   ;; Manual ban management
@@ -120,6 +122,7 @@
   ;; Utility methods
   (register-rpc-method "estimatesmartfee" #'rpc-estimatesmartfee)
   (register-rpc-method "validateaddress" #'rpc-validateaddress)
+  (register-rpc-method "createmultisig" #'rpc-createmultisig)
   (register-rpc-method "decodescript" #'rpc-decodescript)
   (register-rpc-method "signmessagewithprivkey" #'rpc-signmessagewithprivkey)
   (register-rpc-method "verifymessage" #'rpc-verifymessage)
