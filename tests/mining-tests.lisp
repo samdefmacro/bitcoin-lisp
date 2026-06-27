@@ -321,3 +321,67 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
      ;; malformed hex → deserialization error
      (signals bitcoin-lisp.rpc::rpc-error
        (bitcoin-lisp.rpc::rpc-submitheader node (list "zz"))))))
+
+(test generateblock-empty-submit-advances-chain
+  ;; generateblock with no extra txs mines an empty block to the descriptor
+  ;; output and (submit=true) advances the chain.
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "genblk"))
+          (r (bitcoin-lisp.rpc::rpc-generateblock node (list "raw(51)" '()))))
+     (is (stringp (cdr (assoc "hash" r :test #'string=))))
+     (is (null (assoc "hex" r :test #'string=)))   ; no hex when submitted
+     (is (= 1 (bitcoin-lisp.storage:current-height
+               (bitcoin-lisp::node-chain-state node))))
+     (is (string= (cdr (assoc "hash" r :test #'string=))
+                  (bitcoin-lisp.rpc::hash-to-hex
+                   (bitcoin-lisp.storage:best-block-hash
+                    (bitcoin-lisp::node-chain-state node))))))))
+
+(test generateblock-no-submit-returns-hex-without-advancing
+  ;; submit=false returns {hash, hex} and does NOT change the tip.
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "genblk-ns"))
+          (h0 (bitcoin-lisp.storage:current-height (bitcoin-lisp::node-chain-state node)))
+          (r (bitcoin-lisp.rpc::rpc-generateblock node (list "raw(51)" '() nil))))
+     (is (stringp (cdr (assoc "hash" r :test #'string=))))
+     (is (stringp (cdr (assoc "hex" r :test #'string=))))
+     ;; the hex round-trips to a block whose header hashes to the reported hash
+     (let* ((bytes (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" r :test #'string=))))
+            (blk (flexi-streams:with-input-from-sequence (s bytes)
+                   (bitcoin-lisp.serialization:read-bitcoin-block s))))
+       (is (string= (cdr (assoc "hash" r :test #'string=))
+                    (bitcoin-lisp.rpc::hash-to-hex
+                     (bitcoin-lisp.serialization:block-header-hash
+                      (bitcoin-lisp.serialization:bitcoin-block-header blk))))))
+     ;; tip unchanged
+     (is (= h0 (bitcoin-lisp.storage:current-height
+                (bitcoin-lisp::node-chain-state node)))))))
+
+(test generateblock-includes-raw-tx-and-rejects-bad-output
+  ;; A raw (non-coinbase) tx is included and the witness commitment is computed
+  ;; over it (submit=false, so consensus validity isn't required); a bogus output
+  ;; errors.
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "genblk-tx"))
+          (tx (bitcoin-lisp.serialization:make-transaction
+               :version 1
+               :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                  :hash (%zeros 32) :index 0)
+                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                :sequence #xffffffff))
+               :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                 :value 1000
+                                 :script-pubkey (coerce #(#x51) '(vector (unsigned-byte 8)))))
+               :lock-time 0))
+          (tx-hex (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.serialization:serialize-transaction tx)))
+          (r (bitcoin-lisp.rpc::rpc-generateblock node (list "raw(51)" (list tx-hex) nil)))
+          (blk (flexi-streams:with-input-from-sequence
+                   (s (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" r :test #'string=))))
+                 (bitcoin-lisp.serialization:read-bitcoin-block s))))
+     ;; coinbase + the one supplied tx
+     (is (= 2 (length (bitcoin-lisp.serialization:bitcoin-block-transactions blk))))
+     ;; bogus output (neither address nor descriptor) errors
+     (signals bitcoin-lisp.rpc::rpc-error
+       (bitcoin-lisp.rpc::rpc-generateblock node (list "not-an-output" '()))))))

@@ -126,6 +126,7 @@
   (register-rpc-method "submitheader" #'rpc-submitheader)
   (register-rpc-method "generatetoaddress" #'rpc-generatetoaddress)
   (register-rpc-method "generatetodescriptor" #'rpc-generatetodescriptor)
+  (register-rpc-method "generateblock" #'rpc-generateblock)
   ;; Raw transaction methods
   (register-rpc-method "decoderawtransaction" #'rpc-decoderawtransaction)
   (register-rpc-method "getrawtransaction" #'rpc-getrawtransaction)
