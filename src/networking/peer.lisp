@@ -7,8 +7,18 @@
 (deftype peer-state ()
   '(member :disconnected :connecting :connected :handshaking :ready :banned))
 
+;;; Monotonic per-node peer ids (Bitcoin Core CNode::id), assigned at peer
+;;; creation. Exposed via getpeerinfo "id" and used by getblockfrompeer to name a
+;;; peer. Lock-guarded because outbound (sync thread) and inbound (listener
+;;; thread) peers are created concurrently.
+(defvar *peer-id-counter* 0)
+(defvar *peer-id-lock* (bt:make-lock "peer-id"))
+(defun next-peer-id ()
+  (bt:with-lock-held (*peer-id-lock*) (incf *peer-id-counter*)))
+
 (defstruct peer
   "A Bitcoin peer."
+  (id (next-peer-id) :type integer)
   (connection nil :type (or null connection))
   (state :disconnected :type peer-state)
   (version nil)  ; Received version message
