@@ -14,6 +14,8 @@
 (defconstant +rpc-misc-error+ -1)
 (defconstant +rpc-invalid-address-or-key+ -5)
 (defconstant +rpc-invalid-parameter+ -8)
+(defconstant +rpc-client-node-already-added+ -23)
+(defconstant +rpc-client-node-not-added+ -24)
 
 ;;; --- RPC Error Condition ---
 
@@ -89,6 +91,9 @@
   ;; Peer / address methods
   (register-rpc-method "getnodeaddresses" #'rpc-getnodeaddresses)
   (register-rpc-method "getaddrmaninfo" #'rpc-getaddrmaninfo)
+  (register-rpc-method "addnode" #'rpc-addnode)
+  (register-rpc-method "getaddednodeinfo" #'rpc-getaddednodeinfo)
+  (register-rpc-method "setnetworkactive" #'rpc-setnetworkactive)
   (register-rpc-method "disconnectnode" #'rpc-disconnectnode)
   (register-rpc-method "getnettotals" #'rpc-getnettotals)
   ;; Manual ban management

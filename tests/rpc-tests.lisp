@@ -2080,3 +2080,93 @@ all_networks aggregate; counts stay consistent with the address book."
       ;; Nothing classified as a non-IPv4 network.
       (let ((ipv6 (cdr (assoc "ipv6" r :test #'string=))))
         (is (= 0 (cdr (assoc "total" ipv6 :test #'string=))))))))
+
+;;; --- addnode / getaddednodeinfo / setnetworkactive ---
+
+(defun %rpc-fake-peer (address &key inbound)
+  "A peer struct usable in node-peers for RPC tests (no live connection)."
+  (bitcoin-lisp.networking::make-peer
+   :address address :state :ready :connection nil :inbound inbound))
+
+(test parse-node-endpoint-forms
+  "parse-node-endpoint splits host/host:port/[ipv6]:port, defaulting the port."
+  (let ((node (make-test-node)))               ; testnet3 default P2P port 18333
+    (flet ((p (spec) (multiple-value-list (bitcoin-lisp::parse-node-endpoint node spec))))
+      (is (equal (p "1.2.3.4") '("1.2.3.4" 18333)))
+      (is (equal (p "1.2.3.4:8333") '("1.2.3.4" 8333)))
+      (is (equal (p "seed.example.com") '("seed.example.com" 18333)))
+      (is (equal (p "[2001:db8::1]:8333") '("2001:db8::1" 8333)))
+      (is (equal (p "[2001:db8::1]") '("2001:db8::1" 18333)))
+      ;; A bare IPv6 (multiple colons, no brackets) is treated as host-only.
+      (is (equal (p "2001:db8::1") '("2001:db8::1" 18333))))))
+
+(test rpc-addnode-add-remove-onetry
+  "addnode mutates the node's added-nodes / pending-onetry state machine."
+  (let ((node (make-test-node)))
+    ;; add
+    (is (null (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4:18333" "add"))))
+    (is (member "1.2.3.4:18333" (bitcoin-lisp::node-added-nodes node) :test #'string=))
+    ;; duplicate add errors
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4:18333" "add")))
+    ;; onetry queues a one-shot dial without touching added-nodes
+    (is (null (bitcoin-lisp.rpc::rpc-addnode node '("9.9.9.9" "onetry"))))
+    (is (member "9.9.9.9" (bitcoin-lisp::node-pending-onetry node) :test #'string=))
+    (is (not (member "9.9.9.9" (bitcoin-lisp::node-added-nodes node) :test #'string=)))
+    ;; remove
+    (is (null (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4:18333" "remove"))))
+    (is (not (member "1.2.3.4:18333" (bitcoin-lisp::node-added-nodes node) :test #'string=)))
+    ;; remove of a node never added errors
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4:18333" "remove")))
+    ;; bad command + non-string node error
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4" "frobnicate")))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-addnode node '(42 "add")))))
+
+(test rpc-getaddednodeinfo-reports-state
+  "getaddednodeinfo reports each added node + whether a matching peer is live."
+  (let ((node (make-test-node)))
+    (bitcoin-lisp.rpc::rpc-addnode node '("1.2.3.4" "add"))
+    (bitcoin-lisp.rpc::rpc-addnode node '("5.6.7.8:18333" "add"))
+    ;; Mark 1.2.3.4 connected with an outbound peer.
+    (push (%rpc-fake-peer "1.2.3.4") (bitcoin-lisp::node-peers node))
+    (let ((r (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil)))
+      (is (= 2 (length r)))
+      (let ((a (find "1.2.3.4" r :key (lambda (e) (cdr (assoc "addednode" e :test #'string=)))
+                     :test #'string=))
+            (b (find "5.6.7.8:18333" r :key (lambda (e) (cdr (assoc "addednode" e :test #'string=)))
+                     :test #'string=)))
+        (is (eq t (cdr (assoc "connected" a :test #'string=))))
+        (is (null (cdr (assoc "connected" b :test #'string=))))
+        ;; connected node carries one outbound address entry
+        (let ((addrs (cdr (assoc "addresses" a :test #'string=))))
+          (is (= 1 (length addrs)))
+          (is (string= "1.2.3.4" (cdr (assoc "address" (first addrs) :test #'string=))))
+          (is (string= "outbound" (cdr (assoc "connected" (first addrs) :test #'string=)))))
+        ;; unconnected node has no address entries
+        (is (null (cdr (assoc "addresses" b :test #'string=))))))
+    ;; filtering for a never-added node errors
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getaddednodeinfo node '("10.0.0.1")))))
+
+(test rpc-setnetworkactive-toggles-and-drops-peers
+  "setnetworkactive flips node-network-active and drops peers when disabling."
+  (let ((node (make-test-node))
+        (peer (%rpc-fake-peer "1.2.3.4")))
+    (push peer (bitcoin-lisp::node-peers node))
+    (is (bitcoin-lisp::node-network-active node))      ; default enabled
+    ;; disable
+    (is (null (bitcoin-lisp.rpc::rpc-setnetworkactive node '(nil))))
+    (is (null (bitcoin-lisp::node-network-active node)))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+    ;; getnetworkinfo reflects the disabled state
+    (is (null (cdr (assoc "networkactive"
+                          (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil) :test #'string=))))
+    ;; re-enable
+    (is (eq t (bitcoin-lisp.rpc::rpc-setnetworkactive node '(t))))
+    (is (bitcoin-lisp::node-network-active node))
+    ;; missing state errors
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-setnetworkactive node '()))))
