@@ -3104,3 +3104,301 @@ Returns the height of the last pruned block."
       ;; Return the last pruned block height (matching Bitcoin Core).
       ;; Note: getblockchaininfo.pruneheight returns (1+ this) = first UNpruned block.
       (bitcoin-lisp.storage:chain-state-pruned-height chain-state))))
+
+;;; --- BIP157/158 block filter RPCs ---
+
+(defun rpc-getblockfilter (node params)
+  "Return the BIP157 basic filter and filter header for a block.
+PARAMS: (blockhash [filtertype]). Mirrors Bitcoin Core getblockfilter."
+  (let* ((blockhash-hex (first params))
+         (filtertype (or (second params) "basic"))
+         (hash (and (stringp blockhash-hex) (parse-hex-hash blockhash-hex))))
+    (unless hash
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message "blockhash must be a hex string of length 64"))
+    (unless (string-equal filtertype "basic")
+      (error 'rpc-error :code +rpc-invalid-address-or-key+
+                        :message (format nil "Unknown filtertype ~A" filtertype)))
+    (let ((bfi (rpc-get-blockfilterindex node)))
+      (unless (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
+        (error 'rpc-error :code +rpc-misc-error+
+                          :message "Index is not enabled for filtertype basic"))
+      (unless (bitcoin-lisp.storage:get-block-index-entry (rpc-get-chain-state node) hash)
+        (error 'rpc-error :code +rpc-invalid-address-or-key+ :message "Block not found"))
+      (multiple-value-bind (filter header)
+          (bitcoin-lisp.storage:blockfilterindex-get bfi hash)
+        (unless filter
+          (error 'rpc-error :code +rpc-misc-error+
+                            :message "Could not find block filter for the given block"))
+        `(("filter" . ,(bitcoin-lisp.crypto:bytes-to-hex filter))
+          ("header" . ,(hash-to-hex header)))))))
+
+;;; scanblocks — return blockhashes whose filters match a descriptor set.
+
+(defvar *scanblocks-lock* (bt:make-lock "scanblocks"))
+(defvar *scanblocks-running* nil)
+(defvar *scanblocks-progress* 0)
+(defvar *scanblocks-current-height* 0)
+(defvar *scanblocks-abort* nil)
+
+(defun %reserve-scanblocks ()
+  (bt:with-lock-held (*scanblocks-lock*)
+    (if *scanblocks-running*
+        nil
+        (setf *scanblocks-abort* nil *scanblocks-progress* 0
+              *scanblocks-current-height* 0 *scanblocks-running* t))))
+
+(defun %release-scanblocks ()
+  (bt:with-lock-held (*scanblocks-lock*)
+    (setf *scanblocks-running* nil)))
+
+(defun %needle-scripts (scanobjects network)
+  "Expand SCANOBJECTS (descriptor strings/objects) into an equalp hash-table
+mapping each script (byte vector) to its canonical descriptor."
+  (let ((needles (make-hash-table :test 'equalp)))
+    (dolist (scanobject scanobjects needles)
+      (loop for (script . desc)
+              in (parse-output-descriptor (%scanobject-descriptor scanobject) network)
+            do (setf (gethash script needles) desc)))))
+
+(defun %hash-table-keys (ht)
+  (loop for k being the hash-keys of ht collect k))
+
+(defun rpc-scanblocks (node params)
+  "Return blockhashes relevant to a descriptor set using the block filter index.
+PARAMS: (action [scanobjects] [start_height] [stop_height] [filtertype] [options]).
+ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
+  (let ((action (first params)))
+    (cond
+      ((equal action "status")
+       (bt:with-lock-held (*scanblocks-lock*)
+         (if *scanblocks-running*
+             `(("progress" . ,*scanblocks-progress*)
+               ("current_height" . ,*scanblocks-current-height*))
+             nil)))
+      ((equal action "abort")
+       (bt:with-lock-held (*scanblocks-lock*)
+         (if *scanblocks-running* (progn (setf *scanblocks-abort* t) t) nil)))
+      ((equal action "start")
+       (let ((scanobjects (second params))
+             (filtertype (or (fifth params) "basic"))
+             (bfi (rpc-get-blockfilterindex node)))
+         (unless (and scanobjects (listp scanobjects))
+           (error 'rpc-error :code +rpc-misc-error+
+                             :message "scanobjects argument is required for the start action"))
+         (unless (string-equal filtertype "basic")
+           (error 'rpc-error :code +rpc-invalid-address-or-key+
+                             :message (format nil "Unknown filtertype ~A" filtertype)))
+         (unless (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
+           (error 'rpc-error :code +rpc-misc-error+
+                             :message "Index is not enabled for filtertype basic"))
+         (unless (%reserve-scanblocks)
+           (error 'rpc-error :code +rpc-invalid-parameter+
+                             :message "Scan already in progress, use action \"abort\" or \"status\""))
+         (unwind-protect
+              (let* ((chain-state (rpc-get-chain-state node))
+                     (block-store (rpc-get-block-store node))
+                     (network (rpc-get-network node))
+                     (tip (bitcoin-lisp.storage:current-height chain-state))
+                     (start (or (third params) 0))
+                     (stop (or (fourth params) tip))
+                     (options (sixth params))
+                     (fp-check (and (hash-table-p options)
+                                    (gethash "filter_false_positives" options)))
+                     (needles (%needle-scripts scanobjects network))
+                     (needle-list (%hash-table-keys needles))
+                     (relevant '())
+                     (scanned-to start)
+                     (aborted nil))
+                ;; Height bounds, matching Core (errors rather than clamping).
+                (unless (and (integerp start) (<= 0 start tip))
+                  (error 'rpc-error :code +rpc-misc-error+ :message "Invalid start_height"))
+                (unless (and (integerp stop) (<= start stop tip))
+                  (error 'rpc-error :code +rpc-misc-error+ :message "Invalid stop_height"))
+                (loop for height from start to stop do
+                  (when *scanblocks-abort* (setf aborted t) (return))
+                  (setf *scanblocks-current-height* height
+                        *scanblocks-progress*
+                        (if (> stop start)
+                            (floor (* 100 (- height start)) (- stop start))
+                            100))
+                  (let ((entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+                    (when entry
+                      (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                             (filter (bitcoin-lisp.storage:blockfilterindex-get-filter bfi hash)))
+                        (when filter
+                          (multiple-value-bind (k0 k1)
+                              (bitcoin-lisp.storage:block-filter-siphash-keys hash)
+                            (when (bitcoin-lisp.storage:gcs-filter-match-any
+                                   filter k0 k1 needle-list)
+                              (when (or (not fp-check)
+                                        (%block-matches-needles-p
+                                         (bitcoin-lisp.storage:get-block block-store hash)
+                                         hash needles))
+                                (push (hash-to-hex hash) relevant))))))))
+                  ;; Last fully-scanned height; on abort this is where we stopped.
+                  (setf scanned-to height))
+                `(("from_height" . ,start)
+                  ("to_height" . ,scanned-to)
+                  ("relevant_blocks" . ,(nreverse relevant))
+                  ("completed" . ,(not aborted))))
+           (%release-scanblocks))))
+      (t
+       (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message (format nil "Invalid action '~A'" action))))))
+
+(defun %block-matches-needles-p (block block-hash needles)
+  "T if BLOCK genuinely touches any script in NEEDLES (false-positive check).
+Re-derives the block's basic-filter element set (outputs + spent prevouts, the
+latter from undo data when available). When the block body is unavailable
+(pruned), returns T -- we can't verify, so we keep the filter match rather than
+risk a false negative."
+  (if (null block)
+      t
+      (let* ((undo (bitcoin-lisp.validation:get-undo-data block-hash))
+             (spent (mapcar (lambda (e) (bitcoin-lisp.storage:utxo-entry-script-pubkey (third e)))
+                            undo)))
+        (some (lambda (e) (gethash e needles))
+              (bitcoin-lisp.storage:basic-filter-elements block spent)))))
+
+;;; getdescriptoractivity — spend/receive activity for descriptors in blocks.
+
+(defun %spk-object (script needles)
+  "A scriptPubKey JSON object (hex, plus the matched descriptor when known)."
+  `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex script))
+    ,@(let ((desc (gethash script needles))) (when desc `(("desc" . ,desc))))))
+
+(defun %outpoint-key (txid index)
+  (let ((k (make-array 36 :element-type '(unsigned-byte 8))))
+    (replace k txid)
+    (dotimes (i 4) (setf (aref k (+ 32 i)) (logand (ash index (* -8 i)) #xff)))
+    k))
+
+(defun %undo-prevout-table (undo)
+  "Map (outpoint txid+index) -> utxo-entry for an undo list, for spend lookups."
+  (let ((table (make-hash-table :test 'equalp)))
+    (dolist (e undo table)
+      (setf (gethash (%outpoint-key (first e) (second e)) table) (third e)))))
+
+(defun %tx-activity (tx needles prevout-fn base-fields)
+  "Collect spend+receive activity entries for TX. NEEDLES maps script->desc;
+PREVOUT-FN maps (txid index) -> utxo-entry (or NIL); BASE-FIELDS is an alist of
+common fields (blockhash/height, or nil for mempool). Returns a list of entries."
+  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+        (acc '()))
+    ;; Spends: each non-coinbase input whose prevout script matches.
+    (loop for in across (bitcoin-lisp.serialization:transaction-inputs tx)
+          for vin from 0
+          for prev = (bitcoin-lisp.serialization:tx-in-previous-output in)
+          for phash = (bitcoin-lisp.serialization:outpoint-hash prev)
+          for pindex = (bitcoin-lisp.serialization:outpoint-index prev)
+          ;; Skip the coinbase's null prevout (index 0xffffffff, all-zero hash).
+          unless (and (= pindex #xffffffff) (every #'zerop phash))
+            do (let ((entry (funcall prevout-fn phash pindex)))
+                 (when entry
+                   (let ((spk (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
+                     (when (gethash spk needles)
+                       (push `(("type" . "spend")
+                               ("amount" . ,(/ (bitcoin-lisp.storage:utxo-entry-value entry)
+                                               100000000.0d0))
+                               ,@base-fields
+                               ("spend_txid" . ,(hash-to-hex txid))
+                               ("spend_vin" . ,vin)
+                               ("prevout_txid" . ,(hash-to-hex phash))
+                               ("prevout_vout" . ,pindex)
+                               ("prevout_spk" . ,(%spk-object spk needles)))
+                             acc))))))
+    ;; Receives: each output whose script matches.
+    (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
+          for vout from 0
+          for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+          when (gethash spk needles)
+            do (push `(("type" . "receive")
+                       ("amount" . ,(/ (bitcoin-lisp.serialization:tx-out-value out)
+                                       100000000.0d0))
+                       ,@base-fields
+                       ("txid" . ,(hash-to-hex txid))
+                       ("vout" . ,vout)
+                       ("output_spk" . ,(%spk-object spk needles)))
+                     acc))
+    (nreverse acc)))
+
+(defun rpc-getdescriptoractivity (node params)
+  "Return spend/receive activity for descriptors within the given blocks (and
+optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
+[options]). Mirrors Bitcoin Core getdescriptoractivity."
+  (let* ((blockhashes (first params))
+         (scanobjects (second params))
+         (include-mempool (if (>= (length params) 3) (third params) t))
+         (network (rpc-get-network node))
+         (chain-state (rpc-get-chain-state node))
+         (block-store (rpc-get-block-store node))
+         (utxo-set (rpc-get-utxo-set node))
+         (chunks '()))                  ; list of per-tx entry lists, reverse order
+    (unless (and scanobjects (listp scanobjects))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "scanobjects is required"))
+    (let ((needles (%needle-scripts scanobjects network)))
+      ;; Resolve + validate the requested blocks: each must be on the active
+      ;; chain (Core rejects stale/fork blocks). Process them in ascending
+      ;; height order regardless of the order given, matching Core.
+      (let ((entries '()))
+        (dolist (bhash-hex (and (listp blockhashes) blockhashes))
+          (let* ((hash (and (stringp bhash-hex) (parse-hex-hash bhash-hex)))
+                 (entry (and hash (bitcoin-lisp.storage:get-block-index-entry chain-state hash))))
+            (unless entry
+              (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                :message "Block not found"))
+            (unless (bitcoin-lisp.storage:entry-on-active-chain-p chain-state entry)
+              (error 'rpc-error :code +rpc-invalid-parameter+
+                                :message "Block is not in main chain"))
+            (push entry entries)))
+        (dolist (entry (sort entries #'< :key #'bitcoin-lisp.storage:block-index-entry-height))
+          (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                 (height (bitcoin-lisp.storage:block-index-entry-height entry))
+                 (block (bitcoin-lisp.storage:get-block block-store hash))
+                 (undo (bitcoin-lisp.validation:get-undo-data hash)))
+            (unless block
+              (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                :message "Block not available (pruned?)"))
+            ;; A spending block with no undo data can't yield correct spend
+            ;; activity; error rather than silently omitting spends (Core's
+            ;; GetUndoChecked throws).
+            (when (and (null undo)
+                       (> (length (bitcoin-lisp.serialization:bitcoin-block-transactions block)) 1))
+              (error 'rpc-error :code +rpc-misc-error+
+                                :message "Undo data not available (pruned?)"))
+            (let ((prevouts (%undo-prevout-table undo))
+                  (base `(("blockhash" . ,(hash-to-hex hash)) ("height" . ,height))))
+              (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+                (push (%tx-activity tx needles
+                                    (lambda (th ti) (gethash (%outpoint-key th ti) prevouts))
+                                    base)
+                      chunks))))))
+      ;; Mempool (blockhash/height omitted).
+      (when include-mempool
+        (let ((mempool (rpc-get-mempool node)))
+          (when mempool
+            (bitcoin-lisp.mempool:mempool-for-each
+             mempool
+             (lambda (txid entry)
+               (declare (ignore txid))
+               (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+                 (push (%tx-activity
+                        tx needles
+                        (lambda (th ti)
+                          ;; prevout from the UTXO set, else an unconfirmed
+                          ;; mempool parent's output.
+                          (or (bitcoin-lisp.storage:get-utxo utxo-set th ti)
+                              (let ((ptx (bitcoin-lisp.mempool:mempool-get mempool th)))
+                                (when (and ptx
+                                           (< ti (length (bitcoin-lisp.serialization:transaction-outputs
+                                                          (bitcoin-lisp.mempool:mempool-entry-transaction ptx)))))
+                                  (let ((o (aref (bitcoin-lisp.serialization:transaction-outputs
+                                                  (bitcoin-lisp.mempool:mempool-entry-transaction ptx)) ti)))
+                                    (bitcoin-lisp.storage:make-utxo-entry
+                                     :value (bitcoin-lisp.serialization:tx-out-value o)
+                                     :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey o)))))))
+                        nil)
+                       chunks)))))))
+      ;; chunks is reverse-order lists of entries; flatten once (O(total)).
+      `(("activity" . ,(apply #'append (nreverse chunks)))))))
