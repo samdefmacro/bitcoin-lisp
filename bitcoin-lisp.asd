@@ -44,7 +44,8 @@
                  (:module "serialization"
                   :components ((:file "binary")
                                (:file "types")
-                               (:file "messages")))
+                               (:file "messages")
+                               (:file "psbt")))
                  (:module "storage"
                   :components ((:file "blocks")
                                (:file "utxo")
@@ -80,6 +81,7 @@
                                (:file "accessors")
                                (:file "descriptors")
                                (:file "methods")
+                               (:file "psbt")
                                (:file "merkleproof")
                                (:file "rest")
                                (:file "server")))
@@ -163,6 +165,8 @@
                              ;; Bitcoin Core BIP 341 taproot test vectors
                              (:file "bitcoin-core-bip341-tests")
                              ;; BIP 158 compact block filter tests
-                             (:file "blockfilter-tests"))))
+                             (:file "blockfilter-tests")
+                             ;; BIP 174 PSBT tests
+                             (:file "psbt-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

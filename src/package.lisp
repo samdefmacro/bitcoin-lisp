@@ -145,6 +145,7 @@
    #:br-read-compact-size
    #:br-read-var-bytes
    #:br-read-transaction
+   #:br-read-witness-stack
    ;; Types
    #:dovector
    #:outpoint
@@ -160,6 +161,8 @@
    #:make-tx-out
    #:tx-out-value
    #:tx-out-script-pubkey
+   #:br-read-tx-out
+   #:bb-write-tx-out
    #:transaction
    #:make-transaction
    #:transaction-version
@@ -253,6 +256,22 @@
    #:serialize-witness-block
    #:read-transaction
    #:serialize-transaction
+   ;; BIP174 PSBT
+   #:psbt #:make-psbt #:psbt-p #:psbt-tx #:psbt-global #:psbt-inputs #:psbt-outputs
+   #:psbt-map #:make-psbt-map #:psbt-map-records
+   #:psbt-key-type #:psbt-make-record #:psbt-map-find #:psbt-map-collect
+   #:psbt-map-set #:psbt-map-remove-type
+   #:parse-psbt #:serialize-psbt #:encode-psbt #:decode-psbt #:make-empty-psbt
+   #:*psbt-magic*
+   #:+psbt-global-unsigned-tx+ #:+psbt-global-xpub+ #:+psbt-global-version+
+   #:+psbt-global-proprietary+
+   #:+psbt-in-non-witness-utxo+ #:+psbt-in-witness-utxo+ #:+psbt-in-partial-sig+
+   #:+psbt-in-sighash+ #:+psbt-in-redeem-script+ #:+psbt-in-witness-script+
+   #:+psbt-in-bip32+ #:+psbt-in-final-scriptsig+ #:+psbt-in-final-scriptwitness+
+   #:+psbt-in-ripemd160+ #:+psbt-in-sha256+ #:+psbt-in-hash160+ #:+psbt-in-hash256+
+   #:+psbt-in-tap-key-sig+ #:+psbt-in-tap-internal-key+ #:+psbt-in-proprietary+
+   #:+psbt-out-redeem-script+ #:+psbt-out-witness-script+ #:+psbt-out-bip32+
+   #:+psbt-out-tap-internal-key+ #:+psbt-out-proprietary+
    #:coinbase-input-p
    #:get-unix-time
    #:+universal-unix-epoch-offset+
