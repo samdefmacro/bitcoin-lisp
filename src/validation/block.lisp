@@ -1466,6 +1466,9 @@ Handles chain reorganizations when a competing chain has more work."
            (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                utxo-set block new-height)))
              (store-undo-data hash spent-utxos new-height)
+             ;; BIP158: add this block's basic filter to the block filter index
+             ;; (no-op unless the index is enabled; never signals).
+             (bitcoin-lisp:index-block-filter block hash new-height spent-utxos)
              ;; Record fee statistics for fee estimation
              (when fee-estimator
                (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
@@ -1776,6 +1779,13 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
                  tx-index block
                  (bitcoin-lisp.serialization:block-header-hash
                   (bitcoin-lisp.serialization:bitcoin-block-header block))))
+              ;; BIP158: index the reconnected block's basic filter (oldest-to-
+              ;; newest here, so its header chains off the already-indexed parent).
+              (bitcoin-lisp:index-block-filter
+               block
+               (bitcoin-lisp.serialization:block-header-hash
+                (bitcoin-lisp.serialization:bitcoin-block-header block))
+               height spent-utxos)
               (when mempool
                 (bitcoin-lisp.mempool:mempool-remove-for-block mempool block))))
           ;; Remove the disconnected old chain's txs from the tx-index.

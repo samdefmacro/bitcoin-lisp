@@ -487,7 +487,39 @@
    #:load-tx-index
    #:txindex-add-block
    #:txindex-remove-block
-   #:build-tx-index))
+   #:build-tx-index
+   ;; BIP158 block filters (basic filter)
+   #:+basic-filter-type+
+   #:+basic-filter-p+
+   #:+basic-filter-m+
+   #:build-gcs-filter
+   #:gcs-filter-match
+   #:gcs-filter-match-any
+   #:gcs-fast-range
+   #:block-filter-siphash-keys
+   #:basic-filter-elements
+   #:build-basic-block-filter
+   #:block-filter-hash
+   #:block-filter-header
+   #:compute-block-filter-header
+   #:+zero-filter-header+
+   ;; BIP157/158 block filter index
+   #:blockfilterindex
+   #:make-blockfilterindex
+   #:blockfilterindex-enabled
+   #:blockfilterindex-db
+   #:init-blockfilterindex
+   #:close-blockfilterindex
+   #:blockfilterindex-add-block
+   #:blockfilterindex-get
+   #:blockfilterindex-get-filter
+   #:blockfilterindex-get-header
+   #:blockfilterindex-has-block-p
+   #:blockfilterindex-best
+   #:blockfilterindex-height
+   #:blockfilterindex-set-best
+   #:blockfilterindex-clear-best
+   #:build-blockfilterindex))
 
 (defpackage #:bitcoin-lisp.mempool
   (:use #:cl)
@@ -637,6 +669,7 @@
    #:activate-block
    #:find-fork-point
    #:perform-reorg
+   #:get-undo-data
    #:invalidate-block
    #:reconsider-block
    #:precious-block
@@ -960,5 +993,6 @@
    #:disable-console-logging
    #:start-file-logging
    #:stop-file-logging
-   #:maybe-periodic-flush))
+   #:maybe-periodic-flush
+   #:index-block-filter))
 

@@ -53,7 +53,9 @@
                                (:file "coins-view-cache")
                                (:file "coins-view-migration")
                                (:file "chain")
-                               (:file "txindex")))
+                               (:file "txindex")
+                               (:file "blockfilter")
+                               (:file "blockfilterindex")))
                  (:module "validation"
                   :components ((:file "script")
                                (:file "transaction")
@@ -159,6 +161,8 @@
                              ;; Merkle tree edge case tests
                              (:file "merkle-tests")
                              ;; Bitcoin Core BIP 341 taproot test vectors
-                             (:file "bitcoin-core-bip341-tests"))))
+                             (:file "bitcoin-core-bip341-tests")
+                             ;; BIP 158 compact block filter tests
+                             (:file "blockfilter-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
