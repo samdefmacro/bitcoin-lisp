@@ -915,6 +915,67 @@ the median-time-past, which fails the timestamp>MTP rule deterministically."
         (is (null (bitcoin-lisp.storage:get-block-index-entry state bad-hash))
             "invalid header must not be admitted by handle-headers")))))
 
+(test validate-header-chain-rejects-future-and-bad-version
+  "CONSENSUS (Core ContextualCheckBlockHeader): at header admission we now also
+reject a timestamp >2h in the future and a version below the softfork minimum
+for its height -- previously only the block-connect path checked these, so a
+peer could pollute the header index / best-header chain-work with headers Core
+refuses at admission."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         ;; Bind the regtest PoW limit so #x207fffff is a valid target (else
+         ;; derive-target rejects it as above the default limit and PoW never
+         ;; passes) -- mirrors the mining tests' %with-regtest.
+         (bitcoin-lisp.storage:*pow-limit-target* bitcoin-lisp.storage:+regtest-pow-limit-target+)
+         (state (bitcoin-lisp.storage:init-chain-state
+                 (merge-pathnames "test-hdr-ctx/" (uiop:temporary-directory))))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash state)))
+    (flet ((pow-grind (hdr)
+             ;; regtest pow-limit target passes ~half of nonces; find one so the
+             ;; header clears PoW and reaches the check under test.
+             (loop for nonce from 0 below 500
+                   do (setf (bitcoin-lisp.serialization:block-header-nonce hdr) nonce
+                            (bitcoin-lisp.serialization:block-header-cached-hash hdr) nil)
+                   when (bitcoin-lisp.validation:check-proof-of-work hdr)
+                     do (return hdr)
+                   finally (return hdr))))
+      ;; --- future timestamp (child of genesis at height 1; version 4 so the
+      ;;     BIP34 gate, active from height 1 on regtest, isn't what rejects) ---
+      (bitcoin-lisp.storage:add-block-index-entry
+       state (bitcoin-lisp.storage:make-block-index-entry
+              :hash genesis-hash :height 0 :chain-work 1 :status :valid
+              :header (bitcoin-lisp.serialization:make-block-header
+                       :version 1 :prev-block zeros :merkle-root zeros
+                       :timestamp 1296688600 :bits #x207fffff :nonce 0
+                       :cached-hash genesis-hash)))
+      (let ((hdr (pow-grind
+                  (bitcoin-lisp.serialization:make-block-header
+                   :version 4 :prev-block genesis-hash :merkle-root zeros
+                   :timestamp (+ (bitcoin-lisp.serialization:get-unix-time) 7201)
+                   :bits #x207fffff :nonce 0))))
+        (multiple-value-bind (valid error)
+            (bitcoin-lisp.networking::validate-header-chain (list hdr) state)
+          (is (null valid) "future-dated header must be rejected")
+          (is (and error (search "future" error)) "reason should be the future timestamp")))
+      ;; --- version below BIP34 minimum (regtest BIP34 activates at height 1) ---
+      (let* ((parent-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+             (parent-hdr (bitcoin-lisp.serialization:make-block-header
+                          :version 4 :prev-block zeros :merkle-root zeros
+                          :timestamp 1296690000 :bits #x207fffff :nonce 0
+                          :cached-hash parent-hash)))
+        (bitcoin-lisp.storage:add-block-index-entry
+         state (bitcoin-lisp.storage:make-block-index-entry
+                :hash parent-hash :height 100 :chain-work 2 :status :valid
+                :header parent-hdr))
+        (let ((hdr (pow-grind
+                    (bitcoin-lisp.serialization:make-block-header
+                     :version 1 :prev-block parent-hash :merkle-root zeros
+                     :timestamp 1296690100 :bits #x207fffff :nonce 0))))
+          (multiple-value-bind (valid error)
+              (bitcoin-lisp.networking::validate-header-chain (list hdr) state)
+            (is (null valid) "version<2 at/after BIP34 height must be rejected")
+            (is (and error (search "version" error)) "reason should be the bad version")))))))
+
 (test validate-block-skip-scripts
   "Test that validate-block with :skip-scripts t skips script validation."
   ;; Create a minimal block with an invalid script that would normally fail.

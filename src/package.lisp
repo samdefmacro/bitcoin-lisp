@@ -697,6 +697,7 @@
    #:get-bip66-activation-height
    #:get-bip65-activation-height
    #:get-csv-activation-height
+   #:+max-future-block-time+
    #:get-taproot-activation-height
    #:initialize-undo-storage
    #:delete-undo-file
