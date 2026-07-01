@@ -75,6 +75,7 @@ we cap lower). Excess inbound connections are disconnected at merge time.")
   (utxo-set nil)
   (mempool nil)
   (tx-index nil)  ; Transaction index (optional, for getrawtransaction)
+  (blockfilterindex nil)  ; BIP158 basic block filter index (optional)
   (fee-estimator nil)  ; Fee rate estimator for estimatesmartfee
   (address-book nil)  ; Persistent peer address database
   (recent-rejects nil)  ; Recently rejected transaction filter (DoS protection)
@@ -533,6 +534,7 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                         (max-peers 8)
                         (sync t)
                         (txindex nil)
+                        (blockfilterindex nil)
                         (prune nil)
                         (rpc-port nil)
                         (rpc-bind "127.0.0.1")
@@ -551,6 +553,8 @@ CONSOLE-LOG: If T (default), mirror logs to *standard-output* / REPL
 MAX-PEERS: Maximum number of peer connections
 SYNC: If T, start syncing immediately
 TXINDEX: If T, enable transaction index for getrawtransaction lookups
+BLOCKFILTERINDEX: If T, enable the BIP158 basic block filter index (getblockfilter,
+  scanblocks, getdescriptoractivity)
 PRUNE: Block pruning target in MiB (nil=off, 1=manual-only, >=550=automatic)
 RPC-PORT: Port for RPC server (nil = no RPC, default 18332 testnet / 8332 mainnet)
 RPC-BIND: Address to bind RPC server (default 127.0.0.1)
@@ -758,6 +762,44 @@ Returns the node instance."
                                                :enabled t))
     (log-info "Transaction index loaded: ~D entries"
               (bitcoin-lisp.storage:txindex-count (node-tx-index *node*))))
+
+  ;; Initialize BIP158 block filter index (optional)
+  (when blockfilterindex
+    (log-info "Initializing block filter index...")
+    (setf (node-blockfilterindex *node*)
+          (bitcoin-lisp.storage:init-blockfilterindex (node-data-directory *node*)
+                                                       :enabled t))
+    (log-info "Block filter index loaded: indexed to height ~D"
+              (bitcoin-lisp.storage:blockfilterindex-height (node-blockfilterindex *node*)))
+    ;; One-time catch-up over already-stored blocks, before the sync thread
+    ;; starts (single-threaded here, so no writer races). Fresh-from-genesis
+    ;; nodes have nothing to do; the connect-time hook then indexes forward.
+    (let* ((bfi (node-blockfilterindex *node*))
+           (cs (node-chain-state *node*))
+           (tip (bitcoin-lisp.storage:current-height cs)))
+      ;; Repair the recorded "best" if a rollback (e.g. invalidateblock) left it
+      ;; above the active tip: repoint it at the highest indexed active-chain
+      ;; block, else clear it to force a rebuild.
+      (when (> (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
+        (log-warn "Block filter index best above tip (~D > ~D); repairing"
+                  (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
+        (loop for h from tip downto 0
+              for e = (bitcoin-lisp.storage:get-block-at-height cs h)
+              when (and e (bitcoin-lisp.storage:blockfilterindex-has-block-p
+                           bfi (bitcoin-lisp.storage:block-index-entry-hash e)))
+                do (bitcoin-lisp.storage:blockfilterindex-set-best
+                    bfi h (bitcoin-lisp.storage:block-index-entry-hash e))
+                   (return)
+              finally (bitcoin-lisp.storage:blockfilterindex-clear-best bfi)))
+      (when (< (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
+        (log-info "Building block filter index to height ~D..." tip)
+        (let ((n (bitcoin-lisp.storage:build-blockfilterindex
+                  bfi (node-chain-state *node*) (node-block-store *node*)
+                  #'bitcoin-lisp.validation:get-undo-data
+                  :progress-callback
+                  (lambda (h pct)
+                    (log-info "Block filter index: height ~D (~,1F%)" h pct)))))
+          (log-info "Block filter index build complete: ~D block~:P indexed" n)))))
 
   ;; Initialize secp256k1
   (log-info "Initializing cryptographic context...")
@@ -1009,6 +1051,20 @@ flush (atomic temp+fsync+rename inside save-*)."
                      (large-coins-cache-threshold *coins-cache-budget-bytes*))))
     (do-flush)))
 
+(defun index-block-filter (block block-hash height spent-utxos)
+  "Connect-time hook: add BLOCK's BIP158 basic filter to the running node's
+block filter index, if one is enabled. SPENT-UTXOS is the undo list the UTXO
+apply produced. Never signals -- a filter-index failure must not abort a block
+connect -- so consensus is unaffected whether the index is on or off."
+  (let ((bfi (and *node* (node-blockfilterindex *node*))))
+    (when (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
+      (handler-case
+          (bitcoin-lisp.storage:blockfilterindex-add-block
+           bfi block block-hash height spent-utxos)
+        (error (e)
+          (log-warn "Block filter index failed at height ~D: ~A" height e)
+          nil)))))
+
 (defun install-shutdown-handler ()
   "Trap SIGTERM and SIGINT so kill <pid> / Ctrl-C calls stop-node and persists
    chain state and UTXO set before exit. Without this, SIGKILL is the only way
@@ -1194,6 +1250,11 @@ flush (atomic temp+fsync+rename inside save-*)."
   (when (node-tx-index *node*)
     (log-info "Closing transaction index...")
     (bitcoin-lisp.storage:close-tx-index (node-tx-index *node*)))
+
+  ;; Close block filter index
+  (when (node-blockfilterindex *node*)
+    (log-info "Closing block filter index...")
+    (bitcoin-lisp.storage:close-blockfilterindex (node-blockfilterindex *node*)))
 
   ;; Cleanup secp256k1
   (bitcoin-lisp.crypto:cleanup-secp256k1)
