@@ -569,16 +569,11 @@ Returns T if valid or no checkpoint at that height, NIL if checkpoint mismatch."
 ;;;; Header Chain Validation
 
 (defun validate-header-pow (header)
-  "Validate proof-of-work for a header.
-Returns T if hash is below target, NIL otherwise."
-  (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
-         (bits (bitcoin-lisp.serialization:block-header-bits header))
-         (target (bitcoin-lisp.storage:bits-to-target bits)))
-    ;; Convert hash to integer (little-endian)
-    (let ((hash-value 0))
-      (loop for i from 31 downto 0
-            do (setf hash-value (logior (ash hash-value 8) (aref hash i))))
-      (<= hash-value target))))
+  "Validate proof-of-work for a header. Delegates to the consensus
+check-proof-of-work, which derives the target with derive-target -- so a header
+whose nBits is negative / zero / overflowing / above the PoW limit is rejected
+(Core CheckBlockHeader), not silently decoded as an in-range target."
+  (bitcoin-lisp.validation:check-proof-of-work header))
 
 (defun validate-header-chain (headers chain-state)
   "Validate a list of headers against the current chain state.
@@ -623,6 +618,17 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                 (values (nreverse valid-headers)
                         "Invalid proof-of-work")))
 
+            ;; Reject headers timestamped too far in the future (Core
+            ;; ContextualCheckBlockHeader: block time > now + 2h). Admitting one
+            ;; would pollute the index / inflate best-header chain-work with a
+            ;; header Core refuses at admission.
+            (when (> (bitcoin-lisp.serialization:block-header-timestamp header)
+                     (+ (bitcoin-lisp.serialization:get-unix-time)
+                        bitcoin-lisp.validation:+max-future-block-time+))
+              (return-from validate-header-chain
+                (values (nreverse valid-headers)
+                        "Timestamp too far in the future")))
+
             ;; Validate timestamp > median-time-past
             (let ((mtp (bitcoin-lisp.validation:compute-median-time-past
                         chain-state header-prev-hash)))
@@ -646,6 +652,23 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                   (return-from validate-header-chain
                     (values (nreverse valid-headers)
                             (format nil "Bad difficulty at height ~D" new-height)))))
+              ;; Softfork version minimums, gated by activation height (Core
+              ;; ContextualCheckBlockHeader BIP34/66/65). No upper bound --
+              ;; miners roll high version bits (overt AsicBoost).
+              (let ((version (bitcoin-lisp.serialization:block-header-version header)))
+                (when (or (and (< version 2)
+                               (>= new-height (bitcoin-lisp.validation:get-bip34-activation-height
+                                               bitcoin-lisp:*network*)))
+                          (and (< version 3)
+                               (>= new-height (bitcoin-lisp.validation:get-bip66-activation-height
+                                               bitcoin-lisp:*network*)))
+                          (and (< version 4)
+                               (>= new-height (bitcoin-lisp.validation:get-bip65-activation-height
+                                               bitcoin-lisp:*network*))))
+                  (return-from validate-header-chain
+                    (values (nreverse valid-headers)
+                            (format nil "Bad version at height ~D" new-height)))))
+
               (unless (validate-checkpoint hash new-height)
                 (return-from validate-header-chain
                   (values (nreverse valid-headers)
