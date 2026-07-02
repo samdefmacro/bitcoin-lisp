@@ -252,6 +252,54 @@ filter_false_positives keeps the true matches; idle status is null."
          (signals bitcoin-lisp.rpc::rpc-error
            (bitcoin-lisp.rpc::rpc-scanblocks node (list "start" (list "raw(51)") 3 1))))))))
 
+(test blockfilterindex-backfill-seeks-first-indexable
+  "Backfilling an empty index over an existing chain skips leading heights with
+no stored block body (genesis is never stored; a pruned node's whole prefix is
+absent) and seeds at the first indexable block, instead of stopping at height 0
+with nothing indexed. Once seeded, a gap stops the backfill to keep the header
+chain contiguous."
+  (%with-regtest
+   ;; Mine 5 blocks on a node with NO filter index attached, so the connect
+   ;; hook indexes nothing and the backfill does all the work.
+   (let ((node (%regtest-node-fixture (format nil "bfb~D" (get-internal-real-time)))))
+     (let ((bitcoin-lisp::*node* node))
+       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (let* ((cs (bitcoin-lisp::node-chain-state node))
+              (store (bitcoin-lisp::node-block-store node))
+              (idxbase (merge-pathnames
+                        (format nil "test-bfb-~D/" (get-internal-real-time))
+                        (uiop:temporary-directory)))
+              (bfi (bitcoin-lisp.storage:init-blockfilterindex idxbase :enabled t))
+              (n (bitcoin-lisp.storage:build-blockfilterindex
+                  bfi cs store #'bitcoin-lisp.validation:get-undo-data)))
+         ;; Heights 1..5 indexed; genesis (no stored body) skipped, not fatal.
+         (is (= 5 n))
+         (is (= 5 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+         (is-false (bitcoin-lisp.storage:blockfilterindex-has-block-p
+                    bfi (bitcoin-lisp.storage:network-genesis-hash :regtest)))
+         ;; Height 1 seeds its header chain from the all-zero parent header.
+         (let* ((h1 (bitcoin-lisp.storage:block-index-entry-hash
+                     (bitcoin-lisp.storage:get-block-at-height cs 1)))
+                (filter (bitcoin-lisp.storage:blockfilterindex-get-filter bfi h1)))
+           (is (equalp (bitcoin-lisp.storage:blockfilterindex-get-header bfi h1)
+                       (bitcoin-lisp.storage:compute-block-filter-header
+                        filter bitcoin-lisp.storage:+zero-filter-header+))))
+         (bitcoin-lisp.storage:close-blockfilterindex bfi)
+         ;; Prune block 3's body and rebuild from scratch: the backfill seeds at
+         ;; height 1, then STOPS at the gap rather than skipping past it.
+         (bitcoin-lisp.storage:prune-block
+          store (bitcoin-lisp.storage:block-index-entry-hash
+                 (bitcoin-lisp.storage:get-block-at-height cs 3)))
+         (let* ((idxbase2 (merge-pathnames
+                           (format nil "test-bfb2-~D/" (get-internal-real-time))
+                           (uiop:temporary-directory)))
+                (bfi2 (bitcoin-lisp.storage:init-blockfilterindex idxbase2 :enabled t))
+                (n2 (bitcoin-lisp.storage:build-blockfilterindex
+                     bfi2 cs store #'bitcoin-lisp.validation:get-undo-data)))
+           (is (= 2 n2))
+           (is (= 2 (bitcoin-lisp.storage:blockfilterindex-height bfi2)))
+           (bitcoin-lisp.storage:close-blockfilterindex bfi2)))))))
+
 (test getdescriptoractivity-receives
   "getdescriptoractivity reports a receive for a matching coinbase output."
   (%with-regtest

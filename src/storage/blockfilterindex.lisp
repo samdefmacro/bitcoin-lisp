@@ -171,31 +171,32 @@ record after a rollback such as invalidateblock)."
   "Backfill the filter index from just past the last indexed block up to the
 active tip, using stored blocks and their undo data. GET-UNDO-FN maps a
 block-hash to its undo list of (txid index utxo-entry), or NIL when absent.
-STOPS at the first height whose block, or (for a spending block) undo data, is
-unavailable -- e.g. beyond the pruned horizon -- rather than skipping it, so the
-stored filter-header chain stays contiguous (a skipped block would leave the
-next block chained off a wrong parent header). PROGRESS-CALLBACK, if given, is
+While the index is still empty, heights whose block body or (for a spending
+block) undo data is unavailable are SKIPPED -- the genesis body is never
+stored, and on a pruned node the whole pruned prefix is absent -- so the
+indexed range seeds at the first indexable block. Once anything is indexed,
+the first such unavailable height STOPS the backfill instead, keeping the
+stored filter-header chain contiguous (a skipped block would leave the next
+block chained off a wrong parent header). PROGRESS-CALLBACK, if given, is
 called with (height percent). Returns the number of blocks indexed."
   (unless (and (blockfilterindex-enabled bfi) (blockfilterindex-db bfi))
     (return-from build-blockfilterindex 0))
   (let* ((tip (current-height chain-state))
          (start (max 0 (1+ (blockfilterindex-height bfi))))
+         (seeded (>= (blockfilterindex-height bfi) 0))
          (count 0)
          (last-report (get-internal-real-time)))
     (block done
       (loop for height from start to tip
-            do (let ((entry (get-block-at-height chain-state height)))
-                 (unless entry (return-from done))
-                 (let* ((hash (block-index-entry-hash entry))
-                        (block (get-block block-store hash)))
-                   ;; A missing block body, or a spending block with no undo
-                   ;; data, cannot be filtered correctly; stop here to keep the
-                   ;; header chain contiguous.
-                   (when (null block) (return-from done))
-                   (let ((undo (funcall get-undo-fn hash)))
-                     (when (and (null undo) (%block-spends-p block)) (return-from done))
-                     (blockfilterindex-add-block bfi block hash height undo)
-                     (incf count))))
+            do (let* ((entry (get-block-at-height chain-state height))
+                      (hash (and entry (block-index-entry-hash entry)))
+                      (block (and hash (get-block block-store hash)))
+                      (undo (and block (funcall get-undo-fn hash))))
+                 (cond ((and block (or undo (not (%block-spends-p block))))
+                        (blockfilterindex-add-block bfi block hash height undo)
+                        (setf seeded t)
+                        (incf count))
+                       (seeded (return-from done))))
                (when progress-callback
                  (let ((now (get-internal-real-time)))
                    (when (> (- now last-report) internal-time-units-per-second)
