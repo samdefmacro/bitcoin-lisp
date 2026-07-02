@@ -298,7 +298,24 @@ chain contiguous."
                      bfi2 cs store #'bitcoin-lisp.validation:get-undo-data)))
            (is (= 2 n2))
            (is (= 2 (bitcoin-lisp.storage:blockfilterindex-height bfi2)))
-           (bitcoin-lisp.storage:close-blockfilterindex bfi2)))))))
+           (bitcoin-lisp.storage:close-blockfilterindex bfi2))
+         ;; An empty index starts the seek at the pruned horizon (a pruned
+         ;; mainnet node would otherwise probe ~950k deleted heights, ~14 ms
+         ;; each). With pruned-height=2, the scan starts at 3 -- whose body
+         ;; was pruned above -- and still seeds at 4, indexing 4..5.
+         (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 2)
+         (let* ((idxbase3 (merge-pathnames
+                           (format nil "test-bfb3-~D/" (get-internal-real-time))
+                           (uiop:temporary-directory)))
+                (bfi3 (bitcoin-lisp.storage:init-blockfilterindex idxbase3 :enabled t))
+                (n3 (bitcoin-lisp.storage:build-blockfilterindex
+                     bfi3 cs store #'bitcoin-lisp.validation:get-undo-data)))
+           (is (= 2 n3))
+           (is (= 5 (bitcoin-lisp.storage:blockfilterindex-height bfi3)))
+           (is-false (bitcoin-lisp.storage:blockfilterindex-has-block-p
+                      bfi3 (bitcoin-lisp.storage:block-index-entry-hash
+                            (bitcoin-lisp.storage:get-block-at-height cs 1))))
+           (bitcoin-lisp.storage:close-blockfilterindex bfi3)))))))
 
 (test blockfilterindex-refuses-noncontiguous-add
   "Adding a block whose parent has no stored filter header while the index is
