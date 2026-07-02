@@ -766,6 +766,7 @@ Returns the node instance."
   ;; Initialize BIP158 block filter index (optional)
   (when blockfilterindex
     (log-info "Initializing block filter index...")
+    (setf *blockfilterindex-stall-logged* nil)
     (setf (node-blockfilterindex *node*)
           (bitcoin-lisp.storage:init-blockfilterindex (node-data-directory *node*)
                                                        :enabled t))
@@ -1051,6 +1052,10 @@ flush (atomic temp+fsync+rename inside save-*)."
                      (large-coins-cache-threshold *coins-cache-budget-bytes*))))
     (do-flush)))
 
+(defvar *blockfilterindex-stall-logged* nil
+  "One-shot latch so a stalled block filter index (non-contiguous connect
+refused) logs a single warning instead of one per block until restart.")
+
 (defun index-block-filter (block block-hash height spent-utxos)
   "Connect-time hook: add BLOCK's BIP158 basic filter to the running node's
 block filter index, if one is enabled. SPENT-UTXOS is the undo list the UTXO
@@ -1059,8 +1064,17 @@ connect -- so consensus is unaffected whether the index is on or off."
   (let ((bfi (and *node* (node-blockfilterindex *node*))))
     (when (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
       (handler-case
-          (bitcoin-lisp.storage:blockfilterindex-add-block
-           bfi block block-hash height spent-utxos)
+          (multiple-value-bind (filter status)
+              (bitcoin-lisp.storage:blockfilterindex-add-block
+               bfi block block-hash height spent-utxos)
+            (when (and (eq status :noncontiguous)
+                       (not *blockfilterindex-stall-logged*))
+              (setf *blockfilterindex-stall-logged* t)
+              (log-warn "Block filter index stalled at height ~D: gap below ~
+best-indexed height ~D; the startup backfill will heal it on next restart"
+                        height
+                        (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+            filter)
         (error (e)
           (log-warn "Block filter index failed at height ~D: ~A" height e)
           nil)))))

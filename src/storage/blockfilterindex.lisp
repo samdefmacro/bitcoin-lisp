@@ -124,12 +124,15 @@ A disabled index ignores writes and reads and holds no DB handle."
   "Build BLOCK's basic filter from its outputs and SPENT-UTXOS (the undo list of
 (txid index utxo-entry)) and store it, chaining the filter header off the
 parent's. Marks BLOCK as the best-indexed block. Returns the encoded filter, or
-NIL if the index is disabled."
+NIL if the index is disabled, or (values nil :noncontiguous) when BLOCK's
+parent has no stored filter header while the index is non-empty: storing it
+would seed a second header chain on top of a gap (observed after a mid-backfill
+crash left a hole and the connect hook then re-seeded at the tip, stranding the
+hole behind an advanced best marker). Refusing leaves the best marker where the
+indexed range really ends, so the startup backfill can heal the gap."
   (unless (and (blockfilterindex-enabled bfi) (blockfilterindex-db bfi))
     (return-from blockfilterindex-add-block nil))
   (let* ((db (blockfilterindex-db bfi))
-         (scripts (%spent-utxos->scripts spent-utxos))
-         (filter (build-basic-block-filter block block-hash scripts))
          (prev-hash (bitcoin-lisp.serialization:block-header-prev-block
                      (bitcoin-lisp.serialization:bitcoin-block-header block)))
          ;; Chain the filter header off the parent's. Blocks are indexed in
@@ -141,12 +144,16 @@ NIL if the index is disabled."
          ;; connected/backfilled block. The FILTERS are always Core-exact; the
          ;; header chain is internally consistent but its absolute values match
          ;; BIP157 only when the range starts at genesis (not currently possible).
-         (prev-header (or (blockfilterindex-get-header bfi prev-hash)
-                          +zero-filter-header+))
-         (header (compute-block-filter-header filter prev-header)))
-    (leveldb-put db (%bfi-filter-key block-hash) (%bfi-encode-record header filter))
-    (leveldb-put db *bfi-meta-key* (%bfi-encode-meta height block-hash))
-    filter))
+         (prev-header (blockfilterindex-get-header bfi prev-hash)))
+    (when (and (null prev-header) (>= (blockfilterindex-height bfi) 0))
+      (return-from blockfilterindex-add-block (values nil :noncontiguous)))
+    (let* ((scripts (%spent-utxos->scripts spent-utxos))
+           (filter (build-basic-block-filter block block-hash scripts))
+           (header (compute-block-filter-header
+                    filter (or prev-header +zero-filter-header+))))
+      (leveldb-put db (%bfi-filter-key block-hash) (%bfi-encode-record header filter))
+      (leveldb-put db *bfi-meta-key* (%bfi-encode-meta height block-hash))
+      filter)))
 
 ;;; --- backfill over already-stored blocks ---
 
@@ -191,9 +198,17 @@ called with (height percent). Returns the number of blocks indexed."
             do (let* ((entry (get-block-at-height chain-state height))
                       (hash (and entry (block-index-entry-hash entry)))
                       (block (and hash (get-block block-store hash)))
-                      (undo (and block (funcall get-undo-fn hash))))
-                 (cond ((and block (or undo (not (%block-spends-p block))))
-                        (blockfilterindex-add-block bfi block hash height undo)
+                      (undo (and block (funcall get-undo-fn hash)))
+                      ;; FILTER is nil when the height is unindexable (missing
+                      ;; body, or missing undo for a spending block) or when
+                      ;; add-block refused a non-contiguous store (a stale best
+                      ;; marker naming an orphaned block). Either way: skip
+                      ;; pre-seed, stop post-seed.
+                      (filter (and block
+                                   (or undo (not (%block-spends-p block)))
+                                   (blockfilterindex-add-block
+                                    bfi block hash height undo))))
+                 (cond (filter
                         (setf seeded t)
                         (incf count))
                        (seeded (return-from done))))
