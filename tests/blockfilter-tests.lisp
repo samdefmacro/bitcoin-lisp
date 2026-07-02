@@ -300,6 +300,45 @@ chain contiguous."
            (is (= 2 (bitcoin-lisp.storage:blockfilterindex-height bfi2)))
            (bitcoin-lisp.storage:close-blockfilterindex bfi2)))))))
 
+(test blockfilterindex-refuses-noncontiguous-add
+  "Adding a block whose parent has no stored filter header while the index is
+non-empty is refused with (values nil :noncontiguous) -- storing it would seed
+a second header chain over a gap and strand the gap behind an advanced best
+marker (observed live after a mid-backfill crash). An empty index still seeds
+from the zero header, and filling the gap in order is then accepted."
+  (%with-regtest
+   (let ((node (%regtest-node-fixture (format nil "bfc~D" (get-internal-real-time)))))
+     (let ((bitcoin-lisp::*node* node))
+       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 3 "raw(51)"))
+       (let* ((cs (bitcoin-lisp::node-chain-state node))
+              (store (bitcoin-lisp::node-block-store node))
+              (idxbase (merge-pathnames
+                        (format nil "test-bfc-~D/" (get-internal-real-time))
+                        (uiop:temporary-directory)))
+              (bfi (bitcoin-lisp.storage:init-blockfilterindex idxbase :enabled t)))
+         (flet ((blk (h)
+                  (let ((hash (bitcoin-lisp.storage:block-index-entry-hash
+                               (bitcoin-lisp.storage:get-block-at-height cs h))))
+                    (values (bitcoin-lisp.storage:get-block store hash) hash))))
+           ;; Empty index: block 1 seeds from the zero header.
+           (multiple-value-bind (b1 h1) (blk 1)
+             (is-true (bitcoin-lisp.storage:blockfilterindex-add-block bfi b1 h1 1 nil)))
+           ;; Non-empty index: block 3's parent (2) is unindexed -> refused,
+           ;; best marker untouched.
+           (multiple-value-bind (b3 h3) (blk 3)
+             (multiple-value-bind (filter status)
+                 (bitcoin-lisp.storage:blockfilterindex-add-block bfi b3 h3 3 nil)
+               (is (null filter))
+               (is (eq :noncontiguous status))))
+           (is (= 1 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+           ;; In-order adds are accepted and advance the best marker.
+           (multiple-value-bind (b2 h2) (blk 2)
+             (is-true (bitcoin-lisp.storage:blockfilterindex-add-block bfi b2 h2 2 nil)))
+           (multiple-value-bind (b3 h3) (blk 3)
+             (is-true (bitcoin-lisp.storage:blockfilterindex-add-block bfi b3 h3 3 nil)))
+           (is (= 3 (bitcoin-lisp.storage:blockfilterindex-height bfi))))
+         (bitcoin-lisp.storage:close-blockfilterindex bfi))))))
+
 (test getdescriptoractivity-receives
   "getdescriptoractivity reports a receive for a matching coinbase output."
   (%with-regtest
