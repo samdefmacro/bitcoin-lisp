@@ -1389,6 +1389,23 @@ h≈280k (sb-sprof) once blocks carried 500+ spent inputs each."
         (remhash (car pair) *block-undo-data*)
         (remhash (car pair) *undo-cache-heights*)))))
 
+(defun %warn-if-undo-empty (block block-hash height spent-utxos)
+  "Tripwire: a block with non-coinbase transactions must spend something, so an
+empty SPENT-UTXOS means every prevout was already absent from the UTXO view --
+the signature of a double-apply. The old unvalidated reorg-reconnect path
+(pre-CC-1, fixed 2026-06-17) did exactly that on testnet4 and overwrote 7
+blocks' undo files with empty lists, which later stalled the block filter
+backfill. apply-block-to-utxo-set skips missing prevouts silently, so this is
+the one place the condition is visible before a bad undo file hits disk."
+  (when (and (null spent-utxos)
+             (> (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+                         block))
+                1))
+    (bitcoin-lisp:log-warn
+     "Undo data EMPTY for spending block ~A at height ~D — prevouts already ~
+absent from the UTXO view (double-apply?)"
+     (bitcoin-lisp.crypto:bytes-to-hex block-hash) height)))
+
 (defun store-undo-data (block-hash spent-utxos height)
   "Store undo data for a block to disk and in-memory cache."
   (save-undo-data-to-disk block-hash spent-utxos)
@@ -1398,12 +1415,16 @@ h≈280k (sb-sprof) once blocks carried 500+ spent inputs each."
     (evict-undo-cache)))
 
 (defun get-undo-data (block-hash)
-  "Get undo data for a block. Checks in-memory cache first, then disk."
+  "Get undo data for a block. Checks the in-memory cache first, then disk.
+Disk loads are deliberately NOT cached: this read path (reorg disconnects,
+getdescriptoractivity, the block filter backfill) has no eviction hook --
+entries it used to stash in *block-undo-data* carried no *undo-cache-heights*
+record, so evict-undo-cache could never see them and they were live heap
+forever. A filter backfill over the whole testnet4 chain accumulated ~4.5 GiB
+of undo lists that way and exhausted the 6 GiB heap at ~72k blocks. Only
+store-undo-data (the connect path, which does the height bookkeeping) caches."
   (or (gethash block-hash *block-undo-data*)
-      (let ((loaded (load-undo-data-from-disk block-hash)))
-        (when loaded
-          (setf (gethash block-hash *block-undo-data*) loaded))
-        loaded)))
+      (load-undo-data-from-disk block-hash)))
 
 ;;;; Block connection
 
@@ -1465,6 +1486,7 @@ Handles chain reorganizations when a competing chain has more work."
            #+sbcl (sb-sys:without-interrupts
            (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                utxo-set block new-height)))
+             (%warn-if-undo-empty block hash new-height spent-utxos)
              (store-undo-data hash spent-utxos new-height)
              ;; BIP158: add this block's basic filter to the block filter index
              ;; (no-op unless the index is enabled; never signals).
@@ -1759,6 +1781,7 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
               ;; Apply and advance the tip incrementally.
               (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                   utxo-set block height)))
+                (%warn-if-undo-empty block block-hash height spent-utxos)
                 (store-undo-data block-hash spent-utxos height)
                 (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)
                 (bitcoin-lisp.storage:update-chain-tip chain-state block-hash height)

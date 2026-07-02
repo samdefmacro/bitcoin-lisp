@@ -88,6 +88,29 @@
       (setf bitcoin-lisp.validation::*undo-base-path* nil)
       (uiop:delete-directory-tree base-path :validate t :if-does-not-exist :ignore))))
 
+(test get-undo-data-disk-load-not-cached
+  "A disk load via get-undo-data must NOT populate *block-undo-data*: the read
+path does no height bookkeeping, so evict-undo-cache (which iterates
+*undo-cache-heights*) could never evict such entries. The block filter
+backfill read every spending block's undo this way and accumulated ~4.5 GiB
+of permanently-live undo lists before exhausting a 6 GiB heap (testnet4,
+2026-07-02)."
+  (let* ((base-path (make-test-undo-dir))
+         (block-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x45))
+         (spent-utxos (make-sample-spent-utxos)))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp.validation:initialize-undo-storage base-path)
+           (bitcoin-lisp.validation::store-undo-data block-hash spent-utxos 503)
+           (clrhash bitcoin-lisp.validation::*block-undo-data*)
+           (clrhash bitcoin-lisp.validation::*undo-cache-heights*)
+           (let ((loaded (bitcoin-lisp.validation::get-undo-data block-hash)))
+             (is (= 2 (length loaded))))
+           (is (zerop (hash-table-count bitcoin-lisp.validation::*block-undo-data*)))
+           (is (zerop (hash-table-count bitcoin-lisp.validation::*undo-cache-heights*))))
+      (setf bitcoin-lisp.validation::*undo-base-path* nil)
+      (uiop:delete-directory-tree base-path :validate t :if-does-not-exist :ignore))))
+
 (test undo-data-crc-integrity
   "Corrupted undo data file should return NIL on load."
   (let* ((base-path (make-test-undo-dir))
