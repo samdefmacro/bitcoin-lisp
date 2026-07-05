@@ -39,6 +39,16 @@
    #:fsaead-decrypt
    #:hkdf-sha256-extract
    #:hkdf-sha256-expand32
+   ;; MuHash3072 (BIP-less; Core coinstats / gettxoutsetinfo muhash mode)
+   #:+muhash-modulus+
+   #:make-muhash
+   #:muhash
+   #:muhash-insert
+   #:muhash-remove
+   #:muhash-combine
+   #:muhash-divide
+   #:muhash-finalize
+   #:muhash-element-num
    ;; ElligatorSwift (BIP324 key exchange; optional libsecp256k1 module)
    #:ellswift-available-p
    #:ellswift-create
@@ -513,6 +523,9 @@
    #:utxo-set-total-amount
    #:utxo-set-distinct-txids
    #:compute-utxo-set-hash
+   #:compute-utxo-set-muhash
+   #:coin-muhash-element
+   #:coin-muhash-element*
    ;; Header index persistence
    #:save-header-index
    #:load-header-index
