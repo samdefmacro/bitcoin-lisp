@@ -6,6 +6,31 @@
 
 (in-suite :new-features-tests)
 
+;;;; Unspendable-output detection (Core CScript::IsUnspendable)
+
+(test script-unspendable-p-classification
+  "OP_RETURN-first scripts and scripts over MAX_SCRIPT_SIZE are unspendable;
+normal scripts (P2PKH, P2WPKH, bare pubkey, empty) are not."
+  (flet ((mk (&rest bytes) (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                                      :initial-contents bytes)))
+    ;; OP_RETURN (0x6a) first byte -> unspendable, regardless of what follows.
+    (is-true (bitcoin-lisp.storage:script-unspendable-p (mk #x6a)))
+    (is-true (bitcoin-lisp.storage:script-unspendable-p (mk #x6a #x24 #xaa #x21 #xa9 #xed)))
+    ;; A witness-commitment style OP_RETURN.
+    (is-true (bitcoin-lisp.storage:script-unspendable-p
+              (make-array 38 :element-type '(unsigned-byte 8)
+                             :initial-contents (list* #x6a #x24 (make-list 36 :initial-element #xaa)))))
+    ;; Oversized script (> 10000 bytes) -> unspendable.
+    (is-true (bitcoin-lisp.storage:script-unspendable-p
+              (make-array 10001 :element-type '(unsigned-byte 8) :initial-element #x51)))
+    ;; Spendable scripts.
+    (is-false (bitcoin-lisp.storage:script-unspendable-p (mk #x51)))        ; OP_TRUE
+    (is-false (bitcoin-lisp.storage:script-unspendable-p                    ; P2PKH-ish
+               (mk #x76 #xa9 #x14 #x00 #x00 #x00)))
+    (is-false (bitcoin-lisp.storage:script-unspendable-p                    ; exactly 10000
+               (make-array 10000 :element-type '(unsigned-byte 8) :initial-element #x51)))
+    (is-false (bitcoin-lisp.storage:script-unspendable-p (mk)))))           ; empty
+
 ;;;; Undo Data Persistence Tests
 
 (defun make-test-undo-dir ()
