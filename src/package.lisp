@@ -39,6 +39,11 @@
    #:fsaead-decrypt
    #:hkdf-sha256-extract
    #:hkdf-sha256-expand32
+   ;; ElligatorSwift (BIP324 key exchange; optional libsecp256k1 module)
+   #:ellswift-available-p
+   #:ellswift-create
+   #:ellswift-decode
+   #:bip324-ecdh
    ;; secp256k1 ECDSA
    #:verify-signature
    #:parse-public-key
