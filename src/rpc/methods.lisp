@@ -2974,14 +2974,94 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
 
 ;;; --- UTXO Set Statistics ---
 
+(defun %csi-amount-btc (satoshis)
+  (/ satoshis 100000000.0d0))
+
+(defun %gettxoutsetinfo-from-index (node hash-type hash-or-height)
+  "Serve gettxoutsetinfo for a historical height from the coinstatsindex
+(Core's use_index path). HASH-OR-HEIGHT is an integer height or a block-hash
+hex. Returns the cumulative stats at that height plus a block_info object of
+that block's deltas. Only the muhash hash_type is index-backed."
+  (let* ((csi (rpc-get-coinstatsindex node))
+         (chain-state (rpc-get-chain-state node)))
+    (unless (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi))
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "Querying by block height/hash requires -coinstatsindex"))
+    (when (string= hash-type "hash_serialized_3")
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "hash_serialized_3 is not available for historical heights; use 'muhash'"))
+    (let* ((height (cond
+                     ((integerp hash-or-height) hash-or-height)
+                     ((and (stringp hash-or-height) (valid-hex-hash-p hash-or-height))
+                      (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                                    chain-state (parse-hex-hash hash-or-height))))
+                        (unless entry
+                          (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                            :message "Block not found"))
+                        (bitcoin-lisp.storage:block-index-entry-height entry)))
+                     (t (error 'rpc-error :code +rpc-invalid-parameter+
+                                          :message "hash_or_height must be a height or block hash"))))
+           (stats (bitcoin-lisp.storage:coinstatsindex-get-stats csi height))
+           (prev (and (plusp height)
+                      (bitcoin-lisp.storage:coinstatsindex-get-stats csi (1- height))))
+           (entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+      (unless stats
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "Height not in coinstatsindex (out of range or below the indexed horizon)"))
+      (flet ((g (fn s) (if s (funcall fn s) 0)))
+        (let* ((unspendable-total (+ (bitcoin-lisp.storage:coinstats-unspendable-genesis stats)
+                                     (bitcoin-lisp.storage:coinstats-unspendable-bip30 stats)
+                                     (bitcoin-lisp.storage:coinstats-unspendable-scripts stats)
+                                     (bitcoin-lisp.storage:coinstats-unspendable-unclaimed stats)))
+               ;; block_info = this block's deltas (cumulative[h] - cumulative[h-1]).
+               (d-prevout (- (bitcoin-lisp.storage:coinstats-total-prevout-spent stats)
+                             (g #'bitcoin-lisp.storage:coinstats-total-prevout-spent prev)))
+               (d-coinbase (- (bitcoin-lisp.storage:coinstats-total-coinbase stats)
+                              (g #'bitcoin-lisp.storage:coinstats-total-coinbase prev)))
+               (d-newout (- (bitcoin-lisp.storage:coinstats-total-new-outputs-ex-coinbase stats)
+                            (g #'bitcoin-lisp.storage:coinstats-total-new-outputs-ex-coinbase prev)))
+               (d-uns-genesis (- (bitcoin-lisp.storage:coinstats-unspendable-genesis stats)
+                                 (g #'bitcoin-lisp.storage:coinstats-unspendable-genesis prev)))
+               (d-uns-bip30 (- (bitcoin-lisp.storage:coinstats-unspendable-bip30 stats)
+                               (g #'bitcoin-lisp.storage:coinstats-unspendable-bip30 prev)))
+               (d-uns-scripts (- (bitcoin-lisp.storage:coinstats-unspendable-scripts stats)
+                                 (g #'bitcoin-lisp.storage:coinstats-unspendable-scripts prev)))
+               (d-uns-unclaimed (- (bitcoin-lisp.storage:coinstats-unspendable-unclaimed stats)
+                                   (g #'bitcoin-lisp.storage:coinstats-unspendable-unclaimed prev))))
+          `(("height" . ,height)
+            ("bestblock" . ,(if entry (hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash entry)) ""))
+            ("txouts" . ,(bitcoin-lisp.storage:coinstats-txout-count stats))
+            ("bogosize" . ,(bitcoin-lisp.storage:coinstats-bogo-size stats))
+            ("muhash" . ,(hash-to-hex (bitcoin-lisp.crypto:muhash-finalize
+                                       (bitcoin-lisp.storage:coinstats-muhash stats))))
+            ("total_amount" . ,(%csi-amount-btc (bitcoin-lisp.storage:coinstats-total-amount stats)))
+            ("total_unspendable_amount" . ,(%csi-amount-btc unspendable-total))
+            ("block_info"
+             . (("prevout_spent" . ,(%csi-amount-btc d-prevout))
+                ("coinbase" . ,(%csi-amount-btc d-coinbase))
+                ("new_outputs_ex_coinbase" . ,(%csi-amount-btc d-newout))
+                ("unspendable" . ,(%csi-amount-btc (+ d-uns-genesis d-uns-bip30
+                                                      d-uns-scripts d-uns-unclaimed)))
+                ("unspendables"
+                 . (("genesis_block" . ,(%csi-amount-btc d-uns-genesis))
+                    ("bip30" . ,(%csi-amount-btc d-uns-bip30))
+                    ("scripts" . ,(%csi-amount-btc d-uns-scripts))
+                    ("unclaimed_rewards" . ,(%csi-amount-btc d-uns-unclaimed))))))))))))
+
 (defun rpc-gettxoutsetinfo (node params)
-  "Return statistics about the UTXO set."
+  "Return statistics about the UTXO set. With a second argument (height or
+block hash) the stats are served for that historical height from the
+coinstatsindex (Core's use_index path)."
   (let ((hash-type (or (first params) "hash_serialized_3"))
+        (hash-or-height (second params))
         (utxo-set (rpc-get-utxo-set node))
         (chain-state (rpc-get-chain-state node)))
     (unless (member hash-type '("hash_serialized_3" "muhash" "none") :test #'string=)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid hash_type (must be 'hash_serialized_3', 'muhash', or 'none')"))
+    (when hash-or-height
+      (return-from rpc-gettxoutsetinfo
+        (%gettxoutsetinfo-from-index node hash-type hash-or-height)))
     (let* ((height (bitcoin-lisp.storage:current-height chain-state))
            (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
            (txout-count (bitcoin-lisp.storage:utxo-count utxo-set))
