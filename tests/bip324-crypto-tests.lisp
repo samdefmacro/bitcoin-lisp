@@ -397,3 +397,97 @@ packet must match CIPHER-HEX; an independent receiver decrypts it."
     ""
     "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d")
 )
+
+;;; --- ElligatorSwift (BIP324 key exchange) ---
+;;;
+;;; Gated on ellswift-available-p: distro libsecp256k1 builds may lack the
+;;; module (the test-bitcoin-server system lib does), in which case these
+;;; skip rather than fail — the v2 transport degrades to v1 the same way.
+
+(defun %ellswift-vectors-path ()
+  (merge-pathnames
+   "refs/bitcoin/test/functional/test_framework/crypto/ellswift_decode_test_vectors.csv"
+   (asdf:system-source-directory :bitcoin-lisp)))
+
+(test ellswift-decode-core-vectors
+  "All 76 decode vectors from Core's ellswift_decode_test_vectors.csv:
+decode the 64-byte encoding, serialize compressed, compare the x coordinate."
+  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+      (skip "libsecp256k1 lacks the ellswift module")
+      (let ((path (%ellswift-vectors-path)))
+        (if (not (probe-file path))
+            (skip "refs/bitcoin clone not present")
+            (with-open-file (stream path)
+              (read-line stream)      ; header
+              (loop for line = (read-line stream nil)
+                    while line
+                    for comma1 = (position #\, line)
+                    for comma2 = (position #\, line :start (1+ comma1))
+                    for ell = (%bc-hex (subseq line 0 comma1))
+                    for x-hex = (subseq line (1+ comma1) comma2)
+                    for pubkey = (bitcoin-lisp.crypto:ellswift-decode ell)
+                    do (is (string= x-hex
+                                    (bitcoin-lisp.crypto:bytes-to-hex
+                                     (subseq pubkey 1)))
+                           "x mismatch for ~A" (subseq line 0 8))))))))
+
+(test ellswift-create-decode-roundtrip
+  "ellswift-create's encoding decodes back to the secret key's public key,
+with and without auxiliary randomness, and distinct aux gives distinct
+encodings of the same key."
+  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+      (skip "libsecp256k1 lacks the ellswift module")
+      (dolist (priv-hex '("0000000000000000000000000000000000000000000000000000000000000001"
+                          "00000000000000000000000000000000000000000000000000000000deadbeef"
+                          "e93fdb5c762804b9a706816aca31e35b11d2aa3080108ef46a5b1f1508819c0a"))
+        (let* ((priv (%bc-hex priv-hex))
+               (expected (bitcoin-lisp.crypto:derive-public-key priv))
+               (aux (%bc-buf 32))
+               (ell-plain (bitcoin-lisp.crypto:ellswift-create priv)))
+          (is-true ell-plain)
+          (is (= 64 (length ell-plain)))
+          (is (equalp expected (bitcoin-lisp.crypto:ellswift-decode ell-plain)))
+          (fill aux 7)
+          (let ((ell-aux (bitcoin-lisp.crypto:ellswift-create priv aux)))
+            (is (equalp expected (bitcoin-lisp.crypto:ellswift-decode ell-aux)))
+            ;; Different entropy -> different encoding of the same key.
+            (is-false (equalp ell-plain ell-aux)))))))
+
+(test bip324-ecdh-symmetry
+  "Initiator and responder derive the same 32-byte shared secret; a third
+party or a role mix-up does not."
+  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+      (skip "libsecp256k1 lacks the ellswift module")
+      (let* ((priv-a (%bc-hex "1111111111111111111111111111111111111111111111111111111111111111"))
+             (priv-b (%bc-hex "2222222222222222222222222222222222222222222222222222222222222222"))
+             (priv-c (%bc-hex "3333333333333333333333333333333333333333333333333333333333333333"))
+             (ell-a (bitcoin-lisp.crypto:ellswift-create priv-a))
+             (ell-b (bitcoin-lisp.crypto:ellswift-create priv-b))
+             ;; A initiates to B.
+             (secret-a (bitcoin-lisp.crypto:bip324-ecdh ell-b ell-a priv-a t))
+             (secret-b (bitcoin-lisp.crypto:bip324-ecdh ell-a ell-b priv-b nil)))
+        (is (= 32 (length secret-a)))
+        (is (equalp secret-a secret-b))
+        ;; Wrong key: C using its key over A/B's encodings gets a different secret.
+        (is-false (equalp secret-a
+                          (bitcoin-lisp.crypto:bip324-ecdh ell-a ell-b priv-c nil)))
+        ;; Role mix-up: both claiming initiator diverges.
+        (is-false (equalp secret-a
+                          (bitcoin-lisp.crypto:bip324-ecdh ell-a ell-b priv-b t))))))
+
+(test bip324-ecdh-pinned-vectors
+  "Exactness against the pure-Python reference (Core test_framework
+ellswift_ecdh_xonly + TaggedHash, independent of libsecp256k1): fixed key
+and fixed arbitrary 64-byte encodings, both roles. The 'ours' encoding only
+enters the tagged hash, so no key correspondence is required."
+  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+      (skip "libsecp256k1 lacks the ellswift module")
+      (let ((priv (%bc-hex "1111111111111111111111111111111111111111111111111111111111111111"))
+            (theirs (make-array 64 :element-type '(unsigned-byte 8) :initial-element #xAA))
+            (ours (make-array 64 :element-type '(unsigned-byte 8) :initial-element #xBB)))
+        (is (string= "44ea2116a4c8badb83785c77ab0fb13917e022a0e04c42d9b102013d93ac7647"
+                     (bitcoin-lisp.crypto:bytes-to-hex
+                      (bitcoin-lisp.crypto:bip324-ecdh theirs ours priv t))))
+        (is (string= "6cfd97979551cc7aeb682c4067d34f985f5e366eb49f69777e93cfc09292a627"
+                     (bitcoin-lisp.crypto:bytes-to-hex
+                      (bitcoin-lisp.crypto:bip324-ecdh theirs ours priv nil)))))))

@@ -770,3 +770,111 @@ When low-s=T and signature has high-S, returns (values nil :high-s)."
         (cffi:with-pointer-to-vector-data (msg-ptr message-hash)
           (values (= 1 (secp256k1-ecdsa-verify *secp256k1-context* sig msg-ptr pubkey))
                   t))))))
+
+;;; ============================================================
+;;; ElligatorSwift (BIP324) — 64-byte uniformly-random-looking pubkey
+;;; encodings + x-only ECDH, via libsecp256k1's ellswift module.
+;;; ============================================================
+;;;
+;;; The module is optional at build time (--enable-module-ellswift); distro
+;;; libraries may lack it, so everything here is gated on
+;;; ellswift-available-p and callers must degrade to v1 transport when it
+;;; returns NIL. Mirrors Core key.cpp EllSwiftCreate / ComputeBIP324ECDHSecret.
+
+(cffi:defcfun ("secp256k1_ellswift_create" secp256k1-ellswift-create) :int
+  (ctx :pointer)
+  (ell64 :pointer)
+  (seckey32 :pointer)
+  (auxrnd32 :pointer))
+
+(cffi:defcfun ("secp256k1_ellswift_decode" secp256k1-ellswift-decode) :int
+  (ctx :pointer)
+  (pubkey :pointer)
+  (ell64 :pointer))
+
+(cffi:defcfun ("secp256k1_ellswift_xdh" secp256k1-ellswift-xdh) :int
+  (ctx :pointer)
+  (output :pointer)
+  (ell-a64 :pointer)
+  (ell-b64 :pointer)
+  (seckey32 :pointer)
+  (party :int)
+  (hashfp :pointer)
+  (data :pointer))
+
+(defun ellswift-available-p ()
+  "T when the loaded libsecp256k1 was built with the ellswift module.
+Old system libraries lack it; the v2 transport must fall back to v1 then."
+  (ensure-secp256k1-loaded)
+  (not (null (cffi:foreign-symbol-pointer "secp256k1_ellswift_create"))))
+
+(defun %ellswift-bip324-hashfp ()
+  "The library's BIP324 xdh hash function: an exported const VARIABLE holding
+the function pointer, so it needs one dereference."
+  (cffi:mem-ref
+   (or (cffi:foreign-symbol-pointer "secp256k1_ellswift_xdh_hash_function_bip324")
+       (error "libsecp256k1 lacks the ellswift module"))
+   :pointer))
+
+(defun ellswift-create (seckey &optional auxrnd32)
+  "Compute the 64-byte ElligatorSwift encoding of SECKEY's public key.
+AUXRND32 is optional entropy that randomizes the (many-to-one) encoding;
+without it the encoding is still indistinguishable from uniform. Returns the
+64-byte encoding, or NIL if SECKEY is invalid."
+  (declare (type (simple-array (unsigned-byte 8) (*)) seckey))
+  (ensure-secp256k1-loaded)
+  (assert (= (length seckey) 32))
+  (let ((ell64 (make-array 64 :element-type '(unsigned-byte 8))))
+    (cffi:with-pointer-to-vector-data (sec-ptr seckey)
+      (cffi:with-pointer-to-vector-data (ell-ptr ell64)
+        (flet ((create (aux-ptr)
+                 (secp256k1-ellswift-create *secp256k1-context*
+                                            ell-ptr sec-ptr aux-ptr)))
+          (when (= 1 (if auxrnd32
+                         (cffi:with-pointer-to-vector-data (aux-ptr auxrnd32)
+                           (create aux-ptr))
+                         (create (cffi:null-pointer))))
+            ell64))))))
+
+(defun ellswift-decode (ell64)
+  "Decode a 64-byte ElligatorSwift encoding to a 33-byte compressed public
+key. Every 64-byte string decodes to some valid key (that is the point of the
+encoding), so this always succeeds."
+  (declare (type (simple-array (unsigned-byte 8) (*)) ell64))
+  (ensure-secp256k1-loaded)
+  (assert (= (length ell64) 64))
+  (let ((out (make-array 33 :element-type '(unsigned-byte 8))))
+    (cffi:with-foreign-objects ((pubkey :uint8 +secp256k1-pubkey-size+)
+                                (outlen :size))
+      (cffi:with-pointer-to-vector-data (ell-ptr ell64)
+        (secp256k1-ellswift-decode *secp256k1-context* pubkey ell-ptr))
+      (setf (cffi:mem-ref outlen :size) 33)
+      (cffi:with-pointer-to-vector-data (out-ptr out)
+        (secp256k1-ec-pubkey-serialize *secp256k1-context* out-ptr outlen
+                                       pubkey +secp256k1-ec-compressed+))
+      out)))
+
+(defun bip324-ecdh (their-ell64 our-ell64 seckey initiating)
+  "Compute the 32-byte BIP324 shared secret via x-only ECDH over
+ElligatorSwift keys, using libsecp256k1's own BIP324 hash function
+(tagged hash of ell_a64 || ell_b64 || ecdh_x). BIP324 designates the
+INITIATOR as party A, so the a/b argument order and the party flag both
+derive from INITIATING (Core key.cpp ComputeBIP324ECDHSecret). Returns the
+secret, or NIL if SECKEY is invalid."
+  (declare (type (simple-array (unsigned-byte 8) (*)) their-ell64 our-ell64 seckey))
+  (ensure-secp256k1-loaded)
+  (assert (and (= (length their-ell64) 64) (= (length our-ell64) 64)
+               (= (length seckey) 32)))
+  (let ((output (make-array 32 :element-type '(unsigned-byte 8)))
+        (ell-a (if initiating our-ell64 their-ell64))
+        (ell-b (if initiating their-ell64 our-ell64)))
+    (cffi:with-pointer-to-vector-data (out-ptr output)
+      (cffi:with-pointer-to-vector-data (a-ptr ell-a)
+        (cffi:with-pointer-to-vector-data (b-ptr ell-b)
+          (cffi:with-pointer-to-vector-data (sec-ptr seckey)
+            (when (= 1 (secp256k1-ellswift-xdh *secp256k1-context*
+                                               out-ptr a-ptr b-ptr sec-ptr
+                                               (if initiating 0 1)
+                                               (%ellswift-bip324-hashfp)
+                                               (cffi:null-pointer)))
+              output)))))))
