@@ -60,7 +60,8 @@
                                (:file "chain")
                                (:file "txindex")
                                (:file "blockfilter")
-                               (:file "blockfilterindex")))
+                               (:file "blockfilterindex")
+                               (:file "coinstatsindex")))
                  (:module "validation"
                   :components ((:file "script")
                                (:file "transaction")
@@ -178,6 +179,8 @@
                              ;; BIP 324 v2 transport loopback tests
                              (:file "bip324-transport-tests")
                              ;; MuHash3072 tests
-                             (:file "muhash-tests"))))
+                             (:file "muhash-tests")
+                             ;; coinstatsindex tests
+                             (:file "coinstatsindex-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
