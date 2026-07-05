@@ -1095,5 +1095,6 @@
    #:start-file-logging
    #:stop-file-logging
    #:maybe-periodic-flush
-   #:index-block-filter))
+   #:index-block-filter
+   #:index-block-coinstats))
 
