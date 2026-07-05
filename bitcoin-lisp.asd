@@ -40,6 +40,7 @@
                  (:module "crypto"
                   :components ((:file "hash")
                                (:file "chacha20")
+                               (:file "muhash")
                                (:file "secp256k1")
                                (:file "bip324")
                                (:file "address")
@@ -175,6 +176,8 @@
                              ;; BIP 324 cipher suite tests
                              (:file "bip324-crypto-tests")
                              ;; BIP 324 v2 transport loopback tests
-                             (:file "bip324-transport-tests"))))
+                             (:file "bip324-transport-tests")
+                             ;; MuHash3072 tests
+                             (:file "muhash-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

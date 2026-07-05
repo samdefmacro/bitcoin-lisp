@@ -2979,9 +2979,9 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
   (let ((hash-type (or (first params) "hash_serialized_3"))
         (utxo-set (rpc-get-utxo-set node))
         (chain-state (rpc-get-chain-state node)))
-    (unless (member hash-type '("hash_serialized_3" "none") :test #'string=)
+    (unless (member hash-type '("hash_serialized_3" "muhash" "none") :test #'string=)
       (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid hash_type (must be 'hash_serialized_3' or 'none')"))
+                        :message "Invalid hash_type (must be 'hash_serialized_3', 'muhash', or 'none')"))
     (let* ((height (bitcoin-lisp.storage:current-height chain-state))
            (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
            (txout-count (bitcoin-lisp.storage:utxo-count utxo-set))
@@ -2993,11 +2993,19 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                      ("transactions" . ,tx-count)
                      ("txouts" . ,txout-count)
                      ("total_amount" . ,total-btc))))
-      ;; Add hash if requested
-      (when (string= hash-type "hash_serialized_3")
-        (let ((utxo-hash (bitcoin-lisp.storage:compute-utxo-set-hash utxo-set)))
-          (setf result (append result
-                               `(("hash_serialized_3" . ,(hash-to-hex utxo-hash)))))))
+      ;; Add hash if requested (both hashes present the digest in display
+      ;; byte order via hash-to-hex, matching Core's uint256 GetHex()).
+      (cond
+        ((string= hash-type "hash_serialized_3")
+         (setf result (append result
+                              `(("hash_serialized_3"
+                                 . ,(hash-to-hex (bitcoin-lisp.storage:compute-utxo-set-hash
+                                                  utxo-set)))))))
+        ((string= hash-type "muhash")
+         (setf result (append result
+                              `(("muhash"
+                                 . ,(hash-to-hex (bitcoin-lisp.storage:compute-utxo-set-muhash
+                                                  utxo-set))))))))
       result)))
 
 ;;; --- Block Statistics ---
