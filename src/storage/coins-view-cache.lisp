@@ -651,6 +651,43 @@ in gettxoutsetinfo)."
                         (setf (gethash txid txids) t)))
     (hash-table-count txids)))
 
+(defun coin-muhash-element (txid vout height coinbase amount script)
+  "Serialize one UTXO into the byte string MuHash hashes (Bitcoin Core
+coinstats.cpp TxOutSer): outpoint (txid || vout LE32), then the packed
+code (height << 1 | coinbase) as LE32, then the amount as LE64, then the
+scriptPubKey with a compactsize length prefix. Used for gettxoutsetinfo
+muhash mode and (per added/removed coin) the coinstats index."
+  (flexi-streams:with-output-to-sequence (out)
+    (write-sequence txid out)
+    (loop for i below 4 do (write-byte (logand (ash vout (* -8 i)) #xff) out))
+    (let ((code (logior (ash height 1) (if coinbase 1 0))))
+      (loop for i below 4 do (write-byte (logand (ash code (* -8 i)) #xff) out)))
+    (loop for i below 8 do (write-byte (logand (ash amount (* -8 i)) #xff) out))
+    (bitcoin-lisp.serialization:write-compact-size out (length script))
+    (write-sequence script out)))
+
+(defun coin-muhash-element* (txid vout entry)
+  "coin-muhash-element for a utxo-entry ENTRY."
+  (coin-muhash-element txid vout
+                       (utxo-entry-height entry)
+                       (utxo-entry-coinbase entry)
+                       (utxo-entry-value entry)
+                       (utxo-entry-script-pubkey entry)))
+
+(defun compute-utxo-set-muhash (view)
+  "Compute the MuHash of the whole UTXO set (Core gettxoutsetinfo
+hash_type=muhash). Returns the 32-byte finalized hash in internal byte order
+(reverse for display). MuHash is order-independent, so the iteration order
+does not affect the result."
+  (let ((mu (bitcoin-lisp.crypto:make-muhash)))
+    (utxo-set-iterate
+     view
+     (lambda (txid vout entry)
+       (bitcoin-lisp.crypto:muhash-insert
+        mu (coerce (coin-muhash-element* txid vout entry)
+                   '(simple-array (unsigned-byte 8) (*))))))
+    (bitcoin-lisp.crypto:muhash-finalize mu)))
+
 (defun compute-utxo-set-hash (view)
   "Compute the hash_serialized_3 UTXO set hash. Matches Bitcoin Core's
 format. Returns a 32-byte SHA256 digest."

@@ -1121,6 +1121,40 @@ RPC layer normalizes into a JSON object."
         (is (stringp hash))
         (is (= (length hash) 64))))))
 
+(test rpc-gettxoutsetinfo-muhash
+  "gettxoutsetinfo hash_type=muhash returns a 64-hex muhash (order-independent,
+distinct from hash_serialized_3), and inserting then removing a coin restores
+the value."
+  (let* ((node (make-test-node))
+         (utxo-set (bitcoin-lisp::node-utxo-set node))
+         (txid1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (txid2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
+         (script (make-array 25 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (bitcoin-lisp.storage:add-utxo utxo-set txid1 0 100000000 script 1)
+    (bitcoin-lisp.storage:add-utxo utxo-set txid2 0 25000000 script 2)
+    (let* ((mh (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash")))
+           (muhash (cdr (assoc "muhash" mh :test #'string=)))
+           (h3 (cdr (assoc "hash_serialized_3"
+                           (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "hash_serialized_3"))
+                           :test #'string=))))
+      (is (stringp muhash))
+      (is (= 64 (length muhash)))
+      ;; muhash mode does not also emit hash_serialized_3, and vice versa.
+      (is (null (assoc "hash_serialized_3" mh :test #'string=)))
+      ;; The two hash types are computed over different serializations.
+      (is (not (string= muhash h3)))
+      ;; Order-independence / add-remove inverse: add a coin, then delete it,
+      ;; and the muhash returns to its prior value.
+      (bitcoin-lisp.storage:add-utxo utxo-set txid2 1 7 script 3)
+      (bitcoin-lisp.storage:remove-utxo utxo-set txid2 1)
+      (is (string= muhash
+                   (cdr (assoc "muhash"
+                               (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash"))
+                               :test #'string=)))))
+    ;; An unknown hash_type still errors.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "bogus")))))
+
 ;;; --- getblockstats Tests ---
 
 (test rpc-getblockstats-invalid-params
