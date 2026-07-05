@@ -16,7 +16,14 @@
   ;; Serializes writes to this socket: the sync thread and RPC-thread senders
   ;; (ping, getblockfrompeer) can both call send-bytes, and interleaved
   ;; write-sequence calls would corrupt the wire framing.
-  (send-lock (bt:make-lock "conn-send")))
+  (send-lock (bt:make-lock "conn-send"))
+  ;; BIP324 v2 session (a v2-transport struct), or NIL for plaintext v1.
+  ;; Set once by the v2 handshake; message I/O in peer.lisp branches on it.
+  (transport nil)
+  ;; Bytes sniffed ahead of the stream (inbound v1-vs-v2 detection reads 16
+  ;; bytes before knowing which transport owns them); receive-bytes serves
+  ;; these before touching the socket.
+  (pushback nil :type (or null (simple-array (unsigned-byte 8) (*)))))
 
 ;;; Node-wide cumulative byte counters (survive individual connection
 ;;; lifetimes), for getnettotals. Bumped on every send/receive. Plain incf —
@@ -154,6 +161,14 @@ Returns a byte vector or NIL on failure/timeout."
                  (total-read 0)
                  (deadline (+ (get-internal-real-time)
                               (* timeout internal-time-units-per-second))))
+            ;; Serve sniffed-ahead bytes (inbound v1/v2 detection) first.
+            (let ((pushback (connection-pushback conn)))
+              (when pushback
+                (let ((n (min count (length pushback))))
+                  (replace buffer pushback :end2 n)
+                  (setf total-read n
+                        (connection-pushback conn)
+                        (when (< n (length pushback)) (subseq pushback n))))))
             ;; Read until we have all bytes or timeout
             (loop while (< total-read count)
                   ;; Bail promptly on shutdown: a blocked peer read (message wait
@@ -167,13 +182,16 @@ Returns a byte vector or NIL on failure/timeout."
                                          internal-time-units-per-second)))
                        (when (<= time-left 0)
                          (return-from receive-bytes nil))
-                       ;; Wait for data with timeout
-                       (let ((ready (usocket:wait-for-input socket
-                                                            :timeout (max 0.1 (min time-left 5.0))
-                                                            :ready-only t)))
-                         (unless ready
-                           ;; Timeout - no data available
-                           (return-from receive-bytes nil))
+                       ;; Wait for data, but only up to a 5s sub-window at a
+                       ;; time. A not-ready result is NOT treated as failure:
+                       ;; another thread's foreign call (secp256k1) can trigger
+                       ;; a GC safepoint whose signal interrupts the underlying
+                       ;; select() with EINTR, which usocket surfaces as
+                       ;; not-ready. We simply re-wait until the real deadline;
+                       ;; genuine silence is caught by the time-left check above.
+                       (when (usocket:wait-for-input socket
+                                                     :timeout (max 0.1 (min time-left 5.0))
+                                                     :ready-only t)
                          ;; Socket claims to be ready - read what we can
                          (let ((n (read-sequence buffer stream :start total-read)))
                            (when (= n total-read)

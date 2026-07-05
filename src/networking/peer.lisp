@@ -195,11 +195,15 @@ Returns NIL if the host is banned or discouraged (never dial either)."
 ;;; Message I/O
 
 (defun send-message (peer message-bytes)
-  "Send a raw message to a peer.
-Returns T on success, NIL on failure."
+  "Send a raw (v1-framed) message to a peer; a connection with a v2 transport
+re-frames it as an encrypted BIP324 packet. Returns T on success, NIL on
+failure."
   (when (and (peer-connection peer)
              (connection-connected (peer-connection peer)))
-    (send-bytes (peer-connection peer) message-bytes)))
+    (let ((conn (peer-connection peer)))
+      (if (connection-transport conn)
+          (v2-send-message conn (connection-transport conn) message-bytes)
+          (send-bytes conn message-bytes)))))
 
 (defun receive-message (peer &key (timeout 30))
   "Receive a message from a peer.
@@ -207,6 +211,10 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
   (when (and (peer-connection peer)
              (connection-connected (peer-connection peer)))
     (let ((conn (peer-connection peer)))
+      (when (connection-transport conn)
+        (return-from receive-message
+          (v2-receive-message conn (connection-transport conn)
+                              :timeout timeout)))
       ;; Read header (24 bytes)
       (let ((header-bytes (receive-bytes conn 24 :timeout timeout)))
         (when header-bytes
@@ -243,12 +251,14 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
 VERACK). Returns T if the version was sent."
-  ;; BIP 159: advertise NODE_NETWORK_LIMITED instead of NODE_NETWORK when pruning.
-  (let* ((services (if (bitcoin-lisp:pruning-enabled-p)
-                       (logior bitcoin-lisp.serialization:+node-network-limited+
-                               bitcoin-lisp.serialization:+node-witness+)
-                       (logior bitcoin-lisp.serialization:+node-network+
-                               bitcoin-lisp.serialization:+node-witness+)))
+  ;; BIP 159: advertise NODE_NETWORK_LIMITED instead of NODE_NETWORK when
+  ;; pruning. BIP 324: add NODE_P2P_V2 when the v2 transport is available.
+  (let* ((services (logior (if (bitcoin-lisp:pruning-enabled-p)
+                               bitcoin-lisp.serialization:+node-network-limited+
+                               bitcoin-lisp.serialization:+node-network+)
+                           bitcoin-lisp.serialization:+node-witness+
+                           (if (v2-available-p)
+                               bitcoin-lisp.serialization:+node-p2p-v2+ 0)))
          (version-payload (bitcoin-lisp.serialization:make-version-message-bytes
                            :services services
                            :start-height 0
@@ -293,21 +303,61 @@ peer :ready and returns T on VERACK; NIL otherwise."
                ((string= command "wtxidrelay") (setf (peer-wtxid-relay peer) t))))
         finally (return nil)))
 
-(defun perform-handshake (peer)
+(defun %v2-try-outbound (peer)
+  "Attempt the BIP324 v2 handshake on PEER's fresh outbound connection.
+On :FALLBACK-V1 (the peer never answered our key -- almost certainly a v1
+node), reconnect to the same host/port and continue in v1. Returns T when the
+version handshake may proceed (over whichever transport), NIL to give up."
+  (let* ((conn (peer-connection peer))
+         (result (v2-handshake-outbound conn)))
+    (cond
+      ((v2-transport-p result)
+       (setf (connection-transport conn) result)
+       (bitcoin-lisp:log-info "Peer ~A: v2 transport established (outbound)"
+                              (peer-address peer))
+       t)
+      ((eq result :fallback-v1)
+       (let ((fresh (make-tcp-connection (connection-host conn)
+                                         (connection-port conn))))
+         (when fresh
+           (close-connection conn)
+           (setf (peer-connection peer) fresh)
+           (bitcoin-lisp:log-info "Peer ~A: no v2 response, reconnected as v1"
+                                  (peer-address peer))
+           t)))
+      (t nil))))
+
+(defun perform-handshake (peer &key (try-v2 (v2-available-p)))
   "Outbound version handshake (we initiate): send version+caps, receive the
-peer's version, send verack, await theirs. Returns T on success."
+peer's version, send verack, await theirs. When TRY-V2 (default: whenever the
+v2 transport is enabled and supported), the BIP324 encrypted transport is
+established first, reconnecting as v1 if the peer turns out not to speak it.
+Returns T on success."
   (setf (peer-state peer) :handshaking)
-  (and (%send-version-and-capabilities peer)
+  (and (or (not try-v2)
+           (%v2-try-outbound peer))
+       (%send-version-and-capabilities peer)
        (%receive-and-store-version peer)
        (send-message peer (bitcoin-lisp.serialization:make-verack-message))
        (%await-verack peer)))
 
 (defun perform-inbound-handshake (peer &key (timeout 15))
   "Inbound version handshake (the peer dialed us, so it sends VERSION first):
-receive their version, send ours+caps, send verack, await theirs. A shorter
-TIMEOUT than the outbound path bounds how long a silent inbound peer can stall.
-Returns T on success."
+receive their version, send ours+caps, send verack, await theirs. When v2
+transport is enabled, the first 16 bytes decide v1 vs v2 (BIP324 detection):
+v1 bytes are pushed back for the normal path; a v2 initiator gets the full
+key/garbage/version-packet exchange before the version handshake. A shorter
+TIMEOUT than the outbound path bounds how long a silent inbound peer can
+stall. Returns T on success."
   (setf (peer-state peer) :handshaking)
+  (when (v2-available-p)
+    (let ((detected (v2-detect-inbound (peer-connection peer) :timeout timeout)))
+      (cond ((v2-transport-p detected)
+             (setf (connection-transport (peer-connection peer)) detected)
+             (bitcoin-lisp:log-info "Peer ~A: v2 transport established (inbound)"
+                                    (peer-address peer)))
+            ((eq detected :v1))         ; sniffed bytes pushed back; proceed v1
+            (t (return-from perform-inbound-handshake nil)))))
   (and (%receive-and-store-version peer :timeout timeout)
        (%send-version-and-capabilities peer)
        (send-message peer (bitcoin-lisp.serialization:make-verack-message))
