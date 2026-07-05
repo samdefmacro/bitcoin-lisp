@@ -351,9 +351,15 @@ undo list — (txid index entry) for every spent UTXO, in apply order."
                        (push (list prev-txid prev-index entry) spent)))))
                (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
                      for out-idx from 0
+                     for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                     ;; Drop provably-unspendable outputs (Core AddCoin returns
+                     ;; early on IsUnspendable). They can never be spent, so
+                     ;; keeping them only bloats the UTXO set and diverges our
+                     ;; gettxoutsetinfo hashes from Core.
+                     unless (script-unspendable-p spk)
                      do (coin-view-add cache txid out-idx
                                        (bitcoin-lisp.serialization:tx-out-value output)
-                                       (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                                       spk
                                        height
                                        :coinbase is-coinbase
                                        ;; Coinbase tx outputs at a pre-BIP30 height
@@ -512,10 +518,14 @@ data — (txid index entry) for each spent UTXO, in apply order."
                         (setf (utxo-set-dirty view) t))))
                   (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
                         for out-idx from 0
+                        for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                        ;; Drop provably-unspendable outputs (see the
+                        ;; coins-view-cache branch above / Core AddCoin).
+                        unless (script-unspendable-p spk)
                         do (let ((key (make-utxo-key txid out-idx))
                                  (entry (make-utxo-entry
                                          :value (bitcoin-lisp.serialization:tx-out-value output)
-                                         :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                                         :script-pubkey spk
                                          :height height
                                          :coinbase is-coinbase)))
                              (setf (gethash key (utxo-set-entries view)) entry)

@@ -25,8 +25,6 @@
 
 (defconstant +csi-key-stat+ #x53 "LevelDB key prefix ('S') for per-height records.")
 (defconstant +csi-key-meta+ #x42 "LevelDB key ('B') for the best-indexed metadata.")
-(defconstant +csi-max-script-size+ 10000
-  "Core MAX_SCRIPT_SIZE: a scriptPubKey larger than this is unspendable.")
 
 (defstruct coinstatsindex
   "coinstatsindex state (open LevelDB handle + enabled flag)."
@@ -179,12 +177,6 @@ key order is height order)."
 
 ;;; --- per-block update ---
 
-(defun %script-unspendable-p (script)
-  "T if SCRIPT is provably unspendable (Core CScript::IsUnspendable): starts
-with OP_RETURN (0x6a) or is longer than MAX_SCRIPT_SIZE."
-  (or (and (plusp (length script)) (= (aref script 0) #x6a))
-      (> (length script) +csi-max-script-size+)))
-
 (defun %csi-bip30-unspendable-p (height)
   "The two mainnet coinbases (heights 91722, 91812) BIP30-overwritten and thus
 unspendable (Core IsBIP30Unspendable). Height-only match; only mainnet."
@@ -230,26 +222,23 @@ STATS."
                              for vout from 0
                              for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey out)
                              for value = (bitcoin-lisp.serialization:tx-out-value out)
-                             ;; NB: this node adds ALL created outputs to its
-                             ;; UTXO set, including provably-unspendable ones
-                             ;; (e.g. the coinbase witness-commitment OP_RETURN)
-                             ;; -- a divergence from Core, which drops them. To
-                             ;; keep the index equal to this node's own
-                             ;; gettxoutsetinfo we mirror it and index every
-                             ;; output. (unspendable-scripts stays 0 until the
-                             ;; node is fixed to skip unspendable outputs, at
-                             ;; which point restore the %script-unspendable-p
-                             ;; branch here for Core parity.)
-                             do (progn
-                                  (bitcoin-lisp.crypto:muhash-insert
-                                   mu (coerce (coin-muhash-element txid vout height coinbase value spk)
-                                              '(simple-array (unsigned-byte 8) (*))))
-                                  (if coinbase
-                                      (incf (coinstats-total-coinbase stats) value)
-                                      (incf (coinstats-total-new-outputs-ex-coinbase stats) value))
-                                  (incf (coinstats-txout-count stats))
-                                  (incf (coinstats-total-amount stats) value)
-                                  (incf (coinstats-bogo-size stats) (+ 44 (length spk)))))))
+                             ;; Provably-unspendable outputs are dropped from the
+                             ;; UTXO set (Core AddCoin / our block apply), so they
+                             ;; contribute to the unspendable-scripts bucket, not
+                             ;; the MuHash or the live counts.
+                             do (cond
+                                  ((script-unspendable-p spk)
+                                   (incf (coinstats-unspendable-scripts stats) value))
+                                  (t
+                                   (bitcoin-lisp.crypto:muhash-insert
+                                    mu (coerce (coin-muhash-element txid vout height coinbase value spk)
+                                               '(simple-array (unsigned-byte 8) (*))))
+                                   (if coinbase
+                                       (incf (coinstats-total-coinbase stats) value)
+                                       (incf (coinstats-total-new-outputs-ex-coinbase stats) value))
+                                   (incf (coinstats-txout-count stats))
+                                   (incf (coinstats-total-amount stats) value)
+                                   (incf (coinstats-bogo-size stats) (+ 44 (length spk))))))))
           ;; Spent prevouts (from undo data).
           (dolist (entry spent-utxos)
             (destructuring-bind (ptxid pidx putxo) entry
