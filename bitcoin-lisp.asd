@@ -74,6 +74,7 @@
                                (:file "builder")))
                  (:module "networking"
                   :components ((:file "connection")
+                               (:file "v2-transport")
                                (:file "peer")
                                (:file "peerdb")
                                (:file "addrman")
@@ -172,6 +173,8 @@
                              ;; BIP 174 PSBT tests
                              (:file "psbt-tests")
                              ;; BIP 324 cipher suite tests
-                             (:file "bip324-crypto-tests"))))
+                             (:file "bip324-crypto-tests")
+                             ;; BIP 324 v2 transport loopback tests
+                             (:file "bip324-transport-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

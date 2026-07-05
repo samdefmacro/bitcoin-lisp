@@ -542,7 +542,8 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                         (rpc-password nil)
                         (listen t)
                         (listen-bind "0.0.0.0")
-                        (dbcache-mib nil))
+                        (dbcache-mib nil)
+                        (v2transport nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -801,6 +802,13 @@ Returns the node instance."
                   (lambda (h pct)
                     (log-info "Block filter index: height ~D (~,1F%)" h pct)))))
           (log-info "Block filter index build complete: ~D block~:P indexed" n)))))
+
+  ;; BIP324 v2 transport opt-in. Effective only if libsecp256k1 has the
+  ;; ellswift module (probed lazily per connection via v2-available-p).
+  (setf bitcoin-lisp.networking:*v2-transport-enabled* (and v2transport t))
+  (when v2transport
+    (log-info "BIP324 v2 transport enabled (~:[ellswift NOT available -- will run v1 only~;active~])"
+              (bitcoin-lisp.networking:v2-available-p)))
 
   ;; Initialize secp256k1
   (log-info "Initializing cryptographic context...")
