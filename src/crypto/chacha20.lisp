@@ -270,45 +270,48 @@ packet in each direction."
 (defun aead-set-key (aead key)
   (chacha20-set-key (aead-chacha20-poly1305-cipher aead) key))
 
-(defun %aead-compute-tag (aead aad cipher cipher-end tag tag-start)
-  "Poly1305 tag over AAD and CIPHER[0..CIPHER-END) per RFC 8439, written to
-TAG[TAG-START..+16). The cipher must be seeked to the message nonce at block
-0; consumes exactly one keystream block (leaving the stream at block 1)."
+(defun %aead-compute-tag (aead aad cipher cipher-start cipher-end tag tag-start)
+  "Poly1305 tag over AAD and CIPHER[CIPHER-START..CIPHER-END) per RFC 8439,
+written to TAG[TAG-START..+16). The cipher must be seeked to the message nonce
+at block 0; consumes exactly one keystream block (leaving the stream at block
+1)."
   (let ((chacha (aead-chacha20-poly1305-cipher aead))
         (block0 (aead-chacha20-poly1305-block0 aead))
         (poly-key (aead-chacha20-poly1305-poly-key aead))
-        (lengths (aead-chacha20-poly1305-lengths aead)))
+        (lengths (aead-chacha20-poly1305-lengths aead))
+        (cipher-len (- cipher-end cipher-start)))
     (chacha20-keystream chacha block0)
     (replace poly-key block0 :end2 32)
     (let ((mac (ironclad:make-mac :poly1305 poly-key)))
       (ironclad:update-mac mac aad)
       (let ((pad (mod (- 16 (mod (length aad) 16)) 16)))
         (ironclad:update-mac mac *aead-zero-pad* :end pad))
-      (ironclad:update-mac mac cipher :end cipher-end)
-      (let ((pad (mod (- 16 (mod cipher-end 16)) 16)))
+      (ironclad:update-mac mac cipher :start cipher-start :end cipher-end)
+      (let ((pad (mod (- 16 (mod cipher-len 16)) 16)))
         (ironclad:update-mac mac *aead-zero-pad* :end pad))
       (loop for i below 8
             do (setf (aref lengths i) (ldb (byte 8 (* 8 i)) (length aad))
-                     (aref lengths (+ 8 i)) (ldb (byte 8 (* 8 i)) cipher-end)))
+                     (aref lengths (+ 8 i)) (ldb (byte 8 (* 8 i)) cipher-len)))
       (ironclad:update-mac mac lengths)
       (replace tag (ironclad:produce-mac mac) :start1 tag-start))))
 
-(defun aead-encrypt (aead plain aad nonce1 nonce2 cipher &optional (plain2 nil))
+(defun aead-encrypt (aead plain aad nonce1 nonce2 cipher &optional (plain2 nil) (out-start 0))
   "Encrypt PLAIN (optionally followed by PLAIN2) with AAD under the 96-bit
-nonce (NONCE1 u32, NONCE2 u64) into CIPHER, which must be 16 bytes longer than
-the plaintext. Returns CIPHER."
+nonce (NONCE1 u32, NONCE2 u64) into CIPHER at OUT-START, which must leave
+room for the plaintext plus 16 tag bytes. Returns CIPHER."
   (let* ((c (aead-chacha20-poly1305-cipher aead))
          (len1 (length plain))
          (total (+ len1 (if plain2 (length plain2) 0))))
-    (assert (= (length cipher) (+ total +poly1305-taglen+)))
+    (assert (>= (length cipher) (+ out-start total +poly1305-taglen+)))
     (chacha20-seek c nonce1 nonce2 1)
-    (chacha20-crypt c plain cipher)
+    (chacha20-crypt c plain cipher :out-start out-start)
     (when plain2
       ;; Continue the keystream across the segment boundary, writing the
       ;; second segment directly after the first (Core's two-span Encrypt).
-      (chacha20-crypt c plain2 cipher :out-start len1))
+      (chacha20-crypt c plain2 cipher :out-start (+ out-start len1)))
     (chacha20-seek c nonce1 nonce2 0)
-    (%aead-compute-tag aead aad cipher total cipher total)
+    (%aead-compute-tag aead aad cipher out-start (+ out-start total)
+                       cipher (+ out-start total))
     cipher))
 
 (defun aead-decrypt (aead cipher aad nonce1 nonce2 plain &optional (plain2 nil))
@@ -319,7 +322,7 @@ PLAIN). Returns T if the tag is valid, NIL otherwise (outputs unspecified)."
          (expected (aead-chacha20-poly1305-expected aead)))
     (assert (= total (+ (length plain) (if plain2 (length plain2) 0))))
     (chacha20-seek c nonce1 nonce2 0)
-    (%aead-compute-tag aead aad cipher total expected 0)
+    (%aead-compute-tag aead aad cipher 0 total expected 0)
     (unless (ironclad:constant-time-equal expected (subseq cipher total))
       (return-from aead-decrypt nil))
     ;; ComputeTag consumed exactly block 0; the stream is at block 1.
@@ -363,13 +366,14 @@ key ratchets from the cipher's own keystream every REKEY-INTERVAL packets
     (setf (fschacha20poly1305-packet-counter fsa) 0)
     (incf (fschacha20poly1305-rekey-counter fsa))))
 
-(defun fsaead-encrypt (fsa plain aad cipher &optional (plain2 nil))
-  "Encrypt PLAIN (+ PLAIN2) with AAD into CIPHER (plaintext length + 16),
-advancing the packet counter (and key, at the rekey interval)."
+(defun fsaead-encrypt (fsa plain aad cipher &optional (plain2 nil) (out-start 0))
+  "Encrypt PLAIN (+ PLAIN2) with AAD into CIPHER at OUT-START (needs plaintext
+length + 16 bytes of room), advancing the packet counter (and key, at the
+rekey interval)."
   (aead-encrypt (fschacha20poly1305-aead fsa) plain aad
                 (fschacha20poly1305-packet-counter fsa)
                 (fschacha20poly1305-rekey-counter fsa)
-                cipher plain2)
+                cipher plain2 out-start)
   (%fsaead-next-packet fsa)
   cipher)
 

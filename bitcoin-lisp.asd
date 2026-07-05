@@ -41,6 +41,7 @@
                   :components ((:file "hash")
                                (:file "chacha20")
                                (:file "secp256k1")
+                               (:file "bip324")
                                (:file "address")
                                (:file "bip32")))
                  (:module "serialization"
