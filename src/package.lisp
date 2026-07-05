@@ -27,6 +27,18 @@
    #:bytes-to-hex
    #:hex-to-bytes
    #:reverse-bytes
+   ;; BIP324 cipher suite: forward-secure wrappers + HKDF only. The bare
+   ;; ChaCha20/AEAD primitives stay internal -- BIP324's cipher/transport
+   ;; layers consume exactly this surface (as in Core), and exposing the
+   ;; unratcheted primitives would invite bypassing forward secrecy.
+   #:+poly1305-taglen+
+   #:make-fschacha20
+   #:fschacha20-crypt
+   #:make-fschacha20poly1305
+   #:fsaead-encrypt
+   #:fsaead-decrypt
+   #:hkdf-sha256-extract
+   #:hkdf-sha256-expand32
    ;; secp256k1 ECDSA
    #:verify-signature
    #:parse-public-key
