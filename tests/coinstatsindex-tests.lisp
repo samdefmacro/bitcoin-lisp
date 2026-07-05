@@ -84,6 +84,53 @@ height's MuHash is retrievable and distinct from its predecessor."
                           prev-hash hh)))
          (bitcoin-lisp.storage:close-coinstatsindex csi))))))
 
+(test coinstatsindex-connect-hook-and-rpc
+  "With the index enabled on a node, the connect-time hook advances it as
+blocks are mined, and gettxoutsetinfo <height> serves matching historical
+stats from the index (muhash equal to the direct whole-set muhash at the tip)."
+  (%with-regtest
+   (let* ((tag (format nil "csirpc~D" (get-internal-real-time)))
+          (node (%regtest-node-fixture tag))
+          (idxbase (merge-pathnames (format nil "test-csirpc-~A/" tag)
+                                    (uiop:temporary-directory))))
+     (ensure-directories-exist idxbase)
+     (setf (bitcoin-lisp::node-coinstatsindex node)
+           (bitcoin-lisp.storage:init-coinstatsindex idxbase :enabled t))
+     ;; Seed genesis so the connect hook (which needs the parent record) can
+     ;; start at height 1, mirroring start-node's backfill seed.
+     (bitcoin-lisp.storage:coinstatsindex-seed-genesis
+      (bitcoin-lisp::node-coinstatsindex node)
+      (bitcoin-lisp.validation:calculate-block-subsidy 0)
+      (bitcoin-lisp.storage:network-genesis-hash :regtest))
+     (let ((bitcoin-lisp::*node* node))
+       ;; The connect hook fires as generatetodescriptor connects each block.
+       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 6 "raw(51)"))
+       (let* ((csi (bitcoin-lisp::node-coinstatsindex node))
+              (cs (bitcoin-lisp::node-chain-state node))
+              (utxo (bitcoin-lisp::node-utxo-set node))
+              (tip (bitcoin-lisp.storage:current-height cs)))
+         ;; The hook kept the index at the tip.
+         (is (= tip (bitcoin-lisp.storage:coinstatsindex-height csi)))
+         ;; gettxoutsetinfo <tip> from the index matches the direct whole set.
+         (let* ((res (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
+                (direct (bitcoin-lisp.rpc::hash-to-hex
+                         (bitcoin-lisp.storage:compute-utxo-set-muhash utxo))))
+           (is (= tip (cdr (assoc "height" res :test #'string=))))
+           (is (string= direct (cdr (assoc "muhash" res :test #'string=))))
+           (is (= (bitcoin-lisp.storage:utxo-count utxo)
+                  (cdr (assoc "txouts" res :test #'string=))))
+           ;; block_info is present with the per-block deltas.
+           (is-true (assoc "block_info" res :test #'string=))
+           (is-true (assoc "unspendables" (cdr (assoc "block_info" res :test #'string=))
+                           :test #'string=)))
+         ;; A height above the tip errors.
+         (signals bitcoin-lisp.rpc::rpc-error
+           (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash" (+ tip 100))))
+         ;; hash_serialized_3 is not index-backed.
+         (signals bitcoin-lisp.rpc::rpc-error
+           (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "hash_serialized_3" 1)))
+         (bitcoin-lisp.storage:close-coinstatsindex csi))))))
+
 (test coinstatsindex-record-roundtrip
   "A coinstats record survives encode/decode with all fields intact, including
 the full MuHash numerator/denominator fraction."

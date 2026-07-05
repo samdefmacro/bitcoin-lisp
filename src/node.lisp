@@ -76,6 +76,7 @@ we cap lower). Excess inbound connections are disconnected at merge time.")
   (mempool nil)
   (tx-index nil)  ; Transaction index (optional, for getrawtransaction)
   (blockfilterindex nil)  ; BIP158 basic block filter index (optional)
+  (coinstatsindex nil)  ; per-height UTXO stats + MuHash index (optional)
   (fee-estimator nil)  ; Fee rate estimator for estimatesmartfee
   (address-book nil)  ; Persistent peer address database
   (recent-rejects nil)  ; Recently rejected transaction filter (DoS protection)
@@ -543,7 +544,8 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                         (listen t)
                         (listen-bind "0.0.0.0")
                         (dbcache-mib nil)
-                        (v2transport nil))
+                        (v2transport nil)
+                        (coinstatsindex nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -802,6 +804,48 @@ Returns the node instance."
                   (lambda (h pct)
                     (log-info "Block filter index: height ~D (~,1F%)" h pct)))))
           (log-info "Block filter index build complete: ~D block~:P indexed" n)))))
+
+  ;; Initialize coinstatsindex (optional). Like the filter index, catch up over
+  ;; already-stored blocks before the sync thread starts, then the connect-time
+  ;; hook advances it. Its running MuHash must be contiguous from genesis, so a
+  ;; pruned node (missing early undo data) can only build it if its stored
+  ;; history reaches genesis -- otherwise the backfill stops at the first gap.
+  (when coinstatsindex
+    (log-info "Initializing coinstats index...")
+    (setf (node-coinstatsindex *node*)
+          (bitcoin-lisp.storage:init-coinstatsindex (node-data-directory *node*)
+                                                    :enabled t))
+    (log-info "Coinstats index loaded: indexed to height ~D"
+              (bitcoin-lisp.storage:coinstatsindex-height (node-coinstatsindex *node*)))
+    (let* ((csi (node-coinstatsindex *node*))
+           (cs (node-chain-state *node*))
+           (tip (bitcoin-lisp.storage:current-height cs)))
+      ;; Repair a best marker left above the active tip (e.g. after
+      ;; invalidateblock): repoint at the highest indexed active-chain block.
+      (when (> (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+        (log-warn "Coinstats index best above tip (~D > ~D); repairing"
+                  (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+        (loop for h from tip downto 0
+              when (bitcoin-lisp.storage:coinstatsindex-get-stats csi h)
+                do (bitcoin-lisp.storage:coinstatsindex-set-best
+                    csi h (bitcoin-lisp.storage:block-index-entry-hash
+                           (bitcoin-lisp.storage:get-block-at-height cs h)))
+                   (return)
+              finally (bitcoin-lisp.storage:coinstatsindex-clear-best csi)))
+      (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+        (log-info "Building coinstats index to height ~D..." tip)
+        (let ((n (bitcoin-lisp.storage:build-coinstatsindex
+                  csi cs (node-block-store *node*)
+                  #'bitcoin-lisp.validation:get-undo-data
+                  #'bitcoin-lisp.validation:calculate-block-subsidy
+                  :progress-callback
+                  (lambda (h pct)
+                    (log-info "Coinstats index: height ~D (~,1F%)" h pct)))))
+          (log-info "Coinstats index build complete: ~D block~:P indexed" n)
+          (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+            (log-warn "Coinstats index stopped at height ~D of ~D (missing block/undo ~
+data below the pruned horizon; the index needs genesis-contiguous history)"
+                      (bitcoin-lisp.storage:coinstatsindex-height csi) tip))))))
 
   ;; BIP324 v2 transport opt-in. Effective only if libsecp256k1 has the
   ;; ellswift module (probed lazily per connection via v2-available-p).
@@ -1087,6 +1131,23 @@ best-indexed height ~D; the startup backfill will heal it on next restart"
           (log-warn "Block filter index failed at height ~D: ~A" height e)
           nil)))))
 
+(defun index-block-coinstats (block block-hash height spent-utxos)
+  "Connect-time hook: fold BLOCK into the running node's coinstatsindex, if one
+is enabled. SPENT-UTXOS is the undo list the UTXO apply produced; the block
+subsidy is derived from HEIGHT. Never signals -- an index failure must not
+abort a block connect -- so consensus is unaffected whether the index is on or
+off. Returns NIL (and stalls quietly) if the parent height's record is missing
+(non-contiguous); the startup backfill heals such gaps on restart."
+  (let ((csi (and *node* (node-coinstatsindex *node*))))
+    (when (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi))
+      (handler-case
+          (bitcoin-lisp.storage:coinstatsindex-add-block
+           csi block block-hash height spent-utxos
+           (bitcoin-lisp.validation:calculate-block-subsidy height))
+        (error (e)
+          (log-warn "Coinstats index failed at height ~D: ~A" height e)
+          nil)))))
+
 (defun install-shutdown-handler ()
   "Trap SIGTERM and SIGINT so kill <pid> / Ctrl-C calls stop-node and persists
    chain state and UTXO set before exit. Without this, SIGKILL is the only way
@@ -1277,6 +1338,11 @@ best-indexed height ~D; the startup backfill will heal it on next restart"
   (when (node-blockfilterindex *node*)
     (log-info "Closing block filter index...")
     (bitcoin-lisp.storage:close-blockfilterindex (node-blockfilterindex *node*)))
+
+  ;; Close coinstats index
+  (when (node-coinstatsindex *node*)
+    (log-info "Closing coinstats index...")
+    (bitcoin-lisp.storage:close-coinstatsindex (node-coinstatsindex *node*)))
 
   ;; Cleanup secp256k1
   (bitcoin-lisp.crypto:cleanup-secp256k1)

@@ -49,3 +49,8 @@
   "Get the block filter index with lock protection."
   (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
     (bitcoin-lisp::node-blockfilterindex node)))
+
+(defun rpc-get-coinstatsindex (node)
+  "Get the coinstats index with lock protection."
+  (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+    (bitcoin-lisp::node-coinstatsindex node)))
