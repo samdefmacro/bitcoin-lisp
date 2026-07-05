@@ -44,6 +44,20 @@
    #:ellswift-create
    #:ellswift-decode
    #:bip324-ecdh
+   ;; BIP324 session cipher (Core BIP324Cipher)
+   #:make-bip324-cipher
+   #:bip324-cipher-initialize
+   #:bip324-cipher-initialized-p
+   #:bip324-cipher-encrypt
+   #:bip324-cipher-decrypt-length
+   #:bip324-cipher-decrypt
+   #:bip324-cipher-our-pubkey
+   #:bip324-cipher-session-id
+   #:bip324-cipher-send-garbage-terminator
+   #:bip324-cipher-recv-garbage-terminator
+   #:+bip324-expansion+
+   #:+bip324-garbage-terminator-len+
+   #:+bip324-length-len+
    ;; secp256k1 ECDSA
    #:verify-signature
    #:parse-public-key
