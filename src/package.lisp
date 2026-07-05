@@ -58,6 +58,7 @@
    #:+bip324-expansion+
    #:+bip324-garbage-terminator-len+
    #:+bip324-length-len+
+   #:+bip324-header-len+
    ;; secp256k1 ECDSA
    #:verify-signature
    #:parse-public-key
@@ -245,6 +246,10 @@
    #:+node-network+
    #:+node-witness+
    #:+node-network-limited+
+   #:+node-p2p-v2+
+   ;; Message framing helpers
+   #:command-to-bytes
+   #:bytes-to-command
    ;; Version message
    #:version-message
    #:make-version-message-bytes
@@ -804,6 +809,9 @@
    #:close-connection
    #:send-bytes
    #:receive-bytes
+   ;; BIP324 v2 transport
+   #:*v2-transport-enabled*
+   #:v2-available-p
    ;; Inbound listening
    #:open-listener
    #:close-listener

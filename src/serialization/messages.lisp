@@ -143,6 +143,7 @@ Returns (VALUES net-addr timestamp) when WITH-TIMESTAMP, otherwise just net-addr
 (defconstant +node-network+ 1)
 (defconstant +node-witness+ (ash 1 3))
 (defconstant +node-network-limited+ (ash 1 10))  ; BIP 159: pruned node
+(defconstant +node-p2p-v2+ (ash 1 11))            ; BIP 324: v2 transport support
 
 (defstruct version-message
   "Version message payload."
