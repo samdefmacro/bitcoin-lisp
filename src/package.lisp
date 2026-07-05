@@ -49,6 +49,8 @@
    #:muhash-divide
    #:muhash-finalize
    #:muhash-element-num
+   #:muhash-numerator
+   #:muhash-denominator
    ;; ElligatorSwift (BIP324 key exchange; optional libsecp256k1 module)
    #:ellswift-available-p
    #:ellswift-create
@@ -526,6 +528,33 @@
    #:compute-utxo-set-muhash
    #:coin-muhash-element
    #:coin-muhash-element*
+   ;; coinstatsindex (per-height UTXO stats + MuHash)
+   #:coinstatsindex
+   #:coinstats
+   #:init-coinstatsindex
+   #:close-coinstatsindex
+   #:coinstatsindex-enabled
+   #:coinstatsindex-height
+   #:coinstatsindex-best
+   #:coinstatsindex-get-stats
+   #:coinstatsindex-add-block
+   #:coinstatsindex-seed-genesis
+   #:coinstatsindex-set-best
+   #:coinstatsindex-clear-best
+   #:build-coinstatsindex
+   #:apply-block-to-coinstats
+   #:coinstats-muhash
+   #:coinstats-txout-count
+   #:coinstats-bogo-size
+   #:coinstats-total-amount
+   #:coinstats-total-subsidy
+   #:coinstats-total-prevout-spent
+   #:coinstats-total-new-outputs-ex-coinbase
+   #:coinstats-total-coinbase
+   #:coinstats-unspendable-genesis
+   #:coinstats-unspendable-bip30
+   #:coinstats-unspendable-scripts
+   #:coinstats-unspendable-unclaimed
    ;; Header index persistence
    #:save-header-index
    #:load-header-index
