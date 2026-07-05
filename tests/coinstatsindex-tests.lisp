@@ -131,6 +131,33 @@ stats from the index (muhash equal to the direct whole-set muhash at the tip)."
            (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "hash_serialized_3" 1)))
          (bitcoin-lisp.storage:close-coinstatsindex csi))))))
 
+(test block-apply-drops-unspendable-outputs
+  "After mining regtest blocks (whose coinbases carry a witness-commitment
+OP_RETURN output), the UTXO set contains NO unspendable outputs -- block
+application drops them, matching Core's AddCoin. The txout count reflects only
+the spendable coinbase reward outputs."
+  (%with-regtest
+   (let ((node (%regtest-node-fixture (format nil "unsp~D" (get-internal-real-time)))))
+     (let ((bitcoin-lisp::*node* node))
+       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 5 "raw(51)"))
+       (let ((utxo (bitcoin-lisp::node-utxo-set node))
+             (unspendable-found 0)
+             (total 0))
+         (bitcoin-lisp.storage:utxo-set-iterate
+          utxo
+          (lambda (txid vout entry)
+            (declare (ignore txid vout))
+            (incf total)
+            (when (bitcoin-lisp.storage:script-unspendable-p
+                   (bitcoin-lisp.storage:utxo-entry-script-pubkey entry))
+              (incf unspendable-found))))
+         ;; No OP_RETURN / oversized outputs made it into the set.
+         (is (zerop unspendable-found))
+         ;; 5 blocks, one spendable coinbase reward output each (the commitment
+         ;; OP_RETURN was dropped) -- so 5, not 10.
+         (is (= 5 total))
+         (is (= 5 (bitcoin-lisp.storage:utxo-count utxo))))))))
+
 (test coinstatsindex-record-roundtrip
   "A coinstats record survives encode/decode with all fields intact, including
 the full MuHash numerator/denominator fraction."

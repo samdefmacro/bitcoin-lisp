@@ -400,6 +400,8 @@
    #:make-utxo-set
    #:utxo-entry
    #:make-utxo-entry
+   #:script-unspendable-p
+   #:+max-script-size+
    #:any-utxo-for-txid-p
    #:utxo-entry-value
    #:utxo-entry-script-pubkey
