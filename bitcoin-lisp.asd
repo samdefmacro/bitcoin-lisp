@@ -13,6 +13,7 @@
   :license "MIT"
   :description "Bitcoin full node implementation in Common Lisp"
   :depends-on ("ironclad"
+               "nibbles"
                "cffi"
                "usocket"
                "flexi-streams"
@@ -38,6 +39,7 @@
                                (:file "interop")))
                  (:module "crypto"
                   :components ((:file "hash")
+                               (:file "chacha20")
                                (:file "secp256k1")
                                (:file "address")
                                (:file "bip32")))
@@ -167,6 +169,8 @@
                              ;; BIP 158 compact block filter tests
                              (:file "blockfilter-tests")
                              ;; BIP 174 PSBT tests
-                             (:file "psbt-tests"))))
+                             (:file "psbt-tests")
+                             ;; BIP 324 cipher suite tests
+                             (:file "bip324-crypto-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
