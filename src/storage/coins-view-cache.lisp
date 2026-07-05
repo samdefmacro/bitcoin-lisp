@@ -651,20 +651,37 @@ in gettxoutsetinfo)."
                         (setf (gethash txid txids) t)))
     (hash-table-count txids)))
 
+(defun %compact-size-bytes (n)
+  "The compactsize encoding of N as a byte list (1/3/5/9 bytes)."
+  (cond ((< n 253) (list n))
+        ((< n #x10000) (list #xfd (logand n #xff) (logand (ash n -8) #xff)))
+        ((< n #x100000000)
+         (list* #xfe (loop for i below 4 collect (logand (ash n (* -8 i)) #xff))))
+        (t (list* #xff (loop for i below 8 collect (logand (ash n (* -8 i)) #xff))))))
+
 (defun coin-muhash-element (txid vout height coinbase amount script)
   "Serialize one UTXO into the byte string MuHash hashes (Bitcoin Core
 coinstats.cpp TxOutSer): outpoint (txid || vout LE32), then the packed
 code (height << 1 | coinbase) as LE32, then the amount as LE64, then the
 scriptPubKey with a compactsize length prefix. Used for gettxoutsetinfo
-muhash mode and (per added/removed coin) the coinstats index."
-  (flexi-streams:with-output-to-sequence (out)
-    (write-sequence txid out)
-    (loop for i below 4 do (write-byte (logand (ash vout (* -8 i)) #xff) out))
-    (let ((code (logior (ash height 1) (if coinbase 1 0))))
-      (loop for i below 4 do (write-byte (logand (ash code (* -8 i)) #xff) out)))
-    (loop for i below 8 do (write-byte (logand (ash amount (* -8 i)) #xff) out))
-    (bitcoin-lisp.serialization:write-compact-size out (length script))
-    (write-sequence script out)))
+muhash mode and (per added/removed coin) the coinstats index. Built directly
+into a byte vector -- this is per-UTXO on the coinstatsindex backfill, where
+the flexi-streams gray-stream path was measurable overhead."
+  (declare (type (simple-array (unsigned-byte 8) (*)) txid script))
+  (let* ((slen (length script))
+         (cs (%compact-size-bytes slen))
+         (out (make-array (+ 32 4 4 8 (length cs) slen)
+                          :element-type '(unsigned-byte 8)))
+         (code (logior (ash height 1) (if coinbase 1 0)))
+         (i 0))
+    (declare (type fixnum i))
+    (replace out txid) (incf i 32)
+    (dotimes (k 4) (setf (aref out i) (logand (ash vout (* -8 k)) #xff)) (incf i))
+    (dotimes (k 4) (setf (aref out i) (logand (ash code (* -8 k)) #xff)) (incf i))
+    (dotimes (k 8) (setf (aref out i) (logand (ash amount (* -8 k)) #xff)) (incf i))
+    (dolist (b cs) (setf (aref out i) b) (incf i))
+    (replace out script :start1 i)
+    out))
 
 (defun coin-muhash-element* (txid vout entry)
   "coin-muhash-element for a utxo-entry ENTRY."
