@@ -13,6 +13,19 @@
   (height 0 :type (unsigned-byte 32))
   (coinbase nil :type boolean))
 
+(defconstant +max-script-size+ 10000
+  "Core MAX_SCRIPT_SIZE: a scriptPubKey larger than this is unspendable.")
+
+(declaim (inline script-unspendable-p))
+(defun script-unspendable-p (script)
+  "T if SCRIPT is provably unspendable (Bitcoin Core CScript::IsUnspendable):
+it begins with OP_RETURN (0x6a) or exceeds MAX_SCRIPT_SIZE. Such outputs can
+never be spent, so Core's AddCoin drops them from the UTXO set; block
+application here does the same."
+  (declare (type (simple-array (unsigned-byte 8) (*)) script))
+  (or (and (plusp (length script)) (= (aref script 0) #x6a))
+      (> (length script) +max-script-size+)))
+
 ;;; UTXO-KEY — the per-output identity used as the hash-table key.
 ;;;
 ;;; Pack the 32-byte txid as four (unsigned-byte 64) words (LE-interpreted)
