@@ -279,6 +279,37 @@ Returns a list of entries from genesis (index 0) to tip."
           (is (eq t valid))
           (is (null error)))))))
 
+(test validate-difficulty-testnet-mindiff-rejects-walkback-bits
+  "A >20-min-gap testnet block MUST carry powLimit bits (Core returns powLimit
+unconditionally when min-difficulty is allowed). One at the real walk-back
+difficulty is rejected, not accepted -- fixing an over-acceptance vs Core that
+could split us from the testnet network."
+  (let ((bitcoin-lisp:*network* :testnet4))
+    (multiple-value-bind (entries chain-state)
+        (build-mock-chain 10 :start-time 1000000 :interval 600
+                          :bits-fn (lambda (h) (declare (ignore h)) #x1b04864c))
+      (declare (ignore chain-state))
+      (let* ((prev-entry (aref entries 9))
+             (prev-time (bitcoin-lisp.serialization:block-header-timestamp
+                         (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+             ;; >20 min gap but carrying the real (walk-back) difficulty.
+             (header (make-mock-header :bits #x1b04864c
+                                       :timestamp (+ prev-time 1201))))
+        (multiple-value-bind (valid error)
+            (bitcoin-lisp.validation:validate-difficulty header 10 prev-entry)
+          (is (null valid))
+          (is (eq :bad-difficulty error))))
+      ;; The same >20-min gap WITH powLimit bits is still accepted.
+      (let* ((prev-entry (aref entries 9))
+             (prev-time (bitcoin-lisp.serialization:block-header-timestamp
+                         (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
+             (header (make-mock-header :bits bitcoin-lisp.storage:+pow-limit-bits+
+                                       :timestamp (+ prev-time 1201))))
+        (multiple-value-bind (valid error)
+            (bitcoin-lisp.validation:validate-difficulty header 10 prev-entry)
+          (is (eq t valid))
+          (is (null error)))))))
+
 (test validate-difficulty-testnet-walk-back
   "validate-difficulty uses walk-back bits on testnet with <=20 min gap."
   (let ((bitcoin-lisp:*network* :testnet3)
