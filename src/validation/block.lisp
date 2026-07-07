@@ -374,10 +374,18 @@ Returns (VALUES T NIL) on success, (VALUES NIL :bad-difficulty) on failure."
               (block-timestamp (bitcoin-lisp.serialization:block-header-timestamp header))
               (min-diff-allowed (testnet-min-difficulty-allowed-p
                                  block-timestamp prev-timestamp)))
-         ;; >20 min gap: accept min-difficulty bits directly
-         (if (and min-diff-allowed (= block-bits bitcoin-lisp.storage:+pow-limit-bits+))
-             (values t nil)
-             ;; Otherwise (<=20 min, or >20 min with non-min bits): must match walk-back
+         ;; Core GetNextWorkRequired (pow.cpp): on a min-difficulty chain, a
+         ;; >20-min-gap block's expected nBits is powLimit UNCONDITIONALLY, and
+         ;; validation.cpp requires block.nBits == expected exactly. So a
+         ;; >20-min block MUST carry powLimit bits -- one at the real walk-back
+         ;; difficulty is rejected (bad-diffbits). (Previously we also accepted
+         ;; the walk-back value here, which over-accepts vs Core and could split
+         ;; us from the testnet network on a crafted/unusual block.)
+         (if min-diff-allowed
+             (if (= block-bits bitcoin-lisp.storage:+pow-limit-bits+)
+                 (values t nil)
+                 (values nil :bad-difficulty))
+             ;; <=20 min gap: must match the walk-back difficulty.
              (let ((walk-back-bits (testnet-walk-back-bits prev-entry)))
                (if (= block-bits walk-back-bits)
                    (values t nil)
