@@ -545,7 +545,8 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                         (listen-bind "0.0.0.0")
                         (dbcache-mib nil)
                         (v2transport nil)
-                        (coinstatsindex nil))
+                        (coinstatsindex nil)
+                        (reindex-chainstate nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -728,6 +729,13 @@ Returns the node instance."
       (when (plusp swept)
         (log-info "Pruned ~D stale undo file~:P below the prune horizon" swept))))
 
+  ;; Optional chainstate reindex: rebuild the UTXO set from stored blocks
+  ;; before the indexes initialize (so they rebuild against the fresh set) and
+  ;; before the sync thread starts (single-threaded here, no writer races).
+  ;; Runs after the block index + undo storage are ready.
+  (when reindex-chainstate
+    (do-reindex-chainstate))
+
   ;; Initialize recent rejects filter (DoS protection)
   (setf (node-recent-rejects *node*) (make-rejects-filter))
 
@@ -817,6 +825,12 @@ Returns the node instance."
                                                     :enabled t))
     (log-info "Coinstats index loaded: indexed to height ~D"
               (bitcoin-lisp.storage:coinstatsindex-height (node-coinstatsindex *node*)))
+    ;; A chainstate reindex may have changed UTXO-set contents (e.g. dropping
+    ;; unspendable outputs), so the coinstats records must be rebuilt to stay
+    ;; consistent. Clear the best marker to force a full rebuild below.
+    (when reindex-chainstate
+      (bitcoin-lisp.storage:coinstatsindex-clear-best (node-coinstatsindex *node*))
+      (log-info "Coinstats index: rebuilding after chainstate reindex"))
     (let* ((csi (node-coinstatsindex *node*))
            (cs (node-chain-state *node*))
            (tip (bitcoin-lisp.storage:current-height cs)))
@@ -1130,6 +1144,76 @@ best-indexed height ~D; the startup backfill will heal it on next restart"
         (error (e)
           (log-warn "Block filter index failed at height ~D: ~A" height e)
           nil)))))
+
+(defun do-reindex-chainstate ()
+  "Rebuild the UTXO set from already-stored blocks (Bitcoin Core
+-reindex-chainstate): wipe the coins view, reset the chainstate to genesis,
+and re-apply every stored active-chain block's UTXO effects, trusting the
+already-validated stored blocks (no script re-validation, no re-download).
+The undo files are left as-is -- they record spent prevouts, which the rebuild
+does not change. Clears the coinstatsindex best marker so its startup backfill
+rebuilds it against the reindexed set; the blockfilterindex is unaffected
+(its filters are over block scripts, not the UTXO set).
+
+This realizes UTXO-set-content changes (e.g. dropping now-skipped unspendable
+outputs) on an existing node without a full network resync, and doubles as
+chainstate disaster-recovery when blocks+index are intact but the coins DB is
+suspect."
+  (let* ((cs (node-chain-state *node*))
+         (store (node-block-store *node*))
+         (utxo (node-utxo-set *node*))
+         (tip-hash (bitcoin-lisp.storage:best-block-hash cs))
+         (tip-entry (and tip-hash (bitcoin-lisp.storage:get-block-index-entry cs tip-hash)))
+         (tip-height (bitcoin-lisp.storage:current-height cs)))
+    (when (or (null tip-entry) (zerop tip-height))
+      (log-info "Reindex-chainstate: empty chain, nothing to rebuild")
+      (return-from do-reindex-chainstate))
+    (log-info "Reindex-chainstate: rebuilding UTXO set from ~D stored blocks..." tip-height)
+    ;; Active chain genesis+1 .. tip, ascending (push while walking prev-entry
+    ;; down from the tip leaves the list in height order).
+    (let ((entries '()))
+      (loop with e = tip-entry
+            while (and e (plusp (bitcoin-lisp.storage:block-index-entry-height e)))
+            do (push e entries)
+               (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+      ;; Empty the coins view and rewind the chainstate to genesis.
+      (let ((erased (bitcoin-lisp.storage:coins-view-cache-wipe utxo)))
+        (log-info "Reindex-chainstate: erased ~D coin~:P; replaying..." erased))
+      (bitcoin-lisp.storage:update-chain-tip
+       cs (bitcoin-lisp.storage::chain-state-genesis-hash cs) 0)
+      ;; NB: the coinstatsindex is opened AFTER this runs; its rebuild is
+      ;; forced in its own init block (keyed off the reindex flag), not here.
+      ;; The blockfilterindex is left alone -- its filters are over block
+      ;; scripts, unaffected by a UTXO-set rebuild.
+      ;; Replay every block's UTXO effects.
+      (let ((n 0) (last-report (get-internal-real-time)))
+        (block replay
+          (dolist (entry entries)
+            (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                   (height (bitcoin-lisp.storage:block-index-entry-height entry))
+                   (blk (bitcoin-lisp.storage:get-block store hash)))
+              (unless blk
+                (log-warn "Reindex-chainstate: block at height ~D missing from store; ~
+stopping (UTXO set rebuilt to height ~D)" height (1- height))
+                (return-from replay))
+              ;; Apply removes spent prevouts + adds spendable outputs (the
+              ;; unspendable skip lives in apply-block-to-utxo-set). Discard the
+              ;; returned undo list -- the on-disk undo files are unchanged.
+              (bitcoin-lisp.storage:apply-block-to-utxo-set utxo blk height)
+              (bitcoin-lisp.storage:update-chain-tip cs hash height)
+              (incf n)
+              (when (>= (bitcoin-lisp.storage:view-mem-bytes utxo)
+                        (large-coins-cache-threshold *coins-cache-budget-bytes*))
+                (bitcoin-lisp.storage:coins-view-cache-flush utxo :sync nil))
+              (let ((now (get-internal-real-time)))
+                (when (> (- now last-report) internal-time-units-per-second)
+                  (log-info "Reindex-chainstate: height ~D (~,1F%)"
+                            height (* 100.0 (/ height tip-height)))
+                  (setf last-report now))))))
+        (bitcoin-lisp.storage:coins-view-cache-flush utxo :sync t)
+        (bitcoin-lisp.storage:save-state cs)
+        (log-info "Reindex-chainstate complete: ~D block~:P re-applied, tip at height ~D"
+                  n (bitcoin-lisp.storage:current-height cs))))))
 
 (defun index-block-coinstats (block block-hash height spent-utxos)
   "Connect-time hook: fold BLOCK into the running node's coinstatsindex, if one

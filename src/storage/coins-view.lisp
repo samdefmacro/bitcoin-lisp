@@ -174,6 +174,37 @@ coins-view-db-write-batch for multi-op atomicity."
   (declare (type coins-view-db view) (type utxo-key utxo-key))
   (not (null (leveldb-get (cvdb-db view) (encode-coin-key utxo-key)))))
 
+(defun coins-view-db-erase-all-coins (view)
+  "Delete every coin ('C'-prefixed) entry from the base LevelDB, in bounded
+writebatches, leaving non-coin keys (e.g. the 'M' migration marker) intact.
+Used by chainstate reindex to empty the UTXO set. Returns the count erased."
+  (declare (type coins-view-db view))
+  (let ((db (cvdb-db view))
+        (erased 0)
+        (batch (leveldb-make-writebatch))
+        (pending 0))
+    (unwind-protect
+         (progn
+           (with-leveldb-iterator (iter db)
+             (leveldb-iter-seek-to-first iter)
+             (loop
+               (unless (leveldb-iter-valid-p iter) (return))
+               (let ((k (leveldb-iter-key iter)))
+                 (when (and (>= (length k) 1) (= (aref k 0) +db-prefix-coin+))
+                   (leveldb-writebatch-delete batch k)
+                   (incf pending)
+                   (incf erased)
+                   ;; Commit in chunks so the writebatch can't grow unbounded
+                   ;; across a multi-million-entry set.
+                   (when (>= pending 100000)
+                     (leveldb-write db batch :sync nil)
+                     (leveldb-destroy-writebatch batch)
+                     (setf batch (leveldb-make-writebatch) pending 0))))
+               (leveldb-iter-next iter)))
+           (when (plusp pending) (leveldb-write db batch :sync t)))
+      (leveldb-destroy-writebatch batch))
+    erased))
+
 ;;;; Batch writes — the CDBBatch equivalent. The expected pattern is:
 ;;;; build a list of ops during a block's validation pass (adds + erases
 ;;;; for each input/output), then commit them atomically. Core's
