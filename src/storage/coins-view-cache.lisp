@@ -191,6 +191,18 @@ Mirrors CCoinsViewCache::SpendCoin (coins.cpp:153)."
 ;;;; Flush: walk dirty entries, write to base via a single writebatch.
 ;;;; Mirrors CCoinsViewCache::BatchWrite + Flush (coins.cpp:208-289).
 
+(defun coins-view-cache-wipe (cache)
+  "Empty the entire UTXO set: drop the in-memory cache (discarding any dirty
+entries -- the caller is rebuilding from scratch) and erase every coin from
+the base LevelDB. Used only by chainstate reindex. Returns the base count
+erased."
+  (declare (type coins-view-cache cache))
+  (clrhash (cvc-entries cache))
+  (setf (cvc-dirty-count cache) 0
+        (cvc-fresh-count cache) 0
+        (cvc-mem-bytes cache) 0)
+  (coins-view-db-erase-all-coins (cvc-base cache)))
+
 (defun coins-view-cache-flush (cache &key sync)
   "Commit all dirty entries to the base view in a single atomic batch
 then clear the cache. SYNC=T forces fsync. Returns the number of
