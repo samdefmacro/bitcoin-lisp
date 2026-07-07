@@ -181,6 +181,8 @@
                              ;; MuHash3072 tests
                              (:file "muhash-tests")
                              ;; coinstatsindex tests
-                             (:file "coinstatsindex-tests"))))
+                             (:file "coinstatsindex-tests")
+                             ;; -reindex-chainstate tests
+                             (:file "reindex-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
