@@ -175,8 +175,15 @@ MAX_STANDARD_TX_WEIGHT).")
 (defconstant +min-standard-tx-version+ 1
   "Minimum standard transaction version (Bitcoin Core TX_MIN_STANDARD_VERSION).")
 
-(defconstant +max-standard-tx-version+ 3
-  "Maximum standard transaction version (Bitcoin Core TX_MAX_STANDARD_VERSION).")
+(defconstant +max-standard-tx-version+ 2
+  "Maximum standard transaction version. Bitcoin Core bumped
+TX_MAX_STANDARD_VERSION to 3 only in lockstep with enforcing TRUC/v3 topology
+policy (BIP431: at most 1 unconfirmed ancestor + 1 descendant, a 1000-vsize
+child cap, and v3<->non-v3 spend inheritance). We do not implement TRUC, so
+accepting v3 as standard would relay v3 transactions that violate TRUC -- which
+every modern Core peer rejects -- while giving v3 none of its anti-pinning
+guarantees. Until TRUC lands we keep the pre-TRUC cap of 2, treating v3 as
+non-standard (still consensus-valid, just not relayed).")
 
 (defconstant +dust-relay-fee-rate+ 3000
   "Dust relay fee rate in satoshis per kvB (Bitcoin Core DUST_RELAY_TX_FEE).

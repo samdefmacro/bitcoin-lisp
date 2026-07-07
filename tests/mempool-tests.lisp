@@ -664,19 +664,23 @@ sizes it (-datacarrier / -datacarriersize)."
              (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xac))))
 
 (test mempool-rejects-nonstandard-version
-  "A tx with version outside [1,3] is rejected as non-standard."
+  "A tx with version outside [1,2] is rejected as non-standard. Version 3 is
+non-standard too until TRUC (BIP431) is enforced -- see +max-standard-tx-version+."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (utxo (bitcoin-lisp.storage:make-utxo-set))
-         (base (make-mempool-test-tx :input-id 80))
-         (tx (bitcoin-lisp.serialization:make-transaction
-              :version 4
-              :inputs (bitcoin-lisp.serialization:transaction-inputs base)
-              :outputs (bitcoin-lisp.serialization:transaction-outputs base)
-              :lock-time 0)))
-    (multiple-value-bind (valid err)
-        (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
-      (is (null valid))
-      (is (eq err :version-non-standard)))))
+         (base (make-mempool-test-tx :input-id 80)))
+    (flet ((rejected-p (ver)
+             (let ((tx (bitcoin-lisp.serialization:make-transaction
+                        :version ver
+                        :inputs (bitcoin-lisp.serialization:transaction-inputs base)
+                        :outputs (bitcoin-lisp.serialization:transaction-outputs base)
+                        :lock-time 0)))
+               (multiple-value-bind (valid err)
+                   (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
+                 (and (null valid) (eq err :version-non-standard))))))
+      (is-true (rejected-p 4))
+      (is-true (rejected-p 3))
+      (is-true (rejected-p 0)))))
 
 (test mempool-rejects-dust-output
   "A tx with a dust-value output is rejected."
