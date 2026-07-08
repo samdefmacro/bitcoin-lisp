@@ -40,6 +40,16 @@
   (address "" :type string)
   ;; T if the peer connected to us (inbound); NIL if we dialed out (outbound).
   (inbound nil :type boolean)
+  ;; Connection type (Bitcoin Core ConnectionType). Determines tx-relay
+  ;; participation and lifetime:
+  ;;   :inbound              peer dialed us
+  ;;   :outbound-full-relay  normal outbound; full tx + block + addr relay
+  ;;   :block-relay          outbound relay=0 slot; blocks/headers only, NO tx
+  ;;                         relay (anti-partition + the anchor source), and we
+  ;;                         don't request addrs from it
+  ;;   :feeler               short-lived probe of an addrman "new" address to
+  ;;                         validate it into "tried" (anti-eclipse), then close
+  (conn-type :inbound :type keyword)
   ;; T once we have answered this peer's getaddr (Bitcoin Core m_getaddr_recvd):
   ;; one address response per connection, to limit address-stamping spam.
   (getaddr-sent nil :type boolean)
@@ -247,10 +257,17 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
 
 ;;; Handshake
 
+(defun peer-relays-txs-p (peer)
+  "T if we relay transactions with PEER. Block-relay-only and feeler
+connections do not (Core: fRelay=false, no tx inv/getdata either way)."
+  (not (member (peer-conn-type peer) '(:block-relay :feeler))))
+
 (defun %send-version-and-capabilities (peer)
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
-VERACK). Returns T if the version was sent."
+VERACK). Returns T if the version was sent. On a block-relay/feeler connection
+the version's relay flag is 0 and we skip wtxidrelay (Core does not negotiate
+tx relay on those)."
   ;; BIP 159: advertise NODE_NETWORK_LIMITED instead of NODE_NETWORK when
   ;; pruning. BIP 324: add NODE_P2P_V2 when the v2 transport is available.
   (let* ((services (logior (if (bitcoin-lisp:pruning-enabled-p)
@@ -259,14 +276,19 @@ VERACK). Returns T if the version was sent."
                            bitcoin-lisp.serialization:+node-witness+
                            (if (v2-available-p)
                                bitcoin-lisp.serialization:+node-p2p-v2+ 0)))
+         (relays (peer-relays-txs-p peer))
          (version-payload (bitcoin-lisp.serialization:make-version-message-bytes
                            :services services
                            :start-height 0
-                           :timestamp (bitcoin-lisp.serialization:get-unix-time)))
+                           :timestamp (bitcoin-lisp.serialization:get-unix-time)
+                           :relay relays))
          (version-msg (bitcoin-lisp.serialization:serialize-message
                        "version" version-payload)))
     (when (send-message peer version-msg)
-      (send-message peer (bitcoin-lisp.serialization:make-wtxidrelay-message))
+      ;; wtxidrelay only makes sense when we relay txs (BIP339); skip it on
+      ;; block-relay/feeler connections, as Core does.
+      (when relays
+        (send-message peer (bitcoin-lisp.serialization:make-wtxidrelay-message)))
       (send-message peer (bitcoin-lisp.serialization:make-sendaddrv2-message))
       t)))
 
@@ -327,13 +349,17 @@ version handshake may proceed (over whichever transport), NIL to give up."
            t)))
       (t nil))))
 
-(defun perform-handshake (peer &key (try-v2 (v2-available-p)))
+(defun perform-handshake (peer &key (try-v2 (v2-available-p))
+                                    (conn-type :outbound-full-relay))
   "Outbound version handshake (we initiate): send version+caps, receive the
-peer's version, send verack, await theirs. When TRY-V2 (default: whenever the
-v2 transport is enabled and supported), the BIP324 encrypted transport is
-established first, reconnecting as v1 if the peer turns out not to speak it.
-Returns T on success."
-  (setf (peer-state peer) :handshaking)
+peer's version, send verack, await theirs. CONN-TYPE sets the peer's connection
+type (:outbound-full-relay, :block-relay, or :feeler) before the version is
+sent, so a block-relay/feeler peer advertises relay=0 and skips wtxidrelay.
+When TRY-V2 (default: whenever the v2 transport is enabled and supported), the
+BIP324 encrypted transport is established first, reconnecting as v1 if the peer
+turns out not to speak it. Returns T on success."
+  (setf (peer-state peer) :handshaking
+        (peer-conn-type peer) conn-type)
   (and (or (not try-v2)
            (%v2-try-outbound peer))
        (%send-version-and-capabilities peer)

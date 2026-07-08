@@ -832,6 +832,9 @@ Does nothing if relay is disabled for the current network."
       ;; Skip the source peer and disconnected peers
       (when (and (not (eq peer source-peer))
                  (eq (peer-state peer) :ready)
+                 ;; Block-relay-only / feeler peers get no tx relay (they
+                 ;; advertised relay=0; Core never announces txs to them).
+                 (peer-relays-txs-p peer)
                  ;; Skip if already announced to this peer
                  (not (gethash txid (peer-announced-txs peer)))
                  ;; BIP 133: Skip if tx fee rate below peer's feefilter
