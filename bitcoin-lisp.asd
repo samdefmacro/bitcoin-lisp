@@ -183,6 +183,8 @@
                              ;; coinstatsindex tests
                              (:file "coinstatsindex-tests")
                              ;; -reindex-chainstate tests
-                             (:file "reindex-tests"))))
+                             (:file "reindex-tests")
+                             ;; Connection types (block-relay-only + feeler)
+                             (:file "conn-type-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
