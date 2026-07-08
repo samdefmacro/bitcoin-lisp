@@ -188,6 +188,8 @@
                              ;; Connection types (block-relay-only + feeler)
                              (:file "conn-type-tests")
                              ;; Low-work headers sync (anti-DoS presync/redownload)
-                             (:file "headers-sync-tests"))))
+                             (:file "headers-sync-tests")
+                             ;; bitcoin.conf + CLI argument parsing
+                             (:file "config-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

@@ -944,6 +944,39 @@ data below the pruned horizon; the index needs genesis-contiguous history)"
   (log-info "Node started successfully")
   *node*)
 
+(defun start-node-from-args (&optional (args (rest sb-ext:*posix-argv*)))
+  "Start the node from Bitcoin Core-style options: a list of CLI ARGS
+ (-key=value, -key, -nokey) plus a bitcoin.conf read from the data directory.
+CLI arguments override the config file. This is the argv-friendly entry point —
+ e.g. from a saved image's toplevel, or (start-node-from-args
+'(\"-chain=main\" \"-txindex\" \"-dbcache=2000\" \"-server\")).
+
+The data directory and network are resolved from the CLI first (so the config
+file can be located and its [network] section scoped), then the merged config
+is turned into start-node keyword arguments. -conf=PATH overrides the config
+file location."
+  (let* ((cli (parse-cli-args args))
+         (datadir (or (cdr (assoc "datadir" cli :test #'string=)) "~/.bitcoin-lisp/"))
+         (conf-path (or (cdr (assoc "conf" cli :test #'string=))
+                        ;; Ensure a trailing slash so DATADIR is treated as a
+                        ;; directory (else merge-pathnames replaces its last
+                        ;; component).
+                        (merge-pathnames
+                         "bitcoin.conf"
+                         (pathname (if (and (plusp (length datadir))
+                                            (char= (char datadir (1- (length datadir))) #\/))
+                                       datadir
+                                       (concatenate 'string datadir "/"))))))
+         (conf-text (when (probe-file conf-path)
+                      (log-info "Reading config file ~A" conf-path)
+                      (alexandria:read-file-into-string conf-path)))
+         (plist (args->start-node-plist args conf-text)))
+    ;; datadir only comes from the CLI/default (locating the conf needs it), so
+    ;; make sure it reaches start-node even if it wasn't in the spec scan.
+    (unless (getf plist :data-directory)
+      (setf (getf plist :data-directory) datadir))
+    (apply #'start-node plist)))
+
 (defparameter +flush-every-n-blocks+ 25000
   "Block-count flush backstop. The 600s time trigger and the 450MiB
    coins-cache size trigger are the real guards; this count only caps the
