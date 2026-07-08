@@ -53,8 +53,6 @@
   ;; T once we have answered this peer's getaddr (Bitcoin Core m_getaddr_recvd):
   ;; one address response per connection, to limit address-stamping spam.
   (getaddr-sent nil :type boolean)
-  ;; Misbehavior scoring
-  (misbehavior-score 0 :type (unsigned-byte 32))
   ;; Compact block support (BIP 152)
   (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
   (compact-block-high-bandwidth nil :type boolean)    ; High-bandwidth mode enabled
@@ -522,18 +520,19 @@ are likely unproductive. Returns T if the peer should be disconnected."
        ;; Peer claims a height far behind ours (>1000 blocks)
        (> our-height (+ (peer-start-height peer) 1000))))
 
-;;; Misbehavior Scoring, Discouragement, and Banning
+;;; Misbehavior, Discouragement, and Banning
 ;;;
 ;;; Two distinct mechanisms, mirroring Bitcoin Core's BanMan:
-;;;  - Discouragement (automatic): a peer that accumulates misbehavior is added
-;;;    to a bounded, ephemeral rolling filter. We never dial it, prefer it for
-;;;    inbound eviction, and don't gossip it — but it is not hard-banned (which
-;;;    previously let a peer grow our banned map without bound).
+;;;  - Discouragement (automatic): a peer that misbehaves is added to a bounded,
+;;;    ephemeral rolling filter. We never dial it, prefer it for inbound
+;;;    eviction, and don't gossip it — but it is not hard-banned (which
+;;;    previously let a peer grow our banned map without bound). Bitcoin Core's
+;;;    misbehavior model is BINARY (PRs #25325 / #26294): a single protocol
+;;;    violation marks the peer for discouragement — there is no accumulating
+;;;    ban score, and loose (non-block) transaction-validation failures do not
+;;;    count as misbehavior at all.
 ;;;  - Banning (manual): ban-peer / *banned-peers*, an explicit address ban with
 ;;;    an expiry (e.g. for a future setban RPC). Unaffected by misbehavior.
-
-(defconstant +misbehavior-discourage-threshold+ 100
-  "Misbehavior score at which a peer is discouraged and disconnected.")
 
 (defconstant +ban-duration-seconds+ (* 24 60 60)
   "Ban duration: 24 hours.")
@@ -572,18 +571,22 @@ node-lock), never the reverse, so it cannot deadlock against node-lock.")
   (bt:with-lock-held (*ban-lock*)
     (bitcoin-lisp:clear-recent-rejects *discouraged-peers*)))
 
-(defun record-misbehavior (peer score-increment)
-  "Increment PEER's misbehavior score by SCORE-INCREMENT. At the discourage
-threshold, mark the peer's address as discouraged and disconnect it (Bitcoin
-Core's Misbehaving -> Discourage). Returns T if the peer was discouraged."
-  (incf (peer-misbehavior-score peer) score-increment)
-  (when (>= (peer-misbehavior-score peer) +misbehavior-discourage-threshold+)
-    (discourage-peer (peer-address peer))
-    (when (peer-connection peer)
-      (close-connection (peer-connection peer))
-      (setf (peer-connection peer) nil))
-    (setf (peer-state peer) :disconnected)
-    t))
+(defun record-misbehavior (peer &optional reason)
+  "Discourage and disconnect PEER for a protocol violation. Bitcoin Core's
+misbehavior model is binary (Misbehaving -> m_should_discourage): any single
+call marks the peer for discouragement — there is no accumulating score. The
+address is added to the ephemeral discourage filter (never dialed, preferred
+for eviction, not gossiped) and the connection is dropped. REASON, if given, is
+logged. Returns T."
+  (when reason
+    (bitcoin-lisp:log-cat "net" "Misbehaving peer ~A: ~A"
+                          (peer-address peer) reason))
+  (discourage-peer (peer-address peer))
+  (when (peer-connection peer)
+    (close-connection (peer-connection peer))
+    (setf (peer-connection peer) nil))
+  (setf (peer-state peer) :disconnected)
+  t)
 
 (defun ban-peer (peer)
   "Ban a peer. Sets state to :banned and records ban expiry."

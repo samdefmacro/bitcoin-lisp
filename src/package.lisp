@@ -984,8 +984,6 @@
    #:discourage-peer
    #:peer-discouraged-p
    #:clear-discouraged
-   #:peer-misbehavior-score
-   #:+misbehavior-discourage-threshold+
    #:*banned-peers*
    ;; DoS protection
    #:check-peer-rate-limit

@@ -313,21 +313,18 @@
     ;; Failures should be reset
     (is (= 0 (bitcoin-lisp.networking:peer-consecutive-ping-failures peer)))))
 
-;;;; Misbehavior Scoring Tests
+;;;; Misbehavior Tests (binary model — Bitcoin Core PRs #25325 / #26294)
 
-(test peer-misbehavior-discourage-threshold
-  "Peer should be discouraged (not hard-banned) when misbehavior reaches threshold."
+(test peer-misbehavior-is-binary
+  "A single misbehavior event discourages and disconnects the peer (no
+accumulating score); discouragement is NOT a hard ban."
   (bitcoin-lisp.networking:clear-discouraged)
   (let ((peer (bitcoin-lisp.networking:make-peer)))
     (setf (bitcoin-lisp.networking:peer-state peer) :ready)
     (setf (bitcoin-lisp.networking:peer-address peer) "192.0.2.99")
-    ;; Score below threshold
-    (is (not (bitcoin-lisp.networking:record-misbehavior peer 50)))
-    (is (= 50 (bitcoin-lisp.networking:peer-misbehavior-score peer)))
-    (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))
     (is (not (bitcoin-lisp.networking:peer-discouraged-p "192.0.2.99")))
-    ;; Score reaches threshold -> discouraged + disconnected
-    (is (bitcoin-lisp.networking:record-misbehavior peer 50))
+    ;; One event -> immediately discouraged + disconnected.
+    (is (bitcoin-lisp.networking:record-misbehavior peer "test violation"))
     (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
     (is (bitcoin-lisp.networking:peer-discouraged-p "192.0.2.99"))
     ;; Discouragement is NOT a hard ban.
@@ -349,13 +346,12 @@
   (bitcoin-lisp.networking:clear-ban-list))
 
 (test peer-invalid-block-immediate-discourage
-  "Sending an invalid block should immediately discourage (+100)."
+  "Sending an invalid block immediately discourages the peer."
   (bitcoin-lisp.networking:clear-discouraged)
   (let ((peer (bitcoin-lisp.networking:make-peer)))
     (setf (bitcoin-lisp.networking:peer-state peer) :ready)
     (setf (bitcoin-lisp.networking:peer-address peer) "192.0.2.100")
-    ;; One invalid block = +100 = immediate discouragement.
-    (is (bitcoin-lisp.networking:record-misbehavior peer 100))
+    (is (bitcoin-lisp.networking:record-misbehavior peer "invalid block"))
     (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
     (is (bitcoin-lisp.networking:peer-discouraged-p "192.0.2.100"))
     (bitcoin-lisp.networking:clear-discouraged)))
