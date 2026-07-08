@@ -1078,6 +1078,7 @@
    #:node
    #:*node*
    #:start-node
+   #:start-node-from-args
    #:stop-node
    #:node-status
    #:node-fee-estimator
