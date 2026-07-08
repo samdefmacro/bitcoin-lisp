@@ -1678,6 +1678,77 @@ Used during IBD when the validated block tip lags behind the header tip."
      peer
      (bitcoin-lisp.serialization:make-getheaders-message locator))))
 
+(defun %store-validated-headers (peer chain-state headers count-fn label)
+  "Contextually validate HEADERS (validate-header-chain) and add the valid
+prefix to the block index, bumping the running count via COUNT-FN and updating
+per-peer availability. Shared by the normal and redownload store paths."
+  (multiple-value-bind (valid error) (validate-header-chain headers chain-state)
+    (when error
+      (bitcoin-lisp:log-warn "Header validation error: ~A" error))
+    (let ((added (process-headers valid chain-state)))
+      (funcall count-fn added)
+      (let ((last (car (last valid))))
+        (when last
+          (update-block-availability
+           peer chain-state
+           (bitcoin-lisp.serialization:block-header-hash last))))
+      (when (> added 0)
+        (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added))
+      added)))
+
+(defun handle-header-batch (peer chain-state headers full-batch hss count-fn)
+  "Process one received header batch during Phase-1 sync. HSS is the current
+low-work sync state (or NIL). Returns (values hss done): the (possibly new or
+cleared) sync state and whether header sync from this peer is finished.
+
+Three cases:
+  - a low-work sync is already running (HSS): drive it, storing any headers it
+    releases during REDOWNLOAD, and end when it finalizes;
+  - no sync, but this batch is a full low-work chain that connects to our index:
+    start a presync and store nothing yet (anti-DoS);
+  - otherwise: store the batch normally, ending on a short (non-full) batch."
+  (cond
+    ((null headers) (values hss t))
+
+    ;; A low-work presync/redownload is in progress with this peer.
+    (hss
+     (if (headers-pow-valid-p headers)
+         (multiple-value-bind (ok request-more ready)
+             (hss-process-next-headers hss headers full-batch)
+           (when ready
+             (%store-validated-headers peer chain-state ready count-fn "Redownload"))
+           (if (and ok request-more)
+               (values hss nil)
+               (progn
+                 (bitcoin-lisp:log-info "Low-work headers sync ~A with ~A (presync height ~D)"
+                                        (if ok "complete" "aborted")
+                                        (peer-address peer) (hss-current-height hss))
+                 (values nil t))))
+         ;; PoW-invalid batch from a peer we're presyncing — abort the sync.
+         (progn (hss-finalize hss) (values nil t))))
+
+    ;; No sync yet: should this batch be diverted into presync, or stored?
+    (t
+     (let ((start (maybe-start-presync headers chain-state full-batch)))
+       (if start
+           (progn
+             (bitcoin-lisp:log-info
+              "Low-work chain from ~A: presyncing before storing (anti-DoS work gate)"
+              (peer-address peer))
+             ;; Feed this first batch immediately (already PoW-checked in
+             ;; maybe-start-presync); presync never releases headers to store.
+             (multiple-value-bind (ok request-more ready)
+                 (hss-process-next-headers start headers full-batch)
+               (declare (ignore ready))
+               (if (and ok request-more)
+                   (values start nil)
+                   (values nil t))))
+           ;; Normal path: store the batch; a short batch ends the sync.
+           (progn
+             (%store-validated-headers peer chain-state headers count-fn "Received")
+             (values nil (< (length headers)
+                            bitcoin-lisp.serialization:+max-headers-count+))))))))
+
 (defun sync-headers (peer chain-state &key recent-rejects)
   "Download all headers from PEER. Returns (values received-count stalled-p);
 STALLED-P is true when the peer went silent (a getheaders went unanswered),
@@ -1686,7 +1757,10 @@ the signal run-ibd uses to rotate to another header-sync peer."
         (done nil)
         (timed-out nil)
         (requests-sent 0)
-        (max-requests 100))
+        (max-requests 100)
+        ;; Non-NIL while a low-work presync/redownload is in progress with this
+        ;; peer (anti-DoS: we store nothing until the chain's work is proven).
+        (hss nil))
     ;; First, drain any pending messages from peer (sendcmpct, sendheaders, etc.)
     (loop repeat 10
           do (multiple-value-bind (command payload)
@@ -1701,10 +1775,19 @@ the signal run-ibd uses to rotate to another header-sync peer."
 
     (loop until (or done *ibd-stop-requested*)
           do (progn
-               ;; Request headers using header-tip-aware locator
-               (request-headers-for-ibd peer chain-state)
+               ;; Request headers from our index normally, or via the low-work
+               ;; sync's own locator while a presync/redownload is running (its
+               ;; headers aren't in the index yet).
+               (if hss
+                   (send-message peer (bitcoin-lisp.serialization:make-getheaders-message
+                                       (hss-locator-hashes hss)))
+                   (request-headers-for-ibd peer chain-state))
                (incf requests-sent)
-               (when (> requests-sent max-requests)
+               ;; The request cap guards the normal path. A low-work sync
+               ;; downloads the chain twice and so needs many more round-trips;
+               ;; it is instead bounded by its own max-commitments and by the
+               ;; peer-stall detection below.
+               (when (and (null hss) (> requests-sent max-requests))
                  (bitcoin-lisp:log-warn "Header sync: hit max requests (~D)" max-requests)
                  (return))
 
@@ -1727,35 +1810,13 @@ the signal run-ibd uses to rotate to another header-sync peer."
                               ((string= command "headers")
                                (setf got-headers t)
                                (handler-case
-                                   (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-                                     (when (null headers)
-                                       (setf done t))
-                                     ;; Validate and add headers
-                                     (multiple-value-bind (valid-headers error)
-                                         (validate-header-chain headers chain-state)
-                                       (when error
-                                         (bitcoin-lisp:log-warn "Header validation error: ~A" error))
-
-                                       (let ((added (process-headers valid-headers chain-state)))
-                                         (incf received-count added)
-
-                                         ;; A short batch (< the protocol max)
-                                         ;; means the peer has no more headers.
-                                         (when (< (length headers)
-                                                  bitcoin-lisp.serialization:+max-headers-count+)
-                                           (setf done t))
-
-                                         ;; Per-peer availability: peer's tip is
-                                         ;; the last header in this batch.
-                                         (let ((last (car (last valid-headers))))
-                                           (when last
-                                             (update-block-availability
-                                              peer chain-state
-                                              (bitcoin-lisp.serialization:block-header-hash last))))
-
-                                         (when (> added 0)
-                                           (bitcoin-lisp:log-info "Received ~D headers, ~D new, total ~D"
-                                                                  (length headers) added received-count)))))
+                                   (let* ((headers (bitcoin-lisp.serialization:parse-headers-payload payload))
+                                          (full-batch (and headers
+                                                           (= (length headers)
+                                                              bitcoin-lisp.serialization:+max-headers-count+))))
+                                     (multiple-value-setq (hss done)
+                                       (handle-header-batch peer chain-state headers full-batch hss
+                                                            (lambda (n) (incf received-count n)))))
                                  (error (e)
                                    (bitcoin-lisp:log-error "Error parsing headers: ~A" e)
                                    (setf done t))))
