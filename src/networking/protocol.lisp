@@ -421,8 +421,7 @@ blocks instead of being a sink."
                 (progn
                   (format t "Block ~A rejected: ~A~%"
                           (bitcoin-lisp.crypto:bytes-to-hex hash) error)
-                  ;; Record misbehavior for invalid block
-                  (record-misbehavior peer 100)))))))))
+                  (record-misbehavior peer "invalid block")))))))))
 
 ;;; Address handling
 
@@ -570,14 +569,14 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                       (bitcoin-lisp.mempool:mempool-orphan-pool mempool) tx peer)
                      (request-orphan-parents peer tx utxo-set mempool))
                     (t
-                     ;; Add to recent rejects filter
-                     (bitcoin-lisp:add-recent-reject recent-rejects txid)
-                     ;; Record misbehavior for invalid transactions
-                     ;; (policy violations like :insufficient-fee are not penalized)
-                     (when (member error '(:script-failed :no-inputs :no-outputs
-                                           :duplicate-inputs :negative-output
-                                           :output-too-large :total-output-too-large))
-                       (record-misbehavior peer 10)))))
+                     ;; Add to recent rejects so we don't re-request it. A loose
+                     ;; transaction that fails validation is NOT misbehavior:
+                     ;; Bitcoin Core removed tx-relay punishment (PR #26294),
+                     ;; since tx validity is subjective (our mempool/chain state)
+                     ;; and an honest peer shouldn't be discouraged for relaying
+                     ;; a tx we happen to reject. Consensus-invalid txs are only
+                     ;; punished when they arrive inside a block.
+                     (bitcoin-lisp:add-recent-reject recent-rejects txid))))
                 (when valid
                   (multiple-value-bind (result entry)
                       (bitcoin-lisp.mempool:accept-validated-tx
@@ -663,7 +662,7 @@ a malformed request: record misbehavior and don't reply."
                              block-hash
                              (mapcar (lambda (i) (aref txs i)) indexes)
                              :witness t))
-              (record-misbehavior peer 100)))))))
+              (record-misbehavior peer "getblocktxn with out-of-bounds tx indices")))))))
 
 ;;; Serving headers / blocks / addresses to peers
 ;;;
@@ -1148,7 +1147,7 @@ v1 compact block would deliver a witness-stripped coinbase."
                       :mempool mempool))
                    (progn
                      (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
-                     (record-misbehavior peer 100)))))))
+                     (record-misbehavior peer "invalid compact block")))))))
 
         ;; Collision or malformed - fall back to full block
         ((eq missing-indexes :collision)
@@ -1228,7 +1227,7 @@ v1 compact block would deliver a witness-stripped coinbase."
                        :mempool mempool))
                     (progn
                       (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
-                      (record-misbehavior peer 100)))))))))))
+                      (record-misbehavior peer "invalid reconstructed block")))))))))))
 
 (defun request-full-block (peer block-hash)
   "Request a full block (fallback from compact block)."
