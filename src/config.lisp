@@ -220,3 +220,183 @@ disconnected by handle-message's rate-limit gate.")
 
 (defvar *recent-rejects-max-size* 50000
   "Maximum entries in the recent transaction rejects filter.")
+
+;;;; -----------------------------------------------------------------------
+;;;; bitcoin.conf and command-line argument parsing
+;;;;
+;;;; Bitcoin Core-style configuration: -key=value CLI arguments and a
+;;;; bitcoin.conf file, both mapped onto start-node's keyword parameters by
+;;;; start-node-from-args (node.lisp). The parsers here are pure string
+;;;; functions so they can be unit-tested without launching a node.
+
+(defun conf-parse-bool (value)
+  "Interpret a config VALUE string as a boolean. \"1\"/\"true\"/\"yes\"/\"on\"
+and the empty string (a bare -flag) are true; \"0\"/\"false\"/\"no\"/\"off\"
+are false; anything else is true (matching Core's lenient -flag semantics)."
+  (let ((v (string-downcase (string-trim '(#\Space #\Tab) value))))
+    (cond ((member v '("0" "false" "no" "off") :test #'string=) nil)
+          (t t))))
+
+(defun conf-parse-int (value)
+  "Parse a config VALUE as an integer, or signal an error."
+  (let ((v (string-trim '(#\Space #\Tab) value)))
+    (handler-case (parse-integer v)
+      (error () (error "Invalid integer config value: ~S" value)))))
+
+(defun conf-parse-loglevel (value)
+  "Map a -loglevel value to one of :debug :info :warn :error."
+  (let ((v (string-downcase (string-trim '(#\Space #\Tab) value))))
+    (cond ((member v '("debug" "trace") :test #'string=) :debug)
+          ((string= v "info") :info)
+          ((member v '("warn" "warning") :test #'string=) :warn)
+          ((member v '("error" "none") :test #'string=) :error)
+          (t (error "Invalid loglevel: ~S (want debug/info/warn/error)" value)))))
+
+(defun conf-section-name (network)
+  "The bitcoin.conf [section] header that scopes options to NETWORK."
+  (ecase network
+    (:mainnet "main")
+    (:testnet3 "test")
+    (:testnet4 "testnet4")
+    (:signet "signet")
+    (:regtest "regtest")))
+
+(defun parse-cli-args (args)
+  "Parse Bitcoin Core-style CLI ARGS (a list of strings) into an alist of
+ (lower-case-key . value-string), in order. Accepts -key=value and --key=value;
+a bare -key means key=1 and -nokey means key=0. Non-flag tokens are ignored.
+Later occurrences are kept too, so an assoc lookup returns the first (earliest)."
+  (let ((out nil))
+    (dolist (arg args (nreverse out))
+      (when (and (stringp arg) (plusp (length arg)) (char= (char arg 0) #\-))
+        (let* ((s (string-left-trim "-" arg))
+               (eq-pos (position #\= s)))
+          (cond
+            ((zerop (length s)))                                   ; bare "-" / "--"
+            (eq-pos
+             (push (cons (string-downcase (subseq s 0 eq-pos))
+                         (subseq s (1+ eq-pos)))
+                   out))
+            ;; Bare -noKEY negates; bare -KEY asserts.
+            ((and (> (length s) 2) (string-equal (subseq s 0 2) "no"))
+             (push (cons (string-downcase (subseq s 2)) "0") out))
+            (t (push (cons (string-downcase s) "1") out))))))))
+
+(defun parse-bitcoin-conf (text &optional network)
+  "Parse bitcoin.conf TEXT into an alist of (lower-case-key . value-string).
+Blank lines and #-comments are skipped. A [section] header scopes the keys that
+follow to a network; only keys in the global area (before any section) or in the
+section matching NETWORK are returned. When NETWORK is NIL, section headers are
+ignored and every key is returned."
+  (let ((out nil)
+        (active t)
+        (want (and network (conf-section-name network))))
+    (with-input-from-string (in text)
+      (loop for raw = (read-line in nil nil)
+            while raw
+            do (let ((line (string-trim '(#\Space #\Tab #\Return) raw)))
+                 (cond
+                   ((zerop (length line)))                          ; blank
+                   ((char= (char line 0) #\#))                      ; comment
+                   ((and (char= (char line 0) #\[)
+                         (char= (char line (1- (length line))) #\]))
+                    (let ((sec (string-downcase
+                                (string-trim '(#\Space)
+                                             (subseq line 1 (1- (length line)))))))
+                      (setf active (or (null want) (string= sec want)))))
+                   (active
+                    (let ((eq-pos (position #\= line)))
+                      (when eq-pos
+                        (push (cons (string-downcase
+                                     (string-trim '(#\Space #\Tab) (subseq line 0 eq-pos)))
+                                    (string-trim '(#\Space #\Tab) (subseq line (1+ eq-pos))))
+                              out))))))))
+    (nreverse out)))
+
+(defun resolve-network-from-config (alist &optional (default :testnet3))
+  "Determine the network from a merged config ALIST. Honors -regtest/-signet/
+-testnet4/-testnet flags (in Core's precedence) and -chain=main|test|testnet4|
+signet|regtest, else returns DEFAULT."
+  (flet ((flag (k) (let ((c (assoc k alist :test #'string=)))
+                     (and c (conf-parse-bool (cdr c)))))
+         (val (k) (let ((c (assoc k alist :test #'string=))) (and c (cdr c)))))
+    (cond
+      ((flag "regtest") :regtest)
+      ((flag "signet") :signet)
+      ((flag "testnet4") :testnet4)
+      ((flag "testnet") :testnet3)
+      ((val "chain")
+       (let ((c (string-downcase (val "chain"))))
+         (cond ((member c '("main" "mainnet") :test #'string=) :mainnet)
+               ((member c '("test" "testnet" "testnet3") :test #'string=) :testnet3)
+               ((string= c "testnet4") :testnet4)
+               ((string= c "signet") :signet)
+               ((string= c "regtest") :regtest)
+               (t (error "Unknown -chain value: ~S" c)))))
+      (t default))))
+
+(defparameter *cli-option-spec*
+  '(("datadir"           :data-directory     :string)
+    ("txindex"           :txindex            :bool)
+    ("blockfilterindex"  :blockfilterindex   :bool)
+    ("coinstatsindex"    :coinstatsindex     :bool)
+    ("prune"             :prune              :int)
+    ("dbcache"           :dbcache-mib        :int)
+    ("maxconnections"    :max-peers          :int)
+    ("rpcport"           :rpc-port           :int)
+    ("rpcbind"           :rpc-bind           :string)
+    ("rpcuser"           :rpc-user           :string)
+    ("rpcpassword"       :rpc-password       :string)
+    ("listen"            :listen             :bool)
+    ("bind"              :listen-bind        :string)
+    ("v2transport"       :v2transport        :bool)
+    ("reindexchainstate" :reindex-chainstate :bool)
+    ("reindex-chainstate" :reindex-chainstate :bool)
+    ("logfile"           :log-file           :string)
+    ("loglevel"          :log-level          :loglevel)
+    ("sync"              :sync               :bool))
+  "Maps a Bitcoin Core-style option name to a start-node keyword and its value
+type. Network selection (-chain/-testnet/...) and -server/-debug are handled
+specially in config-alist->start-node-plist.")
+
+(defun config-alist->start-node-plist (alist network)
+  "Convert a merged config ALIST (CLI over file) into a plist of start-node
+keyword arguments, coercing each value by its spec type. NETWORK is the already-
+resolved network. Honors -server (enable RPC on the default port when no
+-rpcport is given) and -debug (=> loglevel debug unless -loglevel is set)."
+  (let ((plist (list :network network)))
+    (flet ((lookup (k) (assoc k alist :test #'string=)))
+      (dolist (spec *cli-option-spec*)
+        (destructuring-bind (name keyword type) spec
+          (let ((cell (lookup name)))
+            (when cell
+              (let ((raw (cdr cell)))
+                (setf (getf plist keyword)
+                      (ecase type
+                        (:string raw)
+                        (:bool (conf-parse-bool raw))
+                        (:int (conf-parse-int raw))
+                        (:loglevel (conf-parse-loglevel raw)))))))))
+      ;; -debug is a shortcut for -loglevel=debug (unless loglevel was set).
+      (let ((debug (lookup "debug")))
+        (when (and debug (conf-parse-bool (cdr debug)) (not (lookup "loglevel")))
+          (setf (getf plist :log-level) :debug)))
+      ;; -server enables RPC; give it the network default port if none was set.
+      (let ((server (lookup "server")))
+        (when (and server (conf-parse-bool (cdr server))
+                   (not (getf plist :rpc-port)))
+          (setf (getf plist :rpc-port) (network-rpc-port network)))))
+    plist))
+
+(defun args->start-node-plist (args &optional conf-text)
+  "Pure assembly of a start-node keyword plist from Bitcoin Core-style CLI ARGS
+ (a list of strings) and optional CONF-TEXT (the contents of a bitcoin.conf).
+CLI arguments override the file. The network is resolved from the CLI first, so
+the config file's [network] section can be scoped, then finalized from the
+merge. start-node-from-args (node.lisp) wraps this with the file I/O and launch."
+  (let* ((cli (parse-cli-args args))
+         (cli-network (resolve-network-from-config cli))
+         (conf (when conf-text (parse-bitcoin-conf conf-text cli-network)))
+         (merged (append cli conf))                 ; CLI first => wins on assoc
+         (network (resolve-network-from-config merged)))
+    (config-alist->start-node-plist merged network)))

@@ -129,6 +129,42 @@ sbcl
 (bitcoin-lisp:node-status)
 ```
 
+### Configuration (bitcoin.conf and CLI options)
+
+Instead of Lisp keyword arguments, the node accepts Bitcoin Core-style options
+via `start-node-from-args` — a list of `-key=value` arguments plus an optional
+`bitcoin.conf` read from the data directory. CLI arguments override the file.
+
+```lisp
+;; Options as Core-style flags (bare -flag means =1, -noflag means =0):
+(bitcoin-lisp:start-node-from-args
+ '("-chain=main" "-txindex" "-dbcache=2000" "-server" "-rpcuser=me" "-rpcpassword=secret"))
+
+;; Or read the OS command line (rest of sb-ext:*posix-argv*):
+(bitcoin-lisp:start-node-from-args)
+```
+
+A `bitcoin.conf` in the data directory (`-datadir=`, default `~/.bitcoin-lisp/`)
+is read automatically, with `[main] / [test] / [testnet4] / [signet] / [regtest]`
+sections scoped to the selected network:
+
+```ini
+# ~/.bitcoin-lisp/bitcoin.conf
+txindex=1
+dbcache=2000
+server=1
+
+[main]
+rpcport=8332
+```
+
+Recognized options: `-chain` (`main`/`test`/`testnet4`/`signet`/`regtest`) and
+the `-testnet`/`-testnet4`/`-signet`/`-regtest` flags; `-datadir`, `-conf`;
+`-txindex`, `-blockfilterindex`, `-coinstatsindex`; `-prune`, `-dbcache`,
+`-maxconnections`; `-rpcport`, `-rpcbind`, `-rpcuser`, `-rpcpassword`, `-server`;
+`-listen`, `-bind`, `-v2transport`, `-reindex-chainstate`; `-loglevel`,
+`-debug`, `-logfile`.
+
 ### Step 5: Running as a Background Service (Optional)
 
 Create a systemd service file for running the node:
