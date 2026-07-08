@@ -880,6 +880,8 @@
    #:peer-user-agent
    #:peer-ping-latency
    #:peer-inbound
+   #:peer-conn-type
+   #:peer-relays-txs-p
    #:peer-getaddr-sent
    #:connect-peer
    #:disconnect-peer

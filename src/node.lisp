@@ -1465,11 +1465,20 @@ connect-to-peers so they are attempted before DNS-seed candidates.")
 (defun save-anchors (node)
   "Persist up to +max-anchors+ currently-connected outbound peers' addresses to
 anchors.dat (crash-safe: temp + fsync + atomic rename, CRC32-protected)."
-  (let* ((outbound (remove-if #'bitcoin-lisp.networking:peer-inbound
-                              (node-peers node)))
-         (ready (remove-if-not (lambda (p)
-                                 (eq (bitcoin-lisp.networking:peer-state p) :ready))
-                               outbound))
+  (let* ((ready-outbound
+           (remove-if-not
+            (lambda (p) (and (not (bitcoin-lisp.networking:peer-inbound p))
+                             (eq (bitcoin-lisp.networking:peer-state p) :ready)))
+            (node-peers node)))
+         ;; Prefer block-relay-only peers as anchors (Core anchors are
+         ;; block-relay: an attacker who fed us a poisoned addrman can't
+         ;; substitute a peer we were just block-relay-connected to). Fall back
+         ;; to full-relay outbound if we have no block-relay peers.
+         (block-relay (remove-if-not
+                       (lambda (p) (eq (bitcoin-lisp.networking:peer-conn-type p)
+                                       :block-relay))
+                       ready-outbound))
+         (ready (or block-relay ready-outbound))
          (addrs (mapcar #'bitcoin-lisp.networking:peer-address
                         (subseq ready 0 (min +max-anchors+ (length ready))))))
     (when addrs
@@ -1702,9 +1711,16 @@ Returns the number of new peers connected."
   ;; setnetworkactive off: don't dial replacements.
   (unless (node-network-active node)
     (return-from replace-disconnected-peers 0))
+  ;; Count only the normal peer set (inbound + full-relay) toward max-peers.
+  ;; Block-relay-only peers are a separate additive pool maintained by
+  ;; maintain-block-relay-peers (Core keeps m_max_outbound_block_relay distinct
+  ;; from m_max_outbound_full_relay); folding them in here would let 2 idle
+  ;; block-relay slots starve replacement of a dropped full-relay peer.
   (let* ((active-peers (remove-if-not
                         (lambda (p)
-                          (eq (bitcoin-lisp.networking:peer-state p) :ready))
+                          (and (eq (bitcoin-lisp.networking:peer-state p) :ready)
+                               (not (member (bitcoin-lisp.networking:peer-conn-type p)
+                                            '(:block-relay :feeler)))))
                         (node-peers node)))
          (needed (- (node-max-peers node) (length active-peers))))
     (when (<= needed 0)
@@ -1780,16 +1796,17 @@ bare IPv6 address (which contains colons) is treated as host-only."
                :key #'bitcoin-lisp.networking:peer-address :test #'string=)
          t)))
 
-(defun establish-outbound-peer (node host port)
+(defun establish-outbound-peer (node host port &key (conn-type :outbound-full-relay))
   "Full outbound connect + handshake to HOST:PORT, pushing the ready peer onto
-node-peers. Returns the peer or NIL. MUST run on the sync thread so node-peers
-stays single-writer. No-op when networking is disabled."
+node-peers. CONN-TYPE (:outbound-full-relay or :block-relay) sets the peer's
+connection type. Returns the peer or NIL. MUST run on the sync thread so
+node-peers stays single-writer. No-op when networking is disabled."
   (when (node-network-active node)
     (handler-case
         (let ((peer (bitcoin-lisp.networking:connect-peer host port)))
           (when peer
             (setf (bitcoin-lisp.networking:peer-address peer) host)
-            (if (bitcoin-lisp.networking:perform-handshake peer)
+            (if (bitcoin-lisp.networking:perform-handshake peer :conn-type conn-type)
                 (progn
                   (bitcoin-lisp.networking:send-post-handshake-messages peer)
                   (bitcoin-lisp.networking:send-compact-block-negotiation peer)
@@ -1820,11 +1837,88 @@ then keep every \"add\" peer connected. Honors network-active."
         (unless (peer-connected-to-host-p node host)
           (establish-outbound-peer node host port))))))
 
+(defconstant +target-block-relay-peers+ 2
+  "Dedicated block-relay-only outbound slots (Bitcoin Core opens 2). They carry
+blocks/headers but no tx relay -- anti-partition insurance and the source of
+reconnection anchors.")
+
+(defconstant +feeler-interval-seconds+ 120
+  "Minimum spacing between feeler probes (Core FEELER_INTERVAL averages ~2 min).")
+
+(defvar *last-feeler-time* 0
+  "get-universal-time of the last feeler attempt, for rate-limiting.")
+
+(defun peers-of-conn-type (node type)
+  "Count current peers whose connection type is TYPE."
+  (bt:with-recursive-lock-held ((node-lock node))
+    (count type (node-peers node)
+           :key #'bitcoin-lisp.networking:peer-conn-type)))
+
+(defun %addrman-pick-unconnected (node &key new-only)
+  "Pick an addrman address (as (values host port)) we're not already connected
+to, or NIL. NEW-ONLY restricts to the 'new' table (for feelers)."
+  (let ((ab (node-address-book node)))
+    (when ab
+      (dotimes (_ 20)
+        (let ((pa (bitcoin-lisp.networking:address-book-select ab :new-only new-only)))
+          (when pa
+            (let ((ip (bitcoin-lisp.networking:ip-bytes-to-string
+                       (bitcoin-lisp.networking:peer-address-ip pa))))
+              (when (and ip (not (peer-connected-to-host-p node ip)))
+                (return-from %addrman-pick-unconnected
+                  (values ip (bitcoin-lisp.networking:peer-address-port pa)))))))))))
+
+(defun maintain-block-relay-peers (node)
+  "Ensure up to +target-block-relay-peers+ block-relay-only outbound peers.
+Each carries blocks/headers only (relay=0), never tx relay."
+  (when (and (node-network-active node) (node-address-book node))
+    (loop while (< (peers-of-conn-type node :block-relay) +target-block-relay-peers+)
+          do (multiple-value-bind (ip port) (%addrman-pick-unconnected node)
+               (unless (and ip (establish-outbound-peer
+                                node ip (or port (network-port (node-network node)))
+                                :conn-type :block-relay))
+                 ;; No candidate, or the connect failed: stop trying this cycle.
+                 (return))
+               (log-info "Opened block-relay-only peer ~A" ip)))))
+
+(defun do-feeler-connection (node host port)
+  "Open a short-lived feeler connection: connect, handshake, and on success mark
+the address good (promoting it new -> tried). Always disconnects afterward --
+feelers exist only to validate addrman's tried table (Core anti-eclipse), never
+to join the peer set."
+  (handler-case
+      (let ((peer (bitcoin-lisp.networking:connect-peer host port)))
+        (when peer
+          (setf (bitcoin-lisp.networking:peer-address peer) host)
+          (when (bitcoin-lisp.networking:perform-handshake peer :conn-type :feeler)
+            (let ((ip-bytes (bitcoin-lisp.networking:string-to-ip-bytes host)))
+              (when ip-bytes
+                (bitcoin-lisp.networking:address-book-good
+                 (node-address-book node) ip-bytes port)))
+            (log-debug "Feeler validated ~A (new -> tried)" host))
+          (bitcoin-lisp.networking:disconnect-peer peer)))
+    (error (c)
+      (log-debug "Feeler to ~A:~D failed: ~A" host port c))))
+
+(defun maybe-do-feeler (node)
+  "Rate-limited: probe one addrman 'new' address with a feeler to validate it
+into 'tried'."
+  (let ((now (get-universal-time)))
+    (when (and (node-network-active node) (node-address-book node)
+               (>= (- now *last-feeler-time*) +feeler-interval-seconds+))
+      (setf *last-feeler-time* now)
+      (multiple-value-bind (ip port) (%addrman-pick-unconnected node :new-only t)
+        (when ip
+          (do-feeler-connection node ip (or port (network-port (node-network node)))))))))
+
 (defun maintain-peers (node)
-  "Run periodic peer maintenance: health checks and reconnection."
+  "Run periodic peer maintenance: health checks, reconnection, dedicated
+block-relay-only slots, and an occasional feeler probe."
   (check-peers-health node)
   (connect-added-nodes node)
-  (replace-disconnected-peers node))
+  (replace-disconnected-peers node)
+  (maintain-block-relay-peers node)
+  (maybe-do-feeler node))
 
 ;;;; Blockchain Synchronization
 
