@@ -81,6 +81,7 @@
                                (:file "peerdb")
                                (:file "addrman")
                                (:file "protocol")
+                               (:file "headers-sync")
                                (:file "ibd")))
                  (:module "rpc"
                   :components ((:file "package")
@@ -185,6 +186,8 @@
                              ;; -reindex-chainstate tests
                              (:file "reindex-tests")
                              ;; Connection types (block-relay-only + feeler)
-                             (:file "conn-type-tests"))))
+                             (:file "conn-type-tests")
+                             ;; Low-work headers sync (anti-DoS presync/redownload)
+                             (:file "headers-sync-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
