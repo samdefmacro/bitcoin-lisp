@@ -172,15 +172,13 @@ MAX_STANDARD_TX_WEIGHT).")
 (defconstant +min-standard-tx-version+ 1
   "Minimum standard transaction version (Bitcoin Core TX_MIN_STANDARD_VERSION).")
 
-(defconstant +max-standard-tx-version+ 2
-  "Maximum standard transaction version. Bitcoin Core bumped
-TX_MAX_STANDARD_VERSION to 3 only in lockstep with enforcing TRUC/v3 topology
-policy (BIP431: at most 1 unconfirmed ancestor + 1 descendant, a 1000-vsize
-child cap, and v3<->non-v3 spend inheritance). We do not implement TRUC, so
-accepting v3 as standard would relay v3 transactions that violate TRUC -- which
-every modern Core peer rejects -- while giving v3 none of its anti-pinning
-guarantees. Until TRUC lands we keep the pre-TRUC cap of 2, treating v3 as
-non-standard (still consensus-valid, just not relayed).")
+(defconstant +max-standard-tx-version+ 3
+  "Maximum standard transaction version. Bitcoin Core (TX_MAX_STANDARD_VERSION)
+accepts v3 as standard in lockstep with enforcing TRUC/v3 topology policy
+(BIP431). We now enforce that topology per-tx at mempool acceptance via
+bitcoin-lisp.mempool:single-truc-checks (at most 1 unconfirmed ancestor +
+1 descendant, TRUC_MAX_VSIZE, a 1000-vsize child cap, and v3<->non-v3 spend
+inheritance), so v3 is relayed with its anti-pinning guarantees.")
 
 (defconstant +dust-relay-fee-rate+ 3000
   "Dust relay fee rate in satoshis per kvB (Bitcoin Core DUST_RELAY_TX_FEE).
@@ -668,6 +666,14 @@ re-add, mempool.dat reload) where those checks don't apply."
                          vsize)))
           (return-from validate-transaction-for-mempool
             (values nil :insufficient-fee nil)))
+
+        ;; BIP431 TRUC (v3) topology: inheritance + ancestor/descendant/size
+        ;; limits for this tx and its unconfirmed relatives. Runs on every tx
+        ;; (non-v3 spending v3 is also rejected); a no-op for a lone non-v3 tx.
+        (multiple-value-bind (truc-ok truc-reason)
+            (bitcoin-lisp.mempool:single-truc-checks mempool tx vsize direct-conflicts)
+          (unless truc-ok
+            (return-from validate-transaction-for-mempool (values nil truc-reason nil))))
 
         ;; BIP125 replace-by-fee: if this tx conflicts with mempool entries it
         ;; must satisfy the replacement rules; the set it replaces is returned
