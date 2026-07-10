@@ -1968,6 +1968,8 @@ node's per-network activation heights."
          (best-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
     `(("hash" . ,(if best-hash (hash-to-hex best-hash) ""))
       ("height" . ,height)
+      ;; Script-verify flags active for a block at the tip (Core script_flags).
+      ("script_flags" . ,(bitcoin-lisp.validation::mandatory-script-flags-list height))
       ("deployments"
        . (("bip34" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip34-activation-height network) height))
           ("bip66" . ,(%buried-deployment (bitcoin-lisp.validation:get-bip66-activation-height network) height))
@@ -2057,7 +2059,8 @@ implicit default mode is supported (no longpoll / proposal). Fields mirror Core.
          (mempool (rpc-get-mempool node))
          (template (bitcoin-lisp.mining:assemble-block-template chain-state mempool))
          (bits (bitcoin-lisp.mining:block-template-bits template)))
-    `(("version" . ,(bitcoin-lisp.mining:block-template-version template))
+    `(("capabilities" . ("proposal"))
+      ("version" . ,(bitcoin-lisp.mining:block-template-version template))
       ("previousblockhash" . ,(hash-to-hex (bitcoin-lisp.mining:block-template-prev-hash template)))
       ("transactions" . ,(%gbt-transactions template))
       ("coinbaseaux" . ,(make-hash-table :test 'equal))
@@ -2067,6 +2070,7 @@ implicit default mode is supported (no longpoll / proposal). Fields mirror Core.
       ("mutable" . ("time" "transactions" "prevblock"))
       ("noncerange" . "00000000ffffffff")
       ("sigoplimit" . ,bitcoin-lisp.validation:+max-block-sigops-cost+)
+      ("sizelimit" . 4000000)          ; MAX_BLOCK_SERIALIZED_SIZE
       ("weightlimit" . ,bitcoin-lisp.validation:+max-block-weight+)
       ("curtime" . ,(bitcoin-lisp.mining:block-template-curtime template))
       ("bits" . ,(%bits-hex bits))
@@ -2405,7 +2409,12 @@ Searches mempool first, then txindex (if enabled), then blockhash hint."
               (when found-tx
                 (return-from rpc-getrawtransaction
                   (if verbose
-                      (tx-to-json-confirmed found-tx node block-hash-bytes)
+                      ;; With an explicit blockhash, Core adds in_active_chain.
+                      (let* ((cs (rpc-get-chain-state node))
+                             (entry (bitcoin-lisp.storage:get-block-index-entry cs block-hash-bytes)))
+                        (append (tx-to-json-confirmed found-tx node block-hash-bytes)
+                                `(("in_active_chain"
+                                   . ,(and entry (%block-on-active-chain-p entry cs))))))
                       (bitcoin-lisp.crypto:bytes-to-hex
                        (bitcoin-lisp.serialization:serialize found-tx)))))))))
 
