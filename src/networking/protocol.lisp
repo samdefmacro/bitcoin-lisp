@@ -162,6 +162,17 @@ Returns T if message was handled, NIL otherwise."
      (handle-getaddr peer address-book)
      t)
 
+    ((string= command "mempool")
+     ;; BIP35. Core only honors this when it advertises NODE_BLOOM or the
+     ;; peer has explicit mempool permission — otherwise it disconnects
+     ;; ("mempool request with bloom filters disabled",
+     ;; net_processing.cpp:4940-4951). We never advertise NODE_BLOOM, so
+     ;; the disconnect path is the whole behavior.
+     (bitcoin-lisp:log-cat "net" "mempool request with bloom filters disabled — disconnecting peer ~A"
+                           (peer-address peer))
+     (disconnect-peer peer)
+     t)
+
     ((string= command "notfound")
      (handle-notfound peer payload)
      t)
@@ -651,7 +662,12 @@ and recurse on newly-accepted txs so a parent can unblock a whole chain."
                     ((eq error :missing-input) nil)   ; still missing another parent
                     (t (bitcoin-lisp.mempool:orphan-remove pool otxid)  ; now invalid
                        (when recent-rejects
-                         (bitcoin-lisp:add-recent-reject recent-rejects otxid)))))))))))))
+                         ;; wtxid-keyed, like every reject insert (witness
+                         ;; malleability — Core issue #8279); equals the txid
+                         ;; for no-witness txs.
+                         (bitcoin-lisp:add-recent-reject
+                          recent-rejects
+                          (bitcoin-lisp.serialization:transaction-wtxid otx))))))))))))))
 
 (defun request-orphan-parents (peer tx utxo-set mempool)
   "Send a getdata to PEER for TX's missing parents (inputs not in the UTXO set
@@ -681,19 +697,22 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
         (when tx
           (with-node-lock
             (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+                  (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
                   (current-height (bitcoin-lisp.storage:current-height chain-state)))
               ;; The requested tx arrived — clear its in-flight/announcer
               ;; tracking. MSG_WTX announcements are tracked under the wtxid,
               ;; so clear that key too (txids and wtxids never collide; for
               ;; no-witness txs they are equal and one call suffices).
               (tx-request-received txid)
-              (let ((wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
-                (unless (equalp wtxid txid)
-                  (tx-request-received wtxid)))
+              (unless (equalp wtxid txid)
+                (tx-request-received wtxid))
               ;; Mark as announced by this peer (bounded set)
               (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
-              ;; Check recent rejects filter before expensive validation
-              (when (bitcoin-lisp:recent-reject-p recent-rejects txid)
+              ;; Check recent rejects before expensive validation. The filter
+              ;; is wtxid-keyed (Core m_lazy_recent_rejects); txid entries
+              ;; exist only where Core adds them too, so check both ids.
+              (when (or (bitcoin-lisp:recent-reject-p recent-rejects wtxid)
+                        (bitcoin-lisp:recent-reject-p recent-rejects txid))
                 (return-from handle-tx nil))
               ;; Validate for mempool
               (multiple-value-bind (valid error fee replaced)
@@ -716,7 +735,13 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                      ;; and an honest peer shouldn't be discouraged for relaying
                      ;; a tx we happen to reject. Consensus-invalid txs are only
                      ;; punished when they arrive inside a block.
-                     (bitcoin-lisp:add-recent-reject recent-rejects txid))))
+                     ;;
+                     ;; Keyed by WTXID, never the txid of a witness tx: the
+                     ;; witness can be malleated, so the same txid with a
+                     ;; different witness could still be valid (Core issue
+                     ;; #8279; txdownloadman_impl.cpp MempoolRejectedTx). For
+                     ;; no-witness txs wtxid == txid, so those are covered.
+                     (bitcoin-lisp:add-recent-reject recent-rejects wtxid))))
                 (when valid
                   (multiple-value-bind (result entry)
                       (bitcoin-lisp.mempool:accept-validated-tx
