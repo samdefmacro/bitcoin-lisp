@@ -280,6 +280,29 @@ walking past pushed data. Bitcoin Core CScript::IsPushOnly."
                  (t (incf i)))))         ; OP_0, OP_1NEGATE, OP_1..OP_16
     t))
 
+(defun %op-return-push-only-p (script)
+  "T if the bytes after the leading OP_RETURN in SCRIPT are push-only (only data
+pushes / OP_0 / OP_1NEGATE / OP_1..OP_16), matching Core CScript::IsPushOnly.
+Any non-push opcode -- or a push that runs past the end -- fails."
+  (let ((len (length script)) (i 1))    ; skip OP_RETURN at index 0
+    (loop while (< i len) do
+      (let ((op (aref script i)))
+        (cond
+          ((<= op #x4b) (incf i (+ 1 op)))                          ; OP_0 / direct push
+          ((= op #x4c) (if (< (1+ i) len)                           ; OP_PUSHDATA1
+                           (incf i (+ 2 (aref script (1+ i))))
+                           (return-from %op-return-push-only-p nil)))
+          ((= op #x4d) (if (< (+ i 2) len)                          ; OP_PUSHDATA2
+                           (incf i (+ 3 (aref script (1+ i)) (ash (aref script (+ i 2)) 8)))
+                           (return-from %op-return-push-only-p nil)))
+          ((= op #x4e) (if (< (+ i 4) len)                          ; OP_PUSHDATA4
+                           (incf i (+ 5 (aref script (1+ i)) (ash (aref script (+ i 2)) 8)
+                                      (ash (aref script (+ i 3)) 16) (ash (aref script (+ i 4)) 24)))
+                           (return-from %op-return-push-only-p nil)))
+          ((<= op #x60) (incf i))                                   ; OP_1NEGATE / OP_1..OP_16
+          (t (return-from %op-return-push-only-p nil)))))           ; non-push opcode
+    (= i len)))                          ; NIL if a push overran the script end
+
 (defun standard-output-script-p (script-pubkey)
   "Check if SCRIPT-PUBKEY is a standard output script type.
 Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
@@ -310,11 +333,15 @@ Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
           (= (aref script-pubkey 0) #x51)   ; OP_1
           (= (aref script-pubkey 1) #x20))  ; push 32 bytes
      ;; OP_RETURN data carrier — gated by -datacarrier, sized by
-     ;; -datacarriersize (mempool policy, not consensus).
+     ;; -datacarriersize (mempool policy, not consensus). The bytes after
+     ;; OP_RETURN must be push-only: Core's Solver only classifies NULL_DATA when
+     ;; scriptPubKey.IsPushOnly(begin()+1) (solver.cpp), so an OP_RETURN carrying
+     ;; any non-push opcode is nonstandard.
      (and bitcoin-lisp:*accept-datacarrier*
           (>= len 1)
           (<= len bitcoin-lisp:*max-datacarrier-bytes*)
-          (= (aref script-pubkey 0) #x6a))   ; OP_RETURN
+          (= (aref script-pubkey 0) #x6a)   ; OP_RETURN
+          (%op-return-push-only-p script-pubkey))
      ;; Bare (non-P2SH) multisig — standard only when -permitbaremultisig.
      (and bitcoin-lisp:*permit-bare-multisig*
           (bare-multisig-standard-p script-pubkey)))))
