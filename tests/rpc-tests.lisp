@@ -1725,6 +1725,45 @@ to \"block-relay-only\" with relaytxes false."
       (is-true b)
       (is (null (cdr (assoc "relaytxes" b :test #'string=)))))))
 
+(test rpc-getorphantxs
+  "getorphantxs lists the orphan pool: verbosity 0 -> array of txid hex; 1 ->
+detail objects (txid/wtxid/bytes/vsize/weight/from); 2 -> details plus raw hex.
+The single announcer peer's id appears in \"from\"."
+  (let* ((node (make-test-node))
+         (peer (bitcoin-lisp::make-peer :address "9.9.9.9:8333"))
+         (txid0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 2
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                 :hash txid0 :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 90000
+                                :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))))
+              :lock-time 0))
+         (mempool (bitcoin-lisp.rpc::rpc-get-mempool node))
+         (pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool))
+         (txid-hex (bitcoin-lisp.rpc::hash-to-hex
+                    (bitcoin-lisp.serialization:transaction-hash tx))))
+    (bitcoin-lisp.mempool:orphan-add pool tx peer)
+    ;; verbosity 0 (default): array of txid hex strings
+    (is (equal (list txid-hex) (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
+    ;; verbosity 1: detail object with the expected keys + announcer peer id
+    (let ((v1 (first (bitcoin-lisp.rpc::rpc-getorphantxs node (list 1)))))
+      (is (string= txid-hex (cdr (assoc "txid" v1 :test #'string=))))
+      (is (assoc "wtxid" v1 :test #'string=))
+      (is (plusp (cdr (assoc "bytes" v1 :test #'string=))))
+      (is (plusp (cdr (assoc "vsize" v1 :test #'string=))))
+      (is (plusp (cdr (assoc "weight" v1 :test #'string=))))
+      (is (equal (list (bitcoin-lisp.networking::peer-id peer))
+                 (cdr (assoc "from" v1 :test #'string=))))
+      (is (null (assoc "hex" v1 :test #'string=))))
+    ;; verbosity 2: adds the raw hex
+    (let ((v2 (first (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2)))))
+      (is (stringp (cdr (assoc "hex" v2 :test #'string=)))))))
+
 (test rpc-sign-verify-message
   "signmessagewithprivkey + verifymessage round-trip: a message signed with a
 key's WIF verifies against that key's P2PKH address; a tampered message, a wrong
