@@ -202,6 +202,11 @@ Returns (VALUES net-addr timestamp) when WITH-TIMESTAMP, otherwise just net-addr
 (defconstant +inv-type-tx+ 1)
 (defconstant +inv-type-block+ 2)
 (defconstant +inv-type-filtered-block+ 3)
+(defconstant +inv-type-cmpct-block+ 4)
+;; MSG_WTX (BIP339): a tx identified by its witness txid (wtxid), used for
+;; wtxidrelay-negotiated announcements/getdata. Distinct from MSG_WITNESS_TX
+;; (+inv-type-witness-tx+ = MSG_TX|witness-flag), which is txid-based.
+(defconstant +inv-type-wtx+ 5)
 (defconstant +inv-type-witness-tx+ (logior +inv-type-tx+ (ash 1 30)))
 (defconstant +inv-type-witness-block+ (logior +inv-type-block+ (ash 1 30)))
 
@@ -326,9 +331,14 @@ serializes header-only CBlocks, which append nTx=0)."
 
 ;;;; Transaction message
 
-(defun make-tx-message (tx)
-  "Create a serialized tx message from a transaction."
-  (let ((payload (serialize-transaction tx)))
+(defun make-tx-message (tx &key witness)
+  "Create a serialized \"tx\" message. With :WITNESS (for MSG_WTX / MSG_WITNESS_TX
+getdata), a segwit tx is serialized in BIP144 witness form; a non-witness tx, or
+:WITNESS nil (legacy MSG_TX), uses the legacy encoding — matching Core's
+TX_WITH_WITNESS vs TX_NO_WITNESS in FindTxForGetData."
+  (let ((payload (if (and witness (transaction-has-witness-p tx))
+                     (serialize-witness-transaction tx)
+                     (serialize-transaction tx))))
     (serialize-message "tx" payload)))
 
 (defun make-block-message (block &key witness)

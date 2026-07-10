@@ -288,6 +288,7 @@
    #:inv-vector-hash
    #:+inv-type-tx+
    #:+inv-type-block+
+   #:+inv-type-wtx+
    #:+inv-type-witness-tx+
    #:+inv-type-witness-block+
    #:+inv-type-cmpct-block+
@@ -688,6 +689,7 @@
    #:*mempool-full-rbf*
    #:mempool-has
    #:mempool-get
+   #:mempool-get-by-wtxid
    #:mempool-spending-tx
    #:mempool-add
    #:accept-validated-tx

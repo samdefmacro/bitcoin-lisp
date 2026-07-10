@@ -617,15 +617,32 @@ handling of unavailable blocks."
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
         (cond
-          ;; Transaction request - only respond if relay is enabled
+          ;; Transaction request - only respond if relay is enabled. Resolve the
+          ;; hash by the id its inv type implies: MSG_TX by txid (legacy
+          ;; serialization), MSG_WITNESS_TX by txid (witness serialization),
+          ;; MSG_WTX by wtxid (BIP339, witness serialization). We also accept a
+          ;; wtxid under MSG_WITNESS_TX because our own wtxidrelay announcements
+          ;; carry a wtxid under that type -- txids and wtxids never collide, so
+          ;; trying both is safe, and this was the missing half of serving those
+          ;; announcements (previously mempool-get by txid returned nil).
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
+               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
+               (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
            (when (and mempool (relay-enabled-p))
-             (let ((entry (bitcoin-lisp.mempool:mempool-get mempool hash)))
+             (let* ((legacy (= inv-type bitcoin-lisp.serialization:+inv-type-tx+))
+                    (entry (cond
+                             ((= inv-type bitcoin-lisp.serialization:+inv-type-wtx+)
+                              (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))
+                             (legacy
+                              (bitcoin-lisp.mempool:mempool-get mempool hash))
+                             (t
+                              (or (bitcoin-lisp.mempool:mempool-get mempool hash)
+                                  (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))))))
                (when entry
                  (send-message peer
                                (bitcoin-lisp.serialization:make-tx-message
-                                (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
+                                (bitcoin-lisp.mempool:mempool-entry-transaction entry)
+                                :witness (not legacy)))))))
           ;; Block request - serve the full block from disk (witness-aware).
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
