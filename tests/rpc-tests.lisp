@@ -1451,6 +1451,8 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
            (segwit (cdr (assoc "segwit" deps :test #'string=))))
       (is (assoc "bip34" deps :test #'string=))
       (is (assoc "taproot" deps :test #'string=))
+      ;; script_flags is a list of active script-verify flag names (P2SH at h=0)
+      (is (member "P2SH" (cdr (assoc "script_flags" r :test #'string=)) :test #'string=))
       (is (string= "buried" (cdr (assoc "type" segwit :test #'string=))))
       (is (= (bitcoin-lisp.validation:get-segwit-activation-height net)
              (cdr (assoc "height" segwit :test #'string=))))
