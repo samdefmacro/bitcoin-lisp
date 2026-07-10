@@ -475,6 +475,7 @@
    #:leveldb-get
    #:leveldb-delete
    #:leveldb-write
+   #:leveldb-compact
    #:leveldb-make-writebatch
    #:leveldb-destroy-writebatch
    #:leveldb-writebatch-clear
@@ -504,6 +505,7 @@
    ;; Coins-view-cache (in-memory dirty-tracking layer)
    #:coins-view-cache
    #:make-coins-view-cache
+   #:coins-view-cache-compact
    #:coins-view-cache-get
    #:coins-view-cache-has-p
    #:coins-view-cache-add
@@ -536,6 +538,7 @@
    #:coinstats
    #:init-coinstatsindex
    #:close-coinstatsindex
+   #:coinstatsindex-db
    #:coinstatsindex-enabled
    #:coinstatsindex-height
    #:coinstatsindex-best

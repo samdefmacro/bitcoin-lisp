@@ -52,6 +52,11 @@
   (db :pointer) (options :pointer)
   (batch :pointer) (errptr :pointer))
 
+(cffi:defcfun ("leveldb_compact_range" %leveldb-compact-range) :void
+  (db :pointer)
+  (start-key :pointer) (start-key-len :size)
+  (limit-key :pointer) (limit-key-len :size))
+
 (cffi:defcfun ("leveldb_options_create" %leveldb-options-create) :pointer)
 (cffi:defcfun ("leveldb_options_destroy" %leveldb-options-destroy) :void
   (options :pointer))
@@ -212,6 +217,14 @@ internally with defaults."
          (with-errptr (errptr)
            (%leveldb-destroy-db opts (namestring path) errptr))
       (leveldb-destroy-options opts))))
+
+(defun leveldb-compact (db)
+  "Fully compact DB's entire keyspace: leveldb CompactRange(NULL, NULL), which
+merges every level and physically drops deleted/overwritten keys, reclaiming the
+disk that tombstones still pin after a large deletion churn (e.g. a
+reindex-chainstate wipe). Synchronous and potentially slow on a large database;
+does not signal (leveldb_compact_range has no error out-param)."
+  (%leveldb-compact-range db (cffi:null-pointer) 0 (cffi:null-pointer) 0))
 
 ;;;; Per-key operations. We create writeoptions/readoptions per call. A
 ;;;; future refactor should cache these (Core keeps one set per

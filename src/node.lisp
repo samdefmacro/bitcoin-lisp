@@ -546,7 +546,8 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                         (dbcache-mib nil)
                         (v2transport nil)
                         (coinstatsindex nil)
-                        (reindex-chainstate nil))
+                        (reindex-chainstate nil)
+                        (force-compact-db nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -860,6 +861,13 @@ Returns the node instance."
             (log-warn "Coinstats index stopped at height ~D of ~D (missing block/undo ~
 data below the pruned horizon; the index needs genesis-contiguous history)"
                       (bitcoin-lisp.storage:coinstatsindex-height csi) tip))))))
+
+  ;; -forcecompactdb: once every LevelDB is open (and any reindex/backfill has
+  ;; run), full-compact them to reclaim tombstone space -- e.g. the ~24M delete
+  ;; markers a reindex-chainstate wipe leaves behind. Bitcoin Core does the same
+  ;; via CDBWrapper force_compact when -forcecompactdb is set.
+  (when force-compact-db
+    (force-compact-databases))
 
   ;; BIP324 v2 transport opt-in. Effective only if libsecp256k1 has the
   ;; ellswift module (probed lazily per connection via v2-available-p).
@@ -1247,6 +1255,27 @@ stopping (UTXO set rebuilt to height ~D)" height (1- height))
         (bitcoin-lisp.storage:save-state cs)
         (log-info "Reindex-chainstate complete: ~D block~:P re-applied, tip at height ~D"
                   n (bitcoin-lisp.storage:current-height cs))))))
+
+(defun force-compact-databases ()
+  "Full-compact every LevelDB the node has open -- the coins/chainstate DB plus
+the block-filter and coinstats indexes -- reclaiming the disk that tombstones
+still pin after a large deletion churn (e.g. a reindex-chainstate wipe). Mirrors
+Bitcoin Core's -forcecompactdb, which sets CDBWrapper force_compact on each
+database it opens. Synchronous and potentially slow on a large chainstate."
+  (flet ((compact (label db)
+           (when db
+             (log-info "Starting database compaction of ~A" label)
+             (bitcoin-lisp.storage:leveldb-compact db)
+             (log-info "Finished database compaction of ~A" label))))
+    (let ((utxo (node-utxo-set *node*))
+          (bfi (node-blockfilterindex *node*))
+          (csi (node-coinstatsindex *node*)))
+      (when utxo
+        (log-info "Starting database compaction of chainstate")
+        (bitcoin-lisp.storage:coins-view-cache-compact utxo)
+        (log-info "Finished database compaction of chainstate"))
+      (when bfi (compact "blockfilterindex" (bitcoin-lisp.storage:blockfilterindex-db bfi)))
+      (when csi (compact "coinstatsindex" (bitcoin-lisp.storage:coinstatsindex-db csi))))))
 
 (defun index-block-coinstats (block block-hash height spent-utxos)
   "Connect-time hook: fold BLOCK into the running node's coinstatsindex, if one
