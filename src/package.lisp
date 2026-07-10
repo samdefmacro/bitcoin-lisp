@@ -279,6 +279,12 @@
    #:make-getdata-message
    #:make-inv-message
    #:make-notfound-message
+   #:+node-compact-filters+
+   #:parse-getcfilters-payload
+   #:parse-getcfcheckpt-payload
+   #:make-cfilter-message
+   #:make-cfheaders-message
+   #:make-cfcheckpt-message
    #:make-tx-message
    #:make-block-message
    #:parse-tx-payload
@@ -1053,6 +1059,7 @@
    #:*accept-datacarrier*
    #:*max-datacarrier-bytes*
    #:*permit-bare-multisig*
+   #:*peer-block-filters*
    #:pruning-enabled-p
    #:automatic-pruning-p
    #:minimum-chain-work

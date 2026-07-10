@@ -174,6 +174,18 @@ Returns T if message was handled, NIL otherwise."
      (handle-addrv2 peer payload address-book peers)
      t)
 
+    ((string= command "getcfilters")
+     (handle-getcfilters peer payload chain-state)
+     t)
+
+    ((string= command "getcfheaders")
+     (handle-getcfheaders peer payload chain-state)
+     t)
+
+    ((string= command "getcfcheckpt")
+     (handle-getcfcheckpt peer payload chain-state)
+     t)
+
     ((string= command "sendaddrv2")
      ;; No-op post-handshake (only meaningful during handshake)
      t)
@@ -726,6 +738,111 @@ handling of unavailable blocks."
     (when not-found
       (send-message peer (bitcoin-lisp.serialization:make-notfound-message
                           (nreverse not-found))))))
+
+(defconstant +max-getcfilters-size+ 1000
+  "Max filters per getcfilters request (Core MAX_GETCFILTERS_SIZE).")
+(defconstant +max-getcfheaders-size+ 2000
+  "Max headers per getcfheaders request (Core MAX_GETCFHEADERS_SIZE).")
+(defconstant +cfcheckpt-interval+ 1000
+  "Block spacing of cfcheckpt filter headers (Core CFCHECKPT_INTERVAL).")
+
+(defun %cf-serving-index ()
+  "The block filter index to serve BIP157 requests from, or NIL when serving is
+off (-peerblockfilters absent) or the index is unavailable."
+  (and bitcoin-lisp:*peer-block-filters*
+       bitcoin-lisp::*node*
+       (let ((bfi (bitcoin-lisp::node-blockfilterindex bitcoin-lisp::*node*)))
+         (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi) bfi))))
+
+(defun %cf-active-hash (chain-state height)
+  "Hash of the ACTIVE-chain block at HEIGHT, or NIL."
+  (let ((e (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+    (and e (bitcoin-lisp.storage:block-index-entry-hash e))))
+
+(defun %cf-request-stop-height (chain-state start-height stop-hash max-diff)
+  "Validate a BIP157 request (Core PrepareBlockFilterRequest): STOP-HASH must be
+a known block on the ACTIVE chain, START-HEIGHT <= stop height, and the span
+under MAX-DIFF. Returns the stop height, or NIL. (Core also serves recent fork
+blocks via GetAncestor; we serve the active chain only -- the light-client case.)"
+  (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state stop-hash)))
+    (when entry
+      (let* ((stop-height (bitcoin-lisp.storage:block-index-entry-height entry))
+             (active (%cf-active-hash chain-state stop-height)))
+        (when (and active (equalp active stop-hash)
+                   (<= start-height stop-height)
+                   (< (- stop-height start-height) max-diff))
+          stop-height)))))
+
+(defun handle-getcfilters (peer payload chain-state)
+  "Serve a BIP157 getcfilters: one cfilter message per block in the requested
+range, from the block filter index. Silently ignored when serving is disabled
+or the request is invalid (Core disconnects; we drop the request)."
+  (let ((bfi (%cf-serving-index)))
+    (when bfi
+      (multiple-value-bind (ftype start-height stop-hash)
+          (bitcoin-lisp.serialization:parse-getcfilters-payload payload)
+        (when (and ftype (zerop ftype))   ; type 0 = basic
+          (let ((stop-height (%cf-request-stop-height
+                              chain-state start-height stop-hash
+                              +max-getcfilters-size+)))
+            (when stop-height
+              (loop for h from start-height to stop-height
+                    for bh = (%cf-active-hash chain-state h)
+                    for filter = (and bh (bitcoin-lisp.storage:blockfilterindex-get-filter bfi bh))
+                    while filter
+                    do (send-message
+                        peer (bitcoin-lisp.serialization:make-cfilter-message
+                              0 bh filter))))))))))
+
+(defun handle-getcfheaders (peer payload chain-state)
+  "Serve a BIP157 getcfheaders: the previous filter header at START-1 (zeros at
+genesis) plus the per-block filter HASHES for the range, in one cfheaders."
+  (let ((bfi (%cf-serving-index)))
+    (when bfi
+      (multiple-value-bind (ftype start-height stop-hash)
+          (bitcoin-lisp.serialization:parse-getcfilters-payload payload)
+        (when (and ftype (zerop ftype))
+          (let ((stop-height (%cf-request-stop-height
+                              chain-state start-height stop-hash
+                              +max-getcfheaders-size+)))
+            (when stop-height
+              (let ((prev-header (make-array 32 :element-type '(unsigned-byte 8)
+                                                :initial-element 0)))
+                (when (plusp start-height)
+                  (let* ((ph (%cf-active-hash chain-state (1- start-height)))
+                         (hdr (and ph (bitcoin-lisp.storage:blockfilterindex-get-header bfi ph))))
+                    (unless hdr (return-from handle-getcfheaders))
+                    (setf prev-header hdr)))
+                (let ((hashes '()))
+                  (loop for h from start-height to stop-height
+                        for bh = (%cf-active-hash chain-state h)
+                        for filter = (and bh (bitcoin-lisp.storage:blockfilterindex-get-filter bfi bh))
+                        do (unless filter (return-from handle-getcfheaders))
+                           (push (bitcoin-lisp.crypto:hash256 filter) hashes))
+                  (send-message
+                   peer (bitcoin-lisp.serialization:make-cfheaders-message
+                         0 stop-hash prev-header (nreverse hashes))))))))))))
+
+(defun handle-getcfcheckpt (peer payload chain-state)
+  "Serve a BIP157 getcfcheckpt: the filter header at every 1000th block up to
+the stop hash."
+  (let ((bfi (%cf-serving-index)))
+    (when bfi
+      (multiple-value-bind (ftype stop-hash)
+          (bitcoin-lisp.serialization:parse-getcfcheckpt-payload payload)
+        (when (and ftype (zerop ftype))
+          (let ((stop-height (%cf-request-stop-height
+                              chain-state 0 stop-hash most-positive-fixnum)))
+            (when stop-height
+              (let ((headers '()))
+                (loop for h from +cfcheckpt-interval+ to stop-height by +cfcheckpt-interval+
+                      for bh = (%cf-active-hash chain-state h)
+                      for hdr = (and bh (bitcoin-lisp.storage:blockfilterindex-get-header bfi bh))
+                      do (unless hdr (return-from handle-getcfcheckpt))
+                         (push hdr headers))
+                (send-message
+                 peer (bitcoin-lisp.serialization:make-cfcheckpt-message
+                       0 stop-hash (nreverse headers)))))))))))
 
 (defun handle-getblocktxn (peer payload block-store)
   "Serve a BIP152 getblocktxn: reply with a blocktxn carrying the requested
