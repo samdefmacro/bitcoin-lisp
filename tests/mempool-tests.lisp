@@ -478,8 +478,8 @@ sizes it (-datacarrier / -datacarriersize)."
       (is (bitcoin-lisp.validation::standard-output-script-p big)))))
 
 (test bare-multisig-policy-knob
-  "Bare multisig is non-standard by default and standard under
-*permit-bare-multisig* (1<=m<=n<=3, 33/65-byte keys)."
+  "Bare multisig is standard by default (DEFAULT_PERMIT_BAREMULTISIG=true) and
+non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
   (let* ((k (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2))
          ;; OP_1 <33-key> <33-key> OP_2 OP_CHECKMULTISIG  (1-of-2)
          (ms (concatenate '(vector (unsigned-byte 8))
@@ -488,7 +488,10 @@ sizes it (-datacarrier / -datacarriersize)."
          (ms4 (concatenate '(vector (unsigned-byte 8))
                            (vector #x51 33) k (vector 33) k (vector 33) k (vector 33) k
                            (vector #x54 #xae))))
-    (is (not (bitcoin-lisp.validation::standard-output-script-p ms)))
+    ;; standard by default; non-standard only when the knob is disabled
+    (is (bitcoin-lisp.validation::standard-output-script-p ms))
+    (let ((bitcoin-lisp:*permit-bare-multisig* nil))
+      (is (not (bitcoin-lisp.validation::standard-output-script-p ms))))
     (let ((bitcoin-lisp:*permit-bare-multisig* t))
       (is (bitcoin-lisp.validation::standard-output-script-p ms))
       (is (not (bitcoin-lisp.validation::standard-output-script-p ms4)))
@@ -1210,3 +1213,38 @@ uses the legacy form regardless."
     (setf (aref control 0) #xc0)   ; tapscript leaf version
     ;; stack: [arg(<=80), script, control-block]
     (is-true (%wit-std-p (list (%zbytes 50) (%zbytes 20) control) (%taproot-spk)))))
+
+;;;; OP_RETURN push-only standardness + bare-multisig default
+
+(defun %policy-bytes (&rest bs)
+  (make-array (length bs) :element-type '(unsigned-byte 8) :initial-contents bs))
+
+(test op-return-push-only-standardness
+  "OP_RETURN is a standard data-carrier only when its payload is push-only
+(Core Solver NULL_DATA / IsPushOnly); a non-push opcode makes it nonstandard."
+  (let ((bitcoin-lisp::*accept-datacarrier* t)
+        (bitcoin-lisp::*max-datacarrier-bytes* 83))
+    ;; OP_RETURN <push 3 bytes> -> standard
+    (is-true (bitcoin-lisp.validation::standard-output-script-p
+              (%policy-bytes #x6a #x03 #xaa #xbb #xcc)))
+    ;; OP_RETURN OP_ADD (0x93, a non-push opcode) -> nonstandard
+    (is-false (bitcoin-lisp.validation::standard-output-script-p
+               (%policy-bytes #x6a #x93)))
+    ;; the helper directly
+    (is-true (bitcoin-lisp.validation::%op-return-push-only-p
+              (%policy-bytes #x6a #x03 #x01 #x02 #x03)))
+    (is-true (bitcoin-lisp.validation::%op-return-push-only-p
+              (%policy-bytes #x6a #x51 #x60)))            ; OP_1 .. OP_16 are pushes
+    (is-false (bitcoin-lisp.validation::%op-return-push-only-p
+               (%policy-bytes #x6a #x93)))
+    ;; a push that overruns the script end is not push-only
+    (is-false (bitcoin-lisp.validation::%op-return-push-only-p
+               (%policy-bytes #x6a #x05 #x01)))))
+
+(test bare-multisig-standard-by-default
+  "Bare multisig is standard by default (Core DEFAULT_PERMIT_BAREMULTISIG=true)."
+  (is-true bitcoin-lisp::*permit-bare-multisig*)          ; default flipped to t
+  (let* ((pk (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2))
+         (script (concatenate '(vector (unsigned-byte 8))
+                              (%policy-bytes #x51 #x21) pk (%policy-bytes #x51 #xae))))
+    (is-true (bitcoin-lisp.validation::standard-output-script-p script))))
