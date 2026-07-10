@@ -282,7 +282,10 @@ tx relay on those)."
                                bitcoin-lisp.serialization:+node-network+)
                            bitcoin-lisp.serialization:+node-witness+
                            (if (v2-available-p)
-                               bitcoin-lisp.serialization:+node-p2p-v2+ 0)))
+                               bitcoin-lisp.serialization:+node-p2p-v2+ 0)
+                           ;; BIP157: advertise filter serving when enabled.
+                           (if bitcoin-lisp:*peer-block-filters*
+                               bitcoin-lisp.serialization:+node-compact-filters+ 0)))
          (relays (peer-relays-txs-p peer))
          ;; Advertise our real chain height (Core sends my_height) so peers can
          ;; pick us as a block-sync source; 0 only if the node isn't up yet.
