@@ -929,6 +929,7 @@
    #:sync-with-peer
    #:relay-transaction
    #:peer-announced-txs
+   #:peer-known-addrs
    ;; Compact block relay (BIP 152)
    #:send-compact-block-negotiation
    #:should-use-compact-blocks-p
