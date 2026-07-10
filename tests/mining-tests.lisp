@@ -143,6 +143,8 @@ Returns the txid."
                  (cdr (assoc "coinbasevalue" r :test #'string=))))
           (is (string= "207fffff" (cdr (assoc "bits" r :test #'string=))))
           (is (= 4000000 (cdr (assoc "weightlimit" r :test #'string=))))
+          (is (= 4000000 (cdr (assoc "sizelimit" r :test #'string=))))
+          (is (member "proposal" (cdr (assoc "capabilities" r :test #'string=)) :test #'string=))
           ;; 38-byte commitment script → 76 hex chars, 6a24aa21a9ed prefix
           (let ((dwc (cdr (assoc "default_witness_commitment" r :test #'string=))))
             (is (= 76 (length dwc)))
