@@ -1103,30 +1103,52 @@ Relay is always enabled on test networks, disabled by default on mainnet for saf
   (or (member bitcoin-lisp:*network* '(:testnet3 :testnet4 :signet :regtest))
       bitcoin-lisp:*mainnet-relay-enabled*))
 
+;;; Trickled (Poisson) tx announcement batching — Core SendMessages tx
+;;; inventory (net_processing.cpp:5960-6070). Announcing every tx the
+;;; instant it is accepted leaks its arrival time (tx-origin inference);
+;;; Core instead queues announcements per peer and flushes them in
+;;; batches on a randomized schedule: each OUTBOUND peer flushes on its
+;;; own exponential timer (mean 2s), while ALL INBOUND peers share one
+;;; rotation (mean 5s) so an attacker connecting many times gains no
+;;; extra timing resolution.
+
+(defconstant +inbound-inv-broadcast-interval+ 5
+  "Mean seconds between inv flushes to inbound peers (shared rotation).
+Core INBOUND_INVENTORY_BROADCAST_INTERVAL (net_processing.cpp:165).")
+
+(defconstant +outbound-inv-broadcast-interval+ 2
+  "Mean seconds between inv flushes to an outbound peer.
+Core OUTBOUND_INVENTORY_BROADCAST_INTERVAL (net_processing.cpp:169).")
+
+(defconstant +inv-broadcast-target+ 70
+  "Max announcements per flush: INVENTORY_BROADCAST_PER_SECOND (14) x
+the inbound interval (5s) — net_processing.cpp:172-174. Remainder stays
+queued for the next flush.")
+
+(defconstant +max-tx-inv-queue+ 5000
+  "Per-peer pending-announcement bound (Core MAX_PEER_TX_ANNOUNCEMENTS);
+oldest entries are dropped beyond it.")
+
+(defvar *next-inbound-inv-flush* 0
+  "internal-real-time deadline of the shared inbound inv rotation
+(Core NextInvToInbounds — one timer for all inbound peers).")
+
+(defun %next-exp-interval-ticks (mean-seconds)
+  "Ticks until the next event of a Poisson process with MEAN-SECONDS
+(Core rand_exp_duration): -mean * ln(U), U uniform in (0,1]."
+  (round (* mean-seconds internal-time-units-per-second
+            (- (log (- 1.0d0 (random 1.0d0)))))))
+
 (defun relay-transaction (txid source-peer peers &key fee-rate wtxid)
-  "Relay a transaction to all connected peers except SOURCE-PEER.
-Sends inv messages and tracks announcements to avoid duplicates.
-FEE-RATE is the transaction fee rate in sat/byte (used for BIP 133 feefilter).
-WTXID is the witness txid (used for BIP 339 wtxidrelay peers).
-Does nothing if relay is disabled for the current network."
+  "Queue a newly-accepted transaction for announcement to all connected
+peers except SOURCE-PEER. Nothing is sent here — flush-tx-announcements
+drains each peer's queue on its Poisson schedule (Core queues into
+m_tx_inventory_to_send exactly the same way). FEE-RATE is sat/vB, used
+against BIP133 feefilters at flush time. WTXID enables BIP339 MSG_WTX
+announcements. Does nothing if relay is disabled for the network."
   (unless (relay-enabled-p)
     (return-from relay-transaction nil))
-  (let ((txid-inv-msg (bitcoin-lisp.serialization:make-inv-message
-                       (list (bitcoin-lisp.serialization:make-inv-vector
-                              :type bitcoin-lisp.serialization:+inv-type-tx+
-                              :hash txid))))
-        ;; BIP339: wtxidrelay peers get the wtxid under MSG_WTX — Core
-        ;; announces "m_wtxid_relay ? CInv{MSG_WTX, wtxid} : CInv{MSG_TX,
-        ;; txid}" (net_processing.cpp:6009,6065). We previously sent the
-        ;; wtxid under MSG_TX|WITNESS_FLAG, which is txid-based on the wire
-        ;; — nonstandard, and only servable because our own getdata handler
-        ;; compensates with a dual lookup.
-        (wtxid-inv-msg (when wtxid
-                         (bitcoin-lisp.serialization:make-inv-message
-                          (list (bitcoin-lisp.serialization:make-inv-vector
-                                 :type bitcoin-lisp.serialization:+inv-type-wtx+
-                                 :hash wtxid)))))
-        (fee-rate-per-kb (if fee-rate (* fee-rate 1000) 0)))
+  (let ((fee-rate-per-kb (if fee-rate (* fee-rate 1000) 0)))
     (dolist (peer peers)
       ;; Skip the source peer and disconnected peers
       (when (and (not (eq peer source-peer))
@@ -1134,16 +1156,88 @@ Does nothing if relay is disabled for the current network."
                  ;; Block-relay-only / feeler peers get no tx relay (they
                  ;; advertised relay=0; Core never announces txs to them).
                  (peer-relays-txs-p peer)
-                 ;; Skip if already announced to this peer
-                 (not (bitcoin-lisp:recent-reject-p (peer-announced-txs peer) txid))
-                 ;; BIP 133: Skip if tx fee rate below peer's feefilter
-                 (or (zerop (peer-feefilter-rate peer))
-                     (>= fee-rate-per-kb (peer-feefilter-rate peer))))
-        (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
-        ;; BIP 339: Use wtxid-based inv for peers that support it
-        (if (and (peer-wtxid-relay peer) wtxid-inv-msg)
-            (send-message peer wtxid-inv-msg)
-            (send-message peer txid-inv-msg))))))
+                 ;; Skip if already announced to this peer (Core checks the
+                 ;; known-filter at queue time too, PushTxInventory).
+                 (not (bitcoin-lisp:recent-reject-p (peer-announced-txs peer) txid)))
+        (setf (peer-tx-inv-queue peer)
+              (nconc (peer-tx-inv-queue peer)
+                     (list (list txid wtxid fee-rate-per-kb))))
+        ;; Bound the queue: drop oldest beyond the cap.
+        (let ((excess (- (length (peer-tx-inv-queue peer)) +max-tx-inv-queue+)))
+          (when (plusp excess)
+            (setf (peer-tx-inv-queue peer)
+                  (nthcdr excess (peer-tx-inv-queue peer)))))))))
+
+(defun %flush-peer-tx-invs (peer mempool)
+  "Drain up to +inv-broadcast-target+ queued announcements to PEER as one
+inv message. At flush time each entry is re-checked: still unannounced,
+still in the mempool, and above the peer's BIP133 feefilter (feefiltered
+entries are dropped, not deferred — Core skips them the same way).
+BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
+(net_processing.cpp:6009,6065)."
+  (let ((invs '())
+        (count 0))
+    (loop while (and (peer-tx-inv-queue peer)
+                     (< count +inv-broadcast-target+))
+          do (destructuring-bind (txid wtxid fee-rate-per-kb)
+                 (pop (peer-tx-inv-queue peer))
+               (when (and (not (bitcoin-lisp:recent-reject-p
+                                (peer-announced-txs peer) txid))
+                          ;; Evicted/confirmed since queueing => nothing to announce.
+                          (or (null mempool)
+                              (bitcoin-lisp.mempool:mempool-has mempool txid))
+                          ;; BIP 133 feefilter, evaluated at flush time.
+                          (or (zerop (peer-feefilter-rate peer))
+                              (>= fee-rate-per-kb (peer-feefilter-rate peer))))
+                 (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
+                 (incf count)
+                 (push (if (and (peer-wtxid-relay peer) wtxid)
+                           (bitcoin-lisp.serialization:make-inv-vector
+                            :type bitcoin-lisp.serialization:+inv-type-wtx+
+                            :hash wtxid)
+                           (bitcoin-lisp.serialization:make-inv-vector
+                            :type bitcoin-lisp.serialization:+inv-type-tx+
+                            :hash txid))
+                       invs))))
+    (when invs
+      ;; A dead socket raises from the write; the drain/health passes own
+      ;; disconnecting — just stop announcing to it this round.
+      (handler-case
+          (send-message peer (bitcoin-lisp.serialization:make-inv-message
+                              (nreverse invs)))
+        (error () nil)))))
+
+(defun flush-tx-announcements (peers mempool)
+  "Flush due per-peer tx announcement queues (call ~1x/second from the
+sync loop). Outbound peers each run an exponential timer with mean
++outbound-inv-broadcast-interval+; all inbound peers flush together on
+the shared *next-inbound-inv-flush* rotation with mean
++inbound-inv-broadcast-interval+ — Core net_processing.cpp:5980-5990."
+  (let ((now (get-internal-real-time))
+        (inbound-due nil))
+    ;; Shared inbound rotation.
+    (cond ((zerop *next-inbound-inv-flush*)
+           (setf *next-inbound-inv-flush*
+                 (+ now (%next-exp-interval-ticks +inbound-inv-broadcast-interval+))))
+          ((>= now *next-inbound-inv-flush*)
+           (setf inbound-due t
+                 *next-inbound-inv-flush*
+                 (+ now (%next-exp-interval-ticks +inbound-inv-broadcast-interval+)))))
+    (dolist (peer peers)
+      (when (and (eq (peer-state peer) :ready)
+                 (peer-relays-txs-p peer))
+        (if (peer-inbound peer)
+            (when inbound-due
+              (%flush-peer-tx-invs peer mempool))
+            (cond ((zerop (peer-next-inv-send-time peer))
+                   (setf (peer-next-inv-send-time peer)
+                         (+ now (%next-exp-interval-ticks
+                                 +outbound-inv-broadcast-interval+))))
+                  ((>= now (peer-next-inv-send-time peer))
+                   (setf (peer-next-inv-send-time peer)
+                         (+ now (%next-exp-interval-ticks
+                                 +outbound-inv-broadcast-interval+)))
+                   (%flush-peer-tx-invs peer mempool))))))))
 
 (defun block-relay-targets (source-peer peers)
   "The peers a newly-connected block is announced to: every ready peer except
