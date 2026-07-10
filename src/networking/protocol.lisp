@@ -550,8 +550,8 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                   (current-height (bitcoin-lisp.storage:current-height chain-state)))
               ;; The requested tx arrived — clear its in-flight/announcer tracking.
               (tx-request-received txid)
-              ;; Mark as announced by this peer
-              (setf (gethash txid (peer-announced-txs peer)) t)
+              ;; Mark as announced by this peer (bounded set)
+              (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
               ;; Check recent rejects filter before expensive validation
               (when (bitcoin-lisp:recent-reject-p recent-rejects txid)
                 (return-from handle-tx nil))
@@ -852,11 +852,11 @@ Does nothing if relay is disabled for the current network."
                  ;; advertised relay=0; Core never announces txs to them).
                  (peer-relays-txs-p peer)
                  ;; Skip if already announced to this peer
-                 (not (gethash txid (peer-announced-txs peer)))
+                 (not (bitcoin-lisp:recent-reject-p (peer-announced-txs peer) txid))
                  ;; BIP 133: Skip if tx fee rate below peer's feefilter
                  (or (zerop (peer-feefilter-rate peer))
                      (>= fee-rate-per-kb (peer-feefilter-rate peer))))
-        (setf (gethash txid (peer-announced-txs peer)) t)
+        (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
         ;; BIP 339: Use wtxid-based inv for peers that support it
         (if (and (peer-wtxid-relay peer) wtxid-inv-msg)
             (send-message peer wtxid-inv-msg)
