@@ -943,7 +943,14 @@ data below the pruned horizon; the index needs genesis-contiguous history)"
                                (unwind-protect
                                     (sync-blockchain *node*)
                                  (setf (node-syncing *node*) nil))
-                               (replace-disconnected-peers *node*)
+                               ;; Full peer maintenance, not just replacement:
+                               ;; health checks + outgoing pings, addnode
+                               ;; retry, slot refill, dedicated block-relay
+                               ;; slots, and feeler probes. maintain-peers was
+                               ;; previously dead code — nothing called it, so
+                               ;; the PR #216 block-relay/feeler conns and
+                               ;; ping-timeout eviction never ran live.
+                               (maintain-peers *node*)
                                ;; Re-route any tx getdata that timed out to
                                ;; another announcer (TxRequestTracker).
                                (bitcoin-lisp.networking:retry-timed-out-tx-requests)
@@ -1761,12 +1768,20 @@ Returns the number of peers connected."
 Also checks compact block reconstruction timeouts (BIP 152)."
   (let ((to-disconnect '()))
     (dolist (peer (node-peers node))
-      ;; Check compact block timeout
-      (bitcoin-lisp.networking:check-compact-block-timeout peer)
-      ;; Check ping/pong health
-      (let ((status (bitcoin-lisp.networking:check-peer-health peer)))
-        (when (eq status :disconnect)
-          (push peer to-disconnect))))
+      ;; Both checks below can WRITE (ping, compact-block getdata); a peer
+      ;; that FIN'd since the last drain raises stream-error from that
+      ;; write. Fold any error into :disconnect instead of letting it
+      ;; escape — this runs on the sync thread, whose outer handler-case
+      ;; would otherwise end the thread (2026-05-09 incident pattern).
+      (handler-case
+          (progn
+            ;; Check compact block timeout
+            (bitcoin-lisp.networking:check-compact-block-timeout peer)
+            ;; Check ping/pong health
+            (let ((status (bitcoin-lisp.networking:check-peer-health peer)))
+              (when (eq status :disconnect)
+                (push peer to-disconnect))))
+        (error () (push peer to-disconnect))))
     (dolist (peer to-disconnect)
       (log-warn "Disconnecting unresponsive peer ~A"
                 (bitcoin-lisp.networking:peer-address peer))
@@ -2024,7 +2039,8 @@ phase exits quickly when there's nothing new to fetch."
      peer-height
      :fee-estimator (node-fee-estimator node)
      :recent-rejects (node-recent-rejects node)
-     :mempool (node-mempool node))))
+     :mempool (node-mempool node)
+     :address-book (node-address-book node))))
 
 
 (defun find-best-peer (node)
