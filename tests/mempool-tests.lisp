@@ -1266,3 +1266,31 @@ and unbroadcast. A parent's spentby lists a child that spends it."
         (is (assoc "unbroadcast" f :test #'string=))
         (is (member (bitcoin-lisp.rpc::hash-to-hex ctxid)
                     (cdr (assoc "spentby" f :test #'string=)) :test #'string=))))))
+
+(test witness-unknown-and-p2a-outputs-standard
+  "Future witness-version outputs (v2..v16, 2..40-byte program) and P2A
+(OP_1 <0x4e73>) are standard to create (Core WITNESS_UNKNOWN / ANCHOR);
+irregular version-0 programs stay nonstandard."
+  (flet ((wp (ver-op &rest prog)
+           (concatenate '(vector (unsigned-byte 8))
+                        (vector ver-op (length prog))
+                        (coerce prog '(vector (unsigned-byte 8))))))
+    ;; P2A: OP_1 push2 0x4e73
+    (is-true (bitcoin-lisp.validation::standard-output-script-p (wp #x51 #x4e #x73)))
+    ;; v2 (OP_2) 32-byte program
+    (is-true (bitcoin-lisp.validation::standard-output-script-p
+              (concatenate '(vector (unsigned-byte 8)) (vector #x52 #x20)
+                           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))))
+    ;; v16 (OP_16) 40-byte program (max)
+    (is-true (bitcoin-lisp.validation::standard-output-script-p
+              (concatenate '(vector (unsigned-byte 8)) (vector #x60 #x28)
+                           (make-array 40 :element-type '(unsigned-byte 8) :initial-element 1))))
+    ;; 41-byte program: not a witness program -> nonstandard
+    (is-false (bitcoin-lisp.validation::standard-output-script-p
+               (concatenate '(vector (unsigned-byte 8)) (vector #x52 #x29)
+                            (make-array 41 :element-type '(unsigned-byte 8) :initial-element 1))))
+    ;; irregular v0 (OP_0 push2): stays nonstandard
+    (is-false (bitcoin-lisp.validation::standard-output-script-p (wp #x00 #xaa #xbb)))
+    ;; RPC type names
+    (is (string= "anchor" (bitcoin-lisp.rpc::%script-type (wp #x51 #x4e #x73))))
+    (is (string= "witness_unknown" (bitcoin-lisp.rpc::%script-type (wp #x52 #xaa #xbb))))))
