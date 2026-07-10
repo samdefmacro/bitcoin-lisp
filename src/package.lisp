@@ -893,6 +893,8 @@
    #:reset-tx-requests
    #:tx-request-wanted-p
    #:tx-request-received
+   ;; Trickled tx announcement flushing
+   #:flush-tx-announcements
    ;; Peer
    #:peer
    #:make-peer
