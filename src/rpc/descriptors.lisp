@@ -228,6 +228,17 @@ encoders in crypto/address.lisp."
          (bitcoin-lisp.crypto:encode-p2tr-address (subseq script 2 34) network))
         (t nil)))))
 
+(defun scriptpubkey-desc (script network)
+  "Core InferDescriptor for a bare scriptPubKey (no key material available): an
+addressable script infers to addr(<address>), anything else to raw(<hex>), each
+with the appended descriptor checksum. This is the `desc` field on decoded
+outputs (gettxout, decoderawtransaction, getblock verbosity 2, decodescript)."
+  (let ((addr (%script->address script network)))
+    (descriptor-add-checksum
+     (if addr
+         (format nil "addr(~A)" addr)
+         (format nil "raw(~A)" (bitcoin-lisp.crypto:bytes-to-hex script))))))
+
 (defun rpc-getdescriptorinfo (node params)
   "Validate a descriptor and report its canonical form + checksum (Bitcoin
 Core getdescriptorinfo). PARAMS: (descriptor). isrange/hasprivatekeys are
