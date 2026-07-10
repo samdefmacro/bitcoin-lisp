@@ -1370,8 +1370,20 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     (let ((bitcoin-lisp::*node-start-time*
             (- (bitcoin-lisp.serialization:get-unix-time) 5)))
       (is (>= (bitcoin-lisp.rpc::rpc-uptime node nil) 5)))
-    ;; getindexinfo: no txindex -> empty JSON object (hash-table)
+    ;; getindexinfo: no active index -> empty JSON object (hash-table)
     (is (hash-table-p (bitcoin-lisp.rpc::rpc-getindexinfo node nil)))
+    ;; With block-filter + coinstats indexes present, both are reported (bare
+    ;; structs have a nil db -> height -1); an index-name arg filters to one.
+    (setf (bitcoin-lisp::node-blockfilterindex node)
+          (bitcoin-lisp.storage:make-blockfilterindex :enabled t)
+          (bitcoin-lisp::node-coinstatsindex node)
+          (bitcoin-lisp.storage::make-coinstatsindex :enabled t))
+    (let ((all (bitcoin-lisp.rpc::rpc-getindexinfo node nil)))
+      (is (assoc "basic block filter index" all :test #'string=))
+      (is (assoc "coinstatsindex" all :test #'string=)))
+    (let ((one (bitcoin-lisp.rpc::rpc-getindexinfo node (list "coinstatsindex"))))
+      (is (assoc "coinstatsindex" one :test #'string=))
+      (is (null (assoc "basic block filter index" one :test #'string=))))
     ;; getdeploymentinfo: buried deployments present; segwit reports the
     ;; network's activation height and matches the active/height contract.
     (let* ((r (bitcoin-lisp.rpc::rpc-getdeploymentinfo node nil))
@@ -1691,16 +1703,27 @@ incrementalfee, connections_in/out, and warnings, and still yason-encodes."
 
 (test rpc-getpeerinfo-fields
   "getpeerinfo reports a real inbound flag plus synced_*/bytessent/bytesrecv/
-pingtime (was hardcoded inbound nil with no byte/ping fields)."
+pingtime, and (since #216) each peer's connection_type + relaytxes. An inbound
+peer defaults to conn-type :inbound and relays txs; a block-relay-only peer maps
+to \"block-relay-only\" with relaytxes false."
   (let* ((node (make-test-node))
          (peer (bitcoin-lisp::make-peer :address "1.2.3.4:8333"
-                                        :inbound t :start-height 99)))
-    (setf (bitcoin-lisp::node-peers node) (list peer))
-    (let ((e (first (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))))
+                                        :inbound t :start-height 99))
+         (br (bitcoin-lisp::make-peer :address "5.6.7.8:8333"
+                                      :conn-type :block-relay))
+         (ct (lambda (r) (cdr (assoc "connection_type" r :test #'string=)))))
+    (setf (bitcoin-lisp::node-peers node) (list peer br))
+    (let* ((rows (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+           (e (find "inbound" rows :key ct :test #'string=))
+           (b (find "block-relay-only" rows :key ct :test #'string=)))
+      (is-true e)
       (is (eq t (cdr (assoc "inbound" e :test #'string=))))
       (is (= 99 (cdr (assoc "synced_blocks" e :test #'string=))))
       (is (assoc "bytessent" e :test #'string=))
-      (is (assoc "pingtime" e :test #'string=)))))
+      (is (assoc "pingtime" e :test #'string=))
+      (is (eq t (cdr (assoc "relaytxes" e :test #'string=))))
+      (is-true b)
+      (is (null (cdr (assoc "relaytxes" b :test #'string=)))))))
 
 (test rpc-sign-verify-message
   "signmessagewithprivkey + verifymessage round-trip: a message signed with a
