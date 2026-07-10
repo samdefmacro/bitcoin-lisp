@@ -29,8 +29,12 @@
   (last-ping-time 0 :type integer)
   (ping-latency 0 :type integer)
   (send-queue '() :type list)
-  ;; Set of txids announced to this peer (hash-table of txid -> t)
-  (announced-txs (make-hash-table :test 'equalp) :type hash-table)
+  ;; Bounded set of txids announced to this peer. Was an unbounded hash-table --
+  ;; a per-peer memory leak on long-lived relay connections. Core bounds the
+  ;; equivalent m_tx_inventory_known_filter at CRollingBloomFilter{50000}; we use
+  ;; the same hash+FIFO-ring bounded set as the recent-rejects filter.
+  (announced-txs (bitcoin-lisp:make-rejects-filter 50000)
+                 :type bitcoin-lisp:recent-rejects)
   ;; Health monitoring
   (consecutive-ping-failures 0 :type (unsigned-byte 8))
   (last-health-check 0 :type integer)
