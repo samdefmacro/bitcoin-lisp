@@ -35,6 +35,11 @@
   ;; the same hash+FIFO-ring bounded set as the recent-rejects filter.
   (announced-txs (bitcoin-lisp:make-rejects-filter 50000)
                  :type bitcoin-lisp:recent-rejects)
+  ;; Bounded set of addresses (ip||port keys) this peer already knows -- either
+  ;; it sent them to us or we relayed them to it. Dedup for addr gossip; Core's
+  ;; m_addr_known CRollingBloomFilter{5000}.
+  (known-addrs (bitcoin-lisp:make-rejects-filter 5000)
+               :type bitcoin-lisp:recent-rejects)
   ;; Health monitoring
   (consecutive-ping-failures 0 :type (unsigned-byte 8))
   (last-health-check 0 :type integer)

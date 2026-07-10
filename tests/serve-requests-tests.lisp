@@ -261,3 +261,45 @@ inv vectors (same shape as inv) -- the reply for unserved tx getdata."
              (bitcoin-lisp.serialization:inv-vector-type (first parsed))))
       (is (equalp (%uniq-hash 777)
                   (bitcoin-lisp.serialization:inv-vector-hash (first parsed)))))))
+
+(test relay-address-fanout-and-dedup
+  "relay-address (Core RelayAddress) forwards a fresh address to exactly 2
+eligible peers -- skipping the source, block-relay/feeler peers, and peers that
+already know it -- and marks the source + targets in their known-addrs sets."
+  (let* ((source (bitcoin-lisp.networking:make-peer :state :ready :address "9.9.9.9:8333"))
+         (full (loop for i below 4
+                     collect (bitcoin-lisp.networking:make-peer
+                              :state :ready
+                              :address (format nil "1.1.1.~D:8333" i))))
+         (br (bitcoin-lisp.networking:make-peer :state :ready :conn-type :block-relay))
+         (peers (append (list source br) full))
+         (pa (bitcoin-lisp.networking:make-peer-address
+              :ip (let ((ip (make-array 16 :element-type '(unsigned-byte 8)
+                                           :initial-element 0)))
+                    (setf (aref ip 10) #xff (aref ip 11) #xff (aref ip 12) 8) ip)
+              :port 8333 :services 1
+              :last-seen (bitcoin-lisp.serialization:get-unix-time)))
+         (key (bitcoin-lisp.networking::%addr-gossip-key pa))
+         (sent (bitcoin-lisp.networking::relay-address pa source peers)))
+    ;; exactly 2 targets chosen (4 eligible; source + block-relay excluded)
+    (is (= 2 sent))
+    ;; the source is marked as knowing the address
+    (is-true (bitcoin-lisp:recent-reject-p
+              (bitcoin-lisp.networking:peer-known-addrs source) key))
+    ;; exactly 2 of the full-relay peers know it; the block-relay peer doesn't
+    (is (= 2 (count-if (lambda (p)
+                         (bitcoin-lisp:recent-reject-p
+                          (bitcoin-lisp.networking:peer-known-addrs p) key))
+                       full)))
+    (is-false (bitcoin-lisp:recent-reject-p
+               (bitcoin-lisp.networking:peer-known-addrs br) key))
+    ;; relaying the same address again the same day: all targets already know
+    ;; it or get deduped -- at most the remaining 2 fresh peers are picked
+    (let ((sent2 (bitcoin-lisp.networking::relay-address pa source peers)))
+      (is (= 2 sent2))
+      (is (= 4 (count-if (lambda (p)
+                           (bitcoin-lisp:recent-reject-p
+                            (bitcoin-lisp.networking:peer-known-addrs p) key))
+                         full)))
+      ;; third time: everyone knows it -> nothing sent
+      (is (= 0 (bitcoin-lisp.networking::relay-address pa source peers))))))
