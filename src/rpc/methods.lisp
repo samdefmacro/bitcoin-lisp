@@ -263,6 +263,10 @@ size/hex fields. Mirrors the mempool's tx-wire-bytes."
         ((and (= len 22) (= (b 0) #x00) (= (b 1) #x14)) "witness_v0_keyhash")
         ((and (= len 34) (= (b 0) #x00) (= (b 1) #x20)) "witness_v0_scripthash")
         ((and (= len 34) (= (b 0) #x51) (= (b 1) #x20)) "witness_v1_taproot")
+        ;; P2A (Core ANCHOR): OP_1 <0x4e73>
+        ((and (= len 4) (= (b 0) #x51) (= (b 1) #x02) (= (b 2) #x4e) (= (b 3) #x73)) "anchor")
+        ;; Future witness program v1..v16, 2..40-byte program (Core WITNESS_UNKNOWN)
+        ((and (>= len 4) (<= len 42) (<= #x51 (b 0) #x60) (= (b 1) (- len 2))) "witness_unknown")
         ((and (>= len 1) (= (b 0) #x6a)) "nulldata")
         ((and (or (= len 35) (= len 67)) (= (b (1- len)) #xac)) "pubkey")
         (t "nonstandard")))))
