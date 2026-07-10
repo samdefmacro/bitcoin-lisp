@@ -332,6 +332,14 @@ Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
      (and (= len 34)
           (= (aref script-pubkey 0) #x51)   ; OP_1
           (= (aref script-pubkey 1) #x20))  ; push 32 bytes
+     ;; Future witness program v1..v16 with a 2..40-byte program: Core's Solver
+     ;; classifies these WITNESS_UNKNOWN (or ANCHOR for P2A, OP_1 <0x4e73>) and
+     ;; IsStandard accepts them -- the forward-compat mechanism by which segwit/
+     ;; taproot outputs relayed before activation. Only version-0 programs are
+     ;; restricted to the 20/32-byte forms above (irregular v0 = NONSTANDARD).
+     (and (>= len 4) (<= len 42)
+          (<= #x51 (aref script-pubkey 0) #x60)   ; OP_1..OP_16
+          (= (aref script-pubkey 1) (- len 2)))   ; single direct push of the program
      ;; OP_RETURN data carrier — gated by -datacarrier, sized by
      ;; -datacarriersize (mempool policy, not consensus). The bytes after
      ;; OP_RETURN must be push-only: Core's Solver only classifies NULL_DATA when
