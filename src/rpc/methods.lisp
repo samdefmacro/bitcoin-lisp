@@ -535,8 +535,8 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
                            bitcoin-lisp.serialization:+node-witness+))
          (service-names (list (if pruned "NETWORK_LIMITED" "NETWORK") "WITNESS"))
          (in (count-if #'bitcoin-lisp.networking::peer-inbound peers))
-         ;; sat/vB -> BTC/kvB (same conversion as getmempoolinfo).
-         (relayfee (/ (* bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 1000)
+         ;; +default-min-relay-fee-rate+ is sat/kvB -> BTC/kvB.
+         (relayfee (/ bitcoin-lisp.mempool:+default-min-relay-fee-rate+
                       100000000.0d0))
          ;; +incremental-relay-fee-rate+ is sat/kvB -> BTC/kvB.
          (incfee (/ bitcoin-lisp.mempool::+incremental-relay-fee-rate+ 100000000.0d0)))
@@ -628,10 +628,10 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
   (let ((mempool (rpc-get-mempool node))
         (incfee (/ bitcoin-lisp.mempool::+incremental-relay-fee-rate+ 100000000.0d0)))
     (if mempool
-        ;; Convert sat/vB to BTC/kvB: sat/vB * 1000 / 100000000
-        (let* ((min-fee-sat-vb (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
-               (min-fee-btc-kvb (/ (* min-fee-sat-vb 1000) 100000000.0d0))
-               (relay-fee-btc-kvb (/ (* bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 1000) 100000000.0d0))
+        ;; Rates are sat/kvB (Core CFeeRate); convert to BTC/kvB via /1e8.
+        (let* ((min-fee-sat-kvb (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
+               (min-fee-btc-kvb (/ min-fee-sat-kvb 100000000.0d0))
+               (relay-fee-btc-kvb (/ bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 100000000.0d0))
                (count (bitcoin-lisp.mempool:mempool-count mempool))
                (bytes (bitcoin-lisp.mempool:mempool-total-size mempool))
                (total-fee-sat 0))
@@ -658,8 +658,8 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           ("usage" . 0)
           ("total_fee" . 0)
           ("maxmempool" . ,bitcoin-lisp.mempool:+default-max-mempool-bytes+)
-          ("mempoolminfee" . 0.00001)
-          ("minrelaytxfee" . 0.00001)
+          ("mempoolminfee" . 0.000001)
+          ("minrelaytxfee" . 0.000001)
           ("incrementalrelayfee" . ,incfee)
           ("unbroadcastcount" . 0)
           ("fullrbf" . ,(and bitcoin-lisp.mempool:*mempool-full-rbf* t))))))

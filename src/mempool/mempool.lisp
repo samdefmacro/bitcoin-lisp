@@ -11,8 +11,11 @@
 (defconstant +default-max-mempool-bytes+ (* 300 1024 1024)
   "Default maximum mempool size in bytes (300 MB).")
 
-(defconstant +default-min-relay-fee-rate+ 1
-  "Default minimum relay fee rate in satoshis per virtual byte.")
+(defconstant +default-min-relay-fee-rate+ 100
+  "Default minimum relay fee rate in satoshis per kvB (Bitcoin Core
+DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB = 0.1 sat/vB). Was 1 sat/vB -- 10x
+stricter than Core, rejecting the whole 0.1..1.0 sat/vB band Core relays; the
+sat/kvB representation also makes fractional-sat/vB floors expressible.")
 
 (defconstant +default-ancestor-limit+ 25
   "Max number of in-mempool ancestors (incl. self) for a tx (Bitcoin Core
@@ -117,9 +120,9 @@ prioritisation-modified fee (Core scores mining/eviction on modified fees)."
   (total-size 0 :type integer)
   ;; Maximum allowed size in bytes
   (max-size +default-max-mempool-bytes+ :type integer)
-  ;; Minimum relay fee rate
+  ;; Minimum relay fee rate (sat/kvB, Core CFeeRate::GetFeePerK units)
   (min-fee-rate +default-min-relay-fee-rate+ :type integer)
-  ;; Rolling dynamic minimum fee rate (sat/vB), raised when the mempool is full
+  ;; Rolling dynamic minimum fee rate (sat/kvB), raised when the mempool is full
   ;; and trims, decaying back toward the relay floor over time. Bitcoin Core's
   ;; rolling minimum fee.
   (rolling-min-fee-rate 0 :type integer)
@@ -135,8 +138,9 @@ prioritisation-modified fee (Core scores mining/eviction on modified fees)."
   "Rolling minimum fee decays by half every 12 hours (Bitcoin Core default).")
 
 (defun mempool-effective-min-fee-rate (mempool &optional (now (bitcoin-lisp.serialization:get-unix-time)))
-  "Effective minimum fee rate to enter the mempool: the relay floor, or the
-decayed rolling minimum if higher (Bitcoin Core CTxMemPool::GetMinFee)."
+  "Effective minimum fee rate to enter the mempool, in SAT/KVB: the relay floor,
+or the decayed rolling minimum if higher (Bitcoin Core CTxMemPool::GetMinFee,
+CFeeRate::GetFeePerK units). Compare as (>= (* fee 1000) (* rate vsize))."
   (let ((rolling (mempool-rolling-min-fee-rate mempool)))
     (if (<= rolling 0)
         (mempool-min-fee-rate mempool)
@@ -699,10 +703,13 @@ fee-rate is below NEW-ENTRY-FEE-RATE. Returns T if enough space was freed."
                (mempool-remove-recursive mempool (car pair))
                (incf freed (- before (mempool-total-size mempool)))
                (setf max-evicted-rate (max max-evicted-rate (cdr pair)))))))
-        ;; Raise the rolling minimum fee to just above the priciest evicted
-        ;; package, so newcomers must beat what was just trimmed.
+        ;; Raise the rolling minimum fee (sat/kvB) to the priciest evicted
+        ;; package's feerate plus the incremental relay fee, so newcomers must
+        ;; beat what was just trimmed (Core TrimToSize: maxFeeRateRemoved =
+        ;; evicted feerate + incrementalRelayFee). MAX-EVICTED-RATE is sat/vB.
         (when (plusp max-evicted-rate)
-          (let ((floor-rate (1+ (ceiling max-evicted-rate))))
+          (let ((floor-rate (+ (ceiling (* max-evicted-rate 1000))
+                               +incremental-relay-fee-rate+)))
             (when (> floor-rate (mempool-rolling-min-fee-rate mempool))
               (setf (mempool-rolling-min-fee-rate mempool) floor-rate
                     (mempool-rolling-min-fee-time mempool)
