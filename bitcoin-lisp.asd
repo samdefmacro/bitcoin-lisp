@@ -66,7 +66,8 @@
                   :components ((:file "script")
                                (:file "transaction")
                                (:file "packages")
-                               (:file "block")))
+                               (:file "block")
+                               (:file "signet")))
                  (:module "mempool"
                   :components ((:file "orphan")
                                (:file "mempool")
@@ -153,6 +154,7 @@
                              (:file "dos-protection-tests")
                              ;; Difficulty adjustment tests
                              (:file "difficulty-tests")
+                             (:file "signet-tests")
                              ;; Block weight tests (BIP 141)
                              (:file "weight-tests")
                              ;; Sigops validation tests
