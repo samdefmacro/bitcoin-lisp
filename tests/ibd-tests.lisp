@@ -1236,3 +1236,81 @@ and spamming the log (the testnet4 wedge produced 6.5M lines / 1.1GB this way)."
     (is (= 1 (bitcoin-lisp.networking::note-block-failure h1)))
     (is (= 2 (bitcoin-lisp.networking::note-block-failure h2)))  ; h2 untouched
     (clrhash bitcoin-lisp.networking::*block-failure-counts*)))
+
+;;;; Initial-block-download latch (Core IsInitialBlockDownload)
+;;;;
+;;;; Gates loose-tx fetching in handle-inv: during IBD announced txs are
+;;;; not requested (their inputs can't resolve against a stale UTXO set),
+;;;; mirroring net_processing.cpp:4176-4180. The status is latched — once
+;;;; the tip is recent with enough work it never flips back.
+
+(defun %make-ibd-latch-state (timestamp &key (work 100))
+  "Chain-state whose tip header carries TIMESTAMP and chain-work WORK."
+  (let ((state (bitcoin-lisp.storage:make-chain-state))
+        (hash (make-array 32 :element-type '(unsigned-byte 8)
+                             :initial-element (mod timestamp 251))))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash hash :height 1 :chain-work work :status :valid
+            :header (bitcoin-lisp.serialization::make-block-header
+                     :version 1
+                     :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                :initial-element 0)
+                     :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                 :initial-element 0)
+                     :timestamp timestamp :bits #x1d00ffff :nonce 0)))
+    (bitcoin-lisp.storage:update-chain-tip state hash 1)
+    state))
+
+(test initial-block-download-latch
+  "T while the tip is stale or low-work; latches NIL once the tip is
+recent with enough chain work; never flips back until reset-ibd-stop."
+  (let ((bitcoin-lisp.networking::*cached-is-ibd* t)
+        (bitcoin-lisp:*network* :regtest)  ; minimum-chain-work 0
+        (bitcoin-lisp:*minimum-chain-work-override* nil)
+        (now (bitcoin-lisp.serialization:get-unix-time)))
+    ;; Tip two days old => still in IBD.
+    (is-true (bitcoin-lisp.networking::initial-block-download-p
+              (%make-ibd-latch-state (- now (* 48 60 60)))))
+    ;; Fresh tip but below minimum chain work => still in IBD.
+    (let ((bitcoin-lisp:*minimum-chain-work-override* (expt 2 100)))
+      (is-true (bitcoin-lisp.networking::initial-block-download-p
+                (%make-ibd-latch-state now))))
+    ;; Fresh tip with enough work => leaves IBD and latches.
+    (is-false (bitcoin-lisp.networking::initial-block-download-p
+               (%make-ibd-latch-state now)))
+    (is-false bitcoin-lisp.networking::*cached-is-ibd*)
+    ;; Latched: a stale tip no longer flips it back.
+    (is-false (bitcoin-lisp.networking::initial-block-download-p
+               (%make-ibd-latch-state (- now (* 48 60 60)))))
+    ;; reset-ibd-stop (node start) re-arms the latch.
+    (bitcoin-lisp.networking:reset-ibd-stop)
+    (is-true (bitcoin-lisp.networking::initial-block-download-p
+              (%make-ibd-latch-state (- now (* 48 60 60)))))))
+
+(test handle-inv-tx-fetch-gated-during-ibd
+  "During IBD, tx invs are not recorded in the request tracker and no
+getdata is attempted (Core net_processing.cpp:4176-4180)."
+  (let* ((bitcoin-lisp.networking::*cached-is-ibd* t)
+         (bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp:*minimum-chain-work-override* nil)
+         (now (bitcoin-lisp.serialization:get-unix-time))
+         (state (%make-ibd-latch-state (- now (* 48 60 60))))  ; stale => IBD
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (announcer (bitcoin-lisp.networking:make-peer :state :ready))
+         (probe (bitcoin-lisp.networking:make-peer :state :ready))
+         (tx-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 7))
+         (payload (subseq (bitcoin-lisp.serialization:make-inv-message
+                           (list (bitcoin-lisp.serialization:make-inv-vector
+                                  :type bitcoin-lisp.serialization:+inv-type-tx+
+                                  :hash tx-hash)))
+                          24)))  ; strip the 24-byte v1 message header
+    (bitcoin-lisp.networking:reset-tx-requests)
+    ;; With the announcer's peer having no connection, a getdata attempt
+    ;; would error — the gate must short-circuit before any of that.
+    (finishes (bitcoin-lisp.networking::handle-inv announcer payload state mempool))
+    ;; Nothing was recorded for the hash: a fresh request from another
+    ;; peer is still "wanted" (no outstanding in-flight entry).
+    (is-true (bitcoin-lisp.networking::tx-request-wanted-p tx-hash probe))
+    (bitcoin-lisp.networking:reset-tx-requests)))
