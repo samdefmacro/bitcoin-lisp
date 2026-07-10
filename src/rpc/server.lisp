@@ -17,6 +17,8 @@
 (defconstant +rpc-client-node-already-added+ -23)
 (defconstant +rpc-client-node-not-added+ -24)
 (defconstant +rpc-verify-error+ -25)
+(defconstant +rpc-transaction-rejected+ -26)
+(defconstant +rpc-verify-already-in-utxo-set+ -27)
 
 ;;; --- RPC Error Condition ---
 

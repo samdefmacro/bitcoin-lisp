@@ -264,7 +264,7 @@ is supplied and the script is addressable) address."
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Block not found"))
       (if verbose
-          (block-header-entry-to-json entry hash-str)
+          (block-header-entry-to-json entry hash-str chain-state)
           ;; Non-verbose: return serialized header as hex
           (let ((block-store (rpc-get-block-store node)))
             (let ((block (bitcoin-lisp.storage:get-block block-store hash-bytes)))
@@ -275,7 +275,17 @@ is supplied and the script is addressable) address."
                   (error 'rpc-error :code +rpc-misc-error+
                                     :message "Block data not found"))))))))
 
-(defun block-header-entry-to-json (entry hash-str)
+(defun %block-confirmations (entry chain-state)
+  "Bitcoin Core confirmations for a block ENTRY: depth in the active chain
+(tip-height - height + 1) if the block is on the active chain, else -1."
+  (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
+         (at (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+    (if (and at (equalp (bitcoin-lisp.storage:block-index-entry-hash at)
+                        (bitcoin-lisp.storage:block-index-entry-hash entry)))
+        (+ (- (bitcoin-lisp.storage:current-height chain-state) height) 1)
+        -1)))
+
+(defun block-header-entry-to-json (entry hash-str chain-state)
   "Convert block index entry to header JSON."
   (let ((header (bitcoin-lisp.storage:block-index-entry-header entry)))
     `(("hash" . ,hash-str)
@@ -286,7 +296,7 @@ is supplied and the script is addressable) address."
       ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
       ("bits" . ,(format nil "~8,'0x" (bitcoin-lisp.serialization:block-header-bits header)))
       ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
-      ("confirmations" . 1))))
+      ("confirmations" . ,(%block-confirmations entry chain-state)))))
 
 (defun chaintip-status (entry on-active best-hash hash block-store)
   "Bitcoin Core getchaintips status for a tip ENTRY."
@@ -415,7 +425,9 @@ is supplied and the script is addressable) address."
                                     (bitcoin-lisp.serialization:version-message-version vmsg)
                                     0))
                   ("subver" . ,(or (bitcoin-lisp::peer-user-agent peer) ""))
-                  ("services" . ,(bitcoin-lisp::peer-services peer))
+                  ;; Core reports services as a 16-hex-digit string, not a number.
+                  ("services" . ,(string-downcase
+                                  (format nil "~16,'0X" (or (bitcoin-lisp::peer-services peer) 0))))
                   ;; Real inbound/outbound flag (was hardcoded nil).
                   ("inbound" . ,(bitcoin-lisp.networking::peer-inbound peer))
                   ;; Core ConnectionType string + whether we relay txs to this
@@ -746,17 +758,21 @@ anything to the mempool. Each tx is checked independently against current state
               (bitcoin-lisp.validation:validate-transaction-for-mempool
                tx utxo-set mempool current-height :chain-state chain-state)
             (unless valid
-              (error 'rpc-error :code +rpc-misc-error+
+              (error 'rpc-error :code +rpc-transaction-rejected+
                                 :message (format nil "Transaction rejected: ~A" error)))
             (let ((add-result (bitcoin-lisp.mempool:accept-validated-tx
                                mempool txid tx fee current-height
                                :replaced replaced)))
               (unless (eq add-result :ok)
-                (error 'rpc-error :code +rpc-misc-error+
+                (error 'rpc-error :code +rpc-transaction-rejected+
                                   :message (format nil "Mempool rejection: ~A" add-result)))
               (hash-to-hex txid))))
+      ;; Re-raise our own rpc-errors (the -26 rejections above) unchanged; only a
+      ;; genuine parse/deserialization failure maps to RPC_DESERIALIZATION_ERROR
+      ;; (-22), which Core distinguishes from the -26 mempool rejections.
+      (rpc-error (e) (error e))
       (error (e)
-        (error 'rpc-error :code +rpc-misc-error+
+        (error 'rpc-error :code +rpc-deserialization-error+
                           :message (format nil "TX decode failed: ~A" e))))))
 
 (defun %package-tx-result-fields (r)
@@ -2515,7 +2531,7 @@ bare multisig script regardless of address type. Uncompressed keys force legacy
           (let ((result `(("isvalid" . t)
                           ("address" . ,address)
                           ("scriptPubKey" . ,(bitcoin-lisp.crypto:bytes-to-hex script-pubkey))
-                          ("isscript" . ,(member type '(:p2sh :p2wsh :witness-v0-scripthash)))
+                          ("isscript" . ,(and (member type '(:p2sh :p2wsh :witness-v0-scripthash)) t))
                           ("iswitness" . ,(not (null wit-ver))))))
             (when wit-ver
               (setf result (append result
