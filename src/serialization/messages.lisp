@@ -144,6 +144,7 @@ Returns (VALUES net-addr timestamp) when WITH-TIMESTAMP, otherwise just net-addr
 (defconstant +node-witness+ (ash 1 3))
 (defconstant +node-network-limited+ (ash 1 10))  ; BIP 159: pruned node
 (defconstant +node-p2p-v2+ (ash 1 11))            ; BIP 324: v2 transport support
+(defconstant +node-compact-filters+ (ash 1 6))   ; BIP 157/158: serves cfilters
 
 (defstruct version-message
   "Version message payload."
@@ -776,3 +777,59 @@ Skips unknown or unsupported network types."
                  (when addr
                    (push (list addr timestamp network-id) results))))
       (nreverse results))))
+
+;;;; ============================================================
+;;;; BIP 157 compact block filter serving (getcfilters / getcfheaders /
+;;;; getcfcheckpt and their replies). Filter type 0 = basic (BIP 158).
+;;;; ============================================================
+
+(defun parse-getcfilters-payload (payload)
+  "Parse a getcfilters/getcfheaders payload: filter_type (u8), start_height
+(u32 LE), stop_hash (32 bytes). Returns (VALUES filter-type start-height
+stop-hash), or NIL on truncation."
+  (when (>= (length payload) 37)
+    (let ((br (make-byte-reader-from payload)))
+      (values (br-read-u8 br)
+              (br-read-u32-le br)
+              (br-read-bytes br 32)))))
+
+(defun parse-getcfcheckpt-payload (payload)
+  "Parse a getcfcheckpt payload: filter_type (u8), stop_hash (32 bytes).
+Returns (VALUES filter-type stop-hash), or NIL on truncation."
+  (when (>= (length payload) 33)
+    (let ((br (make-byte-reader-from payload)))
+      (values (br-read-u8 br)
+              (br-read-bytes br 32)))))
+
+(defun make-cfilter-message (filter-type block-hash filter-bytes)
+  "Build a cfilter message: filter_type (u8), block_hash (32), then the encoded
+filter as a var-length byte string."
+  (let ((payload (flexi-streams:with-output-to-sequence (s)
+                   (write-uint8 s filter-type)
+                   (write-bytes s block-hash)
+                   (write-compact-size s (length filter-bytes))
+                   (write-bytes s filter-bytes))))
+    (serialize-message "cfilter" payload)))
+
+(defun make-cfheaders-message (filter-type stop-hash prev-header filter-hashes)
+  "Build a cfheaders message: filter_type (u8), stop_hash (32), previous filter
+header (32), then the vector of per-block filter HASHES (32 each)."
+  (let ((payload (flexi-streams:with-output-to-sequence (s)
+                   (write-uint8 s filter-type)
+                   (write-bytes s stop-hash)
+                   (write-bytes s prev-header)
+                   (write-compact-size s (length filter-hashes))
+                   (dolist (h filter-hashes)
+                     (write-bytes s h)))))
+    (serialize-message "cfheaders" payload)))
+
+(defun make-cfcheckpt-message (filter-type stop-hash headers)
+  "Build a cfcheckpt message: filter_type (u8), stop_hash (32), then the filter
+HEADERS at each 1000-block checkpoint (32 each)."
+  (let ((payload (flexi-streams:with-output-to-sequence (s)
+                   (write-uint8 s filter-type)
+                   (write-bytes s stop-hash)
+                   (write-compact-size s (length headers))
+                   (dolist (h headers)
+                     (write-bytes s h)))))
+    (serialize-message "cfcheckpt" payload)))

@@ -532,8 +532,12 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
          (services (logior (if pruned
                                bitcoin-lisp.serialization:+node-network-limited+
                                bitcoin-lisp.serialization:+node-network+)
-                           bitcoin-lisp.serialization:+node-witness+))
-         (service-names (list (if pruned "NETWORK_LIMITED" "NETWORK") "WITNESS"))
+                           bitcoin-lisp.serialization:+node-witness+
+                           (if bitcoin-lisp:*peer-block-filters*
+                               bitcoin-lisp.serialization:+node-compact-filters+ 0)))
+         (service-names (append (list (if pruned "NETWORK_LIMITED" "NETWORK") "WITNESS")
+                                (when bitcoin-lisp:*peer-block-filters*
+                                  (list "COMPACT_FILTERS"))))
          (in (count-if #'bitcoin-lisp.networking::peer-inbound peers))
          ;; +default-min-relay-fee-rate+ is sat/kvB -> BTC/kvB.
          (relayfee (/ bitcoin-lisp.mempool:+default-min-relay-fee-rate+
