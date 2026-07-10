@@ -1314,3 +1314,45 @@ getdata is attempted (Core net_processing.cpp:4176-4180)."
     ;; peer is still "wanted" (no outstanding in-flight entry).
     (is-true (bitcoin-lisp.networking::tx-request-wanted-p tx-hash probe))
     (bitcoin-lisp.networking:reset-tx-requests)))
+
+(test handle-inv-wtx-announcement-requested
+  "MSG_WTX (BIP339) tx announcements — the only kind modern wtxidrelay
+peers send (net_processing.cpp:6009) — are matched and recorded in the
+request tracker; MSG_TX announcements still work. Regression test: the
+tx branch previously matched only types 1/0x40000001, so every
+announcement from a wtxidrelay peer was silently dropped."
+  (let* ((bitcoin-lisp.networking::*cached-is-ibd* t)
+         (bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp:*minimum-chain-work-override* nil)
+         (now (bitcoin-lisp.serialization:get-unix-time))
+         (state (%make-ibd-latch-state now))  ; fresh tip => not in IBD
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (announcer (bitcoin-lisp.networking:make-peer :state :ready))
+         (probe (bitcoin-lisp.networking:make-peer :state :ready))
+         (wtxid (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 11))
+         (txid (make-array 32 :element-type '(unsigned-byte 8)
+                              :initial-element 12))
+         (inv-payload
+           (lambda (type hash)
+             (subseq (bitcoin-lisp.serialization:make-inv-message
+                      (list (bitcoin-lisp.serialization:make-inv-vector
+                             :type type :hash hash)))
+                     24))))
+    (bitcoin-lisp.networking:reset-tx-requests)
+    ;; The announcer peer has no connection, so the getdata send at the end
+    ;; of handle-inv errors — but the tracker recording happens first, which
+    ;; is the observable we assert on.
+    (ignore-errors
+      (bitcoin-lisp.networking::handle-inv
+       announcer (funcall inv-payload bitcoin-lisp.serialization:+inv-type-wtx+ wtxid)
+       state mempool))
+    ;; Recorded: a probe from another peer sees the request outstanding.
+    (is-false (bitcoin-lisp.networking::tx-request-wanted-p wtxid probe))
+    ;; MSG_TX (txid) announcements keep working alongside.
+    (ignore-errors
+      (bitcoin-lisp.networking::handle-inv
+       announcer (funcall inv-payload bitcoin-lisp.serialization:+inv-type-tx+ txid)
+       state mempool))
+    (is-false (bitcoin-lisp.networking::tx-request-wanted-p txid probe))
+    (bitcoin-lisp.networking:reset-tx-requests)))
