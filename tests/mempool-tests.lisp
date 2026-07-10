@@ -980,6 +980,56 @@ low-fee parent, so a cheaper standalone tx is evicted first."
     (is (bitcoin-lisp.mempool:mempool-has mempool ctxid))
     (is (bitcoin-lisp.mempool:mempool-has mempool ntxid))))
 
+;;;; BIP339 wtxid getdata serving
+
+(defun %witness-tx-for-relay ()
+  "A segwit tx (has a witness stack) so its wtxid differs from its txid."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element 77)
+                                      :index 0)
+                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                    :sequence #xffffffff))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 1000
+                     :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
+                                                  :initial-element #x51)))
+   :witness (vector (list (make-array 4 :element-type '(unsigned-byte 8)
+                                        :initial-contents '(1 2 3 4))))
+   :lock-time 0))
+
+(test mempool-get-by-wtxid-serves-getdata
+  "A segwit tx (wtxid != txid) is retrievable by wtxid via mempool-get-by-wtxid
+(the MSG_WTX / wtxidrelay getdata serving path). A txid lookup by that wtxid
+returns nil -- the pre-fix bug where handle-getdata used mempool-get and served
+nothing for our own wtxid announcements."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (%witness-tx-for-relay))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+    (is (not (equalp txid wtxid)))                 ; witness tx: distinct ids
+    (%add-tx mempool tx)
+    (is-true (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool wtxid))
+    (is (null (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool txid)))
+    (is (null (bitcoin-lisp.mempool:mempool-get mempool wtxid)))))
+
+(test make-tx-message-witness-flag
+  "make-tx-message :witness serializes a segwit tx in BIP144 form (00 01 marker
+after the version); the default (MSG_TX) path strips witness. A non-witness tx
+uses the legacy form regardless."
+  (let* ((tx (%witness-tx-for-relay))
+         (wit (bitcoin-lisp.serialization:make-tx-message tx :witness t))
+         (leg (bitcoin-lisp.serialization:make-tx-message tx)))
+    (is (> (length wit) (length leg)))
+    ;; payload starts after the 24-byte header; version is 4 bytes, then 00 01.
+    (is (= 0 (aref wit (+ 24 4))))
+    (is (= 1 (aref wit (+ 24 5))))
+    ;; legacy path: byte after version is the input count (1), not the marker 0.
+    (is (= 1 (aref leg (+ 24 4))))))
+
 ;;;; PR6 orphan pool
 
 (defun %txid-array (n)
