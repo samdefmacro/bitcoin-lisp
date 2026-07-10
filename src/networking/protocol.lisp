@@ -375,23 +375,41 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
            (bitcoin-lisp.networking::update-block-availability peer chain-state hash)
            (unless (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
              (setf unknown-block-hash hash)))
+          ;; Transaction announcement. MSG_TX / MSG_WITNESS_TX carry a
+          ;; txid; MSG_WTX (BIP339) carries a wtxid. Matching MSG_WTX here
+          ;; is essential: peers that negotiated wtxidrelay — every modern
+          ;; Core peer — announce txs exclusively under MSG_WTX
+          ;; (net_processing.cpp:6009,6065), so without this branch no tx
+          ;; announcement from them was ever requested.
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
-           (when (and mempool
-                      ;; Core requests announced txs only outside IBD —
-                      ;; their inputs won't resolve against a stale UTXO
-                      ;; set anyway (net_processing.cpp:4176-4180 gates
-                      ;; AddTxAnnouncement on !IsInitialBlockDownload).
-                      (not (initial-block-download-p chain-state))
-                      (not (bitcoin-lisp.mempool:mempool-has mempool hash))
-                      (not (bitcoin-lisp:recent-reject-p recent-rejects hash))
-                      ;; Records PEER as an announcer; T only if no request for
-                      ;; this txid is already outstanding (dedup across peers).
-                      (tx-request-wanted-p hash peer))
-             (push (bitcoin-lisp.serialization:make-inv-vector
-                    :type bitcoin-lisp.serialization:+inv-type-witness-tx+
-                    :hash hash)
-                   wanted))))))
+               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
+               (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
+           (let ((wtxidp (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+)))
+             (when (and mempool
+                        ;; Core requests announced txs only outside IBD —
+                        ;; their inputs won't resolve against a stale UTXO
+                        ;; set anyway (net_processing.cpp:4176-4180 gates
+                        ;; AddTxAnnouncement on !IsInitialBlockDownload).
+                        (not (initial-block-download-p chain-state))
+                        ;; Dedup by the id the inv type implies.
+                        (not (if wtxidp
+                                 (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash)
+                                 (bitcoin-lisp.mempool:mempool-has mempool hash)))
+                        (not (bitcoin-lisp:recent-reject-p recent-rejects hash))
+                        ;; Records PEER as an announcer; T only if no request
+                        ;; for this hash is already outstanding (dedup across
+                        ;; peers). txids and wtxids never collide.
+                        (tx-request-wanted-p hash peer))
+               ;; Request with the id type the announcement used: wtxids as
+               ;; MSG_WTX, txids as MSG_TX|WITNESS_FLAG — Core's
+               ;; "gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags(peer))"
+               ;; (net_processing.cpp:6207).
+               (push (bitcoin-lisp.serialization:make-inv-vector
+                      :type (if wtxidp
+                                bitcoin-lisp.serialization:+inv-type-wtx+
+                                bitcoin-lisp.serialization:+inv-type-witness-tx+)
+                      :hash hash)
+                     wanted)))))))
     (when unknown-block-hash
       (bitcoin-lisp:log-cat "net" "inv: unknown block ~A from peer ~A — sending getheaders"
                               (bitcoin-lisp.crypto:bytes-to-hex unknown-block-hash)
@@ -664,8 +682,14 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
           (with-node-lock
             (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
                   (current-height (bitcoin-lisp.storage:current-height chain-state)))
-              ;; The requested tx arrived — clear its in-flight/announcer tracking.
+              ;; The requested tx arrived — clear its in-flight/announcer
+              ;; tracking. MSG_WTX announcements are tracked under the wtxid,
+              ;; so clear that key too (txids and wtxids never collide; for
+              ;; no-witness txs they are equal and one call suffices).
               (tx-request-received txid)
+              (let ((wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+                (unless (equalp wtxid txid)
+                  (tx-request-received wtxid)))
               ;; Mark as announced by this peer (bounded set)
               (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
               ;; Check recent rejects filter before expensive validation
@@ -738,10 +762,9 @@ handling of unavailable blocks."
           ;; hash by the id its inv type implies: MSG_TX by txid (legacy
           ;; serialization), MSG_WITNESS_TX by txid (witness serialization),
           ;; MSG_WTX by wtxid (BIP339, witness serialization). We also accept a
-          ;; wtxid under MSG_WITNESS_TX because our own wtxidrelay announcements
-          ;; carry a wtxid under that type -- txids and wtxids never collide, so
-          ;; trying both is safe, and this was the missing half of serving those
-          ;; announcements (previously mempool-get by txid returned nil).
+          ;; wtxid under MSG_WITNESS_TX: our pre-BIP339-fix versions announced
+          ;; wtxids under that type, and txids and wtxids never collide, so
+          ;; trying both is safe (kept for peers echoing those old requests).
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
@@ -1067,10 +1090,16 @@ Does nothing if relay is disabled for the current network."
                        (list (bitcoin-lisp.serialization:make-inv-vector
                               :type bitcoin-lisp.serialization:+inv-type-tx+
                               :hash txid))))
+        ;; BIP339: wtxidrelay peers get the wtxid under MSG_WTX — Core
+        ;; announces "m_wtxid_relay ? CInv{MSG_WTX, wtxid} : CInv{MSG_TX,
+        ;; txid}" (net_processing.cpp:6009,6065). We previously sent the
+        ;; wtxid under MSG_TX|WITNESS_FLAG, which is txid-based on the wire
+        ;; — nonstandard, and only servable because our own getdata handler
+        ;; compensates with a dual lookup.
         (wtxid-inv-msg (when wtxid
                          (bitcoin-lisp.serialization:make-inv-message
                           (list (bitcoin-lisp.serialization:make-inv-vector
-                                 :type bitcoin-lisp.serialization:+inv-type-witness-tx+
+                                 :type bitcoin-lisp.serialization:+inv-type-wtx+
                                  :hash wtxid)))))
         (fee-rate-per-kb (if fee-rate (* fee-rate 1000) 0)))
     (dolist (peer peers)
