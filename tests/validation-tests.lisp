@@ -1244,3 +1244,42 @@ then are promoted and survive a second rotation, untouched ones age out."
     (bitcoin-lisp.coalton.interop:clear-signature-cache)
     (is (not (bitcoin-lisp.coalton.interop::sig-cache-hit-p (%sig-key 1))))
     (is (not (bitcoin-lisp.coalton.interop::sig-cache-hit-p (%sig-key 2))))))
+
+(test taproot-script-flag-exception-block
+  "The mainnet Taproot exception block (Core script_flag_exceptions) validates
+with P2SH|WITNESS only: a P2TR spend with a garbage witness fails under normal
+post-activation flags (TAPROOT active) but passes when the block's hash matches
+*taproot-exception-mainnet* (v1 witness reverts to an upgradable program)."
+  (let* ((bitcoin-lisp:*network* :mainnet)
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (prev-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xBB))
+         ;; P2TR scriptPubKey: OP_1 push32 <32-byte x-only key>
+         (p2tr (concatenate '(vector (unsigned-byte 8))
+                            (vector #x51 #x20)
+                            (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+         (spending-tx (bitcoin-lisp.serialization:make-transaction
+                       :version 1
+                       :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                        :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                          :hash prev-txid :index 0)
+                                        :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                        :sequence #xFFFFFFFF))
+                       :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                         :value 900000 :script-pubkey p2tr))
+                       ;; garbage 64-byte "signature" -- fails BIP341 verification
+                       :witness (vector (list (make-array 64 :element-type '(unsigned-byte 8)
+                                                             :initial-element 7)))
+                       :lock-time 0))
+         (blk (bitcoin-lisp.serialization:make-bitcoin-block
+               :header (make-test-block-header)
+               :transactions (list (make-coinbase-transaction :value 5000000000 :height 800000)
+                                   spending-tx)))
+         (height 800000))               ; well past mainnet taproot activation
+    (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 1000000 p2tr 5)
+    ;; Normal flags (TAPROOT active): garbage witness rejected.
+    (is (null (bitcoin-lisp.validation:validate-block-scripts blk utxo-set :height height)))
+    ;; Exception block: validated with P2SH|WITNESS only -> passes.
+    (let ((bitcoin-lisp.validation::*taproot-exception-mainnet*
+            (bitcoin-lisp.serialization:block-header-hash
+             (bitcoin-lisp.serialization:bitcoin-block-header blk))))
+      (is (eq t (bitcoin-lisp.validation:validate-block-scripts blk utxo-set :height height))))))
