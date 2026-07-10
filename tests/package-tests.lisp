@@ -166,13 +166,13 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 ;;;; End-to-end acceptance
 
 (test package-cpfp-low-fee-parent-rides-in-on-child
-  ;; The headline case: a parent paying 50 sat (0.x sat/vB, below the 1 sat/vB
-  ;; floor) is accepted because the child pays 50000 sat; the package feerate
-  ;; clears the floor.
+  ;; The headline case: a parent paying 5 sat (~0.05 sat/vB, below the
+  ;; 0.1 sat/vB / 100 sat/kvB floor) is accepted because the child pays
+  ;; 50000 sat; the package feerate clears the floor.
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
-    (let* ((parent (%pkg-tx funding-txid 0 (- 100000000 50)))
+    (let* ((parent (%pkg-tx funding-txid 0 (- 100000000 5)))
            (pid (bitcoin-lisp.serialization:transaction-hash parent))
-           (child (%pkg-tx pid 0 (- (- 100000000 50) 50000))))
+           (child (%pkg-tx pid 0 (- (- 100000000 5) 50000))))
       (multiple-value-bind (msg results replaced)
           (bitcoin-lisp.validation:validate-package-for-mempool
            (list parent child) utxo-set mempool chain-state)
@@ -206,7 +206,7 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
 
 (test package-single-low-fee-tx-rejected
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
-    (let ((tx (%pkg-tx funding-txid 0 (- 100000000 50))))
+    (let ((tx (%pkg-tx funding-txid 0 (- 100000000 5))))
       (multiple-value-bind (msg results replaced)
           (bitcoin-lisp.validation:validate-package-for-mempool
            (list tx) utxo-set mempool chain-state)
@@ -218,11 +218,12 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
                      mempool (bitcoin-lisp.serialization:transaction-hash tx))))))))
 
 (test package-below-floor-rejected
-  ;; parent + child both tiny: even the package feerate is below 1 sat/vB.
+  ;; parent + child both tiny: even the package feerate is below the 0.1 sat/vB
+  ;; (100 sat/kvB) relay floor.
   (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
-    (let* ((parent (%pkg-tx funding-txid 0 (- 100000000 10)))
+    (let* ((parent (%pkg-tx funding-txid 0 (- 100000000 1)))
            (pid (bitcoin-lisp.serialization:transaction-hash parent))
-           (child (%pkg-tx pid 0 (- (- 100000000 10) 10))))
+           (child (%pkg-tx pid 0 (- (- 100000000 1) 1))))
       (multiple-value-bind (msg results replaced)
           (bitcoin-lisp.validation:validate-package-for-mempool
            (list parent child) utxo-set mempool chain-state)
@@ -305,3 +306,17 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
         (is (= 2 (length tx-results)))
         ;; each entry is (wtxid-hex . field-alist) carrying at least a txid
         (is-true (every (lambda (e) (assoc "txid" (cdr e) :test #'string=)) tx-results))))))
+
+(test single-tx-in-sub-1-satvb-band-accepted
+  "A lone tx paying ~0.5 sat/vB -- inside the 0.1..1.0 sat/vB band Core relays --
+is accepted under the 100 sat/kvB floor (the old 1 sat/vB integer floor rejected
+the entire band)."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (let ((tx (%pkg-tx funding-txid 0 (- 100000000 50))))   ; 50 sat fee
+      (multiple-value-bind (msg results replaced)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list tx) utxo-set mempool chain-state)
+        (declare (ignore results replaced))
+        (is (eq :success msg))
+        (is-true (bitcoin-lisp.mempool:mempool-has
+                  mempool (bitcoin-lisp.serialization:transaction-hash tx)))))))

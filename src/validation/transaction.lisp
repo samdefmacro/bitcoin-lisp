@@ -165,9 +165,6 @@ FEE is returned as a Satoshi type."
 
 ;;;; Mempool acceptance validation
 
-(defconstant +min-relay-fee-rate+ 1
-  "Minimum relay fee rate in satoshis per virtual byte.")
-
 (defconstant +max-standard-tx-weight+ 400000
   "Maximum weight of a standard transaction for relay (Bitcoin Core
 MAX_STANDARD_TX_WEIGHT).")
@@ -657,15 +654,18 @@ re-add, mempool.dat reload) where those checks don't apply."
                   (gethash (bitcoin-lisp.serialization:transaction-hash tx)
                            (bitcoin-lisp.mempool:mempool-deltas mempool) 0)))
              (vsize (bitcoin-lisp.serialization:transaction-vsize tx))
-             (fee-rate (if (zerop vsize) 0 (floor modified-fee-value vsize)))
              (direct-conflicts (bitcoin-lisp.mempool:find-rbf-conflicts mempool tx))
              (replaced-set nil))
 
         ;; Policy: minimum relay fee rate (relay floor, or the higher rolling
-        ;; dynamic minimum when the mempool has been trimming). Skipped when this
+        ;; dynamic minimum when the mempool has been trimming). The rate is
+        ;; sat/kvB (Core CFeeRate), so compare fee*1000 against rate*vsize --
+        ;; exact integer math, no truncation to whole sat/vB. Skipped when this
         ;; tx is part of a package evaluated at the package feerate.
         (when (and (not skip-fee-check)
-                   (< fee-rate (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)))
+                   (< (* modified-fee-value 1000)
+                      (* (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)
+                         vsize)))
           (return-from validate-transaction-for-mempool
             (values nil :insufficient-fee nil)))
 
