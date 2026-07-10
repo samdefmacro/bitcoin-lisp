@@ -402,19 +402,36 @@ per-entry deltas, and residual deltas; corrupt files read as not-ok."
 
 (test relay-skips-source-peer
   "Transaction relay sends inv to other peers but not the source."
-  (let ((source-peer (bitcoin-lisp.networking:make-peer
-                      :state :ready
-                      :announced-txs (make-hash-table :test 'equalp)))
-        (other-peer (bitcoin-lisp.networking:make-peer
-                     :state :ready
-                     :announced-txs (make-hash-table :test 'equalp)))
+  (let ((source-peer (bitcoin-lisp.networking:make-peer :state :ready))
+        (other-peer (bitcoin-lisp.networking:make-peer :state :ready))
         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 42)))
     ;; We can't actually send messages without a connection,
-    ;; but we can verify announcement tracking
-    (setf (gethash txid (bitcoin-lisp.networking:peer-announced-txs source-peer)) t)
+    ;; but we can verify announcement tracking (now a bounded set)
+    (bitcoin-lisp:add-recent-reject
+     (bitcoin-lisp.networking:peer-announced-txs source-peer) txid)
     ;; Check source has it, other doesn't
-    (is (gethash txid (bitcoin-lisp.networking:peer-announced-txs source-peer)))
-    (is (not (gethash txid (bitcoin-lisp.networking:peer-announced-txs other-peer))))))
+    (is (bitcoin-lisp:recent-reject-p
+         (bitcoin-lisp.networking:peer-announced-txs source-peer) txid))
+    (is (not (bitcoin-lisp:recent-reject-p
+              (bitcoin-lisp.networking:peer-announced-txs other-peer) txid)))))
+
+(test peer-announced-txs-bounded
+  "peer-announced-txs is a bounded FIFO set (Core CRollingBloomFilter{50000}
+analogue): filling past capacity evicts the oldest entries instead of growing
+without bound (the old hash-table leaked per-peer memory forever)."
+  (let* ((peer (bitcoin-lisp.networking:make-peer
+                :state :ready :announced-txs (bitcoin-lisp:make-rejects-filter 10)))
+         (set (bitcoin-lisp.networking:peer-announced-txs peer))
+         (ids (loop for i below 15
+                    collect (make-array 32 :element-type '(unsigned-byte 8)
+                                           :initial-element i))))
+    (dolist (id ids) (bitcoin-lisp:add-recent-reject set id))
+    ;; the 5 oldest were evicted; the 10 newest remain
+    (is (not (bitcoin-lisp:recent-reject-p set (nth 0 ids))))
+    (is (not (bitcoin-lisp:recent-reject-p set (nth 4 ids))))
+    (is (bitcoin-lisp:recent-reject-p set (nth 5 ids)))
+    (is (bitcoin-lisp:recent-reject-p set (nth 14 ids)))
+    (is (= 10 (hash-table-count (bitcoin-lisp::recent-rejects-table set))))))
 
 ;;;; Standard script detection tests
 
