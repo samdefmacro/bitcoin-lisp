@@ -1068,6 +1068,16 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
             do (return-from validate-block
                  (values nil :multiple-coinbase nil)))
 
+    ;; BIP325: on signet every block must carry a valid signet solution -- a
+    ;; signature over the block by the network's challenge key. Without it,
+    ;; :signet would follow any low-difficulty chain. Runs regardless of
+    ;; SKIP-HEADER (it is a block-level check, never done at header admission,
+    ;; so reorg-connected fork blocks must still be checked). Core CheckBlock:
+    ;;   if (signet_blocks && fCheckPOW && !CheckSignetBlockSolution(...)) reject.
+    (when (eq bitcoin-lisp:*network* :signet)
+      (unless (check-signet-block-solution block)
+        (return-from validate-block (values nil :bad-signet-solution nil))))
+
     ;; Validate merkle root, then reject CVE-2012-2459 malleation. Order
     ;; mirrors Bitcoin Core CheckBlock: a mutated block hashes to the SAME
     ;; root as the original, so the root check passes and the mutated flag is

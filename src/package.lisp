@@ -768,6 +768,12 @@
    #:compute-witness-merkle-root
    #:check-proof-of-work
    #:compute-merkle-root
+   ;; BIP325 signet block-solution validation
+   #:check-signet-block-solution
+   #:make-signet-txs
+   #:signet-challenge-for-network
+   #:*signet-challenge*
+   #:*default-signet-challenge*
    #:connect-block
    #:activate-block
    #:find-fork-point
