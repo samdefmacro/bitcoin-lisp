@@ -1626,9 +1626,14 @@ address (with network), and per-input sequence — the fields explorers expect."
     (let* ((vout (first (cdr (assoc "vout" j :test #'string=))))
            (spk (cdr (assoc "scriptPubKey" vout :test #'string=))))
       (is (string= "pubkeyhash" (cdr (assoc "type" spk :test #'string=))))
-      (is (stringp (cdr (assoc "address" spk :test #'string=)))))
-    (let ((vin (first (cdr (assoc "vin" j :test #'string=)))))
-      (is (assoc "sequence" vin :test #'string=)))))
+      (is (stringp (cdr (assoc "address" spk :test #'string=))))
+      ;; scriptPubKey now carries asm (feeds decoderawtransaction/getblock v2)
+      (is (stringp (cdr (assoc "asm" spk :test #'string=)))))
+    (let* ((vin (first (cdr (assoc "vin" j :test #'string=))))
+           (ss (cdr (assoc "scriptSig" vin :test #'string=))))
+      (is (assoc "sequence" vin :test #'string=))
+      ;; non-coinbase scriptSig now carries asm
+      (is (stringp (cdr (assoc "asm" ss :test #'string=)))))))
 
 ;;;; Operator RPCs + regtest subsidy halving (T3d)
 
