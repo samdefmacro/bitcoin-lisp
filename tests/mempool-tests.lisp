@@ -1248,3 +1248,21 @@ uses the legacy form regardless."
          (script (concatenate '(vector (unsigned-byte 8))
                               (%policy-bytes #x51 #x21) pk (%policy-bytes #x51 #xae))))
     (is-true (bitcoin-lisp.validation::standard-output-script-p script))))
+
+(test mempool-entry-fields-spentby-rbf
+  "%mempool-entry-fields reports spentby (in-mempool children), bip125-replaceable,
+and unbroadcast. A parent's spentby lists a child that spends it."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (parent (make-mempool-test-tx :input-id 200))
+         (ptxid (bitcoin-lisp.serialization:transaction-hash parent)))
+    (%add-tx mempool parent)
+    (let* ((child (%mp-spending-tx ptxid))
+           (ctxid (bitcoin-lisp.serialization:transaction-hash child)))
+      (%add-tx mempool child)
+      (let ((f (bitcoin-lisp.rpc::%mempool-entry-fields
+                mempool ptxid (bitcoin-lisp.mempool:mempool-get mempool ptxid))))
+        (is (assoc "spentby" f :test #'string=))
+        (is (assoc "bip125-replaceable" f :test #'string=))
+        (is (assoc "unbroadcast" f :test #'string=))
+        (is (member (bitcoin-lisp.rpc::hash-to-hex ctxid)
+                    (cdr (assoc "spentby" f :test #'string=)) :test #'string=))))))

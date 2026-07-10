@@ -619,24 +619,44 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
 (defun rpc-getmempoolinfo (node params)
   "Return mempool statistics."
   (declare (ignore params))
-  (let ((mempool (rpc-get-mempool node)))
+  (let ((mempool (rpc-get-mempool node))
+        (incfee (/ bitcoin-lisp.mempool::+incremental-relay-fee-rate+ 100000000.0d0)))
     (if mempool
         ;; Convert sat/vB to BTC/kvB: sat/vB * 1000 / 100000000
         (let* ((min-fee-sat-vb (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
                (min-fee-btc-kvb (/ (* min-fee-sat-vb 1000) 100000000.0d0))
-               (relay-fee-btc-kvb (/ (* bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 1000) 100000000.0d0)))
+               (relay-fee-btc-kvb (/ (* bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 1000) 100000000.0d0))
+               (count (bitcoin-lisp.mempool:mempool-count mempool))
+               (bytes (bitcoin-lisp.mempool:mempool-total-size mempool))
+               (total-fee-sat 0))
+          (bitcoin-lisp.mempool:mempool-for-each
+           mempool (lambda (txid e) (declare (ignore txid))
+                     (incf total-fee-sat (bitcoin-lisp.mempool:mempool-entry-fee e))))
           `(("loaded" . t)
-            ("size" . ,(bitcoin-lisp.mempool:mempool-count mempool))
-            ("bytes" . ,(bitcoin-lisp.mempool:mempool-total-size mempool))
-            ("usage" . 0)
+            ("size" . ,count)
+            ("bytes" . ,bytes)
+            ;; Core reports DynamicMemoryUsage; we don't replicate its exact
+            ;; accounting, so estimate: serialized bytes + a ~per-entry struct/
+            ;; index overhead.
+            ("usage" . ,(+ bytes (* count 180)))
+            ("total_fee" . ,(/ total-fee-sat 100000000.0d0))
+            ("maxmempool" . ,(bitcoin-lisp.mempool::mempool-max-size mempool))
             ("mempoolminfee" . ,min-fee-btc-kvb)
-            ("minrelaytxfee" . ,relay-fee-btc-kvb)))
+            ("minrelaytxfee" . ,relay-fee-btc-kvb)
+            ("incrementalrelayfee" . ,incfee)
+            ("unbroadcastcount" . 0)
+            ("fullrbf" . ,(and bitcoin-lisp.mempool:*mempool-full-rbf* t))))
         `(("loaded" . nil)
           ("size" . 0)
           ("bytes" . 0)
           ("usage" . 0)
+          ("total_fee" . 0)
+          ("maxmempool" . ,bitcoin-lisp.mempool:+default-max-mempool-bytes+)
           ("mempoolminfee" . 0.00001)
-          ("minrelaytxfee" . 0.00001)))))
+          ("minrelaytxfee" . 0.00001)
+          ("incrementalrelayfee" . ,incfee)
+          ("unbroadcastcount" . 0)
+          ("fullrbf" . ,(and bitcoin-lisp.mempool:*mempool-full-rbf* t))))))
 
 (defun rpc-getrawmempool (node params)
   "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
@@ -690,7 +710,20 @@ getmempooldescendants."
                         (maphash (lambda (p v) (declare (ignore v))
                                    (push (hash-to-hex p) deps))
                                  (bitcoin-lisp.mempool:mempool-entry-parents entry))
-                        deps))))))
+                        deps))
+        ;; In-mempool txs that spend this tx's outputs (Core "spentby").
+        ("spentby" . ,(let ((sb '()))
+                        (maphash (lambda (c v) (declare (ignore v))
+                                   (push (hash-to-hex c) sb))
+                                 (bitcoin-lisp.mempool::mempool-entry-children entry))
+                        sb))
+        ;; BIP125: replaceable if the tx or any unconfirmed ancestor signals,
+        ;; or full-rbf is on.
+        ("bip125-replaceable"
+         . ,(and (or bitcoin-lisp.mempool:*mempool-full-rbf*
+                     (bitcoin-lisp.mempool::mempool-tx-or-ancestor-signals-rbf-p mempool txid))
+                 t))
+        ("unbroadcast" . nil)))))
 
 (defun %mempool-txid-arg (params mempool)
   "Resolve the first param (a big-endian txid hex) to (values internal-txid
