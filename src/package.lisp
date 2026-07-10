@@ -668,6 +668,10 @@
    #:make-mempool
    #:mempool-by-wtxid
    #:mempool-find-parents
+   #:single-truc-checks
+   #:+truc-version+
+   #:+truc-max-vsize+
+   #:+truc-child-max-vsize+
    #:mempool-ancestors
    #:mempool-descendants
    #:mempool-ancestor-stats

@@ -684,8 +684,8 @@ non-standard under *permit-bare-multisig* nil (1<=m<=n<=3, 33/65-byte keys)."
              (make-array 1 :element-type '(unsigned-byte 8) :initial-element #xac))))
 
 (test mempool-rejects-nonstandard-version
-  "A tx with version outside [1,2] is rejected as non-standard. Version 3 is
-non-standard too until TRUC (BIP431) is enforced -- see +max-standard-tx-version+."
+  "A tx with version outside [1,3] is rejected as non-standard. Version 3 is now
+standard (TRUC/BIP431 enforced) -- see +max-standard-tx-version+."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (utxo (bitcoin-lisp.storage:make-utxo-set))
          (base (make-mempool-test-tx :input-id 80)))
@@ -699,8 +699,9 @@ non-standard too until TRUC (BIP431) is enforced -- see +max-standard-tx-version
                    (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
                  (and (null valid) (eq err :version-non-standard))))))
       (is-true (rejected-p 4))
-      (is-true (rejected-p 3))
-      (is-true (rejected-p 0)))))
+      (is-true (rejected-p 0))
+      ;; v3 is no longer rejected on the version check (TRUC governs its topology)
+      (is-false (rejected-p 3)))))
 
 (test mempool-rejects-dust-output
   "A tx with a dust-value output is rejected."
@@ -1313,3 +1314,67 @@ irregular version-0 programs stay nonstandard."
     ;; RPC type names
     (is (string= "anchor" (bitcoin-lisp.rpc::%script-type (wp #x51 #x4e #x73))))
     (is (string= "witness_unknown" (bitcoin-lisp.rpc::%script-type (wp #x52 #xaa #xbb))))))
+
+;;;; BIP431 TRUC (v3) topology
+
+(defun %truc-tx (parent-txid &key (version 3) (vout 0) (value 40000000))
+  "A v-VERSION tx spending PARENT-TXID:VOUT (make-outpoint hash is 32 bytes)."
+  (let ((tx (%mp-spending-tx parent-txid :vout vout :value value)))
+    (setf (bitcoin-lisp.serialization:transaction-version tx) version)
+    tx))
+
+(test single-truc-checks-topology
+  "single-truc-checks (Core SingleTRUCChecks): inheritance both ways, v3 ancestor
+and descendant limits of 1, and the 1000-vsize child cap."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 60))
+         ;; a v3 parent in the mempool
+         (v3-parent (%truc-tx root :version 3))
+         (v3-pid (bitcoin-lisp.serialization:transaction-hash v3-parent))
+         ;; a v2 parent in the mempool
+         (v2-parent (%truc-tx (make-array 32 :element-type '(unsigned-byte 8) :initial-element 61)
+                              :version 2))
+         (v2-pid (bitcoin-lisp.serialization:transaction-hash v2-parent)))
+    (%add-tx mempool v3-parent)
+    (%add-tx mempool v2-parent)
+    (flet ((ok (tx &optional (vsize 200) conflicts)
+             (bitcoin-lisp.mempool:single-truc-checks mempool tx vsize conflicts)))
+      ;; a lone v3 tx (no mempool parent) is fine
+      (is-true (ok (%truc-tx root :version 3 :vout 5)))
+      ;; a lone non-v3 tx is unaffected
+      (is-true (ok (%truc-tx root :version 2 :vout 6)))
+      ;; inheritance: non-v3 spending the v3 parent -> rejected
+      (multiple-value-bind (o r) (ok (%truc-tx v3-pid :version 2))
+        (is-false o) (is (eq :truc-nonv3-spends-v3 r)))
+      ;; inheritance: v3 spending the v2 parent -> rejected
+      (multiple-value-bind (o r) (ok (%truc-tx v2-pid :version 3))
+        (is-false o) (is (eq :truc-v3-spends-nonv3 r)))
+      ;; a v3 child of the v3 parent is fine (1 ancestor, 1 descendant)
+      (is-true (ok (%truc-tx v3-pid :version 3)))
+      ;; v3 child too big (> 1000 vsize) -> rejected
+      (multiple-value-bind (o r) (ok (%truc-tx v3-pid :version 3) 1001)
+        (is-false o) (is (eq :truc-child-too-big r)))
+      ;; v3 tx too big (> 10000 vsize) -> rejected even without a parent
+      (multiple-value-bind (o r) (ok (%truc-tx root :version 3 :vout 7) 10001)
+        (is-false o) (is (eq :truc-tx-too-big r))))))
+
+(test truc-descendant-limit-one-child
+  "A v3 parent may have at most one unconfirmed child; a second is rejected
+unless it replaces the first (sibling eviction is declined -> rejected)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 70))
+         (parent (%truc-tx root :version 3))
+         (pid (bitcoin-lisp.serialization:transaction-hash parent)))
+    (%add-tx mempool parent)
+    ;; first child ok, then add it
+    (let ((child1 (%truc-tx pid :version 3 :vout 0)))
+      (is-true (bitcoin-lisp.mempool:single-truc-checks mempool child1 200 nil))
+      (%add-tx mempool child1)
+      ;; a second child of the same parent -> descendant limit
+      (multiple-value-bind (o r)
+          (bitcoin-lisp.mempool:single-truc-checks mempool (%truc-tx pid :version 3 :vout 1) 200 nil)
+        (is-false o) (is (eq :truc-descendant-limit r))))))
+
+(test v3-now-standard
+  "v3 is a standard tx version (TRUC enabled): +max-standard-tx-version+ = 3."
+  (is (= 3 bitcoin-lisp.validation::+max-standard-tx-version+)))

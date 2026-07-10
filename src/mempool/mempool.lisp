@@ -293,6 +293,71 @@ and is evicted later."
     (declare (ignore count))
     (if (zerop vsize) 0 (/ fees vsize))))
 
+(defconstant +truc-version+ 3
+  "BIP431 TRUC (v3) transaction version.")
+(defconstant +truc-max-vsize+ 10000
+  "Max vsize of a TRUC (v3) transaction (Core TRUC_MAX_VSIZE).")
+(defconstant +truc-child-max-vsize+ 1000
+  "Max vsize of a TRUC child that spends an unconfirmed TRUC parent
+(Core TRUC_CHILD_MAX_VSIZE).")
+(defconstant +truc-ancestor-limit+ 2
+  "A TRUC tx's ancestor set (incl. self) must be <= this (Core TRUC_ANCESTOR_LIMIT).")
+(defconstant +truc-descendant-limit+ 2
+  "A TRUC tx's descendant set (incl. self) must be <= this (Core TRUC_DESCENDANT_LIMIT).")
+
+(defun single-truc-checks (mempool tx vsize direct-conflicts)
+  "BIP431 TRUC (v3) topology checks for a single new TX at mempool acceptance,
+a port of Core policy SingleTRUCChecks. VSIZE is TX's virtual size;
+DIRECT-CONFLICTS the list of mempool txids it replaces (RBF). Returns (values t
+NIL) when acceptable, else (values NIL reason-keyword).
+
+Enforces: v3<->non-v3 spend inheritance (both directions); v3 tx <= 10000 vsize;
+at most 1 unconfirmed ancestor and, for a child of an unconfirmed TRUC parent,
+<= 1000 vsize and the parent having no other unconfirmed descendant (unless that
+sibling is being replaced). We decline TRUC sibling eviction (Core permits the
+caller to), so a v3 tx that would need it is rejected with :truc-descendant-limit."
+  (let* ((version (bitcoin-lisp.serialization:transaction-version tx))
+         (parents (mempool-find-parents mempool tx))
+         (v3 (= version +truc-version+)))
+    ;; 1. TRUC / non-TRUC inheritance, both directions.
+    (dolist (p parents)
+      (let* ((pe (mempool-get mempool p))
+             (pv (and pe (bitcoin-lisp.serialization:transaction-version
+                          (mempool-entry-transaction pe)))))
+        (when pe
+          (cond
+            ((and (not v3) (= pv +truc-version+))
+             (return-from single-truc-checks (values nil :truc-nonv3-spends-v3)))
+            ((and v3 (/= pv +truc-version+))
+             (return-from single-truc-checks (values nil :truc-v3-spends-nonv3)))))))
+    ;; 2. The remaining rules apply only to v3 transactions.
+    (unless v3 (return-from single-truc-checks (values t nil)))
+    ;; 3. Size cap.
+    (when (> vsize +truc-max-vsize+)
+      (return-from single-truc-checks (values nil :truc-tx-too-big)))
+    ;; 4. Ancestor limit: parents + self must be within the limit.
+    (when (> (+ (length parents) 1) +truc-ancestor-limit+)
+      (return-from single-truc-checks (values nil :truc-too-many-ancestors)))
+    ;; 5. Child-of-unconfirmed-parent rules.
+    (when parents
+      (let ((parent (first parents)))
+        ;; The parent must have no ancestors of its own (it + self + new > 2).
+        (when (> (+ (mempool-ancestor-stats mempool parent) 1) +truc-ancestor-limit+)
+          (return-from single-truc-checks (values nil :truc-too-many-ancestors)))
+        ;; A child spending a TRUC parent is size-limited.
+        (when (> vsize +truc-child-max-vsize+)
+          (return-from single-truc-checks (values nil :truc-child-too-big)))
+        ;; The parent may have at most this one child (unless its existing child
+        ;; is being replaced). descendant-stats/ancestor-stats counts include self.
+        (let* ((descendants (mempool-descendants mempool parent))   ; excludes parent
+               (child-will-be-replaced
+                 (loop for d being the hash-keys of descendants
+                       thereis (member d direct-conflicts :test #'equalp))))
+          (when (and (> (+ (mempool-descendant-stats mempool parent) 1) +truc-descendant-limit+)
+                     (not child-will-be-replaced))
+            (return-from single-truc-checks (values nil :truc-descendant-limit))))))
+    (values t nil)))
+
 (defun check-ancestor-descendant-limits (mempool parent-txids new-vsize)
   "Check that adding a new tx of NEW-VSIZE with the given in-mempool PARENT-TXIDS
 keeps it within ancestor and descendant limits. Returns (values ok-p reason)."
