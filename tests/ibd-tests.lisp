@@ -1356,3 +1356,62 @@ announcement from a wtxidrelay peer was silently dropped."
        state mempool))
     (is-false (bitcoin-lisp.networking::tx-request-wanted-p txid probe))
     (bitcoin-lisp.networking:reset-tx-requests)))
+
+;;;; Relay polish: wtxid-keyed rejects, getaddr, BIP35 mempool
+
+(test recent-rejects-are-wtxid-keyed
+  "A rejected witness tx lands in the rejects filter under its WTXID,
+never its txid — the witness can be malleated, so the same txid with a
+different witness could still be valid (Core issue #8279,
+txdownloadman_impl.cpp MempoolRejectedTx). No-witness txs are covered
+since wtxid = txid there."
+  (let* ((input (bitcoin-lisp.serialization:make-tx-in
+                 :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                   :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element 42)
+                                   :index 0)
+                 :script-sig (make-array 2 :element-type '(unsigned-byte 8)
+                                           :initial-element 0)
+                 :sequence #xFFFFFFFF))
+         (output (bitcoin-lisp.serialization:make-tx-out
+                  :value 10000
+                  :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                :initial-element 0)))
+         ;; version 5 > +max-standard-tx-version+ (3): rejected as
+         ;; :version-non-standard before input resolution, i.e. the plain
+         ;; reject path (not the :missing-input orphan path).
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 5
+              :inputs (vector input)
+              :outputs (vector output)
+              :lock-time 0
+              :witness (vector (list (make-array 8 :element-type '(unsigned-byte 8)
+                                                   :initial-element 7)))))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
+         (payload (subseq (bitcoin-lisp.serialization:make-tx-message tx :witness t) 24))
+         (rejects (bitcoin-lisp:make-rejects-filter 100))
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    ;; Sanity: this is a witness tx, ids differ.
+    (is-false (equalp txid wtxid))
+    (bitcoin-lisp.networking:reset-tx-requests)
+    (bitcoin-lisp.networking::handle-tx peer payload nil mempool state nil
+                                        :recent-rejects rejects)
+    (is-true (bitcoin-lisp:recent-reject-p rejects wtxid))
+    (is-false (bitcoin-lisp:recent-reject-p rejects txid))))
+
+(test bip35-mempool-message-disconnects
+  "BIP35 'mempool' requests get a disconnect: we never advertise
+NODE_BLOOM, matching Core's no-bloom path (net_processing.cpp:4940-4951)."
+  (let ((peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    (is-true (bitcoin-lisp.networking::handle-message peer "mempool" #() nil nil nil))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))))
+
+(test getaddr-message-format
+  "getaddr serializes as a bare 24-byte v1 header with empty payload."
+  (let ((bytes (bitcoin-lisp.serialization:make-getaddr-message)))
+    (is (= 24 (length bytes)))
+    (is (string= "getaddr" (map 'string #'code-char
+                                (remove 0 (subseq bytes 4 16)))))))

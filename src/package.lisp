@@ -380,6 +380,7 @@
    #:read-net-addr-v2
    #:write-net-addr-v2
    #:make-sendaddrv2-message
+   #:make-getaddr-message
    #:make-sendheaders-message
    #:make-wtxidrelay-message
    #:parse-feefilter-payload
