@@ -80,6 +80,13 @@ the cache's lifecycle (e.g. the node) use this to close the LevelDB
 on shutdown."
   (cvc-base cache))
 
+(defun coins-view-cache-compact (cache)
+  "Full-compact the LevelDB backing CACHE (leveldb-compact over the whole
+keyspace) to reclaim tombstone space after a large deletion churn such as a
+reindex-chainstate wipe. No-op if the base DB is already closed."
+  (let ((db (cvdb-db (cvc-base cache))))
+    (when db (leveldb-compact db))))
+
 ;;;; Internal: fetch a coin into the cache. Mirrors Core's FetchCoin
 ;;;; (coins.cpp:68): if the key isn't in the cache, try the base view;
 ;;;; on hit, populate; on miss, leave the cache untouched (no negative

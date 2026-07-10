@@ -100,6 +100,16 @@
     (is (= 16 (getf plist :max-peers)))
     (is (eq nil (getf plist :v2transport)))))
 
+(test config-forcecompactdb-flag
+  "-forcecompactdb (a hidden Core option) maps to the :force-compact-db start-node
+keyword; absent from the plist when not given."
+  (let ((on (bitcoin-lisp::config-alist->start-node-plist
+             '(("forcecompactdb" . "1")) :mainnet))
+        (off (bitcoin-lisp::config-alist->start-node-plist
+              '(("txindex" . "1")) :mainnet)))
+    (is (eq t (getf on :force-compact-db)))
+    (is (null (getf off :force-compact-db)))))
+
 (test config-plist-server-and-debug-shortcuts
   "-server enables RPC on the network default port; -debug => loglevel debug."
   (let ((plist (bitcoin-lisp::config-alist->start-node-plist
