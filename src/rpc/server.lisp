@@ -83,6 +83,7 @@
   ;; Mempool
   (register-rpc-method "getmempoolinfo" #'rpc-getmempoolinfo)
   (register-rpc-method "getrawmempool" #'rpc-getrawmempool)
+  (register-rpc-method "getorphantxs" #'rpc-getorphantxs)
   (register-rpc-method "getmempoolentry" #'rpc-getmempoolentry)
   (register-rpc-method "prioritisetransaction" #'rpc-prioritisetransaction)
   (register-rpc-method "getprioritisedtransactions" #'rpc-getprioritisedtransactions)

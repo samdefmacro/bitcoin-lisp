@@ -497,6 +497,45 @@ peer disconnecting mid-send."
 
 ;;; --- Mempool Methods ---
 
+(defun %orphan-tx-json (tx from-peer verbose2)
+  "OrphanDescription (Core getorphantxs verbosity 1/2) for orphan TX announced by
+FROM-PEER (a peer object, or nil). VERBOSE2 appends the raw hex. \"from\" is our
+single announcer (Core tracks a list); an empty list when the announcer is gone."
+  (let* ((ser (bitcoin-lisp.serialization:serialize-transaction tx))
+         (base `(("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
+                 ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
+                 ("bytes" . ,(length ser))
+                 ("vsize" . ,(bitcoin-lisp.serialization:transaction-vsize tx))
+                 ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))
+                 ("from" . ,(if from-peer
+                                (list (bitcoin-lisp.networking::peer-id from-peer))
+                                '())))))
+    (if verbose2
+        (append base `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex ser))))
+        base)))
+
+(defun rpc-getorphantxs (node params)
+  "List the transactions in the orphan pool (Bitcoin Core getorphantxs, hidden).
+PARAMS: ([verbosity]) -- 0 (default) an array of txids, 1 an array of orphan
+detail objects, 2 the detail objects plus each transaction's raw hex."
+  (let* ((verbosity (if (integerp (first params)) (first params) 0))
+         (mempool (rpc-get-mempool node))
+         (pool (and mempool (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
+         (result '()))
+    (when pool
+      (maphash
+       (lambda (txid entry)
+         (declare (ignore txid))
+         (let ((tx (bitcoin-lisp.mempool::orphan-entry-transaction entry))
+               (from (bitcoin-lisp.mempool::orphan-entry-from-peer entry)))
+           (push (case verbosity
+                   (0 (hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
+                   (1 (%orphan-tx-json tx from nil))
+                   (t (%orphan-tx-json tx from t)))
+                 result)))
+       (bitcoin-lisp.mempool::orphan-pool-by-txid pool)))
+    (nreverse result)))
+
 (defun rpc-getmempoolinfo (node params)
   "Return mempool statistics."
   (declare (ignore params))
