@@ -757,7 +757,13 @@ used to emit it verbatim, which yason cannot encode."
     ;; Check required fields exist
     (is (assoc "loaded" result :test #'string=))
     (is (assoc "size" result :test #'string=))
-    (is (assoc "bytes" result :test #'string=))))
+    (is (assoc "bytes" result :test #'string=))
+    ;; completeness fields
+    (dolist (k '("usage" "total_fee" "maxmempool" "incrementalrelayfee"
+                 "unbroadcastcount" "fullrbf"))
+      (is (assoc k result :test #'string=)))
+    (is (integerp (cdr (assoc "maxmempool" result :test #'string=))))
+    (is (integerp (cdr (assoc "usage" result :test #'string=))))))
 
 (test rpc-getrawmempool-non-verbose
   "Test getrawmempool non-verbose returns list"
