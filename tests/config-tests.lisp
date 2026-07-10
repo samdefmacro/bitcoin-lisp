@@ -149,3 +149,29 @@ network resolved from the CLI and scoping the conf's [network] section."
   (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest" "-txindex") nil)))
     (is (eq :regtest (getf plist :network)))
     (is (eq t (getf plist :txindex)))))
+
+(test config-apply-globals
+  "apply-config-globals sets the process-global policy/consensus specials from a
+merged config alist (options with no start-node keyword)."
+  (let ((bitcoin-lisp::*accept-datacarrier* t)
+        (bitcoin-lisp::*max-datacarrier-bytes* 83)
+        (bitcoin-lisp::*permit-bare-multisig* nil)
+        (bitcoin-lisp.validation:*signet-challenge*
+          bitcoin-lisp.validation:*default-signet-challenge*))
+    (bitcoin-lisp::apply-config-globals
+     '(("datacarrier" . "0") ("datacarriersize" . "100000")
+       ("permitbaremultisig" . "1") ("signetchallenge" . "5121ff")))
+    (is (eq nil bitcoin-lisp::*accept-datacarrier*))
+    (is (= 100000 bitcoin-lisp::*max-datacarrier-bytes*))
+    (is (eq t bitcoin-lisp::*permit-bare-multisig*))
+    (is (equalp (bitcoin-lisp.crypto:hex-to-bytes "5121ff")
+                bitcoin-lisp.validation:*signet-challenge*))))
+
+(test config-args-returns-merged-alist
+  "args->start-node-plist returns the merged config alist as a second value, so
+start-node-from-args can apply the global-only options."
+  (multiple-value-bind (plist merged)
+      (bitcoin-lisp::args->start-node-plist '("-datacarrier=0" "-signetchallenge=5121ff"))
+    (declare (ignore plist))
+    (is (equal "0" (cdr (assoc "datacarrier" merged :test #'string=))))
+    (is (equal "5121ff" (cdr (assoc "signetchallenge" merged :test #'string=))))))
