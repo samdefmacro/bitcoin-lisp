@@ -390,15 +390,33 @@ resolved network. Honors -server (enable RPC on the default port when no
           (setf (getf plist :rpc-port) (network-rpc-port network)))))
     plist))
 
+(defun apply-config-globals (merged)
+  "Set the process-global policy/consensus config specials from the MERGED config
+alist. These options have no start-node keyword because they configure global
+specials directly: -datacarrier, -datacarriersize, -permitbaremultisig, and
+-signetchallenge (a custom signet block-challenge). CLI-over-file precedence is
+already applied in MERGED. Called at startup by start-node-from-args."
+  (flet ((lk (k) (let ((c (assoc k merged :test #'string=))) (and c (cdr c)))))
+    (let ((v (lk "datacarrier")))
+      (when v (setf *accept-datacarrier* (conf-parse-bool v))))
+    (let ((v (lk "datacarriersize")))
+      (when v (setf *max-datacarrier-bytes* (conf-parse-int v))))
+    (let ((v (lk "permitbaremultisig")))
+      (when v (setf *permit-bare-multisig* (conf-parse-bool v))))
+    (let ((v (lk "signetchallenge")))
+      (when v (setf bitcoin-lisp.validation:*signet-challenge*
+                    (bitcoin-lisp.crypto:hex-to-bytes v))))))
+
 (defun args->start-node-plist (args &optional conf-text)
   "Pure assembly of a start-node keyword plist from Bitcoin Core-style CLI ARGS
  (a list of strings) and optional CONF-TEXT (the contents of a bitcoin.conf).
 CLI arguments override the file. The network is resolved from the CLI first, so
 the config file's [network] section can be scoped, then finalized from the
-merge. start-node-from-args (node.lisp) wraps this with the file I/O and launch."
+merge. Returns (VALUES plist merged-alist network); start-node-from-args
+(node.lisp) wraps this with the file I/O, apply-config-globals, and launch."
   (let* ((cli (parse-cli-args args))
          (cli-network (resolve-network-from-config cli))
          (conf (when conf-text (parse-bitcoin-conf conf-text cli-network)))
          (merged (append cli conf))                 ; CLI first => wins on assoc
          (network (resolve-network-from-config merged)))
-    (config-alist->start-node-plist merged network)))
+    (values (config-alist->start-node-plist merged network) merged network)))
