@@ -304,7 +304,9 @@ witness stack; coinbase inputs emit a coinbase field instead of txid/vout."
               (let ((outpoint (bitcoin-lisp.serialization:tx-in-previous-output input)))
                 `(("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:outpoint-hash outpoint)))
                   ("vout" . ,(bitcoin-lisp.serialization:outpoint-index outpoint))
-                  ("scriptSig" . (("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                  ("scriptSig" . (("asm" . ,(bitcoin-lisp.validation:disassemble-script
+                                             (bitcoin-lisp.serialization:tx-in-script-sig input)))
+                                  ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
                                              (bitcoin-lisp.serialization:tx-in-script-sig input))))))))))
     (when (and witness-stack (plusp (length witness-stack)))
       (setf base (append base
@@ -317,7 +319,8 @@ witness stack; coinbase inputs emit a coinbase field instead of txid/vout."
 is supplied and the script is addressable) address."
   (let* ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output))
          (addr (and network (%script->address spk network)))
-         (spk-json `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+         (spk-json `(("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
+                     ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
                      ("type" . ,(%script-type spk)))))
     (when addr
       (setf spk-json (append spk-json `(("address" . ,addr)))))
@@ -555,7 +558,7 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
       ("relayfee" . ,relayfee)
       ("incrementalfee" . ,incfee)
       ("localaddresses" . ())
-      ("warnings" . ""))))
+      ("warnings" . #()))))
 
 (defun rpc-getconnectioncount (node params)
   "Return the number of connected peers."
@@ -973,7 +976,8 @@ getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
          ("services" . ,(bitcoin-lisp.networking:peer-address-services pa))
          ("address" . ,(bitcoin-lisp.networking:ip-bytes-to-string
                         (bitcoin-lisp.networking:peer-address-ip pa)))
-         ("port" . ,(bitcoin-lisp.networking:peer-address-port pa))))
+         ("port" . ,(bitcoin-lisp.networking:peer-address-port pa))
+         ("network" . ,(or (%addrman-network-name pa) "unroutable"))))
      limited)))
 
 (defun %addrman-network-name (pa)
@@ -2072,7 +2076,7 @@ implicit default mode is supported (no longpoll / proposal). Fields mirror Core.
       ("target" . ,(%bits-to-target-hex bits))
       ("pooledtx" . ,(if mempool (bitcoin-lisp.mempool:mempool-count mempool) 0))
       ("chain" . ,(%chain-name (bitcoin-lisp::node-network node)))
-      ("warnings" . ""))))
+      ("warnings" . #()))))
 
 (defun %activate-submitted-block (node block)
   "Validate+activate BLOCK through the consensus path. Returns the activate-block
