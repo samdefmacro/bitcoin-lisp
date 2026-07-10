@@ -320,6 +320,7 @@ is supplied and the script is addressable) address."
   (let* ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output))
          (addr (and network (%script->address spk network)))
          (spk-json `(("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
+                     ,@(when network `(("desc" . ,(scriptpubkey-desc spk network))))
                      ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
                      ("type" . ,(%script-type spk)))))
     (when addr
@@ -457,6 +458,7 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
               ;; Core's scriptPubKey shape: asm/hex/type plus address when the
               ;; script encodes to one (previously only hex was returned).
               ("scriptPubKey" . (("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
+                                 ("desc" . ,(scriptpubkey-desc spk network))
                                  ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
                                  ("type" . ,(%script-type spk))
                                  ,@(when addr `(("address" . ,addr)))))
