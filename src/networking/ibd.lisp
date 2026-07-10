@@ -141,7 +141,16 @@ block-hash-key-hash. Falls back to plain equalp off SBCL."
   ;; Node mempool, so the block-activation path can remove confirmed txs and
   ;; re-add reorg-disconnected ones. Threaded in once at run-ibd entry rather
   ;; than through every networking function.
-  (mempool nil))
+  (mempool nil)
+  ;; Live peer list and address book for the generic message path
+  ;; (handle-message :peers / :address-book). Without these, tx
+  ;; ingestion/serving, tx-inv getdata, compact-block relay, and addr
+  ;; gossip were all inert outside unit tests — the live loop passed
+  ;; only :fee-estimator/:recent-rejects (wiring bug, fixed 2026-07-10).
+  ;; Threaded in at run-ibd entry like mempool; peers is refreshed
+  ;; whenever run-ibd prunes disconnected entries.
+  (peers nil :type list)
+  (address-book nil))
 
 (defparameter +recent-rate-window-seconds+ 60
   "Window for the recent-rate metric in IBD Progress logs. 60s gives a
@@ -176,8 +185,12 @@ cells and `delivery-samples` (time peer-address latency-ms) lists."
   (setf *ibd-stop-requested* t))
 
 (defun reset-ibd-stop ()
-  "Clear a previous stop request (called at node start)."
-  (setf *ibd-stop-requested* nil))
+  "Clear a previous stop request (called at node start). Also re-latches
+the IBD-status cache to \"in IBD\" so a restarted node re-proves tip
+freshness before requesting loose txs (Core resets m_cached_is_ibd per
+process; reset here covers in-image restarts and tests)."
+  (setf *ibd-stop-requested* nil)
+  (setf *cached-is-ibd* t))
 
 (defvar *ibd-gap-only-mode* nil
   "Set by request-blocks-from-peers when the queue is at cap and the
@@ -1364,8 +1377,17 @@ handler. Shared by the block-download drain and the at-tip reap pass."
               peer chain-state
               (bitcoin-lisp.serialization:block-header-hash last)))))))
 
+    ;; Everything else: the generic handler, with the full node context
+    ;; threaded off the IBD ctx. handle-message silently disables tx
+    ;; ingestion/serving, tx-inv getdata, compact blocks, and addr gossip
+    ;; when :mempool/:peers/:address-book are nil — which is exactly what
+    ;; happened here until 2026-07-10 (only the two keywords below were
+    ;; passed, so those paths never ran outside unit tests and RPC).
     (t (handle-message peer command payload
                        chain-state utxo-set block-store
+                       :mempool (and ctx (ibd-context-mempool ctx))
+                       :peers (and ctx (ibd-context-peers ctx))
+                       :address-book (and ctx (ibd-context-address-book ctx))
                        :fee-estimator fee-estimator
                        :recent-rejects recent-rejects))))
 
@@ -1460,7 +1482,7 @@ disconnects it so replace-disconnected-peers can refill the slot."
   (handle-peer-fin peer))
 
 (defun start-ibd (peers chain-state utxo-set block-store target-height
-                   &key fee-estimator recent-rejects mempool)
+                   &key fee-estimator recent-rejects mempool address-book)
   "Start Initial Block Download.
 Returns the number of blocks downloaded."
   (setf *ibd-context* (make-ibd))
@@ -1473,18 +1495,23 @@ Returns the number of blocks downloaded."
        (run-ibd peers chain-state utxo-set block-store
                 :fee-estimator fee-estimator
                 :recent-rejects recent-rejects
-                :mempool mempool)
+                :mempool mempool
+                :address-book address-book)
     (setf *ibd-context* nil)))
 
 (defun run-ibd (peers chain-state utxo-set block-store
-                &key fee-estimator recent-rejects mempool)
+                &key fee-estimator recent-rejects mempool address-book)
   "Main IBD loop."
   (let ((ctx *ibd-context*)
         (start-height (bitcoin-lisp.storage:current-height chain-state)))
     ;; Make the mempool reachable from the block-activation path (which reads
-    ;; it off *ibd-context*) so confirmed txs are removed during IBD/tip advance.
+    ;; it off *ibd-context*) so confirmed txs are removed during IBD/tip
+    ;; advance — and, with peers + address-book, from dispatch-ibd-message's
+    ;; generic fallthrough so tx relay and addr gossip actually run live.
     (when ctx
-      (setf (ibd-context-mempool ctx) mempool))
+      (setf (ibd-context-mempool ctx) mempool
+            (ibd-context-peers ctx) peers
+            (ibd-context-address-book ctx) address-book))
 
     ;; Initialize header-tip-height from existing chain state
     ;; This ensures we know about existing headers even if header sync fails
@@ -1539,10 +1566,12 @@ Returns the number of blocks downloaded."
                  (when (check-stuck-tip)
                    (return))
 
-                 ;; Prune disconnected peers from the list
+                 ;; Prune disconnected peers from the list (and keep the
+                 ;; ctx copy current — relay fanout reads it).
                  (setf peers (remove-if-not
                               (lambda (p) (eq (peer-state p) :ready))
                               peers))
+                 (setf (ibd-context-peers ctx) peers)
 
                  ;; Handle no-peer condition: exit after a few seconds
                  ;; (caller is responsible for reconnecting and retrying)

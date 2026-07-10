@@ -311,6 +311,43 @@ tx with no other announcer. Returns the number re-requested."
         (error () nil)))
     (length reroutes)))
 
+;;; Initial-block-download status (Core ChainstateManager::IsInitialBlockDownload)
+
+(defconstant +max-tip-age-seconds+ (* 24 60 60)
+  "Consider the node still in IBD while the active tip is older than
+this. Core DEFAULT_MAX_TIP_AGE (kernel/chainstatemanager_opts.h:24).")
+
+(defvar *cached-is-ibd* t
+  "Latched IBD status: starts true; initial-block-download-p latches it
+to false once the tip has enough work and is recent, and it never flips
+back for the life of the node (Core m_cached_is_ibd, validation.h:1049,
+latched by UpdateIBDStatus, validation.cpp:3314-3322). Re-set to T by
+reset-ibd-stop at node start.")
+
+(defun initial-block-download-p (chain-state)
+  "Return T while the node is in initial block download.
+Latches to (and then always returns) NIL once the active tip exists,
+has at least the network's minimum chain work, and its timestamp is
+within +max-tip-age-seconds+ of now — Core UpdateIBDStatus
+(validation.cpp:3314-3322) + CChain::IsTipRecent (chain.h:431-437)."
+  (unless *cached-is-ibd*
+    (return-from initial-block-download-p nil))
+  (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (tip (and tip-hash
+                   (bitcoin-lisp.storage:get-block-index-entry chain-state tip-hash))))
+    (if (and tip
+             (>= (bitcoin-lisp.storage:block-index-entry-chain-work tip)
+                 (bitcoin-lisp:minimum-chain-work bitcoin-lisp:*network*))
+             (>= (bitcoin-lisp.serialization:block-header-timestamp
+                  (bitcoin-lisp.storage:block-index-entry-header tip))
+                 (- (bitcoin-lisp.serialization:get-unix-time)
+                    +max-tip-age-seconds+)))
+        (progn
+          (bitcoin-lisp:log-info "Leaving InitialBlockDownload (latching to false)")
+          (setf *cached-is-ibd* nil)
+          nil)
+        t)))
+
 (defun handle-inv (peer payload chain-state &optional mempool &key recent-rejects)
   "Handle an inv message.
 
@@ -341,6 +378,11 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+))
            (when (and mempool
+                      ;; Core requests announced txs only outside IBD —
+                      ;; their inputs won't resolve against a stale UTXO
+                      ;; set anyway (net_processing.cpp:4176-4180 gates
+                      ;; AddTxAnnouncement on !IsInitialBlockDownload).
+                      (not (initial-block-download-p chain-state))
                       (not (bitcoin-lisp.mempool:mempool-has mempool hash))
                       (not (bitcoin-lisp:recent-reject-p recent-rejects hash))
                       ;; Records PEER as an announcer; T only if no request for
