@@ -623,7 +623,18 @@ status with no scan running returns null; abort with no scan is a no-op."
     (is (assoc "bestblockhash" result :test #'string=))
     (is (assoc "initialblockdownload" result :test #'string=))
     ;; Check chain value for testnet
-    (is (string= (cdr (assoc "chain" result :test #'string=)) "test"))))
+    (is (string= (cdr (assoc "chain" result :test #'string=)) "test"))
+    ;; New completeness fields (all always-present in Core)
+    (dolist (k '("difficulty" "time" "mediantime" "chainwork" "bits" "target"
+                 "size_on_disk" "warnings"))
+      (is (assoc k result :test #'string=)))
+    ;; chainwork/target are 64-hex; bits is 8-hex
+    (is (= 64 (length (cdr (assoc "chainwork" result :test #'string=)))))
+    (is (= 64 (length (cdr (assoc "target" result :test #'string=)))))
+    (is (= 8 (length (cdr (assoc "bits" result :test #'string=)))))
+    ;; encodes cleanly through yason (warnings is an empty JSON array, etc.)
+    (is (stringp (with-output-to-string (s)
+                   (yason:encode (bitcoin-lisp.rpc::make-rpc-response result "id") s))))))
 
 (test rpc-getblockcount
   "Test getblockcount returns integer"
@@ -797,15 +808,24 @@ a hardcoded 1."
   (multiple-value-bind (cs entries) (%make-served-chain 5)  ; genesis..height 5
     (let ((node (make-test-node)))
       (setf (bitcoin-lisp::node-chain-state node) cs)
-      ;; height 3 -> 5 - 3 + 1 = 3 confirmations
+      ;; height 3 -> 5 - 3 + 1 = 3 confirmations, plus the shared chain-header fields
       (let ((r (bitcoin-lisp.rpc::rpc-getblockheader
                 node (list (bitcoin-lisp.rpc::hash-to-hex (%entry-hash entries 3))))))
         (is (= 3 (cdr (assoc "height" r :test #'string=))))
-        (is (= 3 (cdr (assoc "confirmations" r :test #'string=)))))
-      ;; tip (height 5) -> 1 confirmation
+        (is (= 3 (cdr (assoc "confirmations" r :test #'string=))))
+        (is (= 8 (length (cdr (assoc "versionHex" r :test #'string=)))))
+        (is (integerp (cdr (assoc "mediantime" r :test #'string=))))
+        (is (= 64 (length (cdr (assoc "target" r :test #'string=)))))
+        (is (= 64 (length (cdr (assoc "chainwork" r :test #'string=)))))
+        (is (= 8 (length (cdr (assoc "bits" r :test #'string=)))))
+        (is (numberp (cdr (assoc "difficulty" r :test #'string=))))
+        ;; a non-tip active-chain block carries nextblockhash
+        (is (assoc "nextblockhash" r :test #'string=)))
+      ;; tip (height 5) -> 1 confirmation, no nextblockhash
       (let ((r (bitcoin-lisp.rpc::rpc-getblockheader
                 node (list (bitcoin-lisp.rpc::hash-to-hex (%entry-hash entries 5))))))
-        (is (= 1 (cdr (assoc "confirmations" r :test #'string=))))))))
+        (is (= 1 (cdr (assoc "confirmations" r :test #'string=))))
+        (is (null (assoc "nextblockhash" r :test #'string=)))))))
 
 ;;; --- Authentication Tests (7.4) ---
 
