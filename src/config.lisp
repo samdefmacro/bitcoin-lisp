@@ -89,10 +89,10 @@ in bytes (Bitcoin Core -datacarriersize is the DATA size, 80; this is the
 whole script = OP_RETURN + pushdata prefix + 80 data = 83). Consensus is
 unaffected; this only gates mempool standardness.")
 
-(defvar *permit-bare-multisig* nil
+(defvar *permit-bare-multisig* t
   "Mempool policy: treat bare (non-P2SH) multisig outputs as standard
-(Bitcoin Core -permitbaremultisig; default false in modern Core). When
-NIL, bare multisig is non-standard. Consensus is unaffected.")
+(Bitcoin Core -permitbaremultisig, DEFAULT_PERMIT_BAREMULTISIG = true in Core).
+When NIL, bare multisig is non-standard. Consensus is unaffected.")
 
 ;;;; Token Bucket Rate Limiter
 
