@@ -329,6 +329,15 @@ serializes header-only CBlocks, which append nTx=0)."
                      (write-inv-vector stream inv)))))
     (serialize-message "inv" payload)))
 
+(defun make-notfound-message (inv-vectors)
+  "Create a notfound message (same payload shape as inv): tells a peer we cannot
+serve the objects it requested via getdata."
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-compact-size stream (length inv-vectors))
+                   (dolist (inv inv-vectors)
+                     (write-inv-vector stream inv)))))
+    (serialize-message "notfound" payload)))
+
 ;;;; Transaction message
 
 (defun make-tx-message (tx &key witness)

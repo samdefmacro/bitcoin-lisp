@@ -278,6 +278,7 @@
    #:make-headers-message
    #:make-getdata-message
    #:make-inv-message
+   #:make-notfound-message
    #:make-tx-message
    #:make-block-message
    #:parse-tx-payload
