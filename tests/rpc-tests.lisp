@@ -778,14 +778,34 @@ RPC layer normalizes into a JSON object."
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-sendrawtransaction-invalid
-  "Test sendrawtransaction with invalid hex returns error"
+  "Test sendrawtransaction with invalid hex returns error; a decode failure uses
+RPC_DESERIALIZATION_ERROR (-22), matching Core."
   (let ((node (make-test-node)))
     ;; Empty string
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-sendrawtransaction node '("")))
-    ;; Invalid hex
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-sendrawtransaction node '("not-valid-hex")))))
+    ;; Invalid hex -> deserialization error code -22
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-sendrawtransaction node '("not-valid-hex"))
+               (fail "expected rpc-error"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (= -22 (bitcoin-lisp.rpc::rpc-error-code e)))))))
+
+(test rpc-getblockheader-confirmations
+  "getblockheader.confirmations is the active-chain depth (tip - height + 1), not
+a hardcoded 1."
+  (multiple-value-bind (cs entries) (%make-served-chain 5)  ; genesis..height 5
+    (let ((node (make-test-node)))
+      (setf (bitcoin-lisp::node-chain-state node) cs)
+      ;; height 3 -> 5 - 3 + 1 = 3 confirmations
+      (let ((r (bitcoin-lisp.rpc::rpc-getblockheader
+                node (list (bitcoin-lisp.rpc::hash-to-hex (%entry-hash entries 3))))))
+        (is (= 3 (cdr (assoc "height" r :test #'string=))))
+        (is (= 3 (cdr (assoc "confirmations" r :test #'string=)))))
+      ;; tip (height 5) -> 1 confirmation
+      (let ((r (bitcoin-lisp.rpc::rpc-getblockheader
+                node (list (bitcoin-lisp.rpc::hash-to-hex (%entry-hash entries 5))))))
+        (is (= 1 (cdr (assoc "confirmations" r :test #'string=))))))))
 
 ;;; --- Authentication Tests (7.4) ---
 
@@ -967,7 +987,9 @@ RPC layer normalizes into a JSON object."
     (is (eq t (cdr (assoc "isvalid" result :test #'string=))))
     (is (assoc "address" result :test #'string=))
     (is (assoc "scriptPubKey" result :test #'string=))
-    (is (eq nil (cdr (assoc "iswitness" result :test #'string=))))))
+    (is (eq nil (cdr (assoc "iswitness" result :test #'string=))))
+    ;; isscript is a real boolean; a P2PKH address is not a script address.
+    (is (eq nil (cdr (assoc "isscript" result :test #'string=))))))
 
 (test rpc-validateaddress-valid-bech32
   "Test validateaddress with valid testnet bech32 address"
@@ -983,6 +1005,18 @@ RPC layer normalizes into a JSON object."
   (let* ((node (make-test-node))
          (result (bitcoin-lisp.rpc::rpc-validateaddress node '("not-an-address"))))
     (is (eq nil (cdr (assoc "isvalid" result :test #'string=))))))
+
+(test rpc-validateaddress-isscript-boolean
+  "isscript is T (a boolean) for a script address (P2SH) -- regression: it used
+to return a list of keyword symbols for script types, which serialized as a JSON
+array / could error."
+  (let* ((node (make-test-node))
+         (addr (bitcoin-lisp.crypto:encode-p2sh-address
+                (make-array 20 :element-type '(unsigned-byte 8) :initial-element 7)
+                :testnet3))
+         (result (bitcoin-lisp.rpc::rpc-validateaddress node (list addr))))
+    (is (eq t (cdr (assoc "isvalid" result :test #'string=))))
+    (is (eq t (cdr (assoc "isscript" result :test #'string=))))))
 
 (test rpc-validateaddress-empty
   "Test validateaddress with empty string"
@@ -1708,7 +1742,7 @@ peer defaults to conn-type :inbound and relays txs; a block-relay-only peer maps
 to \"block-relay-only\" with relaytxes false."
   (let* ((node (make-test-node))
          (peer (bitcoin-lisp::make-peer :address "1.2.3.4:8333"
-                                        :inbound t :start-height 99))
+                                        :inbound t :start-height 99 :services #x409))
          (br (bitcoin-lisp::make-peer :address "5.6.7.8:8333"
                                       :conn-type :block-relay))
          (ct (lambda (r) (cdr (assoc "connection_type" r :test #'string=)))))
@@ -1722,6 +1756,8 @@ to \"block-relay-only\" with relaytxes false."
       (is (assoc "bytessent" e :test #'string=))
       (is (assoc "pingtime" e :test #'string=))
       (is (eq t (cdr (assoc "relaytxes" e :test #'string=))))
+      ;; services is Core's 16-hex-digit string, not a number.
+      (is (string= "0000000000000409" (cdr (assoc "services" e :test #'string=))))
       (is-true b)
       (is (null (cdr (assoc "relaytxes" b :test #'string=)))))))
 
