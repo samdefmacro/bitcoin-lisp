@@ -246,3 +246,18 @@ Returns (VALUES chain-state entries) with ENTRIES ascending (genesis first)."
         (addrs (list (%make-test-peer-address 203 0 113 7 18333))))
     (is (string= "addr" (%message-command
                          (bitcoin-lisp.networking::build-addr-response peer addrs))))))
+
+(test notfound-message-roundtrip
+  "make-notfound-message builds a \"notfound\" message whose payload parses as
+inv vectors (same shape as inv) -- the reply for unserved tx getdata."
+  (let* ((inv (bitcoin-lisp.serialization:make-inv-vector
+               :type bitcoin-lisp.serialization:+inv-type-wtx+
+               :hash (%uniq-hash 777)))
+         (msg (bitcoin-lisp.serialization:make-notfound-message (list inv))))
+    (is (string= "notfound" (%message-command msg)))
+    (let ((parsed (bitcoin-lisp.serialization:parse-inv-payload (%message-payload msg))))
+      (is (= 1 (length parsed)))
+      (is (= bitcoin-lisp.serialization:+inv-type-wtx+
+             (bitcoin-lisp.serialization:inv-vector-type (first parsed))))
+      (is (equalp (%uniq-hash 777)
+                  (bitcoin-lisp.serialization:inv-vector-hash (first parsed)))))))
