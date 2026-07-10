@@ -167,11 +167,11 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "addr")
-     (handle-addr peer payload address-book)
+     (handle-addr peer payload address-book peers)
      t)
 
     ((string= command "addrv2")
-     (handle-addrv2 peer payload address-book)
+     (handle-addrv2 peer payload address-book peers)
      t)
 
     ((string= command "sendaddrv2")
@@ -425,37 +425,94 @@ blocks instead of being a sink."
 
 ;;; Address handling
 
-(defun handle-addr (peer payload &optional address-book)
+(defun %addr-gossip-key (peer-addr)
+  "Dedup key for addr gossip: ip || port (18 bytes)."
+  (let ((key (make-array 18 :element-type '(unsigned-byte 8)))
+        (port (peer-address-port peer-addr)))
+    (replace key (peer-address-ip peer-addr))
+    (setf (aref key 16) (ldb (byte 8 8) port)
+          (aref key 17) (ldb (byte 8 0) port))
+    key))
+
+(defun relay-address (peer-addr source-peer peers &optional (now (bitcoin-lisp.serialization:get-unix-time)))
+  "Forward a freshly-learned address to up to 2 deterministically-chosen peers
+(Core RelayAddress, net_processing.cpp): eligibility is ready + tx-relaying
+(block-relay-only/feeler peers get no addr gossip) + not the announcing peer;
+selection ranks peers by sha256(addr || day || peer-id), so the same address
+takes the same 2 hops network-wide for a day. Per-peer dedup via the bounded
+known-addrs set (the source is marked as knowing it too). Returns the number of
+peers the address was sent to."
+  (let* ((key (%addr-gossip-key peer-addr))
+         (day (floor now 86400))
+         (sent 0))
+    (when source-peer
+      (bitcoin-lisp:add-recent-reject (peer-known-addrs source-peer) key))
+    (let ((ranked
+            (sort
+             (loop for p in peers
+                   when (and (eq (peer-state p) :ready)
+                             (not (eq p source-peer))
+                             (peer-relays-txs-p p))
+                     collect (cons (let* ((material (concatenate '(vector (unsigned-byte 8))
+                                                                 key
+                                                                 (int-to-le-bytes day 8)
+                                                                 (int-to-le-bytes (peer-id p) 8)))
+                                          (h (bitcoin-lisp.crypto:sha256 material)))
+                                     (loop for i below 8 sum (ash (aref h i) (* 8 i))))
+                                   p))
+             #'> :key #'car)))
+      ;; Take the best <=2 peers that don't already know the address; count the
+      ;; chosen targets (Core queues to exactly its picked nodes) rather than
+      ;; successful writes, so a dropped connection can't widen the fan-out.
+      (loop for (nil . p) in ranked
+            while (< sent 2)
+            unless (bitcoin-lisp:recent-reject-p (peer-known-addrs p) key)
+              do (bitcoin-lisp:add-recent-reject (peer-known-addrs p) key)
+                 (send-message p (build-addr-response p (list peer-addr)))
+                 (incf sent)))
+    sent))
+
+(defun handle-addr (peer payload &optional address-book peers)
   "Handle an addr message. When ADDRESS-BOOK is provided, add plausible
 addresses (timestamp within last 3 hours) to the address book, keyed to the
-gossiping PEER as their source (addrman source-group spreading)."
+gossiping PEER as their source (addrman source-group spreading). Addresses with
+a timestamp within the last 10 minutes arriving in a small (<= 10 entries)
+unsolicited announcement are gossiped onward to up to 2 peers (Core
+RelayAddress)."
   (let ((now (bitcoin-lisp.serialization:get-unix-time))
         (three-hours (* 3 3600))
         (source-ip (when peer (string-to-ip-bytes (peer-address peer))))
-        (added 0))
+        (added 0)
+        (relay-candidates '())
+        (msg-count 0))
     (flexi-streams:with-input-from-sequence (stream payload)
       (let ((count (bitcoin-lisp.serialization:read-compact-size stream)))
+        (setf msg-count count)
         (loop repeat (min count 1000)  ; Limit to prevent abuse
               do (multiple-value-bind (net-addr timestamp)
                      (bitcoin-lisp.serialization:read-net-addr stream :with-timestamp t)
                    (when (and address-book timestamp
                               (<= (abs (- now timestamp)) three-hours))
-                     (address-book-add
-                      address-book
-                      (make-peer-address
-                       :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
-                       :port (bitcoin-lisp.serialization:net-addr-port net-addr)
-                       :services (bitcoin-lisp.serialization:net-addr-services net-addr)
-                       :last-seen timestamp)
-                      source-ip)
-                     (incf added))))))
+                     (let ((pa (make-peer-address
+                                :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
+                                :port (bitcoin-lisp.serialization:net-addr-port net-addr)
+                                :services (bitcoin-lisp.serialization:net-addr-services net-addr)
+                                :last-seen timestamp)))
+                       (address-book-add address-book pa source-ip)
+                       ;; Core relays only fresh (10-min) addrs from small messages.
+                       (when (> timestamp (- now 600))
+                         (push pa relay-candidates))
+                       (incf added)))))))
+    (when (and peers (<= msg-count 10))
+      (dolist (pa relay-candidates)
+        (relay-address pa peer peers now)))
     (when (and address-book (> added 0))
       (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addr message" added))
     added))
 
 ;;; ADDRv2 handling (BIP 155)
 
-(defun handle-addrv2 (peer payload &optional address-book)
+(defun handle-addrv2 (peer payload &optional address-book peers)
   "Handle an addrv2 message (BIP 155). When ADDRESS-BOOK is provided, add
 IPv4/IPv6 addresses with plausible timestamps (within 3 hours) to the address book.
 Other network types are silently skipped."
@@ -463,21 +520,26 @@ Other network types are silently skipped."
         (three-hours (* 3 3600))
         (source-ip (when peer (string-to-ip-bytes (peer-address peer))))
         (added 0)
+        (relay-candidates '())
         (entries (bitcoin-lisp.serialization:parse-addrv2-payload payload)))
     (dolist (entry entries)
       (destructuring-bind (net-addr timestamp network-id) entry
         (declare (ignore network-id))
         (when (and address-book
                    (<= (abs (- now timestamp)) three-hours))
-          (address-book-add
-           address-book
-           (make-peer-address
-            :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
-            :port (bitcoin-lisp.serialization:net-addr-port net-addr)
-            :services (bitcoin-lisp.serialization:net-addr-services net-addr)
-            :last-seen timestamp)
-           source-ip)
-          (incf added))))
+          (let ((pa (make-peer-address
+                     :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
+                     :port (bitcoin-lisp.serialization:net-addr-port net-addr)
+                     :services (bitcoin-lisp.serialization:net-addr-services net-addr)
+                     :last-seen timestamp)))
+            (address-book-add address-book pa source-ip)
+            ;; Core relays only fresh (10-min) addrs from small messages.
+            (when (> timestamp (- now 600))
+              (push pa relay-candidates))
+            (incf added)))))
+    (when (and peers (<= (length entries) 10))
+      (dolist (pa relay-candidates)
+        (relay-address pa peer peers now)))
     (when (and address-book (> added 0))
       (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
     added))
