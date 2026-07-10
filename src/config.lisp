@@ -353,6 +353,7 @@ signet|regtest, else returns DEFAULT."
     ("v2transport"       :v2transport        :bool)
     ("reindexchainstate" :reindex-chainstate :bool)
     ("reindex-chainstate" :reindex-chainstate :bool)
+    ("forcecompactdb"    :force-compact-db   :bool)
     ("logfile"           :log-file           :string)
     ("loglevel"          :log-level          :loglevel)
     ("sync"              :sync               :bool))
