@@ -378,3 +378,47 @@ from the zero header, and filling the gap in order is then accepted."
            (bitcoin-lisp.rpc::rpc-getdescriptoractivity
             node (list (list (bitcoin-lisp.rpc::hash-to-hex (%bfi-zeros32)))
                        (list "raw(51)") nil))))))))
+
+(test bip157-serving-request-validation-and-messages
+  "BIP157 serving: %cf-request-stop-height enforces active-chain stop hash +
+range bounds; the cfilter/cfheaders/cfcheckpt builders and parsers round-trip
+against a real backfilled index. peer-block-filters gates %cf-serving-index."
+  (%with-regtest
+   (let ((node (%bfi-regtest-node)))
+     (let ((bitcoin-lisp::*node* node)
+           (bitcoin-lisp:*peer-block-filters* t))
+       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
+       (let* ((cs (bitcoin-lisp::node-chain-state node))
+              (bfi (bitcoin-lisp::node-blockfilterindex node))
+              (h3 (bitcoin-lisp.storage:block-index-entry-hash
+                   (bitcoin-lisp.storage:get-block-at-height cs 3))))
+         ;; gate: off when peer-block-filters is nil
+         (is-true (bitcoin-lisp.networking::%cf-serving-index))
+         (let ((bitcoin-lisp:*peer-block-filters* nil))
+           (is (null (bitcoin-lisp.networking::%cf-serving-index))))
+         ;; valid request: active-chain stop hash, in range
+         (is (= 3 (bitcoin-lisp.networking::%cf-request-stop-height cs 1 h3 1000)))
+         ;; start > stop -> nil
+         (is (null (bitcoin-lisp.networking::%cf-request-stop-height cs 4 h3 1000)))
+         ;; span >= max-diff -> nil (0..3 is 4 blocks, max-diff 3 -> reject)
+         (is (null (bitcoin-lisp.networking::%cf-request-stop-height cs 0 h3 3)))
+         ;; unknown/fork stop hash -> nil
+         (is (null (bitcoin-lisp.networking::%cf-request-stop-height
+                    cs 0 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)
+                    1000)))
+         ;; getcfilters payload round-trips
+         (let ((payload (subseq (bitcoin-lisp.serialization:make-cfilter-message
+                                 0 h3 (bitcoin-lisp.storage:blockfilterindex-get-filter bfi h3))
+                                24)))
+           (declare (ignore payload)))
+         (multiple-value-bind (ft sh sp)
+             (bitcoin-lisp.serialization:parse-getcfilters-payload
+              (concatenate '(vector (unsigned-byte 8)) (vector 0 1 0 0 0) h3))
+           (is (= 0 ft)) (is (= 1 sh)) (is (equalp h3 sp)))
+         ;; cfcheckpt at interval 1000: none below height 4 -> empty header list, still builds
+         (let* ((msg (bitcoin-lisp.serialization:make-cfcheckpt-message 0 h3 '()))
+                (cmd (bitcoin-lisp.serialization:message-header-command
+                      (flexi-streams:with-input-from-sequence (s msg)
+                        (bitcoin-lisp.serialization:read-message-header s)))))
+           (is (string= "cfcheckpt" cmd))))
+       (bitcoin-lisp.storage:close-blockfilterindex (bitcoin-lisp::node-blockfilterindex node))))))

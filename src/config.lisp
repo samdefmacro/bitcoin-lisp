@@ -89,6 +89,11 @@ in bytes (Bitcoin Core -datacarriersize is the DATA size, 80; this is the
 whole script = OP_RETURN + pushdata prefix + 80 data = 83). Consensus is
 unaffected; this only gates mempool standardness.")
 
+(defvar *peer-block-filters* nil
+  "When true (and the block filter index is enabled), serve BIP157 compact
+filter messages (getcfilters/getcfheaders/getcfcheckpt) and advertise
+NODE_COMPACT_FILTERS (Bitcoin Core -peerblockfilters, default false).")
+
 (defvar *permit-bare-multisig* t
   "Mempool policy: treat bare (non-P2SH) multisig outputs as standard
 (Bitcoin Core -permitbaremultisig, DEFAULT_PERMIT_BAREMULTISIG = true in Core).
@@ -354,6 +359,7 @@ signet|regtest, else returns DEFAULT."
     ("reindexchainstate" :reindex-chainstate :bool)
     ("reindex-chainstate" :reindex-chainstate :bool)
     ("forcecompactdb"    :force-compact-db   :bool)
+    ("peerblockfilters"  :peer-block-filters :bool)
     ("logfile"           :log-file           :string)
     ("loglevel"          :log-level          :loglevel)
     ("sync"              :sync               :bool))

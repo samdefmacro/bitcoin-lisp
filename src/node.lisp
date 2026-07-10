@@ -547,7 +547,8 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                         (v2transport nil)
                         (coinstatsindex nil)
                         (reindex-chainstate nil)
-                        (force-compact-db nil))
+                        (force-compact-db nil)
+                        (peer-block-filters nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -598,6 +599,8 @@ Returns the node instance."
     ;; Bitcoin Core init.cpp: -prune is incompatible with -reindex-chainstate --
     ;; the wipe leaves the UTXO set to be replayed from stored blocks, but early
     ;; blocks are pruned, so a pruned reindex-chainstate wedges at the first gap.
+    (when (and peer-block-filters (not blockfilterindex))
+      (error "Cannot set -peerblockfilters without -blockfilterindex."))
     (when (and prune reindex-chainstate)
       (error "Prune mode is incompatible with -reindex-chainstate (pruned blocks cannot be replayed). Use a full resync instead.")))
 
@@ -873,6 +876,12 @@ data below the pruned horizon; the index needs genesis-contiguous history)"
   ;; via CDBWrapper force_compact when -forcecompactdb is set.
   (when force-compact-db
     (force-compact-databases))
+
+  ;; BIP157 filter serving (-peerblockfilters): gated above on the block filter
+  ;; index being enabled; advertised as NODE_COMPACT_FILTERS in our version.
+  (setf bitcoin-lisp:*peer-block-filters* (and peer-block-filters t))
+  (when peer-block-filters
+    (log-info "BIP157 compact filter serving enabled (NODE_COMPACT_FILTERS)"))
 
   ;; BIP324 v2 transport opt-in. Effective only if libsecp256k1 has the
   ;; ellswift module (probed lazily per connection via v2-available-p).
