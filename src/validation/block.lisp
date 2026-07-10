@@ -263,6 +263,15 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
    (bitcoin-lisp.crypto:hex-to-bytes "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"))
   "Block hash that is exempted from BIP 16 script verification on mainnet (little-endian).")
 
+;;; Taproot script-flag exception block for mainnet (Core chainparams.cpp
+;;; script_flag_exceptions): block 0000...e395ad (height 692261) contains a
+;;; witness-v1 spend that fails full BIP341 verification, so Core validates it
+;;; with P2SH|WITNESS only (taproot disabled for that one block).
+(defvar *taproot-exception-mainnet*
+  (bitcoin-lisp.crypto:reverse-bytes
+   (bitcoin-lisp.crypto:hex-to-bytes "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"))
+  "Block hash validated with P2SH|WITNESS only on mainnet (little-endian).")
+
 ;;;; Difficulty adjustment validation
 
 (defconstant +testnet-min-difficulty-spacing+ 1200
@@ -636,7 +645,14 @@ HEIGHT is used to determine which script verification flags to enable."
   (when (block-is-bip16-exception-p block)
     (return-from validate-block-scripts (values t nil)))
 
-  (let ((script-flags (compute-script-flags-for-height height))
+  (let ((script-flags
+          ;; Taproot script-flag exception (Core script_flag_exceptions): that
+          ;; one mainnet block validates with P2SH|WITNESS only.
+          (if (equalp (bitcoin-lisp.serialization:block-header-hash
+                       (bitcoin-lisp.serialization:bitcoin-block-header block))
+                      *taproot-exception-mainnet*)
+              "P2SH,WITNESS"
+              (compute-script-flags-for-height height)))
         (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
     ;; For non-tiny blocks, parallelize tx-script validation across workers
     ;; — but ONLY when explicitly enabled. The per-block worker threads are
