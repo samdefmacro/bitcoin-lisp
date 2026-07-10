@@ -387,6 +387,17 @@ is supplied and the script is addressable) address."
 
 ;;; --- Network Query Methods ---
 
+(defun %connection-type-string (conn-type)
+  "Core CNode::ConnectionTypeAsString for our peer conn-type keyword."
+  (case conn-type
+    (:inbound "inbound")
+    (:outbound-full-relay "outbound-full-relay")
+    (:block-relay "block-relay-only")
+    (:feeler "feeler")
+    (:manual "manual")
+    (:addr-fetch "addr-fetch")
+    (t (string-downcase (symbol-name conn-type)))))
+
 (defun rpc-getpeerinfo (node params)
   "Return information about connected peers."
   (declare (ignore params))
@@ -407,6 +418,11 @@ is supplied and the script is addressable) address."
                   ("services" . ,(bitcoin-lisp::peer-services peer))
                   ;; Real inbound/outbound flag (was hardcoded nil).
                   ("inbound" . ,(bitcoin-lisp.networking::peer-inbound peer))
+                  ;; Core ConnectionType string + whether we relay txs to this
+                  ;; peer (block-relay-only/feeler peers get no tx relay -- #216).
+                  ("connection_type" . ,(%connection-type-string
+                                          (bitcoin-lisp.networking:peer-conn-type peer)))
+                  ("relaytxes" . ,(and (bitcoin-lisp.networking:peer-relays-txs-p peer) t))
                   ("startingheight" . ,sh)
                   ;; Peer's advertised height as our best proxy for synced_*.
                   ("synced_headers" . ,sh)
@@ -1747,17 +1763,35 @@ help). A full per-method help text is out of scope."
           (format nil "~{~A~^~%~}" (sort names #'string<))))))
 
 (defun rpc-getindexinfo (node params)
-  "Report the status of optional indexes (Bitcoin Core getindexinfo). Currently
-just txindex, when enabled."
-  (declare (ignore params))
-  (let ((tx-index (rpc-get-tx-index node))
-        (height (bitcoin-lisp.storage:current-height (rpc-get-chain-state node))))
-    (if (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
-        ;; The txindex is maintained inline as blocks connect, so it tracks the
-        ;; tip: report synced at the current best height.
-        `(("txindex" . (("synced" . t) ("best_block_height" . ,height))))
-        ;; No active indexes -> empty JSON object.
-        (make-hash-table :test 'equal))))
+  "Report the status of optional indexes (Bitcoin Core getindexinfo): txindex,
+the basic block filter index, and coinstatsindex -- each reported only when
+enabled. An optional index-name argument filters to a single index (empty object
+if it is not an enabled index). Every index is maintained inline as blocks
+connect, so a present index normally tracks the tip; \"synced\" reflects whether
+its best indexed block has reached the current tip."
+  (let* ((name (and (consp params) (first params)))
+         (tip (bitcoin-lisp.storage:current-height (rpc-get-chain-state node)))
+         (tx-index (rpc-get-tx-index node))
+         (bfi (rpc-get-blockfilterindex node))
+         (csi (rpc-get-coinstatsindex node))
+         (entries '()))
+    (flet ((add (key enabled-p height)
+             (when (and enabled-p (or (null name) (string= name key)))
+               (push `(,key . (("synced" . ,(>= height tip))
+                               ("best_block_height" . ,height)))
+                     entries))))
+      ;; txindex has no separate best-height accessor; it tracks the tip inline.
+      (add "txindex"
+           (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
+           tip)
+      (add "basic block filter index"
+           (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
+           (if bfi (bitcoin-lisp.storage:blockfilterindex-height bfi) -1))
+      (add "coinstatsindex"
+           (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi))
+           (if csi (bitcoin-lisp.storage:coinstatsindex-height csi) -1)))
+    ;; No matching active index -> empty JSON object.
+    (if entries (nreverse entries) (make-hash-table :test 'equal))))
 
 (defun %buried-deployment (active-height tip-height)
   "A buried-softfork deployment object: active once TIP-HEIGHT reaches
