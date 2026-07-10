@@ -955,7 +955,15 @@ data below the pruned horizon; the index needs genesis-contiguous history)"
                                ;; another announcer (TxRequestTracker).
                                (bitcoin-lisp.networking:retry-timed-out-tx-requests)
                                (loop repeat 30 while (node-running *node*)
-                                     do (sleep 1)))
+                                     do (sleep 1)
+                                        ;; Trickled tx announcements: drain
+                                        ;; due per-peer inv queues each
+                                        ;; second (Poisson schedules inside;
+                                        ;; Core SendMessages runs its
+                                        ;; equivalent on every message pump).
+                                        (bitcoin-lisp.networking:flush-tx-announcements
+                                         (node-peers *node*)
+                                         (node-mempool *node*))))
                               (t
                                (log-warn "No peers available, reconnecting in 5s...")
                                (loop repeat 5 while (node-running *node*)
