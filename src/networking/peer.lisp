@@ -422,7 +422,15 @@ inbound t, rate limiters initialized)."
   ;; BIP 130: Request header announcements
   (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message))
   ;; BIP 133: Announce our minimum relay fee rate (1000 sat/kB = 1 sat/byte)
-  (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000)))
+  (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000))
+  ;; One-time address fetch to populate/update addrman. Core sends GETADDR
+  ;; on outbound connections only, and never block-relay-only ones (no addr
+  ;; relay there, to avoid leaking the link): net_processing.cpp:3754-3772
+  ;; + SetupAddressRelay. Without this, addrman fills only from unsolicited
+  ;; gossip, DNS seeds, and fixed seeds.
+  (when (and (not (peer-inbound peer))
+             (not (eq (peer-conn-type peer) :block-relay)))
+    (send-message peer (bitcoin-lisp.serialization:make-getaddr-message))))
 
 ;;; Ping/Pong
 
