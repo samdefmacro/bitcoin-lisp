@@ -40,6 +40,16 @@
   ;; m_addr_known CRollingBloomFilter{5000}.
   (known-addrs (bitcoin-lisp:make-rejects-filter 5000)
                :type bitcoin-lisp:recent-rejects)
+  ;; Pending tx announcements, flushed in batches on a Poisson schedule
+  ;; instead of per-tx immediate invs (Core m_tx_inventory_to_send +
+  ;; m_next_inv_send_time). Entries are (txid wtxid fee-rate-per-kb),
+  ;; oldest first. Single-writer: enqueue (relay-transaction) and flush
+  ;; (flush-tx-announcements) both run on the sync thread.
+  (tx-inv-queue '() :type list)
+  ;; internal-real-time deadline of the next inv flush for this peer
+  ;; (outbound peers only — inbound peers share one rotation, see
+  ;; *next-inbound-inv-flush*). 0 = not yet scheduled.
+  (next-inv-send-time 0 :type integer)
   ;; Health monitoring
   (consecutive-ping-failures 0 :type (unsigned-byte 8))
   (last-health-check 0 :type integer)

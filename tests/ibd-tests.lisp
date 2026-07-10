@@ -1415,3 +1415,59 @@ NODE_BLOOM, matching Core's no-bloom path (net_processing.cpp:4940-4951)."
     (is (= 24 (length bytes)))
     (is (string= "getaddr" (map 'string #'code-char
                                 (remove 0 (subseq bytes 4 16)))))))
+
+;;;; Trickled (Poisson) tx announcement batching
+
+(test relay-transaction-queues-instead-of-sending
+  "relay-transaction enqueues per-peer announcements (Core
+m_tx_inventory_to_send); nothing is sent and nothing is marked announced
+until flush time."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (peer (bitcoin-lisp.networking:make-peer :state :ready :wtxid-relay t))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 21))
+         (wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 22)))
+    ;; Peer has no connection: an immediate send would error, a queue won't.
+    (finishes (bitcoin-lisp.networking::relay-transaction
+               txid nil (list peer) :fee-rate 2 :wtxid wtxid))
+    (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+    (is-false (bitcoin-lisp:recent-reject-p
+               (bitcoin-lisp.networking:peer-announced-txs peer) txid))))
+
+(test flush-tx-announcements-drains-on-schedule
+  "First flush pass only arms an outbound peer's exponential timer (Core
+initializes m_next_inv_send_time the same way); once the deadline is
+due, the queue drains and the tx is marked announced. Send errors from
+the connectionless peer are swallowed."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (peer (bitcoin-lisp.networking:make-peer :state :ready :wtxid-relay t))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 23))
+         (wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 24)))
+    (bitcoin-lisp.networking::relay-transaction
+     txid nil (list peer) :fee-rate 2 :wtxid wtxid)
+    ;; Arm pass: timer initialized, nothing flushed.
+    (bitcoin-lisp.networking:flush-tx-announcements (list peer) nil)
+    (is (plusp (bitcoin-lisp.networking::peer-next-inv-send-time peer)))
+    (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+    ;; Deadline in the past: flush drains and marks announced.
+    (setf (bitcoin-lisp.networking::peer-next-inv-send-time peer) 1)
+    (bitcoin-lisp.networking:flush-tx-announcements (list peer) nil)
+    (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+    (is-true (bitcoin-lisp:recent-reject-p
+              (bitcoin-lisp.networking:peer-announced-txs peer) txid))))
+
+(test flush-drops-feefiltered-entries
+  "A queued announcement below the peer's BIP133 feefilter is dropped at
+flush time — neither sent nor marked announced (Core skips it out of
+m_tx_inventory_to_send the same way)."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (peer (bitcoin-lisp.networking:make-peer :state :ready))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 25)))
+    (setf (bitcoin-lisp.networking:peer-feefilter-rate peer) 1000000)
+    ;; fee-rate 1 sat/vB = 1000 sat/kvB < 1000000 filter.
+    (bitcoin-lisp.networking::relay-transaction txid nil (list peer) :fee-rate 1)
+    (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+    (setf (bitcoin-lisp.networking::peer-next-inv-send-time peer) 1)
+    (bitcoin-lisp.networking:flush-tx-announcements (list peer) nil)
+    (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+    (is-false (bitcoin-lisp:recent-reject-p
+               (bitcoin-lisp.networking:peer-announced-txs peer) txid))))
