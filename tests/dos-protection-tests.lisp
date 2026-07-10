@@ -143,8 +143,9 @@
 ;;;; ============================================================
 
 (test max-message-payload-constant
-  "Max message payload should be 4 MB."
-  (is (= (* 4 1024 1024) bitcoin-lisp:+max-message-payload+)))
+  "Max message payload should be 4,000,000 bytes (Core MAX_PROTOCOL_MESSAGE_LENGTH,
+decimal 4e6 -- not 4 MiB)."
+  (is (= (* 4 1000 1000) bitcoin-lisp:+max-message-payload+)))
 
 ;;;; ============================================================
 ;;;; 5. Recent Transaction Rejects Filter Tests

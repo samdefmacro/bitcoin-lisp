@@ -209,8 +209,9 @@ disconnected by handle-message's rate-limit gate.")
 (defvar *rpc-rate-limit* '(100.0 . 200.0)
   "Rate limit for RPC requests: (rate-per-sec . burst).")
 
-(defconstant +max-message-payload+ (* 4 1024 1024)
-  "Maximum P2P message payload size in bytes (4 MB).")
+(defconstant +max-message-payload+ (* 4 1000 1000)
+  "Maximum P2P message payload size in bytes: 4,000,000, matching Bitcoin Core
+MAX_PROTOCOL_MESSAGE_LENGTH (net.h). Not 4 MiB -- Core uses decimal 4e6.")
 
 (defconstant +max-rpc-body-size+ (* 1 1024 1024)
   "Maximum RPC request body size in bytes (1 MB).")
