@@ -594,7 +594,12 @@ Returns the node instance."
     (unless (or (= prune 1) (>= prune 550))
       (error "Invalid prune target: ~A MiB. Must be 1 (manual-only) or >= 550." prune))
     (when (and prune txindex)
-      (error "Cannot enable both pruning and txindex. Pruned blocks cannot be looked up.")))
+      (error "Cannot enable both pruning and txindex. Pruned blocks cannot be looked up."))
+    ;; Bitcoin Core init.cpp: -prune is incompatible with -reindex-chainstate --
+    ;; the wipe leaves the UTXO set to be replayed from stored blocks, but early
+    ;; blocks are pruned, so a pruned reindex-chainstate wedges at the first gap.
+    (when (and prune reindex-chainstate)
+      (error "Prune mode is incompatible with -reindex-chainstate (pruned blocks cannot be replayed). Use a full resync instead.")))
 
   ;; Initialize node
   (setf *node* (init-node data-directory :network network :log-level log-level))
@@ -977,13 +982,16 @@ file location."
                                        (concatenate 'string datadir "/"))))))
          (conf-text (when (probe-file conf-path)
                       (log-info "Reading config file ~A" conf-path)
-                      (alexandria:read-file-into-string conf-path)))
-         (plist (args->start-node-plist args conf-text)))
-    ;; datadir only comes from the CLI/default (locating the conf needs it), so
-    ;; make sure it reaches start-node even if it wasn't in the spec scan.
-    (unless (getf plist :data-directory)
-      (setf (getf plist :data-directory) datadir))
-    (apply #'start-node plist)))
+                      (alexandria:read-file-into-string conf-path))))
+    (multiple-value-bind (plist merged) (args->start-node-plist args conf-text)
+      ;; Apply the process-global config specials (options with no start-node
+      ;; keyword) from the same merged config, before launching.
+      (apply-config-globals merged)
+      ;; datadir only comes from the CLI/default (locating the conf needs it), so
+      ;; make sure it reaches start-node even if it wasn't in the spec scan.
+      (unless (getf plist :data-directory)
+        (setf (getf plist :data-directory) datadir))
+      (apply #'start-node plist))))
 
 (defparameter +flush-every-n-blocks+ 25000
   "Block-count flush backstop. The 600s time trigger and the 450MiB
