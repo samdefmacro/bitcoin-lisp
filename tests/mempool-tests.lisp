@@ -1121,18 +1121,20 @@ uses the legacy form regardless."
 ;;;; Mempool deferrals: dynamic rolling minimum fee
 
 (test mempool-effective-min-fee
-  "Effective min-fee is the relay floor, or the (decaying) rolling minimum."
+  "Effective min-fee (sat/kvB) is the relay floor, or the (decaying) rolling
+minimum."
   (let ((mempool (bitcoin-lisp.mempool:make-mempool)))
-    ;; No rolling minimum set -> relay floor (1 sat/vB).
-    (is (= 1 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)))
+    ;; No rolling minimum set -> relay floor (100 sat/kvB = 0.1 sat/vB, Core
+    ;; DEFAULT_MIN_RELAY_TX_FEE).
+    (is (= 100 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)))
     ;; Set a fresh rolling minimum -> used as-is.
-    (setf (bitcoin-lisp.mempool::mempool-rolling-min-fee-rate mempool) 100
+    (setf (bitcoin-lisp.mempool::mempool-rolling-min-fee-rate mempool) 5000
           (bitcoin-lisp.mempool::mempool-rolling-min-fee-time mempool)
           (bitcoin-lisp.serialization:get-unix-time))
-    (is (= 100 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)))
+    (is (= 5000 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)))
     ;; Far in the future it decays back below the floor -> floor.
-    (is (= 1 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate
-              mempool (+ (bitcoin-lisp.serialization:get-unix-time) (* 100 86400)))))))
+    (is (= 100 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate
+                mempool (+ (bitcoin-lisp.serialization:get-unix-time) (* 100 86400)))))))
 
 ;;;; Min non-witness size (65 B) + witness standardness
 

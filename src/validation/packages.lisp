@@ -203,11 +203,12 @@ REPLACED hash-set. Returns :success or a failure reason keyword."
                         wtxid (or fee 0) vsize rset)
                   validated)))))
     (setf validated (nreverse validated))
-    ;; Package feerate must clear the mempool's effective minimum.
+    ;; Package feerate must clear the mempool's effective minimum (sat/kvB):
+    ;; fee*1000 vs rate*vsize, exact integer math.
     (let ((pkg-feerate (if (zerop total-vsize) 0 (/ total-fee total-vsize)))
           (min-fee (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
           (includes (mapcar #'third validated)))   ; the wtxid of each member
-      (when (< pkg-feerate min-fee)
+      (when (< (* total-fee 1000) (* min-fee (max total-vsize 1)))
         (dolist (v validated)
           (%mark-result-invalid (gethash (third v) results) :insufficient-fee))
         (return-from %accept-package-subset :insufficient-fee))
