@@ -167,6 +167,12 @@ decayed rolling minimum if higher (Bitcoin Core CTxMemPool::GetMinFee)."
   "Get a mempool entry by txid. Returns the entry or NIL."
   (gethash txid (mempool-entries mempool)))
 
+(defun mempool-get-by-wtxid (mempool wtxid)
+  "Get a mempool entry by its BIP339 witness txid (wtxid). Returns the entry or
+NIL. Used to serve MSG_WTX getdata, where the requested hash is a wtxid."
+  (let ((txid (gethash wtxid (mempool-by-wtxid mempool))))
+    (when txid (gethash txid (mempool-entries mempool)))))
+
 (defun mempool-count (mempool)
   "Return the number of transactions in the mempool."
   (hash-table-count (mempool-entries mempool)))

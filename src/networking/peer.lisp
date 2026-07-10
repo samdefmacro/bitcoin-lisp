@@ -275,9 +275,16 @@ tx relay on those)."
                            (if (v2-available-p)
                                bitcoin-lisp.serialization:+node-p2p-v2+ 0)))
          (relays (peer-relays-txs-p peer))
+         ;; Advertise our real chain height (Core sends my_height) so peers can
+         ;; pick us as a block-sync source; 0 only if the node isn't up yet.
+         (node bitcoin-lisp::*node*)
+         (start-height (if node
+                           (bitcoin-lisp.storage:current-height
+                            (bitcoin-lisp::node-chain-state node))
+                           0))
          (version-payload (bitcoin-lisp.serialization:make-version-message-bytes
                            :services services
-                           :start-height 0
+                           :start-height start-height
                            :timestamp (bitcoin-lisp.serialization:get-unix-time)
                            :relay relays))
          (version-msg (bitcoin-lisp.serialization:serialize-message
