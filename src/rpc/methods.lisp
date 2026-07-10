@@ -37,13 +37,35 @@ matching Bitcoin Core's uint256::GetHex."
          (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
          (network (rpc-get-network node))
          (syncing (rpc-is-syncing node))
+         (block-store (rpc-get-block-store node))
+         (tip (and best-hash (bitcoin-lisp.storage:get-block-index-entry chain-state best-hash)))
+         (tip-header (and tip (bitcoin-lisp.storage:block-index-entry-header tip)))
+         (bits (if tip-header (bitcoin-lisp.serialization:block-header-bits tip-header) #x1d00ffff))
          (result `(("chain" . ,(%chain-name network))
                    ("blocks" . ,height)
                    ("headers" . ,height)
                    ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
-                   ("initialblockdownload" . ,syncing)
+                   ("difficulty" . ,(%difficulty-from-bits bits))
+                   ("time" . ,(if tip-header
+                                  (bitcoin-lisp.serialization:block-header-timestamp tip-header) 0))
+                   ("mediantime" . ,(if best-hash
+                                        (bitcoin-lisp.validation:compute-median-time-past
+                                         chain-state best-hash)
+                                        0))
                    ("verificationprogress" . ,(if syncing 0.0 1.0))
-                   ("pruned" . ,(bitcoin-lisp:pruning-enabled-p)))))
+                   ("initialblockdownload" . ,syncing)
+                   ("chainwork" . ,(string-downcase
+                                    (format nil "~64,'0x"
+                                            (if tip (bitcoin-lisp.storage:block-index-entry-chain-work tip) 0))))
+                   ("size_on_disk" . ,(if block-store
+                                          (round (* (bitcoin-lisp.storage:block-storage-size-mib block-store)
+                                                    1048576))
+                                          0))
+                   ("bits" . ,(string-downcase (format nil "~8,'0x" bits)))
+                   ("target" . ,(string-downcase
+                                 (format nil "~64,'0x" (bitcoin-lisp.storage:bits-to-target bits))))
+                   ("pruned" . ,(bitcoin-lisp:pruning-enabled-p))
+                   ("warnings" . #()))))
     ;; Add pruning-specific fields when pruning is enabled
     (when (bitcoin-lisp:pruning-enabled-p)
       (let ((pruned-height (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
@@ -144,26 +166,79 @@ RPCHelpForChainstate."
          (bitcoin-lisp.crypto:bytes-to-hex
           (bitcoin-lisp.serialization:serialize block)))
         (1 ;; Return JSON with txids only
-         (block-to-json block hash-str nil (rpc-get-network node)))
+         (block-to-json block hash-str nil (rpc-get-chain-state node) (rpc-get-network node)))
         (2 ;; Return JSON with full tx details
-         (block-to-json block hash-str t (rpc-get-network node)))))))
+         (block-to-json block hash-str t (rpc-get-chain-state node) (rpc-get-network node)))))))
 
-(defun block-to-json (block hash-str include-tx-details &optional network)
+(defun %block-on-active-chain-p (entry chain-state)
+  "T if ENTRY is the block at its height on the active chain."
+  (let ((at (bitcoin-lisp.storage:get-block-at-height
+             chain-state (bitcoin-lisp.storage:block-index-entry-height entry))))
+    (and at (equalp (bitcoin-lisp.storage:block-index-entry-hash at)
+                    (bitcoin-lisp.storage:block-index-entry-hash entry)))))
+
+(defun %chain-header-fields (entry chain-state)
+  "The chain-context header fields Bitcoin Core shares between getblock and
+getblockheader: confirmations, height, versionHex, mediantime, bits (hex),
+target, difficulty, chainwork, and -- when the block is on the active chain and
+not the tip -- nextblockhash."
+  (let* ((header (bitcoin-lisp.storage:block-index-entry-header entry))
+         (height (bitcoin-lisp.storage:block-index-entry-height entry))
+         (bits (bitcoin-lisp.serialization:block-header-bits header))
+         (on-active (%block-on-active-chain-p entry chain-state))
+         (next (and on-active
+                    (bitcoin-lisp.storage:get-block-at-height chain-state (1+ height)))))
+    (append
+     `(("confirmations" . ,(if on-active
+                               (+ (- (bitcoin-lisp.storage:current-height chain-state) height) 1)
+                               -1))
+       ("height" . ,height)
+       ("versionHex" . ,(string-downcase
+                         (format nil "~8,'0x"
+                                 (logand (bitcoin-lisp.serialization:block-header-version header)
+                                         #xffffffff))))
+       ("mediantime" . ,(bitcoin-lisp.validation:compute-median-time-past
+                         chain-state (bitcoin-lisp.storage:block-index-entry-hash entry)))
+       ("bits" . ,(string-downcase (format nil "~8,'0x" bits)))
+       ("target" . ,(string-downcase
+                     (format nil "~64,'0x" (bitcoin-lisp.storage:bits-to-target bits))))
+       ("difficulty" . ,(%difficulty-from-bits bits))
+       ("chainwork" . ,(string-downcase
+                        (format nil "~64,'0x"
+                                (bitcoin-lisp.storage:block-index-entry-chain-work entry)))))
+     (when next
+       `(("nextblockhash" . ,(hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash next))))))))
+
+(defun block-to-json (block hash-str include-tx-details chain-state &optional network)
   "Convert block to JSON representation. NETWORK enables output addresses in the
-full-tx-detail (verbosity 2) form."
+full-tx-detail (verbosity 2) form. CHAIN-STATE supplies the chain-context fields
+(confirmations/height/mediantime/chainwork/nextblockhash) when the block is in
+the index."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-         (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
-    `(("hash" . ,hash-str)
-      ("version" . ,(bitcoin-lisp.serialization:block-header-version header))
-      ("previousblockhash" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header)))
-      ("merkleroot" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-merkle-root header)))
-      ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
-      ("bits" . ,(bitcoin-lisp.serialization:block-header-bits header))
-      ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
-      ("nTx" . ,(length txs))
-      ("tx" . ,(if include-tx-details
-                   (mapcar (lambda (tx) (tx-to-json tx network)) txs)
-                   (mapcar #'tx-to-txid txs))))))
+         (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+         (ntx (length txs))
+         (entry (bitcoin-lisp.storage:get-block-index-entry
+                 chain-state (bitcoin-lisp.serialization:block-header-hash header)))
+         (stripped (+ 80 (bitcoin-lisp.serialization:compact-size-length ntx)
+                      (reduce #'+ txs :key (lambda (tx)
+                                             (length (bitcoin-lisp.serialization:serialize-transaction tx))))))
+         (size (+ 80 (bitcoin-lisp.serialization:compact-size-length ntx)
+                  (reduce #'+ txs :key (lambda (tx) (length (%tx-wire-bytes tx)))))))
+    (append
+     `(("hash" . ,hash-str))
+     (when entry (%chain-header-fields entry chain-state))
+     `(("strippedsize" . ,stripped)
+       ("size" . ,size)
+       ("weight" . ,(bitcoin-lisp.validation:calculate-block-weight txs))
+       ("version" . ,(bitcoin-lisp.serialization:block-header-version header))
+       ("merkleroot" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-merkle-root header)))
+       ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
+       ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
+       ("nTx" . ,ntx)
+       ("previousblockhash" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header)))
+       ("tx" . ,(if include-tx-details
+                    (mapcar (lambda (tx) (tx-to-json tx network)) txs)
+                    (mapcar #'tx-to-txid txs)))))))
 
 (defun tx-to-txid (tx)
   "Get transaction ID as hex string."
@@ -275,28 +350,18 @@ is supplied and the script is addressable) address."
                   (error 'rpc-error :code +rpc-misc-error+
                                     :message "Block data not found"))))))))
 
-(defun %block-confirmations (entry chain-state)
-  "Bitcoin Core confirmations for a block ENTRY: depth in the active chain
-(tip-height - height + 1) if the block is on the active chain, else -1."
-  (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
-         (at (bitcoin-lisp.storage:get-block-at-height chain-state height)))
-    (if (and at (equalp (bitcoin-lisp.storage:block-index-entry-hash at)
-                        (bitcoin-lisp.storage:block-index-entry-hash entry)))
-        (+ (- (bitcoin-lisp.storage:current-height chain-state) height) 1)
-        -1)))
-
 (defun block-header-entry-to-json (entry hash-str chain-state)
-  "Convert block index entry to header JSON."
+  "Convert block index entry to header JSON (Bitcoin Core getblockheader): the
+shared chain-context fields plus the header's own version/merkleroot/time/nonce."
   (let ((header (bitcoin-lisp.storage:block-index-entry-header entry)))
-    `(("hash" . ,hash-str)
-      ("height" . ,(bitcoin-lisp.storage:block-index-entry-height entry))
-      ("version" . ,(bitcoin-lisp.serialization:block-header-version header))
-      ("previousblockhash" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header)))
-      ("merkleroot" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-merkle-root header)))
-      ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
-      ("bits" . ,(format nil "~8,'0x" (bitcoin-lisp.serialization:block-header-bits header)))
-      ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
-      ("confirmations" . ,(%block-confirmations entry chain-state)))))
+    (append
+     `(("hash" . ,hash-str))
+     (%chain-header-fields entry chain-state)
+     `(("version" . ,(bitcoin-lisp.serialization:block-header-version header))
+       ("merkleroot" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-merkle-root header)))
+       ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
+       ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
+       ("previousblockhash" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header)))))))
 
 (defun chaintip-status (entry on-active best-hash hash block-store)
   "Bitcoin Core getchaintips status for a tip ENTRY."
