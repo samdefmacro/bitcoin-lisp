@@ -433,6 +433,21 @@ delete-directory-tree as belt-and-braces cleanup."
       (bitcoin-lisp.storage:leveldb-put db k v)
       (is (equalp v (bitcoin-lisp.storage:leveldb-get db k))))))
 
+(test leveldb-compact-preserves-data
+  "leveldb-compact (full CompactRange) runs without error and leaves live keys
+readable while deleted keys stay gone -- exercises the FFI binding end-to-end."
+  (%with-tmp-leveldb (db)
+    (flet ((b (n) (make-array 1 :element-type '(unsigned-byte 8)
+                                :initial-contents (list n))))
+      (dotimes (i 50) (bitcoin-lisp.storage:leveldb-put db (b i) (b (* 2 i))))
+      (dotimes (i 25) (bitcoin-lisp.storage:leveldb-delete db (b i))) ; leave tombstones
+      (bitcoin-lisp.storage:leveldb-compact db)
+      ;; deleted keys are gone; surviving keys are intact after compaction
+      (is (null (bitcoin-lisp.storage:leveldb-get db (b 0))))
+      (is (null (bitcoin-lisp.storage:leveldb-get db (b 24))))
+      (is (equalp (b 50) (bitcoin-lisp.storage:leveldb-get db (b 25))))
+      (is (equalp (b 98) (bitcoin-lisp.storage:leveldb-get db (b 49)))))))
+
 (test leveldb-get-missing
   "GET on an absent key returns NIL (not an error)."
   (%with-tmp-leveldb (db)
