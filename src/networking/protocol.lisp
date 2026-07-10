@@ -612,7 +612,8 @@ do not have on disk (pruned or unknown) is silently skipped, like Bitcoin Core's
 handling of unavailable blocks."
   (declare (ignore chain-state))
   (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
-        (blocks-served 0))
+        (blocks-served 0)
+        (not-found '()))
     (dolist (inv inv-vectors)
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
@@ -628,21 +629,23 @@ handling of unavailable blocks."
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
-           (when (and mempool (relay-enabled-p))
-             (let* ((legacy (= inv-type bitcoin-lisp.serialization:+inv-type-tx+))
-                    (entry (cond
-                             ((= inv-type bitcoin-lisp.serialization:+inv-type-wtx+)
-                              (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))
-                             (legacy
-                              (bitcoin-lisp.mempool:mempool-get mempool hash))
-                             (t
-                              (or (bitcoin-lisp.mempool:mempool-get mempool hash)
-                                  (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))))))
-               (when entry
+           (let ((entry (when (and mempool (relay-enabled-p))
+                          (cond
+                            ((= inv-type bitcoin-lisp.serialization:+inv-type-wtx+)
+                             (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))
+                            ((= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
+                             (bitcoin-lisp.mempool:mempool-get mempool hash))
+                            (t
+                             (or (bitcoin-lisp.mempool:mempool-get mempool hash)
+                                 (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash)))))))
+             (if entry
                  (send-message peer
                                (bitcoin-lisp.serialization:make-tx-message
                                 (bitcoin-lisp.mempool:mempool-entry-transaction entry)
-                                :witness (not legacy)))))))
+                                :witness (/= inv-type bitcoin-lisp.serialization:+inv-type-tx+)))
+                 ;; Core accumulates vNotFound for txs it can't serve so the
+                 ;; requester re-routes immediately instead of timing out.
+                 (push inv not-found))))
           ;; Block request - serve the full block from disk (witness-aware).
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
@@ -655,7 +658,12 @@ handling of unavailable blocks."
                   (bitcoin-lisp.serialization:make-block-message
                    block
                    :witness (= inv-type
-                               bitcoin-lisp.serialization:+inv-type-witness-block+))))))))))))
+                               bitcoin-lisp.serialization:+inv-type-witness-block+))))))))))
+    ;; One notfound for every unserved tx request (Core sends notfound for txs
+    ;; only, never blocks).
+    (when not-found
+      (send-message peer (bitcoin-lisp.serialization:make-notfound-message
+                          (nreverse not-found))))))
 
 (defun handle-getblocktxn (peer payload block-store)
   "Serve a BIP152 getblocktxn: reply with a blocktxn carrying the requested
