@@ -94,6 +94,12 @@ unaffected; this only gates mempool standardness.")
 filter messages (getcfilters/getcfheaders/getcfcheckpt) and advertise
 NODE_COMPACT_FILTERS (Bitcoin Core -peerblockfilters, default false).")
 
+(defvar *tx-reconciliation* nil
+  "When true, negotiate BIP330 transaction reconciliation (Erlay) support via
+the sendtxrcncl handshake (Bitcoin Core -txreconciliation, DEBUG_ONLY, default
+false — net_processing.h:41, init.cpp:574). At Core ref d3056bc only the
+handshake + per-peer salt storage exist (no sketch exchange); we match that.")
+
 (defvar *permit-bare-multisig* t
   "Mempool policy: treat bare (non-P2SH) multisig outputs as standard
 (Bitcoin Core -permitbaremultisig, DEFAULT_PERMIT_BAREMULTISIG = true in Core).
@@ -360,6 +366,7 @@ signet|regtest, else returns DEFAULT."
     ("reindex-chainstate" :reindex-chainstate :bool)
     ("forcecompactdb"    :force-compact-db   :bool)
     ("peerblockfilters"  :peer-block-filters :bool)
+    ("txreconciliation"  :tx-reconciliation  :bool)
     ("logfile"           :log-file           :string)
     ("loglevel"          :log-level          :loglevel)
     ("sync"              :sync               :bool))
