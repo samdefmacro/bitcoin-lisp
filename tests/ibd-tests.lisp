@@ -1471,3 +1471,214 @@ m_tx_inventory_to_send the same way)."
     (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
     (is-false (bitcoin-lisp:recent-reject-p
                (bitcoin-lisp.networking:peer-announced-txs peer) txid))))
+
+;;;; Erlay P1: BIP330 sendtxrcncl handshake (Core-parity: handshake only)
+
+(defun %recon-test-peer (&key (relay t) (inbound nil)
+                              (conn-type :outbound-full-relay)
+                              (proto-version 70016) (local-salt 1))
+  "Bare peer mid-handshake: peer VERSION received (fRelay=RELAY, protocol
+PROTO-VERSION), our sendtxrcncl offer already made when LOCAL-SALT is set."
+  (let ((peer (bitcoin-lisp.networking:make-peer
+               :state :handshaking
+               :inbound inbound
+               :conn-type conn-type
+               :version (bitcoin-lisp.serialization::make-version-message
+                         :version proto-version :relay relay))))
+    (when local-salt
+      (setf (bitcoin-lisp.networking::peer-recon-local-salt peer) local-salt))
+    peer))
+
+(defun %sendtxrcncl-payload (version salt)
+  "The 12-byte sendtxrcncl payload (message bytes minus the 24-byte header)."
+  (subseq (bitcoin-lisp.serialization:make-sendtxrcncl-message salt version) 24))
+
+(test sendtxrcncl-message-codec
+  "sendtxrcncl is uint32 version + uint64 salt, both LE — a 12-byte payload
+(Core protocol.h:262-266); default version is 1 (TXRECONCILIATION_VERSION)."
+  (let ((bytes (bitcoin-lisp.serialization:make-sendtxrcncl-message
+                #x1122334455667788)))
+    (is (= (+ 24 12) (length bytes)))
+    (is (string= "sendtxrcncl" (map 'string #'code-char
+                                    (remove 0 (subseq bytes 4 16)))))
+    ;; version=1 LE then salt LE
+    (is (equalp #(1 0 0 0 #x88 #x77 #x66 #x55 #x44 #x33 #x22 #x11)
+                (subseq bytes 24)))
+    (multiple-value-bind (version salt)
+        (bitcoin-lisp.serialization:parse-sendtxrcncl-payload (subseq bytes 24))
+      (is (= 1 version))
+      (is (= #x1122334455667788 salt)))))
+
+(test sendtxrcncl-salt-combination
+  "compute-recon-salt matches Core ComputeSalt (txreconciliation.cpp:18-30):
+tagged hash, tag \"Tx Relay Salting\", over the u64 LE salts in ascending
+order; k0/k1 = digest bytes 0-7 / 8-15 read LE. Expected values derived
+independently with:
+  python3 -c \"import hashlib
+tag = hashlib.sha256(b'Tx Relay Salting').digest()
+h = hashlib.sha256(tag + tag + (1).to_bytes(8,'little')
+                   + (2).to_bytes(8,'little')).digest()
+print(int.from_bytes(h[0:8],'little'), int.from_bytes(h[8:16],'little'))\"
+  => 6513280882736911012 14473150418129592761"
+  (multiple-value-bind (k0 k1)
+      (bitcoin-lisp.networking::compute-recon-salt 1 2)
+    (is (= 6513280882736911012 k0))
+    (is (= 14473150418129592761 k1)))
+  ;; Ascending order is applied internally, so argument order is irrelevant.
+  (multiple-value-bind (k0 k1)
+      (bitcoin-lisp.networking::compute-recon-salt 2 1)
+    (is (= 6513280882736911012 k0))
+    (is (= 14473150418129592761 k1))))
+
+(test sendtxrcncl-offer-conditions
+  "We offer reconciliation only when: -txreconciliation on, negotiated proto
+>= 70016, our conn relays txs, and the peer's VERSION set fRelay (Core
+net_processing.cpp:3728-3742). The offer pre-registers a random local salt."
+  (let ((bitcoin-lisp:*tx-reconciliation* t))
+    (let ((peer (%recon-test-peer :local-salt nil)))
+      (is-true (bitcoin-lisp.networking::%maybe-send-sendtxrcncl peer))
+      (is-true (bitcoin-lisp.networking::peer-recon-local-salt peer)))
+    ;; Peer's fRelay=0
+    (let ((peer (%recon-test-peer :relay nil :local-salt nil)))
+      (bitcoin-lisp.networking::%maybe-send-sendtxrcncl peer)
+      (is-false (bitcoin-lisp.networking::peer-recon-local-salt peer)))
+    ;; We don't relay txs on block-relay connections
+    (let ((peer (%recon-test-peer :conn-type :block-relay :local-salt nil)))
+      (bitcoin-lisp.networking::%maybe-send-sendtxrcncl peer)
+      (is-false (bitcoin-lisp.networking::peer-recon-local-salt peer)))
+    ;; Pre-wtxidrelay protocol version
+    (let ((peer (%recon-test-peer :proto-version 70015 :local-salt nil)))
+      (bitcoin-lisp.networking::%maybe-send-sendtxrcncl peer)
+      (is-false (bitcoin-lisp.networking::peer-recon-local-salt peer))))
+  ;; Feature off
+  (let ((bitcoin-lisp:*tx-reconciliation* nil)
+        (peer (%recon-test-peer :local-salt nil)))
+    (bitcoin-lisp.networking::%maybe-send-sendtxrcncl peer)
+    (is-false (bitcoin-lisp.networking::peer-recon-local-salt peer))))
+
+(test sendtxrcncl-registers-peer
+  "Offer + valid sendtxrcncl reply registers the peer: k0/k1 from
+compute-recon-salt (salts 1,2 — same vector as above), negotiated version 1,
+we-initiate on an outbound connection (Core RegisterPeer SUCCESS)."
+  (let ((bitcoin-lisp:*tx-reconciliation* t)
+        (peer (%recon-test-peer :local-salt 1)))
+    (is-true (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+              peer (%sendtxrcncl-payload 1 2)))
+    (is-true (bitcoin-lisp.networking::peer-recon-registered peer))
+    (is (= 1 (bitcoin-lisp.networking::peer-recon-version peer)))
+    (is (= 6513280882736911012 (bitcoin-lisp.networking::peer-recon-k0 peer)))
+    (is (= 14473150418129592761 (bitcoin-lisp.networking::peer-recon-k1 peer)))
+    (is-true (bitcoin-lisp.networking::peer-recon-we-initiate peer))
+    (is (not (eq :disconnected (bitcoin-lisp.networking:peer-state peer))))))
+
+(test sendtxrcncl-duplicate-disconnects
+  "A second sendtxrcncl on the same connection is a protocol violation
+(Core RegisterPeer ALREADY_REGISTERED => disconnect)."
+  (let ((bitcoin-lisp:*tx-reconciliation* t)
+        (peer (%recon-test-peer)))
+    (is-true (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+              peer (%sendtxrcncl-payload 1 2)))
+    (is-false (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+               peer (%sendtxrcncl-payload 1 3)))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))))
+
+(test sendtxrcncl-from-non-relay-peer-disconnects
+  "sendtxrcncl from a peer whose VERSION had fRelay=0 disconnects
+(net_processing.cpp:3982-3990)."
+  (let ((bitcoin-lisp:*tx-reconciliation* t)
+        (peer (%recon-test-peer :relay nil)))
+    (is-false (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+               peer (%sendtxrcncl-payload 1 2)))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))))
+
+(test sendtxrcncl-on-block-relay-conn-disconnects
+  "sendtxrcncl on a connection where WE indicated no tx relay (block-relay)
+disconnects (Core RejectIncomingTxs, net_processing.cpp:3976-3980)."
+  (let ((bitcoin-lisp:*tx-reconciliation* t)
+        (peer (%recon-test-peer :conn-type :block-relay :local-salt nil)))
+    (is-false (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+               peer (%sendtxrcncl-payload 1 2)))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))))
+
+(test sendtxrcncl-version-zero-disconnects
+  "Version 0 is below the v1 floor: protocol violation => disconnect
+(txreconciliation.cpp:117-119)."
+  (let ((bitcoin-lisp:*tx-reconciliation* t)
+        (peer (%recon-test-peer)))
+    (is-false (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+               peer (%sendtxrcncl-payload 0 2)))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))))
+
+(test sendtxrcncl-higher-version-downgrades
+  "A peer announcing version 2 registers fine at negotiated min(2, 1) = 1
+(txreconciliation.cpp:112-116)."
+  (let ((bitcoin-lisp:*tx-reconciliation* t)
+        (peer (%recon-test-peer)))
+    (is-true (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+              peer (%sendtxrcncl-payload 2 2)))
+    (is-true (bitcoin-lisp.networking::peer-recon-registered peer))
+    (is (= 1 (bitcoin-lisp.networking::peer-recon-version peer)))))
+
+(test sendtxrcncl-unsolicited-ignored
+  "sendtxrcncl when we never offered (no pre-registration) is ignored — no
+registration, no disconnect (Core RegisterPeer NOT_FOUND)."
+  (let ((bitcoin-lisp:*tx-reconciliation* t)
+        (peer (%recon-test-peer :local-salt nil)))
+    (is-true (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+              peer (%sendtxrcncl-payload 1 2)))
+    (is-false (bitcoin-lisp.networking::peer-recon-registered peer))
+    (is (not (eq :disconnected (bitcoin-lisp.networking:peer-state peer))))))
+
+(test sendtxrcncl-forgotten-without-wtxidrelay
+  "At VERACK, a (pre-)registered peer that never negotiated wtxidrelay has
+its reconciliation state forgotten (net_processing.cpp:3879-3886); with
+wtxidrelay negotiated the state survives."
+  (let ((bitcoin-lisp:*tx-reconciliation* t))
+    (let ((peer (%recon-test-peer)))
+      (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+       peer (%sendtxrcncl-payload 1 2))
+      (is-true (bitcoin-lisp.networking::peer-recon-registered peer))
+      ;; wtxidrelay never arrived => forget everything
+      (bitcoin-lisp.networking::%verack-finalize-recon peer)
+      (is-false (bitcoin-lisp.networking::peer-recon-registered peer))
+      (is-false (bitcoin-lisp.networking::peer-recon-k0 peer))
+      (is-false (bitcoin-lisp.networking::peer-recon-local-salt peer)))
+    ;; Offered but never answered: dangling pre-registration salt is dropped.
+    (let ((peer (%recon-test-peer)))
+      (setf (bitcoin-lisp.networking:peer-wtxid-relay peer) t)
+      (bitcoin-lisp.networking::%verack-finalize-recon peer)
+      (is-false (bitcoin-lisp.networking::peer-recon-local-salt peer)))
+    (let ((peer (%recon-test-peer)))
+      (setf (bitcoin-lisp.networking:peer-wtxid-relay peer) t)
+      (bitcoin-lisp.networking::%handle-handshake-sendtxrcncl
+       peer (%sendtxrcncl-payload 1 2))
+      (bitcoin-lisp.networking::%verack-finalize-recon peer)
+      (is-true (bitcoin-lisp.networking::peer-recon-registered peer)))))
+
+(test sendtxrcncl-post-verack-disconnects
+  "Post-verack sendtxrcncl via handle-message is a protocol violation:
+disconnect when -txreconciliation is on (net_processing.cpp:3969-3973);
+ignored when it is off (:3964-3967)."
+  (let ((bitcoin-lisp:*tx-reconciliation* nil)
+        (peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    (is-true (bitcoin-lisp.networking::handle-message
+              peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) nil nil nil))
+    (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))
+  (let ((bitcoin-lisp:*tx-reconciliation* t)
+        (peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    (is-true (bitcoin-lisp.networking::handle-message
+              peer "sendtxrcncl" (%sendtxrcncl-payload 1 2) nil nil nil))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))))
+
+(test txreconciliation-config-flag-wiring
+  "-txreconciliation maps to start-node's :tx-reconciliation keyword like the
+other boolean flags (Core: DEBUG_ONLY, default off)."
+  (multiple-value-bind (plist merged network)
+      (bitcoin-lisp::args->start-node-plist '("-txreconciliation" "-regtest"))
+    (declare (ignore merged))
+    (is (eq :regtest network))
+    (is (eq t (getf plist :tx-reconciliation))))
+  (multiple-value-bind (plist merged network)
+      (bitcoin-lisp::args->start-node-plist '("-regtest"))
+    (declare (ignore merged network))
+    (is (eq nil (getf plist :tx-reconciliation)))))
