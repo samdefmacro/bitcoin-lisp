@@ -89,14 +89,23 @@ Returns a list of IP address strings, ordered so the first N entries
 span as many distinct /16 netgroups as possible (see diversify-by-
 netgroup). The caller iterates this list and connects to the first
 peers that succeed; round-robin ordering prevents a single operator's
-DNS-clustered nodes from monopolizing our 8-peer outbound budget."
-  (let ((addresses '()))
-    (dolist (seed seeds)
-      (let ((resolved (resolve-dns-seed seed)))
-        (when resolved
-          (setf addresses (nconc addresses resolved)))))
-    (diversify-by-netgroup
-     (remove-duplicates addresses :test #'string=))))
+DNS-clustered nodes from monopolizing our 8-peer outbound budget.
+
+When a SOCKS5 proxy is configured (*proxy*), seeds are NOT resolved locally
+— that would leak DNS queries outside the tunnel. Instead each seed HOSTNAME
+is returned as a dial target itself: make-tcp-connection passes it through
+the proxy in the SOCKS5 CONNECT (ATYP DOMAINNAME), and the proxy resolves it.
+Mirrors Bitcoin Core's proxy-mode seed handling, where seeds become one-shot
+AddAddrFetch peer dials instead of getaddrinfo lookups (net.cpp:2353-2358)."
+  (if *proxy*
+      (copy-list seeds)
+      (let ((addresses '()))
+        (dolist (seed seeds)
+          (let ((resolved (resolve-dns-seed seed)))
+            (when resolved
+              (setf addresses (nconc addresses resolved)))))
+        (diversify-by-netgroup
+         (remove-duplicates addresses :test #'string=)))))
 
 ;;; Message handling
 
@@ -203,6 +212,18 @@ Returns T if message was handled, NIL otherwise."
 
     ((string= command "wtxidrelay")
      ;; BIP 339: No-op post-handshake (only meaningful during handshake)
+     t)
+
+    ((string= command "sendtxrcncl")
+     ;; BIP 330: feature negotiation is only valid between VERSION and VERACK
+     ;; (handled in %await-verack). Receiving it here — post-verack — is a
+     ;; protocol violation: Core disconnects (net_processing.cpp:3969-3973),
+     ;; unlike the sendaddrv2/wtxidrelay no-op stubs above. With
+     ;; -txreconciliation off, Core ignores the message instead (:3964-3967).
+     (when bitcoin-lisp:*tx-reconciliation*
+       (bitcoin-lisp:log-cat "net" "sendtxrcncl received after verack — disconnecting peer ~A"
+                             (peer-address peer))
+       (disconnect-peer peer))
      t)
 
     ((string= command "sendheaders")

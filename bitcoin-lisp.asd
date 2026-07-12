@@ -77,7 +77,8 @@
                   :components ((:file "assembler")
                                (:file "builder")))
                  (:module "networking"
-                  :components ((:file "connection")
+                  :components ((:file "socks5")     ; before connection: make-tcp-connection tunnels through *proxy*
+                               (:file "connection")
                                (:file "v2-transport")
                                (:file "peer")
                                (:file "peerdb")
@@ -194,6 +195,8 @@
                              (:file "headers-sync-tests")
                              ;; bitcoin.conf + CLI argument parsing
                              (:file "config-tests")
+                             ;; SOCKS5 outbound proxy (-proxy) client
+                             (:file "socks5-tests")
                              ;; TxOutCompression + hash_serialized_3
                              (:file "compressor-tests"))))
   :perform (test-op (op c)

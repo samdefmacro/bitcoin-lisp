@@ -94,6 +94,12 @@ unaffected; this only gates mempool standardness.")
 filter messages (getcfilters/getcfheaders/getcfcheckpt) and advertise
 NODE_COMPACT_FILTERS (Bitcoin Core -peerblockfilters, default false).")
 
+(defvar *tx-reconciliation* nil
+  "When true, negotiate BIP330 transaction reconciliation (Erlay) support via
+the sendtxrcncl handshake (Bitcoin Core -txreconciliation, DEBUG_ONLY, default
+false — net_processing.h:41, init.cpp:574). At Core ref d3056bc only the
+handshake + per-peer salt storage exist (no sketch exchange); we match that.")
+
 (defvar *permit-bare-multisig* t
   "Mempool policy: treat bare (non-P2SH) multisig outputs as standard
 (Bitcoin Core -permitbaremultisig, DEFAULT_PERMIT_BAREMULTISIG = true in Core).
@@ -258,6 +264,42 @@ are false; anything else is true (matching Core's lenient -flag semantics)."
           ((member v '("error" "none") :test #'string=) :error)
           (t (error "Invalid loglevel: ~S (want debug/info/warn/error)" value)))))
 
+(defconstant +default-proxy-port+ 9050
+  "Default SOCKS5 proxy port when -proxy/-onion gives no :port (Tor's SOCKS
+port; Bitcoin Core init.cpp:1721 Lookup(..., 9050, ...)).")
+
+(defun conf-parse-proxy (value)
+  "Parse a -proxy/-onion VALUE \"ip[:port]\" into (values host port), with
+PORT defaulting to 9050. Returns NIL for \"0\" or the empty string — Core's
+-noproxy / -proxy=0 'remove the proxy' convention (init.cpp:1700-1704).
+Accepts \"[ipv6]:port\" / \"[ipv6]\"; a trailing :port is only honored when it
+is all digits after a single colon, so a bare IPv6 address is host-only
+(same splitting rules as parse-node-endpoint, node.lisp)."
+  (let ((v (string-trim '(#\Space #\Tab) value)))
+    (cond
+      ((or (zerop (length v)) (string= v "0")) nil)
+      ;; [ipv6]:port or [ipv6]
+      ((char= (char v 0) #\[)
+       (let ((close (position #\] v)))
+         (if (null close)
+             (values v +default-proxy-port+)
+             (let ((host (subseq v 1 close))
+                   (rest (subseq v (1+ close))))
+               (if (and (plusp (length rest)) (char= (char rest 0) #\:)
+                        (plusp (length (subseq rest 1)))
+                        (every #'digit-char-p (subseq rest 1)))
+                   (values host (parse-integer rest :start 1))
+                   (values host +default-proxy-port+))))))
+      (t
+       (let ((colon (position #\: v :from-end t)))
+         (if (and colon
+                  (< (1+ colon) (length v))
+                  (every #'digit-char-p (subseq v (1+ colon)))
+                  ;; A single colon => host:port; multiple => bare IPv6.
+                  (= colon (position #\: v)))
+             (values (subseq v 0 colon) (parse-integer v :start (1+ colon)))
+             (values v +default-proxy-port+)))))))
+
 (defun conf-section-name (network)
   "The bitcoin.conf [section] header that scopes options to NETWORK."
   (ecase network
@@ -360,6 +402,7 @@ signet|regtest, else returns DEFAULT."
     ("reindex-chainstate" :reindex-chainstate :bool)
     ("forcecompactdb"    :force-compact-db   :bool)
     ("peerblockfilters"  :peer-block-filters :bool)
+    ("txreconciliation"  :tx-reconciliation  :bool)
     ("logfile"           :log-file           :string)
     ("loglevel"          :log-level          :loglevel)
     ("sync"              :sync               :bool))
@@ -393,15 +436,26 @@ resolved network. Honors -server (enable RPC on the default port when no
       (let ((server (lookup "server")))
         (when (and server (conf-parse-bool (cdr server))
                    (not (getf plist :rpc-port)))
-          (setf (getf plist :rpc-port) (network-rpc-port network)))))
+          (setf (getf plist :rpc-port) (network-rpc-port network))))
+      ;; -proxy soft-disables listening, to protect privacy (Bitcoin Core
+      ;; init.cpp:786-790: SoftSetBoolArg("-listen", false)). Soft = only when
+      ;; the user gave no explicit -listen; same only-if-unset pattern as
+      ;; -server/-debug above. -proxy=0 (a cleared proxy) does not trigger it.
+      (let ((proxy (lookup "proxy")))
+        (when (and proxy
+                   (conf-parse-proxy (cdr proxy))
+                   (not (lookup "listen")))
+          (setf (getf plist :listen) nil))))
     plist))
 
 (defun apply-config-globals (merged)
   "Set the process-global policy/consensus config specials from the MERGED config
 alist. These options have no start-node keyword because they configure global
-specials directly: -datacarrier, -datacarriersize, -permitbaremultisig, and
--signetchallenge (a custom signet block-challenge). CLI-over-file precedence is
-already applied in MERGED. Called at startup by start-node-from-args."
+specials directly: -datacarrier, -datacarriersize, -permitbaremultisig,
+-signetchallenge (a custom signet block-challenge), and the SOCKS5 proxy
+options -proxy/-onion/-proxyrandomize (networking's *proxy*/*onion-proxy*).
+CLI-over-file precedence is already applied in MERGED. Called at startup by
+start-node-from-args."
   (flet ((lk (k) (let ((c (assoc k merged :test #'string=))) (and c (cdr c)))))
     (let ((v (lk "datacarrier")))
       (when v (setf *accept-datacarrier* (conf-parse-bool v))))
@@ -411,7 +465,32 @@ already applied in MERGED. Called at startup by start-node-from-args."
       (when v (setf *permit-bare-multisig* (conf-parse-bool v))))
     (let ((v (lk "signetchallenge")))
       (when v (setf bitcoin-lisp.validation:*signet-challenge*
-                    (bitcoin-lisp.crypto:hex-to-bytes v))))))
+                    (bitcoin-lisp.crypto:hex-to-bytes v))))
+    ;; -proxy: run ALL outbound P2P connections through a SOCKS5 proxy
+    ;; (Bitcoin Core init.cpp:1698-1762 sets it for every network).
+    ;; -noproxy / -proxy=0 clears it. -proxyrandomize (default on) enables
+    ;; Tor stream-isolation credentials (init.cpp:1698, netbase.cpp:748-810).
+    ;; -onion overrides the proxy for reaching onion services, defaulting to
+    ;; -proxy (init.cpp:1764-1790); stored for P1+, nothing dials .onion yet.
+    (let ((randomize (let ((v (lk "proxyrandomize")))
+                       (if v (conf-parse-bool v) t))))
+      (flet ((parse-proxy (value)
+               (multiple-value-bind (host port) (conf-parse-proxy value)
+                 (when host
+                   (bitcoin-lisp.networking:make-proxy
+                    :host host :port port
+                    :randomize-credentials randomize)))))
+        (let ((v (lk "proxy")))
+          (when v
+            (setf bitcoin-lisp.networking:*proxy* (parse-proxy v))))
+        (let ((v (lk "onion")))
+          (cond (v (setf bitcoin-lisp.networking:*onion-proxy* (parse-proxy v)))
+                ;; No -onion: onion reachability follows -proxy when one was
+                ;; given (Core init.cpp:1764 "An empty string is used to not
+                ;; override the onion proxy").
+                ((lk "proxy")
+                 (setf bitcoin-lisp.networking:*onion-proxy*
+                       bitcoin-lisp.networking:*proxy*))))))))
 
 (defun args->start-node-plist (args &optional conf-text)
   "Pure assembly of a start-node keyword plist from Bitcoin Core-style CLI ARGS
