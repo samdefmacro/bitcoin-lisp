@@ -65,12 +65,35 @@ Mirrors Bitcoin Core net.cpp:1794."
 
 (defun make-tcp-connection (host port &key (timeout 10))
   "Create a TCP connection to HOST:PORT.
-Returns a connection structure or NIL on failure."
+Returns a connection structure or NIL on failure.
+
+When a SOCKS5 proxy is configured (*proxy*, socks5.lisp), the TCP dial goes to
+the proxy instead and a SOCKS5 CONNECT tunnels to HOST:PORT — ATYP DOMAINNAME
+always, so the proxy (never local DNS) resolves names. With randomized
+credentials (-proxyrandomize), each connection gets fresh single-use
+username/password so Tor isolates it on its own circuit. Mirrors Bitcoin
+Core's ConnectThroughProxy (netbase.cpp:786-810; connect path net.cpp:439-459).
+The returned connection records the TARGET host/port, so callers (including
+the v1-fallback re-dial in peer.lisp) re-dial through the proxy transparently."
   (handler-case
-      (let ((socket (usocket:socket-connect host port
-                                            :element-type '(unsigned-byte 8)
-                                            :timeout timeout)))
+      (let* ((proxy *proxy*)
+             (socket (usocket:socket-connect (if proxy (proxy-host proxy) host)
+                                             (if proxy (proxy-port proxy) port)
+                                             :element-type '(unsigned-byte 8)
+                                             :timeout timeout)))
         (set-tcp-nodelay socket)
+        (when proxy
+          (handler-case
+              (if (proxy-randomize-credentials proxy)
+                  (let ((credentials (next-proxy-credentials)))
+                    (socks5-connect socket host port
+                                    :username credentials :password credentials))
+                  (socks5-connect socket host port))
+            (error (e)
+              (bitcoin-lisp:log-debug "SOCKS5 connect to ~A:~D via ~A:~D failed: ~A"
+                                      host port (proxy-host proxy) (proxy-port proxy) e)
+              (ignore-errors (usocket:socket-close socket))
+              (return-from make-tcp-connection nil))))
         (make-connection :socket socket
                          :host host
                          :port port
