@@ -282,6 +282,59 @@ TxOutCompression): VARINT(compressed amount) + compressed script."
   (let ((value (decompress-amount (br-read-core-varint br))))
     (values value (br-read-compressed-script br))))
 
+;;;; Stream read variants
+;;;;
+;;;; Assumeutxo snapshot files are multi-GB and streamed from disk, so
+;;;; the readers below consume CL binary streams directly instead of a
+;;;; fully materialized byte-reader. Byte-exact mirrors of the br-
+;;;; functions above.
+
+(defun read-core-varint (stream)
+  "Stream variant of br-read-core-varint (serialize.h:442-462 ReadVarInt)."
+  (let ((n 0))
+    (loop
+      (let ((b (read-byte stream)))
+        (when (> n (ash #xFFFFFFFFFFFFFFFF -7))
+          (error "ReadVarInt(): size too large"))
+        (setf n (logior (ash n 7) (logand b #x7F)))
+        (if (logtest b #x80)
+            (progn
+              (when (= n #xFFFFFFFFFFFFFFFF)
+                (error "ReadVarInt(): size too large"))
+              (incf n))
+            (return n))))))
+
+(defun read-compressed-script (stream)
+  "Stream variant of br-read-compressed-script (compressor.h:76-95
+ScriptCompression::Unser)."
+  (let ((n (read-core-varint stream)))
+    (if (< n +special-scripts+)
+        (let* ((payload (read-bytes stream (special-script-size n)))
+               (script (decompress-script n payload)))
+          (or script
+              (error "read-compressed-script: invalid special script (id ~D)" n)))
+        (let ((size (- n +special-scripts+)))
+          (if (> size +compress-max-script-size+)
+              ;; Overly long script: skip its bytes and replace with a
+              ;; short invalid one (compressor.h:87-90).
+              (let ((chunk (make-array (min size 65536)
+                                       :element-type '(unsigned-byte 8))))
+                (loop with remaining = size
+                      while (plusp remaining)
+                      do (let ((got (read-sequence chunk stream
+                                                   :end (min remaining (length chunk)))))
+                           (when (zerop got)
+                             (error "read-compressed-script: unexpected end of input"))
+                           (decf remaining got)))
+                (make-array 1 :element-type '(unsigned-byte 8)
+                              :initial-element #x6a)) ; OP_RETURN
+              (read-bytes stream size))))))
+
+(defun read-compressed-tx-out (stream)
+  "Stream variant of br-read-compressed-tx-out. Returns (values value script)."
+  (let ((value (decompress-amount (read-core-varint stream))))
+    (values value (read-compressed-script stream))))
+
 ;;;; Per-output Coin record (coins.h:63-79)
 ;;;;
 ;;;; The chainstate/undo/snapshot per-output serialization:
@@ -300,4 +353,11 @@ VARINT(height*2 + coinbase) then the compressed TxOut."
 Returns (values height coinbase-p value script)."
   (let ((code (br-read-core-varint br)))
     (multiple-value-bind (value script) (br-read-compressed-tx-out br)
+      (values (ash code -1) (logtest code 1) value script))))
+
+(defun read-compressed-coin (stream)
+  "Stream variant of br-read-compressed-coin.
+Returns (values height coinbase-p value script)."
+  (let ((code (read-core-varint stream)))
+    (multiple-value-bind (value script) (read-compressed-tx-out stream)
       (values (ash code -1) (logtest code 1) value script))))
