@@ -1,0 +1,935 @@
+(in-package #:bitcoin-lisp.tests)
+
+;;;; TxGraph tests
+;;;;
+;;;; Validates src/mempool/txgraph.lisp against the contract of Bitcoin
+;;;; Core src/txgraph.{h,cpp}: cluster registry semantics, the mining-order
+;;;; comparator (chunk feerate desc, equal-feerate prefix size, fallback
+;;;; order, linearization position; txgraph.cpp:492-524), the block builder,
+;;;; worst-chunk eviction, oversized handling, and Trim. Unit tests cover
+;;;; every API function on hand-built shapes; randomized property tests
+;;;; check the whole engine against a brute-force closure model (the same
+;;;; ancestor/descendant-closure semantics as DepGraph, so a removed
+;;;; middleman keeps grandparents connected), reusing the seeded xorshift64
+;;;; PRNG from cluster-linearize-tests (%cl-make-rng).
+
+(def-suite :txgraph-tests
+  :description "TxGraph engine vs Core txgraph.{h,cpp}"
+  :in :bitcoin-lisp-tests)
+
+(in-suite :txgraph-tests)
+
+;;;; Shorthands
+
+(defun %tg-new (&rest args) (apply #'bitcoin-lisp.mempool:make-txgraph args))
+(defun %tg-add (g fee size) (bitcoin-lisp.mempool:txgraph-add-transaction g fee size))
+(defun %tg-dep (g p c) (bitcoin-lisp.mempool:txgraph-add-dependency g p c))
+(defun %tg-rm (g h) (bitcoin-lisp.mempool:txgraph-remove-transaction g h))
+(defun %tg-setfee (g h fee) (bitcoin-lisp.mempool:txgraph-set-transaction-fee g h fee))
+(defun %tg-exists (g h) (bitcoin-lisp.mempool:txgraph-exists-p g h))
+(defun %tg-count (g) (bitcoin-lisp.mempool:txgraph-tx-count g))
+(defun %tg-oversized (g) (bitcoin-lisp.mempool:txgraph-oversized-p g))
+(defun %tg-feerate (g h) (bitcoin-lisp.mempool:txgraph-get-individual-feerate g h))
+(defun %tg-chunk-feerate (g h) (bitcoin-lisp.mempool:txgraph-get-main-chunk-feerate g h))
+(defun %tg-cluster (g h) (bitcoin-lisp.mempool:txgraph-get-cluster g h))
+(defun %tg-anc (g h) (bitcoin-lisp.mempool:txgraph-get-ancestors g h))
+(defun %tg-desc (g h) (bitcoin-lisp.mempool:txgraph-get-descendants g h))
+(defun %tg-anc-union (g hs) (bitcoin-lisp.mempool:txgraph-get-ancestors-union g hs))
+(defun %tg-desc-union (g hs) (bitcoin-lisp.mempool:txgraph-get-descendants-union g hs))
+(defun %tg-cmp (g a b) (bitcoin-lisp.mempool:txgraph-compare-main-order g a b))
+(defun %tg-distinct (g hs) (bitcoin-lisp.mempool:txgraph-count-distinct-clusters g hs))
+(defun %tg-worst (g) (bitcoin-lisp.mempool:txgraph-get-worst-main-chunk g))
+(defun %tg-trim (g) (bitcoin-lisp.mempool:txgraph-trim g))
+(defun %tg-sane (g) (bitcoin-lisp.mempool:txgraph-sanity-check g))
+(defun %tg-id (h) (bitcoin-lisp.mempool:tx-handle-id h))
+(defun %tg-ids (handles) (sort (mapcar #'%tg-id handles) #'<))
+(defun %tg-ff= (f fee size)
+  (bitcoin-lisp.mempool:feefrac= f (bitcoin-lisp.mempool:make-feefrac fee size)))
+(defun %tg-empty-ff-p (f) (bitcoin-lisp.mempool:feefrac-empty-p f))
+
+(defun %tg-chunks (g)
+  "The full mining-order chunk walk (include everything) as a list of
+(handles . feerate)."
+  (let ((builder (bitcoin-lisp.mempool:make-block-builder g))
+        (out '()))
+    (unwind-protect
+         (loop (multiple-value-bind (txs feerate)
+                   (bitcoin-lisp.mempool:block-builder-current-chunk builder)
+                 (unless txs (return))
+                 (push (cons txs feerate) out)
+                 (bitcoin-lisp.mempool:block-builder-include builder)))
+      (bitcoin-lisp.mempool:block-builder-finish builder))
+    (nreverse out)))
+
+;;;; Brute-force model
+;;;;
+;;;; Transactions are indexed by creation order; ancestor/descendant sets
+;;;; are integer bitsets over those indices, maintained with the same
+;;;; closure-update rules as DepGraph (add-dependency merges full closures;
+;;;; removal masks the removed bit everywhere, preserving links bridged by
+;;;; the removed transaction). Connectivity is closure-based, exactly like
+;;;; depgraph-connected-component.
+
+(defstruct (%tgm-tx (:constructor %make-tgm-tx (handle fee size anc desc)))
+  handle fee size anc desc (live t))
+
+(defun %tgm-add (model fee size handle)
+  (let ((i (length model)))
+    (vector-push-extend (%make-tgm-tx handle fee size (ash 1 i) (ash 1 i)) model)
+    i))
+
+(defun %tgm-dep (model p c)
+  "Closure update for a new dependency P -> C (both live)."
+  (let ((tp (aref model p))
+        (tc (aref model c)))
+    (unless (logbitp p (%tgm-tx-anc tc))     ; already an ancestor: no-op
+      (let ((par-anc (%tgm-tx-anc tp))
+            (chl-desc (%tgm-tx-desc tc)))
+        (dotimes (i (length model))
+          (let ((tx (aref model i)))
+            (when (%tgm-tx-live tx)
+              (when (logbitp i chl-desc)
+                (setf (%tgm-tx-anc tx) (logior (%tgm-tx-anc tx) par-anc)))
+              (when (logbitp i par-anc)
+                (setf (%tgm-tx-desc tx) (logior (%tgm-tx-desc tx) chl-desc))))))))))
+
+(defun %tgm-rm (model i)
+  (setf (%tgm-tx-live (aref model i)) nil)
+  (dotimes (j (length model))
+    (let ((tx (aref model j)))
+      (setf (%tgm-tx-anc tx) (logandc2 (%tgm-tx-anc tx) (ash 1 i))
+            (%tgm-tx-desc tx) (logandc2 (%tgm-tx-desc tx) (ash 1 i))))))
+
+(defun %tgm-component (model i)
+  "Connected component (bitset) of live tx I via ancestor/descendant closures."
+  (let ((ret 0)
+        (to-add (ash 1 i)))
+    (loop
+      (let ((old ret))
+        (bitcoin-lisp.mempool:do-bits (j to-add)
+          (let ((tx (aref model j)))
+            (setf ret (logior ret (%tgm-tx-anc tx) (%tgm-tx-desc tx)))))
+        (setf to-add (logandc2 ret old))
+        (when (zerop to-add) (return ret))))))
+
+(defun %tgm-components (model)
+  "All live components as a list of bitsets."
+  (let ((seen 0)
+        (out '()))
+    (dotimes (i (length model))
+      (when (and (%tgm-tx-live (aref model i)) (not (logbitp i seen)))
+        (let ((comp (%tgm-component model i)))
+          (setf seen (logior seen comp))
+          (push comp out))))
+    out))
+
+(defun %tgm-set-ids (model bits)
+  "Sorted handle ids for the model indices in bitset BITS."
+  (let ((ids '()))
+    (bitcoin-lisp.mempool:do-bits (i bits)
+      (push (%tg-id (%tgm-tx-handle (aref model i))) ids))
+    (sort ids #'<)))
+
+(defun %tgm-comp-stats (model comp)
+  "(values tx-count total-size) of component bitset COMP."
+  (let ((count 0) (size 0))
+    (bitcoin-lisp.mempool:do-bits (i comp)
+      (incf count)
+      (incf size (%tgm-tx-size (aref model i))))
+    (values count size)))
+
+(defun %tgm-oversized-p (model max-count max-size)
+  "Model prediction of TXGRAPH-OVERSIZED-P: some live component (with all
+dependencies applied, pending or not) exceeds the limits, or a single live
+transaction alone exceeds the size limit."
+  (or (loop for i from 0 below (length model)
+              thereis (let ((tx (aref model i)))
+                        (and (%tgm-tx-live tx) (> (%tgm-tx-size tx) max-size))))
+      (loop for comp in (%tgm-components model)
+              thereis (multiple-value-bind (count size) (%tgm-comp-stats model comp)
+                        (or (> count max-count) (> size max-size))))))
+
+(defun %tg-verify-model (g model idx-of rng)
+  "Full equivalence check of graph G against the closure model (only valid
+when G is not oversized)."
+  (is-false (%tg-oversized g))
+  (is-true (%tg-sane g))
+  (let ((live-bits 0))
+    (dotimes (i (length model))
+      (when (%tgm-tx-live (aref model i)) (setf live-bits (logior live-bits (ash 1 i)))))
+    (is (= (logcount live-bits) (%tg-count g)))
+    ;; Per-transaction queries.
+    (dotimes (i (length model))
+      (let* ((tx (aref model i))
+             (h (%tgm-tx-handle tx)))
+        (is (eq (not (null (%tgm-tx-live tx))) (not (null (%tg-exists g h)))))
+        (cond ((%tgm-tx-live tx)
+               (is (%tg-ff= (%tg-feerate g h) (%tgm-tx-fee tx) (%tgm-tx-size tx)))
+               (is (equal (%tgm-set-ids model (%tgm-tx-anc tx)) (%tg-ids (%tg-anc g h))))
+               (is (equal (%tgm-set-ids model (%tgm-tx-desc tx)) (%tg-ids (%tg-desc g h))))
+               (is (equal (%tgm-set-ids model (%tgm-component model i))
+                          (%tg-ids (%tg-cluster g h)))))
+              (t
+               (is (%tg-empty-ff-p (%tg-feerate g h)))
+               (is (null (%tg-cluster g h)))
+               (is (null (%tg-anc g h)))))))
+    ;; Union queries on a random subset (removed handles must be ignored).
+    (let ((subset (loop for i from 0 below (length model)
+                        when (< (funcall rng 100) 40)
+                          collect (%tgm-tx-handle (aref model i))))
+          (anc-bits 0)
+          (desc-bits 0))
+      (dolist (h subset)
+        (let ((i (gethash h idx-of)))
+          (when (%tgm-tx-live (aref model i))
+            (setf anc-bits (logior anc-bits (%tgm-tx-anc (aref model i)))
+                  desc-bits (logior desc-bits (%tgm-tx-desc (aref model i)))))))
+      (is (equal (%tgm-set-ids model anc-bits) (%tg-ids (%tg-anc-union g subset))))
+      (is (equal (%tgm-set-ids model desc-bits) (%tg-ids (%tg-desc-union g subset))))
+      ;; Distinct-cluster count over the same subset.
+      (let ((comps '()))
+        (dolist (h subset)
+          (let ((i (gethash h idx-of)))
+            (when (%tgm-tx-live (aref model i))
+              (pushnew (%tgm-component model i) comps :test #'=))))
+        (is (= (length comps) (%tg-distinct g subset)))))
+    ;; Chunk walk: coverage, feerates, global order, per-cluster
+    ;; concatenation, worst chunk, comparator, chunk-feerate query.
+    (let ((chunks (%tg-chunks g)))
+      (let ((all (loop for (txs . nil) in chunks append txs)))
+        (is (equal (%tgm-set-ids model live-bits) (%tg-ids all)))
+        ;; Chunk feerate = sum of member fees/sizes.
+        (loop for (txs . feerate) in chunks
+              do (let ((fee 0) (size 0))
+                   (dolist (h txs)
+                     (let ((tx (aref model (gethash h idx-of))))
+                       (incf fee (%tgm-tx-fee tx))
+                       (incf size (%tgm-tx-size tx))))
+                   (is (%tg-ff= feerate fee size))))
+        ;; Chunk feerates are globally non-increasing (Core SanityCheck,
+        ;; txgraph.cpp:3100-3109).
+        (loop for ((nil . fa) (nil . fb)) on chunks
+              while fb
+              do (is-false (bitcoin-lisp.mempool:feefrac>> fb fa)))
+        ;; Concatenating a cluster's chunks in emitted order must equal its
+        ;; GetCluster (linearization) order.
+        (let ((by-comp (make-hash-table :test 'eql)))
+          (loop for (txs . nil) in chunks
+                do (dolist (h txs)
+                     (push h (gethash (%tgm-component model (gethash h idx-of))
+                                      by-comp))))
+          (loop for rev being the hash-values of by-comp
+                do (let ((in-order (reverse rev)))
+                     (is (equal in-order (%tg-cluster g (first in-order)))))))
+        ;; Worst chunk = last chunk, in reverse order.
+        (multiple-value-bind (worst wf) (%tg-worst g)
+          (if chunks
+              (let ((last-chunk (car (last chunks))))
+                (is (equal worst (reverse (car last-chunk))))
+                (is (bitcoin-lisp.mempool:feefrac= wf (cdr last-chunk))))
+              (progn (is (null worst))
+                     (is (%tg-empty-ff-p wf)))))
+        ;; CompareMainOrder agrees with the emitted per-transaction order
+        ;; and is antisymmetric; GetMainChunkFeerate agrees with the walk.
+        (when all
+          (let ((order (make-hash-table :test 'eq))
+                (k 0)
+                (v (coerce all 'vector)))
+            (dolist (h all) (setf (gethash h order) (incf k)))
+            (dotimes (s 20)
+              (let ((a (aref v (funcall rng (length v))))
+                    (b (aref v (funcall rng (length v)))))
+                (is (= (%tg-cmp g a b)
+                       (signum (- (gethash a order) (gethash b order)))))
+                (is (= (%tg-cmp g a b) (- (%tg-cmp g b a)))))))
+          (loop for (txs . feerate) in chunks
+                do (dolist (h txs)
+                     (is (bitcoin-lisp.mempool:feefrac= (%tg-chunk-feerate g h) feerate)))))))))
+
+;;;; Unit tests: basics
+
+(test txgraph-constants
+  "Cluster limits are Core-exact (txgraph.h:18, policy 101 kvB)."
+  (is (= 64 bitcoin-lisp.mempool:+max-cluster-count+))
+  (is (= 101000 bitcoin-lisp.mempool:+max-cluster-size+)))
+
+(test txgraph-empty-graph
+  (let ((g (%tg-new)))
+    (is (= 0 (%tg-count g)))
+    (is-false (%tg-oversized g))
+    (is-true (%tg-sane g))
+    (multiple-value-bind (worst wf) (%tg-worst g)
+      (is (null worst))
+      (is (%tg-empty-ff-p wf)))
+    (is (null (%tg-anc-union g '())))
+    (is (= 0 (%tg-distinct g '())))
+    (let ((b (bitcoin-lisp.mempool:make-block-builder g)))
+      (is (null (bitcoin-lisp.mempool:block-builder-current-chunk b)))
+      (bitcoin-lisp.mempool:block-builder-finish b))))
+
+(test txgraph-add-exists-remove
+  "AddTransaction / Exists / RemoveTransaction basics; removal is a no-op
+the second time (Core txgraph.cpp:2262-2266)."
+  (let* ((g (%tg-new))
+         (a (%tg-add g 100 10))
+         (b (%tg-add g -50 20)))         ; negative fees are legal
+    (is (= 2 (%tg-count g)))
+    (is-true (%tg-exists g a))
+    (is-true (%tg-exists g b))
+    (is (%tg-ff= (%tg-feerate g a) 100 10))
+    (is (%tg-ff= (%tg-feerate g b) -50 20))
+    ;; Distinct ids, in creation order.
+    (is (< (%tg-id a) (%tg-id b)))
+    (%tg-rm g a)
+    (is-false (%tg-exists g a))
+    (is (= 1 (%tg-count g)))
+    (is (%tg-empty-ff-p (%tg-feerate g a)))
+    (is (%tg-empty-ff-p (%tg-chunk-feerate g a)))
+    (is (null (%tg-cluster g a)))
+    (is (null (%tg-anc g a)))
+    (is (null (%tg-desc g a)))
+    (%tg-rm g a)                          ; no-op
+    (is (= 1 (%tg-count g)))
+    (is-true (%tg-sane g))))
+
+(test txgraph-handle-of-other-graph-rejected
+  (let* ((g1 (%tg-new))
+         (g2 (%tg-new))
+         (h (%tg-add g1 1 1)))
+    (signals error (%tg-rm g2 h))
+    (signals error (%tg-feerate g2 h))))
+
+(test txgraph-cpfp-chunk
+  "A high-feerate child is chunked with its low-feerate parent; both report
+the combined chunk feerate (CPFP)."
+  (let* ((g (%tg-new))
+         (parent (%tg-add g 100 1000))
+         (child (%tg-add g 4900 1000)))
+    (%tg-dep g parent child)
+    (is (= 1 (%tg-distinct g (list parent child))))
+    (is (equal (list parent child) (%tg-cluster g parent)))
+    (is (%tg-ff= (%tg-chunk-feerate g parent) 5000 2000))
+    (is (%tg-ff= (%tg-chunk-feerate g child) 5000 2000))
+    ;; Individual feerates are unchanged.
+    (is (%tg-ff= (%tg-feerate g parent) 100 1000))
+    ;; One chunk, in topological order; worst chunk is it, reversed.
+    (let ((chunks (%tg-chunks g)))
+      (is (= 1 (length chunks)))
+      (is (equal (list parent child) (car (first chunks)))))
+    (multiple-value-bind (worst wf) (%tg-worst g)
+      (is (equal (list child parent) worst))
+      (is (%tg-ff= wf 5000 2000)))
+    (is-true (%tg-sane g))))
+
+(test txgraph-diamond-closures
+  "Ancestors/descendants across a diamond: d spends b and c; b and c spend a."
+  (let* ((g (%tg-new))
+         (a (%tg-add g 1 1)) (b (%tg-add g 2 1))
+         (c (%tg-add g 3 1)) (d (%tg-add g 4 1)))
+    (%tg-dep g a b)
+    (%tg-dep g a c)
+    (%tg-dep g b d)
+    (%tg-dep g c d)
+    (is (equal (%tg-ids (list a)) (%tg-ids (%tg-anc g a))))
+    (is (equal (%tg-ids (list a b)) (%tg-ids (%tg-anc g b))))
+    (is (equal (%tg-ids (list a c)) (%tg-ids (%tg-anc g c))))
+    (is (equal (%tg-ids (list a b c d)) (%tg-ids (%tg-anc g d))))
+    (is (equal (%tg-ids (list a b c d)) (%tg-ids (%tg-desc g a))))
+    (is (equal (%tg-ids (list b d)) (%tg-ids (%tg-desc g b))))
+    (is (equal (%tg-ids (list d)) (%tg-ids (%tg-desc g d))))
+    ;; Redundant dependency (a -> d) is a no-op.
+    (%tg-dep g a d)
+    (is (equal (%tg-ids (list a b c d)) (%tg-ids (%tg-anc g d))))
+    ;; Unions.
+    (is (equal (%tg-ids (list a b c)) (%tg-ids (%tg-anc-union g (list b c)))))
+    (is (equal (%tg-ids (list b c d)) (%tg-ids (%tg-desc-union g (list b c)))))
+    ;; Duplicates and removed handles in union inputs are handled.
+    (is (equal (%tg-ids (list a b)) (%tg-ids (%tg-anc-union g (list b b)))))
+    (is-true (%tg-sane g))))
+
+(test txgraph-add-dependency-noops-and-cycle
+  (let* ((g (%tg-new))
+         (a (%tg-add g 1 1))
+         (b (%tg-add g 2 1))
+         (r (%tg-add g 3 1)))
+    (%tg-dep g a a)                       ; self: no-op
+    (is (= 3 (%tg-distinct g (list a b r))))
+    (%tg-rm g r)
+    (%tg-dep g r a)                       ; removed parent: no-op
+    (%tg-dep g a r)                       ; removed child: no-op
+    (is (equal (%tg-ids (list a)) (%tg-ids (%tg-anc g a))))
+    (%tg-dep g a b)
+    ;; Making b a parent of a would create a cycle (a is b's ancestor).
+    (signals error (%tg-dep g b a))
+    (is-true (%tg-sane g))))
+
+(test txgraph-merge-and-split
+  "add-dependency merges clusters; removal splits them into components; a
+removed middleman keeps grandparents connected (closure semantics)."
+  (let* ((g (%tg-new))
+         (a (%tg-add g 1 1)) (b (%tg-add g 2 1))
+         (x (%tg-add g 3 1)) (y (%tg-add g 4 1)))
+    (%tg-dep g a b)
+    (%tg-dep g x y)
+    (is (= 2 (%tg-distinct g (list a b x y))))
+    ;; Merge the two clusters.
+    (%tg-dep g b x)
+    (is (= 1 (%tg-distinct g (list a b x y))))
+    (is (equal (%tg-ids (list a b x y)) (%tg-ids (%tg-cluster g a))))
+    (is (equal (%tg-ids (list a b x)) (%tg-ids (%tg-anc g x))))
+    (is-true (%tg-sane g))
+    ;; Removing the middleman b does NOT split: x stays connected to a
+    ;; through the masked closure (grandparent relation survives).
+    (%tg-rm g b)
+    (is (equal (%tg-ids (list a x y)) (%tg-ids (%tg-cluster g a))))
+    (is (equal (%tg-ids (list a x)) (%tg-ids (%tg-anc g x))))
+    (is (equal (%tg-ids (list a x y)) (%tg-ids (%tg-desc g a))))
+    (is-true (%tg-sane g))
+    ;; Removing x, too, still does not split: transitive ancestry survives
+    ;; any number of removed middlemen (a is still y's ancestor).
+    (%tg-rm g x)
+    (is (= 1 (%tg-distinct g (list a y))))
+    (is (equal (%tg-ids (list a y)) (%tg-ids (%tg-cluster g a))))
+    (is (equal (%tg-ids (list a y)) (%tg-ids (%tg-anc g y))))
+    (is-true (%tg-sane g))))
+
+(test txgraph-true-split-on-removal
+  "Removing a parent with two independent children yields two clusters."
+  (let* ((g (%tg-new))
+         (p (%tg-add g 1 1))
+         (c1 (%tg-add g 2 1))
+         (c2 (%tg-add g 3 1)))
+    (%tg-dep g p c1)
+    (%tg-dep g p c2)
+    (is (= 1 (%tg-distinct g (list p c1 c2))))
+    (%tg-rm g p)
+    (is (= 2 (%tg-distinct g (list c1 c2))))
+    (is (equal (list c1) (%tg-cluster g c1)))
+    (is (equal (list c2) (%tg-cluster g c2)))
+    (is-true (%tg-sane g))))
+
+(test txgraph-set-transaction-fee-rechunks
+  "SetTransactionFee re-linearizes and re-chunks the cluster."
+  (let* ((g (%tg-new))
+         (parent (%tg-add g 1000 1000))
+         (child (%tg-add g 1000 1000)))
+    (%tg-dep g parent child)
+    ;; Equal feerates: two chunks (absorption needs strictly higher).
+    (is (= 2 (length (%tg-chunks g))))
+    ;; Raise the child's fee: CPFP merges into one chunk.
+    (%tg-setfee g child 3000)
+    (let ((chunks (%tg-chunks g)))
+      (is (= 1 (length chunks)))
+      (is (%tg-ff= (cdr (first chunks)) 4000 2000)))
+    ;; Drop it again: back to two chunks, parent first.
+    (%tg-setfee g child 500)
+    (let ((chunks (%tg-chunks g)))
+      (is (= 2 (length chunks)))
+      (is (equal (list parent) (car (first chunks))))
+      (is (%tg-ff= (cdr (first chunks)) 1000 1000))
+      (is (%tg-ff= (cdr (second chunks)) 500 1000)))
+    ;; Removed handle: no-op.
+    (%tg-rm g child)
+    (%tg-setfee g child 999999)
+    (is (= 1 (%tg-count g)))
+    (is-true (%tg-sane g))))
+
+;;;; Mining order (the comparator's tie-break chain)
+
+(test txgraph-compare-main-order-feerate
+  "Primary key: chunk feerate, descending."
+  (let* ((g (%tg-new))
+         (lo (%tg-add g 100 100))
+         (hi (%tg-add g 900 100)))
+    (is (= -1 (%tg-cmp g hi lo)))
+    (is (= 1 (%tg-cmp g lo hi)))
+    (is (= 0 (%tg-cmp g lo lo)))))
+
+(test txgraph-compare-main-order-prefix-size
+  "Equal feerate: the equal-feerate chunk prefix size breaks the tie,
+ascending (txgraph.cpp:502-508) - the smaller chunk mines first."
+  (let* ((g (%tg-new))
+         (big (%tg-add g 2 2))            ; feerate 1, prefix size 2
+         (small (%tg-add g 1 1)))         ; feerate 1, prefix size 1
+    (is (= -1 (%tg-cmp g small big)))
+    (is (= 1 (%tg-cmp g big small))))
+  ;; Within one cluster: two equal-feerate chunks; the later one has the
+  ;; larger prefix (sizes accumulate) and mines later.
+  (let* ((g (%tg-new))
+         (p (%tg-add g 5 5))
+         (c (%tg-add g 5 5)))
+    (%tg-dep g p c)
+    (is (= 2 (length (%tg-chunks g))))
+    (is (= -1 (%tg-cmp g p c)))
+    (is (= 1 (%tg-cmp g c p)))))
+
+(test txgraph-compare-main-order-fallback
+  "Equal feerate and prefix in distinct clusters: the fallback order of the
+chunks' maximal elements decides (default: handle creation order)."
+  (let* ((g (%tg-new))
+         (first-added (%tg-add g 7 7))
+         (second-added (%tg-add g 7 7)))
+    (is (= -1 (%tg-cmp g first-added second-added)))
+    (is (= 1 (%tg-cmp g second-added first-added)))
+    ;; The block builder emits them in that order.
+    (let ((chunks (%tg-chunks g)))
+      (is (equal (list (list first-added) (list second-added))
+                 (mapcar #'car chunks))))))
+
+(test txgraph-compare-main-order-custom-fallback
+  "A custom fallback order (Core's mempool passes txid order) flips ties."
+  (let* ((g (%tg-new :fallback-order
+                     (lambda (a b) (signum (- (%tg-id b) (%tg-id a))))))
+         (first-added (%tg-add g 7 7))
+         (second-added (%tg-add g 7 7)))
+    (is (= 1 (%tg-cmp g first-added second-added)))
+    (let ((chunks (%tg-chunks g)))
+      (is (equal (list (list second-added) (list first-added))
+                 (mapcar #'car chunks))))
+    (is-true (%tg-sane g))))
+
+(test txgraph-compare-main-order-within-chunk
+  "Within a single chunk, linearization position orders transactions."
+  (let* ((g (%tg-new))
+         (p (%tg-add g 100 1000))
+         (c (%tg-add g 4900 1000)))
+    (%tg-dep g p c)                       ; one CPFP chunk [p, c]
+    (is (= 1 (length (%tg-chunks g))))
+    (is (= -1 (%tg-cmp g p c)))
+    (is (= 1 (%tg-cmp g c p)))))
+
+;;;; Block builder
+
+(test txgraph-block-builder-order-and-skip
+  "Chunks are drawn in mining order across clusters; Skip suppresses the
+remainder of the skipped chunk's cluster (Core txgraph.cpp:3241-3251)."
+  (let* ((g (%tg-new))
+         ;; Cluster X: two chunks, feerates 30 then 10.
+         (x1 (%tg-add g 30 1))
+         (x2 (%tg-add g 10 1))
+         ;; Singleton s: feerate 20, slots between them.
+         (s (%tg-add g 20 1)))
+    (%tg-dep g x1 x2)
+    (is (equal (list (list x1) (list s) (list x2))
+               (mapcar #'car (%tg-chunks g))))
+    ;; Skip x1's chunk: s is offered, x2 is suppressed.
+    (let ((b (bitcoin-lisp.mempool:make-block-builder g))
+          (emitted '()))
+      (unwind-protect
+           (progn
+             (multiple-value-bind (txs feerate)
+                 (bitcoin-lisp.mempool:block-builder-current-chunk b)
+               (is (equal (list x1) txs))
+               (is (%tg-ff= feerate 30 1)))
+             (bitcoin-lisp.mempool:block-builder-skip b)
+             (loop (multiple-value-bind (txs nil-feerate)
+                       (bitcoin-lisp.mempool:block-builder-current-chunk b)
+                     (declare (ignore nil-feerate))
+                     (unless txs (return))
+                     (push txs emitted)
+                     (bitcoin-lisp.mempool:block-builder-include b))))
+        (bitcoin-lisp.mempool:block-builder-finish b))
+      (is (equal (list (list s)) (nreverse emitted))))
+    ;; Skipping the singleton instead leaves cluster X complete.
+    (let ((b (bitcoin-lisp.mempool:make-block-builder g))
+          (emitted '()))
+      (unwind-protect
+           (loop (multiple-value-bind (txs nil-feerate)
+                     (bitcoin-lisp.mempool:block-builder-current-chunk b)
+                   (declare (ignore nil-feerate))
+                   (unless txs (return))
+                   (if (equal txs (list s))
+                       (bitcoin-lisp.mempool:block-builder-skip b)
+                       (progn (push txs emitted)
+                              (bitcoin-lisp.mempool:block-builder-include b)))))
+        (bitcoin-lisp.mempool:block-builder-finish b))
+      (is (equal (list (list x1) (list x2)) (nreverse emitted))))))
+
+(test txgraph-block-builder-blocks-mutation
+  "While a builder exists, mutators are disallowed (Core
+m_main_chunkindex_observers); after finish they work again."
+  (let* ((g (%tg-new))
+         (a (%tg-add g 5 5))
+         (b (bitcoin-lisp.mempool:make-block-builder g)))
+    (unwind-protect
+         (progn
+           (signals error (%tg-add g 1 1))
+           (signals error (%tg-rm g a))
+           (signals error (%tg-setfee g a 6))
+           ;; Queries stay available.
+           (is-true (%tg-exists g a)))
+      (bitcoin-lisp.mempool:block-builder-finish b))
+    (is (%tg-add g 1 1))
+    (is (= 2 (%tg-count g)))))
+
+;;;; Oversized behavior
+
+(test txgraph-oversized-by-count
+  "A dependency whose merged cluster would exceed the count limit is held
+pending; the graph is oversized, restricted queries signal, mutators and
+the always-available queries keep working (txgraph.h:122-134)."
+  (let* ((g (%tg-new :max-cluster-count 2))
+         (a1 (%tg-add g 1 1))
+         (a2 (%tg-add g 2 1))
+         (b1 (%tg-add g 3 1)))
+    (%tg-dep g a1 a2)
+    (is-false (%tg-oversized g))
+    (%tg-dep g a2 b1)                     ; would-be cluster of 3 > 2
+    (is-true (%tg-oversized g))
+    (is-true (%tg-sane g))
+    ;; The dependency is NOT applied while oversized.
+    (is (= 3 (%tg-count g)))
+    (is-true (%tg-exists g b1))
+    (is (%tg-ff= (%tg-feerate g b1) 3 1))
+    (signals error (%tg-anc g b1))
+    (signals error (%tg-desc g b1))
+    (signals error (%tg-cluster g b1))
+    (signals error (%tg-chunk-feerate g b1))
+    (signals error (%tg-cmp g a1 b1))
+    (signals error (%tg-distinct g (list a1 b1)))
+    (signals error (%tg-worst g))
+    (signals error (bitcoin-lisp.mempool:make-block-builder g))
+    ;; Mutators still work while oversized.
+    (%tg-setfee g b1 30)
+    (is (%tg-ff= (%tg-feerate g b1) 30 1))
+    ;; Removing a1 shrinks the group to 2: the pending dep applies eagerly.
+    (%tg-rm g a1)
+    (is-false (%tg-oversized g))
+    (is (equal (%tg-ids (list a2 b1)) (%tg-ids (%tg-cluster g b1))))
+    (is (equal (%tg-ids (list a2 b1)) (%tg-ids (%tg-anc g b1))))
+    (is-true (%tg-sane g))))
+
+(test txgraph-oversized-clears-when-endpoint-removed
+  "Removing a pending dependency's endpoint drops the dependency."
+  (let* ((g (%tg-new :max-cluster-count 2))
+         (a1 (%tg-add g 1 1))
+         (a2 (%tg-add g 2 1))
+         (b1 (%tg-add g 3 1)))
+    (%tg-dep g a1 a2)
+    (%tg-dep g a2 b1)
+    (is-true (%tg-oversized g))
+    (%tg-rm g a2)                         ; parent of the pending dep
+    (is-false (%tg-oversized g))
+    ;; The dep died with its endpoint: b1 is still a singleton.
+    (is (equal (list b1) (%tg-cluster g b1)))
+    (is (equal (%tg-ids (list a1)) (%tg-ids (%tg-cluster g a1))))
+    (is-true (%tg-sane g))))
+
+(test txgraph-oversized-by-size
+  (let* ((g (%tg-new :max-cluster-size 300))
+         (a (%tg-add g 10 200))
+         (b (%tg-add g 20 200)))
+    (is-false (%tg-oversized g))
+    (%tg-dep g a b)                       ; 400 > 300
+    (is-true (%tg-oversized g))
+    (is-true (%tg-sane g))
+    (%tg-rm g b)
+    (is-false (%tg-oversized g))))
+
+(test txgraph-individually-oversized-transaction
+  "A single transaction larger than the size limit makes the graph
+oversized on its own (Core OVERSIZED_SINGLETON, txgraph.cpp:2244-2259);
+Trim removes it."
+  (let* ((g (%tg-new))
+         (huge (%tg-add g 1000 150000)))  ; > 101,000 vB
+    (is-true (%tg-oversized g))
+    (is-true (%tg-exists g huge))
+    (is (%tg-ff= (%tg-feerate g huge) 1000 150000))
+    (signals error (%tg-anc g huge))
+    (is-true (%tg-sane g))
+    (let ((removed (%tg-trim g)))
+      (is (equal (list huge) removed)))
+    (is-false (%tg-oversized g))
+    (is-false (%tg-exists g huge))
+    (is (= 0 (%tg-count g)))
+    (is-true (%tg-sane g))))
+
+;;;; Trim
+
+(test txgraph-trim-noop-when-not-oversized
+  (let ((g (%tg-new)))
+    (%tg-add g 1 1)
+    (is (null (%tg-trim g)))
+    (is (= 1 (%tg-count g)))))
+
+(test txgraph-trim-count-limit
+  "Trim keeps the greedy best-chunk-feerate prefix of the would-be cluster
+and removes the rest (Core Trim, txgraph.cpp:3285-3533)."
+  (let* ((g (%tg-new :max-cluster-count 3))
+         ;; Cluster X: x1 (10 sat/vB) -> x2 (5 sat/vB).
+         (x1 (%tg-add g 1000 100))
+         (x2 (%tg-add g 500 100))
+         ;; Cluster Y: y1 (20 sat/vB) -> y2 (1 sat/vB).
+         (y1 (%tg-add g 2000 100))
+         (y2 (%tg-add g 100 100)))
+    (%tg-dep g x1 x2)
+    (%tg-dep g y1 y2)
+    (is-false (%tg-oversized g))
+    (%tg-dep g x2 y1)                     ; would-be cluster of 4 > 3
+    (is-true (%tg-oversized g))
+    ;; Greedy: x1 (10) -> x2 (5, count 2) -> y1 (20, count 3) -> y2 would
+    ;; make 4: dropped.
+    (let ((removed (%tg-trim g)))
+      (is (equal (list y2) removed)))
+    (is-false (%tg-oversized g))
+    (is-false (%tg-exists g y2))
+    ;; The pending dependency was applied after trimming.
+    (is (equal (%tg-ids (list x1 x2 y1)) (%tg-ids (%tg-cluster g x1))))
+    (is (equal (%tg-ids (list x1 x2 y1)) (%tg-ids (%tg-anc g y1))))
+    (is-true (%tg-sane g))))
+
+(test txgraph-trim-size-limit
+  (let* ((g (%tg-new :max-cluster-size 300))
+         (x1 (%tg-add g 1000 100))
+         (x2 (%tg-add g 500 100))
+         (y1 (%tg-add g 2000 100))
+         (y2 (%tg-add g 100 100)))
+    (%tg-dep g x1 x2)
+    (%tg-dep g y1 y2)
+    (%tg-dep g x2 y1)                     ; would-be size 400 > 300
+    (is-true (%tg-oversized g))
+    (let ((removed (%tg-trim g)))
+      (is (equal (list y2) removed)))
+    (is-false (%tg-oversized g))
+    (is (= 3 (%tg-count g)))
+    (is-true (%tg-sane g))))
+
+(test txgraph-trim-blocked-descendant
+  "A transaction whose dependency chain is cut is removed no matter how
+high its own feerate is (unmet dependencies are never jumped)."
+  (let* ((g (%tg-new :max-cluster-count 2))
+         (c1 (%tg-add g 100 100))
+         (c2 (%tg-add g 100 100))
+         (c3 (%tg-add g 99000 100)))      ; very high feerate
+    (%tg-dep g c1 c2)
+    (%tg-dep g c2 c3)                     ; would-be cluster of 3 > 2
+    (is-true (%tg-oversized g))
+    (let ((removed (%tg-trim g)))
+      (is (equal (list c3) removed)))
+    (is (equal (%tg-ids (list c1 c2)) (%tg-ids (%tg-cluster g c1))))
+    (is-true (%tg-sane g))))
+
+(test txgraph-trim-multiple-groups
+  "Trim handles several independent over-limit groups in one call."
+  (let* ((g (%tg-new :max-cluster-count 2))
+         (a1 (%tg-add g 300 100)) (a2 (%tg-add g 200 100)) (a3 (%tg-add g 100 100))
+         (b1 (%tg-add g 900 100)) (b2 (%tg-add g 800 100)) (b3 (%tg-add g 50 100)))
+    (%tg-dep g a1 a2) (%tg-dep g a2 a3)
+    (%tg-dep g b1 b2) (%tg-dep g b2 b3)
+    (is-true (%tg-oversized g))
+    (let ((removed (%tg-trim g)))
+      (is (equal (%tg-ids (list a3 b3)) (%tg-ids removed))))
+    (is-false (%tg-oversized g))
+    (is (= 4 (%tg-count g)))
+    (is (equal (%tg-ids (list a1 a2)) (%tg-ids (%tg-cluster g a1))))
+    (is (equal (%tg-ids (list b1 b2)) (%tg-ids (%tg-cluster g b1))))
+    (is-true (%tg-sane g))))
+
+;;;; Randomized property tests vs the brute-force model
+
+(test txgraph-randomized-vs-model
+  "Deterministic random op sequences (add/remove/add-dep/set-fee) with the
+default (never-oversized at these sizes) limits: every query, the chunk
+walk, the comparator, worst-chunk and the sanity check must agree with the
+brute-force closure model."
+  (let ((rng (%cl-make-rng 6364136223846793005)))
+    (dotimes (iter 25)
+      (let ((g (%tg-new))
+            (model (make-array 0 :adjustable t :fill-pointer 0))
+            (idx-of (make-hash-table :test 'eq)))
+        (flet ((live ()
+                 (loop for i from 0 below (length model)
+                       when (%tgm-tx-live (aref model i)) collect i)))
+          (dotimes (op 60)
+            (let ((r (funcall rng 100))
+                  (live (live)))
+              (cond ((or (null live) (< r 35))
+                     (let* ((fee (- (funcall rng 10001) 2000))
+                            (size (1+ (funcall rng 1000)))
+                            (h (%tg-add g fee size)))
+                       (setf (gethash h idx-of) (%tgm-add model fee size h))))
+                    ((< r 70)
+                     (when (rest live)
+                       (let ((p (nth (funcall rng (length live)) live))
+                             (c (nth (funcall rng (length live)) live)))
+                         ;; Skip self-deps and deps that would form a cycle.
+                         (unless (or (= p c)
+                                     (logbitp c (%tgm-tx-anc (aref model p))))
+                           (%tg-dep g (%tgm-tx-handle (aref model p))
+                                    (%tgm-tx-handle (aref model c)))
+                           (%tgm-dep model p c)))))
+                    ((< r 85)
+                     (let ((i (nth (funcall rng (length live)) live)))
+                       (%tg-rm g (%tgm-tx-handle (aref model i)))
+                       (%tgm-rm model i)))
+                    (t
+                     (let ((i (nth (funcall rng (length live)) live))
+                           (fee (- (funcall rng 10001) 2000)))
+                       (%tg-setfee g (%tgm-tx-handle (aref model i)) fee)
+                       (setf (%tgm-tx-fee (aref model i)) fee))))
+              ;; Verify a transient mid-run state once per iteration.
+              (when (= op 29) (%tg-verify-model g model idx-of rng))))
+          (%tg-verify-model g model idx-of rng))))))
+
+(test txgraph-randomized-block-builder-skip
+  "Random skip decisions: the emitted chunk sequence must equal a
+simulation over the full chunk list where skipping suppresses the rest of
+the chunk's cluster."
+  (let ((rng (%cl-make-rng 88172645463325252)))
+    (dotimes (iter 20)
+      ;; Build a random (never-oversized) graph.
+      (let ((g (%tg-new))
+            (model (make-array 0 :adjustable t :fill-pointer 0))
+            (idx-of (make-hash-table :test 'eq)))
+        (dotimes (k (+ 5 (funcall rng 20)))
+          (let* ((fee (- (funcall rng 10001) 2000))
+                 (size (1+ (funcall rng 1000)))
+                 (h (%tg-add g fee size)))
+            (setf (gethash h idx-of) (%tgm-add model fee size h))))
+        (dotimes (k (funcall rng 25))
+          (let ((p (funcall rng (length model)))
+                (c (funcall rng (length model))))
+            (unless (or (= p c) (logbitp c (%tgm-tx-anc (aref model p))))
+              (%tg-dep g (%tgm-tx-handle (aref model p))
+                       (%tgm-tx-handle (aref model c)))
+              (%tgm-dep model p c))))
+        ;; First pass: full chunk list; precompute one skip decision per
+        ;; potentially-offered chunk.
+        (let* ((chunks (%tg-chunks g))
+               (decisions (loop repeat (length chunks)
+                                collect (< (funcall rng 100) 40)))
+               ;; Simulate: cluster key = model component of the chunk head.
+               (expected '()))
+          (let ((excluded '())
+                (ds decisions))
+            (dolist (chunk chunks)
+              (let ((comp (%tgm-component
+                           model (gethash (first (car chunk)) idx-of))))
+                (unless (member comp excluded :test #'=)
+                  (let ((skip (pop ds)))
+                    (if skip
+                        (push comp excluded)
+                        (push (car chunk) expected)))))))
+          (setf expected (nreverse expected))
+          ;; Drive the real builder with the same decisions.
+          (let ((b (bitcoin-lisp.mempool:make-block-builder g))
+                (included '())
+                (ds decisions))
+            (unwind-protect
+                 (loop (multiple-value-bind (txs nil-feerate)
+                           (bitcoin-lisp.mempool:block-builder-current-chunk b)
+                         (declare (ignore nil-feerate))
+                         (unless txs (return))
+                         (if (pop ds)
+                             (bitcoin-lisp.mempool:block-builder-skip b)
+                             (progn (push txs included)
+                                    (bitcoin-lisp.mempool:block-builder-include b)))))
+              (bitcoin-lisp.mempool:block-builder-finish b))
+            (is (equal expected (nreverse included)))))))))
+
+(test txgraph-randomized-oversized-and-trim
+  "Random op sequences under tiny limits, including infeasible dependencies
+and Trim. Oversized reporting must match the model's component analysis at
+every step; removals take whole descendant sets (the defined-behavior
+regime, txgraph.h:82-92); Trim must restore the limits, remove
+descendant-closed sets drawn only from over-limit components, and leave a
+graph equivalent to the model."
+  (let ((rng (%cl-make-rng 2718281828459045235)))
+    (dotimes (iter 25)
+      (let* ((max-count (+ 2 (funcall rng 5)))
+             (max-size (+ 800 (funcall rng 1500)))
+             (g (%tg-new :max-cluster-count max-count :max-cluster-size max-size))
+             (model (make-array 0 :adjustable t :fill-pointer 0))
+             (idx-of (make-hash-table :test 'eq)))
+        (flet ((live ()
+                 (loop for i from 0 below (length model)
+                       when (%tgm-tx-live (aref model i)) collect i))
+               (check-oversized ()
+                 (is (eq (not (null (%tgm-oversized-p model max-count max-size)))
+                         (not (null (%tg-oversized g)))))))
+          (dotimes (op 40)
+            (let ((r (funcall rng 100))
+                  (live (live)))
+              (cond ((or (null live) (< r 35))
+                     (let* ((fee (- (funcall rng 10001) 2000))
+                            (size (1+ (funcall rng 1000)))
+                            (h (%tg-add g fee size)))
+                       (setf (gethash h idx-of) (%tgm-add model fee size h))))
+                    ((< r 65)
+                     (when (rest live)
+                       (let ((p (nth (funcall rng (length live)) live))
+                             (c (nth (funcall rng (length live)) live)))
+                         (unless (or (= p c)
+                                     (logbitp c (%tgm-tx-anc (aref model p))))
+                           (%tg-dep g (%tgm-tx-handle (aref model p))
+                                    (%tgm-tx-handle (aref model c)))
+                           (%tgm-dep model p c)))))
+                    ((< r 75)
+                     ;; Remove a transaction together with all its
+                     ;; descendants (the regime where removal ordering
+                     ;; relative to pending dependencies is well-defined).
+                     (let* ((i (nth (funcall rng (length live)) live))
+                            (victims '()))
+                       (bitcoin-lisp.mempool:do-bits
+                           (j (%tgm-tx-desc (aref model i)))
+                         (push j victims))
+                       (dolist (j victims)
+                         (%tg-rm g (%tgm-tx-handle (aref model j)))
+                         (%tgm-rm model j))))
+                    ((< r 85)
+                     (let ((i (nth (funcall rng (length live)) live))
+                           (fee (- (funcall rng 10001) 2000)))
+                       (%tg-setfee g (%tgm-tx-handle (aref model i)) fee)
+                       (setf (%tgm-tx-fee (aref model i)) fee)))
+                    (t
+                     ;; Trim.
+                     (let ((was-oversized (%tg-oversized g))
+                           (over-bits 0))
+                       (dolist (comp (%tgm-components model))
+                         (multiple-value-bind (count size)
+                             (%tgm-comp-stats model comp)
+                           (when (or (> count max-count) (> size max-size))
+                             (setf over-bits (logior over-bits comp)))))
+                       ;; Individually-oversized txs count as over-limit.
+                       (dotimes (i (length model))
+                         (let ((tx (aref model i)))
+                           (when (and (%tgm-tx-live tx)
+                                      (> (%tgm-tx-size tx) max-size))
+                             (setf over-bits (logior over-bits (ash 1 i))))))
+                       (let* ((removed (%tg-trim g))
+                              (removed-bits 0))
+                         (dolist (h removed)
+                           (setf removed-bits
+                                 (logior removed-bits (ash 1 (gethash h idx-of)))))
+                         (is (eq (not (null was-oversized))
+                                 (not (null removed))))
+                         ;; Only over-limit components lose transactions,
+                         ;; and removals are descendant-closed.
+                         (is (zerop (logandc2 removed-bits over-bits)))
+                         (dolist (h removed)
+                           (is (zerop (logandc2
+                                       (%tgm-tx-desc (aref model (gethash h idx-of)))
+                                       removed-bits))))
+                         (dolist (h removed)
+                           (%tgm-rm model (gethash h idx-of)))
+                         (is-false (%tg-oversized g))))))
+              (check-oversized)
+              (is-true (%tg-sane g))
+              ;; While oversized the restricted queries must signal; the
+              ;; always-available ones must keep working.
+              (let ((live-now (live)))
+                (when live-now
+                  (let ((h (%tgm-tx-handle
+                            (aref model (nth (funcall rng (length live-now))
+                                             live-now)))))
+                    (if (%tg-oversized g)
+                        (progn (signals error (%tg-anc g h))
+                               (is-true (%tg-exists g h)))
+                        (is (equal (%tgm-set-ids
+                                    model (%tgm-tx-anc (aref model (gethash h idx-of))))
+                                   (%tg-ids (%tg-anc g h))))))))))
+          ;; Finish the iteration in a fully-verified state.
+          (let ((removed (%tg-trim g)))
+            (dolist (h removed)
+              (%tgm-rm model (gethash h idx-of))))
+          (%tg-verify-model g model idx-of rng))))))
