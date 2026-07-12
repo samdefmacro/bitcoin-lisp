@@ -218,6 +218,31 @@ Returns an internal public key structure, or NIL if invalid."
   "Check if PUBKEY-BYTES represents a valid secp256k1 public key."
   (not (null (parse-public-key pubkey-bytes))))
 
+(defun decompress-public-key (pubkey33)
+  "Decompress a 33-byte compressed public key (prefix 0x02/0x03) into its
+65-byte uncompressed serialization (0x04 || x || y). Returns NIL if the
+bytes do not parse as a valid curve point. Mirrors Core's
+CPubKey::Decompress (pubkey.h:196-210), used by DecompressScript for the
+0x04/0x05 special script forms (compressor.cpp:122-135)."
+  (ensure-secp256k1-loaded)
+  (unless (= (length pubkey33) 33)
+    (return-from decompress-public-key nil))
+  (let ((pk (parse-public-key pubkey33)))
+    (when pk
+      (cffi:with-foreign-objects ((pkobj :uint8 +secp256k1-pubkey-size+)
+                                  (out :uint8 65)
+                                  (outlen :size))
+        (loop for i below +secp256k1-pubkey-size+
+              do (setf (cffi:mem-aref pkobj :uint8 i) (aref pk i)))
+        (setf (cffi:mem-ref outlen :size) 65)
+        (when (= 1 (secp256k1-ec-pubkey-serialize
+                    *secp256k1-context* out outlen pkobj
+                    +secp256k1-ec-uncompressed+))
+          (let ((result (make-array 65 :element-type '(unsigned-byte 8))))
+            (loop for i below 65
+                  do (setf (aref result i) (cffi:mem-aref out :uint8 i)))
+            result))))))
+
 ;;; Signing operations (private key -> public key / signature)
 
 (defun valid-private-key-p (privkey)
