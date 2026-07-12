@@ -668,7 +668,14 @@ Returns (VALUES net-addr timestamp network-id) for IPv4/IPv6 entries with
 correct address length. Returns NIL for unknown networks, deprecated TorV2,
 or entries with mismatched address lengths (bytes are consumed but skipped)."
   (let* ((timestamp (read-uint32-le stream))
-         (services (read-compact-size stream))
+         ;; services is a BIP155 CompactSize-encoded u64 BITMASK, not a
+         ;; length — Core deserializes it with CompactSizeFormatter<false>
+         ;; (protocol.h:446), i.e. NO range check. The default cap here
+         ;; (+max-compact-size+) made us treat any peer advertising a
+         ;; service bit >= 26 as malformed and disconnect it; exposed in
+         ;; production when #245's getaddr started soliciting 1000-entry
+         ;; addrv2 replies on mainnet (2026-07-12).
+         (services (read-compact-size stream :range-check nil))
          (network-id (read-uint8 stream))
          (addr-len (read-compact-size stream)))
     ;; Read address bytes regardless (to advance stream position)
