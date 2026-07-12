@@ -89,14 +89,23 @@ Returns a list of IP address strings, ordered so the first N entries
 span as many distinct /16 netgroups as possible (see diversify-by-
 netgroup). The caller iterates this list and connects to the first
 peers that succeed; round-robin ordering prevents a single operator's
-DNS-clustered nodes from monopolizing our 8-peer outbound budget."
-  (let ((addresses '()))
-    (dolist (seed seeds)
-      (let ((resolved (resolve-dns-seed seed)))
-        (when resolved
-          (setf addresses (nconc addresses resolved)))))
-    (diversify-by-netgroup
-     (remove-duplicates addresses :test #'string=))))
+DNS-clustered nodes from monopolizing our 8-peer outbound budget.
+
+When a SOCKS5 proxy is configured (*proxy*), seeds are NOT resolved locally
+— that would leak DNS queries outside the tunnel. Instead each seed HOSTNAME
+is returned as a dial target itself: make-tcp-connection passes it through
+the proxy in the SOCKS5 CONNECT (ATYP DOMAINNAME), and the proxy resolves it.
+Mirrors Bitcoin Core's proxy-mode seed handling, where seeds become one-shot
+AddAddrFetch peer dials instead of getaddrinfo lookups (net.cpp:2353-2358)."
+  (if *proxy*
+      (copy-list seeds)
+      (let ((addresses '()))
+        (dolist (seed seeds)
+          (let ((resolved (resolve-dns-seed seed)))
+            (when resolved
+              (setf addresses (nconc addresses resolved)))))
+        (diversify-by-netgroup
+         (remove-duplicates addresses :test #'string=)))))
 
 ;;; Message handling
 
