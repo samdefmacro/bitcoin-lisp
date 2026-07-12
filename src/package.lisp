@@ -263,6 +263,7 @@
    #:command-to-bytes
    #:bytes-to-command
    ;; Version message
+   #:+protocol-version+
    #:version-message
    #:make-version-message-bytes
    #:read-version-message
@@ -270,6 +271,7 @@
    #:version-message-services
    #:version-message-start-height
    #:version-message-user-agent
+   #:version-message-relay
    #:make-verack-message
    #:make-ping-message
    #:make-pong-message
@@ -383,6 +385,9 @@
    #:make-getaddr-message
    #:make-sendheaders-message
    #:make-wtxidrelay-message
+   #:+txreconciliation-version+
+   #:make-sendtxrcncl-message
+   #:parse-sendtxrcncl-payload
    #:parse-feefilter-payload
    #:make-feefilter-message
    #:make-addrv2-message
@@ -1067,6 +1072,7 @@
    #:*max-datacarrier-bytes*
    #:*permit-bare-multisig*
    #:*peer-block-filters*
+   #:*tx-reconciliation*
    #:pruning-enabled-p
    #:automatic-pruning-p
    #:minimum-chain-work

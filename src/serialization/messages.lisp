@@ -746,6 +746,26 @@ TIMESTAMP is the uint32 last-seen time."
 Must be sent between VERSION and VERACK."
   (serialize-message "wtxidrelay" #()))
 
+(defconstant +txreconciliation-version+ 1
+  "BIP 330 transaction reconciliation protocol version we support (Bitcoin
+Core node/txreconciliation.h:15 TXRECONCILIATION_VERSION).")
+
+(defun make-sendtxrcncl-message (salt &optional (version +txreconciliation-version+))
+  "Create a sendtxrcncl message (BIP 330): uint32 VERSION + uint64 SALT, both
+LE — 12-byte payload (Core protocol.h:262-266). Must be sent between VERSION
+and VERACK."
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-uint32-le stream version)
+                   (write-uint64-le stream salt))))
+    (serialize-message "sendtxrcncl" payload)))
+
+(defun parse-sendtxrcncl-payload (payload)
+  "Parse a sendtxrcncl message payload (BIP 330).
+Returns (VALUES version salt)."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (values (read-uint32-le stream)
+            (read-uint64-le stream))))
+
 (defun parse-feefilter-payload (payload)
   "Parse a feefilter message payload (BIP 133). Returns fee rate as uint64 (sat/kB)."
   (flexi-streams:with-input-from-sequence (stream payload)
