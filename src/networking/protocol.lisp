@@ -205,6 +205,18 @@ Returns T if message was handled, NIL otherwise."
      ;; BIP 339: No-op post-handshake (only meaningful during handshake)
      t)
 
+    ((string= command "sendtxrcncl")
+     ;; BIP 330: feature negotiation is only valid between VERSION and VERACK
+     ;; (handled in %await-verack). Receiving it here — post-verack — is a
+     ;; protocol violation: Core disconnects (net_processing.cpp:3969-3973),
+     ;; unlike the sendaddrv2/wtxidrelay no-op stubs above. With
+     ;; -txreconciliation off, Core ignores the message instead (:3964-3967).
+     (when bitcoin-lisp:*tx-reconciliation*
+       (bitcoin-lisp:log-cat "net" "sendtxrcncl received after verack — disconnecting peer ~A"
+                             (peer-address peer))
+       (disconnect-peer peer))
+     t)
+
     ((string= command "sendheaders")
      ;; BIP 130: Peer prefers header announcements over inv
      (setf (peer-prefers-headers peer) t)
