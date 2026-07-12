@@ -46,6 +46,119 @@ real per-network floors are ~10^25 work, unreachable by synthetic chains).")
 assumevalid script-skip entirely. :UNSET (the default) uses the built-in
 per-network value. For tests, and for operators who want to disable assumevalid.")
 
+;;;; Assumeutxo snapshot commitments
+;;;;
+;;;; Bitcoin Core's m_assumeutxo_data (kernel/chainparams.cpp:166-191,
+;;;; 287-300, 400-413, 521-534, 646-667 @ d3056bc): the trusted UTXO-set
+;;;; snapshot heights shipped with the release. loadtxoutset only accepts
+;;;; a snapshot whose base block appears here AND whose hash_serialized_3
+;;;; content hash matches — same trust model as assumevalid.
+
+(defstruct assumeutxo-data
+  "One trusted UTXO-snapshot commitment (Bitcoin Core AssumeutxoData,
+kernel/chainparams.h:60-75)."
+  (height 0 :type (unsigned-byte 32))
+  ;; Base block hash, 32 bytes WIRE order (the block-index key form).
+  (blockhash nil :type (or null (simple-array (unsigned-byte 8) (32))))
+  ;; hash_serialized_3 over the full UTXO set at HEIGHT, 32 bytes in
+  ;; internal digest order (compute-utxo-set-hash's return form).
+  (hash-serialized nil :type (or null (simple-array (unsigned-byte 8) (32))))
+  ;; Number of transactions in the chain up to and including the base
+  ;; block (Core AssumeutxoData::m_chain_tx_count).
+  (chain-tx-count 0 :type (unsigned-byte 64)))
+
+(defvar *assumeutxo-data-override* nil
+  "When non-NIL, a list of assumeutxo-data entries consulted INSTEAD of the
+built-in per-network table. Core's regtest-entries pattern for tests: dump a
+synthetic chain's UTXO set, inject its real base hash + hash_serialized_3
+here, and load it back through the full verification gate.")
+
+(defun %assumeutxo-entry (height blockhash-hex hash-serialized-hex chain-tx-count)
+  "Build an assumeutxo-data from Core's display-order (uint256 GetHex) hex
+strings, reversing both to our internal byte orders."
+  (make-assumeutxo-data
+   :height height
+   :blockhash (reverse (bitcoin-lisp.crypto:hex-to-bytes blockhash-hex))
+   :hash-serialized (reverse (bitcoin-lisp.crypto:hex-to-bytes hash-serialized-hex))
+   :chain-tx-count chain-tx-count))
+
+(defun network-assumeutxo-data (network)
+  "NETWORK's assumeutxo-data entries, newest last. Values mirror Bitcoin
+Core kernel/chainparams.cpp exactly. *assumeutxo-data-override* (when
+non-NIL) takes precedence over the built-in table."
+  (or *assumeutxo-data-override*
+      (ecase network
+        (:mainnet
+         (list
+          (%assumeutxo-entry 840000
+                             "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
+                             "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"
+                             991032194)
+          (%assumeutxo-entry 880000
+                             "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"
+                             "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9"
+                             1145604538)
+          (%assumeutxo-entry 910000
+                             "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"
+                             "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"
+                             1226586151)
+          (%assumeutxo-entry 935000
+                             "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"
+                             "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"
+                             1305397408)))
+        (:testnet3
+         (list
+          (%assumeutxo-entry 2500000
+                             "0000000000000093bcb68c03a9a168ae252572d348a2eaeba2cdf9231d73206f"
+                             "f841584909f68e47897952345234e37fcd9128cd818f41ee6c3ca68db8071be7"
+                             66484552)
+          (%assumeutxo-entry 4840000
+                             "00000000000000f4971a7fb37fbdff89315b69a2e1920c467654a382f0d64786"
+                             "ce6bb677bb2ee9789c4a1c9d73e6683c53fc20e8fdbedbdaaf468982a0c8db2a"
+                             536078574)))
+        (:testnet4
+         (list
+          (%assumeutxo-entry 90000
+                             "0000000002ebe8bcda020e0dd6ccfbdfac531d2f6a81457191b99fc2df2dbe3b"
+                             "784fb5e98241de66fdd429f4392155c9e7db5c017148e66e8fdbc95746f8b9b5"
+                             11347043)
+          (%assumeutxo-entry 120000
+                             "000000000bd2317e51b3c5794981c35ba894ce27d3e772d5c39ecd9cbce01dc8"
+                             "10b05d05ad468d0971162e1b222a4aa66caca89da2bb2a93f8f37fb29c4794b0"
+                             14141057)))
+        (:signet
+         (list
+          (%assumeutxo-entry 160000
+                             "0000003ca3c99aff040f2563c2ad8f8ec88bd0fd6b8f0895cfaf1ef90353a62c"
+                             "fe0a44309b74d6b5883d246cb419c6221bcccf0b308c9b59b7d70783dbdf928a"
+                             2289496)
+          (%assumeutxo-entry 290000
+                             "0000000577f2741bb30cd9d39d6d71b023afbeb9764f6260786a97969d5c9ac0"
+                             "97267e000b4b876800167e71b9123f1529d13b14308abec2888bbd2160d14545"
+                             28547497)))
+        (:regtest
+         ;; Core's regtest entries reference chains produced by its own
+         ;; unit/functional test frameworks; shipped for table parity.
+         (list
+          (%assumeutxo-entry 110
+                             "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"
+                             "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"
+                             111)
+          (%assumeutxo-entry 200
+                             "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"
+                             "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"
+                             201)
+          (%assumeutxo-entry 299
+                             "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"
+                             "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"
+                             334))))))
+
+(defun assumeutxo-data-for-blockhash (network blockhash)
+  "The assumeutxo-data entry whose base block is BLOCKHASH (32-byte wire
+order), or NIL (Core AssumeutxoForBlockhash, kernel/chainparams.cpp:727)."
+  (find blockhash (network-assumeutxo-data network)
+        :key #'assumeutxo-data-blockhash :test #'equalp))
+
 (defvar *parallel-block-validation* nil
   "When NIL (default), block-script validation runs single-threaded.
 

@@ -406,7 +406,11 @@
    #:bb-write-compressed-tx-out
    #:br-read-compressed-tx-out
    #:bb-write-compressed-coin
-   #:br-read-compressed-coin))
+   #:br-read-compressed-coin
+   #:read-core-varint
+   #:read-compressed-script
+   #:read-compressed-tx-out
+   #:read-compressed-coin))
 
 (defpackage #:bitcoin-lisp.storage
   (:use #:cl)
@@ -1161,6 +1165,16 @@
    #:minimum-chain-work
    #:*minimum-chain-work-override*
    #:*assumevalid-override*
+   ;; Assumeutxo snapshot commitments (Core m_assumeutxo_data)
+   #:assumeutxo-data
+   #:make-assumeutxo-data
+   #:assumeutxo-data-height
+   #:assumeutxo-data-blockhash
+   #:assumeutxo-data-hash-serialized
+   #:assumeutxo-data-chain-tx-count
+   #:*assumeutxo-data-override*
+   #:network-assumeutxo-data
+   #:assumeutxo-data-for-blockhash
    #:*parallel-block-validation*
    ;; Token bucket rate limiter
    #:token-bucket
