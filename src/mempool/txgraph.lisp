@@ -1,0 +1,943 @@
+(in-package #:bitcoin-lisp.mempool)
+
+;;; TxGraph - cluster registry with a mining-ordered chunk index
+;;;
+;;; Port of the CONTRACT of Bitcoin Core src/txgraph.{h,cpp}: fees, sizes and
+;;; dependencies for a set of transactions, maintained as clusters (connected
+;;; components under the spends-from relation), each with a linearization
+;;; chopped into chunks, plus one global mining-ordered index over all chunks
+;;; of all clusters. Bitcoin-agnostic, like Core's: no txids, no scripts -
+;;; just fees, sizes and dependencies.
+;;;
+;;; Deviations from Core's implementation (the semantics are Core's):
+;;;
+;;; - EAGER, not lazy. Core queues removals/dependencies and drains them
+;;;   through ApplyRemovals -> SplitAll -> GroupClusters -> Merge ->
+;;;   ApplyDependencies with cost-budgeted relinearization (DoWork). We apply
+;;;   every mutation immediately and relinearize the affected cluster(s) on
+;;;   the spot (ancestor-set seeding + post-linearize; Core's budgeted SFL is
+;;;   the P10 upgrade). The one thing that stays deferred - exactly as in
+;;;   Core - is a dependency whose would-be merged cluster exceeds the
+;;;   count/size limits: it is held in PENDING-DEPS and the graph reports
+;;;   oversized until removals or TXGRAPH-TRIM make it applicable (or drop
+;;;   it). The global chunk index is rebuilt lazily on first access after a
+;;;   mutation; per-cluster chunk data is always eagerly up to date, so this
+;;;   is unobservable.
+;;;
+;;; - HANDLES, not Refs. Core's TxGraph::Ref removes its transaction from
+;;;   the graph in its destructor. Lisp has no destructors: every mempool
+;;;   entry removal must explicitly call TXGRAPH-REMOVE-TRANSACTION. This is
+;;;   the central mechanical discipline of the port; P3's shadow-mode asserts
+;;;   exist to catch any missed removal path. Handles must only be used with
+;;;   the graph that created them (asserted).
+;;;
+;;; - SINGLE GRAPH. Core keeps "main" and an optional "staging" overlay;
+;;;   staging (start/abort/commit + GetMainStagingDiagrams) is P7. All state
+;;;   lives behind the TXGRAPH struct (no globals), so the staging overlay
+;;;   can scratch-copy affected clusters without changing any caller.
+;;;
+;;; - OVERSIZED contract (txgraph.h:122-127): while the graph is oversized
+;;;   (a would-be cluster exceeds the limits, or a single transaction alone
+;;;   exceeds the size limit), the ancestry/cluster/ordering queries and the
+;;;   chunk-index consumers are unavailable - Core Assumes, we assert.
+;;;   Always available: the mutators, TXGRAPH-EXISTS-P, TXGRAPH-TX-COUNT,
+;;;   TXGRAPH-GET-INDIVIDUAL-FEERATE, TXGRAPH-OVERSIZED-P and TXGRAPH-TRIM.
+;;;
+;;; - MAKE-TXGRAPH takes no acceptable-cost: with no lazy work queue there
+;;;   is no linearization cost budget to configure.
+
+(defconstant +max-cluster-size+ 101000
+  "Maximum sum of transaction sizes in a cluster, in virtual bytes (Core
+-limitclustersize default DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101 kvB,
+policy/policy.h). Non-negotiable for future relay compatibility.")
+
+;;;; Handles
+
+(defstruct (tx-handle (:constructor %make-tx-handle (graph id)))
+  "A transaction within a TXGRAPH (Core TxGraph::Ref, txgraph.h:232-253,
+plus its Entry, txgraph.cpp:602-625). Callers hold these and pass them back
+to the txgraph API; all slots except ID are graph-managed. There is no
+destructor: the holder must call TXGRAPH-REMOVE-TRANSACTION explicitly."
+  (graph nil :read-only t)
+  ;; Creation sequence number; basis of the default fallback order.
+  (id 0 :type fixnum :read-only t)
+  ;; Cluster this transaction is in; NIL = removed (Core Locator).
+  (cluster nil)
+  ;; Position in the cluster's depgraph.
+  (pos 0 :type (integer 0 63))
+  ;; Position in the cluster's linearization (Core m_main_lin_index).
+  (lin-index 0 :type fixnum)
+  ;; Feerate of the chunk this transaction is in (Core m_main_chunk_feerate).
+  ;; Shared with the cluster's chunk object; do not mutate.
+  (chunk-feerate nil)
+  ;; Sum of the sizes of the chunks in this cluster with feerate equal to
+  ;; this chunk's, up to and including it (Core
+  ;; m_main_equal_feerate_chunk_prefix_size, txgraph.cpp:613-619).
+  (chunk-prefix-size 0 :type fixnum)
+  ;; The maximal transaction of this chunk per the graph's fallback order
+  ;; (Core m_main_max_chunk_fallback).
+  (chunk-fallback nil))
+
+(defmethod print-object ((h tx-handle) stream)
+  (print-unreadable-object (h stream :type t)
+    (format stream "~D~:[ removed~;~]" (tx-handle-id h) (tx-handle-cluster h))))
+
+(defun %tx-handle-id-order (a b)
+  "Default fallback order: handle creation sequence. Core's mempool passes
+txid ordering here (txmempool.cpp:183-187); P3 will do the same."
+  (signum (- (tx-handle-id a) (tx-handle-id b))))
+
+;;;; Clusters and chunks
+
+(defstruct (%chunk (:constructor %make-chunk (txs feerate)))
+  "One chunk of a cluster's linearization (Core ChunkData, txgraph.cpp:468)."
+  (txs #() :type simple-vector)          ; handles in linearization order
+  (feerate nil))
+
+(declaim (inline %chunk-end))
+(defun %chunk-end (chunk)
+  "The chunk's last transaction, which represents it in the chunk index."
+  (let ((txs (%chunk-txs chunk)))
+    (svref txs (1- (length txs)))))
+
+(defstruct (%cluster (:constructor %make-cluster (sequence)))
+  "A connected component of the graph (Core Cluster, txgraph.cpp:101+)."
+  ;; Unique creation sequence (Core m_sequence): deterministic ordering.
+  (sequence 0 :type unsigned-byte :read-only t)
+  (depgraph (make-depgraph) :type depgraph)
+  ;; Depgraph position -> handle (Core m_mapping). May be longer than the
+  ;; position range; entries at hole positions are stale.
+  (mapping #() :type simple-vector)
+  ;; Simple-vector of depgraph positions (Core m_linearization).
+  (linearization #() :type simple-vector)
+  ;; Simple-vector of %CHUNK, in linearization order.
+  (chunks #() :type simple-vector)
+  ;; Total size of the member transactions.
+  (tx-size 0 :type unsigned-byte))
+
+(defmethod print-object ((c %cluster) stream)
+  (print-unreadable-object (c stream :type t)
+    (format stream "#~D (~D txs)"
+            (%cluster-sequence c) (depgraph-tx-count (%cluster-depgraph c)))))
+
+;;;; The graph
+
+(defstruct (txgraph (:constructor %make-txgraph
+                        (max-cluster-count max-cluster-size fallback-order)))
+  "A transaction graph (Core TxGraphImpl, txgraph.cpp:390): the cluster
+registry, the pending (unapplicable) dependencies, and the mining-ordered
+chunk index. Create with MAKE-TXGRAPH."
+  (max-cluster-count +max-cluster-count+ :type (integer 1 64) :read-only t)
+  (max-cluster-size +max-cluster-size+ :type (integer 1) :read-only t)
+  (fallback-order #'%tx-handle-id-order :type function :read-only t)
+  ;; Registry of all clusters (keys; values are T).
+  (clusters (make-hash-table :test 'eq) :type hash-table)
+  ;; (parent-handle . child-handle) dependencies whose would-be merged
+  ;; cluster exceeds the limits (Core m_deps_to_add; non-empty <=> some
+  ;; group is oversized, because feasible groups are applied eagerly).
+  (pending-deps '() :type list)
+  (next-sequence 0 :type unsigned-byte)
+  (next-id 0 :type fixnum)
+  (tx-count 0 :type unsigned-byte)
+  ;; Number of transactions whose own size exceeds MAX-CLUSTER-SIZE (Core
+  ;; m_txcount_oversized).
+  (oversized-tx-count 0 :type unsigned-byte)
+  ;; Sorted vector of every cluster's %CHUNKs in mining order; NIL = stale,
+  ;; rebuilt on demand (Core m_main_chunkindex).
+  (chunk-index nil :type (or null simple-vector))
+  ;; Active block builders (Core m_main_chunkindex_observers): mutations are
+  ;; disallowed while any exist.
+  (builder-count 0 :type unsigned-byte))
+
+(defmethod print-object ((g txgraph) stream)
+  (print-unreadable-object (g stream :type t)
+    (format stream "~D txs, ~D clusters~:[~; OVERSIZED~]"
+            (txgraph-tx-count g) (hash-table-count (txgraph-clusters g))
+            (txgraph-oversized-p g))))
+
+(defun make-txgraph (&key (max-cluster-count +max-cluster-count+)
+                          (max-cluster-size +max-cluster-size+)
+                          (fallback-order #'%tx-handle-id-order))
+  "Create a transaction graph (Core MakeTxGraph, txgraph.cpp:3570-3581).
+MAX-CLUSTER-COUNT (<= 64) and MAX-CLUSTER-SIZE bound each cluster;
+FALLBACK-ORDER is a stable strong ordering (handle x handle -> -1/0/1) used
+to break mining-order ties between equal-feerate chunks of distinct
+clusters (Core's mempool uses txid order)."
+  (assert (<= 1 max-cluster-count +max-cluster-count+))
+  (assert (plusp max-cluster-size))
+  (%make-txgraph max-cluster-count max-cluster-size fallback-order))
+
+(defun txgraph-oversized-p (graph)
+  "True when some connected component (including would-be components implied
+by pending dependencies) exceeds the cluster limits, or a single transaction
+alone exceeds the size limit (Core IsOversized, txgraph.cpp:2606-2624)."
+  (or (plusp (txgraph-oversized-tx-count graph))
+      (consp (txgraph-pending-deps graph))))
+
+(defun txgraph-exists-p (graph handle)
+  "True when HANDLE's transaction has not been removed (Core Exists).
+Available even when oversized."
+  (%check-handle graph handle)
+  (not (null (tx-handle-cluster handle))))
+
+;;;; Internal helpers
+
+(defun %check-handle (graph handle)
+  (assert (eq (tx-handle-graph handle) graph) ()
+          "txgraph: handle ~S belongs to a different graph" handle))
+
+(defun %assert-no-builder (graph)
+  (assert (zerop (txgraph-builder-count graph)) ()
+          "txgraph: mutation while a block builder is active"))
+
+(defun %assert-not-oversized (graph what)
+  (assert (not (txgraph-oversized-p graph)) ()
+          "txgraph: ~A is unavailable while the graph is oversized" what))
+
+(defun %copy-depgraph (g)
+  "Deep copy of depgraph G (entries and closures)."
+  (let* ((new (make-depgraph))
+         (entries (%depgraph-entries new)))
+    (setf (%depgraph-used new) (%depgraph-used g))
+    (loop for e across (%depgraph-entries g)
+          do (vector-push-extend (%make-dg-entry (copy-feefrac (%dg-entry-feerate e))
+                                                 (%dg-entry-ancestors e)
+                                                 (%dg-entry-descendants e))
+                                 entries))
+    new))
+
+(defun %graph-new-cluster (graph)
+  (let ((cluster (%make-cluster (txgraph-next-sequence graph))))
+    (incf (txgraph-next-sequence graph))
+    (setf (gethash cluster (txgraph-clusters graph)) t)
+    cluster))
+
+(defun %positions-handles (cluster bits)
+  "The handles at the positions of bitset BITS, ascending position order."
+  (let ((mapping (%cluster-mapping cluster))
+        (out '()))
+    (do-bits (i bits) (push (aref mapping i) out))
+    (nreverse out)))
+
+(defun %cluster-updated (graph cluster)
+  "Relinearize CLUSTER and recompute its chunks and its handles' cached
+mining-order data (Core Cluster::Updated, txgraph.cpp:1072-1146, done
+eagerly in place of Relinearize/MakeAcceptable)."
+  (let* ((dg (%cluster-depgraph cluster))
+         (lin (linearize dg))
+         (mapping (%cluster-mapping cluster))
+         (info (chunk-linearization-info dg lin))
+         (chunks (make-array (length info)))
+         (fallback (txgraph-fallback-order graph))
+         (lin-index 0)
+         (chunk-idx 0)
+         ;; Running sum of the chunk feerates equal to the current chunk's,
+         ;; restarted whenever the feerate strictly drops
+         ;; (txgraph.cpp:1093-1109).
+         (acc (make-feefrac))
+         (total-size 0))
+    (setf (%cluster-linearization cluster) lin)
+    (dolist (si info)
+      (let* ((feerate (setinfo-feerate si))
+             (count (logcount (setinfo-transactions si)))
+             (txs (make-array count))
+             (max-h nil))
+        (setf acc (if (feefrac<< feerate acc) (copy-feefrac feerate) (feefrac+ acc feerate)))
+        (incf total-size (feefrac-size feerate))
+        (loop for k from 0 below count
+              for pos = (svref lin (+ lin-index k))
+              for h = (aref mapping pos)
+              do (setf (aref txs k) h)
+                 (when (or (null max-h) (plusp (funcall fallback h max-h)))
+                   (setf max-h h)))
+        (loop for k from 0 below count
+              for h = (svref txs k)
+              do (setf (tx-handle-cluster h) cluster
+                       (tx-handle-pos h) (svref lin (+ lin-index k))
+                       (tx-handle-lin-index h) (+ lin-index k)
+                       (tx-handle-chunk-feerate h) feerate
+                       (tx-handle-chunk-prefix-size h) (feefrac-size acc)
+                       (tx-handle-chunk-fallback h) max-h))
+        (setf (svref chunks chunk-idx) (%make-chunk txs feerate))
+        (incf lin-index count)
+        (incf chunk-idx)))
+    (setf (%cluster-chunks cluster) chunks
+          (%cluster-tx-size cluster) total-size
+          (txgraph-chunk-index graph) nil)
+    cluster))
+
+(defun %compare-main (graph a b)
+  "Mining-order comparison of handles A and B: -1 when A mines first (Core
+CompareMainTransactions, txgraph.cpp:492-524). Keys: chunk feerate
+descending; equal-feerate chunk prefix size ascending; for distinct
+clusters the fallback order of the chunks' maximal elements; within a
+chunk, linearization position."
+  (if (eq a b)
+      0
+      (let ((feerate-cmp (feerate-compare (tx-handle-chunk-feerate b)
+                                          (tx-handle-chunk-feerate a))))
+        (cond ((not (zerop feerate-cmp)) feerate-cmp)
+              ((/= (tx-handle-chunk-prefix-size a) (tx-handle-chunk-prefix-size b))
+               (signum (- (tx-handle-chunk-prefix-size a)
+                          (tx-handle-chunk-prefix-size b))))
+              ((not (eq (tx-handle-cluster a) (tx-handle-cluster b)))
+               (let ((c (funcall (txgraph-fallback-order graph)
+                                 (tx-handle-chunk-fallback a)
+                                 (tx-handle-chunk-fallback b))))
+                 (if (zerop c)
+                     ;; Unreachable with a strong fallback order
+                     ;; (txgraph.cpp:518-520).
+                     (signum (- (%cluster-sequence (tx-handle-cluster a))
+                                (%cluster-sequence (tx-handle-cluster b))))
+                     c)))
+              (t (signum (- (tx-handle-lin-index a) (tx-handle-lin-index b))))))))
+
+(defun %ensure-chunk-index (graph)
+  "The mining-ordered index of every cluster's chunks, rebuilding it if a
+mutation invalidated it (Core m_main_chunkindex; rebuilt rather than
+incrementally maintained - unobservable, as the per-cluster chunk data the
+order is derived from is always eagerly current)."
+  (or (txgraph-chunk-index graph)
+      (let ((entries '()))
+        (loop for cluster being the hash-keys of (txgraph-clusters graph)
+              do (loop for chunk across (%cluster-chunks cluster)
+                       do (push chunk entries)))
+        (setf (txgraph-chunk-index graph)
+              (sort (coerce entries 'simple-vector)
+                    (lambda (x y)
+                      (minusp (%compare-main graph (%chunk-end x) (%chunk-end y)))))))))
+
+;;;; Mutations
+
+(defun txgraph-add-transaction (graph fee size)
+  "Add a new transaction with the given fee (satoshis, may be negative) and
+size (virtual bytes, > 0) and return its handle (Core AddTransaction,
+txgraph.cpp:2230-2260). The transaction starts as a singleton cluster."
+  (%assert-no-builder graph)
+  (assert (plusp size))
+  (let ((handle (%make-tx-handle graph (txgraph-next-id graph)))
+        (cluster (%graph-new-cluster graph)))
+    (incf (txgraph-next-id graph))
+    (depgraph-add-transaction (%cluster-depgraph cluster) (make-feefrac fee size))
+    (setf (%cluster-mapping cluster) (vector handle))
+    (incf (txgraph-tx-count graph))
+    (when (> size (txgraph-max-cluster-size graph))
+      (incf (txgraph-oversized-tx-count graph)))
+    (%cluster-updated graph cluster)
+    handle))
+
+(defun %split-cluster (graph cluster)
+  "Re-establish CLUSTER's connected components after removals (Core Split,
+txgraph.cpp:1439+): drop it if empty, keep it if still connected, otherwise
+replace it with one masked copy per component."
+  (let* ((dg (%cluster-depgraph cluster))
+         (todo (depgraph-positions dg)))
+    (cond ((zerop todo)
+           (remhash cluster (txgraph-clusters graph)))
+          ((depgraph-connected-p dg)
+           (%cluster-updated graph cluster))
+          (t
+           (remhash cluster (txgraph-clusters graph))
+           (loop until (zerop todo)
+                 do (let* ((component (depgraph-find-connected-component dg todo))
+                           (new (%graph-new-cluster graph))
+                           (new-dg (%copy-depgraph dg)))
+                      (depgraph-remove-transactions
+                       new-dg (logandc2 (depgraph-positions dg) component))
+                      (setf (%cluster-depgraph new) new-dg
+                            (%cluster-mapping new) (copy-seq (%cluster-mapping cluster)))
+                      (%cluster-updated graph new)
+                      (setf todo (logandc2 todo component))))))))
+
+(defun txgraph-remove-transaction (graph handle)
+  "Remove HANDLE's transaction; a no-op if already removed (Core
+RemoveTransaction, txgraph.cpp:2262-2279). Splits the cluster into connected
+components (removal only masks the dependency closure, so a transaction
+bridged by the removed one stays connected to its grandparents), drops
+pending dependencies involving the transaction, and retries pending ones
+that removals may have made applicable."
+  (%check-handle graph handle)
+  (%assert-no-builder graph)
+  (let ((cluster (tx-handle-cluster handle)))
+    (when cluster
+      (let* ((dg (%cluster-depgraph cluster))
+             (pos (tx-handle-pos handle)))
+        (when (> (feefrac-size (depgraph-tx-feerate dg pos))
+                 (txgraph-max-cluster-size graph))
+          (decf (txgraph-oversized-tx-count graph)))
+        (depgraph-remove-transactions dg (ash 1 pos))
+        (setf (tx-handle-cluster handle) nil)
+        (decf (txgraph-tx-count graph))
+        (%split-cluster graph cluster)
+        (%resolve-pending graph)
+        (setf (txgraph-chunk-index graph) nil))))
+  (values))
+
+(defun %pending-groups (graph &key include-oversized-singletons)
+  "Partition the clusters referenced by pending dependencies into connected
+groups by union-find (Core GroupClusters, txgraph.cpp:1856-2066), optionally
+seeding a group for each individually-oversized singleton cluster (as Core
+does for Trim, txgraph.cpp:1877-1886). Returns a list of (clusters deps
+count size) with COUNT/SIZE the would-be merged totals."
+  (let ((parent (make-hash-table :test 'eq)))
+    (labels ((add (c)
+               (unless (gethash c parent) (setf (gethash c parent) c)))
+             (find-rep (c)
+               (let ((p (gethash c parent)))
+                 (if (eq p c)
+                     c
+                     (setf (gethash c parent) (find-rep p)))))
+             (union! (a b)
+               (let ((ra (find-rep a)) (rb (find-rep b)))
+                 (unless (eq ra rb) (setf (gethash ra parent) rb)))))
+      (dolist (dep (txgraph-pending-deps graph))
+        (let ((pc (tx-handle-cluster (car dep)))
+              (cc (tx-handle-cluster (cdr dep))))
+          (add pc) (add cc) (union! pc cc)))
+      (when include-oversized-singletons
+        (loop for c being the hash-keys of (txgraph-clusters graph)
+              when (and (= 1 (depgraph-tx-count (%cluster-depgraph c)))
+                        (> (%cluster-tx-size c) (txgraph-max-cluster-size graph)))
+                do (add c)))
+      (let ((groups (make-hash-table :test 'eq))    ; rep -> (clusters . deps)
+            (members '()))
+        ;; Snapshot the keys first: FIND-REP's path compression writes into
+        ;; PARENT, which is not allowed during traversal.
+        (loop for c being the hash-keys of parent do (push c members))
+        (dolist (c members)
+          (let ((cell (or (gethash (find-rep c) groups)
+                          (setf (gethash (find-rep c) groups) (cons '() '())))))
+            (push c (car cell))))
+        (dolist (dep (txgraph-pending-deps graph))
+          (push dep (cdr (gethash (find-rep (tx-handle-cluster (car dep))) groups))))
+        (loop for (clusters . deps) being the hash-values of groups
+              collect (list clusters deps
+                            (reduce #'+ clusters
+                                    :key (lambda (c) (depgraph-tx-count (%cluster-depgraph c))))
+                            (reduce #'+ clusters :key #'%cluster-tx-size)))))))
+
+(defun %merge-group (graph clusters deps)
+  "Merge CLUSTERS into one cluster, preserving each one's dependency
+closure, then apply the (parent-handle . child-handle) DEPS (the eager
+equivalent of Core Merge + Cluster::ApplyDependencies,
+txgraph.cpp:2068-2155). The caller has checked the combined limits."
+  (let ((target
+          (if (null (rest clusters))
+              (first clusters)
+              (let* ((total (reduce #'+ clusters
+                                    :key (lambda (c) (depgraph-tx-count (%cluster-depgraph c)))))
+                     (new (%graph-new-cluster graph))
+                     (dg (%cluster-depgraph new))
+                     (mapping (make-array total)))
+                ;; Copy the transactions.
+                (dolist (old clusters)
+                  (let ((old-dg (%cluster-depgraph old))
+                        (old-map (%cluster-mapping old)))
+                    (loop for pos across (%cluster-linearization old)
+                          for h = (aref old-map pos)
+                          for new-pos = (depgraph-add-transaction
+                                         dg (depgraph-tx-feerate old-dg pos))
+                          do (setf (aref mapping new-pos) h
+                                   (tx-handle-cluster h) new
+                                   (tx-handle-pos h) new-pos))))
+                (setf (%cluster-mapping new) mapping)
+                ;; Re-add each old cluster's internal dependencies (iterating
+                ;; reduced parents reconstructs the closure exactly).
+                (dolist (old clusters)
+                  (let ((old-dg (%cluster-depgraph old))
+                        (old-map (%cluster-mapping old)))
+                    (do-bits (i (depgraph-positions old-dg))
+                      (let ((parents 0))
+                        (do-bits (p (depgraph-reduced-parents old-dg i))
+                          (setf parents (logior parents (ash 1 (tx-handle-pos (aref old-map p))))))
+                        (unless (zerop parents)
+                          (depgraph-add-dependencies
+                           dg parents (tx-handle-pos (aref old-map i))))))))
+                (dolist (old clusters)
+                  (remhash old (txgraph-clusters graph)))
+                new))))
+    (let ((dg (%cluster-depgraph target)))
+      (dolist (dep deps)
+        (depgraph-add-dependencies dg (ash 1 (tx-handle-pos (car dep)))
+                                   (tx-handle-pos (cdr dep))))
+      (assert (depgraph-acyclic-p dg) ()
+              "txgraph: dependencies formed a cycle"))
+    (%cluster-updated graph target)))
+
+(defun %resolve-pending (graph)
+  "Drop pending dependencies whose endpoints were removed, then eagerly
+merge and apply every pending group whose combined totals fit within the
+limits (Core GroupClusters + ApplyDependencies + Merge, run to completion
+instead of lazily). Deps of over-limit groups stay pending, keeping the
+graph oversized until removals or TXGRAPH-TRIM resolve them."
+  (setf (txgraph-pending-deps graph)
+        (delete-if (lambda (dep)
+                     (or (null (tx-handle-cluster (car dep)))
+                         (null (tx-handle-cluster (cdr dep)))))
+                   (txgraph-pending-deps graph)))
+  (when (txgraph-pending-deps graph)
+    (let ((still-pending '()))
+      (dolist (group (%pending-groups graph))
+        (destructuring-bind (clusters deps count size) group
+          (if (and (<= count (txgraph-max-cluster-count graph))
+                   (<= size (txgraph-max-cluster-size graph)))
+              (%merge-group graph clusters deps)
+              (setf still-pending (nconc still-pending deps)))))
+      (setf (txgraph-pending-deps graph) still-pending))))
+
+(defun txgraph-add-dependency (graph parent child)
+  "Make PARENT's transaction a parent of CHILD's (Core AddDependency,
+txgraph.cpp:2281-2303). No-op when the two are the same, either is removed,
+or PARENT is already an ancestor of CHILD. PARENT must not (transitively)
+be a descendant of CHILD. If the merged cluster would exceed the limits the
+dependency is held pending and the graph becomes oversized."
+  (%check-handle graph parent)
+  (%check-handle graph child)
+  (%assert-no-builder graph)
+  (let ((pc (tx-handle-cluster parent))
+        (cc (tx-handle-cluster child)))
+    (unless (or (null pc) (null cc) (eq parent child))
+      (if (eq pc cc)
+          (let ((dg (%cluster-depgraph pc))
+                (ppos (tx-handle-pos parent))
+                (cpos (tx-handle-pos child)))
+            (assert (not (logbitp cpos (depgraph-ancestors dg ppos))) ()
+                    "txgraph-add-dependency: parent is a descendant of child")
+            (unless (logbitp ppos (depgraph-ancestors dg cpos))
+              (depgraph-add-dependencies dg (ash 1 ppos) cpos)
+              (%cluster-updated graph pc)))
+          (progn
+            (push (cons parent child) (txgraph-pending-deps graph))
+            (%resolve-pending graph)))))
+  (values))
+
+(defun txgraph-set-transaction-fee (graph handle fee)
+  "Change the fee of HANDLE's transaction and re-linearize its cluster; a
+no-op if removed (Core SetTransactionFee, txgraph.cpp:2746-2760)."
+  (%check-handle graph handle)
+  (%assert-no-builder graph)
+  (let ((cluster (tx-handle-cluster handle)))
+    (when cluster
+      (setf (feefrac-fee (depgraph-tx-feerate (%cluster-depgraph cluster)
+                                              (tx-handle-pos handle)))
+            fee)
+      (%cluster-updated graph cluster)))
+  (values))
+
+;;;; Queries
+
+(defun txgraph-get-individual-feerate (graph handle)
+  "The transaction's own feefrac, or the empty feefrac if removed (Core
+GetIndividualFeerate). Available even when oversized."
+  (%check-handle graph handle)
+  (let ((cluster (tx-handle-cluster handle)))
+    (if cluster
+        (copy-feefrac (depgraph-tx-feerate (%cluster-depgraph cluster)
+                                           (tx-handle-pos handle)))
+        (make-feefrac))))
+
+(defun txgraph-get-main-chunk-feerate (graph handle)
+  "The feefrac of the chunk HANDLE's transaction is in, or the empty feefrac
+if removed (Core GetMainChunkFeerate). The graph must not be oversized."
+  (%check-handle graph handle)
+  (%assert-not-oversized graph 'txgraph-get-main-chunk-feerate)
+  (if (tx-handle-cluster handle)
+      (copy-feefrac (tx-handle-chunk-feerate handle))
+      (make-feefrac)))
+
+(defun txgraph-get-cluster (graph handle)
+  "All handles in the cluster HANDLE's transaction is in, in linearization
+order, or NIL if removed (Core GetCluster). The graph must not be
+oversized."
+  (%check-handle graph handle)
+  (%assert-not-oversized graph 'txgraph-get-cluster)
+  (let ((cluster (tx-handle-cluster handle)))
+    (when cluster
+      (loop for pos across (%cluster-linearization cluster)
+            collect (aref (%cluster-mapping cluster) pos)))))
+
+(defun txgraph-get-ancestors (graph handle)
+  "All ancestors of HANDLE's transaction, including itself, in unspecified
+order; NIL if removed (Core GetAncestors). The graph must not be oversized."
+  (%check-handle graph handle)
+  (%assert-not-oversized graph 'txgraph-get-ancestors)
+  (let ((cluster (tx-handle-cluster handle)))
+    (when cluster
+      (%positions-handles cluster (depgraph-ancestors (%cluster-depgraph cluster)
+                                                      (tx-handle-pos handle))))))
+
+(defun txgraph-get-descendants (graph handle)
+  "All descendants of HANDLE's transaction, including itself, in unspecified
+order; NIL if removed (Core GetDescendants). The graph must not be
+oversized."
+  (%check-handle graph handle)
+  (%assert-not-oversized graph 'txgraph-get-descendants)
+  (let ((cluster (tx-handle-cluster handle)))
+    (when cluster
+      (%positions-handles cluster (depgraph-descendants (%cluster-depgraph cluster)
+                                                        (tx-handle-pos handle))))))
+
+(defun %closure-union (graph handles what closure-fn)
+  "Union of per-transaction closures over HANDLES, each handle reported
+once; removed handles are ignored (Core GetAncestorsUnion /
+GetDescendantsUnion, txgraph.cpp:2470-2534)."
+  (%assert-not-oversized graph what)
+  (let ((per-cluster (make-hash-table :test 'eq))
+        (out '()))
+    (dolist (h handles)
+      (%check-handle graph h)
+      (let ((cluster (tx-handle-cluster h)))
+        (when cluster
+          (setf (gethash cluster per-cluster)
+                (logior (gethash cluster per-cluster 0)
+                        (funcall closure-fn (%cluster-depgraph cluster)
+                                 (tx-handle-pos h)))))))
+    (loop for cluster being the hash-keys of per-cluster using (hash-value bits)
+          do (setf out (nconc out (%positions-handles cluster bits))))
+    out))
+
+(defun txgraph-get-ancestors-union (graph handles)
+  "Union of the ancestor sets of HANDLES; see %CLOSURE-UNION."
+  (%closure-union graph handles 'txgraph-get-ancestors-union #'depgraph-ancestors))
+
+(defun txgraph-get-descendants-union (graph handles)
+  "Union of the descendant sets of HANDLES; see %CLOSURE-UNION."
+  (%closure-union graph handles 'txgraph-get-descendants-union #'depgraph-descendants))
+
+(defun txgraph-compare-main-order (graph a b)
+  "Compare handles A and B by mining order: -1 when A would be mined first
+(Core CompareMainOrder, txgraph.cpp:2762-2781). Both must exist; the graph
+must not be oversized."
+  (%check-handle graph a)
+  (%check-handle graph b)
+  (%assert-not-oversized graph 'txgraph-compare-main-order)
+  (assert (and (tx-handle-cluster a) (tx-handle-cluster b)) ()
+          "txgraph-compare-main-order: both transactions must exist")
+  (%compare-main graph a b))
+
+(defun txgraph-count-distinct-clusters (graph handles)
+  "The number of distinct clusters the transactions of HANDLES belong to;
+removed handles are ignored (Core CountDistinctClusters,
+txgraph.cpp:2783-2808). The graph must not be oversized."
+  (%assert-not-oversized graph 'txgraph-count-distinct-clusters)
+  (let ((seen (make-hash-table :test 'eq)))
+    (dolist (h handles)
+      (%check-handle graph h)
+      (let ((cluster (tx-handle-cluster h)))
+        (when cluster (setf (gethash cluster seen) t))))
+    (hash-table-count seen)))
+
+;;;; Chunk-index consumers: block builder and eviction
+
+(defun txgraph-get-worst-main-chunk (graph)
+  "The last chunk in mining order - the one to evict first - as (values
+handles feerate), with the handles in REVERSE-topological order (each
+element preceded by all its descendants); (values NIL empty-feefrac) when
+the graph is empty (Core GetWorstMainChunk, txgraph.cpp:3258-3283). The
+graph must not be oversized."
+  (%assert-not-oversized graph 'txgraph-get-worst-main-chunk)
+  (let ((index (%ensure-chunk-index graph)))
+    (if (zerop (length index))
+        (values '() (make-feefrac))
+        (let ((chunk (svref index (1- (length index)))))
+          (values (reverse (coerce (%chunk-txs chunk) 'list))
+                  (copy-feefrac (%chunk-feerate chunk)))))))
+
+(defstruct (block-builder (:constructor %make-block-builder (graph index)))
+  "Iterator over the chunk index in mining order (Core BlockBuilderImpl,
+txgraph.cpp:850-877/3159-3251). While one exists, no mutations of its graph
+are allowed; call BLOCK-BUILDER-FINISH when done (the analogue of Core's
+destructor)."
+  (graph nil :read-only t)
+  (index #() :type simple-vector :read-only t)
+  (pos 0 :type fixnum)
+  ;; Clusters from which a chunk was skipped (Core m_excluded_clusters).
+  (excluded (make-hash-table :test 'eq) :type hash-table)
+  (finished nil))
+
+(defmethod print-object ((b block-builder) stream)
+  (print-unreadable-object (b stream :type t)
+    (format stream "~D/~D~:[~; finished~]"
+            (block-builder-pos b) (length (block-builder-index b))
+            (block-builder-finished b))))
+
+(defun make-block-builder (graph)
+  "Create a block builder over GRAPH's chunk index (Core GetBlockBuilder).
+The graph must not be oversized, and must not be mutated until
+BLOCK-BUILDER-FINISH is called."
+  (%assert-not-oversized graph 'make-block-builder)
+  (let ((index (%ensure-chunk-index graph)))
+    (incf (txgraph-builder-count graph))
+    (%make-block-builder graph index)))
+
+(defun block-builder-finish (builder)
+  "Release BUILDER, allowing graph mutations again (the explicit analogue
+of Core's BlockBuilderImpl destructor)."
+  (assert (not (block-builder-finished builder)))
+  (setf (block-builder-finished builder) t)
+  (decf (txgraph-builder-count (block-builder-graph builder)))
+  (values))
+
+(defun %builder-advance (builder)
+  "Move to the next chunk not belonging to a skipped cluster (Core
+BlockBuilderImpl::Next, txgraph.cpp:3159-3176)."
+  (let ((index (block-builder-index builder))
+        (excluded (block-builder-excluded builder)))
+    (loop do (incf (block-builder-pos builder))
+          while (and (< (block-builder-pos builder) (length index))
+                     (gethash (tx-handle-cluster
+                               (%chunk-end (svref index (block-builder-pos builder))))
+                              excluded)))))
+
+(defun block-builder-current-chunk (builder)
+  "The chunk currently suggested for inclusion as (values handles feerate),
+handles in topological order, or NIL when iteration is done (Core
+GetCurrentChunk)."
+  (let ((index (block-builder-index builder))
+        (pos (block-builder-pos builder)))
+    (when (< pos (length index))
+      (let ((chunk (svref index pos)))
+        (values (coerce (%chunk-txs chunk) 'list)
+                (copy-feefrac (%chunk-feerate chunk)))))))
+
+(defun block-builder-include (builder)
+  "Mark the current chunk as included and move to the next (Core Include)."
+  (%builder-advance builder)
+  (values))
+
+(defun block-builder-skip (builder)
+  "Mark the current chunk as skipped and move on; no further chunks from
+its cluster will be reported, as including them without it could be
+topologically invalid (Core Skip, txgraph.cpp:3241-3251)."
+  (let ((index (block-builder-index builder))
+        (pos (block-builder-pos builder)))
+    (when (< pos (length index))
+      (setf (gethash (tx-handle-cluster (%chunk-end (svref index pos)))
+                     (block-builder-excluded builder))
+            t)))
+  (%builder-advance builder)
+  (values))
+
+;;;; Trim
+
+(defstruct (%trim-entry (:constructor %make-trim-entry (handle chunk-feerate size)))
+  "Per-transaction state for TXGRAPH-TRIM (Core TrimTxData, txgraph.cpp:61-99)."
+  (handle nil :read-only t)
+  (chunk-feerate nil :read-only t)
+  (size 0 :read-only t)
+  (deps-left 0)                 ; unmet dependency instances
+  (parents '())                 ; parent entries, one per dependency instance
+  (children '())                ; child entries, one per dependency instance
+  (included nil)
+  ;; Union-find over included entries (path-splitting + union by count).
+  (uf-parent nil)
+  (uf-count 1)
+  (uf-size 0))
+
+(defun %trim-find (e)
+  (loop until (eq (%trim-entry-uf-parent e) e)
+        do (let ((p (%trim-entry-uf-parent e)))
+             (setf (%trim-entry-uf-parent e) (%trim-entry-uf-parent p)
+                   e p)))
+  e)
+
+(defun %trim-union (a b)
+  (let ((ra (%trim-find a)) (rb (%trim-find b)))
+    (if (eq ra rb)
+        ra
+        (progn
+          (when (< (%trim-entry-uf-count ra) (%trim-entry-uf-count rb))
+            (rotatef ra rb))
+          (setf (%trim-entry-uf-parent rb) ra)
+          (incf (%trim-entry-uf-size ra) (%trim-entry-uf-size rb))
+          (incf (%trim-entry-uf-count ra) (%trim-entry-uf-count rb))
+          ra))))
+
+(defun %trim-group (graph clusters deps)
+  "Choose the transactions to drop from the would-be cluster formed by
+CLUSTERS + DEPS so that the result respects the limits (Core Trim's
+per-group body, txgraph.cpp:3300-3527). A rudimentary merged linearization
+is simulated: every transaction implicitly depends on its predecessor in
+its cluster's linearization (so cluster prefixes are consumed in order),
+plus the explicit DEPS; transactions are greedily included best-chunk-
+feerate-first unless joining them (with everything they depend on, tracked
+by union-find) would exceed the limits. Whatever is not included - which
+automatically covers all descendants of anything skipped - is returned as a
+list of handles to remove."
+  (let ((entries (make-hash-table :test 'eq))
+        (fallback (txgraph-fallback-order graph))
+        (all '()))
+    (flet ((add-dep (par chl)
+             (push chl (%trim-entry-children par))
+             (push par (%trim-entry-parents chl))
+             (incf (%trim-entry-deps-left chl))))
+      (dolist (cluster clusters)
+        (let ((mapping (%cluster-mapping cluster))
+              (dg (%cluster-depgraph cluster))
+              (prev nil))
+          (loop for pos across (%cluster-linearization cluster)
+                for h = (aref mapping pos)
+                for e = (%make-trim-entry
+                         h (tx-handle-chunk-feerate h)
+                         (feefrac-size (depgraph-tx-feerate dg pos)))
+                do (setf (gethash h entries) e)
+                   (push e all)
+                   (when prev (add-dep prev e))
+                   (setf prev e))))
+      (dolist (dep deps)
+        (add-dep (gethash (car dep) entries) (gethash (cdr dep) entries))))
+    ;; Greedy inclusion, best chunk feerate first (full feefrac order; Core
+    ;; leaves exact ties unspecified - we break them with the fallback
+    ;; order for determinism).
+    (let ((ready (remove-if-not
+                  (lambda (e) (and (zerop (%trim-entry-deps-left e))
+                                   (<= (%trim-entry-size e)
+                                       (txgraph-max-cluster-size graph))))
+                  all)))
+      (loop while ready
+            do (let ((best (first ready)))
+                 (dolist (e (rest ready))
+                   (let ((cmp (feefrac-compare (%trim-entry-chunk-feerate e)
+                                               (%trim-entry-chunk-feerate best))))
+                     (when (or (plusp cmp)
+                               (and (zerop cmp)
+                                    (minusp (funcall fallback
+                                                     (%trim-entry-handle e)
+                                                     (%trim-entry-handle best)))))
+                       (setf best e))))
+                 (setf ready (delete best ready :test #'eq :count 1))
+                 (setf (%trim-entry-uf-parent best) best
+                       (%trim-entry-uf-count best) 1
+                       (%trim-entry-uf-size best) (%trim-entry-size best))
+                 ;; The distinct partitions BEST depends on (parents are all
+                 ;; included already, or BEST would not be ready).
+                 (let ((reps '())
+                       (new-count 1)
+                       (new-size (%trim-entry-size best)))
+                   (dolist (p (%trim-entry-parents best))
+                     (pushnew (%trim-find p) reps :test #'eq))
+                   (dolist (r reps)
+                     (incf new-count (%trim-entry-uf-count r))
+                     (incf new-size (%trim-entry-uf-size r)))
+                   (when (and (<= new-count (txgraph-max-cluster-count graph))
+                              (<= new-size (txgraph-max-cluster-size graph)))
+                     (dolist (r reps) (%trim-union best r))
+                     (setf (%trim-entry-included best) t)
+                     (dolist (c (%trim-entry-children best))
+                       (when (zerop (decf (%trim-entry-deps-left c)))
+                         (push c ready))))))))
+    (loop for e in all
+          unless (%trim-entry-included e)
+            collect (%trim-entry-handle e))))
+
+(defun txgraph-trim (graph)
+  "Restore the cluster limits after bulk operations (reorg re-adds) by
+removing transactions - together with their would-be descendants - from
+every over-limit would-be cluster, keeping the best chunks (Core Trim,
+txgraph.cpp:3285-3533). Also removes individually-oversized transactions.
+Fast but best-effort. Returns the list of removed handles; a no-op (NIL)
+unless the graph is oversized."
+  (%assert-no-builder graph)
+  (if (not (txgraph-oversized-p graph))
+      '()
+      (let ((removed '()))
+        (dolist (group (%pending-groups graph :include-oversized-singletons t))
+          (destructuring-bind (clusters deps count size) group
+            (when (or (> count (txgraph-max-cluster-count graph))
+                      (> size (txgraph-max-cluster-size graph)))
+              (setf removed (nconc removed (%trim-group graph clusters deps))))))
+        (dolist (h removed)
+          (txgraph-remove-transaction graph h))
+        (assert (not (txgraph-oversized-p graph)))
+        removed)))
+
+;;;; Consistency check
+
+(defun txgraph-sanity-check (graph)
+  "Verify GRAPH's internal invariants (Core TxGraphImpl::SanityCheck,
+txgraph.cpp:2932+): cluster/handle/mapping consistency, connectivity,
+acyclicity, limits, eagerly-cached chunk data, pending-dependency
+bookkeeping, and chunk-index order. Signals an error on violation;
+returns T."
+  (let ((tx-total 0)
+        (oversized-txs 0))
+    (loop for cluster being the hash-keys of (txgraph-clusters graph) do
+      (let* ((dg (%cluster-depgraph cluster))
+             (lin (%cluster-linearization cluster))
+             (mapping (%cluster-mapping cluster))
+             (n (depgraph-tx-count dg)))
+        (assert (plusp n))
+        (incf tx-total n)
+        (assert (depgraph-acyclic-p dg))
+        (assert (depgraph-connected-p dg))
+        (assert (linearization-topological-p dg lin))
+        (assert (<= n (txgraph-max-cluster-count graph)))
+        ;; Only individually-oversized singletons may exceed the size limit.
+        (unless (= n 1)
+          (assert (<= (%cluster-tx-size cluster) (txgraph-max-cluster-size graph))))
+        (let ((size 0))
+          (do-bits (i (depgraph-positions dg))
+            (let ((h (aref mapping i))
+                  (tx-size (feefrac-size (depgraph-tx-feerate dg i))))
+              (assert (eq (tx-handle-graph h) graph))
+              (assert (eq (tx-handle-cluster h) cluster))
+              (assert (= (tx-handle-pos h) i))
+              (incf size tx-size)
+              (when (> tx-size (txgraph-max-cluster-size graph))
+                (incf oversized-txs))))
+          (assert (= size (%cluster-tx-size cluster))))
+        ;; Chunk cache = fresh chunking; per-handle cached order data.
+        (let ((info (chunk-linearization-info dg lin))
+              (chunks (%cluster-chunks cluster))
+              (lin-idx 0)
+              (acc (make-feefrac))
+              (prev nil))
+          (assert (= (length info) (length chunks)))
+          (loop for si in info
+                for chunk across chunks
+                do (assert (feefrac= (setinfo-feerate si) (%chunk-feerate chunk)))
+                   ;; Chunk feerates are monotonically non-increasing.
+                   (when prev (assert (not (feefrac>> (%chunk-feerate chunk) prev))))
+                   (setf prev (%chunk-feerate chunk))
+                   (setf acc (if (feefrac<< (setinfo-feerate si) acc)
+                                 (copy-feefrac (setinfo-feerate si))
+                                 (feefrac+ acc (setinfo-feerate si))))
+                   (let ((max-h nil))
+                     (loop for h across (%chunk-txs chunk)
+                           do (when (or (null max-h)
+                                        (plusp (funcall (txgraph-fallback-order graph) h max-h)))
+                                (setf max-h h)))
+                     (loop for h across (%chunk-txs chunk)
+                           do (assert (logbitp (tx-handle-pos h) (setinfo-transactions si)))
+                              (assert (eq h (aref mapping (svref lin lin-idx))))
+                              (assert (= (tx-handle-lin-index h) lin-idx))
+                              (assert (eq (tx-handle-chunk-feerate h) (%chunk-feerate chunk)))
+                              (assert (= (tx-handle-chunk-prefix-size h) (feefrac-size acc)))
+                              (assert (eq (tx-handle-chunk-fallback h) max-h))
+                              (incf lin-idx))))
+          (assert (= lin-idx (length lin))))))
+    (assert (= tx-total (txgraph-tx-count graph)))
+    (assert (= oversized-txs (txgraph-oversized-tx-count graph)))
+    ;; Pending deps have live endpoints, and every pending group is
+    ;; genuinely over-limit (feasible ones must have been applied eagerly).
+    (dolist (dep (txgraph-pending-deps graph))
+      (assert (tx-handle-cluster (car dep)))
+      (assert (tx-handle-cluster (cdr dep))))
+    (dolist (group (%pending-groups graph))
+      (destructuring-bind (clusters deps count size) group
+        (declare (ignore clusters))
+        (when deps
+          (assert (or (> count (txgraph-max-cluster-count graph))
+                      (> size (txgraph-max-cluster-size graph)))))))
+    ;; The chunk index covers every chunk exactly once, in strictly
+    ;; ascending mining order.
+    (let ((index (%ensure-chunk-index graph))
+          (expected 0))
+      (loop for cluster being the hash-keys of (txgraph-clusters graph)
+            do (incf expected (length (%cluster-chunks cluster))))
+      (assert (= expected (length index)))
+      (loop for k from 1 below (length index)
+            do (assert (minusp (%compare-main graph
+                                              (%chunk-end (svref index (1- k)))
+                                              (%chunk-end (svref index k)))))))
+    t))

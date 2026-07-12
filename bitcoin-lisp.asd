@@ -72,6 +72,7 @@
                  (:module "mempool"
                   :components ((:file "feefrac")
                                (:file "cluster-linearize")
+                               (:file "txgraph")
                                (:file "orphan")
                                (:file "mempool")
                                (:file "fee-estimator")))
@@ -128,6 +129,8 @@
                              (:file "feefrac-tests")
                              ;; Cluster mempool: DepGraph/chunking/linearization
                              (:file "cluster-linearize-tests")
+                             ;; Cluster mempool: txgraph engine (Core txgraph.{h,cpp})
+                             (:file "txgraph-tests")
                              ;; Package relay tests (submitpackage)
                              (:file "package-tests")
                              ;; Mining / regtest tests
