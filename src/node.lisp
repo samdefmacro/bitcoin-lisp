@@ -1554,19 +1554,82 @@ off. Returns NIL (and stalls quietly) if the parent height's record is missing
 (defparameter +max-anchors+ 2
   "How many outbound peers to persist as reconnection anchors (Core saves 2).")
 
-(defconstant +anchors-magic+ #x414e4331)  ; "ANC1"
+(defconstant +anchors-magic-v1+ #x414e4331)  ; "ANC1" — bare IP strings, no port
+(defconstant +anchors-magic-v2+ #x414e4332)  ; "ANC2" — network-typed + port
 
 (defvar *pending-anchor-addresses* nil
-  "Anchor IP strings loaded at startup, consumed (and cleared) by the first
+  "Anchor host strings loaded at startup, consumed (and cleared) by the first
 connect-to-peers so they are attempted before DNS-seed candidates.")
 
 (defun anchors-dat-path (data-directory)
   "Path to anchors.dat in DATA-DIRECTORY."
   (merge-pathnames "anchors.dat" data-directory))
 
+(defun save-anchor-entries (path entries)
+  "Write anchor ENTRIES — a list of (network bytes port) — to PATH in the v2
+format: magic \"ANC2\", count byte, then per entry a BIP155-style net id,
+length-prefixed address bytes and a big-endian port (crash-safe: temp +
+fsync + atomic rename, CRC32-protected)."
+  (bitcoin-lisp.storage:save-file-with-crc32
+   path
+   (lambda (stream)
+     (loop for shift in '(24 16 8 0)
+           do (write-byte (ldb (byte 8 shift) +anchors-magic-v2+) stream))
+     (write-byte (length entries) stream)
+     (dolist (e entries)
+       (destructuring-bind (net bytes port) e
+         (write-byte (bitcoin-lisp.networking:network-key-id net) stream)
+         (write-byte (length bytes) stream)
+         (write-sequence bytes stream)
+         (write-byte (ldb (byte 8 8) port) stream)
+         (write-byte (ldb (byte 8 0) port) stream))))))
+
+(defun parse-anchor-entries (bytes)
+  "Parse anchors.dat payload BYTES (CRC already verified) into a list of
+(network bytes port). Reads the v2 network-typed format; a v1 file (bare IP
+strings without port) is MIGRATED: each string is parsed to a typed address,
+with the port NIL (caller substitutes the network default — all v1-era
+anchors were dialed at the default port anyway). Unparseable v1 entries
+(e.g. a hostname from addnode) are dropped. Returns NIL for unknown magic."
+  (let ((end (- (length bytes) 4))              ; stay inside payload (before CRC)
+        (magic (logior (ash (aref bytes 0) 24) (ash (aref bytes 1) 16)
+                       (ash (aref bytes 2) 8) (aref bytes 3)))
+        (entries '()))
+    (cond
+      ((= magic +anchors-magic-v2+)
+       (let ((count (aref bytes 4)) (pos 5))
+         (dotimes (i count)
+           (when (< (+ pos 2) end)
+             (let ((net (bitcoin-lisp.networking:key-id-network (aref bytes pos)))
+                   (len (aref bytes (1+ pos))))
+               (incf pos 2)
+               (when (and net (<= (+ pos len 2) end))
+                 (push (list net
+                             (coerce (subseq bytes pos (+ pos len))
+                                     '(simple-array (unsigned-byte 8) (*)))
+                             (logior (ash (aref bytes (+ pos len)) 8)
+                                     (aref bytes (+ pos len 1))))
+                       entries))
+               (incf pos (+ len 2)))))))
+      ((= magic +anchors-magic-v1+)
+       (let ((count (aref bytes 4)) (pos 5))
+         (dotimes (i count)
+           (when (< pos end)
+             (let ((len (aref bytes pos)))
+               (incf pos)
+               (when (<= (+ pos len) end)
+                 (multiple-value-bind (net addr-bytes)
+                     (bitcoin-lisp.networking:parse-network-address
+                      (map 'string #'code-char (subseq bytes pos (+ pos len))))
+                   (when net
+                     (push (list net addr-bytes nil) entries)))
+                 (incf pos len)))))))
+      (t (return-from parse-anchor-entries nil)))
+    (nreverse entries)))
+
 (defun save-anchors (node)
-  "Persist up to +max-anchors+ currently-connected outbound peers' addresses to
-anchors.dat (crash-safe: temp + fsync + atomic rename, CRC32-protected)."
+  "Persist up to +max-anchors+ currently-connected outbound peers to
+anchors.dat in the network-typed v2 format (net + address + port)."
   (let* ((ready-outbound
            (remove-if-not
             (lambda (p) (and (not (bitcoin-lisp.networking:peer-inbound p))
@@ -1581,46 +1644,45 @@ anchors.dat (crash-safe: temp + fsync + atomic rename, CRC32-protected)."
                                        :block-relay))
                        ready-outbound))
          (ready (or block-relay ready-outbound))
-         (addrs (mapcar #'bitcoin-lisp.networking:peer-address
-                        (subseq ready 0 (min +max-anchors+ (length ready))))))
-    (when addrs
+         (default-port (network-port (node-network node)))
+         (entries
+           (loop for p in (subseq ready 0 (min +max-anchors+ (length ready)))
+                 for (net bytes) = (multiple-value-list
+                                    (bitcoin-lisp.networking:parse-network-address
+                                     (bitcoin-lisp.networking:peer-address p)))
+                 when net                        ; hostname peers (addnode) skipped
+                   collect (list net bytes
+                                 (let ((conn (bitcoin-lisp.networking::peer-connection p)))
+                                   (if conn
+                                       (bitcoin-lisp.networking::connection-port conn)
+                                       default-port))))))
+    (when entries
       (handler-case
-          (bitcoin-lisp.storage:save-file-with-crc32
-           (anchors-dat-path (node-data-directory node))
-           (lambda (stream)
-             (write-byte (ldb (byte 8 24) +anchors-magic+) stream)
-             (write-byte (ldb (byte 8 16) +anchors-magic+) stream)
-             (write-byte (ldb (byte 8 8) +anchors-magic+) stream)
-             (write-byte (ldb (byte 8 0) +anchors-magic+) stream)
-             (write-byte (length addrs) stream)
-             (dolist (a addrs)
-               (let ((bytes (map '(vector (unsigned-byte 8)) #'char-code a)))
-                 (write-byte (min 255 (length bytes)) stream)
-                 (write-sequence bytes stream)))))
+          (save-anchor-entries (anchors-dat-path (node-data-directory node)) entries)
         (error (e) (log-warn "Failed to save anchors: ~A" e)))
-      (log-info "Saved ~D anchor peer~:P" (length addrs)))))
+      (log-info "Saved ~D anchor peer~:P" (length entries)))))
 
 (defun load-anchors (node)
   "Read anchors.dat into *pending-anchor-addresses* so the next connect attempts
-them first. Missing/corrupt file is ignored."
+them first. Missing/corrupt file is ignored; a v1-era file migrates (see
+parse-anchor-entries) and the next save rewrites it as v2. Only dialable
+networks become dial candidates — after P1 the file may name onion/i2p/cjdns
+anchors that nothing can connect to until P2. NOTE: the dial list is host
+strings consumed at the network default port (pre-existing limitation); the
+stored port is carried for the P2 dialer."
   (let ((bytes (bitcoin-lisp.storage:load-file-with-crc32
                 (anchors-dat-path (node-data-directory node)) 6)))
-    (when (and bytes
-               (= +anchors-magic+
-                  (logior (ash (aref bytes 0) 24) (ash (aref bytes 1) 16)
-                          (ash (aref bytes 2) 8) (aref bytes 3))))
-      (let ((count (aref bytes 4)) (pos 5) (addrs '()))
-        (dotimes (i count)
-          (when (< pos (- (length bytes) 4))         ; stay inside payload (before CRC)
-            (let ((len (aref bytes pos)))
-              (incf pos)
-              (when (<= (+ pos len) (- (length bytes) 4))
-                (push (map 'string #'code-char (subseq bytes pos (+ pos len))) addrs)
-                (incf pos len)))))
-        (setf *pending-anchor-addresses* (nreverse addrs))
-        (when *pending-anchor-addresses*
-          (log-info "Loaded ~D anchor peer~:P for priority reconnection"
-                    (length *pending-anchor-addresses*)))))))
+    (when bytes
+      (setf *pending-anchor-addresses*
+            (loop for entry in (parse-anchor-entries bytes)
+                  for net = (first entry)
+                  when (and (bitcoin-lisp.networking:dialable-network-p net)
+                            (bitcoin-lisp.networking:reachable-network-p net))
+                    collect (bitcoin-lisp.networking:network-address-to-string
+                             net (second entry))))
+      (when *pending-anchor-addresses*
+        (log-info "Loaded ~D anchor peer~:P for priority reconnection"
+                  (length *pending-anchor-addresses*))))))
 
 (defun connect-to-peers (node max-peers &key (timeout 60) (min-peers 1))
   "Connect to Bitcoin network peers.
@@ -1644,7 +1706,9 @@ Returns the number of peers connected."
       (let ((seen (make-hash-table :test 'equal))
             (picks '()))
         (dotimes (i (* max-peers 8))
-          (let ((pa (bitcoin-lisp.networking:address-book-select address-book)))
+          ;; select-dialable-address, never raw select: post-BIP155 the book
+          ;; can hold torv3/i2p/cjdns entries nothing can dial until P2.
+          (let ((pa (bitcoin-lisp.networking:select-dialable-address address-book)))
             (when pa
               (let ((str (bitcoin-lisp.networking:ip-bytes-to-string
                           (bitcoin-lisp.networking:peer-address-ip pa))))
@@ -1966,11 +2030,13 @@ reconnection anchors.")
 
 (defun %addrman-pick-unconnected (node &key new-only)
   "Pick an addrman address (as (values host port)) we're not already connected
-to, or NIL. NEW-ONLY restricts to the 'new' table (for feelers)."
+to, or NIL. NEW-ONLY restricts to the 'new' table (for feelers). Goes through
+select-dialable-address so automatic slots (block-relay, feelers) can never
+draw a torv3/i2p/cjdns record — representable since P1, dialable only at P2."
   (let ((ab (node-address-book node)))
     (when ab
       (dotimes (_ 20)
-        (let ((pa (bitcoin-lisp.networking:address-book-select ab :new-only new-only)))
+        (let ((pa (bitcoin-lisp.networking:select-dialable-address ab :new-only new-only)))
           (when pa
             (let ((ip (bitcoin-lisp.networking:ip-bytes-to-string
                        (bitcoin-lisp.networking:peer-address-ip pa))))

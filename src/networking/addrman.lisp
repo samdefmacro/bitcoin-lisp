@@ -97,28 +97,68 @@ consistency matters (the key is a per-node secret), not byte-compat with Core."
               (ash (aref h 4) 32) (ash (aref h 5) 40) (ash (aref h 6) 48)
               (ash (aref h 7) 56)))))
 
-(defun net-group-key (ip)
-  "GetGroup (no ASMap): IPv4 -> [1, /16]; IPv6 -> [2, /32]; else [0]. The bucket
-group used to spread addresses across buckets by network operator."
-  (cond
-    ((ipv4-mapped-p ip)
-     (make-array 3 :element-type '(unsigned-byte 8)
-                   :initial-contents (list 1 (aref ip 12) (aref ip 13))))
-    ((notevery #'zerop ip)
-     (make-array 5 :element-type '(unsigned-byte 8)
-                   :initial-contents (list 2 (aref ip 0) (aref ip 1)
-                                           (aref ip 2) (aref ip 3))))
-    (t (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0))))
+(defun net-group-key (ip &optional net)
+  "GetGroup (no ASMap; Core netgroup.cpp:19-107): the bucket group used to
+spread addresses across buckets by network operator. IPv4 -> [1, /16];
+IPv6 -> [2, /32]; TORv3/I2P -> [net, addr[0]|0x0F] (4 group bits of a
+pubkey-derived address); CJDNS -> [5, addr[0], addr[1]|0x0F] (12 bits,
+skipping the constant 0xFC prefix byte); unroutable -> [0]. The leading
+byte is Core's Network enum value (IPV4=1 IPV6=2 ONION=3 I2P=4 CJDNS=5).
+NET NIL derives IPv4/IPv6 from the 16-byte mapped form."
+  (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
+    (case net
+      (:ipv4
+       (if (ipv4-mapped-p ip)
+           (make-array 3 :element-type '(unsigned-byte 8)
+                         :initial-contents (list 1 (aref ip 12) (aref ip 13)))
+           (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (:ipv6
+       (if (notevery #'zerop ip)
+           (make-array 5 :element-type '(unsigned-byte 8)
+                         :initial-contents (list 2 (aref ip 0) (aref ip 1)
+                                                 (aref ip 2) (aref ip 3)))
+           (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0)))
+      (:torv3
+       (make-array 2 :element-type '(unsigned-byte 8)
+                     :initial-contents (list 3 (logior (aref ip 0) #x0F))))
+      (:i2p
+       (make-array 2 :element-type '(unsigned-byte 8)
+                     :initial-contents (list 4 (logior (aref ip 0) #x0F))))
+      (:cjdns
+       (make-array 3 :element-type '(unsigned-byte 8)
+                     :initial-contents (list 5 (aref ip 0)
+                                             (logior (aref ip 1) #x0F))))
+      (t (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0)))))
 
-(defun address-routable-p (ip)
-  "Minimal IsRoutable: a non-zero 16-byte address."
-  (and (= (length ip) 16) (notevery #'zerop ip)))
+(defun address-routable-p (ip &optional net)
+  "Minimal IsRoutable, per network: correct byte length, non-zero, CJDNS
+carries the 0xFC prefix, and plain IPv6 in fc00::/7 (RFC4193, CJDNS's
+carve-out) is NOT routable — Core drops such gossip unless it arrives
+properly tagged NET_CJDNS. IPv4 private ranges are still accepted (long-
+standing deliberate divergence for private/regtest setups)."
+  (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
+    (and net
+         (= (length ip) (network-address-length net))
+         (notevery #'zerop ip)
+         (case net
+           (:cjdns (= (aref ip 0) #xFC))
+           (:ipv6 (not (member (aref ip 0) '(#xFC #xFD))))
+           (t t)))))
+
+(defun peer-address-key (pa)
+  "The addrman map key for record PA (network-typed)."
+  (make-address-key (peer-address-ip pa) (peer-address-port pa)
+                    (peer-address-network pa)))
+
+(defun peer-address-group (pa)
+  "The netgroup key for record PA (network-typed)."
+  (net-group-key (peer-address-ip pa) (peer-address-network pa)))
 
 (defun tried-bucket (book pa)
   "Tried-table bucket for PA (Core GetTriedBucket)."
   (let* ((key (address-book-key book))
-         (akey (make-address-key (peer-address-ip pa) (peer-address-port pa)))
-         (group (net-group-key (peer-address-ip pa)))
+         (akey (peer-address-key pa))
+         (group (peer-address-group pa))
          (h1 (addrman-cheap-hash key akey))
          (h2 (addrman-cheap-hash
               key group (int-to-le-bytes
@@ -128,7 +168,7 @@ group used to spread addresses across buckets by network operator."
 (defun new-bucket (book pa source-group)
   "New-table bucket for PA learned from SOURCE-GROUP (Core GetNewBucket)."
   (let* ((key (address-book-key book))
-         (group (net-group-key (peer-address-ip pa)))
+         (group (peer-address-group pa))
          (h1 (addrman-cheap-hash key group source-group))
          (h2 (addrman-cheap-hash
               key source-group (int-to-le-bytes
@@ -147,8 +187,7 @@ scan over all buckets (MakeTried) computes AKEY once instead of per bucket."
 (defun bucket-position (book pa new-p bucket)
   "Slot within BUCKET for PA (Core GetBucketPosition). Depends only on the
 address + bucket + table, so MakeTried can scan all buckets at this position."
-  (bucket-position-akey
-   book (make-address-key (peer-address-ip pa) (peer-address-port pa)) new-p bucket))
+  (bucket-position-akey book (peer-address-key pa) new-p bucket))
 
 ;;;; Quality (Core IsTerrible / GetChance)
 
@@ -192,19 +231,21 @@ address + bucket + table, so MakeTried can scan all buckets at this position."
 
 ;;;; Core map operations
 
-(defun ab-find (book ip port)
-  "Return the peer-address record for IP:PORT, or NIL."
-  (let ((id (gethash (make-address-key ip port) (address-book-addr-map book))))
+(defun ab-find (book ip port &optional net)
+  "Return the peer-address record for IP:PORT on network NET (NIL derives
+IPv4/IPv6 from the 16-byte form), or NIL."
+  (let ((id (gethash (make-address-key ip port net) (address-book-addr-map book))))
     (and id (gethash id (address-book-info book)))))
 
-(defun ab-create (book ip port services time source-group)
+(defun ab-create (book ip port services time source-group &optional net)
   "Create and register a fresh record (not yet in any bucket). Caller counts it."
   (let* ((id (address-book-next-id book))
-         (pa (make-peer-address :ip (copy-seq ip) :port port :services services
-                                :last-seen time :source-group source-group :id id)))
+         (pa (make-peer-address :net net :ip (copy-seq ip) :port port
+                                :services services :last-seen time
+                                :source-group source-group :id id)))
     (incf (address-book-next-id book))
     (setf (gethash id (address-book-info book)) pa)
-    (setf (gethash (make-address-key ip port) (address-book-addr-map book)) id)
+    (setf (gethash (make-address-key ip port net) (address-book-addr-map book)) id)
     (ab-random-push book pa)
     pa))
 
@@ -214,8 +255,7 @@ address + bucket + table, so MakeTried can scan all buckets at this position."
     (when pa
       (decf (address-book-n-new book))
       (ab-random-remove book pa)
-      (remhash (make-address-key (peer-address-ip pa) (peer-address-port pa))
-               (address-book-addr-map book))
+      (remhash (peer-address-key pa) (address-book-addr-map book))
       (remhash id (address-book-info book)))))
 
 (defun ab-clear-new (book bucket pos)
@@ -236,7 +276,7 @@ address + bucket + table, so MakeTried can scan all buckets at this position."
 incumbent back to a new bucket."
   (let ((nt (address-book-new-table book))
         (id (peer-address-id pa))
-        (akey (make-address-key (peer-address-ip pa) (peer-address-port pa))))
+        (akey (peer-address-key pa)))
     ;; Remove from every new bucket (scan by position — independent of source;
     ;; AKEY is computed once and reused across all 1024 buckets).
     (dotimes (b +addrman-new-bucket-count+)
@@ -258,7 +298,7 @@ incumbent back to a new bucket."
           (setf (aref tt slot) -1)
           (decf (address-book-n-tried book))
           (let* ((sg (or (peer-address-source-group old)
-                         (net-group-key (peer-address-ip old))))
+                         (peer-address-group old)))
                  (ub (new-bucket book old sg))
                  (up (bucket-position book old t ub)))
             (ab-clear-new book ub up)
@@ -276,22 +316,28 @@ incumbent back to a new bucket."
   "Total addresses tracked (new + tried)."
   (+ (address-book-n-new book) (address-book-n-tried book)))
 
-(defun address-book-lookup (book ip port)
-  "Return the record for IP:PORT, or NIL (Core Find)."
-  (ab-find book ip port))
+(defun address-book-lookup (book ip port &optional net)
+  "Return the record for IP:PORT on network NET (NIL derives IPv4/IPv6 from
+the 16-byte form), or NIL (Core Find)."
+  (ab-find book ip port net))
 
 (defun address-book-add (book pa &optional source-ip)
-  "Add address PA (a peer-address carrying ip/port/services/last-seen) learned
-from SOURCE-IP (defaults to the address itself), placing it in a NEW bucket per
-Bitcoin Core AddrMan AddSingle. Returns T if newly inserted into a new bucket."
-  (let ((ip (peer-address-ip pa)))
-    (unless (address-routable-p ip)
+  "Add address PA (a peer-address carrying net/ip/port/services/last-seen)
+learned from SOURCE-IP (defaults to the address itself), placing it in a NEW
+bucket per Bitcoin Core AddrMan AddSingle. Returns T if newly inserted into a
+new bucket. SOURCE-IP is the gossiping peer's 16-byte IP (all sources are IP
+peers until non-IP transports land, P2+)."
+  (let ((ip (peer-address-ip pa))
+        (net (peer-address-network pa)))
+    (unless (address-routable-p ip net)
       (return-from address-book-add nil))
     (let* ((port (peer-address-port pa))
            (services (peer-address-services pa))
            (time (peer-address-last-seen pa))
-           (source-group (net-group-key (or source-ip ip)))
-           (existing (ab-find book ip port))
+           (source-group (if source-ip
+                             (net-group-key source-ip)
+                             (net-group-key ip net)))
+           (existing (ab-find book ip port net))
            (info nil))
       (if existing
           (progn
@@ -310,7 +356,8 @@ Bitcoin Core AddrMan AddSingle. Returns T if newly inserted into a new bucket."
                 (return-from address-book-add nil)))
             (setf info existing))
           (progn
-            (setf info (ab-create book ip port services time source-group))
+            (setf info (ab-create book ip port services time source-group
+                                  (peer-address-net pa)))
             (incf (address-book-n-new book))))
       (let* ((bucket (new-bucket book info source-group))
              (pos (bucket-position book info t bucket))
@@ -337,11 +384,11 @@ Bitcoin Core AddrMan AddSingle. Returns T if newly inserted into a new bucket."
         (setf (address-book-dirty book) t)
         insert))))
 
-(defun address-book-good (book ip port &optional (now (ab-now)))
+(defun address-book-good (book ip port &optional (now (ab-now)) net)
   "Record a successful connection to IP:PORT and promote it new -> tried
 (test-before-evict). Returns T if promoted, NIL if queued for collision test."
   (setf (address-book-last-good book) now)
-  (let ((pa (ab-find book ip port)))
+  (let ((pa (ab-find book ip port net)))
     (when pa
       (setf (peer-address-last-success pa) now
             (peer-address-last-attempt pa) now
@@ -359,9 +406,9 @@ Bitcoin Core AddrMan AddSingle. Returns T if newly inserted into a new bucket."
               nil)
             (progn (ab-make-tried book pa) t))))))
 
-(defun address-book-attempt (book ip port &key (count-failure t) (now (ab-now)))
+(defun address-book-attempt (book ip port &key (count-failure t) (now (ab-now)) net)
   "Record a connection attempt to IP:PORT (Core Attempt)."
-  (let ((pa (ab-find book ip port)))
+  (let ((pa (ab-find book ip port net)))
     (when pa
       (setf (peer-address-last-attempt pa) now)
       (when (and count-failure
@@ -369,10 +416,10 @@ Bitcoin Core AddrMan AddSingle. Returns T if newly inserted into a new bucket."
         (setf (peer-address-last-count-attempt pa) now)
         (incf (peer-address-n-attempts pa))))))
 
-(defun address-book-connected (book ip port &optional (now (ab-now)))
+(defun address-book-connected (book ip port &optional (now (ab-now)) net)
   "Refresh nTime after a working connection, throttled to avoid topology leaks
 (Core Connected — only bumps if >20 min stale)."
-  (let ((pa (ab-find book ip port)))
+  (let ((pa (ab-find book ip port net)))
     (when (and pa (> (- now (peer-address-last-seen pa)) 1200))
       (setf (peer-address-last-seen pa) now))))
 
@@ -413,6 +460,22 @@ entries via GetChance; alternates new/tried roughly 50/50 when both are present.
        (let ((v (address-book-random-ids book)))
          (when (plusp (fill-pointer v))
            (gethash (aref v (random (fill-pointer v))) (address-book-info book))))))))
+
+(defun select-dialable-address (book &key new-only (tries 20))
+  "address-book-select restricted to AUTOMATIC-outbound-eligible addresses:
+the network must be dialable by our transport stack (dialable-network-p —
+IPv4/IPv6 only until P2 onion/CJDNS dialing lands) AND reachable per
+-onlynet. Every automatic selection path (outbound slots, feelers,
+block-relay slots) must go through this, never raw address-book-select:
+post-BIP155 the book can hold torv3/i2p/cjdns records that nothing can
+connect to yet. Manual connections (addnode) bypass addrman entirely and
+are unaffected. Returns a peer-address or NIL after TRIES draws."
+  (dotimes (_ tries nil)
+    (let ((pa (address-book-select book :new-only new-only)))
+      (when pa
+        (let ((net (peer-address-network pa)))
+          (when (and (dialable-network-p net) (reachable-network-p net))
+            (return pa)))))))
 
 (defun address-book-get-addr (book &key (max +addrman-getaddr-max+)
                                          (pct +addrman-getaddr-pct+) (now (ab-now)))
@@ -466,11 +529,15 @@ challenger when the incumbent looks dead or the test window has elapsed."
 
 (defparameter +addrman-magic+ #(#x41 #x44 #x52 #x4D)  ; "ADRM"
   "Magic bytes for the bucket-format peers.dat.")
-(defconstant +addrman-format-version+ 3
-  "v3 appends each new-table entry's bucket numbers so multi-source
-placements (ref-count > 1) survive restart; v2 files still load, with
-each address reconstructed into the single bucket its source-group
-implies (the pre-v3 behavior).")
+(defconstant +addrman-format-version+ 4
+  "v4 makes entries network-typed (BIP155): a net-id byte and a
+variable-length address replace the fixed 16-byte IP, so torv3/i2p/cjdns
+records persist. v2/v3 files still load — their 16-byte IPs migrate in
+place (net derived from the mapped form) and the file is rewritten as v4
+on the next save. v3 added each new-table entry's bucket numbers so
+multi-source placements (ref-count > 1) survive restart; v2 files load
+with each address reconstructed into the single bucket its source-group
+implies.")
 
 (defun %new-table-buckets (book)
   "Map id -> list of new-bucket numbers currently referencing it (one scan
@@ -504,6 +571,9 @@ up to +addrman-new-buckets-per-address+ buckets)."
               (maphash
                (lambda (id pa)
                  (write-byte (if (peer-address-in-tried pa) 1 0) s)
+                 ;; v4: BIP155 net id + length-prefixed address bytes.
+                 (write-byte (network-key-id (peer-address-network pa)) s)
+                 (write-byte (length (peer-address-ip pa)) s)
                  (write-sequence (peer-address-ip pa) s)
                  (write-byte (ldb (byte 8 8) (peer-address-port pa)) s)
                  (write-byte (ldb (byte 8 0) (peer-address-port pa)) s)
@@ -530,17 +600,20 @@ up to +addrman-new-buckets-per-address+ buckets)."
   (setf (address-book-dirty book) nil)
   t)
 
-(defun ab-load-entry (book tried-p ip port services last-seen last-attempt
+(defun ab-load-entry (book tried-p net ip port services last-seen last-attempt
                       last-success n-attempts source-group
                       &optional new-buckets)
-  "Reconstruct one saved entry into BOOK, preserving its stats. NEW-BUCKETS,
-when supplied (v3 files), is the saved list of new-bucket numbers — the entry
-is placed back into each, restoring multi-source ref-counts. Without it (v2),
-the single bucket implied by the source-group is used. Positions within
-buckets re-derive from the address-book key, which load-address-book reads
-before any entry; only bucket NUMBERS need persisting."
+  "Reconstruct one saved entry into BOOK, preserving its stats. NET is the
+network keyword (v4 files), or NIL to derive IPv4/IPv6 from the 16-byte
+mapped IP (v2/v3 migration). NEW-BUCKETS, when supplied (v3+ files), is the
+saved list of new-bucket numbers — the entry is placed back into each,
+restoring multi-source ref-counts. Without it (v2), the single bucket
+implied by the source-group is used. Positions within buckets re-derive
+from the address-book key, which load-address-book reads before any entry;
+only bucket NUMBERS need persisting."
   (let ((pa (ab-create book ip port services last-seen
-                       (if (plusp (length source-group)) source-group nil))))
+                       (if (plusp (length source-group)) source-group nil)
+                       net)))
     (incf (address-book-n-new book))
     (setf (peer-address-last-attempt pa) last-attempt
           (peer-address-last-success pa) last-success
@@ -549,7 +622,7 @@ before any entry; only bucket NUMBERS need persisting."
     (let ((buckets (or (remove-duplicates new-buckets)
                        (list (new-bucket book pa
                                          (or (peer-address-source-group pa)
-                                             (net-group-key ip)))))))
+                                             (peer-address-group pa)))))))
       (setf (peer-address-ref-count pa) 0)
       (dolist (b buckets)
         (let ((p (bucket-position book pa t b)))
@@ -590,7 +663,7 @@ were loaded, NIL otherwise."
                     (bitcoin-lisp:log-warn "peers.dat unknown format; backing up to .bak")
                     (backup) (return-from load-address-book nil)))
                 (let ((version (bitcoin-lisp.serialization:read-uint32-le s)))
-                  (unless (member version '(2 3))
+                  (unless (member version '(2 3 4))
                     (bitcoin-lisp:log-warn "peers.dat version ~D unsupported; backing up to .bak"
                                            version)
                     (backup) (return-from load-address-book nil))
@@ -600,7 +673,14 @@ were loaded, NIL otherwise."
                 (let ((count (bitcoin-lisp.serialization:read-uint32-le s)))
                   (dotimes (i count)
                     (let* ((tried-p (= 1 (read-byte s)))
-                           (ip (make-array 16 :element-type '(unsigned-byte 8))))
+                           ;; v4: net-id + length-prefixed address; v2/v3:
+                           ;; fixed 16-byte IP, net derived (migrate-on-load;
+                           ;; the next save rewrites the file as v4).
+                           (net (when (>= version 4)
+                                  (or (key-id-network (read-byte s))
+                                      (error "peers.dat: unknown network id"))))
+                           (ip-len (if (>= version 4) (read-byte s) 16))
+                           (ip (make-array ip-len :element-type '(unsigned-byte 8))))
                       (read-sequence ip s)
                       (let* ((port (logior (ash (read-byte s) 8) (read-byte s)))
                              (services (bitcoin-lisp.serialization:read-uint64-le s))
@@ -615,7 +695,7 @@ were loaded, NIL otherwise."
                                 (when (>= version 3)
                                   (loop repeat (read-byte s)
                                         collect (bitcoin-lisp.serialization:read-uint16-le s)))))
-                          (ab-load-entry book tried-p ip port services last-seen
+                          (ab-load-entry book tried-p net ip port services last-seen
                                          last-attempt last-success n-attempts sg
                                          new-buckets)))))
                   (bitcoin-lisp:log-info "Loaded ~D peer addresses (~D tried) from peers.dat"
