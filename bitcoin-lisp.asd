@@ -47,6 +47,7 @@
                                (:file "bip32")))
                  (:module "serialization"
                   :components ((:file "binary")
+                               (:file "compressor")
                                (:file "types")
                                (:file "messages")
                                (:file "psbt")))
@@ -192,6 +193,8 @@
                              ;; Low-work headers sync (anti-DoS presync/redownload)
                              (:file "headers-sync-tests")
                              ;; bitcoin.conf + CLI argument parsing
-                             (:file "config-tests"))))
+                             (:file "config-tests")
+                             ;; TxOutCompression + hash_serialized_3
+                             (:file "compressor-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

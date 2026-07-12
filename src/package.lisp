@@ -75,6 +75,7 @@
    #:verify-signature
    #:parse-public-key
    #:public-key-valid-p
+   #:decompress-public-key
    #:ensure-secp256k1-loaded
    #:cleanup-secp256k1
    ;; Signing (private key -> pubkey / signature) + WIF
@@ -386,7 +387,21 @@
    #:parse-feefilter-payload
    #:make-feefilter-message
    #:make-addrv2-message
-   #:parse-addrv2-payload))
+   #:parse-addrv2-payload
+   ;; TxOutCompression (compressor.lisp — Core compressor.{h,cpp})
+   #:bb-write-core-varint
+   #:br-read-core-varint
+   #:compress-amount
+   #:decompress-amount
+   #:compress-script
+   #:decompress-script
+   #:special-script-size
+   #:bb-write-compressed-script
+   #:br-read-compressed-script
+   #:bb-write-compressed-tx-out
+   #:br-read-compressed-tx-out
+   #:bb-write-compressed-coin
+   #:br-read-compressed-coin))
 
 (defpackage #:bitcoin-lisp.storage
   (:use #:cl)
