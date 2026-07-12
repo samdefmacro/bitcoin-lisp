@@ -623,10 +623,11 @@ production store, so the size trigger never fires for it."
           (funcall callback (utxo-key-txid key) (uk-vout key) entry))))))
 
 (defun %coin-view-iterate (cache callback)
-  "Iteration over a coins-view-cache: flush, then walk base via
+  "Raw iteration over a coins-view-cache: flush, then walk base via
 LevelDB iterator. The iterator emits keys in lex order, which for our
 key encoding ('C' + txid + LE vout, all fixed-width) equals the
-on-disk 36-byte key order — same order utxo-set-iterate produces."
+on-disk 36-byte key order — same raw order %utxo-set-iterate produces.
+utxo-set-iterate layers Core's numeric-vout cursor order on top."
   (coins-view-cache-flush cache)
   (with-leveldb-iterator (iter (cvdb-db (cvc-base cache)))
     (leveldb-iter-seek-to-first iter)
@@ -650,17 +651,36 @@ on-disk 36-byte key order — same order utxo-set-iterate produces."
         (leveldb-iter-next iter)))))
 
 (defun utxo-set-iterate (view callback)
-  "Iterate over all UTXOs in deterministic order (on-disk 36-byte
-(txid || LE vout) lex order, matching Bitcoin Core's
-hash_serialized_3 input ordering). CALLBACK is called with
+  "Iterate over all UTXOs in Bitcoin Core's canonical UTXO cursor
+order: coins grouped per txid in serialized-txid lex order, vouts
+NUMERICALLY ascending within each txid — the order ComputeUTXOStats
+consumes (kernel/coinstats.cpp:112-146, which buffers each txid's
+outputs into a std::map<uint32_t, Coin>) and the assumeutxo snapshot
+cursor order (node/utxo_snapshot.h). The raw key walk yields LE-u32
+vout byte order, which diverges from numeric at vout >= 256
+(256 = #x00 #x01 sorts before 1 = #x01 #x00), so each txid's coins
+are buffered and sorted before delivery. CALLBACK is called with
 (txid vout entry) for each UTXO.
 
 For coins-view-cache, this forces a flush so the iteration sees a
 single consistent snapshot (matches Core's CCoinsViewDB::Cursor usage
 in gettxoutsetinfo)."
-  (etypecase view
-    (utxo-set        (%utxo-set-iterate view callback))
-    (coins-view-cache (%coin-view-iterate view callback))))
+  (let ((group-txid nil)
+        (group '()))                    ; (vout . entry) for group-txid
+    (labels ((emit-group ()
+               (when group
+                 (dolist (pair (sort group #'< :key #'car))
+                   (funcall callback group-txid (car pair) (cdr pair)))
+                 (setf group '())))
+             (collect (txid vout entry)
+               (unless (and group-txid (equalp txid group-txid))
+                 (emit-group)
+                 (setf group-txid txid))
+               (push (cons vout entry) group)))
+      (etypecase view
+        (utxo-set         (%utxo-set-iterate view #'collect))
+        (coins-view-cache (%coin-view-iterate view #'collect)))
+      (emit-group))))
 
 (defun utxo-set-total-amount (view)
   "Sum of all utxo-entry-value across the set."
@@ -735,27 +755,25 @@ does not affect the result."
     (bitcoin-lisp.crypto:muhash-finalize mu)))
 
 (defun compute-utxo-set-hash (view)
-  "Compute the hash_serialized_3 UTXO set hash. Matches Bitcoin Core's
-format. Returns a 32-byte SHA256 digest."
-  (let ((data (flexi-streams:with-output-to-sequence (out)
-                (utxo-set-iterate
-                 view
-                 (lambda (txid vout entry)
-                   (write-sequence txid out)
-                   (write-byte (logand vout #xFF) out)
-                   (write-byte (logand (ash vout -8) #xFF) out)
-                   (write-byte (logand (ash vout -16) #xFF) out)
-                   (write-byte (logand (ash vout -24) #xFF) out)
-                   (let ((h (utxo-entry-height entry)))
-                     (write-byte (logand h #xFF) out)
-                     (write-byte (logand (ash h -8) #xFF) out)
-                     (write-byte (logand (ash h -16) #xFF) out)
-                     (write-byte (logand (ash h -24) #xFF) out))
-                   (write-byte (if (utxo-entry-coinbase entry) 1 0) out)
-                   (let ((v (utxo-entry-value entry)))
-                     (loop for i from 0 below 8
-                           do (write-byte (logand (ash v (* -8 i)) #xFF) out)))
-                   (let ((script (utxo-entry-script-pubkey entry)))
-                     (bitcoin-lisp.serialization:write-compact-size out (length script))
-                     (write-sequence script out)))))))
-    (bitcoin-lisp.crypto:sha256 (coerce data '(simple-array (unsigned-byte 8) (*))))))
+  "Compute the hash_serialized_3 UTXO set hash: a double-SHA256 over
+per-coin preimages in Bitcoin Core's exact order and format
+(kernel/coinstats.cpp:88-146 ApplyHash/ComputeUTXOStats). Each coin
+contributes the same bytes TxOutSer feeds the MuHash path
+(coinstats.cpp:47-52): outpoint (txid || vout LE32), packed code
+(height << 1 | coinbase) as LE32, then the uncompressed CTxOut
+(value LE64 + compactsize-prefixed scriptPubKey) — coin-muhash-element.
+
+Ordering (txid-lex groups, numerically ascending vouts — Core's
+std::map<uint32_t, Coin>, coinstats.cpp:118-141) is guaranteed by
+utxo-set-iterate's cursor contract.
+
+Returns the 32-byte digest in internal byte order (hash-to-hex reverses
+for display, matching Core's uint256::GetHex)."
+  (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
+    (utxo-set-iterate
+     view
+     (lambda (txid vout entry)
+       (bitcoin-lisp.serialization:bb-write-bytes
+        buf (coin-muhash-element* txid vout entry))))
+    (bitcoin-lisp.crypto:hash256
+     (bitcoin-lisp.serialization:bb-finish buf))))
