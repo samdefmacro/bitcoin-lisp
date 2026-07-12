@@ -14,6 +14,7 @@
 (defconstant +rpc-misc-error+ -1)
 (defconstant +rpc-invalid-address-or-key+ -5)
 (defconstant +rpc-invalid-parameter+ -8)
+(defconstant +rpc-deserialization-error+ -22)
 (defconstant +rpc-client-node-already-added+ -23)
 (defconstant +rpc-client-node-not-added+ -24)
 (defconstant +rpc-verify-error+ -25)
