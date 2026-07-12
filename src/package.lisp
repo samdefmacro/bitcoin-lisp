@@ -264,6 +264,7 @@
    #:command-to-bytes
    #:bytes-to-command
    ;; Version message
+   #:+protocol-version+
    #:version-message
    #:make-version-message-bytes
    #:read-version-message
@@ -271,6 +272,7 @@
    #:version-message-services
    #:version-message-start-height
    #:version-message-user-agent
+   #:version-message-relay
    #:make-verack-message
    #:make-ping-message
    #:make-pong-message
@@ -384,6 +386,9 @@
    #:make-getaddr-message
    #:make-sendheaders-message
    #:make-wtxidrelay-message
+   #:+txreconciliation-version+
+   #:make-sendtxrcncl-message
+   #:parse-sendtxrcncl-payload
    #:parse-feefilter-payload
    #:make-feefilter-message
    #:make-addrv2-message
@@ -895,6 +900,18 @@
    ;; BIP324 v2 transport
    #:*v2-transport-enabled*
    #:v2-available-p
+   ;; SOCKS5 outbound proxy (Core netbase.cpp Socks5)
+   #:*proxy*
+   #:*onion-proxy*
+   #:proxy
+   #:make-proxy
+   #:proxy-host
+   #:proxy-port
+   #:proxy-randomize-credentials
+   #:socks5-connect
+   #:socks5-error
+   #:socks5-error-phase
+   #:next-proxy-credentials
    ;; Inbound listening
    #:open-listener
    #:close-listener
@@ -1082,6 +1099,7 @@
    #:*max-datacarrier-bytes*
    #:*permit-bare-multisig*
    #:*peer-block-filters*
+   #:*tx-reconciliation*
    #:pruning-enabled-p
    #:automatic-pruning-p
    #:minimum-chain-work

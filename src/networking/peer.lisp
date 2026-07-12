@@ -84,6 +84,18 @@
   (feefilter-rate 0 :type (unsigned-byte 64))          ; Peer's minimum fee rate (sat/kB)
   ;; BIP 339 wtxidrelay support
   (wtxid-relay nil :type boolean)                      ; Peer supports wtxid-based tx relay
+  ;; BIP 330 transaction reconciliation (Erlay) handshake state. Core keeps a
+  ;; per-peer {m_we_initiate, m_k0, m_k1} once registered, or just the locally
+  ;; generated salt while pre-registered (node/txreconciliation.cpp Impl
+  ;; m_states); we keep all of it on the peer struct so disconnect cleanup is
+  ;; free. At ref d3056bc only the handshake exists — nothing reads k0/k1 yet
+  ;; (the sketch exchange is unimplemented upstream too).
+  (recon-local-salt nil :type (or null (unsigned-byte 64))) ; ours, sent in sendtxrcncl
+  (recon-version 0 :type (unsigned-byte 32))          ; negotiated min(theirs, ours=1)
+  (recon-k0 nil :type (or null (unsigned-byte 64)))   ; short-id SipHash key halves
+  (recon-k1 nil :type (or null (unsigned-byte 64)))
+  (recon-we-initiate nil :type boolean)               ; T = we dialed them (outbound)
+  (recon-registered nil :type boolean)                ; sendtxrcncl exchanged both ways
   ;; DoS protection: per-peer rate limiters
   (rate-limit-inv nil)
   (rate-limit-tx nil)
@@ -279,6 +291,127 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
 connections do not (Core: fRelay=false, no tx inv/getdata either way)."
   (not (member (peer-conn-type peer) '(:block-relay :feeler))))
 
+;;; BIP330 sendtxrcncl handshake (Erlay). Core parity at ref d3056bc is the
+;;; handshake + salt storage only — no reqtxrcncl/sketch messages exist
+;;; upstream either (protocol.h:266 defines nothing beyond sendtxrcncl).
+
+(defun compute-recon-salt (salt1 salt2)
+  "Combine the two sendtxrcncl salts into the reconciliation short-id keys
+(Core txreconciliation.cpp:18-30 ComputeSalt): BIP340-style tagged hash with
+tag \"Tx Relay Salting\" over the two u64 salts serialized LE in ascending
+order; k0/k1 are the digest's first/second 8 bytes read LE (Core uint256
+GetUint64(0)/(1)). Returns (VALUES K0 K1)."
+  (let ((msg (make-array 16 :element-type '(unsigned-byte 8)))
+        (lo (min salt1 salt2))
+        (hi (max salt1 salt2)))
+    (dotimes (i 8)
+      (setf (aref msg i) (ldb (byte 8 (* 8 i)) lo)
+            (aref msg (+ 8 i)) (ldb (byte 8 (* 8 i)) hi)))
+    (let ((digest (bitcoin-lisp.crypto:tagged-hash "Tx Relay Salting" msg)))
+      (flet ((u64-le-at (offset)
+               (loop for i below 8
+                     sum (ash (aref digest (+ offset i)) (* 8 i)))))
+        (values (u64-le-at 0) (u64-le-at 8))))))
+
+(defun %forget-recon-state (peer)
+  "Erase all BIP330 reconciliation state for PEER (Core ForgetPeer,
+txreconciliation.cpp:128-136). All state lives on the peer struct, so a
+disconnect needs no extra cleanup."
+  (setf (peer-recon-local-salt peer) nil
+        (peer-recon-version peer) 0
+        (peer-recon-k0 peer) nil
+        (peer-recon-k1 peer) nil
+        (peer-recon-we-initiate peer) nil
+        (peer-recon-registered peer) nil))
+
+(defun %maybe-send-sendtxrcncl (peer)
+  "Announce BIP330 reconciliation support, after the peer's VERSION and before
+our VERACK (Core sends from its VERSION handler, net_processing.cpp:3728-3742),
+when: -txreconciliation is enabled, the negotiated protocol supports wtxid
+relay (>= 70016), our side of the connection relays txs (not block-relay/
+feeler), and the peer's VERSION set fRelay=1. On send, pre-register a random
+u64 local salt (txreconciliation.cpp:82-94 PreRegisterPeer). Always returns
+T — declining to offer never fails the handshake."
+  (let ((version-msg (peer-version peer)))
+    (when (and bitcoin-lisp:*tx-reconciliation*
+               version-msg
+               ;; Negotiated protocol = min(ours, theirs); ours is
+               ;; +protocol-version+ = 70016 (WTXID_RELAY_VERSION), so the
+               ;; gate reduces to theirs >= 70016.
+               (>= (bitcoin-lisp.serialization:version-message-version version-msg)
+                   bitcoin-lisp.serialization:+protocol-version+)
+               (peer-relays-txs-p peer)
+               (bitcoin-lisp.serialization:version-message-relay version-msg))
+      (let ((salt (random (expt 2 64))))
+        (setf (peer-recon-local-salt peer) salt)
+        (send-message peer
+                      (bitcoin-lisp.serialization:make-sendtxrcncl-message salt)))))
+  t)
+
+(defun %handle-handshake-sendtxrcncl (peer payload)
+  "Process a pre-verack sendtxrcncl (Core net_processing.cpp:3963-4014 +
+txreconciliation.cpp:97-126 RegisterPeer). Disconnects PEER and returns NIL
+on a protocol violation; returns T otherwise (registered, or benignly
+ignored)."
+  (flet ((violation (reason)
+           (bitcoin-lisp:log-cat "net" "sendtxrcncl ~A — disconnecting peer ~A"
+                                 reason (peer-address peer))
+           (disconnect-peer peer)
+           nil))
+    (cond
+      ;; Feature disabled: ignored entirely (net_processing.cpp:3964-3967).
+      ((not bitcoin-lisp:*tx-reconciliation*) t)
+      ;; Our VERSION indicated no tx relay on this connection (block-relay/
+      ;; feeler) — Core's RejectIncomingTxs check (:3976-3980).
+      ((not (peer-relays-txs-p peer))
+       (violation "received to which we indicated no tx relay"))
+      ;; The peer's own VERSION had fRelay=0 (:3982-3990).
+      ((not (and (peer-version peer)
+                 (bitcoin-lisp.serialization:version-message-relay
+                  (peer-version peer))))
+       (violation "received which indicated no tx relay to us"))
+      (t
+       (multiple-value-bind (their-version their-salt)
+           (handler-case
+               (bitcoin-lisp.serialization:parse-sendtxrcncl-payload payload)
+             (error () (values nil nil)))
+         (cond
+           ;; Truncated payload: Core's deserialize failure drops the peer.
+           ((null their-version) (violation "with malformed payload"))
+           ;; We never offered, so no pre-registration exists: ignore
+           ;; without disconnecting (RegisterPeer NOT_FOUND).
+           ((null (peer-recon-local-salt peer)) t)
+           ;; Second sendtxrcncl on one connection (ALREADY_REGISTERED).
+           ((peer-recon-registered peer)
+            (violation "from already registered peer"))
+           ;; Negotiated version = min(theirs, ours); v1 is the lowest, so
+           ;; below that is a violation — higher-than-ours downgrades fine
+           ;; (txreconciliation.cpp:112-119).
+           ((< (min their-version
+                    bitcoin-lisp.serialization:+txreconciliation-version+)
+               1)
+            (violation "with unsupported version"))
+           (t
+            (multiple-value-bind (k0 k1)
+                (compute-recon-salt (peer-recon-local-salt peer) their-salt)
+              (setf (peer-recon-version peer)
+                    (min their-version
+                         bitcoin-lisp.serialization:+txreconciliation-version+)
+                    (peer-recon-k0 peer) k0
+                    (peer-recon-k1 peer) k1
+                    ;; We initiate reconciliation rounds iff we dialed them
+                    ;; (Core: we_initiate = !is_peer_inbound).
+                    (peer-recon-we-initiate peer) (not (peer-inbound peer))
+                    (peer-recon-registered peer) t))
+            t)))))))
+
+(defun %verack-finalize-recon (peer)
+  "At VERACK time, reconciliation requires negotiated wtxid relay (which
+cannot be announced later): if the peer (pre-)registered but wtxidrelay never
+arrived, forget the reconciliation state (Core net_processing.cpp:3879-3886)."
+  (unless (and (peer-wtxid-relay peer) (peer-recon-registered peer))
+    (%forget-recon-state peer)))
+
 (defun %send-version-and-capabilities (peer)
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
@@ -337,19 +470,23 @@ Returns T on success, NIL if the first message wasn't a version."
 
 (defun %await-verack (peer &key (timeout 30))
   "Read messages until VERACK arrives (tolerating interleaved wtxidrelay/
-sendaddrv2/sendheaders), tracking the peer's advertised capabilities. Sets the
-peer :ready and returns T on VERACK; NIL otherwise."
+sendaddrv2/sendheaders/sendtxrcncl), tracking the peer's advertised
+capabilities. Sets the peer :ready and returns T on VERACK; NIL otherwise
+(including a sendtxrcncl protocol violation, which disconnects)."
   (loop repeat 10
         do (multiple-value-bind (command payload) (receive-message peer :timeout timeout)
-             (declare (ignore payload))
              (unless command (return nil))
              (cond
                ((string= command "verack")
+                (%verack-finalize-recon peer)
                 (setf (peer-state peer) :ready)
                 (return t))
                ((string= command "sendaddrv2") (setf (peer-wants-addrv2 peer) t))
                ((string= command "sendheaders") (setf (peer-prefers-headers peer) t))
-               ((string= command "wtxidrelay") (setf (peer-wtxid-relay peer) t))))
+               ((string= command "wtxidrelay") (setf (peer-wtxid-relay peer) t))
+               ((string= command "sendtxrcncl")
+                (unless (%handle-handshake-sendtxrcncl peer payload)
+                  (return nil)))))
         finally (return nil)))
 
 (defun %v2-try-outbound (peer)
@@ -391,6 +528,9 @@ turns out not to speak it. Returns T on success."
            (%v2-try-outbound peer))
        (%send-version-and-capabilities peer)
        (%receive-and-store-version peer)
+       ;; BIP330 offer goes after their VERSION (it is gated on their fRelay)
+       ;; and before our VERACK (Core net_processing.cpp:3728-3744).
+       (%maybe-send-sendtxrcncl peer)
        (send-message peer (bitcoin-lisp.serialization:make-verack-message))
        (%await-verack peer)))
 
@@ -413,6 +553,10 @@ stall. Returns T on success."
             (t (return-from perform-inbound-handshake nil)))))
   (and (%receive-and-store-version peer :timeout timeout)
        (%send-version-and-capabilities peer)
+       ;; BIP330 offer: their VERSION is already in hand on the inbound path;
+       ;; ordering matches Core (wtxidrelay → sendaddrv2 → sendtxrcncl →
+       ;; verack, net_processing.cpp:3715-3744).
+       (%maybe-send-sendtxrcncl peer)
        (send-message peer (bitcoin-lisp.serialization:make-verack-message))
        (%await-verack peer :timeout timeout)))
 

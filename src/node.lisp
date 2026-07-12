@@ -548,7 +548,8 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                         (coinstatsindex nil)
                         (reindex-chainstate nil)
                         (force-compact-db nil)
-                        (peer-block-filters nil))
+                        (peer-block-filters nil)
+                        (tx-reconciliation nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -882,6 +883,13 @@ data below the pruned horizon; the index needs genesis-contiguous history)"
   (setf bitcoin-lisp:*peer-block-filters* (and peer-block-filters t))
   (when peer-block-filters
     (log-info "BIP157 compact filter serving enabled (NODE_COMPACT_FILTERS)"))
+
+  ;; BIP330 Erlay handshake (-txreconciliation; Core DEBUG_ONLY, default off).
+  ;; Negotiates sendtxrcncl + per-peer salt storage only — no sketch exchange
+  ;; exists at Core ref d3056bc either.
+  (setf bitcoin-lisp:*tx-reconciliation* (and tx-reconciliation t))
+  (when tx-reconciliation
+    (log-info "BIP330 transaction reconciliation handshake enabled (sendtxrcncl)"))
 
   ;; BIP324 v2 transport opt-in. Effective only if libsecp256k1 has the
   ;; ellswift module (probed lazily per connection via v2-available-p).
