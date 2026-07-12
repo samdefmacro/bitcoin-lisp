@@ -207,6 +207,8 @@
                              ;; SOCKS5 outbound proxy (-proxy) client
                              (:file "socks5-tests")
                              ;; TxOutCompression + hash_serialized_3
-                             (:file "compressor-tests"))))
+                             (:file "compressor-tests")
+                             ;; Assumeutxo snapshot format (dumptxoutset/loadtxoutset)
+                             (:file "snapshot-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
