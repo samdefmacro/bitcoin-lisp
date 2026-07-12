@@ -718,6 +718,40 @@
    #:ancestor-sort-linearization
    #:post-linearize
    #:linearize
+   ;; TxGraph (Core txgraph.{h,cpp})
+   #:+max-cluster-size+
+   #:txgraph
+   #:make-txgraph
+   #:txgraph-p
+   #:txgraph-tx-count
+   #:txgraph-oversized-p
+   #:tx-handle
+   #:tx-handle-p
+   #:tx-handle-id
+   #:txgraph-add-transaction
+   #:txgraph-remove-transaction
+   #:txgraph-add-dependency
+   #:txgraph-set-transaction-fee
+   #:txgraph-exists-p
+   #:txgraph-get-individual-feerate
+   #:txgraph-get-main-chunk-feerate
+   #:txgraph-get-cluster
+   #:txgraph-get-ancestors
+   #:txgraph-get-descendants
+   #:txgraph-get-ancestors-union
+   #:txgraph-get-descendants-union
+   #:txgraph-compare-main-order
+   #:txgraph-count-distinct-clusters
+   #:txgraph-get-worst-main-chunk
+   #:txgraph-trim
+   #:txgraph-sanity-check
+   #:block-builder
+   #:block-builder-p
+   #:make-block-builder
+   #:block-builder-current-chunk
+   #:block-builder-include
+   #:block-builder-skip
+   #:block-builder-finish
    ;; Mempool entry
    #:mempool-entry
    #:make-mempool-entry
