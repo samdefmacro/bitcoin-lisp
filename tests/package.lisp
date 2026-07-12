@@ -81,6 +81,10 @@
   :description "Tests for ADDRv2 (BIP 155) support"
   :in :bitcoin-lisp-tests)
 
+(def-suite :netaddress-tests
+  :description "Tests for network-typed addresses: onion/i2p codecs, netgroups, reachability"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :dos-protection-tests
   :description "Tests for DoS protection (rate limiting, handshake timeout, rejects filter)"
   :in :bitcoin-lisp-tests)

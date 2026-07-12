@@ -96,12 +96,37 @@
 ;;;; Network address structure
 
 (defstruct net-addr
-  "Network address structure."
+  "Network address structure (BIP155 network-typed).
+IP holds the raw address bytes: 16 (IPv4-mapped or plain IPv6, or CJDNS),
+or 32 (TORv3 ed25519 pubkey / I2P SHA256 destination hash). NET is one of
+:ipv4 :ipv6 :torv3 :i2p :cjdns, or NIL meaning \"IP, derive IPv4 vs IPv6
+from the 16-byte mapped form\" (the pre-BIP155 representation, kept as the
+default so plain-IP constructors need no :net)."
   (services 0 :type (unsigned-byte 64))
   (ip (make-array 16 :element-type '(unsigned-byte 8)
                      :initial-contents '(0 0 0 0 0 0 0 0 0 0 #xFF #xFF 127 0 0 1))
-      :type (simple-array (unsigned-byte 8) (16)))
-  (port 0 :type (unsigned-byte 16)))
+      :type (simple-array (unsigned-byte 8) (*)))
+  (port 0 :type (unsigned-byte 16))
+  (net nil :type (or null keyword)))
+
+(defun ip-bytes-v4-mapped-p (ip)
+  "T if a 16-byte address is IPv4-mapped IPv6 (::ffff:a.b.c.d)."
+  (and (= (length ip) 16)
+       (loop for i below 10 always (zerop (aref ip i)))
+       (= (aref ip 10) #xFF)
+       (= (aref ip 11) #xFF)))
+
+(defun net-addr-network (addr)
+  "The network of ADDR as a keyword (:ipv4 :ipv6 :torv3 :i2p :cjdns),
+deriving IPv4 vs IPv6 from the mapped byte form when the net slot is NIL."
+  (or (net-addr-net addr)
+      (if (ip-bytes-v4-mapped-p (net-addr-ip addr)) :ipv4 :ipv6)))
+
+(defun v1-compatible-network-p (network)
+  "T if NETWORK can be carried in pre-BIP155 (addr v1) serialization —
+IPv4/IPv6 only. Onion/I2P/CJDNS exist only in addrv2 gossip (Core
+CNetAddr::IsAddrV1Compatible, netaddress.cpp:477-494)."
+  (member network '(:ipv4 :ipv6)))
 
 (defun read-net-addr (stream &key with-timestamp)
   "Read a network address from STREAM.
@@ -121,11 +146,19 @@ Returns (VALUES net-addr timestamp) when WITH-TIMESTAMP, otherwise just net-addr
             addr)))))
 
 (defun write-net-addr (stream addr &key with-timestamp timestamp)
-  "Write a network address to STREAM."
+  "Write a network address to STREAM in the legacy (pre-BIP155) format.
+A non-v1-compatible address (onion/I2P/CJDNS) is serialized as 16 zero
+bytes, exactly like Core's SerializeV1Array (netaddress.h:324-356) —
+callers should skip such addresses entirely where possible (Core
+IsAddrCompatible, net_processing.cpp:1117-1119); the zero form is only
+the unavoidable-case fallback."
   (when with-timestamp
     (write-uint32-le stream (or timestamp (get-unix-time))))
   (write-uint64-le stream (net-addr-services addr))
-  (write-bytes stream (net-addr-ip addr))
+  (if (v1-compatible-network-p (net-addr-network addr))
+      (write-bytes stream (net-addr-ip addr))
+      (write-bytes stream (make-array 16 :element-type '(unsigned-byte 8)
+                                         :initial-element 0)))
   ;; Port is big-endian
   (write-byte (ash (net-addr-port addr) -8) stream)
   (write-byte (logand (net-addr-port addr) #xFF) stream))
@@ -648,25 +681,61 @@ Each entry is a list (net-addr timestamp)."
 (defconstant +addrv2-net-i2p+   5)
 (defconstant +addrv2-net-cjdns+ 6)
 
-;;; Expected address sizes for each known network ID
+;;; Expected address sizes for each known network ID. TORV2 (id 3) is dead:
+;;; Core's SetNetFromBIP155Network no longer recognizes it (netaddress.cpp:
+;;; 49-98 has no TORV2 case), so it is skipped like an unknown-from-the-future
+;;; id — with NO length check (any length is consumed and dropped).
 (defparameter *addrv2-addr-sizes*
   (let ((ht (make-hash-table)))
     (setf (gethash +addrv2-net-ipv4+  ht) 4)
     (setf (gethash +addrv2-net-ipv6+  ht) 16)
-    (setf (gethash +addrv2-net-torv2+ ht) 10)
     (setf (gethash +addrv2-net-torv3+ ht) 32)
     (setf (gethash +addrv2-net-i2p+   ht) 32)
     (setf (gethash +addrv2-net-cjdns+ ht) 16)
     ht)
-  "Map of BIP 155 network ID to expected address byte length.")
+  "Map of recognized BIP 155 network ID to required address byte length.")
+
+(defconstant +max-addrv2-address-size+ 512
+  "Maximum BIP155 address length (Core CNetAddr::MAX_ADDRV2_SIZE).")
+
+(defparameter *addrv2-net-keywords*
+  `((,+addrv2-net-ipv4+  . :ipv4)
+    (,+addrv2-net-ipv6+  . :ipv6)
+    (,+addrv2-net-torv3+ . :torv3)
+    (,+addrv2-net-i2p+   . :i2p)
+    (,+addrv2-net-cjdns+ . :cjdns))
+  "BIP155 network id <-> network keyword.")
+
+(defun bip155-network-keyword (network-id)
+  "Network keyword for a BIP155 NETWORK-ID, or NIL if unrecognized."
+  (cdr (assoc network-id *addrv2-net-keywords*)))
+
+(defun network-bip155-id (network)
+  "BIP155 network id for the keyword NETWORK (Core GetBIP155Network)."
+  (or (car (rassoc network *addrv2-net-keywords*))
+      (error "network-bip155-id: unknown network ~S" network)))
 
 ;;; Deserialization
 
+(defparameter +torv2-in-ipv6-prefix+ #(#xFD #x87 #xD8 #x7E #xEB #x43)
+  "Prefix of the dead TORv2-embedded-in-IPv6 form (Core TORV2_IN_IPV6_PREFIX).")
+
+(defparameter +internal-in-ipv6-prefix+ #(#xFD #x6B #x88 #xC0 #x87 #x24)
+  "Prefix of Core's NET_INTERNAL-embedded-in-IPv6 form (0xFD + sha256(\"bitcoin\")[0:5]).")
+
+(defun %bytes-have-prefix-p (bytes prefix)
+  (and (>= (length bytes) (length prefix))
+       (loop for i below (length prefix)
+             always (= (aref bytes i) (aref prefix i)))))
+
 (defun read-net-addr-v2 (stream)
-  "Read a single addrv2 entry from STREAM.
-Returns (VALUES net-addr timestamp network-id) for IPv4/IPv6 entries with
-correct address length. Returns NIL for unknown networks, deprecated TorV2,
-or entries with mismatched address lengths (bytes are consumed but skipped)."
+  "Read a single addrv2 entry from STREAM (Core CNetAddr::UnserializeV2Stream,
+netaddress.h:423-470). Returns (VALUES net-addr timestamp network-id) for a
+usable address; NIL after consuming the entry for ones Core drops silently:
+unknown network ids (maybe from the future), dead TORv2, and IPv6 addresses
+embedding IPv4/TORv2/NET_INTERNAL forms. Signals an error — rejecting the
+whole message, as Core throws — for a recognized network id with the wrong
+address length, or any address longer than +max-addrv2-address-size+."
   (let* ((timestamp (read-uint32-le stream))
          ;; services is a BIP155 CompactSize-encoded u64 BITMASK, not a
          ;; length — Core deserializes it with CompactSizeFormatter<false>
@@ -678,36 +747,52 @@ or entries with mismatched address lengths (bytes are consumed but skipped)."
          (services (read-compact-size stream :range-check nil))
          (network-id (read-uint8 stream))
          (addr-len (read-compact-size stream)))
-    ;; Read address bytes regardless (to advance stream position)
-    (let ((addr-bytes (read-bytes stream addr-len))
-          (port-high (read-byte stream))
-          (port-low (read-byte stream))
-          (expected-len (gethash network-id *addrv2-addr-sizes*)))
-      ;; Skip if unknown network, wrong length, or deprecated TorV2
-      (when (or (null expected-len)
-                (/= addr-len expected-len)
-                (= network-id +addrv2-net-torv2+))
-        (return-from read-net-addr-v2 nil))
-      ;; Build net-addr with 16-byte IP for IPv4/IPv6
-      (let ((ip (cond
-                  ((= network-id +addrv2-net-ipv4+)
-                   ;; Convert 4-byte IPv4 to IPv4-mapped IPv6
-                   (let ((mapped (make-array 16 :element-type '(unsigned-byte 8)
-                                                :initial-element 0)))
-                     (setf (aref mapped 10) #xFF)
-                     (setf (aref mapped 11) #xFF)
-                     (replace mapped addr-bytes :start1 12)
-                     mapped))
-                  ((= network-id +addrv2-net-ipv6+)
-                   addr-bytes)
-                  (t
-                   ;; TorV3, I2P, CJDNS — valid parse but not storable in net-addr
-                   (return-from read-net-addr-v2 nil)))))
-        (values (make-net-addr :services services
-                               :ip ip
-                               :port (logior (ash port-high 8) port-low))
-                timestamp
-                network-id)))))
+    (when (> addr-len +max-addrv2-address-size+)
+      (error "addrv2 address too long: ~D > ~D" addr-len +max-addrv2-address-size+))
+    (let ((expected-len (gethash network-id *addrv2-addr-sizes*)))
+      ;; A recognized network with the wrong length is a stream failure in
+      ;; Core (SetNetFromBIP155Network throws) — the entire message is bad.
+      (when (and expected-len (/= addr-len expected-len))
+        (error "BIP155 network ~D address with length ~D (should be ~D)"
+               network-id addr-len expected-len))
+      ;; Read address bytes + port regardless (to advance stream position)
+      (let* ((addr-bytes (read-bytes stream addr-len))
+             (port-high (read-byte stream))
+             (port-low (read-byte stream))
+             (port (logior (ash port-high 8) port-low)))
+        (flet ((entry (net ip)
+                 (values (make-net-addr :services services :ip ip
+                                        :port port :net net)
+                         timestamp network-id)))
+          (cond
+            ;; Unknown network id (or dead TORv2): silently dropped; Core
+            ;; keeps reading subsequent entries (netaddress.cpp:94-98).
+            ((null expected-len) nil)
+            ((= network-id +addrv2-net-ipv4+)
+             ;; Store as IPv4-mapped IPv6 (our internal IP form).
+             (let ((mapped (make-array 16 :element-type '(unsigned-byte 8)
+                                          :initial-element 0)))
+               (setf (aref mapped 10) #xFF)
+               (setf (aref mapped 11) #xFF)
+               (replace mapped addr-bytes :start1 12)
+               (entry :ipv4 mapped)))
+            ((= network-id +addrv2-net-ipv6+)
+             ;; IPv4, TORv2 and NET_INTERNAL embedded in IPv6 are not valid
+             ;; in v2 encoding: Core unserializes them as !IsValid()/internal
+             ;; and they never reach addrman (netaddress.h:446-462).
+             (if (or (ip-bytes-v4-mapped-p addr-bytes)
+                     (%bytes-have-prefix-p addr-bytes +torv2-in-ipv6-prefix+)
+                     (%bytes-have-prefix-p addr-bytes +internal-in-ipv6-prefix+))
+                 nil
+                 (entry :ipv6 addr-bytes)))
+            ((= network-id +addrv2-net-torv3+) (entry :torv3 addr-bytes))
+            ((= network-id +addrv2-net-i2p+)   (entry :i2p addr-bytes))
+            ((= network-id +addrv2-net-cjdns+)
+             ;; A CJDNS address without the fc prefix parses but is invalid
+             ;; (Core IsValid, netaddress.cpp:441-443) — drop it here.
+             (if (= (aref addr-bytes 0) #xFC)
+                 (entry :cjdns addr-bytes)
+                 nil))))))))
 
 ;;; Serialization
 
@@ -722,16 +807,25 @@ TIMESTAMP is the uint32 last-seen time."
   ;; Network ID
   (write-uint8 stream network-id)
   ;; Address bytes (network-dependent)
-  (cond
-    ((= network-id +addrv2-net-ipv4+)
-     ;; Extract 4-byte IPv4 from IPv4-mapped IPv6
-     (write-compact-size stream 4)
-     (write-bytes stream (subseq (net-addr-ip addr) 12 16)))
-    ((= network-id +addrv2-net-ipv6+)
-     (write-compact-size stream 16)
-     (write-bytes stream (net-addr-ip addr)))
-    (t
-     (error "write-net-addr-v2: unsupported network ID ~D (only IPv4 and IPv6 are supported)" network-id)))
+  (let ((ip (net-addr-ip addr)))
+    (flet ((emit (bytes required-len)
+             (unless (= (length bytes) required-len)
+               (error "write-net-addr-v2: network ~D address must be ~D bytes, got ~D"
+                      network-id required-len (length bytes)))
+             (write-compact-size stream required-len)
+             (write-bytes stream bytes)))
+      (cond
+        ((= network-id +addrv2-net-ipv4+)
+         ;; Extract 4-byte IPv4 from IPv4-mapped IPv6
+         (emit (subseq ip 12 16) 4))
+        ((or (= network-id +addrv2-net-ipv6+)
+             (= network-id +addrv2-net-cjdns+))
+         (emit ip 16))
+        ((or (= network-id +addrv2-net-torv3+)
+             (= network-id +addrv2-net-i2p+))
+         (emit ip 32))
+        (t
+         (error "write-net-addr-v2: unsupported network ID ~D" network-id)))))
   ;; Port (big-endian)
   (write-byte (ash (net-addr-port addr) -8) stream)
   (write-byte (logand (net-addr-port addr) #xFF) stream))
@@ -797,8 +891,10 @@ Each entry is a list (net-addr network-id timestamp)."
 
 (defun parse-addrv2-payload (payload)
   "Parse an addrv2 message payload.
-Returns a list of (VALUES net-addr timestamp network-id) for valid IPv4/IPv6 entries.
-Skips unknown or unsupported network types."
+Returns a list of (net-addr timestamp network-id) entries for all usable
+addresses (IPv4/IPv6/TORv3/I2P/CJDNS). Unknown network ids are skipped
+without failing the message (BIP155); a recognized network id with a
+wrong address length signals an error (Core rejects the whole message)."
   (flexi-streams:with-input-from-sequence (stream payload)
     (let ((count (read-bounded-count stream +max-addr-count+ "addrv2"))
           (results '()))

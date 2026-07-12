@@ -314,7 +314,13 @@ bracketed IPv6."
 disables isolation, -noproxy/-proxy=0 clears, -onion overrides and defaults
 to -proxy."
   (let ((old-proxy bitcoin-lisp.networking:*proxy*)
-        (old-onion bitcoin-lisp.networking:*onion-proxy*))
+        (old-onion bitcoin-lisp.networking:*onion-proxy*)
+        ;; apply-config-globals also recomputes the reachable-network set
+        ;; (onion follows the proxy) — keep that from leaking out of the test.
+        (bitcoin-lisp.networking:*reachable-networks*
+          bitcoin-lisp.networking:*reachable-networks*)
+        (bitcoin-lisp.networking:*cjdns-reachable*
+          bitcoin-lisp.networking:*cjdns-reachable*))
     (unwind-protect
         (progn
           ;; -proxy with default randomize; onion follows proxy.

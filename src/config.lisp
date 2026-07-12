@@ -300,6 +300,17 @@ is all digits after a single colon, so a bare IPv6 address is host-only
              (values (subseq v 0 colon) (parse-integer v :start (1+ colon)))
              (values v +default-proxy-port+)))))))
 
+(defun conf-parse-network-name (value)
+  "Map an -onlynet VALUE to a network keyword (Core ParseNetwork,
+netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
+  (let ((v (string-downcase (string-trim '(#\Space #\Tab) value))))
+    (cond ((string= v "ipv4") :ipv4)
+          ((string= v "ipv6") :ipv6)
+          ((string= v "onion") :torv3)
+          ((string= v "i2p") :i2p)
+          ((string= v "cjdns") :cjdns)
+          (t (error "Unknown network specified in -onlynet: ~S" value)))))
+
 (defun conf-section-name (network)
   "The bitcoin.conf [section] header that scopes options to NETWORK."
   (ecase network
@@ -452,8 +463,10 @@ resolved network. Honors -server (enable RPC on the default port when no
   "Set the process-global policy/consensus config specials from the MERGED config
 alist. These options have no start-node keyword because they configure global
 specials directly: -datacarrier, -datacarriersize, -permitbaremultisig,
--signetchallenge (a custom signet block-challenge), and the SOCKS5 proxy
-options -proxy/-onion/-proxyrandomize (networking's *proxy*/*onion-proxy*).
+-signetchallenge (a custom signet block-challenge), the SOCKS5 proxy
+options -proxy/-onion/-proxyrandomize (networking's *proxy*/*onion-proxy*),
+and the network-reachability options -onlynet (repeatable)/-cjdnsreachable
+(networking's *reachable-networks*/*cjdns-reachable*).
 CLI-over-file precedence is already applied in MERGED. Called at startup by
 start-node-from-args."
   (flet ((lk (k) (let ((c (assoc k merged :test #'string=))) (and c (cdr c)))))
@@ -490,7 +503,34 @@ start-node-from-args."
                 ;; override the onion proxy").
                 ((lk "proxy")
                  (setf bitcoin-lisp.networking:*onion-proxy*
-                       bitcoin-lisp.networking:*proxy*))))))))
+                       bitcoin-lisp.networking:*proxy*))))))
+    ;; Network reachability. -onlynet (repeatable) replaces the reachable set
+    ;; (Core init.cpp:1529-1536 g_reachable_nets.RemoveAll + Add per value);
+    ;; it restricts AUTOMATIC outbound selection and gossip storage only —
+    ;; manual addnode/connect are unaffected. Gated nets then drop out unless
+    ;; their transport is configured, and naming a gated net explicitly in
+    ;; -onlynet is an init error (Core init.cpp:1541-1546, 1760-1800,
+    ;; 2240-2245): onion needs a Tor proxy, I2P needs -i2psam (which we do
+    ;; not support at all yet), CJDNS needs -cjdnsreachable.
+    (setf bitcoin-lisp.networking:*cjdns-reachable*
+          (let ((v (lk "cjdnsreachable"))) (and v (conf-parse-bool v))))
+    (let* ((onlynets (loop for (k . v) in merged
+                           when (string= k "onlynet")
+                             collect (conf-parse-network-name v)))
+           (nets (or onlynets
+                     (copy-list bitcoin-lisp.networking:+bip155-networks+))))
+      (unless bitcoin-lisp.networking:*onion-proxy*
+        (when (member :torv3 onlynets)
+          (error "-onlynet=onion given but no Tor proxy (-proxy/-onion) is configured"))
+        (setf nets (remove :torv3 nets)))
+      (when (member :i2p onlynets)
+        (error "-onlynet=i2p given but I2P (SAM) is not supported"))
+      (setf nets (remove :i2p nets))
+      (unless bitcoin-lisp.networking:*cjdns-reachable*
+        (when (member :cjdns onlynets)
+          (error "-onlynet=cjdns given without -cjdnsreachable"))
+        (setf nets (remove :cjdns nets)))
+      (setf bitcoin-lisp.networking:*reachable-networks* nets))))
 
 (defun args->start-node-plist (args &optional conf-text)
   "Pure assembly of a start-node keyword plist from Bitcoin Core-style CLI ARGS

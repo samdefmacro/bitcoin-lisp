@@ -11,9 +11,18 @@
 (defstruct peer-address
   "A known peer address with addrman bucket/reputation metadata (mirrors Bitcoin
 Core's AddrInfo). The address-book (see addrman.lisp) is a new/tried bucket
-manager; these records are its entries."
+manager; these records are its entries.
+
+Network-typed (BIP155): IP holds the raw address bytes — 16 for IPv4
+(IPv4-mapped IPv6, the historical form), IPv6 and CJDNS; 32 for TORv3
+(ed25519 pubkey) and I2P (destination hash). NET is :ipv4 :ipv6 :torv3
+:i2p or :cjdns, or NIL meaning \"IP, derive IPv4 vs IPv6 from the mapped
+bytes\" — the default, so the many plain-IP construction sites need no
+:net argument. Read the network via PEER-ADDRESS-NETWORK, never the raw
+slot."
+  (net nil :type (or null keyword))
   (ip (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
-      :type (simple-array (unsigned-byte 8) (16)))
+      :type (simple-array (unsigned-byte 8) (*)))
   (port 0 :type (unsigned-byte 16))
   (services 0 :type (unsigned-byte 64))
   ;; nTime: last time this address was seen advertised (unix seconds).
@@ -39,12 +48,35 @@ manager; these records are its entries."
 
 ;;;; Address Book Key
 
-(defun make-address-key (ip port)
-  "Create an 18-byte key from IP (16 bytes) and PORT (2 bytes)."
-  (let ((key (make-array 18 :element-type '(unsigned-byte 8))))
-    (replace key ip)
-    (setf (aref key 16) (ldb (byte 8 8) port))
-    (setf (aref key 17) (ldb (byte 8 0) port))
+(defun ip-network (ip)
+  "Derive :ipv4 or :ipv6 from a 16-byte IP's mapped form."
+  (if (ipv4-mapped-p ip) :ipv4 :ipv6))
+
+(defun peer-address-network (pa)
+  "The network keyword of PA (:ipv4 :ipv6 :torv3 :i2p :cjdns), deriving
+IPv4 vs IPv6 from the 16-byte mapped form when the net slot is NIL."
+  (or (peer-address-net pa) (ip-network (peer-address-ip pa))))
+
+(defun network-key-id (network)
+  "One-byte network discriminator for addrman keys — the BIP155 id."
+  (ecase network (:ipv4 1) (:ipv6 2) (:torv3 4) (:i2p 5) (:cjdns 6)))
+
+(defun key-id-network (id)
+  "Inverse of network-key-id; NIL for an unrecognized id."
+  (case id (1 :ipv4) (2 :ipv6) (4 :torv3) (5 :i2p) (6 :cjdns)))
+
+(defun make-address-key (ip port &optional net)
+  "Create an addrman key from address bytes IP, PORT and network NET:
+[net-id-byte, address-bytes..., port-hi, port-lo]. NET NIL derives
+IPv4/IPv6 from 16-byte mapped IP — the pre-BIP155 call sites, which all
+deal in IP peers. Addresses on different networks never collide even
+with identical bytes (e.g. a TORv3 pubkey equal to an I2P hash)."
+  (let* ((n (length ip))
+         (key (make-array (+ n 3) :element-type '(unsigned-byte 8))))
+    (setf (aref key 0) (network-key-id (or net (ip-network ip))))
+    (replace key ip :start1 1)
+    (setf (aref key (+ n 1)) (ldb (byte 8 8) port))
+    (setf (aref key (+ n 2)) (ldb (byte 8 0) port))
     key))
 
 ;;;; IPv4 Helper

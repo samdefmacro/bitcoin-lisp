@@ -84,6 +84,7 @@
                                (:file "v2-transport")
                                (:file "peer")
                                (:file "peerdb")
+                               (:file "netaddress") ; BIP155 codecs/reachability; before addrman (netgroups)
                                (:file "addrman")
                                (:file "protocol")
                                (:file "headers-sync")
@@ -158,6 +159,8 @@
                              (:file "compact-block-tests")
                              ;; ADDRv2 tests (BIP 155)
                              (:file "addrv2-tests")
+                             ;; Network-typed address codecs (onion/i2p/base32) + reachability
+                             (:file "netaddress-tests")
                              ;; DoS protection tests
                              (:file "dos-protection-tests")
                              ;; Difficulty adjustment tests
