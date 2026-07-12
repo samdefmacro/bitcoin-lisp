@@ -880,6 +880,18 @@
    ;; BIP324 v2 transport
    #:*v2-transport-enabled*
    #:v2-available-p
+   ;; SOCKS5 outbound proxy (Core netbase.cpp Socks5)
+   #:*proxy*
+   #:*onion-proxy*
+   #:proxy
+   #:make-proxy
+   #:proxy-host
+   #:proxy-port
+   #:proxy-randomize-credentials
+   #:socks5-connect
+   #:socks5-error
+   #:socks5-error-phase
+   #:next-proxy-credentials
    ;; Inbound listening
    #:open-listener
    #:close-listener
