@@ -499,6 +499,18 @@
    #:save-state
    #:load-state
    #:chain-state-pruned-height
+   ;; Chainstate roles / assumeutxo identity (Core ChainstateManager)
+   #:chain-state-coins-view
+   #:chain-state-from-snapshot-blockhash
+   #:chain-state-assumeutxo-status
+   #:chain-state-target-blockhash
+   #:chain-state-target-utxohash
+   #:chain-state-storage-suffix
+   #:select-current-chainstate
+   #:select-historical-chainstate
+   #:select-validated-chainstate
+   #:state-file-path
+   #:chainstate-leveldb-path
    ;; UTXO persistence
    #:save-utxo-set
    #:load-utxo-set

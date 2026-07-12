@@ -212,6 +212,8 @@
                              ;; TxOutCompression + hash_serialized_3
                              (:file "compressor-tests")
                              ;; Assumeutxo snapshot format (dumptxoutset/loadtxoutset)
-                             (:file "snapshot-tests"))))
+                             (:file "snapshot-tests")
+                             ;; Chainstate list + selection accessors + storage suffix
+                             (:file "chainstate-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

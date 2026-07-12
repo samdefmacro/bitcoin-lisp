@@ -80,38 +80,54 @@ matching Bitcoin Core's uint256::GetHex."
                                                     0)))))))
     result))
 
-(defun rpc-getchainstates (node params)
-  "Report this node's chainstate(s) (Bitcoin Core getchainstates). We run a
-single, fully-validated chainstate (no assumeutxo snapshot/background chainstate),
-so `chainstates` always has exactly one entry. Fields mirror Core's
-RPCHelpForChainstate."
-  (declare (ignore params))
-  (let* ((chain-state (rpc-get-chain-state node))
-         (height (bitcoin-lisp.storage:current-height chain-state))
+(defun %getchainstates-entry (chain-state syncing)
+  "Per-chainstate object for getchainstates — fields per Core's
+RPCHelpForChainstate (rpc/blockchain.cpp): snapshot_blockhash appears only
+for a snapshot chainstate, and validated reflects its assumeutxo status."
+  (let* ((height (bitcoin-lisp.storage:current-height chain-state))
          (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (syncing (rpc-is-syncing node))
          (tip (and best-hash
                    (bitcoin-lisp.storage:get-block-index-entry chain-state best-hash)))
          (bits (if (and tip (bitcoin-lisp.storage:block-index-entry-header tip))
                    (bitcoin-lisp.serialization:block-header-bits
                     (bitcoin-lisp.storage:block-index-entry-header tip))
                    #x1d00ffff))
-         (chainstate
-           `(("blocks" . ,height)
-             ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
-             ("bits" . ,(string-downcase (format nil "~8,'0x" bits)))
-             ("target" . ,(string-downcase
-                           (format nil "~64,'0x" (bitcoin-lisp.storage:bits-to-target bits))))
-             ("difficulty" . ,(%difficulty-from-bits bits))
-             ;; Consistent with getblockchaininfo: 1.0 at tip, 0.0 while syncing.
-             ("verificationprogress" . ,(if syncing 0.0d0 1.0d0))
-             ;; We don't split a coinsdb vs coinstip cache; report the in-memory
-             ;; coins-cache budget for the tip cache and 0 for the db cache.
-             ("coins_db_cache_bytes" . 0)
-             ("coins_tip_cache_bytes" . ,bitcoin-lisp::*coins-cache-budget-bytes*)
-             ("validated" . t))))
-    `(("headers" . ,height)
-      ("chainstates" . (,chainstate)))))
+         (snapshot-hash (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash
+                         chain-state)))
+    `(("blocks" . ,height)
+      ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
+      ("bits" . ,(string-downcase (format nil "~8,'0x" bits)))
+      ("target" . ,(string-downcase
+                    (format nil "~64,'0x" (bitcoin-lisp.storage:bits-to-target bits))))
+      ("difficulty" . ,(%difficulty-from-bits bits))
+      ;; Consistent with getblockchaininfo: 1.0 at tip, 0.0 while syncing.
+      ("verificationprogress" . ,(if syncing 0.0d0 1.0d0))
+      ;; We don't split a coinsdb vs coinstip cache; report the in-memory
+      ;; coins-cache budget for the tip cache and 0 for the db cache.
+      ("coins_db_cache_bytes" . 0)
+      ("coins_tip_cache_bytes" . ,bitcoin-lisp::*coins-cache-budget-bytes*)
+      ,@(when snapshot-hash
+          `(("snapshot_blockhash" . ,(hash-to-hex snapshot-hash))))
+      ("validated" . ,(eq (bitcoin-lisp.storage:chain-state-assumeutxo-status
+                           chain-state)
+                          :validated)))))
+
+(defun rpc-getchainstates (node params)
+  "Report this node's chainstate(s) (Bitcoin Core getchainstates), derived
+from the node's chainstates list in Core's order: the historical chainstate
+first (when background validation is in progress), the current (active)
+chainstate last. Today exactly one (validated, primary) chainstate exists."
+  (declare (ignore params))
+  (let* ((syncing (rpc-is-syncing node))
+         (chainstates (rpc-get-chainstates node))
+         (current (bitcoin-lisp.storage:select-current-chainstate chainstates))
+         (historical (bitcoin-lisp.storage:select-historical-chainstate chainstates))
+         (entries (append
+                   (when historical
+                     (list (%getchainstates-entry historical syncing)))
+                   (list (%getchainstates-entry current syncing)))))
+    `(("headers" . ,(bitcoin-lisp.storage:current-height current))
+      ("chainstates" . ,entries))))
 
 (defun rpc-getbestblockhash (node params)
   "Return the hash of the best (tip) block."
