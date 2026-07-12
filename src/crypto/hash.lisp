@@ -96,6 +96,17 @@ This is SHA256(SHA256(data)), used for Bitcoin block and transaction hashes.
 Returns a 32-byte vector."
   (sha256 (sha256 data)))
 
+(defun sha3-256 (data)
+  "Compute SHA3-256 (Keccak, FIPS 202) of DATA (a byte vector).
+Returns a 32-byte vector. Used by the TORv3 onion-address checksum
+(netaddress.cpp:185-212), which is SHA3-256 — NOT SHA256(d)."
+  (let ((digest (ironclad:make-digest :sha3/256)))
+    (ironclad:update-digest
+     digest (if (typep data '(simple-array (unsigned-byte 8) (*)))
+                data
+                (coerce data '(simple-array (unsigned-byte 8) (*)))))
+    (ironclad:produce-digest digest)))
+
 (defun ripemd160 (data)
   "Compute RIPEMD-160 hash of DATA (a byte vector).
 Returns a 20-byte vector."

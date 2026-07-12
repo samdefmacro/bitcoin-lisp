@@ -376,6 +376,77 @@ restores them (in order) for priority reconnection. Inbound peers excluded."
       (bitcoin-lisp::load-anchors node)
       (is (equal '("1.2.3.4" "5.6.7.8") bitcoin-lisp::*pending-anchor-addresses*)))))
 
+(test anchors-v1-file-migrates-on-load
+  "A pre-P1 anchors.dat (magic ANC1, bare IP strings, no port) still loads:
+entries parse to typed addresses and become dial candidates; the next save
+writes the v2 network-typed format."
+  (let* ((dir (ensure-directories-exist
+               (merge-pathnames "test-anchors-v1/" (uiop:temporary-directory))))
+         (node (bitcoin-lisp::make-node))
+         (path (bitcoin-lisp::anchors-dat-path dir)))
+    (setf (bitcoin-lisp::node-data-directory node) dir)
+    ;; Byte-faithful ANC1 writer (the pre-P1 save-anchors format): magic,
+    ;; count, then len-prefixed address strings — via the same CRC32 wrapper.
+    (bitcoin-lisp.storage:save-file-with-crc32
+     path
+     (lambda (stream)
+       (loop for shift in '(24 16 8 0)
+             do (write-byte (ldb (byte 8 shift) bitcoin-lisp::+anchors-magic-v1+) stream))
+       (write-byte 3 stream)
+       (dolist (a '("203.0.113.7" "2001:db8::7" "not-an-address.example"))
+         (let ((bytes (map '(vector (unsigned-byte 8)) #'char-code a)))
+           (write-byte (length bytes) stream)
+           (write-sequence bytes stream)))))
+    (let ((bitcoin-lisp::*pending-anchor-addresses* nil)
+          (bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6)))
+      (bitcoin-lisp::load-anchors node)
+      ;; IP entries survive (the hostname is dropped — never representable).
+      ;; Our IPv6 rendering is the full uncompressed form (no RFC5952 "::").
+      (is (equal '("203.0.113.7" "2001:0db8:0000:0000:0000:0000:0000:0007")
+                 bitcoin-lisp::*pending-anchor-addresses*)))
+    ;; Re-save from live peers: the file is rewritten as v2.
+    (setf (bitcoin-lisp::node-peers node)
+          (list (bitcoin-lisp.networking:make-peer :address "203.0.113.7"
+                                                   :inbound nil :state :ready)))
+    (bitcoin-lisp::save-anchors node)
+    (let ((bytes (bitcoin-lisp.storage:load-file-with-crc32 path 6)))
+      (is (= bitcoin-lisp::+anchors-magic-v2+
+             (logior (ash (aref bytes 0) 24) (ash (aref bytes 1) 16)
+                     (ash (aref bytes 2) 8) (aref bytes 3)))))))
+
+(test anchors-v2-round-trip-typed-and-filtered
+  "The v2 anchors format round-trips (net, bytes, port); on load only
+dialable+reachable networks become dial candidates — an onion anchor is
+carried in the file but yields no dial target until P2."
+  (let* ((dir (ensure-directories-exist
+               (merge-pathnames "test-anchors-v2/" (uiop:temporary-directory))))
+         (node (bitcoin-lisp::make-node))
+         (path (bitcoin-lisp::anchors-dat-path dir))
+         (onion-pk (bitcoin-lisp.crypto:hex-to-bytes
+                    "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"))
+         (entries (list (list :ipv4 (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 9 9 9 9) 8333)
+                        (list :torv3 onion-pk 8333))))
+    (setf (bitcoin-lisp::node-data-directory node) dir)
+    (bitcoin-lisp::save-anchor-entries path entries)
+    ;; Byte-level round trip.
+    (let ((parsed (bitcoin-lisp::parse-anchor-entries
+                   (bitcoin-lisp.storage:load-file-with-crc32 path 6))))
+      (is (= 2 (length parsed)))
+      (destructuring-bind (net bytes port) (first parsed)
+        (is (eq :ipv4 net))
+        (is (equalp (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 9 9 9 9) bytes))
+        (is (= 8333 port)))
+      (destructuring-bind (net bytes port) (second parsed)
+        (is (eq :torv3 net))
+        (is (equalp onion-pk bytes))
+        (is (= 8333 port))))
+    ;; Dial-candidate filter: only the IPv4 anchor comes back.
+    (let ((bitcoin-lisp::*pending-anchor-addresses* nil)
+          (bitcoin-lisp.networking:*reachable-networks*
+            (copy-list bitcoin-lisp.networking:+bip155-networks+)))
+      (bitcoin-lisp::load-anchors node)
+      (is (equal '("9.9.9.9") bitcoin-lisp::*pending-anchor-addresses*)))))
+
 (test anchors-load-missing-file-noop
   "load-anchors on a directory with no anchors.dat doesn't crash or set anchors."
   (let* ((dir (ensure-directories-exist

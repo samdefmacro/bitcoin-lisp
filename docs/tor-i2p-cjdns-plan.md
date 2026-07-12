@@ -1,6 +1,9 @@
 # Tor / I2P / CJDNS Transports — Implementation Plan
 
-Date: 2026-07-10. Status: **PLAN — not started.**
+Date: 2026-07-10. Status: **P0 DONE (PR #248, SOCKS5 outbound); P1 DONE
+(tor-address-layer branch: BIP155 address layer, onion/i2p codecs, addrman
+netgroups, peers.dat v4 + anchors v2 migrate-on-load, -onlynet/-cjdnsreachable,
+dialable-network-p filter). P2+ not started — nothing dials non-IP nets yet.**
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev). Researched via 2 agents
 (Core SOCKS5/torcontrol/SAM/CJDNS at byte level; our networking layer).
 

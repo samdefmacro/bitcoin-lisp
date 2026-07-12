@@ -1017,20 +1017,20 @@ getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
      (lambda (pa)
        `(("time" . ,(bitcoin-lisp.networking:peer-address-last-seen pa))
          ("services" . ,(bitcoin-lisp.networking:peer-address-services pa))
-         ("address" . ,(bitcoin-lisp.networking:ip-bytes-to-string
-                        (bitcoin-lisp.networking:peer-address-ip pa)))
+         ("address" . ,(bitcoin-lisp.networking:peer-address-string pa))
          ("port" . ,(bitcoin-lisp.networking:peer-address-port pa))
          ("network" . ,(or (%addrman-network-name pa) "unroutable"))))
      limited)))
 
 (defun %addrman-network-name (pa)
   "Network bucket name (Bitcoin Core GetNetworkName) for a peer-address PA, or
-NIL for an unroutable/empty address. This node only stores IPv4/IPv6 (addrv2
-onion/i2p/cjdns are dropped on receipt), so those never occur here."
-  (let ((ip (bitcoin-lisp.networking::peer-address-ip pa)))
-    (cond ((bitcoin-lisp.networking::ipv4-mapped-p ip) "ipv4")
-          ((bitcoin-lisp.networking::address-routable-p ip) "ipv6")
-          (t nil))))
+NIL for an unroutable/empty address."
+  (let ((network (bitcoin-lisp.networking:peer-address-network pa)))
+    (when (bitcoin-lisp.networking:address-routable-p
+           (bitcoin-lisp.networking:peer-address-ip pa) network)
+      (ecase network
+        (:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
+        (:i2p "i2p") (:cjdns "cjdns")))))
 
 (defun rpc-getaddrmaninfo (node params)
   "Address-manager new/tried/total counts per network plus an all_networks
