@@ -221,3 +221,32 @@
         (is (= 16 (aref ip 13)))
         (is (= 0 (aref ip 14)))
         (is (= 5 (aref ip 15)))))))
+
+;;; Regression: services is a u64 bitmask, not a length. Core deserializes
+;;; it with CompactSizeFormatter<false> (protocol.h:446) — no range check.
+;;; Our default read-compact-size cap made any peer advertising a service
+;;; bit >= 26 look malformed, and the whole addrv2 message (e.g. a
+;;; 1000-entry getaddr reply) was dropped and the peer disconnected.
+;;; Observed live on mainnet 2026-07-12 after #245 started sending getaddr.
+(test parse-addrv2-large-services-bitmask
+  "addrv2 entries with high service bits (>= bit 26) must parse."
+  (let* ((services (logior (ash 1 26) (ash 1 30) 1033)) ; > +max-compact-size+
+         (entry (make-addrv2-entry-bytes 1720000000 services 1 #(203 0 113 5) 8333)))
+    (flexi-streams:with-input-from-sequence (s entry)
+      (multiple-value-bind (addr timestamp network-id)
+          (bitcoin-lisp.serialization:read-net-addr-v2 s)
+        (declare (ignore timestamp network-id))
+        (is (not (null addr)))
+        (is (= services (bitcoin-lisp.serialization:net-addr-services addr))))))
+  ;; A whole message: exotic-services entry followed by a normal one —
+  ;; the stream stays aligned and neither entry is lost.
+  (let* ((e1 (make-addrv2-entry-bytes 1720000000 (ash 1 33) 1 #(1 2 3 4) 8333))
+         (e2 (make-addrv2-entry-bytes 1720000001 9 1 #(5 6 7 8) 8334))
+         (payload (coerce
+                   (flexi-streams:with-output-to-sequence (s)
+                     (bitcoin-lisp.serialization:write-compact-size s 2)
+                     (write-sequence e1 s)
+                     (write-sequence e2 s))
+                   '(simple-array (unsigned-byte 8) (*))))
+         (addrs (bitcoin-lisp.serialization:parse-addrv2-payload payload)))
+    (is (= 2 (length addrs)))))
