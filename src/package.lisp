@@ -662,6 +662,62 @@
    #:+fee-history-size+
    #:+min-blocks-for-estimate+
    #:+fee-stats-flush-interval+
+   ;; FeeFrac (Core util/feefrac.{h,cpp})
+   #:feefrac
+   #:make-feefrac
+   #:copy-feefrac
+   #:feefrac-p
+   #:feefrac-fee
+   #:feefrac-size
+   #:feefrac-empty-p
+   #:feefrac+
+   #:feefrac-
+   #:feefrac=
+   #:feerate-compare
+   #:feefrac<<
+   #:feefrac>>
+   #:feefrac-compare
+   #:feefrac<
+   #:feefrac>
+   #:feefrac<=
+   #:feefrac>=
+   #:feefrac-evaluate-fee-down
+   #:feefrac-evaluate-fee-up
+   #:compare-chunks
+   ;; Cluster linearization (Core cluster_linearize.h)
+   #:+max-cluster-count+
+   #:do-bits
+   #:depgraph
+   #:make-depgraph
+   #:depgraph-p
+   #:depgraph-positions
+   #:depgraph-position-range
+   #:depgraph-tx-count
+   #:depgraph-tx-feerate
+   #:depgraph-ancestors
+   #:depgraph-descendants
+   #:depgraph-add-transaction
+   #:depgraph-remove-transactions
+   #:depgraph-add-dependencies
+   #:depgraph-reduced-parents
+   #:depgraph-reduced-children
+   #:depgraph-subset-feerate
+   #:depgraph-connected-component
+   #:depgraph-find-connected-component
+   #:depgraph-connected-p
+   #:depgraph-acyclic-p
+   #:depgraph-topo-sorted
+   #:topological-subset-p
+   #:linearization-topological-p
+   #:setinfo
+   #:make-setinfo
+   #:setinfo-transactions
+   #:setinfo-feerate
+   #:chunk-linearization
+   #:chunk-linearization-info
+   #:ancestor-sort-linearization
+   #:post-linearize
+   #:linearize
    ;; Mempool entry
    #:mempool-entry
    #:make-mempool-entry
