@@ -69,7 +69,9 @@
                                (:file "block")
                                (:file "signet")))
                  (:module "mempool"
-                  :components ((:file "orphan")
+                  :components ((:file "feefrac")
+                               (:file "cluster-linearize")
+                               (:file "orphan")
                                (:file "mempool")
                                (:file "fee-estimator")))
                  (:module "mining"
@@ -120,6 +122,10 @@
                              (:file "ibd-tests")
                              ;; Mempool tests
                              (:file "mempool-tests")
+                             ;; Cluster mempool: FeeFrac + CompareChunks (Core feefrac_tests.cpp)
+                             (:file "feefrac-tests")
+                             ;; Cluster mempool: DepGraph/chunking/linearization
+                             (:file "cluster-linearize-tests")
                              ;; Package relay tests (submitpackage)
                              (:file "package-tests")
                              ;; Mining / regtest tests
