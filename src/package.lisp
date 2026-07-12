@@ -4,6 +4,7 @@
    ;; Hash functions
    #:sha256
    #:hash256
+   #:sha3-256
    #:ripemd160
    #:hash160
    ;; Tagged hashes (BIP 340)
@@ -335,11 +336,15 @@
    #:get-unix-time
    #:+universal-unix-epoch-offset+
    #:read-net-addr
+   #:write-net-addr
    #:net-addr
    #:make-net-addr
    #:net-addr-services
    #:net-addr-ip
    #:net-addr-port
+   #:net-addr-net
+   #:net-addr-network
+   #:v1-compatible-network-p
    #:read-hash256
    #:write-hash256
    ;; Compact block (BIP 152)
@@ -379,7 +384,10 @@
    #:+addrv2-net-torv3+
    #:+addrv2-net-i2p+
    #:+addrv2-net-cjdns+
+   #:+max-addrv2-address-size+
    #:*addrv2-addr-sizes*
+   #:network-bip155-id
+   #:bip155-network-keyword
    #:read-net-addr-v2
    #:write-net-addr-v2
    #:make-sendaddrv2-message
@@ -1089,6 +1097,9 @@
    #:+max-block-timeouts+
    ;; Peer database (peer-address struct shares symbol with peer accessor above)
    #:make-peer-address
+   #:peer-address-net
+   #:peer-address-network
+   #:peer-address-string
    #:peer-address-ip
    #:peer-address-port
    #:peer-address-services
@@ -1107,16 +1118,37 @@
    #:address-book-attempt
    #:address-book-connected
    #:address-book-select
+   #:select-dialable-address
    #:address-book-get-addr
    #:resolve-tried-collisions
    #:addr-info-terrible-p
    #:net-group-key
+   #:make-address-key
+   #:address-routable-p
+   #:network-key-id
+   #:key-id-network
    #:save-address-book
    #:load-address-book
    #:peers-dat-path
    #:ipv4-to-mapped-ipv6
    #:ip-bytes-to-string
    #:string-to-ip-bytes
+   ;; Network-typed addresses (BIP155): codecs + reachability (netaddress.lisp)
+   #:+bip155-networks+
+   #:network-address-length
+   #:*reachable-networks*
+   #:*cjdns-reachable*
+   #:reachable-network-p
+   #:dialable-network-p
+   #:maybe-flip-ipv6-to-cjdns
+   #:base32-encode
+   #:base32-decode
+   #:onion-address-string
+   #:parse-onion-address
+   #:i2p-address-string
+   #:parse-i2p-address
+   #:network-address-to-string
+   #:parse-network-address
    ;; ADDRv2 support (BIP 155)
    #:peer-wants-addrv2
    #:peer-prefers-headers

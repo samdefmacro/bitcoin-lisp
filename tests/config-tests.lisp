@@ -175,3 +175,59 @@ start-node-from-args can apply the global-only options."
     (declare (ignore plist))
     (is (equal "0" (cdr (assoc "datacarrier" merged :test #'string=))))
     (is (equal "5121ff" (cdr (assoc "signetchallenge" merged :test #'string=))))))
+
+;;; --- -onlynet / -cjdnsreachable (network reachability) ----------------------
+
+(test config-onlynet-reachability
+  "-onlynet (repeatable) replaces the reachable-network set; gated nets
+(onion without a proxy, i2p always, cjdns without -cjdnsreachable) drop out
+of the default set; -cjdnsreachable admits cjdns."
+  (let ((bitcoin-lisp.networking:*reachable-networks*
+          bitcoin-lisp.networking:*reachable-networks*)
+        (bitcoin-lisp.networking:*cjdns-reachable*
+          bitcoin-lisp.networking:*cjdns-reachable*)
+        (bitcoin-lisp.networking:*proxy* nil)
+        (bitcoin-lisp.networking:*onion-proxy* nil))
+    ;; Default: no -onlynet, no proxy, no flags => IP only.
+    (bitcoin-lisp::apply-config-globals '())
+    (is (equal '(:ipv4 :ipv6) bitcoin-lisp.networking:*reachable-networks*))
+    (is (null bitcoin-lisp.networking:*cjdns-reachable*))
+    ;; -proxy makes onion reachable (Core: onion proxy follows -proxy).
+    (bitcoin-lisp::apply-config-globals '(("proxy" . "127.0.0.1:9050")))
+    (is-true (bitcoin-lisp.networking:reachable-network-p :torv3))
+    (is-false (bitcoin-lisp.networking:reachable-network-p :i2p))
+    (setf bitcoin-lisp.networking:*proxy* nil
+          bitcoin-lisp.networking:*onion-proxy* nil)
+    ;; Repeatable -onlynet restricts the set.
+    (bitcoin-lisp::apply-config-globals
+     (bitcoin-lisp::parse-cli-args '("-onlynet=ipv4" "-onlynet=ipv6")))
+    (is (equal '(:ipv4 :ipv6) bitcoin-lisp.networking:*reachable-networks*))
+    (bitcoin-lisp::apply-config-globals
+     (bitcoin-lisp::parse-cli-args '("-onlynet=ipv4")))
+    (is (equal '(:ipv4) bitcoin-lisp.networking:*reachable-networks*))
+    (is-false (bitcoin-lisp.networking:reachable-network-p :ipv6))
+    ;; -cjdnsreachable admits cjdns to the default set.
+    (bitcoin-lisp::apply-config-globals '(("cjdnsreachable" . "1")))
+    (is-true bitcoin-lisp.networking:*cjdns-reachable*)
+    (is-true (bitcoin-lisp.networking:reachable-network-p :cjdns))
+    ;; -onlynet=onion with a proxy works; onion-only set results.
+    (bitcoin-lisp::apply-config-globals
+     (append (bitcoin-lisp::parse-cli-args '("-onlynet=onion"))
+             '(("proxy" . "127.0.0.1:9050"))))
+    (is (equal '(:torv3) bitcoin-lisp.networking:*reachable-networks*))
+    (setf bitcoin-lisp.networking:*proxy* nil
+          bitcoin-lisp.networking:*onion-proxy* nil)))
+
+(test config-onlynet-errors
+  "Init errors, per Core: unknown -onlynet name; -onlynet=onion without a
+Tor proxy; -onlynet=i2p (unsupported); -onlynet=cjdns without -cjdnsreachable."
+  (let ((bitcoin-lisp.networking:*reachable-networks*
+          bitcoin-lisp.networking:*reachable-networks*)
+        (bitcoin-lisp.networking:*cjdns-reachable*
+          bitcoin-lisp.networking:*cjdns-reachable*)
+        (bitcoin-lisp.networking:*proxy* nil)
+        (bitcoin-lisp.networking:*onion-proxy* nil))
+    (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "tor"))))
+    (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "onion"))))
+    (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "i2p"))))
+    (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "cjdns"))))))

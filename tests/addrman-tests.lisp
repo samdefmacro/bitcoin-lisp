@@ -153,3 +153,156 @@
         (bitcoin-lisp.networking:address-book-add
          book (%pa (+ 100 (mod i 150)) (mod (floor i 150) 256) (mod i 251) (mod i 241)) src))
       (is (= tried-before (bitcoin-lisp.networking::address-book-n-tried book))))))
+
+;;;; Network-typed records (BIP155 P1): keying, persistence v4, migration
+
+(defparameter +am-onion-pk+
+  "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"
+  "Core net_tests.cpp TORv3 vector (pg6mm....onion).")
+(defparameter +am-i2p-hash+
+  "a2894dabaec08c0051a481a6dac88b64f98232ae42d4b6fd2fa81952dfe36a87"
+  "Core net_tests.cpp I2P vector (ukeu3....b32.i2p).")
+
+(defun %am-hex (s) (bitcoin-lisp.crypto:hex-to-bytes s))
+
+(defun %pa-net (net ip &key (port 8333) (services 1) (last-seen (%now)))
+  (bitcoin-lisp.networking:make-peer-address
+   :net net :ip ip :port port :services services :last-seen last-seen))
+
+(test address-key-disambiguates-networks
+  "Identical bytes + port on different networks produce different keys, so a
+TORv3 pubkey that happens to equal an I2P hash can never collide in the map."
+  (let ((bytes (%am-hex +am-onion-pk+)))
+    (is (not (equalp (bitcoin-lisp.networking:make-address-key bytes 8333 :torv3)
+                     (bitcoin-lisp.networking:make-address-key bytes 8333 :i2p))))
+    ;; And the same record keys identically both times.
+    (is (equalp (bitcoin-lisp.networking:make-address-key bytes 8333 :torv3)
+                (bitcoin-lisp.networking:make-address-key bytes 8333 :torv3)))
+    ;; NIL net derives ipv4/ipv6 from 16-byte mapped form (compat callers).
+    (is (equalp (bitcoin-lisp.networking:make-address-key (%ip 1 2 3 4) 8333)
+                (bitcoin-lisp.networking:make-address-key (%ip 1 2 3 4) 8333 :ipv4)))))
+
+(test same-bytes-different-net-coexist
+  "Add the same 32 bytes as TORv3 and as I2P: two independent records."
+  (let ((book (%ab))
+        (bytes (%am-hex +am-onion-pk+)))
+    (is-true (bitcoin-lisp.networking:address-book-add
+              book (%pa-net :torv3 bytes :port 8333)))
+    (is-true (bitcoin-lisp.networking:address-book-add
+              book (%pa-net :i2p bytes :port 8333)))
+    (is (= 2 (bitcoin-lisp.networking:address-book-count book)))
+    (let ((tor (bitcoin-lisp.networking:address-book-lookup book bytes 8333 :torv3))
+          (i2p (bitcoin-lisp.networking:address-book-lookup book bytes 8333 :i2p)))
+      (is (not (null tor)))
+      (is (not (null i2p)))
+      (is (not (eq tor i2p)))
+      (is (eq :torv3 (bitcoin-lisp.networking:peer-address-network tor)))
+      (is (eq :i2p (bitcoin-lisp.networking:peer-address-network i2p))))))
+
+(test addrman-good-promotes-onion
+  "Good() works for a typed record: the onion entry moves new -> tried."
+  (let ((book (%ab))
+        (bytes (%am-hex +am-onion-pk+)))
+    (bitcoin-lisp.networking:address-book-add book (%pa-net :torv3 bytes))
+    (is-true (bitcoin-lisp.networking:address-book-good book bytes 8333 (%now) :torv3))
+    (let ((pa (bitcoin-lisp.networking:address-book-lookup book bytes 8333 :torv3)))
+      (is (not (null pa)))
+      (is-true (bitcoin-lisp.networking:peer-address-in-tried pa)))))
+
+(test peers-dat-v4-roundtrip-all-nets
+  "Save/load the v4 network-typed format: IPv4, IPv6, TORv3 (tried), I2P and
+CJDNS records all survive with their networks, bytes, ports and stats."
+  (let ((book (bitcoin-lisp.networking:make-address-book))
+        (tmp-dir (merge-pathnames "test-addrman-v4/" (uiop:temporary-directory))))
+    (ensure-directories-exist (merge-pathnames "dummy" tmp-dir))
+    (unwind-protect
+         (let ((path (merge-pathnames "peers.dat" tmp-dir))
+               (onion (%am-hex +am-onion-pk+))
+               (i2p (%am-hex +am-i2p-hash+))
+               (cjdns (%am-hex "fc000001000200030004000500060007")))
+           (bitcoin-lisp.networking:address-book-add book (%pa 1 2 3 4 :services 9))
+           (bitcoin-lisp.networking:address-book-add
+            book (bitcoin-lisp.networking:make-peer-address
+                  :ip (%ipv6 #x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1)
+                  :port 8333 :services 1 :last-seen (%now)))
+           (bitcoin-lisp.networking:address-book-add book (%pa-net :torv3 onion))
+           (bitcoin-lisp.networking:address-book-add book (%pa-net :i2p i2p :port 0))
+           (bitcoin-lisp.networking:address-book-add book (%pa-net :cjdns cjdns))
+           (bitcoin-lisp.networking:address-book-good book onion 8333 (%now) :torv3)
+           (is (eq t (bitcoin-lisp.networking:save-address-book book path)))
+           ;; Version byte in the file header is 4.
+           (with-open-file (in path :element-type '(unsigned-byte 8))
+             (let ((head (make-array 8 :element-type '(unsigned-byte 8))))
+               (read-sequence head in)
+               (is (= 4 (aref head 4)))))
+           (let ((book2 (bitcoin-lisp.networking:make-address-book)))
+             (is (eq t (bitcoin-lisp.networking:load-address-book book2 path)))
+             (is (= 5 (bitcoin-lisp.networking:address-book-count book2)))
+             (is (= 1 (bitcoin-lisp.networking::address-book-n-tried book2)))
+             (let ((tor (bitcoin-lisp.networking:address-book-lookup book2 onion 8333 :torv3)))
+               (is (not (null tor)))
+               (is (eq :torv3 (bitcoin-lisp.networking:peer-address-network tor)))
+               (is-true (bitcoin-lisp.networking:peer-address-in-tried tor)))
+             (let ((v4 (bitcoin-lisp.networking:address-book-lookup book2 (%ip 1 2 3 4) 8333)))
+               (is (not (null v4)))
+               (is (= 9 (bitcoin-lisp.networking:peer-address-services v4))))
+             (is (not (null (bitcoin-lisp.networking:address-book-lookup book2 i2p 0 :i2p))))
+             (is (not (null (bitcoin-lisp.networking:address-book-lookup book2 cjdns 8333 :cjdns))))))
+      (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
+
+(defparameter +peers-dat-v3-fixture-hex+
+  "4144524d0300000007070707070707070707070707070707070707070707070707070707070707070200000001000000030000000100000000000000000000ffff01020304208d090000000000000000f153652cf253652cf253650000000003010102000000000000000000000000ffff05060708479d010000000000000064f1536500000000000000000000000003010506010c010020010db8000000000000000000000001208d0904000000000000c8f15365000000000000000000000000050220010db8017000c2abd34a"
+  "A peers.dat written by the PRE-P1 v3 writer (generated with the old
+save-address-book before the network-typed change): three entries —
+1.2.3.4:8333 services 9 TRIED, 5.6.7.8:18333 services 1, and
+[2001:db8::1]:8333 services 1033 — under a fixed all-07 bucket key.")
+
+(test peers-dat-v3-migrates-on-load
+  "A v3 (fixed 16-byte IP) file loads with networks derived from the mapped
+form, and the next save rewrites it as v4 with everything intact."
+  (let ((tmp-dir (merge-pathnames "test-addrman-migrate/" (uiop:temporary-directory))))
+    (ensure-directories-exist (merge-pathnames "dummy" tmp-dir))
+    (unwind-protect
+         (let ((path (merge-pathnames "peers.dat" tmp-dir)))
+           (with-open-file (out path :direction :output :if-exists :supersede
+                                     :element-type '(unsigned-byte 8))
+             (write-sequence (%am-hex +peers-dat-v3-fixture-hex+) out))
+           (let ((book (bitcoin-lisp.networking:make-address-book)))
+             (is (eq t (bitcoin-lisp.networking:load-address-book book path)))
+             (is (= 3 (bitcoin-lisp.networking:address-book-count book)))
+             (is (= 1 (bitcoin-lisp.networking::address-book-n-tried book)))
+             (let ((a (bitcoin-lisp.networking:address-book-lookup book (%ip 1 2 3 4) 8333)))
+               (is (not (null a)))
+               (is (eq :ipv4 (bitcoin-lisp.networking:peer-address-network a)))
+               (is (= 9 (bitcoin-lisp.networking:peer-address-services a)))
+               (is-true (bitcoin-lisp.networking:peer-address-in-tried a)))
+             (let ((b (bitcoin-lisp.networking:address-book-lookup book (%ip 5 6 7 8) 18333)))
+               (is (not (null b)))
+               (is (= 1700000100 (bitcoin-lisp.networking:peer-address-last-seen b))))
+             (let ((c (bitcoin-lisp.networking:address-book-lookup
+                       book (%ipv6 #x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1) 8333)))
+               (is (not (null c)))
+               (is (eq :ipv6 (bitcoin-lisp.networking:peer-address-network c)))
+               (is (= 1033 (bitcoin-lisp.networking:peer-address-services c))))
+             ;; Migration completes on the next save: file becomes v4 and
+             ;; still round-trips.
+             (is (eq t (bitcoin-lisp.networking:save-address-book book path)))
+             (with-open-file (in path :element-type '(unsigned-byte 8))
+               (let ((head (make-array 8 :element-type '(unsigned-byte 8))))
+                 (read-sequence head in)
+                 (is (= 4 (aref head 4)))))
+             (let ((book2 (bitcoin-lisp.networking:make-address-book)))
+               (is (eq t (bitcoin-lisp.networking:load-address-book book2 path)))
+               (is (= 3 (bitcoin-lisp.networking:address-book-count book2)))
+               (is (= 1 (bitcoin-lisp.networking::address-book-n-tried book2))))))
+      (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
+
+(test get-addr-includes-typed-records
+  "GetAddr returns typed records; peer-address-string renders them."
+  (let ((book (%ab)))
+    (bitcoin-lisp.networking:address-book-add
+     book (%pa-net :torv3 (%am-hex +am-onion-pk+)))
+    (let ((addrs (bitcoin-lisp.networking:address-book-get-addr book :pct 100)))
+      (is (= 1 (length addrs)))
+      (is (string= "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
+                   (bitcoin-lisp.networking:peer-address-string (first addrs)))))))
