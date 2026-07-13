@@ -1524,10 +1524,10 @@ Handles chain reorganizations when a competing chain has more work."
              (store-undo-data hash spent-utxos new-height)
              ;; BIP158: add this block's basic filter to the block filter index
              ;; (no-op unless the index is enabled; never signals).
-             (bitcoin-lisp:index-block-filter block hash new-height spent-utxos)
+             (bitcoin-lisp:index-block-filter chain-state block hash new-height spent-utxos)
              ;; coinstatsindex: fold this block into the running UTXO stats
              ;; (no-op unless enabled; never signals).
-             (bitcoin-lisp:index-block-coinstats block hash new-height spent-utxos)
+             (bitcoin-lisp:index-block-coinstats chain-state block hash new-height spent-utxos)
              ;; Record fee statistics for fee estimation
              (when fee-estimator
                (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
@@ -1549,7 +1549,7 @@ Handles chain reorganizations when a competing chain has more work."
              (bitcoin-lisp.mempool:mempool-expire mempool)
              (bitcoin-lisp.mempool:orphan-expire
               (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
-           (bitcoin-lisp:maybe-periodic-flush)
+           (bitcoin-lisp:maybe-periodic-flush chain-state)
            ;; Automatic block pruning after connecting a new block; each
            ;; pruned block's undo file goes with it.
            (when (bitcoin-lisp:automatic-pruning-p)
@@ -1843,10 +1843,10 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
               ;; newest here, so its header chains off the already-indexed parent).
               (let ((hash (bitcoin-lisp.serialization:block-header-hash
                            (bitcoin-lisp.serialization:bitcoin-block-header block))))
-                (bitcoin-lisp:index-block-filter block hash height spent-utxos)
+                (bitcoin-lisp:index-block-filter chain-state block hash height spent-utxos)
                 ;; coinstatsindex: reconnected oldest-to-newest, so each block
                 ;; loads its (already-reindexed) parent's running state.
-                (bitcoin-lisp:index-block-coinstats block hash height spent-utxos))
+                (bitcoin-lisp:index-block-coinstats chain-state block hash height spent-utxos))
               (when mempool
                 (bitcoin-lisp.mempool:mempool-remove-for-block mempool block))))
           ;; Remove the disconnected old chain's txs from the tx-index.

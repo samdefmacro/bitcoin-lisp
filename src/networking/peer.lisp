@@ -432,10 +432,12 @@ tx relay on those)."
          (relays (peer-relays-txs-p peer))
          ;; Advertise our real chain height (Core sends my_height) so peers can
          ;; pick us as a block-sync source; 0 only if the node isn't up yet.
+         ;; The height is the CURRENT (active) chainstate's tip — never a
+         ;; historical chainstate's.
          (node bitcoin-lisp::*node*)
          (start-height (if node
                            (bitcoin-lisp.storage:current-height
-                            (bitcoin-lisp::node-chain-state node))
+                            (bitcoin-lisp::node-current-chainstate node))
                            0))
          (version-payload (bitcoin-lisp.serialization:make-version-message-bytes
                            :services services

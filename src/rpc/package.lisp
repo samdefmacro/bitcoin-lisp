@@ -11,6 +11,7 @@
 
    ;; Thread-safe accessors
    #:rpc-get-chain-state
+   #:rpc-get-chainstates
    #:rpc-get-utxo-set
    #:rpc-get-peers
    #:rpc-get-mempool
