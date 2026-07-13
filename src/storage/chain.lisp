@@ -21,13 +21,75 @@
   (tx-count 0 :type (unsigned-byte 32)))
 
 (defstruct chain-state
-  "Current blockchain state."
+  "Current blockchain state. One chain-state per chainstate role (Bitcoin
+Core's Chainstate, validation.h): today exactly one exists — the primary,
+fully-validated chainstate — but the slots below already carry the
+assumeutxo identity a snapshot chainstate (a future ActivateSnapshot)
+needs, so the node can hold several in a list and select between them."
   (block-index (make-hash-table :test 'equalp) :type hash-table)
   (best-block-hash nil)
   (best-height 0 :type (unsigned-byte 32))
   (genesis-hash nil)
   (base-path nil :type (or null pathname))
-  (pruned-height 0 :type (unsigned-byte 32)))
+  (pruned-height 0 :type (unsigned-byte 32))
+  ;; The coins view (UTXO set) this chainstate owns — a coins-view-cache on a
+  ;; live node, or a plain utxo-set in tests. Core keeps the coins DB + cache
+  ;; per chainstate (validation.h m_coins_views); the block/undo stores and
+  ;; the header index stay shared across chainstates (Core m_blockman).
+  (coins-view nil)
+  ;; Base block hash of the snapshot this chainstate was created from (Core
+  ;; m_from_snapshot_blockhash); NIL for a chainstate built up from genesis.
+  (from-snapshot-blockhash nil)
+  ;; :validated | :unvalidated | :invalid (Core enum Assumeutxo,
+  ;; validation.h:527-534). NEVER persisted — Core re-derives it on every
+  ;; startup by re-proving the snapshot hash, so neither save-state nor the
+  ;; header index may ever write it.
+  (assumeutxo-status :validated :type keyword)
+  ;; Historical-validation target (Core m_target_blockhash, validation.h:643):
+  ;; when set, this chainstate only re-derives history up to the target block
+  ;; (the snapshot base) instead of following the network tip.
+  (target-blockhash nil)
+  ;; UTXO-set hash computed once the target block is reached (Core
+  ;; m_target_utxohash); NIL before then. A set value means the historical
+  ;; validation work is complete.
+  (target-utxohash nil)
+  ;; On-disk name suffix for this chainstate's files (Core
+  ;; SNAPSHOT_CHAINSTATE_SUFFIX \"_snapshot\", node/utxo_snapshot.h:128).
+  ;; Empty for the primary chainstate, so its file names are unchanged.
+  (storage-suffix "" :type string))
+
+;;; Chainstate selection (Core ChainstateManager, validation.h:1119-1145).
+;;; The node holds a list of chain-states ordered like Core's m_chainstates
+;;; vector; these pick the one filling each role. With a single (primary)
+;;; chainstate all three return it.
+
+(defun select-current-chainstate (chainstates)
+  "The chainstate targeting the most-work network tip: the first non-INVALID
+entry with no validation target (Core CurrentChainstate). New blocks extend
+it and the mempool follows it."
+  (find-if (lambda (cs)
+             (and (not (eq (chain-state-assumeutxo-status cs) :invalid))
+                  (null (chain-state-target-blockhash cs))))
+           chainstates))
+
+(defun select-historical-chainstate (chainstates)
+  "The chainstate still re-deriving history toward a target block: non-INVALID,
+with a target-blockhash but no target-utxohash yet (Core HistoricalChainstate).
+NIL when no background validation is in progress."
+  (find-if (lambda (cs)
+             (and (not (eq (chain-state-assumeutxo-status cs) :invalid))
+                  (chain-state-target-blockhash cs)
+                  (null (chain-state-target-utxohash cs))))
+           chainstates))
+
+(defun select-validated-chainstate (chainstates)
+  "The fully-validated chainstate — the one indexes must bind to, since they
+index blocks in order from genesis (Core ValidatedChainstate: whichever of
+the current/historical chainstates has VALIDATED status)."
+  (find-if (lambda (cs)
+             (and cs (eq (chain-state-assumeutxo-status cs) :validated)))
+           (list (select-current-chainstate chainstates)
+                 (select-historical-chainstate chainstates))))
 
 ;;; Testnet genesis block hash (little-endian, as on wire)
 (defvar *testnet3-genesis-hash*
@@ -221,8 +283,21 @@ off-by-one (2015 intervals, not 2016)."
 ;;; State persistence
 
 (defun state-file-path (state)
-  "Get the path to the chain state file."
-  (merge-pathnames "chainstate.dat" (chain-state-base-path state)))
+  "Path to this chainstate's state file. The primary chainstate's
+storage-suffix is empty, yielding exactly \"chainstate.dat\" (unchanged
+on-disk name); a snapshot chainstate gets \"chainstate_snapshot.dat\"."
+  (merge-pathnames (format nil "chainstate~A.dat" (chain-state-storage-suffix state))
+                   (chain-state-base-path state)))
+
+(defun chainstate-leveldb-path (state)
+  "Directory of this chainstate's coins LevelDB: \"chainstate/\" for the
+primary (empty suffix), \"chainstate_snapshot/\" for a snapshot chainstate.
+Mirrors Core Chainstate::StoragePath (validation.cpp:1872-1879), which
+appends SNAPSHOT_CHAINSTATE_SUFFIX to the datadir/chainstate base. The
+header index (headerindex.dat), block store, and undo storage are shared
+across chainstates and take no suffix."
+  (merge-pathnames (format nil "chainstate~A/" (chain-state-storage-suffix state))
+                   (chain-state-base-path state)))
 
 ;;; Persistence format v3: adds in-transition flag (mirrors Bitcoin Core's
 ;;; DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).

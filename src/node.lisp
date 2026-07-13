@@ -70,9 +70,14 @@ we cap lower). Excess inbound connections are disconnected at merge time.")
   "Bitcoin node state."
   (network :testnet3 :type keyword)
   (data-directory nil :type (or null pathname))
-  (chain-state nil)
+  ;; Chainstates, ordered like Core ChainstateManager::m_chainstates
+  ;; (validation.h:1377): exactly one today (the primary, fully-validated
+  ;; chainstate, owning the coins view); an assumeutxo snapshot activation
+  ;; appends a second. Read via node-current-chainstate /
+  ;; node-historical-chainstate / node-validated-chainstate, or the
+  ;; node-chain-state / node-utxo-set compatibility accessors below.
+  (chainstates '() :type list)
   (block-store nil)
-  (utxo-set nil)
   (mempool nil)
   (tx-index nil)  ; Transaction index (optional, for getrawtransaction)
   (blockfilterindex nil)  ; BIP158 basic block filter index (optional)
@@ -104,6 +109,61 @@ we cap lower). Excess inbound connections are disconnected at merge time.")
   ;; node-peers stays single-writer (only the sync thread pushes to it).
   (pending-onetry '() :type list)
   (max-peers 8 :type (unsigned-byte 8)))
+
+;;; Chainstate selection (Core ChainstateManager, validation.h:1119-1145).
+;;; With one chainstate all three return it.
+
+(defun node-current-chainstate (node)
+  "The chainstate targeting the network tip (Core CurrentChainstate). New
+blocks extend it, the mempool validates against its coins view, and RPC
+reports it as the active chainstate."
+  (bitcoin-lisp.storage:select-current-chainstate (node-chainstates node)))
+
+(defun node-historical-chainstate (node)
+  "The chainstate re-deriving history toward a snapshot base block (Core
+HistoricalChainstate); NIL when no background validation is in progress."
+  (bitcoin-lisp.storage:select-historical-chainstate (node-chainstates node)))
+
+(defun node-validated-chainstate (node)
+  "The fully-validated chainstate (Core ValidatedChainstate) — the one
+indexes bind to, since they index blocks in order from genesis."
+  (bitcoin-lisp.storage:select-validated-chainstate (node-chainstates node)))
+
+;;; Compatibility accessors for the former chain-state / utxo-set node slots.
+;;; The chain-state struct now owns its coins view, and the node holds a
+;;; chainstates list; these read/write the current chainstate so existing
+;;; call sites (and tests) keep their single-chainstate shape.
+
+(defun node-chain-state (node)
+  "The current (active) chainstate — the former chain-state slot."
+  (node-current-chainstate node))
+
+(defun (setf node-chain-state) (chainstate node)
+  "Install CHAINSTATE as the node's current chainstate, replacing an existing
+one. A replaced chainstate's coins view carries over when CHAINSTATE has
+none, preserving the former independent-slot semantics (setting chain-state
+never clobbered utxo-set)."
+  (let ((old (node-current-chainstate node)))
+    (when (and old (null (bitcoin-lisp.storage:chain-state-coins-view chainstate)))
+      (setf (bitcoin-lisp.storage:chain-state-coins-view chainstate)
+            (bitcoin-lisp.storage:chain-state-coins-view old)))
+    (setf (node-chainstates node)
+          (if old
+              (substitute chainstate old (node-chainstates node))
+              (append (node-chainstates node) (list chainstate)))))
+  chainstate)
+
+(defun node-utxo-set (node)
+  "The current chainstate's coins view — the former utxo-set slot."
+  (let ((cs (node-current-chainstate node)))
+    (and cs (bitcoin-lisp.storage:chain-state-coins-view cs))))
+
+(defun (setf node-utxo-set) (view node)
+  "Set the current chainstate's coins view — the former utxo-set slot."
+  (let ((cs (node-current-chainstate node)))
+    (unless cs
+      (error "Cannot set the node's utxo-set: no current chainstate exists"))
+    (setf (bitcoin-lisp.storage:chain-state-coins-view cs) view)))
 
 (defvar *node* nil
   "Current running node instance.")
@@ -467,29 +527,35 @@ NIL if the file is missing or corrupt."
   "Set by start-node when load-state reports :inconsistent, so the recovery
 runs after the block store, UTXO cache, and header index are all open.")
 
-(defun %coinbase-committed-p (node block-hash)
-  "T iff BLOCK-HASH's coinbase output 0 is an unspent coin in the UTXO
-LevelDB. A coinbase is unspendable for +coinbase-maturity+ (100) blocks,
+(defun %coinbase-committed-p (node chainstate block-hash)
+  "T iff BLOCK-HASH's coinbase output 0 is an unspent coin in CHAINSTATE's
+coins view. A coinbase is unspendable for +coinbase-maturity+ (100) blocks,
 so once its block is committed to the UTXO set the coin is necessarily
 present — and every block above the committed tip contributes no coins at
 all. That makes coinbase-presence a monotone probe for 'is the UTXO set at
 or past this block', with no false positives from later spends. Returns
-NIL if the block isn't on disk."
+NIL if the block isn't on disk (the block store is shared across
+chainstates)."
   (let ((block (bitcoin-lisp.storage:get-block (node-block-store node) block-hash)))
     (when block
       (let* ((cb (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
              (txid (bitcoin-lisp.serialization:transaction-hash cb)))
-        (and (bitcoin-lisp.storage:get-utxo (node-utxo-set node) txid 0) t)))))
+        (and (bitcoin-lisp.storage:get-utxo
+              (bitcoin-lisp.storage:chain-state-coins-view chainstate) txid 0)
+             t)))))
 
-(defun recover-inconsistent-chainstate (node)
+(defun recover-inconsistent-chainstate
+    (node &optional (chain-state (node-current-chainstate node)))
   "Resolve an in-transition chainstate without a from-genesis resync.
+Per-chainstate: probes CHAIN-STATE's own coins view and rewrites its own
+state file (storage-suffix-named), so recovering one chainstate can never
+touch another's on-disk state. The 3-phase commit semantics are unchanged.
 Probes whether the recorded tip's coins were committed; if so just clears
 the marker, otherwise walks back to the highest ancestor whose coins ARE
-committed (the true UTXO tip) and rewrites chainstate.dat there so IBD
+committed (the true UTXO tip) and rewrites the state file there so IBD
 re-validates only the gap. Returns T on success, NIL if the blocks needed
 to resolve it aren't on disk (caller then aborts for a resync)."
-  (let* ((chain-state (node-chain-state node))
-         (new-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+  (let* ((new-hash (bitcoin-lisp.storage:best-block-hash chain-state))
          (new-height (bitcoin-lisp.storage:current-height chain-state)))
     (cond
       ((null new-hash)
@@ -497,7 +563,7 @@ to resolve it aren't on disk (caller then aborts for a resync)."
        nil)
       ;; Phase 2 committed the new tip — chainstate.dat already holds it,
       ;; just drop the marker.
-      ((%coinbase-committed-p node new-hash)
+      ((%coinbase-committed-p node chain-state new-hash)
        (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
        (log-info "Chainstate recovery: UTXO set already at recorded tip h=~D; marker cleared"
                  new-height)
@@ -509,7 +575,8 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                do (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
                until (or (null entry)
                          (%coinbase-committed-p
-                          node (bitcoin-lisp.storage:block-index-entry-hash entry))))
+                          node chain-state
+                          (bitcoin-lisp.storage:block-index-entry-hash entry))))
          (cond
            (entry
             (let ((h (bitcoin-lisp.storage:block-index-entry-height entry))
@@ -630,10 +697,13 @@ Returns the node instance."
         (log-info "Transaction relay: ENABLED")
         (log-info "Transaction relay: DISABLED (safety default)")))
 
-  ;; Initialize chain state
+  ;; Initialize chain state: the chainstates list starts with the one primary
+  ;; chainstate (empty storage suffix, so it loads exactly the files a
+  ;; single-chainstate node wrote). A persisted snapshot chainstate would be
+  ;; detected and appended here (Core LoadAssumeutxoChainstate) — future work.
   (log-info "Loading chain state...")
-  (setf (node-chain-state *node*)
-        (bitcoin-lisp.storage:init-chain-state (node-data-directory *node*)))
+  (setf (node-chainstates *node*)
+        (list (bitcoin-lisp.storage:init-chain-state (node-data-directory *node*))))
 
   ;; Genesis block index entry is ensured after load-header-index below
 
@@ -668,7 +738,12 @@ Returns the node instance."
   ;; never re-migrate (the marker is idempotent and crash-safe).
   (log-info "Initializing UTXO storage (LevelDB-backed)...")
   (let* ((data-dir (node-data-directory *node*))
-         (chainstate-path (namestring (merge-pathnames "chainstate/" data-dir)))
+         (primary (node-chain-state *node*))
+         ;; chainstate/ for the primary chainstate (empty storage suffix —
+         ;; same directory as always); a snapshot chainstate would open
+         ;; chainstate_snapshot/ through the same path function.
+         (chainstate-path (namestring
+                           (bitcoin-lisp.storage:chainstate-leveldb-path primary)))
          (utxoset-dat (bitcoin-lisp.storage:utxo-set-file-path data-dir))
          (migrated-p (bitcoin-lisp.storage:leveldb-utxo-migration-complete-p
                       chainstate-path)))
@@ -679,7 +754,7 @@ Returns the node instance."
        utxoset-dat chainstate-path)
       (log-info "Migration complete; LevelDB is now the canonical UTXO store"))
     (let ((view (bitcoin-lisp.storage:open-coins-view-db chainstate-path)))
-      (setf (node-utxo-set *node*)
+      (setf (bitcoin-lisp.storage:chain-state-coins-view primary)
             (bitcoin-lisp.storage:make-coins-view-cache view))
       (log-info "UTXO cache opened (base: ~A)" chainstate-path)))
 
@@ -796,8 +871,11 @@ Returns the node instance."
     ;; One-time catch-up over already-stored blocks, before the sync thread
     ;; starts (single-threaded here, so no writer races). Fresh-from-genesis
     ;; nodes have nothing to do; the connect-time hook then indexes forward.
+    ;; Indexes bind the validated chainstate (Core ValidatedChainstate) —
+    ;; they index blocks in order from genesis. Identical to the current
+    ;; chainstate while only the primary exists.
     (let* ((bfi (node-blockfilterindex *node*))
-           (cs (node-chain-state *node*))
+           (cs (node-validated-chainstate *node*))
            (tip (bitcoin-lisp.storage:current-height cs)))
       ;; Repair the recorded "best" if a rollback (e.g. invalidateblock) left it
       ;; above the active tip: repoint it at the highest indexed active-chain
@@ -816,7 +894,7 @@ Returns the node instance."
       (when (< (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
         (log-info "Building block filter index to height ~D..." tip)
         (let ((n (bitcoin-lisp.storage:build-blockfilterindex
-                  bfi (node-chain-state *node*) (node-block-store *node*)
+                  bfi cs (node-block-store *node*)
                   #'bitcoin-lisp.validation:get-undo-data
                   :progress-callback
                   (lambda (h pct)
@@ -841,8 +919,9 @@ Returns the node instance."
     (when reindex-chainstate
       (bitcoin-lisp.storage:coinstatsindex-clear-best (node-coinstatsindex *node*))
       (log-info "Coinstats index: rebuilding after chainstate reindex"))
+    ;; Like the filter index: binds the validated chainstate.
     (let* ((csi (node-coinstatsindex *node*))
-           (cs (node-chain-state *node*))
+           (cs (node-validated-chainstate *node*))
            (tip (bitcoin-lisp.storage:current-height cs)))
       ;; Repair a best marker left above the active tip (e.g. after
       ;; invalidateblock): repoint at the highest indexed active-chain block.
@@ -1114,10 +1193,13 @@ accounts for ~700 MB. This logger surfaces the gap."
               ibd-pending ibd-queue ibd-in-flight
               (/ used-bytes 1048576.0) (/ dyn-bytes 1048576.0))))
 
-(defun do-flush ()
-  "Synchronously flush chainstate + header-index + UTXO set with 3-phase
-commit (mirrors Bitcoin Core's DB_HEAD_BLOCKS marker pattern in
-txdb.cpp::CCoinsViewDB::BatchWrite):
+(defun do-flush (&optional (chainstate (and *node* (node-current-chainstate *node*))))
+  "Synchronously flush CHAINSTATE (its state file, its coins view, and the
+shared header index) with 3-phase commit (mirrors Bitcoin Core's
+DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).
+CHAINSTATE defaults to the node's current chainstate; each chainstate
+flushes its own storage-suffix-named files, so flushing one can never
+mark another's state file in-transition.
 
   Phase 1: save-state with in-transition=1 — chainstate.dat marked unsafe.
            If we crash anywhere from here through Phase 3, on restart
@@ -1138,32 +1220,30 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
       (#+sbcl sb-sys:without-interrupts
        #-sbcl progn
         ;; Phase 1: mark the chainstate as in-transition.
-        (when (node-chain-state *node*)
-          (bitcoin-lisp.storage:save-state
-           (node-chain-state *node*) :in-transition t)
-          (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
+        (when chainstate
+          (bitcoin-lisp.storage:save-state chainstate :in-transition t)
+          (bitcoin-lisp.storage:save-header-index chainstate))
         ;; Phase 2: flush cache → LevelDB. Per-flush work is proportional
         ;; to dirty entries (typically a few thousand at the tip), not
         ;; the full ~17M-entry set — replaces the ~13s utxoset.dat
         ;; rewrite that previously froze the sync thread.
-        (when (node-utxo-set *node*)
-          ;; :sync t fdatasyncs the LevelDB writebatch before we proceed, so a
-          ;; power loss after Phase 3 clears the marker cannot leave the coins
-          ;; un-durable while chainstate.dat says they are committed. (Was
-          ;; :sync nil — atomic but not durable; the shutdown flush already
-          ;; syncs, the periodic one now matches it.)
-          (bitcoin-lisp.storage:coins-view-cache-flush
-           (node-utxo-set *node*) :sync t))
+        (let ((view (and chainstate
+                         (bitcoin-lisp.storage:chain-state-coins-view chainstate))))
+          (when view
+            ;; :sync t fdatasyncs the LevelDB writebatch before we proceed, so a
+            ;; power loss after Phase 3 clears the marker cannot leave the coins
+            ;; un-durable while chainstate.dat says they are committed. (Was
+            ;; :sync nil — atomic but not durable; the shutdown flush already
+            ;; syncs, the periodic one now matches it.)
+            (bitcoin-lisp.storage:coins-view-cache-flush view :sync t)))
         ;; Phase 3: commit by re-saving chainstate without the marker.
-        (when (node-chain-state *node*)
-          (bitcoin-lisp.storage:save-state
-           (node-chain-state *node*) :in-transition nil))
+        (when chainstate
+          (bitcoin-lisp.storage:save-state chainstate :in-transition nil))
         (setf *last-flush-universal-time* (get-universal-time)
               *blocks-since-flush* 0)
         (log-info "Periodic flush: chainstate at height ~D"
-                  (and (node-chain-state *node*)
-                       (bitcoin-lisp.storage:current-height
-                        (node-chain-state *node*)))))
+                  (and chainstate
+                       (bitcoin-lisp.storage:current-height chainstate))))
     (error (c)
       ;; Was log-warn before — surfaced silently. Bumped to log-error so
       ;; persistence failures are obvious in the log instead of getting
@@ -1176,38 +1256,47 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
   #+sbcl (sb-ext:gc :full t)
   (log-memory-snapshot "post-flush"))
 
-(defun maybe-periodic-flush ()
-  "Flush chainstate, UTXO set, and header index to disk if either:
+(defun maybe-periodic-flush (&optional chainstate)
+  "Flush CHAINSTATE (its state file, coins view, and the header index) to
+disk if either:
 - N blocks have been connected since the last flush, OR
 - N seconds have elapsed since the last flush (catches slow-sync regions
   where 1000 blocks would take many minutes to accumulate).
 
-Called from connect-block. Cheap if no flush needed; durable if it does
-flush (atomic temp+fsync+rename inside save-*)."
+Called from connect-block, which passes the chainstate the block connected
+to; defaults to the node's current chainstate. Cheap if no flush needed;
+durable if it does flush (atomic temp+fsync+rename inside save-*)."
   (unless *node* (return-from maybe-periodic-flush))
-  (incf *blocks-since-flush*)
-  (when (zerop *last-flush-universal-time*)
-    (setf *last-flush-universal-time* (get-universal-time)))
-  (when (or (>= *blocks-since-flush* +flush-every-n-blocks+)
-            (>= (- (get-universal-time) *last-flush-universal-time*)
-                +flush-every-n-seconds+)
-            ;; Size trigger (Bitcoin Core dbcache): flush once the coins cache
-            ;; reaches its memory budget, so it can't grow unbounded between the
-            ;; block-count / time flushes.
-            (and (node-utxo-set *node*)
-                 (>= (bitcoin-lisp.storage:view-mem-bytes (node-utxo-set *node*))
-                     (large-coins-cache-threshold *coins-cache-budget-bytes*))))
-    (do-flush)))
+  (let* ((cs (or chainstate (node-current-chainstate *node*)))
+         (view (and cs (bitcoin-lisp.storage:chain-state-coins-view cs))))
+    (incf *blocks-since-flush*)
+    (when (zerop *last-flush-universal-time*)
+      (setf *last-flush-universal-time* (get-universal-time)))
+    (when (or (>= *blocks-since-flush* +flush-every-n-blocks+)
+              (>= (- (get-universal-time) *last-flush-universal-time*)
+                  +flush-every-n-seconds+)
+              ;; Size trigger (Bitcoin Core dbcache): flush once the coins cache
+              ;; reaches its memory budget, so it can't grow unbounded between the
+              ;; block-count / time flushes.
+              (and view
+                   (>= (bitcoin-lisp.storage:view-mem-bytes view)
+                       (large-coins-cache-threshold *coins-cache-budget-bytes*))))
+      (do-flush cs))))
 
 (defvar *blockfilterindex-stall-logged* nil
   "One-shot latch so a stalled block filter index (non-contiguous connect
 refused) logs a single warning instead of one per block until restart.")
 
-(defun index-block-filter (block block-hash height spent-utxos)
+(defun index-block-filter (chainstate block block-hash height spent-utxos)
   "Connect-time hook: add BLOCK's BIP158 basic filter to the running node's
-block filter index, if one is enabled. SPENT-UTXOS is the undo list the UTXO
-apply produced. Never signals -- a filter-index failure must not abort a block
-connect -- so consensus is unaffected whether the index is on or off."
+block filter index, if one is enabled. CHAINSTATE is the chainstate the block
+connected to — today only the single validated chainstate connects blocks, so
+no filtering is done; once several chainstates exist, signals from
+non-validated ones must be dropped here (Core indexes bind
+ValidatedChainstate, init.cpp:1367-1383). SPENT-UTXOS is the undo list the
+UTXO apply produced. Never signals -- a filter-index failure must not abort a
+block connect -- so consensus is unaffected whether the index is on or off."
+  (declare (ignore chainstate))
   (let ((bfi (and *node* (node-blockfilterindex *node*))))
     (when (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
       (handler-case
@@ -1317,13 +1406,18 @@ database it opens. Synchronous and potentially slow on a large chainstate."
       (when bfi (compact "blockfilterindex" (bitcoin-lisp.storage:blockfilterindex-db bfi)))
       (when csi (compact "coinstatsindex" (bitcoin-lisp.storage:coinstatsindex-db csi))))))
 
-(defun index-block-coinstats (block block-hash height spent-utxos)
+(defun index-block-coinstats (chainstate block block-hash height spent-utxos)
   "Connect-time hook: fold BLOCK into the running node's coinstatsindex, if one
-is enabled. SPENT-UTXOS is the undo list the UTXO apply produced; the block
-subsidy is derived from HEIGHT. Never signals -- an index failure must not
-abort a block connect -- so consensus is unaffected whether the index is on or
-off. Returns NIL (and stalls quietly) if the parent height's record is missing
-(non-contiguous); the startup backfill heals such gaps on restart."
+is enabled. CHAINSTATE is the chainstate the block connected to — today only
+the single validated chainstate connects blocks, so no filtering is done;
+once several chainstates exist, signals from non-validated ones must be
+dropped here (see index-block-filter). SPENT-UTXOS is the undo list the UTXO
+apply produced; the block subsidy is derived from HEIGHT. Never signals -- an
+index failure must not abort a block connect -- so consensus is unaffected
+whether the index is on or off. Returns NIL (and stalls quietly) if the
+parent height's record is missing (non-contiguous); the startup backfill
+heals such gaps on restart."
+  (declare (ignore chainstate))
   (let ((csi (and *node* (node-coinstatsindex *node*))))
     (when (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi))
       (handler-case
@@ -2131,14 +2225,18 @@ phase exits quickly when there's nothing new to fetch."
     (log-warn "No peers connected, cannot sync")
     (return-from sync-blockchain 0))
 
-  (let ((peer-height (bitcoin-lisp.networking:peer-start-height (find-best-peer node))))
+  ;; IBD drives the current chainstate (its tip and coins view). A future
+  ;; historical chainstate gets its own download cursor; this call stays
+  ;; anchored to the chainstate following the network tip.
+  (let ((chainstate (node-current-chainstate node))
+        (peer-height (bitcoin-lisp.networking:peer-start-height (find-best-peer node))))
     (log-debug "Sync cycle: local height ~D, peer-start height ~D"
-               (bitcoin-lisp.storage:current-height (node-chain-state node))
+               (bitcoin-lisp.storage:current-height chainstate)
                peer-height)
     (bitcoin-lisp.networking::start-ibd
      (node-peers node)
-     (node-chain-state node)
-     (node-utxo-set node)
+     chainstate
+     (bitcoin-lisp.storage:chain-state-coins-view chainstate)
      (node-block-store node)
      peer-height
      :fee-estimator (node-fee-estimator node)

@@ -6,14 +6,22 @@
 ;;; ensuring safe concurrent access from RPC handler threads.
 
 (defun rpc-get-chain-state (node)
-  "Get chain-state with lock protection."
+  "Get the current (active) chainstate with lock protection. RPC reports the
+active chainstate (Core getblockchaininfo reports CurrentChainstate)."
   (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-    (bitcoin-lisp::node-chain-state node)))
+    (bitcoin-lisp::node-current-chainstate node)))
 
 (defun rpc-get-utxo-set (node)
-  "Get utxo-set with lock protection."
+  "Get the current chainstate's coins view with lock protection."
   (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-    (bitcoin-lisp::node-utxo-set node)))
+    (let ((cs (bitcoin-lisp::node-current-chainstate node)))
+      (and cs (bitcoin-lisp.storage:chain-state-coins-view cs)))))
+
+(defun rpc-get-chainstates (node)
+  "Get a copy of the full chainstates list with lock protection (for
+getchainstates, which reports every chainstate)."
+  (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+    (copy-list (bitcoin-lisp::node-chainstates node))))
 
 (defun rpc-get-peers (node)
   "Get a copy of the peer list with lock protection."
