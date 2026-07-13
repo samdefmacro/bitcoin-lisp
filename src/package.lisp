@@ -740,6 +740,7 @@
    #:tx-handle
    #:tx-handle-p
    #:tx-handle-id
+   #:tx-handle-data
    #:txgraph-add-transaction
    #:txgraph-remove-transaction
    #:txgraph-add-dependency
@@ -786,9 +787,12 @@
    ;; Mempool entry links
    #:mempool-entry-parents
    #:mempool-entry-children
+   #:mempool-entry-graph-handle
    ;; Mempool
    #:mempool
    #:make-mempool
+   #:mempool-graph
+   #:*txgraph-shadow-checks*
    #:mempool-by-wtxid
    #:mempool-find-parents
    #:single-truc-checks

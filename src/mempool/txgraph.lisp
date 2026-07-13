@@ -61,6 +61,12 @@ destructor: the holder must call TXGRAPH-REMOVE-TRANSACTION explicitly."
   (graph nil :read-only t)
   ;; Creation sequence number; basis of the default fallback order.
   (id 0 :type fixnum :read-only t)
+  ;; Opaque caller slot, ignored by the graph. Core's mempool entry IS its
+  ;; handle (CTxMemPoolEntry : public TxGraph::Ref, kernel/mempool_entry.h:65),
+  ;; so callbacks like the fallback order can reach entry data; our mempool
+  ;; stores the entry's txid here for its txid fallback order and the P3
+  ;; shadow checks.
+  (data nil)
   ;; Cluster this transaction is in; NIL = removed (Core Locator).
   (cluster nil)
   ;; Position in the cluster's depgraph.
@@ -84,7 +90,8 @@ destructor: the holder must call TXGRAPH-REMOVE-TRANSACTION explicitly."
 
 (defun %tx-handle-id-order (a b)
   "Default fallback order: handle creation sequence. Core's mempool passes
-txid ordering here (txmempool.cpp:183-187); P3 will do the same."
+txid ordering here (txmempool.cpp:183-187); the mempool's shadow graph does
+the same via %GRAPH-TXID-ORDER (mempool.lisp)."
   (signum (- (tx-handle-id a) (tx-handle-id b))))
 
 ;;;; Clusters and chunks
