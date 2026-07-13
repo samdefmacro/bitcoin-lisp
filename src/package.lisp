@@ -1141,6 +1141,7 @@
    #:reachable-network-p
    #:dialable-network-p
    #:maybe-flip-ipv6-to-cjdns
+   #:proxy-for-target
    #:base32-encode
    #:base32-decode
    #:onion-address-string
