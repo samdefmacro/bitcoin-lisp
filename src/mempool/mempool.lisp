@@ -60,7 +60,13 @@ DEFAULT_MEMPOOL_EXPIRY_HOURS.")
   ;; are derived on demand by walking these (bounded by the 25/25 limits), so
   ;; there are no cached totals to drift out of sync.
   (parents (make-hash-table :test 'equalp) :type hash-table)
-  (children (make-hash-table :test 'equalp) :type hash-table))
+  (children (make-hash-table :test 'equalp) :type hash-table)
+  ;; This entry's transaction in the mempool's shadow txgraph (cluster mempool
+  ;; P3). Core's entry IS its handle (CTxMemPoolEntry : public TxGraph::Ref,
+  ;; kernel/mempool_entry.h:65) and the Ref destructor removes the tx from the
+  ;; graph; with no destructors, MEMPOOL-ADD assigns this and MEMPOOL-REMOVE
+  ;; must explicitly remove it. NIL until the entry is added.
+  (graph-handle nil :type (or null tx-handle)))
 
 (defun tx-wire-bytes (tx)
   "TX in its wire encoding: witness form only when the tx has witness data,
@@ -92,7 +98,14 @@ accumulated delta."
   (let* ((delta (+ (gethash txid (mempool-deltas mempool) 0) fee-delta))
          (entry (mempool-get mempool txid)))
     (when entry
-      (incf (mempool-entry-modified-fee entry) fee-delta))
+      (incf (mempool-entry-modified-fee entry) fee-delta)
+      ;; Keep the shadow txgraph's (chunk) feerates honest (Core
+      ;; PrioritiseTransaction -> SetTransactionFee, txmempool.cpp:641).
+      (let ((handle (mempool-entry-graph-handle entry)))
+        (when handle
+          (txgraph-set-transaction-fee (mempool-graph mempool) handle
+                                       (mempool-entry-modified-fee entry))))
+      (%mempool-graph-verify mempool))
     (if (zerop delta)
         (remhash txid (mempool-deltas mempool))
         (setf (gethash txid (mempool-deltas mempool)) delta))
@@ -107,6 +120,17 @@ prioritisation-modified fee (Core scores mining/eviction on modified fees)."
         (/ (mempool-entry-modified-fee entry) vsize))))
 
 ;;;; Mempool
+
+(defun %graph-txid-order (a b)
+  "Strong fallback order for the mempool's txgraph: byte-lexicographic txid
+comparison, mirroring Core's fallback lambda (txmempool.cpp:183-187). The
+txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
+  (let ((ta (tx-handle-data a))
+        (tb (tx-handle-data b)))
+    (loop for i from 0 below 32
+          for d = (- (aref ta i) (aref tb i))
+          unless (zerop d) return (signum d)
+          finally (return 0))))
 
 (defstruct mempool
   "In-memory transaction pool."
@@ -132,7 +156,15 @@ prioritisation-modified fee (Core scores mining/eviction on modified fees)."
   (deltas (make-hash-table :test 'equalp) :type hash-table)
   ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
   ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
-  (orphan-pool (make-orphan-pool) :type orphan-pool))
+  (orphan-pool (make-orphan-pool) :type orphan-pool)
+  ;; Shadow txgraph (cluster mempool P3): the cluster/chunk engine, maintained
+  ;; in lockstep with ENTRIES on every mutation but read by no decision yet -
+  ;; mining, eviction, limits, and RBF flip to it in P4-P7. Core-exact cluster
+  ;; limits (64 tx / 101 kvB); under today's 25/25 BFS limits a connected
+  ;; component can exceed them, in which case the graph holds the offending
+  ;; dependencies pending and reports oversized until removals resolve it
+  ;; (txgraph.lisp OVERSIZED contract).
+  (graph (make-txgraph :fallback-order #'%graph-txid-order) :type txgraph))
 
 (defconstant +rolling-fee-halflife-seconds+ 43200
   "Rolling minimum fee decays by half every 12 hours (Bitcoin Core default).")
@@ -148,6 +180,110 @@ CFeeRate::GetFeePerK units). Compare as (>= (* fee 1000) (* rate vsize))."
                (decayed (floor (* rolling
                                   (expt 0.5d0 (/ age +rolling-fee-halflife-seconds+))))))
           (max (mempool-min-fee-rate mempool) decayed)))))
+
+;;;; Shadow txgraph checks (cluster mempool P3)
+;;;;
+;;;; The txgraph is write-only in this phase: every mutation path mirrors
+;;;; into it, nothing reads it for decisions. These checks are the safety
+;;;; net for the P4-P7 flips - they prove, across the whole suite and in
+;;;; production soak, that the graph agrees with the BFS parent/child
+;;;; machinery it will replace.
+
+(defvar *txgraph-shadow-checks* nil
+  "When true, assert full mempool/txgraph equivalence after every mempool
+mutation: graph tx-count vs entry count, per-entry handle liveness,
+TXGRAPH-SANITY-CHECK, and (unless the graph is oversized) ancestor- and
+descendant-set equality against the BFS walks plus parent/child edges lying
+within one cluster. Divergence signals an ERROR. NIL in production, set to T
+by the test suite (tests/package.lisp); production always keeps a free
+tx-count equality check that logs a warning instead.")
+
+(defvar *graph-verify-batch* nil
+  "True inside a multi-removal mempool operation. Interim states of such a
+batch can transiently bridge - a removed tx's parents and children both
+still present - where the graph's closure semantics (grandparents stay
+ancestors) and the BFS links (severed) legitimately differ, so the
+expensive equivalence checks only run at batch end.")
+
+(defun %short-txid (txid)
+  (bitcoin-lisp.crypto:bytes-to-hex (subseq txid 0 8)))
+
+(defun %graph-closure-equal-p (closure self bfs-set)
+  "True when CLOSURE (a txgraph ancestor/descendant handle list, which
+includes SELF) covers exactly BFS-SET (a txid hash-set excluding self)."
+  (and (= (length closure) (1+ (hash-table-count bfs-set)))
+       (every (lambda (h)
+                (or (eq h self) (gethash (tx-handle-data h) bfs-set)))
+              closure)))
+
+(defun %verify-graph-entry (mempool graph txid entry)
+  "Assert graph/BFS equivalence for one entry: ancestor and descendant sets
+match the BFS walks, and every parent edge stays within one cluster. The
+graph must not be oversized."
+  (let ((handle (mempool-entry-graph-handle entry)))
+    (unless (%graph-closure-equal-p (txgraph-get-ancestors graph handle)
+                                    handle (mempool-ancestors mempool txid))
+      (error "txgraph shadow divergence: ancestor sets differ for ~A"
+             (%short-txid txid)))
+    (unless (%graph-closure-equal-p (txgraph-get-descendants graph handle)
+                                    handle (mempool-descendants mempool txid))
+      (error "txgraph shadow divergence: descendant sets differ for ~A"
+             (%short-txid txid)))
+    (maphash (lambda (parent v)
+               (declare (ignore v))
+               (let ((pe (mempool-get mempool parent)))
+                 (unless (and pe (eq (tx-handle-cluster
+                                      (mempool-entry-graph-handle pe))
+                                     (tx-handle-cluster handle)))
+                   (error "txgraph shadow divergence: edge ~A -> ~A ~
+                           spans clusters"
+                          (%short-txid parent) (%short-txid txid)))))
+             (mempool-entry-parents entry))))
+
+(defun %mempool-graph-verify (mempool)
+  "Verify the shadow txgraph against the mempool. The tx-count equality
+check is always on (O(1); logs a warning in production, errors under
+*TXGRAPH-SHADOW-CHECKS*); the full equivalence checks run only under
+*TXGRAPH-SHADOW-CHECKS* and outside removal batches."
+  (let ((graph (mempool-graph mempool))
+        (count (mempool-count mempool)))
+    (unless (= (txgraph-tx-count graph) count)
+      (if *txgraph-shadow-checks*
+          (error "txgraph shadow divergence: graph has ~D transactions, ~
+                  mempool has ~D"
+                 (txgraph-tx-count graph) count)
+          (bitcoin-lisp:log-warn
+           "txgraph shadow divergence: graph ~D txs, mempool ~D"
+           (txgraph-tx-count graph) count)))
+    (when (and *txgraph-shadow-checks* (not *graph-verify-batch*))
+      (txgraph-sanity-check graph)
+      (maphash (lambda (txid entry)
+                 (let ((handle (mempool-entry-graph-handle entry)))
+                   (unless (and handle
+                                (txgraph-exists-p graph handle)
+                                (equalp (tx-handle-data handle) txid))
+                     (error "txgraph shadow divergence: entry ~A has ~
+                             ~:[no~;a dead or mismatched~] graph handle"
+                            (%short-txid txid) handle))))
+               (mempool-entries mempool))
+      (unless (txgraph-oversized-p graph)
+        (maphash (lambda (txid entry)
+                   (%verify-graph-entry mempool graph txid entry))
+                 (mempool-entries mempool)))))
+  (values))
+
+(defmacro %with-graph-verify-batch ((mempool) &body body)
+  "Run BODY as one removal batch: per-removal verification stays cheap
+(tx-count only) and the full shadow verification runs once at the end.
+Nested batches verify only at the outermost exit."
+  (let ((mp (gensym "MEMPOOL")) (outer (gensym "OUTER")))
+    `(let* ((,mp ,mempool)
+            (,outer (not *graph-verify-batch*))
+            (*graph-verify-batch* t))
+       (multiple-value-prog1 (progn ,@body)
+         (when ,outer
+           (let ((*graph-verify-batch* nil))
+             (%mempool-graph-verify ,mp)))))))
 
 ;;;; Outpoint key helper
 
@@ -477,11 +613,33 @@ Returns :ok on success, or a keyword indicating the rejection reason."
   ;; Update total size
   (incf (mempool-total-size mempool) (mempool-entry-size entry))
 
+  ;; Mirror into the shadow txgraph (Core ChangeSet::StageAddition +
+  ;; ProcessDependencies, txmempool.cpp:1005-1071): the modified fee (the
+  ;; delta was applied above; Core adds unmodified then SetTransactionFee -
+  ;; one step here), the vsize, and a dependency per in-mempool parent.
+  (let* ((graph (mempool-graph mempool))
+         (handle (txgraph-add-transaction
+                  graph (mempool-entry-modified-fee entry)
+                  (mempool-entry-vsize entry))))
+    (setf (tx-handle-data handle) txid
+          (mempool-entry-graph-handle entry) handle)
+    (dolist (p parent-txids)
+      (txgraph-add-dependency
+       graph (mempool-entry-graph-handle (mempool-get mempool p)) handle)))
+  (%mempool-graph-verify mempool)
+
   :ok))
 
 (defun mempool-remove (mempool txid)
   "Remove a transaction from the mempool by txid.
-Returns the removed entry, or NIL if not found."
+Returns the removed entry, or NIL if not found.
+
+Callers removing a tx that has in-mempool descendants must use
+MEMPOOL-REMOVE-RECURSIVE (as every current caller does; Core has no
+non-recursive removal of a tx with descendants either): removing only the
+middle of a chain leaves the shadow txgraph - whose closure semantics keep
+grandparents connected - disagreeing with the severed BFS links, which the
+shadow checks report as divergence."
   (let ((entry (gethash txid (mempool-entries mempool))))
     (when entry
       ;; Remove spent outpoint entries
@@ -502,19 +660,30 @@ Returns the removed entry, or NIL if not found."
       (remhash txid (mempool-entries mempool))
       ;; Update total size
       (decf (mempool-total-size mempool) (mempool-entry-size entry))
+      ;; Drop from the shadow txgraph (Core ChangeSet::StageRemoval /
+      ;; removeUnchecked; the Ref destructor does this in Core - with no
+      ;; destructors it must be explicit on EVERY removal path, and all
+      ;; paths funnel through here). A NIL handle means the entry bypassed
+      ;; MEMPOOL-ADD; the verify below reports the count divergence.
+      (let ((handle (mempool-entry-graph-handle entry)))
+        (when handle
+          (txgraph-remove-transaction (mempool-graph mempool) handle)))
+      (%mempool-graph-verify mempool)
       entry)))
 
 (defun mempool-remove-recursive (mempool txid)
   "Remove TXID and all of its in-mempool descendants. Returns the number of
-transactions removed. Used by RBF replacement, eviction, and expiry so a
-removed tx never leaves dangling children behind."
-  (let ((targets (mempool-descendants mempool txid))
-        (removed 0))
-    (setf (gethash txid targets) t)        ; include self
-    (maphash (lambda (t2 v) (declare (ignore v))
-               (when (mempool-remove mempool t2) (incf removed)))
-             targets)
-    removed))
+transactions removed. Used by RBF replacement, eviction, expiry, and
+block-conflict removal so a removed tx never leaves dangling children
+behind."
+  (%with-graph-verify-batch (mempool)
+    (let ((targets (mempool-descendants mempool txid))
+          (removed 0))
+      (setf (gethash txid targets) t)      ; include self
+      (maphash (lambda (t2 v) (declare (ignore v))
+                 (when (mempool-remove mempool t2) (incf removed)))
+               targets)
+      removed)))
 
 ;;;; Replace-by-fee (BIP125)
 
@@ -807,32 +976,37 @@ size cap. Returns T (no-op when already under the cap)."
 
 (defun mempool-remove-for-block (mempool block)
   "Remove transactions confirmed in BLOCK from the mempool.
-Also removes any transactions that conflict with block transactions."
-  (let ((block-outpoints (make-hash-table :test 'equalp)))
-    ;; Collect all outpoints spent by block transactions
-    (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-      (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-               (key (make-outpoint-key
-                     (bitcoin-lisp.serialization:outpoint-hash prevout)
-                     (bitcoin-lisp.serialization:outpoint-index prevout))))
-          (setf (gethash key block-outpoints) t))))
+Also removes any transactions that conflict with block transactions,
+together with their in-mempool descendants (Core removeForBlock ->
+removeConflicts -> removeRecursive, txmempool.cpp:388-424: a conflicted
+tx's descendants spend outputs that no longer exist)."
+  (%with-graph-verify-batch (mempool)
+    (let ((block-outpoints (make-hash-table :test 'equalp)))
+      ;; Collect all outpoints spent by block transactions
+      (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+        (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
+          (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                 (key (make-outpoint-key
+                       (bitcoin-lisp.serialization:outpoint-hash prevout)
+                       (bitcoin-lisp.serialization:outpoint-index prevout))))
+            (setf (gethash key block-outpoints) t))))
 
-    ;; Remove confirmed transactions; a mined tx's prioritisation delta is
-    ;; spent ballast (Core removeForBlock -> ClearPrioritisation).
-    (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-      (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-        (remhash txid (mempool-deltas mempool))
-        (mempool-remove mempool txid)))
+      ;; Remove confirmed transactions; a mined tx's prioritisation delta is
+      ;; spent ballast (Core removeForBlock -> ClearPrioritisation).
+      (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+        (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+          (remhash txid (mempool-deltas mempool))
+          (mempool-remove mempool txid)))
 
-    ;; Remove conflicting transactions (mempool txs that spend same outpoints as block txs)
-    (let ((to-remove '()))
-      (maphash (lambda (outpoint-key spending-txid)
-                 (when (gethash outpoint-key block-outpoints)
-                   (pushnew spending-txid to-remove :test #'equalp)))
-               (mempool-spent-outpoints mempool))
-      (dolist (txid to-remove)
-        (mempool-remove mempool txid)))))
+      ;; Remove conflicting transactions (mempool txs that spend same outpoints
+      ;; as block txs), recursively: their descendants are conflicted too.
+      (let ((to-remove '()))
+        (maphash (lambda (outpoint-key spending-txid)
+                   (when (gethash outpoint-key block-outpoints)
+                     (pushnew spending-txid to-remove :test #'equalp)))
+                 (mempool-spent-outpoints mempool))
+        (dolist (txid to-remove)
+          (mempool-remove-recursive mempool txid))))))
 
 (defun mempool-get-transactions (mempool)
   "Return a list of all transactions in the mempool."

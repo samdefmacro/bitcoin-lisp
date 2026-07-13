@@ -132,6 +132,8 @@
                              (:file "cluster-linearize-tests")
                              ;; Cluster mempool: txgraph engine (Core txgraph.{h,cpp})
                              (:file "txgraph-tests")
+                             ;; Cluster mempool P3: shadow-mode mempool/txgraph equivalence
+                             (:file "mempool-shadow-tests")
                              ;; Package relay tests (submitpackage)
                              (:file "package-tests")
                              ;; Mining / regtest tests

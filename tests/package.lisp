@@ -6,6 +6,11 @@
 
 (in-package #:bitcoin-lisp.tests)
 
+;; Cluster mempool P3 shadow mode: run the WHOLE suite with full
+;; mempool/txgraph equivalence assertions after every mempool mutation
+;; (default NIL in production; see src/mempool/mempool.lisp).
+(setf bitcoin-lisp.mempool:*txgraph-shadow-checks* t)
+
 (def-suite :bitcoin-lisp-tests
   :description "Test suite for bitcoin-lisp")
 
