@@ -369,9 +369,11 @@ a non-empty mempool — all rejected before the coin stream is touched."
                                       :value 1000 :script-pubkey (%snap-cat #(#x6A))))
                     :lock-time 0))
                (mp (bitcoin-lisp::node-mempool node)))
+          ;; make-entry-from-tx: raw make-mempool-entry has vsize 0, which
+          ;; the shadow txgraph (added in cluster mempool P3) rejects.
           (bitcoin-lisp.mempool:mempool-add
            mp (bitcoin-lisp.serialization:transaction-hash tx)
-           (bitcoin-lisp.mempool:make-mempool-entry :transaction tx))
+           (bitcoin-lisp.mempool:make-entry-from-tx tx 0 0))
           (is (%snap-err-matches (%snap-load-err node snap5)
                                  -32603 "mempool not empty"))
           (setf (bitcoin-lisp::node-mempool node) (bitcoin-lisp.mempool:make-mempool)))
