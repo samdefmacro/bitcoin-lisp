@@ -164,17 +164,23 @@ it back lowercase."
         (is (eq net pnet))
         (is (equalp bytes pbytes))))))
 
-;;;; CJDNS retag at string ingress (-cjdnsreachable)
+;;;; CJDNS retag at string ingress
+;;;;
+;;;; Core's exact gate is g_reachable_nets.Contains(NET_CJDNS)
+;;;; (MaybeFlipIPv6toCJDNS, netbase.cpp:942-949): -cjdnsreachable admits
+;;;; :cjdns to the reachable set (apply-config-globals), -onlynet can
+;;;; exclude it again.
 
 (test cjdns-flip-on-ingress
   (let ((fc-bytes (%na-hex "fc000001000200030004000500060007")))
-    ;; Flag off: fc00::/8 strings stay :ipv6 (and are unroutable, see below).
-    (let ((bitcoin-lisp.networking:*cjdns-reachable* nil))
+    ;; CJDNS not reachable (default set): fc00::/8 strings stay :ipv6 (and
+    ;; are unroutable as such, see below).
+    (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6)))
       (is (eq :ipv6 (bitcoin-lisp.networking:maybe-flip-ipv6-to-cjdns :ipv6 fc-bytes)))
       (is (eq :ipv6 (nth-value 0 (bitcoin-lisp.networking:parse-network-address
                                   "fc00:1:2:3:4:5:6:7")))))
-    ;; Flag on: retagged :cjdns.
-    (let ((bitcoin-lisp.networking:*cjdns-reachable* t))
+    ;; CJDNS reachable (-cjdnsreachable set): retagged :cjdns.
+    (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6 :cjdns)))
       (is (eq :cjdns (bitcoin-lisp.networking:maybe-flip-ipv6-to-cjdns :ipv6 fc-bytes)))
       (multiple-value-bind (net bytes)
           (bitcoin-lisp.networking:parse-network-address "fc00:1:2:3:4:5:6:7")
@@ -182,7 +188,12 @@ it back lowercase."
         (is (equalp fc-bytes bytes)))
       ;; Non-fc addresses never flip.
       (is (eq :ipv6 (bitcoin-lisp.networking:maybe-flip-ipv6-to-cjdns
-                     :ipv6 (%na-hex "20010db8000000000000000000000001")))))))
+                     :ipv6 (%na-hex "20010db8000000000000000000000001")))))
+    ;; -cjdnsreachable but -onlynet excludes cjdns: Core does NOT retag
+    ;; (the reachable set, not the raw flag, is the gate).
+    (let ((bitcoin-lisp.networking:*cjdns-reachable* t)
+          (bitcoin-lisp.networking:*reachable-networks* '(:ipv4)))
+      (is (eq :ipv6 (bitcoin-lisp.networking:maybe-flip-ipv6-to-cjdns :ipv6 fc-bytes))))))
 
 ;;;; Routability per network (addrman gate)
 
@@ -244,14 +255,92 @@ it back lowercase."
 
 ;;;; Reachability / dialability
 
-(test dialable-network-p-ip-only
-  "P1 safety valve: only IP networks are dialable until P2, no matter what
--onlynet or the proxy config says."
-  (is-true (bitcoin-lisp.networking:dialable-network-p :ipv4))
-  (is-true (bitcoin-lisp.networking:dialable-network-p :ipv6))
-  (is-false (bitcoin-lisp.networking:dialable-network-p :torv3))
-  (is-false (bitcoin-lisp.networking:dialable-network-p :i2p))
-  (is-false (bitcoin-lisp.networking:dialable-network-p :cjdns)))
+(test dialable-network-p-config-matrix
+  "P2 config-aware dialability: every net x {no proxy, -proxy, -onion,
+-onion=0 with -proxy, -cjdnsreachable}. torv3 is dialable iff a Tor-capable
+proxy is configured (*onion-proxy* — apply-config-globals defaults it to
+-proxy, and -onion=0 clears it, Core init.cpp:1766-1780); cjdns iff
+-cjdnsreachable; i2p never; ipv4/ipv6 always. -onlynet never affects
+dialability (it is applied separately, via reachable-network-p)."
+  (let ((tor (bitcoin-lisp.networking:make-proxy :host "127.0.0.1" :port 9050)))
+    ;; No proxy, no flags: IP-only, exactly as before P2.
+    (let ((bitcoin-lisp.networking:*proxy* nil)
+          (bitcoin-lisp.networking:*onion-proxy* nil)
+          (bitcoin-lisp.networking:*cjdns-reachable* nil))
+      (is-true (bitcoin-lisp.networking:dialable-network-p :ipv4))
+      (is-true (bitcoin-lisp.networking:dialable-network-p :ipv6))
+      (is-false (bitcoin-lisp.networking:dialable-network-p :torv3))
+      (is-false (bitcoin-lisp.networking:dialable-network-p :i2p))
+      (is-false (bitcoin-lisp.networking:dialable-network-p :cjdns)))
+    ;; -proxy: apply-config-globals mirrors it into *onion-proxy* => torv3
+    ;; dialable. (dialable-network-p itself reads only *onion-proxy*.)
+    (let ((bitcoin-lisp.networking:*proxy* tor)
+          (bitcoin-lisp.networking:*onion-proxy* tor)
+          (bitcoin-lisp.networking:*cjdns-reachable* nil))
+      (is-true (bitcoin-lisp.networking:dialable-network-p :torv3))
+      (is-false (bitcoin-lisp.networking:dialable-network-p :i2p))
+      (is-false (bitcoin-lisp.networking:dialable-network-p :cjdns)))
+    ;; -onion alone (no general proxy): torv3 dialable, clearnet direct.
+    (let ((bitcoin-lisp.networking:*proxy* nil)
+          (bitcoin-lisp.networking:*onion-proxy* tor))
+      (is-true (bitcoin-lisp.networking:dialable-network-p :torv3))
+      (is-true (bitcoin-lisp.networking:dialable-network-p :ipv4)))
+    ;; -proxy with -onion=0: *onion-proxy* cleared => torv3 NOT dialable
+    ;; even though a general proxy exists.
+    (let ((bitcoin-lisp.networking:*proxy* tor)
+          (bitcoin-lisp.networking:*onion-proxy* nil))
+      (is-false (bitcoin-lisp.networking:dialable-network-p :torv3)))
+    ;; -cjdnsreachable: cjdns dialable (plain TCP into the cjdroute TUN).
+    (let ((bitcoin-lisp.networking:*cjdns-reachable* t)
+          (bitcoin-lisp.networking:*onion-proxy* nil))
+      (is-true (bitcoin-lisp.networking:dialable-network-p :cjdns))
+      (is-false (bitcoin-lisp.networking:dialable-network-p :torv3))
+      (is-false (bitcoin-lisp.networking:dialable-network-p :i2p)))))
+
+(test proxy-for-target-per-network
+  "Per-target-network proxy pick (Core ConnectNode, net.cpp:449): .onion =>
+*onion-proxy* (refused when none — never raw-dialed/DNS-leaked); .b32.i2p
+=> always refused; everything else => *proxy* (NIL = direct dial)."
+  (let ((tor (bitcoin-lisp.networking:make-proxy :host "10.0.0.2" :port 9051))
+        (all (bitcoin-lisp.networking:make-proxy :host "10.0.0.1" :port 9050)))
+    ;; Onion with a Tor proxy configured.
+    (let ((bitcoin-lisp.networking:*proxy* all)
+          (bitcoin-lisp.networking:*onion-proxy* tor))
+      (multiple-value-bind (proxy refusal)
+          (bitcoin-lisp.networking:proxy-for-target +onion-str-1+)
+        (is (eq tor proxy))          ; -onion's proxy, not -proxy's
+        (is (null refusal)))
+      ;; Clearnet targets and hostnames use *proxy*.
+      (multiple-value-bind (proxy refusal)
+          (bitcoin-lisp.networking:proxy-for-target "203.0.113.7")
+        (is (eq all proxy))
+        (is (null refusal)))
+      (multiple-value-bind (proxy refusal)
+          (bitcoin-lisp.networking:proxy-for-target "seed.example.org")
+        (is (eq all proxy))
+        (is (null refusal)))
+      ;; CJDNS literal: *proxy* covers it (Core: unsuffixed -proxy sets the
+      ;; cjdns proxy too, init.cpp:1735).
+      (multiple-value-bind (proxy refusal)
+          (bitcoin-lisp.networking:proxy-for-target "fc00:1:2:3:4:5:6:7")
+        (is (eq all proxy))
+        (is (null refusal)))
+      ;; I2P is refused even with proxies configured (SAM is P4).
+      (multiple-value-bind (proxy refusal)
+          (bitcoin-lisp.networking:proxy-for-target +i2p-str-1+)
+        (is (null proxy))
+        (is (stringp refusal))))
+    ;; No proxies at all: onion refused, clearnet/cjdns dial direct.
+    (let ((bitcoin-lisp.networking:*proxy* nil)
+          (bitcoin-lisp.networking:*onion-proxy* nil))
+      (multiple-value-bind (proxy refusal)
+          (bitcoin-lisp.networking:proxy-for-target +onion-str-1+)
+        (is (null proxy))
+        (is (stringp refusal)))
+      (multiple-value-bind (proxy refusal)
+          (bitcoin-lisp.networking:proxy-for-target "fc00:1:2:3:4:5:6:7")
+        (is (null proxy))
+        (is (null refusal))))))
 
 (test reachable-network-p-follows-special
   (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :torv3)))
@@ -260,11 +349,14 @@ it back lowercase."
     (is-false (bitcoin-lisp.networking:reachable-network-p :ipv6))))
 
 (test select-dialable-never-returns-non-ip
-  "A book holding ONLY onion/i2p records yields nothing to automatic outbound
-selection; mixed books only ever yield the IP records."
+  "WITHOUT a Tor proxy, a book holding ONLY onion/i2p records yields nothing
+to automatic outbound selection — even with every network in the reachable
+set; mixed books only ever yield the IP records."
   (let ((book (bitcoin-lisp.networking:make-address-book))
         (bitcoin-lisp.networking:*reachable-networks*
-          (copy-list bitcoin-lisp.networking:+bip155-networks+)))
+          (copy-list bitcoin-lisp.networking:+bip155-networks+))
+        (bitcoin-lisp.networking:*onion-proxy* nil)
+        (bitcoin-lisp.networking:*cjdns-reachable* nil))
     (is-true (bitcoin-lisp.networking:address-book-add
               book (bitcoin-lisp.networking:make-peer-address
                     :net :torv3 :ip (%na-hex +onion-pubkey-1+) :port 8333
@@ -287,6 +379,37 @@ selection; mixed books only ever yield the IP records."
         (is (not (null pa)))
         (is (eq :ipv4 (bitcoin-lisp.networking:peer-address-network pa)))))))
 
+(test select-dialable-yields-onion-with-proxy-never-i2p
+  "WITH a Tor proxy, automatic selection may yield torv3 records — but NEVER
+i2p, under any configuration (the P4 gap stays closed)."
+  (let ((book (bitcoin-lisp.networking:make-address-book))
+        (bitcoin-lisp.networking:*reachable-networks*
+          (copy-list bitcoin-lisp.networking:+bip155-networks+))
+        (bitcoin-lisp.networking:*onion-proxy*
+          (bitcoin-lisp.networking:make-proxy :host "127.0.0.1" :port 9050))
+        (bitcoin-lisp.networking:*cjdns-reachable* t))
+    (is-true (bitcoin-lisp.networking:address-book-add
+              book (bitcoin-lisp.networking:make-peer-address
+                    :net :torv3 :ip (%na-hex +onion-pubkey-1+) :port 8333
+                    :services 1 :last-seen (bitcoin-lisp.serialization:get-unix-time))))
+    (is-true (bitcoin-lisp.networking:address-book-add
+              book (bitcoin-lisp.networking:make-peer-address
+                    :net :i2p :ip (%na-hex +i2p-hash-1+) :port 0
+                    :services 1 :last-seen (bitcoin-lisp.serialization:get-unix-time))))
+    ;; The onion record is now selectable...
+    (let ((pa (bitcoin-lisp.networking:select-dialable-address book :tries 500)))
+      (is (not (null pa)))
+      (is (eq :torv3 (bitcoin-lisp.networking:peer-address-network pa))))
+    ;; ...and i2p never comes out, however many draws.
+    (dotimes (_ 50)
+      (let ((pa (bitcoin-lisp.networking:select-dialable-address book :tries 50)))
+        (when pa
+          (is (not (eq :i2p (bitcoin-lisp.networking:peer-address-network pa)))))))
+    ;; Onion selection dies with the proxy (e.g. -onion=0): nothing dialable
+    ;; remains in this book but the i2p record, which stays excluded.
+    (let ((bitcoin-lisp.networking:*onion-proxy* nil))
+      (is (null (bitcoin-lisp.networking:select-dialable-address book :tries 200))))))
+
 (test select-dialable-honors-onlynet
   "-onlynet=ipv6 (reachable set without :ipv4) excludes IPv4 records from
 automatic selection even though IPv4 is dialable."
@@ -300,6 +423,119 @@ automatic selection even though IPv4 is dialable."
       (is (null (bitcoin-lisp.networking:select-dialable-address book :tries 200))))
     (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4)))
       (is (not (null (bitcoin-lisp.networking:select-dialable-address book :tries 200)))))))
+
+;;;; IPv6 text parsing (string-to-ip-bytes / %parse-ipv6-string)
+;;;;
+;;;; Address strings are Core's own test inputs (netbase_tests.cpp
+;;;; netbase_properties/netbase_getgroup ResolveIP calls, which reach
+;;;; inet_pton); expected bytes follow from the RFC4291 text rules.
+
+(test ipv6-parse-core-vectors
+  (flet ((p (s) (bitcoin-lisp.networking:string-to-ip-bytes s)))
+    ;; Full 8-group colon-hex.
+    (is (equalp (%na-hex "00010002000300040005000600070008") (p "1:2:3:4:5:6:7:8")))
+    ;; "::" compression, leading/trailing/inner.
+    (is (equalp (%na-hex "00000000000000000000000000000001") (p "::1")))
+    (is (equalp (%na-hex "20010db8000000000000000000000001") (p "2001:db8::1")))
+    (is (equalp (%na-hex "20010000000000000000000000008888") (p "2001::8888")))
+    (is (equalp (%na-hex "00010002000300040005000600070000") (p "1:2:3:4:5:6:7::")))
+    (is (equalp (%na-hex "00000000000000000000000000000000") (p "::")))
+    ;; Case-insensitive hex (Core: "FC00::", "64:FF9B::").
+    (is (equalp (%na-hex "fc000000000000000000000000000000") (p "FC00::")))
+    ;; Embedded IPv4 tails: mapped (-> :ipv4 net), RFC6145-translated, plain.
+    (is (equalp (%na-hex "00000000000000000000ffff7f000001") (p "::ffff:127.0.0.1")))
+    (is (equalp (%na-hex "00000000000000000000ffffc0a80101") (p "::FFFF:192.168.1.1")))
+    (is (equalp (%na-hex "0000000000000000ffff000001020304") (p "::FFFF:0:102:304")))
+    (is (equalp (%na-hex "0064ff9b000000000000000001020304") (p "64:FF9B::102:304")))
+    ;; Dotted quad still parses to the mapped form.
+    (is (equalp (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 8 8 8 8) (p "8.8.8.8")))
+    ;; Invalid forms all return NIL (total function, never signals).
+    (dolist (bad '("1:2:3:4:5:6:7:8:9"   ; 9 groups
+                   "1:2:3:4:5:6:7:8::"   ; 8 groups + "::"
+                   "1:2:3"               ; too few, no "::"
+                   "1::2::3"             ; two "::"
+                   ":::"                 ; ditto
+                   "1:2:3:4:5:6:7:8%zone" ; scoped
+                   "fe80::1%eth0"        ; scoped
+                   "12345::1"            ; >4 hex digits
+                   "g::1"                ; non-hex
+                   "1.2.3.4::"           ; v4 not in the last 32 bits
+                   "::ffff:1.2.3.4.5"    ; 5-part quad
+                   "256.1.1.1"           ; v4 octet out of range
+                   "-1.2.3.4"            ; sign
+                   "1.2.3"               ; short quad
+                   "seed.example.org"    ; hostname
+                   ""))
+      (is (null (p bad)) "~S should not parse" bad))))
+
+(test parse-network-address-ipv6-nets
+  "parse-network-address types IPv6 text right: mapped quads are :ipv4 (Core
+IsIPv4 on ::FFFF:a.b.c.d), everything else :ipv6 (:cjdns handled in
+cjdns-flip-on-ingress)."
+  (multiple-value-bind (net bytes)
+      (bitcoin-lisp.networking:parse-network-address "::ffff:127.0.0.1")
+    (is (eq :ipv4 net))
+    (is (equalp (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 127 0 0 1) bytes)))
+  (multiple-value-bind (net bytes)
+      (bitcoin-lisp.networking:parse-network-address "1:2:3:4:5:6:7:8")
+    (is (eq :ipv6 net))
+    (is (equalp (%na-hex "00010002000300040005000600070008") bytes)))
+  ;; Round-trip: our uncompressed rendering re-parses to the same bytes.
+  (let ((bytes (%na-hex "20010db8000000000000000000000001")))
+    (multiple-value-bind (net rt)
+        (bitcoin-lisp.networking:parse-network-address
+         (bitcoin-lisp.networking:ip-bytes-to-string bytes))
+      (is (eq :ipv6 net))
+      (is (equalp bytes rt)))))
+
+;;;; Netgroups: Core netbase_getgroup vectors (netbase_tests.cpp:329-343,
+;;;; adapted: NoAsmap, so IPv4 /16 and IPv6 /32).
+;;;;
+;;;; Deliberate divergence retained from the pre-P1 code: private IPv4
+;;;; (RFC1918 etc.) still gets a real group here (Core: [0] unroutable) —
+;;;; regtest/private setups rely on it.
+
+(test net-group-key-core-vectors
+  (flet ((g (s) (multiple-value-bind (net bytes)
+                    (bitcoin-lisp.networking:parse-network-address s)
+                  (coerce (bitcoin-lisp.networking:net-group-key bytes net)
+                          'list))))
+    (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6)))
+      ;; IPv4 -> [1, /16].
+      (is (equal '(1 1 2) (g "1.2.3.4")))
+      ;; Linked-IPv4 carriers group as the tunneled IPv4's /16 with Core's
+      ;; NET_IPV4 class byte (GetNetClass returns NET_IPV4 for them).
+      (is (equal '(1 1 2) (g "::FFFF:0:102:304")))                       ; RFC6145
+      (is (equal '(1 1 2) (g "64:FF9B::102:304")))                       ; RFC6052
+      (is (equal '(1 1 2) (g "2002:102:304:9999:9999:9999:9999:9999")))  ; RFC3964
+      (is (equal '(1 1 2) (g "2001:0:9999:9999:9999:9999:FEFD:FCFB")))   ; RFC4380
+      ;; he.net -> /36; other IPv6 -> /32.
+      (is (equal '(2 32 1 4 112 175) (g "2001:470:abcd:9999:9999:9999:9999:9999")))
+      (is (equal '(2 32 1 32 1) (g "2001:2001:9999:9999:9999:9999:9999:9999")))
+      ;; fc00::/7 arriving untagged (:ipv6) is unroutable -> [0], like Core.
+      (is (equal '(0) (g "fc00:1:2:3:4:5:6:7")))
+      (is (equal '(0) (g "fd6b:88c0:8724:ca97:8112:ca1b:bdca:fac2"))))
+    ;; The same fc00 bytes tagged :cjdns keep their real 12-bit group.
+    (is (equal (list 5 #xFC (logior #x00 #x0F))
+               (coerce (bitcoin-lisp.networking:net-group-key
+                        (%na-hex "fc000001000200030004000500060007") :cjdns)
+                       'list)))))
+
+(test ip-netgroup-ipv6-strings
+  "ip-netgroup (string level, used by eviction/diversification) gives IPv6 a
+real /32 group and distinct operators distinct groups — inbound IPv6/CJDNS
+peers are grouped through this exact path (their socket address strings)."
+  (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6 :cjdns)))
+    (let ((a (bitcoin-lisp.networking:ip-netgroup "2001:db8::1"))
+          (b (bitcoin-lisp.networking:ip-netgroup "2001:db8::2"))
+          (c (bitcoin-lisp.networking:ip-netgroup "2607:f8b0::1")))
+      (is (stringp a))
+      (is (string= a b))               ; same /32
+      (is (not (string= a c))))        ; different /32
+    ;; fc00::/8 inbound under -cjdnsreachable groups as CJDNS (flip at the
+    ;; string ingress), not as one IPv6 blob.
+    (let ((g (bitcoin-lisp.networking:ip-netgroup "fc00:1:2:3:4:5:6:7")))
+      (is (string= "5.252.15" g)))))   ; [5, #xFC, #x01|#x0F] rendered
 
 ;;;; peer-address-string
 

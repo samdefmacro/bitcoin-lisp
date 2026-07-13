@@ -1558,7 +1558,8 @@ off. Returns NIL (and stalls quietly) if the parent height's record is missing
 (defconstant +anchors-magic-v2+ #x414e4332)  ; "ANC2" — network-typed + port
 
 (defvar *pending-anchor-addresses* nil
-  "Anchor host strings loaded at startup, consumed (and cleared) by the first
+  "Anchor dial candidates — (host-string . port) conses, port NIL meaning the
+network default — loaded at startup and consumed (and cleared) by the first
 connect-to-peers so they are attempted before DNS-seed candidates.")
 
 (defun anchors-dat-path (data-directory)
@@ -1663,30 +1664,66 @@ anchors.dat in the network-typed v2 format (net + address + port)."
       (log-info "Saved ~D anchor peer~:P" (length entries)))))
 
 (defun load-anchors (node)
-  "Read anchors.dat into *pending-anchor-addresses* so the next connect attempts
-them first. Missing/corrupt file is ignored; a v1-era file migrates (see
-parse-anchor-entries) and the next save rewrites it as v2. Only dialable
-networks become dial candidates — after P1 the file may name onion/i2p/cjdns
-anchors that nothing can connect to until P2. NOTE: the dial list is host
-strings consumed at the network default port (pre-existing limitation); the
-stored port is carried for the P2 dialer."
+  "Read anchors.dat into *pending-anchor-addresses* — (host . port) dial
+candidates, dialed at the STORED port (migrated v1 entries carry port NIL and
+fall back to the network default) — so the next connect attempts them first.
+Missing/corrupt file is ignored; a v1-era file migrates (see
+parse-anchor-entries) and the next save rewrites it as v2. Only networks that
+are dialable under the current config (dialable-network-p: onion needs a Tor
+proxy, cjdns needs -cjdnsreachable) and reachable (-onlynet) become dial
+candidates."
   (let ((bytes (bitcoin-lisp.storage:load-file-with-crc32
                 (anchors-dat-path (node-data-directory node)) 6)))
     (when bytes
       (setf *pending-anchor-addresses*
-            (loop for entry in (parse-anchor-entries bytes)
-                  for net = (first entry)
+            (loop for (net addr-bytes port) in (parse-anchor-entries bytes)
                   when (and (bitcoin-lisp.networking:dialable-network-p net)
                             (bitcoin-lisp.networking:reachable-network-p net))
-                    collect (bitcoin-lisp.networking:network-address-to-string
-                             net (second entry))))
+                    collect (cons (bitcoin-lisp.networking:network-address-to-string
+                                   net addr-bytes)
+                                  port)))
       (when *pending-anchor-addresses*
         (log-info "Loaded ~D anchor peer~:P for priority reconnection"
                   (length *pending-anchor-addresses*))))))
 
+(defun %record-outbound-result (address-book addr port peer success)
+  "Record an outbound dial outcome for ADDR:PORT in ADDRESS-BOOK, adding the
+entry if new (network-typed, so IPv6/onion/cjdns peers get addrman credit
+too): SUCCESS => Good + Connected, failure => Attempt with count-failure
+(Core CConnman's addrman feedback in ConnectNode/OpenNetworkConnection).
+Hostname dial targets (unparseable as addresses) are skipped."
+  (when address-book
+    (multiple-value-bind (net ip-bytes)
+        (bitcoin-lisp.networking:parse-network-address addr)
+      (when net
+        (unless (bitcoin-lisp.networking:address-book-lookup
+                 address-book ip-bytes port net)
+          (bitcoin-lisp.networking:address-book-add
+           address-book
+           (bitcoin-lisp.networking:make-peer-address
+            :net net :ip ip-bytes :port port
+            :services (if (and success peer)
+                          (bitcoin-lisp.networking:peer-services peer)
+                          0)
+            :last-seen (bitcoin-lisp.serialization:get-unix-time))))
+        (if success
+            (progn
+              (bitcoin-lisp.networking:address-book-good
+               address-book ip-bytes port
+               (bitcoin-lisp.serialization:get-unix-time) net)
+              (bitcoin-lisp.networking:address-book-connected
+               address-book ip-bytes port
+               (bitcoin-lisp.serialization:get-unix-time) net))
+            (bitcoin-lisp.networking:address-book-attempt
+             address-book ip-bytes port :count-failure t :net net))))))
+
 (defun connect-to-peers (node max-peers &key (timeout 60) (min-peers 1))
   "Connect to Bitcoin network peers.
-Uses address book for warm starts, falls back to DNS seeds.
+Uses address book for warm starts, falls back to DNS seeds. Dial candidates
+are (host . port) conses (port NIL = network default): addrman picks and
+anchors carry their STORED ports, DNS/fixed seeds the default. Onion default
+port = chain default port (Core net.cpp:3395-3404 GetDefaultPort), so the
+same fallback covers .onion candidates.
 MAX-PEERS: Target number of peers to connect
 TIMEOUT: Maximum seconds to spend connecting (default 60)
 MIN-PEERS: Return early once we have at least this many peers (default 1)
@@ -1707,22 +1744,24 @@ Returns the number of peers connected."
             (picks '()))
         (dotimes (i (* max-peers 8))
           ;; select-dialable-address, never raw select: post-BIP155 the book
-          ;; can hold torv3/i2p/cjdns entries nothing can dial until P2.
+          ;; can hold records not dialable under the current config (torv3
+          ;; without a Tor proxy, i2p always, cjdns without -cjdnsreachable).
           (let ((pa (bitcoin-lisp.networking:select-dialable-address address-book)))
             (when pa
-              (let ((str (bitcoin-lisp.networking:ip-bytes-to-string
-                          (bitcoin-lisp.networking:peer-address-ip pa))))
+              (let ((str (bitcoin-lisp.networking:peer-address-string pa))
+                    (port (bitcoin-lisp.networking:peer-address-port pa)))
                 (unless (gethash str seen)
                   (setf (gethash str seen) t)
-                  (push str picks))))))
+                  (push (cons str (and (plusp port) port)) picks))))))
         (setf addresses (nreverse picks))))
     ;; Fall back to DNS seeds if not enough candidates
     (when (< (length addresses) 8)
       (log-info "Discovering peers from DNS seeds...")
       (let ((dns-addrs (bitcoin-lisp.networking:discover-peers)))
         (log-info "Found ~D potential peers from DNS" (length dns-addrs))
-        (setf addresses (append addresses dns-addrs))
-        (setf addresses (remove-duplicates addresses :test #'string=))))
+        (setf addresses (append addresses
+                                (mapcar (lambda (a) (cons a nil)) dns-addrs)))
+        (setf addresses (remove-duplicates addresses :key #'car :test #'string=))))
 
     ;; Fixed-seed fallback for testnet4: even after DNS, the candidate pool
     ;; may have only one /16 group (sprovoost.nl seed has been dark since
@@ -1731,7 +1770,9 @@ Returns the number of peers connected."
     ;; last-resort source so we always have netgroup diversity available.
     (when (and (eq (node-network node) :testnet4)
                (let ((groups (remove-duplicates
-                              (remove nil (mapcar #'bitcoin-lisp.networking:ip-netgroup
+                              (remove nil (mapcar (lambda (c)
+                                                    (bitcoin-lisp.networking:ip-netgroup
+                                                     (car c)))
                                                   addresses))
                               :test #'string=)))
                  (< (length groups) 8)))
@@ -1743,22 +1784,25 @@ Returns the number of peers connected."
                          :test #'string=)))
       (setf addresses
             (remove-duplicates
-             (append addresses bitcoin-lisp.networking:*testnet4-fixed-seeds*)
-             :test #'string=)))
+             (append addresses
+                     (mapcar (lambda (a) (cons a nil))
+                             bitcoin-lisp.networking:*testnet4-fixed-seeds*))
+             :key #'car :test #'string=)))
 
     ;; Diversify by /16 netgroup so the first 8 connection attempts spread
     ;; across distinct operators (incident 2026-05-11: 8-of-8 peers were
     ;; from 103.165.192.x wiz.biz nodes — one stall stalled the whole
     ;; sync). Mirrors Bitcoin Core's addrman netgroup bucket selection
     ;; (netaddress.cpp CNetAddr::GetGroup).
-    (setf addresses (bitcoin-lisp.networking:diversify-by-netgroup addresses))
+    (setf addresses (bitcoin-lisp.networking:diversify-by-netgroup addresses
+                                                                   :key #'car))
 
     ;; Anchors first (Core anchors.dat): reconnect to the peers we persisted at
     ;; last shutdown before any DNS/addrman candidate, then consume them so
     ;; later reconnect cycles use the normal pool.
     (when *pending-anchor-addresses*
       (setf addresses (remove-duplicates (append *pending-anchor-addresses* addresses)
-                                         :test #'string= :from-end t))
+                                         :key #'car :test #'string= :from-end t))
       (setf *pending-anchor-addresses* nil))
 
     (log-info "~D candidate peers available" (length addresses))
@@ -1769,7 +1813,7 @@ Returns the number of peers connected."
     (let ((connected 0)
           (start-time (get-internal-real-time))
           (timeout-ticks (* timeout internal-time-units-per-second)))
-      (dolist (addr (node-known-addresses node))
+      (dolist (candidate (node-known-addresses node))
         ;; Stop if we have enough peers
         (when (>= connected max-peers)
           (return))
@@ -1780,63 +1824,35 @@ Returns the number of peers connected."
           (log-info "Connection timeout reached with ~D peers" connected)
           (return))
 
-        (log-debug "Trying to connect to ~A..." addr)
-        (handler-case
-            (let ((peer (bitcoin-lisp.networking:connect-peer
-                         addr (network-port (node-network node)))))
-              (when peer
-                (setf (bitcoin-lisp.networking:peer-address peer) addr)
-                (log-info "Connected to ~A" addr)
-                ;; Perform handshake
-                (when (bitcoin-lisp.networking:perform-handshake peer)
-                  (log-info "Handshake complete with ~A (~A, height ~D)"
-                            addr
-                            (bitcoin-lisp.networking:peer-user-agent peer)
-                            (bitcoin-lisp.networking:peer-start-height peer))
-                  ;; Send feature negotiation messages
-                  (bitcoin-lisp.networking:send-post-handshake-messages peer)
-                  ;; Record success in address book (add if not present)
-                  (when address-book
-                    (let ((ip-bytes (bitcoin-lisp.networking:string-to-ip-bytes addr))
-                          (peer-port (network-port (node-network node))))
-                      (when ip-bytes
-                        (unless (bitcoin-lisp.networking:address-book-lookup
-                                 address-book ip-bytes peer-port)
-                          (bitcoin-lisp.networking:address-book-add
-                           address-book
-                           (bitcoin-lisp.networking:make-peer-address
-                            :ip ip-bytes
-                            :port peer-port
-                            :services (bitcoin-lisp.networking:peer-services peer)
-                            :last-seen (bitcoin-lisp.serialization:get-unix-time))))
-                        (bitcoin-lisp.networking:address-book-good
-                         address-book ip-bytes peer-port)
-                        (bitcoin-lisp.networking:address-book-connected
-                         address-book ip-bytes peer-port))))
-                  ;; Send compact block negotiation (BIP 152)
-                  (bitcoin-lisp.networking:send-compact-block-negotiation peer)
-                  (bt:with-recursive-lock-held ((node-lock node))
-                    (push peer (node-peers node)))
-                  (incf connected))
-                (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
-                  (bitcoin-lisp.networking:disconnect-peer peer))))
-          (error (c)
-            (log-debug "Failed to connect to ~A: ~A" addr c)
-            ;; Record failure in address book (add if not present)
-            (when address-book
-              (let ((ip-bytes (bitcoin-lisp.networking:string-to-ip-bytes addr))
-                    (peer-port (network-port (node-network node))))
-                (when ip-bytes
-                  (unless (bitcoin-lisp.networking:address-book-lookup
-                           address-book ip-bytes peer-port)
-                    (bitcoin-lisp.networking:address-book-add
-                     address-book
-                     (bitcoin-lisp.networking:make-peer-address
-                      :ip ip-bytes
-                      :port peer-port
-                      :last-seen (bitcoin-lisp.serialization:get-unix-time))))
-                  (bitcoin-lisp.networking:address-book-attempt
-                   address-book ip-bytes peer-port :count-failure t)))))))
+        (let* ((addr (car candidate))
+               (dial-port (or (cdr candidate) (network-port (node-network node)))))
+          (log-debug "Trying to connect to ~A..." addr)
+          (handler-case
+              (let ((peer (bitcoin-lisp.networking:connect-peer addr dial-port)))
+                (when peer
+                  (setf (bitcoin-lisp.networking:peer-address peer) addr)
+                  (log-info "Connected to ~A" addr)
+                  ;; Perform handshake
+                  (when (bitcoin-lisp.networking:perform-handshake peer)
+                    (log-info "Handshake complete with ~A (~A, height ~D)"
+                              addr
+                              (bitcoin-lisp.networking:peer-user-agent peer)
+                              (bitcoin-lisp.networking:peer-start-height peer))
+                    ;; Send feature negotiation messages
+                    (bitcoin-lisp.networking:send-post-handshake-messages peer)
+                    ;; Record success in address book (add if not present)
+                    (%record-outbound-result address-book addr dial-port peer t)
+                    ;; Send compact block negotiation (BIP 152)
+                    (bitcoin-lisp.networking:send-compact-block-negotiation peer)
+                    (bt:with-recursive-lock-held ((node-lock node))
+                      (push peer (node-peers node)))
+                    (incf connected))
+                  (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
+                    (bitcoin-lisp.networking:disconnect-peer peer))))
+            (error (c)
+              (log-debug "Failed to connect to ~A: ~A" addr c)
+              ;; Record failure in address book (add if not present)
+              (%record-outbound-result address-book addr dial-port nil nil)))))
 
       (log-info "Connected to ~D peer~:P" connected)
       connected)))
@@ -1904,32 +1920,34 @@ Returns the number of new peers connected."
     (let ((used-addrs (mapcar #'bitcoin-lisp.networking:peer-address
                               (node-peers node)))
           (connected 0))
-      (dolist (addr (node-known-addresses node))
+      (dolist (candidate (node-known-addresses node))
         ;; Stop attempting new connect+handshake cycles the moment shutdown is
         ;; requested — each one can otherwise block (connect timeout + handshake
         ;; read) and delay the sync thread reaching its node-running checkpoint.
         (when (or (>= connected needed)
                   (bitcoin-lisp.networking:ibd-stop-requested-p))
           (return))
-        (unless (member addr used-addrs :test #'string=)
-          (handler-case
-              (let ((peer (bitcoin-lisp.networking:connect-peer
-                           addr (network-port (node-network node)))))
-                (when peer
-                  (setf (bitcoin-lisp.networking:peer-address peer) addr)
-                  (when (bitcoin-lisp.networking:perform-handshake peer)
-                    (log-info "Replacement peer connected: ~A" addr)
-                    ;; Send feature negotiation messages
-                    (bitcoin-lisp.networking:send-post-handshake-messages peer)
-                    ;; Send compact block negotiation (BIP 152)
-                    (bitcoin-lisp.networking:send-compact-block-negotiation peer)
-                    (bt:with-recursive-lock-held ((node-lock node))
-                      (push peer (node-peers node)))
-                    (incf connected))
-                  (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
-                    (bitcoin-lisp.networking:disconnect-peer peer))))
-            (error (c)
-              (declare (ignore c))))))
+        (let ((addr (car candidate)))
+          (unless (member addr used-addrs :test #'string=)
+            (handler-case
+                (let ((peer (bitcoin-lisp.networking:connect-peer
+                             addr (or (cdr candidate)
+                                      (network-port (node-network node))))))
+                  (when peer
+                    (setf (bitcoin-lisp.networking:peer-address peer) addr)
+                    (when (bitcoin-lisp.networking:perform-handshake peer)
+                      (log-info "Replacement peer connected: ~A" addr)
+                      ;; Send feature negotiation messages
+                      (bitcoin-lisp.networking:send-post-handshake-messages peer)
+                      ;; Send compact block negotiation (BIP 152)
+                      (bitcoin-lisp.networking:send-compact-block-negotiation peer)
+                      (bt:with-recursive-lock-held ((node-lock node))
+                        (push peer (node-peers node)))
+                      (incf connected))
+                    (unless (eq (bitcoin-lisp.networking:peer-state peer) :ready)
+                      (bitcoin-lisp.networking:disconnect-peer peer))))
+              (error (c)
+                (declare (ignore c)))))))
       connected)))
 
 ;;;; Manually-added peers (addnode)
@@ -2030,19 +2048,21 @@ reconnection anchors.")
 
 (defun %addrman-pick-unconnected (node &key new-only)
   "Pick an addrman address (as (values host port)) we're not already connected
-to, or NIL. NEW-ONLY restricts to the 'new' table (for feelers). Goes through
-select-dialable-address so automatic slots (block-relay, feelers) can never
-draw a torv3/i2p/cjdns record — representable since P1, dialable only at P2."
+to, or NIL; PORT is NIL when the record has none stored (caller substitutes
+the network default). NEW-ONLY restricts to the 'new' table (for feelers).
+Goes through select-dialable-address so automatic slots (block-relay,
+feelers) only ever draw records dialable under the current config (torv3
+needs a Tor proxy, cjdns needs -cjdnsreachable, i2p never)."
   (let ((ab (node-address-book node)))
     (when ab
       (dotimes (_ 20)
         (let ((pa (bitcoin-lisp.networking:select-dialable-address ab :new-only new-only)))
           (when pa
-            (let ((ip (bitcoin-lisp.networking:ip-bytes-to-string
-                       (bitcoin-lisp.networking:peer-address-ip pa))))
-              (when (and ip (not (peer-connected-to-host-p node ip)))
+            (let ((host (bitcoin-lisp.networking:peer-address-string pa))
+                  (port (bitcoin-lisp.networking:peer-address-port pa)))
+              (unless (peer-connected-to-host-p node host)
                 (return-from %addrman-pick-unconnected
-                  (values ip (bitcoin-lisp.networking:peer-address-port pa)))))))))))
+                  (values host (and (plusp port) port)))))))))))
 
 (defun maintain-block-relay-peers (node)
   "Ensure up to +target-block-relay-peers+ block-relay-only outbound peers.
@@ -2067,10 +2087,12 @@ to join the peer set."
         (when peer
           (setf (bitcoin-lisp.networking:peer-address peer) host)
           (when (bitcoin-lisp.networking:perform-handshake peer :conn-type :feeler)
-            (let ((ip-bytes (bitcoin-lisp.networking:string-to-ip-bytes host)))
-              (when ip-bytes
+            (multiple-value-bind (net ip-bytes)
+                (bitcoin-lisp.networking:parse-network-address host)
+              (when net
                 (bitcoin-lisp.networking:address-book-good
-                 (node-address-book node) ip-bytes port)))
+                 (node-address-book node) ip-bytes port
+                 (bitcoin-lisp.serialization:get-unix-time) net)))
             (log-debug "Feeler validated ~A (new -> tried)" host))
           (bitcoin-lisp.networking:disconnect-peer peer)))
     (error (c)

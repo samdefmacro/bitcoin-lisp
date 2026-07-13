@@ -97,38 +97,63 @@ consistency matters (the key is a per-node secret), not byte-compat with Core."
               (ash (aref h 4) 32) (ash (aref h 5) 40) (ash (aref h 6) 48)
               (ash (aref h 7) 56)))))
 
+(defun ipv6-linked-ipv4-group (ip)
+  "The two high bytes of the IPv4 address carried inside a tunneled/translated
+IPv6 address (Core HasLinkedIPv4/GetLinkedIPv4, netaddress.cpp:652-673), or
+NIL: RFC6052 (64:ff9b::/96) and RFC6145 (::ffff:0:0:0/96) carry it in the
+last 4 bytes, RFC3964 (2002::/16, 6to4) in bytes 2-5, and RFC4380 (2001::/32,
+Teredo) bit-flipped in the last 4 bytes. IPv4-mapped addresses are :ipv4 in
+our representation and never reach this."
+  (flet ((prefix-p (bytes)
+           (loop for b in bytes for i from 0 always (= (aref ip i) b))))
+    (cond ((or (prefix-p '(#x00 #x64 #xFF #x9B #x00 #x00      ; RFC6052
+                           #x00 #x00 #x00 #x00 #x00 #x00))
+               (prefix-p '(#x00 #x00 #x00 #x00 #x00 #x00      ; RFC6145
+                           #x00 #x00 #xFF #xFF #x00 #x00)))
+           (list (aref ip 12) (aref ip 13)))
+          ((prefix-p '(#x20 #x02))                            ; RFC3964 6to4
+           (list (aref ip 2) (aref ip 3)))
+          ((prefix-p '(#x20 #x01 #x00 #x00))                  ; RFC4380 Teredo
+           (list (logxor #xFF (aref ip 12)) (logxor #xFF (aref ip 13)))))))
+
 (defun net-group-key (ip &optional net)
   "GetGroup (no ASMap; Core netgroup.cpp:19-107): the bucket group used to
 spread addresses across buckets by network operator. IPv4 -> [1, /16];
-IPv6 -> [2, /32]; TORv3/I2P -> [net, addr[0]|0x0F] (4 group bits of a
+IPv6 -> [2, /32], except tunneled/translated IPv4 carriers (6to4, Teredo,
+RFC6052/6145) which group as the linked IPv4's /16 with Core's NET_IPV4
+class byte (GetNetClass, netaddress.cpp) and he.net (2001:470::/32) which
+gets /36 groups; TORv3/I2P -> [net, addr[0]|0x0F] (4 group bits of a
 pubkey-derived address); CJDNS -> [5, addr[0], addr[1]|0x0F] (12 bits,
-skipping the constant 0xFC prefix byte); unroutable -> [0]. The leading
-byte is Core's Network enum value (IPV4=1 IPV6=2 ONION=3 I2P=4 CJDNS=5).
-NET NIL derives IPv4/IPv6 from the 16-byte mapped form."
-  (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
-    (case net
-      (:ipv4
-       (if (ipv4-mapped-p ip)
-           (make-array 3 :element-type '(unsigned-byte 8)
-                         :initial-contents (list 1 (aref ip 12) (aref ip 13)))
-           (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0)))
-      (:ipv6
-       (if (notevery #'zerop ip)
-           (make-array 5 :element-type '(unsigned-byte 8)
-                         :initial-contents (list 2 (aref ip 0) (aref ip 1)
-                                                 (aref ip 2) (aref ip 3)))
-           (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0)))
-      (:torv3
-       (make-array 2 :element-type '(unsigned-byte 8)
-                     :initial-contents (list 3 (logior (aref ip 0) #x0F))))
-      (:i2p
-       (make-array 2 :element-type '(unsigned-byte 8)
-                     :initial-contents (list 4 (logior (aref ip 0) #x0F))))
-      (:cjdns
-       (make-array 3 :element-type '(unsigned-byte 8)
-                     :initial-contents (list 5 (aref ip 0)
-                                             (logior (aref ip 1) #x0F))))
-      (t (make-array 1 :element-type '(unsigned-byte 8) :initial-element 0)))))
+skipping the constant 0xFC prefix byte); unroutable -> [0] (for IPv6 that
+includes fc00::/7 arriving untagged, per address-routable-p; private IPv4
+stays grouped — our deliberate divergence). The leading byte is Core's
+Network enum value (IPV4=1 IPV6=2 ONION=3 I2P=4 CJDNS=5). NET NIL derives
+IPv4/IPv6 from the 16-byte mapped form."
+  (flet ((group (&rest bytes)
+           (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                      :initial-contents bytes)))
+    (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
+      (case net
+        (:ipv4
+         (if (ipv4-mapped-p ip)
+             (group 1 (aref ip 12) (aref ip 13))
+             (group 0)))
+        (:ipv6
+         (let ((linked (ipv6-linked-ipv4-group ip)))
+           (cond
+             ((or (every #'zerop ip) (member (aref ip 0) '(#xFC #xFD)))
+              (group 0))
+             (linked (apply #'group 1 linked))
+             ;; he.net 2001:470::/32 -> /36 groups (netgroup.cpp:62-64).
+             ((and (= (aref ip 0) #x20) (= (aref ip 1) #x01)
+                   (= (aref ip 2) #x04) (= (aref ip 3) #x70))
+              (group 2 (aref ip 0) (aref ip 1) (aref ip 2) (aref ip 3)
+                     (logior (aref ip 4) #x0F)))
+             (t (group 2 (aref ip 0) (aref ip 1) (aref ip 2) (aref ip 3))))))
+        (:torv3 (group 3 (logior (aref ip 0) #x0F)))
+        (:i2p (group 4 (logior (aref ip 0) #x0F)))
+        (:cjdns (group 5 (aref ip 0) (logior (aref ip 1) #x0F)))
+        (t (group 0))))))
 
 (defun address-routable-p (ip &optional net)
   "Minimal IsRoutable, per network: correct byte length, non-zero, CJDNS
@@ -321,12 +346,13 @@ incumbent back to a new bucket."
 the 16-byte form), or NIL (Core Find)."
   (ab-find book ip port net))
 
-(defun address-book-add (book pa &optional source-ip)
+(defun address-book-add (book pa &optional source-group)
   "Add address PA (a peer-address carrying net/ip/port/services/last-seen)
-learned from SOURCE-IP (defaults to the address itself), placing it in a NEW
-bucket per Bitcoin Core AddrMan AddSingle. Returns T if newly inserted into a
-new bucket. SOURCE-IP is the gossiping peer's 16-byte IP (all sources are IP
-peers until non-IP transports land, P2+)."
+learned from a peer whose net-group key is SOURCE-GROUP (a net-group-key
+result over the gossiping peer's typed address — any network, now that
+onion/cjdns peers can be dial sources; defaults to the added address's own
+group), placing it in a NEW bucket per Bitcoin Core AddrMan AddSingle.
+Returns T if newly inserted into a new bucket."
   (let ((ip (peer-address-ip pa))
         (net (peer-address-network pa)))
     (unless (address-routable-p ip net)
@@ -334,9 +360,7 @@ peers until non-IP transports land, P2+)."
     (let* ((port (peer-address-port pa))
            (services (peer-address-services pa))
            (time (peer-address-last-seen pa))
-           (source-group (if source-ip
-                             (net-group-key source-ip)
-                             (net-group-key ip net)))
+           (source-group (or source-group (net-group-key ip net)))
            (existing (ab-find book ip port net))
            (info nil))
       (if existing
@@ -464,12 +488,13 @@ entries via GetChance; alternates new/tried roughly 50/50 when both are present.
 (defun select-dialable-address (book &key new-only (tries 20))
   "address-book-select restricted to AUTOMATIC-outbound-eligible addresses:
 the network must be dialable by our transport stack (dialable-network-p —
-IPv4/IPv6 only until P2 onion/CJDNS dialing lands) AND reachable per
--onlynet. Every automatic selection path (outbound slots, feelers,
-block-relay slots) must go through this, never raw address-book-select:
-post-BIP155 the book can hold torv3/i2p/cjdns records that nothing can
-connect to yet. Manual connections (addnode) bypass addrman entirely and
-are unaffected. Returns a peer-address or NIL after TRIES draws."
+config-aware: torv3 needs a Tor proxy, cjdns needs -cjdnsreachable, i2p is
+never dialable until P4) AND reachable per -onlynet. Every automatic
+selection path (outbound slots, feelers, block-relay slots) must go through
+this, never raw address-book-select: post-BIP155 the book can hold records
+nothing can connect to under the current config. Manual connections
+(addnode) bypass addrman entirely and are unaffected. Returns a
+peer-address or NIL after TRIES draws."
   (dotimes (_ tries nil)
     (let ((pa (address-book-select book :new-only new-only)))
       (when pa

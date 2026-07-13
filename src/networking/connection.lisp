@@ -67,17 +67,26 @@ Mirrors Bitcoin Core net.cpp:1794."
   "Create a TCP connection to HOST:PORT.
 Returns a connection structure or NIL on failure.
 
-When a SOCKS5 proxy is configured (*proxy*, socks5.lisp), the TCP dial goes to
-the proxy instead and a SOCKS5 CONNECT tunnels to HOST:PORT — ATYP DOMAINNAME
-always, so the proxy (never local DNS) resolves names. With randomized
+The proxy is picked per target network (proxy-for-target, netaddress.lisp —
+a forward reference resolved at load time, like ibd-stop-requested-p in
+socks5.lisp): a .onion HOST tunnels through the Tor proxy (-onion, defaulting
+to -proxy), every other target through *proxy* when one is configured, else a
+direct dial. A target we must not dial at all — .onion without a Tor proxy,
+.b32.i2p — is refused up front with NIL, so a proxyless node never raw-dials
+(and never DNS-leaks) an onion name. The SOCKS5 CONNECT uses ATYP DOMAINNAME
+always, so the proxy (never local DNS) resolves names; with randomized
 credentials (-proxyrandomize), each connection gets fresh single-use
 username/password so Tor isolates it on its own circuit. Mirrors Bitcoin
-Core's ConnectThroughProxy (netbase.cpp:786-810; connect path net.cpp:439-459).
-The returned connection records the TARGET host/port, so callers (including
-the v1-fallback re-dial in peer.lisp) re-dial through the proxy transparently."
-  (handler-case
-      (let* ((proxy *proxy*)
-             (socket (usocket:socket-connect (if proxy (proxy-host proxy) host)
+Core's ConnectNode proxy branch (net.cpp:439-497) + ConnectThroughProxy
+(netbase.cpp:786-810). The returned connection records the TARGET host/port,
+so callers (including the v1-fallback re-dial in peer.lisp) re-dial through
+the right proxy transparently."
+  (multiple-value-bind (proxy refusal) (proxy-for-target host)
+    (when refusal
+      (bitcoin-lisp:log-debug "Not dialing ~A:~D: ~A" host port refusal)
+      (return-from make-tcp-connection nil))
+    (handler-case
+      (let* ((socket (usocket:socket-connect (if proxy (proxy-host proxy) host)
                                              (if proxy (proxy-port proxy) port)
                                              :element-type '(unsigned-byte 8)
                                              :timeout timeout)))
@@ -99,12 +108,12 @@ the v1-fallback re-dial in peer.lisp) re-dial through the proxy transparently."
                          :port port
                          :connected t
                          :last-activity (get-universal-time)))
-    (usocket:socket-error (e)
-      (declare (ignore e))
-      nil)
-    (usocket:timeout-error (e)
-      (declare (ignore e))
-      nil)))
+      (usocket:socket-error (e)
+        (declare (ignore e))
+        nil)
+      (usocket:timeout-error (e)
+        (declare (ignore e))
+        nil))))
 
 (defun open-listener (bind port &key (backlog 16))
   "Open a listening TCP server socket on BIND:PORT for inbound peers. Returns the

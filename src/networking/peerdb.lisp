@@ -116,9 +116,72 @@ IPv4-mapped addresses (::ffff:a.b.c.d) are rendered as dotted quad."
               (loop for i from 0 below 16 by 2
                     collect (logior (ash (aref ip i) 8) (aref ip (1+ i)))))))
 
+(defun %parse-ipv4-string (string)
+  "Parse a dotted-quad IPv4 STRING to its 16-byte IPv4-mapped form, or NIL.
+Strict: exactly four all-digit components of 1-3 characters, each <= 255
+(inet_pton discipline — no signs, spaces or hex)."
+  (let ((parts (uiop:split-string string :separator ".")))
+    (when (and (= (length parts) 4)
+               (every (lambda (p)
+                        (and (<= 1 (length p) 3)
+                             (every #'digit-char-p p)
+                             (<= (parse-integer p) 255)))
+                      parts))
+      (apply #'ipv4-to-mapped-ipv6 (mapcar #'parse-integer parts)))))
+
+(defun %parse-ipv6-string (string)
+  "Parse an IPv6 literal STRING to 16 bytes, or NIL: full colon-hex, at most
+one \"::\" compression, and an embedded IPv4 dotted-quad tail in the last 32
+bits (\"::ffff:1.2.3.4\", RFC 4291 §2.2.3) — the text forms Bitcoin Core
+accepts via inet_pton (netbase LookupHost). Scoped (%zone) forms are rejected."
+  (when (find #\% string)
+    (return-from %parse-ipv6-string nil))
+  (flet ((split (s)
+           (when (and s (plusp (length s)))
+             (loop for start = 0 then (1+ pos)
+                   for pos = (position #\: s :start start)
+                   collect (subseq s start (or pos (length s)))
+                   while pos)))
+         (words (groups final-p)
+           ;; GROUPS as a list of 16-bit words; an embedded IPv4 quad is only
+           ;; legal as the very last group of the whole address (FINAL-P) and
+           ;; contributes two words.
+           (loop for (g . rest) on groups
+                 append (cond
+                          ((find #\. g)
+                           (let ((v4 (and (null rest) final-p
+                                          (%parse-ipv4-string g))))
+                             (unless v4 (return-from %parse-ipv6-string nil))
+                             (list (logior (ash (aref v4 12) 8) (aref v4 13))
+                                   (logior (ash (aref v4 14) 8) (aref v4 15)))))
+                          ((and (<= 1 (length g) 4)
+                                (every (lambda (c) (digit-char-p c 16)) g))
+                           (list (parse-integer g :radix 16)))
+                          (t (return-from %parse-ipv6-string nil))))))
+    (let ((double (search "::" string)))
+      ;; A second "::" is invalid.
+      (when (and double (search "::" string :start2 (1+ double)))
+        (return-from %parse-ipv6-string nil))
+      (let* ((head (words (split (if double (subseq string 0 double) string))
+                          (not double)))
+             (tail (words (split (when double (subseq string (+ double 2)))) t))
+             (n (+ (length head) (length tail))))
+        (when (or (and double (<= n 7))
+                  (and (not double) (= n 8)))
+          (let ((bytes (make-array 16 :element-type '(unsigned-byte 8)
+                                      :initial-element 0)))
+            (loop for w in (append head (make-list (- 8 n) :initial-element 0)
+                                   tail)
+                  for i from 0
+                  do (setf (aref bytes (* 2 i)) (ash w -8)
+                           (aref bytes (1+ (* 2 i))) (logand w #xFF)))
+            bytes))))))
+
 (defun string-to-ip-bytes (addr-string)
-  "Convert an IPv4 dotted-quad string to 16-byte IPv4-mapped IPv6."
-  (let ((parts (mapcar #'parse-integer
-                       (uiop:split-string addr-string :separator "."))))
-    (when (= (length parts) 4)
-      (apply #'ipv4-to-mapped-ipv6 parts))))
+  "Parse an IP-address string to its 16-byte internal form: an IPv4 dotted
+quad (kept as IPv4-mapped IPv6, the historical form) or any IPv6 text form
+(see %parse-ipv6-string). Returns NIL for anything else — hostnames,
+onion/i2p names, garbage — and never signals."
+  (or (%parse-ipv4-string addr-string)
+      (when (find #\: addr-string)
+        (%parse-ipv6-string addr-string))))

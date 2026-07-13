@@ -372,9 +372,13 @@ restores them (in order) for priority reconnection. Inbound peers excluded."
                 (bitcoin-lisp.networking:make-peer :address "9.9.9.9" :inbound nil :state :ready)
                 (bitcoin-lisp.networking:make-peer :address "7.7.7.7" :inbound t   :state :ready)))
     (bitcoin-lisp::save-anchors node)        ; saves the first 2 ready outbound
-    (let ((bitcoin-lisp::*pending-anchor-addresses* nil))
+    (let ((bitcoin-lisp::*pending-anchor-addresses* nil)
+          ;; Connection-less test peers save the network default port; load
+          ;; yields (host . stored-port) dial candidates.
+          (dp (bitcoin-lisp::network-port (bitcoin-lisp::node-network node))))
       (bitcoin-lisp::load-anchors node)
-      (is (equal '("1.2.3.4" "5.6.7.8") bitcoin-lisp::*pending-anchor-addresses*)))))
+      (is (equal (list (cons "1.2.3.4" dp) (cons "5.6.7.8" dp))
+                 bitcoin-lisp::*pending-anchor-addresses*)))))
 
 (test anchors-v1-file-migrates-on-load
   "A pre-P1 anchors.dat (magic ANC1, bare IP strings, no port) still loads:
@@ -402,7 +406,9 @@ writes the v2 network-typed format."
       (bitcoin-lisp::load-anchors node)
       ;; IP entries survive (the hostname is dropped — never representable).
       ;; Our IPv6 rendering is the full uncompressed form (no RFC5952 "::").
-      (is (equal '("203.0.113.7" "2001:0db8:0000:0000:0000:0000:0000:0007")
+      ;; Migrated v1 entries carry port NIL (dial at the network default).
+      (is (equal '(("203.0.113.7" . nil)
+                   ("2001:0db8:0000:0000:0000:0000:0000:0007" . nil))
                  bitcoin-lisp::*pending-anchor-addresses*)))
     ;; Re-save from live peers: the file is rewritten as v2.
     (setf (bitcoin-lisp::node-peers node)
@@ -416,15 +422,18 @@ writes the v2 network-typed format."
 
 (test anchors-v2-round-trip-typed-and-filtered
   "The v2 anchors format round-trips (net, bytes, port); on load only
-dialable+reachable networks become dial candidates — an onion anchor is
-carried in the file but yields no dial target until P2."
+networks dialable under the current config (and reachable) become dial
+candidates, and each is dialed at its STORED port — an onion anchor yields
+a dial target iff a Tor proxy is configured."
   (let* ((dir (ensure-directories-exist
                (merge-pathnames "test-anchors-v2/" (uiop:temporary-directory))))
          (node (bitcoin-lisp::make-node))
          (path (bitcoin-lisp::anchors-dat-path dir))
          (onion-pk (bitcoin-lisp.crypto:hex-to-bytes
                     "79bcc625184b05194975c28b66b66b0469f7f6556fb1ac3189a79b40dda32f1f"))
-         (entries (list (list :ipv4 (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 9 9 9 9) 8333)
+         (onion-str (bitcoin-lisp.networking:onion-address-string onion-pk))
+         ;; Distinct non-default ports prove the STORED port is what loads.
+         (entries (list (list :ipv4 (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 9 9 9 9) 4567)
                         (list :torv3 onion-pk 8333))))
     (setf (bitcoin-lisp::node-data-directory node) dir)
     (bitcoin-lisp::save-anchor-entries path entries)
@@ -435,17 +444,28 @@ carried in the file but yields no dial target until P2."
       (destructuring-bind (net bytes port) (first parsed)
         (is (eq :ipv4 net))
         (is (equalp (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 9 9 9 9) bytes))
-        (is (= 8333 port)))
+        (is (= 4567 port)))
       (destructuring-bind (net bytes port) (second parsed)
         (is (eq :torv3 net))
         (is (equalp onion-pk bytes))
         (is (= 8333 port))))
-    ;; Dial-candidate filter: only the IPv4 anchor comes back.
+    ;; No Tor proxy: only the IPv4 anchor comes back, at its stored port.
     (let ((bitcoin-lisp::*pending-anchor-addresses* nil)
+          (bitcoin-lisp.networking:*onion-proxy* nil)
           (bitcoin-lisp.networking:*reachable-networks*
             (copy-list bitcoin-lisp.networking:+bip155-networks+)))
       (bitcoin-lisp::load-anchors node)
-      (is (equal '("9.9.9.9") bitcoin-lisp::*pending-anchor-addresses*)))))
+      (is (equal '(("9.9.9.9" . 4567)) bitcoin-lisp::*pending-anchor-addresses*)))
+    ;; With a Tor proxy the onion anchor becomes a dial candidate too —
+    ;; formatted .onion string + stored port (the P2 anchors redial path).
+    (let ((bitcoin-lisp::*pending-anchor-addresses* nil)
+          (bitcoin-lisp.networking:*onion-proxy*
+            (bitcoin-lisp.networking:make-proxy :host "127.0.0.1" :port 9050))
+          (bitcoin-lisp.networking:*reachable-networks*
+            (copy-list bitcoin-lisp.networking:+bip155-networks+)))
+      (bitcoin-lisp::load-anchors node)
+      (is (equal (list '("9.9.9.9" . 4567) (cons onion-str 8333))
+                 bitcoin-lisp::*pending-anchor-addresses*)))))
 
 (test anchors-load-missing-file-noop
   "load-anchors on a directory with no anchors.dat doesn't crash or set anchors."
