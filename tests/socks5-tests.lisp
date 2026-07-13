@@ -277,6 +277,75 @@ contract (no condition escapes to the dial loop)."
         (setf bitcoin-lisp.networking:*proxy* old-proxy)))
     (bt:join-thread thread)))
 
+;;; --- onion dialing (P2) ---------------------------------------------------------
+
+(defparameter +socks5-onion-target+
+  "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
+  "Core's TORv3 test vector address (net_tests.cpp cnetaddr_basic): 56 base32
+chars + \".onion\" = 62 bytes on the SOCKS5 wire.")
+
+(test make-tcp-connection-dials-onion-via-onion-proxy
+  "A torv3 target dials through *onion-proxy* (-onion, i.e. NOT the general
+*proxy*) and the CONNECT carries the exact DOMAINNAME bytes: ATYP 0x03,
+length 62, the .onion name, port 8333 hi/lo — Core ConnectNode picks the
+NET_ONION proxy and passes ToStringAddr()/GetPort() to ConnectThroughProxy
+(net.cpp:449-489)."
+  (multiple-value-bind (port thread captured)
+      (%fake-socks5-server
+       `((:read 3) (:write #(#x05 #x00))          ; NOAUTH
+         (:read-connect)
+         (:write #(#x05 #x00 #x00 #x01 0 0 0 0 #x00 #x00))))
+    (let ((old-proxy bitcoin-lisp.networking:*proxy*)
+          (old-onion bitcoin-lisp.networking:*onion-proxy*))
+      (unwind-protect
+          (progn
+            ;; General proxy points NOWHERE dialable: proves the onion dial
+            ;; uses the -onion proxy, not -proxy.
+            (setf bitcoin-lisp.networking:*proxy*
+                  (bitcoin-lisp.networking:make-proxy
+                   :host "192.0.2.1" :port 1 :randomize-credentials nil))
+            (setf bitcoin-lisp.networking:*onion-proxy*
+                  (bitcoin-lisp.networking:make-proxy
+                   :host "127.0.0.1" :port port :randomize-credentials nil))
+            (let ((conn (bitcoin-lisp.networking:make-tcp-connection
+                         +socks5-onion-target+ 8333)))
+              (is-true conn)
+              (when conn
+                (is (equal +socks5-onion-target+
+                           (bitcoin-lisp.networking:connection-host conn)))
+                (is (= 8333 (bitcoin-lisp.networking::connection-port conn)))
+                (bitcoin-lisp.networking:close-connection conn))))
+        (setf bitcoin-lisp.networking:*proxy* old-proxy
+              bitcoin-lisp.networking:*onion-proxy* old-onion)))
+    (bt:join-thread thread)
+    ;; Exact wire bytes: greeting 05 01 00, CONNECT 05 01 00 03 3E <name> 20 8D.
+    (is (= (+ 3 4 1 62 2) (length captured)))
+    (is (equalp #(#x05 #x01 #x00) (subseq captured 0 3)))
+    (is (equalp #(#x05 #x01 #x00 #x03 62) (subseq captured 3 8)))
+    (is (equalp (map 'vector #'char-code +socks5-onion-target+)
+                (subseq captured 8 70)))
+    (is (= #x20 (aref captured 70)))    ; 8333 = 0x208D
+    (is (= #x8D (aref captured 71)))))
+
+(test make-tcp-connection-refuses-onion-without-proxy
+  "With no Tor proxy configured, an onion dial is refused up front — NIL, no
+socket, no DNS lookup of the onion name. The no-proxy node is provably
+unchanged: onion addresses can be stored but never dialed."
+  (let ((old-proxy bitcoin-lisp.networking:*proxy*)
+        (old-onion bitcoin-lisp.networking:*onion-proxy*))
+    (unwind-protect
+        (progn
+          (setf bitcoin-lisp.networking:*proxy* nil
+                bitcoin-lisp.networking:*onion-proxy* nil)
+          (is (null (bitcoin-lisp.networking:make-tcp-connection
+                     +socks5-onion-target+ 8333)))
+          ;; I2P targets are refused too (SAM is P4).
+          (is (null (bitcoin-lisp.networking:make-tcp-connection
+                     "ukeu3k5oycgaauneqgtnvselmt4yemvoilkln7jpvamvfx7dnkdq.b32.i2p"
+                     0))))
+      (setf bitcoin-lisp.networking:*proxy* old-proxy
+            bitcoin-lisp.networking:*onion-proxy* old-onion))))
+
 ;;; --- DNS discipline -------------------------------------------------------------
 
 (test discover-peers-skips-local-dns-when-proxied
@@ -350,6 +419,41 @@ to -proxy."
           (bitcoin-lisp::apply-config-globals
            (bitcoin-lisp::parse-cli-args '("-noproxy")))
           (is (null bitcoin-lisp.networking:*proxy*)))
+      (setf bitcoin-lisp.networking:*proxy* old-proxy
+            bitcoin-lisp.networking:*onion-proxy* old-onion))))
+
+(test onion-zero-disables-tor-dialing
+  "-onion=0 (or -noonion) disables onion dialing even with -proxy set (Core
+init.cpp:1766-1780: onion_proxy cleared, NET_ONION removed from the reachable
+set): *onion-proxy* NIL, torv3 neither reachable nor dialable, and an onion
+dial is refused."
+  (let ((old-proxy bitcoin-lisp.networking:*proxy*)
+        (old-onion bitcoin-lisp.networking:*onion-proxy*)
+        (bitcoin-lisp.networking:*reachable-networks*
+          bitcoin-lisp.networking:*reachable-networks*)
+        (bitcoin-lisp.networking:*cjdns-reachable*
+          bitcoin-lisp.networking:*cjdns-reachable*))
+    (unwind-protect
+        (progn
+          (bitcoin-lisp::apply-config-globals
+           '(("proxy" . "127.0.0.1:9150") ("onion" . "0")))
+          (is-true bitcoin-lisp.networking:*proxy*)
+          (is (null bitcoin-lisp.networking:*onion-proxy*))
+          (is-false (bitcoin-lisp.networking:reachable-network-p :torv3))
+          (is-false (bitcoin-lisp.networking:dialable-network-p :torv3))
+          (multiple-value-bind (proxy refusal)
+              (bitcoin-lisp.networking:proxy-for-target +socks5-onion-target+)
+            (is (null proxy))
+            (is (stringp refusal)))
+          ;; -noonion parses to onion=0 and behaves identically.
+          (bitcoin-lisp::apply-config-globals
+           (append (bitcoin-lisp::parse-cli-args '("-noonion"))
+                   '(("proxy" . "127.0.0.1:9150"))))
+          (is (null bitcoin-lisp.networking:*onion-proxy*))
+          ;; And plain -proxy (no -onion) re-enables: torv3 dialable again.
+          (bitcoin-lisp::apply-config-globals '(("proxy" . "127.0.0.1:9150")))
+          (is-true (bitcoin-lisp.networking:dialable-network-p :torv3))
+          (is-true (bitcoin-lisp.networking:reachable-network-p :torv3)))
       (setf bitcoin-lisp.networking:*proxy* old-proxy
             bitcoin-lisp.networking:*onion-proxy* old-onion))))
 
