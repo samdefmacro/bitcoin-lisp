@@ -147,7 +147,7 @@
       (bitcoin-lisp.networking:address-book-add book (%pa 20 0 0 i))
       (bitcoin-lisp.networking:address-book-good book (%ip 20 0 0 i) 8333))
     (let ((tried-before (bitcoin-lisp.networking::address-book-n-tried book))
-          (src (%ip 7 7 7 7)))
+          (src (bitcoin-lisp.networking:net-group-key (%ip 7 7 7 7))))
       (is (> tried-before 0))
       (dotimes (i 400)
         (bitcoin-lisp.networking:address-book-add
@@ -168,6 +168,17 @@
 (defun %pa-net (net ip &key (port 8333) (services 1) (last-seen (%now)))
   (bitcoin-lisp.networking:make-peer-address
    :net net :ip ip :port port :services services :last-seen last-seen))
+
+(test add-records-typed-source-group
+  "address-book-add's optional source is a net-group KEY (any network), so
+gossip learned from an onion peer buckets by the onion source group — Core
+AddrMan::Add(…, source) with a Tor source."
+  (let* ((book (%ab))
+         (sg (bitcoin-lisp.networking:net-group-key (%am-hex +am-onion-pk+) :torv3)))
+    (is-true (bitcoin-lisp.networking:address-book-add book (%pa 1 2 3 4) sg))
+    (let ((pa (bitcoin-lisp.networking:address-book-lookup book (%ip 1 2 3 4) 8333)))
+      (is (not (null pa)))
+      (is (equalp sg (bitcoin-lisp.networking::peer-address-source-group pa))))))
 
 (test address-key-disambiguates-networks
   "Identical bytes + port on different networks produce different keys, so a

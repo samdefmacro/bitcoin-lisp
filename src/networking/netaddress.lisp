@@ -32,35 +32,75 @@ we do not support yet — and CJDNS only with -cjdnsreachable). Manual
 connections (addnode/connect) are never restricted by this set.")
 
 (defvar *cjdns-reachable* nil
-  "T when -cjdnsreachable is set: fc00::/8 IPv6 addresses arriving at
-ingress points (parsed strings, inbound connections) are retagged :cjdns
-(Core MaybeFlipIPv6toCJDNS, netbase.cpp:942-949).")
+  "T when -cjdnsreachable is set: the local cjdroute TUN exists, so :cjdns
+addresses are dialable (plain TCP into fc00::/8, dialable-network-p) and
+apply-config-globals admits :cjdns to *reachable-networks* — which in turn
+enables the fc00::/8 ingress retag (maybe-flip-ipv6-to-cjdns).")
 
 (defun reachable-network-p (network)
   "T if NETWORK is in the reachable set (Core g_reachable_nets.Contains)."
   (and (member network *reachable-networks*) t))
 
 (defun dialable-network-p (network)
-  "T if our transport stack can actually open a connection to NETWORK.
-P1 note: the address layer can now REPRESENT torv3/i2p/cjdns addresses, but
-nothing can dial them until P2 (onion via SOCKS5 DOMAINNAME, CJDNS via the
-cjdroute TUN) — so automatic outbound selection, feelers and block-relay
-slot filling MUST filter through this predicate regardless of -onlynet or
-proxy configuration. Raw-TCP-ing a 32-byte onion key is a bug."
-  (and (member network '(:ipv4 :ipv6)) t))
+  "T if our transport stack can actually open a connection to NETWORK under
+the CURRENT configuration (the Core equivalent: whether ConnectNode has a
+route to the target — a proxy for its network, or plain TCP):
+  - :ipv4/:ipv6 — always (direct TCP, or through -proxy);
+  - :torv3 — only with a Tor-capable SOCKS5 proxy (*onion-proxy*, i.e. -onion
+    defaulting to -proxy; -onion=0 clears it even when -proxy is set,
+    init.cpp:1766-1780);
+  - :cjdns — only with -cjdnsreachable (dialing is ordinary TCP into the
+    local cjdroute TUN's fc00::/8);
+  - :i2p — never (the SAM transport is P4).
+Automatic outbound selection, feelers, block-relay slot filling and anchor
+redials MUST filter through this predicate (select-dialable-address adds the
+-onlynet reachability check on top): raw-TCP-ing a 32-byte onion key is a
+bug. Manual connections (addnode/connect) hit the same transport gate at
+dial time via proxy-for-target."
+  (case network
+    ((:ipv4 :ipv6) t)
+    (:torv3 (and *onion-proxy* t))
+    (:cjdns *cjdns-reachable*)
+    (t nil)))
 
 (defun maybe-flip-ipv6-to-cjdns (network bytes)
-  "Retag an :ipv6 address whose first byte is 0xFC as :cjdns when
--cjdnsreachable is set (Core MaybeFlipIPv6toCJDNS, netbase.cpp:942-949).
-Applied at ingress points where addresses arrive UNTYPED (string parsing,
-inbound socket addresses) — addrv2 gossip carries the CJDNS tag itself.
-Returns the (possibly new) network keyword."
+  "Retag an :ipv6 address whose first byte is 0xFC as :cjdns when the CJDNS
+network is reachable — Core's exact gate is g_reachable_nets.Contains(NET_CJDNS)
+(MaybeFlipIPv6toCJDNS, netbase.cpp:942-949), i.e. -cjdnsreachable minus any
+-onlynet exclusion. Applied at ingress points where addresses arrive UNTYPED
+(string parsing — and through it inbound socket addresses, whose host strings
+are parsed wherever they are used in typed form) — addrv2 gossip carries the
+CJDNS tag itself, and an fc00::/8 that arrives as plain :ipv6 in v1 addr
+gossip stays :ipv6 and is dropped as unroutable, both as in Core. Returns
+the (possibly new) network keyword."
   (if (and (eq network :ipv6)
-           *cjdns-reachable*
+           (reachable-network-p :cjdns)
            (plusp (length bytes))
            (= (aref bytes 0) #xFC))
       :cjdns
       network))
+
+(defun proxy-for-target (host)
+  "The SOCKS5 proxy for an outbound dial to HOST (a peer-address string or
+hostname) — Core ConnectNode's per-target-network proxy pick (net.cpp:449
+GetProxy(target network), table built by init.cpp:1696-1801). Returns
+(VALUES PROXY REFUSAL):
+  - a .onion target uses the Tor proxy (*onion-proxy*: -onion, defaulting to
+    -proxy). With none configured, REFUSAL (a string) says why the dial must
+    not happen at all — falling through to a raw dial would leak the onion
+    name to local DNS;
+  - a .b32.i2p target is always refused (no SAM transport until P4);
+  - everything else — IPv4/IPv6/CJDNS literals and hostnames — uses *proxy*
+    (NIL = direct dial). Matches Core, where an unsuffixed -proxy covers
+    IPv4/IPv6/CJDNS/name lookups (init.cpp:1735) and CJDNS without a proxy
+    is ordinary TCP to the fc00::/8 address."
+  (cond ((parse-onion-address host)
+         (if *onion-proxy*
+             (values *onion-proxy* nil)
+             (values nil "onion peer but no Tor proxy is configured (-proxy/-onion)")))
+        ((parse-i2p-address host)
+         (values nil "I2P peers are not dialable (no SAM support)"))
+        (t (values *proxy* nil))))
 
 ;;;; Base32 (Core util/strencodings.cpp:144-200)
 ;;;
@@ -208,60 +248,21 @@ IPv4 dotted quad, IPv6/CJDNS hex groups, .onion, or .b32.i2p."
     (:torv3 (onion-address-string bytes))
     (:i2p (i2p-address-string bytes))))
 
-(defun %parse-ipv6-string (string)
-  "Parse an IPv6 STRING (full or with one \"::\" compression) to 16 bytes,
-or NIL. Accepts what ip-bytes-to-string emits plus standard compressed
-forms used in config values; scoped (%zone) and embedded-IPv4 tails are
-not supported."
-  (let* ((double (search "::" string))
-         (split (lambda (s)
-                  (when (plusp (length s))
-                    (loop for start = 0 then (1+ pos)
-                          for pos = (position #\: s :start start)
-                          collect (subseq s start (or pos (length s)))
-                          while pos))))
-         (head (funcall split (if double (subseq string 0 double) string)))
-         (tail (when double (funcall split (subseq string (+ double 2))))))
-    ;; A second "::" is invalid.
-    (when (and double (search "::" string :start2 (+ double 1)))
-      (return-from %parse-ipv6-string nil))
-    (let ((groups (+ (length head) (length tail))))
-      (when (or (and double (<= groups 7))
-                (and (not double) (= groups 8)))
-        (let ((words (append head
-                             (make-list (if double (- 8 groups) 0)
-                                        :initial-element "0")
-                             tail))
-              (bytes (make-array 16 :element-type '(unsigned-byte 8))))
-          (loop for w in words
-                for i from 0
-                do (let ((v (and (<= 1 (length w) 4)
-                                 (ignore-errors (parse-integer w :radix 16)))))
-                     (unless (and v (<= 0 v #xFFFF))
-                       (return-from %parse-ipv6-string nil))
-                     (setf (aref bytes (* 2 i)) (ash v -8)
-                           (aref bytes (1+ (* 2 i))) (logand v #xFF))))
-          bytes)))))
-
 (defun parse-network-address (string)
   "Parse an address STRING of any supported network. Returns
 (VALUES network bytes) — :ipv4 as 16-byte mapped IPv6, :ipv6/:cjdns as 16
 bytes, :torv3/:i2p as their 32-byte forms — or NIL if unparseable (e.g. a
-hostname). An fc00::/8 IPv6 is retagged :cjdns under -cjdnsreachable, this
-being a string-ingress point (Core applies MaybeFlipIPv6toCJDNS to Lookup
-results, netbase.cpp:825)."
+hostname). IP parsing (dotted quad and every IPv6 text form, including
+::ffff:1.2.3.4) is string-to-ip-bytes (peerdb.lisp). An fc00::/8 IPv6 is
+retagged :cjdns when CJDNS is reachable, this being a string-ingress point
+(Core applies MaybeFlipIPv6toCJDNS to Lookup results, netbase.cpp:825)."
   (let ((onion (parse-onion-address string)))
     (when onion (return-from parse-network-address (values :torv3 onion))))
   (let ((i2p (parse-i2p-address string)))
     (when i2p (return-from parse-network-address (values :i2p i2p))))
-  (let ((v4 (ignore-errors (string-to-ip-bytes string))))
-    (when v4 (return-from parse-network-address (values :ipv4 v4))))
-  (when (find #\: string)
-    (let ((v6 (%parse-ipv6-string string)))
-      (when v6
-        (return-from parse-network-address
-          (values (maybe-flip-ipv6-to-cjdns :ipv6 v6) v6)))))
-  nil)
+  (let ((ip (string-to-ip-bytes string)))
+    (when ip
+      (values (maybe-flip-ipv6-to-cjdns (ip-network ip) ip) ip))))
 
 (defun peer-address-string (pa)
   "Human-readable address string for a peer-address record PA."

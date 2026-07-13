@@ -64,17 +64,19 @@ only equality between keys matters to the callers."
             (format nil "~{~D~^.~}"
                     (coerce (net-group-key bytes net) 'list)))))))
 
-(defun diversify-by-netgroup (addresses)
+(defun diversify-by-netgroup (addresses &key (key #'identity))
   "Reorder ADDRESSES so consecutive entries come from distinct /16
 netgroups when possible. Round-robins across groups: caller (which
 connects to the first N entries) gets the broadest spread for free
 without needing per-group caps. Stable within each group so the DNS-
-returned ordering acts as the within-group tiebreaker."
+returned ordering acts as the within-group tiebreaker. KEY extracts the
+address string from an entry (connect-to-peers passes (host . port)
+dial candidates with :key #'car)."
   (let ((groups (make-hash-table :test 'equal))
         (group-keys '()))
     ;; Bucket by group, preserve within-group order.
     (dolist (addr addresses)
-      (let ((g (or (ip-netgroup addr) "_nogroup")))
+      (let ((g (or (ip-netgroup (funcall key addr)) "_nogroup")))
         (unless (gethash g groups)
           (push g group-keys))
         (setf (gethash g groups) (nconc (gethash g groups) (list addr)))))
@@ -594,14 +596,22 @@ source is marked as knowing it too). Returns the number of peers sent to."
                  (incf sent)))
     sent))
 
-(defun %ingest-gossiped-address (net-addr timestamp address-book source-ip now)
+(defun peer-source-group (peer)
+  "Net-group key of PEER's own address, for addrman source bucketing (Core
+AddrMan::Add's source argument) — network-typed, so onion/i2p/cjdns peers
+get their proper source groups. NIL for hostname peers (addnode by name)."
+  (multiple-value-bind (net bytes) (parse-network-address (peer-address peer))
+    (when net (net-group-key bytes net))))
+
+(defun %ingest-gossiped-address (net-addr timestamp address-book source-group now)
   "Shared addr/addrv2 ingestion for one gossiped NET-ADDR (Core's per-address
-loop in the ADDR handler, net_processing.cpp:4056-4098). Stores it in
-ADDRESS-BOOK only when its network is REACHABLE (-onlynet; Core \"Do not store
-addresses outside our network\"), but fresh (10-min) ROUTABLE addresses are
-relay candidates regardless — an unreachable-net address still relays, just to
-1 peer instead of 2 (Core RelayAddress fReachable). Returns (VALUES stored
-relay-entry): STORED is 1/0 for the caller's log count, RELAY-ENTRY a
+loop in the ADDR handler, net_processing.cpp:4056-4098) learned from a peer
+with net-group key SOURCE-GROUP. Stores it in ADDRESS-BOOK only when its
+network is REACHABLE (-onlynet; Core \"Do not store addresses outside our
+network\"), but fresh (10-min) ROUTABLE addresses are relay candidates
+regardless — an unreachable-net address still relays, just to 1 peer instead
+of 2 (Core RelayAddress fReachable). Returns (VALUES stored relay-entry):
+STORED is 1/0 for the caller's log count, RELAY-ENTRY a
 (peer-address . max-targets) cons when the address should be gossiped onward."
   (unless (and address-book timestamp
                (<= (abs (- now timestamp)) (* 3 3600)))
@@ -615,7 +625,7 @@ relay-entry): STORED is 1/0 for the caller's log count, RELAY-ENTRY a
          (network (peer-address-network pa))
          (reachable (reachable-network-p network)))
     (when reachable
-      (address-book-add address-book pa source-ip))
+      (address-book-add address-book pa source-group))
     (values (if reachable 1 0)
             ;; Core relays only fresh (10-min) routable addrs.
             (when (and (> timestamp (- now 600))
@@ -630,7 +640,7 @@ spreading). Addresses with a timestamp within the last 10 minutes arriving in
 a small (<= 10 entries) unsolicited announcement are gossiped onward (Core
 RelayAddress)."
   (let ((now (bitcoin-lisp.serialization:get-unix-time))
-        (source-ip (when peer (string-to-ip-bytes (peer-address peer))))
+        (source-group (when peer (peer-source-group peer)))
         (added 0)
         (relay-candidates '())
         (msg-count 0))
@@ -642,7 +652,7 @@ RelayAddress)."
                      (bitcoin-lisp.serialization:read-net-addr stream :with-timestamp t)
                    (multiple-value-bind (stored relay)
                        (%ingest-gossiped-address net-addr timestamp
-                                                 address-book source-ip now)
+                                                 address-book source-group now)
                      (incf added stored)
                      (when relay (push relay relay-candidates)))))))
     (when (and peers (<= msg-count 10))
@@ -661,7 +671,7 @@ plausible timestamps (within 3 hours) to the address book — non-IP networks
 only when reachable (-onlynet + proxy/flag gates), mirroring Core. Unknown
 network ids were already skipped by the codec."
   (let ((now (bitcoin-lisp.serialization:get-unix-time))
-        (source-ip (when peer (string-to-ip-bytes (peer-address peer))))
+        (source-group (when peer (peer-source-group peer)))
         (added 0)
         (relay-candidates '())
         (entries (bitcoin-lisp.serialization:parse-addrv2-payload payload)))
@@ -669,7 +679,7 @@ network ids were already skipped by the codec."
       (destructuring-bind (net-addr timestamp network-id) entry
         (declare (ignore network-id))
         (multiple-value-bind (stored relay)
-            (%ingest-gossiped-address net-addr timestamp address-book source-ip now)
+            (%ingest-gossiped-address net-addr timestamp address-book source-group now)
           (incf added stored)
           (when relay (push relay relay-candidates)))))
     (when (and peers (<= (length entries) 10))

@@ -387,6 +387,47 @@ lands in addrman as a typed record, keyed and retrievable by (net,bytes,port)."
       (is (eq :torv3 (bitcoin-lisp.networking:peer-address-network entry)))
       (is (equalp pubkey (bitcoin-lisp.networking:peer-address-ip entry))))))
 
+(test v1-addr-fc00-gossip-drops-not-retags
+  "An fc00::/8 address arriving as plain IPv6 in a v1 addr message is NOT
+retagged to CJDNS at gossip ingestion (Core's ADDR handler has no
+MaybeFlipIPv6toCJDNS call) — addrman drops it as unroutable IPv6, even with
+CJDNS fully reachable. The same 16 bytes properly TAGGED cjdns in addrv2
+store fine. Together with the string-ingress flip (netaddress-tests
+cjdns-flip-on-ingress), this covers every fc00 ingress point."
+  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6 :cjdns))
+         (bitcoin-lisp.networking:*cjdns-reachable* t)
+         (book (bitcoin-lisp.networking:make-address-book))
+         (now (bitcoin-lisp.serialization:get-unix-time))
+         (fc (%av2-hex "fc000001000200030004000500060007"))
+         (v1-payload
+           (coerce
+            (flexi-streams:with-output-to-sequence (s)
+              (bitcoin-lisp.serialization:write-compact-size s 1)
+              (bitcoin-lisp.serialization:write-net-addr
+               s (bitcoin-lisp.serialization:make-net-addr
+                  :services 1 :ip fc :port 8333)
+               :with-timestamp t :timestamp now))
+            '(simple-array (unsigned-byte 8) (*)))))
+    ;; (handle-addr's return counts plausible+reachable entries for the log;
+    ;; the routability drop happens inside address-book-add — assert the book.)
+    (bitcoin-lisp.networking::handle-addr nil v1-payload book)
+    (is (= 0 (bitcoin-lisp.networking:address-book-count book)))
+    (is (null (bitcoin-lisp.networking:address-book-lookup book fc 8333 :cjdns)))
+    (is (null (bitcoin-lisp.networking:address-book-lookup book fc 8333 :ipv6)))
+    (let ((v2-payload
+            (coerce
+             (flexi-streams:with-output-to-sequence (s)
+               (bitcoin-lisp.serialization:write-compact-size s 1)
+               (write-sequence (make-addrv2-entry-bytes
+                                now 1 bitcoin-lisp.serialization:+addrv2-net-cjdns+
+                                fc 8333)
+                               s))
+             '(simple-array (unsigned-byte 8) (*)))))
+      (is (= 1 (bitcoin-lisp.networking:handle-addrv2 nil v2-payload book)))
+      (let ((entry (bitcoin-lisp.networking:address-book-lookup book fc 8333 :cjdns)))
+        (is (not (null entry)))
+        (is (eq :cjdns (bitcoin-lisp.networking:peer-address-network entry)))))))
+
 ;;;; v1 (legacy addr) discipline: non-IP addresses never emitted
 
 (test v1-write-net-addr-zeroes-non-ip
