@@ -845,19 +845,56 @@ PreChecks). Without chain-state the finality check is skipped."
     (is (= 2 (hash-table-count (bitcoin-lisp.mempool:mempool-descendants mempool atxid))))
     (is (= 3 (nth-value 0 (bitcoin-lisp.mempool:mempool-descendant-stats mempool atxid))))))
 
-(test mempool-ancestor-descendant-limit
-  "A chain longer than the 25-tx package limit is rejected."
+(test mempool-cluster-count-limit
+  "Acceptance is bounded by the 64-tx cluster limit (cluster mempool P6): a
+64-long chain — far past the old 25-ancestor limit, which is RPC-reporting-
+only now — is accepted in full, and the 65th link is rejected with
+:too-large-cluster, leaving the graph non-oversized (the staged addition is
+rolled back)."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (root (make-mempool-test-tx :input-id 91))
          (prev-txid (bitcoin-lisp.serialization:transaction-hash root))
-         (last-result (%add-tx mempool root)))
-    (loop for i from 1 to 30
+         (last-result (%add-tx mempool root))
+         (accepted 1))
+    (loop for i from 2 to 65
           while (eq last-result :ok)
           do (let ((child (%mp-spending-tx prev-txid)))
                (setf last-result (%add-tx mempool child))
                (when (eq last-result :ok)
+                 (incf accepted)
                  (setf prev-txid (bitcoin-lisp.serialization:transaction-hash child)))))
-    (is (eq last-result :too-long-mempool-chain))))
+    (is (= 64 accepted))
+    (is (eq last-result :too-large-cluster))
+    (is (= 64 (bitcoin-lisp.mempool:mempool-count mempool)))
+    (is-false (bitcoin-lisp.mempool:txgraph-oversized-p
+               (bitcoin-lisp.mempool:mempool-graph mempool)))))
+
+(test mempool-cluster-size-limit
+  "Acceptance is bounded by the cluster vsize limit: a chain whose total
+vsize would exceed *cluster-size-limit* is rejected at the tx that crosses
+it, and a single tx alone over the limit is rejected outright. (The limit is
+bound low here; the graph's limits are fixed at make-mempool time.)"
+  (let* ((mempool (let ((bitcoin-lisp.mempool:*cluster-size-limit* 200))
+                    (bitcoin-lisp.mempool:make-mempool)))
+         (a (make-mempool-test-tx :input-id 97))
+         (atxid (bitcoin-lisp.serialization:transaction-hash a))
+         (b (%mp-spending-tx atxid))
+         (btxid (bitcoin-lisp.serialization:transaction-hash b))
+         (c (%mp-spending-tx btxid)))
+    ;; Each test tx is 95 vB: A (95) and B (190 total) fit under 200,
+    ;; C (285 total) does not.
+    (is (eq :ok (%add-tx mempool a)))
+    (is (eq :ok (%add-tx mempool b)))
+    (is (eq :too-large-cluster (%add-tx mempool c)))
+    (is (= 2 (bitcoin-lisp.mempool:mempool-count mempool)))
+    (is-false (bitcoin-lisp.mempool:txgraph-oversized-p
+               (bitcoin-lisp.mempool:mempool-graph mempool))))
+  ;; A single transaction larger than the cluster size limit.
+  (let ((mempool (let ((bitcoin-lisp.mempool:*cluster-size-limit* 50))
+                   (bitcoin-lisp.mempool:make-mempool))))
+    (is (eq :too-large-cluster
+            (%add-tx mempool (make-mempool-test-tx :input-id 98))))
+    (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))))
 
 (test mempool-remove-recursive-test
   "Removing a tx removes all of its descendants."
@@ -886,7 +923,8 @@ PreChecks). Without chain-state the finality check is skipped."
       (is (not (null (gethash (cons atxid 0) coins)))))))
 
 (test mempool-eviction-removes-descendants
-  "Evicting a low-fee parent also removes its in-mempool child (no orphan)."
+  "Evicting a low-fee parent also removes its in-mempool child (no orphan):
+the CPFP pair shares one chunk, evicted as a unit."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 260))
          (a (make-mempool-test-tx :input-id 95))
          (atxid (bitcoin-lisp.serialization:transaction-hash a))
@@ -894,15 +932,60 @@ PreChecks). Without chain-state the finality check is skipped."
          (btxid (bitcoin-lisp.serialization:transaction-hash b))
          (c (make-mempool-test-tx :input-id 96))
          (ctxid (bitcoin-lisp.serialization:transaction-hash c)))
-    ;; A has the lowest fee-rate so eviction targets it first; child B has a
-    ;; higher fee-rate but must still be removed together with its parent.
+    ;; B fee-bumps A, so [A B] forms one chunk whose feerate is still below
+    ;; C's — it is the worst chunk, evicted whole.
     (is (eq :ok (%add-tx mempool a :fee 100)))
     (is (eq :ok (%add-tx mempool b :fee 5000)))
-    ;; High-fee C forces eviction; A is evicted and takes child B recursively.
+    ;; High-fee C forces eviction; the [A B] chunk goes together.
     (%add-tx mempool c :fee 100000)
     (is (not (bitcoin-lisp.mempool:mempool-has mempool atxid)))
     (is (not (bitcoin-lisp.mempool:mempool-has mempool btxid)))
     (is (bitcoin-lisp.mempool:mempool-has mempool ctxid))))
+
+(test mempool-eviction-worst-chunk-cpfp-protection
+  "TrimToSize evicts the globally WORST CHUNK: a standalone middling tx goes
+before a CPFP pair whose merged chunk feerate beats it (the high-fee child
+protects its low-fee parent), and the rolling minimum fee rises to exactly
+the evicted chunk's feerate plus the incremental relay fee (Core TrimToSize
++ trackPackageRemoved)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 260))
+         (p (make-mempool-test-tx :input-id 101))
+         (ptxid (bitcoin-lisp.serialization:transaction-hash p))
+         (c (%mp-spending-tx ptxid))
+         (ctxid (bitcoin-lisp.serialization:transaction-hash c))
+         (m (make-mempool-test-tx :input-id 102))
+         (mtxid (bitcoin-lisp.serialization:transaction-hash m))
+         (m-vsize (bitcoin-lisp.serialization:transaction-vsize m)))
+    ;; P alone (100 sat / 95 vB) is far worse than M (2000 sat / 95 vB), but
+    ;; child C (20000 sat) absorbs P into one chunk at ~105 sat/vB - so the
+    ;; worst chunk is [M], not [P ...].
+    (is (eq :ok (%add-tx mempool p :fee 100)))
+    (is (eq :ok (%add-tx mempool m :fee 2000)))
+    (is (eq :ok (%add-tx mempool c :fee 20000)))     ; triggers the trim
+    (is (not (bitcoin-lisp.mempool:mempool-has mempool mtxid)))
+    (is (bitcoin-lisp.mempool:mempool-has mempool ptxid))
+    (is (bitcoin-lisp.mempool:mempool-has mempool ctxid))
+    ;; Rolling minimum fee: evicted chunk feerate (sat/kvB, truncated) +
+    ;; incremental relay fee (100 sat/kvB).
+    (is (= (+ (truncate (* 2000 1000) m-vsize) 100)
+           (bitcoin-lisp.mempool::mempool-rolling-min-fee-rate mempool)))))
+
+(test mempool-full-self-eviction-bumps-rolling-fee
+  "A newcomer whose own chunk is the worst evicts itself (Core: add, trim,
+then \"mempool full\" when the tx is gone) - and still bumps the rolling
+minimum fee past its feerate, so an equal-feerate retry cannot loop."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 100))
+         (rich (make-mempool-test-tx :input-id 103))
+         (poor (make-mempool-test-tx :input-id 104))
+         (poor-vsize (bitcoin-lisp.serialization:transaction-vsize poor)))
+    (is (eq :ok (%add-tx mempool rich :fee 50000)))
+    (is (eq :mempool-full (%add-tx mempool poor :fee 30)))
+    (is (bitcoin-lisp.mempool:mempool-has
+         mempool (bitcoin-lisp.serialization:transaction-hash rich)))
+    (is (not (bitcoin-lisp.mempool:mempool-has
+              mempool (bitcoin-lisp.serialization:transaction-hash poor))))
+    (is (= (+ (truncate (* 30 1000) poor-vsize) 100)
+           (bitcoin-lisp.mempool::mempool-rolling-min-fee-rate mempool)))))
 
 ;;;; PR4 RBF (BIP125)
 

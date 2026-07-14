@@ -167,6 +167,31 @@ merged config alist (options with no start-node keyword)."
     (is (equalp (bitcoin-lisp.crypto:hex-to-bytes "5121ff")
                 bitcoin-lisp.validation:*signet-challenge*))))
 
+(test config-cluster-limit-knobs
+  "-limitclustercount/-limitclustersize set the cluster-limit specials that
+make-mempool reads when creating its txgraph (cluster mempool P6); the
+count is hard-capped at 64 like Core (mempool_args.cpp:110-112)."
+  (let ((bitcoin-lisp.mempool:*cluster-count-limit*
+          bitcoin-lisp.mempool:*cluster-count-limit*)
+        (bitcoin-lisp.mempool:*cluster-size-limit*
+          bitcoin-lisp.mempool:*cluster-size-limit*))
+    (bitcoin-lisp::apply-config-globals
+     '(("limitclustercount" . "32") ("limitclustersize" . "50")))
+    (is (= 32 bitcoin-lisp.mempool:*cluster-count-limit*))
+    (is (= 50000 bitcoin-lisp.mempool:*cluster-size-limit*))    ; kvB -> vB
+    ;; A mempool created under these settings carries them in its graph.
+    (let ((graph (bitcoin-lisp.mempool:mempool-graph
+                  (bitcoin-lisp.mempool:make-mempool))))
+      (is (= 32 (bitcoin-lisp.mempool::txgraph-max-cluster-count graph)))
+      (is (= 50000 (bitcoin-lisp.mempool::txgraph-max-cluster-size graph))))
+    ;; Out-of-range values are init errors.
+    (signals error (bitcoin-lisp::apply-config-globals
+                    '(("limitclustercount" . "65"))))
+    (signals error (bitcoin-lisp::apply-config-globals
+                    '(("limitclustercount" . "0"))))
+    (signals error (bitcoin-lisp::apply-config-globals
+                    '(("limitclustersize" . "0"))))))
+
 (test config-args-returns-merged-alist
   "args->start-node-plist returns the merged config alist as a second value, so
 start-node-from-args can apply the global-only options."

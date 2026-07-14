@@ -576,6 +576,7 @@ resolved network. Honors -server (enable RPC on the default port when no
   "Set the process-global policy/consensus config specials from the MERGED config
 alist. These options have no start-node keyword because they configure global
 specials directly: -datacarrier, -datacarriersize, -permitbaremultisig,
+-limitclustercount/-limitclustersize (cluster mempool acceptance limits),
 -signetchallenge (a custom signet block-challenge), the SOCKS5 proxy
 options -proxy/-onion/-proxyrandomize (networking's *proxy*/*onion-proxy*),
 and the network-reachability options -onlynet (repeatable)/-cjdnsreachable
@@ -589,6 +590,23 @@ start-node-from-args."
       (when v (setf *max-datacarrier-bytes* (conf-parse-int v))))
     (let ((v (lk "permitbaremultisig")))
       (when v (setf *permit-bare-multisig* (conf-parse-bool v))))
+    ;; Cluster mempool limits: -limitclustercount (transactions, hard-capped
+    ;; at 64) and -limitclustersize (kvB) bound every connected component of
+    ;; unconfirmed transactions (Core mempool_args.cpp:35-37 + the cap check
+    ;; at :110-112, init.cpp:658-659). Read by make-mempool, which is created
+    ;; after this runs at startup.
+    (let ((v (lk "limitclustercount")))
+      (when v
+        (let ((n (conf-parse-int v)))
+          (unless (<= 1 n 64)
+            (error "limitclustercount must be between 1 and 64"))
+          (setf bitcoin-lisp.mempool:*cluster-count-limit* n))))
+    (let ((v (lk "limitclustersize")))
+      (when v
+        (let ((kvb (conf-parse-int v)))
+          (unless (plusp kvb)
+            (error "limitclustersize must be a positive number of kvB"))
+          (setf bitcoin-lisp.mempool:*cluster-size-limit* (* kvb 1000)))))
     (let ((v (lk "signetchallenge")))
       (when v (setf bitcoin-lisp.validation:*signet-challenge*
                     (bitcoin-lisp.crypto:hex-to-bytes v))))
