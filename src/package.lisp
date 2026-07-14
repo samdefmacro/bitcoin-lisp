@@ -339,6 +339,7 @@
    #:write-net-addr
    #:net-addr
    #:make-net-addr
+   #:make-empty-net-addr
    #:net-addr-services
    #:net-addr-ip
    #:net-addr-port
@@ -1030,6 +1031,14 @@
    #:socks5-error
    #:socks5-error-phase
    #:next-proxy-credentials
+   #:*onion-proxy-explicit*
+   ;; Tor control client (Core torcontrol.cpp): inbound onion service
+   #:tor-controller
+   #:tor-controller-service-id
+   #:tor-controller-running
+   #:start-tor-control
+   #:stop-tor-control
+   #:parse-torcontrol-spec
    ;; Inbound listening
    #:open-listener
    #:close-listener
@@ -1038,6 +1047,7 @@
    #:request-ibd-stop
    #:reset-ibd-stop
    #:ibd-stop-requested-p
+   #:join-thread-or-destroy
    ;; Tx-request tracking
    #:retry-timed-out-tx-requests
    #:reset-tx-requests
@@ -1154,8 +1164,29 @@
    #:network-address-length
    #:*reachable-networks*
    #:*cjdns-reachable*
+   #:*onlynet-networks*
    #:reachable-network-p
    #:dialable-network-p
+   ;; Local addresses (Core mapLocalHost) + self-advertisement
+   #:+local-manual+
+   #:local-address
+   #:make-local-address
+   #:local-address-network
+   #:local-address-bytes
+   #:local-address-port
+   #:local-address-score
+   #:add-local
+   #:remove-local
+   #:clear-local-addresses
+   #:local-addresses
+   #:best-local-address
+   #:privacy-network-p
+   #:peer-inbound-onion
+   #:peer-connected-through-network
+   #:peer-next-local-addr-send
+   #:get-local-addr-for-peer
+   #:maybe-advertise-local-address
+   #:local-services
    #:maybe-flip-ipv6-to-cjdns
    #:proxy-for-target
    #:base32-encode

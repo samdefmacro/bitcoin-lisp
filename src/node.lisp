@@ -96,6 +96,15 @@ we cap lower). Excess inbound connections are disconnected at merge time.")
   ;; keeping PEERS single-writer so the drain loop never races a push.
   (listener-socket nil)
   (listener-thread nil :type (or null bt:thread))
+  ;; Onion-service listener: a second accept loop on 127.0.0.1:(port+1) that
+  ;; the local Tor daemon forwards inbound onion connections to (Core's
+  ;; onion_binds + default onion service target). Peers accepted here are
+  ;; tagged inbound-onion (their true network is :torv3).
+  (onion-listener-socket nil)
+  (onion-listener-thread nil :type (or null bt:thread))
+  ;; The torcontrol client (bitcoin-lisp.networking:tor-controller) keeping
+  ;; the v3 onion service registered with the local Tor daemon, or NIL.
+  (tor-controller nil)
   (pending-inbound-peers '() :type list)
   (lock (bt:make-recursive-lock "node-lock"))
   (known-addresses '() :type list)
@@ -423,28 +432,33 @@ AttemptToEvictConnection. Returns T if a peer was evicted."
                     (bitcoin-lisp.networking:disconnect-peer victim)
                     t))))))))))
 
-(defun run-inbound-listener (node)
-  "Accept inbound connections, handshake each, and hand the ready peer to the
-sync thread via pending-inbound-peers. Runs until the node stops. The handshake
-runs inline (serial accept) with a short timeout, so a silent peer stalls the
-loop only briefly; a thread pool is a future refinement."
+(defun run-inbound-listener (node &key (socket (node-listener-socket node)) onion)
+  "Accept inbound connections on SOCKET, handshake each, and hand the ready
+peer to the sync thread via pending-inbound-peers. Runs until the node stops.
+The handshake runs inline (serial accept) with a short timeout, so a silent
+peer stalls the loop only briefly; a thread pool is a future refinement.
+ONION marks this as the onion-service listener: its connections arrive from
+the local Tor daemon, so the peers are tagged inbound-onion (their true
+network is :torv3, Core CNode::m_inbound_onion)."
   (loop while (node-running node)
         do (handler-case
                ;; setnetworkactive off: don't accept inbound connections.
                (if (not (node-network-active node))
                    (sleep 1)
                (let ((conn (bitcoin-lisp.networking:accept-connection
-                            (node-listener-socket node) :timeout 1)))
+                            socket :timeout 1)))
                  (when conn
                    (let ((peer (bitcoin-lisp.networking:make-inbound-peer
-                                conn (bitcoin-lisp.networking:connection-host conn))))
+                                conn (bitcoin-lisp.networking:connection-host conn)
+                                :inbound-onion onion)))
                      (if (bitcoin-lisp.networking:perform-inbound-handshake peer)
                          (progn
                            (bitcoin-lisp.networking:send-post-handshake-messages peer)
                            (bitcoin-lisp.networking:send-compact-block-negotiation peer)
                            (bt:with-recursive-lock-held ((node-lock node))
                              (push peer (node-pending-inbound-peers node)))
-                           (log-info "Inbound peer ~A (~A) handshake complete"
+                           (log-info "Inbound~:[~; onion~] peer ~A (~A) handshake complete"
+                                     onion
                                      (bitcoin-lisp.networking:peer-address peer)
                                      (bitcoin-lisp.networking:peer-user-agent peer)))
                          (bitcoin-lisp.networking:disconnect-peer peer))))))
@@ -465,6 +479,31 @@ port can't be bound."
                                 :name "bitcoin-inbound-listener"))
           (log-info "Listening for inbound peers on ~A:~D"
                     bind (network-port (node-network node)))))))
+
+(defun onion-listen-port (node)
+  "The local port Tor forwards inbound onion connections to: the network
+default port + 1 (Core's default_bind_port_onion, init.cpp:2118, and
+DefaultOnionServiceTarget)."
+  (1+ (network-port (node-network node))))
+
+(defun start-onion-listener (node)
+  "Open the onion-service target listener on 127.0.0.1:(port+1) and spawn its
+accept thread. Bound to loopback only — connections come exclusively from the
+local Tor daemon; the bind is never advertised (Core BF_DONT_ADVERTISE on
+onion binds). No-op (logged) if the port can't be bound; torcontrol still
+runs, matching Core, where a failed onion bind and the control thread are
+independent."
+  (let* ((port (onion-listen-port node))
+         (sock (bitcoin-lisp.networking:open-listener "127.0.0.1" port)))
+    (if (null sock)
+        (log-warn "Onion inbound listening disabled: could not bind 127.0.0.1:~D" port)
+        (progn
+          (setf (node-onion-listener-socket node) sock)
+          (setf (node-onion-listener-thread node)
+                (bt:make-thread (lambda ()
+                                  (run-inbound-listener node :socket sock :onion t))
+                                :name "bitcoin-onion-listener"))
+          (log-info "Listening for inbound onion peers on 127.0.0.1:~D" port)))))
 
 (defun load-mempool-from-disk
     (node &optional (path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory node))))
@@ -610,6 +649,9 @@ to resolve it aren't on disk (caller then aborts for a resync)."
                         (rpc-password nil)
                         (listen t)
                         (listen-bind "0.0.0.0")
+                        (listen-onion t)
+                        (tor-control nil)
+                        (tor-password nil)
                         (dbcache-mib nil)
                         (v2transport nil)
                         (coinstatsindex nil)
@@ -634,6 +676,13 @@ RPC-PORT: Port for RPC server (nil = no RPC, default 18332 testnet / 8332 mainne
 RPC-BIND: Address to bind RPC server (default 127.0.0.1)
 RPC-USER: RPC authentication username (nil = no auth)
 RPC-PASSWORD: RPC authentication password
+LISTEN-ONION: If T (default, like Core -listenonion) and LISTEN is on,
+  connect to the local Tor control port, create a v3 onion service forwarding
+  to a loopback listener on port+1, and advertise the .onion address
+LISTEN-ONION requires a reachable Tor daemon to do anything; without one the
+  torcontrol thread just retries with backoff
+TOR-CONTROL: Tor control host:port (nil = 127.0.0.1:9051, Core -torcontrol)
+TOR-PASSWORD: Tor control port password (Core -torpassword)
 
 Returns the node instance."
   (when *node*
@@ -1050,7 +1099,16 @@ data below the pruned horizon; the index needs genesis-contiguous history)"
                                         ;; equivalent on every message pump).
                                         (bitcoin-lisp.networking:flush-tx-announcements
                                          (node-peers *node*)
-                                         (node-mempool *node*))))
+                                         (node-mempool *node*))
+                                        ;; Local-address self-advertisement
+                                        ;; (our onion address, once torcontrol
+                                        ;; registers it): per-peer ~24h Poisson
+                                        ;; schedule inside, no-op while the
+                                        ;; local-address map is empty or in
+                                        ;; IBD (Core MaybeSendAddr).
+                                        (bitcoin-lisp.networking:maybe-advertise-local-address
+                                         (node-peers *node*)
+                                         (node-chain-state *node*))))
                               (t
                                (log-warn "No peers available, reconnecting in 5s...")
                                (loop repeat 5 while (node-running *node*)
@@ -1063,6 +1121,25 @@ data below the pruned horizon; the index needs genesis-contiguous history)"
   ;; Inbound listening (depends on the sync thread to merge accepted peers).
   (when (and sync listen)
     (start-inbound-listener *node* listen-bind))
+
+  ;; Tor onion service (-listenonion, default on like Core): a loopback
+  ;; listener the local Tor daemon forwards inbound onion connections to,
+  ;; plus the torcontrol client that registers the v3 onion service and
+  ;; AddLocal()s the .onion address for self-advertisement. Gated on LISTEN
+  ;; (Core: -listen=0 soft-disables -listenonion; the config layer errors on
+  ;; the explicit combination). Divergence from Core noted: Core binds its
+  ;; onion listener whenever it listens, even with -listenonion=0 — we only
+  ;; bind it when the service can actually exist.
+  (when (and sync listen listen-onion)
+    (bitcoin-lisp.networking:clear-local-addresses)
+    (start-onion-listener *node*)
+    (setf (node-tor-controller *node*)
+          (bitcoin-lisp.networking:start-tor-control
+           :control-spec tor-control
+           :password tor-password
+           :data-directory (node-data-directory *node*)
+           :virtual-port (network-port network)
+           :target-port (onion-listen-port *node*))))
 
   (install-shutdown-handler)
   (log-info "Node started successfully")
@@ -1520,20 +1597,28 @@ heals such gaps on restart."
   (setf (node-running *node*) nil)
   (bitcoin-lisp.networking:request-ibd-stop)
 
-  ;; Stop the inbound listener: close the socket (unblocks accept) and let the
-  ;; accept thread observe node-running=nil and exit (its accept timeout is 1s).
+  ;; Stop the torcontrol client: closing the control connection is what tears
+  ;; the ephemeral onion service down inside Tor (no DEL_ONION, like Core).
+  (when (node-tor-controller *node*)
+    (bitcoin-lisp.networking:stop-tor-control (node-tor-controller *node*))
+    (setf (node-tor-controller *node*) nil))
+
+  ;; Stop the inbound listeners: close the sockets (unblocks accept) and let
+  ;; the accept threads observe node-running=nil and exit (accept timeout 1s).
   (when (node-listener-socket *node*)
     (bitcoin-lisp.networking:close-listener (node-listener-socket *node*))
     (setf (node-listener-socket *node*) nil))
-  (when (and (node-listener-thread *node*)
-             (bt:thread-alive-p (node-listener-thread *node*)))
-    (let ((deadline (+ (get-internal-real-time) (* 5 internal-time-units-per-second))))
-      (loop while (and (bt:thread-alive-p (node-listener-thread *node*))
-                       (< (get-internal-real-time) deadline))
-            do (sleep 0.1))
-      (when (bt:thread-alive-p (node-listener-thread *node*))
-        (bt:destroy-thread (node-listener-thread *node*)))))
-  (setf (node-listener-thread *node*) nil)
+  (when (node-onion-listener-socket *node*)
+    (bitcoin-lisp.networking:close-listener (node-onion-listener-socket *node*))
+    (setf (node-onion-listener-socket *node*) nil))
+  ;; One shared deadline bounds the TOTAL wait for both accept threads.
+  (let ((deadline (+ (get-internal-real-time) (* 5 internal-time-units-per-second))))
+    (bitcoin-lisp.networking:join-thread-or-destroy
+     (node-listener-thread *node*) :deadline deadline)
+    (bitcoin-lisp.networking:join-thread-or-destroy
+     (node-onion-listener-thread *node*) :deadline deadline))
+  (setf (node-listener-thread *node*) nil
+        (node-onion-listener-thread *node*) nil)
   ;; Disconnect any inbound peers not yet merged into the peer list. The listener
   ;; thread is already joined above, but take the lock for consistency.
   (let ((pending (bt:with-recursive-lock-held ((node-lock *node*))
