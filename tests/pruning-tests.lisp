@@ -555,3 +555,246 @@ rises with it, across the default 450 MiB and the larger -dbcache regimes
     (is (= (* 450 1024 1024)
            (let ((bitcoin-lisp::*coins-cache-budget-bytes* (* 450 1024 1024)))
              bitcoin-lisp::*coins-cache-budget-bytes*)))))
+
+;;;; Assumeutxo P6: per-chainstate prune ranges (Core Chainstate::GetPruneRange,
+;;;; validation.cpp:6366-6391) + halved automatic target while a historical
+;;;; chainstate exists (Core FindFilesToPrune, node/blockstorage.cpp:330-338).
+
+(test chain-state-prune-floor-roles
+  "chain-state-prune-floor is the snapshot base height for an UNVALIDATED
+snapshot chainstate, 0 for a plain or VALIDATED chainstate, and refuses all
+pruning (most-positive-fixnum) when the base header is missing from the
+index."
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 5)
+    (declare (ignore block-store))
+    (unwind-protect
+         (progn
+           ;; Plain chainstate: prunes from genesis.
+           (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
+           ;; Unvalidated snapshot chainstate: floor at the base height.
+           (setf (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+                 (nth 3 block-hashes)
+                 (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 :unvalidated)
+           (is (= 3 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
+           ;; Promotion (VALIDATED) lifts the floor entirely.
+           (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 :validated)
+           (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
+           ;; Unknown base header: refuse to prune anything.
+           (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 :unvalidated
+                 (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+                 (make-test-hash #xEE #xEE))
+           (is (= most-positive-fixnum
+                  (bitcoin-lisp.storage:chain-state-prune-floor chain-state))))
+      (cleanup-test-dir base-path))))
+
+(test effective-prune-target-halved-while-historical-exists
+  "effective-prune-target-bytes divides the automatic prune target by the
+number of chainstates — halved while a historical chainstate exists, floored
+at MIN_DISK_SPACE_FOR_BLOCK_FILES (Core node/blockstorage.cpp:330-338)."
+  (let* ((base-hash (make-test-hash #xEE 5))
+         (primary (bitcoin-lisp.storage:make-chain-state))
+         (snap (bitcoin-lisp.storage:make-chain-state
+                :from-snapshot-blockhash base-hash
+                :assumeutxo-status :unvalidated
+                :storage-suffix "_snapshot"))
+         (node (bitcoin-lisp::make-node :network :testnet3)))
+    ;; A target-blockhash (and no target-utxohash) makes PRIMARY historical.
+    (setf (bitcoin-lisp.storage:chain-state-target-blockhash primary) base-hash
+          (bitcoin-lisp::node-chainstates node) (list primary snap))
+    (let ((bitcoin-lisp::*node* node))
+      (let ((bitcoin-lisp:*prune-target-mib* 2000))
+        (is (= (* 1000 1048576) (bitcoin-lisp:effective-prune-target-bytes))))
+      ;; Halving never pushes the target below the 550 MiB floor.
+      (let ((bitcoin-lisp:*prune-target-mib* 550))
+        (is (= bitcoin-lisp:+min-disk-space-for-block-files+
+               (bitcoin-lisp:effective-prune-target-bytes)))))
+    ;; No node / no historical chainstate: the full target.
+    (let ((bitcoin-lisp::*node* nil)
+          (bitcoin-lisp:*prune-target-mib* 2000))
+      (is (= (* 2000 1048576) (bitcoin-lisp:effective-prune-target-bytes))))
+    ;; Background completion ends the historical role: full target again.
+    (setf (bitcoin-lisp.storage:chain-state-target-utxohash primary)
+          (make-test-hash 1 1))
+    (let ((bitcoin-lisp::*node* node)
+          (bitcoin-lisp:*prune-target-mib* 2000))
+      (is (= (* 2000 1048576) (bitcoin-lisp:effective-prune-target-bytes))))))
+
+(test prune-floor-unvalidated-snapshot-then-promotion
+  "Automatic pruning driven by an UNVALIDATED snapshot chainstate never
+deletes a block at or below the snapshot base (deleting one would wedge the
+background validation permanently); after promotion the floor lifts and the
+rewound cursor lets a later walk reclaim the protected window."
+  ;; 400 blocks: tip - 288 = 112 prunable ceiling; snapshot base at 60.
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 400)
+    (unwind-protect
+         (let* ((base-hash (nth 60 block-hashes))
+                (historical (bitcoin-lisp.storage:make-chain-state
+                             :block-index (bitcoin-lisp.storage::chain-state-block-index
+                                           chain-state)))
+                (node (bitcoin-lisp::make-node :network :testnet3)))
+           ;; CHAIN-STATE becomes the snapshot chainstate (tip 400, base 60);
+           ;; HISTORICAL re-derives history below the base (tip 40).
+           (setf (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+                 base-hash
+                 (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 :unvalidated)
+           (bitcoin-lisp.storage:update-chain-tip historical (nth 40 block-hashes) 40)
+           (bitcoin-lisp.storage:set-chainstate-target
+            historical (bitcoin-lisp.storage:get-block-index-entry chain-state base-hash))
+           (setf (bitcoin-lisp::node-chainstates node) (list historical chain-state))
+           (let ((bitcoin-lisp::*node* node)
+                 (bitcoin-lisp:*prune-target-mib* 550)
+                 (bitcoin-lisp:*prune-after-height* 0))
+             (is (= 60 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
+             (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor historical)))
+             ;; Force an over-target prune on the SNAPSHOT chainstate: only
+             ;; heights 61..112 may go; the base range 1..60 stays on disk.
+             (setf (bitcoin-lisp.storage:block-store-total-bytes block-store)
+                   (* 600 1048576))
+             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+                            block-store chain-state)))
+               (is (= 52 pruned)))
+             (is (= 112 (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+             (is (not (null (bitcoin-lisp.storage:block-exists-p
+                             block-store (nth 1 block-hashes)))))
+             (is (not (null (bitcoin-lisp.storage:block-exists-p
+                             block-store (nth 60 block-hashes)))))
+             (is (null (bitcoin-lisp.storage:block-exists-p
+                        block-store (nth 61 block-hashes))))
+             (is (null (bitcoin-lisp.storage:block-exists-p
+                        block-store (nth 112 block-hashes))))
+             (is (not (null (bitcoin-lisp.storage:block-exists-p
+                             block-store (nth 113 block-hashes)))))
+             ;; The HISTORICAL chainstate (tip 40) has no prunable range of
+             ;; its own yet (40 - 288 < 1): nothing deleted.
+             (is (= 0 (bitcoin-lisp.storage:prune-old-blocks
+                       block-store historical)))
+             ;; Promotion: VALIDATED lifts the floor and the cursor rewinds
+             ;; (what %validate-snapshot-against-commitment does), so the
+             ;; protected window is reclaimed.
+             (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                   :validated)
+             (bitcoin-lisp.storage:lift-prune-floor-on-promotion
+              chain-state historical)
+             (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor chain-state)))
+             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+                            block-store chain-state)))
+               (is (= 60 pruned)))
+             (is (null (bitcoin-lisp.storage:block-exists-p
+                        block-store (nth 1 block-hashes))))
+             (is (null (bitcoin-lisp.storage:block-exists-p
+                        block-store (nth 60 block-hashes))))
+             (is (not (null (bitcoin-lisp.storage:block-exists-p
+                             block-store (nth 113 block-hashes)))))))
+      (cleanup-test-dir base-path))))
+
+(test prune-historical-own-range-while-snapshot-floored
+  "While the snapshot chainstate is floored at a high base, the historical
+chainstate still prunes its OWN already-validated range normally (Core: each
+chainstate prunes its GetPruneRange; the historical range starts at 0)."
+  ;; Base at 350 (above the snapshot tip's 400-288=112 prune ceiling): the
+  ;; snapshot chainstate can prune nothing; the historical (tip 300) prunes
+  ;; its own 1..12 window.
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 400)
+    (unwind-protect
+         (let* ((base-hash (nth 350 block-hashes))
+                (historical (bitcoin-lisp.storage:make-chain-state
+                             :block-index (bitcoin-lisp.storage::chain-state-block-index
+                                           chain-state)))
+                (node (bitcoin-lisp::make-node :network :testnet3)))
+           (setf (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+                 base-hash
+                 (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 :unvalidated)
+           (bitcoin-lisp.storage:update-chain-tip historical (nth 300 block-hashes) 300)
+           (bitcoin-lisp.storage:set-chainstate-target
+            historical (bitcoin-lisp.storage:get-block-index-entry chain-state base-hash))
+           (setf (bitcoin-lisp::node-chainstates node) (list historical chain-state))
+           (let ((bitcoin-lisp::*node* node)
+                 (bitcoin-lisp:*prune-target-mib* 550)
+                 (bitcoin-lisp:*prune-after-height* 0))
+             (setf (bitcoin-lisp.storage:block-store-total-bytes block-store)
+                   (* 600 1048576))
+             ;; Snapshot chainstate: floor 350 > prune ceiling 112 -> nothing.
+             (is (= 0 (bitcoin-lisp.storage:prune-old-blocks
+                       block-store chain-state)))
+             (is (not (null (bitcoin-lisp.storage:block-exists-p
+                             block-store (nth 1 block-hashes)))))
+             ;; Historical chainstate: prunes its own 1..12 (300 - 288).
+             (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+                            block-store historical)))
+               (is (= 12 pruned)))
+             (is (= 12 (bitcoin-lisp.storage:chain-state-pruned-height historical)))
+             (is (null (bitcoin-lisp.storage:block-exists-p
+                        block-store (nth 12 block-hashes))))
+             (is (not (null (bitcoin-lisp.storage:block-exists-p
+                             block-store (nth 13 block-hashes)))))))
+      (cleanup-test-dir base-path))))
+
+(test manual-prune-respects-snapshot-floor
+  "pruneblockchain's prune-blocks-to-height honors the snapshot floor too
+(Core FindFilesToPruneManual also bounds the manual range by GetPruneRange):
+a manual prune to a height above the base deletes only blocks strictly
+between the base and the requested height."
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 400)
+    (unwind-protect
+         (let ((bitcoin-lisp:*prune-target-mib* 1))  ; manual-only mode
+           (setf (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+                 (nth 60 block-hashes)
+                 (bitcoin-lisp.storage:chain-state-assumeutxo-status chain-state)
+                 :unvalidated)
+           (let ((pruned (bitcoin-lisp.storage:prune-blocks-to-height
+                          block-store chain-state 90)))
+             (is (= 29 pruned)))    ; heights 61..89
+           (is (= 89 (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+           (is (not (null (bitcoin-lisp.storage:block-exists-p
+                           block-store (nth 60 block-hashes)))))
+           (is (null (bitcoin-lisp.storage:block-exists-p
+                      block-store (nth 61 block-hashes))))
+           (is (null (bitcoin-lisp.storage:block-exists-p
+                      block-store (nth 89 block-hashes))))
+           (is (not (null (bitcoin-lisp.storage:block-exists-p
+                           block-store (nth 90 block-hashes))))))
+      (cleanup-test-dir base-path))))
+
+(test prune-stale-undo-files-horizon-override
+  "The startup undo sweep deletes only at/below the caller-supplied horizon:
+with dual chainstates the caller passes the MINIMUM pruned-height, so the
+snapshot chainstate's high cursor can never wipe the historical chainstate's
+undo window."
+  (multiple-value-bind (base-path block-store chain-state block-hashes)
+      (setup-pruning-test-store 300)
+    (declare (ignore block-store))
+    (let ((undo-dir (merge-pathnames "undo/" base-path)))
+      (unwind-protect
+           (progn
+             (bitcoin-lisp.validation:initialize-undo-storage undo-dir)
+             (dolist (hash (subseq block-hashes 1 6))   ; heights 1..5
+               (bitcoin-lisp.validation::save-undo-data-to-disk hash '()))
+             ;; The (snapshot) chainstate's own cursor claims 5, but the
+             ;; conservative horizon is 3: only undo 1..3 may go.
+             (setf (bitcoin-lisp.storage:chain-state-pruned-height chain-state) 5)
+             (is (= 3 (bitcoin-lisp.validation:prune-stale-undo-files
+                       chain-state :horizon 3)))
+             (is (null (probe-file (merge-pathnames
+                                    (format nil "~A.dat" (bitcoin-lisp.crypto:bytes-to-hex
+                                                          (nth 3 block-hashes)))
+                                    undo-dir))))
+             (is (not (null (probe-file (merge-pathnames
+                                         (format nil "~A.dat" (bitcoin-lisp.crypto:bytes-to-hex
+                                                               (nth 4 block-hashes)))
+                                         undo-dir)))))
+             ;; Default horizon = the chainstate's own pruned-height (5).
+             (is (= 2 (bitcoin-lisp.validation:prune-stale-undo-files chain-state)))
+             (is (null (probe-file (merge-pathnames
+                                    (format nil "~A.dat" (bitcoin-lisp.crypto:bytes-to-hex
+                                                          (nth 5 block-hashes)))
+                                    undo-dir)))))
+        (cleanup-test-dir base-path)))))

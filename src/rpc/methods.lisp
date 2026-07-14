@@ -102,10 +102,13 @@ for a snapshot chainstate, and validated reflects its assumeutxo status."
       ("difficulty" . ,(%difficulty-from-bits bits))
       ;; Consistent with getblockchaininfo: 1.0 at tip, 0.0 while syncing.
       ("verificationprogress" . ,(if syncing 0.0d0 1.0d0))
-      ;; We don't split a coinsdb vs coinstip cache; report the in-memory
-      ;; coins-cache budget for the tip cache and 0 for the db cache.
+      ;; We don't split a coinsdb vs coinstip cache; report the chainstate's
+      ;; coins-cache budget (per-chainstate while an assumeutxo background
+      ;; sync splits it — Core MaybeRebalanceCaches) for the tip cache and 0
+      ;; for the db cache.
       ("coins_db_cache_bytes" . 0)
-      ("coins_tip_cache_bytes" . ,bitcoin-lisp::*coins-cache-budget-bytes*)
+      ("coins_tip_cache_bytes" . ,(bitcoin-lisp::chainstate-coins-cache-budget
+                                   chain-state))
       ,@(when snapshot-hash
           `(("snapshot_blockhash" . ,(hash-to-hex snapshot-hash))))
       ("validated" . ,(eq (bitcoin-lisp.storage:chain-state-assumeutxo-status
@@ -1221,21 +1224,27 @@ was never added). Returns an array of {addednode, connected, addresses}."
                                                            "inbound" "outbound")))))))))
        added))))
 
+(defun %set-network-active (node state)
+  "Flip the node's network-active flag (Core CConnman::SetNetworkActive).
+When disabling, mark current peers disconnected (close socket + set state) —
+Core's socket thread does the same as a consequence of the cleared flag
+(net.cpp DisconnectNodes); the sync thread reaps them from node-peers,
+keeping it single-writer. Shared by setnetworkactive and dumptxoutset's
+rollback-time NetworkDisable. Returns STATE."
+  (setf (bitcoin-lisp::node-network-active node) state)
+  (unless state
+    (dolist (peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                    (copy-list (bitcoin-lisp::node-peers node))))
+      (ignore-errors (bitcoin-lisp.networking:disconnect-peer peer))))
+  state)
+
 (defun rpc-setnetworkactive (node params)
   "Enable or disable all P2P network activity (Bitcoin Core setnetworkactive).
 PARAMS: (state). Disabling drops all current peers and stops new inbound/outbound
 connections until re-enabled. Returns the new state."
   (when (endp params)
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "state is required"))
-  (let ((state (and (first params) t)))
-    (setf (bitcoin-lisp::node-network-active node) state)
-    (unless state
-      ;; Mark current peers disconnected (close socket + set state). The sync
-      ;; thread reaps them from node-peers, keeping it single-writer.
-      (dolist (peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                      (copy-list (bitcoin-lisp::node-peers node))))
-        (ignore-errors (bitcoin-lisp.networking:disconnect-peer peer))))
-    state))
+  (%set-network-active node (and (first params) t)))
 
 (defun rpc-getblockfrompeer (node params)
   "Request block BLOCKHASH from the connected peer with id PEER-ID (Bitcoin Core
@@ -1514,99 +1523,234 @@ CBlockIndex::m_chain_tx_count), or NIL when any block's count is unknown
     ;; The walk fell off a prev-entry link before reaching genesis.
     nil))
 
+(defun %parse-hash-or-height-entry (chain-state param)
+  "Resolve PARAM — a non-negative block height or a block-hash hex string —
+to a block-index entry (Core ParseHashOrHeight, rpc/blockchain.cpp:126-152):
+heights resolve on the ACTIVE chain and must not exceed the tip; hashes
+resolve through the shared block index."
+  (cond
+    ((integerp param)
+     (when (minusp param)
+       (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message (format nil "Target block height ~D is negative" param)))
+     (let ((tip-height (bitcoin-lisp.storage:current-height chain-state)))
+       (when (> param tip-height)
+         (error 'rpc-error :code +rpc-invalid-parameter+
+                           :message (format nil "Target block height ~D after current tip ~D"
+                                            param tip-height))))
+     (or (bitcoin-lisp.storage:get-block-at-height chain-state param)
+         (error 'rpc-error :code +rpc-invalid-address-or-key+
+                           :message "Block not found")))
+    ((and (stringp param) (valid-hex-hash-p param))
+     (or (bitcoin-lisp.storage:get-block-index-entry
+          chain-state (parse-hex-hash param))
+         (error 'rpc-error :code +rpc-invalid-address-or-key+
+                           :message "Block not found")))
+    (t
+     (error 'rpc-error :code +rpc-invalid-parameter+
+                       :message "rollback must be a block height or a block hash"))))
+
+(defun %dump-rollback-target-entry (node chain-state tip-entry type options)
+  "The block-index entry dumptxoutset should dump at (Core rpc/
+blockchain.cpp:3091-3110): an explicit options.rollback height/hash wins
+(the type, if given, must then be \"rollback\"); bare type \"rollback\"
+means the highest chainparams assumeutxo snapshot height
+(GetAvailableSnapshotHeights); \"latest\" means the current tip; anything
+else — including an omitted type — is refused."
+  (multiple-value-bind (rollback-param rollback-supplied)
+      (if (hash-table-p options)
+          (gethash "rollback" options)
+          (values nil nil))
+    (cond
+      (rollback-supplied
+       (unless (or (string= type "") (string= type "rollback"))
+         (error 'rpc-error :code +rpc-invalid-parameter+
+                           :message (format nil "Invalid snapshot type \"~A\" specified with rollback option" type)))
+       (%parse-hash-or-height-entry chain-state rollback-param))
+      ((string= type "rollback")
+       (let ((heights (mapcar #'bitcoin-lisp:assumeutxo-data-height
+                              (bitcoin-lisp:network-assumeutxo-data
+                               (rpc-get-network node)))))
+         (unless heights
+           (error 'rpc-error :code +rpc-misc-error+
+                             :message "No assumeutxo snapshot heights are available for this network"))
+         (%parse-hash-or-height-entry chain-state (reduce #'max heights))))
+      ((string= type "latest") tip-entry)
+      (t
+       (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message (format nil "Invalid snapshot type \"~A\" specified. Please specify \"rollback\" or \"latest\"" type))))))
+
+(defun %dump-txoutset-with-rollback (node chain-state target-entry path)
+  "Temporarily roll the active chain back to TARGET-ENTRY, dump the UTXO set
+at that height, and restore (Core dumptxoutset's NetworkDisable +
+TemporaryRollback RAII pair, rpc/blockchain.cpp:3010-3045,3136-3196): network
+activity is suspended so peers aren't punished for relaying data that only
+looks wrong in the rolled-back state; the rollback is invalidateblock on the
+active chain's block after the target, always undone with reconsiderblock in
+reverse RAII order (rollback restored first, then the network re-enabled)."
+  (let ((target-height (bitcoin-lisp.storage:block-index-entry-height target-entry))
+        (target-hash (bitcoin-lisp.storage:block-index-entry-hash target-entry)))
+    ;; A hash-resolved target must lie on the active chain — Core takes
+    ;; ActiveChain().Next(target), which has no answer off-chain.
+    (unless (eq (bitcoin-lisp.storage:get-block-at-height chain-state target-height)
+                target-entry)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Block is not in the active chain"))
+    ;; Pruned node: rolling back needs every block in (target, tip] (and its
+    ;; undo) still on disk to disconnect down and reconnect afterwards (Core
+    ;; checks GetFirstBlock(BLOCK_HAVE_MASK) <= target, rpc/blockchain.cpp:
+    ;; 3139-3149). Our pruned horizon is the pruned-height cursor.
+    (when (and (bitcoin-lisp:pruning-enabled-p)
+               (<= target-height
+                   (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))
+      (error 'rpc-error :code +rpc-misc-error+
+                        :message "Could not roll back to requested height since necessary block data is already pruned."))
+    (let ((invalidate-hash
+            (bitcoin-lisp.storage:block-index-entry-hash
+             (bitcoin-lisp.storage:get-block-at-height
+              chain-state (1+ target-height))))
+          (block-store (rpc-get-block-store node))
+          (utxo-set (rpc-get-utxo-set node))
+          (mempool (rpc-get-mempool node))
+          (tx-index (rpc-get-tx-index node))
+          (was-active (bitcoin-lisp::node-network-active node)))
+      ;; NetworkDisable: skipped when the network is already off, so we don't
+      ;; re-enable it behind the user's back at the end.
+      (when was-active
+        (%set-network-active node nil))
+      (unwind-protect
+           (unwind-protect
+                (progn
+                  (multiple-value-bind (ok reason)
+                      (bitcoin-lisp.validation:invalidate-block
+                       chain-state block-store utxo-set invalidate-hash
+                       :mempool mempool :tx-index tx-index)
+                    (unless ok
+                      (error 'rpc-error :code +rpc-misc-error+
+                                        :message (format nil "Could not roll back to requested height. (~A)"
+                                                         (string-downcase (symbol-name reason))))))
+                  ;; The new tip must be the target: a block-read failure or a
+                  ;; stale equal-work sister of the invalidated block would
+                  ;; land elsewhere (Core rpc/blockchain.cpp:3178-3187).
+                  (unless (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                                  target-hash)
+                    (error 'rpc-error :code +rpc-misc-error+
+                                      :message "Could not roll back to requested height."))
+                  (%write-utxo-snapshot node chain-state utxo-set path))
+             ;; ~TemporaryRollback: always reconsider, even on error —
+             ;; harmless if the invalidation never took effect.
+             (bitcoin-lisp.validation:reconsider-block
+              chain-state block-store utxo-set invalidate-hash
+              :mempool mempool :tx-index tx-index))
+        ;; ~NetworkDisable (runs after the rollback is undone, like Core's
+        ;; reverse member-destruction order).
+        (when was-active
+          (%set-network-active node t))))))
+
 (defun rpc-dumptxoutset (node params)
   "Write the UTXO set to PATH in Bitcoin Core's snapshot v2 format
-(dumptxoutset, rpc/blockchain.cpp:3052-3323). PARAMS: (path [type]) — only
-type \"latest\" (dump at the current tip) is supported; \"rollback\" needs
-the historical-chainstate rollback we don't have yet. Like gettxoutsetinfo
-this forces a coins-cache flush, then streams coins in cursor order while
-accumulating hash_serialized_3 over the same pass. Writes to PATH.incomplete
-and renames on completion. nchaintx is omitted when some block's tx count is
-unknown (header-only/pruned ancestors; Core reports its cached nChainTx)."
+(dumptxoutset, rpc/blockchain.cpp:3052-3323). PARAMS: (path [type]
+[options]) — type \"latest\" dumps at the current tip; \"rollback\" (or an
+options object {\"rollback\": height-or-hash}) temporarily rolls the active
+chain back to a historical block (network suspended for the duration, then
+restored) and dumps the historical UTXO set, defaulting to the highest
+chainparams assumeutxo snapshot height. Like gettxoutsetinfo this forces a
+coins-cache flush, then streams coins in cursor order while accumulating
+hash_serialized_3 over the same pass. Writes to PATH.incomplete and renames
+on completion. nchaintx is omitted when some block's tx count is unknown
+(header-only/pruned ancestors; Core reports its cached nChainTx)."
   (let ((path (first params))
-        (type (if (stringp (second params)) (second params) "")))
+        (type (if (stringp (second params)) (second params) ""))
+        (options (third params)))
     (unless (and (stringp path) (plusp (length path)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
-    (cond ((string= type "latest"))
-          ((string= type "rollback")
-           (error 'rpc-error :code +rpc-invalid-parameter+
-                             :message "Snapshot type \"rollback\" is not supported (single chainstate); use \"latest\" to dump at the current tip"))
-          (t
-           (error 'rpc-error :code +rpc-invalid-parameter+
-                             :message (format nil "Invalid snapshot type \"~A\" specified. Please specify \"rollback\" or \"latest\"" type))))
-    (when (probe-file path)
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message (format nil "~A already exists. If you are sure this is what you want, move it out of the way first" path)))
     (let* ((chain-state (rpc-get-chain-state node))
-           (utxo-set (rpc-get-utxo-set node))
-           (base-hash (or (bitcoin-lisp.storage:best-block-hash chain-state)
-                          (error 'rpc-error :code +rpc-misc-error+
-                                            :message "Chain has no tip")))
-           (base-height (bitcoin-lisp.storage:current-height chain-state))
-           (base-entry (bitcoin-lisp.storage:get-block-index-entry chain-state base-hash))
-           (temppath (concatenate 'string path ".incomplete"))
-           (digest (ironclad:make-digest :sha256))
-           (count 0)
-           (renamed nil))
-      (unwind-protect
-           (progn
-             (with-open-file (out temppath :direction :output :if-exists :supersede
-                                           :element-type '(unsigned-byte 8))
-               ;; SnapshotMetadata (node/utxo_snapshot.h:63-70); the coin
-               ;; count is back-patched after the streaming pass.
-               (write-sequence +snapshot-magic-bytes+ out)
-               (bitcoin-lisp.serialization:write-uint16-le out +snapshot-version+)
-               (write-sequence (bitcoin-lisp:network-magic (rpc-get-network node)) out)
-               (write-sequence base-hash out)
-               (bitcoin-lisp.serialization:write-uint64-le out 0)
-               ;; Coins grouped per txid (WriteUTXOSnapshot, rpc/
-               ;; blockchain.cpp:3246-3308). utxo-set-iterate's cursor
-               ;; order contract makes groups contiguous and vouts
-               ;; ascending; the same pass feeds hash_serialized_3.
-               (let ((group-txid nil)
-                     (group '()))
-                 (flet ((flush-group ()
-                          (when group
-                            (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
-                              (bitcoin-lisp.serialization:bb-write-bytes buf group-txid)
-                              (bitcoin-lisp.serialization:bb-write-varint buf (length group))
-                              (dolist (pair (nreverse group))
-                                (let ((vout (car pair))
-                                      (entry (cdr pair)))
-                                  (bitcoin-lisp.serialization:bb-write-varint buf vout)
-                                  (bitcoin-lisp.serialization:bb-write-compressed-coin
-                                   buf
-                                   (bitcoin-lisp.storage:utxo-entry-height entry)
-                                   (bitcoin-lisp.storage:utxo-entry-coinbase entry)
-                                   (bitcoin-lisp.storage:utxo-entry-value entry)
-                                   (bitcoin-lisp.storage:utxo-entry-script-pubkey entry))))
-                              (write-sequence (bitcoin-lisp.serialization:bb-finish buf) out))
-                            (setf group '()))))
-                   (bitcoin-lisp.storage:utxo-set-iterate
-                    utxo-set
-                    (lambda (txid vout entry)
-                      (unless (and group-txid (equalp txid group-txid))
-                        (flush-group)
-                        (setf group-txid txid))
-                      (push (cons vout entry) group)
-                      (ironclad:update-digest
-                       digest (bitcoin-lisp.storage:coin-muhash-element* txid vout entry))
-                      (incf count)))
-                   (flush-group)))
-               (file-position out +snapshot-count-offset+)
-               (bitcoin-lisp.serialization:write-uint64-le out count))
-             (rename-file temppath path)
-             (setf renamed t))
-        (unless renamed (ignore-errors (delete-file temppath))))
-      (let ((hash (bitcoin-lisp.crypto:sha256 (ironclad:produce-digest digest)))
-            (nchaintx (and base-entry
-                           (%chain-tx-count base-entry (rpc-get-block-store node)))))
-        `(("coins_written" . ,count)
-          ("base_hash" . ,(hash-to-hex base-hash))
-          ("base_height" . ,base-height)
-          ("path" . ,(namestring (truename path)))
-          ("txoutset_hash" . ,(hash-to-hex hash))
-          ,@(when nchaintx `(("nchaintx" . ,nchaintx))))))))
+           (tip-hash (or (bitcoin-lisp.storage:best-block-hash chain-state)
+                         (error 'rpc-error :code +rpc-misc-error+
+                                           :message "Chain has no tip")))
+           (tip-entry (bitcoin-lisp.storage:get-block-index-entry
+                       chain-state tip-hash))
+           (target-entry (%dump-rollback-target-entry
+                          node chain-state tip-entry type options)))
+      (when (probe-file path)
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "~A already exists. If you are sure this is what you want, move it out of the way first" path)))
+      ;; Dumping at the current tip needs no rollback at all (Core
+      ;; rpc/blockchain.cpp:3136-3138).
+      (if (eq target-entry tip-entry)
+          (%write-utxo-snapshot node chain-state (rpc-get-utxo-set node) path)
+          (%dump-txoutset-with-rollback node chain-state target-entry path)))))
+
+(defun %write-utxo-snapshot (node chain-state utxo-set path)
+  "Stream CHAIN-STATE's UTXO set to PATH in snapshot v2 format at its
+current tip (Core PrepareUTXOSnapshot + WriteUTXOSnapshot, rpc/
+blockchain.cpp:3208-3323) and return dumptxoutset's result alist."
+  (let* ((base-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (base-height (bitcoin-lisp.storage:current-height chain-state))
+         (base-entry (bitcoin-lisp.storage:get-block-index-entry chain-state base-hash))
+         (temppath (concatenate 'string path ".incomplete"))
+         (digest (ironclad:make-digest :sha256))
+         (count 0)
+         (renamed nil))
+    (unwind-protect
+         (progn
+           (with-open-file (out temppath :direction :output :if-exists :supersede
+                                         :element-type '(unsigned-byte 8))
+             ;; SnapshotMetadata (node/utxo_snapshot.h:63-70); the coin
+             ;; count is back-patched after the streaming pass.
+             (write-sequence +snapshot-magic-bytes+ out)
+             (bitcoin-lisp.serialization:write-uint16-le out +snapshot-version+)
+             (write-sequence (bitcoin-lisp:network-magic (rpc-get-network node)) out)
+             (write-sequence base-hash out)
+             (bitcoin-lisp.serialization:write-uint64-le out 0)
+             ;; Coins grouped per txid (WriteUTXOSnapshot, rpc/
+             ;; blockchain.cpp:3246-3308). utxo-set-iterate's cursor
+             ;; order contract makes groups contiguous and vouts
+             ;; ascending; the same pass feeds hash_serialized_3.
+             (let ((group-txid nil)
+                   (group '()))
+               (flet ((flush-group ()
+                        (when group
+                          (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
+                            (bitcoin-lisp.serialization:bb-write-bytes buf group-txid)
+                            (bitcoin-lisp.serialization:bb-write-varint buf (length group))
+                            (dolist (pair (nreverse group))
+                              (let ((vout (car pair))
+                                    (entry (cdr pair)))
+                                (bitcoin-lisp.serialization:bb-write-varint buf vout)
+                                (bitcoin-lisp.serialization:bb-write-compressed-coin
+                                 buf
+                                 (bitcoin-lisp.storage:utxo-entry-height entry)
+                                 (bitcoin-lisp.storage:utxo-entry-coinbase entry)
+                                 (bitcoin-lisp.storage:utxo-entry-value entry)
+                                 (bitcoin-lisp.storage:utxo-entry-script-pubkey entry))))
+                            (write-sequence (bitcoin-lisp.serialization:bb-finish buf) out))
+                          (setf group '()))))
+                 (bitcoin-lisp.storage:utxo-set-iterate
+                  utxo-set
+                  (lambda (txid vout entry)
+                    (unless (and group-txid (equalp txid group-txid))
+                      (flush-group)
+                      (setf group-txid txid))
+                    (push (cons vout entry) group)
+                    (ironclad:update-digest
+                     digest (bitcoin-lisp.storage:coin-muhash-element* txid vout entry))
+                    (incf count)))
+                 (flush-group)))
+             (file-position out +snapshot-count-offset+)
+             (bitcoin-lisp.serialization:write-uint64-le out count))
+           (rename-file temppath path)
+           (setf renamed t))
+      (unless renamed (ignore-errors (delete-file temppath))))
+    (let ((hash (bitcoin-lisp.crypto:sha256 (ironclad:produce-digest digest)))
+          (nchaintx (and base-entry
+                         (%chain-tx-count base-entry (rpc-get-block-store node)))))
+      `(("coins_written" . ,count)
+        ("base_hash" . ,(hash-to-hex base-hash))
+        ("base_height" . ,base-height)
+        ("path" . ,(namestring (truename path)))
+        ("txoutset_hash" . ,(hash-to-hex hash))
+        ,@(when nchaintx `(("nchaintx" . ,nchaintx)))))))
 
 (defun %read-snapshot-metadata (in network)
   "Read and validate a snapshot file's SnapshotMetadata against NETWORK
@@ -1768,8 +1912,11 @@ Core's faked m_chain_tx_count (validation.cpp:5966).
 
 The sync thread is paused for the duration (our stand-in for Core holding
 cs_main), so the chainstates list never changes under a running IBD pass.
-Deliberate P4 restriction: refused on a pruned node (Core supports it via
-per-chainstate prune floors — a later assumeutxo phase)."
+Pruned nodes are supported (P6): the snapshot chainstate's per-chainstate
+prune floor (chain-state-prune-floor — Core Chainstate::GetPruneRange) keeps
+every block at or below the base on disk until background validation
+completes, and the automatic prune target is halved while the historical
+chainstate exists (effective-prune-target-bytes)."
   (let ((path (first params)))
     (unless (and (stringp path) (plusp (length path)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
@@ -1837,8 +1984,6 @@ per-chainstate prune floors — a later assumeutxo phase)."
                                 base-height)))
                 (when (and mempool (plusp (bitcoin-lisp.mempool:mempool-count mempool)))
                   (load-error "Can't activate a snapshot when mempool not empty"))
-                (when (bitcoin-lisp:pruning-enabled-p)
-                  (load-error "Snapshot activation on a pruned node is not supported yet (assumeutxo prune handling is a later phase)"))
                 ;; --- Populate + verify into a NEW snapshot chainstate ---
                 ;; (see %populate-snapshot-chainstate). Any failure leaves
                 ;; the node untouched.
