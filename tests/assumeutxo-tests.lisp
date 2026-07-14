@@ -465,3 +465,243 @@ sync in progress)."
       (is (null (cdr (assoc "validated" cur-entry :test #'string=))))
       (is (string= (bitcoin-lisp.rpc::hash-to-hex base-hash)
                    (cdr (assoc "snapshot_blockhash" cur-entry :test #'string=)))))))
+
+;;;; P5: background-validation completion + promotion
+;;;;
+;;;; MaybeValidateSnapshot (Core validation.cpp:5986-6096) at the connect-tip
+;;;; hook and at startup, the INVALID/fatal path, and the startup
+;;;; ValidatedSnapshotCleanup dir swap (validation.cpp:6299-6364).
+
+(defun %snap-validation-fixture (dir)
+  "Build the shared dual-chainstate setup for the P5 invalid-snapshot tests: a
+historical (validated-from-genesis) chainstate sitting on the snapshot base
+(h5) with a known in-memory 1-coin UTXO set, and a snapshot chainstate whose
+coins live in a REAL LevelDB at chainstate_snapshot/ so the rename-aside /
+dir-swap paths run against a genuine open+closed DB. Returns
+(values node historical snap base-hash); the caller binds *node* and commits
+the assumeutxo-data-override hash."
+  (let* ((base-hash (%au-hash 5))
+         (g (%au-entry (%au-hash 0) 0 nil :status :valid :chain-work 1))
+         (e5 (%au-entry base-hash 5 g :status :valid :chain-work 500))
+         (historical (bitcoin-lisp.storage:make-chain-state
+                      :base-path (pathname dir)
+                      :best-block-hash base-hash :best-height 5))
+         (snap-dir (namestring (ensure-directories-exist
+                                (merge-pathnames "chainstate_snapshot/" dir))))
+         (snap (bitcoin-lisp.storage:make-chain-state
+                :base-path (pathname dir)
+                :best-block-hash base-hash :best-height 5
+                :block-index (bitcoin-lisp.storage::chain-state-block-index historical)
+                :from-snapshot-blockhash base-hash
+                :assumeutxo-status :unvalidated
+                :storage-suffix "_snapshot"))
+         (node (bitcoin-lisp::make-node :network :testnet3))
+         (hv (bitcoin-lisp.storage:make-utxo-set)))
+    (setf (bitcoin-lisp::node-data-directory node) (pathname dir))
+    (dolist (e (list g e5))
+      (bitcoin-lisp.storage:add-block-index-entry historical e))
+    (bitcoin-lisp.storage:add-utxo hv (%snap-fill 32 #x44) 0 1000 (%snap-cat #(#x51)) 1)
+    (setf (bitcoin-lisp.storage:chain-state-coins-view historical) hv
+          (bitcoin-lisp.storage:chain-state-coins-view snap)
+          (bitcoin-lisp.storage:make-coins-view-cache
+           (bitcoin-lisp.storage:open-coins-view-db snap-dir))
+          (bitcoin-lisp::node-chainstates node) (list historical snap))
+    (bitcoin-lisp.storage:set-chainstate-target historical e5)
+    (values node historical snap base-hash)))
+
+(test assumeutxo-maybe-validate-snapshot-promotes
+  "maybe-validate-snapshot at the connect-tip hook: when the historical
+chainstate reaches the snapshot base and its UTXO set re-hashes to the
+committed hash_serialized_3, the snapshot chainstate is promoted to VALIDATED,
+the historical records its target-utxohash (so it is no longer selected as the
+historical chainstate), services regain NODE_NETWORK, and getchainstates
+reports a single validated current chainstate (Core MaybeValidateSnapshot
+SUCCESS, validation.cpp:6088-6095). A second call is a no-op."
+  (%with-snap-dir (dir)
+    (let* ((base-hash (%au-hash 5))
+           (txid (%snap-fill 32 #x44))
+           (spk (%snap-cat #(#x51)))
+           (g (%au-entry (%au-hash 0) 0 nil :status :valid :chain-work 1))
+           (e5 (%au-entry base-hash 5 g :status :valid :chain-work 500))
+           (e6 (%au-entry (%au-hash 6) 6 e5 :chain-work 600))
+           (historical (bitcoin-lisp.storage:make-chain-state
+                        :base-path (pathname dir)
+                        :best-block-hash base-hash :best-height 5))
+           (snap (bitcoin-lisp.storage:make-chain-state
+                  :base-path (pathname dir)
+                  :best-block-hash (%au-hash 6) :best-height 6
+                  :block-index (bitcoin-lisp.storage::chain-state-block-index historical)
+                  :from-snapshot-blockhash base-hash
+                  :assumeutxo-status :unvalidated
+                  :storage-suffix "_snapshot"))
+           (node (bitcoin-lisp::make-node :network :testnet3))
+           (bitcoin-lisp::*node* node)
+           (bitcoin-lisp::*prune-target-mib* nil))
+      (dolist (e (list g e5 e6))
+        (bitcoin-lisp.storage:add-block-index-entry historical e))
+      (let ((hv (bitcoin-lisp.storage:make-utxo-set)))
+        (bitcoin-lisp.storage:add-utxo hv txid 0 1000 spk 1)
+        (setf (bitcoin-lisp.storage:chain-state-coins-view historical) hv))
+      (setf (bitcoin-lisp.storage:chain-state-coins-view snap)
+            (bitcoin-lisp.storage:make-utxo-set)
+            (bitcoin-lisp::node-chainstates node) (list historical snap))
+      ;; Retarget the historical at the base (it becomes the historical cs).
+      (bitcoin-lisp.storage:set-chainstate-target historical e5)
+      (is (eq historical (bitcoin-lisp::node-historical-chainstate node)))
+      (is (eq snap (bitcoin-lisp::node-current-chainstate node)))
+      ;; While background validation is in progress, NODE_NETWORK is dropped.
+      (is (not (logtest (bitcoin-lisp.networking::local-services)
+                        bitcoin-lisp.serialization:+node-network+)))
+      ;; Commit the historical's real hash and run the completion hook.
+      (let* ((hash (bitcoin-lisp.storage:compute-utxo-set-hash
+                    (bitcoin-lisp.storage:chain-state-coins-view historical)))
+             (bitcoin-lisp:*assumeutxo-data-override*
+               (list (%snap-au 5 base-hash hash 7))))
+        (is (eq :success (bitcoin-lisp::maybe-validate-snapshot historical)))
+        ;; Idempotent: the snapshot is already validated now.
+        (is (eq :skipped (bitcoin-lisp::maybe-validate-snapshot historical))))
+      ;; Snapshot chainstate promoted; historical marked done.
+      (is (eq :validated (bitcoin-lisp.storage:chain-state-assumeutxo-status snap)))
+      (is (not (null (bitcoin-lisp.storage:chain-state-target-utxohash historical))))
+      ;; No historical chainstate remains; the snapshot cs is now validated.
+      (is (null (bitcoin-lisp::node-historical-chainstate node)))
+      (is (eq snap (bitcoin-lisp::node-current-chainstate node)))
+      (is (eq snap (bitcoin-lisp::node-validated-chainstate node)))
+      ;; Services regain NODE_NETWORK (unpruned + no historical chainstate).
+      (is (logtest (bitcoin-lisp.networking::local-services)
+                   bitcoin-lisp.serialization:+node-network+))
+      ;; getchainstates now reports a single validated chainstate.
+      (let* ((r (bitcoin-lisp.rpc::rpc-getchainstates node nil))
+             (entries (cdr (assoc "chainstates" r :test #'string=))))
+        (is (= 1 (length entries)))
+        (is (eq t (cdr (assoc "validated" (first entries) :test #'string=))))))))
+
+(test assumeutxo-maybe-validate-snapshot-rejects-bad-hash
+  "A background chainstate whose UTXO set does NOT reproduce the committed
+hash_serialized_3 marks the snapshot chainstate :invalid, resets the
+historical chainstate's target back to the network tip, renames the snapshot
+LevelDB dir to chainstate_snapshot_INVALID for forensics, and fires the fatal
+shutdown decision (Core handle_invalid_snapshot + InvalidateCoinsDBOnDisk,
+validation.cpp:6006-6036). The decision path is exercised via a rebound
+*snapshot-fatal-hook* — no actual process exit."
+  (%with-snap-dir (dir)
+    (multiple-value-bind (node historical snap base-hash)
+        (%snap-validation-fixture dir)
+      (let ((bitcoin-lisp::*node* node)
+            (bitcoin-lisp::*prune-target-mib* nil)
+            (fatal-msg nil))
+        ;; Commit a DIFFERENT hash than the historical set actually produces.
+        (let ((bitcoin-lisp:*assumeutxo-data-override*
+                (list (%snap-au 5 base-hash (%au-hash #x99) 7)))
+              (bitcoin-lisp::*snapshot-fatal-hook*
+                (lambda (msg) (setf fatal-msg msg))))
+          (is (eq :hash-mismatch (bitcoin-lisp::maybe-validate-snapshot historical))))
+        ;; The fatal DECISION fired (message recorded) — but no process exit.
+        (is (not (null fatal-msg)))
+        (is (search "hash mismatch" fatal-msg))
+        ;; Snapshot chainstate marked invalid; historical target reset to tip.
+        (is (eq :invalid (bitcoin-lisp.storage:chain-state-assumeutxo-status snap)))
+        (is (null (bitcoin-lisp.storage:chain-state-target-blockhash historical)))
+        ;; Reverts to the validated chain: no historical; current = historical.
+        (is (null (bitcoin-lisp::node-historical-chainstate node)))
+        (is (eq historical (bitcoin-lisp::node-current-chainstate node)))
+        ;; Coins dir renamed aside for forensics; the original name is gone.
+        (is (null (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir dir)))
+        (is (not (null (probe-file (merge-pathnames "chainstate_snapshot_INVALID/" dir)))))))))
+
+(test assumeutxo-validated-snapshot-cleanup-startup
+  "Startup ValidatedSnapshotCleanup (Core validation.cpp:6299-6364): when a
+persisted historical chainstate has already reached the snapshot base,
+finalize-snapshot-validation-at-startup re-proves the hash and swaps the
+LevelDB dirs — chainstate_snapshot/ becomes chainstate/, the old background
+chainstate is deleted — leaving the node with a single fully-validated
+chainstate whose coins view is the (formerly snapshot) promoted set."
+  (%with-snap-dir (dir)
+    (let* ((base-hash (%au-hash 5))
+           (txid-h (%snap-fill 32 #x11))     ; only in the background chainstate
+           (txid-s (%snap-fill 32 #x22))     ; only in the snapshot chainstate
+           (spk (%snap-cat #(#x51)))
+           (g (%au-entry (%au-hash 0) 0 nil :status :valid :chain-work 1))
+           (e5 (%au-entry base-hash 5 g :status :valid :chain-work 500))
+           (cs-dir (namestring (ensure-directories-exist
+                                (merge-pathnames "chainstate/" dir))))
+           (snap-dir (namestring (ensure-directories-exist
+                                  (merge-pathnames "chainstate_snapshot/" dir))))
+           (historical (bitcoin-lisp.storage:make-chain-state
+                        :base-path (pathname dir)
+                        :best-block-hash base-hash :best-height 5))
+           (snap (bitcoin-lisp.storage:make-chain-state
+                  :base-path (pathname dir)
+                  :best-block-hash base-hash :best-height 5
+                  :block-index (bitcoin-lisp.storage::chain-state-block-index historical)
+                  :from-snapshot-blockhash base-hash
+                  :assumeutxo-status :unvalidated
+                  :storage-suffix "_snapshot"))
+           (node (bitcoin-lisp::make-node :network :testnet3))
+           (bitcoin-lisp::*node* node)
+           (bitcoin-lisp::*prune-target-mib* nil))
+      (setf (bitcoin-lisp::node-data-directory node) (pathname dir))
+      (dolist (e (list g e5))
+        (bitcoin-lisp.storage:add-block-index-entry historical e))
+      ;; Background chainstate coins at chainstate/ (its hash is committed).
+      (let ((hv (bitcoin-lisp.storage:make-coins-view-cache
+                 (bitcoin-lisp.storage:open-coins-view-db cs-dir))))
+        (bitcoin-lisp.storage:add-utxo hv txid-h 0 1000 spk 1)
+        (bitcoin-lisp.storage:coins-view-cache-flush hv)
+        (setf (bitcoin-lisp.storage:chain-state-coins-view historical) hv))
+      ;; Snapshot chainstate coins at chainstate_snapshot/ (a DISTINCT set, so
+      ;; we can prove the dir physically moved into place).
+      (let ((sv (bitcoin-lisp.storage:make-coins-view-cache
+                 (bitcoin-lisp.storage:open-coins-view-db snap-dir))))
+        (bitcoin-lisp.storage:add-utxo sv txid-s 0 2000 spk 1)
+        (bitcoin-lisp.storage:coins-view-cache-flush sv)
+        (setf (bitcoin-lisp.storage:chain-state-coins-view snap) sv))
+      (bitcoin-lisp.storage:write-snapshot-base-blockhash snap)
+      (bitcoin-lisp.storage:save-state historical)
+      (bitcoin-lisp.storage:save-state snap)
+      (setf (bitcoin-lisp::node-chainstates node) (list historical snap))
+      (bitcoin-lisp.storage:set-chainstate-target historical e5)
+      (let* ((hash (bitcoin-lisp.storage:compute-utxo-set-hash
+                    (bitcoin-lisp.storage:chain-state-coins-view historical)))
+             (bitcoin-lisp:*assumeutxo-data-override*
+               (list (%snap-au 5 base-hash hash 7))))
+        (is (eq :success (bitcoin-lisp::finalize-snapshot-validation-at-startup node))))
+      ;; A single fully-validated chainstate remains.
+      (is (= 1 (length (bitcoin-lisp::node-chainstates node))))
+      (is (null (bitcoin-lisp::node-historical-chainstate node)))
+      (let ((cs (bitcoin-lisp::node-current-chainstate node)))
+        (is (string= "" (bitcoin-lisp.storage:chain-state-storage-suffix cs)))
+        (is (null (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash cs)))
+        (is (null (bitcoin-lisp.storage:chain-state-target-blockhash cs)))
+        (is (eq :validated (bitcoin-lisp.storage:chain-state-assumeutxo-status cs)))
+        (is (eq cs (bitcoin-lisp::node-validated-chainstate node)))
+        ;; The promoted coins view is the (formerly snapshot) set at chainstate/.
+        (let ((s (bitcoin-lisp.storage:get-utxo
+                  (bitcoin-lisp.storage:chain-state-coins-view cs) txid-s 0))
+              (h (bitcoin-lisp.storage:get-utxo
+                  (bitcoin-lisp.storage:chain-state-coins-view cs) txid-h 0)))
+          (is (and s (= 2000 (bitcoin-lisp.storage:utxo-entry-value s))))
+          (is (null h)))
+        ;; On-disk: snapshot dir consumed, default dir present, marker gone.
+        (is (null (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir dir)))
+        (is (not (null (probe-file (merge-pathnames "chainstate/" dir)))))
+        (is (null (probe-file (merge-pathnames "chainstate_snapshot.dat" dir))))
+        (is (not (null (probe-file (merge-pathnames "chainstate.dat" dir)))))
+        (bitcoin-lisp.storage:close-chainstate-coins-view cs)))))
+
+(test assumeutxo-finalize-startup-aborts-on-bad-hash
+  "At startup a persisted historical chainstate that reached the base but
+whose UTXO set fails the commitment aborts node startup (Core FAILURE_FATAL,
+node/chainstate.cpp:231-235) and still renames the snapshot dir aside."
+  (%with-snap-dir (dir)
+    (multiple-value-bind (node historical snap base-hash)
+        (%snap-validation-fixture dir)
+      (declare (ignore historical))
+      (let ((bitcoin-lisp::*node* node)
+            (bitcoin-lisp::*prune-target-mib* nil))
+        (let ((bitcoin-lisp:*assumeutxo-data-override*
+                (list (%snap-au 5 base-hash (%au-hash #x99) 7))))
+          (signals error (bitcoin-lisp::finalize-snapshot-validation-at-startup node)))
+        (is (eq :invalid (bitcoin-lisp.storage:chain-state-assumeutxo-status snap)))
+        (is (null (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir dir)))
+        (is (not (null (probe-file (merge-pathnames "chainstate_snapshot_INVALID/" dir)))))))))
