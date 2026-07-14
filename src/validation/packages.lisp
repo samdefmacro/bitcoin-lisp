@@ -8,11 +8,19 @@
 ;;; Bitcoin Core's ProcessNewPackage -> AcceptPackage (validation.cpp) and the
 ;;; well-formedness/topology checks in policy/packages.cpp.
 ;;;
-;;; Scope vs Bitcoin Core: this targets the classic ancestor/descendant mempool
-;;; model the rest of this node uses. Individual-tx RBF inside a package works
-;;; (it flows through validate-transaction-for-mempool's BIP125 path), but
-;;; package RBF (Core's 1p1c PackageRBFChecks, which needs the child's fee to
-;;; pay for replacing a conflict) and BIP431 TRUC are deliberately out of scope.
+;;; Scope vs Bitcoin Core: individual-tx RBF inside a package flows through
+;;; validate-transaction-for-mempool's replacement path (single-tx subsets,
+;;; like Core's SingleInPackageAccept), and multi-tx subsets whose members
+;;; conflict with mempool transactions go through Core's package RBF
+;;; (PackageRBFChecks, validation.cpp:1034-1130): the subset must be exactly
+;;; 1-parent-1-child with NO in-mempool ancestors (resulting cluster <= 2),
+;;; pay the aggregate anti-DoS fees, strictly exceed the parent's feerate,
+;;; and strictly improve the feerate diagram with BOTH transactions staged
+;;; (check-package-rbf-rules, src/mempool/mempool.lisp). Core's
+;;; PackageTRUCChecks (in-package TRUC topology) remains out of scope; the
+;;; per-tx single-truc-checks still run, with sibling eviction disabled in
+;;; the multi-tx path exactly as Core disables it there (PackageChildWith-
+;;; Parents args, validation.cpp:516-527).
 
 ;;;; Constants (Bitcoin Core policy/packages.h)
 
@@ -160,11 +168,15 @@ real mempool."
 
 (defun %accept-into-mempool (tx txid fee height now mempool rset replaced)
   "Record the RBF-replaced txs in RSET into the REPLACED hash-set, then run
-the shared evict+add tail. Returns the mempool-add result keyword."
+the shared evict+add tail. Returns the mempool-add result keyword. The
+per-add byte-cap trim is deferred (Core package_submission,
+validation.cpp:1393): validate-package-for-mempool re-limits once at the
+end, like Core's AcceptPackage (validation.cpp:1728)."
   (dolist (rt rset)
     (setf (gethash rt replaced) t))
   (values (bitcoin-lisp.mempool:accept-validated-tx
-           mempool txid tx fee height :entry-time now :replaced rset)))
+           mempool txid tx fee height :entry-time now :replaced rset
+           :defer-trim t)))
 
 (defun %results-not-validated (package reason)
   "A not-validated result for every tx in PACKAGE — used when a context-free
@@ -177,48 +189,118 @@ package check fails before any tx is processed."
              :error reason))
           package))
 
+(defstruct (%pkg-val (:constructor %make-pkg-val
+                         (tx txid wtxid fee vsize rset modified-fee)))
+  "Validation record for one member of a package subset — the Lisp analogue
+of the per-tx Workspace fields Core's package layer reads back (m_ptx,
+m_base_fees, m_vsize, m_modified_fees, the replaced set)."
+  tx txid wtxid fee vsize rset modified-fee)
+
+(defun %package-rbf-checks (txns validated mempool conflicts)
+  "Core PackageRBFChecks (validation.cpp:1034-1130) for a multi-tx subset
+whose members CONFLICT with mempool transactions. TXNS/VALIDATED are the
+subset and its %PKG-VAL records; CONFLICTS the aggregated direct-conflict
+txids. Returns (values reason-or-NIL replaced-set): NIL reason = checks
+passed and REPLACED-SET (a txid hash-set) is what the package evicts."
+  (cond
+    ;; The replacement proposal must be exactly 1-parent-1-child
+    ;; (validation.cpp:1047-1050).
+    ((not (and (= 2 (length txns))
+               (package-child-with-parents-tree-p txns)))
+     (values :package-rbf-not-1p1c nil))
+    ;; Neither transaction may have in-mempool ancestors, keeping the
+    ;; resulting cluster <= 2 (validation.cpp:1052-1064).
+    ((some (lambda (tx) (bitcoin-lisp.mempool:mempool-find-parents mempool tx))
+           txns)
+     (values :package-rbf-mempool-ancestors nil))
+    (t
+     (destructuring-bind (parent child) validated
+       (multiple-value-bind (ok reason rset)
+           (bitcoin-lisp.mempool:check-package-rbf-rules
+            mempool (%pkg-val-modified-fee parent) (%pkg-val-vsize parent)
+            (%pkg-val-modified-fee child) (%pkg-val-vsize child) conflicts)
+         (if ok
+             (values nil rset)
+             (values reason nil)))))))
+
 (defun %accept-package-subset (txns utxo-set mempool height pkg-coins now results replaced)
   "Validate the deferred TXNS (topologically ordered) as a unit at the package
 feerate and, if they clear the mempool's effective minimum, submit them all
 parents-first. Updates the RESULTS table (wtxid -> package-tx-result) and the
-REPLACED hash-set. Returns :success or a failure reason keyword."
-  (let ((total-fee 0)
-        (total-vsize 0)
-        (validated '()))         ; (tx txid wtxid fee vsize rset), package order
+REPLACED hash-set. Returns :success or a failure reason keyword.
+
+A single-tx subset keeps single-transaction replacement semantics (per-tx
+RBF economics + TRUC sibling eviction, Core SingleInPackageAccept args,
+validation.cpp:530-541). A multi-tx subset defers all conflict handling to
+package RBF (%PACKAGE-RBF-CHECKS), with sibling eviction disabled, exactly
+as Core's AcceptMultipleTransactions does (validation.cpp:1513-1516)."
+  (let* ((package-eval (> (length txns) 1))
+         (total-fee 0)                  ; prioritisation-modified fees
+         (total-vsize 0)
+         (conflict-set (make-hash-table :test 'equalp))
+         (validated '()))               ; %PKG-VAL records, package order
     ;; Validate each with the per-tx fee floor skipped and the package's own
     ;; outputs available, so a child can spend a still-unconfirmed parent.
+    ;; Fee-based policy below runs on the returned MODIFIED fee, like Core's
+    ;; m_total_modified_fees (validation.cpp:1496-1499).
     (dolist (tx txns)
       (let ((wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
-        (multiple-value-bind (valid err fee rset)
+        (multiple-value-bind (valid err fee rset modified-fee conflicts)
             (validate-transaction-for-mempool tx utxo-set mempool height
                                               :package-coins pkg-coins
-                                              :skip-fee-check t)
+                                              :skip-fee-check t
+                                              :skip-rbf-check package-eval)
           (unless valid
             (%mark-result-invalid (gethash wtxid results) err)
             (return-from %accept-package-subset err))
-          (let ((vsize (bitcoin-lisp.serialization:transaction-vsize tx)))
-            (incf total-fee (or fee 0))
-            (incf total-vsize vsize)
-            (push (list tx (bitcoin-lisp.serialization:transaction-hash tx)
-                        wtxid (or fee 0) vsize rset)
-                  validated)))))
+          (when package-eval
+            (dolist (c conflicts) (setf (gethash c conflict-set) t)))
+          (incf total-fee modified-fee)
+          (incf total-vsize (bitcoin-lisp.serialization:transaction-vsize tx))
+          (push (%make-pkg-val tx (bitcoin-lisp.serialization:transaction-hash tx)
+                               wtxid (or fee 0)
+                               (bitcoin-lisp.serialization:transaction-vsize tx)
+                               rset modified-fee)
+                validated))))
     (setf validated (nreverse validated))
-    ;; Package feerate must clear the mempool's effective minimum (sat/kvB):
-    ;; fee*1000 vs rate*vsize, exact integer math.
-    (let ((pkg-feerate (if (zerop total-vsize) 0 (/ total-fee total-vsize)))
-          (min-fee (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
-          (includes (mapcar #'third validated)))   ; the wtxid of each member
-      (when (< (* total-fee 1000) (* min-fee (max total-vsize 1)))
-        (dolist (v validated)
-          (%mark-result-invalid (gethash (third v) results) :insufficient-fee))
-        (return-from %accept-package-subset :insufficient-fee))
-      ;; Submit all, parents first.
-      (dolist (v validated :success)
-        (destructuring-bind (tx txid wtxid fee vsize rset) v
-          (let ((add-result (%accept-into-mempool tx txid fee height now mempool rset replaced))
-                (res (gethash wtxid results)))
+    (flet ((fail-all (reason)
+             (dolist (v validated)
+               (%mark-result-invalid (gethash (%pkg-val-wtxid v) results) reason))
+             reason))
+      ;; Package feerate must clear the mempool's effective minimum (sat/kvB):
+      ;; fee*1000 vs rate*vsize, exact integer math (Core CheckFeeRate on the
+      ;; package feerate, validation.cpp:1500-1510, BEFORE package RBF).
+      (let ((pkg-feerate (if (zerop total-vsize) 0 (/ total-fee total-vsize)))
+            (min-fee (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
+            (includes (mapcar #'%pkg-val-wtxid validated))
+            (pkg-replaced nil))
+        (when (< (* total-fee 1000) (* min-fee (max total-vsize 1)))
+          (return-from %accept-package-subset (fail-all :insufficient-fee)))
+        ;; Package RBF: a multi-tx subset that conflicts with the mempool is
+        ;; only acceptable as a Core package replacement
+        ;; (validation.cpp:1513-1516).
+        (when (and package-eval (plusp (hash-table-count conflict-set)))
+          (multiple-value-bind (reason rset)
+              (%package-rbf-checks txns validated mempool
+                                   (loop for k being the hash-keys of conflict-set
+                                         collect k))
+            (when reason (return-from %accept-package-subset (fail-all reason)))
+            (setf pkg-replaced rset)))
+        ;; Evict the package-RBF replaced set once, up front — the analogue of
+        ;; Core applying the changeset's removals with its additions.
+        (when pkg-replaced
+          (loop for k being the hash-keys of pkg-replaced
+                do (setf (gethash k replaced) t)
+                   (bitcoin-lisp.mempool:mempool-remove-recursive mempool k)))
+        ;; Submit all, parents first.
+        (dolist (v validated :success)
+          (let ((add-result (%accept-into-mempool
+                             (%pkg-val-tx v) (%pkg-val-txid v) (%pkg-val-fee v)
+                             height now mempool (%pkg-val-rset v) replaced))
+                (res (gethash (%pkg-val-wtxid v) results)))
             (if (eq add-result :ok)
-                (%mark-result-valid res vsize fee pkg-feerate includes)
+                (%mark-result-valid res (%pkg-val-vsize v) (%pkg-val-fee v)
+                                    pkg-feerate includes)
                 (progn
                   (%mark-result-invalid res add-result)
                   (return-from %accept-package-subset add-result)))))))))
@@ -292,7 +374,12 @@ Returns (values msg results replaced):
                         (progn
                           (setf quit-early t fail-reason add-result)
                           (%mark-result-invalid res add-result)))))
-                 ((member err '(:insufficient-fee :missing-input))
+                 ;; Fee-related failures are TX_RECONSIDERABLE in Core —
+                 ;; including a failed single-tx RBF diagram (rbf.cpp:136-138)
+                 ;; — and missing inputs may be in-package parents; both defer
+                 ;; to the package-feerate phase (AcceptPackage,
+                 ;; validation.cpp:1695-1712).
+                 ((member err '(:insufficient-fee :replacement-failed :missing-input))
                   (push tx deferred))
                  (t
                   (setf quit-early t fail-reason err)
@@ -306,6 +393,20 @@ Returns (values msg results replaced):
                                            now results replaced)))
           (unless (eq msg :success)
             (setf fail-reason (or fail-reason msg)))))
+      ;; Re-limit ONCE (Core AcceptPackage -> LimitMempoolSize,
+      ;; validation.cpp:1728): every package submission above deferred its
+      ;; per-add byte-cap trim. A member admitted here — or one already in
+      ;; the pool — may be evicted by the trim; flip its result to
+      ;; :mempool-full, as Core does by re-checking existence
+      ;; (validation.cpp:1736-1760).
+      (bitcoin-lisp.mempool:mempool-trim-to-size mempool)
+      (loop for res being the hash-values of results
+            when (and (member (package-tx-result-status res)
+                              '(:valid :mempool-entry :different-witness))
+                      (not (bitcoin-lisp.mempool:mempool-has
+                            mempool (package-tx-result-txid res))))
+              do (%mark-result-invalid res :mempool-full)
+                 (setf fail-reason (or fail-reason :mempool-full)))
       (values (or fail-reason :success)
               (loop for tx in package
                     collect (gethash (bitcoin-lisp.serialization:transaction-wtxid tx) results))

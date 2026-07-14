@@ -742,3 +742,45 @@ failing the reorg forever and wedging the node (testnet4 stuck ~1800 blocks behi
              (is (equalp (bitcoin-lisp.storage:block-index-entry-hash a2-entry)
                          (bitcoin-lisp.storage:best-block-hash chain-state)))))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+;;;; Reorg mempool bulk re-add (cluster mempool P8 — Core
+;;;; MaybeUpdateMempoolForReorg, validation.cpp:294-389)
+
+(test reorg-readd-bulk-bypass-limits
+  "readd-disconnected-txs-to-mempool: a ZERO-fee disconnected tx re-enters
+(bypass_limits skips the fee floor, Core validation.cpp:945) and is wired to
+its pre-existing pool child; a disconnected tx whose inputs are gone on the
+new chain is dropped and its pool spender removed with it (Core
+removeRecursive, validation.cpp:317-321)."
+  (multiple-value-bind (utxo-set mempool chain-state funding)
+      (%pkg-fixture)
+    (declare (ignore chain-state))
+    (let* ((graph (bitcoin-lisp.mempool:mempool-graph mempool))
+           ;; dtx: spends the confirmed funding output, paying ZERO fee.
+           (dtx (%pkg-tx funding 0 100000000))
+           (did (bitcoin-lisp.serialization:transaction-hash dtx))
+           ;; Pool child of dtx (entered while dtx was confirmed).
+           (child (%pkg-tx did 0 99990000))
+           (cid (bitcoin-lisp.serialization:transaction-hash child))
+           ;; dtx2: its input never existed on the new chain.
+           (dtx2 (%pkg-tx (make-reorg-hash 4242) 0 500))
+           (d2id (bitcoin-lisp.serialization:transaction-hash dtx2))
+           ;; Pool spender of dtx2's output.
+           (orphan (%pkg-tx d2id 0 400))
+           (oid (bitcoin-lisp.serialization:transaction-hash orphan)))
+      (is (eq :ok (%add-tx mempool child :fee 10000 :height 200)))
+      (is (eq :ok (%add-tx mempool orphan :fee 100 :height 200)))
+      (bitcoin-lisp.validation::readd-disconnected-txs-to-mempool
+       mempool (list dtx dtx2) utxo-set 200)
+      ;; dtx re-entered fee-free and was wired to its child.
+      (is (bitcoin-lisp.mempool:mempool-has mempool did))
+      (is (bitcoin-lisp.mempool:mempool-has mempool cid))
+      (is (= 2 (length (bitcoin-lisp.mempool:txgraph-get-cluster
+                        graph
+                        (bitcoin-lisp.mempool:mempool-entry-graph-handle
+                         (bitcoin-lisp.mempool:mempool-get mempool did))))))
+      ;; dtx2 failed re-acceptance; its pool spender went with it.
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool d2id)))
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool oid)))
+      (is (= 2 (bitcoin-lisp.mempool:mempool-count mempool)))
+      (bitcoin-lisp.mempool::%mempool-graph-verify mempool))))

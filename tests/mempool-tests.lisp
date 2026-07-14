@@ -822,11 +822,13 @@ PreChecks). Without chain-state the finality check is skipped."
                                           (aref s 23) #x88 (aref s 24) #xac) s)))
    :lock-time 0))
 
-(defun %add-tx (mempool tx &key (fee 10000))
+(defun %add-tx (mempool tx &key (fee 10000) (height 0))
+  "Insert TX directly into MEMPOOL as an already-accepted entry (bypassing
+validation). The shared direct-add helper of the whole test package."
   (bitcoin-lisp.mempool:mempool-add
    mempool (bitcoin-lisp.serialization:transaction-hash tx)
    (bitcoin-lisp.mempool:make-entry-from-tx
-    tx fee 0 :entry-time (bitcoin-lisp.serialization:get-unix-time))))
+    tx fee height :entry-time (bitcoin-lisp.serialization:get-unix-time))))
 
 (test mempool-ancestor-descendant-chain
   "An A->B->C chain reports correct ancestor/descendant sets and stats."
@@ -1580,22 +1582,161 @@ and descendant limits of 1, and the 1000-vsize child cap."
         (is-false o) (is (eq :truc-tx-too-big r))))))
 
 (test truc-descendant-limit-one-child
-  "A v3 parent may have at most one unconfirmed child; a second is rejected
-unless it replaces the first (sibling eviction is declined -> rejected)."
+  "A v3 parent may have at most one unconfirmed child; a second fails the
+descendant limit, naming the existing child as the evictable sibling (the
+caller may then run it through the RBF economics — sibling eviction, Core
+truc_policy.cpp:233-262)."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 70))
          (parent (%truc-tx root :version 3))
          (pid (bitcoin-lisp.serialization:transaction-hash parent)))
     (%add-tx mempool parent)
     ;; first child ok, then add it
-    (let ((child1 (%truc-tx pid :version 3 :vout 0)))
+    (let* ((child1 (%truc-tx pid :version 3 :vout 0))
+           (cid1 (bitcoin-lisp.serialization:transaction-hash child1)))
       (is-true (bitcoin-lisp.mempool:single-truc-checks mempool child1 200 nil))
       (%add-tx mempool child1)
-      ;; a second child of the same parent -> descendant limit
-      (multiple-value-bind (o r)
+      ;; a second child of the same parent -> descendant limit, with CHILD1
+      ;; identified as the considerable sibling (parent has exactly one
+      ;; descendant whose only ancestor is the parent).
+      (multiple-value-bind (o r sibling)
           (bitcoin-lisp.mempool:single-truc-checks mempool (%truc-tx pid :version 3 :vout 1) 200 nil)
-        (is-false o) (is (eq :truc-descendant-limit r))))))
+        (is-false o) (is (eq :truc-descendant-limit r))
+        (is (equalp cid1 sibling)))
+      ;; ... unless the existing child is being replaced anyway.
+      (is-true (bitcoin-lisp.mempool:single-truc-checks
+                mempool (%truc-tx pid :version 3 :vout 1) 200 (list cid1))))))
+
+(test truc-sibling-eviction-not-considerable-with-grandchild
+  "Sibling eviction is only offered in the clean 1p1c shape: a sibling that
+itself has a descendant (a reorg-created shape) is NOT returned (Core
+consider_sibling_eviction: GetDescendantCount(parent)==2 &&
+GetAncestorCount(sibling)==2, truc_policy.cpp:250-252)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (root (make-array 32 :element-type '(unsigned-byte 8) :initial-element 71))
+         (parent (%truc-tx root :version 3))
+         (pid (bitcoin-lisp.serialization:transaction-hash parent))
+         (child1 (%truc-tx pid :version 3 :vout 0))
+         (cid1 (bitcoin-lisp.serialization:transaction-hash child1))
+         ;; Direct adds bypass validation, building the reorg-only shape.
+         (grandchild (%truc-tx cid1 :version 3 :vout 0)))
+    (%add-tx mempool parent)
+    (%add-tx mempool child1)
+    (%add-tx mempool grandchild)
+    (multiple-value-bind (o r sibling)
+        (bitcoin-lisp.mempool:single-truc-checks mempool (%truc-tx pid :version 3 :vout 1) 200 nil)
+      (is-false o) (is (eq :truc-descendant-limit r))
+      (is (null sibling)))))
 
 (test v3-now-standard
   "v3 is a standard tx version (TRUC enabled): +max-standard-tx-version+ = 3."
   (is (= 3 bitcoin-lisp.validation::+max-standard-tx-version+)))
+
+;;;; Package RBF rules (cluster mempool P8 — Core PackageRBFChecks,
+;;;; validation.cpp:1034-1130). check-package-rbf-rules applies the anti-DoS
+;;;; rules to the PACKAGE totals, requires the package feerate to strictly
+;;;; exceed the parent's, and stages BOTH transactions for the diagram test.
+;;;; The 1p1c / no-mempool-ancestor shape preconditions live in the caller
+;;;; (validation/packages.lisp) and are tested in package-tests.
+
+(test package-rbf-rules-accepts-cpfp-replacement
+  "A low-fee parent + high-fee child replacing a conflicting tx passes when
+the pair out-earns it: rules 3/4 on package totals, feerate above parent,
+and a strict diagram improvement."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 170))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig)))
+    (%add-tx mempool orig :fee 1000)
+    (multiple-value-bind (ok reason replaced)
+        (bitcoin-lisp.mempool:check-package-rbf-rules
+         mempool 10 100 5000 100 (list orig-txid))
+      (declare (ignore reason))
+      (is-true ok)
+      (is (not (null (gethash orig-txid replaced)))))))
+
+(test package-rbf-rules-rule3-rule4-on-totals
+  "Rules 3/4 evaluate the package totals: a pair whose combined fee does not
+cover the replaced fees (plus its own bandwidth) is rejected."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 171))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig)))
+    (%add-tx mempool orig :fee 10000)
+    ;; Rule 3: 10 + 5000 < 10000.
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-package-rbf-rules
+         mempool 10 100 5000 100 (list orig-txid))
+      (is-false ok)
+      (is (eq reason :insufficient-fee)))
+    ;; Rule 4: totals exceed the replaced fee but not by the pair's own
+    ;; bandwidth at 100 sat/kvB (needs ceil(200*100/1000) = 20 extra).
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-package-rbf-rules
+         mempool 10 100 10009 100 (list orig-txid))
+      (is-false ok)
+      (is (eq reason :insufficient-fee)))))
+
+(test package-rbf-rules-feerate-must-exceed-parent
+  "The package feerate must STRICTLY exceed the parent's own feerate — the
+pair must be a chunk on its own, not a child merely paying anti-DoS fees
+(Core validation.cpp:1104-1111). Equality is also rejected."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 172))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig)))
+    (%add-tx mempool orig :fee 100)
+    ;; Parent 50 sat/vB, child 0 -> package 25 sat/vB < parent.
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-package-rbf-rules
+         mempool 5000 100 0 100 (list orig-txid))
+      (is-false ok)
+      (is (eq reason :package-feerate-not-above-parent)))
+    ;; Equal feerates (parent 10, child 10 sat/vB) -> still rejected.
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-package-rbf-rules
+         mempool 1000 100 1000 100 (list orig-txid))
+      (is-false ok)
+      (is (eq reason :package-feerate-not-above-parent)))))
+
+(test package-rbf-rules-diagram-must-improve
+  "Rules 3/4 and the parent-feerate check can pass while the two-transaction
+diagram does NOT strictly improve — rejected :replacement-failed."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 173))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig)))
+    ;; Original: 10 sat/vB over 100 vB.
+    (%add-tx mempool orig :fee 1000)
+    ;; Pair: parent 5 sat/vB + child 7 sat/vB -> one 6 sat/vB chunk over
+    ;; 200 vB. Rule 3/4: 1200 >= 1000 + 20. Package feerate 6 > parent 5.
+    ;; Diagram: worse than the original at size 100 (600 < 1000), better at
+    ;; 200 (1200 > 1000) -> :unordered, not a strict improvement.
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-package-rbf-rules
+         mempool 500 100 700 100 (list orig-txid))
+      (is-false ok)
+      (is (eq reason :replacement-failed)))))
+
+(test package-rbf-rules-cluster-caps
+  "Rule 5's caps apply unchanged to the aggregate package conflicts."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (conflicts '()))
+    (loop for i from 1 to 101
+          for tx = (%rbf-tx i)
+          do (%add-tx mempool tx :fee 1000)
+             (push (bitcoin-lisp.serialization:transaction-hash tx) conflicts))
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-package-rbf-rules
+         mempool 1000 100 100000000 100 conflicts)
+      (is-false ok)
+      (is (eq reason :too-many-clusters)))))
+
+(test package-rbf-rules-too-large-cluster
+  "A package member breaching the cluster size limit in staging is rejected
+:too-large-cluster (uncalculable diagram)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 174))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig)))
+    (%add-tx mempool orig :fee 1000)
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-package-rbf-rules
+         mempool 1000 100 100000000 200000 (list orig-txid))
+      (is-false ok)
+      (is (eq reason :too-large-cluster)))))

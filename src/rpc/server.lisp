@@ -94,6 +94,10 @@
   (register-rpc-method "importmempool" #'rpc-importmempool)
   (register-rpc-method "getmempoolancestors" #'rpc-getmempoolancestors)
   (register-rpc-method "getmempooldescendants" #'rpc-getmempooldescendants)
+  ;; Cluster mempool (Core rpc/mempool.cpp:1516 getmempoolcluster, :1519
+  ;; getmempoolfeeratediagram — the latter hidden in Core's help).
+  (register-rpc-method "getmempoolcluster" #'rpc-getmempoolcluster)
+  (register-rpc-method "getmempoolfeeratediagram" #'rpc-getmempoolfeeratediagram)
   (register-rpc-method "gettxspendingprevout" #'rpc-gettxspendingprevout)
   ;; Node / chain info methods
   (register-rpc-method "getdifficulty" #'rpc-getdifficulty)

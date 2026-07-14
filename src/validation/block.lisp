@@ -1606,21 +1606,49 @@ Returns the common ancestor block-index-entry."
     (nreverse entries)))
 
 (defun readd-disconnected-txs-to-mempool (mempool txs utxo-set height)
-  "Best-effort re-add of TXS from reorg-disconnected blocks into the mempool.
-Each tx is re-validated against the post-reorg chain state; txs that are no
-longer valid (inputs spent on the new chain, or re-confirmed by it) are silently
-dropped. Mirrors Bitcoin Core re-adding disconnected-block txs after a reorg."
+  "Re-add TXS from reorg-disconnected blocks into the mempool, best-effort —
+a port of Bitcoin Core's MaybeUpdateMempoolForReorg (validation.cpp:294-389).
+
+TXS is earliest-confirmed first (Core iterates the disconnectpool in
+reverse), so parents re-enter before their children. Each tx is re-validated
+against the post-reorg chain state with BYPASS-LIMITS (fee floor and TRUC
+topology skipped — it was already confirmed — while the RBF economics and
+the per-cluster limits stay on, exactly Core's bypass_limits scope). A tx
+that fails re-acceptance drags down any pool transactions spending its
+outputs, which are now orphans (Core removeRecursive on the not-re-accepted
+origin, validation.cpp:317-321).
+
+Acceptance assumes a new entry has no in-mempool children — false for a
+previously-confirmed tx whose outputs pre-existing pool entries spend — so
+after the per-tx loop, MEMPOOL-UPDATE-FOR-REORG wires those parent->child
+dependencies in bulk and restores the cluster limits with ONE trim (Core
+UpdateTransactionsFromBlock, txmempool.cpp:91-120), and a final byte-cap
+trim re-limits the pool (Core LimitMempoolSize, validation.cpp:387)."
   (when (and mempool txs)
-    (dolist (tx txs)
-      (handler-case
-          (multiple-value-bind (valid error fee replaced)
-              (validate-transaction-for-mempool tx utxo-set mempool height)
-            (declare (ignore error))
-            (when valid
-              (bitcoin-lisp.mempool:accept-validated-tx
-               mempool (bitcoin-lisp.serialization:transaction-hash tx)
-               tx fee height :replaced replaced)))
-        (error () nil)))))
+    (let ((readded '()))                ; txids, most-recently-confirmed first
+      (dolist (tx txs)
+        (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+          (handler-case
+              (multiple-value-bind (valid error fee replaced)
+                  (validate-transaction-for-mempool tx utxo-set mempool height
+                                                    :bypass-limits t)
+                (declare (ignore error))
+                (when valid
+                  (bitcoin-lisp.mempool:accept-validated-tx
+                   mempool txid tx fee height
+                   :replaced replaced :defer-trim t)))
+            (error () nil))
+          ;; Presence decides the outcome (Core: else if m_mempool->exists,
+          ;; validation.cpp:322): a tx that is in the pool now — re-accepted,
+          ;; or already there — gets its child links wired below; one that
+          ;; isn't drags down its in-pool spenders.
+          (if (bitcoin-lisp.mempool:mempool-has mempool txid)
+              (push txid readded)
+              (bitcoin-lisp.mempool:mempool-remove-spenders
+               mempool txid
+               (length (bitcoin-lisp.serialization:transaction-outputs tx))))))
+      (bitcoin-lisp.mempool:mempool-update-for-reorg mempool readded)
+      (bitcoin-lisp.mempool:mempool-trim-to-size mempool))))
 
 (defun %rollback-partial-reorg (chain-state block-store utxo-set
                                 connected to-disconnect old-tip-entry)
