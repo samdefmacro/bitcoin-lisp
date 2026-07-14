@@ -36,7 +36,8 @@
   "A node backed by a fresh LevelDB chainstate at DIR, with genesis + a
 base entry (TIP-HASH at TIP-HEIGHT, prev-linked to genesis) in the header
 index. The chain tip is left at genesis (height 0) so loadtxoutset sees a
-valid fast-forward."
+valid fast-forward. The node's data-directory is DIR — snapshot activation
+creates its chainstate_snapshot/ LevelDB there."
   (let* ((chain-state (bitcoin-lisp.storage:init-chain-state dir))
          (utxo (bitcoin-lisp.storage:make-coins-view-cache
                 (bitcoin-lisp.storage:open-coins-view-db
@@ -49,7 +50,8 @@ valid fast-forward."
                      :hash tip-hash :height tip-height
                      :chain-work (* tip-height 100) :status :valid
                      :prev-entry genesis-entry)))
-    (setf (bitcoin-lisp::node-chain-state node) chain-state
+    (setf (bitcoin-lisp::node-data-directory node) (pathname dir)
+          (bitcoin-lisp::node-chain-state node) chain-state
           (bitcoin-lisp::node-utxo-set node) utxo
           (bitcoin-lisp::node-block-store node)
           (bitcoin-lisp.storage:init-block-store dir))
@@ -225,14 +227,16 @@ expected bytes are assembled by hand from the format spec."
 (test snapshot-roundtrip-verified
   "dumptxoutset -> loadtxoutset round-trips through the full verification
 gate: an injected assumeutxo-data entry carrying the real hash_serialized_3
-accepts the snapshot, the UTXO set is REPLACED (stale coins dropped), the
-tip fast-forwards, and the base entry's tx-count is seeded from nChainTx."
+accepts the snapshot into a NEW snapshot chainstate that becomes the current
+chainstate at the base height, while the previous chainstate is retargeted
+at the base (historical). The base entry's tx-count is seeded from nChainTx."
   (%with-snap-dir (src-dir)
     (%with-snap-dir (dst-dir)
-      (let* ((h5 (%snap-fill 32 5))
+      (let* ((bitcoin-lisp:*prune-target-mib* nil) ; deterministic: pruning off
+             (h5 (%snap-fill 32 5))
              (txid-a (%snap-fill 32 #x11))
              (txid-b (%snap-fill 32 #x22))
-             (txid-s (%snap-fill 32 #xEE))   ; stale coin, not in snapshot
+             (txid-s (%snap-fill 32 #xEE))   ; pre-existing coin, not in snapshot
              (spk-a (%snap-p2pkh #xAA))
              (spk-raw (%snap-cat #(#x51 #x52 #x53)))
              (src (%snap-node src-dir h5 5))
@@ -249,11 +253,12 @@ tip fast-forwards, and the base entry's tx-count is seeded from nChainTx."
           (is (string= (bitcoin-lisp.rpc::hash-to-hex expected-hash)
                        (cdr (assoc "txoutset_hash" r :test #'string=))))
           (let* ((dst (%snap-node dst-dir h5 5))
-                 (dst-chain (bitcoin-lisp::node-chain-state dst))
-                 (dst-utxo (bitcoin-lisp::node-utxo-set dst)))
-            ;; Pre-existing state that must not survive the load.
-            (bitcoin-lisp.storage:add-utxo dst-utxo txid-s 0 777 spk-raw 1)
-            (bitcoin-lisp.storage:coins-view-cache-flush dst-utxo)
+                 (primary (bitcoin-lisp::node-chain-state dst))
+                 (primary-utxo (bitcoin-lisp::node-utxo-set dst)))
+            ;; Pre-existing primary-chainstate coin: must NOT appear in the
+            ;; snapshot chainstate's view, but survives in the primary's.
+            (bitcoin-lisp.storage:add-utxo primary-utxo txid-s 0 777 spk-raw 1)
+            (bitcoin-lisp.storage:coins-view-cache-flush primary-utxo)
             (let ((bitcoin-lisp:*assumeutxo-data-override*
                     (list (%snap-au 5 h5 expected-hash 4242))))
               (let ((r2 (bitcoin-lisp.rpc::rpc-loadtxoutset dst (list snap))))
@@ -261,29 +266,59 @@ tip fast-forwards, and the base entry's tx-count is seeded from nChainTx."
                 (is (= 5 (cdr (assoc "base_height" r2 :test #'string=))))
                 (is (string= (bitcoin-lisp.rpc::hash-to-hex h5)
                              (cdr (assoc "tip_hash" r2 :test #'string=)))))
-              ;; Tip fast-forwarded; nChainTx seeded on the base entry.
-              (is (= 5 (bitcoin-lisp.storage:current-height dst-chain)))
-              (is (equalp h5 (bitcoin-lisp.storage:best-block-hash dst-chain)))
-              (is (= 4242 (bitcoin-lisp.storage:block-index-entry-tx-count
-                           (bitcoin-lisp.storage:get-block-index-entry dst-chain h5))))
-              ;; Snapshot coins present and exact; stale coin replaced away.
-              (let ((a (bitcoin-lisp.storage:get-utxo dst-utxo txid-a 0))
-                    (a300 (bitcoin-lisp.storage:get-utxo dst-utxo txid-a 300))
-                    (b (bitcoin-lisp.storage:get-utxo dst-utxo txid-b 1)))
-                (is (and a (= 4200000000 (bitcoin-lisp.storage:utxo-entry-value a))))
-                (is (bitcoin-lisp.storage:utxo-entry-coinbase a))
-                (is (equalp spk-a (bitcoin-lisp.storage:utxo-entry-script-pubkey a)))
-                (is (and a300 (= 999 (bitcoin-lisp.storage:utxo-entry-value a300))))
-                (is (= 4 (bitcoin-lisp.storage:utxo-entry-height a300)))
-                (is (and b (= 12345 (bitcoin-lisp.storage:utxo-entry-value b))))
-                (is (not (bitcoin-lisp.storage:utxo-entry-coinbase b))))
-              (is (null (bitcoin-lisp.storage:get-utxo dst-utxo txid-s 0)))
-              ;; The loaded set re-hashes to the committed value.
-              (is (equalp expected-hash
-                          (bitcoin-lisp.storage:compute-utxo-set-hash dst-utxo)))
-              ;; Loading again fails: already at the snapshot height.
+              ;; The CURRENT chainstate is now the snapshot chainstate at the
+              ;; base; the primary became historical (target = base).
+              (let ((current (bitcoin-lisp::node-current-chainstate dst))
+                    (historical (bitcoin-lisp::node-historical-chainstate dst))
+                    (dst-utxo (bitcoin-lisp::node-utxo-set dst)))
+                (is (not (eq current primary)))
+                (is (eq historical primary))
+                (is (= 2 (length (bitcoin-lisp::node-chainstates dst))))
+                (is (equalp h5 (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash
+                                current)))
+                (is (eq :unvalidated
+                        (bitcoin-lisp.storage:chain-state-assumeutxo-status current)))
+                (is (string= "_snapshot"
+                             (bitcoin-lisp.storage:chain-state-storage-suffix current)))
+                (is (equalp h5 (bitcoin-lisp.storage:chain-state-target-blockhash
+                                primary)))
+                (is (eq primary (bitcoin-lisp::node-validated-chainstate dst)))
+                ;; Both chainstates share ONE block index (Core m_blockman).
+                (is (eq (bitcoin-lisp.storage::chain-state-block-index primary)
+                        (bitcoin-lisp.storage::chain-state-block-index current)))
+                ;; Tip fast-forwarded; nChainTx seeded on the base entry.
+                (is (= 5 (bitcoin-lisp.storage:current-height current)))
+                (is (equalp h5 (bitcoin-lisp.storage:best-block-hash current)))
+                (is (= 0 (bitcoin-lisp.storage:current-height primary)))
+                (is (= 4242 (bitcoin-lisp.storage:block-index-entry-tx-count
+                             (bitcoin-lisp.storage:get-block-index-entry current h5))))
+                ;; The persistent base_blockhash marker exists and is exact.
+                (let ((marker (bitcoin-lisp.storage:read-snapshot-base-blockhash
+                               (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir
+                                dst-dir))))
+                  (is (equalp h5 marker)))
+                ;; Snapshot coins present and exact in the CURRENT view.
+                (let ((a (bitcoin-lisp.storage:get-utxo dst-utxo txid-a 0))
+                      (a300 (bitcoin-lisp.storage:get-utxo dst-utxo txid-a 300))
+                      (b (bitcoin-lisp.storage:get-utxo dst-utxo txid-b 1)))
+                  (is (and a (= 4200000000 (bitcoin-lisp.storage:utxo-entry-value a))))
+                  (is (bitcoin-lisp.storage:utxo-entry-coinbase a))
+                  (is (equalp spk-a (bitcoin-lisp.storage:utxo-entry-script-pubkey a)))
+                  (is (and a300 (= 999 (bitcoin-lisp.storage:utxo-entry-value a300))))
+                  (is (= 4 (bitcoin-lisp.storage:utxo-entry-height a300)))
+                  (is (and b (= 12345 (bitcoin-lisp.storage:utxo-entry-value b))))
+                  (is (not (bitcoin-lisp.storage:utxo-entry-coinbase b))))
+                ;; The primary's coin is not in the snapshot view — and is
+                ;; UNTOUCHED in the primary's own view (no wipe).
+                (is (null (bitcoin-lisp.storage:get-utxo dst-utxo txid-s 0)))
+                (let ((stale (bitcoin-lisp.storage:get-utxo primary-utxo txid-s 0)))
+                  (is (and stale (= 777 (bitcoin-lisp.storage:utxo-entry-value stale)))))
+                ;; The loaded set re-hashes to the committed value.
+                (is (equalp expected-hash
+                            (bitcoin-lisp.storage:compute-utxo-set-hash dst-utxo))))
+              ;; Loading again fails: a snapshot chainstate already exists.
               (is (%snap-err-matches (%snap-load-err dst snap)
-                                     -32603 "Work does not exceed")))))))))
+                                     -32603 "more than once")))))))))
 
 (test snapshot-metadata-rejections
   "SnapshotMetadata parsing rejects bad magic, unsupported version, wrong
@@ -327,7 +362,8 @@ assumeutxo hash, base header missing from the index, commitment/index
 height mismatch, invalid base header, tip already at the base height, and
 a non-empty mempool — all rejected before the coin stream is touched."
   (%with-snap-dir (dir)
-    (let* ((h5 (%snap-fill 32 5))
+    (let* ((bitcoin-lisp:*prune-target-mib* nil) ; deterministic: pruning off
+           (h5 (%snap-fill 32 5))
            (h7 (%snap-fill 32 7))
            (zero32 (%snap-fill 32 0))
            (node (%snap-node dir h5 5))
@@ -389,7 +425,8 @@ claiming more coins than the metadata count, truncation, trailing bytes,
 an out-of-range vout, and a hash_serialized_3 mismatch. Every rejection
 leaves the node's UTXO set and tip untouched."
   (%with-snap-dir (dir)
-    (let* ((h5 (%snap-fill 32 5))
+    (let* ((bitcoin-lisp:*prune-target-mib* nil) ; deterministic: pruning off
+           (h5 (%snap-fill 32 5))
            (txid (%snap-fill 32 #x33))
            (txid-s (%snap-fill 32 #xEE))
            (spk (%snap-cat #(#x51)))
@@ -437,19 +474,28 @@ leaves the node's UTXO set and tip untouched."
                   (list (%snap-au 5 h5 (%snap-fill 32 0)))))
             (rejects "Bad snapshot content hash"
                      :count 1 :groups `((,txid (0 1 nil 1000 ,spk))))))
-        ;; No partial state from any of the failures.
+        ;; No partial state from any of the failures: the primary chainstate
+        ;; is untouched AND the aborted snapshot chainstate dir was deleted
+        ;; (Core cleanup_bad_snapshot).
         (is (null (bitcoin-lisp.storage:get-utxo utxo txid 0)))
         (let ((stale (bitcoin-lisp.storage:get-utxo utxo txid-s 0)))
           (is (and stale (= 777 (bitcoin-lisp.storage:utxo-entry-value stale)))))
         (is (= 0 (bitcoin-lisp.storage:current-height chain)))
-        ;; Control: the same 1-coin file with the right hash loads cleanly.
+        (is (= 1 (length (bitcoin-lisp::node-chainstates node))))
+        (is (null (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir dir)))
+        ;; Control: the same 1-coin file with the right hash loads cleanly
+        ;; into a snapshot chainstate that becomes current.
         (%snap-write-file f :base-hash h5 :count 1
                             :groups `((,txid (0 1 nil 1000 ,spk))))
         (is (null (%snap-load-err node f)))
-        (is (= 5 (bitcoin-lisp.storage:current-height chain)))
-        (let ((c (bitcoin-lisp.storage:get-utxo utxo txid 0)))
-          (is (and c (= 1000 (bitcoin-lisp.storage:utxo-entry-value c)))))
-        (is (null (bitcoin-lisp.storage:get-utxo utxo txid-s 0)))))))
+        (let ((current (bitcoin-lisp::node-chain-state node))
+              (current-utxo (bitcoin-lisp::node-utxo-set node)))
+          (is (not (eq current chain)))
+          (is (= 5 (bitcoin-lisp.storage:current-height current)))
+          (is (= 0 (bitcoin-lisp.storage:current-height chain)))
+          (let ((c (bitcoin-lisp.storage:get-utxo current-utxo txid 0)))
+            (is (and c (= 1000 (bitcoin-lisp.storage:utxo-entry-value c)))))
+          (is (null (bitcoin-lisp.storage:get-utxo current-utxo txid-s 0))))))))
 
 (test snapshot-assumeutxo-tables
   "The shipped assumeutxo-data tables mirror Bitcoin Core's

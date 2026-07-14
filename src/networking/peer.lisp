@@ -412,23 +412,36 @@ arrived, forget the reconciliation state (Core net_processing.cpp:3879-3886)."
   (unless (and (peer-wtxid-relay peer) (peer-recon-registered peer))
     (%forget-recon-state peer)))
 
+(defun local-service-bits ()
+  "The service bits we advertise in our version message. Mirrors Core's
+g_local_services composition (init.cpp:863,1946-1953): the base is
+NODE_NETWORK_LIMITED | NODE_WITNESS; NODE_NETWORK is added only when we can
+actually serve ALL historical blocks — i.e. not pruning AND no assumeutxo
+historical chainstate exists (while a snapshot's background validation
+runs, blocks below the snapshot base are not yet locally available, so the
+node runs as NODE_NETWORK_LIMITED until it completes). BIP 324 adds
+NODE_P2P_V2 when the v2 transport is available; BIP 157 adds
+NODE_COMPACT_FILTERS when filter serving is enabled."
+  (let ((node bitcoin-lisp::*node*))
+    (logior bitcoin-lisp.serialization:+node-network-limited+
+            bitcoin-lisp.serialization:+node-witness+
+            (if (or (bitcoin-lisp:pruning-enabled-p)
+                    (and node (bitcoin-lisp::node-historical-chainstate node)))
+                0
+                bitcoin-lisp.serialization:+node-network+)
+            (if (v2-available-p)
+                bitcoin-lisp.serialization:+node-p2p-v2+ 0)
+            ;; BIP157: advertise filter serving when enabled.
+            (if bitcoin-lisp:*peer-block-filters*
+                bitcoin-lisp.serialization:+node-compact-filters+ 0))))
+
 (defun %send-version-and-capabilities (peer)
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
 VERACK). Returns T if the version was sent. On a block-relay/feeler connection
 the version's relay flag is 0 and we skip wtxidrelay (Core does not negotiate
 tx relay on those)."
-  ;; BIP 159: advertise NODE_NETWORK_LIMITED instead of NODE_NETWORK when
-  ;; pruning. BIP 324: add NODE_P2P_V2 when the v2 transport is available.
-  (let* ((services (logior (if (bitcoin-lisp:pruning-enabled-p)
-                               bitcoin-lisp.serialization:+node-network-limited+
-                               bitcoin-lisp.serialization:+node-network+)
-                           bitcoin-lisp.serialization:+node-witness+
-                           (if (v2-available-p)
-                               bitcoin-lisp.serialization:+node-p2p-v2+ 0)
-                           ;; BIP157: advertise filter serving when enabled.
-                           (if bitcoin-lisp:*peer-block-filters*
-                               bitcoin-lisp.serialization:+node-compact-filters+ 0)))
+  (let* ((services (local-service-bits))
          (relays (peer-relays-txs-p peer))
          ;; Advertise our real chain height (Core sends my_height) so peers can
          ;; pick us as a block-sync source; 0 only if the node isn't up yet.
