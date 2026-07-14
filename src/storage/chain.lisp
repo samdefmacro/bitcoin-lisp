@@ -136,6 +136,20 @@ connecting a block off that path. NIL TARGET-ENTRY clears the target."
              (chain-state-target-ancestors chain-state) ancestors))))
   target-entry)
 
+(defun clear-snapshot-chainstate-identity (state)
+  "Reset STATE's assumeutxo/snapshot identity so it is a plain, fully-validated
+primary chainstate — the inverse of the snapshot-marking slots a snapshot
+chainstate carries (storage suffix, from-snapshot-blockhash, :unvalidated
+status, target). Keeping this identity-slot set in one place, next to the
+chain-state defstruct, means promotion (validated-snapshot-cleanup) can't
+drift apart from the snapshot constructor when a slot is added. Returns STATE."
+  (set-chainstate-target state nil)
+  (setf (chain-state-storage-suffix state) ""
+        (chain-state-from-snapshot-blockhash state) nil
+        (chain-state-assumeutxo-status state) :validated
+        (chain-state-target-utxohash state) nil)
+  state)
+
 (defun target-ancestor-entry (chain-state height)
   "The target block's ancestor entry at HEIGHT for a targeted (historical)
 CHAIN-STATE, or NIL when no target is set / HEIGHT is out of range. O(1) via
@@ -465,6 +479,52 @@ DeleteChainstate equivalent, used for activation-failure cleanup and
       (delete-file dat)
       (setf removed t))
     removed))
+
+(defun rename-snapshot-chainstate-dir-invalid (data-dir)
+  "Move the snapshot chainstate's coins LevelDB dir aside for forensics after
+its background validation failed (Core Chainstate::InvalidateCoinsDBOnDisk,
+validation.cpp:6220-6250): chainstate_snapshot/ -> chainstate_snapshot_INVALID/.
+The dir is MOVED, not deleted, so a hardware/software fault that produced a
+bad snapshot can be investigated later. Any stale _INVALID leftover from a
+prior failed activation is removed first so the rename can't collide. Returns
+the new path, or NIL when there was no snapshot dir to rename."
+  (let ((src (merge-pathnames "chainstate_snapshot/" data-dir))
+        (dst (merge-pathnames "chainstate_snapshot_INVALID/" data-dir)))
+    (when (probe-file src)
+      (when (probe-file dst)
+        (uiop:delete-directory-tree dst :validate t))
+      (sb-posix:rename (namestring src) (namestring dst))
+      dst)))
+
+(defun promote-snapshot-chainstate-files (data-dir)
+  "Startup-only LevelDB-directory swap that makes a fully-validated snapshot
+chainstate the sole chainstate (Core ChainstateManager::ValidatedSnapshotCleanup,
+validation.cpp:6299-6364): the background (validated-from-genesis) chainstate's
+files are moved aside to *_todelete and deleted, then the snapshot chainstate's
+files are moved into the default (unsuffixed) names. Handles both the coins
+LevelDB dir and our per-chainstate state file (chainstate.dat, which Core has
+no analogue of). Every chainstate's coins DB must already be closed. Returns T."
+  (flet ((swap-dir (old new)
+           (when (probe-file new) (uiop:delete-directory-tree new :validate t))
+           (when (probe-file old) (sb-posix:rename (namestring old) (namestring new))))
+         (swap-file (old new)
+           (when (probe-file new) (delete-file new))
+           (when (probe-file old) (rename-file old new))))
+    (let ((cs         (merge-pathnames "chainstate/" data-dir))
+          (cs-del     (merge-pathnames "chainstate_todelete/" data-dir))
+          (snap       (merge-pathnames "chainstate_snapshot/" data-dir))
+          (cs-dat     (merge-pathnames "chainstate.dat" data-dir))
+          (cs-dat-del (merge-pathnames "chainstate_todelete.dat" data-dir))
+          (snap-dat   (merge-pathnames "chainstate_snapshot.dat" data-dir)))
+      ;; Background chainstate aside, snapshot chainstate into place.
+      (swap-dir cs cs-del)
+      (swap-dir snap cs)
+      (swap-file cs-dat cs-dat-del)
+      (swap-file snap-dat cs-dat)
+      ;; Delete the now-unneeded background chainstate.
+      (when (probe-file cs-del) (uiop:delete-directory-tree cs-del :validate t))
+      (when (probe-file cs-dat-del) (delete-file cs-dat-del))
+      t)))
 
 ;;; Persistence format v3: adds in-transition flag (mirrors Bitcoin Core's
 ;;; DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).
