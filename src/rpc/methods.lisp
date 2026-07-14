@@ -547,18 +547,18 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
   (declare (ignore params))
   (let* ((network (rpc-get-network node))
          (peers (rpc-get-peers node))
-         (pruned (bitcoin-lisp:pruning-enabled-p))
-         ;; Service flags we advertise in our version message (peer.lisp):
-         ;; NODE_NETWORK[_LIMITED] | NODE_WITNESS.
-         (services (logior (if pruned
-                               bitcoin-lisp.serialization:+node-network-limited+
-                               bitcoin-lisp.serialization:+node-network+)
-                           bitcoin-lisp.serialization:+node-witness+
-                           (if bitcoin-lisp:*peer-block-filters*
-                               bitcoin-lisp.serialization:+node-compact-filters+ 0)))
-         (service-names (append (list (if pruned "NETWORK_LIMITED" "NETWORK") "WITNESS")
-                                (when bitcoin-lisp:*peer-block-filters*
-                                  (list "COMPACT_FILTERS"))))
+         ;; THE service bits we advertise on the wire (peer.lisp local-services,
+         ;; Core g_local_services) — the one composition; do not duplicate it
+         ;; here. Names in bit order per Core ServiceFlagsToStr (protocol.cpp).
+         (services (bitcoin-lisp.networking::local-services))
+         (service-names
+           (loop for (bit name)
+                   in `((,bitcoin-lisp.serialization:+node-network+ "NETWORK")
+                        (,bitcoin-lisp.serialization:+node-witness+ "WITNESS")
+                        (,bitcoin-lisp.serialization:+node-compact-filters+ "COMPACT_FILTERS")
+                        (,bitcoin-lisp.serialization:+node-network-limited+ "NETWORK_LIMITED")
+                        (,bitcoin-lisp.serialization:+node-p2p-v2+ "P2P_V2"))
+                 when (logtest services bit) collect name))
          (in (count-if #'bitcoin-lisp.networking::peer-inbound peers))
          ;; +default-min-relay-fee-rate+ is sat/kvB -> BTC/kvB.
          (relayfee (/ bitcoin-lisp.mempool:+default-min-relay-fee-rate+
