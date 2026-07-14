@@ -1042,22 +1042,160 @@ minimum fee past its feerate, so an equal-feerate retry cannot loop."
       (is-false ok)
       (is (eq reason :insufficient-fee)))))
 
-(test rbf-requires-signaling-unless-full-rbf
-  "Rule 1 rejects replacing a non-signaling tx, unless *mempool-full-rbf*."
+(test rbf-full-rbf-unconditional
+  "Cluster mempool drops BIP125 rule 1: a NON-signaling mempool tx is
+replaceable regardless of *mempool-full-rbf* (Core validation.cpp:490 — the
+accept path never consults SignalsOptInRBF; IsRBFOptIn survives for RPC only)."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
-         (orig (%rbf-tx 101 :sequence #xffffffff))   ; non-signaling
+         (orig (%rbf-tx 101 :sequence #xffffffff))   ; non-signaling (final)
          (orig-txid (bitcoin-lisp.serialization:transaction-hash orig))
-         (repl (%rbf-tx 101 :sequence #xfffffffd))
+         (repl (%rbf-tx 101 :sequence #xffffffff :value 40000000))
          (rvsize (bitcoin-lisp.serialization:transaction-vsize repl)))
     (%add-tx mempool orig :fee 1000)
-    (multiple-value-bind (ok reason)
+    ;; Replacing the non-signaling original succeeds on a strictly better fee,
+    ;; with *mempool-full-rbf* NIL (the default).
+    (is (null bitcoin-lisp.mempool:*mempool-full-rbf*))
+    (multiple-value-bind (ok reason replaced)
         (bitcoin-lisp.mempool:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
+      (declare (ignore reason))
+      (is-true ok)
+      (is (not (null (gethash orig-txid replaced)))))))
+
+;;;; Diagram RBF (cluster mempool P7 — Core policy/rbf.cpp ImprovesFeerateDiagram
+;;;; + ReplacementChecks, ported from src/test/rbf_tests.cpp). check-rbf-rules
+;;;; now: drops rules 1/2 (full-RBF unconditional), keeps rules 3/4, redefines
+;;;; rule 5 (100-cluster + 500-tx gather caps), and requires the replacement to
+;;;; strictly improve the mempool feerate diagram.
+
+(defun %rbf-chain (mempool root-id length &key (fee 10000))
+  "Add a chain of LENGTH txs rooted at a fresh %rbf-tx(ROOT-ID) into MEMPOOL
+(each tx spends its predecessor's output 0). Returns the root txid."
+  (let* ((root (%rbf-tx root-id))
+         (root-txid (bitcoin-lisp.serialization:transaction-hash root))
+         (prev-txid root-txid))
+    (%add-tx mempool root :fee fee)
+    (loop repeat (1- length)
+          for child = (%mp-spending-tx prev-txid)
+          for child-txid = (bitcoin-lisp.serialization:transaction-hash child)
+          do (%add-tx mempool child :fee fee)
+             (setf prev-txid child-txid))
+    root-txid))
+
+(test rbf-diagram-accepts-strict-improvement
+  "A replacement paying a strictly higher feerate improves the diagram and is
+accepted; the replaced set is the conflict."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 130))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig))
+         (repl (%rbf-tx 130 :value 40000000))
+         (rvsize (bitcoin-lisp.serialization:transaction-vsize repl)))
+    (%add-tx mempool orig :fee 1000)
+    (multiple-value-bind (ok reason replaced)
+        (bitcoin-lisp.mempool:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
+      (declare (ignore reason))
+      (is-true ok)
+      (is (not (null (gethash orig-txid replaced)))))))
+
+(test rbf-diagram-rejects-non-improvement
+  "Rules 3 and 4 can pass while the diagram does NOT strictly improve: a
+replacement paying slightly more total fee but at a far lower feerate (much
+larger vsize) is rejected :replacement-failed (Core ImprovesFeerateDiagram
+failure, rbf.cpp:136-138)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 131))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig))
+         (repl (%rbf-tx 131 :value 40000000)))
+    (%add-tx mempool orig :fee 1000)
+    ;; new-fee 1100 >= 1000 (rule 3 ok) and additional 100 == bandwidth for a
+    ;; 1000-vbyte replacement (rule 4 ok), but the huge vsize makes the new
+    ;; chunk's feerate far worse than the original's — the diagram is not
+    ;; strictly better.
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-rbf-rules mempool repl 1100 1000 (list orig-txid))
       (is-false ok)
-      (is (eq reason :txn-mempool-conflict)))
-    (let ((bitcoin-lisp.mempool:*mempool-full-rbf* t))
-      (multiple-value-bind (ok)
-          (bitcoin-lisp.mempool:check-rbf-rules mempool repl 50000 rvsize (list orig-txid))
+      (is (eq reason :replacement-failed)))))
+
+(test rbf-rule3-and-rule4-survive
+  "Rule 3 (pay >= replaced fees) and rule 4 (pay own bandwidth at the
+incremental relay fee) still reject before the diagram is consulted."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 132))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig))
+         (repl (%rbf-tx 132 :value 40000000))
+         (rvsize (bitcoin-lisp.serialization:transaction-vsize repl)))
+    (%add-tx mempool orig :fee 10000)
+    ;; Rule 3: fee below the replaced fee.
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-rbf-rules mempool repl 9000 rvsize (list orig-txid))
+      (is-false ok)
+      (is (eq reason :insufficient-fee)))
+    ;; Rule 4: fee above the replaced fee but not by enough to cover the
+    ;; replacement's own bandwidth (needs at least ceil(rvsize*100/1000) extra).
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-rbf-rules mempool repl (1+ 10000) rvsize (list orig-txid))
+      (is-false ok)
+      (is (eq reason :insufficient-fee)))))
+
+(test rbf-rule5-cluster-cap
+  "Rule 5: conflicting directly with more than 100 distinct clusters is
+rejected :too-many-clusters (Core GetUniqueClusterCount > MAX_REPLACEMENT_
+CANDIDATES, rbf.cpp:69-74). 100 distinct clusters is allowed."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (conflicts '()))
+    ;; 101 independent singleton-cluster txs, each on its own outpoint
+    ;; (%rbf-tx's input-id fills a (unsigned-byte 8) array, so ids stay <= 255).
+    (loop for i from 1 to 101
+          for tx = (%rbf-tx i)
+          do (%add-tx mempool tx :fee 1000)
+             (push (bitcoin-lisp.serialization:transaction-hash tx) conflicts))
+    (let ((cand (%rbf-tx 200)))
+      ;; 101 distinct conflicting clusters => rejected.
+      (multiple-value-bind (ok reason)
+          (bitcoin-lisp.mempool:check-rbf-rules
+           mempool cand 100000000 (bitcoin-lisp.serialization:transaction-vsize cand)
+           conflicts)
+        (is-false ok)
+        (is (eq reason :too-many-clusters)))
+      ;; Dropping one leaves exactly 100 => the cluster cap is satisfied (and,
+      ;; paying a huge fee over singletons, the replacement is accepted).
+      (multiple-value-bind (ok reason)
+          (bitcoin-lisp.mempool:check-rbf-rules
+           mempool cand 100000000 (bitcoin-lisp.serialization:transaction-vsize cand)
+           (rest conflicts))
+        (declare (ignore reason))
         (is-true ok)))))
+
+(test rbf-rule5-gather-cap
+  "Rule 5 second bound: the conflicting clusters may hold at most 500 txs in
+total (Core GatherClusters cap). A single conflicting cluster larger than the
+cap is rejected :too-many-replacements."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         ;; A 3-tx conflicting cluster with the cap lowered to 2.
+         (root-txid (%rbf-chain mempool 150 3 :fee 10000))
+         (cand (%rbf-tx 150 :value 40000000))   ; conflicts with the root
+         (bitcoin-lisp.mempool::+max-rbf-gather-transactions+ 2))
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-rbf-rules
+         mempool cand 100000000 (bitcoin-lisp.serialization:transaction-vsize cand)
+         (list root-txid))
+      (is-false ok)
+      (is (eq reason :too-many-replacements)))))
+
+(test rbf-diagram-uncalculable-is-too-large-cluster
+  "When the staged replacement would form an over-limit cluster the diagram is
+uncalculable and the replacement is rejected :too-large-cluster (Core
+CheckMemPoolPolicyLimits failing before ImprovesFeerateDiagram)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (orig (%rbf-tx 160))
+         (orig-txid (bitcoin-lisp.serialization:transaction-hash orig))
+         (repl (%rbf-tx 160 :value 40000000)))
+    (%add-tx mempool orig :fee 1000)
+    ;; Rules 3/4 pass (huge fee), but a 200000-vbyte candidate exceeds the
+    ;; 101000-vB cluster size limit, so the diagram is uncalculable.
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp.mempool:check-rbf-rules mempool repl 200000 200000 (list orig-txid))
+      (is-false ok)
+      (is (eq reason :too-large-cluster)))))
 
 ;;;; PR5 CPFP eviction
 
