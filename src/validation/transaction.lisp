@@ -490,11 +490,18 @@ genuinely missing input)."
                (return-from mempool-extra-coins (values nil nil))))))))))
 
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
-                                         &key package-coins skip-fee-check chain-state)
+                                         &key package-coins skip-fee-check chain-state
+                                              bypass-limits skip-rbf-check
+                                              (allow-sibling-eviction t))
   "Validate a transaction for mempool acceptance.
 Performs consensus checks plus policy checks.
-Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure.
-FEE is returned as an integer (satoshis).
+Returns (VALUES T NIL FEE REPLACED MODIFIED-FEE DIRECT-CONFLICTS) on
+success, (VALUES NIL ERROR-KEYWORD NIL) on failure. FEE is the real paid fee
+(integer satoshis); REPLACED the txids the RBF rules would evict;
+MODIFIED-FEE the prioritisation-modified fee and DIRECT-CONFLICTS the
+directly-conflicting mempool txids — the workspace values Core's PreChecks
+leaves in ws.m_modified_fees / ws.m_conflicts for the package layer to read,
+returned so callers need not re-derive them.
 
 PACKAGE-COINS, when supplied, is a (txid . index) -> utxo-entry table of outputs
 produced by sibling transactions in a package being validated together (so a
@@ -505,7 +512,29 @@ feerate (Bitcoin Core's package_feerates path).
 CHAIN-STATE, when supplied, enables the relay finality + BIP68 sequence-lock
 checks (Core PreChecks: a tx that couldn't be mined into the NEXT block doesn't
 belong in the mempool). Omitted on paths re-adding already-confirmed txs (reorg
-re-add, mempool.dat reload) where those checks don't apply."
+re-add, mempool.dat reload) where those checks don't apply.
+
+BYPASS-LIMITS mirrors Core's ATMP bypass_limits (the reorg re-add path,
+MaybeUpdateMempoolForReorg): the minimum-fee floor (validation.cpp:945) and
+the TRUC topology checks (validation.cpp:951) are skipped — the tx was
+already confirmed, so reorgs may re-create TRUC-violating topologies (Core's
+comment at validation.cpp:340-341). RBF economics still apply.
+
+SKIP-RBF-CHECK skips the per-tx replacement economics while still detecting
+conflicts (returned as the 6th value), for the multi-transaction package
+path where Core evaluates all conflicts at once through PackageRBFChecks
+instead of per-tx ReplacementChecks (validation.cpp:1516); the caller runs
+CHECK-PACKAGE-RBF-RULES itself. It also disables the sibling-eviction
+fallthrough below regardless of ALLOW-SIBLING-EVICTION — with the economics
+skipped there is nothing to evaluate the eviction, so the TRUC error must
+surface (the invariant Core encodes as Assume(!m_allow_sibling_eviction) on
+its package-feerate args, validation.cpp:573).
+
+ALLOW-SIBLING-EVICTION (default T, matching Core's single-transaction
+contexts, validation.cpp:487-497) lets a TRUC descendant-limit failure fall
+through to the RBF path when SINGLE-TRUC-CHECKS identifies an evictable
+sibling: the sibling is added to the conflict set and replacement economics
+decide (Core PreChecks, validation.cpp:950-970)."
   ;; Must not be coinbase
   (when (and (= (length (bitcoin-lisp.serialization:transaction-inputs tx)) 1)
              (bitcoin-lisp.serialization:coinbase-input-p
@@ -659,8 +688,11 @@ re-add, mempool.dat reload) where those checks don't apply."
         ;; dynamic minimum when the mempool has been trimming). The rate is
         ;; sat/kvB (Core CFeeRate), so compare fee*1000 against rate*vsize --
         ;; exact integer math, no truncation to whole sat/vB. Skipped when this
-        ;; tx is part of a package evaluated at the package feerate.
+        ;; tx is part of a package evaluated at the package feerate, and for
+        ;; reorg re-adds (Core: !bypass_limits && !package_feerates &&
+        ;; CheckFeeRate, validation.cpp:945).
         (when (and (not skip-fee-check)
+                   (not bypass-limits)
                    (< (* modified-fee-value 1000)
                       (* (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)
                          vsize)))
@@ -670,15 +702,26 @@ re-add, mempool.dat reload) where those checks don't apply."
         ;; BIP431 TRUC (v3) topology: inheritance + ancestor/descendant/size
         ;; limits for this tx and its unconfirmed relatives. Runs on every tx
         ;; (non-v3 spending v3 is also rejected); a no-op for a lone non-v3 tx.
-        (multiple-value-bind (truc-ok truc-reason)
-            (bitcoin-lisp.mempool:single-truc-checks mempool tx vsize direct-conflicts)
-          (unless truc-ok
-            (return-from validate-transaction-for-mempool (values nil truc-reason nil))))
+        ;; Skipped under BYPASS-LIMITS (Core validation.cpp:951). A
+        ;; :truc-descendant-limit failure with an evictable sibling falls
+        ;; through to the RBF path instead when sibling eviction is allowed
+        ;; (Core validation.cpp:950-970): the sibling joins the conflict set
+        ;; and the replacement economics decide its fate.
+        (unless bypass-limits
+          (multiple-value-bind (truc-ok truc-reason sibling)
+              (bitcoin-lisp.mempool:single-truc-checks mempool tx vsize direct-conflicts)
+            (unless truc-ok
+              (if (and sibling allow-sibling-eviction (not skip-rbf-check))
+                  (pushnew sibling direct-conflicts :test #'equalp)
+                  (return-from validate-transaction-for-mempool
+                    (values nil truc-reason nil))))))
 
-        ;; BIP125 replace-by-fee: if this tx conflicts with mempool entries it
-        ;; must satisfy the replacement rules; the set it replaces is returned
-        ;; to the caller (4th value) to evict before adding.
-        (when direct-conflicts
+        ;; BIP125 replace-by-fee: if this tx conflicts with mempool entries
+        ;; (or evicts a TRUC sibling) it must satisfy the replacement rules;
+        ;; the set it replaces is returned to the caller (4th value) to evict
+        ;; before adding. SKIP-RBF-CHECK defers this to the caller's package
+        ;; RBF evaluation.
+        (when (and direct-conflicts (not skip-rbf-check))
           (multiple-value-bind (ok reason rset)
               (bitcoin-lisp.mempool:check-rbf-rules mempool tx modified-fee-value
                                                     vsize direct-conflicts)
@@ -697,7 +740,8 @@ re-add, mempool.dat reload) where those checks don't apply."
 
         (values t nil fee-value
                 (when replaced-set
-                  (loop for k being the hash-keys of replaced-set collect k)))))))
+                  (loop for k being the hash-keys of replaced-set collect k))
+                modified-fee-value direct-conflicts)))))
 
 ;;;; Script validation
 

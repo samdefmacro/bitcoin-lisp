@@ -518,6 +518,26 @@ dependency is held pending and the graph becomes oversized."
             (%resolve-pending graph)))))
   (values))
 
+(defun txgraph-add-dependencies (graph deps)
+  "Bulk TXGRAPH-ADD-DEPENDENCY: queue every (parent-handle . child-handle)
+pair in DEPS, then resolve them in ONE pass — one union-find grouping and
+one merge + relinearization per connected group (%RESOLVE-PENDING), instead
+of a merge per pair. This is the eager graph's analogue of Core's lazy
+m_deps_to_add batching (AddDependency only queues; GroupClusters/Merge run
+once in ApplyDependencies, txgraph.cpp:1856-2155), used by the reorg bulk
+re-add. Pairs whose endpoints are removed or equal are skipped; groups that
+would exceed the limits stay pending (graph oversized) until TXGRAPH-TRIM."
+  (%assert-no-builder graph)
+  (dolist (dep deps)
+    (%check-handle graph (car dep))
+    (%check-handle graph (cdr dep))
+    (unless (or (eq (car dep) (cdr dep))
+                (null (tx-handle-cluster (car dep)))
+                (null (tx-handle-cluster (cdr dep))))
+      (push (cons (car dep) (cdr dep)) (txgraph-pending-deps graph))))
+  (%resolve-pending graph)
+  (values))
+
 (defun txgraph-set-transaction-fee (graph handle fee)
   "Change the fee of HANDLE's transaction and re-linearize its cluster; a
 no-op if removed (Core SetTransactionFee, txgraph.cpp:2746-2760)."
@@ -562,6 +582,23 @@ oversized."
     (when cluster
       (loop for pos across (%cluster-linearization cluster)
             collect (aref (%cluster-mapping cluster) pos)))))
+
+(defun txgraph-get-cluster-chunks (graph handle)
+  "The chunks of the cluster HANDLE's transaction is in, in mining order, as
+a list of (handles . feerate) conses — HANDLES in linearization order,
+FEERATE the chunk's aggregate feefrac — or NIL if removed. Not part of
+Core's TxGraph interface: Core's RPC layer must RECONSTRUCT chunk membership
+from per-entry chunk feerates (clusterToJSON's size countdown,
+rpc/mempool.cpp:474-506) because its graph hides chunks; our eager cluster
+objects store them directly, so expose them. The graph must not be
+oversized."
+  (%check-handle graph handle)
+  (%assert-not-oversized graph 'txgraph-get-cluster-chunks)
+  (let ((cluster (tx-handle-cluster handle)))
+    (when cluster
+      (loop for chunk across (%cluster-chunks cluster)
+            collect (cons (coerce (%chunk-txs chunk) 'list)
+                          (copy-feefrac (%chunk-feerate chunk)))))))
 
 (defun txgraph-get-ancestors (graph handle)
   "All ancestors of HANDLE's transaction, including itself, in unspecified
@@ -689,23 +726,14 @@ decreasing-feerate sort, txgraph.cpp:2818-2831)."
                    do (push (copy-feefrac (%chunk-feerate chunk)) ffs)))
     (sort ffs #'feefrac>)))
 
-(defun txgraph-rbf-diagrams (graph removed-handles parent-handles new-fee new-size)
-  "Compute the mempool feerate diagrams before and after a candidate RBF
-replacement, without mutating GRAPH (Core ChangeSet::CalculateChunksForRBF ->
-GetMainStagingDiagrams, txmempool.cpp:994-1002, txgraph.cpp:2810-2834).
-
-REMOVED-HANDLES are the transactions the replacement evicts (the direct
-conflicts plus their descendants); PARENT-HANDLES are the candidate's
-in-mempool parents; NEW-FEE/NEW-SIZE describe the candidate (fee in satoshis,
-the prioritisation-modified fee; size in virtual bytes).
-
-Returns (values old-diagram new-diagram): each a list of FeeFracs sorted by
-DECREASING feerate — the chunk feerates whose concave cumulative curve is the
-diagram. Returns (values :uncalculable nil) when the staged replacement would
-form an over-limit cluster (Core CalculateChunksForRBF returning an Error via
-a failed CheckMemPoolPolicyLimits, txmempool.cpp:997-999). GRAPH must not be
-oversized."
-  (%assert-not-oversized graph 'txgraph-rbf-diagrams)
+(defun %rbf-staged-diagrams (graph removed-handles parent-handles new-chain)
+  "The shared staging core of TXGRAPH-RBF-DIAGRAMS and
+TXGRAPH-PACKAGE-RBF-DIAGRAMS. NEW-CHAIN is a list of (fee . size) conses
+describing the candidate transactions, added as a dependency CHAIN (each
+subsequent tx spends its predecessor — the only two shapes Core stages are a
+single candidate and a 1-parent-1-child package); PARENT-HANDLES are in-graph
+parents of the FIRST chain member."
+  (%assert-not-oversized graph '%rbf-staged-diagrams)
   ;; The affected main clusters: those of the evicted txs (Core's (P,R)
   ;; conflicts) and those of the candidate's parents (the only clusters a
   ;; staging cluster can overlap, Core's (P,P) conflicts).
@@ -735,15 +763,52 @@ oversized."
                      (ch (gethash (cdr edge) copy)))
                  (when (and p ch)
                    (txgraph-add-dependency scratch p ch)))))
-    (let ((cand (txgraph-add-transaction scratch new-fee new-size)))
-      (dolist (ph parent-handles)
-        (let ((p (gethash ph copy)))
-          (when p (txgraph-add-dependency scratch p cand)))))
+    (let ((prev nil))
+      (dolist (spec new-chain)
+        (let ((cand (txgraph-add-transaction scratch (car spec) (cdr spec))))
+          (if prev
+              (txgraph-add-dependency scratch prev cand)
+              (dolist (ph parent-handles)
+                (let ((p (gethash ph copy)))
+                  (when p (txgraph-add-dependency scratch p cand)))))
+          (setf prev cand))))
     (if (txgraph-oversized-p scratch)
         (values :uncalculable nil)
         ;; Old diagram off the live clusters, new diagram off the scratch ones.
         (values (%cluster-set-diagram affected)
                 (%cluster-set-diagram (txgraph-clusters scratch))))))
+
+(defun txgraph-rbf-diagrams (graph removed-handles parent-handles new-fee new-size)
+  "Compute the mempool feerate diagrams before and after a candidate RBF
+replacement, without mutating GRAPH (Core ChangeSet::CalculateChunksForRBF ->
+GetMainStagingDiagrams, txmempool.cpp:994-1002, txgraph.cpp:2810-2834).
+
+REMOVED-HANDLES are the transactions the replacement evicts (the direct
+conflicts plus their descendants); PARENT-HANDLES are the candidate's
+in-mempool parents; NEW-FEE/NEW-SIZE describe the candidate (fee in satoshis,
+the prioritisation-modified fee; size in virtual bytes).
+
+Returns (values old-diagram new-diagram): each a list of FeeFracs sorted by
+DECREASING feerate — the chunk feerates whose concave cumulative curve is the
+diagram. Returns (values :uncalculable nil) when the staged replacement would
+form an over-limit cluster (Core CalculateChunksForRBF returning an Error via
+a failed CheckMemPoolPolicyLimits, txmempool.cpp:997-999). GRAPH must not be
+oversized."
+  (%rbf-staged-diagrams graph removed-handles parent-handles
+                        (list (cons new-fee new-size))))
+
+(defun txgraph-package-rbf-diagrams (graph removed-handles
+                                     parent-fee parent-size child-fee child-size)
+  "TXGRAPH-RBF-DIAGRAMS for a 1-parent-1-child package replacement (Core
+PackageRBFChecks staging both package transactions into the same changeset
+before ImprovesFeerateDiagram, validation.cpp:1080-1121): the staged additions
+are the package parent and its child, wired parent -> child. The package has
+no in-graph parents by construction — Core rejects package RBF when either
+transaction has in-mempool ancestors (validation.cpp:1060-1064) — so no
+PARENT-HANDLES parameter. Same return convention as TXGRAPH-RBF-DIAGRAMS."
+  (%rbf-staged-diagrams graph removed-handles '()
+                        (list (cons parent-fee parent-size)
+                              (cons child-fee child-size))))
 
 ;;;; Chunk-index consumers: block builder and eviction
 
@@ -817,6 +882,15 @@ GetCurrentChunk)."
       (let ((chunk (svref index pos)))
         (values (coerce (%chunk-txs chunk) 'list)
                 (copy-feefrac (%chunk-feerate chunk)))))))
+
+(defun block-builder-current-chunk-feerate (builder)
+  "The current chunk's aggregate feefrac only — BLOCK-BUILDER-CURRENT-CHUNK
+without materializing the handle list — or NIL when iteration is done. For
+consumers like the feerate diagram that never look at the members."
+  (let ((index (block-builder-index builder))
+        (pos (block-builder-pos builder)))
+    (when (< pos (length index))
+      (copy-feefrac (%chunk-feerate (svref index pos))))))
 
 (defun block-builder-include (builder)
   "Mark the current chunk as included and move to the next (Core Include)."

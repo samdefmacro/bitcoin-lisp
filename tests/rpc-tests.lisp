@@ -2401,3 +2401,82 @@ the global level threshold)."
            (is (search "MARKER-ENABLED" out))
            (is (null (search "MARKER-OTHER" out)))))
     (clrhash bitcoin-lisp::*debug-categories*)))
+
+;;; --- Cluster mempool RPCs (P9: entry chunk fields, getmempoolcluster,
+;;; getmempoolfeeratediagram — Core rpc/mempool.cpp:413-506/609-650/829-862) ---
+
+(test rpc-mempool-cluster-and-diagram
+  "Entry chunk fields, getmempoolcluster shape, and the cumulative feerate
+diagram, over a CPFP pair that shares one chunk. Sizes are in vB (our
+txgraph unit; Core uses sigops-adjusted weight)."
+  (let* ((node (make-test-node))
+         (mempool (bitcoin-lisp::node-mempool node))
+         (parent (%mp-spending-tx (%txid-array 210) :vout 0 :value 50000000))
+         (pid (bitcoin-lisp.serialization:transaction-hash parent))
+         (pid-hex (bitcoin-lisp.rpc::hash-to-hex pid))
+         (child (%mp-spending-tx pid :vout 0 :value 40000000))
+         (cid (bitcoin-lisp.serialization:transaction-hash child))
+         (cid-hex (bitcoin-lisp.rpc::hash-to-hex cid))
+         (pvsize (bitcoin-lisp.serialization:transaction-vsize parent))
+         (cvsize (bitcoin-lisp.serialization:transaction-vsize child)))
+    ;; Empty mempool: the diagram is just the (0, 0) origin.
+    (let ((r (bitcoin-lisp.rpc::rpc-getmempoolfeeratediagram node nil)))
+      (is (= 1 (length r)))
+      (is (= 0 (cdr (assoc "weight" (first r) :test #'string=))))
+      (is (zerop (cdr (assoc "fee" (first r) :test #'string=)))))
+    ;; Low-fee parent + CPFP child: one chunk of (20100, pvsize+cvsize).
+    (%add-tx mempool parent :fee 100)
+    (%add-tx mempool child :fee 20000)
+    ;; getmempoolentry chunk fields (fees.chunk in BTC, chunkweight in vB).
+    (let* ((r (bitcoin-lisp.rpc::rpc-getmempoolentry node (list pid-hex)))
+           (fees (cdr (assoc "fees" r :test #'string=))))
+      (is (= (+ pvsize cvsize) (cdr (assoc "chunkweight" r :test #'string=))))
+      (is (= 20100 (round (* 100000000 (cdr (assoc "chunk" fees :test #'string=)))))))
+    ;; getmempoolcluster: one cluster, one chunk, txs in mining order.
+    (let* ((r (bitcoin-lisp.rpc::rpc-getmempoolcluster node (list cid-hex)))
+           (chunks (cdr (assoc "chunks" r :test #'string=))))
+      (is (= 2 (cdr (assoc "txcount" r :test #'string=))))
+      (is (= (+ pvsize cvsize) (cdr (assoc "clusterweight" r :test #'string=))))
+      (is (= 1 (length chunks)))
+      (let ((chunk (first chunks)))
+        (is (= 20100 (round (* 100000000 (cdr (assoc "chunkfee" chunk :test #'string=))))))
+        (is (= (+ pvsize cvsize) (cdr (assoc "chunkweight" chunk :test #'string=))))
+        (is (equal (list pid-hex cid-hex) (cdr (assoc "txs" chunk :test #'string=))))))
+    ;; The diagram now has the origin plus one cumulative chunk point.
+    (let ((r (bitcoin-lisp.rpc::rpc-getmempoolfeeratediagram node nil)))
+      (is (= 2 (length r)))
+      (is (= (+ pvsize cvsize) (cdr (assoc "weight" (second r) :test #'string=))))
+      (is (= 20100 (round (* 100000000 (cdr (assoc "fee" (second r) :test #'string=)))))))
+    ;; A standalone lower-feerate tx appends a second, later diagram point.
+    (let ((solo (make-mempool-test-tx :input-id 211)))
+      (%add-tx mempool solo :fee 50)
+      (let ((r (bitcoin-lisp.rpc::rpc-getmempoolfeeratediagram node nil)))
+        (is (= 3 (length r)))
+        (is (= 20150 (round (* 100000000 (cdr (assoc "fee" (third r) :test #'string=))))))))
+    ;; getmempoolcluster on an absent txid errors like getmempoolentry.
+    (signals error
+      (bitcoin-lisp.rpc::rpc-getmempoolcluster
+       node (list (bitcoin-lisp.rpc::hash-to-hex (%txid-array 212)))))))
+
+(test rpc-mempool-cluster-two-chunks
+  "A cluster whose child does NOT absorb its parent reports two chunks in
+mining order (parent's first)."
+  (let* ((node (make-test-node))
+         (mempool (bitcoin-lisp::node-mempool node))
+         (parent (%mp-spending-tx (%txid-array 213) :vout 0 :value 50000000))
+         (pid (bitcoin-lisp.serialization:transaction-hash parent))
+         (pid-hex (bitcoin-lisp.rpc::hash-to-hex pid))
+         (child (%mp-spending-tx pid :vout 0 :value 40000000))
+         (cid-hex (bitcoin-lisp.rpc::hash-to-hex
+                   (bitcoin-lisp.serialization:transaction-hash child))))
+    (%add-tx mempool parent :fee 20000)
+    (%add-tx mempool child :fee 100)
+    (let* ((r (bitcoin-lisp.rpc::rpc-getmempoolcluster node (list pid-hex)))
+           (chunks (cdr (assoc "chunks" r :test #'string=))))
+      (is (= 2 (length chunks)))
+      (is (equal (list pid-hex) (cdr (assoc "txs" (first chunks) :test #'string=))))
+      (is (equal (list cid-hex) (cdr (assoc "txs" (second chunks) :test #'string=))))
+      (is (= 20000 (round (* 100000000
+                             (cdr (assoc "chunkfee" (first chunks) :test #'string=))))))
+      (is (= 100 (round (* 100000000
+                           (cdr (assoc "chunkfee" (second chunks) :test #'string=)))))))))
