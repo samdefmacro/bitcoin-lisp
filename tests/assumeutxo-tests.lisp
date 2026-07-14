@@ -394,7 +394,7 @@ chainstate.dat in-transition, and vice versa."
 ;;;; Service bits (Core init.cpp:863,1946-1953)
 
 (test assumeutxo-service-bits
-  "local-service-bits mirrors Core's g_local_services: the base is always
+  "local-services mirrors Core's g_local_services: the base is always
 NODE_NETWORK_LIMITED | NODE_WITNESS; NODE_NETWORK is added only when not
 pruning AND no historical chainstate exists (i.e. no assumeutxo background
 sync in progress)."
@@ -404,7 +404,7 @@ sync in progress)."
     ;; No node at all: full service (not pruning).
     (let ((bitcoin-lisp::*node* nil)
           (bitcoin-lisp::*prune-target-mib* nil))
-      (let ((bits (bitcoin-lisp.networking::local-service-bits)))
+      (let ((bits (bitcoin-lisp.networking::local-services)))
         (is (logtest bits network))
         (is (logtest bits limited))
         (is (logtest bits witness))))
@@ -420,7 +420,7 @@ sync in progress)."
       (let ((bitcoin-lisp::*node* node)
             (bitcoin-lisp::*prune-target-mib* nil))
         (is (not (null (bitcoin-lisp::node-historical-chainstate node))))
-        (let ((bits (bitcoin-lisp.networking::local-service-bits)))
+        (let ((bits (bitcoin-lisp.networking::local-services)))
           (is (not (logtest bits network)))
           (is (logtest bits limited))
           (is (logtest bits witness)))))))
