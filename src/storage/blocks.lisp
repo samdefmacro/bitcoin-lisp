@@ -145,8 +145,12 @@ maintained by store-block/prune-block (initialized by init-block-store)."
 
 (defun prune-old-blocks (store chain-state &key on-prune)
   "Prune old blocks when storage exceeds target.
-Deletes oldest block files until storage is at or below *prune-target-mib*,
-respecting +min-blocks-to-keep+ and *prune-after-height*.
+Deletes oldest block files until storage is at or below the effective prune
+target (halved while an assumeutxo historical chainstate exists — Core
+BlockManager::FindFilesToPrune, node/blockstorage.cpp:330-338), respecting
++min-blocks-to-keep+, *prune-after-height*, and CHAIN-STATE's per-chainstate
+prune floor (an unvalidated snapshot chainstate never prunes at or below its
+base — Core Chainstate::GetPruneRange).
 Only runs in automatic pruning mode.
 Returns the number of blocks pruned."
   (unless (bitcoin-lisp:automatic-pruning-p)
@@ -156,21 +160,21 @@ Returns the number of blocks pruned."
     ;; Don't prune until chain reaches prune-after-height
     (when (< current-height prune-after)
       (return-from prune-old-blocks 0))
-    (let ((target-bytes (* bitcoin-lisp:*prune-target-mib* 1048576)))
+    (let ((target-bytes (bitcoin-lisp:effective-prune-target-bytes)))
       (when (<= (block-store-total-bytes store) target-bytes)
         (return-from prune-old-blocks 0))
-      ;; Calculate the lowest height we're allowed to prune to
+      ;; Calculate the allowed prune window: (floor, min-keep-height].
       (let* ((min-keep-height (max 0 (- current-height bitcoin-lisp:+min-blocks-to-keep+)))
-             (pruned-height (chain-state-pruned-height chain-state))
+             (start (chain-state-prune-walk-start chain-state))
              (pruned 0))
-        ;; Walk from pruned-height+1 upward, deleting blocks until the
-        ;; running total (maintained by prune-block) is back under target.
+        ;; Walk from start+1 upward, deleting blocks until the running
+        ;; total (maintained by prune-block) is back under target.
         ;; One active-chain walk for the whole range — get-block-at-height
         ;; per height would re-walk from the tip each time, quadratic for
         ;; the initial catch-up prune that deletes a large range at once.
         (loop for entry in (active-chain-entries-from
-                            chain-state (1+ pruned-height)
-                            (- min-keep-height pruned-height))
+                            chain-state (1+ start)
+                            (- min-keep-height start))
               while (> (block-store-total-bytes store) target-bytes)
               do (when (prune-block store (block-index-entry-hash entry))
                    (incf pruned))
@@ -188,20 +192,22 @@ Returns the number of blocks pruned."
 
 (defun prune-blocks-to-height (store chain-state target-height &key on-prune)
   "Prune all block files below TARGET-HEIGHT.
-Respects +min-blocks-to-keep+ retention.
+Respects +min-blocks-to-keep+ retention and CHAIN-STATE's per-chainstate
+prune floor (Core FindFilesToPruneManual also bounds the manual range by
+GetPruneRange, node/blockstorage.cpp:292-319).
 Returns the number of blocks pruned."
   (unless (bitcoin-lisp:pruning-enabled-p)
     (return-from prune-blocks-to-height 0))
   (let* ((current-height (chain-state-best-height chain-state))
          (max-prune-height (max 0 (- current-height bitcoin-lisp:+min-blocks-to-keep+)))
          (effective-target (min target-height max-prune-height))
-         (pruned-height (chain-state-pruned-height chain-state))
+         (start (chain-state-prune-walk-start chain-state))
          (pruned 0))
-    (when (<= effective-target pruned-height)
+    (when (<= effective-target start)
       (return-from prune-blocks-to-height 0))
     (dolist (entry (active-chain-entries-from
-                    chain-state (1+ pruned-height)
-                    (- effective-target pruned-height 1)))
+                    chain-state (1+ start)
+                    (- effective-target start 1)))
       (when (prune-block store (block-index-entry-hash entry))
         (incf pruned))
       (when on-prune

@@ -615,3 +615,174 @@ an oversized raw script is skipped and replaced with OP_RETURN."
         (s (bitcoin-lisp.serialization:bb-finish buf))
       (is (equalp #(#x6A) (bitcoin-lisp.serialization:read-compressed-script s)))
       (is (= 7 (bitcoin-lisp.serialization:read-core-varint s))))))
+
+;;;; Assumeutxo P6: pruned-node activation + dumptxoutset rollback
+
+(test snapshot-load-on-pruned-node
+  "loadtxoutset works on a pruned node (P6 lifts the P4 refusal; Core's
+loadtxoutset has no pruned check — safety comes from the per-chainstate
+prune floor, Chainstate::GetPruneRange, and the halved automatic target,
+FindFilesToPrune). Activation also splits the coins-cache budget 95/5
+toward the snapshot chainstate while the node is in IBD (Core
+MaybeRebalanceCaches via ActivateSnapshot)."
+  (%with-snap-dir (src-dir)
+    (%with-snap-dir (dst-dir)
+      (let* ((bitcoin-lisp:*prune-target-mib* 550)   ; pruning ON
+             (bitcoin-lisp:*prune-after-height* 0)
+             (h5 (%snap-fill 32 5))
+             (txid (%snap-fill 32 #x33))
+             (spk (%snap-cat #(#x51)))
+             (src (%snap-node src-dir h5 5))
+             (snap-path (namestring (merge-pathnames "utxo.dat" src-dir))))
+        (bitcoin-lisp.storage:update-chain-tip
+         (bitcoin-lisp::node-chain-state src) h5 5)
+        (bitcoin-lisp.storage:add-utxo (bitcoin-lisp::node-utxo-set src)
+                                       txid 0 1000 spk 1)
+        (bitcoin-lisp.rpc::rpc-dumptxoutset src (list snap-path "latest"))
+        (let* ((hash (bitcoin-lisp.storage:compute-utxo-set-hash
+                      (bitcoin-lisp::node-utxo-set src)))
+               (dst (%snap-node dst-dir h5 5))
+               (bitcoin-lisp:*assumeutxo-data-override*
+                 (list (%snap-au 5 h5 hash 7)))
+               (bitcoin-lisp.networking::*cached-is-ibd* t))
+          (let ((r (bitcoin-lisp.rpc::rpc-loadtxoutset dst (list snap-path))))
+            (is (= 1 (cdr (assoc "coins_loaded" r :test #'string=)))))
+          (is (= 2 (length (bitcoin-lisp::node-chainstates dst))))
+          (let ((current (bitcoin-lisp::node-current-chainstate dst))
+                (historical (bitcoin-lisp::node-historical-chainstate dst))
+                (store (bitcoin-lisp::node-block-store dst)))
+            ;; Per-chainstate prune ranges: the snapshot chainstate may never
+            ;; prune at or below its base; the historical prunes from 0.
+            (is (= 5 (bitcoin-lisp.storage:chain-state-prune-floor current)))
+            (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor historical)))
+            ;; An over-target automatic prune driven by the snapshot
+            ;; chainstate deletes nothing at or below the base.
+            (setf (bitcoin-lisp.storage:block-store-total-bytes store)
+                  (* 600 1048576))
+            (let ((bitcoin-lisp::*node* dst))
+              (is (= 0 (bitcoin-lisp.storage:prune-old-blocks store current)))
+              ;; The automatic target is halved (floored at 550 MiB) while
+              ;; the historical chainstate exists.
+              (is (= bitcoin-lisp:+min-disk-space-for-block-files+
+                     (bitcoin-lisp:effective-prune-target-bytes)))
+              (let ((bitcoin-lisp:*prune-target-mib* 2000))
+                (is (= (* 1000 1048576)
+                       (bitcoin-lisp:effective-prune-target-bytes)))))
+            ;; Activation rebalanced the coins-cache budget: 95% to the
+            ;; snapshot (current) chainstate during IBD, 5% historical.
+            (let ((total bitcoin-lisp::*coins-cache-budget-bytes*))
+              (is (= (floor (* total 0.95d0))
+                     (bitcoin-lisp.storage:chain-state-coins-cache-bytes current)))
+              (is (= (floor (* total 0.05d0))
+                     (bitcoin-lisp.storage:chain-state-coins-cache-bytes historical)))
+              (is (= (floor (* total 0.95d0))
+                     (bitcoin-lisp::chainstate-coins-cache-budget current))))))))))
+
+(test snapshot-dump-rollback-roundtrip
+  "dumptxoutset with a rollback target (Core rpc/blockchain.cpp:3034-3196):
+the active chain is temporarily rolled back via invalidateblock (network
+activity suspended during, restored after — reverse RAII order), the UTXO
+set is dumped at the target height, and the chain is restored with
+reconsiderblock. The historical dump re-loads through loadtxoutset's full
+verification gate on a fresh node."
+  (%with-mainnet-network
+   (%with-snap-dir (dst-dir)
+     (multiple-value-bind (cs utxo store genesis-hash)
+         (%make-activate-block-fixture "rollback-dump")
+       (let* ((bitcoin-lisp:*prune-target-mib* nil)
+              (node (bitcoin-lisp::make-node :network :testnet3))
+              (hashes (make-test-chain-hashes #xD1 4))
+              (h2 (second hashes))
+              (dump-path (namestring (merge-pathnames "rollback.dat" dst-dir))))
+         (setf (bitcoin-lisp.storage:chain-state-coins-view cs) utxo
+               (bitcoin-lisp::node-chainstates node) (list cs)
+               (bitcoin-lisp::node-block-store node) store)
+         (%build-and-connect cs store utxo genesis-hash hashes)
+         (is (= 4 (bitcoin-lisp.storage:current-height cs)))
+         (let ((tip-hash (bitcoin-lisp.storage:best-block-hash cs))
+               (pre-dump-hash (bitcoin-lisp.storage:compute-utxo-set-hash utxo))
+               (opts (make-hash-table :test 'equal)))
+           (setf (gethash "rollback" opts) 2)
+           ;; --- Parameter/precondition matrix (before any state change) ---
+           ;; A non-rollback type conflicting with the rollback option.
+           (signals bitcoin-lisp.rpc::rpc-error
+             (bitcoin-lisp.rpc::rpc-dumptxoutset
+              node (list (namestring (merge-pathnames "x1.dat" dst-dir))
+                         "latest" opts)))
+           ;; Rollback target above the tip.
+           (let ((bad (make-hash-table :test 'equal)))
+             (setf (gethash "rollback" bad) 99)
+             (signals bitcoin-lisp.rpc::rpc-error
+               (bitcoin-lisp.rpc::rpc-dumptxoutset
+                node (list (namestring (merge-pathnames "x2.dat" dst-dir))
+                           "rollback" bad))))
+           ;; Negative rollback target.
+           (let ((bad (make-hash-table :test 'equal)))
+             (setf (gethash "rollback" bad) -1)
+             (signals bitcoin-lisp.rpc::rpc-error
+               (bitcoin-lisp.rpc::rpc-dumptxoutset
+                node (list (namestring (merge-pathnames "x3.dat" dst-dir))
+                           "rollback" bad))))
+           ;; Pruned refusal: block data below the target already gone.
+           (let ((bitcoin-lisp:*prune-target-mib* 550))
+             (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 2)
+             (let ((err (handler-case
+                            (progn (bitcoin-lisp.rpc::rpc-dumptxoutset
+                                    node (list (namestring
+                                                (merge-pathnames "x4.dat" dst-dir))
+                                               "rollback" opts))
+                                   nil)
+                          (bitcoin-lisp.rpc::rpc-error (e) e))))
+               (is (%snap-err-matches err -1 "already pruned")))
+             (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 0))
+           ;; --- The real rollback dump (positional options form) ---
+           (is (eq t (bitcoin-lisp::node-network-active node)))
+           (let ((r (bitcoin-lisp.rpc::rpc-dumptxoutset
+                     node (list dump-path "rollback" opts))))
+             (is (= 2 (cdr (assoc "base_height" r :test #'string=))))
+             (is (string= (bitcoin-lisp.rpc::hash-to-hex h2)
+                          (cdr (assoc "base_hash" r :test #'string=))))
+             (is (= 2 (cdr (assoc "coins_written" r :test #'string=))))
+             ;; Chain fully restored: original tip, nothing left invalid,
+             ;; the UTXO set re-hashes to its pre-dump value, and network
+             ;; activity is back on.
+             (is (= 4 (bitcoin-lisp.storage:current-height cs)))
+             (is (equalp tip-hash (bitcoin-lisp.storage:best-block-hash cs)))
+             (is (not (eq :invalid (bitcoin-lisp.storage:block-index-entry-status
+                                    (bitcoin-lisp.storage:get-block-index-entry
+                                     cs (third hashes))))))
+             (is (equalp pre-dump-hash
+                         (bitcoin-lisp.storage:compute-utxo-set-hash utxo)))
+             (is (eq t (bitcoin-lisp::node-network-active node)))
+             ;; --- Verified re-load of the historical dump ---
+             (let* ((dump-hash (bitcoin-lisp.rpc::parse-hex-hash
+                                (cdr (assoc "txoutset_hash" r :test #'string=))))
+                    (dst (%snap-node dst-dir h2 2))
+                    (bitcoin-lisp:*assumeutxo-data-override*
+                      (list (%snap-au 2 h2 dump-hash 3)))
+                    (bitcoin-lisp.networking::*cached-is-ibd* t))
+               (let ((r2 (bitcoin-lisp.rpc::rpc-loadtxoutset dst (list dump-path))))
+                 (is (= 2 (cdr (assoc "coins_loaded" r2 :test #'string=))))
+                 (is (= 2 (cdr (assoc "base_height" r2 :test #'string=)))))
+               (let ((current (bitcoin-lisp::node-current-chainstate dst)))
+                 (is (= 2 (bitcoin-lisp.storage:current-height current)))
+                 (is (equalp h2 (bitcoin-lisp.storage:best-block-hash current)))
+                 (is (equalp dump-hash
+                             (bitcoin-lisp.storage:compute-utxo-set-hash
+                              (bitcoin-lisp::node-utxo-set dst)))))))
+           ;; --- Bare type "rollback": defaults to the highest available
+           ;; assumeutxo snapshot height (GetAvailableSnapshotHeights) ---
+           (let* ((bitcoin-lisp:*assumeutxo-data-override*
+                    (list (%snap-au 2 h2 (%snap-fill 32 0) 3)))
+                  (path2 (namestring (merge-pathnames "rollback2.dat" dst-dir)))
+                  (r (bitcoin-lisp.rpc::rpc-dumptxoutset node (list path2 "rollback"))))
+             (is (= 2 (cdr (assoc "base_height" r :test #'string=))))
+             (is (= 4 (bitcoin-lisp.storage:current-height cs))))
+           ;; --- An already-disabled network stays disabled afterwards ---
+           (setf (bitcoin-lisp::node-network-active node) nil)
+           (let ((path3 (namestring (merge-pathnames "rollback3.dat" dst-dir))))
+             (bitcoin-lisp.rpc::rpc-dumptxoutset node (list path3 "" opts))
+             (is (eq nil (bitcoin-lisp::node-network-active node)))
+             (is (= 4 (bitcoin-lisp.storage:current-height cs))))
+           (setf (bitcoin-lisp::node-network-active node) t))
+         (clrhash bitcoin-lisp.validation::*block-undo-data*))))))
