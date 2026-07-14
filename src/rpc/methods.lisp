@@ -676,7 +676,9 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
             ("minrelaytxfee" . ,relay-fee-btc-kvb)
             ("incrementalrelayfee" . ,incfee)
             ("unbroadcastcount" . 0)
-            ("fullrbf" . ,(and bitcoin-lisp.mempool:*mempool-full-rbf* t))))
+            ;; Acceptance is unconditionally full-RBF since cluster mempool;
+            ;; Core hardcodes true (rpc/mempool.cpp:1048, field DEPRECATED).
+            ("fullrbf" . t)))
         `(("loaded" . nil)
           ("size" . 0)
           ("bytes" . 0)
@@ -687,7 +689,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           ("minrelaytxfee" . 0.000001)
           ("incrementalrelayfee" . ,incfee)
           ("unbroadcastcount" . 0)
-          ("fullrbf" . ,(and bitcoin-lisp.mempool:*mempool-full-rbf* t))))))
+          ("fullrbf" . t)))))
 
 (defun rpc-getrawmempool (node params)
   "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
@@ -748,11 +750,11 @@ getmempooldescendants."
                                    (push (hash-to-hex c) sb))
                                  (bitcoin-lisp.mempool::mempool-entry-children entry))
                         sb))
-        ;; BIP125: replaceable if the tx or any unconfirmed ancestor signals,
-        ;; or full-rbf is on.
+        ;; BIP125: whether the tx or any unconfirmed ancestor SIGNALS
+        ;; replaceability (Core IsRBFOptIn, reporting only — acceptance is
+        ;; unconditionally full-RBF; rpc/mempool.cpp:456,567, DEPRECATED).
         ("bip125-replaceable"
-         . ,(and (or bitcoin-lisp.mempool:*mempool-full-rbf*
-                     (bitcoin-lisp.mempool::mempool-tx-or-ancestor-signals-rbf-p mempool txid))
+         . ,(and (bitcoin-lisp.mempool::mempool-tx-or-ancestor-signals-rbf-p mempool txid)
                  t))
         ("unbroadcast" . nil)))))
 
