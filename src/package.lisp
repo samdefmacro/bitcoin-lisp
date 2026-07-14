@@ -515,6 +515,7 @@
    ;; Target block / historical-chainstate path (Core SetTargetBlock)
    #:entry-ancestor-at-height
    #:set-chainstate-target
+   #:clear-snapshot-chainstate-identity
    #:target-ancestor-entry
    #:entry-target-ancestor-p
    #:chain-state-target-height
@@ -528,6 +529,8 @@
    #:read-snapshot-base-blockhash
    #:find-assumeutxo-chainstate-dir
    #:delete-snapshot-chainstate-files
+   #:rename-snapshot-chainstate-dir-invalid
+   #:promote-snapshot-chainstate-files
    ;; UTXO persistence
    #:save-utxo-set
    #:load-utxo-set
@@ -1365,5 +1368,6 @@
    #:stop-file-logging
    #:maybe-periodic-flush
    #:index-block-filter
-   #:index-block-coinstats))
+   #:index-block-coinstats
+   #:maybe-validate-snapshot))
 

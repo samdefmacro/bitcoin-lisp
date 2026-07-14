@@ -822,6 +822,285 @@ before crash-recovery resolution (a torn snapshot flush joins
                        base-height)
              snap)))))))
 
+;;;; --- Assumeutxo P5: background-validation completion + promotion --------
+;;;;
+;;;; When the historical (validated-from-genesis) chainstate finishes
+;;;; re-deriving history up to the snapshot base, its UTXO set must reproduce
+;;;; the committed hash_serialized_3 exactly. maybe-validate-snapshot re-hashes
+;;;; it and, on a match, promotes the snapshot chainstate to VALIDATED (Core
+;;;; ChainstateManager::MaybeValidateSnapshot, validation.cpp:5986-6096); on a
+;;;; mismatch it marks the snapshot INVALID, renames its dir aside for
+;;;; forensics, and fires a fatal shutdown. A mid-run success keeps both
+;;;; chainstates running until the next restart, when
+;;;; validated-snapshot-cleanup swaps the LevelDB dirs so the snapshot
+;;;; chainstate becomes the sole chainstate (Core ValidatedSnapshotCleanup,
+;;;; validation.cpp:6299-6364). Assumeutxo status is never persisted, so it is
+;;;; re-proven by re-hashing on every startup.
+
+(defun %node-snapshot-chainstate (node)
+  "The node's snapshot-derived chainstate (the one carrying a
+from-snapshot-blockhash), regardless of its assumeutxo status, or NIL."
+  (find-if #'bitcoin-lisp.storage:chain-state-from-snapshot-blockhash
+           (node-chainstates node)))
+
+(defun %default-snapshot-fatal (message)
+  "Production reaction to a snapshot that failed background validation (Core
+GetNotifications().fatalError): log the error and request node shutdown. The
+invalid snapshot chainstate dir was already renamed aside for forensics; on
+the next restart the node resumes normal IBD from the validated chain. Runs
+on the sync thread, so it only flips node-running (letting the loops wind
+themselves down) rather than joining threads via stop-node."
+  (log-error "[snapshot] !!! ~A" message)
+  (log-error "[snapshot] the node will shut down and stop using any state built on the snapshot")
+  (when *node*
+    (setf (node-running *node*) nil)))
+
+(defvar *snapshot-fatal-hook* '%default-snapshot-fatal
+  "Funcalled with a message string when an assumeutxo snapshot fails
+background validation mid-run. Production shuts the node down; tests rebind
+it to record the fatal DECISION without exiting the image.")
+
+(defun %snapshot-validation-preconditions-p (node historical snap)
+  "T iff HISTORICAL is a validated-from-genesis chainstate that has reached
+the snapshot base SNAP was built from — the point at which the snapshot can
+be validated (Core MaybeValidateSnapshot's guard, validation.cpp:5990-6003).
+A no-op-guarding predicate: false in every arrangement other than a
+background sync that has just landed on its target."
+  (and node snap historical
+       (member historical (node-chainstates node))
+       (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash snap)
+       (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status snap) :unvalidated)
+       (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status historical) :validated)
+       (bitcoin-lisp.storage:best-block-hash historical)
+       (bitcoin-lisp.storage:chain-state-target-blockhash historical)
+       (equalp (bitcoin-lisp.storage:chain-state-target-blockhash historical)
+               (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash snap))
+       ;; ReachedTarget: the historical tip IS the target/base block.
+       (equalp (bitcoin-lisp.storage:best-block-hash historical)
+               (bitcoin-lisp.storage:chain-state-target-blockhash historical))))
+
+(defun %mark-snapshot-invalid (node historical snap)
+  "State mutation Core performs when a snapshot fails validation
+(MaybeValidateSnapshot's handle_invalid_snapshot + InvalidateCoinsDBOnDisk,
+validation.cpp:6026-6036): reset the historical chainstate's target back to
+the network tip, mark the snapshot chainstate :invalid, close its coins DB and
+rename its dir aside for forensics. No process shutdown here — the caller
+drives that."
+  (bitcoin-lisp.storage:set-chainstate-target historical nil)
+  (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status snap) :invalid)
+  (bitcoin-lisp.storage:close-chainstate-coins-view snap)
+  (ignore-errors
+    (bitcoin-lisp.storage:rename-snapshot-chainstate-dir-invalid
+     (node-data-directory node))))
+
+(defun %validate-snapshot-against-commitment (node historical snap)
+  "The core of Core's MaybeValidateSnapshot (validation.cpp:6039-6095), minus
+the shutdown/cleanup reactions the callers own. Flush HISTORICAL, hash its
+coins DB, and compare to the chainparams commitment for the snapshot base.
+
+MATCH -> SNAP becomes :validated and HISTORICAL records its target-utxohash,
+         so select-historical-chainstate stops returning it (the background
+         work is done). Returns (values :success NIL).
+MISMATCH / no chainparams entry -> %mark-snapshot-invalid, and returns
+         (values :hash-mismatch MESSAGE) or (values :missing-chainparams MESSAGE)."
+  ;; Core holds cs_main so the historical chainstate can't advance during
+  ;; hashing; our caller runs on the single sync/startup thread, so it is
+  ;; likewise frozen. Flush it first (Core ForceFlushStateToDisk) — this also
+  ;; persists the historical's final tip so a crash right after validation
+  ;; doesn't lose it.
+  (%flush-chainstate historical)
+  (let* ((base-hash (bitcoin-lisp.storage:chain-state-target-blockhash historical))
+         (au (assumeutxo-data-for-blockhash (node-network node) base-hash)))
+    (cond
+      ((null au)
+       (let ((msg (format nil "assumeutxo data not found for the snapshot base at height ~D — refusing to validate snapshot"
+                          (bitcoin-lisp.storage:current-height historical))))
+         (log-warn "[snapshot] ~A" msg)
+         (%mark-snapshot-invalid node historical snap)
+         (values :missing-chainparams msg)))
+      (t
+       (log-info "[snapshot] computing UTXO stats for the background chainstate to validate the snapshot — this may take a few minutes")
+       (let ((got (bitcoin-lisp.storage:compute-utxo-set-hash
+                   (bitcoin-lisp.storage:chain-state-coins-view historical)))
+             (want (assumeutxo-data-hash-serialized au)))
+         (cond
+           ((equalp got want)
+            (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status snap) :validated
+                  (bitcoin-lisp.storage:chain-state-target-utxohash historical) got)
+            (log-info "[snapshot] snapshot beginning at ~A has been fully validated"
+                      (bitcoin-lisp.crypto:bytes-to-hex
+                       (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash snap)))
+            (values :success nil))
+           (t
+            (let ((msg (format nil "failed to validate the -assumeutxo snapshot state: hash mismatch (computed ~A, expected ~A)"
+                               (bitcoin-lisp.crypto:bytes-to-hex got)
+                               (bitcoin-lisp.crypto:bytes-to-hex want))))
+              (log-error "[snapshot] ~A" msg)
+              (%mark-snapshot-invalid node historical snap)
+              (values :hash-mismatch msg)))))))))
+
+(defun maybe-validate-snapshot (historical)
+  "Connect-tip hook (Core MaybeValidateSnapshot at ConnectTip,
+validation.cpp:3134-3135): when HISTORICAL — a background-validation
+chainstate — reaches its snapshot base, re-hash its coins DB against the
+chainparams commitment. On a match, the snapshot chainstate becomes the
+node's validated chainstate (services regain NODE_NETWORK once no historical
+chainstate remains, and getchainstates/validated-chainstate reflect it, all
+via the select-* accessors) and the indexes rebind onto it (Core
+init.cpp:1367-1383); the on-disk dir swap waits for the next restart. On a
+mismatch the snapshot dir is renamed aside and the fatal hook is fired (Core
+fatalError). Returns a SnapshotCompletionResult-style keyword; :skipped when
+the preconditions aren't met (the common per-connect case), so it is safe to
+call for any chainstate."
+  (let* ((node *node*)
+         (snap (and node (%node-snapshot-chainstate node))))
+    (if (not (%snapshot-validation-preconditions-p node historical snap))
+        :skipped
+        (multiple-value-bind (result message)
+            (%validate-snapshot-against-commitment node historical snap)
+          (case result
+            (:success
+             (restart-indexes-for-validated-chainstate node)
+             (log-info "[snapshot] promotion complete: the current chainstate (h=~D) is now fully validated; the background chainstate directories are consolidated on the next restart"
+                       (bitcoin-lisp.storage:current-height
+                        (node-current-chainstate node)))
+             :success)
+            (t
+             (funcall *snapshot-fatal-hook* message)
+             result))))))
+
+(defun finalize-snapshot-validation-at-startup (node)
+  "Startup completion + cleanup (Core LoadChainstate's MaybeValidateSnapshot +
+ValidatedSnapshotCleanup, node/chainstate.cpp:196-235). If a persisted
+historical chainstate has already reached the snapshot base (its background
+sync completed on a previous run), re-prove the commitment hash: on success,
+swap the LevelDB dirs so the snapshot chainstate becomes the sole
+fully-validated chainstate (validated-snapshot-cleanup) — Core does this
+shuffle on restart, not mid-run, because moving LevelDB dirs at runtime is
+risky; on failure, abort startup (Core FAILURE_FATAL). Returns the result
+keyword, or :skipped when there is nothing to finalize."
+  (let ((historical (node-historical-chainstate node))
+        (snap (%node-snapshot-chainstate node)))
+    (if (not (%snapshot-validation-preconditions-p node historical snap))
+        :skipped
+        (multiple-value-bind (result message)
+            (%validate-snapshot-against-commitment node historical snap)
+          (case result
+            (:success
+             (validated-snapshot-cleanup node)
+             :success)
+            (t
+             (error "Unable to complete -assumeutxo snapshot validation: ~A. ~
+Restart to resume normal initial block download, or load a different snapshot."
+                    message)))))))
+
+(defun validated-snapshot-cleanup (node)
+  "Startup-only LevelDB-dir consolidation after a snapshot was fully validated
+on a previous run (Core ChainstateManager::ValidatedSnapshotCleanup,
+validation.cpp:6299-6364): close every chainstate's coins DB, move the
+snapshot chainstate's files into the default chainstate names (deleting the
+now-unneeded background chainstate), and re-init the node with a single
+fully-validated chainstate. Returns T when it swapped, NIL when there was
+nothing to do."
+  (let ((snap (%node-snapshot-chainstate node)))
+    (unless (and snap (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status snap)
+                          :validated))
+      (return-from validated-snapshot-cleanup nil))
+    ;; ResetChainstates: release every coins DB handle before shuffling dirs.
+    (dolist (cs (node-chainstates node))
+      (bitcoin-lisp.storage:close-chainstate-coins-view cs))
+    ;; Swap chainstate_snapshot/ into chainstate/ and delete the background one.
+    (bitcoin-lisp.storage:promote-snapshot-chainstate-files (node-data-directory node))
+    ;; Morph the snapshot chainstate struct into the sole primary chainstate:
+    ;; drop its snapshot identity (default file names, no target/snapshot
+    ;; marking) and reopen its coins view over the now-promoted chainstate/
+    ;; LevelDB. Its shared block index and its (snapshot-tip) chain carry over
+    ;; intact, so no block re-download is needed.
+    (bitcoin-lisp.storage:clear-snapshot-chainstate-identity snap)
+    (bitcoin-lisp.storage:open-chainstate-coins-view snap)
+    (setf (node-chainstates node) (list snap))
+    (log-info "[snapshot] background chainstate consolidated; running as a single fully-validated chainstate at height ~D"
+              (bitcoin-lisp.storage:current-height snap))
+    t))
+
+(defun %catch-up-blockfilterindex (node)
+  "Catch the block-filter index up to the node's validated chainstate tip.
+Indexes bind the validated chainstate (Core ValidatedChainstate) and index
+blocks in order from genesis — identical to the current chainstate while only
+the primary exists, and the promoted snapshot chainstate after assumeutxo
+completion. Repairs a best marker left above the tip (e.g. after
+invalidateblock), then backfills any shortfall. Shared by startup and the
+post-promotion index rebind."
+  (let* ((bfi (node-blockfilterindex node))
+         (cs (node-validated-chainstate node))
+         (tip (bitcoin-lisp.storage:current-height cs)))
+    (when (> (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
+      (log-warn "Block filter index best above tip (~D > ~D); repairing"
+                (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
+      (loop for h from tip downto 0
+            for e = (bitcoin-lisp.storage:get-block-at-height cs h)
+            when (and e (bitcoin-lisp.storage:blockfilterindex-has-block-p
+                         bfi (bitcoin-lisp.storage:block-index-entry-hash e)))
+              do (bitcoin-lisp.storage:blockfilterindex-set-best
+                  bfi h (bitcoin-lisp.storage:block-index-entry-hash e))
+                 (return)
+            finally (bitcoin-lisp.storage:blockfilterindex-clear-best bfi)))
+    (when (< (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
+      (log-info "Building block filter index to height ~D..." tip)
+      (let ((n (bitcoin-lisp.storage:build-blockfilterindex
+                bfi cs (node-block-store node)
+                #'bitcoin-lisp.validation:get-undo-data
+                :progress-callback
+                (lambda (h pct)
+                  (log-info "Block filter index: height ~D (~,1F%)" h pct)))))
+        (log-info "Block filter index build complete: ~D block~:P indexed" n)))))
+
+(defun %catch-up-coinstatsindex (node)
+  "Catch the coinstats index up to the node's validated chainstate tip. Its
+running MuHash must be contiguous from genesis, so a pruned node (missing
+early undo data) can only build it if its stored history reaches genesis —
+otherwise the backfill stops at the first gap. Repairs a best marker left
+above the tip, then backfills. Shared by startup and the post-promotion index
+rebind."
+  (let* ((csi (node-coinstatsindex node))
+         (cs (node-validated-chainstate node))
+         (tip (bitcoin-lisp.storage:current-height cs)))
+    (when (> (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+      (log-warn "Coinstats index best above tip (~D > ~D); repairing"
+                (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+      (loop for h from tip downto 0
+            when (bitcoin-lisp.storage:coinstatsindex-get-stats csi h)
+              do (bitcoin-lisp.storage:coinstatsindex-set-best
+                  csi h (bitcoin-lisp.storage:block-index-entry-hash
+                         (bitcoin-lisp.storage:get-block-at-height cs h)))
+                 (return)
+            finally (bitcoin-lisp.storage:coinstatsindex-clear-best csi)))
+    (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+      (log-info "Building coinstats index to height ~D..." tip)
+      (let ((n (bitcoin-lisp.storage:build-coinstatsindex
+                csi cs (node-block-store node)
+                #'bitcoin-lisp.validation:get-undo-data
+                #'bitcoin-lisp.validation:calculate-block-subsidy
+                :progress-callback
+                (lambda (h pct)
+                  (log-info "Coinstats index: height ~D (~,1F%)" h pct)))))
+        (log-info "Coinstats index build complete: ~D block~:P indexed" n)
+        (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
+          (log-warn "Coinstats index stopped at height ~D of ~D (missing block/undo ~
+data below the pruned horizon; the index needs genesis-contiguous history)"
+                    (bitcoin-lisp.storage:coinstatsindex-height csi) tip))))))
+
+(defun restart-indexes-for-validated-chainstate (node)
+  "Rebind the block-filter and coinstats indexes onto the node's (now
+promoted) validated chainstate and catch them up to its tip (Core restarts
+all indexes on background-sync completion, init.cpp:1367-1383). During the
+background sync the indexes tracked the historical chainstate up to the
+snapshot base; the promoted chainstate carries the full chain past the base,
+so this resumes indexing from where each index left off. A no-op when no
+index is enabled."
+  (when (node-blockfilterindex node) (%catch-up-blockfilterindex node))
+  (when (node-coinstatsindex node) (%catch-up-coinstatsindex node)))
+
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
                         (log-level :info)
@@ -1057,6 +1336,15 @@ Returns the node instance."
         (error "chainstate inconsistent and unrecoverable: move ~A aside and re-sync"
                (node-data-directory *node*)))))
 
+  ;; Assumeutxo P5: if a persisted historical chainstate already reached the
+  ;; snapshot base on a previous run, re-prove the commitment hash now and, on
+  ;; success, consolidate the LevelDB dirs so the validated snapshot chainstate
+  ;; becomes the sole chainstate (Core LoadChainstate's MaybeValidateSnapshot +
+  ;; ValidatedSnapshotCleanup, node/chainstate.cpp:196-235). Runs after
+  ;; crash-recovery (the historical tip must be settled) and before the undo /
+  ;; index init below, which then bind the single promoted chainstate.
+  (finalize-snapshot-validation-at-startup *node*)
+
   ;; Initialize undo data persistence
   (let ((undo-path (merge-pathnames "undo/" (node-data-directory *node*))))
     (bitcoin-lisp.validation:initialize-undo-storage undo-path)
@@ -1129,35 +1417,7 @@ Returns the node instance."
     ;; One-time catch-up over already-stored blocks, before the sync thread
     ;; starts (single-threaded here, so no writer races). Fresh-from-genesis
     ;; nodes have nothing to do; the connect-time hook then indexes forward.
-    ;; Indexes bind the validated chainstate (Core ValidatedChainstate) —
-    ;; they index blocks in order from genesis. Identical to the current
-    ;; chainstate while only the primary exists.
-    (let* ((bfi (node-blockfilterindex *node*))
-           (cs (node-validated-chainstate *node*))
-           (tip (bitcoin-lisp.storage:current-height cs)))
-      ;; Repair the recorded "best" if a rollback (e.g. invalidateblock) left it
-      ;; above the active tip: repoint it at the highest indexed active-chain
-      ;; block, else clear it to force a rebuild.
-      (when (> (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
-        (log-warn "Block filter index best above tip (~D > ~D); repairing"
-                  (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
-        (loop for h from tip downto 0
-              for e = (bitcoin-lisp.storage:get-block-at-height cs h)
-              when (and e (bitcoin-lisp.storage:blockfilterindex-has-block-p
-                           bfi (bitcoin-lisp.storage:block-index-entry-hash e)))
-                do (bitcoin-lisp.storage:blockfilterindex-set-best
-                    bfi h (bitcoin-lisp.storage:block-index-entry-hash e))
-                   (return)
-              finally (bitcoin-lisp.storage:blockfilterindex-clear-best bfi)))
-      (when (< (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
-        (log-info "Building block filter index to height ~D..." tip)
-        (let ((n (bitcoin-lisp.storage:build-blockfilterindex
-                  bfi cs (node-block-store *node*)
-                  #'bitcoin-lisp.validation:get-undo-data
-                  :progress-callback
-                  (lambda (h pct)
-                    (log-info "Block filter index: height ~D (~,1F%)" h pct)))))
-          (log-info "Block filter index build complete: ~D block~:P indexed" n)))))
+    (%catch-up-blockfilterindex *node*))
 
   ;; Initialize coinstatsindex (optional). Like the filter index, catch up over
   ;; already-stored blocks before the sync thread starts, then the connect-time
@@ -1177,36 +1437,7 @@ Returns the node instance."
     (when reindex-chainstate
       (bitcoin-lisp.storage:coinstatsindex-clear-best (node-coinstatsindex *node*))
       (log-info "Coinstats index: rebuilding after chainstate reindex"))
-    ;; Like the filter index: binds the validated chainstate.
-    (let* ((csi (node-coinstatsindex *node*))
-           (cs (node-validated-chainstate *node*))
-           (tip (bitcoin-lisp.storage:current-height cs)))
-      ;; Repair a best marker left above the active tip (e.g. after
-      ;; invalidateblock): repoint at the highest indexed active-chain block.
-      (when (> (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
-        (log-warn "Coinstats index best above tip (~D > ~D); repairing"
-                  (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
-        (loop for h from tip downto 0
-              when (bitcoin-lisp.storage:coinstatsindex-get-stats csi h)
-                do (bitcoin-lisp.storage:coinstatsindex-set-best
-                    csi h (bitcoin-lisp.storage:block-index-entry-hash
-                           (bitcoin-lisp.storage:get-block-at-height cs h)))
-                   (return)
-              finally (bitcoin-lisp.storage:coinstatsindex-clear-best csi)))
-      (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
-        (log-info "Building coinstats index to height ~D..." tip)
-        (let ((n (bitcoin-lisp.storage:build-coinstatsindex
-                  csi cs (node-block-store *node*)
-                  #'bitcoin-lisp.validation:get-undo-data
-                  #'bitcoin-lisp.validation:calculate-block-subsidy
-                  :progress-callback
-                  (lambda (h pct)
-                    (log-info "Coinstats index: height ~D (~,1F%)" h pct)))))
-          (log-info "Coinstats index build complete: ~D block~:P indexed" n)
-          (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
-            (log-warn "Coinstats index stopped at height ~D of ~D (missing block/undo ~
-data below the pruned horizon; the index needs genesis-contiguous history)"
-                      (bitcoin-lisp.storage:coinstatsindex-height csi) tip))))))
+    (%catch-up-coinstatsindex *node*))
 
   ;; -forcecompactdb: once every LevelDB is open (and any reindex/backfill has
   ;; run), full-compact them to reclaim tombstone space -- e.g. the ~24M delete
@@ -1515,7 +1746,7 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
         ;; rewrite that previously froze the sync thread.
         (let ((view (and chainstate
                          (bitcoin-lisp.storage:chain-state-coins-view chainstate))))
-          (when view
+          (when (typep view 'bitcoin-lisp.storage:coins-view-cache)
             ;; :sync t fdatasyncs the LevelDB writebatch before we proceed, so a
             ;; power loss after Phase 3 clears the marker cannot leave the coins
             ;; un-durable while chainstate.dat says they are committed. (Was

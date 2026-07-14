@@ -2020,17 +2020,19 @@ where the block is already the tip or weaker), (values nil reason) on failure."
 ;;;; activation.
 
 (defun %maybe-note-target-reached (chain-state)
-  "Log once when a targeted (historical) chainstate's tip lands exactly on
-its target block — the assumeutxo background block download is complete
-(Core's ReachedTarget break in ActivateBestChain, validation.cpp:3437).
-Snapshot validation/promotion (Core MaybeValidateSnapshot) is a later
-assumeutxo phase; until then the chainstate simply stops here."
+  "When a targeted (historical) chainstate's tip lands exactly on its target
+block, the assumeutxo background block download is complete (Core's
+ReachedTarget break in ActivateBestChain, validation.cpp:3437). Hand off to
+the node's snapshot-validation completion (Core MaybeValidateSnapshot at
+ConnectTip, validation.cpp:3134-3135): it re-hashes the historical coins DB
+against the chainparams commitment and, on a match, promotes the snapshot
+chainstate. maybe-validate-snapshot re-checks every precondition and is a
+no-op (:skipped) when they aren't met, so this stays safe for non-snapshot
+chainstates and for tests that drive activate-block directly."
   (let ((target (bitcoin-lisp.storage:chain-state-target-blockhash chain-state)))
     (when (and target
                (equalp (bitcoin-lisp.storage:best-block-hash chain-state) target))
-      (bitcoin-lisp:log-info
-       "[snapshot] historical chainstate reached the snapshot base (height ~D); background block download complete — snapshot validation/promotion is a later phase"
-       (bitcoin-lisp.storage:current-height chain-state)))))
+      (bitcoin-lisp:maybe-validate-snapshot chain-state))))
 
 (defun activate-block (block chain-state block-store utxo-set
                        &key current-time skip-scripts tx-index fee-estimator
