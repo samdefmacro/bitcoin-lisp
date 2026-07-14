@@ -87,6 +87,7 @@
                                (:file "peerdb")
                                (:file "netaddress") ; BIP155 codecs/reachability; before addrman (netgroups)
                                (:file "addrman")
+                               (:file "torcontrol") ; Tor control client (inbound onion service)
                                (:file "protocol")
                                (:file "headers-sync")
                                (:file "ibd")))
@@ -211,6 +212,8 @@
                              (:file "config-tests")
                              ;; SOCKS5 outbound proxy (-proxy) client
                              (:file "socks5-tests")
+                             ;; Tor control client + onion service + self-advertisement
+                             (:file "torcontrol-tests")
                              ;; TxOutCompression + hash_serialized_3
                              (:file "compressor-tests")
                              ;; Assumeutxo snapshot format (dumptxoutset/loadtxoutset)

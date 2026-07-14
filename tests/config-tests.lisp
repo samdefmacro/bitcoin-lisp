@@ -219,15 +219,25 @@ of the default set; -cjdnsreachable admits cjdns."
           bitcoin-lisp.networking:*onion-proxy* nil)))
 
 (test config-onlynet-errors
-  "Init errors, per Core: unknown -onlynet name; -onlynet=onion without a
-Tor proxy; -onlynet=i2p (unsupported); -onlynet=cjdns without -cjdnsreachable."
+  "Init errors, per Core: unknown -onlynet name; -onlynet=onion without ANY
+Tor route (none of -proxy/-onion/-listenonion — Core init.cpp:1788-1798; a
+default -listenonion is a valid route since the torcontrol client can fetch
+the onion proxy from Tor itself); -onlynet=i2p (unsupported); -onlynet=cjdns
+without -cjdnsreachable."
   (let ((bitcoin-lisp.networking:*reachable-networks*
           bitcoin-lisp.networking:*reachable-networks*)
         (bitcoin-lisp.networking:*cjdns-reachable*
           bitcoin-lisp.networking:*cjdns-reachable*)
+        (bitcoin-lisp.networking:*onlynet-networks*
+          bitcoin-lisp.networking:*onlynet-networks*)
+        (bitcoin-lisp.networking:*onion-proxy-explicit* nil)
         (bitcoin-lisp.networking:*proxy* nil)
         (bitcoin-lisp.networking:*onion-proxy* nil))
     (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "tor"))))
-    (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "onion"))))
+    (signals error (bitcoin-lisp::apply-config-globals
+                    '(("onlynet" . "onion") ("listenonion" . "0"))))
+    ;; With the default -listenonion, -onlynet=onion alone is legal: the
+    ;; onion proxy arrives later over the torcontrol connection.
+    (finishes (bitcoin-lisp::apply-config-globals '(("onlynet" . "onion"))))
     (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "i2p"))))
     (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "cjdns"))))))

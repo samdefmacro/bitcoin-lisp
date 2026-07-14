@@ -37,9 +37,55 @@ addresses are dialable (plain TCP into fc00::/8, dialable-network-p) and
 apply-config-globals admits :cjdns to *reachable-networks* — which in turn
 enables the fc00::/8 ingress retag (maybe-flip-ipv6-to-cjdns).")
 
+(defvar *onlynet-networks* nil
+  "The raw -onlynet restriction as a list of network keywords, NIL when no
+-onlynet was given. Set by apply-config-globals. *reachable-networks* is the
+DERIVED set (restriction minus transport-gated nets); this keeps the user's
+stated restriction so a transport that comes up later — the torcontrol
+GETINFO-discovered onion proxy (Core get_socks_cb, torcontrol.cpp:412-426) —
+can re-admit its network exactly when -onlynet allows it.")
+
 (defun reachable-network-p (network)
   "T if NETWORK is in the reachable set (Core g_reachable_nets.Contains)."
   (and (member network *reachable-networks*) t))
+
+(defun admit-reachable-network (network)
+  "Admit NETWORK to the reachable set iff the user's -onlynet restriction
+allows it — the re-admission rule for a transport that arrives after startup
+(Core get_socks_cb's g_reachable_nets.Add gate, torcontrol.cpp:412-426).
+Lives here, next to the globals it manipulates, so each late transport
+(torcontrol today, I2P SAM later) shares one copy of the rule."
+  (when (or (null *onlynet-networks*)
+            (member network *onlynet-networks*))
+    (pushnew network *reachable-networks*)))
+
+(defun split-host-port (spec default-port)
+  "Split a \"host[:port]\" SPEC into (VALUES host port), PORT defaulting to
+DEFAULT-PORT. Accepts \"[ipv6]:port\" / \"[ipv6]\"; a trailing :port is only
+honored when it is all digits after a single colon, so a bare IPv6 literal is
+host-only. The one splitter behind the networking layer's host:port surfaces
+(-torcontrol, GETINFO socks locations; -proxy/-onion and addnode specs
+predate it and keep their own copies for now)."
+  (cond
+    ((and (plusp (length spec)) (char= (char spec 0) #\[))
+     (let ((close (position #\] spec)))
+       (if (null close)
+           (values spec default-port)
+           (let ((host (subseq spec 1 close))
+                 (rest (subseq spec (1+ close))))
+             (if (and (> (length rest) 1) (char= (char rest 0) #\:)
+                      (every #'digit-char-p (subseq rest 1)))
+                 (values host (parse-integer rest :start 1))
+                 (values host default-port))))))
+    (t
+     (let ((colon (position #\: spec :from-end t)))
+       (if (and colon
+                (< (1+ colon) (length spec))
+                (every #'digit-char-p (subseq spec (1+ colon)))
+                ;; A single colon => host:port; multiple => bare IPv6.
+                (= colon (position #\: spec)))
+           (values (subseq spec 0 colon) (parse-integer spec :start (1+ colon)))
+           (values spec default-port))))))
 
 (defun dialable-network-p (network)
   "T if our transport stack can actually open a connection to NETWORK under
@@ -267,3 +313,160 @@ retagged :cjdns when CJDNS is reachable, this being a string-ingress point
 (defun peer-address-string (pa)
   "Human-readable address string for a peer-address record PA."
   (network-address-to-string (peer-address-network pa) (peer-address-ip pa)))
+
+;;;; Local addresses (Core mapLocalHost, net.cpp:119)
+;;;
+;;; The addresses THIS node is reachable at, for self-advertisement. Today the
+;;; only writer is the torcontrol client (ADD_ONION -> add-local, Core
+;;; AddLocal(service, LOCAL_MANUAL)); there is no interface discovery
+;;; (Core Discover()/-discover) and no -externalip yet, so entries are always
+;;; LOCAL_MANUAL. The map is read by the sync thread (self-advertisement) and
+;;; written by the torcontrol thread — hence the lock.
+
+;; Core LocalServiceInfo scores (net.h:152-160).
+(defconstant +local-none+ 0)
+(defconstant +local-if+ 1)
+(defconstant +local-bind+ 2)
+(defconstant +local-manual+ 3)
+
+(defstruct local-address
+  "One entry of the local-address map: an address this node believes it is
+reachable at (Core mapLocalHost key + LocalServiceInfo)."
+  (network :ipv4 :type keyword)
+  (bytes (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+         :type (simple-array (unsigned-byte 8) (*)))
+  (port 0 :type (unsigned-byte 16))
+  (score 0 :type fixnum))
+
+(defvar *local-addresses* '()
+  "List of local-address records (Core mapLocalHost). Guarded by
+*local-addresses-lock*.")
+
+(defvar *local-addresses-lock* (bt:make-lock "local-addresses")
+  "Guards *local-addresses* (torcontrol thread writes, sync thread reads —
+Core g_maplocalhost_mutex).")
+
+(defun privacy-network-p (network)
+  "T for networks whose addresses must not be advertised across networks
+(Core CNetAddr::IsPrivacyNet, netaddress.h:186: onion and I2P)."
+  (and (member network '(:torv3 :i2p)) t))
+
+(defun clear-local-addresses ()
+  "Remove all local addresses (Core ClearLocal; for tests)."
+  (bt:with-lock-held (*local-addresses-lock*)
+    (setf *local-addresses* '())))
+
+(defun local-addresses ()
+  "Snapshot of the local-address records."
+  (bt:with-lock-held (*local-addresses-lock*)
+    (copy-list *local-addresses*)))
+
+(defun %find-local-address (network bytes)
+  "The local-address record for NETWORK/BYTES, or NIL. mapLocalHost is keyed
+by the ADDRESS only (Core std::map<CNetAddr, ...>) — the port lives in the
+entry and updates on re-add. Caller holds *local-addresses-lock*."
+  (find-if (lambda (la)
+             (and (eq (local-address-network la) network)
+                  (equalp (local-address-bytes la) bytes)))
+           *local-addresses*))
+
+(defun add-local (network bytes port &optional (score +local-none+))
+  "Register an address this node is reachable at (Core AddLocal,
+net.cpp:277-303). Rejects unroutable addresses and unreachable networks
+(g_reachable_nets gate: e.g. -onion=0 keeps an onion service from being
+advertised); without discovery support, only LOCAL_MANUAL-or-better entries
+are accepted (Core's !fDiscover gate, with fDiscover permanently false for
+us). Re-adding an existing address with a score at least as high bumps its
+score by one and updates the port, exactly like Core. Returns T if the
+address is (now) present."
+  (unless (address-routable-p bytes network)
+    (return-from add-local nil))
+  (when (< score +local-manual+)
+    (return-from add-local nil))
+  (unless (reachable-network-p network)
+    (return-from add-local nil))
+  (bitcoin-lisp:log-info "AddLocal(~A:~D,~D)"
+                         (network-address-to-string network bytes) port score)
+  (bt:with-lock-held (*local-addresses-lock*)
+    (let ((existing (%find-local-address network bytes)))
+      (if existing
+          (when (>= score (local-address-score existing))
+            (setf (local-address-score existing) (1+ score)
+                  (local-address-port existing) port))
+          (push (make-local-address :network network
+                                    :bytes (copy-seq bytes)
+                                    :port port
+                                    :score score)
+                *local-addresses*))))
+  t)
+
+(defun remove-local (network bytes)
+  "Forget a local address (Core RemoveLocal, net.cpp:310-315; keyed by
+address only, like the map)."
+  (bitcoin-lisp:log-info "RemoveLocal(~A)"
+                         (network-address-to-string network bytes))
+  (bt:with-lock-held (*local-addresses-lock*)
+    (let ((la (%find-local-address network bytes)))
+      (when la
+        (setf *local-addresses* (remove la *local-addresses*))))))
+
+;; Core GetReachabilityFrom's Reachability enum (netaddress.cpp:715-723).
+;; We omit the Teredo (RFC4380) and tunneled-IPv6 (RFC3964/6052/6145)
+;; refinements — we have no predicates for those encapsulations, and they
+;; only shade tie-breaks between multiple IPv6-ish local addresses, which
+;; cannot occur while the map's only writer is torcontrol (onion entries).
+(defconstant +reach-unreachable+ 0)
+(defconstant +reach-default+ 1)
+(defconstant +reach-ipv4+ 4)
+(defconstant +reach-ipv6-strong+ 5)
+(defconstant +reach-private+ 6)
+
+(defun network-reachability-from (our-net their-net)
+  "How good is a local address on OUR-NET to advertise to a peer connected
+through THEIR-NET (Core CNetAddr::GetReachabilityFrom, netaddress.cpp:713-770,
+minus the Teredo/tunnel shadings)? THEIR-NET may be :unroutable for a peer
+whose address we cannot type (Core's default arm)."
+  (case their-net
+    (:ipv4 (if (eq our-net :ipv4) +reach-ipv4+ +reach-default+))
+    (:ipv6 (case our-net
+             (:ipv4 +reach-ipv4+)
+             (:ipv6 +reach-ipv6-strong+)
+             (t +reach-default+)))
+    (:torv3 (case our-net
+              (:ipv4 +reach-ipv4+)      ; Tor users can connect to IPv4 as well
+              (:torv3 +reach-private+)
+              (t +reach-default+)))
+    (:i2p (if (eq our-net :i2p) +reach-private+ +reach-default+))
+    (:cjdns (if (eq our-net :cjdns) +reach-private+ +reach-default+))
+    ;; Unroutable/unknown partner (Core's trailing default arm).
+    (t (case our-net
+         (:ipv6 +reach-ipv6-strong+)
+         (:ipv4 +reach-ipv4+)
+         ;; "either from Tor, or don't care about our address"
+         (:torv3 +reach-private+)
+         (t +reach-default+)))))
+
+(defun best-local-address (peer-network)
+  "The best local address to advertise to a peer connected through
+PEER-NETWORK (Core GetLocal, net.cpp:166-196): highest reachability, then
+highest score, subject to the privacy rule — never advertise a privacy-net
+(onion/I2P) address to a peer on a different network, and never advertise
+any other-network address to a privacy-net peer. Returns the local-address
+record, or NIL."
+  (let ((best nil)
+        (best-reach -1)
+        (best-score -1))
+    (bt:with-lock-held (*local-addresses-lock*)
+      (dolist (la *local-addresses*)
+        (let ((net (local-address-network la)))
+          (unless (and (not (eq net peer-network))
+                       (or (privacy-network-p net)
+                           (privacy-network-p peer-network)))
+            (let ((reach (network-reachability-from net peer-network))
+                  (score (local-address-score la)))
+              (when (or (> reach best-reach)
+                        (and (= reach best-reach) (> score best-score)))
+                (setf best la
+                      best-reach reach
+                      best-score score)))))))
+    best))
