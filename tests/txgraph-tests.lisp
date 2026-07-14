@@ -1039,3 +1039,62 @@ uncalculable (Core CalculateChunksForRBF returning an Error)."
       (is (eq :uncalculable old))
       (is (null new)))
     (is-true (%tg-sane g))))
+
+;;;; Package RBF staging (txgraph-package-rbf-diagrams, cluster mempool P8)
+;;;;
+;;;; Core PackageRBFChecks stages BOTH transactions of a 1-parent-1-child
+;;;; package into the changeset before ImprovesFeerateDiagram
+;;;; (validation.cpp:1080-1121); these mirror that two-addition staging.
+
+(defun %tg-pkg-rbf (g removed pfee psize cfee csize)
+  (bitcoin-lisp.mempool:txgraph-package-rbf-diagrams g removed pfee psize cfee csize))
+
+(test package-rbf-diagrams-stages-both-as-cpfp-chunk
+  "A low-fee parent + high-fee child stage as one CPFP chunk; replacing a
+conflicting tx improves the diagram when the pair out-earns it."
+  (let* ((g (%tg-new))
+         (orig (%tg-add g 1000 100)))
+    (multiple-value-bind (old new) (%tg-pkg-rbf g (list orig) 10 100 5000 100)
+      (is (equal '((1000 . 100)) (%tg-diag old)))
+      ;; Child feerate 50 > parent 0.1 -> one merged chunk (5010, 200).
+      (is (equal '((5010 . 200)) (%tg-diag new)))
+      (is (eq :greater (bitcoin-lisp.mempool:compare-chunks new old))))
+    ;; The staging did not mutate the live graph.
+    (is-true (%tg-sane g))
+    (is (= 1 (%tg-count g)))))
+
+(test package-rbf-diagrams-two-chunks-when-child-cheaper
+  "A child at a lower feerate than its parent does NOT absorb it: the staged
+pair contributes two chunks, parent first."
+  (let* ((g (%tg-new))
+         (orig (%tg-add g 1000 100)))
+    (multiple-value-bind (old new) (%tg-pkg-rbf g (list orig) 5000 100 100 100)
+      (is (equal '((1000 . 100)) (%tg-diag old)))
+      (is (equal '((5000 . 100) (100 . 100)) (%tg-diag new))))
+    (is-true (%tg-sane g))))
+
+(test package-rbf-diagrams-survivors-kept
+  "Conflicted-cluster survivors stay in the new diagram alongside the pair."
+  (let* ((g (%tg-new))
+         (keep (%tg-add g 700 100))
+         (victim (%tg-add g 100 100)))
+    (%tg-dep g keep victim)              ; one cluster, chunks (700,100) (100,100)
+    (multiple-value-bind (old new) (%tg-pkg-rbf g (list victim) 10 100 5000 100)
+      (is (equal '((700 . 100) (100 . 100)) (%tg-diag old)))
+      ;; KEEP survives; the pair forms its own (5010, 200) chunk.
+      (is (equal '((5010 . 200) (700 . 100)) (%tg-diag new)))
+      (is (eq :greater (bitcoin-lisp.mempool:compare-chunks new old))))
+    (is-true (%tg-sane g))
+    (is (= 2 (%tg-count g)))))
+
+(test package-rbf-diagrams-uncalculable-when-oversized
+  "A package member whose size exceeds the cluster size limit makes the
+staged diagram uncalculable (Core CheckMemPoolPolicyLimits failing,
+\"too-large-cluster\")."
+  (let* ((g (%tg-new :max-cluster-size 1000))
+         (orig (%tg-add g 100 100)))
+    (multiple-value-bind (old new) (%tg-pkg-rbf g (list orig) 100 100 90000 5000)
+      (is (eq :uncalculable old))
+      (is (null new)))
+    (is-false (%tg-oversized g))
+    (is-true (%tg-sane g))))

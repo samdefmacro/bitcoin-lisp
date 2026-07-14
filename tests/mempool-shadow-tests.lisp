@@ -437,3 +437,79 @@ checking; explicit spot checks at the end."
           (unless (bitcoin-lisp.mempool:txgraph-oversized-p (%shp-graph mempool))
             (dolist (txid live)
               (is (%shp-equiv-p mempool txid)))))))))
+
+;;;; Reorg bulk re-add (cluster mempool P8 — Core MaybeUpdateMempoolForReorg
+;;;; validation.cpp:294-389 + UpdateTransactionsFromBlock txmempool.cpp:91-120)
+
+(test shadow-reorg-bulk-readd-wires-preexisting-children
+  "A re-added disconnected tx whose outputs a pre-existing pool entry spends
+gets the parent->child link wired by MEMPOOL-UPDATE-FOR-REORG, in both the
+BFS links and the txgraph, with the shadow checks green throughout."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (graph (%shp-graph mempool))
+         (p (%shp-root-tx 40))               ; the disconnected tx
+         (ptxid (%shp-hash p))
+         ;; The pool child entered while P was confirmed: standalone.
+         (c (%shp-tx (list (cons ptxid 0)))))
+    (%shp-add mempool c :fee 9000)
+    (is (= 1 (length (bitcoin-lisp.mempool:txgraph-get-cluster
+                      graph (%shp-handle mempool (%shp-hash c))))))
+    ;; Reorg re-add (the bypass-limits acceptance tail): P is unlinked so far.
+    (is (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+                 mempool ptxid p 10000 0 :defer-trim t)))
+    (is (= 1 (length (bitcoin-lisp.mempool:txgraph-get-ancestors
+                      graph (%shp-handle mempool (%shp-hash c))))))
+    ;; Bulk repair: wires P -> C; the trim is a no-op within limits.
+    (is (zerop (bitcoin-lisp.mempool:mempool-update-for-reorg
+                mempool (list ptxid))))
+    (is (= 2 (length (bitcoin-lisp.mempool:txgraph-get-ancestors
+                      graph (%shp-handle mempool (%shp-hash c))))))
+    (is (= 2 (length (bitcoin-lisp.mempool:txgraph-get-cluster
+                      graph (%shp-handle mempool ptxid)))))
+    (is (%shp-equiv-p mempool (%shp-hash c)))
+    (is (%shp-verify mempool))))
+
+(test shadow-reorg-trim-restores-cluster-limits
+  "Re-add dependency merges that push a would-be cluster over the count limit
+are resolved by ONE trim keeping the best chunks (Core m_txgraph->Trim()
+after UpdateTransactionsFromBlock): the worst tail tx is evicted and the
+graph ends within limits, shadow-consistent."
+  (let* ((bitcoin-lisp.mempool:*cluster-count-limit* 3)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (graph (%shp-graph mempool))
+         (a (%shp-root-tx 41))               ; the disconnected tx (high fee)
+         (atxid (%shp-hash a))
+         ;; Pre-existing pool chain B -> C -> D rooted at A's output.
+         (b (%shp-tx (list (cons atxid 0))))
+         (c (%shp-tx (list (cons (%shp-hash b) 0))))
+         (d (%shp-tx (list (cons (%shp-hash c) 0)))))
+    (%shp-add mempool b :fee 10000)
+    (%shp-add mempool c :fee 10000)
+    (%shp-add mempool d :fee 10)             ; the worst chunk
+    (is (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+                 mempool atxid a 50000 0 :defer-trim t)))
+    ;; Wiring A -> B would form a 4-tx cluster over the 3-tx limit: the one
+    ;; trim drops D (the worst chunk's tail) and keeps {A, B, C}.
+    (is (= 1 (bitcoin-lisp.mempool:mempool-update-for-reorg
+              mempool (list atxid))))
+    (is (not (bitcoin-lisp.mempool:mempool-has mempool (%shp-hash d))))
+    (is (not (bitcoin-lisp.mempool:txgraph-oversized-p graph)))
+    (is (= 3 (length (bitcoin-lisp.mempool:txgraph-get-cluster
+                      graph (%shp-handle mempool atxid)))))
+    (is (%shp-equiv-p mempool (%shp-hash c)))
+    (is (%shp-verify mempool))))
+
+(test shadow-reorg-failed-readd-removes-spenders
+  "A disconnected tx that fails re-acceptance drags down the pool entries
+spending its outputs, recursively (Core removeRecursive on a not-in-pool
+origin, txmempool.cpp:333-359)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (ptxid (%shp-outpoint-hash 42))     ; the failed tx's txid (not in pool)
+         (c (%shp-tx (list (cons ptxid 0)))) ; pool spender of its output 0
+         (g (%shp-tx (list (cons (%shp-hash c) 0)))))
+    (%shp-add mempool c :fee 9000)
+    (%shp-add mempool g :fee 9000)
+    (is (= 2 (bitcoin-lisp.mempool:mempool-remove-spenders mempool ptxid 1)))
+    (is (zerop (bitcoin-lisp.mempool:mempool-count mempool)))
+    (is (zerop (bitcoin-lisp.mempool:txgraph-tx-count (%shp-graph mempool))))
+    (is (%shp-verify mempool))))

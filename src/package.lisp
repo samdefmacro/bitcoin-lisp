@@ -776,11 +776,13 @@
    #:txgraph-add-transaction
    #:txgraph-remove-transaction
    #:txgraph-add-dependency
+   #:txgraph-add-dependencies
    #:txgraph-set-transaction-fee
    #:txgraph-exists-p
    #:txgraph-get-individual-feerate
    #:txgraph-get-main-chunk-feerate
    #:txgraph-get-cluster
+   #:txgraph-get-cluster-chunks
    #:txgraph-get-ancestors
    #:txgraph-get-descendants
    #:txgraph-get-ancestors-union
@@ -789,6 +791,7 @@
    #:txgraph-count-distinct-clusters
    #:txgraph-cluster-transaction-count
    #:txgraph-rbf-diagrams
+   #:txgraph-package-rbf-diagrams
    #:txgraph-get-worst-main-chunk
    #:txgraph-trim
    #:txgraph-sanity-check
@@ -796,6 +799,7 @@
    #:block-builder-p
    #:make-block-builder
    #:block-builder-current-chunk
+   #:block-builder-current-chunk-feerate
    #:block-builder-include
    #:block-builder-skip
    #:block-builder-finish
@@ -860,6 +864,7 @@
    #:tx-signals-rbf-p
    #:find-rbf-conflicts
    #:check-rbf-rules
+   #:check-package-rbf-rules
    #:*mempool-full-rbf*
    #:mempool-has
    #:mempool-get
@@ -873,6 +878,8 @@
    #:mempool-min-fee-rate
    #:mempool-check-conflict
    #:mempool-remove-for-block
+   #:mempool-remove-spenders
+   #:mempool-update-for-reorg
    #:mempool-get-transactions
    #:mempool-for-each
    ;; Block fee stats
