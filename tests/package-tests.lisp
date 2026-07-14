@@ -320,3 +320,195 @@ the entire band)."
         (is (eq :success msg))
         (is-true (bitcoin-lisp.mempool:mempool-has
                   mempool (bitcoin-lisp.serialization:transaction-hash tx)))))))
+
+;;;; Package RBF (cluster mempool P8 — Core PackageRBFChecks,
+;;;; validation.cpp:1034-1130, wired through %accept-package-subset)
+
+(defun %pkg-tx-2in (prev1 idx1 prev2 idx2 out-value)
+  "A two-input P2SH(OP_TRUE) tx spending (PREV1,IDX1) and (PREV2,IDX2)."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash prev1 :index idx1)
+                    :script-sig (%p2sh-optrue-scriptsig)
+                    :sequence #xffffffff)
+                   (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash prev2 :index idx2)
+                    :script-sig (%p2sh-optrue-scriptsig)
+                    :sequence #xffffffff))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value out-value
+                     :script-pubkey (%p2sh-optrue-spk)))
+   :lock-time 0))
+
+(test package-rbf-replaces-mempool-conflict
+  "A 1p1c package whose parent conflicts with a pool tx replaces it when the
+package out-earns it through the diagram check: the conflict is evicted and
+both members enter the pool."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((a (%pkg-tx funding 0 99999000))          ; pool tx, fee 1000
+           (aid (bitcoin-lisp.serialization:transaction-hash a))
+           ;; Parent double-spends FUNDING:0 at a sub-floor fee (5 sat) so its
+           ;; individual attempt defers; the child carries the package.
+           (parent (%pkg-tx funding 0 99999995))
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (child (%pkg-tx pid 0 99949995))          ; fee 50000
+           (cid (bitcoin-lisp.serialization:transaction-hash child)))
+      (is (eq :ok (%add-tx mempool a :fee 1000 :height 200)))
+      (multiple-value-bind (msg results replaced)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state)
+        (is (eq :success msg))
+        (is (every (lambda (r) (eq :valid (bitcoin-lisp.validation:package-tx-result-status r)))
+                   results))
+        (is (member aid replaced :test #'equalp)))
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool aid)))
+      (is (bitcoin-lisp.mempool:mempool-has mempool pid))
+      (is (bitcoin-lisp.mempool:mempool-has mempool cid)))))
+
+(test package-rbf-insufficient-total-fees-rejected
+  "Package RBF rule 3 on the totals: a pair whose combined fees do not cover
+the replaced tx's is rejected and the pool is untouched."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((a (%pkg-tx funding 0 99950000))          ; pool tx, fee 50000
+           (aid (bitcoin-lisp.serialization:transaction-hash a))
+           (parent (%pkg-tx funding 0 99999995))     ; fee 5, conflicts with A
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (child (%pkg-tx pid 0 99989995)))         ; fee 10000
+      (is (eq :ok (%add-tx mempool a :fee 50000 :height 200)))
+      (multiple-value-bind (msg results replaced)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state)
+        (declare (ignore results))
+        (is (eq :insufficient-fee msg))
+        (is (null replaced)))
+      (is (bitcoin-lisp.mempool:mempool-has mempool aid))
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool pid))))))
+
+(test package-rbf-mempool-ancestors-rejected
+  "Package RBF requires NO in-mempool ancestors (the resulting cluster must
+be exactly the pair, Core validation.cpp:1052-1064): a conflicting package
+whose parent also spends a pool tx's output is rejected."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((funding2 (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element 8))
+           (m (%pkg-tx funding 0 99999000))          ; pool tx: parent's ancestor
+           (mid (bitcoin-lisp.serialization:transaction-hash m))
+           (a2 (%pkg-tx funding2 0 99999000))        ; pool tx: the conflict
+           (a2id (bitcoin-lisp.serialization:transaction-hash a2))
+           ;; Parent spends M:0 (in-mempool ancestor) AND double-spends
+           ;; FUNDING2:0 (the conflict), at a sub-floor fee.
+           (parent (%pkg-tx-2in mid 0 funding2 0 199998990))
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (child (%pkg-tx pid 0 199948990)))        ; fee 50000
+      (bitcoin-lisp.storage:add-utxo utxo-set funding2 0 100000000
+                                     (%p2sh-optrue-spk) 1 :coinbase nil)
+      (is (eq :ok (%add-tx mempool m :fee 1000 :height 200)))
+      (is (eq :ok (%add-tx mempool a2 :fee 1000 :height 200)))
+      (multiple-value-bind (msg results replaced)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state)
+        (declare (ignore results))
+        (is (eq :package-rbf-mempool-ancestors msg))
+        (is (null replaced)))
+      (is (bitcoin-lisp.mempool:mempool-has mempool mid))
+      (is (bitcoin-lisp.mempool:mempool-has mempool a2id))
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool pid))))))
+
+(test package-rbf-not-1p1c-rejected
+  "A conflicting multi-tx subset larger than 1-parent-1-child cannot use
+package RBF (Core validation.cpp:1047-1050)."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((funding4 (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element 9))
+           (a (%pkg-tx funding 0 99999000))          ; pool tx, fee 1000
+           (aid (bitcoin-lisp.serialization:transaction-hash a))
+           (p1 (%pkg-tx funding 0 99999995))         ; conflicts with A, fee 5
+           (p2 (%pkg-tx funding4 0 99999995))        ; fee 5
+           (child (%pkg-tx-2in (bitcoin-lisp.serialization:transaction-hash p1) 0
+                               (bitcoin-lisp.serialization:transaction-hash p2) 0
+                               199899990)))          ; fee 100000
+      (bitcoin-lisp.storage:add-utxo utxo-set funding4 0 100000000
+                                     (%p2sh-optrue-spk) 1 :coinbase nil)
+      (is (eq :ok (%add-tx mempool a :fee 1000 :height 200)))
+      (multiple-value-bind (msg results replaced)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list p1 p2 child) utxo-set mempool chain-state)
+        (declare (ignore results))
+        (is (eq :package-rbf-not-1p1c msg))
+        (is (null replaced)))
+      (is (bitcoin-lisp.mempool:mempool-has mempool aid)))))
+
+;;;; TRUC sibling eviction through the single-tx acceptance path (Core
+;;;; PreChecks, validation.cpp:950-970: the sibling joins the conflict set
+;;;; and the replacement economics decide)
+
+(defun %truc-2out-parent (funding)
+  "A v3 parent spending FUNDING:0 with TWO outputs, so a second child does
+not input-conflict with the first."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 3
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash funding :index 0)
+                    :script-sig (%p2sh-optrue-scriptsig)
+                    :sequence #xffffffff))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 49990000 :script-pubkey (%p2sh-optrue-spk))
+                    (bitcoin-lisp.serialization:make-tx-out
+                     :value 49990000 :script-pubkey (%p2sh-optrue-spk)))
+   :lock-time 0))
+
+(test truc-sibling-eviction-accepted-when-paying
+  "A second TRUC child that pays enough EVICTS its sibling through the RBF
+economics instead of being rejected on the descendant limit (Core PreChecks
+sibling eviction, validation.cpp:950-970); one that does not pay is rejected
+on the economics (:insufficient-fee), and with sibling eviction disabled the
+TRUC error surfaces unchanged."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (declare (ignore chain-state))
+    (let* ((parent (%truc-2out-parent funding))
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (sib (%pkg-tx pid 0 49985000 :version 3))          ; fee 5000
+           (sibid (bitcoin-lisp.serialization:transaction-hash sib))
+           (rich (%pkg-tx pid 1 49930000 :version 3))         ; fee 60000
+           (richid (bitcoin-lisp.serialization:transaction-hash rich))
+           (poor (%pkg-tx pid 1 49984996 :version 3)))        ; fee 5004
+      (is (eq :ok (%add-tx mempool parent :fee 20000 :height 200)))
+      (is (eq :ok (%add-tx mempool sib :fee 5000 :height 200)))
+      ;; Not paying its own bandwidth over the sibling's 5000 (rule 4 needs
+      ;; ~+9 sat): rejected on the ECONOMICS, not the descendant limit.
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           poor utxo-set mempool 200)
+        (is-false valid)
+        (is (eq :insufficient-fee err)))
+      ;; With sibling eviction disabled (the multi-tx package context), the
+      ;; TRUC descendant-limit error surfaces instead.
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           rich utxo-set mempool 200 :allow-sibling-eviction nil)
+        (is-false valid)
+        (is (eq :truc-descendant-limit err)))
+      ;; :skip-rbf-check alone also disables the fallthrough — with the
+      ;; economics skipped there is nothing to evaluate the eviction.
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           rich utxo-set mempool 200 :skip-rbf-check t)
+        (is-false valid)
+        (is (eq :truc-descendant-limit err)))
+      ;; Paying enough: the sibling is the replaced set; accepting evicts it.
+      (multiple-value-bind (valid err fee replaced)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           rich utxo-set mempool 200)
+        (declare (ignore err))
+        (is-true valid)
+        (is (= 60000 fee))
+        (is (member sibid replaced :test #'equalp))
+        (is (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+                     mempool richid rich fee 200 :replaced replaced))))
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool sibid)))
+      (is (bitcoin-lisp.mempool:mempool-has mempool richid))
+      (is (bitcoin-lisp.mempool:mempool-has mempool pid)))))

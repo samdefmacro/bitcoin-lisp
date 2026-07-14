@@ -720,46 +720,59 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
 
 (defun %mempool-entry-fields (mempool txid entry)
   "The verbose field alist for one mempool ENTRY (TXID) — vsize/weight/time/
-height/fees{base,ancestor,descendant}/ancestor+descendant counts/wtxid/depends.
-Shared by getrawmempool (verbose), getmempoolentry, getmempoolancestors, and
-getmempooldescendants."
+height/fees{base,modified,ancestor,descendant,chunk}/ancestor+descendant
+counts/chunkweight/wtxid/depends. Shared by getrawmempool (verbose),
+getmempoolentry, getmempoolancestors, and getmempooldescendants.
+
+The chunk fields (Core MempoolEntryDescription + entryToJSON,
+rpc/mempool.cpp:433-465/508-541) report the txgraph chunk this entry mines
+in: \"chunkweight\" is the chunk's total size and fees.\"chunk\" its total
+modified fees. UNIT DIVERGENCE: Core's txgraph measures sigops-adjusted
+WEIGHT (GetAdjustedWeight), ours measures BIP141 virtual bytes, so
+\"chunkweight\" here is in vB (~ Core's value / 4)."
   (multiple-value-bind (acount asize afees)
       (bitcoin-lisp.mempool:mempool-ancestor-stats mempool txid)
     (multiple-value-bind (dcount dsize dfees)
         (bitcoin-lisp.mempool:mempool-descendant-stats mempool txid)
-      `(("vsize" . ,(bitcoin-lisp.mempool:mempool-entry-vsize entry))
-        ("weight" . ,(bitcoin-lisp.serialization:transaction-weight
-                      (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
-        ("time" . ,(bitcoin-lisp.mempool:mempool-entry-entry-time entry))
-        ("height" . ,(bitcoin-lisp.mempool:mempool-entry-height entry))
-        ("fees" . (("base" . ,(/ (bitcoin-lisp.mempool:mempool-entry-fee entry) 100000000.0d0))
-                   ("modified" . ,(/ (bitcoin-lisp.mempool:mempool-entry-modified-fee entry)
-                                     100000000.0d0))
-                   ("ancestor" . ,(/ afees 100000000.0d0))
-                   ("descendant" . ,(/ dfees 100000000.0d0))))
-        ("ancestorcount" . ,acount)
-        ("ancestorsize" . ,asize)
-        ("descendantcount" . ,dcount)
-        ("descendantsize" . ,dsize)
-        ("wtxid" . ,(hash-to-hex (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
-        ("depends" . ,(let ((deps '()))
-                        (maphash (lambda (p v) (declare (ignore v))
-                                   (push (hash-to-hex p) deps))
-                                 (bitcoin-lisp.mempool:mempool-entry-parents entry))
-                        deps))
-        ;; In-mempool txs that spend this tx's outputs (Core "spentby").
-        ("spentby" . ,(let ((sb '()))
-                        (maphash (lambda (c v) (declare (ignore v))
-                                   (push (hash-to-hex c) sb))
-                                 (bitcoin-lisp.mempool::mempool-entry-children entry))
-                        sb))
-        ;; BIP125: whether the tx or any unconfirmed ancestor SIGNALS
-        ;; replaceability (Core IsRBFOptIn, reporting only — acceptance is
-        ;; unconditionally full-RBF; rpc/mempool.cpp:456,567, DEPRECATED).
-        ("bip125-replaceable"
-         . ,(and (bitcoin-lisp.mempool::mempool-tx-or-ancestor-signals-rbf-p mempool txid)
-                 t))
-        ("unbroadcast" . nil)))))
+      (let ((chunk (bitcoin-lisp.mempool:txgraph-get-main-chunk-feerate
+                    (bitcoin-lisp.mempool:mempool-graph mempool)
+                    (bitcoin-lisp.mempool:mempool-entry-graph-handle entry))))
+        `(("vsize" . ,(bitcoin-lisp.mempool:mempool-entry-vsize entry))
+          ("weight" . ,(bitcoin-lisp.serialization:transaction-weight
+                        (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+          ("time" . ,(bitcoin-lisp.mempool:mempool-entry-entry-time entry))
+          ("height" . ,(bitcoin-lisp.mempool:mempool-entry-height entry))
+          ("chunkweight" . ,(bitcoin-lisp.mempool:feefrac-size chunk))
+          ("fees" . (("base" . ,(/ (bitcoin-lisp.mempool:mempool-entry-fee entry) 100000000.0d0))
+                     ("modified" . ,(/ (bitcoin-lisp.mempool:mempool-entry-modified-fee entry)
+                                       100000000.0d0))
+                     ("ancestor" . ,(/ afees 100000000.0d0))
+                     ("descendant" . ,(/ dfees 100000000.0d0))
+                     ("chunk" . ,(/ (bitcoin-lisp.mempool:feefrac-fee chunk)
+                                    100000000.0d0))))
+          ("ancestorcount" . ,acount)
+          ("ancestorsize" . ,asize)
+          ("descendantcount" . ,dcount)
+          ("descendantsize" . ,dsize)
+          ("wtxid" . ,(hash-to-hex (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
+          ("depends" . ,(let ((deps '()))
+                          (maphash (lambda (p v) (declare (ignore v))
+                                     (push (hash-to-hex p) deps))
+                                   (bitcoin-lisp.mempool:mempool-entry-parents entry))
+                          deps))
+          ;; In-mempool txs that spend this tx's outputs (Core "spentby").
+          ("spentby" . ,(let ((sb '()))
+                          (maphash (lambda (c v) (declare (ignore v))
+                                     (push (hash-to-hex c) sb))
+                                   (bitcoin-lisp.mempool::mempool-entry-children entry))
+                          sb))
+          ;; BIP125: whether the tx or any unconfirmed ancestor SIGNALS
+          ;; replaceability (Core IsRBFOptIn, reporting only — acceptance is
+          ;; unconditionally full-RBF; rpc/mempool.cpp:456,567, DEPRECATED).
+          ("bip125-replaceable"
+           . ,(and (bitcoin-lisp.mempool::mempool-tx-or-ancestor-signals-rbf-p mempool txid)
+                   t))
+          ("unbroadcast" . nil))))))
 
 (defun %mempool-txid-arg (params mempool)
   "Resolve the first param (a big-endian txid hex) to (values internal-txid
@@ -812,6 +825,65 @@ PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
     (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
       (declare (ignore entry))
       (%mempool-set->result mempool (bitcoin-lisp.mempool:mempool-descendants mempool txid) verbose))))
+
+(defun rpc-getmempoolcluster (node params)
+  "Return mempool data for the cluster containing TXID (Bitcoin Core
+getmempoolcluster, rpc/mempool.cpp:829-862 + clusterToJSON :474-506):
+clusterweight, txcount, and the cluster's chunks in mining order, each with
+chunkfee (BTC), chunkweight, and its txids in mining order. Core's RPC layer
+reconstructs chunk membership with a size countdown because its graph hides
+chunks; ours exposes them (TXGRAPH-GET-CLUSTER-CHUNKS). UNIT DIVERGENCE:
+Core's clusterweight/chunkweight are sigops-adjusted WEIGHT
+(GetAdjustedWeight); our txgraph measures BIP141 virtual bytes, so those
+fields here are in vB (~ Core / 4)."
+  (let ((mempool (rpc-get-mempool node)))
+    (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
+      (declare (ignore txid))
+      (let ((chunks (bitcoin-lisp.mempool:txgraph-get-cluster-chunks
+                     (bitcoin-lisp.mempool:mempool-graph mempool)
+                     (bitcoin-lisp.mempool:mempool-entry-graph-handle entry))))
+        `(("clusterweight"
+           . ,(reduce #'+ chunks
+                      :key (lambda (c) (bitcoin-lisp.mempool:feefrac-size (cdr c)))))
+          ("txcount" . ,(reduce #'+ chunks :key (lambda (c) (length (car c)))))
+          ("chunks"
+           . ,(mapcar (lambda (c)
+                        `(("chunkfee" . ,(/ (bitcoin-lisp.mempool:feefrac-fee (cdr c))
+                                            100000000.0d0))
+                          ("chunkweight" . ,(bitcoin-lisp.mempool:feefrac-size (cdr c)))
+                          ("txs" . ,(mapcar (lambda (h)
+                                              (hash-to-hex
+                                               (bitcoin-lisp.mempool:tx-handle-data h)))
+                                            (car c)))))
+                      chunks)))))))
+
+(defun rpc-getmempoolfeeratediagram (node params)
+  "Return the feerate diagram for the whole mempool (Bitcoin Core
+getmempoolfeeratediagram — a hidden RPC, rpc/mempool.cpp:609-650 +
+CTxMemPool::GetFeerateDiagram, txmempool.cpp:1082-1102): the cumulative
+(weight, fee-in-BTC) point after each chunk in mining order, starting from
+the (0, 0) origin. UNIT DIVERGENCE: Core's weight axis is sigops-adjusted
+weight; ours is BIP141 virtual bytes (~ Core / 4)."
+  (declare (ignore params))
+  (let ((mempool (rpc-get-mempool node))
+        (cum-weight 0)
+        (cum-fee 0)
+        (points (list `(("weight" . 0) ("fee" . 0.0d0)))))
+    (when mempool
+      (let ((builder (bitcoin-lisp.mempool:make-block-builder
+                      (bitcoin-lisp.mempool:mempool-graph mempool))))
+        (unwind-protect
+             (loop for feerate = (bitcoin-lisp.mempool:block-builder-current-chunk-feerate
+                                  builder)
+                   while feerate
+                   do (incf cum-weight (bitcoin-lisp.mempool:feefrac-size feerate))
+                      (incf cum-fee (bitcoin-lisp.mempool:feefrac-fee feerate))
+                      (push `(("weight" . ,cum-weight)
+                              ("fee" . ,(/ cum-fee 100000000.0d0)))
+                            points)
+                      (bitcoin-lisp.mempool:block-builder-include builder))
+          (bitcoin-lisp.mempool:block-builder-finish builder))))
+    (nreverse points)))
 
 (defun rpc-gettxspendingprevout (node params)
   "For each {txid, vout} outpoint in the array PARAM, report the mempool

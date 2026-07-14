@@ -213,8 +213,10 @@ tx-count equality check that logs a warning instead.")
   "True inside a multi-removal mempool operation. Interim states of such a
 batch can transiently bridge - a removed tx's parents and children both
 still present - where the graph's closure semantics (grandparents stay
-ancestors) and the BFS links (severed) legitimately differ, so the
-expensive equivalence checks only run at batch end.")
+ancestors) and the BFS links (severed) legitimately differ, and the reorg
+trim removes transactions from the graph before their mempool entries
+follow (MEMPOOL-UPDATE-FOR-REORG), so ALL the checks - including the cheap
+tx-count equality - only run at batch end.")
 
 (defun %short-txid (txid)
   (bitcoin-lisp.crypto:bytes-to-hex (subseq txid 0 8)))
@@ -253,12 +255,13 @@ graph must not be oversized."
 
 (defun %mempool-graph-verify (mempool)
   "Verify the shadow txgraph against the mempool. The tx-count equality
-check is always on (O(1); logs a warning in production, errors under
-*TXGRAPH-SHADOW-CHECKS*); the full equivalence checks run only under
-*TXGRAPH-SHADOW-CHECKS* and outside removal batches."
+check is always on outside batches (O(1); logs a warning in production,
+errors under *TXGRAPH-SHADOW-CHECKS*); the full equivalence checks run only
+under *TXGRAPH-SHADOW-CHECKS* and outside removal batches. Inside a batch
+everything is deferred to the batch-end verify."
   (let ((graph (mempool-graph mempool))
         (count (mempool-count mempool)))
-    (unless (= (txgraph-tx-count graph) count)
+    (unless (or *graph-verify-batch* (= (txgraph-tx-count graph) count))
       (if *txgraph-shadow-checks*
           (error "txgraph shadow divergence: graph has ~D transactions, ~
                   mempool has ~D"
@@ -455,15 +458,23 @@ to the txgraph's worst chunk (P5)."
 
 (defun single-truc-checks (mempool tx vsize direct-conflicts)
   "BIP431 TRUC (v3) topology checks for a single new TX at mempool acceptance,
-a port of Core policy SingleTRUCChecks. VSIZE is TX's virtual size;
-DIRECT-CONFLICTS the list of mempool txids it replaces (RBF). Returns (values t
-NIL) when acceptable, else (values NIL reason-keyword).
+a port of Core policy SingleTRUCChecks (truc_policy.cpp:171-264). VSIZE is TX's
+virtual size; DIRECT-CONFLICTS the list of mempool txids it replaces (RBF).
+Returns (values t NIL NIL) when acceptable, else (values NIL reason-keyword
+sibling-txid-or-NIL).
 
 Enforces: v3<->non-v3 spend inheritance (both directions); v3 tx <= 10000 vsize;
 at most 1 unconfirmed ancestor and, for a child of an unconfirmed TRUC parent,
 <= 1000 vsize and the parent having no other unconfirmed descendant (unless that
-sibling is being replaced). We decline TRUC sibling eviction (Core permits the
-caller to), so a v3 tx that would need it is rejected with :truc-descendant-limit."
+sibling is being replaced).
+
+The third value mirrors Core's sibling-eviction escape hatch: on a
+:truc-descendant-limit failure where eviction of the existing child can be
+CONSIDERED — the parent has exactly one existing descendant and that sibling's
+ancestor set is exactly {parent, itself} (Core truc_policy.cpp:250-252) — it is
+that sibling's txid. The caller (validate-transaction-for-mempool, mirroring
+Core PreChecks validation.cpp:950-970) may then treat the sibling as a
+to-be-replaced conflict and re-run the RBF economics, instead of rejecting."
   (let* ((version (bitcoin-lisp.serialization:transaction-version tx))
          (parents (mempool-find-parents mempool tx))
          (v3 (= version +truc-version+)))
@@ -503,7 +514,19 @@ caller to), so a v3 tx that would need it is rejected with :truc-descendant-limi
                        thereis (member d direct-conflicts :test #'equalp))))
           (when (and (> (+ (mempool-descendant-stats mempool parent) 1) +truc-descendant-limit+)
                      (not child-will-be-replaced))
-            (return-from single-truc-checks (values nil :truc-descendant-limit))))))
+            ;; Sibling eviction is considerable only in the clean 1p1c shape:
+            ;; the parent has exactly this one existing child and the child
+            ;; has no relatives beyond the parent (Core: GetDescendantCount
+            ;; (parent) == 2 && GetAncestorCount(sibling) == 2, ruling out
+            ;; reorg-created multi-child / grandchild shapes).
+            (let ((sibling (when (= 1 (hash-table-count descendants))
+                             (loop for d being the hash-keys of descendants
+                                   return d))))
+              (return-from single-truc-checks
+                (values nil :truc-descendant-limit
+                        (when (and sibling
+                                   (= 2 (mempool-ancestor-stats mempool sibling)))
+                          sibling))))))))
     (values t nil)))
 
 (defun %link-entry-parents (mempool txid entry parent-txids)
@@ -527,25 +550,35 @@ caller to), so a v3 tx that would need it is rejected with :truc-descendant-limi
 (defun accept-validated-tx (mempool txid tx fee height
                             &key (entry-time
                                   (bitcoin-lisp.serialization:get-unix-time))
-                                 replaced)
+                                 replaced defer-trim)
   "The shared tail of every mempool acceptance path (peer tx handler,
 orphan cascade, sendrawtransaction, mempool.dat reload, reorg re-add,
 submitpackage): evict the BIP125 REPLACED txids, build the entry for TX,
 add it. Caller has already run validate-transaction-for-mempool. Returns
-(values result entry) where RESULT is mempool-add's keyword."
+(values result entry) where RESULT is mempool-add's keyword.
+DEFER-TRIM is threaded to MEMPOOL-ADD (reorg re-add, package submission)."
   (dolist (rt replaced)
     (mempool-remove-recursive mempool rt))
   (let ((entry (make-entry-from-tx tx (or fee 0) height :entry-time entry-time)))
-    (values (mempool-add mempool txid entry) entry)))
+    (values (mempool-add mempool txid entry :defer-trim defer-trim)
+            entry)))
 
-(defun mempool-add (mempool txid entry)
+(defun mempool-add (mempool txid entry &key defer-trim)
   "Add a transaction to the mempool.
 Returns :ok on success, or a rejection keyword: :duplicate, :conflict,
 :too-large-cluster (joining its in-mempool parents would form a cluster over
 the 64-tx / 101-kvB limits, Core's \"too-large-cluster\",
 validation.cpp:1020-1022), or :mempool-full (after adding, trimming back to
 the byte cap evicted the new tx's own chunk as the worst,
-validation.cpp:1394-1401)."
+validation.cpp:1394-1401).
+
+DEFER-TRIM skips only the per-add byte-cap trim, for callers that admit
+several transactions and re-limit ONCE afterwards — Core's guard is
+`!package_submission && !bypass_limits` (validation.cpp:1393), the single
+re-limit living at the end of MaybeUpdateMempoolForReorg (:387) for the
+reorg re-add and of AcceptPackage (:1728) for package submission. The
+cluster-limit rejection is NOT deferred: Core's CheckMemPoolPolicyLimits
+runs unconditionally (validation.cpp:1338-1342)."
   ;; Check for duplicate
   (when (mempool-has mempool txid)
     (return-from mempool-add :duplicate))
@@ -616,8 +649,10 @@ validation.cpp:1394-1401)."
   ;; then LimitMempoolSize, validation.cpp:1394-1401): the new tx competes as
   ;; part of its own cluster's chunks, and if its chunk is the worst it
   ;; evicts itself - that is the "mempool full" outcome, and the rolling
-  ;; minimum fee has been raised past its feerate either way.
-  (when (> (mempool-total-size mempool) (mempool-max-size mempool))
+  ;; minimum fee has been raised past its feerate either way. Skipped under
+  ;; DEFER-TRIM (see docstring).
+  (when (and (not defer-trim)
+             (> (mempool-total-size mempool) (mempool-max-size mempool)))
     (mempool-trim-to-size mempool)
     (unless (mempool-has mempool txid)
       (return-from mempool-add :mempool-full)))
@@ -752,6 +787,58 @@ a hash-set's keys), skipping any that are absent or handle-less."
           (dolist (k txids) (collect k))))
     handles))
 
+(defun %rbf-replaced-set (mempool direct-conflicts)
+  "The full set a replacement of DIRECT-CONFLICTS evicts, as a txid hash-set:
+each conflict and all its in-mempool descendants (Core GetEntriesForConflicts
+-> CalculateDescendants)."
+  (let ((replaced (make-hash-table :test 'equalp)))
+    (dolist (ctxid direct-conflicts replaced)
+      (setf (gethash ctxid replaced) t)
+      (maphash (lambda (d v) (declare (ignore v)) (setf (gethash d replaced) t))
+               (mempool-descendants mempool ctxid)))))
+
+(defun %rbf-cluster-caps (mempool direct-conflicts)
+  "Rule 5 (redefined for cluster mempool, Core rbf.cpp:58-83 +
+txmempool.cpp:988-990): NIL when DIRECT-CONFLICTS touch at most 100 distinct
+CLUSTERS together holding at most 500 transactions (the GatherClusters gather
+cap that bounds the diagram-staging work), else the rejection keyword."
+  (let ((graph (mempool-graph mempool))
+        (conflict-handles (%rbf-entry-handles mempool direct-conflicts)))
+    (cond ((> (txgraph-count-distinct-clusters graph conflict-handles)
+              +max-rbf-replacement-candidates+)
+           :too-many-clusters)
+          ((> (txgraph-cluster-transaction-count graph conflict-handles)
+              +max-rbf-gather-transactions+)
+           :too-many-replacements))))
+
+(defun %rbf-replaced-fees (mempool replaced)
+  "Total prioritisation-modified fees of the REPLACED txid hash-set's entries."
+  (let ((orig-fees 0))
+    (maphash (lambda (txid v) (declare (ignore v))
+               (let ((e (mempool-get mempool txid)))
+                 (when e (incf orig-fees (mempool-entry-modified-fee e)))))
+             replaced)
+    orig-fees))
+
+(defun %rbf-pays-for-rbf-p (orig-fees new-fee new-vsize)
+  "Rules 3 and 4 (Core PaysForRBF, rbf.cpp:106-123): the replacement must pay
+at least the total fee of what it replaces (rule 3) PLUS its own bandwidth at
+the incremental relay fee rate — 0.1 sat/vB, not the 1 sat/vB relay floor
+(rule 4)."
+  (and (>= new-fee orig-fees)
+       (>= (- new-fee orig-fees)
+           (ceiling (* new-vsize +incremental-relay-fee-rate+) 1000))))
+
+(defun %rbf-diagram-verdict (old-diagram new-diagram)
+  "The economic verdict on a staged replacement's before/after diagrams:
+NIL when NEW strictly improves OLD, :too-large-cluster when the staging was
+uncalculable (an over-limit cluster, Core CheckMemPoolPolicyLimits failing
+before the diagram, validation.cpp:1020-1022), else :replacement-failed
+(Core ImprovesFeerateDiagram failure, rbf.cpp:136-138)."
+  (cond ((eq old-diagram :uncalculable) :too-large-cluster)
+        ((not (eq (compare-chunks new-diagram old-diagram) :greater))
+         :replacement-failed)))
+
 (defun check-rbf-rules (mempool tx new-fee new-vsize direct-conflicts)
   "Apply the cluster-mempool replacement rules for TX (paying NEW-FEE — the
 prioritisation-MODIFIED fee, like the replaced entries' fees below — over
@@ -767,26 +854,11 @@ in terms of clusters; and the old feerate-superiority test
 (PaysMoreThanConflicts) is replaced by the feerate-diagram improvement check
 (Core ReplacementChecks, validation.cpp:981-1032)."
   (let ((graph (mempool-graph mempool))
-        (replaced (make-hash-table :test 'equalp))
-        (orig-fees 0))
-    ;; Build the full set to be replaced: each conflict and all its descendants
-    ;; (Core GetEntriesForConflicts -> CalculateDescendants).
-    (dolist (ctxid direct-conflicts)
-      (setf (gethash ctxid replaced) t)
-      (maphash (lambda (d v) (declare (ignore v)) (setf (gethash d replaced) t))
-               (mempool-descendants mempool ctxid)))
-    ;; Rule 5 (redefined for cluster mempool, Core rbf.cpp:58-83 +
-    ;; txmempool.cpp:988-990): reject a replacement that conflicts directly with
-    ;; more than 100 distinct CLUSTERS, or whose conflicting clusters together
-    ;; hold more than 500 transactions (the GatherClusters gather cap that
-    ;; bounds the diagram-staging work below).
-    (let ((conflict-handles (%rbf-entry-handles mempool direct-conflicts)))
-      (when (> (txgraph-count-distinct-clusters graph conflict-handles)
-               +max-rbf-replacement-candidates+)
-        (return-from check-rbf-rules (values nil :too-many-clusters nil)))
-      (when (> (txgraph-cluster-transaction-count graph conflict-handles)
-               +max-rbf-gather-transactions+)
-        (return-from check-rbf-rules (values nil :too-many-replacements nil))))
+        (replaced (%rbf-replaced-set mempool direct-conflicts)))
+    ;; Rule 5.
+    (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts)))
+      (when cap-failure
+        (return-from check-rbf-rules (values nil cap-failure nil))))
     ;; A replacement must not spend an output of any tx it replaces (Core
     ;; EntriesAndTxidsDisjoint, rbf.cpp:85-98) — that would leave a dangling
     ;; input after the replaced set is evicted. (This is NOT old rule 2, which
@@ -796,20 +868,9 @@ in terms of clusters; and the old feerate-superiority test
                       (bitcoin-lisp.serialization:tx-in-previous-output in))
                      replaced)
         (return-from check-rbf-rules (values nil :spends-conflicting-tx nil))))
-    ;; Sum the fees of everything being replaced.
-    (maphash (lambda (txid v) (declare (ignore v))
-               (let ((e (mempool-get mempool txid)))
-                 (when e (incf orig-fees (mempool-entry-modified-fee e)))))
-             replaced)
-    ;; Rule 3 (Core PaysForRBF, rbf.cpp:106-112): pay at least the total fee of
-    ;; the replaced transactions.
-    (when (< new-fee orig-fees)
-      (return-from check-rbf-rules (values nil :insufficient-fee nil)))
-    ;; Rule 4 (Core PaysForRBF, rbf.cpp:114-123): pay for the replacement's own
-    ;; bandwidth on top, at the incremental relay fee rate (0.1 sat/vB), not the
-    ;; 1 sat/vB relay floor.
-    (when (< (- new-fee orig-fees)
-             (ceiling (* new-vsize +incremental-relay-fee-rate+) 1000))
+    ;; Rules 3 and 4 against the total fees of everything being replaced.
+    (unless (%rbf-pays-for-rbf-p (%rbf-replaced-fees mempool replaced)
+                                 new-fee new-vsize)
       (return-from check-rbf-rules (values nil :insufficient-fee nil)))
     ;; Economic test (Core ImprovesFeerateDiagram, rbf.cpp:127-140): the
     ;; replacement must STRICTLY improve the mempool's feerate diagram. Stage
@@ -822,13 +883,61 @@ in terms of clusters; and the old feerate-superiority test
       (multiple-value-bind (old-diagram new-diagram)
           (txgraph-rbf-diagrams graph removed-handles parent-handles
                                 new-fee new-vsize)
-        (when (eq old-diagram :uncalculable)
-          ;; The staged replacement would form an over-limit cluster (Core
-          ;; CheckMemPoolPolicyLimits failing before the diagram, "too-large-
-          ;; cluster", validation.cpp:1020-1022).
-          (return-from check-rbf-rules (values nil :too-large-cluster nil)))
-        (unless (eq (compare-chunks new-diagram old-diagram) :greater)
-          (return-from check-rbf-rules (values nil :replacement-failed nil)))))
+        (let ((verdict (%rbf-diagram-verdict old-diagram new-diagram)))
+          (when verdict
+            (return-from check-rbf-rules (values nil verdict nil))))))
+    (values t nil replaced)))
+
+(defun check-package-rbf-rules (mempool parent-fee parent-vsize
+                                child-fee child-vsize direct-conflicts)
+  "Apply the package RBF rules for a 1-parent-1-child package whose members
+conflict with mempool transactions (Core PackageRBFChecks,
+validation.cpp:1034-1130). PARENT-FEE/CHILD-FEE are the prioritisation-
+modified fees; DIRECT-CONFLICTS the aggregated directly-conflicting mempool
+txids of BOTH package members. Returns (values ok-p reason replaced-set)
+like CHECK-RBF-RULES.
+
+The caller enforces Core's shape preconditions first: exactly 2 transactions
+forming child-with-parents (validation.cpp:1047-1050) and NO in-mempool
+ancestors for either (validation.cpp:1052-1064, keeping the resulting
+cluster <= 2) — the latter also makes the single-RBF spends-conflicting-tx
+check vacuous here (a package member cannot spend any mempool output at
+all). On top of the single-RBF anti-DoS rules evaluated against the PACKAGE
+totals, the package feerate must STRICTLY exceed the parent's own feerate
+(validation.cpp:1104-1111: the pair must be a chunk on its own — the child
+must not merely pay anti-DoS fees), and the diagram test stages BOTH package
+transactions (validation.cpp:1113-1121)."
+  (let ((graph (mempool-graph mempool))
+        (replaced (%rbf-replaced-set mempool direct-conflicts))
+        (total-fee (+ parent-fee child-fee))
+        (total-vsize (+ parent-vsize child-vsize)))
+    ;; Rule 5, on the aggregate conflict set ("this limit is not increased in
+    ;; a package RBF", validation.cpp:1076-1082).
+    (let ((cap-failure (%rbf-cluster-caps mempool direct-conflicts)))
+      (when cap-failure
+        (return-from check-package-rbf-rules (values nil cap-failure nil))))
+    ;; Rules 3 and 4 on the package totals (validation.cpp:1092-1099).
+    (unless (%rbf-pays-for-rbf-p (%rbf-replaced-fees mempool replaced)
+                                 total-fee total-vsize)
+      (return-from check-package-rbf-rules (values nil :insufficient-fee nil)))
+    ;; Package feerate must strictly exceed the parent feerate. Core compares
+    ;; CFeeRate objects, whose sat/kvB value is the C++-truncated division
+    ;; fee*1000/size (validation.cpp:1104-1111).
+    (when (<= (truncate (* total-fee 1000) total-vsize)
+              (truncate (* parent-fee 1000) parent-vsize))
+      (return-from check-package-rbf-rules
+        (values nil :package-feerate-not-above-parent nil)))
+    ;; Economic test: stage the removal of the replaced set and the addition
+    ;; of BOTH package transactions, then require a strict diagram improvement
+    ;; (Core CheckMemPoolPolicyLimits + ImprovesFeerateDiagram over the
+    ;; two-transaction changeset, validation.cpp:1113-1121).
+    (multiple-value-bind (old-diagram new-diagram)
+        (txgraph-package-rbf-diagrams graph (%rbf-entry-handles mempool replaced)
+                                      parent-fee parent-vsize
+                                      child-fee child-vsize)
+      (let ((verdict (%rbf-diagram-verdict old-diagram new-diagram)))
+        (when verdict
+          (return-from check-package-rbf-rules (values nil verdict nil)))))
     (values t nil replaced)))
 
 ;;;; Persistence (Bitcoin Core mempool.dat — node/mempool_persist.cpp)
@@ -1022,6 +1131,59 @@ tx's descendants spend outputs that no longer exist)."
                  (mempool-spent-outpoints mempool))
         (dolist (txid to-remove)
           (mempool-remove-recursive mempool txid))))))
+
+(defun mempool-remove-spenders (mempool txid n-outputs)
+  "Remove, with their descendants, any mempool transactions spending an output
+of TXID — a transaction NOT itself in the pool (Core removeRecursive's
+not-in-mempool branch, txmempool.cpp:333-359: \"this can happen during chain
+re-orgs if origTx isn't re-accepted into the mempool\"). N-OUTPUTS is TXID's
+output count. Used by the reorg re-add path when a disconnected transaction
+fails re-acceptance: its in-pool spenders' inputs no longer exist anywhere.
+Returns the number of transactions removed."
+  (let ((removed 0))
+    (dotimes (i n-outputs removed)
+      (let ((spender (mempool-spending-tx mempool txid i)))
+        (when spender
+          (incf removed (mempool-remove-recursive mempool spender)))))))
+
+(defun mempool-update-for-reorg (mempool readded-txids)
+  "After a reorg's disconnected transactions have been re-accepted one by one,
+repair the whole-pool state in ONE batch (Core UpdateTransactionsFromBlock,
+txmempool.cpp:91-120, called from MaybeUpdateMempoolForReorg): acceptance
+assumes a new entry has no in-mempool children, which is false for a
+previously-confirmed transaction whose outputs pre-existing pool entries
+spend, so wire those parent->child links (BFS links + a txgraph dependency
+per spender), then restore the cluster limits with a single TXGRAPH-TRIM —
+the dependency merges are what can push clusters over 64 tx / 101 kvB, and
+batching them here (instead of re-clustering per re-add) is the point of the
+bulk flow. READDED-TXIDS is most-recently-confirmed first (Core iterates
+vHashUpdate in reverse). Returns the number of transactions the trim evicted."
+  (%with-graph-verify-batch (mempool)
+    (let ((graph (mempool-graph mempool))
+          (deps '()))
+      (dolist (txid readded-txids)
+        (let ((entry (mempool-get mempool txid)))
+          (when entry
+            (dotimes (i (length (bitcoin-lisp.serialization:transaction-outputs
+                                 (mempool-entry-transaction entry))))
+              (let* ((child-txid (mempool-spending-tx mempool txid i))
+                     (child (and child-txid (mempool-get mempool child-txid))))
+                (when child
+                  (%link-entry-parents mempool child-txid child (list txid))
+                  (push (cons (mempool-entry-graph-handle entry)
+                              (mempool-entry-graph-handle child))
+                        deps)))))))
+      ;; All graph dependencies in one resolve pass (one union-find and one
+      ;; merge + relinearization per connected group), not per pair.
+      (txgraph-add-dependencies graph deps)
+      ;; One trim (Core m_txgraph->Trim(), txmempool.cpp:115): drops whole
+      ;; would-be-descendant subtrees from every over-limit would-be cluster,
+      ;; keeping the best chunks. The removed set is descendant-closed, so
+      ;; plain per-tx removal leaves nothing dangling.
+      (let ((evicted 0))
+        (dolist (handle (txgraph-trim graph) evicted)
+          (when (mempool-remove mempool (tx-handle-data handle))
+            (incf evicted)))))))
 
 (defun mempool-get-transactions (mempool)
   "Return a list of all transactions in the mempool."
