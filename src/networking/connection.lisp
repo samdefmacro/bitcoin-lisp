@@ -50,6 +50,23 @@ in-flight socket reads.")
   "Return T if node shutdown has been requested (see *ibd-stop-requested*)."
   *ibd-stop-requested*)
 
+(defun join-thread-or-destroy (thread &key (timeout 5) deadline)
+  "Wait for THREAD to exit, destroying it if it is still alive after TIMEOUT
+seconds (or past DEADLINE, an internal-real-time absolute cutoff — pass one
+shared deadline to bound the TOTAL wait when joining several threads). The
+shutdown-path teardown for network threads whose blocking work was already
+cancelled (socket closed, stop flag set): they exit within a poll tick or
+they never will. NIL THREAD is a no-op."
+  (when (and thread (bt:thread-alive-p thread))
+    (let ((deadline (or deadline
+                        (+ (get-internal-real-time)
+                           (round (* timeout internal-time-units-per-second))))))
+      (loop while (and (bt:thread-alive-p thread)
+                       (< (get-internal-real-time) deadline))
+            do (sleep 0.1))
+      (when (bt:thread-alive-p thread)
+        (bt:destroy-thread thread)))))
+
 (defun set-tcp-nodelay (usocket-socket)
   "Disable Nagle's algorithm on USOCKET-SOCKET. Bitcoin's wire protocol
 sends small request messages followed by long silence while awaiting

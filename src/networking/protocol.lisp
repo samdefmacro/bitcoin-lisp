@@ -1169,6 +1169,99 @@ elicit more than one reply regardless of whether we had addresses to send."
           (when msg
             (send-message peer msg)))))))
 
+;;; Local-address self-advertisement (Core MaybeSendAddr's local-address half,
+;;; net_processing.cpp:5530-5567 + GetLocalAddrForPeer, net.cpp:240-267)
+
+(defconstant +avg-local-address-broadcast-interval+ (* 24 60 60)
+  "Mean seconds between self-announcements of our own address to a peer
+(Core AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL = 24h, net_processing.cpp:158).")
+
+(defun peer-connected-through-network (peer)
+  "The network of the transport PEER is actually connected over (Core
+CNode::ConnectedThroughNetwork): :torv3 for peers accepted on the local
+onion-service listener (whose socket address is Tor's 127.0.0.1) and for
+outbound dials to .onion targets; otherwise the network of the peer's
+address, or :unroutable when it cannot be typed (hostname addnode)."
+  (if (peer-inbound-onion peer)
+      :torv3
+      (multiple-value-bind (net bytes)
+          (parse-network-address (peer-address peer))
+        (declare (ignore bytes))
+        (or net :unroutable))))
+
+(defun get-local-addr-for-peer (peer)
+  "The local address worth advertising to PEER, as a local-address record, or
+NIL (Core GetLocalAddrForPeer, net.cpp:240-267): the best mapLocalHost entry
+for the peer's connected-through network (privacy rule + reachability rank,
+best-local-address), provided it is routable. Core's other branch — sometimes
+echoing back the address the peer SEES us as — is fDiscover-gated, and we
+have no -discover support (fDiscover permanently false), so it never fires."
+  (let ((la (best-local-address (peer-connected-through-network peer))))
+    (when (and la
+               (address-routable-p (local-address-bytes la)
+                                   (local-address-network la)))
+      la)))
+
+(defun %announce-local-address (peer)
+  "Send our best local address for PEER as a single-address addr/addrv2
+message; T when one actually went out. build-addr-response drops a torv3
+address for a peer without addrv2 (Core IsAddrCompatible); the sent address
+is marked into the peer's known-addrs (Core AddAddressKnown at the queue
+flush) so relay-address won't echo it back."
+  (let ((la (get-local-addr-for-peer peer)))
+    (when la
+      (let* ((pa (make-peer-address
+                  :net (local-address-network la)
+                  :ip (local-address-bytes la)
+                  :port (local-address-port la)
+                  :services (local-services)
+                  :last-seen (bitcoin-lisp.serialization:get-unix-time)))
+             (msg (build-addr-response peer (list pa))))
+        (when msg
+          (bitcoin-lisp:add-recent-reject (peer-known-addrs peer)
+                                          (%addr-gossip-key pa))
+          (when (send-message peer msg)
+            (bitcoin-lisp:log-cat "net" "Advertising address ~A:~D to peer ~A"
+                                  (peer-address-string pa)
+                                  (peer-address-port pa)
+                                  (peer-address peer))
+            t))))))
+
+(defun maybe-advertise-local-address (peers chain-state)
+  "Advertise our own best local address to each due addr-relay peer (Core
+MaybeSendAddr's periodic local-address push): per peer, every ~24h on an
+exponential schedule, with the first announcement due as soon as the peer is
+ready. All our announcements are their own single-address message (Core only
+distinguishes the first because later ones ride its outgoing addr queue,
+which we don't have; its addr-known bloom reset before repeats is unneeded
+here because this path never consults known-addrs). Eligibility matches our
+addr gossip: ready + tx-relaying. Gated on !IBD like Core; the fListen gate
+is implicit — the local-address map only gains entries while the onion
+service (which requires listening) is up. Call ~1x/second from the sync
+loop. Returns the number of peers announced to."
+  ;; Fast path first: an empty map is the steady state of every node without
+  ;; a Tor daemon, and this runs every second — don't touch the chainstate
+  ;; (initial-block-download-p) or the peer list for it. (Consequence, unlike
+  ;; Core: peers aren't rescheduled +24h while there is nothing to say, so
+  ;; the first announcement goes out promptly once the service appears.)
+  (unless *local-addresses*
+    (return-from maybe-advertise-local-address 0))
+  (when (initial-block-download-p chain-state)
+    (return-from maybe-advertise-local-address 0))
+  (let ((now (get-internal-real-time))
+        (sent 0))
+    (dolist (peer peers sent)
+      (when (and (eq (peer-state peer) :ready)
+                 (peer-relays-txs-p peer)
+                 (<= (peer-next-local-addr-send peer) now))
+        (when (%announce-local-address peer)
+          (incf sent))
+        ;; Reschedule whether or not anything was sent (Core sets
+        ;; m_next_local_addr_send unconditionally once due).
+        (setf (peer-next-local-addr-send peer)
+              (+ now (%next-exp-interval-ticks
+                      +avg-local-address-broadcast-interval+)))))))
+
 ;;; Transaction relay
 
 (defun relay-enabled-p ()

@@ -36,6 +36,14 @@ SOCKS5, and discover-peers stops resolving DNS seeds locally.")
 Set from -onion, defaulting to -proxy when unset (Core init.cpp:1764-1790).
 Stored for the P1+ onion-dialing phases — nothing dials .onion yet.")
 
+(defvar *onion-proxy-explicit* nil
+  "T when the user gave -onion (any value, including -onion=0) explicitly.
+The torcontrol client auto-configures the onion proxy from Tor's own
+GETINFO net/listeners/socks ONLY when -onion was not given at all — Core's
+gArgs.GetArg(\"-onion\", \"\") == \"\" test (torcontrol.cpp:471), which is
+about the raw argument, not the derived proxy (an unadorned -proxy still
+gets overridden by what Tor reports). Set by apply-config-globals.")
+
 ;;; Tor stream isolation (Core netbase.cpp:748-784
 ;;; TorStreamIsolationCredentialsGenerator): a per-process random 8-byte hex
 ;;; prefix (so separate launches never share circuits) plus a per-connection
