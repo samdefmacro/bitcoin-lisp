@@ -719,6 +719,9 @@ The caller owns cleanup on failure (abort-snapshot-chainstate)."
   "Tear down SNAP mid-activation (Core cleanup_bad_snapshot): close its coins
 DB (releasing the LevelDB lock) and delete its on-disk footprint. Never
 signals — this runs on the activation failure path."
+  ;; Core's cleanup_bad_snapshot rebalances first (validation.cpp:5697) —
+  ;; the failed activation must not leave a split cache allocation behind.
+  (ignore-errors (maybe-rebalance-caches node))
   (bitcoin-lisp.storage:close-chainstate-coins-view snap)
   (ignore-errors
     (bitcoin-lisp.storage:delete-snapshot-chainstate-files
@@ -747,6 +750,10 @@ historical chainstate's candidate filtering is the target guard there."
     (bt:with-recursive-lock-held ((node-lock node))
       (setf (node-chainstates node)
             (append (node-chainstates node) (list snap))))
+    ;; Split the coins-cache budget across the two chainstates (Core calls
+    ;; MaybeRebalanceCaches at the end of ActivateSnapshot,
+    ;; validation.cpp:5745).
+    (maybe-rebalance-caches node)
     (log-info "[snapshot] successfully activated snapshot ~A: current chainstate now at height ~D following the network tip; historical chainstate (h=~D) re-derives history toward the base in the background"
               (bitcoin-lisp.crypto:bytes-to-hex base-hash)
               (bitcoin-lisp.storage:current-height snap)
@@ -816,6 +823,9 @@ before crash-recovery resolution (a torn snapshot flush joins
              (bitcoin-lisp.storage:set-chainstate-target primary base-entry)
              (setf (node-chainstates node)
                    (append (node-chainstates node) (list snap)))
+             ;; Split the coins-cache budget across the re-adopted pair (Core
+             ;; LoadChainstate's MaybeRebalanceCaches, node/chainstate.cpp:146).
+             (maybe-rebalance-caches node)
              (log-info "[snapshot] switching active chainstate to the snapshot chainstate (tip h=~D); historical chainstate at h=~D targets the base at h=~D"
                        (bitcoin-lisp.storage:current-height snap)
                        (bitcoin-lisp.storage:current-height primary)
@@ -927,6 +937,14 @@ MISMATCH / no chainparams entry -> %mark-snapshot-invalid, and returns
            ((equalp got want)
             (setf (bitcoin-lisp.storage:chain-state-assumeutxo-status snap) :validated
                   (bitcoin-lisp.storage:chain-state-target-utxohash historical) got)
+            ;; VALIDATED lifts the snapshot chainstate's prune floor (Core: a
+            ;; validated chainstate's GetPruneRange starts at 0 again); the
+            ;; prune-walk cursor rewinds so the window the floor protected
+            ;; becomes reclaimable.
+            (bitcoin-lisp.storage:lift-prune-floor-on-promotion snap historical)
+            ;; Core rebalances the caches immediately after promotion
+            ;; (validation.cpp:6093): everything to the snapshot chainstate.
+            (maybe-rebalance-caches node)
             (log-info "[snapshot] snapshot beginning at ~A has been fully validated"
                       (bitcoin-lisp.crypto:bytes-to-hex
                        (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash snap)))
@@ -1353,10 +1371,16 @@ Returns the node instance."
   ;; Catch-up sweep: drop undo files at/below the pruned horizon. They
   ;; accumulated before undo pruning existed (53GB/500k files on the first
   ;; mainnet run); after the first sweep the directory only holds the
-  ;; unpruned window, so this is cheap on every later start.
+  ;; unpruned window, so this is cheap on every later start. The undo
+  ;; directory is shared across chainstates, so the horizon is the MINIMUM
+  ;; pruned-height over all of them: during an assumeutxo background sync the
+  ;; current (snapshot) chainstate's cursor sits above the base while the
+  ;; historical chainstate still needs its own undo window far below it.
   (when (pruning-enabled-p)
     (let ((swept (bitcoin-lisp.validation:prune-stale-undo-files
-                  (node-chain-state *node*))))
+                  (node-chain-state *node*)
+                  :horizon (reduce #'min (node-chainstates *node*)
+                                   :key #'bitcoin-lisp.storage:chain-state-pruned-height))))
       (when (plusp swept)
         (log-info "Pruned ~D stale undo file~:P below the prune horizon" swept))))
 
@@ -1658,6 +1682,72 @@ the budget, whichever is larger free margin) remains."
   (max (floor (* budget 9) 10)
        (- budget (* 10 1024 1024))))
 
+(defun chainstate-coins-cache-budget (chainstate)
+  "CHAINSTATE's coins-cache budget in bytes: its per-chainstate allocation
+when maybe-rebalance-caches has split the global budget (assumeutxo dual
+chainstates), otherwise the whole *coins-cache-budget-bytes*."
+  (or (bitcoin-lisp.storage:chain-state-coins-cache-bytes chainstate)
+      *coins-cache-budget-bytes*))
+
+(defun maybe-rebalance-caches (node)
+  "Split the coins-cache budget between NODE's chainstates (Core
+ChainstateManager::MaybeRebalanceCaches, validation.cpp:6103-6134). A sole
+chainstate gets everything — both the ordinary no-snapshot case and the
+snapshot chainstate after background validation completes. While BOTH
+chainstates exist, the one doing the urgent work gets 95%: the snapshot
+(current) chainstate while the node is still in IBD, the historical
+chainstate once the tip is synced. Core calls this at chainstate init,
+snapshot activation (incl. the activation-failure cleanup), background-
+validation completion, and on IBD exit; our call sites mirror those.
+
+Divergence from Core: Core sizes TWO caches per chainstate (coinstip +
+coinsdb) from separate totals; we keep one coins cache per chainstate whose
+budget is a flush-trigger threshold (maybe-periodic-flush), so the same
+ratios apply to the single global budget and take effect at the next flush
+check rather than through an immediate resize/eviction."
+  (let ((current (node-current-chainstate node))
+        (historical (node-historical-chainstate node)))
+    (cond
+      ((null historical)
+       (when (and current
+                  (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash current))
+         (log-info "[snapshot] allocating all cache to the snapshot chainstate"))
+       (when current
+         (setf (bitcoin-lisp.storage:chain-state-coins-cache-bytes current) nil)))
+      (t
+       (let ((total *coins-cache-budget-bytes*))
+         (multiple-value-bind (current-share historical-share)
+             (if (bitcoin-lisp.networking:initial-block-download-p current)
+                 (values 0.95d0 0.05d0)
+                 (values 0.05d0 0.95d0))
+           (setf (bitcoin-lisp.storage:chain-state-coins-cache-bytes current)
+                 (floor (* total current-share))
+                 (bitcoin-lisp.storage:chain-state-coins-cache-bytes historical)
+                 (floor (* total historical-share)))
+           (log-info "[snapshot] coins-cache budgets rebalanced: current chainstate ~D MiB, historical chainstate ~D MiB"
+                     (floor (chainstate-coins-cache-budget current) 1048576)
+                     (floor (chainstate-coins-cache-budget historical) 1048576))))))))
+
+(defun rebalance-caches-on-ibd-exit ()
+  "Rebalance the coins-cache allocation when the node leaves initial block
+download while a background (historical) chainstate is in use (Core
+ActivateBestChain's exited_ibd hook, validation.cpp:3479-3486). Called from
+the IBD latch flip in bitcoin-lisp.networking:initial-block-download-p."
+  (let ((node *node*))
+    (when (and node (node-historical-chainstate node))
+      (maybe-rebalance-caches node))))
+
+(defun effective-prune-target-bytes ()
+  "The automatic-prune target in bytes (Core BlockManager::FindFilesToPrune,
+node/blockstorage.cpp:330-338): the -prune target divided by the number of
+chainstates — halved while an assumeutxo historical chainstate exists, so
+half the block storage is reserved for the historical chainstate's
+re-derivation and the other half for the most-work chainstate — and floored
+at +min-disk-space-for-block-files+ (550 MiB, validation.h:87)."
+  (let ((num-chainstates (if (and *node* (node-historical-chainstate *node*)) 2 1)))
+    (max +min-disk-space-for-block-files+
+         (floor (* *prune-target-mib* 1048576) num-chainstates))))
+
 (defvar *blocks-since-flush* 0
   "Counter incremented per connected block; reset to 0 when a flush runs.")
 
@@ -1809,10 +1899,12 @@ durable if it does flush (atomic temp+fsync+rename inside save-*)."
                   +flush-every-n-seconds+)
               ;; Size trigger (Bitcoin Core dbcache): flush once the coins cache
               ;; reaches its memory budget, so it can't grow unbounded between the
-              ;; block-count / time flushes.
+              ;; block-count / time flushes. The budget is per-chainstate while an
+              ;; assumeutxo background sync splits it (maybe-rebalance-caches).
               (and view
                    (>= (bitcoin-lisp.storage:view-mem-bytes view)
-                       (large-coins-cache-threshold *coins-cache-budget-bytes*))))
+                       (large-coins-cache-threshold
+                        (chainstate-coins-cache-budget cs)))))
       ;; Triggering chainstate first (its cache may be the urgent one),
       ;; then the rest. Per-cycle bookkeeping (trigger resets, ONE major
       ;; GC, memory snapshots) runs once around the whole pass — not per
