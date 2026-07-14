@@ -115,18 +115,23 @@ for a snapshot chainstate, and validated reflects its assumeutxo status."
 (defun rpc-getchainstates (node params)
   "Report this node's chainstate(s) (Bitcoin Core getchainstates), derived
 from the node's chainstates list in Core's order: the historical chainstate
-first (when background validation is in progress), the current (active)
-chainstate last. Today exactly one (validated, primary) chainstate exists."
+first (when assumeutxo background validation is in progress), the current
+(active) chainstate last."
   (declare (ignore params))
   (let* ((syncing (rpc-is-syncing node))
          (chainstates (rpc-get-chainstates node))
          (current (bitcoin-lisp.storage:select-current-chainstate chainstates))
          (historical (bitcoin-lisp.storage:select-historical-chainstate chainstates))
+         ;; Core reports m_best_header's height, which can exceed every
+         ;; chainstate's validated tip.
+         (best-header (bitcoin-lisp.storage:best-header-entry current))
          (entries (append
                    (when historical
                      (list (%getchainstates-entry historical syncing)))
                    (list (%getchainstates-entry current syncing)))))
-    `(("headers" . ,(bitcoin-lisp.storage:current-height current))
+    `(("headers" . ,(if best-header
+                        (bitcoin-lisp.storage:block-index-entry-height best-header)
+                        (bitcoin-lisp.storage:current-height current)))
       ("chainstates" . ,entries))))
 
 (defun rpc-getbestblockhash (node params)
@@ -1580,24 +1585,103 @@ of coins consumed."
                      (decf coins-left))))))
     (- coins-count coins-left)))
 
+(defun %populate-snapshot-chainstate (node in au base-hash base-entry
+                                      base-height coins-count fail)
+  "Populate + verify + adopt a snapshot chainstate from the coin stream IN
+(Core PopulateAndValidateSnapshot, validation.cpp:5773-5973, plus the
+adoption tail of ActivateSnapshot). Coins stream straight into the new
+chainstate's own LevelDB in durable batches with Core's per-coin checks
+(validation.cpp:5834-5845); the commitment hash is then computed over the
+POPULATED set (Core hashes the new DB), so even a snapshot whose stream
+order differs from cursor order verifies correctly. On success the tip is
+set to the base, the base_blockhash marker and state file are written, the
+base entry's tx-count is seeded from the commitment's nChainTx (Core
+validation.cpp:5938-5967), and the chainstate is adopted as current. Any
+failure tears the snapshot chainstate down (dir deleted) via FAIL, a
+function of (format-string &rest args) that must signal."
+  (let ((snap (bitcoin-lisp::create-snapshot-chainstate node base-hash))
+        (adopted nil))
+    (unwind-protect
+         (let* ((view (bitcoin-lisp.storage:chain-state-coins-view snap))
+                (base-db (bitcoin-lisp.storage:coins-view-cache-base view))
+                (processed 0))
+           (flet ((put-coin (batch txid vout height coinbase value script)
+                    (when (or (> height base-height) (>= vout #xFFFFFFFF))
+                      (funcall fail "Bad snapshot data after deserializing ~D coins"
+                               processed))
+                    (when (or (minusp value)
+                              (> value bitcoin-lisp.validation:+max-money+))
+                      (funcall fail "Bad snapshot data after deserializing ~D coins - bad tx out value"
+                               processed))
+                    (bitcoin-lisp.storage:coins-view-batch-put
+                     batch
+                     (bitcoin-lisp.storage::make-utxo-key txid vout)
+                     (bitcoin-lisp.storage:make-utxo-entry
+                      :value value :script-pubkey script
+                      :height height :coinbase coinbase))
+                    (incf processed)))
+             (handler-case
+                 (loop while (< processed coins-count)
+                       do (bitcoin-lisp.storage:with-coins-view-batch
+                              (batch base-db :sync t)
+                            (%map-snapshot-coins
+                             in (min (- coins-count processed) 100000)
+                             (lambda (txid vout height coinbase value script)
+                               (put-coin batch txid vout height coinbase value script))
+                             :mismatch-fn
+                             (lambda ()
+                               (funcall fail "Mismatch in coins count in snapshot metadata and actual snapshot data")))))
+               (rpc-error (e) (error e))
+               (error ()
+                 (funcall fail "Bad snapshot format or truncated snapshot after deserializing ~D coins"
+                          processed))))
+           (unless (eq :eof (read-byte in nil :eof))
+             (funcall fail "Bad snapshot - coins left over after deserializing ~D coins"
+                      coins-count))
+           ;; hash_serialized_3 over the POPULATED set vs the chainparams
+           ;; commitment (Core ComputeUTXOStats over the new DB,
+           ;; validation.cpp:5921-5936).
+           (let ((got (bitcoin-lisp.storage:compute-utxo-set-hash view))
+                 (want (bitcoin-lisp:assumeutxo-data-hash-serialized au)))
+             (unless (equalp got want)
+               (funcall fail "Bad snapshot content hash: expected ~A, got ~A"
+                        (hash-to-hex want) (hash-to-hex got))))
+           ;; Verified: finalize and adopt.
+           (bitcoin-lisp.storage:update-chain-tip snap base-hash base-height)
+           (bitcoin-lisp.storage:write-snapshot-base-blockhash snap)
+           (bitcoin-lisp.storage:save-state snap)
+           (setf (bitcoin-lisp.storage:block-index-entry-tx-count base-entry)
+                 (bitcoin-lisp:assumeutxo-data-chain-tx-count au))
+           (bitcoin-lisp::add-snapshot-chainstate node snap)
+           (setf adopted t)
+           (bitcoin-lisp::node-log
+            :info "RPC loadtxoutset: loaded ~D coins, hash_serialized_3 verified, snapshot chainstate active at h=~D"
+            coins-count base-height))
+      (unless adopted
+        (bitcoin-lisp::abort-snapshot-chainstate node snap)))))
+
 (defun rpc-loadtxoutset (node params)
   "Load a Bitcoin Core-format UTXO snapshot (loadtxoutset). PARAMS: (path).
 
-The full verification gate of Core's ActivateSnapshot/PopulateAndValidate-
-Snapshot (validation.cpp:5607-5973) runs BEFORE any state is touched: the
-base blockhash must have an assumeutxo-data entry (chainparams commitment)
-and its header must already be in the block index; every coin passes
-height/vout/MoneyRange checks; the file must contain exactly the declared
-coin count with no trailing bytes; and hash_serialized_3 over the snapshot
-must equal the committed hash. Any failure rejects the load with the node
-untouched.
+This is Core's ActivateSnapshot + PopulateAndValidateSnapshot flow
+(validation.cpp:5607-5973): preconditions (chainparams commitment, base
+header known + on the best header chain + not invalid, empty mempool, more
+work than the active tip), then the snapshot streams into a NEW chainstate's
+own coins LevelDB at chainstate_snapshot/ with per-coin checks
+(height/vout/MoneyRange), exact-EOF, and hash_serialized_3 over the
+populated set compared to the committed hash. Any failure deletes the
+snapshot chainstate dir and leaves the node untouched. On success the
+base_blockhash marker is written (the only persistent snapshot-exists
+marker, re-detected at startup), the snapshot chainstate becomes the
+CURRENT chainstate following the network tip, and the previous chainstate is
+retargeted at the base — it keeps validating history in the background. The
+base entry's tx-count is seeded from the commitment's nChainTx, mirroring
+Core's faked m_chain_tx_count (validation.cpp:5966).
 
-We are still a single-chainstate node, so on success the UTXO set is
-REPLACED by the snapshot and the tip fast-forwards to the base block —
-Core instead builds a second chainstate and re-validates the snapshot in
-the background (that is later phases of the assumeutxo plan). The base
-entry's tx-count is seeded from the commitment's nChainTx, mirroring
-Core's faked m_chain_tx_count (validation.cpp:5966)."
+The sync thread is paused for the duration (our stand-in for Core holding
+cs_main), so the chainstates list never changes under a running IBD pass.
+Deliberate P4 restriction: refused on a pruned node (Core supports it via
+per-chainstate prune floors — a later assumeutxo phase)."
   (let ((path (first params)))
     (unless (and (stringp path) (plusp (length path)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "path required"))
@@ -1612,12 +1696,13 @@ Core's faked m_chain_tx_count (validation.cpp:5966)."
                                                 (apply #'format nil fmt args) path))))
       (let* ((network (rpc-get-network node))
              (chain-state (rpc-get-chain-state node))
-             (utxo-set (rpc-get-utxo-set node))
              (mempool (rpc-get-mempool node)))
         (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
           (multiple-value-bind (base-hash coins-count)
               (%read-snapshot-metadata in network)
             ;; --- Preconditions (ActivateSnapshot, validation.cpp:5616-5650) ---
+            (when (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash chain-state)
+              (load-error "Can't activate a snapshot-based chainstate more than once"))
             (let ((au (bitcoin-lisp:assumeutxo-data-for-blockhash network base-hash))
                   (base-entry (bitcoin-lisp.storage:get-block-index-entry
                                chain-state base-hash)))
@@ -1637,81 +1722,44 @@ Core's faked m_chain_tx_count (validation.cpp:5966)."
                 (unless (= base-height (bitcoin-lisp:assumeutxo-data-height au))
                   (load-error "Assumeutxo height in snapshot metadata not recognized (~D) - refusing to load snapshot"
                               base-height))
-                (when (>= (bitcoin-lisp.storage:current-height chain-state) base-height)
-                  (load-error "Work does not exceed active chainstate (node already at or past height ~D)"
-                              base-height))
+                ;; The base must lie on the best header chain (Core
+                ;; m_best_header->GetAncestor(height) == base).
+                (let ((best (bitcoin-lisp.storage:best-header-entry chain-state)))
+                  (unless (and best
+                               (eq (bitcoin-lisp.storage:entry-ancestor-at-height
+                                    best base-height)
+                                   base-entry))
+                    (load-error "A forked headers-chain with more work than the chain with the snapshot base block header exists. Please proceed to sync without AssumeUtxo.")))
+                ;; The snapshot must be a more-work chain than the active tip
+                ;; (Core CBlockIndexWorkComparator; height as the tiebreak
+                ;; for work-less synthetic chains in tests).
+                (let* ((tip-entry (bitcoin-lisp.storage:get-block-index-entry
+                                   chain-state
+                                   (bitcoin-lisp.storage:best-block-hash chain-state)))
+                       (tip-height (bitcoin-lisp.storage:current-height chain-state))
+                       (tip-work (if tip-entry
+                                     (bitcoin-lisp.storage:block-index-entry-chain-work
+                                      tip-entry)
+                                     0))
+                       (base-work (bitcoin-lisp.storage:block-index-entry-chain-work
+                                   base-entry)))
+                  (unless (or (> base-work tip-work)
+                              (and (= base-work tip-work) (> base-height tip-height)))
+                    (load-error "Work does not exceed active chainstate (node already at or past height ~D)"
+                                base-height)))
                 (when (and mempool (plusp (bitcoin-lisp.mempool:mempool-count mempool)))
                   (load-error "Can't activate a snapshot when mempool not empty"))
-                ;; --- Pass 1: verify the whole file before touching state ---
-                ;; Per-coin checks + exact-EOF + hash_serialized_3 vs the
-                ;; commitment. The file is in cursor order (Core-produced
-                ;; snapshots always are), so hashing the stream directly
-                ;; equals hashing the resulting set.
-                (let ((digest (ironclad:make-digest :sha256))
-                      (processed 0))
-                  (handler-case
-                      (%map-snapshot-coins
-                       in coins-count
-                       (lambda (txid vout height coinbase value script)
-                         (when (or (> height base-height) (>= vout #xFFFFFFFF))
-                           (load-error "Bad snapshot data after deserializing ~D coins" processed))
-                         (when (or (minusp value)
-                                   (> value bitcoin-lisp.validation:+max-money+))
-                           (load-error "Bad snapshot data after deserializing ~D coins - bad tx out value" processed))
-                         (ironclad:update-digest
-                          digest (bitcoin-lisp.storage:coin-muhash-element
-                                  txid vout height coinbase value script))
-                         (incf processed))
-                       :mismatch-fn
-                       (lambda ()
-                         (load-error "Mismatch in coins count in snapshot metadata and actual snapshot data")))
-                    (rpc-error (e) (error e))
-                    (error ()
-                      (load-error "Bad snapshot format or truncated snapshot after deserializing ~D coins" processed)))
-                  (unless (eq :eof (read-byte in nil :eof))
-                    (load-error "Bad snapshot - coins left over after deserializing ~D coins" coins-count))
-                  (let ((got (bitcoin-lisp.crypto:sha256 (ironclad:produce-digest digest)))
-                        (want (bitcoin-lisp:assumeutxo-data-hash-serialized au)))
-                    (unless (equalp got want)
-                      (load-error "Bad snapshot content hash: expected ~A, got ~A"
-                                  (hash-to-hex want) (hash-to-hex got)))))
-                ;; --- Pass 2: verified — replace the UTXO set ---
-                (file-position in (+ +snapshot-count-offset+ 8))
-                (etypecase utxo-set
-                  (bitcoin-lisp.storage:coins-view-cache
-                   ;; Drop cache + all existing base coins, then stream the
-                   ;; snapshot into the base LevelDB in bounded batches.
-                   (bitcoin-lisp.storage:coins-view-cache-wipe utxo-set)
-                   (let ((base-db (bitcoin-lisp.storage:coins-view-cache-base utxo-set))
-                         (loaded 0))
-                     (loop while (< loaded coins-count)
-                           do (bitcoin-lisp.storage:with-coins-view-batch (batch base-db)
-                                (incf loaded
-                                      (%map-snapshot-coins
-                                       in (min (- coins-count loaded) 100000)
-                                       (lambda (txid vout height coinbase value script)
-                                         (bitcoin-lisp.storage:coins-view-batch-put
-                                          batch
-                                          (bitcoin-lisp.storage::make-utxo-key txid vout)
-                                          (bitcoin-lisp.storage:make-utxo-entry
-                                           :value value :script-pubkey script
-                                           :height height :coinbase coinbase)))))))))
-                  (bitcoin-lisp.storage:utxo-set
-                   (clrhash (bitcoin-lisp.storage::utxo-set-entries utxo-set))
-                   (%map-snapshot-coins
-                    in coins-count
-                    (lambda (txid vout height coinbase value script)
-                      (bitcoin-lisp.storage:add-utxo utxo-set txid vout value script
-                                                     height :coinbase coinbase)))))
-                ;; Fast-forward the tip and seed the base's chain tx count
-                ;; (Core index->m_chain_tx_count = au_data.m_chain_tx_count;
-                ;; headerindex v2 persists the field).
-                (bitcoin-lisp.storage:update-chain-tip chain-state base-hash base-height)
-                (setf (bitcoin-lisp.storage:block-index-entry-tx-count base-entry)
-                      (bitcoin-lisp:assumeutxo-data-chain-tx-count au))
-                (bitcoin-lisp::node-log
-                 :info "RPC loadtxoutset: loaded ~D coins, hash_serialized_3 verified, tip -> h=~D"
-                 coins-count base-height)
+                (when (bitcoin-lisp:pruning-enabled-p)
+                  (load-error "Snapshot activation on a pruned node is not supported yet (assumeutxo prune handling is a later phase)"))
+                ;; --- Populate + verify into a NEW snapshot chainstate ---
+                ;; (see %populate-snapshot-chainstate). Any failure leaves
+                ;; the node untouched.
+                (bitcoin-lisp::call-with-sync-paused
+                 node
+                 (lambda ()
+                   (%populate-snapshot-chainstate
+                    node in au base-hash base-entry base-height coins-count
+                    #'load-error)))
                 `(("coins_loaded" . ,coins-count)
                   ("tip_hash" . ,(hash-to-hex base-hash))
                   ("base_height" . ,base-height)

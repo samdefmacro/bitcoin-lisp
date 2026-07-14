@@ -511,6 +511,22 @@
    #:select-validated-chainstate
    #:state-file-path
    #:chainstate-leveldb-path
+   ;; Target block / historical-chainstate path (Core SetTargetBlock)
+   #:entry-ancestor-at-height
+   #:set-chainstate-target
+   #:target-ancestor-entry
+   #:entry-target-ancestor-p
+   #:chain-state-target-height
+   #:best-header-entry
+   ;; Per-chainstate coins-view lifecycle
+   #:open-chainstate-coins-view
+   #:close-chainstate-coins-view
+   ;; Snapshot chainstate on-disk marker (Core node/utxo_snapshot)
+   #:snapshot-base-blockhash-path
+   #:write-snapshot-base-blockhash
+   #:read-snapshot-base-blockhash
+   #:find-assumeutxo-chainstate-dir
+   #:delete-snapshot-chainstate-files
    ;; UTXO persistence
    #:save-utxo-set
    #:load-utxo-set
