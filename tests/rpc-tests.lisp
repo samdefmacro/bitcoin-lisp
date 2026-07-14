@@ -1668,12 +1668,23 @@ per key (previously empty)."
 
 (test rpc-getnetworkinfo-completeness
   "getnetworkinfo now reports localservices(+names), localrelay, relayfee,
-incrementalfee, connections_in/out, and warnings, and still yason-encodes."
+incrementalfee, connections_in/out, and warnings, and still yason-encodes.
+localservices is the SAME composition the version message advertises
+(peer.lisp local-services) — Core keeps NODE_NETWORK_LIMITED set alongside
+NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
   (let* ((node (make-test-node))
-         (r (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)))
+         (bitcoin-lisp::*node* node)
+         (bitcoin-lisp::*prune-target-mib* nil)
+         (r (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil))
+         (names (cdr (assoc "localservicesnames" r :test #'string=))))
     (is (= 16 (length (cdr (assoc "localservices" r :test #'string=)))))
-    (is (member "WITNESS" (cdr (assoc "localservicesnames" r :test #'string=))
-                :test #'string=))
+    (is (member "WITNESS" names :test #'string=))
+    (is (member "NETWORK" names :test #'string=))
+    (is (member "NETWORK_LIMITED" names :test #'string=))
+    ;; And the hex field decodes to exactly the wire bits.
+    (is (= (bitcoin-lisp.networking::local-services)
+           (parse-integer (cdr (assoc "localservices" r :test #'string=))
+                          :radix 16)))
     (is (assoc "localrelay" r :test #'string=))
     (is (floatp (cdr (assoc "relayfee" r :test #'string=))))
     (is (floatp (cdr (assoc "incrementalfee" r :test #'string=))))
