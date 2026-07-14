@@ -1563,27 +1563,37 @@ Core loadtxoutset's \"Unable to parse metadata\" wrapper."
       (rpc-error (e) (error e))
       (error () (bad "truncated snapshot header")))))
 
-(defun %map-snapshot-coins (in coins-count coin-fn &key mismatch-fn)
-  "Drive COIN-FN (txid vout height coinbase value script) over at least
-COINS-COUNT coins of the snapshot coin stream IN, reading whole txid groups
-(PopulateAndValidateSnapshot's read loop, validation.cpp:5816-5882). When
-MISMATCH-FN (no args) is supplied, it is called if a txid group claims more
-coins than the metadata has left; without it a group may overrun COINS-COUNT
-and is consumed whole — the bulk-load batching contract. Returns the number
-of coins consumed."
-  (let ((coins-left coins-count))
-    (loop while (plusp coins-left)
+(defparameter *snapshot-load-batch-coins* 100000
+  "How many coins to stream into the snapshot chainstate's LevelDB per
+durable write batch (%populate-snapshot-chainstate). This bounds only the
+LevelDB commit cadence, NOT the coin-count accounting: a txid group is atomic
+and may push a batch past this budget rather than straddle a commit. Tests
+bind it small to exercise the multi-batch path.")
+
+(defun %map-snapshot-coins (in global-remaining batch-budget coin-fn mismatch-fn)
+  "Read whole txid groups from the snapshot coin stream IN, driving COIN-FN
+(txid vout height coinbase value script) per coin, until at least
+BATCH-BUDGET coins are consumed or GLOBAL-REMAINING is reached
+(PopulateAndValidateSnapshot's read loop, validation.cpp:5816-5882). Groups
+are atomic: the last group of a batch may push the tally past BATCH-BUDGET
+and is still consumed whole, so a group NEVER straddles a durable-write
+boundary. MISMATCH-FN (no args) fires when a group claims more coins than
+GLOBAL-REMAINING has left — Core's coins_per_txid > coins_left guard
+(validation.cpp:5823), which is against the GLOBAL remaining count, never a
+per-batch budget. Returns the number of coins consumed in this call."
+  (let ((consumed 0))
+    (loop while (and (< consumed batch-budget) (< consumed global-remaining))
           do (let ((txid (bitcoin-lisp.serialization:read-bytes in 32))
                    (ncoins (bitcoin-lisp.serialization:read-compact-size in)))
-               (when (and mismatch-fn (> ncoins coins-left))
+               (when (> ncoins (- global-remaining consumed))
                  (funcall mismatch-fn))
                (dotimes (i ncoins)
                  (let ((vout (bitcoin-lisp.serialization:read-compact-size in)))
                    (multiple-value-bind (height coinbase value script)
                        (bitcoin-lisp.serialization:read-compressed-coin in)
                      (funcall coin-fn txid vout height coinbase value script)
-                     (decf coins-left))))))
-    (- coins-count coins-left)))
+                     (incf consumed))))))
+    consumed))
 
 (defun %populate-snapshot-chainstate (node in au base-hash base-entry
                                       base-height coins-count fail)
@@ -1624,11 +1634,15 @@ function of (format-string &rest args) that must signal."
                  (loop while (< processed coins-count)
                        do (bitcoin-lisp.storage:with-coins-view-batch
                               (batch base-db :sync t)
+                            ;; GLOBAL remaining drives the mismatch guard; the
+                            ;; batch budget only bounds this LevelDB commit, so
+                            ;; a txid group can overrun it without tripping a
+                            ;; false coins-count mismatch (put-coin advances
+                            ;; PROCESSED as each coin lands).
                             (%map-snapshot-coins
-                             in (min (- coins-count processed) 100000)
+                             in (- coins-count processed) *snapshot-load-batch-coins*
                              (lambda (txid vout height coinbase value script)
                                (put-coin batch txid vout height coinbase value script))
-                             :mismatch-fn
                              (lambda ()
                                (funcall fail "Mismatch in coins count in snapshot metadata and actual snapshot data")))))
                (rpc-error (e) (error e))
