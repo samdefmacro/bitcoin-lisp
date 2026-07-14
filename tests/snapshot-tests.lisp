@@ -320,6 +320,50 @@ at the base (historical). The base entry's tx-count is seeded from nChainTx."
               (is (%snap-err-matches (%snap-load-err dst snap)
                                      -32603 "more than once")))))))))
 
+(test snapshot-load-multibatch-straddle
+  "A txid group that straddles a durable-load batch boundary must load, not
+be rejected as a coins-count mismatch. The coin stream is committed to the
+snapshot LevelDB in batches; Core's coins_per_txid>coins_left guard
+(validation.cpp:5823) is against the GLOBAL remaining, so a group larger than
+the batch budget is consumed whole. With the batch budget pinned to 2 and
+txid-a carrying 3 coins, the group crosses the first commit — the exact shape
+that made every real multi-batch public snapshot (>100k coins) fail before."
+  (%with-snap-dir (src-dir)
+    (%with-snap-dir (dst-dir)
+      (let* ((bitcoin-lisp:*prune-target-mib* nil)
+             (bitcoin-lisp.rpc::*snapshot-load-batch-coins* 2) ; tiny batches
+             (h5 (%snap-fill 32 5))
+             (txid-a (%snap-fill 32 #x11))
+             (txid-b (%snap-fill 32 #x22))
+             (spk-a (%snap-p2pkh #xAA))
+             (spk-raw (%snap-cat #(#x51 #x52 #x53)))
+             (src (%snap-node src-dir h5 5))
+             (snap (namestring (merge-pathnames "utxo.dat" src-dir))))
+        (bitcoin-lisp.storage:update-chain-tip
+         (bitcoin-lisp::node-chain-state src) h5 5)
+        (let ((utxo (bitcoin-lisp::node-utxo-set src)))
+          ;; txid-a: 3 coins (straddles batch size 2); txid-b: 2 coins.
+          (bitcoin-lisp.storage:add-utxo utxo txid-a 0 4200000000 spk-a 3 :coinbase t)
+          (bitcoin-lisp.storage:add-utxo utxo txid-a 1 999 spk-raw 4)
+          (bitcoin-lisp.storage:add-utxo utxo txid-a 2 1000 spk-raw 4)
+          (bitcoin-lisp.storage:add-utxo utxo txid-b 0 12345 spk-raw 5)
+          (bitcoin-lisp.storage:add-utxo utxo txid-b 1 6789 spk-raw 5))
+        (let ((expected-hash (bitcoin-lisp.storage:compute-utxo-set-hash
+                              (bitcoin-lisp::node-utxo-set src))))
+          (bitcoin-lisp.rpc::rpc-dumptxoutset src (list snap "latest"))
+          (let ((dst (%snap-node dst-dir h5 5))
+                (bitcoin-lisp:*assumeutxo-data-override*
+                  (list (%snap-au 5 h5 expected-hash 4242))))
+            (let ((r (bitcoin-lisp.rpc::rpc-loadtxoutset dst (list snap))))
+              (is (= 5 (cdr (assoc "coins_loaded" r :test #'string=))))
+              (is (= 5 (cdr (assoc "base_height" r :test #'string=)))))
+            (let ((dst-utxo (bitcoin-lisp::node-utxo-set dst)))
+              ;; Every coin landed and the set re-hashes to the commitment.
+              (is (equalp expected-hash
+                          (bitcoin-lisp.storage:compute-utxo-set-hash dst-utxo)))
+              (is (bitcoin-lisp.storage:get-utxo dst-utxo txid-a 2))
+              (is (bitcoin-lisp.storage:get-utxo dst-utxo txid-b 1)))))))))
+
 (test snapshot-metadata-rejections
   "SnapshotMetadata parsing rejects bad magic, unsupported version, wrong
 or unrecognized network magic, and a truncated header — all as
