@@ -819,7 +819,9 @@
    #:mempool-descendant-fee-rate
    #:mempool-remove-recursive
    #:mempool-expire
-   #:mempool-trim
+   #:mempool-trim-to-size
+   #:*cluster-count-limit*
+   #:*cluster-size-limit*
    #:mempool-effective-min-fee-rate
    #:mempool-orphan-pool
    ;; Orphan pool
@@ -982,6 +984,7 @@
    #:next-block-required-bits
    #:build-witness-commitment-script
    #:*last-block-template*
+   #:*block-min-tx-fee-rate*
    ;; block construction + mining (builder.lisp)
    #:build-coinbase-transaction
    #:assemble-full-block

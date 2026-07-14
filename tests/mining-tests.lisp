@@ -75,14 +75,18 @@ an empty mempool."
     (bitcoin-lisp.storage:update-chain-tip cs ghash 0)
     (values cs (bitcoin-lisp.mempool:make-mempool))))
 
+(defun %mine-add-entry (mempool tx fee &key (sigops 0))
+  "Add TX to MEMPOOL with FEE and SIGOPS (bypassing validation). Returns the
+mempool-add result keyword."
+  (bitcoin-lisp.mempool:mempool-add
+   mempool (bitcoin-lisp.serialization:transaction-hash tx)
+   (bitcoin-lisp.mempool:make-entry-from-tx tx fee 1 :sigops sigops :entry-time 1)))
+
 (defun %mine-add (mempool tx fee)
   "Add TX to MEMPOOL with FEE (bypassing validation, like the mempool tests).
 Returns the txid."
-  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-    (bitcoin-lisp.mempool:mempool-add
-     mempool txid
-     (bitcoin-lisp.mempool:make-entry-from-tx tx fee 1 :entry-time 1))
-    txid))
+  (%mine-add-entry mempool tx fee)
+  (bitcoin-lisp.serialization:transaction-hash tx))
 
 (test assembler-empty-mempool
   (let ((bitcoin-lisp:*network* :regtest))
@@ -126,6 +130,211 @@ Returns the txid."
                  (bitcoin-lisp.mining:block-template-total-fees tmpl)))
           (is (= (+ (bitcoin-lisp.validation:calculate-block-subsidy 1) 100 50000)
                  (bitcoin-lisp.mining:block-template-coinbase-value tmpl))))))))
+
+;;;; Cluster-mempool chunk-walk builder (P4)
+
+(defun %mine-locktime-tx (input-id locktime sequence)
+  "A standalone test tx with the given LOCKTIME and input SEQUENCE."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element input-id)
+                                      :index 0)
+                    :script-sig (%zeros 10)
+                    :sequence sequence))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 40000000
+                     :script-pubkey (%zeros 25)))
+   :lock-time locktime))
+
+(defun %template-txids (tmpl)
+  (mapcar (lambda (e)
+            (bitcoin-lisp.serialization:transaction-hash
+             (bitcoin-lisp.mempool:mempool-entry-transaction e)))
+          (bitcoin-lisp.mining:block-template-transactions tmpl)))
+
+(test assembler-blockmintxfee-early-out
+  "Selection stops at the first chunk whose feerate is strictly below
+*block-min-tx-fee-rate* (Core blockMinFeeRate, miner.cpp:299-303); a
+zero-fee tx is excluded even by the default 1 sat/kvB floor."
+  (let ((bitcoin-lisp:*network* :regtest))
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (let* ((rich (make-mempool-test-tx :input-id 30))
+             (cheap (make-mempool-test-tx :input-id 31)))
+        (%mine-add mp rich 50000)              ; ~526,000 sat/kvB
+        (%mine-add mp cheap 2000)              ; ~21,000 sat/kvB
+        ;; Floor above CHEAP but below RICH: only RICH is mined.
+        (let* ((bitcoin-lisp.mining:*block-min-tx-fee-rate* 100000)
+               (txids (%template-txids
+                       (bitcoin-lisp.mining:assemble-block-template cs mp))))
+          (is (equal (list (bitcoin-lisp.serialization:transaction-hash rich))
+                     txids)))
+        ;; Default floor (1 sat/kvB): both are mined.
+        (is (= 2 (length (%template-txids
+                          (bitcoin-lisp.mining:assemble-block-template cs mp)))))))
+    ;; A zero-fee tx falls below the default floor.
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (%mine-add mp (make-mempool-test-tx :input-id 32) 0)
+      (is (null (%template-txids
+                 (bitcoin-lisp.mining:assemble-block-template cs mp)))))))
+
+(test assembler-locktime-nonfinal-excluded
+  "A chunk containing a non-final transaction (future locktime, non-final
+sequence) is skipped (Core TestChunkTransactions/IsFinalTx,
+miner.cpp:257-263) without ending selection: worse-feerate final txs are
+still mined."
+  (let ((bitcoin-lisp:*network* :regtest))
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (let* ((nonfinal (%mine-locktime-tx 33 1000 0)) ; height 1000 > next block 1
+             (final (make-mempool-test-tx :input-id 34)))
+        (%mine-add mp nonfinal 50000)     ; best feerate, but not final
+        (%mine-add mp final 1000)
+        (let ((txids (%template-txids
+                      (bitcoin-lisp.mining:assemble-block-template cs mp))))
+          (is (equal (list (bitcoin-lisp.serialization:transaction-hash final))
+                     txids)))))))
+
+(test assembler-skip-suppresses-rest-of-cluster
+  "A skipped chunk suppresses the LATER chunks of its cluster - including
+them without it could be topologically invalid - while other clusters keep
+being considered (Core BlockBuilder Skip semantics, txgraph.cpp:3241-3251).
+The parent chunk here busts the sigops budget; the child chunk would fit
+easily but must not appear."
+  (let ((bitcoin-lisp:*network* :regtest))
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (let* ((p (make-mempool-test-tx :input-id 35))
+             (ptxid (bitcoin-lisp.serialization:transaction-hash p))
+             (c (%mp-spending-tx ptxid))
+             (x (make-mempool-test-tx :input-id 36)))
+        ;; Chunks by feerate: [P] (skipped: 400 + 79601 >= 80000 sigops),
+        ;; [X] (included), [C] (suppressed with P's cluster; C alone would fit).
+        (is (eq :ok (%mine-add-entry mp p 50000 :sigops 79601)))
+        (is (eq :ok (%mine-add-entry mp c 10)))          ; lower feerate than P: own chunk
+        (is (eq :ok (%mine-add-entry mp x 2000)))
+        (let ((txids (%template-txids
+                      (bitcoin-lisp.mining:assemble-block-template cs mp))))
+          (is (equal (list (bitcoin-lisp.serialization:transaction-hash x))
+                     txids)))))))
+
+(defun %ab-reference-greedy-fees (mempool)
+  "The pre-cluster ancestor-package greedy selection (the old
+assemble-block-template), kept as the A/B reference: rank txs by
+ancestor-package feerate (txid-ascending tiebreak) and include each with its
+not-yet-included ancestors when the package fits the weight and sigops
+budgets. Returns the total fees collected."
+  (let ((included (make-hash-table :test 'equalp))
+        (weight bitcoin-lisp.mining:+block-reserved-weight+)
+        (sigops bitcoin-lisp.mining::+coinbase-reserved-sigops+)
+        (fees 0)
+        (ranked '()))
+    (bitcoin-lisp.mempool:mempool-for-each
+     mempool
+     (lambda (txid e) (declare (ignore e))
+       (push (cons txid (bitcoin-lisp.mempool:mempool-ancestor-fee-rate mempool txid))
+             ranked)))
+    (setf ranked (sort ranked (lambda (a b)
+                                (cond ((> (cdr a) (cdr b)) t)
+                                      ((< (cdr a) (cdr b)) nil)
+                                      (t (%shp-txid< (car a) (car b)))))))
+    (dolist (pair ranked fees)
+      (let ((txid (car pair)))
+        (unless (gethash txid included)
+          (let ((pkg (list txid))
+                (pkg-weight 0) (pkg-sigops 0) (pkg-fees 0))
+            (maphash (lambda (a v) (declare (ignore v))
+                       (unless (gethash a included) (push a pkg)))
+                     (bitcoin-lisp.mempool:mempool-ancestors mempool txid))
+            (dolist (t2 pkg)
+              (let ((e (bitcoin-lisp.mempool:mempool-get mempool t2)))
+                (incf pkg-weight (bitcoin-lisp.serialization:transaction-weight
+                                  (bitcoin-lisp.mempool:mempool-entry-transaction e)))
+                (incf pkg-sigops (bitcoin-lisp.mempool:mempool-entry-sigops e))
+                (incf pkg-fees (bitcoin-lisp.mempool:mempool-entry-fee e))))
+            (when (and (<= (+ weight pkg-weight)
+                           bitcoin-lisp.validation:+max-block-weight+)
+                       (<= (+ sigops pkg-sigops)
+                           bitcoin-lisp.validation:+max-block-sigops-cost+))
+              (dolist (t2 pkg) (setf (gethash t2 included) t))
+              (incf weight pkg-weight)
+              (incf sigops pkg-sigops)
+              (incf fees pkg-fees))))))))
+
+(defun %ab-populate (rng mempool n max-sigops)
+  "Fill MEMPOOL with N seeded-random txs - fresh roots and children spending
+1-2 live parents (CPFP chains) - with random fees and sigop costs up to
+MAX-SIGOPS. Returns the total fee accepted."
+  (let ((live '())
+        (next-vout (make-hash-table :test 'equalp))
+        (total 0))
+    (flet ((fresh-vout (parent)
+             (1- (incf (gethash parent next-vout 0)))))
+      (dotimes (i n total)
+        (let* ((tx (if (or (null live) (< (funcall rng 10) 4))
+                       (%shp-root-tx (+ 3000 i))
+                       (let* ((k (length live))
+                              (p1 (nth (funcall rng k) live))
+                              (p2 (when (and (> k 1) (zerop (funcall rng 3)))
+                                    (nth (funcall rng k) live))))
+                         (%shp-tx (cons (cons p1 (fresh-vout p1))
+                                        (when (and p2 (not (equalp p1 p2)))
+                                          (list (cons p2 (fresh-vout p2)))))))))
+               (fee (+ 1000 (funcall rng 50000)))
+               (sigops (if (plusp max-sigops) (funcall rng max-sigops) 0)))
+          (when (eq :ok (%mine-add-entry mempool tx fee :sigops sigops))
+            (push (bitcoin-lisp.serialization:transaction-hash tx) live)
+            (incf total fee)))))))
+
+(test assembler-chunk-walk-ab-vs-greedy
+  "A/B property test (cluster mempool P4): on seeded random mempools - CPFP
+chains, random fees, sigop costs heavy enough that the sigops budget forces
+real selection - the chunk-walk builder collects at least as much fee as the
+old ancestor-package greedy it replaced, its template is topologically
+valid, and the consensus budgets hold. Without resource pressure both
+builders take the entire pool.
+
+The fee comparison is asserted over the aggregate of the seed set, not per
+seed: at the very edge of a budget the chunk walk consumes whole chunks and
+a skip suppresses the chunk's cluster, so the old greedy can occasionally
+squeeze one small package into the final gap that the chunk walk passed
+over (seed 981 here loses ~1% that way while the others win 0-6%). Core's
+miner accepts exactly this granularity trade-off - its guarantee is the
+chunk feerate diagram, not boundary knapsack optimality."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (new-total 0)
+        (old-total 0))
+    (dolist (seed '(981 4550 77143 260201 11 3333))
+      (multiple-value-bind (cs mp) (%mining-fixture)
+        (%ab-populate (%cl-make-rng seed) mp 60 3000)
+        (let* ((tmpl (bitcoin-lisp.mining:assemble-block-template cs mp))
+               (txs (bitcoin-lisp.mining:block-template-transactions tmpl)))
+          (incf new-total (bitcoin-lisp.mining:block-template-total-fees tmpl))
+          (incf old-total (%ab-reference-greedy-fees mp))
+          ;; Consensus budgets (Core's strict < on both).
+          (is (< (bitcoin-lisp.mining:block-template-total-weight tmpl)
+                 bitcoin-lisp.validation:+max-block-weight+))
+          (is (< (bitcoin-lisp.mining:block-template-total-sigops tmpl)
+                 bitcoin-lisp.validation:+max-block-sigops-cost+))
+          ;; Topological validity: every selected tx's in-mempool parents
+          ;; are selected, and earlier.
+          (let ((seen (make-hash-table :test 'equalp)))
+            (dolist (e txs)
+              (let ((txid (bitcoin-lisp.serialization:transaction-hash
+                           (bitcoin-lisp.mempool:mempool-entry-transaction e))))
+                (maphash (lambda (p v) (declare (ignore v))
+                           (when (bitcoin-lisp.mempool:mempool-has mp p)
+                             (is-true (gethash p seen))))
+                         (bitcoin-lisp.mempool:mempool-entry-parents e))
+                (setf (gethash txid seen) t)))))))
+    ;; Fee-optimality vs the old builder, over the whole seed set.
+    (is (>= new-total old-total))
+    ;; No resource pressure: both builders take everything.
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (let ((total (%ab-populate (%cl-make-rng 60259) mp 30 0)))
+        (is (= total (bitcoin-lisp.mining:block-template-total-fees
+                      (bitcoin-lisp.mining:assemble-block-template cs mp))))
+        (is (= total (%ab-reference-greedy-fees mp)))))))
 
 ;;;; Mining RPCs
 
