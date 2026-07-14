@@ -563,8 +563,10 @@ NIL if the file is missing or corrupt."
 ;;; resolving its DB_HEAD_BLOCKS marker on startup rather than reindexing.
 
 (defvar *pending-chainstate-recovery* nil
-  "Set by start-node when load-state reports :inconsistent, so the recovery
-runs after the block store, UTXO cache, and header index are all open.")
+  "List of chainstates whose load-state reported :inconsistent, so their
+recovery runs after the block store, UTXO caches, and header index are all
+open. Per-chainstate: the primary and a snapshot chainstate recover
+independently against their own state files and coins views.")
 
 (defun %coinbase-committed-p (node chainstate block-hash)
   "T iff BLOCK-HASH's coinbase output 0 is an unspent coin in CHAINSTATE's
@@ -593,45 +595,232 @@ Probes whether the recorded tip's coins were committed; if so just clears
 the marker, otherwise walks back to the highest ancestor whose coins ARE
 committed (the true UTXO tip) and rewrites the state file there so IBD
 re-validates only the gap. Returns T on success, NIL if the blocks needed
-to resolve it aren't on disk (caller then aborts for a resync)."
+to resolve it aren't on disk (caller then aborts for a resync).
+
+For a snapshot chainstate, its base block is always treated as committed:
+the populate step verified and durably flushed the whole snapshot UTXO set
+before the chainstate ever existed, and its coins only move forward from
+there — so both the tip==base case (nothing dirty could have been flushed)
+and the walk-back floor (rewind to the base, whose coins ARE the verified
+snapshot) resolve without probing blocks below the base, which are not on
+disk on the snapshot side."
   (let* ((new-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (new-height (bitcoin-lisp.storage:current-height chain-state)))
-    (cond
-      ((null new-hash)
-       (log-error "Chainstate recovery: no recorded tip to recover from")
-       nil)
-      ;; Phase 2 committed the new tip — chainstate.dat already holds it,
-      ;; just drop the marker.
-      ((%coinbase-committed-p node chain-state new-hash)
-       (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
-       (log-info "Chainstate recovery: UTXO set already at recorded tip h=~D; marker cleared"
-                 new-height)
-       t)
-      ;; UTXO set is behind: find the real tip by walking back.
-      (t
-       (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state new-hash)))
-         (loop while entry
-               do (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
-               until (or (null entry)
-                         (%coinbase-committed-p
-                          node chain-state
-                          (bitcoin-lisp.storage:block-index-entry-hash entry))))
-         (cond
-           (entry
-            (let ((h (bitcoin-lisp.storage:block-index-entry-height entry))
-                  (hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
-              ;; pruned-height is left as recorded — pruning is monotone and
-              ;; lags the tip by the whole block window, so it is far below
-              ;; this rewind point and those files are gone regardless.
-              (setf (bitcoin-lisp.storage::chain-state-best-block-hash chain-state) hash
-                    (bitcoin-lisp.storage::chain-state-best-height chain-state) h)
-              (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
-              (log-warn "Chainstate recovery: UTXO set at h=~D (recorded tip h=~D); rewound chainstate.dat ~D block~:P, will re-validate the gap"
-                        h new-height (- new-height h))
-              t))
-           (t
-            (log-error "Chainstate recovery: no committed ancestor found on disk (blocks pruned below the UTXO tip?); resync required")
-            nil)))))))
+         (new-height (bitcoin-lisp.storage:current-height chain-state))
+         (snapshot-base (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash
+                         chain-state)))
+    (flet ((committed-p (hash)
+             (or (and snapshot-base (equalp hash snapshot-base))
+                 (%coinbase-committed-p node chain-state hash))))
+      (cond
+        ((null new-hash)
+         (log-error "Chainstate recovery: no recorded tip to recover from")
+         nil)
+        ;; Phase 2 committed the new tip — chainstate.dat already holds it,
+        ;; just drop the marker.
+        ((committed-p new-hash)
+         (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
+         (log-info "Chainstate recovery: UTXO set already at recorded tip h=~D; marker cleared"
+                   new-height)
+         t)
+        ;; UTXO set is behind: find the real tip by walking back.
+        (t
+         (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state new-hash)))
+           (loop while entry
+                 do (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
+                 until (or (null entry)
+                           (committed-p
+                            (bitcoin-lisp.storage:block-index-entry-hash entry))))
+           (cond
+             (entry
+              (let ((h (bitcoin-lisp.storage:block-index-entry-height entry))
+                    (hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+                ;; pruned-height is left as recorded — pruning is monotone and
+                ;; lags the tip by the whole block window, so it is far below
+                ;; this rewind point and those files are gone regardless.
+                (setf (bitcoin-lisp.storage::chain-state-best-block-hash chain-state) hash
+                      (bitcoin-lisp.storage::chain-state-best-height chain-state) h)
+                (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
+                (log-warn "Chainstate recovery: UTXO set at h=~D (recorded tip h=~D); rewound chainstate.dat ~D block~:P, will re-validate the gap"
+                          h new-height (- new-height h))
+                t))
+             (t
+              (log-error "Chainstate recovery: no committed ancestor found on disk (blocks pruned below the UTXO tip?); resync required")
+              nil))))))))
+
+;;; --- Assumeutxo snapshot chainstate lifecycle ------------------------------
+;;;
+;;; Core model (validation.cpp ActivateSnapshot/AddChainstate + node/
+;;; chainstate.cpp LoadChainstate): a verified snapshot becomes a SECOND
+;;; chainstate with storage suffix "_snapshot", status :unvalidated (never
+;;; persisted — re-derived every startup), sharing the block index / block
+;;; store / undo storage with the primary. The primary is retargeted at the
+;;; snapshot base and becomes the HISTORICAL chainstate, re-deriving history
+;;; in the background while the snapshot chainstate follows the network tip.
+;;; The only persistent marker is chainstate_snapshot/base_blockhash.
+;;;
+;;; The streaming/verification half of activation (Core
+;;; PopulateAndValidateSnapshot) lives with the loadtxoutset RPC
+;;; (rpc/methods.lisp), which parses the snapshot format; the chainstate
+;;; mechanics live here.
+
+(defun call-with-sync-paused (node thunk)
+  "Run THUNK with the sync thread's IBD loops paused — the coarse equivalent
+of Core holding cs_main across snapshot activation. Requests an IBD stop,
+waits (bounded) for the in-progress sync-blockchain pass to unwind, runs
+THUNK, then clears the stop request so the next sync cycle resumes against
+the (possibly changed) chainstate arrangement. A no-op without a live sync
+thread (tests, :sync nil nodes)."
+  (if (and (node-sync-thread node)
+           (bt:thread-alive-p (node-sync-thread node)))
+      (progn
+        (bitcoin-lisp.networking:request-ibd-stop)
+        (loop repeat 600                ; <= 120s; the IBD loops poll the flag
+              while (node-syncing node)
+              do (sleep 0.2))
+        (when (node-syncing node)
+          (log-warn "Sync pass did not pause within 120s; proceeding with snapshot activation anyway"))
+        (unwind-protect (funcall thunk)
+          (bitcoin-lisp.networking:reset-ibd-stop)))
+      (funcall thunk)))
+
+(defun %make-snapshot-chainstate (node base-hash)
+  "The snapshot chain-state struct for BASE-HASH: status :unvalidated (Core
+derives it from from_snapshot_blockhash, validation.cpp:1868 — never
+persisted), storage suffix \"_snapshot\", and the block index SHARED with
+the primary chainstate (Core keeps it in m_blockman, outside any
+chainstate). Used by both activation (create-snapshot-chainstate) and
+startup re-detection (load-snapshot-chainstate)."
+  (let ((primary (node-current-chainstate node)))
+    (bitcoin-lisp.storage:make-chain-state
+     :base-path (node-data-directory node)
+     :genesis-hash (bitcoin-lisp.storage::chain-state-genesis-hash primary)
+     :block-index (bitcoin-lisp.storage::chain-state-block-index primary)
+     :from-snapshot-blockhash (copy-seq base-hash)
+     :assumeutxo-status :unvalidated
+     :storage-suffix "_snapshot")))
+
+(defun create-snapshot-chainstate (node base-hash)
+  "Construct an :unvalidated snapshot chainstate for BASE-HASH with a fresh
+coins LevelDB at <data-dir>/chainstate_snapshot/ (Core ActivateSnapshot's
+Chainstate construction + InitCoinsDB). Stale on-disk leftovers from an
+aborted or unadoptable earlier activation are removed first — startup
+adopts any intact snapshot chainstate, so anything still here is refuse.
+The caller owns cleanup on failure (abort-snapshot-chainstate)."
+  (let ((snap (%make-snapshot-chainstate node base-hash)))
+    (when (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir
+           (node-data-directory node))
+      (log-warn "[snapshot] removing stale snapshot chainstate leftovers before activation")
+      (bitcoin-lisp.storage:delete-snapshot-chainstate-files
+       (node-data-directory node)))
+    (bitcoin-lisp.storage:open-chainstate-coins-view snap)
+    snap))
+
+(defun abort-snapshot-chainstate (node snap)
+  "Tear down SNAP mid-activation (Core cleanup_bad_snapshot): close its coins
+DB (releasing the LevelDB lock) and delete its on-disk footprint. Never
+signals — this runs on the activation failure path."
+  (bitcoin-lisp.storage:close-chainstate-coins-view snap)
+  (ignore-errors
+    (bitcoin-lisp.storage:delete-snapshot-chainstate-files
+     (node-data-directory node)))
+  nil)
+
+(defun add-snapshot-chainstate (node snap)
+  "Adopt a populated, verified snapshot chainstate (Core AddChainstate,
+validation.cpp:6189-6206): retarget the previously-current chainstate at the
+snapshot base — making it the historical chainstate — and append SNAP, which
+select-current-chainstate then returns as the new current chainstate.
+
+The mempool needs no explicit hand-off (Core swaps the pointer): ours lives
+on the node and every mempool call site reads the CURRENT chainstate's coins
+view, which this swap redirects. Callers must have verified the mempool is
+empty first (Core asserts it). Core's PopulateBlockIndexCandidates has no
+equivalent here — our fork choice is per-block (activate-block) and the
+historical chainstate's candidate filtering is the target guard there."
+  (let* ((prev (node-current-chainstate node))
+         (base-hash (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash snap))
+         (base-entry (bitcoin-lisp.storage:get-block-index-entry prev base-hash)))
+    (assert (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status prev) :validated))
+    (assert (null (bitcoin-lisp.storage:chain-state-target-blockhash prev)))
+    (assert base-entry)
+    (bitcoin-lisp.storage:set-chainstate-target prev base-entry)
+    (bt:with-recursive-lock-held ((node-lock node))
+      (setf (node-chainstates node)
+            (append (node-chainstates node) (list snap))))
+    (log-info "[snapshot] successfully activated snapshot ~A: current chainstate now at height ~D following the network tip; historical chainstate (h=~D) re-derives history toward the base in the background"
+              (bitcoin-lisp.crypto:bytes-to-hex base-hash)
+              (bitcoin-lisp.storage:current-height snap)
+              (bitcoin-lisp.storage:current-height prev))
+    snap))
+
+(defun load-snapshot-chainstate (node)
+  "Detect and re-adopt a persisted snapshot chainstate at startup (Core
+LoadAssumeutxoChainstate, validation.cpp:6170-6187, in node/chainstate.cpp
+LoadChainstate ordering). The chainstate_snapshot/ dir plus its
+base_blockhash marker are the only persistent evidence; assumeutxo-status is
+re-derived as :unvalidated (never persisted). Must run after the primary
+chainstate's header index is loaded — the base entry has to resolve — and
+before crash-recovery resolution (a torn snapshot flush joins
+*pending-chainstate-recovery*). Returns the snapshot chainstate or NIL."
+  (let* ((data-dir (node-data-directory node))
+         (dir (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir data-dir)))
+    (when dir
+      (let* ((base-hash (bitcoin-lisp.storage:read-snapshot-base-blockhash dir))
+             (primary (node-current-chainstate node))
+             (base-entry (and base-hash
+                              (bitcoin-lisp.storage:get-block-index-entry
+                               primary base-hash))))
+        (cond
+          ((null base-hash)
+           (log-warn "[snapshot] snapshot chainstate dir is malformed! no base blockhash file exists at path ~A. Try deleting ~A and calling loadtxoutset again"
+                     (namestring (bitcoin-lisp.storage:snapshot-base-blockhash-path dir))
+                     (namestring dir))
+           nil)
+          ((null base-entry)
+           ;; Header index lost/regressed below the base. Leave the snapshot
+           ;; chainstate on disk and run single-chainstate this boot; once
+           ;; headers re-cover the base, the next restart adopts it.
+           (log-warn "[snapshot] snapshot base block ~A is not in the header index; not loading the snapshot chainstate this run"
+                     (bitcoin-lisp.crypto:bytes-to-hex base-hash))
+           nil)
+          (t
+           (log-info "[snapshot] detected active snapshot chainstate (~A) - loading"
+                     (namestring dir))
+           (let ((snap (%make-snapshot-chainstate node base-hash))
+                 (base-height (bitcoin-lisp.storage:block-index-entry-height base-entry)))
+             ;; Tip from chainstate_snapshot.dat; a torn flush defers to the
+             ;; per-chainstate recovery pass; a missing .dat means activation
+             ;; completed (dir + marker prove the populate did) but the first
+             ;; save-state never landed — start the chainstate at its base.
+             (case (bitcoin-lisp.storage:load-state snap)
+               ((:inconsistent)
+                (log-warn "[snapshot] snapshot chainstate in-transition (flush interrupted); will attempt automatic recovery after storage init")
+                (push snap *pending-chainstate-recovery*))
+               ((t) nil)
+               ((nil)
+                (log-warn "[snapshot] no chainstate_snapshot.dat; starting the snapshot chainstate at its base (h=~D)" base-height)
+                (bitcoin-lisp.storage:update-chain-tip
+                 snap (copy-seq base-hash) base-height)))
+             ;; The recorded tip must resolve in the shared header index;
+             ;; otherwise fall back to the base (blocks above it re-sync).
+             (let ((tip-hash (bitcoin-lisp.storage:best-block-hash snap)))
+               (unless (and tip-hash
+                            (bitcoin-lisp.storage:get-block-index-entry primary tip-hash))
+                 (log-warn "[snapshot] snapshot chainstate tip not in the header index; resetting to the base (h=~D)" base-height)
+                 (bitcoin-lisp.storage:update-chain-tip
+                  snap (copy-seq base-hash) base-height)))
+             ;; Open its coins DB (chainstate_snapshot/).
+             (bitcoin-lisp.storage:open-chainstate-coins-view snap)
+             ;; Retarget the primary (it becomes the historical chainstate)
+             ;; and adopt the snapshot chainstate as current.
+             (bitcoin-lisp.storage:set-chainstate-target primary base-entry)
+             (setf (node-chainstates node)
+                   (append (node-chainstates node) (list snap)))
+             (log-info "[snapshot] switching active chainstate to the snapshot chainstate (tip h=~D); historical chainstate at h=~D targets the base at h=~D"
+                       (bitcoin-lisp.storage:current-height snap)
+                       (bitcoin-lisp.storage:current-height primary)
+                       base-height)
+             snap)))))))
 
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
@@ -706,8 +895,10 @@ Returns the node instance."
     (setf *coins-cache-budget-bytes* (* dbcache-mib 1024 1024))
     (log-info "UTXO coins-cache budget: ~D MiB" dbcache-mib))
 
-  ;; Validate and set pruning configuration
-  (setf *prune-target-mib* prune)
+  ;; Validate the pruning configuration BEFORE assigning the global — a
+  ;; config-validation error must not leave *prune-target-mib* set (a failed
+  ;; start-node previously leaked the half-applied prune setting into the
+  ;; process, making e.g. a later loadtxoutset believe the node is pruned).
   (when prune
     (unless (or (= prune 1) (>= prune 550))
       (error "Invalid prune target: ~A MiB. Must be 1 (manual-only) or >= 550." prune))
@@ -720,6 +911,7 @@ Returns the node instance."
       (error "Cannot set -peerblockfilters without -blockfilterindex."))
     (when (and prune reindex-chainstate)
       (error "Prune mode is incompatible with -reindex-chainstate (pruned blocks cannot be replayed). Use a full resync instead.")))
+  (setf *prune-target-mib* prune)
 
   ;; Initialize node
   (setf *node* (init-node data-directory :network network :log-level log-level))
@@ -764,7 +956,7 @@ Returns the node instance."
        ;; until the block store, UTXO cache, and header index are open
        ;; (recover-inconsistent-chainstate needs all three).
        (log-warn "Chainstate in-transition (flush interrupted); will attempt automatic recovery after storage init")
-       (setf *pending-chainstate-recovery* t))
+       (push (node-chain-state *node*) *pending-chainstate-recovery*))
       ((t)
        (log-info "Loaded existing chain state: height ~D"
                  (bitcoin-lisp.storage:current-height (node-chain-state *node*))))
@@ -839,14 +1031,31 @@ Returns the node instance."
           :status :valid
           :tx-count 1))))   ; genesis carries exactly its coinbase
 
-  ;; Resolve an interrupted-flush chainstate now that the block store, UTXO
-  ;; cache, and header index are all available. Only abort (resync) if the
-  ;; on-disk blocks needed to recover are gone.
-  (when *pending-chainstate-recovery*
+  ;; Snapshot chainstate startup handling (Core LoadChainstate ordering,
+  ;; node/chainstate.cpp:151-238). -reindex-chainstate deletes a snapshot
+  ;; chainstate outright (Core wipe_chainstate_db) — the primary then
+  ;; rebuilds from stored blocks with no target. Otherwise, detect a
+  ;; persisted snapshot chainstate dir and re-init dual chainstates. Runs
+  ;; after the header index is loaded (the base entry must resolve) and
+  ;; before crash-recovery resolution below (a torn snapshot flush joins the
+  ;; pending-recovery list).
+  (if reindex-chainstate
+      (when (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir
+             (node-data-directory *node*))
+        (log-info "[snapshot] deleting snapshot chainstate due to reindexing")
+        (bitcoin-lisp.storage:delete-snapshot-chainstate-files
+         (node-data-directory *node*)))
+      (load-snapshot-chainstate *node*))
+
+  ;; Resolve interrupted-flush chainstates now that the block store, UTXO
+  ;; caches, and header index are all available. Only abort (resync) if the
+  ;; on-disk state needed to recover is gone.
+  (let ((pending *pending-chainstate-recovery*))
     (setf *pending-chainstate-recovery* nil)
-    (unless (recover-inconsistent-chainstate *node*)
-      (error "chainstate inconsistent and unrecoverable: move ~A aside and re-sync"
-             (node-data-directory *node*))))
+    (dolist (cs pending)
+      (unless (recover-inconsistent-chainstate *node* cs)
+        (error "chainstate inconsistent and unrecoverable: move ~A aside and re-sync"
+               (node-data-directory *node*)))))
 
   ;; Initialize undo data persistence
   (let ((undo-path (merge-pathnames "undo/" (node-data-directory *node*))))
@@ -1270,13 +1479,14 @@ accounts for ~700 MB. This logger surfaces the gap."
               ibd-pending ibd-queue ibd-in-flight
               (/ used-bytes 1048576.0) (/ dyn-bytes 1048576.0))))
 
-(defun do-flush (&optional (chainstate (and *node* (node-current-chainstate *node*))))
-  "Synchronously flush CHAINSTATE (its state file, its coins view, and the
-shared header index) with 3-phase commit (mirrors Bitcoin Core's
+(defun %flush-chainstate (chainstate)
+  "Synchronously flush one CHAINSTATE (its state file, its coins view, and
+the shared header index) with 3-phase commit (mirrors Bitcoin Core's
 DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).
-CHAINSTATE defaults to the node's current chainstate; each chainstate
-flushes its own storage-suffix-named files, so flushing one can never
-mark another's state file in-transition.
+Each chainstate flushes its own storage-suffix-named files, so flushing one
+can never mark another's state file in-transition. Per-flush-CYCLE concerns
+(trigger counter resets, the post-flush GC, memory snapshots) live in the
+callers — this is strictly the per-chainstate mechanism.
 
   Phase 1: save-state with in-transition=1 — chainstate.dat marked unsafe.
            If we crash anywhere from here through Phase 3, on restart
@@ -1292,7 +1502,6 @@ interrupted between, on-disk best-height was ahead of the saved UTXO
 entries, which then cascaded into MISSING-INPUT validation failures on
 restart (observed at testnet4 h=70541 — block 70514 tx-2's outputs
 were nowhere in utxoset.dat despite chainstate showing h=70540)."
-  (log-memory-snapshot "pre-flush")
   (handler-case
       (#+sbcl sb-sys:without-interrupts
        #-sbcl progn
@@ -1316,32 +1525,47 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
         ;; Phase 3: commit by re-saving chainstate without the marker.
         (when chainstate
           (bitcoin-lisp.storage:save-state chainstate :in-transition nil))
-        (setf *last-flush-universal-time* (get-universal-time)
-              *blocks-since-flush* 0)
-        (log-info "Periodic flush: chainstate at height ~D"
+        (log-info "Periodic flush: chainstate~@[~A~] at height ~D"
+                  (let ((suffix (and chainstate
+                                     (bitcoin-lisp.storage:chain-state-storage-suffix
+                                      chainstate))))
+                    (and suffix (plusp (length suffix)) suffix))
                   (and chainstate
                        (bitcoin-lisp.storage:current-height chainstate))))
     (error (c)
       ;; Was log-warn before — surfaced silently. Bumped to log-error so
       ;; persistence failures are obvious in the log instead of getting
       ;; lost between progress lines.
-      (log-error "Periodic flush FAILED: ~A" c)))
-  ;; After flush, request a major GC so reachable post-flush memory is the
-  ;; only thing in the old generations next time we measure. This is the
-  ;; same pattern as Bitcoin Core's CCoinsViewCache::Flush returning bytes
-  ;; freed to the system allocator.
+      (log-error "Periodic flush FAILED: ~A" c))))
+
+(defun do-flush (&optional (chainstate (and *node* (node-current-chainstate *node*))))
+  "Flush CHAINSTATE (default: the node's current chainstate) and run the
+per-cycle bookkeeping: reset the periodic-flush triggers, request a major GC
+so reachable post-flush memory is the only thing in the old generations next
+time we measure (the same pattern as Bitcoin Core's CCoinsViewCache::Flush
+returning bytes freed to the system allocator), and log memory snapshots."
+  (log-memory-snapshot "pre-flush")
+  (%flush-chainstate chainstate)
+  (setf *last-flush-universal-time* (get-universal-time)
+        *blocks-since-flush* 0)
   #+sbcl (sb-ext:gc :full t)
   (log-memory-snapshot "post-flush"))
 
 (defun maybe-periodic-flush (&optional chainstate)
-  "Flush CHAINSTATE (its state file, coins view, and the header index) to
-disk if either:
+  "Flush chainstates (state file, coins view, and the header index) to disk
+if either:
 - N blocks have been connected since the last flush, OR
 - N seconds have elapsed since the last flush (catches slow-sync regions
   where 1000 blocks would take many minutes to accumulate).
 
 Called from connect-block, which passes the chainstate the block connected
-to; defaults to the node's current chainstate. Cheap if no flush needed;
+to; defaults to the node's current chainstate. The size trigger checks the
+connecting chainstate's own coins cache; once ANY trigger fires, EVERY
+chainstate is flushed — with an assumeutxo background sync two chainstates
+connect blocks concurrently but the global time/count triggers reset on any
+flush, so flushing only the triggering one would let the other's dirty
+coins and redo window grow unboundedly. Flushing a clean chainstate is
+cheap (work is proportional to dirty entries). Cheap if no flush needed;
 durable if it does flush (atomic temp+fsync+rename inside save-*)."
   (unless *node* (return-from maybe-periodic-flush))
   (let* ((cs (or chainstate (node-current-chainstate *node*)))
@@ -1358,7 +1582,20 @@ durable if it does flush (atomic temp+fsync+rename inside save-*)."
               (and view
                    (>= (bitcoin-lisp.storage:view-mem-bytes view)
                        (large-coins-cache-threshold *coins-cache-budget-bytes*))))
-      (do-flush cs))))
+      ;; Triggering chainstate first (its cache may be the urgent one),
+      ;; then the rest. Per-cycle bookkeeping (trigger resets, ONE major
+      ;; GC, memory snapshots) runs once around the whole pass — not per
+      ;; chainstate, which would double the stop-the-world GC pauses
+      ;; during an assumeutxo background sync.
+      (log-memory-snapshot "pre-flush")
+      (%flush-chainstate cs)
+      (dolist (other (node-chainstates *node*))
+        (unless (eq other cs)
+          (%flush-chainstate other)))
+      (setf *last-flush-universal-time* (get-universal-time)
+            *blocks-since-flush* 0)
+      #+sbcl (sb-ext:gc :full t)
+      (log-memory-snapshot "post-flush"))))
 
 (defvar *blockfilterindex-stall-logged* nil
   "One-shot latch so a stalled block filter index (non-contiguous connect
@@ -1366,16 +1603,17 @@ refused) logs a single warning instead of one per block until restart.")
 
 (defun index-block-filter (chainstate block block-hash height spent-utxos)
   "Connect-time hook: add BLOCK's BIP158 basic filter to the running node's
-block filter index, if one is enabled. CHAINSTATE is the chainstate the block
-connected to — today only the single validated chainstate connects blocks, so
-no filtering is done; once several chainstates exist, signals from
-non-validated ones must be dropped here (Core indexes bind
-ValidatedChainstate, init.cpp:1367-1383). SPENT-UTXOS is the undo list the
-UTXO apply produced. Never signals -- a filter-index failure must not abort a
-block connect -- so consensus is unaffected whether the index is on or off."
-  (declare (ignore chainstate))
+block filter index, if one is enabled. CHAINSTATE is the chainstate the
+block connected to; signals from any chainstate other than the node's
+VALIDATED one are dropped — indexes index blocks in order from genesis, so
+they bind Core's ValidatedChainstate (init.cpp:1367-1383) and must ignore
+an unvalidated snapshot chainstate's tip-range connects. SPENT-UTXOS is the
+undo list the UTXO apply produced. Never signals -- a filter-index failure
+must not abort a block connect -- so consensus is unaffected whether the
+index is on or off."
   (let ((bfi (and *node* (node-blockfilterindex *node*))))
-    (when (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi))
+    (when (and bfi (bitcoin-lisp.storage:blockfilterindex-enabled bfi)
+               (eq chainstate (node-validated-chainstate *node*)))
       (handler-case
           (multiple-value-bind (filter status)
               (bitcoin-lisp.storage:blockfilterindex-add-block
@@ -1484,19 +1722,19 @@ database it opens. Synchronous and potentially slow on a large chainstate."
       (when csi (compact "coinstatsindex" (bitcoin-lisp.storage:coinstatsindex-db csi))))))
 
 (defun index-block-coinstats (chainstate block block-hash height spent-utxos)
-  "Connect-time hook: fold BLOCK into the running node's coinstatsindex, if one
-is enabled. CHAINSTATE is the chainstate the block connected to — today only
-the single validated chainstate connects blocks, so no filtering is done;
-once several chainstates exist, signals from non-validated ones must be
-dropped here (see index-block-filter). SPENT-UTXOS is the undo list the UTXO
-apply produced; the block subsidy is derived from HEIGHT. Never signals -- an
-index failure must not abort a block connect -- so consensus is unaffected
-whether the index is on or off. Returns NIL (and stalls quietly) if the
-parent height's record is missing (non-contiguous); the startup backfill
-heals such gaps on restart."
-  (declare (ignore chainstate))
+  "Connect-time hook: fold BLOCK into the running node's coinstatsindex, if
+one is enabled. CHAINSTATE is the chainstate the block connected to; like
+index-block-filter, only the node's VALIDATED chainstate's connects are
+indexed — the running MuHash must be contiguous from genesis, which an
+unvalidated snapshot chainstate's tip-range blocks are not. SPENT-UTXOS is
+the undo list the UTXO apply produced; the block subsidy is derived from
+HEIGHT. Never signals -- an index failure must not abort a block connect --
+so consensus is unaffected whether the index is on or off. Returns NIL (and
+stalls quietly) if the parent height's record is missing (non-contiguous);
+the startup backfill heals such gaps on restart."
   (let ((csi (and *node* (node-coinstatsindex *node*))))
-    (when (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi))
+    (when (and csi (bitcoin-lisp.storage:coinstatsindex-enabled csi)
+               (eq chainstate (node-validated-chainstate *node*)))
       (handler-case
           (bitcoin-lisp.storage:coinstatsindex-add-block
            csi block block-hash height spent-utxos
@@ -1656,20 +1894,19 @@ heals such gaps on restart."
   (bt:with-recursive-lock-held ((node-lock *node*))
     (setf (node-peers *node*) nil))
 
-  ;; Save chain state
-  (log-info "Saving chain state...")
-  (when (node-chain-state *node*)
-    (bitcoin-lisp.storage:save-state (node-chain-state *node*)))
-
-  ;; Flush UTXO cache to LevelDB and close the underlying DB.
-  (log-info "Flushing UTXO cache...")
-  (when (node-utxo-set *node*)
-    (bitcoin-lisp.storage:coins-view-cache-flush
-     (node-utxo-set *node*) :sync t)
-    (let ((base (bitcoin-lisp.storage:coins-view-cache-base
-                 (node-utxo-set *node*))))
-      (when base
-        (bitcoin-lisp.storage:close-coins-view-db base))))
+  ;; Save every chainstate's state file and flush+close its coins view.
+  ;; Per-chainstate: with an assumeutxo snapshot active there are two, each
+  ;; owning its own storage-suffix-named files and LevelDB.
+  (dolist (cs (node-chainstates *node*))
+    (log-info "Saving chain state~@[ (~A)~]..."
+              (let ((suffix (bitcoin-lisp.storage:chain-state-storage-suffix cs)))
+                (and (plusp (length suffix)) suffix)))
+    (bitcoin-lisp.storage:save-state cs)
+    (let ((view (bitcoin-lisp.storage:chain-state-coins-view cs)))
+      (when (typep view 'bitcoin-lisp.storage:coins-view-cache)
+        (log-info "Flushing UTXO cache...")
+        (bitcoin-lisp.storage:coins-view-cache-flush view :sync t)))
+    (bitcoin-lisp.storage:close-chainstate-coins-view cs))
 
   ;; Save fee statistics
   (when (node-fee-estimator *node*)
@@ -2310,9 +2547,11 @@ phase exits quickly when there's nothing new to fetch."
     (log-warn "No peers connected, cannot sync")
     (return-from sync-blockchain 0))
 
-  ;; IBD drives the current chainstate (its tip and coins view). A future
-  ;; historical chainstate gets its own download cursor; this call stays
-  ;; anchored to the chainstate following the network tip.
+  ;; IBD drives the current chainstate (its tip and coins view). When an
+  ;; assumeutxo background sync is active, the historical chainstate rides
+  ;; along as a second download cursor inside the same IBD pass: run-ibd
+  ;; queues its [historical-tip .. snapshot-base] range and routes received
+  ;; blocks to whichever chainstate owns their height.
   (let ((chainstate (node-current-chainstate node))
         (peer-height (bitcoin-lisp.networking:peer-start-height (find-best-peer node))))
     (log-debug "Sync cycle: local height ~D, peer-start height ~D"
@@ -2324,6 +2563,7 @@ phase exits quickly when there's nothing new to fetch."
      (bitcoin-lisp.storage:chain-state-coins-view chainstate)
      (node-block-store node)
      peer-height
+     :historical-chainstate (node-historical-chainstate node)
      :fee-estimator (node-fee-estimator node)
      :recent-rejects (node-recent-rejects node)
      :mempool (node-mempool node)
