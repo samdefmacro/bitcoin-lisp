@@ -549,6 +549,11 @@ SUCCESS, validation.cpp:6088-6095). A second call is a no-op."
       (bitcoin-lisp.storage:set-chainstate-target historical e5)
       (is (eq historical (bitcoin-lisp::node-historical-chainstate node)))
       (is (eq snap (bitcoin-lisp::node-current-chainstate node)))
+      ;; P6 pre-state: a floored prune cursor above the base and a split
+      ;; cache budget, to prove promotion rewinds/releases them.
+      (setf (bitcoin-lisp.storage:chain-state-pruned-height snap) 100
+            (bitcoin-lisp.storage:chain-state-pruned-height historical) 3
+            (bitcoin-lisp.storage:chain-state-coins-cache-bytes snap) 12345)
       ;; While background validation is in progress, NODE_NETWORK is dropped.
       (is (not (logtest (bitcoin-lisp.networking::local-services)
                         bitcoin-lisp.serialization:+node-network+)))
@@ -563,6 +568,12 @@ SUCCESS, validation.cpp:6088-6095). A second call is a no-op."
       ;; Snapshot chainstate promoted; historical marked done.
       (is (eq :validated (bitcoin-lisp.storage:chain-state-assumeutxo-status snap)))
       (is (not (null (bitcoin-lisp.storage:chain-state-target-utxohash historical))))
+      ;; P6: promotion lifts the prune floor — the cursor rewinds to the
+      ;; historical chainstate's so the protected window can be reclaimed —
+      ;; and rebalances the whole coins-cache budget onto the promoted cs.
+      (is (= 0 (bitcoin-lisp.storage:chain-state-prune-floor snap)))
+      (is (= 3 (bitcoin-lisp.storage:chain-state-pruned-height snap)))
+      (is (null (bitcoin-lisp.storage:chain-state-coins-cache-bytes snap)))
       ;; No historical chainstate remains; the snapshot cs is now validated.
       (is (null (bitcoin-lisp::node-historical-chainstate node)))
       (is (eq snap (bitcoin-lisp::node-current-chainstate node)))
@@ -705,3 +716,59 @@ node/chainstate.cpp:231-235) and still renames the snapshot dir aside."
         (is (eq :invalid (bitcoin-lisp.storage:chain-state-assumeutxo-status snap)))
         (is (null (bitcoin-lisp.storage:find-assumeutxo-chainstate-dir dir)))
         (is (not (null (probe-file (merge-pathnames "chainstate_snapshot_INVALID/" dir)))))))))
+
+;;;; P6: coins-cache rebalancing (Core ChainstateManager::MaybeRebalanceCaches,
+;;;; validation.cpp:6103-6134)
+
+(test assumeutxo-cache-rebalance
+  "maybe-rebalance-caches splits the coins-cache budget 95/5 by IBD status
+while both chainstates exist — snapshot(current)-heavy during IBD,
+historical-heavy once the tip is synced (the IBD-exit latch drives
+rebalance-caches-on-ibd-exit, Core validation.cpp:3479-3486) — and hands
+everything back to a sole chainstate (budget slot NIL = whole global
+budget)."
+  (let* ((base-hash (%au-hash 5))
+         (g (%au-entry (%au-hash 0) 0 nil :status :valid :chain-work 1))
+         (e5 (%au-entry base-hash 5 g :status :valid :chain-work 500))
+         (primary (bitcoin-lisp.storage:make-chain-state
+                   :best-block-hash (%au-hash 0) :best-height 0))
+         (snap (bitcoin-lisp.storage:make-chain-state
+                :best-block-hash base-hash :best-height 5
+                :block-index (bitcoin-lisp.storage::chain-state-block-index primary)
+                :from-snapshot-blockhash base-hash
+                :assumeutxo-status :unvalidated
+                :storage-suffix "_snapshot"))
+         (node (bitcoin-lisp::make-node :network :testnet3))
+         (total (* 1000 1048576))
+         (bitcoin-lisp::*coins-cache-budget-bytes* total))
+    (dolist (e (list g e5))
+      (bitcoin-lisp.storage:add-block-index-entry primary e))
+    (bitcoin-lisp.storage:set-chainstate-target primary e5)
+    (setf (bitcoin-lisp::node-chainstates node) (list primary snap))
+    ;; During IBD: 95% to the snapshot (current) chainstate.
+    (let ((bitcoin-lisp.networking::*cached-is-ibd* t))
+      (bitcoin-lisp::maybe-rebalance-caches node))
+    (is (= (floor (* total 0.95d0))
+           (bitcoin-lisp.storage:chain-state-coins-cache-bytes snap)))
+    (is (= (floor (* total 0.05d0))
+           (bitcoin-lisp.storage:chain-state-coins-cache-bytes primary)))
+    (is (= (floor (* total 0.95d0))
+           (bitcoin-lisp::chainstate-coins-cache-budget snap)))
+    ;; IBD exit flips the split toward the historical chainstate.
+    (let ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+          (bitcoin-lisp::*node* node))
+      (bitcoin-lisp:rebalance-caches-on-ibd-exit))
+    (is (= (floor (* total 0.05d0))
+           (bitcoin-lisp.storage:chain-state-coins-cache-bytes snap)))
+    (is (= (floor (* total 0.95d0))
+           (bitcoin-lisp.storage:chain-state-coins-cache-bytes primary)))
+    ;; Background completion ends the historical role: everything to the
+    ;; current chainstate (NIL slot = the whole global budget).
+    (setf (bitcoin-lisp.storage:chain-state-target-utxohash primary) (%au-hash 9))
+    (bitcoin-lisp::maybe-rebalance-caches node)
+    (is (null (bitcoin-lisp.storage:chain-state-coins-cache-bytes snap)))
+    (is (= total (bitcoin-lisp::chainstate-coins-cache-budget snap)))
+    ;; A no-op when no historical chainstate exists and *node* is unset.
+    (let ((bitcoin-lisp::*node* nil))
+      (bitcoin-lisp:rebalance-caches-on-ibd-exit))
+    (is (null (bitcoin-lisp.storage:chain-state-coins-cache-bytes snap)))))

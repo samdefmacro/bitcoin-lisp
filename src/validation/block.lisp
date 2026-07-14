@@ -1335,17 +1335,22 @@ dead weight — Core deletes rev files together with blk files."
       (remhash block-hash *undo-cache-heights*)
       t)))
 
-(defun prune-stale-undo-files (chain-state)
-  "One-time catch-up: delete undo files for blocks at or below the
-chain's pruned-height (they accumulated before undo pruning existed —
-53GB/500k files observed on the first mainnet run). Lists the undo
+(defun prune-stale-undo-files (chain-state
+                               &key (horizon (bitcoin-lisp.storage:chain-state-pruned-height
+                                              chain-state)))
+  "One-time catch-up: delete undo files for blocks at or below HORIZON
+(default: the chain's pruned-height; they accumulated before undo pruning
+existed — 53GB/500k files observed on the first mainnet run). Lists the undo
 directory and resolves each filename (a block-hash hex) against the
 in-memory index, so after the first sweep the directory only holds the
-unpruned window and subsequent startup sweeps are cheap. Returns the
-number of files deleted."
-  (let ((pruned-height (bitcoin-lisp.storage:chain-state-pruned-height chain-state))
-        (deleted 0))
-    (when (and *undo-base-path* (plusp pruned-height))
+unpruned window and subsequent startup sweeps are cheap. The undo directory
+is shared across chainstates, so with an assumeutxo background sync the
+caller must pass the MINIMUM pruned-height over all chainstates — sweeping
+by the snapshot chainstate's cursor (above the base) would delete the
+historical chainstate's whole undo window. Returns the number of files
+deleted."
+  (let ((deleted 0))
+    (when (and *undo-base-path* (plusp horizon))
       (dolist (file (directory (merge-pathnames "*.dat" *undo-base-path*)))
         (let* ((hash (ignore-errors
                       (bitcoin-lisp.crypto:hex-to-bytes (pathname-name file))))
@@ -1357,7 +1362,7 @@ number of files deleted."
           ;; the hash is unknown to the index entirely (stale fork remnant).
           (when (or (null entry)
                     (<= (bitcoin-lisp.storage:block-index-entry-height entry)
-                        pruned-height))
+                        horizon))
             (ignore-errors (delete-file file))
             (when hash (remhash hash *undo-cache-heights*))
             (incf deleted)))))

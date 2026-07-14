@@ -500,8 +500,11 @@
    #:save-state
    #:load-state
    #:chain-state-pruned-height
+   #:chain-state-prune-floor
+   #:lift-prune-floor-on-promotion
    ;; Chainstate roles / assumeutxo identity (Core ChainstateManager)
    #:chain-state-coins-view
+   #:chain-state-coins-cache-bytes
    #:chain-state-from-snapshot-blockhash
    #:chain-state-assumeutxo-status
    #:chain-state-target-blockhash
@@ -1134,6 +1137,7 @@
    #:relay-transaction
    #:peer-announced-txs
    #:peer-known-addrs
+   #:initial-block-download-p
    ;; Compact block relay (BIP 152)
    #:send-compact-block-negotiation
    #:should-use-compact-blocks-p
@@ -1300,6 +1304,8 @@
    #:*prune-target-mib*
    #:*prune-after-height*
    #:+min-blocks-to-keep+
+   #:+min-disk-space-for-block-files+
+   #:effective-prune-target-bytes
    #:*accept-datacarrier*
    #:*max-datacarrier-bytes*
    #:*permit-bare-multisig*
@@ -1376,5 +1382,6 @@
    #:maybe-periodic-flush
    #:index-block-filter
    #:index-block-coinstats
-   #:maybe-validate-snapshot))
+   #:maybe-validate-snapshot
+   #:rebalance-caches-on-ibd-exit))
 
