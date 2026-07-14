@@ -521,6 +521,9 @@ signet|regtest, else returns DEFAULT."
     ("rpcpassword"       :rpc-password       :string)
     ("listen"            :listen             :bool)
     ("bind"              :listen-bind        :string)
+    ("listenonion"       :listen-onion       :bool)
+    ("torcontrol"        :tor-control        :string)
+    ("torpassword"       :tor-password       :string)
     ("v2transport"       :v2transport        :bool)
     ("reindexchainstate" :reindex-chainstate :bool)
     ("reindex-chainstate" :reindex-chainstate :bool)
@@ -533,6 +536,25 @@ signet|regtest, else returns DEFAULT."
   "Maps a Bitcoin Core-style option name to a start-node keyword and its value
 type. Network selection (-chain/-testnet/...) and -server/-debug are handled
 specially in config-alist->start-node-plist.")
+
+(defun conf-effective-listen-flags (alist)
+  "Replay Core's -proxy/-listen/-listenonion soft-set chain over a merged
+config ALIST: -proxy soft-disables -listen (init.cpp:786-790), -listen=0
+soft-disables -listenonion (init.cpp:808-809), and the explicit contradiction
+-listen=0 -listenonion=1 is an init ERROR (init.cpp:1022-1024). Returns
+(VALUES listen-p listen-onion-p). The ONE encoding of this chain — both the
+start-node plist assembly and apply-config-globals' -onlynet=onion gate
+derive from it, so the two can never drift."
+  (flet ((lk (k) (let ((c (assoc k alist :test #'string=))) (and c (cdr c)))))
+    (let* ((proxy-p (let ((v (lk "proxy"))) (and v (conf-parse-proxy v) t)))
+           (listen-p (let ((v (lk "listen")))
+                       (if v (conf-parse-bool v) (not proxy-p))))
+           (lo (lk "listenonion"))
+           (lo-p (and lo (conf-parse-bool lo))))
+      (when (and (not listen-p) lo-p)
+        (error "Cannot set -listen=0 together with -listenonion=1"))
+      (values listen-p
+              (and listen-p (if lo lo-p t))))))
 
 (defun config-alist->start-node-plist (alist network)
   "Convert a merged config ALIST (CLI over file) into a plist of start-node
@@ -569,7 +591,15 @@ resolved network. Honors -server (enable RPC on the default port when no
         (when (and proxy
                    (conf-parse-proxy (cdr proxy))
                    (not (lookup "listen")))
-          (setf (getf plist :listen) nil))))
+          (setf (getf plist :listen) nil)))
+      ;; -listen=0 (given, or soft-set by -proxy just above) disables the
+      ;; onion service (conf-effective-listen-flags: the shared soft-set
+      ;; chain, which also signals on -listen=0 -listenonion=1).
+      (multiple-value-bind (listen-p listen-onion-p)
+          (conf-effective-listen-flags alist)
+        (declare (ignore listen-p))
+        (unless listen-onion-p
+          (setf (getf plist :listen-onion) nil))))
     plist))
 
 (defun apply-config-globals (merged)
@@ -628,6 +658,10 @@ start-node-from-args."
           (when v
             (setf bitcoin-lisp.networking:*proxy* (parse-proxy v))))
         (let ((v (lk "onion")))
+          ;; The torcontrol client only auto-configures the onion proxy from
+          ;; Tor's GETINFO when -onion was never given at all (Core's raw
+          ;; GetArg("-onion","") == "" test) — record the raw fact.
+          (setf bitcoin-lisp.networking:*onion-proxy-explicit* (and v t))
           (cond (v (setf bitcoin-lisp.networking:*onion-proxy* (parse-proxy v)))
                 ;; No -onion: onion reachability follows -proxy when one was
                 ;; given (Core init.cpp:1764 "An empty string is used to not
@@ -649,10 +683,22 @@ start-node-from-args."
                            when (string= k "onlynet")
                              collect (conf-parse-network-name v)))
            (nets (or onlynets
-                     (copy-list bitcoin-lisp.networking:+bip155-networks+))))
+                     (copy-list bitcoin-lisp.networking:+bip155-networks+)))
+           ;; Effective -listenonion via the shared soft-set chain.
+           (listenonion-p (nth-value 1 (conf-effective-listen-flags merged))))
+      ;; Keep the user's raw restriction for later transport arrivals (the
+      ;; torcontrol GETINFO-discovered onion proxy re-admits :torv3 iff
+      ;; -onlynet allows it — Core get_socks_cb).
+      (setf bitcoin-lisp.networking:*onlynet-networks* onlynets)
       (unless bitcoin-lisp.networking:*onion-proxy*
         (when (member :torv3 onlynets)
-          (error "-onlynet=onion given but no Tor proxy (-proxy/-onion) is configured"))
+          ;; Core init.cpp:1769-1773 / 1788-1798: -onion=0 explicitly forbids
+          ;; the Tor route; otherwise -listenonion may still deliver a proxy
+          ;; later via the torcontrol connection.
+          (cond ((lk "onion")
+                 (error "-onlynet=onion given but the proxy for reaching the Tor network is explicitly forbidden: -onion=0"))
+                ((not listenonion-p)
+                 (error "-onlynet=onion given but no Tor route is configured: none of -proxy, -onion or -listenonion is given"))))
         (setf nets (remove :torv3 nets)))
       (when (member :i2p onlynets)
         (error "-onlynet=i2p given but I2P (SAM) is not supported"))

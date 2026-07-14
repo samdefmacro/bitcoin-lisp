@@ -59,6 +59,16 @@
   (address "" :type string)
   ;; T if the peer connected to us (inbound); NIL if we dialed out (outbound).
   (inbound nil :type boolean)
+  ;; T if the peer connected through our local Tor onion-service listener
+  ;; (Core CNode::m_inbound_onion, set when the accepting socket is an onion
+  ;; bind). Such peers' socket address is Tor's local client (127.0.0.1), so
+  ;; this flag is what makes ConnectedThroughNetwork() answer :torv3 — the
+  ;; network used for the self-advertisement privacy rule.
+  (inbound-onion nil :type boolean)
+  ;; internal-real-time deadline of the next local-address self-announcement
+  ;; to this peer; 0 = none sent yet, due immediately (Core Peer::
+  ;; m_next_local_addr_send, net_processing.cpp:376).
+  (next-local-addr-send 0 :type integer)
   ;; Connection type (Bitcoin Core ConnectionType). Determines tx-relay
   ;; participation and lifetime:
   ;;   :inbound              peer dialed us
@@ -412,23 +422,51 @@ arrived, forget the reconciliation state (Core net_processing.cpp:3879-3886)."
   (unless (and (peer-wtxid-relay peer) (peer-recon-registered peer))
     (%forget-recon-state peer)))
 
+(defun local-services ()
+  "Our advertised service bits (Core g_local_services / peer.m_our_services):
+BIP 159 NODE_NETWORK_LIMITED instead of NODE_NETWORK when pruning, BIP 324
+NODE_P2P_V2 when the v2 transport is available, BIP 157 NODE_COMPACT_FILTERS
+when filter serving is enabled. Used in our version message and as the
+services field of our self-advertised address (Core MaybeSendAddr's
+CAddress{*local_service, peer.m_our_services, ...})."
+  (logior (if (bitcoin-lisp:pruning-enabled-p)
+              bitcoin-lisp.serialization:+node-network-limited+
+              bitcoin-lisp.serialization:+node-network+)
+          bitcoin-lisp.serialization:+node-witness+
+          (if (v2-available-p)
+              bitcoin-lisp.serialization:+node-p2p-v2+ 0)
+          (if bitcoin-lisp:*peer-block-filters*
+              bitcoin-lisp.serialization:+node-compact-filters+ 0)))
+
+(defun %version-addr-recv (peer)
+  "The addr_recv (\"addr_you\") field for our version message to PEER: the
+peer's own address with the services we know for it, when that address is
+routable and carriable in the version message's pre-BIP155 form — else the
+all-zero dummy, exactly Core's `addr.IsRoutable() && !IsProxy(addr) &&
+addr.IsAddrV1Compatible() ? addr : CService{}` (net_processing.cpp:1570).
+The IsProxy arm has no analogue here: our peer-address always records the
+dial TARGET, never the proxy. addr_from stays the all-zero dummy — that IS
+Core's behavior (CNetAddr::V1(CService{}), net_processing.cpp:1585); real
+self-advertisement happens via addr/addrv2 push, not the version message."
+  (multiple-value-bind (net bytes) (parse-network-address (peer-address peer))
+    (if (and net
+             (bitcoin-lisp.serialization:v1-compatible-network-p net)
+             (address-routable-p bytes net))
+        (bitcoin-lisp.serialization:make-net-addr
+         :services (peer-services peer)
+         :ip bytes
+         :port (let ((conn (peer-connection peer)))
+                 (if conn (connection-port conn) 0)))
+        (bitcoin-lisp.serialization:make-empty-net-addr
+         :services (peer-services peer)))))
+
 (defun %send-version-and-capabilities (peer)
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
 VERACK). Returns T if the version was sent. On a block-relay/feeler connection
 the version's relay flag is 0 and we skip wtxidrelay (Core does not negotiate
 tx relay on those)."
-  ;; BIP 159: advertise NODE_NETWORK_LIMITED instead of NODE_NETWORK when
-  ;; pruning. BIP 324: add NODE_P2P_V2 when the v2 transport is available.
-  (let* ((services (logior (if (bitcoin-lisp:pruning-enabled-p)
-                               bitcoin-lisp.serialization:+node-network-limited+
-                               bitcoin-lisp.serialization:+node-network+)
-                           bitcoin-lisp.serialization:+node-witness+
-                           (if (v2-available-p)
-                               bitcoin-lisp.serialization:+node-p2p-v2+ 0)
-                           ;; BIP157: advertise filter serving when enabled.
-                           (if bitcoin-lisp:*peer-block-filters*
-                               bitcoin-lisp.serialization:+node-compact-filters+ 0)))
+  (let* ((services (local-services))
          (relays (peer-relays-txs-p peer))
          ;; Advertise our real chain height (Core sends my_height) so peers can
          ;; pick us as a block-sync source; 0 only if the node isn't up yet.
@@ -441,6 +479,7 @@ tx relay on those)."
                            0))
          (version-payload (bitcoin-lisp.serialization:make-version-message-bytes
                            :services services
+                           :addr-recv (%version-addr-recv peer)
                            :start-height start-height
                            :timestamp (bitcoin-lisp.serialization:get-unix-time)
                            :relay relays))
@@ -562,13 +601,16 @@ stall. Returns T on success."
        (send-message peer (bitcoin-lisp.serialization:make-verack-message))
        (%await-verack peer :timeout timeout)))
 
-(defun make-inbound-peer (connection address)
+(defun make-inbound-peer (connection address &key inbound-onion)
   "Build a peer for an accepted inbound CONNECTION from ADDRESS (state :connected,
-inbound t, rate limiters initialized)."
+inbound t, rate limiters initialized). INBOUND-ONION marks a connection accepted
+on the local onion-service listener (Tor forwarding), whose true network is
+:torv3 even though the socket peer is 127.0.0.1."
   (let ((peer (make-peer :connection connection
                          :state :connected
                          :address address
                          :inbound t
+                         :inbound-onion (and inbound-onion t)
                          :connect-time (get-internal-real-time))))
     (init-peer-rate-limiters peer)
     peer))

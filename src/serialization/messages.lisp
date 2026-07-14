@@ -109,6 +109,17 @@ default so plain-IP constructors need no :net)."
   (port 0 :type (unsigned-byte 16))
   (net nil :type (or null keyword)))
 
+(defun make-empty-net-addr (&key (services 0))
+  "An \"empty\" wire address — Core's default-constructed CService: all-zero
+IPv6 (\"::\") and port 0. This is what modern Core serializes for the version
+message's addr_from (always) and addr_recv (when the peer's address is
+unusable), net_processing.cpp:1570/1585. Distinct from make-net-addr's
+default, which is loopback."
+  (make-net-addr :services services
+                 :ip (make-array 16 :element-type '(unsigned-byte 8)
+                                    :initial-element 0)
+                 :port 0))
+
 (defun ip-bytes-v4-mapped-p (ip)
   "T if a 16-byte address is IPv4-mapped IPv6 (::ffff:a.b.c.d)."
   (and (= (length ip) 16)
@@ -278,14 +289,21 @@ the unavoidable-case fallback."
                                         (timestamp (get-unix-time))
                                         (user-agent "/bitcoin-lisp:0.1.0/")
                                         (start-height 0)
-                                        (relay t))
-  "Create a serialized version message."
+                                        (relay t)
+                                        addr-recv)
+  "Create a serialized version message. ADDR-RECV (\"addr_you\"), when given,
+is a net-addr carrying the peer's own address; the default is the all-zero
+empty address. addr_from is ALWAYS the all-zero empty address — that is
+Core's behavior too (PushNodeVersion serializes CNetAddr::V1(CService{}) for
+\"addrMe\", net_processing.cpp:1585); self-advertisement happens via
+addr/addrv2. (The former dummy here was loopback ::ffff:127.0.0.1, a real
+divergence from Core's empty CService.)"
   (let ((msg (make-version-message
               :version version
               :services services
               :timestamp timestamp
-              :addr-recv (make-net-addr :services services :port 0)
-              :addr-from (make-net-addr :services services :port 0)
+              :addr-recv (or addr-recv (make-empty-net-addr :services services))
+              :addr-from (make-empty-net-addr :services services)
               :nonce (random (expt 2 64))
               :user-agent user-agent
               :start-height start-height
