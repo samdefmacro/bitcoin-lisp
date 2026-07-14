@@ -4,7 +4,8 @@
 ;;;
 ;;; Stores validated unconfirmed transactions. Indexed by txid with
 ;;; secondary index on spent outpoints for conflict detection.
-;;; Enforces size limits via lowest-fee-rate eviction.
+;;; Enforces the byte cap by evicting the worst txgraph chunk (cluster
+;;; mempool) and per-cluster count/size limits at acceptance.
 
 ;;;; Constants
 
@@ -17,19 +18,24 @@ DEFAULT_MIN_RELAY_TX_FEE = 100 sat/kvB = 0.1 sat/vB). Was 1 sat/vB -- 10x
 stricter than Core, rejecting the whole 0.1..1.0 sat/vB band Core relays; the
 sat/kvB representation also makes fractional-sat/vB floors expressible.")
 
-(defconstant +default-ancestor-limit+ 25
-  "Max number of in-mempool ancestors (incl. self) for a tx (Bitcoin Core
-DEFAULT_ANCESTOR_LIMIT).")
+;; The historical 25/25 ancestor/descendant package limits (Core
+;; DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT) are gone: since the
+;; cluster-limit flip (P6), acceptance is bounded by the cluster limits
+;; below, and ancestor/descendant stats are RPC-reporting-only (Core
+;; deprecated -limitancestorcount et al., init.cpp:650-659).
 
-(defconstant +default-descendant-limit+ 25
-  "Max number of in-mempool descendants (incl. self) for a tx (Bitcoin Core
-DEFAULT_DESCENDANT_LIMIT).")
+(defvar *cluster-count-limit* +max-cluster-count+
+  "Max number of transactions in a cluster (a connected component under the
+spends-from relation). Core -limitclustercount (mempool_args.cpp:35), default
+DEFAULT_CLUSTER_LIMIT = 64, hard-capped at MAX_CLUSTER_COUNT_LIMIT = 64
+(mempool_args.cpp:110-112). Read at MAKE-MEMPOOL time (the graph's limits are
+fixed at creation); set from config before the node's mempool is built.")
 
-(defconstant +default-ancestor-size-limit+ 101000
-  "Max total vsize of a tx + its ancestors, in vbytes (Core 101 kvB).")
-
-(defconstant +default-descendant-size-limit+ 101000
-  "Max total vsize of a tx + its descendants, in vbytes (Core 101 kvB).")
+(defvar *cluster-size-limit* +max-cluster-size+
+  "Max total vsize of a cluster, in vbytes. Core -limitclustersize in kvB
+x 1000 (mempool_args.cpp:37), default DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101.
+Core-exact 64/101k defaults are non-negotiable for relay compatibility.
+Read at MAKE-MEMPOOL time, like *CLUSTER-COUNT-LIMIT*.")
 
 (defconstant +default-mempool-expiry-hours+ 336
   "Drop mempool txs older than this (14 days) — Bitcoin Core
@@ -157,14 +163,18 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
   ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
   (orphan-pool (make-orphan-pool) :type orphan-pool)
-  ;; Shadow txgraph (cluster mempool P3): the cluster/chunk engine, maintained
-  ;; in lockstep with ENTRIES on every mutation but read by no decision yet -
-  ;; mining, eviction, limits, and RBF flip to it in P4-P7. Core-exact cluster
-  ;; limits (64 tx / 101 kvB); under today's 25/25 BFS limits a connected
-  ;; component can exceed them, in which case the graph holds the offending
-  ;; dependencies pending and reports oversized until removals resolve it
-  ;; (txgraph.lisp OVERSIZED contract).
-  (graph (make-txgraph :fallback-order #'%graph-txid-order) :type txgraph))
+  ;; The cluster/chunk engine (Core TxGraph), maintained in lockstep with
+  ;; ENTRIES on every mutation. AUTHORITATIVE since the P4-P6 flips for
+  ;; mining (chunk-walk block builder), eviction (worst-chunk trim), and the
+  ;; acceptance limits (64 tx / 101 kvB per cluster, enforced in MEMPOOL-ADD,
+  ;; so the graph never stays oversized). RBF economics flip in P7. The BFS
+  ;; parent/child machinery remains for RPC ancestor/descendant reporting,
+  ;; TRUC topology checks, and mempool.dat ordering, with the P3 shadow
+  ;; equivalence asserts as the standing safety net.
+  (graph (make-txgraph :max-cluster-count *cluster-count-limit*
+                       :max-cluster-size *cluster-size-limit*
+                       :fallback-order #'%graph-txid-order)
+         :type txgraph))
 
 (defconstant +rolling-fee-halflife-seconds+ 43200
   "Rolling minimum fee decays by half every 12 hours (Bitcoin Core default).")
@@ -181,13 +191,14 @@ CFeeRate::GetFeePerK units). Compare as (>= (* fee 1000) (* rate vsize))."
                                   (expt 0.5d0 (/ age +rolling-fee-halflife-seconds+))))))
           (max (mempool-min-fee-rate mempool) decayed)))))
 
-;;;; Shadow txgraph checks (cluster mempool P3)
+;;;; Shadow txgraph checks (cluster mempool P3, kept through the P4-P6 flips)
 ;;;;
-;;;; The txgraph is write-only in this phase: every mutation path mirrors
-;;;; into it, nothing reads it for decisions. These checks are the safety
-;;;; net for the P4-P7 flips - they prove, across the whole suite and in
-;;;; production soak, that the graph agrees with the BFS parent/child
-;;;; machinery it will replace.
+;;;; Every mutation path mirrors into the txgraph, and since P4-P6 the graph
+;;;; is authoritative for mining, eviction, and the acceptance limits. The
+;;;; BFS parent/child machinery remains for RPC reporting, TRUC checks, and
+;;;; persistence ordering; these equivalence checks stay on as the safety
+;;;; net proving the two views agree until the remaining flips (P7 RBF, P8
+;;;; reorg bulk re-add) retire the BFS side.
 
 (defvar *txgraph-shadow-checks* nil
   "When true, assert full mempool/txgraph equivalence after every mempool
@@ -352,7 +363,7 @@ Returns the txid of the conflicting transaction, or NIL if no conflict."
 (defun %walk-mempool-graph (mempool seed-txids link-accessor)
   "BFS from SEED-TXIDS following LINK-ACCESSOR (parents or children of an entry).
 Returns a hash-set (txid -> t) of all reached txids (excluding the seeds unless
-they are reachable from each other). Bounded by the ancestor/descendant limits."
+they are reachable from each other). Bounded by the 64-tx cluster limit."
   (let ((found (make-hash-table :test 'equalp))
         (queue (copy-list seed-txids)))
     (loop while queue
@@ -415,16 +426,17 @@ they are reachable from each other). Bounded by the ancestor/descendant limits."
         (values 0 0 0))))
 
 (defun mempool-ancestor-fee-rate (mempool txid)
-  "Ancestor-package fee rate (the mining score): ancestor-fees / ancestor-vsize.
-A low-fee tx with a high-fee unconfirmed parent chain scores higher here."
+  "Ancestor-package fee rate: ancestor-fees / ancestor-vsize. The pre-cluster
+mining score, reporting/diagnostic-only since mining flipped to txgraph
+chunk feerates (P4)."
   (multiple-value-bind (count vsize fees) (mempool-ancestor-stats mempool txid)
     (declare (ignore count))
     (if (zerop vsize) 0 (/ fees vsize))))
 
 (defun mempool-descendant-fee-rate (mempool txid)
-  "Descendant-package fee rate (the eviction score): descendant-fees /
-descendant-vsize. A low-fee parent with a high-fee child (CPFP) scores higher
-and is evicted later."
+  "Descendant-package fee rate: descendant-fees / descendant-vsize. The
+pre-cluster eviction score, reporting/diagnostic-only since eviction flipped
+to the txgraph's worst chunk (P5)."
   (multiple-value-bind (count vsize fees) (mempool-descendant-stats mempool txid)
     (declare (ignore count))
     (if (zerop vsize) 0 (/ fees vsize))))
@@ -494,33 +506,6 @@ caller to), so a v3 tx that would need it is rejected with :truc-descendant-limi
             (return-from single-truc-checks (values nil :truc-descendant-limit))))))
     (values t nil)))
 
-(defun check-ancestor-descendant-limits (mempool parent-txids new-vsize)
-  "Check that adding a new tx of NEW-VSIZE with the given in-mempool PARENT-TXIDS
-keeps it within ancestor and descendant limits. Returns (values ok-p reason)."
-  ;; Ancestors of the new tx = its parents plus all of their ancestors.
-  (let* ((ancestors (%walk-mempool-graph mempool (copy-list parent-txids)
-                                         #'mempool-entry-parents))
-         (acount 1) (avsize new-vsize))     ; include the new tx itself
-    (maphash (lambda (a v) (declare (ignore v))
-               (let ((e (mempool-get mempool a)))
-                 (when e (incf acount) (incf avsize (mempool-entry-vsize e)))))
-             ancestors)
-    (cond
-      ((> acount +default-ancestor-limit+) (values nil :too-long-mempool-chain))
-      ((> avsize +default-ancestor-size-limit+) (values nil :too-long-mempool-chain))
-      (t
-       ;; Adding the new tx adds one descendant (+new-vsize) to each ancestor.
-       (let ((result-ok t) (result-reason nil))
-         (block scan
-           (maphash (lambda (a v) (declare (ignore v))
-                      (multiple-value-bind (dcount dvsize) (mempool-descendant-stats mempool a)
-                        (when (or (> (1+ dcount) +default-descendant-limit+)
-                                  (> (+ dvsize new-vsize) +default-descendant-size-limit+))
-                          (setf result-ok nil result-reason :too-long-mempool-chain)
-                          (return-from scan))))
-                    ancestors))
-         (values result-ok result-reason))))))
-
 (defun %link-entry-parents (mempool txid entry parent-txids)
   "Wire up the parent/child links between ENTRY (TXID) and its in-mempool parents."
   (dolist (p parent-txids)
@@ -555,13 +540,18 @@ add it. Caller has already run validate-transaction-for-mempool. Returns
 
 (defun mempool-add (mempool txid entry)
   "Add a transaction to the mempool.
-Returns :ok on success, or a keyword indicating the rejection reason."
+Returns :ok on success, or a rejection keyword: :duplicate, :conflict,
+:too-large-cluster (joining its in-mempool parents would form a cluster over
+the 64-tx / 101-kvB limits, Core's \"too-large-cluster\",
+validation.cpp:1020-1022), or :mempool-full (after adding, trimming back to
+the byte cap evicted the new tx's own chunk as the worst,
+validation.cpp:1394-1401)."
   ;; Check for duplicate
   (when (mempool-has mempool txid)
     (return-from mempool-add :duplicate))
 
   ;; Apply any pre-existing prioritisation delta (Core: ATMP ApplyDelta) so
-  ;; eviction scoring below and later mining selection see the modified fee.
+  ;; eviction scoring and mining selection see the modified fee.
   (let ((delta (gethash txid (mempool-deltas mempool))))
     (when delta
       (incf (mempool-entry-modified-fee entry) delta)))
@@ -572,29 +562,37 @@ Returns :ok on success, or a keyword indicating the rejection reason."
     (when conflict
       (return-from mempool-add :conflict)))
 
-  ;; Ancestor/descendant package limits.
   (let ((parent-txids (mempool-find-parents
-                       mempool (mempool-entry-transaction entry))))
-    (multiple-value-bind (ok reason)
-        (check-ancestor-descendant-limits mempool parent-txids
-                                          (mempool-entry-vsize entry))
-      (unless ok
-        (return-from mempool-add reason)))
+                       mempool (mempool-entry-transaction entry)))
+        (graph (mempool-graph mempool)))
+    ;; Stage into the txgraph first (Core ChangeSet::StageAddition +
+    ;; ProcessDependencies, txmempool.cpp:1005-1071): the modified fee (the
+    ;; delta was applied above; Core adds unmodified then SetTransactionFee -
+    ;; one step here), the vsize, and a dependency per in-mempool parent.
+    ;; Then enforce the cluster limits (Core CheckMemPoolPolicyLimits ->
+    ;; IsOversized, validation.cpp:1020): a dependency whose merged cluster
+    ;; would exceed the count/size limits is held pending and the graph
+    ;; reports oversized - undo the staged addition and reject. A tx whose
+    ;; own vsize exceeds the size limit is oversized the same way. The
+    ;; historical 25/25 ancestor/descendant limits no longer reject; they
+    ;; are RPC-reporting-only (Core init.cpp:650-659).
+    (let ((handle (txgraph-add-transaction
+                   graph (mempool-entry-modified-fee entry)
+                   (mempool-entry-vsize entry))))
+      (setf (tx-handle-data handle) txid)
+      (dolist (p parent-txids)
+        (txgraph-add-dependency
+         graph (mempool-entry-graph-handle (mempool-get mempool p)) handle))
+      (when (txgraph-oversized-p graph)
+        (txgraph-remove-transaction graph handle)
+        (return-from mempool-add :too-large-cluster))
+      (setf (mempool-entry-graph-handle entry) handle))
 
-  ;; Evict if needed to make room
-  (let ((tx-size (mempool-entry-size entry)))
-    (when (> (+ (mempool-total-size mempool) tx-size)
-             (mempool-max-size mempool))
-      ;; Try to evict enough lowest-fee-rate entries
-      (unless (mempool-evict-for-size mempool tx-size
-                                       (mempool-entry-fee-rate entry))
-        (return-from mempool-add :mempool-full))))
+    ;; Add to entries table
+    (setf (gethash txid (mempool-entries mempool)) entry)
 
-  ;; Add to entries table
-  (setf (gethash txid (mempool-entries mempool)) entry)
-
-  ;; Wire up ancestor/descendant links to in-mempool parents.
-  (%link-entry-parents mempool txid entry parent-txids)
+    ;; Wire up ancestor/descendant links to in-mempool parents.
+    (%link-entry-parents mempool txid entry parent-txids))
 
   ;; Index by wtxid (BIP339)
   (let ((wtxid (mempool-entry-wtxid entry)))
@@ -612,23 +610,19 @@ Returns :ok on success, or a keyword indicating the rejection reason."
 
   ;; Update total size
   (incf (mempool-total-size mempool) (mempool-entry-size entry))
-
-  ;; Mirror into the shadow txgraph (Core ChangeSet::StageAddition +
-  ;; ProcessDependencies, txmempool.cpp:1005-1071): the modified fee (the
-  ;; delta was applied above; Core adds unmodified then SetTransactionFee -
-  ;; one step here), the vsize, and a dependency per in-mempool parent.
-  (let* ((graph (mempool-graph mempool))
-         (handle (txgraph-add-transaction
-                  graph (mempool-entry-modified-fee entry)
-                  (mempool-entry-vsize entry))))
-    (setf (tx-handle-data handle) txid
-          (mempool-entry-graph-handle entry) handle)
-    (dolist (p parent-txids)
-      (txgraph-add-dependency
-       graph (mempool-entry-graph-handle (mempool-get mempool p)) handle)))
   (%mempool-graph-verify mempool)
 
-  :ok))
+  ;; Trim back to the byte cap now that the tx is in (Core FinalizeSubpackage
+  ;; then LimitMempoolSize, validation.cpp:1394-1401): the new tx competes as
+  ;; part of its own cluster's chunks, and if its chunk is the worst it
+  ;; evicts itself - that is the "mempool full" outcome, and the rolling
+  ;; minimum fee has been raised past its feerate either way.
+  (when (> (mempool-total-size mempool) (mempool-max-size mempool))
+    (mempool-trim-to-size mempool)
+    (unless (mempool-has mempool txid)
+      (return-from mempool-add :mempool-full)))
+
+  :ok)
 
 (defun mempool-remove (mempool txid)
   "Remove a transaction from the mempool by txid.
@@ -907,48 +901,41 @@ empty mempool, like Core."
 
 ;;;; Eviction
 
-(defun mempool-evict-for-size (mempool needed-bytes new-entry-fee-rate)
-  "Evict transactions to free NEEDED-BYTES of space, lowest descendant-package
-fee-rate first (so a high-fee child protects its low-fee parent — CPFP), and
-remove each evictee together with its descendants. Only evicts packages whose
-fee-rate is below NEW-ENTRY-FEE-RATE. Returns T if enough space was freed."
-  (let ((to-free (- (+ (mempool-total-size mempool) needed-bytes)
-                     (mempool-max-size mempool))))
-    (when (<= to-free 0)
-      (return-from mempool-evict-for-size t))
-
-    ;; Rank every entry by its descendant-package fee-rate, ascending.
-    (let ((ranked '()))
-      (maphash (lambda (txid entry)
-                 (declare (ignore entry))
-                 (push (cons txid (mempool-descendant-fee-rate mempool txid)) ranked))
-               (mempool-entries mempool))
-      (setf ranked (sort ranked #'< :key #'cdr))
-
-      (let ((freed 0) (max-evicted-rate 0) (done nil))
-        (dolist (pair ranked)
-          (when (or done (>= freed to-free)) (return))
-          (cond
-            ;; Never evict a package that pays at least as much as the incoming tx.
-            ((>= (cdr pair) new-entry-fee-rate) (setf done t))
-            ;; May already be gone if removed as a descendant of an earlier evictee.
-            ((mempool-has mempool (car pair))
-             (let ((before (mempool-total-size mempool)))
-               (mempool-remove-recursive mempool (car pair))
-               (incf freed (- before (mempool-total-size mempool)))
-               (setf max-evicted-rate (max max-evicted-rate (cdr pair)))))))
-        ;; Raise the rolling minimum fee (sat/kvB) to the priciest evicted
-        ;; package's feerate plus the incremental relay fee, so newcomers must
-        ;; beat what was just trimmed (Core TrimToSize: maxFeeRateRemoved =
-        ;; evicted feerate + incrementalRelayFee). MAX-EVICTED-RATE is sat/vB.
-        (when (plusp max-evicted-rate)
-          (let ((floor-rate (+ (ceiling (* max-evicted-rate 1000))
-                               +incremental-relay-fee-rate+)))
-            (when (> floor-rate (mempool-rolling-min-fee-rate mempool))
-              (setf (mempool-rolling-min-fee-rate mempool) floor-rate
-                    (mempool-rolling-min-fee-time mempool)
-                    (bitcoin-lisp.serialization:get-unix-time)))))
-        (>= freed to-free)))))
+(defun mempool-trim-to-size (mempool &optional (limit (mempool-max-size mempool)))
+  "Evict the globally worst chunk - the lowest-chunk-feerate tail of the
+mining order - repeatedly until the mempool's total size is within LIMIT
+(Core TrimToSize, txmempool.cpp:861-911). A high-fee child still protects
+its low-fee parent (CPFP): they share a chunk, evicted only as a unit. Each
+evicted chunk raises the rolling minimum fee (sat/kvB) to its feerate plus
+the incremental relay fee, so newcomers must beat what was just trimmed
+(Core trackPackageRemoved). Returns the number of transactions removed."
+  (let ((graph (mempool-graph mempool))
+        (removed 0))
+    (%with-graph-verify-batch (mempool)
+      (loop while (and (plusp (mempool-count mempool))
+                       (> (mempool-total-size mempool) limit))
+            do (multiple-value-bind (handles feerate)
+                   (txgraph-get-worst-main-chunk graph)
+                 ;; Feerate in sat/kvB, truncating like Core's
+                 ;; CFeeRate(fee, size) constructor, plus the incremental
+                 ;; relay fee (txmempool.cpp:870-878).
+                 (let ((rate (+ (truncate (* (feefrac-fee feerate) 1000)
+                                          (feefrac-size feerate))
+                                +incremental-relay-fee-rate+)))
+                   (when (> rate (mempool-rolling-min-fee-rate mempool))
+                     (setf (mempool-rolling-min-fee-rate mempool) rate
+                           (mempool-rolling-min-fee-time mempool)
+                           (bitcoin-lisp.serialization:get-unix-time))))
+                 ;; The worst chunk is the tail of its own cluster's
+                 ;; linearization, so it contains every in-mempool descendant
+                 ;; of its members: removing its transactions (delivered
+                 ;; children-first, reverse-topological) leaves nothing
+                 ;; dangling and needs no recursion (Core removeUnchecked
+                 ;; per chunk member).
+                 (dolist (h handles)
+                   (when (mempool-remove mempool (tx-handle-data h))
+                     (incf removed))))))
+    removed))
 
 ;;;; Expiry and periodic trim
 
@@ -966,11 +953,6 @@ Returns the number of transactions removed."
       ;; A stale tx may already be gone (removed as a descendant of another).
       (when (mempool-has mempool txid)
         (incf removed (mempool-remove-recursive mempool txid))))))
-
-(defun mempool-trim (mempool)
-  "Evict lowest-package-feerate transactions until the mempool is within its
-size cap. Returns T (no-op when already under the cap)."
-  (mempool-evict-for-size mempool 0 most-positive-fixnum))
 
 ;;;; Block interaction
 
