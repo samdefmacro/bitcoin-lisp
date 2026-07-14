@@ -9,9 +9,9 @@
 ;;;; divergence on any path errors the test that triggered it. These tests
 ;;;; drive the specific sequences the plan calls out (add/remove/replace,
 ;;;; block-confirmation cluster splitting, block conflicts, a reorg re-add
-;;;; cycle, mempool.dat reload, prioritisation, an oversized cluster, and
-;;;; a seeded randomized op mix) and assert the resulting graph state
-;;;; directly.
+;;;; cycle, mempool.dat reload, prioritisation, the cluster limits at
+;;;; acceptance, and a seeded randomized op mix) and assert the resulting
+;;;; graph state directly.
 
 (def-suite :mempool-shadow-tests
   :description "Mempool/txgraph shadow-mode equivalence (cluster mempool P3)"
@@ -321,44 +321,39 @@ deltas, via set-transaction-fee for in-mempool entries."
       (%shp-add mempool b :fee 10000)
       (is (= 10300 (graph-fee (%shp-hash b)))))))
 
-;;;; Oversized clusters (possible under the 25/25 BFS limits)
+;;;; Cluster limits at acceptance (P6: what P3 merely tolerated is rejected)
 
-(test shadow-oversized-cluster-tolerated
-  "A connected component above 64 txs (legal under the 25/25 limits via a
-caterpillar shape) drives the graph oversized: mutations and the count
-check keep working, held-back dependencies resolve once removals shrink
-the component, and full equivalence resumes."
+(test shadow-cluster-limit-rejects-oversized-component
+  "A connected component may not exceed 64 txs: growing a caterpillar (every
+tx well within the old 25/25 limits) is fine until the bridge that would
+fuse it into a 65-tx cluster, which is rejected with :too-large-cluster and
+its staged graph addition rolled back - the graph never stays oversized,
+mempool and graph agree throughout, and the pool remains fully usable."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (graph (%shp-graph mempool))
          (roots (loop for i from 1 to 33
-                      collect (%shp-root-tx (+ 100 i))))
-         (bridges '()))
+                      collect (%shp-root-tx (+ 100 i)))))
     (dolist (r roots) (is (eq :ok (%shp-add mempool r))))
-    ;; bridge-i spends (root-i, 1) and (root-i+1, 0): every tx stays within
-    ;; the 25/25 limits, but the component grows to 33 + 32 = 65 txs.
+    ;; bridge-i spends (root-i, 1) and (root-i+1, 0). After k bridges the
+    ;; component holds 2k+1 txs: bridges 1-31 pass (63 txs), bridge 32 would
+    ;; make 65 and is rejected.
     (loop for (r1 r2) on roots
+          for k from 1
           while r2
           for bridge = (%shp-tx (list (cons (%shp-hash r1) 1)
                                       (cons (%shp-hash r2) 0)))
-          do (push bridge bridges)
-             (is (eq :ok (%shp-add mempool bridge))))
-    (setf bridges (nreverse bridges))
-    (is (= 65 (bitcoin-lisp.mempool:mempool-count mempool)))
-    (is (= 65 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
-    (is-true (bitcoin-lisp.mempool:txgraph-oversized-p graph))
-    ;; Mutations remain available while oversized.
+          do (is (eq (if (<= k 31) :ok :too-large-cluster)
+                     (%shp-add mempool bridge))))
+    (is (= 64 (bitcoin-lisp.mempool:mempool-count mempool)))
+    (is (= 64 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
+    (is-false (bitcoin-lisp.mempool:txgraph-oversized-p graph))
+    ;; The pool stays fully usable after the rejection.
     (let ((extra (%shp-root-tx 200)))
       (is (eq :ok (%shp-add mempool extra)))
-      (is (= 66 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
+      (is (= 65 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
       (bitcoin-lisp.mempool:mempool-remove mempool (%shp-hash extra)))
-    ;; Removing a middle bridge (childless: a plain remove) splits the
-    ;; would-be component into two halves within the limits, so the pending
-    ;; dependency resolves and the graph is whole again.
-    (bitcoin-lisp.mempool:mempool-remove mempool (%shp-hash (nth 16 bridges)))
-    (is-false (bitcoin-lisp.mempool:txgraph-oversized-p graph))
-    (is (= 64 (bitcoin-lisp.mempool:txgraph-tx-count graph)))
     (is (%shp-verify mempool))
-    (is (%shp-equiv-p mempool (%shp-hash (first bridges))))))
+    (is (%shp-equiv-p mempool (%shp-hash (first roots))))))
 
 ;;;; Randomized equivalence
 
