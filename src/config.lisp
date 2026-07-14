@@ -11,6 +11,12 @@
 (defconstant +min-blocks-to-keep+ 288
   "Minimum number of recent blocks to keep on disk (matches Bitcoin Core).")
 
+(defconstant +min-disk-space-for-block-files+ (* 550 1024 1024)
+  "Floor for the effective automatic-prune target in bytes (Bitcoin Core
+MIN_DISK_SPACE_FOR_BLOCK_FILES, validation.h:87). The per-chainstate halving
+while an assumeutxo historical chainstate exists never pushes the target
+below this.")
+
 (defvar *prune-target-mib* nil
   "Block pruning target in MiB.
 NIL = pruning disabled (default).

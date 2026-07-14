@@ -389,6 +389,11 @@ within +max-tip-age-seconds+ of now — Core UpdateIBDStatus
         (progn
           (bitcoin-lisp:log-info "Leaving InitialBlockDownload (latching to false)")
           (setf *cached-is-ibd* nil)
+          ;; With an assumeutxo background chainstate in use, leaving IBD
+          ;; shifts the coins-cache allocation to the historical chainstate
+          ;; (Core ActivateBestChain's exited_ibd -> MaybeRebalanceCaches,
+          ;; validation.cpp:3479-3486).
+          (bitcoin-lisp:rebalance-caches-on-ibd-exit)
           nil)
         t)))
 

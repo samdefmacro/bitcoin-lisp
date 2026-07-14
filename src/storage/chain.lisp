@@ -57,6 +57,11 @@ needs, so the node can hold several in a list and select between them."
   ;; SNAPSHOT_CHAINSTATE_SUFFIX \"_snapshot\", node/utxo_snapshot.h:128).
   ;; Empty for the primary chainstate, so its file names are unchanged.
   (storage-suffix "" :type string)
+  ;; Per-chainstate coins-cache budget in bytes (Core
+  ;; m_coinstip_cache_size_bytes, resized by MaybeRebalanceCaches). NIL means
+  ;; the whole global budget — the single-chainstate default. Never persisted:
+  ;; Core recomputes cache sizes on every startup/rebalance.
+  (coins-cache-bytes nil :type (or null (integer 0)))
   ;; Target-path index: simple-vector mapping height -> the target block's
   ;; ancestor entry at that height (0..target-height), built by
   ;; set-chainstate-target. This is our O(1) form of Core's
@@ -147,8 +152,49 @@ drift apart from the snapshot constructor when a slot is added. Returns STATE."
   (setf (chain-state-storage-suffix state) ""
         (chain-state-from-snapshot-blockhash state) nil
         (chain-state-assumeutxo-status state) :validated
-        (chain-state-target-utxohash state) nil)
+        (chain-state-target-utxohash state) nil
+        ;; Sole surviving chainstate: back to the whole coins-cache budget
+        ;; (Core MaybeRebalanceCaches' single-chainstate arm).
+        (chain-state-coins-cache-bytes state) nil)
   state)
+
+(defun chain-state-prune-floor (state)
+  "Height of the last UNprunable block for STATE — the per-chainstate prune
+range's lower bound (Core Chainstate::GetPruneRange, validation.cpp:6366-6391,
+whose prune_start is this + 1). An unvalidated snapshot chainstate must never
+prune a block at or below its snapshot base: the historical chainstate still
+has to download and validate those blocks, and deleting one wedges the
+background sync permanently. Every other chainstate prunes from genesis (0).
+If the base header is somehow missing from the shared index, refuse to prune
+anything (most conservative)."
+  (let ((base (chain-state-from-snapshot-blockhash state)))
+    (if (and base (not (eq (chain-state-assumeutxo-status state) :validated)))
+        (let ((entry (get-block-index-entry state base)))
+          (if entry
+              (block-index-entry-height entry)
+              most-positive-fixnum))
+        0)))
+
+(defun chain-state-prune-walk-start (state)
+  "The height a prune walk over STATE resumes ABOVE: the max of the monotone
+pruned-height cursor and the per-chainstate prune floor. Shared by the
+automatic and manual prune paths (Core: FindFilesToPrune and
+FindFilesToPruneManual both consume the same GetPruneRange)."
+  (max (chain-state-pruned-height state)
+       (chain-state-prune-floor state)))
+
+(defun lift-prune-floor-on-promotion (snap historical)
+  "Prune-cursor repair when SNAP becomes VALIDATED and its floor lifts:
+rewind SNAP's monotone pruned-height cursor to HISTORICAL's, so the window
+the floor kept on disk — heights in (historical pruned-height, base] —
+becomes reachable again by later prune walks (which skip already-deleted
+files harmlessly). Core needs no equivalent: it recomputes GetPruneRange
+statelessly on every FindFilesToPrune; the cursor is our walk-resume
+optimization, so the floor/cursor interaction is repaired here, next to
+where both are defined."
+  (setf (chain-state-pruned-height snap)
+        (min (chain-state-pruned-height snap)
+             (chain-state-pruned-height historical))))
 
 (defun target-ancestor-entry (chain-state height)
   "The target block's ancestor entry at HEIGHT for a targeted (historical)
