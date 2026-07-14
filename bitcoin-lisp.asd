@@ -219,6 +219,8 @@
                              ;; Assumeutxo snapshot format (dumptxoutset/loadtxoutset)
                              (:file "snapshot-tests")
                              ;; Chainstate list + selection accessors + storage suffix
-                             (:file "chainstate-tests"))))
+                             (:file "chainstate-tests")
+                             ;; Assumeutxo P4: dual chainstate + background IBD
+                             (:file "assumeutxo-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

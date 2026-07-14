@@ -423,20 +423,29 @@ arrived, forget the reconciliation state (Core net_processing.cpp:3879-3886)."
     (%forget-recon-state peer)))
 
 (defun local-services ()
-  "Our advertised service bits (Core g_local_services / peer.m_our_services):
-BIP 159 NODE_NETWORK_LIMITED instead of NODE_NETWORK when pruning, BIP 324
-NODE_P2P_V2 when the v2 transport is available, BIP 157 NODE_COMPACT_FILTERS
-when filter serving is enabled. Used in our version message and as the
-services field of our self-advertised address (Core MaybeSendAddr's
-CAddress{*local_service, peer.m_our_services, ...})."
-  (logior (if (bitcoin-lisp:pruning-enabled-p)
-              bitcoin-lisp.serialization:+node-network-limited+
-              bitcoin-lisp.serialization:+node-network+)
-          bitcoin-lisp.serialization:+node-witness+
-          (if (v2-available-p)
-              bitcoin-lisp.serialization:+node-p2p-v2+ 0)
-          (if bitcoin-lisp:*peer-block-filters*
-              bitcoin-lisp.serialization:+node-compact-filters+ 0)))
+  "Our advertised service bits (Core g_local_services / peer.m_our_services),
+used in our version message and as the services field of our self-advertised
+address (Core MaybeSendAddr's CAddress{*local_service, peer.m_our_services,
+...}). Mirrors Core's composition (init.cpp:863,1946-1953): the base is
+NODE_NETWORK_LIMITED | NODE_WITNESS; NODE_NETWORK is added only when we can
+actually serve ALL historical blocks — i.e. not pruning AND no assumeutxo
+historical chainstate exists (while a snapshot's background validation
+runs, blocks below the snapshot base are not yet locally available, so the
+node runs as NODE_NETWORK_LIMITED until it completes). BIP 324 adds
+NODE_P2P_V2 when the v2 transport is available; BIP 157 adds
+NODE_COMPACT_FILTERS when filter serving is enabled."
+  (let ((node bitcoin-lisp::*node*))
+    (logior bitcoin-lisp.serialization:+node-network-limited+
+            bitcoin-lisp.serialization:+node-witness+
+            (if (or (bitcoin-lisp:pruning-enabled-p)
+                    (and node (bitcoin-lisp::node-historical-chainstate node)))
+                0
+                bitcoin-lisp.serialization:+node-network+)
+            (if (v2-available-p)
+                bitcoin-lisp.serialization:+node-p2p-v2+ 0)
+            ;; BIP157: advertise filter serving when enabled.
+            (if bitcoin-lisp:*peer-block-filters*
+                bitcoin-lisp.serialization:+node-compact-filters+ 0))))
 
 (defun %version-addr-recv (peer)
   "The addr_recv (\"addr_you\") field for our version message to PEER: the

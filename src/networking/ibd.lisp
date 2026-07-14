@@ -150,7 +150,28 @@ block-hash-key-hash. Falls back to plain equalp off SBCL."
   ;; Threaded in at run-ibd entry like mempool; peers is refreshed
   ;; whenever run-ibd prunes disconnected entries.
   (peers nil :type list)
-  (address-book nil))
+  (address-book nil)
+  ;; --- Assumeutxo dual-cursor state (set at run-ibd entry) ---
+  ;; The historical chainstate re-deriving history toward the snapshot base
+  ;; (Core HistoricalChainstate), or NIL. When set, run-ibd also queues the
+  ;; [historical-tip .. base] range and routes received blocks at heights
+  ;; <= base to this chainstate (Core ProcessNewBlock runs ABC on both,
+  ;; validation.cpp:4463-4470).
+  (historical-chain-state nil)
+  ;; Block-index entry of the snapshot base (the historical chainstate's
+  ;; target). Height boundary for routing and the historical window.
+  (snapshot-base-entry nil)
+  ;; T while the CURRENT chainstate is an unvalidated snapshot chainstate:
+  ;; all block downloads are then restricted to peers whose best-known chain
+  ;; contains the base — no undo data exists below the base, so we cannot
+  ;; reorg across it (Core net_processing.cpp:1412-1421 for the tip range,
+  ;; TryDownloadingHistoricalBlocks:1458-1471 for the historical range).
+  (snapshot-unvalidated-p nil)
+  ;; Memo for the base-in-chain peer test, keyed by the peer's best-known
+  ;; block hash (the walk from a peer tip down to the base is O(tip-base);
+  ;; best-known hashes change rarely within a session). Recreated with the
+  ;; context, so it can never go stale across snapshot changes.
+  (base-in-chain-cache (make-block-hash-table) :type hash-table))
 
 (defparameter +recent-rate-window-seconds+ 60
   "Window for the recent-rate metric in IBD Progress logs. 60s gives a
@@ -283,6 +304,37 @@ skip-list ancestor index was reverted for a live regression (PR #71)."
       (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state bk)))
         (when entry
           (bitcoin-lisp.storage:block-index-entry-height entry))))))
+
+(defun peer-chain-contains-base-p (peer chain-state)
+  "T iff PEER's best-known chain contains the snapshot base block — i.e. the
+base entry is an ancestor of the peer's best-known block (Core
+`state->pindexBestKnownBlock->GetAncestor(base->nHeight) == base`,
+net_processing.cpp:1412-1421). NIL when we have no availability info for
+the peer yet (Core also refuses to download from such peers while the
+snapshot is unvalidated). Memoized per best-known hash on the IBD context."
+  (let ((ctx *ibd-context*))
+    (when ctx
+      (let ((base (ibd-context-snapshot-base-entry ctx))
+            (bk (peer-best-known-block-hash peer)))
+        (when (and base bk)
+          (let ((cache (ibd-context-base-in-chain-cache ctx)))
+            (multiple-value-bind (cached present) (gethash bk cache)
+              (if present
+                  cached
+                  (let* ((bk-entry (bitcoin-lisp.storage:get-block-index-entry
+                                    chain-state bk))
+                         (result
+                           (and bk-entry
+                                (eq base
+                                    (bitcoin-lisp.storage:entry-ancestor-at-height
+                                     bk-entry
+                                     (bitcoin-lisp.storage:block-index-entry-height base)))
+                                t)))
+                    ;; Bound the memo (best-known hashes churn slowly; 4096
+                    ;; is far beyond any realistic peer set).
+                    (when (> (hash-table-count cache) 4096)
+                      (clrhash cache))
+                    (setf (gethash bk cache) result))))))))))
 
 (defun peer-disclaimed-block-p (peer hash)
   "T if PEER has answered `notfound` for block HASH in the current
@@ -807,6 +859,33 @@ Walks the header chain and adds block hashes to the pending queue."
              (bitcoin-lisp.storage::chain-state-block-index chain-state))
     queued))
 
+(defun queue-historical-blocks (historical-chainstate)
+  "Queue the historical (background-validation) range for download:
+[historical tip + 1 .. snapshot base], following the target-ancestors path
+EXACTLY — no maphash over the index, so sibling forks below the base are
+never queued for the historical cursor (Core TryDownloadingHistoricalBlocks
+walks GetAncestor the same way, net_processing.cpp:1445-1472). Returns the
+number queued."
+  (unless *ibd-context*
+    (return-from queue-historical-blocks 0))
+  (let ((target-height (bitcoin-lisp.storage:chain-state-target-height
+                        historical-chainstate)))
+    (unless target-height
+      (return-from queue-historical-blocks 0))
+    (let ((pending (ibd-context-pending-blocks *ibd-context*))
+          (in-flight (ibd-context-in-flight *ibd-context*))
+          (queued 0))
+      (loop for h from (1+ (bitcoin-lisp.storage:current-height historical-chainstate))
+              to target-height
+            for entry = (bitcoin-lisp.storage:target-ancestor-entry
+                         historical-chainstate h)
+            while entry
+            do (let ((hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+                 (unless (or (gethash hash pending) (gethash hash in-flight))
+                   (setf (gethash hash pending) h)
+                   (incf queued))))
+      queued)))
+
 (defun get-next-blocks-to-request (n &optional tip-height)
   "Get up to N block hashes to request, sorted by height.
 
@@ -819,7 +898,15 @@ observed at h=1027 on May 7 where 53k blocks were dropped and the gap
 above the tip became permanent.
 
 If TIP-HEIGHT is NIL, the height filter is skipped (used by unit tests
-that don't construct a chain-state)."
+that don't construct a chain-state).
+
+Assumeutxo dual-cursor: when the context carries a historical chainstate,
+pending entries at heights <= the snapshot base belong to the historical
+range and get their own window anchored at the HISTORICAL tip; entries above
+the base use the current-chainstate window as before. Tip-range blocks sort
+before historical ones — Core fills download slots from
+FindNextBlocksToDownload first and tops up with
+TryDownloadingHistoricalBlocks (net_processing.cpp:6164-6199)."
   (unless *ibd-context*
     (return-from get-next-blocks-to-request nil))
 
@@ -836,24 +923,41 @@ that don't construct a chain-state)."
                                      (max 1 (ibd-context-avg-block-wire-bytes
                                              *ibd-context*))))))
          (max-request-height (when tip-height (+ tip-height window)))
+         (historical (ibd-context-historical-chain-state *ibd-context*))
+         (base-entry (ibd-context-snapshot-base-entry *ibd-context*))
+         (base-height (and historical base-entry
+                           (bitcoin-lisp.storage:block-index-entry-height base-entry)))
+         (historical-max (when base-height
+                           (min base-height
+                                (+ (bitcoin-lisp.storage:current-height historical)
+                                   window))))
          (pending (ibd-context-pending-blocks *ibd-context*))
          (in-flight (ibd-context-in-flight *ibd-context*))
-         (available '()))
-    ;; Collect blocks that are within the window AND not in-flight. Check
-    ;; the cheap height filter FIRST: during early IBD pending holds the
-    ;; whole chain (130k+ entries), almost all far ABOVE the window, so
-    ;; testing the window before the (equalp) in-flight gethash skips the
-    ;; hash for the vast majority. Profile (fresh testnet4 IBD h~5k-22k)
-    ;; showed the old order — gethash on every pending block per cycle — at
-    ;; ~35% of CPU (data-vector-hash on the 32-byte key).
+         (tip-range '())
+         (historical-range '()))
+    ;; Collect blocks that are within their range's window AND not
+    ;; in-flight, partitioned by range. Check the cheap height filter
+    ;; FIRST: during early IBD pending holds the whole chain (130k+
+    ;; entries), almost all far ABOVE the window, so testing the window
+    ;; before the (equalp) in-flight gethash skips the hash for the vast
+    ;; majority. Profile (fresh testnet4 IBD h~5k-22k) showed the old
+    ;; order — gethash on every pending block per cycle — at ~35% of CPU
+    ;; (data-vector-hash on the 32-byte key).
     (maphash (lambda (hash height)
-               (when (and (or (null max-request-height)
-                              (<= height max-request-height))
-                          (not (gethash hash in-flight)))
-                 (push (cons hash height) available)))
+               (let ((historical-p (and base-height (<= height base-height))))
+                 (when (and (if historical-p
+                                (<= height historical-max)
+                                (or (null max-request-height)
+                                    (<= height max-request-height)))
+                            (not (gethash hash in-flight)))
+                   (if historical-p
+                       (push (cons hash height) historical-range)
+                       (push (cons hash height) tip-range)))))
              pending)
-    ;; Sort by height and take first N
-    (let ((sorted (sort available #'< :key #'cdr)))
+    ;; Each range ascending by height; tip range first (Core fills
+    ;; FindNextBlocksToDownload slots before TryDownloadingHistoricalBlocks).
+    (let ((sorted (nconc (sort tip-range #'< :key #'cdr)
+                         (sort historical-range #'< :key #'cdr))))
       (mapcar #'car (subseq sorted 0 (min n (length sorted)))))))
 
 (defun note-block-wire-size (ctx wire-size)
@@ -1131,6 +1235,18 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
                             #'< :key (lambda (p)
                                        (let ((lat (peer-ping-latency p)))
                                          (if (plusp lat) lat most-positive-fixnum)))))
+         ;; While the snapshot chainstate is UNVALIDATED, request blocks only
+         ;; from peers whose best-known chain contains the snapshot base: no
+         ;; undo data exists below the base, so a chain that omits it can
+         ;; never be reorged to (Core net_processing.cpp:1412-1421), and only
+         ;; such peers can serve the historical range (1458-1471). Peers with
+         ;; no availability info yet are excluded too, as in Core.
+         (ready-peers (if (and (ibd-context-snapshot-unvalidated-p *ibd-context*)
+                               (ibd-context-snapshot-base-entry *ibd-context*))
+                          (remove-if-not
+                           (lambda (p) (peer-chain-contains-base-p p chain-state))
+                           ready-peers)
+                          ready-peers))
          ;; Calculate total budget across all peers. When the queue is at cap
          ;; and we're only allowed to request the gap block, clamp to 1.
          (raw-budget (loop for peer in ready-peers
@@ -1349,12 +1465,36 @@ handler. Shared by the block-download drain and the at-tip reap pass."
                  (write-sequence payload s))))))
        ;; Per-peer availability: receiving a block proves peer had it.
        (update-block-availability peer chain-state hash)
-       (mark-block-received hash)
-       (record-block-received-from-peer peer)
-       (process-received-block block chain-state utxo-set block-store
-                               :fee-estimator fee-estimator
-                               :recent-rejects recent-rejects
-                               :wire-size (length payload))))
+       ;; Assumeutxo routing (Core ProcessNewBlock runs ABC on the current
+       ;; AND the historical chainstate, validation.cpp:4430-4478): blocks
+       ;; at heights at or below the snapshot base belong to the historical
+       ;; chainstate's background validation; everything else extends the
+       ;; current chainstate. The two height ranges are disjoint, so one
+       ;; download pipeline serves both cursors. The height is read from
+       ;; the pending table (which stores it) BEFORE mark-block-received
+       ;; removes the entry — the index lookup is only the fallback for
+       ;; blocks that were never pending (tip relay).
+       (multiple-value-bind (route-cs route-view)
+           (let* ((hist (and ctx (ibd-context-historical-chain-state ctx)))
+                  (base (and hist (ibd-context-snapshot-base-entry ctx)))
+                  (height (and base
+                               (or (gethash hash (ibd-context-pending-blocks ctx))
+                                   (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                                                 chain-state hash)))
+                                     (and entry
+                                          (bitcoin-lisp.storage:block-index-entry-height
+                                           entry)))))))
+             (if (and height
+                      (<= height
+                          (bitcoin-lisp.storage:block-index-entry-height base)))
+                 (values hist (bitcoin-lisp.storage:chain-state-coins-view hist))
+                 (values chain-state utxo-set)))
+         (mark-block-received hash)
+         (record-block-received-from-peer peer)
+         (process-received-block block route-cs route-view block-store
+                                 :fee-estimator fee-estimator
+                                 :recent-rejects recent-rejects
+                                 :wire-size (length payload)))))
 
     ((string= command "headers")
      (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
@@ -1482,9 +1622,12 @@ disconnects it so replace-disconnected-peers can refill the slot."
   (handle-peer-fin peer))
 
 (defun start-ibd (peers chain-state utxo-set block-store target-height
-                   &key fee-estimator recent-rejects mempool address-book)
+                   &key fee-estimator recent-rejects mempool address-book
+                     historical-chainstate)
   "Start Initial Block Download.
-Returns the number of blocks downloaded."
+Returns the number of blocks downloaded. HISTORICAL-CHAINSTATE, when
+non-NIL, is the assumeutxo background-validation chainstate — run-ibd adds
+a second download cursor for its [tip .. snapshot-base] range."
   (setf *ibd-context* (make-ibd))
   (setf (ibd-context-target-height *ibd-context*) target-height)
   ;; Set adaptive timeout based on number of peers
@@ -1496,11 +1639,13 @@ Returns the number of blocks downloaded."
                 :fee-estimator fee-estimator
                 :recent-rejects recent-rejects
                 :mempool mempool
-                :address-book address-book)
+                :address-book address-book
+                :historical-chainstate historical-chainstate)
     (setf *ibd-context* nil)))
 
 (defun run-ibd (peers chain-state utxo-set block-store
-                &key fee-estimator recent-rejects mempool address-book)
+                &key fee-estimator recent-rejects mempool address-book
+                  historical-chainstate)
   "Main IBD loop."
   (let ((ctx *ibd-context*)
         (start-height (bitcoin-lisp.storage:current-height chain-state)))
@@ -1512,6 +1657,27 @@ Returns the number of blocks downloaded."
       (setf (ibd-context-mempool ctx) mempool
             (ibd-context-peers ctx) peers
             (ibd-context-address-book ctx) address-book))
+
+    ;; Assumeutxo dual-cursor setup: resolve the historical chainstate's
+    ;; target (the snapshot base) and whether the CURRENT chainstate is an
+    ;; unvalidated snapshot chainstate (which gates block downloads to
+    ;; base-in-chain peers). The base entry lives in the shared block index.
+    (when (and ctx historical-chainstate)
+      (let* ((target-hash (bitcoin-lisp.storage:chain-state-target-blockhash
+                           historical-chainstate))
+             (base-entry (and target-hash
+                              (bitcoin-lisp.storage:get-block-index-entry
+                               chain-state target-hash))))
+        (when base-entry
+          (setf (ibd-context-historical-chain-state ctx) historical-chainstate
+                (ibd-context-snapshot-base-entry ctx) base-entry
+                (ibd-context-snapshot-unvalidated-p ctx)
+                (and (bitcoin-lisp.storage:chain-state-from-snapshot-blockhash
+                      chain-state)
+                     (eq (bitcoin-lisp.storage:chain-state-assumeutxo-status
+                          chain-state)
+                         :unvalidated)
+                     t)))))
 
     ;; Initialize header-tip-height from existing chain state
     ;; This ensures we know about existing headers even if header sync fails
@@ -1537,6 +1703,18 @@ Returns the number of blocks downloaded."
       (setf (ibd-context-target-height ctx) header-tip)
       (queue-blocks-for-download chain-state (1+ start-height) header-tip))
 
+    ;; Assumeutxo: queue the historical range [historical tip .. base] along
+    ;; the exact target-ancestor path (second download cursor).
+    (let ((hist (ibd-context-historical-chain-state ctx)))
+      (when hist
+        (let ((queued (queue-historical-blocks hist)))
+          (when (plusp queued)
+            (bitcoin-lisp:log-info
+             "[snapshot] queued ~D historical block~:P for background validation (h=~D..~D)"
+             queued
+             (1+ (bitcoin-lisp.storage:current-height hist))
+             (bitcoin-lisp.storage:chain-state-target-height hist))))))
+
     ;; Initialize stuck-tip tracking — start the timer at IBD entry so the
     ;; first stall is detected even if no block ever connects.
     (setf (ibd-context-last-tip-advance-time ctx) (get-universal-time)
@@ -1552,10 +1730,18 @@ Returns the number of blocks downloaded."
       ;; entries are competing-fork blocks that don't move the active
       ;; chain forward. Without the header-tip exit, fork-block headers
       ;; auto-queued by process-headers can pin the loop forever (peers
-      ;; don't typically serve side-chain blocks).
+      ;; don't typically serve side-chain blocks). With a historical
+      ;; chainstate still short of the snapshot base, the loop also
+      ;; continues for the background cursor even once the tip cursor is
+      ;; caught up.
       (loop while (and (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
-                       (< (bitcoin-lisp.storage:current-height chain-state)
-                          (ibd-context-header-tip-height ctx)))
+                       (or (< (bitcoin-lisp.storage:current-height chain-state)
+                              (ibd-context-header-tip-height ctx))
+                           (let ((hist (ibd-context-historical-chain-state ctx)))
+                             (and hist
+                                  (< (bitcoin-lisp.storage:current-height hist)
+                                     (or (bitcoin-lisp.storage:chain-state-target-height hist)
+                                         0))))))
             do (progn
                  (when *ibd-stop-requested*
                    (return))
