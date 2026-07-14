@@ -56,7 +56,16 @@ needs, so the node can hold several in a list and select between them."
   ;; On-disk name suffix for this chainstate's files (Core
   ;; SNAPSHOT_CHAINSTATE_SUFFIX \"_snapshot\", node/utxo_snapshot.h:128).
   ;; Empty for the primary chainstate, so its file names are unchanged.
-  (storage-suffix "" :type string))
+  (storage-suffix "" :type string)
+  ;; Target-path index: simple-vector mapping height -> the target block's
+  ;; ancestor entry at that height (0..target-height), built by
+  ;; set-chainstate-target. This is our O(1) form of Core's
+  ;; target_block->GetAncestor(h) used by TryAddBlockIndexCandidate
+  ;; (validation.cpp:3764-3794) to keep a historical chainstate on the exact
+  ;; path to the snapshot base — without it an equal-work sibling fork could
+  ;; wedge the background sync. NIL when no target. Never persisted; rebuilt
+  ;; whenever the target is set (activation or startup detection).
+  (target-ancestors nil :type (or null simple-vector)))
 
 ;;; Chainstate selection (Core ChainstateManager, validation.h:1119-1145).
 ;;; The node holds a list of chain-states ordered like Core's m_chainstates
@@ -90,6 +99,79 @@ the current/historical chainstates has VALIDATED status)."
              (and cs (eq (chain-state-assumeutxo-status cs) :validated)))
            (list (select-current-chainstate chainstates)
                  (select-historical-chainstate chainstates))))
+
+;;; Target block (Core Chainstate::SetTargetBlock / TargetBlock,
+;;; validation.h:660-675). A chainstate with a target is \"historical\": it
+;;; only re-derives history along the exact ancestor path of the target (the
+;;; snapshot base) and stops there.
+
+(defun entry-ancestor-at-height (entry height)
+  "ENTRY's chain ancestor at HEIGHT (Core CBlockIndex::GetAncestor), or NIL
+when HEIGHT is above ENTRY's height or the prev-entry links don't reach it.
+Plain prev-entry walk — O(distance), no skip list."
+  (when (and entry (<= height (block-index-entry-height entry)))
+    (loop while (and entry (> (block-index-entry-height entry) height))
+          do (setf entry (block-index-entry-prev-entry entry)))
+    (when (and entry (= (block-index-entry-height entry) height))
+      entry)))
+
+(defun set-chainstate-target (chain-state target-entry)
+  "Retarget CHAIN-STATE at TARGET-ENTRY (Core SetTargetBlock): record the
+target blockhash and build the target-ancestors index (height -> entry along
+the target's ancestor path) that keeps a historical chainstate from ever
+connecting a block off that path. NIL TARGET-ENTRY clears the target."
+  (cond
+    ((null target-entry)
+     (setf (chain-state-target-blockhash chain-state) nil
+           (chain-state-target-ancestors chain-state) nil))
+    (t
+     (let* ((target-height (block-index-entry-height target-entry))
+            (ancestors (make-array (1+ target-height) :initial-element nil)))
+       (loop with entry = target-entry
+             while entry
+             do (setf (aref ancestors (block-index-entry-height entry)) entry)
+                (setf entry (block-index-entry-prev-entry entry)))
+       (setf (chain-state-target-blockhash chain-state)
+             (block-index-entry-hash target-entry)
+             (chain-state-target-ancestors chain-state) ancestors))))
+  target-entry)
+
+(defun target-ancestor-entry (chain-state height)
+  "The target block's ancestor entry at HEIGHT for a targeted (historical)
+CHAIN-STATE, or NIL when no target is set / HEIGHT is out of range. O(1) via
+the target-ancestors index."
+  (let ((ancestors (chain-state-target-ancestors chain-state)))
+    (when (and ancestors (< height (length ancestors)))
+      (aref ancestors height))))
+
+(defun entry-target-ancestor-p (chain-state entry)
+  "T iff ENTRY lies on the exact ancestor path of CHAIN-STATE's target block
+(Core target_block->GetAncestor(entry->nHeight) == entry). NIL when no
+target is set."
+  (and entry
+       (eq entry (target-ancestor-entry
+                  chain-state (block-index-entry-height entry)))))
+
+(defun chain-state-target-height (chain-state)
+  "Height of CHAIN-STATE's target block, or NIL when no target is set."
+  (let ((ancestors (chain-state-target-ancestors chain-state)))
+    (when ancestors (1- (length ancestors)))))
+
+(defun best-header-entry (chain-state)
+  "The most-work non-invalid header entry in the block index (Core
+m_best_header; recomputed by scan like Core RecalculateBestHeader,
+validation.cpp:6379-6388). O(index size) — fine for its callers
+(snapshot-activation preconditions, RPC), not for per-block paths."
+  (let ((best nil))
+    (maphash (lambda (hash entry)
+               (declare (ignore hash))
+               (when (and (not (eq (block-index-entry-status entry) :invalid))
+                          (or (null best)
+                              (> (block-index-entry-chain-work entry)
+                                 (block-index-entry-chain-work best))))
+                 (setf best entry)))
+             (chain-state-block-index chain-state))
+    best))
 
 ;;; Testnet genesis block hash (little-endian, as on wire)
 (defvar *testnet3-genesis-hash*
@@ -298,6 +380,91 @@ header index (headerindex.dat), block store, and undo storage are shared
 across chainstates and take no suffix."
   (merge-pathnames (format nil "chainstate~A/" (chain-state-storage-suffix state))
                    (chain-state-base-path state)))
+
+;;; Coins-view lifecycle over a chainstate's own LevelDB. Every chainstate
+;;; on a live node owns a coins-view-cache over the LevelDB at its
+;;; chainstate-leveldb-path; these pair up at startup/activation and
+;;; shutdown/activation-abort.
+
+(defun open-chainstate-coins-view (state)
+  "Open STATE's coins LevelDB (at its chainstate-leveldb-path) and install a
+coins-view-cache over it as the chainstate's coins view. Returns the view."
+  (setf (chain-state-coins-view state)
+        (make-coins-view-cache
+         (open-coins-view-db (namestring (chainstate-leveldb-path state))))))
+
+(defun close-chainstate-coins-view (state)
+  "Close STATE's coins LevelDB (releasing its lock) if the chainstate owns a
+DB-backed coins view; plain in-memory views are left alone. Clears the
+coins-view slot so a stale handle can never be reused. Never signals."
+  (let ((view (chain-state-coins-view state)))
+    (when (typep view 'coins-view-cache)
+      (let ((base (coins-view-cache-base view)))
+        (when base
+          (ignore-errors (close-coins-view-db base))))
+      (setf (chain-state-coins-view state) nil))))
+
+;;; Snapshot chainstate on-disk marker (Core node/utxo_snapshot.{h,cpp}).
+;;; The base_blockhash file inside chainstate_snapshot/ is the ONLY
+;;; persistent \"a snapshot chainstate exists\" marker: startup detects the
+;;; dir + marker and re-creates the dual-chainstate arrangement. Format is
+;;; Core's exactly — the raw 32-byte base block hash (wire order), nothing
+;;; else. LevelDB ignores foreign files in its directory, so co-locating the
+;;; marker with the coins DB (as Core does) is safe.
+
+(defparameter +snapshot-blockhash-filename+ "base_blockhash"
+  "Core SNAPSHOT_BLOCKHASH_FILENAME (node/utxo_snapshot.h:113).")
+
+(defun snapshot-base-blockhash-path (chainstate-dir)
+  "Path of the base_blockhash marker inside CHAINSTATE-DIR."
+  (merge-pathnames +snapshot-blockhash-filename+ chainstate-dir))
+
+(defun write-snapshot-base-blockhash (state)
+  "Write STATE's from-snapshot-blockhash marker into its coins LevelDB dir
+(Core WriteSnapshotBaseBlockhash). The dir must already exist (the coins DB
+open creates it). Returns T on success."
+  (let ((hash (chain-state-from-snapshot-blockhash state)))
+    (assert hash () "write-snapshot-base-blockhash: not a snapshot chainstate")
+    (with-open-file (out (snapshot-base-blockhash-path (chainstate-leveldb-path state))
+                         :direction :output :element-type '(unsigned-byte 8)
+                         :if-exists :supersede)
+      (write-sequence hash out))
+    t))
+
+(defun read-snapshot-base-blockhash (chainstate-dir)
+  "Read the 32-byte base block hash marker from CHAINSTATE-DIR (Core
+ReadSnapshotBaseBlockhash), or NIL when the marker is missing or short.
+Like Core, trailing data only warrants a warning (via the return-anyway)."
+  (let ((path (snapshot-base-blockhash-path chainstate-dir)))
+    (when (probe-file path)
+      (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+        (let ((hash (make-array 32 :element-type '(unsigned-byte 8))))
+          (when (= 32 (read-sequence hash in))
+            hash))))))
+
+(defun find-assumeutxo-chainstate-dir (data-dir)
+  "The snapshot chainstate LevelDB dir under DATA-DIR, if one exists (Core
+FindAssumeutxoChainstateDir): \"chainstate_snapshot/\"."
+  (let ((dir (merge-pathnames "chainstate_snapshot/" data-dir)))
+    (when (probe-file dir)
+      dir)))
+
+(defun delete-snapshot-chainstate-files (data-dir)
+  "Remove a snapshot chainstate's on-disk footprint under DATA-DIR: the
+chainstate_snapshot/ LevelDB dir (marker included) and the
+chainstate_snapshot.dat state file. Core's DeleteCoinsDBFromDisk +
+DeleteChainstate equivalent, used for activation-failure cleanup and
+-reindex-chainstate. Returns T if anything was removed."
+  (let ((removed nil)
+        (dir (merge-pathnames "chainstate_snapshot/" data-dir))
+        (dat (merge-pathnames "chainstate_snapshot.dat" data-dir)))
+    (when (probe-file dir)
+      (uiop:delete-directory-tree dir :validate t)
+      (setf removed t))
+    (when (probe-file dat)
+      (delete-file dat)
+      (setf removed t))
+    removed))
 
 ;;; Persistence format v3: adds in-transition flag (mirrors Bitcoin Core's
 ;;; DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).

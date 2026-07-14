@@ -1881,11 +1881,9 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
 (defun block-descends-from-p (entry ancestor-entry)
   "True if ANCESTOR-ENTRY lies on ENTRY's ancestry (ENTRY is ANCESTOR-ENTRY or a
 descendant of it)."
-  (let ((target-height (bitcoin-lisp.storage:block-index-entry-height ancestor-entry))
-        (cur entry))
-    (loop while (and cur (> (bitcoin-lisp.storage:block-index-entry-height cur) target-height))
-          do (setf cur (bitcoin-lisp.storage:block-index-entry-prev-entry cur)))
-    (and cur (eq cur ancestor-entry))))
+  (eq ancestor-entry
+      (bitcoin-lisp.storage:entry-ancestor-at-height
+       entry (bitcoin-lisp.storage:block-index-entry-height ancestor-entry))))
 
 (defun block-index-descendants (chain-state entry)
   "All block-index entries that descend from ENTRY, including ENTRY itself."
@@ -2021,6 +2019,19 @@ where the block is already the tip or weaker), (values nil reason) on failure."
 ;;;; particularly the disconnect/connect interaction before block
 ;;;; activation.
 
+(defun %maybe-note-target-reached (chain-state)
+  "Log once when a targeted (historical) chainstate's tip lands exactly on
+its target block — the assumeutxo background block download is complete
+(Core's ReachedTarget break in ActivateBestChain, validation.cpp:3437).
+Snapshot validation/promotion (Core MaybeValidateSnapshot) is a later
+assumeutxo phase; until then the chainstate simply stops here."
+  (let ((target (bitcoin-lisp.storage:chain-state-target-blockhash chain-state)))
+    (when (and target
+               (equalp (bitcoin-lisp.storage:best-block-hash chain-state) target))
+      (bitcoin-lisp:log-info
+       "[snapshot] historical chainstate reached the snapshot base (height ~D); background block download complete — snapshot validation/promotion is a later phase"
+       (bitcoin-lisp.storage:current-height chain-state)))))
+
 (defun activate-block (block chain-state block-store utxo-set
                        &key current-time skip-scripts tx-index fee-estimator
                             recent-rejects mempool)
@@ -2038,11 +2049,29 @@ where the block is already the tip or weaker), (values nil reason) on failure."
 Returns (VALUES T NIL) on activation,
         (VALUES NIL ERROR-KEYWORD) on validation failure or
         non-activation. The :weaker-chain return is informational —
-        the block was stored safely, just not made active."
+        the block was stored safely, just not made active.
+
+A targeted (historical) chainstate — one with a target-blockhash, i.e. an
+assumeutxo background-validation chainstate re-deriving history up to the
+snapshot base — only ever connects blocks on the exact ancestor path of its
+target (Core TryAddBlockIndexCandidate, validation.cpp:3764-3794). Anything
+off that path (a sibling fork, or any block past the target) is stored for
+the block store's benefit but never activated, so the historical chainstate
+can neither wedge on an equal-work sibling nor advance past the base."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
          (current-best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
          (now (or current-time (bitcoin-lisp.serialization:get-unix-time))))
+    ;; Historical-chainstate target filter. Runs before any dispatch so no
+    ;; branch (extend / pre-reorg) can move the chain off the target path.
+    (when (bitcoin-lisp.storage:chain-state-target-blockhash chain-state)
+      (let* ((hash (bitcoin-lisp.serialization:block-header-hash header))
+             (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+        (unless (and entry
+                     (bitcoin-lisp.storage:entry-target-ancestor-p chain-state entry))
+          (unless (block-witness-stripped-p block)
+            (bitcoin-lisp.storage:store-block block-store block))
+          (return-from activate-block (values nil :weaker-chain)))))
     (cond
       ;; Case 1: extends current tip — normal path.
       ((equalp prev-hash current-best-hash)
@@ -2057,6 +2086,7 @@ Returns (VALUES T NIL) on activation,
                                 :fee-estimator fee-estimator
                                 :recent-rejects recent-rejects
                                 :mempool mempool)
+                 (%maybe-note-target-reached chain-state)
                  (values t nil))
                (values nil error)))))
 
@@ -2129,6 +2159,7 @@ Returns (VALUES T NIL) on activation,
                                           :fee-estimator fee-estimator
                                           :recent-rejects recent-rejects
                                           :mempool mempool)
+                           (%maybe-note-target-reached chain-state)
                            (values t nil))
                          (progn
                            ;; The incoming block that justified this reorg (its
