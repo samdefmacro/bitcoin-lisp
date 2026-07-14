@@ -784,6 +784,8 @@
    #:txgraph-get-descendants-union
    #:txgraph-compare-main-order
    #:txgraph-count-distinct-clusters
+   #:txgraph-cluster-transaction-count
+   #:txgraph-rbf-diagrams
    #:txgraph-get-worst-main-chunk
    #:txgraph-trim
    #:txgraph-sanity-check

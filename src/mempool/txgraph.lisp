@@ -622,17 +622,128 @@ must not be oversized."
           "txgraph-compare-main-order: both transactions must exist")
   (%compare-main graph a b))
 
+(defun %distinct-clusters (graph handles)
+  "The distinct live clusters the transactions of HANDLES belong to, as a
+%CLUSTER -> T hash-table; removed handles are ignored. The shared core of the
+cluster-count / cluster-gather / RBF affected-set enumerations."
+  (let ((seen (make-hash-table :test 'eq)))
+    (dolist (h handles seen)
+      (%check-handle graph h)
+      (let ((cluster (tx-handle-cluster h)))
+        (when cluster (setf (gethash cluster seen) t))))))
+
 (defun txgraph-count-distinct-clusters (graph handles)
   "The number of distinct clusters the transactions of HANDLES belong to;
 removed handles are ignored (Core CountDistinctClusters,
 txgraph.cpp:2783-2808). The graph must not be oversized."
   (%assert-not-oversized graph 'txgraph-count-distinct-clusters)
-  (let ((seen (make-hash-table :test 'eq)))
-    (dolist (h handles)
-      (%check-handle graph h)
-      (let ((cluster (tx-handle-cluster h)))
-        (when cluster (setf (gethash cluster seen) t))))
-    (hash-table-count seen)))
+  (hash-table-count (%distinct-clusters graph handles)))
+
+(defun txgraph-cluster-transaction-count (graph handles)
+  "Total number of transactions across the DISTINCT clusters that HANDLES
+belong to (the size of what Core GatherClusters would return,
+txmempool.cpp:968-991, used for the RBF 500-tx gather cap); removed handles
+are ignored. The graph must not be oversized."
+  (%assert-not-oversized graph 'txgraph-cluster-transaction-count)
+  (let ((n 0))
+    (loop for c being the hash-keys of (%distinct-clusters graph handles)
+          do (incf n (depgraph-tx-count (%cluster-depgraph c))))
+    n))
+
+;;;; Diagram RBF staging (Core txgraph.cpp:2626-2834 staging overlay)
+;;;;
+;;;; Core keeps a copy-on-write "staging" level and derives the before/after
+;;;; feerate diagrams from it (StartStaging + ProcessDependencies +
+;;;; GetMainStagingDiagrams). We take the plan's scratch-copy simplification
+;;;; (docs/cluster-mempool-plan.md §4.9): the only clusters a replacement can
+;;;; touch are those of the transactions it evicts and those of the new
+;;;; candidate's in-mempool parents, so we copy exactly those clusters into a
+;;;; throwaway graph, apply the removal + addition there, and read the two
+;;;; diagrams off the live clusters (before) and the scratch clusters (after).
+;;;; This is exactly equivalent to Core's GetConflicts()/AppendChunkFeerates:
+;;;; GetConflicts returns the main clusters that contain a removed tx or that
+;;;; overlap a staging cluster, and a staging cluster only ever pulls in the
+;;;; candidate's parents' clusters (the candidate depends solely on its direct
+;;;; parents) plus removal-split remnants.
+
+(defun %cluster-reduced-edges (cluster)
+  "The transitive-reduction parent edges of CLUSTER as a list of
+\(parent-handle . child-handle) conses. Re-adding these to a fresh graph
+reconstructs CLUSTER's exact dependency closure."
+  (let ((dg (%cluster-depgraph cluster))
+        (mapping (%cluster-mapping cluster))
+        (edges '()))
+    (do-bits (i (depgraph-positions dg))
+      (do-bits (p (depgraph-reduced-parents dg i))
+        (push (cons (aref mapping p) (aref mapping i)) edges)))
+    edges))
+
+(defun %cluster-set-diagram (cluster-set)
+  "The feerate diagram of a set of clusters (CLUSTER-SET is a %CLUSTER -> T
+hash-table): every member cluster's chunk feerates gathered and sorted by
+DECREASING feerate (Core AppendChunkFeerates over a cluster set followed by the
+decreasing-feerate sort, txgraph.cpp:2818-2831)."
+  (let ((ffs '()))
+    (loop for c being the hash-keys of cluster-set
+          do (loop for chunk across (%cluster-chunks c)
+                   do (push (copy-feefrac (%chunk-feerate chunk)) ffs)))
+    (sort ffs #'feefrac>)))
+
+(defun txgraph-rbf-diagrams (graph removed-handles parent-handles new-fee new-size)
+  "Compute the mempool feerate diagrams before and after a candidate RBF
+replacement, without mutating GRAPH (Core ChangeSet::CalculateChunksForRBF ->
+GetMainStagingDiagrams, txmempool.cpp:994-1002, txgraph.cpp:2810-2834).
+
+REMOVED-HANDLES are the transactions the replacement evicts (the direct
+conflicts plus their descendants); PARENT-HANDLES are the candidate's
+in-mempool parents; NEW-FEE/NEW-SIZE describe the candidate (fee in satoshis,
+the prioritisation-modified fee; size in virtual bytes).
+
+Returns (values old-diagram new-diagram): each a list of FeeFracs sorted by
+DECREASING feerate — the chunk feerates whose concave cumulative curve is the
+diagram. Returns (values :uncalculable nil) when the staged replacement would
+form an over-limit cluster (Core CalculateChunksForRBF returning an Error via
+a failed CheckMemPoolPolicyLimits, txmempool.cpp:997-999). GRAPH must not be
+oversized."
+  (%assert-not-oversized graph 'txgraph-rbf-diagrams)
+  ;; The affected main clusters: those of the evicted txs (Core's (P,R)
+  ;; conflicts) and those of the candidate's parents (the only clusters a
+  ;; staging cluster can overlap, Core's (P,P) conflicts).
+  (let ((removed (make-hash-table :test 'eq))
+        (affected (%distinct-clusters graph (append removed-handles parent-handles)))
+        (scratch (make-txgraph :max-cluster-count (txgraph-max-cluster-count graph)
+                               :max-cluster-size (txgraph-max-cluster-size graph)))
+        (copy (make-hash-table :test 'eq)))   ; live handle -> scratch handle
+    (dolist (h removed-handles) (setf (gethash h removed) t))
+    ;; New diagram: rebuild the surviving transactions of the affected clusters
+    ;; plus the candidate in a scratch graph, preserving every dependency among
+    ;; survivors (all edges are intra-cluster) and wiring the candidate to its
+    ;; parents. Add all survivor nodes before any edges so both endpoints exist.
+    (loop for c being the hash-keys of affected
+          do (let ((dg (%cluster-depgraph c))
+                   (mapping (%cluster-mapping c)))
+               (do-bits (i (depgraph-positions dg))
+                 (let ((h (aref mapping i)))
+                   (unless (gethash h removed)
+                     (let ((ff (depgraph-tx-feerate dg i)))
+                       (setf (gethash h copy)
+                             (txgraph-add-transaction
+                              scratch (feefrac-fee ff) (feefrac-size ff)))))))))
+    (loop for c being the hash-keys of affected
+          do (dolist (edge (%cluster-reduced-edges c))
+               (let ((p (gethash (car edge) copy))
+                     (ch (gethash (cdr edge) copy)))
+                 (when (and p ch)
+                   (txgraph-add-dependency scratch p ch)))))
+    (let ((cand (txgraph-add-transaction scratch new-fee new-size)))
+      (dolist (ph parent-handles)
+        (let ((p (gethash ph copy)))
+          (when p (txgraph-add-dependency scratch p cand)))))
+    (if (txgraph-oversized-p scratch)
+        (values :uncalculable nil)
+        ;; Old diagram off the live clusters, new diagram off the scratch ones.
+        (values (%cluster-set-diagram affected)
+                (%cluster-set-diagram (txgraph-clusters scratch))))))
 
 ;;;; Chunk-index consumers: block builder and eviction
 

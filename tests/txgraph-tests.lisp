@@ -933,3 +933,109 @@ graph equivalent to the model."
             (dolist (h removed)
               (%tgm-rm model (gethash h idx-of))))
           (%tg-verify-model g model idx-of rng))))))
+
+;;;; Diagram RBF staging (txgraph-rbf-diagrams)
+;;;;
+;;;; Port of Bitcoin Core src/test/rbf_tests.cpp calc_feerate_diagram_rbf: a
+;;;; single candidate replacing various sets, asserting the exact before/after
+;;;; feerate diagrams the staging returns. Core measures size in adjusted
+;;;; weight; we (like the rest of our txgraph) measure it in vbytes — the
+;;;; comparison is scale-free, so we use plain sizes here.
+
+(defun %tg-diag (ffs)
+  "A diagram (list of feefracs) as a list of (fee . size) conses."
+  (mapcar (lambda (f) (cons (bitcoin-lisp.mempool:feefrac-fee f)
+                            (bitcoin-lisp.mempool:feefrac-size f)))
+          ffs))
+
+(defun %tg-rbf (g removed parents fee size)
+  (bitcoin-lisp.mempool:txgraph-rbf-diagrams g removed parents fee size))
+
+(test rbf-diagrams-replace-singleton
+  "Replacing a lone tx: old diagram is its chunk, new is the candidate's."
+  (let* ((g (%tg-new))
+         (low (%tg-add g 100 100)))     ; feerate 1
+    ;; Zero-fee replacement.
+    (multiple-value-bind (old new) (%tg-rbf g (list low) '() 0 100)
+      (is (equal '((100 . 100)) (%tg-diag old)))
+      (is (equal '((0 . 100)) (%tg-diag new)))
+      ;; Does not improve the diagram.
+      (is (not (eq :greater (bitcoin-lisp.mempool:compare-chunks new old)))))
+    ;; High-fee replacement strictly improves.
+    (multiple-value-bind (old new) (%tg-rbf g (list low) '() 10000 100)
+      (is (equal '((100 . 100)) (%tg-diag old)))
+      (is (equal '((10000 . 100)) (%tg-diag new)))
+      (is (eq :greater (bitcoin-lisp.mempool:compare-chunks new old))))
+    ;; The staging did not mutate the live graph.
+    (is-true (%tg-sane g))
+    (is (= 1 (%tg-count g)))))
+
+(test rbf-diagrams-replace-cpfp-cluster
+  "A low->high CPFP cluster is a single chunk; the diagrams reflect removing
+both members or only the child."
+  (let* ((g (%tg-new))
+         (low (%tg-add g 100 100))       ; parent, feerate 1
+         (high (%tg-add g 10000 100)))   ; child, feerate 100
+    (%tg-dep g low high)                 ; low -> high, one chunk (10100,200)
+    ;; Replace the whole cluster.
+    (multiple-value-bind (old new) (%tg-rbf g (list low high) '() 10000 100)
+      (is (equal '((10100 . 200)) (%tg-diag old)))
+      (is (equal '((10000 . 100)) (%tg-diag new))))
+    ;; Replace only the CPFP child: the parent survives as its own chunk, so
+    ;; the new diagram has two entries (Core replace_cpfp_child).
+    (multiple-value-bind (old new) (%tg-rbf g (list high) '() 10000 100)
+      (is (equal '((10100 . 200)) (%tg-diag old)))
+      (is (equal '((10000 . 100) (100 . 100)) (%tg-diag new))))
+    (is-true (%tg-sane g))
+    (is (= 2 (%tg-count g)))))
+
+(test rbf-diagrams-multiple-clusters
+  "Conflicting with several independent clusters gathers all their chunks
+into the old diagram; the single candidate is the whole new diagram."
+  (let* ((g (%tg-new))
+         (c1 (%tg-add g 100 100))
+         (c2 (%tg-add g 200 100))
+         (c3 (%tg-add g 300 100)))
+    (multiple-value-bind (old new) (%tg-rbf g (list c1 c2 c3) '() 10000 100)
+      (is (= 3 (length old)))
+      (is (= 1 (length new)))
+      ;; Old chunks are sorted by decreasing feerate.
+      (is (equal '((300 . 100) (200 . 100) (100 . 100)) (%tg-diag old)))
+      (is (equal '((10000 . 100)) (%tg-diag new))))
+    (is-true (%tg-sane g))))
+
+(test rbf-diagrams-candidate-merges-parents
+  "The candidate's in-mempool parents' clusters are pulled into staging and
+merged through it (new diagram is one chunk over parents + candidate)."
+  (let* ((g (%tg-new))
+         (p1 (%tg-add g 500 100))
+         (p2 (%tg-add g 500 100))
+         (victim (%tg-add g 100 100)))   ; the tx being replaced
+    ;; Candidate spends p1 and p2 and conflicts with VICTIM.
+    (multiple-value-bind (old new) (%tg-rbf g (list victim) (list p1 p2) 9000 100)
+      ;; Old gathers the three touched clusters' chunks.
+      (is (= 3 (length old)))
+      ;; New: p1, p2 and the candidate merge into a single cluster. Since the
+      ;; candidate's feerate dominates, they form one chunk.
+      (is (equal '((10000 . 300)) (%tg-diag new))))
+    (is-true (%tg-sane g))))
+
+(test rbf-diagrams-uncalculable-when-oversized
+  "When the staged replacement would exceed the cluster limits the diagram is
+uncalculable (Core CalculateChunksForRBF returning an Error)."
+  ;; A candidate merging two parents into a 3-tx cluster with a 2-tx cap.
+  (let* ((g (%tg-new :max-cluster-count 2))
+         (p1 (%tg-add g 500 100))
+         (p2 (%tg-add g 500 100)))
+    (multiple-value-bind (old new) (%tg-rbf g '() (list p1 p2) 9000 100)
+      (is (eq :uncalculable old))
+      (is (null new)))
+    (is-false (%tg-oversized g))         ; live graph untouched
+    (is-true (%tg-sane g)))
+  ;; A candidate whose own size exceeds the size limit.
+  (let* ((g (%tg-new :max-cluster-size 1000))
+         (low (%tg-add g 100 100)))
+    (multiple-value-bind (old new) (%tg-rbf g (list low) '() 5000 5000)
+      (is (eq :uncalculable old))
+      (is (null new)))
+    (is-true (%tg-sane g))))

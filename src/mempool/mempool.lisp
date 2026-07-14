@@ -685,15 +685,25 @@ behind."
   "An input signals opt-in RBF when its nSequence is <= this value.")
 
 (defparameter +max-rbf-replacement-candidates+ 100
-  "BIP125 rule 5: a replacement may evict at most this many transactions.")
+  "Cluster-mempool rule 5: a replacement may conflict directly with at most
+this many distinct CLUSTERS (Core MAX_REPLACEMENT_CANDIDATES, policy/rbf.h:26;
+rbf.cpp:58-83 counts clusters, not transactions, since cluster mempool). The
+old BIP125 meaning — at most 100 replaced transactions — is gone.")
+
+(defparameter +max-rbf-gather-transactions+ 500
+  "Cluster-mempool rule 5, second bound: the clusters a replacement conflicts
+with may hold at most this many transactions in total (Core's GatherClusters
+gather cap, txmempool.cpp:988-990), bounding the diagram-staging work.")
 
 (defparameter +incremental-relay-fee-rate+ 100
   "Incremental relay fee in satoshis per kvB for BIP125 rule 4 (Bitcoin Core
 DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB = 0.1 sat/vB).")
 
 (defvar *mempool-full-rbf* nil
-  "When true, treat every mempool tx as replaceable regardless of signaling
-(Bitcoin Core -mempoolfullrbf). When nil, enforce BIP125 opt-in signaling.")
+  "Retained for RPC display only (Core's IsRBFOptIn survives solely to report
+whether a tx signals BIP125 opt-in, rbf.cpp:24-56; getmempoolinfo.fullrbf).
+The acceptance path is full-RBF UNCONDITIONALLY — signaling is not consulted
+(validation.cpp:490), so this flag no longer gates replacement.")
 
 (defun tx-signals-rbf-p (tx)
   "True if TX opts in to replacement (any input nSequence <= 0xfffffffd)."
@@ -729,73 +739,96 @@ outpoint). Generalizes mempool-check-conflict, which returns only the first."
           (setf (gethash sp seen) t)
           (push sp result))))))
 
+(defun %rbf-entry-handles (mempool txids)
+  "The live txgraph handles of the mempool entries named by TXIDS (a list or
+a hash-set's keys), skipping any that are absent or handle-less."
+  (let ((handles '()))
+    (flet ((collect (txid)
+             (let ((e (mempool-get mempool txid)))
+               (when (and e (mempool-entry-graph-handle e))
+                 (push (mempool-entry-graph-handle e) handles)))))
+      (if (hash-table-p txids)
+          (maphash (lambda (k v) (declare (ignore v)) (collect k)) txids)
+          (dolist (k txids) (collect k))))
+    handles))
+
 (defun check-rbf-rules (mempool tx new-fee new-vsize direct-conflicts)
-  "Apply the BIP125 replacement rules for TX (paying NEW-FEE — the
+  "Apply the cluster-mempool replacement rules for TX (paying NEW-FEE — the
 prioritisation-MODIFIED fee, like the replaced entries' fees below — over
-NEW-VSIZE)
-against DIRECT-CONFLICTS (a list of directly-conflicting mempool txids).
-Returns (values ok-p reason replaced-set), where REPLACED-SET is a hash-set of
-all txids that would be evicted (the conflicts plus their descendants)."
-  ;; Build the full set to be replaced: each conflict and all its descendants.
-  (let ((replaced (make-hash-table :test 'equalp))
+NEW-VSIZE) against DIRECT-CONFLICTS (a list of directly-conflicting mempool
+txids). Returns (values ok-p reason replaced-set), where REPLACED-SET is a
+hash-set of all txids that would be evicted (the conflicts plus their
+descendants).
+
+Full-RBF is UNCONDITIONAL: BIP125 rules 1 (signaling) and 2 (no new
+unconfirmed inputs) are gone from node policy (Core validation.cpp:490;
+rules 1/2 are wallet/RPC-only now). Rules 3 and 4 survive; rule 5 is redefined
+in terms of clusters; and the old feerate-superiority test
+(PaysMoreThanConflicts) is replaced by the feerate-diagram improvement check
+(Core ReplacementChecks, validation.cpp:981-1032)."
+  (let ((graph (mempool-graph mempool))
+        (replaced (make-hash-table :test 'equalp))
         (orig-fees 0))
+    ;; Build the full set to be replaced: each conflict and all its descendants
+    ;; (Core GetEntriesForConflicts -> CalculateDescendants).
     (dolist (ctxid direct-conflicts)
       (setf (gethash ctxid replaced) t)
       (maphash (lambda (d v) (declare (ignore v)) (setf (gethash d replaced) t))
                (mempool-descendants mempool ctxid)))
-    ;; Rule 5: bounded number of replacements.
-    (when (> (hash-table-count replaced) +max-rbf-replacement-candidates+)
-      (return-from check-rbf-rules (values nil :too-many-replacements nil)))
+    ;; Rule 5 (redefined for cluster mempool, Core rbf.cpp:58-83 +
+    ;; txmempool.cpp:988-990): reject a replacement that conflicts directly with
+    ;; more than 100 distinct CLUSTERS, or whose conflicting clusters together
+    ;; hold more than 500 transactions (the GatherClusters gather cap that
+    ;; bounds the diagram-staging work below).
+    (let ((conflict-handles (%rbf-entry-handles mempool direct-conflicts)))
+      (when (> (txgraph-count-distinct-clusters graph conflict-handles)
+               +max-rbf-replacement-candidates+)
+        (return-from check-rbf-rules (values nil :too-many-clusters nil)))
+      (when (> (txgraph-cluster-transaction-count graph conflict-handles)
+               +max-rbf-gather-transactions+)
+        (return-from check-rbf-rules (values nil :too-many-replacements nil))))
     ;; A replacement must not spend an output of any tx it replaces (Core
-    ;; EntriesAndTxidsDisjoint) — that would leave a dangling input after the
-    ;; replaced set is evicted.
+    ;; EntriesAndTxidsDisjoint, rbf.cpp:85-98) — that would leave a dangling
+    ;; input after the replaced set is evicted. (This is NOT old rule 2, which
+    ;; is gone; it only forbids depending on the very txs being removed.)
     (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
       (when (gethash (bitcoin-lisp.serialization:outpoint-hash
                       (bitcoin-lisp.serialization:tx-in-previous-output in))
                      replaced)
-        (return-from check-rbf-rules (values nil :replacement-adds-unconfirmed nil))))
-    ;; Rule 1: every directly-conflicting tx must be replaceable (signaling,
-    ;; directly or via an ancestor) — unless full-RBF is enabled.
-    (unless *mempool-full-rbf*
-      (dolist (ctxid direct-conflicts)
-        (unless (mempool-tx-or-ancestor-signals-rbf-p mempool ctxid)
-          (return-from check-rbf-rules (values nil :txn-mempool-conflict nil)))))
-    ;; Rule 2: the replacement may only spend an unconfirmed output if that exact
-    ;; outpoint was already spent by one of the original transactions.
-    (let ((orig-inputs (make-hash-table :test 'equalp)))
-      (dolist (ctxid direct-conflicts)
-        (let ((ce (mempool-get mempool ctxid)))
-          (when ce
-            (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs
-                         (mempool-entry-transaction ce)))
-              (let ((p (bitcoin-lisp.serialization:tx-in-previous-output in)))
-                (setf (gethash (make-outpoint-key
-                                (bitcoin-lisp.serialization:outpoint-hash p)
-                                (bitcoin-lisp.serialization:outpoint-index p))
-                               orig-inputs)
-                      t))))))
-      (bitcoin-lisp.serialization:dovector (in (bitcoin-lisp.serialization:transaction-inputs tx))
-        (let* ((p (bitcoin-lisp.serialization:tx-in-previous-output in))
-               (ptxid (bitcoin-lisp.serialization:outpoint-hash p)))
-          (when (and (mempool-has mempool ptxid)
-                     (not (gethash (make-outpoint-key
-                                    ptxid (bitcoin-lisp.serialization:outpoint-index p))
-                                   orig-inputs)))
-            (return-from check-rbf-rules
-              (values nil :replacement-adds-unconfirmed nil))))))
+        (return-from check-rbf-rules (values nil :spends-conflicting-tx nil))))
     ;; Sum the fees of everything being replaced.
     (maphash (lambda (txid v) (declare (ignore v))
                (let ((e (mempool-get mempool txid)))
                  (when e (incf orig-fees (mempool-entry-modified-fee e)))))
              replaced)
-    ;; Rule 3: pay at least the total fee of the replaced transactions.
+    ;; Rule 3 (Core PaysForRBF, rbf.cpp:106-112): pay at least the total fee of
+    ;; the replaced transactions.
     (when (< new-fee orig-fees)
       (return-from check-rbf-rules (values nil :insufficient-fee nil)))
-    ;; Rule 4: pay for the replacement's own bandwidth on top, at the
-    ;; incremental relay fee rate (0.1 sat/vB), not the 1 sat/vB relay floor.
+    ;; Rule 4 (Core PaysForRBF, rbf.cpp:114-123): pay for the replacement's own
+    ;; bandwidth on top, at the incremental relay fee rate (0.1 sat/vB), not the
+    ;; 1 sat/vB relay floor.
     (when (< (- new-fee orig-fees)
              (ceiling (* new-vsize +incremental-relay-fee-rate+) 1000))
       (return-from check-rbf-rules (values nil :insufficient-fee nil)))
+    ;; Economic test (Core ImprovesFeerateDiagram, rbf.cpp:127-140): the
+    ;; replacement must STRICTLY improve the mempool's feerate diagram. Stage
+    ;; the removal of the replaced set and the addition of the candidate in a
+    ;; scratch copy of the affected clusters, compute the before/after diagrams,
+    ;; and require is_gt(CompareChunks(new, old)).
+    (let ((removed-handles (%rbf-entry-handles mempool replaced))
+          (parent-handles (%rbf-entry-handles
+                           mempool (mempool-find-parents mempool tx))))
+      (multiple-value-bind (old-diagram new-diagram)
+          (txgraph-rbf-diagrams graph removed-handles parent-handles
+                                new-fee new-vsize)
+        (when (eq old-diagram :uncalculable)
+          ;; The staged replacement would form an over-limit cluster (Core
+          ;; CheckMemPoolPolicyLimits failing before the diagram, "too-large-
+          ;; cluster", validation.cpp:1020-1022).
+          (return-from check-rbf-rules (values nil :too-large-cluster nil)))
+        (unless (eq (compare-chunks new-diagram old-diagram) :greater)
+          (return-from check-rbf-rules (values nil :replacement-failed nil)))))
     (values t nil replaced)))
 
 ;;;; Persistence (Bitcoin Core mempool.dat — node/mempool_persist.cpp)
