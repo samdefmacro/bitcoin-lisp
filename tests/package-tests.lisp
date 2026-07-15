@@ -512,3 +512,124 @@ TRUC error surfaces unchanged."
       (is (not (bitcoin-lisp.mempool:mempool-has mempool sibid)))
       (is (bitcoin-lisp.mempool:mempool-has mempool richid))
       (is (bitcoin-lisp.mempool:mempool-has mempool pid)))))
+
+;;;; Wave 7: sigop-cost recording + 16k standardness cap + package finality
+
+(defun %bare-multisig-spk ()
+  "A standard bare 1-of-3 multisig scriptPubKey. CHECKMULTISIG counts 20
+legacy (inaccurate) sigops, so each such OUTPUT adds 20*4 = 80 weighted
+sigop cost to the transaction that CREATES it (Core GetLegacySigOpCount
+covers the tx's own outputs)."
+  (let ((spk (make-array 105 :element-type '(unsigned-byte 8))))
+    (setf (aref spk 0) #x51)            ; OP_1
+    (loop for k below 3
+          for base = (+ 1 (* k 34))
+          do (setf (aref spk base) 33)  ; push 33 bytes
+             (fill spk #x02 :start (1+ base) :end (+ base 34)))
+    (setf (aref spk 103) #x53)          ; OP_3
+    (setf (aref spk 104) #xae)          ; OP_CHECKMULTISIG
+    spk))
+
+(defun %multisig-outputs-tx (funding n-multisig change)
+  "A tx spending the FUNDING P2SH(OP_TRUE) coin into N-MULTISIG bare 1-of-3
+multisig outputs of 1000 sat each, plus a CHANGE P2SH(OP_TRUE) output."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash funding :index 0)
+                    :script-sig (%p2sh-optrue-scriptsig)
+                    :sequence #xffffffff))
+   :outputs (coerce
+             (append (loop repeat n-multisig
+                           collect (bitcoin-lisp.serialization:make-tx-out
+                                    :value 1000
+                                    :script-pubkey (%bare-multisig-spk)))
+                     (list (bitcoin-lisp.serialization:make-tx-out
+                            :value change :script-pubkey (%p2sh-optrue-spk))))
+             'simple-vector)
+   :lock-time 0))
+
+(test mempool-acceptance-records-sigop-cost
+  "The weighted sigop cost computed during validation is returned (5th value)
+and recorded on the mempool entry — the value the block assembler's sigop
+budget consumes (Core PreChecks -> StageAddition sigops_cost,
+validation.cpp:908,935). 5 bare 1-of-3 multisig outputs = 5 * 20 * 4 = 400."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((tx (%multisig-outputs-tx funding 5 99900000))
+           (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+      (multiple-value-bind (valid err fee replaced sigops)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           tx utxo-set mempool 200 :chain-state chain-state)
+        (declare (ignore err))
+        (is-true valid)
+        (is (= 400 sigops))
+        (is (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
+                     mempool txid tx fee 200
+                     :sigops sigops :replaced replaced))))
+      (is (= 400 (bitcoin-lisp.mempool:mempool-entry-sigops
+                  (bitcoin-lisp.mempool:mempool-get mempool txid)))))))
+
+(test standardness-sigop-cap-is-16000
+  "MAX_STANDARD_TX_SIGOPS_COST is MAX_BLOCK_SIGOPS_COST/5 = 16,000 (Core
+policy.h:43), not the 80,000 block budget: 201 bare multisig outputs
+(16,080 cost) are rejected, 200 (exactly 16,000 — Core rejects on >) pass."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (multiple-value-bind (valid err)
+        (bitcoin-lisp.validation:validate-transaction-for-mempool
+         (%multisig-outputs-tx funding 201 99000000)
+         utxo-set mempool 200 :chain-state chain-state)
+      (is-false valid)
+      (is (eq :too-many-sigops err)))
+    (multiple-value-bind (valid err fee replaced sigops)
+        (bitcoin-lisp.validation:validate-transaction-for-mempool
+         (%multisig-outputs-tx funding 200 99000000)
+         utxo-set mempool 200 :chain-state chain-state)
+      (declare (ignore err fee replaced))
+      (is-true valid)
+      (is (= 16000 sigops)))))
+
+(test package-member-nonfinal-rejected
+  "A submitpackage member with an unmet nLockTime is rejected — Core's
+PreChecks runs CheckFinalTxAtTip for package members like any other tx
+(validation.cpp:819); previously the package path skipped finality entirely
+and a timelocked tx could sit in the mempool and get mined. The zero-fee
+parent forces the CPFP package-feerate path."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((parent (%pkg-tx funding 0 100000000))     ; zero fee -> deferred
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (child (bitcoin-lisp.serialization:make-transaction
+                   :version 2
+                   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                      :hash pid :index 0)
+                                    :script-sig (%p2sh-optrue-scriptsig)
+                                    :sequence 0))   ; non-final sequence: locktime enforced
+                   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                     :value 99900000
+                                     :script-pubkey (%p2sh-optrue-spk)))
+                   :lock-time 500)))                  ; height 500 > next block 201
+      (multiple-value-bind (msg results)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state)
+        (is (eq :non-final msg))
+        (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status
+                          (%result-for results child)))))
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool pid))))))
+
+(test package-member-bip68-nonfinal-rejected
+  "A submitpackage member whose BIP68 relative lock cannot be satisfied is
+rejected. The child's 5-block height lock is on an UNCONFIRMED parent, which
+Core assumes confirms in the next block (prevheight = tip+1,
+validation.cpp:185-192) — so any nonzero relative lock on it is non-final."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((parent (%pkg-tx funding 0 100000000))     ; zero fee -> deferred
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (child (%pkg-tx pid 0 99900000 :sequence 5)))   ; 5-block relative lock
+      (multiple-value-bind (msg results)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state)
+        (is (eq :non-bip68-final msg))
+        (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status
+                          (%result-for results child)))))
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool pid))))))

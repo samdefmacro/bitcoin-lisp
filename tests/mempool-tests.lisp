@@ -912,7 +912,9 @@ bound low here; the graph's limits are fixed at make-mempool time.)"
     (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))))
 
 (test mempool-chained-spend-coins
-  "mempool-extra-coins resolves an input spending an unconfirmed parent output."
+  "mempool-extra-coins resolves an input spending an unconfirmed parent output,
+recording it at the spend height (tip+1) — Core treats every mempool prevout
+as confirming in the next block for BIP68 (validation.cpp:185-192)."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (utxo (bitcoin-lisp.storage:make-utxo-set))
          (a (make-mempool-test-tx :input-id 93))
@@ -920,9 +922,11 @@ bound low here; the graph's limits are fixed at make-mempool time.)"
          (b (%mp-spending-tx atxid)))
     (%add-tx mempool a)
     (multiple-value-bind (coins ok)
-        (bitcoin-lisp.validation::mempool-extra-coins b utxo mempool)
+        (bitcoin-lisp.validation::mempool-extra-coins b utxo mempool 201)
       (is-true ok)
-      (is (not (null (gethash (cons atxid 0) coins)))))))
+      (let ((coin (gethash (cons atxid 0) coins)))
+        (is (not (null coin)))
+        (is (= 201 (bitcoin-lisp.storage:utxo-entry-height coin)))))))
 
 (test mempool-eviction-removes-descendants
   "Evicting a low-fee parent also removes its in-mempool child (no orphan):

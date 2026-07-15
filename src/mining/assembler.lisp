@@ -212,7 +212,25 @@ adjustment would bite)."
          ;; Median-time-past: the locktime cutoff for tx finality (Core
          ;; m_lock_time_cutoff, miner.cpp:150) and, +1, the header floor.
          (mtp (bitcoin-lisp.validation:compute-median-time-past chain-state prev-hash))
-         (mintime (1+ mtp))
+         ;; Header time floor (Core GetMinimumTime, miner.cpp:36-47): MTP+1,
+         ;; raised at retarget heights to the previous block's ACTUAL time
+         ;; minus MAX_TIMEWARP — the BIP94 timewarp rule, applied on ALL
+         ;; networks ("makes future activation safer"); testnet4 already
+         ;; enforces it in consensus, so a template without the clamp can be
+         ;; a block everyone rejects. Divergence: Core's clamp fires at
+         ;; height % DifficultyAdjustmentInterval == 0 per network; ours uses
+         ;; the fixed 2016, which matches every network except regtest
+         ;; (Core: 144), where BIP94 is off and the extra floor is moot.
+         (mintime (let ((mtp-floor (1+ mtp)))
+                    (if (and tip
+                             (zerop (mod height
+                                         bitcoin-lisp.storage:+difficulty-adjustment-interval+)))
+                        (max mtp-floor
+                             (- (bitcoin-lisp.serialization:block-header-timestamp
+                                 (bitcoin-lisp.storage:block-index-entry-header tip))
+                                bitcoin-lisp.validation:+max-timewarp+))
+                        mtp-floor)))
+         ;; Core UpdateTime (miner.cpp:49-57): nTime = max(mintime, now).
          (curtime (max now mintime))
          (bits (if tip
                    (next-block-required-bits chain-state tip curtime)

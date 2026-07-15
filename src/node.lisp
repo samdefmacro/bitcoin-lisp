@@ -532,15 +532,20 @@ NIL if the file is missing or corrupt."
                     (height (bitcoin-lisp.storage:current-height chain-state)))
                 (unless (zerop delta)
                   (bitcoin-lisp.mempool:mempool-prioritise mempool txid delta))
-                (multiple-value-bind (valid error fee replaced)
+                ;; CHAIN-STATE gates the finality/BIP68 checks — a saved tx
+                ;; that is no longer minable in the next block must not
+                ;; reload (Core LoadMempool goes through the full
+                ;; AcceptToMemoryPool, node/mempool_persist.cpp:105).
+                (multiple-value-bind (valid error fee replaced sigops)
                     (bitcoin-lisp.validation:validate-transaction-for-mempool
-                     tx utxo-set mempool height)
+                     tx utxo-set mempool height :chain-state chain-state)
                   (declare (ignore error))
                   (cond
                     (valid
                      (if (eq :ok (bitcoin-lisp.mempool:accept-validated-tx
                                   mempool txid tx fee height
-                                  :entry-time entry-time :replaced replaced))
+                                  :entry-time entry-time :sigops sigops
+                                  :replaced replaced))
                          (incf accepted)
                          (incf failed)))
                     (t (incf failed)))))))

@@ -963,7 +963,7 @@ anything to the mempool. Each tx is checked independently against current state
                (chain-state (rpc-get-chain-state node))
                (current-height (bitcoin-lisp.storage:current-height chain-state)))
           ;; Validate transaction for mempool
-          (multiple-value-bind (valid error fee replaced)
+          (multiple-value-bind (valid error fee replaced sigops)
               (bitcoin-lisp.validation:validate-transaction-for-mempool
                tx utxo-set mempool current-height :chain-state chain-state)
             (unless valid
@@ -971,7 +971,7 @@ anything to the mempool. Each tx is checked independently against current state
                                 :message (format nil "Transaction rejected: ~A" error)))
             (let ((add-result (bitcoin-lisp.mempool:accept-validated-tx
                                mempool txid tx fee current-height
-                               :replaced replaced)))
+                               :sigops sigops :replaced replaced)))
               (unless (eq add-result :ok)
                 (error 'rpc-error :code +rpc-transaction-rejected+
                                   :message (format nil "Mempool rejection: ~A" add-result)))
@@ -2570,11 +2570,20 @@ template outright."
 (defun rpc-getblocktemplate (node params)
   "Return a block template assembled from the mempool (Bitcoin Core
 getblocktemplate). The optional template-request object is accepted but only its
-implicit default mode is supported (no longpoll / proposal). Fields mirror Core."
+implicit default mode is supported (no longpoll / proposal). Fields mirror Core.
+The template is assembled as a full block around a dummy OP_TRUE coinbase (Core's
+scriptDummy) and dry-run through TestBlockValidity (Core CreateNewBlock,
+node/miner.cpp:227-231) — an invalid template errors here instead of reaching a
+miner."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
          (mempool (rpc-get-mempool node))
-         (template (bitcoin-lisp.mining:assemble-block-template chain-state mempool))
+         (template (nth-value 1 (bitcoin-lisp.mining:assemble-full-block
+                                 chain-state mempool
+                                 :coinbase-script-pubkey
+                                 (make-array 1 :element-type '(unsigned-byte 8)
+                                               :initial-element #x51) ; OP_TRUE
+                                 :utxo-set (rpc-get-utxo-set node))))
          (bits (bitcoin-lisp.mining:block-template-bits template)))
     `(("capabilities" . ("proposal"))
       ("version" . ,(bitcoin-lisp.mining:block-template-version template))
@@ -2714,7 +2723,9 @@ by generatetoaddress and generatetodescriptor."
         (hashes '()))
     (dotimes (i nblocks (nreverse hashes))
       (let ((block (bitcoin-lisp.mining:assemble-full-block
-                    chain-state mempool :coinbase-script-pubkey script-pubkey)))
+                    chain-state mempool :coinbase-script-pubkey script-pubkey
+                    ;; TestBlockValidity before mining (Core CreateNewBlock).
+                    :utxo-set (rpc-get-utxo-set node))))
         (unless (bitcoin-lisp.mining:mine-block block :max-tries maxtries)
           (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
         (multiple-value-bind (ok reason) (%activate-submitted-block node block)
@@ -2815,10 +2826,11 @@ zero and whose remaining transactions are TXS (Core GenerateCoinbaseCommitment).
 generateblock; CPU mining, intended for regtest). PARAMS: (output [tx,...]
 [submit]). OUTPUT is an address or descriptor for the coinbase, which is paid the
 block subsidy only (Core builds the template with use_mempool=false). Each tx is a
-64-hex mempool txid or a raw-tx hex. When SUBMIT (default true) the block is
-activated through the normal consensus path and {hash} is returned; otherwise it
-is returned as {hash, hex} WITHOUT validation (our validation is coupled to
-activation)."
+64-hex mempool txid or a raw-tx hex. The assembled block is dry-run through
+TestBlockValidity BEFORE mining, exactly like Core (rpc/mining.cpp:389-393) —
+so submit=false hex is consensus-valid too, not just decodable. When SUBMIT
+(default true) the block is then activated through the normal consensus path
+and {hash} is returned; otherwise {hash, hex}."
   (let ((output (first params))
         (txs-arg (second params))
         (submit (if (>= (length params) 3) (and (third params) t) t))
@@ -2852,14 +2864,25 @@ activation)."
                     :nonce 0))
            (block (bitcoin-lisp.serialization:make-bitcoin-block
                    :header header :transactions all-txs)))
+      ;; TestBlockValidity before mining (Core rpc/mining.cpp:389-393): a
+      ;; consensus-invalid tx list errors instead of producing a doomed block.
+      (multiple-value-bind (ok reason)
+          (bitcoin-lisp.validation:test-block-validity
+           block chain-state (rpc-get-utxo-set node))
+        (unless ok
+          (error 'rpc-error :code +rpc-verify-error+
+                            :message (format nil "TestBlockValidity failed: ~A" reason))))
       (unless (bitcoin-lisp.mining:mine-block block)
         (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
       (let ((hash-hex (hash-to-hex (bitcoin-lisp.serialization:block-header-hash header))))
         (if submit
             (multiple-value-bind (ok reason) (%activate-submitted-block node block)
               (unless (or ok (eq reason :weaker-chain))
+                ;; Validity was already dry-run above; a failure here is the
+                ;; activation itself (Core "ProcessNewBlock, block not
+                ;; accepted", rpc/mining.cpp:158).
                 (error 'rpc-error :code +rpc-verify-error+
-                                  :message (format nil "TestBlockValidity failed: ~A" reason)))
+                                  :message (format nil "Block not accepted: ~A" reason)))
               `(("hash" . ,hash-hex)))
             `(("hash" . ,hash-hex)
               ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex

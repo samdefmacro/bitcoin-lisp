@@ -475,14 +475,17 @@ Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4129-4136)."
              +max-timewarp+))))
 
 (defun validate-block-header (header chain-state current-time
-                               &key prev-hash height prev-entry)
+                               &key prev-hash height prev-entry skip-pow)
   "Validate a block header.
 PREV-HASH is the hash of the previous block (for MTP calculation).
 HEIGHT and PREV-ENTRY are optional; when provided, difficulty adjustment is validated.
+SKIP-POW skips only the hash<=target check (Core's fCheckPOW=false), for
+dry-running an unmined block template (TEST-BLOCK-VALIDITY); the contextual
+checks — timestamp, timewarp, version, difficulty BITS — still run.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 
   ;; Check proof of work
-  (unless (check-proof-of-work header)
+  (unless (or skip-pow (check-proof-of-work header))
     (return-from validate-block-header
       (values nil :bad-proof-of-work)))
 
@@ -1041,7 +1044,7 @@ set (tx_verify.cpp). Legacy sigops are always counted."
 ;;;; Full block validation
 
 (defun validate-block (block chain-state utxo-set current-height current-time
-                        &key skip-scripts skip-header)
+                        &key skip-scripts skip-header skip-pow)
   "Fully validate a block including all transactions.
 When SKIP-SCRIPTS is true, script validation is skipped (used during IBD for
 blocks below the last checkpoint, matching Bitcoin Core behavior).
@@ -1051,6 +1054,10 @@ header admission (process-headers), exactly as Bitcoin Core's ConnectBlock does
 not re-check the header. Used by perform-reorg, whose fork blocks are already in
 the index with validated headers (and whose deserialized copies carry no cached
 hash, so a redundant PoW recompute would spuriously fail).
+When SKIP-POW is true, only the PoW hash<=target check (and, on signet, the
+block-solution check — Core gates both on fCheckPOW) is skipped, while every
+contextual header check still runs: the TEST-BLOCK-VALIDITY dry-run of an
+unmined template (Core TestBlockValidity's check_pow=false).
 Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (transactions (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
@@ -1063,7 +1070,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                                    :prev-hash prev-hash
                                    :height current-height
                                    :prev-entry (bitcoin-lisp.storage:get-block-index-entry
-                                                chain-state prev-hash))
+                                                chain-state prev-hash)
+                                   :skip-pow skip-pow)
           (unless valid
             (return-from validate-block (values nil error nil))))))
 
@@ -1088,9 +1096,10 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
     ;; signature over the block by the network's challenge key. Without it,
     ;; :signet would follow any low-difficulty chain. Runs regardless of
     ;; SKIP-HEADER (it is a block-level check, never done at header admission,
-    ;; so reorg-connected fork blocks must still be checked). Core CheckBlock:
+    ;; so reorg-connected fork blocks must still be checked) but not under
+    ;; SKIP-POW — an unmined template has no solution yet. Core CheckBlock:
     ;;   if (signet_blocks && fCheckPOW && !CheckSignetBlockSolution(...)) reject.
-    (when (eq bitcoin-lisp:*network* :signet)
+    (when (and (eq bitcoin-lisp:*network* :signet) (not skip-pow))
       (unless (check-signet-block-solution block)
         (return-from validate-block (values nil :bad-signet-solution nil))))
 
@@ -1271,6 +1280,35 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
       ;; Return total-fees as Satoshi type
       (values t nil total-fees))))
+
+(defun test-block-validity (block chain-state utxo-set
+                            &key (current-time
+                                  (bitcoin-lisp.serialization:get-unix-time)))
+  "Dry-run BLOCK's full validation against CHAIN-STATE's current tip without
+mutating any state — Bitcoin Core's TestBlockValidity (validation.cpp:4495),
+which every created block template runs through (node/miner.cpp:227-231) so
+a template the network would reject is never handed to a miner. BLOCK must
+extend the tip. Runs the complete VALIDATE-BLOCK battery — contextual header
+checks (difficulty bits, timestamps, BIP94 timewarp), merkle root, block
+weight, the sigops budget, scripts, finality, BIP68 sequence locks, witness
+commitment, BIP34 height, coinbase value — with only the PoW hash<=target
+(and signet solution) skipped, since the template is unmined (Core's
+check_pow=false). VALIDATE-BLOCK only reads the UTXO set (intra-block spends
+ride in its pending table), so no scratch coins view is needed; nothing is
+connected, stored, or indexed. Divergence from Core: Core also skips the
+merkle-root check because its template coinbase is a dummy; our callers
+validate the fully assembled block, so the root is checked too.
+Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
+  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header)))
+    (unless (equalp prev-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+      (return-from test-block-validity
+        (values nil :inconclusive-not-best-prevblk)))
+    (multiple-value-bind (valid error)
+        (validate-block block chain-state utxo-set
+                        (1+ (bitcoin-lisp.storage:current-height chain-state))
+                        current-time :skip-pow t)
+      (values (and valid t) error))))
 
 ;;;; Helper functions
 
@@ -1610,7 +1648,7 @@ Returns the common ancestor block-index-entry."
              (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
     (nreverse entries)))
 
-(defun readd-disconnected-txs-to-mempool (mempool txs utxo-set height)
+(defun readd-disconnected-txs-to-mempool (mempool txs utxo-set height chain-state)
   "Re-add TXS from reorg-disconnected blocks into the mempool, best-effort —
 a port of Bitcoin Core's MaybeUpdateMempoolForReorg (validation.cpp:294-389).
 
@@ -1618,10 +1656,14 @@ TXS is earliest-confirmed first (Core iterates the disconnectpool in
 reverse), so parents re-enter before their children. Each tx is re-validated
 against the post-reorg chain state with BYPASS-LIMITS (fee floor and TRUC
 topology skipped — it was already confirmed — while the RBF economics and
-the per-cluster limits stay on, exactly Core's bypass_limits scope). A tx
-that fails re-acceptance drags down any pool transactions spending its
-outputs, which are now orphans (Core removeRecursive on the not-re-accepted
-origin, validation.cpp:317-321).
+the per-cluster limits stay on, exactly Core's bypass_limits scope).
+CHAIN-STATE — already at the NEW tip — keeps the finality/BIP68 checks on:
+Core's bypass_limits does NOT skip CheckFinalTxAtTip /
+CheckSequenceLocksAtTip (validation.cpp:819,886-889), so a disconnected tx
+whose timelock the shorter chain no longer satisfies is dropped, not
+re-pooled and re-mined. A tx that fails re-acceptance drags down any pool
+transactions spending its outputs, which are now orphans (Core
+removeRecursive on the not-re-accepted origin, validation.cpp:317-321).
 
 Acceptance assumes a new entry has no in-mempool children — false for a
 previously-confirmed tx whose outputs pre-existing pool entries spend — so
@@ -1634,14 +1676,15 @@ trim re-limits the pool (Core LimitMempoolSize, validation.cpp:387)."
       (dolist (tx txs)
         (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
           (handler-case
-              (multiple-value-bind (valid error fee replaced)
+              (multiple-value-bind (valid error fee replaced sigops)
                   (validate-transaction-for-mempool tx utxo-set mempool height
-                                                    :bypass-limits t)
+                                                    :bypass-limits t
+                                                    :chain-state chain-state)
                 (declare (ignore error))
                 (when valid
                   (bitcoin-lisp.mempool:accept-validated-tx
                    mempool txid tx fee height
-                   :replaced replaced :defer-trim t)))
+                   :sigops sigops :replaced replaced :defer-trim t)))
             (error () nil))
           ;; Presence decides the outcome (Core: else if m_mempool->exists,
           ;; validation.cpp:322): a tx that is in the pool now — re-accepted,
@@ -1896,7 +1939,7 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
           ;; new chain are dropped by re-validation.
           (readd-disconnected-txs-to-mempool
            mempool (loop for txs in disconnected-block-txs append txs)
-           utxo-set new-height)
+           utxo-set new-height chain-state)
 
           (bitcoin-lisp:log-info "REORG complete: disconnected ~D, connected ~D blocks"
                                  (length to-disconnect) (length to-connect))

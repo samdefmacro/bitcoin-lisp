@@ -947,6 +947,7 @@
    ;; Block validation
    #:validate-block-header
    #:validate-block
+   #:test-block-validity
    #:validate-block-scripts
    #:find-witness-commitment
    #:validate-witness-commitment
@@ -974,6 +975,7 @@
    #:get-bip65-activation-height
    #:get-csv-activation-height
    #:+max-future-block-time+
+   #:+max-timewarp+
    #:get-taproot-activation-height
    #:initialize-undo-storage
    #:delete-undo-file
