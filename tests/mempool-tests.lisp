@@ -1560,36 +1560,131 @@ uses the legacy form regardless."
   (make-array 32 :element-type '(unsigned-byte 8) :initial-element n))
 
 (test orphan-add-depend-remove
-  "Orphans are indexed by parent txid; remove clears the index."
+  "Orphans are indexed under each input's parent txid; remove clears the
+index. The pool is wtxid-keyed (Core TxOrphanage) — for this witnessless tx
+wtxid == txid."
   (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
          (parent (%txid-array 50))
          (o (%mp-spending-tx parent))
-         (otxid (bitcoin-lisp.serialization:transaction-hash o)))
+         (owtxid (bitcoin-lisp.serialization:transaction-wtxid o)))
     (is-true (bitcoin-lisp.mempool:orphan-add pool o nil))
     (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))
-    (is (member otxid (bitcoin-lisp.mempool:orphans-depending-on pool parent) :test #'equalp))
-    (is (bitcoin-lisp.mempool:orphan-remove pool otxid))
+    (is (member owtxid (bitcoin-lisp.mempool:orphans-depending-on pool parent) :test #'equalp))
+    (is-true (bitcoin-lisp.mempool:orphan-have pool owtxid))
+    (is (bitcoin-lisp.mempool:orphan-remove pool owtxid))
     (is (= 0 (bitcoin-lisp.mempool:orphan-pool-count pool)))
     (is (null (bitcoin-lisp.mempool:orphans-depending-on pool parent)))))
 
-(test orphan-expiry
-  "orphan-expire drops entries older than the expiry window."
+(test orphan-multiple-announcers
+  "One orphan can carry several announcers (Core AddTx/AddAnnouncer): a
+second peer's announcement doesn't duplicate the orphan, erase-for-peer
+removes only that peer's announcement, and the orphan disappears with its
+LAST announcer (Core EraseForPeer)."
   (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
-         (o (%mp-spending-tx (%txid-array 51))))
-    (bitcoin-lisp.mempool:orphan-add pool o nil)
+         (peer-a (list :a))
+         (peer-b (list :b))
+         (o (%mp-spending-tx (%txid-array 52)))
+         (owtxid (bitcoin-lisp.serialization:transaction-wtxid o)))
+    ;; First announcement stores the orphan; the second only adds an announcer.
+    (is-true (bitcoin-lisp.mempool:orphan-add pool o peer-a))
+    (is-false (bitcoin-lisp.mempool:orphan-add pool o peer-b))
+    ;; Duplicate (wtxid, peer) announcement is a no-op.
+    (is-false (bitcoin-lisp.mempool:orphan-add pool o peer-a))
     (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))
-    (is (= 1 (bitcoin-lisp.mempool:orphan-expire
-              pool (+ (bitcoin-lisp.serialization:get-unix-time)
-                      bitcoin-lisp.mempool::+orphan-expire-seconds+ 1))))
+    (is (= 2 (bitcoin-lisp.mempool::orphan-pool-announcement-count pool)))
+    (is-true (bitcoin-lisp.mempool:orphan-have-from-peer pool owtxid peer-a))
+    (is-true (bitcoin-lisp.mempool:orphan-have-from-peer pool owtxid peer-b))
+    ;; peer-a disconnects: the orphan survives via peer-b.
+    (is (= 1 (bitcoin-lisp.mempool:orphan-erase-for-peer pool peer-a)))
+    (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))
+    (is-false (bitcoin-lisp.mempool:orphan-have-from-peer pool owtxid peer-a))
+    ;; Last announcer goes: so does the orphan.
+    (is (= 1 (bitcoin-lisp.mempool:orphan-erase-for-peer pool peer-b)))
     (is (= 0 (bitcoin-lisp.mempool:orphan-pool-count pool)))))
 
-(test orphan-cap
-  "The orphan pool is bounded by +max-orphan-transactions+."
-  (let ((pool (bitcoin-lisp.mempool:make-orphan-pool)))
-    (dotimes (i 110)
-      (bitcoin-lisp.mempool:orphan-add pool (%mp-spending-tx (%txid-array i)) nil))
-    (is (<= (bitcoin-lisp.mempool:orphan-pool-count pool)
-            bitcoin-lisp.mempool::+max-orphan-transactions+))))
+(test orphan-oversized-rejected
+  "Orphans above max standard tx weight are never stored (Core AddTx's
+MAX_STANDARD_TX_WEIGHT check — the send-big-orphans memory-exhaustion
+attack)."
+  (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
+         (big (bitcoin-lisp.serialization:make-transaction
+               :version 1
+               :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                  :hash (%txid-array 53) :index 0)
+                                :script-sig (make-array 110000
+                                                        :element-type '(unsigned-byte 8)
+                                                        :initial-element 0)
+                                :sequence #xFFFFFFFF))
+               :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                 :value 1000
+                                 :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
+                                                              :initial-element #x51)))
+               :lock-time 0)))
+    (is (> (bitcoin-lisp.serialization:transaction-weight big)
+           bitcoin-lisp.mempool::+orphan-max-tx-weight+))
+    (is-false (bitcoin-lisp.mempool:orphan-add pool big nil))
+    (is (= 0 (bitcoin-lisp.mempool:orphan-pool-count pool)))))
+
+(test orphan-eviction-is-per-peer-fair
+  "A single peer flooding the orphanage cannot evict another peer's orphans
+(Core LimitOrphans: eviction targets the peer with the highest DoS score,
+so a peer within its own reservation is never trimmed while a flooder
+exceeds its allowance). The pool ends within its global limits and only
+the flooder lost announcements."
+  (let ((pool (bitcoin-lisp.mempool:make-orphan-pool))
+        (victim (list :victim))
+        (attacker (list :attacker)))
+    ;; The victim announces one modest orphan.
+    (let ((vic-tx (%mp-spending-tx (%txid-array 200))))
+      (is-true (bitcoin-lisp.mempool:orphan-add pool vic-tx victim))
+      ;; The attacker floods well past every per-peer allowance. Announcement
+      ;; latency score is 1 each (single-input txs), so the global latency
+      ;; budget (3000) is the binding limit with two peers.
+      (dotimes (i 3500)
+        (bitcoin-lisp.mempool:orphan-add
+         pool
+         (%mp-spending-tx (%txid-array (mod i 250)) :vout i)
+         attacker))
+      ;; Global limits are enforced...
+      (is (<= (bitcoin-lisp.mempool:orphan-total-latency-score pool)
+              bitcoin-lisp.mempool:+max-orphanage-latency-score+))
+      (is (<= (bitcoin-lisp.mempool:orphan-total-usage pool)
+              (* 2 bitcoin-lisp.mempool:+reserved-orphan-weight-per-peer+)))
+      ;; ...the attacker lost announcements to the trim...
+      (is (< (bitcoin-lisp.mempool:orphan-announcements-from-peer pool attacker)
+             3500))
+      ;; ...and the victim's orphan is untouched.
+      (is-true (bitcoin-lisp.mempool:orphan-have-from-peer
+                pool
+                (bitcoin-lisp.serialization:transaction-wtxid vic-tx)
+                victim)))))
+
+(test orphan-erase-for-block
+  "Orphans included in or conflicting with a connected block are erased by
+EXACT spent outpoint (Core EraseForBlock): an orphan spending a different
+output of the same parent tx survives."
+  (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
+         (parent (%txid-array 70))
+         (conflicted (%mp-spending-tx parent :vout 0))
+         (unrelated (%mp-spending-tx parent :vout 1))
+         (block-tx (%mp-spending-tx parent :vout 0 :value 123456))
+         (block (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header (bitcoin-lisp.serialization:make-block-header
+                          :version 1
+                          :prev-block (%txid-array 0)
+                          :merkle-root (%txid-array 0)
+                          :timestamp 1700000000 :bits #x1d00ffff :nonce 0)
+                 :transactions (list block-tx))))
+    (bitcoin-lisp.mempool:orphan-add pool conflicted (list :p))
+    (bitcoin-lisp.mempool:orphan-add pool unrelated (list :p))
+    (is (= 2 (bitcoin-lisp.mempool:orphan-pool-count pool)))
+    ;; block-tx spends parent:0 — conflicts with CONFLICTED only.
+    (is (= 1 (bitcoin-lisp.mempool:orphan-erase-for-block pool block)))
+    (is-false (bitcoin-lisp.mempool:orphan-have
+               pool (bitcoin-lisp.serialization:transaction-wtxid conflicted)))
+    (is-true (bitcoin-lisp.mempool:orphan-have
+              pool (bitcoin-lisp.serialization:transaction-wtxid unrelated)))))
 
 (test orphan-erase-for-peer
   "orphan-erase-for-peer drops only the given peer's orphans."

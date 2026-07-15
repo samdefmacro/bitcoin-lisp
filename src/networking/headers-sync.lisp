@@ -402,15 +402,22 @@ The 144-block buffer lets us accept headers that fork just below our tip."
 
 (defun maybe-start-presync (headers chain-state full-batch-p)
   "Decide whether a received header batch should be diverted into low-work
-presync instead of stored directly. Returns a fresh headers-sync-state when the
-batch connects to our index, is a full batch (so the peer may have much more),
-and its claimed total work is below the anti-DoS threshold; otherwise NIL and
-the caller stores the batch normally. Mirrors the gate in ProcessHeadersMessage/
-TryLowWorkHeadersSync."
+presync instead of stored directly. Returns (VALUES sync low-work-p): SYNC is
+a fresh headers-sync-state when the batch connects to our index, is a full
+batch (so the peer may have much more), is PoW-valid, and its claimed total
+work is below the anti-DoS threshold. LOW-WORK-P is T whenever the batch
+connects but claims sub-threshold work — even when no sync starts: Core
+IGNORES such batches entirely rather than storing them (TryLowWorkHeadersSync
+\"Ignoring low-work chain\" for a sub-batch chain; a PoW-invalid batch is
+dropped by CheckHeadersPoW before ever being stored), so callers must not
+fall back to a normal store when LOW-WORK-P is set. Mirrors the gate in
+ProcessHeadersMessage/TryLowWorkHeadersSync (net_processing.cpp:2767-2811)."
   (let ((chain-start (bitcoin-lisp.storage:get-block-index-entry
                       chain-state
                       (bitcoin-lisp.serialization:block-header-prev-block (first headers)))))
-    (when (and chain-start full-batch-p (headers-pow-valid-p headers))
+    (when chain-start
       (let ((min-work (anti-dos-work-threshold chain-state)))
         (when (< (claimed-headers-work chain-start headers) min-work)
-          (make-headers-sync chain-start min-work))))))
+          (values (when (and full-batch-p (headers-pow-valid-p headers))
+                    (make-headers-sync chain-start min-work))
+                  t))))))
