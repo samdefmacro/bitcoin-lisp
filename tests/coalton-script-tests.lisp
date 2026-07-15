@@ -708,7 +708,10 @@ x-only pubkey isolate it: a 5-byte n fails with SE-NumberOverflow."
     (is-false (bitcoin-lisp.coalton.interop:is-compressed-pubkey-p pubkey))))
 
 (test validate-witness-program-empty-witness
-  "Witness program validation fails with empty witness."
+  "Witness program validation fails with empty witness. For a v0 20-byte
+program Core reports WITNESS_PROGRAM_MISMATCH — the stack-size-2 check fires,
+not the empty-stack check (interpreter.cpp:1938-1940); WITNESS_EMPTY is the
+32-byte P2WSH error (interpreter.cpp:1926-1928)."
   (let* ((keyhash (make-array 20 :element-type '(unsigned-byte 8) :initial-element #xab))
          (script (make-p2wpkh-script keyhash))
          (witness nil)  ; Empty witness
@@ -716,7 +719,16 @@ x-only pubkey isolate it: a 5-byte n fails with SE-NumberOverflow."
     (multiple-value-bind (success err)
         (bitcoin-lisp.coalton.interop:validate-witness-program script witness amount nil)
       (is-false success)
-      (is (eq err :witness-program-witness-empty)))))
+      (is (eq err :witness-program-mismatch)))
+    ;; P2WSH (32-byte program) with empty witness: WITNESS_PROGRAM_WITNESS_EMPTY
+    (let ((p2wsh (concatenate '(vector (unsigned-byte 8))
+                              (vector #x00 #x20)
+                              (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element #xcd))))
+      (multiple-value-bind (success err)
+          (bitcoin-lisp.coalton.interop:validate-witness-program p2wsh nil amount nil)
+        (is-false success)
+        (is (eq err :witness-program-witness-empty))))))
 
 (test validate-witness-program-malleated
   "Native witness program fails if scriptSig is non-empty."
@@ -732,14 +744,15 @@ x-only pubkey isolate it: a 5-byte n fails with SE-NumberOverflow."
       (is (eq err :witness-malleated)))))
 
 (test validate-p2wpkh-wrong-witness-count
-  "P2WPKH fails with wrong number of witness elements."
+  "P2WPKH fails with wrong number of witness elements. Core reports
+WITNESS_PROGRAM_MISMATCH for stack size != 2 (interpreter.cpp:1938-1940)."
   (let* ((program (make-array 20 :element-type '(unsigned-byte 8) :initial-element #xab))
          (witness (list (make-array 10 :element-type '(unsigned-byte 8))))  ; Only 1 element
          (amount 100000))
     (multiple-value-bind (success err)
         (bitcoin-lisp.coalton.interop:validate-p2wpkh witness program amount)
       (is-false success)
-      (is (eq err :witness-program-witness-empty)))))
+      (is (eq err :witness-program-mismatch)))))
 
 (test validate-p2wsh-empty-witness
   "P2WSH fails with empty witness."

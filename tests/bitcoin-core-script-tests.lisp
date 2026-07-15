@@ -403,10 +403,11 @@
                 (let* ((redeem-script (extract-p2sh-redeem-script sig-bytes)))
                   (when (and redeem-script
                              (bitcoin-lisp.coalton.interop:is-witness-program-p redeem-script))
-                    ;; Validate the wrapped witness program
+                    ;; Validate the wrapped witness program (is-p2sh = T:
+                    ;; Core passes is_p2sh=true, disabling Taproot/P2A branches)
                     (multiple-value-bind (success err)
                         (bitcoin-lisp.coalton.interop:validate-witness-program
-                         redeem-script witness-stack input-amount nil)
+                         redeem-script witness-stack input-amount nil t)
                       (if success
                           (return-from run-script-test (values t nil))
                           (return-from run-script-test (values nil err)))))))
