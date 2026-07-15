@@ -1621,6 +1621,32 @@ disconnects it so replace-disconnected-peers can refill the slot."
         (handler-case (disconnect-peer peer) (error () nil)))))
   (handle-peer-fin peer))
 
+(defun pump-peer-messages (peers chain-state utxo-set block-store
+                           &key mempool address-book fee-estimator
+                                recent-rejects)
+  "Drain every peer's currently-readable messages once, with the FULL node
+context — the steady-state receive pump. Called ~1x/second from the sync
+thread's between-cycles wait: without it the node had a ~30s window per
+cycle where no thread read peer sockets, so pings, invs, headers
+announcements and — worst — getdata for txs we had just announced sat
+unanswered until the next sync cycle (Core has no such window: each peer's
+ProcessMessages/SendMessages runs continuously). Returns the pump's
+ibd-context so the caller can inspect counters (e.g. headers-received > 0
+means a new block was announced and a sync cycle should start now)."
+  (let ((ctx (make-ibd)))
+    (setf (ibd-context-mempool ctx) mempool
+          (ibd-context-peers ctx) peers
+          (ibd-context-address-book ctx) address-book)
+    ;; process-received-block and the block-activation path read the ambient
+    ;; *ibd-context*; bind it to the pump's context for the drain (thread-
+    ;; local, so concurrent RPC readers are unaffected).
+    (let ((*ibd-context* ctx))
+      (dolist (peer peers)
+        (drain-and-reap-peer peer chain-state utxo-set block-store ctx
+                             :fee-estimator fee-estimator
+                             :recent-rejects recent-rejects)))
+    ctx))
+
 (defun start-ibd (peers chain-state utxo-set block-store target-height
                    &key fee-estimator recent-rejects mempool address-book
                      historical-chainstate)
@@ -1691,7 +1717,11 @@ a second download cursor for its [tip .. snapshot-base] range."
 
     ;; Phase 1: Download headers
     (set-ibd-state :syncing-headers)
-    (sync-headers-with-failover peers chain-state ctx :recent-rejects recent-rejects)
+    (sync-headers-with-failover peers chain-state ctx
+                                :recent-rejects recent-rejects
+                                :utxo-set utxo-set
+                                :block-store block-store
+                                :fee-estimator fee-estimator)
 
     ;; Phase 2: Download and validate blocks
     (set-ibd-state :syncing-blocks)
@@ -1964,15 +1994,28 @@ Three cases:
              (values nil (< (length headers)
                             bitcoin-lisp.serialization:+max-headers-count+))))))))
 
-(defun sync-headers (peer chain-state &key recent-rejects)
+(defun sync-headers (peer chain-state &key recent-rejects ctx utxo-set
+                                           block-store fee-estimator)
   "Download all headers from PEER. Returns (values received-count stalled-p);
 STALLED-P is true when the peer went silent (a getheaders went unanswered),
-the signal run-ibd uses to rotate to another header-sync peer."
+the signal run-ibd uses to rotate to another header-sync peer.
+
+CTX (the ibd-context) plus UTXO-SET/BLOCK-STORE/FEE-ESTIMATOR give the
+interleaved-message drains below the full node context. They used to pass
+NIL for everything but chain-state/recent-rejects, so any message a peer
+sent during header sync hit handle-message with no mempool or block-store:
+a getdata for a tx WE had announced was answered notfound — advertising txs
+and then failing to serve them, which also broke the unbroadcast-set
+propagation signal (its removal fires on getdata serve). Core has no such
+window: ProcessMessages always runs with the full node state."
   (let ((received-count 0)
         (done nil)
         (timed-out nil)
         (requests-sent 0)
         (max-requests 100)
+        (mempool (and ctx (ibd-context-mempool ctx)))
+        (peers (and ctx (ibd-context-peers ctx)))
+        (address-book (and ctx (ibd-context-address-book ctx)))
         ;; Non-NIL while a low-work presync/redownload is in progress with this
         ;; peer (anti-DoS: we store nothing until the chain's work is proven).
         (hss nil))
@@ -1983,7 +2026,12 @@ the signal run-ibd uses to rotate to another header-sync peer."
                (when command
                  (bitcoin-lisp:log-cat "net" "Pre-sync: received ~A" command)
                  (handler-case
-                     (handle-message peer command payload chain-state nil nil
+                     (handle-message peer command payload chain-state
+                                     utxo-set block-store
+                                     :mempool mempool
+                                     :peers peers
+                                     :address-book address-book
+                                     :fee-estimator fee-estimator
                                      :recent-rejects recent-rejects)
                    (error () nil)))
                (unless command (return))))
@@ -2038,9 +2086,15 @@ the signal run-ibd uses to rotate to another header-sync peer."
 
                               (t
                                ;; Handle other messages (ping, sendcmpct, etc.)
+                               ;; with the full node context — see docstring.
                                (bitcoin-lisp:log-cat "net" "Header sync: received ~A" command)
                                (handler-case
-                                   (handle-message peer command payload chain-state nil nil
+                                   (handle-message peer command payload chain-state
+                                                   utxo-set block-store
+                                                   :mempool mempool
+                                                   :peers peers
+                                                   :address-book address-book
+                                                   :fee-estimator fee-estimator
                                                    :recent-rejects recent-rejects)
                                  (error () nil)))))))))
 
@@ -2048,12 +2102,15 @@ the signal run-ibd uses to rotate to another header-sync peer."
     (values received-count timed-out)))
 
 (defun sync-headers-with-failover (peers chain-state ctx
-                                   &key recent-rejects (sync-fn #'sync-headers))
+                                   &key recent-rejects (sync-fn #'sync-headers)
+                                        utxo-set block-store fee-estimator)
   "Run header sync against ready PEERS in descending start-height order,
 rotating to the next peer whenever one STALLS (sync-fn's 2nd value true),
 and stopping at the first that answers. Returns the peer that responded, or
 NIL if every ready peer stalled / none were ready. SYNC-FN is injectable so
-the rotation logic is testable without network I/O.
+the rotation logic is testable without network I/O. The full node context
+(CTX + UTXO-SET/BLOCK-STORE/FEE-ESTIMATOR) is threaded to SYNC-FN so its
+interleaved-message drains can serve tx getdata and process blocks.
 
 Fixes the single-peer header-sync freeze: run-ibd previously synced from one
 peer chosen by start-height (frozen at handshake), with no failover — a quiet
@@ -2064,7 +2121,12 @@ or dead-fork peer was re-picked every cycle and pinned the tip for hours."
     (when (eq (peer-state peer) :ready)
       (setf (ibd-context-header-sync-peer ctx) peer)
       (multiple-value-bind (count stalled)
-          (funcall sync-fn peer chain-state :recent-rejects recent-rejects)
+          (funcall sync-fn peer chain-state
+                   :recent-rejects recent-rejects
+                   :ctx ctx
+                   :utxo-set utxo-set
+                   :block-store block-store
+                   :fee-estimator fee-estimator)
         (declare (ignore count))
         (unless stalled (return peer))))))
 

@@ -834,6 +834,8 @@
    #:mempool-entry-sigops
    #:mempool-entry-height
    #:mempool-entry-entry-time
+   #:mempool-entry-sequence
+   #:mempool-sequence
    #:mempool-entry-fee-rate
    ;; Mempool entry links
    #:mempool-entry-parents
@@ -863,17 +865,26 @@
    #:*cluster-size-limit*
    #:mempool-effective-min-fee-rate
    #:mempool-orphan-pool
-   ;; Orphan pool
+   ;; Orphan pool (Core TxOrphanage at d3056bc: wtxid-keyed, per-peer
+   ;; announcement accounting, DoS-bounded eviction, no time expiry)
    #:make-orphan-pool
    #:orphan-pool-count
    #:orphan-entry-transaction
-   #:orphan-entry-from-peer
    #:orphan-add
    #:orphan-remove
    #:orphan-tx
+   #:orphan-have
+   #:orphan-have-from-peer
+   #:orphan-announcers
    #:orphans-depending-on
    #:orphan-erase-for-peer
-   #:orphan-expire
+   #:orphan-erase-for-block
+   #:orphan-total-usage
+   #:orphan-total-latency-score
+   #:orphan-usage-by-peer
+   #:orphan-announcements-from-peer
+   #:+max-orphanage-latency-score+
+   #:+reserved-orphan-weight-per-peer+
    #:tx-signals-rbf-p
    #:find-rbf-conflicts
    #:check-rbf-rules
@@ -974,6 +985,12 @@
    #:connect-block
    #:activate-block
    #:find-fork-point
+   ;; Tx-relay tip structures (Core recent-confirmed filter +
+   ;; most-recent-block tx map)
+   #:recently-confirmed-p
+   #:most-recent-block-tx
+   #:note-block-connected
+   #:reset-recent-confirmed
    #:perform-reorg
    #:get-undo-data
    #:invalidate-block
@@ -1099,6 +1116,13 @@
    #:reset-tx-requests
    #:tx-request-wanted-p
    #:tx-request-received
+   #:tx-request-notfound
+   #:tx-request-disconnected-peer
+   #:tx-request-count
+   #:process-tx-requests
+   ;; Steady-state message pump (post-IBD receive loop)
+   #:pump-peer-messages
+   #:ibd-context-headers-received
    ;; Trickled tx announcement flushing
    #:flush-tx-announcements
    ;; Local-submission broadcast (unbroadcast set)
@@ -1118,6 +1142,8 @@
    #:peer-inbound
    #:peer-conn-type
    #:peer-relays-txs-p
+   #:peer-tx-relay-p
+   #:peer-last-inv-sequence
    #:peer-getaddr-sent
    #:connect-peer
    #:disconnect-peer

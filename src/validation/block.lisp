@@ -1503,6 +1503,69 @@ store-undo-data (the connect path, which does the height bookkeeping) caches."
   (or (gethash block-hash *block-undo-data*)
       (load-undo-data-from-disk block-hash)))
 
+;;;; Recently-confirmed transactions + most-recent-block tx set
+;;;;
+;;;; Two small tip-following structures Core keeps for tx relay, maintained
+;;;; here because every block-connect path (IBD, relay, compact blocks,
+;;;; reorg reconnect) funnels through this file:
+;;;;
+;;;;  - The recent-confirmed filter (Core m_lazy_recent_confirmed_transactions,
+;;;;    txdownloadman_impl.h:120-128, a CRollingBloomFilter{48000, 0.000001}):
+;;;;    txids AND wtxids of txs confirmed in recent blocks, so freshly-mined
+;;;;    txs aren't re-requested or re-processed when a slower peer announces
+;;;;    them (AlreadyHaveTx, txdownloadman_impl.cpp:144). Reset on block
+;;;;    DISCONNECT (reorg) so previously-confirmed txs can relay again
+;;;;    (BlockDisconnected, txdownloadman_impl.cpp:112-123).
+;;;;
+;;;;  - The most-recent-block tx map (Core m_most_recent_block_txs,
+;;;;    net_processing.cpp:869, rebuilt in NewPoWValidBlock:2121-2132): the
+;;;;    newest block's txs keyed by txid and wtxid, so a getdata for a
+;;;;    just-confirmed tx is still served even though it left the mempool
+;;;;    (FindTxForGetData's second source, net_processing.cpp:2507-2514).
+
+(defvar *recent-confirmed-txs* (bitcoin-lisp:make-rejects-filter 48000)
+  "Bounded rolling set of recently-confirmed txids/wtxids (Core
+m_lazy_recent_confirmed_transactions). Reuses the recent-rejects ring
+structure, sized like Core: 48,000 entries covers ~a couple hours of blocks.")
+
+(defvar *most-recent-block-txs* nil
+  "Hash-table (equalp) mapping the most recent connected block's tx ids —
+txid AND wtxid — to their transactions, or NIL before any block connects
+(Core m_most_recent_block_txs). Replaced wholesale on every tip advance.")
+
+(defun recently-confirmed-p (hash)
+  "T if HASH (txid or wtxid) was confirmed in a recent block."
+  (and (bitcoin-lisp:recent-reject-p *recent-confirmed-txs* hash) t))
+
+(defun most-recent-block-tx (hash)
+  "The most recent block's transaction with txid or wtxid HASH, or NIL."
+  (and *most-recent-block-txs*
+       (gethash hash *most-recent-block-txs*)))
+
+(defun reset-recent-confirmed ()
+  "Empty the recent-confirmed filter — on block disconnect (Core
+BlockDisconnected: a reorg may return confirmed txs to circulation, and the
+filter would otherwise block their relay) and at node start."
+  (bitcoin-lisp:clear-recent-rejects *recent-confirmed-txs*))
+
+(defun note-block-connected (block)
+  "Record BLOCK as the new most-recent block: rebuild the getdata-servable
+tx map and add every transaction's txid (and distinct wtxid) to the
+recent-confirmed filter (Core BlockConnected, txdownloadman_impl.cpp:98-110,
++ NewPoWValidBlock's most_recent_block_txs rebuild)."
+  (let ((map (make-hash-table :test 'equalp)))
+    (dolist (tx (coerce (bitcoin-lisp.serialization:bitcoin-block-transactions
+                         block)
+                        'list))
+      (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+            (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+        (setf (gethash txid map) tx)
+        (bitcoin-lisp:add-recent-reject *recent-confirmed-txs* txid)
+        (unless (equalp wtxid txid)
+          (setf (gethash wtxid map) tx)
+          (bitcoin-lisp:add-recent-reject *recent-confirmed-txs* wtxid))))
+    (setf *most-recent-block-txs* map)))
+
 ;;;; Block connection
 
 (defun connect-block (block chain-state block-store utxo-set
@@ -1586,12 +1649,23 @@ Handles chain reorganizations when a competing chain has more work."
            ;; inside the same critical section as the tip update.
            (when mempool
              (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
-           ;; Expire stale mempool/orphan entries once per block (outside the
-           ;; critical section), matching Bitcoin Core's expire-on-block.
-           (when mempool
-             (bitcoin-lisp.mempool:mempool-expire mempool)
-             (bitcoin-lisp.mempool:orphan-expire
-              (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
+           ;; Tx-relay tip bookkeeping (outside the critical section):
+           ;; expire stale mempool entries once per block (Core expire-on-
+           ;; block); erase orphans included in/conflicted by this block
+           ;; (Core BlockConnected -> TxOrphanage::EraseForBlock); record the
+           ;; block's txids/wtxids as recently confirmed and getdata-servable
+           ;; (Core m_lazy_recent_confirmed_transactions +
+           ;; m_most_recent_block_txs). A TARGETED chainstate — the assumeutxo
+           ;; historical chainstate re-deriving old history — must not touch
+           ;; these: its "tip" blocks are ancient, and Core only wires the
+           ;; validation-interface tx-relay callbacks to the ACTIVE chainstate
+           ;; (BlockConnected checks role, net_processing.cpp:2149-2157).
+           (unless (bitcoin-lisp.storage:chain-state-target-blockhash chain-state)
+             (when mempool
+               (bitcoin-lisp.mempool:mempool-expire mempool)
+               (bitcoin-lisp.mempool:orphan-erase-for-block
+                (bitcoin-lisp.mempool:mempool-orphan-pool mempool) block))
+             (note-block-connected block))
            ;; Core resets the recent-rejects filter on EVERY active tip change,
            ;; not just reorgs: cached failures (non-final, too-low-fee, missing
            ;; inputs) can become valid at the next block (ActiveTipChange,
@@ -1909,6 +1983,14 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
 
           ;; PHASE C — commit side effects, only now the whole fork is valid
           ;; and applied. Oldest-to-newest for chain-order indexing.
+          ;;
+          ;; Blocks were disconnected: reset the recent-confirmed filter so
+          ;; previously-confirmed txs returning to circulation can relay
+          ;; again (Core BlockDisconnected -> RecentConfirmedTransactions
+          ;; Filter().reset(), txdownloadman_impl.cpp:112-123). Deferred to
+          ;; the commit phase alongside the other side effects: a rolled-back
+          ;; reorg never disconnected anything observably.
+          (reset-recent-confirmed)
           (dolist (item (reverse connected))
             (destructuring-bind (entry block height spent-utxos) item
               (when fee-estimator
@@ -1931,7 +2013,12 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
                 ;; loads its (already-reindexed) parent's running state.
                 (bitcoin-lisp:index-block-coinstats chain-state block hash height spent-utxos))
               (when mempool
-                (bitcoin-lisp.mempool:mempool-remove-for-block mempool block))))
+                (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)
+                (bitcoin-lisp.mempool:orphan-erase-for-block
+                 (bitcoin-lisp.mempool:mempool-orphan-pool mempool) block))
+              ;; Each reconnected block counts as connected for the tx-relay
+              ;; tip structures; the LAST one leaves the map at the new tip.
+              (note-block-connected block)))
           ;; The disconnected old chain's txs stay in the tx-index: Core never
           ;; erases txindex entries on disconnect (index/base.h:136 CustomRemove
           ;; defaults to a no-op; index/txindex.cpp has no override). Txs

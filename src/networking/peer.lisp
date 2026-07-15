@@ -95,6 +95,14 @@
   (prefers-headers nil :type boolean)                  ; Peer sent sendheaders
   ;; BIP 133 feefilter support
   (feefilter-rate 0 :type (unsigned-byte 64))          ; Peer's minimum fee rate (sat/kB)
+  ;; Mempool-sequence snapshot taken at each inv flush to this peer (Core
+  ;; Peer::TxRelay::m_last_inv_sequence, net_processing.cpp:322, init 1).
+  ;; The getdata anti-probing gate serves a mempool tx only when its entry
+  ;; sequence is BELOW this snapshot — i.e. the tx was already in the pool
+  ;; when we last announced inventory to the peer (Core FindTxForGetData ->
+  ;; info_for_relay). Blocks mempool-content probing of txs the peer
+  ;; shouldn't know about yet.
+  (last-inv-sequence 1 :type (unsigned-byte 64))
   ;; BIP 339 wtxidrelay support
   (wtxid-relay nil :type boolean)                      ; Peer supports wtxid-based tx relay
   ;; BIP 330 transaction reconciliation (Erlay) handshake state. Core keeps a
@@ -231,18 +239,30 @@ Returns NIL if the host is banned or discouraged (never dial either)."
         (init-peer-rate-limiters peer)
         peer))))
 
+(defvar *peer-disconnect-hook* nil
+  "When non-NIL, a function of one argument (the peer) called from
+DISCONNECT-PEER after the connection is torn down. protocol.lisp registers
+the tx-request tracker's DisconnectedPeer cleanup here — the tracker lives in
+a later-loaded file, so a direct call would be a forward reference.")
+
 (defun disconnect-peer (peer)
   "Disconnect from a peer."
   (when (peer-connection peer)
     (close-connection (peer-connection peer)))
   (setf (peer-state peer) :disconnected)
   (setf (peer-connection peer) nil)
-  ;; Drop any orphan transactions this peer contributed (DoS hygiene).
+  ;; Drop this peer's orphan ANNOUNCEMENTS (DoS hygiene). Orphans other
+  ;; peers also announced survive (Core TxOrphanage::EraseForPeer).
   (let ((node bitcoin-lisp::*node*))
     (when (and node (bitcoin-lisp::node-mempool node))
       (bitcoin-lisp.mempool:orphan-erase-for-peer
        (bitcoin-lisp.mempool:mempool-orphan-pool (bitcoin-lisp::node-mempool node))
-       peer))))
+       peer)))
+  ;; Tx-request tracker cleanup (Core TxDownloadManagerImpl::DisconnectedPeer):
+  ;; forget the peer's announcements; its in-flight requests become
+  ;; re-schedulable so the next scheduler pass fails them over.
+  (when *peer-disconnect-hook*
+    (ignore-errors (funcall *peer-disconnect-hook* peer))))
 
 ;;; Message I/O
 
@@ -300,9 +320,34 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
 ;;; Handshake
 
 (defun peer-relays-txs-p (peer)
-  "T if we relay transactions with PEER. Block-relay-only and feeler
-connections do not (Core: fRelay=false, no tx inv/getdata either way)."
+  "T if OUR side of the connection participates in tx relay with PEER.
+Block-relay-only and feeler connections do not (Core: fRelay=false, no tx
+inv/getdata either way). This is our half only; whether the PEER wants tx
+announcements from us is PEER-TX-RELAY-P (their version's fRelay)."
   (not (member (peer-conn-type peer) '(:block-relay :feeler))))
+
+(defun relay-enabled-p ()
+  "Check if transaction relay is enabled for the current network.
+Relay is always enabled on test networks, disabled by default on mainnet for
+safety — our analogue of Core's -blocksonly (m_opts.ignore_incoming_txs).
+Returns a strict boolean (it feeds the version message's fRelay slot)."
+  (and (or (member bitcoin-lisp:*network* '(:testnet3 :testnet4 :signet :regtest))
+           bitcoin-lisp:*mainnet-relay-enabled*)
+       t))
+
+(defun peer-tx-relay-p (peer)
+  "T when tx-relay state exists for PEER — the exact condition under which
+Core initializes Peer::TxRelay at VERSION time (net_processing.cpp:3681-3696):
+the connection is not block-relay-only or feeler, AND the peer's version set
+fRelay=1. We never advertise NODE_BLOOM, so Core's other arm (fRelay=0 but
+NODE_BLOOM offered, letting a later filterload turn relay on) never applies:
+a BIP37/BIP60 fRelay=0 peer gets NO tx invs and its tx getdata is ignored for
+the life of the connection. A peer with no stored version yet counts as
+relaying — Core's pre-70001 default is fRelay=true (net_processing.cpp:3597)."
+  (and (peer-relays-txs-p peer)
+       (let ((v (peer-version peer)))
+         (or (null v)
+             (bitcoin-lisp.serialization:version-message-relay v)))))
 
 ;;; BIP330 sendtxrcncl handshake (Erlay). Core parity at ref d3056bc is the
 ;;; handshake + salt storage only — no reqtxrcncl/sketch messages exist
@@ -494,7 +539,12 @@ tx relay on those)."
                            :addr-recv (%version-addr-recv peer)
                            :start-height start-height
                            :timestamp (bitcoin-lisp.serialization:get-unix-time)
-                           :relay relays))
+                           ;; Core my_tx_relay = !RejectIncomingTxs(pnode)
+                           ;; (net_processing.cpp:1573,5686-5693): false on
+                           ;; block-relay/feeler connections AND in blocksonly
+                           ;; mode — our mainnet-relay-disabled default. With
+                           ;; fRelay=0 honest peers stop announcing txs to us.
+                           :relay (and relays (relay-enabled-p))))
          (version-msg (bitcoin-lisp.serialization:serialize-message
                        "version" version-payload)))
     (when (send-message peer version-msg)
@@ -631,8 +681,15 @@ on the local onion-service listener (Tor forwarding), whose true network is
   "Send feature negotiation messages after handshake completes."
   ;; BIP 130: Request header announcements
   (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message))
-  ;; BIP 133: Announce our minimum relay fee rate (1000 sat/kB = 1 sat/byte)
-  (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000))
+  ;; BIP 133: Announce our minimum relay fee rate (1000 sat/kB = 1 sat/byte).
+  ;; Core MaybeSendFeefilter (net_processing.cpp:5628-5637) skips it in
+  ;; blocksonly mode (ignore_incoming_txs — our relay-disabled mainnet
+  ;; default) and on outbound block-relay-only connections, which never
+  ;; announce txs to us regardless. Note Core does NOT gate feefilter on the
+  ;; peer's own fRelay — an fRelay=0 peer still receives it (harmlessly).
+  (when (and (relay-enabled-p)
+             (not (eq (peer-conn-type peer) :block-relay)))
+    (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000)))
   ;; One-time address fetch to populate/update addrman. Core sends GETADDR
   ;; on outbound connections only, and never block-relay-only ones (no addr
   ;; relay there, to avoid leaking the link): net_processing.cpp:3754-3772
