@@ -1472,6 +1472,83 @@ m_tx_inventory_to_send the same way)."
     (is-false (bitcoin-lisp:recent-reject-p
                (bitcoin-lisp.networking:peer-announced-txs peer) txid))))
 
+;;;; Initial broadcast of locally-submitted txs (unbroadcast set)
+
+(test getdata-serving-clears-unbroadcast
+  "Serving a tx from the mempool in response to a getdata removes it from
+the unbroadcast set — the propagation signal (Core ProcessGetData,
+net_processing.cpp:2550). An unrelated getdata leaves the set alone."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (%witness-tx-for-relay))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (peer (bitcoin-lisp.networking:make-peer :state :ready))
+         (other (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (%add-tx mempool tx)
+    (is-true (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid))
+    (flet ((getdata-payload (hash)
+             (subseq (bitcoin-lisp.serialization:make-getdata-message
+                      (list (bitcoin-lisp.serialization:make-inv-vector
+                             :type bitcoin-lisp.serialization:+inv-type-witness-tx+
+                             :hash hash)))
+                     24)))
+      ;; A request for some OTHER tx (not served) doesn't clear ours.
+      (bitcoin-lisp.networking::handle-getdata peer (getdata-payload other) nil mempool)
+      (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+      ;; A request for the unbroadcast tx clears it.
+      (bitcoin-lisp.networking::handle-getdata peer (getdata-payload txid) nil mempool)
+      (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))))))
+
+(test reattempt-initial-broadcast-relays-only-in-mempool
+  "The re-announcement pass queues invs for unbroadcast txs still in the
+pool and drops ids whose tx has left it (Core ReattemptInitialBroadcast,
+net_processing.cpp:1625-1643)."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (%witness-tx-for-relay))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (stale (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
+         (peer (bitcoin-lisp.networking:make-peer :state :ready :wtxid-relay t)))
+    (%add-tx mempool tx)
+    (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+    ;; Simulate a stale id (tx evicted after a crash-restore of the set):
+    ;; poke the table directly — the public adder refuses non-members.
+    (setf (gethash stale (bitcoin-lisp.mempool:mempool-unbroadcast mempool)) t)
+    (bitcoin-lisp.networking:reattempt-initial-broadcast (list peer) mempool)
+    ;; The live tx was queued for announcement (wtxid rides along)...
+    (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+    (destructuring-bind (qtxid qwtxid fee-rate-per-kb)
+        (first (bitcoin-lisp.networking::peer-tx-inv-queue peer))
+      (declare (ignore fee-rate-per-kb))
+      (is (equalp txid qtxid))
+      (is (equalp (bitcoin-lisp.serialization:transaction-wtxid tx) qwtxid)))
+    ;; ...and stays tracked until a getdata confirms; the stale id is gone.
+    (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+    (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool)))))
+
+(test maybe-reattempt-initial-broadcast-schedule
+  "First call only arms the 10-15min timer (Core schedules the first pass a
+full interval out, net_processing.cpp:2036-2038); once the deadline passes,
+the pass runs and the timer re-arms."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (%witness-tx-for-relay))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    (%add-tx mempool tx)
+    (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+    (bitcoin-lisp.networking:reset-initial-broadcast-schedule)
+    ;; Arm pass: nothing queued yet.
+    (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast (list peer) mempool)
+    (is (plusp bitcoin-lisp.networking::*next-initial-broadcast-time*))
+    (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+    ;; Deadline in the past: the pass runs and re-arms.
+    (setf bitcoin-lisp.networking::*next-initial-broadcast-time* 1)
+    (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast (list peer) mempool)
+    (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+    (is (> bitcoin-lisp.networking::*next-initial-broadcast-time* 1))
+    (bitcoin-lisp.networking:reset-initial-broadcast-schedule)))
+
 ;;;; Erlay P1: BIP330 sendtxrcncl handshake (Core-parity: handshake only)
 
 (defun %recon-test-peer (&key (relay t) (inbound nil)

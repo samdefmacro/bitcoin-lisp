@@ -871,14 +871,23 @@ handling of unavailable blocks."
                             (t
                              (or (bitcoin-lisp.mempool:mempool-get mempool hash)
                                  (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash)))))))
-             (if entry
-                 (send-message peer
-                               (bitcoin-lisp.serialization:make-tx-message
-                                (bitcoin-lisp.mempool:mempool-entry-transaction entry)
-                                :witness (/= inv-type bitcoin-lisp.serialization:+inv-type-tx+)))
-                 ;; Core accumulates vNotFound for txs it can't serve so the
-                 ;; requester re-routes immediately instead of timing out.
-                 (push inv not-found))))
+             (cond
+               (entry
+                (send-message peer
+                              (bitcoin-lisp.serialization:make-tx-message
+                               (bitcoin-lisp.mempool:mempool-entry-transaction entry)
+                               :witness (/= inv-type bitcoin-lisp.serialization:+inv-type-tx+)))
+                ;; A peer requesting the tx is the proof our announcement
+                ;; propagated: drop it from the unbroadcast set (Core
+                ;; ProcessGetData, net_processing.cpp:2550).
+                (bitcoin-lisp.mempool:mempool-remove-unbroadcast
+                 mempool
+                 (bitcoin-lisp.serialization:transaction-hash
+                  (bitcoin-lisp.mempool:mempool-entry-transaction entry))))
+               (t
+                ;; Core accumulates vNotFound for txs it can't serve so the
+                ;; requester re-routes immediately instead of timing out.
+                (push inv not-found)))))
           ;; Block request - serve the full block from disk (witness-aware).
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
@@ -1386,32 +1395,109 @@ BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
 sync loop). Outbound peers each run an exponential timer with mean
 +outbound-inv-broadcast-interval+; all inbound peers flush together on
 the shared *next-inbound-inv-flush* rotation with mean
-+inbound-inv-broadcast-interval+ — Core net_processing.cpp:5980-5990."
-  (let ((now (get-internal-real-time))
-        (inbound-due nil))
-    ;; Shared inbound rotation.
-    (cond ((zerop *next-inbound-inv-flush*)
-           (setf *next-inbound-inv-flush*
-                 (+ now (%next-exp-interval-ticks +inbound-inv-broadcast-interval+))))
-          ((>= now *next-inbound-inv-flush*)
-           (setf inbound-due t
-                 *next-inbound-inv-flush*
-                 (+ now (%next-exp-interval-ticks +inbound-inv-broadcast-interval+)))))
-    (dolist (peer peers)
-      (when (and (eq (peer-state peer) :ready)
-                 (peer-relays-txs-p peer))
-        (if (peer-inbound peer)
-            (when inbound-due
-              (%flush-peer-tx-invs peer mempool))
-            (cond ((zerop (peer-next-inv-send-time peer))
-                   (setf (peer-next-inv-send-time peer)
-                         (+ now (%next-exp-interval-ticks
-                                 +outbound-inv-broadcast-interval+))))
-                  ((>= now (peer-next-inv-send-time peer))
-                   (setf (peer-next-inv-send-time peer)
-                         (+ now (%next-exp-interval-ticks
-                                 +outbound-inv-broadcast-interval+)))
-                   (%flush-peer-tx-invs peer mempool))))))))
++inbound-inv-broadcast-interval+ — Core net_processing.cpp:5980-5990.
+Holds the node lock: the queues are also written by the RPC broadcast
+path (sendrawtransaction/submitpackage), which enqueues under the same
+lock from RPC handler threads."
+  (with-node-lock
+    (let ((now (get-internal-real-time))
+          (inbound-due nil))
+      ;; Shared inbound rotation.
+      (cond ((zerop *next-inbound-inv-flush*)
+             (setf *next-inbound-inv-flush*
+                   (+ now (%next-exp-interval-ticks +inbound-inv-broadcast-interval+))))
+            ((>= now *next-inbound-inv-flush*)
+             (setf inbound-due t
+                   *next-inbound-inv-flush*
+                   (+ now (%next-exp-interval-ticks +inbound-inv-broadcast-interval+)))))
+      (dolist (peer peers)
+        (when (and (eq (peer-state peer) :ready)
+                   (peer-relays-txs-p peer))
+          (if (peer-inbound peer)
+              (when inbound-due
+                (%flush-peer-tx-invs peer mempool))
+              (cond ((zerop (peer-next-inv-send-time peer))
+                     (setf (peer-next-inv-send-time peer)
+                           (+ now (%next-exp-interval-ticks
+                                   +outbound-inv-broadcast-interval+))))
+                    ((>= now (peer-next-inv-send-time peer))
+                     (setf (peer-next-inv-send-time peer)
+                           (+ now (%next-exp-interval-ticks
+                                   +outbound-inv-broadcast-interval+)))
+                     (%flush-peer-tx-invs peer mempool)))))))))
+
+;;; Initial broadcast of locally-submitted transactions (Core
+;;; BroadcastTransaction -> InitiateTxBroadcastToAll + the scheduled
+;;; ReattemptInitialBroadcast pass over the mempool's unbroadcast set).
+
+(defun announce-mempool-tx (peers mempool txid)
+  "Queue an announcement of the in-mempool TXID to every relay-capable peer
+(Core PeerManagerImpl::InitiateTxBroadcastToAll, net_processing.cpp:
+2245-2266, with no source peer to exclude). Announces the ENTRY's wtxid —
+when a caller re-broadcasts a same-txid/different-witness transaction, the
+mempool's witness is the one peers must request (Core BroadcastTransaction,
+node/transaction.cpp:63-72). The entry's feerate rides along for BIP133
+flush-time filtering. Peers that already had the tx announced are skipped
+by relay-transaction's per-peer known filter, exactly like Core's
+m_tx_inventory_known_filter check. Returns T when the tx was in the pool
+and queued, NIL otherwise."
+  (let ((entry (and mempool (bitcoin-lisp.mempool:mempool-get mempool txid))))
+    (when entry
+      (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry))
+            (fee (bitcoin-lisp.mempool:mempool-entry-fee entry)))
+        (relay-transaction txid nil peers
+                           :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                           :wtxid (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
+      t)))
+
+(defconstant +initial-broadcast-interval+ 600
+  "Base seconds between unbroadcast re-announcement passes (Core
+INITIAL_BROADCAST_INTERVAL semantics: ReattemptInitialBroadcast reschedules
+itself 10min out, net_processing.cpp:1639-1642).")
+
+(defconstant +initial-broadcast-jitter+ 300
+  "Random extra seconds added to every re-announcement interval — Core adds
+randrange(5min) each cycle so the cadence can't fingerprint the node
+(net_processing.cpp:1639-1641).")
+
+(defvar *next-initial-broadcast-time* 0
+  "internal-real-time deadline of the next unbroadcast re-announcement pass;
+0 = not yet scheduled (armed on the first maybe- call, matching Core's
+initial scheduleFromNow a full interval out, net_processing.cpp:2036-2038).")
+
+(defun %next-initial-broadcast-ticks ()
+  (+ (* +initial-broadcast-interval+ internal-time-units-per-second)
+     (random (* +initial-broadcast-jitter+ internal-time-units-per-second))))
+
+(defun reset-initial-broadcast-schedule ()
+  "Clear the re-announcement deadline (called at node start, alongside
+reset-tx-requests) so the first pass re-arms fresh."
+  (setf *next-initial-broadcast-time* 0))
+
+(defun reattempt-initial-broadcast (peers mempool)
+  "Re-announce every unbroadcast tx still in the mempool to the current
+relay peers; drop the ids of txs that have left the pool (Core
+PeerManagerImpl::ReattemptInitialBroadcast, net_processing.cpp:1625-1643).
+Because each peer's known filter suppresses re-queueing, this mostly
+reaches peers connected since the original announcement."
+  (dolist (txid (bitcoin-lisp.mempool:mempool-unbroadcast-txids mempool))
+    (unless (announce-mempool-tx peers mempool txid)
+      (bitcoin-lisp.mempool:mempool-remove-unbroadcast mempool txid))))
+
+(defun maybe-reattempt-initial-broadcast (peers mempool)
+  "Run the unbroadcast re-announcement pass when due (call ~1x/second from
+the sync loop, our stand-in for Core's scheduler). Each cycle — including
+the first — is scheduled 10min + rand(5min) out."
+  (when mempool
+    (let ((now (get-internal-real-time)))
+      (cond ((zerop *next-initial-broadcast-time*)
+             (setf *next-initial-broadcast-time*
+                   (+ now (%next-initial-broadcast-ticks))))
+            ((>= now *next-initial-broadcast-time*)
+             (setf *next-initial-broadcast-time*
+                   (+ now (%next-initial-broadcast-ticks)))
+             (with-node-lock
+               (reattempt-initial-broadcast peers mempool)))))))
 
 (defun block-relay-targets (source-peer peers)
   "The peers a newly-connected block is announced to: every ready peer except

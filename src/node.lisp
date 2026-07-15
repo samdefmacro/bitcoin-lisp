@@ -505,19 +505,36 @@ independent."
                                 :name "bitcoin-onion-listener"))
           (log-info "Listening for inbound onion peers on 127.0.0.1:~D" port)))))
 
+(defun broadcast-transaction-to-peers (node txid)
+  "Queue announcements of the in-mempool TXID to every connected
+relay-capable peer — the broadcast tail of Core's BroadcastTransaction
+(node/transaction.cpp:131-135 -> PeerManager::InitiateTxBroadcastToAll).
+Nothing is sent directly: the sync loop's Poisson flusher
+(flush-tx-announcements) drains the queues, respecting each peer's
+wtxid-relay preference, fRelay, and BIP133 feefilter. Under the node lock
+because RPC handler threads call this while the sync thread owns the same
+queues. Returns T when the tx was found in the mempool and queued."
+  (bt:with-recursive-lock-held ((node-lock node))
+    (bitcoin-lisp.networking:announce-mempool-tx
+     (node-peers node) (node-mempool node) txid)))
+
 (defun load-mempool-from-disk
-    (node &optional (path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory node))))
+    (node &optional (path (bitcoin-lisp.mempool:mempool-dat-path (node-data-directory node)))
+     &key (apply-unbroadcast t))
   "Load a mempool.dat-format file through the normal acceptance path (Core
 LoadMempool): prioritisation deltas first (so fee policy sees them), then per-tx
 validation against the current UTXO set — stale entries (spent inputs, reorged
 context) simply fail and are dropped. Entries are loaded regardless of age (no
 expiry filter, unlike Core): mempool-expire prunes old entries on the next block
 connection anyway. Residual deltas (txs not in the saved pool) are re-applied
-last. PATH defaults to the node's mempool.dat; the importmempool RPC passes an
-arbitrary file. Returns (values accepted failed residual-count) on success, or
-NIL if the file is missing or corrupt."
+last, then the saved unbroadcast set for txs that made it back into the pool
+(Core node/mempool_persist.cpp:134-141) — unless APPLY-UNBROADCAST is NIL,
+which is the importmempool RPC's default (Core apply_unbroadcast_set,
+rpc/mempool.cpp:1115). PATH defaults to the node's mempool.dat. Returns
+(values accepted failed residual-count) on success, or NIL if the file is
+missing or corrupt."
   (when (and path (probe-file path))
-      (multiple-value-bind (entries residual ok)
+      (multiple-value-bind (entries residual ok unbroadcast)
           (bitcoin-lisp.mempool:read-mempool-file path)
         (unless ok
           (log-warn "mempool file ~A unreadable or corrupt" path)
@@ -525,7 +542,7 @@ NIL if the file is missing or corrupt."
         (let ((mempool (node-mempool node))
               (utxo-set (node-utxo-set node))
               (chain-state (node-chain-state node))
-              (accepted 0) (failed 0))
+              (accepted 0) (failed 0) (unbroadcast-count 0))
           (dolist (rec entries)
             (destructuring-bind (tx entry-time delta) rec
               (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
@@ -551,8 +568,15 @@ NIL if the file is missing or corrupt."
                     (t (incf failed)))))))
           (dolist (pair residual)
             (bitcoin-lisp.mempool:mempool-prioritise mempool (car pair) (cdr pair)))
-          (log-info "Imported mempool: ~D accepted, ~D failed, ~D residual deltas"
-                    accepted failed (length residual))
+          ;; Restore the unbroadcast set for txs that were re-accepted; ids
+          ;; whose tx failed to reload are dropped (mempool-add-unbroadcast's
+          ;; membership gate) — Core node/mempool_persist.cpp:136-142.
+          (when apply-unbroadcast
+            (dolist (txid unbroadcast)
+              (when (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+                (incf unbroadcast-count))))
+          (log-info "Imported mempool: ~D accepted, ~D failed, ~D residual deltas, ~D waiting for initial broadcast"
+                    accepted failed (length residual) unbroadcast-count)
           (values accepted failed (length residual))))))
 
 ;;; --- Chainstate crash recovery -------------------------------------------
@@ -1539,6 +1563,7 @@ Returns the node instance."
   (when sync
     (bitcoin-lisp.networking:reset-ibd-stop)
     (bitcoin-lisp.networking:reset-tx-requests)
+    (bitcoin-lisp.networking:reset-initial-broadcast-schedule)
     (setf (node-sync-thread *node*)
           (bt:make-thread
            (lambda ()
@@ -1591,6 +1616,14 @@ Returns the node instance."
                                         ;; Core SendMessages runs its
                                         ;; equivalent on every message pump).
                                         (bitcoin-lisp.networking:flush-tx-announcements
+                                         (node-peers *node*)
+                                         (node-mempool *node*))
+                                        ;; Locally-submitted txs still in the
+                                        ;; unbroadcast set get re-announced
+                                        ;; every 10-15 min until a peer's
+                                        ;; getdata confirms propagation (Core
+                                        ;; ReattemptInitialBroadcast).
+                                        (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast
                                          (node-peers *node*)
                                          (node-mempool *node*))
                                         ;; Local-address self-advertisement
