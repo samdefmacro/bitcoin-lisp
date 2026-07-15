@@ -1555,6 +1555,9 @@ Returns the node instance."
     (bitcoin-lisp.networking:reset-ibd-stop)
     (bitcoin-lisp.networking:reset-tx-requests)
     (bitcoin-lisp.networking:reset-initial-broadcast-schedule)
+    ;; Fresh recent-confirmed filter (Core builds it per process; covers
+    ;; in-image restarts).
+    (bitcoin-lisp.validation:reset-recent-confirmed)
     (setf (node-sync-thread *node*)
           (bt:make-thread
            (lambda ()
@@ -1596,9 +1599,6 @@ Returns the node instance."
                                ;; the PR #216 block-relay/feeler conns and
                                ;; ping-timeout eviction never ran live.
                                (maintain-peers *node*)
-                               ;; Re-route any tx getdata that timed out to
-                               ;; another announcer (TxRequestTracker).
-                               (bitcoin-lisp.networking:retry-timed-out-tx-requests)
                                (loop repeat 30 while (node-running *node*)
                                      do (sleep 1)
                                         ;; Retry buffered unsent bytes on
@@ -1607,31 +1607,66 @@ Returns the node instance."
                                         ;; SocketSendData.
                                         (bitcoin-lisp.networking:flush-peer-send-buffers
                                          (node-peers *node*))
-                                        ;; Trickled tx announcements: drain
-                                        ;; due per-peer inv queues each
-                                        ;; second (Poisson schedules inside;
-                                        ;; Core SendMessages runs its
-                                        ;; equivalent on every message pump).
-                                        (bitcoin-lisp.networking:flush-tx-announcements
-                                         (node-peers *node*)
-                                         (node-mempool *node*))
-                                        ;; Locally-submitted txs still in the
-                                        ;; unbroadcast set get re-announced
-                                        ;; every 10-15 min until a peer's
-                                        ;; getdata confirms propagation (Core
-                                        ;; ReattemptInitialBroadcast).
-                                        (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast
-                                         (node-peers *node*)
-                                         (node-mempool *node*))
-                                        ;; Local-address self-advertisement
-                                        ;; (our onion address, once torcontrol
-                                        ;; registers it): per-peer ~24h Poisson
-                                        ;; schedule inside, no-op while the
-                                        ;; local-address map is empty or in
-                                        ;; IBD (Core MaybeSendAddr).
-                                        (bitcoin-lisp.networking:maybe-advertise-local-address
-                                         (node-peers *node*)
-                                         (node-chain-state *node*))))
+                                        ;; Steady-state receive pump: drain
+                                        ;; every peer's readable messages
+                                        ;; with the full node context. This
+                                        ;; loop used to be a pure 30s sleep
+                                        ;; — a receive dead window in which
+                                        ;; pings, invs, and getdata for txs
+                                        ;; we had JUST announced sat unread
+                                        ;; (Core's per-peer ProcessMessages
+                                        ;; runs continuously). A new header
+                                        ;; announcement ends the wait so the
+                                        ;; block is fetched immediately.
+                                        (let* ((cs (node-current-chainstate *node*))
+                                               (pump (bitcoin-lisp.networking:pump-peer-messages
+                                                      (node-peers *node*)
+                                                      cs
+                                                      (bitcoin-lisp.storage:chain-state-coins-view cs)
+                                                      (node-block-store *node*)
+                                                      :mempool (node-mempool *node*)
+                                                      :address-book (node-address-book *node*)
+                                                      :fee-estimator (node-fee-estimator *node*)
+                                                      :recent-rejects (node-recent-rejects *node*))))
+                                          ;; Tx-request scheduler: send
+                                          ;; delayed announcements now due,
+                                          ;; and re-route requests that
+                                          ;; expired (60s) to another
+                                          ;; announcer (Core GetRequestsToSend
+                                          ;; runs per SendMessages pass).
+                                          (bitcoin-lisp.networking:process-tx-requests)
+                                          (bitcoin-lisp.networking:retry-timed-out-tx-requests)
+                                          ;; Trickled tx announcements: drain
+                                          ;; due per-peer inv queues each
+                                          ;; second (Poisson schedules inside;
+                                          ;; Core SendMessages runs its
+                                          ;; equivalent on every message pump).
+                                          (bitcoin-lisp.networking:flush-tx-announcements
+                                           (node-peers *node*)
+                                           (node-mempool *node*))
+                                          ;; Locally-submitted txs still in the
+                                          ;; unbroadcast set get re-announced
+                                          ;; every 10-15 min until a peer's
+                                          ;; getdata confirms propagation (Core
+                                          ;; ReattemptInitialBroadcast).
+                                          (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast
+                                           (node-peers *node*)
+                                           (node-mempool *node*))
+                                          ;; Local-address self-advertisement
+                                          ;; (our onion address, once torcontrol
+                                          ;; registers it): per-peer ~24h Poisson
+                                          ;; schedule inside, no-op while the
+                                          ;; local-address map is empty or in
+                                          ;; IBD (Core MaybeSendAddr).
+                                          (bitcoin-lisp.networking:maybe-advertise-local-address
+                                           (node-peers *node*)
+                                           (node-chain-state *node*))
+                                          ;; New headers announced: start the
+                                          ;; next sync cycle now to fetch the
+                                          ;; block instead of waiting out the
+                                          ;; 30s poll.
+                                          (when (plusp (bitcoin-lisp.networking:ibd-context-headers-received pump))
+                                            (return)))))
                               (t
                                (log-warn "No peers available, reconnecting in 5s...")
                                (loop repeat 5 while (node-running *node*)
