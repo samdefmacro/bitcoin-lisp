@@ -696,7 +696,8 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
             ("mempoolminfee" . ,min-fee-btc-kvb)
             ("minrelaytxfee" . ,relay-fee-btc-kvb)
             ("incrementalrelayfee" . ,incfee)
-            ("unbroadcastcount" . 0)
+            ;; Core rpc/mempool.cpp:1047: GetUnbroadcastTxs().size().
+            ("unbroadcastcount" . ,(bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))
             ;; Acceptance is unconditionally full-RBF since cluster mempool;
             ;; Core hardcodes true (rpc/mempool.cpp:1048, field DEPRECATED).
             ("fullrbf" . t)))
@@ -973,7 +974,12 @@ anything to the mempool. Each tx is checked independently against current state
          results)))))
 
 (defun rpc-sendrawtransaction (node params)
-  "Submit a raw transaction to the mempool."
+  "Submit a raw transaction to the mempool AND broadcast it: on acceptance the
+txid joins the mempool's unbroadcast set and an announcement is queued to every
+relay-capable peer (Core sendrawtransaction -> BroadcastTransaction,
+node/transaction.cpp:100-135: AddUnbroadcastTx + InitiateTxBroadcastToAll). A
+tx already in the mempool is not resubmitted but IS re-announced, so the RPC
+doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
   (let ((hex-str (first params)))
     (unless (and (stringp hex-str) (> (length hex-str) 0))
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -991,6 +997,14 @@ anything to the mempool. Each tx is checked independently against current state
           (multiple-value-bind (valid error fee replaced sigops)
               (bitcoin-lisp.validation:validate-transaction-for-mempool
                tx utxo-set mempool current-height :chain-state chain-state)
+            (when (and (not valid) (eq error :already-in-mempool))
+              ;; Core doesn't reject a same-txid resubmission: it skips the
+              ;; mempool submission but still relays, announcing the POOL
+              ;; entry's wtxid (a same-txid/different-witness submission must
+              ;; advertise the witness we can actually serve). No unbroadcast
+              ;; add — Core's already-in-mempool branch skips it too.
+              (bitcoin-lisp::broadcast-transaction-to-peers node txid)
+              (return-from rpc-sendrawtransaction (hash-to-hex txid)))
             (unless valid
               (error 'rpc-error :code +rpc-transaction-rejected+
                                 :message (format nil "Transaction rejected: ~A" error)))
@@ -1000,6 +1014,11 @@ anything to the mempool. Each tx is checked independently against current state
               (unless (eq add-result :ok)
                 (error 'rpc-error :code +rpc-transaction-rejected+
                                   :message (format nil "Mempool rejection: ~A" add-result)))
+              ;; Track for best-effort initial broadcast (Core
+              ;; node/transaction.cpp:100-104), then queue the announcement
+              ;; to all relay peers.
+              (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+              (bitcoin-lisp::broadcast-transaction-to-peers node txid)
               (hash-to-hex txid))))
       ;; Re-raise our own rpc-errors (the -26 rejections above) unchanged; only a
       ;; genuine parse/deserialization failure maps to RPC_DESERIALIZATION_ERROR
@@ -1076,6 +1095,15 @@ for API compatibility but not enforced (matching sendrawtransaction here)."
       (multiple-value-bind (msg results replaced)
           (bitcoin-lisp.validation:validate-package-for-mempool
            package utxo-set mempool chain-state)
+        ;; Broadcast every package member that made it into (or already was
+        ;; in) the mempool — Core submitpackage runs BroadcastTransaction on
+        ;; each such tx (rpc/mempool.cpp:1423-1444). Those txs are in the
+        ;; pool by now, so Core's already-in-mempool branch applies: relay
+        ;; only, no unbroadcast-set add (node/transaction.cpp:63-72).
+        (dolist (tx package)
+          (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+            (when (bitcoin-lisp.mempool:mempool-has mempool txid)
+              (bitcoin-lisp::broadcast-transaction-to-peers node txid))))
         `(("package_msg" . ,(if (eq msg :success) "success"
                                 (string-downcase (symbol-name msg))))
           ("tx-results"
@@ -2041,17 +2069,24 @@ The same dump runs automatically on graceful shutdown."
   "Load transactions from a mempool.dat-format file at FILEPATH through the normal
 acceptance path (Bitcoin Core importmempool). PARAMS: (filepath [options]).
 Entries are validated against the current UTXO set; their prioritisation deltas
-are applied. Returns an empty object. The options object is accepted for
-compatibility but ignored — only the default import behavior is implemented
-(apply_fee_delta_priority/use_current_time/apply_unbroadcast_set are no-ops)."
-  (let ((filepath (first params)))
+are applied. The options object supports apply_unbroadcast_set (default false,
+Core rpc/mempool.cpp:1115-1116: only restore the file's unbroadcast set when
+asked — unlike the startup load, where it defaults on);
+apply_fee_delta_priority/use_current_time remain no-ops. Returns an empty
+object."
+  (let ((filepath (first params))
+        (options (second params)))
     (unless (and (stringp filepath) (plusp (length filepath)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "filepath must be a string"))
-    (let ((path (probe-file filepath)))
+    (let ((path (probe-file filepath))
+          (apply-unbroadcast (and (hash-table-p options)
+                                  (gethash "apply_unbroadcast_set" options)
+                                  t)))
       (unless path
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "Can't open mempool file ~A" filepath)))
-      (unless (bitcoin-lisp::load-mempool-from-disk node path)
+      (unless (bitcoin-lisp::load-mempool-from-disk
+               node path :apply-unbroadcast apply-unbroadcast)
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Unable to import mempool file (unreadable or corrupt)")))
     ;; Core returns an empty object; an empty hash-table serializes as {}.

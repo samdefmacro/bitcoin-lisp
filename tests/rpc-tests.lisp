@@ -775,6 +775,132 @@ RPC_DESERIALIZATION_ERROR (-22), matching Core."
       (bitcoin-lisp.rpc::rpc-error (e)
         (is (= -22 (bitcoin-lisp.rpc::rpc-error-code e)))))))
 
+;;; --- sendrawtransaction broadcast (unbroadcast set + peer announcement) ---
+;;;
+;;; Uses the P2SH(OP_TRUE) fixture from package-tests.lisp (%pkg-fixture /
+;;; %pkg-tx): standard, script-valid transactions with no signing key.
+
+(defun %broadcast-test-node (utxo-set mempool chain-state peer)
+  "A test node wired to the fixture state with one ready relay peer."
+  (let ((node (bitcoin-lisp::make-node :network :testnet3)))
+    (setf (bitcoin-lisp::node-chain-state node) chain-state
+          (bitcoin-lisp::node-utxo-set node) utxo-set
+          (bitcoin-lisp::node-mempool node) mempool
+          (bitcoin-lisp::node-peers node) (list peer))
+    node))
+
+(test rpc-sendrawtransaction-broadcasts
+  "sendrawtransaction accepts the tx, adds it to the mempool's unbroadcast
+set, and queues an announcement to relay peers (Core BroadcastTransaction,
+node/transaction.cpp:100-135); resubmitting the same tx is NOT an error and
+re-announces (already-in-mempool branch, :63-72) without re-adding to the
+unbroadcast set."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (let* ((peer (bitcoin-lisp.networking:make-peer :state :ready))
+           (node (%broadcast-test-node utxo-set mempool chain-state peer))
+           (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
+           (txid (bitcoin-lisp.serialization:transaction-hash tx))
+           (hex (bitcoin-lisp.crypto:bytes-to-hex
+                 (bitcoin-lisp.serialization:serialize-transaction tx))))
+      (let ((r (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))))
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex txid) r)))
+      (is-true (bitcoin-lisp.mempool:mempool-has mempool txid))
+      ;; Tracked for initial broadcast...
+      (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+      (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool)))
+      ;; ...and queued to the relay peer (flushed later by the Poisson timer).
+      (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+      (is (equalp txid (first (first (bitcoin-lisp.networking::peer-tx-inv-queue peer)))))
+      ;; Resubmission: same txid returned, another announcement queued,
+      ;; unbroadcast set unchanged.
+      (let ((r2 (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))))
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex txid) r2)))
+      (is (= 2 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+      (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))))))
+
+(test rpc-testmempoolaccept-does-not-broadcast
+  "testmempoolaccept is a dry run: nothing enters the mempool, nothing joins
+the unbroadcast set, and no announcement is queued."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (let* ((peer (bitcoin-lisp.networking:make-peer :state :ready))
+           (node (%broadcast-test-node utxo-set mempool chain-state peer))
+           (tx (%pkg-tx funding-txid 0 (- 100000000 10000)))
+           (hex (bitcoin-lisp.crypto:bytes-to-hex
+                 (bitcoin-lisp.serialization:serialize-transaction tx))))
+      (let ((r (first (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list hex))))))
+        (is (eq t (cdr (assoc "allowed" r :test #'string=)))))
+      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))
+      (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+      (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer))))))
+
+(test rpc-getmempoolinfo-unbroadcastcount
+  "getmempoolinfo reports the live unbroadcast set size (Core
+rpc/mempool.cpp:1047)."
+  (let* ((node (make-test-node))
+         (mempool (bitcoin-lisp::node-mempool node))
+         (tx (make-mempool-test-tx :input-id 201))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+    (is (= 0 (cdr (assoc "unbroadcastcount"
+                         (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)
+                         :test #'string=))))
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                 mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))))
+    (is-true (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid))
+    (is (= 1 (cdr (assoc "unbroadcastcount"
+                         (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)
+                         :test #'string=))))))
+
+(test rpc-importmempool-unbroadcast-option
+  "The saved unbroadcast set is restored by the startup load
+(load-mempool-from-disk defaults apply-unbroadcast on, Core
+node/mempool_persist.h:24) but by importmempool only when
+apply_unbroadcast_set is passed true (Core default false,
+rpc/mempool.cpp:1115-1116)."
+  (let ((path (merge-pathnames (format nil "bl-unbr-import-~D.dat" (get-universal-time))
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (let (txid)
+           ;; Source pool: one accepted tx marked unbroadcast, saved to PATH.
+           (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+             (declare (ignore utxo-set chain-state))
+             (let ((tx (%pkg-tx funding-txid 0 (- 100000000 10000))))
+               (setf txid (bitcoin-lisp.serialization:transaction-hash tx))
+               (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                            mempool txid
+                            (bitcoin-lisp.mempool:make-entry-from-tx tx 10000 200))))
+               (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+               (bitcoin-lisp.mempool:save-mempool-file mempool path)))
+           ;; importmempool default: entries load, unbroadcast NOT applied.
+           (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+             (declare (ignore funding-txid))
+             (let ((node (%broadcast-test-node
+                          utxo-set mempool chain-state
+                          (bitcoin-lisp.networking:make-peer :state :ready))))
+               (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path)))
+               (is-true (bitcoin-lisp.mempool:mempool-has mempool txid))
+               (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))))
+           ;; importmempool with apply_unbroadcast_set=true restores the set.
+           (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+             (declare (ignore funding-txid))
+             (let ((node (%broadcast-test-node
+                          utxo-set mempool chain-state
+                          (bitcoin-lisp.networking:make-peer :state :ready)))
+                   (opts (make-hash-table :test 'equal)))
+               (setf (gethash "apply_unbroadcast_set" opts) t)
+               (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path) opts))
+               (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+               (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool)))))
+           ;; Startup path (load-mempool-from-disk) applies it by default.
+           (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+             (declare (ignore funding-txid))
+             (let ((node (%broadcast-test-node
+                          utxo-set mempool chain-state
+                          (bitcoin-lisp.networking:make-peer :state :ready))))
+               (bitcoin-lisp::load-mempool-from-disk node path)
+               (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+               (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool))))))
+      (ignore-errors (delete-file path)))))
+
 (test rpc-getblockheader-confirmations
   "getblockheader.confirmations is the active-chain depth (tip - height + 1), not
 a hardcoded 1."

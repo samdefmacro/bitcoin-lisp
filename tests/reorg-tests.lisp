@@ -1010,3 +1010,33 @@ confirmations."
          (bitcoin-lisp.storage:close-tx-index txindex)
          (ignore-errors (delete-file (merge-pathnames "txindex.dat" txdir)))
          (clrhash bitcoin-lisp.validation::*block-undo-data*))))))
+
+;;;; Wave 8A: recent-rejects reset on EVERY tip advance (not just reorgs)
+
+(test tip-advance-clears-recent-rejects
+  "Connecting a block that plainly extends the active tip clears the
+recent-rejects filter — Core resets it on EVERY active tip change
+(ActiveTipChange, net_processing.cpp:2045-2059 ->
+txdownloadman_impl.cpp:92-96), because cached failures like non-final,
+too-low-fee, or missing-inputs can become valid at the next block.
+Previously only the reorg path cleared it."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "wave8-rejects-clear")
+     (let ((rejects (bitcoin-lisp:make-rejects-filter 100))
+           (cached (make-array 32 :element-type '(unsigned-byte 8)
+                                  :initial-element 77)))
+       (bitcoin-lisp:add-recent-reject rejects cached)
+       (is-true (bitcoin-lisp:recent-reject-p rejects cached))
+       ;; Plain tip extension: genesis -> B1 (no reorg involved).
+       (let* ((b1-hash (first (make-test-chain-hashes #xE8 1)))
+              (b1 (make-reorg-test-block genesis-hash b1-hash 1)))
+         (bitcoin-lisp.validation:connect-block
+          b1 chain-state block-store utxo-set :recent-rejects rejects)
+         (is (= 1 (bitcoin-lisp.storage:current-height chain-state)))
+         (is (equalp b1-hash (bitcoin-lisp.storage:best-block-hash chain-state))))
+       (is-false (bitcoin-lisp:recent-reject-p rejects cached))
+       ;; And the filter still works after the reset.
+       (bitcoin-lisp:add-recent-reject rejects cached)
+       (is-true (bitcoin-lisp:recent-reject-p rejects cached)))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))

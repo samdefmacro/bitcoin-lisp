@@ -236,6 +236,43 @@ of the script."
          (let ((push (aref script-pubkey 1)))
            (and (<= 2 push 40) (= len (+ 2 push)))))))
 
+(defun pay-to-anchor-p (script-pubkey)
+  "True for a pay-to-anchor (P2A) output: the witness-v1 program OP_1 <push-2
+0x4e73>, byte-exactly #x51 #x02 #x4e #x73 (Core CScript::IsPayToAnchor,
+script/script.h). Spending a P2A never requires witness data, so it is
+excluded from the witness-stripped classification below."
+  (and (= (length script-pubkey) 4)
+       (= (aref script-pubkey 0) #x51)
+       (= (aref script-pubkey 1) #x02)
+       (= (aref script-pubkey 2) #x4e)
+       (= (aref script-pubkey 3) #x73)))
+
+(defun spends-non-anchor-witness-program-p (tx utxo-set extra-coins)
+  "True if any input of TX spends a witness-program output (any version,
+including not-yet-defined ones) other than pay-to-anchor — directly, or via
+P2SH whose redeem script (the scriptSig's last push; the scriptSig is known
+push-only here from the standardness checks) is a witness program. Port of
+Core SpendsNonAnchorWitnessProg (policy/policy.cpp:340-373): the classifier
+for a script failure that could be explained by a stripped witness."
+  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+           (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
+           (pidx (bitcoin-lisp.serialization:outpoint-index prevout))
+           (utxo (or (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)
+                     (when extra-coins (gethash (cons ptxid pidx) extra-coins))))
+           (spk (and utxo (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))))
+      (when spk
+        (cond
+          ((and (output-witness-program-p spk)
+                (not (pay-to-anchor-p spk)))
+           (return-from spends-non-anchor-witness-program-p t))
+          ((script-is-p2sh-p spk)
+           (let ((redeem (extract-last-push
+                          (bitcoin-lisp.serialization:tx-in-script-sig input))))
+             (when (and redeem (output-witness-program-p redeem))
+               (return-from spends-non-anchor-witness-program-p t))))))))
+  nil)
+
 (defun dust-threshold (script-pubkey)
   "Minimum non-dust value for an output paying to SCRIPT-PUBKEY (Bitcoin Core
 GetDustThreshold). Unspendable (OP_RETURN) outputs return 0 — never dust."
@@ -675,8 +712,14 @@ decide (Core PreChecks, validation.cpp:950-970)."
                         (when (and redeem
                                    (> (count-script-sigops redeem :accurate t)
                                       +max-standard-p2sh-sigops+))
+                          ;; Core AreInputsStandard (policy.cpp) →
+                          ;; TX_INPUTS_NOT_STANDARD "bad-txns-nonstandard-
+                          ;; inputs": distinct from the TX_NOT_STANDARD total
+                          ;; sigop-cost cap above, because this failure depends
+                          ;; only on the txid (spent scriptPubKeys + scriptSig)
+                          ;; — the P2P reject cache may key it by txid too.
                           (return-from validate-transaction-for-mempool
-                            (values nil :too-many-sigops nil)))))))
+                            (values nil :nonstandard-inputs nil)))))))
                 ;; Policy: witness must be standard (P2WSH/Taproot stack &
                 ;; script limits, no annex). Needs the spent scriptPubKeys,
                 ;; hence inside this flet.
@@ -688,8 +731,18 @@ decide (Core PreChecks, validation.cpp:950-970)."
 
       ;; Contextual validation (consensus): coinbase maturity, fee calculation.
       ;; EXTRA-COINS is passed as pending-utxos so chained-spend inputs resolve.
+      ;; The spend height is the NEXT block's height, not the tip's: Core's
+      ;; PreChecks calls Consensus::CheckTxInputs with nSpendHeight =
+      ;; m_active_chainstate.m_chain.Height() + 1 (validation.cpp, PreChecks:
+      ;; "m_view.GetBestBlock() is the tip; a tx enters a block one higher"),
+      ;; and maturity is nSpendHeight - coin.nHeight < COINBASE_MATURITY
+      ;; (consensus/tx_verify.cpp) — so a coinbase spend maturing at tip+1
+      ;; must be accepted NOW. Same tip+1 the finality/BIP68 checks above and
+      ;; mempool-extra-coins already use. Block connection is untouched: there
+      ;; current-height IS the connecting block's height, already the spend
+      ;; height.
       (multiple-value-bind (valid error fee)
-          (validate-transaction-contextual tx utxo-set current-height
+          (validate-transaction-contextual tx utxo-set (1+ current-height)
                                            :pending-utxos extra-coins)
         (unless valid
           (return-from validate-transaction-for-mempool
@@ -756,6 +809,25 @@ decide (Core PreChecks, validation.cpp:950-970)."
               (unless ok
                 (return-from validate-transaction-for-mempool (values nil reason nil)))
               (setf replaced-set rset)))
+
+          ;; Witness-stripped gate: a tx with NO witness data spending a
+          ;; (non-anchor) witness program can never satisfy its scripts —
+          ;; the witness is simply missing. Core fails these inside
+          ;; CheckInputScripts and PolicyScriptChecks then reclassifies the
+          ;; failure TX_WITNESS_STRIPPED (validation.cpp:1132-1150,
+          ;; SpendsNonAnchorWitnessProg) so the P2P layer never caches it in
+          ;; recent-rejects: a stripped tx's wtxid equals its txid, so
+          ;; caching would poison the real witnessed tx's txid and block its
+          ;; relay permanently. Our script engine treats an absent witness
+          ;; as no-op for witness-program inputs (validate-input-script's
+          ;; legacy-block tolerance), so the check must run explicitly here
+          ;; — without it a stripped segwit tx was ACCEPTED into the
+          ;; mempool. Anchor (P2A) spends are exempt: they legitimately
+          ;; carry no witness.
+          (when (and (not (bitcoin-lisp.serialization:transaction-has-witness-p tx))
+                     (spends-non-anchor-witness-program-p tx utxo-set extra-coins))
+            (return-from validate-transaction-for-mempool
+              (values nil :witness-stripped nil)))
 
           ;; Script validation (consensus)
           (multiple-value-bind (scripts-valid failed-input)
