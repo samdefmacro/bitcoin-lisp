@@ -682,3 +682,228 @@ size fails the floor."
            tx utxo-set mempool 200 :chain-state chain-state)
         (is-false valid)
         (is (eq :insufficient-fee err))))))
+
+;;;; Wave 9C: PackageTRUCChecks (Core policy/truc_policy.cpp:58-170)
+
+(defun %pkg-truc (mempool tx vsize txns)
+  (bitcoin-lisp.validation:package-truc-checks mempool tx vsize txns))
+
+(test package-truc-checks-inheritance
+  "In-package v3<->v2 inheritance: a v3 member cannot spend an in-package v2
+parent, a v2 member cannot spend an in-package v3 parent; a clean v3
+parent/child pair passes."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (funding (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 21))
+         (p3 (%pkg-tx funding 0 99990000 :version 3))
+         (p3id (bitcoin-lisp.serialization:transaction-hash p3))
+         (c3 (%pkg-tx p3id 0 99980000 :version 3))
+         (p2 (%pkg-tx funding 0 99990000 :version 2))
+         (p2id (bitcoin-lisp.serialization:transaction-hash p2))
+         (c3-of-v2 (%pkg-tx p2id 0 99980000 :version 3))
+         (c2-of-v3 (%pkg-tx p3id 0 99980000 :version 2)))
+    ;; clean v3 pair: both members pass
+    (is (null (%pkg-truc mempool p3 100 (list p3 c3))))
+    (is (null (%pkg-truc mempool c3 100 (list p3 c3))))
+    ;; v3 spending in-package v2 parent
+    (is (eq :truc-v3-spends-nonv3
+            (%pkg-truc mempool c3-of-v2 100 (list p2 c3-of-v2))))
+    ;; v2 spending in-package v3 parent
+    (is (eq :truc-nonv3-spends-v3
+            (%pkg-truc mempool c2-of-v3 100 (list p3 c2-of-v3))))))
+
+(test package-truc-checks-child-size-and-ancestors
+  "A v3 child of an in-package parent is capped at TRUC_CHILD_MAX_VSIZE =
+1000 vB; ancestor counting spans mempool AND in-package parents (limit 2
+including self); a member with both a parent and an in-package child fails."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (funding (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 22))
+         (a (%pkg-tx funding 0 99990000 :version 3))
+         (aid (bitcoin-lisp.serialization:transaction-hash a))
+         (b (%pkg-tx aid 0 99980000 :version 3))
+         (bid (bitcoin-lisp.serialization:transaction-hash b))
+         (c (%pkg-tx bid 0 99970000 :version 3)))
+    ;; child size cap (vsize passed directly)
+    (is (eq :truc-child-too-big (%pkg-truc mempool b 1001 (list a b))))
+    (is (null (%pkg-truc mempool b 1000 (list a b))))
+    ;; grandparent chain [A B C]: B has a parent (A) and an in-package
+    ;; child (C) -> too many ancestors (Core truc_policy.cpp:138-142).
+    (is (eq :truc-too-many-ancestors (%pkg-truc mempool b 100 (list a b c))))
+    ;; C itself: one in-package parent (B) + self = 2, fine in isolation...
+    ;; but B's violation already kills the package; C alone passes.
+    (is (null (%pkg-truc mempool c 100 (list b c))))))
+
+(test package-truc-checks-in-package-sibling
+  "Two package members spending the same TRUC parent exceed the descendant
+limit, with NO sibling-eviction escape (the sibling is in the same package,
+Core truc_policy.cpp:127-136); a mempool parent that already has a
+descendant is likewise at its limit."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (funding (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element 23))
+         (parent (%truc-2out-parent funding))
+         (pid (bitcoin-lisp.serialization:transaction-hash parent))
+         (c1 (%pkg-tx pid 0 49980000 :version 3))
+         (c2 (%pkg-tx pid 1 49980000 :version 3)))
+    ;; in-package sibling: checking either child sees the other spend PID
+    (is (eq :truc-descendant-limit (%pkg-truc mempool c1 100 (list parent c1 c2))))
+    ;; mempool parent with an existing pool child: a package child of it is
+    ;; one descendant too many
+    (is (eq :ok (%add-tx mempool parent :fee 20000 :height 200)))
+    (is (eq :ok (%add-tx mempool c1 :fee 20000 :height 200)))
+    (is (eq :truc-descendant-limit (%pkg-truc mempool c2 100 (list c2))))))
+
+(test package-truc-enforced-end-to-end
+  "The in-package TRUC topology is enforced on the CPFP path: a v2 child
+CPFPing a 0-fee v3 parent — invisible to the per-tx single checks because
+the parent is not in the mempool — is rejected by PACKAGE-TRUC-CHECKS and
+the mempool is untouched (pre-Wave-9 this package was ACCEPTED: the
+PackageTRUCChecks port was a stub)."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((parent (%pkg-tx funding 0 100000000 :version 3))   ; 0 fee -> deferred
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (child (%pkg-tx pid 0 99950000 :version 2)))        ; v2 spends v3!
+      (multiple-value-bind (msg results)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state)
+        (is (eq :truc-nonv3-spends-v3 msg))
+        ;; package-level failure: members keep their phase-1 nonfinal results
+        (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status
+                          (%result-for results parent)))))
+      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool))))))
+
+(test package-truc-child-size-end-to-end
+  "TRUC_CHILD_MAX_VSIZE applies to a child of an IN-PACKAGE v3 parent on the
+CPFP path (single checks only see in-mempool parents): a >1000-vB v3 child
+fails the package."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((parent (%pkg-tx funding 0 100000000 :version 3))   ; 0 fee -> deferred
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           ;; Bulk the child past 1000 vB with a large OP_RETURN output
+           ;; (standard now that the datacarrier budget is 100k).
+           (child (bitcoin-lisp.serialization:make-transaction
+                   :version 3
+                   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                      :hash pid :index 0)
+                                    :script-sig (%p2sh-optrue-scriptsig)
+                                    :sequence #xffffffff))
+                   :outputs (vector
+                             (bitcoin-lisp.serialization:make-tx-out
+                              :value 99000000
+                              :script-pubkey (%p2sh-optrue-spk))
+                             (bitcoin-lisp.serialization:make-tx-out
+                              :value 0
+                              :script-pubkey
+                              ;; OP_RETURN + OP_PUSHDATA2 + 2 len bytes + 1000
+                              ;; data bytes = 1004-byte script.
+                              (let ((s (make-array 1004 :element-type '(unsigned-byte 8)
+                                                        :initial-element 0)))
+                                (setf (aref s 0) #x6a      ; OP_RETURN
+                                      (aref s 1) #x4d      ; OP_PUSHDATA2
+                                      (aref s 2) (ldb (byte 8 0) 1000)
+                                      (aref s 3) (ldb (byte 8 8) 1000))
+                                s)))
+                   :lock-time 0)))
+      (is (> (bitcoin-lisp.serialization:transaction-vsize child) 1000))
+      (multiple-value-bind (msg results)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state)
+        (declare (ignore results))
+        (is (eq :truc-child-too-big msg)))
+      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool))))))
+
+;;;; Wave 9C: atomic package acceptance + Core result semantics
+
+(test package-cluster-limit-failure-is-atomic
+  "A package that fails the cluster limits leaves the mempool UNTOUCHED: the
+staged cluster-limit check runs before any mutation (Core changeset
+CheckMemPoolPolicyLimits, validation.cpp:1516-1520). Pre-Wave-9 the members
+were added one by one and a mid-package :too-large-cluster stranded the
+earlier members in the pool."
+  (let ((bitcoin-lisp.mempool:*cluster-count-limit* 2))
+    (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+      (let* ((m (%pkg-tx funding 0 99990000))          ; pool tx, fee 10000
+             (mid (bitcoin-lisp.serialization:transaction-hash m))
+             ;; P spends M's output at 0 fee -> deferred to the CPFP phase.
+             (parent (%pkg-tx mid 0 99990000))
+             (pid (bitcoin-lisp.serialization:transaction-hash parent))
+             (child (%pkg-tx pid 0 99940000))          ; fee 50000
+             (cid (bitcoin-lisp.serialization:transaction-hash child)))
+        (is (eq :ok (%add-tx mempool m :fee 10000 :height 200)))
+        ;; [M P C] would form a 3-tx cluster; the limit is 2. P alone would
+        ;; fit (M-P = 2), so the pre-fix flow admitted P and then stranded it
+        ;; when C tripped the limit.
+        (multiple-value-bind (msg results replaced)
+            (bitcoin-lisp.validation:validate-package-for-mempool
+             (list parent child) utxo-set mempool chain-state)
+          (declare (ignore results))
+          (is (eq :too-large-cluster msg))
+          (is (null replaced)))
+        ;; ATOMIC: neither member entered; the pool is exactly as before.
+        (is (bitcoin-lisp.mempool:mempool-has mempool mid))
+        (is (not (bitcoin-lisp.mempool:mempool-has mempool pid)))
+        (is (not (bitcoin-lisp.mempool:mempool-has mempool cid)))
+        (is (= 1 (bitcoin-lisp.mempool:mempool-count mempool)))
+        (bitcoin-lisp.mempool::%mempool-graph-verify mempool)))))
+
+(test package-hard-failure-does-not-drop-later-members
+  "A member failing individually for a non-fee reason no longer voids the
+rest: Core keeps validating the remaining members individually and the
+valid ones land in the mempool (AcceptPackage quit_early only skips the
+package-feerate retry, validation.cpp:1694-1712)."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((funding2 (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element 31))
+           ;; P1: pays a 100-sat P2SH output -> :dust, a hard failure.
+           (p1 (%pkg-tx funding 0 100))
+           (p1id (bitcoin-lisp.serialization:transaction-hash p1))
+           ;; P2: individually valid with an ample fee.
+           (p2 (%pkg-tx funding2 0 99990000))
+           (p2id (bitcoin-lisp.serialization:transaction-hash p2))
+           (child (%pkg-tx-2in p1id 0 p2id 0 99000000)))
+      (bitcoin-lisp.storage:add-utxo utxo-set funding2 0 100000000
+                                     (%p2sh-optrue-spk) 1 :coinbase nil)
+      (multiple-value-bind (msg results)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list p1 p2 child) utxo-set mempool chain-state)
+        (is (eq :dust msg))
+        (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status
+                          (%result-for results p1))))
+        (is (eq :dust (bitcoin-lisp.validation:package-tx-result-error
+                       (%result-for results p1))))
+        ;; P2 was validated on its own and ENTERED the mempool.
+        (is (eq :valid (bitcoin-lisp.validation:package-tx-result-status
+                        (%result-for results p2))))
+        ;; The child keeps its individual :missing-input (nonfinal) result —
+        ;; the package-feerate retry was skipped.
+        (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status
+                          (%result-for results child))))
+        (is (eq :missing-input (bitcoin-lisp.validation:package-tx-result-error
+                                (%result-for results child)))))
+      (is (bitcoin-lisp.mempool:mempool-has mempool p2id))
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool p1id))))))
+
+(test package-feerate-failure-lands-on-child
+  "A package-feerate failure is reported on the CHILD alone, carrying the
+package feerate and the wtxids it was computed over (Core FeeFailure on
+workspaces.back(), validation.cpp:1504-1509); the parent keeps its phase-1
+individual fee failure without those fields."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((parent (%pkg-tx funding 0 (- 100000000 1)))
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (child (%pkg-tx pid 0 (- (- 100000000 1) 1))))
+      (multiple-value-bind (msg results)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state)
+        (is (eq :insufficient-fee msg))
+        (let ((pres (%result-for results parent))
+              (cres (%result-for results child)))
+          (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status pres)))
+          (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status cres)))
+          ;; the child carries the package-feerate diagnostics
+          (is (not (null (bitcoin-lisp.validation:package-tx-result-effective-feerate cres))))
+          (is (= 2 (length (bitcoin-lisp.validation:package-tx-result-effective-includes cres))))
+          ;; the parent does not
+          (is (null (bitcoin-lisp.validation:package-tx-result-effective-feerate pres))))))))

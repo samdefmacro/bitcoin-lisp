@@ -796,7 +796,6 @@
    #:txgraph-get-descendants-union
    #:txgraph-compare-main-order
    #:txgraph-count-distinct-clusters
-   #:txgraph-cluster-transaction-count
    #:txgraph-rbf-diagrams
    #:txgraph-package-rbf-diagrams
    #:txgraph-get-worst-main-chunk
@@ -829,11 +828,14 @@
    #:save-mempool-file
    #:read-mempool-file
    #:mempool-entry-size
+   #:mempool-entry-usage
    #:mempool-entry-vsize
    #:mempool-entry-wtxid
    #:mempool-entry-sigops
    #:mempool-entry-height
    #:mempool-entry-entry-time
+   #:mempool-entry-sequence
+   #:mempool-sequence
    #:mempool-entry-fee-rate
    ;; Mempool entry links
    #:mempool-entry-parents
@@ -850,6 +852,7 @@
    #:+truc-version+
    #:+truc-max-vsize+
    #:+truc-child-max-vsize+
+   #:+truc-ancestor-limit+
    #:mempool-ancestors
    #:mempool-descendants
    #:mempool-ancestor-stats
@@ -863,17 +866,26 @@
    #:*cluster-size-limit*
    #:mempool-effective-min-fee-rate
    #:mempool-orphan-pool
-   ;; Orphan pool
+   ;; Orphan pool (Core TxOrphanage at d3056bc: wtxid-keyed, per-peer
+   ;; announcement accounting, DoS-bounded eviction, no time expiry)
    #:make-orphan-pool
    #:orphan-pool-count
    #:orphan-entry-transaction
-   #:orphan-entry-from-peer
    #:orphan-add
    #:orphan-remove
    #:orphan-tx
+   #:orphan-have
+   #:orphan-have-from-peer
+   #:orphan-announcers
    #:orphans-depending-on
    #:orphan-erase-for-peer
-   #:orphan-expire
+   #:orphan-erase-for-block
+   #:orphan-total-usage
+   #:orphan-total-latency-score
+   #:orphan-usage-by-peer
+   #:orphan-announcements-from-peer
+   #:+max-orphanage-latency-score+
+   #:+reserved-orphan-weight-per-peer+
    #:tx-signals-rbf-p
    #:find-rbf-conflicts
    #:check-rbf-rules
@@ -888,8 +900,11 @@
    #:mempool-remove
    #:mempool-count
    #:mempool-total-size
+   #:mempool-dynamic-usage
+   #:transaction-dynamic-usage
    #:mempool-min-fee-rate
    #:mempool-check-conflict
+   #:mempool-package-fits-cluster-limits-p
    #:mempool-remove-for-block
    #:mempool-remove-spenders
    #:mempool-update-for-reorg
@@ -931,6 +946,7 @@
    #:validate-transaction-for-mempool
    ;; Package relay (submitpackage)
    #:validate-package-for-mempool
+   #:package-truc-checks
    #:package-well-formed
    #:package-child-with-parents-tree-p
    #:+max-package-count+
@@ -974,6 +990,12 @@
    #:connect-block
    #:activate-block
    #:find-fork-point
+   ;; Tx-relay tip structures (Core recent-confirmed filter +
+   ;; most-recent-block tx map)
+   #:recently-confirmed-p
+   #:most-recent-block-tx
+   #:note-block-connected
+   #:reset-recent-confirmed
    #:perform-reorg
    #:get-undo-data
    #:invalidate-block
@@ -1062,6 +1084,12 @@
    #:close-connection
    #:send-bytes
    #:receive-bytes
+   ;; Non-blocking send buffer (Core vSendMsg / fPauseSend / SocketSendData)
+   #:connection-send-paused-p
+   #:connection-send-stalled-p
+   #:flush-send-buffer
+   #:flush-peer-send-buffers
+   #:+max-send-buffer-bytes+
    ;; BIP324 v2 transport
    #:*v2-transport-enabled*
    #:v2-available-p
@@ -1099,6 +1127,13 @@
    #:reset-tx-requests
    #:tx-request-wanted-p
    #:tx-request-received
+   #:tx-request-notfound
+   #:tx-request-disconnected-peer
+   #:tx-request-count
+   #:process-tx-requests
+   ;; Steady-state message pump (post-IBD receive loop)
+   #:pump-peer-messages
+   #:ibd-context-headers-received
    ;; Trickled tx announcement flushing
    #:flush-tx-announcements
    ;; Local-submission broadcast (unbroadcast set)
@@ -1118,6 +1153,8 @@
    #:peer-inbound
    #:peer-conn-type
    #:peer-relays-txs-p
+   #:peer-tx-relay-p
+   #:peer-last-inv-sequence
    #:peer-getaddr-sent
    #:connect-peer
    #:disconnect-peer
@@ -1148,6 +1185,7 @@
    #:ip-netgroup
    ;; Protocol
    #:handle-message
+   #:ingest-headers-from-peer
    #:request-headers
    #:request-blocks
    #:sync-with-peer
@@ -1254,6 +1292,7 @@
    #:peer-prefers-headers
    #:peer-feefilter-rate
    #:peer-wtxid-relay
+   #:handle-addr
    #:handle-addrv2
    ;; Misbehavior and banning
    #:record-misbehavior

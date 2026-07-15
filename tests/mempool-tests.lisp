@@ -351,7 +351,7 @@ removal (eviction/expiry funnel through mempool-remove, Core removeUnchecked
 (test mempool-eviction-lowest-fee-rate
   "When mempool is full, lowest fee-rate entry is evicted for a higher one."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool
-                   :max-size 100))  ; Smaller than one tx (~95 bytes)
+                   :max-size 800))  ; one tx models to 704 usage bytes; two to 1392
          (tx1 (make-mempool-test-tx :input-id 10 :value 10000000))
          (tx2 (make-mempool-test-tx :input-id 11 :value 20000000))
          (txid1 (bitcoin-lisp.serialization:transaction-hash tx1))
@@ -370,7 +370,7 @@ removal (eviction/expiry funnel through mempool-remove, Core removeUnchecked
 (test mempool-reject-low-fee-when-full
   "When mempool is full, a transaction with lower fee-rate than all entries is rejected."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool
-                   :max-size 100))
+                   :max-size 800))  ; one tx = 704 usage bytes, two = 1392
          (tx1 (make-mempool-test-tx :input-id 12 :value 10000000))
          (tx2 (make-mempool-test-tx :input-id 13 :value 20000000))
          (txid1 (bitcoin-lisp.serialization:transaction-hash tx1))
@@ -571,26 +571,77 @@ without bound (the old hash-table leaked per-peer memory forever)."
     (is (not (bitcoin-lisp.validation::standard-output-script-p script)))))
 
 (defun %op-return-script (data-len)
-  "An OP_RETURN scriptPubKey carrying DATA-LEN data bytes (OP_RETURN +
-1-byte pushdata prefix + data)."
-  (let ((s (make-array (+ 2 data-len) :element-type '(unsigned-byte 8) :initial-element 0)))
-    (setf (aref s 0) #x6a (aref s 1) data-len)
-    s))
+  "An OP_RETURN scriptPubKey carrying DATA-LEN data bytes: OP_RETURN + a
+direct push (<=75) or OP_PUSHDATA1 prefix + data."
+  (if (<= data-len 75)
+      (let ((s (make-array (+ 2 data-len) :element-type '(unsigned-byte 8)
+                           :initial-element 0)))
+        (setf (aref s 0) #x6a (aref s 1) data-len)
+        s)
+      (let ((s (make-array (+ 3 data-len) :element-type '(unsigned-byte 8)
+                           :initial-element 0)))
+        (setf (aref s 0) #x6a (aref s 1) #x4c (aref s 2) data-len)
+        s)))
 
-(test datacarrier-policy-knobs
-  "*accept-datacarrier* gates OP_RETURN standardness; *max-datacarrier-bytes*
-sizes it (-datacarrier / -datacarriersize)."
-  (let ((ok (%op-return-script 75))      ; 77 bytes total
-        (big (%op-return-script 82)))     ; 84 bytes total, over the 83 default
-    ;; default: accepted up to the size cap, rejected beyond it
-    (is (bitcoin-lisp.validation::standard-output-script-p ok))
-    (is (not (bitcoin-lisp.validation::standard-output-script-p big)))
-    ;; datacarrier disabled: even a small OP_RETURN is non-standard
-    (let ((bitcoin-lisp:*accept-datacarrier* nil))
-      (is (not (bitcoin-lisp.validation::standard-output-script-p ok))))
-    ;; raised size cap admits the larger script
-    (let ((bitcoin-lisp:*max-datacarrier-bytes* 100))
-      (is (bitcoin-lisp.validation::standard-output-script-p big)))))
+(defun %datacarrier-validate (data-lens &key value)
+  "Validate (against an empty UTXO set) a tx whose outputs are OP_RETURN
+scripts carrying DATA-LENS data bytes each, plus one standard P2PKH output.
+Returns the rejection keyword. A tx passing the output-standardness stage
+fails later with :missing-input (empty UTXO set), so :missing-input here
+means the datacarrier budget was satisfied."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (base (make-mempool-test-tx :input-id 90 :value (or value 50000000)))
+         (outputs (concatenate
+                   'vector
+                   (bitcoin-lisp.serialization:transaction-outputs base)
+                   (map 'vector (lambda (len)
+                                  (bitcoin-lisp.serialization:make-tx-out
+                                   :value 0
+                                   :script-pubkey (%op-return-script len)))
+                        data-lens)))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 1
+              :inputs (bitcoin-lisp.serialization:transaction-inputs base)
+              :outputs outputs
+              :lock-time 0)))
+    (nth-value 1 (bitcoin-lisp.validation:validate-transaction-for-mempool
+                  tx utxo mempool 100))))
+
+(test datacarrier-shared-budget
+  "OP_RETURN outputs draw on ONE shared -datacarriersize byte budget (Core
+IsStandardTx datacarrier_bytes_left, policy.cpp:136-150): each output's whole
+scriptPubKey size counts, multiple outputs are fine within the budget, and
+the default budget is MAX_OP_RETURN_RELAY = 100,000."
+  ;; Default budget is Core's MAX_OP_RETURN_RELAY.
+  (is (= 100000 bitcoin-lisp:*max-datacarrier-bytes*))
+  ;; Per-output classification no longer size-caps OP_RETURN.
+  (is-true (bitcoin-lisp.validation::standard-output-script-p
+            (%op-return-script 200)))
+  (let ((bitcoin-lisp:*max-datacarrier-bytes* 168))
+    ;; Two 84-byte scripts (OP_RETURN + PUSHDATA1 + len + 81 data) total
+    ;; exactly 168 <= 168: both fit the shared budget.
+    (is (eq :missing-input (%datacarrier-validate '(81 81))))
+    ;; Three of them (252 bytes) overdraw the shared budget -> "datacarrier".
+    (is (eq :datacarrier (%datacarrier-validate '(81 81 81))))
+    ;; A single output bigger than the whole budget is rejected outright.
+    (is (eq :datacarrier (%datacarrier-validate '(180))))
+    ;; The budget counts each WHOLE script (84 bytes), not the data (81):
+    ;; 165 covers the 162 data bytes but not two whole scripts.
+    (let ((bitcoin-lisp:*max-datacarrier-bytes* 165))
+      (is (eq :datacarrier (%datacarrier-validate '(81 81)))))))
+
+(test datacarrier-disabled-zeroes-budget
+  "-datacarrier=0 zeroes the shared budget: any OP_RETURN output — of any
+size — fails with the \"datacarrier\" reason (Core mempool_args.cpp:95-98:
+max_datacarrier_bytes = nullopt -> value_or(0)); classification itself stays
+NULL_DATA (standard)."
+  (let ((bitcoin-lisp:*accept-datacarrier* nil))
+    ;; Still classified a standard script type...
+    (is-true (bitcoin-lisp.validation::standard-output-script-p
+              (%op-return-script 3)))
+    ;; ...but any NULL_DATA output overdraws the zero budget.
+    (is (eq :datacarrier (%datacarrier-validate '(3))))))
 
 (test bare-multisig-policy-knob
   "Bare multisig is standard by default (DEFAULT_PERMIT_BAREMULTISIG=true) and
@@ -1263,7 +1314,7 @@ as confirming in the next block for BIP68 (validation.cpp:185-192)."
 (test mempool-eviction-removes-descendants
   "Evicting a low-fee parent also removes its in-mempool child (no orphan):
 the CPFP pair shares one chunk, evicted as a unit."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 260))
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 1500)) ; 2 txs = 1392 usage, 3 = 2080
          (a (make-mempool-test-tx :input-id 95))
          (atxid (bitcoin-lisp.serialization:transaction-hash a))
          (b (%mp-spending-tx atxid))
@@ -1286,7 +1337,7 @@ before a CPFP pair whose merged chunk feerate beats it (the high-fee child
 protects its low-fee parent), and the rolling minimum fee rises to exactly
 the evicted chunk's feerate plus the incremental relay fee (Core TrimToSize
 + trackPackageRemoved)."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 260))
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 1500)) ; 2 txs = 1392 usage, 3 = 2080
          (p (make-mempool-test-tx :input-id 101))
          (ptxid (bitcoin-lisp.serialization:transaction-hash p))
          (c (%mp-spending-tx ptxid))
@@ -1312,7 +1363,7 @@ the evicted chunk's feerate plus the incremental relay fee (Core TrimToSize
   "A newcomer whose own chunk is the worst evicts itself (Core: add, trim,
 then \"mempool full\" when the tx is gone) - and still bumps the rolling
 minimum fee past its feerate, so an equal-feerate retry cannot loop."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 100))
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 800)) ; one tx = 704 usage bytes
          (rich (make-mempool-test-tx :input-id 103))
          (poor (make-mempool-test-tx :input-id 104))
          (poor-vsize (bitcoin-lisp.serialization:transaction-vsize poor)))
@@ -1402,7 +1453,7 @@ accept path never consults SignalsOptInRBF; IsRBFOptIn survives for RPC only)."
 ;;;; Diagram RBF (cluster mempool P7 — Core policy/rbf.cpp ImprovesFeerateDiagram
 ;;;; + ReplacementChecks, ported from src/test/rbf_tests.cpp). check-rbf-rules
 ;;;; now: drops rules 1/2 (full-RBF unconditional), keeps rules 3/4, redefines
-;;;; rule 5 (100-cluster + 500-tx gather caps), and requires the replacement to
+;;;; rule 5 (100-distinct-cluster cap only), and requires the replacement to
 ;;;; strictly improve the mempool feerate diagram.
 
 (defun %rbf-chain (mempool root-id length &key (fee 10000))
@@ -1503,21 +1554,25 @@ CANDIDATES, rbf.cpp:69-74). 100 distinct clusters is allowed."
         (declare (ignore reason))
         (is-true ok)))))
 
-(test rbf-rule5-gather-cap
-  "Rule 5 second bound: the conflicting clusters may hold at most 500 txs in
-total (Core GatherClusters cap). A single conflicting cluster larger than the
-cap is rejected :too-many-replacements."
+(test rbf-rule5-no-transaction-count-cap
+  "Rule 5 bounds only the DISTINCT CLUSTER count; there is no cap on how many
+transactions those clusters hold (the old 500-tx gather cap was ours alone —
+Core's GatherClusters cap serves the mini-miner fee estimator,
+node/mini_miner.cpp:66, and GetEntriesForConflicts, rbf.cpp:58-83, checks
+only GetUniqueClusterCount). Replacing the root of a multi-tx cluster is
+decided by the economics, not a transaction-count bound."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
-         ;; A 3-tx conflicting cluster with the cap lowered to 2.
-         (root-txid (%rbf-chain mempool 150 3 :fee 10000))
-         (cand (%rbf-tx 150 :value 40000000))   ; conflicts with the root
-         (bitcoin-lisp.mempool::+max-rbf-gather-transactions+ 2))
-    (multiple-value-bind (ok reason)
+         ;; One conflicting cluster of 5 chained txs.
+         (root-txid (%rbf-chain mempool 150 5 :fee 10000))
+         (cand (%rbf-tx 150 :value 40000000)))   ; conflicts with the root
+    (multiple-value-bind (ok reason replaced)
         (bitcoin-lisp.mempool:check-rbf-rules
          mempool cand 100000000 (bitcoin-lisp.serialization:transaction-vsize cand)
          (list root-txid))
-      (is-false ok)
-      (is (eq reason :too-many-replacements)))))
+      (declare (ignore reason))
+      (is-true ok)
+      ;; The whole 5-tx chain (root + descendants) is the replaced set.
+      (is (= 5 (hash-table-count replaced))))))
 
 (test rbf-diagram-uncalculable-is-too-large-cluster
   "When the staged replacement would form an over-limit cluster the diagram is
@@ -1540,7 +1595,7 @@ CheckMemPoolPolicyLimits failing before ImprovesFeerateDiagram)."
 (test mempool-cpfp-eviction-protects-parent
   "Eviction ranks by descendant-package fee-rate: a high-fee child protects its
 low-fee parent, so a cheaper standalone tx is evicted first."
-  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 300))
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool :max-size 2200)) ; 3 txs = 2080 usage, 4 = 2768
          (s (make-mempool-test-tx :input-id 110))        ; standalone, low fee
          (stxid (bitcoin-lisp.serialization:transaction-hash s))
          (p (make-mempool-test-tx :input-id 111))        ; parent, low fee
@@ -1616,36 +1671,131 @@ uses the legacy form regardless."
   (make-array 32 :element-type '(unsigned-byte 8) :initial-element n))
 
 (test orphan-add-depend-remove
-  "Orphans are indexed by parent txid; remove clears the index."
+  "Orphans are indexed under each input's parent txid; remove clears the
+index. The pool is wtxid-keyed (Core TxOrphanage) — for this witnessless tx
+wtxid == txid."
   (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
          (parent (%txid-array 50))
          (o (%mp-spending-tx parent))
-         (otxid (bitcoin-lisp.serialization:transaction-hash o)))
+         (owtxid (bitcoin-lisp.serialization:transaction-wtxid o)))
     (is-true (bitcoin-lisp.mempool:orphan-add pool o nil))
     (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))
-    (is (member otxid (bitcoin-lisp.mempool:orphans-depending-on pool parent) :test #'equalp))
-    (is (bitcoin-lisp.mempool:orphan-remove pool otxid))
+    (is (member owtxid (bitcoin-lisp.mempool:orphans-depending-on pool parent) :test #'equalp))
+    (is-true (bitcoin-lisp.mempool:orphan-have pool owtxid))
+    (is (bitcoin-lisp.mempool:orphan-remove pool owtxid))
     (is (= 0 (bitcoin-lisp.mempool:orphan-pool-count pool)))
     (is (null (bitcoin-lisp.mempool:orphans-depending-on pool parent)))))
 
-(test orphan-expiry
-  "orphan-expire drops entries older than the expiry window."
+(test orphan-multiple-announcers
+  "One orphan can carry several announcers (Core AddTx/AddAnnouncer): a
+second peer's announcement doesn't duplicate the orphan, erase-for-peer
+removes only that peer's announcement, and the orphan disappears with its
+LAST announcer (Core EraseForPeer)."
   (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
-         (o (%mp-spending-tx (%txid-array 51))))
-    (bitcoin-lisp.mempool:orphan-add pool o nil)
+         (peer-a (list :a))
+         (peer-b (list :b))
+         (o (%mp-spending-tx (%txid-array 52)))
+         (owtxid (bitcoin-lisp.serialization:transaction-wtxid o)))
+    ;; First announcement stores the orphan; the second only adds an announcer.
+    (is-true (bitcoin-lisp.mempool:orphan-add pool o peer-a))
+    (is-false (bitcoin-lisp.mempool:orphan-add pool o peer-b))
+    ;; Duplicate (wtxid, peer) announcement is a no-op.
+    (is-false (bitcoin-lisp.mempool:orphan-add pool o peer-a))
     (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))
-    (is (= 1 (bitcoin-lisp.mempool:orphan-expire
-              pool (+ (bitcoin-lisp.serialization:get-unix-time)
-                      bitcoin-lisp.mempool::+orphan-expire-seconds+ 1))))
+    (is (= 2 (bitcoin-lisp.mempool::orphan-pool-announcement-count pool)))
+    (is-true (bitcoin-lisp.mempool:orphan-have-from-peer pool owtxid peer-a))
+    (is-true (bitcoin-lisp.mempool:orphan-have-from-peer pool owtxid peer-b))
+    ;; peer-a disconnects: the orphan survives via peer-b.
+    (is (= 1 (bitcoin-lisp.mempool:orphan-erase-for-peer pool peer-a)))
+    (is (= 1 (bitcoin-lisp.mempool:orphan-pool-count pool)))
+    (is-false (bitcoin-lisp.mempool:orphan-have-from-peer pool owtxid peer-a))
+    ;; Last announcer goes: so does the orphan.
+    (is (= 1 (bitcoin-lisp.mempool:orphan-erase-for-peer pool peer-b)))
     (is (= 0 (bitcoin-lisp.mempool:orphan-pool-count pool)))))
 
-(test orphan-cap
-  "The orphan pool is bounded by +max-orphan-transactions+."
-  (let ((pool (bitcoin-lisp.mempool:make-orphan-pool)))
-    (dotimes (i 110)
-      (bitcoin-lisp.mempool:orphan-add pool (%mp-spending-tx (%txid-array i)) nil))
-    (is (<= (bitcoin-lisp.mempool:orphan-pool-count pool)
-            bitcoin-lisp.mempool::+max-orphan-transactions+))))
+(test orphan-oversized-rejected
+  "Orphans above max standard tx weight are never stored (Core AddTx's
+MAX_STANDARD_TX_WEIGHT check — the send-big-orphans memory-exhaustion
+attack)."
+  (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
+         (big (bitcoin-lisp.serialization:make-transaction
+               :version 1
+               :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                  :hash (%txid-array 53) :index 0)
+                                :script-sig (make-array 110000
+                                                        :element-type '(unsigned-byte 8)
+                                                        :initial-element 0)
+                                :sequence #xFFFFFFFF))
+               :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                 :value 1000
+                                 :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
+                                                              :initial-element #x51)))
+               :lock-time 0)))
+    (is (> (bitcoin-lisp.serialization:transaction-weight big)
+           bitcoin-lisp.mempool::+orphan-max-tx-weight+))
+    (is-false (bitcoin-lisp.mempool:orphan-add pool big nil))
+    (is (= 0 (bitcoin-lisp.mempool:orphan-pool-count pool)))))
+
+(test orphan-eviction-is-per-peer-fair
+  "A single peer flooding the orphanage cannot evict another peer's orphans
+(Core LimitOrphans: eviction targets the peer with the highest DoS score,
+so a peer within its own reservation is never trimmed while a flooder
+exceeds its allowance). The pool ends within its global limits and only
+the flooder lost announcements."
+  (let ((pool (bitcoin-lisp.mempool:make-orphan-pool))
+        (victim (list :victim))
+        (attacker (list :attacker)))
+    ;; The victim announces one modest orphan.
+    (let ((vic-tx (%mp-spending-tx (%txid-array 200))))
+      (is-true (bitcoin-lisp.mempool:orphan-add pool vic-tx victim))
+      ;; The attacker floods well past every per-peer allowance. Announcement
+      ;; latency score is 1 each (single-input txs), so the global latency
+      ;; budget (3000) is the binding limit with two peers.
+      (dotimes (i 3500)
+        (bitcoin-lisp.mempool:orphan-add
+         pool
+         (%mp-spending-tx (%txid-array (mod i 250)) :vout i)
+         attacker))
+      ;; Global limits are enforced...
+      (is (<= (bitcoin-lisp.mempool:orphan-total-latency-score pool)
+              bitcoin-lisp.mempool:+max-orphanage-latency-score+))
+      (is (<= (bitcoin-lisp.mempool:orphan-total-usage pool)
+              (* 2 bitcoin-lisp.mempool:+reserved-orphan-weight-per-peer+)))
+      ;; ...the attacker lost announcements to the trim...
+      (is (< (bitcoin-lisp.mempool:orphan-announcements-from-peer pool attacker)
+             3500))
+      ;; ...and the victim's orphan is untouched.
+      (is-true (bitcoin-lisp.mempool:orphan-have-from-peer
+                pool
+                (bitcoin-lisp.serialization:transaction-wtxid vic-tx)
+                victim)))))
+
+(test orphan-erase-for-block
+  "Orphans included in or conflicting with a connected block are erased by
+EXACT spent outpoint (Core EraseForBlock): an orphan spending a different
+output of the same parent tx survives."
+  (let* ((pool (bitcoin-lisp.mempool:make-orphan-pool))
+         (parent (%txid-array 70))
+         (conflicted (%mp-spending-tx parent :vout 0))
+         (unrelated (%mp-spending-tx parent :vout 1))
+         (block-tx (%mp-spending-tx parent :vout 0 :value 123456))
+         (block (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header (bitcoin-lisp.serialization:make-block-header
+                          :version 1
+                          :prev-block (%txid-array 0)
+                          :merkle-root (%txid-array 0)
+                          :timestamp 1700000000 :bits #x1d00ffff :nonce 0)
+                 :transactions (list block-tx))))
+    (bitcoin-lisp.mempool:orphan-add pool conflicted (list :p))
+    (bitcoin-lisp.mempool:orphan-add pool unrelated (list :p))
+    (is (= 2 (bitcoin-lisp.mempool:orphan-pool-count pool)))
+    ;; block-tx spends parent:0 — conflicts with CONFLICTED only.
+    (is (= 1 (bitcoin-lisp.mempool:orphan-erase-for-block pool block)))
+    (is-false (bitcoin-lisp.mempool:orphan-have
+               pool (bitcoin-lisp.serialization:transaction-wtxid conflicted)))
+    (is-true (bitcoin-lisp.mempool:orphan-have
+              pool (bitcoin-lisp.serialization:transaction-wtxid unrelated)))))
 
 (test orphan-erase-for-peer
   "orphan-erase-for-peer drops only the given peer's orphans."
@@ -2105,3 +2255,111 @@ Core's entry reports and mines by (CTxMemPoolEntry::GetTxSize)."
            (bitcoin-lisp.mempool:mempool-entry-vsize plain)))
     (is (< weight (* 400 20)))          ; sigops dominate for this tiny tx
     (is (= 2000 (bitcoin-lisp.mempool:mempool-entry-vsize dense)))))
+
+;;;; Wave 9C: modeled dynamic memory usage (Core DynamicMemoryUsage)
+
+(test dynamic-usage-models-core-formula
+  "The mempool cap is keyed on Core's malloc-modeled DYNAMIC MEMORY USAGE,
+computed as a formula over transaction structure (core_memusage.h /
+memusage.h / txmempool.cpp:778-782, 64-bit): for the 1-in/1-out test tx
+(both scripts within the 36-byte prevector direct storage) the entry usage
+is MallocUsage(sizeof CTransaction=128) + MallocUsage(shared counter=24) +
+MallocUsage(1*sizeof CTxIn=112) + MallocUsage(1*sizeof CTxOut=48) =
+144+48+128+64 = 384; the pool adds per-entry mapTx (224), per-input
+mapNextTx (64) and the txns_randomized vector on top."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 230))
+         (entry (make-mempool-entry-for-tx tx)))
+    ;; MallocUsage: 16 bytes overhead rounded up to a 16-byte boundary; 0 -> 0.
+    (is (= 0 (bitcoin-lisp.mempool::malloc-usage 0)))
+    (is (= 32 (bitcoin-lisp.mempool::malloc-usage 1)))
+    (is (= 48 (bitcoin-lisp.mempool::malloc-usage 24)))
+    (is (= 144 (bitcoin-lisp.mempool::malloc-usage 128)))
+    ;; Entry usage (Core CTxMemPoolEntry::nUsageSize).
+    (is (= 384 (bitcoin-lisp.mempool:transaction-dynamic-usage tx)))
+    (is (= 384 (bitcoin-lisp.mempool:mempool-entry-usage entry)))
+    ;; Empty pool models zero.
+    (is (= 0 (bitcoin-lisp.mempool:mempool-dynamic-usage mempool)))
+    ;; One entry: 224 (mapTx node) + 64 (mapNextTx per input) +
+    ;; MallocUsage(16) = 32 (txns_randomized) + 384 (inner) = 704.
+    (bitcoin-lisp.mempool:mempool-add
+     mempool (bitcoin-lisp.serialization:transaction-hash tx) entry)
+    (is (= 704 (bitcoin-lisp.mempool:mempool-dynamic-usage mempool)))
+    ;; Second identical-shape entry: 2*224 + 2*64 + MallocUsage(32)=48 + 768.
+    (let ((tx2 (make-mempool-test-tx :input-id 231)))
+      (bitcoin-lisp.mempool:mempool-add
+       mempool (bitcoin-lisp.serialization:transaction-hash tx2)
+       (make-mempool-entry-for-tx tx2))
+      (is (= 1392 (bitcoin-lisp.mempool:mempool-dynamic-usage mempool))))
+    ;; A prioritisation delta for an absent txid adds one mapDeltas node (96).
+    (bitcoin-lisp.mempool:mempool-prioritise
+     mempool (make-array 32 :element-type '(unsigned-byte 8) :initial-element 99)
+     500)
+    (is (= (+ 1392 96) (bitcoin-lisp.mempool:mempool-dynamic-usage mempool)))
+    ;; Removal restores the previous number exactly.
+    (bitcoin-lisp.mempool:mempool-remove
+     mempool (bitcoin-lisp.serialization:transaction-hash tx))
+    (is (= (+ 704 96) (bitcoin-lisp.mempool:mempool-dynamic-usage mempool)))))
+
+(test dynamic-usage-counts-witness-and-large-scripts
+  "Witness stacks and over-36-byte scripts allocate in Core's model: each
+witness stack costs MallocUsage(items * 24) plus MallocUsage(len) per
+non-empty item (core_memusage.h:20-26); scripts within the prevector's
+36-byte direct storage cost nothing, longer ones MallocUsage(len)."
+  ;; %witness-tx-for-relay: 1-in/1-out (384) + stack of one 4-byte item:
+  ;; MallocUsage(24) = 48 outer + MallocUsage(4) = 32 item -> 464.
+  (is (= 464 (bitcoin-lisp.mempool:transaction-dynamic-usage
+              (%witness-tx-for-relay))))
+  ;; A 37-byte scriptPubKey exceeds direct storage: + MallocUsage(37) = 64.
+  (let ((base (make-mempool-test-tx :input-id 232)))
+    (flet ((tx-with-spk (n)
+             (bitcoin-lisp.serialization:make-transaction
+              :version 1
+              :inputs (bitcoin-lisp.serialization:transaction-inputs base)
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 50000000
+                                :script-pubkey (make-array
+                                                n :element-type '(unsigned-byte 8)
+                                                :initial-element 0)))
+              :lock-time 0)))
+      (is (= 384 (bitcoin-lisp.mempool:transaction-dynamic-usage (tx-with-spk 36))))
+      (is (= (+ 384 64)
+             (bitcoin-lisp.mempool:transaction-dynamic-usage (tx-with-spk 37)))))))
+
+(test maxmempool-default-is-core-decimal-mb
+  "-maxmempool is a MEMORY cap: DEFAULT_MAX_MEMPOOL_SIZE_MB{300} * 1'000'000
+decimal bytes (Core kernel/mempool_options.h:19,40), not 300 MiB, and not
+wire bytes."
+  (is (= 300000000 bitcoin-lisp.mempool:+default-max-mempool-bytes+)))
+
+(test rolling-fee-halflife-shortens-when-pool-underfull
+  "The rolling minimum fee's 12h half-life divides by 4 while the pool's
+dynamic usage sits below 1/4 of the cap (Core GetMinFee,
+txmempool.cpp:836-840), and a rolling rate decayed below half the
+incremental relay fee resets to zero (txmempool.cpp:845-848)."
+  (let ((mempool (bitcoin-lisp.mempool:make-mempool))
+        (now (bitcoin-lisp.serialization:get-unix-time)))
+    ;; Empty pool -> usage 0 < cap/4 -> halflife 43200/4 = 10800. One full
+    ;; 43200 s window is then FOUR half-lives: 16000 -> 1000.
+    (setf (bitcoin-lisp.mempool::mempool-rolling-min-fee-rate mempool) 16000
+          (bitcoin-lisp.mempool::mempool-rolling-min-fee-time mempool) now)
+    (is (= 1000 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate
+                 mempool (+ now 43200))))
+    ;; Decayed below incremental/2 (= 50): resets the slot to 0 and the
+    ;; relay floor applies.
+    (is (= 100 (bitcoin-lisp.mempool:mempool-effective-min-fee-rate
+                mempool (+ now (* 20 43200)))))
+    (is (= 0 (bitcoin-lisp.mempool::mempool-rolling-min-fee-rate mempool)))))
+
+(test getmempoolinfo-reports-usage-and-vsize-bytes
+  "getmempoolinfo: \"bytes\" is the summed sigop-adjusted VIRTUAL size (Core
+GetTotalTxSize, txmempool.h:191) and \"usage\" the modeled DynamicMemoryUsage
+(rpc/mempool.cpp:1040-1041)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 233))
+         (entry (make-mempool-entry-for-tx tx)))
+    (bitcoin-lisp.mempool:mempool-add
+     mempool (bitcoin-lisp.serialization:transaction-hash tx) entry)
+    (is (= (bitcoin-lisp.mempool:mempool-entry-vsize entry)
+           (bitcoin-lisp.mempool:mempool-total-size mempool)))
+    (is (= 704 (bitcoin-lisp.mempool:mempool-dynamic-usage mempool)))))

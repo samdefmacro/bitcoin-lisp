@@ -9,8 +9,19 @@
 
 ;;;; Constants
 
-(defconstant +default-max-mempool-bytes+ (* 300 1024 1024)
-  "Default maximum mempool size in bytes (300 MB).")
+(defconstant +default-max-mempool-bytes+ (* 300 1000 1000)
+  "Default maximum mempool MEMORY usage in bytes: Core -maxmempool is in
+megabytes of modeled dynamic memory usage, DEFAULT_MAX_MEMPOOL_SIZE_MB{300}
+* 1'000'000 (kernel/mempool_options.h:19,40 — decimal MB, not MiB). The cap
+is compared against MEMPOOL-DYNAMIC-USAGE, Core's DynamicMemoryUsage()
+malloc-model — roughly 3x the transactions' wire size — not serialized
+bytes.")
+
+(defparameter +incremental-relay-fee-rate+ 100
+  "Incremental relay fee in satoshis per kvB (Bitcoin Core
+DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB = 0.1 sat/vB): BIP125 rule 4
+pricing, the eviction rolling-fee bump, and the floor below which a decayed
+rolling minimum resets to zero.")
 
 (defconstant +default-min-relay-fee-rate+ 100
   "Default minimum relay fee rate in satoshis per kvB (Bitcoin Core
@@ -54,8 +65,13 @@ DEFAULT_MEMPOOL_EXPIRY_HOURS.")
   ;; the value mining selection, eviction, and RBF scoring see; FEE stays the
   ;; real paid fee (block reward accounting, fees.base). Can go negative.
   (modified-fee 0 :type integer)
-  ;; Serialized (witness) byte length — used for the byte-based mempool size cap.
+  ;; Serialized (witness) byte length (Core GetTransactionSize uses of the
+  ;; wire form; reporting only — the mempool cap is USAGE below).
   (size 0 :type (unsigned-byte 32))
+  ;; Modeled dynamic memory usage (Core CTxMemPoolEntry::nUsageSize,
+  ;; RecursiveDynamicUsage of the tx): the entry's contribution to the
+  ;; pool's cachedInnerUsage, which the -maxmempool cap is keyed on.
+  (usage 0 :type (unsigned-byte 64))
   ;; Sigop-adjusted virtual size (Core CTxMemPoolEntry::GetTxSize,
   ;; kernel/mempool_entry.h:110-113) — the basis for fee-rates, RBF economics,
   ;; TRUC caps, the cluster size limit, and the txgraph chunk feerates that
@@ -69,6 +85,12 @@ DEFAULT_MEMPOOL_EXPIRY_HOURS.")
   ;; Chain height at the time of acceptance.
   (height 0 :type (unsigned-byte 32))
   (entry-time 0 :type (unsigned-byte 64))
+  ;; Mempool admission sequence number (Core CTxMemPoolEntry m_sequence,
+  ;; assigned from the pool's counter at add time). Drives the getdata
+  ;; anti-probing gate: a tx is served to a peer only if it entered the pool
+  ;; BEFORE our last inv flush to that peer (Core info_for_relay,
+  ;; txmempool.h:533, vs Peer::TxRelay::m_last_inv_sequence).
+  (sequence 0 :type (unsigned-byte 64))
   ;; In-mempool dependency links (txid -> t). Ancestor/descendant aggregates
   ;; are derived on demand by walking these (bounded by the 25/25 limits), so
   ;; there are no cached totals to drift out of sync.
@@ -95,6 +117,111 @@ chunk feerates the transactions whose cost to the network is validation
 work rather than bytes."
   (ceiling (max weight (* sigops +bytes-per-sigop+)) 4))
 
+;;;; Modeled dynamic memory usage (Core DynamicMemoryUsage)
+;;;;
+;;;; Core caps the mempool by MALLOC-MODELED MEMORY, not wire bytes: every
+;;;; entry carries nUsageSize = RecursiveDynamicUsage(CTransactionRef)
+;;;; (kernel/mempool_entry.h:95) and CTxMemPool::DynamicMemoryUsage()
+;;;; (txmempool.cpp:778-782) adds the per-entry container overheads. We model
+;;;; the same numbers as a FORMULA over the transaction's structure — actual
+;;;; Lisp object sizes are irrelevant; what matters is trimming at the same
+;;;; transaction mass Core does. All struct sizes below are Core's on a
+;;;; 64-bit platform (sizeof(void*) == 8, the only branch of
+;;;; memusage::MallocUsage we model; the 32-bit branch rounds to 8 instead).
+
+(declaim (inline malloc-usage))
+(defun malloc-usage (alloc)
+  "memusage::MallocUsage (memusage.h:53-64), 64-bit branch: the total memory
+consumed by a malloc of ALLOC bytes, ((alloc + 31) >> 4) << 4 — i.e. 16
+bytes of allocator overhead, rounded up to a 16-byte boundary. 0 for 0."
+  (if (zerop alloc)
+      0
+      (ash (ash (+ alloc 31) -4) 4)))
+
+;; Core struct sizes on 64-bit (x86_64 System V / libstdc++), derived member
+;; by member from the d3056bc headers:
+(defconstant +sizeof-ctransaction+ 128
+  "sizeof(CTransaction): vin vector 24 + vout vector 24 + version 4 +
+nLockTime 4 + m_has_witness 1 + Txid 32 + Wtxid 32 = 121, padded to the
+8-byte class alignment (primitives/transaction.h:291-300).")
+(defconstant +sizeof-stl-shared-counter+ 24
+  "sizeof(memusage::stl_shared_counter): class-type pointer + use_count +
+weak_count (memusage.h:79-86).")
+(defconstant +sizeof-ctxin+ 112
+  "sizeof(CTxIn): COutPoint 36, pad 4, CScript 40 (prevector<36,uint8>: 36
+direct bytes + uint32 size, 8-aligned), nSequence 4, pad 4, CScriptWitness
+24 (a std::vector<std::vector<uchar>>).")
+(defconstant +sizeof-ctxout+ 48
+  "sizeof(CTxOut): CAmount 8 + CScript 40.")
+(defconstant +sizeof-std-vector+ 24
+  "sizeof(std::vector<unsigned char>) on 64-bit: three pointers.")
+(defconstant +script-prevector-direct+ 36
+  "CScript's prevector direct capacity (script.h:399 prevector<36, uint8_t>):
+scripts at most this long live inside the object and allocate nothing.")
+(defconstant +sizeof-mempool-entry+ 136
+  "sizeof(CTxMemPoolEntry) (kernel/mempool_entry.h:66-142): vptr 8 +
+TxGraph::Ref{m_graph 8, m_index 4, pad 4} + CTransactionRef 16 + nFee 8 +
+nTxWeight 4, pad 4, nUsageSize 8 + nTime 8 + entry_sequence 8 + entryHeight
+4 + spendsCoinbase 1, pad 3 + sigOpCost 8 + m_modified_fee 8 +
+LockPoints{int 4, pad 4, int64 8, ptr 8} + idx_randomized 8.")
+
+(defconstant +usage-per-entry+ 224
+  "The fixed mapTx cost Core charges per entry:
+MallocUsage(sizeof(CTxMemPoolEntry) + 9 * sizeof(void*)) — the 9 pointers
+approximate the boost multi_index node overhead (txmempool.cpp:781).
+= MallocUsage(136 + 72) = 224.")
+(defconstant +usage-per-spent-outpoint+ 64
+  "Per-input mapNextTx cost: an indirectmap tree node holding a
+(const COutPoint*, const CTransaction*) pair —
+MallocUsage(sizeof(stl_tree_node<pair<ptr,ptr>>)) = MallocUsage(4 color +
+pad + 3 ptrs + 16) = MallocUsage(48) = 64 (memusage.h:70-77,138-142).")
+(defconstant +usage-per-delta+ 96
+  "Per-prioritisation-delta mapDeltas cost: a std::map tree node holding a
+(Txid, CAmount) pair — MallocUsage(32 node header + 32 + 8) =
+MallocUsage(72) = 96 (memusage.h:125-128).")
+
+(defun %script-usage (script)
+  "memusage::DynamicUsage of a CScript: nothing while the bytes fit the
+prevector's 36-byte direct storage, else MallocUsage of the byte length
+(deserialized prevectors allocate exactly their size)."
+  (let ((len (length script)))
+    (if (<= len +script-prevector-direct+)
+        0
+        (malloc-usage len))))
+
+(defun transaction-dynamic-usage (tx)
+  "Core's modeled heap usage of a mempool transaction — the CTxMemPoolEntry
+nUsageSize: RecursiveDynamicUsage(CTransactionRef) (core_memusage.h:32-41,
+68-71) = the shared_ptr control block + CTransaction object, the vin/vout
+vector allocations, each input's scriptSig (prevector) and witness stack
+(outer vector + one exact-sized allocation per stack item), and each
+output's scriptPubKey."
+  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
+         (witness (bitcoin-lisp.serialization:transaction-witness tx))
+         (usage (+ ;; DynamicUsage(shared_ptr<CTransaction>): object +
+                   ;; control block, each a separate modeled malloc
+                   ;; (memusage.h:156-163).
+                   (malloc-usage +sizeof-ctransaction+)
+                   (malloc-usage +sizeof-stl-shared-counter+)
+                   ;; DynamicUsage(tx.vin) + DynamicUsage(tx.vout).
+                   (malloc-usage (* (length inputs) +sizeof-ctxin+))
+                   (malloc-usage (* (length outputs) +sizeof-ctxout+)))))
+    (bitcoin-lisp.serialization:dovector (input inputs)
+      (incf usage (%script-usage (bitcoin-lisp.serialization:tx-in-script-sig input))))
+    (bitcoin-lisp.serialization:dovector (output outputs)
+      (incf usage (%script-usage (bitcoin-lisp.serialization:tx-out-script-pubkey output))))
+    (when witness
+      (bitcoin-lisp.serialization:dovector (wstack witness)
+        (when wstack
+          ;; The stack's outer vector, then each item's own allocation
+          ;; (std::vector<uchar> has no small-buffer optimization, so even
+          ;; 1-byte items allocate; empty items don't) — core_memusage.h:20-26.
+          (incf usage (malloc-usage (* (length wstack) +sizeof-std-vector+)))
+          (dolist (item wstack)
+            (incf usage (malloc-usage (length item)))))))
+    usage))
+
 (defun make-entry-from-tx (tx fee height &key (sigops 0) (entry-time 0))
   "Build a mempool-entry from TX, computing the derived size/vsize/wtxid fields
 (VSIZE is sigop-adjusted, so SIGOPS matters beyond the mining budget).
@@ -105,6 +232,7 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
    :fee fee
    :modified-fee fee
    :size (length (bitcoin-lisp.serialization:transaction-wire-bytes tx))
+   :usage (transaction-dynamic-usage tx)
    :vsize (sigop-adjusted-vsize (bitcoin-lisp.serialization:transaction-weight tx)
                                 sigops)
    :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)
@@ -196,9 +324,17 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   (by-wtxid (make-hash-table :test 'equalp) :type hash-table)
   ;; outpoint-key (byte vector) -> txid that spends it
   (spent-outpoints (make-hash-table :test 'equalp) :type hash-table)
-  ;; Total serialized size of all transactions
+  ;; Sum of the entries' sigop-adjusted virtual sizes (Core totalTxSize,
+  ;; txmempool.h:191 "sum of all mempool tx's virtual sizes" —
+  ;; getmempoolinfo's "bytes").
   (total-size 0 :type integer)
-  ;; Maximum allowed size in bytes
+  ;; Sum of the entries' modeled dynamic memory usage (Core cachedInnerUsage,
+  ;; txmempool.h:193). Pool-level usage — Core DynamicMemoryUsage(), the
+  ;; number the -maxmempool cap compares against — adds the per-entry
+  ;; container overheads on top; see MEMPOOL-DYNAMIC-USAGE.
+  (total-usage 0 :type integer)
+  ;; Maximum allowed MEMORY usage in bytes (Core -maxmempool * 1'000'000),
+  ;; compared against MEMPOOL-DYNAMIC-USAGE.
   (max-size +default-max-mempool-bytes+ :type integer)
   ;; Minimum relay fee rate (sat/kvB, Core CFeeRate::GetFeePerK units)
   (min-fee-rate +default-min-relay-fee-rate+ :type integer)
@@ -219,6 +355,11 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
   ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
   (orphan-pool (make-orphan-pool) :type orphan-pool)
+  ;; Monotonic admission counter (Core CTxMemPool::m_sequence_number,
+  ;; txmempool.h:202, initialized to 1): each accepted tx records the current
+  ;; value and increments it. MEMPOOL-SEQUENCE reads the counter (Core
+  ;; GetSequence()) for the per-peer last-inv-sequence snapshots.
+  (next-sequence 1 :type (unsigned-byte 64))
   ;; The cluster/chunk engine (Core TxGraph), maintained in lockstep with
   ;; ENTRIES on every mutation. AUTHORITATIVE since the P4-P6 flips for
   ;; mining (chunk-walk block builder), eviction (worst-chunk trim), and the
@@ -232,20 +373,63 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
                        :fallback-order #'%graph-txid-order)
          :type txgraph))
 
+(defun mempool-dynamic-usage (mempool)
+  "The pool's modeled dynamic memory usage — Core
+CTxMemPool::DynamicMemoryUsage() (txmempool.cpp:778-782), the number the
+-maxmempool cap and getmempoolinfo's \"usage\" report: a fixed mapTx cost
+per entry, a mapNextTx tree node per spent outpoint, a mapDeltas node per
+prioritisation delta, the txns_randomized vector (modeled at capacity ==
+size), and the entries' summed inner usage (cachedInnerUsage). Core's
+m_txgraph->GetMainMemoryUsage() term is consciously omitted: it prices the
+txgraph's internal cluster representations (bitsets, linearizations), not
+transaction structure, and has no meaningful analogue in our graph."
+  (let ((count (mempool-count mempool)))
+    (+ (* count +usage-per-entry+)
+       (* (hash-table-count (mempool-spent-outpoints mempool))
+          +usage-per-spent-outpoint+)
+       (* (hash-table-count (mempool-deltas mempool)) +usage-per-delta+)
+       ;; txns_randomized: a std::vector<CTransactionRef>, 16 bytes per
+       ;; element (txmempool.cpp:781). Core uses the actual capacity; we
+       ;; model capacity == size.
+       (malloc-usage (* 16 count))
+       (mempool-total-usage mempool))))
+
 (defconstant +rolling-fee-halflife-seconds+ 43200
-  "Rolling minimum fee decays by half every 12 hours (Bitcoin Core default).")
+  "Rolling minimum fee decays by half every 12 hours (Bitcoin Core
+CTxMemPool::ROLLING_FEE_HALFLIFE); the half-life shortens 2x/4x while the
+pool sits below half/quarter of its memory cap (txmempool.cpp:835-840).")
+
+(defun mempool-sequence (mempool)
+  "The pool's current admission sequence — the value the NEXT accepted tx will
+be stamped with (Core CTxMemPool::GetSequence, txmempool.h:574). Snapshotted
+into a peer's last-inv-sequence whenever an inv flush to it completes; a tx is
+then servable to that peer iff its entry sequence is below the snapshot."
+  (mempool-next-sequence mempool))
 
 (defun mempool-effective-min-fee-rate (mempool &optional (now (bitcoin-lisp.serialization:get-unix-time)))
   "Effective minimum fee rate to enter the mempool, in SAT/KVB: the relay floor,
 or the decayed rolling minimum if higher (Bitcoin Core CTxMemPool::GetMinFee,
-CFeeRate::GetFeePerK units). Compare as (>= (* fee 1000) (* rate vsize))."
+CFeeRate::GetFeePerK units). Compare as (>= (* fee 1000) (* rate vsize)).
+The decay half-life is divided by 4 (2) while the pool's dynamic usage sits
+below 1/4 (1/2) of the memory cap — a near-empty pool forgets fee spikes
+faster (txmempool.cpp:836-840) — and a rolling minimum that decays below
+half the incremental relay fee resets to zero (txmempool.cpp:845-848)."
   (let ((rolling (mempool-rolling-min-fee-rate mempool)))
     (if (<= rolling 0)
         (mempool-min-fee-rate mempool)
         (let* ((age (max 0 (- now (mempool-rolling-min-fee-time mempool))))
-               (decayed (floor (* rolling
-                                  (expt 0.5d0 (/ age +rolling-fee-halflife-seconds+))))))
-          (max (mempool-min-fee-rate mempool) decayed)))))
+               (usage (mempool-dynamic-usage mempool))
+               (limit (mempool-max-size mempool))
+               (halflife (cond ((< usage (floor limit 4))
+                                (floor +rolling-fee-halflife-seconds+ 4))
+                               ((< usage (floor limit 2))
+                                (floor +rolling-fee-halflife-seconds+ 2))
+                               (t +rolling-fee-halflife-seconds+)))
+               (decayed (floor (* rolling (expt 0.5d0 (/ age halflife))))))
+          (cond ((< decayed (floor +incremental-relay-fee-rate+ 2))
+                 (setf (mempool-rolling-min-fee-rate mempool) 0)
+                 (mempool-min-fee-rate mempool))
+                (t (max (mempool-min-fee-rate mempool) decayed)))))))
 
 ;;;; Shadow txgraph checks (cluster mempool P3, kept through the P4-P6 flips)
 ;;;;
@@ -681,6 +865,12 @@ runs unconditionally (validation.cpp:1338-1342)."
         (return-from mempool-add :too-large-cluster))
       (setf (mempool-entry-graph-handle entry) handle))
 
+    ;; Stamp the admission sequence (Core addNewTransaction's
+    ;; GetAndIncrementSequence) — the getdata anti-probing gate compares this
+    ;; against each peer's last-inv-sequence snapshot.
+    (setf (mempool-entry-sequence entry) (mempool-next-sequence mempool))
+    (incf (mempool-next-sequence mempool))
+
     ;; Add to entries table
     (setf (gethash txid (mempool-entries mempool)) entry)
 
@@ -701,18 +891,21 @@ runs unconditionally (validation.cpp:1338-1342)."
                  (bitcoin-lisp.serialization:outpoint-index prevout))))
       (setf (gethash key (mempool-spent-outpoints mempool)) txid)))
 
-  ;; Update total size
-  (incf (mempool-total-size mempool) (mempool-entry-size entry))
+  ;; Update the running totals (Core addNewTransaction, txmempool.cpp:250:
+  ;; totalTxSize += GetTxSize(), cachedInnerUsage += DynamicMemoryUsage()).
+  (incf (mempool-total-size mempool) (mempool-entry-vsize entry))
+  (incf (mempool-total-usage mempool) (mempool-entry-usage entry))
   (%mempool-graph-verify mempool)
 
-  ;; Trim back to the byte cap now that the tx is in (Core FinalizeSubpackage
-  ;; then LimitMempoolSize, validation.cpp:1394-1401): the new tx competes as
-  ;; part of its own cluster's chunks, and if its chunk is the worst it
-  ;; evicts itself - that is the "mempool full" outcome, and the rolling
-  ;; minimum fee has been raised past its feerate either way. Skipped under
-  ;; DEFER-TRIM (see docstring).
+  ;; Trim back to the memory cap now that the tx is in (Core
+  ;; FinalizeSubpackage then LimitMempoolSize, validation.cpp:1394-1401): the
+  ;; new tx competes as part of its own cluster's chunks, and if its chunk is
+  ;; the worst it evicts itself - that is the "mempool full" outcome, and the
+  ;; rolling minimum fee has been raised past its feerate either way. The cap
+  ;; is Core's: modeled DYNAMIC MEMORY USAGE against -maxmempool, not wire
+  ;; bytes. Skipped under DEFER-TRIM (see docstring).
   (when (and (not defer-trim)
-             (> (mempool-total-size mempool) (mempool-max-size mempool)))
+             (> (mempool-dynamic-usage mempool) (mempool-max-size mempool)))
     (mempool-trim-to-size mempool)
     (unless (mempool-has mempool txid)
       (return-from mempool-add :mempool-full)))
@@ -750,8 +943,9 @@ shadow checks report as divergence."
       (%unlink-entry mempool txid entry)
       ;; Remove from entries
       (remhash txid (mempool-entries mempool))
-      ;; Update total size
-      (decf (mempool-total-size mempool) (mempool-entry-size entry))
+      ;; Update the running totals (Core removeUnchecked, txmempool.cpp:301-303).
+      (decf (mempool-total-size mempool) (mempool-entry-vsize entry))
+      (decf (mempool-total-usage mempool) (mempool-entry-usage entry))
       ;; Drop from the shadow txgraph (Core ChangeSet::StageRemoval /
       ;; removeUnchecked; the Ref destructor does this in Core - with no
       ;; destructors it must be explicit on EVERY removal path, and all
@@ -786,16 +980,11 @@ behind."
   "Cluster-mempool rule 5: a replacement may conflict directly with at most
 this many distinct CLUSTERS (Core MAX_REPLACEMENT_CANDIDATES, policy/rbf.h:26;
 rbf.cpp:58-83 counts clusters, not transactions, since cluster mempool). The
-old BIP125 meaning — at most 100 replaced transactions — is gone.")
-
-(defparameter +max-rbf-gather-transactions+ 500
-  "Cluster-mempool rule 5, second bound: the clusters a replacement conflicts
-with may hold at most this many transactions in total (Core's GatherClusters
-gather cap, txmempool.cpp:988-990), bounding the diagram-staging work.")
-
-(defparameter +incremental-relay-fee-rate+ 100
-  "Incremental relay fee in satoshis per kvB for BIP125 rule 4 (Bitcoin Core
-DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB = 0.1 sat/vB).")
+old BIP125 meaning — at most 100 replaced transactions — is gone. This is the
+ONLY rule-5 bound: Core's 500-tx GatherClusters cap (txmempool.cpp:988-990)
+is not on the replacement path — its sole caller is the mini-miner fee
+estimator (node/mini_miner.cpp:66); GetEntriesForConflicts checks only the
+cluster count.")
 
 (defvar *mempool-full-rbf* nil
   "Retained for RPC display only (Core's IsRBFOptIn survives solely to report
@@ -861,18 +1050,17 @@ each conflict and all its in-mempool descendants (Core GetEntriesForConflicts
                (mempool-descendants mempool ctxid)))))
 
 (defun %rbf-cluster-caps (mempool direct-conflicts)
-  "Rule 5 (redefined for cluster mempool, Core rbf.cpp:58-83 +
-txmempool.cpp:988-990): NIL when DIRECT-CONFLICTS touch at most 100 distinct
-CLUSTERS together holding at most 500 transactions (the GatherClusters gather
-cap that bounds the diagram-staging work), else the rejection keyword."
+  "Rule 5 (redefined for cluster mempool, Core GetEntriesForConflicts,
+rbf.cpp:58-83): NIL when DIRECT-CONFLICTS touch at most 100 distinct
+CLUSTERS, else :too-many-clusters. There is no transaction-count bound —
+the cluster count alone bounds the relinearization work (Core's comment at
+rbf.cpp:65-68); the 500-tx GatherClusters cap belongs to the mini-miner
+fee estimator, not replacement."
   (let ((graph (mempool-graph mempool))
         (conflict-handles (%rbf-entry-handles mempool direct-conflicts)))
-    (cond ((> (txgraph-count-distinct-clusters graph conflict-handles)
-              +max-rbf-replacement-candidates+)
-           :too-many-clusters)
-          ((> (txgraph-cluster-transaction-count graph conflict-handles)
-              +max-rbf-gather-transactions+)
-           :too-many-replacements))))
+    (when (> (txgraph-count-distinct-clusters graph conflict-handles)
+             +max-rbf-replacement-candidates+)
+      :too-many-clusters)))
 
 (defun %rbf-replaced-fees (mempool replaced)
   "Total prioritisation-modified fees of the REPLACED txid hash-set's entries."
@@ -1003,6 +1191,53 @@ transactions (validation.cpp:1113-1121)."
           (return-from check-package-rbf-rules (values nil verdict nil)))))
     (values t nil replaced)))
 
+(defun mempool-package-fits-cluster-limits-p (mempool members)
+  "Would admitting the whole package keep every cluster within the 64-tx /
+101-kvB limits? MEMBERS is a list of (tx modified-fee vsize), in package
+(parents-first) order. Stages every member into the txgraph — with a
+dependency per in-mempool parent and per in-package parent — tests
+TXGRAPH-OVERSIZED-P, then unstages, leaving the graph unchanged. This is
+the read-only analogue of Core's changeset CheckMemPoolPolicyLimits over
+the staged package (AcceptMultipleTransactions, validation.cpp:1516-1520):
+checking BEFORE any mutation is what makes package submission atomic — once
+it passes, the per-member MEMPOOL-ADDs cannot fail the cluster check,
+because any prefix of the staged additions forms only smaller clusters (and
+the package-RBF evictions that precede the adds only shrink clusters
+further)."
+  (let ((graph (mempool-graph mempool))
+        (staged (make-hash-table :test 'equalp))   ; txid -> handle
+        (handles '()))
+    (unwind-protect
+         (progn
+           (dolist (m members)
+             (destructuring-bind (tx fee vsize) m
+               (let ((handle (txgraph-add-transaction graph fee vsize))
+                     (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+                 (setf (tx-handle-data handle) txid
+                       (gethash txid staged) handle)
+                 (push handle handles)
+                 (dolist (p (mempool-find-parents mempool tx))
+                   (txgraph-add-dependency
+                    graph (mempool-entry-graph-handle (mempool-get mempool p))
+                    handle))
+                 ;; In-package parents: inputs spending an already-staged
+                 ;; member (MEMBERS is topologically sorted, so parents are
+                 ;; staged before their spenders). Dedupe multi-input spends.
+                 (let ((seen (make-hash-table :test 'equalp)))
+                   (bitcoin-lisp.serialization:dovector
+                       (input (bitcoin-lisp.serialization:transaction-inputs tx))
+                     (let* ((ptxid (bitcoin-lisp.serialization:outpoint-hash
+                                    (bitcoin-lisp.serialization:tx-in-previous-output input)))
+                            (ph (gethash ptxid staged)))
+                       (when (and ph
+                                  (not (eq ph handle))
+                                  (not (gethash ptxid seen)))
+                         (setf (gethash ptxid seen) t)
+                         (txgraph-add-dependency graph ph handle))))))))
+           (not (txgraph-oversized-p graph)))
+      (dolist (h handles)
+        (txgraph-remove-transaction graph h)))))
+
 ;;;; Persistence (Bitcoin Core mempool.dat — node/mempool_persist.cpp)
 ;;;;
 ;;;; Own versioned format (like the UTXO snapshot, NOT Core's binary layout):
@@ -1128,9 +1363,10 @@ an unknown version — callers continue with an empty mempool, like Core."
 
 (defun mempool-trim-to-size (mempool &optional (limit (mempool-max-size mempool)))
   "Evict the globally worst chunk - the lowest-chunk-feerate tail of the
-mining order - repeatedly until the mempool's total size is within LIMIT
-(Core TrimToSize, txmempool.cpp:861-911). A high-fee child still protects
-its low-fee parent (CPFP): they share a chunk, evicted only as a unit. Each
+mining order - repeatedly until the mempool's modeled DYNAMIC MEMORY USAGE
+is within LIMIT (Core TrimToSize, txmempool.cpp:861-911: while
+DynamicMemoryUsage() > sizelimit). A high-fee child still protects its
+low-fee parent (CPFP): they share a chunk, evicted only as a unit. Each
 evicted chunk raises the rolling minimum fee (sat/kvB) to its feerate plus
 the incremental relay fee, so newcomers must beat what was just trimmed
 (Core trackPackageRemoved). Returns the number of transactions removed."
@@ -1138,7 +1374,7 @@ the incremental relay fee, so newcomers must beat what was just trimmed
         (removed 0))
     (%with-graph-verify-batch (mempool)
       (loop while (and (plusp (mempool-count mempool))
-                       (> (mempool-total-size mempool) limit))
+                       (> (mempool-dynamic-usage mempool) limit))
             do (multiple-value-bind (handles feerate)
                    (txgraph-get-worst-main-chunk graph)
                  ;; Feerate in sat/kvB, truncating like Core's

@@ -208,6 +208,9 @@
                              (:file "conn-type-tests")
                              ;; Low-work headers sync (anti-DoS presync/redownload)
                              (:file "headers-sync-tests")
+                             ;; Wave 9A: eclipse/DoS hardening (outbound accounting,
+                             ;; non-blocking send, addr rate limit, generic presync)
+                             (:file "eclipse-dos-tests")
                              ;; bitcoin.conf + CLI argument parsing
                              (:file "config-tests")
                              ;; SOCKS5 outbound proxy (-proxy) client
