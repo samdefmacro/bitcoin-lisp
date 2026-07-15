@@ -138,12 +138,14 @@ indexed range really ends, so the startup backfill can heal the gap."
          ;; Chain the filter header off the parent's. Blocks are indexed in
          ;; order (connect hook + contiguous backfill), so the parent is present
          ;; for every block except the first one of the indexed range, which
-         ;; seeds from the all-zero header. That first block is genesis on a
-         ;; from-genesis full node -- but our genesis block body is not stored,
-         ;; so genesis itself cannot be indexed and the range starts at the first
-         ;; connected/backfilled block. The FILTERS are always Core-exact; the
-         ;; header chain is internally consistent but its absolute values match
-         ;; BIP157 only when the range starts at genesis (not currently possible).
+         ;; seeds from the all-zero header. On an unpruned node that first block
+         ;; is GENESIS (constructed from chain parameters by the backfill, since
+         ;; its body is never in block storage), giving the BIP157 anchor
+         ;; filter_header(genesis) = H(filter_hash(genesis) || 0^32) — Core
+         ;; index/blockfilterindex.cpp:251-258 (CustomAppend with m_last_header
+         ;; zero-initialized). Only a pruned node, whose early bodies are gone,
+         ;; still seeds mid-chain: its header chain is internally consistent but
+         ;; not BIP157-absolute (Core refuses -blockfilterindex with pruning).
          (prev-header (blockfilterindex-get-header bfi prev-hash)))
     (when (and (null prev-header) (>= (blockfilterindex-height bfi) 0))
       (return-from blockfilterindex-add-block (values nil :noncontiguous)))
@@ -173,57 +175,137 @@ record after a rollback such as invalidateblock)."
   (when (blockfilterindex-db bfi)
     (leveldb-delete (blockfilterindex-db bfi) *bfi-meta-key*)))
 
+(defun blockfilterindex-wipe (bfi)
+  "Delete the on-disk filter index entirely and reopen it empty. Used when the
+stored header chain is not anchored at genesis (a legacy index built before
+genesis indexing existed) and must be rebuilt from scratch."
+  (when (and (blockfilterindex-enabled bfi) (blockfilterindex-db bfi))
+    (let ((path (blockfilterindex-path (blockfilterindex-base-path bfi))))
+      (close-blockfilterindex bfi)
+      (leveldb-destroy-db path)
+      (ensure-directories-exist path)
+      (setf (blockfilterindex-db bfi) (leveldb-open path)))
+    t))
+
+(defun blockfilterindex-ensure-genesis-anchor (bfi chain-state)
+  "BIP157 anchors the filter-header chain at genesis: filter_header(genesis) =
+H(filter_hash(genesis) || 0^32). Indexes built before genesis indexing existed
+seeded their header chain at the FIRST STORED block instead, so every absolute
+cfheaders/cfcheckpt/getblockfilter header they serve diverges from Core and
+BIP157 light clients ban the node. Detect that shape — no genesis record, or a
+genesis / height-1 record that does not recompute — and wipe the index so the
+caller's backfill rebuilds it from height 0. Safe on fresh and healthy indexes
+(no-op). Returns:
+  :ok                 anchored (or empty checks all pass)
+  :empty              nothing indexed yet — backfill will seed genesis
+  :rebuilt            bad chain wiped; backfill must rebuild from scratch
+  :unanchored-pruned  bad chain kept: bodies below the prune horizon are gone
+                      so a rebuild is impossible (Core refuses -blockfilterindex
+                      with pruning outright; we keep the internally consistent
+                      chain and warn)
+  NIL                 index disabled"
+  (unless (and (blockfilterindex-enabled bfi) (blockfilterindex-db bfi))
+    (return-from blockfilterindex-ensure-genesis-anchor nil))
+  (let ((genesis-hash (network-genesis-hash bitcoin-lisp:*network*)))
+    (flet ((rebuild (reason)
+             (cond ((plusp (chain-state-pruned-height chain-state))
+                    (bitcoin-lisp:log-warn
+                     "Block filter index ~A, and block bodies below the prune horizon (~D) are gone so it cannot be rebuilt; BIP157 headers stay internally consistent but do NOT match the network's absolute values"
+                     reason (chain-state-pruned-height chain-state))
+                    :unanchored-pruned)
+                   (t
+                    (bitcoin-lisp:log-warn
+                     "Block filter index ~A; wiping ~A for a full rebuild from genesis"
+                     reason (blockfilterindex-path (blockfilterindex-base-path bfi)))
+                    (blockfilterindex-wipe bfi)
+                    :rebuilt))))
+      (multiple-value-bind (gfilter gheader) (blockfilterindex-get bfi genesis-hash)
+        (cond
+          ;; Fresh/empty index: the backfill seeds genesis itself.
+          ((and (null gfilter) (< (blockfilterindex-height bfi) 0)) :empty)
+          ;; Legacy shape: entries exist but no genesis anchor.
+          ((null gfilter)
+           (rebuild "is not anchored at genesis (built before genesis indexing)"))
+          ;; Genesis present: verify the anchor and the height-1 link recompute.
+          ((not (equalp gheader (compute-block-filter-header
+                                 gfilter +zero-filter-header+)))
+           (rebuild "has a corrupt genesis filter header"))
+          (t
+           (let* ((e1 (get-block-at-height chain-state 1))
+                  (h1 (and e1 (block-index-entry-hash e1))))
+             (multiple-value-bind (f1 hdr1)
+                 (if h1 (blockfilterindex-get bfi h1) (values nil nil))
+               (if (and f1 (not (equalp hdr1 (compute-block-filter-header
+                                              f1 gheader))))
+                   (rebuild "has a height-1 filter header that does not chain off the genesis anchor")
+                   :ok)))))))))
+
 (defun build-blockfilterindex (bfi chain-state block-store get-undo-fn
                                &key progress-callback)
   "Backfill the filter index from just past the last indexed block up to the
 active tip, using stored blocks and their undo data. GET-UNDO-FN maps a
 block-hash to its undo list of (txid index utxo-entry), or NIL when absent.
-While the index is still empty, heights whose block body or (for a spending
-block) undo data is unavailable are SKIPPED -- the genesis body is never
-stored, and on a pruned node the whole pruned prefix is absent -- so the
-indexed range seeds at the first indexable block. Once anything is indexed,
-the first such unavailable height STOPS the backfill instead, keeping the
-stored filter-header chain contiguous (a skipped block would leave the next
-block chained off a wrong parent header). PROGRESS-CALLBACK, if given, is
-called with (height percent). Returns the number of blocks indexed."
+An empty index on an UNPRUNED chain first indexes GENESIS, constructed from
+chain parameters (its body is never in block storage), so the filter-header
+chain gets its BIP157 anchor: filter_header(genesis) over the all-zero
+previous header (Core indexes genesis like any block,
+index/blockfilterindex.cpp CustomAppend). While the index is still empty on a
+PRUNED chain, heights whose block body or (for a spending block) undo data is
+unavailable are SKIPPED -- the whole pruned prefix is absent -- so the indexed
+range seeds at the first indexable block (internally consistent, not
+BIP157-absolute; Core refuses -blockfilterindex with pruning). Once anything
+is indexed, the first such unavailable height STOPS the backfill instead,
+keeping the stored filter-header chain contiguous (a skipped block would
+leave the next block chained off a wrong parent header). PROGRESS-CALLBACK,
+if given, is called with (height percent). Returns the number of blocks
+indexed."
   (unless (and (blockfilterindex-enabled bfi) (blockfilterindex-db bfi))
     (return-from build-blockfilterindex 0))
-  (let* ((tip (current-height chain-state))
-         ;; An empty index starts its seed-seek at the pruned horizon: block
-         ;; bodies at or below chain-state-pruned-height are deleted, and
-         ;; probing each height costs a LevelDB block-index read -- observed
-         ;; ~14 ms/height on the pruned mainnet node, i.e. a ~3.7 h stall
-         ;; scanning ~950k pruned heights that cannot contain the seed.
-         (start (if (< (blockfilterindex-height bfi) 0)
-                    (1+ (chain-state-pruned-height chain-state))
-                    (1+ (blockfilterindex-height bfi))))
-         (seeded (>= (blockfilterindex-height bfi) 0))
-         (count 0)
-         (last-report (get-internal-real-time)))
-    (block done
-      (loop for height from start to tip
-            do (let* ((entry (get-block-at-height chain-state height))
-                      (hash (and entry (block-index-entry-hash entry)))
-                      (block (and hash (get-block block-store hash)))
-                      (undo (and block (funcall get-undo-fn hash)))
-                      ;; FILTER is nil when the height is unindexable (missing
-                      ;; body, or missing undo for a spending block) or when
-                      ;; add-block refused a non-contiguous store (a stale best
-                      ;; marker naming an orphaned block). Either way: skip
-                      ;; pre-seed, stop post-seed.
-                      (filter (and block
-                                   (or undo (not (%block-spends-p block)))
-                                   (blockfilterindex-add-block
-                                    bfi block hash height undo))))
-                 (cond (filter
-                        (setf seeded t)
-                        (incf count))
-                       (seeded (return-from done))))
-               (when progress-callback
-                 (let ((now (get-internal-real-time)))
-                   (when (> (- now last-report) internal-time-units-per-second)
-                     (funcall progress-callback height
-                              (if (zerop tip) 100.0 (* 100.0 (/ height tip))))
-                     (setf last-report now))))))
-    (when progress-callback (funcall progress-callback tip 100.0))
-    count))
+  (let ((count 0))
+    ;; BIP157 genesis anchor: seed height 0 from chain parameters. The
+    ;; genesis block spends nothing, so its filter needs no undo data.
+    (when (and (< (blockfilterindex-height bfi) 0)
+               (zerop (chain-state-pruned-height chain-state)))
+      (let ((genesis-hash (network-genesis-hash bitcoin-lisp:*network*)))
+        (when (blockfilterindex-add-block
+               bfi (make-genesis-block bitcoin-lisp:*network*)
+               genesis-hash 0 nil)
+          (incf count))))
+    (let* ((tip (current-height chain-state))
+           ;; An empty index starts its seed-seek at the pruned horizon: block
+           ;; bodies at or below chain-state-pruned-height are deleted, and
+           ;; probing each height costs a LevelDB block-index read -- observed
+           ;; ~14 ms/height on the pruned mainnet node, i.e. a ~3.7 h stall
+           ;; scanning ~950k pruned heights that cannot contain the seed.
+           (start (if (< (blockfilterindex-height bfi) 0)
+                      (1+ (chain-state-pruned-height chain-state))
+                      (1+ (blockfilterindex-height bfi))))
+           (seeded (>= (blockfilterindex-height bfi) 0))
+           (last-report (get-internal-real-time)))
+      (block done
+        (loop for height from start to tip
+              do (let* ((entry (get-block-at-height chain-state height))
+                        (hash (and entry (block-index-entry-hash entry)))
+                        (block (and hash (get-block block-store hash)))
+                        (undo (and block (funcall get-undo-fn hash)))
+                        ;; FILTER is nil when the height is unindexable (missing
+                        ;; body, or missing undo for a spending block) or when
+                        ;; add-block refused a non-contiguous store (a stale best
+                        ;; marker naming an orphaned block). Either way: skip
+                        ;; pre-seed, stop post-seed.
+                        (filter (and block
+                                     (or undo (not (%block-spends-p block)))
+                                     (blockfilterindex-add-block
+                                      bfi block hash height undo))))
+                   (cond (filter
+                          (setf seeded t)
+                          (incf count))
+                         (seeded (return-from done))))
+                 (when progress-callback
+                   (let ((now (get-internal-real-time)))
+                     (when (> (- now last-report) internal-time-units-per-second)
+                       (funcall progress-callback height
+                                (if (zerop tip) 100.0 (* 100.0 (/ height tip))))
+                       (setf last-report now))))))
+      (when progress-callback (funcall progress-callback tip 100.0))
+      count)))

@@ -1911,34 +1911,34 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
           ;; and applied. Oldest-to-newest for chain-order indexing.
           (dolist (item (reverse connected))
             (destructuring-bind (entry block height spent-utxos) item
-              (declare (ignore entry))
               (when fee-estimator
                 (let ((stats (bitcoin-lisp.mempool:compute-block-fee-stats
                               block spent-utxos height)))
                   (when stats
                     (bitcoin-lisp.mempool:fee-estimator-add-stats fee-estimator stats))))
-              (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
-                (bitcoin-lisp.storage:txindex-add-block
-                 tx-index block
-                 (bitcoin-lisp.serialization:block-header-hash
-                  (bitcoin-lisp.serialization:bitcoin-block-header block))))
-              ;; BIP158: index the reconnected block's basic filter (oldest-to-
-              ;; newest here, so its header chains off the already-indexed parent).
-              (let ((hash (bitcoin-lisp.serialization:block-header-hash
-                           (bitcoin-lisp.serialization:bitcoin-block-header block))))
+              ;; Index under the block-index ENTRY's hash — the block index is
+              ;; the canonical identity (Core BaseIndex writes are keyed off
+              ;; the CBlockIndex), and BLOCK here was re-read from disk so a
+              ;; recomputed header hash is a fresh object, not the one the
+              ;; connect path / index entries key by.
+              (let ((hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
+                (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
+                  (bitcoin-lisp.storage:txindex-add-block tx-index block hash))
+                ;; BIP158: index the reconnected block's basic filter (oldest-to-
+                ;; newest here, so its header chains off the already-indexed parent).
                 (bitcoin-lisp:index-block-filter chain-state block hash height spent-utxos)
                 ;; coinstatsindex: reconnected oldest-to-newest, so each block
                 ;; loads its (already-reindexed) parent's running state.
                 (bitcoin-lisp:index-block-coinstats chain-state block hash height spent-utxos))
               (when mempool
                 (bitcoin-lisp.mempool:mempool-remove-for-block mempool block))))
-          ;; Remove the disconnected old chain's txs from the tx-index.
-          (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
-            (dolist (entry to-disconnect)
-              (let ((block (bitcoin-lisp.storage:get-block
-                            block-store (bitcoin-lisp.storage:block-index-entry-hash entry))))
-                (when block
-                  (bitcoin-lisp.storage:txindex-remove-block tx-index block)))))
+          ;; The disconnected old chain's txs stay in the tx-index: Core never
+          ;; erases txindex entries on disconnect (index/base.h:136 CustomRemove
+          ;; defaults to a no-op; index/txindex.cpp has no override). Txs
+          ;; re-mined in the new chain were re-pointed by the connect-time
+          ;; upserts above; stale-branch-only txs keep resolving through the
+          ;; still-stored stale block (removing them here used to leave re-mined
+          ;; txs UNINDEXED, since the old txindex-add skipped existing txids).
           ;; Reorg may change tx validity — clear the rejects cache.
           (bitcoin-lisp:clear-recent-rejects recent-rejects)
           ;; Re-add disconnected-block txs (best-effort, against the new tip),
