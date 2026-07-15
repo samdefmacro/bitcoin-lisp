@@ -2254,31 +2254,14 @@ already running."
   (bt:with-lock-held (*txoutset-scan-lock*)
     (setf *txoutset-scan-running* nil)))
 
-(defun %scanobject-descriptor (scanobject)
-  "The descriptor string of a scanobject: either a plain string or an
-object {\"desc\": ..., [\"range\": ...]}. Ranged descriptors are not
-supported (we have no derivable keys)."
-  (cond
-    ((stringp scanobject) scanobject)
-    ((hash-table-p scanobject)
-     (when (gethash "range" scanobject)
-       (error 'rpc-error :code +rpc-invalid-parameter+
-                         :message "Ranged descriptors are not supported"))
-     (let ((desc (gethash "desc" scanobject)))
-       (unless (stringp desc)
-         (error 'rpc-error :code +rpc-invalid-parameter+
-                           :message "Descriptor needs to be provided in scan object"))
-       desc))
-    (t (error 'rpc-error :code +rpc-invalid-parameter+
-                         :message "Invalid scan object"))))
-
 (defun rpc-scantxoutset (node params)
   "Scan the UTXO set for outputs matching descriptors (Bitcoin Core
 scantxoutset). PARAMS: (action [scanobjects]) — action is \"start\",
-\"status\" or \"abort\". Supports the descriptor subset documented in
-descriptors.lisp (addr/raw/pk/pkh/wpkh/sh(wpkh)/combo/tr/rawtr). The scan
-runs synchronously on the calling RPC thread; status/abort act from
-another connection, mirroring Core."
+\"status\" or \"abort\". Scanobjects are descriptor strings or
+{\"desc\": ..., \"range\": ...} objects; ranged descriptors expand over
+their range (default [0,1000], like Core). The scan runs synchronously on
+the calling RPC thread; status/abort act from another connection,
+mirroring Core."
   (let ((action (first params)))
     (cond
       ((equal action "status")
@@ -2298,14 +2281,7 @@ another connection, mirroring Core."
            (error 'rpc-error :code +rpc-invalid-parameter+
                              :message "Scan already in progress, use action \"abort\" or \"status\""))
          (unwind-protect
-              (let ((needles (make-hash-table :test 'equalp))
-                    (network (rpc-get-network node)))
-                ;; Expand every scanobject into needle scripts.
-                (dolist (scanobject scanobjects)
-                  (loop for (script . desc)
-                          in (parse-output-descriptor
-                              (%scanobject-descriptor scanobject) network)
-                        do (setf (gethash script needles) desc)))
+              (let ((needles (%needle-scripts scanobjects (rpc-get-network node))))
                 (let* ((chain-state (rpc-get-chain-state node))
                        (utxo-set (rpc-get-utxo-set node))
                        (tip-height (bitcoin-lisp.storage:current-height chain-state))
@@ -4178,15 +4154,6 @@ PARAMS: (blockhash [filtertype]). Mirrors Bitcoin Core getblockfilter."
 (defun %release-scanblocks ()
   (bt:with-lock-held (*scanblocks-lock*)
     (setf *scanblocks-running* nil)))
-
-(defun %needle-scripts (scanobjects network)
-  "Expand SCANOBJECTS (descriptor strings/objects) into an equalp hash-table
-mapping each script (byte vector) to its canonical descriptor."
-  (let ((needles (make-hash-table :test 'equalp)))
-    (dolist (scanobject scanobjects needles)
-      (loop for (script . desc)
-              in (parse-output-descriptor (%scanobject-descriptor scanobject) network)
-            do (setf (gethash script needles) desc)))))
 
 (defun %hash-table-keys (ht)
   (loop for k being the hash-keys of ht collect k))
