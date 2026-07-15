@@ -167,6 +167,104 @@ per-entry deltas, and residual deltas; corrupt files read as not-ok."
            (is-false (nth-value 2 (bitcoin-lisp.mempool:read-mempool-file path))))
       (ignore-errors (delete-file path)))))
 
+(test mempool-dat-unbroadcast-round-trip
+  "The v2 mempool.dat trailer round-trips the unbroadcast set (Core
+node/mempool_persist.cpp:134-141/205-206), and a version-1 file (no
+trailer) still loads cleanly with an empty set."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 61))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (path (merge-pathnames (format nil "mempool-unbr-test-~D.dat" (get-universal-time))
+                                (uiop:temporary-directory))))
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                 mempool txid (make-mempool-entry-for-tx tx :fee 5000))))
+    (is-true (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid))
+    (unwind-protect
+         (progn
+           ;; v2 round trip: the set comes back as the 4th value.
+           (is (= 1 (bitcoin-lisp.mempool:save-mempool-file mempool path)))
+           (multiple-value-bind (entries residual ok unbroadcast)
+               (bitcoin-lisp.mempool:read-mempool-file path)
+             (declare (ignore residual))
+             (is-true ok)
+             (is (= 1 (length entries)))
+             (is (= 1 (length unbroadcast)))
+             (is (equalp txid (first unbroadcast))))
+           ;; Old-format (version 1) file: ends after the residual deltas.
+           ;; A restart with a pre-v2 mempool.dat must not crash.
+           (let ((tx-bytes (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+             (bitcoin-lisp.storage:save-file-with-crc32
+              path
+              (lambda (s)
+                (bitcoin-lisp.serialization:write-uint32-le
+                 s bitcoin-lisp.mempool::+mempool-dat-magic+)
+                (bitcoin-lisp.serialization:write-uint8 s 1)   ; version 1
+                (bitcoin-lisp.serialization:write-uint32-le s 1)
+                (bitcoin-lisp.serialization:write-uint32-le s (length tx-bytes))
+                (write-sequence tx-bytes s)
+                (bitcoin-lisp.serialization:write-uint64-le s 1000000)
+                (bitcoin-lisp.serialization:write-int64-le s 0)
+                (bitcoin-lisp.serialization:write-uint32-le s 0))))   ; no residuals
+           (multiple-value-bind (entries residual ok unbroadcast)
+               (bitcoin-lisp.mempool:read-mempool-file path)
+             (declare (ignore residual))
+             (is-true ok)
+             (is (= 1 (length entries)))
+             (is (equalp txid (bitcoin-lisp.serialization:transaction-hash
+                               (first (first entries)))))
+             (is (null unbroadcast))))
+      (ignore-errors (delete-file path)))))
+
+;;;; Unbroadcast set (Core m_unbroadcast_txids)
+
+(test mempool-unbroadcast-add-requires-membership
+  "mempool-add-unbroadcast records only in-pool txids (Core AddUnbroadcastTx's
+exists() guard, txmempool.h:542-548); removal reports presence."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 70))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (absent (make-array 32 :element-type '(unsigned-byte 8) :initial-element 71)))
+    ;; Not in the pool -> not recorded.
+    (is-false (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool absent))
+    (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                 mempool txid (make-mempool-entry-for-tx tx))))
+    (is-true (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid))
+    (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+    (is (equalp (list txid) (bitcoin-lisp.mempool:mempool-unbroadcast-txids mempool)))
+    (is-true (bitcoin-lisp.mempool:mempool-remove-unbroadcast mempool txid))
+    (is-false (bitcoin-lisp.mempool:mempool-remove-unbroadcast mempool txid))
+    (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))))
+
+(test mempool-unbroadcast-cleared-when-tx-leaves-pool
+  "A tx leaving the mempool leaves the unbroadcast set with it — direct
+removal (eviction/expiry funnel through mempool-remove, Core removeUnchecked
+-> RemoveUnbroadcastTx, txmempool.cpp:287) and block confirmation
+(removeForBlock) both clear it."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 72))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+    ;; Direct removal.
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                 mempool txid (make-mempool-entry-for-tx tx))))
+    (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+    (bitcoin-lisp.mempool:mempool-remove mempool txid)
+    (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+    ;; Confirmation in a block.
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                 mempool txid (make-mempool-entry-for-tx tx))))
+    (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+    (let ((block (bitcoin-lisp.serialization:make-bitcoin-block
+                  :header (bitcoin-lisp.serialization:make-block-header
+                           :version 1
+                           :prev-block (make-array 32 :element-type '(unsigned-byte 8))
+                           :merkle-root (make-array 32 :element-type '(unsigned-byte 8))
+                           :timestamp 0 :bits 0 :nonce 0)
+                  :transactions (list tx))))
+      (bitcoin-lisp.mempool:mempool-remove-for-block mempool block))
+    (is (null (bitcoin-lisp.mempool:mempool-get mempool txid)))
+    (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))))
+
 ;;;; Mempool core tests
 
 (test mempool-add-and-get

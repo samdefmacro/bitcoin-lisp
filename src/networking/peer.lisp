@@ -43,8 +43,11 @@
   ;; Pending tx announcements, flushed in batches on a Poisson schedule
   ;; instead of per-tx immediate invs (Core m_tx_inventory_to_send +
   ;; m_next_inv_send_time). Entries are (txid wtxid fee-rate-per-kb),
-  ;; oldest first. Single-writer: enqueue (relay-transaction) and flush
-  ;; (flush-tx-announcements) both run on the sync thread.
+  ;; oldest first. Guarded by the node lock: the P2P enqueue paths
+  ;; (handle-tx, orphan cascade) run under with-node-lock on the sync
+  ;; thread, the RPC broadcast path (sendrawtransaction/submitpackage)
+  ;; enqueues under the same lock from RPC threads, and the flush
+  ;; (flush-tx-announcements) takes it too.
   (tx-inv-queue '() :type list)
   ;; internal-real-time deadline of the next inv flush for this peer
   ;; (outbound peers only — inbound peers share one rotation, see
