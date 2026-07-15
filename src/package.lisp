@@ -221,6 +221,7 @@
    #:transaction-has-witness-p
    #:transaction-vsize
    #:transaction-weight
+   #:transaction-wire-bytes
    #:serialize-witness-transaction
    #:block-header
    #:make-block-header

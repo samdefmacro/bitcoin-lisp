@@ -74,13 +74,6 @@ DEFAULT_MEMPOOL_EXPIRY_HOURS.")
   ;; must explicitly remove it. NIL until the entry is added.
   (graph-handle nil :type (or null tx-handle)))
 
-(defun tx-wire-bytes (tx)
-  "TX in its wire encoding: witness form only when the tx has witness data,
-so legacy txs aren't charged phantom marker/flag bytes."
-  (if (bitcoin-lisp.serialization:transaction-has-witness-p tx)
-      (bitcoin-lisp.serialization:serialize-witness-transaction tx)
-      (bitcoin-lisp.serialization:serialize-transaction tx)))
-
 (defun make-entry-from-tx (tx fee height &key (sigops 0) (entry-time 0))
   "Build a mempool-entry from TX, computing the derived size/vsize/wtxid fields.
 Centralizes entry construction so every acceptance path records the same
@@ -89,7 +82,7 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
    :transaction tx
    :fee fee
    :modified-fee fee
-   :size (length (tx-wire-bytes tx))
+   :size (length (bitcoin-lisp.serialization:transaction-wire-bytes tx))
    :vsize (bitcoin-lisp.serialization:transaction-vsize tx)
    :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)
    :sigops sigops
@@ -993,7 +986,8 @@ Returns the number of entries written."
        (bitcoin-lisp.serialization:write-uint8 s +mempool-dat-version+)
        (bitcoin-lisp.serialization:write-uint32-le s (length ordered))
        (loop for (txid . entry) in ordered
-             for bytes = (tx-wire-bytes (mempool-entry-transaction entry))
+             for bytes = (bitcoin-lisp.serialization:transaction-wire-bytes
+                          (mempool-entry-transaction entry))
              do (bitcoin-lisp.serialization:write-uint32-le s (length bytes))
                 (write-sequence bytes s)
                 (bitcoin-lisp.serialization:write-uint64-le s (mempool-entry-entry-time entry))
