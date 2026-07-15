@@ -201,7 +201,11 @@ Used by chainstate reindex to empty the UTXO set. Returns the count erased."
                      (leveldb-destroy-writebatch batch)
                      (setf batch (leveldb-make-writebatch) pending 0))))
                (leveldb-iter-next iter)))
-           (when (plusp pending) (leveldb-write db batch :sync t)))
+           ;; Final batch always written with :sync t — even when empty
+           ;; (coin count a multiple of the chunk size) — so the whole wipe,
+           ;; whose earlier chunks were :sync nil in the same WAL, is durable
+           ;; before callers persist state that assumes the coins are gone.
+           (leveldb-write db batch :sync t))
       (leveldb-destroy-writebatch batch))
     erased))
 
