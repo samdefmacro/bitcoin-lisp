@@ -394,6 +394,17 @@ flexi-streams at ~50% of CPU during validation."
     (bb-write-u32-le bb (transaction-lock-time tx))
     (bb-finish bb)))
 
+(defun transaction-wire-bytes (tx)
+  "TX in its wire encoding: BIP 144 witness form only when the tx carries
+witness data, legacy otherwise. This is Core's TX_WITH_WITNESS serialization
+(SerializeTransaction, primitives/transaction.h:241 — the marker/flag pair is
+emitted only when HasWitness()), the encoding EncodeHexTx uses for every RPC
+hex field. Serializing a witnessless tx in extended form would make Core
+reject it with \"Superfluous witness record\"."
+  (if (transaction-has-witness-p tx)
+      (serialize-witness-transaction tx)
+      (serialize-transaction tx)))
+
 (defun transaction-hash (tx)
   "Compute the transaction hash (txid).
 This is the double-SHA256 of the legacy serialized transaction (no witness)."
@@ -573,10 +584,12 @@ auto-detects the per-tx witness marker)."
   (serialize-block-header header))
 
 (defmethod serialize ((block bitcoin-block))
-  ;; Hot path: called from store-block + save-undo-data per block.
-  ;; Build into a byte-buf, writing each tx in-place to avoid the
-  ;; per-tx intermediate byte-vector allocation that bb-write-bytes
-  ;; (serialize-transaction tx) would do.
+  ;; LEGACY (witness-stripped) block form — only correct for answering a
+  ;; MSG_BLOCK getdata (make-block-message :witness nil). Anything that must
+  ;; reproduce the block's real bytes (disk storage, RPC hex) wants
+  ;; serialize-witness-block instead. Build into a byte-buf, writing each tx
+  ;; in-place to avoid the per-tx intermediate byte-vector allocation that
+  ;; bb-write-bytes (serialize-transaction tx) would do.
   (let ((bb (make-byte-buf))
         (txs (bitcoin-block-transactions block)))
     (bb-write-block-header bb (bitcoin-block-header block))
