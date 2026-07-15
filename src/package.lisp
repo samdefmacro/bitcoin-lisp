@@ -462,6 +462,7 @@
    #:make-chain-state
    #:init-chain-state
    #:network-genesis-hash
+   #:make-genesis-block
    #:*testnet3-genesis-hash*
    #:*testnet4-genesis-hash*
    #:*signet-genesis-hash*
@@ -699,6 +700,8 @@
    #:blockfilterindex-height
    #:blockfilterindex-set-best
    #:blockfilterindex-clear-best
+   #:blockfilterindex-wipe
+   #:blockfilterindex-ensure-genesis-anchor
    #:build-blockfilterindex))
 
 (defpackage #:bitcoin-lisp.mempool

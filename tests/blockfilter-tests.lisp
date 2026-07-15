@@ -155,7 +155,10 @@ an unrelated script (almost surely) does not."
 ;;; hook (index-block-filter) fire as generatetodescriptor mines blocks.
 
 (defun %bfi-regtest-node ()
-  "A regtest node at genesis with an enabled block filter index (fresh temp DB)."
+  "A regtest node at genesis with an enabled block filter index (fresh temp
+DB), genesis-anchored the way production startup leaves it: the initial
+backfill (%catch-up-blockfilterindex -> build-blockfilterindex) indexes the
+genesis filter from chain parameters before any block connects."
   (let* ((tag (format nil "bfi~D" (get-internal-real-time)))
          (node (%regtest-node-fixture tag))
          (idxbase (merge-pathnames (format nil "test-bfi-~A/" tag)
@@ -163,6 +166,11 @@ an unrelated script (almost surely) does not."
     (ensure-directories-exist idxbase)
     (setf (bitcoin-lisp::node-blockfilterindex node)
           (bitcoin-lisp.storage:init-blockfilterindex idxbase :enabled t))
+    (bitcoin-lisp.storage:build-blockfilterindex
+     (bitcoin-lisp::node-blockfilterindex node)
+     (bitcoin-lisp::node-chain-state node)
+     (bitcoin-lisp::node-block-store node)
+     #'bitcoin-lisp.validation:get-undo-data)
     node))
 
 (defun %bfi-zeros32 ()
@@ -253,11 +261,12 @@ filter_false_positives keeps the true matches; idle status is null."
            (bitcoin-lisp.rpc::rpc-scanblocks node (list "start" (list "raw(51)") 3 1))))))))
 
 (test blockfilterindex-backfill-seeks-first-indexable
-  "Backfilling an empty index over an existing chain skips leading heights with
-no stored block body (genesis is never stored; a pruned node's whole prefix is
-absent) and seeds at the first indexable block, instead of stopping at height 0
-with nothing indexed. Once seeded, a gap stops the backfill to keep the header
-chain contiguous."
+  "Backfilling an empty index over an UNPRUNED chain first indexes GENESIS from
+chain parameters (its body is never stored), anchoring the header chain per
+BIP157, then continues 1..tip. On a pruned chain the genesis anchor is
+impossible (bodies gone) and the range still seeds at the first indexable
+block. Once seeded, a gap stops the backfill to keep the header chain
+contiguous."
   (%with-regtest
    ;; Mine 5 blocks on a node with NO filter index attached, so the connect
    ;; hook indexes nothing and the backfill does all the work.
@@ -272,21 +281,27 @@ chain contiguous."
               (bfi (bitcoin-lisp.storage:init-blockfilterindex idxbase :enabled t))
               (n (bitcoin-lisp.storage:build-blockfilterindex
                   bfi cs store #'bitcoin-lisp.validation:get-undo-data)))
-         ;; Heights 1..5 indexed; genesis (no stored body) skipped, not fatal.
-         (is (= 5 n))
+         ;; Genesis (from chain params) + heights 1..5 indexed.
+         (is (= 6 n))
          (is (= 5 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
-         (is-false (bitcoin-lisp.storage:blockfilterindex-has-block-p
-                    bfi (bitcoin-lisp.storage:network-genesis-hash :regtest)))
-         ;; Height 1 seeds its header chain from the all-zero parent header.
-         (let* ((h1 (bitcoin-lisp.storage:block-index-entry-hash
+         (is-true (bitcoin-lisp.storage:blockfilterindex-has-block-p
+                   bfi (bitcoin-lisp.storage:network-genesis-hash :regtest)))
+         ;; Genesis anchors on the all-zero header; height 1 chains off genesis.
+         (let* ((ghash (bitcoin-lisp.storage:network-genesis-hash :regtest))
+                (gheader (bitcoin-lisp.storage:blockfilterindex-get-header bfi ghash))
+                (gfilter (bitcoin-lisp.storage:blockfilterindex-get-filter bfi ghash))
+                (h1 (bitcoin-lisp.storage:block-index-entry-hash
                      (bitcoin-lisp.storage:get-block-at-height cs 1)))
                 (filter (bitcoin-lisp.storage:blockfilterindex-get-filter bfi h1)))
+           (is (equalp gheader
+                       (bitcoin-lisp.storage:compute-block-filter-header
+                        gfilter bitcoin-lisp.storage:+zero-filter-header+)))
            (is (equalp (bitcoin-lisp.storage:blockfilterindex-get-header bfi h1)
                        (bitcoin-lisp.storage:compute-block-filter-header
-                        filter bitcoin-lisp.storage:+zero-filter-header+))))
+                        filter gheader))))
          (bitcoin-lisp.storage:close-blockfilterindex bfi)
-         ;; Prune block 3's body and rebuild from scratch: the backfill seeds at
-         ;; height 1, then STOPS at the gap rather than skipping past it.
+         ;; Prune block 3's body and rebuild from scratch: the backfill seeds
+         ;; genesis + 1..2, then STOPS at the gap rather than skipping past it.
          (bitcoin-lisp.storage:prune-block
           store (bitcoin-lisp.storage:block-index-entry-hash
                  (bitcoin-lisp.storage:get-block-at-height cs 3)))
@@ -296,13 +311,16 @@ chain contiguous."
                 (bfi2 (bitcoin-lisp.storage:init-blockfilterindex idxbase2 :enabled t))
                 (n2 (bitcoin-lisp.storage:build-blockfilterindex
                      bfi2 cs store #'bitcoin-lisp.validation:get-undo-data)))
-           (is (= 2 n2))
+           (is (= 3 n2))
            (is (= 2 (bitcoin-lisp.storage:blockfilterindex-height bfi2)))
+           (is-true (bitcoin-lisp.storage:blockfilterindex-has-block-p
+                     bfi2 (bitcoin-lisp.storage:network-genesis-hash :regtest)))
            (bitcoin-lisp.storage:close-blockfilterindex bfi2))
          ;; An empty index starts the seek at the pruned horizon (a pruned
          ;; mainnet node would otherwise probe ~950k deleted heights, ~14 ms
-         ;; each). With pruned-height=2, the scan starts at 3 -- whose body
-         ;; was pruned above -- and still seeds at 4, indexing 4..5.
+         ;; each). With pruned-height=2 the genesis anchor is impossible (no
+         ;; genesis seeding on a pruned chain): the scan starts at 3 -- whose
+         ;; body was pruned above -- and still seeds at 4, indexing 4..5.
          (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 2)
          (let* ((idxbase3 (merge-pathnames
                            (format nil "test-bfb3-~D/" (get-internal-real-time))
@@ -313,9 +331,12 @@ chain contiguous."
            (is (= 2 n3))
            (is (= 5 (bitcoin-lisp.storage:blockfilterindex-height bfi3)))
            (is-false (bitcoin-lisp.storage:blockfilterindex-has-block-p
+                      bfi3 (bitcoin-lisp.storage:network-genesis-hash :regtest)))
+           (is-false (bitcoin-lisp.storage:blockfilterindex-has-block-p
                       bfi3 (bitcoin-lisp.storage:block-index-entry-hash
                             (bitcoin-lisp.storage:get-block-at-height cs 1))))
-           (bitcoin-lisp.storage:close-blockfilterindex bfi3)))))))
+           (bitcoin-lisp.storage:close-blockfilterindex bfi3)
+           (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 0)))))))
 
 (test blockfilterindex-refuses-noncontiguous-add
   "Adding a block whose parent has no stored filter header while the index is
@@ -422,3 +443,154 @@ against a real backfilled index. peer-block-filters gates %cf-serving-index."
                         (bitcoin-lisp.serialization:read-message-header s)))))
            (is (string= "cfcheckpt" cmd))))
        (bitcoin-lisp.storage:close-blockfilterindex (bitcoin-lisp::node-blockfilterindex node))))))
+
+;;; --- BIP157 genesis anchor ---
+;;;
+;;; The filter-header chain MUST be anchored at genesis:
+;;; filter_header(genesis) = double-SHA256(filter_hash(genesis) || 0^32)
+;;; (Core indexes genesis like any block: index/blockfilterindex.cpp
+;;; CustomAppend with m_last_header zero-initialized; blockfilter.cpp
+;;; ComputeHeader). The genesis block body is never in block storage, so it is
+;;; constructed from chain parameters (Core kernel/chainparams.cpp
+;;; CreateGenesisBlock) — construction is verified below byte-for-byte against
+;;; Core's own blockfilters.json height-0 row.
+
+(test genesis-block-construction-matches-core-vector
+  "make-genesis-block reproduces Core's testnet3 genesis block BYTE-EXACTLY
+(blockfilters.json height-0 row carries the full block hex), and the computed
+genesis filter + filter header match the vector — the BIP157 anchor case with
+the all-zero previous header."
+  (let ((rows (%load-blockfilter-vectors)))
+    (if (null rows)
+        (skip "refs/bitcoin blockfilters.json not present")
+        (let ((row0 (find 0 (rest rows) :key #'first)))
+          (is (not (null row0)) "no height-0 row in blockfilters.json")
+          (destructuring-bind (height block-hash-hex block-hex prev-scripts
+                               prev-header-hex expected-filter-hex
+                               expected-header-hex &optional notes)
+              row0
+            (declare (ignore height notes))
+            ;; The genesis anchor really is the zero header in Core's vector.
+            (is (string= prev-header-hex (make-string 64 :initial-element #\0)))
+            (is (null prev-scripts))
+            (let* ((blk (bitcoin-lisp.storage:make-genesis-block :testnet3))
+                   (ghash (bitcoin-lisp.serialization:block-header-hash
+                           (bitcoin-lisp.serialization:bitcoin-block-header blk)))
+                   (filter (bitcoin-lisp.storage:build-basic-block-filter
+                            blk ghash '()))
+                   (header (bitcoin-lisp.storage:compute-block-filter-header
+                            filter bitcoin-lisp.storage:+zero-filter-header+)))
+              ;; Constructed block serializes to Core's exact genesis bytes.
+              (is (string= (%bf-hex (bitcoin-lisp.serialization:serialize-witness-block blk))
+                           block-hex))
+              (is (equalp ghash (%bf-unhex-reversed block-hash-hex)))
+              ;; Filter and anchor header match the Core vector.
+              (is (string= (%bf-hex filter) expected-filter-hex))
+              (is (string= (%bf-hex (bitcoin-lisp.crypto:reverse-bytes header))
+                           expected-header-hex))))))))
+
+(test genesis-filter-headers-all-networks
+  "Every network's genesis block constructs (make-genesis-block errors on any
+hash mismatch) with merkle root == coinbase txid, and the mainnet genesis
+basic-filter header matches its known value.
+
+Derivation of the mainnet constants (blockfilters.json has no mainnet rows):
+computed twice, independently — (1) by this repo's GCS pipeline, which is
+byte-exact against every Core blockfilters.json vector INCLUDING the testnet3
+genesis row (see genesis-block-construction-matches-core-vector), and (2) by a
+from-scratch Python BIP158 implementation (siphash-2-4 + fastrange +
+Golomb-Rice P=19/M=784931) that also reproduces Core's testnet3 genesis row
+bit-exactly. Both derivations agree; a regression in either pipeline fails
+this test loudly."
+  (dolist (net '(:mainnet :testnet3 :testnet4 :signet :regtest))
+    (let* ((blk (bitcoin-lisp.storage:make-genesis-block net))
+           (hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+           (cb (first (bitcoin-lisp.serialization:bitcoin-block-transactions blk))))
+      (is (equalp (bitcoin-lisp.serialization:block-header-merkle-root hdr)
+                  (bitcoin-lisp.serialization:transaction-hash cb))
+          "~A: genesis merkle root must equal the coinbase txid" net)
+      (is (equalp (bitcoin-lisp.serialization:block-header-hash hdr)
+                  (bitcoin-lisp.storage:network-genesis-hash net)))))
+  (let* ((blk (bitcoin-lisp.storage:make-genesis-block :mainnet))
+         (ghash (bitcoin-lisp.storage:network-genesis-hash :mainnet))
+         (filter (bitcoin-lisp.storage:build-basic-block-filter blk ghash '()))
+         (header (bitcoin-lisp.storage:compute-block-filter-header
+                  filter bitcoin-lisp.storage:+zero-filter-header+)))
+    (is (string= "017fa880" (%bf-hex filter)))
+    (is (string= "02c2392180d0ce2b5b6f8b08d39a11ffe831c673311a3ecf77b97fc3f0303c9f"
+                 (%bf-hex (bitcoin-lisp.crypto:reverse-bytes header))))))
+
+(test blockfilterindex-genesis-anchor-migration
+  "A legacy index (header chain seeded at the first stored block, no height-0
+entry) is detected by blockfilterindex-ensure-genesis-anchor and wiped so the
+backfill rebuilds it anchored at genesis; healthy and empty indexes are left
+alone; a pruned node's legacy index is kept (rebuild impossible) with a
+warning."
+  (%with-regtest
+   (let ((node (%regtest-node-fixture (format nil "bfm~D" (get-internal-real-time)))))
+     (let ((bitcoin-lisp::*node* node))
+       (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list 4 "raw(51)"))
+       (let* ((cs (bitcoin-lisp::node-chain-state node))
+              (store (bitcoin-lisp::node-block-store node))
+              (ghash (bitcoin-lisp.storage:network-genesis-hash :regtest))
+              (idxbase (merge-pathnames
+                        (format nil "test-bfm-~D/" (get-internal-real-time))
+                        (uiop:temporary-directory)))
+              (bfi (bitcoin-lisp.storage:init-blockfilterindex idxbase :enabled t)))
+         ;; Empty index: nothing to migrate.
+         (is (eq :empty (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor
+                         bfi cs)))
+         ;; Fabricate the LEGACY shape: seed the header chain at height 1
+         ;; (exactly what the old code did on every from-genesis node).
+         (flet ((add (h)
+                  (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash
+                                (bitcoin-lisp.storage:get-block-at-height cs h)))
+                         (block (bitcoin-lisp.storage:get-block store hash))
+                         (undo (bitcoin-lisp.validation:get-undo-data hash)))
+                    (bitcoin-lisp.storage:blockfilterindex-add-block
+                     bfi block hash h undo))))
+           (loop for h from 1 to 4 do (is-true (add h))))
+         (is (= 4 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+         (is-false (bitcoin-lisp.storage:blockfilterindex-has-block-p bfi ghash))
+         ;; Pruned chain: the bad index is kept (bodies gone, cannot rebuild).
+         (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 2)
+         (is (eq :unanchored-pruned
+                 (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor bfi cs)))
+         (is (= 4 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+         (setf (bitcoin-lisp.storage:chain-state-pruned-height cs) 0)
+         ;; Unpruned: detected and wiped...
+         (is (eq :rebuilt
+                 (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor bfi cs)))
+         (is (= -1 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+         ;; ...and the backfill rebuilds the whole chain anchored at genesis.
+         (let ((n (bitcoin-lisp.storage:build-blockfilterindex
+                   bfi cs store #'bitcoin-lisp.validation:get-undo-data)))
+           (is (= 5 n)))
+         (is (= 4 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+         (multiple-value-bind (gfilter gheader)
+             (bitcoin-lisp.storage:blockfilterindex-get bfi ghash)
+           ;; Stored genesis record matches a from-parameters recomputation
+           ;; (and the independently derived regtest constants, python BIP158).
+           (let* ((gblk (bitcoin-lisp.storage:make-genesis-block :regtest))
+                  (expected-filter (bitcoin-lisp.storage:build-basic-block-filter
+                                    gblk ghash '())))
+             (is (equalp gfilter expected-filter))
+             (is (string= "014756c0" (%bf-hex gfilter)))
+             (is (equalp gheader (bitcoin-lisp.storage:compute-block-filter-header
+                                  gfilter bitcoin-lisp.storage:+zero-filter-header+)))
+             (is (string= "485e301e4509d7f0d954bf5b529f3ecef68c5191fd0e635f775c1d0266dc5a2b"
+                          (%bf-hex (bitcoin-lisp.crypto:reverse-bytes gheader)))))
+           ;; Every subsequent header chains, so absolute values are anchored.
+           (loop for h from 1 to 4
+                 for hash = (bitcoin-lisp.storage:block-index-entry-hash
+                             (bitcoin-lisp.storage:get-block-at-height cs h))
+                 for prev = gheader then hdr
+                 for hdr = (bitcoin-lisp.storage:blockfilterindex-get-header bfi hash)
+                 for filter = (bitcoin-lisp.storage:blockfilterindex-get-filter bfi hash)
+                 do (is (equalp hdr (bitcoin-lisp.storage:compute-block-filter-header
+                                     filter prev)))))
+         ;; Healthy index: second run is a no-op.
+         (is (eq :ok (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor
+                      bfi cs)))
+         (is (= 4 (bitcoin-lisp.storage:blockfilterindex-height bfi)))
+         (bitcoin-lisp.storage:close-blockfilterindex bfi))))))
