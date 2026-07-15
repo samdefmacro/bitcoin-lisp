@@ -996,3 +996,132 @@ chainstate.dat to the highest ancestor whose coins ARE committed."
                     (bitcoin-lisp::node-chain-state node)))))
       (is (eq t (bitcoin-lisp.storage:load-state reload)))
       (is (= 2 (bitcoin-lisp.storage:current-height reload))))))
+
+;;;; Shutdown flush crash safety (stop-node -> %shutdown-flush-chainstates).
+;;;;
+;;;; stop-node used to save-state (which CLEARS the in-transition marker) and
+;;;; THEN coins-flush as two bare steps -- a kill between them left
+;;;; chainstate.dat ahead of the coins DB with no marker, so load-state
+;;;; returned clean over the inconsistency: the exact silent-corruption class
+;;;; the 3-phase commit exists to prevent. These tests pin the shutdown flush
+;;;; to the marker discipline (Core Shutdown iterates every chainstate through
+;;;; ForceFlushStateToDisk, init.cpp:379-387 -- the same marker-protected
+;;;; BatchWrite path as the periodic flush).
+
+(defun %shutdown-fixture-chainstate (base suffix height &rest cs-args)
+  "A chainstate over BASE with storage-SUFFIX, tip at HEIGHT, and its own
+coins LevelDB (chainstate<SUFFIX>/) holding one dirty, unflushed coin whose
+txid bytes are all HEIGHT."
+  (let ((cs (apply #'bitcoin-lisp.storage:make-chain-state
+                   :base-path base
+                   :best-block-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element #xAA)
+                   :best-height height
+                   :storage-suffix suffix
+                   cs-args)))
+    (bitcoin-lisp.storage:open-chainstate-coins-view cs)
+    (bitcoin-lisp.storage:add-utxo
+     (bitcoin-lisp.storage:chain-state-coins-view cs)
+     (make-array 32 :element-type '(unsigned-byte 8) :initial-element height)
+     0 5000000000
+     (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51)
+     height :coinbase t)
+    cs))
+
+(defun %shutdown-fixture-coin-durable-p (base suffix height)
+  "T iff the fixture coin for HEIGHT is in the on-disk LevelDB at
+BASE/chainstate<SUFFIX>/ (opened fresh, so only flushed state counts)."
+  (let ((cs (bitcoin-lisp.storage:make-chain-state :base-path base
+                                                   :storage-suffix suffix)))
+    (bitcoin-lisp.storage:open-chainstate-coins-view cs)
+    (unwind-protect
+         (and (bitcoin-lisp.storage:get-utxo
+               (bitcoin-lisp.storage:chain-state-coins-view cs)
+               (make-array 32 :element-type '(unsigned-byte 8)
+                              :initial-element height)
+               0)
+              t)
+      (bitcoin-lisp.storage:close-chainstate-coins-view cs))))
+
+(test shutdown-flush-marker-window
+  "%shutdown-flush-chainstates runs the shutdown flush through the 3-phase
+commit: DURING the coins-flush window the on-disk state file carries the
+in-transition marker (a crash there is detected at the next startup), and
+after it completes the marker is cleared, the coins are durable, and the
+coins view is closed."
+  (let* ((base (ensure-directories-exist
+                (merge-pathnames (format nil "test-shutdown-flush-~D/"
+                                         (get-universal-time))
+                                 (uiop:temporary-directory))))
+         (node (bitcoin-lisp::make-node))
+         (mid-window '()))
+    (unwind-protect
+         (let ((cs (%shutdown-fixture-chainstate base "" 7)))
+           (setf (bitcoin-lisp::node-chainstates node) (list cs))
+           (let ((bitcoin-lisp::*flush-mid-commit-hook*
+                   (lambda (flushing)
+                     ;; Probe the ON-DISK state file from a fresh struct, as
+                     ;; a post-crash startup would.
+                     (let ((probe (bitcoin-lisp.storage:make-chain-state
+                                   :base-path base
+                                   :storage-suffix
+                                   (bitcoin-lisp.storage:chain-state-storage-suffix
+                                    flushing))))
+                       (push (bitcoin-lisp.storage:load-state probe) mid-window)))))
+             (bitcoin-lisp::%shutdown-flush-chainstates node))
+           ;; The unsafe window was marked on disk...
+           (is (equal '(:inconsistent) mid-window))
+           ;; ...and the completed shutdown committed clean at the tip.
+           (let ((reload (bitcoin-lisp.storage:make-chain-state :base-path base)))
+             (is (eq t (bitcoin-lisp.storage:load-state reload)))
+             (is (= 7 (bitcoin-lisp.storage:current-height reload))))
+           ;; Coins view closed; the dirty coin made it to LevelDB.
+           (is (null (bitcoin-lisp.storage:chain-state-coins-view cs)))
+           (is (eq t (%shutdown-fixture-coin-durable-p base "" 7))))
+      (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
+
+(test shutdown-flush-covers-all-chainstates
+  "With an assumeutxo snapshot active (two chainstates), the shutdown flush
+runs EACH through its own 3-phase commit: both storage-suffix-named state
+files carry the marker during their own window, and both load clean at their
+own tips afterwards with their coins durable."
+  (let* ((base (ensure-directories-exist
+                (merge-pathnames (format nil "test-shutdown-flush2-~D/"
+                                         (get-universal-time))
+                                 (uiop:temporary-directory))))
+         (node (bitcoin-lisp::make-node))
+         (mid-window '()))
+    (unwind-protect
+         (let ((primary (%shutdown-fixture-chainstate base "" 1))
+               (snap (%shutdown-fixture-chainstate
+                      base "_snapshot" 5
+                      :from-snapshot-blockhash
+                      (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element 5)
+                      :assumeutxo-status :unvalidated)))
+           (setf (bitcoin-lisp::node-chainstates node) (list primary snap))
+           (let ((bitcoin-lisp::*flush-mid-commit-hook*
+                   (lambda (flushing)
+                     (let* ((suffix (bitcoin-lisp.storage:chain-state-storage-suffix
+                                     flushing))
+                            (probe (bitcoin-lisp.storage:make-chain-state
+                                    :base-path base :storage-suffix suffix)))
+                       (push (cons suffix (bitcoin-lisp.storage:load-state probe))
+                             mid-window)))))
+             (bitcoin-lisp::%shutdown-flush-chainstates node))
+           ;; Both chainstates hit their own marker window, in list order.
+           (is (equal '(("" . :inconsistent) ("_snapshot" . :inconsistent))
+                      (reverse mid-window)))
+           ;; Both committed clean, each at its own tip, coins durable.
+           (let ((p (bitcoin-lisp.storage:make-chain-state :base-path base))
+                 (s (bitcoin-lisp.storage:make-chain-state
+                     :base-path base :storage-suffix "_snapshot")))
+             (is (eq t (bitcoin-lisp.storage:load-state p)))
+             (is (eq t (bitcoin-lisp.storage:load-state s)))
+             (is (= 1 (bitcoin-lisp.storage:current-height p)))
+             (is (= 5 (bitcoin-lisp.storage:current-height s))))
+           (is (null (bitcoin-lisp.storage:chain-state-coins-view primary)))
+           (is (null (bitcoin-lisp.storage:chain-state-coins-view snap)))
+           (is (eq t (%shutdown-fixture-coin-durable-p base "" 1)))
+           (is (eq t (%shutdown-fixture-coin-durable-p base "_snapshot" 5))))
+      (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
