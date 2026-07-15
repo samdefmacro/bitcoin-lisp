@@ -141,6 +141,40 @@ prioritisation-modified fee (Core scores mining/eviction on modified fees)."
         0
         (/ (mempool-entry-modified-fee entry) vsize))))
 
+;;;; Unbroadcast set (Core m_unbroadcast_txids)
+;;;;
+;;;; Locally-submitted transactions get a best-effort initial broadcast:
+;;;; sendrawtransaction adds the txid here, the periodic re-announcement
+;;;; pass (reattempt-initial-broadcast) keeps re-relaying it, and a peer's
+;;;; getdata for the tx — proof the announcement propagated — removes it.
+
+(defun mempool-add-unbroadcast (mempool txid)
+  "Track TXID as a locally-submitted transaction awaiting confirmation of
+its initial broadcast (Core CTxMemPool::AddUnbroadcastTx, txmempool.h:
+542-548). Gated on the tx actually being in the pool — Core's exists()
+sanity check — keeping the set a subset of the entries. Returns T when
+recorded."
+  (when (mempool-has mempool txid)
+    (setf (gethash txid (mempool-unbroadcast mempool)) t)))
+
+(defun mempool-remove-unbroadcast (mempool txid)
+  "Drop TXID from the unbroadcast set (Core CTxMemPool::RemoveUnbroadcastTx,
+txmempool.cpp:784-790): a peer requested the tx via getdata, or the tx left
+the mempool. Returns T when it was present."
+  (remhash txid (mempool-unbroadcast mempool)))
+
+(defun mempool-unbroadcast-txids (mempool)
+  "The txids awaiting initial broadcast, as a fresh list (Core
+CTxMemPool::GetUnbroadcastTxs returns a copy for the same reason: the
+caller iterates while re-announcing, which may mutate the set)."
+  (loop for txid being the hash-keys of (mempool-unbroadcast mempool)
+        collect txid))
+
+(defun mempool-unbroadcast-count (mempool)
+  "Number of transactions awaiting initial broadcast (getmempoolinfo's
+\"unbroadcastcount\")."
+  (hash-table-count (mempool-unbroadcast mempool)))
+
 ;;;; Mempool
 
 (defun %graph-txid-order (a b)
@@ -176,6 +210,12 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   ;; txid -> satoshi fee delta from prioritisetransaction (Core's mapDeltas).
   ;; Deltas may exist for txs not (yet) in the mempool; applied on acceptance.
   (deltas (make-hash-table :test 'equalp) :type hash-table)
+  ;; txid -> T for locally-submitted transactions (sendrawtransaction) whose
+  ;; initial broadcast hasn't been confirmed yet (Core m_unbroadcast_txids,
+  ;; txmempool.h:286). A peer's getdata for the tx is the confirmation signal;
+  ;; until then the periodic re-announcement pass keeps re-relaying. Always a
+  ;; subset of ENTRIES: adds are gated on membership, removal drops the txid.
+  (unbroadcast (make-hash-table :test 'equalp) :type hash-table)
   ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
   ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
   (orphan-pool (make-orphan-pool) :type orphan-pool)
@@ -703,6 +743,9 @@ shadow checks report as divergence."
       (let ((wtxid (mempool-entry-wtxid entry)))
         (when wtxid
           (remhash wtxid (mempool-by-wtxid mempool))))
+      ;; A tx leaving the pool leaves the unbroadcast set with it (Core
+      ;; removeUnchecked -> RemoveUnbroadcastTx, txmempool.cpp:287).
+      (mempool-remove-unbroadcast mempool txid)
       ;; Drop ancestor/descendant links to/from this entry
       (%unlink-entry mempool txid entry)
       ;; Remove from entries
@@ -966,16 +1009,21 @@ transactions (validation.cpp:1113-1121)."
 ;;;;   magic "MPL\x01" (u32) | version (u8) |
 ;;;;   entry-count (u32) | entries: [tx-len u32 | tx bytes (witness form) |
 ;;;;     entry-time u64 | fee-delta i64] |
-;;;;   residual-delta-count (u32) | [txid 32B | fee-delta i64]* | CRC32
+;;;;   residual-delta-count (u32) | [txid 32B | fee-delta i64]* |
+;;;;   [v2+] unbroadcast-count (u32) | [txid 32B]* | CRC32
 ;;;; Entries are written parents-before-children (ascending in-mempool
 ;;;; ancestor count) so reload through normal acceptance resolves chained
 ;;;; spends, mirroring Core's sorted infoAll(). Per-entry deltas ride with
 ;;;; their entry; deltas for txs not in the pool are the residual map.
+;;;; Version 2 appends the unbroadcast txid set after the deltas — the same
+;;;; trailing placement as Core's format (node/mempool_persist.cpp:159/206,
+;;;; unbroadcast set after mapDeltas); version-1 files still load, with an
+;;;; empty unbroadcast set.
 
 (defconstant +mempool-dat-magic+ #x4d504c01
   "Magic identifying a mempool.dat file (\"MPL\" + 0x01).")
 
-(defconstant +mempool-dat-version+ 1)
+(defconstant +mempool-dat-version+ 2)
 
 (defun mempool-dat-path (data-directory)
   "Path of the mempool persistence file under DATA-DIRECTORY, or NIL."
@@ -998,10 +1046,11 @@ than any of its parents)."
             (sort pairs #'< :key #'third))))
 
 (defun save-mempool-file (mempool path)
-  "Persist MEMPOOL (entries + prioritisation deltas) to PATH atomically.
-Returns the number of entries written."
+  "Persist MEMPOOL (entries + prioritisation deltas + the unbroadcast txid
+set) to PATH atomically. Returns the number of entries written."
   (let ((ordered (%mempool-entries-parents-first mempool))
-        (residual '()))
+        (residual '())
+        (unbroadcast (mempool-unbroadcast-txids mempool)))
     (maphash (lambda (txid delta)
                (unless (mempool-has mempool txid)
                  (push (cons txid delta) residual)))
@@ -1023,27 +1072,35 @@ Returns the number of entries written."
        (bitcoin-lisp.serialization:write-uint32-le s (length residual))
        (loop for (txid . delta) in residual
              do (write-sequence txid s)
-                (bitcoin-lisp.serialization:write-int64-le s delta))))
+                (bitcoin-lisp.serialization:write-int64-le s delta))
+       ;; v2: the unbroadcast set, trailing like Core's
+       ;; (node/mempool_persist.cpp:205-206, after mapDeltas).
+       (bitcoin-lisp.serialization:write-uint32-le s (length unbroadcast))
+       (dolist (txid unbroadcast)
+         (write-sequence txid s))))
     (length ordered)))
 
 (defun read-mempool-file (path)
   "Read a mempool.dat written by save-mempool-file. Returns
-(values entries residual-deltas ok-p) where ENTRIES is a list of
-(tx entry-time fee-delta) in file (parents-first) order and
-RESIDUAL-DELTAS is an alist of (txid . delta). OK-P is NIL when the file
-is missing, corrupt, or an unknown version — callers continue with an
-empty mempool, like Core."
+(values entries residual-deltas ok-p unbroadcast-txids) where ENTRIES is a
+list of (tx entry-time fee-delta) in file (parents-first) order,
+RESIDUAL-DELTAS is an alist of (txid . delta), and UNBROADCAST-TXIDS is a
+list of txids awaiting initial broadcast (always NIL for version-1 files,
+which predate the set). OK-P is NIL when the file is missing, corrupt, or
+an unknown version — callers continue with an empty mempool, like Core."
   (let ((data (bitcoin-lisp.storage:load-file-with-crc32 path 13)))
     (unless data
-      (return-from read-mempool-file (values nil nil nil)))
+      (return-from read-mempool-file (values nil nil nil nil)))
     (handler-case
         ;; The byte-reader spans the full verified buffer; parsing reads
         ;; exactly the declared counts, so the trailing CRC bytes (already
         ;; checked by load-file-with-crc32) are simply never consumed.
-        (let ((br (bitcoin-lisp.serialization:make-byte-reader-from data)))
+        (let ((br (bitcoin-lisp.serialization:make-byte-reader-from data))
+              (version 0))
           (unless (and (= (bitcoin-lisp.serialization:br-read-u32-le br) +mempool-dat-magic+)
-                       (= (bitcoin-lisp.serialization:br-read-u8 br) +mempool-dat-version+))
-            (return-from read-mempool-file (values nil nil nil)))
+                       (<= 1 (setf version (bitcoin-lisp.serialization:br-read-u8 br))
+                           +mempool-dat-version+))
+            (return-from read-mempool-file (values nil nil nil nil)))
           (let* ((count (bitcoin-lisp.serialization:br-read-u32-le br))
                  (entries
                    (loop repeat count
@@ -1058,9 +1115,14 @@ empty mempool, like Core."
                  (residual
                    (loop repeat (bitcoin-lisp.serialization:br-read-u32-le br)
                          collect (cons (bitcoin-lisp.serialization:br-read-bytes br 32)
-                                       (bitcoin-lisp.serialization:br-read-i64-le br)))))
-            (values entries residual t)))
-      (error () (values nil nil nil)))))
+                                       (bitcoin-lisp.serialization:br-read-i64-le br))))
+                 ;; v1 files end after the residual deltas: no trailer to read.
+                 (unbroadcast
+                   (when (>= version 2)
+                     (loop repeat (bitcoin-lisp.serialization:br-read-u32-le br)
+                           collect (bitcoin-lisp.serialization:br-read-bytes br 32)))))
+            (values entries residual t unbroadcast)))
+      (error () (values nil nil nil nil)))))
 
 ;;;; Eviction
 
