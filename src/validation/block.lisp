@@ -1729,6 +1729,91 @@ Returns the common ancestor block-index-entry."
              (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
     (nreverse entries)))
 
+(defun %mempool-entry-invalid-after-reorg-p (mempool entry utxo-set eval-height
+                                             chain-state mtp locktime-time
+                                             csv-active)
+  "Core's filter_final_and_mature predicate (validation.cpp:341-382), run
+over a mempool entry after a reorg: T when the entry would be invalid in
+the next block on the NEW chain and must be removed with its descendants —
+no longer final, BIP68 sequence locks no longer satisfied, or spending a
+now-immature coinbase. EVAL-HEIGHT is the next block's height (new tip +
+1); MTP the new tip's median-time-past; LOCKTIME-TIME the BIP113 clock for
+absolute locktimes (MTP once CSV is active, mirroring the acceptance path)."
+  (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+    (or
+     ;; The transaction must still be final (Core CheckFinalTxAtTip:
+     ;; next-block height + tip MTP, validation.cpp:347-348).
+     (not (check-transaction-final tx eval-height locktime-time))
+     ;; BIP68 re-tested against the new chain. Core re-tests cached
+     ;; LockPoints and recalculates stale ones (TestLockPointValidity /
+     ;; CalculateLockPointsAtTip, validation.cpp:350-366); we cache no
+     ;; lockpoints, so always recalculate. In-mempool prevouts count as
+     ;; confirming in the next block, like acceptance (mempool-extra-coins).
+     (and csv-active
+          (multiple-value-bind (extra ok)
+              (mempool-extra-coins tx utxo-set mempool eval-height)
+            (or (not ok)   ; an input no longer exists anywhere — invalid
+                (not (check-sequence-locks tx utxo-set eval-height mtp
+                                           chain-state :pending-utxos extra)))))
+     ;; Coinbase spends must still be mature (validation.cpp:368-379):
+     ;; skip inputs funded by other mempool txs (unconfirmed, never
+     ;; coinbase); a confirmed coin must be COINBASE_MATURITY deep at the
+     ;; next block. Core has a per-entry spends-coinbase flag and asserts
+     ;; the coin exists; we scan the inputs and treat a missing coin as
+     ;; invalid (defensive — the re-add path should have removed it).
+     (block immature
+       (bitcoin-lisp.serialization:dovector
+           (input (bitcoin-lisp.serialization:transaction-inputs tx))
+         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
+                (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))
+           (unless (bitcoin-lisp.mempool:mempool-has mempool ptxid)
+             (let ((utxo (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)))
+               (cond ((null utxo)
+                      (return-from immature t))
+                     ((and (bitcoin-lisp.storage:utxo-entry-coinbase utxo)
+                           (< (- eval-height
+                                 (bitcoin-lisp.storage:utxo-entry-height utxo))
+                              +coinbase-maturity+))
+                      (return-from immature t)))))))
+       nil))))
+
+(defun remove-reorged-nonfinal-mempool-entries (mempool utxo-set height chain-state)
+  "Re-filter PRE-EXISTING mempool entries after a reorg — Core
+CTxMemPool::removeForReorg (txmempool.cpp:360-386) driven by
+filter_final_and_mature: entries that are non-final under the new tip, have
+BIP68 locks the shorter/different chain no longer satisfies, or spend
+now-immature coinbases are removed together with all their descendants.
+The re-add loop only vets the txs coming BACK from disconnected blocks;
+this pass covers what was already in the pool, whose validity the reorg may
+have silently revoked. HEIGHT is the NEW tip height. Returns the number of
+transactions removed."
+  (let* ((eval-height (1+ height))
+         (tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (mtp (compute-median-time-past chain-state tip-hash))
+         (csv-active (>= eval-height
+                         (get-csv-activation-height bitcoin-lisp:*network*)))
+         ;; BIP113: same clock the acceptance path uses (transaction.lisp).
+         (locktime-time (if csv-active
+                            mtp
+                            (bitcoin-lisp.serialization:get-unix-time)))
+         (flagged '()))
+    ;; Flag first (Core collects to_remove over all of mapTx), remove after —
+    ;; the entries table must not be mutated mid-iteration.
+    (bitcoin-lisp.mempool:mempool-for-each
+     mempool
+     (lambda (txid entry)
+       (when (%mempool-entry-invalid-after-reorg-p
+              mempool entry utxo-set eval-height chain-state
+              mtp locktime-time csv-active)
+         (push txid flagged))))
+    (let ((removed 0))
+      (dolist (txid flagged removed)
+        ;; May be gone already as an earlier removal's descendant.
+        (when (bitcoin-lisp.mempool:mempool-has mempool txid)
+          (incf removed (bitcoin-lisp.mempool:mempool-remove-recursive
+                         mempool txid)))))))
+
 (defun readd-disconnected-txs-to-mempool (mempool txs utxo-set height chain-state)
   "Re-add TXS from reorg-disconnected blocks into the mempool, best-effort —
 a port of Bitcoin Core's MaybeUpdateMempoolForReorg (validation.cpp:294-389).
@@ -1750,9 +1835,14 @@ Acceptance assumes a new entry has no in-mempool children — false for a
 previously-confirmed tx whose outputs pre-existing pool entries spend — so
 after the per-tx loop, MEMPOOL-UPDATE-FOR-REORG wires those parent->child
 dependencies in bulk and restores the cluster limits with ONE trim (Core
-UpdateTransactionsFromBlock, txmempool.cpp:91-120), and a final byte-cap
-trim re-limits the pool (Core LimitMempoolSize, validation.cpp:387)."
-  (when (and mempool txs)
+UpdateTransactionsFromBlock, txmempool.cpp:91-120). Then the PRE-EXISTING
+entries are re-filtered against the new tip (Core removeForReorg,
+validation.cpp:384-385 — finality, BIP68, coinbase maturity; the ordering
+is Core's MaybeUpdateMempoolForReorg exactly), and a final cap trim
+re-limits the pool (Core LimitMempoolSize, validation.cpp:387). Runs even
+with no TXS to re-add: the filter and trim concern the pool, not the
+disconnected blocks."
+  (when mempool
     (let ((readded '()))                ; txids, most-recently-confirmed first
       (dolist (tx txs)
         (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
@@ -1777,6 +1867,7 @@ trim re-limits the pool (Core LimitMempoolSize, validation.cpp:387)."
                mempool txid
                (length (bitcoin-lisp.serialization:transaction-outputs tx))))))
       (bitcoin-lisp.mempool:mempool-update-for-reorg mempool readded)
+      (remove-reorged-nonfinal-mempool-entries mempool utxo-set height chain-state)
       (bitcoin-lisp.mempool:mempool-trim-to-size mempool))))
 
 (defun %rollback-partial-reorg (chain-state block-store utxo-set
