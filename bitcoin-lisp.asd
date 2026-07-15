@@ -99,6 +99,7 @@
                                (:file "psbt")
                                (:file "merkleproof")
                                (:file "rest")
+                               (:file "ui")
                                (:file "server")))
                  (:file "node"))))
   :in-order-to ((test-op (test-op "bitcoin-lisp/tests"))))
@@ -153,6 +154,8 @@
                              (:file "persistence-tests")
                              ;; RPC tests
                              (:file "rpc-tests")
+                             ;; Web UI serving + Origin-check tests (gui-plan P0)
+                             (:file "ui-tests")
                              ;; Mainnet support tests
                              (:file "mainnet-tests")
                              ;; Pruning tests
