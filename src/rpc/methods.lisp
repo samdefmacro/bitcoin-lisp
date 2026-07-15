@@ -169,29 +169,48 @@ first (when assumeutxo background validation is in progress), the current
             (error 'rpc-error :code +rpc-misc-error+
                               :message "Block not found"))))))
 
+(defun %parse-verbosity (params index default &key allow-bool)
+  "Core's ParseVerbosity (rpc/util.cpp:83) for the positional argument at INDEX
+in PARAMS: an integer passes through, a boolean (where allowed) maps true→1 /
+false→0, and a missing argument yields DEFAULT. Our JSON layer folds false and
+null both to NIL, so a supplied NIL reads as false where booleans are allowed
+and as null (→ DEFAULT) where they aren't."
+  (if (< (length params) (1+ index))
+      default
+      (let ((v (nth index params)))
+        (cond ((integerp v) v)
+              ((null v) (if allow-bool 0 default))
+              ((and allow-bool (eq v t)) 1)
+              ((eq v t)
+               (error 'rpc-error :code +rpc-type-error+
+                                 :message "Verbosity was boolean but only integer allowed"))
+              (t (error 'rpc-error :code +rpc-type-error+
+                                   :message "JSON value is not an integer as expected"))))))
+
 (defun rpc-getblock (node params)
-  "Return block data. Verbosity: 0=hex, 1=json, 2=json+tx details."
-  (let ((hash-str (first params))
-        (verbosity (or (second params) 1)))
+  "Return block data (Bitcoin Core getblock). Verbosity <= 0 (or false) returns
+the serialized block hex; 1 (or true) a JSON object with txids; >= 2 the object
+with full transaction details (Core's verbosity-3 prevout data is not supported
+and folds into 2)."
+  (let ((hash-str (first params)))
     (unless (valid-hex-hash-p hash-str)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid block hash"))
-    (unless (member verbosity '(0 1 2))
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Verbosity must be 0, 1, or 2"))
-    (let* ((hash-bytes (parse-hex-hash hash-str))
+    (let* ((verbosity (%parse-verbosity params 1 1 :allow-bool t))
+           (hash-bytes (parse-hex-hash hash-str))
            (block-store (rpc-get-block-store node))
-           (block (bitcoin-lisp.storage:get-block block-store hash-bytes)))
+           (block (and block-store
+                       (bitcoin-lisp.storage:get-block block-store hash-bytes))))
       (unless block
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Block not found"))
-      (case verbosity
-        (0 ;; Return hex-encoded raw block
+      (cond
+        ((<= verbosity 0) ;; Hex of the block's wire (witness-complete) bytes
          (bitcoin-lisp.crypto:bytes-to-hex
-          (bitcoin-lisp.serialization:serialize block)))
-        (1 ;; Return JSON with txids only
+          (bitcoin-lisp.serialization:serialize-witness-block block)))
+        ((= verbosity 1) ;; JSON with txids only
          (block-to-json block hash-str nil (rpc-get-chain-state node) (rpc-get-network node)))
-        (2 ;; Return JSON with full tx details
+        (t ;; JSON with full tx details
          (block-to-json block hash-str t (rpc-get-chain-state node) (rpc-get-network node)))))))
 
 (defun %block-on-active-chain-p (entry chain-state)
@@ -247,7 +266,8 @@ the index."
                       (reduce #'+ txs :key (lambda (tx)
                                              (length (bitcoin-lisp.serialization:serialize-transaction tx))))))
          (size (+ 80 (bitcoin-lisp.serialization:compact-size-length ntx)
-                  (reduce #'+ txs :key (lambda (tx) (length (%tx-wire-bytes tx)))))))
+                  (reduce #'+ txs :key (lambda (tx)
+                                         (length (bitcoin-lisp.serialization:transaction-wire-bytes tx)))))))
     (append
      `(("hash" . ,hash-str))
      (when entry (%chain-header-fields entry chain-state))
@@ -267,13 +287,6 @@ the index."
 (defun tx-to-txid (tx)
   "Get transaction ID as hex string."
   (hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
-
-(defun %tx-wire-bytes (tx)
-  "TX in its wire encoding (witness form when it has witness data), for the
-size/hex fields. Mirrors the mempool's tx-wire-bytes."
-  (if (bitcoin-lisp.serialization:transaction-has-witness-p tx)
-      (bitcoin-lisp.serialization:serialize-witness-transaction tx)
-      (bitcoin-lisp.serialization:serialize-transaction tx)))
 
 (defun %script-type (script)
   "Bitcoin Core scriptPubKey 'type' name for a standard SCRIPT, else
@@ -306,7 +319,7 @@ size/hex fields. Mirrors the mempool's tx-wire-bytes."
 derived. Includes the size/weight/hex fields explorers and fee tools expect."
   (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
-        (wire (%tx-wire-bytes tx)))
+        (wire (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
     `(("txid" . ,(tx-to-txid tx))
       ("hash" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
       ("version" . ,(bitcoin-lisp.serialization:transaction-version tx))
@@ -613,9 +626,11 @@ peer disconnecting mid-send."
 
 (defun %orphan-tx-json (tx from-peer verbose2)
   "OrphanDescription (Core getorphantxs verbosity 1/2) for orphan TX announced by
-FROM-PEER (a peer object, or nil). VERBOSE2 appends the raw hex. \"from\" is our
-single announcer (Core tracks a list); an empty list when the announcer is gone."
-  (let* ((ser (bitcoin-lisp.serialization:serialize-transaction tx))
+FROM-PEER (a peer object, or nil). VERBOSE2 appends the raw hex. \"bytes\" and
+\"hex\" use the wire (witness-complete) encoding — Core ComputeTotalSize /
+EncodeHexTx. \"from\" is our single announcer (Core tracks a list); an empty
+list when the announcer is gone."
+  (let* ((ser (bitcoin-lisp.serialization:transaction-wire-bytes tx))
          (base `(("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
                  ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
                  ("bytes" . ,(length ser))
@@ -632,10 +647,13 @@ single announcer (Core tracks a list); an empty list when the announcer is gone.
   "List the transactions in the orphan pool (Bitcoin Core getorphantxs, hidden).
 PARAMS: ([verbosity]) -- 0 (default) an array of txids, 1 an array of orphan
 detail objects, 2 the detail objects plus each transaction's raw hex."
-  (let* ((verbosity (if (integerp (first params)) (first params) 0))
+  (let* ((verbosity (%parse-verbosity params 0 0))
          (mempool (rpc-get-mempool node))
          (pool (and mempool (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
          (result '()))
+    (unless (member verbosity '(0 1 2))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "Invalid verbosity value ~A" verbosity)))
     (when pool
       (maphash
        (lambda (txid entry)
@@ -2550,8 +2568,11 @@ selected tx with data/txid/hash/depends/fee/sigops/weight. `depends` holds the
                                                 index-of)))
                               (when idx (pushnew idx ds))))
                           (sort ds #'<))
+          ;; Wire encoding (Core EncodeHexTx): a witnessless tx must NOT carry
+          ;; marker/flag or the reconstructed block fails Core deserialization
+          ;; with "Superfluous witness record".
           collect `(("data" . ,(bitcoin-lisp.crypto:bytes-to-hex
-                                (bitcoin-lisp.serialization:serialize-witness-transaction tx)))
+                                (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
                     ("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
                     ("hash" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
                     ("depends" . ,depends)
@@ -2674,11 +2695,22 @@ string. Routes through the same activate-block consensus path as network blocks.
                      (error 'rpc-error :code +rpc-misc-error+
                                        :message (format nil "Block decode failed: ~A" e)))))
           (chain-state (rpc-get-chain-state node)))
-      (let ((hash (bitcoin-lisp.serialization:block-header-hash
-                   (bitcoin-lisp.serialization:bitcoin-block-header block))))
-        ;; Already in the block index → duplicate.
-        (when (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
-          (return-from rpc-submitblock "duplicate"))
+      (let* ((hash (bitcoin-lisp.serialization:block-header-hash
+                    (bitcoin-lisp.serialization:bitcoin-block-header block)))
+             (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+        (when entry
+          ;; A known-invalid block short-circuits (Core AcceptBlockHeader,
+          ;; validation.cpp:4231-4235 — BLOCK_FAILED_VALID → "duplicate-invalid").
+          (when (eq (bitcoin-lisp.storage:block-index-entry-status entry) :invalid)
+            (return-from rpc-submitblock "duplicate-invalid"))
+          ;; "duplicate" only when we already HAVE the block data (Core
+          ;; AcceptBlock fAlreadyHave = BLOCK_HAVE_DATA, validation.cpp:4351;
+          ;; submitblock's accepted && !new_block, rpc/mining.cpp:1091-1093).
+          ;; A header-only index entry (headers-sync / submitheader) must
+          ;; proceed to full processing or the mined block is silently lost.
+          (let ((store (rpc-get-block-store node)))
+            (when (and store (bitcoin-lisp.storage:block-exists-p store hash))
+              (return-from rpc-submitblock "duplicate"))))
         (multiple-value-bind (ok reason) (%activate-submitted-block node block)
           (cond
             (ok nil)                        ; accepted → JSON null (BIP22 success)
@@ -2922,10 +2954,12 @@ and {hash} is returned; otherwise {hash, hex}."
                           :message (format nil "TX decode failed: ~A" e))))))
 
 (defun rpc-getrawtransaction (node params)
-  "Get raw transaction data by txid.
-Searches mempool first, then txindex (if enabled), then blockhash hint."
+  "Get raw transaction data by txid (Bitcoin Core getrawtransaction).
+Verbosity <= 0 (or false, the default) returns the wire-serialized (witness-
+complete) tx hex — Core's EncodeHexTx; >= 1 (or true) the decoded object
+(Core's verbosity-2 fee/prevout fields are not supported and fold into 1).
+Searches mempool first, then blockhash hint, then txindex (if enabled)."
   (let ((txid-str (first params))
-        (verbose (second params))
         (blockhash-hint (third params)))
     (unless (valid-hex-hash-p txid-str)
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -2933,7 +2967,8 @@ Searches mempool first, then txindex (if enabled), then blockhash hint."
     (when (and blockhash-hint (not (valid-hex-hash-p blockhash-hint)))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid blockhash"))
-    (let* ((txid-bytes (parse-hex-hash txid-str))
+    (let* ((verbose (plusp (%parse-verbosity params 1 0 :allow-bool t)))
+           (txid-bytes (parse-hex-hash txid-str))
            (mempool (rpc-get-mempool node))
            (mempool-entry (when mempool
                             (bitcoin-lisp.mempool:mempool-get mempool txid-bytes))))
@@ -2944,7 +2979,7 @@ Searches mempool first, then txindex (if enabled), then blockhash hint."
             (if verbose
                 (tx-to-json tx (rpc-get-network node))
                 (bitcoin-lisp.crypto:bytes-to-hex
-                 (bitcoin-lisp.serialization:serialize tx))))))
+                 (bitcoin-lisp.serialization:transaction-wire-bytes tx))))))
 
       ;; Try blockhash hint if provided
       (when blockhash-hint
@@ -2963,7 +2998,7 @@ Searches mempool first, then txindex (if enabled), then blockhash hint."
                                 `(("in_active_chain"
                                    . ,(and entry (%block-on-active-chain-p entry cs))))))
                       (bitcoin-lisp.crypto:bytes-to-hex
-                       (bitcoin-lisp.serialization:serialize found-tx)))))))))
+                       (bitcoin-lisp.serialization:transaction-wire-bytes found-tx)))))))))
 
       ;; Try txindex if enabled
       (let ((tx-index (rpc-get-tx-index node)))
@@ -2980,7 +3015,7 @@ Searches mempool first, then txindex (if enabled), then blockhash hint."
                         (if verbose
                             (tx-to-json-confirmed found-tx node block-hash)
                             (bitcoin-lisp.crypto:bytes-to-hex
-                             (bitcoin-lisp.serialization:serialize found-tx))))))))))))
+                             (bitcoin-lisp.serialization:transaction-wire-bytes found-tx))))))))))))
 
       ;; Not found
       (let ((tx-index (rpc-get-tx-index node)))
@@ -3641,10 +3676,7 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                              errors)))))))
         (when (or any-witness (bitcoin-lisp.serialization:transaction-witness tx))
           (setf (bitcoin-lisp.serialization:transaction-witness tx) witness))
-        (let ((bytes (if (or any-witness
-                             (bitcoin-lisp.serialization:transaction-has-witness-p tx))
-                         (bitcoin-lisp.serialization:serialize-witness-transaction tx)
-                         (bitcoin-lisp.serialization:serialize-transaction tx))))
+        (let ((bytes (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
           (append
            `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex bytes))
              ("complete" . ,(null errors)))
@@ -3717,7 +3749,7 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
                  :outputs (coerce (nreverse tx-outputs) 'simple-vector)
                  :lock-time locktime)))
         (bitcoin-lisp.crypto:bytes-to-hex
-         (bitcoin-lisp.serialization:serialize tx))))))
+         (bitcoin-lisp.serialization:transaction-wire-bytes tx))))))
 
 ;;; --- UTXO Set Statistics ---
 

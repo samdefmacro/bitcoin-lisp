@@ -469,6 +469,109 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
        ;; resubmit the same block → duplicate
        (is (string= "duplicate" (bitcoin-lisp.rpc::rpc-submitblock node (list hex))))))))
 
+(test submitblock-header-only-entry-proceeds
+  ;; Standard pool flow: submitheader, then submitblock. The header-only index
+  ;; entry must NOT short-circuit as "duplicate" (Core returns "duplicate" only
+  ;; when the entry has BLOCK_HAVE_DATA — AcceptBlock fAlreadyHave,
+  ;; validation.cpp:4351); a known-invalid block returns "duplicate-invalid"
+  ;; (AcceptBlockHeader, validation.cpp:4231-4235).
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "subhdrblk"))
+          (cs (bitcoin-lisp::node-chain-state node))
+          (block (bitcoin-lisp.mining:assemble-full-block
+                  cs (bitcoin-lisp::node-mempool node)
+                  :coinbase-script-pubkey (%p2sh-optrue-spk))))
+     (bitcoin-lisp.mining:mine-block block)
+     (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header block))
+            (hash (bitcoin-lisp.serialization:block-header-hash hdr))
+            (hdr-hex (bitcoin-lisp.crypto:bytes-to-hex
+                      (flexi-streams:with-output-to-sequence (s)
+                        (bitcoin-lisp.serialization::write-block-header s hdr))))
+            (blk-hex (bitcoin-lisp.crypto:bytes-to-hex
+                      (bitcoin-lisp.serialization:serialize-witness-block block))))
+       ;; submitheader indexes the header only.
+       (is (null (bitcoin-lisp.rpc::rpc-submitheader node (list hdr-hex))))
+       (let ((entry (bitcoin-lisp.storage:get-block-index-entry cs hash)))
+         (is (not (null entry)))
+         (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status entry))))
+       ;; submitblock proceeds to full processing — the mined block is not lost.
+       (is (null (bitcoin-lisp.rpc::rpc-submitblock node (list blk-hex))))
+       (is (= 1 (bitcoin-lisp.storage:current-height cs)))
+       ;; Now the data is on disk → resubmit is a true duplicate.
+       (is (string= "duplicate" (bitcoin-lisp.rpc::rpc-submitblock node (list blk-hex))))
+       ;; A known-invalid entry short-circuits before the data check.
+       (setf (bitcoin-lisp.storage:block-index-entry-status
+              (bitcoin-lisp.storage:get-block-index-entry cs hash))
+             :invalid)
+       (is (string= "duplicate-invalid"
+                    (bitcoin-lisp.rpc::rpc-submitblock node (list blk-hex))))))))
+
+(test rpc-getblock-v0-witness-round-trip
+  ;; getblock verbosity 0 must return the block's wire (witness-complete)
+  ;; bytes — Core reads the raw on-disk block (GetRawBlockChecked) — and the
+  ;; verbosity argument follows Core ParseVerbosity: booleans allowed
+  ;; (false→0, true→1), default 1, verbosity >= 2 gives tx details.
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "getblockv0"))
+          (block (bitcoin-lisp.mining:assemble-full-block
+                  (bitcoin-lisp::node-chain-state node)
+                  (bitcoin-lisp::node-mempool node)
+                  :coinbase-script-pubkey (%p2sh-optrue-spk))))
+     (bitcoin-lisp.mining:mine-block block)
+     (let* ((wire (bitcoin-lisp.serialization:serialize-witness-block block))
+            (hash-hex (bitcoin-lisp.rpc::hash-to-hex
+                       (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header block)))))
+       (is (null (bitcoin-lisp.rpc::rpc-submitblock
+                  node (list (bitcoin-lisp.crypto:bytes-to-hex wire)))))
+       ;; Verbosity 0 → hex of the exact wire bytes; the segwit coinbase's
+       ;; witness (reserved value) survives a round-trip.
+       (let ((hex (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex 0))))
+         (is (stringp hex))
+         (is (equalp wire (bitcoin-lisp.crypto:hex-to-bytes hex)))
+         (let ((parsed (flexi-streams:with-input-from-sequence
+                           (s (bitcoin-lisp.crypto:hex-to-bytes hex))
+                         (bitcoin-lisp.serialization:read-bitcoin-block s))))
+           (is (bitcoin-lisp.serialization:transaction-has-witness-p
+                (first (bitcoin-lisp.serialization:bitcoin-block-transactions parsed))))))
+       ;; Boolean/legacy verbosity: false → hex, true → object; absent → object.
+       (is (stringp (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex nil))))
+       (let ((r (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex t))))
+         (is (consp r))
+         (is (string= hash-hex (cdr (assoc "hash" r :test #'string=)))))
+       (is (consp (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex))))
+       ;; Core accepts any integer: 3 behaves like 2 (details; prevout data
+       ;; unsupported), negative returns hex.
+       (is (consp (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex 3))))
+       (is (stringp (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex -1))))
+       ;; Non-integer/non-bool verbosity → type error.
+       (signals bitcoin-lisp.rpc::rpc-error
+         (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex "x")))))))
+
+(test gbt-transactions-data-uses-wire-encoding
+  ;; getblocktemplate transactions[].data must be the wire encoding (Core
+  ;; EncodeHexTx): a witnessless tx carries NO marker/flag — extended-form
+  ;; data makes the miner's reconstructed block fail Core deserialization
+  ;; ("Superfluous witness record") — while a segwit tx keeps its witness.
+  (let* ((legacy-tx (make-mempool-test-tx))
+         (witness-raw (make-witness-test-tx-bytes))
+         (witness-tx (flexi-streams:with-input-from-sequence (s witness-raw)
+                       (bitcoin-lisp.serialization:read-transaction s)))
+         (template (bitcoin-lisp.mining::make-block-template
+                    :transactions
+                    (list (bitcoin-lisp.mempool:make-entry-from-tx legacy-tx 1000 0)
+                          (bitcoin-lisp.mempool:make-entry-from-tx witness-tx 1000 0))))
+         (txs (bitcoin-lisp.rpc::%gbt-transactions template)))
+    (let ((legacy-data (bitcoin-lisp.crypto:hex-to-bytes
+                        (cdr (assoc "data" (first txs) :test #'string=)))))
+      (is (equalp (bitcoin-lisp.serialization:serialize-transaction legacy-tx)
+                  legacy-data))
+      ;; byte 4 is the input count in legacy form — 0x00 would be a marker.
+      (is (/= #x00 (aref legacy-data 4))))
+    (is (equalp witness-raw
+                (bitcoin-lisp.crypto:hex-to-bytes
+                 (cdr (assoc "data" (second txs) :test #'string=)))))))
+
 (test generatetoaddress-advances-chain
   (%with-regtest
    (let* ((node (%regtest-node-fixture "gen"))
