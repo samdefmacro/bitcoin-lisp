@@ -1182,7 +1182,10 @@ index is enabled."
                         (reindex-chainstate nil)
                         (force-compact-db nil)
                         (peer-block-filters nil)
-                        (tx-reconciliation nil))
+                        (tx-reconciliation nil)
+                        (webui nil webui-supplied-p)
+                        (webui-path nil)
+                        (webui-open nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -1207,6 +1210,11 @@ LISTEN-ONION requires a reachable Tor daemon to do anything; without one the
   torcontrol thread just retries with backoff
 TOR-CONTROL: Tor control host:port (nil = 127.0.0.1:9051, Core -torcontrol)
 TOR-PASSWORD: Tor control port password (Core -torpassword)
+WEBUI: Serve the web UI at /ui/ on the RPC port (docs/gui-plan.md P0).
+  Default: on for every network except mainnet (operator's choice there)
+WEBUI-PATH: Web UI asset directory (nil = the repo's ui/ directory)
+WEBUI-OPEN: If T (default nil), open http://localhost:<rpcport>/ui/ in the
+  local browser after the RPC server starts — the local-daemon pattern
 
 Returns the node instance."
   (when *node*
@@ -1542,11 +1550,22 @@ Returns the node instance."
 
   ;; Start RPC server if port specified
   (when rpc-port
-    (bitcoin-lisp.rpc:start-rpc-server *node*
-                                        :port rpc-port
-                                        :bind rpc-bind
-                                        :user rpc-user
-                                        :password rpc-password))
+    ;; Web UI default (gui-plan §2): on everywhere except mainnet, where
+    ;; enabling it is the operator's explicit choice (-webui).
+    (let* ((webui-enabled (if webui-supplied-p
+                              (and webui t)
+                              (not (eq network :mainnet))))
+           (server (bitcoin-lisp.rpc:start-rpc-server *node*
+                                                      :port rpc-port
+                                                      :bind rpc-bind
+                                                      :user rpc-user
+                                                      :password rpc-password
+                                                      :ui-enabled webui-enabled
+                                                      :ui-directory webui-path)))
+      ;; -webuiopen: pop the local browser at the dashboard. Logged, never
+      ;; fatal (open-browser-to-ui catches everything).
+      (when (and server webui-enabled webui-open)
+        (bitcoin-lisp.rpc:open-browser-to-ui rpc-port))))
 
   ;; Connect to peers and sync if requested (in background thread)
   ;; Reconnects and retries when peers are lost, similar to Bitcoin Core's
