@@ -1601,6 +1601,12 @@ Returns the node instance."
                                (maintain-peers *node*)
                                (loop repeat 30 while (node-running *node*)
                                      do (sleep 1)
+                                        ;; Retry buffered unsent bytes on
+                                        ;; every peer (non-blocking) — the
+                                        ;; periodic half of Core's
+                                        ;; SocketSendData.
+                                        (bitcoin-lisp.networking:flush-peer-send-buffers
+                                         (node-peers *node*))
                                         ;; Steady-state receive pump: drain
                                         ;; every peer's readable messages
                                         ;; with the full node context. This
@@ -2755,6 +2761,21 @@ Also checks compact block reconstruction timeouts (BIP 152)."
         (setf (node-peers node) (remove peer (node-peers node)))))
     (length to-disconnect)))
 
+(defun outbound-full-relay-peer-p (peer)
+  "T iff PEER is a ready outbound full-relay connection — the only kind that
+counts toward the outbound full-relay target (Core CNode::IsFullOutboundConn:
+m_conn_type == OUTBOUND_FULL_RELAY, which is never inbound). Inbound peers
+and block-relay/feeler outbound peers are deliberately excluded."
+  (and (eq (bitcoin-lisp.networking:peer-state peer) :ready)
+       (not (bitcoin-lisp.networking:peer-inbound peer))
+       (eq (bitcoin-lisp.networking:peer-conn-type peer) :outbound-full-relay)))
+
+(defun count-outbound-full-relay-peers (peers)
+  "Count ready outbound full-relay peers among PEERS (Core nOutboundFullRelay).
+Inbound connections are excluded so an attacker filling our inbound slots
+cannot suppress replacement outbound dials (eclipse-attack prevention)."
+  (count-if #'outbound-full-relay-peer-p peers))
+
 (defun replace-disconnected-peers (node)
   "Replace disconnected peers to maintain target peer count.
 Returns the number of new peers connected."
@@ -2768,18 +2789,24 @@ Returns the number of new peers connected."
   ;; setnetworkactive off: don't dial replacements.
   (unless (node-network-active node)
     (return-from replace-disconnected-peers 0))
-  ;; Count only the normal peer set (inbound + full-relay) toward max-peers.
-  ;; Block-relay-only peers are a separate additive pool maintained by
-  ;; maintain-block-relay-peers (Core keeps m_max_outbound_block_relay distinct
-  ;; from m_max_outbound_full_relay); folding them in here would let 2 idle
+  ;; Count ONLY outbound full-relay peers toward the outbound target — never
+  ;; inbound, never block-relay/feeler. Core's ThreadOpenConnections counts
+  ;; nOutboundFullRelay via IsFullOutboundConn() (net.cpp:2648-2657,2718) and
+  ;; explicitly keeps inbound out of the arithmetic: inbound connections are
+  ;; free for an attacker to make, so letting them satisfy the outbound
+  ;; target is an eclipse primitive — 8 attacker inbounds previously
+  ;; suppressed dialing any honest outbound replacement here. The inbound
+  ;; population has its own separate cap (+max-inbound-peers+, enforced at
+  ;; merge time in merge-inbound-peers). Block-relay-only peers are a
+  ;; separate additive pool maintained by maintain-block-relay-peers (Core
+  ;; keeps m_max_outbound_block_relay distinct from
+  ;; m_max_outbound_full_relay); folding them in here would let 2 idle
   ;; block-relay slots starve replacement of a dropped full-relay peer.
-  (let* ((active-peers (remove-if-not
-                        (lambda (p)
-                          (and (eq (bitcoin-lisp.networking:peer-state p) :ready)
-                               (not (member (bitcoin-lisp.networking:peer-conn-type p)
-                                            '(:block-relay :feeler)))))
-                        (node-peers node)))
-         (needed (- (node-max-peers node) (length active-peers))))
+  ;; (Known simplification vs Core: addnode peers are typed
+  ;; :outbound-full-relay in our code, so they do count here, whereas Core's
+  ;; MANUAL connections are additive.)
+  (let* ((active-count (count-outbound-full-relay-peers (node-peers node)))
+         (needed (- (node-max-peers node) active-count)))
     (when (<= needed 0)
       (return-from replace-disconnected-peers 0))
 
