@@ -1505,9 +1505,12 @@ handler. Shared by the block-download drain and the at-tip reap pass."
        ;; process-headers' own gate is off — without the presync diversion a
        ;; peer could grow the index without bound through this path
        ;; (ingest-headers-from-peer, Core ProcessHeadersMessage).
-       (ingest-headers-from-peer
-        peer headers chain-state
-        :count-fn (lambda (n) (incf (ibd-context-headers-received ctx) n)))))
+       ;; Node lock: process-headers inside mutates the block index the RPC
+       ;; threads read/write under the same lock (see handle-headers).
+       (with-node-lock
+         (ingest-headers-from-peer
+          peer headers chain-state
+          :count-fn (lambda (n) (incf (ibd-context-headers-received ctx) n))))))
 
     ;; Everything else: the generic handler, with the full node context
     ;; threaded off the IBD ctx. handle-message silently disables tx
@@ -1924,8 +1927,11 @@ Used during IBD when the validated block tip lags behind the header tip."
 (defun %store-validated-headers (peer chain-state headers count-fn label)
   "Contextually validate HEADERS (validate-header-chain) and add the valid
 prefix to the block index, bumping the running count via COUNT-FN and updating
-per-peer availability. Shared by the normal and redownload store paths."
-  (multiple-value-bind (valid error) (validate-header-chain headers chain-state)
+per-peer availability. Shared by the normal and redownload store paths.
+Holds the node lock: process-headers mutates the block index the RPC
+threads read/write under the same lock."
+  (with-node-lock
+   (multiple-value-bind (valid error) (validate-header-chain headers chain-state)
     (when error
       (bitcoin-lisp:log-warn "Header validation error: ~A" error))
     (let ((added (process-headers valid chain-state)))
@@ -1939,7 +1945,7 @@ per-peer availability. Shared by the normal and redownload store paths."
            (bitcoin-lisp.serialization:block-header-hash last))))
       (when (> added 0)
         (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added))
-      added)))
+      added))))
 
 (defun %clear-peer-headers-sync (peer &key finalize)
   "Drop PEER's low-work sync state (Core peer.m_headers_sync.reset()),
@@ -2320,7 +2326,9 @@ After connecting, drains the queue of any children that can now be connected."
         (if (bitcoin-lisp.validation:block-witness-stripped-p block)
             (bitcoin-lisp:log-debug
              "Competing-fork block ~D arrived witness-stripped; not storing" height)
-            (progn
+            ;; Node lock: activation mutates chainstate/UTXO/mempool state
+            ;; the RPC threads access under the same lock.
+            (with-node-lock
               (bitcoin-lisp.storage:store-block block-store block)
               (multiple-value-bind (activated error)
                   (bitcoin-lisp.validation:activate-block
@@ -2354,13 +2362,17 @@ After connecting, drains the queue of any children that can now be connected."
           (let ((current-time (bitcoin-lisp.serialization:get-unix-time))
                 (skip-scripts (<= height (script-skip-height chain-state))))
             (multiple-value-bind (activated error missing-blocks)
-                (bitcoin-lisp.validation:activate-block
-                 block chain-state block-store utxo-set
-                 :current-time current-time
-                 :skip-scripts skip-scripts
-                 :fee-estimator fee-estimator
-                 :recent-rejects recent-rejects
-                 :mempool mempool)
+                ;; Node lock per block connect (drain-block-queue then
+                ;; re-takes it per drained block, so RPC threads interleave
+                ;; between connects instead of stalling for a whole cascade).
+                (with-node-lock
+                  (bitcoin-lisp.validation:activate-block
+                   block chain-state block-store utxo-set
+                   :current-time current-time
+                   :skip-scripts skip-scripts
+                   :fee-estimator fee-estimator
+                   :recent-rejects recent-rejects
+                   :mempool mempool))
               (cond
                 (activated
                  (clear-block-failure hash)
@@ -2461,13 +2473,16 @@ Repeats until no more queued blocks can be connected."
         (let* ((current-time (bitcoin-lisp.serialization:get-unix-time))
                (skip-scripts (<= next-height skip-height)))
           (multiple-value-bind (activated error missing-blocks)
-              (bitcoin-lisp.validation:activate-block
-               block chain-state block-store utxo-set
-               :current-time current-time
-               :skip-scripts skip-scripts
-               :fee-estimator fee-estimator
-               :recent-rejects recent-rejects
-               :mempool mempool)
+              ;; Node lock per connect, released between loop iterations so
+              ;; RPC threads aren't starved across a long drain cascade.
+              (with-node-lock
+                (bitcoin-lisp.validation:activate-block
+                 block chain-state block-store utxo-set
+                 :current-time current-time
+                 :skip-scripts skip-scripts
+                 :fee-estimator fee-estimator
+                 :recent-rejects recent-rejects
+                 :mempool mempool))
             (cond
               (activated
                (note-tip-advanced chain-state)
