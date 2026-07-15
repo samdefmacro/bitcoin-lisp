@@ -368,6 +368,20 @@ Returns T if allowed, NIL if rate limited."
         (bitcoin-lisp:token-bucket-allow-p *rpc-rate-limiter*))))
   t)
 
+(defun rpc-origin-allowed-p (origin host)
+  "T unless ORIGIN (the Origin request header, or NIL when absent) names a
+different authority than HOST (the request's Host header). Browsers attach
+Origin to cross-site POSTs but never let a page forge it, so an alien value
+(including \"null\") is a hostile web page driving the user's browser at our
+RPC port — rejected before auth (docs/gui-plan.md §2/§4). Non-browser
+clients (bitcoin-cli, curl) send no Origin at all and always pass."
+  (or (null origin)
+      (let* ((origin (string-trim '(#\Space #\Tab) origin))
+             (scheme-end (search "://" origin)))
+        (and scheme-end host
+             (string-equal (subseq origin (+ scheme-end 3))
+                           (string-trim '(#\Space #\Tab) host))))))
+
 (defun check-auth (request)
   "Authorize an RPC request.
 - With rpcuser/password configured, require a matching HTTP Basic credential
@@ -391,6 +405,13 @@ Returns T if allowed, NIL if rate limited."
 (defun rpc-handler ()
   "Handle incoming RPC requests."
   (let ((request hunchentoot:*request*))
+    ;; Reject cross-origin browser POSTs BEFORE auth (rpc-origin-allowed-p).
+    (unless (rpc-origin-allowed-p (hunchentoot:header-in :origin request)
+                                  (hunchentoot:header-in :host request))
+      (return-from rpc-handler
+        (rpc-json-error hunchentoot:+http-forbidden+ +rpc-misc-error+
+                        "Origin does not match Host")))
+
     ;; Check authentication
     (unless (check-auth request)
       (setf (hunchentoot:return-code*) hunchentoot:+http-authorization-required+)
@@ -460,9 +481,12 @@ Returns T if allowed, NIL if rate limited."
         "")))
 
 (defun start-rpc-server (node &key port (bind "127.0.0.1")
-                                   user password)
+                                   user password
+                                   ui-enabled ui-directory)
   "Start the RPC server.
-PORT defaults to 18332 for testnet, 8332 for mainnet."
+PORT defaults to 18332 for testnet, 8332 for mainnet.
+UI-ENABLED registers the /ui/ web UI dispatcher (gui-plan P0); UI-DIRECTORY
+overrides the asset directory (default: the repo's ui/, see ui.lisp)."
   (let ((port (or port (bitcoin-lisp:network-rpc-port bitcoin-lisp:*network*))))
     (when *rpc-server*
       (bitcoin-lisp::node-log :warn "RPC server already running")
@@ -501,6 +525,20 @@ PORT defaults to 18332 for testnet, 8332 for mainnet."
                                   "/rest/" 'rest-dispatch-handler)))
             (setf *rest-dispatcher* rest-dispatcher)
             (push rest-dispatcher hunchentoot:*dispatch-table*))
+          ;; Web UI static assets under /ui/ (gui-plan P0). Registered only
+          ;; when enabled — a disabled UI leaves no handler at all.
+          (setf *ui-enabled* (and ui-enabled t)
+                *ui-directory* (and ui-directory
+                                    (uiop:ensure-directory-pathname ui-directory)))
+          (when *ui-enabled*
+            (let ((dir (ui-directory)))
+              (if (and dir (probe-file dir))
+                  (bitcoin-lisp::node-log :info "Web UI enabled at /ui/ (serving ~A)" dir)
+                  (bitcoin-lisp::node-log
+                   :warn "Web UI enabled but asset directory ~A is missing — /ui/ will 404" dir)))
+            (let ((ui-dispatcher (make-ui-dispatcher)))
+              (setf *ui-dispatcher* ui-dispatcher)
+              (push ui-dispatcher hunchentoot:*dispatch-table*)))
 
           (hunchentoot:start acceptor)
           (setf *rpc-server* acceptor)
@@ -529,10 +567,16 @@ PORT defaults to 18332 for testnet, 8332 for mainnet."
     (when *rest-dispatcher*
       (setf hunchentoot:*dispatch-table*
             (remove *rest-dispatcher* hunchentoot:*dispatch-table*)))
+    (when *ui-dispatcher*
+      (setf hunchentoot:*dispatch-table*
+            (remove *ui-dispatcher* hunchentoot:*dispatch-table*)))
     (setf *rpc-server* nil)
     (setf *rpc-node* nil)
     (setf *rpc-user* nil)
     (setf *rpc-password* nil)
     (setf *rpc-dispatcher* nil)
     (setf *rest-dispatcher* nil)
+    (setf *ui-dispatcher* nil)
+    (setf *ui-enabled* nil)
+    (setf *ui-directory* nil)
     (setf *rpc-rate-limiter* nil)))

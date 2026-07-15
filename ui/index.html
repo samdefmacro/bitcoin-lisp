@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bitcoin-lisp · node</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23e8963f'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Login -->
+<div id="login-view" class="login-wrap" hidden>
+  <form id="login-form" class="login-panel" autocomplete="off">
+    <h1 class="login-title">bitcoin-lisp</h1>
+    <p class="login-sub">Sign in to this node's RPC interface. Credentials are kept in
+    this tab's session only — never written to disk.</p>
+    <label class="field">
+      <span>RPC user</span>
+      <input id="login-user" name="user" autocomplete="username" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>RPC password</span>
+      <input id="login-pass" name="pass" type="password" autocomplete="current-password">
+    </label>
+    <div class="login-or"><span>or</span></div>
+    <label class="field">
+      <span>Cookie</span>
+      <input id="login-cookie" name="cookie" placeholder="paste the .cookie file contents" spellcheck="false">
+    </label>
+    <button type="submit" id="login-btn">Connect</button>
+    <p id="login-error" class="login-error" role="alert" hidden></p>
+    <p class="login-hint">Leave everything empty to connect to a node with open local RPC.</p>
+  </form>
+</div>
+
+<!-- Dashboard -->
+<div id="dash-view" hidden>
+  <header class="topbar">
+    <span id="status-dot" class="dot" data-state="idle"></span>
+    <span class="brand">bitcoin-lisp</span>
+    <span id="chain-badge" class="badge">—</span>
+    <span class="topbar-right">
+      <span id="node-subversion" class="mono muted">—</span>
+      <span class="sep" aria-hidden="true">·</span>
+      <span class="muted">up <span id="node-uptime" class="mono">—</span></span>
+      <button id="logout-btn" class="linklike" type="button">sign out</button>
+    </span>
+  </header>
+
+  <div id="warnings-banner" class="banner banner-warn" role="alert" hidden></div>
+  <div id="conn-banner" class="banner banner-bad" role="alert" hidden>
+    Disconnected from node — retrying…</div>
+
+  <nav class="nav" aria-label="Sections">
+    <a class="nav-item active" href="#" aria-current="page">Dashboard</a>
+    <span class="nav-item planned">Explorer <em>planned</em></span>
+    <span class="nav-item planned">Peers <em>planned</em></span>
+    <span class="nav-item planned">Console <em>planned</em></span>
+  </nav>
+
+  <main class="grid">
+    <section class="card card-sync" aria-label="Sync status">
+      <h2 class="card-title">Sync
+        <span id="ibd-flag" class="pill" hidden>IBD</span>
+      </h2>
+      <div class="hero">
+        <div id="sync-height" class="hero-height mono">—</div>
+        <div class="hero-sub muted">
+          of <span id="sync-headers" class="mono">—</span> headers
+          · <span id="sync-progress-label" class="mono">—</span> verified
+        </div>
+      </div>
+      <div class="meter" role="progressbar" aria-label="Verification progress"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="sync-meter">
+        <div id="sync-meter-fill" class="meter-fill"></div>
+      </div>
+      <dl class="kv">
+        <div><dt>best block</dt><dd id="sync-hash" class="mono hash">—</dd></div>
+        <div><dt>tip age</dt><dd id="sync-age" class="mono">—</dd></div>
+        <div id="sync-rate-row" hidden><dt>blocks/s</dt><dd id="sync-rate" class="mono">—</dd></div>
+        <div id="sync-eta-row" hidden><dt>ETA</dt><dd id="sync-eta" class="mono">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="card" aria-label="Peers">
+      <h2 class="card-title">Peers</h2>
+      <div id="peers-total" class="stat mono">—</div>
+      <dl class="kv">
+        <div><dt>inbound</dt><dd id="peers-in" class="mono">—</dd></div>
+        <div><dt>outbound</dt><dd id="peers-out" class="mono">—</dd></div>
+        <div><dt>network</dt><dd id="net-active">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="card" aria-label="Mempool">
+      <h2 class="card-title">Mempool</h2>
+      <div id="mempool-count" class="stat mono">—</div>
+      <dl class="kv">
+        <div><dt>size</dt><dd id="mempool-bytes" class="mono">—</dd></div>
+        <div><dt>memory</dt><dd id="mempool-usage" class="mono">—</dd></div>
+        <div><dt>min fee</dt><dd id="mempool-minfee" class="mono">—</dd></div>
+        <div><dt>relay fee</dt><dd id="mempool-relayfee" class="mono">—</dd></div>
+        <div id="mempool-unbroadcast-row" hidden>
+          <dt>unbroadcast</dt><dd id="mempool-unbroadcast" class="mono">—</dd></div>
+      </dl>
+    </section>
+
+    <section class="card" aria-label="Traffic">
+      <h2 class="card-title">Traffic</h2>
+      <dl class="kv">
+        <div><dt>received</dt>
+          <dd><span id="traffic-recv" class="mono">—</span>
+              <span id="traffic-recv-rate" class="muted mono rate"></span></dd></div>
+        <div><dt>sent</dt>
+          <dd><span id="traffic-sent" class="mono">—</span>
+              <span id="traffic-sent-rate" class="muted mono rate"></span></dd></div>
+      </dl>
+    </section>
+
+    <section class="card card-blocks" aria-label="Recent blocks">
+      <h2 class="card-title">Recent blocks</h2>
+      <div class="table-wrap">
+        <table class="blocks">
+          <thead>
+            <tr><th>height</th><th>age</th><th>txs</th><th>size</th><th>weight</th><th>hash</th></tr>
+          </thead>
+          <tbody id="blocks-body">
+            <tr><td colspan="6" class="muted">no data yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot muted">
+    <span id="node-version" class="mono">—</span>
+    <span class="sep" aria-hidden="true">·</span>
+    polls every 3s, paused while this tab is hidden
+    <span class="sep" aria-hidden="true">·</span>
+    last poll <span id="last-poll" class="mono">—</span>
+  </footer>
+</div>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
