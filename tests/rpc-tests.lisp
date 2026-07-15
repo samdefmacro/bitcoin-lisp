@@ -87,7 +87,8 @@ the no-wallet/no-range constants; bad descriptors error."
                  (cdr (assoc "descriptor" r :test #'string=))))
     (is (string= "fm24fxxy" (cdr (assoc "checksum" r :test #'string=))))
     (is (null (cdr (assoc "isrange" r :test #'string=))))
-    (is (eq t (cdr (assoc "issolvable" r :test #'string=))))
+    ;; raw() is not solvable (Core IsSolvable, RawDescriptor override)
+    (is (null (cdr (assoc "issolvable" r :test #'string=))))
     (is (null (cdr (assoc "hasprivatekeys" r :test #'string=))))
     ;; accepts a correct input checksum, rejects a wrong one and junk
     (is (string= (concatenate 'string body "#fm24fxxy")
@@ -102,31 +103,35 @@ the no-wallet/no-range constants; bad descriptors error."
 
 (test rpc-deriveaddresses
   "deriveaddresses returns the address(es) a descriptor's scriptPubKey
-encodes to; combo() yields several; address-less scripts error; range
-argument rejected."
+encodes to (checksum required); combo() yields several (P2PK skipped);
+address-less scripts error; range on an unranged descriptor rejected."
   (let* ((node (make-test-node))   ; make-test-node is :testnet3
          (pk "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
          (keyhash (bitcoin-lisp.crypto:hash160 (bitcoin-lisp.crypto:hex-to-bytes pk))))
-    ;; pkh -> single P2PKH address; matches the direct encoder.
-    (let ((addrs (bitcoin-lisp.rpc::rpc-deriveaddresses
-                  node (list (format nil "pkh(~A)" pk)))))
-      (is (= 1 (length addrs)))
-      (is (string= (bitcoin-lisp.crypto:encode-p2pkh-address keyhash :testnet3)
-                   (first addrs))))
-    ;; wpkh -> single bech32 address.
-    (is (= 1 (length (bitcoin-lisp.rpc::rpc-deriveaddresses
-                      node (list (format nil "wpkh(~A)" pk))))))
-    ;; combo -> 4 addressable scripts (pk has no address) ... combo emits
-    ;; pk+pkh+wpkh+sh(wpkh); pk() script is address-less => deriveaddresses
-    ;; errors on the whole combo.
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-deriveaddresses node (list (format nil "combo(~A)" pk))))
-    ;; raw() non-standard script -> no address -> error
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-deriveaddresses node (list "raw(51)")))
-    ;; range argument rejected
-    (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-deriveaddresses node (list (format nil "wpkh(~A)" pk) 5)))))
+    (flet ((descsum (body) (bitcoin-lisp.rpc::descriptor-add-checksum body)))
+      ;; checksum is required (Core: "Missing checksum")
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-deriveaddresses node (list (format nil "pkh(~A)" pk))))
+      ;; pkh -> single P2PKH address; matches the direct encoder.
+      (let ((addrs (bitcoin-lisp.rpc::rpc-deriveaddresses
+                    node (list (descsum (format nil "pkh(~A)" pk))))))
+        (is (= 1 (length addrs)))
+        (is (string= (bitcoin-lisp.crypto:encode-p2pkh-address keyhash :testnet3)
+                     (first addrs))))
+      ;; wpkh -> single bech32 address.
+      (is (= 1 (length (bitcoin-lisp.rpc::rpc-deriveaddresses
+                        node (list (descsum (format nil "wpkh(~A)" pk)))))))
+      ;; combo emits pk+pkh+wpkh+sh(wpkh); the address-less P2PK script is
+      ;; skipped (Core DeriveAddresses), leaving 3 addresses.
+      (is (= 3 (length (bitcoin-lisp.rpc::rpc-deriveaddresses
+                        node (list (descsum (format nil "combo(~A)" pk)))))))
+      ;; raw() non-standard script -> no address -> error
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-deriveaddresses node (list (descsum "raw(51)"))))
+      ;; range argument rejected for an unranged descriptor
+      (signals bitcoin-lisp.rpc::rpc-error
+        (bitcoin-lisp.rpc::rpc-deriveaddresses
+         node (list (descsum (format nil "wpkh(~A)" pk)) 5))))))
 
 ;;; --- Prioritisation RPC Tests ---
 
