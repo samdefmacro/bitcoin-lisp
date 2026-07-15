@@ -482,7 +482,11 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
     (unless (and (integerp vout) (>= vout 0))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid vout"))
-    (let* ((txid-bytes (parse-hex-hash txid-str))
+    ;; Node lock: the coin lookup and the bestblock/height it is reported
+    ;; against must come from one consistent chain state (Core gettxout
+    ;; holds cs_main, rpc/blockchain.cpp).
+    (with-node-lock (node)
+     (let* ((txid-bytes (parse-hex-hash txid-str))
            (utxo-set (rpc-get-utxo-set node))
            (entry (bitcoin-lisp.storage:get-utxo utxo-set txid-bytes vout)))
       (if entry
@@ -504,7 +508,7 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
                                  ("type" . ,(%script-type spk))
                                  ,@(when addr `(("address" . ,addr)))))
               ("coinbase" . ,(bitcoin-lisp.storage:utxo-entry-coinbase entry))))
-          nil)))) ; Return null for spent outputs
+          nil))))) ; Return null for spent outputs
 
 ;;; --- Network Query Methods ---
 
@@ -552,6 +556,11 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
                   ("synced_blocks" . ,sh)
                   ("bytessent" . ,(if conn (bitcoin-lisp.networking::connection-bytes-sent conn) 0))
                   ("bytesrecv" . ,(if conn (bitcoin-lisp.networking::connection-bytes-received conn) 0))
+                  ;; Addr intake counters (Core m_addr_processed /
+                  ;; m_addr_rate_limited; the rate-limited count is addresses
+                  ;; dropped by the per-address token bucket).
+                  ("addr_processed" . ,(bitcoin-lisp.networking::peer-addr-processed peer))
+                  ("addr_rate_limited" . ,(bitcoin-lisp.networking::peer-addr-rate-limited peer))
                   ;; ping-latency is in internal-time units; report seconds (0 = unknown).
                   ("pingtime" . ,(if (and ping (plusp ping))
                                      (/ ping internal-time-units-per-second 1.0d0)
@@ -624,21 +633,21 @@ peer disconnecting mid-send."
 
 ;;; --- Mempool Methods ---
 
-(defun %orphan-tx-json (tx from-peer verbose2)
-  "OrphanDescription (Core getorphantxs verbosity 1/2) for orphan TX announced by
-FROM-PEER (a peer object, or nil). VERBOSE2 appends the raw hex. \"bytes\" and
-\"hex\" use the wire (witness-complete) encoding — Core ComputeTotalSize /
-EncodeHexTx. \"from\" is our single announcer (Core tracks a list); an empty
-list when the announcer is gone."
+(defun %orphan-tx-json (tx announcers verbose2)
+  "OrphanDescription (Core getorphantxs verbosity 1/2) for orphan TX announced
+by ANNOUNCERS (a list of peer objects, possibly containing nil for local
+submissions). VERBOSE2 appends the raw hex. \"bytes\" and \"hex\" use the wire
+(witness-complete) encoding — Core ComputeTotalSize / EncodeHexTx. \"from\"
+lists every announcer's peer id (Core OrphanInfo::announcers)."
   (let* ((ser (bitcoin-lisp.serialization:transaction-wire-bytes tx))
          (base `(("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
                  ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
                  ("bytes" . ,(length ser))
                  ("vsize" . ,(bitcoin-lisp.serialization:transaction-vsize tx))
                  ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))
-                 ("from" . ,(if from-peer
-                                (list (bitcoin-lisp.networking::peer-id from-peer))
-                                '())))))
+                 ("from" . ,(loop for peer in announcers
+                                  when peer
+                                    collect (bitcoin-lisp.networking::peer-id peer))))))
     (if verbose2
         (append base `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex ser))))
         base)))
@@ -654,18 +663,22 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
     (unless (member verbosity '(0 1 2))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message (format nil "Invalid verbosity value ~A" verbosity)))
+    ;; Node lock: the sync thread adds/erases orphans while handling txs;
+    ;; iterating the pool's hash table concurrently is undefined.
     (when pool
-      (maphash
-       (lambda (txid entry)
-         (declare (ignore txid))
-         (let ((tx (bitcoin-lisp.mempool::orphan-entry-transaction entry))
-               (from (bitcoin-lisp.mempool::orphan-entry-from-peer entry)))
-           (push (case verbosity
-                   (0 (hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
-                   (1 (%orphan-tx-json tx from nil))
-                   (t (%orphan-tx-json tx from t)))
-                 result)))
-       (bitcoin-lisp.mempool::orphan-pool-by-txid pool)))
+      (with-node-lock (node)
+        (maphash
+         (lambda (wtxid entry)
+           (declare (ignore wtxid))
+           (let ((tx (bitcoin-lisp.mempool:orphan-entry-transaction entry))
+                 (from (mapcar #'bitcoin-lisp.mempool::orphan-announcement-peer
+                               (bitcoin-lisp.mempool::orphan-entry-announcements entry))))
+             (push (case verbosity
+                     (0 (hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
+                     (1 (%orphan-tx-json tx from nil))
+                     (t (%orphan-tx-json tx from t)))
+                   result)))
+         (bitcoin-lisp.mempool::orphan-pool-by-wtxid pool))))
     (nreverse result)))
 
 (defun rpc-getmempoolinfo (node params)
@@ -675,10 +688,17 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
         (incfee (/ bitcoin-lisp.mempool::+incremental-relay-fee-rate+ 100000000.0d0)))
     (if mempool
         ;; Rates are sat/kvB (Core CFeeRate); convert to BTC/kvB via /1e8.
-        (let* ((min-fee-sat-kvb (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
+        ;; Node lock: count/bytes/total-fee must be one consistent snapshot
+        ;; while the sync thread adds/evicts entries (Core getmempoolinfo
+        ;; takes pool.cs via the stats getters).
+        (with-node-lock (node)
+         (let* ((min-fee-sat-kvb (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
                (min-fee-btc-kvb (/ min-fee-sat-kvb 100000000.0d0))
                (relay-fee-btc-kvb (/ bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 100000000.0d0))
                (count (bitcoin-lisp.mempool:mempool-count mempool))
+               ;; Core "bytes" = GetTotalTxSize(), the sum of the entries'
+               ;; sigop-adjusted VIRTUAL sizes (rpc/mempool.cpp:1040,
+               ;; txmempool.h:191), not serialized bytes.
                (bytes (bitcoin-lisp.mempool:mempool-total-size mempool))
                (total-fee-sat 0))
           (bitcoin-lisp.mempool:mempool-for-each
@@ -687,10 +707,9 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           `(("loaded" . t)
             ("size" . ,count)
             ("bytes" . ,bytes)
-            ;; Core reports DynamicMemoryUsage; we don't replicate its exact
-            ;; accounting, so estimate: serialized bytes + a ~per-entry struct/
-            ;; index overhead.
-            ("usage" . ,(+ bytes (* count 180)))
+            ;; Core DynamicMemoryUsage(): the malloc-modeled memory usage the
+            ;; -maxmempool cap is keyed on (rpc/mempool.cpp:1041).
+            ("usage" . ,(bitcoin-lisp.mempool:mempool-dynamic-usage mempool))
             ("total_fee" . ,(/ total-fee-sat 100000000.0d0))
             ("maxmempool" . ,(bitcoin-lisp.mempool::mempool-max-size mempool))
             ("mempoolminfee" . ,min-fee-btc-kvb)
@@ -700,7 +719,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
             ("unbroadcastcount" . ,(bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))
             ;; Acceptance is unconditionally full-RBF since cluster mempool;
             ;; Core hardcodes true (rpc/mempool.cpp:1048, field DEPRECATED).
-            ("fullrbf" . t)))
+            ("fullrbf" . t))))
         `(("loaded" . nil)
           ("size" . 0)
           ("bytes" . 0)
@@ -717,7 +736,11 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
   "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
   (let ((verbose (first params))
         (mempool (rpc-get-mempool node)))
-    (cond
+    ;; Node lock: iterating entries (and, verbose, walking each entry's
+    ;; ancestors/descendants/chunk) must not race the sync thread's
+    ;; add/evict/reorg mutations (Core getrawmempool takes pool.cs).
+    (with-node-lock (node)
+     (cond
       ((null mempool) (if verbose '() '()))
       ((not verbose)
        (let ((ids '()))
@@ -735,7 +758,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           (lambda (txid entry)
             (push (cons (hash-to-hex txid) (%mempool-entry-fields mempool txid entry))
                   result)))
-         result)))))
+         result))))))
 
 (defun %mempool-entry-fields (mempool txid entry)
   "The verbose field alist for one mempool ENTRY (TXID) — vsize/weight/time/
@@ -812,8 +835,9 @@ entry), erroring if malformed or not in the mempool."
 (defun rpc-getmempoolentry (node params)
   "Return mempool details for transaction TXID (Bitcoin Core getmempoolentry)."
   (let ((mempool (rpc-get-mempool node)))
-    (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
-      (%mempool-entry-fields mempool txid entry))))
+    (with-node-lock (node)
+      (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
+        (%mempool-entry-fields mempool txid entry)))))
 
 (defun %mempool-set->result (mempool txid-set verbose)
   "Format a hash-set of mempool txids as either an array of (big-endian) txid hex
@@ -834,18 +858,20 @@ strings or, when VERBOSE, an alist of txid-hex -> entry fields."
 PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   (let ((mempool (rpc-get-mempool node))
         (verbose (second params)))
-    (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
-      (declare (ignore entry))
-      (%mempool-set->result mempool (bitcoin-lisp.mempool:mempool-ancestors mempool txid) verbose))))
+    (with-node-lock (node)
+      (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
+        (declare (ignore entry))
+        (%mempool-set->result mempool (bitcoin-lisp.mempool:mempool-ancestors mempool txid) verbose)))))
 
 (defun rpc-getmempooldescendants (node params)
   "Return the in-mempool descendants of TXID (Bitcoin Core getmempooldescendants).
 PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   (let ((mempool (rpc-get-mempool node))
         (verbose (second params)))
-    (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
-      (declare (ignore entry))
-      (%mempool-set->result mempool (bitcoin-lisp.mempool:mempool-descendants mempool txid) verbose))))
+    (with-node-lock (node)
+      (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
+        (declare (ignore entry))
+        (%mempool-set->result mempool (bitcoin-lisp.mempool:mempool-descendants mempool txid) verbose)))))
 
 (defun rpc-getmempoolcluster (node params)
   "Return mempool data for the cluster containing TXID (Bitcoin Core
@@ -858,7 +884,10 @@ Core's clusterweight/chunkweight are sigops-adjusted WEIGHT
 (GetAdjustedWeight); our txgraph measures BIP141 virtual bytes, so those
 fields here are in vB (~ Core / 4)."
   (let ((mempool (rpc-get-mempool node)))
-    (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
+    ;; Node lock: the chunk walk reads the live txgraph, which the sync
+    ;; thread relinearizes on every mempool mutation.
+    (with-node-lock (node)
+     (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
       (declare (ignore txid))
       (let ((chunks (bitcoin-lisp.mempool:txgraph-get-cluster-chunks
                      (bitcoin-lisp.mempool:mempool-graph mempool)
@@ -876,7 +905,7 @@ fields here are in vB (~ Core / 4)."
                                               (hash-to-hex
                                                (bitcoin-lisp.mempool:tx-handle-data h)))
                                             (car c)))))
-                      chunks)))))))
+                      chunks))))))))
 
 (defun rpc-getmempoolfeeratediagram (node params)
   "Return the feerate diagram for the whole mempool (Bitcoin Core
@@ -890,20 +919,24 @@ weight; ours is BIP141 virtual bytes (~ Core / 4)."
         (cum-weight 0)
         (cum-fee 0)
         (points (list `(("weight" . 0) ("fee" . 0.0d0)))))
+    ;; Node lock: an active block builder forbids concurrent txgraph
+    ;; mutation — the same exclusion the mining assembler's chunk walk
+    ;; takes (assembler.lisp %with-mempool-lock).
     (when mempool
-      (let ((builder (bitcoin-lisp.mempool:make-block-builder
-                      (bitcoin-lisp.mempool:mempool-graph mempool))))
-        (unwind-protect
-             (loop for feerate = (bitcoin-lisp.mempool:block-builder-current-chunk-feerate
-                                  builder)
-                   while feerate
-                   do (incf cum-weight (bitcoin-lisp.mempool:feefrac-size feerate))
-                      (incf cum-fee (bitcoin-lisp.mempool:feefrac-fee feerate))
-                      (push `(("weight" . ,cum-weight)
-                              ("fee" . ,(/ cum-fee 100000000.0d0)))
-                            points)
-                      (bitcoin-lisp.mempool:block-builder-include builder))
-          (bitcoin-lisp.mempool:block-builder-finish builder))))
+      (with-node-lock (node)
+        (let ((builder (bitcoin-lisp.mempool:make-block-builder
+                        (bitcoin-lisp.mempool:mempool-graph mempool))))
+          (unwind-protect
+               (loop for feerate = (bitcoin-lisp.mempool:block-builder-current-chunk-feerate
+                                    builder)
+                     while feerate
+                     do (incf cum-weight (bitcoin-lisp.mempool:feefrac-size feerate))
+                        (incf cum-fee (bitcoin-lisp.mempool:feefrac-fee feerate))
+                        (push `(("weight" . ,cum-weight)
+                                ("fee" . ,(/ cum-fee 100000000.0d0)))
+                              points)
+                        (bitcoin-lisp.mempool:block-builder-include builder))
+            (bitcoin-lisp.mempool:block-builder-finish builder)))))
     (nreverse points)))
 
 (defun rpc-gettxspendingprevout (node params)
@@ -915,19 +948,22 @@ array of {txid, vout, spendingtxid?}."
     (unless (and (listp outpoints) outpoints)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "First parameter must be a non-empty array of outpoints"))
-    (mapcar
-     (lambda (op)
-       (let* ((txid-hex (and (hash-table-p op) (gethash "txid" op)))
-              (vout (and (hash-table-p op) (gethash "vout" op)))
-              (txid (and (stringp txid-hex) (parse-hex-hash txid-hex))))
-         (unless (and txid (integerp vout))
-           (error 'rpc-error :code +rpc-invalid-parameter+
-                             :message "Each outpoint needs a txid (hex) and vout (integer)"))
-         (let ((spender (and mempool (bitcoin-lisp.mempool:mempool-spending-tx mempool txid vout))))
-           `(("txid" . ,txid-hex)
-             ("vout" . ,vout)
-             ,@(when spender `(("spendingtxid" . ,(hash-to-hex spender))))))))
-     outpoints)))
+    ;; Node lock: one consistent spent-map snapshot across all queried
+    ;; outpoints (Core gettxspendingprevout takes pool.cs once).
+    (with-node-lock (node)
+     (mapcar
+      (lambda (op)
+        (let* ((txid-hex (and (hash-table-p op) (gethash "txid" op)))
+               (vout (and (hash-table-p op) (gethash "vout" op)))
+               (txid (and (stringp txid-hex) (parse-hex-hash txid-hex))))
+          (unless (and txid (integerp vout))
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message "Each outpoint needs a txid (hex) and vout (integer)"))
+          (let ((spender (and mempool (bitcoin-lisp.mempool:mempool-spending-tx mempool txid vout))))
+            `(("txid" . ,txid-hex)
+              ("vout" . ,vout)
+              ,@(when spender `(("spendingtxid" . ,(hash-to-hex spender))))))))
+      outpoints))))
 
 (defun rpc-testmempoolaccept (node params)
   "Dry-run mempool acceptance for one or more raw transactions (hex). Returns an
@@ -941,7 +977,11 @@ anything to the mempool. Each tx is checked independently against current state
     (unless (listp txs)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "First parameter must be an array of tx hex"))
-    (let ((height (bitcoin-lisp.storage:current-height chain-state))
+    ;; Node lock: validation reads the mempool + UTXO set + tip together;
+    ;; a consistent view for the whole batch (Core ProcessTransaction
+    ;; requires cs_main even for test_accept).
+    (with-node-lock (node)
+     (let ((height (bitcoin-lisp.storage:current-height chain-state))
           (results '()))
       (dolist (hex-str txs (nreverse results))
         (push
@@ -971,7 +1011,7 @@ anything to the mempool. Each tx is checked independently against current state
            (error (e)
              `(("allowed" . nil)
                ("reject-reason" . ,(format nil "decode-failed: ~A" e)))))
-         results)))))
+         results))))))
 
 (defun rpc-sendrawtransaction (node params)
   "Submit a raw transaction to the mempool AND broadcast it: on acceptance the
@@ -988,38 +1028,45 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
         (let* ((tx-bytes (bitcoin-lisp.crypto:hex-to-bytes hex-str))
                (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
                      (bitcoin-lisp.serialization:read-transaction stream)))
-               (txid (bitcoin-lisp.serialization:transaction-hash tx))
-               (utxo-set (rpc-get-utxo-set node))
-               (mempool (rpc-get-mempool node))
-               (chain-state (rpc-get-chain-state node))
-               (current-height (bitcoin-lisp.storage:current-height chain-state)))
-          ;; Validate transaction for mempool
-          (multiple-value-bind (valid error fee replaced sigops)
-              (bitcoin-lisp.validation:validate-transaction-for-mempool
-               tx utxo-set mempool current-height :chain-state chain-state)
-            (when (and (not valid) (eq error :already-in-mempool))
-              ;; Core doesn't reject a same-txid resubmission: it skips the
-              ;; mempool submission but still relays, announcing the POOL
-              ;; entry's wtxid (a same-txid/different-witness submission must
-              ;; advertise the witness we can actually serve). No unbroadcast
-              ;; add — Core's already-in-mempool branch skips it too.
-              (bitcoin-lisp::broadcast-transaction-to-peers node txid)
-              (return-from rpc-sendrawtransaction (hash-to-hex txid)))
-            (unless valid
-              (error 'rpc-error :code +rpc-transaction-rejected+
-                                :message (format nil "Transaction rejected: ~A" error)))
-            (let ((add-result (bitcoin-lisp.mempool:accept-validated-tx
-                               mempool txid tx fee current-height
-                               :sigops sigops :replaced replaced)))
-              (unless (eq add-result :ok)
+               (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+          ;; Node lock across validate -> accept -> unbroadcast -> announce:
+          ;; the whole sequence mutates state the sync thread owns (Core
+          ;; BroadcastTransaction runs under cs_main + pool.cs,
+          ;; node/transaction.cpp:52). Without it, the tip/mempool can move
+          ;; between validation and insertion, admitting an entry the
+          ;; validation no longer justifies.
+          (with-node-lock (node)
+           (let* ((utxo-set (rpc-get-utxo-set node))
+                  (mempool (rpc-get-mempool node))
+                  (chain-state (rpc-get-chain-state node))
+                  (current-height (bitcoin-lisp.storage:current-height chain-state)))
+            ;; Validate transaction for mempool
+            (multiple-value-bind (valid error fee replaced sigops)
+                (bitcoin-lisp.validation:validate-transaction-for-mempool
+                 tx utxo-set mempool current-height :chain-state chain-state)
+              (when (and (not valid) (eq error :already-in-mempool))
+                ;; Core doesn't reject a same-txid resubmission: it skips the
+                ;; mempool submission but still relays, announcing the POOL
+                ;; entry's wtxid (a same-txid/different-witness submission must
+                ;; advertise the witness we can actually serve). No unbroadcast
+                ;; add — Core's already-in-mempool branch skips it too.
+                (bitcoin-lisp::broadcast-transaction-to-peers node txid)
+                (return-from rpc-sendrawtransaction (hash-to-hex txid)))
+              (unless valid
                 (error 'rpc-error :code +rpc-transaction-rejected+
-                                  :message (format nil "Mempool rejection: ~A" add-result)))
-              ;; Track for best-effort initial broadcast (Core
-              ;; node/transaction.cpp:100-104), then queue the announcement
-              ;; to all relay peers.
-              (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
-              (bitcoin-lisp::broadcast-transaction-to-peers node txid)
-              (hash-to-hex txid))))
+                                  :message (format nil "Transaction rejected: ~A" error)))
+              (let ((add-result (bitcoin-lisp.mempool:accept-validated-tx
+                                 mempool txid tx fee current-height
+                                 :sigops sigops :replaced replaced)))
+                (unless (eq add-result :ok)
+                  (error 'rpc-error :code +rpc-transaction-rejected+
+                                    :message (format nil "Mempool rejection: ~A" add-result)))
+                ;; Track for best-effort initial broadcast (Core
+                ;; node/transaction.cpp:100-104), then queue the announcement
+                ;; to all relay peers.
+                (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+                (bitcoin-lisp::broadcast-transaction-to-peers node txid)
+                (hash-to-hex txid))))))
       ;; Re-raise our own rpc-errors (the -26 rejections above) unchanged; only a
       ;; genuine parse/deserialization failure maps to RPC_DESERIALIZATION_ERROR
       ;; (-22), which Core distinguishes from the -26 mempool rejections.
@@ -1092,18 +1139,25 @@ for API compatibility but not enforced (matching sendrawtransaction here)."
               (error (e)
                 (error 'rpc-error :code +rpc-misc-error+
                                   :message (format nil "TX decode failed: ~A" e))))))
+      ;; Node lock across validate-package -> mempool submission ->
+      ;; broadcast: package acceptance mutates the mempool tx-by-tx and
+      ;; must not interleave with the sync thread (Core AcceptPackage runs
+      ;; entirely under cs_main + pool.cs).
       (multiple-value-bind (msg results replaced)
-          (bitcoin-lisp.validation:validate-package-for-mempool
-           package utxo-set mempool chain-state)
-        ;; Broadcast every package member that made it into (or already was
-        ;; in) the mempool — Core submitpackage runs BroadcastTransaction on
-        ;; each such tx (rpc/mempool.cpp:1423-1444). Those txs are in the
-        ;; pool by now, so Core's already-in-mempool branch applies: relay
-        ;; only, no unbroadcast-set add (node/transaction.cpp:63-72).
-        (dolist (tx package)
-          (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-            (when (bitcoin-lisp.mempool:mempool-has mempool txid)
-              (bitcoin-lisp::broadcast-transaction-to-peers node txid))))
+          (with-node-lock (node)
+            (multiple-value-prog1
+                (bitcoin-lisp.validation:validate-package-for-mempool
+                 package utxo-set mempool chain-state)
+              ;; Broadcast every package member that made it into (or already
+              ;; was in) the mempool — Core submitpackage runs
+              ;; BroadcastTransaction on each such tx (rpc/mempool.cpp:
+              ;; 1423-1444). Those txs are in the pool by now, so Core's
+              ;; already-in-mempool branch applies: relay only, no
+              ;; unbroadcast-set add (node/transaction.cpp:63-72).
+              (dolist (tx package)
+                (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+                  (when (bitcoin-lisp.mempool:mempool-has mempool txid)
+                    (bitcoin-lisp::broadcast-transaction-to-peers node txid))))))
         `(("package_msg" . ,(if (eq msg :success) "success"
                                 (string-downcase (symbol-name msg))))
           ("tx-results"
@@ -1126,18 +1180,23 @@ context. Returns null on success; errors otherwise."
     (let ((hash (parse-hex-hash hash-hex)))
       (unless hash
         (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid block hash"))
-      (multiple-value-bind (ok reason)
-          (funcall op
-                   (rpc-get-chain-state node)
-                   (rpc-get-block-store node)
-                   (rpc-get-utxo-set node)
-                   hash
-                   :mempool (rpc-get-mempool node)
-                   :tx-index (rpc-get-tx-index node))
-        (unless ok
-          (error 'rpc-error :code +rpc-misc-error+
-                            :message (string-downcase (symbol-name reason))))
-        nil))))
+      ;; Node lock: these ops reorg the active chain, rewrite the UTXO set,
+      ;; and re-add/evict mempool entries — the same mutations the sync
+      ;; thread performs under the lock (Core invalidateblock/
+      ;; reconsiderblock/preciousblock all hold cs_main).
+      (with-node-lock (node)
+        (multiple-value-bind (ok reason)
+            (funcall op
+                     (rpc-get-chain-state node)
+                     (rpc-get-block-store node)
+                     (rpc-get-utxo-set node)
+                     hash
+                     :mempool (rpc-get-mempool node)
+                     :tx-index (rpc-get-tx-index node))
+          (unless ok
+            (error 'rpc-error :code +rpc-misc-error+
+                              :message (string-downcase (symbol-name reason))))
+          nil)))))
 
 (defun rpc-invalidateblock (node params)
   "Mark a block (and its descendants) invalid and reorg the active chain away from
@@ -1433,26 +1492,30 @@ block reads back. Returns T if all checks pass, NIL otherwise."
   (let* ((checklevel (if (integerp (first params)) (first params) 3))
          (nblocks (if (integerp (second params)) (second params) 6))
          (chain-state (rpc-get-chain-state node))
-         (block-store (rpc-get-block-store node))
-         (tip (bitcoin-lisp.storage:current-height chain-state)))
-    (when (or (<= nblocks 0) (> nblocks (1+ tip)))
-      (setf nblocks (1+ tip)))
-    (loop for height from tip downto (max 0 (- tip (1- nblocks)))
-          do (let ((entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
-               (unless entry (return-from rpc-verifychain nil))
-               (let ((block (bitcoin-lisp.storage:get-block
-                             block-store
-                             (bitcoin-lisp.storage:block-index-entry-hash entry))))
-                 (unless block (return-from rpc-verifychain nil))
-                 (when (>= checklevel 1)
-                   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-                          (txids (mapcar #'bitcoin-lisp.serialization:transaction-hash
-                                         (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
-                     (unless (and (equalp (bitcoin-lisp.validation:compute-merkle-root txids)
-                                          (bitcoin-lisp.serialization:block-header-merkle-root header))
-                                  (bitcoin-lisp.validation:check-proof-of-work header))
-                       (return-from rpc-verifychain nil)))))))
-    t))
+         (block-store (rpc-get-block-store node)))
+    ;; Node lock: walk one consistent chain — a concurrent reorg on the
+    ;; sync thread could otherwise splice entries from two tips (Core
+    ;; VerifyDB holds cs_main throughout).
+    (with-node-lock (node)
+     (let ((tip (bitcoin-lisp.storage:current-height chain-state)))
+      (when (or (<= nblocks 0) (> nblocks (1+ tip)))
+        (setf nblocks (1+ tip)))
+      (loop for height from tip downto (max 0 (- tip (1- nblocks)))
+            do (let ((entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+                 (unless entry (return-from rpc-verifychain nil))
+                 (let ((block (bitcoin-lisp.storage:get-block
+                               block-store
+                               (bitcoin-lisp.storage:block-index-entry-hash entry))))
+                   (unless block (return-from rpc-verifychain nil))
+                   (when (>= checklevel 1)
+                     (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+                            (txids (mapcar #'bitcoin-lisp.serialization:transaction-hash
+                                           (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
+                       (unless (and (equalp (bitcoin-lisp.validation:compute-merkle-root txids)
+                                            (bitcoin-lisp.serialization:block-header-merkle-root header))
+                                    (bitcoin-lisp.validation:check-proof-of-work header))
+                         (return-from rpc-verifychain nil)))))))
+      t))))
 
 ;;; --- waitfornewblock / dumptxoutset (Bitcoin Core rpc/blockchain.cpp) ---
 
@@ -1674,27 +1737,33 @@ reverse RAII order (rollback restored first, then the network re-enabled)."
       (unwind-protect
            (unwind-protect
                 (progn
-                  (multiple-value-bind (ok reason)
-                      (bitcoin-lisp.validation:invalidate-block
-                       chain-state block-store utxo-set invalidate-hash
-                       :mempool mempool :tx-index tx-index)
-                    (unless ok
+                  ;; Node lock around the rollback mutation only, not the
+                  ;; (long) snapshot streaming: with the network disabled no
+                  ;; new blocks arrive, so the rolled-back chain stays put
+                  ;; while the dump runs unlocked.
+                  (with-node-lock (node)
+                    (multiple-value-bind (ok reason)
+                        (bitcoin-lisp.validation:invalidate-block
+                         chain-state block-store utxo-set invalidate-hash
+                         :mempool mempool :tx-index tx-index)
+                      (unless ok
+                        (error 'rpc-error :code +rpc-misc-error+
+                                          :message (format nil "Could not roll back to requested height. (~A)"
+                                                           (string-downcase (symbol-name reason))))))
+                    ;; The new tip must be the target: a block-read failure or a
+                    ;; stale equal-work sister of the invalidated block would
+                    ;; land elsewhere (Core rpc/blockchain.cpp:3178-3187).
+                    (unless (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                                    target-hash)
                       (error 'rpc-error :code +rpc-misc-error+
-                                        :message (format nil "Could not roll back to requested height. (~A)"
-                                                         (string-downcase (symbol-name reason))))))
-                  ;; The new tip must be the target: a block-read failure or a
-                  ;; stale equal-work sister of the invalidated block would
-                  ;; land elsewhere (Core rpc/blockchain.cpp:3178-3187).
-                  (unless (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
-                                  target-hash)
-                    (error 'rpc-error :code +rpc-misc-error+
-                                      :message "Could not roll back to requested height."))
+                                        :message "Could not roll back to requested height.")))
                   (%write-utxo-snapshot node chain-state utxo-set path))
              ;; ~TemporaryRollback: always reconsider, even on error —
              ;; harmless if the invalidation never took effect.
-             (bitcoin-lisp.validation:reconsider-block
-              chain-state block-store utxo-set invalidate-hash
-              :mempool mempool :tx-index tx-index))
+             (with-node-lock (node)
+               (bitcoin-lisp.validation:reconsider-block
+                chain-state block-store utxo-set invalidate-hash
+                :mempool mempool :tx-index tx-index)))
         ;; ~NetworkDisable (runs after the rollback is undone, like Core's
         ;; reverse member-destruction order).
         (when was-active
@@ -2062,7 +2131,11 @@ The same dump runs automatically on graceful shutdown."
     (unless path
       (error 'rpc-error :code +rpc-misc-error+
                         :message "Node has no data directory"))
-    (bitcoin-lisp.mempool:save-mempool-file (rpc-get-mempool node) path)
+    ;; Node lock: the dump iterates entries, deltas, and the unbroadcast
+    ;; set; a concurrent sync-thread mutation would tear the snapshot
+    ;; (Core DumpMempool snapshots under pool.cs).
+    (with-node-lock (node)
+      (bitcoin-lisp.mempool:save-mempool-file (rpc-get-mempool node) path))
     `(("filename" . ,(namestring path)))))
 
 (defun rpc-importmempool (node params)
@@ -2085,8 +2158,13 @@ object."
       (unless path
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message (format nil "Can't open mempool file ~A" filepath)))
-      (unless (bitcoin-lisp::load-mempool-from-disk
-               node path :apply-unbroadcast apply-unbroadcast)
+      ;; Node lock: the import validates and inserts every entry against
+      ;; the live UTXO set/mempool — it must not interleave with the sync
+      ;; thread (Core importmempool holds cs_main + pool.cs through
+      ;; LoadMempool, rpc/mempool.cpp:1130).
+      (unless (with-node-lock (node)
+                (bitcoin-lisp::load-mempool-from-disk
+                 node path :apply-unbroadcast apply-unbroadcast))
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Unable to import mempool file (unreadable or corrupt)")))
     ;; Core returns an empty object; an empty hash-table serializes as {}.
@@ -2112,7 +2190,11 @@ mempool acceptance and RBF scoring; the fee is not actually paid. Returns T."
     (unless (integerp fee-delta)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid fee_delta"))
-    (let* ((mempool (rpc-get-mempool node))
+    ;; Node lock: mempool-prioritise mutates the deltas table and the
+    ;; entry's modified fee/txgraph position (Core PrioritiseTransaction
+    ;; takes pool.cs).
+    (with-node-lock (node)
+     (let* ((mempool (rpc-get-mempool node))
            (entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
       ;; Core: dust-output txs can't enter with a nonzero delta, so refuse to
       ;; prioritise them after the fact too.
@@ -2125,7 +2207,7 @@ mempool acceptance and RBF scoring; the fee is not actually paid. Returns T."
                      (error 'rpc-error :code +rpc-invalid-parameter+
                                        :message "Priority is not supported for transactions with dust outputs.")))))
       (bitcoin-lisp.mempool:mempool-prioritise mempool txid fee-delta)
-      t)))
+      t))))
 
 (defun rpc-getprioritisedtransactions (node params)
   "Map of all prioritisetransaction fee deltas by txid (Bitcoin Core
@@ -2134,17 +2216,20 @@ tx is currently in the mempool."
   (declare (ignore params))
   (let ((mempool (rpc-get-mempool node))
         (result '()))
-    (maphash
-     (lambda (txid delta)
-       (let ((entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
-         (push
-          (cons (hash-to-hex txid)
-                `(("fee_delta" . ,delta)
-                  ("in_mempool" . ,(and entry t))
-                  ,@(when entry
-                      `(("modified_fee" . ,(bitcoin-lisp.mempool:mempool-entry-modified-fee entry))))))
-          result)))
-     (bitcoin-lisp.mempool:mempool-deltas mempool))
+    ;; Node lock: prioritisetransaction (RPC threads) and acceptance paths
+    ;; (sync thread) both write the deltas table this iterates.
+    (with-node-lock (node)
+      (maphash
+       (lambda (txid delta)
+         (let ((entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
+           (push
+            (cons (hash-to-hex txid)
+                  `(("fee_delta" . ,delta)
+                    ("in_mempool" . ,(and entry t))
+                    ,@(when entry
+                        `(("modified_fee" . ,(bitcoin-lisp.mempool:mempool-entry-modified-fee entry))))))
+            result)))
+       (bitcoin-lisp.mempool:mempool-deltas mempool)))
     (or result (make-hash-table :test 'equal))))
 
 ;;; --- UTXO set scanning (Bitcoin Core scantxoutset) ---
@@ -2617,12 +2702,19 @@ miner."
   (declare (ignore params))
   (let* ((chain-state (rpc-get-chain-state node))
          (mempool (rpc-get-mempool node))
-         (template (nth-value 1 (bitcoin-lisp.mining:assemble-full-block
-                                 chain-state mempool
-                                 :coinbase-script-pubkey
-                                 (make-array 1 :element-type '(unsigned-byte 8)
-                                               :initial-element #x51) ; OP_TRUE
-                                 :utxo-set (rpc-get-utxo-set node))))
+         ;; Node lock around the whole assembly: the chunk walk locks
+         ;; internally (assembler %with-mempool-lock), but the template's
+         ;; height/prev/finality context and its TestBlockValidity dry run
+         ;; must see the SAME tip the transactions were selected against
+         ;; (Core CreateNewBlock holds cs_main + pool.cs end-to-end,
+         ;; node/miner.cpp:151).
+         (template (with-node-lock (node)
+                     (nth-value 1 (bitcoin-lisp.mining:assemble-full-block
+                                   chain-state mempool
+                                   :coinbase-script-pubkey
+                                   (make-array 1 :element-type '(unsigned-byte 8)
+                                                 :initial-element #x51) ; OP_TRUE
+                                   :utxo-set (rpc-get-utxo-set node)))))
          (bits (bitcoin-lisp.mining:block-template-bits template)))
     `(("capabilities" . ("proposal"))
       ("version" . ,(bitcoin-lisp.mining:block-template-version template))
@@ -2658,7 +2750,8 @@ miner."
 (defun rpc-getmininginfo (node params)
   "Return mining-related state (Bitcoin Core getmininginfo)."
   (declare (ignore params))
-  (let* ((chain-state (rpc-get-chain-state node))
+  (with-node-lock (node)                 ; consistent tip + pool count snapshot
+   (let* ((chain-state (rpc-get-chain-state node))
          (mempool (rpc-get-mempool node))
          (height (bitcoin-lisp.storage:current-height chain-state))
          (tip (bitcoin-lisp.storage:get-block-index-entry
@@ -2678,18 +2771,21 @@ miner."
       ("target" . ,(%bits-to-target-hex bits))
       ("pooledtx" . ,(if mempool (bitcoin-lisp.mempool:mempool-count mempool) 0))
       ("chain" . ,(%chain-name (bitcoin-lisp::node-network node)))
-      ("warnings" . #()))))
+      ("warnings" . #())))))
 
 (defun %activate-submitted-block (node block)
   "Validate+activate BLOCK through the consensus path. Returns the activate-block
-(values ok reason)."
-  (bitcoin-lisp.validation:activate-block
-   block
-   (rpc-get-chain-state node)
-   (rpc-get-block-store node)
-   (rpc-get-utxo-set node)
-   :mempool (rpc-get-mempool node)
-   :tx-index (rpc-get-tx-index node)))
+(values ok reason). Holds the node lock: activation mutates the chainstate,
+UTXO set, and mempool exactly like a network block, which the sync thread
+only ever does under the lock (Core ProcessNewBlock takes cs_main)."
+  (with-node-lock (node)
+    (bitcoin-lisp.validation:activate-block
+     block
+     (rpc-get-chain-state node)
+     (rpc-get-block-store node)
+     (rpc-get-utxo-set node)
+     :mempool (rpc-get-mempool node)
+     :tx-index (rpc-get-tx-index node))))
 
 (defun rpc-submitblock (node params)
   "Submit a mined block (Bitcoin Core submitblock). PARAMS: (block-hex). Returns
@@ -2706,7 +2802,12 @@ string. Routes through the same activate-block consensus path as network blocks.
                      (error 'rpc-error :code +rpc-misc-error+
                                        :message (format nil "Block decode failed: ~A" e)))))
           (chain-state (rpc-get-chain-state node)))
-      (let* ((hash (bitcoin-lisp.serialization:block-header-hash
+      ;; Node lock: the duplicate probe and the activation must see one
+      ;; chain state (Core submitblock reads the index and calls
+      ;; ProcessNewBlock under cs_main); the lock is recursive, so the
+      ;; nested %activate-submitted-block lock is free.
+      (with-node-lock (node)
+       (let* ((hash (bitcoin-lisp.serialization:block-header-hash
                     (bitcoin-lisp.serialization:bitcoin-block-header block)))
              (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
         (when entry
@@ -2727,7 +2828,7 @@ string. Routes through the same activate-block consensus path as network blocks.
             (ok nil)                        ; accepted → JSON null (BIP22 success)
             ;; A valid block stored on a weaker side chain is still accepted.
             ((eq reason :weaker-chain) nil)
-            (t (string-downcase (symbol-name reason)))))))))
+            (t (string-downcase (symbol-name reason))))))))))
 
 (defun rpc-submitheader (node params)
   "Validate and add a block header to the header index (Bitcoin Core
@@ -2745,7 +2846,11 @@ header); errors if the parent is missing or the header fails validation."
                       (error 'rpc-error :code +rpc-deserialization-error+
                                         :message "Block header decode failed"))))
           (chain-state (rpc-get-chain-state node)))
-      (let ((hash (bitcoin-lisp.serialization:block-header-hash header))
+      ;; Node lock: process-headers mutates the header index the sync
+      ;; thread's headers-sync also writes (Core ProcessNewBlockHeaders
+      ;; takes cs_main).
+      (with-node-lock (node)
+       (let ((hash (bitcoin-lisp.serialization:block-header-hash header))
             (prev (bitcoin-lisp.serialization:block-header-prev-block header)))
         ;; Already known → success (Core returns null).
         (when (bitcoin-lisp.storage:get-block-index-entry chain-state hash)
@@ -2762,7 +2867,7 @@ header); errors if the parent is missing or the header fails validation."
             (error 'rpc-error :code +rpc-verify-error+
                               :message (or err "header validation failed")))
           (bitcoin-lisp.networking::process-headers valid chain-state))
-        nil))))
+        nil)))))
 
 (defun %generate-to-script-pubkey (node script-pubkey nblocks maxtries)
   "Mine NBLOCKS blocks whose coinbase pays SCRIPT-PUBKEY, activating each through
@@ -2772,10 +2877,15 @@ by generatetoaddress and generatetodescriptor."
         (mempool (rpc-get-mempool node))
         (hashes '()))
     (dotimes (i nblocks (nreverse hashes))
-      (let ((block (bitcoin-lisp.mining:assemble-full-block
-                    chain-state mempool :coinbase-script-pubkey script-pubkey
-                    ;; TestBlockValidity before mining (Core CreateNewBlock).
-                    :utxo-set (rpc-get-utxo-set node))))
+      ;; Assemble under the node lock (one consistent tip+mempool view);
+      ;; grind the nonce OUTSIDE it — Core likewise drops cs_main between
+      ;; CreateNewBlock and ProcessNewBlock (rpc/mining.cpp GenerateBlocks),
+      ;; and a stale-template block simply fails activation below.
+      (let ((block (with-node-lock (node)
+                     (bitcoin-lisp.mining:assemble-full-block
+                      chain-state mempool :coinbase-script-pubkey script-pubkey
+                      ;; TestBlockValidity before mining (Core CreateNewBlock).
+                      :utxo-set (rpc-get-utxo-set node)))))
         (unless (bitcoin-lisp.mining:mine-block block :max-tries maxtries)
           (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
         (multiple-value-bind (ok reason) (%activate-submitted-block node block)
@@ -2890,41 +3000,51 @@ and {hash} is returned; otherwise {hash, hex}."
     (unless (listp txs-arg)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "transactions must be an array"))
     (let* ((script-pubkey (%resolve-coinbase-output-script output network))
-           (txs (mapcar (lambda (s) (%resolve-generateblock-tx node s)) txs-arg))
-           (chain-state (rpc-get-chain-state node))
-           (mempool (rpc-get-mempool node))
-           ;; Reuse the assembler only for header fields (height/prev/bits/version/
-           ;; time); its tx selection and coinbase value are ignored.
-           (template (bitcoin-lisp.mining:assemble-block-template chain-state mempool))
-           (height (bitcoin-lisp.mining:block-template-height template))
-           (coinbase (bitcoin-lisp.mining:build-coinbase-transaction
-                      height
-                      (bitcoin-lisp.validation:calculate-block-subsidy height)
-                      :script-pubkey script-pubkey
-                      :witness-commitment-script (%witness-commitment-script-for-txs txs)))
-           (all-txs (cons coinbase txs))
-           (merkle (bitcoin-lisp.validation:compute-merkle-root
-                    (mapcar #'bitcoin-lisp.serialization:transaction-hash all-txs)))
-           (header (bitcoin-lisp.serialization:make-block-header
-                    :version (bitcoin-lisp.mining:block-template-version template)
-                    :prev-block (bitcoin-lisp.mining:block-template-prev-hash template)
-                    :merkle-root merkle
-                    :timestamp (bitcoin-lisp.mining:block-template-curtime template)
-                    :bits (bitcoin-lisp.mining:block-template-bits template)
-                    :nonce 0))
-           (block (bitcoin-lisp.serialization:make-bitcoin-block
-                   :header header :transactions all-txs)))
-      ;; TestBlockValidity before mining (Core rpc/mining.cpp:389-393): a
-      ;; consensus-invalid tx list errors instead of producing a doomed block.
-      (multiple-value-bind (ok reason)
-          (bitcoin-lisp.validation:test-block-validity
-           block chain-state (rpc-get-utxo-set node))
-        (unless ok
-          (error 'rpc-error :code +rpc-verify-error+
-                            :message (format nil "TestBlockValidity failed: ~A" reason))))
+           ;; Node lock: mempool tx resolution, template assembly, and the
+           ;; TestBlockValidity dry run all read the tip + mempool and must
+           ;; see one consistent state; the nonce grind below runs OUTSIDE
+           ;; the lock (Core drops cs_main between CreateNewBlock and the
+           ;; grind too, rpc/mining.cpp) — a stale block fails activation.
+           (block
+             (with-node-lock (node)
+               (let* ((txs (mapcar (lambda (s) (%resolve-generateblock-tx node s)) txs-arg))
+                      (chain-state (rpc-get-chain-state node))
+                      (mempool (rpc-get-mempool node))
+                      ;; Reuse the assembler only for header fields (height/prev/
+                      ;; bits/version/time); its tx selection and coinbase value
+                      ;; are ignored.
+                      (template (bitcoin-lisp.mining:assemble-block-template chain-state mempool))
+                      (height (bitcoin-lisp.mining:block-template-height template))
+                      (coinbase (bitcoin-lisp.mining:build-coinbase-transaction
+                                 height
+                                 (bitcoin-lisp.validation:calculate-block-subsidy height)
+                                 :script-pubkey script-pubkey
+                                 :witness-commitment-script (%witness-commitment-script-for-txs txs)))
+                      (all-txs (cons coinbase txs))
+                      (merkle (bitcoin-lisp.validation:compute-merkle-root
+                               (mapcar #'bitcoin-lisp.serialization:transaction-hash all-txs)))
+                      (header (bitcoin-lisp.serialization:make-block-header
+                               :version (bitcoin-lisp.mining:block-template-version template)
+                               :prev-block (bitcoin-lisp.mining:block-template-prev-hash template)
+                               :merkle-root merkle
+                               :timestamp (bitcoin-lisp.mining:block-template-curtime template)
+                               :bits (bitcoin-lisp.mining:block-template-bits template)
+                               :nonce 0))
+                      (block (bitcoin-lisp.serialization:make-bitcoin-block
+                              :header header :transactions all-txs)))
+                 ;; TestBlockValidity before mining (Core rpc/mining.cpp:389-393): a
+                 ;; consensus-invalid tx list errors instead of producing a doomed block.
+                 (multiple-value-bind (ok reason)
+                     (bitcoin-lisp.validation:test-block-validity
+                      block chain-state (rpc-get-utxo-set node))
+                   (unless ok
+                     (error 'rpc-error :code +rpc-verify-error+
+                                       :message (format nil "TestBlockValidity failed: ~A" reason))))
+                 block))))
       (unless (bitcoin-lisp.mining:mine-block block)
         (error 'rpc-error :code +rpc-misc-error+ :message "Failed to find a valid nonce"))
-      (let ((hash-hex (hash-to-hex (bitcoin-lisp.serialization:block-header-hash header))))
+      (let ((hash-hex (hash-to-hex (bitcoin-lisp.serialization:block-header-hash
+                                    (bitcoin-lisp.serialization:bitcoin-block-header block)))))
         (if submit
             (multiple-value-bind (ok reason) (%activate-submitted-block node block)
               (unless (or ok (eq reason :weaker-chain))
@@ -3973,7 +4093,11 @@ Returns the height of the last pruned block."
     (unless (and (integerp target-height) (>= target-height 0))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid height parameter"))
-    (let* ((chain-state (rpc-get-chain-state node))
+    ;; Node lock: pruning rewrites the block store + pruned-height cursor
+    ;; the sync thread reads when serving/connecting blocks (Core
+    ;; pruneblockchain holds cs_main).
+    (with-node-lock (node)
+     (let* ((chain-state (rpc-get-chain-state node))
            (block-store (rpc-get-block-store node))
            (pruned (bitcoin-lisp.storage:prune-blocks-to-height
                     block-store chain-state target-height
@@ -3982,7 +4106,7 @@ Returns the height of the last pruned block."
                               pruned target-height)
       ;; Return the last pruned block height (matching Bitcoin Core).
       ;; Note: getblockchaininfo.pruneheight returns (1+ this) = first UNpruned block.
-      (bitcoin-lisp.storage:chain-state-pruned-height chain-state))))
+      (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))))
 
 ;;; --- BIP157/158 block filter RPCs ---
 

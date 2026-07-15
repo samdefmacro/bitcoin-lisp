@@ -838,6 +838,133 @@ the unbroadcast set, and no announcement is queued."
       (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
       (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer))))))
 
+(test rpc-testmempoolaccept-policy-script-reject-reason
+  "A consensus-valid but policy-invalid spend (CLEANSTACK: extra scriptSig
+push on a P2SH(OP_TRUE) coin) reports Core's TX_NOT_STANDARD reject-reason
+token \"mempool-script-verify-flag-failed\" (CheckInputScripts,
+validation.cpp:2117) through testmempoolaccept."
+  (multiple-value-bind (tx utxo mempool)
+      (%cleanstack-violation-fixture
+       (make-array 4 :element-type '(unsigned-byte 8)
+                     :initial-contents '(#x01 #x51 #x01 #x51))
+       :input-id 140)
+    (let ((node (%broadcast-test-node
+                 utxo mempool
+                 (bitcoin-lisp.storage:make-chain-state :best-height 100)
+                 (bitcoin-lisp.networking:make-peer :state :ready)))
+          (hex (bitcoin-lisp.crypto:bytes-to-hex
+                (bitcoin-lisp.serialization:serialize-transaction tx))))
+      (let ((r (first (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list hex))))))
+        (is (null (cdr (assoc "allowed" r :test #'string=))))
+        (is (string= "mempool-script-verify-flag-failed"
+                     (cdr (assoc "reject-reason" r :test #'string=))))))))
+
+;;; --- Wave 9D: RPC/mempool locking discipline ---
+
+(test rpc-mempool-mutators-hold-node-lock
+  "RPC handlers that mutate the mempool run under the node lock: while
+another thread holds it, prioritisetransaction blocks; once released it
+completes. (The sync loop's message handlers hold this same lock, so an
+unlocked RPC mutation would interleave with them.)"
+  (let* ((node (make-test-node))
+         (txid-hex (format nil "~64,'0d" 1))
+         (done (cons nil nil))
+         (thread nil))
+    (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+      (setf thread
+            (bt:make-thread
+             (lambda ()
+               (bitcoin-lisp.rpc::rpc-prioritisetransaction
+                node (list txid-hex 0 12345))
+               (setf (car done) t))
+             :name "rpc-lock-test"))
+      ;; Give the thread ample time to reach the lock acquisition: it must
+      ;; be blocked, not finished.
+      (sleep 0.3)
+      (is (null (car done))
+          "prioritisetransaction completed while the node lock was held elsewhere"))
+    ;; Lock released — the handler must now complete and take effect.
+    (bt:join-thread thread)
+    (is (eq t (car done)))
+    (is (= 12345 (gethash (bitcoin-lisp.rpc::parse-hex-hash txid-hex)
+                          (bitcoin-lisp.mempool:mempool-deltas
+                           (bitcoin-lisp::node-mempool node))
+                          0)))))
+
+(test rpc-concurrent-mempool-smoke
+  "Concurrency smoke: writer threads submit distinct P2SH(OP_TRUE) spends via
+rpc-sendrawtransaction while reader threads hammer getrawmempool (verbose),
+getmempoolinfo, and getprioritisedtransactions, and a prioritiser thread
+mutates the deltas table. With the node lock on every path this must finish
+with zero thread errors and every submitted tx in the pool exactly once."
+  (let* ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (chain-state (bitcoin-lisp.storage:make-chain-state :best-height 200))
+         (node (%broadcast-test-node utxo-set mempool chain-state
+                                     (bitcoin-lisp.networking:make-peer :state :ready)))
+         (n-txs 24)
+         (hexes '())
+         (txids '())
+         (errors (list nil))
+         (errors-lock (bt:make-lock "smoke-errors")))
+    ;; N distinct confirmed P2SH(OP_TRUE) funding coins and their spends.
+    (dotimes (i n-txs)
+      (let ((funding (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element (+ 50 i))))
+        (bitcoin-lisp.storage:add-utxo utxo-set funding 0 100000000
+                                       (%p2sh-optrue-spk) 1 :coinbase nil)
+        (let ((tx (%pkg-tx funding 0 99990000)))
+          (push (bitcoin-lisp.crypto:bytes-to-hex
+                 (bitcoin-lisp.serialization:serialize-transaction tx))
+                hexes)
+          (push (bitcoin-lisp.serialization:transaction-hash tx) txids))))
+    (flet ((guarded (fn)
+             (lambda ()
+               (handler-case (funcall fn)
+                 (error (e)
+                   (bt:with-lock-held (errors-lock)
+                     (push e (car errors))))))))
+      (let ((threads '()))
+        ;; 3 writers, 8 txs each.
+        (loop for chunk on hexes by (lambda (l) (nthcdr 8 l))
+              for batch = (subseq chunk 0 (min 8 (length chunk)))
+              do (push (bt:make-thread
+                        (guarded
+                         (let ((batch batch))
+                           (lambda ()
+                             (dolist (hex batch)
+                               (bitcoin-lisp.rpc::rpc-sendrawtransaction
+                                node (list hex))))))
+                        :name "smoke-writer")
+                       threads))
+        ;; 3 readers.
+        (dotimes (i 3)
+          (push (bt:make-thread
+                 (guarded
+                  (lambda ()
+                    (dotimes (j 40)
+                      (bitcoin-lisp.rpc::rpc-getrawmempool node (list t))
+                      (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)
+                      (bitcoin-lisp.rpc::rpc-getprioritisedtransactions node nil))))
+                 :name "smoke-reader")
+                threads))
+        ;; 1 prioritiser mutating the deltas table under the readers.
+        (push (bt:make-thread
+               (guarded
+                (lambda ()
+                  (dotimes (j 40)
+                    (bitcoin-lisp.rpc::rpc-prioritisetransaction
+                     node (list (format nil "~64,'0x" (+ j 1)) 0 100)))))
+               :name "smoke-prioritiser")
+              threads)
+        (mapc #'bt:join-thread threads)))
+    (is (null (car errors))
+        "concurrent RPC calls signalled: ~A" (car errors))
+    (is (= n-txs (bitcoin-lisp.mempool:mempool-count mempool)))
+    (dolist (txid txids)
+      (is-true (bitcoin-lisp.mempool:mempool-has mempool txid)))
+    (is (= n-txs (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))))
+
 (test rpc-getmempoolinfo-unbroadcastcount
   "getmempoolinfo reports the live unbroadcast set size (Core
 rpc/mempool.cpp:1047)."

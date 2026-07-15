@@ -99,6 +99,7 @@
                                (:file "psbt")
                                (:file "merkleproof")
                                (:file "rest")
+                               (:file "ui")
                                (:file "server")))
                  (:file "node"))))
   :in-order-to ((test-op (test-op "bitcoin-lisp/tests"))))
@@ -155,6 +156,8 @@
                              (:file "rpc-tests")
                              ;; Output descriptor engine (Core descriptor_tests.cpp vectors)
                              (:file "descriptor-tests")
+                             ;; Web UI serving + Origin-check tests (gui-plan P0)
+                             (:file "ui-tests")
                              ;; Mainnet support tests
                              (:file "mainnet-tests")
                              ;; Pruning tests
@@ -210,6 +213,9 @@
                              (:file "conn-type-tests")
                              ;; Low-work headers sync (anti-DoS presync/redownload)
                              (:file "headers-sync-tests")
+                             ;; Wave 9A: eclipse/DoS hardening (outbound accounting,
+                             ;; non-blocking send, addr rate limit, generic presync)
+                             (:file "eclipse-dos-tests")
                              ;; bitcoin.conf + CLI argument parsing
                              (:file "config-tests")
                              ;; SOCKS5 outbound proxy (-proxy) client
