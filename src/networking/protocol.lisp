@@ -709,14 +709,15 @@ and recurse on newly-accepted txs so a parent can unblock a whole chain."
           (let ((otx (bitcoin-lisp.mempool:orphan-tx pool otxid)))
             (when otx
               (let ((current-height (bitcoin-lisp.storage:current-height chain-state)))
-                (multiple-value-bind (valid error fee replaced)
+                (multiple-value-bind (valid error fee replaced sigops)
                     (bitcoin-lisp.validation:validate-transaction-for-mempool
                      otx utxo-set mempool current-height :chain-state chain-state)
                   (cond
                     (valid
                      (multiple-value-bind (result entry)
                          (bitcoin-lisp.mempool:accept-validated-tx
-                          mempool otxid otx fee current-height :replaced replaced)
+                          mempool otxid otx fee current-height
+                          :sigops sigops :replaced replaced)
                        (when (eq :ok result)
                          (bitcoin-lisp.mempool:orphan-remove pool otxid)
                          (when peers
@@ -782,7 +783,7 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                         (bitcoin-lisp:recent-reject-p recent-rejects txid))
                 (return-from handle-tx nil))
               ;; Validate for mempool
-              (multiple-value-bind (valid error fee replaced)
+              (multiple-value-bind (valid error fee replaced sigops)
                   (bitcoin-lisp.validation:validate-transaction-for-mempool
                    tx utxo-set mempool current-height :chain-state chain-state)
                 (unless valid
@@ -812,7 +813,8 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                 (when valid
                   (multiple-value-bind (result entry)
                       (bitcoin-lisp.mempool:accept-validated-tx
-                       mempool txid tx fee current-height :replaced replaced)
+                       mempool txid tx fee current-height
+                       :sigops sigops :replaced replaced)
                     (when (eq result :ok)
                       ;; Relay to other peers
                       (when peers

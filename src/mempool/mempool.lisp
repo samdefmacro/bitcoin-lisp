@@ -550,16 +550,20 @@ to-be-replaced conflict and re-run the RBF economics, instead of rejecting."
 (defun accept-validated-tx (mempool txid tx fee height
                             &key (entry-time
                                   (bitcoin-lisp.serialization:get-unix-time))
-                                 replaced defer-trim)
+                                 (sigops 0) replaced defer-trim)
   "The shared tail of every mempool acceptance path (peer tx handler,
 orphan cascade, sendrawtransaction, mempool.dat reload, reorg re-add,
 submitpackage): evict the BIP125 REPLACED txids, build the entry for TX,
-add it. Caller has already run validate-transaction-for-mempool. Returns
-(values result entry) where RESULT is mempool-add's keyword.
-DEFER-TRIM is threaded to MEMPOOL-ADD (reorg re-add, package submission)."
+add it. Caller has already run validate-transaction-for-mempool and passes
+the weighted SIGOPS cost it computed (Core threads the same value from
+PreChecks into the entry, validation.cpp:935) — without it the block
+assembler's sigop budget is vacuous. Returns (values result entry) where
+RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
+(reorg re-add, package submission)."
   (dolist (rt replaced)
     (mempool-remove-recursive mempool rt))
-  (let ((entry (make-entry-from-tx tx (or fee 0) height :entry-time entry-time)))
+  (let ((entry (make-entry-from-tx tx (or fee 0) height
+                                   :sigops sigops :entry-time entry-time)))
     (values (mempool-add mempool txid entry :defer-trim defer-trim)
             entry)))
 

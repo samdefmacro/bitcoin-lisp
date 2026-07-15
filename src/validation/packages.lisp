@@ -140,7 +140,8 @@ DAG). Returns (values ok-p reason)."
 PACKAGE, so a later package tx's input that spends an earlier sibling's output
 resolves during the package-feerate phase (Core's CCoinsViewMemPool layered over
 the package). Consulted only as a fallback, after the confirmed UTXO set and the
-real mempool."
+real mempool. HEIGHT is the height these unconfirmed outputs are assumed to
+confirm at — the next block (tip+1) — which is what BIP68 evaluates against."
   (let ((coins (make-hash-table :test 'equalp)))
     (dolist (tx package coins)
       (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
@@ -166,17 +167,18 @@ real mempool."
   (setf (package-tx-result-status res) :invalid
         (package-tx-result-error res) reason))
 
-(defun %accept-into-mempool (tx txid fee height now mempool rset replaced)
+(defun %accept-into-mempool (tx txid fee sigops height now mempool rset replaced)
   "Record the RBF-replaced txs in RSET into the REPLACED hash-set, then run
-the shared evict+add tail. Returns the mempool-add result keyword. The
-per-add byte-cap trim is deferred (Core package_submission,
-validation.cpp:1393): validate-package-for-mempool re-limits once at the
-end, like Core's AcceptPackage (validation.cpp:1728)."
+the shared evict+add tail (recording the weighted SIGOPS cost on the entry).
+Returns the mempool-add result keyword. The per-add byte-cap trim is
+deferred (Core package_submission, validation.cpp:1393):
+validate-package-for-mempool re-limits once at the end, like Core's
+AcceptPackage (validation.cpp:1728)."
   (dolist (rt rset)
     (setf (gethash rt replaced) t))
   (values (bitcoin-lisp.mempool:accept-validated-tx
-           mempool txid tx fee height :entry-time now :replaced rset
-           :defer-trim t)))
+           mempool txid tx fee height :entry-time now :sigops sigops
+           :replaced rset :defer-trim t)))
 
 (defun %results-not-validated (package reason)
   "A not-validated result for every tx in PACKAGE — used when a context-free
@@ -190,11 +192,11 @@ package check fails before any tx is processed."
           package))
 
 (defstruct (%pkg-val (:constructor %make-pkg-val
-                         (tx txid wtxid fee vsize rset modified-fee)))
+                         (tx txid wtxid fee vsize sigops rset modified-fee)))
   "Validation record for one member of a package subset — the Lisp analogue
 of the per-tx Workspace fields Core's package layer reads back (m_ptx,
-m_base_fees, m_vsize, m_modified_fees, the replaced set)."
-  tx txid wtxid fee vsize rset modified-fee)
+m_base_fees, m_vsize, m_sigops_cost, m_modified_fees, the replaced set)."
+  tx txid wtxid fee vsize sigops rset modified-fee)
 
 (defun %package-rbf-checks (txns validated mempool conflicts)
   "Core PackageRBFChecks (validation.cpp:1034-1130) for a multi-tx subset
@@ -223,7 +225,8 @@ passed and REPLACED-SET (a txid hash-set) is what the package evicts."
              (values nil rset)
              (values reason nil)))))))
 
-(defun %accept-package-subset (txns utxo-set mempool height pkg-coins now results replaced)
+(defun %accept-package-subset (txns utxo-set mempool chain-state height
+                               pkg-coins now results replaced)
   "Validate the deferred TXNS (topologically ordered) as a unit at the package
 feerate and, if they clear the mempool's effective minimum, submit them all
 parents-first. Updates the RESULTS table (wtxid -> package-tx-result) and the
@@ -242,12 +245,16 @@ as Core's AcceptMultipleTransactions does (validation.cpp:1513-1516)."
     ;; Validate each with the per-tx fee floor skipped and the package's own
     ;; outputs available, so a child can spend a still-unconfirmed parent.
     ;; Fee-based policy below runs on the returned MODIFIED fee, like Core's
-    ;; m_total_modified_fees (validation.cpp:1496-1499).
+    ;; m_total_modified_fees (validation.cpp:1496-1499). CHAIN-STATE keeps
+    ;; the finality/BIP68 checks on: Core's PreChecks runs them for package
+    ;; members like any other tx (validation.cpp:819,886-889), so a non-final
+    ;; member fails the whole package instead of riding in on CPFP.
     (dolist (tx txns)
       (let ((wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
-        (multiple-value-bind (valid err fee rset modified-fee conflicts)
+        (multiple-value-bind (valid err fee rset sigops modified-fee conflicts)
             (validate-transaction-for-mempool tx utxo-set mempool height
                                               :package-coins pkg-coins
+                                              :chain-state chain-state
                                               :skip-fee-check t
                                               :skip-rbf-check package-eval)
           (unless valid
@@ -260,7 +267,7 @@ as Core's AcceptMultipleTransactions does (validation.cpp:1513-1516)."
           (push (%make-pkg-val tx (bitcoin-lisp.serialization:transaction-hash tx)
                                wtxid (or fee 0)
                                (bitcoin-lisp.serialization:transaction-vsize tx)
-                               rset modified-fee)
+                               sigops rset modified-fee)
                 validated))))
     (setf validated (nreverse validated))
     (flet ((fail-all (reason)
@@ -296,6 +303,7 @@ as Core's AcceptMultipleTransactions does (validation.cpp:1513-1516)."
         (dolist (v validated :success)
           (let ((add-result (%accept-into-mempool
                              (%pkg-val-tx v) (%pkg-val-txid v) (%pkg-val-fee v)
+                             (%pkg-val-sigops v)
                              height now mempool (%pkg-val-rset v) replaced))
                 (res (gethash (%pkg-val-wtxid v) results)))
             (if (eq add-result :ok)
@@ -360,11 +368,15 @@ Returns (values msg results replaced):
                      (package-tx-result-other-wtxid res)
                      (and e (bitcoin-lisp.mempool:mempool-entry-wtxid e)))))
             (t
-             (multiple-value-bind (valid err fee rset)
-                 (validate-transaction-for-mempool tx utxo-set mempool height)
+             ;; CHAIN-STATE keeps the finality/BIP68 checks on (Core PreChecks
+             ;; runs them for every package member, validation.cpp:819,886-889).
+             (multiple-value-bind (valid err fee rset sigops)
+                 (validate-transaction-for-mempool tx utxo-set mempool height
+                                                   :chain-state chain-state)
                (cond
                  (valid
-                  (let ((add-result (%accept-into-mempool tx txid fee height now
+                  (let ((add-result (%accept-into-mempool tx txid fee sigops
+                                                          height now
                                                           mempool rset replaced)))
                     (if (eq add-result :ok)
                         (let ((vsize (bitcoin-lisp.serialization:transaction-vsize tx)))
@@ -388,8 +400,12 @@ Returns (values msg results replaced):
       ;;    coin view is only needed here, so build it lazily.
       (setf deferred (nreverse deferred))
       (when (and (not quit-early) deferred)
-        (let ((msg (%accept-package-subset deferred utxo-set mempool height
-                                           (%build-package-coins package height)
+        ;; Package-sibling coins are unconfirmed, so they carry the
+        ;; next-block height for BIP68, like mempool-extra-coins (Core
+        ;; MEMPOOL_HEIGHT -> tip+1, validation.cpp:185-192).
+        (let ((msg (%accept-package-subset deferred utxo-set mempool chain-state
+                                           height
+                                           (%build-package-coins package (1+ height))
                                            now results replaced)))
           (unless (eq msg :success)
             (setf fail-reason (or fail-reason msg)))))
