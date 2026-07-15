@@ -909,10 +909,13 @@ Each entry is a list (net-addr network-id timestamp)."
 
 (defun parse-addrv2-payload (payload)
   "Parse an addrv2 message payload.
-Returns a list of (net-addr timestamp network-id) entries for all usable
-addresses (IPv4/IPv6/TORv3/I2P/CJDNS). Unknown network ids are skipped
-without failing the message (BIP155); a recognized network id with a
-wrong address length signals an error (Core rejects the whole message)."
+Returns (VALUES entries announced-count): ENTRIES a list of
+(net-addr timestamp network-id) for all usable addresses
+(IPv4/IPv6/TORv3/I2P/CJDNS), ANNOUNCED-COUNT the message's declared address
+count — which can exceed (length entries), since unknown network ids are
+skipped without failing the message (BIP155) yet still count toward Core's
+vAddr.size() gates. A recognized network id with a wrong address length
+signals an error (Core rejects the whole message)."
   (flexi-streams:with-input-from-sequence (stream payload)
     (let ((count (read-bounded-count stream +max-addr-count+ "addrv2"))
           (results '()))
@@ -921,7 +924,7 @@ wrong address length signals an error (Core rejects the whole message)."
                    (read-net-addr-v2 stream)
                  (when addr
                    (push (list addr timestamp network-id) results))))
-      (nreverse results))))
+      (values (nreverse results) count))))
 
 ;;;; ============================================================
 ;;;; BIP 157 compact block filter serving (getcfilters / getcfheaders /

@@ -1062,6 +1062,12 @@
    #:close-connection
    #:send-bytes
    #:receive-bytes
+   ;; Non-blocking send buffer (Core vSendMsg / fPauseSend / SocketSendData)
+   #:connection-send-paused-p
+   #:connection-send-stalled-p
+   #:flush-send-buffer
+   #:flush-peer-send-buffers
+   #:+max-send-buffer-bytes+
    ;; BIP324 v2 transport
    #:*v2-transport-enabled*
    #:v2-available-p
@@ -1148,6 +1154,7 @@
    #:ip-netgroup
    ;; Protocol
    #:handle-message
+   #:ingest-headers-from-peer
    #:request-headers
    #:request-blocks
    #:sync-with-peer
@@ -1254,6 +1261,7 @@
    #:peer-prefers-headers
    #:peer-feefilter-rate
    #:peer-wtxid-relay
+   #:handle-addr
    #:handle-addrv2
    ;; Misbehavior and banning
    #:record-misbehavior
