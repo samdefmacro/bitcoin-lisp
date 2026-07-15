@@ -4,6 +4,36 @@
 ;;;
 ;;; These functions acquire the node lock before accessing state,
 ;;; ensuring safe concurrent access from RPC handler threads.
+;;;
+;;; LOCKING DISCIPLINE. The node has ONE state lock — the recursive
+;;; node-lock — guarding the chainstates list, each chainstate's tip/index/
+;;; coins view, the mempool (entries, txgraph, deltas, unbroadcast set,
+;;; orphan pool), and the peer list. It is our single-lock analogue of
+;;; Core's cs_main + pool.cs pair. The P2P sync thread holds it around
+;;; every message handler that touches shared state (networking's
+;;; WITH-NODE-LOCK, protocol.lisp:7); RPC handler threads run concurrently
+;;; on hunchentoot worker threads, so every RPC that MUTATES that state —
+;;; or wants a torn-free consistent read of it — must hold the same lock
+;;; for the whole operation, not just while fetching the object reference
+;;; (which is all the accessors below do).
+;;;
+;;; Lock ORDERING (deadlock freedom): the node-lock is the OUTERMOST lock.
+;;; Code holding it may take leaf locks (per-connection send locks,
+;;; *tx-request-lock*, *ban-lock*, *log-buffer-lock*, SBCL's synchronized
+;;; sig-cache tables); no code path acquires the node-lock while holding
+;;; any of those, so the ordering is acyclic. The lock is recursive, so a
+;;; locked RPC body may freely call helpers that re-acquire it
+;;; (broadcast-transaction-to-peers, the mining assembler's chunk walk,
+;;; these accessors). Long-polling RPCs (waitfornewblock/waitforblock*)
+;;; must NEVER hold it across their sleep loops — the sync thread needs it
+;;; to advance the tip they are waiting on.
+
+(defmacro with-node-lock ((node) &body body)
+  "Execute BODY holding NODE's recursive state lock. Use around any RPC
+handler section that mutates — or must consistently read — the mempool,
+chainstate, or peer list (see the locking discipline above)."
+  `(bt:with-recursive-lock-held ((bitcoin-lisp::node-lock ,node))
+     ,@body))
 
 (defun rpc-get-chain-state (node)
   "Get the current (active) chainstate with lock protection. RPC reports the

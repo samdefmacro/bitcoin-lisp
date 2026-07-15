@@ -852,7 +852,11 @@ from-genesis IBD the validated tip sits below the work floor, so
 process-headers' own gate is off and unbounded cheap headers could be
 committed to the index from announcements."
   (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-    (ingest-headers-from-peer peer headers chain-state)))
+    ;; Node lock: process-headers (inside ingest-headers-from-peer) mutates
+    ;; the block index, which the RPC threads (submitheader, chain queries)
+    ;; also touch under this lock — the same discipline handle-block follows.
+    (with-node-lock
+      (ingest-headers-from-peer peer headers chain-state))))
 
 ;;; Block handling
 
