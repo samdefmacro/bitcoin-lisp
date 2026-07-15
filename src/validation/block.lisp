@@ -1592,6 +1592,13 @@ Handles chain reorganizations when a competing chain has more work."
              (bitcoin-lisp.mempool:mempool-expire mempool)
              (bitcoin-lisp.mempool:orphan-expire
               (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
+           ;; Core resets the recent-rejects filter on EVERY active tip change,
+           ;; not just reorgs: cached failures (non-final, too-low-fee, missing
+           ;; inputs) can become valid at the next block (ActiveTipChange,
+           ;; net_processing.cpp:2045-2059 -> txdownloadman_impl.cpp:92-96
+           ;; RecentRejectsFilter().reset()). Previously only the reorg path
+           ;; cleared it.
+           (bitcoin-lisp:clear-recent-rejects recent-rejects)
            (bitcoin-lisp:maybe-periodic-flush chain-state)
            ;; Automatic block pruning after connecting a new block; each
            ;; pruned block's undo file goes with it.

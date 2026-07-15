@@ -303,8 +303,11 @@ Returns T if added, NIL if already present."
         t))))
 
 (defun clear-recent-rejects (filter)
-  "Clear all entries from the rejects filter."
-  (when filter
+  "Clear all entries from the rejects filter. O(1) when already empty — the
+filter is now cleared on every block connect (Core ActiveTipChange resets
+RecentRejectsFilter on every tip change), which during IBD would otherwise
+wipe a 50k-slot ring per block for nothing."
+  (when (and filter (plusp (hash-table-count (recent-rejects-table filter))))
     (clrhash (recent-rejects-table filter))
     (let ((ring (recent-rejects-ring filter)))
       (dotimes (i (length ring))

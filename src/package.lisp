@@ -820,6 +820,11 @@
    #:mempool-entry-modified-fee
    #:mempool-deltas
    #:mempool-prioritise
+   #:mempool-unbroadcast
+   #:mempool-add-unbroadcast
+   #:mempool-remove-unbroadcast
+   #:mempool-unbroadcast-txids
+   #:mempool-unbroadcast-count
    #:mempool-dat-path
    #:save-mempool-file
    #:read-mempool-file
@@ -1096,6 +1101,11 @@
    #:tx-request-received
    ;; Trickled tx announcement flushing
    #:flush-tx-announcements
+   ;; Local-submission broadcast (unbroadcast set)
+   #:announce-mempool-tx
+   #:reattempt-initial-broadcast
+   #:maybe-reattempt-initial-broadcast
+   #:reset-initial-broadcast-schedule
    ;; Peer
    #:peer
    #:make-peer

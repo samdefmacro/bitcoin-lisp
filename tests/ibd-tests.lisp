@@ -1402,6 +1402,223 @@ since wtxid = txid there."
     (is-true (bitcoin-lisp:recent-reject-p rejects wtxid))
     (is-false (bitcoin-lisp:recent-reject-p rejects txid))))
 
+;;;; Wave 8A: tx-relay request path (orphan-parent fetch, failover id type,
+;;;; reject-poisoning semantics) — Core txdownloadman/txrequest parity.
+
+(defun %wave8-witness-peer (&optional (state :ready))
+  "A :ready peer advertising NODE_WITNESS, like every modern Core peer."
+  (bitcoin-lisp.networking:make-peer
+   :address "test" :state state
+   :services bitcoin-lisp.serialization:+node-witness+))
+
+(defun %wave8-p2pkh-script ()
+  "A well-formed (garbage-hash) P2PKH scriptPubKey."
+  (let ((s (make-array 25 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
+          (aref s 23) #x88 (aref s 24) #xac)
+    s))
+
+(defun %wave8-tx (&key (prev-id #xAA) (prev-index 0) (value 50000000)
+                       (script-sig #()) witness)
+  "A standard v2 tx spending <PREV-ID-filled hash>:PREV-INDEX to a P2PKH
+output. WITNESS, when true, attaches a one-element witness stack so
+wtxid /= txid."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element prev-id)
+                                      :index prev-index)
+                    :script-sig (coerce script-sig '(vector (unsigned-byte 8)))
+                    :sequence #xFFFFFFFF))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value value
+                     :script-pubkey (%wave8-p2pkh-script)))
+   :lock-time 0
+   :witness (when witness
+              (vector (list (make-array 8 :element-type '(unsigned-byte 8)
+                                          :initial-element 7))))))
+
+(test tx-request-failover-preserves-announcement-id-type
+  "The tracker remembers whether each entry was announced by wtxid (MSG_WTX)
+or txid, and a timed-out request fails over with the SAME id type: wtxid
+entries as MSG_WTX, txid entries as MSG_TX|witness-flag (Core txrequest
+GenTxid + net_processing.cpp:6207). Regression: failover used to re-request
+EVERYTHING as MSG_WITNESS_TX, which Core interprets as a TXID lookup — a
+wtxid hash got notfound and failover never worked for segwit txs."
+  (bitcoin-lisp.networking:reset-tx-requests)
+  (let ((wtxid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 41))
+        (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 42))
+        (p1 (%wave8-witness-peer))
+        (p2 (%wave8-witness-peer)))
+    ;; One wtxid-based and one txid-based announcement, two candidates each.
+    (is-true (bitcoin-lisp.networking::tx-request-wanted-p wtxid p1 t))
+    (is-false (bitcoin-lisp.networking::tx-request-wanted-p wtxid p2 t))
+    (is-true (bitcoin-lisp.networking::tx-request-wanted-p txid p1 nil))
+    (is-false (bitcoin-lisp.networking::tx-request-wanted-p txid p2 nil))
+    ;; Backdate both in-flight entries past the timeout to force failover.
+    (let ((stale (- (get-internal-real-time)
+                    (* 120 internal-time-units-per-second))))
+      (setf (gethash wtxid bitcoin-lisp.networking::*tx-in-flight*) (cons p1 stale))
+      (setf (gethash txid bitcoin-lisp.networking::*tx-in-flight*) (cons p1 stale)))
+    (is (= 2 (bitcoin-lisp.networking::retry-timed-out-tx-requests)))
+    ;; Both rerouted to p2 with the id type preserved.
+    (is (eq p2 (car (gethash wtxid bitcoin-lisp.networking::*tx-in-flight*))))
+    (is (eq p2 (car (gethash txid bitcoin-lisp.networking::*tx-in-flight*))))
+    (is-true (gethash wtxid bitcoin-lisp.networking::*tx-request-wtxid-p*))
+    (is-false (gethash txid bitcoin-lisp.networking::*tx-request-wtxid-p*))
+    ;; The inv the failover getdata carries for each entry type:
+    (is (= bitcoin-lisp.serialization:+inv-type-wtx+
+           (bitcoin-lisp.serialization:inv-vector-type
+            (bitcoin-lisp.networking::tx-request-inv wtxid t p2))))
+    (is (= bitcoin-lisp.serialization:+inv-type-witness-tx+
+           (bitcoin-lisp.serialization:inv-vector-type
+            (bitcoin-lisp.networking::tx-request-inv txid nil p2))))
+    ;; A peer without NODE_WITNESS gets bare MSG_TX for txid entries
+    ;; (Core GetFetchFlags returns no witness flag for it).
+    (is (= bitcoin-lisp.serialization:+inv-type-tx+
+           (bitcoin-lisp.serialization:inv-vector-type
+            (bitcoin-lisp.networking::tx-request-inv
+             txid nil (%make-peer-with-state :ready)))))
+    (bitcoin-lisp.networking:reset-tx-requests)))
+
+(test orphan-parent-getdata-carries-witness-flag
+  "Missing parents of an orphan are requested by TXID with the witness flag
+(MSG_TX|MSG_WITNESS_FLAG) for witness-capable peers, never bare MSG_TX
+(Core requests txid announcements as MSG_TX | GetFetchFlags,
+net_processing.cpp:6207; orphan parents enter the tracker via
+MaybeAddOrphanResolutionCandidate, txdownloadman_impl.cpp:257-260).
+Regression: bare MSG_TX fetched the witness-stripped parent, which failed
+scripts and — wtxid == txid for a stripped tx — poisoned recent-rejects
+with the parent's real txid, so the orphan could never resolve."
+  (bitcoin-lisp.networking:reset-tx-requests)
+  (let* ((utxo (bitcoin-lisp.storage:make-utxo-set))
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (orphan (%wave8-tx :prev-id #xB1))
+         (peer (%wave8-witness-peer))
+         (parents (bitcoin-lisp.networking::missing-parent-txids orphan utxo mempool)))
+    (is (= 1 (length parents)))
+    (let ((invs (bitcoin-lisp.networking::request-orphan-parents peer parents)))
+      (is (= 1 (length invs)))
+      (is (= bitcoin-lisp.serialization:+inv-type-witness-tx+
+             (bitcoin-lisp.serialization:inv-vector-type (first invs))))
+      (is (equalp (first parents)
+                  (bitcoin-lisp.serialization:inv-vector-hash (first invs)))))
+    ;; The parent request is registered with the tx-request tracker (txid-
+    ;; based), so another announcer doesn't trigger a duplicate getdata and
+    ;; timeout failover applies to parent fetches too.
+    (is-false (bitcoin-lisp.networking::tx-request-wanted-p
+               (first parents) (%make-peer-with-state :ready)))
+    (is-false (gethash (first parents)
+                       bitcoin-lisp.networking::*tx-request-wtxid-p*))
+    (bitcoin-lisp.networking:reset-tx-requests)))
+
+(test orphan-with-rejected-parent-rejected-under-both-ids
+  "A tx with missing inputs whose missing parent is already in recent-rejects
+is NOT kept as an orphan: it is rejected outright under BOTH its txid and
+wtxid, and no parent fetch goes out (Core 'not keeping orphan with rejected
+parents', txdownloadman_impl.cpp:422-436)."
+  (bitcoin-lisp.networking:reset-tx-requests)
+  (let* ((utxo (bitcoin-lisp.storage:make-utxo-set))
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%wave8-witness-peer))
+         (rejects (bitcoin-lisp:make-rejects-filter 100))
+         (tx (%wave8-tx :prev-id #xB2 :witness t))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
+         (parent-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element #xB2))
+         (payload (subseq (bitcoin-lisp.serialization:make-tx-message tx :witness t) 24)))
+    (is-false (equalp txid wtxid))
+    ;; The missing parent was recently rejected.
+    (bitcoin-lisp:add-recent-reject rejects parent-txid)
+    (bitcoin-lisp.networking::handle-tx peer payload utxo mempool state nil
+                                        :recent-rejects rejects)
+    ;; Rejected under both ids; never admitted to the orphan pool; the
+    ;; parent was NOT re-requested.
+    (is-true (bitcoin-lisp:recent-reject-p rejects txid))
+    (is-true (bitcoin-lisp:recent-reject-p rejects wtxid))
+    (is-false (bitcoin-lisp.mempool:orphan-tx
+               (bitcoin-lisp.mempool:mempool-orphan-pool mempool) txid))
+    (is (zerop (hash-table-count bitcoin-lisp.networking::*tx-in-flight*)))
+    (bitcoin-lisp.networking:reset-tx-requests)))
+
+(test orphan-with-unrejected-parent-is-kept-and-parent-fetched
+  "The healthy counterpart: a missing-inputs tx whose parents are NOT
+rejected goes into the orphan pool, its parent fetch is tracker-registered,
+and the tx itself is not cached as a reject."
+  (bitcoin-lisp.networking:reset-tx-requests)
+  (let* ((utxo (bitcoin-lisp.storage:make-utxo-set))
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%wave8-witness-peer))
+         (rejects (bitcoin-lisp:make-rejects-filter 100))
+         (tx (%wave8-tx :prev-id #xB3 :witness t))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (parent-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element #xB3))
+         (payload (subseq (bitcoin-lisp.serialization:make-tx-message tx :witness t) 24)))
+    (bitcoin-lisp.networking::handle-tx peer payload utxo mempool state nil
+                                        :recent-rejects rejects)
+    (is-true (bitcoin-lisp.mempool:orphan-tx
+              (bitcoin-lisp.mempool:mempool-orphan-pool mempool) txid))
+    (is-false (bitcoin-lisp:recent-reject-p rejects txid))
+    (is-false (bitcoin-lisp:recent-reject-p
+               rejects (bitcoin-lisp.serialization:transaction-wtxid tx)))
+    ;; Parent fetch registered as a txid-based tracker entry.
+    (is-false (bitcoin-lisp.networking::tx-request-wanted-p
+               parent-txid (%make-peer-with-state :ready)))
+    (bitcoin-lisp.networking:reset-tx-requests)))
+
+(test witness-stripped-failure-not-cached-in-recent-rejects
+  "A no-witness tx that fails scripts while spending a witness-program
+output is classified witness-stripped and cached NOWHERE — its wtxid equals
+its txid, so caching would poison the real witnessed tx's txid and block its
+relay permanently (Core TX_WITNESS_STRIPPED, txdownloadman_impl.cpp:438-439,
+classified by validation.cpp:1143-1148 SpendsNonAnchorWitnessProg). A
+genuinely failing non-witness-program spend IS still cached (wtxid-keyed)."
+  (bitcoin-lisp.networking:reset-tx-requests)
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp:*minimum-chain-work-override* nil)
+         (now (bitcoin-lisp.serialization:get-unix-time))
+         (state (%make-ibd-latch-state now))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (peer (%wave8-witness-peer))
+         (rejects (bitcoin-lisp:make-rejects-filter 100))
+         ;; Coin 1: P2WPKH (a witness program).
+         (p2wpkh (let ((s (make-array 22 :element-type '(unsigned-byte 8)
+                                         :initial-element 0)))
+                   (setf (aref s 0) #x00 (aref s 1) #x14)
+                   s))
+         (stripped (%wave8-tx :prev-id #xC1))   ; no witness attached
+         (stripped-id (bitcoin-lisp.serialization:transaction-hash stripped))
+         ;; Coin 2: P2PKH — witness stripping cannot explain this failure.
+         (failing (%wave8-tx :prev-id #xC2 :script-sig (vector #x51)))
+         (failing-id (bitcoin-lisp.serialization:transaction-hash failing)))
+    (bitcoin-lisp.storage:add-utxo
+     utxo (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xC1)
+     0 100000000 p2wpkh 0)
+    (bitcoin-lisp.storage:add-utxo
+     utxo (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xC2)
+     0 100000000 (%wave8-p2pkh-script) 0)
+    ;; Sanity: wtxid == txid for both (no witness), the poisoning precondition.
+    (is (equalp stripped-id (bitcoin-lisp.serialization:transaction-wtxid stripped)))
+    (bitcoin-lisp.networking::handle-tx
+     peer (subseq (bitcoin-lisp.serialization:make-tx-message stripped) 24)
+     utxo mempool state nil :recent-rejects rejects)
+    (bitcoin-lisp.networking::handle-tx
+     peer (subseq (bitcoin-lisp.serialization:make-tx-message failing) 24)
+     utxo mempool state nil :recent-rejects rejects)
+    ;; The plain script failure IS cached (proves this fixture reaches the
+    ;; reject-insert path)...
+    (is-true (bitcoin-lisp:recent-reject-p rejects failing-id))
+    ;; ...but the witness-stripped one is NOT.
+    (is-false (bitcoin-lisp:recent-reject-p rejects stripped-id))
+    (bitcoin-lisp.networking:reset-tx-requests)))
+
 (test bip35-mempool-message-disconnects
   "BIP35 'mempool' requests get a disconnect: we never advertise
 NODE_BLOOM, matching Core's no-bloom path (net_processing.cpp:4940-4951)."
@@ -1471,6 +1688,83 @@ m_tx_inventory_to_send the same way)."
     (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
     (is-false (bitcoin-lisp:recent-reject-p
                (bitcoin-lisp.networking:peer-announced-txs peer) txid))))
+
+;;;; Initial broadcast of locally-submitted txs (unbroadcast set)
+
+(test getdata-serving-clears-unbroadcast
+  "Serving a tx from the mempool in response to a getdata removes it from
+the unbroadcast set — the propagation signal (Core ProcessGetData,
+net_processing.cpp:2550). An unrelated getdata leaves the set alone."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (%witness-tx-for-relay))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (peer (bitcoin-lisp.networking:make-peer :state :ready))
+         (other (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (%add-tx mempool tx)
+    (is-true (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid))
+    (flet ((getdata-payload (hash)
+             (subseq (bitcoin-lisp.serialization:make-getdata-message
+                      (list (bitcoin-lisp.serialization:make-inv-vector
+                             :type bitcoin-lisp.serialization:+inv-type-witness-tx+
+                             :hash hash)))
+                     24)))
+      ;; A request for some OTHER tx (not served) doesn't clear ours.
+      (bitcoin-lisp.networking::handle-getdata peer (getdata-payload other) nil mempool)
+      (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+      ;; A request for the unbroadcast tx clears it.
+      (bitcoin-lisp.networking::handle-getdata peer (getdata-payload txid) nil mempool)
+      (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))))))
+
+(test reattempt-initial-broadcast-relays-only-in-mempool
+  "The re-announcement pass queues invs for unbroadcast txs still in the
+pool and drops ids whose tx has left it (Core ReattemptInitialBroadcast,
+net_processing.cpp:1625-1643)."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (%witness-tx-for-relay))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (stale (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
+         (peer (bitcoin-lisp.networking:make-peer :state :ready :wtxid-relay t)))
+    (%add-tx mempool tx)
+    (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+    ;; Simulate a stale id (tx evicted after a crash-restore of the set):
+    ;; poke the table directly — the public adder refuses non-members.
+    (setf (gethash stale (bitcoin-lisp.mempool:mempool-unbroadcast mempool)) t)
+    (bitcoin-lisp.networking:reattempt-initial-broadcast (list peer) mempool)
+    ;; The live tx was queued for announcement (wtxid rides along)...
+    (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+    (destructuring-bind (qtxid qwtxid fee-rate-per-kb)
+        (first (bitcoin-lisp.networking::peer-tx-inv-queue peer))
+      (declare (ignore fee-rate-per-kb))
+      (is (equalp txid qtxid))
+      (is (equalp (bitcoin-lisp.serialization:transaction-wtxid tx) qwtxid)))
+    ;; ...and stays tracked until a getdata confirms; the stale id is gone.
+    (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+    (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool)))))
+
+(test maybe-reattempt-initial-broadcast-schedule
+  "First call only arms the 10-15min timer (Core schedules the first pass a
+full interval out, net_processing.cpp:2036-2038); once the deadline passes,
+the pass runs and the timer re-arms."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (%witness-tx-for-relay))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    (%add-tx mempool tx)
+    (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
+    (bitcoin-lisp.networking:reset-initial-broadcast-schedule)
+    ;; Arm pass: nothing queued yet.
+    (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast (list peer) mempool)
+    (is (plusp bitcoin-lisp.networking::*next-initial-broadcast-time*))
+    (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+    ;; Deadline in the past: the pass runs and re-arms.
+    (setf bitcoin-lisp.networking::*next-initial-broadcast-time* 1)
+    (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast (list peer) mempool)
+    (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+    (is (> bitcoin-lisp.networking::*next-initial-broadcast-time* 1))
+    (bitcoin-lisp.networking:reset-initial-broadcast-schedule)))
 
 ;;;; Erlay P1: BIP330 sendtxrcncl handshake (Core-parity: handshake only)
 

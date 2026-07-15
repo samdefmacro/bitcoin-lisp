@@ -307,6 +307,37 @@ a confirmed P2SH(OP_TRUE) output of FUND-VALUE that test parents spend."
         ;; each entry is (wtxid-hex . field-alist) carrying at least a txid
         (is-true (every (lambda (e) (assoc "txid" (cdr e) :test #'string=)) tx-results))))))
 
+(test rpc-submitpackage-broadcasts-accepted-members
+  "submitpackage queues an announcement for every package member that made
+it into the mempool (Core rpc/mempool.cpp:1423-1444 runs
+BroadcastTransaction per accepted tx). The members are NOT added to the
+unbroadcast set: they are already in the pool when broadcast runs, so
+Core's already-in-mempool branch (node/transaction.cpp:63-72) relays
+without AddUnbroadcastTx — matched exactly."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (let* ((node (bitcoin-lisp::make-node :network :testnet3))
+           (peer (bitcoin-lisp.networking:make-peer :state :ready))
+           (parent (%pkg-tx funding-txid 0 (- 100000000 50)))
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (child (%pkg-tx pid 0 (- (- 100000000 50) 50000)))
+           (phex (bitcoin-lisp.crypto:bytes-to-hex
+                  (bitcoin-lisp.serialization:serialize-transaction parent)))
+           (chex (bitcoin-lisp.crypto:bytes-to-hex
+                  (bitcoin-lisp.serialization:serialize-transaction child))))
+      (setf (bitcoin-lisp::node-chain-state node) chain-state
+            (bitcoin-lisp::node-utxo-set node) utxo-set
+            (bitcoin-lisp::node-mempool node) mempool
+            (bitcoin-lisp::node-peers node) (list peer))
+      (let ((result (bitcoin-lisp.rpc::rpc-submitpackage node (list (list phex chex)))))
+        (is (string= "success" (cdr (assoc "package_msg" result :test #'string=)))))
+      ;; Both members queued for announcement to the relay peer.
+      (let ((queued (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+        (is (= 2 (length queued)))
+        (is-true (find pid queued :key #'first :test #'equalp))
+        (is-true (find (bitcoin-lisp.serialization:transaction-hash child)
+                       queued :key #'first :test #'equalp)))
+      (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))))))
+
 (test single-tx-in-sub-1-satvb-band-accepted
   "A lone tx paying ~0.5 sat/vB -- inside the 0.1..1.0 sat/vB band Core relays --
 is accepted under the 100 sat/kvB floor (the old 1 sat/vB integer floor rejected
