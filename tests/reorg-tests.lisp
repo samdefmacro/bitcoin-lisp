@@ -754,7 +754,6 @@ new chain is dropped and its pool spender removed with it (Core
 removeRecursive, validation.cpp:317-321)."
   (multiple-value-bind (utxo-set mempool chain-state funding)
       (%pkg-fixture)
-    (declare (ignore chain-state))
     (let* ((graph (bitcoin-lisp.mempool:mempool-graph mempool))
            ;; dtx: spends the confirmed funding output, paying ZERO fee.
            (dtx (%pkg-tx funding 0 100000000))
@@ -771,7 +770,7 @@ removeRecursive, validation.cpp:317-321)."
       (is (eq :ok (%add-tx mempool child :fee 10000 :height 200)))
       (is (eq :ok (%add-tx mempool orphan :fee 100 :height 200)))
       (bitcoin-lisp.validation::readd-disconnected-txs-to-mempool
-       mempool (list dtx dtx2) utxo-set 200)
+       mempool (list dtx dtx2) utxo-set 200 chain-state)
       ;; dtx re-entered fee-free and was wired to its child.
       (is (bitcoin-lisp.mempool:mempool-has mempool did))
       (is (bitcoin-lisp.mempool:mempool-has mempool cid))
@@ -784,3 +783,28 @@ removeRecursive, validation.cpp:317-321)."
       (is (not (bitcoin-lisp.mempool:mempool-has mempool oid)))
       (is (= 2 (bitcoin-lisp.mempool:mempool-count mempool)))
       (bitcoin-lisp.mempool::%mempool-graph-verify mempool))))
+
+(test reorg-readd-drops-nonfinal-tx
+  "A disconnected tx whose nLockTime the post-reorg chain no longer satisfies
+is NOT re-added: bypass_limits skips the fee floor but never the finality /
+BIP68 checks (Core PreChecks CheckFinalTxAtTip runs unconditionally,
+validation.cpp:819). Previously the re-add path skipped finality entirely,
+letting a premature tx re-enter the pool and get mined."
+  (multiple-value-bind (utxo-set mempool chain-state funding)
+      (%pkg-fixture)
+    (let* ((locked (bitcoin-lisp.serialization:make-transaction
+                    :version 1
+                    :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                       :hash funding :index 0)
+                                     :script-sig (%p2sh-optrue-scriptsig)
+                                     :sequence 0))   ; locktime enforced
+                    :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                      :value 99990000
+                                      :script-pubkey (%p2sh-optrue-spk)))
+                    :lock-time 500))                 ; height 500 > next block 201
+           (lid (bitcoin-lisp.serialization:transaction-hash locked)))
+      (bitcoin-lisp.validation::readd-disconnected-txs-to-mempool
+       mempool (list locked) utxo-set 200 chain-state)
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool lid)))
+      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool))))))

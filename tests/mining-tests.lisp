@@ -200,23 +200,36 @@ still mined."
   "A skipped chunk suppresses the LATER chunks of its cluster - including
 them without it could be topologically invalid - while other clusters keep
 being considered (Core BlockBuilder Skip semantics, txgraph.cpp:3241-3251).
-The parent chunk here busts the sigops budget; the child chunk would fit
-easily but must not appear."
+Sigop-dense fillers leave the block's sigop budget too small for P's chunk;
+P's child C would fit easily but must not appear. (A single tx can no
+longer bust the 80k budget by itself: its sigop-adjusted vsize caps a
+cluster at 20,200 sigops - the same bound Core's 404k adjusted-weight
+cluster limit imposes.)"
   (let ((bitcoin-lisp:*network* :regtest))
     (multiple-value-bind (cs mp) (%mining-fixture)
       (let* ((p (make-mempool-test-tx :input-id 35))
              (ptxid (bitcoin-lisp.serialization:transaction-hash p))
              (c (%mp-spending-tx ptxid))
-             (x (make-mempool-test-tx :input-id 36)))
-        ;; Chunks by feerate: [P] (skipped: 400 + 79601 >= 80000 sigops),
-        ;; [X] (included), [C] (suppressed with P's cluster; C alone would fit).
-        (is (eq :ok (%mine-add-entry mp p 50000 :sigops 79601)))
-        (is (eq :ok (%mine-add-entry mp c 10)))          ; lower feerate than P: own chunk
-        (is (eq :ok (%mine-add-entry mp x 2000)))
+             (fillers (list (make-mempool-test-tx :input-id 36)
+                            (make-mempool-test-tx :input-id 37)
+                            (make-mempool-test-tx :input-id 38))))
+        ;; Fillers first at top feerate: 400 (coinbase reserve) + 3 x 20,000
+        ;; in the block. P's chunk (20,000 more, lower feerate) busts the
+        ;; budget (80,400 >= 80,000) and is skipped; C - its own lower-feerate
+        ;; chunk in P's cluster - is suppressed, though it alone would fit.
+        (dolist (x fillers)
+          (is (eq :ok (%mine-add-entry mp x 50000 :sigops 20000))))
+        (is (eq :ok (%mine-add-entry mp p 10000 :sigops 20000)))
+        (is (eq :ok (%mine-add-entry mp c 1)))
         (let ((txids (%template-txids
-                      (bitcoin-lisp.mining:assemble-block-template cs mp))))
-          (is (equal (list (bitcoin-lisp.serialization:transaction-hash x))
-                     txids)))))))
+                      (bitcoin-lisp.mining:assemble-block-template cs mp)))
+              (tmpl bitcoin-lisp.mining:*last-block-template*))
+          (is (= 3 (length txids)))
+          (is (not (member ptxid txids :test #'equalp)))
+          (is (not (member (bitcoin-lisp.serialization:transaction-hash c)
+                           txids :test #'equalp)))
+          (is (= (+ bitcoin-lisp.mining::+coinbase-reserved-sigops+ 60000)
+                 (bitcoin-lisp.mining:block-template-total-sigops tmpl))))))))
 
 (defun %ab-reference-greedy-fees (mempool)
   "The pre-cluster ancestor-package greedy selection (the old
@@ -672,30 +685,156 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
                 (bitcoin-lisp::node-chain-state node)))))))
 
 (test generateblock-includes-raw-tx-and-rejects-bad-output
-  ;; A raw (non-coinbase) tx is included and the witness commitment is computed
-  ;; over it (submit=false, so consensus validity isn't required); a bogus output
-  ;; errors.
+  ;; A consensus-valid raw (non-coinbase) tx is included and the witness
+  ;; commitment is computed over it (submit=false). The block is dry-run
+  ;; through TestBlockValidity before mining (Core rpc/mining.cpp:389-393),
+  ;; so the tx must genuinely spend an existing UTXO; a bogus output errors.
   (%with-regtest
    (let* ((node (%regtest-node-fixture "genblk-tx"))
-          (tx (bitcoin-lisp.serialization:make-transaction
-               :version 1
-               :inputs (vector (bitcoin-lisp.serialization:make-tx-in
-                                :previous-output (bitcoin-lisp.serialization:make-outpoint
-                                                  :hash (%zeros 32) :index 0)
-                                :script-sig (make-array 0 :element-type '(unsigned-byte 8))
-                                :sequence #xffffffff))
-               :outputs (vector (bitcoin-lisp.serialization:make-tx-out
-                                 :value 1000
-                                 :script-pubkey (coerce #(#x51) '(vector (unsigned-byte 8)))))
-               :lock-time 0))
+          (funding (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+          (tx (%pkg-tx funding 0 99990000 :version 1))
           (tx-hex (bitcoin-lisp.crypto:bytes-to-hex
-                   (bitcoin-lisp.serialization:serialize-transaction tx)))
-          (r (bitcoin-lisp.rpc::rpc-generateblock node (list "raw(51)" (list tx-hex) nil)))
-          (blk (flexi-streams:with-input-from-sequence
-                   (s (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" r :test #'string=))))
-                 (bitcoin-lisp.serialization:read-bitcoin-block s))))
-     ;; coinbase + the one supplied tx
-     (is (= 2 (length (bitcoin-lisp.serialization:bitcoin-block-transactions blk))))
+                   (bitcoin-lisp.serialization:serialize-transaction tx))))
+     ;; A confirmed P2SH(OP_TRUE) coin the raw tx spends without a signature.
+     (bitcoin-lisp.storage:add-utxo (bitcoin-lisp::node-utxo-set node)
+                                    funding 0 100000000 (%p2sh-optrue-spk) 0
+                                    :coinbase nil)
+     (let* ((r (bitcoin-lisp.rpc::rpc-generateblock node (list "raw(51)" (list tx-hex) nil)))
+            (blk (flexi-streams:with-input-from-sequence
+                     (s (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" r :test #'string=))))
+                   (bitcoin-lisp.serialization:read-bitcoin-block s))))
+       ;; coinbase + the one supplied tx
+       (is (= 2 (length (bitcoin-lisp.serialization:bitcoin-block-transactions blk)))))
      ;; bogus output (neither address nor descriptor) errors
      (signals bitcoin-lisp.rpc::rpc-error
        (bitcoin-lisp.rpc::rpc-generateblock node (list "not-an-output" '()))))))
+
+(test generateblock-testblockvalidity-rejects-bad-tx
+  ;; A raw tx spending a nonexistent outpoint fails the pre-mining
+  ;; TestBlockValidity dry-run with an RPC verify error — even with
+  ;; submit=false, unvalidated hex is never returned (Core generateblock
+  ;; runs TestBlockValidity unconditionally, rpc/mining.cpp:389-393).
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "genblk-badtx"))
+          (bogus (%pkg-tx (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element 66)
+                          0 1000 :version 1))
+          (hex (bitcoin-lisp.crypto:bytes-to-hex
+                (bitcoin-lisp.serialization:serialize-transaction bogus))))
+     (signals bitcoin-lisp.rpc::rpc-error
+       (bitcoin-lisp.rpc::rpc-generateblock node (list "raw(51)" (list hex) nil)))
+     ;; tip unchanged — nothing was mined or activated
+     (is (= 0 (bitcoin-lisp.storage:current-height
+               (bitcoin-lisp::node-chain-state node)))))))
+
+;;;; Wave 7: BIP94 timewarp clamp on template mintime (Core GetMinimumTime,
+;;;; node/miner.cpp:36-47) + TestBlockValidity on assembled templates
+;;;; (node/miner.cpp:227-231, validation.cpp:4495)
+
+(defun %timewarp-fixture (tip-height tip-time)
+  "(values chain-state mempool) — a regtest chain-state whose tip sits at
+TIP-HEIGHT with timestamp TIP-TIME, preceded by 10 linked entries at
+timestamps 1000000..1000009 (so MTP is 1000005, far below TIP-TIME)."
+  (let ((cs (bitcoin-lisp.storage:make-chain-state))
+        (prev nil))
+    (loop for h from (- tip-height 10) to tip-height
+          for i from 0
+          do (let* ((ts (if (= h tip-height) tip-time (+ 1000000 i)))
+                    (hash (let ((v (%zeros 32)))
+                            (setf (aref v 0) (logand h #xff)
+                                  (aref v 1) (logand (ash h -8) #xff)
+                                  (aref v 2) #x77)
+                            v))
+                    (hdr (bitcoin-lisp.serialization:make-block-header
+                          :version 1
+                          :prev-block (if prev
+                                          (bitcoin-lisp.storage:block-index-entry-hash prev)
+                                          (%zeros 32))
+                          :merkle-root (%zeros 32)
+                          :timestamp ts :bits #x207fffff :nonce 0))
+                    (entry (bitcoin-lisp.storage:make-block-index-entry
+                            :hash hash
+                            :header hdr :height h :prev-entry prev
+                            :status :valid)))
+               (bitcoin-lisp.storage:add-block-index-entry cs entry)
+               (setf prev entry)))
+    (bitcoin-lisp.storage:update-chain-tip
+     cs (bitcoin-lisp.storage:block-index-entry-hash prev) tip-height)
+    (values cs (bitcoin-lisp.mempool:make-mempool))))
+
+(test assembler-bip94-timewarp-clamp-at-retarget
+  "At a retarget height (height % 2016 == 0) the template's mintime is
+clamped to prev-block-time - MAX_TIMEWARP when that exceeds MTP+1 (Core
+GetMinimumTime, miner.cpp:36-47), and curtime is floored to mintime
+(UpdateTime, miner.cpp:49-57). Off-boundary the floor stays MTP+1."
+  (let ((bitcoin-lisp:*network* :regtest))
+    ;; Tip at 2015 -> template height 2016, a retarget boundary.
+    (multiple-value-bind (cs mp) (%timewarp-fixture 2015 2000000)
+      (let ((tmpl (bitcoin-lisp.mining:assemble-block-template
+                   cs mp :block-time 1000010)))
+        (is (= 2016 (bitcoin-lisp.mining:block-template-height tmpl)))
+        ;; mintime = max(MTP+1, tip-time - 600) = 2000000 - 600
+        (is (= (- 2000000 bitcoin-lisp.validation:+max-timewarp+)
+               (bitcoin-lisp.mining:block-template-mintime tmpl)))
+        ;; curtime = max(now, mintime): the stale block-time is floored up.
+        (is (= (bitcoin-lisp.mining:block-template-mintime tmpl)
+               (bitcoin-lisp.mining:block-template-curtime tmpl)))))
+    ;; Tip at 2016 -> template height 2017: no clamp, floor is MTP+1.
+    (multiple-value-bind (cs mp) (%timewarp-fixture 2016 2000000)
+      (let ((tmpl (bitcoin-lisp.mining:assemble-block-template
+                   cs mp :block-time 1000010)))
+        (is (= 2017 (bitcoin-lisp.mining:block-template-height tmpl)))
+        (is (= (1+ 1000005)                ; MTP+1
+               (bitcoin-lisp.mining:block-template-mintime tmpl)))
+        (is (= 1000010 (bitcoin-lisp.mining:block-template-curtime tmpl)))))))
+
+(test template-testblockvalidity-catches-bad-mempool-tx
+  "A consensus-invalid tx smuggled into the mempool (validation bypassed —
+the class of bug TestBlockValidity exists to net) makes template assembly
+ERROR instead of handing miners a doomed block; both getblocktemplate and
+the generate* paths pass the UTXO set, so all live templates are dry-run
+(Core CreateNewBlock throws, node/miner.cpp:227-231)."
+  (%with-regtest
+   (let ((node (%regtest-node-fixture "tbv")))
+     ;; Missing-input tx, injected directly (bypasses acceptance validation).
+     (%mine-add (bitcoin-lisp::node-mempool node)
+                (make-mempool-test-tx :input-id 77) 50000)
+     (signals error
+       (bitcoin-lisp.mining:assemble-full-block
+        (bitcoin-lisp::node-chain-state node)
+        (bitcoin-lisp::node-mempool node)
+        :coinbase-script-pubkey (%p2sh-optrue-spk)
+        :utxo-set (bitcoin-lisp::node-utxo-set node)))
+     ;; getblocktemplate takes the same guarded path.
+     (signals error (bitcoin-lisp.rpc::rpc-getblocktemplate node nil))
+     ;; generatetoaddress refuses to mine it.
+     (signals error
+       (bitcoin-lisp.rpc::rpc-generatetoaddress
+        node (list 1 (bitcoin-lisp.crypto:encode-p2pkh-address
+                      (make-array 20 :element-type '(unsigned-byte 8)
+                                     :initial-element 3)
+                      :regtest)))))))
+
+(test test-block-validity-accepts-valid-and-rejects-stale-prev
+  "TEST-BLOCK-VALIDITY passes a freshly assembled valid block (PoW not yet
+ground — check_pow=false) and reports inconclusive-not-best-prevblk for a
+block not extending the tip (Core validation.cpp:4506-4509)."
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "tbv-ok"))
+          (cs (bitcoin-lisp::node-chain-state node))
+          (utxo (bitcoin-lisp::node-utxo-set node))
+          (block (bitcoin-lisp.mining:assemble-full-block
+                  cs (bitcoin-lisp::node-mempool node)
+                  :coinbase-script-pubkey (%p2sh-optrue-spk))))
+     (multiple-value-bind (ok err)
+         (bitcoin-lisp.validation:test-block-validity block cs utxo)
+       (is-true ok)
+       (is (null err)))
+     ;; Point the header at a bogus parent: inconclusive, not a hard failure.
+     (setf (bitcoin-lisp.serialization:block-header-prev-block
+            (bitcoin-lisp.serialization:bitcoin-block-header block))
+           (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+     (multiple-value-bind (ok err)
+         (bitcoin-lisp.validation:test-block-validity block cs utxo)
+       (is-false ok)
+       (is (eq :inconclusive-not-best-prevblk err))))))

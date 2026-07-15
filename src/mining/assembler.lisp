@@ -197,13 +197,14 @@ it from MEMPOOL by walking txgraph chunks in descending chunk-feerate order
 chunk). BLOCK-TIME defaults to now.
 
 Deliberate divergence from Core's fit test: Core sizes graph entries in
-sigops-adjusted weight (max(weight, sigops * 20 * 4), txmempool.cpp:1017) and
-tests that against the weight budget, a conservative overestimate; our graph
-is in vsize, so the chunk's exact weight and exact sigops are each tested
-against their own consensus budget instead - equally safe, marginally less
-conservative for sigops-dense chunks, and chunk feerates order by fee/vsize
-rather than fee/adjusted-weight (identical except where the sigops
-adjustment would bite)."
+sigops-adjusted weight (max(weight, sigops * 20), txmempool.cpp:1017-1018)
+and tests that against the weight budget, a conservative overestimate; our
+graph is in sigops-adjusted VSIZE (the same value /4, ceilinged — see
+sigop-adjusted-vsize), and the chunk's exact weight and exact sigops are
+each tested against their own consensus budget instead - equally safe,
+marginally less conservative for sigops-dense chunks. Chunk feerates order
+by fee/adjusted-vsize, matching Core's fee/adjusted-weight ordering up to
+the per-tx ceiling."
   (let* ((tip (bitcoin-lisp.storage:get-block-index-entry
                chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
          (prev-hash (bitcoin-lisp.storage:best-block-hash chain-state))
@@ -212,7 +213,25 @@ adjustment would bite)."
          ;; Median-time-past: the locktime cutoff for tx finality (Core
          ;; m_lock_time_cutoff, miner.cpp:150) and, +1, the header floor.
          (mtp (bitcoin-lisp.validation:compute-median-time-past chain-state prev-hash))
-         (mintime (1+ mtp))
+         ;; Header time floor (Core GetMinimumTime, miner.cpp:36-47): MTP+1,
+         ;; raised at retarget heights to the previous block's ACTUAL time
+         ;; minus MAX_TIMEWARP — the BIP94 timewarp rule, applied on ALL
+         ;; networks ("makes future activation safer"); testnet4 already
+         ;; enforces it in consensus, so a template without the clamp can be
+         ;; a block everyone rejects. Divergence: Core's clamp fires at
+         ;; height % DifficultyAdjustmentInterval == 0 per network; ours uses
+         ;; the fixed 2016, which matches every network except regtest
+         ;; (Core: 144), where BIP94 is off and the extra floor is moot.
+         (mintime (let ((mtp-floor (1+ mtp)))
+                    (if (and tip
+                             (zerop (mod height
+                                         bitcoin-lisp.storage:+difficulty-adjustment-interval+)))
+                        (max mtp-floor
+                             (- (bitcoin-lisp.serialization:block-header-timestamp
+                                 (bitcoin-lisp.storage:block-index-entry-header tip))
+                                bitcoin-lisp.validation:+max-timewarp+))
+                        mtp-floor)))
+         ;; Core UpdateTime (miner.cpp:49-57): nTime = max(mintime, now).
          (curtime (max now mintime))
          (bits (if tip
                    (next-block-required-bits chain-state tip curtime)

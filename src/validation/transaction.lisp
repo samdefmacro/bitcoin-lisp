@@ -189,8 +189,11 @@ this rate (~546 sat for P2PKH, ~294 sat for P2WPKH).")
   "Maximum scriptSig size for a standard input (Bitcoin Core
 MAX_STANDARD_SCRIPTSIG_SIZE) — fits a 15-of-15 P2SH redeem.")
 
-(defconstant +max-standard-tx-sigops-cost+ 80000
-  "Maximum weighted sigop cost for a standard tx (MAX_BLOCK_SIGOPS_COST / 5).")
+(defconstant +max-standard-tx-sigops-cost+ 16000
+  "Maximum weighted sigop cost for a standard tx: MAX_BLOCK_SIGOPS_COST / 5
+= 16,000 (Bitcoin Core MAX_STANDARD_TX_SIGOPS_COST, policy.h:43). Was
+mistakenly 80,000 — the full BLOCK budget — letting a single standard tx
+carry 5x the sigop density Core relays.")
 
 (defconstant +max-standard-p2sh-sigops+ 15
   "Maximum sigops in a standard P2SH redeemScript (Bitcoin Core MAX_P2SH_SIGOPS).")
@@ -458,13 +461,21 @@ standard."
                            wstack spk
                            (bitcoin-lisp.serialization:tx-in-script-sig input)))))))))
 
-(defun mempool-extra-coins (tx utxo-set mempool &optional package-coins)
+(defun mempool-extra-coins (tx utxo-set mempool spend-height &optional package-coins)
   "Build a (txid . index) -> utxo-entry table for TX inputs that spend
 unconfirmed outputs — either an in-mempool tx (chained spends) or, as a final
 fallback, a sibling output supplied in PACKAGE-COINS (a package being validated
 together, before its members are in the mempool). Returns (values table ok-p);
 OK-P is NIL if some input references none of those nor a confirmed UTXO (a
-genuinely missing input)."
+genuinely missing input).
+
+Every entry here is by construction unconfirmed, so it carries SPEND-HEIGHT
+(the height TX itself would confirm at, tip+1) as its coin height: Bitcoin
+Core's BIP68 evaluation assumes every mempool prevout confirms in the next
+block (CalculatePrevHeights maps MEMPOOL_HEIGHT coins to tip.nHeight+1,
+validation.cpp:185-192), so any nonzero relative lock on an unconfirmed
+input is non-final. Recording the parent's acceptance height instead let
+such locks mature while the parent was still unconfirmed."
   (let ((extra (make-hash-table :test 'equalp)))
     (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx) (values extra t))
       (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
@@ -482,7 +493,7 @@ genuinely missing input)."
                        (bitcoin-lisp.storage:make-utxo-entry
                         :value (bitcoin-lisp.serialization:tx-out-value out)
                         :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey out)
-                        :height (bitcoin-lisp.mempool:mempool-entry-height pe)
+                        :height spend-height
                         :coinbase nil))))
               (pkg-coin
                (setf (gethash (cons ptxid pidx) extra) pkg-coin))
@@ -495,13 +506,15 @@ genuinely missing input)."
                                               (allow-sibling-eviction t))
   "Validate a transaction for mempool acceptance.
 Performs consensus checks plus policy checks.
-Returns (VALUES T NIL FEE REPLACED MODIFIED-FEE DIRECT-CONFLICTS) on
+Returns (VALUES T NIL FEE REPLACED SIGOPS MODIFIED-FEE DIRECT-CONFLICTS) on
 success, (VALUES NIL ERROR-KEYWORD NIL) on failure. FEE is the real paid fee
-(integer satoshis); REPLACED the txids the RBF rules would evict;
-MODIFIED-FEE the prioritisation-modified fee and DIRECT-CONFLICTS the
-directly-conflicting mempool txids — the workspace values Core's PreChecks
-leaves in ws.m_modified_fees / ws.m_conflicts for the package layer to read,
-returned so callers need not re-derive them.
+(integer satoshis); REPLACED the txids the RBF rules would evict; SIGOPS the
+weighted sigop cost (Core's nSigOpsCost, recorded on the mempool entry so
+the block assembler's sigop budget sees real numbers); MODIFIED-FEE the
+prioritisation-modified fee and DIRECT-CONFLICTS the directly-conflicting
+mempool txids — the workspace values Core's PreChecks leaves in
+ws.m_modified_fees / ws.m_conflicts for the package layer to read, returned
+so callers need not re-derive them.
 
 PACKAGE-COINS, when supplied, is a (txid . index) -> utxo-entry table of outputs
 produced by sibling transactions in a package being validated together (so a
@@ -509,10 +522,13 @@ child can spend a not-yet-in-mempool parent). SKIP-FEE-CHECK bypasses the per-tx
 minimum-fee floor, used when the package as a whole is evaluated at the package
 feerate (Bitcoin Core's package_feerates path).
 
-CHAIN-STATE, when supplied, enables the relay finality + BIP68 sequence-lock
-checks (Core PreChecks: a tx that couldn't be mined into the NEXT block doesn't
-belong in the mempool). Omitted on paths re-adding already-confirmed txs (reorg
-re-add, mempool.dat reload) where those checks don't apply.
+CHAIN-STATE enables the relay finality + BIP68 sequence-lock checks (Core
+PreChecks: a tx that couldn't be mined into the NEXT block doesn't belong in
+the mempool). EVERY acceptance path must pass it — Core runs
+CheckFinalTxAtTip and CheckSequenceLocksAtTip unconditionally, including
+under bypass_limits (validation.cpp:819,886-889), so reorg re-adds,
+mempool.dat reloads, and package members are all filtered too. NIL only in
+unit tests exercising other layers.
 
 BYPASS-LIMITS mirrors Core's ATMP bypass_limits (the reorg re-add path,
 MaybeUpdateMempoolForReorg): the minimum-fee floor (validation.cpp:945) and
@@ -600,9 +616,10 @@ decide (Core PreChecks, validation.cpp:950-970)."
   ;; the fee is known (see the fee section below).
 
   ;; Check inputs: each must reference a confirmed UTXO or an unconfirmed
-  ;; in-mempool output (chained spend). EXTRA-COINS carries the latter.
+  ;; in-mempool output (chained spend). EXTRA-COINS carries the latter, at
+  ;; the next-block height (see mempool-extra-coins).
   (multiple-value-bind (extra-coins inputs-ok)
-      (mempool-extra-coins tx utxo-set mempool package-coins)
+      (mempool-extra-coins tx utxo-set mempool (1+ current-height) package-coins)
     (unless inputs-ok
       (return-from validate-transaction-for-mempool
         (values nil :missing-input nil)))
@@ -632,116 +649,127 @@ decide (Core PreChecks, validation.cpp:950-970)."
             (return-from validate-transaction-for-mempool
               (values nil :non-bip68-final nil))))))
 
-    ;; Policy: bounded sigop cost (now that spent scripts are available).
-    (flet ((spent-script (txid index)
-             (let ((u (or (bitcoin-lisp.storage:get-utxo utxo-set txid index)
-                          (gethash (cons txid index) extra-coins))))
-               (when u (bitcoin-lisp.storage:utxo-entry-script-pubkey u)))))
-      ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
-      (when (> (count-transaction-sigops-cost tx #'spent-script)
-               +max-standard-tx-sigops-cost+)
-        (return-from validate-transaction-for-mempool
-          (values nil :too-many-sigops nil)))
-      ;; Per-input P2SH redeemScript sigops <= MAX_P2SH_SIGOPS.
-      (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-        (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-               (spk (spent-script (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                  (bitcoin-lisp.serialization:outpoint-index prevout))))
-          (when (and spk (script-is-p2sh-p spk))
-            (let ((redeem (extract-last-push
-                           (bitcoin-lisp.serialization:tx-in-script-sig input))))
-              (when (and redeem
-                         (> (count-script-sigops redeem :accurate t)
-                            +max-standard-p2sh-sigops+))
-                (return-from validate-transaction-for-mempool
-                  (values nil :too-many-sigops nil)))))))
-
-      ;; Policy: witness must be standard (P2WSH/Taproot stack & script limits,
-      ;; no annex). Needs the spent scriptPubKeys, hence inside this flet.
-      (when (and (bitcoin-lisp.serialization:transaction-has-witness-p tx)
-                 (not (is-witness-standard-p tx #'spent-script)))
-        (return-from validate-transaction-for-mempool
-          (values nil :bad-witness-nonstandard nil))))
-
-    ;; Contextual validation (consensus): coinbase maturity, fee calculation.
-    ;; EXTRA-COINS is passed as pending-utxos so chained-spend inputs resolve.
-    (multiple-value-bind (valid error fee)
-        (validate-transaction-contextual tx utxo-set current-height
-                                         :pending-utxos extra-coins)
-      (unless valid
-        (return-from validate-transaction-for-mempool
-          (values nil error nil)))
-
-      ;; Convert typed fee to integer; fee-rate is per virtual byte (BIP141).
-      ;; Policy fee checks (floor, RBF) run on the prioritisation-modified fee
-      ;; (Core's ws.m_modified_fees); the real fee is what gets recorded.
-      (let* ((fee-value (unwrap-satoshi fee))
-             (modified-fee-value
-               (+ fee-value
-                  (gethash (bitcoin-lisp.serialization:transaction-hash tx)
-                           (bitcoin-lisp.mempool:mempool-deltas mempool) 0)))
-             (vsize (bitcoin-lisp.serialization:transaction-vsize tx))
-             (direct-conflicts (bitcoin-lisp.mempool:find-rbf-conflicts mempool tx))
-             (replaced-set nil))
-
-        ;; Policy: minimum relay fee rate (relay floor, or the higher rolling
-        ;; dynamic minimum when the mempool has been trimming). The rate is
-        ;; sat/kvB (Core CFeeRate), so compare fee*1000 against rate*vsize --
-        ;; exact integer math, no truncation to whole sat/vB. Skipped when this
-        ;; tx is part of a package evaluated at the package feerate, and for
-        ;; reorg re-adds (Core: !bypass_limits && !package_feerates &&
-        ;; CheckFeeRate, validation.cpp:945).
-        (when (and (not skip-fee-check)
-                   (not bypass-limits)
-                   (< (* modified-fee-value 1000)
-                      (* (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)
-                         vsize)))
-          (return-from validate-transaction-for-mempool
-            (values nil :insufficient-fee nil)))
-
-        ;; BIP431 TRUC (v3) topology: inheritance + ancestor/descendant/size
-        ;; limits for this tx and its unconfirmed relatives. Runs on every tx
-        ;; (non-v3 spending v3 is also rejected); a no-op for a lone non-v3 tx.
-        ;; Skipped under BYPASS-LIMITS (Core validation.cpp:951). A
-        ;; :truc-descendant-limit failure with an evictable sibling falls
-        ;; through to the RBF path instead when sibling eviction is allowed
-        ;; (Core validation.cpp:950-970): the sibling joins the conflict set
-        ;; and the replacement economics decide its fate.
-        (unless bypass-limits
-          (multiple-value-bind (truc-ok truc-reason sibling)
-              (bitcoin-lisp.mempool:single-truc-checks mempool tx vsize direct-conflicts)
-            (unless truc-ok
-              (if (and sibling allow-sibling-eviction (not skip-rbf-check))
-                  (pushnew sibling direct-conflicts :test #'equalp)
+    ;; Policy: bounded sigop cost (now that spent scripts are available). The
+    ;; computed cost is kept — it is returned to the caller and recorded on
+    ;; the mempool entry, exactly as Core's PreChecks computes nSigOpsCost
+    ;; once and stages it into the entry (validation.cpp:905,924), so the
+    ;; block assembler's sigop budget sees real numbers.
+    (let ((sigops-cost
+            (flet ((spent-script (txid index)
+                     (let ((u (or (bitcoin-lisp.storage:get-utxo utxo-set txid index)
+                                  (gethash (cons txid index) extra-coins))))
+                       (when u (bitcoin-lisp.storage:utxo-entry-script-pubkey u)))))
+              ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
+              (let ((cost (count-transaction-sigops-cost tx #'spent-script)))
+                (when (> cost +max-standard-tx-sigops-cost+)
                   (return-from validate-transaction-for-mempool
-                    (values nil truc-reason nil))))))
+                    (values nil :too-many-sigops nil)))
+                ;; Per-input P2SH redeemScript sigops <= MAX_P2SH_SIGOPS.
+                (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
+                  (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                         (spk (spent-script (bitcoin-lisp.serialization:outpoint-hash prevout)
+                                            (bitcoin-lisp.serialization:outpoint-index prevout))))
+                    (when (and spk (script-is-p2sh-p spk))
+                      (let ((redeem (extract-last-push
+                                     (bitcoin-lisp.serialization:tx-in-script-sig input))))
+                        (when (and redeem
+                                   (> (count-script-sigops redeem :accurate t)
+                                      +max-standard-p2sh-sigops+))
+                          (return-from validate-transaction-for-mempool
+                            (values nil :too-many-sigops nil)))))))
+                ;; Policy: witness must be standard (P2WSH/Taproot stack &
+                ;; script limits, no annex). Needs the spent scriptPubKeys,
+                ;; hence inside this flet.
+                (when (and (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+                           (not (is-witness-standard-p tx #'spent-script)))
+                  (return-from validate-transaction-for-mempool
+                    (values nil :bad-witness-nonstandard nil)))
+                cost))))
 
-        ;; BIP125 replace-by-fee: if this tx conflicts with mempool entries
-        ;; (or evicts a TRUC sibling) it must satisfy the replacement rules;
-        ;; the set it replaces is returned to the caller (4th value) to evict
-        ;; before adding. SKIP-RBF-CHECK defers this to the caller's package
-        ;; RBF evaluation.
-        (when (and direct-conflicts (not skip-rbf-check))
-          (multiple-value-bind (ok reason rset)
-              (bitcoin-lisp.mempool:check-rbf-rules mempool tx modified-fee-value
-                                                    vsize direct-conflicts)
-            (unless ok
-              (return-from validate-transaction-for-mempool (values nil reason nil)))
-            (setf replaced-set rset)))
+      ;; Contextual validation (consensus): coinbase maturity, fee calculation.
+      ;; EXTRA-COINS is passed as pending-utxos so chained-spend inputs resolve.
+      (multiple-value-bind (valid error fee)
+          (validate-transaction-contextual tx utxo-set current-height
+                                           :pending-utxos extra-coins)
+        (unless valid
+          (return-from validate-transaction-for-mempool
+            (values nil error nil)))
 
-        ;; Script validation (consensus)
-        (multiple-value-bind (scripts-valid failed-input)
-            (validate-transaction-scripts tx utxo-set :height current-height
-                                          :extra-coins extra-coins)
-          (declare (ignore failed-input))
-          (unless scripts-valid
+        ;; Convert typed fee to integer. Policy fee checks (floor, RBF) run on
+        ;; the prioritisation-modified fee (Core's ws.m_modified_fees); the
+        ;; real fee is what gets recorded. VSIZE is the SIGOP-ADJUSTED virtual
+        ;; size — Core's ws.m_vsize is the entry's GetTxSize()
+        ;; (validation.cpp:929), not the raw BIP141 vsize — so the fee floor,
+        ;; TRUC size caps, and RBF economics all price sigop-dense txs.
+        (let* ((fee-value (unwrap-satoshi fee))
+               (modified-fee-value
+                 (+ fee-value
+                    (gethash (bitcoin-lisp.serialization:transaction-hash tx)
+                             (bitcoin-lisp.mempool:mempool-deltas mempool) 0)))
+               (vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
+                       (bitcoin-lisp.serialization:transaction-weight tx)
+                       sigops-cost))
+               (direct-conflicts (bitcoin-lisp.mempool:find-rbf-conflicts mempool tx))
+               (replaced-set nil))
+
+          ;; Policy: minimum relay fee rate (relay floor, or the higher rolling
+          ;; dynamic minimum when the mempool has been trimming). The rate is
+          ;; sat/kvB (Core CFeeRate), so compare fee*1000 against rate*vsize --
+          ;; exact integer math, no truncation to whole sat/vB. Skipped when this
+          ;; tx is part of a package evaluated at the package feerate, and for
+          ;; reorg re-adds (Core: !bypass_limits && !package_feerates &&
+          ;; CheckFeeRate, validation.cpp:945).
+          (when (and (not skip-fee-check)
+                     (not bypass-limits)
+                     (< (* modified-fee-value 1000)
+                        (* (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)
+                           vsize)))
             (return-from validate-transaction-for-mempool
-              (values nil :script-failed nil))))
+              (values nil :insufficient-fee nil)))
 
-        (values t nil fee-value
-                (when replaced-set
-                  (loop for k being the hash-keys of replaced-set collect k))
-                modified-fee-value direct-conflicts)))))
+          ;; BIP431 TRUC (v3) topology: inheritance + ancestor/descendant/size
+          ;; limits for this tx and its unconfirmed relatives. Runs on every tx
+          ;; (non-v3 spending v3 is also rejected); a no-op for a lone non-v3 tx.
+          ;; Skipped under BYPASS-LIMITS (Core validation.cpp:951). A
+          ;; :truc-descendant-limit failure with an evictable sibling falls
+          ;; through to the RBF path instead when sibling eviction is allowed
+          ;; (Core validation.cpp:950-970): the sibling joins the conflict set
+          ;; and the replacement economics decide its fate.
+          (unless bypass-limits
+            (multiple-value-bind (truc-ok truc-reason sibling)
+                (bitcoin-lisp.mempool:single-truc-checks mempool tx vsize direct-conflicts)
+              (unless truc-ok
+                (if (and sibling allow-sibling-eviction (not skip-rbf-check))
+                    (pushnew sibling direct-conflicts :test #'equalp)
+                    (return-from validate-transaction-for-mempool
+                      (values nil truc-reason nil))))))
+
+          ;; BIP125 replace-by-fee: if this tx conflicts with mempool entries
+          ;; (or evicts a TRUC sibling) it must satisfy the replacement rules;
+          ;; the set it replaces is returned to the caller (4th value) to evict
+          ;; before adding. SKIP-RBF-CHECK defers this to the caller's package
+          ;; RBF evaluation.
+          (when (and direct-conflicts (not skip-rbf-check))
+            (multiple-value-bind (ok reason rset)
+                (bitcoin-lisp.mempool:check-rbf-rules mempool tx modified-fee-value
+                                                      vsize direct-conflicts)
+              (unless ok
+                (return-from validate-transaction-for-mempool (values nil reason nil)))
+              (setf replaced-set rset)))
+
+          ;; Script validation (consensus)
+          (multiple-value-bind (scripts-valid failed-input)
+              (validate-transaction-scripts tx utxo-set :height current-height
+                                            :extra-coins extra-coins)
+            (declare (ignore failed-input))
+            (unless scripts-valid
+              (return-from validate-transaction-for-mempool
+                (values nil :script-failed nil))))
+
+          (values t nil fee-value
+                  (when replaced-set
+                    (loop for k being the hash-keys of replaced-set collect k))
+                  sigops-cost modified-fee-value direct-conflicts))))))
 
 ;;;; Script validation
 

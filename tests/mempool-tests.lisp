@@ -912,7 +912,9 @@ bound low here; the graph's limits are fixed at make-mempool time.)"
     (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))))
 
 (test mempool-chained-spend-coins
-  "mempool-extra-coins resolves an input spending an unconfirmed parent output."
+  "mempool-extra-coins resolves an input spending an unconfirmed parent output,
+recording it at the spend height (tip+1) — Core treats every mempool prevout
+as confirming in the next block for BIP68 (validation.cpp:185-192)."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (utxo (bitcoin-lisp.storage:make-utxo-set))
          (a (make-mempool-test-tx :input-id 93))
@@ -920,9 +922,11 @@ bound low here; the graph's limits are fixed at make-mempool time.)"
          (b (%mp-spending-tx atxid)))
     (%add-tx mempool a)
     (multiple-value-bind (coins ok)
-        (bitcoin-lisp.validation::mempool-extra-coins b utxo mempool)
+        (bitcoin-lisp.validation::mempool-extra-coins b utxo mempool 201)
       (is-true ok)
-      (is (not (null (gethash (cons atxid 0) coins)))))))
+      (let ((coin (gethash (cons atxid 0) coins)))
+        (is (not (null coin)))
+        (is (= 201 (bitcoin-lisp.storage:utxo-entry-height coin)))))))
 
 (test mempool-eviction-removes-descendants
   "Evicting a low-fee parent also removes its in-mempool child (no orphan):
@@ -1740,3 +1744,32 @@ diagram does NOT strictly improve — rejected :replacement-failed."
          mempool 1000 100 100000000 200000 (list orig-txid))
       (is-false ok)
       (is (eq reason :too-large-cluster)))))
+
+;;;; Wave 7: sigop-adjusted virtual size (Core GetVirtualTransactionSize,
+;;;; policy.cpp:376-384; CTxMemPoolEntry::GetTxSize)
+
+(test sigop-adjusted-vsize-matches-core
+  "ceil(max(weight, sigops * DEFAULT_BYTES_PER_SIGOP) / 4), hand-checked
+against Core's arithmetic."
+  ;; weight dominates: plain BIP141 vsize, with Core's ceiling division.
+  (is (= 100 (bitcoin-lisp.mempool:sigop-adjusted-vsize 400 0)))
+  (is (= 101 (bitcoin-lisp.mempool:sigop-adjusted-vsize 401 0)))
+  (is (= 101 (bitcoin-lisp.mempool:sigop-adjusted-vsize 404 0)))
+  ;; tie: 20 sigops * 20 = 400 = weight.
+  (is (= 100 (bitcoin-lisp.mempool:sigop-adjusted-vsize 400 20)))
+  ;; sigops dominate: 100 * 20 / 4 = 500; 1 * 20 / 4 = 5.
+  (is (= 500 (bitcoin-lisp.mempool:sigop-adjusted-vsize 400 100)))
+  (is (= 5 (bitcoin-lisp.mempool:sigop-adjusted-vsize 0 1))))
+
+(test entry-vsize-is-sigop-adjusted
+  "make-entry-from-tx records the sigop-adjusted virtual size: unchanged for
+plain txs, max(weight, sigops*20)/4 when the sigop cost dominates — the size
+Core's entry reports and mines by (CTxMemPoolEntry::GetTxSize)."
+  (let* ((tx (make-mempool-test-tx :input-id 97))
+         (weight (bitcoin-lisp.serialization:transaction-weight tx))
+         (plain (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))
+         (dense (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0 :sigops 400)))
+    (is (= (bitcoin-lisp.serialization:transaction-vsize tx)
+           (bitcoin-lisp.mempool:mempool-entry-vsize plain)))
+    (is (< weight (* 400 20)))          ; sigops dominate for this tiny tx
+    (is (= 2000 (bitcoin-lisp.mempool:mempool-entry-vsize dense)))))
