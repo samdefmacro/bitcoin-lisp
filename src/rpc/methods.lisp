@@ -728,8 +728,10 @@ The chunk fields (Core MempoolEntryDescription + entryToJSON,
 rpc/mempool.cpp:433-465/508-541) report the txgraph chunk this entry mines
 in: \"chunkweight\" is the chunk's total size and fees.\"chunk\" its total
 modified fees. UNIT DIVERGENCE: Core's txgraph measures sigops-adjusted
-WEIGHT (GetAdjustedWeight), ours measures BIP141 virtual bytes, so
-\"chunkweight\" here is in vB (~ Core's value / 4)."
+WEIGHT (GetAdjustedWeight), ours sigops-adjusted virtual bytes, so
+\"chunkweight\" here is in vB (~ Core's value / 4). \"vsize\" and the
+ancestor/descendant sizes are the sigop-adjusted virtual size, exactly
+Core's GetTxSize-based reporting."
   (multiple-value-bind (acount asize afees)
       (bitcoin-lisp.mempool:mempool-ancestor-stats mempool txid)
     (multiple-value-bind (dcount dsize dfees)
@@ -929,14 +931,19 @@ anything to the mempool. Each tx is checked independently against current state
                     (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
                           (bitcoin-lisp.serialization:read-transaction stream)))
                     (txid (bitcoin-lisp.serialization:transaction-hash tx)))
-               (multiple-value-bind (valid error fee)
+               (multiple-value-bind (valid error fee replaced sigops)
                    (bitcoin-lisp.validation:validate-transaction-for-mempool
                     tx utxo-set mempool height :chain-state chain-state)
+                 (declare (ignore replaced))
                  (if valid
                      `(("txid" . ,(hash-to-hex txid))
                        ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
                        ("allowed" . t)
-                       ("vsize" . ,(bitcoin-lisp.serialization:transaction-vsize tx))
+                       ;; Core reports ws.m_vsize here — the sigop-adjusted
+                       ;; size, not the raw BIP141 vsize (rpc/mempool.cpp:375).
+                       ("vsize" . ,(bitcoin-lisp.mempool:sigop-adjusted-vsize
+                                    (bitcoin-lisp.serialization:transaction-weight tx)
+                                    sigops))
                        ("fees" . (("base" . ,(/ (or fee 0) 100000000.0d0)))))
                      `(("txid" . ,(hash-to-hex txid))
                        ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))

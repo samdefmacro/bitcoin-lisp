@@ -197,13 +197,14 @@ it from MEMPOOL by walking txgraph chunks in descending chunk-feerate order
 chunk). BLOCK-TIME defaults to now.
 
 Deliberate divergence from Core's fit test: Core sizes graph entries in
-sigops-adjusted weight (max(weight, sigops * 20 * 4), txmempool.cpp:1017) and
-tests that against the weight budget, a conservative overestimate; our graph
-is in vsize, so the chunk's exact weight and exact sigops are each tested
-against their own consensus budget instead - equally safe, marginally less
-conservative for sigops-dense chunks, and chunk feerates order by fee/vsize
-rather than fee/adjusted-weight (identical except where the sigops
-adjustment would bite)."
+sigops-adjusted weight (max(weight, sigops * 20), txmempool.cpp:1017-1018)
+and tests that against the weight budget, a conservative overestimate; our
+graph is in sigops-adjusted VSIZE (the same value /4, ceilinged — see
+sigop-adjusted-vsize), and the chunk's exact weight and exact sigops are
+each tested against their own consensus budget instead - equally safe,
+marginally less conservative for sigops-dense chunks. Chunk feerates order
+by fee/adjusted-vsize, matching Core's fee/adjusted-weight ordering up to
+the per-tx ceiling."
   (let* ((tip (bitcoin-lisp.storage:get-block-index-entry
                chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
          (prev-hash (bitcoin-lisp.storage:best-block-hash chain-state))

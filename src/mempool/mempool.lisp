@@ -32,10 +32,13 @@ DEFAULT_CLUSTER_LIMIT = 64, hard-capped at MAX_CLUSTER_COUNT_LIMIT = 64
 fixed at creation); set from config before the node's mempool is built.")
 
 (defvar *cluster-size-limit* +max-cluster-size+
-  "Max total vsize of a cluster, in vbytes. Core -limitclustersize in kvB
-x 1000 (mempool_args.cpp:37), default DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101.
-Core-exact 64/101k defaults are non-negotiable for relay compatibility.
-Read at MAKE-MEMPOOL time, like *CLUSTER-COUNT-LIMIT*.")
+  "Max total vsize of a cluster, in SIGOP-ADJUSTED vbytes (entries carry the
+adjusted size). Core -limitclustersize in kvB x 1000 (mempool_args.cpp:37),
+default DEFAULT_CLUSTER_SIZE_LIMIT_KVB = 101; its txgraph limit is the same
+101k scaled to adjusted WEIGHT (x4, txmempool.cpp:179-181), so ours matches
+up to the per-tx ceiling in SIGOP-ADJUSTED-VSIZE. Core-exact 64/101k
+defaults are non-negotiable for relay compatibility. Read at MAKE-MEMPOOL
+time, like *CLUSTER-COUNT-LIMIT*.")
 
 (defconstant +default-mempool-expiry-hours+ 336
   "Drop mempool txs older than this (14 days) — Bitcoin Core
@@ -53,7 +56,11 @@ DEFAULT_MEMPOOL_EXPIRY_HOURS.")
   (modified-fee 0 :type integer)
   ;; Serialized (witness) byte length — used for the byte-based mempool size cap.
   (size 0 :type (unsigned-byte 32))
-  ;; BIP141 virtual size — the basis for fee-rate (Core computes fee-rate on vsize).
+  ;; Sigop-adjusted virtual size (Core CTxMemPoolEntry::GetTxSize,
+  ;; kernel/mempool_entry.h:110-113) — the basis for fee-rates, RBF economics,
+  ;; TRUC caps, the cluster size limit, and the txgraph chunk feerates that
+  ;; drive mining and eviction. Equals the BIP141 vsize except for sigop-dense
+  ;; txs (see SIGOP-ADJUSTED-VSIZE).
   (vsize 0 :type (unsigned-byte 32))
   ;; Witness txid (BIP339); 32 bytes once populated.
   (wtxid nil :type (or null (simple-array (unsigned-byte 8) (32))))
@@ -81,8 +88,23 @@ so legacy txs aren't charged phantom marker/flag bytes."
       (bitcoin-lisp.serialization:serialize-witness-transaction tx)
       (bitcoin-lisp.serialization:serialize-transaction tx)))
 
+(defconstant +bytes-per-sigop+ 20
+  "Equivalent bytes charged per weighted sigop in the sigop-adjusted
+transaction size (Bitcoin Core DEFAULT_BYTES_PER_SIGOP, policy.h:49; the
+-bytespersigop knob is not exposed).")
+
+(defun sigop-adjusted-vsize (weight sigops)
+  "The sigop-adjusted virtual size: ceil(max(WEIGHT, SIGOPS * 20) / 4) —
+Core GetVirtualTransactionSize (policy.cpp:376-384). This, not the raw
+BIP141 vsize, is Core's mempool-entry size (CTxMemPoolEntry::GetTxSize):
+it prices into the fee floor, RBF rules, TRUC caps, cluster limits, and
+chunk feerates the transactions whose cost to the network is validation
+work rather than bytes."
+  (ceiling (max weight (* sigops +bytes-per-sigop+)) 4))
+
 (defun make-entry-from-tx (tx fee height &key (sigops 0) (entry-time 0))
-  "Build a mempool-entry from TX, computing the derived size/vsize/wtxid fields.
+  "Build a mempool-entry from TX, computing the derived size/vsize/wtxid fields
+(VSIZE is sigop-adjusted, so SIGOPS matters beyond the mining budget).
 Centralizes entry construction so every acceptance path records the same
 fields (handle-tx, sendrawtransaction, reorg re-add)."
   (make-mempool-entry
@@ -90,7 +112,8 @@ fields (handle-tx, sendrawtransaction, reorg re-add)."
    :fee fee
    :modified-fee fee
    :size (length (tx-wire-bytes tx))
-   :vsize (bitcoin-lisp.serialization:transaction-vsize tx)
+   :vsize (sigop-adjusted-vsize (bitcoin-lisp.serialization:transaction-weight tx)
+                                sigops)
    :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)
    :sigops sigops
    :height height
@@ -556,7 +579,7 @@ orphan cascade, sendrawtransaction, mempool.dat reload, reorg re-add,
 submitpackage): evict the BIP125 REPLACED txids, build the entry for TX,
 add it. Caller has already run validate-transaction-for-mempool and passes
 the weighted SIGOPS cost it computed (Core threads the same value from
-PreChecks into the entry, validation.cpp:935) — without it the block
+PreChecks into the entry, validation.cpp:924) — without it the block
 assembler's sigop budget is vacuous. Returns (values result entry) where
 RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
 (reorg re-add, package submission)."

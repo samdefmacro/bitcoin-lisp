@@ -810,6 +810,7 @@
    #:mempool-entry
    #:make-mempool-entry
    #:make-entry-from-tx
+   #:sigop-adjusted-vsize
    #:mempool-entry-transaction
    #:mempool-entry-fee
    #:mempool-entry-modified-fee

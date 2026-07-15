@@ -262,13 +262,15 @@ as Core's AcceptMultipleTransactions does (validation.cpp:1513-1516)."
             (return-from %accept-package-subset err))
           (when package-eval
             (dolist (c conflicts) (setf (gethash c conflict-set) t)))
-          (incf total-fee modified-fee)
-          (incf total-vsize (bitcoin-lisp.serialization:transaction-vsize tx))
-          (push (%make-pkg-val tx (bitcoin-lisp.serialization:transaction-hash tx)
-                               wtxid (or fee 0)
-                               (bitcoin-lisp.serialization:transaction-vsize tx)
-                               sigops rset modified-fee)
-                validated))))
+          ;; Package feerate and per-tx records use the sigop-adjusted vsize,
+          ;; like Core's ws.m_vsize totals (validation.cpp:1494-1496).
+          (let ((vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
+                        (bitcoin-lisp.serialization:transaction-weight tx) sigops)))
+            (incf total-fee modified-fee)
+            (incf total-vsize vsize)
+            (push (%make-pkg-val tx (bitcoin-lisp.serialization:transaction-hash tx)
+                                 wtxid (or fee 0) vsize sigops rset modified-fee)
+                  validated)))))
     (setf validated (nreverse validated))
     (flet ((fail-all (reason)
              (dolist (v validated)
@@ -379,7 +381,11 @@ Returns (values msg results replaced):
                                                           height now
                                                           mempool rset replaced)))
                     (if (eq add-result :ok)
-                        (let ((vsize (bitcoin-lisp.serialization:transaction-vsize tx)))
+                        ;; Reported vsize/feerate use the sigop-adjusted size
+                        ;; (Core MempoolAcceptResult carries ws.m_vsize).
+                        (let ((vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
+                                      (bitcoin-lisp.serialization:transaction-weight tx)
+                                      sigops)))
                           (%mark-result-valid res vsize fee
                                               (if (zerop vsize) 0 (/ fee vsize))
                                               (list wtxid)))
