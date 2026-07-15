@@ -153,6 +153,8 @@
                              (:file "persistence-tests")
                              ;; RPC tests
                              (:file "rpc-tests")
+                             ;; Output descriptor engine (Core descriptor_tests.cpp vectors)
+                             (:file "descriptor-tests")
                              ;; Mainnet support tests
                              (:file "mainnet-tests")
                              ;; Pruning tests
