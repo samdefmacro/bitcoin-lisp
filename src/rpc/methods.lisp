@@ -679,6 +679,9 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
                (min-fee-btc-kvb (/ min-fee-sat-kvb 100000000.0d0))
                (relay-fee-btc-kvb (/ bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 100000000.0d0))
                (count (bitcoin-lisp.mempool:mempool-count mempool))
+               ;; Core "bytes" = GetTotalTxSize(), the sum of the entries'
+               ;; sigop-adjusted VIRTUAL sizes (rpc/mempool.cpp:1040,
+               ;; txmempool.h:191), not serialized bytes.
                (bytes (bitcoin-lisp.mempool:mempool-total-size mempool))
                (total-fee-sat 0))
           (bitcoin-lisp.mempool:mempool-for-each
@@ -687,10 +690,9 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           `(("loaded" . t)
             ("size" . ,count)
             ("bytes" . ,bytes)
-            ;; Core reports DynamicMemoryUsage; we don't replicate its exact
-            ;; accounting, so estimate: serialized bytes + a ~per-entry struct/
-            ;; index overhead.
-            ("usage" . ,(+ bytes (* count 180)))
+            ;; Core DynamicMemoryUsage(): the malloc-modeled memory usage the
+            ;; -maxmempool cap is keyed on (rpc/mempool.cpp:1041).
+            ("usage" . ,(bitcoin-lisp.mempool:mempool-dynamic-usage mempool))
             ("total_fee" . ,(/ total-fee-sat 100000000.0d0))
             ("maxmempool" . ,(bitcoin-lisp.mempool::mempool-max-size mempool))
             ("mempoolminfee" . ,min-fee-btc-kvb)

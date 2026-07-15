@@ -338,6 +338,17 @@ Any non-push opcode -- or a push that runs past the end -- fails."
           (t (return-from %op-return-push-only-p nil)))))           ; non-push opcode
     (= i len)))                          ; NIL if a push overran the script end
 
+(defun null-data-script-p (script-pubkey)
+  "True for a NULL_DATA (OP_RETURN data-carrier) scriptPubKey: a leading
+OP_RETURN whose remaining bytes are push-only (Core Solver's NULL_DATA
+classification, script/solver.cpp). Size is deliberately NOT considered —
+the -datacarriersize limit is a shared per-transaction budget, checked in
+VALIDATE-TRANSACTION-FOR-MEMPOOL against each such output's whole script
+size (Core IsStandardTx, policy.cpp:136-150)."
+  (and (>= (length script-pubkey) 1)
+       (= (aref script-pubkey 0) #x6a)   ; OP_RETURN
+       (%op-return-push-only-p script-pubkey)))
+
 (defun standard-output-script-p (script-pubkey)
   "Check if SCRIPT-PUBKEY is a standard output script type.
 Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
@@ -375,16 +386,14 @@ Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
      (and (>= len 4) (<= len 42)
           (<= #x51 (aref script-pubkey 0) #x60)   ; OP_1..OP_16
           (= (aref script-pubkey 1) (- len 2)))   ; single direct push of the program
-     ;; OP_RETURN data carrier — gated by -datacarrier, sized by
-     ;; -datacarriersize (mempool policy, not consensus). The bytes after
-     ;; OP_RETURN must be push-only: Core's Solver only classifies NULL_DATA when
-     ;; scriptPubKey.IsPushOnly(begin()+1) (solver.cpp), so an OP_RETURN carrying
-     ;; any non-push opcode is nonstandard.
-     (and bitcoin-lisp:*accept-datacarrier*
-          (>= len 1)
-          (<= len bitcoin-lisp:*max-datacarrier-bytes*)
-          (= (aref script-pubkey 0) #x6a)   ; OP_RETURN
-          (%op-return-push-only-p script-pubkey))
+     ;; OP_RETURN data carrier. Core's Solver classifies NULL_DATA whenever
+     ;; the bytes after OP_RETURN are push-only (solver.cpp) — with no size
+     ;; cap and no -datacarrier gate here: those live in the SHARED
+     ;; per-transaction byte budget that IsStandardTx tracks across all
+     ;; NULL_DATA outputs (policy.cpp:136-150), enforced in
+     ;; validate-transaction-for-mempool's output loop. An OP_RETURN carrying
+     ;; any non-push opcode is TxoutType::NONSTANDARD, hence rejected HERE.
+     (null-data-script-p script-pubkey)
      ;; Bare (non-P2SH) multisig — standard only when -permitbaremultisig.
      (and bitcoin-lisp:*permit-bare-multisig*
           (bare-multisig-standard-p script-pubkey)))))
@@ -632,16 +641,32 @@ decide (Core PreChecks, validation.cpp:950-970)."
         (return-from validate-transaction-for-mempool
           (values nil :scriptsig-not-pushonly nil)))))
 
-  ;; Policy: all outputs must be standard script types, and none dust
-  (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
-    (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
-      (unless (standard-output-script-p spk)
-        (return-from validate-transaction-for-mempool
-          (values nil :non-standard-output nil)))
-      (when (< (bitcoin-lisp.serialization:tx-out-value output)
-               (dust-threshold spk))
-        (return-from validate-transaction-for-mempool
-          (values nil :dust nil)))))
+  ;; Policy: all outputs must be standard script types, and none dust.
+  ;; OP_RETURN outputs share ONE -datacarriersize byte budget across the
+  ;; whole transaction: each NULL_DATA output's raw scriptPubKey size is
+  ;; drawn from it and an output that would overdraw is rejected
+  ;; "datacarrier" (Core IsStandardTx, policy.cpp:136-150 — since the 2025
+  ;; relaxation there is no per-output cap and no output-count cap, only
+  ;; this shared budget). -datacarrier=0 zeroes the budget, so any OP_RETURN
+  ;; output fails with the same reason (Core mempool_args.cpp:95-98:
+  ;; max_datacarrier_bytes = nullopt -> value_or(0)).
+  (let ((datacarrier-bytes-left (if bitcoin-lisp:*accept-datacarrier*
+                                    bitcoin-lisp:*max-datacarrier-bytes*
+                                    0)))
+    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
+      (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+        (unless (standard-output-script-p spk)
+          (return-from validate-transaction-for-mempool
+            (values nil :non-standard-output nil)))
+        (when (null-data-script-p spk)
+          (when (> (length spk) datacarrier-bytes-left)
+            (return-from validate-transaction-for-mempool
+              (values nil :datacarrier nil)))
+          (decf datacarrier-bytes-left (length spk)))
+        (when (< (bitcoin-lisp.serialization:tx-out-value output)
+                 (dust-threshold spk))
+          (return-from validate-transaction-for-mempool
+            (values nil :dust nil))))))
 
   ;; Check for duplicate in mempool
   (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
