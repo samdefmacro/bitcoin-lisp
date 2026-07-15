@@ -1518,6 +1518,69 @@ store-undo-data (the connect path, which does the height bookkeeping) caches."
   (or (gethash block-hash *block-undo-data*)
       (load-undo-data-from-disk block-hash)))
 
+;;;; Recently-confirmed transactions + most-recent-block tx set
+;;;;
+;;;; Two small tip-following structures Core keeps for tx relay, maintained
+;;;; here because every block-connect path (IBD, relay, compact blocks,
+;;;; reorg reconnect) funnels through this file:
+;;;;
+;;;;  - The recent-confirmed filter (Core m_lazy_recent_confirmed_transactions,
+;;;;    txdownloadman_impl.h:120-128, a CRollingBloomFilter{48000, 0.000001}):
+;;;;    txids AND wtxids of txs confirmed in recent blocks, so freshly-mined
+;;;;    txs aren't re-requested or re-processed when a slower peer announces
+;;;;    them (AlreadyHaveTx, txdownloadman_impl.cpp:144). Reset on block
+;;;;    DISCONNECT (reorg) so previously-confirmed txs can relay again
+;;;;    (BlockDisconnected, txdownloadman_impl.cpp:112-123).
+;;;;
+;;;;  - The most-recent-block tx map (Core m_most_recent_block_txs,
+;;;;    net_processing.cpp:869, rebuilt in NewPoWValidBlock:2121-2132): the
+;;;;    newest block's txs keyed by txid and wtxid, so a getdata for a
+;;;;    just-confirmed tx is still served even though it left the mempool
+;;;;    (FindTxForGetData's second source, net_processing.cpp:2507-2514).
+
+(defvar *recent-confirmed-txs* (bitcoin-lisp:make-rejects-filter 48000)
+  "Bounded rolling set of recently-confirmed txids/wtxids (Core
+m_lazy_recent_confirmed_transactions). Reuses the recent-rejects ring
+structure, sized like Core: 48,000 entries covers ~a couple hours of blocks.")
+
+(defvar *most-recent-block-txs* nil
+  "Hash-table (equalp) mapping the most recent connected block's tx ids —
+txid AND wtxid — to their transactions, or NIL before any block connects
+(Core m_most_recent_block_txs). Replaced wholesale on every tip advance.")
+
+(defun recently-confirmed-p (hash)
+  "T if HASH (txid or wtxid) was confirmed in a recent block."
+  (and (bitcoin-lisp:recent-reject-p *recent-confirmed-txs* hash) t))
+
+(defun most-recent-block-tx (hash)
+  "The most recent block's transaction with txid or wtxid HASH, or NIL."
+  (and *most-recent-block-txs*
+       (gethash hash *most-recent-block-txs*)))
+
+(defun reset-recent-confirmed ()
+  "Empty the recent-confirmed filter — on block disconnect (Core
+BlockDisconnected: a reorg may return confirmed txs to circulation, and the
+filter would otherwise block their relay) and at node start."
+  (bitcoin-lisp:clear-recent-rejects *recent-confirmed-txs*))
+
+(defun note-block-connected (block)
+  "Record BLOCK as the new most-recent block: rebuild the getdata-servable
+tx map and add every transaction's txid (and distinct wtxid) to the
+recent-confirmed filter (Core BlockConnected, txdownloadman_impl.cpp:98-110,
++ NewPoWValidBlock's most_recent_block_txs rebuild)."
+  (let ((map (make-hash-table :test 'equalp)))
+    (dolist (tx (coerce (bitcoin-lisp.serialization:bitcoin-block-transactions
+                         block)
+                        'list))
+      (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+            (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+        (setf (gethash txid map) tx)
+        (bitcoin-lisp:add-recent-reject *recent-confirmed-txs* txid)
+        (unless (equalp wtxid txid)
+          (setf (gethash wtxid map) tx)
+          (bitcoin-lisp:add-recent-reject *recent-confirmed-txs* wtxid))))
+    (setf *most-recent-block-txs* map)))
+
 ;;;; Block connection
 
 (defun connect-block (block chain-state block-store utxo-set
@@ -1601,12 +1664,23 @@ Handles chain reorganizations when a competing chain has more work."
            ;; inside the same critical section as the tip update.
            (when mempool
              (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)))
-           ;; Expire stale mempool/orphan entries once per block (outside the
-           ;; critical section), matching Bitcoin Core's expire-on-block.
-           (when mempool
-             (bitcoin-lisp.mempool:mempool-expire mempool)
-             (bitcoin-lisp.mempool:orphan-expire
-              (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
+           ;; Tx-relay tip bookkeeping (outside the critical section):
+           ;; expire stale mempool entries once per block (Core expire-on-
+           ;; block); erase orphans included in/conflicted by this block
+           ;; (Core BlockConnected -> TxOrphanage::EraseForBlock); record the
+           ;; block's txids/wtxids as recently confirmed and getdata-servable
+           ;; (Core m_lazy_recent_confirmed_transactions +
+           ;; m_most_recent_block_txs). A TARGETED chainstate — the assumeutxo
+           ;; historical chainstate re-deriving old history — must not touch
+           ;; these: its "tip" blocks are ancient, and Core only wires the
+           ;; validation-interface tx-relay callbacks to the ACTIVE chainstate
+           ;; (BlockConnected checks role, net_processing.cpp:2149-2157).
+           (unless (bitcoin-lisp.storage:chain-state-target-blockhash chain-state)
+             (when mempool
+               (bitcoin-lisp.mempool:mempool-expire mempool)
+               (bitcoin-lisp.mempool:orphan-erase-for-block
+                (bitcoin-lisp.mempool:mempool-orphan-pool mempool) block))
+             (note-block-connected block))
            ;; Core resets the recent-rejects filter on EVERY active tip change,
            ;; not just reorgs: cached failures (non-final, too-low-fee, missing
            ;; inputs) can become valid at the next block (ActiveTipChange,
@@ -1670,6 +1744,91 @@ Returns the common ancestor block-index-entry."
              (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
     (nreverse entries)))
 
+(defun %mempool-entry-invalid-after-reorg-p (mempool entry utxo-set eval-height
+                                             chain-state mtp locktime-time
+                                             csv-active)
+  "Core's filter_final_and_mature predicate (validation.cpp:341-382), run
+over a mempool entry after a reorg: T when the entry would be invalid in
+the next block on the NEW chain and must be removed with its descendants —
+no longer final, BIP68 sequence locks no longer satisfied, or spending a
+now-immature coinbase. EVAL-HEIGHT is the next block's height (new tip +
+1); MTP the new tip's median-time-past; LOCKTIME-TIME the BIP113 clock for
+absolute locktimes (MTP once CSV is active, mirroring the acceptance path)."
+  (let ((tx (bitcoin-lisp.mempool:mempool-entry-transaction entry)))
+    (or
+     ;; The transaction must still be final (Core CheckFinalTxAtTip:
+     ;; next-block height + tip MTP, validation.cpp:347-348).
+     (not (check-transaction-final tx eval-height locktime-time))
+     ;; BIP68 re-tested against the new chain. Core re-tests cached
+     ;; LockPoints and recalculates stale ones (TestLockPointValidity /
+     ;; CalculateLockPointsAtTip, validation.cpp:350-366); we cache no
+     ;; lockpoints, so always recalculate. In-mempool prevouts count as
+     ;; confirming in the next block, like acceptance (mempool-extra-coins).
+     (and csv-active
+          (multiple-value-bind (extra ok)
+              (mempool-extra-coins tx utxo-set mempool eval-height)
+            (or (not ok)   ; an input no longer exists anywhere — invalid
+                (not (check-sequence-locks tx utxo-set eval-height mtp
+                                           chain-state :pending-utxos extra)))))
+     ;; Coinbase spends must still be mature (validation.cpp:368-379):
+     ;; skip inputs funded by other mempool txs (unconfirmed, never
+     ;; coinbase); a confirmed coin must be COINBASE_MATURITY deep at the
+     ;; next block. Core has a per-entry spends-coinbase flag and asserts
+     ;; the coin exists; we scan the inputs and treat a missing coin as
+     ;; invalid (defensive — the re-add path should have removed it).
+     (block immature
+       (bitcoin-lisp.serialization:dovector
+           (input (bitcoin-lisp.serialization:transaction-inputs tx))
+         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                (ptxid (bitcoin-lisp.serialization:outpoint-hash prevout))
+                (pidx (bitcoin-lisp.serialization:outpoint-index prevout)))
+           (unless (bitcoin-lisp.mempool:mempool-has mempool ptxid)
+             (let ((utxo (bitcoin-lisp.storage:get-utxo utxo-set ptxid pidx)))
+               (cond ((null utxo)
+                      (return-from immature t))
+                     ((and (bitcoin-lisp.storage:utxo-entry-coinbase utxo)
+                           (< (- eval-height
+                                 (bitcoin-lisp.storage:utxo-entry-height utxo))
+                              +coinbase-maturity+))
+                      (return-from immature t)))))))
+       nil))))
+
+(defun remove-reorged-nonfinal-mempool-entries (mempool utxo-set height chain-state)
+  "Re-filter PRE-EXISTING mempool entries after a reorg — Core
+CTxMemPool::removeForReorg (txmempool.cpp:360-386) driven by
+filter_final_and_mature: entries that are non-final under the new tip, have
+BIP68 locks the shorter/different chain no longer satisfies, or spend
+now-immature coinbases are removed together with all their descendants.
+The re-add loop only vets the txs coming BACK from disconnected blocks;
+this pass covers what was already in the pool, whose validity the reorg may
+have silently revoked. HEIGHT is the NEW tip height. Returns the number of
+transactions removed."
+  (let* ((eval-height (1+ height))
+         (tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (mtp (compute-median-time-past chain-state tip-hash))
+         (csv-active (>= eval-height
+                         (get-csv-activation-height bitcoin-lisp:*network*)))
+         ;; BIP113: same clock the acceptance path uses (transaction.lisp).
+         (locktime-time (if csv-active
+                            mtp
+                            (bitcoin-lisp.serialization:get-unix-time)))
+         (flagged '()))
+    ;; Flag first (Core collects to_remove over all of mapTx), remove after —
+    ;; the entries table must not be mutated mid-iteration.
+    (bitcoin-lisp.mempool:mempool-for-each
+     mempool
+     (lambda (txid entry)
+       (when (%mempool-entry-invalid-after-reorg-p
+              mempool entry utxo-set eval-height chain-state
+              mtp locktime-time csv-active)
+         (push txid flagged))))
+    (let ((removed 0))
+      (dolist (txid flagged removed)
+        ;; May be gone already as an earlier removal's descendant.
+        (when (bitcoin-lisp.mempool:mempool-has mempool txid)
+          (incf removed (bitcoin-lisp.mempool:mempool-remove-recursive
+                         mempool txid)))))))
+
 (defun readd-disconnected-txs-to-mempool (mempool txs utxo-set height chain-state)
   "Re-add TXS from reorg-disconnected blocks into the mempool, best-effort —
 a port of Bitcoin Core's MaybeUpdateMempoolForReorg (validation.cpp:294-389).
@@ -1691,9 +1850,14 @@ Acceptance assumes a new entry has no in-mempool children — false for a
 previously-confirmed tx whose outputs pre-existing pool entries spend — so
 after the per-tx loop, MEMPOOL-UPDATE-FOR-REORG wires those parent->child
 dependencies in bulk and restores the cluster limits with ONE trim (Core
-UpdateTransactionsFromBlock, txmempool.cpp:91-120), and a final byte-cap
-trim re-limits the pool (Core LimitMempoolSize, validation.cpp:387)."
-  (when (and mempool txs)
+UpdateTransactionsFromBlock, txmempool.cpp:91-120). Then the PRE-EXISTING
+entries are re-filtered against the new tip (Core removeForReorg,
+validation.cpp:384-385 — finality, BIP68, coinbase maturity; the ordering
+is Core's MaybeUpdateMempoolForReorg exactly), and a final cap trim
+re-limits the pool (Core LimitMempoolSize, validation.cpp:387). Runs even
+with no TXS to re-add: the filter and trim concern the pool, not the
+disconnected blocks."
+  (when mempool
     (let ((readded '()))                ; txids, most-recently-confirmed first
       (dolist (tx txs)
         (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
@@ -1718,6 +1882,7 @@ trim re-limits the pool (Core LimitMempoolSize, validation.cpp:387)."
                mempool txid
                (length (bitcoin-lisp.serialization:transaction-outputs tx))))))
       (bitcoin-lisp.mempool:mempool-update-for-reorg mempool readded)
+      (remove-reorged-nonfinal-mempool-entries mempool utxo-set height chain-state)
       (bitcoin-lisp.mempool:mempool-trim-to-size mempool))))
 
 (defun %rollback-partial-reorg (chain-state block-store utxo-set
@@ -1924,6 +2089,14 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
 
           ;; PHASE C — commit side effects, only now the whole fork is valid
           ;; and applied. Oldest-to-newest for chain-order indexing.
+          ;;
+          ;; Blocks were disconnected: reset the recent-confirmed filter so
+          ;; previously-confirmed txs returning to circulation can relay
+          ;; again (Core BlockDisconnected -> RecentConfirmedTransactions
+          ;; Filter().reset(), txdownloadman_impl.cpp:112-123). Deferred to
+          ;; the commit phase alongside the other side effects: a rolled-back
+          ;; reorg never disconnected anything observably.
+          (reset-recent-confirmed)
           (dolist (item (reverse connected))
             (destructuring-bind (entry block height spent-utxos) item
               (when fee-estimator
@@ -1946,7 +2119,12 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
                 ;; loads its (already-reindexed) parent's running state.
                 (bitcoin-lisp:index-block-coinstats chain-state block hash height spent-utxos))
               (when mempool
-                (bitcoin-lisp.mempool:mempool-remove-for-block mempool block))))
+                (bitcoin-lisp.mempool:mempool-remove-for-block mempool block)
+                (bitcoin-lisp.mempool:orphan-erase-for-block
+                 (bitcoin-lisp.mempool:mempool-orphan-pool mempool) block))
+              ;; Each reconnected block counts as connected for the tx-relay
+              ;; tip structures; the LAST one leaves the map at the new tip.
+              (note-block-connected block)))
           ;; The disconnected old chain's txs stay in the tx-index: Core never
           ;; erases txindex entries on disconnect (index/base.h:136 CustomRemove
           ;; defaults to a no-op; index/txindex.cpp has no override). Txs

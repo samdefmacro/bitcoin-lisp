@@ -676,17 +676,6 @@ txgraph.cpp:2783-2808). The graph must not be oversized."
   (%assert-not-oversized graph 'txgraph-count-distinct-clusters)
   (hash-table-count (%distinct-clusters graph handles)))
 
-(defun txgraph-cluster-transaction-count (graph handles)
-  "Total number of transactions across the DISTINCT clusters that HANDLES
-belong to (the size of what Core GatherClusters would return,
-txmempool.cpp:968-991, used for the RBF 500-tx gather cap); removed handles
-are ignored. The graph must not be oversized."
-  (%assert-not-oversized graph 'txgraph-cluster-transaction-count)
-  (let ((n 0))
-    (loop for c being the hash-keys of (%distinct-clusters graph handles)
-          do (incf n (depgraph-tx-count (%cluster-depgraph c))))
-    n))
-
 ;;;; Diagram RBF staging (Core txgraph.cpp:2626-2834 staging overlay)
 ;;;;
 ;;;; Core keeps a copy-on-write "staging" level and derives the before/after

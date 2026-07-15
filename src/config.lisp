@@ -198,15 +198,24 @@ genesis sync) accepts headers normally until it crosses the floor."
         (:regtest  0))))
 
 (defvar *accept-datacarrier* t
-  "Mempool policy: accept OP_RETURN data-carrier outputs as standard
-(Bitcoin Core -datacarrier, default true). When NIL, any OP_RETURN output
-is non-standard and the tx is rejected from the mempool.")
+  "Mempool policy: accept OP_RETURN data-carrier outputs (Bitcoin Core
+-datacarrier, default true). When NIL the shared *MAX-DATACARRIER-BYTES*
+budget is treated as ZERO (Core mempool_args.cpp:95-98: max_datacarrier_bytes
+= nullopt -> value_or(0)), so any transaction with an OP_RETURN output is
+rejected \"datacarrier\"; the output's NULL_DATA classification itself is
+unchanged.")
 
-(defvar *max-datacarrier-bytes* 83
-  "Mempool policy: maximum total size of a standard OP_RETURN scriptPubKey
-in bytes (Bitcoin Core -datacarriersize is the DATA size, 80; this is the
-whole script = OP_RETURN + pushdata prefix + 80 data = 83). Consensus is
-unaffected; this only gates mempool standardness.")
+(defvar *max-datacarrier-bytes* 100000
+  "Mempool policy: the SHARED byte budget for OP_RETURN (data-carrier)
+outputs across a whole transaction (Bitcoin Core -datacarriersize). Every
+NULL_DATA output's raw scriptPubKey size — OP_RETURN byte + push opcodes +
+data — draws from the one budget, so multiple OP_RETURN outputs are standard
+as long as their total fits (Core IsStandardTx tracks datacarrier_bytes_left
+over all outputs, policy.cpp:136-150; the old per-output 83-byte cap and the
+one-OP_RETURN-per-tx rule are gone since the 2025 relaxation). Default
+MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR =
+100,000 (policy.h:81-83). Consensus is unaffected; this only gates mempool
+standardness.")
 
 (defvar *peer-block-filters* nil
   "When true (and the block filter index is enabled), serve BIP157 compact

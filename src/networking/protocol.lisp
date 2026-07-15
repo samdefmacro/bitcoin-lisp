@@ -149,7 +149,10 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "inv")
-     (handle-inv peer payload chain-state mempool :recent-rejects recent-rejects)
+     (handle-inv peer payload chain-state mempool
+                 :recent-rejects recent-rejects
+                 :peers peers
+                 :utxo-set utxo-set)
      t)
 
     ((string= command "headers")
@@ -286,12 +289,36 @@ Returns T if message was handled, NIL otherwise."
 ;;; it at once, and if the one peer we asked never delivered, the tx was lost
 ;;; until re-announced. We keep at most one outstanding request per txid, record
 ;;; the other announcers as failover candidates, and re-route to one of them if
-;;; the request times out.
+;;; the request times out, the peer answers notfound, or it disconnects.
+;;;
+;;; Wave 9 adds Core's txrequest protections (src/txrequest.cpp constants and
+;;; their use in src/node/txdownloadman_impl.cpp:196-282 at d3056bc):
+;;;   - MAX_PEER_TX_ANNOUNCEMENTS (5000): announcements beyond a peer's cap
+;;;     are dropped outright.
+;;;   - Request-time delays: NONPREF_PEER_TX_DELAY (2s) for non-preferred
+;;;     (inbound) peers, TXID_RELAY_DELAY (2s) for txid-based announcements
+;;;     while wtxid-relay peers are connected, OVERLOADED_PEER_TX_DELAY (2s)
+;;;     for peers with >= MAX_PEER_TX_REQUEST_IN_FLIGHT (100) requests
+;;;     outstanding. A delayed announcement becomes a candidate; the
+;;;     scheduler (process-tx-requests, run ~1x/second from the sync loop)
+;;;     requests it once due, preferring preferred (outbound) candidates.
+;;;   - GETDATA_TX_INTERVAL (60s) expiry with failover, and DisconnectedPeer
+;;;     cleanup: a disconnecting peer's announcements are forgotten and its
+;;;     in-flight requests become immediately re-schedulable.
+;;;
+;;; Simplified vs Core's full 3-state priority machinery (txrequest.cpp):
+;;; no per-(peer,txhash) priority hashing — candidate selection is preferred-
+;;; first then earliest-ready; expiry failover selects among currently-ready
+;;; candidates instead of promoting the exact next-by-priority announcement;
+;;; and the scheduler runs on a ~1s cadence rather than per SendMessages pass.
 
 (defvar *tx-in-flight* (make-hash-table :test 'equalp)
   "txid -> (peer . request-internal-real-time); at most one per txid.")
 (defvar *tx-announcers* (make-hash-table :test 'equalp)
-  "txid -> list of peers that announced it (failover candidates).")
+  "hash -> list of (peer . ready-internal-real-time) announcements — failover
+candidates, each requestable once its ready time (announcement time + Core's
+NONPREF/TXID/OVERLOADED delays) passes. The peer currently in flight stays in
+this list; its cons is the record that it announced the hash.")
 (defvar *tx-request-wtxid-p* (make-hash-table :test 'equalp)
   "hash -> T when the tracked announcement is wtxid-based (BIP339 MSG_WTX).
 Core's TxRequestTracker stores GenTxids, so every entry remembers whether it
@@ -300,39 +327,227 @@ a wtxid entry MUST go out as MSG_WTX and for a txid entry as
 MSG_TX|witness-flag (net_processing.cpp:6207). A wtxid re-requested under
 MSG_WITNESS_TX is interpreted by Core peers as a TXID lookup and answered
 notfound, so failover would silently never work for segwit txs.")
+(defvar *tx-peer-announcements* (make-hash-table :test 'eq)
+  "peer -> number of tracked announcements (candidates + in-flight), for the
+MAX_PEER_TX_ANNOUNCEMENTS cap (Core m_txrequest.Count(peer)).")
+(defvar *tx-peer-in-flight* (make-hash-table :test 'eq)
+  "peer -> number of in-flight getdata requests, for the overloaded-peer
+delay (Core m_txrequest.CountInFlight(peer)).")
 (defvar *tx-request-lock* (bt:make-lock "tx-request"))
+
 (defparameter +tx-request-timeout-seconds+ 60
-  "Re-route a tx getdata to another announcer after this long with no delivery
-(Bitcoin Core GETDATA_TX_INTERVAL is 60s for non-preferred peers).")
+  "Expire an outstanding tx getdata after this long with no delivery and fail
+over to another announcer (Core GETDATA_TX_INTERVAL, txdownloadman.h:38).")
+(defconstant +max-peer-tx-announcements+ 5000
+  "Per-peer cap on tracked tx announcements; beyond it new announcements from
+the peer are dropped (Core MAX_PEER_TX_ANNOUNCEMENTS, txdownloadman.h:30).")
+(defconstant +max-peer-tx-request-in-flight+ 100
+  "In-flight request count above which a peer's further announcements get the
+overloaded delay (Core MAX_PEER_TX_REQUEST_IN_FLIGHT, txdownloadman.h:25).")
+(defconstant +nonpref-peer-tx-delay-seconds+ 2
+  "Request delay for announcements from non-preferred (inbound) peers (Core
+NONPREF_PEER_TX_DELAY, txdownloadman.h:34).")
+(defconstant +txid-relay-delay-seconds+ 2
+  "Extra delay for txid-based announcements while wtxid-relay peers are
+connected — preferring the malleation-proof id (Core TXID_RELAY_DELAY,
+txdownloadman.h:32).")
+(defconstant +overloaded-peer-tx-delay-seconds+ 2
+  "Extra delay for announcements from overloaded peers (Core
+OVERLOADED_PEER_TX_DELAY, txdownloadman.h:36).")
 
 (defun reset-tx-requests ()
   "Clear all tx-request tracking (called at node start)."
   (bt:with-lock-held (*tx-request-lock*)
     (clrhash *tx-in-flight*)
     (clrhash *tx-announcers*)
-    (clrhash *tx-request-wtxid-p*)))
+    (clrhash *tx-request-wtxid-p*)
+    (clrhash *tx-peer-announcements*)
+    (clrhash *tx-peer-in-flight*)))
 
-(defun tx-request-wanted-p (txid peer &optional wtxidp)
-  "Record PEER as an announcer of TXID and return T iff we should send a getdata
-to PEER now — i.e. no request for TXID is currently outstanding. NIL means a
-request is already in flight and PEER is retained only as a failover candidate.
-WTXIDP marks the announcement as wtxid-based (MSG_WTX): the id type is a
-property of the announced hash itself and is remembered for the lifetime of
-the entry, so a timed-out request fails over with the SAME id type."
-  (bt:with-lock-held (*tx-request-lock*)
-    (pushnew peer (gethash txid *tx-announcers*))
-    (setf (gethash txid *tx-request-wtxid-p*) wtxidp)
-    (cond ((gethash txid *tx-in-flight*) nil)
-          (t (setf (gethash txid *tx-in-flight*)
-                   (cons peer (get-internal-real-time)))
-             t))))
+(defun tx-request-preferred-p (peer)
+  "Preferred announcers are requested first and without the non-preferred
+delay: outbound connections (Core's fPreferredDownload — outbound or NoBan
+permission; we have no permission flags)."
+  (not (peer-inbound peer)))
 
-(defun tx-request-received (txid)
-  "Clear tracking for TXID once the tx arrives (or is otherwise resolved)."
+(defun %tx-announcement-delay-ticks (peer wtxidp num-wtxid-peers)
+  "The announcement's request delay in internal-time ticks — the sum Core
+computes in AddTxAnnouncement (txdownloadman_impl.cpp:210-219)."
+  (* internal-time-units-per-second
+     (+ (if (tx-request-preferred-p peer) 0 +nonpref-peer-tx-delay-seconds+)
+        (if (and (not wtxidp) (plusp num-wtxid-peers))
+            +txid-relay-delay-seconds+ 0)
+        (if (>= (gethash peer *tx-peer-in-flight* 0)
+                +max-peer-tx-request-in-flight+)
+            +overloaded-peer-tx-delay-seconds+ 0))))
+
+(defun %tx-request-mark-in-flight (hash peer now)
+  "Lock held: record an outstanding getdata for HASH to PEER."
+  (setf (gethash hash *tx-in-flight*) (cons peer now))
+  (incf (gethash peer *tx-peer-in-flight* 0)))
+
+(defun %tx-request-clear-in-flight (hash)
+  "Lock held: drop HASH's outstanding request, fixing the peer's count."
+  (let ((entry (gethash hash *tx-in-flight*)))
+    (when entry
+      (let ((n (1- (gethash (car entry) *tx-peer-in-flight* 1))))
+        (if (plusp n)
+            (setf (gethash (car entry) *tx-peer-in-flight*) n)
+            (remhash (car entry) *tx-peer-in-flight*)))
+      (remhash hash *tx-in-flight*))))
+
+(defun %tx-request-drop-announcer (hash peer)
+  "Lock held: remove PEER's announcement of HASH (if any), fixing its count.
+Removes the whole entry when no announcers remain."
+  (let* ((anns (gethash hash *tx-announcers*))
+         (ann (assoc peer anns :test #'eq)))
+    (when ann
+      (let ((rest (remove ann anns)))
+        (if rest
+            (setf (gethash hash *tx-announcers*) rest)
+            (progn (remhash hash *tx-announcers*)
+                   (remhash hash *tx-request-wtxid-p*))))
+      (let ((n (1- (gethash peer *tx-peer-announcements* 1))))
+        (if (plusp n)
+            (setf (gethash peer *tx-peer-announcements*) n)
+            (remhash peer *tx-peer-announcements*))))))
+
+(defun tx-request-count (peer)
+  "Number of announcements tracked for PEER (Core m_txrequest.Count)."
   (bt:with-lock-held (*tx-request-lock*)
-    (remhash txid *tx-in-flight*)
-    (remhash txid *tx-announcers*)
-    (remhash txid *tx-request-wtxid-p*)))
+    (gethash peer *tx-peer-announcements* 0)))
+
+(defun tx-request-wanted-p (hash peer &optional wtxidp (num-wtxid-peers 0))
+  "Record PEER as an announcer of HASH and return T iff a getdata should go to
+PEER immediately — no request outstanding and the announcement carries no
+delay. NIL means the announcement was either dropped (per-peer cap), retained
+as a failover candidate behind an in-flight request, or deferred until its
+Core-mandated delay passes (the scheduler sends it then). WTXIDP marks the
+announcement as wtxid-based (MSG_WTX): the id type is a property of the
+announced hash itself and is remembered for the lifetime of the entry, so a
+timed-out request fails over with the SAME id type. NUM-WTXID-PEERS is the
+count of connected wtxid-relay peers, driving Core's TXID_RELAY_DELAY."
+  (bt:with-lock-held (*tx-request-lock*)
+    (let ((anns (gethash hash *tx-announcers*)))
+      ;; Duplicate announcement from the same peer: nothing new to record.
+      (when (assoc peer anns :test #'eq)
+        (return-from tx-request-wanted-p nil))
+      ;; MAX_PEER_TX_ANNOUNCEMENTS: drop, don't record
+      ;; (txdownloadman_impl.cpp:204-207).
+      (when (>= (gethash peer *tx-peer-announcements* 0)
+                +max-peer-tx-announcements+)
+        (return-from tx-request-wanted-p nil))
+      (let* ((now (get-internal-real-time))
+             (ready (+ now (%tx-announcement-delay-ticks peer wtxidp
+                                                         num-wtxid-peers))))
+        (push (cons peer ready) (gethash hash *tx-announcers*))
+        (incf (gethash peer *tx-peer-announcements* 0))
+        (setf (gethash hash *tx-request-wtxid-p*) wtxidp)
+        (cond ((gethash hash *tx-in-flight*) nil)
+              ((> ready now) nil)        ; deferred; scheduler sends when due
+              (t (%tx-request-mark-in-flight hash peer now)
+                 t))))))
+
+(defun tx-request-received (hash)
+  "Clear tracking for HASH once the tx arrives (or is otherwise resolved) —
+Core ForgetTxHash: every peer's announcement of it is released."
+  (bt:with-lock-held (*tx-request-lock*)
+    (%tx-request-clear-in-flight hash)
+    (dolist (ann (gethash hash *tx-announcers*))
+      (let ((n (1- (gethash (car ann) *tx-peer-announcements* 1))))
+        (if (plusp n)
+            (setf (gethash (car ann) *tx-peer-announcements*) n)
+            (remhash (car ann) *tx-peer-announcements*))))
+    (remhash hash *tx-announcers*)
+    (remhash hash *tx-request-wtxid-p*)))
+
+(defun tx-request-notfound (peer hash)
+  "PEER answered notfound for HASH: mark its announcement completed (Core
+ReceivedNotFound -> m_txrequest.ReceivedResponse) so the request fails over
+to another announcer on the next scheduler pass instead of burning the full
+timeout."
+  (bt:with-lock-held (*tx-request-lock*)
+    (let ((entry (gethash hash *tx-in-flight*)))
+      (when (and entry (eq (car entry) peer))
+        (%tx-request-clear-in-flight hash)))
+    (%tx-request-drop-announcer hash peer)))
+
+(defun tx-request-disconnected-peer (peer)
+  "Forget every announcement PEER made and release its in-flight requests so
+other announcers take over (Core TxRequestTracker::DisconnectedPeer via
+TxDownloadManagerImpl::DisconnectedPeer). Failover getdatas go out on the
+next scheduler pass — deliberately not from here, which may run on a non-sync
+thread. Registered as *peer-disconnect-hook*."
+  (bt:with-lock-held (*tx-request-lock*)
+    ;; Release in-flight requests held by this peer.
+    (let ((held '()))
+      (maphash (lambda (hash entry)
+                 (when (eq (car entry) peer) (push hash held)))
+               *tx-in-flight*)
+      (dolist (hash held) (%tx-request-clear-in-flight hash)))
+    ;; Forget its announcements.
+    (let ((announced '()))
+      (maphash (lambda (hash anns)
+                 (when (assoc peer anns :test #'eq) (push hash announced)))
+               *tx-announcers*)
+      (dolist (hash announced) (%tx-request-drop-announcer hash peer)))
+    (remhash peer *tx-peer-announcements*)
+    (remhash peer *tx-peer-in-flight*)))
+
+;;; Registered here rather than called directly from peer.lisp (which loads
+;;; first): the tracker must observe every disconnect path.
+(setf *peer-disconnect-hook* #'tx-request-disconnected-peer)
+
+(defun %tx-request-best-candidate (anns now &optional exclude)
+  "The best requestable announcement in ANNS at NOW: ready (delay passed),
+peer :ready, not EXCLUDE — preferred (outbound) peers first, then earliest
+ready time (Core GetRequestable's CANDIDATE_BEST selection, simplified)."
+  (let ((best nil))
+    (dolist (ann anns best)
+      (destructuring-bind (peer . ready) ann
+        (when (and (not (eq peer exclude))
+                   (<= ready now)
+                   (eq (peer-state peer) :ready))
+          (when (or (null best)
+                    (let ((bp (tx-request-preferred-p (car best)))
+                          (ap (tx-request-preferred-p peer)))
+                      (or (and ap (not bp))
+                          (and (eq ap bp) (< ready (cdr best))))))
+            (setf best ann)))))))
+
+(defun process-tx-requests ()
+  "Send getdatas for announcements whose delay has passed and that have no
+request outstanding — the scheduler half of Core's GetRequestsToSend
+(txdownloadman_impl.cpp:264-284), run ~1x/second from the sync loop. Each
+hash goes to its best ready candidate (preferred first). Returns the number
+of requests sent."
+  (let ((now (get-internal-real-time))
+        (to-send '()))                  ; (peer . list-of-invs)
+    (bt:with-lock-held (*tx-request-lock*)
+      (maphash
+       (lambda (hash anns)
+         (unless (gethash hash *tx-in-flight*)
+           (let ((best (%tx-request-best-candidate anns now)))
+             (when best
+               (let ((peer (car best))
+                     (wtxidp (gethash hash *tx-request-wtxid-p*)))
+                 (%tx-request-mark-in-flight hash peer now)
+                 (let ((bucket (assoc peer to-send :test #'eq)))
+                   (if bucket
+                       (push (tx-request-inv hash wtxidp peer) (cdr bucket))
+                       (push (list peer (tx-request-inv hash wtxidp peer))
+                             to-send))))))))
+       *tx-announcers*))
+    ;; Send outside the lock, one getdata per peer.
+    (let ((sent 0))
+      (loop for (peer . invs) in to-send
+            do (incf sent (length invs))
+               (handler-case
+                   (send-message peer
+                                 (bitcoin-lisp.serialization:make-getdata-message
+                                  invs))
+                 (error () nil)))
+      sent)))
 
 (defun tx-fetch-inv-type (peer)
   "Inv type for a TXID-based tx getdata to PEER: MSG_TX|MSG_WITNESS_FLAG when
@@ -357,9 +572,10 @@ wtxid-based entry, MSG_TX|witness-flag for a txid-based one — Core's
    :hash hash))
 
 (defun retry-timed-out-tx-requests ()
-  "Re-route each in-flight tx getdata outstanding longer than the timeout to the
-next ready announcer (other than the one that timed out); drop tracking for a
-tx with no other announcer. Returns the number re-requested."
+  "Re-route each in-flight tx getdata outstanding longer than
+GETDATA_TX_INTERVAL to the next ready announcer (the timed-out peer's
+announcement is dropped — Core's expiry marks it COMPLETED); drop tracking
+for a tx with no other ready announcer. Returns the number re-requested."
   (let ((now (get-internal-real-time))
         (timeout-ticks (* +tx-request-timeout-seconds+ internal-time-units-per-second))
         (reroutes '()))
@@ -371,17 +587,26 @@ tx with no other announcer. Returns the number re-requested."
                  *tx-in-flight*)
         (dolist (item timed-out)
           (let* ((txid (car item))
-                 (old-peer (cadr item))
-                 (next (find-if (lambda (p) (and (not (eq p old-peer))
-                                                 (eq (peer-state p) :ready)))
-                                (gethash txid *tx-announcers*))))
-            (if next
-                (progn (setf (gethash txid *tx-in-flight*) (cons next now))
-                       (push (list txid next (gethash txid *tx-request-wtxid-p*))
-                             reroutes))
-                (progn (remhash txid *tx-in-flight*)
-                       (remhash txid *tx-announcers*)
-                       (remhash txid *tx-request-wtxid-p*)))))))
+                 (old-peer (cadr item)))
+            (%tx-request-clear-in-flight txid)
+            ;; The expired announcement is completed (Core txrequest expiry).
+            (%tx-request-drop-announcer txid old-peer)
+            (let ((next (%tx-request-best-candidate
+                         (gethash txid *tx-announcers*) now old-peer)))
+              (if next
+                  (progn (%tx-request-mark-in-flight txid (car next) now)
+                         (push (list txid (car next)
+                                     (gethash txid *tx-request-wtxid-p*))
+                               reroutes))
+                  ;; No READY candidate right now. Entries with only delayed
+                  ;; candidates stay for the scheduler; entries with no
+                  ;; announcers at all were already dropped above.
+                  (let ((anns (gethash txid *tx-announcers*)))
+                    (unless (find-if (lambda (ann)
+                                       (eq (peer-state (car ann)) :ready))
+                                     anns)
+                      (dolist (ann anns)
+                        (%tx-request-drop-announcer txid (car ann)))))))))))
     ;; Send getdata outside the lock. The re-request must carry the id type the
     ;; entry was announced under: a wtxid entry as MSG_WTX, a txid entry as
     ;; MSG_TX|witness-flag. Previously every failover went out as
@@ -439,7 +664,53 @@ within +max-tip-age-seconds+ of now — Core UpdateIBDStatus
           nil)
         t)))
 
-(defun handle-inv (peer payload chain-state &optional mempool &key recent-rejects)
+(defun count-wtxid-relay-peers (peers)
+  "Number of connected peers that negotiated BIP339 wtxid relay (Core
+m_num_wtxid_peers, txdownloadman_impl.cpp ConnectedPeer/DisconnectedPeer).
+Drives the TXID_RELAY_DELAY on txid-based announcements."
+  (count-if (lambda (p) (and (eq (peer-state p) :ready)
+                             (peer-wtxid-relay p)))
+            peers))
+
+(defun %already-have-tx-p (hash wtxidp mempool recent-rejects)
+  "Core AlreadyHaveTx (txdownloadman_impl.cpp:126-148): the orphanage (HASH
+cast to a wtxid — never a real txid lookup, witness malleation makes txid
+matches unreliable; for non-segwit txs txid == wtxid so the cast still finds
+them), the recent-confirmed filter, recent rejects, and the mempool by the id
+the announcement implies."
+  (or (bitcoin-lisp.mempool:orphan-have
+       (bitcoin-lisp.mempool:mempool-orphan-pool mempool) hash)
+      (bitcoin-lisp.validation:recently-confirmed-p hash)
+      (bitcoin-lisp:recent-reject-p recent-rejects hash)
+      (if wtxidp
+          (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash)
+          (bitcoin-lisp.mempool:mempool-has mempool hash))))
+
+(defun %maybe-add-orphan-resolution-candidate (peer orphan-wtxid mempool utxo-set
+                                               recent-rejects num-wtxid-peers)
+  "A wtxid announcement matched a stored orphan: treat PEER as an orphan-
+resolution candidate instead of requesting the announced tx again (Core
+AddTxAnnouncement's orphan branch + MaybeAddOrphanResolutionCandidate,
+txdownloadman_impl.cpp:172-282): unless PEER already announced this orphan,
+register its still-missing parents with the tx-request tracker as txid-based
+announcements from PEER (with the usual delays; the per-parent cap check
+lives in request-orphan-parents) and record PEER as an additional announcer."
+  (let* ((pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool))
+         (otx (bitcoin-lisp.mempool:orphan-tx pool orphan-wtxid)))
+    (when (and otx (not (bitcoin-lisp.mempool:orphan-have-from-peer
+                         pool orphan-wtxid peer)))
+      (let ((parents (remove-if
+                      (lambda (ptxid)
+                        (%already-have-tx-p ptxid nil mempool recent-rejects))
+                      (missing-parent-txids otx utxo-set mempool))))
+        ;; All parents accepted/rejected since the orphan was stored: nothing
+        ;; to resolve from this peer (the orphan awaits reprocessing).
+        (when parents
+          (when (request-orphan-parents peer parents num-wtxid-peers)
+            (bitcoin-lisp.mempool:orphan-add pool otx peer)))))))
+
+(defun handle-inv (peer payload chain-state &optional mempool
+                   &key recent-rejects peers utxo-set)
   "Handle an inv message.
 
 For block invs we DO NOT request the block directly via getdata — under
@@ -450,9 +721,13 @@ would drop it with WARN: Received unknown block. Instead, on the first
 unknown block hash we send a getheaders sourced from our header tip;
 once headers connect, the IBD/follow-tip path issues the actual getdata.
 
-Mirrors Bitcoin Core net_processing.cpp:4153-4211 (best_block tracking
-plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
+Mirrors Bitcoin Core net_processing.cpp:4126-4214 (reject_tx_invs,
+wtxidrelay-mismatch skip, AddTxAnnouncement, best_block tracking plus a
+single MaybeSendGetHeaders after the inv vector is fully scanned)."
   (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
+        (reject-tx-invs (or (not (relay-enabled-p))
+                            (not (peer-relays-txs-p peer))))
+        (num-wtxid-peers (count-wtxid-relay-peers peers))
         (wanted '())
         (unknown-block-hash nil))
     (dolist (inv inv-vectors)
@@ -475,29 +750,51 @@ plus a single MaybeSendGetHeaders after the inv vector is fully scanned)."
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
+           ;; Tx invs in violation of our advertised fRelay=0 (blocksonly
+           ;; mainnet default, block-relay/feeler conns): disconnect (Core
+           ;; net_processing.cpp:4168-4172).
+           (when reject-tx-invs
+             (bitcoin-lisp:log-cat "net" "transaction inv sent in violation of protocol — disconnecting peer ~A"
+                                   (peer-address peer))
+             (disconnect-peer peer)
+             (return-from handle-inv))
+           ;; Ignore invs that don't match the wtxidrelay negotiation: a
+           ;; wtxidrelay peer never announces MSG_TX, a non-wtxidrelay peer
+           ;; never MSG_WTX (Core net_processing.cpp:4145-4152).
            (let ((wtxidp (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+)))
-             (when (and mempool
-                        ;; Core requests announced txs only outside IBD —
-                        ;; their inputs won't resolve against a stale UTXO
-                        ;; set anyway (net_processing.cpp:4176-4180 gates
-                        ;; AddTxAnnouncement on !IsInitialBlockDownload).
-                        (not (initial-block-download-p chain-state))
-                        ;; Dedup by the id the inv type implies.
-                        (not (if wtxidp
-                                 (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash)
-                                 (bitcoin-lisp.mempool:mempool-has mempool hash)))
-                        (not (bitcoin-lisp:recent-reject-p recent-rejects hash))
-                        ;; Records PEER as an announcer AND the id type of the
-                        ;; announcement (wtxid vs txid), so a timed-out request
-                        ;; fails over with the right inv type; T only if no
-                        ;; request for this hash is already outstanding (dedup
-                        ;; across peers). txids and wtxids never collide.
-                        (tx-request-wanted-p hash peer wtxidp))
-               ;; Request with the id type the announcement used: wtxids as
-               ;; MSG_WTX, txids as MSG_TX|WITNESS_FLAG — Core's
-               ;; "gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags(peer))"
-               ;; (net_processing.cpp:6207).
-               (push (tx-request-inv hash wtxidp peer) wanted)))))))
+             (unless (if (peer-wtxid-relay peer)
+                         (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
+                         wtxidp)
+               (when (and mempool
+                          ;; Core requests announced txs only outside IBD —
+                          ;; their inputs won't resolve against a stale UTXO
+                          ;; set anyway (net_processing.cpp:4176-4180 gates
+                          ;; AddTxAnnouncement on !IsInitialBlockDownload).
+                          (not (initial-block-download-p chain-state)))
+                 (cond
+                   ;; A wtxid announcement matching a stored orphan makes
+                   ;; PEER an orphan-resolution candidate: fetch the missing
+                   ;; PARENTS from it, not the orphan again.
+                   ((and wtxidp utxo-set
+                         (bitcoin-lisp.mempool:orphan-have
+                          (bitcoin-lisp.mempool:mempool-orphan-pool mempool)
+                          hash))
+                    (%maybe-add-orphan-resolution-candidate
+                     peer hash mempool utxo-set recent-rejects num-wtxid-peers))
+                   ((%already-have-tx-p hash wtxidp mempool recent-rejects)
+                    nil)
+                   ;; Records PEER as an announcer AND the id type of the
+                   ;; announcement (wtxid vs txid), so a timed-out request
+                   ;; fails over with the right inv type; T only if no request
+                   ;; is outstanding AND the announcement carries no delay
+                   ;; (non-preferred / txid-relay / overloaded) — delayed ones
+                   ;; go out via process-tx-requests when due.
+                   ((tx-request-wanted-p hash peer wtxidp num-wtxid-peers)
+                    ;; Request with the id type the announcement used: wtxids
+                    ;; as MSG_WTX, txids as MSG_TX|WITNESS_FLAG — Core's
+                    ;; "gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags)"
+                    ;; (net_processing.cpp:6207).
+                    (push (tx-request-inv hash wtxidp peer) wanted))))))))))
     (when unknown-block-hash
       (bitcoin-lisp:log-cat "net" "inv: unknown block ~A from peer ~A — sending getheaders"
                               (bitcoin-lisp.crypto:bytes-to-hex unknown-block-hash)
@@ -517,10 +814,27 @@ disclaim so the IBD scheduler stops asking this peer for the block and
 releases it from in-flight for immediate retry elsewhere (see
 note-block-not-available). Without this we burn the full block-request
 timeout on every peer that lacks a stale-fork block before giving up.
-Mirrors Bitcoin Core's MSG NOTFOUND handling (net_processing.cpp)."
-  (dolist (inv (bitcoin-lisp.serialization:parse-inv-payload payload))
-    (when (block-inv-type-p (bitcoin-lisp.serialization:inv-vector-type inv))
-      (note-block-not-available peer (bitcoin-lisp.serialization:inv-vector-hash inv)))))
+For tx items, complete the peer's announcement in the tx-request tracker
+so the request fails over to another announcer instead of burning the
+60s expiry (Core ReceivedNotFound -> m_txrequest.ReceivedResponse,
+txdownloadman_impl.cpp:287-293). Mirrors Bitcoin Core's MSG NOTFOUND
+handling (net_processing.cpp)."
+  (let ((tx-completed nil))
+    (dolist (inv (bitcoin-lisp.serialization:parse-inv-payload payload))
+      (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
+            (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
+        (cond
+          ((block-inv-type-p inv-type)
+           (note-block-not-available peer hash))
+          ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
+               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
+               (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
+           (tx-request-notfound peer hash)
+           (setf tx-completed t)))))
+    ;; Fail over promptly: re-run the scheduler so another announcer's
+    ;; candidate is requested now rather than on the next 1s tick.
+    (when tx-completed
+      (process-tx-requests))))
 
 ;;; Headers handling
 
@@ -532,24 +846,17 @@ IBD pre-sync drain via handle-message, and BIP130 sendheaders announcements);
 like the Phase-1 sync-headers path it MUST validate before admission, or a peer
 could inject unchecked headers into the index — inflating chain-work with
 low-target headers lacking matching PoW and bypassing checkpoints at admission.
-Previously this admitted any header with a known parent, unvalidated."
+Routes through ingest-headers-from-peer (Core ProcessHeadersMessage), which
+adds the low-work anti-DoS presync gate this path previously lacked: during a
+from-genesis IBD the validated tip sits below the work floor, so
+process-headers' own gate is off and unbounded cheap headers could be
+committed to the index from announcements."
   (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-    ;; Node lock: process-headers mutates the block index, which the RPC
-    ;; threads (submitheader, chain queries) also touch under this lock —
-    ;; the same discipline handle-block already follows.
+    ;; Node lock: process-headers (inside ingest-headers-from-peer) mutates
+    ;; the block index, which the RPC threads (submitheader, chain queries)
+    ;; also touch under this lock — the same discipline handle-block follows.
     (with-node-lock
-      (multiple-value-bind (valid-headers error)
-          (validate-header-chain headers chain-state)
-        (when error
-          (bitcoin-lisp:log-warn "Header validation error: ~A" error))
-        (process-headers valid-headers chain-state)
-        ;; Per-peer availability: the peer's advertised tip is the last VALID
-        ;; header. Mirrors Core's UpdateBlockAvailability (net_processing.cpp).
-        (let ((last (car (last valid-headers))))
-          (when last
-            (update-block-availability
-             peer chain-state
-             (bitcoin-lisp.serialization:block-header-hash last))))))))
+      (ingest-headers-from-peer peer headers chain-state))))
 
 ;;; Block handling
 
@@ -680,35 +987,103 @@ STORED is 1/0 for the caller's log count, RELAY-ENTRY a
                        (address-routable-p (peer-address-ip pa) network))
               (cons pa (if reachable 2 1))))))
 
+(defun %refill-addr-token-bucket (peer &optional (now (get-internal-real-time)))
+  "Refill PEER's addr token bucket from elapsed time, once per addr/addrv2
+message (Core net_processing.cpp:4056-4064): only while below the soft cap,
+at +max-addr-rate-per-second+, clamped to the cap — so the getaddr-response
+bump above the cap is never refilled further but also not clawed back. The
+timestamp always advances."
+  (let ((cap (coerce +max-addr-processing-token-bucket+ 'double-float)))
+    (when (< (peer-addr-token-bucket peer) cap)
+      (let* ((elapsed (max 0 (- now (peer-addr-token-timestamp peer))))
+             (increment (* (/ (coerce elapsed 'double-float)
+                              internal-time-units-per-second)
+                           +max-addr-rate-per-second+)))
+        (setf (peer-addr-token-bucket peer)
+              (min (+ (peer-addr-token-bucket peer) increment) cap))))
+    (setf (peer-addr-token-timestamp peer) now)))
+
+(defun %process-gossiped-addresses (peer entries announced-count address-book peers)
+  "Shared addr/addrv2 processing core (the per-address loop of Core's
+ADDR/ADDRV2 handler, net_processing.cpp:4038-4118). ENTRIES is a list of
+(net-addr . timestamp); ANNOUNCED-COUNT is the message's declared address
+count. Applies the per-ADDRESS token bucket — addresses beyond the bucket
+are DROPPED, not queued (Core rate_limited branch; we have no per-peer Addr
+permission, so every peer is subject to it and only the getaddr-response
+bump exempts solicited replies). Processing order is shuffled first so an
+attacker cannot choose which addresses survive the limit (Core std::shuffle).
+Fresh routable addresses from small (<=10) UNSOLICITED announcements relay
+onward; a non-full message marks our outstanding getaddr answered. Returns
+the number stored."
+  (let* ((now (bitcoin-lisp.serialization:get-unix-time))
+         (source-group (when peer (peer-source-group peer)))
+         ;; Read before the end-of-message reset below, like Core (the reset
+         ;; runs after the loop): a getaddr response never relays onward.
+         (unsolicited (not (and peer (peer-getaddr-requested peer))))
+         (added 0)
+         (num-proc 0)
+         (num-rate-limit 0)
+         (relay-candidates '()))
+    (when peer
+      (%refill-addr-token-bucket peer))
+    (dolist (entry (alexandria:shuffle (copy-list entries)))
+      (cond
+        ((and peer (< (peer-addr-token-bucket peer) 1.0d0))
+         (incf num-rate-limit))
+        (t
+         (when peer
+           (decf (peer-addr-token-bucket peer) 1.0d0)
+           (incf num-proc))
+         (multiple-value-bind (stored relay)
+             (%ingest-gossiped-address (car entry) (cdr entry)
+                                       address-book source-group now)
+           (incf added stored)
+           (when relay (push relay relay-candidates))))))
+    (when peer
+      (incf (peer-addr-processed peer) num-proc)
+      (incf (peer-addr-rate-limited peer) num-rate-limit)
+      (when (plusp num-rate-limit)
+        (bitcoin-lisp:log-cat "net" "addr from peer ~A: ~D processed, ~D rate-limited"
+                              (peer-address peer) num-proc num-rate-limit))
+      ;; A non-full message answers our getaddr (Core: "if (vAddr.size() <
+      ;; 1000) peer.m_getaddr_sent = false", net_processing.cpp:4116).
+      (when (< announced-count bitcoin-lisp.serialization:+max-addr-count+)
+        (setf (peer-getaddr-requested peer) nil)))
+    (when (and peers unsolicited (<= announced-count 10))
+      (loop for (pa . max-targets) in relay-candidates
+            do (relay-address pa peer peers :now now :max-targets max-targets)))
+    added))
+
 (defun handle-addr (peer payload &optional address-book peers)
   "Handle an addr message. When ADDRESS-BOOK is provided, add plausible
 addresses (timestamp within last 3 hours) on reachable networks to the address
 book, keyed to the gossiping PEER as their source (addrman source-group
-spreading). Addresses with a timestamp within the last 10 minutes arriving in
-a small (<= 10 entries) unsolicited announcement are gossiped onward (Core
-RelayAddress)."
-  (let ((now (bitcoin-lisp.serialization:get-unix-time))
-        (source-group (when peer (peer-source-group peer)))
-        (added 0)
-        (relay-candidates '())
+spreading), subject to the per-address token bucket (see
+%process-gossiped-addresses). Ignored entirely from a block-relay-only peer
+(Core SetupAddressRelay, net_processing.cpp:4041); more than 1000 announced
+addresses is misbehavior (net_processing.cpp:4046-4050)."
+  (when (and peer (eq (peer-conn-type peer) :block-relay))
+    (bitcoin-lisp:log-cat "net" "ignoring addr message from block-relay-only peer ~A"
+                          (peer-address peer))
+    (return-from handle-addr 0))
+  (let ((entries '())
         (msg-count 0))
     (flexi-streams:with-input-from-sequence (stream payload)
       (let ((count (bitcoin-lisp.serialization:read-compact-size stream)))
+        (when (> count bitcoin-lisp.serialization:+max-addr-count+)
+          (when peer
+            (record-misbehavior peer (format nil "addr message size = ~D" count)))
+          (return-from handle-addr 0))
         (setf msg-count count)
-        (loop repeat (min count 1000)  ; Limit to prevent abuse
+        (loop repeat count
               do (multiple-value-bind (net-addr timestamp)
                      (bitcoin-lisp.serialization:read-net-addr stream :with-timestamp t)
-                   (multiple-value-bind (stored relay)
-                       (%ingest-gossiped-address net-addr timestamp
-                                                 address-book source-group now)
-                     (incf added stored)
-                     (when relay (push relay relay-candidates)))))))
-    (when (and peers (<= msg-count 10))
-      (loop for (pa . max-targets) in relay-candidates
-            do (relay-address pa peer peers :now now :max-targets max-targets)))
-    (when (and address-book (> added 0))
-      (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addr message" added))
-    added))
+                   (push (cons net-addr timestamp) entries)))))
+    (let ((added (%process-gossiped-addresses peer (nreverse entries) msg-count
+                                              address-book peers)))
+      (when (and address-book (> added 0))
+        (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addr message" added))
+      added)))
 
 ;;; ADDRv2 handling (BIP 155)
 
@@ -716,26 +1091,28 @@ RelayAddress)."
   "Handle an addrv2 message (BIP 155). When ADDRESS-BOOK is provided, add
 addresses of any representable network (IPv4/IPv6/TORv3/I2P/CJDNS) with
 plausible timestamps (within 3 hours) to the address book — non-IP networks
-only when reachable (-onlynet + proxy/flag gates), mirroring Core. Unknown
-network ids were already skipped by the codec."
-  (let ((now (bitcoin-lisp.serialization:get-unix-time))
-        (source-group (when peer (peer-source-group peer)))
-        (added 0)
-        (relay-candidates '())
-        (entries (bitcoin-lisp.serialization:parse-addrv2-payload payload)))
-    (dolist (entry entries)
-      (destructuring-bind (net-addr timestamp network-id) entry
-        (declare (ignore network-id))
-        (multiple-value-bind (stored relay)
-            (%ingest-gossiped-address net-addr timestamp address-book source-group now)
-          (incf added stored)
-          (when relay (push relay relay-candidates)))))
-    (when (and peers (<= (length entries) 10))
-      (loop for (pa . max-targets) in relay-candidates
-            do (relay-address pa peer peers :now now :max-targets max-targets)))
-    (when (and address-book (> added 0))
-      (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
-    added))
+only when reachable (-onlynet + proxy/flag gates), subject to the per-address
+token bucket (see %process-gossiped-addresses). Unknown network ids were
+already skipped by the codec; a count above 1000 fails parsing (Core
+Misbehaving path — the caller disconnects). Ignored entirely from a
+block-relay-only peer (Core SetupAddressRelay)."
+  (when (and peer (eq (peer-conn-type peer) :block-relay))
+    (bitcoin-lisp:log-cat "net" "ignoring addrv2 message from block-relay-only peer ~A"
+                          (peer-address peer))
+    (return-from handle-addrv2 0))
+  (multiple-value-bind (entries announced-count)
+      (bitcoin-lisp.serialization:parse-addrv2-payload payload)
+    (let ((added (%process-gossiped-addresses
+                  peer
+                  (mapcar (lambda (entry)
+                            (destructuring-bind (net-addr timestamp network-id) entry
+                              (declare (ignore network-id))
+                              (cons net-addr timestamp)))
+                          entries)
+                  announced-count address-book peers)))
+      (when (and address-book (> added 0))
+        (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
+      added)))
 
 ;;; Transaction handling
 
@@ -743,15 +1120,18 @@ network ids were already skipped by the codec."
                         &key recent-rejects)
   "De-orphan cascade: after ACCEPTED-TXID enters the mempool, re-validate the
 orphans that depend on it; accept+relay any now valid, drop those now invalid,
-and recurse on newly-accepted txs so a parent can unblock a whole chain."
+and recurse on newly-accepted txs so a parent can unblock a whole chain.
+The orphanage is wtxid-keyed (Core TxOrphanage); children reference parents
+by TXID, so the cascade work list carries txids."
   (let ((pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool))
         (work (list accepted-txid)))
     (loop while work do
       (let ((ptxid (pop work)))
-        (dolist (otxid (bitcoin-lisp.mempool:orphans-depending-on pool ptxid))
-          (let ((otx (bitcoin-lisp.mempool:orphan-tx pool otxid)))
+        (dolist (owtxid (bitcoin-lisp.mempool:orphans-depending-on pool ptxid))
+          (let ((otx (bitcoin-lisp.mempool:orphan-tx pool owtxid)))
             (when otx
-              (let ((current-height (bitcoin-lisp.storage:current-height chain-state)))
+              (let ((otxid (bitcoin-lisp.serialization:transaction-hash otx))
+                    (current-height (bitcoin-lisp.storage:current-height chain-state)))
                 (multiple-value-bind (valid error fee replaced sigops)
                     (bitcoin-lisp.validation:validate-transaction-for-mempool
                      otx utxo-set mempool current-height :chain-state chain-state)
@@ -762,16 +1142,16 @@ and recurse on newly-accepted txs so a parent can unblock a whole chain."
                           mempool otxid otx fee current-height
                           :sigops sigops :replaced replaced)
                        (when (eq :ok result)
-                         (bitcoin-lisp.mempool:orphan-remove pool otxid)
+                         (bitcoin-lisp.mempool:orphan-remove pool owtxid)
                          (when peers
                            (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
                              (relay-transaction
                               otxid nil peers
                               :fee-rate (if (plusp vsize) (floor fee vsize) 0)
-                              :wtxid (bitcoin-lisp.serialization:transaction-wtxid otx))))
+                              :wtxid owtxid)))
                          (push otxid work))))   ; cascade to this tx's dependents
                     ((eq error :missing-input) nil)   ; still missing another parent
-                    (t (bitcoin-lisp.mempool:orphan-remove pool otxid)  ; now invalid
+                    (t (bitcoin-lisp.mempool:orphan-remove pool owtxid)  ; now invalid
                        (when recent-rejects
                          ;; Same insertion rules as handle-tx — Core routes
                          ;; orphan re-validation failures through the same
@@ -782,12 +1162,9 @@ and recurse on newly-accepted txs so a parent can unblock a whole chain."
                          ;; the real tx's txid), plus the txid for
                          ;; :nonstandard-inputs (txid-only failure).
                          (unless (eq error :witness-stripped)
-                           (bitcoin-lisp:add-recent-reject
-                            recent-rejects
-                            (bitcoin-lisp.serialization:transaction-wtxid otx))
+                           (bitcoin-lisp:add-recent-reject recent-rejects owtxid)
                            (when (and (eq error :nonstandard-inputs)
-                                      (not (equalp (bitcoin-lisp.serialization:transaction-wtxid otx)
-                                                   otxid)))
+                                      (not (equalp owtxid otxid)))
                              (bitcoin-lisp:add-recent-reject recent-rejects otxid)))))))))))))))
 
 (defun missing-parent-txids (tx utxo-set mempool)
@@ -808,9 +1185,15 @@ apply)."
           (push ptxid parents))))
     (nreverse parents)))
 
-(defun request-orphan-parents (peer parent-txids)
-  "Send a getdata to PEER for an orphan's missing PARENT-TXIDS so the orphan
-can be resolved promptly. Returns the list of inv-vectors requested.
+(defun request-orphan-parents (peer parent-txids &optional (num-wtxid-peers 0))
+  "Register an orphan's missing PARENT-TXIDS with the tx-request tracker as
+txid-based announcements from PEER and getdata the ones requestable now.
+Returns the list of inv-vectors sent immediately (delayed/duplicate parents
+ride the scheduler), or NIL when the whole batch was dropped by the per-peer
+cap — Core MaybeAddOrphanResolutionCandidate returns false then and no
+announcer is recorded (txdownloadman_impl.cpp:230-282). NUM-WTXID-PEERS
+drives the txid-relay delay: Core delays parent fetches whenever wtxid peers
+exist, since parents are requested by txid (:246-251).
 
 Parents are known only by TXID, so the request MUST carry the witness flag
 (MSG_TX|MSG_WITNESS_FLAG) for witness-capable peers — Core requests every
@@ -823,23 +1206,39 @@ script validation, and since a stripped tx's wtxid equals its txid, the
 reject path then poisoned recent-rejects with the parent's real TXID — the
 witnessed parent could never be fetched again and the orphan never resolved.
 
-Each parent is also registered with the tx-request tracker (as a txid-based
-entry), so concurrent orphans wanting the same parent don't duplicate the
-getdata and a timed-out parent request fails over like any other
-(Core routes them through the same m_txrequest)."
+Registration with the shared tracker means concurrent orphans wanting the
+same parent don't duplicate the getdata and a timed-out parent request fails
+over like any other (Core routes them through the same m_txrequest)."
+  ;; Bulk per-peer cap (Core: Count(peer) + unique_parents.size() >
+  ;; MAX_PEER_TX_ANNOUNCEMENTS drops the whole candidacy, :242).
+  (when (> (+ (tx-request-count peer) (length parent-txids))
+           +max-peer-tx-announcements+)
+    (return-from request-orphan-parents nil))
   (let ((invs '()))
     (dolist (ptxid parent-txids)
-      (when (tx-request-wanted-p ptxid peer nil)
+      ;; Parents are txid-based announcements: Core adds TXID_RELAY_DELAY
+      ;; whenever wtxid peers exist (unconditional on the id type, :251) —
+      ;; matched here since wtxidp is NIL.
+      (when (tx-request-wanted-p ptxid peer nil num-wtxid-peers)
         (push (tx-request-inv ptxid nil peer) invs)))
     (setf invs (nreverse invs))
     (when invs
       (send-message peer (bitcoin-lisp.serialization:make-getdata-message invs)))
-    invs))
+    (or invs t)))
 
 (defun handle-tx (peer payload utxo-set mempool chain-state peers
                   &key recent-rejects)
   "Handle a tx message. Validate, add to mempool, and relay.
 RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
+  ;; A tx sent where we advertised fRelay=0 (blocksonly mainnet default,
+  ;; block-relay/feeler conns) violates the protocol: disconnect (Core
+  ;; RejectIncomingTxs gate in the TX handler, net_processing.cpp:4474-4479).
+  (when (or (not (relay-enabled-p))
+            (not (peer-relays-txs-p peer)))
+    (bitcoin-lisp:log-cat "net" "transaction sent in violation of protocol — disconnecting peer ~A"
+                          (peer-address peer))
+    (disconnect-peer peer)
+    (return-from handle-tx nil))
   (handler-case
       (let ((tx (bitcoin-lisp.serialization:parse-tx-payload payload)))
         (when tx
@@ -856,11 +1255,16 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                 (tx-request-received wtxid))
               ;; Mark as announced by this peer (bounded set)
               (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
-              ;; Check recent rejects before expensive validation. The filter
-              ;; is wtxid-keyed (Core m_lazy_recent_rejects); txid entries
-              ;; exist only where Core adds them too, so check both ids.
+              ;; Check recent rejects and recently-confirmed before expensive
+              ;; validation (Core's AlreadyHaveTx at tx receipt). The rejects
+              ;; filter is wtxid-keyed (Core m_lazy_recent_rejects); txid
+              ;; entries exist only where Core adds them too, so check both
+              ;; ids. Freshly-confirmed txs (still relaying through the
+              ;; network) are dropped without being treated as rejects.
               (when (or (bitcoin-lisp:recent-reject-p recent-rejects wtxid)
-                        (bitcoin-lisp:recent-reject-p recent-rejects txid))
+                        (bitcoin-lisp:recent-reject-p recent-rejects txid)
+                        (bitcoin-lisp.validation:recently-confirmed-p wtxid)
+                        (bitcoin-lisp.validation:recently-confirmed-p txid))
                 (return-from handle-tx nil))
               ;; Validate for mempool
               (multiple-value-bind (valid error fee replaced sigops)
@@ -889,7 +1293,8 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                            (progn
                              (bitcoin-lisp.mempool:orphan-add
                               (bitcoin-lisp.mempool:mempool-orphan-pool mempool) tx peer)
-                             (request-orphan-parents peer parents)))))
+                             (request-orphan-parents
+                              peer parents (count-wtxid-relay-peers peers))))))
                     (t
                      ;; Add to recent rejects so we don't re-request it. A loose
                      ;; transaction that fails validation is NOT misbehavior:
@@ -961,6 +1366,15 @@ handling of unavailable blocks."
         (blocks-served 0)
         (not-found '()))
     (dolist (inv inv-vectors)
+      ;; Stop serving a send-paused peer (its outgoing buffer is over the
+      ;; cap) — Core breaks out of ProcessGetData on fPauseSend
+      ;; (net_processing.cpp:2536). Core parks the rest of the getdata for
+      ;; later; we drop it and the peer re-requests, which its own request
+      ;; timeout already handles. The notfound for what WAS processed still
+      ;; goes out below, as in Core.
+      (let ((conn (peer-connection peer)))
+        (when (and conn (connection-send-paused-p conn))
+          (return)))
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
         (cond
@@ -974,32 +1388,55 @@ handling of unavailable blocks."
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))
-           (let ((entry (when (and mempool (relay-enabled-p))
-                          (cond
-                            ((= inv-type bitcoin-lisp.serialization:+inv-type-wtx+)
-                             (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))
-                            ((= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
-                             (bitcoin-lisp.mempool:mempool-get mempool hash))
-                            (t
-                             (or (bitcoin-lisp.mempool:mempool-get mempool hash)
-                                 (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash)))))))
-             (cond
-               (entry
-                (send-message peer
-                              (bitcoin-lisp.serialization:make-tx-message
-                               (bitcoin-lisp.mempool:mempool-entry-transaction entry)
-                               :witness (/= inv-type bitcoin-lisp.serialization:+inv-type-tx+)))
-                ;; A peer requesting the tx is the proof our announcement
-                ;; propagated: drop it from the unbroadcast set (Core
-                ;; ProcessGetData, net_processing.cpp:2550).
-                (bitcoin-lisp.mempool:mempool-remove-unbroadcast
-                 mempool
-                 (bitcoin-lisp.serialization:transaction-hash
-                  (bitcoin-lisp.mempool:mempool-entry-transaction entry))))
-               (t
-                ;; Core accumulates vNotFound for txs it can't serve so the
-                ;; requester re-routes immediately instead of timing out.
-                (push inv not-found)))))
+           (cond
+             ;; No tx-relay state with this peer (its version had fRelay=0, or
+             ;; a block-relay/feeler conn): ignore the request entirely — not
+             ;; even a notfound (Core ProcessGetData's `tx_relay == nullptr`
+             ;; continue, net_processing.cpp:2539-2543).
+             ((not (peer-tx-relay-p peer)))
+             (t
+              (let* ((entry (when (and mempool (relay-enabled-p))
+                              (cond
+                                ((= inv-type bitcoin-lisp.serialization:+inv-type-wtx+)
+                                 (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))
+                                ((= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
+                                 (bitcoin-lisp.mempool:mempool-get mempool hash))
+                                (t
+                                 (or (bitcoin-lisp.mempool:mempool-get mempool hash)
+                                     (bitcoin-lisp.mempool:mempool-get-by-wtxid mempool hash))))))
+                     ;; Anti-probing gate (Core FindTxForGetData ->
+                     ;; info_for_relay, net_processing.cpp:2496-2505): serve a
+                     ;; mempool tx only if it entered the pool BEFORE our last
+                     ;; inv flush to this peer — i.e. we could already have
+                     ;; announced it. A getdata for anything newer reveals the
+                     ;; peer is probing mempool contents: notfound.
+                     (tx (cond
+                           ((and entry
+                                 (< (bitcoin-lisp.mempool:mempool-entry-sequence entry)
+                                    (peer-last-inv-sequence peer)))
+                            (bitcoin-lisp.mempool:mempool-entry-transaction entry))
+                           ;; Or it might be from the most recent block (Core
+                           ;; m_most_recent_block_txs, keyed by txid AND
+                           ;; wtxid) — freshly-confirmed txs stay servable.
+                           (t (bitcoin-lisp.validation:most-recent-block-tx hash)))))
+                (cond
+                  (tx
+                   (send-message peer
+                                 (bitcoin-lisp.serialization:make-tx-message
+                                  tx
+                                  :witness (/= inv-type bitcoin-lisp.serialization:+inv-type-tx+)))
+                   ;; A peer requesting the tx is the proof our announcement
+                   ;; propagated: drop it from the unbroadcast set (Core
+                   ;; ProcessGetData, net_processing.cpp:2550 — on EVERY
+                   ;; successful serve, either source).
+                   (when mempool
+                     (bitcoin-lisp.mempool:mempool-remove-unbroadcast
+                      mempool
+                      (bitcoin-lisp.serialization:transaction-hash tx))))
+                  (t
+                   ;; Core accumulates vNotFound for txs it can't serve so the
+                   ;; requester re-routes immediately instead of timing out.
+                   (push inv not-found)))))))
           ;; Block request - serve the full block from disk (witness-aware).
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
@@ -1391,12 +1828,9 @@ loop. Returns the number of peers announced to."
                       +avg-local-address-broadcast-interval+)))))))
 
 ;;; Transaction relay
-
-(defun relay-enabled-p ()
-  "Check if transaction relay is enabled for the current network.
-Relay is always enabled on test networks, disabled by default on mainnet for safety."
-  (or (member bitcoin-lisp:*network* '(:testnet3 :testnet4 :signet :regtest))
-      bitcoin-lisp:*mainnet-relay-enabled*))
+;;;
+;;; relay-enabled-p lives in peer.lisp now (the version handshake needs it to
+;;; set our fRelay bit, and peer.lisp loads first).
 
 ;;; Trickled (Poisson) tx announcement batching — Core SendMessages tx
 ;;; inventory (net_processing.cpp:5960-6070). Announcing every tx the
@@ -1448,9 +1882,12 @@ announcements. Does nothing if relay is disabled for the network."
       ;; Skip the source peer and disconnected peers
       (when (and (not (eq peer source-peer))
                  (eq (peer-state peer) :ready)
-                 ;; Block-relay-only / feeler peers get no tx relay (they
-                 ;; advertised relay=0; Core never announces txs to them).
-                 (peer-relays-txs-p peer)
+                 ;; No announcements without tx-relay state: block-relay/
+                 ;; feeler conns AND peers whose version had fRelay=0 (BIP37/
+                 ;; BIP60 blocksonly peers — Core only builds tx inventory
+                 ;; under `if (tx_relay != nullptr)`, and announcing to them
+                 ;; gets us disconnected).
+                 (peer-tx-relay-p peer)
                  ;; Skip if already announced to this peer (Core checks the
                  ;; known-filter at queue time too, PushTxInventory).
                  (not (bitcoin-lisp:recent-reject-p (peer-announced-txs peer) txid)))
@@ -1500,7 +1937,15 @@ BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
       (handler-case
           (send-message peer (bitcoin-lisp.serialization:make-inv-message
                               (nreverse invs)))
-        (error () nil)))))
+        (error () nil)))
+    ;; Snapshot the mempool sequence: everything in the pool right now was
+    ;; announceable in this flush, so getdata for it is legitimate from here
+    ;; on (Core SendMessages, net_processing.cpp:6086-6088 — updated on every
+    ;; trickle flush, sent invs or not). This is what FindTxForGetData's
+    ;; anti-probing gate compares against.
+    (when mempool
+      (setf (peer-last-inv-sequence peer)
+            (bitcoin-lisp.mempool:mempool-sequence mempool)))))
 
 (defun flush-tx-announcements (peers mempool)
   "Flush due per-peer tx announcement queues (call ~1x/second from the
@@ -1524,7 +1969,10 @@ lock from RPC handler threads."
                    (+ now (%next-exp-interval-ticks +inbound-inv-broadcast-interval+)))))
       (dolist (peer peers)
         (when (and (eq (peer-state peer) :ready)
-                   (peer-relays-txs-p peer))
+                   ;; fRelay=0 peers have no tx-relay state: no inv flushes,
+                   ;; and no last-inv-sequence advance either (their getdata
+                   ;; is ignored outright anyway).
+                   (peer-tx-relay-p peer))
           (if (peer-inbound peer)
               (when inbound-due
                 (%flush-peer-tx-invs peer mempool))

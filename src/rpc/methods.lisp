@@ -556,6 +556,11 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
                   ("synced_blocks" . ,sh)
                   ("bytessent" . ,(if conn (bitcoin-lisp.networking::connection-bytes-sent conn) 0))
                   ("bytesrecv" . ,(if conn (bitcoin-lisp.networking::connection-bytes-received conn) 0))
+                  ;; Addr intake counters (Core m_addr_processed /
+                  ;; m_addr_rate_limited; the rate-limited count is addresses
+                  ;; dropped by the per-address token bucket).
+                  ("addr_processed" . ,(bitcoin-lisp.networking::peer-addr-processed peer))
+                  ("addr_rate_limited" . ,(bitcoin-lisp.networking::peer-addr-rate-limited peer))
                   ;; ping-latency is in internal-time units; report seconds (0 = unknown).
                   ("pingtime" . ,(if (and ping (plusp ping))
                                      (/ ping internal-time-units-per-second 1.0d0)
@@ -628,21 +633,21 @@ peer disconnecting mid-send."
 
 ;;; --- Mempool Methods ---
 
-(defun %orphan-tx-json (tx from-peer verbose2)
-  "OrphanDescription (Core getorphantxs verbosity 1/2) for orphan TX announced by
-FROM-PEER (a peer object, or nil). VERBOSE2 appends the raw hex. \"bytes\" and
-\"hex\" use the wire (witness-complete) encoding — Core ComputeTotalSize /
-EncodeHexTx. \"from\" is our single announcer (Core tracks a list); an empty
-list when the announcer is gone."
+(defun %orphan-tx-json (tx announcers verbose2)
+  "OrphanDescription (Core getorphantxs verbosity 1/2) for orphan TX announced
+by ANNOUNCERS (a list of peer objects, possibly containing nil for local
+submissions). VERBOSE2 appends the raw hex. \"bytes\" and \"hex\" use the wire
+(witness-complete) encoding — Core ComputeTotalSize / EncodeHexTx. \"from\"
+lists every announcer's peer id (Core OrphanInfo::announcers)."
   (let* ((ser (bitcoin-lisp.serialization:transaction-wire-bytes tx))
          (base `(("txid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
                  ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
                  ("bytes" . ,(length ser))
                  ("vsize" . ,(bitcoin-lisp.serialization:transaction-vsize tx))
                  ("weight" . ,(bitcoin-lisp.serialization:transaction-weight tx))
-                 ("from" . ,(if from-peer
-                                (list (bitcoin-lisp.networking::peer-id from-peer))
-                                '())))))
+                 ("from" . ,(loop for peer in announcers
+                                  when peer
+                                    collect (bitcoin-lisp.networking::peer-id peer))))))
     (if verbose2
         (append base `(("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex ser))))
         base)))
@@ -663,16 +668,17 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
     (when pool
       (with-node-lock (node)
         (maphash
-         (lambda (txid entry)
-           (declare (ignore txid))
-           (let ((tx (bitcoin-lisp.mempool::orphan-entry-transaction entry))
-                 (from (bitcoin-lisp.mempool::orphan-entry-from-peer entry)))
+         (lambda (wtxid entry)
+           (declare (ignore wtxid))
+           (let ((tx (bitcoin-lisp.mempool:orphan-entry-transaction entry))
+                 (from (mapcar #'bitcoin-lisp.mempool::orphan-announcement-peer
+                               (bitcoin-lisp.mempool::orphan-entry-announcements entry))))
              (push (case verbosity
                      (0 (hash-to-hex (bitcoin-lisp.serialization:transaction-hash tx)))
                      (1 (%orphan-tx-json tx from nil))
                      (t (%orphan-tx-json tx from t)))
                    result)))
-         (bitcoin-lisp.mempool::orphan-pool-by-txid pool))))
+         (bitcoin-lisp.mempool::orphan-pool-by-wtxid pool))))
     (nreverse result)))
 
 (defun rpc-getmempoolinfo (node params)
@@ -690,6 +696,9 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
                (min-fee-btc-kvb (/ min-fee-sat-kvb 100000000.0d0))
                (relay-fee-btc-kvb (/ bitcoin-lisp.mempool:+default-min-relay-fee-rate+ 100000000.0d0))
                (count (bitcoin-lisp.mempool:mempool-count mempool))
+               ;; Core "bytes" = GetTotalTxSize(), the sum of the entries'
+               ;; sigop-adjusted VIRTUAL sizes (rpc/mempool.cpp:1040,
+               ;; txmempool.h:191), not serialized bytes.
                (bytes (bitcoin-lisp.mempool:mempool-total-size mempool))
                (total-fee-sat 0))
           (bitcoin-lisp.mempool:mempool-for-each
@@ -698,10 +707,9 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           `(("loaded" . t)
             ("size" . ,count)
             ("bytes" . ,bytes)
-            ;; Core reports DynamicMemoryUsage; we don't replicate its exact
-            ;; accounting, so estimate: serialized bytes + a ~per-entry struct/
-            ;; index overhead.
-            ("usage" . ,(+ bytes (* count 180)))
+            ;; Core DynamicMemoryUsage(): the malloc-modeled memory usage the
+            ;; -maxmempool cap is keyed on (rpc/mempool.cpp:1041).
+            ("usage" . ,(bitcoin-lisp.mempool:mempool-dynamic-usage mempool))
             ("total_fee" . ,(/ total-fee-sat 100000000.0d0))
             ("maxmempool" . ,(bitcoin-lisp.mempool::mempool-max-size mempool))
             ("mempoolminfee" . ,min-fee-btc-kvb)

@@ -16,6 +16,19 @@
 (defun next-peer-id ()
   (bt:with-lock-held (*peer-id-lock*) (incf *peer-id-counter*)))
 
+;;; Per-address addr/addrv2 intake rate limit (Bitcoin Core
+;;; net_processing.cpp:190-197): the units are ADDRESSES, not messages.
+(defconstant +max-addr-rate-per-second+ 0.1d0
+  "Token-bucket refill rate for gossiped-address processing (Core
+MAX_ADDR_RATE_PER_SECOND). At steady state a peer gets one address through
+every 10 seconds; everything faster is dropped, not queued.")
+
+(defconstant +max-addr-processing-token-bucket+
+  bitcoin-lisp.serialization:+max-addr-count+
+  "Soft cap of the addr token bucket (Core MAX_ADDR_PROCESSING_TOKEN_BUCKET =
+MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
++MAX_ADDR_TO_SEND bump after our own getaddr may.")
+
 (defstruct peer
   "A Bitcoin peer."
   (id (next-peer-id) :type integer)
@@ -85,6 +98,31 @@
   ;; T once we have answered this peer's getaddr (Bitcoin Core m_getaddr_recvd):
   ;; one address response per connection, to limit address-stamping spam.
   (getaddr-sent nil :type boolean)
+  ;; T while a getaddr WE sent to this peer is unanswered (Bitcoin Core
+  ;; m_getaddr_sent — note our getaddr-sent slot above is Core's
+  ;; m_getaddr_recvd). Set when send-post-handshake-messages requests
+  ;; addresses; cleared by the addr handler on any non-full (<1000) addr/
+  ;; addrv2 message. While set, freshly-learned addresses are NOT relayed
+  ;; onward (getaddr responses are stale gossip, net_processing.cpp:4100).
+  (getaddr-requested nil :type boolean)
+  ;; Per-peer addr processing token bucket (Core Peer::m_addr_token_bucket,
+  ;; net_processing.cpp:384): starts at 1.0, refills at
+  ;; +max-addr-rate-per-second+ (0.1/s) up to +max-addr-processing-token-
+  ;; bucket+ (1000), one token consumed per gossiped address; addresses
+  ;; beyond the bucket are DROPPED. Sending a getaddr bumps it by 1000 so
+  ;; the solicited response is exempt.
+  (addr-token-bucket 1.0d0 :type double-float)
+  ;; internal-real-time when the bucket was last refilled (m_addr_token_timestamp).
+  (addr-token-timestamp (get-internal-real-time) :type integer)
+  ;; Lifetime counters surfaced in getpeerinfo (m_addr_processed /
+  ;; m_addr_rate_limited).
+  (addr-processed 0 :type integer)
+  (addr-rate-limited 0 :type integer)
+  ;; In-progress low-work headers presync/redownload with this peer, or NIL
+  ;; (Bitcoin Core Peer::m_headers_sync). One slot serves both drivers — the
+  ;; solicited Phase-1 sync (sync-headers) and the generic announcement path
+  ;; (ingest-headers-from-peer) — so they can never run two syncs at once.
+  (headers-sync nil)
   ;; Compact block support (BIP 152)
   (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
   (compact-block-high-bandwidth nil :type boolean)    ; High-bandwidth mode enabled
@@ -95,6 +133,14 @@
   (prefers-headers nil :type boolean)                  ; Peer sent sendheaders
   ;; BIP 133 feefilter support
   (feefilter-rate 0 :type (unsigned-byte 64))          ; Peer's minimum fee rate (sat/kB)
+  ;; Mempool-sequence snapshot taken at each inv flush to this peer (Core
+  ;; Peer::TxRelay::m_last_inv_sequence, net_processing.cpp:322, init 1).
+  ;; The getdata anti-probing gate serves a mempool tx only when its entry
+  ;; sequence is BELOW this snapshot — i.e. the tx was already in the pool
+  ;; when we last announced inventory to the peer (Core FindTxForGetData ->
+  ;; info_for_relay). Blocks mempool-content probing of txs the peer
+  ;; shouldn't know about yet.
+  (last-inv-sequence 1 :type (unsigned-byte 64))
   ;; BIP 339 wtxidrelay support
   (wtxid-relay nil :type boolean)                      ; Peer supports wtxid-based tx relay
   ;; BIP 330 transaction reconciliation (Erlay) handshake state. Core keeps a
@@ -231,18 +277,43 @@ Returns NIL if the host is banned or discouraged (never dial either)."
         (init-peer-rate-limiters peer)
         peer))))
 
+(defvar *peer-disconnect-hook* nil
+  "When non-NIL, a function of one argument (the peer) called from
+DISCONNECT-PEER after the connection is torn down. protocol.lisp registers
+the tx-request tracker's DisconnectedPeer cleanup here — the tracker lives in
+a later-loaded file, so a direct call would be a forward reference.")
+
 (defun disconnect-peer (peer)
   "Disconnect from a peer."
   (when (peer-connection peer)
     (close-connection (peer-connection peer)))
   (setf (peer-state peer) :disconnected)
   (setf (peer-connection peer) nil)
-  ;; Drop any orphan transactions this peer contributed (DoS hygiene).
+  ;; Drop any in-progress low-work headers sync with this peer (Core
+  ;; FinalizeNode resets Peer state; the buffers die with the struct).
+  (setf (peer-headers-sync peer) nil)
+  ;; Drop this peer's orphan ANNOUNCEMENTS (DoS hygiene). Orphans other
+  ;; peers also announced survive (Core TxOrphanage::EraseForPeer).
   (let ((node bitcoin-lisp::*node*))
     (when (and node (bitcoin-lisp::node-mempool node))
       (bitcoin-lisp.mempool:orphan-erase-for-peer
        (bitcoin-lisp.mempool:mempool-orphan-pool (bitcoin-lisp::node-mempool node))
-       peer))))
+       peer)))
+  ;; Tx-request tracker cleanup (Core TxDownloadManagerImpl::DisconnectedPeer):
+  ;; forget the peer's announcements; its in-flight requests become
+  ;; re-schedulable so the next scheduler pass fails them over.
+  (when *peer-disconnect-hook*
+    (ignore-errors (funcall *peer-disconnect-hook* peer))))
+
+(defun flush-peer-send-buffers (peers)
+  "Retry every connected peer's buffered unsent bytes without blocking — the
+periodic half of Core's per-socket SocketSendData, driven from the sync/IBD
+housekeeping loops (~1x/second) since we have no dedicated socket thread.
+No-op for peers with nothing buffered."
+  (dolist (peer peers)
+    (let ((conn (peer-connection peer)))
+      (when (and conn (connection-connected conn))
+        (flush-send-buffer conn)))))
 
 ;;; Message I/O
 
@@ -300,9 +371,34 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
 ;;; Handshake
 
 (defun peer-relays-txs-p (peer)
-  "T if we relay transactions with PEER. Block-relay-only and feeler
-connections do not (Core: fRelay=false, no tx inv/getdata either way)."
+  "T if OUR side of the connection participates in tx relay with PEER.
+Block-relay-only and feeler connections do not (Core: fRelay=false, no tx
+inv/getdata either way). This is our half only; whether the PEER wants tx
+announcements from us is PEER-TX-RELAY-P (their version's fRelay)."
   (not (member (peer-conn-type peer) '(:block-relay :feeler))))
+
+(defun relay-enabled-p ()
+  "Check if transaction relay is enabled for the current network.
+Relay is always enabled on test networks, disabled by default on mainnet for
+safety — our analogue of Core's -blocksonly (m_opts.ignore_incoming_txs).
+Returns a strict boolean (it feeds the version message's fRelay slot)."
+  (and (or (member bitcoin-lisp:*network* '(:testnet3 :testnet4 :signet :regtest))
+           bitcoin-lisp:*mainnet-relay-enabled*)
+       t))
+
+(defun peer-tx-relay-p (peer)
+  "T when tx-relay state exists for PEER — the exact condition under which
+Core initializes Peer::TxRelay at VERSION time (net_processing.cpp:3681-3696):
+the connection is not block-relay-only or feeler, AND the peer's version set
+fRelay=1. We never advertise NODE_BLOOM, so Core's other arm (fRelay=0 but
+NODE_BLOOM offered, letting a later filterload turn relay on) never applies:
+a BIP37/BIP60 fRelay=0 peer gets NO tx invs and its tx getdata is ignored for
+the life of the connection. A peer with no stored version yet counts as
+relaying — Core's pre-70001 default is fRelay=true (net_processing.cpp:3597)."
+  (and (peer-relays-txs-p peer)
+       (let ((v (peer-version peer)))
+         (or (null v)
+             (bitcoin-lisp.serialization:version-message-relay v)))))
 
 ;;; BIP330 sendtxrcncl handshake (Erlay). Core parity at ref d3056bc is the
 ;;; handshake + salt storage only — no reqtxrcncl/sketch messages exist
@@ -494,7 +590,12 @@ tx relay on those)."
                            :addr-recv (%version-addr-recv peer)
                            :start-height start-height
                            :timestamp (bitcoin-lisp.serialization:get-unix-time)
-                           :relay relays))
+                           ;; Core my_tx_relay = !RejectIncomingTxs(pnode)
+                           ;; (net_processing.cpp:1573,5686-5693): false on
+                           ;; block-relay/feeler connections AND in blocksonly
+                           ;; mode — our mainnet-relay-disabled default. With
+                           ;; fRelay=0 honest peers stop announcing txs to us.
+                           :relay (and relays (relay-enabled-p))))
          (version-msg (bitcoin-lisp.serialization:serialize-message
                        "version" version-payload)))
     (when (send-message peer version-msg)
@@ -631,8 +732,15 @@ on the local onion-service listener (Tor forwarding), whose true network is
   "Send feature negotiation messages after handshake completes."
   ;; BIP 130: Request header announcements
   (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message))
-  ;; BIP 133: Announce our minimum relay fee rate (1000 sat/kB = 1 sat/byte)
-  (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000))
+  ;; BIP 133: Announce our minimum relay fee rate (1000 sat/kB = 1 sat/byte).
+  ;; Core MaybeSendFeefilter (net_processing.cpp:5628-5637) skips it in
+  ;; blocksonly mode (ignore_incoming_txs — our relay-disabled mainnet
+  ;; default) and on outbound block-relay-only connections, which never
+  ;; announce txs to us regardless. Note Core does NOT gate feefilter on the
+  ;; peer's own fRelay — an fRelay=0 peer still receives it (harmlessly).
+  (when (and (relay-enabled-p)
+             (not (eq (peer-conn-type peer) :block-relay)))
+    (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000)))
   ;; One-time address fetch to populate/update addrman. Core sends GETADDR
   ;; on outbound connections only, and never block-relay-only ones (no addr
   ;; relay there, to avoid leaking the link): net_processing.cpp:3754-3772
@@ -640,7 +748,15 @@ on the local onion-service listener (Tor forwarding), whose true network is
   ;; gossip, DNS seeds, and fixed seeds.
   (when (and (not (peer-inbound peer))
              (not (eq (peer-conn-type peer) :block-relay)))
-    (send-message peer (bitcoin-lisp.serialization:make-getaddr-message))))
+    (send-message peer (bitcoin-lisp.serialization:make-getaddr-message))
+    ;; Track the solicitation and accept a full MAX_ADDR_TO_SEND response
+    ;; beyond the token bucket's cap (Core net_processing.cpp:3769-3772:
+    ;; "When requesting a getaddr, accept an additional MAX_ADDR_TO_SEND
+    ;; addresses in response (bypassing the MAX_ADDR_PROCESSING_TOKEN_BUCKET
+    ;; limit)").
+    (setf (peer-getaddr-requested peer) t)
+    (incf (peer-addr-token-bucket peer)
+          (coerce bitcoin-lisp.serialization:+max-addr-count+ 'double-float))))
 
 ;;; Ping/Pong
 
@@ -702,6 +818,19 @@ Returns :disconnect if the peer should be disconnected, :ok otherwise."
   "Check health of a single peer. Returns :ok, :ping-sent, or :disconnect.
 Should be called periodically (every ~60s).
 Also checks handshake timeout for peers that haven't completed handshake."
+  ;; Send-side upkeep, regardless of state: retry buffered unsent bytes
+  ;; (non-blocking), and disconnect a peer whose socket has accepted nothing
+  ;; for +send-stall-timeout-seconds+ while data is pending (Core
+  ;; InactivityCheck \"socket sending timeout\").
+  (let ((conn (peer-connection peer)))
+    (when (and conn (connection-connected conn))
+      (flush-send-buffer conn)
+      (when (connection-send-stalled-p conn)
+        (bitcoin-lisp:log-warn "Peer ~A socket sending timeout (~D unsent bytes)"
+                               (peer-address peer)
+                               (connection-send-queue-bytes conn))
+        (return-from check-peer-health :disconnect))))
+
   ;; Check handshake timeout for non-ready peers
   (unless (eq (peer-state peer) :ready)
     (return-from check-peer-health (check-handshake-timeout peer)))
