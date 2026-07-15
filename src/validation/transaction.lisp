@@ -652,7 +652,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
     ;; Policy: bounded sigop cost (now that spent scripts are available). The
     ;; computed cost is kept — it is returned to the caller and recorded on
     ;; the mempool entry, exactly as Core's PreChecks computes nSigOpsCost
-    ;; once and stages it into the entry (validation.cpp:908,935), so the
+    ;; once and stages it into the entry (validation.cpp:905,924), so the
     ;; block assembler's sigop budget sees real numbers.
     (let ((sigops-cost
             (flet ((spent-script (txid index)
@@ -695,15 +695,20 @@ decide (Core PreChecks, validation.cpp:950-970)."
           (return-from validate-transaction-for-mempool
             (values nil error nil)))
 
-        ;; Convert typed fee to integer; fee-rate is per virtual byte (BIP141).
-        ;; Policy fee checks (floor, RBF) run on the prioritisation-modified fee
-        ;; (Core's ws.m_modified_fees); the real fee is what gets recorded.
+        ;; Convert typed fee to integer. Policy fee checks (floor, RBF) run on
+        ;; the prioritisation-modified fee (Core's ws.m_modified_fees); the
+        ;; real fee is what gets recorded. VSIZE is the SIGOP-ADJUSTED virtual
+        ;; size — Core's ws.m_vsize is the entry's GetTxSize()
+        ;; (validation.cpp:929), not the raw BIP141 vsize — so the fee floor,
+        ;; TRUC size caps, and RBF economics all price sigop-dense txs.
         (let* ((fee-value (unwrap-satoshi fee))
                (modified-fee-value
                  (+ fee-value
                     (gethash (bitcoin-lisp.serialization:transaction-hash tx)
                              (bitcoin-lisp.mempool:mempool-deltas mempool) 0)))
-               (vsize (bitcoin-lisp.serialization:transaction-vsize tx))
+               (vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
+                       (bitcoin-lisp.serialization:transaction-weight tx)
+                       sigops-cost))
                (direct-conflicts (bitcoin-lisp.mempool:find-rbf-conflicts mempool tx))
                (replaced-set nil))
 

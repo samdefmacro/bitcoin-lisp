@@ -554,7 +554,7 @@ multisig outputs of 1000 sat each, plus a CHANGE P2SH(OP_TRUE) output."
   "The weighted sigop cost computed during validation is returned (5th value)
 and recorded on the mempool entry — the value the block assembler's sigop
 budget consumes (Core PreChecks -> StageAddition sigops_cost,
-validation.cpp:908,935). 5 bare 1-of-3 multisig outputs = 5 * 20 * 4 = 400."
+validation.cpp:905,924). 5 bare 1-of-3 multisig outputs = 5 * 20 * 4 = 400."
   (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
     (let* ((tx (%multisig-outputs-tx funding 5 99900000))
            (txid (bitcoin-lisp.serialization:transaction-hash tx)))
@@ -633,3 +633,21 @@ validation.cpp:185-192) — so any nonzero relative lock on it is non-final."
         (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status
                           (%result-for results child)))))
       (is (not (bitcoin-lisp.mempool:mempool-has mempool pid))))))
+
+(test fee-floor-uses-sigop-adjusted-vsize
+  "The relay fee floor prices sigop-dense txs on the ADJUSTED virtual size
+(Core CheckFeeRate runs on ws.m_vsize = the entry's GetTxSize,
+validation.cpp:929,945): 200 bare multisig outputs adjust ~23 kvB of actual
+bytes up to 80,000 vB (16,000 sigops * 20 / 4), so a fee ample for the raw
+size fails the floor."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let ((tx (%multisig-outputs-tx funding 200 99795000)))   ; fee 5,000 sat
+      ;; Ample for the raw ~23 kvB at 100 sat/kvB (needs ~2,300)...
+      (is (> 5000 (ceiling (* 100 (bitcoin-lisp.serialization:transaction-vsize tx))
+                           1000)))
+      ;; ...but the adjusted 80,000 vB needs 8,000 sat.
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           tx utxo-set mempool 200 :chain-state chain-state)
+        (is-false valid)
+        (is (eq :insufficient-fee err))))))

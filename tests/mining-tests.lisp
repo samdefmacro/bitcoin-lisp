@@ -200,23 +200,36 @@ still mined."
   "A skipped chunk suppresses the LATER chunks of its cluster - including
 them without it could be topologically invalid - while other clusters keep
 being considered (Core BlockBuilder Skip semantics, txgraph.cpp:3241-3251).
-The parent chunk here busts the sigops budget; the child chunk would fit
-easily but must not appear."
+Sigop-dense fillers leave the block's sigop budget too small for P's chunk;
+P's child C would fit easily but must not appear. (A single tx can no
+longer bust the 80k budget by itself: its sigop-adjusted vsize caps a
+cluster at 20,200 sigops - the same bound Core's 404k adjusted-weight
+cluster limit imposes.)"
   (let ((bitcoin-lisp:*network* :regtest))
     (multiple-value-bind (cs mp) (%mining-fixture)
       (let* ((p (make-mempool-test-tx :input-id 35))
              (ptxid (bitcoin-lisp.serialization:transaction-hash p))
              (c (%mp-spending-tx ptxid))
-             (x (make-mempool-test-tx :input-id 36)))
-        ;; Chunks by feerate: [P] (skipped: 400 + 79601 >= 80000 sigops),
-        ;; [X] (included), [C] (suppressed with P's cluster; C alone would fit).
-        (is (eq :ok (%mine-add-entry mp p 50000 :sigops 79601)))
-        (is (eq :ok (%mine-add-entry mp c 10)))          ; lower feerate than P: own chunk
-        (is (eq :ok (%mine-add-entry mp x 2000)))
+             (fillers (list (make-mempool-test-tx :input-id 36)
+                            (make-mempool-test-tx :input-id 37)
+                            (make-mempool-test-tx :input-id 38))))
+        ;; Fillers first at top feerate: 400 (coinbase reserve) + 3 x 20,000
+        ;; in the block. P's chunk (20,000 more, lower feerate) busts the
+        ;; budget (80,400 >= 80,000) and is skipped; C - its own lower-feerate
+        ;; chunk in P's cluster - is suppressed, though it alone would fit.
+        (dolist (x fillers)
+          (is (eq :ok (%mine-add-entry mp x 50000 :sigops 20000))))
+        (is (eq :ok (%mine-add-entry mp p 10000 :sigops 20000)))
+        (is (eq :ok (%mine-add-entry mp c 1)))
         (let ((txids (%template-txids
-                      (bitcoin-lisp.mining:assemble-block-template cs mp))))
-          (is (equal (list (bitcoin-lisp.serialization:transaction-hash x))
-                     txids)))))))
+                      (bitcoin-lisp.mining:assemble-block-template cs mp)))
+              (tmpl bitcoin-lisp.mining:*last-block-template*))
+          (is (= 3 (length txids)))
+          (is (not (member ptxid txids :test #'equalp)))
+          (is (not (member (bitcoin-lisp.serialization:transaction-hash c)
+                           txids :test #'equalp)))
+          (is (= (+ bitcoin-lisp.mining::+coinbase-reserved-sigops+ 60000)
+                 (bitcoin-lisp.mining:block-template-total-sigops tmpl))))))))
 
 (defun %ab-reference-greedy-fees (mempool)
   "The pre-cluster ancestor-package greedy selection (the old

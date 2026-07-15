@@ -1744,3 +1744,32 @@ diagram does NOT strictly improve — rejected :replacement-failed."
          mempool 1000 100 100000000 200000 (list orig-txid))
       (is-false ok)
       (is (eq reason :too-large-cluster)))))
+
+;;;; Wave 7: sigop-adjusted virtual size (Core GetVirtualTransactionSize,
+;;;; policy.cpp:376-384; CTxMemPoolEntry::GetTxSize)
+
+(test sigop-adjusted-vsize-matches-core
+  "ceil(max(weight, sigops * DEFAULT_BYTES_PER_SIGOP) / 4), hand-checked
+against Core's arithmetic."
+  ;; weight dominates: plain BIP141 vsize, with Core's ceiling division.
+  (is (= 100 (bitcoin-lisp.mempool:sigop-adjusted-vsize 400 0)))
+  (is (= 101 (bitcoin-lisp.mempool:sigop-adjusted-vsize 401 0)))
+  (is (= 101 (bitcoin-lisp.mempool:sigop-adjusted-vsize 404 0)))
+  ;; tie: 20 sigops * 20 = 400 = weight.
+  (is (= 100 (bitcoin-lisp.mempool:sigop-adjusted-vsize 400 20)))
+  ;; sigops dominate: 100 * 20 / 4 = 500; 1 * 20 / 4 = 5.
+  (is (= 500 (bitcoin-lisp.mempool:sigop-adjusted-vsize 400 100)))
+  (is (= 5 (bitcoin-lisp.mempool:sigop-adjusted-vsize 0 1))))
+
+(test entry-vsize-is-sigop-adjusted
+  "make-entry-from-tx records the sigop-adjusted virtual size: unchanged for
+plain txs, max(weight, sigops*20)/4 when the sigop cost dominates — the size
+Core's entry reports and mines by (CTxMemPoolEntry::GetTxSize)."
+  (let* ((tx (make-mempool-test-tx :input-id 97))
+         (weight (bitcoin-lisp.serialization:transaction-weight tx))
+         (plain (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))
+         (dense (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0 :sigops 400)))
+    (is (= (bitcoin-lisp.serialization:transaction-vsize tx)
+           (bitcoin-lisp.mempool:mempool-entry-vsize plain)))
+    (is (< weight (* 400 20)))          ; sigops dominate for this tiny tx
+    (is (= 2000 (bitcoin-lisp.mempool:mempool-entry-vsize dense)))))
