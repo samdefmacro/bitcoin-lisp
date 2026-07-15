@@ -16,6 +16,19 @@
 (defun next-peer-id ()
   (bt:with-lock-held (*peer-id-lock*) (incf *peer-id-counter*)))
 
+;;; Per-address addr/addrv2 intake rate limit (Bitcoin Core
+;;; net_processing.cpp:190-197): the units are ADDRESSES, not messages.
+(defconstant +max-addr-rate-per-second+ 0.1d0
+  "Token-bucket refill rate for gossiped-address processing (Core
+MAX_ADDR_RATE_PER_SECOND). At steady state a peer gets one address through
+every 10 seconds; everything faster is dropped, not queued.")
+
+(defconstant +max-addr-processing-token-bucket+
+  bitcoin-lisp.serialization:+max-addr-count+
+  "Soft cap of the addr token bucket (Core MAX_ADDR_PROCESSING_TOKEN_BUCKET =
+MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
++MAX_ADDR_TO_SEND bump after our own getaddr may.")
+
 (defstruct peer
   "A Bitcoin peer."
   (id (next-peer-id) :type integer)
@@ -85,6 +98,31 @@
   ;; T once we have answered this peer's getaddr (Bitcoin Core m_getaddr_recvd):
   ;; one address response per connection, to limit address-stamping spam.
   (getaddr-sent nil :type boolean)
+  ;; T while a getaddr WE sent to this peer is unanswered (Bitcoin Core
+  ;; m_getaddr_sent — note our getaddr-sent slot above is Core's
+  ;; m_getaddr_recvd). Set when send-post-handshake-messages requests
+  ;; addresses; cleared by the addr handler on any non-full (<1000) addr/
+  ;; addrv2 message. While set, freshly-learned addresses are NOT relayed
+  ;; onward (getaddr responses are stale gossip, net_processing.cpp:4100).
+  (getaddr-requested nil :type boolean)
+  ;; Per-peer addr processing token bucket (Core Peer::m_addr_token_bucket,
+  ;; net_processing.cpp:384): starts at 1.0, refills at
+  ;; +max-addr-rate-per-second+ (0.1/s) up to +max-addr-processing-token-
+  ;; bucket+ (1000), one token consumed per gossiped address; addresses
+  ;; beyond the bucket are DROPPED. Sending a getaddr bumps it by 1000 so
+  ;; the solicited response is exempt.
+  (addr-token-bucket 1.0d0 :type double-float)
+  ;; internal-real-time when the bucket was last refilled (m_addr_token_timestamp).
+  (addr-token-timestamp (get-internal-real-time) :type integer)
+  ;; Lifetime counters surfaced in getpeerinfo (m_addr_processed /
+  ;; m_addr_rate_limited).
+  (addr-processed 0 :type integer)
+  (addr-rate-limited 0 :type integer)
+  ;; In-progress low-work headers presync/redownload with this peer, or NIL
+  ;; (Bitcoin Core Peer::m_headers_sync). One slot serves both drivers — the
+  ;; solicited Phase-1 sync (sync-headers) and the generic announcement path
+  ;; (ingest-headers-from-peer) — so they can never run two syncs at once.
+  (headers-sync nil)
   ;; Compact block support (BIP 152)
   (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
   (compact-block-high-bandwidth nil :type boolean)    ; High-bandwidth mode enabled
@@ -251,6 +289,9 @@ a later-loaded file, so a direct call would be a forward reference.")
     (close-connection (peer-connection peer)))
   (setf (peer-state peer) :disconnected)
   (setf (peer-connection peer) nil)
+  ;; Drop any in-progress low-work headers sync with this peer (Core
+  ;; FinalizeNode resets Peer state; the buffers die with the struct).
+  (setf (peer-headers-sync peer) nil)
   ;; Drop this peer's orphan ANNOUNCEMENTS (DoS hygiene). Orphans other
   ;; peers also announced survive (Core TxOrphanage::EraseForPeer).
   (let ((node bitcoin-lisp::*node*))
@@ -263,6 +304,16 @@ a later-loaded file, so a direct call would be a forward reference.")
   ;; re-schedulable so the next scheduler pass fails them over.
   (when *peer-disconnect-hook*
     (ignore-errors (funcall *peer-disconnect-hook* peer))))
+
+(defun flush-peer-send-buffers (peers)
+  "Retry every connected peer's buffered unsent bytes without blocking — the
+periodic half of Core's per-socket SocketSendData, driven from the sync/IBD
+housekeeping loops (~1x/second) since we have no dedicated socket thread.
+No-op for peers with nothing buffered."
+  (dolist (peer peers)
+    (let ((conn (peer-connection peer)))
+      (when (and conn (connection-connected conn))
+        (flush-send-buffer conn)))))
 
 ;;; Message I/O
 
@@ -697,7 +748,15 @@ on the local onion-service listener (Tor forwarding), whose true network is
   ;; gossip, DNS seeds, and fixed seeds.
   (when (and (not (peer-inbound peer))
              (not (eq (peer-conn-type peer) :block-relay)))
-    (send-message peer (bitcoin-lisp.serialization:make-getaddr-message))))
+    (send-message peer (bitcoin-lisp.serialization:make-getaddr-message))
+    ;; Track the solicitation and accept a full MAX_ADDR_TO_SEND response
+    ;; beyond the token bucket's cap (Core net_processing.cpp:3769-3772:
+    ;; "When requesting a getaddr, accept an additional MAX_ADDR_TO_SEND
+    ;; addresses in response (bypassing the MAX_ADDR_PROCESSING_TOKEN_BUCKET
+    ;; limit)").
+    (setf (peer-getaddr-requested peer) t)
+    (incf (peer-addr-token-bucket peer)
+          (coerce bitcoin-lisp.serialization:+max-addr-count+ 'double-float))))
 
 ;;; Ping/Pong
 
@@ -759,6 +818,19 @@ Returns :disconnect if the peer should be disconnected, :ok otherwise."
   "Check health of a single peer. Returns :ok, :ping-sent, or :disconnect.
 Should be called periodically (every ~60s).
 Also checks handshake timeout for peers that haven't completed handshake."
+  ;; Send-side upkeep, regardless of state: retry buffered unsent bytes
+  ;; (non-blocking), and disconnect a peer whose socket has accepted nothing
+  ;; for +send-stall-timeout-seconds+ while data is pending (Core
+  ;; InactivityCheck \"socket sending timeout\").
+  (let ((conn (peer-connection peer)))
+    (when (and conn (connection-connected conn))
+      (flush-send-buffer conn)
+      (when (connection-send-stalled-p conn)
+        (bitcoin-lisp:log-warn "Peer ~A socket sending timeout (~D unsent bytes)"
+                               (peer-address peer)
+                               (connection-send-queue-bytes conn))
+        (return-from check-peer-health :disconnect))))
+
   ;; Check handshake timeout for non-ready peers
   (unless (eq (peer-state peer) :ready)
     (return-from check-peer-health (check-handshake-timeout peer)))

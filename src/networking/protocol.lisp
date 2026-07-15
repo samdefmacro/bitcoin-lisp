@@ -846,20 +846,13 @@ IBD pre-sync drain via handle-message, and BIP130 sendheaders announcements);
 like the Phase-1 sync-headers path it MUST validate before admission, or a peer
 could inject unchecked headers into the index — inflating chain-work with
 low-target headers lacking matching PoW and bypassing checkpoints at admission.
-Previously this admitted any header with a known parent, unvalidated."
+Routes through ingest-headers-from-peer (Core ProcessHeadersMessage), which
+adds the low-work anti-DoS presync gate this path previously lacked: during a
+from-genesis IBD the validated tip sits below the work floor, so
+process-headers' own gate is off and unbounded cheap headers could be
+committed to the index from announcements."
   (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-    (multiple-value-bind (valid-headers error)
-        (validate-header-chain headers chain-state)
-      (when error
-        (bitcoin-lisp:log-warn "Header validation error: ~A" error))
-      (process-headers valid-headers chain-state)
-      ;; Per-peer availability: the peer's advertised tip is the last VALID
-      ;; header. Mirrors Core's UpdateBlockAvailability (net_processing.cpp).
-      (let ((last (car (last valid-headers))))
-        (when last
-          (update-block-availability
-           peer chain-state
-           (bitcoin-lisp.serialization:block-header-hash last)))))))
+    (ingest-headers-from-peer peer headers chain-state)))
 
 ;;; Block handling
 
@@ -990,35 +983,103 @@ STORED is 1/0 for the caller's log count, RELAY-ENTRY a
                        (address-routable-p (peer-address-ip pa) network))
               (cons pa (if reachable 2 1))))))
 
+(defun %refill-addr-token-bucket (peer &optional (now (get-internal-real-time)))
+  "Refill PEER's addr token bucket from elapsed time, once per addr/addrv2
+message (Core net_processing.cpp:4056-4064): only while below the soft cap,
+at +max-addr-rate-per-second+, clamped to the cap — so the getaddr-response
+bump above the cap is never refilled further but also not clawed back. The
+timestamp always advances."
+  (let ((cap (coerce +max-addr-processing-token-bucket+ 'double-float)))
+    (when (< (peer-addr-token-bucket peer) cap)
+      (let* ((elapsed (max 0 (- now (peer-addr-token-timestamp peer))))
+             (increment (* (/ (coerce elapsed 'double-float)
+                              internal-time-units-per-second)
+                           +max-addr-rate-per-second+)))
+        (setf (peer-addr-token-bucket peer)
+              (min (+ (peer-addr-token-bucket peer) increment) cap))))
+    (setf (peer-addr-token-timestamp peer) now)))
+
+(defun %process-gossiped-addresses (peer entries announced-count address-book peers)
+  "Shared addr/addrv2 processing core (the per-address loop of Core's
+ADDR/ADDRV2 handler, net_processing.cpp:4038-4118). ENTRIES is a list of
+(net-addr . timestamp); ANNOUNCED-COUNT is the message's declared address
+count. Applies the per-ADDRESS token bucket — addresses beyond the bucket
+are DROPPED, not queued (Core rate_limited branch; we have no per-peer Addr
+permission, so every peer is subject to it and only the getaddr-response
+bump exempts solicited replies). Processing order is shuffled first so an
+attacker cannot choose which addresses survive the limit (Core std::shuffle).
+Fresh routable addresses from small (<=10) UNSOLICITED announcements relay
+onward; a non-full message marks our outstanding getaddr answered. Returns
+the number stored."
+  (let* ((now (bitcoin-lisp.serialization:get-unix-time))
+         (source-group (when peer (peer-source-group peer)))
+         ;; Read before the end-of-message reset below, like Core (the reset
+         ;; runs after the loop): a getaddr response never relays onward.
+         (unsolicited (not (and peer (peer-getaddr-requested peer))))
+         (added 0)
+         (num-proc 0)
+         (num-rate-limit 0)
+         (relay-candidates '()))
+    (when peer
+      (%refill-addr-token-bucket peer))
+    (dolist (entry (alexandria:shuffle (copy-list entries)))
+      (cond
+        ((and peer (< (peer-addr-token-bucket peer) 1.0d0))
+         (incf num-rate-limit))
+        (t
+         (when peer
+           (decf (peer-addr-token-bucket peer) 1.0d0)
+           (incf num-proc))
+         (multiple-value-bind (stored relay)
+             (%ingest-gossiped-address (car entry) (cdr entry)
+                                       address-book source-group now)
+           (incf added stored)
+           (when relay (push relay relay-candidates))))))
+    (when peer
+      (incf (peer-addr-processed peer) num-proc)
+      (incf (peer-addr-rate-limited peer) num-rate-limit)
+      (when (plusp num-rate-limit)
+        (bitcoin-lisp:log-cat "net" "addr from peer ~A: ~D processed, ~D rate-limited"
+                              (peer-address peer) num-proc num-rate-limit))
+      ;; A non-full message answers our getaddr (Core: "if (vAddr.size() <
+      ;; 1000) peer.m_getaddr_sent = false", net_processing.cpp:4116).
+      (when (< announced-count bitcoin-lisp.serialization:+max-addr-count+)
+        (setf (peer-getaddr-requested peer) nil)))
+    (when (and peers unsolicited (<= announced-count 10))
+      (loop for (pa . max-targets) in relay-candidates
+            do (relay-address pa peer peers :now now :max-targets max-targets)))
+    added))
+
 (defun handle-addr (peer payload &optional address-book peers)
   "Handle an addr message. When ADDRESS-BOOK is provided, add plausible
 addresses (timestamp within last 3 hours) on reachable networks to the address
 book, keyed to the gossiping PEER as their source (addrman source-group
-spreading). Addresses with a timestamp within the last 10 minutes arriving in
-a small (<= 10 entries) unsolicited announcement are gossiped onward (Core
-RelayAddress)."
-  (let ((now (bitcoin-lisp.serialization:get-unix-time))
-        (source-group (when peer (peer-source-group peer)))
-        (added 0)
-        (relay-candidates '())
+spreading), subject to the per-address token bucket (see
+%process-gossiped-addresses). Ignored entirely from a block-relay-only peer
+(Core SetupAddressRelay, net_processing.cpp:4041); more than 1000 announced
+addresses is misbehavior (net_processing.cpp:4046-4050)."
+  (when (and peer (eq (peer-conn-type peer) :block-relay))
+    (bitcoin-lisp:log-cat "net" "ignoring addr message from block-relay-only peer ~A"
+                          (peer-address peer))
+    (return-from handle-addr 0))
+  (let ((entries '())
         (msg-count 0))
     (flexi-streams:with-input-from-sequence (stream payload)
       (let ((count (bitcoin-lisp.serialization:read-compact-size stream)))
+        (when (> count bitcoin-lisp.serialization:+max-addr-count+)
+          (when peer
+            (record-misbehavior peer (format nil "addr message size = ~D" count)))
+          (return-from handle-addr 0))
         (setf msg-count count)
-        (loop repeat (min count 1000)  ; Limit to prevent abuse
+        (loop repeat count
               do (multiple-value-bind (net-addr timestamp)
                      (bitcoin-lisp.serialization:read-net-addr stream :with-timestamp t)
-                   (multiple-value-bind (stored relay)
-                       (%ingest-gossiped-address net-addr timestamp
-                                                 address-book source-group now)
-                     (incf added stored)
-                     (when relay (push relay relay-candidates)))))))
-    (when (and peers (<= msg-count 10))
-      (loop for (pa . max-targets) in relay-candidates
-            do (relay-address pa peer peers :now now :max-targets max-targets)))
-    (when (and address-book (> added 0))
-      (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addr message" added))
-    added))
+                   (push (cons net-addr timestamp) entries)))))
+    (let ((added (%process-gossiped-addresses peer (nreverse entries) msg-count
+                                              address-book peers)))
+      (when (and address-book (> added 0))
+        (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addr message" added))
+      added)))
 
 ;;; ADDRv2 handling (BIP 155)
 
@@ -1026,26 +1087,28 @@ RelayAddress)."
   "Handle an addrv2 message (BIP 155). When ADDRESS-BOOK is provided, add
 addresses of any representable network (IPv4/IPv6/TORv3/I2P/CJDNS) with
 plausible timestamps (within 3 hours) to the address book — non-IP networks
-only when reachable (-onlynet + proxy/flag gates), mirroring Core. Unknown
-network ids were already skipped by the codec."
-  (let ((now (bitcoin-lisp.serialization:get-unix-time))
-        (source-group (when peer (peer-source-group peer)))
-        (added 0)
-        (relay-candidates '())
-        (entries (bitcoin-lisp.serialization:parse-addrv2-payload payload)))
-    (dolist (entry entries)
-      (destructuring-bind (net-addr timestamp network-id) entry
-        (declare (ignore network-id))
-        (multiple-value-bind (stored relay)
-            (%ingest-gossiped-address net-addr timestamp address-book source-group now)
-          (incf added stored)
-          (when relay (push relay relay-candidates)))))
-    (when (and peers (<= (length entries) 10))
-      (loop for (pa . max-targets) in relay-candidates
-            do (relay-address pa peer peers :now now :max-targets max-targets)))
-    (when (and address-book (> added 0))
-      (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
-    added))
+only when reachable (-onlynet + proxy/flag gates), subject to the per-address
+token bucket (see %process-gossiped-addresses). Unknown network ids were
+already skipped by the codec; a count above 1000 fails parsing (Core
+Misbehaving path — the caller disconnects). Ignored entirely from a
+block-relay-only peer (Core SetupAddressRelay)."
+  (when (and peer (eq (peer-conn-type peer) :block-relay))
+    (bitcoin-lisp:log-cat "net" "ignoring addrv2 message from block-relay-only peer ~A"
+                          (peer-address peer))
+    (return-from handle-addrv2 0))
+  (multiple-value-bind (entries announced-count)
+      (bitcoin-lisp.serialization:parse-addrv2-payload payload)
+    (let ((added (%process-gossiped-addresses
+                  peer
+                  (mapcar (lambda (entry)
+                            (destructuring-bind (net-addr timestamp network-id) entry
+                              (declare (ignore network-id))
+                              (cons net-addr timestamp)))
+                          entries)
+                  announced-count address-book peers)))
+      (when (and address-book (> added 0))
+        (bitcoin-lisp:log-cat "net" "Added ~D peer addresses from addrv2 message" added))
+      added)))
 
 ;;; Transaction handling
 
@@ -1299,6 +1362,15 @@ handling of unavailable blocks."
         (blocks-served 0)
         (not-found '()))
     (dolist (inv inv-vectors)
+      ;; Stop serving a send-paused peer (its outgoing buffer is over the
+      ;; cap) — Core breaks out of ProcessGetData on fPauseSend
+      ;; (net_processing.cpp:2536). Core parks the rest of the getdata for
+      ;; later; we drop it and the peer re-requests, which its own request
+      ;; timeout already handles. The notfound for what WAS processed still
+      ;; goes out below, as in Core.
+      (let ((conn (peer-connection peer)))
+        (when (and conn (connection-send-paused-p conn))
+          (return)))
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
         (cond
