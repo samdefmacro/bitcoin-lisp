@@ -108,6 +108,11 @@
    #:bip32-serialize
    #:bip32-parse
    #:+bip32-hardened+
+   #:+secp256k1-order+
+   #:+xprv-mainnet+
+   #:+xpub-mainnet+
+   #:+xprv-testnet+
+   #:+xpub-testnet+
    #:taproot-tweak-private-key
    ;; Schnorr / x-only pubkeys (BIP 340)
    #:verify-schnorr-signature
