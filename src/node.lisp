@@ -254,40 +254,15 @@ LEVEL can be :debug, :info, :warn, or :error."
 ;;;; Genesis block headers
 ;;; Genesis parameters from Bitcoin Core chainparams.cpp
 
-(defvar *genesis-merkle-root*
-  (bitcoin-lisp.crypto:hex-to-bytes
-   "3ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a")
-  "Genesis block merkle root (little-endian). Same for mainnet and testnet.")
-
 (defun make-genesis-header (network)
-  "Construct the genesis block header for NETWORK."
-  (let ((prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
-    (ecase network
-      (:testnet3
-       (bitcoin-lisp.serialization:make-block-header
-        :version 1 :prev-block prev-block
-        :merkle-root (copy-seq *genesis-merkle-root*)
-        :timestamp 1296688602 :bits #x1d00ffff :nonce 414098458))
-      (:testnet4
-       (bitcoin-lisp.serialization:make-block-header
-        :version 1 :prev-block prev-block
-        :merkle-root (copy-seq *genesis-merkle-root*)
-        :timestamp 1714777860 :bits #x1d00ffff :nonce 393743547))
-      (:signet
-       (bitcoin-lisp.serialization:make-block-header
-        :version 1 :prev-block prev-block
-        :merkle-root (copy-seq *genesis-merkle-root*)
-        :timestamp 1598918400 :bits #x1e0377ae :nonce 52613770))
-      (:regtest
-       (bitcoin-lisp.serialization:make-block-header
-        :version 1 :prev-block prev-block
-        :merkle-root (copy-seq *genesis-merkle-root*)
-        :timestamp 1296688602 :bits #x207fffff :nonce 2))
-      (:mainnet
-       (bitcoin-lisp.serialization:make-block-header
-        :version 1 :prev-block prev-block
-        :merkle-root (copy-seq *genesis-merkle-root*)
-        :timestamp 1231006505 :bits #x1d00ffff :nonce 2083236893)))))
+  "Construct the genesis block header for NETWORK, taken from the full
+genesis-block construction (bitcoin-lisp.storage:make-genesis-block) so the
+merkle root is COMPUTED from the real per-network coinbase and the header
+hash is verified against the known genesis hash. A previous version shared
+mainnet's merkle-root constant across all networks, which was wrong for
+testnet4 (its genesis coinbase differs; Core kernel/chainparams.cpp:367-379)."
+  (bitcoin-lisp.serialization:bitcoin-block-header
+   (bitcoin-lisp.storage:make-genesis-block network)))
 
 ;;;; Startup Sequence
 
@@ -1081,6 +1056,16 @@ post-promotion index rebind."
   (let* ((bfi (node-blockfilterindex node))
          (cs (node-validated-chainstate node))
          (tip (bitcoin-lisp.storage:current-height cs)))
+    ;; BIP157 genesis-anchor migration: an index built before genesis indexing
+    ;; existed seeded its header chain at the first STORED block, so every
+    ;; absolute cfheaders/cfcheckpt/getblockfilter header it serves diverges
+    ;; from Core and BIP157 light clients ban us. Detect and wipe it here; the
+    ;; backfill below then rebuilds the whole index from height 0 (the genesis
+    ;; filter is computed from chain parameters). No-op on fresh and healthy
+    ;; indexes; on a pruned node a bad index is kept (rebuild impossible) with
+    ;; a warning.
+    (when (eq :rebuilt (bitcoin-lisp.storage:blockfilterindex-ensure-genesis-anchor bfi cs))
+      (log-info "Block filter index wiped; rebuilding from genesis"))
     (when (> (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
       (log-warn "Block filter index best above tip (~D > ~D); repairing"
                 (bitcoin-lisp.storage:blockfilterindex-height bfi) tip)
@@ -1339,12 +1324,18 @@ Returns the node instance."
                          (node-chain-state *node*) genesis-hash))
          (genesis-header (make-genesis-header network)))
     (if genesis-entry
-        ;; Fix existing entry if it has a missing or zeroed header
-        (when (or (null (bitcoin-lisp.storage:block-index-entry-header genesis-entry))
-                  (zerop (bitcoin-lisp.serialization:block-header-bits
-                          (bitcoin-lisp.storage:block-index-entry-header genesis-entry))))
-          (setf (bitcoin-lisp.storage:block-index-entry-header genesis-entry)
-                genesis-header))
+        ;; Fix existing entry if it has a missing or zeroed header, or a
+        ;; persisted header with the wrong merkle root (the old shared-constant
+        ;; make-genesis-header gave testnet4 mainnet's merkle root, and header
+        ;; indexes saved before the fix still carry it).
+        (let ((h (bitcoin-lisp.storage:block-index-entry-header genesis-entry)))
+          (when (or (null h)
+                    (zerop (bitcoin-lisp.serialization:block-header-bits h))
+                    (not (equalp (bitcoin-lisp.serialization:block-header-merkle-root h)
+                                 (bitcoin-lisp.serialization:block-header-merkle-root
+                                  genesis-header))))
+            (setf (bitcoin-lisp.storage:block-index-entry-header genesis-entry)
+                  genesis-header)))
         ;; Create new genesis entry
         (bitcoin-lisp.storage:add-block-index-entry
          (node-chain-state *node*)
