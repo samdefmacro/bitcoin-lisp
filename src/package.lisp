@@ -995,7 +995,7 @@
    #:compute-median-time-past
    #:check-sequence-locks
    #:compute-script-flags-for-height
-   #:compute-standard-script-flags-for-height
+   #:+standard-script-verify-flags+
    #:get-segwit-activation-height
    ;; Difficulty validation
    #:validate-difficulty
