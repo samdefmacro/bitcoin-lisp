@@ -3027,8 +3027,9 @@ phase exits quickly when there's nothing new to fetch."
   (when (node-mempool *node*)
     (format t "  Transactions: ~D~%"
             (bitcoin-lisp.mempool:mempool-count (node-mempool *node*)))
-    (format t "  Size: ~:D bytes~%"
-            (bitcoin-lisp.mempool:mempool-total-size (node-mempool *node*))))
+    (format t "  Size: ~:D vbytes (~:D bytes memory)~%"
+            (bitcoin-lisp.mempool:mempool-total-size (node-mempool *node*))
+            (bitcoin-lisp.mempool:mempool-dynamic-usage (node-mempool *node*))))
   (format t "~%Peers:~%")
   (if (node-peers *node*)
       (dolist (peer (node-peers *node*))
