@@ -960,7 +960,9 @@ for plain non-witness spends."
   "A script failure of a NO-witness tx spending a witness program is
 classified :witness-stripped (Core TX_WITNESS_STRIPPED, validation.cpp:
 1143-1148) so the P2P layer never caches it; the same failure on a
-non-witness-program spend stays :script-failed."
+non-witness-program spend is the policy-pass script rejection
+:mempool-script-verify-flag-failed (Core TX_NOT_STANDARD from
+PolicyScriptChecks)."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (utxo (bitcoin-lisp.storage:make-utxo-set))
          (p2wpkh (let ((s (make-array 22 :element-type '(unsigned-byte 8)
@@ -977,7 +979,7 @@ non-witness-program spend stays :script-failed."
       (is (null valid))
       (is (eq err :witness-stripped)))
     ;; Same tx shape spending a P2PKH coin: witness stripping cannot explain
-    ;; the failure, so it remains :script-failed.
+    ;; the failure, so it is the generic policy-pass script rejection.
     (let ((base2 (make-mempool-test-tx :input-id 121 :value 50000000)))
       (bitcoin-lisp.storage:add-utxo
        utxo (make-array 32 :element-type '(unsigned-byte 8) :initial-element 121)
@@ -989,7 +991,7 @@ non-witness-program spend stays :script-failed."
           (bitcoin-lisp.validation:validate-transaction-for-mempool
            base2 utxo mempool 100)
         (is (null valid))
-        (is (eq err :script-failed))))))
+        (is (eq err :mempool-script-verify-flag-failed))))))
 
 (test mempool-coinbase-maturity-at-next-block-height
   "Core's mempool acceptance checks maturity at nSpendHeight = tip + 1
@@ -1022,7 +1024,116 @@ to evaluate maturity at the tip height itself, off by one."
          tx utxo mempool 99)
       (declare (ignore valid))
       (is (not (eq err :coinbase-not-mature)))
-      (is (eq err :script-failed)))))
+      (is (eq err :mempool-script-verify-flag-failed)))))
+
+;;;; Wave 9D: two-pass mempool script validation — PolicyScriptChecks
+;;;; (STANDARD flags) then ConsensusScriptChecks (tip consensus flags),
+;;;; Core validation.cpp:1132-1185.
+
+(test standard-script-verify-flags-composition
+  "+standard-script-verify-flags+ is Core's STANDARD_SCRIPT_VERIFY_FLAGS
+(policy/policy.h:118-133): the height-independent MANDATORY set
+(P2SH|DERSIG|NULLDUMMY|CLTV|CSV|WITNESS|TAPROOT, policy.h:104-110) plus
+every policy flag — 20 flags total, as a comma-separated string."
+  (let ((flags (uiop:split-string
+                bitcoin-lisp.validation:+standard-script-verify-flags+
+                :separator ",")))
+    (is (= 20 (length flags)))
+    (dolist (f '("P2SH" "DERSIG" "NULLDUMMY" "CHECKLOCKTIMEVERIFY"
+                 "CHECKSEQUENCEVERIFY" "WITNESS" "TAPROOT"
+                 "STRICTENC" "MINIMALDATA" "DISCOURAGE_UPGRADABLE_NOPS"
+                 "CLEANSTACK" "MINIMALIF" "NULLFAIL" "LOW_S"
+                 "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" "WITNESS_PUBKEYTYPE"
+                 "CONST_SCRIPTCODE" "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+                 "DISCOURAGE_OP_SUCCESS" "DISCOURAGE_UPGRADABLE_PUBKEYTYPE"))
+      (is (member f flags :test #'string=) "missing flag ~A" f))))
+
+(defun %p2sh-of (redeem)
+  "P2SH scriptPubKey paying to REDEEM (a byte vector)."
+  (let ((spk (make-array 23 :element-type '(unsigned-byte 8))))
+    (setf (aref spk 0) #xa9 (aref spk 1) #x14 (aref spk 22) #x87)
+    (replace spk (bitcoin-lisp.crypto:hash160 redeem) :start1 2)
+    spk))
+
+(defun %cleanstack-violation-fixture (script-sig &key (input-id 130))
+  "(values tx utxo-set mempool): TX spends a P2SH(OP_TRUE) coin with
+SCRIPT-SIG, paying a standard non-dust P2PKH output with an ample fee."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (redeem (make-array 1 :element-type '(unsigned-byte 8)
+                               :initial-element #x51))   ; OP_TRUE
+         (prev (make-array 32 :element-type '(unsigned-byte 8)
+                              :initial-element input-id))
+         (base (make-mempool-test-tx))     ; borrow its P2PKH output shape
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 2
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                 :hash prev :index 0)
+                               :script-sig script-sig
+                               :sequence #xFFFFFFFF))
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 99000000
+                                :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                                (elt (bitcoin-lisp.serialization:transaction-outputs base) 0))))
+              :lock-time 0)))
+    (bitcoin-lisp.storage:add-utxo utxo prev 0 100000000 (%p2sh-of redeem) 1)
+    (values tx utxo mempool)))
+
+(test mempool-policy-scripts-reject-consensus-valid-nonstandard
+  "PolicyScriptChecks: a P2SH(OP_TRUE) spend whose scriptSig carries an EXTRA
+leading push is CONSENSUS-valid (no consensus flag rejects the leftover
+stack item) but fails STANDARD flags on CLEANSTACK — mempool acceptance
+must reject it :mempool-script-verify-flag-failed (Core TX_NOT_STANDARD,
+reject reason \"mempool-script-verify-flag-failed\", CheckInputScripts
+validation.cpp:2117). Regression: the pre-Wave-9 mempool path ran
+MANDATORY-only flags and ACCEPTED it."
+  ;; scriptSig: push OP_TRUE's byte (extra), then push the redeemScript.
+  (let ((extra-push-sig (make-array 4 :element-type '(unsigned-byte 8)
+                                      :initial-contents '(#x01 #x51 #x01 #x51)))
+        (canonical-sig (make-array 2 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(#x01 #x51))))
+    (multiple-value-bind (tx utxo mempool) (%cleanstack-violation-fixture extra-push-sig)
+      ;; Consensus scripts (block flags at this height) PASS — the failure
+      ;; is purely a policy-flag one...
+      (is (eq t (bitcoin-lisp.validation:validate-transaction-scripts
+                 tx utxo :height 100)))
+      ;; ...and the full STANDARD set rejects it...
+      (is (null (bitcoin-lisp.validation:validate-transaction-scripts
+                 tx utxo
+                 :flags bitcoin-lisp.validation:+standard-script-verify-flags+)))
+      ;; ...so mempool acceptance classifies TX_NOT_STANDARD. This keyword
+      ;; hits the generic P2P reject branch (wtxid cached, txid never) —
+      ;; exactly Core's handling of TX_NOT_STANDARD (txdownloadman_impl.cpp).
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           tx utxo mempool 100)
+        (is (null valid))
+        (is (eq err :mempool-script-verify-flag-failed))))
+    ;; Control: the canonical single-push scriptSig sails through BOTH
+    ;; passes and is accepted.
+    (multiple-value-bind (tx utxo mempool)
+        (%cleanstack-violation-fixture canonical-sig :input-id 131)
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           tx utxo mempool 100)
+        (is (eq t valid))
+        (is (null err))))))
+
+(test mempool-policy-scripts-minimaldata-rejected
+  "A non-minimal redeemScript push (OP_PUSHDATA1 for a 1-byte push) is
+consensus-valid but violates MINIMALDATA: rejected by the policy pass."
+  (let ((pushdata1-sig (make-array 3 :element-type '(unsigned-byte 8)
+                                     :initial-contents '(#x4c #x01 #x51))))
+    (multiple-value-bind (tx utxo mempool)
+        (%cleanstack-violation-fixture pushdata1-sig :input-id 132)
+      (is (eq t (bitcoin-lisp.validation:validate-transaction-scripts
+                 tx utxo :height 100)))
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           tx utxo mempool 100)
+        (is (null valid))
+        (is (eq err :mempool-script-verify-flag-failed))))))
 
 ;;;; PR3 ancestor/descendant tracking + chained spends
 

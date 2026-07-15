@@ -216,7 +216,27 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
     "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" "WITNESS_PUBKEYTYPE"
     "CONST_SCRIPTCODE" "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
     "DISCOURAGE_OP_SUCCESS" "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
-  "Policy flags layered on top of mandatory consensus flags for mempool acceptance.")
+  "Policy flags layered on top of mandatory consensus flags for mempool acceptance
+(Core STANDARD_SCRIPT_VERIFY_FLAGS minus MANDATORY_SCRIPT_VERIFY_FLAGS =
+STANDARD_NOT_MANDATORY_VERIFY_FLAGS, policy/policy.h:118-134).")
+
+(defparameter +mandatory-script-verify-flags+
+  '("P2SH" "DERSIG" "NULLDUMMY" "CHECKLOCKTIMEVERIFY"
+    "CHECKSEQUENCEVERIFY" "WITNESS" "TAPROOT")
+  "Core MANDATORY_SCRIPT_VERIFY_FLAGS (policy/policy.h:104-110): the flags all
+NEW transactions must comply with. A height-independent CONSTANT in Core —
+distinct from GetBlockScriptFlags/compute-script-flags-for-height, which gate
+each flag on its activation height for block (consensus) validation.")
+
+(defparameter +standard-script-verify-flags+
+  (format nil "~{~A~^,~}" (append +mandatory-script-verify-flags+
+                                  +standard-policy-flags+))
+  "Core STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:118-133) as the
+comma-separated flag string the script engine consumes: the mandatory set
+plus every policy flag. This is what MemPoolAccept::PolicyScriptChecks runs
+(validation.cpp:1140) — a constant, not a per-height computation, because
+the mempool only ever validates against the current tip where every
+deployment is active.")
 
 (defun mandatory-script-flags-list (height)
   "Mandatory consensus flags active at HEIGHT, as a list of strings.
@@ -242,11 +262,6 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
    (Bitcoin Core: MANDATORY_SCRIPT_VERIFY_FLAGS)."
   (format nil "~{~A~^,~}" (mandatory-script-flags-list height)))
 
-(defun compute-standard-script-flags-for-height (height)
-  "Comma-separated STANDARD script verification flags for mempool acceptance at HEIGHT
-   (Bitcoin Core: STANDARD_SCRIPT_VERIFY_FLAGS = mandatory + policy)."
-  (format nil "~{~A~^,~}"
-          (append (mandatory-script-flags-list height) +standard-policy-flags+)))
 
 ;;; BIP 16 (P2SH) exception block hash for testnet3
 ;;; This block predates proper BIP 16 enforcement and must skip script validation

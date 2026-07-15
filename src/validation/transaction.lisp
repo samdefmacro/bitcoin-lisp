@@ -814,29 +814,64 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; (non-anchor) witness program can never satisfy its scripts —
           ;; the witness is simply missing. Core fails these inside
           ;; CheckInputScripts and PolicyScriptChecks then reclassifies the
-          ;; failure TX_WITNESS_STRIPPED (validation.cpp:1132-1150,
+          ;; failure TX_WITNESS_STRIPPED (validation.cpp:1143-1148,
           ;; SpendsNonAnchorWitnessProg) so the P2P layer never caches it in
           ;; recent-rejects: a stripped tx's wtxid equals its txid, so
           ;; caching would poison the real witnessed tx's txid and block its
-          ;; relay permanently. The script engine also rejects these
-          ;; (validate-input-script validates a missing witness as an EMPTY
-          ;; stack, per Core VerifyScript), but this gate must stay AND run
-          ;; FIRST so the failure keeps its :witness-stripped classification
-          ;; instead of the generic :script-failed. Anchor (P2A) spends are
-          ;; exempt: they legitimately carry no witness.
+          ;; relay permanently. Running the gate BEFORE the script passes is
+          ;; equivalent to Core's fail-then-reclassify: under the STANDARD
+          ;; flags of the policy pass below, every witnessless non-anchor
+          ;; witness-program spend fails (v0/v1 on the empty witness stack,
+          ;; unknown versions on DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM), so
+          ;; the reclassification would always fire anyway — pre-gating just
+          ;; skips the doomed execution and keeps the :witness-stripped
+          ;; classification. Anchor (P2A) spends are exempt: they
+          ;; legitimately carry no witness.
           (when (and (not (bitcoin-lisp.serialization:transaction-has-witness-p tx))
                      (spends-non-anchor-witness-program-p tx utxo-set extra-coins))
             (return-from validate-transaction-for-mempool
               (values nil :witness-stripped nil)))
 
-          ;; Script validation (consensus)
+          ;; Script pass 1 — PolicyScriptChecks (Core MemPoolAccept::
+          ;; PolicyScriptChecks, validation.cpp:1132-1153): run the input
+          ;; scripts under the full STANDARD flag set (a constant in Core,
+          ;; policy/policy.h:118). A failure is a POLICY rejection
+          ;; (TX_NOT_STANDARD), reject reason "mempool-script-verify-flag-
+          ;; failed (...)" (CheckInputScripts, validation.cpp:2117), which
+          ;; the P2P reject cache keys by wtxid only — never misbehavior.
           (multiple-value-bind (scripts-valid failed-input)
-              (validate-transaction-scripts tx utxo-set :height current-height
+              (validate-transaction-scripts tx utxo-set
+                                            :flags +standard-script-verify-flags+
                                             :extra-coins extra-coins)
             (declare (ignore failed-input))
             (unless scripts-valid
               (return-from validate-transaction-for-mempool
-                (values nil :script-failed nil))))
+                (values nil :mempool-script-verify-flag-failed nil))))
+
+          ;; Script pass 2 — ConsensusScriptChecks (Core MemPoolAccept::
+          ;; ConsensusScriptChecks -> CheckInputsFromMempoolAndCache,
+          ;; validation.cpp:1155-1185): re-run against the CURRENT TIP's
+          ;; consensus flags. Its purposes are (a) never admit a tx that
+          ;; standard flags pass but tip consensus flags reject (a
+          ;; standardness-bug backstop — Core cites STRICTENC once wrongly
+          ;; passing invalid CHECKSIG NOT scripts), and (b) warm the
+          ;; validation cache under the flags block connection will use:
+          ;; our sig-cache keys include the flag string, so this pass's
+          ;; verifies are the ones block connect hits. Standard-pass/
+          ;; consensus-fail is a should-never-happen internal error in Core
+          ;; ("BUG! ... CheckInputScripts failed against latest-block but
+          ;; not STANDARD flags"); we log the same and reject.
+          (multiple-value-bind (scripts-valid failed-input)
+              (validate-transaction-scripts tx utxo-set :height current-height
+                                            :extra-coins extra-coins)
+            (unless scripts-valid
+              (bitcoin-lisp:log-error
+               "BUG! PLEASE REPORT THIS! input scripts failed against latest-block but not STANDARD flags: txid=~A input=~A"
+               (bitcoin-lisp.crypto:bytes-to-hex
+                (bitcoin-lisp.serialization:transaction-hash tx))
+               failed-input)
+              (return-from validate-transaction-for-mempool
+                (values nil :block-script-verify-flag-failed nil))))
 
           (values t nil fee-value
                   (when replaced-set
@@ -869,17 +904,20 @@ decide (Core PreChecks, validation.cpp:950-970)."
           do (setf (aref result i) utxo))
     result))
 
-(defun validate-transaction-scripts (tx utxo-set &key (height 0) extra-coins)
+(defun validate-transaction-scripts (tx utxo-set &key (height 0) extra-coins flags)
   "Validate all input scripts for a transaction via Coalton interop.
 Uses validate-input-script for each input (same path as block validation).
-HEIGHT determines which script verification flags are active.
+HEIGHT determines which script verification flags are active; FLAGS, when
+supplied, overrides the height-derived flags with an explicit comma-separated
+flag string (the mempool's PolicyScriptChecks pass runs the constant
++standard-script-verify-flags+ set this way).
 EXTRA-COINS supplies spent outputs not in the confirmed UTXO set (chained
 mempool spends).
 Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
   (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
          (spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
          (bitcoin-lisp.coalton.interop:*script-flags*
-           (compute-script-flags-for-height height))
+           (or flags (compute-script-flags-for-height height)))
          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
            (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
          (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
