@@ -818,12 +818,12 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; SpendsNonAnchorWitnessProg) so the P2P layer never caches it in
           ;; recent-rejects: a stripped tx's wtxid equals its txid, so
           ;; caching would poison the real witnessed tx's txid and block its
-          ;; relay permanently. Our script engine treats an absent witness
-          ;; as no-op for witness-program inputs (validate-input-script's
-          ;; legacy-block tolerance), so the check must run explicitly here
-          ;; — without it a stripped segwit tx was ACCEPTED into the
-          ;; mempool. Anchor (P2A) spends are exempt: they legitimately
-          ;; carry no witness.
+          ;; relay permanently. The script engine also rejects these
+          ;; (validate-input-script validates a missing witness as an EMPTY
+          ;; stack, per Core VerifyScript), but this gate must stay AND run
+          ;; FIRST so the failure keeps its :witness-stripped classification
+          ;; instead of the generic :script-failed. Anchor (P2A) spends are
+          ;; exempt: they legitimately carry no witness.
           (when (and (not (bitcoin-lisp.serialization:transaction-has-witness-p tx))
                      (spends-non-anchor-witness-program-p tx utxo-set extra-coins))
             (return-from validate-transaction-for-mempool
