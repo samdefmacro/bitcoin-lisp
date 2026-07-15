@@ -534,18 +534,22 @@ could inject unchecked headers into the index — inflating chain-work with
 low-target headers lacking matching PoW and bypassing checkpoints at admission.
 Previously this admitted any header with a known parent, unvalidated."
   (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
-    (multiple-value-bind (valid-headers error)
-        (validate-header-chain headers chain-state)
-      (when error
-        (bitcoin-lisp:log-warn "Header validation error: ~A" error))
-      (process-headers valid-headers chain-state)
-      ;; Per-peer availability: the peer's advertised tip is the last VALID
-      ;; header. Mirrors Core's UpdateBlockAvailability (net_processing.cpp).
-      (let ((last (car (last valid-headers))))
-        (when last
-          (update-block-availability
-           peer chain-state
-           (bitcoin-lisp.serialization:block-header-hash last)))))))
+    ;; Node lock: process-headers mutates the block index, which the RPC
+    ;; threads (submitheader, chain queries) also touch under this lock —
+    ;; the same discipline handle-block already follows.
+    (with-node-lock
+      (multiple-value-bind (valid-headers error)
+          (validate-header-chain headers chain-state)
+        (when error
+          (bitcoin-lisp:log-warn "Header validation error: ~A" error))
+        (process-headers valid-headers chain-state)
+        ;; Per-peer availability: the peer's advertised tip is the last VALID
+        ;; header. Mirrors Core's UpdateBlockAvailability (net_processing.cpp).
+        (let ((last (car (last valid-headers))))
+          (when last
+            (update-block-availability
+             peer chain-state
+             (bitcoin-lisp.serialization:block-header-hash last))))))))
 
 ;;; Block handling
 
