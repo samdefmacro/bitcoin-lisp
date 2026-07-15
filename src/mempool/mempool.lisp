@@ -69,6 +69,12 @@ DEFAULT_MEMPOOL_EXPIRY_HOURS.")
   ;; Chain height at the time of acceptance.
   (height 0 :type (unsigned-byte 32))
   (entry-time 0 :type (unsigned-byte 64))
+  ;; Mempool admission sequence number (Core CTxMemPoolEntry m_sequence,
+  ;; assigned from the pool's counter at add time). Drives the getdata
+  ;; anti-probing gate: a tx is served to a peer only if it entered the pool
+  ;; BEFORE our last inv flush to that peer (Core info_for_relay,
+  ;; txmempool.h:533, vs Peer::TxRelay::m_last_inv_sequence).
+  (sequence 0 :type (unsigned-byte 64))
   ;; In-mempool dependency links (txid -> t). Ancestor/descendant aggregates
   ;; are derived on demand by walking these (bounded by the 25/25 limits), so
   ;; there are no cached totals to drift out of sync.
@@ -219,6 +225,11 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   ;; Orphan transactions (inputs not yet available); de-orphaned when a parent
   ;; arrives. Lives here so the tx-handling path reaches it via the mempool.
   (orphan-pool (make-orphan-pool) :type orphan-pool)
+  ;; Monotonic admission counter (Core CTxMemPool::m_sequence_number,
+  ;; txmempool.h:202, initialized to 1): each accepted tx records the current
+  ;; value and increments it. MEMPOOL-SEQUENCE reads the counter (Core
+  ;; GetSequence()) for the per-peer last-inv-sequence snapshots.
+  (next-sequence 1 :type (unsigned-byte 64))
   ;; The cluster/chunk engine (Core TxGraph), maintained in lockstep with
   ;; ENTRIES on every mutation. AUTHORITATIVE since the P4-P6 flips for
   ;; mining (chunk-walk block builder), eviction (worst-chunk trim), and the
@@ -234,6 +245,13 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
 
 (defconstant +rolling-fee-halflife-seconds+ 43200
   "Rolling minimum fee decays by half every 12 hours (Bitcoin Core default).")
+
+(defun mempool-sequence (mempool)
+  "The pool's current admission sequence — the value the NEXT accepted tx will
+be stamped with (Core CTxMemPool::GetSequence, txmempool.h:574). Snapshotted
+into a peer's last-inv-sequence whenever an inv flush to it completes; a tx is
+then servable to that peer iff its entry sequence is below the snapshot."
+  (mempool-next-sequence mempool))
 
 (defun mempool-effective-min-fee-rate (mempool &optional (now (bitcoin-lisp.serialization:get-unix-time)))
   "Effective minimum fee rate to enter the mempool, in SAT/KVB: the relay floor,
@@ -680,6 +698,12 @@ runs unconditionally (validation.cpp:1338-1342)."
         (txgraph-remove-transaction graph handle)
         (return-from mempool-add :too-large-cluster))
       (setf (mempool-entry-graph-handle entry) handle))
+
+    ;; Stamp the admission sequence (Core addNewTransaction's
+    ;; GetAndIncrementSequence) — the getdata anti-probing gate compares this
+    ;; against each peer's last-inv-sequence snapshot.
+    (setf (mempool-entry-sequence entry) (mempool-next-sequence mempool))
+    (incf (mempool-next-sequence mempool))
 
     ;; Add to entries table
     (setf (gethash txid (mempool-entries mempool)) entry)
