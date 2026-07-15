@@ -45,11 +45,21 @@ carrying it is appended and the coinbase gets the BIP141 reserved witness value
      :witness (when witness-commitment-script (vector (list (%zeros32))))
      :lock-time 0)))
 
-(defun assemble-full-block (chain-state mempool &key coinbase-script-pubkey block-time)
+(defun assemble-full-block (chain-state mempool &key coinbase-script-pubkey block-time
+                                                     utxo-set)
   "Build a complete (unmined) block extending CHAIN-STATE's tip: assemble a
 template, prepend a coinbase paying the template's coinbase-value to
 COINBASE-SCRIPT-PUBKEY (carrying the default witness commitment), set the merkle
-root, and produce a header with nonce 0. Returns (values block template)."
+root, and produce a header with nonce 0. Returns (values block template).
+
+When UTXO-SET is supplied the assembled block is dry-run through
+TEST-BLOCK-VALIDITY — CheckBlock + a non-mutating connect against the tip —
+and a failure signals an ERROR, exactly as Bitcoin Core's CreateNewBlock
+throws when TestBlockValidity rejects its own template (node/miner.cpp:
+227-231). This is the server-side net that keeps a mempool bug from mining
+a consensus-invalid block; every live template path (getblocktemplate,
+generate*) passes UTXO-SET. NIL skips the check (unit tests exercising
+assembly against synthetic chain states with no coins view)."
   (let* ((template (assemble-block-template chain-state mempool :block-time block-time))
          (coinbase (build-coinbase-transaction
                     (block-template-height template)
@@ -68,10 +78,16 @@ root, and produce a header with nonce 0. Returns (values block template)."
                   :merkle-root merkle
                   :timestamp (block-template-curtime template)
                   :bits (block-template-bits template)
-                  :nonce 0)))
-    (values (bitcoin-lisp.serialization:make-bitcoin-block
-             :header header :transactions txs)
-            template)))
+                  :nonce 0))
+         (block (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header header :transactions txs)))
+    (when utxo-set
+      (multiple-value-bind (ok reason)
+          (bitcoin-lisp.validation:test-block-validity block chain-state utxo-set)
+        (unless ok
+          (error "TestBlockValidity failed on assembled block at height ~D: ~A"
+                 (block-template-height template) reason))))
+    (values block template)))
 
 (defun mine-block (block &key (max-tries 10000000))
   "Grind the header nonce until BLOCK meets its PoW target. Returns BLOCK (header
