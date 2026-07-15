@@ -266,6 +266,115 @@ validation.cpp:6379-6388). O(index size) — fine for its callers
     (:regtest *regtest-genesis-hash*)
     (:mainnet *mainnet-genesis-hash*)))
 
+;;;; Genesis block construction (Core kernel/chainparams.cpp CreateGenesisBlock)
+;;;
+;;; The genesis block's BODY is never stored in block storage (it is never
+;;; received over the wire), but the BIP157 filter index must index it: the
+;;; filter-header chain is anchored at filter_header(genesis) computed over the
+;;; genesis filter with a 32-zero-byte previous header. So we rebuild the block
+;;; from chain parameters exactly as Core does. Construction is self-verifying:
+;;; the merkle root is COMPUTED from the constructed coinbase (never a pasted
+;;; constant) and the resulting header hash must equal the network's known
+;;; genesis hash, or we signal an error rather than return a wrong block.
+
+(defun %script-push (bytes)
+  "Minimal CScript data push of BYTES: direct push below OP_PUSHDATA1 (76),
+OP_PUSHDATA1 up to 255 (the testnet4 timestamp message is 76 bytes)."
+  (let ((n (length bytes)))
+    (cond ((< n 76)
+           (concatenate '(simple-array (unsigned-byte 8) (*)) (vector n) bytes))
+          ((<= n 255)
+           (concatenate '(simple-array (unsigned-byte 8) (*)) (vector #x4c n) bytes))
+          (t (error "%script-push: ~D bytes unsupported" n)))))
+
+(defun %ascii-bytes (string)
+  (map '(simple-array (unsigned-byte 8) (*)) #'char-code string))
+
+(defparameter *genesis-output-pubkey*
+  (bitcoin-lisp.crypto:hex-to-bytes
+   "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f")
+  "Satoshi's genesis coinbase pubkey (kernel/chainparams.cpp:71), used by
+mainnet, testnet3, signet and regtest. Verified by the genesis-hash check in
+MAKE-GENESIS-BLOCK: a transcription error cannot produce the known hash.")
+
+(defparameter *genesis-timestamp-message*
+  "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+  "pszTimestamp for mainnet/testnet3/signet/regtest (kernel/chainparams.cpp:70).")
+
+(defparameter *testnet4-timestamp-message*
+  "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+  "testnet4's own pszTimestamp (kernel/chainparams.cpp:367).")
+
+(defun %genesis-coinbase (network)
+  "The genesis coinbase transaction for NETWORK, per Core CreateGenesisBlock
+(kernel/chainparams.cpp:36-49): scriptSig pushes 486604799, CScriptNum(4) and
+the timestamp message; one 50 BTC output to <pubkey> OP_CHECKSIG (testnet4:
+33 zero bytes as the \"pubkey\", chainparams.cpp:368)."
+  (let* ((testnet4-p (eq network :testnet4))
+         (message (%ascii-bytes (if testnet4-p
+                                    *testnet4-timestamp-message*
+                                    *genesis-timestamp-message*)))
+         ;; CScript() << 486604799: minimal CScriptNum bytes of 0x1d00ffff,
+         ;; little-endian -> ff ff 00 1d, pushed as data.
+         (script-sig (concatenate '(simple-array (unsigned-byte 8) (*))
+                                  (%script-push (vector #xff #xff #x00 #x1d))
+                                  (%script-push (vector #x04))
+                                  (%script-push message)))
+         (pubkey (if testnet4-p
+                     (make-array 33 :element-type '(unsigned-byte 8)
+                                    :initial-element 0)
+                     *genesis-output-pubkey*))
+         (script-pubkey (concatenate '(simple-array (unsigned-byte 8) (*))
+                                     (%script-push pubkey)
+                                     (vector #xac)))) ; OP_CHECKSIG
+    (bitcoin-lisp.serialization:make-transaction
+     :version 1
+     :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                      :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                        :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                             :initial-element 0)
+                                        :index #xffffffff)
+                      :script-sig script-sig
+                      :sequence #xffffffff))
+     :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                       :value 5000000000
+                       :script-pubkey script-pubkey))
+     :lock-time 0)))
+
+(defun make-genesis-block (network)
+  "Construct NETWORK's full genesis block from chain parameters (Core
+CreateGenesisBlock, kernel/chainparams.cpp; per-network time/nonce/bits from
+the CreateGenesisBlock call sites). The merkle root is computed from the
+constructed coinbase — testnet4's differs from the other networks' — and the
+header hash is checked against the known genesis hash, so a wrong construction
+signals an error instead of returning a corrupt block."
+  (let* ((coinbase (%genesis-coinbase network))
+         (merkle-root (bitcoin-lisp.serialization:transaction-hash coinbase))
+         (header
+           (multiple-value-bind (timestamp bits nonce)
+               (ecase network
+                 (:mainnet  (values 1231006505 #x1d00ffff 2083236893))
+                 (:testnet3 (values 1296688602 #x1d00ffff 414098458))
+                 (:testnet4 (values 1714777860 #x1d00ffff 393743547))
+                 (:signet   (values 1598918400 #x1e0377ae 52613770))
+                 (:regtest  (values 1296688602 #x207fffff 2)))
+             (bitcoin-lisp.serialization:make-block-header
+              :version 1
+              :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element 0)
+              :merkle-root (copy-seq merkle-root)
+              :timestamp timestamp :bits bits :nonce nonce)))
+         (hash (bitcoin-lisp.serialization:block-header-hash header)))
+    (unless (equalp hash (network-genesis-hash network))
+      (error "make-genesis-block: constructed ~A genesis hashes to ~A, expected ~A"
+             network
+             (bitcoin-lisp.crypto:bytes-to-hex (bitcoin-lisp.crypto:reverse-bytes hash))
+             (bitcoin-lisp.crypto:bytes-to-hex
+              (bitcoin-lisp.crypto:reverse-bytes (network-genesis-hash network)))))
+    (bitcoin-lisp.serialization:make-bitcoin-block
+     :header header
+     :transactions (list coinbase))))
+
 (defun init-chain-state (base-path &key genesis-hash network)
   "Initialize chain state at BASE-PATH.
 NETWORK defaults to bitcoin-lisp:*network* if not specified."

@@ -376,6 +376,37 @@ used the legacy serializer, which dropped witness."
       ;; Cleanup
       (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir))))))
 
+(test txindex-upsert-overwrites
+  "txindex-add UPSERTS: adding an existing txid overwrites its stored location
+(Core index/txindex.cpp CustomAppend batch-writes unconditionally), both live
+and across a close/reopen (load-tx-index's sequential replay is
+last-entry-wins). This is what re-points a reorg-disconnected tx re-mined in
+the new chain; the old early-return left it at the stale branch's block."
+  (let* ((test-dir (format nil "/tmp/btc-txindex-test-~A-up/" (get-universal-time)))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8))
+         (block-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA))
+         (block-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xBB)))
+    (unwind-protect
+        (progn
+          (let ((txindex (bitcoin-lisp.storage:init-tx-index test-dir)))
+            (bitcoin-lisp.storage:txindex-add txindex txid block-a 1)
+            (bitcoin-lisp.storage:txindex-add txindex txid block-b 3)
+            ;; Live: the newest location wins; still a single distinct txid.
+            (let ((loc (bitcoin-lisp.storage:txindex-lookup txindex txid)))
+              (is (equalp block-b (bitcoin-lisp.storage:tx-location-block-hash loc)))
+              (is (= 3 (bitcoin-lisp.storage:tx-location-tx-position loc))))
+            (is (= 1 (bitcoin-lisp.storage:txindex-count txindex)))
+            (bitcoin-lisp.storage:close-tx-index txindex))
+          ;; Reopen: the file replay resolves to the newest location too.
+          (let ((txindex (bitcoin-lisp.storage:init-tx-index test-dir)))
+            (unwind-protect
+                (let ((loc (bitcoin-lisp.storage:txindex-lookup txindex txid)))
+                  (is (equalp block-b (bitcoin-lisp.storage:tx-location-block-hash loc)))
+                  (is (= 3 (bitcoin-lisp.storage:tx-location-tx-position loc)))
+                  (is (= 1 (bitcoin-lisp.storage:txindex-count txindex))))
+              (bitcoin-lisp.storage:close-tx-index txindex))))
+      (ignore-errors (delete-file (merge-pathnames "txindex.dat" test-dir))))))
+
 (test txindex-multiple-entries
   "Transaction index should handle multiple entries."
   (let* ((test-dir (format nil "/tmp/btc-txindex-test-~A/" (get-universal-time)))

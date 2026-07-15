@@ -3068,27 +3068,28 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
              txs)))
 
 (defun tx-to-json-confirmed (tx node block-hash)
-  "Convert a confirmed transaction to JSON with block info."
+  "Convert a confirmed transaction to JSON with block context, per Core's
+TxToJSON (rpc/rawtransaction.cpp:58-86): blockhash is always present; when
+the block index knows the block AND it is on the active chain, add
+confirmations/time/blocktime; a known but STALE block (e.g. a txindex entry
+pointing into a reorged-away branch — Core keeps those) gets confirmations 0
+and NO time fields; an unknown block gets blockhash only."
   (let* ((chain-state (rpc-get-chain-state node))
          (block-entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
-         (current-height (bitcoin-lisp.storage:current-height chain-state))
-         (block-height (if block-entry
-                           (bitcoin-lisp.storage:block-index-entry-height block-entry)
-                           0))
-         (confirmations (if block-entry
-                            (1+ (- current-height block-height))
-                            0))
-         (header (when block-entry
-                   (bitcoin-lisp.storage:block-index-entry-header block-entry)))
-         (block-time (when header
-                       (bitcoin-lisp.serialization:block-header-timestamp header)))
          (base-json (tx-to-json tx (rpc-get-network node))))
-    ;; Add confirmed transaction fields
     (append base-json
-            `(("blockhash" . ,(hash-to-hex block-hash))
-              ("confirmations" . ,confirmations)
-              ("time" . ,block-time)
-              ("blocktime" . ,block-time)))))
+            `(("blockhash" . ,(hash-to-hex block-hash)))
+            (cond ((null block-entry) '())
+                  ((%block-on-active-chain-p block-entry chain-state)
+                   (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
+                          (block-height (bitcoin-lisp.storage:block-index-entry-height block-entry))
+                          (header (bitcoin-lisp.storage:block-index-entry-header block-entry))
+                          (block-time (when header
+                                        (bitcoin-lisp.serialization:block-header-timestamp header))))
+                     `(("confirmations" . ,(1+ (- current-height block-height)))
+                       ("time" . ,block-time)
+                       ("blocktime" . ,block-time))))
+                  (t '(("confirmations" . 0)))))))
 
 (defun rpc-estimatesmartfee (node params)
   "Estimate fee rate for confirmation in conf_target blocks.
