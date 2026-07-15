@@ -808,3 +808,205 @@ letting a premature tx re-enter the pool and get mined."
        mempool (list locked) utxo-set 200 chain-state)
       (is (not (bitcoin-lisp.mempool:mempool-has mempool lid)))
       (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool))))))
+
+;;;; txindex across reorgs (Core parity: upsert on connect, no erase on
+;;;; disconnect — index/txindex.cpp CustomAppend, index/base.h:136)
+
+(defun %make-txindex-test-block (prev-hash block-hash height extra-txs)
+  "Like make-reorg-test-block but appending EXTRA-TXS after the coinbase and
+computing the real merkle root over all transactions."
+  (let* ((script-sig (let ((s (make-array 4 :element-type '(unsigned-byte 8))))
+                       (replace s block-hash :start2 0 :end2 4)
+                       s))
+         (coinbase-tx (bitcoin-lisp.serialization:make-transaction
+                       :version 1
+                       :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                        :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                          :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                                               :initial-element 0)
+                                                          :index #xFFFFFFFF)
+                                        :script-sig script-sig))
+                       :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                         :value 5000000000
+                                         :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                                       :initial-element #x76)))
+                       :lock-time 0))
+         (txs (cons coinbase-tx extra-txs))
+         (merkle-root (bitcoin-lisp.validation:compute-merkle-root
+                       (mapcar #'bitcoin-lisp.serialization:transaction-hash txs)))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1
+                  :prev-block prev-hash
+                  :merkle-root merkle-root
+                  :timestamp (+ 1231006505 (* height 600))
+                  :bits #x1d00ffff
+                  :nonce 0
+                  :cached-hash block-hash)))
+    (bitcoin-lisp.serialization:make-bitcoin-block :header header :transactions txs)))
+
+(defun %optrue-spk ()
+  (make-array 1 :element-type '(unsigned-byte 8) :initial-element #x51))
+
+(defun %empty-script ()
+  (make-array 0 :element-type '(unsigned-byte 8)))
+
+(test reorg-txindex-remined-and-stale-txs
+  "Core txindex reorg semantics: (a) a tx disconnected by a reorg and RE-MINED
+in the new chain stays indexed, pointing at its NEW block (connect upserts;
+the old early-return + disconnect-time removal left it UNINDEXED); (b) a tx
+only in the stale branch keeps its entry and resolves through the still-stored
+stale block; (c) the startup catch-up scan is idempotent under upsert
+semantics and re-points entries left stale by a crash."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "txidx-remined")
+     (let* ((txdir (ensure-directories-exist
+                    (merge-pathnames (format nil "test-txidx-reorg-~D/" (get-internal-real-time))
+                                     (uiop:temporary-directory))))
+            (txindex (bitcoin-lisp.storage:init-tx-index txdir))
+            ;; A mature non-coinbase UTXO for T to spend (OP_TRUE, so the
+            ;; full script validation in perform-reorg passes).
+            (u-txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xEE))
+            (tx-t (bitcoin-lisp.serialization:make-transaction
+                   :version 1
+                   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                      :hash u-txid :index 0)
+                                    :script-sig (%empty-script)
+                                    :sequence #xFFFFFFFF))
+                   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                     :value 100000 :script-pubkey (%optrue-spk)))
+                   :lock-time 0))
+            (t-txid (bitcoin-lisp.serialization:transaction-hash tx-t))
+            (a-hashes (make-test-chain-hashes #xA6 2))
+            (b-hashes (make-test-chain-hashes #xB6 3)))
+       (bitcoin-lisp.storage:add-utxo utxo-set u-txid 0 100000 (%optrue-spk) 1)
+       (unwind-protect
+            (progn
+              ;; Chain A: A1 (coinbase only), A2 = coinbase + T.
+              (let* ((a1 (make-reorg-test-block genesis-hash (first a-hashes) 1))
+                     (a2 (%make-txindex-test-block (first a-hashes) (second a-hashes)
+                                                   2 (list tx-t))))
+                (bitcoin-lisp.validation:connect-block
+                 a1 chain-state block-store utxo-set :tx-index txindex)
+                (bitcoin-lisp.validation:connect-block
+                 a2 chain-state block-store utxo-set :tx-index txindex))
+              (is (= 2 (bitcoin-lisp.storage:current-height chain-state)))
+              (let ((loc (bitcoin-lisp.storage:txindex-lookup txindex t-txid)))
+                (is (equalp (second a-hashes)
+                            (bitcoin-lisp.storage:tx-location-block-hash loc))))
+              ;; Chain B (more work): B1, B2 = coinbase + T re-mined, B3.
+              ;; B1/B2 are stored as a weaker chain; B3 triggers the reorg,
+              ;; which validates B1-B3 fully (scripts included) and re-adds
+              ;; their txs to the index in Phase C.
+              (let* ((b1 (make-reorg-test-block genesis-hash (first b-hashes) 1))
+                     (b2 (%make-txindex-test-block (first b-hashes) (second b-hashes)
+                                                   2 (list tx-t)))
+                     (b3 (make-reorg-test-block (second b-hashes) (third b-hashes) 3)))
+                (bitcoin-lisp.validation:connect-block
+                 b1 chain-state block-store utxo-set :tx-index txindex)
+                (bitcoin-lisp.validation:connect-block
+                 b2 chain-state block-store utxo-set :tx-index txindex)
+                (bitcoin-lisp.validation:connect-block
+                 b3 chain-state block-store utxo-set :tx-index txindex))
+              (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+              (is (equalp (third b-hashes) (bitcoin-lisp.storage:best-block-hash chain-state)))
+              ;; (a) T re-mined: indexed at the NEW block.
+              (let ((loc (bitcoin-lisp.storage:txindex-lookup txindex t-txid)))
+                (is (not (null loc)))
+                (when loc
+                  (is (equalp (second b-hashes)
+                              (bitcoin-lisp.storage:tx-location-block-hash loc)))
+                  (is (= 1 (bitcoin-lisp.storage:tx-location-tx-position loc)))))
+              ;; (b) A2's coinbase exists only in the stale branch: still
+              ;; indexed at A2 and resolvable through the stored stale block.
+              (let* ((a2 (bitcoin-lisp.storage:get-block block-store (second a-hashes)))
+                     (a2-cb (first (bitcoin-lisp.serialization:bitcoin-block-transactions a2)))
+                     (a2-cb-id (bitcoin-lisp.serialization:transaction-hash a2-cb))
+                     (loc (bitcoin-lisp.storage:txindex-lookup txindex a2-cb-id)))
+                (is (not (null loc)))
+                (when loc
+                  (is (equalp (second a-hashes)
+                              (bitcoin-lisp.storage:tx-location-block-hash loc)))
+                  ;; The stale block body is still on disk, so the lookup
+                  ;; resolves end-to-end (Core keeps stale block data too).
+                  (is (not (null a2)))))
+              ;; (c1) Catch-up scan is idempotent: nothing re-appended.
+              (let ((entries-before (bitcoin-lisp.storage::tx-index-entry-count txindex)))
+                (is (= 0 (bitcoin-lisp.storage:build-tx-index
+                          txindex chain-state block-store)))
+                (is (= entries-before
+                       (bitcoin-lisp.storage::tx-index-entry-count txindex))))
+              ;; (c2) A stale mapping (e.g. crash before the reorg's index
+              ;; update) is re-pointed by the catch-up scan: force T back to
+              ;; A2, then rescan — the verified per-block check sees B2's
+              ;; last tx pointing elsewhere and re-indexes B2.
+              (bitcoin-lisp.storage:txindex-add txindex t-txid (second a-hashes) 1)
+              (is (plusp (bitcoin-lisp.storage:build-tx-index
+                          txindex chain-state block-store)))
+              (let ((loc (bitcoin-lisp.storage:txindex-lookup txindex t-txid)))
+                (is (equalp (second b-hashes)
+                            (bitcoin-lisp.storage:tx-location-block-hash loc)))))
+         (bitcoin-lisp.storage:close-tx-index txindex)
+         (ignore-errors (delete-file (merge-pathnames "txindex.dat" txdir)))
+         (clrhash bitcoin-lisp.validation::*block-undo-data*))))))
+
+(test reorg-getrawtransaction-stale-block-core-semantics
+  "getrawtransaction for a tx whose txindex entry points into a stale
+(reorged-away) block matches Core TxToJSON (rpc/rawtransaction.cpp:58-86):
+the tx IS returned, blockhash names the stale block, confirmations is 0, and
+no time/blocktime fields are present; a tx on the active chain gets normal
+confirmations."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "txidx-rpc")
+     (let* ((txdir (ensure-directories-exist
+                    (merge-pathnames (format nil "test-txidx-rpc-~D/" (get-internal-real-time))
+                                     (uiop:temporary-directory))))
+            (txindex (bitcoin-lisp.storage:init-tx-index txdir))
+            (a-hashes (make-test-chain-hashes #xA7 2))
+            (b-hashes (make-test-chain-hashes #xB7 3)))
+       (unwind-protect
+            (progn
+              ;; Chain A then a longer chain B; A2's coinbase ends up stale-only.
+              (dolist (spec (list (list genesis-hash (first a-hashes) 1)
+                                  (list (first a-hashes) (second a-hashes) 2)
+                                  (list genesis-hash (first b-hashes) 1)
+                                  (list (first b-hashes) (second b-hashes) 2)
+                                  (list (second b-hashes) (third b-hashes) 3)))
+                (bitcoin-lisp.validation:connect-block
+                 (apply #'make-reorg-test-block spec)
+                 chain-state block-store utxo-set :tx-index txindex))
+              (is (equalp (third b-hashes) (bitcoin-lisp.storage:best-block-hash chain-state)))
+              (let ((node (bitcoin-lisp::make-node :network :mainnet)))
+                (setf (bitcoin-lisp::node-chain-state node) chain-state
+                      (bitcoin-lisp::node-block-store node) block-store
+                      (bitcoin-lisp::node-utxo-set node) utxo-set
+                      (bitcoin-lisp::node-tx-index node) txindex
+                      (bitcoin-lisp::node-mempool node) (bitcoin-lisp.mempool:make-mempool))
+                ;; Stale-branch tx: found, blockhash = stale block,
+                ;; confirmations 0, no time/blocktime (Core pushes them only
+                ;; for active-chain blocks).
+                (let* ((a2 (bitcoin-lisp.storage:get-block block-store (second a-hashes)))
+                       (a2-cb-id (bitcoin-lisp.serialization:transaction-hash
+                                  (first (bitcoin-lisp.serialization:bitcoin-block-transactions a2))))
+                       (r (bitcoin-lisp.rpc::rpc-getrawtransaction
+                           node (list (bitcoin-lisp.rpc::hash-to-hex a2-cb-id) 1))))
+                  (is (consp r))
+                  (is (string= (bitcoin-lisp.rpc::hash-to-hex (second a-hashes))
+                               (cdr (assoc "blockhash" r :test #'string=))))
+                  (is (eql 0 (cdr (assoc "confirmations" r :test #'string=))))
+                  (is (null (assoc "time" r :test #'string=)))
+                  (is (null (assoc "blocktime" r :test #'string=))))
+                ;; Active-chain tx: normal confirmations (tip 3, B2 at 2 -> 2).
+                (let* ((b2 (bitcoin-lisp.storage:get-block block-store (second b-hashes)))
+                       (b2-cb-id (bitcoin-lisp.serialization:transaction-hash
+                                  (first (bitcoin-lisp.serialization:bitcoin-block-transactions b2))))
+                       (r (bitcoin-lisp.rpc::rpc-getrawtransaction
+                           node (list (bitcoin-lisp.rpc::hash-to-hex b2-cb-id) 1))))
+                  (is (string= (bitcoin-lisp.rpc::hash-to-hex (second b-hashes))
+                               (cdr (assoc "blockhash" r :test #'string=))))
+                  (is (eql 2 (cdr (assoc "confirmations" r :test #'string=)))))))
+         (bitcoin-lisp.storage:close-tx-index txindex)
+         (ignore-errors (delete-file (merge-pathnames "txindex.dat" txdir)))
+         (clrhash bitcoin-lisp.validation::*block-undo-data*))))))
