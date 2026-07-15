@@ -1283,3 +1283,214 @@ post-activation flags (TAPROOT active) but passes when the block's hash matches
             (bitcoin-lisp.serialization:block-header-hash
              (bitcoin-lisp.serialization:bitcoin-block-header blk))))
       (is (eq t (bitcoin-lisp.validation:validate-block-scripts blk utxo-set :height height))))))
+
+;;; ============================================================
+;;; Wave 8D: witnessless spends of witness programs on the BLOCK path
+;;; (Core VerifyScript, interpreter.cpp:2002-2126 + VerifyWitnessProgram,
+;;; interpreter.cpp:1917-2000). A missing witness is an EMPTY witness stack;
+;;; under SCRIPT_VERIFY_WITNESS a v0/v1-taproot program spend with no
+;;; witness must FAIL, while pre-activation flags evaluate the same
+;;; scriptPubKey as an ordinary legacy script. Regression: the old
+;;; validate-input-script returned T unconditionally when the input had no
+;;; witness ("no witness data = pass"), so a crafted block with a stripped
+;;; segwit spend was ACCEPTED by us and REJECTED by Core — a chain-split
+;;; primitive. All tests below go through the real block dispatch
+;;; (validate-block-scripts -> validate-tx-scripts -> validate-input-script).
+;;; Heights: mainnet 800000 = WITNESS+TAPROOT on; 500000 = WITNESS on,
+;;; TAPROOT off; 400000 = pre-segwit (no WITNESS flag).
+;;; ============================================================
+
+(defun %w8d-spend-tx (prev-txid script-sig witness)
+  "1-in-1-out spend of PREV-TXID:0. WITNESS is a list of byte vectors for
+input 0, or NIL for a transaction serialized with no witness at all."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash prev-txid :index 0)
+                    :script-sig script-sig
+                    :sequence #xFFFFFFFF))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 900000
+                     :script-pubkey (make-array 25 :element-type '(unsigned-byte 8)
+                                                   :initial-element #x76)))
+   :witness (when witness (vector witness))
+   :lock-time 0))
+
+(defun %w8d-block-valid-p (script-pubkey script-sig witness height)
+  "Build a block containing one spend of a SCRIPT-PUBKEY utxo and run it
+through validate-block-scripts at HEIGHT on mainnet. Returns the primary
+value (T on acceptance, NIL on rejection)."
+  (let* ((bitcoin-lisp:*network* :mainnet)
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (prev-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element #xC4))
+         (spend (%w8d-spend-tx prev-txid script-sig witness))
+         (blk (bitcoin-lisp.serialization:make-bitcoin-block
+               :header (make-test-block-header)
+               :transactions (list (make-coinbase-transaction
+                                    :value 5000000000 :height height)
+                                   spend))))
+    (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 1000000 script-pubkey 5)
+    (bitcoin-lisp.validation:validate-block-scripts blk utxo-set :height height)))
+
+(defun %w8d-script (&rest bytes-and-seqs)
+  "Byte vector from a mix of integers and sequences."
+  (coerce (loop for x in bytes-and-seqs
+                if (integerp x) collect x
+                else append (coerce x 'list))
+          '(vector (unsigned-byte 8))))
+
+(test block-witnessless-v0-spend-rejected-post-segwit
+  "A block spending a v0 witness program with NO witness fails under the
+WITNESS flag: Core validates the missing witness as an empty stack and
+fails WITNESS_PROGRAM_MISMATCH (P2WPKH, stack != 2, interpreter.cpp:1938)
+or WITNESS_PROGRAM_WITNESS_EMPTY (P2WSH, interpreter.cpp:1926). The old
+block path accepted both."
+  (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+        (p2wpkh (%w8d-script #x00 #x14 (make-array 20 :element-type '(unsigned-byte 8)
+                                                      :initial-element 7)))
+        (p2wsh (%w8d-script #x00 #x20 (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 9))))
+    (is (null (%w8d-block-valid-p p2wpkh empty nil 800000)))
+    (is (null (%w8d-block-valid-p p2wsh empty nil 800000)))
+    ;; An explicitly EMPTY witness stack (not just an absent one) is the
+    ;; same thing and must also fail.
+    (is (null (%w8d-block-valid-p p2wpkh empty '() 800000)))))
+
+(test block-witnessless-v0-spend-legacy-pass-pre-segwit
+  "The same witnessless v0-program spends in a PRE-segwit-activation block
+(no WITNESS flag) are ordinary legacy scripts: the scriptPubKey pushes the
+program, top-of-stack is truthy, anyone-can-spend. Blanket rejection here
+would be the opposite consensus bug — mainnet IBD rejecting historical
+blocks (witness-program-shaped outputs were spendable pre-481824)."
+  (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+        (p2wpkh (%w8d-script #x00 #x14 (make-array 20 :element-type '(unsigned-byte 8)
+                                                      :initial-element 7)))
+        (p2wsh (%w8d-script #x00 #x20 (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 9))))
+    (is (eq t (%w8d-block-valid-p p2wpkh empty nil 400000)))
+    (is (eq t (%w8d-block-valid-p p2wsh empty nil 400000)))))
+
+(test block-native-witness-nonempty-scriptsig-malleated
+  "A native witness program spend with a NON-empty scriptSig fails under the
+WITNESS flag even when the witness itself is valid: the scriptSig must be
+exactly empty (SCRIPT_ERR_WITNESS_MALLEATED, interpreter.cpp:2038-2041)."
+  (let* ((op-true-script (%w8d-script #x51))
+         (p2wsh (%w8d-script #x00 #x20 (bitcoin-lisp.crypto:sha256 op-true-script)))
+         (op1-sig (%w8d-script #x51))
+         (witness (list op-true-script)))
+    ;; Valid witness, empty scriptSig: passes.
+    (is (eq t (%w8d-block-valid-p p2wsh (make-array 0 :element-type '(unsigned-byte 8))
+                                  witness 800000)))
+    ;; Same witness, scriptSig = OP_1: malleated, fails.
+    (is (null (%w8d-block-valid-p p2wsh op1-sig witness 800000)))))
+
+(test block-unknown-witness-version-witnessless-passes
+  "Regression guard against overshooting: unknown witness versions
+consensus-PASS with no witness (interpreter.cpp:1993-1998, upgradeable;
+DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM is policy-only and absent from block
+flags). Covers v2 programs, pay-to-anchor (interpreter.cpp:1991-1992), and
+v1 with a non-32/non-P2A length; also v1-taproot-shaped under WITNESS-only
+flags (TAPROOT not yet active, interpreter.cpp:1949)."
+  (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+        (v2-prog (%w8d-script #x52 #x14 (make-array 20 :element-type '(unsigned-byte 8)
+                                                       :initial-element 3)))
+        (p2a (%w8d-script #x51 #x02 #x4e #x73))
+        (v1-20 (%w8d-script #x51 #x14 (make-array 20 :element-type '(unsigned-byte 8)
+                                                     :initial-element 4)))
+        (p2tr (%w8d-script #x51 #x20 (make-array 32 :element-type '(unsigned-byte 8)
+                                                    :initial-element 2))))
+    (is (eq t (%w8d-block-valid-p v2-prog empty nil 800000)))
+    (is (eq t (%w8d-block-valid-p p2a empty nil 800000)))
+    (is (eq t (%w8d-block-valid-p v1-20 empty nil 800000)))
+    ;; v1/32 (taproot-shaped) WITHOUT the TAPROOT flag: upgradeable pass.
+    (is (eq t (%w8d-block-valid-p p2tr empty nil 500000)))
+    ;; v1/32 WITH the TAPROOT flag and no witness: WITNESS_EMPTY, fails.
+    (is (null (%w8d-block-valid-p p2tr empty nil 800000)))))
+
+(test block-p2sh-wrapped-witness-program
+  "P2SH-wrapped witness programs on the block path. The old path executed
+the redeem script as a plain legacy script — the witness was never
+validated at all. Core (interpreter.cpp:2057-2098): scriptSig must be
+exactly the canonical push of the redeem script, then VerifyWitnessProgram
+runs with is_p2sh=true. A missing witness fails for wrapped v0; a wrapped
+v1/32 (taproot-shaped) redeem script is an UNKNOWN witness version under
+is_p2sh (interpreter.cpp:1947 '!is_p2sh') and consensus-passes."
+  (let* ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+         (op-true-script (%w8d-script #x51))
+         ;; P2SH-P2WSH of OP_TRUE
+         (p2wsh-redeem (%w8d-script #x00 #x20 (bitcoin-lisp.crypto:sha256 op-true-script)))
+         (p2sh-of-p2wsh (%w8d-script #xa9 #x14 (bitcoin-lisp.crypto:hash160 p2wsh-redeem) #x87))
+         (p2wsh-sig (%w8d-script (length p2wsh-redeem) p2wsh-redeem))
+         ;; P2SH-P2WPKH (no valid key needed: it must fail before any sig check)
+         (p2wpkh-redeem (%w8d-script #x00 #x14 (make-array 20 :element-type '(unsigned-byte 8)
+                                                              :initial-element 7)))
+         (p2sh-of-p2wpkh (%w8d-script #xa9 #x14 (bitcoin-lisp.crypto:hash160 p2wpkh-redeem) #x87))
+         (p2wpkh-sig (%w8d-script (length p2wpkh-redeem) p2wpkh-redeem))
+         ;; P2SH-wrapped v1/32 (taproot-shaped)
+         (v1-redeem (%w8d-script #x51 #x20 (make-array 32 :element-type '(unsigned-byte 8)
+                                                          :initial-element 2)))
+         (p2sh-of-v1 (%w8d-script #xa9 #x14 (bitcoin-lisp.crypto:hash160 v1-redeem) #x87))
+         (v1-sig (%w8d-script (length v1-redeem) v1-redeem)))
+    (declare (ignorable empty))
+    ;; Wrapped P2WSH with the witness present: valid spend, passes.
+    (is (eq t (%w8d-block-valid-p p2sh-of-p2wsh p2wsh-sig (list op-true-script) 800000)))
+    ;; Wrapped P2WSH with NO witness: fails (WITNESS_PROGRAM_WITNESS_EMPTY).
+    (is (null (%w8d-block-valid-p p2sh-of-p2wsh p2wsh-sig nil 800000)))
+    ;; Wrapped P2WPKH with NO witness: fails (WITNESS_PROGRAM_MISMATCH).
+    (is (null (%w8d-block-valid-p p2sh-of-p2wpkh p2wpkh-sig nil 800000)))
+    ;; Pre-segwit flags: both are plain P2SH spends (redeem script pushes
+    ;; the program, truthy) and pass.
+    (is (eq t (%w8d-block-valid-p p2sh-of-p2wsh p2wsh-sig nil 400000)))
+    (is (eq t (%w8d-block-valid-p p2sh-of-p2wpkh p2wpkh-sig nil 400000)))
+    ;; Wrapped v1/32, TAPROOT active, no witness: UNKNOWN version under
+    ;; is_p2sh -> upgradeable, consensus-PASSES (the is-p2sh regression guard).
+    (is (eq t (%w8d-block-valid-p p2sh-of-v1 v1-sig nil 800000)))))
+
+(test block-witness-on-legacy-input-unexpected
+  "Witness data attached to an input whose scriptPubKey is NOT a witness
+program (native or wrapped) fails under the WITNESS flag
+(SCRIPT_ERR_WITNESS_UNEXPECTED, interpreter.cpp:2110-2121); without the
+flag it is ignored at the input level (the block-level BIP144 commitment
+rule handles pre-activation blocks separately)."
+  (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+        (op-true (%w8d-script #x51))
+        (witness (list (%w8d-script #x01))))
+    (is (null (%w8d-block-valid-p op-true empty witness 800000)))
+    (is (eq t (%w8d-block-valid-p op-true empty witness 400000)))
+    ;; IsNull() is stack.empty(): a witness of one ZERO-LENGTH item is
+    ;; still "unexpected" (script.h CScriptWitness::IsNull).
+    (is (null (%w8d-block-valid-p op-true empty
+                                  (list (make-array 0 :element-type '(unsigned-byte 8)))
+                                  800000)))))
+
+(test block-legacy-eval-false-rejected
+  "A legacy spend whose scripts complete with a FALSE top-of-stack fails
+(SCRIPT_ERR_EVAL_FALSE, interpreter.cpp:2029-2033). Regression: the old
+block path returned the engine's ScriptOk without the final CastToBool,
+accepting e.g. an OP_0 scriptPubKey spent with an empty scriptSig."
+  (let ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+        (op-false (%w8d-script #x00)))
+    (is (null (%w8d-block-valid-p op-false empty nil 800000)))
+    (is (null (%w8d-block-valid-p op-false empty nil 400000)))))
+
+(test transaction-scripts-witnessless-v0-rejected
+  "validate-transaction-scripts (the mempool consensus-script entry, shared
+with the block path via validate-input-script) also rejects a witnessless
+v0 spend post-activation. The mempool additionally pre-gates these as
+:witness-stripped BEFORE reaching the script engine (PR #273) so the P2P
+reject classification is preserved; this test pins the engine-level
+agreement underneath that gate."
+  (let* ((bitcoin-lisp:*network* :mainnet)
+         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (prev-txid (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element #xC5))
+         (p2wpkh (%w8d-script #x00 #x14 (make-array 20 :element-type '(unsigned-byte 8)
+                                                       :initial-element 7)))
+         (tx (%w8d-spend-tx prev-txid (make-array 0 :element-type '(unsigned-byte 8)) nil)))
+    (bitcoin-lisp.storage:add-utxo utxo-set prev-txid 0 1000000 p2wpkh 5)
+    (is (null (bitcoin-lisp.validation:validate-transaction-scripts
+               tx utxo-set :height 800000)))
+    (is (eq t (bitcoin-lisp.validation:validate-transaction-scripts
+               tx utxo-set :height 400000)))))

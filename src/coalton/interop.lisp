@@ -735,9 +735,13 @@ Returns (values success error-keyword)."
                 (replace expected redeem-script :start1 1)
                 (unless (equalp script-sig expected)
                   (return-from verify-script (values nil :witness-malleated-p2sh))))
+              ;; is-p2sh = T: Core passes is_p2sh=true here
+              ;; (interpreter.cpp:2087), which disables the Taproot and
+              ;; pay-to-anchor branches — a P2SH-wrapped v1/32 program is an
+              ;; unknown witness version (upgradeable, consensus-pass).
               (multiple-value-bind (wok werr)
                   (validate-witness-program
-                   redeem-script (or witness '()) (or amount 0) nil)
+                   redeem-script (or witness '()) (or amount 0) nil t)
                 (unless wok
                   (return-from verify-script (values nil werr)))))))
 
@@ -746,12 +750,14 @@ Returns (values success error-keyword)."
           (when (and (consp stack) (consp (cdr stack)))
             (return-from verify-script (values nil :cleanstack))))
 
-        ;; Step 8: WITNESS_UNEXPECTED check
+        ;; Step 8: WITNESS_UNEXPECTED check (Core interpreter.cpp:2110-2121):
+        ;; witness data present but the scriptPubKey was neither a native nor
+        ;; a P2SH-wrapped witness program. CScriptWitness::IsNull() is
+        ;; stack.empty() (script.h) — a stack whose items are all zero-length
+        ;; is still non-null and must fail.
         (when (flag-enabled-p "WITNESS")
           (when (and (not had-witness) witness (plusp (length witness)))
-            ;; Check if witness has actual data (not all empty)
-            (when (some (lambda (w) (plusp (length w))) witness)
-              (return-from verify-script (values nil :witness-unexpected)))))
+            (return-from verify-script (values nil :witness-unexpected))))
 
         ;; Success
         (values t nil)))))
@@ -2649,9 +2655,11 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
    PROGRAM is the 20-byte keyhash.
    AMOUNT is the input value in satoshis.
    Returns (values success error-keyword)."
-  ;; Witness must have exactly 2 elements
+  ;; Witness must have exactly 2 elements. Core reports
+  ;; WITNESS_PROGRAM_MISMATCH for any other count, including zero
+  ;; (interpreter.cpp:1938-1940 "2 items in witness").
   (unless (= (length witness) 2)
-    (return-from validate-p2wpkh (values nil :witness-program-witness-empty)))
+    (return-from validate-p2wpkh (values nil :witness-program-mismatch)))
 
   (let ((sig (first witness))
         (pubkey (second witness)))
@@ -2728,68 +2736,81 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
               (t (values t nil))))
           (values nil :script-error)))))
 
-(defun validate-witness-program (script-pubkey witness amount &optional script-sig)
-  "Validate a witness program.
-   SCRIPT-PUBKEY is the witness program scriptPubKey.
-   WITNESS is the witness stack (list of byte arrays).
+(defun validate-witness-program (script-pubkey witness amount &optional script-sig is-p2sh)
+  "Validate a witness program, mirroring Bitcoin Core's VerifyWitnessProgram
+   (interpreter.cpp:1917-2000) branch for branch.
+   SCRIPT-PUBKEY is the witness program: the scriptPubKey for a native spend,
+   or the redeem script for a P2SH-wrapped spend (IS-P2SH = T).
+   WITNESS is the witness stack (list of byte arrays). A MISSING witness is an
+   EMPTY stack: Core's VerifyScript substitutes emptyWitness for a null
+   witness pointer (interpreter.cpp:2004-2007), so absence is never a bypass.
    AMOUNT is the input value in satoshis.
-   SCRIPT-SIG is the scriptSig (must be empty for native witness).
+   SCRIPT-SIG, when supplied, must be empty for native witness spends
+   (SCRIPT_ERR_WITNESS_MALLEATED; the caller performs Core's check from
+   interpreter.cpp:2038-2041 — kept here as well for direct callers).
+   IS-P2SH selects Core's is_p2sh behavior: the Taproot and pay-to-anchor
+   branches apply ONLY to native (non-P2SH) programs — a P2SH-wrapped v1
+   32-byte program is an UNKNOWN witness version in Core and consensus-passes
+   as upgradeable (interpreter.cpp:1947 '!is_p2sh' guard).
    Returns (values success error-keyword)."
   (let ((version (get-witness-version script-pubkey))
         (program (get-witness-program-bytes script-pubkey)))
 
-    ;; Native witness: scriptSig must be empty
+    ;; Native witness: scriptSig must be empty (Core interpreter.cpp:2038-2041).
     (when (and script-sig (plusp (length script-sig)))
       (return-from validate-witness-program (values nil :witness-malleated)))
 
-    ;; Empty witness is an error for v0/v1, but unknown versions are anyone-can-spend
-    (when (or (null witness) (zerop (length witness)))
-      (if (> version 1)
-          ;; Unknown version with empty witness: anyone-can-spend (unless discouraged)
-          (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM")
-              (return-from validate-witness-program (values nil :discourage-upgradable-witness-program))
-              (return-from validate-witness-program (values t nil)))
-          (return-from validate-witness-program (values nil :witness-program-witness-empty))))
-
     (cond
-      ;; Version 0
+      ;; Version 0 (interpreter.cpp:1923-1946): dispatch on program LENGTH
+      ;; first; the empty/short-stack checks are per shape. Any other v0
+      ;; length is WITNESS_PROGRAM_WRONG_LENGTH — even with an empty stack.
       ((= version 0)
        (let ((prog-len (length program)))
          (cond
-           ;; P2WPKH: 20-byte program
-           ((= prog-len 20)
-            (validate-p2wpkh witness program amount))
-           ;; P2WSH: 32-byte program
+           ;; P2WSH: 32-byte program; empty stack fails (interpreter.cpp:1926-1928)
            ((= prog-len 32)
-            (validate-p2wsh witness program amount))
-           ;; Invalid length for v0
+            (if (zerop (length witness))
+                (values nil :witness-program-witness-empty)
+                (validate-p2wsh witness program amount)))
+           ;; P2WPKH: 20-byte program; stack must be exactly (sig, pubkey) —
+           ;; Core returns WITNESS_PROGRAM_MISMATCH for any other size,
+           ;; including zero (interpreter.cpp:1938-1940)
+           ((= prog-len 20)
+            (if (/= (length witness) 2)
+                (values nil :witness-program-mismatch)
+                (validate-p2wpkh witness program amount)))
            (t
             (values nil :witness-program-wrong-length)))))
 
-      ;; Version 1 (Taproot / P2A)
-      ((= version 1)
-       (let ((prog-len (length program)))
-         (cond
-           ;; P2A (Pay-to-Anchor): v1 with 2-byte program 0x4e73
-           ;; Always anyone-can-spend (Bitcoin Core: IsPayToAnchor)
-           ((and (= prog-len 2)
-                 (= (aref program 0) #x4e)
-                 (= (aref program 1) #x73))
-            (values t nil))
-           ;; Taproot: v1 with 32-byte program
-           ((and (flag-enabled-p "TAPROOT") (= prog-len 32))
-            (validate-taproot witness program amount))
-           ;; Pre-Taproot activation: anyone-can-spend
-           ((not (flag-enabled-p "TAPROOT"))
-            (values t nil))
-           ;; Invalid program length for v1 with Taproot active
-           (t (values nil :witness-program-wrong-length)))))
+      ;; Version 1, 32-byte program, NATIVE only: Taproot (interpreter.cpp:1947-1990)
+      ((and (= version 1) (= (length program) 32) (not is-p2sh))
+       (cond
+         ;; TAPROOT flag not in effect: consensus-pass, before any stack
+         ;; inspection (interpreter.cpp:1949)
+         ((not (flag-enabled-p "TAPROOT"))
+          (values t nil))
+         ;; Empty stack fails only once TAPROOT is enforced (interpreter.cpp:1950)
+         ((zerop (length witness))
+          (values nil :witness-program-witness-empty))
+         (t
+          (validate-taproot witness program amount))))
 
-      ;; Unknown version (v2+)
+      ;; Pay-to-anchor, NATIVE only (interpreter.cpp:1991-1992): spendable
+      ;; regardless of witness content or absence, and checked BEFORE the
+      ;; DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM policy branch.
+      ((and (not is-p2sh)
+            (= version 1)
+            (= (length program) 2)
+            (= (aref program 0) #x4e)
+            (= (aref program 1) #x73))
+       (values t nil))
+
+      ;; All other version/size/p2sh combinations consensus-PASS for future
+      ;; softfork compatibility (interpreter.cpp:1993-1998); the DISCOURAGE
+      ;; flag is policy-only and never set for block validation.
       (t
        (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM")
            (values nil :discourage-upgradable-witness-program)
-           ;; Anyone-can-spend for unknown versions
            (values t nil))))))
 
 ;;; ============================================================

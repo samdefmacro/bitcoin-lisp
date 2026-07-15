@@ -415,38 +415,40 @@ Returns a list of byte vectors, or NIL if no witness data."
       (aref witness input-idx))))
 
 (defun validate-input-script (tx input-idx utxo)
-  "Validate a single transaction input's script against its spent UTXO.
-Dispatches to the Coalton interop path for both legacy/P2SH and witness scripts.
+  "Validate a single transaction input's script against its spent UTXO by
+running the full Bitcoin Core VerifyScript flow (interpreter.cpp:2002-2126)
+via the Coalton interop port: scriptSig/scriptPubKey evaluation, EVAL_FALSE,
+P2SH, native and P2SH-wrapped witness programs, and the per-input
+unexpected-witness rule — all gated on the flags bound in *script-flags*
+(per-height consensus flags for block connect, standard flags callers).
+
+A MISSING witness is validated as an EMPTY witness stack, exactly as Core's
+VerifyScript substitutes emptyWitness for a null witness pointer
+(interpreter.cpp:2004-2007). Under SCRIPT_VERIFY_WITNESS a v0 or v1-taproot
+program spend with no witness therefore FAILS
+(SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY / MISMATCH), while unknown witness
+versions — including pay-to-anchor — consensus-pass as upgradeable. Without
+the WITNESS flag (pre-activation heights) a witness-program-shaped
+scriptPubKey is nothing special and evaluates as an ordinary legacy script,
+so historical pre-segwit spends of such outputs stay valid.
+
 Binds *current-tx* and *current-input-index* for sighash computation.
 Returns T on success, NIL on failure."
   (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig
                      (aref (bitcoin-lisp.serialization:transaction-inputs tx) input-idx)))
         (script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
         (amount (bitcoin-lisp.storage:utxo-entry-value utxo))
+        (witness (get-input-witness tx input-idx))
         (bitcoin-lisp.coalton.interop:*current-tx* tx)
         (bitcoin-lisp.coalton.interop:*current-input-index* input-idx))
-    (if (script-is-witness-program-p script-pubkey)
-        ;; Witness program: validate with witness stack
-        (let ((witness (get-input-witness tx input-idx)))
-          (if witness
-              (multiple-value-bind (success error)
-                  (bitcoin-lisp.coalton.interop:validate-witness-program
-                   script-pubkey witness amount script-sig)
-                (unless success
-                  (bitcoin-lisp:log-warn
-                   "validate-input-script witness program failed: input-idx=~D error=~A"
-                   input-idx error))
-                success)
-              t))  ; no witness data = pass (matches validate-block-scripts behavior)
-        ;; Legacy/P2SH: validate via Coalton interop
-        (multiple-value-bind (success error)
-            (bitcoin-lisp.coalton.interop:run-scripts-with-p2sh
-             script-sig script-pubkey t)
-          (unless success
-            (bitcoin-lisp:log-warn
-             "validate-input-script legacy/P2SH failed: input-idx=~D error=~A"
-             input-idx error))
-          success))))
+    (multiple-value-bind (success error)
+        (bitcoin-lisp.coalton.interop:verify-script
+         script-sig script-pubkey :witness witness :amount amount)
+      (unless success
+        (bitcoin-lisp:log-warn
+         "validate-input-script failed: input-idx=~D error=~A"
+         input-idx error))
+      success)))
 
 ;;; ============================================================
 ;;; Script Disassembly
