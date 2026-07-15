@@ -89,6 +89,37 @@
          (re-serialized (bitcoin-lisp.serialization:serialize-witness-transaction tx)))
     (is (equalp raw re-serialized))))
 
+(test transaction-wire-bytes-matches-core-tx-with-witness
+  "transaction-wire-bytes mirrors Core's TX_WITH_WITNESS SerializeTransaction
+(primitives/transaction.h:241): a segwit tx serializes with marker/flag and
+round-trips byte-exact; a witnessless tx serializes in legacy form, with NO
+marker/flag (byte 4, the input count, must be non-zero)."
+  ;; Witness tx: wire form == BIP 144 form, byte-exact against the source bytes.
+  (let* ((raw (make-witness-test-tx-bytes))
+         (tx (flexi-streams:with-input-from-sequence (s raw)
+               (bitcoin-lisp.serialization:read-transaction s)))
+         (wire (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+    (is (equalp raw wire))
+    (is (= #x00 (aref wire 4)))         ; marker
+    (is (= #x01 (aref wire 5)))         ; flag
+    ;; Round-trip: witness survives re-deserialization of the wire bytes.
+    (let ((tx2 (flexi-streams:with-input-from-sequence (s wire)
+                 (bitcoin-lisp.serialization:read-transaction s))))
+      (is (bitcoin-lisp.serialization:transaction-has-witness-p tx2))
+      (is (equalp (bitcoin-lisp.serialization:transaction-wtxid tx)
+                  (bitcoin-lisp.serialization:transaction-wtxid tx2)))))
+  ;; Witnessless tx: wire form == legacy form, no marker/flag.
+  (let* ((tx (make-mempool-test-tx))
+         (wire (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+    (is (equalp (bitcoin-lisp.serialization:serialize-transaction tx) wire))
+    (is (/= #x00 (aref wire 4))))
+  ;; A tx whose witness vector holds only empty stacks counts as witnessless
+  ;; (Core HasWitness: some scriptWitness must be non-null).
+  (let ((tx (make-mempool-test-tx)))
+    (setf (bitcoin-lisp.serialization:transaction-witness tx) (vector '()))
+    (is (equalp (bitcoin-lisp.serialization:serialize-transaction tx)
+                (bitcoin-lisp.serialization:transaction-wire-bytes tx)))))
+
 (test witness-txid-excludes-witness
   "The txid should be computed from legacy serialization (no witness)."
   (let* ((raw (make-witness-test-tx-bytes))

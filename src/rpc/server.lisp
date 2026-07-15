@@ -12,6 +12,7 @@
 (defconstant +rpc-invalid-params+ -32602)
 (defconstant +rpc-internal-error+ -32603)
 (defconstant +rpc-misc-error+ -1)
+(defconstant +rpc-type-error+ -3)
 (defconstant +rpc-invalid-address-or-key+ -5)
 (defconstant +rpc-invalid-parameter+ -8)
 (defconstant +rpc-deserialization-error+ -22)

@@ -599,8 +599,11 @@ touch another's on-disk state. The 3-phase commit semantics are unchanged.
 Probes whether the recorded tip's coins were committed; if so just clears
 the marker, otherwise walks back to the highest ancestor whose coins ARE
 committed (the true UTXO tip) and rewrites the state file there so IBD
-re-validates only the gap. Returns T on success, NIL if the blocks needed
-to resolve it aren't on disk (caller then aborts for a resync).
+re-validates only the gap. A recorded tip AT genesis is an interrupted
+-reindex-chainstate (see do-reindex-chainstate): the coins DB is re-wiped
+and the marker cleared, resuming as an ordinary from-genesis sync. Returns
+T on success, NIL if the blocks needed to resolve it aren't on disk (caller
+then aborts for a resync).
 
 For a snapshot chainstate, its base block is always treated as committed:
 the populate step verified and durably flushed the whole snapshot UTXO set
@@ -620,6 +623,27 @@ disk on the snapshot side."
         ((null new-hash)
          (log-error "Chainstate recovery: no recorded tip to recover from")
          nil)
+        ;; Recorded tip = genesis: an interrupted -reindex-chainstate.
+        ;; do-reindex-chainstate rewinds chainstate.dat to genesis (marker
+        ;; set) before wiping the coins DB, so this state means the wipe or
+        ;; the replay's first flush never completed. Nothing SHOULD be
+        ;; committed at genesis — whatever the coins DB holds is refuse from
+        ;; the interrupted wipe — so the one consistent resolution is an
+        ;; empty set: re-wipe and clear the marker. The node then resumes as
+        ;; an ordinary from-genesis sync (or rebuilds from stored blocks if
+        ;; -reindex-chainstate is passed again after IBD re-covers the tip).
+        ((and (not snapshot-base)
+              (equalp new-hash (bitcoin-lisp.storage::chain-state-genesis-hash
+                                chain-state)))
+         (let ((view (bitcoin-lisp.storage:chain-state-coins-view chain-state)))
+           (when (typep view 'bitcoin-lisp.storage:coins-view-cache)
+             (let ((erased (bitcoin-lisp.storage:coins-view-cache-wipe view)))
+               (when (plusp erased)
+                 (log-info "Chainstate recovery: erased ~D leftover coin~:P from the interrupted wipe"
+                           erased)))))
+         (bitcoin-lisp.storage:save-state chain-state :in-transition nil)
+         (log-warn "Chainstate recovery: interrupted reindex-chainstate; UTXO set reset to empty at genesis (chain will re-sync)")
+         t)
         ;; Phase 2 committed the new tip — chainstate.dat already holds it,
         ;; just drop the marker.
         ((committed-p new-hash)
@@ -1805,14 +1829,22 @@ accounts for ~700 MB. This logger surfaces the gap."
               ibd-pending ibd-queue ibd-in-flight
               (/ used-bytes 1048576.0) (/ dyn-bytes 1048576.0))))
 
-(defun %flush-chainstate (chainstate)
+(defvar *flush-mid-commit-hook* nil
+  "When non-NIL, funcalled with the chainstate between Phase 1 (in-transition
+marker written) and Phase 2 (coins flush) of %flush-chainstate — inside the
+window where a crash must be detected at the next startup. Production leaves
+it NIL; crash-safety tests bind it to observe the on-disk marker or abort
+(via THROW) to simulate a crash at the most dangerous point.")
+
+(defun %flush-chainstate (chainstate &key (label "Periodic"))
   "Synchronously flush one CHAINSTATE (its state file, its coins view, and
 the shared header index) with 3-phase commit (mirrors Bitcoin Core's
 DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).
 Each chainstate flushes its own storage-suffix-named files, so flushing one
 can never mark another's state file in-transition. Per-flush-CYCLE concerns
 (trigger counter resets, the post-flush GC, memory snapshots) live in the
-callers — this is strictly the per-chainstate mechanism.
+callers — this is strictly the per-chainstate mechanism. LABEL names the
+flush in log lines (\"Periodic\", \"Shutdown\", \"Reindex\").
 
   Phase 1: save-state with in-transition=1 — chainstate.dat marked unsafe.
            If we crash anywhere from here through Phase 3, on restart
@@ -1835,6 +1867,8 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
         (when chainstate
           (bitcoin-lisp.storage:save-state chainstate :in-transition t)
           (bitcoin-lisp.storage:save-header-index chainstate))
+        (when *flush-mid-commit-hook*
+          (funcall *flush-mid-commit-hook* chainstate))
         ;; Phase 2: flush cache → LevelDB. Per-flush work is proportional
         ;; to dirty entries (typically a few thousand at the tip), not
         ;; the full ~17M-entry set — replaces the ~13s utxoset.dat
@@ -1851,7 +1885,8 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
         ;; Phase 3: commit by re-saving chainstate without the marker.
         (when chainstate
           (bitcoin-lisp.storage:save-state chainstate :in-transition nil))
-        (log-info "Periodic flush: chainstate~@[~A~] at height ~D"
+        (log-info "~A flush: chainstate~@[~A~] at height ~D"
+                  label
                   (let ((suffix (and chainstate
                                      (bitcoin-lisp.storage:chain-state-storage-suffix
                                       chainstate))))
@@ -1862,7 +1897,7 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
       ;; Was log-warn before — surfaced silently. Bumped to log-error so
       ;; persistence failures are obvious in the log instead of getting
       ;; lost between progress lines.
-      (log-error "Periodic flush FAILED: ~A" c))))
+      (log-error "~A flush FAILED: ~A" label c))))
 
 (defun do-flush (&optional (chainstate (and *node* (node-current-chainstate *node*))))
   "Flush CHAINSTATE (default: the node's current chainstate) and run the
@@ -1971,7 +2006,23 @@ rebuilds it against the reindexed set; the blockfilterindex is unaffected
 This realizes UTXO-set-content changes (e.g. dropping now-skipped unspendable
 outputs) on an existing node without a full network resync, and doubles as
 chainstate disaster-recovery when blocks+index are intact but the coins DB is
-suspect."
+suspect.
+
+Crash safety: before the wipe, chainstate.dat is rewound to genesis WITH the
+in-transition marker, and every flush during the replay (size-triggered and
+final) goes through the 3-phase %flush-chainstate. In Core the coins DB owns
+its own tip (DB_BEST_BLOCK is erased by the -reindex-chainstate wipe and
+re-committed atomically with the coins in each BatchWrite, txdb.cpp:124-159),
+so a crashed rebuild can never load a tip ahead of the coins; our separate
+chainstate.dat needs the marker discipline to get the same guarantee. A crash
+before the first replay flush completes leaves tip=genesis + marker, which
+recover-inconsistent-chainstate resolves by re-wiping (nothing should be
+committed at genesis; anything on disk is refuse from the interrupted wipe).
+A crash later leaves the marker at the current replay height with the coins
+DB at exactly the last committed flush height, so the standard walk-back
+recovery rewinds chainstate.dat to it. Previously the old CLEAN pre-reindex
+chainstate.dat sat untouched over the gutted coins DB for the whole replay —
+a crash loaded it silently over garbage."
   (let* ((cs (node-chain-state *node*))
          (store (node-block-store *node*))
          (utxo (node-utxo-set *node*))
@@ -1989,11 +2040,17 @@ suspect."
             while (and e (plusp (bitcoin-lisp.storage:block-index-entry-height e)))
             do (push e entries)
                (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
-      ;; Empty the coins view and rewind the chainstate to genesis.
-      (let ((erased (bitcoin-lisp.storage:coins-view-cache-wipe utxo)))
-        (log-info "Reindex-chainstate: erased ~D coin~:P; replaying..." erased))
+      ;; Rewind the chainstate to genesis and persist it WITH the
+      ;; in-transition marker BEFORE touching the coins DB: from here until
+      ;; the first replay flush commits, a crash is detected at load-state
+      ;; and resolved by recover-inconsistent-chainstate's genesis branch
+      ;; (re-wipe + clear), never loaded as clean state over a gutted set.
       (bitcoin-lisp.storage:update-chain-tip
        cs (bitcoin-lisp.storage::chain-state-genesis-hash cs) 0)
+      (bitcoin-lisp.storage:save-state cs :in-transition t)
+      ;; Empty the coins view.
+      (let ((erased (bitcoin-lisp.storage:coins-view-cache-wipe utxo)))
+        (log-info "Reindex-chainstate: erased ~D coin~:P; replaying..." erased))
       ;; NB: the coinstatsindex is opened AFTER this runs; its rebuild is
       ;; forced in its own init block (keyed off the reindex flag), not here.
       ;; The blockfilterindex is left alone -- its filters are over block
@@ -2015,16 +2072,19 @@ stopping (UTXO set rebuilt to height ~D)" height (1- height))
               (bitcoin-lisp.storage:apply-block-to-utxo-set utxo blk height)
               (bitcoin-lisp.storage:update-chain-tip cs hash height)
               (incf n)
+              ;; Size-triggered flushes go through the 3-phase commit like
+              ;; the periodic flush: marker at the replay height, one atomic
+              ;; synced coins batch, marker cleared — so the on-disk pair is
+              ;; always chainstate.dat <= coins DB by an identifiable gap.
               (when (>= (bitcoin-lisp.storage:view-mem-bytes utxo)
                         (large-coins-cache-threshold *coins-cache-budget-bytes*))
-                (bitcoin-lisp.storage:coins-view-cache-flush utxo :sync nil))
+                (%flush-chainstate cs :label "Reindex"))
               (let ((now (get-internal-real-time)))
                 (when (> (- now last-report) internal-time-units-per-second)
                   (log-info "Reindex-chainstate: height ~D (~,1F%)"
                             height (* 100.0 (/ height tip-height)))
                   (setf last-report now))))))
-        (bitcoin-lisp.storage:coins-view-cache-flush utxo :sync t)
-        (bitcoin-lisp.storage:save-state cs)
+        (%flush-chainstate cs :label "Reindex")
         (log-info "Reindex-chainstate complete: ~D block~:P re-applied, tip at height ~D"
                   n (bitcoin-lisp.storage:current-height cs))))))
 
@@ -2143,6 +2203,25 @@ the startup backfill heals such gaps on restart."
               (log-error "Backtrace:~%~A" bt)))
           (sb-ext:exit :code 1))))
 
+(defun %shutdown-flush-chainstates (node)
+  "Shutdown flush: every chainstate through the same 3-phase in-transition
+commit as the periodic flush, then close its coins DB (Core Shutdown
+iterates m_chainstates calling ForceFlushStateToDisk — the marker-protected
+FlushStateToDisk/BatchWrite path — then ResetCoinsViews, init.cpp:379-387).
+The previous bare save-state + coins-flush pair re-opened the exact crash
+window the marker exists to close: killed between the two steps,
+chainstate.dat (clean, no marker) was ahead of the coins DB, and startup
+loaded the inconsistency silently. Per-chainstate: with an assumeutxo
+snapshot active there are two, each owning its own storage-suffix-named
+state file and LevelDB. The shared header index is saved inside each flush's
+Phase 1."
+  (dolist (cs (node-chainstates node))
+    (log-info "Flushing chain state~@[ (~A)~]..."
+              (let ((suffix (bitcoin-lisp.storage:chain-state-storage-suffix cs)))
+                (and (plusp (length suffix)) suffix)))
+    (%flush-chainstate cs :label "Shutdown")
+    (bitcoin-lisp.storage:close-chainstate-coins-view cs)))
+
 (defun stop-node ()
   "Stop the running Bitcoin node."
   (unless *node*
@@ -2222,19 +2301,9 @@ the startup backfill heals such gaps on restart."
   (bt:with-recursive-lock-held ((node-lock *node*))
     (setf (node-peers *node*) nil))
 
-  ;; Save every chainstate's state file and flush+close its coins view.
-  ;; Per-chainstate: with an assumeutxo snapshot active there are two, each
-  ;; owning its own storage-suffix-named files and LevelDB.
-  (dolist (cs (node-chainstates *node*))
-    (log-info "Saving chain state~@[ (~A)~]..."
-              (let ((suffix (bitcoin-lisp.storage:chain-state-storage-suffix cs)))
-                (and (plusp (length suffix)) suffix)))
-    (bitcoin-lisp.storage:save-state cs)
-    (let ((view (bitcoin-lisp.storage:chain-state-coins-view cs)))
-      (when (typep view 'bitcoin-lisp.storage:coins-view-cache)
-        (log-info "Flushing UTXO cache...")
-        (bitcoin-lisp.storage:coins-view-cache-flush view :sync t)))
-    (bitcoin-lisp.storage:close-chainstate-coins-view cs))
+  ;; Flush every chainstate through the crash-safe 3-phase commit and close
+  ;; its coins view (see %shutdown-flush-chainstates).
+  (%shutdown-flush-chainstates *node*)
 
   ;; Save fee statistics
   (when (node-fee-estimator *node*)
@@ -2246,11 +2315,6 @@ the startup backfill heals such gaps on restart."
     (when (and path (node-mempool *node*))
       (log-info "Saving mempool (~D entries)..."
                 (bitcoin-lisp.mempool:save-mempool-file (node-mempool *node*) path))))
-
-  ;; Save header index
-  (log-info "Saving header index...")
-  (when (node-chain-state *node*)
-    (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)))
 
   ;; Save peer address book
   (when (node-address-book *node*)
