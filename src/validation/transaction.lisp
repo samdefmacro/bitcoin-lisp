@@ -338,6 +338,17 @@ Any non-push opcode -- or a push that runs past the end -- fails."
           (t (return-from %op-return-push-only-p nil)))))           ; non-push opcode
     (= i len)))                          ; NIL if a push overran the script end
 
+(defun null-data-script-p (script-pubkey)
+  "True for a NULL_DATA (OP_RETURN data-carrier) scriptPubKey: a leading
+OP_RETURN whose remaining bytes are push-only (Core Solver's NULL_DATA
+classification, script/solver.cpp). Size is deliberately NOT considered —
+the -datacarriersize limit is a shared per-transaction budget, checked in
+VALIDATE-TRANSACTION-FOR-MEMPOOL against each such output's whole script
+size (Core IsStandardTx, policy.cpp:136-150)."
+  (and (>= (length script-pubkey) 1)
+       (= (aref script-pubkey 0) #x6a)   ; OP_RETURN
+       (%op-return-push-only-p script-pubkey)))
+
 (defun standard-output-script-p (script-pubkey)
   "Check if SCRIPT-PUBKEY is a standard output script type.
 Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
@@ -375,16 +386,14 @@ Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
      (and (>= len 4) (<= len 42)
           (<= #x51 (aref script-pubkey 0) #x60)   ; OP_1..OP_16
           (= (aref script-pubkey 1) (- len 2)))   ; single direct push of the program
-     ;; OP_RETURN data carrier — gated by -datacarrier, sized by
-     ;; -datacarriersize (mempool policy, not consensus). The bytes after
-     ;; OP_RETURN must be push-only: Core's Solver only classifies NULL_DATA when
-     ;; scriptPubKey.IsPushOnly(begin()+1) (solver.cpp), so an OP_RETURN carrying
-     ;; any non-push opcode is nonstandard.
-     (and bitcoin-lisp:*accept-datacarrier*
-          (>= len 1)
-          (<= len bitcoin-lisp:*max-datacarrier-bytes*)
-          (= (aref script-pubkey 0) #x6a)   ; OP_RETURN
-          (%op-return-push-only-p script-pubkey))
+     ;; OP_RETURN data carrier. Core's Solver classifies NULL_DATA whenever
+     ;; the bytes after OP_RETURN are push-only (solver.cpp) — with no size
+     ;; cap and no -datacarrier gate here: those live in the SHARED
+     ;; per-transaction byte budget that IsStandardTx tracks across all
+     ;; NULL_DATA outputs (policy.cpp:136-150), enforced in
+     ;; validate-transaction-for-mempool's output loop. An OP_RETURN carrying
+     ;; any non-push opcode is TxoutType::NONSTANDARD, hence rejected HERE.
+     (null-data-script-p script-pubkey)
      ;; Bare (non-P2SH) multisig — standard only when -permitbaremultisig.
      (and bitcoin-lisp:*permit-bare-multisig*
           (bare-multisig-standard-p script-pubkey)))))
@@ -632,16 +641,32 @@ decide (Core PreChecks, validation.cpp:950-970)."
         (return-from validate-transaction-for-mempool
           (values nil :scriptsig-not-pushonly nil)))))
 
-  ;; Policy: all outputs must be standard script types, and none dust
-  (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
-    (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
-      (unless (standard-output-script-p spk)
-        (return-from validate-transaction-for-mempool
-          (values nil :non-standard-output nil)))
-      (when (< (bitcoin-lisp.serialization:tx-out-value output)
-               (dust-threshold spk))
-        (return-from validate-transaction-for-mempool
-          (values nil :dust nil)))))
+  ;; Policy: all outputs must be standard script types, and none dust.
+  ;; OP_RETURN outputs share ONE -datacarriersize byte budget across the
+  ;; whole transaction: each NULL_DATA output's raw scriptPubKey size is
+  ;; drawn from it and an output that would overdraw is rejected
+  ;; "datacarrier" (Core IsStandardTx, policy.cpp:136-150 — since the 2025
+  ;; relaxation there is no per-output cap and no output-count cap, only
+  ;; this shared budget). -datacarrier=0 zeroes the budget, so any OP_RETURN
+  ;; output fails with the same reason (Core mempool_args.cpp:95-98:
+  ;; max_datacarrier_bytes = nullopt -> value_or(0)).
+  (let ((datacarrier-bytes-left (if bitcoin-lisp:*accept-datacarrier*
+                                    bitcoin-lisp:*max-datacarrier-bytes*
+                                    0)))
+    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
+      (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+        (unless (standard-output-script-p spk)
+          (return-from validate-transaction-for-mempool
+            (values nil :non-standard-output nil)))
+        (when (null-data-script-p spk)
+          (when (> (length spk) datacarrier-bytes-left)
+            (return-from validate-transaction-for-mempool
+              (values nil :datacarrier nil)))
+          (decf datacarrier-bytes-left (length spk)))
+        (when (< (bitcoin-lisp.serialization:tx-out-value output)
+                 (dust-threshold spk))
+          (return-from validate-transaction-for-mempool
+            (values nil :dust nil))))))
 
   ;; Check for duplicate in mempool
   (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
@@ -814,29 +839,64 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; (non-anchor) witness program can never satisfy its scripts —
           ;; the witness is simply missing. Core fails these inside
           ;; CheckInputScripts and PolicyScriptChecks then reclassifies the
-          ;; failure TX_WITNESS_STRIPPED (validation.cpp:1132-1150,
+          ;; failure TX_WITNESS_STRIPPED (validation.cpp:1143-1148,
           ;; SpendsNonAnchorWitnessProg) so the P2P layer never caches it in
           ;; recent-rejects: a stripped tx's wtxid equals its txid, so
           ;; caching would poison the real witnessed tx's txid and block its
-          ;; relay permanently. The script engine also rejects these
-          ;; (validate-input-script validates a missing witness as an EMPTY
-          ;; stack, per Core VerifyScript), but this gate must stay AND run
-          ;; FIRST so the failure keeps its :witness-stripped classification
-          ;; instead of the generic :script-failed. Anchor (P2A) spends are
-          ;; exempt: they legitimately carry no witness.
+          ;; relay permanently. Running the gate BEFORE the script passes is
+          ;; equivalent to Core's fail-then-reclassify: under the STANDARD
+          ;; flags of the policy pass below, every witnessless non-anchor
+          ;; witness-program spend fails (v0/v1 on the empty witness stack,
+          ;; unknown versions on DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM), so
+          ;; the reclassification would always fire anyway — pre-gating just
+          ;; skips the doomed execution and keeps the :witness-stripped
+          ;; classification. Anchor (P2A) spends are exempt: they
+          ;; legitimately carry no witness.
           (when (and (not (bitcoin-lisp.serialization:transaction-has-witness-p tx))
                      (spends-non-anchor-witness-program-p tx utxo-set extra-coins))
             (return-from validate-transaction-for-mempool
               (values nil :witness-stripped nil)))
 
-          ;; Script validation (consensus)
+          ;; Script pass 1 — PolicyScriptChecks (Core MemPoolAccept::
+          ;; PolicyScriptChecks, validation.cpp:1132-1153): run the input
+          ;; scripts under the full STANDARD flag set (a constant in Core,
+          ;; policy/policy.h:118). A failure is a POLICY rejection
+          ;; (TX_NOT_STANDARD), reject reason "mempool-script-verify-flag-
+          ;; failed (...)" (CheckInputScripts, validation.cpp:2117), which
+          ;; the P2P reject cache keys by wtxid only — never misbehavior.
           (multiple-value-bind (scripts-valid failed-input)
-              (validate-transaction-scripts tx utxo-set :height current-height
+              (validate-transaction-scripts tx utxo-set
+                                            :flags +standard-script-verify-flags+
                                             :extra-coins extra-coins)
             (declare (ignore failed-input))
             (unless scripts-valid
               (return-from validate-transaction-for-mempool
-                (values nil :script-failed nil))))
+                (values nil :mempool-script-verify-flag-failed nil))))
+
+          ;; Script pass 2 — ConsensusScriptChecks (Core MemPoolAccept::
+          ;; ConsensusScriptChecks -> CheckInputsFromMempoolAndCache,
+          ;; validation.cpp:1155-1185): re-run against the CURRENT TIP's
+          ;; consensus flags. Its purposes are (a) never admit a tx that
+          ;; standard flags pass but tip consensus flags reject (a
+          ;; standardness-bug backstop — Core cites STRICTENC once wrongly
+          ;; passing invalid CHECKSIG NOT scripts), and (b) warm the
+          ;; validation cache under the flags block connection will use:
+          ;; our sig-cache keys include the flag string, so this pass's
+          ;; verifies are the ones block connect hits. Standard-pass/
+          ;; consensus-fail is a should-never-happen internal error in Core
+          ;; ("BUG! ... CheckInputScripts failed against latest-block but
+          ;; not STANDARD flags"); we log the same and reject.
+          (multiple-value-bind (scripts-valid failed-input)
+              (validate-transaction-scripts tx utxo-set :height current-height
+                                            :extra-coins extra-coins)
+            (unless scripts-valid
+              (bitcoin-lisp:log-error
+               "BUG! PLEASE REPORT THIS! input scripts failed against latest-block but not STANDARD flags: txid=~A input=~A"
+               (bitcoin-lisp.crypto:bytes-to-hex
+                (bitcoin-lisp.serialization:transaction-hash tx))
+               failed-input)
+              (return-from validate-transaction-for-mempool
+                (values nil :block-script-verify-flag-failed nil))))
 
           (values t nil fee-value
                   (when replaced-set
@@ -869,17 +929,20 @@ decide (Core PreChecks, validation.cpp:950-970)."
           do (setf (aref result i) utxo))
     result))
 
-(defun validate-transaction-scripts (tx utxo-set &key (height 0) extra-coins)
+(defun validate-transaction-scripts (tx utxo-set &key (height 0) extra-coins flags)
   "Validate all input scripts for a transaction via Coalton interop.
 Uses validate-input-script for each input (same path as block validation).
-HEIGHT determines which script verification flags are active.
+HEIGHT determines which script verification flags are active; FLAGS, when
+supplied, overrides the height-derived flags with an explicit comma-separated
+flag string (the mempool's PolicyScriptChecks pass runs the constant
++standard-script-verify-flags+ set this way).
 EXTRA-COINS supplies spent outputs not in the confirmed UTXO set (chained
 mempool spends).
 Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
   (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
          (spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
          (bitcoin-lisp.coalton.interop:*script-flags*
-           (compute-script-flags-for-height height))
+           (or flags (compute-script-flags-for-height height)))
          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
            (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
          (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))

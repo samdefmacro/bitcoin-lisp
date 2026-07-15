@@ -1040,3 +1040,112 @@ Previously only the reorg path cleared it."
        (bitcoin-lisp:add-recent-reject rejects cached)
        (is-true (bitcoin-lisp:recent-reject-p rejects cached)))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+;;;; Wave 9C: removeForReorg — re-filter PRE-EXISTING entries after a reorg
+;;;; (Core CTxMemPool::removeForReorg, txmempool.cpp:360-386, driven by
+;;;; filter_final_and_mature, validation.cpp:334-385)
+
+(test reorg-refilter-drops-nonfinal-preexisting-entry
+  "After a reorg the pool's PRE-EXISTING entries are re-filtered: an entry
+whose absolute locktime the new (shorter) chain no longer satisfies is
+removed WITH its descendants — the re-add loop only vets the disconnected
+blocks' txs, never what already sat in the pool."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* (;; LOCKED entered the pool while the tip was high enough; the
+           ;; reorg leaves the tip at 200, so locktime 350 > next block 201.
+           (locked (bitcoin-lisp.serialization:make-transaction
+                    :version 1
+                    :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                       :hash funding :index 0)
+                                     :script-sig (%p2sh-optrue-scriptsig)
+                                     :sequence 0))   ; locktime enforced
+                    :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                      :value 99990000
+                                      :script-pubkey (%p2sh-optrue-spk)))
+                    :lock-time 350))
+           (lid (bitcoin-lisp.serialization:transaction-hash locked))
+           ;; a pool child of the locked tx: removed as a descendant
+           (child (%pkg-tx lid 0 99980000))
+           (cid (bitcoin-lisp.serialization:transaction-hash child))
+           ;; an unrelated, final pool tx: stays
+           (funding2 (make-reorg-hash 4310))
+           (ok-tx (%pkg-tx funding2 0 99990000))
+           (okid (bitcoin-lisp.serialization:transaction-hash ok-tx)))
+      (bitcoin-lisp.storage:add-utxo utxo-set funding2 0 100000000
+                                     (%p2sh-optrue-spk) 1 :coinbase nil)
+      (is (eq :ok (%add-tx mempool locked :fee 10000 :height 200)))
+      (is (eq :ok (%add-tx mempool child :fee 10000 :height 200)))
+      (is (eq :ok (%add-tx mempool ok-tx :fee 10000 :height 200)))
+      ;; No disconnected txs at all — the filter must still run.
+      (bitcoin-lisp.validation::readd-disconnected-txs-to-mempool
+       mempool '() utxo-set 200 chain-state)
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool lid)))
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool cid)))
+      (is (bitcoin-lisp.mempool:mempool-has mempool okid))
+      (bitcoin-lisp.mempool::%mempool-graph-verify mempool))))
+
+(test reorg-refilter-drops-immature-coinbase-spend
+  "A pool entry spending a coinbase that the reorg made immature again is
+removed (Core filter_final_and_mature, validation.cpp:368-379): maturity is
+COINBASE_MATURITY at the NEXT block. A spend of a still-mature coinbase
+stays."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (declare (ignore funding))
+    (let* ((cb-young (make-reorg-hash 4320))     ; coinbase @ 150: age 51 < 100
+           (cb-old (make-reorg-hash 4321))       ; coinbase @ 90: age 111 >= 100
+           (spend-young (%pkg-tx cb-young 0 99990000))
+           (yid (bitcoin-lisp.serialization:transaction-hash spend-young))
+           (spend-old (%pkg-tx cb-old 0 99990000))
+           (oid (bitcoin-lisp.serialization:transaction-hash spend-old)))
+      (bitcoin-lisp.storage:add-utxo utxo-set cb-young 0 100000000
+                                     (%p2sh-optrue-spk) 150 :coinbase t)
+      (bitcoin-lisp.storage:add-utxo utxo-set cb-old 0 100000000
+                                     (%p2sh-optrue-spk) 90 :coinbase t)
+      (is (eq :ok (%add-tx mempool spend-young :fee 10000 :height 200)))
+      (is (eq :ok (%add-tx mempool spend-old :fee 10000 :height 200)))
+      ;; New tip 200 -> spend height 201: 201-150 = 51 < 100 immature;
+      ;; 201-90 = 111 mature.
+      (bitcoin-lisp.validation::readd-disconnected-txs-to-mempool
+       mempool '() utxo-set 200 chain-state)
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool yid)))
+      (is (bitcoin-lisp.mempool:mempool-has mempool oid)))))
+
+(test reorg-refilter-drops-bip68-nonfinal-entry
+  "A pool entry whose BIP68 height lock the new chain no longer satisfies is
+removed: Core re-tests lockpoints against the new tip
+(validation.cpp:350-366). A lock already deep enough stays."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (declare (ignore funding))
+    (let* ((coin1 (make-reorg-hash 4330))
+           (coin2 (make-reorg-hash 4331))
+           ;; 100-block relative lock on a coin confirmed at 150: at the new
+           ;; tip 200 (spend height 201) only 51 blocks deep -> non-final.
+           (locked (%pkg-tx coin1 0 99990000 :sequence 100))
+           (lid (bitcoin-lisp.serialization:transaction-hash locked))
+           ;; 40-block lock on the same depth -> satisfied.
+           (ok-tx (%pkg-tx coin2 0 99990000 :sequence 40))
+           (okid (bitcoin-lisp.serialization:transaction-hash ok-tx)))
+      (bitcoin-lisp.storage:add-utxo utxo-set coin1 0 100000000
+                                     (%p2sh-optrue-spk) 150 :coinbase nil)
+      (bitcoin-lisp.storage:add-utxo utxo-set coin2 0 100000000
+                                     (%p2sh-optrue-spk) 150 :coinbase nil)
+      (is (eq :ok (%add-tx mempool locked :fee 10000 :height 200)))
+      (is (eq :ok (%add-tx mempool ok-tx :fee 10000 :height 200)))
+      (bitcoin-lisp.validation::readd-disconnected-txs-to-mempool
+       mempool '() utxo-set 200 chain-state)
+      (is (not (bitcoin-lisp.mempool:mempool-has mempool lid)))
+      (is (bitcoin-lisp.mempool:mempool-has mempool okid)))))
+
+(test reorg-refilter-runs-after-readd
+  "Ordering matches Core MaybeUpdateMempoolForReorg: re-add first, then the
+re-filter — so a disconnected tx that is itself non-final under the new tip
+is caught even though the filter, not the re-add validation, is what sees
+the pool child it would strand. A re-added final tx survives the filter."
+  (multiple-value-bind (utxo-set mempool chain-state funding) (%pkg-fixture)
+    (let* ((dtx (%pkg-tx funding 0 100000000))   ; zero-fee, final: re-adds
+           (did (bitcoin-lisp.serialization:transaction-hash dtx)))
+      (bitcoin-lisp.validation::readd-disconnected-txs-to-mempool
+       mempool (list dtx) utxo-set 200 chain-state)
+      ;; the re-added tx passed the filter too
+      (is (bitcoin-lisp.mempool:mempool-has mempool did)))))

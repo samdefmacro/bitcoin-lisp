@@ -8,6 +8,7 @@
    #:start-rpc-server
    #:stop-rpc-server
    #:*rpc-server*
+   #:open-browser-to-ui
 
    ;; Thread-safe accessors
    #:rpc-get-chain-state

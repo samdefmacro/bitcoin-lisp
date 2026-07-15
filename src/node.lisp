@@ -1182,7 +1182,10 @@ index is enabled."
                         (reindex-chainstate nil)
                         (force-compact-db nil)
                         (peer-block-filters nil)
-                        (tx-reconciliation nil))
+                        (tx-reconciliation nil)
+                        (webui nil webui-supplied-p)
+                        (webui-path nil)
+                        (webui-open nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -1207,6 +1210,11 @@ LISTEN-ONION requires a reachable Tor daemon to do anything; without one the
   torcontrol thread just retries with backoff
 TOR-CONTROL: Tor control host:port (nil = 127.0.0.1:9051, Core -torcontrol)
 TOR-PASSWORD: Tor control port password (Core -torpassword)
+WEBUI: Serve the web UI at /ui/ on the RPC port (docs/gui-plan.md P0).
+  Default: on for every network except mainnet (operator's choice there)
+WEBUI-PATH: Web UI asset directory (nil = the repo's ui/ directory)
+WEBUI-OPEN: If T (default nil), open http://localhost:<rpcport>/ui/ in the
+  local browser after the RPC server starts — the local-daemon pattern
 
 Returns the node instance."
   (when *node*
@@ -1542,11 +1550,22 @@ Returns the node instance."
 
   ;; Start RPC server if port specified
   (when rpc-port
-    (bitcoin-lisp.rpc:start-rpc-server *node*
-                                        :port rpc-port
-                                        :bind rpc-bind
-                                        :user rpc-user
-                                        :password rpc-password))
+    ;; Web UI default (gui-plan §2): on everywhere except mainnet, where
+    ;; enabling it is the operator's explicit choice (-webui).
+    (let* ((webui-enabled (if webui-supplied-p
+                              (and webui t)
+                              (not (eq network :mainnet))))
+           (server (bitcoin-lisp.rpc:start-rpc-server *node*
+                                                      :port rpc-port
+                                                      :bind rpc-bind
+                                                      :user rpc-user
+                                                      :password rpc-password
+                                                      :ui-enabled webui-enabled
+                                                      :ui-directory webui-path)))
+      ;; -webuiopen: pop the local browser at the dashboard. Logged, never
+      ;; fatal (open-browser-to-ui catches everything).
+      (when (and server webui-enabled webui-open)
+        (bitcoin-lisp.rpc:open-browser-to-ui rpc-port))))
 
   ;; Connect to peers and sync if requested (in background thread)
   ;; Reconnects and retries when peers are lost, similar to Bitcoin Core's
@@ -1555,6 +1574,9 @@ Returns the node instance."
     (bitcoin-lisp.networking:reset-ibd-stop)
     (bitcoin-lisp.networking:reset-tx-requests)
     (bitcoin-lisp.networking:reset-initial-broadcast-schedule)
+    ;; Fresh recent-confirmed filter (Core builds it per process; covers
+    ;; in-image restarts).
+    (bitcoin-lisp.validation:reset-recent-confirmed)
     (setf (node-sync-thread *node*)
           (bt:make-thread
            (lambda ()
@@ -1596,36 +1618,74 @@ Returns the node instance."
                                ;; the PR #216 block-relay/feeler conns and
                                ;; ping-timeout eviction never ran live.
                                (maintain-peers *node*)
-                               ;; Re-route any tx getdata that timed out to
-                               ;; another announcer (TxRequestTracker).
-                               (bitcoin-lisp.networking:retry-timed-out-tx-requests)
                                (loop repeat 30 while (node-running *node*)
                                      do (sleep 1)
-                                        ;; Trickled tx announcements: drain
-                                        ;; due per-peer inv queues each
-                                        ;; second (Poisson schedules inside;
-                                        ;; Core SendMessages runs its
-                                        ;; equivalent on every message pump).
-                                        (bitcoin-lisp.networking:flush-tx-announcements
-                                         (node-peers *node*)
-                                         (node-mempool *node*))
-                                        ;; Locally-submitted txs still in the
-                                        ;; unbroadcast set get re-announced
-                                        ;; every 10-15 min until a peer's
-                                        ;; getdata confirms propagation (Core
-                                        ;; ReattemptInitialBroadcast).
-                                        (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast
-                                         (node-peers *node*)
-                                         (node-mempool *node*))
-                                        ;; Local-address self-advertisement
-                                        ;; (our onion address, once torcontrol
-                                        ;; registers it): per-peer ~24h Poisson
-                                        ;; schedule inside, no-op while the
-                                        ;; local-address map is empty or in
-                                        ;; IBD (Core MaybeSendAddr).
-                                        (bitcoin-lisp.networking:maybe-advertise-local-address
-                                         (node-peers *node*)
-                                         (node-chain-state *node*))))
+                                        ;; Retry buffered unsent bytes on
+                                        ;; every peer (non-blocking) — the
+                                        ;; periodic half of Core's
+                                        ;; SocketSendData.
+                                        (bitcoin-lisp.networking:flush-peer-send-buffers
+                                         (node-peers *node*))
+                                        ;; Steady-state receive pump: drain
+                                        ;; every peer's readable messages
+                                        ;; with the full node context. This
+                                        ;; loop used to be a pure 30s sleep
+                                        ;; — a receive dead window in which
+                                        ;; pings, invs, and getdata for txs
+                                        ;; we had JUST announced sat unread
+                                        ;; (Core's per-peer ProcessMessages
+                                        ;; runs continuously). A new header
+                                        ;; announcement ends the wait so the
+                                        ;; block is fetched immediately.
+                                        (let* ((cs (node-current-chainstate *node*))
+                                               (pump (bitcoin-lisp.networking:pump-peer-messages
+                                                      (node-peers *node*)
+                                                      cs
+                                                      (bitcoin-lisp.storage:chain-state-coins-view cs)
+                                                      (node-block-store *node*)
+                                                      :mempool (node-mempool *node*)
+                                                      :address-book (node-address-book *node*)
+                                                      :fee-estimator (node-fee-estimator *node*)
+                                                      :recent-rejects (node-recent-rejects *node*))))
+                                          ;; Tx-request scheduler: send
+                                          ;; delayed announcements now due,
+                                          ;; and re-route requests that
+                                          ;; expired (60s) to another
+                                          ;; announcer (Core GetRequestsToSend
+                                          ;; runs per SendMessages pass).
+                                          (bitcoin-lisp.networking:process-tx-requests)
+                                          (bitcoin-lisp.networking:retry-timed-out-tx-requests)
+                                          ;; Trickled tx announcements: drain
+                                          ;; due per-peer inv queues each
+                                          ;; second (Poisson schedules inside;
+                                          ;; Core SendMessages runs its
+                                          ;; equivalent on every message pump).
+                                          (bitcoin-lisp.networking:flush-tx-announcements
+                                           (node-peers *node*)
+                                           (node-mempool *node*))
+                                          ;; Locally-submitted txs still in the
+                                          ;; unbroadcast set get re-announced
+                                          ;; every 10-15 min until a peer's
+                                          ;; getdata confirms propagation (Core
+                                          ;; ReattemptInitialBroadcast).
+                                          (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast
+                                           (node-peers *node*)
+                                           (node-mempool *node*))
+                                          ;; Local-address self-advertisement
+                                          ;; (our onion address, once torcontrol
+                                          ;; registers it): per-peer ~24h Poisson
+                                          ;; schedule inside, no-op while the
+                                          ;; local-address map is empty or in
+                                          ;; IBD (Core MaybeSendAddr).
+                                          (bitcoin-lisp.networking:maybe-advertise-local-address
+                                           (node-peers *node*)
+                                           (node-chain-state *node*))
+                                          ;; New headers announced: start the
+                                          ;; next sync cycle now to fetch the
+                                          ;; block instead of waiting out the
+                                          ;; 30s poll.
+                                          (when (plusp (bitcoin-lisp.networking:ibd-context-headers-received pump))
+                                            (return)))))
                               (t
                                (log-warn "No peers available, reconnecting in 5s...")
                                (loop repeat 5 while (node-running *node*)
@@ -2720,6 +2780,21 @@ Also checks compact block reconstruction timeouts (BIP 152)."
         (setf (node-peers node) (remove peer (node-peers node)))))
     (length to-disconnect)))
 
+(defun outbound-full-relay-peer-p (peer)
+  "T iff PEER is a ready outbound full-relay connection — the only kind that
+counts toward the outbound full-relay target (Core CNode::IsFullOutboundConn:
+m_conn_type == OUTBOUND_FULL_RELAY, which is never inbound). Inbound peers
+and block-relay/feeler outbound peers are deliberately excluded."
+  (and (eq (bitcoin-lisp.networking:peer-state peer) :ready)
+       (not (bitcoin-lisp.networking:peer-inbound peer))
+       (eq (bitcoin-lisp.networking:peer-conn-type peer) :outbound-full-relay)))
+
+(defun count-outbound-full-relay-peers (peers)
+  "Count ready outbound full-relay peers among PEERS (Core nOutboundFullRelay).
+Inbound connections are excluded so an attacker filling our inbound slots
+cannot suppress replacement outbound dials (eclipse-attack prevention)."
+  (count-if #'outbound-full-relay-peer-p peers))
+
 (defun replace-disconnected-peers (node)
   "Replace disconnected peers to maintain target peer count.
 Returns the number of new peers connected."
@@ -2733,18 +2808,24 @@ Returns the number of new peers connected."
   ;; setnetworkactive off: don't dial replacements.
   (unless (node-network-active node)
     (return-from replace-disconnected-peers 0))
-  ;; Count only the normal peer set (inbound + full-relay) toward max-peers.
-  ;; Block-relay-only peers are a separate additive pool maintained by
-  ;; maintain-block-relay-peers (Core keeps m_max_outbound_block_relay distinct
-  ;; from m_max_outbound_full_relay); folding them in here would let 2 idle
+  ;; Count ONLY outbound full-relay peers toward the outbound target — never
+  ;; inbound, never block-relay/feeler. Core's ThreadOpenConnections counts
+  ;; nOutboundFullRelay via IsFullOutboundConn() (net.cpp:2648-2657,2718) and
+  ;; explicitly keeps inbound out of the arithmetic: inbound connections are
+  ;; free for an attacker to make, so letting them satisfy the outbound
+  ;; target is an eclipse primitive — 8 attacker inbounds previously
+  ;; suppressed dialing any honest outbound replacement here. The inbound
+  ;; population has its own separate cap (+max-inbound-peers+, enforced at
+  ;; merge time in merge-inbound-peers). Block-relay-only peers are a
+  ;; separate additive pool maintained by maintain-block-relay-peers (Core
+  ;; keeps m_max_outbound_block_relay distinct from
+  ;; m_max_outbound_full_relay); folding them in here would let 2 idle
   ;; block-relay slots starve replacement of a dropped full-relay peer.
-  (let* ((active-peers (remove-if-not
-                        (lambda (p)
-                          (and (eq (bitcoin-lisp.networking:peer-state p) :ready)
-                               (not (member (bitcoin-lisp.networking:peer-conn-type p)
-                                            '(:block-relay :feeler)))))
-                        (node-peers node)))
-         (needed (- (node-max-peers node) (length active-peers))))
+  ;; (Known simplification vs Core: addnode peers are typed
+  ;; :outbound-full-relay in our code, so they do count here, whereas Core's
+  ;; MANUAL connections are additive.)
+  (let* ((active-count (count-outbound-full-relay-peers (node-peers node)))
+         (needed (- (node-max-peers node) active-count)))
     (when (<= needed 0)
       (return-from replace-disconnected-peers 0))
 
@@ -3027,8 +3108,9 @@ phase exits quickly when there's nothing new to fetch."
   (when (node-mempool *node*)
     (format t "  Transactions: ~D~%"
             (bitcoin-lisp.mempool:mempool-count (node-mempool *node*)))
-    (format t "  Size: ~:D bytes~%"
-            (bitcoin-lisp.mempool:mempool-total-size (node-mempool *node*))))
+    (format t "  Size: ~:D vbytes (~:D bytes memory)~%"
+            (bitcoin-lisp.mempool:mempool-total-size (node-mempool *node*))
+            (bitcoin-lisp.mempool:mempool-dynamic-usage (node-mempool *node*))))
   (format t "~%Peers:~%")
   (if (node-peers *node*)
       (dolist (peer (node-peers *node*))
