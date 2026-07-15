@@ -215,7 +215,14 @@ m_addr_rate_limited)."
       (is (= 5 added) "only 5 addresses fit the bucket")
       (is (= 5 (bitcoin-lisp.networking::peer-addr-processed p)))
       (is (= 15 (bitcoin-lisp.networking::peer-addr-rate-limited p)))
-      (is (= 5 (bitcoin-lisp.networking:address-book-count book))))))
+      ;; Upper bound only: the 20 test addresses share one /16 and one
+      ;; source, so addrman maps them all into a single 64-slot new bucket
+      ;; (bucket keys on the (addr-group, source-group) pair) and 5 inserts
+      ;; slot-collide with p~15% per run — a colliding insert correctly
+      ;; REPLACES the earlier entry, making exact-count flaky. The rate
+      ;; limit's storage-layer guarantee is that no more than 5 ever reach
+      ;; the book; placement within addrman is addrman's own contract.
+      (is (<= (bitcoin-lisp.networking:address-book-count book) 5)))))
 
 (test addr-full-bucket-processes-all
   "With a full bucket a normal small announcement is fully processed and
