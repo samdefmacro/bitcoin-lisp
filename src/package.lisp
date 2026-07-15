@@ -796,7 +796,6 @@
    #:txgraph-get-descendants-union
    #:txgraph-compare-main-order
    #:txgraph-count-distinct-clusters
-   #:txgraph-cluster-transaction-count
    #:txgraph-rbf-diagrams
    #:txgraph-package-rbf-diagrams
    #:txgraph-get-worst-main-chunk
@@ -829,6 +828,7 @@
    #:save-mempool-file
    #:read-mempool-file
    #:mempool-entry-size
+   #:mempool-entry-usage
    #:mempool-entry-vsize
    #:mempool-entry-wtxid
    #:mempool-entry-sigops
@@ -852,6 +852,7 @@
    #:+truc-version+
    #:+truc-max-vsize+
    #:+truc-child-max-vsize+
+   #:+truc-ancestor-limit+
    #:mempool-ancestors
    #:mempool-descendants
    #:mempool-ancestor-stats
@@ -899,8 +900,11 @@
    #:mempool-remove
    #:mempool-count
    #:mempool-total-size
+   #:mempool-dynamic-usage
+   #:transaction-dynamic-usage
    #:mempool-min-fee-rate
    #:mempool-check-conflict
+   #:mempool-package-fits-cluster-limits-p
    #:mempool-remove-for-block
    #:mempool-remove-spenders
    #:mempool-update-for-reorg
@@ -942,6 +946,7 @@
    #:validate-transaction-for-mempool
    ;; Package relay (submitpackage)
    #:validate-package-for-mempool
+   #:package-truc-checks
    #:package-well-formed
    #:package-child-with-parents-tree-p
    #:+max-package-count+
