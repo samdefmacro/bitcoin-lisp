@@ -552,6 +552,11 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
                   ("synced_blocks" . ,sh)
                   ("bytessent" . ,(if conn (bitcoin-lisp.networking::connection-bytes-sent conn) 0))
                   ("bytesrecv" . ,(if conn (bitcoin-lisp.networking::connection-bytes-received conn) 0))
+                  ;; Addr intake counters (Core m_addr_processed /
+                  ;; m_addr_rate_limited; the rate-limited count is addresses
+                  ;; dropped by the per-address token bucket).
+                  ("addr_processed" . ,(bitcoin-lisp.networking::peer-addr-processed peer))
+                  ("addr_rate_limited" . ,(bitcoin-lisp.networking::peer-addr-rate-limited peer))
                   ;; ping-latency is in internal-time units; report seconds (0 = unknown).
                   ("pingtime" . ,(if (and ping (plusp ping))
                                      (/ ping internal-time-units-per-second 1.0d0)
