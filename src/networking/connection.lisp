@@ -4,6 +4,24 @@
 ;;;
 ;;; Handles low-level TCP connections to Bitcoin peers.
 
+(defconstant +max-send-buffer-bytes+ 1000000
+  "Per-connection cap on buffered unsent bytes, above which the connection is
+send-paused (Bitcoin Core CNode::fPauseSend; cap = -maxsendbuffer default,
+1000 * DEFAULT_MAXSENDBUFFER(1000) bytes, net.h:99 / init.cpp:2105). A single
+message may take the buffer past the cap (Core queues it the same way — a
+>1MB block message must still be servable); while over it, send-bytes drops
+further messages instead of queueing without bound.")
+
+(defconstant +send-stall-timeout-seconds+ (* 20 60)
+  "Disconnect a peer whose socket has accepted no bytes for this long while
+unsent data is buffered (Bitcoin Core InactivityCheck \"socket sending
+timeout\": now > m_last_send + TIMEOUT_INTERVAL, net.h TIMEOUT_INTERVAL =
+20min; m_last_send advances only when the kernel accepts bytes). Core's check
+runs even with an empty queue but is kept alive by periodic pings; ours is
+additionally gated on data actually pending, which avoids false positives
+without changing the effective behavior (a jammed socket always has data
+pending — the pings themselves buffer up).")
+
 (defstruct connection
   "A TCP connection to a Bitcoin peer."
   (socket nil)
@@ -17,6 +35,17 @@
   ;; (ping, getblockfrompeer) can both call send-bytes, and interleaved
   ;; write-sequence calls would corrupt the wire framing.
   (send-lock (bt:make-lock "conn-send"))
+  ;; Per-connection outgoing send buffer (Core CNode::vSendMsg, byte-level):
+  ;; whatever the kernel would not accept without blocking is queued here in
+  ;; wire order and retried non-blockingly by later sends / flush passes.
+  ;; Two-list FIFO (push on IN, pop off the reversed OUT) so appends and pops
+  ;; are O(1). All three slots are guarded by SEND-LOCK.
+  (send-queue-in nil :type list)
+  (send-queue-out nil :type list)
+  (send-queue-bytes 0 :type integer)
+  ;; internal-real-time of the last write the kernel accepted (Core
+  ;; CNode::m_last_send), for the send-stall inactivity check.
+  (last-send-progress (get-internal-real-time) :type integer)
   ;; BIP324 v2 session (a v2-transport struct), or NIL for plaintext v1.
   ;; Set once by the v2 handshake; message I/O in peer.lisp branches on it.
   (transport nil)
@@ -80,6 +109,23 @@ Mirrors Bitcoin Core net.cpp:1794."
   #-sbcl
   (declare (ignore usocket-socket)))
 
+(defun set-socket-non-blocking (usocket-socket)
+  "Put USOCKET-SOCKET's fd in non-blocking mode (Core makes every peer socket
+non-blocking, SetSocketNonBlocking / CreateSock). This is what lets the send
+path (%try-send-now) write only what the kernel will accept instead of
+pinning the shared sync thread on one peer's stalled TCP window. Reads are
+unaffected: SBCL fd-streams wait internally on EAGAIN, so receive-bytes'
+wait-for-input + read-sequence behave exactly as on a blocking fd (verified
+empirically). If the fcntl fails the socket stays blocking and sends degrade
+to the pre-existing blocking behavior."
+  #+sbcl
+  (let ((underlying (usocket:socket usocket-socket)))
+    (when (typep underlying 'sb-bsd-sockets:socket)
+      (ignore-errors
+        (setf (sb-bsd-sockets:non-blocking-mode underlying) t))))
+  #-sbcl
+  (declare (ignore usocket-socket)))
+
 (defun make-tcp-connection (host port &key (timeout 10))
   "Create a TCP connection to HOST:PORT.
 Returns a connection structure or NIL on failure.
@@ -120,6 +166,9 @@ the right proxy transparently."
                                       host port (proxy-host proxy) (proxy-port proxy) e)
               (ignore-errors (usocket:socket-close socket))
               (return-from make-tcp-connection nil))))
+        ;; Non-blocking AFTER the SOCKS5 handshake: socks5-connect speaks over
+        ;; the blocking stream and needs no change in semantics.
+        (set-socket-non-blocking socket)
         (make-connection :socket socket
                          :host host
                          :port port
@@ -157,6 +206,7 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
                                              :element-type '(unsigned-byte 8))))
           (when client
             (set-tcp-nodelay client)
+            (set-socket-non-blocking client)
             (let ((host (handler-case
                             (usocket:host-to-hostname (usocket:get-peer-address client))
                           (error () "inbound"))))
@@ -174,27 +224,176 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
         (usocket:socket-close (connection-socket conn))
       (error () nil)))
   (setf (connection-connected conn) nil)
-  (setf (connection-socket conn) nil))
+  (setf (connection-socket conn) nil)
+  ;; Free any buffered unsent bytes.
+  (setf (connection-send-queue-in conn) nil
+        (connection-send-queue-out conn) nil
+        (connection-send-queue-bytes conn) 0))
 
 (defun connection-stream (conn)
   "Get the stream for a connection."
   (when (connection-socket conn)
     (usocket:socket-stream (connection-socket conn))))
 
-(defun send-bytes (conn bytes)
-  "Send raw bytes over the connection.
-Returns the number of bytes sent or NIL on failure."
+;;; --- Non-blocking send path -------------------------------------------------
+;;;
+;;; Bitcoin Core never blocks its message thread on a peer's socket: writes go
+;;; through send(MSG_DONTWAIT) on a non-blocking fd, whatever the kernel won't
+;;; take sits in a per-peer queue (vSendMsg) retried from the socket loop, a
+;;; peer whose queue exceeds -maxsendbuffer is send-paused (fPauseSend), and a
+;;; socket that accepts nothing for TIMEOUT_INTERVAL is disconnected
+;;; (net.cpp CConnman::SocketSendData / InactivityCheck). Our previous
+;;; send-bytes did a blocking write-sequence on the shared sync thread — one
+;;; peer advertising a zero TCP window pinned the entire node. The port below
+;;; keeps Core's structure at the byte level (we buffer wire bytes, not
+;;; message objects — the framing/encryption has already happened by the time
+;;; send-bytes runs, including BIP324 packets whose cipher order must equal
+;;; wire order): non-blocking write, per-connection FIFO of the remainder,
+;;; the same 1MB pause cap, and the same 20-minute send-stall disconnect.
+;;; Divergence from Core, documented in the PR: while a peer is over the cap
+;;; we DROP new messages instead of pausing message processing (our handlers
+;;; respond synchronously and cannot be paused); the peer's own timeout
+;;; machinery (ping/pong, block-request timeouts, the stall check) then
+;;; disconnects it, which is Core's eventual outcome too.
+
+(defun %connection-sb-socket (conn)
+  "The underlying sb-bsd-sockets socket of CONN, or NIL."
+  #+sbcl
+  (let ((sock (connection-socket conn)))
+    (when sock
+      (let ((raw (usocket:socket sock)))
+        (and (typep raw 'sb-bsd-sockets:socket) raw))))
+  #-sbcl
+  (progn conn nil))
+
+(defun %try-send-now (conn bytes)
+  "Write as much of BYTES to CONN's socket as the kernel accepts without
+blocking. Returns the number of bytes accepted (0 on would-block), or :ERROR
+on a hard socket failure. sb-bsd-sockets:socket-send on a non-blocking fd
+returns a partial count when the buffer fills mid-write and NIL on
+EAGAIN/EINTR (verified on SBCL 2.5/2.6). Non-SBCL fallback: the old blocking
+full write through the stream."
+  #+sbcl
+  (let ((raw (%connection-sb-socket conn)))
+    (if raw
+        (handler-case
+            (or (sb-bsd-sockets:socket-send raw bytes (length bytes)) 0)
+          (error () :error))
+        :error))
+  #-sbcl
   (handler-case
       (let ((stream (connection-stream conn)))
-        (when stream
-          ;; One writer at a time: a whole message must hit the socket atomically.
-          (bt:with-lock-held ((connection-send-lock conn))
-            (write-sequence bytes stream)
-            (force-output stream))
-          (incf (connection-bytes-sent conn) (length bytes))
-          (incf *total-bytes-sent* (length bytes))
-          (setf (connection-last-activity conn) (get-universal-time))
-          (length bytes)))
+        (if stream
+            (progn (write-sequence bytes stream)
+                   (force-output stream)
+                   (length bytes))
+            :error))
+    (error () :error)))
+
+(defun %record-send-progress (conn n)
+  "Account N bytes the kernel just accepted (Core m_last_send / nSendBytes)."
+  (incf (connection-bytes-sent conn) n)
+  (incf *total-bytes-sent* n)
+  (setf (connection-last-activity conn) (get-universal-time)
+        (connection-last-send-progress conn) (get-internal-real-time)))
+
+(defun %flush-send-queue-locked (conn)
+  "Write as much buffered data as the socket accepts without blocking (Core
+CConnman::SocketSendData). Returns T while the connection remains usable, NIL
+after a hard send failure (connection marked dead). Caller holds SEND-LOCK."
+  (loop
+    ;; Refill the pop side from the push side when it runs dry (FIFO).
+    (when (and (null (connection-send-queue-out conn))
+               (connection-send-queue-in conn))
+      (setf (connection-send-queue-out conn)
+            (nreverse (connection-send-queue-in conn))
+            (connection-send-queue-in conn) nil))
+    (let ((chunk (first (connection-send-queue-out conn))))
+      (unless chunk (return t))
+      (let ((n (%try-send-now conn chunk)))
+        (cond
+          ((eq n :error)
+           (setf (connection-connected conn) nil)
+           (return nil))
+          ((zerop n) (return t))               ; would-block: retry later
+          (t
+           (%record-send-progress conn n)
+           (decf (connection-send-queue-bytes conn) n)
+           (if (< n (length chunk))
+               ;; Partial: keep the remainder at the queue head; the socket
+               ;; buffer is full, so stop (Core: "could not send full
+               ;; message; stop sending more").
+               (progn
+                 (setf (first (connection-send-queue-out conn))
+                       (subseq chunk n))
+                 (return t))
+               (pop (connection-send-queue-out conn)))))))))
+
+(defun %enqueue-send-bytes (conn bytes)
+  "Append BYTES to CONN's send queue (wire order). Caller holds SEND-LOCK."
+  (push bytes (connection-send-queue-in conn))
+  (incf (connection-send-queue-bytes conn) (length bytes)))
+
+(defun connection-send-paused-p (conn)
+  "T while CONN's buffered unsent data exceeds the send-buffer cap (Core
+CNode::fPauseSend). Bulk producers (block serving in handle-getdata, exactly
+where Core checks it in ProcessGetData) stop sending to a paused peer;
+send-bytes drops further messages until the buffer drains below the cap."
+  (> (connection-send-queue-bytes conn) +max-send-buffer-bytes+))
+
+(defun connection-send-stalled-p (conn)
+  "T when CONN has had unsent data buffered while the socket accepted nothing
+for +send-stall-timeout-seconds+ (Core InactivityCheck \"socket sending
+timeout\"). check-peer-health disconnects such peers."
+  (and (plusp (connection-send-queue-bytes conn))
+       (> (- (get-internal-real-time) (connection-last-send-progress conn))
+          (* +send-stall-timeout-seconds+ internal-time-units-per-second))))
+
+(defun flush-send-buffer (conn)
+  "Retry CONN's buffered unsent bytes without blocking (the periodic half of
+Core's SocketSendData, driven here from the sync/IBD housekeeping passes
+since we have no dedicated socket thread). Returns T while the connection
+remains usable."
+  (if (plusp (connection-send-queue-bytes conn))
+      (bt:with-lock-held ((connection-send-lock conn))
+        (%flush-send-queue-locked conn))
+      t))
+
+(defun send-bytes (conn bytes)
+  "Send raw bytes over the connection without ever blocking the calling
+thread: bytes the kernel won't take immediately are queued on the connection
+and retried by later sends / flush passes. Returns the number of bytes
+accepted (sent or queued), or NIL when the message was dropped — connection
+dead, or send-paused with the buffer over +max-send-buffer-bytes+."
+  (when (zerop (length bytes))
+    (return-from send-bytes 0))
+  (handler-case
+      ;; One writer at a time: a whole message must enter the queue/socket
+      ;; atomically, and queue order must equal wire order.
+      (bt:with-lock-held ((connection-send-lock conn))
+        ;; Older unsent data goes first — never interleave.
+        (unless (%flush-send-queue-locked conn)
+          (return-from send-bytes nil))
+        (cond
+          ((plusp (connection-send-queue-bytes conn))
+           ;; Still backed up. Queue behind it — unless over the cap, in
+           ;; which case the message is dropped (see pause note above).
+           (cond ((connection-send-paused-p conn) nil)
+                 (t (%enqueue-send-bytes conn bytes)
+                    (length bytes))))
+          (t
+           ;; Queue empty: optimistic direct send (Core PushMessage's
+           ;; optimistic SocketSendData), buffering any remainder.
+           (let ((n (%try-send-now conn bytes)))
+             (cond
+               ((eq n :error)
+                (setf (connection-connected conn) nil)
+                nil)
+               (t
+                (when (plusp n) (%record-send-progress conn n))
+                (when (< n (length bytes))
+                  (%enqueue-send-bytes conn (if (zerop n) bytes (subseq bytes n))))
+                (length bytes)))))))
     (error ()
       (setf (connection-connected conn) nil)
       nil)))
