@@ -570,16 +570,75 @@ status with no scan running returns null; abort with no scan is a no-op."
     ;; Invalid characters
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getblock node '("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")))
-    ;; Invalid verbosity
+    ;; Non-integer/non-bool verbosity (Core: type error; any integer is valid)
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getblock node
-        '("0000000000000000000000000000000000000000000000000000000000000000" 5)))))
+        '("0000000000000000000000000000000000000000000000000000000000000000" "5")))))
 
 (test rpc-getblockheader-invalid-hash
   "Test getblockheader with invalid hash returns error"
   (let ((node (make-test-node)))
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getblockheader node '("tooshort")))))
+
+;;; --- getrawtransaction verbosity + witness-complete hex ---
+
+(test rpc-getrawtransaction-witness-hex-and-verbosity
+  "The non-verbose hex is the wire (witness-complete) encoding — Core's
+EncodeHexTx — and the verbosity argument follows Core ParseVerbosity: 0, false
+and absent return hex (verbosity 0 is Core's default but was truthy in Lisp);
+1, true and 2 return the decoded object; a string errors."
+  (let* ((node (make-test-node))
+         (mempool (bitcoin-lisp::node-mempool node))
+         (raw (make-witness-test-tx-bytes))
+         (tx (flexi-streams:with-input-from-sequence (s raw)
+               (bitcoin-lisp.serialization:read-transaction s)))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (txid-hex (bitcoin-lisp.rpc::hash-to-hex txid)))
+    (is (eq :ok (bitcoin-lisp.mempool:mempool-add
+                 mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))))
+    ;; Hex-returning verbosities: absent, 0, false (NIL).
+    (dolist (params (list (list txid-hex)
+                          (list txid-hex 0)
+                          (list txid-hex nil)))
+      (let ((hex (bitcoin-lisp.rpc::rpc-getrawtransaction node params)))
+        (is (stringp hex))
+        ;; Byte-exact wire bytes: witnesses intact through a round-trip.
+        (is (equalp raw (bitcoin-lisp.crypto:hex-to-bytes hex)))))
+    ;; Object-returning verbosities: 1, true, 2.
+    (dolist (params (list (list txid-hex 1)
+                          (list txid-hex t)
+                          (list txid-hex 2)))
+      (let ((r (bitcoin-lisp.rpc::rpc-getrawtransaction node params)))
+        (is (consp r))
+        (is (string= txid-hex (cdr (assoc "txid" r :test #'string=))))
+        ;; The object's hex field is the wire encoding too.
+        (is (equalp raw (bitcoin-lisp.crypto:hex-to-bytes
+                         (cdr (assoc "hex" r :test #'string=)))))))
+    ;; Non-integer/non-bool verbosity → type error (Core getInt<int> throw).
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getrawtransaction node (list txid-hex "abc")))))
+
+;;; --- getorphantxs wire hex + verbosity validation ---
+
+(test rpc-getorphantxs-wire-hex-and-verbosity
+  "%orphan-tx-json's bytes/hex use the wire (witness-complete) encoding — Core
+OrphanToJSON's ComputeTotalSize/EncodeHexTx — and getorphantxs rejects
+out-of-range or boolean verbosity like Core (ParseVerbosity allow_bool=false)."
+  (let* ((raw (make-witness-test-tx-bytes))
+         (tx (flexi-streams:with-input-from-sequence (s raw)
+               (bitcoin-lisp.serialization:read-transaction s)))
+         (o (bitcoin-lisp.rpc::%orphan-tx-json tx nil t)))
+    (is (= (length raw) (cdr (assoc "bytes" o :test #'string=))))
+    (is (equalp raw (bitcoin-lisp.crypto:hex-to-bytes
+                     (cdr (assoc "hex" o :test #'string=))))))
+  (let ((node (make-test-node)))
+    (is (null (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
+    (is (null (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2))))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getorphantxs node (list 3)))
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getorphantxs node (list t)))))
 
 ;;; --- UTXO Query Method Tests (4.3) ---
 

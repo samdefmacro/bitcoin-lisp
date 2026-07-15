@@ -397,8 +397,8 @@ serve the objects it requested via getdata."
 getdata), a segwit tx is serialized in BIP144 witness form; a non-witness tx, or
 :WITNESS nil (legacy MSG_TX), uses the legacy encoding — matching Core's
 TX_WITH_WITNESS vs TX_NO_WITNESS in FindTxForGetData."
-  (let ((payload (if (and witness (transaction-has-witness-p tx))
-                     (serialize-witness-transaction tx)
+  (let ((payload (if witness
+                     (transaction-wire-bytes tx)
                      (serialize-transaction tx))))
     (serialize-message "tx" payload)))
 

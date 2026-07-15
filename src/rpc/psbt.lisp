@@ -664,9 +664,7 @@ fields (partial sigs, sighash, redeem/witness scripts, derivations)."
                      :lock-time (bitcoin-lisp.serialization:transaction-lock-time tx)
                      :witness (if any-witness witnesses nil))))
       (bitcoin-lisp.crypto:bytes-to-hex
-       (if any-witness
-           (bitcoin-lisp.serialization:serialize-witness-transaction final-tx)
-           (bitcoin-lisp.serialization:serialize-transaction final-tx))))))
+       (bitcoin-lisp.serialization:transaction-wire-bytes final-tx)))))
 
 (defun rpc-finalizepsbt (node params)
   "Finalize every input possible; if all are final and EXTRACT (default true),
@@ -749,6 +747,4 @@ PARAMS: (txs). Mirrors Core combinerawtransaction."
                        :lock-time (bitcoin-lisp.serialization:transaction-lock-time base)
                        :witness (if any-witness witnesses nil))))
           (bitcoin-lisp.crypto:bytes-to-hex
-           (if any-witness
-               (bitcoin-lisp.serialization:serialize-witness-transaction merged)
-               (bitcoin-lisp.serialization:serialize-transaction merged))))))))
+           (bitcoin-lisp.serialization:transaction-wire-bytes merged)))))))
