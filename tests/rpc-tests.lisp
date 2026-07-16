@@ -2035,7 +2035,17 @@ to \"block-relay-only\" with relaytxes false."
       ;; services is Core's 16-hex-digit string, not a number.
       (is (string= "0000000000000409" (cdr (assoc "services" e :test #'string=))))
       (is-true b)
-      (is (null (cdr (assoc "relaytxes" b :test #'string=)))))))
+      (is (null (cdr (assoc "relaytxes" b :test #'string=))))
+      ;; transport_protocol_type (Core TransportTypeAsString): "v1" without a
+      ;; BIP324 session, "v2" when the connection carries one.
+      (is (string= "v1" (cdr (assoc "transport_protocol_type" e :test #'string=))))
+      (setf (bitcoin-lisp.networking::peer-connection br)
+            (bitcoin-lisp.networking::make-connection :host "5.6.7.8" :port 8333
+                                                      :transport t))
+      (let* ((rows2 (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+             (b2 (find "block-relay-only" rows2 :key ct :test #'string=)))
+        (is (string= "v2" (cdr (assoc "transport_protocol_type" b2
+                                      :test #'string=))))))))
 
 (test rpc-getorphantxs
   "getorphantxs lists the orphan pool: verbosity 0 -> array of txid hex; 1 ->

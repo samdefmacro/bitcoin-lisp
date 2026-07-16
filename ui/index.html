@@ -51,11 +51,14 @@
   <div id="warnings-banner" class="banner banner-warn" role="alert" hidden></div>
   <div id="conn-banner" class="banner banner-bad" role="alert" hidden>
     Disconnected from node — retrying…</div>
+  <div id="net-banner" class="banner banner-warn" role="alert" hidden>
+    P2P networking is disabled — the node makes and accepts no peer
+    connections. <a href="#/peers">Manage in Peers.</a></div>
 
   <nav class="nav" aria-label="Sections">
     <a class="nav-item" data-nav="dashboard" href="#/">Dashboard</a>
     <a class="nav-item" data-nav="explorer" href="#/explorer">Explorer</a>
-    <span class="nav-item planned">Peers <em>planned</em></span>
+    <a class="nav-item" data-nav="peers" href="#/peers">Peers</a>
     <span class="nav-item planned">Console <em>planned</em></span>
     <form id="search-form" class="nav-search" role="search">
       <input id="search-input" type="search" placeholder="height · block hash · txid"
@@ -153,6 +156,9 @@
   </main>
   <main class="grid" id="view-block" hidden></main>
   <main class="grid" id="view-tx" hidden></main>
+
+  <!-- Peers & network ops (gui-plan P3), rendered by js/peers.js -->
+  <main class="grid" id="view-peers" hidden></main>
 
   <footer class="foot muted">
     <span id="node-version" class="mono">—</span>
