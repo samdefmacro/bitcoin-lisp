@@ -1,7 +1,10 @@
-// App shell: login flow + poll scheduler (gui-plan P0).
+// App shell: login flow, poll scheduler (gui-plan P0), hash routing +
+// universal search (gui-plan P2).
 
 import * as rpc from './rpc.js';
 import { tick, resetDashboard } from './dashboard.js';
+import * as router from './router.js';
+import * as explorer from './explorer.js';
 
 const POLL_MS = 3000;
 
@@ -28,12 +31,78 @@ function showLogin(message = '') {
   $('login-user').focus();
 }
 
-function showDashboard() {
+function showApp() {
   loggedIn = true;
   $('login-view').hidden = true;
   $('dash-view').hidden = false;
   startPolling();
+  router.dispatch(); // render whatever view the permalink deep-links to
 }
+
+// --- views + routing (gui-plan P2) ---
+// The dashboard poll keeps running on every view: it feeds the topbar,
+// status dot, and banners, and the dashboard DOM is simply hidden.
+
+const VIEWS = ['dashboard', 'explorer', 'block', 'tx'];
+
+function showView(name, navName = name) {
+  for (const v of VIEWS) $(`view-${v}`).hidden = v !== name;
+  for (const item of document.querySelectorAll('.nav [data-nav]')) {
+    const active = item.dataset.nav === navName;
+    item.classList.toggle('active', active);
+    if (active) item.setAttribute('aria-current', 'page');
+    else item.removeAttribute('aria-current');
+  }
+}
+
+function setSearchError(message) {
+  const box = $('search-error');
+  box.hidden = !message;
+  box.textContent = message || '';
+}
+
+function handleRoute(route) {
+  if (!loggedIn) return; // login gate; showApp re-dispatches after sign-in
+  setSearchError('');
+  switch (route.name) {
+    case 'dashboard':
+      showView('dashboard');
+      break;
+    case 'block':
+    case 'block-height': {
+      showView('block', 'explorer');
+      const ref = route.name === 'block'
+        ? { hash: route.args[0] }
+        : { height: route.args[0] };
+      explorer.showBlock($('view-block'), ref, route.query.get('page'));
+      break;
+    }
+    case 'tx':
+      showView('tx', 'explorer');
+      explorer.showTx($('view-tx'), route.args[0]);
+      break;
+    case 'explorer':
+    default:
+      showView('explorer');
+  }
+}
+
+$('search-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const input = $('search-input');
+  input.disabled = true;
+  try {
+    const res = await explorer.search(input.value);
+    if (res.ok) {
+      input.value = '';
+      setSearchError('');
+    } else {
+      setSearchError(res.message);
+    }
+  } finally {
+    input.disabled = false;
+  }
+});
 
 // --- poll scheduler: one batched tick, rescheduled after completion; the
 // chain stops while the tab is hidden and resumes on visibilitychange. ---
@@ -106,7 +175,7 @@ $('login-form').addEventListener('submit', async (ev) => {
     await rpc.call('getblockcount'); // cheap auth probe
     $('login-pass').value = '';
     $('login-cookie').value = '';
-    showDashboard();
+    showApp();
   } catch (e) {
     rpc.clearCredentials();
     err.textContent = e instanceof rpc.AuthError
@@ -122,8 +191,9 @@ $('logout-btn').addEventListener('click', () => showLogin());
 
 // --- boot: reuse this tab's session if it already has credentials ---
 
+router.start(handleRoute); // no-ops until logged in; showApp re-dispatches
 if (rpc.hasCredentials()) {
-  showDashboard();
+  showApp();
 } else {
   showLogin();
 }
