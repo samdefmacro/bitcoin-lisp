@@ -545,6 +545,12 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
                                   (format nil "~16,'0X" (or (bitcoin-lisp::peer-services peer) 0))))
                   ;; Real inbound/outbound flag (was hardcoded nil).
                   ("inbound" . ,(bitcoin-lisp.networking::peer-inbound peer))
+                  ;; Core TransportTypeAsString: the BIP324 v2 session lives in
+                  ;; connection-transport (NIL = plaintext v1). Peers surface
+                  ;; here only after the handshake, so "detecting" never applies.
+                  ("transport_protocol_type"
+                   . ,(if (and conn (bitcoin-lisp.networking::connection-transport conn))
+                          "v2" "v1"))
                   ;; Core ConnectionType string + whether we relay txs to this
                   ;; peer (block-relay-only/feeler peers get no tx relay -- #216).
                   ("connection_type" . ,(%connection-type-string
