@@ -79,6 +79,24 @@ dot-dot, absolute paths, dotfiles, backslashes, wildcards, empty segments."
     (is (= 200 (hunchentoot:return-code*)))
     (is (alexandria:starts-with-subseq "text/javascript" (hunchentoot:content-type*)))))
 
+(test ui-handle-serves-explorer-assets
+  "The P2 explorer modules are served with the JS content type, and the
+shell wires in the explorer views + universal search box."
+  (dolist (path '("/ui/js/router.js" "/ui/js/explorer.js"))
+    (with-ui-reply ()
+      (let ((body (bitcoin-lisp.rpc::ui-handle path)))
+        (is (= 200 (hunchentoot:return-code*)) "~S must be served" path)
+        (is (alexandria:starts-with-subseq "text/javascript"
+                                           (hunchentoot:content-type*)))
+        (is (plusp (length body))))))
+  (with-ui-reply ()
+    (let* ((body (bitcoin-lisp.rpc::ui-handle "/ui/index.html"))
+           (html (flexi-streams:octets-to-string body :external-format :utf-8)))
+      (is (search "view-block" html))
+      (is (search "view-tx" html))
+      (is (search "view-explorer" html))
+      (is (search "search-form" html)))))
+
 (test ui-handle-404s
   "Missing files, traversal attempts, and directories are all 404."
   (dolist (path '("/ui/nope.js"

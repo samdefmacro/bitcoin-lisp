@@ -56,3 +56,35 @@ export function shortHash(hash, tail = 16) {
   if (!hash) return '—';
   return hash.length <= tail ? hash : `…${hash.slice(-tail)}`;
 }
+
+// Txids/addresses are distinctive at both ends; keep head and tail.
+export function shortId(id, ends = 10) {
+  if (!id) return '—';
+  return id.length <= 2 * ends + 1 ? id : `${id.slice(0, ends)}…${id.slice(-ends)}`;
+}
+
+// The RPC's BTC-denominated JSON number, shown with full 8-decimal precision
+// (rounded to whole satoshis first so float noise never leaks into amounts).
+export function fmtBtc(btc) {
+  if (btc === null || btc === undefined || Number.isNaN(btc)) return '—';
+  return `${(Math.round(Number(btc) * 1e8) / 1e8).toFixed(8)} BTC`;
+}
+
+export function fmtSats(sats) {
+  if (sats === null || sats === undefined || Number.isNaN(sats)) return '—';
+  return `${fmtInt(sats)} sat`;
+}
+
+// Absolute wall-clock form of a unix timestamp, viewer's locale + timezone.
+export function fmtTimestamp(unixTime) {
+  if (!unixTime) return '—';
+  return new Date(unixTime * 1000).toLocaleString();
+}
+
+export function fmtDifficulty(d) {
+  if (d === null || d === undefined || Number.isNaN(d)) return '—';
+  const n = Number(d);
+  if (n >= 1000) return n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+  if (n >= 1) return n.toLocaleString('en-US', { maximumFractionDigits: 4 });
+  return n.toPrecision(6);
+}

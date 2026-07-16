@@ -53,13 +53,20 @@
     Disconnected from node — retrying…</div>
 
   <nav class="nav" aria-label="Sections">
-    <a class="nav-item active" href="#" aria-current="page">Dashboard</a>
-    <span class="nav-item planned">Explorer <em>planned</em></span>
+    <a class="nav-item" data-nav="dashboard" href="#/">Dashboard</a>
+    <a class="nav-item" data-nav="explorer" href="#/explorer">Explorer</a>
     <span class="nav-item planned">Peers <em>planned</em></span>
     <span class="nav-item planned">Console <em>planned</em></span>
+    <form id="search-form" class="nav-search" role="search">
+      <input id="search-input" type="search" placeholder="height · block hash · txid"
+             spellcheck="false" autocomplete="off"
+             aria-label="Search for a block height, block hash, or transaction id">
+    </form>
   </nav>
 
-  <main class="grid">
+  <div id="search-error" class="banner banner-bad" role="alert" hidden></div>
+
+  <main class="grid" id="view-dashboard">
     <section class="card card-sync" aria-label="Sync status">
       <h2 class="card-title">Sync
         <span id="ibd-flag" class="pill" hidden>IBD</span>
@@ -132,6 +139,20 @@
       </div>
     </section>
   </main>
+
+  <!-- Explorer (gui-plan P2): landing, block page, tx page -->
+  <main class="grid" id="view-explorer" hidden>
+    <section class="card card-full">
+      <h2 class="card-title">Explorer</h2>
+      <p class="explorer-lead">Look up a <strong>block</strong> by height or hash, or a
+      <strong>transaction</strong> by txid, with the search box in the navigation bar.</p>
+      <p class="muted">Every page is a permalink: <span class="mono">#/block/&lt;hash&gt;</span>,
+      <span class="mono">#/block-height/&lt;n&gt;</span>, and
+      <span class="mono">#/tx/&lt;txid&gt;</span> deep-link directly and survive reload.</p>
+    </section>
+  </main>
+  <main class="grid" id="view-block" hidden></main>
+  <main class="grid" id="view-tx" hidden></main>
 
   <footer class="foot muted">
     <span id="node-version" class="mono">—</span>
