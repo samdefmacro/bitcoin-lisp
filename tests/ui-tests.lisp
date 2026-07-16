@@ -97,6 +97,30 @@ shell wires in the explorer views + universal search box."
       (is (search "view-explorer" html))
       (is (search "search-form" html)))))
 
+(test ui-handle-serves-peers-assets
+  "The P3 peers module is served with the JS content type, the shell wires
+in the peers view + nav link + networking-disabled banner, and every RPC
+method the page calls is a registered dispatcher method. (The page's
+rendering/sort/action behavior is covered by the zero-dependency node
+harness in tests/ui/peers.test.mjs — run: node --test tests/ui/peers.test.mjs.)"
+  (with-ui-reply ()
+    (let ((body (bitcoin-lisp.rpc::ui-handle "/ui/js/peers.js")))
+      (is (= 200 (hunchentoot:return-code*)))
+      (is (alexandria:starts-with-subseq "text/javascript"
+                                         (hunchentoot:content-type*)))
+      (is (plusp (length body)))))
+  (with-ui-reply ()
+    (let* ((body (bitcoin-lisp.rpc::ui-handle "/ui/index.html"))
+           (html (flexi-streams:octets-to-string body :external-format :utf-8)))
+      (is (search "view-peers" html))
+      (is (search "#/peers" html))
+      (is (search "net-banner" html))))
+  (bitcoin-lisp.rpc::register-all-methods)
+  (dolist (method '("getpeerinfo" "listbanned" "setban" "disconnectnode"
+                    "setnetworkactive" "getnetworkinfo"))
+    (is (not (null (gethash method bitcoin-lisp.rpc::*rpc-methods*)))
+        "RPC method ~S (called by the peers page) must be registered" method)))
+
 (test ui-handle-404s
   "Missing files, traversal attempts, and directories are all 404."
   (dolist (path '("/ui/nope.js"
