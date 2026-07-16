@@ -82,6 +82,10 @@ we cap lower). Excess inbound connections are disconnected at merge time.")
   (tx-index nil)  ; Transaction index (optional, for getrawtransaction)
   (blockfilterindex nil)  ; BIP158 basic block filter index (optional)
   (coinstatsindex nil)  ; per-height UTXO stats + MuHash index (optional)
+  ;; Wallet manager (bitcoin-lisp.rpc:wallet-manager) fanning RPCs out to
+  ;; loaded wallets by name; NIL when wallet support is disabled (mainnet
+  ;; default). Wallet P1, docs/wallet-plan.md §4.
+  (wallet-manager nil)
   (fee-estimator nil)  ; Fee rate estimator for estimatesmartfee
   (address-book nil)  ; Persistent peer address database
   (recent-rejects nil)  ; Recently rejected transaction filter (DoS protection)
@@ -1185,7 +1189,8 @@ index is enabled."
                         (tx-reconciliation nil)
                         (webui nil webui-supplied-p)
                         (webui-path nil)
-                        (webui-open nil))
+                        (webui-open nil)
+                        (wallet nil wallet-supplied-p))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -1215,6 +1220,10 @@ WEBUI: Serve the web UI at /ui/ on the RPC port (docs/gui-plan.md P0).
 WEBUI-PATH: Web UI asset directory (nil = the repo's ui/ directory)
 WEBUI-OPEN: If T (default nil), open http://localhost:<rpcport>/ui/ in the
   local browser after the RPC server starts — the local-daemon pattern
+WALLET: Enable descriptor-wallet support (createwallet/loadwallet/... RPCs,
+  per-wallet storage under <datadir>/wallets/). Default: on for every network
+  except mainnet, where holding keys is the operator's explicit opt-in
+  (docs/wallet-plan.md §1 deployment posture)
 
 Returns the node instance."
   (when *node*
@@ -1545,6 +1554,20 @@ Returns the node instance."
   ;; Initialize secp256k1
   (log-info "Initializing cryptographic context...")
   (bitcoin-lisp.crypto:ensure-secp256k1-loaded)
+
+  ;; Wallet support (wallet P1). Default: enabled everywhere except mainnet,
+  ;; where holding keys on an internet-facing node is the operator's explicit
+  ;; opt-in (-wallet), mirroring the relay/-webui safety pattern. Wallets are
+  ;; not auto-loaded; use createwallet/loadwallet.
+  (let ((wallet-enabled (if wallet-supplied-p
+                            (and wallet t)
+                            (not (eq network :mainnet)))))
+    (when wallet-enabled
+      (setf (node-wallet-manager *node*)
+            (bitcoin-lisp.rpc:init-wallet-manager (node-data-directory *node*)
+                                                  network))
+      (log-info "Wallet support enabled (descriptor wallets under ~A)"
+                (merge-pathnames "wallets/" (node-data-directory *node*)))))
 
   (setf (node-running *node*) t)
 
@@ -2406,6 +2429,12 @@ Phase 1."
     (bitcoin-lisp.networking:save-address-book
      (node-address-book *node*)
      (bitcoin-lisp.networking:peers-dat-path (node-data-directory *node*))))
+
+  ;; Unload wallets (writes each wallet's best-block marker, closes its DB)
+  (when (node-wallet-manager *node*)
+    (log-info "Unloading wallets...")
+    (bitcoin-lisp.rpc:close-wallet-manager (node-wallet-manager *node*))
+    (setf (node-wallet-manager *node*) nil))
 
   ;; Close transaction index
   (when (node-tx-index *node*)
