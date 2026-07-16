@@ -96,6 +96,8 @@
                                (:file "accessors")
                                (:file "descriptors")
                                (:file "methods")
+                               (:file "wallet-store")
+                               (:file "wallet")
                                (:file "psbt")
                                (:file "merkleproof")
                                (:file "rest")
@@ -229,6 +231,8 @@
                              ;; Chainstate list + selection accessors + storage suffix
                              (:file "chainstate-tests")
                              ;; Assumeutxo P4: dual chainstate + background IBD
-                             (:file "assumeutxo-tests"))))
+                             (:file "assumeutxo-tests")
+                             ;; Wallet P1: container + keystore + wallet RPCs
+                             (:file "wallet-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

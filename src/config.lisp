@@ -551,6 +551,7 @@ signet|regtest, else returns DEFAULT."
     ("webui"             :webui              :bool)
     ("webuipath"         :webui-path         :string)
     ("webuiopen"         :webui-open         :bool)
+    ("wallet"            :wallet             :bool)
     ("logfile"           :log-file           :string)
     ("loglevel"          :log-level          :loglevel)
     ("sync"              :sync               :bool))
