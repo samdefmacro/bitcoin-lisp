@@ -166,7 +166,19 @@
   ;; Block statistics
   (register-rpc-method "getblockstats" #'rpc-getblockstats)
   ;; Pruning
-  (register-rpc-method "pruneblockchain" #'rpc-pruneblockchain))
+  (register-rpc-method "pruneblockchain" #'rpc-pruneblockchain)
+  ;; Wallet (wallet P1; handlers reject with method-not-found when the node
+  ;; runs without wallet support, matching a no-wallet Core build)
+  (register-rpc-method "createwallet" #'rpc-createwallet)
+  (register-rpc-method "loadwallet" #'rpc-loadwallet)
+  (register-rpc-method "unloadwallet" #'rpc-unloadwallet)
+  (register-rpc-method "listwallets" #'rpc-listwallets)
+  (register-rpc-method "listwalletdir" #'rpc-listwalletdir)
+  (register-rpc-method "getwalletinfo" #'rpc-getwalletinfo)
+  (register-rpc-method "getnewaddress" #'rpc-getnewaddress)
+  (register-rpc-method "getrawchangeaddress" #'rpc-getrawchangeaddress)
+  (register-rpc-method "listdescriptors" #'rpc-listdescriptors)
+  (register-rpc-method "importdescriptors" #'rpc-importdescriptors))
 
 ;;; --- JSON-RPC Request/Response Handling ---
 
@@ -440,9 +452,12 @@ clients (bitcoin-cli, curl) send no Origin at all and always pass."
         (setf (hunchentoot:return-code*) hunchentoot:+http-unsupported-media-type+)
         (return-from rpc-handler "")))
 
-    ;; Process request
+    ;; Process request. A /wallet/<name> endpoint routes wallet RPCs to that
+    ;; wallet (Core httprpc.cpp:340 registers the same handler under
+    ;; /wallet/); non-wallet methods ignore the binding.
     (setf (hunchentoot:content-type*) "application/json")
-    (let ((body (hunchentoot:raw-post-data :force-text t)))
+    (let ((*rpc-wallet-name* (wallet-name-from-uri (hunchentoot:script-name*)))
+          (body (hunchentoot:raw-post-data :force-text t)))
       ;; Post-read body size check (in case Content-Length was absent or wrong)
       (when (and body (> (length body) bitcoin-lisp:+max-rpc-body-size+))
         (return-from rpc-handler
