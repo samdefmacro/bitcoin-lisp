@@ -335,10 +335,12 @@ CTX is the surrounding context: :top :sh :wsh :wpkh :tr."
       (when (logbitp 31 i)
         (write-char (if apostrophe #\' #\h) s)))))
 
-(defun desc-key-string (key)
+(defun desc-key-string (key &optional (style :public))
   "The canonical public string form of KEY: origins preserved, xprv shown as
-xpub, WIF as its hex pubkey, hardened markers in the style used on input."
-  (let ((apostrophe (desc-key-apostrophe key)))
+xpub, WIF as its hex pubkey, hardened markers in the style used on input.
+STYLE :compat forces apostrophe hardened markers (Core's StringType::COMPAT,
+used only for DescriptorID stability across versions)."
+  (let ((apostrophe (if (eq style :compat) t (desc-key-apostrophe key))))
     (concatenate
      'string
      (if (desc-key-origin-fingerprint key)
@@ -370,7 +372,11 @@ public-only descriptor) or hit an invalid BIP32 child."))
 (defun %desc-key-pubkey-at (key pos)
   "The pubkey bytes KEY produces at range position POS (Core GetPubKey).
 Signals descriptor-derivation-error when hardened derivation is required but
-only public key material is available."
+only public key material is available.
+
+Note: %desc-key-pubkey-at-cached below performs the same derivation through
+the wallet's persistent xpub cache (Core folds both into one GetPubKey with
+optional caches); keep the two derivation paths in sync."
   (if (desc-key-pubkey key)
       (desc-key-pubkey key)
       (let* ((hardened (or (eq (desc-key-derive key) :hardened)
@@ -578,21 +584,57 @@ Core getdescriptorinfo's hasprivatekeys (provider.keys non-empty)."
   (or (some #'desc-key-has-privkey-p (out-desc-keys desc))
       (and (out-desc-sub desc) (out-desc-has-privkeys-p (out-desc-sub desc)))))
 
-(defun out-desc-string (desc)
-  "The canonical public descriptor body (no checksum): private keys replaced
-by their public forms, origins and hardened-marker style preserved."
+(defun %out-desc-string-walk (desc keyfn)
+  "The descriptor body of DESC with each key expression rendered by
+(KEYFN desc-key) — the one structural walker behind the public/compat,
+private, and normalized string forms (Core's ToStringHelper, parameterized
+by StringType, descriptor.cpp:909)."
   (ecase (out-desc-kind desc)
     (:addr (format nil "addr(~A)" (out-desc-address desc)))
     (:raw (format nil "raw(~A)" (bitcoin-lisp.crypto:bytes-to-hex (out-desc-script desc))))
     ((:pk :pkh :wpkh :combo :tr :rawtr)
      (format nil "~(~A~)(~A)" (out-desc-kind desc)
-             (desc-key-string (first (out-desc-keys desc)))))
+             (funcall keyfn (first (out-desc-keys desc)))))
     ((:multi :sortedmulti)
      (format nil "~(~A~)(~D~{,~A~})" (out-desc-kind desc) (out-desc-threshold desc)
-             (mapcar #'desc-key-string (out-desc-keys desc))))
+             (mapcar keyfn (out-desc-keys desc))))
     ((:sh :wsh)
      (format nil "~(~A~)(~A)" (out-desc-kind desc)
-             (out-desc-string (out-desc-sub desc))))))
+             (%out-desc-string-walk (out-desc-sub desc) keyfn)))))
+
+(defun out-desc-string (desc &optional (style :public))
+  "The canonical public descriptor body (no checksum): private keys replaced
+by their public forms, origins and hardened-marker style preserved. STYLE
+:compat forces apostrophe hardened markers (Core StringType::COMPAT)."
+  (%out-desc-string-walk desc (lambda (k) (desc-key-string k style))))
+
+(defun descriptor-id (desc)
+  "The 32-byte descriptor ID: single SHA256 over the checksummed public string
+in COMPAT format — apostrophe hardened markers regardless of input style
+(Core DescriptorID, descriptor.cpp:2902: desc.ToString(/*compat_format=*/true)
+then CSHA256 over the string). Keys wallet records for this descriptor."
+  (bitcoin-lisp.crypto:sha256
+   (flexi-streams:string-to-octets
+    (descriptor-add-checksum (out-desc-string desc :compat))
+    :external-format :ascii)))
+
+;;; --- Key expression enumeration (Core's m_expr_index) ---
+
+(defun out-desc-ordered-keys (desc)
+  "All desc-keys of DESC in parse order — the order Core assigns m_expr_index
+to PubkeyProviders. Our grammar never mixes keys and subscripts in one node,
+so this is simply the node's keys or its subscript's."
+  (if (out-desc-sub desc)
+      (out-desc-ordered-keys (out-desc-sub desc))
+      (out-desc-keys desc)))
+
+(defun out-desc-key-indexes (desc)
+  "EQ map from each desc-key of DESC to its key expression index."
+  (let ((table (make-hash-table :test 'eq)))
+    (loop for key in (out-desc-ordered-keys desc)
+          for i from 0
+          do (setf (gethash key table) i))
+    table))
 
 ;;; --- Script construction ---
 
@@ -646,31 +688,31 @@ minimal 1-byte push (CScript << int64_t for the 1..20 range used here)."
   "The 32-byte x-only form of a 33-byte compressed pubkey."
   (subseq pubkey 1 33))
 
-(defun %out-desc-expand-uncached (desc pos)
-  "Expand DESC at range position POS into its scriptPubKey list (Core Expand)."
+(defun %out-desc-expand-1 (desc pos keyfn)
+  "Expand DESC at range position POS into its scriptPubKey list (Core Expand),
+resolving each key expression's pubkey via (KEYFN desc-key)."
   (ecase (out-desc-kind desc)
     ((:addr :raw) (list (out-desc-script desc)))
-    (:pk (list (%script-p2pk (%desc-key-pubkey-at (first (out-desc-keys desc)) pos))))
-    (:pkh (list (%script-p2pkh (%desc-key-pubkey-at (first (out-desc-keys desc)) pos))))
-    (:wpkh (list (%script-p2wpkh (%desc-key-pubkey-at (first (out-desc-keys desc)) pos))))
+    (:pk (list (%script-p2pk (funcall keyfn (first (out-desc-keys desc))))))
+    (:pkh (list (%script-p2pkh (funcall keyfn (first (out-desc-keys desc))))))
+    (:wpkh (list (%script-p2wpkh (funcall keyfn (first (out-desc-keys desc))))))
     (:combo
-     (let ((key (%desc-key-pubkey-at (first (out-desc-keys desc)) pos)))
+     (let ((key (funcall keyfn (first (out-desc-keys desc)))))
        (append (list (%script-p2pk key)
                      (%script-p2pkh key))
                (when (= (length key) 33)
                  (list (%script-p2wpkh key)
                        (%script-p2sh (%script-p2wpkh key)))))))
     ((:multi :sortedmulti)
-     (let ((pubkeys (mapcar (lambda (k) (%desc-key-pubkey-at k pos))
-                            (out-desc-keys desc))))
+     (let ((pubkeys (mapcar keyfn (out-desc-keys desc))))
        (when (eq (out-desc-kind desc) :sortedmulti)
          (setf pubkeys (sort (copy-list pubkeys) #'%pubkey-lessp)))
        (list (%script-multisig (out-desc-threshold desc) pubkeys))))
-    (:sh (list (%script-p2sh (first (%out-desc-expand-uncached (out-desc-sub desc) pos)))))
-    (:wsh (list (%script-p2wsh (first (%out-desc-expand-uncached (out-desc-sub desc) pos)))))
+    (:sh (list (%script-p2sh (first (%out-desc-expand-1 (out-desc-sub desc) pos keyfn)))))
+    (:wsh (list (%script-p2wsh (first (%out-desc-expand-1 (out-desc-sub desc) pos keyfn)))))
     (:tr
      (let* ((internal (%key-xonly-bytes
-                       (%desc-key-pubkey-at (first (out-desc-keys desc)) pos)))
+                       (funcall keyfn (first (out-desc-keys desc)))))
             (tweak (bitcoin-lisp.crypto:tap-tweak-hash internal))
             (output-key (bitcoin-lisp.crypto:tweak-xonly-pubkey internal tweak)))
        (unless output-key
@@ -678,7 +720,11 @@ minimal 1-byte push (CScript << int64_t for the 1..20 range used here)."
        (list (%script-p2tr output-key))))
     (:rawtr
      (list (%script-p2tr (%key-xonly-bytes
-                          (%desc-key-pubkey-at (first (out-desc-keys desc)) pos)))))))
+                          (funcall keyfn (first (out-desc-keys desc)))))))))
+
+(defun %out-desc-expand-uncached (desc pos)
+  "Expand DESC at range position POS into its scriptPubKey list (Core Expand)."
+  (%out-desc-expand-1 desc pos (lambda (k) (%desc-key-pubkey-at k pos))))
 
 ;;; --- Expansion cache (Core DescriptorCache intent: repeat expansion of a
 ;;; ranged descriptor at the same index must not redo EC derivation; a bounded
@@ -718,6 +764,374 @@ public-only form."
               (clrhash *descriptor-expansion-cache*))
             (setf (gethash key *descriptor-expansion-cache*) scripts))
           scripts))))
+
+;;; --- DescriptorCache (Core descriptor.h DescriptorCache) ---
+;;;
+;;; The wallet's persistent expansion cache: per key expression index it holds
+;;; the PARENT xpub (the extended key at the end of the fixed derivation path),
+;;; DERIVED child xpubs per range position (only for hardened-ranged /*h keys),
+;;; and the LAST-HARDENED xpub along the path. With these cached, a descriptor
+;;; whose fixed path contains hardened steps (e.g. the default wallets'
+;;; .../84h/1h/0h/0/*) expands without private keys. Persisted by the wallet
+;;; as walletdescriptorcache / walletdescriptorlhcache records (wallet P1).
+
+(defstruct descriptor-cache
+  "Cached xpubs for one descriptor (Core DescriptorCache). All tables map a
+key expression index (m_expr_index) to ext-key structs; derived-xpubs maps to
+an inner table keyed by derivation (range) index."
+  (parent-xpubs (make-hash-table :test 'eql) :type hash-table)
+  (derived-xpubs (make-hash-table :test 'eql) :type hash-table)
+  (last-hardened-xpubs (make-hash-table :test 'eql) :type hash-table))
+
+(defun descriptor-cache-parent (cache expr-index)
+  (gethash expr-index (descriptor-cache-parent-xpubs cache)))
+
+(defun (setf descriptor-cache-parent) (xpub cache expr-index)
+  (setf (gethash expr-index (descriptor-cache-parent-xpubs cache)) xpub))
+
+(defun descriptor-cache-derived (cache expr-index der-index)
+  (let ((inner (gethash expr-index (descriptor-cache-derived-xpubs cache))))
+    (and inner (gethash der-index inner))))
+
+(defun (setf descriptor-cache-derived) (xpub cache expr-index der-index)
+  (let ((inner (or (gethash expr-index (descriptor-cache-derived-xpubs cache))
+                   (setf (gethash expr-index (descriptor-cache-derived-xpubs cache))
+                         (make-hash-table :test 'eql)))))
+    (setf (gethash der-index inner) xpub)))
+
+(defun descriptor-cache-last-hardened (cache expr-index)
+  (gethash expr-index (descriptor-cache-last-hardened-xpubs cache)))
+
+(defun (setf descriptor-cache-last-hardened) (xpub cache expr-index)
+  (setf (gethash expr-index (descriptor-cache-last-hardened-xpubs cache)) xpub))
+
+(defun %ext-key-equal-p (a b)
+  (and (= (bitcoin-lisp.crypto:ext-key-depth a)
+          (bitcoin-lisp.crypto:ext-key-depth b))
+       (= (bitcoin-lisp.crypto:ext-key-parent-fingerprint a)
+          (bitcoin-lisp.crypto:ext-key-parent-fingerprint b))
+       (= (bitcoin-lisp.crypto:ext-key-child-number a)
+          (bitcoin-lisp.crypto:ext-key-child-number b))
+       (equalp (bitcoin-lisp.crypto:ext-key-chain-code a)
+               (bitcoin-lisp.crypto:ext-key-chain-code b))
+       (equalp (bitcoin-lisp.crypto:ext-key-key a)
+               (bitcoin-lisp.crypto:ext-key-key b))))
+
+(defun descriptor-cache-merge-and-diff (cache new-items)
+  "Merge NEW-ITEMS into CACHE and return a fresh descriptor-cache holding only
+the entries that were actually new (Core DescriptorCache::MergeAndDiff). A
+conflicting entry — same slot, different xpub — signals an error, matching
+Core's cache-corruption check."
+  (let ((diff (make-descriptor-cache)))
+    (maphash (lambda (expr-index xpub)
+               (let ((existing (descriptor-cache-parent cache expr-index)))
+                 (cond ((null existing)
+                        (setf (descriptor-cache-parent cache expr-index) xpub
+                              (descriptor-cache-parent diff expr-index) xpub))
+                       ((not (%ext-key-equal-p existing xpub))
+                        (error "Attempted to overwrite a cached parent xpub with a different one")))))
+             (descriptor-cache-parent-xpubs new-items))
+    (maphash (lambda (expr-index inner)
+               (maphash (lambda (der-index xpub)
+                          (let ((existing (descriptor-cache-derived cache expr-index der-index)))
+                            (cond ((null existing)
+                                   (setf (descriptor-cache-derived cache expr-index der-index) xpub
+                                         (descriptor-cache-derived diff expr-index der-index) xpub))
+                                  ((not (%ext-key-equal-p existing xpub))
+                                   (error "Attempted to overwrite a cached derived xpub with a different one")))))
+                        inner))
+             (descriptor-cache-derived-xpubs new-items))
+    (maphash (lambda (expr-index xpub)
+               (let ((existing (descriptor-cache-last-hardened cache expr-index)))
+                 (cond ((null existing)
+                        (setf (descriptor-cache-last-hardened cache expr-index) xpub
+                              (descriptor-cache-last-hardened diff expr-index) xpub))
+                       ((not (%ext-key-equal-p existing xpub))
+                        (error "Attempted to overwrite a cached last hardened xpub with a different one")))))
+             (descriptor-cache-last-hardened-xpubs new-items))
+    diff))
+
+;;; --- Cache/provider-aware key expansion (Core BIP32PubkeyProvider::GetPubKey) ---
+
+(defun %desc-key-root-keyid (key)
+  "hash160 of the root pubkey of a BIP32 key expression — the CKeyID under
+which the wallet stores the root private key."
+  (bitcoin-lisp.crypto:hash160
+   (bitcoin-lisp.crypto:ext-key-public-bytes (desc-key-extkey key))))
+
+(defun %desc-key-root-xprv (key privkey-provider)
+  "The root extended PRIVATE key for a BIP32 key expression, or NIL. Prefers
+the xprv embedded at parse time; otherwise reconstructs it from the 32-byte
+secret PRIVKEY-PROVIDER returns for the root pubkey's keyid (Core
+BIP32PubkeyProvider::GetExtKey: copy depth/fingerprint/child/chaincode from
+the xpub, substitute the private key material)."
+  (or (desc-key-ext-privkey key)
+      (when privkey-provider
+        (let* ((pub (desc-key-extkey key))
+               (priv (funcall privkey-provider (%desc-key-root-keyid key))))
+          (when priv
+            (bitcoin-lisp.crypto:make-ext-key
+             :version (if (= (bitcoin-lisp.crypto:ext-key-version pub)
+                             bitcoin-lisp.crypto:+xpub-mainnet+)
+                          bitcoin-lisp.crypto:+xprv-mainnet+
+                          bitcoin-lisp.crypto:+xprv-testnet+)
+             :depth (bitcoin-lisp.crypto:ext-key-depth pub)
+             :parent-fingerprint (bitcoin-lisp.crypto:ext-key-parent-fingerprint pub)
+             :child-number (bitcoin-lisp.crypto:ext-key-child-number pub)
+             :chain-code (bitcoin-lisp.crypto:ext-key-chain-code pub)
+             :key (concatenate '(vector (unsigned-byte 8)) #(0) priv)
+             :privatep t))))))
+
+(defun %desc-key-pubkey-at-cached (key expr-index pos read-cache write-cache privkey-provider)
+  "The pubkey KEY produces at POS, via the wallet cache machinery (Core
+BIP32PubkeyProvider::GetPubKey, descriptor.cpp:425-485). With READ-CACHE, only
+cached xpubs are consulted (Core ExpandFromCache) — a miss signals
+descriptor-derivation-error. Without it, hardened derivation pulls the root
+xprv from PRIVKEY-PROVIDER, and WRITE-CACHE (when given) collects the parent /
+derived / last-hardened xpubs exactly as Core caches them."
+  (when (desc-key-pubkey key)
+    (return-from %desc-key-pubkey-at-cached (desc-key-pubkey key)))
+  (let* ((path (desc-key-path key))
+         (derive (desc-key-derive key))
+         (hardened-p (or (eq derive :hardened)
+                         (some (lambda (i) (logbitp 31 i)) path)))
+         (final nil)
+         (parent nil)
+         (last-hardened nil))
+    (handler-case
+        (cond
+          (read-cache
+           (let ((cached (descriptor-cache-derived read-cache expr-index pos)))
+             (cond (cached (setf final cached))
+                   ((eq derive :hardened) (error 'descriptor-derivation-error))
+                   (t (let ((p (descriptor-cache-parent read-cache expr-index)))
+                        (unless p (error 'descriptor-derivation-error))
+                        (setf final (if (eq derive :unhardened)
+                                        (bitcoin-lisp.crypto:bip32-derive-child p pos)
+                                        p)))))))
+          (hardened-p
+           (let ((xprv (%desc-key-root-xprv key privkey-provider)))
+             (unless xprv (error 'descriptor-derivation-error))
+             (let ((k xprv) (lh nil))
+               (dolist (entry path)
+                 (setf k (bitcoin-lisp.crypto:bip32-derive-child k entry))
+                 (when (logbitp 31 entry) (setf lh k)))
+               (setf parent (bitcoin-lisp.crypto:bip32-neuter k))
+               (ecase derive
+                 (:none)
+                 (:unhardened
+                  (setf k (bitcoin-lisp.crypto:bip32-derive-child k pos)))
+                 (:hardened
+                  (setf k (bitcoin-lisp.crypto:bip32-derive-child
+                           k (+ pos bitcoin-lisp.crypto:+bip32-hardened+)))))
+               (setf final (bitcoin-lisp.crypto:bip32-neuter k))
+               (when lh (setf last-hardened (bitcoin-lisp.crypto:bip32-neuter lh))))))
+          (t
+           (let ((k (desc-key-extkey key)))
+             (dolist (entry path)
+               (setf k (bitcoin-lisp.crypto:bip32-derive-child k entry)))
+             (setf parent k)
+             (setf final (if (eq derive :unhardened)
+                             (bitcoin-lisp.crypto:bip32-derive-child k pos)
+                             k)))))
+      (descriptor-derivation-error (e) (error e))
+      (error () (error 'descriptor-derivation-error)))
+    (when write-cache
+      ;; Only cache the parent when there is any unhardened derivation; a
+      ;; hardened-ranged terminal caches the derived child instead
+      ;; (descriptor.cpp:471-483).
+      (if (not (eq derive :hardened))
+          (progn
+            (setf (descriptor-cache-parent write-cache expr-index) parent)
+            (when last-hardened
+              (setf (descriptor-cache-last-hardened write-cache expr-index)
+                    last-hardened)))
+          (setf (descriptor-cache-derived write-cache expr-index pos) final)))
+    (bitcoin-lisp.crypto:ext-key-public-bytes final)))
+
+(defun %out-desc-expand-cached (desc pos &key read-cache write-cache privkey-provider)
+  "Expand DESC at POS through the wallet cache machinery. Returns
+(values scripts pubkeys) where PUBKEYS lists the derived pubkey per key
+expression, in expression order (feeds the SPKM's pubkey map). Signals
+descriptor-derivation-error when a needed cache entry or private key is
+missing (Core Expand/ExpandFromCache returning false)."
+  (let ((indexes (out-desc-key-indexes desc))
+        (pubkeys '()))
+    (let ((scripts (%out-desc-expand-1
+                    desc pos
+                    (lambda (key)
+                      (let ((pk (%desc-key-pubkey-at-cached
+                                 key (gethash key indexes) pos
+                                 read-cache write-cache privkey-provider)))
+                        (push pk pubkeys)
+                        pk)))))
+      (values scripts (nreverse pubkeys)))))
+
+(defun out-desc-expand-from-cache (desc pos cache)
+  "Expand DESC at POS strictly from CACHE (Core ExpandFromCache). Returns
+(values scripts pubkeys), or NIL when the cache lacks a needed xpub."
+  (handler-case (%out-desc-expand-cached desc pos :read-cache cache)
+    (descriptor-derivation-error () nil)))
+
+(defun out-desc-expand-with-provider (desc pos privkey-provider write-cache)
+  "Expand DESC at POS deriving from key material — PRIVKEY-PROVIDER maps a
+20-byte keyid to a 32-byte secret (or NIL) — collecting new cache entries into
+WRITE-CACHE (Core Expand with a write cache). Signals
+descriptor-derivation-error when required private keys are unavailable."
+  (%out-desc-expand-cached desc pos :write-cache write-cache
+                                    :privkey-provider privkey-provider))
+
+;;; --- Private / normalized descriptor strings (Core ToPrivateString /
+;;; ToNormalizedString) ---
+
+(defun %desc-key-privkey-for (key privkey-provider)
+  "The (values priv32 compressed-p) for a const-pubkey KEY, from the parse
+itself or PRIVKEY-PROVIDER. X-only keys try both parities (Core
+XOnlyPubKey::GetKeyIDs)."
+  (cond
+    ((desc-key-privkey key)
+     (values (desc-key-privkey key) (desc-key-compressed-p key)))
+    ((null privkey-provider) nil)
+    ((desc-key-xonly-p key)
+     (let ((x (subseq (desc-key-pubkey key) 1)))
+       (dolist (prefix '(2 3))
+         (let* ((full (concatenate '(vector (unsigned-byte 8))
+                                   (vector prefix) x))
+                (priv (funcall privkey-provider
+                               (bitcoin-lisp.crypto:hash160 full))))
+           (when priv (return (values priv t)))))))
+    (t
+     (let ((priv (funcall privkey-provider
+                          (bitcoin-lisp.crypto:hash160 (desc-key-pubkey key)))))
+       (when priv (values priv (= (length (desc-key-pubkey key)) 33)))))))
+
+(defun desc-key-private-string (key network privkey-provider)
+  "KEY's private string form (Core PubkeyProvider::ToPrivateString): WIF for
+const keys, xprv for BIP32 keys, hardened markers in input style. Returns
+(values string has-priv-p); without private material the public form is
+returned with HAS-PRIV-P nil."
+  (let ((origin (if (desc-key-origin-fingerprint key)
+                    (format nil "[~A~A]"
+                            (bitcoin-lisp.crypto:bytes-to-hex
+                             (desc-key-origin-fingerprint key))
+                            (%format-key-path (desc-key-origin-path key)
+                                              (desc-key-apostrophe key)))
+                    "")))
+    (if (desc-key-pubkey key)
+        (multiple-value-bind (priv compressed)
+            (%desc-key-privkey-for key privkey-provider)
+          (if priv
+              (values (concatenate 'string origin
+                                   (bitcoin-lisp.crypto:private-key-to-wif
+                                    priv
+                                    :network (if (eq network :mainnet) :mainnet :testnet)
+                                    :compressed compressed))
+                      t)
+              (values (desc-key-string key) nil)))
+        (let ((xprv (%desc-key-root-xprv key privkey-provider)))
+          (if xprv
+              (values (concatenate
+                       'string origin
+                       (bitcoin-lisp.crypto:bip32-serialize xprv)
+                       (%format-key-path (desc-key-path key)
+                                         (desc-key-apostrophe key))
+                       (ecase (desc-key-derive key)
+                         (:none "")
+                         (:unhardened "/*")
+                         (:hardened (if (desc-key-apostrophe key) "/*'" "/*h"))))
+                      t)
+              (values (desc-key-string key) nil))))))
+
+(defun desc-key-normalized-string (key expr-index cache privkey-provider)
+  "KEY's normalized public form (Core ToNormalizedString): BIP32 keys with
+hardened steps in their fixed path are rewritten as
+[fingerprint/path-to-last-hardened]xpub-at-last-hardened/rest/*, merging with
+any existing origin; hardened markers normalize to 'h'. Returns (values
+string ok-p) — OK-P nil when the last-hardened xpub is unavailable (no cache
+entry and no private key)."
+  (flet ((wrap-origin (sub)
+           ;; Core OriginPubkeyProvider::ToNormalizedString: merge our origin
+           ;; with an origin the inner normalization produced.
+           (if (desc-key-origin-fingerprint key)
+               (let ((origin (format nil "~A~A"
+                                     (bitcoin-lisp.crypto:bytes-to-hex
+                                      (desc-key-origin-fingerprint key))
+                                     (%format-key-path (desc-key-origin-path key) nil))))
+                 (if (and (plusp (length sub)) (char= (char sub 0) #\[))
+                     ;; strip "[" + 8-char fingerprint from SUB, keep its path
+                     (concatenate 'string "[" origin (subseq sub 9))
+                     (concatenate 'string "[" origin "]" sub)))
+               sub)))
+    (cond
+      ;; Const pubkeys normalize to their public form.
+      ((desc-key-pubkey key)
+       (values (wrap-origin (desc-key-string key)) t))
+      ;; Hardened-ranged: print public as-is with normalized markers.
+      ((eq (desc-key-derive key) :hardened)
+       (values (wrap-origin
+                (concatenate 'string
+                             (bitcoin-lisp.crypto:bip32-serialize (desc-key-extkey key))
+                             (%format-key-path (desc-key-path key) nil)
+                             "/*h"))
+               t))
+      (t
+       (let* ((path (desc-key-path key))
+              (last-hardened-pos (position-if (lambda (i) (logbitp 31 i)) path
+                                              :from-end t)))
+         (if (null last-hardened-pos)
+             ;; No hardened derivation: the plain public form.
+             (values (wrap-origin (desc-key-string key)) t)
+             (let* ((origin-path (subseq path 0 (1+ last-hardened-pos)))
+                    (end-path (subseq path (1+ last-hardened-pos)))
+                    (fingerprint (subseq (%desc-key-root-keyid key) 0 4))
+                    (xpub (or (and cache (descriptor-cache-last-hardened cache expr-index))
+                              (let ((xprv (%desc-key-root-xprv key privkey-provider)))
+                                (when xprv
+                                  (let ((k xprv))
+                                    (dolist (entry origin-path
+                                                   (bitcoin-lisp.crypto:bip32-neuter k))
+                                      (setf k (bitcoin-lisp.crypto:bip32-derive-child
+                                               k entry)))))))))
+               (if (null xpub)
+                   (values (desc-key-string key) nil)
+                   (values (wrap-origin
+                            (concatenate
+                             'string
+                             "[" (bitcoin-lisp.crypto:bytes-to-hex fingerprint)
+                             (%format-key-path origin-path nil) "]"
+                             (bitcoin-lisp.crypto:bip32-serialize xpub)
+                             (%format-key-path end-path nil)
+                             (if (eq (desc-key-derive key) :unhardened) "/*" "")))
+                           t)))))))))
+
+(defun out-desc-string-private (desc network privkey-provider)
+  "The private descriptor body (Core ToPrivateString semantics): each key
+prints its private form when available, its public form otherwise. Returns
+(values body any-priv-p)."
+  (let ((any nil))
+    (values (%out-desc-string-walk
+             desc
+             (lambda (key)
+               (multiple-value-bind (s ok)
+                   (desc-key-private-string key network privkey-provider)
+                 (when ok (setf any t))
+                 s)))
+            any)))
+
+(defun out-desc-string-normalized (desc cache privkey-provider)
+  "The normalized public descriptor body (Core ToNormalizedString). Returns
+(values body ok-p)."
+  (let ((indexes (out-desc-key-indexes desc))
+        (ok t))
+    (values (%out-desc-string-walk
+             desc
+             (lambda (key)
+               (multiple-value-bind (s key-ok)
+                   (desc-key-normalized-string key (gethash key indexes)
+                                               cache privkey-provider)
+                 (unless key-ok (setf ok nil))
+                 s)))
+            ok)))
 
 ;;; --- Range parameters (rpc/util.cpp ParseRange/ParseDescriptorRange) ---
 

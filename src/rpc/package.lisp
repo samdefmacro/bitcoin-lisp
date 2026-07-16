@@ -23,6 +23,10 @@
    #:register-rpc-method
    #:dispatch-rpc-method
 
+   ;; Wallet manager (wallet P1; owned by the node)
+   #:init-wallet-manager
+   #:close-wallet-manager
+
    ;; Error codes
    #:+rpc-parse-error+
    #:+rpc-invalid-request+
