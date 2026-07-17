@@ -99,6 +99,7 @@
                                (:file "wallet-store")
                                (:file "wallet")
                                (:file "wallet-tx")
+                               (:file "wallet-coins")
                                (:file "psbt")
                                (:file "merkleproof")
                                (:file "rest")
@@ -238,6 +239,9 @@
                              ;; Wallet P2: chain tracking (hooks, TxState,
                              ;; conflicts, rescan, tx RPCs)
                              (:file "wallet-chain-tests")
+                             ;; Wallet P3: balances, coins, labels,
+                             ;; getaddressinfo, abandontransaction
+                             (:file "wallet-balance-tests")
                              ;; Wave 10: RPC boolean/error-code parity, HTTP
                              ;; layer, BIP64 getutxos, config wires, arg
                              ;; handling, banlist persistence

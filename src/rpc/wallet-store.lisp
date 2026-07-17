@@ -31,6 +31,7 @@
 (alexandria:define-constant +wdb-key-bestblock-nomerkle+ "bestblock_nomerkle" :test #'equal)
 (alexandria:define-constant +wdb-key-name+ "name" :test #'equal)
 (alexandria:define-constant +wdb-key-purpose+ "purpose" :test #'equal)
+(alexandria:define-constant +wdb-key-destdata+ "destdata" :test #'equal)
 (alexandria:define-constant +wdb-key-flags+ "flags" :test #'equal)
 (alexandria:define-constant +wdb-key-mkey+ "mkey" :test #'equal)
 (alexandria:define-constant +wdb-key-orderposnext+ "orderposnext" :test #'equal)
@@ -230,6 +231,19 @@ CPubKey (compactsize-prefixed)."
   "Key for the address-book records name/purpose: type + address string."
   (%wser (s) (%wser-string s type)
              (%wser-string s address)))
+
+(defun wdb-key-destdata (address key)
+  "Key for a destination-data record: type + address string + data key
+string (walletdb.cpp WriteAddressPreviouslySpent uses the data key \"used\";
+receive requests use \"rr<id>\")."
+  (%wser (s) (%wser-string s +wdb-key-destdata+)
+             (%wser-string s address)
+             (%wser-string s key)))
+
+(defun wdb-parse-destdata-fields (fields)
+  "(values address data-key) from a destdata record key's field bytes."
+  (%wparse (s fields)
+    (values (%wread-string s) (%wread-string s))))
 
 (defun wdb-key-mkey (id)
   (%wser (s) (%wser-string s +wdb-key-mkey+)
