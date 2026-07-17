@@ -725,7 +725,7 @@ Mirrors Bitcoin Core net_processing.cpp:4126-4214 (reject_tx_invs,
 wtxidrelay-mismatch skip, AddTxAnnouncement, best_block tracking plus a
 single MaybeSendGetHeaders after the inv vector is fully scanned)."
   (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
-        (reject-tx-invs (or (not (relay-enabled-p))
+        (reject-tx-invs (or (ignore-incoming-txs-p)
                             (not (peer-relays-txs-p peer))))
         (num-wtxid-peers (count-wtxid-relay-peers peers))
         (wanted '())
@@ -1066,6 +1066,9 @@ addresses is misbehavior (net_processing.cpp:4046-4050)."
     (bitcoin-lisp:log-cat "net" "ignoring addr message from block-relay-only peer ~A"
                           (peer-address peer))
     (return-from handle-addr 0))
+  ;; First addr-related message from an inbound peer enables address relay
+  ;; (Core SetupAddressRelay; getpeerinfo addr_relay_enabled).
+  (when peer (setf (peer-addr-relay-enabled peer) t))
   (let ((entries '())
         (msg-count 0))
     (flexi-streams:with-input-from-sequence (stream payload)
@@ -1100,6 +1103,9 @@ block-relay-only peer (Core SetupAddressRelay)."
     (bitcoin-lisp:log-cat "net" "ignoring addrv2 message from block-relay-only peer ~A"
                           (peer-address peer))
     (return-from handle-addrv2 0))
+  ;; First addr-related message from an inbound peer enables address relay
+  ;; (Core SetupAddressRelay; getpeerinfo addr_relay_enabled).
+  (when peer (setf (peer-addr-relay-enabled peer) t))
   (multiple-value-bind (entries announced-count)
       (bitcoin-lisp.serialization:parse-addrv2-payload payload)
     (let ((added (%process-gossiped-addresses
@@ -1230,10 +1236,11 @@ over like any other (Core routes them through the same m_txrequest)."
                   &key recent-rejects)
   "Handle a tx message. Validate, add to mempool, and relay.
 RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
-  ;; A tx sent where we advertised fRelay=0 (blocksonly mainnet default,
-  ;; block-relay/feeler conns) violates the protocol: disconnect (Core
-  ;; RejectIncomingTxs gate in the TX handler, net_processing.cpp:4474-4479).
-  (when (or (not (relay-enabled-p))
+  ;; A tx sent where we advertised fRelay=0 (-blocksonly / relay-disabled
+  ;; mainnet default, block-relay/feeler conns) violates the protocol:
+  ;; disconnect (Core RejectIncomingTxs gate in the TX handler,
+  ;; net_processing.cpp:4474-4479).
+  (when (or (ignore-incoming-txs-p)
             (not (peer-relays-txs-p peer)))
     (bitcoin-lisp:log-cat "net" "transaction sent in violation of protocol — disconnecting peer ~A"
                           (peer-address peer))
@@ -1333,6 +1340,11 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                        mempool txid tx fee current-height
                        :sigops sigops :replaced replaced)
                     (when (eq result :ok)
+                      ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
+                      ;; stamped only on mempool ACCEPTANCE,
+                      ;; net_processing.cpp:4540).
+                      (setf (peer-last-tx-time peer)
+                            (bitcoin-lisp.serialization:get-unix-time))
                       ;; Relay to other peers
                       (when peers
                         (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
@@ -1716,6 +1728,11 @@ node's). The inbound-only + once-per-connection rules mirror Bitcoin Core's
 GETADDR handler (anti-fingerprinting and anti-spam) — the once flag latches as
 soon as the request arrives, before we build any response, so a peer can never
 elicit more than one reply regardless of whether we had addresses to send."
+  ;; getaddr is an addr-related message: it enables address relay with the
+  ;; peer unless the connection never does addr relay (block-relay-only) —
+  ;; Core SetupAddressRelay from the GETADDR handler.
+  (unless (eq (peer-conn-type peer) :block-relay)
+    (setf (peer-addr-relay-enabled peer) t))
   (when (and (peer-inbound peer)
              (not (peer-getaddr-sent peer)))
     (setf (peer-getaddr-sent peer) t)
@@ -1874,7 +1891,11 @@ peers except SOURCE-PEER. Nothing is sent here — flush-tx-announcements
 drains each peer's queue on its Poisson schedule (Core queues into
 m_tx_inventory_to_send exactly the same way). FEE-RATE is sat/vB, used
 against BIP133 feefilters at flush time. WTXID enables BIP339 MSG_WTX
-announcements. Does nothing if relay is disabled for the network."
+announcements. Does nothing if relay is disabled for the network — but is
+deliberately NOT gated on -blocksonly: a blocksonly node still announces
+its OWN (locally-submitted) transactions, exactly like Core, whose
+RelayTransaction has no ignore_incoming_txs check (incoming txs can't
+reach here anyway — their senders are disconnected)."
   (unless (relay-enabled-p)
     (return-from relay-transaction nil))
   (let ((fee-rate-per-kb (if fee-rate (* fee-rate 1000) 0)))
@@ -2072,7 +2093,9 @@ SOURCE-PEER (which already has it)."
 BIP 130: peers that sent sendheaders get a headers message (the cheaper
 announcement Core prefers); the rest get an inv. Gated on relay-enabled-p so a
 relay-disabled node (mainnet default) stays a non-participant. Without this the
-node validates blocks but never propagates them — a pure block sink."
+node validates blocks but never propagates them — a pure block sink.
+Deliberately NOT gated on -blocksonly: blocksonly is a TX-relay switch only;
+Core relays blocks normally under it."
   (unless (relay-enabled-p)
     (return-from relay-block nil))
   (let ((headers-msg (bitcoin-lisp.serialization:make-headers-message (list header)))
@@ -2175,9 +2198,16 @@ MSG_WITNESS_BLOCK downloads.")
   "Advertise compact block support to PEER. We announce only version 2 (witness),
 matching Bitcoin Core — a v1 (non-witness) compact block would strip the coinbase
 witness nonce. Requests high-bandwidth mode when not in IBD (peer may then send us
-unsolicited compact blocks for faster relay)."
-  (let ((high-bw (not (or (eq (ibd-state) :syncing-blocks)
-                          (eq (ibd-state) :syncing-headers)))))
+unsolicited compact blocks for faster relay) — but never in blocksonly mode:
+our mempool won't contain the transactions needed to reconstruct a compact
+block (Core MaybeSetPeerAsAnnouncingHeaderAndIDs, net_processing.cpp:1275-1280)."
+  (let ((high-bw (and (not (ignore-incoming-txs-p))
+                      (not (or (eq (ibd-state) :syncing-blocks)
+                               (eq (ibd-state) :syncing-headers))))))
+    ;; getpeerinfo bip152_hb_to (Core m_bip152_highbandwidth_to): whether WE
+    ;; selected the peer as a high-bandwidth compact-block peer.
+    (when high-bw
+      (setf (peer-compact-block-high-bandwidth-to peer) t))
     (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
                         high-bw +compact-blocks-version+))))
 
@@ -2344,6 +2374,9 @@ v1 compact block would deliver a witness-stripped coinbase."
         ;; Successful reconstruction
         (block
          (increment-compact-block-success)
+         ;; A reconstructed compact block is a block delivery from this peer:
+         ;; stamps getpeerinfo "last_block" and resets stall tracking.
+         (record-block-received-from-peer peer)
          (bitcoin-lisp:log-debug "Compact block reconstructed successfully")
          ;; Process like a normal block
          (with-node-lock
@@ -2426,6 +2459,8 @@ v1 compact block would deliver a witness-stripped coinbase."
 
           ;; Validate and connect
           (increment-compact-block-success)
+          ;; Block delivery from this peer (getpeerinfo "last_block").
+          (record-block-received-from-peer peer)
           (with-node-lock
             (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
                    (current-time (bitcoin-lisp.serialization:get-unix-time)))

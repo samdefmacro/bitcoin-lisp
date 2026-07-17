@@ -150,6 +150,17 @@ network resolved from the CLI and scoping the conf's [network] section."
     (is (eq :regtest (getf plist :network)))
     (is (eq t (getf plist :txindex)))))
 
+(test config-blocksonly-option
+  "-blocksonly wires through to start-node's :blocksonly keyword (Core
+DEFAULT_BLOCKSONLY = false: absent unless given; -noblocksonly negates)."
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest" "-blocksonly") nil)))
+    (is (eq t (getf plist :blocksonly))))
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest" "-blocksonly=0") nil)))
+    (is (null (getf plist :blocksonly)))
+    (is-true (member :blocksonly plist)))          ; explicitly given as off
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest") nil)))
+    (is (null (member :blocksonly plist)))))       ; default: not passed at all
+
 (test config-apply-globals
   "apply-config-globals sets the process-global policy/consensus specials from a
 merged config alist (options with no start-node keyword)."
