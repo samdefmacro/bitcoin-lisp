@@ -5,17 +5,23 @@
 //
 //   getpeerinfo -> [{ id, addr, version, subver, services (16-hex string),
 //     inbound, transport_protocol_type ("v1"|"v2"), connection_type,
-//     relaytxes, startingheight, synced_headers, synced_blocks, bytessent,
+//     relaytxes, startingheight, synced_headers (-1 = unknown),
+//     synced_blocks (always -1 — no last-common-block tracking), bytessent,
 //     bytesrecv, addr_processed, addr_rate_limited,
-//     pingtime (seconds, 0 = unknown) }].
+//     pingtime (seconds; ABSENT until a pong arrived, like Core), plus the
+//     Core-parity extras (network, servicesnames, lastsend/lastrecv,
+//     last_transaction/last_block, conntime, timeoffset, minping, pingwait,
+//     bip152_hb_to/_from, presynced_headers, inflight, addr_relay_enabled,
+//     permissions, minfeefilter, bytessent_per_msg, bytesrecv_per_msg,
+//     last_inv_sequence, inv_to_send, session_id) — the drawer renders any
+//     field it doesn't special-case raw, so new fields surface automatically.
 //     addr is the host only (no port) — it is exactly the string
 //     disconnectnode matches and the ban list keys on.
 //   listbanned -> [{ address, banned_until (unix) }] — no ban_created/
 //     ban_duration/time_remaining fields (unlike Core).
 //   setban [address, "add", seconds] / [address, "remove"]; addresses are
-//     matched exactly (no subnet/CIDR support). Our setban does NOT drop a
-//     connected peer (Core's does), so banAddress chains a disconnectnode
-//     for any connected peer with that address.
+//     matched exactly (no subnet/CIDR support). setban add disconnects any
+//     matching connected peer itself, like Core — no disconnectnode chase.
 //   disconnectnode [address] -> null, error -1 when not connected.
 //   setnetworkactive [bool] -> the new state; disabling drops every peer.
 //
@@ -89,9 +95,11 @@ export const COLUMNS = [
   { key: 'ping', label: 'ping', numeric: true,
     value: (p) => (p.pingtime > 0 ? p.pingtime : null),
     cell: (p) => (p.pingtime > 0 ? `${(p.pingtime * 1000).toFixed(0)} ms` : '—') },
+  // startingheight: the peer's advertised chain height at handshake.
+  // (synced_blocks is honestly -1 now — no last-common-block tracking.)
   { key: 'height', label: 'height', numeric: true,
-    value: (p) => (p.synced_blocks >= 0 ? p.synced_blocks : null),
-    cell: (p) => (p.synced_blocks >= 0 ? fmtInt(p.synced_blocks) : '—') },
+    value: (p) => (p.startingheight >= 0 ? p.startingheight : null),
+    cell: (p) => (p.startingheight >= 0 ? fmtInt(p.startingheight) : '—') },
   { key: 'sent', label: 'sent', numeric: true,
     value: (p) => p.bytessent ?? 0, cell: (p) => fmtBytes(p.bytessent) },
   { key: 'recv', label: 'recv', numeric: true,
@@ -219,15 +227,10 @@ async function runAction(errEl, fn) {
 
 // --- write actions ------------------------------------------------------
 
-// Ban ADDRESS, then disconnect any connected peer with that exact address
-// (Core's setban disconnects matching peers itself; ours does not).
+// Ban ADDRESS. setban itself disconnects any matching connected peer
+// (Core parity) — no follow-up disconnectnode needed.
 async function banAddress(address, seconds) {
   await rpc.call(...banParams(address, seconds));
-  if (state.peers.some((p) => p.addr === address)) {
-    try {
-      await rpc.call(...disconnectParams(address));
-    } catch { /* raced a disconnect — the ban itself succeeded */ }
-  }
 }
 
 // --- skeleton -----------------------------------------------------------

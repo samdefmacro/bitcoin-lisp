@@ -41,6 +41,38 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (ping-nonce nil)
   (last-ping-time 0 :type integer)
   (ping-latency 0 :type integer)
+  ;; Minimum ping round-trip observed on this connection, internal-time units
+  ;; (Core CNode::m_min_ping_time; 0 = no pong yet). Surfaced as getpeerinfo
+  ;; "minping".
+  (min-ping-latency 0 :type integer)
+  ;; Seconds the peer's version-message timestamp was ahead of (positive) or
+  ;; behind (negative) our clock at receipt (Core Peer::m_time_offset,
+  ;; net_processing.cpp:3646). getpeerinfo "timeoffset".
+  (time-offset 0 :type integer)
+  ;; Unix time of the last transaction ACCEPTED to the mempool from this peer
+  ;; (Core CNode::m_last_tx_time, stamped on MempoolAcceptResult VALID,
+  ;; net_processing.cpp:4540). 0 = never.
+  (last-tx-time 0 :type integer)
+  ;; Unix time of the last block received from this peer (Core
+  ;; CNode::m_last_block_time, stamped in ProcessBlock, net_processing.cpp:
+  ;; 3432). 0 = never.
+  (last-block-time 0 :type integer)
+  ;; Unix time this peer object was created (Core CNode::m_connected).
+  (connected-at (bitcoin-lisp.serialization:get-unix-time) :type integer)
+  ;; T once address relay is set up with this peer (Core Peer::
+  ;; m_addr_relay_enabled via SetupAddressRelay): at handshake time for
+  ;; outbound non-block-relay connections, or on the first addr-related
+  ;; message (getaddr/addr/addrv2) from an inbound peer. Never for
+  ;; block-relay-only connections.
+  (addr-relay-enabled nil :type boolean)
+  ;; Per-message-type wire byte counters (Core CNode::mapSendBytesPerMsgType /
+  ;; mapRecvBytesPerMsgType), keyed by command string. Synchronized: sends
+  ;; happen from both the sync thread and RPC threads, and getpeerinfo reads
+  ;; from RPC threads (a lost incf under contention only under-counts a stat).
+  (sent-per-msg (make-hash-table :test 'equal #+sbcl :synchronized #+sbcl t)
+                :type hash-table)
+  (recv-per-msg (make-hash-table :test 'equal #+sbcl :synchronized #+sbcl t)
+                :type hash-table)
   (send-queue '() :type list)
   ;; Bounded set of txids announced to this peer. Was an unbounded hash-table --
   ;; a per-peer memory leak on long-lived relay connections. Core bounds the
@@ -125,7 +157,8 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (headers-sync nil)
   ;; Compact block support (BIP 152)
   (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
-  (compact-block-high-bandwidth nil :type boolean)    ; High-bandwidth mode enabled
+  (compact-block-high-bandwidth nil :type boolean)    ; Peer selected US as high-bandwidth (Core m_bip152_highbandwidth_from)
+  (compact-block-high-bandwidth-to nil :type boolean) ; WE selected peer as high-bandwidth (Core m_bip152_highbandwidth_to)
   (pending-compact-block nil)                         ; Pending reconstruction state
   ;; ADDRv2 support (BIP 155)
   (wants-addrv2 nil :type boolean)                    ; Peer sent sendaddrv2
@@ -317,6 +350,33 @@ No-op for peers with nothing buffered."
 
 ;;; Message I/O
 
+(defun %message-wire-size (v2-p command payload-len)
+  "On-the-wire byte size of one message with COMMAND and PAYLOAD-LEN: v1 is
+the 24-byte header plus payload; a BIP324 v2 packet is the 3-byte encrypted
+length, 1-byte header, contents (1-byte short type id, or 0x00 + the 12-byte
+type verbatim, plus the payload), and the 16-byte Poly1305 tag."
+  (if v2-p
+      (+ 20
+         (if (position command *v2-message-ids* :test #'equal) 1 13)
+         payload-len)
+      (+ 24 payload-len)))
+
+(defun %account-message (table v2-p command payload-len)
+  "Accumulate one message's wire bytes into TABLE (a per-peer command ->
+bytes counter map, Core mapSend/RecvBytesPerMsgType)."
+  (incf (gethash command table 0) (%message-wire-size v2-p command payload-len)))
+
+(defun snapshot-per-msg-table (table)
+  "Fresh copy of a per-message byte-counter TABLE for safe cross-thread
+reporting (getpeerinfo bytessent_per_msg / bytesrecv_per_msg): the live
+table is written by the sync/RPC sender threads while getpeerinfo reads."
+  (let ((copy (make-hash-table :test 'equal)))
+    (flet ((copy-all ()
+             (maphash (lambda (k v) (setf (gethash k copy) v)) table)))
+      #+sbcl (sb-ext:with-locked-hash-table (table) (copy-all))
+      #-sbcl (copy-all))
+    copy))
+
 (defun send-message (peer message-bytes)
   "Send a raw (v1-framed) message to a peer; a connection with a v2 transport
 re-frames it as an encrypted BIP324 packet. Returns T on success, NIL on
@@ -324,6 +384,14 @@ failure."
   (when (and (peer-connection peer)
              (connection-connected (peer-connection peer)))
     (let ((conn (peer-connection peer)))
+      ;; Per-command send accounting (Core CConnman::PushMessage's
+      ;; mapSendBytesPerMsgType, counted when the message is handed to the
+      ;; transport). The command sits at bytes 4-15 of the v1 frame.
+      (%account-message (peer-sent-per-msg peer)
+                        (connection-transport conn)
+                        (bitcoin-lisp.serialization:bytes-to-command
+                         (subseq message-bytes 4 16))
+                        (- (length message-bytes) 24))
       (if (connection-transport conn)
           (v2-send-message conn (connection-transport conn) message-bytes)
           (send-bytes conn message-bytes)))))
@@ -336,8 +404,13 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
     (let ((conn (peer-connection peer)))
       (when (connection-transport conn)
         (return-from receive-message
-          (v2-receive-message conn (connection-transport conn)
-                              :timeout timeout)))
+          (multiple-value-bind (command payload)
+              (v2-receive-message conn (connection-transport conn)
+                                  :timeout timeout)
+            (when command
+              (%account-message (peer-recv-per-msg peer) t command
+                                (length payload)))
+            (values command payload))))
       ;; Read header (24 bytes)
       (let ((header-bytes (receive-bytes conn 24 :timeout timeout)))
         (when header-bytes
@@ -365,8 +438,10 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
                              (if (zerop payload-len) #() payload))))
                       (when (equalp (subseq computed-checksum 0 4)
                                     (bitcoin-lisp.serialization:message-header-checksum header))
-                        (values (bitcoin-lisp.serialization:message-header-command header)
-                                payload)))))))))))))
+                        (let ((command (bitcoin-lisp.serialization:message-header-command header)))
+                          (%account-message (peer-recv-per-msg peer) nil
+                                            command payload-len)
+                          (values command payload))))))))))))))
 
 ;;; Handshake
 
@@ -378,13 +453,27 @@ announcements from us is PEER-TX-RELAY-P (their version's fRelay)."
   (not (member (peer-conn-type peer) '(:block-relay :feeler))))
 
 (defun relay-enabled-p ()
-  "Check if transaction relay is enabled for the current network.
-Relay is always enabled on test networks, disabled by default on mainnet for
-safety — our analogue of Core's -blocksonly (m_opts.ignore_incoming_txs).
-Returns a strict boolean (it feeds the version message's fRelay slot)."
+  "Check if transaction relay is enabled for the current network: always on
+test networks, disabled by default on mainnet for safety (a non-participation
+posture stricter than Core's -blocksonly — it also gates block relay and
+local-submission announcements; see relay-block / relay-transaction).
+Returns a strict boolean. The Core-parity incoming-tx switch is
+IGNORE-INCOMING-TXS-P, which this feeds."
   (and (or (member bitcoin-lisp:*network* '(:testnet3 :testnet4 :signet :regtest))
            bitcoin-lisp:*mainnet-relay-enabled*)
        t))
+
+(defun ignore-incoming-txs-p ()
+  "Core PeerManager::Options::ignore_incoming_txs — T when this node refuses
+transactions FROM the network: -blocksonly=1, or the network relay posture is
+off (mainnet default). Drives the version message's fRelay=0, disconnection
+of peers that announce or send txs anyway (Core RejectIncomingTxs), feefilter
+suppression, high-bandwidth compact-block opt-out, and getnetworkinfo's
+localrelay. It does NOT gate block relay or announcing locally-submitted
+txs — a -blocksonly node still relays its OWN transactions (Core
+BroadcastTransaction is unaffected by the flag)."
+  (or bitcoin-lisp:*blocksonly*
+      (not (relay-enabled-p))))
 
 (defun peer-tx-relay-p (peer)
   "T when tx-relay state exists for PEER — the exact condition under which
@@ -450,6 +539,10 @@ T — declining to offer never fails the handshake."
                (>= (bitcoin-lisp.serialization:version-message-version version-msg)
                    bitcoin-lisp.serialization:+protocol-version+)
                (peer-relays-txs-p peer)
+               ;; Core also skips the offer entirely in blocksonly mode
+               ;; (!m_opts.ignore_incoming_txs, net_processing.cpp:3737) —
+               ;; reconciliation is pointless when we reject incoming txs.
+               (not (ignore-incoming-txs-p))
                (bitcoin-lisp.serialization:version-message-relay version-msg))
       (let ((salt (random (expt 2 64))))
         (setf (peer-recon-local-salt peer) salt)
@@ -593,9 +686,10 @@ tx relay on those)."
                            ;; Core my_tx_relay = !RejectIncomingTxs(pnode)
                            ;; (net_processing.cpp:1573,5686-5693): false on
                            ;; block-relay/feeler connections AND in blocksonly
-                           ;; mode — our mainnet-relay-disabled default. With
-                           ;; fRelay=0 honest peers stop announcing txs to us.
-                           :relay (and relays (relay-enabled-p))))
+                           ;; mode (-blocksonly, or our mainnet relay-disabled
+                           ;; default). With fRelay=0 honest peers stop
+                           ;; announcing txs to us.
+                           :relay (and relays (not (ignore-incoming-txs-p)))))
          (version-msg (bitcoin-lisp.serialization:serialize-message
                        "version" version-payload)))
     (when (send-message peer version-msg)
@@ -619,7 +713,13 @@ Returns T on success, NIL if the first message wasn't a version."
                 (peer-start-height peer)
                 (bitcoin-lisp.serialization:version-message-start-height version-msg)
                 (peer-user-agent peer)
-                (bitcoin-lisp.serialization:version-message-user-agent version-msg))))
+                (bitcoin-lisp.serialization:version-message-user-agent version-msg)
+                ;; Their clock vs ours, captured at receipt (Core Peer::
+                ;; m_time_offset, net_processing.cpp:3646); getpeerinfo
+                ;; "timeoffset".
+                (peer-time-offset peer)
+                (- (bitcoin-lisp.serialization::version-message-timestamp version-msg)
+                   (bitcoin-lisp.serialization:get-unix-time)))))
       t)))
 
 (defun %await-verack (peer &key (timeout 30))
@@ -734,13 +834,21 @@ on the local onion-service listener (Tor forwarding), whose true network is
   (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message))
   ;; BIP 133: Announce our minimum relay fee rate (1000 sat/kB = 1 sat/byte).
   ;; Core MaybeSendFeefilter (net_processing.cpp:5628-5637) skips it in
-  ;; blocksonly mode (ignore_incoming_txs — our relay-disabled mainnet
-  ;; default) and on outbound block-relay-only connections, which never
-  ;; announce txs to us regardless. Note Core does NOT gate feefilter on the
-  ;; peer's own fRelay — an fRelay=0 peer still receives it (harmlessly).
-  (when (and (relay-enabled-p)
+  ;; blocksonly mode (ignore_incoming_txs — -blocksonly, or our
+  ;; relay-disabled mainnet default) and on outbound block-relay-only
+  ;; connections, which never announce txs to us regardless. Note Core does
+  ;; NOT gate feefilter on the peer's own fRelay — an fRelay=0 peer still
+  ;; receives it (harmlessly).
+  (when (and (not (ignore-incoming-txs-p))
              (not (eq (peer-conn-type peer) :block-relay)))
     (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000)))
+  ;; Address relay is set up for every outbound connection except
+  ;; block-relay-only ones (Core SetupAddressRelay from the VERSION handler,
+  ;; net_processing.cpp:3754+5697-5711); inbound peers enable it on their
+  ;; first addr-related message instead (see handle-getaddr/handle-addr).
+  (when (and (not (peer-inbound peer))
+             (not (eq (peer-conn-type peer) :block-relay)))
+    (setf (peer-addr-relay-enabled peer) t))
   ;; One-time address fetch to populate/update addrman. Core sends GETADDR
   ;; on outbound connections only, and never block-relay-only ones (no addr
   ;; relay there, to avoid leaking the link): net_processing.cpp:3754-3772
@@ -775,8 +883,12 @@ on the local onion-service listener (Tor forwarding), whose true network is
   "Handle a pong message."
   (when (and (peer-ping-nonce peer)
              (= nonce (peer-ping-nonce peer)))
-    (setf (peer-ping-latency peer)
-          (- (get-internal-real-time) (peer-last-ping-time peer)))
+    (let ((rtt (- (get-internal-real-time) (peer-last-ping-time peer))))
+      (setf (peer-ping-latency peer) rtt)
+      ;; Track the connection's best round trip (Core m_min_ping_time).
+      (when (or (zerop (peer-min-ping-latency peer))
+                (< rtt (peer-min-ping-latency peer)))
+        (setf (peer-min-ping-latency peer) rtt)))
     (setf (peer-ping-nonce peer) nil)
     ;; Reset failure count on successful pong
     (setf (peer-consecutive-ping-failures peer) 0)))
@@ -863,8 +975,13 @@ Returns T if the peer should be disconnected."
   (>= (peer-block-timeout-count peer) +max-block-timeouts+))
 
 (defun record-block-received-from-peer (peer)
-  "Record that we received a block from PEER. Resets stalling state."
+  "Record that we received a block from PEER. Resets stalling state and
+stamps the unix receipt time getpeerinfo reports as \"last_block\" (Core
+CNode::m_last_block_time; Core stamps only NEW blocks in ProcessBlock —
+ours stamps every block message, but we request each block once, so
+duplicates are rare)."
   (setf (peer-last-block-received-time peer) (get-internal-real-time))
+  (setf (peer-last-block-time peer) (bitcoin-lisp.serialization:get-unix-time))
   (setf (peer-block-timeout-count peer) 0))
 
 (defun peer-stalling-p (peer &key (timeout-seconds 30))

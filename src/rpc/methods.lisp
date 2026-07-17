@@ -568,55 +568,198 @@ accepted but ignored."
     (:addr-fetch "addr-fetch")
     (t (string-downcase (symbol-name conn-type)))))
 
+(defun %service-names (services)
+  "Human-readable service-flag names for SERVICES as a list, in bit order —
+Core serviceFlagsToStr (protocol.cpp:92-115): the six named bits, and
+UNKNOWN[2^n] for any other set bit. Callers emitting a possibly-EMPTY set
+must coerce to a vector (NIL would encode as null, not [])."
+  (loop for bit from 0 below 64
+        when (logtest services (ash 1 bit))
+          collect (case bit
+                    (0 "NETWORK")
+                    (2 "BLOOM")
+                    (3 "WITNESS")
+                    (6 "COMPACT_FILTERS")
+                    (10 "NETWORK_LIMITED")
+                    (11 "P2P_V2")
+                    (t (format nil "UNKNOWN[2^~D]" bit)))))
+
+(defun %peer-network-name (peer)
+  "Core GetNetworkName(ConnectedThroughNetwork()) for getpeerinfo's
+\"network\": a peer accepted through the local onion service is \"onion\"
+regardless of its socket address (127.0.0.1); otherwise the address's
+network, or \"not_publicly_routable\" when it isn't a routable literal."
+  (multiple-value-bind (net bytes)
+      (bitcoin-lisp.networking:parse-network-address
+       (bitcoin-lisp::peer-address peer))
+    (cond
+      ((bitcoin-lisp.networking::peer-inbound-onion peer) "onion")
+      ((and net (bitcoin-lisp.networking:address-routable-p bytes net))
+       (ecase net
+         (:ipv4 "ipv4") (:ipv6 "ipv6") (:torv3 "onion")
+         (:i2p "i2p") (:cjdns "cjdns")))
+      (t "not_publicly_routable"))))
+
+(defun %peer-addrlocal (peer)
+  "Our address as the peer reported it in its version message's addr_recv
+(Core addrLocal, set from the version addrMe for outbound peers when
+routable, net_processing.cpp:3651-3654). Returns \"ip:port\" or NIL — the
+field is optional in Core and omitted when unknown."
+  (let ((vmsg (bitcoin-lisp::peer-version peer)))
+    (when (and vmsg (not (bitcoin-lisp.networking::peer-inbound peer)))
+      (let* ((addr-me (bitcoin-lisp.serialization::version-message-addr-recv vmsg))
+             (ip (bitcoin-lisp.serialization:net-addr-ip addr-me))
+             (net (and (= (length ip) 16) (bitcoin-lisp.networking::ip-network ip))))
+        (when (and net (bitcoin-lisp.networking:address-routable-p ip net))
+          (format nil "~A:~D"
+                  (bitcoin-lisp.networking:network-address-to-string net ip)
+                  (bitcoin-lisp.serialization:net-addr-port addr-me)))))))
+
+(defun %universal-to-unix (universal)
+  "Universal-time -> unix time, preserving 0 as \"never\" (Core reports 0)."
+  (if (plusp universal)
+      (- universal bitcoin-lisp.serialization:+universal-unix-epoch-offset+)
+      0))
+
 (defun rpc-getpeerinfo (node params)
-  "Return information about connected peers."
+  "Return information about connected peers (Bitcoin Core getpeerinfo),
+emitting every Core field we can populate honestly. Deliberate omissions:
+addrbind (local socket address not recorded), mapped_as (no -asmap support).
+Divergences: startingheight is always present (Core hides it behind
+-deprecatedrpc=startingheight); synced_blocks is always -1 (we track no
+per-peer last-common-block cursor — -1 is Core's \"unknown\" value);
+last_block stamps every block received (Core stamps only NEW blocks)."
   (declare (ignore params))
-  (let ((peers (rpc-get-peers node)))
-    (mapcar (lambda (peer)
-              ;; peer-version holds the received version *message* struct, not a
-              ;; number — pull the numeric protocol version out of it.
-              (let* ((vmsg (bitcoin-lisp::peer-version peer))
-                     (conn (bitcoin-lisp.networking::peer-connection peer))
-                     (ping (bitcoin-lisp.networking::peer-ping-latency peer))
-                     (sh (or (bitcoin-lisp::peer-start-height peer) -1)))
-                `(("id" . ,(bitcoin-lisp.networking::peer-id peer))
-                  ("addr" . ,(bitcoin-lisp::peer-address peer))
-                  ("version" . ,(if vmsg
-                                    (bitcoin-lisp.serialization:version-message-version vmsg)
-                                    0))
-                  ("subver" . ,(or (bitcoin-lisp::peer-user-agent peer) ""))
-                  ;; Core reports services as a 16-hex-digit string, not a number.
-                  ("services" . ,(string-downcase
-                                  (format nil "~16,'0X" (or (bitcoin-lisp::peer-services peer) 0))))
-                  ;; Real inbound/outbound flag (was hardcoded nil).
-                  ("inbound" . ,(json-bool (bitcoin-lisp.networking::peer-inbound peer)))
-                  ;; Core TransportTypeAsString: the BIP324 v2 session lives in
-                  ;; connection-transport (NIL = plaintext v1). Peers surface
-                  ;; here only after the handshake, so "detecting" never applies.
-                  ("transport_protocol_type"
-                   . ,(if (and conn (bitcoin-lisp.networking::connection-transport conn))
-                          "v2" "v1"))
-                  ;; Core ConnectionType string + whether we relay txs to this
-                  ;; peer (block-relay-only/feeler peers get no tx relay -- #216).
-                  ("connection_type" . ,(%connection-type-string
-                                          (bitcoin-lisp.networking:peer-conn-type peer)))
-                  ("relaytxes" . ,(json-bool (bitcoin-lisp.networking:peer-relays-txs-p peer)))
-                  ("startingheight" . ,sh)
-                  ;; Peer's advertised height as our best proxy for synced_*.
-                  ("synced_headers" . ,sh)
-                  ("synced_blocks" . ,sh)
-                  ("bytessent" . ,(if conn (bitcoin-lisp.networking::connection-bytes-sent conn) 0))
-                  ("bytesrecv" . ,(if conn (bitcoin-lisp.networking::connection-bytes-received conn) 0))
-                  ;; Addr intake counters (Core m_addr_processed /
-                  ;; m_addr_rate_limited; the rate-limited count is addresses
-                  ;; dropped by the per-address token bucket).
-                  ("addr_processed" . ,(bitcoin-lisp.networking::peer-addr-processed peer))
-                  ("addr_rate_limited" . ,(bitcoin-lisp.networking::peer-addr-rate-limited peer))
-                  ;; ping-latency is in internal-time units; report seconds (0 = unknown).
-                  ("pingtime" . ,(if (and ping (plusp ping))
-                                     (/ ping internal-time-units-per-second 1.0d0)
-                                     0)))))
-            peers)))
+  (let ((peers (rpc-get-peers node))
+        (chain-state (rpc-get-chain-state node))
+        (now (get-internal-real-time)))
+    (mapcar
+     (lambda (peer)
+       ;; peer-version holds the received version *message* struct, not a
+       ;; number — pull the numeric protocol version out of it.
+       (let* ((vmsg (bitcoin-lisp::peer-version peer))
+              (conn (bitcoin-lisp.networking::peer-connection peer))
+              (ping (bitcoin-lisp.networking::peer-ping-latency peer))
+              (minping (bitcoin-lisp.networking::peer-min-ping-latency peer))
+              (ping-nonce (bitcoin-lisp.networking::peer-ping-nonce peer))
+              (services (or (bitcoin-lisp::peer-services peer) 0))
+              (sh (or (bitcoin-lisp::peer-start-height peer) -1))
+              (hss (bitcoin-lisp.networking::peer-headers-sync peer))
+              (transport (and conn (bitcoin-lisp.networking::connection-transport conn)))
+              ;; Last header we have in common: the peer's best known block
+              ;; per its inv/headers announcements (Core pindexBestKnownBlock
+              ;; -> nSyncHeight), -1 while unknown.
+              (best-known (bitcoin-lisp.networking::peer-best-known-block-hash peer))
+              (best-entry (and best-known chain-state
+                               (bitcoin-lisp.storage:get-block-index-entry
+                                chain-state best-known)))
+              ;; Heights of blocks in flight from this peer (Core
+              ;; vHeightInFlight), ascending; hashes whose header vanished
+              ;; (reorged index) are skipped.
+              (inflight
+                (sort (loop for hash in (bitcoin-lisp.networking::peer-inflight-block-hashes peer)
+                            for entry = (and chain-state
+                                             (bitcoin-lisp.storage:get-block-index-entry
+                                              chain-state hash))
+                            when entry
+                              collect (bitcoin-lisp.storage:block-index-entry-height entry))
+                      #'<)))
+         `(("id" . ,(bitcoin-lisp.networking::peer-id peer))
+           ("addr" . ,(bitcoin-lisp::peer-address peer))
+           ,@(let ((addrlocal (%peer-addrlocal peer)))
+               (when addrlocal `(("addrlocal" . ,addrlocal))))
+           ("network" . ,(%peer-network-name peer))
+           ;; Core reports services as a 16-hex-digit string, not a number.
+           ("services" . ,(string-downcase (format nil "~16,'0X" services)))
+           ("servicesnames" . ,(coerce (%service-names services) 'vector))
+           ;; Whether we relay txs to this peer: tx-relay state exists — the
+           ;; connection type allows it AND the peer's version set fRelay
+           ;; (Core CNodeStateStats::m_relay_txs).
+           ("relaytxes" . ,(json-bool (bitcoin-lisp.networking:peer-tx-relay-p peer)))
+           ;; Mempool sequence snapshot of our last inv flush to this peer +
+           ;; queued-but-unsent announcements (Core m_last_inv_sequence /
+           ;; m_inv_to_send).
+           ("last_inv_sequence" . ,(bitcoin-lisp.networking::peer-last-inv-sequence peer))
+           ("inv_to_send" . ,(length (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+           ("lastsend" . ,(%universal-to-unix
+                           (if conn (bitcoin-lisp.networking::connection-last-send-time conn) 0)))
+           ("lastrecv" . ,(%universal-to-unix
+                           (if conn (bitcoin-lisp.networking::connection-last-recv-time conn) 0)))
+           ("last_transaction" . ,(bitcoin-lisp.networking::peer-last-tx-time peer))
+           ("last_block" . ,(bitcoin-lisp.networking::peer-last-block-time peer))
+           ("bytessent" . ,(if conn (bitcoin-lisp.networking::connection-bytes-sent conn) 0))
+           ("bytesrecv" . ,(if conn (bitcoin-lisp.networking::connection-bytes-received conn) 0))
+           ("conntime" . ,(bitcoin-lisp.networking::peer-connected-at peer))
+           ;; Peer's version-message timestamp vs our clock at receipt.
+           ("timeoffset" . ,(bitcoin-lisp.networking::peer-time-offset peer))
+           ;; ping stats are in internal-time units; report seconds. All
+           ;; three are optional in Core: pingtime/minping only once a pong
+           ;; arrived, pingwait only while a ping is outstanding.
+           ,@(when (plusp ping)
+               `(("pingtime" . ,(/ ping internal-time-units-per-second 1.0d0))))
+           ,@(when (plusp minping)
+               `(("minping" . ,(/ minping internal-time-units-per-second 1.0d0))))
+           ,@(when ping-nonce
+               `(("pingwait" . ,(/ (- now (bitcoin-lisp.networking::peer-last-ping-time peer))
+                                   internal-time-units-per-second 1.0d0))))
+           ("version" . ,(if vmsg
+                             (bitcoin-lisp.serialization:version-message-version vmsg)
+                             0))
+           ("subver" . ,(or (bitcoin-lisp::peer-user-agent peer) ""))
+           ("inbound" . ,(json-bool (bitcoin-lisp.networking::peer-inbound peer)))
+           ;; BIP152 high-bandwidth selection, both directions (Core
+           ;; m_bip152_highbandwidth_to / _from).
+           ("bip152_hb_to" . ,(json-bool
+                               (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to peer)))
+           ("bip152_hb_from" . ,(json-bool
+                                 (bitcoin-lisp.networking::peer-compact-block-high-bandwidth peer)))
+           ;; Kept unconditionally (Core gates it behind -deprecatedrpc).
+           ("startingheight" . ,sh)
+           ;; Low-work headers presync progress (Core presync_height): the
+           ;; current height of an in-progress PRESYNC phase, else -1.
+           ("presynced_headers"
+            . ,(if (and hss (eq (bitcoin-lisp.networking::hss-state hss) :presync))
+                   (bitcoin-lisp.networking::hss-current-height hss)
+                   -1))
+           ("synced_headers" . ,(if best-entry
+                                    (bitcoin-lisp.storage:block-index-entry-height best-entry)
+                                    -1))
+           ;; We keep no pindexLastCommonBlock analogue; -1 = unknown.
+           ("synced_blocks" . -1)
+           ("inflight" . ,(coerce inflight 'vector))
+           ("addr_relay_enabled" . ,(json-bool
+                                     (bitcoin-lisp.networking::peer-addr-relay-enabled peer)))
+           ;; Addr intake counters (Core m_addr_processed /
+           ;; m_addr_rate_limited; the rate-limited count is addresses
+           ;; dropped by the per-address token bucket).
+           ("addr_processed" . ,(bitcoin-lisp.networking::peer-addr-processed peer))
+           ("addr_rate_limited" . ,(bitcoin-lisp.networking::peer-addr-rate-limited peer))
+           ;; No NetPermissionFlags support: no peer ever has special
+           ;; permissions, so the array is honestly empty.
+           ("permissions" . #())
+           ;; BIP133: the peer's advertised fee floor, sat/kvB -> BTC/kvB.
+           ("minfeefilter" . ,(/ (bitcoin-lisp.networking::peer-feefilter-rate peer)
+                                 100000000.0d0))
+           ("bytessent_per_msg" . ,(bitcoin-lisp.networking::snapshot-per-msg-table
+                                    (bitcoin-lisp.networking::peer-sent-per-msg peer)))
+           ("bytesrecv_per_msg" . ,(bitcoin-lisp.networking::snapshot-per-msg-table
+                                    (bitcoin-lisp.networking::peer-recv-per-msg peer)))
+           ;; Core ConnectionType string (block-relay-only/feeler peers get
+           ;; no tx relay -- #216).
+           ("connection_type" . ,(%connection-type-string
+                                  (bitcoin-lisp.networking:peer-conn-type peer)))
+           ;; Core TransportTypeAsString: the BIP324 v2 session lives in
+           ;; connection-transport (NIL = plaintext v1). Peers surface
+           ;; here only after the handshake, so "detecting" never applies.
+           ("transport_protocol_type" . ,(if transport "v2" "v1"))
+           ;; BIP324 session id (v2 only; "" otherwise, like Core).
+           ("session_id"
+            . ,(let ((sid (and transport
+                               (bitcoin-lisp.networking::v2-transport-p transport)
+                               (bitcoin-lisp.crypto:bip324-cipher-session-id
+                                (bitcoin-lisp.networking::v2-transport-cipher transport)))))
+                 (if sid (bitcoin-lisp.crypto:bytes-to-hex sid) ""))))))
+     peers)))
 
 (defun rpc-getnetworkinfo (node params)
   "Return network state information (Bitcoin Core getnetworkinfo)."
@@ -625,16 +768,9 @@ accepted but ignored."
          (peers (rpc-get-peers node))
          ;; THE service bits we advertise on the wire (peer.lisp local-services,
          ;; Core g_local_services) — the one composition; do not duplicate it
-         ;; here. Names in bit order per Core ServiceFlagsToStr (protocol.cpp).
+         ;; here. Names via the shared %service-names (Core GetServicesNames).
          (services (bitcoin-lisp.networking::local-services))
-         (service-names
-           (loop for (bit name)
-                   in `((,bitcoin-lisp.serialization:+node-network+ "NETWORK")
-                        (,bitcoin-lisp.serialization:+node-witness+ "WITNESS")
-                        (,bitcoin-lisp.serialization:+node-compact-filters+ "COMPACT_FILTERS")
-                        (,bitcoin-lisp.serialization:+node-network-limited+ "NETWORK_LIMITED")
-                        (,bitcoin-lisp.serialization:+node-p2p-v2+ "P2P_V2"))
-                 when (logtest services bit) collect name))
+         (service-names (%service-names services))
          (in (count-if #'bitcoin-lisp.networking::peer-inbound peers))
          ;; The EFFECTIVE -minrelaytxfee (sat/kvB -> BTC/kvB); Core reports
          ;; ::minRelayTxFee.GetFeePerK(), not the compile-time default.
@@ -647,9 +783,10 @@ accepted but ignored."
       ("protocolversion" . 70016)
       ("localservices" . ,(string-downcase (format nil "~16,'0X" services)))
       ("localservicesnames" . ,service-names)
-      ;; relay-enabled-p returns a truthy list (member result), not a boolean —
-      ;; coerce so it serializes as JSON true/false (never null).
-      ("localrelay" . ,(json-bool (bitcoin-lisp.networking:relay-enabled-p)))
+      ;; Core: localrelay = !peerman->IgnoresIncomingTxs() — false under
+      ;; -blocksonly OR our mainnet relay-disabled default. json-bool so it
+      ;; serializes as JSON true/false (never null).
+      ("localrelay" . ,(json-bool (not (bitcoin-lisp.networking:ignore-incoming-txs-p))))
       ("timeoffset" . 0)
       ("networkactive" . ,(json-bool (bitcoin-lisp::node-network-active node)))
       ("connections" . ,(length peers))
@@ -1502,11 +1639,12 @@ null on success; errors if no connected peer has that address."
   "Add or remove a manual ban (Bitcoin Core setban). PARAMS:
 (address command [bantime] [absolute]). COMMAND is \"add\" or \"remove\". For add,
 BANTIME is seconds from now (default -bantime, 24h), or an absolute Unix time
-when ABSOLUTE is true. Error codes mirror Core (net.cpp:766-812): a
-non-address (-30 RPC_CLIENT_INVALID_IP_OR_SUBNET), re-banning (-23), a failed
-unban (-30). Subnet (CIDR) bans are not supported — bans match exact
-addresses — so subnet syntax is rejected as invalid. Returns null."
-  (declare (ignore node))
+when ABSOLUTE is true, and every connected peer with that address is
+disconnected (Core net.cpp:803-810 -> CConnman::DisconnectNode). Error codes
+mirror Core (net.cpp:766-812): a non-address (-30
+RPC_CLIENT_INVALID_IP_OR_SUBNET), re-banning (-23), a failed unban (-30).
+Subnet (CIDR) bans are not supported — bans match exact addresses — so
+subnet syntax is rejected as invalid. Returns null."
   (let ((address (first params))
         (command (second params))
         (bantime (third params))
@@ -1540,6 +1678,15 @@ addresses — so subnet syntax is rejected as invalid. Returns null."
          ;; Core: bantime <= 0 falls back to -bantime (banman.cpp:130-140).
          ((<= bantime 0) (bitcoin-lisp.networking:ban-address address))
          (t (bitcoin-lisp.networking:ban-address address bantime)))
+       ;; Core: a fresh ban disconnects every matching connected peer itself
+       ;; (net.cpp:803-810, CConnman::DisconnectNode marks ALL nodes with
+       ;; that address). Same node-lock discipline as rpc-disconnectnode:
+       ;; hold it across the scan + disconnects so we never act on a peer
+       ;; mid-removal by the sync thread.
+       (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+         (dolist (peer (bitcoin-lisp::node-peers node))
+           (when (string= address (bitcoin-lisp::peer-address peer))
+             (bitcoin-lisp.networking:disconnect-peer peer))))
        nil)
       ((equal command "remove")
        (unless (bitcoin-lisp.networking:unban-address address)

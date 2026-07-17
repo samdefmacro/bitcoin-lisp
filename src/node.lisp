@@ -417,6 +417,22 @@ AttemptToEvictConnection. Returns T if a peer was evicted."
                     (bitcoin-lisp.networking:disconnect-peer victim)
                     t))))))))))
 
+(defun inbound-connection-allowed-p (node host)
+  "Admission check for a freshly-accepted inbound connection from HOST,
+before any handshake work (Core CConnman::CreateNodeFromAcceptedSocket,
+net.cpp:1801-1813): a banned address is always dropped; a discouraged
+address is dropped only when the inbound slots are (almost) full. Returns T,
+or (VALUES NIL REASON) when the connection must be dropped."
+  (cond
+    ((bitcoin-lisp.networking:peer-banned-p host)
+     (values nil :banned))
+    ((and (bitcoin-lisp.networking:peer-discouraged-p host)
+          (>= (1+ (bt:with-recursive-lock-held ((node-lock node))
+                    (count-inbound-peers node)))
+              +max-inbound-peers+))
+     (values nil :discouraged))
+    (t t)))
+
 (defun run-inbound-listener (node &key (socket (node-listener-socket node)) onion)
   "Accept inbound connections on SOCKET, handshake each, and hand the ready
 peer to the sync thread via pending-inbound-peers. Runs until the node stops.
@@ -433,20 +449,32 @@ network is :torv3, Core CNode::m_inbound_onion)."
                (let ((conn (bitcoin-lisp.networking:accept-connection
                             socket :timeout 1)))
                  (when conn
-                   (let ((peer (bitcoin-lisp.networking:make-inbound-peer
-                                conn (bitcoin-lisp.networking:connection-host conn)
-                                :inbound-onion onion)))
-                     (if (bitcoin-lisp.networking:perform-inbound-handshake peer)
+                   ;; Banned/discouraged admission gate BEFORE the handshake
+                   ;; (Core drops these in CreateNodeFromAcceptedSocket,
+                   ;; net.cpp:1801-1813).
+                   (multiple-value-bind (allowed reason)
+                       (inbound-connection-allowed-p
+                        node (bitcoin-lisp.networking:connection-host conn))
+                     (if (not allowed)
                          (progn
-                           (bitcoin-lisp.networking:send-post-handshake-messages peer)
-                           (bitcoin-lisp.networking:send-compact-block-negotiation peer)
-                           (bt:with-recursive-lock-held ((node-lock node))
-                             (push peer (node-pending-inbound-peers node)))
-                           (log-info "Inbound~:[~; onion~] peer ~A (~A) handshake complete"
-                                     onion
-                                     (bitcoin-lisp.networking:peer-address peer)
-                                     (bitcoin-lisp.networking:peer-user-agent peer)))
-                         (bitcoin-lisp.networking:disconnect-peer peer))))))
+                           (log-info "Inbound connection from ~A dropped (~(~A~))"
+                                     (bitcoin-lisp.networking:connection-host conn)
+                                     reason)
+                           (bitcoin-lisp.networking:close-connection conn))
+                         (let ((peer (bitcoin-lisp.networking:make-inbound-peer
+                                      conn (bitcoin-lisp.networking:connection-host conn)
+                                      :inbound-onion onion)))
+                           (if (bitcoin-lisp.networking:perform-inbound-handshake peer)
+                               (progn
+                                 (bitcoin-lisp.networking:send-post-handshake-messages peer)
+                                 (bitcoin-lisp.networking:send-compact-block-negotiation peer)
+                                 (bt:with-recursive-lock-held ((node-lock node))
+                                   (push peer (node-pending-inbound-peers node)))
+                                 (log-info "Inbound~:[~; onion~] peer ~A (~A) handshake complete"
+                                           onion
+                                           (bitcoin-lisp.networking:peer-address peer)
+                                           (bitcoin-lisp.networking:peer-user-agent peer)))
+                               (bitcoin-lisp.networking:disconnect-peer peer))))))))
              (error (c)
                (log-debug "Inbound accept/handshake error: ~A" c)))))
 
@@ -1285,7 +1313,8 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (port nil)
                         (network-active t)
                         ((:rest rest-enabled) nil)
-                        (addnode nil))
+                        (addnode nil)
+                        (blocksonly nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -1327,6 +1356,10 @@ REST: If T, serve the Core-style REST interface under /rest/ on the RPC port
   (Core -rest; default OFF, DEFAULT_REST_ENABLE = false, init.cpp:153).
 ADDNODE: List of \"host[:port]\" strings to keep connected as manually-added
   peers (Core -addnode as a config option; same list addnode RPC manages).
+BLOCKSONLY: If T, reject transactions from network peers (Core -blocksonly,
+  default false): fRelay=0 in our version messages, tx announcements/txs
+  from peers disconnect them, no feefilter. Local submissions still relay;
+  block relay is unaffected.
 
 Returns the node instance."
   (when *node*
@@ -1387,6 +1420,12 @@ Returns the node instance."
   ;; Initialize node
   (setf *node* (init-node data-directory :network network :log-level log-level))
   (setf (node-max-peers *node*) max-peers)
+  ;; -blocksonly: reject transactions from network peers (Core
+  ;; ignore_incoming_txs). Always assigned so a fresh start-node never
+  ;; inherits a stale value from a previous run.
+  (setf *blocksonly* (and blocksonly t))
+  (when *blocksonly*
+    (log-info "Blocksonly mode: transactions from network peers are rejected (-blocksonly)"))
   ;; -networkactive=0: start with all P2P activity disabled (Core passes the
   ;; flag to the CConnman ctor, init.cpp:1648); setnetworkactive re-enables.
   (setf (node-network-active *node*) (and network-active t))

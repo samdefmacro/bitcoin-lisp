@@ -79,10 +79,16 @@ profile (fresh testnet4 IBD) showed this hashing dominating IBD CPU."
               most-positive-fixnum)
       (sxhash k)))
 
-(defun make-block-hash-table ()
+(defun make-block-hash-table (&key synchronized)
   "An equalp hash-table for 32-byte block-hash keys, using the fast
-block-hash-key-hash. Falls back to plain equalp off SBCL."
-  (make-hash-table :test 'equalp #+sbcl :hash-function #+sbcl #'block-hash-key-hash))
+block-hash-key-hash. Falls back to plain equalp off SBCL. SYNCHRONIZED makes
+the table thread-safe (SBCL): the in-flight table needs it because
+getpeerinfo's \"inflight\" snapshot reads it from RPC threads while the sync
+thread mutates it."
+  (declare (ignorable synchronized))
+  (make-hash-table :test 'equalp
+                   #+sbcl :hash-function #+sbcl #'block-hash-key-hash
+                   #+sbcl :synchronized #+sbcl synchronized))
 
 (defstruct ibd-context
   "Context for managing Initial Block Download."
@@ -95,7 +101,7 @@ block-hash-key-hash. Falls back to plain equalp off SBCL."
   (header-tip-height 0 :type (unsigned-byte 32))
   ;; Download queue
   (pending-blocks (make-block-hash-table) :type hash-table)  ; hash -> height
-  (in-flight (make-block-hash-table) :type hash-table)       ; hash -> (peer . timestamp)
+  (in-flight (make-block-hash-table :synchronized t) :type hash-table) ; hash -> (peer . timestamp)
   (block-queue (make-hash-table :test 'eql) :type hash-table)  ; height -> (block . wire-bytes), out-of-order
   (block-queue-bytes 0 :type integer)  ; sum of queued wire-bytes (see +max-block-queue-bytes+)
   ;; Exponential moving average of received block wire sizes. Seeds at 1MB
@@ -352,6 +358,23 @@ timed out too many times and when every peer has disclaimed it."
     (remhash hash (ibd-context-pending-blocks *ibd-context*))
     (remhash hash (ibd-context-request-timeouts *ibd-context*))
     (remhash hash (ibd-context-block-disclaims *ibd-context*))))
+
+(defun peer-inflight-block-hashes (peer)
+  "Block hashes currently requested from PEER and not yet received — the
+source of getpeerinfo's \"inflight\" heights (Core CNodeStateStats::
+vHeightInFlight). Snapshots the synchronized in-flight table under its lock
+so RPC threads can read while the sync thread mutates."
+  (let ((result '()))
+    (when *ibd-context*
+      (let ((in-flight (ibd-context-in-flight *ibd-context*)))
+        (flet ((scan ()
+                 (maphash (lambda (hash entry)
+                            (when (eq (car entry) peer)
+                              (push hash result)))
+                          in-flight)))
+          #+sbcl (sb-ext:with-locked-hash-table (in-flight) (scan))
+          #-sbcl (scan))))
+    result))
 
 (defun note-block-not-available (peer hash)
   "Record that PEER answered `notfound` for block HASH and release the
