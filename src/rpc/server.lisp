@@ -25,6 +25,7 @@
 (defconstant +rpc-verify-already-in-utxo-set+ -27)
 (defconstant +rpc-client-node-not-connected+ -29)
 (defconstant +rpc-client-invalid-ip-or-subnet+ -30)
+(defconstant +rpc-method-deprecated+ -32)
 (defconstant +rpc-client-mempool-disabled+ -33)
 
 ;;; --- RPC Error Condition ---
@@ -190,7 +191,18 @@
   (register-rpc-method "listtransactions" #'rpc-listtransactions)
   (register-rpc-method "listsinceblock" #'rpc-listsinceblock)
   (register-rpc-method "rescanblockchain" #'rpc-rescanblockchain)
-  (register-rpc-method "abortrescan" #'rpc-abortrescan))
+  (register-rpc-method "abortrescan" #'rpc-abortrescan)
+  ;; Wallet balances & coins (wallet P3)
+  (register-rpc-method "getbalance" #'rpc-getbalance)
+  (register-rpc-method "getbalances" #'rpc-getbalances)
+  (register-rpc-method "listunspent" #'rpc-listunspent)
+  (register-rpc-method "lockunspent" #'rpc-lockunspent)
+  (register-rpc-method "listlockunspent" #'rpc-listlockunspent)
+  (register-rpc-method "getaddressinfo" #'rpc-getaddressinfo)
+  (register-rpc-method "setlabel" #'rpc-setlabel)
+  (register-rpc-method "getaddressesbylabel" #'rpc-getaddressesbylabel)
+  (register-rpc-method "listlabels" #'rpc-listlabels)
+  (register-rpc-method "abandontransaction" #'rpc-abandontransaction))
 
 ;;; --- JSON-RPC Request/Response Handling ---
 
