@@ -515,12 +515,12 @@ the cache; different descriptors/indices don't collide."
     (let ((r (bitcoin-lisp.rpc::rpc-getdescriptorinfo
               node
               (list "pkh(tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B/1/1/0)"))))
-      (is (null (cdr (assoc "isrange" r :test #'string=))))
+      (is (eq 'yason:false (cdr (assoc "isrange" r :test #'string=))))
       (is (eq t (cdr (assoc "issolvable" r :test #'string=))))
-      (is (null (cdr (assoc "hasprivatekeys" r :test #'string=)))))
+      (is (eq 'yason:false (cdr (assoc "hasprivatekeys" r :test #'string=)))))
     ;; addr()/raw() are not solvable.
     (let ((r (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list "raw(51)"))))
-      (is (null (cdr (assoc "issolvable" r :test #'string=)))))
+      (is (eq 'yason:false (cdr (assoc "issolvable" r :test #'string=)))))
     ;; Bad checksum still rejected.
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getdescriptorinfo node (list "raw(51)#deadbeef")))))

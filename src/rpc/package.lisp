@@ -35,4 +35,8 @@
    #:+rpc-internal-error+
    #:+rpc-misc-error+
    #:+rpc-invalid-address-or-key+
-   #:+rpc-invalid-parameter+))
+   #:+rpc-invalid-parameter+
+
+   ;; JSON boolean helpers (Core booleans are true/false, never null)
+   #:+json-false+
+   #:json-bool))

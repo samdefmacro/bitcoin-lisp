@@ -43,8 +43,10 @@ Set automatically based on network: 100000 for mainnet, 1000 for testnet.")
     ((:testnet3 :testnet4 :signet :regtest) 1000)))
 
 (defvar *minimum-chain-work-override* nil
-  "When non-NIL, overrides the per-network nMinimumChainWork. For tests (the
-real per-network floors are ~10^25 work, unreachable by synthetic chains).")
+  "When non-NIL, overrides the per-network nMinimumChainWork. Set by
+-minimumchainwork (Core init.cpp:512, chainstatemanager_args.cpp:32-38) and
+by tests (the real per-network floors are ~10^25 work, unreachable by
+synthetic chains).")
 
 (defvar *assumevalid-override* :unset
   "When not :UNSET, overrides the per-network defaultAssumeValid block hash: a
@@ -164,6 +166,26 @@ non-NIL) takes precedence over the built-in table."
 order), or NIL (Core AssumeutxoForBlockhash, kernel/chainparams.cpp:727)."
   (find blockhash (network-assumeutxo-data network)
         :key #'assumeutxo-data-blockhash :test #'equalp))
+
+(defvar *p2p-port-override* nil
+  "When non-NIL, the P2P LISTEN port (Core -port, init.cpp:575): the inbound
+listener binds here, the onion target listener at port+1 (Core init.cpp:2118),
+and -externalip advertisements carry it (Core GetListenPort, net.cpp:138-162).
+The DEFAULT port used to dial peers is unaffected — Core dials
+chainparams GetDefaultPort regardless of -port.")
+
+(defvar *stop-at-height* 0
+  "Stop the node once the active tip reaches this height; 0 = disabled (Core
+-stopatheight, DEFAULT_STOPATHEIGHT = 0, node/kernel_notifications.cpp:61-66:
+the blockTip notification requests shutdown when nHeight >= m_stop_at_height).")
+
+(defvar *dns-seed-enabled* t
+  "Query DNS seeds for peer addresses when the address book is low (Core
+-dnsseed, DEFAULT_DNSSEED = true, net.h:96).")
+
+(defvar *fixed-seeds-enabled* t
+  "Allow the hardcoded fixed-seed fallback when DNS/addrman leave the
+candidate pool thin (Core -fixedseeds, DEFAULT_FIXEDSEEDS = true, net.h:97).")
 
 (defvar *parallel-block-validation* nil
   "When NIL (default), block-script validation runs single-threaded.
@@ -355,8 +377,11 @@ disconnected by handle-message's rate-limit gate.")
   "Maximum P2P message payload size in bytes: 4,000,000, matching Bitcoin Core
 MAX_PROTOCOL_MESSAGE_LENGTH (net.h). Not 4 MiB -- Core uses decimal 4e6.")
 
-(defconstant +max-rpc-body-size+ (* 1 1024 1024)
-  "Maximum RPC request body size in bytes (1 MB).")
+(defconstant +max-rpc-body-size+ #x02000000
+  "Maximum RPC request body size in bytes: 32 MiB, matching Bitcoin Core's
+evhttp_set_max_body_size(MAX_SIZE) (httpserver.cpp:410, serialize.h:32).
+The previous 1 MiB cap rejected submitblock for a normal mainnet block.
+Oversized bodies get HTTP 400, like libevent's enforcement.")
 
 (defconstant +handshake-timeout-seconds+ 30
   "Maximum seconds to complete version handshake.")
@@ -394,6 +419,68 @@ are false; anything else is true (matching Core's lenient -flag semantics)."
           ((member v '("warn" "warning") :test #'string=) :warn)
           ((member v '("error" "none") :test #'string=) :error)
           (t (error "Invalid loglevel: ~S (want debug/info/warn/error)" value)))))
+
+(defun conf-parse-money (value)
+  "Parse a config VALUE as a BTC amount string into satoshis (Bitcoin Core
+ParseMoney, util/moneystr.cpp): optional whitespace, digits, optional '.'
+plus up to 8 decimal digits. Returns NIL for anything else (negative,
+malformed, >8 decimals, out of range) — callers turn that into their own
+AmountErrMsg-style error."
+  (let* ((v (string-trim '(#\Space #\Tab) value))
+         (dot (position #\. v)))
+    (flet ((digits-p (s) (and (plusp (length s)) (every #'digit-char-p s))))
+      (let ((whole (if dot (subseq v 0 dot) v))
+            (frac (if dot (subseq v (1+ dot)) "")))
+        (when (and (digits-p whole)
+                   (or (null dot) (digits-p frac))
+                   (<= (length frac) 8))
+          (let ((sats (+ (* (parse-integer whole) 100000000)
+                         (if (plusp (length frac))
+                             (* (parse-integer frac)
+                                (expt 10 (- 8 (length frac))))
+                             0))))
+            (when (<= sats 2100000000000000) ; MAX_MONEY
+              sats)))))))
+
+(defun conf-parse-user-hex (value)
+  "Core uint256::FromUserHex (uint256.h:165-176) as raw bytes: strip an
+optional 0x prefix, accept UP TO 64 hex digits, left-pad with zeros to 32
+bytes. Returns the 32 bytes in DISPLAY order (most significant first), or
+NIL for non-hex / over-long input."
+  (let* ((v (string-trim '(#\Space #\Tab) value))
+         (v (if (and (> (length v) 1)
+                     (char= (char v 0) #\0)
+                     (char-equal (char v 1) #\x))
+                (subseq v 2)
+                v)))
+    (when (and (<= (length v) 64)
+               (every (lambda (c) (digit-char-p c 16)) v))
+      (let ((padded (concatenate 'string
+                                 (make-string (- 64 (length v)) :initial-element #\0)
+                                 v)))
+        (bitcoin-lisp.crypto:hex-to-bytes padded)))))
+
+;;; -uacomment / BIP14 subversion (Core init.cpp:1676-1686)
+
+(defconstant +max-subversion-length+ 256
+  "Cap on the full formatted subversion string (Core MAX_SUBVERSION_LENGTH,
+net.h:67). Exceeding it is an init ERROR, not a truncation.")
+
+(defun ua-comment-safe-p (comment)
+  "T when COMMENT survives Core's SanitizeString with SAFE_CHARS_UA_COMMENT
+unchanged (strencodings.cpp:25: alphanumerics plus \" .,;-_?@\"). An unsafe
+character makes -uacomment an init error, matching Core."
+  (every (lambda (c)
+           (or (alphanumericp c) (find c " .,;-_?@")))
+         comment))
+
+(defun format-subversion (comments)
+  "BIP14 subversion string with COMMENTS (Core FormatSubVersion,
+clientversion.cpp:67-72): \"/bitcoin-lisp:0.1.0(c1; c2)/\", no parens block
+when COMMENTS is empty."
+  (if comments
+      (format nil "/bitcoin-lisp:0.1.0(~{~A~^; ~})/" comments)
+      "/bitcoin-lisp:0.1.0/"))
 
 (defconstant +default-proxy-port+ 9050
   "Default SOCKS5 proxy port when -proxy/-onion gives no :port (Tor's SOCKS
@@ -451,13 +538,23 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
     (:signet "signet")
     (:regtest "regtest")))
 
+(defparameter *repeatable-config-options* '("onlynet" "addnode" "uacomment" "externalip")
+  "Option names whose every occurrence is meaningful (Core GetArgs
+list-options); all other repeated command-line options collapse to their
+LAST occurrence (Core GetArg on the command line takes span.end()[-1],
+settings.cpp:193 — a repeated config-FILE key instead keeps the FIRST,
+which parse-bitcoin-conf's in-order alist gives assoc for free).")
+
 (defun parse-cli-args (args)
   "Parse Bitcoin Core-style CLI ARGS (a list of strings) into an alist of
- (lower-case-key . value-string), in order. Accepts -key=value and --key=value;
-a bare -key means key=1 and -nokey means key=0. Non-flag tokens are ignored.
-Later occurrences are kept too, so an assoc lookup returns the first (earliest)."
+ (lower-case-key . value-string), in order. Accepts -key=value and
+--key=value; a bare -key means key=1 and -nokey means key=0 (Core
+InterpretKey/InterpretValue). A repeated non-repeatable key keeps only its
+LAST occurrence (see *repeatable-config-options*), so an assoc lookup
+matches Core's command-line GetArg. Non-flag tokens are ignored here;
+check-cli-args rejects them up front."
   (let ((out nil))
-    (dolist (arg args (nreverse out))
+    (dolist (arg args)
       (when (and (stringp arg) (plusp (length arg)) (char= (char arg 0) #\-))
         (let* ((s (string-left-trim "-" arg))
                (eq-pos (position #\= s)))
@@ -470,7 +567,18 @@ Later occurrences are kept too, so an assoc lookup returns the first (earliest).
             ;; Bare -noKEY negates; bare -KEY asserts.
             ((and (> (length s) 2) (string-equal (subseq s 0 2) "no"))
              (push (cons (string-downcase (subseq s 2)) "0") out))
-            (t (push (cons (string-downcase s) "1") out))))))))
+            (t (push (cons (string-downcase s) "1") out))))))
+    ;; OUT is reversed (last arg first): keep the FIRST cell seen per
+    ;; non-repeatable key = the LAST command-line occurrence, then restore
+    ;; command-line order.
+    (let ((kept nil) (seen (make-hash-table :test 'equal)))
+      (dolist (cell out (copy-list kept))
+        (let ((key (car cell)))
+          (if (member key *repeatable-config-options* :test #'string=)
+              (push cell kept)
+              (unless (gethash key seen)
+                (setf (gethash key seen) t)
+                (push cell kept))))))))
 
 (defun parse-bitcoin-conf (text &optional network)
   "Parse bitcoin.conf TEXT into an alist of (lower-case-key . value-string).
@@ -554,10 +662,70 @@ signet|regtest, else returns DEFAULT."
     ("wallet"            :wallet             :bool)
     ("logfile"           :log-file           :string)
     ("loglevel"          :log-level          :loglevel)
+    ("port"              :port               :int)
+    ("networkactive"     :network-active     :bool)
+    ("rest"              :rest               :bool)
     ("sync"              :sync               :bool))
   "Maps a Bitcoin Core-style option name to a start-node keyword and its value
 type. Network selection (-chain/-testnet/...) and -server/-debug are handled
 specially in config-alist->start-node-plist.")
+
+(defparameter *known-config-options*
+  '(;; network selection + entry-point specials
+    "regtest" "signet" "testnet4" "testnet" "chain" "server" "debug" "conf"
+    "datadir"
+    ;; apply-config-globals options
+    "datacarrier" "datacarriersize" "permitbaremultisig"
+    "limitclustercount" "limitclustersize" "signetchallenge"
+    "proxy" "onion" "proxyrandomize" "onlynet" "cjdnsreachable"
+    "assumevalid" "minimumchainwork" "mempoolexpiry" "minrelaytxfee"
+    "blockmintxfee" "bantime" "uacomment" "dnsseed" "fixedseeds"
+    "stopatheight" "externalip"
+    ;; repeatable start-node option collected outside the spec scan
+    "addnode")
+  "Config option names recognized OUTSIDE *cli-option-spec* (network flags,
+entry-point specials, and the process-global options apply-config-globals
+consumes). check-cli-args unions this with the spec to reject unknown
+command-line options at startup, like Core ArgsManager::ParseParameters
+(common/args.cpp:229-238).")
+
+(defun known-config-option-p (name)
+  "T if NAME (lower-case, no dashes) is a recognized config option."
+  (and (or (member name *known-config-options* :test #'string=)
+           (assoc name *cli-option-spec* :test #'string=)
+           ;; -nokey negation of a known key parses to key=0 before this
+           ;; check, but tolerate the raw \"noKEY\" spelling too.
+           (and (> (length name) 2) (string-equal (subseq name 0 2) "no")
+                (known-config-option-p (subseq name 2))))
+       t))
+
+(defun check-cli-args (args)
+  "Reject unknown command-line options and bare non-option tokens, like
+Bitcoin Core (common/args.cpp:211 \"Invalid command\", :229-238 \"Invalid
+parameter\" — unknown CLI options are a HARD error; unknown CONFIG-FILE keys
+only warn, common/config.cpp:107-115 with ignore_invalid_keys=true from
+common/init.cpp:38). Returns ARGS."
+  (dolist (arg args args)
+    (unless (stringp arg)
+      (error "Invalid command '~A'" arg))
+    (if (and (plusp (length arg)) (char= (char arg 0) #\-))
+        (let* ((s (string-left-trim "-" arg))
+               (eq-pos (position #\= s))
+               (name (string-downcase (if eq-pos (subseq s 0 eq-pos) s))))
+          (unless (or (zerop (length name))          ; bare "-"/"--"
+                      (known-config-option-p name))
+            (error "Invalid parameter ~A" arg)))
+        (error "Invalid command '~A'" arg))))
+
+(defun unknown-config-file-keys (conf-alist)
+  "The keys in CONF-ALIST that no option table recognizes. The caller logs a
+warning per key (Core LogWarning \"Ignoring unknown configuration value\")
+— unknown config-FILE keys never abort startup."
+  (remove-duplicates
+   (loop for (k . nil) in conf-alist
+         unless (known-config-option-p k)
+           collect k)
+   :test #'string= :from-end t))
 
 (defun conf-effective-listen-flags (alist)
   "Replay Core's -proxy/-listen/-listenonion soft-set chain over a merged
@@ -596,6 +764,17 @@ resolved network. Honors -server (enable RPC on the default port when no
                         (:bool (conf-parse-bool raw))
                         (:int (conf-parse-int raw))
                         (:loglevel (conf-parse-loglevel raw)))))))))
+      ;; -port must be a real port number (Core init.cpp InitError
+      ;; "Invalid port specified in -port").
+      (let ((port (getf plist :port)))
+        (when (and port (not (<= 1 port 65535)))
+          (error "Invalid port specified in -port: '~A'" port)))
+      ;; -addnode is repeatable (Core GetArgs -> m_added_node_params,
+      ;; init.cpp:2107): collect every occurrence, CLI and config file.
+      (let ((adds (loop for (k . v) in alist
+                        when (string= k "addnode")
+                          collect v)))
+        (when adds (setf (getf plist :addnode) adds)))
       ;; -debug is a shortcut for -loglevel=debug (unless loglevel was set).
       (let ((debug (lookup "debug")))
         (when (and debug (conf-parse-bool (cdr debug)) (not (lookup "loglevel")))
@@ -631,8 +810,11 @@ specials directly: -datacarrier, -datacarriersize, -permitbaremultisig,
 -limitclustercount/-limitclustersize (cluster mempool acceptance limits),
 -signetchallenge (a custom signet block-challenge), the SOCKS5 proxy
 options -proxy/-onion/-proxyrandomize (networking's *proxy*/*onion-proxy*),
-and the network-reachability options -onlynet (repeatable)/-cjdnsreachable
-(networking's *reachable-networks*/*cjdns-reachable*).
+the network-reachability options -onlynet (repeatable)/-cjdnsreachable
+(networking's *reachable-networks*/*cjdns-reachable*), plus the Wave-10
+wires: -assumevalid/-minimumchainwork (consensus overrides), -mempoolexpiry,
+-minrelaytxfee, -blockmintxfee, -bantime, -uacomment (repeatable),
+-dnsseed/-fixedseeds, -stopatheight, -port, and -externalip (repeatable).
 CLI-over-file precedence is already applied in MERGED. Called at startup by
 start-node-from-args."
   (flet ((lk (k) (let ((c (assoc k merged :test #'string=))) (and c (cdr c)))))
@@ -662,6 +844,87 @@ start-node-from-args."
     (let ((v (lk "signetchallenge")))
       (when v (setf bitcoin-lisp.validation:*signet-challenge*
                     (bitcoin-lisp.crypto:hex-to-bytes v))))
+    ;; -assumevalid: a block hash (up to 64 hex digits, Core FromUserHex
+    ;; left-pads) below which block scripts are assumed valid, or 0 to
+    ;; disable the skip entirely (Core chainstatemanager_args.cpp:40-46).
+    ;; Stored in WIRE byte order (the block-index key form).
+    (let ((v (lk "assumevalid")))
+      (when v
+        (let ((display (conf-parse-user-hex v)))
+          (unless display
+            (error "Invalid assumevalid block hash specified (~A), must be up to 64 hex digits (or 0 to disable)" v))
+          (setf *assumevalid-override*
+                (if (every #'zerop display)
+                    nil                              ; assumevalid=0: always verify
+                    (bitcoin-lisp.crypto:reverse-bytes display))))))
+    ;; -minimumchainwork: hex work floor overriding the per-network
+    ;; nMinimumChainWork (Core chainstatemanager_args.cpp:32-38).
+    (let ((v (lk "minimumchainwork")))
+      (when v
+        (let ((display (conf-parse-user-hex v)))
+          (unless display
+            (error "Invalid minimum work specified (~A), must be up to 64 hex digits" v))
+          (setf *minimum-chain-work-override*
+                (loop with acc = 0
+                      for b across display
+                      do (setf acc (+ (ash acc 8) b))
+                      finally (return acc))))))
+    ;; -mempoolexpiry: hours before an untouched mempool entry is dropped
+    ;; (Core mempool_args.cpp:57, default DEFAULT_MEMPOOL_EXPIRY_HOURS 336).
+    (let ((v (lk "mempoolexpiry")))
+      (when v (setf bitcoin-lisp.mempool:*mempool-expiry-hours* (conf-parse-int v))))
+    ;; -minrelaytxfee: BTC/kvB (Core ParseMoney, mempool_args.cpp:69-81).
+    ;; Read at MAKE-MEMPOOL time like the cluster limits.
+    (let ((v (lk "minrelaytxfee")))
+      (when v
+        (let ((sats (conf-parse-money v)))
+          (unless sats
+            (error "Invalid amount for -minrelaytxfee=~A" v))
+          (setf bitcoin-lisp.mempool:*min-relay-fee-rate* sats))))
+    ;; -blockmintxfee: BTC/kvB floor for block-template selection (Core
+    ;; miner.cpp:102-104, default DEFAULT_BLOCK_MIN_TX_FEE = 1 sat/kvB).
+    (let ((v (lk "blockmintxfee")))
+      (when v
+        (let ((sats (conf-parse-money v)))
+          (unless sats
+            (error "Invalid amount for -blockmintxfee=~A" v))
+          (setf bitcoin-lisp.mining:*block-min-tx-fee-rate* sats))))
+    ;; -bantime: default setban duration in seconds (Core banman.h:19
+    ;; DEFAULT_MISBEHAVING_BANTIME = 86400, applied when setban gets no time).
+    (let ((v (lk "bantime")))
+      (when v (setf bitcoin-lisp.networking:*default-ban-time-seconds*
+                    (conf-parse-int v))))
+    ;; -uacomment (repeatable): BIP14 subversion comments. Unsafe characters
+    ;; or an over-long result are init ERRORS (Core init.cpp:1676-1686).
+    (let ((comments (loop for (k . v) in merged
+                          when (string= k "uacomment")
+                            collect v)))
+      (dolist (cmt comments)
+        (unless (ua-comment-safe-p cmt)
+          (error "User Agent comment (~A) contains unsafe characters." cmt)))
+      (when comments
+        (let ((subversion (format-subversion comments)))
+          (when (> (length subversion) +max-subversion-length+)
+            (error "Total length of network version string (~D) exceeds maximum length (~D). Reduce the number or size of uacomments."
+                   (length subversion) +max-subversion-length+))
+          (setf bitcoin-lisp.serialization:*user-agent* subversion))))
+    ;; -dnsseed / -fixedseeds: peer-discovery source gates (Core net.h:96-97).
+    (let ((v (lk "dnsseed")))
+      (when v (setf *dns-seed-enabled* (conf-parse-bool v))))
+    (let ((v (lk "fixedseeds")))
+      (when v (setf *fixed-seeds-enabled* (conf-parse-bool v))))
+    ;; -stopatheight: shut down once the tip reaches this height (Core
+    ;; kernel_notifications.cpp:61-66).
+    (let ((v (lk "stopatheight")))
+      (when v (setf *stop-at-height* (conf-parse-int v))))
+    ;; -externalip (repeatable): addresses to advertise as our own (Core
+    ;; init.cpp:1803-1808, AddLocal LOCAL_MANUAL). Raw strings here; start-node
+    ;; resolves them once the network (and thus the listen port) is known, and
+    ;; errors on unparseable input like Core's ResolveErrMsg.
+    (setf bitcoin-lisp.networking:*external-ips*
+          (loop for (k . v) in merged
+                when (string= k "externalip")
+                  collect v))
     ;; -proxy: run ALL outbound P2P connections through a SOCKS5 proxy
     ;; (Bitcoin Core init.cpp:1698-1762 sets it for every network).
     ;; -noproxy / -proxy=0 clears it. -proxyrandomize (default on) enables

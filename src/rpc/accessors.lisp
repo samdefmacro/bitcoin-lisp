@@ -92,3 +92,22 @@ getchainstates, which reports every chainstate)."
   "Get the coinstats index with lock protection."
   (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
     (bitcoin-lisp::node-coinstatsindex node)))
+
+;;; --- JSON booleans ---
+;;;
+;;; The RPC layer's historical convention folds CL NIL to JSON null, but a
+;;; Core boolean field is ALWAYS true/false when present (UniValue pushKV of
+;;; bool; conditional booleans are OMITTED, never null). JSON-BOOL is the one
+;;; coercion point: NIL still means null for genuinely nullable/absent
+;;; values, and 'YASON:FALSE is the explicit false literal. Defined here (not
+;;; server.lisp) so every later-compiled RPC file sees the definitions.
+
+(defconstant +json-false+ 'yason:false
+  "The JSON false literal: yason encodes this symbol as false (encode.lisp
+defmethod on (eql 'false)); rpc-result->json passes it through as an atom.")
+
+(defun json-bool (x)
+  "Coerce generalized boolean X to a JSON boolean: T or the false literal.
+Use for every field Core emits as a bool — NIL must never leak into such a
+field, as it would encode as null."
+  (if x t +json-false+))

@@ -15,12 +15,17 @@
 (defconstant +rpc-type-error+ -3)
 (defconstant +rpc-invalid-address-or-key+ -5)
 (defconstant +rpc-invalid-parameter+ -8)
+(defconstant +rpc-client-not-connected+ -9)
+(defconstant +rpc-client-in-initial-download+ -10)
 (defconstant +rpc-deserialization-error+ -22)
 (defconstant +rpc-client-node-already-added+ -23)
 (defconstant +rpc-client-node-not-added+ -24)
 (defconstant +rpc-verify-error+ -25)
 (defconstant +rpc-transaction-rejected+ -26)
 (defconstant +rpc-verify-already-in-utxo-set+ -27)
+(defconstant +rpc-client-node-not-connected+ -29)
+(defconstant +rpc-client-invalid-ip-or-subnet+ -30)
+(defconstant +rpc-client-mempool-disabled+ -33)
 
 ;;; --- RPC Error Condition ---
 
@@ -44,8 +49,9 @@
   "Dispatch to the appropriate method handler."
   (let ((handler (gethash method *rpc-methods*)))
     (unless handler
+      ;; Core's exact message (server.cpp:499) — no method-name suffix.
       (error 'rpc-error :code +rpc-method-not-found+
-                        :message (format nil "Method not found: ~A" method)))
+                        :message "Method not found"))
     (funcall handler node params)))
 
 ;;; --- Register All Methods ---
@@ -183,7 +189,11 @@
 ;;; --- JSON-RPC Request/Response Handling ---
 
 (defun parse-json-rpc-request (body)
-  "Parse JSON-RPC request body. Returns (method params id) or signals error."
+  "Parse JSON-RPC request body. Returns (values :single method params id
+version id-present-p) or (values :batch requests). VERSION is :v2 when the
+request carries jsonrpc:\"2.0\", else :v1 (absent/1.0/1.1 — Core JSONRPCRequest
+::parse's V1_LEGACY); ID-PRESENT-P distinguishes a V2 notification (no id
+member at all) from id:null. Signals rpc-error on malformed input."
   (handler-case
       (let ((json (yason:parse body)))
         (cond
@@ -194,17 +204,23 @@
           ((hash-table-p json)
            (let ((method (gethash "method" json))
                  (params (gethash "params" json))
-                 (id (gethash "id" json)))
+                 (version (if (equal (gethash "jsonrpc" json) "2.0") :v2 :v1)))
              ;; Accept any/absent "jsonrpc" version: bitcoin-cli sends 1.0 (or
              ;; omits it) on older builds and 2.0 on newer; Core doesn't
              ;; validate it. Rejecting non-2.0 made stock bitcoin-cli unusable.
              (unless (stringp method)
                (error 'rpc-error :code +rpc-invalid-request+
                                  :message "Missing or invalid method"))
-             (values :single method (or params '()) id)))
+             (multiple-value-bind (id id-present) (gethash "id" json)
+               (values :single method (or params '()) id version
+                       (and id-present t)))))
           (t
            (error 'rpc-error :code +rpc-invalid-request+
                              :message "Invalid request format"))))
+    ;; Our own -32600 invalid-request errors must pass through unchanged;
+    ;; only a genuine JSON parse failure is -32700 (previously the outer
+    ;; clause swallowed them into "Parse error").
+    (rpc-error (e) (error e))
     (error (e)
       (declare (ignore e))
       (error 'rpc-error :code +rpc-parse-error+
@@ -414,6 +430,23 @@ clients (bitcoin-cli, curl) send no Origin at all and always pass."
   (with-output-to-string (s)
     (yason:encode (make-rpc-error-response code message nil) s)))
 
+(defun rpc-error-http-status (code)
+  "HTTP status for a JSON-RPC 1.x error response (Core JSONErrorReply,
+httprpc.cpp:41-59): -32600 -> 400, -32601 -> 404, everything else -> 500.
+JSON-RPC 2.0 requests never use this — they always answer HTTP 200 with the
+error in the body (httprpc.cpp:160-164)."
+  (cond ((= code +rpc-invalid-request+) hunchentoot:+http-bad-request+)
+        ((= code +rpc-method-not-found+) hunchentoot:+http-not-found+)
+        (t hunchentoot:+http-internal-server-error+)))
+
+(defun rpc-response-http-status (response version)
+  "The HTTP status to send with a single JSON-RPC RESPONSE hash-table:
+200 for success or any :V2 request; the Core 1.x mapping otherwise."
+  (let ((err (gethash "error" response)))
+    (if (or (null err) (eq version :v2))
+        hunchentoot:+http-ok+
+        (rpc-error-http-status (gethash "code" err)))))
+
 (defun rpc-handler ()
   "Handle incoming RPC requests."
   (let ((request hunchentoot:*request*))
@@ -435,14 +468,16 @@ clients (bitcoin-cli, curl) send no Origin at all and always pass."
       (return-from rpc-handler
         (rpc-json-error 429 +rpc-misc-error+ "Rate limit exceeded")))
 
-    ;; Check body size limit
+    ;; Check body size limit: 32 MiB (Core evhttp_set_max_body_size(MAX_SIZE),
+    ;; httpserver.cpp:410). libevent answers an oversized body with 400.
     (let* ((content-length-str (hunchentoot:header-in :content-length request))
            (content-length (and content-length-str
                                 (parse-integer content-length-str :junk-allowed t))))
       (when (and content-length
                  (> content-length bitcoin-lisp:+max-rpc-body-size+))
         (return-from rpc-handler
-          (rpc-json-error 413 +rpc-misc-error+ "Request body too large"))))
+          (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
+                          "Request body too large"))))
 
     ;; Check Content-Type
     (let ((content-type (hunchentoot:header-in :content-type request)))
@@ -461,19 +496,39 @@ clients (bitcoin-cli, curl) send no Origin at all and always pass."
       ;; Post-read body size check (in case Content-Length was absent or wrong)
       (when (and body (> (length body) bitcoin-lisp:+max-rpc-body-size+))
         (return-from rpc-handler
-          (rpc-json-error 413 +rpc-misc-error+ "Request body too large")))
+          (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
+                          "Request body too large")))
       (handler-case
-          (multiple-value-bind (request-type method-or-batch params id)
+          (multiple-value-bind (request-type method-or-batch params id version id-present)
               (parse-json-rpc-request body)
-            (let ((response
-                    (case request-type
-                      (:single
-                       (handle-single-request *rpc-node* method-or-batch params id))
-                      (:batch
-                       (handle-batch-request *rpc-node* method-or-batch)))))
-              (with-output-to-string (s)
-                (yason:encode response s))))
+            (case request-type
+              (:single
+               (let ((response (handle-single-request *rpc-node* method-or-batch
+                                                      params id)))
+                 ;; A JSON-RPC 2.0 notification (no id member) answers 204
+                 ;; with no body after executing (Core httprpc.cpp:169);
+                 ;; otherwise the 1.x error->status mapping applies
+                 ;; (rpc-response-http-status; 2.0 is always 200).
+                 (cond
+                   ((and (eq version :v2) (not id-present))
+                    (setf (hunchentoot:return-code*) hunchentoot:+http-no-content+)
+                    "")
+                   (t
+                    (setf (hunchentoot:return-code*)
+                          (rpc-response-http-status response version))
+                    (with-output-to-string (s)
+                      (yason:encode response s))))))
+              (:batch
+               ;; Batches always answer HTTP 200 (Core httprpc.cpp:196-206).
+               (let ((response (handle-batch-request *rpc-node* method-or-batch)))
+                 (with-output-to-string (s)
+                   (yason:encode response s))))))
         (rpc-error (e)
+          ;; Body-level failures (parse error -32700, invalid request -32600)
+          ;; have no version context; Core treats them as 1.x and maps the
+          ;; status accordingly (parse error -> 500, invalid request -> 400).
+          (setf (hunchentoot:return-code*)
+                (rpc-error-http-status (rpc-error-code e)))
           (with-output-to-string (s)
             (yason:encode (make-rpc-error-response (rpc-error-code e)
                                                    (rpc-error-message e)
@@ -481,6 +536,7 @@ clients (bitcoin-cli, curl) send no Origin at all and always pass."
                           s)))
         (error (e)
           (bitcoin-lisp::node-log :error "RPC handler error: ~A" e)
+          (setf (hunchentoot:return-code*) hunchentoot:+http-internal-server-error+)
           (with-output-to-string (s)
             (yason:encode (make-rpc-error-response +rpc-internal-error+
                                                    "Internal error"
@@ -497,9 +553,13 @@ clients (bitcoin-cli, curl) send no Origin at all and always pass."
 
 (defun start-rpc-server (node &key port (bind "127.0.0.1")
                                    user password
+                                   rest-enabled
                                    ui-enabled ui-directory)
   "Start the RPC server.
 PORT defaults to 18332 for testnet, 8332 for mainnet.
+REST-ENABLED registers the Core-style /rest/ GET surface; like Core, the
+REST interface is OFF unless -rest is given (DEFAULT_REST_ENABLE = false,
+init.cpp:153,758 — previously we registered it unconditionally).
 UI-ENABLED registers the /ui/ web UI dispatcher (gui-plan P0); UI-DIRECTORY
 overrides the asset directory (default: the repo's ui/, see ui.lisp)."
   (let ((port (or port (bitcoin-lisp:network-rpc-port bitcoin-lisp:*network*))))
@@ -535,11 +595,14 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
             (setf *rpc-dispatcher* dispatcher)
             (push dispatcher hunchentoot:*dispatch-table*))
           ;; REST GET surface under /rest/ — pushed AFTER the "/" dispatcher
-          ;; so it sits at the front of the list and matches first.
-          (let ((rest-dispatcher (hunchentoot:create-prefix-dispatcher
-                                  "/rest/" 'rest-dispatch-handler)))
-            (setf *rest-dispatcher* rest-dispatcher)
-            (push rest-dispatcher hunchentoot:*dispatch-table*))
+          ;; so it sits at the front of the list and matches first. Only when
+          ;; -rest is given (Core StartREST gate, init.cpp:758).
+          (when rest-enabled
+            (bitcoin-lisp::node-log :info "REST interface enabled at /rest/")
+            (let ((rest-dispatcher (hunchentoot:create-prefix-dispatcher
+                                    "/rest/" 'rest-dispatch-handler)))
+              (setf *rest-dispatcher* rest-dispatcher)
+              (push rest-dispatcher hunchentoot:*dispatch-table*)))
           ;; Web UI static assets under /ui/ (gui-plan P0). Registered only
           ;; when enabled — a disabled UI leaves no handler at all.
           (setf *ui-enabled* (and ui-enabled t)
