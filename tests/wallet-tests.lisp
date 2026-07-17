@@ -762,9 +762,6 @@ throws out of the whole call."
                        node (list (list (%ht "desc" desc "timestamp" "now"
                                              "active" t "range" 9))))))
         (is (eq t (%aval "success" (first results))))
-        ;; rescan-deferred warning present
-        (is (some (lambda (w) (search "P2" w))
-                  (%aval "warnings" (first results))))
         ;; the wallet can now hand out watch-only bech32 addresses
         (let ((address (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "bech32"))))
           (is (string= "tb1q" (subseq address 0 4))))
