@@ -86,10 +86,10 @@ the no-wallet/no-range constants; bad descriptors error."
     (is (string= (concatenate 'string body "#fm24fxxy")
                  (cdr (assoc "descriptor" r :test #'string=))))
     (is (string= "fm24fxxy" (cdr (assoc "checksum" r :test #'string=))))
-    (is (null (cdr (assoc "isrange" r :test #'string=))))
+    (is (eq 'yason:false (cdr (assoc "isrange" r :test #'string=))))
     ;; raw() is not solvable (Core IsSolvable, RawDescriptor override)
-    (is (null (cdr (assoc "issolvable" r :test #'string=))))
-    (is (null (cdr (assoc "hasprivatekeys" r :test #'string=))))
+    (is (eq 'yason:false (cdr (assoc "issolvable" r :test #'string=))))
+    (is (eq 'yason:false (cdr (assoc "hasprivatekeys" r :test #'string=))))
     ;; accepts a correct input checksum, rejects a wrong one and junk
     (is (string= (concatenate 'string body "#fm24fxxy")
                  (cdr (assoc "descriptor"
@@ -153,7 +153,8 @@ reports fee_delta/in_mempool/modified_fee; getmempoolentry exposes fees.modified
     (let* ((r (bitcoin-lisp.rpc::rpc-getprioritisedtransactions node nil))
            (row (cdr (assoc txid-hex r :test #'string=))))
       (is (= 2500 (cdr (assoc "fee_delta" row :test #'string=))))
-      (is (null (cdr (assoc "in_mempool" row :test #'string=)))))
+      ;; A Core boolean: JSON false, never null (wave-10 false/null fix).
+      (is (eq 'yason:false (cdr (assoc "in_mempool" row :test #'string=)))))
     ;; Net-zero clears it; empty map encodes as an object
     (is (eq t (bitcoin-lisp.rpc::rpc-prioritisetransaction node (list txid-hex nil -2500))))
     (is (hash-table-p (bitcoin-lisp.rpc::rpc-getprioritisedtransactions node nil)))
@@ -182,9 +183,10 @@ error mapping (400 bad request / 404 not found / unknown endpoint)."
       ;; mempool/info.json -> 200 json
       (is (= 200 (progn (bitcoin-lisp.rpc::rest-handle node "/rest/mempool/info.json")
                         (status))))
-      ;; chaininfo only supports .json -> .hex is 400
+      ;; chaininfo only supports .json -> unknown format is Core's 404
+      ;; "output format not found"
       (bitcoin-lisp.rpc::rest-handle node "/rest/chaininfo.hex")
-      (is (= 400 (status)))
+      (is (= 404 (status)))
       ;; malformed block hash -> 400
       (bitcoin-lisp.rpc::rest-handle node "/rest/block/nothex.json")
       (is (= 400 (status)))
@@ -204,7 +206,8 @@ error mapping (400 bad request / 404 not found / unknown endpoint)."
       (is (= 400 (status))))))
 
 (test rest-getutxos-reports-absence
-  "getutxos returns found=false for an unknown outpoint (no error)."
+  "BIP64 getutxos: an unknown outpoint yields an empty utxos array and a
+\"0\" bitmap (Core interface_rest.py: bitmap \"0\", len(utxos) 0)."
   (let ((node (make-test-node))
         (hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
     (let* ((txid (make-string 64 :initial-element #\c))
@@ -212,9 +215,10 @@ error mapping (400 bad request / 404 not found / unknown endpoint)."
                   node (format nil "/rest/getutxos/~A-0.json" txid)))
            (parsed (yason:parse body)))
       (is (= 200 (hunchentoot:return-code*)))
-      (let ((utxos (gethash "utxos" parsed)))
-        (is (= 1 (length utxos)))
-        (is (eq nil (gethash "found" (first utxos))))))))
+      (is (integerp (gethash "chainHeight" parsed)))
+      (is (stringp (gethash "chaintipHash" parsed)))
+      (is (string= "0" (gethash "bitmap" parsed)))
+      (is (= 0 (length (gethash "utxos" parsed)))))))
 
 (defun %proof-hashes (n)
   "N distinct 32-byte hashes for partial-merkle-tree tests."
@@ -442,9 +446,10 @@ status with no scan running returns null; abort with no scan is a no-op."
         (is (every (lambda (u) (find #\# (cdr (assoc "desc" u :test #'string=))))
                    unspents)))
       (is (= 2.0 (cdr (assoc "total_amount" r :test #'string=)))))
-    ;; No scan running: status -> null, abort -> no-op null.
+    ;; No scan running: status -> null (Core NullUniValue); abort -> a bare
+    ;; JSON false (nothing to abort).
     (is (null (bitcoin-lisp.rpc::rpc-scantxoutset node (list "status"))))
-    (is (null (bitcoin-lisp.rpc::rpc-scantxoutset node (list "abort"))))
+    (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-scantxoutset node (list "abort"))))
     ;; Bad action / missing scanobjects -> errors.
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-scantxoutset node (list "frobnicate")))
@@ -855,7 +860,7 @@ validation.cpp:2117) through testmempoolaccept."
           (hex (bitcoin-lisp.crypto:bytes-to-hex
                 (bitcoin-lisp.serialization:serialize-transaction tx))))
       (let ((r (first (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list hex))))))
-        (is (null (cdr (assoc "allowed" r :test #'string=))))
+        (is (eq 'yason:false (cdr (assoc "allowed" r :test #'string=))))
         (is (string= "mempool-script-verify-flag-failed"
                      (cdr (assoc "reject-reason" r :test #'string=))))))))
 
@@ -1238,9 +1243,9 @@ a hardcoded 1."
     (is (eq t (cdr (assoc "isvalid" result :test #'string=))))
     (is (assoc "address" result :test #'string=))
     (is (assoc "scriptPubKey" result :test #'string=))
-    (is (eq nil (cdr (assoc "iswitness" result :test #'string=))))
+    (is (eq 'yason:false (cdr (assoc "iswitness" result :test #'string=))))
     ;; isscript is a real boolean; a P2PKH address is not a script address.
-    (is (eq nil (cdr (assoc "isscript" result :test #'string=))))))
+    (is (eq 'yason:false (cdr (assoc "isscript" result :test #'string=))))))
 
 (test rpc-validateaddress-valid-bech32
   "Test validateaddress with valid testnet bech32 address"
@@ -1255,7 +1260,9 @@ a hardcoded 1."
   "Test validateaddress with invalid address"
   (let* ((node (make-test-node))
          (result (bitcoin-lisp.rpc::rpc-validateaddress node '("not-an-address"))))
-    (is (eq nil (cdr (assoc "isvalid" result :test #'string=))))))
+    (is (eq 'yason:false (cdr (assoc "isvalid" result :test #'string=))))
+    ;; Core's invalid shape carries error + error_locations.
+    (is (stringp (cdr (assoc "error" result :test #'string=))))))
 
 (test rpc-validateaddress-isscript-boolean
   "isscript is T (a boolean) for a script address (P2SH) -- regression: it used
@@ -1273,7 +1280,7 @@ array / could error."
   "Test validateaddress with empty string"
   (let* ((node (make-test-node))
          (result (bitcoin-lisp.rpc::rpc-validateaddress node '(""))))
-    (is (eq nil (cdr (assoc "isvalid" result :test #'string=))))))
+    (is (eq 'yason:false (cdr (assoc "isvalid" result :test #'string=))))))
 
 (test rpc-validateaddress-wrong-network
   "Test validateaddress with mainnet address on testnet"
@@ -1281,7 +1288,7 @@ array / could error."
          ;; Mainnet P2PKH address (starts with 1)
          (result (bitcoin-lisp.rpc::rpc-validateaddress node '("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2"))))
     ;; Should be invalid on testnet node
-    (is (eq nil (cdr (assoc "isvalid" result :test #'string=))))))
+    (is (eq 'yason:false (cdr (assoc "isvalid" result :test #'string=))))))
 
 ;;; decodescript tests
 
@@ -1587,7 +1594,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     (is (= 1 (length result)))
     (let ((r (first result)))
       ;; Empty UTXO set => missing input => not allowed, with a reason.
-      (is (null (cdr (assoc "allowed" r :test #'string=))))
+      (is (eq 'yason:false (cdr (assoc "allowed" r :test #'string=))))
       (is (string= "missing-input" (cdr (assoc "reject-reason" r :test #'string=)))))
     ;; Nothing was added to the mempool.
     (is (= 0 (bitcoin-lisp.mempool:mempool-count (bitcoin-lisp::node-mempool node))))))
@@ -1681,8 +1688,10 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       (is (string= "buried" (cdr (assoc "type" segwit :test #'string=))))
       (is (= (bitcoin-lisp.validation:get-segwit-activation-height net)
              (cdr (assoc "height" segwit :test #'string=))))
-      ;; height 0 < testnet segwit activation -> not active
-      (is (eq (>= 0 (bitcoin-lisp.validation:get-segwit-activation-height net))
+      ;; height 0 < testnet segwit activation -> not active (a JSON boolean,
+      ;; so inactive is false rather than null)
+      (is (eq (bitcoin-lisp.rpc:json-bool
+               (>= 0 (bitcoin-lisp.validation:get-segwit-activation-height net)))
               (cdr (assoc "active" segwit :test #'string=)))))))
 
 ;;; --- Peer / address RPCs ---
@@ -1768,9 +1777,10 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
     (is (integerp (cdr (assoc "timemillis" r :test #'string=))))
     (is (consp (cdr (assoc "uploadtarget" r :test #'string=))))))
 
-(test rpc-verifychain-empty-node-returns-nil
-  "verifychain on a node with no stored blocks returns NIL gracefully."
-  (is (null (bitcoin-lisp.rpc::rpc-verifychain (make-test-node) (list 0 1)))))
+(test rpc-verifychain-empty-node-returns-false
+  "verifychain on a node with no stored blocks returns JSON false (a bare
+Core boolean — never null)."
+  (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-verifychain (make-test-node) (list 0 1)))))
 
 ;;; --- waitfornewblock / dumptxoutset ---
 
@@ -2035,7 +2045,17 @@ to \"block-relay-only\" with relaytxes false."
       ;; services is Core's 16-hex-digit string, not a number.
       (is (string= "0000000000000409" (cdr (assoc "services" e :test #'string=))))
       (is-true b)
-      (is (null (cdr (assoc "relaytxes" b :test #'string=)))))))
+      (is (eq 'yason:false (cdr (assoc "relaytxes" b :test #'string=))))
+      ;; transport_protocol_type (Core TransportTypeAsString): "v1" without a
+      ;; BIP324 session, "v2" when the connection carries one.
+      (is (string= "v1" (cdr (assoc "transport_protocol_type" e :test #'string=))))
+      (setf (bitcoin-lisp.networking::peer-connection br)
+            (bitcoin-lisp.networking::make-connection :host "5.6.7.8" :port 8333
+                                                      :transport t))
+      (let* ((rows2 (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+             (b2 (find "block-relay-only" rows2 :key ct :test #'string=)))
+        (is (string= "v2" (cdr (assoc "transport_protocol_type" b2
+                                      :test #'string=))))))))
 
 (test rpc-getorphantxs
   "getorphantxs lists the orphan pool: verbosity 0 -> array of txid hex; 1 ->
@@ -2092,14 +2112,21 @@ address, and a malformed signature all fail. The signature is deterministic."
     (is (stringp sig))
     (is (string= sig (bitcoin-lisp.rpc::rpc-signmessagewithprivkey node (list wif msg))))
     (is (eq t (bitcoin-lisp.rpc::rpc-verifymessage node (list addr sig msg))))
-    (is (null (bitcoin-lisp.rpc::rpc-verifymessage node (list addr sig "tampered"))))
+    ;; Bare Core booleans: failures are JSON false, never null (wave 10).
+    (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-verifymessage node (list addr sig "tampered"))))
     (let* ((k2 (let ((k (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
                  (setf (aref k 31) 2) k))
            (addr2 (bitcoin-lisp.crypto:encode-p2pkh-address
                    (bitcoin-lisp.crypto:hash160 (bitcoin-lisp.crypto:derive-public-key k2))
                    :testnet3)))
-      (is (null (bitcoin-lisp.rpc::rpc-verifymessage node (list addr2 sig msg)))))
-    (is (null (bitcoin-lisp.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg))))))
+      (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-verifymessage node (list addr2 sig msg)))))
+    ;; Malformed base64 is an ERROR in Core (-5 "Malformed base64 encoding"),
+    ;; not a false result (rpc/signmessage.cpp ERR_MALFORMED_SIGNATURE).
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-verifymessage node (list addr "not-a-valid-sig" msg))
+               (fail "malformed base64 should signal"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (= -5 (bitcoin-lisp.rpc::rpc-error-code e)))))))
 
 (test rpc-signrawtransactionwithkey-p2pkh-p2wpkh
   "signrawtransactionwithkey signs a P2WPKH input (input 0) and a P2PKH input
@@ -2547,7 +2574,7 @@ all_networks aggregate; counts stay consistent with the address book."
             (b (find "5.6.7.8:18333" r :key (lambda (e) (cdr (assoc "addednode" e :test #'string=)))
                      :test #'string=)))
         (is (eq t (cdr (assoc "connected" a :test #'string=))))
-        (is (null (cdr (assoc "connected" b :test #'string=))))
+        (is (eq 'yason:false (cdr (assoc "connected" b :test #'string=))))
         ;; connected node carries one outbound address entry
         (let ((addrs (cdr (assoc "addresses" a :test #'string=))))
           (is (= 1 (length addrs)))
@@ -2566,11 +2593,11 @@ all_networks aggregate; counts stay consistent with the address book."
     (push peer (bitcoin-lisp::node-peers node))
     (is (bitcoin-lisp::node-network-active node))      ; default enabled
     ;; disable
-    (is (null (bitcoin-lisp.rpc::rpc-setnetworkactive node '(nil))))
+    (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-setnetworkactive node '(nil))))
     (is (null (bitcoin-lisp::node-network-active node)))
     (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
     ;; getnetworkinfo reflects the disabled state
-    (is (null (cdr (assoc "networkactive"
+    (is (eq 'yason:false (cdr (assoc "networkactive"
                           (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil) :test #'string=))))
     ;; re-enable
     (is (eq t (bitcoin-lisp.rpc::rpc-setnetworkactive node '(t))))
@@ -2682,20 +2709,21 @@ all/none and unknown-category handling."
          (let ((r (bitcoin-lisp.rpc::rpc-logging node nil)))
            (is (= (length bitcoin-lisp::+log-categories+) (length r)))
            (is (assoc "net" r :test #'string=))
-           (is (null (cdr (assoc "net" r :test #'string=)))))
+           ;; category states are JSON booleans — false, never null (wave 10)
+           (is (eq 'yason:false (cdr (assoc "net" r :test #'string=)))))
          ;; include enables, leaving others off
          (let ((r (bitcoin-lisp.rpc::rpc-logging node (list (list "net") nil))))
            (is (eq t (cdr (assoc "net" r :test #'string=))))
-           (is (null (cdr (assoc "mempool" r :test #'string=)))))
+           (is (eq 'yason:false (cdr (assoc "mempool" r :test #'string=)))))
          ;; exclude disables
          (let ((r (bitcoin-lisp.rpc::rpc-logging node (list nil (list "net")))))
-           (is (null (cdr (assoc "net" r :test #'string=)))))
+           (is (eq 'yason:false (cdr (assoc "net" r :test #'string=)))))
          ;; "all" enables every category
          (let ((r (bitcoin-lisp.rpc::rpc-logging node (list (list "all") nil))))
            (is (every (lambda (pair) (eq t (cdr pair))) r)))
          ;; exclude "all" disables every category
          (let ((r (bitcoin-lisp.rpc::rpc-logging node (list nil (list "all")))))
-           (is (notany #'cdr r)))
+           (is (every (lambda (pair) (eq 'yason:false (cdr pair))) r)))
          ;; unknown category errors
          (signals bitcoin-lisp.rpc::rpc-error
            (bitcoin-lisp.rpc::rpc-logging node (list (list "boguscat") nil))))

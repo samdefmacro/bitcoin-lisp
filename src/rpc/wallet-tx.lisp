@@ -1407,7 +1407,7 @@ chain.findBlock time lookup). Caller holds the node-lock."
               ("blockheight" . ,(wallet-tx-block-height wtx))
               ("blockindex" . ,(wallet-tx-block-index wtx))
               ("blocktime" . ,(%wallet-block-time node (wallet-tx-block-hash wtx))))
-            `(("trusted" . ,(%wallet-tx-trusted-p wallet wtx))))
+            `(("trusted" . ,(json-bool (%wallet-tx-trusted-p wallet wtx)))))
       ("txid" . ,(hash-to-hex (wallet-tx-txid wtx)))
       ("wtxid" . ,(hash-to-hex (%tx-witness-hash (wallet-tx-tx wtx))))
       ("walletconflicts" . ,(or (mapcar #'hash-to-hex
@@ -1460,7 +1460,7 @@ push order."
   (multiple-value-bind (received sent fee)
       (%wallet-tx-amounts wallet wtx include-change)
     (let ((entries '())
-          (abandoned (%wtx-abandoned-p wtx))
+          (abandoned (json-bool (%wtx-abandoned-p wtx)))
           (long-fields (when long (%wallet-tx-json-fields node wallet wtx))))
       (unless filter-label
         (dolist (s sent)
@@ -1739,6 +1739,6 @@ whether an abort was triggered."
   (let ((wallet (wallet-for-request node)))
     (if (or (not (wallet-scanning-since wallet))
             (wallet-abort-rescan wallet))
-        nil
+        +json-false+
         (progn (setf (wallet-abort-rescan wallet) t)
                t))))

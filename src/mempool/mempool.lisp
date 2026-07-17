@@ -55,6 +55,17 @@ time, like *CLUSTER-COUNT-LIMIT*.")
   "Drop mempool txs older than this (14 days) — Bitcoin Core
 DEFAULT_MEMPOOL_EXPIRY_HOURS.")
 
+(defvar *mempool-expiry-hours* +default-mempool-expiry-hours+
+  "Effective mempool expiry window in hours (Core -mempoolexpiry,
+mempool_args.cpp:57). Set from config at startup; read by MEMPOOL-EXPIRE
+on every block connect.")
+
+(defvar *min-relay-fee-rate* +default-min-relay-fee-rate+
+  "Effective minimum relay fee rate in sat/kvB (Core -minrelaytxfee via
+ParseMoney, mempool_args.cpp:69-81). Set from config BEFORE the node's
+mempool is built — it seeds the mempool's min-fee-rate slot at MAKE-MEMPOOL
+time, like the cluster limits.")
+
 ;;;; Mempool entry
 
 (defstruct mempool-entry
@@ -298,6 +309,11 @@ caller iterates while re-announcing, which may mutate the set)."
   (loop for txid being the hash-keys of (mempool-unbroadcast mempool)
         collect txid))
 
+(defun mempool-unbroadcast-p (mempool txid)
+  "T if TXID is in the unbroadcast set (Core CTxMemPool::IsUnbroadcastTx —
+the entryToJSON \"unbroadcast\" field)."
+  (and (gethash txid (mempool-unbroadcast mempool)) t))
+
 (defun mempool-unbroadcast-count (mempool)
   "Number of transactions awaiting initial broadcast (getmempoolinfo's
 \"unbroadcastcount\")."
@@ -336,8 +352,10 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   ;; Maximum allowed MEMORY usage in bytes (Core -maxmempool * 1'000'000),
   ;; compared against MEMPOOL-DYNAMIC-USAGE.
   (max-size +default-max-mempool-bytes+ :type integer)
-  ;; Minimum relay fee rate (sat/kvB, Core CFeeRate::GetFeePerK units)
-  (min-fee-rate +default-min-relay-fee-rate+ :type integer)
+  ;; Minimum relay fee rate (sat/kvB, Core CFeeRate::GetFeePerK units).
+  ;; The default form reads *min-relay-fee-rate* at MAKE-MEMPOOL time, so
+  ;; -minrelaytxfee (applied before the node's mempool is built) takes effect.
+  (min-fee-rate *min-relay-fee-rate* :type integer)
   ;; Rolling dynamic minimum fee rate (sat/kvB), raised when the mempool is full
   ;; and trims, decaying back toward the relay floor over time. Bitcoin Core's
   ;; rolling minimum fee.
@@ -1429,7 +1447,7 @@ the incremental relay fee, so newcomers must beat what was just trimmed
 (defun mempool-expire (mempool &optional (now (bitcoin-lisp.serialization:get-unix-time)))
   "Remove transactions (and their descendants) older than the expiry window.
 Returns the number of transactions removed."
-  (let ((cutoff (- now (* +default-mempool-expiry-hours+ 3600)))
+  (let ((cutoff (- now (* *mempool-expiry-hours* 3600)))
         (stale '())
         (removed 0)
         (*mempool-removal-reason* :expiry))

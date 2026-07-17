@@ -274,6 +274,7 @@
    #:+protocol-version+
    #:version-message
    #:make-version-message-bytes
+   #:*user-agent*
    #:read-version-message
    #:version-message-version
    #:version-message-services
@@ -829,6 +830,7 @@
    #:mempool-remove-unbroadcast
    #:mempool-unbroadcast-txids
    #:mempool-unbroadcast-count
+   #:mempool-unbroadcast-p
    #:mempool-dat-path
    #:save-mempool-file
    #:read-mempool-file
@@ -866,6 +868,8 @@
    #:mempool-descendant-fee-rate
    #:mempool-remove-recursive
    #:mempool-expire
+   #:*mempool-expiry-hours*
+   #:*min-relay-fee-rate*
    #:mempool-trim-to-size
    #:*cluster-count-limit*
    #:*cluster-size-limit*
@@ -1306,6 +1310,11 @@
    #:peer-banned-p
    #:clear-ban-list
    #:ban-address
+   #:*default-ban-time-seconds*
+   #:*banlist-path*
+   #:save-banlist
+   #:load-banlist
+   #:*external-ips*
    #:unban-address
    #:list-bans
    #:*total-bytes-sent*
@@ -1378,6 +1387,18 @@
    #:minimum-chain-work
    #:*minimum-chain-work-override*
    #:*assumevalid-override*
+   #:*p2p-port-override*
+   #:*stop-at-height*
+   #:*dns-seed-enabled*
+   #:*fixed-seeds-enabled*
+   #:check-cli-args
+   #:unknown-config-file-keys
+   #:known-config-option-p
+   #:conf-parse-money
+   #:conf-parse-user-hex
+   #:ua-comment-safe-p
+   #:format-subversion
+   #:+max-subversion-length+
    ;; Assumeutxo snapshot commitments (Core m_assumeutxo_data)
    #:assumeutxo-data
    #:make-assumeutxo-data
@@ -1442,6 +1463,8 @@
    #:start-file-logging
    #:stop-file-logging
    #:maybe-periodic-flush
+   #:maybe-stop-at-height
+   #:listen-port
    #:index-block-filter
    #:index-block-coinstats
    ;; Wallet chain-tracking hooks (wallet P2; defined in node.lisp, called

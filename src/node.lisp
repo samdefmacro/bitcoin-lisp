@@ -39,6 +39,12 @@
     (:regtest 18444)
     (:mainnet 8333)))
 
+(defun listen-port (network)
+  "The P2P LISTEN port: -port when given, else NETWORK's default (Core
+GetListenPort, net.cpp:138-162). Dialing peers keeps the chain default —
+Core's -port only moves the listening/advertised side."
+  (or *p2p-port-override* (network-port network)))
+
 (defun network-dns-seeds (network)
   "Return the DNS seeds for NETWORK."
   (ecase network
@@ -447,23 +453,23 @@ network is :torv3, Core CNode::m_inbound_onion)."
 (defun start-inbound-listener (node bind)
   "Open the listening socket and spawn the accept thread. No-op (logged) if the
 port can't be bound."
-  (let ((sock (bitcoin-lisp.networking:open-listener bind (network-port (node-network node)))))
+  (let ((sock (bitcoin-lisp.networking:open-listener bind (listen-port (node-network node)))))
     (if (null sock)
         (log-warn "Inbound listening disabled: could not bind ~A:~D"
-                  bind (network-port (node-network node)))
+                  bind (listen-port (node-network node)))
         (progn
           (setf (node-listener-socket node) sock)
           (setf (node-listener-thread node)
                 (bt:make-thread (lambda () (run-inbound-listener node))
                                 :name "bitcoin-inbound-listener"))
           (log-info "Listening for inbound peers on ~A:~D"
-                    bind (network-port (node-network node)))))))
+                    bind (listen-port (node-network node)))))))
 
 (defun onion-listen-port (node)
-  "The local port Tor forwards inbound onion connections to: the network
-default port + 1 (Core's default_bind_port_onion, init.cpp:2118, and
-DefaultOnionServiceTarget)."
-  (1+ (network-port (node-network node))))
+  "The local port Tor forwards inbound onion connections to: the listen
+port + 1 (Core's default_bind_port_onion, init.cpp:2118 — -port shifts it
+too — and DefaultOnionServiceTarget)."
+  (1+ (listen-port (node-network node))))
 
 (defun start-onion-listener (node)
   "Open the onion-service target listener on 127.0.0.1:(port+1) and spawn its
@@ -1161,6 +1167,91 @@ index is enabled."
   (when (node-blockfilterindex node) (%catch-up-blockfilterindex node))
   (when (node-coinstatsindex node) (%catch-up-coinstatsindex node)))
 
+;;; -stopatheight / disk-space / periodic peers.dat dump support
+
+(defvar *stop-at-height-triggered* nil
+  "Once-only latch for -stopatheight so the shutdown thread spawns once.")
+
+(defvar *disk-space-abort-triggered* nil
+  "Once-only latch for the low-disk-space abort at flush points.")
+
+(defvar *last-peers-dump-time* 0
+  "Universal-time of the last periodic peers.dat dump.")
+
+(defconstant +peers-dump-interval-seconds+ (* 15 60)
+  "Cadence of the periodic peers.dat dump (Core DUMP_PEERS_INTERVAL = 15
+minutes, net.cpp:63, scheduled at net.cpp:3560).")
+
+(defun maybe-stop-at-height (height)
+  "Request a node shutdown once HEIGHT reaches -stopatheight (Core
+KernelNotifications::blockTip, node/kernel_notifications.cpp:61-66). Called
+from connect-block on every ACTIVE-chainstate tip advance; a background
+(targeted) chainstate never triggers it. Shutdown runs on its own thread —
+stop-node joins the sync thread, which is usually the caller here."
+  (when (and (plusp *stop-at-height*)
+             (>= height *stop-at-height*)
+             (not *stop-at-height-triggered*)
+             *node*
+             (node-running *node*))
+    (setf *stop-at-height-triggered* t)
+    (log-info "Reached stopatheight=~D — requesting shutdown" *stop-at-height*)
+    (bt:make-thread (lambda () (ignore-errors (stop-node)))
+                    :name "stopatheight-shutdown")
+    t))
+
+(defun check-disk-space (directory &optional (additional-bytes 0))
+  "Free-space gate at flush points (Core CheckDiskSpace, util/fs_helpers.cpp:
+87-93: available >= 50 MiB + ADDITIONAL-BYTES). Reads df -Pk; any failure to
+determine free space passes — the gate must never false-positive a healthy
+node into shutdown."
+  (handler-case
+      (let* ((out (with-output-to-string (s)
+                    (uiop:run-program (list "df" "-Pk" (namestring directory))
+                                      :output s :error-output nil)))
+             (lines (remove-if (lambda (l) (zerop (length l)))
+                               (uiop:split-string out :separator '(#\Newline))))
+             (fields (and (>= (length lines) 2)
+                          (remove-if (lambda (f) (zerop (length f)))
+                                     (uiop:split-string (second lines)
+                                                        :separator '(#\Space #\Tab)))))
+             (avail-kb (and fields
+                            (>= (length fields) 4)
+                            (parse-integer (fourth fields) :junk-allowed t))))
+        (or (null avail-kb)
+            (>= (* avail-kb 1024) (+ 52428800 additional-bytes))))
+    (error () t)))
+
+(defun %abort-on-low-disk-space (label)
+  "Log + request shutdown once when free disk space is below the floor
+(Core FlushStateToDisk's CheckDiskSpace failure -> FatalError \"Disk space
+is too low!\", validation.cpp:2775/2808)."
+  (log-error "~A flush: Disk space is too low!" label)
+  (unless *disk-space-abort-triggered*
+    (setf *disk-space-abort-triggered* t)
+    (bt:make-thread (lambda () (ignore-errors (stop-node)))
+                    :name "disk-space-shutdown")))
+
+(defun maybe-dump-peer-addresses (node)
+  "Dump the address book to peers.dat when the 15-minute cadence elapses
+(Core scheduler DumpAddresses every DUMP_PEERS_INTERVAL, net.cpp:3560).
+Called from the sync loop; also runs unconditionally at shutdown."
+  (let ((now (get-universal-time)))
+    (when (and (node-address-book node)
+               (node-data-directory node)
+               (>= (- now *last-peers-dump-time*) +peers-dump-interval-seconds+))
+      (setf *last-peers-dump-time* now)
+      (handler-case
+          (progn
+            (bitcoin-lisp.networking:save-address-book
+             (node-address-book node)
+             (bitcoin-lisp.networking:peers-dat-path (node-data-directory node)))
+            (log-debug "Periodic peers.dat dump (~D entries)"
+                       (bitcoin-lisp.networking:address-book-count
+                        (node-address-book node))))
+        (error (e)
+          (log-warn "Periodic peers.dat dump failed: ~A" e)))
+      t)))
+
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
                         (log-level :info)
@@ -1190,7 +1281,11 @@ index is enabled."
                         (webui nil webui-supplied-p)
                         (webui-path nil)
                         (webui-open nil)
-                        (wallet nil wallet-supplied-p))
+                        (wallet nil wallet-supplied-p)
+                        (port nil)
+                        (network-active t)
+                        ((:rest rest-enabled) nil)
+                        (addnode nil))
   "Start the Bitcoin node.
 
 DATA-DIRECTORY: Path to store blockchain data (mainnet uses mainnet/ subdirectory)
@@ -1224,6 +1319,14 @@ WALLET: Enable descriptor-wallet support (createwallet/loadwallet/... RPCs,
   per-wallet storage under <datadir>/wallets/). Default: on for every network
   except mainnet, where holding keys is the operator's explicit opt-in
   (docs/wallet-plan.md §1 deployment posture)
+PORT: P2P LISTEN port override (Core -port); the onion target moves to PORT+1.
+  NIL = the network default. Dialing peers keeps the chain default port.
+NETWORK-ACTIVE: If NIL, start with all P2P activity disabled (Core
+  -networkactive=0); re-enable at runtime with setnetworkactive.
+REST: If T, serve the Core-style REST interface under /rest/ on the RPC port
+  (Core -rest; default OFF, DEFAULT_REST_ENABLE = false, init.cpp:153).
+ADDNODE: List of \"host[:port]\" strings to keep connected as manually-added
+  peers (Core -addnode as a config option; same list addnode RPC manages).
 
 Returns the node instance."
   (when *node*
@@ -1265,9 +1368,40 @@ Returns the node instance."
       (error "Prune mode is incompatible with -reindex-chainstate (pruned blocks cannot be replayed). Use a full resync instead.")))
   (setf *prune-target-mib* prune)
 
+  ;; -port: validate, then make it the single global listen-port override.
+  ;; Always assigned (NIL clears), so a fresh start-node never inherits a
+  ;; stale override from a previous run.
+  (when port
+    (unless (and (integerp port) (<= 1 port 65535))
+      (error "Invalid port specified in -port: '~A'" port)))
+  (setf *p2p-port-override* port)
+
+  ;; -externalip: validate resolvability up front (Core init errors before
+  ;; the network starts, init.cpp:1806 ResolveErrMsg); the AddLocal itself
+  ;; happens after the tor block below, whose clear-local-addresses would
+  ;; otherwise wipe it.
+  (dolist (spec bitcoin-lisp.networking:*external-ips*)
+    (unless (bitcoin-lisp.networking:parse-network-address spec)
+      (error "Cannot resolve -externalip address: '~A'" spec)))
+
   ;; Initialize node
   (setf *node* (init-node data-directory :network network :log-level log-level))
   (setf (node-max-peers *node*) max-peers)
+  ;; -networkactive=0: start with all P2P activity disabled (Core passes the
+  ;; flag to the CConnman ctor, init.cpp:1648); setnetworkactive re-enables.
+  (setf (node-network-active *node*) (and network-active t))
+  (unless (node-network-active *node*)
+    (log-warn "P2P network activity DISABLED (-networkactive=0)"))
+  ;; -addnode: seed the manually-added peer list the addnode RPC manages
+  ;; (Core m_added_node_params from GetArgs(\"-addnode\"), init.cpp:2107).
+  (when addnode
+    (setf (node-added-nodes *node*) (copy-list addnode))
+    (log-info "Manually-added peers (-addnode): ~{~A~^, ~}" addnode))
+  ;; -stopatheight: re-arm the once-only shutdown trigger for this run.
+  (setf *stop-at-height-triggered* nil
+        *disk-space-abort-triggered* nil)
+  ;; Periodic peers.dat dump baseline (first dump 15 min from now).
+  (setf *last-peers-dump-time* (get-universal-time))
   (setf *current-log-level* log-level)
   (log-info "Bitcoin-Lisp Node v0.1.0")
   (log-info "Network: ~A" network)
@@ -1478,6 +1612,15 @@ Returns the node instance."
       (log-info "Loaded peer address book: ~D entries"
                 (bitcoin-lisp.networking:address-book-count (node-address-book *node*)))))
 
+  ;; Manual banlist persistence (Core BanMan <datadir>/banlist.json): load
+  ;; previous bans (expired entries swept) and point future mutations at the
+  ;; file — every setban/clearbanned dumps it immediately, like Core.
+  (setf bitcoin-lisp.networking:*banlist-path*
+        (merge-pathnames "banlist.json" (node-data-directory *node*)))
+  (let ((n (bitcoin-lisp.networking:load-banlist)))
+    (when (and n (plusp n))
+      (log-info "Loaded ~D banned address~:P from banlist.json" n)))
+
   ;; Load reconnection anchors (tried first, before DNS seeds — anti-eclipse).
   (load-anchors *node*)
 
@@ -1583,6 +1726,7 @@ Returns the node instance."
                                                       :bind rpc-bind
                                                       :user rpc-user
                                                       :password rpc-password
+                                                      :rest-enabled rest-enabled
                                                       :ui-enabled webui-enabled
                                                       :ui-directory webui-path)))
       ;; -webuiopen: pop the local browser at the dashboard. Logged, never
@@ -1641,6 +1785,9 @@ Returns the node instance."
                                ;; the PR #216 block-relay/feeler conns and
                                ;; ping-timeout eviction never ran live.
                                (maintain-peers *node*)
+                               ;; Periodic peers.dat dump (Core DumpAddresses
+                               ;; every 15 min); cadence-gated inside.
+                               (maybe-dump-peer-addresses *node*)
                                (loop repeat 30 while (node-running *node*)
                                      do (sleep 1)
                                         ;; Retry buffered unsent bytes on
@@ -1741,6 +1888,18 @@ Returns the node instance."
            :virtual-port (network-port network)
            :target-port (onion-listen-port *node*))))
 
+  ;; -externalip: advertise the given addresses as our own (Core
+  ;; init.cpp:1803-1808: AddLocal(addr, LOCAL_MANUAL) at the listen port).
+  ;; Validated resolvable above; runs after the tor block so its
+  ;; clear-local-addresses cannot wipe these entries.
+  (dolist (spec bitcoin-lisp.networking:*external-ips*)
+    (multiple-value-bind (net bytes)
+        (bitcoin-lisp.networking:parse-network-address spec)
+      (when net
+        (bitcoin-lisp.networking:add-local
+         net bytes (listen-port network)
+         bitcoin-lisp.networking:+local-manual+))))
+
   (install-shutdown-handler)
   (log-info "Node started successfully")
   *node*)
@@ -1756,6 +1915,9 @@ The data directory and network are resolved from the CLI first (so the config
 file can be located and its [network] section scoped), then the merged config
 is turned into start-node keyword arguments. -conf=PATH overrides the config
 file location."
+  ;; Unknown command-line options are a HARD startup error, exactly like
+  ;; Core ArgsManager::ParseParameters ("Invalid parameter -foo").
+  (check-cli-args args)
   (let* ((cli (parse-cli-args args))
          (datadir (or (cdr (assoc "datadir" cli :test #'string=)) "~/.bitcoin-lisp/"))
          (conf-path (or (cdr (assoc "conf" cli :test #'string=))
@@ -1772,6 +1934,13 @@ file location."
                       (log-info "Reading config file ~A" conf-path)
                       (alexandria:read-file-into-string conf-path))))
     (multiple-value-bind (plist merged) (args->start-node-plist args conf-text)
+      ;; Unknown CONFIG-FILE keys only warn (Core ReadConfigFiles with
+      ;; ignore_invalid_keys=true, common/init.cpp:38: "Ignoring unknown
+      ;; configuration value") — unlike unknown CLI options, which error.
+      (when conf-text
+        (dolist (k (unknown-config-file-keys
+                    (parse-bitcoin-conf conf-text)))
+          (log-warn "Ignoring unknown configuration value ~A" k)))
       ;; Apply the process-global config specials (options with no start-node
       ;; keyword) from the same merged config, before launching.
       (apply-config-globals merged)
@@ -1967,6 +2136,13 @@ interrupted between, on-disk best-height was ahead of the saved UTXO
 entries, which then cascaded into MISSING-INPUT validation failures on
 restart (observed at testnet4 h=70541 — block 70514 tx-2's outputs
 were nowhere in utxoset.dat despite chainstate showing h=70540)."
+  ;; Free-disk-space gate (Core FlushStateToDisk's CheckDiskSpace calls,
+  ;; validation.cpp:2775/2808): refuse to start a flush the disk cannot
+  ;; absorb, and request shutdown like Core's FatalError.
+  (when (and chainstate *node* (node-data-directory *node*)
+             (not (check-disk-space (node-data-directory *node*))))
+    (%abort-on-low-disk-space label)
+    (return-from %flush-chainstate nil))
   (handler-case
       (#+sbcl sb-sys:without-interrupts
        #-sbcl progn
@@ -2498,6 +2674,11 @@ Phase 1."
      (node-address-book *node*)
      (bitcoin-lisp.networking:peers-dat-path (node-data-directory *node*))))
 
+  ;; Final banlist dump (Core ~BanMan calls DumpBanlist, banman.cpp:26),
+  ;; then detach the path so post-shutdown mutations stop writing.
+  (bitcoin-lisp.networking:save-banlist)
+  (setf bitcoin-lisp.networking:*banlist-path* nil)
+
   ;; Unload wallets (writes each wallet's best-block marker, closes its DB)
   (when (node-wallet-manager *node*)
     (log-info "Unloading wallets...")
@@ -2743,8 +2924,12 @@ Returns the number of peers connected."
                   (setf (gethash str seen) t)
                   (push (cons str (and (plusp port) port)) picks))))))
         (setf addresses (nreverse picks))))
-    ;; Fall back to DNS seeds if not enough candidates
-    (when (< (length addresses) 8)
+    ;; Fall back to DNS seeds if not enough candidates (-dnsseed=0 forbids
+    ;; the query entirely, Core DEFAULT_DNSSEED/ThreadDNSAddressSeed).
+    (when (and (< (length addresses) 8)
+               (not *dns-seed-enabled*))
+      (log-info "DNS seeding disabled (-dnsseed=0)"))
+    (when (and (< (length addresses) 8) *dns-seed-enabled*)
       (log-info "Discovering peers from DNS seeds...")
       (let ((dns-addrs (bitcoin-lisp.networking:discover-peers)))
         (log-info "Found ~D potential peers from DNS" (length dns-addrs))
@@ -2758,6 +2943,9 @@ Returns the number of peers connected."
     ;; Core's vFixedSeeds population in chainparams.cpp — used as a
     ;; last-resort source so we always have netgroup diversity available.
     (when (and (eq (node-network node) :testnet4)
+               ;; -fixedseeds=0 forbids the hardcoded fallback (Core
+               ;; net.cpp:2571-2572 "Fixed seeds are disabled").
+               *fixed-seeds-enabled*
                (let ((groups (remove-duplicates
                               (remove nil (mapcar (lambda (c)
                                                     (bitcoin-lisp.networking:ip-netgroup

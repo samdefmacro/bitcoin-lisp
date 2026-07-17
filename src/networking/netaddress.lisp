@@ -316,10 +316,10 @@ retagged :cjdns when CJDNS is reachable, this being a string-ingress point
 
 ;;;; Local addresses (Core mapLocalHost, net.cpp:119)
 ;;;
-;;; The addresses THIS node is reachable at, for self-advertisement. Today the
-;;; only writer is the torcontrol client (ADD_ONION -> add-local, Core
-;;; AddLocal(service, LOCAL_MANUAL)); there is no interface discovery
-;;; (Core Discover()/-discover) and no -externalip yet, so entries are always
+;;; The addresses THIS node is reachable at, for self-advertisement. The
+;;; writers are the torcontrol client (ADD_ONION -> add-local, Core
+;;; AddLocal(service, LOCAL_MANUAL)) and -externalip at startup; there is no
+;;; interface discovery (Core Discover()/-discover), so entries are always
 ;;; LOCAL_MANUAL. The map is read by the sync thread (self-advertisement) and
 ;;; written by the torcontrol thread — hence the lock.
 
@@ -341,6 +341,11 @@ reachable at (Core mapLocalHost key + LocalServiceInfo)."
 (defvar *local-addresses* '()
   "List of local-address records (Core mapLocalHost). Guarded by
 *local-addresses-lock*.")
+
+(defvar *external-ips* '()
+  "Raw -externalip strings from config (Core init.cpp:1803-1808), consumed
+at node startup: each parses through parse-network-address and lands in the
+local-address map via add-local with +local-manual+ and the listen port.")
 
 (defvar *local-addresses-lock* (bt:make-lock "local-addresses")
   "Guards *local-addresses* (torcontrol thread writes, sync thread reads —
