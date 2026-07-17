@@ -462,7 +462,7 @@ sync in progress)."
       (is (null (assoc "snapshot_blockhash" hist-entry :test #'string=)))
       ;; Current entry: the snapshot chainstate, unvalidated, hash present.
       (is (= 5 (cdr (assoc "blocks" cur-entry :test #'string=))))
-      (is (null (cdr (assoc "validated" cur-entry :test #'string=))))
+      (is (eq 'yason:false (cdr (assoc "validated" cur-entry :test #'string=))))
       (is (string= (bitcoin-lisp.rpc::hash-to-hex base-hash)
                    (cdr (assoc "snapshot_blockhash" cur-entry :test #'string=)))))))
 

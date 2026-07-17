@@ -1680,7 +1680,12 @@ Handles chain reorganizations when a competing chain has more work."
                (bitcoin-lisp.mempool:mempool-expire mempool)
                (bitcoin-lisp.mempool:orphan-erase-for-block
                 (bitcoin-lisp.mempool:mempool-orphan-pool mempool) block))
-             (note-block-connected block))
+             (note-block-connected block)
+             ;; -stopatheight: request shutdown once the ACTIVE tip reaches
+             ;; the configured height (Core KernelNotifications::blockTip,
+             ;; node/kernel_notifications.cpp:61-66); a background (targeted)
+             ;; chainstate's ancient tips never trigger it.
+             (bitcoin-lisp:maybe-stop-at-height new-height))
            ;; Core resets the recent-rejects filter on EVERY active tip change,
            ;; not just reorgs: cached failures (non-final, too-low-fee, missing
            ;; inputs) can become valid at the next block (ActiveTipChange,

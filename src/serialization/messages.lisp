@@ -284,10 +284,15 @@ the unavoidable-case fallback."
       (write-message-header stream header)
       (write-bytes stream payload-bytes))))
 
+(defvar *user-agent* "/bitcoin-lisp:0.1.0/"
+  "The BIP14 subversion string this node advertises (Core strSubVersion,
+init.cpp:1683 FormatSubVersion). -uacomment appends sanitized comments:
+\"/bitcoin-lisp:0.1.0(comment1; comment2)/\".")
+
 (defun make-version-message-bytes (&key (version +protocol-version+)
                                         (services +node-network+)
                                         (timestamp (get-unix-time))
-                                        (user-agent "/bitcoin-lisp:0.1.0/")
+                                        (user-agent *user-agent*)
                                         (start-height 0)
                                         (relay t)
                                         addr-recv)
