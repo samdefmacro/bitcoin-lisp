@@ -818,12 +818,23 @@ PreChecks into the entry, validation.cpp:924) — without it the block
 assembler's sigop budget is vacuous. Returns (values result entry) where
 RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
 (reorg re-add, package submission)."
-  (dolist (rt replaced)
-    (mempool-remove-recursive mempool rt))
+  (let ((*mempool-removal-reason* :replaced))
+    (dolist (rt replaced)
+      (mempool-remove-recursive mempool rt)))
   (let ((entry (make-entry-from-tx tx (or fee 0) height
                                    :sigops sigops :entry-time entry-time)))
     (values (mempool-add mempool txid entry :defer-trim defer-trim)
             entry)))
+
+(defvar *mempool-removal-reason* nil
+  "The MemPoolRemovalReason of the removal in progress, bound by each removal
+path around its MEMPOOL-REMOVE calls: :expiry, :size-limit, :reorg, :block,
+:conflict, or :replaced (Core txmempool.h MemPoolRemovalReason). NIL means an
+unclassified removal, which the wallet treats like the generic (non-conflict)
+reasons. MEMPOOL-REMOVE forwards it to the wallet chain-tracking hook exactly
+like Core removeUnchecked forwards its reason to TransactionRemovedFromMempool
+(txmempool.cpp:263-275), including the reason-BLOCK skip — the wallet learns
+about mined transactions from the block-connected hook instead.")
 
 (defun mempool-add (mempool txid entry &key defer-trim)
   "Add a transaction to the mempool.
@@ -928,6 +939,15 @@ runs unconditionally (validation.cpp:1338-1342)."
     (unless (mempool-has mempool txid)
       (return-from mempool-add :mempool-full)))
 
+  ;; Wallet chain-tracking hook (cheap no-op without loaded wallets). Fires
+  ;; only for a tx that made it in AND survived its own trim, matching where
+  ;; Core fires TransactionAddedToMempool (validation.cpp:1393-1416 — after
+  ;; LimitMempoolSize, never on the self-evicted "mempool full" outcome).
+  ;; Under DEFER-TRIM the caller's later re-limit can still evict it, but
+  ;; Core's package path fires the added signal before its final re-limit
+  ;; too (SubmitPackage, validation.cpp:1292-1310) — the eviction then
+  ;; surfaces as a :size-limit removal.
+  (bitcoin-lisp:wallet-notify-mempool-tx-added (mempool-entry-transaction entry))
   :ok)
 
 (defun mempool-remove (mempool txid)
@@ -973,6 +993,11 @@ shadow checks report as divergence."
         (when handle
           (txgraph-remove-transaction (mempool-graph mempool) handle)))
       (%mempool-graph-verify mempool)
+      ;; Wallet chain-tracking hook — the single removal chokepoint, like
+      ;; Core removeUnchecked's TransactionRemovedFromMempool signal. The
+      ;; hook itself skips reason :block (Core txmempool.cpp:269-275).
+      (bitcoin-lisp:wallet-notify-mempool-tx-removed
+       (mempool-entry-transaction entry) *mempool-removal-reason*)
       entry)))
 
 (defun mempool-remove-recursive (mempool txid)
@@ -1389,7 +1414,8 @@ evicted chunk raises the rolling minimum fee (sat/kvB) to its feerate plus
 the incremental relay fee, so newcomers must beat what was just trimmed
 (Core trackPackageRemoved). Returns the number of transactions removed."
   (let ((graph (mempool-graph mempool))
-        (removed 0))
+        (removed 0)
+        (*mempool-removal-reason* :size-limit))
     (%with-graph-verify-batch (mempool)
       (loop while (and (plusp (mempool-count mempool))
                        (> (mempool-dynamic-usage mempool) limit))
@@ -1423,7 +1449,8 @@ the incremental relay fee, so newcomers must beat what was just trimmed
 Returns the number of transactions removed."
   (let ((cutoff (- now (* *mempool-expiry-hours* 3600)))
         (stale '())
-        (removed 0))
+        (removed 0)
+        (*mempool-removal-reason* :expiry))
     (maphash (lambda (txid entry)
                (when (< (mempool-entry-entry-time entry) cutoff)
                  (push txid stale)))
@@ -1453,15 +1480,19 @@ tx's descendants spend outputs that no longer exist)."
             (setf (gethash key block-outpoints) t))))
 
       ;; Remove confirmed transactions; a mined tx's prioritisation delta is
-      ;; spent ballast (Core removeForBlock -> ClearPrioritisation).
-      (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-        (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-          (remhash txid (mempool-deltas mempool))
-          (mempool-remove mempool txid)))
+      ;; spent ballast (Core removeForBlock -> ClearPrioritisation). Reason
+      ;; :block never reaches the wallet hook (blockConnected covers these).
+      (let ((*mempool-removal-reason* :block))
+        (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+          (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+            (remhash txid (mempool-deltas mempool))
+            (mempool-remove mempool txid))))
 
       ;; Remove conflicting transactions (mempool txs that spend same outpoints
-      ;; as block txs), recursively: their descendants are conflicted too.
-      (let ((to-remove '()))
+      ;; as block txs), recursively: their descendants are conflicted too
+      ;; (Core removeConflicts, MemPoolRemovalReason::CONFLICT).
+      (let ((to-remove '())
+            (*mempool-removal-reason* :conflict))
         (maphash (lambda (outpoint-key spending-txid)
                    (when (gethash outpoint-key block-outpoints)
                      (pushnew spending-txid to-remove :test #'equalp)))
@@ -1477,7 +1508,8 @@ re-orgs if origTx isn't re-accepted into the mempool\"). N-OUTPUTS is TXID's
 output count. Used by the reorg re-add path when a disconnected transaction
 fails re-acceptance: its in-pool spenders' inputs no longer exist anywhere.
 Returns the number of transactions removed."
-  (let ((removed 0))
+  (let ((removed 0)
+        (*mempool-removal-reason* :reorg))
     (dotimes (i n-outputs removed)
       (let ((spender (mempool-spending-tx mempool txid i)))
         (when spender
@@ -1517,7 +1549,8 @@ vHashUpdate in reverse). Returns the number of transactions the trim evicted."
       ;; would-be-descendant subtrees from every over-limit would-be cluster,
       ;; keeping the best chunks. The removed set is descendant-closed, so
       ;; plain per-tx removal leaves nothing dangling.
-      (let ((evicted 0))
+      (let ((evicted 0)
+            (*mempool-removal-reason* :size-limit))
         (dolist (handle (txgraph-trim graph) evicted)
           (when (mempool-remove mempool (tx-handle-data handle))
             (incf evicted)))))))

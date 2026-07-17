@@ -98,6 +98,7 @@
                                (:file "methods")
                                (:file "wallet-store")
                                (:file "wallet")
+                               (:file "wallet-tx")
                                (:file "psbt")
                                (:file "merkleproof")
                                (:file "rest")
@@ -234,6 +235,9 @@
                              (:file "assumeutxo-tests")
                              ;; Wallet P1: container + keystore + wallet RPCs
                              (:file "wallet-tests")
+                             ;; Wallet P2: chain tracking (hooks, TxState,
+                             ;; conflicts, rescan, tx RPCs)
+                             (:file "wallet-chain-tests")
                              ;; Wave 10: RPC boolean/error-code parity, HTTP
                              ;; layer, BIP64 getutxos, config wires, arg
                              ;; handling, banlist persistence

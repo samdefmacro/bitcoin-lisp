@@ -1681,10 +1681,19 @@ Handles chain reorganizations when a competing chain has more work."
                (bitcoin-lisp.mempool:orphan-erase-for-block
                 (bitcoin-lisp.mempool:mempool-orphan-pool mempool) block))
              (note-block-connected block)
+             ;; Wallet chain-tracking hook (wallet P2): scan the block for
+             ;; wallet-relevant txs (Core CWallet::blockConnected). Runs
+             ;; after mempool-remove-for-block, so the wallet sees the
+             ;; conflict removals first — Core's signal order. Cheap no-op
+             ;; when no wallets are loaded; never signals.
+             (bitcoin-lisp:wallet-notify-block-connected
+              chain-state block hash new-height)
              ;; -stopatheight: request shutdown once the ACTIVE tip reaches
              ;; the configured height (Core KernelNotifications::blockTip,
              ;; node/kernel_notifications.cpp:61-66); a background (targeted)
-             ;; chainstate's ancient tips never trigger it.
+             ;; chainstate's ancient tips never trigger it. After the wallet
+             ;; hook — Core's blockTip notification fires after the wallet's
+             ;; BlockConnected signals.
              (bitcoin-lisp:maybe-stop-at-height new-height))
            ;; Core resets the recent-rejects filter on EVERY active tip change,
            ;; not just reorgs: cached failures (non-final, too-low-fee, missing
@@ -1827,7 +1836,8 @@ transactions removed."
               mempool entry utxo-set eval-height chain-state
               mtp locktime-time csv-active)
          (push txid flagged))))
-    (let ((removed 0))
+    (let ((removed 0)
+          (bitcoin-lisp.mempool:*mempool-removal-reason* :reorg))
       (dolist (txid flagged removed)
         ;; May be gone already as an earlier removal's descendant.
         (when (bitcoin-lisp.mempool:mempool-has mempool txid)
@@ -1976,7 +1986,10 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
             ;; loop, so the list ends up oldest-block-first — flattening then
             ;; re-adds parents before children (a child can only spend a parent
             ;; in an equal-or-lower block).
-            (disconnected-block-txs '()))
+            (disconnected-block-txs '())
+            ;; (block . height) per disconnected block, oldest-first (same
+            ;; push order), for the PHASE C wallet notifications.
+            (disconnected-blocks '()))
 
         ;; Self-heal stored witness-stripped forward blocks. A fork block stored
         ;; via the deferred-validation (:weaker-chain) path before the v2-only
@@ -2043,6 +2056,8 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
               (when mempool
                 (push (rest (bitcoin-lisp.serialization:bitcoin-block-transactions block))
                       disconnected-block-txs))
+              (push (cons block (bitcoin-lisp.storage:block-index-entry-height entry))
+                    disconnected-blocks)
               (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid))))
 
         ;; Tip is now logically at the fork point. Set it so each fork block's
@@ -2102,6 +2117,14 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
           ;; the commit phase alongside the other side effects: a rolled-back
           ;; reorg never disconnected anything observably.
           (reset-recent-confirmed)
+          ;; Wallet chain-tracking (wallet P2): Core fires BlockDisconnected
+          ;; per DisconnectTip — tip-first, before the fork's BlockConnected
+          ;; signals. Deferred here with the other side effects, so a
+          ;; rolled-back reorg never notified anything. disconnected-blocks
+          ;; is oldest-first (PHASE A push order); reverse restores tip-first.
+          (dolist (pair (reverse disconnected-blocks))
+            (bitcoin-lisp:wallet-notify-block-disconnected
+             chain-state (car pair) (cdr pair)))
           (dolist (item (reverse connected))
             (destructuring-bind (entry block height spent-utxos) item
               (when fee-estimator
@@ -2129,7 +2152,12 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
                  (bitcoin-lisp.mempool:mempool-orphan-pool mempool) block))
               ;; Each reconnected block counts as connected for the tx-relay
               ;; tip structures; the LAST one leaves the map at the new tip.
-              (note-block-connected block)))
+              (note-block-connected block)
+              ;; Wallet hook: the fork's blocks connect oldest-to-newest,
+              ;; after that block's mempool conflict removals (Core order).
+              (bitcoin-lisp:wallet-notify-block-connected
+               chain-state block (bitcoin-lisp.storage:block-index-entry-hash entry)
+               height)))
           ;; The disconnected old chain's txs stay in the tx-index: Core never
           ;; erases txindex entries on disconnect (index/base.h:136 CustomRemove
           ;; defaults to a no-op; index/txindex.cpp has no override). Txs
