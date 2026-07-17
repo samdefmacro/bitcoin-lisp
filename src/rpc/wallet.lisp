@@ -426,32 +426,57 @@ GetNewDestination persists via WriteDescriptor before returning)."
       (spkm-write-descriptor wallet spkm)
       address)))
 
-;;; --- Address book records (name/purpose; full address book is wallet P3) ---
+;;; --- Address book (Core m_address_book / CAddressBookData, wallet/types.h) ---
+
+(defstruct addr-book-entry
+  "Core CAddressBookData. LABEL is NIL when never set — such an entry is a
+change-only record (IsChange) invisible to label lookups; \"\" is the
+default label. PURPOSE is \"send\"/\"receive\"/\"refund\" or NIL (unknown).
+PREVIOUSLY-SPENT backs the avoid_reuse feature (destdata \"used\" records)."
+  (label nil)
+  (purpose nil)
+  (previously-spent nil))
+
+(defun %wallet-book-entry (wallet address)
+  "ADDRESS's address-book record, created empty if absent (the
+m_address_book[dest] idiom)."
+  (or (gethash address (wallet-address-book wallet))
+      (setf (gethash address (wallet-address-book wallet))
+            (make-addr-book-entry))))
+
+(defun wallet-set-address-book (wallet address label purpose)
+  "Core SetAddressBookWithDB: set ADDRESS's label, update its purpose only
+when PURPOSE is non-NIL, persist the purpose (when given) and name records."
+  (let ((entry (%wallet-book-entry wallet address)))
+    (setf (addr-book-entry-label entry) label)
+    (when purpose
+      (setf (addr-book-entry-purpose entry) purpose)
+      (bitcoin-lisp.storage:leveldb-put
+       (wallet-db wallet)
+       (wdb-key-address-string +wdb-key-purpose+ address)
+       (wdb-string-value purpose)))
+    (bitcoin-lisp.storage:leveldb-put
+     (wallet-db wallet)
+     (wdb-key-address-string +wdb-key-name+ address)
+     (wdb-string-value label)
+     :sync t))
+  t)
 
 (defun wallet-write-address-book-entry (wallet address label purpose)
-  "Write the name + purpose records for ADDRESS (Core SetAddressBookWithDB —
-receiving addresses always get an entry) and mirror them in the in-memory
-address book (m_address_book), which powers the P2 label fields and the
-IsChange heuristic."
-  (setf (gethash address (wallet-address-book wallet)) (cons label purpose))
-  (bitcoin-lisp.storage:leveldb-put
-   (wallet-db wallet)
-   (wdb-key-address-string +wdb-key-purpose+ address)
-   (wdb-string-value purpose))
-  (bitcoin-lisp.storage:leveldb-put
-   (wallet-db wallet)
-   (wdb-key-address-string +wdb-key-name+ address)
-   (wdb-string-value label)
-   :sync t))
+  "Backward-compatible alias for wallet-set-address-book (P1/P2 call sites)."
+  (wallet-set-address-book wallet address label purpose))
 
-(defun wallet-find-address-book-entry (wallet address)
+(defun wallet-find-address-book-entry (wallet address &key allow-change)
   "(values label purpose found-p) for ADDRESS's address-book entry (Core
-FindAddressBookEntry; every entry we create is a receive entry, so the
-allow_change=false filtering is vacuous until the P4 spend path writes
-change entries)."
+FindAddressBookEntry). Change entries — records whose label was never set,
+e.g. pure previously-spent markers — are reported as absent unless
+ALLOW-CHANGE. LABEL is the entry's label with NIL folded to \"\" (Core
+GetLabel)."
   (let ((entry (gethash address (wallet-address-book wallet))))
-    (if entry
-        (values (car entry) (cdr entry) t)
+    (if (and entry (or allow-change (addr-book-entry-label entry)))
+        (values (or (addr-book-entry-label entry) "")
+                (addr-book-entry-purpose entry)
+                t)
         (values nil nil nil))))
 
 ;;; --- Default wallet descriptors (Core walletutil.cpp:35-86 GenerateWalletDescriptor,
@@ -689,25 +714,35 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
           ((equal type +wdb-key-bestblock+)
            (setf locator-main (wdb-parse-block-locator-value (cdr rec))))
           ((equal type +wdb-key-lockedutxo+)
-           (push (cons (subseq fields 0 32)
-                       (%wparse (s fields)
-                         (bitcoin-lisp.serialization:read-bytes s 32)
-                         (bitcoin-lisp.serialization:read-uint32-le s)))
+           ;; Records on disk are the persistent locks (lockunspent
+           ;; persistent=true); memory-only locks never reach the DB.
+           (push (%wparse (s fields)
+                   (list (bitcoin-lisp.serialization:read-bytes s 32)
+                         (bitcoin-lisp.serialization:read-uint32-le s)
+                         t))
                  (wallet-locked-utxos wallet)))
           ((equal type +wdb-key-tx+)
            (push (cons fields (cdr rec)) tx-records))
           ((equal type +wdb-key-name+)
-           (let* ((address (wdb-parse-string-value fields))
-                  (entry (or (gethash address (wallet-address-book wallet))
-                             (setf (gethash address (wallet-address-book wallet))
-                                   (cons "" "")))))
-             (setf (car entry) (wdb-parse-string-value (cdr rec)))))
+           (setf (addr-book-entry-label
+                  (%wallet-book-entry wallet (wdb-parse-string-value fields)))
+                 (wdb-parse-string-value (cdr rec))))
           ((equal type +wdb-key-purpose+)
-           (let* ((address (wdb-parse-string-value fields))
-                  (entry (or (gethash address (wallet-address-book wallet))
-                             (setf (gethash address (wallet-address-book wallet))
-                                   (cons "" "")))))
-             (setf (cdr entry) (wdb-parse-string-value (cdr rec)))))
+           (setf (addr-book-entry-purpose
+                  (%wallet-book-entry wallet (wdb-parse-string-value fields)))
+                 (wdb-parse-string-value (cdr rec))))
+          ((equal type +wdb-key-destdata+)
+           ;; Core LoadRecords DESTDATA: "used" -> previously-spent marker;
+           ;; "rr<id>" receive requests are GUI-only and skipped.
+           (multiple-value-bind (address data-key)
+               (wdb-parse-destdata-fields fields)
+             (cond ((equal data-key "used")
+                    (setf (addr-book-entry-previously-spent
+                           (%wallet-book-entry wallet address))
+                          t))
+                   ((and (>= (length data-key) 2)
+                         (string= "rr" data-key :end2 2)))
+                   (t (push "Found unknown address data record" warnings)))))
           (t nil))))
     ;; Pass 2: keys, caches, active mappings.
     (dolist (rec records)

@@ -18,10 +18,11 @@
 ;;;  - The transaction RPCs (src/wallet/rpc/transactions.cpp):
 ;;;    gettransaction / listtransactions / listsinceblock plus
 ;;;    rescanblockchain / abortrescan, with WalletTxToJSON / ListTransactions
-;;;    field sets, and the minimal receive.cpp accounting they need
-;;;    (debit/credit/fee via m_txos, the IsChange heuristic, CachedTxIsTrusted).
-;;;    The FULL receive.cpp port — balance aggregation, avoid_reuse
-;;;    accounting, amount caching — is wallet P3.
+;;;    field sets, and the receive.cpp accounting they need (debit/credit/
+;;;    fee via m_txos, the IsChange heuristic, CachedTxIsTrusted). Wallet P3
+;;;    added the CWalletTx amount caches + MarkDirty propagation and the
+;;;    avoid_reuse previously-spent tracking here; balance rollups, coin
+;;;    listing, and the coins/address RPCs live in wallet-coins.lisp.
 ;;;
 ;;; Delivery: the node's hardcoded hooks (node.lisp wallet-notify-*) call
 ;;; the wallets-* fan-outs below synchronously from connect-block /
@@ -118,7 +119,20 @@ carries no height; CWalletTx::updateState fills it)."
   ;; mempool_conflicts) — a set keyed by txid.
   (mempool-conflicts (make-hash-table :test 'equalp) :type hash-table)
   ;; TRUC (v3) child in the mempool spending this tx (truc_child_in_mempool).
-  (truc-child nil))
+  (truc-child nil)
+  ;; --- Amount caches (wallet P3; CWalletTx m_amounts / nChangeCached /
+  ;; m_cached_from_me, transaction.h:236-251). One slot per amount where
+  ;; Core keeps two keyed by avoid_reuse: at d3056bc GetCachableAmount
+  ;; computes the identical value for both slots (the computation ignores
+  ;; the flag), so a single slot is behavior-identical. NIL = uncached. ---
+  (cached-debit nil)
+  (cached-credit nil)
+  (cached-change nil)
+  (cached-from-me :unknown)
+  ;; T while both debit and credit slots are empty (m_is_cache_empty; the
+  ;; MarkDestinationsDirty short-circuit — deliberately ignores the change/
+  ;; from-me caches, like Core).
+  (cache-empty t))
 
 (defun %wtx-apply-state (wtx kind &optional block-hash (block-height -1)
                                             (block-index -1) abandoned)
@@ -385,16 +399,18 @@ copies the metadata of the oldest one."
                 (wallet-tx-time-smart copy-from)))))))
 
 (defun %wallet-unlock-coin (wallet txid index)
-  "Core CWallet::UnlockCoin: drop the locked-coin entry (and its persistent
-record) for the outpoint."
-  (let ((entry (find-if (lambda (pair)
-                          (and (equalp (car pair) txid) (= (cdr pair) index)))
+  "Core CWallet::UnlockCoin: drop the locked-coin entry — a (txid index
+persist) triple — erasing its record only when it was persisted."
+  (let ((entry (find-if (lambda (e)
+                          (and (equalp (first e) txid) (= (second e) index)))
                         (wallet-locked-utxos wallet))))
     (when entry
       (setf (wallet-locked-utxos wallet)
             (remove entry (wallet-locked-utxos wallet)))
-      (bitcoin-lisp.storage:leveldb-delete
-       (wallet-db wallet) (wdb-key-lockedutxo txid index)))))
+      (when (third entry)
+        (bitcoin-lisp.storage:leveldb-delete
+         (wallet-db wallet) (wdb-key-lockedutxo txid index))))
+    t))
 
 (defun wallet-add-to-spends (wallet wtx)
   "Core CWallet::AddToSpends over a whole wtx: register every input's
@@ -435,8 +451,7 @@ AND unspent) in m_txos."
   (let ((entry (gethash (%wtx-outpoint-key txid index) (wallet-txos wallet))))
     (if entry (values (car entry) (cdr entry)) nil)))
 
-;;; --- IsMine / debit / credit (the minimal receive.cpp subset P2 needs;
-;;; balance aggregation + caching are wallet P3) ---
+;;; --- IsMine / debit / credit (receive.cpp; cached amounts are wallet P3) ---
 
 (defun %wallet-script-mine-p (wallet script)
   "IsMine on a script without re-taking the wallet lock (callers hold it)."
@@ -484,19 +499,143 @@ TXO, else 0."
                      0))
           :initial-value 0))
 
+;;; --- CWalletTx amount caches (receive.cpp GetCachableAmount +
+;;; CWalletTx::MarkDirty; wallet P3) ---
+
+(defun wtx-mark-dirty (wtx)
+  "Core CWalletTx::MarkDirty: drop every cached amount."
+  (setf (wallet-tx-cached-debit wtx) nil
+        (wallet-tx-cached-credit wtx) nil
+        (wallet-tx-cached-change wtx) nil
+        (wallet-tx-cached-from-me wtx) :unknown
+        (wallet-tx-cache-empty wtx) t))
+
+(defun wallet-mark-inputs-dirty (wallet tx)
+  "Core CWallet::MarkInputsDirty: break the amount caches of every wallet tx
+TX spends — its state change usually changes their available balance."
+  (bitcoin-lisp.serialization:dovector
+      (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (let ((wtx (wallet-get-wallet-tx
+                wallet
+                (bitcoin-lisp.serialization:outpoint-hash
+                 (bitcoin-lisp.serialization:tx-in-previous-output input)))))
+      (when wtx (wtx-mark-dirty wtx)))))
+
+(defun wallet-tx-get-debit (wallet wtx)
+  "receive.cpp CachedTxGetDebit: 0 when the tx has no inputs, else the
+cached GetDebit."
+  (if (zerop (length (bitcoin-lisp.serialization:transaction-inputs
+                      (wallet-tx-tx wtx))))
+      0
+      (or (wallet-tx-cached-debit wtx)
+          (setf (wallet-tx-cache-empty wtx) nil
+                (wallet-tx-cached-debit wtx)
+                (wallet-tx-debit wallet (wallet-tx-tx wtx))))))
+
 (defun wallet-tx-credit (wallet wtx)
-  "receive.cpp CachedTxGetCredit (uncached): 0 for an immature coinbase."
+  "receive.cpp CachedTxGetCredit: 0 for an immature coinbase, else the
+cached TxGetCredit."
   (if (wallet-tx-immature-coinbase-p wallet wtx)
       0
-      (wallet-tx-credit-raw wallet (wallet-tx-tx wtx))))
+      (or (wallet-tx-cached-credit wtx)
+          (setf (wallet-tx-cache-empty wtx) nil
+                (wallet-tx-cached-credit wtx)
+                (wallet-tx-credit-raw wallet (wallet-tx-tx wtx))))))
+
+(defun wallet-tx-from-me-cached (wallet wtx)
+  "receive.cpp CachedTxIsFromMe."
+  (if (eq (wallet-tx-cached-from-me wtx) :unknown)
+      (setf (wallet-tx-cached-from-me wtx)
+            (wallet-tx-from-me-p wallet (wallet-tx-tx wtx)))
+      (wallet-tx-cached-from-me wtx)))
 
 (defun %wallet-output-change-p (wallet output)
-  "receive.cpp ScriptIsChange heuristic: IsMine but not in the address book."
+  "receive.cpp ScriptIsChange heuristic: IsMine but not in the address book
+(change-only book records don't count — allow_change=false lookup)."
   (let ((script (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
     (and (%wallet-script-mine-p wallet script)
          (let ((address (%script->address script (wallet-network wallet))))
            (or (null address)
                (not (nth-value 2 (wallet-find-address-book-entry wallet address))))))))
+
+(defun wallet-tx-get-change (wallet wtx)
+  "receive.cpp CachedTxGetChange: cached Σ change-output values."
+  (or (wallet-tx-cached-change wtx)
+      (setf (wallet-tx-cached-change wtx)
+            (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs
+                         (wallet-tx-tx wtx))
+                    :key (lambda (out)
+                           (if (%wallet-output-change-p wallet out)
+                               (bitcoin-lisp.serialization:tx-out-value out)
+                               0))
+                    :initial-value 0))))
+
+;;; --- avoid_reuse spent-key tracking (wallet.cpp:993-1021,2863-2891) ---
+
+(defun wallet-set-address-previously-spent (wallet address used &key batch)
+  "Core SetAddressPreviouslySpent + WriteAddressPreviouslySpent: flag the
+address-book record and write (or erase) its destdata \"used\" record."
+  (setf (addr-book-entry-previously-spent (%wallet-book-entry wallet address))
+        (and used t))
+  (let ((key (wdb-key-destdata address "used")))
+    (cond ((not used)
+           (bitcoin-lisp.storage:leveldb-delete (wallet-db wallet) key))
+          (batch
+           (bitcoin-lisp.storage:leveldb-writebatch-put
+            batch key (wdb-string-value "1")))
+          (t
+           (bitcoin-lisp.storage:leveldb-put (wallet-db wallet) key
+                                             (wdb-string-value "1"))))))
+
+(defun wallet-address-previously-spent-p (wallet address)
+  "Core IsAddressPreviouslySpent."
+  (let ((entry (gethash address (wallet-address-book wallet))))
+    (and entry (addr-book-entry-previously-spent entry) t)))
+
+(defun wallet-spent-key-script-p (wallet script)
+  "Core CWallet::IsSpentKey on a scriptPubKey. DIVERGENCE (cosmetic): only
+address-representable scripts are tracked; Core additionally keys bare
+pubkey/nonstandard destinations whose encoded form can never be spent to
+again anyway."
+  (let ((address (%script->address script (wallet-network wallet))))
+    (and address (wallet-address-previously-spent-p wallet address))))
+
+(defun %wallet-set-spent-key-state (wallet batch txid n used tx-destinations)
+  "Core CWallet::SetSpentKeyState: when the outpoint is a wallet tx's IsMine
+output, record its address as previously spent; newly-flagged addresses
+collect into TX-DESTINATIONS (an equal-set of address strings)."
+  (let ((srctx (wallet-get-wallet-tx wallet txid)))
+    (when (and srctx
+               (< n (length (bitcoin-lisp.serialization:transaction-outputs
+                             (wallet-tx-tx srctx)))))
+      (let* ((script (bitcoin-lisp.serialization:tx-out-script-pubkey
+                      (aref (bitcoin-lisp.serialization:transaction-outputs
+                             (wallet-tx-tx srctx))
+                            n)))
+             (address (%script->address script (wallet-network wallet))))
+        (when (and address (%wallet-script-mine-p wallet script))
+          (unless (eq (and used t)
+                      (wallet-address-previously-spent-p wallet address))
+            (when used
+              (setf (gethash address tx-destinations) t))
+            (wallet-set-address-previously-spent wallet address used
+                                                 :batch batch)))))))
+
+(defun wallet-mark-destinations-dirty (wallet tx-destinations)
+  "Core CWallet::MarkDestinationsDirty: break the caches of every wallet tx
+paying one of TX-DESTINATIONS (address-string set)."
+  (when (plusp (hash-table-count tx-destinations))
+    (loop for wtx being the hash-values of (wallet-map-wallet wallet)
+          do (unless (wallet-tx-cache-empty wtx)
+               (loop for output across (bitcoin-lisp.serialization:transaction-outputs
+                                        (wallet-tx-tx wtx))
+                     for address = (%script->address
+                                    (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                     output)
+                                    (wallet-network wallet))
+                     do (when (and address (gethash address tx-destinations))
+                          (wtx-mark-dirty wtx)
+                          (return)))))))
 
 (defun %wallet-tx-trusted-p (wallet wtx &optional (trusted-parents
                                                    (make-hash-table :test 'equalp)))
@@ -506,7 +645,7 @@ TXO, else 0."
       ((gethash txid trusted-parents) t)
       ((eq (wallet-tx-state wtx) :confirmed) t)
       ((eq (wallet-tx-state wtx) :block-conflicted) nil)
-      ((not (wallet-tx-from-me-p wallet (wallet-tx-tx wtx))) nil)
+      ((not (wallet-tx-from-me-cached wallet wtx)) nil)
       ((not (eq (wallet-tx-state wtx) :in-mempool)) nil)
       (t
        (block check-parents
@@ -585,7 +724,9 @@ ordering of same-block historical txs."
     (loop while stack
           do (let ((desc (pop stack)))
                (%wtx-apply-state desc :inactive nil -1 -1 t)
+               (wtx-mark-dirty desc)
                (wallet-write-tx wallet desc :batch batch)
+               (wallet-mark-inputs-dirty wallet (wallet-tx-tx desc))
                (dotimes (i (length (bitcoin-lisp.serialization:transaction-outputs
                                     (wallet-tx-tx desc))))
                  (dolist (spender (gethash (%wtx-outpoint-key
@@ -602,9 +743,26 @@ STATE (a state list), persist, refresh the TXO cache. Returns the wallet-tx."
          (wtx (or existing (make-wallet-tx :tx tx :txid txid)))
          (inserted (not existing))
          (updated nil))
-    ;; TODO(wallet P3): WALLET_FLAG_AVOID_REUSE SetSpentKeyState /
-    ;; MarkDestinationsDirty (needs the previously-spent address records).
     (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
+      ;; WALLET_FLAG_AVOID_REUSE: destinations this tx spends from become
+      ;; previously-spent; txs paying newly-flagged destinations lose their
+      ;; caches (wallet.cpp:1032-1042).
+      (when (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+)
+        (let ((tx-destinations (make-hash-table :test 'equal)))
+          (bitcoin-lisp.serialization:dovector
+              (input (bitcoin-lisp.serialization:transaction-inputs tx))
+            (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+              (%wallet-set-spent-key-state
+               wallet batch
+               (bitcoin-lisp.serialization:outpoint-hash prevout)
+               (bitcoin-lisp.serialization:outpoint-index prevout)
+               t tx-destinations)))
+          ;; The batch below only commits on inserted/updated; a queued
+          ;; previously-spent record must land regardless (Core's batch
+          ;; commits unconditionally on destruction).
+          (when (plusp (hash-table-count tx-destinations))
+            (setf updated t))
+          (wallet-mark-destinations-dirty wallet tx-destinations)))
       (when inserted
         (%wtx-apply-state-list wtx state)
         (setf (gethash txid (wallet-map-wallet wallet)) wtx)
@@ -645,6 +803,8 @@ STATE (a state list), persist, refresh the TXO cache. Returns the wallet-tx."
       (when (or inserted updated)
         (wallet-write-tx wallet wtx :batch batch)
         (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t)))
+    ;; Break debit/credit balance caches (wallet.cpp:1117).
+    (wtx-mark-dirty wtx)
     (wallet-refresh-txos wallet wtx)
     wtx))
 
@@ -728,12 +888,15 @@ Returns the newly-marked addresses."
 
 (defun wallet-sync-transaction (wallet tx state &key (update t) rescanning
                                                      block-time)
-  "Core CWallet::SyncTransaction. Returns T when TX is (now) a wallet tx.
-MarkInputsDirty is a no-op here — P2 keeps no amount caches (P3)."
-  (wallet-add-to-wallet-if-involving-me wallet tx state
-                                        :update update
-                                        :rescanning rescanning
-                                        :block-time block-time))
+  "Core CWallet::SyncTransaction. Returns T when TX is (now) a wallet tx;
+a state change alters the balance available of the outputs it spends, so
+their caches are broken (MarkInputsDirty)."
+  (when (wallet-add-to-wallet-if-involving-me wallet tx state
+                                              :update update
+                                              :rescanning rescanning
+                                              :block-time block-time)
+    (wallet-mark-inputs-dirty wallet tx)
+    t))
 
 ;;; --- Conflict tracking (wallet.cpp:1328,1363) ---
 
@@ -751,13 +914,17 @@ mempool-conflicts bookkeeping passes NIL (Core passes a null batch)."
                  (let ((wtx (wallet-get-wallet-tx wallet now)))
                    (when (and wtx
                               (not (eq (funcall update-fn wtx) :unchanged)))
+                     (wtx-mark-dirty wtx)
                      (when write (wallet-write-tx wallet wtx))
                      (dotimes (i (length (bitcoin-lisp.serialization:transaction-outputs
                                           (wallet-tx-tx wtx))))
                        (dolist (spender (gethash (%wtx-outpoint-key now i)
                                                  (wallet-tx-spends wallet)))
                          (unless (gethash spender done)
-                           (push spender todo)))))))))))
+                           (push spender todo))))
+                     ;; A state change alters the balance available of the
+                     ;; outputs this tx spends (Core RecursiveUpdateTxState).
+                     (wallet-mark-inputs-dirty wallet (wallet-tx-tx wtx)))))))))
 
 (defun wallet-mark-conflicted (wallet block-hash conflicting-height txid)
   "Core CWallet::MarkConflicted: mark TXID (and its wallet descendants)
@@ -1424,17 +1591,20 @@ chain.findBlock time lookup). Caller holds the node-lock."
               collect (cons k v)))))
 
 (defun %wallet-parent-descs (wallet script)
-  "Core PushParentDescriptors: descriptor strings of the SPKMs owning SCRIPT."
+  "Core PushParentDescriptors: the NORMALIZED descriptor string of each SPKM
+owning SCRIPT (GetDescriptorString priv=false), falling back to the stored
+canonical form if normalization fails."
   (loop for spkm being the hash-values of (wallet-spkms wallet)
         when (spkm-is-mine spkm script)
-          collect (desc-spkm-desc-string spkm)))
+          collect (handler-case (%spkm-descriptor-string wallet spkm nil)
+                    (rpc-error () (desc-spkm-desc-string spkm)))))
 
 (defun %wallet-tx-amounts (wallet wtx include-change)
-  "receive.cpp CachedTxGetAmounts (uncached): (values received sent fee-sat)
-where entries are (address value vout script); FEE-SAT is positive when we
-funded the tx."
+  "receive.cpp CachedTxGetAmounts: (values received sent fee-sat) where
+entries are (address value vout script); FEE-SAT is positive when we funded
+the tx."
   (let* ((tx (wallet-tx-tx wtx))
-         (debit (wallet-tx-debit wallet tx))
+         (debit (wallet-tx-get-debit wallet wtx))
          (fee (if (plusp debit) (- debit (%tx-value-out tx)) 0))
          (received '())
          (sent '()))
@@ -1522,7 +1692,7 @@ gettransaction). PARAMS: (txid include_watchonly verbose)."
                               :message "Invalid or non-wallet transaction id"))
           (let* ((tx (wallet-tx-tx wtx))
                  (credit (wallet-tx-credit wallet wtx))
-                 (debit (wallet-tx-debit wallet tx))
+                 (debit (wallet-tx-get-debit wallet wtx))
                  (net (- credit debit))
                  (from-me (plusp debit))
                  ;; Negative by construction when we funded the tx.
