@@ -31,6 +31,11 @@ pending — the pings themselves buffer up).")
   (last-activity 0 :type integer)
   (bytes-sent 0 :type integer)
   (bytes-received 0 :type integer)
+  ;; Universal-times of the last kernel-accepted write and the last completed
+  ;; read (Core CNode::m_last_send / m_last_recv; 0 = never). Reported as
+  ;; unix times by getpeerinfo's lastsend/lastrecv.
+  (last-send-time 0 :type integer)
+  (last-recv-time 0 :type integer)
   ;; Serializes writes to this socket: the sync thread and RPC-thread senders
   ;; (ping, getblockfrompeer) can both call send-bytes, and interleaved
   ;; write-sequence calls would corrupt the wire framing.
@@ -295,6 +300,7 @@ full write through the stream."
   (incf (connection-bytes-sent conn) n)
   (incf *total-bytes-sent* n)
   (setf (connection-last-activity conn) (get-universal-time)
+        (connection-last-send-time conn) (get-universal-time)
         (connection-last-send-progress conn) (get-internal-real-time)))
 
 (defun %flush-send-queue-locked (conn)
@@ -450,7 +456,8 @@ Returns a byte vector or NIL on failure/timeout."
             (when (= total-read count)
               (incf (connection-bytes-received conn) count)
               (incf *total-bytes-received* count)
-              (setf (connection-last-activity conn) (get-universal-time))
+              (setf (connection-last-activity conn) (get-universal-time)
+                    (connection-last-recv-time conn) (get-universal-time))
               buffer))))
     (error ()
       (setf (connection-connected conn) nil)

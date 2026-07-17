@@ -219,6 +219,15 @@ genesis sync) accepts headers normally until it crosses the floor."
         (:signet   #x00000000000000000000000000000000000000000000000000000b463ea0a4b8)
         (:regtest  0))))
 
+(defvar *blocksonly* nil
+  "Core -blocksonly (DEFAULT_BLOCKSONLY = false, init.cpp:501): when T,
+reject transactions from network peers on ANY network — version messages
+carry fRelay=0, peers announcing or sending txs anyway are disconnected, no
+feefilter is sent, and getnetworkinfo reports localrelay=false. Local
+submissions still work and are still announced (sendrawtransaction relays,
+per Core BroadcastTransaction), and block relay is unaffected. See
+networking's IGNORE-INCOMING-TXS-P. Set by start-node's :blocksonly keyword.")
+
 (defvar *accept-datacarrier* t
   "Mempool policy: accept OP_RETURN data-carrier outputs (Bitcoin Core
 -datacarrier, default true). When NIL the shared *MAX-DATACARRIER-BYTES*
@@ -665,6 +674,7 @@ signet|regtest, else returns DEFAULT."
     ("port"              :port               :int)
     ("networkactive"     :network-active     :bool)
     ("rest"              :rest               :bool)
+    ("blocksonly"        :blocksonly         :bool)
     ("sync"              :sync               :bool))
   "Maps a Bitcoin Core-style option name to a start-node keyword and its value
 type. Network selection (-chain/-testnet/...) and -server/-debug are handled

@@ -1349,7 +1349,8 @@
    #:network-checkpoints
    #:get-checkpoint-hash
    #:last-checkpoint-height
-   #:relay-enabled-p))
+   #:relay-enabled-p
+   #:ignore-incoming-txs-p))
 
 (defpackage #:bitcoin-lisp
   (:use #:cl)
@@ -1371,6 +1372,7 @@
    #:network-dns-seeds
    #:network-rpc-port
    #:*mainnet-relay-enabled*
+   #:*blocksonly*
    ;; Pruning
    #:*prune-target-mib*
    #:*prune-after-height*
