@@ -416,7 +416,7 @@ the double-spend re-conflicts it and clears the mempool conflict."
               (is (eq :block-conflicted (bitcoin-lisp.rpc::wallet-tx-state wtx))))
             (let ((gettx (%wc-gettx node txid2)))
               (is (= -1 (%aval "confirmations" gettx)))
-              (is (null (%aval "trusted" gettx)))
+              (is (eq 'yason:false (%aval "trusted" gettx)))
               (is (zerop (length (%aval "mempoolconflicts" gettx)))))
             ;; Disconnect the conflict block: tx2 reverts to inactive, and
             ;; the re-added double-spend becomes a mempool conflict of tx2.
