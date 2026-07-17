@@ -249,10 +249,11 @@ wallet) reproduces exactly the live-tracked state."
         (let* ((fund-txid (%wc-coinbase-txid node (first fund-hashes)))
                (tx1 (%wc-spend-tx fund-txid 0 (- +wc-subsidy+ 10000) spk))
                (txid1 (%wc-send node tx1)))
-          ;; In-mempool: confirmations 0, trusted false (not from us).
+          ;; In-mempool: confirmations 0, trusted false (not from us) —
+          ;; the wave-10 JSON false literal, not null.
           (let ((gettx (%wc-gettx node txid1)))
             (is (= 0 (%aval "confirmations" gettx)))
-            (is (null (%aval "trusted" gettx)))
+            (is (eq 'yason:false (%aval "trusted" gettx)))
             (is (null (%aval "generated" gettx)))
             (is (string= "receive" (%wc-details-category gettx)))
             (is (< (abs (- (%aval "amount" gettx) 49.9999d0)) 1d-9))
@@ -286,10 +287,11 @@ wallet) reproduces exactly the live-tracked state."
                     (lambda ()
                       (bitcoin-lisp.rpc::rpc-listsinceblock
                        node (list (make-string 64 :initial-element #\7))))))))
-          ;; abortrescan with no scan running: false (null); not scanning.
-          (is (null (bitcoin-lisp.rpc::rpc-abortrescan node nil)))
-          (is (null (%aval "scanning"
-                           (bitcoin-lisp.rpc::rpc-getwalletinfo node nil))))
+          ;; abortrescan with no scan running: JSON false; not scanning.
+          (is (eq 'yason:false (bitcoin-lisp.rpc::rpc-abortrescan node nil)))
+          (is (eq 'yason:false
+                  (%aval "scanning"
+                         (bitcoin-lisp.rpc::rpc-getwalletinfo node nil))))
           ;; rescanblockchain from genesis must reproduce the live state.
           (let ((before (%wc-state-snapshot wallet))
                 (result (bitcoin-lisp.rpc::rpc-rescanblockchain node '(0))))

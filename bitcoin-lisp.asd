@@ -237,6 +237,10 @@
                              (:file "wallet-tests")
                              ;; Wallet P2: chain tracking (hooks, TxState,
                              ;; conflicts, rescan, tx RPCs)
-                             (:file "wallet-chain-tests"))))
+                             (:file "wallet-chain-tests")
+                             ;; Wave 10: RPC boolean/error-code parity, HTTP
+                             ;; layer, BIP64 getutxos, config wires, arg
+                             ;; handling, banlist persistence
+                             (:file "wave10-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

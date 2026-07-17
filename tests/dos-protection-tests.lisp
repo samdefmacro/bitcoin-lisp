@@ -253,8 +253,9 @@ decimal 4e6 -- not 4 MiB)."
 ;;;; ============================================================
 
 (test max-rpc-body-size-constant
-  "Max RPC body size should be 1 MB."
-  (is (= (* 1 1024 1024) bitcoin-lisp:+max-rpc-body-size+)))
+  "Max RPC body size is Core's MAX_SIZE = 32 MiB (httpserver.cpp:410,
+serialize.h:32) — the old 1 MiB cap broke submitblock for mainnet blocks."
+  (is (= #x02000000 bitcoin-lisp:+max-rpc-body-size+)))
 
 ;;;; ============================================================
 ;;;; Configuration Tests

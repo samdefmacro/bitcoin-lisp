@@ -1687,7 +1687,14 @@ Handles chain reorganizations when a competing chain has more work."
              ;; conflict removals first — Core's signal order. Cheap no-op
              ;; when no wallets are loaded; never signals.
              (bitcoin-lisp:wallet-notify-block-connected
-              chain-state block hash new-height))
+              chain-state block hash new-height)
+             ;; -stopatheight: request shutdown once the ACTIVE tip reaches
+             ;; the configured height (Core KernelNotifications::blockTip,
+             ;; node/kernel_notifications.cpp:61-66); a background (targeted)
+             ;; chainstate's ancient tips never trigger it. After the wallet
+             ;; hook — Core's blockTip notification fires after the wallet's
+             ;; BlockConnected signals.
+             (bitcoin-lisp:maybe-stop-at-height new-height))
            ;; Core resets the recent-rejects filter on EVERY active tip change,
            ;; not just reorgs: cached failures (non-final, too-low-fee, missing
            ;; inputs) can become valid at the next block (ActiveTipChange,

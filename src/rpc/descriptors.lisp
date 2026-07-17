@@ -1277,9 +1277,9 @@ isrange/issolvable/hasprivatekeys flags."
     (multiple-value-bind (desc input-checksum) (parse-descriptor desc-str network)
       `(("descriptor" . ,(descriptor-add-checksum (out-desc-string desc)))
         ("checksum" . ,input-checksum)
-        ("isrange" . ,(out-desc-ranged-p desc))
-        ("issolvable" . ,(out-desc-solvable-p desc))
-        ("hasprivatekeys" . ,(out-desc-has-privkeys-p desc))))))
+        ("isrange" . ,(json-bool (out-desc-ranged-p desc)))
+        ("issolvable" . ,(json-bool (out-desc-solvable-p desc)))
+        ("hasprivatekeys" . ,(json-bool (out-desc-has-privkeys-p desc)))))))
 
 (defun rpc-deriveaddresses (node params)
   "Derive the address(es) for a descriptor (Bitcoin Core deriveaddresses).

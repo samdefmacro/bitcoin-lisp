@@ -482,8 +482,8 @@ lists and vsize estimation are not computed (no script solving here)."
                                   ((not has-utxo) "updater")
                                   (has-sigs "finalizer")
                                   (t "signer"))))
-                 (push `(("has_utxo" . ,(and has-utxo t))
-                         ("is_final" . ,(and final t))
+                 (push `(("has_utxo" . ,(json-bool has-utxo))
+                         ("is_final" . ,(json-bool final))
                          ("next" . ,next))
                        inputs-json)
                  (when (< (rank next) (rank overall)) (setf overall next)))))
@@ -690,7 +690,7 @@ return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
     (if (and complete extract)
         `(("hex" . ,(%psbt-extract-hex psbt)) ("complete" . t))
         `(("psbt" . ,(bitcoin-lisp.serialization:encode-psbt psbt))
-          ("complete" . ,complete)))))
+          ("complete" . ,(json-bool complete))))))
 
 ;;; --- combinerawtransaction ---
 

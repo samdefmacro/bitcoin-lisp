@@ -557,7 +557,7 @@ getwalletinfo reports Core's fields."
         (bitcoin-lisp.rpc::rpc-createwallet node '("wo" t t nil t)))
       (let ((info (bitcoin-lisp.rpc::rpc-getwalletinfo node nil)))
         (is (string= "wo" (%aval "walletname" info)))
-        (is (null (%aval "private_keys_enabled" info)))
+        (is (eq 'yason:false (%aval "private_keys_enabled" info)))
         (is (eq t (%aval "avoid_reuse" info)))
         (is (eq t (%aval "blank" info)))
         (is (eq t (%aval "descriptors" info)))
@@ -742,7 +742,7 @@ throws out of the whole call."
                                              "timestamp" 1))))
                       )
              (err (%aval "error" (first results))))
-        (is (null (%aval "success" (first results))))
+        (is (eq 'yason:false (%aval "success" (first results))))
         (is (= bitcoin-lisp.rpc::+rpc-invalid-address-or-key+ (%aval "code" err)))
         (is (string= "Missing checksum" (%aval "message" err))))
       ;; watch-only descriptor into a privkey wallet -> per-request error

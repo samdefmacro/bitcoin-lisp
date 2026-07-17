@@ -1105,20 +1105,22 @@ backend (leveldb, where Core says sqlite)."
           ("txcount" . ,(hash-table-count (wallet-map-wallet wallet)))
           ("keypoolsize" . ,external-count)
           ("keypoolsize_hd_internal" . ,(- total-count external-count))
-          ;; JSON false encodes as null here, like every existing handler
-          ;; (codebase-wide convention; the false/null cleanup is a wave-10
-          ;; item).
-          ("private_keys_enabled" . ,(not (wallet-flag-set-p
-                                           wallet +wallet-flag-disable-private-keys+)))
-          ("avoid_reuse" . ,(wallet-flag-set-p wallet +wallet-flag-avoid-reuse+))
+          ;; Core booleans are true/false, never null (wave-10 cleanup);
+          ;; "scanning" is Core's false-or-progress-object — the progress
+          ;; object during a rescan, false otherwise.
+          ("private_keys_enabled" . ,(json-bool
+                                      (not (wallet-flag-set-p
+                                            wallet +wallet-flag-disable-private-keys+))))
+          ("avoid_reuse" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+)))
           ("scanning" . ,(let ((since (wallet-scanning-since wallet)))
-                           (when since
-                             `(("duration" . ,(- (bitcoin-lisp.serialization:get-unix-time)
-                                                 since))
-                               ("progress" . ,(wallet-scan-progress wallet))))))
-          ("descriptors" . ,(wallet-flag-set-p wallet +wallet-flag-descriptors+))
-          ("external_signer" . nil)
-          ("blank" . ,(wallet-flag-set-p wallet +wallet-flag-blank-wallet+))
+                           (if since
+                               `(("duration" . ,(- (bitcoin-lisp.serialization:get-unix-time)
+                                                   since))
+                                 ("progress" . ,(wallet-scan-progress wallet)))
+                               +json-false+)))
+          ("descriptors" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-descriptors+)))
+          ("external_signer" . ,+json-false+)
+          ("blank" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-blank-wallet+)))
           ,@(when birthtime `(("birthtime" . ,birthtime)))
           ("flags" . ,(or (loop for bit from 0 below 64
                                 for flag = (ash 1 bit)
@@ -1235,10 +1237,10 @@ PARAMS: (private)."
                          entry
                        `(("desc" . ,desc-str)
                          ("timestamp" . ,(desc-spkm-creation-time spkm))
-                         ("active" . ,active)
+                         ("active" . ,(json-bool active))
                          ;; internal is defined only for active descriptors
                          ,@(when active
-                             `(("internal" . ,internal)))
+                             `(("internal" . ,(json-bool internal))))
                          ,@(when ranged
                              `(("range" . (,(desc-spkm-range-start spkm)
                                            ,(1- (desc-spkm-range-end spkm))))
@@ -1437,7 +1439,7 @@ caught into {success: false, error: {...}}."
               (%push-warnings (nreverse warnings) `(("success" . t))))))
       (rpc-error (e)
         (%push-warnings (nreverse warnings)
-                        `(("success" . nil)
+                        `(("success" . ,+json-false+)
                           ("error" . (("code" . ,(rpc-error-code e))
                                       ("message" . ,(rpc-error-message e))))))))))
 
@@ -1505,7 +1507,7 @@ rescan-failed error."
                             (if (or (<= scanned-time timestamp)
                                     (assoc "error" result :test #'string=))
                                 result
-                                `(("success" . nil)
+                                `(("success" . ,+json-false+)
                                   ("error"
                                    . (("code" . ,+rpc-misc-error+)
                                       ("message"
