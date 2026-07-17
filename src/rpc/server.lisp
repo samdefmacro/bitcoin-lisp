@@ -178,7 +178,13 @@
   (register-rpc-method "getnewaddress" #'rpc-getnewaddress)
   (register-rpc-method "getrawchangeaddress" #'rpc-getrawchangeaddress)
   (register-rpc-method "listdescriptors" #'rpc-listdescriptors)
-  (register-rpc-method "importdescriptors" #'rpc-importdescriptors))
+  (register-rpc-method "importdescriptors" #'rpc-importdescriptors)
+  ;; Wallet chain tracking (wallet P2)
+  (register-rpc-method "gettransaction" #'rpc-gettransaction)
+  (register-rpc-method "listtransactions" #'rpc-listtransactions)
+  (register-rpc-method "listsinceblock" #'rpc-listsinceblock)
+  (register-rpc-method "rescanblockchain" #'rpc-rescanblockchain)
+  (register-rpc-method "abortrescan" #'rpc-abortrescan))
 
 ;;; --- JSON-RPC Request/Response Handling ---
 

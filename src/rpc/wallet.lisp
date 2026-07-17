@@ -13,7 +13,8 @@
 ;;;    wallet/rpc/util.cpp:19-85) and the wallet management RPCs
 ;;;    (wallet/rpc/wallet.cpp, addresses.cpp, backup.cpp).
 ;;;
-;;; Chain tracking (mapWallet/TxState/rescan) is wallet P2; encryption is P6.
+;;; Chain tracking (mapWallet/TxState/rescan) is wallet P2, in wallet-tx.lisp;
+;;; encryption is P6.
 ;;;
 ;;; Locking: each wallet carries its own recursive lock (cs_wallet
 ;;; equivalent). Order: node-lock -> wallet-manager lock -> wallet lock,
@@ -131,7 +132,7 @@ map, and the descriptor's private keys."
   (keys (make-hash-table :test 'equalp) :type hash-table))
 
 (defstruct wallet
-  "A loaded wallet (Core CWallet, keystore subset for P1)."
+  "A loaded wallet (Core CWallet: P1 keystore + P2 chain tracking)."
   (name "" :type string)
   (path nil)                     ; wallet directory pathname
   (db nil)                       ; LevelDB handle
@@ -145,7 +146,20 @@ map, and the descriptor's private keys."
   (orderposnext 0 :type integer)
   (locked-utxos '() :type list)  ; (txid . n) pairs from lockedutxo records
   (last-block-hash nil)          ; 32-byte wire-order hash, or NIL
-  (last-block-height 0 :type integer))
+  (last-block-height 0 :type integer)
+  ;; --- Chain tracking (wallet P2) ---
+  (map-wallet (make-hash-table :test 'equalp) :type hash-table)  ; txid -> wallet-tx
+  (tx-ordered (make-array 0 :adjustable t :fill-pointer 0)
+   :type vector)                                                 ; wtxOrdered (nOrderPos ascending)
+  (txos (make-hash-table :test 'equalp) :type hash-table)        ; outpoint key -> (wtx . n), Core m_txos
+  (tx-spends (make-hash-table :test 'equalp) :type hash-table)   ; outpoint key -> spender txids, Core mapTxSpends
+  (address-book (make-hash-table :test 'equal) :type hash-table) ; address -> (label . purpose)
+  (birth-time most-positive-fixnum :type integer)                ; Core m_birth_time
+  (chain-time-max 0 :type integer)   ; running max block time over processed blocks
+  (loaded-locator '() :type list)    ; bestblock locator hashes read at load
+  (scanning-since nil)               ; unix time a rescan started, or NIL (reserver)
+  (scan-progress 0.0)
+  (abort-rescan nil))
 
 (defmacro with-wallet-lock ((wallet) &body body)
   "Execute BODY holding WALLET's recursive cs_wallet-equivalent lock. Never
@@ -165,6 +179,12 @@ through it (Core WalletContext)."
 
 (defun wallet-flag-set-p (wallet flag)
   (logtest (wallet-flags wallet) flag))
+
+(defun wallet-manager-has-wallets-p (manager)
+  "T when at least one wallet is loaded. Lock-free fast-path gate for the
+per-block/per-tx chain hooks: a stale read only skips or enters the (locked)
+fan-out one event early or late."
+  (plusp (hash-table-count (wallet-manager-wallets manager))))
 
 (defun wallets-directory (manager)
   (merge-pathnames "wallets/" (uiop:ensure-directory-pathname
@@ -410,7 +430,10 @@ GetNewDestination persists via WriteDescriptor before returning)."
 
 (defun wallet-write-address-book-entry (wallet address label purpose)
   "Write the name + purpose records for ADDRESS (Core SetAddressBookWithDB —
-receiving addresses always get an entry)."
+receiving addresses always get an entry) and mirror them in the in-memory
+address book (m_address_book), which powers the P2 label fields and the
+IsChange heuristic."
+  (setf (gethash address (wallet-address-book wallet)) (cons label purpose))
   (bitcoin-lisp.storage:leveldb-put
    (wallet-db wallet)
    (wdb-key-address-string +wdb-key-purpose+ address)
@@ -420,6 +443,16 @@ receiving addresses always get an entry)."
    (wdb-key-address-string +wdb-key-name+ address)
    (wdb-string-value label)
    :sync t))
+
+(defun wallet-find-address-book-entry (wallet address)
+  "(values label purpose found-p) for ADDRESS's address-book entry (Core
+FindAddressBookEntry; every entry we create is a receive entry, so the
+allow_change=false filtering is vacuous until the P4 spend path writes
+change entries)."
+  (let ((entry (gethash address (wallet-address-book wallet))))
+    (if entry
+        (values (car entry) (cdr entry) t)
+        (values nil nil nil))))
 
 ;;; --- Default wallet descriptors (Core walletutil.cpp:35-86 GenerateWalletDescriptor,
 ;;; wallet.cpp:3594-3685 SetupDescriptorScriptPubKeyMans) ---
@@ -512,7 +545,8 @@ wallet.cpp:3594-3602)."
             (unless (spkm-top-up wallet spkm 0 batch)
               (error "wallet setup: keypool top-up failed for ~A" desc-str))
             (wallet-add-active-spkm wallet spkm type internal :batch batch))))
-      (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))))
+      (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))
+    (wallet-maybe-update-birth-time wallet now)))
 
 (defun generate-wallet-master-key (network)
   "A fresh random HD master key (Core SetupOwnDescriptorScriptPubKeyMans:
@@ -528,11 +562,15 @@ GenerateRandomKey -> CExtKey::SetSeed over the 32 secret bytes)."
 
 ;;; --- Best block records (Core WriteBestBlock, walletdb.cpp:180-191) ---
 
-(defun wallet-write-best-block (wallet)
+(defun wallet-write-best-block (wallet &optional locator-hashes)
   "Write the bestblock records: an empty locator under 'bestblock' (so old
-versions rescan) and the real locator under 'bestblock_nomerkle'. P1 stores a
-single-hash locator; the exponential step-back locator lands with chain
-tracking in P2."
+versions rescan) and the real locator under 'bestblock_nomerkle' (Core
+WalletBatch::WriteBestBlock, walletdb.cpp:180-184). LOCATOR-HASHES is the
+exponential step-back locator for the wallet's last processed block, built
+by callers with chain access; without one (unload/shutdown, where the last
+processed block is on the active chain anyway) a single-hash locator is
+written — fork lookup still succeeds unless that exact block was reorged
+away, in which case the load-time catch-up rescans from genesis (safe)."
   (bitcoin-lisp.storage:leveldb-put (wallet-db wallet)
                                     (wdb-key-simple +wdb-key-bestblock+)
                                     (wdb-block-locator-value '()))
@@ -540,8 +578,9 @@ tracking in P2."
    (wallet-db wallet)
    (wdb-key-simple +wdb-key-bestblock-nomerkle+)
    (wdb-block-locator-value
-    (if (wallet-last-block-hash wallet)
-        (list (wallet-last-block-hash wallet))
+    (or locator-hashes
+        (and (wallet-last-block-hash wallet)
+             (list (wallet-last-block-hash wallet)))
         '()))
    :sync t))
 
@@ -600,14 +639,17 @@ wallet is blank or has private keys disabled."
 
 ;;; --- Wallet loading (Core CWallet::LoadExisting + walletdb LoadWallet) ---
 
-(defun %load-wallet-records (wallet warnings)
+(defun %load-wallet-records (wallet warnings &key chain-state)
   "Populate WALLET from its database records. Two-pass: descriptors first,
 then keys/caches/active mappings (LevelDB iteration order does not guarantee
-descriptor-before-key)."
+descriptor-before-key). Transaction records load last — RefreshTXOs needs
+the IsMine script maps the cache install builds. CHAIN-STATE (when given)
+resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
   (let ((records (wallet-db-records (wallet-db wallet)))
         (network (wallet-network wallet))
         (caches (make-hash-table :test 'equalp))   ; id -> descriptor-cache
         (actives '())
+        (tx-records '())
         (locator-main '())
         (locator-nomerkle '()))
     ;; Pass 1: singletons + descriptors.
@@ -652,6 +694,20 @@ descriptor-before-key)."
                          (bitcoin-lisp.serialization:read-bytes s 32)
                          (bitcoin-lisp.serialization:read-uint32-le s)))
                  (wallet-locked-utxos wallet)))
+          ((equal type +wdb-key-tx+)
+           (push (cons fields (cdr rec)) tx-records))
+          ((equal type +wdb-key-name+)
+           (let* ((address (wdb-parse-string-value fields))
+                  (entry (or (gethash address (wallet-address-book wallet))
+                             (setf (gethash address (wallet-address-book wallet))
+                                   (cons "" "")))))
+             (setf (car entry) (wdb-parse-string-value (cdr rec)))))
+          ((equal type +wdb-key-purpose+)
+           (let* ((address (wdb-parse-string-value fields))
+                  (entry (or (gethash address (wallet-address-book wallet))
+                             (setf (gethash address (wallet-address-book wallet))
+                                   (cons "" "")))))
+             (setf (cdr entry) (wdb-parse-string-value (cdr rec)))))
           (t nil))))
     ;; Pass 2: keys, caches, active mappings.
     (dolist (rec records)
@@ -708,12 +764,17 @@ descriptor-before-key)."
     ;; ReadBestBlock; WriteBestBlock deliberately leaves bestblock empty).
     (let ((locator (or locator-main locator-nomerkle)))
       (when locator
+        (setf (wallet-loaded-locator wallet) locator)
         (setf (wallet-last-block-hash wallet) (first locator))))
     ;; Install caches (rebuilds script/pubkey maps), then active mappings.
     (loop for spkm being the hash-values of (wallet-spkms wallet)
           do (spkm-set-cache wallet spkm
                              (or (gethash (desc-spkm-id spkm) caches)
-                                 (make-descriptor-cache))))
+                                 (make-descriptor-cache)))
+             ;; Core wires NotifyFirstKeyTimeChanged -> MaybeUpdateBirthTime
+             ;; per SPKM (wallet.cpp:3556).
+             (wallet-maybe-update-birth-time wallet
+                                             (desc-spkm-creation-time spkm)))
     (dolist (active actives)
       (destructuring-bind (internal type-code id) active
         (let ((spkm (gethash id (wallet-spkms wallet)))
@@ -722,11 +783,18 @@ descriptor-before-key)."
               (wallet-add-active-spkm wallet spkm type internal :persist nil)
               (push "Wallet file references an unknown active ScriptPubKeyMan"
                     warnings)))))
+    ;; Transaction records last: RefreshTXOs consults the IsMine maps built
+    ;; by the cache installs above (Core LoadTxRecords runs after descriptor
+    ;; records too).
+    (setf warnings (wallet-load-tx-records wallet (nreverse tx-records)
+                                           chain-state warnings))
     warnings))
 
-(defun load-wallet (manager name)
+(defun load-wallet (manager name &key chain-state)
   "Load an existing wallet from <wallets>/<name>/ and register it. Returns
-(values wallet warnings)."
+(values wallet warnings). CHAIN-STATE resolves stored tx block heights; the
+locator catch-up rescan is a separate step (wallet-attach-chain) run by the
+RPC after registration, mirroring Core's LoadWallet -> AttachChain split."
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (when (gethash name (wallet-manager-wallets manager))
       (error 'rpc-error :code +rpc-wallet-already-loaded+
@@ -746,7 +814,8 @@ descriptor-before-key)."
              (warnings '()))
         (handler-case
             (with-wallet-lock (wallet)
-              (setf warnings (%load-wallet-records wallet warnings))
+              (setf warnings (%load-wallet-records wallet warnings
+                                                   :chain-state chain-state))
               (when (and (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+)
                          (loop for spkm being the hash-values of (wallet-spkms wallet)
                                thereis (spkm-have-private-keys-p spkm)))
@@ -766,8 +835,15 @@ descriptor-before-key)."
               (append (wallet-manager-wallet-order manager) (list name)))
         (values wallet (nreverse warnings))))))
 
-(defun unload-wallet (manager wallet)
-  "Write the best-block marker, close the database, and deregister."
+(defun unload-wallet (manager wallet &key force)
+  "Write the best-block marker, close the database, and deregister. Refuses
+while a rescan is running (the scan thread holds the DB) unless FORCE — the
+shutdown path — which flags the scan to abort and proceeds."
+  (when (wallet-scanning-since wallet)
+    (if force
+        (setf (wallet-abort-rescan wallet) t)
+        (error 'rpc-error :code +rpc-wallet-error+
+                          :message "Wallet is currently rescanning. Abort existing rescan or wait.")))
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (with-wallet-lock (wallet)
       (wallet-write-best-block wallet)
@@ -799,7 +875,7 @@ persistent load_on_startup settings store yet — use loadwallet."
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (dolist (name (copy-list (wallet-manager-wallet-order manager)))
       (let ((wallet (gethash name (wallet-manager-wallets manager))))
-        (when wallet (unload-wallet manager wallet))))))
+        (when wallet (unload-wallet manager wallet :force t))))))
 
 ;;; --- RPC plumbing: /wallet/<name> endpoint resolution ---
 
@@ -851,16 +927,21 @@ Callers take this BEFORE any wallet lock (lock order)."
                   (max (bitcoin-lisp.storage:current-height cs) 0))
           (values nil 0)))))
 
-(defun %wallet-tip-mtp (node)
-  "The tip's median-time-past for importdescriptors' \"now\" (Core reads the
-tip's MTP into `now`, backup.cpp:388), falling back to wall-clock time when
-there is no tip."
+(defun %wallet-tip-time-and-mtp (node)
+  "(values tip-block-time tip-mtp) for importdescriptors: `now` (the meaning
+of a \"now\" timestamp) is the tip's median-time-past and the lowest-timestamp
+accumulator starts at the tip's block time (Core backup.cpp:385-388), falling
+back to wall-clock time when there is no tip."
   (with-node-lock (node)
     (let* ((cs (bitcoin-lisp::node-current-chainstate node))
-           (hash (and cs (bitcoin-lisp.storage:best-block-hash cs))))
-      (if hash
-          (bitcoin-lisp.validation:compute-median-time-past cs hash)
-          (bitcoin-lisp.serialization:get-unix-time)))))
+           (hash (and cs (bitcoin-lisp.storage:best-block-hash cs)))
+           (entry (and hash (bitcoin-lisp.storage:get-block-index-entry cs hash))))
+      (if entry
+          (values (bitcoin-lisp.serialization:block-header-timestamp
+                   (bitcoin-lisp.storage:block-index-entry-header entry))
+                  (bitcoin-lisp.validation:compute-median-time-past cs hash))
+          (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+            (values now now))))))
 
 (defun %label-from-value (value)
   "Core LabelFromValue: NIL -> \"\", \"*\" -> invalid."
@@ -920,13 +1001,43 @@ passphrases are rejected until encryption lands (wallet P6)."
 (defun rpc-loadwallet (node params)
   "Load a wallet from the wallet directory (Bitcoin Core loadwallet).
 PARAMS: (filename load_on_startup); load_on_startup is accepted but has no
-persistent settings store yet."
+persistent settings store yet. After the records load, the wallet is caught
+up from its stored best-block locator (Core AttachChain: fork lookup +
+rescan to the tip); a failed catch-up unloads the wallet and errors, like
+Core's failed-AttachChain load."
   (let ((manager (node-wallet-manager-checked node))
         (name (first params)))
     (unless (stringp name)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "filename must be a string"))
-    (multiple-value-bind (wallet warnings) (load-wallet manager name)
+    ;; Record load under the node-lock (outermost; manager/wallet locks nest
+    ;; inside): tx-state resolution reads the chain, and no block may connect
+    ;; between the load and the wallet becoming hook-visible.
+    (multiple-value-bind (wallet warnings)
+        (with-node-lock (node)
+          (load-wallet manager name
+                       :chain-state (bitcoin-lisp::node-current-chainstate node)))
+      ;; Catch up from the stored locator OUTSIDE the node-lock hold — the
+      ;; scan takes it per segment; blocks connecting meanwhile reach the
+      ;; wallet through the hooks (Core registers notifications pre-rescan).
+      (let ((error-message (wallet-attach-chain node wallet)))
+        (when error-message
+          (ignore-errors (unload-wallet manager wallet :force t))
+          (error 'rpc-error :code +rpc-wallet-error+ :message error-message)))
+      ;; Fold the current mempool in (Core LoadWallet -> postInitProcess ->
+      ;; requestMempoolTransactions); the attach-chain scan only does this
+      ;; when the wallet was behind the tip. Resubmitting the wallet's own
+      ;; unconfirmed txs is wallet P4 (rebroadcast machinery).
+      (with-node-lock (node)
+        (let ((mempool (bitcoin-lisp::node-mempool node)))
+          (when mempool
+            (bitcoin-lisp.mempool:mempool-for-each
+             mempool
+             (lambda (txid entry)
+               (declare (ignore txid))
+               (wallet-transaction-added-to-mempool
+                wallet mempool
+                (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
       (%push-warnings warnings `(("name" . ,(wallet-name wallet)))))))
 
 (defun rpc-unloadwallet (node params)
@@ -970,9 +1081,8 @@ listwallets)."
                         #())))))
 
 (defun rpc-getwalletinfo (node params)
-  "Wallet state info (Bitcoin Core getwalletinfo). txcount is 0 until chain
-tracking lands in P2; format reports our storage backend (leveldb, where Core
-says sqlite)."
+  "Wallet state info (Bitcoin Core getwalletinfo); format reports our storage
+backend (leveldb, where Core says sqlite)."
   (declare (ignore params))
   (let ((wallet (wallet-for-request node)))
     (with-wallet-lock (wallet)
@@ -986,14 +1096,13 @@ says sqlite)."
                              (reduce #'+ (set-difference active-internal
                                                          active-external)
                                      :key #'spkm-keypool-count :initial-value 0)))
-             (spkms (alexandria:hash-table-values (wallet-spkms wallet)))
-             (birthtime (when spkms
-                          (reduce #'min spkms :key #'desc-spkm-creation-time)))
+             (birthtime (when (< (wallet-birth-time wallet) most-positive-fixnum)
+                          (wallet-birth-time wallet)))
              (flags (wallet-flags wallet)))
         `(("walletname" . ,(wallet-name wallet))
           ("walletversion" . ,+wallet-legacy-version+)
           ("format" . "leveldb")
-          ("txcount" . 0)
+          ("txcount" . ,(hash-table-count (wallet-map-wallet wallet)))
           ("keypoolsize" . ,external-count)
           ("keypoolsize_hd_internal" . ,(- total-count external-count))
           ;; JSON false encodes as null here, like every existing handler
@@ -1002,7 +1111,11 @@ says sqlite)."
           ("private_keys_enabled" . ,(not (wallet-flag-set-p
                                            wallet +wallet-flag-disable-private-keys+)))
           ("avoid_reuse" . ,(wallet-flag-set-p wallet +wallet-flag-avoid-reuse+))
-          ("scanning" . nil)
+          ("scanning" . ,(let ((since (wallet-scanning-since wallet)))
+                           (when since
+                             `(("duration" . ,(- (bitcoin-lisp.serialization:get-unix-time)
+                                                 since))
+                               ("progress" . ,(wallet-scan-progress wallet))))))
           ("descriptors" . ,(wallet-flag-set-p wallet +wallet-flag-descriptors+))
           ("external_signer" . nil)
           ("blank" . ,(wallet-flag-set-p wallet +wallet-flag-blank-wallet+))
@@ -1202,6 +1315,7 @@ write address-book entries for non-ranged external descriptors, persist
               when address
                 do (wallet-write-address-book-entry wallet address label "receive"))))
     (spkm-write-descriptor wallet spkm)
+    (wallet-maybe-update-birth-time wallet timestamp)
     spkm))
 
 (defun %import-timestamp (data now)
@@ -1320,10 +1434,6 @@ caught into {success: false, error: {...}}."
                                 warnings))
                       (when output-type
                         (wallet-deactivate-spkm wallet spkm output-type internal)))))
-              ;; Rescan is deferred until chain tracking lands (wallet P2);
-              ;; the timestamp is recorded for that rescan.
-              (push "Rescan is deferred until wallet chain-tracking (P2); the import timestamp was recorded but historical transactions are not scanned yet"
-                    warnings)
               (%push-warnings (nreverse warnings) `(("success" . t))))))
       (rpc-error (e)
         (%push-warnings (nreverse warnings)
@@ -1332,20 +1442,75 @@ caught into {success: false, error: {...}}."
                                       ("message" . ,(rpc-error-message e))))))))))
 
 (defun rpc-importdescriptors (node params)
-  "Import descriptors into the wallet (Bitcoin Core importdescriptors).
-Stores + activates them; the timestamp-gated rescan lands with wallet P2."
+  "Import descriptors into the wallet (Bitcoin Core importdescriptors), then
+rescan the chain from the lowest request timestamp (backup.cpp:302-462): a
+successful import triggers RescanFromTime(lowest_timestamp), and any request
+whose timestamp the scan could not cover has its result replaced with Core's
+rescan-failed error."
   (let ((wallet (wallet-for-request node))
         (requests (first params)))
     (unless (and (listp requests) requests)
       (error 'rpc-error :code +rpc-type-error+
                         :message "requests must be a non-empty array"))
-    ;; Tip MTP read under the node-lock BEFORE the wallet lock (lock order).
-    (let ((now (%wallet-tip-mtp node)))
-      (with-wallet-lock (wallet)
-        (mapcar (lambda (request)
-                  ;; A bad timestamp throws out of the whole RPC — Core runs
-                  ;; GetImportTimestamp outside the per-request try block
-                  ;; (backup.cpp:392).
-                  (let ((timestamp (max (%import-timestamp request now) 1)))
-                    (%process-descriptor-import wallet request timestamp)))
-                requests)))))
+    (unless (wallet-reserve-rescan wallet)
+      (error 'rpc-error :code +rpc-wallet-error+
+                        :message "Wallet is currently rescanning. Abort existing rescan or wait."))
+    (unwind-protect
+        ;; Tip time + MTP read under the node-lock BEFORE the wallet lock
+        ;; (lock order): `now` = tip MTP, and the lowest-timestamp
+        ;; accumulator starts at the tip's block time (backup.cpp:385-388).
+        (multiple-value-bind (tip-time now) (%wallet-tip-time-and-mtp node)
+          (let ((lowest-timestamp tip-time)
+                (rescan nil)
+                (timestamps '())
+                (results nil))
+            (with-wallet-lock (wallet)
+              (setf results
+                    (mapcar (lambda (request)
+                              ;; A bad timestamp throws out of the whole RPC —
+                              ;; Core runs GetImportTimestamp outside the
+                              ;; per-request try block (backup.cpp:392).
+                              (let ((timestamp (max (%import-timestamp request now) 1)))
+                                (push timestamp timestamps)
+                                (when (< timestamp lowest-timestamp)
+                                  (setf lowest-timestamp timestamp))
+                                (let ((result (%process-descriptor-import
+                                               wallet request timestamp)))
+                                  (when (eq t (cdr (assoc "success" result
+                                                          :test #'string=)))
+                                    (setf rescan t))
+                                  result)))
+                            requests))
+              ;; Newly imported descriptors can make outputs of already-known
+              ;; wallet txs IsMine (Core RefreshAllTXOs, backup.cpp:404).
+              (wallet-refresh-all-txos wallet))
+            (setf timestamps (nreverse timestamps))
+            (if (not rescan)
+                results
+                (let ((scanned-time (wallet-rescan-from-time
+                                     node wallet lowest-timestamp :update t)))
+                  (when (wallet-abort-rescan wallet)
+                    (error 'rpc-error :code +rpc-misc-error+
+                                      :message "Rescan aborted by user."))
+                  ;; TODO(wallet P4): ResubmitWalletTransactions after the
+                  ;; rescan (backup.cpp:410) — rebroadcast machinery lands
+                  ;; with the spend path.
+                  (if (<= scanned-time lowest-timestamp)
+                      results
+                      ;; Replace the result of any request whose timestamp
+                      ;; the scan failed to reach (backup.cpp:417-457).
+                      (loop for result in results
+                            for timestamp in timestamps
+                            collect
+                            (if (or (<= scanned-time timestamp)
+                                    (assoc "error" result :test #'string=))
+                                result
+                                `(("success" . nil)
+                                  ("error"
+                                   . (("code" . ,+rpc-misc-error+)
+                                      ("message"
+                                       . ,(format nil "Rescan failed for descriptor with timestamp ~D. There was an error reading a block from time ~D, which is after or within ~D seconds of key creation, and could contain transactions pertaining to the desc. As a result, transactions and coins using this desc may not appear in the wallet. This error could potentially caused by data corruption. If the issue persists you may want to reindex (see -reindex option)."
+                                                  timestamp
+                                                  (- scanned-time +wallet-timestamp-window+ 1)
+                                                  +wallet-timestamp-window+))))))))))))
+      (wallet-release-rescan wallet))))

@@ -27,6 +27,14 @@
    #:init-wallet-manager
    #:close-wallet-manager
 
+   ;; Wallet chain-tracking fan-out (wallet P2; called by node.lisp's
+   ;; wallet-notify-* hooks)
+   #:wallet-manager-has-wallets-p
+   #:wallets-block-connected
+   #:wallets-block-disconnected
+   #:wallets-mempool-tx-added
+   #:wallets-mempool-tx-removed
+
    ;; Error codes
    #:+rpc-parse-error+
    #:+rpc-invalid-request+
