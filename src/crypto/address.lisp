@@ -368,17 +368,22 @@ Regtest reuses testnet address versions (base58) like Bitcoin Core."
                      +p2sh-version-mainnet+)))
     (base58check-encode version script-hash)))
 
+(defun segwit-hrp (network)
+  "Bech32 human-readable part per network (Core chainparams bech32_hrp):
+bc mainnet, tb test chains, bcrt regtest — matching decode-address's
+expected-hrp so encode/decode round-trip on every network."
+  (cond ((eq network :regtest) "bcrt")
+        ((test-network-p network) "tb")
+        (t "bc")))
+
 (defun encode-p2wpkh-address (pubkey-hash network)
   "Encode a 20-byte pubkey hash as P2WPKH address."
-  (let ((hrp (if (test-network-p network) "tb" "bc")))
-    (segwit-address-encode hrp 0 pubkey-hash)))
+  (segwit-address-encode (segwit-hrp network) 0 pubkey-hash))
 
 (defun encode-p2wsh-address (script-hash network)
   "Encode a 32-byte script hash as P2WSH address."
-  (let ((hrp (if (test-network-p network) "tb" "bc")))
-    (segwit-address-encode hrp 0 script-hash)))
+  (segwit-address-encode (segwit-hrp network) 0 script-hash))
 
 (defun encode-p2tr-address (output-key network)
   "Encode a 32-byte output key as P2TR address."
-  (let ((hrp (if (test-network-p network) "tb" "bc")))
-    (segwit-address-encode hrp 1 output-key)))
+  (segwit-address-encode (segwit-hrp network) 1 output-key))

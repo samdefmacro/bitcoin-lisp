@@ -1004,12 +1004,15 @@ reads the trailing v2 tx-count field (v1/legacy entries default it to 0)."
 
 ;;; Block locator for syncing
 
-(defun build-block-locator (state)
+(defun build-block-locator (state &optional from-entry)
   "Build a block locator for the getheaders/getblocks messages.
-Returns a list of block hashes starting from the tip and going back
-with exponentially increasing gaps."
+Returns a list of block hashes starting from FROM-ENTRY (default: the tip)
+and going back with exponentially increasing gaps. The wallet's best-block
+record (Core GetLocator over the wallet's last processed block) passes an
+explicit FROM-ENTRY."
   (let ((locator '())
-        (entry (get-block-index-entry state (chain-state-best-block-hash state)))
+        (entry (or from-entry
+                   (get-block-index-entry state (chain-state-best-block-hash state))))
         (step 1)
         (count 0))
     ;; Walk back through the chain

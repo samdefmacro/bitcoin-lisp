@@ -465,9 +465,10 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
       ;; Evict the package-RBF replaced set once, up front — the analogue of
       ;; Core applying the changeset's removals with its additions.
       (when pkg-replaced
-        (loop for k being the hash-keys of pkg-replaced
-              do (setf (gethash k replaced) t)
-                 (bitcoin-lisp.mempool:mempool-remove-recursive mempool k)))
+        (let ((bitcoin-lisp.mempool:*mempool-removal-reason* :replaced))
+          (loop for k being the hash-keys of pkg-replaced
+                do (setf (gethash k replaced) t)
+                   (bitcoin-lisp.mempool:mempool-remove-recursive mempool k))))
       ;; Submit all, parents first. For a multi-tx subset a failure here is
       ;; unreachable (step 5); mirror Core's belt-and-suspenders (SubmitPackage,
       ;; validation.cpp:1255-1277): mark the member, keep submitting the rest.

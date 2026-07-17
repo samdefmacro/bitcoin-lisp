@@ -903,6 +903,7 @@
    #:mempool-add
    #:accept-validated-tx
    #:mempool-remove
+   #:*mempool-removal-reason*
    #:mempool-count
    #:mempool-total-size
    #:mempool-dynamic-usage
@@ -1443,6 +1444,12 @@
    #:maybe-periodic-flush
    #:index-block-filter
    #:index-block-coinstats
+   ;; Wallet chain-tracking hooks (wallet P2; defined in node.lisp, called
+   ;; from connect-block / perform-reorg / the mempool like the index hooks)
+   #:wallet-notify-block-connected
+   #:wallet-notify-block-disconnected
+   #:wallet-notify-mempool-tx-added
+   #:wallet-notify-mempool-tx-removed
    #:maybe-validate-snapshot
    #:rebalance-caches-on-ibd-exit))
 
