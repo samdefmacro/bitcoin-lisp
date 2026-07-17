@@ -377,6 +377,98 @@ details.reveal pre {
   .nav-search input { width: 100%; }
 }
 
+/* --- peers & network ops (gui-plan P3) ------------------------------- */
+
+.banner a { color: inherit; }
+
+.net-line { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
+.net-status { font-size: 13.5px; }
+.net-status.net-off { color: var(--warn); font-weight: 600; }
+.net-hint { font-size: 11.5px; margin: 0.5rem 0 0; }
+
+/* peers + ban tables (mono like the blocks table, mixed alignment) */
+table.peers {
+  width: 100%; border-collapse: collapse;
+  font: 12.5px/1.4 var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+table.peers th {
+  text-align: left;
+  font: 600 10.5px var(--font-ui);
+  text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--muted);
+  padding: 0.3rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+table.peers td {
+  padding: 0.34rem 0.75rem;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+table.peers th:first-child, table.peers td:first-child { padding-left: 0; }
+table.peers th:last-child, table.peers td:last-child { padding-right: 0; }
+table.peers tr:last-child td { border-bottom: none; }
+table.peers th.num, table.peers td.num { text-align: right; }
+table.peers td.col-subver {
+  max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+  color: var(--muted);
+}
+table.peers tbody tr[role="button"] { cursor: pointer; }
+table.peers tbody tr[role="button"]:hover td { background: var(--panel-2); }
+table.peers tbody tr.selected td { background: var(--panel-2); }
+
+.th-sort {
+  background: none; border: none; padding: 0;
+  font: inherit; color: inherit; letter-spacing: inherit;
+  text-transform: inherit; cursor: pointer;
+}
+.th-sort:hover, .th-sort.sorted { color: var(--ink); }
+
+/* manual-ban form */
+.ban-form { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.7rem; }
+.ban-form input {
+  flex: 1; min-width: 200px;
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 0.32rem 0.55rem;
+  font: 12px var(--font-mono);
+}
+.ban-form select, .drawer-actions select {
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 0.25rem 0.4rem;
+  font: 12px var(--font-ui);
+}
+
+/* destructive actions: quiet until armed by the first click */
+.btn-danger { color: var(--bad); border-color: var(--bad); background: none; }
+.btn-danger:hover:enabled { border-color: var(--bad); filter: brightness(1.15); }
+.btn.armed { background: var(--bad); color: var(--bg); border-color: var(--bad); }
+
+/* peer detail drawer */
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0;
+  width: min(420px, 94vw);
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+  box-shadow: -12px 0 32px rgba(0, 0, 0, 0.35);
+  padding: 0.9rem 1.1rem 1.2rem;
+  overflow-y: auto;
+  z-index: 20;
+}
+.drawer-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 0.5rem;
+}
+.drawer-head .card-title { margin: 0; }
+.drawer-head .linklike { margin-left: 0; }
+.drawer-actions {
+  display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;
+  margin-top: 0.9rem; padding-top: 0.7rem;
+  border-top: 1px solid var(--line);
+}
+
 /* --- a11y / motion -------------------------------------------------- */
 
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

@@ -1,10 +1,11 @@
 // App shell: login flow, poll scheduler (gui-plan P0), hash routing +
-// universal search (gui-plan P2).
+// universal search (gui-plan P2), peers view wiring (gui-plan P3).
 
 import * as rpc from './rpc.js';
 import { tick, resetDashboard } from './dashboard.js';
 import * as router from './router.js';
 import * as explorer from './explorer.js';
+import * as peers from './peers.js';
 
 const POLL_MS = 3000;
 
@@ -23,6 +24,7 @@ function showLogin(message = '') {
   stopPolling();
   rpc.clearCredentials();
   resetDashboard();
+  peers.resetPeers();
   $('dash-view').hidden = true;
   $('login-view').hidden = false;
   const err = $('login-error');
@@ -43,7 +45,7 @@ function showApp() {
 // The dashboard poll keeps running on every view: it feeds the topbar,
 // status dot, and banners, and the dashboard DOM is simply hidden.
 
-const VIEWS = ['dashboard', 'explorer', 'block', 'tx'];
+const VIEWS = ['dashboard', 'explorer', 'block', 'tx', 'peers'];
 
 function showView(name, navName = name) {
   for (const v of VIEWS) $(`view-${v}`).hidden = v !== name;
@@ -81,6 +83,12 @@ function handleRoute(route) {
       showView('tx', 'explorer');
       explorer.showTx($('view-tx'), route.args[0]);
       break;
+    case 'peers':
+      showView('peers');
+      // A failed initial fetch is not fatal: the shared poll retries every
+      // 3s and drives the disconnected banner / re-login itself.
+      peers.show($('view-peers')).catch(() => {});
+      break;
     case 'explorer':
     default:
       showView('explorer');
@@ -117,6 +125,7 @@ async function poll(epoch) {
   if (epoch !== pollEpoch || document.hidden || !loggedIn) return;
   try {
     await tick();
+    await peers.refresh(); // no-op unless the peers view is on screen
     setStatus('live');
     $('conn-banner').hidden = true;
   } catch (e) {

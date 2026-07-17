@@ -84,6 +84,9 @@ function renderPeers(net) {
   setText('peers-in', fmtInt(net.connections_in));
   setText('peers-out', fmtInt(net.connections_out));
   setText('net-active', net.networkactive ? 'active' : 'disabled');
+  // Global networking-disabled banner (gui-plan P3) — every view shows it;
+  // the toggle itself lives on the peers page.
+  $('net-banner').hidden = net.networkactive !== false;
 }
 
 function renderMempool(mem) {
