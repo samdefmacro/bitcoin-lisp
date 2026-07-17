@@ -901,10 +901,23 @@ are likely unproductive. Returns T if the peer should be disconnected."
 ;;;    an expiry (e.g. for a future setban RPC). Unaffected by misbehavior.
 
 (defconstant +ban-duration-seconds+ (* 24 60 60)
-  "Ban duration: 24 hours.")
+  "Default ban duration: 24 hours (Bitcoin Core DEFAULT_MISBEHAVING_BANTIME,
+banman.h:19).")
+
+(defvar *default-ban-time-seconds* +ban-duration-seconds+
+  "Effective default ban duration in seconds, applied when setban/ban-address
+gets no explicit time (Core -bantime, banman.cpp:130-140: a non-positive
+ban_time_offset falls back to m_default_ban_time). Set from config at startup.")
 
 (defvar *banned-peers* (make-hash-table :test 'equal)
   "Hash table mapping peer address (string) -> ban-expiry-time (universal-time).")
+
+(defvar *banlist-path* nil
+  "Pathname of the banlist.json persistence file (Core BanMan's
+<datadir>/banlist.json), or NIL when persistence is off (no node running).
+Set at node startup; every manual-ban mutation dumps the file immediately,
+exactly like Core (banman.cpp:153,170,79 — Ban/Unban/ClearBanned each call
+DumpBanlist).")
 
 (defvar *discouraged-peers* (bitcoin-lisp:make-rejects-filter)
   "Bounded, ephemeral rolling set of discouraged peer addresses (strings).
@@ -961,7 +974,8 @@ logged. Returns T."
     (when (and address (plusp (length address)))
       (bt:with-lock-held (*ban-lock*)
         (setf (gethash address *banned-peers*)
-              (+ (get-universal-time) +ban-duration-seconds+)))))
+              (+ (get-universal-time) *default-ban-time-seconds*)))
+      (save-banlist)))
   (when (peer-connection peer)
     (close-connection (peer-connection peer))
     (setf (peer-connection peer) nil)))
@@ -982,22 +996,26 @@ Returns T if banned, NIL otherwise. Expired bans are cleaned up."
 (defun clear-ban-list ()
   "Clear all bans."
   (bt:with-lock-held (*ban-lock*)
-    (clrhash *banned-peers*)))
+    (clrhash *banned-peers*))
+  (save-banlist))
 
-(defun ban-address (address &optional (seconds +ban-duration-seconds+))
-  "Manually ban ADDRESS (string) for SECONDS from now (Bitcoin Core setban add).
-Returns T, NIL for an empty address."
+(defun ban-address (address &optional (seconds *default-ban-time-seconds*))
+  "Manually ban ADDRESS (string) for SECONDS from now (Bitcoin Core setban add;
+SECONDS defaults to -bantime). Returns T, NIL for an empty address."
   (when (and (stringp address) (plusp (length address)))
     (bt:with-lock-held (*ban-lock*)
       (setf (gethash address *banned-peers*)
             (+ (get-universal-time) seconds)))
+    (save-banlist)
     t))
 
 (defun unban-address (address)
   "Remove ADDRESS from the ban list (Bitcoin Core setban remove). Returns T if it
 was banned, NIL otherwise."
-  (bt:with-lock-held (*ban-lock*)
-    (remhash address *banned-peers*)))
+  (let ((removed (bt:with-lock-held (*ban-lock*)
+                   (remhash address *banned-peers*))))
+    (when removed (save-banlist))
+    removed))
 
 (defun list-bans ()
   "Return a list of (address . banned-until-universal-time) for active bans,
@@ -1013,6 +1031,71 @@ pruning any that have expired (Bitcoin Core listbanned)."
                *banned-peers*)
       (dolist (addr expired) (remhash addr *banned-peers*)))
     result))
+
+;;; Banlist persistence (Core BanMan <datadir>/banlist.json, banman.cpp).
+;;; Core dumps immediately on every Ban/Unban/ClearBanned plus a 15-minute
+;;; scheduler sweep; the mutators above call save-banlist directly, so the
+;;; file never lags the in-memory list.
+
+(defun save-banlist (&optional (path *banlist-path*))
+  "Write the manual ban list to PATH as Core-style banlist.json:
+{\"banned_nets\": [{\"version\", \"ban_created\", \"banned_until\",
+\"address\"}]} with UNIX-epoch times. No-op when PATH is NIL. Never signals —
+a failed dump only logs (Core LogError in DumpBanlist)."
+  (when path
+    (handler-case
+        (let* ((bans (list-bans))
+               (entries
+                 (mapcar (lambda (ban)
+                           (let ((ht (make-hash-table :test 'equal)))
+                             (setf (gethash "version" ht) 1
+                                   ;; Creation time is not tracked; 0 keeps the
+                                   ;; field present for Core-shaped consumers.
+                                   (gethash "ban_created" ht) 0
+                                   (gethash "banned_until" ht)
+                                   (- (cdr ban)
+                                      bitcoin-lisp.serialization:+universal-unix-epoch-offset+)
+                                   (gethash "address" ht) (car ban))
+                             ht))
+                         bans))
+               (top (make-hash-table :test 'equal))
+               (tmp (merge-pathnames (concatenate 'string (file-namestring path) ".new")
+                                     path)))
+          (setf (gethash "banned_nets" top) entries)
+          (ensure-directories-exist path)
+          (with-open-file (out tmp :direction :output :if-exists :supersede
+                                   :if-does-not-exist :create)
+            (yason:encode top out))
+          (rename-file tmp path)
+          t)
+      (error (e)
+        (bitcoin-lisp:log-warn "Could not write banlist ~A: ~A" path e)
+        nil))))
+
+(defun load-banlist (&optional (path *banlist-path*))
+  "Load the manual ban list from PATH (Core BanMan ctor LoadBanlist),
+dropping already-expired entries (Core SweepBanned). Returns the number of
+active bans loaded; NIL when the file is absent/unreadable."
+  (when (and path (probe-file path))
+    (handler-case
+        (let* ((json (with-open-file (in path) (yason:parse in)))
+               (nets (and (hash-table-p json) (gethash "banned_nets" json)))
+               (now (get-universal-time))
+               (count 0))
+          (bt:with-lock-held (*ban-lock*)
+            (dolist (entry nets)
+              (when (hash-table-p entry)
+                (let ((addr (gethash "address" entry))
+                      (until (gethash "banned_until" entry)))
+                  (when (and (stringp addr) (integerp until))
+                    (let ((expiry (+ until bitcoin-lisp.serialization:+universal-unix-epoch-offset+)))
+                      (when (> expiry now)
+                        (setf (gethash addr *banned-peers*) expiry)
+                        (incf count))))))))
+          count)
+      (error (e)
+        (bitcoin-lisp:log-warn "Could not read banlist ~A: ~A" path e)
+        nil))))
 
 ;;; Per-Peer Rate Limiting
 

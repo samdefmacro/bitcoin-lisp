@@ -996,16 +996,17 @@ says sqlite)."
           ("txcount" . 0)
           ("keypoolsize" . ,external-count)
           ("keypoolsize_hd_internal" . ,(- total-count external-count))
-          ;; JSON false encodes as null here, like every existing handler
-          ;; (codebase-wide convention; the false/null cleanup is a wave-10
-          ;; item).
-          ("private_keys_enabled" . ,(not (wallet-flag-set-p
-                                           wallet +wallet-flag-disable-private-keys+)))
-          ("avoid_reuse" . ,(wallet-flag-set-p wallet +wallet-flag-avoid-reuse+))
-          ("scanning" . nil)
-          ("descriptors" . ,(wallet-flag-set-p wallet +wallet-flag-descriptors+))
-          ("external_signer" . nil)
-          ("blank" . ,(wallet-flag-set-p wallet +wallet-flag-blank-wallet+))
+          ;; Core booleans are true/false, never null (wave-10 cleanup);
+          ;; "scanning" is Core's false-or-progress-object — false while no
+          ;; rescan runs.
+          ("private_keys_enabled" . ,(json-bool
+                                      (not (wallet-flag-set-p
+                                            wallet +wallet-flag-disable-private-keys+))))
+          ("avoid_reuse" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+)))
+          ("scanning" . ,+json-false+)
+          ("descriptors" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-descriptors+)))
+          ("external_signer" . ,+json-false+)
+          ("blank" . ,(json-bool (wallet-flag-set-p wallet +wallet-flag-blank-wallet+)))
           ,@(when birthtime `(("birthtime" . ,birthtime)))
           ("flags" . ,(or (loop for bit from 0 below 64
                                 for flag = (ash 1 bit)
@@ -1122,10 +1123,10 @@ PARAMS: (private)."
                          entry
                        `(("desc" . ,desc-str)
                          ("timestamp" . ,(desc-spkm-creation-time spkm))
-                         ("active" . ,active)
+                         ("active" . ,(json-bool active))
                          ;; internal is defined only for active descriptors
                          ,@(when active
-                             `(("internal" . ,internal)))
+                             `(("internal" . ,(json-bool internal))))
                          ,@(when ranged
                              `(("range" . (,(desc-spkm-range-start spkm)
                                            ,(1- (desc-spkm-range-end spkm))))
@@ -1327,7 +1328,7 @@ caught into {success: false, error: {...}}."
               (%push-warnings (nreverse warnings) `(("success" . t))))))
       (rpc-error (e)
         (%push-warnings (nreverse warnings)
-                        `(("success" . nil)
+                        `(("success" . ,+json-false+)
                           ("error" . (("code" . ,(rpc-error-code e))
                                       ("message" . ,(rpc-error-message e))))))))))
 
