@@ -233,6 +233,10 @@
                              ;; Assumeutxo P4: dual chainstate + background IBD
                              (:file "assumeutxo-tests")
                              ;; Wallet P1: container + keystore + wallet RPCs
-                             (:file "wallet-tests"))))
+                             (:file "wallet-tests")
+                             ;; Wave 10: RPC boolean/error-code parity, HTTP
+                             ;; layer, BIP64 getutxos, config wires, arg
+                             ;; handling, banlist persistence
+                             (:file "wave10-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
