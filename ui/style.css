@@ -98,12 +98,6 @@ body {
   border-bottom: 2px solid transparent;
 }
 .nav-item.active { color: var(--ink); border-bottom-color: var(--accent); }
-.nav-item.planned { cursor: default; }
-.nav-item.planned em {
-  font-style: normal; font-size: 10px; text-transform: uppercase;
-  letter-spacing: 0.08em; color: var(--muted); opacity: 0.75;
-  margin-left: 2px;
-}
 
 /* --- card grid ----------------------------------------------------- */
 
@@ -468,6 +462,79 @@ table.peers tbody tr.selected td { background: var(--panel-2); }
   margin-top: 0.9rem; padding-top: 0.7rem;
   border-top: 1px solid var(--line);
 }
+
+/* --- RPC console (gui-plan P4) --------------------------------------- */
+
+.console-head { display: flex; align-items: baseline; justify-content: space-between; }
+.console-head .linklike { margin-left: 0; font-size: 12px; }
+
+.console-log {
+  max-height: 55vh; min-height: 120px;
+  overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg);
+  padding: 0.3rem 0.7rem;
+  margin-bottom: 0.7rem;
+}
+.console-empty { font-size: 12.5px; margin: 0.4rem 0; }
+.console-entry { padding: 0.45rem 0; border-top: 1px solid var(--line); }
+.console-entry:first-child { border-top: none; }
+.console-cmd { font-size: 12.5px; overflow-wrap: anywhere; }
+.console-cmd::before { content: "› "; color: var(--accent); }
+.console-body { margin-top: 3px; }
+.console-scalar {
+  font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.console-error { color: var(--bad); font-size: 12.5px; overflow-wrap: anywhere; }
+.console-pending { font-size: 12px; }
+details.console-json { margin-top: 2px; }
+details.console-json pre { max-height: 340px; }
+
+.console-form { display: flex; gap: 0.5rem; position: relative; flex-wrap: wrap; }
+.console-input {
+  flex: 1; min-width: 220px;
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+  font: 12.5px var(--font-mono);
+}
+.console-input::placeholder { color: var(--muted); }
+.btn[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+
+/* suggestions drop UP from the input row (the input sits under the log) */
+.console-suggest {
+  position: absolute; bottom: calc(100% + 4px); left: 0;
+  min-width: 280px; max-width: 100%;
+  max-height: 260px; overflow-y: auto;
+  margin: 0; padding: 0.25rem 0; list-style: none;
+  background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  z-index: 15;
+}
+.console-suggest li {
+  padding: 0.18rem 0.7rem;
+  font: 12px var(--font-mono);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.console-suggest li:hover, .console-suggest li.active {
+  background: var(--accent); color: var(--bg);
+}
+
+.console-params { margin-top: 0.55rem; }
+.console-json-area {
+  width: 100%; min-height: 74px; resize: vertical;
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 0.45rem 0.6rem;
+  font: 12.5px/1.5 var(--font-mono);
+}
+.console-json-area::placeholder { color: var(--muted); }
+.console-json-area:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent;
+}
+.console-hint { font-size: 11.5px; margin: 0.5rem 0 0; }
 
 /* --- a11y / motion -------------------------------------------------- */
 
