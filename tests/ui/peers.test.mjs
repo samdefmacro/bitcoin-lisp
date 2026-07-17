@@ -83,27 +83,30 @@ globalThis.sessionStorage = {
 
 // --- stubbed JSON-RPC endpoint -------------------------------------------
 
-// Fixtures mirror exactly what src/rpc/methods.lisp emits.
+// Fixtures mirror what src/rpc/methods.lisp emits (a representative subset
+// of the Core-parity field set): synced_blocks is always -1 (no
+// last-common-block tracking), pingtime is ABSENT until a pong arrived, and
+// the height column reads startingheight.
 const NOW = Math.floor(Date.now() / 1000);
 const PEER_FIXTURES = [
   { id: 0, addr: '203.0.113.7', version: 70016, subver: '/Satoshi:29.0.0/',
-    services: '0000000000000c09', inbound: false,
+    services: '0000000000000c09', inbound: false, network: 'ipv4',
     transport_protocol_type: 'v2', connection_type: 'outbound-full-relay',
     relaytxes: true, startingheight: 905000, synced_headers: 905003,
-    synced_blocks: 905003, bytessent: 52340, bytesrecv: 1049000,
+    synced_blocks: -1, bytessent: 52340, bytesrecv: 1049000,
     addr_processed: 400, addr_rate_limited: 12, pingtime: 0.083 },
   { id: 1, addr: '2001:db8::beef', version: 70015, subver: '/miniclient:1.0/',
-    services: '0000000000000009', inbound: true,
+    services: '0000000000000009', inbound: true, network: 'ipv6',
     transport_protocol_type: 'v1', connection_type: 'inbound',
     relaytxes: true, startingheight: -1, synced_headers: -1,
     synced_blocks: -1, bytessent: 300, bytesrecv: 250,
-    addr_processed: 0, addr_rate_limited: 0, pingtime: 0 },
+    addr_processed: 0, addr_rate_limited: 0 },
   { id: 2, addr: 'expl0r6dbldpvzflmac2wtl3sad5f7tqoyfar2cyhcqnjbfaxxwbnzid.onion',
     version: 70016, subver: '/Satoshi:28.1.0/',
-    services: '0000000000000c09', inbound: false,
+    services: '0000000000000c09', inbound: false, network: 'onion',
     transport_protocol_type: 'v1', connection_type: 'block-relay-only',
     relaytxes: false, startingheight: 905001, synced_headers: 905003,
-    synced_blocks: 905001, bytessent: 9000, bytesrecv: 4200000,
+    synced_blocks: -1, bytessent: 9000, bytesrecv: 4200000,
     addr_processed: 0, addr_rate_limited: 0, pingtime: 0.412 },
 ];
 const fixtures = {
@@ -216,7 +219,7 @@ test('peer table renders one row per getpeerinfo entry, id-sorted', () => {
   assert.equal(first[4], 'v2');
   assert.equal(first[5], 'ipv4');
   assert.equal(first[6], '83 ms');
-  assert.equal(first[7], '905,003');
+  assert.equal(first[7], '905,000'); // startingheight drives the height column
   assert.equal(first[10], '/Satoshi:29.0.0/');
   // unknown ping / pre-verack -1 height render as em dashes; ipv6 detected
   const second = cellTexts(rows[1]);
@@ -295,7 +298,7 @@ test('drawer disconnect: armed confirm, then disconnectnode(addr)', async () => 
     { method: 'disconnectnode', params: ['203.0.113.7'] });
 });
 
-test('drawer ban: setban add with the chosen duration, then disconnect', async () => {
+test('drawer ban: setban add with the chosen duration, no disconnect chase', async () => {
   const rows = tableRows(container, 1);
   await rows[2].dispatch('click'); // the onion peer, id 2
   const drawer = container.find((n) => n.tagName === 'ASIDE');
@@ -305,11 +308,11 @@ test('drawer ban: setban add with the chosen duration, then disconnect', async (
   rpcLog.length = 0;
   await confirmClick(btn);
   const calls = rpcLog.filter((c) => ['setban', 'disconnectnode'].includes(c.method));
-  assert.deepEqual(calls[0],
-    { method: 'setban', params: [PEER_FIXTURES[2].addr, 'add', 604800] });
-  // our setban does not drop the connected peer (Core's does) — the UI chains it
-  assert.deepEqual(calls[1],
-    { method: 'disconnectnode', params: [PEER_FIXTURES[2].addr] });
+  // setban itself disconnects the matching connected peer now (Core parity),
+  // so the single RPC is the whole action.
+  assert.deepEqual(calls, [
+    { method: 'setban', params: [PEER_FIXTURES[2].addr, 'add', 604800] },
+  ]);
 });
 
 test('unban: setban remove for the banned address', async () => {

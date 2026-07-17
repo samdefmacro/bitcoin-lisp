@@ -2101,6 +2101,48 @@ RejectIncomingTxs in the TX handler, net_processing.cpp:4474-4479)."
     (bitcoin-lisp.networking::handle-inv peer payload state nil)
     (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))))
 
+(test blocksonly-rejects-incoming-txs-any-network
+  "-blocksonly (Core ignore_incoming_txs, DEFAULT_BLOCKSONLY=false) rejects
+incoming txs on ANY network: ignore-incoming-txs-p flips, a tx message and a
+tx inv both disconnect the sender — on a test network where relay is
+otherwise always on."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp:*blocksonly* t))
+    (is-true (bitcoin-lisp.networking:ignore-incoming-txs-p))
+    ;; tx message in violation of our fRelay=0 -> disconnect
+    ;; (Core net_processing.cpp:4474-4479).
+    (let ((peer (bitcoin-lisp.networking:make-peer :state :ready)))
+      (bitcoin-lisp.networking::handle-tx peer #() nil nil nil nil)
+      (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))))
+    ;; tx inv in violation -> disconnect (net_processing.cpp:4168-4172).
+    (let ((state (bitcoin-lisp.storage:make-chain-state))
+          (peer (bitcoin-lisp.networking:make-peer :state :ready))
+          (payload (subseq (bitcoin-lisp.serialization:make-inv-message
+                            (list (bitcoin-lisp.serialization:make-inv-vector
+                                   :type bitcoin-lisp.serialization:+inv-type-tx+
+                                   :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                        :initial-element 94))))
+                           24)))
+      (bitcoin-lisp.networking::handle-inv peer payload state nil)
+      (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))))
+  ;; Default off: regtest relays normally.
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp:*blocksonly* nil))
+    (is-false (bitcoin-lisp.networking:ignore-incoming-txs-p))))
+
+(test blocksonly-still-announces-own-txs
+  "A blocksonly node still queues announcements of its OWN (locally
+submitted) transactions — Core's RelayTransaction has no
+ignore_incoming_txs gate; only the receive side is switched off."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp:*blocksonly* t)
+         (frelay1 (bitcoin-lisp.networking:make-peer
+                   :state :ready :version (%w9-version-msg :relay t)))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 95)))
+    (bitcoin-lisp.networking::relay-transaction
+     txid nil (list frelay1) :fee-rate 2)
+    (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue frelay1))))))
+
 ;;;; Tx-request tracker: Core txrequest caps, delays, cleanup
 
 (test tx-request-nonpref-peer-delayed

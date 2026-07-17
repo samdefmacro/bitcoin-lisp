@@ -718,6 +718,21 @@ used to emit it verbatim, which yason cannot encode."
     (is (assoc "connections" result :test #'string=))
     (is (assoc "networkactive" result :test #'string=))))
 
+(test rpc-getnetworkinfo-localrelay-blocksonly
+  "localrelay = !IgnoresIncomingTxs (Core): true on a test network by
+default, json-false under -blocksonly."
+  (let ((node (make-test-node)))
+    (let ((bitcoin-lisp:*network* :regtest)
+          (bitcoin-lisp:*blocksonly* nil))
+      (is (eq t (cdr (assoc "localrelay"
+                            (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
+                            :test #'string=)))))
+    (let ((bitcoin-lisp:*network* :regtest)
+          (bitcoin-lisp:*blocksonly* t))
+      (is (eq 'yason:false (cdr (assoc "localrelay"
+                                       (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
+                                       :test #'string=)))))))
+
 (test rpc-getconnectioncount
   "Test getconnectioncount returns integer"
   (let* ((node (make-test-node))
@@ -1769,6 +1784,55 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       (is (<= (abs (- future (cdr (assoc "banned_until" (first banned) :test #'string=)))) 2)))
     (bitcoin-lisp.networking:clear-ban-list)))
 
+(test rpc-setban-add-disconnects-connected-peer
+  "setban add disconnects every connected peer with the banned address itself
+(Core rpc/net.cpp:803-810 -> CConnman::DisconnectNode) — the peers UI no
+longer needs to chain a disconnectnode. Other peers are untouched."
+  (bitcoin-lisp.networking:clear-ban-list)
+  (let* ((node (make-test-node))
+         (conn (bitcoin-lisp.networking::make-connection
+                :host "203.0.113.9" :port 8333 :connected t))
+         (target (bitcoin-lisp::make-peer :address "203.0.113.9" :state :ready
+                                          :connection conn))
+         (other (bitcoin-lisp::make-peer :address "198.51.100.3" :state :ready)))
+    (setf (bitcoin-lisp::node-peers node) (list target other))
+    (is (null (bitcoin-lisp.rpc::rpc-setban node (list "203.0.113.9" "add"))))
+    (is-true (bitcoin-lisp.networking:peer-banned-p "203.0.113.9"))
+    (is (eq :disconnected (bitcoin-lisp.networking:peer-state target)))
+    (is (null (bitcoin-lisp.networking::peer-connection target)))
+    (is (eq :ready (bitcoin-lisp.networking:peer-state other)))
+    (bitcoin-lisp.networking:clear-ban-list)))
+
+(test inbound-connection-admission-gate
+  "The inbound accept path consults the ban list BEFORE any handshake work
+(Core CConnman::CreateNodeFromAcceptedSocket, net.cpp:1801-1813): banned
+addresses are always dropped; discouraged addresses only when the inbound
+slots are (almost) full."
+  (bitcoin-lisp.networking:clear-ban-list)
+  (bitcoin-lisp.networking:clear-discouraged)
+  (let ((node (make-test-node)))
+    (is-true (bitcoin-lisp::inbound-connection-allowed-p node "203.0.113.77"))
+    ;; Banned: dropped regardless of slot pressure.
+    (bitcoin-lisp.networking:ban-address "203.0.113.77")
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp::inbound-connection-allowed-p node "203.0.113.77")
+      (is (null ok))
+      (is (eq :banned reason)))
+    ;; Discouraged with free slots: still admitted.
+    (bitcoin-lisp.networking:discourage-peer "198.51.100.77")
+    (is-true (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.77"))
+    ;; Discouraged at inbound capacity: dropped.
+    (setf (bitcoin-lisp::node-peers node)
+          (loop for i from 1 to bitcoin-lisp::+max-inbound-peers+
+                collect (bitcoin-lisp::make-peer
+                         :address (format nil "10.~D.1.1" i) :inbound t)))
+    (multiple-value-bind (ok reason)
+        (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.77")
+      (is (null ok))
+      (is (eq :discouraged reason)))
+    (bitcoin-lisp.networking:clear-ban-list)
+    (bitcoin-lisp.networking:clear-discouraged)))
+
 (test rpc-getnettotals-fields
   "getnettotals returns integer byte totals + timemillis + an uploadtarget object."
   (let ((r (bitcoin-lisp.rpc::rpc-getnettotals (make-test-node) nil)))
@@ -2022,10 +2086,12 @@ NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
       (finishes (with-output-to-string (s) (yason:encode resp s))))))
 
 (test rpc-getpeerinfo-fields
-  "getpeerinfo reports a real inbound flag plus synced_*/bytessent/bytesrecv/
-pingtime, and (since #216) each peer's connection_type + relaytxes. An inbound
+  "getpeerinfo reports a real inbound flag plus startingheight/bytessent/
+bytesrecv, and (since #216) each peer's connection_type + relaytxes. An inbound
 peer defaults to conn-type :inbound and relays txs; a block-relay-only peer maps
-to \"block-relay-only\" with relaytxes false."
+to \"block-relay-only\" with relaytxes false. synced_headers/synced_blocks are
+-1 while unknown (Core), and pingtime is absent until a pong arrived (Core
+emits it conditionally)."
   (let* ((node (make-test-node))
          (peer (bitcoin-lisp::make-peer :address "1.2.3.4:8333"
                                         :inbound t :start-height 99 :services #x409))
@@ -2038,9 +2104,15 @@ to \"block-relay-only\" with relaytxes false."
            (b (find "block-relay-only" rows :key ct :test #'string=)))
       (is-true e)
       (is (eq t (cdr (assoc "inbound" e :test #'string=))))
-      (is (= 99 (cdr (assoc "synced_blocks" e :test #'string=))))
+      (is (= 99 (cdr (assoc "startingheight" e :test #'string=))))
+      ;; No best-known-block yet and no common-block tracking: both -1.
+      (is (= -1 (cdr (assoc "synced_headers" e :test #'string=))))
+      (is (= -1 (cdr (assoc "synced_blocks" e :test #'string=))))
       (is (assoc "bytessent" e :test #'string=))
-      (is (assoc "pingtime" e :test #'string=))
+      ;; No pong yet: pingtime/minping/pingwait are all absent (Core).
+      (is (null (assoc "pingtime" e :test #'string=)))
+      (is (null (assoc "minping" e :test #'string=)))
+      (is (null (assoc "pingwait" e :test #'string=)))
       (is (eq t (cdr (assoc "relaytxes" e :test #'string=))))
       ;; services is Core's 16-hex-digit string, not a number.
       (is (string= "0000000000000409" (cdr (assoc "services" e :test #'string=))))
@@ -2056,6 +2128,104 @@ to \"block-relay-only\" with relaytxes false."
              (b2 (find "block-relay-only" rows2 :key ct :test #'string=)))
         (is (string= "v2" (cdr (assoc "transport_protocol_type" b2
                                       :test #'string=))))))))
+
+(test rpc-getpeerinfo-parity-fields
+  "The Core-parity getpeerinfo fields added by the P2P/RPC parity batch:
+network classification, servicesnames, ping stats (conditional), feefilter,
+per-message byte maps, addr_relay_enabled, bip152 flags, timeoffset/conntime,
+inv queue counters, permissions, session_id — and the whole row must encode
+through yason."
+  (let* ((node (make-test-node))
+         (vmsg (bitcoin-lisp.serialization::make-version-message
+                :version 70016 :start-height 42 :user-agent "/parity/"))
+         (conn (bitcoin-lisp.networking::make-connection
+                :host "203.0.113.5" :port 8333 :connected t))
+         (peer (bitcoin-lisp::make-peer :address "203.0.113.5"
+                                        :version vmsg
+                                        :services #x409
+                                        :connection conn)))
+    ;; Simulate live state: one pong observed, one ping outstanding, a
+    ;; feefilter received, a queued announcement, addr relay set up, and
+    ;; some per-command traffic.
+    (setf (bitcoin-lisp.networking::peer-ping-latency peer)
+          internal-time-units-per-second        ; 1.0s last ping
+          (bitcoin-lisp.networking::peer-min-ping-latency peer)
+          (floor internal-time-units-per-second 2) ; 0.5s best
+          (bitcoin-lisp.networking::peer-ping-nonce peer) 7
+          (bitcoin-lisp.networking::peer-last-ping-time peer)
+          (get-internal-real-time)
+          (bitcoin-lisp.networking::peer-feefilter-rate peer) 1000
+          (bitcoin-lisp.networking::peer-time-offset peer) -3
+          (bitcoin-lisp.networking::peer-addr-relay-enabled peer) t
+          (bitcoin-lisp.networking::peer-tx-inv-queue peer)
+          (let ((txid (make-array 32 :element-type '(unsigned-byte 8))))
+            (list (list txid txid 0)))
+          (bitcoin-lisp.networking::connection-last-send-time conn)
+          (get-universal-time))
+    (incf (gethash "ping" (bitcoin-lisp.networking::peer-sent-per-msg peer) 0) 32)
+    (setf (bitcoin-lisp::node-peers node) (list peer))
+    (let* ((rows (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+           (e (first rows))
+           (f (lambda (k) (cdr (assoc k e :test #'string=)))))
+      (is (string= "ipv4" (funcall f "network")))
+      (is (equalp #("NETWORK" "WITNESS" "NETWORK_LIMITED")
+                  (funcall f "servicesnames")))
+      ;; ping stats in seconds, all present here.
+      (is (= 1.0d0 (funcall f "pingtime")))
+      (is (= 0.5d0 (funcall f "minping")))
+      (is (numberp (funcall f "pingwait")))
+      ;; feefilter: 1000 sat/kvB -> BTC/kvB.
+      (is (= 1.0d-5 (funcall f "minfeefilter")))
+      ;; timeoffset captured at version receipt; conntime a plausible unix time.
+      (is (= -3 (funcall f "timeoffset")))
+      (is (> (funcall f "conntime") 1600000000))
+      ;; lastsend reflects the connection stamp; lastrecv never happened.
+      (is (> (funcall f "lastsend") 1600000000))
+      (is (= 0 (funcall f "lastrecv")))
+      (is (= 0 (funcall f "last_transaction")))
+      (is (= 0 (funcall f "last_block")))
+      ;; inv queue counters.
+      (is (= 1 (funcall f "inv_to_send")))
+      (is (= 1 (funcall f "last_inv_sequence")))
+      ;; presync/headers cursors: nothing known yet.
+      (is (= -1 (funcall f "presynced_headers")))
+      (is (equalp #() (funcall f "inflight")))
+      ;; booleans are json-bool coded, never NIL.
+      (is (eq t (funcall f "addr_relay_enabled")))
+      (is (eq 'yason:false (funcall f "bip152_hb_to")))
+      (is (eq 'yason:false (funcall f "bip152_hb_from")))
+      ;; no permission system: honestly empty array.
+      (is (equalp #() (funcall f "permissions")))
+      ;; per-command byte maps are fresh hash-table snapshots.
+      (let ((sent (funcall f "bytessent_per_msg")))
+        (is (hash-table-p sent))
+        (is (= 32 (gethash "ping" sent))))
+      (is (hash-table-p (funcall f "bytesrecv_per_msg")))
+      ;; v1 connection: empty session id.
+      (is (string= "" (funcall f "session_id")))
+      ;; the deliberate omissions stay omitted.
+      (is (null (assoc "addrbind" e :test #'string=)))
+      (is (null (assoc "mapped_as" e :test #'string=)))
+      ;; full row encodes through yason.
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response rows "id")))
+        (finishes (with-output-to-string (s) (yason:encode response s)))))))
+
+(test rpc-getpeerinfo-synced-headers-from-best-known
+  "synced_headers reports the height of the peer's best known block (Core
+pindexBestKnownBlock -> nSyncHeight) once an announcement recorded one."
+  (let* ((node (make-test-node))
+         (chain-state (bitcoin-lisp.rpc::rpc-get-chain-state node))
+         (bhash (make-array 32 :element-type '(unsigned-byte 8)
+                               :initial-element 33))
+         (peer (bitcoin-lisp::make-peer :address "198.51.100.9")))
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state (bitcoin-lisp.storage:make-block-index-entry
+                  :hash bhash :height 7 :status :valid))
+    (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer) bhash)
+    (setf (bitcoin-lisp::node-peers node) (list peer))
+    (let ((e (first (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))))
+      (is (= 7 (cdr (assoc "synced_headers" e :test #'string=))))
+      (is (= -1 (cdr (assoc "synced_blocks" e :test #'string=)))))))
 
 (test rpc-getorphantxs
   "getorphantxs lists the orphan pool: verbosity 0 -> array of txid hex; 1 ->
