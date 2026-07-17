@@ -1,11 +1,13 @@
 // App shell: login flow, poll scheduler (gui-plan P0), hash routing +
-// universal search (gui-plan P2), peers view wiring (gui-plan P3).
+// universal search (gui-plan P2), peers view wiring (gui-plan P3),
+// RPC console wiring (gui-plan P4).
 
 import * as rpc from './rpc.js';
 import { tick, resetDashboard } from './dashboard.js';
 import * as router from './router.js';
 import * as explorer from './explorer.js';
 import * as peers from './peers.js';
+import * as consoleView from './console.js';
 
 const POLL_MS = 3000;
 
@@ -25,6 +27,7 @@ function showLogin(message = '') {
   rpc.clearCredentials();
   resetDashboard();
   peers.resetPeers();
+  consoleView.resetConsole();
   $('dash-view').hidden = true;
   $('login-view').hidden = false;
   const err = $('login-error');
@@ -45,7 +48,7 @@ function showApp() {
 // The dashboard poll keeps running on every view: it feeds the topbar,
 // status dot, and banners, and the dashboard DOM is simply hidden.
 
-const VIEWS = ['dashboard', 'explorer', 'block', 'tx', 'peers'];
+const VIEWS = ['dashboard', 'explorer', 'block', 'tx', 'peers', 'console'];
 
 function showView(name, navName = name) {
   for (const v of VIEWS) $(`view-${v}`).hidden = v !== name;
@@ -88,6 +91,12 @@ function handleRoute(route) {
       // A failed initial fetch is not fatal: the shared poll retries every
       // 3s and drives the disconnected banner / re-login itself.
       peers.show($('view-peers')).catch(() => {});
+      break;
+    case 'console':
+      showView('console');
+      // A failed `help` fetch only disables autocomplete; show() retries it
+      // the next time the view opens.
+      consoleView.show($('view-console')).catch(() => {});
       break;
     case 'explorer':
     default:
