@@ -121,6 +121,46 @@ harness in tests/ui/peers.test.mjs — run: node --test tests/ui/peers.test.mjs.
     (is (not (null (gethash method bitcoin-lisp.rpc::*rpc-methods*)))
         "RPC method ~S (called by the peers page) must be registered" method)))
 
+(test ui-handle-serves-console-assets
+  "The P4 console module is served with the JS content type, the shell wires
+in the console view + nav link, and `help` — the one RPC the page's
+autocomplete depends on — is registered and emits the newline-separated
+list of registered method names the page parses. (The page's parsing/
+autocomplete/history/rendering behavior is covered by the zero-dependency
+node harness in tests/ui/console.test.mjs — run: node --test
+tests/ui/console.test.mjs.)"
+  (with-ui-reply ()
+    (let ((body (bitcoin-lisp.rpc::ui-handle "/ui/js/console.js")))
+      (is (= 200 (hunchentoot:return-code*)))
+      (is (alexandria:starts-with-subseq "text/javascript"
+                                         (hunchentoot:content-type*)))
+      (is (plusp (length body)))))
+  (with-ui-reply ()
+    (let* ((body (bitcoin-lisp.rpc::ui-handle "/ui/index.html"))
+           (html (flexi-streams:octets-to-string body :external-format :utf-8)))
+      (is (search "view-console" html))
+      (is (search "#/console" html))))
+  (bitcoin-lisp.rpc::register-all-methods)
+  (is (not (null (gethash "help" bitcoin-lisp.rpc::*rpc-methods*)))
+      "RPC method \"help\" (the console's autocomplete source) must be registered")
+  ;; help with no params: one registered method name per line, sorted —
+  ;; exactly the format console.js parseHelpText consumes.
+  (let* ((text (bitcoin-lisp.rpc::rpc-help nil nil))
+         (lines (uiop:split-string text :separator '(#\Newline))))
+    (is (stringp text))
+    (is (< 1 (length lines)))
+    (is (member "getblockcount" lines :test #'string=))
+    (is (member "help" lines :test #'string=))
+    (is (notany (lambda (line)
+                  (or (zerop (length line)) (find #\Space line)))
+                lines)
+        "every help line must be a single bare method name")
+    (is (every (lambda (line)
+                 (nth-value 1 (gethash line bitcoin-lisp.rpc::*rpc-methods*)))
+               lines)
+        "every help line must be a registered method")
+    (is (equal lines (sort (copy-list lines) #'string<)))))
+
 (test ui-handle-404s
   "Missing files, traversal attempts, and directories are all 404."
   (dolist (path '("/ui/nope.js"
