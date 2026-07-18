@@ -46,12 +46,12 @@ export function hasCredentials() {
   return sessionStorage.getItem(AUTH_KEY) !== null;
 }
 
-async function post(payload) {
+async function post(payload, endpoint) {
   const headers = { 'Content-Type': 'application/json' };
   const auth = sessionStorage.getItem(AUTH_KEY);
   if (auth) headers['Authorization'] = `Basic ${auth}`;
 
-  const res = await fetch(ENDPOINT, {
+  const res = await fetch(endpoint, {
     method: 'POST',
     headers,
     body: JSON.stringify(payload),
@@ -63,8 +63,11 @@ async function post(payload) {
 }
 
 // Single call: resolves to the result, throws RpcError on a JSON-RPC error.
-export async function call(method, params = []) {
-  const body = await post({ jsonrpc: '2.0', id: nextId++, method, params });
+// ENDPOINT selects the URI path — the wallet pages pass '/wallet/<name>' so
+// wallet RPCs address a specific wallet (gui-plan P6a); everything else
+// uses the base endpoint default.
+export async function call(method, params = [], endpoint = ENDPOINT) {
+  const body = await post({ jsonrpc: '2.0', id: nextId++, method, params }, endpoint);
   if (body.error) throw new RpcError(body.error.code, body.error.message);
   return body.result;
 }
@@ -73,11 +76,11 @@ export async function call(method, params = []) {
 // { result, error } in the same order (matched by id, never by position).
 // Transport/auth failures throw; per-method errors are returned in place so
 // one failing card never blanks the whole dashboard.
-export async function batch(calls) {
+export async function batch(calls, endpoint = ENDPOINT) {
   if (calls.length === 0) return [];
   const requests = calls.map(([method, params = []]) =>
     ({ jsonrpc: '2.0', id: nextId++, method, params }));
-  const responses = await post(requests);
+  const responses = await post(requests, endpoint);
   if (!Array.isArray(responses)) throw new Error('malformed batch response');
   const byId = new Map(responses.map((r) => [r.id, r]));
   return requests.map((req) => {

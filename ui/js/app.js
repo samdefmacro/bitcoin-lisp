@@ -1,6 +1,6 @@
 // App shell: login flow, poll scheduler (gui-plan P0), hash routing +
 // universal search (gui-plan P2), peers view wiring (gui-plan P3),
-// RPC console wiring (gui-plan P4).
+// RPC console wiring (gui-plan P4), wallet screens wiring (gui-plan P6a).
 
 import * as rpc from './rpc.js';
 import { tick, resetDashboard } from './dashboard.js';
@@ -8,6 +8,7 @@ import * as router from './router.js';
 import * as explorer from './explorer.js';
 import * as peers from './peers.js';
 import * as consoleView from './console.js';
+import * as wallet from './wallet.js';
 
 const POLL_MS = 3000;
 
@@ -28,6 +29,7 @@ function showLogin(message = '') {
   resetDashboard();
   peers.resetPeers();
   consoleView.resetConsole();
+  wallet.resetWallet();
   $('dash-view').hidden = true;
   $('login-view').hidden = false;
   const err = $('login-error');
@@ -48,7 +50,7 @@ function showApp() {
 // The dashboard poll keeps running on every view: it feeds the topbar,
 // status dot, and banners, and the dashboard DOM is simply hidden.
 
-const VIEWS = ['dashboard', 'explorer', 'block', 'tx', 'peers', 'console'];
+const VIEWS = ['dashboard', 'explorer', 'block', 'tx', 'peers', 'console', 'wallet'];
 
 function showView(name, navName = name) {
   for (const v of VIEWS) $(`view-${v}`).hidden = v !== name;
@@ -98,6 +100,12 @@ function handleRoute(route) {
       // the next time the view opens.
       consoleView.show($('view-console')).catch(() => {});
       break;
+    case 'wallet':
+      showView('wallet');
+      // A failed initial fetch is not fatal: the shared poll retries every
+      // 3s and drives the disconnected banner / re-login itself.
+      wallet.show($('view-wallet'), route.args[0]).catch(() => {});
+      break;
     case 'explorer':
     default:
       showView('explorer');
@@ -135,6 +143,7 @@ async function poll(epoch) {
   try {
     await tick();
     await peers.refresh(); // no-op unless the peers view is on screen
+    await wallet.refresh(); // no-op unless the wallet view is on screen
     setStatus('live');
     $('conn-banner').hidden = true;
   } catch (e) {

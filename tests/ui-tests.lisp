@@ -161,6 +161,41 @@ tests/ui/console.test.mjs.)"
         "every help line must be a registered method")
     (is (equal lines (sort (copy-list lines) #'string<)))))
 
+(test ui-handle-serves-wallet-assets
+  "The P6a wallet + QR modules are served with the JS content type, the
+shell wires in the wallet view + nav link, every RPC method the page calls
+is a registered dispatcher method, and the /wallet/<name> endpoint parsing
+the page's endpoint-aware rpc.js relies on resolves names. (The page's
+selector/overview/receive/history/address-book behavior is covered by the
+zero-dependency node harness in tests/ui/wallet.test.mjs, and the QR
+encoder byte-exactly against reference vectors in tests/ui/qr.test.mjs —
+run: node --test tests/ui/wallet.test.mjs tests/ui/qr.test.mjs.)"
+  (dolist (path '("/ui/js/wallet.js" "/ui/js/qr.js"))
+    (with-ui-reply ()
+      (let ((body (bitcoin-lisp.rpc::ui-handle path)))
+        (is (= 200 (hunchentoot:return-code*)) "~S must be served" path)
+        (is (alexandria:starts-with-subseq "text/javascript"
+                                           (hunchentoot:content-type*)))
+        (is (plusp (length body))))))
+  (with-ui-reply ()
+    (let* ((body (bitcoin-lisp.rpc::ui-handle "/ui/index.html"))
+           (html (flexi-streams:octets-to-string body :external-format :utf-8)))
+      (is (search "view-wallet" html))
+      (is (search "#/wallet" html))))
+  (bitcoin-lisp.rpc::register-all-methods)
+  (dolist (method '("listwallets" "listwalletdir" "loadwallet"
+                    "getbalances" "getwalletinfo" "getblockcount"
+                    "getnewaddress" "getaddressinfo"
+                    "listtransactions" "gettransaction"
+                    "listlabels" "getaddressesbylabel" "setlabel"))
+    (is (not (null (gethash method bitcoin-lisp.rpc::*rpc-methods*)))
+        "RPC method ~S (called by the wallet page) must be registered" method))
+  ;; The page pins every wallet RPC to /wallet/<name>; the URI parsing it
+  ;; rides must resolve names (and leave the base endpoint wallet-less).
+  (is (equal "w1" (bitcoin-lisp.rpc::wallet-name-from-uri "/wallet/w1")))
+  (is (null (bitcoin-lisp.rpc::wallet-name-from-uri "/")))
+  (is (null (bitcoin-lisp.rpc::wallet-name-from-uri "/wallet/"))))
+
 (test ui-handle-404s
   "Missing files, traversal attempts, and directories are all 404."
   (dolist (path '("/ui/nope.js"
