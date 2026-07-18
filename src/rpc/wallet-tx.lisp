@@ -735,14 +735,19 @@ ordering of same-block historical txs."
                    (let ((child (wallet-get-wallet-tx wallet spender)))
                      (when child (push child stack)))))))))
 
-(defun wallet-add-to-wallet (wallet tx state &key rescanning block-time)
+(defun wallet-add-to-wallet (wallet tx state &key rescanning block-time map-value)
   "Core CWallet::AddToWallet: insert or update the wallet tx for TX with
-STATE (a state list), persist, refresh the TXO cache. Returns the wallet-tx."
+STATE (a state list), persist, refresh the TXO cache. Returns the wallet-tx.
+MAP-VALUE seeds a freshly-inserted wtx's user mapValue pairs — the
+CommitTransaction update callback (wallet.cpp:2464-2472); ignored on update,
+where Core asserts the existing mapValue is what it keeps."
   (let* ((txid (bitcoin-lisp.serialization:transaction-hash tx))
          (existing (wallet-get-wallet-tx wallet txid))
          (wtx (or existing (make-wallet-tx :tx tx :txid txid)))
          (inserted (not existing))
          (updated nil))
+    (when (and inserted map-value)
+      (setf (wallet-tx-map-value wtx) map-value))
     (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
       ;; WALLET_FLAG_AVOID_REUSE: destinations this tx spends from become
       ;; previously-spent; txs paying newly-flagged destinations lose their
@@ -1091,6 +1096,9 @@ single-hash fallback when the entry is unknown."
           (wallet-last-block-height wallet) height)
     (let ((block-time (bitcoin-lisp.serialization:block-header-timestamp
                        (bitcoin-lisp.serialization:bitcoin-block-header block))))
+      ;; Core SetLastBlockProcessed's m_best_block_time — the rebroadcast
+      ;; filter's reference clock (wallet P4).
+      (setf (wallet-last-block-time wallet) block-time)
       ;; Birthday gate over a wallet-side running max of processed block
       ;; times (over-approximates Core's per-block nTimeMax — see the
       ;; divergence note at the top of this file).
@@ -1149,10 +1157,11 @@ single-hash fallback when the entry is unknown."
 ;;; --- Manager fan-outs (called by node.lisp's wallet-notify-* hooks) ---
 
 (defun %manager-wallets (manager)
-  (bt:with-recursive-lock-held ((wallet-manager-lock manager))
-    (loop for name in (wallet-manager-wallet-order manager)
-          for wallet = (gethash name (wallet-manager-wallets manager))
-          when wallet collect wallet)))
+  "The loaded wallets, in load order — the manager's immutable lock-free
+snapshot. Deliberately does NOT take the manager lock: fan-outs run from
+hook contexts that may already hold a wallet lock, and the only lock order
+involving the manager is manager -> wallet (see wallet-manager)."
+  (wallet-manager-wallet-snapshot manager))
 
 (defun wallets-block-connected (manager mempool chain-state block block-hash height)
   (dolist (wallet (%manager-wallets manager))

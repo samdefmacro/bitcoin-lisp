@@ -74,6 +74,15 @@ satoshis, at most 8 fraction digits, within MoneyRange."
   "Satoshis as the BTC double the RPC layer emits."
   (/ satoshis 100000000.0d0))
 
+(defun %feerate-fee (rate-sat-kvb size)
+  "Core CFeeRate::GetFee: RATE-SAT-KVB * SIZE / 1000 truncated, floored at
+1 satoshi for a non-zero rate on a non-zero size. Pure integer math."
+  (declare (type integer rate-sat-kvb size))
+  (let ((fee (truncate (* rate-sat-kvb size) 1000)))
+    (if (and (zerop fee) (plusp size) (plusp rate-sat-kvb))
+        1
+        fee)))
+
 ;;; --- IsSpent (wallet.cpp:770) ---
 
 (defun %wallet-outpoint-key-spent-p (wallet key)
@@ -222,14 +231,27 @@ whose redeem script is a witness program as :p2sh-segwit."
 ;;; --- AvailableCoins (spend.cpp:320, the listunspent subset) ---
 
 (defstruct wallet-coin
-  "One spendable candidate (Core COutput, the fields listunspent reports)."
+  "One spendable candidate (Core COutput). P3 fills the listunspent fields;
+the coin-selection fields (input-bytes/fee/effective-value/from-me/time,
+wallet P4) are populated only when wallet-available-coins runs with a
+FEERATE + INPUT-BYTES-FN — exactly the fields Core's COutput constructor
+fills when a feerate is passed (coinselection.h:75-99)."
   txid
   index
   output
   wtx
   (depth 0 :type integer)
   solvable
-  safe)
+  safe
+  ;; --- Coin selection fields (wallet P4) ---
+  (input-bytes -1 :type integer)   ; max signed input vsize, -1 unknown
+  from-me
+  (time 0 :type integer)           ; CWalletTx::GetTxTime
+  fee                              ; satoshis to spend at the effective feerate, NIL when no feerate
+  (long-term-fee 0 :type integer)  ; filled by out-group insertion
+  (bump-fee 0 :type integer)       ; ancestor bump fee (always 0 — no bump-fee machinery, see wallet-spend)
+  effective-value                  ; value - fee, NIL when no feerate
+  output-type)                     ; :legacy/:p2sh-segwit/:bech32/:bech32m/:unknown
 
 (defparameter +output-type-order+ '(:legacy :p2sh-segwit :bech32 :bech32m :unknown)
   "CoinsResult::All concatenation order (OutputType enum order).")
@@ -241,12 +263,24 @@ whose redeem script is a witness program as :p2sh-segwit."
                                            min-sum-amount
                                            max-count
                                            include-immature-coinbase
-                                           (skip-locked t))
+                                           (skip-locked t)
+                                           ;; --- Coin-selection extensions (wallet P4) ---
+                                           feerate            ; sat/kvB, fills fee/effective-value
+                                           input-bytes-fn     ; script -> max signed input vsize or NIL
+                                           (allow-used-addresses t)
+                                           skip-outpoints     ; equalp hash of outpoint keys to skip
+                                           check-version-trucness
+                                           (tx-version 2)
+                                           mempool)
   "The wallet's unspent, eligible coins as wallet-coin structs, grouped in
-output-type order. Caller holds the wallet lock."
+output-type order. Caller holds the wallet lock (and, when MEMPOOL /
+CHECK-VERSION-TRUCNESS are in play, the node lock outside it)."
   (let ((buckets (make-hash-table :test 'eq))
         (tx-safe-cache (make-hash-table :test 'equalp)) ; txid -> (ok . safe)
         (trusted-parents (make-hash-table :test 'equalp))
+        ;; Unconfirmed TRUC coins bucketed aside (spend.cpp:329-330,498-513).
+        (truc-coins '())                                ; (type . coin), reversed
+        (truc-value (make-hash-table :test 'equalp))    ; txid -> total value
         (total 0)
         (count 0)
         (done nil))
@@ -283,6 +317,25 @@ output-type order. Caller holds the wallet lock."
                                 (assoc "replaced_by_txid" (wallet-tx-map-value wtx)
                                        :test #'string=)))
                    (setf safe nil))
+                 ;; TRUC topology gate (spend.cpp:401-414): a v3 spend may
+                 ;; only take unconfirmed v3 coins whose tx has no mempool
+                 ;; child yet and no unconfirmed parent (2-generation rule);
+                 ;; a non-v3 spend never takes unconfirmed v3 coins.
+                 (when (and (zerop depth) check-version-trucness)
+                   (let ((v3 (= (bitcoin-lisp.serialization:transaction-version
+                                 (wallet-tx-tx wtx))
+                                bitcoin-lisp.mempool:+truc-version+)))
+                     (if (= tx-version bitcoin-lisp.mempool:+truc-version+)
+                         (progn
+                           (unless v3 (return-from skip-coin))
+                           (when (wallet-tx-truc-child wtx)
+                             (return-from skip-coin))
+                           (when (and mempool
+                                      (> (bitcoin-lisp.mempool:mempool-ancestor-stats
+                                          mempool txid)
+                                         1))
+                             (return-from skip-coin)))
+                         (when v3 (return-from skip-coin)))))
                  (when (and only-safe (not safe)) (return-from skip-coin))
                  (when (or (< depth min-depth) (> depth max-depth))
                    (return-from skip-coin))
@@ -295,24 +348,74 @@ output-type order. Caller holds the wallet lock."
                (when (or (< value min-amount)
                          (and max-amount (> value max-amount)))
                  (return-from skip-coin))
+               ;; Manually selected coins are fetched by the caller directly.
+               (when (and skip-outpoints
+                          (gethash (%wtx-outpoint-key txid index) skip-outpoints))
+                 (return-from skip-coin))
                (when (and skip-locked (wallet-locked-coin-p wallet txid index))
                  (return-from skip-coin))
                (when (wallet-outpoint-spent-p wallet txid index)
                  (return-from skip-coin))
+               (when (and (not allow-used-addresses)
+                          (wallet-spent-key-script-p wallet script))
+                 (return-from skip-coin))
                (multiple-value-bind (spkm) (%wallet-owning-spkm wallet script)
-                 (let ((coin (make-wallet-coin
-                              :txid txid :index index :output output :wtx wtx
-                              :depth depth
-                              :solvable (and spkm (%spkm-solvable-p spkm) t)
-                              :safe (cdr checked))))
-                   (push coin (gethash (%wallet-coin-output-type wallet script)
-                                       buckets))
-                   (incf total value)
-                   (incf count)
-                   (when (or (and min-sum-amount (>= total min-sum-amount))
-                             (and max-count (>= count max-count)))
-                     (setf done t)))))))))
+                 (let* ((input-bytes (or (and input-bytes-fn
+                                              (funcall input-bytes-fn script))
+                                         -1))
+                        (output-type (%wallet-coin-output-type wallet script))
+                        (coin (make-wallet-coin
+                               :txid txid :index index :output output :wtx wtx
+                               :depth depth
+                               ;; With an INPUT-BYTES-FN the solvability
+                               ;; criterion is Core's: a satisfaction size
+                               ;; could be inferred (spend.cpp:453-455).
+                               :solvable (if input-bytes-fn
+                                             (> input-bytes -1)
+                                             (and spkm (%spkm-solvable-p spkm) t))
+                               :safe (cdr checked)
+                               :input-bytes input-bytes
+                               :from-me (wallet-tx-from-me-cached wallet wtx)
+                               :time (wallet-tx-get-time wtx)
+                               :fee (when feerate
+                                      (if (minusp input-bytes)
+                                          0
+                                          (%feerate-fee feerate input-bytes)))
+                               :effective-value
+                               (when feerate
+                                 (- value (if (minusp input-bytes)
+                                              0
+                                              (%feerate-fee feerate input-bytes))))
+                               :output-type output-type)))
+                   (if (and check-version-trucness (zerop depth)
+                            (= (bitcoin-lisp.serialization:transaction-version
+                                (wallet-tx-tx wtx))
+                               bitcoin-lisp.mempool:+truc-version+))
+                       ;; Bucketed aside; only the highest-value v3 tx's
+                       ;; coins join the result (spend.cpp:475-478,498-513).
+                       (progn
+                         (push (cons output-type coin) truc-coins)
+                         (incf (gethash txid truc-value 0) value))
+                       (progn
+                         (push coin (gethash output-type buckets))
+                         (incf total value)
+                         (incf count)
+                         (when (or (and min-sum-amount (>= total min-sum-amount))
+                                   (and max-count (>= count max-count)))
+                           (setf done t)))))))))))
      (wallet-txos wallet))
+    ;; Fold in the coins of the single highest-value unconfirmed TRUC tx —
+    ;; skipped entirely when the min-sum/max-count early return fired, like
+    ;; Core's in-loop `return result` (spend.cpp:486-495).
+    (when (and truc-coins (not done))
+      (let ((best-txid nil) (best-value -1))
+        (maphash (lambda (txid value)
+                   (when (> value best-value)
+                     (setf best-txid txid best-value value)))
+                 truc-value)
+        (dolist (entry truc-coins)
+          (when (equalp (wallet-coin-txid (cdr entry)) best-txid)
+            (push (cdr entry) (gethash (car entry) buckets))))))
     (loop for type in +output-type-order+
           nconc (nreverse (gethash type buckets)))))
 

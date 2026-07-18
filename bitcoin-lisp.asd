@@ -100,6 +100,7 @@
                                (:file "wallet")
                                (:file "wallet-tx")
                                (:file "wallet-coins")
+                               (:file "wallet-spend")
                                (:file "psbt")
                                (:file "merkleproof")
                                (:file "rest")
@@ -242,6 +243,9 @@
                              ;; Wallet P3: balances, coins, labels,
                              ;; getaddressinfo, abandontransaction
                              (:file "wallet-balance-tests")
+                             ;; Wallet P4: coin selection, spending RPCs,
+                             ;; wallet signing, rebroadcast
+                             (:file "wallet-spend-tests")
                              ;; Wave 10: RPC boolean/error-code parity, HTTP
                              ;; layer, BIP64 getutxos, config wires, arg
                              ;; handling, banlist persistence
