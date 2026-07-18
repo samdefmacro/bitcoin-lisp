@@ -228,6 +228,18 @@ submissions still work and are still announced (sendrawtransaction relays,
 per Core BroadcastTransaction), and block relay is unaffected. See
 networking's IGNORE-INCOMING-TXS-P. Set by start-node's :blocksonly keyword.")
 
+(defvar *wallet-max-tx-fee* 10000000
+  "Maximum ABSOLUTE fee, in satoshis, a wallet-built (or wallet-resubmitted)
+transaction may pay (Bitcoin Core -maxtxfee, DEFAULT_TRANSACTION_MAXFEE =
+COIN/10 = 0.1 BTC, wallet.h:137). A transaction exceeding it is never built
+and never broadcast — funds-safety rail, wallet P4.")
+
+(defvar *wallet-fallback-fee* 0
+  "Fee rate in sat/kvB the wallet falls back to when fee estimation has no
+data (Bitcoin Core -fallbackfee, DEFAULT_FALLBACK_FEE = 0, wallet.h:106).
+0 disables the fallback: fee estimation failure is then an error, exactly
+Core's m_allow_fallback_fee = (fallback fee != 0) gate (wallet.cpp:3013).")
+
 (defvar *accept-datacarrier* t
   "Mempool policy: accept OP_RETURN data-carrier outputs (Bitcoin Core
 -datacarrier, default true). When NIL the shared *MAX-DATACARRIER-BYTES*
@@ -689,7 +701,8 @@ specially in config-alist->start-node-plist.")
     "limitclustercount" "limitclustersize" "signetchallenge"
     "proxy" "onion" "proxyrandomize" "onlynet" "cjdnsreachable"
     "assumevalid" "minimumchainwork" "mempoolexpiry" "minrelaytxfee"
-    "blockmintxfee" "bantime" "uacomment" "dnsseed" "fixedseeds"
+    "blockmintxfee" "maxtxfee" "fallbackfee" "bantime" "uacomment"
+    "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
     ;; repeatable start-node option collected outside the spec scan
     "addnode")
@@ -899,6 +912,22 @@ start-node-from-args."
           (unless sats
             (error "Invalid amount for -blockmintxfee=~A" v))
           (setf bitcoin-lisp.mining:*block-min-tx-fee-rate* sats))))
+    ;; -maxtxfee: BTC, absolute cap on any wallet tx fee (Core init: BTC via
+    ;; ParseMoney, default DEFAULT_TRANSACTION_MAXFEE = 0.1 BTC).
+    (let ((v (lk "maxtxfee")))
+      (when v
+        (let ((sats (conf-parse-money v)))
+          (unless sats
+            (error "Invalid amount for -maxtxfee=~A" v))
+          (setf *wallet-max-tx-fee* sats))))
+    ;; -fallbackfee: BTC/kvB used when fee estimation has no data (Core
+    ;; wallet.cpp:3005-3014); 0 keeps the fallback disabled.
+    (let ((v (lk "fallbackfee")))
+      (when v
+        (let ((sats (conf-parse-money v)))
+          (unless sats
+            (error "Invalid amount for -fallbackfee=~A" v))
+          (setf *wallet-fallback-fee* sats))))
     ;; -bantime: default setban duration in seconds (Core banman.h:19
     ;; DEFAULT_MISBEHAVING_BANTIME = 86400, applied when setban gets no time).
     (let ((v (lk "bantime")))

@@ -24,6 +24,7 @@
 ;;; --- Wallet RPC error codes (Core rpc/protocol.h:71-86) ---
 
 (defconstant +rpc-wallet-error+ -4)
+(defconstant +rpc-wallet-insufficient-funds+ -6)
 (defconstant +rpc-wallet-invalid-label-name+ -11)
 (defconstant +rpc-wallet-keypool-ran-out+ -12)
 (defconstant +rpc-wallet-not-found+ -18)
@@ -147,6 +148,10 @@ map, and the descriptor's private keys."
   (locked-utxos '() :type list)  ; (txid . n) pairs from lockedutxo records
   (last-block-hash nil)          ; 32-byte wire-order hash, or NIL
   (last-block-height 0 :type integer)
+  ;; Timestamp of the last connected block (Core m_best_block_time) and the
+  ;; next scheduled rebroadcast time (m_next_resend) — wallet P4 resend.
+  (last-block-time 0 :type integer)
+  (next-resend 0 :type integer)
   ;; --- Chain tracking (wallet P2) ---
   (map-wallet (make-hash-table :test 'equalp) :type hash-table)  ; txid -> wallet-tx
   (tx-ordered (make-array 0 :adjustable t :fill-pointer 0)
@@ -175,7 +180,20 @@ through it (Core WalletContext)."
   (keypool-size +default-keypool-size+ :type (integer 1))
   (wallets (make-hash-table :test 'equal) :type hash-table)  ; name -> wallet
   (wallet-order '() :type list)                              ; names, load order
+  ;; Immutable load-ordered wallet list, replaced wholesale under the
+  ;; manager lock on every registry change. The chain/mempool hook fan-outs
+  ;; read it WITHOUT the manager lock, so a hook firing while an RPC thread
+  ;; holds node -> wallet locks can never invert against the
+  ;; manager -> wallet order of load/unload/shutdown (wallet P4).
+  (wallet-snapshot '() :type list)
   (lock (bt:make-recursive-lock "wallet-manager")))
+
+(defun %refresh-wallet-snapshot (manager)
+  "Rebuild the lock-free wallet snapshot; caller holds the manager lock."
+  (setf (wallet-manager-wallet-snapshot manager)
+        (loop for name in (wallet-manager-wallet-order manager)
+              for wallet = (gethash name (wallet-manager-wallets manager))
+              when wallet collect wallet)))
 
 (defun wallet-flag-set-p (wallet flag)
   (logtest (wallet-flags wallet) flag))
@@ -660,6 +678,7 @@ wallet is blank or has private keys disabled."
         (setf (gethash name (wallet-manager-wallets manager)) wallet)
         (setf (wallet-manager-wallet-order manager)
               (append (wallet-manager-wallet-order manager) (list name)))
+        (%refresh-wallet-snapshot manager)
         wallet))))
 
 ;;; --- Wallet loading (Core CWallet::LoadExisting + walletdb LoadWallet) ---
@@ -868,6 +887,7 @@ RPC after registration, mirroring Core's LoadWallet -> AttachChain split."
         (setf (gethash name (wallet-manager-wallets manager)) wallet)
         (setf (wallet-manager-wallet-order manager)
               (append (wallet-manager-wallet-order manager) (list name)))
+        (%refresh-wallet-snapshot manager)
         (values wallet (nreverse warnings))))))
 
 (defun unload-wallet (manager wallet &key force)
@@ -887,7 +907,8 @@ shutdown path — which flags the scan to abort and proceeds."
     (remhash (wallet-name wallet) (wallet-manager-wallets manager))
     (setf (wallet-manager-wallet-order manager)
           (remove (wallet-name wallet) (wallet-manager-wallet-order manager)
-                  :test #'string=))))
+                  :test #'string=))
+    (%refresh-wallet-snapshot manager)))
 
 (defun list-wallet-dir (manager)
   "Names of wallet databases under <datadir>/wallets/ (Core ListDatabases)."
@@ -1061,8 +1082,7 @@ Core's failed-AttachChain load."
           (error 'rpc-error :code +rpc-wallet-error+ :message error-message)))
       ;; Fold the current mempool in (Core LoadWallet -> postInitProcess ->
       ;; requestMempoolTransactions); the attach-chain scan only does this
-      ;; when the wallet was behind the tip. Resubmitting the wallet's own
-      ;; unconfirmed txs is wallet P4 (rebroadcast machinery).
+      ;; when the wallet was behind the tip.
       (with-node-lock (node)
         (let ((mempool (bitcoin-lisp::node-mempool node)))
           (when mempool
@@ -1073,6 +1093,10 @@ Core's failed-AttachChain load."
                (wallet-transaction-added-to-mempool
                 wallet mempool
                 (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
+      ;; Core postInitProcess: push the wallet's own unconfirmed txs back
+      ;; into OUR mempool without relaying them (wallet.cpp:3305). Takes
+      ;; its own locks — must run outside the node-lock hold above.
+      (wallet-post-load-resubmit node wallet)
       (%push-warnings warnings `(("name" . ,(wallet-name wallet)))))))
 
 (defun rpc-unloadwallet (node params)
@@ -1529,9 +1553,10 @@ rescan-failed error."
                   (when (wallet-abort-rescan wallet)
                     (error 'rpc-error :code +rpc-misc-error+
                                       :message "Rescan aborted by user."))
-                  ;; TODO(wallet P4): ResubmitWalletTransactions after the
-                  ;; rescan (backup.cpp:410) — rebroadcast machinery lands
-                  ;; with the spend path.
+                  ;; The rescan can revert wallet txs to unconfirmed: push
+                  ;; them back into our mempool, no relay (backup.cpp:410,
+                  ;; MEMPOOL_NO_BROADCAST + force).
+                  (wallet-post-load-resubmit node wallet)
                   (if (<= scanned-time lowest-timestamp)
                       results
                       ;; Replace the result of any request whose timestamp

@@ -202,7 +202,14 @@
   (register-rpc-method "setlabel" #'rpc-setlabel)
   (register-rpc-method "getaddressesbylabel" #'rpc-getaddressesbylabel)
   (register-rpc-method "listlabels" #'rpc-listlabels)
-  (register-rpc-method "abandontransaction" #'rpc-abandontransaction))
+  (register-rpc-method "abandontransaction" #'rpc-abandontransaction)
+  ;; Wallet spending (wallet P4)
+  (register-rpc-method "sendtoaddress" #'rpc-sendtoaddress)
+  (register-rpc-method "sendmany" #'rpc-sendmany)
+  (register-rpc-method "send" #'rpc-send)
+  (register-rpc-method "sendall" #'rpc-sendall)
+  (register-rpc-method "fundrawtransaction" #'rpc-fundrawtransaction)
+  (register-rpc-method "signrawtransactionwithwallet" #'rpc-signrawtransactionwithwallet))
 
 ;;; --- JSON-RPC Request/Response Handling ---
 

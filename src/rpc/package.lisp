@@ -35,6 +35,10 @@
    #:wallets-mempool-tx-added
    #:wallets-mempool-tx-removed
 
+   ;; Wallet rebroadcast timer (wallet P4; driven by node.lisp's
+   ;; housekeeping loop)
+   #:wallets-maybe-resend
+
    ;; Error codes
    #:+rpc-parse-error+
    #:+rpc-invalid-request+

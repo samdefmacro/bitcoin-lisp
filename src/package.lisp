@@ -165,6 +165,7 @@
    #:write-bytes
    #:read-var-bytes
    #:write-var-bytes
+   #:write-tx-out
    ;; Auto-growing byte buffer (faster than flexi-streams in hot paths)
    #:byte-buf
    #:make-byte-buf
@@ -1042,6 +1043,10 @@
    #:count-transaction-sigops-cost
    #:+max-block-sigops-cost+
    #:+witness-scale-factor+
+   ;; Dust / standardness (wallet spend path)
+   #:dust-threshold
+   #:+dust-relay-fee-rate+
+   #:+max-standard-tx-weight+
    ;; Constants
    #:+coinbase-maturity+
    #:+max-money+
@@ -1373,6 +1378,9 @@
    #:network-rpc-port
    #:*mainnet-relay-enabled*
    #:*blocksonly*
+   ;; Wallet fee rails (config.lisp; consumed by the wallet spend path)
+   #:*wallet-max-tx-fee*
+   #:*wallet-fallback-fee*
    ;; Pruning
    #:*prune-target-mib*
    #:*prune-after-height*

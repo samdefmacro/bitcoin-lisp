@@ -1880,6 +1880,16 @@ Returns the node instance."
                                           (bitcoin-lisp.networking:maybe-reattempt-initial-broadcast
                                            (node-peers *node*)
                                            (node-mempool *node*))
+                                          ;; Wallet rebroadcast timer (Core
+                                          ;; MaybeResendWalletTxs on the
+                                          ;; scheduler, every minute): each
+                                          ;; wallet resubmits its unconfirmed
+                                          ;; txs past a randomized 12-36h
+                                          ;; deadline. Cadence-gated inside;
+                                          ;; takes node-lock -> wallet-lock
+                                          ;; per tx, so it must run OUTSIDE
+                                          ;; any node-lock hold (wallet P4).
+                                          (bitcoin-lisp.rpc:wallets-maybe-resend *node*)
                                           ;; Local-address self-advertisement
                                           ;; (our onion address, once torcontrol
                                           ;; registers it): per-peer ~24h Poisson
