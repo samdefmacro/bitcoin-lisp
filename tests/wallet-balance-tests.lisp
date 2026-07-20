@@ -198,7 +198,8 @@ trusted-change transitions exactly like Core's wallet_balance.py."
                 ;; In-mempool coins report their ancestor package.
                 (is (= 1 (%wb-aval "ancestorcount" zero-conf)))
                 (is (plusp (%wb-aval "ancestorsize" zero-conf)))))
-            (is (= 1 (length (%wb-listunspent node 0 nil nil nil))))
+            (is (= 1 (length (%wb-listunspent node 0 nil nil
+                                               bitcoin-lisp.rpc:+json-false+))))
             (is (= 1 (length (%wb-listunspent node))))
             ;; Trusted zero-conf change: spend our own mature coinbase with
             ;; change to an internal address.
@@ -618,9 +619,11 @@ listunspent flags them reused, and the destdata record survives reload."
               (is (%wb= 0.0d0 (%wb-aval "trusted" mine)))
               (is (%wb= 49.9999d0 (%wb-aval "used" mine))))
             (is (%wb= 0.0d0 (bitcoin-lisp.rpc::rpc-getbalance node nil)))
-            ;; Explicit avoid_reuse=false sees the reused funds.
+            ;; Explicit avoid_reuse=false sees the reused funds (a null
+            ;; fourth argument keeps the wallet default, like Core).
             (is (%wb= 49.9999d0 (bitcoin-lisp.rpc::rpc-getbalance
-                                 node '("*" 0 nil nil))))
+                                 node (list "*" 0 nil
+                                            bitcoin-lisp.rpc:+json-false+))))
             ;; listunspent still lists the coin, flagged reused.
             (let ((coins (%wb-listunspent node)))
               (is (= 1 (length coins)))

@@ -104,7 +104,29 @@ getchainstates, which reports every chainstate)."
 
 (defconstant +json-false+ 'yason:false
   "The JSON false literal: yason encodes this symbol as false (encode.lisp
-defmethod on (eql 'false)); rpc-result->json passes it through as an atom.")
+defmethod on (eql 'false)); rpc-result->json passes it through as an atom.
+On the REQUEST side the same symbol is the explicit-false sentinel the
+parser leaves at TOP-LEVEL positional parameter positions (see
+parse-json-rpc-request): explicit false must be distinguishable from
+null/omitted because Core's isNull() checks treat only the latter as
+\"use the default\". IMPORTANT: the sentinel is TRUTHY — positional
+boolean parameters must be read through %positional-bool /
+%positional-bool-or, never by raw truthiness.")
+
+(defun %positional-bool (value)
+  "Truth of a positional JSON boolean parameter: NIL (null or omitted) and
+the explicit-false sentinel are false; anything else is true. Mirrors
+Core's pattern `if (!params[i].isNull()) x = params[i].get_bool()` for
+default-false parameters."
+  (and value (not (eq value +json-false+)) t))
+
+(defun %positional-bool-or (value default)
+  "Positional JSON boolean with a non-false DEFAULT: NIL (null or omitted)
+yields DEFAULT; explicit false yields NIL; anything else T. Core:
+`params[i].isNull() ? default : params[i].get_bool()`."
+  (if (null value)
+      default
+      (%positional-bool value)))
 
 (defun json-bool (x)
   "Coerce generalized boolean X to a JSON boolean: T or the false literal.

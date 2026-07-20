@@ -94,9 +94,12 @@ equality)."
         (skip "refs/bitcoin rpc_psbt.json not present")
         (let* ((c (first (gethash "creator" data)))
                (node (bitcoin-lisp::make-node :network :regtest))
-               ;; Core's rpc_psbt.py generates this vector with replaceable=False.
+               ;; Core's rpc_psbt.py generates this vector with replaceable=False
+               ;; (explicit false = the +json-false+ sentinel; a null would
+               ;; take Core's default true and signal RBF).
                (out (bitcoin-lisp.rpc::rpc-createpsbt
-                     node (list (gethash "inputs" c) (gethash "outputs" c) 0 nil))))
+                     node (list (gethash "inputs" c) (gethash "outputs" c) 0
+                                bitcoin-lisp.rpc:+json-false+))))
           (is (equalp (%psbt-ser out) (%psbt-ser (gethash "result" c))))))))
 
 (test psbt-decodepsbt-shape
@@ -194,7 +197,9 @@ tx is rejected unless permitsigdata."
         (skip "refs/bitcoin rpc_psbt.json not present")
         (let* ((node (bitcoin-lisp::make-node :network :regtest))
                (f (first (gethash "finalizer" data)))
-               (out (bitcoin-lisp.rpc::rpc-finalizepsbt node (list (gethash "finalize" f) nil)))
+               (out (bitcoin-lisp.rpc::rpc-finalizepsbt
+                     node (list (gethash "finalize" f)
+                                bitcoin-lisp.rpc:+json-false+)))
                (got (bitcoin-lisp.serialization:decode-psbt (cdr (assoc "psbt" out :test #'equal))))
                (exp (bitcoin-lisp.serialization:decode-psbt (gethash "result" f))))
           (is-true (cdr (assoc "complete" out :test #'equal)))
@@ -251,10 +256,15 @@ false honors locktime), and duplicate outputs are rejected."
                           0)))))
     ;; default (no replaceable) -> RBF-signaling 0xfffffffd
     (is (= #xfffffffd (funcall seq-of (list in '()))))
+    ;; null replaceable = Core default (true) -> RBF
+    (is (= #xfffffffd (funcall seq-of (list in '() 0 nil))))
     ;; explicit replaceable=false, locktime 0 -> final 0xffffffff
-    (is (= #xffffffff (funcall seq-of (list in '() 0 nil))))
+    (is (= #xffffffff (funcall seq-of
+                               (list in '() 0 bitcoin-lisp.rpc:+json-false+))))
     ;; explicit replaceable=false, locktime>0 -> 0xfffffffe (locktime enforced)
-    (is (= #xfffffffe (funcall seq-of (list in '() 500000 nil))))
+    (is (= #xfffffffe (funcall seq-of
+                               (list in '() 500000
+                                     bitcoin-lisp.rpc:+json-false+))))
     ;; duplicate output address is rejected
     (let ((addr (bitcoin-lisp.crypto:encode-p2pkh-address
                  (make-array 20 :element-type '(unsigned-byte 8) :initial-element 5) :regtest)))

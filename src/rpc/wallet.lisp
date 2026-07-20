@@ -24,6 +24,7 @@
 ;;; --- Wallet RPC error codes (Core rpc/protocol.h:71-86) ---
 
 (defconstant +rpc-wallet-error+ -4)
+(defconstant +rpc-wallet-insufficient-funds+ -6)
 (defconstant +rpc-wallet-invalid-label-name+ -11)
 (defconstant +rpc-wallet-keypool-ran-out+ -12)
 (defconstant +rpc-wallet-not-found+ -18)
@@ -147,6 +148,10 @@ map, and the descriptor's private keys."
   (locked-utxos '() :type list)  ; (txid . n) pairs from lockedutxo records
   (last-block-hash nil)          ; 32-byte wire-order hash, or NIL
   (last-block-height 0 :type integer)
+  ;; Timestamp of the last connected block (Core m_best_block_time) and the
+  ;; next scheduled rebroadcast time (m_next_resend) — wallet P4 resend.
+  (last-block-time 0 :type integer)
+  (next-resend 0 :type integer)
   ;; --- Chain tracking (wallet P2) ---
   (map-wallet (make-hash-table :test 'equalp) :type hash-table)  ; txid -> wallet-tx
   (tx-ordered (make-array 0 :adjustable t :fill-pointer 0)
@@ -162,8 +167,17 @@ map, and the descriptor's private keys."
   (abort-rescan nil))
 
 (defmacro with-wallet-lock ((wallet) &body body)
-  "Execute BODY holding WALLET's recursive cs_wallet-equivalent lock. Never
-acquire the node-lock inside this — lock order is node -> manager -> wallet."
+  "Execute BODY holding WALLET's recursive cs_wallet-equivalent lock.
+Lock-order contract (wallet P4):
+  - Global order: node-lock -> manager-lock -> wallet-lock. Never acquire
+    the node lock OR the manager lock while holding a wallet lock (the
+    chain/mempool hook fan-outs read the manager's lock-free wallet
+    snapshot precisely so hook code under node+wallet locks never needs
+    the manager lock).
+  - Taking ANOTHER wallet's lock while holding one is only legal under the
+    node lock (which serializes all such multi-wallet paths — the hook
+    fan-outs); manager-locked paths (load/unload/shutdown) take at most
+    one wallet lock at a time."
   `(bt:with-recursive-lock-held ((wallet-lock ,wallet))
      ,@body))
 
@@ -175,7 +189,25 @@ through it (Core WalletContext)."
   (keypool-size +default-keypool-size+ :type (integer 1))
   (wallets (make-hash-table :test 'equal) :type hash-table)  ; name -> wallet
   (wallet-order '() :type list)                              ; names, load order
+  ;; Immutable load-ordered wallet list, replaced wholesale under the
+  ;; manager lock on every registry change. The chain/mempool hook fan-outs
+  ;; read it WITHOUT the manager lock, so a hook firing while an RPC thread
+  ;; holds node -> wallet locks can never invert against the
+  ;; manager -> wallet order of load/unload/shutdown (wallet P4).
+  (wallet-snapshot '() :type list)
   (lock (bt:make-recursive-lock "wallet-manager")))
+
+(defun %refresh-wallet-snapshot (manager)
+  "Rebuild the lock-free wallet snapshot; caller holds the manager lock.
+The write barrier publishes the freshly-consed list before the slot store
+so lock-free readers on weakly-ordered CPUs (ARM64) never observe
+uninitialized cons cells; readers need no counterpart barrier — walking
+the list is dependency-ordered loads."
+  (let ((snapshot (loop for name in (wallet-manager-wallet-order manager)
+                        for wallet = (gethash name (wallet-manager-wallets manager))
+                        when wallet collect wallet)))
+    #+sbcl (sb-thread:barrier (:write))
+    (setf (wallet-manager-wallet-snapshot manager) snapshot)))
 
 (defun wallet-flag-set-p (wallet flag)
   (logtest (wallet-flags wallet) flag))
@@ -660,6 +692,7 @@ wallet is blank or has private keys disabled."
         (setf (gethash name (wallet-manager-wallets manager)) wallet)
         (setf (wallet-manager-wallet-order manager)
               (append (wallet-manager-wallet-order manager) (list name)))
+        (%refresh-wallet-snapshot manager)
         wallet))))
 
 ;;; --- Wallet loading (Core CWallet::LoadExisting + walletdb LoadWallet) ---
@@ -868,6 +901,7 @@ RPC after registration, mirroring Core's LoadWallet -> AttachChain split."
         (setf (gethash name (wallet-manager-wallets manager)) wallet)
         (setf (wallet-manager-wallet-order manager)
               (append (wallet-manager-wallet-order manager) (list name)))
+        (%refresh-wallet-snapshot manager)
         (values wallet (nreverse warnings))))))
 
 (defun unload-wallet (manager wallet &key force)
@@ -887,7 +921,8 @@ shutdown path — which flags the scan to abort and proceeds."
     (remhash (wallet-name wallet) (wallet-manager-wallets manager))
     (setf (wallet-manager-wallet-order manager)
           (remove (wallet-name wallet) (wallet-manager-wallet-order manager)
-                  :test #'string=))))
+                  :test #'string=))
+    (%refresh-wallet-snapshot manager)))
 
 (defun list-wallet-dir (manager)
   "Names of wallet databases under <datadir>/wallets/ (Core ListDatabases)."
@@ -1008,12 +1043,12 @@ passphrases are rejected until encryption lands (wallet P6)."
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "wallet_name must be a string"))
     ;; descriptors must be true — legacy wallets cannot be created
-    ;; (rpc/wallet.cpp:403-406). yason folds JSON false and null together;
-    ;; an explicitly supplied null/false is rejected like Core rejects false.
-    (when (and (> (length params) 5) (null (nth 5 params)))
+    ;; (rpc/wallet.cpp:403-406). Explicit false arrives as the +json-false+
+    ;; sentinel; null/omitted defaults to true, exactly Core's isNull gate.
+    (when (eq (nth 5 params) +json-false+)
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "descriptors argument must be set to \"true\"; it is no longer possible to create a legacy wallet."))
-    (when (and (> (length params) 7) (nth 7 params))
+    (when (%positional-bool (nth 7 params))
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "Compiled without external signing support (required for external signing)"))
     (let ((passphrase (nth 3 params)))
@@ -1025,9 +1060,11 @@ passphrases are rejected until encryption lands (wallet P6)."
                    warnings))))
     (multiple-value-bind (tip-hash tip-height) (%wallet-current-tip node)
       (let ((wallet (create-wallet manager name
-                                   :disable-private-keys (nth 1 params)
-                                   :blank (nth 2 params)
-                                   :avoid-reuse (nth 4 params)
+                                   :disable-private-keys (%positional-bool
+                                                          (nth 1 params))
+                                   :blank (%positional-bool (nth 2 params))
+                                   :avoid-reuse (%positional-bool
+                                                 (nth 4 params))
                                    :last-block-hash tip-hash
                                    :last-block-height tip-height)))
         (%push-warnings (nreverse warnings)
@@ -1061,8 +1098,7 @@ Core's failed-AttachChain load."
           (error 'rpc-error :code +rpc-wallet-error+ :message error-message)))
       ;; Fold the current mempool in (Core LoadWallet -> postInitProcess ->
       ;; requestMempoolTransactions); the attach-chain scan only does this
-      ;; when the wallet was behind the tip. Resubmitting the wallet's own
-      ;; unconfirmed txs is wallet P4 (rebroadcast machinery).
+      ;; when the wallet was behind the tip.
       (with-node-lock (node)
         (let ((mempool (bitcoin-lisp::node-mempool node)))
           (when mempool
@@ -1073,6 +1109,10 @@ Core's failed-AttachChain load."
                (wallet-transaction-added-to-mempool
                 wallet mempool
                 (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
+      ;; Core postInitProcess: push the wallet's own unconfirmed txs back
+      ;; into OUR mempool without relaying them (wallet.cpp:3305). Takes
+      ;; its own locks — must run outside the node-lock hold above.
+      (wallet-post-load-resubmit node wallet)
       (%push-warnings warnings `(("name" . ,(wallet-name wallet)))))))
 
 (defun rpc-unloadwallet (node params)
@@ -1249,7 +1289,7 @@ SPKMs (Core IsInternalScriptPubKeyMan's optional bool)."
   "All wallet descriptors, sorted by string (Bitcoin Core listdescriptors).
 PARAMS: (private)."
   (let ((wallet (wallet-for-request node))
-        (private (first params)))
+        (private (%positional-bool (first params))))
     (when (and private
                (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
       (error 'rpc-error :code +rpc-wallet-error+
@@ -1529,9 +1569,10 @@ rescan-failed error."
                   (when (wallet-abort-rescan wallet)
                     (error 'rpc-error :code +rpc-misc-error+
                                       :message "Rescan aborted by user."))
-                  ;; TODO(wallet P4): ResubmitWalletTransactions after the
-                  ;; rescan (backup.cpp:410) — rebroadcast machinery lands
-                  ;; with the spend path.
+                  ;; The rescan can revert wallet txs to unconfirmed: push
+                  ;; them back into our mempool, no relay (backup.cpp:410,
+                  ;; MEMPOOL_NO_BROADCAST + force).
+                  (wallet-post-load-resubmit node wallet)
                   (if (<= scanned-time lowest-timestamp)
                       results
                       ;; Replace the result of any request whose timestamp
