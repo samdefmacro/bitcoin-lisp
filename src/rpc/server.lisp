@@ -202,18 +202,56 @@
   (register-rpc-method "setlabel" #'rpc-setlabel)
   (register-rpc-method "getaddressesbylabel" #'rpc-getaddressesbylabel)
   (register-rpc-method "listlabels" #'rpc-listlabels)
-  (register-rpc-method "abandontransaction" #'rpc-abandontransaction))
+  (register-rpc-method "abandontransaction" #'rpc-abandontransaction)
+  ;; Wallet spending (wallet P4)
+  (register-rpc-method "sendtoaddress" #'rpc-sendtoaddress)
+  (register-rpc-method "sendmany" #'rpc-sendmany)
+  (register-rpc-method "send" #'rpc-send)
+  (register-rpc-method "sendall" #'rpc-sendall)
+  (register-rpc-method "fundrawtransaction" #'rpc-fundrawtransaction)
+  (register-rpc-method "signrawtransactionwithwallet" #'rpc-signrawtransactionwithwallet))
 
 ;;; --- JSON-RPC Request/Response Handling ---
+
+(defun %normalize-json-value (value top-level)
+  "Boolean normalization of a parsed request value (booleans arrive as
+'yason:true / 'yason:false from the symbols parse mode): true -> T
+everywhere; false -> the +json-false+ sentinel when TOP-LEVEL (a direct
+positional parameter — handlers read those through %positional-bool so
+explicit false, null, and omitted are distinguishable, Core's isNull
+semantics), NIL inside nested arrays/objects (the historical folding —
+object readers distinguish absence via present-p). Hash tables are
+normalized in place; lists are rebuilt."
+  (cond ((eq value 'yason:true) t)
+        ((eq value 'yason:false) (if top-level +json-false+ nil))
+        ((hash-table-p value)
+         (maphash (lambda (key v)
+                    (setf (gethash key value) (%normalize-json-value v nil)))
+                  value)
+         value)
+        ((and (consp value) (rpc-proper-list-p value))
+         (mapcar (lambda (v) (%normalize-json-value v nil)) value))
+        (t value)))
+
+(defun %normalize-rpc-params (params)
+  "Normalize a request's params: positional (array) params keep explicit
+false as the +json-false+ sentinel at top level; named-params objects are
+normalized as nested values."
+  (if (and (consp params) (rpc-proper-list-p params))
+      (mapcar (lambda (v) (%normalize-json-value v t)) params)
+      (%normalize-json-value params nil)))
 
 (defun parse-json-rpc-request (body)
   "Parse JSON-RPC request body. Returns (values :single method params id
 version id-present-p) or (values :batch requests). VERSION is :v2 when the
 request carries jsonrpc:\"2.0\", else :v1 (absent/1.0/1.1 — Core JSONRPCRequest
 ::parse's V1_LEGACY); ID-PRESENT-P distinguishes a V2 notification (no id
-member at all) from id:null. Signals rpc-error on malformed input."
+member at all) from id:null. Signals rpc-error on malformed input.
+Booleans are parsed as symbols and normalized via %normalize-rpc-params so
+top-level positional false survives as the +json-false+ sentinel."
   (handler-case
-      (let ((json (yason:parse body)))
+      (let ((json (let ((yason:*parse-json-booleans-as-symbols* t))
+                    (yason:parse body))))
         (cond
           ;; Batch request (array)
           ((listp json)
@@ -230,7 +268,8 @@ member at all) from id:null. Signals rpc-error on malformed input."
                (error 'rpc-error :code +rpc-invalid-request+
                                  :message "Missing or invalid method"))
              (multiple-value-bind (id id-present) (gethash "id" json)
-               (values :single method (or params '()) id version
+               (values :single method (%normalize-rpc-params (or params '()))
+                       id version
                        (and id-present t)))))
           (t
            (error 'rpc-error :code +rpc-invalid-request+
@@ -315,7 +354,8 @@ pairs — so without this every object-returning RPC errors out."
   (mapcar (lambda (req)
             (if (hash-table-p req)
                 (let ((method (gethash "method" req))
-                      (params (or (gethash "params" req) '()))
+                      (params (%normalize-rpc-params
+                               (or (gethash "params" req) '())))
                       (id (gethash "id" req)))
                   (if (stringp method)
                       (handle-single-request node method params id)

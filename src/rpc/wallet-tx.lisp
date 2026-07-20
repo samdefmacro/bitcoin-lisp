@@ -735,14 +735,19 @@ ordering of same-block historical txs."
                    (let ((child (wallet-get-wallet-tx wallet spender)))
                      (when child (push child stack)))))))))
 
-(defun wallet-add-to-wallet (wallet tx state &key rescanning block-time)
+(defun wallet-add-to-wallet (wallet tx state &key rescanning block-time map-value)
   "Core CWallet::AddToWallet: insert or update the wallet tx for TX with
-STATE (a state list), persist, refresh the TXO cache. Returns the wallet-tx."
+STATE (a state list), persist, refresh the TXO cache. Returns the wallet-tx.
+MAP-VALUE seeds a freshly-inserted wtx's user mapValue pairs — the
+CommitTransaction update callback (wallet.cpp:2464-2472); ignored on update,
+where Core asserts the existing mapValue is what it keeps."
   (let* ((txid (bitcoin-lisp.serialization:transaction-hash tx))
          (existing (wallet-get-wallet-tx wallet txid))
          (wtx (or existing (make-wallet-tx :tx tx :txid txid)))
          (inserted (not existing))
          (updated nil))
+    (when (and inserted map-value)
+      (setf (wallet-tx-map-value wtx) map-value))
     (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
       ;; WALLET_FLAG_AVOID_REUSE: destinations this tx spends from become
       ;; previously-spent; txs paying newly-flagged destinations lose their
@@ -1091,6 +1096,9 @@ single-hash fallback when the entry is unknown."
           (wallet-last-block-height wallet) height)
     (let ((block-time (bitcoin-lisp.serialization:block-header-timestamp
                        (bitcoin-lisp.serialization:bitcoin-block-header block))))
+      ;; Core SetLastBlockProcessed's m_best_block_time — the rebroadcast
+      ;; filter's reference clock (wallet P4).
+      (setf (wallet-last-block-time wallet) block-time)
       ;; Birthday gate over a wallet-side running max of processed block
       ;; times (over-approximates Core's per-block nTimeMax — see the
       ;; divergence note at the top of this file).
@@ -1149,25 +1157,42 @@ single-hash fallback when the entry is unknown."
 ;;; --- Manager fan-outs (called by node.lisp's wallet-notify-* hooks) ---
 
 (defun %manager-wallets (manager)
-  (bt:with-recursive-lock-held ((wallet-manager-lock manager))
-    (loop for name in (wallet-manager-wallet-order manager)
-          for wallet = (gethash name (wallet-manager-wallets manager))
-          when wallet collect wallet)))
+  "The loaded wallets, in load order — the manager's immutable lock-free
+snapshot. Deliberately does NOT take the manager lock: fan-outs run from
+hook contexts that may already hold a wallet lock, and the only lock order
+involving the manager is manager -> wallet (see wallet-manager)."
+  (wallet-manager-wallet-snapshot manager))
+
+(defmacro %do-fanout-wallets ((wallet manager what) &body body)
+  "Iterate the manager's wallet snapshot running BODY per wallet with
+per-wallet error isolation: an unloaded wallet (db already closed by a
+concurrent unloadwallet — Core's shared_ptr lifetime has no equivalent
+here) is skipped, and one wallet's failure is logged loudly without
+aborting delivery to the remaining wallets or the calling hook (the
+divergence note at the top of this file: hook failures never take the
+node down)."
+  `(dolist (,wallet (%manager-wallets ,manager))
+     (handler-case
+         (when (wallet-db ,wallet)
+           ,@body)
+       (error (e)
+         (bitcoin-lisp:log-error "Wallet ~A: ~A hook failed: ~A"
+                                 (wallet-name ,wallet) ,what e)))))
 
 (defun wallets-block-connected (manager mempool chain-state block block-hash height)
-  (dolist (wallet (%manager-wallets manager))
+  (%do-fanout-wallets (wallet manager "block-connected")
     (wallet-block-connected wallet mempool chain-state block block-hash height)))
 
 (defun wallets-block-disconnected (manager block height)
-  (dolist (wallet (%manager-wallets manager))
+  (%do-fanout-wallets (wallet manager "block-disconnected")
     (wallet-block-disconnected wallet block height)))
 
 (defun wallets-mempool-tx-added (manager mempool tx)
-  (dolist (wallet (%manager-wallets manager))
+  (%do-fanout-wallets (wallet manager "mempool-tx-added")
     (wallet-transaction-added-to-mempool wallet mempool tx)))
 
 (defun wallets-mempool-tx-removed (manager mempool tx reason)
-  (dolist (wallet (%manager-wallets manager))
+  (%do-fanout-wallets (wallet manager "mempool-tx-removed")
     (wallet-transaction-removed-from-mempool wallet mempool tx reason)))
 
 ;;; --- Load-time tx record replay (walletdb.cpp LoadTxRecords + LoadToWallet) ---
@@ -1683,7 +1708,7 @@ push order."
 gettransaction). PARAMS: (txid include_watchonly verbose)."
   (let ((wallet (wallet-for-request node))
         (txid (%wallet-parse-txid (first params)))
-        (verbose (and (>= (length params) 3) (third params) t)))
+        (verbose (%positional-bool (third params))))
     (with-node-lock (node)
       (with-wallet-lock (wallet)
         (let ((wtx (wallet-get-wallet-tx wallet txid)))
@@ -1755,8 +1780,8 @@ include_removed include_change label)."
         (target-confirms (if (and (>= (length params) 2) (second params))
                              (second params)
                              1))
-        (include-removed (if (>= (length params) 4) (and (fourth params) t) t))
-        (include-change (and (>= (length params) 5) (fifth params) t))
+        (include-removed (%positional-bool-or (fourth params) t))
+        (include-change (%positional-bool (fifth params)))
         (filter-label (when (and (>= (length params) 6) (sixth params))
                         (%label-from-value (sixth params)))))
     (unless (and (integerp target-confirms) (>= target-confirms 1))
