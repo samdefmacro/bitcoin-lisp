@@ -111,7 +111,7 @@ when locktime>0, else 0xffffffff."
 PARAMS: (inputs outputs [locktime] [replaceable]). Mirrors Core createpsbt."
   (let ((tx (%psbt-build-unsigned-tx (first params) (second params)
                                      (or (third params) 0)
-                                     (if (>= (length params) 4) (fourth params) t)
+                                     (%positional-bool-or (fourth params) t)
                                      (rpc-get-network node))))
     (bitcoin-lisp.serialization:encode-psbt
      (bitcoin-lisp.serialization:make-empty-psbt tx))))
@@ -123,7 +123,7 @@ PARAMS: (inputs outputs [locktime] [replaceable]). Mirrors Core createpsbt."
 PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
   (declare (ignore node))
   (let* ((hexstr (first params))
-         (permitsigdata (if (>= (length params) 2) (second params) nil)))
+         (permitsigdata (%positional-bool (second params))))
     (unless (stringp hexstr)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "hexstring required"))
     (let ((tx (handler-case
@@ -671,7 +671,7 @@ fields (partial sigs, sighash, redeem/witness scripts, derivations)."
 return the network tx hex. PARAMS: (psbt [extract]). Mirrors Core finalizepsbt."
   (declare (ignore node))
   (let* ((psbt (%psbt-decode-arg (first params)))
-         (extract (if (>= (length params) 2) (second params) t))
+         (extract (%positional-bool-or (second params) t))
          (tx (bitcoin-lisp.serialization:psbt-tx psbt))
          (ins (bitcoin-lisp.serialization:transaction-inputs tx))
          (complete t))

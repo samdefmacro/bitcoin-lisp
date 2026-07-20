@@ -173,16 +173,16 @@ first (when assumeutxo background validation is in progress), the current
 (defun %parse-verbosity (params index default &key allow-bool)
   "Core's ParseVerbosity (rpc/util.cpp:83) for the positional argument at INDEX
 in PARAMS: an integer passes through, a boolean (where allowed) maps true→1 /
-false→0, and a missing argument yields DEFAULT. Our JSON layer folds false and
-null both to NIL, so a supplied NIL reads as false where booleans are allowed
-and as null (→ DEFAULT) where they aren't."
+explicit false→0, and null/omitted yields DEFAULT (Core checks isNull BEFORE
+the bool branch). Explicit false arrives as the +json-false+ sentinel."
   (if (< (length params) (1+ index))
       default
       (let ((v (nth index params)))
         (cond ((integerp v) v)
-              ((null v) (if allow-bool 0 default))
+              ((null v) default)
               ((and allow-bool (eq v t)) 1)
-              ((eq v t)
+              ((and allow-bool (eq v +json-false+)) 0)
+              ((or (eq v t) (eq v +json-false+))
                (error 'rpc-error :code +rpc-type-error+
                                  :message "Verbosity was boolean but only integer allowed"))
               (t (error 'rpc-error :code +rpc-type-error+
@@ -375,7 +375,7 @@ is supplied and the script is addressable) address."
 (defun rpc-getblockheader (node params)
   "Return block header data."
   (let ((hash-str (first params))
-        (verbose (if (>= (length params) 2) (second params) t)))
+        (verbose (%positional-bool-or (second params) t)))
     (unless (valid-hex-hash-p hash-str)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid block hash"))
@@ -506,7 +506,7 @@ accepted but ignored."
         ;; Default true; JSON false and null both fold to NIL here, matching
         ;; Core's params[2].isNull() ? true : params[2].get_bool() closely
         ;; enough for the false case that matters.
-        (include-mempool (if (>= (length params) 3) (and (third params) t) t)))
+        (include-mempool (%positional-bool-or (third params) t)))
     (unless (valid-hex-hash-p txid-str)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid txid"))
@@ -927,7 +927,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
 
 (defun rpc-getrawmempool (node params)
   "Return mempool transaction IDs (verbose nil) or per-tx details (verbose t)."
-  (let ((verbose (first params))
+  (let ((verbose (%positional-bool (first params)))
         (mempool (rpc-get-mempool node)))
     ;; Node lock: iterating entries (and, verbose, walking each entry's
     ;; ancestors/descendants/chunk) must not race the sync thread's
@@ -1055,7 +1055,7 @@ strings or, when VERBOSE, an alist of txid-hex -> entry fields."
   "Return the in-mempool ancestors of TXID (Bitcoin Core getmempoolancestors).
 PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   (let ((mempool (rpc-get-mempool node))
-        (verbose (second params)))
+        (verbose (%positional-bool (second params))))
     (with-node-lock (node)
       (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
         (declare (ignore entry))
@@ -1065,7 +1065,7 @@ PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   "Return the in-mempool descendants of TXID (Bitcoin Core getmempooldescendants).
 PARAMS: (txid [verbose]). Array of txids, or txid->details when verbose."
   (let ((mempool (rpc-get-mempool node))
-        (verbose (second params)))
+        (verbose (%positional-bool (second params))))
     (with-node-lock (node)
       (multiple-value-bind (txid entry) (%mempool-txid-arg params mempool)
         (declare (ignore entry))
@@ -1569,7 +1569,7 @@ connections until re-enabled. Returns the new state."
   (when (endp params)
     (error 'rpc-error :code +rpc-invalid-parameter+ :message "state is required"))
   ;; Bare JSON boolean result (Core net.cpp:907) — false must not be null.
-  (json-bool (%set-network-active node (and (first params) t))))
+  (json-bool (%set-network-active node (%positional-bool (first params)))))
 
 (defun rpc-getblockfrompeer (node params)
   "Request block BLOCKHASH from the connected peer with id PEER-ID (Bitcoin Core
@@ -1648,7 +1648,7 @@ subnet syntax is rejected as invalid. Returns null."
   (let ((address (first params))
         (command (second params))
         (bantime (third params))
-        (absolute (fourth params)))
+        (absolute (%positional-bool (fourth params))))
     (unless (and (stringp address) (plusp (length address)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "address required"))
     ;; Core: unparseable IP/subnet -> RPC_CLIENT_INVALID_IP_OR_SUBNET (-30),
@@ -3257,7 +3257,7 @@ so submit=false hex is consensus-valid too, not just decodable. When SUBMIT
 and {hash} is returned; otherwise {hash, hex}."
   (let ((output (first params))
         (txs-arg (second params))
-        (submit (if (>= (length params) 3) (and (third params) t) t))
+        (submit (%positional-bool-or (third params) t))
         (network (bitcoin-lisp::node-network node)))
     (unless (stringp output)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "output must be a string"))
@@ -4636,7 +4636,7 @@ optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
 [options]). Mirrors Bitcoin Core getdescriptoractivity."
   (let* ((blockhashes (first params))
          (scanobjects (second params))
-         (include-mempool (if (>= (length params) 3) (third params) t))
+         (include-mempool (%positional-bool-or (third params) t))
          (network (rpc-get-network node))
          (chain-state (rpc-get-chain-state node))
          (block-store (rpc-get-block-store node))

@@ -534,11 +534,13 @@ behave like Core, including the exact error codes."
                                (%aval "wallets"
                                       (bitcoin-lisp.rpc::rpc-listwalletdir node nil)))))
         (is (equal '("w1" "w2") (sort (copy-list dir-names) #'string<))))
-      ;; createwallet flag semantics
+      ;; createwallet flag semantics: explicit descriptors=false is
+      ;; rejected; a null descriptors argument takes Core's default (true).
       (is (= bitcoin-lisp.rpc::+rpc-wallet-error+
              (%rpc-error-code    ; descriptors=false rejected like Core
               (lambda () (bitcoin-lisp.rpc::rpc-createwallet
-                          node '("legacy0" nil nil nil nil nil))))))
+                          node (list "legacy0" nil nil nil nil
+                                     bitcoin-lisp.rpc:+json-false+))))))
       (is (= bitcoin-lisp.rpc::+rpc-wallet-error+
              (%rpc-error-code    ; passphrase -> encryption is P6
               (lambda () (bitcoin-lisp.rpc::rpc-createwallet
