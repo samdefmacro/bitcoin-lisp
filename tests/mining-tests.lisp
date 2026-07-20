@@ -535,7 +535,10 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
            (is (bitcoin-lisp.serialization:transaction-has-witness-p
                 (first (bitcoin-lisp.serialization:bitcoin-block-transactions parsed))))))
        ;; Boolean/legacy verbosity: false → hex, true → object; absent → object.
-       (is (stringp (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex nil))))
+       ;; null verbosity -> Core default 1 (JSON); explicit false -> hex.
+       (is (consp (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex nil))))
+       (is (stringp (bitcoin-lisp.rpc::rpc-getblock
+                     node (list hash-hex bitcoin-lisp.rpc:+json-false+))))
        (let ((r (bitcoin-lisp.rpc::rpc-getblock node (list hash-hex t))))
          (is (consp r))
          (is (string= hash-hex (cdr (assoc "hash" r :test #'string=)))))
@@ -669,7 +672,8 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "genblk-ns"))
           (h0 (bitcoin-lisp.storage:current-height (bitcoin-lisp::node-chain-state node)))
-          (r (bitcoin-lisp.rpc::rpc-generateblock node (list "raw(51)" '() nil))))
+          (r (bitcoin-lisp.rpc::rpc-generateblock
+              node (list "raw(51)" '() bitcoin-lisp.rpc:+json-false+))))
      (is (stringp (cdr (assoc "hash" r :test #'string=))))
      (is (stringp (cdr (assoc "hex" r :test #'string=))))
      ;; the hex round-trips to a block whose header hashes to the reported hash
@@ -699,7 +703,9 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
      (bitcoin-lisp.storage:add-utxo (bitcoin-lisp::node-utxo-set node)
                                     funding 0 100000000 (%p2sh-optrue-spk) 0
                                     :coinbase nil)
-     (let* ((r (bitcoin-lisp.rpc::rpc-generateblock node (list "raw(51)" (list tx-hex) nil)))
+     (let* ((r (bitcoin-lisp.rpc::rpc-generateblock
+                node (list "raw(51)" (list tx-hex)
+                           bitcoin-lisp.rpc:+json-false+)))
             (blk (flexi-streams:with-input-from-sequence
                      (s (bitcoin-lisp.crypto:hex-to-bytes (cdr (assoc "hex" r :test #'string=))))
                    (bitcoin-lisp.serialization:read-bitcoin-block s))))

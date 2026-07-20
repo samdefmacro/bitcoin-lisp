@@ -340,7 +340,10 @@ with include_mempool=false (Core mempool.isSpent path)."
                      mempool spender-txid (make-mempool-entry-for-tx spender))))
         (is (null (bitcoin-lisp.rpc::rpc-gettxout node (list hex 0))))
         (is (null (bitcoin-lisp.rpc::rpc-gettxout node (list hex 0 t))))
-        (is (consp (bitcoin-lisp.rpc::rpc-gettxout node (list hex 0 nil))))
+        (is (consp (bitcoin-lisp.rpc::rpc-gettxout
+                    node (list hex 0 bitcoin-lisp.rpc:+json-false+))))
+        ;; null include_mempool = Core default true (spent view).
+        (is (null (bitcoin-lisp.rpc::rpc-gettxout node (list hex 0 nil))))
         ;; The SPENDER's own output is visible via the mempool view with 0
         ;; confirmations and coinbase:false.
         (let ((r (bitcoin-lisp.rpc::rpc-gettxout
@@ -348,9 +351,10 @@ with include_mempool=false (Core mempool.isSpent path)."
           (is (consp r))
           (is (= 0 (cdr (assoc "confirmations" r :test #'string=))))
           (is (eq 'yason:false (cdr (assoc "coinbase" r :test #'string=))))
-          ;; ... and invisible without the mempool.
+          ;; ... and invisible without the mempool (explicit false).
           (is (null (bitcoin-lisp.rpc::rpc-gettxout
-                     node (list (bitcoin-lisp.rpc::hash-to-hex spender-txid) 0 nil)))))))))
+                     node (list (bitcoin-lisp.rpc::hash-to-hex spender-txid) 0
+                                bitcoin-lisp.rpc:+json-false+)))))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; E. BIP64 /rest/getutxos

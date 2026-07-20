@@ -43,11 +43,37 @@ the yason hash-table form and the alist form test callers use."
 
 (defun %amount-from-value (value)
   "Core AmountFromValue: a JSON number or decimal string in BTC to
-satoshis, at most 8 fraction digits, within MoneyRange."
+satoshis, at most 8 fraction digits, within MoneyRange. Sub-satoshi
+precision is REJECTED like Core (which parses the decimal text exactly):
+rationals/integers are checked exactly; floats (JSON doubles, which cannot
+carry the original decimal text) are accepted only when they sit within
+double-representation noise of a whole satoshi — 0.001 sat at amounts
+where doubles are satoshi-exact, scaling with magnitude above ~2^48 sats
+where a double's nearest representation may be off by up to ~0.4 sat."
   (let ((satoshis
           (cond
-            ((rationalp value) (round (* (rational value) 100000000)))
-            ((floatp value) (round (* (rational value) 100000000)))
+            ((rationalp value)
+             (let ((scaled (* (rational value) 100000000)))
+               (unless (integerp scaled)
+                 (error 'rpc-error :code +rpc-type-error+
+                                   :message "Invalid amount"))
+               scaled))
+            ((floatp value)
+             ;; JSON numbers arrive as double-floats; the 2^-48 relative
+             ;; slack only covers double-representation noise. Wider
+             ;; single-float slack exists solely for direct Lisp callers
+             ;; (tests) whose literals default to single precision.
+             (let* ((scaled (* (rational value) 100000000))
+                    (nearest (round scaled))
+                    (tolerance (max 1/1000
+                                    (* (abs scaled)
+                                       (if (typep value 'double-float)
+                                           (expt 2 -48)
+                                           (expt 2 -19))))))
+               (unless (<= (abs (- scaled nearest)) tolerance)
+                 (error 'rpc-error :code +rpc-type-error+
+                                   :message "Invalid amount"))
+               nearest))
             ((stringp value)
              (let* ((dot (position #\. value))
                     (whole (if dot (subseq value 0 dot) value))
@@ -75,13 +101,14 @@ satoshis, at most 8 fraction digits, within MoneyRange."
   (/ satoshis 100000000.0d0))
 
 (defun %feerate-fee (rate-sat-kvb size)
-  "Core CFeeRate::GetFee: RATE-SAT-KVB * SIZE / 1000 truncated, floored at
-1 satoshi for a non-zero rate on a non-zero size. Pure integer math."
+  "Core CFeeRate::GetFee at d3056bc: ceil(RATE-SAT-KVB * SIZE / 1000) —
+FeeFrac::EvaluateFeeUp (feerate.cpp:20-27, feefrac.h:196-223, \"rounding
+up\"). Round-up is what makes per-part fee budgets additive: the sum of
+rounded-up parts always covers the rounded-up whole, so the exact-fee loop's
+fee_needed <= current_fee invariant holds. Pure integer math; negative
+rates never occur in the wallet."
   (declare (type integer rate-sat-kvb size))
-  (let ((fee (truncate (* rate-sat-kvb size) 1000)))
-    (if (and (zerop fee) (plusp size) (plusp rate-sat-kvb))
-        1
-        fee)))
+  (ceiling (* rate-sat-kvb size) 1000))
 
 ;;; --- IsSpent (wallet.cpp:770) ---
 
@@ -216,7 +243,10 @@ whose redeem script is a witness program as :p2sh-segwit."
     (case type
       ((:witness-v0-keyhash :witness-v0-scripthash) :bech32)
       (:witness-v1-taproot :bech32m)
-      ((:pubkey :pubkeyhash :multisig) :legacy)
+      ;; Core GetOutputType (spend.cpp:250-265): only SCRIPTHASH and
+      ;; PUBKEYHASH map to LEGACY; bare PUBKEY / MULTISIG fall through to
+      ;; UNKNOWN like every other TxoutType.
+      (:pubkeyhash :legacy)
       (:scripthash
        (multiple-value-bind (spkm) (%wallet-owning-spkm wallet script)
          (let ((redeem (and spkm (%spkm-solvable-p spkm)
@@ -515,11 +545,13 @@ descriptor for SCRIPT, or NIL when the wallet cannot solve it."
 
 ;;; --- getbalance / getbalances (wallet/rpc/coins.cpp:164,401) ---
 
-(defun %get-avoid-reuse-flag (wallet param param-present)
-  "Core GetAvoidReuseFlag: default is the wallet's avoid_reuse flag;
-requesting it on a wallet without the flag errors."
+(defun %get-avoid-reuse-flag (wallet param)
+  "Core GetAvoidReuseFlag: null/omitted PARAM keeps the wallet's avoid_reuse
+flag as the default (Core's isNull check); an explicit boolean (incl. the
++json-false+ sentinel) overrides it. Requesting it on a wallet without the
+flag errors."
   (let* ((can (wallet-flag-set-p wallet +wallet-flag-avoid-reuse+))
-         (avoid (if param-present (and param t) can)))
+         (avoid (if (null param) can (%positional-bool param))))
     (when (and avoid (not can))
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "wallet does not have the \"avoid reuse\" feature enabled"))
@@ -544,8 +576,7 @@ PARAMS: (dummy minconf include_watchonly avoid_reuse)."
     (unless (integerp minconf)
       (error 'rpc-error :code +rpc-type-error+ :message "minconf must be an integer"))
     (with-wallet-lock (wallet)
-      (let ((avoid-reuse (%get-avoid-reuse-flag wallet (fourth params)
-                                                (> (length params) 3))))
+      (let ((avoid-reuse (%get-avoid-reuse-flag wallet (fourth params))))
         (%btc (wallet-get-balance wallet :min-depth minconf
                                          :avoid-reuse avoid-reuse))))))
 
@@ -620,7 +651,7 @@ include_unsafe query_options)."
         (minconf (if (and (>= (length params) 1) (first params)) (first params) 1))
         (maxconf (if (and (>= (length params) 2) (second params)) (second params) 9999999))
         (addresses (third params))
-        (include-unsafe (if (> (length params) 3) (and (fourth params) t) t))
+        (include-unsafe (%positional-bool-or (fourth params) t))
         (options (fifth params))
         (min-amount 0)
         (max-amount nil)
@@ -688,9 +719,9 @@ include_unsafe query_options)."
   "Lock or unlock unspent outputs (Bitcoin Core lockunspent). PARAMS:
 (unlock transactions persistent)."
   (let ((wallet (wallet-for-request node))
-        (unlock (and (first params) t))
+        (unlock (%positional-bool (first params)))
         (outputs-param (second params))
-        (persistent (and (> (length params) 2) (third params) t)))
+        (persistent (%positional-bool (third params))))
     (with-wallet-lock (wallet)
       (when (null outputs-param)
         (when unlock (wallet-unlock-all-coins wallet))

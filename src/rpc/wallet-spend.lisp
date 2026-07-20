@@ -40,6 +40,10 @@
 ;;; inside the same node-lock hold, so the tip cannot move between fee
 ;;; computation and broadcast (Core holds cs_wallet and takes cs_main
 ;;; inside; our lock order is the reverse, so we take both up front).
+;;; The mempool-accept hook that fires during submission fans out over the
+;;; manager's LOCK-FREE wallet snapshot, so no code path ever takes the
+;;; manager lock while holding a wallet lock; the full contract lives on
+;;; with-wallet-lock (wallet.lisp).
 ;;;
 ;;; Known divergences from Core (each justified inline at its site):
 ;;;  1. ECDSA size estimation assumes 72-byte signatures (Core use_max_sig):
@@ -205,9 +209,12 @@ relay rate)."
         (%feerate-fee rate-sat-kvb nsize))))
 
 (defun %output-dust-p (value script)
-  "Core IsDust at the dust relay feerate."
-  (and (< value (bitcoin-lisp.validation:dust-threshold script))
-       (plusp (bitcoin-lisp.validation:dust-threshold script))))
+  "Core IsDust at the dust relay feerate: strictly nValue < threshold
+(policy.cpp). No positive-threshold guard: an OP_RETURN output's threshold
+is 0, so a NEGATIVE value (SFFO driving a data output below zero) IS dust —
+that is exactly the check that turns it into Core's \"transaction amount is
+too small to pay the fee\" error instead of committing a broken tx."
+  (< value (bitcoin-lisp.validation:dust-threshold script)))
 
 (defun %format-money (satoshis)
   "Core FormatMoney: BTC decimal string, trailing zeros trimmed but at
@@ -529,9 +536,19 @@ incl. outpoint/sequence/length prefixes, or NIL when unsolvable."
   (let ((weight (%max-input-weight wallet cc script :tx-is-segwit t)))
     (if weight (ceiling weight 4) -1)))
 
-(defun %script-segwit-solvable-p (wallet cc script)
-  (multiple-value-bind (sat segwit) (%script-sat-weight wallet cc script)
-    (and sat segwit)))
+(defun %txout-script-segwit-p (wallet cc script)
+  "Whether spending SCRIPT contributes witness data — drives the 2-byte
+segwit marker/flag in CalculateMaximumSignedTxSize. Native witness
+programs count even when unsolvable (Core's InferDescriptor falls back to
+an addr() descriptor whose output type is still a witness type,
+spend.cpp:150-157); P2SH counts only when the known redeem script wraps a
+witness program."
+  (case (bitcoin-lisp.validation:classify-script script)
+    ((:witness-v0-keyhash :witness-v0-scripthash :witness-v1-taproot) t)
+    (:scripthash
+     (multiple-value-bind (sat segwit) (%script-sat-weight wallet cc script)
+       (and sat segwit t)))
+    (t nil)))
 
 (defun %max-signed-tx-size (wallet cc tx txouts)
   "Core CalculateMaximumSignedTxSize over TXOUTS (parallel to the inputs;
@@ -544,7 +561,7 @@ control's explicit input weight or NIL). Returns (values vsize weight) or
                          (%compact-size-size (length inputs))
                          (%compact-size-size (length outputs)))))
          (is-segwit (some (lambda (txo)
-                            (%script-segwit-solvable-p wallet cc (car txo)))
+                            (%txout-script-segwit-p wallet cc (car txo)))
                           txouts)))
     (when is-segwit (incf weight 2))
     (loop for output across outputs
@@ -1745,9 +1762,26 @@ wrong-key signature)."
                   (loop for (key . pubkey) in pairs
                         for priv = (%desc-key-priv-at key pos provider)
                         do (when priv
-                             (let ((derived (bitcoin-lisp.crypto:derive-public-key
-                                             priv :compressed (= (length pubkey) 33))))
-                               (if (equalp derived pubkey)
+                             (let* ((derived (bitcoin-lisp.crypto:derive-public-key
+                                              priv :compressed (= (length pubkey) 33)))
+                                    ;; X-only descriptor keys (tr()/rawtr()
+                                    ;; key expressions) persist as bare
+                                    ;; 32-byte x hex and reload lifted with
+                                    ;; a fixed 02 prefix, so an odd-Y key's
+                                    ;; stored parity byte is arbitrary:
+                                    ;; compare X COORDINATES only. Taproot
+                                    ;; signing normalizes parity itself
+                                    ;; (derive-xonly-pubkey + BIP86 tweak).
+                                    ;; Everything else keeps the strict
+                                    ;; full-point check.
+                                    (matches
+                                      (if (and (desc-key-xonly-p key)
+                                               (= (length derived) 33)
+                                               (= (length pubkey) 33))
+                                          (equalp (subseq derived 1)
+                                                  (subseq pubkey 1))
+                                          (equalp derived pubkey))))
+                               (if matches
                                    (progn
                                      (setf (gethash (bitcoin-lisp.crypto:hash160 pubkey)
                                                     keymap)
@@ -2420,9 +2454,10 @@ node lock. Returns (values ok error-string)."
 our coins; its change is ours), break the input coins' caches, then submit
 to the mempool and relay. Broadcast failure is logged, never raised — the
 tx stays in the wallet for the rebroadcast timer, exactly like Core.
-Caller holds the NODE lock but NOT the wallet lock: the mempool-accept
-hook fans out through the wallet manager (manager -> wallet), so holding
-this wallet's lock across the submission would invert the lock order."
+Caller holds the NODE lock; holding this wallet's (recursive) lock across
+the submission is safe because the mempool-accept hook fan-out reads the
+manager's lock-free wallet snapshot — the manager LOCK is never taken from
+hook context (see with-wallet-lock's lock-order contract)."
   (let ((wtx (with-wallet-lock (wallet)
                (prog1 (wallet-add-to-wallet wallet tx '(:inactive)
                                             :map-value map-value)
@@ -2448,11 +2483,21 @@ minute; each wallet then gates on its own 12-36h m_next_resend).")
      (* 12 3600)
      (wrng-randrange rng (* 24 3600))))
 
-(defun wallet-resubmit-transactions (node wallet &key relay force)
+(defconstant +max-resubmit-per-pass+ 32
+  "Cap on transactions one ResubmitWalletTransactions pass will push
+through full mempool validation. Core runs its (unbounded) resubmission on
+the scheduler thread; ours runs inline on the sync/housekeeping thread, so
+each pass is bounded and a wallet with more stuck txs simply continues on
+the next pass (~1 min later) — see wallets-maybe-resend.")
+
+(defun wallet-resubmit-transactions (node wallet &key relay force limit)
   "Core ResubmitWalletTransactions: resubmit unconfirmed wallet txs to the
 mempool in nOrderPos order; with RELAY also announce them. Without FORCE,
-txs received within 5 minutes of the last block are skipped. Takes the
-locks itself (node -> wallet per tx); call WITHOUT holding either."
+txs received within 5 minutes of the last block are skipped. LIMIT bounds
+the number of submissions attempted this pass. Takes the locks itself
+(node -> wallet per tx); call WITHOUT holding either. A failure on one tx
+is logged and never aborts the rest (nor the caller). Returns
+(values submitted remaining-p)."
   (let ((candidates
           (with-wallet-lock (wallet)
             (loop for wtx across (wallet-tx-ordered wallet)
@@ -2463,53 +2508,94 @@ locks itself (node -> wallet per tx); call WITHOUT holding either."
                                 (<= (wallet-tx-time-received wtx)
                                     (- (wallet-last-block-time wallet) 300))))
                     collect wtx))))
-    (let ((submitted 0))
+    (let ((submitted 0)
+          (attempted 0)
+          (remaining nil))
       (dolist (wtx candidates)
-        (with-node-lock (node)
-          (let ((ok (with-wallet-lock (wallet)
-                      ;; Re-check under the locks: state may have moved.
-                      (and (%wtx-unconfirmed-p wtx)
-                           (zerop (wallet-tx-depth wallet wtx))))))
-            (when (and ok
-                       (nth-value 0 (%wallet-submit-tx
-                                     node (wallet-tx-tx wtx) :relay relay)))
-              (incf submitted)))))
+        (when (and limit (>= attempted limit))
+          (setf remaining t)
+          (return))
+        (incf attempted)
+        (handler-case
+            (with-node-lock (node)
+              (let ((ok (with-wallet-lock (wallet)
+                          ;; Re-check under the locks: state may have moved.
+                          (and (%wtx-unconfirmed-p wtx)
+                               (zerop (wallet-tx-depth wallet wtx))))))
+                (when (and ok
+                           (nth-value 0 (%wallet-submit-tx
+                                         node (wallet-tx-tx wtx) :relay relay)))
+                  (incf submitted))))
+          (error (e)
+            (bitcoin-lisp:log-error
+             "ResubmitWalletTransactions: error resubmitting ~A (wallet ~A): ~A"
+             (hash-to-hex (wallet-tx-txid wtx)) (wallet-name wallet) e))))
       (when (plusp submitted)
         (bitcoin-lisp:log-info "ResubmitWalletTransactions: resubmit ~D unconfirmed transactions (wallet ~A)"
                                submitted (wallet-name wallet)))
-      submitted)))
+      (values submitted remaining))))
 
 (defun wallets-maybe-resend (node)
   "Core MaybeResendWalletTxs, driven from the node's 1s housekeeping loop:
 at most one pass per minute; each wallet resubmits only past its own
-randomized next-resend time, then reschedules 12-36h out. No-ops during
-IBD (Core isReadyToBroadcast)."
-  (let ((manager (bitcoin-lisp::node-wallet-manager node)))
-    (when (and manager (wallet-manager-has-wallets-p manager))
-      (let ((now (bitcoin-lisp.serialization:get-unix-time)))
-        (when (>= (- now *last-resend-check*) +resend-check-interval+)
-          (setf *last-resend-check* now)
-          (let ((chain-state (bitcoin-lisp::node-chain-state node)))
-            (unless (or (null chain-state)
-                        (bitcoin-lisp.networking:initial-block-download-p
-                         chain-state))
-              (dolist (wallet (%manager-wallets manager))
-                (let ((next (wallet-next-resend wallet)))
-                  (cond
-                    ((zerop next)
-                     ;; First sighting: schedule, don't resend (Core seeds
-                     ;; m_next_resend at construction).
-                     (setf (wallet-next-resend wallet)
-                           (%wallet-default-next-resend)))
-                    ((>= now next)
-                     (wallet-resubmit-transactions node wallet :relay t)
-                     (setf (wallet-next-resend wallet)
-                           (%wallet-default-next-resend)))))))))))))
+randomized next-resend time, then reschedules 12-36h out (or continues
+next pass when the per-pass cap truncated the batch). No-ops during IBD
+(Core isReadyToBroadcast). This runs on the sync thread, whose outer error
+handler EXITS the thread with no respawn — so nothing here may ever unwind
+into the caller: every wallet is isolated, and the whole pass is fenced.
+The inline work is acceptable because each pass is bounded
+(+max-resubmit-per-pass+ mempool validations, each under its own
+node-lock hold) and this thread is idle between 1s housekeeping ticks."
+  (handler-case
+      (let ((manager (bitcoin-lisp::node-wallet-manager node)))
+        (when (and manager (wallet-manager-has-wallets-p manager))
+          (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+            (when (>= (- now *last-resend-check*) +resend-check-interval+)
+              (setf *last-resend-check* now)
+              (let ((chain-state (bitcoin-lisp::node-chain-state node)))
+                (unless (or (null chain-state)
+                            (bitcoin-lisp.networking:initial-block-download-p
+                             chain-state))
+                  (dolist (wallet (%manager-wallets manager))
+                    (handler-case
+                        (let ((next (wallet-next-resend wallet)))
+                          (cond
+                            ((null (wallet-db wallet)))  ; unloaded: skip
+                            ((zerop next)
+                             ;; First sighting: schedule, don't resend (Core
+                             ;; seeds m_next_resend at construction).
+                             (setf (wallet-next-resend wallet)
+                                   (%wallet-default-next-resend)))
+                            ((>= now next)
+                             (multiple-value-bind (submitted remaining)
+                                 (wallet-resubmit-transactions
+                                  node wallet :relay t
+                                  :limit +max-resubmit-per-pass+)
+                               (declare (ignore submitted))
+                               ;; Truncated pass: resume on the next 60s
+                               ;; tick instead of waiting 12-36h.
+                               (setf (wallet-next-resend wallet)
+                                     (if remaining
+                                         now
+                                         (%wallet-default-next-resend)))))))
+                      (error (e)
+                        (bitcoin-lisp:log-error
+                         "MaybeResendWalletTxs: wallet ~A resend pass failed: ~A"
+                         (wallet-name wallet) e))))))))))
+    (error (e)
+      (bitcoin-lisp:log-error "MaybeResendWalletTxs: pass failed: ~A" e))))
 
 (defun wallet-post-load-resubmit (node wallet)
   "Core CWallet::postInitProcess: push the loaded wallet's unconfirmed txs
-back into OUR mempool (no relay — the periodic timer announces later)."
-  (wallet-resubmit-transactions node wallet :relay nil :force t))
+back into OUR mempool (no relay — the periodic timer announces later).
+Errors are logged, never raised: a resubmission problem must not fail
+wallet loading or an importdescriptors rescan."
+  (handler-case
+      (wallet-resubmit-transactions node wallet :relay nil :force t)
+    (error (e)
+      (bitcoin-lisp:log-error
+       "postInitProcess resubmit failed for wallet ~A: ~A"
+       (wallet-name wallet) e))))
 
 ;;; --- RPC option plumbing (rpc/spend.cpp:46-236) ---
 
@@ -2935,9 +3021,9 @@ holds node + wallet locks."
 
 (defun %send-money (node wallet cc recipients map-value verbose)
   "Core SendMoney: shuffle recipients, create signed, commit, broadcast.
-Caller holds the NODE lock only; the wallet lock is scoped to the
-build+sign phase so the broadcast's mempool hook can take the manager and
-wallet locks in order."
+Caller holds the NODE lock (holding the wallet lock too is fine — it is
+recursive, and the mempool hook fan-out reads the manager's lock-free
+snapshot, so no lock-order inversion is possible; see with-wallet-lock)."
   (multiple-value-bind (tx fee-or-error change-pos fee-reason)
       (with-wallet-lock (wallet)
         (when (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+)
@@ -2977,13 +3063,15 @@ conf_target estimate_mode avoid_reuse fee_rate verbose)."
               (push (cons "comment" comment) map-value))
             (when (and (stringp comment-to) (plusp (length comment-to)))
               (push (cons "to" comment-to) map-value)))
-          (when (> (length params) 5)
-            (let ((replaceable (nth 5 params)))
-              (unless (null replaceable)
-                (setf (wcc-signal-bip125-rbf cc) (and replaceable t)))))
+          (let ((replaceable (nth 5 params)))
+            ;; Core: `if (!params[5].isNull()) ... get_bool()` — explicit
+            ;; false (the sentinel) must turn RBF signaling OFF, while
+            ;; null/omitted keeps the wallet default.
+            (unless (null replaceable)
+              (setf (wcc-signal-bip125-rbf cc)
+                    (%positional-bool replaceable))))
           (setf (wcc-avoid-address-reuse cc)
-                (%get-avoid-reuse-flag wallet (nth 8 params)
-                                       (> (length params) 8)))
+                (%get-avoid-reuse-flag wallet (nth 8 params)))
           (setf (wcc-avoid-partial-spends cc)
                 (or (wcc-avoid-partial-spends cc)
                     (wcc-avoid-address-reuse cc)))
@@ -2996,9 +3084,9 @@ conf_target estimate_mode avoid_reuse fee_rate verbose)."
             (multiple-value-bind (recipients)
                 (%parse-outputs (wallet-network wallet)
                                 (list (cons address (second params))))
-              (when (and (nth 4 params) (> (length params) 4))
+              (when (%positional-bool (nth 4 params))
                 (setf (recipient-sffo (first recipients)) t))
-              (let ((verbose (and (> (length params) 10) (nth 10 params) t)))
+              (let ((verbose (%positional-bool (nth 10 params))))
                 (%send-money node wallet cc recipients (nreverse map-value)
                              verbose)))))))))
 
@@ -3020,16 +3108,16 @@ estimate_mode fee_rate verbose)."
           (let ((comment (nth 3 params)))
             (when (and (stringp comment) (plusp (length comment)))
               (push (cons "comment" comment) map-value)))
-          (when (> (length params) 5)
-            (let ((replaceable (nth 5 params)))
-              (unless (null replaceable)
-                (setf (wcc-signal-bip125-rbf cc) (and replaceable t)))))
+          (let ((replaceable (nth 5 params)))
+            (unless (null replaceable)
+              (setf (wcc-signal-bip125-rbf cc)
+                    (%positional-bool replaceable))))
           (%set-fee-estimate-mode cc (nth 6 params) (nth 7 params)
                                   (nth 8 params) nil)
           (multiple-value-bind (recipients keys)
               (%parse-outputs (wallet-network wallet) (second params))
             (%interpret-sffo (nth 4 params) keys recipients)
-            (let ((verbose (and (> (length params) 9) (nth 9 params) t)))
+            (let ((verbose (%positional-bool (nth 9 params))))
               (%send-money node wallet cc recipients (nreverse map-value)
                            verbose))))))))
 
@@ -3326,9 +3414,21 @@ estimate_mode fee_rate options)."
                                          :input-bytes-fn
                                          (lambda (script)
                                            (%max-signed-input-vsize wallet cc script))
-                                         :allow-used-addresses
-                                         (not (wallet-flag-set-p
-                                               wallet +wallet-flag-avoid-reuse+))
+                                         ;; Core sendall ALWAYS sweeps reused
+                                         ;; coins: AvailableCoins' allow_used
+                                         ;; = !AVOID_REUSE || (cc &&
+                                         ;; !cc->m_avoid_address_reuse)
+                                         ;; (spend.cpp:333) and sendall's
+                                         ;; default CCoinControl has
+                                         ;; m_avoid_address_reuse=false, so
+                                         ;; the condition is always true.
+                                         ;; (Core's own help text at
+                                         ;; rpc/spend.cpp:1298 claims the
+                                         ;; opposite — we match BEHAVIOR, not
+                                         ;; the doc; excluding reused coins
+                                         ;; would strand them, since sendall
+                                         ;; is the sweep tool.)
+                                         :allow-used-addresses t
                                          :check-version-trucness t
                                          :tx-version (wcc-version cc)
                                          :mempool (bitcoin-lisp::node-mempool node)))
@@ -3440,10 +3540,12 @@ estimate_mode fee_rate options)."
 
 (defun %wallet-sighash-byte (value)
   "Core ParseSighashString: NIL/\"DEFAULT\" -> SIGHASH_DEFAULT, which our
-ECDSA machinery signs as ALL (taproot inputs always sign keypath DEFAULT)."
+ECDSA machinery signs as ALL. Returns (values sighash-byte default-p) so
+callers can reject explicit non-DEFAULT types where only DEFAULT is
+supported (taproot inputs, until the P5 signer lands sighash plumbing)."
   (if (or (null value) (and (stringp value) (string-equal value "DEFAULT")))
-      1
-      (%parse-sighash-type value)))
+      (values 1 t)
+      (values (%parse-sighash-type value) nil)))
 
 (defun rpc-signrawtransactionwithwallet (node params)
   "Sign a raw transaction with the wallet's keys (Bitcoin Core
@@ -3463,8 +3565,9 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                           :message "TX decode failed. Make sure the tx has at least one input."))
       (with-node-lock (node)
         (with-wallet-lock (wallet)
-          (let ((coins (%wallet-input-coins node wallet tx))
-                (sighash-byte (%wallet-sighash-byte (third params))))
+          (multiple-value-bind (sighash-byte sighash-default-p)
+              (%wallet-sighash-byte (third params))
+            (let ((coins (%wallet-input-coins node wallet tx)))
             ;; ParsePrevouts: caller-supplied prevout data overrides/extends.
             (dolist (prevtx (and (listp (second params)) (second params)))
               (let ((txid (%opt prevtx "txid"))
@@ -3497,6 +3600,21 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                               (if (stringp witness-hex)
                                   (bitcoin-lisp.crypto:hex-to-bytes witness-hex)
                                   (and known (fourth known))))))))
+            ;; Explicit non-DEFAULT sighash types cannot be honored on
+            ;; taproot inputs yet (the P2TR arm signs keypath
+            ;; SIGHASH_DEFAULT): refuse rather than silently sign with a
+            ;; different type than requested (P5's signer adds the
+            ;; plumbing).
+            (unless sighash-default-p
+              (maphash
+               (lambda (key entry)
+                 (declare (ignore key))
+                 (when (eq (bitcoin-lisp.validation:classify-script
+                            (first entry))
+                           :witness-v1-taproot)
+                   (error 'rpc-error :code +rpc-invalid-parameter+
+                                     :message "Only DEFAULT sighash type is supported for taproot inputs")))
+               coins))
             (let* ((sign-errors (%wallet-sign-transaction wallet tx coins
                                                           :sighash-byte sighash-byte))
                    (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
@@ -3526,4 +3644,4 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                                                  (bitcoin-lisp.serialization:tx-in-script-sig input)))
                                 ("sequence" . ,(bitcoin-lisp.serialization:tx-in-sequence input))
                                 ("error" . ,message)))))
-                        sign-errors))))))))))))
+                        sign-errors)))))))))))))

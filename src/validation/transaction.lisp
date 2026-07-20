@@ -287,7 +287,10 @@ GetDustThreshold). Unspendable (OP_RETURN) outputs return 0 — never dust."
                                  (+ 32 4 1 (floor 107 4) 4)   ; 67
                                  (+ 32 4 1 107 4)))           ; 148
              (nsize (+ output-size spend-overhead)))
-        (floor (* nsize +dust-relay-fee-rate+) 1000))))
+        ;; CFeeRate::GetFee rounds UP (EvaluateFeeUp) at d3056bc; a no-op at
+        ;; the 3000 sat/kvB default (3*nsize is always exact) but keeps this
+        ;; aligned with the wallet's parameterized dust threshold.
+        (ceiling (* nsize +dust-relay-fee-rate+) 1000))))
 
 (defun scriptsig-push-only-p (script-sig)
   "True if SCRIPT-SIG contains only push opcodes (every opcode <= OP_16),

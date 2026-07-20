@@ -1163,20 +1163,36 @@ hook contexts that may already hold a wallet lock, and the only lock order
 involving the manager is manager -> wallet (see wallet-manager)."
   (wallet-manager-wallet-snapshot manager))
 
+(defmacro %do-fanout-wallets ((wallet manager what) &body body)
+  "Iterate the manager's wallet snapshot running BODY per wallet with
+per-wallet error isolation: an unloaded wallet (db already closed by a
+concurrent unloadwallet — Core's shared_ptr lifetime has no equivalent
+here) is skipped, and one wallet's failure is logged loudly without
+aborting delivery to the remaining wallets or the calling hook (the
+divergence note at the top of this file: hook failures never take the
+node down)."
+  `(dolist (,wallet (%manager-wallets ,manager))
+     (handler-case
+         (when (wallet-db ,wallet)
+           ,@body)
+       (error (e)
+         (bitcoin-lisp:log-error "Wallet ~A: ~A hook failed: ~A"
+                                 (wallet-name ,wallet) ,what e)))))
+
 (defun wallets-block-connected (manager mempool chain-state block block-hash height)
-  (dolist (wallet (%manager-wallets manager))
+  (%do-fanout-wallets (wallet manager "block-connected")
     (wallet-block-connected wallet mempool chain-state block block-hash height)))
 
 (defun wallets-block-disconnected (manager block height)
-  (dolist (wallet (%manager-wallets manager))
+  (%do-fanout-wallets (wallet manager "block-disconnected")
     (wallet-block-disconnected wallet block height)))
 
 (defun wallets-mempool-tx-added (manager mempool tx)
-  (dolist (wallet (%manager-wallets manager))
+  (%do-fanout-wallets (wallet manager "mempool-tx-added")
     (wallet-transaction-added-to-mempool wallet mempool tx)))
 
 (defun wallets-mempool-tx-removed (manager mempool tx reason)
-  (dolist (wallet (%manager-wallets manager))
+  (%do-fanout-wallets (wallet manager "mempool-tx-removed")
     (wallet-transaction-removed-from-mempool wallet mempool tx reason)))
 
 ;;; --- Load-time tx record replay (walletdb.cpp LoadTxRecords + LoadToWallet) ---
@@ -1692,7 +1708,7 @@ push order."
 gettransaction). PARAMS: (txid include_watchonly verbose)."
   (let ((wallet (wallet-for-request node))
         (txid (%wallet-parse-txid (first params)))
-        (verbose (and (>= (length params) 3) (third params) t)))
+        (verbose (%positional-bool (third params))))
     (with-node-lock (node)
       (with-wallet-lock (wallet)
         (let ((wtx (wallet-get-wallet-tx wallet txid)))
@@ -1764,8 +1780,8 @@ include_removed include_change label)."
         (target-confirms (if (and (>= (length params) 2) (second params))
                              (second params)
                              1))
-        (include-removed (if (>= (length params) 4) (and (fourth params) t) t))
-        (include-change (and (>= (length params) 5) (fifth params) t))
+        (include-removed (%positional-bool-or (fourth params) t))
+        (include-change (%positional-bool (fifth params)))
         (filter-label (when (and (>= (length params) 6) (sixth params))
                         (%label-from-value (sixth params)))))
     (unless (and (integerp target-confirms) (>= target-confirms 1))

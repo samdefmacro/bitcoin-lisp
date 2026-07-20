@@ -87,16 +87,28 @@ add_coin comment: group.Insert overwrites long_term_fee, set it after)."
 ;;; --- CFeeRate / FormatMoney / dust arithmetic ---
 
 (test ws-feerate-fee
-  "Core CFeeRate::GetFee: truncating integer division, 1-sat floor for
-non-zero rate on non-zero size."
+  "Core CFeeRate::GetFee at d3056bc: EvaluateFeeUp — ceil(rate*size/1000),
+always rounded UP (feerate.cpp:20-27, feefrac.h)."
   (is (= 0 (bitcoin-lisp.rpc::%feerate-fee 1000 0)))
   (is (= 1 (bitcoin-lisp.rpc::%feerate-fee 1000 1)))
-  (is (= 1 (bitcoin-lisp.rpc::%feerate-fee 1 999)))     ; 0.999 -> floor 0 -> min 1
+  (is (= 1 (bitcoin-lisp.rpc::%feerate-fee 1 999)))     ; ceil(0.999)
   (is (= 1 (bitcoin-lisp.rpc::%feerate-fee 1 1000)))
+  (is (= 2 (bitcoin-lisp.rpc::%feerate-fee 1 1001)))    ; ceil(1.001)
   (is (= 141 (bitcoin-lisp.rpc::%feerate-fee 1000 141)))
   (is (= 1410 (bitcoin-lisp.rpc::%feerate-fee 10000 141)))
-  (is (= 423 (bitcoin-lisp.rpc::%feerate-fee 3000 141)))
-  (is (= 204 (bitcoin-lisp.rpc::%feerate-fee 3000 68)))   ; truncation of 204.0
+  (is (= 423 (bitcoin-lisp.rpc::%feerate-fee 3000 141)))  ; exact
+  ;; Round-up discriminator: truncation would give 422 (422.859 -> 423 up).
+  (is (= 423 (bitcoin-lisp.rpc::%feerate-fee 2999 141)))
+  ;; The 1300 sat/kvB case from the review: per-part round-up sums (54+40+88
+  ;; = 182... under truncation the parts sum BELOW the whole ceil(183.3);
+  ;; under round-up every part covers its share and the whole is 184 <= sum
+  ;; of any parts covering >= its size).
+  (is (= 184 (bitcoin-lisp.rpc::%feerate-fee 1300 141)))
+  (is (<= (bitcoin-lisp.rpc::%feerate-fee 1300 141)
+          (+ (bitcoin-lisp.rpc::%feerate-fee 1300 41)
+             (bitcoin-lisp.rpc::%feerate-fee 1300 31)
+             (bitcoin-lisp.rpc::%feerate-fee 1300 69))))
+  (is (= 204 (bitcoin-lisp.rpc::%feerate-fee 3000 68)))   ; exact
   (is (= 0 (bitcoin-lisp.rpc::%feerate-fee 0 1000))))
 
 (test ws-format-money
@@ -135,6 +147,46 @@ fixed-rate version at the 3000 sat/kvB dust relay rate."
   (is (= 25000 (bitcoin-lisp.rpc::%feerate-from-value 25)))
   (signals bitcoin-lisp.rpc::rpc-error
     (bitcoin-lisp.rpc::%feerate-from-value "1.0001")))
+
+(test ws-amount-sub-satoshi-rejected
+  "AmountFromValue rejects sub-satoshi precision (Core parses the decimal
+text exactly and errors on >8 fraction digits); legit amounts still parse."
+  (is (= 500000 (bitcoin-lisp.rpc::%amount-from-value 0.005)))
+  (is (= 1 (bitcoin-lisp.rpc::%amount-from-value 1/100000000)))
+  (signals bitcoin-lisp.rpc::rpc-error
+    (bitcoin-lisp.rpc::%amount-from-value 1/1000000000))        ; 0.1 sat exact
+  (signals bitcoin-lisp.rpc::rpc-error
+    (bitcoin-lisp.rpc::%amount-from-value 1.23456789012d0))     ; sub-sat double
+  (signals bitcoin-lisp.rpc::rpc-error
+    (bitcoin-lisp.rpc::%amount-from-value 0.000000001d0)))      ; 0.1 sat double
+
+(test ws-positional-bool-plumbing
+  "Explicit false survives JSON parsing as the +json-false+ sentinel at
+top-level positional positions (distinguishable from null/omitted, Core's
+isNull semantics); nested objects/arrays keep the historical present-p
+folding; the %positional-bool helpers decode all three states."
+  (multiple-value-bind (type method params)
+      (bitcoin-lisp.rpc::parse-json-rpc-request
+       "{\"method\":\"x\",\"params\":[true,false,null,{\"a\":false,\"b\":true},[false]],\"id\":1}")
+    (is (eq type :single))
+    (is (string= method "x"))
+    (is (eq t (first params)))
+    (is (eq bitcoin-lisp.rpc:+json-false+ (second params)))
+    (is (null (third params)))
+    (let ((obj (fourth params)))
+      (multiple-value-bind (a present) (gethash "a" obj)
+        (is (null a))
+        (is (eq t present)))
+      (is (eq t (gethash "b" obj))))
+    (is (equal '(nil) (fifth params))))
+  (is (null (bitcoin-lisp.rpc::%positional-bool
+             bitcoin-lisp.rpc:+json-false+)))
+  (is (null (bitcoin-lisp.rpc::%positional-bool nil)))
+  (is (eq t (bitcoin-lisp.rpc::%positional-bool t)))
+  (is (eq t (bitcoin-lisp.rpc::%positional-bool-or nil t)))
+  (is (null (bitcoin-lisp.rpc::%positional-bool-or
+             bitcoin-lisp.rpc:+json-false+ t)))
+  (is (eq t (bitcoin-lisp.rpc::%positional-bool-or t t))))
 
 ;;; --- RNG determinism ---
 
@@ -928,3 +980,227 @@ hex+psbt without committing."
                        (%aval "psbt" result2))))
             (is (= 1 (length (bitcoin-lisp.serialization:transaction-inputs
                               (bitcoin-lisp.serialization:psbt-tx psbt)))))))))))
+
+;;; --- Adversarial-review regression tests (PR #293 review round) ---
+
+(test ws-sffo-negative-data-output-rejected
+  "B2: SFFO driving an OP_RETURN output negative is DUST (threshold 0) and
+must error with Core's too-small-to-pay-the-fee message instead of
+committing a mempool-invalid transaction as success."
+  (%with-wallet-chain-node (node "ws-sffo-neg")
+    (multiple-value-bind (wallet) (%ws-fund-wallet node)
+      (let ((bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 13))
+            (dest (%wc-optrue-address))
+            (mempool-before
+              (bitcoin-lisp.rpc::with-node-lock (node)
+                (bitcoin-lisp.mempool::mempool-count
+                 (bitcoin-lisp::node-mempool node)))))
+        (handler-case
+            (progn
+              (bitcoin-lisp.rpc::rpc-send
+               node (list (list (list (cons dest 1/1000))
+                                (list (cons "data" "aa")))
+                          nil nil 10
+                          '(("subtract_fee_from_outputs" . (1)))))
+              (fail "negative SFFO data output was not rejected"))
+          (bitcoin-lisp.rpc::rpc-error (e)
+            (is (search "too small to pay the fee"
+                        (bitcoin-lisp.rpc::rpc-error-message e)))))
+        ;; Nothing committed, nothing in the mempool, no coins spent.
+        (is (= mempool-before
+               (bitcoin-lisp.rpc::with-node-lock (node)
+                 (bitcoin-lisp.mempool::mempool-count
+                  (bitcoin-lisp::node-mempool node)))))
+        (bitcoin-lisp.rpc::with-wallet-lock (wallet)
+          (is (= 1 (hash-table-count
+                    (bitcoin-lisp.rpc::wallet-map-wallet wallet)))))))))
+
+(test ws-sendall-sweeps-reused-coins
+  "B3: sendall on an avoid_reuse wallet still sweeps coins on previously
+used addresses (Core AvailableCoins allow_used with sendall's default
+coin control; excluding them would strand funds)."
+  (%with-wallet-chain-node (node "ws-reuse")
+    ;; avoid_reuse wallet.
+    (bitcoin-lisp.rpc::rpc-createwallet node '("w" nil nil nil t))
+    (let* ((wallet (%wc-wallet node "w"))
+           (addr-a (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "bech32")))
+           (addr-b (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "bech32")))
+           (bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 17)))
+      (is (bitcoin-lisp.rpc::wallet-flag-set-p
+           wallet bitcoin-lisp.rpc::+wallet-flag-avoid-reuse+))
+      ;; Fund A, spend from A (marks A previously-spent), then fund A again
+      ;; (reused coin) and B (clean coin).
+      (%wc-mine node 1 addr-a)
+      (%wc-mine node 101 (%wc-optrue-address))
+      (let ((sweep1 (bitcoin-lisp.rpc::rpc-sendall
+                     node (list (list (%wc-optrue-address)) nil nil 2))))
+        (is (eq t (%aval "complete" sweep1))))
+      (%wc-mine node 1 (%wc-optrue-address))
+      (is (bitcoin-lisp.rpc::wallet-address-previously-spent-p wallet addr-a))
+      (%wc-mine node 1 addr-a)
+      (%wc-mine node 1 addr-b)
+      (%wc-mine node 101 (%wc-optrue-address))
+      ;; The default balance hides the reused coin ...
+      (is (= 50.0d0 (bitcoin-lisp.rpc::rpc-getbalance node '())))
+      ;; ... but sendall sweeps BOTH coins.
+      (let* ((result (bitcoin-lisp.rpc::rpc-sendall
+                      node (list (list (%wc-optrue-address)) nil nil 2)))
+             (txid (bitcoin-lisp.rpc::parse-hex-hash (%aval "txid" result)))
+             (tx (%ws-mempool-tx node txid)))
+        (is (eq t (%aval "complete" result)))
+        (is (not (null tx)))
+        (is (= 2 (length (bitcoin-lisp.serialization:transaction-inputs tx)))))
+      (%wc-mine node 1 (%wc-optrue-address))
+      (is (= 0.0d0 (bitcoin-lisp.rpc::rpc-getbalance node '())))
+      ;; getbalances "used" is empty too: everything left the wallet.
+      (let ((balances (%wb-balances node)))
+        (is (= 0.0d0 (%wb-aval "trusted" balances)))
+        (is (= 0.0d0 (%wb-aval "used" balances)))))))
+
+(test ws-explicit-false-positional-booleans
+  "B4: explicit false on positional funds-policy booleans is honored.
+replaceable=false turns RBF signaling off (nonfinal sequences); a
+null-padded avoid_reuse keeps the wallet default while explicit true on a
+wallet without the flag errors."
+  (%with-wallet-chain-node (node "ws-bools")
+    (multiple-value-bind (wallet) (%ws-fund-wallet node)
+      (declare (ignore wallet))
+      (let* ((bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 23))
+             (dest (%wc-optrue-address))
+             (txid (bitcoin-lisp.rpc::parse-hex-hash
+                    (bitcoin-lisp.rpc::rpc-sendtoaddress
+                     node (list dest 1 nil nil nil
+                                bitcoin-lisp.rpc:+json-false+
+                                nil nil nil 10))))
+             (tx (%ws-mempool-tx node txid)))
+        (is (not (null tx)))
+        (bitcoin-lisp.serialization:dovector
+            (input (bitcoin-lisp.serialization:transaction-inputs tx))
+          (is (= #xFFFFFFFE
+                 (bitcoin-lisp.serialization:tx-in-sequence input)))))
+      ;; avoid_reuse positional: null-padded (the normal way to reach
+      ;; fee_rate at position 9) = wallet default -> fine on a wallet
+      ;; without the flag; explicit true errors (Core GetAvoidReuseFlag).
+      (is (numberp (bitcoin-lisp.rpc::rpc-getbalance
+                    node (list "*" 0 nil nil))))
+      (handler-case
+          (progn (bitcoin-lisp.rpc::rpc-getbalance node (list "*" 0 nil t))
+                 (fail "explicit avoid_reuse=true on a non-avoid_reuse wallet must error"))
+        (bitcoin-lisp.rpc::rpc-error (e)
+          (is (= -4 (bitcoin-lisp.rpc::rpc-error-code e)))))
+      ;; createwallet: explicit descriptors=false is rejected; a null-padded
+      ;; descriptors argument keeps the default (true) and succeeds.
+      (handler-case
+          (progn (bitcoin-lisp.rpc::rpc-createwallet
+                  node (list "wleg" nil nil nil nil
+                             bitcoin-lisp.rpc:+json-false+))
+                 (fail "createwallet descriptors=false must be rejected"))
+        (bitcoin-lisp.rpc::rpc-error (e)
+          (is (search "no longer possible to create a legacy wallet"
+                      (bitcoin-lisp.rpc::rpc-error-message e)))))
+      (is (equal "wnull"
+                 (%aval "name" (bitcoin-lisp.rpc::rpc-createwallet
+                                node (list "wnull" nil nil nil nil nil))))))))
+
+(test ws-taproot-spend-and-oddy-reload
+  "B5: taproot end-to-end — the default wallet's tr() descriptor signs a
+keypath spend, and an imported tr(WIF) with an ODD-Y internal key still
+signs after a full unload/reload cycle (the persisted public descriptor
+stores only the 32-byte x coordinate)."
+  (%with-wallet-chain-node (node "ws-tr")
+    (bitcoin-lisp.rpc::rpc-createwallet node '("w"))
+    (let* ((wallet (%wc-wallet node "w"))
+           (addr-tr (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "bech32m")))
+           (bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 29))
+           (dest (%wc-optrue-address)))
+      ;; Fund the default 86h tr() descriptor and spend from it (BIP86
+      ;; keypath through the wallet signer + script verifier).
+      (%wc-mine node 1 addr-tr)
+      (%wc-mine node 101 (%wc-optrue-address))
+      (let* ((txid (bitcoin-lisp.rpc::parse-hex-hash
+                    (bitcoin-lisp.rpc::rpc-sendtoaddress
+                     node (list dest 1 nil nil nil nil nil nil nil 10))))
+             (tx (%ws-mempool-tx node txid)))
+        (is (not (null tx)))
+        (is (%ws-verify-ok-p node wallet tx)))
+      (%wc-mine node 1 (%wc-optrue-address))
+      ;; Grind a private key whose point has ODD Y (03 prefix).
+      (let* ((priv (loop for i from 1
+                         for candidate = (let ((v (make-array 32 :element-type '(unsigned-byte 8)
+                                                                 :initial-element 0)))
+                                           (setf (aref v 31) (logand i 255)
+                                                 (aref v 30) (ash i -8))
+                                           v)
+                         when (= 3 (aref (bitcoin-lisp.crypto:derive-public-key
+                                          candidate :compressed t)
+                                         0))
+                           return candidate))
+             (wif (bitcoin-lisp.crypto:private-key-to-wif
+                   priv :network :testnet :compressed t))
+             (desc (bitcoin-lisp.rpc::descriptor-add-checksum
+                    (format nil "tr(~A)" wif)))
+             (qx (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey
+                  (bitcoin-lisp.crypto:derive-xonly-pubkey priv)))
+             (tr-address (bitcoin-lisp.crypto:segwit-address-encode
+                          "bcrt" 1 qx))
+             (request (make-hash-table :test 'equal)))
+        (setf (gethash "desc" request) desc
+              (gethash "timestamp" request) "now")
+        (let ((results (bitcoin-lisp.rpc::rpc-importdescriptors
+                        node (list (list request)))))
+          (is (eq t (%aval "success" (first results)))))
+        ;; Fund the imported odd-Y taproot address from the same wallet.
+        (bitcoin-lisp.rpc::rpc-sendtoaddress
+         node (list tr-address 1 nil nil nil nil nil nil nil 10))
+        (%wc-mine node 1 (%wc-optrue-address))
+        ;; Crash-close + reload: the imported descriptor comes back from its
+        ;; persisted PUBLIC form (bare x-only hex).
+        (bitcoin-lisp.rpc::rpc-unloadwallet node (list "w"))
+        (bitcoin-lisp.rpc::rpc-loadwallet node (list "w"))
+        (let ((reloaded (%wc-wallet node "w")))
+          (is (not (null reloaded)))
+          ;; Sweep everything — including the odd-Y tr(WIF) coin, which is
+          ;; only signable when x-only keys are matched by X coordinate.
+          (let* ((result (bitcoin-lisp.rpc::rpc-sendall
+                          node (list (list dest) nil nil 10)))
+                 (txid (bitcoin-lisp.rpc::parse-hex-hash (%aval "txid" result)))
+                 (tx (%ws-mempool-tx node txid)))
+            (is (eq t (%aval "complete" result)))
+            (is (not (null tx)))
+            (is (%ws-verify-ok-p node reloaded tx)))
+          (%wc-mine node 1 (%wc-optrue-address))
+          (is (= 0.0d0 (bitcoin-lisp.rpc::rpc-getbalance node '()))))))))
+
+(test ws-resubmit-chunking
+  "B6: the per-pass resubmission cap chunks work across passes instead of
+doing unbounded validation in one housekeeping tick."
+  (%with-wallet-chain-node (node "ws-chunk")
+    (multiple-value-bind (wallet) (%ws-fund-wallet node :blocks 2)
+      (let* ((bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 37))
+             (dest (%wc-optrue-address))
+             (txid1 (bitcoin-lisp.rpc::parse-hex-hash
+                     (bitcoin-lisp.rpc::rpc-sendtoaddress
+                      node (list dest 1 nil nil nil nil nil nil nil 10)))))
+        (%wb-evict-tx node txid1)
+        (let ((txid2 (bitcoin-lisp.rpc::parse-hex-hash
+                      (bitcoin-lisp.rpc::rpc-sendtoaddress
+                       node (list dest 2 nil nil nil nil nil nil nil 10)))))
+          (%wb-evict-tx node txid2)
+          (is (null (%ws-mempool-tx node txid1)))
+          (is (null (%ws-mempool-tx node txid2)))
+          ;; Capped pass: one submitted, remainder flagged.
+          (multiple-value-bind (submitted remaining)
+              (bitcoin-lisp.rpc::wallet-resubmit-transactions
+               node wallet :relay nil :force t :limit 1)
+            (is (= 1 submitted))
+            (is (eq t remaining)))
+          ;; Follow-up pass drains the rest (the already-in-mempool tx1
+          ;; counts as submitted again, exactly like Core's OK-returning
+          ;; already-in-mempool branch).
+          (multiple-value-bind (submitted remaining)
+              (bitcoin-lisp.rpc::wallet-resubmit-transactions
+               node wallet :relay nil :force t)
+            (is (<= 1 submitted 2))
+            (is (null remaining)))
+          (is (not (null (%ws-mempool-tx node txid1))))
+          (is (not (null (%ws-mempool-tx node txid2)))))))))
