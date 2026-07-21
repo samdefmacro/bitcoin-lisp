@@ -1149,3 +1149,132 @@ the pool child it would strand. A re-added final tx survives the filter."
        mempool (list dtx) utxo-set 200 chain-state)
       ;; the re-added tx passed the filter too
       (is (bitcoin-lisp.mempool:mempool-has mempool did)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Deep-reorg download-path regression (fix-deep-reorg-sequencing)
+;;;
+;;; A block that does NOT extend the active tip must be accepted CONTEXT-FREE
+;;; and stored, then connected by perform-reorg fork-to-tip. Tip-validating
+;;; such a fork block against the active UTXO set / height was the testnet4
+;;; wedge: MISSING-INPUT (its inputs are on its own branch) or
+;;; BAD-COINBASE-HEIGHT (its height is not tip+1), so it was rejected before
+;;; storage and perform-reorg never received the branch. These reproduce the
+;;; height case (regtest enforces BIP34 from h=1, so a fork block whose height
+;;; differs from tip+1 fails the old tip-gate).
+;;; ---------------------------------------------------------------------------
+
+(defun %dr-mine-on (node spk)
+  "Assemble + PoW-mine a block on NODE's current tip paying coinbase to SPK,
+WITHOUT connecting it. Returns the mined block."
+  (let ((block (bitcoin-lisp.mining:assemble-full-block
+                (bitcoin-lisp::node-chain-state node)
+                (bitcoin-lisp::node-mempool node)
+                :coinbase-script-pubkey spk)))
+    (bitcoin-lisp.mining:mine-block block)
+    block))
+
+(defun %dr-connect (node block)
+  "Connect BLOCK into NODE (advances the tip / stores / reorgs)."
+  (bitcoin-lisp.validation:connect-block
+   block
+   (bitcoin-lisp::node-chain-state node)
+   (bitcoin-lisp::node-block-store node)
+   (bitcoin-lisp::node-utxo-set node)))
+
+(test validate-block-context-free-only-skips-contextual
+  "CONTEXT-FREE-ONLY returns success before the UTXO/height-dependent checks
+(so a fork block validated at the wrong tip height is not spuriously rejected),
+while the pure block-integrity checks still run."
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "cfo"))
+          (cs (bitcoin-lisp::node-chain-state node))
+          (utxo (bitcoin-lisp::node-utxo-set node))
+          (spk (%p2sh-optrue-spk))
+          (now (bitcoin-lisp.serialization:get-unix-time))
+          ;; A valid, mined height-1 block on genesis.
+          (block (%dr-mine-on node spk)))
+     ;; Full validation at the block's real height (1) succeeds.
+     (is-true (bitcoin-lisp.validation:validate-block block cs utxo 1 now))
+     ;; Full validation at a WRONG height fails BIP34 (BAD-COINBASE-HEIGHT):
+     ;; this is exactly what the old download path did to a fork block.
+     (multiple-value-bind (valid error)
+         (bitcoin-lisp.validation:validate-block block cs utxo 9 now)
+       (is (null valid))
+       (is (eq :bad-coinbase-height error)))
+     ;; CONTEXT-FREE-ONLY at the same wrong height succeeds — the height check
+     ;; is deferred to perform-reorg.
+     (is-true (bitcoin-lisp.validation:validate-block
+               block cs utxo 9 now :context-free-only t))
+     ;; But a genuine context-free failure (merkle mismatch) is still caught
+     ;; under CONTEXT-FREE-ONLY. Corrupt the header's merkle root; skip-pow so
+     ;; the header check (which never looks at merkle) passes and we reach the
+     ;; block-level merkle check.
+     (let ((bad (bitcoin-lisp.serialization:make-bitcoin-block
+                 :header (copy-structure
+                          (bitcoin-lisp.serialization:bitcoin-block-header block))
+                 :transactions (bitcoin-lisp.serialization:bitcoin-block-transactions
+                                block))))
+       (setf (bitcoin-lisp.serialization:block-header-merkle-root
+              (bitcoin-lisp.serialization:bitcoin-block-header bad))
+             (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.validation:validate-block
+            bad cs utxo 1 now :context-free-only t :skip-pow t)
+         (is (null valid))
+         (is (eq :bad-merkle-root error)))))))
+
+(test deep-reorg-fork-blocks-accepted-and-reorged
+  "A competing longer branch fed to ACCEPT-DOWNLOADED-BLOCK while the node's tip
+is already on the shorter branch: every fork block must be stored (not rejected
+by tip-validation), and the branch must win via reorg once it outweighs the
+active chain. Old code rejected the fork blocks (BAD-COINBASE-HEIGHT, since
+their height != tip+1) and never reorged."
+  (%with-regtest
+   (let* ((spk-a (%p2sh-optrue-spk))
+          ;; A distinct coinbase spk so branch B's blocks differ from A's.
+          (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))  ; bare OP_TRUE
+          ;; Throwaway node to build branch B (4 blocks on genesis), capturing
+          ;; the block objects.
+          (nb (%regtest-node-fixture "dr-b"))
+          (b-blocks (loop repeat 4
+                          for blk = (%dr-mine-on nb spk-b)
+                          do (%dr-connect nb blk)
+                          collect blk))
+          ;; Main node: branch A, 3 blocks on the same genesis.
+          (na (%regtest-node-fixture "dr-a"))
+          (csa (bitcoin-lisp::node-chain-state na))
+          (utxoa (bitcoin-lisp::node-utxo-set na))
+          (storea (bitcoin-lisp::node-block-store na)))
+     (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))
+     (is (= 3 (bitcoin-lisp.storage:current-height csa)))
+     (let ((a-tip (bitcoin-lisp.storage:best-block-hash csa)))
+       ;; Feed B1: it forks at genesis, so its height (1) != tip+1 (4). The old
+       ;; tip-gate rejected this as BAD-COINBASE-HEIGHT; now it is stored as a
+       ;; weaker side block and the active tip stays on A.
+       (let ((b1-hash (bitcoin-lisp.serialization:block-header-hash
+                       (bitcoin-lisp.serialization:bitcoin-block-header
+                        (first b-blocks)))))
+         (multiple-value-bind (valid error)
+             (bitcoin-lisp.networking::accept-downloaded-block
+              (first b-blocks) csa utxoa storea)
+           (is-true valid)
+           (is (null error)))
+         (is-true (bitcoin-lisp.storage:get-block-index-entry csa b1-hash))
+         (is (equalp a-tip (bitcoin-lisp.storage:best-block-hash csa)))
+         (is (= 3 (bitcoin-lisp.storage:current-height csa))))
+       ;; Feed B2, B3 (still weaker/equal — A stays active).
+       (bitcoin-lisp.networking::accept-downloaded-block
+        (second b-blocks) csa utxoa storea)
+       (bitcoin-lisp.networking::accept-downloaded-block
+        (third b-blocks) csa utxoa storea)
+       (is (equalp a-tip (bitcoin-lisp.storage:best-block-hash csa)))
+       ;; Feed B4 — branch B now outweighs A (4 > 3): reorg onto B.
+       (bitcoin-lisp.networking::accept-downloaded-block
+        (fourth b-blocks) csa utxoa storea)
+       (let ((b4-hash (bitcoin-lisp.serialization:block-header-hash
+                       (bitcoin-lisp.serialization:bitcoin-block-header
+                        (fourth b-blocks)))))
+         (is (= 4 (bitcoin-lisp.storage:current-height csa)))
+         (is (equalp b4-hash (bitcoin-lisp.storage:best-block-hash csa)))
+         ;; UTXO set is now branch B's 4 coinbases.
+         (is (= 4 (bitcoin-lisp.storage:utxo-count utxoa))))))))
