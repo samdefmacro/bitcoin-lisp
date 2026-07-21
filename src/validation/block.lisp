@@ -1059,8 +1059,19 @@ set (tx_verify.cpp). Legacy sigops are always counted."
 ;;;; Full block validation
 
 (defun validate-block (block chain-state utxo-set current-height current-time
-                        &key skip-scripts skip-header skip-pow)
+                        &key skip-scripts skip-header skip-pow context-free-only)
   "Fully validate a block including all transactions.
+When CONTEXT-FREE-ONLY is true, run only the checks that are a pure function of
+the block itself (Bitcoin Core CheckBlock: header, coinbase structure, signet
+solution, merkle root / CVE-2012-2459, weight, size) and RETURN SUCCESS before
+the UTXO-dependent contextual checks (BIP30, per-input validation, sequence
+locks, scripts, BIP34 coinbase height, coinbase value — Core ContextualCheck
+Block + ConnectBlock). Used when accepting a downloaded block that does NOT
+extend the active tip: its inputs live on its own branch, not in the active
+UTXO set, so the contextual checks would spuriously fail (MISSING-INPUT) — they
+are performed instead by PERFORM-REORG, which connects the fork fork-to-tip
+against the rewound UTXO set. CURRENT-HEIGHT should still be the block's own
+branch height so the header (difficulty/MTP/timewarp) checks are correct.
 When SKIP-SCRIPTS is true, script validation is skipped (used during IBD for
 blocks below the last checkpoint, matching Bitcoin Core behavior).
 When SKIP-HEADER is true, the block-header re-validation (PoW / difficulty /
@@ -1150,6 +1161,14 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
       (when (> base-size +max-block-size+)
         (return-from validate-block
           (values nil :block-too-large nil))))
+
+    ;; CONTEXT-FREE-ONLY stops here: everything above is a pure function of the
+    ;; block (Core CheckBlock); everything below depends on the active UTXO set
+    ;; / chain height (Core ContextualCheckBlock + ConnectBlock) and is only
+    ;; correct for a tip-extending block. A fork block is stored now and its
+    ;; contextual checks run later in PERFORM-REORG, fork-to-tip.
+    (when context-free-only
+      (return-from validate-block (values t nil nil)))
 
     ;; BIP 30: reject a block that re-creates a still-unspent txid.
     ;; Per-output point lookups, exactly Core's HaveCoin loop
