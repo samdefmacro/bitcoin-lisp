@@ -1162,6 +1162,25 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
         (return-from validate-block
           (values nil :block-too-large nil))))
 
+    ;; Per-transaction context-free checks (Core CheckBlock: CheckTransaction
+    ;; per tx — CVE-2018-17144 duplicate inputs, empty vin/vout, value
+    ;; overflow, coinbase scriptSig length) plus the legacy-sigop block budget.
+    ;; These need no UTXO set, so they run in the context-free portion — a fork
+    ;; block is rejected before storage if it is structurally malformed, rather
+    ;; than being stored and only caught later in PERFORM-REORG. Core sums
+    ;; GetLegacySigOpCount over every tx (coinbase included) and rejects when
+    ;; nSigOps * WITNESS_SCALE_FACTOR > MAX_BLOCK_SIGOPS_COST (validation.cpp
+    ;; CheckBlock; deliberately an underestimate — P2SH/witness sigops are the
+    ;; contextual ConnectBlock count below).
+    (let ((legacy-sigops 0))
+      (dolist (tx transactions)
+        (multiple-value-bind (valid error) (validate-transaction-structure tx)
+          (unless valid
+            (return-from validate-block (values nil error nil))))
+        (incf legacy-sigops (count-legacy-sigops tx)))
+      (when (> (* legacy-sigops +witness-scale-factor+) +max-block-sigops-cost+)
+        (return-from validate-block (values nil :bad-blk-sigops nil))))
+
     ;; CONTEXT-FREE-ONLY stops here: everything above is a pure function of the
     ;; block (Core CheckBlock); everything below depends on the active UTXO set
     ;; / chain height (Core ContextualCheckBlock + ConnectBlock) and is only
@@ -1204,12 +1223,10 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                  (when utxo
                    (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo)))))
 
-        ;; Validate coinbase structure (skip input validation)
+        ;; Coinbase: per-tx structure (CheckTransaction) already ran in the
+        ;; context-free section above; here just accumulate its contextual
+        ;; sigop cost and stage its outputs for intra-block spending.
         (let ((coinbase-tx (first transactions)))
-          (multiple-value-bind (valid error)
-              (validate-transaction-structure coinbase-tx)
-            (unless valid
-              (return-from validate-block (values nil error nil))))
           ;; Coinbase sigops: legacy only (no inputs to look up), scaled by witness factor
           (incf total-sigops-cost (* (count-legacy-sigops coinbase-tx) +witness-scale-factor+))
           ;; Add coinbase outputs to pending (for intra-block spending)
@@ -1223,13 +1240,11 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                             :height current-height
                             :coinbase t)))))
 
-        ;; Validate other transactions
+        ;; Validate other transactions. Per-tx structure (CheckTransaction)
+        ;; already ran context-free above; here we do the contextual checks
+        ;; (inputs / fees / sigops with P2SH+witness).
         (loop for tx in (rest transactions)
-              do (multiple-value-bind (valid error)
-                     (validate-transaction-structure tx)
-                   (unless valid
-                     (return-from validate-block (values nil error nil))))
-                 (multiple-value-bind (valid error fee)
+              do (multiple-value-bind (valid error fee)
                      (validate-transaction-contextual tx utxo-set current-height
                                                       :pending-utxos pending-utxos)
                    (unless valid
