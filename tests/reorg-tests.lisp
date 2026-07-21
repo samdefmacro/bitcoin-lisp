@@ -1279,6 +1279,48 @@ their height != tip+1) and never reorged."
          ;; UTXO set is now branch B's 4 coinbases.
          (is (= 4 (bitcoin-lisp.storage:utxo-count utxoa))))))))
 
+(test context-free-only-runs-checktransaction
+  "F2: CONTEXT-FREE-ONLY now runs Core CheckBlock's per-tx CheckTransaction
+(and legacy-sigop budget), so a structurally-invalid fork block (here a tx
+with duplicate inputs, CVE-2018-17144) is rejected before storage rather than
+being stored and only caught later in perform-reorg. A well-formed block still
+passes context-free."
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "cfo-ct"))
+          (cs (bitcoin-lisp::node-chain-state node))
+          (utxo (bitcoin-lisp::node-utxo-set node))
+          (now (bitcoin-lisp.serialization:get-unix-time))
+          (block (%dr-mine-on node (%p2sh-optrue-spk)))
+          (coinbase (first (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
+     ;; Baseline: the valid coinbase-only block passes context-free.
+     (is-true (bitcoin-lisp.validation:validate-block
+               block cs utxo 1 now :context-free-only t :skip-header t))
+     ;; Build a non-coinbase tx with two identical inputs (duplicate outpoint).
+     (let* ((empty (make-array 0 :element-type '(unsigned-byte 8)))
+            (op (bitcoin-lisp.serialization:make-outpoint
+                 :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)
+                 :index 0))
+            (in (bitcoin-lisp.serialization:make-tx-in
+                 :previous-output op :script-sig empty :sequence #xFFFFFFFF))
+            (out (bitcoin-lisp.serialization:make-tx-out
+                  :value 1000 :script-pubkey (coerce '(#x51) '(vector (unsigned-byte 8)))))
+            (dup (bitcoin-lisp.serialization:make-transaction
+                  :version 1 :inputs (vector in in) :outputs (vector out) :lock-time 0))
+            (txs (list coinbase dup))
+            ;; Correct merkle root over the two txs so the malleation check
+            ;; passes and we reach the per-tx CheckTransaction.
+            (root (bitcoin-lisp.validation::compute-merkle-root
+                   (mapcar #'bitcoin-lisp.serialization:transaction-hash txs)))
+            (hdr (copy-structure (bitcoin-lisp.serialization:bitcoin-block-header block)))
+            (bad (progn
+                   (setf (bitcoin-lisp.serialization:block-header-merkle-root hdr) root)
+                   (bitcoin-lisp.serialization:make-bitcoin-block :header hdr :transactions txs))))
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.validation:validate-block
+            bad cs utxo 1 now :context-free-only t :skip-header t)
+         (is (null valid))
+         (is (eq :duplicate-inputs error)))))))
+
 (test connect-block-surfaces-missing-fork-blocks-on-refused-reorg
   "When connect-block triggers a reorg that must be REFUSED because intermediate
 fork blocks are absent from the store, it returns the missing (hash . height)
