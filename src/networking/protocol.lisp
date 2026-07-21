@@ -860,6 +860,57 @@ committed to the index from announcements."
 
 ;;; Block handling
 
+(defun accept-downloaded-block (block chain-state utxo-set block-store
+                                &key mempool fee-estimator recent-rejects)
+  "Validate and connect a freshly-downloaded block (full, reconstructed, or
+completed compact), handling the fork case correctly. Must be called under the
+node lock. Returns (values valid error).
+
+A block that extends the active tip gets full contextual validation at tip+1,
+then CONNECT-BLOCK applies it. A block whose parent is NOT the current tip is
+on a side branch: it is validated CONTEXT-FREE (Core CheckBlock) at its own
+branch height and handed to CONNECT-BLOCK, which stores it and — once its
+branch outweighs the active chain — reorganizes onto it via PERFORM-REORG,
+which runs the contextual checks (inputs / scripts / BIP34 height / value)
+fork-to-tip against the rewound UTXO set.
+
+Tip-validating a fork block was the deep-reorg wedge: its inputs live on its
+own branch, not the active UTXO set (MISSING-INPUT), and its height is not
+tip+1 (BAD-COINBASE-HEIGHT), so it was rejected before storage and PERFORM-REORG
+never received the branch's blocks."
+  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
+         (current-best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (current-time (bitcoin-lisp.serialization:get-unix-time)))
+    (flet ((%connect ()
+             (bitcoin-lisp.validation:connect-block
+              block chain-state block-store utxo-set
+              :fee-estimator fee-estimator
+              :recent-rejects recent-rejects
+              :mempool mempool)))
+      (if (equalp prev-hash current-best-hash)
+          ;; Extends the active tip — full validation at tip+1.
+          (let ((new-height (1+ (bitcoin-lisp.storage:current-height chain-state))))
+            (multiple-value-bind (valid error)
+                (bitcoin-lisp.validation:validate-block
+                 block chain-state utxo-set new-height current-time)
+              (if valid (progn (%connect) (values t nil)) (values nil error))))
+          ;; Side branch — context-free validation at the block's own height;
+          ;; CONNECT-BLOCK stores it and reorgs (validating fully) when it wins.
+          (let ((prev-entry (bitcoin-lisp.storage:get-block-index-entry
+                             chain-state prev-hash)))
+            (if (null prev-entry)
+                ;; Parent header unknown: can't place the block or check its
+                ;; PoW/difficulty. Drop it (a healthy IBD has the headers first).
+                (values nil :orphan-block)
+                (let ((fork-height (1+ (bitcoin-lisp.storage:block-index-entry-height
+                                        prev-entry))))
+                  (multiple-value-bind (valid error)
+                      (bitcoin-lisp.validation:validate-block
+                       block chain-state utxo-set fork-height current-time
+                       :context-free-only t)
+                    (if valid (progn (%connect) (values t nil)) (values nil error))))))))))
+
 (defun handle-block (peer payload chain-state utxo-set block-store
                      &optional mempool fee-estimator &key recent-rejects peers)
   "Handle a block message. When PEERS is supplied and the block becomes the new
@@ -869,29 +920,22 @@ blocks instead of being a sink."
     (when block
       (with-node-lock
         (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-               (hash (bitcoin-lisp.serialization:block-header-hash header))
-               (current-height (bitcoin-lisp.storage:current-height chain-state))
-               (current-time (bitcoin-lisp.serialization:get-unix-time)))
-          ;; Validate and connect block
+               (hash (bitcoin-lisp.serialization:block-header-hash header)))
           (multiple-value-bind (valid error)
-              (bitcoin-lisp.validation:validate-block
-               block chain-state utxo-set (1+ current-height) current-time)
+              (accept-downloaded-block block chain-state utxo-set block-store
+                                       :mempool mempool
+                                       :fee-estimator fee-estimator
+                                       :recent-rejects recent-rejects)
             (if valid
+                ;; Announce onward only if this block is now the active tip
+                ;; (accept may have stored a side block or reorged).
+                (when (and peers
+                           (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                                   hash))
+                  (relay-block header peer peers))
                 (progn
-                  (bitcoin-lisp.validation:connect-block
-                   block chain-state block-store utxo-set
-                   :fee-estimator fee-estimator
-                   :recent-rejects recent-rejects
-                   :mempool mempool)
-                  ;; Announce onward only if this block is now the active tip
-                  ;; (connect-block may have stored a side block or reorged).
-                  (when (and peers
-                             (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
-                                     hash))
-                    (relay-block header peer peers)))
-                (progn
-                  (format t "Block ~A rejected: ~A~%"
-                          (bitcoin-lisp.crypto:bytes-to-hex hash) error)
+                  (bitcoin-lisp:log-warn "Block ~A rejected: ~A"
+                                         (bitcoin-lisp.crypto:bytes-to-hex hash) error)
                   (record-misbehavior peer "invalid block")))))))))
 
 ;;; Address handling
@@ -2378,23 +2422,17 @@ v1 compact block would deliver a witness-stripped coinbase."
          ;; stamps getpeerinfo "last_block" and resets stall tracking.
          (record-block-received-from-peer peer)
          (bitcoin-lisp:log-debug "Compact block reconstructed successfully")
-         ;; Process like a normal block
+         ;; Process like a normal block (fork-aware: a reconstructed block on a
+         ;; side branch is stored and reorged, not tip-validated).
          (with-node-lock
-           (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
-                  (current-time (bitcoin-lisp.serialization:get-unix-time)))
-             (multiple-value-bind (valid error)
-                 (bitcoin-lisp.validation:validate-block
-                  block chain-state utxo-set (1+ current-height) current-time)
-               (if valid
-                   (progn
-                     (bitcoin-lisp.validation:connect-block
-                      block chain-state block-store utxo-set
-                      :fee-estimator fee-estimator
-                      :recent-rejects recent-rejects
-                      :mempool mempool))
-                   (progn
-                     (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
-                     (record-misbehavior peer "invalid compact block")))))))
+           (multiple-value-bind (valid error)
+               (accept-downloaded-block block chain-state utxo-set block-store
+                                        :mempool mempool
+                                        :fee-estimator fee-estimator
+                                        :recent-rejects recent-rejects)
+             (unless valid
+               (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
+               (record-misbehavior peer "invalid compact block")))))
 
         ;; Collision or malformed - fall back to full block
         ((eq missing-indexes :collision)
@@ -2462,21 +2500,14 @@ v1 compact block would deliver a witness-stripped coinbase."
           ;; Block delivery from this peer (getpeerinfo "last_block").
           (record-block-received-from-peer peer)
           (with-node-lock
-            (let* ((current-height (bitcoin-lisp.storage:current-height chain-state))
-                   (current-time (bitcoin-lisp.serialization:get-unix-time)))
-              (multiple-value-bind (valid error)
-                  (bitcoin-lisp.validation:validate-block
-                   block chain-state utxo-set (1+ current-height) current-time)
-                (if valid
-                    (progn
-                      (bitcoin-lisp.validation:connect-block
-                       block chain-state block-store utxo-set
-                       :fee-estimator fee-estimator
-                       :recent-rejects recent-rejects
-                       :mempool mempool))
-                    (progn
-                      (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
-                      (record-misbehavior peer "invalid reconstructed block")))))))))))
+            (multiple-value-bind (valid error)
+                (accept-downloaded-block block chain-state utxo-set block-store
+                                         :mempool mempool
+                                         :fee-estimator fee-estimator
+                                         :recent-rejects recent-rejects)
+              (unless valid
+                (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
+                (record-misbehavior peer "invalid reconstructed block")))))))))
 
 (defun request-full-block (peer block-hash)
   "Request a full block (fallback from compact block)."
