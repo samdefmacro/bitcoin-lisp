@@ -1656,7 +1656,15 @@ Handles chain reorganizations when a competing chain has more work."
                                      block)))))
       (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
 
-      ;; Check if we need a reorganization
+      ;; Check if we need a reorganization. REORG-OUTCOME captures perform-reorg's
+      ;; result so callers can act on a refused reorg: NIL for a tip extension or
+      ;; a stored side block, or (REORG-OK DETAIL) for the reorg branch — where
+      ;; a NIL REORG-OK with a LIST detail is "refused, these (hash . height)
+      ;; fork blocks are missing from the store" (re-download them) and a NIL
+      ;; REORG-OK with a KEYWORD detail is "a fork block was invalid, rolled
+      ;; back". Returned as connect-block's second value; existing callers that
+      ;; read only the first value (the index entry) are unaffected.
+      (let ((reorg-outcome
       (let* ((current-best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
              (current-best-entry (bitcoin-lisp.storage:get-block-index-entry
                                   chain-state current-best-hash))
@@ -1746,19 +1754,22 @@ Handles chain reorganizations when a competing chain has more work."
                (when (> pruned 0)
                  (bitcoin-lisp:log-info "Pruned ~D old block~:P" pruned)))))
 
-          ;; New chain has more work - reorganize
+          ;; New chain has more work - reorganize. Capture perform-reorg's
+          ;; (values ok detail) so the caller can re-queue missing fork blocks
+          ;; on a refusal.
           ((> chain-work current-best-work)
-           (perform-reorg chain-state block-store utxo-set
-                          current-best-entry entry
-                          :tx-index tx-index
-                          :fee-estimator fee-estimator
-                          :recent-rejects recent-rejects
-                          :mempool mempool))
+           (multiple-value-list
+            (perform-reorg chain-state block-store utxo-set
+                           current-best-entry entry
+                           :tx-index tx-index
+                           :fee-estimator fee-estimator
+                           :recent-rejects recent-rejects
+                           :mempool mempool)))
 
           ;; New block is on a weaker chain - just store it
-          (t nil)))
+          (t nil)))))
 
-      entry)))
+      (values entry reorg-outcome)))))
 
 (defun find-fork-point (entry-a entry-b)
   "Find the common ancestor (fork point) of two chain entries.

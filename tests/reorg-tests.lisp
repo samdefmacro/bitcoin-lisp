@@ -1320,3 +1320,55 @@ passes context-free."
             bad cs utxo 1 now :context-free-only t :skip-header t)
          (is (null valid))
          (is (eq :duplicate-inputs error)))))))
+
+(test connect-block-surfaces-missing-fork-blocks-on-refused-reorg
+  "When connect-block triggers a reorg that must be REFUSED because intermediate
+fork blocks are absent from the store, it returns the missing (hash . height)
+list as its second value, so the download path (accept-downloaded-block) can
+re-queue them. Regression for the testnet4 deep-reorg wedge: the compact/relay
+path swallowed this signal and never re-requested the sub-tip fork blocks."
+  (%with-regtest
+   (let* ((spk-a (%p2sh-optrue-spk))
+          (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
+          ;; Branch B (4 blocks) built on a throwaway node; capture the blocks.
+          (nb (%regtest-node-fixture "requeue-b"))
+          (b-blocks (loop repeat 4 for blk = (%dr-mine-on nb spk-b)
+                          do (%dr-connect nb blk) collect blk))
+          ;; Main node: capture genesis, then branch A (3 blocks). Tip = A3.
+          (na (%regtest-node-fixture "requeue-a"))
+          (csa (bitcoin-lisp::node-chain-state na))
+          (utxoa (bitcoin-lisp::node-utxo-set na))
+          (storea (bitcoin-lisp::node-block-store na))
+          (genesis-hash (bitcoin-lisp.storage:best-block-hash csa)))
+     (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))
+     (is (= 3 (bitcoin-lisp.storage:current-height csa)))
+     ;; Add branch B's HEADERS (index entries for B1-B3) to na WITHOUT their
+     ;; bodies, so a reorg toward B can be attempted but must refuse for the
+     ;; missing bodies. B4's entry + body are added by connect-block itself.
+     (let ((prev (bitcoin-lisp.storage:get-block-index-entry csa genesis-hash)))
+       (loop for blk in (subseq b-blocks 0 3)
+             for h from 1 to 3
+             do (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                       (bhash (bitcoin-lisp.serialization:block-header-hash hdr))
+                       (work (bitcoin-lisp.storage:calculate-chain-work
+                              (bitcoin-lisp.serialization:block-header-bits hdr)
+                              (bitcoin-lisp.storage:block-index-entry-chain-work prev)))
+                       (e (bitcoin-lisp.storage:make-block-index-entry
+                           :hash bhash :height h :header hdr
+                           :prev-entry prev :chain-work work :status :valid)))
+                  (bitcoin-lisp.storage:add-block-index-entry csa e)
+                  (setf prev e))))
+     ;; connect-block B4: chain-work 4 > active A3's 3, so it triggers a reorg
+     ;; toward B4, which refuses because B1-B3 bodies aren't stored.
+     (multiple-value-bind (entry outcome)
+         (bitcoin-lisp.validation:connect-block (fourth b-blocks) csa storea utxoa)
+       (declare (ignore entry))
+       ;; outcome = (reorg-ok detail); refused-for-missing -> (nil <list>).
+       (is (null (first outcome)))
+       (is (consp (second outcome)))
+       ;; The three missing sub-tip fork blocks B1-B3.
+       (is (= 3 (length (second outcome))))
+       ;; Every element is a (hash . height) cons.
+       (is (every (lambda (c) (and (consp c) (integerp (cdr c)))) (second outcome)))
+       ;; Reorg refused -> active tip unchanged (still on branch A).
+       (is (= 3 (bitcoin-lisp.storage:current-height csa)))))))

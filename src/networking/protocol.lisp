@@ -883,11 +883,27 @@ never received the branch's blocks."
          (current-best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
          (current-time (bitcoin-lisp.serialization:get-unix-time)))
     (flet ((%connect ()
-             (bitcoin-lisp.validation:connect-block
-              block chain-state block-store utxo-set
-              :fee-estimator fee-estimator
-              :recent-rejects recent-rejects
-              :mempool mempool)))
+             (multiple-value-bind (entry reorg-outcome)
+                 (bitcoin-lisp.validation:connect-block
+                  block chain-state block-store utxo-set
+                  :fee-estimator fee-estimator
+                  :recent-rejects recent-rejects
+                  :mempool mempool)
+               (declare (ignore entry))
+               ;; If CONNECT-BLOCK triggered a reorg that was REFUSED because
+               ;; fork blocks are missing from the store, re-download them.
+               ;; REORG-OUTCOME is (REORG-OK DETAIL): a NIL REORG-OK with a LIST
+               ;; detail is the missing (hash . height) list. The IBD path
+               ;; (process-received-block -> activate-block) does this itself,
+               ;; but a winning block arriving via the compact/relay path lands
+               ;; here instead — without re-queuing, the sub-tip fork blocks the
+               ;; reorg needs are never requested and the node wedges (the
+               ;; testnet4 deep-reorg wedge). A KEYWORD detail means an invalid
+               ;; fork block (rolled back) — do not re-download.
+               (when (and (consp reorg-outcome)
+                          (null (first reorg-outcome))
+                          (consp (second reorg-outcome)))
+                 (queue-missing-fork-blocks (second reorg-outcome))))))
       (if (equalp prev-hash current-best-hash)
           ;; Extends the active tip — full validation at tip+1.
           (let ((new-height (1+ (bitcoin-lisp.storage:current-height chain-state))))
