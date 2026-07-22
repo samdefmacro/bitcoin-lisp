@@ -79,6 +79,7 @@
   (register-rpc-method "utxoupdatepsbt" #'rpc-utxoupdatepsbt)
   (register-rpc-method "analyzepsbt" #'rpc-analyzepsbt)
   (register-rpc-method "finalizepsbt" #'rpc-finalizepsbt)
+  (register-rpc-method "descriptorprocesspsbt" #'rpc-descriptorprocesspsbt)
   (register-rpc-method "combinerawtransaction" #'rpc-combinerawtransaction)
   (register-rpc-method "gettxoutproof" #'rpc-gettxoutproof)
   (register-rpc-method "verifytxoutproof" #'rpc-verifytxoutproof)
@@ -218,7 +219,12 @@
   (register-rpc-method "send" #'rpc-send)
   (register-rpc-method "sendall" #'rpc-sendall)
   (register-rpc-method "fundrawtransaction" #'rpc-fundrawtransaction)
-  (register-rpc-method "signrawtransactionwithwallet" #'rpc-signrawtransactionwithwallet))
+  (register-rpc-method "signrawtransactionwithwallet" #'rpc-signrawtransactionwithwallet)
+  ;; Wallet PSBT signer + RBF fee-bump (wallet P5)
+  (register-rpc-method "walletprocesspsbt" #'rpc-walletprocesspsbt)
+  (register-rpc-method "walletcreatefundedpsbt" #'rpc-walletcreatefundedpsbt)
+  (register-rpc-method "bumpfee" #'rpc-bumpfee)
+  (register-rpc-method "psbtbumpfee" #'rpc-psbtbumpfee))
 
 ;;; --- JSON-RPC Request/Response Handling ---
 

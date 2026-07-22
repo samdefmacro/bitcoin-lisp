@@ -1067,3 +1067,209 @@ keeps an unrelated lone address in its own group."
             (is (not (null g3)))
             (is (= 1 (length g3)))
             (is (not (member addr1 (funcall group-addrs g3) :test #'string=)))))))))
+
+;;; ==============================================================
+;;; Wallet P5 — PSBT signer (walletprocesspsbt / walletcreatefundedpsbt) +
+;;; RBF fee-bump (bumpfee / psbtbumpfee): hermetic regtest round-trips.
+;;;
+;;; wallet-tests.lisp loads BEFORE wallet-chain/spend-tests, so their
+;;; %with-wallet-chain-node / %ws-fund-wallet fixtures are not yet defined here;
+;;; this section carries its own %pp-* equivalents built on the
+;;; %regtest-node-fixture + %with-regtest primitives (mining-tests.lisp).
+;;; ==============================================================
+
+(defvar *pp-counter* 0)
+
+(defun %pp-optrue-address ()
+  (bitcoin-lisp.crypto:encode-p2sh-address
+   (bitcoin-lisp.crypto:hash160 +optrue-redeem+) :regtest))
+
+(defun %pp-fixture (suffix &key (keypool 5))
+  "A regtest node at genesis with a wallet manager + genesis block stored."
+  (let* ((id (format nil "~A-~D-~D" suffix (get-universal-time) (incf *pp-counter*)))
+         (node (%regtest-node-fixture (format nil "pp-~A" id)))
+         (wallet-dir (merge-pathnames (format nil "pp-wallet-~A/" id)
+                                      (uiop:temporary-directory))))
+    (bitcoin-lisp.storage:store-block
+     (bitcoin-lisp::node-block-store node)
+     (bitcoin-lisp.storage:make-genesis-block :regtest))
+    (setf (bitcoin-lisp::node-wallet-manager node)
+          (bitcoin-lisp.rpc::make-wallet-manager
+           :data-directory wallet-dir :network :regtest :keypool-size keypool))
+    node))
+
+(defmacro %with-pp-node ((node suffix) &body body)
+  "BODY under regtest bindings with NODE a %pp-fixture and bitcoin-lisp::*node*
+bound so the wallet chain hooks fire."
+  `(%with-regtest
+    (let* ((,node (%pp-fixture ,suffix))
+           (bitcoin-lisp::*node* ,node))
+      (unwind-protect (progn ,@body)
+        (ignore-errors
+         (bitcoin-lisp.rpc:close-wallet-manager
+          (bitcoin-lisp::node-wallet-manager ,node)))))))
+
+(defun %pp-mine (node n address)
+  (bitcoin-lisp.rpc::rpc-generatetoaddress node (list n address)))
+
+(defun %pp-fund-wallet (node &key (blocks 1))
+  "createwallet \"w\", mine BLOCKS coinbases to a fresh bech32 (P2WPKH) address,
+mature them. Returns the wallet."
+  (bitcoin-lisp.rpc::rpc-createwallet node '("w"))
+  (let* ((wallet (gethash "w" (bitcoin-lisp.rpc::wallet-manager-wallets
+                               (bitcoin-lisp::node-wallet-manager node))))
+         (address (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "bech32"))))
+    (dotimes (i blocks) (%pp-mine node 1 address))
+    (%pp-mine node 101 (%pp-optrue-address))
+    wallet))
+
+(defun %pp-mempool-tx (node txid)
+  (bitcoin-lisp.rpc::with-node-lock (node)
+    (let* ((mp (bitcoin-lisp::node-mempool node))
+           (e (and mp (bitcoin-lisp.mempool:mempool-get mp txid))))
+      (and e (bitcoin-lisp.mempool:mempool-entry-transaction e)))))
+
+(defun %pp-verify-ok-p (node wallet tx)
+  (bitcoin-lisp.rpc::with-node-lock (node)
+    (bitcoin-lisp.rpc::with-wallet-lock (wallet)
+      (let ((coins (bitcoin-lisp.rpc::%wallet-input-coins node wallet tx)))
+        (nth-value 0 (bitcoin-lisp.rpc::%verify-tx-scripts tx coins))))))
+
+(defun %pp-input-outpoints (tx)
+  (map 'list (lambda (in)
+               (let ((op (bitcoin-lisp.serialization:tx-in-previous-output in)))
+                 (cons (bitcoin-lisp.serialization:outpoint-hash op)
+                       (bitcoin-lisp.serialization:outpoint-index op))))
+       (bitcoin-lisp.serialization:transaction-inputs tx)))
+
+(test pp-walletcreatefundedpsbt-roundtrip
+  "walletcreatefundedpsbt funds an UNSIGNED PSBT (witness_utxo + bip32 derivs per
+input, no sigs); walletprocesspsbt signs + finalizes it into a valid network tx
+that our own script verifier accepts and the mempool relays."
+  (%with-pp-node (node "pp-wcfp")
+    (let ((wallet (%pp-fund-wallet node)))
+      (let* ((bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 42))
+             (dest (%pp-optrue-address))
+             (created (bitcoin-lisp.rpc::rpc-walletcreatefundedpsbt
+                       node (list '() (list (%ht dest 1))
+                                  0 (%ht "fee_rate" 5))))
+             (b64 (%aval "psbt" created)))
+        (is (stringp b64))
+        (is (> (%aval "fee" created) 0))
+        ;; The created PSBT is unsigned: every input has a witness_utxo + bip32
+        ;; derivation but no partial sigs and no final scripts.
+        (let ((psbt (bitcoin-lisp.serialization:decode-psbt b64)))
+          (is (> (length (bitcoin-lisp.serialization:psbt-inputs psbt)) 0))
+          (loop for m across (bitcoin-lisp.serialization:psbt-inputs psbt)
+                do (is-true (bitcoin-lisp.serialization:psbt-map-find
+                             m bitcoin-lisp.serialization:+psbt-in-witness-utxo+))
+                   (is-true (bitcoin-lisp.serialization:psbt-map-find
+                             m bitcoin-lisp.serialization:+psbt-in-bip32+))
+                   (is (null (bitcoin-lisp.serialization:psbt-map-collect
+                              m bitcoin-lisp.serialization:+psbt-in-partial-sig+)))
+                   (is (null (bitcoin-lisp.serialization:psbt-map-find
+                              m bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)))))
+        ;; walletprocesspsbt (defaults: sign + finalize) completes it.
+        (let* ((processed (bitcoin-lisp.rpc::rpc-walletprocesspsbt node (list b64)))
+               (hex (%aval "hex" processed)))
+          (is (eq t (%aval "complete" processed)))
+          (is (stringp hex))
+          (let ((tx (bitcoin-lisp.serialization:parse-tx-payload
+                     (bitcoin-lisp.crypto:hex-to-bytes hex))))
+            (is (%pp-verify-ok-p node wallet tx))
+            ;; The extracted tx relays.
+            (is (stringp (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))))))))))
+
+(test pp-walletprocesspsbt-sign-false-then-sign
+  "walletprocesspsbt with sign=false only fills data (no sigs, incomplete); a
+second call with sign=true (default) completes it."
+  (%with-pp-node (node "pp-signflag")
+    (%pp-fund-wallet node)
+    (let* ((bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 99))
+           (dest (%pp-optrue-address))
+           (b64 (%aval "psbt" (bitcoin-lisp.rpc::rpc-walletcreatefundedpsbt
+                               node (list '() (list (%ht dest 1)) 0 (%ht "fee_rate" 5)))))
+           ;; sign=false, finalize=false: no partial sigs, incomplete.
+           (unsigned (bitcoin-lisp.rpc::rpc-walletprocesspsbt
+                      node (list b64 bitcoin-lisp.rpc:+json-false+ nil nil
+                                 bitcoin-lisp.rpc:+json-false+))))
+      (is (eq bitcoin-lisp.rpc:+json-false+ (%aval "complete" unsigned)))
+      (let ((psbt (bitcoin-lisp.serialization:decode-psbt (%aval "psbt" unsigned))))
+        (loop for m across (bitcoin-lisp.serialization:psbt-inputs psbt)
+              do (is (null (bitcoin-lisp.serialization:psbt-map-collect
+                            m bitcoin-lisp.serialization:+psbt-in-partial-sig+)))))
+      ;; Now sign (defaults) -> complete + extractable.
+      (let ((signed (bitcoin-lisp.rpc::rpc-walletprocesspsbt
+                     node (list (%aval "psbt" unsigned)))))
+        (is (eq t (%aval "complete" signed)))
+        (is (stringp (%aval "hex" signed)))))))
+
+(test pp-bumpfee-rbf-chain
+  "bumpfee rebuilds a higher-feerate replacement re-spending ALL original inputs,
+signs + broadcasts it (RBF-evicting the original), records replaced_by_txid, and
+refuses to bump an already-bumped tx."
+  (%with-pp-node (node "pp-bump")
+    (let ((wallet (%pp-fund-wallet node :blocks 2)))
+      (let* ((bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 7))
+             (dest (%pp-optrue-address))
+             (txid-hex (bitcoin-lisp.rpc::rpc-sendtoaddress
+                        node (list dest 1 nil nil nil nil nil nil nil 5)))
+             (txid (bitcoin-lisp.rpc::parse-hex-hash txid-hex))
+             (orig-tx (%pp-mempool-tx node txid)))
+        (is (not (null orig-tx)))
+        (let ((orig-inputs (%pp-input-outpoints orig-tx))
+              (result (bitcoin-lisp.rpc::rpc-bumpfee
+                       node (list txid-hex (%ht "fee_rate" 20)))))
+          (let* ((new-txid-hex (%aval "txid" result))
+                 (new-tx (%pp-mempool-tx node (bitcoin-lisp.rpc::parse-hex-hash new-txid-hex))))
+            (is (stringp new-txid-hex))
+            (is (> (%aval "fee" result) (%aval "origfee" result)))
+            (is (equalp #() (%aval "errors" result)))
+            ;; Replacement is in the mempool (accepted => RBF evicted the original).
+            (is (not (null new-tx)))
+            (is (null (%pp-mempool-tx node txid)))
+            ;; All original inputs are re-spent.
+            (dolist (op orig-inputs)
+              (is-true (member op (%pp-input-outpoints new-tx) :test #'equalp)))
+            ;; Replacement verifies against the exact spent scripts.
+            (is (%pp-verify-ok-p node wallet new-tx))
+            ;; Original tx is marked replaced.
+            (let ((owtx (bitcoin-lisp.rpc::wallet-get-wallet-tx wallet txid)))
+              (is (string= new-txid-hex
+                           (cdr (assoc "replaced_by_txid"
+                                       (bitcoin-lisp.rpc::wallet-tx-map-value owtx)
+                                       :test #'string=)))))
+            ;; Cannot bump the same (already-bumped) tx again.
+            (signals bitcoin-lisp.rpc::rpc-error
+              (bitcoin-lisp.rpc::rpc-bumpfee node (list txid-hex (%ht "fee_rate" 40))))))))))
+
+(test pp-psbtbumpfee-unsigned
+  "psbtbumpfee returns an UNSIGNED PSBT of the replacement without broadcasting;
+the original stays in the mempool, and walletprocesspsbt completes the PSBT."
+  (%with-pp-node (node "pp-psbtbump")
+    (%pp-fund-wallet node :blocks 2)
+    (let* ((bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 13))
+           (dest (%pp-optrue-address))
+           (txid-hex (bitcoin-lisp.rpc::rpc-sendtoaddress
+                      node (list dest 1 nil nil nil nil nil nil nil 5)))
+           (txid (bitcoin-lisp.rpc::parse-hex-hash txid-hex))
+           (result (bitcoin-lisp.rpc::rpc-psbtbumpfee
+                    node (list txid-hex (%ht "fee_rate" 20))))
+           (b64 (%aval "psbt" result)))
+      (is (stringp b64))
+      (is (> (%aval "fee" result) (%aval "origfee" result)))
+      ;; The returned PSBT is unsigned but carries witness_utxo per input.
+      (let ((psbt (bitcoin-lisp.serialization:decode-psbt b64)))
+        (loop for m across (bitcoin-lisp.serialization:psbt-inputs psbt)
+              do (is (null (bitcoin-lisp.serialization:psbt-map-find
+                            m bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)))
+                 (is (null (bitcoin-lisp.serialization:psbt-map-collect
+                            m bitcoin-lisp.serialization:+psbt-in-partial-sig+)))
+                 (is-true (bitcoin-lisp.serialization:psbt-map-find
+                           m bitcoin-lisp.serialization:+psbt-in-witness-utxo+))))
+      ;; The original is untouched (psbtbumpfee does not broadcast).
+      (is (not (null (%pp-mempool-tx node txid))))
+      ;; walletprocesspsbt completes the replacement PSBT into a network tx.
+      (let ((processed (bitcoin-lisp.rpc::rpc-walletprocesspsbt node (list b64))))
+        (is (eq t (%aval "complete" processed)))
+        (is (stringp (%aval "hex" processed)))))))
