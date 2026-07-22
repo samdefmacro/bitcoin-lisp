@@ -612,6 +612,40 @@ details.console-json pre { max-height: 340px; }
 }
 .receive-kv { flex: 1; min-width: 260px; }
 
+/* send screen */
+.send-form { margin-bottom: 0.4rem; }
+.send-recipients { display: flex; flex-direction: column; gap: 0.5rem; }
+.send-row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+.send-row input {
+  background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 0.32rem 0.55rem;
+  font: 12px var(--font-mono);
+}
+.send-addr { flex: 3; min-width: 220px; }
+.send-amt { flex: 1; min-width: 120px; }
+.send-rm { flex: none; }
+.send-add { margin: 0.6rem 0 0.2rem; }
+.send-controls {
+  display: flex; gap: 1.2rem; flex-wrap: wrap; align-items: center;
+  margin: 0.7rem 0; padding-top: 0.7rem; border-top: 1px solid var(--line);
+  font-size: 12.5px;
+}
+.send-control { display: flex; gap: 0.4rem; align-items: center; }
+.send-control select {
+  background: var(--panel-2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 0.25rem 0.4rem;
+  font: 12px var(--font-ui);
+}
+.send-review-btn { margin-top: 0.3rem; }
+.send-review, .send-result {
+  margin-top: 0.9rem; padding-top: 0.8rem; border-top: 1px solid var(--line);
+}
+.send-subtitle { font-size: 14px; margin: 0 0 0.5rem; }
+.send-actions { display: flex; gap: 0.9rem; align-items: center; margin-top: 0.7rem; }
+.send-ok { color: var(--good); font-size: 13.5px; margin: 0 0 0.4rem; }
+
 /* history + address book tables share the peers table skeleton via the
    extra `wtx` class; the few overrides live here */
 table.wtx td { white-space: normal; }
