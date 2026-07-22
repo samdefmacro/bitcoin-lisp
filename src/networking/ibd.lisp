@@ -1059,6 +1059,21 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
              (max-height (min (bitcoin-lisp.storage:block-index-entry-height best-known)
                               (1+ window-end)))
              (in-flight (ibd-context-in-flight *ibd-context*))
+             ;; Per-peer service-flag guards (Core FindNextBlocks): a peer that
+             ;; cannot serve witnesses is useless once segwit is active, and a
+             ;; limited (pruned) peer can only serve recent blocks. :ready peers
+             ;; always have services populated — %receive-and-store-version sets
+             ;; peer-services before %await-verack flips the peer to :ready.
+             (services (peer-services peer))
+             (peer-witness-p (logtest services
+                                      bitcoin-lisp.serialization:+node-witness+))
+             (is-limited (and (logtest services
+                                       bitcoin-lisp.serialization:+node-network-limited+)
+                              (not (logtest services
+                                            bitcoin-lisp.serialization:+node-network+))))
+             (best-known-height (bitcoin-lisp.storage:block-index-entry-height best-known))
+             (segwit-height (bitcoin-lisp.validation:get-segwit-activation-height
+                             bitcoin-lisp:*network*))
              (chain '())       ; peer's chain above last-common, oldest-first
              (result '())
              (advancing t))
@@ -1077,6 +1092,15 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
             ;; marked invalid (invalidateblock) poisons the whole chain above
             ;; it — abort the walk, keeping what we collected below it.
             (when (eq (bitcoin-lisp.storage:block-index-entry-status entry) :invalid)
+              (return-from collect))
+            ;; Core FindNextBlocks (net_processing.cpp:1502-1505): if this peer
+            ;; cannot serve witnesses and segwit is active at this block, we would
+            ;; never download it or its descendants from this peer — abort the walk
+            ;; (keeping what we collected below). On our networks segwit is active
+            ;; for the whole IBD range, so a non-witness peer yields nothing.
+            (when (and (not peer-witness-p)
+                       (>= (bitcoin-lisp.storage:block-index-entry-height entry)
+                           segwit-height))
               (return-from collect))
             (let ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
                   (h (bitcoin-lisp.storage:block-index-entry-height entry)))
@@ -1110,7 +1134,14 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
                 (t
                  (setf advancing nil)
                  (when (> h window-end) (return-from collect))
-                 (unless (gethash hash in-flight)
+                 ;; Core FindNextBlocks (net_processing.cpp:1533-1536): never ask a
+                 ;; limited (pruned) peer for a block deeper than it retains —
+                 ;; NODE_NETWORK_LIMITED_MIN_BLOCKS-2 = 286 below the peer's best
+                 ;; known. Skip it but keep walking toward the peer's tip, where
+                 ;; shallower blocks become fetchable.
+                 (unless (or (gethash hash in-flight)
+                             (and is-limited
+                                  (>= (- best-known-height h) 286)))
                    (push hash result)
                    (when (>= (length result) count)
                      (return-from collect))))))))
@@ -1297,22 +1328,6 @@ TIMEOUT-SECONDS overrides the per-block timeout (shorter near the tip)."
     (length timed-out)))
 
 ;;;; Multi-Peer Request Distribution
-
-(defun find-peer-blocking-progress (next-height chain-state)
-  "Return the peer that holds the in-flight request for NEXT-HEIGHT, if any.
-   This is the one peer whose delivery would unblock chain progress; Bitcoin
-   Core's stalling-peer detection focuses solely on this peer."
-  (declare (ignore chain-state))
-  (when *ibd-context*
-    (let ((found nil))
-      (maphash (lambda (hash peer-time)
-                 (declare (ignore hash))
-                 (let* ((entry-height (gethash hash
-                                               (ibd-context-pending-blocks *ibd-context*))))
-                   (when (and entry-height (= entry-height next-height))
-                     (setf found (car peer-time)))))
-               (ibd-context-in-flight *ibd-context*))
-      found)))
 
 (defun count-peer-in-flight (peer)
   "Count in-flight block requests assigned to PEER."
@@ -1896,6 +1911,16 @@ a second download cursor for its [tip .. snapshot-base] range."
     ;; Phase 2: Download and validate blocks
     (set-ibd-state :syncing-blocks)
 
+    ;; Prime per-peer block availability across the whole ready set before the
+    ;; per-peer download walk runs. Phase 1 only learned the bulk header-sync
+    ;; peer's tip; the others' best-known-block stays empty until they happen to
+    ;; announce, so find-blocks-to-download-for-peer cannot tell which peers
+    ;; serve the tip. One getheaders per ready peer, on a locator one block back
+    ;; from our header tip (Core's pprev trick), makes a caught-up peer reply
+    ;; with the single header we already have — the already-known fast path
+    ;; records its best-known cheaply, no block transfer.
+    (broadcast-initial-getheaders peers chain-state)
+
     ;; Queue all blocks from current height to header tip
     (let ((header-tip (ibd-context-header-tip-height ctx)))
       ;; Reflect the real chain tip in the progress reporter — `target-height`
@@ -2115,39 +2140,58 @@ a second download cursor for its [tip .. snapshot-base] range."
           (set-ibd-state :idle)))
     (ibd-context-blocks-received ctx)))
 
-(defun build-header-locator (chain-state)
-  "Build a block locator starting from the highest header in the index.
-Used during IBD when the validated block tip lags behind the header tip."
+(defun %best-header-entry (chain-state)
+  "The highest-height entry in the block index (the header tip)."
   (let ((best-entry nil)
         (best-height 0))
-    ;; Find the highest header-valid entry
     (maphash (lambda (hash entry)
                (declare (ignore hash))
                (when (> (bitcoin-lisp.storage:block-index-entry-height entry) best-height)
                  (setf best-height (bitcoin-lisp.storage:block-index-entry-height entry))
                  (setf best-entry entry)))
              (bitcoin-lisp.storage::chain-state-block-index chain-state))
-    (if best-entry
-        ;; Walk back through prev-entry links
-        (let ((locator '())
-              (entry best-entry)
-              (step 1)
-              (count 0))
-          (loop while entry
-                do (push (bitcoin-lisp.storage:block-index-entry-hash entry) locator)
-                   (incf count)
-                   (when (> count 10)
-                     (setf step (* step 2)))
-                   (let ((moved nil))
-                     (loop repeat step
-                           while (bitcoin-lisp.storage:block-index-entry-prev-entry entry)
-                           do (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
-                              (setf moved t))
-                     (unless moved
-                       (return))))
-          (nreverse locator))
-        ;; No entries - use genesis
-        (bitcoin-lisp.storage:build-block-locator chain-state))))
+    best-entry))
+
+(defun %locator-from-entry (entry chain-state)
+  "Exponential block locator walking back from ENTRY through prev-entry links;
+the genesis locator when ENTRY is NIL."
+  (if entry
+      ;; Walk back through prev-entry links
+      (let ((locator '())
+            (e entry)
+            (step 1)
+            (count 0))
+        (loop while e
+              do (push (bitcoin-lisp.storage:block-index-entry-hash e) locator)
+                 (incf count)
+                 (when (> count 10)
+                   (setf step (* step 2)))
+                 (let ((moved nil))
+                   (loop repeat step
+                         while (bitcoin-lisp.storage:block-index-entry-prev-entry e)
+                         do (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e))
+                            (setf moved t))
+                   (unless moved
+                     (return))))
+        (nreverse locator))
+      ;; No entries - use genesis
+      (bitcoin-lisp.storage:build-block-locator chain-state)))
+
+(defun build-header-locator (chain-state)
+  "Build a block locator starting from the highest header in the index.
+Used during IBD when the validated block tip lags behind the header tip."
+  (%locator-from-entry (%best-header-entry chain-state) chain-state))
+
+(defun build-header-locator-pprev (chain-state)
+  "Block locator starting ONE BLOCK BACK from the header tip (Core's
+GetLocator(pindexBestHeader->pprev)). A caught-up peer answers a getheaders on
+this locator with the single header it thinks comes next — our own best header,
+which we already have — so the already-known fast path in ingest-headers-from-
+peer runs update-block-availability and records the peer's best-known cheaply,
+transferring nothing. Falls back to the header-tip locator at genesis."
+  (let* ((best (%best-header-entry chain-state))
+         (pprev (and best (bitcoin-lisp.storage:block-index-entry-prev-entry best))))
+    (%locator-from-entry (or pprev best) chain-state)))
 
 (defun request-headers-for-ibd (peer chain-state)
   "Request headers using a locator built from the header tip, not the validated block tip."
@@ -2155,6 +2199,26 @@ Used during IBD when the validated block tip lags behind the header tip."
     (bitcoin-lisp.networking:send-message
      peer
      (bitcoin-lisp.serialization:make-getheaders-message locator))))
+
+(defun broadcast-initial-getheaders (peers chain-state)
+  "At the start of block download, send one getheaders — locator one block back
+from our header tip — to every ready peer. Phase 1 learned only the bulk
+header-sync peer's tip; every other peer has an empty best-known-block, so the
+per-peer download walk (find-blocks-to-download-for-peer) cannot yet tell which
+of them serve the tip. A caught-up peer replies with our own best header
+(already-known fast path -> update-block-availability), setting its best-known
+without any block transfer; a peer slightly ahead sends the few new headers it
+has. Core sends this pprev-locator getheaders on peer/sync events; here it
+primes availability for the whole ready set as Phase 2 begins. Errors are
+isolated per peer so one dead socket cannot abort the sweep."
+  (let ((locator (build-header-locator-pprev chain-state)))
+    (when locator
+      (dolist (peer peers)
+        (when (eq (peer-state peer) :ready)
+          (ignore-errors
+           (send-message
+            peer
+            (bitcoin-lisp.serialization:make-getheaders-message locator))))))))
 
 (defun %store-validated-headers (peer chain-state headers count-fn label)
   "Contextually validate HEADERS (validate-header-chain) and add the valid
@@ -2773,17 +2837,6 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
 
     (let ((height (bitcoin-lisp.storage:block-index-entry-height entry))
           (current-height (bitcoin-lisp.storage:current-height chain-state)))
-
-      ;; Forensic capture: store the block to disk BEFORE validation if
-      ;; *forensic-store-from-height* is set and we're at-or-above that
-      ;; height. Lets us analyze blocks our validator rejects.
-      (when (and *forensic-store-from-height*
-                 (>= height *forensic-store-from-height*))
-        (handler-case
-            (bitcoin-lisp.storage:store-block block-store block)
-          (error (e)
-            (bitcoin-lisp:log-warn "Forensic store failed for block ~D: ~A"
-                                   height e))))
 
       ;; Skip blocks we already applied (duplicates from multiple peers).
       ;; Distinct from competing-fork blocks at h ≤ current-height: those

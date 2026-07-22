@@ -223,9 +223,10 @@ second chainstate (single-chainstate startup, dir left for later adoption)."
 
 (test assumeutxo-dual-cursor-queueing
   "queue-historical-blocks queues exactly the target-ancestor path above the
-historical tip (never sibling forks); get-next-blocks-to-request windows the
-two ranges independently and orders tip-range blocks first (Core fills
-FindNextBlocksToDownload slots before TryDownloadingHistoricalBlocks)."
+historical tip (never sibling forks); find-historical-blocks-to-download windows
+the historical range per peer, yielding [hist-tip+1 .. base] only to peers whose
+chain contains the base (Core fills FindNextBlocksToDownload slots before
+TryDownloadingHistoricalBlocks)."
   (let* ((g (%au-entry (%au-hash 0) 0 nil :status :valid))
          (e1 (%au-entry (%au-hash 1) 1 g :status :valid))
          (e2 (%au-entry (%au-hash 2) 2 e1))
