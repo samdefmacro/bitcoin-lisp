@@ -289,6 +289,39 @@ the unavoidable-case fallback."
 init.cpp:1683 FormatSubVersion). -uacomment appends sanitized comments:
 \"/bitcoin-lisp:0.1.0(comment1; comment2)/\".")
 
+(defparameter *build-git-rev* "unknown"
+  "Short git revision of the running build. The launcher (scripts/run-node.sh)
+stamps it via STAMP-BUILD-GIT-REV after loading the system and before the node
+advertises, so getnetworkinfo and the version handshake identify exactly which
+commit is deployed. Kept separate from the version literal — rather than baked
+in at compile time — so the launcher (or a future save-image build step) can
+set it without a recompile. The default \"unknown\" leaves the subversion at
+its plain BIP14 form.")
+
+(defun subversion-git-comment ()
+  "The build git rev as a BIP14 subversion comment token \"g<rev>\", or NIL
+when unstamped (*build-git-rev* = \"unknown\"). The leading 'g' (git-describe
+convention) over a hex rev is alphanumeric, so it is inherently uacomment-safe
+and cannot overflow the +max-subversion-length+ cap."
+  (unless (string= *build-git-rev* "unknown")
+    (concatenate 'string "g" *build-git-rev*)))
+
+(defun stamp-build-git-rev (rev)
+  "Record REV as the running build's git revision and fold it into *user-agent*
+as a leading BIP14 comment (\"/bitcoin-lisp:0.1.0(g<rev>)/\"). The launcher
+calls this once, after load and before start-node. A NIL, empty, or \"unknown\"
+REV leaves the plain \"/bitcoin-lisp:0.1.0/\" subversion. Assumes no -uacomment
+is in play (the supervisor path); config parsing of -uacomment re-derives
+*user-agent* via FORMAT-SUBVERSION, which also folds in the stamped rev."
+  (when (and rev (plusp (length rev)) (not (string= rev "unknown")))
+    (setf *build-git-rev* rev))
+  (let ((comment (subversion-git-comment)))
+    (setf *user-agent*
+          (if comment
+              (format nil "/bitcoin-lisp:0.1.0(~A)/" comment)
+              "/bitcoin-lisp:0.1.0/")))
+  *user-agent*)
+
 (defun make-version-message-bytes (&key (version +protocol-version+)
                                         (services +node-network+)
                                         (timestamp (get-unix-time))
