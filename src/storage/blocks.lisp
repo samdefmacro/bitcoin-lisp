@@ -90,17 +90,37 @@ Returns the block hash."
 
 (defun get-block (store hash)
   "Retrieve a block by its hash.
-Returns the bitcoin-block structure, or NIL if not found."
+Returns the bitcoin-block structure, or NIL if not found.
+
+A corrupt / truncated / unreadable block file is treated as ABSENT and PRUNED
+rather than allowed to signal. read-bitcoin-block raises on a malformed body;
+before this guard that raise escaped through the reorg/download paths
+(%best-completable-reorg-target, perform-reorg, retry-best-reorg-candidate) up
+to the sync-thread top level and TERMINATED the sync thread — a live-but-wedged
+zombie until restart (a real risk given this node's history of corrupt block/
+undo files, e.g. a crash mid store-block leaves a truncated-but-indexed .blk).
+Pruning is essential, not optional: returning NIL alone leaves probe-file true
+so the block is never re-requested (silent permanent stall); deleting the file
+makes probe + index agree so the normal download path re-fetches it and
+store-block (:if-exists :supersede) overwrites. Every caller already treats NIL
+as absent, so none relies on the raise."
   (let ((path (block-file-path store hash)))
     (when (probe-file path)
-      (with-open-file (stream path
-                              :direction :input
-                              :element-type '(unsigned-byte 8))
-        (let ((data (make-array (file-length stream)
-                                :element-type '(unsigned-byte 8))))
-          (read-sequence data stream)
-          (flexi-streams:with-input-from-sequence (in data)
-            (bitcoin-lisp.serialization:read-bitcoin-block in)))))))
+      (handler-case
+          (with-open-file (stream path
+                                  :direction :input
+                                  :element-type '(unsigned-byte 8))
+            (let ((data (make-array (file-length stream)
+                                    :element-type '(unsigned-byte 8))))
+              (read-sequence data stream)
+              (flexi-streams:with-input-from-sequence (in data)
+                (bitcoin-lisp.serialization:read-bitcoin-block in))))
+        (error (e)
+          (bitcoin-lisp:log-warn
+           "CORRUPT BLOCK file for ~A (~A) — pruning for re-download"
+           (bitcoin-lisp.crypto:bytes-to-hex hash) e)
+          (ignore-errors (prune-block store hash))
+          nil)))))
 
 (defun block-exists-p (store hash)
   "Check if a block with HASH exists in storage."
