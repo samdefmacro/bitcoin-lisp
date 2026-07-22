@@ -250,21 +250,32 @@ FindNextBlocksToDownload slots before TryDownloadingHistoricalBlocks)."
         (is (null (gethash (%au-hash 3 99) pending)))
         ;; Re-queueing is idempotent.
         (is (= 0 (bitcoin-lisp.networking::queue-historical-blocks hist)))
-        ;; Add tip-range pending blocks (heights above the base).
-        (setf (gethash (%au-hash 100) pending) 100
-              (gethash (%au-hash 101) pending) 101)
         ;; Configure the dual-cursor context.
         (setf (bitcoin-lisp.networking::ibd-context-historical-chain-state ctx) hist
               (bitcoin-lisp.networking::ibd-context-snapshot-base-entry ctx) e5)
-        ;; Tip range first (100, 101), then historical ascending (2..5).
-        (let ((order (mapcar (lambda (h) (gethash h pending))
-                             (bitcoin-lisp.networking::get-next-blocks-to-request 10 99))))
-          (is (equal '(100 101 2 3 4 5) order)))
-        ;; A tight historical window: with the historical tip at 1 the
-        ;; window is min(base, 1+window) = base here; blocks beyond a
-        ;; far-below-base tip would be excluded (exercised via the sort
-        ;; result above staying within base).
-        (is (= 6 (length (bitcoin-lisp.networking::get-next-blocks-to-request 10 99))))))))
+        ;; Historical download now comes from the per-peer walk
+        ;; (find-historical-blocks-to-download, Core
+        ;; TryDownloadingHistoricalBlocks): a peer whose best-known chain
+        ;; contains the base yields exactly the target-ancestor range
+        ;; [hist-tip+1 .. base] ascending — e2..e5, sibling s3 excluded —
+        ;; and a peer on a chain without the base yields nothing.
+        (let ((probe-store (bitcoin-lisp.storage::make-block-store
+                            :base-path #p"/nonexistent/au-hist-walk/"))
+              (p-base (bitcoin-lisp.networking::make-peer))
+              (p-fork (bitcoin-lisp.networking::make-peer)))
+          (setf (bitcoin-lisp.networking::peer-best-known-block-hash p-base)
+                (%au-hash 5)
+                (bitcoin-lisp.networking::peer-best-known-block-hash p-fork)
+                (%au-hash 3 99))
+          (let ((got (bitcoin-lisp.networking::find-historical-blocks-to-download
+                      p-base hist probe-store 10)))
+            (is (equalp (list (%au-hash 2) (%au-hash 3) (%au-hash 4) (%au-hash 5))
+                        got)))
+          ;; Budget respected: only the first COUNT ascending hashes.
+          (is (= 2 (length (bitcoin-lisp.networking::find-historical-blocks-to-download
+                            p-base hist probe-store 2))))
+          (is (null (bitcoin-lisp.networking::find-historical-blocks-to-download
+                     p-fork hist probe-store 10))))))))
 
 (test assumeutxo-base-in-chain-peer-filter
   "peer-chain-contains-base-p admits only peers whose best-known chain
