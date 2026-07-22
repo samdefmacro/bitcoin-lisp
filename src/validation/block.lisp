@@ -1982,6 +1982,93 @@ perform-reorg's success phase, so there is nothing to undo here."
    (bitcoin-lisp.storage:block-index-entry-hash old-tip-entry)
    (bitcoin-lisp.storage:block-index-entry-height old-tip-entry)))
 
+;;;; ---------------------------------------------------------------------------
+;;;; Deterministic-invalid classification (Core BLOCK_FAILED_VALID / _CHILD)
+;;;;
+;;;; When a FORK block fails validation during a reorg we mark it :invalid — and
+;;;; BLOCK_FAILED_CHILD its whole descendant subtree — ONLY when the failure is a
+;;;; DETERMINISTIC CONSENSUS verdict that a clean re-download can never change.
+;;;; Poisoning a RECOVERABLE block would permanently wedge the node (a witness-
+;;;; stripped or corrupt-on-disk body, re-fetched clean, would validate) — the
+;;;; exact failure class this project has spent months fighting. So the rule is a
+;;;; tight ALLOWLIST: anything not explicitly listed stays TRANSIENT and is never
+;;;; poisoned (a too-narrow list merely degrades to the pre-item behavior of
+;;;; retrying; a too-broad list re-wedges the node — so we err narrow).
+;;;;
+;;;; The allowlist is exactly the CONTEXTUAL consensus checks (Core
+;;;; ContextualCheckBlock + ConnectBlock) that depend SOLELY on data the block
+;;;; hash authenticates — txid-committed transaction bytes — plus the chain's own
+;;;; structure (heights, the fork's UTXO set, MTP). Two properties make each safe:
+;;;;   1. For a fork block these run for the FIRST time at reorg — it was stored
+;;;;      after only CONTEXT-FREE / CheckBlock validation (see validate-block's
+;;;;      :context-free-only path and protocol.lisp accept-downloaded-block), so a
+;;;;      failure here is a genuine NEW verdict, not a re-run of a store-time check.
+;;;;   2. Every input to the check is committed by the header / merkle root, so a
+;;;;      clean re-download yields the byte-identical block and the identical
+;;;;      failure — the block is permanently, deterministically invalid.
+;;;;
+;;;; DELIBERATELY EXCLUDED (kept TRANSIENT), each because it could fire on a
+;;;; RECOVERABLE block:
+;;;;   * Every CheckBlock / structural / header / merkle / weight / size / legacy-
+;;;;     sigops failure (:bad-merkle-root, :bad-txns-duplicate, :no-transactions,
+;;;;     :first-tx-not-coinbase, :multiple-coinbase, :block-too-heavy,
+;;;;     :block-too-large, :bad-blk-sigops, the validate-transaction-structure
+;;;;     keywords, every validate-block-header keyword, ...). A fork block ALREADY
+;;;;     PASSED these when it was stored; failing one now means the on-disk bytes
+;;;;     changed = corruption = a re-download fixes it. (:bad-merkle-root is also
+;;;;     THE canonical corrupt-body signal.) get-block already prunes a body that
+;;;;     fails to deserialize, so such a block surfaces as MISSING, not here.
+;;;;   * Script failures (:script-failed), witness-commitment failures
+;;;;     (:bad-witness-nonce-size, :bad-witness-merkle-match, :unexpected-witness)
+;;;;     and the CONTEXTUAL sigop budget (:too-many-sigops). These consume WITNESS
+;;;;     bytes, which the block hash does NOT commit; a corrupt-but-present witness
+;;;;     (deserializes cleanly, passes merkle) would fail them yet re-download
+;;;;     clean. Witness-STRIPPED bodies are self-healed before PHASE B, but
+;;;;     corrupt-PRESENT witnesses are not — so every witness-dependent verdict
+;;;;     stays transient. Cost: a fork invalid ONLY by a bad signature is
+;;;;     soft-rejected (retry-best-reorg-candidate's bounded rejected-set) instead
+;;;;     of poisoned — redundant work, never a wedge (== pre-item behavior).
+;;;;   * The control keywords the reorg machinery itself returns
+;;;;     (:corrupt-undo, :reorg-refused, :weaker-chain, :unknown-parent,
+;;;;     :reorg-failed, :block-missing, :block-not-found) — all transient.
+
+(defparameter *deterministic-invalid-block-errors*
+  '(:duplicate-txid       ; BIP30: block re-creates a still-unspent txid
+    :missing-input        ; spends an output absent from the fork's UTXO set
+    :coinbase-not-mature  ; spends a coinbase before +coinbase-maturity+
+    :insufficient-funds   ; a tx's outputs exceed its inputs
+    :non-final-tx         ; IsFinalTx against the fork height / MTP
+    :bad-sequence-lock    ; BIP68 relative locktime not satisfied
+    :bad-coinbase-height  ; BIP34 coinbase-height prefix mismatch
+    :coinbase-too-large)  ; coinbase pays more than subsidy + fees
+  "Allowlist of VALIDATE-BLOCK error keywords that are DETERMINISTIC consensus
+verdicts — decided purely from txid-committed data + chain structure, never from
+witness bytes, and never a re-run of a CheckBlock test the block already passed
+at store time. A fork block failing one of these is permanently invalid
+regardless of any re-download, so it (and its descendants) may be marked
+:invalid. Every other keyword is deliberately excluded — see the section comment
+above for why each exclusion could otherwise poison a recoverable block.")
+
+(defun %deterministic-consensus-failure-p (error)
+  "T iff ERROR is a deterministic consensus verdict (member of
+*deterministic-invalid-block-errors*) — i.e. safe to permanently mark the failing
+block :invalid. Any other value — a transient control keyword, a corrupt-body /
+witness-dependent failure, or an unrecognized keyword — returns NIL, defaulting
+to the SAFE non-poisoning (recoverable) behavior."
+  (and (keywordp error)
+       (member error *deterministic-invalid-block-errors*)
+       t))
+
+(defun %mark-block-subtree-invalid (chain-state entry)
+  "Mark ENTRY and every block-index entry descending from it :invalid — Core
+BLOCK_FAILED_VALID on ENTRY plus BLOCK_FAILED_CHILD on the doomed subtree — so
+the per-peer download walk aborts above it (ibd find-blocks-to-download-for-peer),
+the deep-reorg candidate scan prunes it (%best-completable-reorg-target), and the
+best-header / best-valid-tip scans skip it. Idempotent. block-index-descendants
+includes ENTRY itself."
+  (dolist (e (block-index-descendants chain-state entry))
+    (setf (bitcoin-lisp.storage:block-index-entry-status e) :invalid)))
+
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
                       &key tx-index fee-estimator recent-rejects mempool skip-scripts)
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
@@ -2167,6 +2254,20 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
                   (bitcoin-lisp:log-error
                    "REORG ABORTED at height ~D: fork block failed validation (~A). Rolling back to original chain."
                    height error)
+                  ;; BLOCK_FAILED_VALID / _CHILD: only when this is a DETERMINISTIC
+                  ;; consensus verdict (never a corrupt-body / witness-dependent /
+                  ;; transient artifact — see %deterministic-consensus-failure-p),
+                  ;; poison this fork block and its whole descendant subtree BEFORE
+                  ;; the rollback, so the download walk aborts above it and the
+                  ;; deep-reorg candidate scan prunes it — the doomed subtree is
+                  ;; never re-requested or re-attempted. Marking before the rollback
+                  ;; is safe: %rollback-partial-reorg only resets the CONNECTED
+                  ;; ancestors (-> :header-valid) and the re-applied original chain
+                  ;; (-> :valid); ENTRY (never connected, this is the first failure)
+                  ;; and its descendants (all strictly above it, not yet processed)
+                  ;; are in neither list, so the :invalid marks survive.
+                  (when (%deterministic-consensus-failure-p error)
+                    (%mark-block-subtree-invalid chain-state entry))
                   (%rollback-partial-reorg chain-state block-store utxo-set
                                            connected to-disconnect old-tip-entry)
                   (return-from perform-reorg (values nil error))))
@@ -2559,6 +2660,22 @@ can neither wedge on an equal-work sibling nor advance past the base."
                            (bitcoin-lisp:log-error
                             "Incoming block failed validation after reorg (~A); reverting to original chain"
                             error)
+                           ;; BLOCK_FAILED_VALID / _CHILD: only on a DETERMINISTIC
+                           ;; consensus verdict (never a corrupt-body / witness-
+                           ;; dependent / transient artifact), poison the incoming
+                           ;; block and any indexed descendants so it is never
+                           ;; re-activated or extended. The revert below cannot
+                           ;; clobber this: the incoming block was never connected,
+                           ;; and it sits above the reverted fork on neither reorg
+                           ;; side.
+                           (when (%deterministic-consensus-failure-p error)
+                             (let ((this-entry
+                                     (bitcoin-lisp.storage:get-block-index-entry
+                                      chain-state
+                                      (bitcoin-lisp.serialization:block-header-hash
+                                       header))))
+                               (when this-entry
+                                 (%mark-block-subtree-invalid chain-state this-entry))))
                            (let ((fork-tip (bitcoin-lisp.storage:get-block-index-entry
                                             chain-state
                                             (bitcoin-lisp.storage:best-block-hash
