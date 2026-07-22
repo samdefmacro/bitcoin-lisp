@@ -2835,7 +2835,11 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                   ;; Stored, doesn't yet outweigh the tip: note it so the
                   ;; per-cycle retry re-evaluates once its fork completes
                   ;; (the crossover-at-or-below-tip case — F3).
-                  ((eq error :weaker-chain)
+                  ;; :corrupt-undo is our own disconnect-side undo fault, not
+                  ;; the incoming block's — note it as a candidate (the retry
+                  ;; below re-attempts once the undo is re-derived) rather than
+                  ;; blaming the innocent block.
+                  ((member error '(:weaker-chain :corrupt-undo))
                    (note-reorg-candidate entry chain-state))
                   ;; Outweighs but intermediate bodies missing: re-queue the
                   ;; hole (cursors rewound) and note for retry.
@@ -2906,7 +2910,13 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                 ;; only ABOVE here later; record it as a reorg candidate so
                 ;; the per-cycle retry can trigger the reorg once complete
                 ;; (fixes the crossover-at-or-below-tip stall).
-                ((eq error :weaker-chain)
+                ;; :corrupt-undo is our own disconnect-side undo fault, not the
+                ;; incoming block's — route it like a refused reorg (note the
+                ;; candidate + retry once the undo is re-derived) instead of
+                ;; handle-validation-failure, which would blame the innocent
+                ;; block and burn it through +max-block-revalidation-attempts+
+                ;; pointless re-downloads.
+                ((member error '(:weaker-chain :corrupt-undo))
                  (note-reorg-candidate entry chain-state)
                  (retry-best-reorg-candidate chain-state block-store utxo-set
                                              :fee-estimator fee-estimator

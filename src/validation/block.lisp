@@ -2513,9 +2513,12 @@ can neither wedge on an equal-work sibling nor advance past the base."
                                :mempool mempool
                                :skip-scripts skip-scripts)
               (cond
-                ;; A fork block failed validation; perform-reorg rolled the
-                ;; chain back to its original tip. DETAIL is the error keyword.
-                ;; Don't re-queue — the fork is invalid, not incomplete.
+                ;; perform-reorg refused with a keyword DETAIL: either a fork
+                ;; block failed validation (chain rolled back to the original
+                ;; tip), or a pre-mutation refusal (:corrupt-undo — our own
+                ;; disconnect-side undo is missing/corrupt, nothing mutated).
+                ;; Either way don't re-queue: the fork is invalid or the fault
+                ;; is local, not an incomplete download.
                 ((and (null reorg-ok) (keywordp detail))
                  (values nil detail))
                 ;; Reorg refused for missing fork blocks. chain-state and
