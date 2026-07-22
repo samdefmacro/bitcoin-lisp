@@ -897,30 +897,57 @@ Returns the number of new headers added."
                      (bits (bitcoin-lisp.serialization:block-header-bits header))
                      (new-work (bitcoin-lisp.storage:calculate-chain-work
                                 bits prev-work)))
-                ;; Anti-DoS: when already synced past the floor, drop headers
-                ;; whose chain is still below it (a fresh low-work fork an
-                ;; attacker is trying to plant). Legitimate near-tip forks have
-                ;; chain-work far above the floor and are unaffected.
-                (unless (and past-min-work (< new-work min-work))
-                  (let ((entry (bitcoin-lisp.storage:make-block-index-entry
-                                :hash hash
-                                :height new-height
-                                :header header
-                                :prev-entry prev-entry
-                                :chain-work new-work
-                                :status :header-valid)))
-                    (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
-                    (push (cons hash new-height) newly-added)
-                    (incf added)
-                    ;; Track header tip height in IBD context
-                    (when (> new-height best-header-height)
-                      (setf best-header-height new-height))
-                    ;; Maintain best-header-WORK incrementally (monotonic max)
-                    ;; so the download-loop gate can key on work, not just
-                    ;; height — a heavier-but-shorter fork must still be fetched.
-                    (when (and *ibd-context*
-                               (> new-work (ibd-context-best-header-work *ibd-context*)))
-                      (setf (ibd-context-best-header-work *ibd-context*) new-work))))))))))
+                (cond
+                  ;; BLOCK_FAILED_CHILD at header admission (Core
+                  ;; AcceptBlockHeader: pindexPrev->nStatus & BLOCK_FAILED_MASK
+                  ;; -> this header is BLOCK_FAILED_CHILD and never becomes a
+                  ;; download candidate). A header extending a block already
+                  ;; marked :invalid is itself permanently invalid, so an
+                  ;; attacker cannot make us fetch a doomed subtree by extending
+                  ;; a known-invalid block with fresh headers. Keep it in the
+                  ;; index marked :invalid — so its OWN descendants are
+                  ;; recognized and FAILED_CHILD'd in turn — but do NOT push it to
+                  ;; newly-added, so it is never queued for download. Safe because
+                  ;; :invalid is ONLY ever set on a deterministic consensus
+                  ;; verdict (see block.lisp %deterministic-consensus-failure-p);
+                  ;; the transient reorg-refusal paths never mark :invalid.
+                  ((eq (bitcoin-lisp.storage:block-index-entry-status prev-entry)
+                       :invalid)
+                   (bitcoin-lisp.storage:add-block-index-entry
+                    chain-state
+                    (bitcoin-lisp.storage:make-block-index-entry
+                     :hash hash
+                     :height new-height
+                     :header header
+                     :prev-entry prev-entry
+                     :chain-work new-work
+                     :status :invalid)))
+                  ;; Anti-DoS: when already synced past the floor, drop headers
+                  ;; whose chain is still below it (a fresh low-work fork an
+                  ;; attacker is trying to plant). Legitimate near-tip forks have
+                  ;; chain-work far above the floor and are unaffected. Matched
+                  ;; with an empty body = dropped (not added, not queued).
+                  ((and past-min-work (< new-work min-work)))
+                  (t
+                   (let ((entry (bitcoin-lisp.storage:make-block-index-entry
+                                 :hash hash
+                                 :height new-height
+                                 :header header
+                                 :prev-entry prev-entry
+                                 :chain-work new-work
+                                 :status :header-valid)))
+                     (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
+                     (push (cons hash new-height) newly-added)
+                     (incf added)
+                     ;; Track header tip height in IBD context
+                     (when (> new-height best-header-height)
+                       (setf best-header-height new-height))
+                     ;; Maintain best-header-WORK incrementally (monotonic max)
+                     ;; so the download-loop gate can key on work, not just
+                     ;; height — a heavier-but-shorter fork must still be fetched.
+                     (when (and *ibd-context*
+                                (> new-work (ibd-context-best-header-work *ibd-context*)))
+                       (setf (ibd-context-best-header-work *ibd-context*) new-work)))))))))))
     ;; Update header tip in IBD context (not the chain-state best-height)
     (when *ibd-context*
       (setf (ibd-context-header-tip-height *ibd-context*) best-header-height)

@@ -2230,3 +2230,305 @@ Bitcoin Core vectors."
            ;; A peer whose best chain does not contain the base: nothing.
            (is (null (bitcoin-lisp.networking::find-historical-blocks-to-download
                       fork-peer cs store 16)))))))))
+
+;;;; ===========================================================================
+;;;; Item #14 — Mark deterministically-invalid fork blocks :invalid + propagate
+;;;;            to descendants (Core BLOCK_FAILED_VALID / BLOCK_FAILED_CHILD)
+;;;;
+;;;; The ENTIRE risk is classification: poison ONLY on a deterministic consensus
+;;;; verdict, NEVER on a transient / corrupt-body / witness-dependent failure that
+;;;; a clean re-download could fix (poisoning a recoverable block re-wedges the
+;;;; node). These tests lock both halves: the positive path (an invalid fork block
+;;;; + its subtree become :invalid and the download walk aborts above it) and the
+;;;; CRITICAL NEGATIVE path (:reorg-refused-with-missing and :corrupt-undo mark
+;;;; NOTHING :invalid and stay recoverable).
+;;;; ===========================================================================
+
+(test item14-classification-allowlist-is-tight
+  "Unit lock on %deterministic-consensus-failure-p: exactly the txid-committed
+contextual consensus verdicts poison; every witness-dependent, structural/merkle,
+CheckBlock, control, unrecognized, or NIL value is TRANSIENT (never poisons)."
+  ;; Every allowlisted keyword classifies as deterministic-invalid.
+  (dolist (k '(:duplicate-txid :missing-input :coinbase-not-mature
+               :insufficient-funds :non-final-tx :bad-sequence-lock
+               :bad-coinbase-height :coinbase-too-large))
+    (is-true (bitcoin-lisp.validation::%deterministic-consensus-failure-p k)
+             "~A must be deterministic-invalid" k))
+  ;; Everything else must be TRANSIENT (recoverable) — must NOT poison. Includes
+  ;; witness-byte-dependent verdicts (script / witness-commitment / contextual
+  ;; sigops), corrupt-body signals (merkle), CheckBlock/structural failures,
+  ;; header keywords, the reorg control keywords, an unknown keyword, and NIL.
+  (dolist (k '(:script-failed :bad-witness-merkle-match :bad-witness-nonce-size
+               :unexpected-witness :too-many-sigops
+               :bad-merkle-root :bad-txns-duplicate :no-transactions
+               :first-tx-not-coinbase :multiple-coinbase :block-too-heavy
+               :block-too-large :bad-blk-sigops :no-inputs :no-outputs
+               :duplicate-inputs :negative-output :bad-prevout-null
+               :corrupt-undo :reorg-refused :weaker-chain :unknown-parent
+               :reorg-failed :block-missing :block-not-found
+               :some-unrecognized-keyword nil))
+    (is (null (bitcoin-lisp.validation::%deterministic-consensus-failure-p k))
+        "~A must be transient (not poisoned)" k)))
+
+(test item14-phase-b-poisons-invalid-fork-and-descendants
+  "perform-reorg PHASE B: a fork block that DETERMINISTICALLY fails validate-block
+(:coinbase-too-large) is marked :invalid, its descendant subtree is
+BLOCK_FAILED_CHILD'd, the reorg rolls back, and ANCESTORS on the fork stay
+recoverable (:header-valid). Directly exercises the perform-reorg poisoning hook."
+  (%with-mainnet-network
+   (multiple-value-bind (cs utxo store genesis-hash)
+       (%make-activate-block-fixture "item14-phaseb")
+     ;; Active chain A: A1 is the tip (height 1), fully valid.
+     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
+     (let* ((a1-hash (bitcoin-lisp.storage:best-block-hash cs))
+            (a1-entry (bitcoin-lisp.storage:get-block-index-entry cs a1-hash))
+            (genesis-entry (bitcoin-lisp.storage:get-block-index-entry cs genesis-hash))
+            (b-hashes (make-test-chain-hashes #xB0 2))
+            (b1-hash (first b-hashes)) (b2-hash (second b-hashes))
+            ;; B3: a descendant header of the invalid B2 (body-less), present only
+            ;; to prove BLOCK_FAILED_CHILD reaches the whole subtree.
+            (b3-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8)
+                                            :initial-element 0)))
+                       (setf (aref h 0) #xB0) (setf (aref h 1) 3) h))
+            (b1-block (make-reorg-test-block genesis-hash b1-hash 1))            ; valid
+            (b2-block (make-reorg-test-block b1-hash b2-hash 2 :value 5000000001)) ; over-value coinbase
+            (b3-block (make-reorg-test-block b2-hash b3-hash 3)))
+       ;; Store B1 + B2 bodies (perform-reorg needs both to-connect bodies present);
+       ;; B3 stays header-only (never connected — it's only a descendant to poison).
+       (bitcoin-lisp.storage:store-block store b1-block)
+       (bitcoin-lisp.storage:store-block store b2-block)
+       (let* ((b1-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b1-hash :height 1 :prev-entry genesis-entry
+                         :chain-work 100 :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b1-block)))
+              (_ (bitcoin-lisp.storage:add-block-index-entry cs b1-entry))
+              (b2-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b2-hash :height 2 :prev-entry b1-entry
+                         :chain-work 200 :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b2-block)))
+              (__ (bitcoin-lisp.storage:add-block-index-entry cs b2-entry))
+              (b3-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b3-hash :height 3 :prev-entry b2-entry
+                         :chain-work 300 :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b3-block))))
+         (declare (ignore _ __))
+         (bitcoin-lisp.storage:add-block-index-entry cs b3-entry)
+         ;; Reorg A1 -> B2. PHASE B connects B1 (valid) then hits B2's over-value
+         ;; coinbase -> deterministic :coinbase-too-large -> poison + rollback.
+         (multiple-value-bind (ok detail)
+             (bitcoin-lisp.validation:perform-reorg cs store utxo a1-entry b2-entry)
+           (is (null ok))
+           (is (eq :coinbase-too-large detail)))
+         ;; B2 :invalid (BLOCK_FAILED_VALID), B3 :invalid (BLOCK_FAILED_CHILD).
+         (is (eq :invalid (bitcoin-lisp.storage:block-index-entry-status b2-entry)))
+         (is (eq :invalid (bitcoin-lisp.storage:block-index-entry-status b3-entry)))
+         ;; B1 (a VALID ancestor of the invalid block) is NOT poisoned — the
+         ;; rollback restored it to :header-valid, recoverable.
+         (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status b1-entry)))
+         ;; Rolled back to chain A: tip + height unchanged, A1 valid.
+         (is (equalp a1-hash (bitcoin-lisp.storage:best-block-hash cs)))
+         (is (= 1 (bitcoin-lisp.storage:current-height cs)))
+         (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status a1-entry)))
+         ;; best-valid-tip skips the poisoned subtree (never names B2/B3).
+         (let ((bvt (bitcoin-lisp.validation::best-valid-tip cs store)))
+           (is-true bvt)
+           (is (not (eq bvt b2-entry)))
+           (is (not (eq bvt b3-entry)))))
+       (clrhash bitcoin-lisp.validation::*block-undo-data*)))))
+
+(test item14-download-walk-aborts-above-invalid-block
+  "Verifies the already-wired hook fires: find-blocks-to-download-for-peer aborts
+the per-peer walk at an :invalid block (Core FindNextBlocks) — blocks BELOW it are
+still offered, the invalid block and everything above it are never re-requested."
+  (%with-regtest
+   (let* ((spk-a (%p2sh-optrue-spk))
+          (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
+          (nb (%regtest-node-fixture "item14-walk-b"))
+          (b-blocks (loop repeat 5 for blk = (%dr-mine-on nb spk-b)
+                          do (%dr-connect nb blk) collect blk))
+          (na (%regtest-node-fixture "item14-walk-a"))
+          (csa (bitcoin-lisp::node-chain-state na))
+          (storea (bitcoin-lisp::node-block-store na))
+          (genesis-hash (bitcoin-lisp.storage:best-block-hash csa)))
+     (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))   ; active branch A, tip A3
+     ;; Add branch-B headers (5, more work) to na, no bodies. Capture B2's entry.
+     (let ((prev (bitcoin-lisp.storage:get-block-index-entry csa genesis-hash))
+           (b-entries '()))
+       (loop for blk in b-blocks for h from 1 to 5
+             do (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                       (bhash (bitcoin-lisp.serialization:block-header-hash hdr))
+                       (work (bitcoin-lisp.storage:calculate-chain-work
+                              (bitcoin-lisp.serialization:block-header-bits hdr)
+                              (bitcoin-lisp.storage:block-index-entry-chain-work prev)))
+                       (e (bitcoin-lisp.storage:make-block-index-entry
+                           :hash bhash :height h :header hdr
+                           :prev-entry prev :chain-work work :status :header-valid)))
+                  (bitcoin-lisp.storage:add-block-index-entry csa e)
+                  (push e b-entries)
+                  (setf prev e)))
+       (setf b-entries (nreverse b-entries))
+       ;; Poison B2 (as perform-reorg would on a deterministic failure).
+       (setf (bitcoin-lisp.storage:block-index-entry-status (second b-entries)) :invalid)
+       (let* ((ctx (bitcoin-lisp.networking::make-ibd))
+              (b-hashes (mapcar (lambda (blk)
+                                  (bitcoin-lisp.serialization:block-header-hash
+                                   (bitcoin-lisp.serialization:bitcoin-block-header blk)))
+                                b-blocks))
+              (svc (logior bitcoin-lisp.serialization:+node-network+
+                           bitcoin-lisp.serialization:+node-witness+))
+              (peer-b (bitcoin-lisp.networking::make-peer :address "1.2.3.4:18333"
+                                                          :services svc)))
+         (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer-b) (fifth b-hashes))
+         (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+           (let ((got (bitcoin-lisp.networking::find-blocks-to-download-for-peer
+                       peer-b csa storea 16)))
+             ;; Only B1 (below the invalid B2) is offered; the walk aborts at B2,
+             ;; so B2..B5 are never requested.
+             (is (= 1 (length got)))
+             (is (equalp (first b-hashes) (first got)))
+             (dolist (h (subseq b-hashes 1 5))
+               (is (null (member h got :test #'equalp)))))))))))
+
+(test item14-header-admission-failed-child
+  "process-headers BLOCK_FAILED_CHILD: a header extending a known-:invalid block
+is admitted marked :invalid (so its own descendants are recognized) but is NEVER
+queued for download; a header on a valid parent is still admitted normally."
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "item14-fc"))
+          (cs (bitcoin-lisp::node-chain-state node))
+          (genesis-hash (bitcoin-lisp.storage:best-block-hash cs))
+          (genesis-entry (bitcoin-lisp.storage:get-block-index-entry cs genesis-hash))
+          ;; X: an :invalid block-index entry directly on genesis.
+          (x-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                    (setf (aref h 0) #xE0) (setf (aref h 1) 1) h))
+          (x-block (make-reorg-test-block genesis-hash x-hash 1))
+          (x-entry (bitcoin-lisp.storage:make-block-index-entry
+                    :hash x-hash :height 1 :prev-entry genesis-entry
+                    :chain-work 50 :status :invalid
+                    :header (bitcoin-lisp.serialization:bitcoin-block-header x-block)))
+          ;; Y: a header extending the INVALID X.
+          (y-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                    (setf (aref h 0) #xE0) (setf (aref h 1) 2) h))
+          (y-header (bitcoin-lisp.serialization:bitcoin-block-header
+                     (make-reorg-test-block x-hash y-hash 2)))
+          ;; V: a header extending VALID genesis (control — normal admission).
+          (v-hash (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+                    (setf (aref h 0) #xF0) (setf (aref h 1) 1) h))
+          (v-header (bitcoin-lisp.serialization:bitcoin-block-header
+                     (make-reorg-test-block genesis-hash v-hash 1))))
+     (bitcoin-lisp.storage:add-block-index-entry cs x-entry)
+     (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
+       (let ((ctx bitcoin-lisp.networking::*ibd-context*))
+         ;; Feed Y (FAILED_CHILD) and V (valid) together. Only V counts as "added".
+         (let ((added (bitcoin-lisp.networking::process-headers (list y-header v-header) cs)))
+           (is (= 1 added)))
+         ;; Y is in the index marked :invalid (BLOCK_FAILED_CHILD), not queued.
+         (let ((y-entry (bitcoin-lisp.storage:get-block-index-entry cs y-hash)))
+           (is-true y-entry)
+           (is (eq :invalid (bitcoin-lisp.storage:block-index-entry-status y-entry)))
+           (is (null (gethash y-hash (bitcoin-lisp.networking::ibd-context-pending-blocks ctx)))))
+         ;; V (valid parent) is admitted :header-valid and queued for download.
+         (let ((v-entry (bitcoin-lisp.storage:get-block-index-entry cs v-hash)))
+           (is-true v-entry)
+           (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status v-entry)))
+           (is-true (gethash v-hash (bitcoin-lisp.networking::ibd-context-pending-blocks ctx)))))))))
+
+(test item14-negative-missing-fork-bodies-not-poisoned
+  "CRITICAL NEGATIVE: a reorg REFUSED because the fork bodies are missing
+(:reorg-refused-with-missing) is TRANSIENT — it marks NOTHING :invalid, so the
+fork stays recoverable once the bodies arrive. Poisoning here would re-wedge the
+node (the exact class of bug this project has fought)."
+  (%with-mainnet-network
+   (multiple-value-bind (cs utxo store genesis-hash)
+       (%make-activate-block-fixture "item14-neg-missing")
+     ;; Active chain A: A1 -> A2 (tip height 2), bodies on disk.
+     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 2))
+     (let* ((a2-hash (bitcoin-lisp.storage:best-block-hash cs))
+            (a2-entry (bitcoin-lisp.storage:get-block-index-entry cs a2-hash))
+            (genesis-entry (bitcoin-lisp.storage:get-block-index-entry cs genesis-hash))
+            (b-hashes (make-test-chain-hashes #xB0 2))
+            (b1-hash (first b-hashes)) (b2-hash (second b-hashes))
+            (b1-block (make-reorg-test-block genesis-hash b1-hash 1))
+            (b2-block (make-reorg-test-block b1-hash b2-hash 2)))
+       ;; Fork B headers ONLY — deliberately store NO bodies (the missing case).
+       (let* ((b1-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b1-hash :height 1 :prev-entry genesis-entry
+                         :chain-work 100 :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b1-block)))
+              (_ (bitcoin-lisp.storage:add-block-index-entry cs b1-entry))
+              (b2-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b2-hash :height 2 :prev-entry b1-entry
+                         :chain-work 200 :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b2-block))))
+         (declare (ignore _))
+         (bitcoin-lisp.storage:add-block-index-entry cs b2-entry)
+         ;; perform-reorg refuses at the missing-body precondition (before PHASE B).
+         (multiple-value-bind (ok detail)
+             (bitcoin-lisp.validation:perform-reorg cs store utxo a2-entry b2-entry)
+           (is (null ok))
+           ;; DETAIL is the missing (hash . height) list, NOT a keyword verdict.
+           (is-true (consp detail))
+           (is (= 2 (length detail))))
+         ;; NOTHING poisoned — both fork entries remain recoverable.
+         (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status b1-entry)))
+         (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status b2-entry)))
+         ;; Active chain untouched.
+         (is (equalp a2-hash (bitcoin-lisp.storage:best-block-hash cs)))
+         (is (= 2 (bitcoin-lisp.storage:current-height cs))))
+       (clrhash bitcoin-lisp.validation::*block-undo-data*)))))
+
+(test item14-negative-corrupt-undo-not-poisoned
+  "CRITICAL NEGATIVE: a reorg refused because a to-DISCONNECT spending block's undo
+is missing/corrupt (:corrupt-undo) is TRANSIENT — a LOCAL fault, not a verdict on
+the fork. It marks NOTHING :invalid; the competing fork stays recoverable."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "item14-neg-corrupt")
+     (let* ((genesis-entry (bitcoin-lisp.storage:get-block-index-entry chain-state genesis-hash))
+            (a-hashes (make-test-chain-hashes #xA0 2))
+            (a1-hash (first a-hashes)) (a2-hash (second a-hashes))
+            (a1-block (make-reorg-test-block genesis-hash a1-hash 1))       ; coinbase-only
+            (a2-block (%make-2tx-reorg-block a1-hash a2-hash 2))            ; SPENDING (tx-count 2)
+            (b-hashes (make-test-chain-hashes #xB0 2))
+            (b1-hash (first b-hashes)) (b2-hash (second b-hashes))
+            (b1-block (make-reorg-test-block genesis-hash b1-hash 1))
+            (b2-block (make-reorg-test-block b1-hash b2-hash 2)))
+       (dolist (blk (list a1-block a2-block b1-block b2-block))
+         (bitcoin-lisp.storage:store-block block-store blk))
+       (let* ((a1-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash a1-hash :height 1 :prev-entry genesis-entry :chain-work 100
+                         :status :valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header a1-block)))
+              (_ (bitcoin-lisp.storage:add-block-index-entry chain-state a1-entry))
+              (a2-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash a2-hash :height 2 :prev-entry a1-entry :chain-work 200
+                         :status :valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header a2-block)))
+              (__ (bitcoin-lisp.storage:add-block-index-entry chain-state a2-entry))
+              (b1-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b1-hash :height 1 :prev-entry genesis-entry :chain-work 150
+                         :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b1-block)))
+              (___ (bitcoin-lisp.storage:add-block-index-entry chain-state b1-entry))
+              (b2-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b2-hash :height 2 :prev-entry b1-entry :chain-work 300
+                         :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b2-block))))
+         (declare (ignore _ __ ___))
+         (bitcoin-lisp.storage:add-block-index-entry chain-state b2-entry)
+         (bitcoin-lisp.storage:update-chain-tip chain-state a2-hash 2)
+         ;; No undo for the spending A2 (the modelled corruption).
+         (clrhash bitcoin-lisp.validation::*block-undo-data*)
+         (multiple-value-bind (ok detail)
+             (bitcoin-lisp.validation:perform-reorg chain-state block-store utxo-set
+                                                    a2-entry b2-entry)
+           (is (null ok))
+           (is (eq detail :corrupt-undo)))
+         ;; NOTHING poisoned — the competing fork B stays recoverable.
+         (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status b1-entry)))
+         (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status b2-entry)))
+         ;; The refused disconnect left the active chain intact (A still valid).
+         (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status a1-entry)))
+         (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status a2-entry)))
+         (is (= 2 (bitcoin-lisp.storage:current-height chain-state)))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
