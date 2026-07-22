@@ -1822,3 +1822,411 @@ the retry, not eager arrival-time activation, is what performs the reorg."
          ;; H5 stays a candidate (still not completable); G3 consumed.
          (is (null (gethash g-hash (bitcoin-lisp.networking::ibd-context-reorg-candidates
                                     bitcoin-lisp.networking::*ibd-context*)))))))))
+
+;;;; ===========================================================================
+;;;; Item #12 — Layer-5 reorg / download REGRESSION SUITE
+;;;;
+;;;; Locks in the just-shipped layer-5 invariants (per-peer chain-aware
+;;;; download, AcceptBlock persist gate, deep-reorg candidate set, witness-
+;;;; strip guard). Every test is deterministic and hermetic — synthetic index
+;;;; topologies or deterministic regtest mining, no Bitcoin Core test vectors.
+;;;; Reuses the layer-5 fixtures (%with-regtest, %regtest-node-fixture,
+;;;; %dr-mine-on/%dr-connect, %make-activate-block-fixture, make-reorg-test-block,
+;;;; make-stripped-reorg-block, make-reorg-hash). Synthetic peers advertise
+;;;; NODE_NETWORK|NODE_WITNESS or the per-peer walk's service guard skips them.
+;;;; ===========================================================================
+
+(test l5-invalid-reorg-candidate-rejected-and-never-retried
+  "Item #12(1): a consensus-INVALID completable fork noted as a reorg candidate
+is PERMANENTLY rejected by retry-best-reorg-candidate — it moves to
+ibd-context-rejected-reorg-candidates, the active tip rolls back untouched, and
+it is never re-selected (note-reorg-candidate refuses to re-add a rejected
+hash). The invalid signal is an over-value coinbase (:coinbase-too-large), the
+same deterministic fork failure as reorg-rejects-fork-carrying-invalid-block."
+  (%with-mainnet-network
+   (multiple-value-bind (cs utxo store genesis-hash)
+       (%make-activate-block-fixture "l5-invalid-cand")
+     ;; Active chain A: a single block A1 on genesis (tip height 1).
+     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
+     (let* ((a1-hash (bitcoin-lisp.storage:best-block-hash cs))
+            (a1-entry (bitcoin-lisp.storage:get-block-index-entry cs a1-hash))
+            (a1-work (bitcoin-lisp.storage:block-index-entry-chain-work a1-entry))
+            (b-hashes (make-test-chain-hashes #xB0 2))
+            (b1-hash (first b-hashes))
+            (b2-hash (second b-hashes))
+            ;; B1 valid; B2's coinbase pays one satoshi over the 50 BTC subsidy.
+            (b1-block (make-reorg-test-block genesis-hash b1-hash 1))
+            (b2-block (make-reorg-test-block b1-hash b2-hash 2 :value 5000000001)))
+       ;; B1 enters as an equal-work weaker side block (A stays tip); connect-block
+       ;; stores its body + a real-work index entry.
+       (bitcoin-lisp.validation:connect-block b1-block cs store utxo)
+       (let ((b1-entry (bitcoin-lisp.storage:get-block-index-entry cs b1-hash)))
+         ;; B2 (invalid) stored + indexed directly with more work than the tip so
+         ;; it is the highest-work completable candidate. Its own header bits +
+         ;; B1's entry work make activate-block recompute a work that outweighs A1,
+         ;; so the pre-reorg fires and reaches B2's over-value coinbase.
+         (bitcoin-lisp.storage:store-block store b2-block)
+         (bitcoin-lisp.storage:add-block-index-entry
+          cs (bitcoin-lisp.storage:make-block-index-entry
+              :hash b2-hash :height 2 :prev-entry b1-entry
+              :chain-work (+ a1-work 1000) :status :header-valid
+              :header (bitcoin-lisp.serialization:bitcoin-block-header b2-block)))
+         (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
+           (let ((set (bitcoin-lisp.networking::ibd-context-reorg-candidates
+                       bitcoin-lisp.networking::*ibd-context*))
+                 (rej (bitcoin-lisp.networking::ibd-context-rejected-reorg-candidates
+                       bitcoin-lisp.networking::*ibd-context*))
+                 (b2-entry (bitcoin-lisp.storage:get-block-index-entry cs b2-hash)))
+             (setf (gethash b2-hash set) t)
+             ;; Retry attempts the reorg, hits the over-value coinbase, and
+             ;; permanently rejects the fork.
+             (is (null (bitcoin-lisp.networking::retry-best-reorg-candidate cs store utxo)))
+             (is-true (gethash b2-hash rej))
+             (is (null (gethash b2-hash set)))
+             ;; Active tip rolled back to A1 — nothing invalid entered the chain.
+             (is (equalp a1-hash (bitcoin-lisp.storage:best-block-hash cs)))
+             (is (= 1 (bitcoin-lisp.storage:current-height cs)))
+             ;; NEVER retried: re-noting the rejected candidate is refused, and a
+             ;; second retry finds nothing to activate — tip stays put.
+             (bitcoin-lisp.networking::note-reorg-candidate b2-entry cs)
+             (is (null (gethash b2-hash set)))
+             (is (null (bitcoin-lisp.networking::retry-best-reorg-candidate cs store utxo)))
+             (is (equalp a1-hash (bitcoin-lisp.storage:best-block-hash cs))))))
+       (clrhash bitcoin-lisp.validation::*block-undo-data*)))))
+
+(test l5-refused-reorg-requeues-missing-and-keeps-candidate
+  "Item #12(1) contrast: a tip+1 block that WINS on work but whose intermediate
+fork bodies are absent yields a transient :reorg-refused. process-received-block
+re-queues the missing (hash . height) blocks into pending (queue-missing-fork-
+blocks) and records the winner as a reorg CANDIDATE (recoverable) — never in the
+rejected set. The active tip is untouched until the bodies arrive."
+  (%with-regtest
+   (let* ((spk-a (%p2sh-optrue-spk))
+          (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
+          (nb (%regtest-node-fixture "l5-refuse-b"))
+          (b-blocks (loop repeat 4 for blk = (%dr-mine-on nb spk-b)
+                          do (%dr-connect nb blk) collect blk))
+          (na (%regtest-node-fixture "l5-refuse-a"))
+          (csa (bitcoin-lisp::node-chain-state na))
+          (utxoa (bitcoin-lisp::node-utxo-set na))
+          (storea (bitcoin-lisp::node-block-store na))
+          (genesis-hash (bitcoin-lisp.storage:best-block-hash csa)))
+     (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))   ; tip A3 (height 3)
+     (is (= 3 (bitcoin-lisp.storage:current-height csa)))
+     ;; Add ALL four branch-B headers (B1-B4) to na with real chain-work; store
+     ;; NO bodies. B4's entry must exist for process-received-block to accept it.
+     (let ((prev (bitcoin-lisp.storage:get-block-index-entry csa genesis-hash)))
+       (loop for blk in b-blocks for h from 1 to 4
+             do (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                       (bhash (bitcoin-lisp.serialization:block-header-hash hdr))
+                       (work (bitcoin-lisp.storage:calculate-chain-work
+                              (bitcoin-lisp.serialization:block-header-bits hdr)
+                              (bitcoin-lisp.storage:block-index-entry-chain-work prev)))
+                       (e (bitcoin-lisp.storage:make-block-index-entry
+                           :hash bhash :height h :header hdr
+                           :prev-entry prev :chain-work work :status :header-valid)))
+                  (bitcoin-lisp.storage:add-block-index-entry csa e)
+                  (setf prev e))))
+     (let* ((b-hashes (mapcar (lambda (blk)
+                                (bitcoin-lisp.serialization:block-header-hash
+                                 (bitcoin-lisp.serialization:bitcoin-block-header blk)))
+                              b-blocks))
+            (b4-hash (fourth b-hashes)))
+       (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
+         (let ((ctx bitcoin-lisp.networking::*ibd-context*))
+           ;; Feed B4 (height 4 = tip+1). It outweighs A3, but B1-B3 bodies are
+           ;; missing -> perform-reorg refuses -> :reorg-refused + missing list.
+           (bitcoin-lisp.networking::process-received-block
+            (fourth b-blocks) csa utxoa storea :requested t)
+           ;; The three missing sub-tip fork bodies were re-queued for download.
+           (is (= 3 (hash-table-count
+                     (bitcoin-lisp.networking::ibd-context-pending-blocks ctx))))
+           (dolist (h (subseq b-hashes 0 3))
+             (is-true (gethash h (bitcoin-lisp.networking::ibd-context-pending-blocks ctx))))
+           ;; B4 is a live reorg candidate, NOT rejected (recoverable).
+           (is-true (gethash b4-hash
+                             (bitcoin-lisp.networking::ibd-context-reorg-candidates ctx)))
+           (is (null (gethash b4-hash
+                              (bitcoin-lisp.networking::ibd-context-rejected-reorg-candidates
+                               ctx))))
+           ;; Active tip untouched (all-or-nothing reorg refused cleanly).
+           (is (= 3 (bitcoin-lisp.storage:current-height csa)))))))))
+
+(test l5-witness-stripped-block-never-persisted
+  "Item #12(2): a witness-stripped block is NEVER persisted at any chain position
+— below the tip (competing fork), at tip+1, or above tip (out-of-order) — since a
+stripped body on disk fails every later reorg (the original testnet4 wedge).
+block-exists-p stays NIL for the stripped copy in all three cases. An above-tip
+stripped copy of a REQUESTED block re-enters pending so a witness-complete copy is
+re-fetched; an unsolicited stripped copy does not."
+  (%with-mainnet-network
+   (multiple-value-bind (cs utxo store genesis-hash)
+       (%make-activate-block-fixture "l5-stripped")
+     ;; Active chain A: two blocks, tip A2 at height 2.
+     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 2))
+     (let* ((a2-hash (bitcoin-lisp.storage:best-block-hash cs))
+            (a2-entry (bitcoin-lisp.storage:get-block-index-entry cs a2-hash))
+            (genesis-entry (bitcoin-lisp.storage:get-block-index-entry cs genesis-hash))
+            (below-hash (make-reorg-hash #xB100))
+            (tip1-hash (make-reorg-hash #xB101))
+            (above-req-hash (make-reorg-hash #xB102))
+            (above-uns-hash (make-reorg-hash #xB103))
+            (below (make-stripped-reorg-block genesis-hash below-hash 1))
+            (tip1 (make-stripped-reorg-block a2-hash tip1-hash 3))
+            (above-req (make-stripped-reorg-block a2-hash above-req-hash 5))
+            (above-uns (make-stripped-reorg-block a2-hash above-uns-hash 6)))
+       ;; Header-valid index entries only (no bodies on disk). The stripped-drop
+       ;; paths read only the entry's height + status, so the above-tip entries'
+       ;; height/prev mismatch is immaterial.
+       (bitcoin-lisp.storage:add-block-index-entry
+        cs (bitcoin-lisp.storage:make-block-index-entry
+            :hash below-hash :height 1 :prev-entry genesis-entry :chain-work 50
+            :status :header-valid
+            :header (bitcoin-lisp.serialization:bitcoin-block-header below)))
+       (bitcoin-lisp.storage:add-block-index-entry
+        cs (bitcoin-lisp.storage:make-block-index-entry
+            :hash tip1-hash :height 3 :prev-entry a2-entry :chain-work 5000
+            :status :header-valid
+            :header (bitcoin-lisp.serialization:bitcoin-block-header tip1)))
+       (bitcoin-lisp.storage:add-block-index-entry
+        cs (bitcoin-lisp.storage:make-block-index-entry
+            :hash above-req-hash :height 5 :prev-entry a2-entry :chain-work 9000
+            :status :header-valid
+            :header (bitcoin-lisp.serialization:bitcoin-block-header above-req)))
+       (bitcoin-lisp.storage:add-block-index-entry
+        cs (bitcoin-lisp.storage:make-block-index-entry
+            :hash above-uns-hash :height 6 :prev-entry a2-entry :chain-work 9000
+            :status :header-valid
+            :header (bitcoin-lisp.serialization:bitcoin-block-header above-uns)))
+       (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
+         (let ((ctx bitcoin-lisp.networking::*ibd-context*))
+           ;; sanity: all four copies really are witness-stripped.
+           (dolist (blk (list below tip1 above-req above-uns))
+             (is-true (bitcoin-lisp.validation:block-witness-stripped-p blk)))
+           ;; (a) below the tip (competing fork, height 1) — dropped, not stored.
+           (bitcoin-lisp.networking::process-received-block below cs utxo store :requested t)
+           (is (null (bitcoin-lisp.storage:block-exists-p store below-hash)))
+           ;; (b) tip+1 (height 3) — dropped, not stored.
+           (bitcoin-lisp.networking::process-received-block tip1 cs utxo store :requested t)
+           (is (null (bitcoin-lisp.storage:block-exists-p store tip1-hash)))
+           ;; (c) above tip (height 5), REQUESTED — dropped, not stored, but the
+           ;; requested block re-enters pending for a witness-complete re-fetch.
+           (bitcoin-lisp.networking::process-received-block above-req cs utxo store :requested t)
+           (is (null (bitcoin-lisp.storage:block-exists-p store above-req-hash)))
+           (is (eql 5 (gethash above-req-hash
+                               (bitcoin-lisp.networking::ibd-context-pending-blocks ctx))))
+           ;; (d) above tip (height 6), UNSOLICITED — dropped, not stored, and NOT
+           ;; re-queued (only a requested stripped copy re-arms a fetch).
+           (bitcoin-lisp.networking::process-received-block above-uns cs utxo store)
+           (is (null (bitcoin-lisp.storage:block-exists-p store above-uns-hash)))
+           (is (null (gethash above-uns-hash
+                              (bitcoin-lisp.networking::ibd-context-pending-blocks ctx)))))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test l5-out-of-order-acceptable-boundaries
+  "Item #12(3): %out-of-order-block-acceptable-p boundary cases beyond the
+existing coverage. Height boundary: a more-work unsolicited block exactly at
+tip + +min-blocks-to-keep+ is accepted; one height further is rejected (but a
+REQUESTED copy bypasses the gate). Min-work boundary: a more-work in-window
+unsolicited block is accepted only when its work meets minimum-chain-work; one
+unit below the floor is rejected (again bypassed when REQUESTED). Pure synthetic
+index — no Bitcoin Core vectors."
+  (%with-regtest
+   (let* ((cs (bitcoin-lisp.storage:make-chain-state))
+          (%h (lambda (n) (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element n)))
+          (g (bitcoin-lisp.storage:make-block-index-entry
+              :hash (funcall %h 0) :height 0 :chain-work 0 :status :valid))
+          (tip (bitcoin-lisp.storage:make-block-index-entry
+                :hash (funcall %h 1) :height 1 :chain-work 100 :prev-entry g
+                :status :valid)))
+     (bitcoin-lisp.storage:add-block-index-entry cs g)
+     (bitcoin-lisp.storage:add-block-index-entry cs tip)
+     (bitcoin-lisp.storage:update-chain-tip cs (funcall %h 1) 1)
+     ;; --- height boundary (current-height = 1) ---
+     (let ((at-window (bitcoin-lisp.storage:make-block-index-entry
+                       :hash (funcall %h 2)
+                       :height (+ 1 bitcoin-lisp:+min-blocks-to-keep+)
+                       :chain-work 150 :status :header-valid))
+           (past-window (bitcoin-lisp.storage:make-block-index-entry
+                         :hash (funcall %h 3)
+                         :height (+ 2 bitcoin-lisp:+min-blocks-to-keep+)
+                         :chain-work 150 :status :header-valid)))
+       ;; Exactly tip + min-blocks-to-keep ahead: accepted.
+       (is (bitcoin-lisp.networking::%out-of-order-block-acceptable-p at-window 1 nil cs))
+       ;; One height further: rejected (unsolicited)...
+       (is (null (bitcoin-lisp.networking::%out-of-order-block-acceptable-p
+                  past-window 1 nil cs)))
+       ;; ...but a requested copy of the same block is accepted.
+       (is (bitcoin-lisp.networking::%out-of-order-block-acceptable-p past-window 1 t cs)))
+     ;; --- minimum-chain-work boundary (in-window, more work than tip) ---
+     (let ((cand (bitcoin-lisp.storage:make-block-index-entry
+                  :hash (funcall %h 4) :height 3 :chain-work 150 :status :header-valid)))
+       ;; work 150 > tip 100; floor exactly at 150 -> accepted.
+       (let ((bitcoin-lisp::*minimum-chain-work-override* 150))
+         (is (bitcoin-lisp.networking::%out-of-order-block-acceptable-p cand 1 nil cs)))
+       ;; floor one unit above the block's work -> rejected (unsolicited)...
+       (let ((bitcoin-lisp::*minimum-chain-work-override* 151))
+         (is (null (bitcoin-lisp.networking::%out-of-order-block-acceptable-p cand 1 nil cs)))
+         ;; ...unless requested.
+         (is (bitcoin-lisp.networking::%out-of-order-block-acceptable-p cand 1 t cs)))))))
+
+(test l5-multi-peer-same-chain-dedups-in-flight
+  "Item #12(4): two ready peers whose best-known block is the SAME fork tip do
+not both get the same block in one request-blocks-from-peers pass. Each peer's
+chosen blocks are marked in-flight before the next peer is walked (Core
+FindNextBlocksToDownload marks mapBlocksInFlight), so the two peers PARTITION the
+fork range — no hash is requested twice."
+  (%with-regtest
+   (let* ((cs (bitcoin-lisp.storage:make-chain-state))
+          (store (bitcoin-lisp.storage::make-block-store :base-path #p"/nonexistent/l5-dedup/"))
+          (genesis (bitcoin-lisp.storage:make-block-index-entry
+                    :hash (make-reorg-hash 0) :height 0 :prev-entry nil
+                    :chain-work 1 :status :valid))
+          (fork-hashes '()))
+     (bitcoin-lisp.storage:add-block-index-entry cs genesis)
+     (bitcoin-lisp.storage:update-chain-tip cs (make-reorg-hash 0) 0)
+     ;; Fork f1..f5 above genesis: more-work each, header-valid, no bodies.
+     (let ((prev genesis))
+       (loop for h from 1 to 5
+             for hash = (make-reorg-hash (+ 2000 h))
+             do (push hash fork-hashes)
+                (bitcoin-lisp.storage:add-block-index-entry
+                 cs (bitcoin-lisp.storage:make-block-index-entry
+                     :hash hash :height h :header nil :prev-entry prev
+                     :chain-work (+ 100 h) :status :header-valid))
+                (setf prev (bitcoin-lisp.storage:get-block-index-entry cs hash))))
+     (setf fork-hashes (nreverse fork-hashes))
+     (let* ((svc (logior bitcoin-lisp.serialization:+node-network+
+                         bitcoin-lisp.serialization:+node-witness+))
+            (tip-hash (make-reorg-hash (+ 2000 5)))
+            (ctx (bitcoin-lisp.networking::make-ibd))
+            (p1 (bitcoin-lisp.networking::make-peer :address "1.1.1.1:1"
+                                                    :state :ready :services svc))
+            (p2 (bitcoin-lisp.networking::make-peer :address "2.2.2.2:2"
+                                                    :state :ready :services svc)))
+       (setf (bitcoin-lisp.networking::peer-best-known-block-hash p1) tip-hash
+             (bitcoin-lisp.networking::peer-best-known-block-hash p2) tip-hash)
+       ;; Small per-peer cap so BOTH peers must contribute (else p1 takes all 5).
+       (setf (bitcoin-lisp.networking::ibd-context-max-in-flight ctx) 3)
+       (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+         (let ((made (bitcoin-lisp.networking::request-blocks-from-peers
+                      (list p1 p2) cs store))
+               (in-flight (bitcoin-lisp.networking::ibd-context-in-flight ctx)))
+           ;; All five fork blocks requested exactly once: requests-made equals the
+           ;; distinct in-flight count (a duplicate would have collided on a key).
+           (is (= 5 made))
+           (is (= 5 (hash-table-count in-flight)))
+           ;; Both peers contributed and their assignments are disjoint & cover the
+           ;; range: the two per-peer counts are {2,3} (order-independent).
+           (is (equal '(2 3)
+                      (sort (list (bitcoin-lisp.networking::count-peer-in-flight p1)
+                                  (bitcoin-lisp.networking::count-peer-in-flight p2))
+                            #'<)))
+           ;; Every fork hash is in-flight.
+           (dolist (h fork-hashes)
+             (is-true (gethash h in-flight)))))))))
+
+(test l5-gap-only-backpressure-clamps-to-one-request
+  "Item #12(5): when the out-of-order block-queue is at capacity and the
+next-needed (gap) block is absent from it, request-blocks-from-peers lifts
+backpressure for only ONE block — the over-cap gap-only path clamps the total
+request budget to 1, so peers can't flood blocks above a stalled gap (the heap
+exhaustion this gate exists to prevent)."
+  (%with-regtest
+   (let* ((cs (bitcoin-lisp.storage:make-chain-state))
+          (store (bitcoin-lisp.storage::make-block-store :base-path #p"/nonexistent/l5-gap/"))
+          (genesis (bitcoin-lisp.storage:make-block-index-entry
+                    :hash (make-reorg-hash 0) :height 0 :prev-entry nil
+                    :chain-work 1 :status :valid)))
+     (bitcoin-lisp.storage:add-block-index-entry cs genesis)
+     (bitcoin-lisp.storage:update-chain-tip cs (make-reorg-hash 0) 0)
+     ;; A more-work fork of 3 header-valid blocks above genesis (no bodies) so
+     ;; there IS something to request.
+     (let ((prev genesis))
+       (loop for h from 1 to 3
+             for hash = (make-reorg-hash (+ 3000 h))
+             do (bitcoin-lisp.storage:add-block-index-entry
+                 cs (bitcoin-lisp.storage:make-block-index-entry
+                     :hash hash :height h :header nil :prev-entry prev
+                     :chain-work (+ 100 h) :status :header-valid))
+                (setf prev (bitcoin-lisp.storage:get-block-index-entry cs hash))))
+     (let* ((svc (logior bitcoin-lisp.serialization:+node-network+
+                         bitcoin-lisp.serialization:+node-witness+))
+            (fork-tip (make-reorg-hash (+ 3000 3)))
+            (ctx (bitcoin-lisp.networking::make-ibd))
+            (peer (bitcoin-lisp.networking::make-peer :address "9.9.9.9:9"
+                                                      :state :ready :services svc)))
+       (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer) fork-tip)
+       ;; Fill the RAM block-queue to capacity, but leave the gap (next-needed
+       ;; height 1) absent so the over-cap gap-only path is taken.
+       (let ((q (bitcoin-lisp.networking::ibd-context-block-queue ctx)))
+         (loop for i from 0 below bitcoin-lisp.networking::+max-block-queue-size+
+               do (setf (gethash (+ 2 i) q) t)))
+       (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+         ;; Over cap + gap missing: exactly one request is allowed.
+         (let ((made (bitcoin-lisp.networking::request-blocks-from-peers
+                      (list peer) cs store)))
+           (is (= 1 made))
+           (is (= 1 (hash-table-count
+                     (bitcoin-lisp.networking::ibd-context-in-flight ctx))))))))))
+
+(test l5-historical-download-only-for-base-containing-peer
+  "Item #12(6): find-historical-blocks-to-download returns the assumeutxo
+target-ancestor range [hist-tip+1 .. base] ONLY for a peer whose best-known chain
+contains the snapshot base (Core GetAncestor(base->nHeight) == base). A peer on a
+fork that does not contain the base gets nothing. Synthetic chainstates, no
+Bitcoin Core vectors."
+  (%with-regtest
+   (let* ((cs (bitcoin-lisp.storage:make-chain-state))
+          (hist (bitcoin-lisp.storage:make-chain-state))
+          (store (bitcoin-lisp.storage::make-block-store :base-path #p"/nonexistent/l5-hist/"))
+          (svc (logior bitcoin-lisp.serialization:+node-network+
+                       bitcoin-lisp.serialization:+node-witness+))
+          (chain '())    ; genesis .. h5, oldest first
+          (prev nil))
+     ;; Build genesis..h5 as a single linked chain in the shared index (cs).
+     (loop for h from 0 to 5
+           for hash = (make-reorg-hash (+ 4000 h))
+           for e = (bitcoin-lisp.storage:make-block-index-entry
+                    :hash hash :height h :header nil :prev-entry prev
+                    :chain-work (+ 10 h) :status (if (zerop h) :valid :header-valid))
+           do (bitcoin-lisp.storage:add-block-index-entry cs e)
+              (push e chain)
+              (setf prev e))
+     (setf chain (nreverse chain))
+     (let* ((base-entry (nth 5 chain))            ; h5 = snapshot base = target
+            (base-hash (bitcoin-lisp.storage:block-index-entry-hash base-entry))
+            ;; A separate fork off genesis that does NOT contain the base.
+            (fork-hash (make-reorg-hash 9999))
+            (ctx (bitcoin-lisp.networking::make-ibd)))
+       (bitcoin-lisp.storage:add-block-index-entry
+        cs (bitcoin-lisp.storage:make-block-index-entry
+            :hash fork-hash :height 1 :prev-entry (first chain)
+            :chain-work 11 :status :header-valid))
+       ;; Point the historical chainstate at the base; its validated tip is genesis
+       ;; (height 0), so it must download h1..h5.
+       (bitcoin-lisp.storage:set-chainstate-target hist base-entry)
+       (setf (bitcoin-lisp.networking::ibd-context-historical-chain-state ctx) hist
+             (bitcoin-lisp.networking::ibd-context-snapshot-base-entry ctx) base-entry)
+       (let ((base-peer (bitcoin-lisp.networking::make-peer :address "1.0.0.1:1"
+                                                            :state :ready :services svc))
+             (fork-peer (bitcoin-lisp.networking::make-peer :address "2.0.0.2:2"
+                                                            :state :ready :services svc)))
+         (setf (bitcoin-lisp.networking::peer-best-known-block-hash base-peer) base-hash
+               (bitcoin-lisp.networking::peer-best-known-block-hash fork-peer) fork-hash)
+         (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+           ;; Base-containing peer: the whole h1..h5 target-ancestor range,
+           ;; oldest-first, none on disk.
+           (let ((got (bitcoin-lisp.networking::find-historical-blocks-to-download
+                       base-peer cs store 16)))
+             (is (= 5 (length got)))
+             (is (equalp (bitcoin-lisp.storage:block-index-entry-hash (nth 1 chain))
+                         (first got)))
+             (is (equalp base-hash (car (last got))))
+             (is (equalp (mapcar #'bitcoin-lisp.storage:block-index-entry-hash
+                                 (subseq chain 1))
+                         got)))
+           ;; A peer whose best chain does not contain the base: nothing.
+           (is (null (bitcoin-lisp.networking::find-historical-blocks-to-download
+                      fork-peer cs store 16)))))))))

@@ -50,8 +50,8 @@
 import * as rpc from './rpc.js';
 import { qrDataUri } from './qr.js';
 import {
-  fmtInt, fmtBtc, fmtAge, fmtPct, fmtDuration, fmtTimestamp, shortHash,
-  shortId,
+  fmtInt, fmtBtc, fmtAge, fmtPct, fmtDuration, fmtTimestamp, fmtFeeRate,
+  shortHash, shortId,
 } from './format.js';
 
 // --- pure helpers (exported for tests) --------------------------------
@@ -123,6 +123,143 @@ export function categoryVariant(category) {
   }
 }
 
+// --- send: pure helpers (exported for tests) --------------------------
+
+// Confirmation-target choices for the fee control (blocks); 6 is the wallet
+// default (Core -txconfirmtarget, DEFAULT_TX_CONFIRM_TARGET = 6).
+export const SEND_CONF_TARGETS = [1, 2, 3, 6, 12, 24, 144, 1008];
+export const DEFAULT_CONF_TARGET = 6;
+export const MAX_MONEY_SATS = 2100000000000000n; // 21e6 BTC (consensus.h)
+
+// The wallet signals RBF by default (Core -walletrbf true); the fee-estimate
+// mode tracks it exactly like CWallet::GetMinimumFeeRate — economical while
+// signaling replaceability, conservative otherwise — so the estimatesmartfee
+// preview reflects the rate the node itself will target for this spend.
+export function feeModeForRbf(rbf) {
+  return rbf ? 'economical' : 'conservative';
+}
+
+// estimatesmartfee is a NODE method (base endpoint): [conf_target, mode].
+export function estimateFeeParams(confTarget, rbf) {
+  return ['estimatesmartfee', [confTarget, feeModeForRbf(rbf)]];
+}
+
+// A BTC amount string -> { ok, value, sats } or { ok:false, reason }. VALUE is
+// a canonical decimal string (never a float): the node parses the decimal
+// text exactly (AmountFromValue), so we forward text and never let JS float
+// noise into a funds amount. Satoshis are exact BigInt for the review total.
+export function normalizeAmount(input) {
+  const s = String(input ?? '').trim();
+  if (s === '') return { ok: false, reason: 'amount is required' };
+  if (!/^\d*\.?\d*$/.test(s) || s === '.') {
+    return { ok: false, reason: 'amount must be a number' };
+  }
+  const [whole = '', frac = ''] = s.split('.');
+  if (frac.length > 8) return { ok: false, reason: 'at most 8 decimal places' };
+  const sats = BigInt(whole || '0') * 100000000n
+    + BigInt((frac + '00000000').slice(0, 8));
+  if (sats <= 0n) return { ok: false, reason: 'amount must be greater than zero' };
+  if (sats > MAX_MONEY_SATS) {
+    return { ok: false, reason: 'amount exceeds 21,000,000 BTC' };
+  }
+  const value = frac.length ? `${whole || '0'}.${frac}` : (whole || '0');
+  return { ok: true, value, sats };
+}
+
+// Lightweight, network-agnostic destination check: catches empty/whitespace
+// and obviously-malformed strings for instant feedback; the node stays the
+// authority (decode-address re-validates the checksum before spending).
+const BECH32_RE = /^(bc|tb|bcrt)1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{6,100}$/;
+const BASE58_RE = /^[123mn][1-9A-HJ-NP-Za-km-z]{25,39}$/;
+export function validateAddress(input) {
+  const a = String(input ?? '').trim();
+  if (a === '') return { ok: false, reason: 'address is required' };
+  if (/\s/.test(a)) return { ok: false, reason: 'address must not contain spaces' };
+  if (!BECH32_RE.test(a.toLowerCase()) && !BASE58_RE.test(a)) {
+    return { ok: false, reason: 'not a recognized Bitcoin address' };
+  }
+  return { ok: true, address: a };
+}
+
+// Validate every recipient row. Returns { ok, cleaned, errors }: CLEANED is
+// [{ address, amount(string), sats(BigInt) }] when OK; ERRORS is
+// [{ index, field, reason }] (index -1 = whole form).
+export function validateRecipients(recipients) {
+  const cleaned = [];
+  const errors = [];
+  const rows = recipients ?? [];
+  if (rows.length === 0) {
+    return { ok: false, cleaned,
+      errors: [{ index: -1, field: 'form', reason: 'add at least one recipient' }] };
+  }
+  const seen = new Map();
+  rows.forEach((r, i) => {
+    const addr = validateAddress(r.address);
+    if (!addr.ok) errors.push({ index: i, field: 'address', reason: addr.reason });
+    const amt = normalizeAmount(r.amount);
+    if (!amt.ok) errors.push({ index: i, field: 'amount', reason: amt.reason });
+    if (addr.ok) {
+      if (seen.has(addr.address)) {
+        errors.push({ index: i, field: 'address', reason: 'duplicate address' });
+      } else {
+        seen.set(addr.address, i);
+      }
+    }
+    cleaned.push(addr.ok && amt.ok
+      ? { address: addr.address, amount: amt.value, sats: amt.sats } : null);
+  });
+  return {
+    ok: errors.length === 0,
+    cleaned: errors.length === 0 ? cleaned : [],
+    errors,
+  };
+}
+
+// Build the exact [method, params] for a spend. A single recipient rides
+// sendtoaddress (Core's single-payment path); multiple recipients ride send
+// with an order-preserving array-of-objects outputs list. Amounts are
+// forwarded as decimal strings. Booleans are real JSON booleans — the node's
+// request parser promotes a top-level positional `false` to its explicit-
+// false sentinel, so RBF-off / SFFO-off transmit losslessly.
+export function buildSendCall({ recipients, confTarget, rbf, subtractFee }) {
+  const mode = feeModeForRbf(rbf);
+  if (recipients.length === 1) {
+    const r = recipients[0];
+    // sendtoaddress: address, amount, comment, comment_to,
+    //   subtractfeefromamount, replaceable, conf_target, estimate_mode
+    return ['sendtoaddress',
+      [r.address, r.amount, '', '', !!subtractFee, !!rbf, confTarget, mode]];
+  }
+  // send: outputs, conf_target, estimate_mode, fee_rate, options
+  const outputs = recipients.map((r) => ({ [r.address]: r.amount }));
+  const options = { replaceable: !!rbf };
+  if (subtractFee) options.subtract_fee_from_outputs = recipients.map((_, i) => i);
+  return ['send', [outputs, confTarget, mode, null, options]];
+}
+
+// Broadcast txid from either RPC's result (sendtoaddress -> bare txid string;
+// send -> { txid, complete }).
+export function sendResultTxid(result) {
+  return typeof result === 'string' ? result : (result?.txid ?? null);
+}
+
+// Rough signed-vsize estimate for the fee PREVIEW only (P2WPKH-ish: 11 vB
+// overhead + ~68 vB/input + ~31 vB/output incl. one change output). The node
+// computes the real size from the selected coins; this only powers the
+// "≈ fee" line beside the authoritative feerate.
+export function estimateVsize(numOutputs, numInputs = 1) {
+  return Math.ceil(11 + numInputs * 68 + (numOutputs + 1) * 31);
+}
+
+// Exact BigInt-satoshi -> "N.NNNNNNNN BTC" (no float round-trip).
+export function fmtSatsBtc(sats) {
+  const neg = sats < 0n;
+  const a = neg ? -sats : sats;
+  const whole = (a / 100000000n).toString();
+  const frac = (a % 100000000n).toString().padStart(8, '0');
+  return `${neg ? '-' : ''}${whole}.${frac} BTC`;
+}
+
 export function isMasked(storage = globalThis.sessionStorage) {
   return storage.getItem(MASK_KEY) === '1';
 }
@@ -135,6 +272,7 @@ export function setMasked(on, storage = globalThis.sessionStorage) {
 
 const TABS = [
   ['overview', 'Overview'],
+  ['send', 'Send'],
   ['receive', 'Receive'],
   ['history', 'History'],
   ['addresses', 'Address book'],
@@ -157,8 +295,24 @@ const state = {
   txDetails: new Map(), // txid -> gettransaction result
   bookRows: [],         // [{ address, label, purpose, info? }]
   receive: null,        // { address, label, type, uri, info? }
+  send: freshSend(),    // send-tab compose model
   refreshing: false,
 };
+
+// A blank send-tab compose model (one empty recipient, wallet defaults).
+function freshSend() {
+  return {
+    recipients: [{ address: '', amount: '' }],
+    confTarget: DEFAULT_CONF_TARGET,
+    rbf: true,
+    sffo: false,
+    preview: null,     // { feerate, blocks, errors, vsize, feeSats, rbf, sffo }
+    result: null,      // { txid, feeReason } | { error }
+    reviewing: false,
+    rowRefs: [],       // [{ addr, amount }] live input elements
+    cleaned: [],       // validated recipients backing the review/confirm
+  };
+}
 
 export function resetWallet() {
   state.container = null;
@@ -177,6 +331,7 @@ export function resetWallet() {
   state.txDetails = new Map();
   state.bookRows = [];
   state.receive = null;
+  state.send = freshSend();
   state.refreshing = false;
 }
 
@@ -397,6 +552,68 @@ function buildSkeleton(container) {
   refs.overviewError.hidden = true;
   refs.infoCard.appendChild(refs.overviewError);
 
+  // Send: multi-recipient compose + fee control -> review/confirm.
+  refs.sendCard = el('section', 'card card-full');
+  refs.sendCard.setAttribute('aria-label', 'Send');
+  refs.sendCard.appendChild(el('h2', 'card-title', 'Send'));
+  const sendForm = el('form', 'send-form');
+  refs.sendRecipients = el('div', 'send-recipients');
+  sendForm.appendChild(refs.sendRecipients);
+
+  refs.sendAddBtn = el('button', 'btn send-add', '+ add recipient');
+  refs.sendAddBtn.type = 'button';
+  refs.sendAddBtn.addEventListener('click', () => addRecipient());
+  sendForm.appendChild(refs.sendAddBtn);
+
+  const controls = el('div', 'send-controls');
+  const ctWrap = el('label', 'send-control');
+  ctWrap.appendChild(el('span', 'muted', 'confirm within'));
+  refs.sendConfTarget = el('select', 'send-conf-target');
+  refs.sendConfTarget.setAttribute('aria-label', 'Confirmation target (blocks)');
+  for (const t of SEND_CONF_TARGETS) {
+    const opt = el('option', '', `${fmtInt(t)} block${t === 1 ? '' : 's'}`);
+    opt.value = String(t);
+    refs.sendConfTarget.appendChild(opt);
+  }
+  refs.sendConfTarget.value = String(DEFAULT_CONF_TARGET);
+  ctWrap.appendChild(refs.sendConfTarget);
+  controls.appendChild(ctWrap);
+
+  const rbfWrap = el('label', 'send-control');
+  refs.sendRbf = el('input');
+  refs.sendRbf.type = 'checkbox';
+  refs.sendRbf.checked = true;
+  refs.sendRbf.setAttribute('aria-label', 'Signal replace-by-fee (BIP125)');
+  rbfWrap.append(refs.sendRbf, el('span', '', 'replaceable (RBF)'));
+  controls.appendChild(rbfWrap);
+
+  const sffoWrap = el('label', 'send-control');
+  refs.sendSffo = el('input');
+  refs.sendSffo.type = 'checkbox';
+  refs.sendSffo.checked = false;
+  refs.sendSffo.setAttribute('aria-label', 'Subtract fee from outputs');
+  sffoWrap.append(refs.sendSffo, el('span', '', 'subtract fee from amount(s)'));
+  controls.appendChild(sffoWrap);
+  sendForm.appendChild(controls);
+
+  refs.sendError = el('p', 'error-text');
+  refs.sendError.hidden = true;
+  sendForm.appendChild(refs.sendError);
+
+  refs.sendReviewBtn = el('button', 'btn send-review-btn', 'review send');
+  refs.sendReviewBtn.type = 'submit';
+  sendForm.appendChild(refs.sendReviewBtn);
+  sendForm.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    await onReviewSend();
+  });
+
+  refs.sendReview = el('div', 'send-review-wrap');
+  refs.sendReview.hidden = true;
+  refs.sendResult = el('div', 'send-result-wrap');
+  refs.sendResult.hidden = true;
+  refs.sendCard.append(sendForm, refs.sendReview, refs.sendResult);
+
   // Receive.
   refs.receiveCard = el('section', 'card card-full');
   refs.receiveCard.setAttribute('aria-label', 'Receive');
@@ -497,8 +714,9 @@ function buildSkeleton(container) {
 
   state.refs = refs;
   container.replaceChildren(head, refs.disabledCard, refs.emptyCard,
-    refs.balancesCard, refs.infoCard, refs.receiveCard, refs.historyCard,
-    refs.bookCard);
+    refs.balancesCard, refs.infoCard, refs.sendCard, refs.receiveCard,
+    refs.historyCard, refs.bookCard);
+  renderRecipients();
   renderTabStrip();
   applyMask();
   renderVisibility();
@@ -524,6 +742,7 @@ function renderVisibility() {
   };
   show(refs.balancesCard, 'overview');
   show(refs.infoCard, 'overview');
+  show(refs.sendCard, 'send');
   show(refs.receiveCard, 'receive');
   show(refs.historyCard, 'history');
   show(refs.bookCard, 'addresses');
@@ -558,10 +777,15 @@ function selectWallet(name) {
   state.txDetails = new Map();
   state.bookRows = [];
   state.receive = null;
+  state.send = freshSend();
   if (state.refs) {
     state.refs.histStamp = null;
     state.refs.receiveResult.replaceChildren();
     state.refs.receiveError.hidden = true;
+    state.refs.sendError.hidden = true;
+    renderRecipients();
+    renderReview();
+    renderSendResult();
   }
   return refresh();
 }
@@ -780,6 +1004,231 @@ function renderReceive() {
   }
   box.appendChild(kv);
   refs.receiveResult.replaceChildren(box);
+}
+
+// --- send -----------------------------------------------------------------
+
+// Rebuild the recipient rows from the model, preserving element handles for
+// syncing values back out of the DOM.
+function renderRecipients() {
+  const { refs, send } = state;
+  if (!refs) return;
+  const rowRefs = [];
+  const nodes = send.recipients.map((model, i) => {
+    const row = el('div', 'send-row');
+    const addr = el('input', 'send-addr');
+    addr.setAttribute('aria-label', `Recipient ${i + 1} address`);
+    addr.placeholder = 'address';
+    addr.spellcheck = false;
+    addr.value = model.address;
+    const amount = el('input', 'send-amt');
+    amount.setAttribute('aria-label', `Recipient ${i + 1} amount (BTC)`);
+    amount.placeholder = 'amount (BTC)';
+    amount.spellcheck = false;
+    amount.value = model.amount;
+    row.append(addr, amount);
+    if (send.recipients.length > 1) {
+      const rm = el('button', 'btn send-rm', 'remove');
+      rm.type = 'button';
+      rm.setAttribute('aria-label', `Remove recipient ${i + 1}`);
+      rm.addEventListener('click', () => removeRecipient(i));
+      row.append(rm);
+    }
+    rowRefs.push({ addr, amount });
+    return row;
+  });
+  send.rowRefs = rowRefs;
+  refs.sendRecipients.replaceChildren(...nodes);
+}
+
+// Pull the live input/control values into the model (so add/remove never
+// drops half-typed rows, and review reads the latest text).
+function syncSendFromDom() {
+  const { refs, send } = state;
+  send.rowRefs.forEach((ref, i) => {
+    if (send.recipients[i]) {
+      send.recipients[i].address = ref.addr.value;
+      send.recipients[i].amount = ref.amount.value;
+    }
+  });
+  send.confTarget = Number(refs.sendConfTarget.value) || DEFAULT_CONF_TARGET;
+  send.rbf = !!refs.sendRbf.checked;
+  send.sffo = !!refs.sendSffo.checked;
+}
+
+function addRecipient() {
+  syncSendFromDom();
+  state.send.recipients.push({ address: '', amount: '' });
+  renderRecipients();
+}
+
+function removeRecipient(index) {
+  syncSendFromDom();
+  state.send.recipients.splice(index, 1);
+  if (state.send.recipients.length === 0) {
+    state.send.recipients.push({ address: '', amount: '' });
+  }
+  renderRecipients();
+}
+
+function fmtRecipientError(e) {
+  return e.index >= 0 ? `recipient ${e.index + 1} ${e.field}: ${e.reason}` : e.reason;
+}
+
+// Review: validate every row, then price the spend via estimatesmartfee (a
+// node method on the base endpoint) and show the confirm panel.
+async function onReviewSend() {
+  const { refs, send } = state;
+  syncSendFromDom();
+  refs.sendError.hidden = true;
+  send.result = null;
+  renderSendResult();
+
+  const check = validateRecipients(send.recipients);
+  if (!check.ok) {
+    refs.sendError.textContent = check.errors.map(fmtRecipientError).join('; ');
+    refs.sendError.hidden = false;
+    send.reviewing = false;
+    send.preview = null;
+    renderReview();
+    return;
+  }
+  send.cleaned = check.cleaned;
+
+  let feerate = null;
+  let blocks = send.confTarget;
+  let errors = null;
+  try {
+    const est = await rpc.call(...estimateFeeParams(send.confTarget, send.rbf));
+    feerate = est?.feerate ?? null;
+    blocks = est?.blocks ?? send.confTarget;
+    errors = est?.errors ?? null;
+  } catch (e) {
+    errors = [rpcErrorMessage(e)];
+  }
+  const vsize = estimateVsize(send.cleaned.length);
+  const satPerVb = feerate != null ? (feerate * 1e8) / 1000 : null;
+  const feeSats = satPerVb != null ? Math.round(satPerVb * vsize) : null;
+  send.preview = {
+    feerate, blocks, errors, vsize, feeSats, rbf: send.rbf, sffo: send.sffo,
+  };
+  send.reviewing = true;
+  renderReview();
+}
+
+function renderReview() {
+  const { refs, send } = state;
+  if (!refs) return;
+  if (!send.reviewing || !send.preview) {
+    refs.sendReview.hidden = true;
+    refs.sendReview.replaceChildren();
+    return;
+  }
+  const p = send.preview;
+  const box = el('div', 'send-review');
+  box.appendChild(el('h3', 'send-subtitle', 'Review send'));
+
+  const kv = el('dl', 'kv');
+  let total = 0n;
+  send.cleaned.forEach((r, i) => {
+    total += r.sats;
+    kv.appendChild(kvRow(`to ${i + 1}`,
+      el('span', 'mono', shortId(r.address, 14)),
+      el('span', 'sep', '·'),
+      el('span', 'mono', `${r.amount} BTC`)));
+  });
+  kv.appendChild(kvRow('total to send', el('span', 'mono', fmtSatsBtc(total))));
+  kv.appendChild(kvRow('confirmation target',
+    `${fmtInt(p.blocks)} block${p.blocks === 1 ? '' : 's'}`));
+  kv.appendChild(kvRow('fee rate',
+    p.feerate != null ? fmtFeeRate(p.feerate) : 'node fallback (no estimate)'));
+  kv.appendChild(kvRow('estimated fee',
+    el('span', 'mono', p.feeSats != null ? `≈ ${fmtSatsBtc(BigInt(p.feeSats))}` : '—'),
+    el('span', 'muted', ` · ~${fmtInt(p.vsize)} vB, exact fee set when built`)));
+  kv.appendChild(kvRow('replace-by-fee', p.rbf ? 'signaled (BIP125)' : 'not signaled'));
+  kv.appendChild(kvRow('subtract fee from outputs', p.sffo ? 'yes' : 'no'));
+  box.appendChild(kv);
+  if (p.errors && p.errors.length) {
+    box.appendChild(el('p', 'muted', `fee estimate: ${p.errors.join('; ')}`));
+  }
+
+  const actions = el('div', 'send-actions');
+  const confirm = el('button', 'btn send-confirm', 'confirm and send');
+  confirm.type = 'button';
+  confirm.addEventListener('click', () => onConfirmSend(confirm));
+  const edit = el('button', 'linklike', 'edit');
+  edit.type = 'button';
+  edit.addEventListener('click', () => {
+    send.reviewing = false;
+    renderReview();
+  });
+  actions.append(confirm, edit);
+  box.appendChild(actions);
+
+  refs.sendReview.hidden = false;
+  refs.sendReview.replaceChildren(box);
+}
+
+async function onConfirmSend(btn) {
+  const { refs, send } = state;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'sending…';
+  refs.sendError.hidden = true;
+  try {
+    const [method, params] = buildSendCall({
+      recipients: send.cleaned,
+      confTarget: send.confTarget,
+      rbf: send.rbf,
+      subtractFee: send.sffo,
+    });
+    const result = await rpc.call(method, params, endpoint());
+    send.result = {
+      txid: sendResultTxid(result),
+      feeReason: (result && result.fee_reason) || null,
+    };
+    // Reset the compose form to a single blank recipient after a broadcast.
+    send.recipients = [{ address: '', amount: '' }];
+    send.cleaned = [];
+    send.reviewing = false;
+    send.preview = null;
+    renderRecipients();
+    renderReview();
+    renderSendResult();
+  } catch (e) {
+    send.result = { error: rpcErrorMessage(e) };
+    renderSendResult();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
+function renderSendResult() {
+  const { refs, send } = state;
+  if (!refs) return;
+  if (!send.result) {
+    refs.sendResult.hidden = true;
+    refs.sendResult.replaceChildren();
+    return;
+  }
+  refs.sendResult.hidden = false;
+  if (send.result.error) {
+    refs.sendResult.replaceChildren(el('p', 'error-text', send.result.error));
+    return;
+  }
+  const box = el('div', 'send-result');
+  box.appendChild(el('p', 'send-ok', 'Transaction broadcast.'));
+  const kv = el('dl', 'kv');
+  kv.appendChild(kvRow('txid',
+    copyable(send.result.txid, shortId(send.result.txid, 16)),
+    el('span', 'sep', '·'),
+    link(`#/tx/${send.result.txid}`, 'open in explorer')));
+  if (send.result.feeReason) {
+    kv.appendChild(kvRow('fee reason', send.result.feeReason));
+  }
+  box.appendChild(kv);
+  refs.sendResult.replaceChildren(box);
 }
 
 // --- history --------------------------------------------------------------
