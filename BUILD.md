@@ -76,30 +76,44 @@ bordeaux-threads) via `~/.sbclrc`.
 
 ## Running the nodes
 
-Both nodes run under a **crash-recovery supervisor** (a `bash` respawn loop) on
-the 2.6.5 SBCL, resuming from chainstate in ~60 s on any exit. The launchers
-live on the server:
+Nodes run under a **crash-recovery supervisor** (a `bash` respawn loop) on the
+2.6.5 SBCL, resuming from chainstate in ~60 s on any exit. The single in-repo
+launcher `scripts/run-node.sh` versions the previously ad-hoc inline supervisors
+so the load-bearing launch logic is under source control:
 
-| Script | Network | `dynamic-space-size` | RPC | P2P | Supervisor marker |
-|--------|---------|----------------------|-----|-----|-------------------|
-| `run-mainnet.sh`  | mainnet (pruned, outbound-only) | 5120 | 8332 | 8333 | `MAINNET_SUPERVISOR_5120` |
-| `restart-node.sh` | testnet4 (listening)            | 6144 | 18332 | 18333 | `TESTNET4_SUPERVISOR_6144` |
+```sh
+scripts/run-node.sh testnet4      # or: mainnet | regtest
+```
+
+| Network  | `dynamic-space-size` | RPC   | P2P (default) |
+|----------|----------------------|-------|---------------|
+| mainnet  | 5120 (pruned, outbound-only) | 8332  | 8333  |
+| testnet4 | 6144 (listening)             | 18332 | 18333 |
+| regtest  | 4096                         | 18443 | —     |
 
 The `dynamic-space-size` (5120 vs 6144) doubles as the `pgrep` discriminator
-between the two nodes. Both launchers point at `/data/bitcoin-lisp/sbcl-final`
-and export `SBCL_HOME=/data/bitcoin-lisp/sbcl-final/lib/sbcl`.
+between the mainnet and testnet4 nodes. Toolchain paths default to
+`/data/bitcoin-lisp/sbcl-final` (with `SBCL_HOME` exported to its `lib/sbcl`)
+and are all overridable via the environment variables documented at the top of
+the script.
+
+The launcher also stamps the deployed short git rev into the BIP14 subversion
+(so `getnetworkinfo` reports the running commit) and, when that rev differs from
+the one the on-disk FASL cache was last built for, clears the cache once before
+launch — turning a post-redeploy "incompatible layout" boot failure into a
+clean recompile instead of a respawn loop.
 
 ### Stopping a node (e.g. for redeploy)
 
 Kill the **supervisor first** so it doesn't respawn, then the sbcl child:
 
 ```sh
-pkill -f MAINNET_SUPERVISOR_5120        # or TESTNET4_SUPERVISOR_6144
-# then TERM the sbcl child (matched by 'dynamic-space-size 5120' / '6144')
+# TERM the supervisor's process group (stops the respawn loop for good),
+# then TERM the sbcl child (matched by 'dynamic-space-size 5120' / '6144').
 ```
 
-The launcher scripts do this automatically. Graceful shutdown takes ~6 s
-(durable UTXO / header-index / mempool flush); a `TERM` no longer hangs.
+Graceful shutdown takes ~6 s (durable UTXO / header-index / mempool flush); a
+`TERM` no longer hangs.
 
 ## Operational notes
 
