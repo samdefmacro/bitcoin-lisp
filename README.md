@@ -165,42 +165,26 @@ the `-testnet`/`-testnet4`/`-signet`/`-regtest` flags; `-datadir`, `-conf`;
 `-listen`, `-bind`, `-v2transport`, `-reindex-chainstate`; `-loglevel`,
 `-debug`, `-logfile`.
 
-### Step 5: Running as a Background Service (Optional)
+### Step 5: Running as a Background Service
 
-Create a systemd service file for running the node:
+Production nodes do **not** run under systemd. They run under a small bash
+respawn supervisor, [`scripts/run-node.sh`](scripts/run-node.sh), which
+relaunches SBCL on any exit (graceful shutdown, in-image watchdog, or crash)
+and stamps the deployed git rev into the advertised subversion:
 
 ```bash
-sudo nano /etc/systemd/system/bitcoin-lisp.service
+scripts/run-node.sh testnet4      # or: mainnet | regtest
 ```
 
-```ini
-[Unit]
-Description=Bitcoin-Lisp Node
-After=network.target
+Toolchain paths, heap sizes, and per-network start options are overridable via
+environment variables documented at the top of that script.
 
-[Service]
-Type=simple
-User=YOUR_USERNAME
-WorkingDirectory=/home/YOUR_USERNAME/quicklisp/local-projects/bitcoin-lisp
-ExecStart=/usr/bin/sbcl --load /home/YOUR_USERNAME/quicklisp/setup.lisp \
-    --eval '(ql:quickload "bitcoin-lisp")' \
-    --eval '(bitcoin-lisp:start-node :sync t)' \
-    --eval '(loop (sleep 3600))'
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start the service:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable bitcoin-lisp
-sudo systemctl start bitcoin-lisp
-
-# Check status
-sudo systemctl status bitcoin-lisp
-```
+> **Mainnet caveat.** Mainnet requires the custom **SBCL 2.6.5** build and a
+> large `--dynamic-space-size` — the distro SBCL 2.1.11 corrupts the heap at
+> chain tip. apt's `sbcl` is fine for **testnet/regtest** experimentation. See
+> **[`BUILD.md`](BUILD.md)** — the single source of truth for building the
+> toolchain and running the live nodes (no server-specific paths are duplicated
+> into this guide).
 
 ### Ubuntu Troubleshooting
 
@@ -306,6 +290,7 @@ sbcl --load quicklisp.lisp \
 
 **Important notes about mainnet:**
 - Mainnet requires approximately **600GB+ of storage** for the full blockchain
+- Mainnet needs the **custom SBCL 2.6.5** build and a large `--dynamic-space-size` (apt's SBCL is fine for testnet/regtest only) — see [`BUILD.md`](BUILD.md)
 - Transaction relay is **disabled by default** on mainnet for safety
 - A warning is logged at startup when running on mainnet
 - To enable mainnet relay: `(setf bitcoin-lisp:*mainnet-relay-enabled* t)`

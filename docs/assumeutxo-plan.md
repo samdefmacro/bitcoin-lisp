@@ -133,7 +133,7 @@ From the architecture map (all cites our tree):
   agnostic, so Core's NORMAL/ASSUMED blockfile segmentation is **unnecessary for us**), undo
   storage, header/block index, headerindex.dat (its 185-byte record already persists tx-count —
   the faked `m_chain_tx_count` persists for free).
-- **IBD driver**: `get-next-blocks-to-request`/`queue-blocks-for-download` (ibd.lisp:775-844)
+- **IBD driver**: `find-blocks-to-download-for-peer`/`queue-blocks-for-download` (ibd.lisp:775-844)
   need a second height cursor for the historical range `[historical-tip .. snapshot-base]`, plus
   the peer filter (skip peers whose chain omits the base for tip download).
 - Existing `save-file-with-crc32` durability primitives, 3-phase `do-flush`, and

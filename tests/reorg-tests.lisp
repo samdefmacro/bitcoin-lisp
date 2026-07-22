@@ -1488,8 +1488,15 @@ fixating on a fork no connected peer has."
                                 (bitcoin-lisp.serialization:block-header-hash
                                  (bitcoin-lisp.serialization:bitcoin-block-header blk)))
                               b-blocks))
-            (peer-b (bitcoin-lisp.networking::make-peer :address "1.2.3.4:18333"))
-            (peer-tip (bitcoin-lisp.networking::make-peer :address "5.6.7.8:18333")))
+            ;; Both peers advertise NODE_NETWORK|NODE_WITNESS: with segwit active
+            ;; (regtest activates at genesis) the per-peer walk's witness guard
+            ;; would otherwise skip a non-witness peer entirely.
+            (svc (logior bitcoin-lisp.serialization:+node-network+
+                         bitcoin-lisp.serialization:+node-witness+))
+            (peer-b (bitcoin-lisp.networking::make-peer :address "1.2.3.4:18333"
+                                                        :services svc))
+            (peer-tip (bitcoin-lisp.networking::make-peer :address "5.6.7.8:18333"
+                                                          :services svc)))
        (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer-b) (fifth b-hashes)
              (bitcoin-lisp.networking::peer-best-known-block-hash peer-tip)
              (bitcoin-lisp.storage:best-block-hash csa))
@@ -1502,6 +1509,72 @@ fixating on a fork no connected peer has."
          ;; Peer at our own tip (A3): nothing more-work to fetch.
          (is (null (bitcoin-lisp.networking::find-blocks-to-download-for-peer
                     peer-tip csa storea 16))))))))
+
+(test find-blocks-to-download-service-flag-guards
+  "Layer-5 per-peer download service guards (Core FindNextBlocks): with segwit
+active (regtest activates it at genesis) a peer that does NOT advertise
+NODE_WITNESS yields nothing — from it we could only ever get witness-stripped
+blocks. A limited (pruned) peer — NODE_NETWORK_LIMITED set, NODE_NETWORK clear —
+is asked only for blocks within NODE_NETWORK_LIMITED_MIN_BLOCKS-2 (=286) of its
+best-known height; deeper blocks are skipped, shallower ones still fetched. A
+full NODE_NETWORK|NODE_WITNESS peer gets the whole range. Pure synthetic
+index/peer setup, no Bitcoin Core vectors."
+  (%with-regtest
+   (let* ((store (bitcoin-lisp.storage::make-block-store
+                  :base-path #p"/nonexistent/l5-svc-guards/"))
+          (cs (bitcoin-lisp.storage:make-chain-state))
+          (tip-height 300)
+          ;; Genesis is our active tip (height 0); the peer chain is a 300-block
+          ;; more-work extension above it whose bodies we lack (not on disk).
+          (genesis (bitcoin-lisp.storage:make-block-index-entry
+                    :hash (make-reorg-hash 0) :height 0 :prev-entry nil
+                    :chain-work 1 :status :valid))
+          (fork-hashes (make-array (1+ tip-height) :initial-element nil)))
+     (bitcoin-lisp.storage:add-block-index-entry cs genesis)
+     (bitcoin-lisp.storage:update-chain-tip cs (make-reorg-hash 0) 0)
+     ;; f1..f300: unique ids offset by 1000, each more-work than the last, all
+     ;; header-valid and absent from disk so the walk treats them as lacking.
+     (let ((prev genesis))
+       (loop for h from 1 to tip-height
+             for hash = (make-reorg-hash (+ 1000 h))
+             for e = (bitcoin-lisp.storage:make-block-index-entry
+                      :hash hash :height h :header nil
+                      :prev-entry prev :chain-work (+ 100 h) :status :header-valid)
+             do (setf (aref fork-hashes h) hash)
+                (bitcoin-lisp.storage:add-block-index-entry cs e)
+                (setf prev e)))
+     (let* ((tip-hash (make-reorg-hash (+ 1000 tip-height)))
+            (ctx (bitcoin-lisp.networking::make-ibd))
+            (nowit (bitcoin-lisp.networking::make-peer
+                    :address "1.0.0.1:18444"
+                    :services bitcoin-lisp.serialization:+node-network+))      ; no witness
+            (limited (bitcoin-lisp.networking::make-peer
+                      :address "2.0.0.2:18444"
+                      :services (logior bitcoin-lisp.serialization:+node-network-limited+
+                                        bitcoin-lisp.serialization:+node-witness+)))
+            (full (bitcoin-lisp.networking::make-peer
+                   :address "3.0.0.3:18444"
+                   :services (logior bitcoin-lisp.serialization:+node-network+
+                                     bitcoin-lisp.serialization:+node-witness+))))
+       (dolist (p (list nowit limited full))
+         (setf (bitcoin-lisp.networking::peer-best-known-block-hash p) tip-hash))
+       (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+         ;; (a) No-witness peer: segwit active at every height -> nothing at all.
+         (is (null (bitcoin-lisp.networking::find-blocks-to-download-for-peer
+                    nowit cs store 512)))
+         ;; (c) Full peer: the whole 300-block range, shallowest (f1) first.
+         (let ((got (bitcoin-lisp.networking::find-blocks-to-download-for-peer
+                     full cs store 512)))
+           (is (= tip-height (length got)))
+           (is (equalp (aref fork-hashes 1) (first got))))
+         ;; (b) Limited peer: best-known height 300, so heights 1..14
+         ;; (300-h >= 286) are skipped; the shallowest fetched is f15.
+         (let ((got (bitcoin-lisp.networking::find-blocks-to-download-for-peer
+                     limited cs store 512)))
+           (is (equalp (aref fork-hashes 15) (first got)))
+           (is (= (- tip-height 14) (length got)))
+           (is (not (member (aref fork-hashes 14) got :test #'equalp)))
+           (is (not (member (aref fork-hashes 1) got :test #'equalp)))))))))
 
 (test deep-reorg-candidate-activates-fork-winning-above-tip-plus-1
   "THE deep-reorg livelock regression (2026-07-22 liveness review): a fork

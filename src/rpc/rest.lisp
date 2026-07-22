@@ -300,6 +300,26 @@ outpoints come from the URI."
           ext (bitcoin-lisp.crypto:bytes-to-hex
                (%getutxos-binary height tip-hash hits coins))))))))
 
+;;; --- Liveness probe (bitcoin-lisp extension, not a Core REST endpoint) ---
+
+(defun %rest-health (node)
+  "Unauthenticated liveness probe. HTTP 200 iff the node's sync thread is alive
+AND the active chain tip advanced within the staleness threshold; else HTTP
+503. Body: {\"status\", \"seconds_since_tip\", \"synced\"}. The underlying
+node-tip-liveness read is lock-free and side-effect-free, so the probe stays
+responsive (and correctly reports 503) even when the node is wedged."
+  (multiple-value-bind (healthy seconds-since-tip synced)
+      (bitcoin-lisp::node-tip-liveness node)
+    (%rest-respond (if healthy 200 503)
+                   "application/json"
+                   (with-output-to-string (s)
+                     (yason:encode
+                      (rpc-result->json
+                       `(("status" . ,(if healthy "ok" "unhealthy"))
+                         ("seconds_since_tip" . ,seconds-since-tip)
+                         ("synced" . ,(json-bool synced))))
+                      s)))))
+
 ;;; --- Router ---
 
 (defun rest-handle (node uri)
@@ -333,6 +353,10 @@ to its handler. Returns the response body; sets status/content-type."
         ((alexandria:starts-with-subseq "getutxos/" rest)
          (multiple-value-bind (b e) (%rest-split-ext (after "getutxos/"))
            (%rest-getutxos node b e)))
+        ;; Unauthenticated liveness probe (bitcoin-lisp extension, not Core):
+        ;; /rest/health or /rest/health.json.
+        ((or (string= rest "health") (string= rest "health.json"))
+         (%rest-health node))
         (t (%rest-error 404 "Unknown REST endpoint"))))))
 
 (defun rest-dispatch-handler ()
