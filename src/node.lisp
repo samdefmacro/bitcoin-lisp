@@ -127,6 +127,15 @@ we cap lower). Excess inbound connections are disconnected at merge time.")
   ;; addnode "onetry": one-shot dial requests handed off to the sync thread so
   ;; node-peers stays single-writer (only the sync thread pushes to it).
   (pending-onetry '() :type list)
+  ;; Durable at-tip liveness signal (item #6). last-tip-advance-time is the
+  ;; wall-clock (get-universal-time) of the last observed active-chain tip
+  ;; advance; last-tip-height is the tip height at that observation. Unlike the
+  ;; ibd-context copy (nil between sync passes), these persist so the
+  ;; /rest/health probe can tell a live, progressing node from a wedged one
+  ;; (sync thread alive but tip frozen). Seeded at sync start;
+  ;; note-node-tip-progress bumps them from the sync loop.
+  (last-tip-advance-time 0 :type integer)
+  (last-tip-height 0 :type integer)
   (max-peers 8 :type (unsigned-byte 8)))
 
 ;;; Chainstate selection (Core ChainstateManager, validation.h:1119-1145).
@@ -189,6 +198,60 @@ never clobbered utxo-set)."
 
 (defvar *node-start-time* nil
   "Unix time the node was started (set by start-node); basis for the uptime RPC.")
+
+;;;; At-tip liveness signal (item #6): a durable, node-level record of when the
+;;;; active chain tip last advanced, plus the /rest/health decision it feeds.
+;;;; The ibd-context copy (networking) is nil between sync passes; these node
+;;;; slots persist so an external monitor can distinguish a live, progressing
+;;;; node from a wedged one (sync thread alive but tip frozen — the failure
+;;;; mode the layer-5 work chased).
+
+(defparameter *health-max-tip-staleness-seconds* 5400
+  "Seconds the active chain tip may go without advancing before /rest/health
+reports the node unhealthy (HTTP 503). Deliberately generous (90 min): the goal
+is to surface a wedged-but-running node, not normal quiet periods. Testnet4
+permits 20-minute minimum-difficulty blocks and occasional longer gaps, so a
+tight threshold would flap; a multi-hour wedge is still caught quickly.")
+
+(defun note-node-tip-progress (node)
+  "Observe the active chain tip from the sync loop; if it rose past the last
+height recorded on NODE, stamp NODE's durable last-tip-advance time. An O(1)
+height read, safe to call every loop iteration. This is the persistent
+counterpart to note-tip-advanced's ephemeral ibd-context slot."
+  (let* ((cs (node-current-chainstate node))
+         (h (and cs (bitcoin-lisp.storage:current-height cs))))
+    (when (and (integerp h) (> h (node-last-tip-height node)))
+      (setf (node-last-tip-height node) h
+            (node-last-tip-advance-time node) (get-universal-time)))))
+
+(defun health-ok-p (sync-thread-alive-p seconds-since-tip
+                    &optional (threshold *health-max-tip-staleness-seconds*))
+  "Pure /rest/health decision: T (serve HTTP 200) iff the sync thread is alive
+AND the tip advanced within THRESHOLD seconds; NIL (serve HTTP 503) otherwise.
+Kept free of node state so it is directly unit-testable."
+  (and sync-thread-alive-p
+       (integerp seconds-since-tip)
+       (<= seconds-since-tip threshold)
+       t))
+
+(defun node-tip-liveness (node)
+  "Liveness report for the /rest/health endpoint, as
+(values healthy-p seconds-since-tip synced-p). Lock-free and side-effect-free
+(a health probe must neither block on the node lock nor mutate IBD state):
+  HEALTHY-P         - health-ok-p of the two signals below.
+  SECONDS-SINCE-TIP - wall-clock seconds since the last observed tip advance,
+                      or MOST-POSITIVE-FIXNUM if the tip has never advanced.
+  SYNCED-P          - node has left initial block download (latched IBD cache,
+                      read without triggering initial-block-download-p's latch)."
+  (let* ((alive (and (node-sync-thread node)
+                     (bt:thread-alive-p (node-sync-thread node))
+                     t))
+         (last (node-last-tip-advance-time node))
+         (seconds (if (plusp last)
+                      (max 0 (- (get-universal-time) last))
+                      most-positive-fixnum))
+         (synced (not bitcoin-lisp.networking::*cached-is-ibd*)))
+    (values (health-ok-p alive seconds) seconds synced)))
 
 ;;;; Logging (macros and core functions defined in logging.lisp)
 
@@ -1783,23 +1846,27 @@ Returns the node instance."
     ;; Fresh recent-confirmed filter (Core builds it per process; covers
     ;; in-image restarts).
     (bitcoin-lisp.validation:reset-recent-confirmed)
+    ;; Seed the durable at-tip liveness signal (item #6) so a freshly-started,
+    ;; already-at-tip node reports healthy on /rest/health before its first new
+    ;; block. last-tip-height starts at the current tip so only genuine advances
+    ;; bump the timestamp.
+    (let ((cs (node-current-chainstate *node*)))
+      (setf (node-last-tip-advance-time *node*) (get-universal-time)
+            (node-last-tip-height *node*)
+            (if cs (bitcoin-lisp.storage:current-height cs) 0)))
     (setf (node-sync-thread *node*)
           (bt:make-thread
            (lambda ()
              (handler-case
-                 (handler-bind
-                     ((error
-                        (lambda (c)
-                          ;; handler-bind keeps the stack live; backtrace here
-                          ;; points at the actual error site. handler-case
-                          ;; (outer) then unwinds.
-                          (log-error "Sync thread error: ~A" c)
-                          #+sbcl
-                          (let ((bt (with-output-to-string (s)
-                                      (sb-debug:print-backtrace :stream s :count 50))))
-                            (log-error "Sync thread backtrace:~%~A" bt)))))
-                   ;; Initial connection
-                   (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
+                 (progn
+                   ;; Initial connection. Guarded on its own so a startup dial
+                   ;; failure logs and defers to the loop's reconnect path
+                   ;; instead of ending the thread (a dead sync thread with
+                   ;; node-running still T is a socket-reading zombie).
+                   (handler-case
+                       (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
+                     (error (c)
+                       (log-error "Initial peer connection failed (retrying in loop): ~A" c)))
                    ;; Sync + follow-tip loop runs until node shutdown. The
                    ;; previous early-return on "sync complete" exited the only
                    ;; thread reading from peer sockets, so live tip
@@ -1807,7 +1874,23 @@ Returns the node instance."
                    ;; new tips via sendheaders (BIP 130); this 30s poll is the
                    ;; backstop for inv-only peers and missed announcements.
                    (loop while (node-running *node*)
-                         do (merge-inbound-peers *node*)
+                         ;; Per-iteration error containment (item #5): a
+                         ;; transient error must retry the loop, never unwind
+                         ;; out of it and end the thread. handler-bind logs a
+                         ;; live-stack backtrace at the error site; the
+                         ;; enclosing handler-case then unwinds to the short
+                         ;; backoff + retry in its error clause below.
+                         do (handler-case
+                                (handler-bind
+                                    ((error
+                                       (lambda (c)
+                                         (log-error "Sync thread error: ~A" c)
+                                         #+sbcl
+                                         (let ((bt (with-output-to-string (s)
+                                                     (sb-debug:print-backtrace
+                                                      :stream s :count 50))))
+                                           (log-error "Sync thread backtrace:~%~A" bt)))))
+                                  (merge-inbound-peers *node*)
                             ;; Maintain manually-added peers each cycle (addnode).
                             (connect-added-nodes *node*)
                             (cond
@@ -1816,6 +1899,10 @@ Returns the node instance."
                                (unwind-protect
                                     (sync-blockchain *node*)
                                  (setf (node-syncing *node*) nil))
+                               ;; Durable at-tip liveness signal (item #6):
+                               ;; record a tip advance whenever this sync pass
+                               ;; raised the active-chain height.
+                               (note-node-tip-progress *node*)
                                ;; Full peer maintenance, not just replacement:
                                ;; health checks + outgoing pings, addnode
                                ;; retry, slot refill, dedicated block-relay
@@ -1903,6 +1990,9 @@ Returns the node instance."
                                           ;; next sync cycle now to fetch the
                                           ;; block instead of waiting out the
                                           ;; 30s poll.
+                                          ;; Record a tip advance observed this
+                                          ;; second (item #6 durable liveness).
+                                          (note-node-tip-progress *node*)
                                           (when (plusp (bitcoin-lisp.networking:ibd-context-headers-received pump))
                                             (return)))))
                               (t
@@ -1910,7 +2000,15 @@ Returns the node instance."
                                (loop repeat 5 while (node-running *node*)
                                      do (sleep 1))
                                (connect-to-peers *node* max-peers
-                                                 :timeout 30 :min-peers 1)))))
+                                                 :timeout 30 :min-peers 1))))
+                              (error (c)
+                                ;; Transient iteration error: the backtrace was
+                                ;; already logged above (live stack). Log a
+                                ;; summary, short-backoff, and RETRY the loop
+                                ;; rather than let the error end the thread.
+                                (log-error "Sync thread iteration error (retrying): ~A" c)
+                                (loop repeat 5 while (node-running *node*)
+                                      do (sleep 1))))))
                (error () nil)))
            :name "bitcoin-sync-thread")))
 
