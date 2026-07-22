@@ -498,10 +498,15 @@ character makes -uacomment an init error, matching Core."
 (defun format-subversion (comments)
   "BIP14 subversion string with COMMENTS (Core FormatSubVersion,
 clientversion.cpp:67-72): \"/bitcoin-lisp:0.1.0(c1; c2)/\", no parens block
-when COMMENTS is empty."
-  (if comments
-      (format nil "/bitcoin-lisp:0.1.0(~{~A~^; ~})/" comments)
-      "/bitcoin-lisp:0.1.0/"))
+when COMMENTS is empty. When the running build's short git rev has been stamped
+(bitcoin-lisp.serialization:*build-git-rev*), it is prepended as a leading
+\"g<rev>\" comment so the advertised subversion identifies the deployed build;
+unstamped, output is byte-identical to plain Core parity."
+  (let* ((git (bitcoin-lisp.serialization::subversion-git-comment))
+         (all (if git (cons git comments) comments)))
+    (if all
+        (format nil "/bitcoin-lisp:0.1.0(~{~A~^; ~})/" all)
+        "/bitcoin-lisp:0.1.0/")))
 
 (defconstant +default-proxy-port+ 9050
   "Default SOCKS5 proxy port when -proxy/-onion gives no :port (Tor's SOCKS

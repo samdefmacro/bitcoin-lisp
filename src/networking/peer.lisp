@@ -991,17 +991,6 @@ duplicates are rare)."
   (setf (peer-last-block-time peer) (bitcoin-lisp.serialization:get-unix-time))
   (setf (peer-block-timeout-count peer) 0))
 
-(defun peer-stalling-p (peer &key (timeout-seconds 30))
-  "Check if PEER is stalling block download.
-A peer is stalling if it has been connected and we haven't received a block
-from it in TIMEOUT-SECONDS despite having in-flight requests.
-Returns T if the peer appears to be stalling."
-  (and (eq (peer-state peer) :ready)
-       (not (zerop (peer-last-block-received-time peer)))
-       (> (/ (float (- (get-internal-real-time) (peer-last-block-received-time peer)))
-             (float internal-time-units-per-second))
-          timeout-seconds)))
-
 (defun consider-peer-eviction (peer our-height)
   "Check if PEER should be evicted based on chain quality.
 Peers whose advertised height is significantly behind our validated tip
