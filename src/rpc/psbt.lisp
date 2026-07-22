@@ -878,6 +878,25 @@ must be written to the input (taproot: != DEFAULT; else != DEFAULT and != ALL)."
             (if taproot (/= eff #x00) (and (/= eff #x00) (/= eff #x01)))
             nil)))
 
+(defun %input-sig-witness-p (sig)
+  "True when the input-sig SIG is a segwit (witness) signature — the kinds for
+which Core's ProduceSignature sets SignatureData.witness. Legacy kinds (:p2pkh,
+:multisig, :p2sh-multisig) are false."
+  (and (member (input-sig-kind sig)
+               '(:p2wpkh :p2tr :p2wsh :p2sh-p2wpkh :p2sh-p2wsh))
+       t))
+
+(defun %psbt-require-witness-sig-p (map)
+  "Core SignPSBTInput's require_witness_sig: an input whose only prevout source is
+the witness_utxo (no non_witness_utxo) can only be signed with a witness
+signature — witness_utxo alone cannot authenticate a non-witness (legacy) spend,
+so a legacy signature over it must be refused. True when witness_utxo is present
+and non_witness_utxo is absent."
+  (and (bitcoin-lisp.serialization:psbt-map-find
+        map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)
+       (not (bitcoin-lisp.serialization:psbt-map-find
+             map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))))
+
 (defun %psbt-record-signatures (psbt coins keymap pubmap tr-keymap user-sighash)
   "Compute + record partial signatures on every non-final input of PSBT the key
 maps can satisfy, sourcing prevouts from COINS. ECDSA partial sigs go into
@@ -913,7 +932,13 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                   (%compute-input-signatures tx i prev keymap pubmap tr-keymap
                                              (if (zerop eff) #x01 eff)
                                              precomp spent-utxos eff)
-                (unless err
+                ;; Core SignPSBTInput's require_witness_sig gate: never record a
+                ;; legacy (non-witness) signature for an input sourced only from
+                ;; the witness_utxo — Core refuses it (a witness_utxo cannot
+                ;; authenticate a non-witness spend).
+                (unless (or err
+                            (and (%psbt-require-witness-sig-p map)
+                                 (not (%input-sig-witness-p sig))))
                   (when (and (input-sig-redeem sig)
                              (not (bitcoin-lisp.serialization:psbt-map-find
                                    map bitcoin-lisp.serialization:+psbt-in-redeem-script+)))
@@ -930,11 +955,18 @@ key we do not hold (or an unsourceable prevout) leaves the input untouched."
                     (bitcoin-lisp.serialization:psbt-map-set
                      map bitcoin-lisp.serialization:+psbt-in-sighash+ empty
                      (%psbt-uint32-le eff)))
+                  ;; Core CreateSig reuses a signature already present for a key
+                  ;; (input.FillSignatureData loads existing partial_sigs) rather
+                  ;; than re-signing — so an input already signed by this pubkey
+                  ;; keeps its existing sig. Never overwrite one we already hold.
                   (dolist (pair (input-sig-ecdsa sig))
-                    (bitcoin-lisp.serialization:psbt-map-set
-                     map bitcoin-lisp.serialization:+psbt-in-partial-sig+
-                     (car pair) (cdr pair)))
-                  (when (input-sig-tap sig)
+                    (unless (%psbt-sig-for map (car pair))
+                      (bitcoin-lisp.serialization:psbt-map-set
+                       map bitcoin-lisp.serialization:+psbt-in-partial-sig+
+                       (car pair) (cdr pair))))
+                  (when (and (input-sig-tap sig)
+                             (not (bitcoin-lisp.serialization:psbt-map-find
+                                   map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+)))
                     (bitcoin-lisp.serialization:psbt-map-set
                      map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+ empty
                      (input-sig-tap sig))))))))))))
