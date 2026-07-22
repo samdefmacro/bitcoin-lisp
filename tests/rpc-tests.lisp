@@ -2995,3 +2995,38 @@ mining order (parent's first)."
                              (cdr (assoc "chunkfee" (first chunks) :test #'string=))))))
       (is (= 100 (round (* 100000000
                            (cdr (assoc "chunkfee" (second chunks) :test #'string=)))))))))
+
+;;; --- /rest/health liveness decision (item #6) ---
+
+(test rest-health-decision-logic
+  "health-ok-p feeds /rest/health: HTTP 200 only when the sync thread is alive
+AND the tip advanced within the staleness threshold; HTTP 503 otherwise."
+  (let ((threshold bitcoin-lisp::*health-max-tip-staleness-seconds*))
+    ;; Alive + recent tip -> healthy (HTTP 200).
+    (is-true (bitcoin-lisp::health-ok-p t 5))
+    (is-true (bitcoin-lisp::health-ok-p t 0))
+    ;; Boundary: exactly at the threshold is still healthy (<=).
+    (is-true (bitcoin-lisp::health-ok-p t threshold))
+    ;; Stale tip -> unhealthy (HTTP 503) even though the thread is alive.
+    (is-false (bitcoin-lisp::health-ok-p t (1+ threshold)))
+    (is-false (bitcoin-lisp::health-ok-p t (* threshold 100)))
+    ;; Dead / absent sync thread -> unhealthy regardless of tip recency.
+    (is-false (bitcoin-lisp::health-ok-p nil 5))
+    (is-false (bitcoin-lisp::health-ok-p nil (1+ threshold)))
+    ;; An explicit THRESHOLD argument is honored.
+    (is-true (bitcoin-lisp::health-ok-p t 30 60))
+    (is-false (bitcoin-lisp::health-ok-p t 90 60))))
+
+(test rest-health-liveness-report
+  "node-tip-liveness on a fresh, unstarted node: no sync thread -> unhealthy,
+and a never-advanced tip reads as a large seconds-since-tip."
+  (let ((node (bitcoin-lisp::make-node :network :testnet4)))
+    (multiple-value-bind (healthy seconds synced)
+        (bitcoin-lisp::node-tip-liveness node)
+      (declare (ignore synced))
+      ;; No sync thread has been started, so the probe reports unhealthy.
+      (is-false healthy)
+      ;; The tip has never advanced (last-tip-advance-time = 0), so
+      ;; seconds-since-tip is well past the staleness threshold.
+      (is (integerp seconds))
+      (is (>= seconds bitcoin-lisp::*health-max-tip-staleness-seconds*)))))
