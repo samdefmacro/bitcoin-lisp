@@ -3902,61 +3902,226 @@ order; else NIL."
             (when (and (= i (- len 2)) (= (length pubkeys) n))
               (values m n (nreverse pubkeys)))))))))
 
-(defun %collect-multisig-sigs (sighash pubmap pubkeys m sighash-byte)
-  "ECDSA signatures (DER || sighash-byte) for the keys we hold among PUBKEYS, in
-pubkey order, capped at M. CHECKMULTISIG requires sigs ordered as the pubkeys
-appear, which iterating PUBKEYS in order preserves."
-  (let ((sigs '()) (count 0))
-    (dolist (pub pubkeys (nreverse sigs))
+(defun %collect-multisig-sig-pairs (sighash pubmap pubkeys m sighash-byte)
+  "ECDSA (pubkey . DER||sighash-byte) pairs for the keys we hold among PUBKEYS,
+in pubkey order, capped at M. CHECKMULTISIG requires sigs ordered as the pubkeys
+appear, which iterating PUBKEYS in order preserves. The cap at M matches the
+in-place signer's historical collection (finalize needs exactly M); the PSBT
+signer therefore records at most M partial sigs per multisig input."
+  (let ((pairs '()) (count 0))
+    (dolist (pub pubkeys (nreverse pairs))
       (when (< count m)
         (let ((sk (gethash pub pubmap)))
           (when sk
-            (push (concatenate '(vector (unsigned-byte 8))
-                               (bitcoin-lisp.crypto:sign-ecdsa sk sighash)
-                               (vector sighash-byte))
-                  sigs)
+            (push (cons pub (concatenate '(vector (unsigned-byte 8))
+                                         (bitcoin-lisp.crypto:sign-ecdsa sk sighash)
+                                         (vector sighash-byte)))
+                  pairs)
             (incf count)))))))
 
-(defun %multisig-scriptsig (subscript tx input-index sighash-byte pubmap &optional redeem)
-  "Legacy multisig scriptSig for a multisig SUBSCRIPT (also the sighash subscript).
-Returns (values scriptsig nil) = OP_0 <sig>... [push(redeem)] when we hold m keys,
-else (values nil error-string). REDEEM (the P2SH redeemScript) is appended when
-given; omit it for bare multisig. *current-tx* must be bound by the caller."
-  (multiple-value-bind (m nn pubkeys) (%parse-multisig subscript)
-    (declare (ignore nn))
-    (if (null m)
-        (values nil "script is not multisig")
-        (let* ((sighash (bitcoin-lisp.coalton.interop::compute-legacy-sighash
-                         tx input-index subscript sighash-byte))
-               (sigs (%collect-multisig-sigs sighash pubmap pubkeys m sighash-byte)))
-          (if (< (length sigs) m)
-              (values nil (format nil "multisig needs ~D sigs, have ~D" m (length sigs)))
-              (values (apply #'concatenate '(vector (unsigned-byte 8))
-                             (vector 0)   ; CHECKMULTISIG NULLDUMMY
-                             (append (mapcar #'%script-push sigs)
-                                     (when redeem (list (%script-push redeem)))))
-                      nil))))))
+;;; --- Per-input signing split into (compute signatures) + (finalize) ---
+;;;
+;;; %sign-tx-inputs historically both computed each input's signature(s) AND
+;;; finalized them into scriptSig/witness in one pass. Wallet P5's PSBT signer
+;;; needs the FIRST half alone (record partial sigs without finalizing), so the
+;;; per-input work is factored into %compute-input-signatures (the funds-critical
+;;; sighash + sign dispatch) and %finalize-input-signatures (assembly). The spend
+;;; path still runs both back-to-back and its output is byte-identical.
 
-(defun %multisig-witness-stack (witscript amount input-index sighash-byte pubmap precomp)
-  "P2WSH multisig witness stack for WITSCRIPT. Returns (values stack nil) =
-(<empty> <sig>... witscript) when we hold m keys, else (values nil error-string).
-*current-tx*/*current-spent-utxos* must be bound by the caller."
-  (multiple-value-bind (m nn pubkeys) (%parse-multisig witscript)
-    (declare (ignore nn))
-    (cond
-      ((null m) (values nil "witnessScript is not multisig"))
-      ((null amount) (values nil "P2WSH requires amount"))
-      (t (let* ((bitcoin-lisp.coalton.interop::*current-input-index* input-index)
-                (bitcoin-lisp.coalton.interop::*precomputed-sighash* precomp)
-                (sighash (bitcoin-lisp.coalton.interop::compute-bip143-sighash
-                          witscript amount sighash-byte))
-                (sigs (%collect-multisig-sigs sighash pubmap pubkeys m sighash-byte)))
-           (if (< (length sigs) m)
-               (values nil (format nil "multisig needs ~D sigs, have ~D" m (length sigs)))
-               (values (concatenate 'list
-                                    (list (make-array 0 :element-type '(unsigned-byte 8)))
-                                    sigs (list witscript))
-                       nil)))))))
+(defstruct (input-sig (:constructor %make-input-sig))
+  "Signature material for one input, produced by %compute-input-signatures
+without finalizing. KIND selects the finalize shape; ECDSA is an ordered list of
+(pubkey . sig) pairs (sig = DER || sighash-byte); TAP is a taproot key-path
+signature; NEEDED is the m-of-n threshold finalize enforces (1 for single-key);
+REDEEM/WITNESS-SCRIPT are the P2SH/P2WSH sub-scripts to reveal."
+  (kind nil :type symbol)
+  (ecdsa '() :type list)
+  (tap nil)
+  (needed 0 :type fixnum)
+  (redeem nil)
+  (witness-script nil))
+
+(defun %compute-input-signatures (tx i prev keymap pubmap tr-keymap sighash-byte
+                                  precomp spent-utxos &optional (tap-sighash-type #x00))
+  "Compute the signature material for input I of TX spending PREV
+= (script-pubkey amount redeem witness-script), using the key maps. Returns
+(values input-sig error-string): the funds-critical sighash + sign dispatch
+shared by the in-place spend signer (%sign-tx-inputs, which then finalizes) and
+the PSBT signer (which records the partial sigs). It never applies the m-of-n
+completeness threshold — %finalize-input-signatures does — so the PSBT signer can
+record the partial sigs it managed to produce. TAP-SIGHASH-TYPE is the taproot
+sighash byte (0 = SIGHASH_DEFAULT; the spend path always passes 0, preserving its
+historical DEFAULT-only taproot signing). *current-tx* / *current-spent-utxos*
+must be bound by the caller."
+  (let* ((spk (first prev)) (amount (second prev))
+         (redeem (third prev)) (witness-script (fourth prev))
+         (type (%script-type spk))
+         (bitcoin-lisp.coalton.interop::*current-input-index* i)
+         (bitcoin-lisp.coalton.interop::*precomputed-sighash* precomp))
+    (macrolet ((fail (msg)
+                 `(return-from %compute-input-signatures (values nil ,msg))))
+      (labels ((legacy-sig (subscript key)
+                 (concatenate '(vector (unsigned-byte 8))
+                              (bitcoin-lisp.crypto:sign-ecdsa
+                               key (bitcoin-lisp.coalton.interop::compute-legacy-sighash
+                                    tx i subscript sighash-byte))
+                              (vector sighash-byte)))
+               (bip143-sig (script-code key)
+                 (concatenate '(vector (unsigned-byte 8))
+                              (bitcoin-lisp.crypto:sign-ecdsa
+                               key (bitcoin-lisp.coalton.interop::compute-bip143-sighash
+                                    script-code amount sighash-byte))
+                              (vector sighash-byte)))
+               (p2wpkh-scriptcode (pkh)
+                 (concatenate '(vector (unsigned-byte 8))
+                              (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
+               (legacy-multisig (subscript)
+                 (multiple-value-bind (m nn pubkeys) (%parse-multisig subscript)
+                   (declare (ignore nn))
+                   (values (%collect-multisig-sig-pairs
+                            (bitcoin-lisp.coalton.interop::compute-legacy-sighash
+                             tx i subscript sighash-byte)
+                            pubmap pubkeys m sighash-byte)
+                           m)))
+               (bip143-multisig (witscript)
+                 (multiple-value-bind (m nn pubkeys) (%parse-multisig witscript)
+                   (declare (ignore nn))
+                   (values (%collect-multisig-sig-pairs
+                            (bitcoin-lisp.coalton.interop::compute-bip143-sighash
+                             witscript amount sighash-byte)
+                            pubmap pubkeys m sighash-byte)
+                           m))))
+        (cond
+          ((string= type "pubkeyhash")
+           (let ((entry (gethash (subseq spk 3 23) keymap)))
+             (unless entry (fail "no key for P2PKH"))
+             (values (%make-input-sig
+                      :kind :p2pkh :needed 1
+                      :ecdsa (list (cons (cdr entry) (legacy-sig spk (car entry))))))))
+          ((string= type "witness_v0_keyhash")
+           (let ((entry (gethash (subseq spk 2 22) keymap)))
+             (cond
+               ((null entry) (fail "no key for P2WPKH"))
+               ((null amount) (fail "P2WPKH requires amount"))
+               (t (values (%make-input-sig
+                           :kind :p2wpkh :needed 1
+                           :ecdsa (list (cons (cdr entry)
+                                              (bip143-sig (p2wpkh-scriptcode (subseq spk 2 22))
+                                                          (car entry))))))))))
+          ((string= type "witness_v1_taproot")
+           (let ((sk (gethash (subseq spk 2 34) tr-keymap)))
+             (cond
+               ((null sk) (fail "no key for P2TR (key path)"))
+               ((null spent-utxos)
+                (fail "P2TR requires prevtx amounts for all inputs"))
+               (t (let* ((sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
+                                   amount tap-sighash-type nil nil))
+                         (tsk (bitcoin-lisp.crypto:taproot-tweak-private-key sk))
+                         (sig64 (bitcoin-lisp.crypto:sign-schnorr tsk sighash))
+                         (sig (if (zerop tap-sighash-type)
+                                  sig64
+                                  (concatenate '(vector (unsigned-byte 8))
+                                               sig64 (vector tap-sighash-type)))))
+                    (values (%make-input-sig :kind :p2tr :needed 1 :tap sig)))))))
+          ((string= type "scripthash")   ; P2SH (wrapped)
+           (cond
+             ((null redeem) (fail "P2SH requires redeemScript"))
+             ((not (equalp (bitcoin-lisp.crypto:hash160 redeem) (subseq spk 2 22)))
+              (fail "redeemScript hash mismatch"))
+             ;; P2SH-P2WPKH (nested segwit single-key)
+             ((and (= (length redeem) 22) (= (aref redeem 0) #x00) (= (aref redeem 1) #x14))
+              (let ((entry (gethash (subseq redeem 2 22) keymap)))
+                (cond
+                  ((null entry) (fail "no key for P2SH-P2WPKH"))
+                  ((null amount) (fail "P2SH-P2WPKH requires amount"))
+                  (t (values (%make-input-sig
+                              :kind :p2sh-p2wpkh :needed 1 :redeem redeem
+                              :ecdsa (list (cons (cdr entry)
+                                                 (bip143-sig (p2wpkh-scriptcode (subseq redeem 2 22))
+                                                             (car entry))))))))))
+             ;; P2SH-P2WSH (nested segwit multisig; witnessScript = real script)
+             ((and (= (length redeem) 34) (= (aref redeem 0) #x00) (= (aref redeem 1) #x20))
+              (cond
+                ((null witness-script) (fail "P2SH-P2WSH requires witnessScript"))
+                ((not (equalp (bitcoin-lisp.crypto:sha256 witness-script) (subseq redeem 2 34)))
+                 (fail "witnessScript hash mismatch (P2SH-P2WSH)"))
+                ((not (%parse-multisig witness-script)) (fail "witnessScript is not multisig"))
+                ((null amount) (fail "P2WSH requires amount"))
+                (t (multiple-value-bind (pairs m) (bip143-multisig witness-script)
+                     (values (%make-input-sig :kind :p2sh-p2wsh :needed m :redeem redeem
+                                              :witness-script witness-script :ecdsa pairs))))))
+             ;; P2SH-multisig (legacy)
+             ((%parse-multisig redeem)
+              (multiple-value-bind (pairs m) (legacy-multisig redeem)
+                (values (%make-input-sig :kind :p2sh-multisig :needed m :redeem redeem
+                                         :ecdsa pairs))))
+             (t (fail "unsupported redeemScript type"))))
+          ((string= type "witness_v0_scripthash")   ; native P2WSH
+           (cond
+             ((null witness-script) (fail "P2WSH requires witnessScript"))
+             ((not (equalp (bitcoin-lisp.crypto:sha256 witness-script) (subseq spk 2 34)))
+              (fail "witnessScript hash mismatch"))
+             ((not (%parse-multisig witness-script)) (fail "witnessScript is not multisig"))
+             ((null amount) (fail "P2WSH requires amount"))
+             (t (multiple-value-bind (pairs m) (bip143-multisig witness-script)
+                  (values (%make-input-sig :kind :p2wsh :needed m
+                                           :witness-script witness-script :ecdsa pairs))))))
+          ((%parse-multisig spk)   ; bare multisig
+           (multiple-value-bind (pairs m) (legacy-multisig spk)
+             (values (%make-input-sig :kind :multisig :needed m :ecdsa pairs))))
+          (t (fail (format nil "unsupported scriptPubKey type ~A" type))))))))
+
+(defun %finalize-input-signatures (sig)
+  "Re-assemble the input-sig SIG into (values scriptsig witness error),
+byte-identical to the historical in-place signer's per-arm assembly. A NIL
+scriptsig leaves the input's scriptSig untouched; a NIL witness sets no witness.
+ERROR (a string) means the m-of-n threshold was not met — the same 'multisig
+needs N sigs, have K' report the old signer produced; single-key kinds never
+error here (a missing key already failed in %compute-input-signatures)."
+  (let ((empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (labels ((sigs () (mapcar #'cdr (input-sig-ecdsa sig)))
+             (threshold-error (prefix)
+               (when (< (length (input-sig-ecdsa sig)) (input-sig-needed sig))
+                 (format nil "~Amultisig needs ~D sigs, have ~D"
+                         prefix (input-sig-needed sig) (length (input-sig-ecdsa sig))))))
+      (ecase (input-sig-kind sig)
+        (:p2pkh (let ((s (first (input-sig-ecdsa sig))))
+                  (values (concatenate '(vector (unsigned-byte 8))
+                                       (%script-push (cdr s)) (%script-push (car s)))
+                          nil nil)))
+        (:p2wpkh (let ((s (first (input-sig-ecdsa sig))))
+                   (values nil (list (cdr s) (car s)) nil)))
+        (:p2tr (values nil (list (input-sig-tap sig)) nil))
+        (:p2sh-p2wpkh (let ((s (first (input-sig-ecdsa sig))))
+                        (values (%script-push (input-sig-redeem sig))
+                                (list (cdr s) (car s)) nil)))
+        (:p2wsh (let ((err (threshold-error "")))
+                  (if err
+                      (values nil nil err)
+                      (values nil (concatenate 'list (list empty) (sigs)
+                                               (list (input-sig-witness-script sig)))
+                              nil))))
+        (:p2sh-p2wsh (let ((err (threshold-error "")))
+                       (if err
+                           (values nil nil err)
+                           (values (%script-push (input-sig-redeem sig))
+                                   (concatenate 'list (list empty) (sigs)
+                                                (list (input-sig-witness-script sig)))
+                                   nil))))
+        (:multisig (let ((err (threshold-error "")))
+                     (if err
+                         (values nil nil err)
+                         (values (apply #'concatenate '(vector (unsigned-byte 8))
+                                        (vector 0) (mapcar #'%script-push (sigs)))
+                                 nil nil))))
+        (:p2sh-multisig (let ((err (threshold-error "P2SH-")))
+                          (if err
+                              (values nil nil err)
+                              (values (apply #'concatenate '(vector (unsigned-byte 8))
+                                             (vector 0)
+                                             (append (mapcar #'%script-push (sigs))
+                                                     (list (%script-push (input-sig-redeem sig)))))
+                                      nil nil))))))))
 
 (defun %build-spent-utxos (inputs prevmap)
   "Vector of storage:utxo-entry for every input (the spent outputs, needed for the
@@ -4007,126 +4172,24 @@ Returns a list of (input-index . error-message), NIL when every input signed."
                (prev (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
                                     (bitcoin-lisp.serialization:outpoint-index op))
                               prevmap)))
+          ;; Compute the input's signature material then finalize it into
+          ;; scriptSig/witness. Taproot signs SIGHASH_DEFAULT (tap-sighash 0),
+          ;; the historical spend-path behavior.
           (if (null prev)
               (push (cons i "no prevtx scriptPubKey provided") errors)
-              (let* ((spk (first prev)) (amount (second prev))
-                     (redeem (third prev)) (witness-script (fourth prev))
-                     (type (%script-type spk)))
-                (cond
-                  ((string= type "pubkeyhash")
-                   (let ((entry (gethash (subseq spk 3 23) keymap)))
-                     (if (null entry)
-                         (push (cons i "no key for P2PKH") errors)
-                         (let* ((sighash (bitcoin-lisp.coalton.interop::compute-legacy-sighash
-                                          tx i spk sighash-byte))
-                                (sig (concatenate '(vector (unsigned-byte 8))
-                                                  (bitcoin-lisp.crypto:sign-ecdsa (car entry) sighash)
-                                                  (vector sighash-byte))))
-                           (setf (bitcoin-lisp.serialization:tx-in-script-sig in)
-                                 (concatenate '(vector (unsigned-byte 8))
-                                              (%script-push sig) (%script-push (cdr entry))))))))
-                  ((string= type "witness_v0_keyhash")
-                   (let ((entry (gethash (subseq spk 2 22) keymap)))
-                     (cond
-                       ((null entry) (push (cons i "no key for P2WPKH") errors))
-                       ((null amount) (push (cons i "P2WPKH requires amount") errors))
-                       (t
-                        (let* ((pkh (subseq spk 2 22))
-                               ;; BIP143 scriptCode for P2WPKH is the implicit P2PKH script.
-                               (script-code (concatenate '(vector (unsigned-byte 8))
-                                                         (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
-                               (bitcoin-lisp.coalton.interop::*current-input-index* i)
-                               (bitcoin-lisp.coalton.interop::*precomputed-sighash* precomp)
-                               (sighash (bitcoin-lisp.coalton.interop::compute-bip143-sighash
-                                         script-code amount sighash-byte))
-                               (sig (concatenate '(vector (unsigned-byte 8))
-                                                 (bitcoin-lisp.crypto:sign-ecdsa (car entry) sighash)
-                                                 (vector sighash-byte))))
-                          (setf (aref witness i) (list sig (cdr entry)))
-                          (setf any-witness t))))))
-                  ((string= type "witness_v1_taproot")
-                   (let ((sk (gethash (subseq spk 2 34) tr-keymap)))
-                     (cond
-                       ((null sk) (push (cons i "no key for P2TR (key path)") errors))
-                       ((null spent-utxos)
-                        (push (cons i "P2TR requires prevtx amounts for all inputs") errors))
-                       (t
-                        (let* ((bitcoin-lisp.coalton.interop::*current-input-index* i)
-                               (bitcoin-lisp.coalton.interop::*precomputed-sighash* precomp)
-                               ;; SIGHASH_DEFAULT (0x00): 64-byte signature, no appended byte.
-                               (sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
-                                         amount #x00 nil nil))
-                               (tsk (bitcoin-lisp.crypto:taproot-tweak-private-key sk))
-                               (sig (bitcoin-lisp.crypto:sign-schnorr tsk sighash)))
-                          (setf (aref witness i) (list sig))
-                          (setf any-witness t))))))
-                  ((string= type "scripthash")   ; P2SH (wrapped)
-                   (cond
-                     ((null redeem)
-                      (push (cons i "P2SH requires redeemScript") errors))
-                     ((not (equalp (bitcoin-lisp.crypto:hash160 redeem) (subseq spk 2 22)))
-                      (push (cons i "redeemScript hash mismatch") errors))
-                     ;; P2SH-P2WPKH (nested segwit single-key)
-                     ((and (= (length redeem) 22) (= (aref redeem 0) #x00) (= (aref redeem 1) #x14))
-                      (let ((entry (gethash (subseq redeem 2 22) keymap)))
-                        (cond
-                          ((null entry) (push (cons i "no key for P2SH-P2WPKH") errors))
-                          ((null amount) (push (cons i "P2SH-P2WPKH requires amount") errors))
-                          (t (let* ((pkh (subseq redeem 2 22))
-                                    (script-code (concatenate '(vector (unsigned-byte 8))
-                                                              (vector #x76 #xa9 #x14) pkh (vector #x88 #xac)))
-                                    (bitcoin-lisp.coalton.interop::*current-input-index* i)
-                                    (bitcoin-lisp.coalton.interop::*precomputed-sighash* precomp)
-                                    (sighash (bitcoin-lisp.coalton.interop::compute-bip143-sighash
-                                              script-code amount sighash-byte))
-                                    (sig (concatenate '(vector (unsigned-byte 8))
-                                                      (bitcoin-lisp.crypto:sign-ecdsa (car entry) sighash)
-                                                      (vector sighash-byte))))
-                               (setf (bitcoin-lisp.serialization:tx-in-script-sig in) (%script-push redeem))
-                               (setf (aref witness i) (list sig (cdr entry)))
-                               (setf any-witness t))))))
-                     ;; P2SH-P2WSH (nested segwit multisig; witnessScript = real script)
-                     ((and (= (length redeem) 34) (= (aref redeem 0) #x00) (= (aref redeem 1) #x20))
+              (multiple-value-bind (sig err)
+                  (%compute-input-signatures tx i prev keymap pubmap tr-keymap
+                                             sighash-byte precomp spent-utxos)
+                (if err
+                    (push (cons i err) errors)
+                    (multiple-value-bind (ss wit ferr) (%finalize-input-signatures sig)
                       (cond
-                        ((null witness-script)
-                         (push (cons i "P2SH-P2WSH requires witnessScript") errors))
-                        ((not (equalp (bitcoin-lisp.crypto:sha256 witness-script) (subseq redeem 2 34)))
-                         (push (cons i "witnessScript hash mismatch (P2SH-P2WSH)") errors))
-                        (t (multiple-value-bind (stack err)
-                               (%multisig-witness-stack witness-script amount i sighash-byte pubmap precomp)
-                             (if err
-                                 (push (cons i err) errors)
-                                 (progn
-                                   (setf (bitcoin-lisp.serialization:tx-in-script-sig in) (%script-push redeem))
-                                   (setf (aref witness i) stack)
-                                   (setf any-witness t)))))))
-                     ;; P2SH-multisig (legacy)
-                     ((%parse-multisig redeem)
-                      (multiple-value-bind (ss err)
-                          (%multisig-scriptsig redeem tx i sighash-byte pubmap redeem)
-                        (if err
-                            (push (cons i (format nil "P2SH-~A" err)) errors)
-                            (setf (bitcoin-lisp.serialization:tx-in-script-sig in) ss))))
-                     (t (push (cons i "unsupported redeemScript type") errors))))
-                  ((string= type "witness_v0_scripthash")   ; native P2WSH
-                   (cond
-                     ((null witness-script)
-                      (push (cons i "P2WSH requires witnessScript") errors))
-                     ((not (equalp (bitcoin-lisp.crypto:sha256 witness-script) (subseq spk 2 34)))
-                      (push (cons i "witnessScript hash mismatch") errors))
-                     (t (multiple-value-bind (stack err)
-                            (%multisig-witness-stack witness-script amount i sighash-byte pubmap precomp)
-                          (if err
-                              (push (cons i err) errors)
-                              (progn (setf (aref witness i) stack) (setf any-witness t)))))))
-                  ((%parse-multisig spk)   ; bare multisig
-                   (multiple-value-bind (ss err)
-                       (%multisig-scriptsig spk tx i sighash-byte pubmap)
-                     (if err
-                         (push (cons i err) errors)
-                         (setf (bitcoin-lisp.serialization:tx-in-script-sig in) ss))))
-                  (t (push (cons i (format nil "unsupported scriptPubKey type ~A" type))
-                           errors)))))))
+                        (ferr (push (cons i ferr) errors))
+                        (t (when ss
+                             (setf (bitcoin-lisp.serialization:tx-in-script-sig in) ss))
+                           (when wit
+                             (setf (aref witness i) wit)
+                             (setf any-witness t))))))))))
       (when (or any-witness (bitcoin-lisp.serialization:transaction-witness tx))
         (setf (bitcoin-lisp.serialization:transaction-witness tx) witness)))
     (nreverse errors)))
