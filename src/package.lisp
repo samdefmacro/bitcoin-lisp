@@ -1032,6 +1032,7 @@
    #:get-segwit-activation-height
    ;; Difficulty validation
    #:validate-difficulty
+   #:bip94-timewarp-violation-p
    #:get-expected-bits
    #:testnet-min-difficulty-allowed-p
    #:testnet-walk-back-bits

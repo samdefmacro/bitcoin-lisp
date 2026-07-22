@@ -2077,6 +2077,33 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
              (length missing) (cdr (first missing)))
             (return-from perform-reorg (values nil missing))))
 
+        ;; Corrupt/missing undo on the DISCONNECT side. PHASE A disconnects each
+        ;; old-chain block with (or undo '()) — an EMPTY undo for a SPENDING
+        ;; block silently corrupts the UTXO set: it removes the outputs the
+        ;; block created but never restores the coins it spent, surfacing later
+        ;; as spurious MISSING-INPUT wedges or double-spend acceptance (this node
+        ;; has a documented history of corrupt undo files). get-undo-data returns
+        ;; nil for BOTH a corrupt/missing undo file AND a legitimate coinbase-only
+        ;; block (empty undo), so require undo only for tx-count > 1, mirroring
+        ;; %warn-if-undo-empty's exemption. Refuse with a DISTINCT keyword — NOT
+        ;; the missing-block list, which would (wrongly) tell the caller to
+        ;; re-download the to-CONNECT fork; a corrupt LOCAL disconnect-side undo
+        ;; is not fixed by fetching fork blocks. Core aborts DisconnectBlock on
+        ;; undo-read failure (DISCONNECT_FAILED) for the same reason.
+        (dolist (entry to-disconnect)
+          (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                 (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+            (when (and block
+                       (> (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+                                   block))
+                          1)
+                       (null (get-undo-data block-hash)))
+              (bitcoin-lisp:log-error
+               "REORG REFUSED: corrupt/missing undo for spending block ~A at height ~D — refusing rather than corrupting the UTXO set"
+               (bitcoin-lisp.crypto:bytes-to-hex block-hash)
+               (bitcoin-lisp.storage:block-index-entry-height entry))
+              (return-from perform-reorg (values nil :corrupt-undo)))))
+
         (bitcoin-lisp:log-warn "REORG: old tip height ~D -> fork at ~D -> new tip height ~D"
                                old-height fork-height new-height)
 

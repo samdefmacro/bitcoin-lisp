@@ -743,6 +743,86 @@ failing the reorg forever and wedging the node (testnet4 stuck ~1800 blocks behi
                          (bitcoin-lisp.storage:best-block-hash chain-state)))))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
 
+(defun %make-2tx-reorg-block (prev-hash block-hash height)
+  "A reorg test block with a coinbase PLUS a dummy second tx, so tx-count > 1 —
+exercises the corrupt-undo guard (which exempts coinbase-only blocks, whose
+empty undo is legitimate)."
+  (let* ((base (make-reorg-test-block prev-hash block-hash height))
+         (coinbase (first (bitcoin-lisp.serialization:bitcoin-block-transactions base)))
+         (hdr (bitcoin-lisp.serialization:bitcoin-block-header base))
+         (dummy (bitcoin-lisp.serialization:make-transaction
+                 :version 1
+                 :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                  :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                    :hash block-hash :index 0)
+                                  :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                                  :sequence #xffffffff))
+                 :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                   :value 1000
+                                   :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
+                                                              :initial-element #x51)))
+                 :lock-time 0)))
+    (bitcoin-lisp.serialization:make-bitcoin-block
+     :header hdr :transactions (list coinbase dummy))))
+
+(test perform-reorg-refuses-on-corrupt-disconnect-undo
+  "A to-DISCONNECT spending block (tx-count > 1) whose undo is missing/corrupt
+must make perform-reorg REFUSE with :corrupt-undo — not disconnect with empty
+undo, which silently corrupts the UTXO set (removes the block's created outputs
+but never restores the coins it spent). Coinbase-only disconnect blocks (empty
+undo is legitimate) are exempt. The refusal is a DISTINCT keyword, not the
+missing-block list."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "corrupt-undo")
+     (let* ((genesis-entry (bitcoin-lisp.storage:get-block-index-entry chain-state genesis-hash))
+            (a-hashes (make-test-chain-hashes #xA0 2))
+            (a1-hash (first a-hashes)) (a2-hash (second a-hashes))
+            (a1-block (make-reorg-test-block genesis-hash a1-hash 1))            ; coinbase-only
+            (a2-block (%make-2tx-reorg-block a1-hash a2-hash 2))                 ; SPENDING (tx-count 2)
+            (b-hashes (make-test-chain-hashes #xB0 2))
+            (b1-hash (first b-hashes)) (b2-hash (second b-hashes))
+            (b1-block (make-reorg-test-block genesis-hash b1-hash 1))
+            (b2-block (make-reorg-test-block b1-hash b2-hash 2)))
+       ;; Build the ACTIVE chain genesis -> A1 -> A2 by hand so A2 is a spending
+       ;; block with NO undo stored (the corruption we're modelling). Then a
+       ;; competing fork B1 -> B2.
+       (dolist (blk (list a1-block a2-block b1-block b2-block))
+         (bitcoin-lisp.storage:store-block block-store blk))
+       (let* ((a1-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash a1-hash :height 1 :prev-entry genesis-entry :chain-work 100
+                         :status :valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header a1-block)))
+              (_ (bitcoin-lisp.storage:add-block-index-entry chain-state a1-entry))
+              (a2-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash a2-hash :height 2 :prev-entry a1-entry :chain-work 200
+                         :status :valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header a2-block)))
+              (__ (bitcoin-lisp.storage:add-block-index-entry chain-state a2-entry))
+              (b1-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b1-hash :height 1 :prev-entry genesis-entry :chain-work 150
+                         :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b1-block)))
+              (___ (bitcoin-lisp.storage:add-block-index-entry chain-state b1-entry))
+              (b2-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b2-hash :height 2 :prev-entry b1-entry :chain-work 300
+                         :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b2-block))))
+         (declare (ignore _ __ ___))
+         (bitcoin-lisp.storage:add-block-index-entry chain-state b2-entry)
+         (bitcoin-lisp.storage:update-chain-tip chain-state a2-hash 2)
+         ;; Ensure no undo exists for A2 (the corruption).
+         (clrhash bitcoin-lisp.validation::*block-undo-data*)
+         (multiple-value-bind (ok detail)
+             (bitcoin-lisp.validation:perform-reorg
+              chain-state block-store utxo-set a2-entry b2-entry)
+           (is (null ok))                                   ; refused
+           (is (eq detail :corrupt-undo))                   ; distinct keyword, NOT a missing list
+           ;; No mutation on a refused reorg — tip still A2.
+           (is (= 2 (bitcoin-lisp.storage:current-height chain-state)))
+           (is (equalp a2-hash (bitcoin-lisp.storage:best-block-hash chain-state))))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
 ;;;; Reorg mempool bulk re-add (cluster mempool P8 — Core
 ;;;; MaybeUpdateMempoolForReorg, validation.cpp:294-389)
 
