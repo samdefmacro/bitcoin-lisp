@@ -1019,3 +1019,460 @@ listlabels). PARAMS: (purpose)."
           (error 'rpc-error :code +rpc-invalid-address-or-key+
                             :message "Transaction not eligible for abandonment"))))
     nil))
+
+;;; --- Wallet P7: received-by / keypoolrefill / simulate / groupings ---
+;;;
+;;; Ports, from Bitcoin Core @ d3056bc:
+;;;  - GetReceived (wallet/rpc/coins.cpp:21) behind getreceivedbyaddress /
+;;;    getreceivedbylabel; ListReceived (wallet/rpc/transactions.cpp:75) behind
+;;;    listreceivedbyaddress / listreceivedbylabel — mapWallet output tallies
+;;;    keyed by ExtractDestination, gated by the tx-level depth / coinbase /
+;;;    immature-coinbase filters.
+;;;  - keypoolrefill (wallet/rpc/addresses.cpp:218): TopUpKeyPool over the
+;;;    active SPKMs (wallet.cpp:2591), then RefreshAllTXOs.
+;;;  - simulaterawtransaction (wallet/rpc/wallet.cpp:489): the GetDebit /
+;;;    IsMine balance delta over an array of raw txs, tracking outputs created
+;;;    within the array (new_utxos) and rejecting double-spends across it.
+;;;  - listaddressgroupings (wallet/rpc/addresses.cpp:157) over GetAddressGroupings
+;;;    + GetAddressBalances (receive.cpp:276,304): co-spend clustering by
+;;;    union-find, with change grouped with the inputs and lone owned outputs
+;;;    seeding singletons.
+
+;;; --- getreceivedbyaddress / getreceivedbylabel (coins.cpp:21) ---
+
+(defun %wallet-addresses-for-label (wallet label)
+  "Core CWallet::ListAddrBookAddresses(AddrBookFilter{label}): the non-change
+book addresses whose label equals LABEL."
+  (let ((result '()))
+    (maphash (lambda (address entry)
+               (when (and (addr-book-entry-label entry)
+                          (equal (addr-book-entry-label entry) label))
+                 (push address result)))
+             (wallet-address-book wallet))
+    result))
+
+(defun %wallet-received-total (wallet output-scripts min-depth include-immature)
+  "Σ over mapWallet of the values of outputs whose script is in the
+OUTPUT-SCRIPTS set (Core GetReceived's tally), applying the shared tx-level
+filters (depth, sub-1-conf coinbase, immature coinbase). Caller holds the
+wallet lock."
+  (let ((amount 0))
+    (maphash
+     (lambda (txid wtx)
+       (declare (ignore txid))
+       (let ((depth (wallet-tx-depth wallet wtx)))
+         (unless (or (< depth min-depth)
+                     (and (%wtx-coinbase-p wtx) (< depth 1))
+                     (and (wallet-tx-immature-coinbase-p wallet wtx)
+                          (not include-immature)))
+           (loop for output across (bitcoin-lisp.serialization:transaction-outputs
+                                    (wallet-tx-tx wtx))
+                 do (when (gethash (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                    output)
+                                   output-scripts)
+                      (incf amount (bitcoin-lisp.serialization:tx-out-value
+                                    output)))))))
+     (wallet-map-wallet wallet))
+    amount))
+
+(defun %rpc-getreceived (node params by-label)
+  "Core GetReceived: total received by an address (BY-LABEL nil) or by every
+address with a label (BY-LABEL t). PARAMS: (address|label minconf
+include_immature_coinbase)."
+  (let* ((wallet (wallet-for-request node))
+         (min-depth (if (second params) (second params) 1))
+         (include-immature (%positional-bool (third params))))
+    (unless (integerp min-depth)
+      (error 'rpc-error :code +rpc-type-error+ :message "minconf must be an integer"))
+    (with-wallet-lock (wallet)
+      (let ((output-scripts (make-hash-table :test 'equalp)))
+        (if by-label
+            (let ((addresses (%wallet-addresses-for-label
+                              wallet (%label-from-value (first params)))))
+              (unless addresses
+                (error 'rpc-error :code +rpc-wallet-error+
+                                  :message "Label not found in wallet"))
+              (dolist (address addresses)
+                (multiple-value-bind (type script)
+                    (bitcoin-lisp.crypto:decode-address address
+                                                        (wallet-network wallet))
+                  (declare (ignore type))
+                  (when (and script (%wallet-script-mine-p wallet script))
+                    (setf (gethash script output-scripts) t)))))
+            (multiple-value-bind (type script)
+                (and (stringp (first params))
+                     (bitcoin-lisp.crypto:decode-address (first params)
+                                                         (wallet-network wallet)))
+              (unless type
+                (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                  :message "Invalid Bitcoin address"))
+              (when (%wallet-script-mine-p wallet script)
+                (setf (gethash script output-scripts) t))))
+        (when (zerop (hash-table-count output-scripts))
+          (error 'rpc-error :code +rpc-wallet-error+
+                            :message "Address not found in wallet"))
+        (%btc (%wallet-received-total wallet output-scripts min-depth
+                                      include-immature))))))
+
+(defun rpc-getreceivedbyaddress (node params)
+  "Total amount received by an address in txs with >= minconf confirmations
+(Bitcoin Core getreceivedbyaddress). PARAMS: (address minconf
+include_immature_coinbase)."
+  (%rpc-getreceived node params nil))
+
+(defun rpc-getreceivedbylabel (node params)
+  "Total amount received across all addresses carrying a label (Bitcoin Core
+getreceivedbylabel). PARAMS: (label minconf include_immature_coinbase)."
+  (%rpc-getreceived node params t))
+
+;;; --- listreceivedbyaddress / listreceivedbylabel (transactions.cpp:75) ---
+
+(defstruct (received-tally (:constructor %make-received-tally))
+  "Core ListReceived's tallyitem for one destination."
+  (amount 0 :type integer)
+  (conf most-positive-fixnum :type integer)  ; numeric_limits<int>::max sentinel
+  (txids '()))                               ; wtx txids, reversed
+
+(defun %wallet-received-map-tally (wallet min-depth include-immature filter-address)
+  "Core ListReceived's mapTally: address-string -> received-tally over
+mapWallet outputs that are IsMine (and, when FILTER-ADDRESS, equal to it).
+Caller holds the wallet lock."
+  (let ((tally (make-hash-table :test 'equal)))
+    (maphash
+     (lambda (txid wtx)
+       (declare (ignore txid))
+       (let ((depth (wallet-tx-depth wallet wtx)))
+         (unless (or (< depth min-depth)
+                     (and (%wtx-coinbase-p wtx) (< depth 1))
+                     (and (wallet-tx-immature-coinbase-p wallet wtx)
+                          (not include-immature)))
+           (loop for output across (bitcoin-lisp.serialization:transaction-outputs
+                                    (wallet-tx-tx wtx))
+                 for script = (bitcoin-lisp.serialization:tx-out-script-pubkey
+                               output)
+                 for address = (%script->address script (wallet-network wallet))
+                 do (when (and address
+                               (or (null filter-address)
+                                   (equal address filter-address))
+                               (%wallet-script-mine-p wallet script))
+                      (let ((item (or (gethash address tally)
+                                      (setf (gethash address tally)
+                                            (%make-received-tally)))))
+                        (incf (received-tally-amount item)
+                              (bitcoin-lisp.serialization:tx-out-value output))
+                        (setf (received-tally-conf item)
+                              (min (received-tally-conf item) depth))
+                        (push (wallet-tx-txid wtx) (received-tally-txids item))))))))
+     (wallet-map-wallet wallet))
+    tally))
+
+(defun %listreceived-address-obj (address label item)
+  "One listreceivedbyaddress result object (Core func's non-by_label branch)."
+  (let ((amount (if item (received-tally-amount item) 0))
+        (conf (if item (received-tally-conf item) most-positive-fixnum)))
+    `(("address" . ,address)
+      ("amount" . ,(%btc amount))
+      ("confirmations" . ,(if (= conf most-positive-fixnum) 0 conf))
+      ("label" . ,label)
+      ("txids" . ,(if (and item (received-tally-txids item))
+                      (mapcar #'hash-to-hex (reverse (received-tally-txids item)))
+                      #())))))
+
+(defun rpc-listreceivedbyaddress (node params)
+  "Balances by receiving address (Bitcoin Core listreceivedbyaddress).
+PARAMS: (minconf include_empty include_watchonly address_filter
+include_immature_coinbase)."
+  (let* ((wallet (wallet-for-request node))
+         (min-depth (if (first params) (first params) 1))
+         (include-empty (%positional-bool (second params)))
+         (address-filter (fourth params))
+         (include-immature (%positional-bool (fifth params))))
+    (unless (integerp min-depth)
+      (error 'rpc-error :code +rpc-type-error+ :message "minconf must be an integer"))
+    (with-wallet-lock (wallet)
+      (let ((filter-address nil))
+        (when (and address-filter (stringp address-filter)
+                   (plusp (length address-filter)))
+          (unless (nth-value 0 (bitcoin-lisp.crypto:decode-address
+                                address-filter (wallet-network wallet)))
+            (error 'rpc-error :code +rpc-wallet-error+
+                              :message "address_filter parameter was invalid"))
+          (setf filter-address address-filter))
+        (let ((tally (%wallet-received-map-tally
+                      wallet min-depth include-immature filter-address))
+              (result '()))
+          (flet ((emit (address label)
+                   (let ((item (gethash address tally)))
+                     (when (or item include-empty)
+                       (push (%listreceived-address-obj address label item)
+                             result)))))
+            (if filter-address
+                ;; FindAddressBookEntry(allow_change=false): skips change.
+                (multiple-value-bind (label purpose found)
+                    (wallet-find-address-book-entry wallet filter-address)
+                  (declare (ignore purpose))
+                  (when found (emit filter-address label)))
+                ;; ForEachAddrBookEntry, skipping change (nil label = IsChange).
+                (maphash (lambda (address entry)
+                           (when (addr-book-entry-label entry)
+                             (emit address (addr-book-entry-label entry))))
+                         (wallet-address-book wallet))))
+          (or (nreverse result) #()))))))
+
+(defun rpc-listreceivedbylabel (node params)
+  "Received amounts by label (Bitcoin Core listreceivedbylabel). PARAMS:
+(minconf include_empty include_watchonly include_immature_coinbase)."
+  (let* ((wallet (wallet-for-request node))
+         (min-depth (if (first params) (first params) 1))
+         (include-empty (%positional-bool (second params)))
+         (include-immature (%positional-bool (fourth params))))
+    (unless (integerp min-depth)
+      (error 'rpc-error :code +rpc-type-error+ :message "minconf must be an integer"))
+    (with-wallet-lock (wallet)
+      (let ((tally (%wallet-received-map-tally wallet min-depth include-immature nil))
+            (label-amount (make-hash-table :test 'equal))
+            (label-conf (make-hash-table :test 'equal))
+            (result '()))
+        ;; label_tally: fold each non-change address's tally into its label.
+        (maphash
+         (lambda (address entry)
+           (let ((label (addr-book-entry-label entry)))
+             (when label
+               (let ((item (gethash address tally)))
+                 (when (or item include-empty)
+                   (incf (gethash label label-amount 0)
+                         (if item (received-tally-amount item) 0))
+                   (setf (gethash label label-conf most-positive-fixnum)
+                         (min (gethash label label-conf most-positive-fixnum)
+                              (if item (received-tally-conf item)
+                                  most-positive-fixnum))))))))
+         (wallet-address-book wallet))
+        (maphash (lambda (label amount)
+                   (let ((conf (gethash label label-conf most-positive-fixnum)))
+                     (push `(("amount" . ,(%btc amount))
+                             ("confirmations" . ,(if (= conf most-positive-fixnum)
+                                                     0 conf))
+                             ("label" . ,label))
+                           result)))
+                 label-amount)
+        (or (sort result #'string<
+                  :key (lambda (o) (cdr (assoc "label" o :test #'string=))))
+            #())))))
+
+;;; --- keypoolrefill (addresses.cpp:218; wallet.cpp:2580,2591) ---
+
+(defun %wallet-active-spkms (wallet)
+  "Core CWallet::GetActiveScriptPubKeyMans: the active external + internal
+SPKMs (one per output type on each side)."
+  (append (loop for spkm being the hash-values of (wallet-external-spkms wallet)
+                collect spkm)
+          (loop for spkm being the hash-values of (wallet-internal-spkms wallet)
+                collect spkm)))
+
+(defun rpc-keypoolrefill (node params)
+  "Refill each active descriptor keypool up to NEWSIZE new keys (Bitcoin Core
+keypoolrefill). PARAMS: (newsize). 0/omitted uses the wallet's keypool size."
+  (let ((wallet (wallet-for-request node))
+        (newsize (first params)))
+    (when (and newsize (not (integerp newsize)))
+      (error 'rpc-error :code +rpc-type-error+ :message "newsize must be an integer"))
+    (when (and (integerp newsize) (minusp newsize))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Invalid parameter, expected valid size."))
+    (with-wallet-lock (wallet)
+      ;; 0 => TopUp's -keypool default.
+      (let ((kp-size (if (integerp newsize) newsize 0))
+            (spkms (%wallet-active-spkms wallet)))
+        (dolist (spkm spkms)
+          (spkm-top-up wallet spkm kp-size))
+        ;; GetKeyPoolSize (sum across active SPKMs) must reach the request.
+        (when (< (reduce #'+ spkms :key #'spkm-keypool-count :initial-value 0)
+                 kp-size)
+          (error 'rpc-error :code +rpc-wallet-error+
+                            :message "Error refreshing keypool."))
+        (wallet-refresh-all-txos wallet)
+        nil))))
+
+;;; --- simulaterawtransaction (wallet.cpp:489) ---
+
+(defun rpc-simulaterawtransaction (node params)
+  "Wallet balance change from signing+broadcasting the given raw txs (Bitcoin
+Core simulaterawtransaction). PARAMS: (rawtxs options). Returns
+{\"balance_change\": <btc>}. DIVERGENCE: Core also runs chain findCoins to
+reject inputs that are missing or already spent on-chain; here the delta is
+computed from wallet-owned prevouts (GetDebit) and the in-array new_utxos,
+which yields the same balance_change without touching the chain UTXO set."
+  (let ((wallet (wallet-for-request node))
+        (rawtxs (first params)))
+    (unless (or (null rawtxs) (listp rawtxs))
+      (error 'rpc-error :code +rpc-type-error+ :message "rawtxs must be an array"))
+    (with-wallet-lock (wallet)
+      (let ((changes 0)
+            (new-utxos (make-hash-table :test 'equalp))  ; outpoint-key -> value
+            (spent (make-hash-table :test 'equalp)))
+        (dolist (raw rawtxs)
+          (unless (stringp raw)
+            (error 'rpc-error :code +rpc-deserialization-error+
+                              :message "Transaction hex string decoding failure."))
+          (let ((tx (handler-case
+                        (bitcoin-lisp.serialization:parse-tx-payload
+                         (bitcoin-lisp.crypto:hex-to-bytes raw))
+                      (error ()
+                        (error 'rpc-error :code +rpc-deserialization-error+
+                                          :message "Transaction hex string decoding failure.")))))
+            ;; Debit: these inputs are spent when the tx is broadcast.
+            (bitcoin-lisp.serialization:dovector
+                (input (bitcoin-lisp.serialization:transaction-inputs tx))
+              (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                     (key (%wtx-outpoint-key
+                           (bitcoin-lisp.serialization:outpoint-hash prevout)
+                           (bitcoin-lisp.serialization:outpoint-index prevout))))
+                (when (gethash key spent)
+                  (error 'rpc-error :code +rpc-invalid-parameter+
+                                    :message "Transaction(s) are spending the same output more than once"))
+                (multiple-value-bind (utxo-value present) (gethash key new-utxos)
+                  (if present
+                      (progn (decf changes utxo-value)
+                             (remhash key new-utxos))
+                      (decf changes (%wallet-input-debit wallet input))))
+                (setf (gethash key spent) t)))
+            ;; Credit: outputs the wallet considers mine, also feeding new_utxos.
+            (let ((hash (bitcoin-lisp.serialization:transaction-hash tx)))
+              (loop for i from 0
+                    for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+                    do (let ((value (if (%wallet-script-mine-p
+                                         wallet
+                                         (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                          output))
+                                        (bitcoin-lisp.serialization:tx-out-value output)
+                                        0)))
+                         (setf (gethash (%wtx-outpoint-key hash i) new-utxos) value)
+                         (incf changes value))))))
+        `(("balance_change" . ,(%btc changes)))))))
+
+;;; --- listaddressgroupings (addresses.cpp:157; receive.cpp:276,304) ---
+
+(defun %wallet-address-balances (wallet)
+  "Core GetAddressBalances: address-string -> spendable satoshis, over owned
+TXOs that are trusted, mature, and deep enough (>=0 confs from-me, else >=1);
+a spent TXO contributes 0. Caller holds the wallet lock."
+  (let ((balances (make-hash-table :test 'equal))
+        (trusted-parents (make-hash-table :test 'equalp)))
+    (maphash
+     (lambda (key entry)
+       (let* ((wtx (car entry))
+              (index (cdr entry))
+              (output (aref (bitcoin-lisp.serialization:transaction-outputs
+                             (wallet-tx-tx wtx))
+                            index))
+              (script (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+         (when (and (%wallet-tx-trusted-p wallet wtx trusted-parents)
+                    (not (wallet-tx-immature-coinbase-p wallet wtx))
+                    (>= (wallet-tx-depth wallet wtx)
+                        (if (wallet-tx-from-me-cached wallet wtx) 0 1)))
+           (let ((address (%script->address script (wallet-network wallet))))
+             (when address
+               (incf (gethash address balances 0)
+                     (if (%wallet-outpoint-key-spent-p wallet key)
+                         0
+                         (bitcoin-lisp.serialization:tx-out-value output))))))))
+     (wallet-txos wallet))
+    balances))
+
+(defun %tx-input-owned-address (wallet input)
+  "The wallet address of INPUT's prevout when the wallet owns that TXO, else
+NIL (Core InputIsMine + ExtractDestination on the mapWallet prevout)."
+  (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+    (multiple-value-bind (pwtx pindex)
+        (wallet-get-txo wallet
+                        (bitcoin-lisp.serialization:outpoint-hash prevout)
+                        (bitcoin-lisp.serialization:outpoint-index prevout))
+      (when pwtx
+        (values (%script->address
+                 (bitcoin-lisp.serialization:tx-out-script-pubkey
+                  (aref (bitcoin-lisp.serialization:transaction-outputs
+                         (wallet-tx-tx pwtx))
+                        pindex))
+                 (wallet-network wallet))
+                t)))))
+
+(defun %wallet-raw-groupings (wallet)
+  "The pre-merge groupings (each a list of address strings) Core builds in
+GetAddressGroupings before the union-find: co-spent owned inputs plus change
+form one group per tx, and every lone owned output seeds a singleton. Caller
+holds the wallet lock."
+  (let ((groupings '()))
+    (maphash
+     (lambda (txid wtx)
+       (declare (ignore txid))
+       (let ((tx (wallet-tx-tx wtx))
+             (grouping '()))
+         (when (plusp (length (bitcoin-lisp.serialization:transaction-inputs tx)))
+           (let ((any-mine nil))
+             (bitcoin-lisp.serialization:dovector
+                 (input (bitcoin-lisp.serialization:transaction-inputs tx))
+               (multiple-value-bind (address owned) (%tx-input-owned-address wallet input)
+                 (when owned
+                   (setf any-mine t)
+                   (when address (pushnew address grouping :test #'equal)))))
+             (when any-mine
+               (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+                     do (when (%wallet-output-change-p wallet output)
+                          (let ((address (%script->address
+                                          (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                           output)
+                                          (wallet-network wallet))))
+                            (when address (pushnew address grouping :test #'equal))))))
+             (when grouping (push grouping groupings))))
+         ;; lone owned outputs, each its own group
+         (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+               for script = (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+               do (when (%wallet-script-mine-p wallet script)
+                    (let ((address (%script->address script (wallet-network wallet))))
+                      (when address (push (list address) groupings)))))))
+     (wallet-map-wallet wallet))
+    groupings))
+
+(defun %merge-groupings (groupings)
+  "Union-find merge of GROUPINGS (lists of address strings) into the maximal
+disjoint groups (Core's setmap loop). Returns a list of address-string lists."
+  (let ((setmap (make-hash-table :test 'equal)))  ; address -> shared holder (list of members)
+    (dolist (grouping groupings)
+      (let ((merged (make-hash-table :test 'equal)))
+        (dolist (address grouping)
+          (setf (gethash address merged) t)
+          (let ((holder (gethash address setmap)))
+            (when holder
+              (dolist (a (car holder)) (setf (gethash a merged) t)))))
+        (let* ((members (loop for a being the hash-keys of merged collect a))
+               (holder (list members)))
+          (dolist (a members) (setf (gethash a setmap) holder)))))
+    (let ((seen '()) (result '()))
+      (loop for holder being the hash-values of setmap
+            do (unless (member holder seen :test #'eq)
+                 (push holder seen)
+                 (push (car holder) result)))
+      result)))
+
+(defun rpc-listaddressgroupings (node params)
+  "Groups of addresses whose common ownership is public through shared use as
+inputs or change (Bitcoin Core listaddressgroupings). Each address entry is a
+[address, amount, label?] array — encoded as a Lisp vector so the JSON layer
+emits an array, not an object."
+  (declare (ignore params))
+  (let ((wallet (wallet-for-request node)))
+    (with-wallet-lock (wallet)
+      (let ((balances (%wallet-address-balances wallet))
+            (groupings (%merge-groupings (%wallet-raw-groupings wallet)))
+            (result '()))
+        (dolist (grouping groupings)
+          (push (mapcar
+                 (lambda (address)
+                   (multiple-value-bind (label purpose found)
+                       (wallet-find-address-book-entry wallet address :allow-change t)
+                     (declare (ignore purpose))
+                     (apply #'vector address (%btc (gethash address balances 0))
+                            (when found (list label)))))
+                 (sort (copy-list grouping) #'string<))
+                result))
+        (or (nreverse result) #())))))
