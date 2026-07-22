@@ -721,24 +721,16 @@ block when in the index, and NIL when availability is unknown."
     (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer) hash)
     (is (= 42 (bitcoin-lisp.networking::peer-best-known-height peer state)))))
 
-(test request-blocks-drops-block-when-all-peers-disclaim
-  "When every ready peer has answered notfound for a pending block, the
-scheduler drops it from pending — a stale fork no peer can serve — so
-IBD stops retrying it forever."
-  (let* ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
-         (state (bitcoin-lisp.storage:make-chain-state))
-         (peer-a (%make-peer-with-state :ready))
-         (peer-b (%make-peer-with-state :ready))
-         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5)))
-    ;; Block is pending at a height within the download window of tip 0.
-    (setf (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
-                         bitcoin-lisp.networking::*ibd-context*)) 5)
-    ;; Both peers have disclaimed it.
-    (bitcoin-lisp.networking::note-block-not-available peer-a hash)
-    (bitcoin-lisp.networking::note-block-not-available peer-b hash)
-    (bitcoin-lisp.networking::request-blocks-from-peers (list peer-a peer-b) state)
-    (is (null (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
-                             bitcoin-lisp.networking::*ibd-context*))))))
+;; NOTE: the old test `request-blocks-drops-block-when-all-peers-disclaim`
+;; was removed with the layer-5 download rewrite. It asserted that the
+;; scheduler drops a pending block once every peer answered notfound for it —
+;; a band-aid built on the false premise that peers notfound blocks. They do
+;; not (Bitcoin only sends notfound for txs, never blocks — net_processing.cpp
+;; ProcessGetData), which is exactly why the node wedged retrying an
+;; unobtainable fork forever. The new scheduler (find-blocks-to-download-for-peer)
+;; never requests a block off a peer's own best chain in the first place, so
+;; there is nothing to "drop". That correct behavior is covered directly by
+;; `find-blocks-to-download-only-on-peer-chain` in reorg-tests.lisp.
 
 (test handle-notfound-marks-block-disclaimed
   "An incoming notfound message for a block marks it disclaimed on the
@@ -758,8 +750,9 @@ peer (wire-path coverage of the parse + dispatch)."
 ;;;;
 ;;;; When a peer disconnects, the blocks it held in-flight must be freed
 ;;;; for immediate reassignment (Bitcoin Core's FinalizeNode), not left
-;;;; until the ~125s per-hash timeout. The block stays in pending, so the
-;;;; next get-next-blocks-to-request picks it up.
+;;;; until the ~125s per-hash timeout. Once freed from in-flight, the next
+;;;; per-peer download walk (find-blocks-to-download-for-peer) re-requests it
+;;;; from a live peer whose chain still covers it.
 
 (test release-orphaned-in-flight-reclaims-disconnected-peer-blocks
   "Releases in-flight blocks held by a non-:ready peer (still in pending),
