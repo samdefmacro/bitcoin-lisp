@@ -785,3 +785,285 @@ throws out of the whole call."
              (err (%aval "error" (first results))))
         (is (= bitcoin-lisp.rpc::+rpc-wallet-error+ (%aval "code" err)))
         (is (search "private keys disabled" (%aval "message" err)))))))
+
+;;; --- Wallet P7: signmessage (methods.lisp) + received-by / keypoolrefill /
+;;; simulaterawtransaction / listaddressgroupings (wallet-coins.lisp) ---
+
+(defun %wt= (a b)
+  "Two BTC doubles equal to sub-satoshi tolerance."
+  (< (abs (- a b)) 1d-6))
+
+(defun %wt-dummy-txid (n)
+  "A distinct non-zero 32-byte outpoint hash (so it never reads as coinbase)."
+  (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element n)))
+    (setf (aref h 0) (logior 1 n))
+    h))
+
+(defun %wt-add-confirmed-tx (wallet inputs outputs &key (height 100))
+  "Build and AddToWallet a confirmed tx. INPUTS: ((hash . vout) ...) prevouts;
+OUTPUTS: ((script . value-sats) ...). Returns the tx's txid."
+  (let* ((tx (bitcoin-lisp.serialization:make-transaction
+              :version 2
+              :inputs (coerce
+                       (mapcar (lambda (in)
+                                 (bitcoin-lisp.serialization:make-tx-in
+                                  :previous-output
+                                  (bitcoin-lisp.serialization:make-outpoint
+                                   :hash (car in) :index (cdr in))
+                                  :script-sig (make-array 0 :element-type
+                                                          '(unsigned-byte 8))
+                                  :sequence #xffffffff))
+                               inputs)
+                       'simple-vector)
+              :outputs (coerce
+                        (mapcar (lambda (out)
+                                  (bitcoin-lisp.serialization:make-tx-out
+                                   :value (cdr out) :script-pubkey (car out)))
+                                outputs)
+                        'simple-vector)
+              :lock-time 0))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (block-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element 9)))
+    (bitcoin-lisp.rpc::wallet-add-to-wallet
+     wallet tx (list :confirmed block-hash height 0))
+    txid))
+
+(defun %wt-raw-tx-hex (inputs outputs)
+  "Wire hex of a v2 tx over INPUTS ((hash . vout) ...) and OUTPUTS
+((script . value) ...)."
+  (let ((tx (bitcoin-lisp.serialization:make-transaction
+             :version 2
+             :inputs (coerce
+                      (mapcar (lambda (in)
+                                (bitcoin-lisp.serialization:make-tx-in
+                                 :previous-output
+                                 (bitcoin-lisp.serialization:make-outpoint
+                                  :hash (car in) :index (cdr in))
+                                 :script-sig (make-array 0 :element-type
+                                                         '(unsigned-byte 8))
+                                 :sequence #xffffffff))
+                              inputs)
+                      'simple-vector)
+             :outputs (coerce
+                       (mapcar (lambda (out)
+                                 (bitcoin-lisp.serialization:make-tx-out
+                                  :value (cdr out) :script-pubkey (car out)))
+                               outputs)
+                       'simple-vector)
+             :lock-time 0)))
+    (bitcoin-lisp.crypto:bytes-to-hex
+     (bitcoin-lisp.serialization:transaction-wire-bytes tx))))
+
+(test wallet-signmessage-roundtrip
+  "signmessage on a legacy (P2PKH) getnewaddress verifies true via
+verifymessage; a tampered message verifies false; a valid non-P2PKH (bech32)
+address is -3, an undecodable address -5, and a foreign P2PKH address the
+wallet does not own -4 (Core wallet/rpc/signmessage.cpp error codes)."
+  (with-wallet-test-node (node :keypool 4)
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
+      (bitcoin-lisp.rpc::rpc-createwallet node '("signer")))
+    (let* ((bitcoin-lisp.rpc::*rpc-wallet-name* "signer")
+           (address (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "legacy")))
+           (message "hello from bitcoin-lisp")
+           (sig (bitcoin-lisp.rpc::rpc-signmessage node (list address message))))
+      (is (stringp sig))
+      ;; Round-trips through verifymessage.
+      (is (eq t (bitcoin-lisp.rpc::rpc-verifymessage
+                 node (list address sig message))))
+      ;; A tampered message no longer verifies.
+      (is (eq 'yason:false
+              (bitcoin-lisp.rpc::rpc-verifymessage
+               node (list address sig "a different message"))))
+      ;; Valid bech32 address (not a key hash) -> -3.
+      (let ((bech32 (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "bech32"))))
+        (is (= bitcoin-lisp.rpc::+rpc-type-error+
+               (%rpc-error-code
+                (lambda () (bitcoin-lisp.rpc::rpc-signmessage
+                            node (list bech32 message)))))))
+      ;; Garbage address -> -5.
+      (is (= bitcoin-lisp.rpc::+rpc-invalid-address-or-key+
+             (%rpc-error-code
+              (lambda () (bitcoin-lisp.rpc::rpc-signmessage
+                          node (list "not-a-real-address" message))))))
+      ;; A valid P2PKH address the wallet does not own -> -4.
+      (let ((foreign (bitcoin-lisp.crypto:encode-p2pkh-address
+                      (make-array 20 :element-type '(unsigned-byte 8)
+                                     :initial-element 7)
+                      :testnet4)))
+        (is (= bitcoin-lisp.rpc::+rpc-wallet-error+
+               (%rpc-error-code
+                (lambda () (bitcoin-lisp.rpc::rpc-signmessage
+                            node (list foreign message))))))))))
+
+(test wallet-received-by-rpcs
+  "getreceivedbyaddress/bylabel and listreceivedbyaddress/bylabel tally owned
+outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label
+-> -4."
+  (with-wallet-test-node (node :keypool 4)
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
+      (bitcoin-lisp.rpc::rpc-createwallet node '("recv")))
+    (let* ((manager (%node-manager node))
+           (wallet (gethash "recv"
+                            (bitcoin-lisp.rpc::wallet-manager-wallets manager)))
+           (bitcoin-lisp.rpc::*rpc-wallet-name* "recv"))
+      (setf (bitcoin-lisp.rpc::wallet-last-block-height wallet) 100)
+      (let* ((addr (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "legacy")))
+             (script (%address-script addr :testnet4)))
+        (bitcoin-lisp.rpc::rpc-setlabel node (list addr "L1"))
+        ;; Two confirmed receives to the same address: 0.005 + 0.003 BTC.
+        (%wt-add-confirmed-tx wallet (list (cons (%wt-dummy-txid 1) 0))
+                              (list (cons script 500000)))
+        (%wt-add-confirmed-tx wallet (list (cons (%wt-dummy-txid 2) 0))
+                              (list (cons script 300000)))
+        (is (%wt= 0.008d0 (bitcoin-lisp.rpc::rpc-getreceivedbyaddress
+                           node (list addr))))
+        (is (%wt= 0.008d0 (bitcoin-lisp.rpc::rpc-getreceivedbylabel
+                           node (list "L1"))))
+        ;; minconf 200 excludes the depth-1 receives.
+        (is (%wt= 0.0d0 (bitcoin-lisp.rpc::rpc-getreceivedbyaddress
+                         node (list addr 200))))
+        ;; listreceivedbyaddress: one row for addr with both txids.
+        (let* ((rows (bitcoin-lisp.rpc::rpc-listreceivedbyaddress node nil))
+               (row (find addr rows :key (lambda (r) (%aval "address" r))
+                                    :test #'string=)))
+          (is (not (null row)))
+          (is (%wt= 0.008d0 (%aval "amount" row)))
+          (is (string= "L1" (%aval "label" row)))
+          (is (= 1 (%aval "confirmations" row)))
+          (is (= 2 (length (%aval "txids" row)))))
+        ;; listreceivedbylabel: one row for L1.
+        (let* ((rows (bitcoin-lisp.rpc::rpc-listreceivedbylabel node nil))
+               (row (find "L1" rows :key (lambda (r) (%aval "label" r))
+                                    :test #'string=)))
+          (is (not (null row)))
+          (is (%wt= 0.008d0 (%aval "amount" row))))
+        ;; Error codes.
+        (let ((foreign (bitcoin-lisp.crypto:encode-p2pkh-address
+                        (make-array 20 :element-type '(unsigned-byte 8)
+                                       :initial-element 3)
+                        :testnet4)))
+          (is (= bitcoin-lisp.rpc::+rpc-wallet-error+
+                 (%rpc-error-code
+                  (lambda () (bitcoin-lisp.rpc::rpc-getreceivedbyaddress
+                              node (list foreign)))))))
+        (is (= bitcoin-lisp.rpc::+rpc-invalid-address-or-key+
+               (%rpc-error-code
+                (lambda () (bitcoin-lisp.rpc::rpc-getreceivedbyaddress
+                            node (list "garbage"))))))
+        (is (= bitcoin-lisp.rpc::+rpc-wallet-error+
+               (%rpc-error-code
+                (lambda () (bitcoin-lisp.rpc::rpc-getreceivedbylabel
+                            node (list "no-such-label"))))))))))
+
+(test wallet-keypoolrefill-grows-active-spkms
+  "keypoolrefill tops every active SPKM up to newsize; a negative size is -8."
+  (with-wallet-test-node (node :keypool 5)
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
+      (bitcoin-lisp.rpc::rpc-createwallet node '("kp")))
+    (let* ((manager (%node-manager node))
+           (wallet (gethash "kp"
+                            (bitcoin-lisp.rpc::wallet-manager-wallets manager)))
+           (bitcoin-lisp.rpc::*rpc-wallet-name* "kp")
+           (spkm (gethash :bech32
+                          (bitcoin-lisp.rpc::wallet-external-spkms wallet))))
+      (is (= 5 (bitcoin-lisp.rpc::spkm-keypool-count spkm)))
+      (is (null (bitcoin-lisp.rpc::rpc-keypoolrefill node '(20))))
+      (is (>= (bitcoin-lisp.rpc::spkm-keypool-count spkm) 20))
+      ;; Every active SPKM grew.
+      (dolist (s (bitcoin-lisp.rpc::%wallet-active-spkms wallet))
+        (is (>= (bitcoin-lisp.rpc::spkm-keypool-count s) 20)))
+      (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+             (%rpc-error-code
+              (lambda () (bitcoin-lisp.rpc::rpc-keypoolrefill node '(-1)))))))))
+
+(test wallet-simulaterawtransaction-balance-change
+  "simulaterawtransaction reports +owned-output and -owned-input deltas, and
+rejects a double-spend across the array."
+  (with-wallet-test-node (node :keypool 4)
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
+      (bitcoin-lisp.rpc::rpc-createwallet node '("sim")))
+    (let* ((manager (%node-manager node))
+           (wallet (gethash "sim"
+                            (bitcoin-lisp.rpc::wallet-manager-wallets manager)))
+           (bitcoin-lisp.rpc::*rpc-wallet-name* "sim"))
+      (setf (bitcoin-lisp.rpc::wallet-last-block-height wallet) 100)
+      (let* ((addr (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "bech32")))
+             (script (%address-script addr :testnet4))
+             (foreign (%address-script
+                       (bitcoin-lisp.crypto:encode-p2wpkh-address
+                        (make-array 20 :element-type '(unsigned-byte 8)
+                                       :initial-element 4)
+                        :testnet4)
+                       :testnet4)))
+        ;; A pure receive to an owned script: +0.007.
+        (let ((result (bitcoin-lisp.rpc::rpc-simulaterawtransaction
+                       node (list (list (%wt-raw-tx-hex
+                                         (list (cons (%wt-dummy-txid 5) 0))
+                                         (list (cons script 700000))))))))
+          (is (%wt= 0.007d0 (%aval "balance_change" result))))
+        ;; Fund an owned coin, then spend it to a foreign output: -0.01.
+        (let ((funded (%wt-add-confirmed-tx
+                       wallet (list (cons (%wt-dummy-txid 6) 0))
+                       (list (cons script 1000000)))))
+          (let ((result (bitcoin-lisp.rpc::rpc-simulaterawtransaction
+                         node (list (list (%wt-raw-tx-hex
+                                           (list (cons funded 0))
+                                           (list (cons foreign 900000))))))))
+            (is (%wt= -0.01d0 (%aval "balance_change" result))))
+          ;; Two txs spending the same funded coin -> -8.
+          (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+                 (%rpc-error-code
+                  (lambda ()
+                    (bitcoin-lisp.rpc::rpc-simulaterawtransaction
+                     node (list (list (%wt-raw-tx-hex (list (cons funded 0))
+                                                      (list (cons foreign 900000)))
+                                      (%wt-raw-tx-hex (list (cons funded 0))
+                                                      (list (cons foreign 800000)))))))))))))))
+
+(test wallet-listaddressgroupings-clusters
+  "listaddressgroupings clusters addresses co-spent as inputs of one tx and
+keeps an unrelated lone address in its own group."
+  (with-wallet-test-node (node :keypool 5)
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
+      (bitcoin-lisp.rpc::rpc-createwallet node '("grp")))
+    (let* ((manager (%node-manager node))
+           (wallet (gethash "grp"
+                            (bitcoin-lisp.rpc::wallet-manager-wallets manager)))
+           (bitcoin-lisp.rpc::*rpc-wallet-name* "grp"))
+      (setf (bitcoin-lisp.rpc::wallet-last-block-height wallet) 100)
+      (let* ((addr1 (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "legacy")))
+             (addr2 (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "legacy")))
+             (addr3 (bitcoin-lisp.rpc::rpc-getnewaddress node '("" "legacy")))
+             (s1 (%address-script addr1 :testnet4))
+             (s2 (%address-script addr2 :testnet4))
+             (s3 (%address-script addr3 :testnet4))
+             ;; tx A funds addr1 and addr2.
+             (txa (%wt-add-confirmed-tx
+                   wallet (list (cons (%wt-dummy-txid 8) 0))
+                   (list (cons s1 400000) (cons s2 600000)))))
+        ;; tx B co-spends addr1 and addr2, paying addr3 -> {addr1,addr2} cluster.
+        (%wt-add-confirmed-tx wallet
+                              (list (cons txa 0) (cons txa 1))
+                              (list (cons s3 900000)))
+        (let* ((groups (bitcoin-lisp.rpc::rpc-listaddressgroupings node nil))
+               (addr-of (lambda (info) (aref info 0)))
+               (group-addrs (lambda (g) (mapcar addr-of g)))
+               (g-with (lambda (addr)
+                         (find-if (lambda (g)
+                                    (member addr (funcall group-addrs g)
+                                            :test #'string=))
+                                  groups))))
+          (is (>= (length groups) 2))
+          ;; addr1 and addr2 land in one group.
+          (let ((g1 (funcall g-with addr1)))
+            (is (not (null g1)))
+            (is (member addr2 (funcall group-addrs g1) :test #'string=))
+            ;; each entry is a [address, amount, label] vector
+            (is (every #'vectorp g1))
+            (is (>= (length (first g1)) 2)))
+          ;; addr3 is alone.
+          (let ((g3 (funcall g-with addr3)))
+            (is (not (null g3)))
+            (is (= 1 (length g3)))
+            (is (not (member addr1 (funcall group-addrs g3) :test #'string=)))))))))

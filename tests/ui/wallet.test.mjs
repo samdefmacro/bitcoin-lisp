@@ -188,6 +188,13 @@ const WALLETINFO = {
 
 const NEW_ADDRESS = 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx';
 
+// Send-tab fixtures: a broadcast txid, a fee estimate (0.00002 BTC/kvB =
+// 2.00 sat/vB), and the two spend RPCs (sendtoaddress -> bare txid string,
+// send -> { complete, txid }).
+const BROADCAST_TXID = '7c'.repeat(32);
+const RECIP_A = 'tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx';
+const RECIP_B = 'tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7';
+
 const ADDRINFO = {
   [NEW_ADDRESS]: {
     address: NEW_ADDRESS,
@@ -237,6 +244,9 @@ const fixtures = {
     ? { tb1qalpha: { purpose: 'receive' }, tb1qreused: { purpose: 'receive' } }
     : { tb1qelsewhere: { purpose: 'send' } }),
   setlabel: () => null,
+  estimatesmartfee: (params) => ({ feerate: 0.00002, blocks: params[0] ?? 6 }),
+  sendtoaddress: () => BROADCAST_TXID,
+  send: () => ({ complete: true, txid: BROADCAST_TXID }),
 };
 
 const rpcLog = []; // every { url, method, params } POSTed through rpc.js
@@ -344,6 +354,130 @@ test('mask preference persists in sessionStorage', () => {
   assert.equal(wallet.isMasked(), true);
   wallet.setMasked(false);
   assert.equal(wallet.isMasked(), false);
+});
+
+// --- send: pure param-building + validation ---------------------------------
+
+test('feeModeForRbf tracks the wallet default (economical while signaling RBF)', () => {
+  assert.equal(wallet.feeModeForRbf(true), 'economical');
+  assert.equal(wallet.feeModeForRbf(false), 'conservative');
+});
+
+test('estimateFeeParams: node conf_target + mode', () => {
+  assert.deepEqual(wallet.estimateFeeParams(6, true),
+    ['estimatesmartfee', [6, 'economical']]);
+  assert.deepEqual(wallet.estimateFeeParams(2, false),
+    ['estimatesmartfee', [2, 'conservative']]);
+});
+
+test('normalizeAmount: canonical decimal string + exact satoshis, rejects junk', () => {
+  assert.deepEqual(wallet.normalizeAmount('0.5'),
+    { ok: true, value: '0.5', sats: 50000000n });
+  assert.deepEqual(wallet.normalizeAmount(' 1 '),
+    { ok: true, value: '1', sats: 100000000n });
+  assert.deepEqual(wallet.normalizeAmount('0.00000001'),
+    { ok: true, value: '0.00000001', sats: 1n });
+  // decimal text is forwarded verbatim (no float round-trip)
+  assert.equal(wallet.normalizeAmount('0.10000000').value, '0.10000000');
+  assert.equal(wallet.normalizeAmount('').ok, false);
+  assert.equal(wallet.normalizeAmount('0').ok, false); // zero not allowed
+  assert.equal(wallet.normalizeAmount('1.234567891').ok, false); // >8 dp
+  assert.equal(wallet.normalizeAmount('1e8').ok, false);
+  assert.equal(wallet.normalizeAmount('abc').ok, false);
+  assert.equal(wallet.normalizeAmount('21000001').ok, false); // > MAX_MONEY
+});
+
+test('validateAddress: bech32 + base58 accepted, garbage rejected', () => {
+  assert.equal(wallet.validateAddress(RECIP_A).ok, true);
+  assert.equal(wallet.validateAddress('mzBc4XEFSdzCDcTxAgf6EZXgsZWpztRhef').ok, true);
+  assert.equal(wallet.validateAddress('2N1LGaGg836mqSQqiuUBLfcyGBhyZbremDX').ok, true);
+  assert.equal(wallet.validateAddress('  ').ok, false);
+  assert.equal(wallet.validateAddress('tb1q has spaces').ok, false);
+  assert.equal(wallet.validateAddress('not-an-address').ok, false);
+  assert.equal(wallet.validateAddress('').reason, 'address is required');
+});
+
+test('validateRecipients: dedup + per-row errors, cleaned parallel array', () => {
+  const good = wallet.validateRecipients([
+    { address: RECIP_A, amount: '0.5' },
+    { address: RECIP_B, amount: '0.25' },
+  ]);
+  assert.equal(good.ok, true);
+  assert.deepEqual(good.cleaned.map((r) => [r.address, r.amount, r.sats]),
+    [[RECIP_A, '0.5', 50000000n], [RECIP_B, '0.25', 25000000n]]);
+
+  const bad = wallet.validateRecipients([
+    { address: 'garbage', amount: '0.5' },
+    { address: RECIP_A, amount: 'x' },
+  ]);
+  assert.equal(bad.ok, false);
+  assert.deepEqual(bad.cleaned, []);
+  assert.ok(bad.errors.some((e) => e.index === 0 && e.field === 'address'));
+  assert.ok(bad.errors.some((e) => e.index === 1 && e.field === 'amount'));
+
+  const dup = wallet.validateRecipients([
+    { address: RECIP_A, amount: '0.5' },
+    { address: RECIP_A, amount: '0.25' },
+  ]);
+  assert.ok(dup.errors.some((e) => e.reason === 'duplicate address'));
+});
+
+test('buildSendCall: single recipient rides sendtoaddress (RBF on, no SFFO)', () => {
+  assert.deepEqual(
+    wallet.buildSendCall({
+      recipients: [{ address: RECIP_A, amount: '0.5' }],
+      confTarget: 6, rbf: true, subtractFee: false,
+    }),
+    ['sendtoaddress',
+      [RECIP_A, '0.5', '', '', false, true, 6, 'economical']]);
+});
+
+test('buildSendCall: single recipient RBF off + SFFO on flips the positionals', () => {
+  assert.deepEqual(
+    wallet.buildSendCall({
+      recipients: [{ address: RECIP_A, amount: '0.001' }],
+      confTarget: 2, rbf: false, subtractFee: true,
+    }),
+    ['sendtoaddress',
+      [RECIP_A, '0.001', '', '', true, false, 2, 'conservative']]);
+});
+
+test('buildSendCall: multi recipient rides send with ordered outputs + options', () => {
+  assert.deepEqual(
+    wallet.buildSendCall({
+      recipients: [
+        { address: RECIP_A, amount: '0.5' },
+        { address: RECIP_B, amount: '0.25' },
+      ],
+      confTarget: 6, rbf: true, subtractFee: false,
+    }),
+    ['send',
+      [[{ [RECIP_A]: '0.5' }, { [RECIP_B]: '0.25' }], 6, 'economical', null,
+        { replaceable: true }]]);
+});
+
+test('buildSendCall: multi recipient SFFO subtracts fee from every output index', () => {
+  assert.deepEqual(
+    wallet.buildSendCall({
+      recipients: [
+        { address: RECIP_A, amount: '0.5' },
+        { address: RECIP_B, amount: '0.25' },
+      ],
+      confTarget: 12, rbf: false, subtractFee: true,
+    }),
+    ['send',
+      [[{ [RECIP_A]: '0.5' }, { [RECIP_B]: '0.25' }], 12, 'conservative', null,
+        { replaceable: false, subtract_fee_from_outputs: [0, 1] }]]);
+});
+
+test('sendResultTxid: bare string (sendtoaddress) or { txid } (send)', () => {
+  assert.equal(wallet.sendResultTxid('deadbeef'), 'deadbeef');
+  assert.equal(wallet.sendResultTxid({ txid: 'cafe', complete: true }), 'cafe');
+});
+
+test('fmtSatsBtc: exact 8-decimal BTC from BigInt satoshis', () => {
+  assert.equal(wallet.fmtSatsBtc(187500000n), '1.87500000 BTC');
+  assert.equal(wallet.fmtSatsBtc(1n), '0.00000001 BTC');
 });
 
 // --- disabled state (mainnet: wallet RPCs answer -32601) --------------------
@@ -657,6 +791,105 @@ test('the new-entry form labels an arbitrary (sending) address', async () => {
   await card.find((n) => n.tagName === 'FORM').dispatch('submit');
   assert.deepEqual(rpcLog.find((c) => c.method === 'setlabel'),
     { url: '/wallet/hot', method: 'setlabel', params: ['tb1qelsewhere', 'exchange'] });
+});
+
+// --- send screen ------------------------------------------------------------
+
+test('send: single recipient previews the fee then POSTs sendtoaddress', async () => {
+  await wallet.show(container, 'send');
+  const card = byAria(container, 'Send');
+  assert.equal(card.hidden, false);
+  assert.equal(byAria(container, 'Balances').hidden, true);
+  // a single blank recipient row to start; the four Core defaults are set
+  byAria(container, 'Recipient 1 address').value = RECIP_A;
+  byAria(container, 'Recipient 1 amount (BTC)').value = '0.5';
+  const form = card.find((n) => n.tagName === 'FORM');
+
+  rpcLog.length = 0;
+  await form.dispatch('submit'); // review step prices the spend
+  // estimatesmartfee is a NODE method: base endpoint, mode tracks RBF (on)
+  assert.deepEqual(rpcLog.find((c) => c.method === 'estimatesmartfee'),
+    { url: '/', method: 'estimatesmartfee', params: [6, 'economical'] });
+  assert.ok(!rpcLog.some((c) => c.method === 'sendtoaddress')); // not yet
+  assert.match(card.textContent, /Review send/);
+  assert.match(card.textContent, /2\.00 sat\/vB/); // feerate preview
+
+  const confirm = card.find((n) =>
+    n.tagName === 'BUTTON' && n.textContent === 'confirm and send');
+  rpcLog.length = 0;
+  await confirm.dispatch('click');
+  assert.deepEqual(rpcLog.find((c) => c.method === 'sendtoaddress'),
+    { url: '/wallet/hot', method: 'sendtoaddress',
+      params: [RECIP_A, '0.5', '', '', false, true, 6, 'economical'] });
+  // broadcast result surfaces the txid + an explorer permalink
+  assert.match(card.textContent, /Transaction broadcast/);
+  assert.ok(card.findAll((n) => n.tagName === 'A')
+    .some((a) => a.href === `#/tx/${BROADCAST_TXID}`));
+});
+
+test('send: adding a recipient POSTs the ordered multi-output send shape', async () => {
+  const card = byAria(container, 'Send');
+  // the prior broadcast reset the form to one blank recipient
+  byAria(container, 'Recipient 1 address').value = RECIP_A;
+  byAria(container, 'Recipient 1 amount (BTC)').value = '0.5';
+  const addBtn = card.find((n) =>
+    n.tagName === 'BUTTON' && n.textContent === '+ add recipient');
+  await addBtn.dispatch('click');
+  byAria(container, 'Recipient 2 address').value = RECIP_B;
+  byAria(container, 'Recipient 2 amount (BTC)').value = '0.25';
+
+  const form = card.find((n) => n.tagName === 'FORM');
+  await form.dispatch('submit');
+  const confirm = card.find((n) =>
+    n.tagName === 'BUTTON' && n.textContent === 'confirm and send');
+  rpcLog.length = 0;
+  await confirm.dispatch('click');
+  // two recipients switch the call to `send` with an order-preserving
+  // array-of-objects outputs list on the wallet endpoint
+  assert.deepEqual(rpcLog.find((c) => c.method === 'send'),
+    { url: '/wallet/hot', method: 'send',
+      params: [[{ [RECIP_A]: '0.5' }, { [RECIP_B]: '0.25' }], 6, 'economical',
+        null, { replaceable: true }] });
+  assert.ok(!rpcLog.some((c) => c.method === 'sendtoaddress'));
+});
+
+test('send: RBF off + subtract-fee flip the sendtoaddress positionals', async () => {
+  const card = byAria(container, 'Send');
+  byAria(container, 'Recipient 1 address').value = RECIP_A;
+  byAria(container, 'Recipient 1 amount (BTC)').value = '0.001';
+  byAria(container, 'Signal replace-by-fee (BIP125)').checked = false;
+  byAria(container, 'Subtract fee from outputs').checked = true;
+  byAria(container, 'Confirmation target (blocks)').value = '2';
+
+  const form = card.find((n) => n.tagName === 'FORM');
+  rpcLog.length = 0;
+  await form.dispatch('submit');
+  // preview mode follows RBF-off -> conservative, at the chosen target
+  assert.deepEqual(rpcLog.find((c) => c.method === 'estimatesmartfee'),
+    { url: '/', method: 'estimatesmartfee', params: [2, 'conservative'] });
+  const confirm = card.find((n) =>
+    n.tagName === 'BUTTON' && n.textContent === 'confirm and send');
+  rpcLog.length = 0;
+  await confirm.dispatch('click');
+  assert.deepEqual(rpcLog.find((c) => c.method === 'sendtoaddress'),
+    { url: '/wallet/hot', method: 'sendtoaddress',
+      params: [RECIP_A, '0.001', '', '', true, false, 2, 'conservative'] });
+});
+
+test('send: client-side validation blocks a bad destination before any RPC', async () => {
+  const card = byAria(container, 'Send');
+  byAria(container, 'Signal replace-by-fee (BIP125)').checked = true;
+  byAria(container, 'Subtract fee from outputs').checked = false;
+  byAria(container, 'Recipient 1 address').value = 'definitely-not-an-address';
+  byAria(container, 'Recipient 1 amount (BTC)').value = '0.5';
+
+  const form = card.find((n) => n.tagName === 'FORM');
+  rpcLog.length = 0;
+  await form.dispatch('submit');
+  // no fee estimate, no spend — the row error renders instead
+  assert.equal(rpcLog.length, 0);
+  const err = card.find((n) => n.classList.contains('error-text') && !n.hidden);
+  assert.match(err.textContent, /recipient 1 address/);
 });
 
 // --- poll integration ---------------------------------------------------
