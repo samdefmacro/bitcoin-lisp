@@ -1059,10 +1059,18 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
         ;; collect the first COUNT we lack and aren't in-flight.
         (block collect
           (dolist (entry chain)
+            ;; Core FindNextBlocks (net_processing.cpp:1497-1500): a block
+            ;; marked invalid (invalidateblock) poisons the whole chain above
+            ;; it — abort the walk, keeping what we collected below it.
+            (when (eq (bitcoin-lisp.storage:block-index-entry-status entry) :invalid)
+              (return-from collect))
             (let ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
                   (h (bitcoin-lisp.storage:block-index-entry-height entry)))
               (cond
-                ((or (bitcoin-lisp.storage:get-block block-store hash)
+                ;; block-exists-p, not get-block: presence probe only — the
+                ;; same path get-block checks, without reading + deserializing
+                ;; a multi-MB block file per have-data block per tick.
+                ((or (bitcoin-lisp.storage:block-exists-p block-store hash)
                      (let ((a (bitcoin-lisp.storage:get-block-at-height chain-state h)))
                        (and a (equalp (bitcoin-lisp.storage:block-index-entry-hash a) hash))))
                  (when advancing
@@ -1383,10 +1391,16 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
     ;; blocks, so the old height-based scheduler retried such blocks forever).
     ;; Mark each peer's chosen blocks in-flight BEFORE walking the next peer so
     ;; two peers on the same chain don't both get the same block.
+    ;; TOTAL-BUDGET is the cross-peer request cap: the aggregate per-peer
+    ;; capacity normally, clamped to 1 in gap-only mode. It was computed
+    ;; BEFORE *ibd-gap-only-mode* was reset above — do not re-read the
+    ;; special here (re-reading it after the reset silently disabled the
+    ;; gap-only clamp, re-opening the request flood the backpressure gate
+    ;; exists to prevent).
     (let ((requests-made 0)
           (peer-requests (make-hash-table :test 'eq))
           (in-flight (ibd-context-in-flight *ibd-context*))
-          (remaining (if *ibd-gap-only-mode* 1 most-positive-fixnum)))
+          (remaining total-budget))
       (dolist (peer ready-peers)
         (when (plusp remaining)
           (let ((budget (min remaining
