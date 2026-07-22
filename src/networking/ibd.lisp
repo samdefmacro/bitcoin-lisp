@@ -983,6 +983,99 @@ TryDownloadingHistoricalBlocks (net_processing.cpp:6164-6199)."
                          (sort historical-range #'< :key #'cdr))))
       (mapcar #'car (subseq sorted 0 (min n (length sorted)))))))
 
+(defun %entry-ancestor-of-p (ancestor descendant)
+  "T if ANCESTOR lies on DESCENDANT's chain (i.e. is an ancestor, or equal).
+Walks DESCENDANT back to ANCESTOR's height and compares hashes. O(height diff),
+no skip list."
+  (when (and ancestor descendant
+             (<= (bitcoin-lisp.storage:block-index-entry-height ancestor)
+                 (bitcoin-lisp.storage:block-index-entry-height descendant)))
+    (let ((e descendant)
+          (h (bitcoin-lisp.storage:block-index-entry-height ancestor)))
+      (loop while (and e (> (bitcoin-lisp.storage:block-index-entry-height e) h))
+            do (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+      (and e (equalp (bitcoin-lisp.storage:block-index-entry-hash e)
+                     (bitcoin-lisp.storage:block-index-entry-hash ancestor))))))
+
+(defun find-blocks-to-download-for-peer (peer chain-state block-store count)
+  "Bitcoin Core FindNextBlocksToDownload (net_processing.cpp): up to COUNT block
+hashes ON THIS PEER'S CHAIN that we lack and are not in-flight, from the peer's
+last-common block forward, within the download window. Because it only returns
+ancestors of the peer's best-known block, the node downloads the chains its
+peers actually serve rather than fixating on a fork whose blocks no connected
+peer has (the testnet4 min-difficulty fork-storm wedge). Advances the peer's
+LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain."
+  (when (or (null *ibd-context*) (zerop count))
+    (return-from find-blocks-to-download-for-peer nil))
+  (process-block-availability peer chain-state)
+  (let* ((best-known (and (peer-best-known-block-hash peer)
+                          (bitcoin-lisp.storage:get-block-index-entry
+                           chain-state (peer-best-known-block-hash peer))))
+         (tip-entry (bitcoin-lisp.storage:get-block-index-entry
+                     chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+         (tip-work (if tip-entry
+                       (bitcoin-lisp.storage:block-index-entry-chain-work tip-entry) 0)))
+    ;; Peer has nothing more-work than our tip, or is below minimum chain work.
+    (when (or (null best-known)
+              (<= (bitcoin-lisp.storage:block-index-entry-chain-work best-known) tip-work)
+              (< (bitcoin-lisp.storage:block-index-entry-chain-work best-known)
+                 (bitcoin-lisp:minimum-chain-work bitcoin-lisp:*network*)))
+      (return-from find-blocks-to-download-for-peer nil))
+    ;; last-common = fork point between the peer's chain and ours, unless the
+    ;; cached cursor is still a >=work ancestor of the peer's best block.
+    (let* ((cached (and (peer-last-common-block-hash peer)
+                        (bitcoin-lisp.storage:get-block-index-entry
+                         chain-state (peer-last-common-block-hash peer))))
+           (fork (bitcoin-lisp.validation:find-fork-point best-known tip-entry))
+           (last-common (if (and cached
+                                 (%entry-ancestor-of-p cached best-known)
+                                 (>= (bitcoin-lisp.storage:block-index-entry-chain-work cached)
+                                     (bitcoin-lisp.storage:block-index-entry-chain-work fork)))
+                            cached fork)))
+      (when (null last-common)
+        (return-from find-blocks-to-download-for-peer nil))
+      (setf (peer-last-common-block-hash peer)
+            (bitcoin-lisp.storage:block-index-entry-hash last-common))
+      (when (equalp (bitcoin-lisp.storage:block-index-entry-hash last-common)
+                    (bitcoin-lisp.storage:block-index-entry-hash best-known))
+        (return-from find-blocks-to-download-for-peer nil))
+      (let* ((lc-hash (bitcoin-lisp.storage:block-index-entry-hash last-common))
+             (window-end (+ (bitcoin-lisp.storage:block-index-entry-height last-common)
+                            +max-block-queue-size+))
+             (max-height (min (bitcoin-lisp.storage:block-index-entry-height best-known)
+                              (1+ window-end)))
+             (in-flight (ibd-context-in-flight *ibd-context*))
+             (chain '())       ; peer's chain above last-common, oldest-first
+             (result '())
+             (advancing t))
+        ;; Walk from best-known down (skipping above the window) to last-common.
+        (let ((e best-known))
+          (loop while (and e (> (bitcoin-lisp.storage:block-index-entry-height e) max-height))
+                do (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+          (loop while (and e (not (equalp (bitcoin-lisp.storage:block-index-entry-hash e) lc-hash)))
+                do (push e chain)
+                   (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e))))
+        ;; Forward pass: advance the cursor over contiguous have-data blocks;
+        ;; collect the first COUNT we lack and aren't in-flight.
+        (block collect
+          (dolist (entry chain)
+            (let ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                  (h (bitcoin-lisp.storage:block-index-entry-height entry)))
+              (cond
+                ((or (bitcoin-lisp.storage:get-block block-store hash)
+                     (let ((a (bitcoin-lisp.storage:get-block-at-height chain-state h)))
+                       (and a (equalp (bitcoin-lisp.storage:block-index-entry-hash a) hash))))
+                 (when advancing
+                   (setf (peer-last-common-block-hash peer) hash)))
+                (t
+                 (setf advancing nil)
+                 (when (> h window-end) (return-from collect))
+                 (unless (gethash hash in-flight)
+                   (push hash result)
+                   (when (>= (length result) count)
+                     (return-from collect))))))))
+        (nreverse result)))))
+
 (defun note-block-wire-size (ctx wire-size)
   "Fold WIRE-SIZE into the context's moving average of block sizes
 (0.9 old + 0.1 new, integer EMA). Ignores zero (unknown) sizes."
@@ -1193,7 +1286,7 @@ PEER-COUNTS and BK-HEIGHTS are precomputed once per call by the caller."
                (setf best-tier tier best-count count best peer)))))))
     (values best disclaimed)))
 
-(defun request-blocks-from-peers (peers chain-state)
+(defun request-blocks-from-peers (peers chain-state block-store)
   "Request blocks from multiple peers, distributing the load.
 Enforces per-peer in-flight limits (like Bitcoin Core's
 MAX_BLOCKS_IN_TRANSIT_PER_PEER) rather than a single global limit.
@@ -1282,49 +1375,35 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
     (when (or (null ready-peers) (zerop total-budget))
       (return-from request-blocks-from-peers 0))
 
-    ;; Get blocks to request (up to total budget, filtered to within the
-    ;; download window of current tip).
-    (let ((to-request (get-next-blocks-to-request
-                       total-budget
-                       (bitcoin-lisp.storage:current-height chain-state))))
-      (when (null to-request)
+    ;; Per-peer chain-aware download (Bitcoin Core FindNextBlocksToDownload):
+    ;; ask each peer ONLY for blocks on that peer's own best chain, walking
+    ;; from our last-common block with it. This is the layer-5 fix: the node
+    ;; downloads whatever chains its peers actually serve and can never fixate
+    ;; on a fork whose blocks no connected peer has (there is no notfound for
+    ;; blocks, so the old height-based scheduler retried such blocks forever).
+    ;; Mark each peer's chosen blocks in-flight BEFORE walking the next peer so
+    ;; two peers on the same chain don't both get the same block.
+    (let ((requests-made 0)
+          (peer-requests (make-hash-table :test 'eq))
+          (in-flight (ibd-context-in-flight *ibd-context*))
+          (remaining (if *ibd-gap-only-mode* 1 most-positive-fixnum)))
+      (dolist (peer ready-peers)
+        (when (plusp remaining)
+          (let ((budget (min remaining
+                             (max 0 (- max-per-peer (count-peer-in-flight peer))))))
+            (when (plusp budget)
+              (dolist (hash (find-blocks-to-download-for-peer
+                             peer chain-state block-store budget))
+                (unless (gethash hash in-flight)
+                  (mark-block-in-flight hash peer)
+                  (push hash (gethash peer peer-requests))
+                  (incf requests-made)
+                  (decf remaining)))))))
+      (when (zerop requests-made)
         (return-from request-blocks-from-peers 0))
 
-      ;; Distribute requests across peers, respecting per-peer limits.
-      ;; peer-counts (in-flight per peer) and bk-heights (each peer's
-      ;; best-known block height) are computed once per call here and read
-      ;; by select-peer-for-block, rather than re-derived per (block,peer).
-      (let ((requests-made 0)
-            (peer-requests (make-hash-table :test 'eq))
-            (peer-counts (make-hash-table :test 'eq))
-            (bk-heights (make-hash-table :test 'eq))
-            (pending (ibd-context-pending-blocks *ibd-context*))
-            (num-ready (length ready-peers)))
-        (dolist (peer ready-peers)
-          (setf (gethash peer peer-counts) (count-peer-in-flight peer))
-          (setf (gethash peer bk-heights) (peer-best-known-height peer chain-state)))
-
-        (dolist (hash to-request)
-          (multiple-value-bind (best disclaimed)
-              (select-peer-for-block hash (gethash hash pending)
-                                     ready-peers peer-counts bk-heights max-per-peer)
-            (cond
-              (best
-               (mark-block-in-flight hash best)
-               (push hash (gethash best peer-requests))
-               (setf (gethash best peer-counts) (1+ (gethash best peer-counts 0)))
-               (incf requests-made))
-              ;; No peer can serve it and every ready peer has disclaimed
-              ;; it (a stale fork) — drop it so IBD stops retrying forever
-              ;; instead of completing the reorg.
-              ((and (plusp num-ready) (>= disclaimed num-ready))
-               (drop-pending-block hash)
-               (bitcoin-lisp:log-warn
-                "Dropping block ~A — all ~D peers report notfound (stale fork)"
-                (bitcoin-lisp.crypto:bytes-to-hex hash) num-ready)))))
-
-        ;; Send batch request to each peer
-        (maphash (lambda (peer hashes)
+      ;; Send batch request to each peer
+      (maphash (lambda (peer hashes)
                    (when hashes
                      (handler-case
                          (let ((inv-vectors (mapcar (lambda (h)
@@ -1338,7 +1417,7 @@ re-request, which causes duplicate-delivery thrash and wasted bandwidth."
                        (error () nil))))
                  peer-requests)
 
-        requests-made))))
+      requests-made)))
 
 ;;;; Progress Reporting
 
@@ -1825,7 +1904,7 @@ a second download cursor for its [tip .. snapshot-base] range."
                  ;; Request more blocks if needed
                  (when peers
                    (setf no-peer-cycles 0)
-                   (request-blocks-from-peers peers chain-state))
+                   (request-blocks-from-peers peers chain-state block-store))
 
                  ;; Receive and process messages from all peers. Drain up to
                  ;; +max-messages-per-peer-per-cycle+ messages per peer per
@@ -1849,7 +1928,7 @@ a second download cursor for its [tip .. snapshot-base] range."
                             (ash (* (length peers)
                                     (ibd-context-max-in-flight ctx))
                                  -1))
-                     (request-blocks-from-peers peers chain-state)))
+                     (request-blocks-from-peers peers chain-state block-store)))
 
                  ;; Per-block request timeout retries (retry-timed-out-requests
                  ;; in request-blocks-from-peers) is our peer-disconnect path:

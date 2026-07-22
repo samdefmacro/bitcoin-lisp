@@ -208,7 +208,14 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;;     have an index entry for yet; resolved on next call to
   ;;     process-block-availability once headers catch up.
   (best-known-block-hash nil)
-  (hash-last-unknown-block nil))
+  (hash-last-unknown-block nil)
+  ;;   last-common-block-hash — the walk cursor for per-peer block download
+  ;;     (Core CNodeState::pindexLastCommonBlock): the highest block on BOTH
+  ;;     this peer's best chain and ours whose ancestors we already have. Block
+  ;;     requests to this peer start just above it, so we only ever ask a peer
+  ;;     for blocks on the peer's OWN chain — the fix for fixating on a fork
+  ;;     whose blocks no connected peer serves.
+  (last-common-block-hash nil))
 
 ;;; Pending compact block reconstruction state
 (defstruct pending-compact-block

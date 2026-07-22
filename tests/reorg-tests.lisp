@@ -1372,3 +1372,53 @@ path swallowed this signal and never re-requested the sub-tip fork blocks."
        (is (every (lambda (c) (and (consp c) (integerp (cdr c)))) (second outcome)))
        ;; Reorg refused -> active tip unchanged (still on branch A).
        (is (= 3 (bitcoin-lisp.storage:current-height csa)))))))
+
+(test find-blocks-to-download-only-on-peer-chain
+  "Layer-5 per-peer download: find-blocks-to-download-for-peer returns blocks on
+the PEER'S chain only. A peer whose best-known block is on fork B yields fork-B
+blocks to download and never fork-A blocks; a peer at our own tip yields nothing.
+This is why the node downloads the chains its peers actually serve instead of
+fixating on a fork no connected peer has."
+  (%with-regtest
+   (let* ((spk-a (%p2sh-optrue-spk))
+          (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
+          (nb (%regtest-node-fixture "l5-b"))
+          (b-blocks (loop repeat 5 for blk = (%dr-mine-on nb spk-b)
+                          do (%dr-connect nb blk) collect blk))
+          (na (%regtest-node-fixture "l5-a"))
+          (csa (bitcoin-lisp::node-chain-state na))
+          (storea (bitcoin-lisp::node-block-store na))
+          (genesis-hash (bitcoin-lisp.storage:best-block-hash csa)))
+     (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))   ; branch A, tip A3 (h3)
+     ;; Add branch B (5 blocks, more work) HEADERS to na, no bodies.
+     (let ((prev (bitcoin-lisp.storage:get-block-index-entry csa genesis-hash)))
+       (loop for blk in b-blocks for h from 1 to 5
+             do (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                       (bhash (bitcoin-lisp.serialization:block-header-hash hdr))
+                       (work (bitcoin-lisp.storage:calculate-chain-work
+                              (bitcoin-lisp.serialization:block-header-bits hdr)
+                              (bitcoin-lisp.storage:block-index-entry-chain-work prev)))
+                       (e (bitcoin-lisp.storage:make-block-index-entry
+                           :hash bhash :height h :header hdr
+                           :prev-entry prev :chain-work work :status :header-valid)))
+                  (bitcoin-lisp.storage:add-block-index-entry csa e)
+                  (setf prev e))))
+     (let* ((ctx (bitcoin-lisp.networking::make-ibd))
+            (b-hashes (mapcar (lambda (blk)
+                                (bitcoin-lisp.serialization:block-header-hash
+                                 (bitcoin-lisp.serialization:bitcoin-block-header blk)))
+                              b-blocks))
+            (peer-b (bitcoin-lisp.networking::make-peer :address "1.2.3.4:18333"))
+            (peer-tip (bitcoin-lisp.networking::make-peer :address "5.6.7.8:18333")))
+       (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer-b) (fifth b-hashes)
+             (bitcoin-lisp.networking::peer-best-known-block-hash peer-tip)
+             (bitcoin-lisp.storage:best-block-hash csa))
+       (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+         ;; Peer on fork B: returns exactly the 5 fork-B blocks, none of fork A.
+         (let ((got (bitcoin-lisp.networking::find-blocks-to-download-for-peer
+                     peer-b csa storea 16)))
+           (is (= 5 (length got)))
+           (is (every (lambda (h) (member h b-hashes :test #'equalp)) got)))
+         ;; Peer at our own tip (A3): nothing more-work to fetch.
+         (is (null (bitcoin-lisp.networking::find-blocks-to-download-for-peer
+                    peer-tip csa storea 16))))))))
