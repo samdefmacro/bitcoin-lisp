@@ -117,17 +117,21 @@ thread mutates it."
   ;; (all-or-nothing, disk-only) never saw them, and the per-peer download
   ;; walk could not distinguish them from missing blocks.
   (disk-blocks-above-tip (make-hash-table :test 'eql) :type hash-table)
-  ;; Hash of the highest-work PERSISTED block whose chain outweighs the
-  ;; active tip — the pending deep-reorg candidate (poor man's Core
-  ;; ActivateBestChain target: Core re-evaluates the best chain after
-  ;; every accepted block; our receive path is height-dispatched and a
-  ;; block above tip+1 otherwise never gets a reorg attempted for it).
-  ;; Recorded by the out-of-order receive path and the download walk
-  ;; (which re-records after a restart); retried cheaply on arrivals and
-  ;; once per fetch cycle, gated on the fork's bodies being complete on
-  ;; disk so the all-or-nothing perform-reorg is attempted only when it
-  ;; can succeed.
-  (pending-reorg-candidate nil)
+  ;; Deep-reorg candidate SET: hashes of PERSISTED blocks whose chain
+  ;; outweighs the active tip (Core setBlockIndexCandidates, restricted to
+  ;; what we hold on disk). Core re-evaluates the best chain after every
+  ;; accepted block; our receive path is height-dispatched, so a block that
+  ;; wins the reorg only above tip+1 (or below the tip on a heavier-shorter
+  ;; fork) otherwise never gets a reorg attempted. retry-best-reorg-candidate
+  ;; walks this set for the highest-work COMPLETABLE target — a work-ordered
+  ;; SET, not a single slot, so a higher-work but unobtainable fork can never
+  ;; starve a lower-work obtainable one. Recorded by the receive path and the
+  ;; download walk (re-arms after restart). hash -> t.
+  (reorg-candidates (make-block-hash-table) :type hash-table)
+  ;; Hashes of candidates whose reorg deterministically FAILED validation, or
+  ;; that stayed refused past the retry throttle — so the retry stops
+  ;; re-attempting a doomed/never-completable fork every cycle. hash -> t.
+  (rejected-reorg-candidates (make-block-hash-table) :type hash-table)
   ;; Exponential moving average of received block wire sizes. Seeds at 1MB
   ;; (safe both ways: modern blocks ~1-2MB; early-chain blocks correct it
   ;; downward within seconds). Telemetry only since the per-peer walk
@@ -420,10 +424,14 @@ Core's MSG NOTFOUND handling, which clears the peer's block request."
 (defun queue-missing-fork-blocks (missing-blocks)
   "MISSING-BLOCKS is a list of (hash . height) cons cells, returned by
 perform-reorg when it refused due to blocks missing from the store.
-Add each to the pending queue and reset its timeout counter so the
-existing download scheduler asks peers for them again. Without this,
-perform-reorg refuses on the same missing block forever — the
-deferred-reorg loop bug (project_per_peer_block_tracking.md)."
+Add each to the pending queue, reset its timeout counter, and REWIND each
+ready peer's per-peer download cursor to below the lowest missing height so
+the next chain walk re-derives from the fork point and re-requests the hole.
+The rewind is essential under the layer-5 scheduler: the walk requests from
+each peer's chain (not from pending-blocks), and once a peer's cursor has
+advanced past the hole it would never re-request it — the re-queue alone is
+a dead letter. Without recovery, perform-reorg refuses on the same missing
+block forever (the deferred-reorg loop bug, project_per_peer_block_tracking.md)."
   (unless (and *ibd-context* missing-blocks)
     (return-from queue-missing-fork-blocks 0))
   (let ((pending (ibd-context-pending-blocks *ibd-context*))
@@ -441,8 +449,14 @@ deferred-reorg loop bug (project_per_peer_block_tracking.md)."
           (remhash hash timeouts)
           (remhash hash (ibd-context-block-disclaims *ibd-context*))
           (incf queued))))
+    ;; Rewind cursors at/above the lowest missing block so the per-peer walk
+    ;; revisits the hole. Setting to NIL is safe and self-limiting: the next
+    ;; walk recomputes last-common = fork point and re-requests only what we
+    ;; still lack (a one-time O(window) rewalk per peer).
+    (dolist (peer (ibd-context-peers *ibd-context*))
+      (setf (peer-last-common-block-hash peer) nil))
     (when (plusp queued)
-      (bitcoin-lisp:log-warn "Re-queued ~D missing fork blocks for download"
+      (bitcoin-lisp:log-warn "Re-queued ~D missing fork blocks for download (cursors rewound)"
                              queued))
     queued))
 
@@ -1600,12 +1614,18 @@ handler. Shared by the block-download drain and the at-tip reap pass."
                           (bitcoin-lisp.storage:block-index-entry-height base)))
                  (values hist (bitcoin-lisp.storage:chain-state-coins-view hist))
                  (values chain-state utxo-set)))
-         (mark-block-received hash)
-         (record-block-received-from-peer peer)
-         (process-received-block block route-cs route-view block-store
-                                 :fee-estimator fee-estimator
-                                 :recent-rejects recent-rejects
-                                 :wire-size (length payload)))))
+         ;; Capture "did we request this?" BEFORE mark-block-received clears
+         ;; the in-flight/pending entry — the out-of-order persist gate needs
+         ;; it to tell a solicited download from an unsolicited disk-fill push.
+         (let ((requested (and ctx (or (gethash hash (ibd-context-in-flight ctx))
+                                       (gethash hash (ibd-context-pending-blocks ctx))))))
+           (mark-block-received hash)
+           (record-block-received-from-peer peer)
+           (process-received-block block route-cs route-view block-store
+                                   :fee-estimator fee-estimator
+                                   :recent-rejects recent-rejects
+                                   :wire-size (length payload)
+                                   :requested (and requested t))))))
 
     ((string= command "headers")
      (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
@@ -1970,9 +1990,9 @@ a second download cursor for its [tip .. snapshot-base] range."
                  ;; candidates). No-op unless a candidate is armed, and the
                  ;; bodies-complete gate keeps a still-downloading fork
                  ;; cheap (early-exit probe at its first gap).
-                 (retry-pending-reorg-candidate chain-state block-store utxo-set
-                                                :fee-estimator fee-estimator
-                                                :recent-rejects recent-rejects)
+                 (retry-best-reorg-candidate chain-state block-store utxo-set
+                                             :fee-estimator fee-estimator
+                                             :recent-rejects recent-rejects)
 
                  ;; Idle pacing: when a full cycle neither requested nor
                  ;; received a single block, yield briefly. The loop gate
@@ -2442,113 +2462,221 @@ trigger holds the incoming block in hand."
                                            bh))))
                 (return nil)))))))))
 
-(defun note-reorg-candidate (entry chain-state)
-  "Record ENTRY as the pending deep-reorg candidate if its chain outweighs
-both the active tip and any current candidate. Only PERSISTED blocks may
-be noted (the retry loads the body from the block-store). O(1) compares —
-safe to call once per walked block per tick."
+(defparameter +reorg-candidates-cap+ 4096
+  "Hard cap on the reorg-candidate SET (and disk-blocks-above-tip). The
+AcceptBlock gate already bounds what enters, but this is a belt-and-suspenders
+ceiling so a pathological header topology can't grow the set without bound.")
+
+(defparameter +reorg-refused-retry-cap+ 4
+  "After this many gate-passed-but-refused reorg attempts for one candidate
+hash, reject it — a fork whose DISCONNECT-side (active-chain) body is missing,
+or whose connect-side body vanished repeatedly, would otherwise re-run a full
+perform-reorg every fetch cycle (100% CPU + log flood).")
+
+(defun %record-disk-block-above-tip (height hash)
+  "Record a persisted above-tip block in disk-blocks-above-tip (drain's disk
+fallback). Bounded by +reorg-candidates-cap+ heights; over cap the entry is
+dropped (the block stays on disk and the download walk re-records it when the
+window reaches it)."
   (when *ibd-context*
-    (let* ((tip-entry (bitcoin-lisp.storage:get-block-index-entry
-                       chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
-           (work (bitcoin-lisp.storage:block-index-entry-chain-work entry)))
-      (when (and tip-entry
-                 (> work (bitcoin-lisp.storage:block-index-entry-chain-work tip-entry)))
-        (let* ((cand-hash (ibd-context-pending-reorg-candidate *ibd-context*))
-               (cand (and cand-hash
-                          (bitcoin-lisp.storage:get-block-index-entry
-                           chain-state cand-hash))))
-          (when (or (null cand)
-                    (> work (bitcoin-lisp.storage:block-index-entry-chain-work cand)))
-            (setf (ibd-context-pending-reorg-candidate *ibd-context*)
-                  (bitcoin-lisp.storage:block-index-entry-hash entry))))))))
+    (let ((map (ibd-context-disk-blocks-above-tip *ibd-context*)))
+      (when (or (gethash height map)
+                (< (hash-table-count map) +reorg-candidates-cap+))
+        (pushnew hash (gethash height map) :test #'equalp)))))
 
-(defun retry-pending-reorg-candidate (chain-state block-store utxo-set
-                                      &key fee-estimator recent-rejects)
-  "Deep-reorg activation — the case the height-dispatched receive path
-cannot reach. A block arriving more than one above the tip never goes
-through activate-block, so when a fork's cumulative work overtakes the
-active tip only ABOVE tip+1 (testnet4 min-difficulty fork storm), no
-arrival ever attempted the reorg: the winning bodies piled up while the
-tip+1 fork block kept reading as \"weaker\" and the tip sat still forever
-(there is no periodic best-chain re-evaluation; Core's ActivateBestChain
-runs after every accepted block).
+(defun %out-of-order-block-acceptable-p (entry current-height requested chain-state)
+  "Core AcceptBlock anti-DoS gate (validation.cpp:4367-4378) for an
+out-of-order block: keep it if we REQUESTED it, or (unsolicited) it has more
+work than our tip, sits within +min-blocks-to-keep+ of the tip, and meets
+minimum chain work. Header admission already validated its PoW before the
+entry got chain-work, so this bounds only unsolicited far-ahead / low-work
+disk fill."
+  (or requested
+      (let* ((tip-entry (bitcoin-lisp.storage:get-block-index-entry
+                         chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+             (work (bitcoin-lisp.storage:block-index-entry-chain-work entry))
+             (height (bitcoin-lisp.storage:block-index-entry-height entry)))
+        (and tip-entry
+             (> work (bitcoin-lisp.storage:block-index-entry-chain-work tip-entry))
+             (<= height (+ current-height bitcoin-lisp:+min-blocks-to-keep+))
+             (>= work (bitcoin-lisp:minimum-chain-work bitcoin-lisp:*network*))))))
 
-Attempts activate-block's pre-reorg case for the recorded candidate when
-(a) it still outweighs the tip and (b) its fork bodies are complete on
-disk (cheap early-exit probe gate) — so the all-or-nothing perform-reorg
-runs only when it can succeed. Called on out-of-order arrivals and once
-per fetch cycle (the cycle call also covers restarts: the download walk
-re-records persisted candidates). Returns T if the candidate activated."
-  (when (null *ibd-context*)
-    (return-from retry-pending-reorg-candidate nil))
-  (let ((cand-hash (ibd-context-pending-reorg-candidate *ibd-context*)))
-    (when (null cand-hash)
-      (return-from retry-pending-reorg-candidate nil))
-    (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state cand-hash))
-          (tip-entry (bitcoin-lisp.storage:get-block-index-entry
+(defun note-reorg-candidate (entry chain-state)
+  "Add ENTRY to the deep-reorg candidate SET if its chain outweighs the active
+tip and it isn't already rejected. Only PERSISTED blocks should be noted (the
+retry loads the body from disk); callers note from the persist paths and the
+download walk. O(1); safe to call once per walked block per tick. Bounded by
++reorg-candidates-cap+."
+  (when *ibd-context*
+    (let ((tip-entry (bitcoin-lisp.storage:get-block-index-entry
                       chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
-          (mempool (ibd-context-mempool *ibd-context*)))
-      (cond
-        ;; Stale: unknown, or no longer outweighs the (advanced) tip.
-        ((or (null entry) (null tip-entry)
-             (<= (bitcoin-lisp.storage:block-index-entry-chain-work entry)
-                 (bitcoin-lisp.storage:block-index-entry-chain-work tip-entry)))
-         (setf (ibd-context-pending-reorg-candidate *ibd-context*) nil)
-         nil)
-        ((not (%fork-bodies-complete-p entry tip-entry chain-state block-store))
-         nil)                            ; keep waiting; walk keeps fetching
-        (t
-         (let ((blk (bitcoin-lisp.storage:get-block block-store cand-hash))
-               (height (bitcoin-lisp.storage:block-index-entry-height entry)))
-           (cond
-             ((null blk)
-              ;; Body vanished (pruned/stripped): drop the candidate; the
-              ;; walk re-fetches and re-records if it still matters.
-              (setf (ibd-context-pending-reorg-candidate *ibd-context*) nil)
-              nil)
-             (t
-              (bitcoin-lisp:log-warn
-               "Deep-reorg candidate at height ~D outweighs tip ~D with complete bodies; attempting reorg"
-               height (bitcoin-lisp.storage:block-index-entry-height tip-entry))
-              (multiple-value-bind (activated error missing-blocks)
-                  (with-node-lock
-                    (bitcoin-lisp.validation:activate-block
-                     blk chain-state block-store utxo-set
-                     :current-time (bitcoin-lisp.serialization:get-unix-time)
-                     :skip-scripts (<= height (script-skip-height chain-state))
-                     :fee-estimator fee-estimator
-                     :recent-rejects recent-rejects
-                     :mempool mempool))
-                (cond
-                  (activated
-                   (setf (ibd-context-pending-reorg-candidate *ibd-context*) nil)
-                   (clear-block-failure cand-hash)
-                   (note-tip-advanced chain-state)
-                   ;; Children above the new tip may already be buffered.
-                   (drain-block-queue chain-state utxo-set block-store
-                                      :fee-estimator fee-estimator
-                                      :recent-rejects recent-rejects)
-                   t)
-                  ((and (eq error :reorg-refused) missing-blocks)
-                   ;; Raced: something went missing between the gate and the
-                   ;; reorg (e.g. pruning). Keep the candidate; re-queue.
-                   (queue-missing-fork-blocks missing-blocks)
-                   nil)
-                  (t
-                   ;; Validation failure or structural refusal: this
-                   ;; candidate cannot activate — drop it so we don't
-                   ;; re-attempt a doomed reorg every cycle.
-                   (bitcoin-lisp:log-warn
-                    "Deep-reorg candidate at height ~D did not activate: ~A"
-                    height error)
-                   (setf (ibd-context-pending-reorg-candidate *ibd-context*) nil)
-                   nil)))))))))))
+          (hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+          (set (ibd-context-reorg-candidates *ibd-context*)))
+      (when (and tip-entry
+                 (> (bitcoin-lisp.storage:block-index-entry-chain-work entry)
+                    (bitcoin-lisp.storage:block-index-entry-chain-work tip-entry))
+                 (not (gethash hash (ibd-context-rejected-reorg-candidates *ibd-context*)))
+                 (or (gethash hash set)
+                     (< (hash-table-count set) +reorg-candidates-cap+)))
+        (setf (gethash hash set) t)))))
+
+(defun %reject-reorg-candidate (hash)
+  "Move HASH out of the candidate set into the rejected set (bounded)."
+  (when *ibd-context*
+    (remhash hash (ibd-context-reorg-candidates *ibd-context*))
+    (let ((rej (ibd-context-rejected-reorg-candidates *ibd-context*)))
+      (when (>= (hash-table-count rej) +reorg-candidates-cap+)
+        (clrhash rej))
+      (setf (gethash hash rej) t))))
+
+(defun %best-completable-reorg-target (chain-state block-store tip-entry tip-work)
+  "Highest-work candidate in the set whose fork bodies are all on disk (both
+the connect side via %fork-bodies-complete-p and — because perform-reorg is
+all-or-nothing on BOTH sides — the disconnect side, the active chain down to
+the fork point). Prunes stale (<=tip work), rejected, :invalid, and
+body-missing entries as it scans. Returns (values entry block) or NIL. Bounds
+the per-cycle gate work: probes only the top few by work, since higher-work
+completable targets are what we want and gated forks early-exit cheaply."
+  (let ((set (ibd-context-reorg-candidates *ibd-context*))
+        (rej (ibd-context-rejected-reorg-candidates *ibd-context*))
+        (cands '()))
+    (maphash
+     (lambda (hash v)
+       (declare (ignore v))
+       (let ((e (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+         (cond
+           ((or (null e)
+                (gethash hash rej)
+                (eq (bitcoin-lisp.storage:block-index-entry-status e) :invalid)
+                (<= (bitcoin-lisp.storage:block-index-entry-chain-work e) tip-work))
+            (remhash hash set))          ; prune: stale / rejected / invalid
+           (t (push e cands)))))
+     set)
+    ;; Highest work first; try the top few through the (two-sided) gate.
+    (setf cands (sort cands #'>
+                      :key #'bitcoin-lisp.storage:block-index-entry-chain-work))
+    (loop for e in cands
+          for i from 0 below 16
+          do (when (and (%fork-bodies-complete-p e tip-entry chain-state block-store)
+                        (%active-chain-present-to-fork-p e tip-entry chain-state
+                                                         block-store))
+               (let ((blk (bitcoin-lisp.storage:get-block
+                           block-store (bitcoin-lisp.storage:block-index-entry-hash e))))
+                 (if blk
+                     (return-from %best-completable-reorg-target (values e blk))
+                     ;; Body vanished since it was noted — prune and keep scanning.
+                     (remhash (bitcoin-lisp.storage:block-index-entry-hash e) set)))))
+    nil))
+
+(defun %active-chain-present-to-fork-p (entry tip-entry chain-state block-store)
+  "T when every ACTIVE-chain (disconnect-side) body from TIP-ENTRY down to the
+fork point with ENTRY is present — perform-reorg needs both sides, and a
+missing active-chain body (undo/block corruption) otherwise makes it refuse
+every cycle after the connect-side gate passed. Active-chain blocks below the
+tip are treated as present when on-chain (get-block-at-height), even if pruned;
+perform-reorg's own precondition is the authority — this only avoids the
+wasteful attempt."
+  (let ((fork (bitcoin-lisp.validation:find-fork-point entry tip-entry)))
+    (when fork
+      (let ((fork-height (bitcoin-lisp.storage:block-index-entry-height fork))
+            (e tip-entry))
+        (loop while (and e (> (bitcoin-lisp.storage:block-index-entry-height e)
+                              fork-height))
+              do (let ((bh (bitcoin-lisp.storage:block-index-entry-hash e))
+                       (h (bitcoin-lisp.storage:block-index-entry-height e)))
+                   (unless (or (bitcoin-lisp.storage:block-exists-p block-store bh)
+                               (let ((a (bitcoin-lisp.storage:get-block-at-height
+                                         chain-state h)))
+                                 (and a (equalp (bitcoin-lisp.storage:block-index-entry-hash a)
+                                                bh))))
+                     (return-from %active-chain-present-to-fork-p nil))
+                   (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e))))
+        t))))
+
+(defun retry-best-reorg-candidate (chain-state block-store utxo-set
+                                   &key fee-estimator recent-rejects)
+  "Deep-reorg activation — the case the height-dispatched receive path cannot
+reach. A block that wins the reorg only above tip+1 (or below the tip on a
+heavier-shorter fork) never triggers activate-block, so nothing attempts the
+reorg and the tip sits still forever (there is no periodic best-chain
+re-evaluation; Core's ActivateBestChain runs after every accepted block).
+
+Finds the highest-work COMPLETABLE candidate (both fork sides on disk) and
+runs activate-block's pre-reorg case for it — the all-or-nothing perform-reorg
+is attempted only when it can succeed. On a deterministic validation failure
+the candidate is REJECTED (never retried); on repeated gate-passed refusals it
+is rejected after +reorg-refused-retry-cap+ tries (a fork whose disconnect
+body never arrives). Called on out-of-order/weaker arrivals and once per fetch
+cycle (which also re-arms after restart via the download walk). Returns T if a
+candidate activated."
+  (when (null *ibd-context*)
+    (return-from retry-best-reorg-candidate nil))
+  (let ((tip-entry (bitcoin-lisp.storage:get-block-index-entry
+                    chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+        (mempool (ibd-context-mempool *ibd-context*)))
+    (when (null tip-entry)
+      (return-from retry-best-reorg-candidate nil))
+    (multiple-value-bind (entry blk)
+        (%best-completable-reorg-target
+         chain-state block-store tip-entry
+         (bitcoin-lisp.storage:block-index-entry-chain-work tip-entry))
+      (when (null entry)
+        (return-from retry-best-reorg-candidate nil))
+      (let ((cand-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+            (height (bitcoin-lisp.storage:block-index-entry-height entry)))
+        (bitcoin-lisp:log-warn
+         "Deep-reorg candidate at height ~D outweighs tip ~D with complete bodies; attempting reorg"
+         height (bitcoin-lisp.storage:block-index-entry-height tip-entry))
+        (multiple-value-bind (activated error missing-blocks)
+            (with-node-lock
+              (bitcoin-lisp.validation:activate-block
+               blk chain-state block-store utxo-set
+               :current-time (bitcoin-lisp.serialization:get-unix-time)
+               :skip-scripts (<= height (script-skip-height chain-state))
+               :fee-estimator fee-estimator
+               :recent-rejects recent-rejects
+               :mempool mempool))
+          (cond
+            (activated
+             (remhash cand-hash (ibd-context-reorg-candidates *ibd-context*))
+             (clear-block-failure cand-hash)
+             (note-tip-advanced chain-state)
+             ;; Children above the new tip may already be buffered.
+             (drain-block-queue chain-state utxo-set block-store
+                                :fee-estimator fee-estimator
+                                :recent-rejects recent-rejects)
+             t)
+            ((and (eq error :reorg-refused) missing-blocks)
+             ;; Gate passed but perform-reorg still refused: a body raced out
+             ;; (pruned) or the disconnect side is missing. Re-queue what's
+             ;; gone; throttle so a fork whose hole never fills is eventually
+             ;; rejected instead of looping a full reorg every cycle.
+             (queue-missing-fork-blocks missing-blocks)
+             (note-block-failure cand-hash)
+             (when (>= (gethash cand-hash *block-failure-counts* 0)
+                       +reorg-refused-retry-cap+)
+               (bitcoin-lisp:log-warn
+                "Deep-reorg candidate at height ~D refused ~D times; rejecting"
+                height +reorg-refused-retry-cap+)
+               (%reject-reorg-candidate cand-hash))
+             nil)
+            (t
+             ;; Deterministic validation failure (this fork or the incoming
+             ;; block is consensus-invalid): reject so we never re-attempt a
+             ;; doomed reorg.
+             (bitcoin-lisp:log-warn
+              "Deep-reorg candidate at height ~D did not activate (~A); rejecting"
+              height error)
+             (%reject-reorg-candidate cand-hash)
+             nil)))))))
 
 (defun process-received-block (block chain-state utxo-set block-store
                                 &key fee-estimator recent-rejects
-                                  (wire-size 0))
+                                  (wire-size 0) requested)
   "Process a received block - validate and connect to chain.
-After connecting, drains the queue of any children that can now be connected."
+After connecting, drains the queue of any children that can now be connected.
+REQUESTED is T when this block was in-flight/pending (we asked for it); it
+lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (hash (bitcoin-lisp.serialization:block-header-hash header))
          (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash))
@@ -2601,21 +2729,45 @@ After connecting, drains the queue of any children that can now be connected."
              "Competing-fork block ~D arrived witness-stripped; not storing" height)
             ;; Node lock: activation mutates chainstate/UTXO/mempool state
             ;; the RPC threads access under the same lock.
-            (with-node-lock
-              (bitcoin-lisp.storage:store-block block-store block)
-              (multiple-value-bind (activated error)
-                  (bitcoin-lisp.validation:activate-block
-                   block chain-state block-store utxo-set
-                   :skip-scripts (<= height (script-skip-height chain-state))
-                   :fee-estimator fee-estimator
-                   :recent-rejects recent-rejects
-                   :mempool mempool)
-                (declare (ignore activated))
-                ;; :weaker-chain is the expected outcome here; any other
-                ;; error is worth logging at debug level for now.
-                (unless (eq error :weaker-chain)
-                  (bitcoin-lisp:log-debug "Competing-fork block ~D activate result: ~A"
-                                          height error)))))
+            (progn
+              (with-node-lock
+                (bitcoin-lisp.storage:store-block block-store block))
+              (multiple-value-bind (activated error missing-blocks)
+                  (with-node-lock
+                    (bitcoin-lisp.validation:activate-block
+                     block chain-state block-store utxo-set
+                     :skip-scripts (<= height (script-skip-height chain-state))
+                     :fee-estimator fee-estimator
+                     :recent-rejects recent-rejects
+                     :mempool mempool))
+                (cond
+                  ;; A heavier-shorter fork can win the reorg with its tip at or
+                  ;; below our height (real-difficulty fork vs min-difficulty
+                  ;; spam) — activate-block case 2 then fires here.
+                  (activated
+                   (clear-block-failure hash)
+                   (note-tip-advanced chain-state)
+                   (drain-block-queue chain-state utxo-set block-store
+                                      :fee-estimator fee-estimator
+                                      :recent-rejects recent-rejects))
+                  ;; Stored, doesn't yet outweigh the tip: note it so the
+                  ;; per-cycle retry re-evaluates once its fork completes
+                  ;; (the crossover-at-or-below-tip case — F3).
+                  ((eq error :weaker-chain)
+                   (note-reorg-candidate entry chain-state))
+                  ;; Outweighs but intermediate bodies missing: re-queue the
+                  ;; hole (cursors rewound) and note for retry.
+                  ((eq error :reorg-refused)
+                   (queue-missing-fork-blocks missing-blocks)
+                   (note-reorg-candidate entry chain-state))
+                  (t
+                   (bitcoin-lisp:log-debug "Competing-fork block ~D activate result: ~A"
+                                           height error)))
+                ;; Try the best completable candidate now that this block is on
+                ;; disk (may complete a fork whose bodies just filled in).
+                (retry-best-reorg-candidate chain-state block-store utxo-set
+                                            :fee-estimator fee-estimator
+                                            :recent-rejects recent-rejects))))
         (return-from process-received-block nil))
 
       ;; Check if this is the next block we need
@@ -2632,6 +2784,18 @@ After connecting, drains the queue of any children that can now be connected."
           ;; Skip signature validation for blocks at or below the last
           ;; checkpoint or the assumevalid block (matches Bitcoin Core IBD;
           ;; everything except sig checks is still validated).
+          ;; A witness-stripped block at tip+1 must NOT reach activate-block:
+          ;; the case-3 (weaker-fork) path would persist it, and a stripped
+          ;; block on disk fails every later reorg — the original testnet4
+          ;; wedge. Drop it; a witness-complete copy arrives via the normal
+          ;; download / compact-block path. (Mirrors the competing-fork guard
+          ;; below and the out-of-order guard further down.)
+          (if (bitcoin-lisp.validation:block-witness-stripped-p block)
+              (progn
+                (bitcoin-lisp:log-debug
+                 "Tip+1 block ~D arrived witness-stripped; dropping (await complete copy)"
+                 height)
+                nil)
           (let ((current-time (bitcoin-lisp.serialization:get-unix-time))
                 (skip-scripts (<= height (script-skip-height chain-state))))
             (multiple-value-bind (activated error missing-blocks)
@@ -2656,87 +2820,92 @@ After connecting, drains the queue of any children that can now be connected."
                                     :recent-rejects recent-rejects)
                  t)
                 ;; :weaker-chain isn't an error — block stored, no
-                ;; activation needed.
+                ;; activation needed. But its chain may cross the tip's work
+                ;; only ABOVE here later; record it as a reorg candidate so
+                ;; the per-cycle retry can trigger the reorg once complete
+                ;; (fixes the crossover-at-or-below-tip stall).
                 ((eq error :weaker-chain)
+                 (note-reorg-candidate entry chain-state)
                  nil)
                 ;; :reorg-refused — the new block sits on a stronger
                 ;; fork but we don't have the intermediate fork blocks.
                 ;; Re-queue the missing ones for download (with timeout
                 ;; counters reset) and DON'T re-queue the incoming
                 ;; block — otherwise we'd retry the same unprocessable
-                ;; tip forever. When the fork blocks finally arrive
-                ;; through normal download, the next tip announcement
-                ;; will trigger another reorg attempt, this time with
-                ;; everything in store.
+                ;; tip forever. Record the candidate so the per-cycle retry
+                ;; re-attempts once the fork bodies are all in store, rather
+                ;; than waiting for the next fresh tip announcement.
                 ((eq error :reorg-refused)
                  (queue-missing-fork-blocks missing-blocks)
+                 (note-reorg-candidate entry chain-state)
                  nil)
                 (t
                  ;; handle-validation-failure logs (throttled by retry count) and
                  ;; manages re-request budget.
                  (handle-validation-failure block height error chain-state)
-                 nil))))
+                 nil)))))
 
-          ;; Out of order (h > tip+1). Bitcoin Core persists every accepted
+          ;; Out of order (h > tip+1). Bitcoin Core persists every ACCEPTED
           ;; block to disk immediately (AcceptBlock -> SaveBlockToDisk,
-          ;; BLOCK_HAVE_DATA) and connects from disk; we do the same here —
-          ;; the RAM block-queue below remains only the in-order fast path
-          ;; for drain-block-queue. Witness-stripped copies are never
-          ;; persisted (same rule as the competing-fork path above: a
-          ;; stripped block on disk fails every later reorg — the original
-          ;; testnet4 wedge) and instead re-enter pending on drop so a
-          ;; complete copy is re-fetched. Persisted blocks that miss the RAM
-          ;; queue (cap, same-height fork collision, too-far-ahead) stay
-          ;; reachable through disk-blocks-above-tip — drain's disk
-          ;; fallback — so they are never re-requested and never stranded
-          ;; (pre-fix, a drop here re-queued the block for a full
-          ;; re-download; observed May 7 at h=1027 with 53k drops).
+          ;; BLOCK_HAVE_DATA) and connects from disk; we do the same — the RAM
+          ;; block-queue below is only the in-order fast path for
+          ;; drain-block-queue. But we persist ONLY if the block passes Core's
+          ;; AcceptBlock anti-DoS gate: it must be REQUESTED, or (unsolicited)
+          ;; carry more work than our tip, sit within +min-blocks-to-keep+ of
+          ;; it, and meet minimum chain work (validation.cpp:4367-4378).
+          ;; Without this an attacker fills our disk with unsolicited
+          ;; far-ahead min-difficulty fork bodies. Witness-stripped copies are
+          ;; never persisted (a stripped block on disk fails every later reorg
+          ;; — the original testnet4 wedge). Persisted blocks that miss the RAM
+          ;; queue (cap, same-height fork collision) stay reachable through
+          ;; disk-blocks-above-tip (drain's disk fallback), so they are never
+          ;; re-requested and never stranded.
           (progn
             (bitcoin-lisp:log-debug "Block ~D received out of order (current: ~D)"
                                     height current-height)
-            (let ((stripped (bitcoin-lisp.validation:block-witness-stripped-p block)))
-              (if stripped
-                  (bitcoin-lisp:log-debug
-                   "Out-of-order block ~D arrived witness-stripped; not persisting"
-                   height)
-                  (with-node-lock
-                    (bitcoin-lisp.storage:store-block block-store block)))
-              (when *ibd-context*
-                (unless stripped
-                  (pushnew hash (gethash height (ibd-context-disk-blocks-above-tip
-                                                 *ibd-context*))
-                           :test #'equalp))
-                (let ((queue (ibd-context-block-queue *ibd-context*))
-                      (pending (ibd-context-pending-blocks *ibd-context*)))
-                  (cond
-                    ((gethash height queue)
-                     nil)  ; RAM slot taken (duplicate or fork sibling); disk copy recorded above
-                    ((or (>= (hash-table-count queue) +max-block-queue-size+)
-                         (>= (ibd-context-block-queue-bytes *ibd-context*)
-                             +max-block-queue-bytes+)
-                         (> (- height current-height) +max-block-queue-size+))
-                     (bitcoin-lisp:log-debug
-                      "Out-of-order block at height ~D skips the RAM queue (~:[cap/window~;persisted to disk~], tip ~D)"
-                      height (not stripped) current-height)
-                     ;; Only an unpersisted (stripped) copy needs re-fetching.
-                     (when stripped
-                       (setf (gethash hash pending) height)))
-                    (t
-                     (setf (gethash height queue) (cons block wire-size))
-                     (incf (ibd-context-block-queue-bytes *ibd-context*)
-                           wire-size)))))
-              ;; Deep-reorg trigger: a block above tip+1 never reaches
-              ;; activate-block via the height dispatch, so a fork whose
-              ;; work overtakes the tip only up here would otherwise never
-              ;; get its reorg attempted. Record the candidate and retry
-              ;; immediately (gated on fork bodies being complete on disk;
-              ;; the fetch loop retries once per cycle as arrivals fill the
-              ;; fork in whatever order the network delivers).
-              (unless stripped
-                (note-reorg-candidate entry chain-state)
-                (retry-pending-reorg-candidate chain-state block-store utxo-set
+            (let* ((stripped (bitcoin-lisp.validation:block-witness-stripped-p block))
+                   (accept (and (not stripped)
+                                (%out-of-order-block-acceptable-p
+                                 entry current-height requested chain-state))))
+              (cond
+                ((not accept)
+                 (bitcoin-lisp:log-debug
+                  "Out-of-order block ~D not persisted (~:[unsolicited/low-work/too-far~;stripped~], tip ~D)"
+                  height stripped current-height)
+                 ;; An unpersisted copy we still want (stripped, or gate-failed
+                 ;; but requested elsewhere) re-enters pending for a re-fetch.
+                 (when (and *ibd-context* stripped requested)
+                   (setf (gethash hash (ibd-context-pending-blocks *ibd-context*))
+                         height)))
+                (t
+                 (with-node-lock
+                   (bitcoin-lisp.storage:store-block block-store block))
+                 (when *ibd-context*
+                   (%record-disk-block-above-tip height hash)
+                   (let ((queue (ibd-context-block-queue *ibd-context*)))
+                     (cond
+                       ((gethash height queue)
+                        nil)  ; RAM slot taken (dup/fork sibling); disk copy recorded
+                       ((or (>= (hash-table-count queue) +max-block-queue-size+)
+                            (>= (ibd-context-block-queue-bytes *ibd-context*)
+                                +max-block-queue-bytes+)
+                            (> (- height current-height) +max-block-queue-size+))
+                        nil)  ; skips RAM queue; disk copy + map entry carry it
+                       (t
+                        (setf (gethash height queue) (cons block wire-size))
+                        (incf (ibd-context-block-queue-bytes *ibd-context*)
+                              wire-size))))
+                   ;; Deep-reorg trigger: a block above tip+1 never reaches
+                   ;; activate-block via the height dispatch, so a fork whose
+                   ;; work overtakes the tip only up here would otherwise never
+                   ;; get its reorg attempted. Record it as a candidate and
+                   ;; retry immediately (gated on fork bodies complete on disk;
+                   ;; the fetch loop retries once per cycle as arrivals fill
+                   ;; the fork in whatever order the network delivers).
+                   (note-reorg-candidate entry chain-state)
+                   (retry-best-reorg-candidate chain-state block-store utxo-set
                                                :fee-estimator fee-estimator
-                                               :recent-rejects recent-rejects)))
+                                               :recent-rejects recent-rejects)))))
             nil)))))
 
 (defun %next-disk-block-for-drain (next-height chain-state block-store)

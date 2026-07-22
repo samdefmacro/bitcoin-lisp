@@ -2547,6 +2547,11 @@ can neither wedge on an equal-work sibling nor advance past the base."
            ;; Case 3: weaker / equal chain — store the block, don't
            ;; activate. Bitcoin Core does the same: blocks on weaker
            ;; tips sit in the block-store until their chain catches up.
+           ;; NEVER persist a witness-stripped block: it would sit on disk
+           ;; and fail every later reorg that needs it (the original testnet4
+           ;; wedge). Drop it; a witness-complete copy is re-fetched. Mirrors
+           ;; the target-filter guard above (block.lisp ~2428).
            (t
-            (bitcoin-lisp.storage:store-block block-store block)
+            (unless (block-witness-stripped-p block)
+              (bitcoin-lisp.storage:store-block block-store block))
             (values nil :weaker-chain))))))))
