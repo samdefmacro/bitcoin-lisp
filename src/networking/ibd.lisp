@@ -55,6 +55,17 @@ parsed, comfortably inside the 5GB dynamic space.")
    clamp, peers no longer redeliver dropped blocks because we stop
    asking once at cap.")
 
+(defparameter +no-progress-yield-seconds+ 5
+  "The block-download loop RETURNS (yielding to the 30s maintenance cadence)
+when it has neither requested nor received a single block for this many
+seconds while its gate is still open. Distinct from +stuck-tip-halt-seconds+
+(a hard halt when the tip is stuck AND the queue is full): here the queue is
+empty and the loop is simply idle because the servable chain is exhausted but
+`pending` still holds fork headers no peer serves — OR the gate stays open on a
+heavier chain that is unobtainable. Returning is safe: run-ibd is re-entered
+every maintenance pass, so control resumes; without this the work-based gate
+below could spin the loop forever and starve peer maintenance.")
+
 (defparameter +stuck-tip-halt-seconds+ 300
   "If the connect-tip fails to advance for this many seconds AND the
    block-queue is at cap, IBD halts. Mirrors the spirit of Bitcoin Core's
@@ -99,6 +110,14 @@ thread mutates it."
   (blocks-received 0 :type (unsigned-byte 32))
   ;; Header tip (separate from validated block tip in chain-state)
   (header-tip-height 0 :type (unsigned-byte 32))
+  ;; Best-header chain-WORK (monotonic max over the header index). The block-
+  ;; download loop gate keys on this in addition to header-tip-HEIGHT so a
+  ;; heavier-but-SHORTER fork (fewer full-difficulty blocks, tip height <= ours
+  ;; but more cumulative work — the classic testnet4 min-difficulty case) is
+  ;; still downloaded; a height-only gate leaves such a most-work chain
+  ;; unrequested (a most-work-chain liveness violation). O(index) to seed at
+  ;; startup, then maintained incrementally as headers are admitted.
+  (best-header-work 0 :type integer)
   ;; Download queue
   (pending-blocks (make-block-hash-table) :type hash-table)  ; hash -> height
   (in-flight (make-block-hash-table :synchronized t) :type hash-table) ; hash -> (peer . timestamp)
@@ -780,6 +799,20 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                   (return-from validate-header-chain
                     (values (nreverse valid-headers)
                             (format nil "Bad difficulty at height ~D" new-height)))))
+              ;; BIP94 timewarp mitigation at header ADMISSION (Core
+              ;; ContextualCheckBlockHeader, validation.cpp:4129). This was
+              ;; only enforced at connect time (validate-block-header); but
+              ;; perform-reorg validates fork intermediates with :skip-header t,
+              ;; so a violating testnet4 retarget-boundary block admitted here
+              ;; would be counted toward chain-work and connectable on a reorg —
+              ;; a consensus chain-split from the testnet4 network (the exact
+              ;; cheap-fork threat BIP94 stops). No-op off testnet4 retarget
+              ;; boundaries and for honest blocks, so no false-reject risk.
+              (when (bitcoin-lisp.validation:bip94-timewarp-violation-p
+                     header new-height parent)
+                (return-from validate-header-chain
+                  (values (nreverse valid-headers)
+                          (format nil "BIP94 timewarp violation at height ~D" new-height))))
               ;; Softfork version minimums, gated by activation height (Core
               ;; ContextualCheckBlockHeader BIP34/66/65). No upper bound --
               ;; miners roll high version bits (overt AsicBoost).
@@ -881,7 +914,13 @@ Returns the number of new headers added."
                     (incf added)
                     ;; Track header tip height in IBD context
                     (when (> new-height best-header-height)
-                      (setf best-header-height new-height))))))))))
+                      (setf best-header-height new-height))
+                    ;; Maintain best-header-WORK incrementally (monotonic max)
+                    ;; so the download-loop gate can key on work, not just
+                    ;; height — a heavier-but-shorter fork must still be fetched.
+                    (when (and *ibd-context*
+                               (> new-work (ibd-context-best-header-work *ibd-context*)))
+                      (setf (ibd-context-best-header-work *ibd-context*) new-work))))))))))
     ;; Update header tip in IBD context (not the chain-state best-height)
     (when *ibd-context*
       (setf (ibd-context-header-tip-height *ibd-context*) best-header-height)
@@ -1831,13 +1870,20 @@ a second download cursor for its [tip .. snapshot-base] range."
 
     ;; Initialize header-tip-height from existing chain state
     ;; This ensures we know about existing headers even if header sync fails
-    (let ((best-header-height 0))
+    (let ((best-header-height 0)
+          (best-header-work 0))
       (maphash (lambda (hash entry)
                  (declare (ignore hash))
                  (when (> (bitcoin-lisp.storage:block-index-entry-height entry) best-header-height)
-                   (setf best-header-height (bitcoin-lisp.storage:block-index-entry-height entry))))
+                   (setf best-header-height (bitcoin-lisp.storage:block-index-entry-height entry)))
+                 ;; Best-WORK header (Core m_best_header): skip invalid branches.
+                 (when (and (not (eq (bitcoin-lisp.storage:block-index-entry-status entry) :invalid))
+                            (> (bitcoin-lisp.storage:block-index-entry-chain-work entry)
+                               best-header-work))
+                   (setf best-header-work (bitcoin-lisp.storage:block-index-entry-chain-work entry))))
                (bitcoin-lisp.storage::chain-state-block-index chain-state))
-      (setf (ibd-context-header-tip-height ctx) best-header-height))
+      (setf (ibd-context-header-tip-height ctx) best-header-height
+            (ibd-context-best-header-work ctx) best-header-work))
 
     ;; Phase 1: Download headers
     (set-ibd-state :syncing-headers)
@@ -1877,20 +1923,35 @@ a second download cursor for its [tip .. snapshot-base] range."
     ;; Download blocks
     (let ((last-report-time (get-internal-real-time))
           (report-interval (* 10 internal-time-units-per-second))  ; Every 10 seconds
-          (no-peer-cycles 0))
+          (no-peer-cycles 0)
+          ;; Wall-clock of the last cycle that made download progress (requested
+          ;; or received a block). Drives the +no-progress-yield-seconds+
+          ;; bounded exit below.
+          (last-progress-time (get-universal-time)))
 
-      ;; Loop until either (a) the pending queue is empty, or (b) we've
-      ;; reached the header tip — in which case any remaining pending
-      ;; entries are competing-fork blocks that don't move the active
-      ;; chain forward. Without the header-tip exit, fork-block headers
-      ;; auto-queued by process-headers can pin the loop forever (peers
-      ;; don't typically serve side-chain blocks). With a historical
-      ;; chainstate still short of the snapshot base, the loop also
-      ;; continues for the background cursor even once the tip cursor is
-      ;; caught up.
+      ;; Loop until either (a) the pending queue is empty, or (b) we've caught
+      ;; up to the best chain — current height >= header tip AND no heavier
+      ;; header chain outweighs our tip. The WORK term matters: a heavier-but-
+      ;; SHORTER fork (tip height <= ours but more cumulative work) must still
+      ;; be downloaded, and a height-only gate would leave it unrequested (a
+      ;; most-work-chain liveness violation). Any remaining pending entries once
+      ;; the gate closes are competing-fork blocks no peer serves; without the
+      ;; gate they'd pin the loop forever. A historical (assumeutxo) chainstate
+      ;; keeps the loop alive for its background cursor. The +no-progress-yield-
+      ;; seconds+ exit inside the body is the required backstop: the work gate
+      ;; can stay open on an UNOBTAINABLE heavier chain, and without a bounded
+      ;; exit the loop would spin forever (its pending blocks never go in-flight
+      ;; so never time out) and starve the 30s maintenance cadence.
       (loop while (and (> (hash-table-count (ibd-context-pending-blocks ctx)) 0)
                        (or (< (bitcoin-lisp.storage:current-height chain-state)
                               (ibd-context-header-tip-height ctx))
+                           (let ((tip (bitcoin-lisp.storage:get-block-index-entry
+                                       chain-state
+                                       (bitcoin-lisp.storage:best-block-hash chain-state))))
+                             (> (ibd-context-best-header-work ctx)
+                                (if tip
+                                    (bitcoin-lisp.storage:block-index-entry-chain-work tip)
+                                    0)))
                            (let ((hist (ibd-context-historical-chain-state ctx)))
                              (and hist
                                   (< (bitcoin-lisp.storage:current-height hist)
@@ -1992,18 +2053,34 @@ a second download cursor for its [tip .. snapshot-base] range."
                                              :fee-estimator fee-estimator
                                              :recent-rejects recent-rejects)
 
-                 ;; Idle pacing: when a full cycle neither requested nor
-                 ;; received a single block, yield briefly. The loop gate
-                 ;; keeps us here while pending holds fork headers no peer
-                 ;; serves (per-peer download correctly never requests
-                 ;; them), and drain-and-reap polls non-blockingly — without
-                 ;; this the loop busy-spins at 100% CPU in exactly the
-                 ;; fork-storm scenario (unservable higher fork headers)
-                 ;; until the servable chain overtakes the stale fork.
-                 (when (and peers
-                            (zerop cycle-requested)
-                            (= (ibd-context-blocks-received ctx) cycle-received))
-                   (sleep 0.05)))))
+                 ;; Progress accounting for the two idle backstops below.
+                 (if (or (plusp cycle-requested)
+                         (/= (ibd-context-blocks-received ctx) cycle-received))
+                     (setf last-progress-time (get-universal-time))
+                     (progn
+                       ;; Idle pacing: a cycle that neither requested nor
+                       ;; received a block yields the CPU briefly. The gate
+                       ;; keeps us here while pending holds fork headers no peer
+                       ;; serves (the per-peer walk correctly never requests
+                       ;; them) and drain-and-reap polls non-blockingly — without
+                       ;; this the loop busy-spins at 100% CPU during a fork
+                       ;; storm.
+                       (when peers (sleep 0.05))
+                       ;; Bounded no-progress exit: if we've made NO download
+                       ;; progress for +no-progress-yield-seconds+ while the gate
+                       ;; is still open, RETURN so control yields to the 30s
+                       ;; maintenance loop (run-ibd re-enters next pass). Without
+                       ;; this the work-based gate could spin forever on a
+                       ;; heavier chain no peer can serve — its pending blocks
+                       ;; never go in-flight so never time out — starving peer
+                       ;; maintenance. Safe because returning only pauses the
+                       ;; download loop, not the node.
+                       (when (>= (- (get-universal-time) last-progress-time)
+                                 +no-progress-yield-seconds+)
+                         (bitcoin-lisp:log-debug
+                          "IBD download idle ~Ds (gate open, nothing servable) — yielding to maintenance"
+                          +no-progress-yield-seconds+)
+                         (return)))))))
 
     ;; At-tip FIN reap: the block-download loop above is gated on
     ;; (< current-height header-tip-height), so once we reach the tip it
@@ -2654,13 +2731,15 @@ candidate activated."
              ;; absent, so there is no expensive loop.
              (queue-missing-fork-blocks missing-blocks)
              nil)
-            ((member error '(:weaker-chain :reorg-refused :unknown-parent))
-             ;; NOT a validation verdict: the tip advanced under us (raced
-             ;; :weaker-chain), or the reorg is structurally impossible right
-             ;; now (no common ancestor / fork below pruned height, bare
-             ;; :reorg-refused). Drop from the candidate set but do NOT
-             ;; permanently reject — it may become the best completable target
-             ;; again.
+            ((member error '(:weaker-chain :reorg-refused :unknown-parent :corrupt-undo))
+             ;; NOT a validation verdict on the CANDIDATE: the tip advanced under
+             ;; us (raced :weaker-chain), the reorg is structurally impossible
+             ;; right now (no common ancestor / fork below pruned height, bare
+             ;; :reorg-refused), or our own disconnect-side undo is corrupt
+             ;; (:corrupt-undo — the candidate is fine, our local state isn't).
+             ;; Drop from the candidate set but do NOT permanently reject — it
+             ;; may become the best completable target again once the transient
+             ;; condition clears (e.g. the undo is repaired / re-derived).
              (remhash cand-hash (ibd-context-reorg-candidates *ibd-context*))
              nil)
             (t
