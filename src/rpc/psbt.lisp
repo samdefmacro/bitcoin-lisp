@@ -748,3 +748,786 @@ PARAMS: (txs). Mirrors Core combinerawtransaction."
                        :witness (if any-witness witnesses nil))))
           (bitcoin-lisp.crypto:bytes-to-hex
            (bitcoin-lisp.serialization:transaction-wire-bytes merged)))))))
+
+;;;; =====================================================================
+;;;; Wallet P5 — PSBT SIGNER role: walletprocesspsbt, descriptorprocesspsbt,
+;;;; walletcreatefundedpsbt (wallet/rpc/spend.cpp, rpc/rawtransaction.cpp) +
+;;;; RBF fee-bump: bumpfee, psbtbumpfee (wallet/feebumper.cpp).
+;;;; =====================================================================
+;;;;
+;;;; The signer REUSES the funds-critical sighash+sign dispatch factored out of
+;;;; the in-place spend signer: %compute-input-signatures (methods.lisp) computes
+;;;; the per-input partial signatures without finalizing, and the same key
+;;;; resolution (%wallet-sign-maps / %sign-map-add-key!) resolves wallet or
+;;;; descriptor keys. Prevouts are sourced from the PSBT's own witness_utxo /
+;;;; non_witness_utxo; partial sigs are recorded as +psbt-in-partial-sig+
+;;;; (ECDSA) / +psbt-in-tap-key-sig+ (taproot key path). Finalization is the
+;;;; existing finalizepsbt machinery (%psbt-finalize / %psbt-set-final /
+;;;; %psbt-extract-hex).
+
+(defun %psbt-uint32-le (n)
+  "N as a 4-byte little-endian vector (PSBT sighash / bip32 path element)."
+  (let ((v (make-array 4 :element-type '(unsigned-byte 8))))
+    (dotimes (i 4 v) (setf (aref v i) (ldb (byte 8 (* 8 i)) n)))))
+
+(defun %psbt-bip32-value (fingerprint path)
+  "The <fingerprint:4><path-element:4-LE>* value bytes of a bip32 derivation
+record (inverse of %psbt-keypath-json's decode)."
+  (apply #'%psbt-concat
+         (coerce fingerprint '(simple-array (unsigned-byte 8) (*)))
+         (mapcar #'%psbt-uint32-le path)))
+
+;;; --- Sourcing prevouts + missing UTXOs ---
+
+(defun %psbt-coins-map (psbt &optional wallet cc)
+  "(txid . vout) -> (script-pubkey amount redeem witness-script) for every input
+of PSBT whose prevout is known from its OWN witness_utxo / non_witness_utxo —
+the coins map %compute-input-signatures / %wallet-sign-maps consume. redeem /
+witness scripts come from the PSBT input map, else (when WALLET given) from the
+wallet's known sub-scripts. Inputs with no UTXO are absent."
+  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+        (coins (make-hash-table :test 'equalp)))
+    (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
+          for in across (bitcoin-lisp.serialization:transaction-inputs tx)
+          for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
+          for spk = (%psbt-input-spk map in)
+          do (when spk
+               (let ((amount (%psbt-input-amount map in))
+                     (redeem (bitcoin-lisp.serialization:psbt-map-find
+                              map bitcoin-lisp.serialization:+psbt-in-redeem-script+))
+                     (witness (bitcoin-lisp.serialization:psbt-map-find
+                               map bitcoin-lisp.serialization:+psbt-in-witness-script+)))
+                 (when (and wallet (or (null redeem) (null witness)))
+                   (multiple-value-bind (wr ww) (%known-sub-scripts wallet cc spk)
+                     (setf redeem (or redeem wr) witness (or witness ww))))
+                 (setf (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
+                                      (bitcoin-lisp.serialization:outpoint-index op))
+                                coins)
+                       (list spk amount redeem witness)))))
+    coins))
+
+(defun %psbt-fill-wallet-utxos (psbt wallet)
+  "For inputs with no UTXO field, add non_witness_utxo from the wallet's full
+previous transaction — Core FillPSBT (the non_witness_utxo is a superset; the
+signer switches to the smaller witness_utxo when that is safe)."
+  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
+          for in across (bitcoin-lisp.serialization:transaction-inputs tx)
+          for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
+          do (unless (or (bitcoin-lisp.serialization:psbt-map-find
+                          map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)
+                         (bitcoin-lisp.serialization:psbt-map-find
+                          map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))
+               (let ((wtx (wallet-get-wallet-tx
+                           wallet (bitcoin-lisp.serialization:outpoint-hash op))))
+                 (when wtx
+                   (bitcoin-lisp.serialization:psbt-map-set
+                    map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+ empty
+                    (bitcoin-lisp.serialization:transaction-wire-bytes
+                     (wallet-tx-tx wtx)))))))))
+
+(defun %psbt-fill-node-utxos (psbt node)
+  "For witness inputs with no UTXO field, add witness_utxo from the node's UTXO
+set (descriptorprocesspsbt updates segwit inputs from the UTXO set / mempool)."
+  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+        (utxo-set (rpc-get-utxo-set node)))
+    (when utxo-set
+      (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
+            for in across (bitcoin-lisp.serialization:transaction-inputs tx)
+            for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
+            do (unless (or (bitcoin-lisp.serialization:psbt-map-find
+                            map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)
+                           (bitcoin-lisp.serialization:psbt-map-find
+                            map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))
+                 (let ((entry (bitcoin-lisp.storage:get-utxo
+                               utxo-set
+                               (bitcoin-lisp.serialization:outpoint-hash op)
+                               (bitcoin-lisp.serialization:outpoint-index op))))
+                   (when (and entry (%psbt-witness-spk-p
+                                     (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
+                     (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+                       (bitcoin-lisp.serialization:bb-write-tx-out
+                        bb (bitcoin-lisp.serialization:make-tx-out
+                            :value (bitcoin-lisp.storage:utxo-entry-value entry)
+                            :script-pubkey (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
+                       (bitcoin-lisp.serialization:psbt-map-set
+                        map bitcoin-lisp.serialization:+psbt-in-witness-utxo+
+                        (make-array 0 :element-type '(unsigned-byte 8))
+                        (bitcoin-lisp.serialization:bb-finish bb))))))))))
+
+;;; --- Recording signatures + derivations ---
+
+(defun %psbt-input-sighash-stored (map)
+  (let ((sh (bitcoin-lisp.serialization:psbt-map-find
+             map bitcoin-lisp.serialization:+psbt-in-sighash+)))
+    (and sh (loop for j below 4 sum (ash (aref sh j) (* 8 j))))))
+
+(defun %psbt-effective-sighash (spk user-sighash stored-sighash)
+  "(values effective-byte record-p error). Core SignPSBTInput: effective = USER
+param, else SIGHASH_DEFAULT(0) for taproot / SIGHASH_ALL(1) otherwise; a stored
++psbt-in-sighash+ must match. RECORD-P is true when EFFECTIVE is non-default and
+must be written to the input (taproot: != DEFAULT; else != DEFAULT and != ALL)."
+  (let* ((taproot (eq (bitcoin-lisp.validation:classify-script spk)
+                      :witness-v1-taproot))
+         (eff (or user-sighash (if taproot #x00 #x01))))
+    (when (and stored-sighash (/= stored-sighash eff))
+      (return-from %psbt-effective-sighash
+        (values nil nil "Specified sighash and sighash in PSBT do not match.")))
+    (values eff
+            (if taproot (/= eff #x00) (and (/= eff #x00) (/= eff #x01)))
+            nil)))
+
+(defun %input-sig-witness-p (sig)
+  "True when the input-sig SIG is a segwit (witness) signature — the kinds for
+which Core's ProduceSignature sets SignatureData.witness. Legacy kinds (:p2pkh,
+:multisig, :p2sh-multisig) are false."
+  (and (member (input-sig-kind sig)
+               '(:p2wpkh :p2tr :p2wsh :p2sh-p2wpkh :p2sh-p2wsh))
+       t))
+
+(defun %psbt-require-witness-sig-p (map)
+  "Core SignPSBTInput's require_witness_sig: an input whose only prevout source is
+the witness_utxo (no non_witness_utxo) can only be signed with a witness
+signature — witness_utxo alone cannot authenticate a non-witness (legacy) spend,
+so a legacy signature over it must be refused. True when witness_utxo is present
+and non_witness_utxo is absent."
+  (and (bitcoin-lisp.serialization:psbt-map-find
+        map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)
+       (not (bitcoin-lisp.serialization:psbt-map-find
+             map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))))
+
+(defun %psbt-record-signatures (psbt coins keymap pubmap tr-keymap user-sighash)
+  "Compute + record partial signatures on every non-final input of PSBT the key
+maps can satisfy, sourcing prevouts from COINS. ECDSA partial sigs go into
++psbt-in-partial-sig+ (keyed by pubkey), taproot key-path sigs into
++psbt-in-tap-key-sig+; a non-default sighash into +psbt-in-sighash+, and the
+P2SH/P2WSH sub-scripts revealed (needed for finalization). Never finalizes. A
+key we do not hold (or an unsourceable prevout) leaves the input untouched."
+  (let* ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+         (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+         (n (length inputs))
+         (spent-utxos (%build-spent-utxos inputs coins))
+         (bitcoin-lisp.coalton.interop::*current-tx* tx)
+         (bitcoin-lisp.coalton.interop::*current-spent-utxos* spent-utxos)
+         (precomp (bitcoin-lisp.coalton.interop::init-precomputed-sighash tx spent-utxos))
+         (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (dotimes (i n)
+      (let* ((map (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i))
+             (in (aref inputs i))
+             (op (bitcoin-lisp.serialization:tx-in-previous-output in))
+             (prev (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
+                                  (bitcoin-lisp.serialization:outpoint-index op))
+                            coins)))
+        (unless (or (null prev)
+                    (bitcoin-lisp.serialization:psbt-map-find
+                     map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)
+                    (bitcoin-lisp.serialization:psbt-map-find
+                     map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+))
+          (multiple-value-bind (eff record-p sherr)
+              (%psbt-effective-sighash (first prev) user-sighash
+                                       (%psbt-input-sighash-stored map))
+            (unless sherr
+              (multiple-value-bind (sig err)
+                  (%compute-input-signatures tx i prev keymap pubmap tr-keymap
+                                             (if (zerop eff) #x01 eff)
+                                             precomp spent-utxos eff)
+                ;; Core SignPSBTInput's require_witness_sig gate: never record a
+                ;; legacy (non-witness) signature for an input sourced only from
+                ;; the witness_utxo — Core refuses it (a witness_utxo cannot
+                ;; authenticate a non-witness spend).
+                (unless (or err
+                            (and (%psbt-require-witness-sig-p map)
+                                 (not (%input-sig-witness-p sig))))
+                  (when (and (input-sig-redeem sig)
+                             (not (bitcoin-lisp.serialization:psbt-map-find
+                                   map bitcoin-lisp.serialization:+psbt-in-redeem-script+)))
+                    (bitcoin-lisp.serialization:psbt-map-set
+                     map bitcoin-lisp.serialization:+psbt-in-redeem-script+ empty
+                     (input-sig-redeem sig)))
+                  (when (and (input-sig-witness-script sig)
+                             (not (bitcoin-lisp.serialization:psbt-map-find
+                                   map bitcoin-lisp.serialization:+psbt-in-witness-script+)))
+                    (bitcoin-lisp.serialization:psbt-map-set
+                     map bitcoin-lisp.serialization:+psbt-in-witness-script+ empty
+                     (input-sig-witness-script sig)))
+                  (when record-p
+                    (bitcoin-lisp.serialization:psbt-map-set
+                     map bitcoin-lisp.serialization:+psbt-in-sighash+ empty
+                     (%psbt-uint32-le eff)))
+                  ;; Core CreateSig reuses a signature already present for a key
+                  ;; (input.FillSignatureData loads existing partial_sigs) rather
+                  ;; than re-signing — so an input already signed by this pubkey
+                  ;; keeps its existing sig. Never overwrite one we already hold.
+                  (dolist (pair (input-sig-ecdsa sig))
+                    (unless (%psbt-sig-for map (car pair))
+                      (bitcoin-lisp.serialization:psbt-map-set
+                       map bitcoin-lisp.serialization:+psbt-in-partial-sig+
+                       (car pair) (cdr pair))))
+                  (when (and (input-sig-tap sig)
+                             (not (bitcoin-lisp.serialization:psbt-map-find
+                                   map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+)))
+                    (bitcoin-lisp.serialization:psbt-map-set
+                     map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+ empty
+                     (input-sig-tap sig))))))))))))
+
+(defun %psbt-add-map-derivs (map spk pos pairs)
+  "Add +psbt-in-bip32+ (ECDSA) / +psbt-in-tap-internal-key+ (taproot) records to
+MAP for the (desc-key . pubkey) PAIRS expanded at POS for scriptPubKey SPK."
+  (let ((taproot (eq (bitcoin-lisp.validation:classify-script spk)
+                     :witness-v1-taproot))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (loop for (key . pubkey) in pairs
+          do (if taproot
+                 (bitcoin-lisp.serialization:psbt-map-set
+                  map bitcoin-lisp.serialization:+psbt-in-tap-internal-key+ empty
+                  (%key-xonly-bytes pubkey))
+                 (multiple-value-bind (fpr path) (%desc-key-origin-info key pubkey pos)
+                   (bitcoin-lisp.serialization:psbt-map-set
+                    map bitcoin-lisp.serialization:+psbt-in-bip32+ pubkey
+                    (%psbt-bip32-value fpr path)))))))
+
+(defun %psbt-add-wallet-input-derivs (psbt coins wallet)
+  "Add input bip32 derivations / taproot internal keys for wallet-owned inputs
+(Core FillPSBT bip32derivs). Metadata only — helps offline signers."
+  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt)))
+    (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
+          for in across (bitcoin-lisp.serialization:transaction-inputs tx)
+          for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
+          for entry = (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
+                                     (bitcoin-lisp.serialization:outpoint-index op))
+                               coins)
+          for spk = (and entry (first entry))
+          do (when spk
+               (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet spk)
+                 (when spkm
+                   (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
+                     (declare (ignore scripts))
+                     (%psbt-add-map-derivs map spk pos pairs))))))))
+
+(defun %psbt-add-wallet-output-derivs (psbt wallet)
+  "Add output bip32 derivations / redeem / witness scripts for wallet-owned
+outputs so an offline signer can identify change (Core UpdatePSBTOutput)."
+  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+        (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (loop for map across (bitcoin-lisp.serialization:psbt-outputs psbt)
+          for out across (bitcoin-lisp.serialization:transaction-outputs tx)
+          for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+          do (multiple-value-bind (spkm pos) (%wallet-owning-spkm wallet spk)
+               (when spkm
+                 (multiple-value-bind (redeem witness) (%spkm-sub-scripts spkm spk)
+                   (when redeem
+                     (bitcoin-lisp.serialization:psbt-map-set
+                      map bitcoin-lisp.serialization:+psbt-out-redeem-script+ empty redeem))
+                   (when witness
+                     (bitcoin-lisp.serialization:psbt-map-set
+                      map bitcoin-lisp.serialization:+psbt-out-witness-script+ empty witness)))
+                 (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
+                   (declare (ignore scripts))
+                   (let ((taproot (eq (bitcoin-lisp.validation:classify-script spk)
+                                      :witness-v1-taproot)))
+                     (loop for (key . pubkey) in pairs
+                           do (if taproot
+                                  (bitcoin-lisp.serialization:psbt-map-set
+                                   map bitcoin-lisp.serialization:+psbt-out-tap-internal-key+
+                                   empty (%key-xonly-bytes pubkey))
+                                  (multiple-value-bind (fpr path)
+                                      (%desc-key-origin-info key pubkey pos)
+                                    (bitcoin-lisp.serialization:psbt-map-set
+                                     map bitcoin-lisp.serialization:+psbt-out-bip32+ pubkey
+                                     (%psbt-bip32-value fpr path))))))))))))
+
+;;; --- Completeness / extract ---
+
+(defun %psbt-finalize-in-place (psbt)
+  "Finalize every finalizable input of PSBT in place (finalizepsbt machinery).
+Returns T when EVERY input is final."
+  (let* ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
+         (ins (bitcoin-lisp.serialization:transaction-inputs tx))
+         (complete t))
+    (dotimes (i (length ins))
+      (let ((map (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i)))
+        (if (or (bitcoin-lisp.serialization:psbt-map-find
+                 map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)
+                (bitcoin-lisp.serialization:psbt-map-find
+                 map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+))
+            nil
+            (let ((spk (%psbt-input-spk map (aref ins i))))
+              (multiple-value-bind (ss wit)
+                  (if spk (%psbt-finalize map spk) (values nil nil))
+                (if (or (and ss (plusp (length ss))) wit)
+                    (%psbt-set-final map ss wit)
+                    (setf complete nil)))))))
+    complete))
+
+(defun %psbt-copy (psbt)
+  "A deep copy of PSBT via its serialization."
+  (bitcoin-lisp.serialization:decode-psbt
+   (bitcoin-lisp.serialization:encode-psbt psbt)))
+
+(defun %psbt-signer-result (psbt finalize)
+  "The {psbt, complete, hex?} object of walletprocesspsbt / descriptorprocesspsbt.
+When FINALIZE, PSBT is finalized in place; completeness + the extracted hex are
+computed from a finalized COPY either way (Core returns the network tx whenever
+every input can be finalized, even without finalize=true)."
+  (when finalize (%psbt-finalize-in-place psbt))
+  (let* ((trial (%psbt-copy psbt))
+         (complete (%psbt-finalize-in-place trial)))
+    (append `(("psbt" . ,(bitcoin-lisp.serialization:encode-psbt psbt))
+              ("complete" . ,(json-bool complete)))
+            (when complete
+              `(("hex" . ,(%psbt-extract-hex trial)))))))
+
+;;; --- walletprocesspsbt (wallet/rpc/spend.cpp:1573) ---
+
+(defun rpc-walletprocesspsbt (node params)
+  "Update a PSBT with wallet input info and sign the inputs we can (Bitcoin Core
+walletprocesspsbt). PARAMS: (psbt [sign] [sighashtype] [bip32derivs] [finalize]).
+Returns {psbt, complete, hex?}."
+  (let ((wallet (wallet-for-request node)))
+    (with-node-lock (node)
+      (with-wallet-lock (wallet)
+        (let* ((psbt (%psbt-decode-arg (first params)))
+               (sign (%positional-bool-or (second params) t))
+               (user-sighash (multiple-value-bind (byte default-p)
+                                 (%wallet-sighash-byte (third params))
+                               (if default-p nil byte)))
+               (bip32derivs (%positional-bool-or (fourth params) t))
+               (finalize (%positional-bool-or (fifth params) t)))
+          (when (and sign (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
+            (error 'rpc-error :code +rpc-wallet-error+
+                              :message "Error: Private keys are disabled for this wallet"))
+          (%psbt-fill-wallet-utxos psbt wallet)
+          (let ((coins (%psbt-coins-map psbt wallet nil)))
+            (when bip32derivs
+              (%psbt-add-wallet-input-derivs psbt coins wallet)
+              (%psbt-add-wallet-output-derivs psbt wallet))
+            (when sign
+              (multiple-value-bind (keymap pubmap tr-keymap)
+                  (%wallet-sign-maps wallet (bitcoin-lisp.serialization:psbt-tx psbt) coins)
+                (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash)))
+            (%psbt-signer-result psbt finalize)))))))
+
+;;; --- descriptorprocesspsbt (rpc/rawtransaction.cpp:1992) ---
+
+(defun %psbt-descriptor-expansions (descs network)
+  "script-pubkey -> (desc pos pairs) for every script the descriptor DESCS
+produce over their ranges (EvalDescriptorStringOrObject: default [0,1000] ranged
+/ [0,0] unranged). PAIRS are (desc-key . derived-pubkey) in expression order —
+the input to %sign-map-add-key! and the derivations."
+  (let ((table (make-hash-table :test 'equalp)))
+    (unless (listp descs)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "descriptors must be an array"))
+    (dolist (d descs table)
+      (multiple-value-bind (desc-str range)
+          (cond ((stringp d) (values d nil))
+                ((hash-table-p d) (values (gethash "desc" d) (gethash "range" d)))
+                ((and (consp d) (consp (car d)))
+                 (values (cdr (assoc "desc" d :test #'string=))
+                         (cdr (assoc "range" d :test #'string=))))
+                (t (error 'rpc-error :code +rpc-invalid-parameter+
+                                     :message "Descriptor needs to be provided in the object")))
+        (unless (stringp desc-str)
+          (error 'rpc-error :code +rpc-invalid-parameter+
+                            :message "Descriptor needs to be provided in the object"))
+        (let ((desc (parse-descriptor desc-str network)))
+          (multiple-value-bind (low high)
+              (cond ((not (out-desc-ranged-p desc)) (values 0 0))
+                    (range (%parse-descriptor-range range))
+                    (t (values 0 1000)))
+            (loop for pos from low to high
+                  do (let ((cache (make-descriptor-cache)))
+                       (multiple-value-bind (scripts pubkeys)
+                           (handler-case
+                               (out-desc-expand-with-provider desc pos nil cache)
+                             (error () (values nil nil)))
+                         (when scripts
+                           (let ((pairs (mapcar #'cons (out-desc-ordered-keys desc)
+                                                pubkeys)))
+                             (dolist (s scripts)
+                               (unless (gethash s table)
+                                 (setf (gethash s table) (list desc pos pairs)))))))))))))))
+
+(defun %descriptor-sign-maps (expansions tx coins)
+  "(values keymap pubmap tr-keymap) for the inputs of TX whose spent script is in
+EXPANSIONS (script -> (desc pos pairs)); derives each key's private key from the
+descriptor's own material (%desc-key-priv-at with no provider) and verifies it
+through the shared %sign-map-add-key!."
+  (let ((keymap (make-hash-table :test 'equalp))
+        (pubmap (make-hash-table :test 'equalp))
+        (tr-keymap (make-hash-table :test 'equalp)))
+    (bitcoin-lisp.serialization:dovector
+        (in (bitcoin-lisp.serialization:transaction-inputs tx))
+      (let* ((op (bitcoin-lisp.serialization:tx-in-previous-output in))
+             (entry (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
+                                   (bitcoin-lisp.serialization:outpoint-index op))
+                             coins))
+             (script (and entry (first entry)))
+             (exp (and script (gethash script expansions))))
+        (when exp
+          (destructuring-bind (desc pos pairs) exp
+            (declare (ignore desc))
+            (loop for (key . pubkey) in pairs
+                  for priv = (%desc-key-priv-at key pos nil)
+                  do (when priv
+                       (%sign-map-add-key! keymap pubmap tr-keymap
+                                           key pubkey priv pos)))))))
+    (values keymap pubmap tr-keymap)))
+
+(defun %psbt-add-descriptor-input-derivs (psbt coins expansions)
+  (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt)))
+    (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
+          for in across (bitcoin-lisp.serialization:transaction-inputs tx)
+          for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
+          for entry = (gethash (cons (bitcoin-lisp.serialization:outpoint-hash op)
+                                     (bitcoin-lisp.serialization:outpoint-index op))
+                               coins)
+          for spk = (and entry (first entry))
+          for exp = (and spk (gethash spk expansions))
+          do (when exp
+               (destructuring-bind (desc pos pairs) exp
+                 (declare (ignore desc))
+                 (%psbt-add-map-derivs map spk pos pairs))))))
+
+(defun rpc-descriptorprocesspsbt (node params)
+  "Update a PSBT's segwit inputs from output descriptors + the UTXO set, then
+sign the inputs the descriptors can (Bitcoin Core descriptorprocesspsbt).
+PARAMS: (psbt descriptors [sighashtype] [bip32derivs] [finalize])."
+  (with-node-lock (node)
+    (let* ((network (rpc-get-network node))
+           (psbt (%psbt-decode-arg (first params)))
+           (expansions (%psbt-descriptor-expansions (second params) network))
+           (user-sighash (multiple-value-bind (byte default-p)
+                             (%wallet-sighash-byte (third params))
+                           (if default-p nil byte)))
+           (bip32derivs (%positional-bool-or (fourth params) t))
+           (finalize (%positional-bool-or (fifth params) t)))
+      (%psbt-fill-node-utxos psbt node)
+      (let ((coins (%psbt-coins-map psbt)))
+        (when bip32derivs
+          (%psbt-add-descriptor-input-derivs psbt coins expansions))
+        (multiple-value-bind (keymap pubmap tr-keymap)
+            (%descriptor-sign-maps expansions (bitcoin-lisp.serialization:psbt-tx psbt) coins)
+          (%psbt-record-signatures psbt coins keymap pubmap tr-keymap user-sighash))
+        (%psbt-signer-result psbt finalize)))))
+
+;;; --- The PSBT-from-wallet path (shared by walletcreatefundedpsbt +
+;;; psbtbumpfee): an UNSIGNED PSBT with UTXOs + bip32 derivations. ---
+
+(defun %wallet-unsigned-psbt (node wallet tx bip32derivs)
+  "Build an UNSIGNED PSBT for the wallet-funded TX: witness_utxo (+ non_witness_utxo
+when the full previous tx is in the wallet) per input, plus, when BIP32DERIVS,
+input/output bip32 derivations. Mirrors Core FillPSBT(sign=false)."
+  (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
+         (psbt (bitcoin-lisp.serialization:make-empty-psbt tx))
+         (coins (%wallet-input-coins node wallet tx))
+         (empty (make-array 0 :element-type '(unsigned-byte 8))))
+    (dotimes (i (length inputs))
+      (let* ((in (aref inputs i))
+             (op (bitcoin-lisp.serialization:tx-in-previous-output in))
+             (txid (bitcoin-lisp.serialization:outpoint-hash op))
+             (vout (bitcoin-lisp.serialization:outpoint-index op))
+             (entry (gethash (cons txid vout) coins))
+             (map (aref (bitcoin-lisp.serialization:psbt-inputs psbt) i)))
+        (when entry
+          (bitcoin-lisp.serialization:psbt-map-set
+           map bitcoin-lisp.serialization:+psbt-in-witness-utxo+ empty
+           (%serialize-txout-bytes
+            (bitcoin-lisp.serialization:make-tx-out
+             :value (second entry) :script-pubkey (first entry))))
+          (when (third entry)
+            (bitcoin-lisp.serialization:psbt-map-set
+             map bitcoin-lisp.serialization:+psbt-in-redeem-script+ empty (third entry)))
+          (when (fourth entry)
+            (bitcoin-lisp.serialization:psbt-map-set
+             map bitcoin-lisp.serialization:+psbt-in-witness-script+ empty (fourth entry)))
+          (let ((wtx (wallet-get-wallet-tx wallet txid)))
+            (when wtx
+              (bitcoin-lisp.serialization:psbt-map-set
+               map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+ empty
+               (bitcoin-lisp.serialization:transaction-wire-bytes (wallet-tx-tx wtx))))))))
+    (when bip32derivs
+      (%psbt-add-wallet-input-derivs psbt coins wallet)
+      (%psbt-add-wallet-output-derivs psbt wallet))
+    (bitcoin-lisp.serialization:encode-psbt psbt)))
+
+;;; --- walletcreatefundedpsbt (wallet/rpc/spend.cpp:1657) ---
+
+(defun rpc-walletcreatefundedpsbt (node params)
+  "Create + fund a PSBT (Creator + Updater). PARAMS: (inputs outputs [locktime]
+[options] [bip32derivs] [version]). Returns {psbt, fee, changepos}. JSON-object
+outputs arrive as hash tables whose key order is not preserved; use the
+array-of-objects form when output order matters."
+  (let ((wallet (wallet-for-request node)))
+    (with-node-lock (node)
+      (with-wallet-lock (wallet)
+        (let* ((options (or (nth 3 params) '()))
+               (version (let ((v (nth 5 params))) (if (integerp v) v 2)))
+               (rbf (if (%opt-present-p options "replaceable")
+                        (and (%opt options "replaceable") t)
+                        *wallet-signal-rbf*))
+               (locktime (or (nth 2 params) 0))
+               (inputs (%parse-rpc-inputs (or (first params) '())))
+               (bip32derivs (%positional-bool-or (nth 4 params) t))
+               (cc (make-wcc :version version)))
+          (unless (and (integerp locktime) (<= 0 locktime #xffffffff))
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message "Invalid parameter, locktime out of range"))
+          (multiple-value-bind (recipients keys)
+              (%parse-outputs (wallet-network wallet) (second params))
+            (%interpret-sffo (%opt options "subtractFeeFromOutputs") keys recipients)
+            (%apply-rpc-inputs cc inputs rbf locktime)
+            (setf (wcc-allow-other-inputs cc) (null inputs))
+            (multiple-value-bind (change-position lock-unspents)
+                (%parse-fund-options node wallet cc options recipients t)
+              (declare (ignore lock-unspents))
+              (setf (wcc-locktime cc) locktime)
+              (multiple-value-bind (tx fee change-pos)
+                  (%create-transaction node wallet recipients change-position cc nil)
+                (unless tx
+                  (error 'rpc-error :code +rpc-wallet-error+ :message fee))
+                `(("psbt" . ,(%wallet-unsigned-psbt node wallet tx bip32derivs))
+                  ("fee" . ,(%btc fee))
+                  ("changepos" . ,(or change-pos -1)))))))))))
+
+;;; --- feebumper (wallet/feebumper.cpp) ---
+
+(defconstant +wallet-incremental-relay-fee-rate+ 5000
+  "Core WALLET_INCREMENTAL_RELAY_FEE = 5000 sat/kvB — the conservative
+incremental relay bump the wallet applies over the original feerate (future-
+proofs against network incremental-fee changes the node may not know).")
+
+(defun %output-is-change (wallet script)
+  "Core wallet::OutputIsChange: SCRIPT is ours and has no (non-change) address
+book entry."
+  (and (wallet-is-mine wallet script)
+       (not (nth-value 2 (wallet-find-address-book-entry
+                          wallet (%script->address script (wallet-network wallet)))))))
+
+(defun %all-inputs-mine (node wallet tx)
+  "Core AllInputsMine: every input of TX spends a wallet-owned output."
+  (block scan
+    (bitcoin-lisp.serialization:dovector
+        (in (bitcoin-lisp.serialization:transaction-inputs tx))
+      (let* ((op (bitcoin-lisp.serialization:tx-in-previous-output in))
+             (txout (%wallet-input-txout node wallet
+                                         (bitcoin-lisp.serialization:outpoint-hash op)
+                                         (bitcoin-lisp.serialization:outpoint-index op))))
+        (unless (and txout (wallet-is-mine
+                            wallet (bitcoin-lisp.serialization:tx-out-script-pubkey txout)))
+          (return-from scan nil))))
+    t))
+
+(defun %wallet-has-spend (wallet tx)
+  "Core CWallet::HasWalletSpend: a wallet tx spends one of TX's outputs."
+  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+    (dotimes (n (length (bitcoin-lisp.serialization:transaction-outputs tx)) nil)
+      (when (gethash (%wtx-outpoint-key txid n) (wallet-tx-spends wallet))
+        (return t)))))
+
+(defun %bump-precondition-checks (node wallet wtx require-mine)
+  "Core feebumper::PreconditionChecks. Returns (values ok error-code error-msg).
+Adds the task-mandated BIP125-replaceable requirement on the original tx."
+  (let ((tx (wallet-tx-tx wtx))
+        (mempool (bitcoin-lisp::node-mempool node)))
+    (cond
+      ((%wallet-has-spend wallet tx)
+       (values nil +rpc-invalid-parameter+ "Transaction has descendants in the wallet"))
+      ((and mempool (plusp (hash-table-count
+                            (bitcoin-lisp.mempool:mempool-descendants
+                             mempool (wallet-tx-txid wtx)))))
+       (values nil +rpc-invalid-parameter+ "Transaction has descendants in the mempool"))
+      ((/= (wallet-tx-depth wallet wtx) 0)
+       (values nil +rpc-wallet-error+
+               "Transaction has been mined, or is conflicted with a mined transaction"))
+      ((assoc "replaced_by_txid" (wallet-tx-map-value wtx) :test #'string=)
+       (values nil +rpc-wallet-error+
+               (format nil "Cannot bump transaction ~A which was already bumped by transaction ~A"
+                       (hash-to-hex (wallet-tx-txid wtx))
+                       (cdr (assoc "replaced_by_txid" (wallet-tx-map-value wtx) :test #'string=)))))
+      ((not (bitcoin-lisp.mempool:tx-signals-rbf-p tx))
+       (values nil +rpc-wallet-error+
+               "Transaction is not BIP 125 replaceable"))
+      ((and require-mine (not (%all-inputs-mine node wallet tx)))
+       (values nil +rpc-wallet-error+
+               "Transaction contains inputs that don't belong to this wallet"))
+      (t (values t nil nil)))))
+
+(defun %bump-estimate-feerate (node wallet orig old-fee cc)
+  "Core feebumper::EstimateFeeRate (sat/kvB): the original feerate + 1 sat/kvB +
+max(node incremental, wallet incremental), floored at GetMinimumFeeRate."
+  (declare (ignore wallet))
+  (let* ((txsize (bitcoin-lisp.serialization:transaction-vsize orig))
+         (base (if (plusp txsize) (floor (* old-fee 1000) txsize) 0))
+         (feerate (+ base 1 (max bitcoin-lisp.mempool::+incremental-relay-fee-rate+
+                                 +wallet-incremental-relay-fee-rate+)))
+         (min-rate (%wallet-minimum-fee-rate node cc)))
+    (max feerate min-rate)))
+
+(defun %create-rate-bump (node wallet txid cc require-mine)
+  "Core feebumper::CreateRateBumpTransaction (subset). Rebuilds a higher-feerate
+replacement of the wallet tx TXID that re-spends all its inputs. Returns
+(values new-tx old-fee new-fee) on success, or (values nil error-code error-msg).
+Caller holds node + wallet locks."
+  (let ((wtx (wallet-get-wallet-tx wallet txid)))
+    (unless wtx
+      (return-from %create-rate-bump
+        (values nil +rpc-invalid-address-or-key+ "Invalid or non-wallet transaction id")))
+    (let* ((orig (wallet-tx-tx wtx))
+           (inputs (bitcoin-lisp.serialization:transaction-inputs orig))
+           (input-value 0))
+      ;; Retrieve every input's coin; select it on the coin control (external
+      ;; inputs get their txout preset). A spent input aborts.
+      (bitcoin-lisp.serialization:dovector (in inputs)
+        (let* ((op (bitcoin-lisp.serialization:tx-in-previous-output in))
+               (thash (bitcoin-lisp.serialization:outpoint-hash op))
+               (n (bitcoin-lisp.serialization:outpoint-index op))
+               (txout (%wallet-input-txout node wallet thash n)))
+          (unless txout
+            (return-from %create-rate-bump
+              (values nil +rpc-misc-error+
+                      (format nil "~A:~D is already spent" (hash-to-hex thash) n))))
+          (let ((preset (wcc-select cc thash n)))
+            (unless (wallet-is-mine wallet (bitcoin-lisp.serialization:tx-out-script-pubkey txout))
+              (setf (wcc-preset-txout preset) txout)))
+          (incf input-value (bitcoin-lisp.serialization:tx-out-value txout))))
+      ;; Preconditions.
+      (multiple-value-bind (ok code msg)
+          (%bump-precondition-checks node wallet wtx require-mine)
+        (unless ok (return-from %create-rate-bump (values nil code msg))))
+      (let* ((output-value (reduce #'+ (bitcoin-lisp.serialization:transaction-outputs orig)
+                                   :key #'bitcoin-lisp.serialization:tx-out-value
+                                   :initial-value 0))
+             (old-fee (- input-value output-value))
+             (network (wallet-network wallet))
+             (recipients '()))
+        ;; Recipients = original outputs; a single change output becomes destChange.
+        (bitcoin-lisp.serialization:dovector
+            (out (bitcoin-lisp.serialization:transaction-outputs orig))
+          (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey out)))
+            (if (%output-is-change wallet spk)
+                (setf (wcc-dest-change cc) spk)
+                (push (make-recipient :script spk
+                                      :amount (bitcoin-lisp.serialization:tx-out-value out)
+                                      :address (%script->address spk network))
+                      recipients))))
+        (setf recipients (nreverse recipients))
+        (when (null recipients)
+          (unless (wcc-dest-change cc)
+            (return-from %create-rate-bump
+              (values nil +rpc-invalid-parameter+
+                      "Unable to create transaction. Transaction must have at least one recipient")))
+          (push (make-recipient :script (wcc-dest-change cc) :amount output-value :sffo t
+                                :address (%script->address (wcc-dest-change cc) network))
+                recipients)
+          (setf (wcc-dest-change cc) nil))
+        ;; Feerate: user-provided (already on CC) or estimated from the old fee.
+        (if (wcc-feerate cc)
+            (setf (wcc-override-feerate cc) t)
+            (setf (wcc-feerate cc) (%bump-estimate-feerate node wallet orig old-fee cc)
+                  (wcc-override-feerate cc) t))
+        ;; Re-spend all original inputs; may add more; no new unconfirmed inputs.
+        (bitcoin-lisp.serialization:dovector (in inputs)
+          (let ((op (bitcoin-lisp.serialization:tx-in-previous-output in)))
+            (wcc-select cc (bitcoin-lisp.serialization:outpoint-hash op)
+                        (bitcoin-lisp.serialization:outpoint-index op))))
+        (setf (wcc-allow-other-inputs cc) t
+              (wcc-min-depth cc) 1)
+        (multiple-value-bind (new-tx new-fee) (%create-transaction node wallet recipients nil cc nil)
+          (unless new-tx
+            (return-from %create-rate-bump
+              (values nil +rpc-wallet-error+
+                      (format nil "Unable to create transaction. ~A" new-fee))))
+          ;; BIP125 rule 3/4 (feebumper::CheckFeeRate minTotalFee): the new total
+          ;; fee must be at least the old fee plus one incremental relay fee over
+          ;; the replacement's size, or the node's mempool will reject it. Enforce
+          ;; it here so a too-low bump fails BEFORE we sign / mark the original
+          ;; replaced (%create-transaction already caps at -maxtxfee).
+          (let ((min-total (+ old-fee
+                              (%feerate-fee bitcoin-lisp.mempool::+incremental-relay-fee-rate+
+                                            (bitcoin-lisp.serialization:transaction-vsize new-tx)))))
+            (when (< new-fee min-total)
+              (return-from %create-rate-bump
+                (values nil +rpc-invalid-parameter+
+                        (format nil "Insufficient total fee ~A, must be at least ~A (oldFee ~A + incrementalFee)"
+                                (%format-money new-fee) (%format-money min-total)
+                                (%format-money old-fee))))))
+          (values new-tx old-fee new-fee))))))
+
+(defun %bumpfee-options->cc (options cc)
+  "Apply the bumpfee/psbtbumpfee OPTIONS (conf_target, fee_rate, replaceable,
+estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
+  (when options
+    (let ((replaceable (%opt options "replaceable")))
+      (when (%opt-present-p options "replaceable")
+        (setf (wcc-signal-bip125-rbf cc) (and replaceable t))))
+    (let ((conf-target (or (%opt options "conf_target") (%opt options "confTarget"))))
+      (%set-fee-estimate-mode cc conf-target (%opt options "estimate_mode")
+                              (%opt options "fee_rate") nil)))
+  cc)
+
+(defun %bumpfee-helper (node params want-psbt)
+  "Shared body of bumpfee / psbtbumpfee. PARAMS: (txid [options])."
+  (let ((wallet (wallet-for-request node))
+        (txid-hex (first params)))
+    (unless (and (stringp txid-hex) (valid-hex-hash-p txid-hex))
+      (error 'rpc-error :code +rpc-invalid-parameter+ :message "txid must be a hex string"))
+    (with-node-lock (node)
+      (with-wallet-lock (wallet)
+        (when (and (not want-psbt)
+                   (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
+          (error 'rpc-error :code +rpc-wallet-error+
+                            :message "bumpfee is not available with wallets that have private keys disabled. Use psbtbumpfee instead."))
+        (let ((txid (parse-hex-hash txid-hex))
+              (cc (make-wcc)))
+          (setf (wcc-signal-bip125-rbf cc) t)   ; Core: default true, RBF replacement
+          (%bumpfee-options->cc (second params) cc)
+          (multiple-value-bind (mtx old-fee new-fee code msg)
+              (%create-rate-bump node wallet txid cc (not want-psbt))
+            (unless mtx
+              (error 'rpc-error :code code :message msg))
+            (if want-psbt
+                `(("psbt" . ,(%wallet-unsigned-psbt node wallet mtx t))
+                  ("origfee" . ,(%btc old-fee))
+                  ("fee" . ,(%btc new-fee))
+                  ("errors" . ,#()))
+                (progn
+                  ;; Sign in place with the wallet keys, then verify.
+                  (let ((coins (%wallet-input-coins node wallet mtx cc)))
+                    (when (%wallet-sign-transaction wallet mtx coins)
+                      (error 'rpc-error :code +rpc-wallet-error+ :message "Can't sign transaction."))
+                    (multiple-value-bind (verified bad) (%verify-tx-scripts mtx coins)
+                      (unless verified
+                        (error 'rpc-error :code +rpc-wallet-error+
+                                          :message (format nil "Internal bug detected: bumped transaction fails script verification at input ~D" bad)))))
+                  ;; Re-check preconditions, commit + broadcast, mark replaced.
+                  (let ((old-wtx (wallet-get-wallet-tx wallet txid)))
+                    (multiple-value-bind (ok code2 msg2)
+                        (%bump-precondition-checks node wallet old-wtx nil)
+                      (unless ok (error 'rpc-error :code code2 :message msg2)))
+                    (let ((new-txid (bitcoin-lisp.serialization:transaction-hash mtx)))
+                      (%wallet-commit-transaction
+                       node wallet mtx
+                       (list (cons "replaces_txid" (hash-to-hex txid))))
+                      ;; MarkReplaced: record the bump on the original tx.
+                      (setf (wallet-tx-map-value old-wtx)
+                            (append (remove "replaced_by_txid" (wallet-tx-map-value old-wtx)
+                                            :key #'car :test #'string=)
+                                    (list (cons "replaced_by_txid" (hash-to-hex new-txid)))))
+                      `(("txid" . ,(hash-to-hex new-txid))
+                        ("origfee" . ,(%btc old-fee))
+                        ("fee" . ,(%btc new-fee))
+                        ("errors" . ,#()))))))))))))
+
+(defun rpc-bumpfee (node params)
+  "Bump the fee of an unconfirmed wallet transaction, signing + broadcasting the
+replacement (Bitcoin Core bumpfee). PARAMS: (txid [options]). Returns
+{txid, origfee, fee, errors}."
+  (%bumpfee-helper node params nil))
+
+(defun rpc-psbtbumpfee (node params)
+  "Like bumpfee but return an UNSIGNED PSBT of the replacement instead of signing
+and broadcasting (Bitcoin Core psbtbumpfee). PARAMS: (txid [options]). Returns
+{psbt, origfee, fee, errors}."
+  (%bumpfee-helper node params t))

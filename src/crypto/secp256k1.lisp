@@ -86,6 +86,12 @@
   (outputlen :pointer)
   (sig :pointer))
 
+(cffi:defcfun ("secp256k1_ecdsa_signature_serialize_compact"
+               secp256k1-ecdsa-signature-serialize-compact) :int
+  (ctx :pointer)
+  (output64 :pointer)
+  (sig :pointer))
+
 ;;; Recoverable signatures (BIP137 message signing) — libsecp recovery module.
 
 (cffi:defcfun ("secp256k1_ecdsa_sign_recoverable" secp256k1-ecdsa-sign-recoverable) :int
@@ -302,21 +308,47 @@ range). Used for BIP32 CKDpub (child pubkey = Kpar + IL*G)."
 
 (defun sign-ecdsa (privkey hash32)
   "DER-encoded ECDSA signature of the 32-byte HASH32 under the 32-byte secret
-PRIVKEY, using libsecp256k1's RFC6979 deterministic nonce (low-S, like Core).
-Returns the DER signature bytes. Errors if PRIVKEY is invalid."
+PRIVKEY. Byte-identical to Bitcoin Core's CKey::Sign (grind=true): libsecp256k1's
+RFC6979 deterministic nonce with low-S normalization, PLUS low-R grinding — the
+nonce is retried with an incrementing 4-byte little-endian extra-entropy value
+until the signature's R has its high bit clear (a 32-byte, not 33-byte, DER
+integer), which Core does to shave a byte off every signature. Without this,
+~50% of signatures would differ from Core's for the same key+hash (Core's PSBT
+signer test vectors, wallet spends, etc.). Returns the DER bytes; errors if
+PRIVKEY is invalid."
   (ensure-secp256k1-loaded)
   (unless (= (length hash32) 32) (error "message hash must be 32 bytes"))
   (unless (= (length privkey) 32) (error "private key must be 32 bytes"))
   (cffi:with-foreign-objects ((sk :uint8 32)
                               (msg :uint8 32)
                               (sig :uint8 +secp256k1-signature-size+)
+                              (compact :uint8 64)
+                              (extra :uint8 32)
                               (der :uint8 72)
                               (derlen :size))
     (loop for i below 32 do (setf (cffi:mem-aref sk :uint8 i) (aref privkey i)))
     (loop for i below 32 do (setf (cffi:mem-aref msg :uint8 i) (aref hash32 i)))
-    (unless (= 1 (secp256k1-ecdsa-sign *secp256k1-context* sig msg sk
-                                       (cffi:null-pointer) (cffi:null-pointer)))
-      (error "ECDSA signing failed (invalid private key?)"))
+    (loop for i below 32 do (setf (cffi:mem-aref extra :uint8 i) 0))
+    ;; Core CKey::Sign grind loop: the first attempt passes no extra entropy
+    ;; (ndata NULL); each retry writes ++counter as 4-byte little-endian into the
+    ;; 32-byte extra-entropy buffer and passes it as ndata, until R is low
+    ;; (compact[0], the big-endian MSB of R, < 0x80).
+    (let ((counter 0))
+      (loop
+        (unless (= 1 (secp256k1-ecdsa-sign
+                      *secp256k1-context* sig msg sk (cffi:null-pointer)
+                      (if (zerop counter) (cffi:null-pointer) extra)))
+          (error "ECDSA signing failed (invalid private key?)"))
+        (unless (= 1 (secp256k1-ecdsa-signature-serialize-compact
+                      *secp256k1-context* compact sig))
+          (error "compact signature serialization failed"))
+        (when (< (cffi:mem-aref compact :uint8 0) #x80)
+          (return))                     ; low-R found
+        (incf counter)
+        (setf (cffi:mem-aref extra :uint8 0) (ldb (byte 8 0) counter)
+              (cffi:mem-aref extra :uint8 1) (ldb (byte 8 8) counter)
+              (cffi:mem-aref extra :uint8 2) (ldb (byte 8 16) counter)
+              (cffi:mem-aref extra :uint8 3) (ldb (byte 8 24) counter))))
     (setf (cffi:mem-ref derlen :size) 72)
     (unless (= 1 (secp256k1-ecdsa-signature-serialize-der
                   *secp256k1-context* der derlen sig))
