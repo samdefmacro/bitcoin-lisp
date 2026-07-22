@@ -241,6 +241,113 @@ vector."
     (is (= 5 (length (bitcoin-lisp.serialization:tx-in-script-sig
                       (aref (bitcoin-lisp.serialization:transaction-inputs tx) 0)))))))
 
+;;; --- Wallet P5 SIGNER role -----------------------------------------------
+
+(defun %psbt-partial-sigs (psbt)
+  "Per-input sorted list of (pubkey-hex . sig-hex) partial signatures — the
+funds-critical signer output, compared independent of metadata ordering."
+  (loop for m across (bitcoin-lisp.serialization:psbt-inputs psbt)
+        collect (sort (loop for (pk . sig)
+                              in (bitcoin-lisp.serialization:psbt-map-collect
+                                  m bitcoin-lisp.serialization:+psbt-in-partial-sig+)
+                            collect (cons (bitcoin-lisp.crypto:bytes-to-hex pk)
+                                          (bitcoin-lisp.crypto:bytes-to-hex sig)))
+                      #'string< :key #'car)))
+
+(defun %psbt-sign-with-wifs (psbt wifs)
+  "Drive the wallet-P5 signer core (%psbt-coins-map + %psbt-record-signatures)
+over PSBT with the WIF privkeys, recording partial sigs in place. This is exactly
+the machinery walletprocesspsbt/descriptorprocesspsbt use, minus wallet/descriptor
+key resolution — so it validates the signing dispatch against Core's vectors."
+  (let ((keymap (make-hash-table :test 'equalp))
+        (pubmap (make-hash-table :test 'equalp))
+        (tr-keymap (make-hash-table :test 'equalp)))
+    (dolist (wif wifs)
+      (multiple-value-bind (sk compressed) (bitcoin-lisp.crypto:wif-to-private-key wif)
+        (let ((pub (bitcoin-lisp.crypto:derive-public-key sk :compressed compressed)))
+          (setf (gethash (bitcoin-lisp.crypto:hash160 pub) keymap) (cons sk pub))
+          (setf (gethash pub pubmap) sk))
+        (let ((qx (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey
+                   (bitcoin-lisp.crypto:derive-xonly-pubkey sk))))
+          (when qx (setf (gethash qx tr-keymap) sk)))))
+    (let ((coins (bitcoin-lisp.rpc::%psbt-coins-map psbt)))
+      (bitcoin-lisp.rpc::%psbt-record-signatures psbt coins keymap pubmap tr-keymap nil))
+    psbt))
+
+(test psbt-signer-vectors
+  "The wallet-P5 signer core reproduces Core's rpc_psbt.json SIGNER partial
+signatures byte-for-byte (bip32-origin metadata comes from the wallet and is not
+compared). NOTE: requires the vendored rpc_psbt.json — runs at integration."
+  (let ((data (%psbt-vectors)))
+    (if (null data)
+        (skip "refs/bitcoin rpc_psbt.json not present")
+        (let ((n 0))
+          (dolist (e (gethash "signer" data))
+            (let ((got (%psbt-sign-with-wifs
+                        (bitcoin-lisp.serialization:decode-psbt (gethash "psbt" e))
+                        (gethash "privkeys" e)))
+                  (exp (bitcoin-lisp.serialization:decode-psbt (gethash "result" e))))
+              (is (equal (%psbt-partial-sigs got) (%psbt-partial-sigs exp))
+                  "signer vector #~D partial signatures mismatch" n)
+              (incf n)))
+          (is (>= n 5) "expected the signer vectors, got ~D" n)))))
+
+(test descriptorprocesspsbt-wpkh-hermetic
+  "descriptorprocesspsbt signs a P2WPKH input from a wpkh(WIF) descriptor and the
+PSBT's own witness_utxo, completing into a network tx whose witness verifies
+under the consensus script verifier. Runs WITHOUT vendored vectors."
+  (let* ((node (bitcoin-lisp::make-node :network :regtest))
+         (sk (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (wif (bitcoin-lisp.crypto:private-key-to-wif sk :network :regtest :compressed t))
+         (pub (bitcoin-lisp.crypto:derive-public-key sk :compressed t))
+         (pkh (bitcoin-lisp.crypto:hash160 pub))
+         (spk (concatenate '(simple-array (unsigned-byte 8) (*))
+                           #(#x00 #x14) pkh))
+         (value 100000)
+         (prevout (bitcoin-lisp.serialization:make-outpoint
+                   :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x11)
+                   :index 0))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 2
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                               :previous-output prevout
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xffffffff))
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value (- value 1000) :script-pubkey spk))
+              :lock-time 0))
+         (psbt (bitcoin-lisp.serialization:make-empty-psbt tx)))
+    ;; Provide the input's witness_utxo directly in the PSBT.
+    (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+      (bitcoin-lisp.serialization:bb-write-tx-out
+       bb (bitcoin-lisp.serialization:make-tx-out :value value :script-pubkey spk))
+      (bitcoin-lisp.serialization:psbt-map-set
+       (aref (bitcoin-lisp.serialization:psbt-inputs psbt) 0)
+       bitcoin-lisp.serialization:+psbt-in-witness-utxo+
+       (make-array 0 :element-type '(unsigned-byte 8))
+       (bitcoin-lisp.serialization:bb-finish bb)))
+    (let* ((b64 (bitcoin-lisp.serialization:encode-psbt psbt))
+           (result (bitcoin-lisp.rpc::rpc-descriptorprocesspsbt
+                    node (list b64 (list (format nil "wpkh(~A)" wif)))))
+           (hex (cdr (assoc "hex" result :test #'equal))))
+      (is (eq t (cdr (assoc "complete" result :test #'equal))))
+      (is (stringp hex))
+      (let* ((tx2 (bitcoin-lisp.serialization:parse-tx-payload
+                   (bitcoin-lisp.crypto:hex-to-bytes hex)))
+             (witnesses (bitcoin-lisp.serialization:transaction-witness tx2)))
+        ;; Witness = <sig> <pubkey>.
+        (is (= 2 (length (aref witnesses 0))))
+        (is (equalp pub (second (aref witnesses 0))))
+        ;; Consensus script verification of the signed input.
+        (let* ((utxo (bitcoin-lisp.storage:make-utxo-entry :value value :script-pubkey spk))
+               (spent (vector utxo))
+               (bitcoin-lisp.coalton.interop:*script-flags*
+                 bitcoin-lisp.validation:+standard-script-verify-flags+)
+               (bitcoin-lisp.coalton.interop:*precomputed-sighash*
+                 (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx2 spent))
+               (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent))
+          (is-true (bitcoin-lisp.validation:validate-input-script tx2 0 (aref spent 0))))))))
+
 (test psbt-createpsbt-defaults-and-validation
   "createpsbt sequence follows Core (replaceable default true -> RBF; explicit
 false honors locktime), and duplicate outputs are rejected."

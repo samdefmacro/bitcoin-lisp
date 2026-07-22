@@ -1737,6 +1737,39 @@ path plus the ranged step; const keys come from the parse or PROVIDER."
             (subseq (bitcoin-lisp.crypto:ext-key-key k) 1 33))))
       (nth-value 0 (%desc-key-privkey-for key provider))))
 
+(defun %sign-map-add-key! (keymap pubmap tr-keymap key pubkey priv pos)
+  "Verify PRIV reproduces PUBKEY, then register it in the three signing maps:
+KEYMAP hash160(pubkey) -> (priv . pubkey); PUBMAP pubkey -> priv; TR-KEYMAP
+tweaked-taproot-output-x-only-key -> priv. A mismatch is logged and the key
+skipped — a derivation bug MUST surface as a missing-key signing error, never a
+wrong-key signature (funds-critical). Shared by the wallet signer
+(%wallet-sign-maps) and the descriptor PSBT signer (%descriptor-sign-maps).
+
+X-only descriptor keys (tr()/rawtr() key expressions) persist as bare 32-byte x
+hex and reload lifted with a fixed 02 prefix, so an odd-Y key's stored parity
+byte is arbitrary: compare X COORDINATES only. Taproot signing normalizes parity
+itself (derive-xonly-pubkey + BIP86 tweak). Everything else keeps the strict
+full-point check."
+  (let* ((derived (bitcoin-lisp.crypto:derive-public-key
+                   priv :compressed (= (length pubkey) 33)))
+         (matches (if (and (desc-key-xonly-p key)
+                           (= (length derived) 33)
+                           (= (length pubkey) 33))
+                      (equalp (subseq derived 1) (subseq pubkey 1))
+                      (equalp derived pubkey))))
+    (if matches
+        (progn
+          (setf (gethash (bitcoin-lisp.crypto:hash160 pubkey) keymap)
+                (cons priv pubkey))
+          (setf (gethash pubkey pubmap) priv)
+          (when (= (length pubkey) 33)
+            (let ((qx (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey
+                       (bitcoin-lisp.crypto:derive-xonly-pubkey priv))))
+              (when qx (setf (gethash qx tr-keymap) priv)))))
+        (bitcoin-lisp:log-warn
+         "wallet-sign: derived key does not match expected pubkey at index ~D; key skipped"
+         pos))))
+
 (defun %wallet-sign-maps (wallet tx coins)
   "(values keymap pubmap tr-keymap) covering every input of TX whose spent
 script belongs to a wallet SPKM. Each derived private key is verified to
@@ -1762,39 +1795,8 @@ wrong-key signature)."
                   (loop for (key . pubkey) in pairs
                         for priv = (%desc-key-priv-at key pos provider)
                         do (when priv
-                             (let* ((derived (bitcoin-lisp.crypto:derive-public-key
-                                              priv :compressed (= (length pubkey) 33)))
-                                    ;; X-only descriptor keys (tr()/rawtr()
-                                    ;; key expressions) persist as bare
-                                    ;; 32-byte x hex and reload lifted with
-                                    ;; a fixed 02 prefix, so an odd-Y key's
-                                    ;; stored parity byte is arbitrary:
-                                    ;; compare X COORDINATES only. Taproot
-                                    ;; signing normalizes parity itself
-                                    ;; (derive-xonly-pubkey + BIP86 tweak).
-                                    ;; Everything else keeps the strict
-                                    ;; full-point check.
-                                    (matches
-                                      (if (and (desc-key-xonly-p key)
-                                               (= (length derived) 33)
-                                               (= (length pubkey) 33))
-                                          (equalp (subseq derived 1)
-                                                  (subseq pubkey 1))
-                                          (equalp derived pubkey))))
-                               (if matches
-                                   (progn
-                                     (setf (gethash (bitcoin-lisp.crypto:hash160 pubkey)
-                                                    keymap)
-                                           (cons priv pubkey))
-                                     (setf (gethash pubkey pubmap) priv)
-                                     (when (= (length pubkey) 33)
-                                       (let ((qx (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey
-                                                  (bitcoin-lisp.crypto:derive-xonly-pubkey priv))))
-                                         (when qx
-                                           (setf (gethash qx tr-keymap) priv)))))
-                                   (bitcoin-lisp:log-warn
-                                    "wallet-sign: derived key does not match expected pubkey at index ~D; key skipped"
-                                    pos))))))))))))
+                             (%sign-map-add-key! keymap pubmap tr-keymap
+                                                 key pubkey priv pos))))))))))
     (values keymap pubmap tr-keymap)))
 
 (defun %wallet-sign-transaction (wallet tx coins &key (sighash-byte 1))
