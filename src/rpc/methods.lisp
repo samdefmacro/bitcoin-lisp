@@ -41,9 +41,17 @@ matching Bitcoin Core's uint256::GetHex."
          (tip (and best-hash (bitcoin-lisp.storage:get-block-index-entry chain-state best-hash)))
          (tip-header (and tip (bitcoin-lisp.storage:block-index-entry-header tip)))
          (bits (if tip-header (bitcoin-lisp.serialization:block-header-bits tip-header) #x1d00ffff))
+         ;; Report the best-HEADER height, not the validated-tip height, so a
+         ;; download wedge is visible as blocks < headers (Core parity; matches
+         ;; getchainstates). Reporting tip height for both hid exactly the
+         ;; kind of stuck-tip-below-headers state the reorg wedge produced.
+         (best-header (bitcoin-lisp.storage:best-header-entry chain-state))
+         (headers-height (if best-header
+                             (bitcoin-lisp.storage:block-index-entry-height best-header)
+                             height))
          (result `(("chain" . ,(%chain-name network))
                    ("blocks" . ,height)
-                   ("headers" . ,height)
+                   ("headers" . ,headers-height)
                    ("bestblockhash" . ,(if best-hash (hash-to-hex best-hash) nil))
                    ("difficulty" . ,(%difficulty-from-bits bits))
                    ("time" . ,(if tip-header

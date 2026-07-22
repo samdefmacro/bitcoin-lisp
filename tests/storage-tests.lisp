@@ -4,6 +4,49 @@
 
 ;;;; Block store
 
+(test get-block-treats-corrupt-file-as-absent-and-prunes
+  "A truncated / corrupt block file must NOT raise out of get-block — before the
+guard, read-bitcoin-block's raise escaped the reorg/download paths to the
+sync-thread top level and killed it (a live-but-wedged zombie). get-block now
+returns NIL (treated as absent) AND prunes the file so the normal download path
+re-fetches it (store-block :supersede overwrites)."
+  (let* ((dir (merge-pathnames "test-corrupt-block/" (uiop:temporary-directory)))
+         (store (bitcoin-lisp.storage:init-block-store dir))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (tx (bitcoin-lisp.serialization:make-transaction
+              :version 1
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                               :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                                 :hash zeros :index #xffffffff)
+                               :script-sig (make-array 1 :element-type '(unsigned-byte 8)
+                                                       :initial-element 0)
+                               :sequence #xffffffff))
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 5000000000
+                                :script-pubkey (make-array 1 :element-type '(unsigned-byte 8)
+                                                           :initial-element #x51)))
+              :lock-time 0))
+         (hdr (bitcoin-lisp.serialization:make-block-header
+               :version 1 :prev-block zeros :merkle-root zeros
+               :timestamp 1700000000 :bits #x207fffff :nonce 0))
+         (blk (bitcoin-lisp.serialization:make-bitcoin-block
+               :header hdr :transactions (list tx))))
+    (unwind-protect
+         (let ((hash (bitcoin-lisp.storage:store-block store blk)))
+           ;; Reads back fine while intact.
+           (is-true (bitcoin-lisp.storage:get-block store hash))
+           ;; Truncate the on-disk file to garbage so read-bitcoin-block raises.
+           (let ((path (bitcoin-lisp.storage::block-file-path store hash)))
+             (with-open-file (s path :direction :output :if-exists :supersede
+                                     :element-type '(unsigned-byte 8))
+               (write-sequence (make-array 3 :element-type '(unsigned-byte 8)
+                                             :initial-contents '(1 2 3)) s))
+             ;; get-block must NOT raise: returns NIL and prunes the file.
+             (is (null (bitcoin-lisp.storage:get-block store hash)))
+             (is (null (probe-file path))
+                 "corrupt block file must be pruned so re-download can self-heal")))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
 (test store-block-preserves-witness
   "store-block must persist witness data (BIP144) so blocks read back from disk
 are witness-complete — needed to serve MSG_WITNESS_BLOCK to peers (the
