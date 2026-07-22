@@ -1486,20 +1486,22 @@ would let the ordinary tip+1 path preempt the scenario)."
            (is (gethash (fourth b-hashes)
                         (bitcoin-lisp.networking::ibd-context-reorg-candidates ctx)))
            (is (equalp a2-hash (bitcoin-lisp.storage:best-block-hash csa)))
-           ;; B1, B2 (below tip) and B3 (tip+1, cumulatively WEAKER) arrive:
-           ;; all are stored, none can trigger the reorg — this is exactly
-           ;; where the pre-fix node livelocked.
+           ;; B1, B2 arrive (below tip): stored, fork still incomplete (B3
+           ;; missing), so the candidate retry on each arrival still can't
+           ;; fire — tip stays A2. This is exactly where the pre-fix node
+           ;; livelocked (winning bodies present but no reorg attempted).
            (bitcoin-lisp.networking::process-received-block
             (first b-blocks) csa utxoa storea :requested t)
            (bitcoin-lisp.networking::process-received-block
             (second b-blocks) csa utxoa storea :requested t)
+           (is (equalp a2-hash (bitcoin-lisp.storage:best-block-hash csa)))
+           ;; B3 (tip+1, cumulatively weaker) completes B1..B3 on disk. Its
+           ;; own activate-block stays :weaker-chain, but the candidate retry
+           ;; it triggers now finds B4's fork complete and performs the reorg
+           ;; eagerly (Core-style: ActivateBestChain after every accepted
+           ;; block) -> tip = B4, candidate consumed.
            (bitcoin-lisp.networking::process-received-block
             (third b-blocks) csa utxoa storea :requested t)
-           (is (equalp a2-hash (bitcoin-lisp.storage:best-block-hash csa)))
-           ;; The per-cycle candidate retry: bodies now complete -> reorg
-           ;; fires -> tip = B4, candidate cleared from the set.
-           (is (eq t (bitcoin-lisp.networking::retry-best-reorg-candidate
-                      csa storea utxoa)))
            (is (= 4 (bitcoin-lisp.storage:current-height csa)))
            (is (equalp (fourth b-hashes) (bitcoin-lisp.storage:best-block-hash csa)))
            (is (null (gethash (fourth b-hashes)
