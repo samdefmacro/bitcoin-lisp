@@ -92,26 +92,13 @@
 
 ;;;; Download Queue Tests
 
-(test download-queue-tracking
-  "Test tracking blocks in the download queue."
-  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
-        (hash1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
-        (hash2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
-    ;; Add blocks to pending
-    (setf (gethash hash1 (bitcoin-lisp.networking::ibd-context-pending-blocks
-                          bitcoin-lisp.networking::*ibd-context*)) 100)
-    (setf (gethash hash2 (bitcoin-lisp.networking::ibd-context-pending-blocks
-                          bitcoin-lisp.networking::*ibd-context*)) 101)
-
-    ;; Check pending count
-    (is (= 2 (hash-table-count (bitcoin-lisp.networking::ibd-context-pending-blocks
-                                bitcoin-lisp.networking::*ibd-context*))))
-
-    ;; Get blocks to request
-    (let ((to-request (bitcoin-lisp.networking::get-next-blocks-to-request 10)))
-      (is (= 2 (length to-request)))
-      ;; Should be sorted by height (hash1 at 100 should come first)
-      (is (equalp hash1 (first to-request))))))
+;; NOTE: `download-queue-tracking` and the three `request-window-*` tests
+;; were removed with the height-based scheduler they exercised
+;; (get-next-blocks-to-request): block selection is now the per-peer chain
+;; walk find-blocks-to-download-for-peer, covered in reorg-tests
+;; (find-blocks-to-download-only-on-peer-chain and friends), whose window
+;; is Core's BLOCK_DOWNLOAD_WINDOW in block count anchored at the per-peer
+;; last-common block.
 
 (test in-flight-tracking
   "Test tracking in-flight block requests."
@@ -131,10 +118,7 @@
                       bitcoin-lisp.networking::*ibd-context*)))
       (is (= 1 (hash-table-count in-flight)))
       (let ((entry (gethash hash in-flight)))
-        (is (eq mock-peer (car entry)))))
-
-    ;; Should not appear in get-next-blocks-to-request
-    (is (null (bitcoin-lisp.networking::get-next-blocks-to-request 10)))))
+        (is (eq mock-peer (car entry)))))))
 
 (test block-received-tracking
   "Test marking blocks as received."
@@ -162,63 +146,12 @@
     (is (= 1 (bitcoin-lisp.networking::ibd-context-blocks-received
               bitcoin-lisp.networking::*ibd-context*)))))
 
-;;;; Byte-aware request window
-;;;;
-;;;; The request lookahead must never exceed what the byte-capped block
-;;;; queue can hold (+max-block-queue-bytes+ / avg block wire size).
-;;;; Regression for 2026-06-12 mainnet h~851.7k: the 1024-count window
-;;;; vs the ~170-block byte capacity stuffed peers' send queues with
-;;;; far-ahead 2MB blocks that were dropped at the cap on arrival,
-;;;; serializing the tip on multi-minute deliveries (~1 block/min).
-
-(defun %plant-pending (heights)
-  "Add one pending block per height in HEIGHTS, hash derived from height."
-  (let ((pending (bitcoin-lisp.networking::ibd-context-pending-blocks
-                  bitcoin-lisp.networking::*ibd-context*)))
-    (dolist (h heights)
-      (let ((hash (make-array 32 :element-type '(unsigned-byte 8)
-                                 :initial-element 0)))
-        (setf (aref hash 0) (ldb (byte 8 0) h)
-              (aref hash 1) (ldb (byte 8 8) h)
-              (aref hash 2) (ldb (byte 8 16) h))
-        (setf (gethash hash pending) h)))))
-
-(test request-window-clamped-by-byte-cap
-  "With the default 1MB avg block size, the window is byte-cap/1MB = 256
-blocks, far below the 1024 count window."
-  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
-    (%plant-pending '(150 356 357 1100))
-    (let ((heights (mapcar (lambda (hash)
-                             (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
-                                            bitcoin-lisp.networking::*ibd-context*)))
-                           (bitcoin-lisp.networking::get-next-blocks-to-request 10 100))))
-      ;; tip 100 + window 256 = 356: heights 150 and 356 in, 357/1100 out
-      (is (equal '(150 356) (sort heights #'<))))))
-
-(test request-window-expands-for-small-blocks
-  "With tiny historic blocks the byte capacity exceeds 1024, so the
-count window is the binding limit again."
-  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
-    (setf (bitcoin-lisp.networking::ibd-context-avg-block-wire-bytes
-           bitcoin-lisp.networking::*ibd-context*)
-          1024)                         ; 1KB blocks -> capacity 262144
-    (%plant-pending (list (+ 100 bitcoin-lisp.networking::+max-block-queue-size+)
-                          (+ 101 bitcoin-lisp.networking::+max-block-queue-size+)))
-    (is (= 1 (length (bitcoin-lisp.networking::get-next-blocks-to-request 10 100))))))
-
-(test request-window-floor-keeps-pipeline-alive
-  "Even with absurdly large blocks the window never shrinks below 32."
-  (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
-    (setf (bitcoin-lisp.networking::ibd-context-avg-block-wire-bytes
-           bitcoin-lisp.networking::*ibd-context*)
-          (* 64 1024 1024))             ; 64MB avg -> raw capacity 4
-    (%plant-pending '(132 133))
-    (let ((heights (mapcar (lambda (hash)
-                             (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
-                                            bitcoin-lisp.networking::*ibd-context*)))
-                           (bitcoin-lisp.networking::get-next-blocks-to-request 10 100))))
-      ;; tip 100 + floor 32 = 132: height 132 in, 133 out
-      (is (equal '(132) heights)))))
+;;;; (The byte-aware request-window tests that lived here exercised the
+;;;; retired height-based scheduler. The per-peer walk's window is Core's
+;;;; BLOCK_DOWNLOAD_WINDOW in block COUNT anchored at last-common;
+;;;; byte-level backpressure is enforced by the receive-side queue caps in
+;;;; process-received-block and the gap-only gate in
+;;;; request-blocks-from-peers. avg-block-wire-bytes remains as telemetry.)
 
 (test note-block-wire-size-ema
   "note-block-wire-size folds sizes in as a 0.9/0.1 integer EMA and
@@ -721,24 +654,16 @@ block when in the index, and NIL when availability is unknown."
     (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer) hash)
     (is (= 42 (bitcoin-lisp.networking::peer-best-known-height peer state)))))
 
-(test request-blocks-drops-block-when-all-peers-disclaim
-  "When every ready peer has answered notfound for a pending block, the
-scheduler drops it from pending — a stale fork no peer can serve — so
-IBD stops retrying it forever."
-  (let* ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd))
-         (state (bitcoin-lisp.storage:make-chain-state))
-         (peer-a (%make-peer-with-state :ready))
-         (peer-b (%make-peer-with-state :ready))
-         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5)))
-    ;; Block is pending at a height within the download window of tip 0.
-    (setf (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
-                         bitcoin-lisp.networking::*ibd-context*)) 5)
-    ;; Both peers have disclaimed it.
-    (bitcoin-lisp.networking::note-block-not-available peer-a hash)
-    (bitcoin-lisp.networking::note-block-not-available peer-b hash)
-    (bitcoin-lisp.networking::request-blocks-from-peers (list peer-a peer-b) state)
-    (is (null (gethash hash (bitcoin-lisp.networking::ibd-context-pending-blocks
-                             bitcoin-lisp.networking::*ibd-context*))))))
+;; NOTE: the old test `request-blocks-drops-block-when-all-peers-disclaim`
+;; was removed with the layer-5 download rewrite. It asserted that the
+;; scheduler drops a pending block once every peer answered notfound for it —
+;; a band-aid built on the false premise that peers notfound blocks. They do
+;; not (Bitcoin only sends notfound for txs, never blocks — net_processing.cpp
+;; ProcessGetData), which is exactly why the node wedged retrying an
+;; unobtainable fork forever. The new scheduler (find-blocks-to-download-for-peer)
+;; never requests a block off a peer's own best chain in the first place, so
+;; there is nothing to "drop". That correct behavior is covered directly by
+;; `find-blocks-to-download-only-on-peer-chain` in reorg-tests.lisp.
 
 (test handle-notfound-marks-block-disclaimed
   "An incoming notfound message for a block marks it disclaimed on the
@@ -758,8 +683,9 @@ peer (wire-path coverage of the parse + dispatch)."
 ;;;;
 ;;;; When a peer disconnects, the blocks it held in-flight must be freed
 ;;;; for immediate reassignment (Bitcoin Core's FinalizeNode), not left
-;;;; until the ~125s per-hash timeout. The block stays in pending, so the
-;;;; next get-next-blocks-to-request picks it up.
+;;;; until the ~125s per-hash timeout. Once freed from in-flight, the next
+;;;; per-peer download walk (find-blocks-to-download-for-peer) re-requests it
+;;;; from a live peer whose chain still covers it.
 
 (test release-orphaned-in-flight-reclaims-disconnected-peer-blocks
   "Releases in-flight blocks held by a non-:ready peer (still in pending),

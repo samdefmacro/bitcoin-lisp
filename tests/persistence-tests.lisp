@@ -535,11 +535,9 @@ accumulating score); discouragement is NOT a hard ban."
       (is (= 2 retried)))
     ;; In-flight should be empty now
     (is (= 0 (hash-table-count (bitcoin-lisp.networking::ibd-context-in-flight ctx))))
-    ;; Blocks should still be in pending (re-requestable)
-    (is (= 2 (hash-table-count (bitcoin-lisp.networking::ibd-context-pending-blocks ctx))))
-    ;; get-next-blocks-to-request should return them
-    (let ((next (bitcoin-lisp.networking::get-next-blocks-to-request 10)))
-      (is (= 2 (length next))))))
+    ;; Blocks should still be in pending (and, no longer being in-flight,
+    ;; the next per-peer download walk can re-request them).
+    (is (= 2 (hash-table-count (bitcoin-lisp.networking::ibd-context-pending-blocks ctx))))))
 
 ;;;; Sync Resume Simulation Test
 

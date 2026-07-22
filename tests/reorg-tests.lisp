@@ -1372,3 +1372,300 @@ path swallowed this signal and never re-requested the sub-tip fork blocks."
        (is (every (lambda (c) (and (consp c) (integerp (cdr c)))) (second outcome)))
        ;; Reorg refused -> active tip unchanged (still on branch A).
        (is (= 3 (bitcoin-lisp.storage:current-height csa)))))))
+
+(test find-blocks-to-download-only-on-peer-chain
+  "Layer-5 per-peer download: find-blocks-to-download-for-peer returns blocks on
+the PEER'S chain only. A peer whose best-known block is on fork B yields fork-B
+blocks to download and never fork-A blocks; a peer at our own tip yields nothing.
+This is why the node downloads the chains its peers actually serve instead of
+fixating on a fork no connected peer has."
+  (%with-regtest
+   (let* ((spk-a (%p2sh-optrue-spk))
+          (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
+          (nb (%regtest-node-fixture "l5-b"))
+          (b-blocks (loop repeat 5 for blk = (%dr-mine-on nb spk-b)
+                          do (%dr-connect nb blk) collect blk))
+          (na (%regtest-node-fixture "l5-a"))
+          (csa (bitcoin-lisp::node-chain-state na))
+          (storea (bitcoin-lisp::node-block-store na))
+          (genesis-hash (bitcoin-lisp.storage:best-block-hash csa)))
+     (dotimes (i 3) (%dr-connect na (%dr-mine-on na spk-a)))   ; branch A, tip A3 (h3)
+     ;; Add branch B (5 blocks, more work) HEADERS to na, no bodies.
+     (let ((prev (bitcoin-lisp.storage:get-block-index-entry csa genesis-hash)))
+       (loop for blk in b-blocks for h from 1 to 5
+             do (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                       (bhash (bitcoin-lisp.serialization:block-header-hash hdr))
+                       (work (bitcoin-lisp.storage:calculate-chain-work
+                              (bitcoin-lisp.serialization:block-header-bits hdr)
+                              (bitcoin-lisp.storage:block-index-entry-chain-work prev)))
+                       (e (bitcoin-lisp.storage:make-block-index-entry
+                           :hash bhash :height h :header hdr
+                           :prev-entry prev :chain-work work :status :header-valid)))
+                  (bitcoin-lisp.storage:add-block-index-entry csa e)
+                  (setf prev e))))
+     (let* ((ctx (bitcoin-lisp.networking::make-ibd))
+            (b-hashes (mapcar (lambda (blk)
+                                (bitcoin-lisp.serialization:block-header-hash
+                                 (bitcoin-lisp.serialization:bitcoin-block-header blk)))
+                              b-blocks))
+            (peer-b (bitcoin-lisp.networking::make-peer :address "1.2.3.4:18333"))
+            (peer-tip (bitcoin-lisp.networking::make-peer :address "5.6.7.8:18333")))
+       (setf (bitcoin-lisp.networking::peer-best-known-block-hash peer-b) (fifth b-hashes)
+             (bitcoin-lisp.networking::peer-best-known-block-hash peer-tip)
+             (bitcoin-lisp.storage:best-block-hash csa))
+       (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+         ;; Peer on fork B: returns exactly the 5 fork-B blocks, none of fork A.
+         (let ((got (bitcoin-lisp.networking::find-blocks-to-download-for-peer
+                     peer-b csa storea 16)))
+           (is (= 5 (length got)))
+           (is (every (lambda (h) (member h b-hashes :test #'equalp)) got)))
+         ;; Peer at our own tip (A3): nothing more-work to fetch.
+         (is (null (bitcoin-lisp.networking::find-blocks-to-download-for-peer
+                    peer-tip csa storea 16))))))))
+
+(test deep-reorg-candidate-activates-fork-winning-above-tip-plus-1
+  "THE deep-reorg livelock regression (2026-07-22 liveness review): a fork
+whose cumulative work overtakes the active tip only ABOVE tip+1. The fork's
+tip+1 block reads as weaker on arrival (stored, no reorg), the decisive
+blocks arrive out of order — pre-fix they sat in RAM only, perform-reorg
+(all-or-nothing, disk-only) was never attempted, and the tip sat still
+forever. Now: the out-of-order path persists them, records the outweighing
+block as the pending reorg candidate, and the candidate retry (gated on
+fork bodies complete on disk) performs the reorg.
+
+Fork-B index works are hand-set so B's cumulative work crosses the tip's
+only at B4 (equal-bits regtest blocks always cross exactly at tip+1, which
+would let the ordinary tip+1 path preempt the scenario)."
+  (%with-regtest
+   (let* ((spk-a (%p2sh-optrue-spk))
+          (spk-b (coerce '(#x51) '(vector (unsigned-byte 8))))
+          (nb (%regtest-node-fixture "drc-b"))
+          (b-blocks (loop repeat 4 for blk = (%dr-mine-on nb spk-b)
+                          do (%dr-connect nb blk) collect blk))
+          (na (%regtest-node-fixture "drc-a"))
+          (csa (bitcoin-lisp::node-chain-state na))
+          (storea (bitcoin-lisp::node-block-store na))
+          (utxoa (bitcoin-lisp::node-utxo-set na))
+          (genesis-hash (bitcoin-lisp.storage:best-block-hash csa)))
+     (dotimes (i 2) (%dr-connect na (%dr-mine-on na spk-a)))   ; branch A, tip A2
+     (let* ((w1 (bitcoin-lisp.storage:block-index-entry-chain-work
+                 (bitcoin-lisp.storage:get-block-at-height csa 1)))
+            (w2 (bitcoin-lisp.storage:block-index-entry-chain-work
+                 (bitcoin-lisp.storage:get-block-at-height csa 2)))
+            (a2-hash (bitcoin-lisp.storage:best-block-hash csa))
+            ;; Cumulative-work schedule for B: strictly increasing, below
+            ;; the tip through B3 (so B3's tip+1 arrival stays weaker even
+            ;; after adding one real block-work to B2's ENTRY work), crossing
+            ;; at B4. activate-block recomputes the INCOMING block's work
+            ;; from its header bits + the prev ENTRY's work, so B3's entry
+            ;; work must exceed w1 for the B4 activation to outweigh w2.
+            (b-works (list 1 2 (1+ w1) (1+ w2)))
+            (b-hashes (mapcar (lambda (blk)
+                                (bitcoin-lisp.serialization:block-header-hash
+                                 (bitcoin-lisp.serialization:bitcoin-block-header blk)))
+                              b-blocks)))
+       ;; Add fork-B headers to na's index (bodies not yet delivered).
+       (let ((prev (bitcoin-lisp.storage:get-block-index-entry csa genesis-hash)))
+         (loop for blk in b-blocks for bw in b-works for h from 1
+               do (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                         (e (bitcoin-lisp.storage:make-block-index-entry
+                             :hash (bitcoin-lisp.serialization:block-header-hash hdr)
+                             :height h :header hdr :prev-entry prev
+                             :chain-work bw :status :header-valid)))
+                    (bitcoin-lisp.storage:add-block-index-entry csa e)
+                    (setf prev e))))
+       (let ((bitcoin-lisp.networking::*ibd-context*
+               (bitcoin-lisp.networking::make-ibd)))
+         (let ((ctx bitcoin-lisp.networking::*ibd-context*))
+           ;; B4 arrives FIRST (out of order, above tip+1): persisted to
+           ;; disk, recorded as reorg candidate — but gated (fork bodies
+           ;; incomplete), so the tip must not move.
+           (bitcoin-lisp.networking::process-received-block
+            (fourth b-blocks) csa utxoa storea :requested t)
+           (is (bitcoin-lisp.storage:block-exists-p storea (fourth b-hashes)))
+           (is (gethash (fourth b-hashes)
+                        (bitcoin-lisp.networking::ibd-context-reorg-candidates ctx)))
+           (is (equalp a2-hash (bitcoin-lisp.storage:best-block-hash csa)))
+           ;; B1, B2 arrive (below tip): stored, fork still incomplete (B3
+           ;; missing), so the candidate retry on each arrival still can't
+           ;; fire — tip stays A2. This is exactly where the pre-fix node
+           ;; livelocked (winning bodies present but no reorg attempted).
+           (bitcoin-lisp.networking::process-received-block
+            (first b-blocks) csa utxoa storea :requested t)
+           (bitcoin-lisp.networking::process-received-block
+            (second b-blocks) csa utxoa storea :requested t)
+           (is (equalp a2-hash (bitcoin-lisp.storage:best-block-hash csa)))
+           ;; B3 (tip+1, cumulatively weaker) completes B1..B3 on disk. Its
+           ;; own activate-block stays :weaker-chain, but the candidate retry
+           ;; it triggers now finds B4's fork complete and performs the reorg
+           ;; eagerly (Core-style: ActivateBestChain after every accepted
+           ;; block) -> tip = B4, candidate consumed.
+           (bitcoin-lisp.networking::process-received-block
+            (third b-blocks) csa utxoa storea :requested t)
+           (is (= 4 (bitcoin-lisp.storage:current-height csa)))
+           (is (equalp (fourth b-hashes) (bitcoin-lisp.storage:best-block-hash csa)))
+           (is (null (gethash (fourth b-hashes)
+                              (bitcoin-lisp.networking::ibd-context-reorg-candidates
+                               ctx))))))))))
+
+(test drain-connects-persisted-block-after-ram-drop
+  "Drain's disk fallback: an out-of-order block is persisted on receipt;
+even if its RAM queue slot is lost (cap-drop, fork collision, restart),
+drain-block-queue connects it from disk via disk-blocks-above-tip once the
+tip reaches its parent — pre-fix the block was silently re-downloaded (or,
+post-persist without the fallback, stranded on disk forever)."
+  (%with-regtest
+   (let* ((spk-a (%p2sh-optrue-spk))
+          (na (%regtest-node-fixture "ddf-a"))
+          (nb (%regtest-node-fixture "ddf-b"))
+          (csa (bitcoin-lisp::node-chain-state na))
+          (storea (bitcoin-lisp::node-block-store na))
+          (utxoa (bitcoin-lisp::node-utxo-set na))
+          (a1 (%dr-mine-on na spk-a)))
+     (%dr-connect na a1) (%dr-connect nb a1)
+     (let ((a2 (%dr-mine-on na spk-a)))
+       (%dr-connect na a2) (%dr-connect nb a2))          ; both tips at A2
+     (let* ((a3 (%dr-mine-on nb spk-a))
+            (a4 (progn (%dr-connect nb a3) (%dr-mine-on nb spk-a)))
+            (h4 (bitcoin-lisp.serialization:block-header-hash
+                 (bitcoin-lisp.serialization:bitcoin-block-header a4))))
+       ;; Register A3/A4 headers on na (real chain-work).
+       (let ((prev (bitcoin-lisp.storage:get-block-index-entry
+                    csa (bitcoin-lisp.storage:best-block-hash csa))))
+         (dolist (blk (list a3 a4))
+           (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                  (e (bitcoin-lisp.storage:make-block-index-entry
+                      :hash (bitcoin-lisp.serialization:block-header-hash hdr)
+                      :height (1+ (bitcoin-lisp.storage:block-index-entry-height prev))
+                      :header hdr :prev-entry prev
+                      :chain-work (bitcoin-lisp.storage:calculate-chain-work
+                                   (bitcoin-lisp.serialization:block-header-bits hdr)
+                                   (bitcoin-lisp.storage:block-index-entry-chain-work prev))
+                      :status :header-valid)))
+             (bitcoin-lisp.storage:add-block-index-entry csa e)
+             (setf prev e))))
+       (let ((bitcoin-lisp.networking::*ibd-context*
+               (bitcoin-lisp.networking::make-ibd)))
+         (let ((ctx bitcoin-lisp.networking::*ibd-context*))
+           ;; A4 arrives out of order: persisted + RAM-queued + recorded.
+           (bitcoin-lisp.networking::process-received-block a4 csa utxoa storea)
+           (is (bitcoin-lisp.storage:block-exists-p storea h4))
+           (is (gethash 4 (bitcoin-lisp.networking::ibd-context-block-queue ctx)))
+           ;; Simulate the RAM slot being lost (cap-drop / restart).
+           (remhash 4 (bitcoin-lisp.networking::ibd-context-block-queue ctx))
+           (setf (bitcoin-lisp.networking::ibd-context-block-queue-bytes ctx) 0)
+           ;; A3 connects at tip+1; drain must then pull A4 from DISK.
+           (bitcoin-lisp.networking::process-received-block a3 csa utxoa storea)
+           (is (= 4 (bitcoin-lisp.storage:current-height csa)))
+           (is (equalp h4 (bitcoin-lisp.storage:best-block-hash csa)))
+           ;; The consumed disk-map entry is gone.
+           (is (null (gethash
+                      4 (bitcoin-lisp.networking::ibd-context-disk-blocks-above-tip
+                         ctx))))))))))
+
+(test out-of-order-persist-gated-by-acceptblock
+  "Case-C persist DoS gate (Core AcceptBlock, safety review Lens 3): an
+UNSOLICITED out-of-order block is kept only if it outweighs the tip, sits
+within +min-blocks-to-keep+ of it, and meets minimum chain work — else an
+attacker fills disk with unsolicited far-ahead / low-work fork bodies. A
+REQUESTED block always passes. Tests %out-of-order-block-acceptable-p directly."
+  (%with-regtest
+   (let* ((cs (bitcoin-lisp.storage:make-chain-state))
+          (%h (lambda (n) (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element n)))
+          (g (bitcoin-lisp.storage:make-block-index-entry
+              :hash (funcall %h 0) :height 0 :chain-work 0 :status :valid))
+          (tip (bitcoin-lisp.storage:make-block-index-entry
+                :hash (funcall %h 1) :height 1 :chain-work 100 :prev-entry g
+                :status :valid)))
+     (bitcoin-lisp.storage:add-block-index-entry cs g)
+     (bitcoin-lisp.storage:add-block-index-entry cs tip)
+     (bitcoin-lisp.storage:update-chain-tip cs (funcall %h 1) 1)
+     (let ((more-work (bitcoin-lisp.storage:make-block-index-entry
+                       :hash (funcall %h 2) :height 3 :chain-work 150 :status :header-valid))
+           (less-work (bitcoin-lisp.storage:make-block-index-entry
+                       :hash (funcall %h 3) :height 3 :chain-work 50 :status :header-valid))
+           (too-far (bitcoin-lisp.storage:make-block-index-entry
+                     :hash (funcall %h 4) :height 500 :chain-work 200 :status :header-valid)))
+       ;; Unsolicited, less work than tip -> rejected.
+       (is (null (bitcoin-lisp.networking::%out-of-order-block-acceptable-p
+                  less-work 1 nil cs)))
+       ;; Same block, REQUESTED -> accepted (gate lifted).
+       (is (bitcoin-lisp.networking::%out-of-order-block-acceptable-p
+            less-work 1 t cs))
+       ;; Unsolicited, more work, within the window -> accepted.
+       (is (bitcoin-lisp.networking::%out-of-order-block-acceptable-p
+            more-work 1 nil cs))
+       ;; Unsolicited, more work but > tip + min-blocks-to-keep ahead -> rejected.
+       (is (null (bitcoin-lisp.networking::%out-of-order-block-acceptable-p
+                  too-far 1 nil cs)))))))
+
+(test reorg-candidate-set-prefers-completable-over-higher-work-gated
+  "F1 (liveness review): a candidate SET, not a single sticky slot. A
+higher-work fork whose bodies are INCOMPLETE (unobtainable) must not starve a
+lower-work fork that IS complete — retry-best-reorg-candidate activates the
+best COMPLETABLE target. Blocks are stored + candidates populated directly so
+the retry, not eager arrival-time activation, is what performs the reorg."
+  (%with-regtest
+   (let* ((spk-g (coerce '(#x51) '(vector (unsigned-byte 8))))       ; OP_TRUE
+          (spk-h (coerce '(#x52) '(vector (unsigned-byte 8))))       ; OP_2 — distinct
+          (spk-a (%p2sh-optrue-spk))                                 ; distinct from both
+          ;; Distinct coinbase scripts per fork so deterministic regtest mining
+          ;; produces genuinely different blocks (same spk => identical hashes).
+          (ng (%regtest-node-fixture "cand-g"))          ; fork G, fully stored
+          (g-blocks (loop repeat 3 for blk = (%dr-mine-on ng spk-g)
+                          do (%dr-connect ng blk) collect blk))
+          (nh (%regtest-node-fixture "cand-h"))          ; fork H, only top stored
+          (h-blocks (loop repeat 5 for blk = (%dr-mine-on nh spk-h)
+                          do (%dr-connect nh blk) collect blk))
+          (na (%regtest-node-fixture "cand-a"))
+          (csa (bitcoin-lisp::node-chain-state na))
+          (storea (bitcoin-lisp::node-block-store na))
+          (utxoa (bitcoin-lisp::node-utxo-set na))
+          (genesis-hash (bitcoin-lisp.storage:best-block-hash csa)))
+     (dotimes (i 2) (%dr-connect na (%dr-mine-on na spk-a)))   ; tip A2
+     (let* ((tip-work (bitcoin-lisp.storage:block-index-entry-chain-work
+                       (bitcoin-lisp.storage:get-block-at-height csa 2)))
+            (g-hash (bitcoin-lisp.serialization:block-header-hash
+                     (bitcoin-lisp.serialization:bitcoin-block-header (third g-blocks))))
+            (h-hash (bitcoin-lisp.serialization:block-header-hash
+                     (bitcoin-lisp.serialization:bitcoin-block-header (fifth h-blocks)))))
+       ;; G index: G2 entry work = tip-work, so activate-block recomputes
+       ;; G3's work = tip-work + one block > tip (case 2 fires). Store ALL G
+       ;; bodies on disk directly (no activation).
+       (let ((prev (bitcoin-lisp.storage:get-block-index-entry csa genesis-hash)))
+         (loop for blk in g-blocks for h from 1
+               for w in (list 1 tip-work (1+ tip-work))
+               do (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                         (e (bitcoin-lisp.storage:make-block-index-entry
+                             :hash (bitcoin-lisp.serialization:block-header-hash hdr)
+                             :height h :header hdr :prev-entry prev
+                             :chain-work w :status :header-valid)))
+                    (bitcoin-lisp.storage:add-block-index-entry csa e)
+                    (bitcoin-lisp.storage:store-block storea blk)
+                    (setf prev e))))
+       ;; H index: H5 work = tip+1000 (higher), but only H5's body on disk.
+       (let ((prev (bitcoin-lisp.storage:get-block-index-entry csa genesis-hash)))
+         (loop for blk in h-blocks for h from 1
+               for w in (list 1 2 3 4 (+ tip-work 1000))
+               do (let* ((hdr (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                         (e (bitcoin-lisp.storage:make-block-index-entry
+                             :hash (bitcoin-lisp.serialization:block-header-hash hdr)
+                             :height h :header hdr :prev-entry prev
+                             :chain-work w :status :header-valid)))
+                    (bitcoin-lisp.storage:add-block-index-entry csa e)
+                    (setf prev e))))
+       (bitcoin-lisp.storage:store-block storea (fifth h-blocks))
+       (let ((bitcoin-lisp.networking::*ibd-context* (bitcoin-lisp.networking::make-ibd)))
+         (let ((set (bitcoin-lisp.networking::ibd-context-reorg-candidates
+                     bitcoin-lisp.networking::*ibd-context*)))
+           ;; Both are candidates; H5 outranks G3 by work.
+           (setf (gethash g-hash set) t
+                 (gethash h-hash set) t))
+         ;; Retry must skip higher-work INCOMPLETE H5 and activate complete G3.
+         (is (eq t (bitcoin-lisp.networking::retry-best-reorg-candidate
+                    csa storea utxoa)))
+         (is (equalp g-hash (bitcoin-lisp.storage:best-block-hash csa)))
+         ;; H5 stays a candidate (still not completable); G3 consumed.
+         (is (null (gethash g-hash (bitcoin-lisp.networking::ibd-context-reorg-candidates
+                                    bitcoin-lisp.networking::*ibd-context*)))))))))
