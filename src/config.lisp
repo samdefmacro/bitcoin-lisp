@@ -1036,7 +1036,22 @@ start-node-from-args."
         (when (member :cjdns onlynets)
           (error "-onlynet=cjdns given without -cjdnsreachable"))
         (setf nets (remove :cjdns nets)))
-      (setf bitcoin-lisp.networking:*reachable-networks* nets))))
+      (setf bitcoin-lisp.networking:*reachable-networks* nets)
+      ;; PRIVACY: requesting DNS seeds entails clearnet. Resolving a seed
+      ;; hostname is a plaintext DNS query to the local resolver, and the
+      ;; addresses it returns are dialed directly over IPv4/IPv6 — so a
+      ;; Tor-only node (-onlynet=onion with -listenonion and no -proxy) would
+      ;; deanonymize itself on its very first start, defeating the point of
+      ;; -onlynet. Core soft-sets -dnsseed=0 when -onlynet excludes IPv4 and
+      ;; IPv6 (init.cpp:835-844) and aborts when -dnsseed=1 was given
+      ;; explicitly (init.cpp:1691-1693). Soft-set semantics matter: an
+      ;; explicit -dnsseed=0 must stay 0, and an explicit 1 is an error rather
+      ;; than a silent override.
+      (unless (or (member :ipv4 nets) (member :ipv6 nets))
+        (cond ((not (lk "dnsseed"))
+               (setf *dns-seed-enabled* nil))
+              (*dns-seed-enabled*
+               (error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")))))))
 
 (defun args->start-node-plist (args &optional conf-text)
   "Pure assembly of a start-node keyword plist from Bitcoin Core-style CLI ARGS
