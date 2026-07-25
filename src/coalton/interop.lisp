@@ -950,69 +950,100 @@ Used to get the redeem script from a P2SH scriptSig."
       (let ((len (length item)))
         (incf total (+ (bitcoin-lisp.serialization:compact-size-length len) len))))))
 
+(defun check-schnorr-signature (sig-bytes pubkey-bytes)
+  "Verify a BIP 340 Schnorr signature under the Tapscript sighash.
+   Mirrors GenericTransactionSignatureChecker::CheckSchnorrSignature
+   (interpreter.cpp:1716-1741). The caller guarantees a 32-byte x-only pubkey
+   and a non-empty signature — Core asserts the former and documents that empty
+   signatures never reach here. Returns (values status result)."
+  (let ((sig-len (length sig-bytes)))
+    ;; SCRIPT_ERR_SCHNORR_SIG_SIZE. Enforced ONLY here, which is why it applies
+    ;; only to 32-byte pubkeys — an upgradable pubkey type never inspects the
+    ;; signature at all.
+    (unless (or (= sig-len 64) (= sig-len 65))
+      (return-from check-schnorr-signature (values :invalid-sig nil)))
+
+    (let ((sighash-type (if (= sig-len 65) (aref sig-bytes 64) #x00))  ; SIGHASH_DEFAULT
+          (sig64 (if (= sig-len 64) sig-bytes (subseq sig-bytes 0 64))))
+
+      ;; A 65-byte sig's explicit sighash byte must not be SIGHASH_DEFAULT
+      ;; (0x00) — that form must use the 64-byte encoding.
+      (when (and (= sig-len 65) (zerop sighash-type))
+        (return-from check-schnorr-signature (values :bad-sighash-type nil)))
+      ;; hash_type set check, inside SignatureHashSchnorr (interpreter.cpp:1515);
+      ;; failure there is SCRIPT_ERR_SCHNORR_SIG_HASHTYPE.
+      (unless (valid-taproot-sighash-type-p sighash-type)
+        (return-from check-schnorr-signature (values :bad-sighash-type nil)))
+
+      ;; Compute BIP 341 sighash with tapleaf extension. NIL means
+      ;; SignatureHashSchnorr returned false (SIGHASH_SINGLE with no output at
+      ;; this input index) — a hard failure BEFORE any verification, never a
+      ;; sighash over a truncated preimage.
+      (let ((sighash (compute-bip341-sighash *tapscript-amount* sighash-type
+                                             *tapscript-leaf-hash* 0)))
+        (when (null sighash)
+          (return-from check-schnorr-signature (values :bad-sighash-type nil)))
+        (when *debug-bip341-sighash*
+          (bitcoin-lisp:log-warn "TAPSCRIPT-CHECKSIG: sighash=~A sig=~A pubkey=~A current-tx-bound=~A spent-utxos-bound=~A"
+                                 (bitcoin-lisp.crypto:bytes-to-hex sighash)
+                                 (bitcoin-lisp.crypto:bytes-to-hex sig64)
+                                 (bitcoin-lisp.crypto:bytes-to-hex pubkey-bytes)
+                                 (if *current-tx* "yes" "NO")
+                                 (if *current-spent-utxos* "yes" "NO")))
+        (if (cached-verify-schnorr sighash sig64 pubkey-bytes)
+            (values :ok t)
+            (values :invalid-sig nil))))))
+
 (defun verify-tapscript-signature (sig-bytes pubkey-bytes)
   "Verify a Tapscript signature (BIP 342 rules).
-   SIG-BYTES: signature (64 bytes for default sighash, 65 bytes with explicit type)
-   PUBKEY-BYTES: 32-byte x-only public key
+   SIG-BYTES: signature (empty, or 64/65 bytes for a 32-byte pubkey)
+   PUBKEY-BYTES: 32-byte x-only public key, or an upgradable pubkey type
    Returns (values status result) where:
-     status: :ok, :empty-sig, :invalid-sig, :invalid-pubkey, :bad-sighash-type
-     result: T if valid, NIL otherwise"
-  ;; Empty signature is treated specially (for OP_CHECKSIGADD)
-  (when (zerop (length sig-bytes))
-    (return-from verify-tapscript-signature (values :empty-sig nil)))
+     status: :ok, :empty-sig, :invalid-sig, :empty-pubkey, :bad-sighash-type,
+             :upgradable-pubkey, :discourage-upgradable-pubkeytype,
+             :validation-weight-exceeded
+     result: T if the signature check succeeded, NIL otherwise
 
-  ;; Signature must be 64 or 65 bytes
-  (let ((sig-len (length sig-bytes)))
-    (unless (or (= sig-len 64) (= sig-len 65))
-      (return-from verify-tapscript-signature (values :invalid-sig nil))))
+   The ordering below is CONSENSUS CRITICAL and mirrors EvalChecksigTapscript
+   (interpreter.cpp:346-386) statement for statement. Per Core's own comment:
+   upgradable pubkey versions precede other rules; execution fails on an empty
+   signature with an invalid pubkey; execution fails on a non-empty invalid
+   signature. In particular the 64/65 size check lives inside
+   CHECK-SCHNORR-SIGNATURE and so is unreachable for non-32-byte pubkeys, and
+   an empty pubkey fails regardless of the signature."
+  ;; success = !sig.empty()
+  (let ((success (plusp (length sig-bytes))))
 
-  ;; BIP 342: Decrement validation weight for non-empty signatures.
-  ;; This applies to all pubkey types (including upgradable).
-  (when *tapscript-validation-weight-left*
-    (decf *tapscript-validation-weight-left* +validation-weight-per-sigop-passed+)
-    (when (< *tapscript-validation-weight-left* 0)
-      (return-from verify-tapscript-signature (values :validation-weight-exceeded nil))))
+    ;; BIP 342 sigops/witness-size ratio test. Charged for every non-empty
+    ;; signature, including one passed against an upgradable pubkey type.
+    (when (and success *tapscript-validation-weight-left*)
+      (decf *tapscript-validation-weight-left* +validation-weight-per-sigop-passed+)
+      (when (< *tapscript-validation-weight-left* 0)
+        (return-from verify-tapscript-signature (values :validation-weight-exceeded nil))))
 
-  ;; Empty pubkey is always an error (BIP 342)
-  (when (zerop (length pubkey-bytes))
-    (return-from verify-tapscript-signature (values :empty-pubkey nil)))
+    (cond
+      ;; Empty pubkey is unconditionally SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY —
+      ;; the signature is never looked at, not even to notice it is empty.
+      ((zerop (length pubkey-bytes))
+       (values :empty-pubkey nil))
 
-  ;; Non-32-byte, non-empty pubkey = upgradable type (BIP 342 forward compatibility)
-  ;; These are treated as successful signature checks (anyone-can-spend for that key type)
-  ;; but still cost validation weight. Only rejected if DISCOURAGE flag is set.
-  (unless (= (length pubkey-bytes) 32)
-    (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
-        (return-from verify-tapscript-signature (values :discourage-upgradable-pubkeytype nil))
-        (return-from verify-tapscript-signature (values :upgradable-pubkey t))))
+      ;; 32-byte x-only pubkey: the only branch that inspects the signature.
+      ((= (length pubkey-bytes) 32)
+       (if success
+           (check-schnorr-signature sig-bytes pubkey-bytes)
+           (values :empty-sig nil)))
 
-  (let* ((sig-len (length sig-bytes))
-         (sighash-type (if (= sig-len 65)
-                           (aref sig-bytes 64)
-                           #x00))  ; SIGHASH_DEFAULT
-         (sig64 (if (= sig-len 64) sig-bytes (subseq sig-bytes 0 64))))
+      ;; Upgradable (non-empty, non-32-byte) pubkey type. New pubkey-version
+      ;; softforks are defined before this branch; this branch must not inspect
+      ;; the signature and must not modify SUCCESS.
+      ((flag-enabled-p "DISCOURAGE_UPGRADABLE_PUBKEYTYPE")
+       (values :discourage-upgradable-pubkeytype nil))
 
-    ;; A 65-byte sig's explicit sighash byte must not be SIGHASH_DEFAULT
-    ;; (0x00); and the byte must be in the valid Schnorr set. Mirrors
-    ;; CheckSchnorrSignature (interpreter.cpp:1731-1734).
-    (when (and (= sig-len 65) (zerop (aref sig-bytes 64)))
-      (return-from verify-tapscript-signature (values :bad-sighash-type nil)))
-    (unless (valid-taproot-sighash-type-p sighash-type)
-      (return-from verify-tapscript-signature (values :bad-sighash-type nil)))
+      ;; Anyone-can-spend for that key type, but only when SUCCESS was already
+      ;; true; an empty signature still yields a failed (not erroring) check.
+      (success (values :upgradable-pubkey t))
 
-    ;; Compute BIP 341 sighash with tapleaf extension
-    (let ((sighash (compute-bip341-sighash *tapscript-amount* sighash-type
-                                            *tapscript-leaf-hash* 0)))
-      (when *debug-bip341-sighash*
-        (bitcoin-lisp:log-warn "TAPSCRIPT-CHECKSIG: sighash=~A sig=~A pubkey=~A current-tx-bound=~A spent-utxos-bound=~A"
-                               (bitcoin-lisp.crypto:bytes-to-hex sighash)
-                               (bitcoin-lisp.crypto:bytes-to-hex sig64)
-                               (bitcoin-lisp.crypto:bytes-to-hex pubkey-bytes)
-                               (if *current-tx* "yes" "NO")
-                               (if *current-spent-utxos* "yes" "NO")))
-      ;; Verify Schnorr signature
-      (if (cached-verify-schnorr sighash sig64 pubkey-bytes)
-          (values :ok t)
-          (values :invalid-sig nil)))))
+      (t (values :empty-sig nil)))))
 
 (defun increment-script-number (bytes)
   "Increment a Bitcoin Script number by 1.
@@ -2902,8 +2933,12 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
       (unless (valid-taproot-sighash-type-p sighash-type)
         (return-from validate-taproot-key-path (values nil :sig-hashtype)))
 
-      ;; Compute BIP 341 sighash
+      ;; Compute BIP 341 sighash. NIL means SignatureHashSchnorr returned false
+      ;; (SIGHASH_SINGLE with no output at this input index) — hard failure
+      ;; before verification, same as an out-of-set hash_type.
       (let ((sighash (compute-bip341-sighash amount sighash-type nil nil)))
+        (when (null sighash)
+          (return-from validate-taproot-key-path (values nil :sig-hashtype)))
         ;; Verify Schnorr signature
         (if (cached-verify-schnorr sighash sig64 output-pubkey32)
             (values t nil)
@@ -3006,7 +3041,9 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
 (defun compute-bip341-sighash (amount sighash-type &optional tapleaf-hash key-version)
   "Compute BIP 341 signature hash for Taproot.
    Dispatches to -real when validating a real transaction (*current-tx* bound),
-   or -test when running script_tests.json fixtures."
+   or -test when running script_tests.json fixtures.
+   Returns NIL when this input has no defined sighash (SIGHASH_SINGLE past the
+   end of the output list); callers MUST hard-fail rather than verify."
   (if (and *current-tx* *current-spent-utxos*)
       (compute-bip341-sighash-real sighash-type tapleaf-hash key-version)
       (compute-bip341-sighash-test amount sighash-type tapleaf-hash key-version)))
@@ -3015,7 +3052,21 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
   "Compute BIP 341 sighash from real transaction data.
    Uses *current-tx*, *current-input-index*, *current-spent-utxos*.
    Implements BIP 341 SigMsg per Annex G; tapleaf-hash + key-version trigger
-   the script-path tail. ANYONECANPAY and SIGHASH_NONE/SINGLE per spec."
+   the script-path tail. ANYONECANPAY and SIGHASH_NONE/SINGLE per spec.
+
+   Returns NIL when no sighash is defined for this input, which callers MUST
+   treat as a hard script failure (SCRIPT_ERR_SCHNORR_SIG_HASHTYPE)."
+  ;; CONSENSUS: SIGHASH_SINGLE with no output at this input index has no
+  ;; defined sighash. SignatureHashSchnorr returns false (interpreter.cpp:1550)
+  ;; and the spend is rejected BEFORE any signature verification. Computing a
+  ;; preimage with the sha_single_output field simply omitted would produce a
+  ;; well-formed hash that an owner-crafted signature verifies against — we
+  ;; would accept a spend Core rejects. NB the legacy (uint256(1)) and BIP 143
+  ;; (zero32) out-of-range quirks are different rules and are handled elsewhere.
+  (when (and (= (logand sighash-type #x1f) 3)
+             (>= *current-input-index*
+                 (length (bitcoin-lisp.serialization:transaction-outputs *current-tx*))))
+    (return-from compute-bip341-sighash-real nil))
   (let* ((tx *current-tx*)
          (input-index *current-input-index*)
          (inputs (bitcoin-lisp.serialization:transaction-inputs tx))
@@ -3042,8 +3093,11 @@ DEFAULT) is NOT valid — DEFAULT cannot carry the flag."
          (hash-outputs
            (when (or (= base-type 0) (= base-type 1))  ; SIGHASH_DEFAULT or SIGHASH_ALL
              (precomputed-sighash-data-sha-outputs precomp)))
+         ;; In-range is guaranteed by the SIGHASH_SINGLE guard above, so this
+         ;; field is present whenever the sighash type calls for it — there is
+         ;; no path that silently omits it from the preimage.
          (single-output-hash
-           (when (and (= base-type 3) (< input-index (length outputs)))
+           (when (= base-type 3)
              (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
                (bb-write-all-outputs bb (list (aref outputs input-index)))
                (bitcoin-lisp.crypto:sha256
