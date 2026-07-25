@@ -1273,3 +1273,186 @@ the original stays in the mempool, and walletprocesspsbt completes the PSBT."
       (let ((processed (bitcoin-lisp.rpc::rpc-walletprocesspsbt node (list b64))))
         (is (eq t (%aval "complete" processed)))
         (is (stringp (%aval "hex" processed)))))))
+
+;;;; ============================================================
+;;;; G7-04: load_on_startup persistence (Core settings.json)
+;;;;
+;;;; The bug: the node only ever created the wallet manager, and
+;;;; load_on_startup was accepted and discarded — so every restart silently
+;;;; dropped all wallets. Under a respawn supervisor that means balances
+;;;; vanish and rebroadcast stops unattended; it already stranded a funded
+;;;; testnet4 deposit.
+;;;; ============================================================
+
+(defun %wallet-settings-dir (node)
+  (bitcoin-lisp.rpc::wallet-manager-data-directory (%node-manager node)))
+
+(defun %wallet-settings-path (node)
+  (bitcoin-lisp.rpc::settings-json-path (%wallet-settings-dir node)))
+
+(defun %wallet-settings-raw (node)
+  "Parsed settings.json, or NIL when the file does not exist."
+  (let ((path (%wallet-settings-path node)))
+    (when (probe-file path)
+      (with-open-file (s path :direction :input :external-format :utf-8)
+        (yason:parse s)))))
+
+(defun %startup-names (node)
+  (bitcoin-lisp.rpc::wallet-startup-names (%wallet-settings-dir node)))
+
+(defun %write-raw-settings (node text)
+  (let ((path (%wallet-settings-path node)))
+    (ensure-directories-exist path)
+    (with-open-file (s path :direction :output :external-format :utf-8
+                           :if-exists :supersede :if-does-not-exist :create)
+      (write-string text s))))
+
+(defun %restart-wallet-manager (node)
+  "Simulate a node restart: unload every wallet and rebuild the manager over
+the same datadir, leaving settings.json in place."
+  (let ((dir (%wallet-settings-dir node)))
+    (bitcoin-lisp.rpc:close-wallet-manager (%node-manager node))
+    (setf (bitcoin-lisp::node-wallet-manager node)
+          (bitcoin-lisp.rpc::make-wallet-manager
+           :data-directory dir :network :testnet4 :keypool-size 5))))
+
+(defun %loaded-wallet-names (node)
+  (coerce (bitcoin-lisp.rpc::rpc-listwallets node nil) 'list))
+
+(test g7-04-load-on-startup-is-tristate
+  "load_on_startup is Core's std::optional<bool> (wallet.cpp:124-135):
+omitted/null leaves the setting untouched, true records the wallet, false
+removes it. Only an explicit value writes anything."
+  (with-wallet-test-node (node)
+    ;; Omitted: no setting recorded, and no settings.json written at all.
+    (bitcoin-lisp.rpc::rpc-createwallet node '("plain"))
+    (is (null (%startup-names node)))
+    (is (null (%wallet-settings-raw node))
+        "a no-op update must not create settings.json")
+    ;; Explicit true records it.
+    (bitcoin-lisp.rpc::rpc-createwallet node (list "auto" nil nil nil nil nil t))
+    (is (equal '("auto") (%startup-names node)))
+    ;; Explicit null on an already-recorded wallet leaves it recorded.
+    (bitcoin-lisp.rpc::rpc-unloadwallet node '("auto"))
+    (is (equal '("auto") (%startup-names node)))
+    (bitcoin-lisp.rpc::rpc-loadwallet node '("auto"))
+    (is (equal '("auto") (%startup-names node)))
+    ;; Explicit false removes it.
+    (bitcoin-lisp.rpc::rpc-unloadwallet
+     node (list "auto" bitcoin-lisp.rpc::+json-false+))
+    (is (null (%startup-names node)))
+    ;; loadwallet with true records a wallet created without it.
+    (bitcoin-lisp.rpc::rpc-unloadwallet node '("plain"))
+    (bitcoin-lisp.rpc::rpc-loadwallet node '("plain" t))
+    (is (equal '("plain") (%startup-names node)))))
+
+(test g7-04-settings-store-semantics
+  "Add/remove mirror Core AddWalletSetting/RemoveWalletSetting: duplicate adds
+and absent removes are SKIP_WRITE no-ops that still report success, and file
+order is preserved."
+  (with-wallet-test-node (node)
+    (let ((dir (%wallet-settings-dir node)))
+      (is (bitcoin-lisp.rpc::update-wallet-setting dir "a" :true))
+      (is (bitcoin-lisp.rpc::update-wallet-setting dir "a" :true))
+      (is (equal '("a") (bitcoin-lisp.rpc::wallet-startup-names dir))
+          "adding twice must not duplicate the entry")
+      (bitcoin-lisp.rpc::update-wallet-setting dir "b" :true)
+      (bitcoin-lisp.rpc::update-wallet-setting dir "c" :true)
+      (is (equal '("a" "b" "c") (bitcoin-lisp.rpc::wallet-startup-names dir)))
+      (is (bitcoin-lisp.rpc::update-wallet-setting dir "nosuch" :false)
+          "removing an absent name is a successful no-op")
+      (is (equal '("a" "b" "c") (bitcoin-lisp.rpc::wallet-startup-names dir)))
+      (bitcoin-lisp.rpc::update-wallet-setting dir "b" :false)
+      (is (equal '("a" "c") (bitcoin-lisp.rpc::wallet-startup-names dir))
+          "removal from the middle keeps the rest in order")
+      ;; NIL action never touches the file.
+      (is (bitcoin-lisp.rpc::update-wallet-setting dir "zzz" nil))
+      (is (equal '("a" "c") (bitcoin-lisp.rpc::wallet-startup-names dir))))))
+
+(test g7-04-settings-preserves-other-keys
+  "settings.json is node-wide in Core, so a wallet update must rewrite only
+the \"wallet\" key and leave every other setting intact. The list is written
+as a JSON array, not an object."
+  (with-wallet-test-node (node)
+    (%write-raw-settings node "{\"prune\":1234,\"other\":[\"x\",\"y\"]}")
+    (is (bitcoin-lisp.rpc::update-wallet-setting (%wallet-settings-dir node) "w" :true))
+    (let ((raw (%wallet-settings-raw node)))
+      (is (eql 1234 (gethash "prune" raw)))
+      (is (equal '("x" "y") (gethash "other" raw)))
+      (is (equal '("w") (gethash "wallet" raw))
+          "the wallet list must round-trip as a JSON array"))))
+
+(test g7-04-non-string-entries-ignored
+  "Core filters the settings list with isStr(); a malformed entry must be
+skipped rather than crashing startup."
+  (with-wallet-test-node (node)
+    (%write-raw-settings node "{\"wallet\":[\"ok\",42,null,[\"nested\"],\"fine\"]}")
+    (is (equal '("ok" "fine") (%startup-names node)))
+    ;; A non-array value contributes nothing but is still replaceable.
+    (%write-raw-settings node "{\"wallet\":\"notalist\"}")
+    (is (null (%startup-names node)))
+    ;; Duplicates in a hand-edited file collapse to the first occurrence
+    ;; (Core's wallet_paths set), so startup never double-loads a wallet.
+    (%write-raw-settings node "{\"wallet\":[\"a\",\"b\",\"a\"]}")
+    (is (equal '("a" "b") (%startup-names node)))))
+
+(test g7-04-corrupt-settings-not-clobbered
+  "An unparseable settings.json must disable auto-load AND refuse updates.
+Treating it as empty would rewrite the file and destroy a wallet list the
+operator can still repair by hand."
+  (with-wallet-test-node (node)
+    (let ((garbage "{ this is not json"))
+      (%write-raw-settings node garbage)
+      (is (null (%startup-names node)))
+      (is (null (bitcoin-lisp.rpc::update-wallet-setting
+                 (%wallet-settings-dir node) "w" :true))
+          "an update against corrupt settings must report failure")
+      (is (string= garbage
+                   (with-open-file (s (%wallet-settings-path node)) (read-line s)))
+          "the corrupt file must be left exactly as found")
+      ;; A NIL action has nothing to write, so it still succeeds.
+      (is (bitcoin-lisp.rpc::update-wallet-setting
+           (%wallet-settings-dir node) "w" nil)))))
+
+(test g7-04-failed-update-returns-core-warning
+  "Core surfaces a warning rather than failing the RPC when the setting cannot
+be persisted (wallet.cpp:131-133)."
+  (with-wallet-test-node (node)
+    (%write-raw-settings node "{ corrupt")
+    (let* ((result (bitcoin-lisp.rpc::rpc-createwallet
+                    node (list "w" nil nil nil nil nil t)))
+           (warnings (%aval "warnings" result)))
+      (is (string= "w" (%aval "name" result)) "the wallet is still created")
+      (is (member "Wallet load on startup setting could not be updated, so wallet may not be loaded next node startup."
+                  warnings :test #'string=)))))
+
+(test g7-04-wallets-auto-load-at-startup
+  "THE BUG: a restart dropped every wallet. A wallet recorded with
+load_on_startup must come back by itself; one that was not recorded must not."
+  (with-wallet-test-node (node)
+    (bitcoin-lisp.rpc::rpc-createwallet node (list "keeper" nil nil nil nil nil t))
+    (bitcoin-lisp.rpc::rpc-createwallet node '("transient"))
+    (is (equal '("keeper" "transient") (%loaded-wallet-names node)))
+    (%restart-wallet-manager node)
+    (is (null (%loaded-wallet-names node))
+        "the restart must start with nothing loaded")
+    (bitcoin-lisp.rpc:load-wallets-on-startup node)
+    (is (equal '("keeper") (%loaded-wallet-names node))
+        "only the wallet recorded for startup comes back")))
+
+(test g7-04-startup-skips-unloadable-wallet
+  "DELIBERATE divergence from Core, which aborts startup with an init error
+when a listed wallet fails to load. The node runs under a respawn supervisor,
+so aborting would turn one bad wallet into an endless restart loop with no
+node at all. A failure is logged and the remaining wallets still load — and
+the broken entry is listed FIRST here, so this fails if the loop aborts."
+  (with-wallet-test-node (node)
+    (bitcoin-lisp.rpc::rpc-createwallet node '("good"))
+    (let ((dir (%wallet-settings-dir node)))
+      (bitcoin-lisp.rpc::update-wallet-setting dir "ghost" :true)
+      (bitcoin-lisp.rpc::update-wallet-setting dir "good" :true)
+      (is (equal '("ghost" "good") (bitcoin-lisp.rpc::wallet-startup-names dir))))
+    (%restart-wallet-manager node)
+    (bitcoin-lisp.rpc:load-wallets-on-startup node)
+    (is (equal '("good") (%loaded-wallet-names node))
+        "a wallet listed before a broken one must still load")))

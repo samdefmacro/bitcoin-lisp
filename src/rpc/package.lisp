@@ -25,6 +25,7 @@
 
    ;; Wallet manager (wallet P1; owned by the node)
    #:init-wallet-manager
+   #:load-wallets-on-startup
    #:close-wallet-manager
 
    ;; Wallet chain-tracking fan-out (wallet P2; called by node.lisp's
