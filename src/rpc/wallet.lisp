@@ -933,11 +933,132 @@ shutdown path — which flags the scan to abort and proceeds."
             when (wallet-db-exists-p sub)
               collect name))))
 
+;;; --- Persistent settings (Core settings.json) ---
+;;;
+;;; Core keeps a read-write settings file in the network datadir and records
+;;; the auto-load wallet list under its "wallet" key (wallet.cpp
+;;; AddWalletSetting/RemoveWalletSetting:96-122, load.cpp LoadWallets:118).
+;;; The file is node-wide in Core and holds other keys too, so every write
+;;; here reads the whole object and replaces only "wallet" — unknown keys are
+;;; preserved verbatim.
+
+(defun settings-json-path (data-directory)
+  "Path of the read-write settings file (Core GetDataDirNet()/settings.json)."
+  (merge-pathnames "settings.json"
+                   (uiop:ensure-directory-pathname data-directory)))
+
+(defun %settings-wallet-list (table)
+  "The \"wallet\" key of a parsed settings object as a list of names. A
+missing, non-array, or non-string-element value contributes nothing, matching
+Core's isStr() filter."
+  (let ((value (gethash "wallet" table)))
+    (cond ((stringp value) '())          ; a bare string is not the array Core writes
+          ((listp value) (remove-if-not #'stringp value))
+          ((vectorp value) (remove-if-not #'stringp (coerce value 'list)))
+          (t '()))))
+
+(defun %read-settings (data-directory)
+  "Parse settings.json. Returns (values TABLE OK-P): the top-level object as a
+hash-table and T, or (values NIL NIL) if the file exists but cannot be read as
+a JSON object. A missing file is an empty settings set, not an error.
+
+A corrupt file is deliberately NOT treated as empty: reporting it as empty
+would make the next update rewrite the file and silently discard a wallet list
+the operator can still repair by hand."
+  (let ((path (settings-json-path data-directory)))
+    (handler-case
+        (if (probe-file path)
+            (with-open-file (s path :direction :input :external-format :utf-8)
+              (let ((parsed (yason:parse s)))
+                (if (hash-table-p parsed)
+                    (values parsed t)
+                    (values nil nil))))
+            (values (make-hash-table :test 'equal) t))
+      (error (e)
+        (bitcoin-lisp:log-warn "settings.json at ~A is unreadable (~A); wallet auto-load is disabled and the load_on_startup setting cannot be updated until it is repaired or removed"
+                               path e)
+        (values nil nil)))))
+
+(defun %write-settings (data-directory table)
+  "Replace settings.json with TABLE atomically: write a temp file, fsync it,
+rename over the destination, then fsync the directory. Without the fsyncs a
+crash can leave the renamed file empty or revert the rename entirely
+(see storage:fsync-file / fsync-directory). Returns T on success."
+  (let* ((path (settings-json-path data-directory))
+         (tmp (merge-pathnames "settings.json.tmp"
+                               (uiop:ensure-directory-pathname data-directory))))
+    (handler-case
+        (progn
+          (ensure-directories-exist path)
+          (with-open-file (s tmp :direction :output :external-format :utf-8
+                                 :if-exists :supersede :if-does-not-exist :create)
+            (yason:encode table s)
+            (terpri s))
+          (bitcoin-lisp.storage::fsync-file tmp)
+          (rename-file tmp path)
+          (bitcoin-lisp.storage::fsync-directory path)
+          t)
+      (error (e)
+        (bitcoin-lisp:log-warn "could not write ~A: ~A" path e)
+        (ignore-errors (delete-file tmp))
+        nil))))
+
+(defun wallet-startup-names (data-directory)
+  "Wallet names recorded for auto-load, in file order (Core
+chain.getSettingsList(\"wallet\")). NIL when settings.json is unreadable.
+Duplicates are dropped keeping the first occurrence, like Core's wallet_paths
+set — a hand-edited file would otherwise make the second load fail with a
+confusing \"already loaded\"."
+  (multiple-value-bind (table ok) (%read-settings data-directory)
+    (when ok
+      (remove-duplicates (%settings-wallet-list table)
+                         :test #'string= :from-end t))))
+
+(defun update-wallet-setting (data-directory name action)
+  "Add or remove NAME in the settings \"wallet\" list (Core
+UpdateWalletSetting, wallet.cpp:124). ACTION mirrors Core's
+std::optional<bool> load_on_startup: NIL leaves the setting untouched, :TRUE
+adds, :FALSE removes. Returns T when the setting holds the requested state
+afterwards — including Core's SKIP_WRITE no-ops — and NIL when it could not be
+updated, which the caller surfaces as a warning rather than failing the RPC."
+  (if (null action)
+      t
+      (multiple-value-bind (table ok) (%read-settings data-directory)
+        (when ok
+          (let* ((current (%settings-wallet-list table))
+                 (new (ecase action
+                        (:true (if (member name current :test #'string=)
+                                   current
+                                   (append current (list name))))
+                        (:false (remove name current :test #'string=)))))
+            (if (equal new current)
+                t                        ; already in the requested state
+                (progn
+                  ;; Store a vector: yason encodes it unambiguously as a JSON
+                  ;; array, whereas a list of strings is shape-sniffed.
+                  (setf (gethash "wallet" table) (coerce new 'vector))
+                  (%write-settings data-directory table))))))))
+
+(defun %load-on-startup-action (value)
+  "Read a positional load_on_startup parameter as Core's
+std::optional<bool>: NIL for null/omitted, :FALSE for the explicit-false
+sentinel, :TRUE otherwise."
+  (cond ((null value) nil)
+        ((eq value +json-false+) :false)
+        (t :true)))
+
+(defun %load-on-startup-warning (action)
+  "Core's warning when the setting could not be persisted (wallet.cpp:131-133)."
+  (if (eq action :false)
+      "Wallet load on startup setting could not be updated, so wallet may still be loaded next node startup."
+      "Wallet load on startup setting could not be updated, so wallet may not be loaded next node startup."))
+
 ;;; --- Manager lifecycle (called from node.lisp) ---
 
 (defun init-wallet-manager (data-directory network)
-  "Create the node's wallet manager. Wallets are not auto-loaded: there is no
-persistent load_on_startup settings store yet — use loadwallet."
+  "Create the node's wallet manager. Wallets recorded for auto-load in
+settings.json are loaded separately by LOAD-WALLETS-ON-STARTUP once the
+chainstate is up."
   (make-wallet-manager :data-directory data-directory :network network))
 
 (defun close-wallet-manager (manager)
@@ -1066,58 +1187,105 @@ passphrases are rejected until encryption lands (wallet P6)."
                                    :avoid-reuse (%positional-bool
                                                  (nth 4 params))
                                    :last-block-hash tip-hash
-                                   :last-block-height tip-height)))
-        (%push-warnings (nreverse warnings)
-                        `(("name" . ,(wallet-name wallet))))))))
+                                   :last-block-height tip-height))
+            (action (%load-on-startup-action (nth 6 params))))
+        (setf warnings (nreverse warnings))
+        (unless (update-wallet-setting (wallet-manager-data-directory manager)
+                                       (wallet-name wallet) action)
+          (setf warnings (append warnings (list (%load-on-startup-warning action)))))
+        (%push-warnings warnings `(("name" . ,(wallet-name wallet))))))))
+
+(defun %load-and-attach-wallet (node manager name)
+  "Load NAME and bring it fully online: catch up from the stored best-block
+locator, fold in the current mempool, and resubmit its own unconfirmed txs.
+Returns (values wallet warnings). Signals an RPC-ERROR after unloading the
+partially-loaded wallet if the catch-up fails, like Core's failed AttachChain.
+
+Shared by loadwallet and the startup auto-load so this funds-critical
+sequence has exactly one definition."
+  ;; Record load under the node-lock (outermost; manager/wallet locks nest
+  ;; inside): tx-state resolution reads the chain, and no block may connect
+  ;; between the load and the wallet becoming hook-visible.
+  (multiple-value-bind (wallet warnings)
+      (with-node-lock (node)
+        (load-wallet manager name
+                     :chain-state (bitcoin-lisp::node-current-chainstate node)))
+    ;; Catch up from the stored locator OUTSIDE the node-lock hold — the
+    ;; scan takes it per segment; blocks connecting meanwhile reach the
+    ;; wallet through the hooks (Core registers notifications pre-rescan).
+    (let ((error-message (wallet-attach-chain node wallet)))
+      (when error-message
+        (ignore-errors (unload-wallet manager wallet :force t))
+        (error 'rpc-error :code +rpc-wallet-error+ :message error-message)))
+    ;; Fold the current mempool in (Core LoadWallet -> postInitProcess ->
+    ;; requestMempoolTransactions); the attach-chain scan only does this
+    ;; when the wallet was behind the tip.
+    (with-node-lock (node)
+      (let ((mempool (bitcoin-lisp::node-mempool node)))
+        (when mempool
+          (bitcoin-lisp.mempool:mempool-for-each
+           mempool
+           (lambda (txid entry)
+             (declare (ignore txid))
+             (wallet-transaction-added-to-mempool
+              wallet mempool
+              (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
+    ;; Core postInitProcess: push the wallet's own unconfirmed txs back
+    ;; into OUR mempool without relaying them (wallet.cpp:3305). Takes
+    ;; its own locks — must run outside the node-lock hold above.
+    (wallet-post-load-resubmit node wallet)
+    (values wallet warnings)))
+
+(defun load-wallets-on-startup (node)
+  "Load every wallet recorded for auto-load in settings.json (Core LoadWallets,
+load.cpp:118-160). Called from start-node once the chainstate and mempool are
+up, so each wallet catches up and folds in the mempool exactly as loadwallet
+does.
+
+DELIBERATE DIVERGENCE from Core: Core aborts startup with an init error when a
+listed wallet fails to load. We log it and skip to the next one. The node runs
+under a respawn supervisor, so aborting would turn one corrupt wallet into an
+endless restart loop with no node at all — strictly worse than a running node
+whose wallet is missing and loudly logged."
+  (let ((manager (bitcoin-lisp::node-wallet-manager node)))
+    (when manager
+      (let ((names (wallet-startup-names (wallet-manager-data-directory manager))))
+        (when names
+          (bitcoin-lisp:log-info "Loading ~D wallet~:P recorded for startup: ~{~S~^, ~}"
+                                 (length names) names))
+        (dolist (name names)
+          (handler-case
+              (progn (%load-and-attach-wallet node manager name)
+                     (bitcoin-lisp:log-info "Loaded wallet ~S" name))
+            (error (e)
+              (bitcoin-lisp:log-warn "Could not load wallet ~S at startup, skipping it: ~A"
+                                     name e))))))))
 
 (defun rpc-loadwallet (node params)
   "Load a wallet from the wallet directory (Bitcoin Core loadwallet).
-PARAMS: (filename load_on_startup); load_on_startup is accepted but has no
-persistent settings store yet. After the records load, the wallet is caught
-up from its stored best-block locator (Core AttachChain: fork lookup +
+PARAMS: (filename load_on_startup). After the records load, the wallet is
+caught up from its stored best-block locator (Core AttachChain: fork lookup +
 rescan to the tip); a failed catch-up unloads the wallet and errors, like
-Core's failed-AttachChain load."
+Core's failed-AttachChain load. load_on_startup records the wallet in
+settings.json so the next node start loads it automatically."
   (let ((manager (node-wallet-manager-checked node))
-        (name (first params)))
+        (name (first params))
+        (action (%load-on-startup-action (nth 1 params))))
     (unless (stringp name)
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "filename must be a string"))
-    ;; Record load under the node-lock (outermost; manager/wallet locks nest
-    ;; inside): tx-state resolution reads the chain, and no block may connect
-    ;; between the load and the wallet becoming hook-visible.
-    (multiple-value-bind (wallet warnings)
-        (with-node-lock (node)
-          (load-wallet manager name
-                       :chain-state (bitcoin-lisp::node-current-chainstate node)))
-      ;; Catch up from the stored locator OUTSIDE the node-lock hold — the
-      ;; scan takes it per segment; blocks connecting meanwhile reach the
-      ;; wallet through the hooks (Core registers notifications pre-rescan).
-      (let ((error-message (wallet-attach-chain node wallet)))
-        (when error-message
-          (ignore-errors (unload-wallet manager wallet :force t))
-          (error 'rpc-error :code +rpc-wallet-error+ :message error-message)))
-      ;; Fold the current mempool in (Core LoadWallet -> postInitProcess ->
-      ;; requestMempoolTransactions); the attach-chain scan only does this
-      ;; when the wallet was behind the tip.
-      (with-node-lock (node)
-        (let ((mempool (bitcoin-lisp::node-mempool node)))
-          (when mempool
-            (bitcoin-lisp.mempool:mempool-for-each
-             mempool
-             (lambda (txid entry)
-               (declare (ignore txid))
-               (wallet-transaction-added-to-mempool
-                wallet mempool
-                (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))))
-      ;; Core postInitProcess: push the wallet's own unconfirmed txs back
-      ;; into OUR mempool without relaying them (wallet.cpp:3305). Takes
-      ;; its own locks — must run outside the node-lock hold above.
-      (wallet-post-load-resubmit node wallet)
+    (multiple-value-bind (wallet warnings) (%load-and-attach-wallet node manager name)
+      ;; Core updates the setting only after the load succeeds (wallet.cpp:183).
+      (unless (update-wallet-setting (wallet-manager-data-directory manager)
+                                     (wallet-name wallet) action)
+        (setf warnings (append warnings (list (%load-on-startup-warning action)))))
       (%push-warnings warnings `(("name" . ,(wallet-name wallet)))))))
 
 (defun rpc-unloadwallet (node params)
   "Unload the wallet named by the endpoint or the wallet_name argument
-(Bitcoin Core unloadwallet); both given must match."
+(Bitcoin Core unloadwallet); both given must match. PARAMS:
+ (wallet_name load_on_startup) — load_on_startup false removes the wallet from
+settings.json so the next node start no longer loads it."
   (let* ((manager (node-wallet-manager-checked node))
          (arg (first params))
          (name (cond ((and *rpc-wallet-name* arg)
@@ -1135,7 +1303,13 @@ Core's failed-AttachChain load."
         (error 'rpc-error :code +rpc-wallet-not-found+
                           :message "Requested wallet does not exist or is not loaded"))
       (unload-wallet manager wallet)
-      (make-hash-table :test 'equal))))
+      (let ((action (%load-on-startup-action (nth 1 params))))
+        ;; Core returns {} here, or {"warnings":[...]} if the setting could not
+        ;; be persisted. An EMPTY object must be a hash-table (a NIL alist
+        ;; would encode as null); a populated one is an alist.
+        (if (update-wallet-setting (wallet-manager-data-directory manager) name action)
+            (make-hash-table :test 'equal)
+            `(("warnings" . ,(list (%load-on-startup-warning action)))))))))
 
 (defun rpc-listwallets (node params)
   "Names of the currently loaded wallets, in load order (Bitcoin Core
