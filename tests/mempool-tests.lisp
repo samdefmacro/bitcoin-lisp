@@ -853,14 +853,32 @@ standard (TRUC/BIP431 enforced) -- see +max-standard-tx-version+."
       (is-false (rejected-p 3)))))
 
 (test mempool-rejects-dust-output
-  "A tx with a dust-value output is rejected."
+  "EPHEMERAL DUST (Core policy.cpp:157-161): MAX_DUST_OUTPUTS_PER_TX is 1, so a
+SECOND dust output is rejected outright. A single dust output is no longer
+rejected on sight — that is what made us refuse the 0-fee TRUC parent carrying
+a P2A anchor that every Core peer relays — it is gated by the 0-fee rule
+instead (see mempool-ephemeral-dust-requires-zero-fee)."
   (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
          (utxo (bitcoin-lisp.storage:make-utxo-set))
-         (tx (make-mempool-test-tx :input-id 81 :value 1)))  ; 1 sat < 546 dust
+         (base (make-mempool-test-tx :input-id 81 :value 1))   ; 1 sat < 546 dust
+         (dust-out (elt (bitcoin-lisp.serialization:transaction-outputs base) 0)))
+    ;; Two dust outputs: over the cap, rejected before inputs are even resolved.
+    (let ((tx (bitcoin-lisp.serialization:make-transaction
+               :version 1
+               :inputs (bitcoin-lisp.serialization:transaction-inputs base)
+               :outputs (vector dust-out dust-out)
+               :lock-time 0)))
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
+        (is (null valid))
+        (is (eq err :dust))))
+    ;; Exactly one dust output passes the count rule and proceeds (here it
+    ;; falls through to the unresolved input, proving it was NOT rejected
+    ;; :dust).
     (multiple-value-bind (valid err)
-        (bitcoin-lisp.validation:validate-transaction-for-mempool tx utxo mempool 100)
+        (bitcoin-lisp.validation:validate-transaction-for-mempool base utxo mempool 100)
       (is (null valid))
-      (is (eq err :dust)))))
+      (is (not (eq err :dust))))))
 
 (test mempool-rejects-nonpushonly-scriptsig
   "A tx whose scriptSig contains a non-push opcode is rejected."
@@ -2363,3 +2381,214 @@ GetTotalTxSize, txmempool.h:191) and \"usage\" the modeled DynamicMemoryUsage
     (is (= (bitcoin-lisp.mempool:mempool-entry-vsize entry)
            (bitcoin-lisp.mempool:mempool-total-size mempool)))
     (is (= 704 (bitcoin-lisp.mempool:mempool-dynamic-usage mempool)))))
+
+;;;; ============================================================
+;;;; GA7 wave 2: mempool relay-policy parity with Bitcoin Core
+;;;; ============================================================
+
+(defun %spk (&rest bytes)
+  (make-array (length bytes) :element-type '(unsigned-byte 8)
+                             :initial-contents bytes))
+
+(defun %push-script (push-len first-byte trailer)
+  "A script: <push-len> <first-byte> <padding..> <trailer>."
+  (let ((s (make-array (+ 2 push-len) :element-type '(unsigned-byte 8)
+                                      :initial-element 0)))
+    (setf (aref s 0) push-len
+          (aref s 1) first-byte
+          (aref s (+ 1 push-len)) trailer)
+    s))
+
+(test classify-output-script-solver-parity
+  "G7-12/13: classify-output-script mirrors Core's Solver (solver.cpp:141),
+including the order in which the forms are matched."
+  (flet ((c (s) (bitcoin-lisp.validation::classify-output-script s)))
+    ;; P2SH is matched first, before anything else.
+    (is (eq :scripthash
+            (c (let ((s (make-array 23 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+                 (setf (aref s 0) #xa9 (aref s 1) #x14 (aref s 22) #x87) s))))
+    ;; Witness programs.
+    (is (eq :witness-v0-keyhash
+            (c (let ((s (make-array 22 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+                 (setf (aref s 0) #x00 (aref s 1) #x14) s))))
+    (is (eq :witness-v0-scripthash
+            (c (let ((s (make-array 34 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+                 (setf (aref s 0) #x00 (aref s 1) #x20) s))))
+    (is (eq :witness-v1-taproot
+            (c (let ((s (make-array 34 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+                 (setf (aref s 0) #x51 (aref s 1) #x20) s))))
+    (is (eq :anchor (c (%spk #x51 #x02 #x4e #x73))))
+    ;; v2..v16 and odd-sized v1 are the forward-compatible class.
+    (is (eq :witness-unknown
+            (c (let ((s (make-array 34 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+                 (setf (aref s 0) #x52 (aref s 1) #x20) s))))
+    (is (eq :witness-unknown
+            (c (let ((s (make-array 22 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+                 (setf (aref s 0) #x51 (aref s 1) #x14) s))))
+    ;; An IRREGULAR v0 program is NONSTANDARD, never witness-unknown — the
+    ;; asymmetry that makes this classifier necessary.
+    (is (eq :nonstandard
+            (c (let ((s (make-array 24 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+                 (setf (aref s 0) #x00 (aref s 1) #x16) s))))
+    ;; OP_RETURN, matched before the bare key forms.
+    (is (eq :null-data (c (%spk #x6a #x02 #xaa #xbb))))
+    ;; Bare pay-to-pubkey, both encodings.
+    (is (eq :pubkey (c (%push-script 33 #x02 #xac))))
+    (is (eq :pubkey (c (%push-script 33 #x03 #xac))))
+    (is (eq :pubkey (c (%push-script 65 #x04 #xac))))
+    (is (eq :pubkey (c (%push-script 65 #x06 #xac))))
+    (is (eq :pubkey (c (%push-script 65 #x07 #xac))))
+    ;; Header byte must AGREE with the length (CPubKey::ValidSize).
+    (is (eq :nonstandard (c (%push-script 33 #x04 #xac))))
+    (is (eq :nonstandard (c (%push-script 65 #x02 #xac))))
+    ;; ...and the script must end in OP_CHECKSIG.
+    (is (eq :nonstandard (c (%push-script 33 #x02 #xad))))
+    (is (eq :pubkeyhash
+            (c (let ((s (make-array 25 :element-type '(unsigned-byte 8)
+                                       :initial-element 0)))
+                 (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
+                       (aref s 23) #x88 (aref s 24) #xac)
+                 s))))
+    (is (eq :nonstandard (c (%spk #x51))))          ; bare OP_TRUE
+    (is (eq :nonstandard (c (%spk))))))             ; empty
+
+(test g7-13-bare-p2pk-output-is-standard
+  "G7-13: Core's IsStandard accepts TxoutType::PUBKEY unconditionally
+(solver.cpp:190-192, policy.cpp:79-97). We classified bare P2PK NONSTANDARD
+and so refused to relay transactions the whole network relays."
+  (is-true (bitcoin-lisp.validation::standard-output-script-p
+            (%push-script 33 #x02 #xac)))
+  (is-true (bitcoin-lisp.validation::standard-output-script-p
+            (%push-script 65 #x04 #xac)))
+  ;; A malformed pubkey script stays nonstandard.
+  (is-false (bitcoin-lisp.validation::standard-output-script-p
+             (%push-script 33 #x04 #xac))))
+
+(test g7-12-multisig-shape-vs-output-standardness
+  "Core's Solver classifies MULTISIG by SHAPE (up to 16 keys); the n<=3 cap is
+an IsStandard rule for OUTPUTS only. An input SPENDING a bigger bare multisig
+is still standard, so the two must not share one predicate."
+  (flet ((ms (m n)   ; OP_m <n 33-byte pushes> OP_n OP_CHECKMULTISIG
+           (let ((s (make-array (+ 1 (* n 34) 2) :element-type '(unsigned-byte 8)
+                                                 :initial-element 0)))
+             (setf (aref s 0) (+ #x50 m))
+             (dotimes (i n) (setf (aref s (+ 1 (* i 34))) 33))
+             (setf (aref s (- (length s) 2)) (+ #x50 n)
+                   (aref s (- (length s) 1)) #xae)
+             s)))
+    ;; Shape matches well past the standardness cap.
+    (is (eq :multisig (bitcoin-lisp.validation::classify-output-script (ms 1 1))))
+    (is (eq :multisig (bitcoin-lisp.validation::classify-output-script (ms 2 3))))
+    (is (eq :multisig (bitcoin-lisp.validation::classify-output-script (ms 5 5))))
+    (is (eq :multisig (bitcoin-lisp.validation::classify-output-script (ms 15 15))))
+    ;; But only n<=3 is a standard OUTPUT.
+    (let ((bitcoin-lisp:*permit-bare-multisig* t))
+      (is-true (bitcoin-lisp.validation::standard-output-script-p (ms 2 3)))
+      (is-false (bitcoin-lisp.validation::standard-output-script-p (ms 4 4))))
+    ;; -permitbaremultisig=0 rejects even the small ones.
+    (let ((bitcoin-lisp:*permit-bare-multisig* nil))
+      (is-false (bitcoin-lisp.validation::standard-output-script-p (ms 2 3))))))
+
+(test g7-12-nonstandard-and-unknown-witness-inputs-rejected
+  "G7-12 (Core AreInputsStandard, policy.cpp:224-232): spending a NONSTANDARD
+or WITNESS_UNKNOWN prevout is rejected. Both are standard as OUTPUTS and only
+nonstandard to SPEND — we relayed txs every Core peer rejects."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (p2pkh (let ((s (make-array 25 :element-type '(unsigned-byte 8)
+                                        :initial-element 0)))
+                  (setf (aref s 0) #x76 (aref s 1) #xa9 (aref s 2) #x14
+                        (aref s 23) #x88 (aref s 24) #xac)
+                  s))
+         (bare-true (%spk #x51))                       ; NONSTANDARD prevout
+         (v2-program (let ((s (make-array 34 :element-type '(unsigned-byte 8)
+                                            :initial-element 0)))
+                       (setf (aref s 0) #x52 (aref s 1) #x20) s))  ; WITNESS_UNKNOWN
+         (p2pk (%push-script 33 #x02 #xac)))
+    (flet ((spend (id)
+             (bitcoin-lisp.serialization:make-transaction
+              :version 2
+              :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                               :previous-output
+                               (bitcoin-lisp.serialization:make-outpoint
+                                :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element id)
+                                :index 0)
+                               :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                               :sequence #xFFFFFFFF))
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 10000 :script-pubkey p2pkh))
+              :lock-time 0))
+           (err-of (tx)
+             (nth-value 1 (bitcoin-lisp.validation:validate-transaction-for-mempool
+                           tx utxo mempool 100))))
+      (bitcoin-lisp.storage:add-utxo utxo (make-array 32 :element-type '(unsigned-byte 8)
+                                                         :initial-element 1)
+                                     0 100000 bare-true 0)
+      (bitcoin-lisp.storage:add-utxo utxo (make-array 32 :element-type '(unsigned-byte 8)
+                                                         :initial-element 2)
+                                     0 100000 v2-program 0)
+      (bitcoin-lisp.storage:add-utxo utxo (make-array 32 :element-type '(unsigned-byte 8)
+                                                         :initial-element 3)
+                                     0 100000 p2pk 0)
+      (is (eq :nonstandard-inputs (err-of (spend 1))) "bare OP_TRUE prevout")
+      (is (eq :nonstandard-inputs (err-of (spend 2))) "unknown witness version prevout")
+      ;; A bare-P2PK prevout is perfectly standard to spend — it must NOT be
+      ;; caught by the same gate.
+      (is (not (eq :nonstandard-inputs (err-of (spend 3)))) "bare P2PK prevout"))))
+
+(test g7-14-p2a-witness-stuffing-nonstandard
+  "G7-14 (Core IsWitnessStandard, policy.cpp:268-271): spending a pay-to-anchor
+output never needs witness data, so ANY witness on a P2A spend is stuffing.
+It matters beyond bloat — a stuffed variant shares the clean spend's TXID, so
+admitting it makes the clean spend bounce as :already-in-mempool, which is the
+anchor-pinning this rule prevents."
+  (let ((p2a (%spk #x51 #x02 #x4e #x73))
+        (p2wpkh (let ((s (make-array 22 :element-type '(unsigned-byte 8)
+                                        :initial-element 0)))
+                  (setf (aref s 0) #x00 (aref s 1) #x14) s))
+        (empty (make-array 0 :element-type '(unsigned-byte 8)))
+        (stuffing (list (make-array 1 :element-type '(unsigned-byte 8)
+                                      :initial-element #x51))))
+    ;; Any witness at all on a P2A spend is nonstandard.
+    (is-false (bitcoin-lisp.validation::input-witness-standard-p stuffing p2a empty))
+    ;; The same witness on a normal P2WPKH spend is fine.
+    (is-true (bitcoin-lisp.validation::input-witness-standard-p stuffing p2wpkh empty))))
+
+(test g7-36-disconnect-pool-is-bounded
+  "G7-36 (Core LimitMemoryUsage): the reorg disconnect pool is capped, and it
+trims the blocks NEAREST THE OLD TIP. Direction is the point — the re-add
+walks oldest-first, so the survivors must be parents; dropping the oldest
+would strand children with missing inputs."
+  (let ((cap bitcoin-lisp.validation::+max-disconnected-tx-pool-bytes+))
+    ;; Under the cap: nothing is touched.
+    (multiple-value-bind (kept bytes dropped)
+        (bitcoin-lisp.validation::trim-disconnect-pool
+         (list (cons '(:a) 10) (cons '(:b) 20)) 30)
+      (is (equal '(((:a) . 10) ((:b) . 20)) kept))
+      (is (= 30 bytes))
+      (is (= 0 dropped)))
+    ;; Over the cap: the TAIL (newest) goes first, the head (oldest) survives.
+    (let* ((oldest (cons '(:old1 :old2) (floor cap 2)))
+           (newer (cons '(:new1) cap))
+           (newest (cons '(:tip1 :tip2 :tip3) cap)))
+      (multiple-value-bind (kept bytes dropped)
+          (bitcoin-lisp.validation::trim-disconnect-pool
+           (list oldest newer newest) (+ (cdr oldest) (cdr newer) (cdr newest)))
+        (is (equal (list oldest) kept) "only the oldest block survives")
+        (is (= (cdr oldest) bytes))
+        (is (= 4 dropped) "3 tip txs + 1 from the middle block")))
+    ;; Never trims to empty, even when one block alone exceeds the cap.
+    (multiple-value-bind (kept bytes dropped)
+        (bitcoin-lisp.validation::trim-disconnect-pool
+         (list (cons '(:only) (* 2 cap))) (* 2 cap))
+      (is (= 1 (length kept)))
+      (is (= (* 2 cap) bytes))
+      (is (= 0 dropped)))))

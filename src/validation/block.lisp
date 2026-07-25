@@ -14,6 +14,32 @@
 (defconstant +max-block-sigops-cost+ 80000)  ; BIP 141: max weighted sigops cost
 (defconstant +witness-scale-factor+ 4)       ; BIP 141: legacy sigops weight multiplier
 (defconstant +max-block-weight+ 4000000)     ; BIP 141: max block weight in weight units
+(defconstant +max-disconnected-tx-pool-bytes+ 20000000
+  "Cap on the transactions held for mempool re-add while a reorg is in flight
+(Core MAX_DISCONNECTED_TX_POOL_BYTES, kernel/disconnected_transactions.h:18).")
+
+(defun trim-disconnect-pool (entries bytes)
+  "Bound the reorg disconnect pool (Core LimitMemoryUsage,
+kernel/disconnected_transactions.cpp:31). ENTRIES is one (TXS . BYTES) cons
+per disconnected block, OLDEST block first, with the block nearest the old tip
+at the tail; BYTES is their running total. Returns
+(values kept-entries kept-bytes dropped-tx-count).
+
+Drops from the TAIL — the most-recently-confirmed blocks. Core does the same
+(its queue holds newest at the front and it pops the front), and the direction
+is the whole point: the re-add walks oldest-first, so keeping the oldest keeps
+PARENTS. Trimming the oldest instead would strand children with missing inputs
+— they would fail re-validation anyway, and we would have discarded the
+entries most likely to still be valid. Never trims to empty."
+  (let ((dropped 0))
+    (loop while (and (> bytes +max-disconnected-tx-pool-bytes+)
+                     (cdr entries))
+          do (let ((newest (car (last entries))))
+               (decf bytes (cdr newest))
+               (incf dropped (length (car newest)))
+               (setf entries (butlast entries))))
+    (values entries bytes dropped)))
+
 (defconstant +max-future-block-time+ 7200)  ; 2 hours in seconds
 (defconstant +max-timewarp+ 600
   "BIP 94 timewarp-attack mitigation: on networks that enforce BIP 94
@@ -2118,7 +2144,12 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
             ;; loop, so the list ends up oldest-block-first — flattening then
             ;; re-adds parents before children (a child can only spend a parent
             ;; in an equal-or-lower block).
+            ;; Each element is (TXS . BYTES) for one disconnected block.
             (disconnected-block-txs '())
+            ;; Running size of the pool above, bounded by
+            ;; +max-disconnected-tx-pool-bytes+ (see the trim in the loop).
+            (disconnected-bytes 0)
+            (disconnected-dropped 0)
             ;; (block . height) per disconnected block, oldest-first (same
             ;; push order), for the PHASE C wallet notifications.
             (disconnected-blocks '()))
@@ -2212,9 +2243,37 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
               ;; Collect this block's non-coinbase txs (original order) for the
               ;; PHASE C mempool re-add. Pushing whole per-block lists during
               ;; the tip-first loop leaves disconnected-block-txs oldest-first.
+              ;; Bound the pool at Core's MAX_DISCONNECTED_TX_POOL_BYTES
+              ;; (20MB, kernel/disconnected_transactions.h:18). Unbounded, a
+              ;; deep reorg over full blocks pins hundreds of MB right in the
+              ;; middle of chainstate surgery — and this node has lived
+              ;; through multi-hundred-block testnet4 reorgs.
+              ;;
+              ;; Direction matters: Core trims the MOST-RECENTLY-CONFIRMED
+              ;; entries (LimitMemoryUsage pops the front, which holds the
+              ;; blocks nearest the old tip) and re-adds from the oldest end,
+              ;; so survivors are always PARENTS. Dropping the oldest instead
+              ;; would strand children with missing inputs — they would fail
+              ;; re-validation anyway, and we would have thrown away the
+              ;; entries most likely to still be valid. Our list is
+              ;; oldest-block-first with the tip block at the TAIL, so
+              ;; "trim newest" means dropping from the tail.
               (when mempool
-                (push (rest (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-                      disconnected-block-txs))
+                (let* ((txs (rest (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+                       ;; Serialized size stands in for Core's
+                       ;; RecursiveDynamicUsage: same order of magnitude and
+                       ;; monotone in the same thing, without walking every
+                       ;; input/output allocation.
+                       (bytes (let ((n 0))
+                                (dolist (tx txs n)
+                                  (incf n (bitcoin-lisp.serialization:transaction-weight tx))))))
+                  (push (cons txs bytes) disconnected-block-txs)
+                  (incf disconnected-bytes bytes)
+                  (multiple-value-bind (kept left dropped)
+                      (trim-disconnect-pool disconnected-block-txs disconnected-bytes)
+                    (setf disconnected-block-txs kept
+                          disconnected-bytes left)
+                    (incf disconnected-dropped dropped))))
               (push (cons block (bitcoin-lisp.storage:block-index-entry-height entry))
                     disconnected-blocks)
               (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid))))
@@ -2343,8 +2402,12 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
           ;; Re-add disconnected-block txs (best-effort, against the new tip),
           ;; parents before children. Txs re-confirmed or invalidated by the
           ;; new chain are dropped by re-validation.
+          (when (plusp disconnected-dropped)
+            (bitcoin-lisp:log-warn "REORG: disconnect pool over ~D bytes — dropped ~D transaction~:P nearest the old tip; they will not be re-added to the mempool"
+                                   +max-disconnected-tx-pool-bytes+
+                                   disconnected-dropped))
           (readd-disconnected-txs-to-mempool
-           mempool (loop for txs in disconnected-block-txs append txs)
+           mempool (loop for entry in disconnected-block-txs append (car entry))
            utxo-set new-height chain-state)
 
           (bitcoin-lisp:log-info "REORG complete: disconnected ~D, connected ~D blocks"

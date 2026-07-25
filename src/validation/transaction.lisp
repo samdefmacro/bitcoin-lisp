@@ -292,6 +292,83 @@ GetDustThreshold). Unspendable (OP_RETURN) outputs return 0 — never dust."
         ;; aligned with the wallet's parameterized dust threshold.
         (ceiling (* nsize +dust-relay-fee-rate+) 1000))))
 
+(defconstant +max-dust-outputs-per-tx+ 1
+  "How many dust outputs a standard transaction may carry (Core
+MAX_DUST_OUTPUTS_PER_TX, policy.h:94). Dust is permitted at all only as
+EPHEMERAL dust: the carrying tx must pay zero fee and the dust must be swept
+by whatever spends it.")
+
+(defun output-is-dust-p (output)
+  "Core IsDust (policy.cpp:65): the output's value is below the dust threshold
+for its scriptPubKey."
+  (< (bitcoin-lisp.serialization:tx-out-value output)
+     (dust-threshold (bitcoin-lisp.serialization:tx-out-script-pubkey output))))
+
+(defun transaction-dust-output-count (tx)
+  "Number of dust outputs in TX (Core GetDust, policy.cpp:70-77, counted
+rather than collected)."
+  (let ((n 0))
+    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
+      (when (output-is-dust-p output) (incf n)))
+    n))
+
+(defun transaction-dust-indices (tx)
+  "Indices of TX's dust outputs, ascending (Core GetDust)."
+  (let ((indices '())
+        (i 0))
+    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
+      (when (output-is-dust-p output) (push i indices))
+      (incf i))
+    (nreverse indices)))
+
+(defun check-ephemeral-spends (txns mempool)
+  "Core CheckEphemeralSpends (ephemeral_policy.cpp:33): every transaction in
+TXNS must spend ALL of the dust outputs of each parent it spends from, where a
+parent is looked up first in TXNS itself and then in MEMPOOL. Returns
+(values ok-p offending-txid).
+
+Dust is only tolerated because it is ephemeral — created and destroyed inside
+one package, never left in the UTXO set for anyone to sweep. A child that
+spends a dust-carrying parent without also spending the dust would strand it,
+so the whole exemption depends on this check."
+  (let ((in-package (make-hash-table :test 'equalp)))
+    (dolist (tx txns)
+      (setf (gethash (bitcoin-lisp.serialization:transaction-hash tx) in-package) tx))
+    (dolist (tx txns)
+      (let ((processed (make-hash-table :test 'equalp))
+            ;; (parent-txid . index) of every unspent dust output of every
+            ;; parent this tx spends from.
+            (unspent-dust '()))
+        (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
+          (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                 (parent-txid (bitcoin-lisp.serialization:outpoint-hash prevout)))
+            (unless (gethash parent-txid processed)
+              (setf (gethash parent-txid processed) t)
+              (let* ((entry (and mempool
+                                 (bitcoin-lisp.mempool:mempool-get mempool parent-txid)))
+                     (parent (or (gethash parent-txid in-package)
+                                 (and entry
+                                      (bitcoin-lisp.mempool:mempool-entry-transaction entry)))))
+                (when parent
+                  (dolist (index (transaction-dust-indices parent))
+                    (push (cons parent-txid index) unspent-dust)))))))
+        (when unspent-dust
+          ;; Remove everything this tx actually spends; anything left is dust
+          ;; the child stranded.
+          (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
+            (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+              (setf unspent-dust
+                    (remove-if (lambda (od)
+                                 (and (equalp (car od)
+                                              (bitcoin-lisp.serialization:outpoint-hash prevout))
+                                      (= (cdr od)
+                                         (bitcoin-lisp.serialization:outpoint-index prevout))))
+                               unspent-dust))))
+          (when unspent-dust
+            (return-from check-ephemeral-spends
+              (values nil (bitcoin-lisp.serialization:transaction-hash tx)))))))
+    (values t nil)))
+
 (defun scriptsig-push-only-p (script-sig)
   "True if SCRIPT-SIG contains only push opcodes (every opcode <= OP_16),
 walking past pushed data. Bitcoin Core CScript::IsPushOnly."
@@ -352,79 +429,126 @@ size (Core IsStandardTx, policy.cpp:136-150)."
        (= (aref script-pubkey 0) #x6a)   ; OP_RETURN
        (%op-return-push-only-p script-pubkey)))
 
+(defun %match-p2pkh (script)
+  "T for OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG (Core
+MatchPayToPubkeyHash, solver.cpp:50-57)."
+  (and (= (length script) 25)
+       (= (aref script 0) #x76)    ; OP_DUP
+       (= (aref script 1) #xa9)    ; OP_HASH160
+       (= (aref script 2) #x14)    ; push 20 bytes
+       (= (aref script 23) #x88)   ; OP_EQUALVERIFY
+       (= (aref script 24) #xac))) ; OP_CHECKSIG
+
+(defun %match-p2pk (script)
+  "Pubkey length for a bare pay-to-pubkey SCRIPT (<push key> OP_CHECKSIG), or
+NIL. Core MatchPayToPubkey (solver.cpp:36-47) accepts only the two sizes whose
+header byte AGREES with the length, via CPubKey::ValidSize/GetLen: 0x02 or
+0x03 for the 33-byte compressed form, 0x04/0x06/0x07 for the 65-byte
+uncompressed form. A 33-byte push starting 0x04 is NOT a pubkey."
+  (let ((len (length script)))
+    (cond ((and (= len 35)
+                (= (aref script 0) 33)
+                (= (aref script 34) #xac)                  ; OP_CHECKSIG
+                (member (aref script 1) '(#x02 #x03)))
+           33)
+          ((and (= len 67)
+                (= (aref script 0) 65)
+                (= (aref script 66) #xac)                  ; OP_CHECKSIG
+                (member (aref script 1) '(#x04 #x06 #x07)))
+           65))))
+
+(defun %match-multisig (script)
+  "(values m n) when SCRIPT is bare multisig — OP_m <key>.. OP_n
+OP_CHECKMULTISIG with 1<=m<=n<=16 and every key a 33/65-byte push — else NIL.
+
+This is Core MatchMultisig: the SHAPE only. The n<=3 cap is an IsStandard
+rule for OUTPUTS, not part of the classification, and an input SPENDING a
+larger bare multisig is still standard (AreInputsStandard only rejects
+NONSTANDARD/WITNESS_UNKNOWN)."
+  (let ((len (length script)))
+    (when (and (>= len 4)
+               (= (aref script (1- len)) #xae)          ; OP_CHECKMULTISIG
+               (<= #x51 (aref script 0) #x60)           ; OP_m (1..16)
+               (<= #x51 (aref script (- len 2)) #x60))  ; OP_n (1..16)
+      (let ((m (- (aref script 0) #x50))
+            (n (- (aref script (- len 2)) #x50))
+            (pos 1)
+            (keys 0))
+        (when (<= 1 m n 16)
+          ;; Walk the n key pushes between OP_m and OP_n.
+          (loop while (< pos (- len 2))
+                do (let ((plen (aref script pos)))
+                     (unless (or (= plen 33) (= plen 65))
+                       (return-from %match-multisig nil))
+                     (incf pos (1+ plen))
+                     (incf keys)
+                     (when (> keys n)
+                       (return-from %match-multisig nil))))
+          (when (and (= pos (- len 2)) (= keys n))
+            (values m n)))))))
+
+(defun classify-output-script (script-pubkey)
+  "Classify SCRIPT-PUBKEY the way Bitcoin Core's Solver does (solver.cpp:141),
+returning a TxoutType keyword: :scripthash, :witness-v0-keyhash,
+:witness-v0-scripthash, :witness-v1-taproot, :anchor, :witness-unknown,
+:null-data, :pubkey, :pubkeyhash, :multisig, or :nonstandard.
+
+The ORDER is Solver's and matters. P2SH is matched first (it is the most
+constrained form). Witness programs come next, and note the asymmetry that
+makes this classifier necessary: an IRREGULAR version-0 program is
+:nonstandard, while v1..v16 are :witness-unknown — standard as an OUTPUT (the
+forward-compat mechanism that let segwit and taproot outputs relay before
+activation) but NOT standard to SPEND. Only after that do the bare key forms
+match, so an OP_RETURN or witness program can never be read as a key script."
+  (if (script-is-p2sh-p script-pubkey)
+      :scripthash
+      (multiple-value-bind (version program) (witness-program-parts script-pubkey)
+        (cond
+          (version
+           (cond ((and (= version 0) (= (length program) 20)) :witness-v0-keyhash)
+                 ((and (= version 0) (= (length program) 32)) :witness-v0-scripthash)
+                 ((and (= version 1) (= (length program) 32)) :witness-v1-taproot)
+                 ((pay-to-anchor-p script-pubkey) :anchor)
+                 ((/= version 0) :witness-unknown)
+                 ;; Irregular v0 program: reserved, never relayed.
+                 (t :nonstandard)))
+          ;; OP_RETURN data carrier. Core's Solver classifies NULL_DATA whenever
+          ;; the bytes after OP_RETURN are push-only (solver.cpp:185) — with no
+          ;; size cap and no -datacarrier gate here: those live in the SHARED
+          ;; per-transaction byte budget that IsStandardTx tracks across all
+          ;; NULL_DATA outputs (policy.cpp:136-150), enforced in
+          ;; validate-transaction-for-mempool's output loop. An OP_RETURN
+          ;; carrying any non-push opcode is NONSTANDARD.
+          ((null-data-script-p script-pubkey) :null-data)
+          ((%match-p2pk script-pubkey) :pubkey)
+          ((%match-p2pkh script-pubkey) :pubkeyhash)
+          ((%match-multisig script-pubkey) :multisig)
+          (t :nonstandard)))))
+
 (defun standard-output-script-p (script-pubkey)
-  "Check if SCRIPT-PUBKEY is a standard output script type.
-Standard types: P2PKH, P2SH, P2WPKH, P2WSH, P2TR, OP_RETURN (data carrier)."
-  (let ((len (length script-pubkey)))
-    (or
-     ;; P2PKH: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-     (and (= len 25)
-          (= (aref script-pubkey 0) #x76)   ; OP_DUP
-          (= (aref script-pubkey 1) #xa9)   ; OP_HASH160
-          (= (aref script-pubkey 2) #x14)   ; push 20 bytes
-          (= (aref script-pubkey 23) #x88)  ; OP_EQUALVERIFY
-          (= (aref script-pubkey 24) #xac)) ; OP_CHECKSIG
-     ;; P2SH: OP_HASH160 <20 bytes> OP_EQUAL
-     (and (= len 23)
-          (= (aref script-pubkey 0) #xa9)   ; OP_HASH160
-          (= (aref script-pubkey 1) #x14)   ; push 20 bytes
-          (= (aref script-pubkey 22) #x87)) ; OP_EQUAL
-     ;; P2WPKH: OP_0 <20 bytes>
-     (and (= len 22)
-          (= (aref script-pubkey 0) #x00)   ; OP_0
-          (= (aref script-pubkey 1) #x14))  ; push 20 bytes
-     ;; P2WSH: OP_0 <32 bytes>
-     (and (= len 34)
-          (= (aref script-pubkey 0) #x00)   ; OP_0
-          (= (aref script-pubkey 1) #x20))  ; push 32 bytes
-     ;; P2TR: OP_1 <32 bytes>
-     (and (= len 34)
-          (= (aref script-pubkey 0) #x51)   ; OP_1
-          (= (aref script-pubkey 1) #x20))  ; push 32 bytes
-     ;; Future witness program v1..v16 with a 2..40-byte program: Core's Solver
-     ;; classifies these WITNESS_UNKNOWN (or ANCHOR for P2A, OP_1 <0x4e73>) and
-     ;; IsStandard accepts them -- the forward-compat mechanism by which segwit/
-     ;; taproot outputs relayed before activation. Only version-0 programs are
-     ;; restricted to the 20/32-byte forms above (irregular v0 = NONSTANDARD).
-     (and (>= len 4) (<= len 42)
-          (<= #x51 (aref script-pubkey 0) #x60)   ; OP_1..OP_16
-          (= (aref script-pubkey 1) (- len 2)))   ; single direct push of the program
-     ;; OP_RETURN data carrier. Core's Solver classifies NULL_DATA whenever
-     ;; the bytes after OP_RETURN are push-only (solver.cpp) — with no size
-     ;; cap and no -datacarrier gate here: those live in the SHARED
-     ;; per-transaction byte budget that IsStandardTx tracks across all
-     ;; NULL_DATA outputs (policy.cpp:136-150), enforced in
-     ;; validate-transaction-for-mempool's output loop. An OP_RETURN carrying
-     ;; any non-push opcode is TxoutType::NONSTANDARD, hence rejected HERE.
-     (null-data-script-p script-pubkey)
-     ;; Bare (non-P2SH) multisig — standard only when -permitbaremultisig.
-     (and bitcoin-lisp:*permit-bare-multisig*
-          (bare-multisig-standard-p script-pubkey)))))
+  "Whether SCRIPT-PUBKEY is a standard OUTPUT script type (Core IsStandard,
+policy.cpp:79-97): everything Solver classifies except NONSTANDARD, plus the
+bare-multisig limits.
+
+NB bare multisig folds BOTH of Core's output-only restrictions in here — the
+n<=3 cap from IsStandard and the -permitbaremultisig gate that IsStandardTx
+applies separately (policy.cpp:151-153). Core reports the latter as its own
+\"bare-multisig\" reason; we report :non-standard-output for both, which is a
+pre-existing reason-code difference and not a relay difference."
+  (case (classify-output-script script-pubkey)
+    (:nonstandard nil)
+    (:multisig (and bitcoin-lisp:*permit-bare-multisig*
+                    (bare-multisig-standard-p script-pubkey)))
+    (t t)))
 
 (defun bare-multisig-standard-p (script)
-  "T if SCRIPT is a standard bare multisig: OP_m <pubkey>.. OP_n
-OP_CHECKMULTISIG with 1<=m<=n<=3 and each key a 33/65-byte push (Bitcoin
-Core's TX_MULTISIG standardness limit). Consensus allows up to 20 keys;
-standardness caps bare multisig at 3."
-  (let ((len (length script)))
-    (and (>= len 4)
-         (= (aref script (1- len)) #xae)         ; OP_CHECKMULTISIG
-         (<= #x51 (aref script 0) #x60)          ; OP_m (1..16)
-         (<= #x51 (aref script (- len 2)) #x60)  ; OP_n (1..16)
-         (let ((m (- (aref script 0) #x50))
-               (n (- (aref script (- len 2)) #x50)))
-           (and (<= 1 m n 3)
-                ;; Walk the n key pushes between OP_m and OP_n.
-                (let ((pos 1) (keys 0))
-                  (loop while (< pos (- len 2))
-                        do (let ((plen (aref script pos)))
-                             (unless (or (= plen 33) (= plen 65))
-                               (return-from bare-multisig-standard-p nil))
-                             (incf pos (1+ plen))
-                             (incf keys)
-                             (when (> keys n)
-                               (return-from bare-multisig-standard-p nil))))
-                  (and (= pos (- len 2)) (= keys n))))))))
+  "T if SCRIPT is a standard bare multisig OUTPUT: the multisig shape with
+n<=3 (Core IsStandard, policy.cpp:85-93). Consensus allows up to 20 keys;
+standardness caps bare multisig outputs at 3. Inputs spending a larger bare
+multisig remain standard — see %match-multisig."
+  (multiple-value-bind (m n) (%match-multisig script)
+    (declare (ignore m))
+    (and n (<= n 3) t)))
 
 (defun witness-program-parts (script)
   "If SCRIPT is a witness program, return (VALUES version program-bytes);
@@ -471,6 +595,15 @@ have no policy rules."
 (defun input-witness-standard-p (wstack spk script-sig)
   "Whether one input's witness WSTACK is standard for the output SPK it spends
 (SCRIPT-SIG is needed to unwrap a P2SH redeemScript)."
+  ;; Witness stuffing: spending a pay-to-anchor output never requires witness
+  ;; data, so ANY witness attached to a P2A spend is nonstandard (Core
+  ;; IsWitnessStandard, policy.cpp:268-271). This matters beyond bloat —
+  ;; a stuffed variant shares the clean spend's TXID, so admitting it makes
+  ;; the clean spend bounce off as :already-in-mempool. That is exactly the
+  ;; anchor-pinning attack the rule exists to prevent. Checked on the
+  ;; DIRECTLY spent scriptPubKey, before any P2SH unwrap, as Core does.
+  (when (pay-to-anchor-p spk)
+    (return-from input-witness-standard-p nil))
   (let ((prev-script spk)
         (p2sh nil))
     ;; P2SH-wrapped: the redeemScript is the last push of the (push-only) scriptSig
@@ -644,7 +777,8 @@ decide (Core PreChecks, validation.cpp:950-970)."
         (return-from validate-transaction-for-mempool
           (values nil :scriptsig-not-pushonly nil)))))
 
-  ;; Policy: all outputs must be standard script types, and none dust.
+  ;; Policy: all outputs must be standard script types (dust is handled
+  ;; separately below — see EPHEMERAL DUST).
   ;; OP_RETURN outputs share ONE -datacarriersize byte budget across the
   ;; whole transaction: each NULL_DATA output's raw scriptPubKey size is
   ;; drawn from it and an output that would overdraw is rejected
@@ -665,11 +799,21 @@ decide (Core PreChecks, validation.cpp:950-970)."
           (when (> (length spk) datacarrier-bytes-left)
             (return-from validate-transaction-for-mempool
               (values nil :datacarrier nil)))
-          (decf datacarrier-bytes-left (length spk)))
-        (when (< (bitcoin-lisp.serialization:tx-out-value output)
-                 (dust-threshold spk))
-          (return-from validate-transaction-for-mempool
-            (values nil :dust nil))))))
+          (decf datacarrier-bytes-left (length spk))))))
+
+  ;; EPHEMERAL DUST (Core policy.cpp:157-161 + policy/ephemeral_policy.cpp).
+  ;; Dust is no longer rejected on sight. Core permits up to
+  ;; MAX_DUST_OUTPUTS_PER_TX (=1) dust output, on the condition that the
+  ;; carrying transaction pays NO fee at all — so it is never worth mining
+  ;; alone — and that whatever spends it also sweeps the dust (checked by
+  ;; check-ephemeral-spends once the package/mempool context is known).
+  ;; Rejecting the first dust output, as we used to, refuses a 0-fee TRUC
+  ;; parent carrying a P2A anchor: the modern LN 1P1C package that every Core
+  ;; peer relays.
+  (let ((dust-count (transaction-dust-output-count tx)))
+    (when (> dust-count +max-dust-outputs-per-tx+)
+      (return-from validate-transaction-for-mempool
+        (values nil :dust nil))))
 
   ;; Check for duplicate in mempool
   (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
@@ -734,6 +878,20 @@ decide (Core PreChecks, validation.cpp:950-970)."
                   (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                          (spk (spent-script (bitcoin-lisp.serialization:outpoint-hash prevout)
                                             (bitcoin-lisp.serialization:outpoint-index prevout))))
+                    ;; Core AreInputsStandard (policy.cpp:224-232): classify
+                    ;; EVERY spent scriptPubKey and refuse the two types that
+                    ;; may not be spent under policy. NONSTANDARD keeps
+                    ;; unknown/irregular scripts reserved as upgrade hooks and
+                    ;; blocks DoS via expensive scripts; WITNESS_UNKNOWN stops
+                    ;; us relaying spends of future segwit versions we cannot
+                    ;; validate. Both are standard as OUTPUTS and only
+                    ;; nonstandard to SPEND, which is why this cannot reuse
+                    ;; standard-output-script-p.
+                    (when spk
+                      (case (classify-output-script spk)
+                        ((:nonstandard :witness-unknown)
+                         (return-from validate-transaction-for-mempool
+                           (values nil :nonstandard-inputs nil)))))
                     (when (and spk (script-is-p2sh-p spk))
                       (let ((redeem (extract-last-push
                                      (bitcoin-lisp.serialization:tx-in-script-sig input))))
@@ -792,6 +950,25 @@ decide (Core PreChecks, validation.cpp:950-970)."
                        sigops-cost))
                (direct-conflicts (bitcoin-lisp.mempool:find-rbf-conflicts mempool tx))
                (replaced-set nil))
+
+          ;; EPHEMERAL DUST, part 2 (Core PreCheckEphemeralTx,
+          ;; ephemeral_policy.cpp:23, called at validation.cpp:933 — right here,
+          ;; after the fees are known and before the fee-rate floor). A tx
+          ;; carrying dust must pay NOTHING, on base fee AND modified fee, so
+          ;; there is never an incentive to mine it on its own: the dust is only
+          ;; safe while it can travel and be swept as a package.
+          (when (and (or (/= fee-value 0) (/= modified-fee-value 0))
+                     (plusp (transaction-dust-output-count tx)))
+            (return-from validate-transaction-for-mempool
+              (values nil :dust nil)))
+
+          ;; EPHEMERAL DUST, part 3 (Core CheckEphemeralSpends at
+          ;; validation.cpp:1372, with package={ptx}). Only MEMPOOL parents are
+          ;; visible from here; a parent still inside an unsubmitted package is
+          ;; covered by the package-level call in validate-package-for-mempool.
+          (unless (check-ephemeral-spends (list tx) mempool)
+            (return-from validate-transaction-for-mempool
+              (values nil :missing-ephemeral-spends nil)))
 
           ;; Policy: minimum relay fee rate (relay floor, or the higher rolling
           ;; dynamic minimum when the mempool has been trimming). The rate is
