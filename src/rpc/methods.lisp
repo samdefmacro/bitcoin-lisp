@@ -4014,15 +4014,21 @@ must be bound by the caller."
                ((null sk) (fail "no key for P2TR (key path)"))
                ((null spent-utxos)
                 (fail "P2TR requires prevtx amounts for all inputs"))
-               (t (let* ((sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
-                                   amount tap-sighash-type nil nil))
-                         (tsk (bitcoin-lisp.crypto:taproot-tweak-private-key sk))
-                         (sig64 (bitcoin-lisp.crypto:sign-schnorr tsk sighash))
-                         (sig (if (zerop tap-sighash-type)
-                                  sig64
-                                  (concatenate '(vector (unsigned-byte 8))
-                                               sig64 (vector tap-sighash-type)))))
-                    (values (%make-input-sig :kind :p2tr :needed 1 :tap sig)))))))
+               (t (let ((sighash (bitcoin-lisp.coalton.interop::compute-bip341-sighash
+                                  amount tap-sighash-type nil nil)))
+                    ;; No sighash is defined for SIGHASH_SINGLE at an input
+                    ;; index with no matching output. Signing the
+                    ;; omitted-field preimage would hand back a transaction
+                    ;; Core rejects, so fail loudly instead.
+                    (unless sighash
+                      (fail "P2TR SIGHASH_SINGLE has no output at this input index"))
+                    (let* ((tsk (bitcoin-lisp.crypto:taproot-tweak-private-key sk))
+                           (sig64 (bitcoin-lisp.crypto:sign-schnorr tsk sighash))
+                           (sig (if (zerop tap-sighash-type)
+                                    sig64
+                                    (concatenate '(vector (unsigned-byte 8))
+                                                 sig64 (vector tap-sighash-type)))))
+                      (values (%make-input-sig :kind :p2tr :needed 1 :tap sig))))))))
           ((string= type "scripthash")   ; P2SH (wrapped)
            (cond
              ((null redeem) (fail "P2SH requires redeemScript"))
