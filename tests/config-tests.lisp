@@ -277,3 +277,95 @@ without -cjdnsreachable."
     (finishes (bitcoin-lisp::apply-config-globals '(("onlynet" . "onion"))))
     (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "i2p"))))
     (signals error (bitcoin-lisp::apply-config-globals '(("onlynet" . "cjdns"))))))
+
+;;; --- G7-03: -onlynet clearnet exclusion must disable DNS seeding ------------
+;;;
+;;; A Tor-only node (-onlynet=onion) that still queries DNS seeds resolves a
+;;; seed hostname in plaintext through the local resolver and then dials the
+;;; returned peers over clearnet — deanonymizing itself on first start, which
+;;; is precisely what -onlynet exists to prevent.
+
+(defmacro %with-net-config-globals (&body body)
+  "Run BODY with every global APPLY-CONFIG-GLOBALS mutates rebound, so these
+tests cannot leak reachability or seed state into each other."
+  `(let ((bitcoin-lisp.networking:*reachable-networks*
+           bitcoin-lisp.networking:*reachable-networks*)
+         (bitcoin-lisp.networking:*cjdns-reachable* nil)
+         (bitcoin-lisp.networking:*onlynet-networks* nil)
+         (bitcoin-lisp.networking:*onion-proxy-explicit* nil)
+         (bitcoin-lisp.networking:*proxy* nil)
+         (bitcoin-lisp.networking:*onion-proxy* nil)
+         (bitcoin-lisp::*dns-seed-enabled* t)
+         (bitcoin-lisp::*fixed-seeds-enabled* t))
+     ,@body))
+
+(defun %dnsseed-after (&rest cli)
+  "Value of *dns-seed-enabled* after applying CLI, from a clean t default."
+  (%with-net-config-globals
+    (bitcoin-lisp::apply-config-globals (bitcoin-lisp::parse-cli-args cli))
+    bitcoin-lisp::*dns-seed-enabled*))
+
+(test config-onlynet-clearnet-exclusion-disables-dnsseed
+  "G7-03: -onlynet excluding IPv4 and IPv6 soft-sets -dnsseed=0
+(Core init.cpp:835-844)."
+  ;; The standard Tor-only setup: onion-only via -listenonion, no -proxy.
+  (is-false (%dnsseed-after "-onlynet=onion" "-listenonion=1"))
+  ;; Onion-only with an explicit proxy.
+  (is-false (%dnsseed-after "-onlynet=onion" "-proxy=127.0.0.1:9050"))
+  ;; CJDNS-only is equally clearnet-free.
+  (is-false (%dnsseed-after "-onlynet=cjdns" "-cjdnsreachable=1"))
+  ;; Any clearnet net in the set leaves seeding alone.
+  (is-true (%dnsseed-after "-onlynet=ipv4"))
+  (is-true (%dnsseed-after "-onlynet=ipv6"))
+  (is-true (%dnsseed-after "-onlynet=onion" "-onlynet=ipv6"
+                           "-proxy=127.0.0.1:9050"))
+  ;; No -onlynet at all: unchanged default.
+  (is-true (%dnsseed-after)))
+
+(test config-onlynet-dnsseed-soft-set-semantics
+  "Soft-set semantics (Core SoftSetBoolArg + the explicit check at
+init.cpp:1691-1693): an explicit -dnsseed=0 stays off, and an explicit
+-dnsseed=1 under a clearnet-excluding -onlynet is an init error rather than a
+silent override — the user asked for two incompatible things."
+  ;; Explicit 0 with no clearnet: already off, no error.
+  (is-false (%dnsseed-after "-onlynet=onion" "-listenonion=1" "-dnsseed=0"))
+  ;; Explicit 1 with no clearnet: init error.
+  (signals error
+    (%dnsseed-after "-onlynet=onion" "-listenonion=1" "-dnsseed=1"))
+  (signals error
+    (%dnsseed-after "-onlynet=onion" "-proxy=127.0.0.1:9050" "-dnsseed=1"))
+  (signals error
+    (%dnsseed-after "-onlynet=cjdns" "-cjdnsreachable=1" "-dnsseed=1"))
+  ;; Explicit 1 WITH clearnet reachable is fine — no error, stays on.
+  (is-true (%dnsseed-after "-onlynet=ipv4" "-dnsseed=1"))
+  (is-true (%dnsseed-after "-dnsseed=1"))
+  ;; Explicit 0 with clearnet reachable stays off.
+  (is-false (%dnsseed-after "-dnsseed=0")))
+
+(test reachable-seed-addresses-filter
+  "G7-03 (dial side): seed lists are clearnet by construction, so under an
+-onlynet that forbids clearnet they must not become dial candidates. Core
+never hits this because seeds enter addrman and every candidate is filtered by
+g_reachable_nets at selection time; we build the dial list directly."
+  (let* ((clearnet '("203.0.113.7" "2001:db8::1"))
+         ;; Literal rather than netaddress-tests' +onion-str-1+: that file may
+         ;; load after this one, which would make the reference a
+         ;; compile-time undefined-variable warning.
+         (onion '("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion")))
+    ;; Default reachable set: clearnet seeds pass through untouched.
+    (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6)))
+      (is (equal clearnet (bitcoin-lisp::%reachable-seed-addresses clearnet))))
+    ;; Onion-only: every clearnet seed is dropped rather than dialed.
+    (let ((bitcoin-lisp.networking:*reachable-networks* '(:torv3)))
+      (is (null (bitcoin-lisp::%reachable-seed-addresses clearnet)))
+      (is (equal onion (bitcoin-lisp::%reachable-seed-addresses onion))))
+    ;; IPv4-only drops IPv6 seeds and keeps IPv4.
+    (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4)))
+      (is (equal '("203.0.113.7")
+                 (bitcoin-lisp::%reachable-seed-addresses clearnet))))
+    ;; An address whose network cannot be determined is dropped, not dialed:
+    ;; under an active restriction an unclassifiable candidate is exactly what
+    ;; must not leak.
+    (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6)))
+      (is (null (bitcoin-lisp::%reachable-seed-addresses
+                 '("seed.example.invalid" "not an address")))))))
