@@ -3008,6 +3008,27 @@ candidates."
         (log-info "Loaded ~D anchor peer~:P for priority reconnection"
                   (length *pending-anchor-addresses*))))))
 
+(defun %reachable-seed-addresses (addresses)
+  "Keep only the seed-derived ADDRESSES (strings) whose network -onlynet still
+permits dialing.
+
+Seed lists — DNS-seed results and the hardcoded fixed seeds — are clearnet by
+construction, so under -onlynet=onion (or cjdns-only) dialing them is a direct
+deanonymizing clearnet TCP connection. Core never hits this because seeds go
+into addrman and every dial candidate is filtered by g_reachable_nets at
+selection time (ThreadOpenConnections); we build the dial list directly, so the
+filter has to happen here. The addrman branch above is already filtered by
+select-dialable-address, and anchors by load-anchors.
+
+Applies to SEED candidates only: manual -addnode/-connect targets are
+deliberately exempt from -onlynet, matching Core. An address whose network
+cannot be determined is dropped rather than dialed — under an active -onlynet
+restriction, an unclassifiable candidate is exactly what must not leak."
+  (remove-if-not (lambda (addr)
+                   (let ((net (bitcoin-lisp.networking:parse-network-address addr)))
+                     (and net (bitcoin-lisp.networking:reachable-network-p net))))
+                 addresses))
+
 (defun %record-outbound-result (address-book addr port peer success)
   "Record an outbound dial outcome for ADDR:PORT in ADDRESS-BOOK, adding the
 entry if new (network-typed, so IPv6/onion/cjdns peers get addrman credit
@@ -3083,10 +3104,13 @@ Returns the number of peers connected."
       (log-info "DNS seeding disabled (-dnsseed=0)"))
     (when (and (< (length addresses) 8) *dns-seed-enabled*)
       (log-info "Discovering peers from DNS seeds...")
-      (let ((dns-addrs (bitcoin-lisp.networking:discover-peers)))
-        (log-info "Found ~D potential peers from DNS" (length dns-addrs))
+      (let* ((dns-addrs (bitcoin-lisp.networking:discover-peers))
+             (usable (%reachable-seed-addresses dns-addrs)))
+        (log-info "Found ~D potential peers from DNS~:[~; (~:*~D dialable under -onlynet)~]"
+                  (length dns-addrs)
+                  (and (/= (length usable) (length dns-addrs)) (length usable)))
         (setf addresses (append addresses
-                                (mapcar (lambda (a) (cons a nil)) dns-addrs)))
+                                (mapcar (lambda (a) (cons a nil)) usable)))
         (setf addresses (remove-duplicates addresses :key #'car :test #'string=))))
 
     ;; Fixed-seed fallback for testnet4: even after DNS, the candidate pool
@@ -3115,7 +3139,8 @@ Returns the number of peers connected."
             (remove-duplicates
              (append addresses
                      (mapcar (lambda (a) (cons a nil))
-                             bitcoin-lisp.networking:*testnet4-fixed-seeds*))
+                             (%reachable-seed-addresses
+                              bitcoin-lisp.networking:*testnet4-fixed-seeds*)))
              :key #'car :test #'string=)))
 
     ;; Diversify by /16 netgroup so the first 8 connection attempts spread
