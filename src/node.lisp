@@ -1802,8 +1802,7 @@ Returns the node instance."
 
   ;; Wallet support (wallet P1). Default: enabled everywhere except mainnet,
   ;; where holding keys on an internet-facing node is the operator's explicit
-  ;; opt-in (-wallet), mirroring the relay/-webui safety pattern. Wallets are
-  ;; not auto-loaded; use createwallet/loadwallet.
+  ;; opt-in (-wallet), mirroring the relay/-webui safety pattern.
   (let ((wallet-enabled (if wallet-supplied-p
                             (and wallet t)
                             (not (eq network :mainnet)))))
@@ -1812,7 +1811,13 @@ Returns the node instance."
             (bitcoin-lisp.rpc:init-wallet-manager (node-data-directory *node*)
                                                   network))
       (log-info "Wallet support enabled (descriptor wallets under ~A)"
-                (merge-pathnames "wallets/" (node-data-directory *node*)))))
+                (merge-pathnames "wallets/" (node-data-directory *node*)))
+      ;; Core LoadWallets (load.cpp:118): load every wallet recorded for
+      ;; startup in settings.json. Runs here because the chainstate (above)
+      ;; and the mempool (load-mempool-from-disk) are both up, so each wallet
+      ;; can catch up from its locator and fold in the mempool; networking has
+      ;; not started, so no block can connect underneath the catch-up.
+      (bitcoin-lisp.rpc:load-wallets-on-startup *node*)))
 
   (setf (node-running *node*) t)
 
