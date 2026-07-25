@@ -461,6 +461,14 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
                                                  (%pkg-val-vsize v)))
                                validated))))
         (return-from %accept-package-subset :too-large-cluster))
+      ;; 6. Ephemeral-dust spend check over the whole subset (Core
+      ;; CheckEphemeralSpends at validation.cpp:1526 — same position, after the
+      ;; cluster-limit test and before the commit). The per-tx call in
+      ;; validate-transaction-for-mempool only sees MEMPOOL parents; a dust
+      ;; parent that is still in this package is only visible here. Read-only,
+      ;; so it keeps the atomicity above.
+      (unless (check-ephemeral-spends (mapcar #'%pkg-val-tx validated) mempool)
+        (return-from %accept-package-subset :unspent-dust))
       ;; ---- Commit point: every check passed; mutate the mempool. ----
       ;; Evict the package-RBF replaced set once, up front — the analogue of
       ;; Core applying the changeset's removals with its additions.
