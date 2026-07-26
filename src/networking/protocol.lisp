@@ -1781,6 +1781,66 @@ net_processing.cpp:1117-1136). Returns NIL when nothing remains to announce."
                      (list (peer-address->net-addr pa) (peer-address-last-seen pa)))
                    compatible))))))
 
+;;; --- getaddr response cache (Core CConnman::m_addr_response_caches) ---
+;;;
+;;; Answering every getaddr with a FRESH ~23% sample of addrman lets an
+;;; attacker reconnect repeatedly and harvest many independent samples: enough
+;;; to reconstruct much of our address table and to watch timestamps churn.
+;;; Core answers every requestor arriving on the same network with the SAME
+;;; snapshot for 21-27h, which is exactly what makes reconnecting pointless
+;;; (net.h:1621-1640, net.cpp:3694-3730).
+
+(defconstant +addr-response-cache-base-seconds+ (* 21 60 60)
+  "Base lifetime of a cached getaddr response (Core's 21 hours).")
+
+(defconstant +addr-response-cache-jitter-seconds+ (* 6 60 60)
+  "Random extra lifetime on top of the base (Core's rand(6h)), so the refresh
+instant is not predictable.")
+
+(defvar *addr-response-caches* (make-hash-table :test 'eq)
+  "Requestor network keyword -> (ADDRS . EXPIRY-UNIX). Core keys by
+(network, local listening socket) — H(RANDOMIZER_ID_NETWORKKEY, netclass,
+bind addr, bind port), net.cpp:1832-1836. We key by network ALONE. That is a
+deliberate simplification, not byte parity: our two listeners (clearnet and
+onion, node.lisp) already map to distinct network keywords through
+peer-connected-through-network, so the multi-bind case Core's key exists to
+separate is covered. Two binds on the SAME network would share a cache here.")
+
+(defun clear-addr-response-caches ()
+  "Drop every cached getaddr response (tests; also a reset point if the
+address book is rebuilt)."
+  (clrhash *addr-response-caches*))
+
+(defun %sample-addr-response (book)
+  "Take a fresh addrman sample for the cache, filtered as Core's
+GetAddressesUnsafe filters it (net.cpp:3686-3690): banned AND discouraged
+addresses are dropped HERE, at fill time."
+  (remove-if (lambda (pa)
+               (let ((s (peer-address-string pa)))
+                 (or (peer-discouraged-p s)
+                     (peer-banned-p s))))
+             (address-book-get-addr book :max +addrman-getaddr-max+
+                                         :pct +addrman-getaddr-pct+)))
+
+(defun cached-getaddr-response (book network now)
+  "The cached response for a requestor on NETWORK, refilling if absent or
+expired.
+
+The ban/discourage filter runs only when the cache is FILLED, never on a hit —
+Core returns m_addrs_response_cache verbatim (net.cpp:3729). Re-filtering per
+hit would make responses differ between requestors inside one window whenever a
+ban landed mid-window, which is precisely the fingerprinting signal the cache
+exists to erase. The visible consequence is that we keep gossiping an address
+for up to 27h after banning it; that is Core-identical and intended."
+  (let ((entry (gethash network *addr-response-caches*)))
+    (if (and entry (< now (cdr entry)))
+        (car entry)
+        (let ((addrs (%sample-addr-response book)))
+          (setf (gethash network *addr-response-caches*)
+                (cons addrs (+ now +addr-response-cache-base-seconds+
+                               (random (1+ +addr-response-cache-jitter-seconds+)))))
+          addrs))))
+
 (defun handle-getaddr (peer &optional address-book)
   "Serve a peer's getaddr: reply once per connection, and only to inbound peers,
 with up to +max-addr-count+ known addresses from ADDRESS-BOOK (defaulting to the
@@ -1800,12 +1860,14 @@ elicit more than one reply regardless of whether we had addresses to send."
                     (let ((node bitcoin-lisp::*node*))
                       (and node (bitcoin-lisp::node-address-book node))))))
       (when book
-        ;; Don't gossip discouraged addresses (Bitcoin Core skips them in relay).
-        (let* ((addrs (remove-if
-                       (lambda (pa)
-                         (peer-discouraged-p (peer-address-string pa)))
-                       (address-book-get-addr book :max +addrman-getaddr-max+
-                                                   :pct +addrman-getaddr-pct+)))
+        ;; Served from the per-network cache: every requestor arriving on this
+        ;; network sees the SAME snapshot for 21-27h, so reconnecting harvests
+        ;; nothing new. Banned/discouraged addresses were filtered when the
+        ;; cache was filled.
+        (let* ((addrs (cached-getaddr-response
+                       book
+                       (peer-connected-through-network peer)
+                       (bitcoin-lisp.serialization:get-unix-time)))
                ;; NIL when the peer is v1-only and every address was non-IP.
                (msg (and addrs (build-addr-response peer addrs))))
           (when msg
