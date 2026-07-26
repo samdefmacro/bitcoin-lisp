@@ -318,6 +318,221 @@ carry it — and be dropped before validation on re-arrival."
            peer (%pr-payload tx) utxo mempool state nil :recent-rejects rejects)
           (is (= 1 calls) "re-arrival must not be re-validated" calls))))))
 
+;;;; (e) A FAILED 1p1c package must not black-hole its members
+;;;
+;;; The mirror of section (a). When a 1p1c package fails a PACKAGE-LEVEL check
+;;; — TRUC topology, package RBF, cluster limits, ephemeral dust, or the
+;;; quit-early path — validate-package-for-mempool leaves the CHILD's phase-1
+;;; individual result untouched, and that result is :invalid / :missing-input.
+;;; Core carries exactly that nonfinal TX_MISSING_INPUTS into results_final
+;;; (validation.cpp:1759-1763) so that ProcessPackageResult can see it and do
+;;; NOTHING with it: MempoolRejectedTx's TX_MISSING_INPUTS branch is gated on
+;;; first_time_failure, which ProcessPackageResult always passes as false
+;;; (net_processing.cpp:3209), so nothing is cached and the child is not even
+;;; erased from the orphanage (txdownloadman_impl.cpp:360-362, 490-492).
+;;;
+;;; Caching it in the MAIN rejects filter instead would black-hole the child
+;;; until the next block — dropped at the handle-tx precheck, dropped from
+;;; every peer's inv by AlreadyHaveTx, and (for a non-segwit child, where
+;;; txid == wtxid) excluded from every future pairing by Find1P1CPackage's own
+;;; child-txid guard. That is the failure mode the reconsiderable-filter split
+;;; exists to remove, in the mirror direction.
+
+(defun %pr-rbf-loser-fixture ()
+  "The package-RBF loss: a well-paying RIVAL already holds the funding
+outpoint, PARENT double-spends it at a sub-floor fee, CHILD fee-bumps PARENT.
+The pair is a legitimate CPFP package, it just cannot out-earn RIVAL, so
+validate-package-for-mempool fails at the package-RBF step — a PACKAGE-level
+failure that overwrites no member result. Returns
+(values utxo mempool state rival parent child)."
+  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+    (let* ((rival (%pkg-tx funding 0 (- 100000000 50000)))     ; fee 50000
+           (parent (%pkg-tx funding 0 (- 100000000 5)))        ; fee 5
+           (child (%pkg-tx (bitcoin-lisp.serialization:transaction-hash parent)
+                           0 (- 100000000 5 10000))))          ; fee 10000
+      (values utxo mempool state rival parent child))))
+
+(test package-level-failure-keeps-the-childs-missing-input-result
+  "The precondition the P2P test below rests on, asserted directly so that
+test cannot go vacuous: a package-RBF loss is a PACKAGE-level failure, so the
+CHILD still carries the nonfinal :missing-input from phase 1 (Core
+individual_results_nonfinal -> results_final, validation.cpp:1759-1763). If
+the failure had come from the package-FEERATE step instead, the child's
+result would read :insufficient-fee and no :missing-input would ever reach
+the caller."
+  (multiple-value-bind (utxo mempool state rival parent child)
+      (%pr-rbf-loser-fixture)
+    (is (eq :ok (%add-tx mempool rival :fee 50000 :height 200)))
+    (multiple-value-bind (msg results)
+        (bitcoin-lisp.validation:validate-package-for-mempool
+         (list parent child) utxo mempool state)
+      (is (eq :insufficient-fee msg))
+      (let ((pres (%result-for results parent))
+            (cres (%result-for results child)))
+        (is (not (null pres)))
+        (is (not (null cres)))
+        (when (and pres cres)
+          (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status pres)))
+          (is (eq :insufficient-fee
+                  (bitcoin-lisp.validation:package-tx-result-error pres)))
+          (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status cres)))
+          (is (eq :missing-input
+                  (bitcoin-lisp.validation:package-tx-result-error cres))
+              "the child must still carry its nonfinal missing-input result"))))
+    ;; Nothing was admitted and RIVAL is untouched.
+    (is (= 1 (bitcoin-lisp.mempool:mempool-count mempool)))))
+
+(test failed-1p1c-package-does-not-blacklist-the-child
+  "THE regression this section exists for. A 1p1c package that loses a
+package-RBF race must not put the CHILD into the MAIN rejects filter: its
+carried failure is :missing-input, which Core caches nowhere. Driven end to
+end through handle-tx.
+
+Also asserts the two halves the walk must keep doing: the failed COMBINATION
+is remembered by package hash (Core MempoolRejectedPackage, so the same pair
+is not re-validated on every re-announcement), and the PARENT's own
+:insufficient-fee still lands in the RECONSIDERABLE filter, never the main
+one."
+  (multiple-value-bind (utxo mempool state rival parent child)
+      (%pr-rbf-loser-fixture)
+    (let* ((rid (bitcoin-lisp.serialization:transaction-hash rival))
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (pwtxid (bitcoin-lisp.serialization:transaction-wtxid parent))
+           (cid (bitcoin-lisp.serialization:transaction-hash child))
+           (cwtxid (bitcoin-lisp.serialization:transaction-wtxid child))
+           (pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool))
+           (peer (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        (%counting-tx-validations (calls)
+          ;; RIVAL wins the outpoint honestly.
+          (bitcoin-lisp.networking::handle-tx
+           peer (%pr-payload rival) utxo mempool state nil :recent-rejects rejects)
+          (is-true (bitcoin-lisp.mempool:mempool-has mempool rid))
+          ;; The sub-floor double-spending PARENT: reconsiderable, not main.
+          (bitcoin-lisp.networking::handle-tx
+           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p pwtxid))
+          ;; The CHILD: held as an orphan (one reconsiderable parent is fine).
+          (bitcoin-lisp.networking::handle-tx
+           peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+          (is-true (%pr-orphan-p mempool child))
+          ;; The parent again — this forms the package, and it FAILS.
+          (bitcoin-lisp.networking::handle-tx
+           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          ;; The package path really ran and really failed as a package.
+          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p
+                    (bitcoin-lisp.validation:package-hash (list parent child)))
+                   "the failed combination must be remembered by package hash")
+          (is-false (bitcoin-lisp.mempool:mempool-has mempool pid))
+          (is-false (bitcoin-lisp.mempool:mempool-has mempool cid))
+          (is-true (bitcoin-lisp.mempool:mempool-has mempool rid))
+          ;; THE BLOCKER: the child is cached NOWHERE, under either id.
+          (is-false (bitcoin-lisp:recent-reject-p rejects cwtxid)
+                    "child wtxid must not enter the MAIN rejects filter")
+          (is-false (bitcoin-lisp:recent-reject-p rejects cid)
+                    "child txid must not enter the MAIN rejects filter")
+          (is-false (bitcoin-lisp.validation:reconsiderable-reject-p cwtxid))
+          ;; ...and it is not erased from the orphanage either
+          ;; (txdownloadman_impl.cpp:490-492 excludes TX_MISSING_INPUTS).
+          (is-true (%pr-orphan-p mempool child))
+          ;; CONTROL (b): the parent's own fee failure is still reconsiderable.
+          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p pwtxid))
+          (is-false (bitcoin-lisp:recent-reject-p rejects pwtxid))
+          ;; The child is still RETRYABLE. Simulate the orphanage eviction
+          ;; LimitOrphans performs under load: the announcement must still be
+          ;; worth requesting (Core AlreadyHaveTx, the gate handle-inv uses)...
+          (bitcoin-lisp.mempool:orphan-remove pool cwtxid)
+          (is-false (bitcoin-lisp.networking::%already-have-tx-p
+                     cwtxid t mempool rejects t)
+                    "an inv for the child must still be requestable")
+          ;; ...and the re-sent child must reach validation instead of being
+          ;; dropped at handle-tx's precheck, and be held as an orphan again.
+          (let ((before calls))
+            (bitcoin-lisp.networking::handle-tx
+             peer (%pr-payload child) utxo mempool state nil
+             :recent-rejects rejects)
+            (is (= (1+ before) calls)
+                "re-sent child must reach validation, not the reject precheck"
+                before calls))
+          (is-true (%pr-orphan-p mempool child))
+          ;; And once the blocking condition clears — the next block confirms
+          ;; RIVAL and wipes both reject filters (Core ActiveTipChange) — the
+          ;; honest CPFP pair is accepted after all.
+          (bitcoin-lisp.mempool:mempool-remove mempool rid)
+          (bitcoin-lisp:clear-recent-rejects rejects)
+          (bitcoin-lisp.validation:clear-reconsiderable-rejects)
+          (bitcoin-lisp.networking::handle-tx
+           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          (is-true (bitcoin-lisp.mempool:mempool-has mempool pid))
+          (is-true (bitcoin-lisp.mempool:mempool-has mempool cid)))))))
+
+(defun %pr-badscript-child (parent-txid out-value)
+  "A child of PARENT-TXID whose scriptSig pushes the WRONG redeemScript, so
+the P2SH OP_EQUAL fails. Push-only and standard, so it is rejected only once
+the parent's output is actually available — i.e. individually it is a plain
+:missing-input orphan, and the hard failure surfaces inside the package."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash parent-txid :index 0)
+                    :script-sig (make-array 2 :element-type '(unsigned-byte 8)
+                                              :initial-contents '(#x01 #x00))
+                    :sequence #xffffffff))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value out-value
+                     :script-pubkey (%p2sh-optrue-spk)))
+   :lock-time 0))
+
+(test hard-failure-inside-a-1p1c-package-is-still-cached
+  "CONTROL (a) for the test above: the fix must not simply stop caching
+package members, which would be a DoS regression. A child that fails the
+package for a HARD reason — its scripts do not verify once the parent's
+output is available — still lands in the MAIN filter, still leaves the
+orphanage (Core MempoolRejectedTx's tail erases everything except
+TX_MISSING_INPUTS, txdownloadman_impl.cpp:490-492), and is dropped on
+re-arrival WITHOUT being re-validated. The parent's :insufficient-fee still
+goes to the reconsiderable filter — CONTROL (b) again, on this path."
+  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+    (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))        ; fee 5
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (pwtxid (bitcoin-lisp.serialization:transaction-wtxid parent))
+           (child (%pr-badscript-child pid (- 100000000 5 10000)))
+           (cid (bitcoin-lisp.serialization:transaction-hash child))
+           (cwtxid (bitcoin-lisp.serialization:transaction-wtxid child))
+           (peer (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        (%counting-tx-validations (calls)
+          (bitcoin-lisp.networking::handle-tx
+           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p pwtxid))
+          (bitcoin-lisp.networking::handle-tx
+           peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+          (is-true (%pr-orphan-p mempool child)
+                   "the bad child must be an orphan first, or the package
+never forms and this control asserts nothing")
+          ;; Form the package; the child fails hard inside it.
+          (bitcoin-lisp.networking::handle-tx
+           peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+          (is (zerop (bitcoin-lisp.mempool:mempool-count mempool)))
+          (is-true (bitcoin-lisp:recent-reject-p rejects cwtxid)
+                   "a hard package failure must still be cached")
+          (is-false (bitcoin-lisp.validation:reconsiderable-reject-p cwtxid))
+          (is-false (%pr-orphan-p mempool child)
+                    "a hard failure must leave the orphanage")
+          ;; CONTROL (b): the parent is still only reconsiderable.
+          (is-true (bitcoin-lisp.validation:reconsiderable-reject-p pwtxid))
+          (is-false (bitcoin-lisp:recent-reject-p rejects pwtxid))
+          ;; Re-announced: dropped at the precheck, never re-validated.
+          (let ((before calls))
+            (bitcoin-lisp.networking::handle-tx
+             peer (%pr-payload child) utxo mempool state nil
+             :recent-rejects rejects)
+            (is (= before calls)
+                "a cached hard failure must not be re-validated" before calls))
+          (is-false (%pr-orphan-p mempool child))
+          (is-false (bitcoin-lisp.mempool:mempool-has mempool cid)))))))
+
 ;;;; Filter plumbing
 
 (test package-hash-is-order-independent

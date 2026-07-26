@@ -680,8 +680,10 @@ matches unreliable; for non-segwit txs txid == wtxid so the cast still finds
 them), the recent-confirmed filter, recent rejects, and the mempool by the id
 the announcement implies.
 
-INCLUDE-RECONSIDERABLE is Core's parameter of the same name (:125, :199,
-:274). Set it where the question is \"is there any point requesting this?\" —
+INCLUDE-RECONSIDERABLE is Core's parameter of the same name (declared at
+:125, consulted at :142). Core passes TRUE at exactly one site,
+AddTxAnnouncement (:199); every other caller passes false (:180, :274, :395,
+:527). Set it where the question is \"is there any point requesting this?\" —
 a tx that failed reconsiderably must not be re-downloaded to be submitted
 alone. Leave it NIL where the question is \"can this still be resolved?\" —
 notably when filtering an orphan's missing parents, since a low-feerate
@@ -1213,9 +1215,23 @@ is not a fee problem and a package cannot fix it.")
   (and (member reason +reconsiderable-tx-failures+) t))
 
 (defun %cache-tx-rejection (tx reason recent-rejects)
-  "Core MempoolRejectedTx's caching rules for a failure that is NOT
-:missing-input (txdownloadman_impl.cpp:438-484):
+  "Core MempoolRejectedTx's caching rules, for the first_time_failure=false
+callers this node has (txdownloadman_impl.cpp:350-484):
 
+  - :missing-input is cached NOWHERE (:361-364). Core's TX_MISSING_INPUTS
+    branch does orphan INTAKE, and only when first_time_failure is true;
+    at first_time_failure=false — which is what every caller here is — the
+    whole branch is a no-op. A missing input is not a verdict on the
+    transaction: the parent may still arrive, or the pair may still be
+    submitted as a package. Caching it in the main filter would black-hole
+    the CHILD of a CPFP pair, which is the mirror of the bug the
+    reconsiderable filter exists to fix. This arm matters because a
+    package member can REACH here carrying :missing-input: a package-LEVEL
+    failure (TRUC topology, package RBF, cluster limits, ephemeral dust, or
+    the quit-early path) leaves the child's nonfinal phase-1 result
+    untouched, and Core deliberately carries that nonfinal
+    TX_MISSING_INPUTS into results_final (validation.cpp:1759-1763) so that
+    ProcessPackageResult can see it and do nothing with it.
   - RECONSIDERABLE failures go to the SEPARATE reconsiderable filter, keyed
     by wtxid (:454-459). They must not enter the main filter: an entry there
     is permanent until the next block, and would black-hole the transaction
@@ -1229,6 +1245,7 @@ is not a fee problem and a package cannot fix it.")
   (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
         (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
     (cond
+      ((eq reason :missing-input) nil)
       ((eq reason :witness-stripped) nil)
       ((%reconsiderable-failure-p reason)
        (bitcoin-lisp.validation:add-reconsiderable-reject wtxid))
@@ -1405,7 +1422,12 @@ re-validated on every re-announcement; members are walked CHILD FIRST, so
 an in-package descendant leaves the orphanage before the parent's de-orphan
 cascade could pick it up again; an accepted member takes the ordinary
 accept tail; and a member that failed is cached under Core's
-first_time_failure=false rules — no orphan intake, no further 1p1c."
+first_time_failure=false rules — no orphan intake, no further 1p1c.
+
+Note the CHILD of a package that failed a PACKAGE-LEVEL check still carries
+its nonfinal phase-1 :missing-input result, which under those rules is
+cached NOWHERE and does not even leave the orphanage. Caching it would
+black-hole an honest CPFP child after a single lost package attempt."
   (let ((child (%find-1p1c-package peer parent-tx mempool recent-rejects)))
     (when child
       (let ((package (list parent-tx child)))
@@ -1419,14 +1441,36 @@ first_time_failure=false rules — no orphan intake, no further 1p1c."
           ;; RESULTS is in package order; walk it backwards.
           (loop for tx in (reverse package)
                 for res in (reverse results)
-                do (case (bitcoin-lisp.validation:package-tx-result-status res)
-                     (:valid
-                      (%after-mempool-accept tx peer peers utxo-set mempool
-                                             chain-state recent-rejects))
-                     (:invalid
-                      (%cache-tx-rejection
-                       tx (bitcoin-lisp.validation:package-tx-result-error res)
-                       recent-rejects))))
+                do (let ((err (bitcoin-lisp.validation:package-tx-result-error res)))
+                     (case (bitcoin-lisp.validation:package-tx-result-status res)
+                       (:valid
+                        (%after-mempool-accept tx peer peers utxo-set mempool
+                                               chain-state recent-rejects))
+                       ;; Core routes INVALID and DIFFERENT_WITNESS through the
+                       ;; same ProcessInvalidTx (net_processing.cpp:3204-3212).
+                       ;; A DIFFERENT_WITNESS result carries a
+                       ;; default-constructed (TX_RESULT_UNSET) state
+                       ;; (validation.h:228-229), so MempoolRejectedTx's final
+                       ;; else caches its wtxid in the main filter — which is
+                       ;; what %CACHE-TX-REJECTION does for a NIL reason.
+                       ((:invalid :different-witness)
+                        ;; :missing-input is cached nowhere and does NOT leave
+                        ;; the orphanage: a package-LEVEL failure leaves the
+                        ;; child's nonfinal phase-1 result untouched, and Core
+                        ;; deliberately does nothing with it here
+                        ;; (txdownloadman_impl.cpp:361-364, :489-492).
+                        (%cache-tx-rejection tx err recent-rejects)
+                        (unless (eq err :missing-input)
+                          (bitcoin-lisp.mempool:orphan-remove
+                           (bitcoin-lisp.mempool:mempool-orphan-pool mempool)
+                           (bitcoin-lisp.serialization:transaction-wtxid tx))))
+                       ;; :not-validated — a context-free package check
+                       ;; (well-formedness, child-with-parents) failed before
+                       ;; any member was processed. Core's ProcessNewPackage
+                       ;; returns no per-tx results at all in that case and
+                       ;; ProcessPackageResult's `it_result != end()` guard
+                       ;; skips them, so nothing is cached: deliberate.
+                       (otherwise nil))))
           t)))))
 
 (defun %orphan-parents-rejected-p (parent-txids recent-rejects)
