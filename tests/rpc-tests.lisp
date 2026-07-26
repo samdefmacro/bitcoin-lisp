@@ -3461,6 +3461,79 @@ mining order (parent's first)."
       (is (= 100 (round (* 100000000
                            (cdr (assoc "chunkfee" (second chunks) :test #'string=)))))))))
 
+;;; --- /rest/headers active-chain membership ---
+
+(defmacro %with-rest-count ((count) &body body)
+  "Run BODY with hunchentoot's `count` query parameter stubbed to COUNT.
+The REST handlers read it through hunchentoot:get-parameter, which needs a
+live *request*; swapping the fdefinition is the smallest seam that lets the
+real handler run unmodified."
+  (let ((orig (gensym "ORIG")))
+    `(let ((,orig (fdefinition 'hunchentoot:get-parameter)))
+       (unwind-protect
+            (progn (setf (fdefinition 'hunchentoot:get-parameter)
+                         (lambda (name &optional request)
+                           (declare (ignore request))
+                           (when (string= name "count") ,count)))
+                   ,@body)
+         (setf (fdefinition 'hunchentoot:get-parameter) ,orig)))))
+
+(test rest-headers-refuses-fork-start-and-stays-contiguous
+  "/rest/headers walks forward by ABSOLUTE HEIGHT via get-block-at-height,
+which descends from the ACTIVE tip — so a start header on a FORK used to be
+spliced onto the active chain's successors and the reply was not a chain at
+all (headers[1].previousblockhash did not name headers[0]). Core's loop is
+`while (pindex && active_chain.Contains(pindex))` with active_chain.Next
+(rest.cpp:227-232), so a fork start yields an EMPTY result and contiguity is
+structural."
+  (multiple-value-bind (cs entries) (%make-served-chain 2) ; heights 0,1,2
+    (let* ((node (make-test-node))
+           (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+           (genesis (first entries))
+           (genesis-hex (bitcoin-lisp.rpc::hash-to-hex
+                         (bitcoin-lisp.storage:block-index-entry-hash genesis)))
+           ;; A competing block at height 1, off the active chain.
+           (fork-header (bitcoin-lisp.serialization:make-block-header
+                         :version 1
+                         :prev-block (bitcoin-lisp.storage:block-index-entry-hash genesis)
+                         :merkle-root (make-32-byte-hash 99)
+                         :timestamp 1700000500 :bits #x1d00ffff :nonce 4242))
+           (fork-hash (bitcoin-lisp.serialization:block-header-hash fork-header))
+           (fork-hex (bitcoin-lisp.rpc::hash-to-hex fork-hash)))
+      (setf (bitcoin-lisp::node-chain-state node) cs)
+      (bitcoin-lisp.storage:add-block-index-entry
+       cs (bitcoin-lisp.storage:make-block-index-entry
+           :hash fork-hash :height 1 :header fork-header
+           :prev-entry genesis :chain-work 2 :status :valid))
+      ;; The fork block really is known to the index but not on the active
+      ;; chain — otherwise the assertions below would pass for the wrong reason.
+      (is-true (bitcoin-lisp.storage:get-block-index-entry cs fork-hash))
+      (is-false (bitcoin-lisp.storage:entry-on-active-chain-p
+                 cs (bitcoin-lisp.storage:get-block-index-entry cs fork-hash)))
+      (flet ((rest-get (hex ext)
+               (bitcoin-lisp.rpc::rest-handle
+                node (format nil "/rest/headers/~A.~A" hex ext))))
+        (%with-rest-count ("3")
+          ;; Fork start: empty, in every representation. Before the fix this
+          ;; was [fork@1, active@2] — two headers that are not a chain.
+          (is (string= "[]" (rest-get fork-hex "json")))
+          (is (= 200 (hunchentoot:return-code*)))
+          (is (string= (format nil "~%") (rest-get fork-hex "hex")))
+          (is (zerop (length (rest-get fork-hex "bin"))))
+          ;; CONTROL: an active-chain start still returns COUNT headers...
+          (let* ((body (rest-get genesis-hex "json"))
+                 (parsed (let ((yason:*parse-json-arrays-as-vectors* t))
+                           (yason:parse body))))
+            (is (= 3 (length parsed)))
+            ;; ...and they form a real chain.
+            (loop for i from 1 below (length parsed)
+                  do (is (string= (gethash "hash" (aref parsed (1- i)))
+                                  (gethash "previousblockhash" (aref parsed i)))
+                         "header ~D does not follow header ~D" i (1- i))))
+          ;; 3 headers * 80 bytes, plus the trailing newline .hex adds.
+          (is (= (1+ (* 3 160)) (length (rest-get genesis-hex "hex"))))
+          (is (= (* 3 80) (length (rest-get genesis-hex "bin")))))))))
+
 ;;; --- /rest/health liveness decision (item #6) ---
 
 (test rest-health-decision-logic
