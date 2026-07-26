@@ -31,11 +31,13 @@ function b64(s) {
   return btoa(String.fromCharCode(...new TextEncoder().encode(s)));
 }
 
-// Store credentials for this tab. Empty user AND pass = "no credentials"
-// mode (open local RPC): an empty marker is stored so the login state is
-// remembered, but no Authorization header is sent.
+// Store credentials for this tab. The node requires a credential on every
+// request, so an empty pair is rejected here rather than producing a session
+// that 401s on its first call.
 export function setCredentials(user, pass) {
-  sessionStorage.setItem(AUTH_KEY, (user || pass) ? b64(`${user}:${pass}`) : '');
+  if (!user && !pass) return false;
+  sessionStorage.setItem(AUTH_KEY, b64(`${user}:${pass}`));
+  return true;
 }
 
 export function clearCredentials() {
@@ -43,7 +45,7 @@ export function clearCredentials() {
 }
 
 export function hasCredentials() {
-  return sessionStorage.getItem(AUTH_KEY) !== null;
+  return !!sessionStorage.getItem(AUTH_KEY);
 }
 
 async function post(payload, endpoint) {
