@@ -2327,7 +2327,18 @@ v1 compact block would deliver a witness-stripped coinbase."
    - On success: block is the full block, missing-indexes is NIL
    - On missing txs: block is NIL, missing-indexes is list of needed indexes,
      partial-transactions is array with found txs filled in
-   - On collision: block is NIL, missing-indexes is :collision"
+   - On collision: block is NIL, missing-indexes is :COLLISION
+   - On a structurally malformed message: block is NIL, missing-indexes is
+     :MALFORMED
+
+:COLLISION and :MALFORMED are Core's two distinct PartiallyDownloadedBlock::
+InitData failures and the caller must NOT conflate them (blockencodings.cpp:
+59-120). :MALFORMED is READ_STATUS_INVALID — a message no honest peer can
+send (no transactions at all, an absurd transaction count, a prefilled index
+outside the block, fewer short IDs than empty slots) — and Core answers it with
+Misbehaving (net_processing.cpp:4680-4683). :COLLISION is READ_STATUS_FAILED —
+two of OUR OWN mempool transactions sharing a short ID, which is nobody's
+fault — and Core answers it with a plain full-block getdata (:4683-4694)."
   (let* ((header (bitcoin-lisp.serialization:compact-block-header compact-block))
          (nonce (bitcoin-lisp.serialization:compact-block-nonce compact-block))
          (short-ids-list (bitcoin-lisp.serialization:compact-block-short-ids compact-block))
@@ -2337,10 +2348,11 @@ v1 compact block would deliver a witness-stripped coinbase."
          ;; Convert short-ids list to vector for O(1) access
          (short-ids (coerce short-ids-list 'vector)))
 
-    ;; Validate tx-count is reasonable (prevent DoS)
+    ;; Validate tx-count is reasonable (prevent DoS). Core InitData's first two
+    ;; guards, both READ_STATUS_INVALID (blockencodings.cpp:62-66).
     (when (or (zerop tx-count) (> tx-count 100000))
       (bitcoin-lisp:log-warn "Invalid compact block tx count: ~D" tx-count)
-      (return-from reconstruct-compact-block (values nil :collision)))
+      (return-from reconstruct-compact-block (values nil :malformed)))
 
     ;; Compute SipHash keys
     (multiple-value-bind (k0 k1)
@@ -2368,18 +2380,22 @@ v1 compact block would deliver a witness-stripped coinbase."
                   (setf (aref transactions idx)
                         (bitcoin-lisp.serialization:prefilled-tx-transaction ptx))
                   (progn
+                    ;; Core's lastprefilledindex bounds check, READ_STATUS_INVALID
+                    ;; (blockencodings.cpp:78-84).
                     (bitcoin-lisp:log-warn "Prefilled tx index out of bounds: ~D (max ~D)"
                                            idx (1- tx-count))
-                    (return-from reconstruct-compact-block (values nil :collision nil))))))
+                    (return-from reconstruct-compact-block (values nil :malformed nil))))))
 
           ;; Fill remaining slots with mempool transactions matched by short ID
           (dotimes (i tx-count)
             (when (null (aref transactions i))
               ;; This slot needs a transaction from short IDs
               (when (>= short-id-idx (length short-ids))
-                ;; More empty slots than short IDs - malformed message
+                ;; More empty slots than short IDs — a slot with neither a
+                ;; prefilled tx nor a short ID. READ_STATUS_INVALID in Core
+                ;; (blockencodings.cpp:80-84).
                 (bitcoin-lisp:log-warn "Short ID count mismatch")
-                (return-from reconstruct-compact-block (values nil :collision nil)))
+                (return-from reconstruct-compact-block (values nil :malformed nil)))
               (let* ((short-id (aref short-ids short-id-idx))
                      (tx-pair (gethash short-id shortid-map)))
                 (if tx-pair
@@ -2407,11 +2423,48 @@ v1 compact block would deliver a witness-stripped coinbase."
 
 (defun handle-cmpctblock (peer payload chain-state utxo-set block-store mempool
                           &optional fee-estimator &key recent-rejects)
-  "Handle a cmpctblock message. Attempt reconstruction from mempool."
+  "Handle a cmpctblock message. Attempt reconstruction from mempool.
+
+Punishment here is reserved for STRUCTURALLY malformed messages. A compact
+block that merely fails validation must never discourage its sender: BIP152
+lets a peer relay a compact block having validated only the header, so Core
+records the source with via_compact_block=true (mapBlockSource ... /*punish=*/
+false, net_processing.cpp:4778, inverted at :2211) and MaybePunishNodeForBlock
+then skips BLOCK_CONSENSUS / BLOCK_MUTATED entirely (:1920-1926). We fall back
+to a full-block getdata instead — which is exactly what Core does one layer
+down for the same shape, since a reconstruction that produced a mutated block
+is READ_STATUS_FAILED -> getdata (blockencodings.cpp FillBlock, net_processing
+.cpp:4683-4694). If the block really is invalid, the full copy arrives on the
+BLOCK path, where via_compact_block is false and HANDLE-BLOCK does punish."
   (let* ((compact-block (bitcoin-lisp.serialization:parse-cmpctblock-payload payload))
          (header (bitcoin-lisp.serialization:compact-block-header compact-block))
          (block-hash (bitcoin-lisp.serialization:block-header-hash header))
+         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
          (use-wtxid (= (peer-compact-block-version peer) 2)))
+
+    ;; Parent not in the index: the announcement outran our header chain. This
+    ;; is the ORDINARY case, not an attack — high-bandwidth compact relay beats
+    ;; headers announcements by design, so falling one block behind while a
+    ;; getblocktxn round-trip is in flight is enough. Core asks for deeper
+    ;; headers and returns before it can DoS-score anything
+    ;; (net_processing.cpp:4571-4577); reconstructing here instead would hand
+    ;; ACCEPT-DOWNLOADED-BLOCK a block whose parent entry is missing, i.e.
+    ;; :ORPHAN-BLOCK, and permanently exile our fastest honest block-relay peer.
+    ;; Checked BEFORE the stale-pending clear below, so an announcement we are
+    ;; about to ignore cannot also destroy an in-flight reconstruction of the
+    ;; block we are actually missing (Core keeps per-block in-flight state, so
+    ;; it has no such cross-talk).
+    (unless (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)
+      (bitcoin-lisp:log-cat "net"
+                            "cmpctblock ~A: parent ~A not in index — getheaders to ~A"
+                            (bitcoin-lisp.crypto:bytes-to-hex block-hash)
+                            (bitcoin-lisp.crypto:bytes-to-hex prev-hash)
+                            (peer-address peer))
+      ;; Core gates the getheaders on !IsInitialBlockDownload(): during IBD the
+      ;; header sync owns the locator and an extra request is noise.
+      (unless (initial-block-download-p chain-state)
+        (request-headers-for-ibd peer chain-state))
+      (return-from handle-cmpctblock nil))
 
     ;; Clear any old pending reconstruction for different block
     (when (peer-pending-compact-block peer)
@@ -2419,12 +2472,6 @@ v1 compact block would deliver a witness-stripped coinbase."
                            (peer-pending-compact-block peer))))
         (unless (equalp pending-hash block-hash)
           (setf (peer-pending-compact-block peer) nil))))
-
-    ;; Skip if we already have this block connected
-    (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
-      (when (and entry
-                 (eq (bitcoin-lisp.storage:block-index-entry-status entry) :connected))
-        (return-from handle-cmpctblock nil)))
 
     ;; Attempt reconstruction
     (multiple-value-bind (block missing-indexes partial-transactions)
@@ -2447,12 +2494,20 @@ v1 compact block would deliver a witness-stripped coinbase."
                                         :fee-estimator fee-estimator
                                         :recent-rejects recent-rejects)
              (unless valid
-               (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
-               (record-misbehavior peer "invalid compact block")))))
+               (bitcoin-lisp:log-warn "Reconstructed block ~A invalid: ~A — refetching in full"
+                                      (bitcoin-lisp.crypto:bytes-to-hex block-hash) error)
+               (request-full-block peer block-hash)))))
 
-        ;; Collision or malformed - fall back to full block
-        ((eq missing-indexes :collision)
+        ;; Structurally malformed message — Core READ_STATUS_INVALID ->
+        ;; Misbehaving (net_processing.cpp:4679-4683). This is the one
+        ;; compact-block shape an honest peer cannot produce.
+        ((eq missing-indexes :malformed)
          (increment-compact-block-failure)
+         (record-misbehavior peer "invalid compact block"))
+
+        ;; Short-ID collision in OUR mempool — nobody's fault, fall back to the
+        ;; full block (Core READ_STATUS_FAILED, net_processing.cpp:4683-4694).
+        ((eq missing-indexes :collision)
          (request-full-block peer block-hash))
 
         ;; Missing transactions - request them
@@ -2475,7 +2530,13 @@ v1 compact block would deliver a witness-stripped coinbase."
 
 (defun handle-blocktxn (peer payload chain-state utxo-set block-store mempool
                         &optional fee-estimator &key recent-rejects)
-  "Handle a blocktxn message. Complete pending block reconstruction."
+  "Handle a blocktxn message. Complete pending block reconstruction.
+
+Same punishment rule as HANDLE-CMPCTBLOCK: a completed reconstruction that
+fails validation is a compact-block delivery (mapBlockSource ... /*punish=*/
+false, net_processing.cpp:3516), so it gets a full-block refetch and no
+discouragement. Only a blocktxn that does not answer the getblocktxn we sent —
+Core's READ_STATUS_INVALID from FillBlock — is punished (:3487-3491)."
   (let ((response (bitcoin-lisp.serialization:parse-blocktxn-payload payload))
         (pending (peer-pending-compact-block peer)))
 
@@ -2494,10 +2555,17 @@ v1 compact block would deliver a witness-stripped coinbase."
       ;; Insert missing transactions
       (let ((transactions (pending-compact-block-transactions pending))
             (missing-indexes (pending-compact-block-missing-indexes pending)))
+        ;; A blocktxn that does not deliver exactly the transactions we asked
+        ;; for is structurally malformed: Core's FillBlock returns
+        ;; READ_STATUS_INVALID for both too few and too many
+        ;; (blockencodings.cpp:198-217) and the peer is punished
+        ;; (net_processing.cpp:3487-3491).
         (when (/= (length txs) (length missing-indexes))
           (bitcoin-lisp:log-warn "blocktxn transaction count mismatch")
           (setf (peer-pending-compact-block peer) nil)
-          (request-full-block peer block-hash)
+          (increment-compact-block-failure)
+          (record-misbehavior peer
+                              "invalid compact block/non-matching block transactions")
           (return-from handle-blocktxn nil))
 
         (loop for tx in txs
@@ -2522,8 +2590,9 @@ v1 compact block would deliver a witness-stripped coinbase."
                                          :fee-estimator fee-estimator
                                          :recent-rejects recent-rejects)
               (unless valid
-                (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
-                (record-misbehavior peer "invalid reconstructed block")))))))))
+                (bitcoin-lisp:log-warn "Completed block ~A invalid: ~A — refetching in full"
+                                       (bitcoin-lisp.crypto:bytes-to-hex block-hash) error)
+                (request-full-block peer block-hash)))))))))
 
 (defun request-full-block (peer block-hash)
   "Request a full block (fallback from compact block)."
