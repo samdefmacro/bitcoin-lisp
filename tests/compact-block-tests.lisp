@@ -427,6 +427,35 @@ BLOCK_MISSING_PREV punishment (:1938-1944) is unreachable via the compact path."
                "an honest peer relaying ahead of our headers must not be discouraged")
      (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))))
 
+(test cmpctblock-unknown-parent-sends-no-getheaders-during-ibd
+  "GA8 W4. Core gates the unknown-parent getheaders on
+!IsInitialBlockDownload() (net_processing.cpp:4572-4574) — during IBD the
+header sync owns the locator and an unsolicited getheaders per stray
+cmpctblock is pure noise. The early return, and the absence of punishment,
+still hold. Without this test the IBD gate is an unasserted clause: the
+unknown-parent test above pins *cached-is-ibd* to NIL and cannot distinguish a
+gated getheaders from an ungated one."
+  (%with-regtest
+   (let* ((bitcoin-lisp.networking::*cached-is-ibd* t)
+          (addr "203.0.113.47")
+          (peer (%cbp-peer addr))
+          ;; No tip at all ⇒ initial-block-download-p stays latched at T.
+          (state (bitcoin-lisp.storage:make-chain-state))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (cb (%cbp-one-tx-compact-block (%cbp-hash #xAB) 0 (make-simple-tx #x14)))
+          (sent (%cbp-capture-sends
+                 (lambda ()
+                   (bitcoin-lisp.networking::handle-cmpctblock
+                    peer (%cbp-payload cb) state utxo nil
+                    (bitcoin-lisp.mempool:make-mempool))))))
+     (is-true bitcoin-lisp.networking::*cached-is-ibd*
+              "fixture must still be in IBD or this test asserts nothing")
+     (is (null sent)
+         "no getheaders may be sent for an unknown-parent cmpctblock during IBD, sent: ~S"
+         sent)
+     (is-false (bitcoin-lisp.networking:peer-discouraged-p addr))
+     (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))))
+
 (test cmpctblock-invalid-reconstruction-refetches-instead-of-discouraging
   "GA8 W4. When the parent IS known and reconstruction succeeds but the block
 fails validation, fall back to a full-block getdata -- never discourage.
