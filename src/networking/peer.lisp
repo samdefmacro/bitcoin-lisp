@@ -330,6 +330,23 @@ Returns NIL if the host is banned or discouraged (never dial either)."
         (init-peer-rate-limiters peer)
         peer))))
 
+(defun peer-live-p (peer)
+  "T while PEER is still a connection we could actually use — our stand-in for
+Core's `!pfrom.fDisconnect`.
+
+Core marks a node it has decided to retire with fDisconnect and then refuses
+to give it anything more; the socket handler reaps it on the next pass and
+FinalizeNode runs. We have no fDisconnect flag: our retirement paths set the
+state instead — DISCONNECT-PEER and RECORD-MISBEHAVIOR to :disconnected,
+BAN-PEER to :banned — so those two states are our \"already retired\".
+
+Anything that hands a retired peer a RESOURCE must consult this first: the
+peer will never be retired a second time, so whatever it was granted is never
+given back. (REPLACE-DISCONNECTED-PEERS reaps :disconnected peers straight out
+of NODE-PEERS and never reaps :banned ones at all — neither reap runs a
+release, because by then the retirement that set the state already did.)"
+  (not (member (peer-state peer) '(:disconnected :banned))))
+
 ;;; --- Chain-sync protection slots (Core
 ;;; m_outbound_peers_with_protect_from_disconnect) ---
 ;;;
@@ -359,9 +376,19 @@ chain at least as good as our tip (Core net_processing.cpp:2946-2956), up to
 MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.
 
 Block-relay peers are deliberately NOT protected — Core keeps them always
-subject to the bad/lagging chain logic."
+subject to the bad/lagging chain logic.
+
+A peer that has ALREADY been retired is refused (PEER-LIVE-P = Core's
+`!pfrom.fDisconnect` on :2951). Without that clause the grant is a permanent
+slot leak: the retirement that would hand the slot back has already happened,
+so the increment is never undone and after four of them no peer can ever earn
+protection again. Core needs the guard because the sub-minchainwork drop
+(:2926-2944) sets fDisconnect a few lines ABOVE this grant on the same peer in
+the same pass, and both conditions are satisfied at once by the common IBD
+case of a peer whose best-known beats our low tip but misses the work floor."
   (bt:with-lock-held (*outbound-protection-lock*)
     (when (and (not (peer-chain-sync-protect peer))
+               (peer-live-p peer)
                (not (peer-inbound peer))
                (not (peer-manual peer))
                (eq (peer-conn-type peer) :outbound-full-relay)
