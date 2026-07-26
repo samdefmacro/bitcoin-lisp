@@ -927,40 +927,74 @@ never received the branch's blocks."
                        :context-free-only t)
                     (if valid (progn (%connect) (values t nil)) (values nil error))))))))))
 
+(defun %block-newly-connected-p (chain-state hash tip-before)
+  "T when accepting the block HASH actually ADVANCED the active chain onto it.
+TIP-BEFORE is BEST-BLOCK-HASH sampled before ACCEPT-DOWNLOADED-BLOCK ran.
+
+This is the BlockChecked gate. Core reaches
+MaybeSetPeerAsAnnouncingHeaderAndIDs only from BlockChecked's `state.IsValid()'
+arm (net_processing.cpp:2214-2223), and the only emit site that can produce a
+VALID state is ConnectTip (validation.cpp:3070): ProcessNewBlock's other emit
+(:4455) is the AcceptBlock-failure path, and a block we already have
+short-circuits inside AcceptBlock long before ConnectTip. So a block Core never
+connects promotes nobody, and a REPLAY of a block we already hold promotes
+nobody either.
+
+ACCEPT-DOWNLOADED-BLOCK's `valid' value cannot express that on its own: it is T
+for a block merely STORED on a side branch (the :context-free-only arm above)
+and T again for a block we already hold — including a replay of our own tip,
+for which `(equalp (best-block-hash cs) hash)' alone is TRIVIALLY TRUE, since
+the tip already is that block. Hence TIP-BEFORE: the tip must have MOVED, and
+it must have moved onto this very block. Without it any inbound peer that sent
+sendcmpct could echo our own tip back and buy a high-bandwidth slot for free,
+repeatedly, choosing which honest peer the cap-of-3 eviction demotes.
+
+Conservative in exactly one direction, deliberately: if accepting HASH also
+reconnects already-stored descendants, the tip lands above it and we do not
+promote where Core would. Failing closed costs a little bandwidth; failing open
+sells an HB slot."
+  (and (not (equalp tip-before hash))
+       (equalp (bitcoin-lisp.storage:best-block-hash chain-state) hash)))
+
 (defun handle-block (peer payload chain-state utxo-set block-store
                      &optional mempool fee-estimator &key recent-rejects peers)
   "Handle a block message. When PEERS is supplied and the block becomes the new
 active tip, announce it onward (BIP 130 headers / inv), so the node propagates
-blocks instead of being a sink. A peer that delivers a VALID block earns
-consideration for high-bandwidth compact-block announcements — Core drives that
-off mapBlockSource (net_processing.cpp:2202, 2218-2223), which is filled for
-plain block messages exactly as it is for reconstructed compact ones, so
-promotion must not be a compact-block-only privilege."
+blocks instead of being a sink. A peer that delivers a block that CONNECTS
+earns consideration for high-bandwidth compact-block announcements — Core
+drives that off mapBlockSource (net_processing.cpp:2202, 2218-2223), which is
+filled for plain block messages exactly as it is for reconstructed compact
+ones, so promotion must not be a compact-block-only privilege."
   (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
     (when block
-      (let ((accepted
+      (let ((connected
               (with-node-lock
                 (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-                       (hash (bitcoin-lisp.serialization:block-header-hash header)))
+                       (hash (bitcoin-lisp.serialization:block-header-hash header))
+                       (tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
                   (multiple-value-bind (valid error)
                       (accept-downloaded-block block chain-state utxo-set block-store
                                                :mempool mempool
                                                :fee-estimator fee-estimator
                                                :recent-rejects recent-rejects)
-                    (if valid
-                        ;; Announce onward only if this block is now the active
-                        ;; tip (accept may have stored a side block or reorged).
-                        (when (and peers
-                                   (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
-                                           hash))
-                          (relay-block header peer peers))
-                        (progn
-                          (bitcoin-lisp:log-warn "Block ~A rejected: ~A"
-                                                 (bitcoin-lisp.crypto:bytes-to-hex hash) error)
-                          (record-misbehavior peer "invalid block")))
-                    valid)))))
+                    (cond
+                      (valid
+                       ;; Announce onward only if this block is now the active
+                       ;; tip (accept may have stored a side block or reorged).
+                       (when (and peers
+                                  (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                                          hash))
+                         (relay-block header peer peers))
+                       ;; Promotion needs strictly more than acceptance: the
+                       ;; block must have CONNECTED (see %block-newly-connected-p).
+                       (%block-newly-connected-p chain-state hash tip-before))
+                      (t
+                       (bitcoin-lisp:log-warn "Block ~A rejected: ~A"
+                                              (bitcoin-lisp.crypto:bytes-to-hex hash) error)
+                       (record-misbehavior peer "invalid block")
+                       nil)))))))
         ;; Outside the node lock: promotion writes sendcmpct to up to two peers.
-        (when accepted
+        (when connected
           (maybe-promote-block-deliverer peer chain-state))))))
 
 ;;; Address handling
@@ -2361,20 +2395,28 @@ Four subtleties, each of which Core spells out:
   "Consider promoting PEER to HB after it delivered a block (Core BlockChecked,
 net_processing.cpp:2207-2223).
 
-CALL THIS ONLY ONCE THE BLOCK HAS VALIDATED. Core's BlockChecked splits on the
-validation result: an INVALID block goes to MaybePunishNodeForBlock (:2207),
-and only the `state.IsValid()` arm reaches MaybeSetPeerAsAnnouncingHeaderAndIDs
-(:2218-2223). Promoting before validation lets a peer that delivers a
-reconstructible-but-invalid compact block buy an HB slot and, through the
-cap-of-3 eviction, demote an honest one — an attacker-chosen swap for the price
-of one bad block. The transport does not matter: Core drives this off
+CALL THIS ONLY ONCE THE BLOCK HAS CONNECTED — validating is not enough. Core's
+BlockChecked splits on the validation result: an INVALID block goes to
+MaybePunishNodeForBlock (:2207), and only the `state.IsValid()` arm reaches
+MaybeSetPeerAsAnnouncingHeaderAndIDs (:2218-2223). Promoting before validation
+lets a peer that delivers a reconstructible-but-invalid compact block buy an HB
+slot and, through the cap-of-3 eviction, demote an honest one — an
+attacker-chosen swap for the price of one bad block.
+
+And a VALID state can only ever come from ConnectTip (validation.cpp:3070);
+ProcessNewBlock's other BlockChecked emit (:4455) is the AcceptBlock-failure
+path, and a block we already hold short-circuits inside AcceptBlock and never
+reaches ConnectTip. So the transports must gate on the block having ADVANCED
+THE TIP (%block-newly-connected-p), not on ACCEPT-DOWNLOADED-BLOCK's `valid',
+which is also T for a side-branch store and for a replay of our own tip — the
+free-HB-slot echo. The transport itself does not matter: Core drives this off
 mapBlockSource, which is filled for full blocks as well as compact ones, so
-every delivery path must reach here after (and only after) it validates.
+every delivery path must reach here after (and only after) it connects.
 
 Core's gate is state.IsValid() AND !IsInitialBlockDownload() AND
 mapBlocksInFlight.count(hash) == mapBlocksInFlight.size() — that last clause
 being its proxy for \"this delivery was not part of a batch download\". We gate
-on validity and not-IBD only. DOCUMENTED DIVERGENCE: we may therefore promote
+on connection and not-IBD only. DOCUMENTED DIVERGENCE: we may therefore promote
 somewhat more eagerly than Core mid-download. The blast radius is bounded — the
 cap of 3, the move-to-back on re-selection, and the inbound-protection swap all
 still apply — but it is a real difference and is left as a follow-up rather
@@ -2531,11 +2573,18 @@ v1 compact block would deliver a witness-stripped coinbase."
         (unless (equalp pending-hash block-hash)
           (setf (peer-pending-compact-block peer) nil))))
 
-    ;; Skip if we already have this block connected
-    (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
-      (when (and entry
-                 (eq (bitcoin-lisp.storage:block-index-entry-status entry) :connected))
-        (return-from handle-cmpctblock nil)))
+    ;; NOTE: a dedup guard used to sit here testing
+    ;; (eq (block-index-entry-status entry) :connected). :CONNECTED is not in
+    ;; the status enum (storage/chain.lisp:17 — :unknown / :header-valid /
+    ;; :valid / :invalid), so it could never fire and was deleted: a guard that
+    ;; cannot fire is worse than none, because it reads as protection that is
+    ;; not there. Core's real dedup is
+    ;; `pindex->nChainWork <= tip->nChainWork || pindex->nTx != 0'
+    ;; (net_processing.cpp, CMPCTBLOCK handler), which also wants the
+    ;; unknown-parent getheaders answer next to it; both belong to the wave-4
+    ;; compact-block item in docs/gap-analysis-8-plan.md. What the missing
+    ;; dedup must NOT be relied on for is HB selection — that is gated below on
+    ;; the block actually connecting, not on it being new to us.
 
     ;; Attempt reconstruction
     (multiple-value-bind (block missing-indexes partial-transactions)
@@ -2551,22 +2600,26 @@ v1 compact block would deliver a witness-stripped coinbase."
          (bitcoin-lisp:log-debug "Compact block reconstructed successfully")
          ;; Process like a normal block (fork-aware: a reconstructed block on a
          ;; side branch is stored and reorged, not tip-validated).
-         (let ((accepted
+         (let ((connected
                  (with-node-lock
-                   (multiple-value-bind (valid error)
-                       (accept-downloaded-block block chain-state utxo-set block-store
-                                                :mempool mempool
-                                                :fee-estimator fee-estimator
-                                                :recent-rejects recent-rejects)
-                     (unless valid
-                       (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
-                       (record-misbehavior peer "invalid compact block"))
-                     valid))))
-           ;; Earned HB promotion — AFTER validation, never before (Core
-           ;; BlockChecked promotes only on state.IsValid(); an invalid block
-           ;; goes to MaybePunishNodeForBlock instead). Outside the node lock:
-           ;; promotion writes sendcmpct to up to two sockets.
-           (when accepted
+                   (let ((tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
+                     (multiple-value-bind (valid error)
+                         (accept-downloaded-block block chain-state utxo-set block-store
+                                                  :mempool mempool
+                                                  :fee-estimator fee-estimator
+                                                  :recent-rejects recent-rejects)
+                       (unless valid
+                         (bitcoin-lisp:log-warn "Reconstructed block invalid: ~A" error)
+                         (record-misbehavior peer "invalid compact block"))
+                       (and valid
+                            (%block-newly-connected-p chain-state block-hash
+                                                      tip-before)))))))
+           ;; Earned HB promotion — only once the block CONNECTED, never on
+           ;; acceptance alone (Core BlockChecked's valid state comes from
+           ;; ConnectTip; an invalid block goes to MaybePunishNodeForBlock, and
+           ;; a block we already have never reaches ConnectTip at all). Outside
+           ;; the node lock: promotion writes sendcmpct to up to two sockets.
+           (when connected
              (maybe-promote-block-deliverer peer chain-state))))
 
         ;; Collision or malformed - fall back to full block
@@ -2634,20 +2687,24 @@ v1 compact block would deliver a witness-stripped coinbase."
           (increment-compact-block-success)
           ;; Block delivery from this peer (getpeerinfo "last_block").
           (record-block-received-from-peer peer)
-          (let ((accepted
+          (let ((connected
                   (with-node-lock
-                    (multiple-value-bind (valid error)
-                        (accept-downloaded-block block chain-state utxo-set block-store
-                                                 :mempool mempool
-                                                 :fee-estimator fee-estimator
-                                                 :recent-rejects recent-rejects)
-                      (unless valid
-                        (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
-                        (record-misbehavior peer "invalid reconstructed block"))
-                      valid))))
-            ;; HB promotion only once the completed block validated (Core
-            ;; BlockChecked's state.IsValid() arm), never on delivery alone.
-            (when accepted
+                    (let ((tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
+                      (multiple-value-bind (valid error)
+                          (accept-downloaded-block block chain-state utxo-set block-store
+                                                   :mempool mempool
+                                                   :fee-estimator fee-estimator
+                                                   :recent-rejects recent-rejects)
+                        (unless valid
+                          (bitcoin-lisp:log-warn "Completed block invalid: ~A" error)
+                          (record-misbehavior peer "invalid reconstructed block"))
+                        (and valid
+                             (%block-newly-connected-p chain-state block-hash
+                                                       tip-before)))))))
+            ;; HB promotion only once the completed block CONNECTED (Core
+            ;; BlockChecked's valid state is emitted from ConnectTip), never on
+            ;; delivery or bare acceptance.
+            (when connected
               (maybe-promote-block-deliverer peer chain-state))))))))
 
 (defun request-full-block (peer block-hash)
