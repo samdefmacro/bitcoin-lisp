@@ -295,3 +295,297 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
     (is (bitcoin-lisp.networking:peer-pending-compact-block peer))
     (bitcoin-lisp.networking:clear-pending-compact-block peer)
     (is (null (bitcoin-lisp.networking:peer-pending-compact-block peer)))))
+
+;;;; ====================================================================
+;;;; Compact-block punishment policy (GA8 wave 4)
+;;;;
+;;;; Core's MaybePunishNodeForBlock skips BLOCK_CONSENSUS / BLOCK_MUTATED
+;;;; whenever via_compact_block is true (net_processing.cpp:1920-1926), and
+;;;; both compact-block call sites set it (mapBlockSource emplaced with
+;;;; /*punish=*/false at :4778 cmpctblock and :3516 blocktxn, inverted at
+;;;; :2211, versus true for the BLOCK message at :4893). Punishment on the
+;;;; compact path is therefore reserved for structurally malformed messages
+;;;; (READ_STATUS_INVALID), and an unknown-parent compact block is answered
+;;;; with getheaders before any scoring can happen (:4571-4577).
+;;;;
+;;;; %WITH-REGTEST (mining-tests.lisp, loaded earlier) binds *network* and the
+;;;; active PoW limit so #x207fffff is a legal target -- without it
+;;;; derive-target rejects these fixture headers and every test would stop at
+;;;; :BAD-PROOF-OF-WORK instead of the check it is about.
+;;;; ====================================================================
+
+(defun %cbp-capture-sends (thunk)
+  "Call THUNK with SEND-MESSAGE replaced by a recorder; return the list of
+message command strings it sent, in order. Restores the real definition under
+UNWIND-PROTECT. Needed because a test peer owns no socket, so the production
+SEND-MESSAGE silently drops everything and would assert nothing."
+  (let ((sent '())
+        (real (fdefinition 'bitcoin-lisp.networking:send-message)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bitcoin-lisp.networking:send-message)
+                 (lambda (peer bytes)
+                   (declare (ignore peer))
+                   (push (bitcoin-lisp.serialization:bytes-to-command
+                          (subseq bytes 4 16))
+                         sent)
+                   t))
+           (funcall thunk))
+      (setf (fdefinition 'bitcoin-lisp.networking:send-message) real))
+    (nreverse sent)))
+
+(defun %cbp-peer (address)
+  "A ready, compact-block-v2 peer at ADDRESS. Each punishment test uses its own
+address: the discourage filter is a process-global rolling set."
+  (let ((p (bitcoin-lisp.networking:make-peer :state :ready :address address)))
+    (setf (bitcoin-lisp.networking:peer-compact-block-version p) 2)
+    p))
+
+(defun %cbp-hash (byte)
+  (make-array 32 :element-type '(unsigned-byte 8) :initial-element byte))
+
+(defun %cbp-header (prev-hash timestamp)
+  "A regtest-difficulty header on PREV-HASH. Version 4 clears the BIP34/66/65
+gates (BIP34 is active from height 1 on regtest), so the checks under test are
+never pre-empted by :BAD-VERSION. Call inside %WITH-REGTEST."
+  (bitcoin-lisp.serialization:make-block-header
+   :version 4
+   :prev-block prev-hash
+   :merkle-root (%cbp-hash 0)
+   :timestamp timestamp
+   :bits #x207fffff
+   :nonce 0))
+
+(defun %cbp-grind (header)
+  "Find a nonce that satisfies HEADER's own bits. The regtest pow-limit target
+passes roughly half of all nonces, so a fixed nonce would flake ~50% of runs on
+:BAD-PROOF-OF-WORK instead of reaching the check under test. Returns HEADER."
+  (loop for nonce from 0 below 500
+        do (setf (bitcoin-lisp.serialization:block-header-nonce header) nonce
+                 (bitcoin-lisp.serialization:block-header-cached-hash header) nil)
+        when (bitcoin-lisp.validation:check-proof-of-work header)
+          do (return header)
+        finally (return header)))
+
+(defun %cbp-payload (compact-block)
+  (flexi-streams:with-output-to-sequence (s)
+    (bitcoin-lisp.serialization:write-compact-block s compact-block)))
+
+(defun %cbp-state-with-parent (parent-hash parent-timestamp)
+  "A chain-state holding only PARENT-HASH at height 0, with a real header (the
+MTP walk and the difficulty check both dereference it). BEST-BLOCK-HASH stays
+NIL so ACCEPT-DOWNLOADED-BLOCK takes its side-branch path, which is the one
+that consults the parent index entry."
+  (let ((state (bitcoin-lisp.storage:make-chain-state)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash parent-hash :height 0 :chain-work 1 :status :valid
+            :header (%cbp-header (%cbp-hash 0) parent-timestamp)))
+    state))
+
+(defun %cbp-one-tx-compact-block (prev-hash prefilled-index tx)
+  "A compact block on PREV-HASH carrying exactly one prefilled transaction and
+no short IDs, so tx-count is 1. PREFILLED-INDEX 0 reconstructs; anything else
+is out of bounds and is Core's READ_STATUS_INVALID."
+  (bitcoin-lisp.serialization:make-compact-block
+   :header (%cbp-grind (%cbp-header prev-hash 1296688700))
+   :nonce 7
+   :short-ids '()
+   :prefilled-txs (list (bitcoin-lisp.serialization:make-prefilled-tx
+                         :index prefilled-index :transaction tx))))
+
+(test cmpctblock-unknown-parent-asks-for-headers-and-never-punishes
+  "GA8 W4 (the finding). A cmpctblock whose PARENT is not in the block index
+must produce a getheaders and nothing else -- no reconstruction, no validation,
+no discouragement.
+
+NO ATTACKER IS NEEDED to reach this shape. BIP152 high-bandwidth relay outruns
+headers announcements by design, so with tip = N-1 and block N still inside a
+getblocktxn round-trip, an HB peer's cmpctblock(N+1) arrives while N is absent
+from the index. Before this fix reconstruction ran anyway, ACCEPT-DOWNLOADED-
+BLOCK returned :ORPHAN-BLOCK (no parent entry => no branch height, no difficulty
+context), and RECORD-MISBEHAVIOR -- which is binary and immediate -- discouraged
+the address and dropped the connection, permanently exiling our FASTEST honest
+block-relay peer. Core answers this shape with MaybeSendGetHeaders and an early
+return, before anything can be scored (net_processing.cpp:4571-4577); its
+BLOCK_MISSING_PREV punishment (:1938-1944) is unreachable via the compact path."
+  (%with-regtest
+   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+          (addr "203.0.113.41")
+          (peer (%cbp-peer addr))
+          (state (bitcoin-lisp.storage:make-chain-state))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (cb (%cbp-one-tx-compact-block (%cbp-hash #xAA) 0 (make-simple-tx #x11)))
+          (sent (%cbp-capture-sends
+                 (lambda ()
+                   (bitcoin-lisp.networking::handle-cmpctblock
+                    peer (%cbp-payload cb) state utxo nil
+                    (bitcoin-lisp.mempool:make-mempool))))))
+     (is (equal '("getheaders") sent)
+         "unknown-parent cmpctblock must send exactly one getheaders, sent: ~S" sent)
+     (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+               "an honest peer relaying ahead of our headers must not be discouraged")
+     (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))))
+
+(test cmpctblock-invalid-reconstruction-refetches-instead-of-discouraging
+  "GA8 W4. When the parent IS known and reconstruction succeeds but the block
+fails validation, fall back to a full-block getdata -- never discourage.
+
+BIP152 lets a peer relay a compact block having validated only the header, so
+Core records the source with via_compact_block=true and MaybePunishNodeForBlock
+then skips BLOCK_CONSENSUS / BLOCK_MUTATED outright (net_processing.cpp:
+1920-1926). The refetch mirrors what Core does one layer down for the same
+shape: a reconstruction that yields a mutated block is READ_STATUS_FAILED, and
+Core answers that with a plain getdata (:4683-4694). If the block really is
+bad, the full copy arrives on the BLOCK path where punishment is correct.
+
+Doubles as the anti-vacuity control for the unknown-parent test above: the
+parent guard must be narrow enough that a KNOWN parent still reaches
+reconstruction -- otherwise this test would see a getheaders here."
+  (%with-regtest
+   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+          (bitcoin-lisp.networking::*compact-block-success-count* 0)
+          (bitcoin-lisp.networking::*compact-block-failure-count* 0)
+          (addr "203.0.113.42")
+          (peer (%cbp-peer addr))
+          (parent (%cbp-hash #xA1))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          ;; The single prefilled transaction is NOT a coinbase: reconstruction
+          ;; succeeds, then validate-block rejects with :FIRST-TX-NOT-COINBASE.
+          (cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x12)))
+          (sent (%cbp-capture-sends
+                 (lambda ()
+                   (bitcoin-lisp.networking::handle-cmpctblock
+                    peer (%cbp-payload cb) state utxo nil
+                    (bitcoin-lisp.mempool:make-mempool))))))
+     (is (= 1 bitcoin-lisp.networking::*compact-block-success-count*)
+         "the compact block must have been reconstructed (parent guard too broad?)")
+     (is (equal '("getdata") sent)
+         "an invalid reconstruction must be refetched in full, sent: ~S" sent)
+     (is (= 1 bitcoin-lisp.networking::*compact-block-failure-count*))
+     (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+               "a compact block that fails validation must not discourage its sender")
+     (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))))
+
+(test cmpctblock-structurally-malformed-still-punishes
+  "GA8 W4 control: removing the punishment for INVALID blocks must not remove
+the punishment for INVALID MESSAGES. A prefilled transaction whose index lies
+outside the block is Core's READ_STATUS_INVALID (blockencodings.cpp:78-84),
+which net_processing answers with Misbehaving (:4679-4683) -- no honest peer can
+produce it. Before this change our reconstruction reported it as :COLLISION,
+i.e. the same value as an innocent short-ID clash in our own mempool, so it got
+a polite full-block getdata instead."
+  (%with-regtest
+   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+          (addr "203.0.113.43")
+          (peer (%cbp-peer addr))
+          (parent (%cbp-hash #xA2))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          ;; tx-count = 1 (one prefilled, no short IDs), prefilled index 3.
+          (cb (%cbp-one-tx-compact-block parent 3 (make-simple-tx #x13)))
+          (sent (%cbp-capture-sends
+                 (lambda ()
+                   (bitcoin-lisp.networking::handle-cmpctblock
+                    peer (%cbp-payload cb) state utxo nil
+                    (bitcoin-lisp.mempool:make-mempool))))))
+     (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+              "a structurally malformed cmpctblock must still discourage the sender")
+     (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+     (is (null sent)
+         "a malformed message must not earn a full-block refetch, sent: ~S" sent))))
+
+(test blocktxn-invalid-completed-block-refetches-instead-of-discouraging
+  "GA8 W4. The blocktxn half of the same rule: a completed reconstruction that
+fails validation is still a compact-block delivery (Core emplaces mapBlockSource
+with /*punish=*/false at net_processing.cpp:3516, and says so in the comment
+right above it), so it gets a full-block refetch, not a discouragement."
+  (%with-regtest
+   (let* ((addr "203.0.113.44")
+          (peer (%cbp-peer addr))
+          (block-hash (%cbp-hash #xB1))
+          (state (bitcoin-lisp.storage:make-chain-state))
+          (utxo (bitcoin-lisp.storage:make-utxo-set)))
+     (setf (bitcoin-lisp.networking:peer-pending-compact-block peer)
+           (bitcoin-lisp.networking:make-pending-compact-block
+            :block-hash block-hash
+            ;; Parent unknown => ACCEPT-DOWNLOADED-BLOCK returns :ORPHAN-BLOCK,
+            ;; which is precisely the verdict that used to exile the peer.
+            :header (%cbp-grind (%cbp-header (%cbp-hash #xBB) 1296688700))
+            :transactions (make-array 1 :initial-element nil)
+            :missing-indexes '(0)
+            :request-time (get-internal-real-time)
+            :use-wtxid t))
+     (let ((sent (%cbp-capture-sends
+                  (lambda ()
+                    (bitcoin-lisp.networking::handle-blocktxn
+                     peer
+                     (subseq (bitcoin-lisp.serialization:make-blocktxn-message
+                              block-hash (list (make-simple-tx #x21)))
+                             24)
+                     state utxo nil (bitcoin-lisp.mempool:make-mempool))))))
+       (is (equal '("getdata") sent)
+           "an invalid completed block must be refetched in full, sent: ~S" sent)
+       (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+                 "a completed compact block that fails validation must not discourage")
+       (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))))))
+
+(test blocktxn-non-matching-transaction-count-punishes
+  "GA8 W4 control for the blocktxn side: a blocktxn that does not answer the
+getblocktxn we sent is structurally malformed -- Core's FillBlock returns
+READ_STATUS_INVALID for both too few and too many transactions
+(blockencodings.cpp:198-217) and Misbehaves (net_processing.cpp:3487-3491).
+Previously we treated it as a mere reconstruction miss and sent a getdata."
+  (%with-regtest
+   (let* ((addr "203.0.113.45")
+          (peer (%cbp-peer addr))
+          (block-hash (%cbp-hash #xB2))
+          (state (bitcoin-lisp.storage:make-chain-state))
+          (utxo (bitcoin-lisp.storage:make-utxo-set)))
+     (setf (bitcoin-lisp.networking:peer-pending-compact-block peer)
+           (bitcoin-lisp.networking:make-pending-compact-block
+            :block-hash block-hash
+            :header (%cbp-grind (%cbp-header (%cbp-hash #xBC) 1296688700))
+            :transactions (make-array 2 :initial-element nil)
+            :missing-indexes '(0 1)          ; we asked for TWO
+            :request-time (get-internal-real-time)
+            :use-wtxid t))
+     (let ((sent (%cbp-capture-sends
+                  (lambda ()
+                    (bitcoin-lisp.networking::handle-blocktxn
+                     peer
+                     (subseq (bitcoin-lisp.serialization:make-blocktxn-message
+                              block-hash (list (make-simple-tx #x22)))  ; got ONE
+                             24)
+                     state utxo nil (bitcoin-lisp.mempool:make-mempool))))))
+       (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+                "a non-matching blocktxn must discourage the sender")
+       (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+       (is (null (bitcoin-lisp.networking:peer-pending-compact-block peer)))
+       (is (null sent)
+           "a malformed blocktxn must not earn a full-block refetch, sent: ~S" sent)))))
+
+(test handle-block-still-punishes-orphan-block
+  "CORE PARITY CONTROL -- must be unchanged by the compact-block work. A block
+arriving on the BLOCK message path is recorded with via_compact_block=false
+(mapBlockSource emplaced /*punish=*/true, net_processing.cpp:4893), so
+MaybePunishNodeForBlock DOES punish BLOCK_MISSING_PREV (:1938-1944). This is
+the asymmetry the fix depends on: the full-block refetch that now replaces
+compact-block punishment still ends in punishment when the block is genuinely
+bad. This test passes both before and after the fix; it is a regression guard,
+not mutation evidence."
+  (%with-regtest
+   (let* ((addr "203.0.113.46")
+          (peer (%cbp-peer addr))
+          (state (bitcoin-lisp.storage:make-chain-state))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (blk (bitcoin-lisp.serialization:make-bitcoin-block
+                :header (%cbp-grind (%cbp-header (%cbp-hash #xCC) 1296688700))
+                :transactions (list (make-simple-tx #x31)))))
+     (bitcoin-lisp.networking::handle-block
+      peer (subseq (bitcoin-lisp.serialization:make-block-message blk) 24)
+      state utxo nil)
+     (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+              "the BLOCK path must keep punishing :ORPHAN-BLOCK (Core parity)")
+     (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))))))
