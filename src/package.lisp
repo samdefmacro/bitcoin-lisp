@@ -1167,6 +1167,8 @@
    #:peer-user-agent
    #:peer-ping-latency
    #:peer-inbound
+   #:maybe-set-peer-announcing-hb
+   #:forget-hb-announcing-peer
    #:peer-conn-type
    #:peer-relays-txs-p
    #:peer-tx-relay-p
