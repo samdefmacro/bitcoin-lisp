@@ -3072,10 +3072,10 @@ candidates."
                   (length *pending-anchor-addresses*))))))
 
 (defun %reachable-seed-addresses (addresses)
-  "Keep only the seed-derived ADDRESSES (strings) whose network -onlynet still
-permits dialing.
+  "Keep only the seed-derived ADDRESSES (strings) we may actually dial.
 
-Seed lists — DNS-seed results and the hardcoded fixed seeds — are clearnet by
+An address LITERAL survives when -onlynet still permits its network. Seed
+lists — DNS-seed results and the hardcoded fixed seeds — are clearnet by
 construction, so under -onlynet=onion (or cjdns-only) dialing them is a direct
 deanonymizing clearnet TCP connection. Core never hits this because seeds go
 into addrman and every dial candidate is filtered by g_reachable_nets at
@@ -3083,14 +3083,39 @@ selection time (ThreadOpenConnections); we build the dial list directly, so the
 filter has to happen here. The addrman branch above is already filtered by
 select-dialable-address, and anchors by load-anchors.
 
+A candidate parse-network-address cannot classify is a HOSTNAME, and survives
+only when a SOCKS5 proxy is configured AND clearnet is reachable. Under -proxy
+discover-peers deliberately returns the seed hostnames UNRESOLVED (protocol.lisp)
+— resolving them locally would leak a plaintext DNS query outside the tunnel —
+and make-tcp-connection hands each one to the proxy inside the SOCKS5 CONNECT
+(ATYP DOMAINNAME, socks5.lisp) for the proxy to resolve. That mirrors Core's
+'if (HaveNameProxy()) AddAddrFetch(seed)' (net.cpp:2356-2357): a proxied seed
+stays dialable BY NAME. Dropping those unconditionally (this filter's behaviour
+as first written, PR #306) left a proxied node with a fresh datadir zero dial
+candidates on mainnet/signet/testnet3 — they have hostname DNS seeds and no
+fixed-seed list, so it could not bootstrap at all.
+
+The clearnet conjunct keeps the -onlynet privacy guarantee closed HERE, not
+merely upstream: a DNS seed answers with A/AAAA records, so a hostname
+candidate is a clearnet candidate however it gets resolved. It cannot cost a
+dial in any configuration apply-config-globals can produce, since an -onlynet
+excluding IPv4 and IPv6 already soft-sets -dnsseed=0 (config.lisp, Core
+init.cpp:835-844) so no hostname ever reaches this function, and with no proxy
+discover-peers emits IP literals only.
+
 Applies to SEED candidates only: manual -addnode/-connect targets are
-deliberately exempt from -onlynet, matching Core. An address whose network
-cannot be determined is dropped rather than dialed — under an active -onlynet
-restriction, an unclassifiable candidate is exactly what must not leak."
-  (remove-if-not (lambda (addr)
-                   (let ((net (bitcoin-lisp.networking:parse-network-address addr)))
-                     (and net (bitcoin-lisp.networking:reachable-network-p net))))
-                 addresses))
+deliberately exempt from -onlynet, matching Core."
+  (let ((name-proxy-p
+          (and bitcoin-lisp.networking:*proxy*
+               (or (bitcoin-lisp.networking:reachable-network-p :ipv4)
+                   (bitcoin-lisp.networking:reachable-network-p :ipv6))
+               t)))
+    (remove-if-not (lambda (addr)
+                     (let ((net (bitcoin-lisp.networking:parse-network-address addr)))
+                       (if net
+                           (bitcoin-lisp.networking:reachable-network-p net)
+                           name-proxy-p)))
+                   addresses)))
 
 (defun %record-outbound-result (address-book addr port peer success)
   "Record an outbound dial outcome for ADDR:PORT in ADDRESS-BOOK, adding the
