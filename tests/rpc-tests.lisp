@@ -1743,6 +1743,212 @@ the value."
       (bitcoin-lisp.rpc::rpc-getblockstats node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
+;;; getblockstats against an exact fixture: coinbase + one witness tx.
+
+(defparameter *gbs-p2pkh*
+  (concatenate '(vector (unsigned-byte 8))
+               #(#x76 #xa9 #x14) (make-array 20 :element-type '(unsigned-byte 8)
+                                               :initial-element #x33)
+               #(#x88 #xac))
+  "A 25-byte P2PKH scriptPubKey (spendable).")
+
+(defparameter *gbs-opreturn*
+  (coerce #(#x6a #x01 #x02) '(vector (unsigned-byte 8)))
+  "A 3-byte OP_RETURN scriptPubKey (provably unspendable).")
+
+(defun %gbs-coinbase ()
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-32-byte-hash 0) :index #xffffffff)
+                    :script-sig (coerce #(#x01 #x64) '(vector (unsigned-byte 8)))
+                    :sequence #xffffffff))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 5000030000 :script-pubkey *gbs-p2pkh*))
+   :lock-time 0))
+
+(defun %gbs-spender (prev-txid)
+  "A segwit transaction spending PREV-TXID:0 (100000 sat) into 40000 + 30000,
+so its fee is exactly 30000 sat. Its second output is unspendable."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash prev-txid :index 0)
+                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                    :sequence #xfffffffd))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 40000 :script-pubkey *gbs-p2pkh*)
+                    (bitcoin-lisp.serialization:make-tx-out
+                     :value 30000 :script-pubkey *gbs-opreturn*))
+   :witness (vector (list (make-array 72 :element-type '(unsigned-byte 8) :initial-element 9)
+                          (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2)))
+   :lock-time 0))
+
+(defmacro %with-gbs-block ((node hash-hex spender &key (with-undo t) (coinbase-only nil))
+                           &body body)
+  "Store a height-100 block (coinbase + one 30000-sat-fee segwit spend, unless
+COINBASE-ONLY) with its undo data, and bind NODE / HASH-HEX / SPENDER."
+  (let ((dir (gensym "DIR")) (store (gensym "STORE")) (hash (gensym "HASH"))
+        (prev (gensym "PREV")))
+    `(let* ((,node (make-test-node))
+            (,dir (ensure-directories-exist
+                   (merge-pathnames (format nil "gbs-~D/" (get-internal-real-time))
+                                    (uiop:temporary-directory))))
+            (,store (bitcoin-lisp.storage:init-block-store ,dir))
+            (,prev (make-32-byte-hash 77))
+            (,spender (%gbs-spender ,prev))
+            (%gbs-txs (if ,coinbase-only
+                          (list (%gbs-coinbase))
+                          (list (%gbs-coinbase) ,spender)))
+            (%gbs-blk (%hdrfields-block %gbs-txs (make-32-byte-hash 5) 1700000000))
+            (,hash (bitcoin-lisp.serialization:block-header-hash
+                    (bitcoin-lisp.serialization:bitcoin-block-header %gbs-blk)))
+            (,hash-hex (bitcoin-lisp.rpc::hash-to-hex ,hash)))
+       (declare (ignorable ,spender))
+       (setf (bitcoin-lisp::node-block-store ,node) ,store)
+       (unwind-protect
+            (progn
+              (bitcoin-lisp.storage:store-block ,store %gbs-blk)
+              (bitcoin-lisp.storage:add-block-index-entry
+               (bitcoin-lisp::node-chain-state ,node)
+               (bitcoin-lisp.storage:make-block-index-entry
+                :hash ,hash :height 100 :chain-work 1 :status :valid
+                :header (bitcoin-lisp.serialization:bitcoin-block-header %gbs-blk)))
+              (when ,with-undo
+                (setf (gethash ,hash bitcoin-lisp.validation::*block-undo-data*)
+                      (list (list ,prev 0
+                                  (bitcoin-lisp.storage:make-utxo-entry
+                                   :value 100000 :script-pubkey *gbs-p2pkh*
+                                   :height 50 :coinbase nil)))))
+              ,@body)
+         (remhash ,hash bitcoin-lisp.validation::*block-undo-data*)
+         (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
+
+(test rpc-getblockstats-excludes-coinbase-and-uses-witness-tx-sizes
+  "getblockstats accumulates per-transaction, AFTER Core's
+`if (tx->IsCoinBase()) continue;` (rpc/blockchain.cpp:2075-2077), using the
+witness-inclusive ComputeTotalSize (:2085) — so total_size, total_out and
+total_weight exclude the coinbase and carry no block header or tx-count varint,
+and avgtxsize divides by vtx.size()-1 (:2143). We previously used
+(length (serialize block)) — the LEGACY whole-block form — over ntx, and
+summed the coinbase's outputs into total_out."
+  (%with-gbs-block (node hex spender)
+    (let* ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))
+           (stat (lambda (k) (cdr (assoc k r :test #'string=))))
+           (wire (length (bitcoin-lisp.serialization:transaction-wire-bytes spender)))
+           (stripped (length (bitcoin-lisp.serialization:serialize-transaction spender)))
+           (weight (bitcoin-lisp.serialization:transaction-weight spender))
+           (whole-block (length (bitcoin-lisp.serialization:serialize
+                                 (bitcoin-lisp.storage:get-block
+                                  (bitcoin-lisp::node-block-store node)
+                                  (bitcoin-lisp.rpc::parse-hex-hash hex))))))
+      ;; --- sizes ---
+      (is (= wire (funcall stat "total_size")))
+      ;; ...which is witness-INCLUSIVE (the stripped form is strictly smaller)
+      ;; and is NOT the whole-block quantity we used to report.
+      (is (> wire stripped))
+      (is (/= whole-block (funcall stat "total_size")))
+      (is (= weight (funcall stat "total_weight")))
+      ;; avgtxsize divides by the NON-coinbase count (1 here), not by ntx (2).
+      (is (= wire (funcall stat "avgtxsize")))
+      (is (/= (round whole-block 2) (funcall stat "avgtxsize")))
+      (is (= wire (funcall stat "maxtxsize")))
+      (is (= wire (funcall stat "mintxsize")))
+      (is (= wire (funcall stat "mediantxsize")))
+      ;; --- amounts ---
+      ;; 40000 + 30000; the 5000030000-sat coinbase output is NOT counted.
+      (is (= 70000 (funcall stat "total_out")))
+      (is (= 2 (funcall stat "txs")))
+      (is (= 1 (funcall stat "ins")))
+      ;; CONTROL: "outs" IS counted before the coinbase continue (Core :2054),
+      ;; so it still includes the coinbase's output — do not "fix" it.
+      (is (= 3 (funcall stat "outs")))
+      ;; --- fees, from undo data ---
+      (is (= 30000 (funcall stat "totalfee")))
+      (is (= 30000 (funcall stat "avgfee")))
+      (is (= 30000 (funcall stat "maxfee")))
+      (is (= 30000 (funcall stat "minfee")))
+      (is (= 30000 (funcall stat "medianfee")))
+      (let ((feerate (truncate (* 30000 4) weight)))
+        (is (plusp feerate))
+        (is (= feerate (funcall stat "avgfeerate")))
+        (is (= feerate (funcall stat "maxfeerate")))
+        (is (= feerate (funcall stat "minfeerate")))
+        (is (equal (list feerate feerate feerate feerate feerate)
+                   (funcall stat "feerate_percentiles"))))
+      ;; --- segwit + utxo-set deltas ---
+      (is (= 1 (funcall stat "swtxs")))
+      (is (= wire (funcall stat "swtotal_size")))
+      (is (= weight (funcall stat "swtotal_weight")))
+      ;; 3 outputs created, 1 spent.
+      (is (= 2 (funcall stat "utxo_increase")))
+      ;; The OP_RETURN output never enters the UTXO set: 2 created, 1 spent.
+      (is (= 1 (funcall stat "utxo_increase_actual")))
+      ;; Sizes: a 25-byte spk costs 8+1+25+41 = 75, the 3-byte OP_RETURN
+      ;; 8+1+3+41 = 53; one 75-byte prevout is removed.
+      (is (= (- (+ 75 75 53) 75) (funcall stat "utxo_size_inc")))
+      (is (= (- (+ 75 75) 75) (funcall stat "utxo_size_inc_actual")))
+      ;; --- chain context ---
+      (is (= 100 (funcall stat "height")))
+      (is (= 1700000000 (funcall stat "time")))
+      (is (= 1700000000 (funcall stat "mediantime")))
+      (is (string= hex (funcall stat "blockhash")))
+      (is (= (bitcoin-lisp.validation:calculate-block-subsidy 100)
+             (funcall stat "subsidy")))
+      ;; Core's full key set is 31 keys.
+      (is (= 31 (length r))))))
+
+(test rpc-getblockstats-coinbase-only-block
+  "CONTROL for the coinbase exclusion at the boundary: a block with nothing but
+a coinbase has zero total_size / total_out / total_weight / fees and a zero
+average (Core divides by vtx.size()-1 only `if (block.vtx.size() > 1)`), while
+its output is still counted in outs."
+  (%with-gbs-block (node hex spender :with-undo nil :coinbase-only t)
+    (let* ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))
+           (stat (lambda (k) (cdr (assoc k r :test #'string=)))))
+      (is (= 1 (funcall stat "txs")))
+      (is (= 1 (funcall stat "outs")))
+      (is (= 0 (funcall stat "ins")))
+      (is (= 0 (funcall stat "total_size")))
+      (is (= 0 (funcall stat "total_out")))
+      (is (= 0 (funcall stat "total_weight")))
+      (is (= 0 (funcall stat "avgtxsize")))
+      (is (= 0 (funcall stat "avgfee")))
+      (is (= 0 (funcall stat "totalfee")))
+      (is (= 0 (funcall stat "minfee")))
+      (is (= 0 (funcall stat "mintxsize")))
+      (is (equal (list 0 0 0 0 0) (funcall stat "feerate_percentiles"))))))
+
+(test rpc-getblockstats-unknown-stat-errors
+  "An unknown statistic name is Core's RPC_INVALID_PARAMETER (-8) 'Invalid
+selected statistic' (rpc/blockchain.cpp:2183-2186); we used to drop it
+silently, so a typo read as 'that statistic is unavailable for this block'."
+  (%with-gbs-block (node hex spender)
+    (let ((code (handler-case
+                    (progn (bitcoin-lisp.rpc::rpc-getblockstats
+                            node (list hex (list "totalfee" "bogus")))
+                           :no-error)
+                  (bitcoin-lisp.rpc::rpc-error (e) (bitcoin-lisp.rpc::rpc-error-code e)))))
+      (is (eql -8 code)))
+    ;; CONTROL: a known name still selects exactly that key.
+    (let ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex (list "totalfee")))))
+      (is (= 1 (length r)))
+      (is (= 30000 (cdr (assoc "totalfee" r :test #'string=)))))
+    ;; A non-array stats argument is Core's type error.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node (list hex "totalfee")))))
+
+(test rpc-getblockstats-requires-undo-data
+  "The fee statistics come from undo data, and Core's GetUndoChecked
+(rpc/blockchain.cpp:2016, :718-735) runs unconditionally — so a spending block
+whose undo data is missing is an error, never a silently wrong fee total.
+CONTROL: the identical block WITH its undo data answers (previous test)."
+  (%with-gbs-block (node hex spender :with-undo nil)
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))))
+
 (test rpc-calculate-block-subsidy
   "Test block subsidy calculation"
   ;; Initial subsidy: 50 BTC = 5000000000 satoshis
