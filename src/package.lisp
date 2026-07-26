@@ -629,6 +629,7 @@
    #:coinstatsindex-best
    #:coinstatsindex-get-stats
    #:coinstatsindex-add-block
+   #:coinstatsindex-record-matches-block-p
    #:coinstatsindex-seed-genesis
    #:coinstatsindex-set-best
    #:coinstatsindex-clear-best
@@ -887,6 +888,7 @@
    #:orphan-have
    #:orphan-have-from-peer
    #:orphan-announcers
+   #:orphan-children-from-peer
    #:orphans-depending-on
    #:orphan-erase-for-peer
    #:orphan-erase-for-block
@@ -955,8 +957,9 @@
    #:validate-transaction-contextual
    #:validate-transaction-scripts
    #:validate-transaction-for-mempool
-   ;; Package relay (submitpackage)
+   ;; Package relay (submitpackage + opportunistic 1p1c)
    #:validate-package-for-mempool
+   #:package-hash
    #:package-truc-checks
    #:package-well-formed
    #:package-child-with-parents-tree-p
@@ -1007,6 +1010,11 @@
    #:most-recent-block-tx
    #:note-block-connected
    #:reset-recent-confirmed
+   ;; The reconsiderable rejects filter (Core's second rejects filter)
+   #:*recent-rejects-reconsiderable*
+   #:reconsiderable-reject-p
+   #:add-reconsiderable-reject
+   #:clear-reconsiderable-rejects
    #:perform-reorg
    #:get-undo-data
    #:invalidate-block
@@ -1026,6 +1034,8 @@
    ;; Locktime validation
    #:check-transaction-final
    #:compute-median-time-past
+   #:compute-median-time-past-from-entry
+   #:header-time-too-old-p
    #:check-sequence-locks
    #:compute-script-flags-for-height
    #:+standard-script-verify-flags+
@@ -1454,6 +1464,13 @@
    #:start-node
    #:start-node-from-args
    #:stop-node
+   ;; Shutdown coordination (internal paths request; the main thread performs)
+   #:request-node-shutdown
+   #:node-shutdown-requested-p
+   #:run-node-watchdog
+   #:+node-exit-clean+
+   #:+node-exit-error+
+   #:+node-exit-watchdog+
    #:node-status
    #:node-fee-estimator
    #:node-recent-rejects

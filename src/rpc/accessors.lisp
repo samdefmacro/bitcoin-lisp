@@ -133,3 +133,32 @@ yields DEFAULT; explicit false yields NIL; anything else T. Core:
 Use for every field Core emits as a bool — NIL must never leak into such a
 field, as it would encode as null."
   (if x t +json-false+))
+
+;;; --- Empty JSON collections ---
+;;;
+;;; rpc-result->json hands NIL straight to yason, which encodes it as null,
+;;; but Core builds every collection as a UniValue VARR/VOBJ and so renders
+;;; an EMPTY one as [] / {} — never null. Clients index the result
+;;; (`len(node.listbanned())`) and break on null.
+;;;
+;;; This must be applied PER SITE, not as a global normalizer in
+;;; rpc-result->json: CL NIL is genuinely ambiguous — it is the empty list,
+;;; the empty alist AND the null/absent value — so only the producing site
+;;; knows which of [], {} and null it meant. Core methods that return null
+;;; on absence (scantxoutset "status" with no scan running) must keep
+;;; returning NIL.
+
+(defun json-array (list)
+  "LIST as a JSON array, rendering [] rather than null when it is empty.
+yason encodes a vector as an array unconditionally, and rpc-result->json
+passes vectors through as atoms, so a non-empty LIST is returned unchanged
+(letting rpc-result->json recurse into nested objects) while the empty case
+becomes a literal empty vector."
+  (or list #()))
+
+(defun json-object (alist)
+  "ALIST as a JSON object, rendering {} rather than null when it is empty —
+the object-valued counterpart of JSON-ARRAY (rpc-result->json turns a
+non-empty (string . value) alist into a hash-table by itself, but cannot
+tell an empty object from null)."
+  (or alist (make-hash-table :test 'equal)))
