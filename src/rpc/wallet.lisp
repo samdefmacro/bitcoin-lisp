@@ -1130,7 +1130,8 @@ back to wall-clock time when there is no tip."
       (if entry
           (values (bitcoin-lisp.serialization:block-header-timestamp
                    (bitcoin-lisp.storage:block-index-entry-header entry))
-                  (bitcoin-lisp.validation:compute-median-time-past cs hash))
+                  (or (bitcoin-lisp.validation:compute-median-time-past-from-entry entry)
+                      0))
           (let ((now (bitcoin-lisp.serialization:get-unix-time)))
             (values now now))))))
 

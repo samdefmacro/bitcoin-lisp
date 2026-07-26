@@ -902,6 +902,138 @@ refuses at admission."
             (is (null valid) "version<2 at/after BIP34 height must be rejected")
             (is (and error (search "version" error)) "reason should be the bad version")))))))
 
+;;;; Median-time-past across a header batch (GA8 S1-7)
+
+(defconstant +mtp-batch-genesis-time+ 1296688600
+  "Timestamp of the synthetic genesis header the MTP-batch fixtures chain from.")
+
+(defmacro %with-mtp-regtest (&body body)
+  "Regtest network plus the regtest PoW limit, so #x207fffff is a valid target
+and ground headers reach the contextual checks."
+  `(let ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp.storage:*pow-limit-target*
+           bitcoin-lisp.storage:+regtest-pow-limit-target+))
+     ,@body))
+
+(defun %mtp-batch-fixture (suffix)
+  "(values chain-state genesis-hash) — a regtest chain-state whose genesis index
+entry carries a header timestamped +mtp-batch-genesis-time+."
+  (let* ((state (bitcoin-lisp.storage:init-chain-state
+                 (ensure-directories-exist
+                  (merge-pathnames (format nil "test-mtp-batch-~A/" suffix)
+                                   (uiop:temporary-directory)))))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash state)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash genesis-hash :height 0 :chain-work 1 :status :valid
+            :header (bitcoin-lisp.serialization:make-block-header
+                     :version 4 :prev-block zeros :merkle-root zeros
+                     :timestamp +mtp-batch-genesis-time+ :bits #x207fffff :nonce 0
+                     :cached-hash genesis-hash)))
+    (values state genesis-hash)))
+
+(defun %mtp-header (prev-hash timestamp &key (version 4) (bits #x207fffff) (grind t))
+  "A header for the MTP-batch fixtures. GRIND searches nonces for one that clears
+the regtest pow-limit target, so the header reaches the contextual checks."
+  (let ((hdr (bitcoin-lisp.serialization:make-block-header
+              :version version :prev-block prev-hash
+              :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                          :initial-element 0)
+              :timestamp timestamp :bits bits :nonce 0)))
+    (when grind
+      (loop for nonce from 0 below 5000
+            do (setf (bitcoin-lisp.serialization:block-header-nonce hdr) nonce
+                     (bitcoin-lisp.serialization:block-header-cached-hash hdr) nil)
+            until (bitcoin-lisp.validation:check-proof-of-work hdr)))
+    hdr))
+
+(test validate-header-chain-mtp-uses-in-batch-parent
+  "CONSENSUS (GA8 S1-7): the timestamp>median-time-past rule must be evaluated
+against the parent ENTRY threaded through the batch, not a block-index lookup of
+the parent HASH. A header whose parent is only staged in this batch found nothing
+in the index and was compared against a neutral 0, so Core's
+ContextualCheckBlockHeader time-too-old rule (validation.cpp:4124,
+pindexPrev->GetMedianTimePast()) was vacuously satisfied for every header after
+the first in a batch.
+Control: the same two headers delivered as SEPARATE batches — the second is
+rejected once its parent is indexed — proving the fixture really violates MTP."
+  (%with-mtp-regtest
+   (multiple-value-bind (state genesis-hash) (%mtp-batch-fixture "inbatch")
+     (let* ((h1 (%mtp-header genesis-hash (+ +mtp-batch-genesis-time+ 1000)))
+            (h1-hash (bitcoin-lisp.serialization:block-header-hash h1))
+            ;; MTP(H1) = median{genesis, H1}; Core takes the upper element of an
+            ;; even window, so it is H1's own time and anything at or below it
+            ;; violates the rule.
+            (h2 (%mtp-header h1-hash (+ +mtp-batch-genesis-time+ 500))))
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.networking::validate-header-chain (list h1 h2) state)
+         (is (= 1 (length valid)) "only the first header may be admitted")
+         (is (equalp h1 (first valid)))
+         (is (and error (search "median-time-past" error))))
+       ;; Control, part 1: H1 on its own is a valid batch.
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.networking::validate-header-chain (list h1) state)
+         (is (= 1 (length valid)))
+         (is (null error)))
+       ;; Control, part 2: with H1 indexed, the hash lookup finds a median and
+       ;; H2 is rejected — the behaviour a second batch always had.
+       (bitcoin-lisp.networking::process-headers (list h1) state)
+       (is (not (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash)))
+           "H1 must be indexed for the control to mean anything")
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.networking::validate-header-chain (list h2) state)
+         (is (null valid))
+         (is (and error (search "median-time-past" error))))))))
+
+(test validate-header-chain-accepts-valid-mtp-batch
+  "No false positives: a batch whose every header is strictly after its parent's
+median-time-past is admitted whole."
+  (%with-mtp-regtest
+   (multiple-value-bind (state genesis-hash) (%mtp-batch-fixture "valid")
+     (let* ((h1 (%mtp-header genesis-hash (+ +mtp-batch-genesis-time+ 1000)))
+            (h2 (%mtp-header (bitcoin-lisp.serialization:block-header-hash h1)
+                             (+ +mtp-batch-genesis-time+ 2000)))
+            (h3 (%mtp-header (bitcoin-lisp.serialization:block-header-hash h2)
+                             (+ +mtp-batch-genesis-time+ 3000))))
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.networking::validate-header-chain (list h1 h2 h3) state)
+         (is (null error))
+         (is (= 3 (length valid))))))))
+
+(test validate-header-chain-contextual-rules-reject-at-batch-position-2
+  "Regression guard for the verified scope of GA8 S1-7: MTP was the ONLY
+contextual rule that consulted the index by hash. Proof-of-work, the future-time
+bound, difficulty and the softfork version minimums all consume the threaded
+parent entry and already reject a violating header at batch position 2, so none
+of them needed the same fix."
+  (%with-mtp-regtest
+   (multiple-value-bind (state genesis-hash) (%mtp-batch-fixture "position2")
+     (let* ((h1 (%mtp-header genesis-hash (+ +mtp-batch-genesis-time+ 1000)))
+            (h1-hash (bitcoin-lisp.serialization:block-header-hash h1))
+            (good-time (+ +mtp-batch-genesis-time+ 2000)))
+       (dolist (case (list
+                      ;; Target below the regtest pow limit that a nonce sweep
+                      ;; will not reach: PoW fails.
+                      (list "proof-of-work"
+                            (%mtp-header h1-hash good-time :bits #x1d00ffff :grind nil))
+                      (list "future"
+                            (%mtp-header h1-hash (+ (bitcoin-lisp.serialization:get-unix-time)
+                                                    7201)))
+                      ;; Regtest never retargets, so a child must inherit its
+                      ;; parent's bits exactly.
+                      (list "difficulty"
+                            (%mtp-header h1-hash good-time :bits #x207ffffe))
+                      ;; Regtest activates BIP34 at height 1.
+                      (list "version"
+                            (%mtp-header h1-hash good-time :version 1))))
+         (destructuring-bind (reason h2) case
+           (multiple-value-bind (valid error)
+               (bitcoin-lisp.networking::validate-header-chain (list h1 h2) state)
+             (is (= 1 (length valid)) "~A: header 2 must not be admitted" reason)
+             (is (and error (search reason error))
+                 "~A: rejection reason should name it, got ~A" reason error))))))))
+
 (test validate-block-skip-scripts
   "Test that validate-block with :skip-scripts t skips script validation."
   ;; Create a minimal block with an invalid script that would normally fail.
@@ -2475,8 +2607,12 @@ its availability with no block transfer. It recorded nothing."
             :hash hash :height 5 :chain-work 100 :status :header-valid))
     (is (null (bitcoin-lisp.networking::peer-best-known-block-hash peer))
         "precondition: peer has no recorded best block")
+    ;; FULL-BATCH t: Core's may_have_more_headers. The sibling half of
+    ;; UpdatePeerStateForReceivedHeaders — the IBD sub-minchainwork outbound
+    ;; drop — is skipped for a full batch, keeping this test on availability
+    ;; alone (that drop has its own tests in ECLIPSE-DOS-TESTS).
     (bitcoin-lisp.networking::%store-validated-headers
-     peer state (list hdr) (lambda (n) (declare (ignore n))) "test")
+     peer state (list hdr) t (lambda (n) (declare (ignore n))) "test")
     (is (equalp hash (bitcoin-lisp.networking::peer-best-known-block-hash peer))
         "an all-already-known batch must still record the peer's best block")))
 
