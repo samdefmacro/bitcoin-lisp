@@ -4528,81 +4528,251 @@ coinstatsindex (Core's use_index path)."
       result)))
 
 ;;; --- Block Statistics ---
+;;;
+;;; Bitcoin Core getblockstats (rpc/blockchain.cpp:1934-2190). Two structural
+;;; rules drive everything below and were both wrong here:
+;;;
+;;;  1. The per-transaction accumulators run AFTER `if (tx->IsCoinBase())
+;;;     continue;` (:2075-2077), so total_out, total_size, total_weight, the
+;;;     size extrema and every fee statistic EXCLUDE the coinbase, and the
+;;;     averages divide by vtx.size()-1 (:2141,:2143). Only `outs` is counted
+;;;     before the continue (:2054) and therefore includes it.
+;;;  2. The sizes are per-transaction ComputeTotalSize() — the WITNESS-inclusive
+;;;     serialization of each tx (:2085) — never the whole-block serialization,
+;;;     which additionally carries the 80-byte header and the tx-count varint.
+
+(defconstant +per-utxo-overhead+ 41
+  "Core PER_UTXO_OVERHEAD (rpc/blockchain.cpp:1932):
+sizeof(COutPoint) + sizeof(uint32_t) + sizeof(bool) = 36 + 4 + 1.")
+
+(defun %txout-serialize-size (script-pubkey)
+  "GetSerializeSize(CTxOut) for an output with SCRIPT-PUBKEY: the 8-byte amount
+plus the compact-size-prefixed script."
+  (+ 8 (bitcoin-lisp.serialization:compact-size-length (length script-pubkey))
+     (length script-pubkey)))
+
+(defun %truncated-median (values)
+  "Core CalculateTruncatedMedian (rpc/blockchain.cpp:1878-1892): 0 for an empty
+sample, the (integer) mean of the two middle elements for an even count, the
+middle element otherwise."
+  ;; map (not coerce) so the destructive sort always gets a fresh vector.
+  (let* ((v (sort (map 'vector #'identity values) #'<))
+         (n (length v)))
+    (cond ((zerop n) 0)
+          ((evenp n) (truncate (+ (aref v (1- (truncate n 2))) (aref v (truncate n 2))) 2))
+          (t (aref v (truncate n 2))))))
+
+(defun %feerate-percentiles (scores total-weight)
+  "Core CalculatePercentilesByWeight (rpc/blockchain.cpp:1894-1921): the feerate
+at the 10th/25th/50th/75th/90th percentile WEIGHT unit. SCORES is a list of
+(feerate . weight) conses, sorted here exactly as std::sort orders std::pair
+(by feerate, then weight). Returns a 5-element list, all zeros for no scores."
+  (let ((result (list 0 0 0 0 0)))
+    (when scores
+      (let* ((sorted (sort (copy-list scores)
+                           (lambda (a b)
+                             (or (< (car a) (car b))
+                                 (and (= (car a) (car b)) (< (cdr a) (cdr b)))))))
+             (cutoffs (list (/ total-weight 10.0d0)
+                            (/ total-weight 4.0d0)
+                            (/ total-weight 2.0d0)
+                            (/ (* total-weight 3.0d0) 4.0d0)
+                            (/ (* total-weight 9.0d0) 10.0d0)))
+             (next 0)
+             (cumulative 0))
+        (dolist (score sorted)
+          (incf cumulative (cdr score))
+          (loop while (and (< next 5) (>= cumulative (nth next cutoffs)))
+                do (setf (nth next result) (car score))
+                   (incf next)))
+        ;; Fill any remaining percentiles with the last (largest) feerate.
+        (let ((last-feerate (car (car (last sorted)))))
+          (loop for i from next below 5 do (setf (nth i result) last-feerate)))))
+    result))
+
+(defun %getblockstats-block-hash (chain-state hash-or-height)
+  "Resolve getblockstats' first parameter (Core ParseHashOrHeight)."
+  (cond
+    ((integerp hash-or-height)
+     (let ((entry (bitcoin-lisp.storage:get-block-at-height chain-state hash-or-height)))
+       (unless entry
+         (error 'rpc-error :code +rpc-invalid-parameter+
+                           :message "Block height out of range"))
+       (bitcoin-lisp.storage:block-index-entry-hash entry)))
+    ((valid-hex-hash-p hash-or-height) (parse-hex-hash hash-or-height))
+    (t (error 'rpc-error :code +rpc-invalid-parameter+
+                         :message "Invalid hash_or_height parameter"))))
+
+(defun %select-block-stats (all-stats stats-filter)
+  "Core's stats selection (rpc/blockchain.cpp:2181-2189): no selection returns
+everything; an unknown name is RPC_INVALID_PARAMETER (-8) rather than being
+silently dropped, which is how a typo used to read as 'that statistic is
+unavailable in this block'."
+  (cond
+    ((null stats-filter) all-stats)
+    ((not (listp stats-filter))
+     (error 'rpc-error :code +rpc-type-error+
+                       :message "Expected type array for stats"))
+    (t
+     (mapcar
+      (lambda (name)
+        (unless (stringp name)
+          (error 'rpc-error :code +rpc-type-error+
+                            :message "Expected type string for selected statistic"))
+        (or (assoc name all-stats :test #'string=)
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message (format nil "Invalid selected statistic '~A'" name))))
+      stats-filter))))
 
 (defun rpc-getblockstats (node params)
-  "Return statistics about a block."
+  "Per-block statistics (Bitcoin Core getblockstats, rpc/blockchain.cpp:1934-2190).
+PARAMS: (hash_or_height [stats]) — STATS selects a subset of the keys; an
+unknown name is an error. All amounts are in satoshis, feerates in sat/vB.
+The fee statistics come from the block's undo data, so — as in Core, whose
+GetUndoChecked runs unconditionally (:2016) — a spending block whose undo data
+is unavailable (pruned) is an error rather than a silently wrong answer."
   (let ((hash-or-height (first params))
         (stats-filter (second params)))
     (unless hash-or-height
       (error 'rpc-error :code +rpc-invalid-params+
                         :message "Missing required parameter hash_or_height"))
-    ;; Resolve block hash
     (let* ((chain-state (rpc-get-chain-state node))
            (block-store (rpc-get-block-store node)))
       (unless block-store
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Block data not available"))
-      (let* ((block-hash
-               (cond
-                 ;; Height provided
-                 ((integerp hash-or-height)
-                  (let ((entry (bitcoin-lisp.storage:get-block-at-height
-                                chain-state hash-or-height)))
-                    (unless entry
-                      (error 'rpc-error :code +rpc-invalid-parameter+
-                                        :message "Block height out of range"))
-                    (bitcoin-lisp.storage:block-index-entry-hash entry)))
-                 ;; Hash string provided
-                 ((valid-hex-hash-p hash-or-height)
-                  (parse-hex-hash hash-or-height))
-                 (t
-                  (error 'rpc-error :code +rpc-invalid-parameter+
-                                    :message "Invalid hash_or_height parameter"))))
+      (let* ((block-hash (%getblockstats-block-hash chain-state hash-or-height))
              (block (bitcoin-lisp.storage:get-block block-store block-hash)))
-      (unless block
-        (error 'rpc-error :code +rpc-invalid-address-or-key+
-                          :message "Block not found"))
-      (let* ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
-             (height (if entry
-                         (bitcoin-lisp.storage:block-index-entry-height entry)
-                         0))
-             (header (bitcoin-lisp.serialization:bitcoin-block-header block))
-             (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-             (ntx (length txs))
-             ;; Calculate stats
-             (total-size (length (bitcoin-lisp.serialization:serialize block)))
-             (total-ins 0)
-             (total-outs 0)
-             (total-out-value 0))
-        ;; Count inputs/outputs
-        (loop for tx in txs
-              for tx-idx from 0
-              do (unless (zerop tx-idx)  ; Skip coinbase inputs
-                   (incf total-ins (length (bitcoin-lisp.serialization:transaction-inputs tx))))
-                 (incf total-outs (length (bitcoin-lisp.serialization:transaction-outputs tx)))
-                 (bitcoin-lisp.serialization:dovector (out (bitcoin-lisp.serialization:transaction-outputs tx))
-                   (incf total-out-value (bitcoin-lisp.serialization:tx-out-value out))))
-        ;; Calculate subsidy
-        (let* ((subsidy (bitcoin-lisp.validation:calculate-block-subsidy height))
-               (avg-tx-size (if (> ntx 0)
-                                (round (/ total-size ntx))
-                                0))
-               (all-stats `(("avgtxsize" . ,avg-tx-size)
-                            ("blockhash" . ,(hash-to-hex block-hash))
-                            ("height" . ,height)
-                            ("ins" . ,total-ins)
-                            ("outs" . ,total-outs)
-                            ("subsidy" . ,subsidy)
-                            ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
-                            ("total_out" . ,total-out-value)
-                            ("total_size" . ,total-size)
-                            ("txs" . ,ntx))))
-          ;; Filter stats if requested
-          (if (and stats-filter (listp stats-filter))
-              (remove-if-not (lambda (pair)
-                               (member (car pair) stats-filter :test #'string=))
-                             all-stats)
-              all-stats)))))))
+        (unless block
+          (error 'rpc-error :code +rpc-invalid-address-or-key+
+                            :message "Block not found"))
+        (let* ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
+               (height (if entry (bitcoin-lisp.storage:block-index-entry-height entry) 0))
+               (header (bitcoin-lisp.serialization:bitcoin-block-header block))
+               (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+               (ntx (length txs))
+               (undo (bitcoin-lisp.validation:get-undo-data block-hash)))
+          (when (and (> ntx 1) (null undo))
+            ;; Core GetUndoChecked, rpc/blockchain.cpp:730-732.
+            (error 'rpc-error :code +rpc-misc-error+
+                              :message "Can't read undo data from disk"))
+          (let ((prevouts (%undo-prevout-table undo))
+                (maxfee 0) (minfee nil) (maxfeerate 0) (minfeerate nil)
+                (total-out 0) (totalfee 0) (inputs 0) (outputs 0)
+                (maxtxsize 0) (mintxsize nil)
+                (swtotal-size 0) (swtotal-weight 0) (swtxs 0)
+                (total-size 0) (total-weight 0)
+                (utxos 0) (utxo-size-inc 0) (utxo-size-inc-actual 0)
+                (fee-array '()) (feerate-array '()) (txsize-array '()))
+            (loop
+              for tx in txs
+              for i from 0
+              for coinbase-p = (zerop i)
+              do (let ((tx-total-out 0))
+                   ;; Outputs are counted for EVERY transaction, coinbase
+                   ;; included — Core :2054, before the coinbase continue.
+                   (incf outputs (length (bitcoin-lisp.serialization:transaction-outputs tx)))
+                   (bitcoin-lisp.serialization:dovector
+                       (out (bitcoin-lisp.serialization:transaction-outputs tx))
+                     (let* ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey out))
+                            (out-size (+ (%txout-serialize-size spk) +per-utxo-overhead+)))
+                       (incf tx-total-out (bitcoin-lisp.serialization:tx-out-value out))
+                       (incf utxo-size-inc out-size)
+                       ;; Genesis and the BIP30-repeated coinbases never enter
+                       ;; the UTXO set, and unspendable outputs are dropped
+                       ;; from it, so neither counts toward the *_actual
+                       ;; figures (Core :2064-2072).
+                       (unless (or (zerop height)
+                                   (and coinbase-p
+                                        (bitcoin-lisp.validation::bip30-repeat-block-p height))
+                                   (bitcoin-lisp.storage:script-unspendable-p spk))
+                         (incf utxos)
+                         (incf utxo-size-inc-actual out-size))))
+                   ;; Everything below is non-coinbase only (Core :2075-2077).
+                   (unless coinbase-p
+                     (let* ((tx-size (length (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
+                            (weight (bitcoin-lisp.serialization:transaction-weight tx))
+                            (tx-total-in 0))
+                       (incf inputs (length (bitcoin-lisp.serialization:transaction-inputs tx)))
+                       (incf total-out tx-total-out)
+                       (push tx-size txsize-array)
+                       (setf maxtxsize (max maxtxsize tx-size))
+                       (setf mintxsize (if mintxsize (min mintxsize tx-size) tx-size))
+                       (incf total-size tx-size)
+                       (incf total-weight weight)
+                       (when (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+                         (incf swtxs)
+                         (incf swtotal-size tx-size)
+                         (incf swtotal-weight weight))
+                       (bitcoin-lisp.serialization:dovector
+                           (in (bitcoin-lisp.serialization:transaction-inputs tx))
+                         (let* ((outpoint (bitcoin-lisp.serialization:tx-in-previous-output in))
+                                (coin (gethash (%outpoint-key
+                                                (bitcoin-lisp.serialization:outpoint-hash outpoint)
+                                                (bitcoin-lisp.serialization:outpoint-index outpoint))
+                                               prevouts)))
+                           (unless coin
+                             ;; Incomplete undo data: fail closed rather than
+                             ;; report a fee total that is silently too high.
+                             (error 'rpc-error :code +rpc-misc-error+
+                                               :message "Can't read undo data from disk"))
+                           (let ((prevout-size
+                                   (+ (%txout-serialize-size
+                                       (bitcoin-lisp.storage:utxo-entry-script-pubkey coin))
+                                      +per-utxo-overhead+)))
+                             (incf tx-total-in (bitcoin-lisp.storage:utxo-entry-value coin))
+                             (decf utxo-size-inc prevout-size)
+                             (decf utxo-size-inc-actual prevout-size))))
+                       (let* ((txfee (- tx-total-in tx-total-out))
+                              (feerate (if (plusp weight)
+                                           (truncate (* txfee 4) weight)
+                                           0)))
+                         (push txfee fee-array)
+                         (setf maxfee (max maxfee txfee))
+                         (setf minfee (if minfee (min minfee txfee) txfee))
+                         (incf totalfee txfee)
+                         (push (cons feerate weight) feerate-array)
+                         (setf maxfeerate (max maxfeerate feerate))
+                         (setf minfeerate (if minfeerate (min minfeerate feerate) feerate)))))))
+            (let* ((non-coinbase (max 0 (1- ntx)))
+                   (all-stats
+                     `(("avgfee" . ,(if (plusp non-coinbase) (truncate totalfee non-coinbase) 0))
+                       ("avgfeerate" . ,(if (plusp total-weight)
+                                            (truncate (* totalfee 4) total-weight)
+                                            0))
+                       ("avgtxsize" . ,(if (plusp non-coinbase)
+                                           (truncate total-size non-coinbase)
+                                           0))
+                       ("blockhash" . ,(hash-to-hex block-hash))
+                       ("feerate_percentiles" . ,(%feerate-percentiles feerate-array total-weight))
+                       ("height" . ,height)
+                       ("ins" . ,inputs)
+                       ("maxfee" . ,maxfee)
+                       ("maxfeerate" . ,maxfeerate)
+                       ("maxtxsize" . ,maxtxsize)
+                       ("medianfee" . ,(%truncated-median fee-array))
+                       ("mediantime" . ,(bitcoin-lisp.validation:compute-median-time-past
+                                         chain-state block-hash))
+                       ("mediantxsize" . ,(%truncated-median txsize-array))
+                       ("minfee" . ,(or minfee 0))
+                       ("minfeerate" . ,(or minfeerate 0))
+                       ("mintxsize" . ,(or mintxsize 0))
+                       ("outs" . ,outputs)
+                       ("subsidy" . ,(bitcoin-lisp.validation:calculate-block-subsidy height))
+                       ("swtotal_size" . ,swtotal-size)
+                       ("swtotal_weight" . ,swtotal-weight)
+                       ("swtxs" . ,swtxs)
+                       ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
+                       ("total_out" . ,total-out)
+                       ("total_size" . ,total-size)
+                       ("total_weight" . ,total-weight)
+                       ("totalfee" . ,totalfee)
+                       ("txs" . ,ntx)
+                       ("utxo_increase" . ,(- outputs inputs))
+                       ("utxo_size_inc" . ,utxo-size-inc)
+                       ("utxo_increase_actual" . ,(- utxos inputs))
+                       ("utxo_size_inc_actual" . ,utxo-size-inc-actual))))
+              (%select-block-stats all-stats stats-filter))))))))
 
 ;; calculate-block-subsidy lives in bitcoin-lisp.validation (consensus, now
 ;; network-aware incl. the regtest 150-block halving). The duplicate that lived
