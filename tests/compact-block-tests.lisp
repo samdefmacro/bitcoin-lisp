@@ -295,3 +295,115 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
     (is (bitcoin-lisp.networking:peer-pending-compact-block peer))
     (bitcoin-lisp.networking:clear-pending-compact-block peer)
     (is (null (bitcoin-lisp.networking:peer-pending-compact-block peer)))))
+
+;;;; ============================================================
+;;;; G7-16: BIP152 high-bandwidth selection
+;;;; ============================================================
+
+(defun %g716-peer (&key inbound (version 2))
+  (let ((p (bitcoin-lisp.networking::make-peer :inbound inbound)))
+    (setf (bitcoin-lisp.networking::peer-compact-block-version p) version
+          (bitcoin-lisp.networking::peer-state p) :ready)
+    p))
+
+(defmacro %g716-quiet (&body body)
+  "Run BODY with send-message stubbed out (no sockets)."
+  `(let ((real (fdefinition 'bitcoin-lisp.networking::send-message)))
+     (unwind-protect
+          (progn (setf (fdefinition 'bitcoin-lisp.networking::send-message)
+                       (lambda (peer msg) (declare (ignore peer msg)) t))
+                 ,@body)
+       (setf (fdefinition 'bitcoin-lisp.networking::send-message) real))))
+
+(test g7-16-initial-sendcmpct-is-low-bandwidth
+  "G7-16: high bandwidth is a SCARCE SELECTION (BIP152 allows 3), not a
+capability handshake. We used to request HB from every compact-capable peer, so
+every one of them pushed an unsolicited cmpctblock for every block instead of
+about three."
+  (let ((sent '())
+        (peer (%g716-peer)))
+    (let ((real (fdefinition 'bitcoin-lisp.networking::send-message)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'bitcoin-lisp.networking::send-message)
+                   (lambda (p msg) (declare (ignore p)) (push msg sent)))
+             (bitcoin-lisp.networking::send-compact-block-negotiation peer))
+        (setf (fdefinition 'bitcoin-lisp.networking::send-message) real)))
+    (is (= 1 (length sent)))
+    ;; Assert on the ACTUAL sendcmpct byte on the wire, and on the peer that
+    ;; was negotiated — checking a fresh peer's default-NIL flag would pass no
+    ;; matter what this function does.
+    (let ((payload (subseq (first sent) 24)))
+      (is (zerop (aref payload 0))
+          "the high-bandwidth byte of the initial sendcmpct must be 0"))
+    (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to peer))
+        "negotiation must not mark the peer HB")))
+
+(test g7-16-hb-selection-capped-at-three-demoting-oldest
+  "Core caps the HB set at 3 and demotes the OLDEST (front of
+lNodesAnnouncingHeaderAndIDs). A peer already selected is only moved to the
+back with NO sendcmpct re-sent — re-announcing every block would be a visible
+protocol anomaly."
+  (let ((bitcoin-lisp.networking::*hb-announcing-peers* '()))
+    (%g716-quiet
+      (let ((a (%g716-peer)) (b (%g716-peer)) (c (%g716-peer)) (d (%g716-peer)))
+        (dolist (p (list a b c))
+          (bitcoin-lisp.networking:maybe-set-peer-announcing-hb p))
+        (is (equal (list a b c) bitcoin-lisp.networking::*hb-announcing-peers*))
+        (is (every #'bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to
+                   (list a b c)))
+        ;; Re-selecting an existing peer only reorders it.
+        (bitcoin-lisp.networking:maybe-set-peer-announcing-hb a)
+        (is (equal (list b c a) bitcoin-lisp.networking::*hb-announcing-peers*)
+            "an already-selected peer moves to the back")
+        ;; A fourth peer evicts the oldest (now b).
+        (bitcoin-lisp.networking:maybe-set-peer-announcing-hb d)
+        (is (equal (list c a d) bitcoin-lisp.networking::*hb-announcing-peers*))
+        (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to b))
+            "the evicted peer must be demoted to low bandwidth")))))
+
+(test g7-16-inbound-promotion-protects-last-outbound-hb-peer
+  "THE SUBTLE ONE (Core net_processing.cpp:1299-1310). When an INBOUND peer is
+promoted, the set is full, and exactly ONE entry is outbound sitting at the
+front, Core swaps the first two so the outbound HB peer is not evicted.
+
+Without it a flood of inbound peers evicts every outbound HB peer in turn — an
+eclipse/partition weakening, and the same class of ordering mistake as trimming
+the wrong end of the reorg disconnect pool."
+  (let ((bitcoin-lisp.networking::*hb-announcing-peers* '()))
+    (%g716-quiet
+      (let ((out (%g716-peer))
+            (in1 (%g716-peer :inbound t))
+            (in2 (%g716-peer :inbound t))
+            (in3 (%g716-peer :inbound t)))
+        ;; Outbound peer is at the FRONT and is the only outbound entry.
+        (dolist (p (list out in1 in2))
+          (bitcoin-lisp.networking:maybe-set-peer-announcing-hb p))
+        (is (equal (list out in1 in2) bitcoin-lisp.networking::*hb-announcing-peers*))
+        ;; Promoting another inbound peer must NOT evict the lone outbound one.
+        (bitcoin-lisp.networking:maybe-set-peer-announcing-hb in3)
+        (is (member out bitcoin-lisp.networking::*hb-announcing-peers*)
+            "the last outbound HB peer must be protected from inbound eviction")
+        (is-true (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to out))
+        (is (null (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to in1))
+            "the inbound peer in slot 1 is evicted instead")))))
+
+(test g7-16-non-signalling-and-blocksonly-peers-not-promoted
+  "Core gates promotion on m_provides_cmpctblocks and skips it entirely in
+blocksonly mode — our mempool would not hold the transactions needed to
+reconstruct the block."
+  (let ((bitcoin-lisp.networking::*hb-announcing-peers* '()))
+    (%g716-quiet
+      (bitcoin-lisp.networking:maybe-set-peer-announcing-hb (%g716-peer :version 0))
+      (is (null bitcoin-lisp.networking::*hb-announcing-peers*)
+          "a peer that never signalled compact-block support is not eligible"))))
+
+(test g7-16-disconnect-frees-an-hb-slot
+  "A disconnected peer must not hold one of the three slots forever."
+  (let ((bitcoin-lisp.networking::*hb-announcing-peers* '()))
+    (%g716-quiet
+      (let ((a (%g716-peer)))
+        (bitcoin-lisp.networking:maybe-set-peer-announcing-hb a)
+        (is (equal (list a) bitcoin-lisp.networking::*hb-announcing-peers*))
+        (bitcoin-lisp.networking:forget-hb-announcing-peer a)
+        (is (null bitcoin-lisp.networking::*hb-announcing-peers*))))))

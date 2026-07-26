@@ -2254,22 +2254,95 @@ from a v1 compact block fails BIP141 validation (bad-witness-nonce-size). We
 therefore never announce or accept v1; non-v2 peers fall back to full
 MSG_WITNESS_BLOCK downloads.")
 
+(defvar *hb-announcing-peers* '()
+  "Peers we have asked to announce blocks in high-bandwidth compact form,
+OLDEST FIRST (Core lNodesAnnouncingHeaderAndIDs). BIP152 caps this at 3;
+promotion is earned by delivering a new best block, never granted at
+handshake.")
+
+(defconstant +max-hb-announcing-peers+ 3
+  "BIP152: only 3 peers are asked to announce with compact encodings.")
+
 (defun send-compact-block-negotiation (peer)
-  "Advertise compact block support to PEER. We announce only version 2 (witness),
-matching Bitcoin Core — a v1 (non-witness) compact block would strip the coinbase
-witness nonce. Requests high-bandwidth mode when not in IBD (peer may then send us
-unsolicited compact blocks for faster relay) — but never in blocksonly mode:
-our mempool won't contain the transactions needed to reconstruct a compact
-block (Core MaybeSetPeerAsAnnouncingHeaderAndIDs, net_processing.cpp:1275-1280)."
-  (let ((high-bw (and (not (ignore-incoming-txs-p))
-                      (not (or (eq (ibd-state) :syncing-blocks)
-                               (eq (ibd-state) :syncing-headers))))))
-    ;; getpeerinfo bip152_hb_to (Core m_bip152_highbandwidth_to): whether WE
-    ;; selected the peer as a high-bandwidth compact-block peer.
-    (when high-bw
-      (setf (peer-compact-block-high-bandwidth-to peer) t))
-    (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
-                        high-bw +compact-blocks-version+))))
+  "Advertise compact block support to PEER. We announce only version 2
+(witness), matching Bitcoin Core — a v1 (non-witness) compact block would strip
+the coinbase witness nonce.
+
+The initial sendcmpct is LOW-BANDWIDTH, as Core's is. High bandwidth is not a
+capability handshake, it is a scarce selection: BIP152 allows only 3 peers, and
+Core grants it only to a peer that has just delivered a new best block
+(MaybeSetPeerAsAnnouncingHeaderAndIDs). Asking every compact-capable peer for
+HB — what we used to do — makes every one of them push an unsolicited
+cmpctblock for every block instead of about three, and misreports
+getpeerinfo's bip152_hb_to."
+  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
+                      nil +compact-blocks-version+)))
+
+(defun %set-peer-hb (peer high-bandwidth)
+  (setf (peer-compact-block-high-bandwidth-to peer) high-bandwidth)
+  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
+                      high-bandwidth +compact-blocks-version+)))
+
+(defun maybe-set-peer-announcing-hb (peer)
+  "Promote PEER to high-bandwidth compact-block announcements after it
+delivered a new best block (Core MaybeSetPeerAsAnnouncingHeaderAndIDs,
+net_processing.cpp:1273-1330).
+
+Three subtleties, each of which Core spells out:
+  - A peer ALREADY in the list is only moved to the back; no sendcmpct is
+    re-sent. Re-announcing on every block would be a visible protocol anomaly.
+  - Never in blocksonly mode: our mempool would not hold the transactions
+    needed to reconstruct the block anyway.
+  - INBOUND-PROTECTION SWAP. When the peer being promoted is inbound, the list
+    is already full, and exactly ONE entry is outbound sitting at the front,
+    Core swaps the first two so the outbound HB peer is not the one evicted.
+    Without it a flood of inbound peers evicts every outbound HB peer in turn —
+    an eclipse/partition weakening, and the same class of ordering mistake as
+    trimming the wrong end of the reorg disconnect pool."
+  (when (and (not (ignore-incoming-txs-p))
+             ;; Core's m_provides_cmpctblocks gate: only a peer that signalled
+             ;; compact-block support is eligible.
+             (plusp (peer-compact-block-version peer)))
+    ;; Already selected: move to the back (most recently useful), send nothing.
+    (if (member peer *hb-announcing-peers*)
+        (setf *hb-announcing-peers*
+              (append (remove peer *hb-announcing-peers*) (list peer)))
+        (let ((outbound-count (count-if-not #'peer-inbound *hb-announcing-peers*)))
+          ;; Inbound-protection swap.
+          (when (and (peer-inbound peer)
+                     (>= (length *hb-announcing-peers*) +max-hb-announcing-peers+)
+                     (= outbound-count 1)
+                     (first *hb-announcing-peers*)
+                     (not (peer-inbound (first *hb-announcing-peers*))))
+            (rotatef (nth 0 *hb-announcing-peers*) (nth 1 *hb-announcing-peers*)))
+          ;; Over the cap: demote the OLDEST (front) back to low bandwidth.
+          (when (>= (length *hb-announcing-peers*) +max-hb-announcing-peers+)
+            (let ((evicted (first *hb-announcing-peers*)))
+              (setf *hb-announcing-peers* (rest *hb-announcing-peers*))
+              (ignore-errors (%set-peer-hb evicted nil))))
+          (%set-peer-hb peer t)
+          (setf *hb-announcing-peers*
+                (append *hb-announcing-peers* (list peer)))))))
+
+(defun maybe-promote-block-deliverer (peer chain-state)
+  "Consider promoting PEER to HB after it delivered a block (Core BlockChecked,
+net_processing.cpp:2218-2223).
+
+Core's gate is state.IsValid() AND !IsInitialBlockDownload() AND
+mapBlocksInFlight.count(hash) == mapBlocksInFlight.size() — that last clause
+being its proxy for \"this delivery was not part of a batch download\". We gate
+on validity and not-IBD only. DOCUMENTED DIVERGENCE: we may therefore promote
+somewhat more eagerly than Core mid-download. The blast radius is bounded — the
+cap of 3, the move-to-back on re-selection, and the inbound-protection swap all
+still apply — but it is a real difference and is left as a follow-up rather
+than silently approximated away."
+  (unless (initial-block-download-p chain-state)
+    (maybe-set-peer-announcing-hb peer)))
+
+(defun forget-hb-announcing-peer (peer)
+  "Drop PEER from the HB selection (disconnect), so a dead peer does not hold
+one of the three slots forever."
+  (setf *hb-announcing-peers* (remove peer *hb-announcing-peers*)))
 
 (defun handle-sendcmpct (peer payload)
   "Handle a sendcmpct message from a peer. We support only compact block version 2;
@@ -2437,6 +2510,8 @@ v1 compact block would deliver a witness-stripped coinbase."
          ;; A reconstructed compact block is a block delivery from this peer:
          ;; stamps getpeerinfo "last_block" and resets stall tracking.
          (record-block-received-from-peer peer)
+         ;; Earned HB promotion (Core MaybeSetPeerAsAnnouncingHeaderAndIDs).
+         (maybe-promote-block-deliverer peer chain-state)
          (bitcoin-lisp:log-debug "Compact block reconstructed successfully")
          ;; Process like a normal block (fork-aware: a reconstructed block on a
          ;; side branch is stored and reorged, not tip-validated).
@@ -2515,6 +2590,7 @@ v1 compact block would deliver a witness-stripped coinbase."
           (increment-compact-block-success)
           ;; Block delivery from this peer (getpeerinfo "last_block").
           (record-block-received-from-peer peer)
+          (maybe-promote-block-deliverer peer chain-state)
           (with-node-lock
             (multiple-value-bind (valid error)
                 (accept-downloaded-block block chain-state utxo-set block-store
