@@ -2479,3 +2479,145 @@ its availability with no block transfer. It recorded nothing."
      peer state (list hdr) (lambda (n) (declare (ignore n))) "test")
     (is (equalp hash (bitcoin-lisp.networking::peer-best-known-block-hash peer))
         "an all-already-known batch must still record the peer's best block")))
+
+;;;; ============================================================
+;;;; G7-15: BIP133 feefilter (Core MaybeSendFeefilter + FeeFilterRounder)
+;;;; ============================================================
+
+(defun %g715-peer (&key (version bitcoin-lisp.serialization:+protocol-version+)
+                        (conn-type :outbound-full-relay))
+  "A :ready peer that has completed a version handshake at VERSION, with a
+capturing transport so sends can be observed without sockets."
+  (let ((p (bitcoin-lisp.networking::make-peer :address "test")))
+    (setf (bitcoin-lisp.networking::peer-state p) :ready
+          (bitcoin-lisp.networking::peer-conn-type p) conn-type
+          (bitcoin-lisp.networking::peer-version p)
+          (flexi-streams:with-input-from-sequence
+              (s (bitcoin-lisp.serialization:make-version-message-bytes :version version))
+            (bitcoin-lisp.serialization:read-version-message s)))
+    p))
+
+(defmacro %g715-capturing ((sent) &body body)
+  "Run BODY capturing every feefilter value sent, into the list SENT."
+  `(let ((,sent '()))
+     (let ((real (fdefinition 'bitcoin-lisp.networking::send-message)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'bitcoin-lisp.networking::send-message)
+                    (lambda (peer msg)
+                      (declare (ignore peer))
+                      (when (string= "feefilter"
+                                     (flexi-streams:with-input-from-sequence (s msg)
+                                       (bitcoin-lisp.serialization:message-header-command
+                                        (bitcoin-lisp.serialization:read-message-header s))))
+                        (push (bitcoin-lisp.serialization:parse-feefilter-payload
+                               (subseq msg 24))
+                              ,sent))))
+              ,@body)
+         (setf (fdefinition 'bitcoin-lisp.networking::send-message) real)))
+     (setf ,sent (nreverse ,sent))))
+
+(test g7-15-fee-filter-buckets-match-core
+  "Buckets are {0} U {50 * 1.1^k <= 1e7}, built by repeated MULTIPLICATION as
+Core does (MakeFeeSet) — so the third boundary is 55.00000000000001, not 55.0.
+The base is Core's compile-time DEFAULT_MIN_RELAY_TX_FEE/2 = 50, NOT the
+configured -minrelaytxfee: configuring the relay floor must not move the
+buckets, or our quantization would become a fingerprint."
+  (let ((b bitcoin-lisp.networking::*fee-filter-buckets*))
+    (is (= 0 (aref b 0)))
+    (is (= 50.0d0 (aref b 1)))
+    (is (= (* 50.0d0 1.1d0) (aref b 2))
+        "built by repeated multiplication, not recomputed as 50*1.1^k")
+    (is (<= (aref b (1- (length b))) 1d7))
+    ;; The IBD sentinel goes on the wire as the TOP BUCKET, never MAX_MONEY.
+    (is (= 9936506 (bitcoin-lisp.networking::%feefilter-max-value)))))
+
+(test g7-15-rounding-clamps-and-quantizes
+  "round() clamps anything above the top bucket to the top bucket, never
+returns a non-bucket value, and is never above the requested fee's bucket."
+  (dotimes (i 200)
+    (declare (ignore i))
+    (let ((r (bitcoin-lisp.networking::fee-filter-round 1000)))
+      (is (find (float r 1d0) bitcoin-lisp.networking::*fee-filter-buckets*
+                :test (lambda (x b) (= x (floor b))))
+          "every rounded value must be an actual bucket")))
+  (is (= (bitcoin-lisp.networking::%feefilter-max-value)
+         (bitcoin-lisp.networking::fee-filter-round most-positive-fixnum))
+      "above the top bucket must clamp deterministically"))
+
+(test g7-15-ibd-sends-top-bucket-then-resends-on-exit
+  "During IBD we ask peers for no txs at all (they would be discarded), by
+sending round(MAX_MONEY) = the top bucket. Leaving IBD must FORCE a resend —
+without that, peers keep withholding txs from us for up to another 10 minutes."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%g715-peer)))
+    ;; --- in IBD ---
+    (%g715-capturing (sent)
+      (let ((bitcoin-lisp.networking::*cached-is-ibd* t))
+        (bitcoin-lisp.networking:maybe-send-feefilter peer mempool state 1000))
+      (is (equal (list (bitcoin-lisp.networking::%feefilter-max-value)) sent)
+          "IBD must put the top bucket on the wire, not MAX_MONEY"))
+    (is (> (bitcoin-lisp.networking::peer-next-send-feefilter peer) 1000)
+        "the next-send time must be advanced")
+    ;; --- out of IBD: forced resend regardless of the schedule ---
+    (%g715-capturing (sent)
+      (let ((bitcoin-lisp.networking::*cached-is-ibd* nil))
+        (bitcoin-lisp.networking:maybe-send-feefilter peer mempool state 1001))
+      (is (= 1 (length sent))
+          "leaving IBD must force an immediate resend")
+      (is (/= (bitcoin-lisp.networking::%feefilter-max-value) (first sent))
+          "the resent value must be the real filter, not the IBD sentinel"))))
+
+(test g7-15-next-send-advances-even-when-value-unchanged
+  "Core advances m_next_send_feefilter UNCONDITIONALLY inside the due branch,
+even when the value is unchanged and nothing is sent. Omitting that turns the
+tick into a per-second re-evaluation of every peer."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp.networking::*cached-is-ibd* nil)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%g715-peer)))
+    (%g715-capturing (sent)
+      (bitcoin-lisp.networking:maybe-send-feefilter peer mempool state 1000)
+      (is (= 1 (length sent)) "first call sends"))
+    (let ((scheduled (bitcoin-lisp.networking::peer-next-send-feefilter peer)))
+      (is (> scheduled 1000))
+      ;; Due again, same value: nothing sent, but the timer still moves.
+      (%g715-capturing (sent)
+        (bitcoin-lisp.networking:maybe-send-feefilter
+         peer mempool state (1+ scheduled))
+        (is (null sent) "an unchanged value must not be resent"))
+      (is (> (bitcoin-lisp.networking::peer-next-send-feefilter peer) scheduled)
+          "the timer must advance even when nothing was sent"))))
+
+(test g7-15-gates-version-and-block-relay
+  "Core skips feefilter for peers below FEEFILTER_VERSION (70013) and for
+outbound block-relay-only peers, which never announce txs to us anyway."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp.networking::*cached-is-ibd* nil)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (state (bitcoin-lisp.storage:make-chain-state)))
+    (%g715-capturing (sent)
+      (bitcoin-lisp.networking:maybe-send-feefilter
+       (%g715-peer :version 70012) mempool state 1000)
+      (is (null sent) "a pre-70013 peer must not receive feefilter"))
+    (%g715-capturing (sent)
+      (bitcoin-lisp.networking:maybe-send-feefilter
+       (%g715-peer :conn-type :block-relay) mempool state 1000)
+      (is (null sent) "block-relay-only peers must not receive feefilter"))
+    (%g715-capturing (sent)
+      (bitcoin-lisp.networking:maybe-send-feefilter
+       (%g715-peer) mempool state 1000)
+      (is (= 1 (length sent)) "a normal peer must receive one"))))
+
+(test g7-15-rolling-min-excludes-relay-floor
+  "Core rounds CTxMemPool::GetMinFee, which EXCLUDES -minrelaytxfee; the max()
+with the floor is applied AFTER rounding. Feeding the already-floored value to
+round() would emit 107 a third of the time where Core emits a flat 100."
+  (let ((mempool (bitcoin-lisp.mempool:make-mempool)))
+    (is (= 0 (bitcoin-lisp.mempool:mempool-decayed-rolling-min-fee-rate mempool))
+        "an idle pool has NO rolling minimum, independent of the relay floor")
+    (is (plusp (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
+        "the effective rate still folds the floor in")))

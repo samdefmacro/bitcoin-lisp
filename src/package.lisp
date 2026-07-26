@@ -875,6 +875,7 @@
    #:*cluster-count-limit*
    #:*cluster-size-limit*
    #:mempool-effective-min-fee-rate
+   #:mempool-decayed-rolling-min-fee-rate
    #:mempool-orphan-pool
    ;; Orphan pool (Core TxOrphanage at d3056bc: wtxid-keyed, per-peer
    ;; announcement accounting, DoS-bounded eviction, no time expiry)
@@ -1167,6 +1168,8 @@
    #:peer-user-agent
    #:peer-ping-latency
    #:peer-inbound
+   #:maybe-send-feefilter
+   #:fee-filter-round
    #:peer-conn-type
    #:peer-relays-txs-p
    #:peer-tx-relay-p
