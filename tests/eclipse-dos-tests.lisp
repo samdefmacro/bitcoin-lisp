@@ -309,6 +309,180 @@ nothing is stored."
     (is (= 0 (bitcoin-lisp.networking:address-book-count book)))))
 
 ;;; ============================================================
+;;; 3b. Gossiped-address ingestion: age never gates STORAGE
+;;; ============================================================
+;;;
+;;; Core (net_processing.cpp:4087-4114) stores every gossiped address it can
+;;; use, rewriting only absurd timestamps, and lets addrman's 30-day horizon
+;;; retire stale entries at SELECTION time (AddrInfo::IsTerrible). Its own DNS
+;;; seed path deliberately mints entries aged 3-7 DAYS (net.cpp:2375), so a
+;;; storage-side freshness window would discard exactly what a getaddr response
+;;; exists to deliver -- and addrman diversity is the substrate every
+;;; anti-eclipse mechanism selects from.
+
+(defun %addr-test-book ()
+  "A fresh address book with a PINNED bucket key. Placement is otherwise keyed
+by a per-process CSPRNG secret, which makes exact-content assertions on a book
+holding several addresses flake on random bucket/slot collisions; pin the seed
+through the constructor rather than derandomising production."
+  (bitcoin-lisp.networking:make-address-book
+   :key (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)))
+
+(defun %gossip-ip (d)
+  "A routable IPv4 (198.51.100.D) as mapped IPv6 bytes."
+  (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 198 51 100 d))
+
+(defun %gossip-net-addr (ip &key (services bitcoin-lisp.serialization:+node-network+)
+                                 (port 8333))
+  (bitcoin-lisp.serialization:make-net-addr :services services :ip ip :port port))
+
+(defun %gossip-ingest (book net-addr timestamp now &key source-net source-ip)
+  "One address through the production ingestion path; (VALUES stored relay)."
+  (bitcoin-lisp.networking::%ingest-gossiped-address
+   net-addr timestamp book nil now source-net source-ip))
+
+(defun %gossip-last-seen (book ip &optional (port 8333))
+  "Stored nTime for IP:PORT in BOOK, or NIL when absent."
+  (let ((entry (bitcoin-lisp.networking:address-book-lookup book ip port)))
+    (and entry (bitcoin-lisp.networking:peer-address-last-seen entry))))
+
+(test gossiped-address-age-does-not-gate-storage
+  "A 20-day-old gossiped address is STORED -- Core applies no storage-side
+freshness window, leaving stale entries to addrman's 30-day horizon at
+selection time -- but is NOT relayed onward, the 10-minute gate applying to
+relay only (net_processing.cpp:4102). The window this replaces DISCARDED it,
+which is why the live node accumulated ~1,600 addrman entries in 2.5 months."
+  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+         (book (%addr-test-book))
+         (now 1800000000)
+         (ip (%gossip-ip 7))
+         (old (- now (* 20 24 60 60))))
+    (multiple-value-bind (stored relay)
+        (%gossip-ingest book (%gossip-net-addr ip) old now)
+      (is (= 1 stored) "a 20-day-old address is stored")
+      (is (null relay) "...and is never relayed onward"))
+    (is (= 1 (bitcoin-lisp.networking:address-book-count book)))
+    (let ((last-seen (%gossip-last-seen book ip)))
+      (is (not (null last-seen)) "the 20-day-old address is in the book")
+      (when last-seen
+        (is (= (- old (* 2 60 60)) last-seen)
+            "stored with Core's 2h gossip time penalty")))))
+
+(test handle-addr-stores-aged-address-end-to-end
+  "The same thing through the real message path (handle-addr ->
+%process-gossiped-addresses -> ingestion): a week-old address in an addr
+message reaches addrman, penalised by 2h and by nothing else."
+  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+         (book (%addr-test-book))
+         (ip (%gossip-ip 11))
+         (old (- (bitcoin-lisp.serialization:get-unix-time) (* 7 24 60 60)))
+         (payload (coerce
+                   (flexi-streams:with-output-to-sequence (s)
+                     (bitcoin-lisp.serialization:write-compact-size s 1)
+                     (bitcoin-lisp.serialization:write-net-addr
+                      s (%gossip-net-addr ip)
+                      :with-timestamp t :timestamp old))
+                   '(simple-array (unsigned-byte 8) (*)))))
+    (is (= 1 (bitcoin-lisp.networking:handle-addr nil payload book)))
+    (is (= 1 (bitcoin-lisp.networking:address-book-count book)))
+    (is (eql (- old (* 2 60 60)) (%gossip-last-seen book ip)))))
+
+(test gossiped-absurd-timestamp-is-rewritten-not-dropped
+  "A timestamp at or below CAddress::TIME_INIT, or more than 10 minutes ahead
+of us, is REWRITTEN to now - 5 days and stored anyway (Core
+net_processing.cpp:4090-4092) rather than dropped -- and the rewrite is what
+the relay gate then reads, so a flying-DeLorean timestamp cannot buy relay."
+  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+         (now 1800000000)
+         ;; rewrite to now-5d, then the 2h storage penalty on top.
+         (expected (- now (* 5 24 60 60) (* 2 60 60))))
+    (loop for (timestamp . d) in (list (cons 0 21)                ; unset
+                                       (cons 100000000 22)        ; TIME_INIT itself
+                                       (cons (+ now 3600) 23))    ; an hour ahead
+          do (let ((book (%addr-test-book))
+                   (ip (%gossip-ip d)))
+               (multiple-value-bind (stored relay)
+                   (%gossip-ingest book (%gossip-net-addr ip) timestamp now)
+                 (is (= 1 stored) "absurd timestamp ~D is stored, not dropped" timestamp)
+                 (is (null relay) "a rewritten address is not relayed"))
+               (let ((last-seen (%gossip-last-seen book ip)))
+                 (is (not (null last-seen)) "timestamp ~D reached the book" timestamp)
+                 (when last-seen
+                   (is (= expected last-seen)
+                       "timestamp ~D rewritten to now-5d" timestamp)))))
+    ;; Boundary: exactly now+10min is NOT absurd, so it survives verbatim.
+    (let ((book (%addr-test-book))
+          (ip (%gossip-ip 24)))
+      (%gossip-ingest book (%gossip-net-addr ip) (+ now 600) now)
+      (is (eql (- (+ now 600) (* 2 60 60)) (%gossip-last-seen book ip))))))
+
+(test gossiped-address-stored-with-two-hour-penalty
+  "Gossip is hearsay, so Core stores a third party's address 2 hours in the
+past (/*time_penalty=*/2h, net_processing.cpp:4114) and exempts only a peer
+announcing ITSELF (addrman.cpp:559-563, \"Do not set a penalty for a source's
+self-announcement\")."
+  (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+        (now 1800000000))
+    ;; Third party: penalised.
+    (let ((book (%addr-test-book))
+          (ip (%gossip-ip 31)))
+      (%gossip-ingest book (%gossip-net-addr ip) now now
+                      :source-net :ipv4 :source-ip (%gossip-ip 99))
+      (is (eql (- now (* 2 60 60)) (%gossip-last-seen book ip))))
+    ;; Self-announcement, source derived from the peer by the real path.
+    (let* ((book (%addr-test-book))
+           (ip (%gossip-ip 32))
+           (ts (bitcoin-lisp.serialization:get-unix-time))
+           (p (bitcoin-lisp.networking:make-peer :conn-type :outbound-full-relay
+                                                 :address "198.51.100.32")))
+      (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 10.0d0)
+      (bitcoin-lisp.networking::%process-gossiped-addresses
+       p (list (cons (%gossip-net-addr ip) ts)) 1 book nil)
+      (is (eql ts (%gossip-last-seen book ip))
+          "a peer announcing its own address is not time-penalised"))))
+
+(test gossiped-address-service-filter
+  "Core stores only addresses that may run a useful address DB
+(net_processing.cpp:4087 / MayHaveUsefulAddressDB): NODE_NETWORK or
+NODE_NETWORK_LIMITED. Anything else is skipped entirely -- neither stored nor
+relayed -- so services=0 junk never becomes a dial candidate."
+  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+         (now 1800000000))
+    (loop for (services d storedp) in
+          (list (list 0 41 nil)                                             ; nothing
+                (list bitcoin-lisp.serialization:+node-witness+ 42 nil)     ; witness only
+                (list bitcoin-lisp.serialization:+node-network+ 43 t)
+                (list bitcoin-lisp.serialization:+node-network-limited+ 44 t)
+                (list (logior bitcoin-lisp.serialization:+node-network+
+                              bitcoin-lisp.serialization:+node-witness+) 45 t))
+          do (let ((book (%addr-test-book))
+                   (ip (%gossip-ip d)))
+               (multiple-value-bind (stored relay)
+                   (%gossip-ingest book (%gossip-net-addr ip :services services) now now)
+                 (is (= (if storedp 1 0) stored) "services ~D storage" services)
+                 (is (eq storedp (not (null relay))) "services ~D relay" services))
+               (is (= (if storedp 1 0)
+                      (bitcoin-lisp.networking:address-book-count book))
+                   "services ~D book count" services)))))
+
+(test gossiped-address-relay-gate-is-ten-minutes
+  "Control for the storage change: the RELAY gate is untouched and still the
+10 minutes Core uses (net_processing.cpp:4102). 9m59s old relays; 10m01s old
+does not -- yet BOTH are stored, which is the whole point of separating the
+two gates."
+  (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
+         (now 1800000000))
+    (loop for (age d relayp) in (list (list 599 51 t)
+                                      (list 601 52 nil)
+                                      (list (* 20 24 60 60) 53 nil))
+          do (let ((book (%addr-test-book))
+                   (ip (%gossip-ip d)))
+               (multiple-value-bind (stored relay)
+                   (%gossip-ingest book (%gossip-net-addr ip) (- now age) now)
+                 (is (= 1 stored) "age ~Ds is stored regardless" age)
+                 (is (eq relayp (not (null relay))) "age ~Ds relay decision" age))))))
+
+;;; ============================================================
 ;;; 4. Generic-path low-work presync anti-DoS
 ;;; ============================================================
 
