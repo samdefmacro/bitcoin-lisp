@@ -1026,6 +1026,53 @@ Tracks indices and allocates only once at the end."
     (when (and last-start last-end)
       (subseq script last-start last-end))))
 
+(defun p2sh-sigop-subscript (script-sig)
+  "The subscript Bitcoin Core counts the sigops of when SCRIPT-SIG spends a P2SH
+output, or NIL when Core counts none.
+
+CScript::GetSigOpCount(const CScript&) (script.cpp:183-205) walks SCRIPT-SIG with
+GetScriptOp and returns zero on a truncated push or on any opcode above OP_16.
+That bail-out condition is exactly CScript::IsPushOnly (script.cpp:266-281), so a
+non-NIL result doubles as the push-only gate the P2SH-wrapped-witness branch
+needs (interpreter.cpp:2152-2163).
+
+GetScriptOp clears its data buffer for every opcode and refills it only for
+opcode <= OP_PUSHDATA4 (script.cpp:313-359), so OP_1NEGATE, OP_RESERVED and
+OP_1..OP_16 leave an EMPTY subscript behind instead of the preceding push.
+
+Deliberately separate from EXTRACT-LAST-PUSH, which is the policy/standardness
+redeem-script extractor and has different semantics."
+  (let ((len (length script-sig))
+        (i 0)
+        (start 0)
+        (end 0))
+    (loop while (< i len)
+          do (let ((opcode (aref script-sig i)))
+               (cond
+                 ((<= opcode +op-pushdata4+)
+                  (let* ((width (cond ((< opcode +op-pushdata1+) 0)
+                                      ((= opcode +op-pushdata1+) 1)
+                                      ((= opcode +op-pushdata2+) 2)
+                                      (t 4)))
+                         (data (+ i 1 width)))
+                    (when (> data len)
+                      (return-from p2sh-sigop-subscript nil))
+                    (let ((size (if (zerop width)
+                                    opcode
+                                    (loop for k from 0 below width
+                                          sum (ash (aref script-sig (+ i 1 k)) (* 8 k))))))
+                      (when (> (+ data size) len)
+                        (return-from p2sh-sigop-subscript nil))
+                      (setf start data
+                            end (+ data size)
+                            i end))))
+                 ((> opcode +op-16+)
+                  (return-from p2sh-sigop-subscript nil))
+                 (t
+                  (setf start 0 end 0)
+                  (incf i)))))
+    (subseq script-sig start end)))
+
 (defun count-legacy-sigops (tx)
   "Count legacy (inaccurate) sigops across all scriptSigs and scriptPubKeys of TX."
   (let ((count 0))
@@ -1074,9 +1121,11 @@ GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
                     (let ((witness (get-input-witness tx input-idx)))
                       (incf witness-count (count-witness-sigops-for-input
                                            script-pubkey witness))))
-                   ;; P2SH input
+                   ;; P2SH input. A NIL subscript is Core's "not push-only",
+                   ;; which zeroes the P2SH sigops AND gates the wrapped-witness
+                   ;; branch (CountWitnessSigOps requires IsPushOnly).
                    ((script-is-p2sh-p script-pubkey)
-                    (let ((redeem-script (extract-last-push
+                    (let ((redeem-script (p2sh-sigop-subscript
                                           (bitcoin-lisp.serialization:tx-in-script-sig input))))
                       (when redeem-script
                         ;; P2SH sigops from redeemScript
