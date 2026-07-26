@@ -2252,9 +2252,11 @@ a consensus split."
                           ((ScriptOk (Tuple len-byte len-ctx))
                            (let ((push-len (lisp UFix (len-byte) len-byte)))
                              ;; Check push size limit (always, even in non-executing branches).
-                             ;; BIP 342 removes this 520-byte cap in tapscript.
-                             (if (and (not (flag-enabled "TAPSCRIPT"))
-                                      (> push-len +max-push-size+))
+                             ;; BIP 342 keeps this 520-byte cap: Core's check
+                             ;; (interpreter.cpp:447-448) sits between the
+                             ;; sigversion-gated MAX_SCRIPT_SIZE (:428) and
+                             ;; MAX_OPS_PER_SCRIPT (:451-455) and is itself ungated.
+                             (if (> push-len +max-push-size+)
                                  (ScriptErr SE-PushSize)
                                  (match (read-script-bytes push-len len-ctx)
                                    ((ScriptErr e) (ScriptErr e))
@@ -2276,9 +2278,11 @@ a consensus split."
                                              (cl:+ (cl:aref len-bytes 0)
                                                    (cl:ash (cl:aref len-bytes 1) 8)))))
                              ;; Check push size limit (always, even in non-executing branches).
-                             ;; BIP 342 removes this 520-byte cap in tapscript.
-                             (if (and (not (flag-enabled "TAPSCRIPT"))
-                                      (> data-len +max-push-size+))
+                             ;; BIP 342 keeps this 520-byte cap: Core's check
+                             ;; (interpreter.cpp:447-448) sits between the
+                             ;; sigversion-gated MAX_SCRIPT_SIZE (:428) and
+                             ;; MAX_OPS_PER_SCRIPT (:451-455) and is itself ungated.
+                             (if (> data-len +max-push-size+)
                                  (ScriptErr SE-PushSize)
                                  (match (read-script-bytes data-len len-ctx)
                                    ((ScriptErr e) (ScriptErr e))
@@ -2302,9 +2306,11 @@ a consensus split."
                                                    (cl:ash (cl:aref len-bytes 2) 16)
                                                    (cl:ash (cl:aref len-bytes 3) 24)))))
                              ;; Check push size limit (always, even in non-executing branches).
-                             ;; BIP 342 removes this 520-byte cap in tapscript.
-                             (if (and (not (flag-enabled "TAPSCRIPT"))
-                                      (> data-len +max-push-size+))
+                             ;; BIP 342 keeps this 520-byte cap: Core's check
+                             ;; (interpreter.cpp:447-448) sits between the
+                             ;; sigversion-gated MAX_SCRIPT_SIZE (:428) and
+                             ;; MAX_OPS_PER_SCRIPT (:451-455) and is itself ungated.
+                             (if (> data-len +max-push-size+)
                                  (ScriptErr SE-PushSize)
                                  (match (read-script-bytes data-len len-ctx)
                                    ((ScriptErr e) (ScriptErr e))

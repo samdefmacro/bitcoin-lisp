@@ -134,6 +134,31 @@ false positive is impossible (Core AlreadyHaveTx's guess, txdownloadman_impl
     (when e
       (mapcar #'orphan-announcement-peer (orphan-entry-announcements e)))))
 
+(defun orphan-children-from-peer (pool parent-tx peer)
+  "The orphan transactions PEER announced that spend an output of PARENT-TX,
+NEWEST announcement first (Core GetChildrenFromSamePeer,
+txorphanage.cpp:645-670). Restricting the search to one peer's own orphans is
+the anti-censorship property Core documents there: an attacker flooding us
+with fake children of PARENT-TX cannot crowd out the real child supplied by
+the honest peer, because we only ever pair a parent with children from the
+same announcer. Newest-first matters when children replace one another — the
+most recent is usually the highest-feerate one."
+  (let ((ptxid (bitcoin-lisp.serialization:transaction-hash parent-tx))
+        (found '()))
+    (dolist (wtxid (gethash ptxid (orphan-pool-by-prev pool)))
+      (let ((entry (gethash wtxid (orphan-pool-by-wtxid pool))))
+        (when entry
+          (let ((ann (find peer (orphan-entry-announcements entry)
+                           :key #'orphan-announcement-peer)))
+            (when ann
+              (push (cons (orphan-announcement-sequence ann)
+                          (orphan-entry-transaction entry))
+                    found))))))
+    ;; by-prev is parent-txid-granular, which is exactly the granularity of
+    ;; Core's `input.prevout.hash == parent_txid` test, so no per-outpoint
+    ;; re-check is needed here (unlike orphan-erase-for-block).
+    (mapcar #'cdr (sort found #'> :key #'car))))
+
 (defun orphans-depending-on (pool parent-txid)
   "The wtxids of orphans that reference PARENT-TXID as an input parent
 (Core AddChildrenToWorkSet's m_outpoint_to_orphan_wtxids lookup across all of

@@ -212,7 +212,7 @@ the per-tx ceiling."
          (now (or block-time (bitcoin-lisp.serialization:get-unix-time)))
          ;; Median-time-past: the locktime cutoff for tx finality (Core
          ;; m_lock_time_cutoff, miner.cpp:150) and, +1, the header floor.
-         (mtp (bitcoin-lisp.validation:compute-median-time-past chain-state prev-hash))
+         (mtp (or (bitcoin-lisp.validation:compute-median-time-past-from-entry tip) 0))
          ;; Header time floor (Core GetMinimumTime, miner.cpp:36-47): MTP+1,
          ;; raised at retarget heights to the previous block's ACTUAL time
          ;; minus MAX_TIMEWARP — the BIP94 timewarp rule, applied on ALL

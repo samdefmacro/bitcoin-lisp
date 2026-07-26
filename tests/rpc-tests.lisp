@@ -8,6 +8,75 @@
 
 (in-suite rpc-tests)
 
+;;; --- Shared fixtures: temp data directory + raw HTTP client ---
+;;;
+;;; The HTTP helpers also serve ui-tests.lisp, which loads after this file.
+
+(defmacro with-rpc-test-datadir ((var) &body body)
+  "Run BODY with VAR bound to a fresh temporary data directory, removed after.
+Every start-rpc-server call needs one: the .cookie written there is the
+credential when no rpcuser/rpcpassword is configured."
+  `(let ((,var (ensure-directories-exist
+                (merge-pathnames (format nil "bl-rpc-test-~D-~D/"
+                                         (get-universal-time) (random 1000000))
+                                 (uiop:temporary-directory)))))
+     (unwind-protect (progn ,@body)
+       (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
+
+(defun %basic-auth-header (credential)
+  "An HTTP Basic Authorization header value carrying CREDENTIAL (\"user:pass\")."
+  (concatenate 'string "Basic " (cl-base64:string-to-base64-string credential)))
+
+(defun %http-raw-request (port lines &optional body)
+  "Send an HTTP request (header LINES + optional BODY, CRLF framing) to
+127.0.0.1:PORT and return the whole response as a string."
+  (let ((request
+          (with-output-to-string (s)
+            (dolist (line lines)
+              (write-string line s)
+              (write-char #\Return s)
+              (write-char #\Linefeed s))
+            (write-char #\Return s)
+            (write-char #\Linefeed s)
+            (when body (write-string body s)))))
+    (usocket:with-client-socket (socket stream "127.0.0.1" port
+                                 :element-type '(unsigned-byte 8) :timeout 15)
+      (write-sequence (flexi-streams:string-to-octets request :external-format :utf-8)
+                      stream)
+      (force-output stream)
+      (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
+                                 :adjustable t :fill-pointer 0)))
+        (loop for b = (read-byte stream nil nil)
+              while b do (vector-push-extend b bytes))
+        (flexi-streams:octets-to-string
+         (coerce bytes '(vector (unsigned-byte 8))) :external-format :utf-8)))))
+
+(defun %http-status (response)
+  "The status code of an \"HTTP/1.1 NNN ...\" response string."
+  (parse-integer response :start 9 :junk-allowed t))
+
+(defun %http-post-rpc (port json &key origin auth auth-header)
+  "POST JSON to / on 127.0.0.1:PORT. AUTH is a \"user:pass\" credential sent as
+HTTP Basic; AUTH-HEADER sends a literal Authorization value instead."
+  (%http-raw-request
+   port
+   (append (list "POST / HTTP/1.1"
+                 (format nil "Host: 127.0.0.1:~D" port))
+           (when origin (list (format nil "Origin: ~A" origin)))
+           (let ((header (or auth-header (and auth (%basic-auth-header auth)))))
+             (when header (list (format nil "Authorization: ~A" header))))
+           (list "Content-Type: application/json"
+                 (format nil "Content-Length: ~D" (length json))
+                 "Connection: close"))
+   json))
+
+(defun %http-get (port path)
+  (%http-raw-request
+   port
+   (list (format nil "GET ~A HTTP/1.1" path)
+         (format nil "Host: 127.0.0.1:~D" port)
+         "Connection: close")))
+
 ;;; --- JSON-RPC Parsing Tests ---
 
 (test json-rpc-parse-valid-request
@@ -335,7 +404,20 @@ when the block is on the active chain and rejects a root-mismatched proof."
                ;; Corrupt the proof's last hex nibble -> root/parse mismatch -> error.
                (signals bitcoin-lisp.rpc::rpc-error
                  (bitcoin-lisp.rpc::rpc-verifytxoutproof
-                  node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))))
+                  node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))
+               ;; Same proof once its block is off the active chain: Core
+               ;; returns an empty VARR, which must render [] and not null.
+               ;; (Control: the (equal (list target) verified) assertion above
+               ;; is the same proof while the block IS on the active chain.)
+               (let ((sibling (make-32-byte-hash 200)))
+                 (bitcoin-lisp.storage:add-block-index-entry
+                  chain-state (bitcoin-lisp.storage:make-block-index-entry
+                               :hash sibling :height 0 :header header
+                               :chain-work 2 :status :valid))
+                 (bitcoin-lisp.storage:update-chain-tip chain-state sibling 0)
+                 (is (string= "[]" (%encode-rpc-result
+                                    (bitcoin-lisp.rpc::rpc-verifytxoutproof
+                                     node (list proof))))))))
         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 
 ;;; dumptxoutset / loadtxoutset (Core snapshot v2 format) tests live in
@@ -460,14 +542,14 @@ status with no scan running returns null; abort with no scan is a no-op."
 
 (test json-rpc-response-success
   "Test successful response format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-response 42 "test-id")))
+  (let ((response (bitcoin-lisp.rpc::make-rpc-response 42 "test-id" :v2)))
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (= (gethash "result" response) 42))
     (is (string= (gethash "id" response) "test-id"))))
 
 (test json-rpc-response-error
   "Test error response format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" "test-id")))
+  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" "test-id" :v2)))
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (string= (gethash "id" response) "test-id"))
     (let ((error-obj (gethash "error" response)))
@@ -503,13 +585,15 @@ status with no scan running returns null; abort with no scan is a no-op."
   (is (null bitcoin-lisp.rpc:*rpc-server*))
 
   ;; Start on an unusual port to avoid conflicts
-  (let ((node (make-test-node)))
-    (bitcoin-lisp.rpc:start-rpc-server node :port 19999)
-    (is (not (null bitcoin-lisp.rpc:*rpc-server*)))
+  (with-rpc-test-datadir (dir)
+    (let ((node (make-test-node)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (bitcoin-lisp.rpc:start-rpc-server node :port 19999)
+      (is (not (null bitcoin-lisp.rpc:*rpc-server*)))
 
-    ;; Stop server
-    (bitcoin-lisp.rpc:stop-rpc-server)
-    (is (null bitcoin-lisp.rpc:*rpc-server*))))
+      ;; Stop server
+      (bitcoin-lisp.rpc:stop-rpc-server)
+      (is (null bitcoin-lisp.rpc:*rpc-server*)))))
 
 ;;; --- Helper to create initialized test node ---
 
@@ -552,7 +636,7 @@ status with no scan running returns null; abort with no scan is a no-op."
     (is (= 8 (length (cdr (assoc "bits" result :test #'string=)))))
     ;; encodes cleanly through yason (warnings is an empty JSON array, etc.)
     (is (stringp (with-output-to-string (s)
-                   (yason:encode (bitcoin-lisp.rpc::make-rpc-response result "id") s))))))
+                   (yason:encode (bitcoin-lisp.rpc::make-rpc-response result "id" :v2) s))))))
 
 (test rpc-getblockcount
   "Test getblockcount returns integer"
@@ -643,12 +727,97 @@ out-of-range or boolean verbosity like Core (ParseVerbosity allow_bool=false)."
     (is (equalp raw (bitcoin-lisp.crypto:hex-to-bytes
                      (cdr (assoc "hex" o :test #'string=))))))
   (let ((node (make-test-node)))
-    (is (null (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
-    (is (null (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2))))
+    ;; An empty orphanage is Core's empty VARR. This used to assert
+    ;; (null ...), i.e. the bug: NIL encodes as JSON null, not [].
+    (is (equalp #() (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
+    (is (equalp #() (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2))))
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getorphantxs node (list 3)))
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getorphantxs node (list t)))))
+
+;;; --- Empty collections render [] / {} , never null ---
+
+(defun %encode-rpc-result (result)
+  "The exact JSON text RESULT renders to, through the same normalizer and
+encoder the RPC server uses (rpc-result->json, then yason). Asserting on the
+Lisp value alone would not catch this bug: NIL is a perfectly good empty list
+in CL and only becomes wrong at the encoder."
+  (with-output-to-string (s)
+    (yason:encode (bitcoin-lisp.rpc::rpc-result->json result) s)))
+
+(test rpc-empty-collections-encode-as-array-or-object
+  "Core builds every collection as a UniValue VARR/VOBJ, so an EMPTY one
+renders [] (or {}), never null. Our encoder maps CL NIL to JSON null, so each
+producing site coerces with json-array / json-object. Verified live before the
+fix: listbanned and getaddednodeinfo answered result:null."
+  (bitcoin-lisp.networking:clear-ban-list)
+  (let* ((node (make-test-node))
+         (mempool (bitcoin-lisp::node-mempool node)))
+    ;; The premise: a bare NIL really does encode as null. Without this the
+    ;; assertions below could pass for the wrong reason.
+    (is (string= "null" (%encode-rpc-result nil)))
+    ;; Arrays (Core VARR).
+    (dolist (site (list (cons "getpeerinfo" (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+                        (cons "listbanned" (bitcoin-lisp.rpc::rpc-listbanned node nil))
+                        (cons "getorphantxs" (bitcoin-lisp.rpc::rpc-getorphantxs node nil))
+                        (cons "getnodeaddresses"
+                              (bitcoin-lisp.rpc::rpc-getnodeaddresses node (list 0)))
+                        (cons "getaddednodeinfo"
+                              (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil))
+                        (cons "getrawmempool"
+                              (bitcoin-lisp.rpc::rpc-getrawmempool node nil))
+                        (cons "getmempoolancestors"
+                              (bitcoin-lisp.rpc::%mempool-set->result
+                               mempool (make-hash-table :test 'equalp) nil))
+                        (cons "getnetworkinfo.localaddresses"
+                              (cdr (assoc "localaddresses"
+                                          (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
+                                          :test #'string=)))
+                        (cons "scantxoutset.unspents"
+                              (cdr (assoc "unspents"
+                                          (bitcoin-lisp.rpc::rpc-scantxoutset
+                                           node (list "start" (list "raw(51)")))
+                                          :test #'string=)))))
+      (is (string= "[]" (%encode-rpc-result (cdr site)))
+          "~A must render [] when empty, got ~A"
+          (car site) (%encode-rpc-result (cdr site))))
+    ;; Objects (Core VOBJ): getrawmempool's VERBOSE form is a txid-keyed
+    ;; object, so its empty case is {} and NOT [].
+    (dolist (site (list (cons "getrawmempool verbose"
+                              (bitcoin-lisp.rpc::rpc-getrawmempool node (list t)))
+                        (cons "getmempooldescendants verbose"
+                              (bitcoin-lisp.rpc::%mempool-set->result
+                               mempool (make-hash-table :test 'equalp) t))))
+      (is (string= "{}" (%encode-rpc-result (cdr site)))
+          "~A must render {} when empty, got ~A"
+          (car site) (%encode-rpc-result (cdr site))))
+    ;; A node with no mempool at all takes getrawmempool's other early branch,
+    ;; which must still pick the shape by verbosity.
+    (setf (bitcoin-lisp::node-mempool node) nil)
+    (is (string= "[]" (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getrawmempool node nil))))
+    (is (string= "{}" (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getrawmempool node (list t))))))
+  ;; CONTROL 1 — populated collections keep their existing shape: an array of
+  ;; JSON objects, not a vector of unencodable dotted pairs.
+  (let ((node (make-test-node)))
+    (setf (bitcoin-lisp::node-peers node)
+          (list (bitcoin-lisp::make-peer :address "1.2.3.4:48333" :user-agent "/t/")))
+    (bitcoin-lisp.rpc::rpc-addnode node (list "192.0.2.10:48333" "add"))
+    (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "add"))
+    (let ((peers (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)))
+          (bans (%encode-rpc-result (bitcoin-lisp.rpc::rpc-listbanned node nil)))
+          (added (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil))))
+      (is (eql 0 (search "[{" peers)))
+      (is (eql 0 (search "[{" bans)))
+      (is (search "\"address\":\"1.2.3.4\"" bans))
+      (is (eql 0 (search "[{" added)))
+      ;; ... and a populated row's own empty nested array is [] too.
+      (is (search "\"addresses\":[]" added)))
+    (bitcoin-lisp.networking:clear-ban-list))
+  ;; CONTROL 2 — NIL must still mean null where Core returns null. This is why
+  ;; the fix is per-site and not a global normalizer in rpc-result->json.
+  (is (string= "null" (%encode-rpc-result
+                       (bitcoin-lisp.rpc::rpc-scantxoutset (make-test-node) (list "status"))))))
 
 ;;; --- UTXO Query Method Tests (4.3) ---
 
@@ -704,7 +873,7 @@ used to emit it verbatim, which yason cannot encode."
       (is (integerp (cdr (assoc "version" entry :test #'string=))))
       (is (= (cdr (assoc "version" entry :test #'string=)) 70016))
       ;; full result must serialize without error
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-getnetworkinfo
@@ -758,11 +927,11 @@ default, json-false under -blocksonly."
     (is (integerp (cdr (assoc "usage" result :test #'string=))))))
 
 (test rpc-getrawmempool-non-verbose
-  "Test getrawmempool non-verbose returns list"
+  "getrawmempool non-verbose returns a JSON array of txids — [] for a new
+node, not null (it used to assert only LISTP, which NIL satisfies)."
   (let* ((node (make-test-node))
          (result (bitcoin-lisp.rpc::rpc-getrawmempool node '(nil))))
-    ;; Should return a list (empty for new node)
-    (is (listp result))))
+    (is (equalp #() result))))
 
 (test rpc-getrawmempool-verbose
   "getrawmempool verbose returns a per-tx detail alist (txid -> fields) that the
@@ -771,8 +940,11 @@ RPC layer normalizes into a JSON object."
          (mempool (bitcoin-lisp::node-mempool node))
          (tx (make-mempool-test-tx :input-id 200))
          (txid (bitcoin-lisp.serialization:transaction-hash tx)))
-    ;; Empty mempool -> empty.
-    (is (null (bitcoin-lisp.rpc::rpc-getrawmempool node '(t))))
+    ;; Empty mempool -> Core's empty VOBJ, i.e. an empty JSON object, not
+    ;; null (this used to assert (null ...), the bug).
+    (let ((empty (bitcoin-lisp.rpc::rpc-getrawmempool node '(t))))
+      (is (hash-table-p empty))
+      (is (zerop (hash-table-count empty))))
     ;; Populate and check the entry + a couple of fields.
     (bitcoin-lisp.mempool:mempool-add
      mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))
@@ -783,7 +955,7 @@ RPC layer normalizes into a JSON object."
       (is (assoc "vsize" entry :test #'string=))
       (is (= 1 (cdr (assoc "ancestorcount" entry :test #'string=))))
       ;; serializes cleanly through the RPC response normalizer
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-sendrawtransaction-invalid
@@ -1078,25 +1250,226 @@ a hardcoded 1."
         (is (= 1 (cdr (assoc "confirmations" r :test #'string=))))
         (is (null (assoc "nextblockhash" r :test #'string=)))))))
 
+;;; --- getblockheader nTx / previousblockhash, getblock coinbase_tx ---
+
+(defun %hdrfields-tx (tag &key witness)
+  "A coinbase-shaped transaction, distinct per TAG (its 3-byte scriptSig)."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-32-byte-hash 0) :index #xffffffff)
+                    :script-sig (make-array 3 :element-type '(unsigned-byte 8)
+                                              :initial-element tag)
+                    :sequence #xfffffffe))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 5000 :script-pubkey (make-array 4 :element-type '(unsigned-byte 8)
+                                                              :initial-element #x6a)))
+   :witness (when witness (vector (list witness)))
+   :lock-time 7))
+
+(defun %hdrfields-block (txs prev-hash time)
+  "A block over TXS with a real merkle root and PREV-HASH."
+  (let* ((root (bitcoin-lisp.validation:compute-merkle-root
+                (mapcar #'bitcoin-lisp.serialization:transaction-hash txs)))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1 :prev-block prev-hash :merkle-root root
+                  :timestamp time :bits #x207fffff :nonce 0)))
+    (bitcoin-lisp.serialization:make-bitcoin-block :header header :transactions txs)))
+
+(defmacro %with-hdrfields-chain ((node store g a b) &body body)
+  "Bind NODE to a test node whose block store holds a 1-tx block G at height 0
+and a 2-tx block A at height 1, plus a header-only entry B at height 2 (the
+active tip). G, A and B are bound to (block . hash) conses."
+  (let ((dir (gensym "DIR")))
+    `(let* ((,node (make-test-node))
+            (,dir (ensure-directories-exist
+                   (merge-pathnames (format nil "hdrfields-~D/" (get-internal-real-time))
+                                    (uiop:temporary-directory))))
+            (,store (bitcoin-lisp.storage:init-block-store ,dir)))
+       (setf (bitcoin-lisp::node-block-store ,node) ,store)
+       (unwind-protect
+            (let* ((gb (%hdrfields-block (list (%hdrfields-tx 1)) (make-32-byte-hash 0) 1700000000))
+                   (gh (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header gb)))
+                   (ab (%hdrfields-block (list (%hdrfields-tx 2) (%hdrfields-tx 3)) gh 1700000600))
+                   (ah (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header ab)))
+                   (bb (%hdrfields-block (list (%hdrfields-tx 4)) ah 1700001200))
+                   (bh (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header bb)))
+                   (,g (cons gb gh)) (,a (cons ab ah)) (,b (cons bb bh))
+                   (cs (bitcoin-lisp::node-chain-state ,node)))
+              (declare (ignorable ,g ,a ,b))
+              (setf (bitcoin-lisp.storage::chain-state-genesis-hash cs) gh)
+              ;; B is header-only on purpose: its body is never stored.
+              (bitcoin-lisp.storage:store-block ,store gb)
+              (bitcoin-lisp.storage:store-block ,store ab)
+              (let* ((ge (bitcoin-lisp.storage:make-block-index-entry
+                          :hash gh :height 0 :chain-work 1 :status :valid
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header gb)))
+                     (ae (bitcoin-lisp.storage:make-block-index-entry
+                          :hash ah :height 1 :chain-work 2 :status :valid :prev-entry ge
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header ab)))
+                     (be (bitcoin-lisp.storage:make-block-index-entry
+                          :hash bh :height 2 :chain-work 3 :status :valid :prev-entry ae
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header bb))))
+                (bitcoin-lisp.storage:add-block-index-entry cs ge)
+                (bitcoin-lisp.storage:add-block-index-entry cs ae)
+                (bitcoin-lisp.storage:add-block-index-entry cs be)
+                (bitcoin-lisp.storage:update-chain-tip cs bh 2))
+              ,@body)
+         (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
+
+(test rpc-getblockheader-ntx-and-genesis-previousblockhash
+  "getblockheader emits nTx (Core blockheaderToJSON, rpc/blockchain.cpp:175) and
+OMITS previousblockhash for genesis (`if (blockindex.pprev)`, :177-178) rather
+than reporting 64 zeros — a client walking the chain backwards terminates on the
+missing key; given the all-zero hash it asks for a block nobody has and errors."
+  (%with-hdrfields-chain (node store g a b)
+    (flet ((hdr (hash)
+             (bitcoin-lisp.rpc::rpc-getblockheader
+              node (list (bitcoin-lisp.rpc::hash-to-hex hash)))))
+      (let ((gj (hdr (cdr g))) (aj (hdr (cdr a))) (bj (hdr (cdr b))))
+        ;; nTx is always present. Genesis carries its coinbase; A's index entry
+        ;; predates the tx-count field and is backfilled from the block store;
+        ;; B is header-only, so 0 — Core's nTx is 0 until the body arrives.
+        (is (= 1 (cdr (assoc "nTx" gj :test #'string=))))
+        (is (= 2 (cdr (assoc "nTx" aj :test #'string=))))
+        (is (= 0 (cdr (assoc "nTx" bj :test #'string=))))
+        ;; Genesis omits previousblockhash entirely...
+        (is (null (assoc "previousblockhash" gj :test #'string=)))
+        (is (not (search "previousblockhash" (%encode-rpc-result gj))))
+        ;; ...CONTROL: every other header still carries it, naming the real
+        ;; parent (so the omission is genesis-specific, not a blanket drop).
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr g))
+                     (cdr (assoc "previousblockhash" aj :test #'string=))))
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr a))
+                     (cdr (assoc "previousblockhash" bj :test #'string=))))
+        ;; The fields survive the encoder.
+        (is (search "\"nTx\":2" (%encode-rpc-result aj)))))))
+
+(test rpc-getblock-coinbase-tx-and-genesis-previousblockhash
+  "getblock emits coinbase_tx (Core blockToJSON:211 -> coinbaseTxToJSON:185-200):
+version, locktime, the coinbase input's sequence and scriptSig hex, plus the
+single witness item only when the coinbase carries one. blockToJSON delegates
+its header fields to blockheaderToJSON, so genesis omits previousblockhash here
+too."
+  (%with-hdrfields-chain (node store g a b)
+    (flet ((blk (hash &optional (verbosity 1))
+             (bitcoin-lisp.rpc::rpc-getblock
+              node (list (bitcoin-lisp.rpc::hash-to-hex hash) verbosity))))
+      (let* ((gj (blk (cdr g)))
+             (cb (cdr (assoc "coinbase_tx" gj :test #'string=))))
+        (is (not (null cb)) "getblock must emit coinbase_tx")
+        (when cb
+          (is (= 2 (cdr (assoc "version" cb :test #'string=))))
+          (is (= 7 (cdr (assoc "locktime" cb :test #'string=))))
+          (is (= #xfffffffe (cdr (assoc "sequence" cb :test #'string=))))
+          (is (string= "010101" (cdr (assoc "coinbase" cb :test #'string=))))
+          ;; CONTROL: a witness-less coinbase omits the witness key entirely
+          ;; (Core pushes it only for a non-empty stack).
+          (is (null (assoc "witness" cb :test #'string=))))
+        ;; Genesis omits previousblockhash here as well...
+        (is (null (assoc "previousblockhash" gj :test #'string=)))
+        ;; ...CONTROL: a non-genesis block still reports it.
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr g))
+                     (cdr (assoc "previousblockhash" (blk (cdr a)) :test #'string=))))
+        ;; Verbosity 2 (full tx detail) carries coinbase_tx too; verbosity 0 is
+        ;; untouched raw hex.
+        (is (assoc "coinbase_tx" (blk (cdr a) 2) :test #'string=))
+        (is (stringp (blk (cdr a) 0)))))))
+
+(test rpc-getblock-coinbase-tx-witness
+  "A coinbase with a witness stack reports it as coinbase_tx.witness (the BIP141
+reserved value), matching Core's `if (!witness_stack.empty())`."
+  (let* ((node (make-test-node))
+         (dir (ensure-directories-exist
+               (merge-pathnames (format nil "cbwitness-~D/" (get-internal-real-time))
+                                (uiop:temporary-directory))))
+         (store (bitcoin-lisp.storage:init-block-store dir)))
+    (setf (bitcoin-lisp::node-block-store node) store)
+    (unwind-protect
+         (let* ((reserved (make-32-byte-hash 0))
+                (blk (%hdrfields-block (list (%hdrfields-tx 8 :witness reserved))
+                                       (make-32-byte-hash 0) 1700000000))
+                (hash (bitcoin-lisp.serialization:block-header-hash
+                       (bitcoin-lisp.serialization:bitcoin-block-header blk))))
+           (bitcoin-lisp.storage:store-block store blk)
+           (let ((cb (cdr (assoc "coinbase_tx"
+                                 (bitcoin-lisp.rpc::rpc-getblock
+                                  node (list (bitcoin-lisp.rpc::hash-to-hex hash) 1))
+                                 :test #'string=))))
+             (is (not (null cb)))
+             (when cb
+               (is (string= (bitcoin-lisp.crypto:bytes-to-hex reserved)
+                            (cdr (assoc "witness" cb :test #'string=))))
+               (is (string= "080808" (cdr (assoc "coinbase" cb :test #'string=)))))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
 ;;; --- Authentication Tests (7.4) ---
 
 (test rpc-auth-check-no-credentials
-  "Test auth check passes when no credentials configured"
-  ;; When no user/password is set, auth should pass
-  (let ((bitcoin-lisp.rpc::*rpc-user* nil)
-        (bitcoin-lisp.rpc::*rpc-password* nil))
-    (is (bitcoin-lisp.rpc::check-auth nil))))
-
-(test rpc-auth-header-parsing
-  "Test Basic auth header parsing"
-  ;; Create a mock request with Authorization header
-  ;; Base64 of "testuser:testpass" is "dGVzdHVzZXI6dGVzdHBhc3M="
+  "A request carrying no Authorization header is never authorized, in every
+credential state startup can produce. Core answers 401 for an absent header
+before looking at any configuration (HTTPReq_JSONRPC, httprpc.cpp:112-117);
+this test used to assert the opposite for the default deployment, which left
+the whole RPC surface — loaded wallet included — open to any local process."
+  ;; default startup: the .cookie pair is the credential
+  (let ((bitcoin-lisp.rpc::*rpc-user* bitcoin-lisp.rpc::+rpc-cookie-user+)
+        (bitcoin-lisp.rpc::*rpc-password* "deadbeef"))
+    (is (not (bitcoin-lisp.rpc::check-auth nil)))
+    (is (not (bitcoin-lisp.rpc::check-auth ""))))
+  ;; -rpcuser/-rpcpassword startup
   (let ((bitcoin-lisp.rpc::*rpc-user* "testuser")
         (bitcoin-lisp.rpc::*rpc-password* "testpass"))
-    ;; We can't easily mock hunchentoot request, but we can test the logic
-    ;; by checking that auth is required when credentials are set
-    (is (not (null bitcoin-lisp.rpc::*rpc-user*)))
-    (is (not (null bitcoin-lisp.rpc::*rpc-password*)))))
+    (is (not (bitcoin-lisp.rpc::check-auth nil))))
+  ;; no credential installed at all: nothing authorizes, not even an empty one
+  (let ((bitcoin-lisp.rpc::*rpc-user* nil)
+        (bitcoin-lisp.rpc::*rpc-password* nil))
+    (is (not (bitcoin-lisp.rpc::check-auth nil)))
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header ":"))))))
+
+(test rpc-auth-header-parsing
+  "check-auth parses the HTTP Basic header the way Core's RPCAuthorized does
+(httprpc.cpp:84-101): \"Basic \" prefix, base64, split on the FIRST colon, so a
+password may contain colons. Anything malformed is rejected, never accepted."
+  (let ((bitcoin-lisp.rpc::*rpc-user* "testuser")
+        (bitcoin-lisp.rpc::*rpc-password* "testpass"))
+    ;; base64 of "testuser:testpass"
+    (is (bitcoin-lisp.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpass")))
+    ;; scheme name is case-insensitive, surrounding space is trimmed (Core
+    ;; TrimStringView)
+    (is (bitcoin-lisp.rpc::check-auth "basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    (is (bitcoin-lisp.rpc::check-auth "Basic  dGVzdHVzZXI6dGVzdHBhc3M= "))
+    ;; malformed shapes
+    (is (not (bitcoin-lisp.rpc::check-auth "dGVzdHVzZXI6dGVzdHBhc3M=")))
+    (is (not (bitcoin-lisp.rpc::check-auth "Bearer dGVzdHVzZXI6dGVzdHBhc3M=")))
+    (is (not (bitcoin-lisp.rpc::check-auth "Basic ")))
+    (is (not (bitcoin-lisp.rpc::check-auth "Basic not-base64!!")))
+    ;; no colon in the decoded credential
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testusertestpass"))))
+    ;; near misses
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpas"))))
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpassX"))))
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "TESTUSER:testpass")))))
+  ;; the split is on the first colon, so the password keeps the rest
+  (let ((bitcoin-lisp.rpc::*rpc-user* "u")
+        (bitcoin-lisp.rpc::*rpc-password* "a:b:c"))
+    (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:a:b:c")))))
+
+(test rpc-timing-resistant-equal
+  "%timing-resistant-equal decides exactly what STRING= decides (Core
+TimingResistantEqual, util/strencodings.h:203-210) — a comparator that is
+constant-time but wrong would hand out access."
+  (let ((cases '("" "a" "ab" "deadbeef" "deadbee" "deadbeef0"
+                 "DEADBEEF" "d" "xxxxxxxx")))
+    (dolist (a cases)
+      (dolist (b cases)
+        (is (eq (and (string= a b) t)
+                (and (bitcoin-lisp.rpc::%timing-resistant-equal a b) t))
+            "~S vs ~S" a b)))))
 
 ;;; --- Concurrent Access Tests (2.7) ---
 
@@ -1164,7 +1537,7 @@ a hardcoded 1."
 
 (test rpc-error-response-format
   "Test error response matches Bitcoin Core format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" 123)))
+  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" 123 :v2)))
     ;; Must have jsonrpc, error, and id fields
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (gethash "error" response))
@@ -1485,6 +1858,212 @@ the value."
       (bitcoin-lisp.rpc::rpc-getblockstats node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
 
+;;; getblockstats against an exact fixture: coinbase + one witness tx.
+
+(defparameter *gbs-p2pkh*
+  (concatenate '(vector (unsigned-byte 8))
+               #(#x76 #xa9 #x14) (make-array 20 :element-type '(unsigned-byte 8)
+                                               :initial-element #x33)
+               #(#x88 #xac))
+  "A 25-byte P2PKH scriptPubKey (spendable).")
+
+(defparameter *gbs-opreturn*
+  (coerce #(#x6a #x01 #x02) '(vector (unsigned-byte 8)))
+  "A 3-byte OP_RETURN scriptPubKey (provably unspendable).")
+
+(defun %gbs-coinbase ()
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-32-byte-hash 0) :index #xffffffff)
+                    :script-sig (coerce #(#x01 #x64) '(vector (unsigned-byte 8)))
+                    :sequence #xffffffff))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 5000030000 :script-pubkey *gbs-p2pkh*))
+   :lock-time 0))
+
+(defun %gbs-spender (prev-txid)
+  "A segwit transaction spending PREV-TXID:0 (100000 sat) into 40000 + 30000,
+so its fee is exactly 30000 sat. Its second output is unspendable."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash prev-txid :index 0)
+                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                    :sequence #xfffffffd))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 40000 :script-pubkey *gbs-p2pkh*)
+                    (bitcoin-lisp.serialization:make-tx-out
+                     :value 30000 :script-pubkey *gbs-opreturn*))
+   :witness (vector (list (make-array 72 :element-type '(unsigned-byte 8) :initial-element 9)
+                          (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2)))
+   :lock-time 0))
+
+(defmacro %with-gbs-block ((node hash-hex spender &key (with-undo t) (coinbase-only nil))
+                           &body body)
+  "Store a height-100 block (coinbase + one 30000-sat-fee segwit spend, unless
+COINBASE-ONLY) with its undo data, and bind NODE / HASH-HEX / SPENDER."
+  (let ((dir (gensym "DIR")) (store (gensym "STORE")) (hash (gensym "HASH"))
+        (prev (gensym "PREV")))
+    `(let* ((,node (make-test-node))
+            (,dir (ensure-directories-exist
+                   (merge-pathnames (format nil "gbs-~D/" (get-internal-real-time))
+                                    (uiop:temporary-directory))))
+            (,store (bitcoin-lisp.storage:init-block-store ,dir))
+            (,prev (make-32-byte-hash 77))
+            (,spender (%gbs-spender ,prev))
+            (%gbs-txs (if ,coinbase-only
+                          (list (%gbs-coinbase))
+                          (list (%gbs-coinbase) ,spender)))
+            (%gbs-blk (%hdrfields-block %gbs-txs (make-32-byte-hash 5) 1700000000))
+            (,hash (bitcoin-lisp.serialization:block-header-hash
+                    (bitcoin-lisp.serialization:bitcoin-block-header %gbs-blk)))
+            (,hash-hex (bitcoin-lisp.rpc::hash-to-hex ,hash)))
+       (declare (ignorable ,spender))
+       (setf (bitcoin-lisp::node-block-store ,node) ,store)
+       (unwind-protect
+            (progn
+              (bitcoin-lisp.storage:store-block ,store %gbs-blk)
+              (bitcoin-lisp.storage:add-block-index-entry
+               (bitcoin-lisp::node-chain-state ,node)
+               (bitcoin-lisp.storage:make-block-index-entry
+                :hash ,hash :height 100 :chain-work 1 :status :valid
+                :header (bitcoin-lisp.serialization:bitcoin-block-header %gbs-blk)))
+              (when ,with-undo
+                (setf (gethash ,hash bitcoin-lisp.validation::*block-undo-data*)
+                      (list (list ,prev 0
+                                  (bitcoin-lisp.storage:make-utxo-entry
+                                   :value 100000 :script-pubkey *gbs-p2pkh*
+                                   :height 50 :coinbase nil)))))
+              ,@body)
+         (remhash ,hash bitcoin-lisp.validation::*block-undo-data*)
+         (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
+
+(test rpc-getblockstats-excludes-coinbase-and-uses-witness-tx-sizes
+  "getblockstats accumulates per-transaction, AFTER Core's
+`if (tx->IsCoinBase()) continue;` (rpc/blockchain.cpp:2075-2077), using the
+witness-inclusive ComputeTotalSize (:2085) — so total_size, total_out and
+total_weight exclude the coinbase and carry no block header or tx-count varint,
+and avgtxsize divides by vtx.size()-1 (:2143). We previously used
+(length (serialize block)) — the LEGACY whole-block form — over ntx, and
+summed the coinbase's outputs into total_out."
+  (%with-gbs-block (node hex spender)
+    (let* ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))
+           (stat (lambda (k) (cdr (assoc k r :test #'string=))))
+           (wire (length (bitcoin-lisp.serialization:transaction-wire-bytes spender)))
+           (stripped (length (bitcoin-lisp.serialization:serialize-transaction spender)))
+           (weight (bitcoin-lisp.serialization:transaction-weight spender))
+           (whole-block (length (bitcoin-lisp.serialization:serialize
+                                 (bitcoin-lisp.storage:get-block
+                                  (bitcoin-lisp::node-block-store node)
+                                  (bitcoin-lisp.rpc::parse-hex-hash hex))))))
+      ;; --- sizes ---
+      (is (= wire (funcall stat "total_size")))
+      ;; ...which is witness-INCLUSIVE (the stripped form is strictly smaller)
+      ;; and is NOT the whole-block quantity we used to report.
+      (is (> wire stripped))
+      (is (/= whole-block (funcall stat "total_size")))
+      (is (= weight (funcall stat "total_weight")))
+      ;; avgtxsize divides by the NON-coinbase count (1 here), not by ntx (2).
+      (is (= wire (funcall stat "avgtxsize")))
+      (is (/= (round whole-block 2) (funcall stat "avgtxsize")))
+      (is (= wire (funcall stat "maxtxsize")))
+      (is (= wire (funcall stat "mintxsize")))
+      (is (= wire (funcall stat "mediantxsize")))
+      ;; --- amounts ---
+      ;; 40000 + 30000; the 5000030000-sat coinbase output is NOT counted.
+      (is (= 70000 (funcall stat "total_out")))
+      (is (= 2 (funcall stat "txs")))
+      (is (= 1 (funcall stat "ins")))
+      ;; CONTROL: "outs" IS counted before the coinbase continue (Core :2054),
+      ;; so it still includes the coinbase's output — do not "fix" it.
+      (is (= 3 (funcall stat "outs")))
+      ;; --- fees, from undo data ---
+      (is (= 30000 (funcall stat "totalfee")))
+      (is (= 30000 (funcall stat "avgfee")))
+      (is (= 30000 (funcall stat "maxfee")))
+      (is (= 30000 (funcall stat "minfee")))
+      (is (= 30000 (funcall stat "medianfee")))
+      (let ((feerate (truncate (* 30000 4) weight)))
+        (is (plusp feerate))
+        (is (= feerate (funcall stat "avgfeerate")))
+        (is (= feerate (funcall stat "maxfeerate")))
+        (is (= feerate (funcall stat "minfeerate")))
+        (is (equal (list feerate feerate feerate feerate feerate)
+                   (funcall stat "feerate_percentiles"))))
+      ;; --- segwit + utxo-set deltas ---
+      (is (= 1 (funcall stat "swtxs")))
+      (is (= wire (funcall stat "swtotal_size")))
+      (is (= weight (funcall stat "swtotal_weight")))
+      ;; 3 outputs created, 1 spent.
+      (is (= 2 (funcall stat "utxo_increase")))
+      ;; The OP_RETURN output never enters the UTXO set: 2 created, 1 spent.
+      (is (= 1 (funcall stat "utxo_increase_actual")))
+      ;; Sizes: a 25-byte spk costs 8+1+25+41 = 75, the 3-byte OP_RETURN
+      ;; 8+1+3+41 = 53; one 75-byte prevout is removed.
+      (is (= (- (+ 75 75 53) 75) (funcall stat "utxo_size_inc")))
+      (is (= (- (+ 75 75) 75) (funcall stat "utxo_size_inc_actual")))
+      ;; --- chain context ---
+      (is (= 100 (funcall stat "height")))
+      (is (= 1700000000 (funcall stat "time")))
+      (is (= 1700000000 (funcall stat "mediantime")))
+      (is (string= hex (funcall stat "blockhash")))
+      (is (= (bitcoin-lisp.validation:calculate-block-subsidy 100)
+             (funcall stat "subsidy")))
+      ;; Core's full key set is 31 keys.
+      (is (= 31 (length r))))))
+
+(test rpc-getblockstats-coinbase-only-block
+  "CONTROL for the coinbase exclusion at the boundary: a block with nothing but
+a coinbase has zero total_size / total_out / total_weight / fees and a zero
+average (Core divides by vtx.size()-1 only `if (block.vtx.size() > 1)`), while
+its output is still counted in outs."
+  (%with-gbs-block (node hex spender :with-undo nil :coinbase-only t)
+    (let* ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))
+           (stat (lambda (k) (cdr (assoc k r :test #'string=)))))
+      (is (= 1 (funcall stat "txs")))
+      (is (= 1 (funcall stat "outs")))
+      (is (= 0 (funcall stat "ins")))
+      (is (= 0 (funcall stat "total_size")))
+      (is (= 0 (funcall stat "total_out")))
+      (is (= 0 (funcall stat "total_weight")))
+      (is (= 0 (funcall stat "avgtxsize")))
+      (is (= 0 (funcall stat "avgfee")))
+      (is (= 0 (funcall stat "totalfee")))
+      (is (= 0 (funcall stat "minfee")))
+      (is (= 0 (funcall stat "mintxsize")))
+      (is (equal (list 0 0 0 0 0) (funcall stat "feerate_percentiles"))))))
+
+(test rpc-getblockstats-unknown-stat-errors
+  "An unknown statistic name is Core's RPC_INVALID_PARAMETER (-8) 'Invalid
+selected statistic' (rpc/blockchain.cpp:2183-2186); we used to drop it
+silently, so a typo read as 'that statistic is unavailable for this block'."
+  (%with-gbs-block (node hex spender)
+    (let ((code (handler-case
+                    (progn (bitcoin-lisp.rpc::rpc-getblockstats
+                            node (list hex (list "totalfee" "bogus")))
+                           :no-error)
+                  (bitcoin-lisp.rpc::rpc-error (e) (bitcoin-lisp.rpc::rpc-error-code e)))))
+      (is (eql -8 code)))
+    ;; CONTROL: a known name still selects exactly that key.
+    (let ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex (list "totalfee")))))
+      (is (= 1 (length r)))
+      (is (= 30000 (cdr (assoc "totalfee" r :test #'string=)))))
+    ;; A non-array stats argument is Core's type error.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node (list hex "totalfee")))))
+
+(test rpc-getblockstats-requires-undo-data
+  "The fee statistics come from undo data, and Core's GetUndoChecked
+(rpc/blockchain.cpp:2016, :718-735) runs unconditionally — so a spending block
+whose undo data is missing is an error, never a silently wrong fee total.
+CONTROL: the identical block WITH its undo data answers (previous test)."
+  (%with-gbs-block (node hex spender :with-undo nil)
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))))
+
 (test rpc-calculate-block-subsidy
   "Test block subsidy calculation"
   ;; Initial subsidy: 50 BTC = 5000000000 satoshis
@@ -1550,7 +2129,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
                           (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
                           (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)
                           (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)))
-      (let* ((response (bitcoin-lisp.rpc::make-rpc-response result "id"))
+      (let* ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2))
              (json (with-output-to-string (s) (yason:encode response s)))
              (parsed (yason:parse json)))
         (is (hash-table-p parsed))
@@ -1595,7 +2174,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       ;; B is a side branch one block off the active chain.
       (is (= (cdr (assoc "branchlen" fork :test #'string=)) 1))
       ;; full result serializes cleanly.
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response tips "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response tips "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-testmempoolaccept-missing-input
@@ -1910,17 +2489,277 @@ bitcoin-cli sends those; rejecting non-2.0 made it unusable."
     (is (string= "uptime" method))))
 
 (test rpc-basic-auth-and-cookie
-  "%basic-auth-matches-p accepts the configured user:pass and the cookie
-credential, and rejects a wrong password (fixing the prior mismatch bypass)."
-  (let ((bitcoin-lisp.rpc::*rpc-user* "u")
-        (bitcoin-lisp.rpc::*rpc-password* "p")
-        (bitcoin-lisp.rpc::*rpc-cookie-secret* "deadbeef"))
-    (flet ((basic (s) (concatenate 'string "Basic "
-                                   (cl-base64:string-to-base64-string s))))
-      (is (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "u:p")))
-      (is (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "__cookie__:deadbeef")))
-      (is (not (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "u:wrong"))))
-      (is (not (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "__cookie__:bad")))))))
+  "check-auth against the two credential states start-rpc-server can actually
+produce. Startup installs exactly one credential, as Core's
+InitRPCAuthentication pushes exactly one entry into g_rpcauth
+(httprpc.cpp:262-288): the .cookie pair when no rpcuser/rpcpassword is given,
+that pair otherwise. Binding user, password AND cookie secret at once — what
+this test used to do — describes no reachable configuration."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let ((node (make-test-node))
+          (cookie-file (merge-pathnames ".cookie" dir)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             ;; (a) no rpcuser/rpcpassword: the cookie is the credential
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port 19994))))
+             (is (string= bitcoin-lisp.rpc::+rpc-cookie-user+
+                          bitcoin-lisp.rpc::*rpc-user*))
+             (let ((cookie (alexandria:read-file-into-string cookie-file)))
+               (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header cookie)))
+               (is (not (bitcoin-lisp.rpc::check-auth
+                         (%basic-auth-header "__cookie__:bad"))))
+               (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:p")))))
+             ;; shutdown removes the cookie it generated (Core DeleteAuthCookie)
+             (bitcoin-lisp.rpc:stop-rpc-server)
+             (is (null (probe-file cookie-file)))
+             ;; (b) rpcuser/rpcpassword: that pair is the credential, no cookie
+             ;; is written, and the cookie user is not a way in
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server
+                             node :port 19994 :user "u" :password "p"))))
+             (is (null (probe-file cookie-file)))
+             (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:p")))
+             (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:wrong"))))
+             (is (not (bitcoin-lisp.rpc::check-auth
+                       (%basic-auth-header "__cookie__:p")))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
+
+(test rpc-cookie-file-is-owner-only
+  "The generated .cookie is the RPC credential, so no other local user may read
+it: Core creates it under umask 0077 (GenerateAuthCookie, request.cpp:99-146).
+Ours was 0664 on the live testnet4 and mainnet datadirs, which would have left
+the credential readable node-wide even with auth enforced."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let ((node (make-test-node)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port 19995))))
+             (let ((path (merge-pathnames ".cookie" dir)))
+               (is (not (null (probe-file path))))
+               (is (= #o600
+                      (logand #o777
+                              (sb-posix:stat-mode
+                               (sb-posix:stat (namestring (truename path)))))))
+               ;; the file is renamed into place, never left half-written
+               (is (null (probe-file (merge-pathnames ".cookie.tmp" dir))))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
+
+(defun %file-mode (path)
+  "The permission bits of PATH."
+  (logand #o777 (sb-posix:stat-mode (sb-posix:stat (namestring path)))))
+
+(test rpc-cookie-owner-only-under-a-permissive-umask
+  "0600 has to come from open(2), not from a chmod afterwards. Core gets it
+from a process-wide umask 0077 (common/system.cpp:92-93) so the cookie is
+owner-only from creation (GenerateAuthCookie, request.cpp:99-146); we set no
+process umask, so the mode must be passed to open. The live host runs umask
+002 — its .cookie files were 0664 — which is what this test reproduces."
+  (with-rpc-test-datadir (dir)
+    (let ((old-umask (sb-posix:umask #o002)))
+      (unwind-protect
+           (progn
+             ;; Premise check: without this the 0600 assertion below would pass
+             ;; on a strict ambient umask no matter what the cookie code does.
+             (let ((control (merge-pathnames "umask-control" dir)))
+               (with-open-file (s control :direction :output :if-does-not-exist :create)
+                 (write-string "x" s))
+               (is (= #o664 (%file-mode control))
+                   "test premise: under umask 002 an ordinary file is 0664, got ~O"
+                   (%file-mode control)))
+             (multiple-value-bind (path secret)
+                 (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+               (is (not (null path)))
+               (is (= #o600 (%file-mode path))
+                   "the cookie must be 0600 whatever the umask, got ~O" (%file-mode path))
+               (is (search secret (alexandria:read-file-into-string path)))
+               (is (null (probe-file (merge-pathnames ".cookie.tmp" dir))))))
+        (sb-posix:umask old-umask)))))
+
+(test rpc-cookie-never-written-into-a-file-we-did-not-create
+  "The secret must only ever be written into a file this process exclusively
+created. Chmod-after-write cannot deliver that: POSIX checks permissions at
+open(2) only, so a descriptor opened while .cookie.tmp still carries the
+umask's mode stays valid across the chmod and the rename, and inotify on the
+data directory makes that window deterministic on every node start. Both halves
+below are the same defect — WITH-OPEN-FILE :if-exists :supersede opens the
+EXISTING inode with O_TRUNC, and follows a symlink to do it."
+  (with-rpc-test-datadir (dir)
+    (let ((tmp (merge-pathnames ".cookie.tmp" dir)))
+      ;; (a) a planted regular file whose descriptor the attacker still holds
+      (with-open-file (s tmp :direction :output :if-does-not-exist :create)
+        (write-string "" s))
+      (sb-posix:chmod (namestring tmp) #o666)
+      (with-open-file (spy tmp :direction :input)
+        (multiple-value-bind (path secret) (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+          (is (not (null path)))
+          (is (not (null secret)))
+          (let ((seen (progn (file-position spy 0) (or (read-line spy nil nil) ""))))
+            (is (not (search secret seen))
+                "the secret was written into a pre-existing inode the attacker ~
+still holds open: ~S" seen))))
+      (when (probe-file (merge-pathnames ".cookie" dir))
+        (delete-file (merge-pathnames ".cookie" dir)))
+      ;; (b) a planted symlink: written through, and then RENAME moves the
+      ;; resolved target over .cookie
+      (let ((target (merge-pathnames "attacker-target" dir)))
+        (with-open-file (s target :direction :output :if-does-not-exist :create)
+          (write-string "" s))
+        (handler-case (sb-posix:unlink (namestring tmp)) (error () nil))
+        (sb-posix:symlink (namestring target) (namestring tmp))
+        (multiple-value-bind (path secret) (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+          (is (not (null path)))
+          ;; NB: keep this out of a 3-element (and a b) inside IS — FiveAM
+          ;; treats any 3-element form as (predicate expected actual) and
+          ;; evaluates both arguments, so the short-circuit is lost and a
+          ;; renamed-away target errors instead of failing.
+          (let ((leaked (if (probe-file target)
+                            (search secret (alexandria:read-file-into-string target))
+                            :target-renamed-over-cookie)))
+            (is (null leaked)
+                "the secret leaked through a planted .cookie.tmp symlink (~S)" leaked))
+          ;; and the cookie that did get installed is still usable and 0600
+          (is (search secret (alexandria:read-file-into-string path)))
+          (is (= #o600 (%file-mode path))))))))
+
+(test rpc-failed-start-does-not-clobber-a-live-cookie
+  "A start that cannot bind must leave .cookie alone. Core binds first —
+AppInitServers runs InitHTTPServer before StartHTTPRPC ->
+InitRPCAuthentication -> GenerateAuthCookie (init.cpp:748-761) — so a port
+conflict aborts before any credential is touched. Writing the cookie first
+means a second process started on a running node's data directory (which has
+happened here: restart-node.sh's pkill marker missed the live supervisor)
+overwrites .cookie with a secret matching nothing and then exits. The healthy
+node keeps serving with the old secret, so every client that re-reads the file
+gets 401 from a node that is perfectly fine, and nothing logs anything."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let* ((port 19993)
+           (node (make-test-node))
+           (cookie-file (merge-pathnames ".cookie" dir)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             ;; the healthy node: bound, cookie written, credential live
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             (let ((live-cookie (alexandria:read-file-into-string cookie-file))
+                   (live-user bitcoin-lisp.rpc::*rpc-user*)
+                   (live-pass bitcoin-lisp.rpc::*rpc-password*)
+                   (live-dispatch hunchentoot:*dispatch-table*))
+               (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
+               ;; the second process: same data directory, same port. The
+               ;; "already running" guard is per-process, so unbind it to reach
+               ;; the code a second process would run.
+               (let ((bitcoin-lisp.rpc::*rpc-server* nil))
+                 (is (null (bitcoin-lisp.rpc:start-rpc-server node :port port))
+                     "the second start must fail: the port is taken"))
+               ;; nothing about the running node changed
+               (let ((on-disk (and (probe-file cookie-file)
+                                   (alexandria:read-file-into-string cookie-file))))
+                 (is (equal live-cookie on-disk)
+                     "the failed start rewrote or removed .cookie under a live node")
+                 (is (equal live-user bitcoin-lisp.rpc::*rpc-user*))
+                 (is (equal live-pass bitcoin-lisp.rpc::*rpc-password*))
+                 (is (eq live-dispatch hunchentoot:*dispatch-table*)
+                     "the failed start leaked a dispatcher into hunchentoot:*dispatch-table*")
+                 (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
+                 ;; and a client reading .cookie off disk still gets in
+                 (let ((r (%http-post-rpc port "{\"method\":\"getblockcount\",\"id\":1}"
+                                          :auth (or on-disk "__cookie__:gone"))))
+                   (is (= 200 (%http-status r))
+                       "a client re-reading .cookie was locked out of a live node")))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
+
+(test rpc-requires-credentials-end-to-end
+  "Live acceptor through rpc-handler: no Authorization header answers 401 with
+a WWW-Authenticate challenge, a wrong credential answers 401, and the generated
+cookie answers 200 (Core HTTPReq_JSONRPC, httprpc.cpp:112-133). Proven live
+against the running testnet4 node before this fix: an unauthenticated
+getblockcount returned 200, and so did a wrong Basic credential."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let ((port 19996)
+          (node (make-test-node))
+          (body "{\"method\":\"getblockcount\",\"id\":1}"))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             ;; no credential at all
+             (let ((r (%http-post-rpc port body)))
+               (is (= 401 (%http-status r)))
+               (is (search "www-authenticate: basic" (string-downcase r)))
+               (is (not (search "\"result\"" r))))
+             ;; wrong credential
+             (let ((r (%http-post-rpc port body :auth "__cookie__:wrong")))
+               (is (= 401 (%http-status r)))
+               (is (not (search "\"result\"" r))))
+             ;; malformed credentials: wrong scheme, and Basic with no colon
+             (let ((r (%http-post-rpc port body :auth-header "Bearer deadbeef")))
+               (is (= 401 (%http-status r))))
+             (let ((r (%http-post-rpc port body :auth "no-colon-here")))
+               (is (= 401 (%http-status r))))
+             ;; the cookie file the node wrote
+             (let ((r (%http-post-rpc
+                       port body
+                       :auth (alexandria:read-file-into-string
+                              (merge-pathnames ".cookie" dir)))))
+               (is (= 200 (%http-status r)))
+               (is (search "\"result\"" r))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
+
+(test rpc-start-refuses-without-any-credential
+  "With no rpcuser/rpcpassword and nowhere to write a .cookie there is no way
+to authorize a request, so the server does not start — Core aborts startup when
+InitRPCAuthentication fails (httprpc.cpp:300-302). Starting anyway would leave
+a listener that 401s everything."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (let ((node (make-test-node)))
+    (is (null (bitcoin-lisp::node-data-directory node))
+        "fixture must have nowhere to write a cookie, or this test is vacuous")
+    (unwind-protect
+         (progn
+           (is (null (bitcoin-lisp.rpc:start-rpc-server node :port 19997)))
+           (is (null bitcoin-lisp.rpc:*rpc-server*)))
+      (bitcoin-lisp.rpc:stop-rpc-server))))
+
+(test rpc-aborted-start-releases-the-listening-socket
+  "Binding before the credential means a start can now abort with a socket
+already open, so the abort path has to give the port back — otherwise one
+failed start would cost RPC until the process restarts. (Regression guard for
+the reorder, not a test of the pre-existing bug: the old order never reached a
+bind before giving up.)"
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (let ((port 19992)
+        (no-datadir-node (make-test-node)))
+    (is (null (bitcoin-lisp::node-data-directory no-datadir-node))
+        "fixture must have nowhere to write a cookie, or this test is vacuous")
+    (unwind-protect
+         (progn
+           ;; binds, then finds it has no credential to install, then aborts
+           (is (null (bitcoin-lisp.rpc:start-rpc-server no-datadir-node :port port)))
+           (is (null bitcoin-lisp.rpc:*rpc-server*))
+           (with-rpc-test-datadir (dir)
+             (let ((node (make-test-node)))
+               (setf (bitcoin-lisp::node-data-directory node) dir)
+               (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port)))
+                   "the aborted start leaked its listening socket"))))
+      (bitcoin-lisp.rpc:stop-rpc-server))))
+
+(test rpc-bind-non-loopback-refused
+  "-rpcbind to a non-loopback address falls back to loopback. Core ignores
+-rpcbind unless -rpcallowip is also given (HTTPBindAddresses,
+httpserver.cpp:316-327); we have no -rpcallowip, so a single flag would
+otherwise put the whole RPC surface on the public internet."
+  (dolist (loopback '("127.0.0.1" "127.0.0.2" "::1" "[::1]" "localhost"))
+    (is (string= loopback (bitcoin-lisp.rpc::%rpc-bind-address loopback))
+        "~S is loopback and must be kept" loopback))
+  (dolist (exposed '("0.0.0.0" "" "192.168.1.5" "::" "1.2.3.4" "127acme.example"))
+    (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address exposed))
+        "~S is not loopback and must fall back" exposed))
+  (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address nil))))
 
 ;;;; tx JSON field completeness (T3c)
 
@@ -2082,7 +2921,7 @@ NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
     (is (integerp (cdr (assoc "connections_in" r :test #'string=))))
     (is (integerp (cdr (assoc "connections_out" r :test #'string=))))
     (is (assoc "warnings" r :test #'string=))
-    (let ((resp (bitcoin-lisp.rpc::make-rpc-response r "id")))
+    (let ((resp (bitcoin-lisp.rpc::make-rpc-response r "id" :v2)))
       (finishes (with-output-to-string (s) (yason:encode resp s))))))
 
 (test rpc-getpeerinfo-fields
@@ -2207,7 +3046,7 @@ through yason."
       (is (null (assoc "addrbind" e :test #'string=)))
       (is (null (assoc "mapped_as" e :test #'string=)))
       ;; full row encodes through yason.
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response rows "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response rows "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-getpeerinfo-synced-headers-from-best-known
@@ -2750,8 +3589,9 @@ all_networks aggregate; counts stay consistent with the address book."
           (is (= 1 (length addrs)))
           (is (string= "1.2.3.4" (cdr (assoc "address" (first addrs) :test #'string=))))
           (is (string= "outbound" (cdr (assoc "connected" (first addrs) :test #'string=)))))
-        ;; unconnected node has no address entries
-        (is (null (cdr (assoc "addresses" b :test #'string=))))))
+        ;; unconnected node has no address entries — Core's empty VARR, so
+        ;; [] rather than null (this used to assert (null ...), the bug).
+        (is (equalp #() (cdr (assoc "addresses" b :test #'string=))))))
     ;; filtering for a never-added node errors
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getaddednodeinfo node '("10.0.0.1")))))
@@ -2996,6 +3836,79 @@ mining order (parent's first)."
       (is (= 100 (round (* 100000000
                            (cdr (assoc "chunkfee" (second chunks) :test #'string=)))))))))
 
+;;; --- /rest/headers active-chain membership ---
+
+(defmacro %with-rest-count ((count) &body body)
+  "Run BODY with hunchentoot's `count` query parameter stubbed to COUNT.
+The REST handlers read it through hunchentoot:get-parameter, which needs a
+live *request*; swapping the fdefinition is the smallest seam that lets the
+real handler run unmodified."
+  (let ((orig (gensym "ORIG")))
+    `(let ((,orig (fdefinition 'hunchentoot:get-parameter)))
+       (unwind-protect
+            (progn (setf (fdefinition 'hunchentoot:get-parameter)
+                         (lambda (name &optional request)
+                           (declare (ignore request))
+                           (when (string= name "count") ,count)))
+                   ,@body)
+         (setf (fdefinition 'hunchentoot:get-parameter) ,orig)))))
+
+(test rest-headers-refuses-fork-start-and-stays-contiguous
+  "/rest/headers walks forward by ABSOLUTE HEIGHT via get-block-at-height,
+which descends from the ACTIVE tip — so a start header on a FORK used to be
+spliced onto the active chain's successors and the reply was not a chain at
+all (headers[1].previousblockhash did not name headers[0]). Core's loop is
+`while (pindex && active_chain.Contains(pindex))` with active_chain.Next
+(rest.cpp:227-232), so a fork start yields an EMPTY result and contiguity is
+structural."
+  (multiple-value-bind (cs entries) (%make-served-chain 2) ; heights 0,1,2
+    (let* ((node (make-test-node))
+           (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+           (genesis (first entries))
+           (genesis-hex (bitcoin-lisp.rpc::hash-to-hex
+                         (bitcoin-lisp.storage:block-index-entry-hash genesis)))
+           ;; A competing block at height 1, off the active chain.
+           (fork-header (bitcoin-lisp.serialization:make-block-header
+                         :version 1
+                         :prev-block (bitcoin-lisp.storage:block-index-entry-hash genesis)
+                         :merkle-root (make-32-byte-hash 99)
+                         :timestamp 1700000500 :bits #x1d00ffff :nonce 4242))
+           (fork-hash (bitcoin-lisp.serialization:block-header-hash fork-header))
+           (fork-hex (bitcoin-lisp.rpc::hash-to-hex fork-hash)))
+      (setf (bitcoin-lisp::node-chain-state node) cs)
+      (bitcoin-lisp.storage:add-block-index-entry
+       cs (bitcoin-lisp.storage:make-block-index-entry
+           :hash fork-hash :height 1 :header fork-header
+           :prev-entry genesis :chain-work 2 :status :valid))
+      ;; The fork block really is known to the index but not on the active
+      ;; chain — otherwise the assertions below would pass for the wrong reason.
+      (is-true (bitcoin-lisp.storage:get-block-index-entry cs fork-hash))
+      (is-false (bitcoin-lisp.storage:entry-on-active-chain-p
+                 cs (bitcoin-lisp.storage:get-block-index-entry cs fork-hash)))
+      (flet ((rest-get (hex ext)
+               (bitcoin-lisp.rpc::rest-handle
+                node (format nil "/rest/headers/~A.~A" hex ext))))
+        (%with-rest-count ("3")
+          ;; Fork start: empty, in every representation. Before the fix this
+          ;; was [fork@1, active@2] — two headers that are not a chain.
+          (is (string= "[]" (rest-get fork-hex "json")))
+          (is (= 200 (hunchentoot:return-code*)))
+          (is (string= (format nil "~%") (rest-get fork-hex "hex")))
+          (is (zerop (length (rest-get fork-hex "bin"))))
+          ;; CONTROL: an active-chain start still returns COUNT headers...
+          (let* ((body (rest-get genesis-hex "json"))
+                 (parsed (let ((yason:*parse-json-arrays-as-vectors* t))
+                           (yason:parse body))))
+            (is (= 3 (length parsed)))
+            ;; ...and they form a real chain.
+            (loop for i from 1 below (length parsed)
+                  do (is (string= (gethash "hash" (aref parsed (1- i)))
+                                  (gethash "previousblockhash" (aref parsed i)))
+                         "header ~D does not follow header ~D" i (1- i))))
+          ;; 3 headers * 80 bytes, plus the trailing newline .hex adds.
+          (is (= (1+ (* 3 160)) (length (rest-get genesis-hex "hex"))))
+          (is (= (* 3 80) (length (rest-get genesis-hex "bin")))))))))
+
 ;;; --- /rest/health liveness decision (item #6) ---
 
 (test rest-health-decision-logic
@@ -3030,3 +3943,530 @@ and a never-advanced tip reads as a large seconds-since-tip."
       ;; seconds-since-tip is well past the staleness threshold.
       (is (integerp seconds))
       (is (>= seconds bitcoin-lisp::*health-max-tip-staleness-seconds*)))))
+
+;;;; ---------------------------------------------------------------------
+;;;; JSON-RPC reply shape by request version (GA8 wave 6, item 1)
+;;;;
+;;;; Core JSONRPCReplyObj (rpc/request.cpp:51-68) shapes the reply from the
+;;;; request's version: "jsonrpc" is emitted for 2.0 only; a legacy 1.x reply
+;;;; carries BOTH "result" and "error" with one of them null; "id" is omitted
+;;;; when the request carried no id member (request.cpp:207-211).
+;;;; We used to answer every request with the 2.0 shape, which makes
+;;;; python-bitcoinrpc's AuthServiceProxy (`if response['error'] is not None:`)
+;;;; raise KeyError: 'error' on every successful call.
+;;;; ---------------------------------------------------------------------
+
+(defparameter *jsonrpc-shape-method* "ga8shapeecho"
+  "Name of the throwaway RPC method the reply-shape tests dispatch.")
+
+(defun call-with-jsonrpc-shape-method (thunk)
+  "Register an always-succeeding dispatch target, run THUNK, then remove it so
+the global method registry (which the /ui help test enumerates) is unchanged."
+  (bitcoin-lisp.rpc::register-rpc-method
+   *jsonrpc-shape-method*
+   (lambda (node params) (declare (ignore node params)) 42))
+  (unwind-protect (funcall thunk)
+    (remhash *jsonrpc-shape-method* bitcoin-lisp.rpc::*rpc-methods*)))
+
+(defmacro with-jsonrpc-shape-method (&body body)
+  `(call-with-jsonrpc-shape-method (lambda () ,@body)))
+
+(defun jsonrpc-shape-key-present-p (object key)
+  "True when the parsed JSON OBJECT carries KEY at all — which is a different
+question from its value being null, and is exactly the difference that breaks
+python-bitcoinrpc."
+  (and (hash-table-p object) (nth-value 1 (gethash key object))))
+
+(defun jsonrpc-shape-reply (body)
+  "Drive BODY through the production path (parse-json-rpc-request ->
+handle-single-request -> yason:encode) and return (values parsed-reply
+json-text). Returns (values :no-reply nil) for a 2.0 notification, which
+rpc-handler answers with HTTP 204 and no body."
+  (multiple-value-bind (kind method params id version id-present)
+      (bitcoin-lisp.rpc::parse-json-rpc-request body)
+    (unless (eq kind :single)
+      (error "jsonrpc-shape-reply: expected a single request, got ~S" kind))
+    (if (and (eq version :v2) (not id-present))
+        (values :no-reply nil)
+        (let* ((response (bitcoin-lisp.rpc::handle-single-request
+                          nil method params id version :id-present id-present))
+               (json (with-output-to-string (s) (yason:encode response s))))
+          (values (yason:parse json) json)))))
+
+(defun jsonrpc-shape-body (version-member method id-member)
+  "A request body: VERSION-MEMBER and ID-MEMBER are the literal JSON members
+to splice in (\"\" for absent)."
+  (format nil "{~@[~A,~]\"method\":\"~A\",\"params\":[]~@[,~A~]}"
+          version-member method id-member))
+
+(test jsonrpc-v1-success-reply-has-both-result-and-null-error
+  "A jsonrpc:\"1.0\" request — and one with no jsonrpc member at all, which
+Core also classifies V1_LEGACY (request.cpp:212-227) — gets the legacy reply
+shape: NO \"jsonrpc\" key, both \"result\" and \"error\" present with the error
+null, and the id echoed. The last assertion is python-bitcoinrpc's:
+response[\"error\"] must EXIST and be null on success."
+  (with-jsonrpc-shape-method
+    (dolist (version-member (list "\"jsonrpc\":\"1.0\"" nil))
+      (multiple-value-bind (reply json)
+          (jsonrpc-shape-reply (jsonrpc-shape-body version-member
+                                                   *jsonrpc-shape-method*
+                                                   "\"id\":7"))
+        (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+        (when (hash-table-p reply)
+          (is-false (jsonrpc-shape-key-present-p reply "jsonrpc")
+                    "1.x reply must not carry a \"jsonrpc\" key: ~A" json)
+          (is-true (jsonrpc-shape-key-present-p reply "result"))
+          (is (eql 42 (gethash "result" reply)))
+          ;; python-bitcoinrpc: `if response['error'] is not None:`
+          (is-true (jsonrpc-shape-key-present-p reply "error")
+                   "1.x success reply must carry a null \"error\": ~A" json)
+          (is-false (gethash "error" reply))
+          (is-true (search "\"error\":null" json)
+                   "\"error\" must serialize as JSON null: ~A" json)
+          (is-true (jsonrpc-shape-key-present-p reply "id"))
+          (is (eql 7 (gethash "id" reply))))))))
+
+(test jsonrpc-v1-error-reply-has-both-null-result-and-error
+  "A 1.x error reply carries a null \"result\" beside the error object and no
+\"jsonrpc\" key (Core rpc/request.cpp:60-64)."
+  (with-jsonrpc-shape-method
+    (dolist (version-member (list "\"jsonrpc\":\"1.0\"" nil))
+      (multiple-value-bind (reply json)
+          (jsonrpc-shape-reply (jsonrpc-shape-body version-member
+                                                   "ga8shapenosuchmethod"
+                                                   "\"id\":7"))
+        (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+        (when (hash-table-p reply)
+          (is-false (jsonrpc-shape-key-present-p reply "jsonrpc")
+                    "1.x reply must not carry a \"jsonrpc\" key: ~A" json)
+          (is-true (jsonrpc-shape-key-present-p reply "result")
+                   "1.x error reply must carry a null \"result\": ~A" json)
+          (is-false (gethash "result" reply))
+          (is-true (search "\"result\":null" json))
+          (let ((err (gethash "error" reply)))
+            (is (hash-table-p err) "expected an error object, got ~S" err)
+            (when (hash-table-p err)
+              (is (eql bitcoin-lisp.rpc::+rpc-method-not-found+
+                       (gethash "code" err)))
+              (is (equal "Method not found" (gethash "message" err)))))
+          (is (eql 7 (gethash "id" reply))))))))
+
+(test jsonrpc-v1-omits-id-when-request-had-none
+  "Core omits \"id\" entirely when the request carried no id member
+(rpc/request.cpp:66 with id = std::nullopt, :207-211). A 1.x request without an
+id is NOT a notification — it still gets a reply, just without the key."
+  (with-jsonrpc-shape-method
+    (dolist (version-member (list "\"jsonrpc\":\"1.0\"" nil))
+      ;; Success and error both.
+      (dolist (method (list *jsonrpc-shape-method* "ga8shapenosuchmethod"))
+        (multiple-value-bind (reply json)
+            (jsonrpc-shape-reply (jsonrpc-shape-body version-member method nil))
+          (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+          (when (hash-table-p reply)
+            (is-false (jsonrpc-shape-key-present-p reply "id")
+                      "no id member in the request => no \"id\" key: ~A" json)
+            (is-true (jsonrpc-shape-key-present-p reply "result"))
+            (is-true (jsonrpc-shape-key-present-p reply "error")))))
+      ;; id:null is a different thing from an absent id: the key comes back.
+      (multiple-value-bind (reply json)
+          (jsonrpc-shape-reply (jsonrpc-shape-body version-member
+                                                   *jsonrpc-shape-method*
+                                                   "\"id\":null"))
+        (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+        (when (hash-table-p reply)
+          (is-true (jsonrpc-shape-key-present-p reply "id")
+                   "id:null must echo back as \"id\":null: ~A" json)
+          (is-false (gethash "id" reply)))))))
+
+(test jsonrpc-v2-reply-shape-is-unchanged
+  "Control: a 2.0 request must still get the strict 2.0 shape — \"jsonrpc\"
+present, and only ONE of result/error (Core rpc/request.cpp:55-64). This is
+what proves the 1.x fix did not simply flip every reply to the legacy shape."
+  (with-jsonrpc-shape-method
+    ;; Success.
+    (multiple-value-bind (reply json)
+        (jsonrpc-shape-reply (jsonrpc-shape-body "\"jsonrpc\":\"2.0\""
+                                                 *jsonrpc-shape-method*
+                                                 "\"id\":7"))
+      (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+      (when (hash-table-p reply)
+        (is (equal "2.0" (gethash "jsonrpc" reply)))
+        (is (eql 42 (gethash "result" reply)))
+        (is-false (jsonrpc-shape-key-present-p reply "error")
+                  "2.0 success reply must omit \"error\": ~A" json)
+        (is (eql 7 (gethash "id" reply)))))
+    ;; Error.
+    (multiple-value-bind (reply json)
+        (jsonrpc-shape-reply (jsonrpc-shape-body "\"jsonrpc\":\"2.0\""
+                                                 "ga8shapenosuchmethod"
+                                                 "\"id\":7"))
+      (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+      (when (hash-table-p reply)
+        (is (equal "2.0" (gethash "jsonrpc" reply)))
+        (is-false (jsonrpc-shape-key-present-p reply "result")
+                  "2.0 error reply must omit \"result\": ~A" json)
+        (is-true (hash-table-p (gethash "error" reply)))
+        (is (eql 7 (gethash "id" reply)))))
+    ;; A 2.0 notification (no id member) is executed but gets no reply at all
+    ;; (Core httprpc.cpp:167-171 answers HTTP 204).
+    (is (eq :no-reply
+            (jsonrpc-shape-reply (jsonrpc-shape-body "\"jsonrpc\":\"2.0\""
+                                                     *jsonrpc-shape-method*
+                                                     nil))))))
+
+(test jsonrpc-batch-reply-shape-is-per-member
+  "Core re-parses every batch member on its own (httprpc.cpp:194-206), so the
+reply shape is per member: a 1.x member gets result+error and no \"jsonrpc\",
+a 2.0 member gets the strict shape, a 2.0 notification contributes no reply at
+all (:207-209), and a 1.x member without an id gets a reply with no \"id\"."
+  (with-jsonrpc-shape-method
+    (multiple-value-bind (kind requests)
+        (bitcoin-lisp.rpc::parse-json-rpc-request
+         (format nil "[{\"jsonrpc\":\"1.0\",\"method\":\"~A\",\"id\":1},~
+                       {\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"id\":2},~
+                       {\"jsonrpc\":\"2.0\",\"method\":\"~A\"},~
+                       {\"method\":\"~A\"}]"
+                 *jsonrpc-shape-method* *jsonrpc-shape-method*
+                 *jsonrpc-shape-method* *jsonrpc-shape-method*))
+      (is (eq :batch kind))
+      (let ((replies (bitcoin-lisp.rpc::handle-batch-request nil requests)))
+        (is (= 3 (length replies))
+            "the 2.0 notification must contribute no reply; got ~S replies"
+            (length replies))
+        (when (= 3 (length replies))
+          (destructuring-bind (v1 v2 v1-no-id) replies
+            (is-false (jsonrpc-shape-key-present-p v1 "jsonrpc"))
+            (is-true (jsonrpc-shape-key-present-p v1 "error"))
+            (is-false (gethash "error" v1))
+            (is (eql 1 (gethash "id" v1)))
+            (is (equal "2.0" (gethash "jsonrpc" v2)))
+            (is-false (jsonrpc-shape-key-present-p v2 "error"))
+            (is (eql 2 (gethash "id" v2)))
+            (is-false (jsonrpc-shape-key-present-p v1-no-id "jsonrpc"))
+            (is-true (jsonrpc-shape-key-present-p v1-no-id "error"))
+            (is-false (jsonrpc-shape-key-present-p v1-no-id "id")
+                      "a 1.x batch member with no id must get no \"id\" key")))))))
+
+(test jsonrpc-pre-dispatch-errors-use-the-legacy-shape
+  "Failures raised before a version is known — parse errors, invalid requests,
+and the HTTP-level refusals rpc-json-error builds — take Core's default
+V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59, request.h:55,63), so they
+carry result+error and no \"jsonrpc\"."
+  (let* ((response (bitcoin-lisp.rpc::make-rpc-error-response
+                    bitcoin-lisp.rpc::+rpc-parse-error+ "Parse error" nil :v1))
+         (json (with-output-to-string (s) (yason:encode response s)))
+         (reply (yason:parse json)))
+    (is-false (jsonrpc-shape-key-present-p reply "jsonrpc") "~A" json)
+    (is-true (jsonrpc-shape-key-present-p reply "result") "~A" json)
+    (is-false (gethash "result" reply))
+    (is-true (jsonrpc-shape-key-present-p reply "id") "~A" json)
+    (is-false (gethash "id" reply))
+    (let ((err (gethash "error" reply)))
+      (is (hash-table-p err))
+      (when (hash-table-p err)
+        (is (eql bitcoin-lisp.rpc::+rpc-parse-error+ (gethash "code" err)))))))
+
+;;;; ---------------------------------------------------------------------
+;;;; The same rules, asserted at the HTTP HANDLER — the call site the bug
+;;;; actually lived at.
+;;;;
+;;;; The tests above drive parse-json-rpc-request -> handle-single-request by
+;;;; hand, which proves the reply BUILDERS but says nothing about the wiring:
+;;;; the original defect was precisely that rpc-handler parsed the version and
+;;;; never passed it on. So these tests call RPC-HANDLER itself (and
+;;;; RPC-JSON-ERROR, the pre-dispatch refusal path) and assert the ENCODED
+;;;; RESPONSE BODY plus the HTTP status, byte for byte — a Lisp-value
+;;;; assertion cannot see a serialization regression, and this whole bug class
+;;;; is serialization.
+;;;;
+;;;; rpc-handler only ever reads headers-in, script-name and raw-post-data off
+;;;; hunchentoot:*request*, so a synthetic request with its raw-post-data slot
+;;;; pre-filled — exactly what hunchentoot's own get-post-data leaves there
+;;;; (hunchentoot request.lisp:150-183) — drives the real function with no
+;;;; socket, acceptor or server.
+;;;;
+;;;; Authentication is mandatory and is checked BEFORE the body is parsed or
+;;;; dispatched (Core HTTPReq_JSONRPC, httprpc.cpp:112-133), so these requests
+;;;; carry a real HTTP Basic credential, exactly as bitcoin-cli does: the
+;;;; helpers bind *rpc-user*/*rpc-password* for the duration of the call and
+;;;; send the matching header. None of the shapes below can be reached without
+;;;; one — see the 401 assertion in the pre-dispatch test, which is what fails
+;;;; if that credential ever stops being load-bearing.
+;;;; ---------------------------------------------------------------------
+
+(defparameter *jsonrpc-handler-rpc-user* "ga8shapeuser"
+  "The RPC user the handler tests authorize as (bound over *rpc-user* for the
+duration of one jsonrpc-handler-reply call).")
+
+(defparameter *jsonrpc-handler-rpc-password* "ga8shapepass"
+  "The RPC password the handler tests authorize with (bound over
+*rpc-password* for the duration of one jsonrpc-handler-reply call).")
+
+(defun jsonrpc-handler-credential ()
+  "The \"user:pass\" credential the handler tests send as HTTP Basic."
+  (concatenate 'string *jsonrpc-handler-rpc-user* ":"
+               *jsonrpc-handler-rpc-password*))
+
+(defun jsonrpc-handler-basic-auth (credential)
+  "CREDENTIAL (\"user:pass\") as an HTTP Basic Authorization header value:
+the scheme name, a space, then the base64 of the pair — what Core's
+RPCAuthorized decodes (httprpc.cpp:84-101). Spelled out here so this section
+builds on its own; it is the one line of HTTP a handler test needs."
+  (concatenate 'string "Basic " (cl-base64:string-to-base64-string credential)))
+
+(defparameter *jsonrpc-handler-dotted-method* "ga8shapedotted"
+  "A method whose result (an improper list) has no JSON encoding, so
+yason:encode signals inside rpc-handler — the only way to reach its
+outermost internal-error clause, since handle-single-request catches
+everything a method itself signals.")
+
+(defun call-with-jsonrpc-handler-methods (thunk)
+  "Register the handler tests' throwaway dispatch targets, run THUNK, then
+remove them so the global method registry is unchanged."
+  (bitcoin-lisp.rpc::register-rpc-method
+   *jsonrpc-shape-method*
+   (lambda (node params) (declare (ignore node params)) 42))
+  (bitcoin-lisp.rpc::register-rpc-method
+   *jsonrpc-handler-dotted-method*
+   (lambda (node params) (declare (ignore node params)) (cons 1 2)))
+  (unwind-protect (funcall thunk)
+    (remhash *jsonrpc-shape-method* bitcoin-lisp.rpc::*rpc-methods*)
+    (remhash *jsonrpc-handler-dotted-method* bitcoin-lisp.rpc::*rpc-methods*)))
+
+(defmacro with-jsonrpc-handler-methods (&body body)
+  `(call-with-jsonrpc-handler-methods (lambda () ,@body)))
+
+(defun jsonrpc-handler-request (body &key (content-type "application/json")
+                                       (uri "/") (headers '()) content-length
+                                       (auth (jsonrpc-handler-credential)))
+  "A synthetic hunchentoot POST request carrying BODY.
+AUTH is a \"user:pass\" credential sent as an HTTP Basic Authorization header;
+it defaults to the pair jsonrpc-handler-reply installs, so the request is
+authorized. NIL sends no Authorization header at all (a 401), and any other
+string exercises a wrong credential.
+CONTENT-LENGTH overrides the Content-Length header (to exercise the
+oversized-body refusal without allocating 32 MiB). hunchentoot:*acceptor*
+must be bound while the request is built: initialize-instance :after consults
+it through session-verify."
+  (let* ((octets (flexi-streams:string-to-octets body :external-format :utf-8))
+         (hunchentoot:*acceptor* nil)
+         (request (make-instance 'hunchentoot:request
+                                 :acceptor nil
+                                 :headers-in
+                                 (list* (cons :content-type content-type)
+                                        (cons :host "127.0.0.1:18332")
+                                        (cons :content-length
+                                              (or content-length
+                                                  (princ-to-string (length octets))))
+                                        (append
+                                         (when auth
+                                           (list (cons :authorization
+                                                       (jsonrpc-handler-basic-auth
+                                                        auth))))
+                                         headers))
+                                 :method :post
+                                 :uri uri
+                                 ;; The refused-credential path logs the peer
+                                 ;; address; the slot has no initform, so a
+                                 ;; request built without one would signal
+                                 ;; UNBOUND-SLOT instead of answering 401.
+                                 :remote-addr "127.0.0.1"
+                                 :server-protocol :http/1.1
+                                 :content-stream nil)))
+    (setf (slot-value request 'hunchentoot::raw-post-data) octets)
+    request))
+
+(defun jsonrpc-handler-reply (body &rest request-args)
+  "POST BODY to the production entry point RPC-HANDLER; return
+ (values http-status response-body content-type). The RPC credential is
+installed for the duration of the call and sent with the request, so the
+handler authorizes it and reaches the paths under test; :AUTH overrides what
+the client presents (see jsonrpc-handler-request). RATE-LIMITER, when given as
+:rate-limiter, replaces the global limiter for this one call."
+  (let* ((rate-limiter (getf request-args :rate-limiter))
+         (request-args (loop for (k v) on request-args by #'cddr
+                             unless (eq k :rate-limiter)
+                               append (list k v)))
+         (bitcoin-lisp.rpc::*rpc-user* *jsonrpc-handler-rpc-user*)
+         (bitcoin-lisp.rpc::*rpc-password* *jsonrpc-handler-rpc-password*)
+         (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+         (hunchentoot:*request* (apply #'jsonrpc-handler-request body request-args))
+         (bitcoin-lisp.rpc::*rpc-node* nil)
+         (bitcoin-lisp.rpc::*rpc-rate-limiter* rate-limiter))
+    ;; A fresh reply starts at 200; reset explicitly so a request-construction
+    ;; hiccup could not pre-seed the status the assertions read back.
+    (setf (hunchentoot:return-code*) hunchentoot:+http-ok+)
+    (let ((out (bitcoin-lisp.rpc::rpc-handler)))
+      (values (hunchentoot:return-code*) out (hunchentoot:content-type*)))))
+
+(defun jsonrpc-handler-check (body expected-status expected-json &rest request-args)
+  "Assert that POSTing BODY to rpc-handler answers EXPECTED-STATUS with
+EXPECTED-JSON as the exact response body."
+  (multiple-value-bind (status json)
+      (apply #'jsonrpc-handler-reply body request-args)
+    (is (eql expected-status status)
+        "~A~%  status: expected ~S, got ~S (body ~S)"
+        body expected-status status json)
+    (is (string= expected-json json)
+        "~A~%  body: expected ~S~%        got      ~S"
+        body expected-json json)))
+
+(defun jsonrpc-legacy-error-json (code message)
+  "The exact legacy-1.x error body Core's JSONErrorReply sends for a failure
+raised before any version is known: null result, the error object, null id
+(httprpc.cpp:41-59 over the default V1_LEGACY/VNULL-id JSONRPCRequest,
+request.h:55,63)."
+  (format nil "{\"result\":null,\"error\":{\"code\":~D,\"message\":\"~A\"},\"id\":null}"
+          code message))
+
+(test jsonrpc-handler-threads-request-version-into-the-reply
+  "rpc-handler must hand handle-single-request the version and id-presence it
+just parsed. Asserted on the wire bytes: a 1.x request (explicit \"1.0\" or no
+jsonrpc member, both V1_LEGACY per request.cpp:212-227) gets result+error with
+one null and no \"jsonrpc\" key, while a 2.0 request keeps the strict 2.0
+shape. Hardcoding either argument at the call site — which IS the bug this
+wave repairs — changes these bytes."
+  (with-jsonrpc-handler-methods
+    (let ((echo *jsonrpc-shape-method*))
+      ;; --- 1.x success: both keys, error null, id echoed, no "jsonrpc". ---
+      (dolist (version-member '("\"jsonrpc\":\"1.0\"," ""))
+        (jsonrpc-handler-check
+         (format nil "{~A\"method\":\"~A\",\"params\":[],\"id\":7}" version-member echo)
+         200 "{\"result\":42,\"error\":null,\"id\":7}")
+        ;; --- 1.x, no id member: still answered, but with no "id" key. A 1.x
+        ;; request is never a notification (Core IsNotification, request.h:67).
+        (jsonrpc-handler-check
+         (format nil "{~A\"method\":\"~A\",\"params\":[]}" version-member echo)
+         200 "{\"result\":42,\"error\":null}")
+        ;; --- 1.x error: null result beside the error, and the 1.x status
+        ;; mapping (-32601 -> 404, httprpc.cpp:41-59).
+        (jsonrpc-handler-check
+         (format nil "{~A\"method\":\"ga8shapenosuchmethod\",\"id\":7}" version-member)
+         404
+         (format nil "{\"result\":null,\"error\":{\"code\":~D,\"message\":\"Method not found\"},\"id\":7}"
+                 bitcoin-lisp.rpc::+rpc-method-not-found+)))
+      ;; --- 2.0 control: unchanged, and always HTTP 200 even for an error. ---
+      (jsonrpc-handler-check
+       (format nil "{\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"params\":[],\"id\":7}" echo)
+       200 "{\"jsonrpc\":\"2.0\",\"result\":42,\"id\":7}")
+      (jsonrpc-handler-check
+       "{\"jsonrpc\":\"2.0\",\"method\":\"ga8shapenosuchmethod\",\"id\":7}"
+       200
+       (format nil "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":~D,\"message\":\"Method not found\"},\"id\":7}"
+               bitcoin-lisp.rpc::+rpc-method-not-found+))
+      ;; --- The reply is the same on a /wallet/<name> endpoint. ---
+      (jsonrpc-handler-check
+       (format nil "{\"method\":\"~A\",\"id\":7}" echo)
+       200 "{\"result\":42,\"error\":null,\"id\":7}"
+       :uri "/wallet/w1"))))
+
+(test jsonrpc-handler-notification-and-batch-http-shapes
+  "The handler's own HTTP-level decisions: a 2.0 notification and a non-empty
+all-notification batch answer 204 with no body (Core httprpc.cpp:167-171,220),
+while an EMPTY batch answers 200 with [] (:211-219) — NIL would encode as JSON
+null, so the empty array has to be spelled #(). Batch replies are per member."
+  (with-jsonrpc-handler-methods
+    (let ((echo *jsonrpc-shape-method*))
+      ;; 2.0 notification: executed, no reply, 204.
+      (jsonrpc-handler-check
+       (format nil "{\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"params\":[]}" echo)
+       204 "")
+      ;; Non-empty all-notification batch: 204, no body.
+      (jsonrpc-handler-check
+       (format nil "[{\"jsonrpc\":\"2.0\",\"method\":\"~A\"},~
+                     {\"jsonrpc\":\"2.0\",\"method\":\"~A\"}]" echo echo)
+       204 "")
+      ;; Empty batch: 200 with a JSON array, NOT null.
+      (jsonrpc-handler-check "[]" 200 "[]")
+      ;; Mixed batch: 1.x member, 2.0 member, dropped 2.0 notification, and a
+      ;; 1.x member with no id (reply present, "id" key absent).
+      (jsonrpc-handler-check
+       (format nil "[{\"jsonrpc\":\"1.0\",\"method\":\"~A\",\"id\":1},~
+                     {\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"id\":2},~
+                     {\"jsonrpc\":\"2.0\",\"method\":\"~A\"},~
+                     {\"method\":\"~A\"}]"
+               echo echo echo echo)
+       200
+       (concatenate 'string
+                    "[{\"result\":42,\"error\":null,\"id\":1},"
+                    "{\"jsonrpc\":\"2.0\",\"result\":42,\"id\":2},"
+                    "{\"result\":42,\"error\":null}]"))
+      ;; A non-object member has no version of its own: Core's fresh request is
+      ;; V1_LEGACY with a null id, and the batch still answers 200.
+      (jsonrpc-handler-check
+       "[7]" 200
+       (format nil "[~A]"
+               (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-invalid-request+
+                                          "Invalid request format"))))))
+
+(test jsonrpc-handler-pre-dispatch-errors-use-the-legacy-shape
+  "Every reply rpc-handler sends before (or instead of) dispatching — origin
+refusal, rate limit, oversized body, parse error, invalid request, and the
+outermost internal-error clause — carries Core's default V1_LEGACY/null-id
+shape and the 1.x status mapping. These are the paths a broken client hits
+most, so the bytes are pinned here rather than only in the builder.
+The two credential cases also pin the ORDER of the guards (origin -> auth ->
+rate limit -> size -> content-type -> dispatch): each assertion below only
+reaches the refusal it is named for because the ones ahead of it passed."
+  (with-jsonrpc-handler-methods
+    ;; Malformed JSON -> -32700, HTTP 500.
+    (jsonrpc-handler-check
+     "not valid json" 500
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-parse-error+ "Parse error"))
+    ;; Missing method -> -32600, HTTP 400. Note the request says 2.0 and still
+    ;; gets the legacy shape: pre-dispatch failures carry no version (the
+    ;; documented deviation from Core, which has already recorded V2 here).
+    (jsonrpc-handler-check
+     "{\"jsonrpc\":\"2.0\",\"id\":1}" 400
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-invalid-request+
+                                "Missing or invalid method"))
+    ;; A result yason cannot encode reaches the handler's outermost clause.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-handler-dotted-method*)
+     500
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-internal-error+ "Internal error"))
+    ;; Oversized body (Content-Length over the 32 MiB cap) -> 400.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 400
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Request body too large")
+     :content-length (princ-to-string (1+ bitcoin-lisp:+max-rpc-body-size+)))
+    ;; A credential that does not match -> 401 with an empty body, decided
+    ;; before the body is even looked at. This assertion is also what keeps
+    ;; every other check in this section honest: they reach the paths they name
+    ;; only because jsonrpc-handler-reply presents a real credential, and this
+    ;; is the check that fails first if that credential ever stops mattering.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 401 ""
+     :auth (concatenate 'string *jsonrpc-handler-rpc-user* ":wrong"))
+    ;; Cross-origin browser POST -> 403, refused BEFORE auth: sent with no
+    ;; credential at all, so a handler that authenticated first would answer
+    ;; 401 here and this check would fail.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 403
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+
+                                "Origin does not match Host")
+     :auth nil
+     :headers (list (cons :origin "http://evil.example")))
+    ;; Rate limited -> 429 (an exhausted bucket: rate 0, burst 0), reached with
+    ;; a valid credential: the limiter sits behind auth.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 429
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Rate limit exceeded")
+     :rate-limiter (bitcoin-lisp:make-rate-limiter 0 0))
+    ;; Wrong Content-Type is refused with an empty body (Core answers 415 too).
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 415 ""
+     :content-type "application/xml")))
+
+(test rpc-json-error-emits-the-legacy-shape
+  "rpc-json-error is the single builder behind those HTTP-level refusals: it
+sets the status and application/json, and its body is the V1_LEGACY shape."
+  (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+    (let ((json (bitcoin-lisp.rpc::rpc-json-error
+                 429 bitcoin-lisp.rpc::+rpc-misc-error+ "Rate limit exceeded")))
+      (is (eql 429 (hunchentoot:return-code*)))
+      (is (equal "application/json" (hunchentoot:content-type*)))
+      (is (string= (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+
+                                              "Rate limit exceeded")
+                   json)
+          "rpc-json-error body: ~S" json))))

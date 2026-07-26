@@ -40,6 +40,14 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; wire (NIL = none yet); NEXT-SEND-FEEFILTER is a unix time, 0 = due now.
   (fee-filter-sent nil)
   (next-send-feefilter 0 :type integer)
+  ;; Operator-pinned connection (-addnode / addnode onetry). Core types these
+  ;; ConnectionType::MANUAL and exempts them from every automatic eviction; we
+  ;; carry the fact as a flag because our -addnode peers are otherwise typed
+  ;; :outbound-full-relay and would be indistinguishable.
+  (manual nil)
+  ;; OUR nonce for this one connection, sent in the VERSION we push (Core
+  ;; CNode::nLocalHostNonce, net.h:994). Per-connection, never node-wide.
+  (local-nonce 0 :type (unsigned-byte 64))
   (services 0 :type (unsigned-byte 64))
   (start-height 0 :type (signed-byte 32))
   (user-agent "" :type string)
@@ -455,6 +463,23 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
                                             command payload-len)
                           (values command payload))))))))))))))
 
+(defun peer-outbound-or-block-relay-p (peer)
+  "T for the connection types that are candidates for AUTOMATIC disconnection
+on chain-quality grounds — Core CNode::IsOutboundOrBlockRelayConn
+(net.h:771-785): OUTBOUND_FULL_RELAY and BLOCK_RELAY only.
+
+Two halves matter equally. It must INCLUDE :block-relay, which the word
+\"outbound\" does not obviously cover in our vocabulary. And it must EXCLUDE
+manual (-addnode) peers: ours are typed :outbound-full-relay, and
+connect-added-nodes redials every missing added node on the ~30s maintenance
+tick, so a plain not-inbound test would produce a
+connect -> getheaders -> disconnect -> reconnect loop every 30 seconds against
+a peer the operator explicitly pinned. Feelers and inbound are excluded too."
+  (and (not (peer-inbound peer))
+       (not (peer-manual peer))
+       (member (peer-conn-type peer) '(:outbound-full-relay :block-relay))
+       t))
+
 ;;; Handshake
 
 (defun peer-relays-txs-p (peer)
@@ -673,6 +698,65 @@ self-advertisement happens via addr/addrv2 push, not the version message."
         (bitcoin-lisp.serialization:make-empty-net-addr
          :services (peer-services peer)))))
 
+;;; --- Self-connection detection (Core CheckIncomingNonce) ---
+;;;
+;;; A node that dials its own advertised address completes the handshake
+;;; against itself: the connection answers ping/pong forever, is never evicted,
+;;; permanently burns an outbound slot and pollutes addrman and getpeerinfo.
+;;; The only signal is the VERSION nonce — if a nonce we just sent comes back
+;;; at us, the far end is us.
+
+(defvar *outbound-nonce-lock* (bt:make-lock "outbound-nonces"))
+
+(defvar *outbound-nonces* (make-hash-table :test 'eql)
+  "Nonces of outbound connections whose handshake is still in flight, i.e.
+whose VERACK has not been received. Core matches only against nodes with
+!fSuccessfullyConnected (net.cpp:353-370); registering for exactly the
+handshake window is the same test. Entries MUST be released on handshake
+failure too, or the registry leaks and stays armed forever.")
+
+(defun %fresh-local-nonce ()
+  "A fresh 64-bit VERSION nonce for ONE connection.
+
+Core gives every CNode its own nonce (net.cpp:515-516 outbound, :1824-1825
+inbound) rather than reusing a node-wide value, and that matters beyond
+tidiness: the nonce travels in cleartext in the first message of every
+connection, so a stable one would be a permanent unique fingerprint linking
+our clearnet, Tor and I2P identities and every reconnect. Core keeps the real
+per-connection nonce even on privacy-hardened private-broadcast connections
+where it blanks every other field (net_processing.cpp:1557-1564).
+
+Uses ironclad's CSPRNG: SBCL's *random-state* is neither thread-safe nor
+unpredictable, and handshakes run on several threads at once."
+  (let ((bytes (ironclad:random-data 8)))
+    (loop for i from 0 below 8
+          for shift from 0 by 8
+          sum (ash (aref bytes i) shift))))
+
+(defun %register-outbound-nonce (nonce)
+  (bt:with-lock-held (*outbound-nonce-lock*)
+    (setf (gethash nonce *outbound-nonces*) t)))
+
+(defun %release-outbound-nonce (nonce)
+  (bt:with-lock-held (*outbound-nonce-lock*)
+    (remhash nonce *outbound-nonces*)))
+
+(defun self-connection-nonce-p (nonce)
+  "T when NONCE belongs to an outbound handshake of ours still in flight —
+i.e. the peer that sent it is us (Core CheckIncomingNonce)."
+  (bt:with-lock-held (*outbound-nonce-lock*)
+    (and (gethash nonce *outbound-nonces*) t)))
+
+(defun %detected-self-connection-p (peer)
+  "T when the VERSION already stored on PEER carries one of our own in-flight
+outbound nonces. Only meaningful on the INBOUND side: an inbound peer's nonce
+is never registered, so this cannot false-positive on a normal peer unless it
+guesses a 64-bit CSPRNG value."
+  (let ((version (peer-version peer)))
+    (and version
+         (self-connection-nonce-p
+          (bitcoin-lisp.serialization::version-message-nonce version)))))
+
 (defun %send-version-and-capabilities (peer)
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
@@ -695,6 +779,9 @@ tx relay on those)."
                            :addr-recv (%version-addr-recv peer)
                            :start-height start-height
                            :timestamp (bitcoin-lisp.serialization:get-unix-time)
+                           ;; This connection's own nonce, so a peer that is
+                           ;; really us can be recognised when it echoes back.
+                           :nonce (peer-local-nonce peer)
                            ;; Core my_tx_relay = !RejectIncomingTxs(pnode)
                            ;; (net_processing.cpp:1573,5686-5693): false on
                            ;; block-relay/feeler connections AND in blocksonly
@@ -789,16 +876,24 @@ When TRY-V2 (default: whenever the v2 transport is enabled and supported), the
 BIP324 encrypted transport is established first, reconnecting as v1 if the peer
 turns out not to speak it. Returns T on success."
   (setf (peer-state peer) :handshaking
-        (peer-conn-type peer) conn-type)
-  (and (or (not try-v2)
-           (%v2-try-outbound peer))
-       (%send-version-and-capabilities peer)
-       (%receive-and-store-version peer)
-       ;; BIP330 offer goes after their VERSION (it is gated on their fRelay)
-       ;; and before our VERACK (Core net_processing.cpp:3728-3744).
-       (%maybe-send-sendtxrcncl peer)
-       (send-message peer (bitcoin-lisp.serialization:make-verack-message))
-       (%await-verack peer)))
+        (peer-conn-type peer) conn-type
+        (peer-local-nonce peer) (%fresh-local-nonce))
+  ;; Arm self-connection detection for exactly the handshake window (Core
+  ;; matches only against !fSuccessfullyConnected nodes). unwind-protect so a
+  ;; FAILED handshake releases the nonce too — otherwise the registry leaks
+  ;; and stays armed against an unrelated future peer forever.
+  (%register-outbound-nonce (peer-local-nonce peer))
+  (unwind-protect
+       (and (or (not try-v2)
+                (%v2-try-outbound peer))
+            (%send-version-and-capabilities peer)
+            (%receive-and-store-version peer)
+            ;; BIP330 offer goes after their VERSION (it is gated on their fRelay)
+            ;; and before our VERACK (Core net_processing.cpp:3728-3744).
+            (%maybe-send-sendtxrcncl peer)
+            (send-message peer (bitcoin-lisp.serialization:make-verack-message))
+            (%await-verack peer))
+    (%release-outbound-nonce (peer-local-nonce peer))))
 
 (defun perform-inbound-handshake (peer &key (timeout 15))
   "Inbound version handshake (the peer dialed us, so it sends VERSION first):
@@ -817,14 +912,28 @@ stall. Returns T on success."
                                     (peer-address peer)))
             ((eq detected :v1))         ; sniffed bytes pushed back; proceed v1
             (t (return-from perform-inbound-handshake nil)))))
+  (setf (peer-local-nonce peer) (%fresh-local-nonce))
   (and (%receive-and-store-version peer :timeout timeout)
-       (%send-version-and-capabilities peer)
-       ;; BIP330 offer: their VERSION is already in hand on the inbound path;
-       ;; ordering matches Core (wtxidrelay → sendaddrv2 → sendtxrcncl →
-       ;; verack, net_processing.cpp:3715-3744).
-       (%maybe-send-sendtxrcncl peer)
-       (send-message peer (bitcoin-lisp.serialization:make-verack-message))
-       (%await-verack peer :timeout timeout)))
+       ;; SELF-CONNECTION: their VERSION carries a nonce we are still using for
+       ;; an outbound handshake, so the far end is us. Refuse BEFORE replying
+       ;; and before any local-address/addrman bookkeeping — Core's check at
+       ;; net_processing.cpp:3649 precedes both SeenLocal (:3658) and
+       ;; PushNodeVersion (:3664). The disconnect is SILENT: no ban, no
+       ;; discouragement, no misbehaviour score. Scoring it would be actively
+       ;; harmful, since the address being punished is our own.
+       (cond ((%detected-self-connection-p peer)
+              (bitcoin-lisp:log-info "Peer ~A: connected to self, disconnecting"
+                                     (peer-address peer))
+              nil)
+             (t
+              (and (%send-version-and-capabilities peer)
+                   ;; BIP330 offer: their VERSION is already in hand on the
+                   ;; inbound path; ordering matches Core (wtxidrelay →
+                   ;; sendaddrv2 → sendtxrcncl → verack,
+                   ;; net_processing.cpp:3715-3744).
+                   (%maybe-send-sendtxrcncl peer)
+                   (send-message peer (bitcoin-lisp.serialization:make-verack-message))
+                   (%await-verack peer :timeout timeout))))))
 
 (defun make-inbound-peer (connection address &key inbound-onion)
   "Build a peer for an accepted inbound CONNECTION from ADDRESS (state :connected,
