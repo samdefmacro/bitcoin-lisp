@@ -1026,6 +1026,8 @@
    ;; Locktime validation
    #:check-transaction-final
    #:compute-median-time-past
+   #:compute-median-time-past-from-entry
+   #:header-time-too-old-p
    #:check-sequence-locks
    #:compute-script-flags-for-height
    #:+standard-script-verify-flags+

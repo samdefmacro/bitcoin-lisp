@@ -848,7 +848,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
     (when chain-state
       (let* ((eval-height (1+ current-height))
              (tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-             (mtp (compute-median-time-past chain-state tip-hash))
+             (mtp (or (compute-median-time-past chain-state tip-hash) 0))
              (csv-active (>= eval-height
                              (get-csv-activation-height bitcoin-lisp:*network*)))
              ;; BIP113: locktime compares against MTP once CSV is active

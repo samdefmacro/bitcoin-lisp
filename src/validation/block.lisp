@@ -97,25 +97,31 @@ values at or above are Unix timestamps.")
 (defconstant +median-time-span+ 11
   "Number of previous blocks used to compute median-time-past.")
 
+(defun compute-median-time-past-from-entry (entry)
+  "Median-time-past of ENTRY: the median of its own timestamp and up to its 10
+ancestors', walking the PREV-ENTRY chain — Bitcoin Core
+CBlockIndex::GetMedianTimePast (chain.h:233-246). Returns NIL when ENTRY is NIL.
+The entry chain is the only walk that can see a parent which is not (yet) in the
+block index, such as a header staged earlier in the same batch."
+  (when entry
+    (let ((timestamps '())
+          (e entry))
+      (dotimes (i +median-time-span+)
+        (unless e (return))
+        (push (bitcoin-lisp.serialization:block-header-timestamp
+               (bitcoin-lisp.storage:block-index-entry-header e))
+              timestamps)
+        (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+      (nth (floor (length timestamps) 2) (sort timestamps #'<)))))
+
 (defun compute-median-time-past (chain-state prev-hash)
   "Compute the median-time-past for the block following PREV-HASH.
-Returns the median of up to 11 previous block timestamps."
-  (let ((timestamps '())
-        (hash prev-hash))
-    (dotimes (i +median-time-span+)
-      (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
-        (unless entry (return))
-        (push (bitcoin-lisp.serialization:block-header-timestamp
-               (bitcoin-lisp.storage:block-index-entry-header entry))
-              timestamps)
-        (let ((prev (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
-          (if prev
-              (setf hash (bitcoin-lisp.storage:block-index-entry-hash prev))
-              (return)))))
-    (if (null timestamps)
-        0
-        (let ((sorted (sort timestamps #'<)))
-          (nth (floor (length sorted) 2) sorted)))))
+Returns NIL when PREV-HASH is not in the block index: absence is not a time, and
+a numeric fallback silently satisfies a consensus comparison such as
+(<= timestamp mtp). Callers on a consensus path must reject on NIL; informational
+callers substitute their own default."
+  (compute-median-time-past-from-entry
+   (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)))
 
 ;;;; Transaction finality check (IsFinalTx)
 
@@ -176,11 +182,8 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
                        (utxo-prev-height (max 0 (1- utxo-height)))
                        (utxo-prev-entry (bitcoin-lisp.storage:get-block-at-height
                                          chain-state utxo-prev-height))
-                       (utxo-mtp (if utxo-prev-entry
-                                     (compute-median-time-past
-                                      chain-state
-                                      (bitcoin-lisp.storage:block-index-entry-hash
-                                       utxo-prev-entry))
+                       (utxo-mtp (or (compute-median-time-past-from-entry
+                                      utxo-prev-entry)
                                      0)))
                   (when (< (- mtp utxo-mtp) required-time)
                     (return-from check-sequence-locks nil)))
@@ -515,6 +518,16 @@ Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4129-4136)."
               (bitcoin-lisp.storage:block-index-entry-header prev-entry))
              +max-timewarp+))))
 
+(defun header-time-too-old-p (header prev-entry)
+  "T if HEADER's timestamp is at or before PREV-ENTRY's median-time-past —
+Bitcoin Core ContextualCheckBlockHeader's time-too-old rule (validation.cpp:4124).
+An ancestry that yields no median (a NIL PREV-ENTRY) counts as a violation: the
+rule cannot be evaluated, and answering with a neutral time would satisfy the
+comparison for every header."
+  (let ((mtp (compute-median-time-past-from-entry prev-entry)))
+    (or (null mtp)
+        (<= (bitcoin-lisp.serialization:block-header-timestamp header) mtp))))
+
 (defun validate-block-header (header chain-state current-time
                                &key prev-hash height prev-entry skip-pow)
   "Validate a block header.
@@ -536,12 +549,16 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
       (return-from validate-block-header
         (values nil :time-too-new)))
 
-    ;; Check timestamp > median-time-past of previous 11 blocks
-    (when (and chain-state prev-hash)
-      (let ((mtp (compute-median-time-past chain-state prev-hash)))
-        (when (<= timestamp mtp)
-          (return-from validate-block-header
-            (values nil :time-too-old)))))
+    ;; Check timestamp > median-time-past of previous 11 blocks. PREV-ENTRY is
+    ;; preferred over the hash: a hash lookup cannot see a parent that is not in
+    ;; the index.
+    (when (or prev-entry (and chain-state prev-hash))
+      (when (header-time-too-old-p
+             header (or prev-entry
+                        (bitcoin-lisp.storage:get-block-index-entry
+                         chain-state prev-hash)))
+        (return-from validate-block-header
+          (values nil :time-too-old))))
 
     ;; BIP 94 timewarp-attack mitigation (see bip94-timewarp-violation-p).
     (when (bip94-timewarp-violation-p header height prev-entry)
@@ -1389,7 +1406,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
       ;; Transaction finality check (IsFinalTx) and BIP 68 sequence locks
       (let* ((prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
-             (mtp (compute-median-time-past chain-state prev-hash))
+             (mtp (or (compute-median-time-past chain-state prev-hash) 0))
              (csv-height (get-csv-activation-height bitcoin-lisp:*network*))
              (csv-active (>= current-height csv-height))
              ;; For IsFinalTx: use MTP after BIP 113 activation, block timestamp before
@@ -1982,7 +1999,7 @@ have silently revoked. HEIGHT is the NEW tip height. Returns the number of
 transactions removed."
   (let* ((eval-height (1+ height))
          (tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (mtp (compute-median-time-past chain-state tip-hash))
+         (mtp (or (compute-median-time-past chain-state tip-hash) 0))
          (csv-active (>= eval-height
                          (get-csv-activation-height bitcoin-lisp:*network*)))
          ;; BIP113: same clock the acceptance path uses (transaction.lisp).
@@ -2394,13 +2411,22 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
               ;; competing-fork block stored via the :weaker-chain path had its
               ;; body (scripts / merkle / coinbase value / finality / seqlocks)
               ;; UNvalidated — connecting it blindly was the consensus hole.
+              ;; Re-run the ONE header rule an already-persisted index entry may
+              ;; predate, since :skip-header t below will not. It must stay
+              ;; exactly this rule: a fork body re-read from the store carries no
+              ;; cached hash, so re-running PoW here would spuriously fail (see
+              ;; VALIDATE-BLOCK's SKIP-HEADER docstring).
               (multiple-value-bind (valid error)
-                  (validate-block block chain-state utxo-set height now
-                                  :skip-scripts skip-scripts
-                                  ;; Header (PoW/difficulty/MTP/timewarp) was
-                                  ;; validated at index admission — Core's
-                                  ;; ConnectBlock doesn't re-check it.
-                                  :skip-header t)
+                  (if (header-time-too-old-p
+                       (bitcoin-lisp.serialization:bitcoin-block-header block)
+                       (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
+                      (values nil :time-too-old)
+                      (validate-block block chain-state utxo-set height now
+                                      :skip-scripts skip-scripts
+                                      ;; Header (PoW/difficulty/MTP/timewarp) was
+                                      ;; validated at index admission — Core's
+                                      ;; ConnectBlock doesn't re-check it.
+                                      :skip-header t))
                 (unless valid
                   (bitcoin-lisp:log-error
                    "REORG ABORTED at height ~D: fork block failed validation (~A). Rolling back to original chain."
