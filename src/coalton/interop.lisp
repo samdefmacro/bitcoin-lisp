@@ -2951,9 +2951,12 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
             (values t nil)
             (values nil :taproot-invalid-signature))))))
 
-(defun validate-taproot-script-path (witness output-pubkey32 amount)
+(defun validate-taproot-script-path (witness output-pubkey32 amount
+                                     &optional (full-witness witness))
   "Validate a Taproot script path spend.
    Witness format: [script-inputs...] <script> <control-block>
+   FULL-WITNESS is the witness stack before the annex was stripped; the BIP 342
+   validation weight budget is computed over it.
    Returns (values success error-keyword)."
   ;; Script path: witness has at least 2 elements (script + control block)
   (when (< (length witness) 2)
@@ -3011,8 +3014,12 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
                 ;; run-tapscript's unwind-protect to restore — racy
                 ;; across worker threads and a suspected cause of the
                 ;; intermittent h=67100-67105 tapscript bug (Task #22).
+                ;; The budget is GetSerializeSize(witness.stack)
+                ;; (interpreter.cpp:1979) — the annex, control block and script
+                ;; all still counted, because Core's pops are SpanPopBack on a
+                ;; view and never shrink the vector.
                 (let ((*tapscript-validation-weight-left*
-                        (+ (compute-witness-serialization-size witness)
+                        (+ (compute-witness-serialization-size full-witness)
                            +validation-weight-offset+)))
                   ;; 4. Execute the Tapscript with witness inputs as stack
                   (run-tapscript script script-inputs leaf-hash amount internal-pubkey)))
@@ -3030,21 +3037,23 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
     (return-from validate-taproot (values nil :witness-program-witness-empty)))
 
   ;; Check for annex (BIP 341: a final witness element starting with 0x50,
-  ;; present only when the stack has >1 element). Strip it from the witness
-  ;; but keep it: it is committed to the sighash (spend_type bit 0 +
-  ;; sha256(ser_string(annex))) via *current-annex*.
-  (let ((annex nil)
-        (maybe-annex (car (last witness))))
-    (when (and (plusp (length maybe-annex))
-               (= (aref maybe-annex 0) #x50)
-               (> (length witness) 1))
-      (setf annex maybe-annex
-            witness (butlast witness)))
+  ;; present only when the stack has >1 element). It is dropped from the
+  ;; spending stack but kept: it is committed to the sighash (spend_type bit 0 +
+  ;; sha256(ser_string(annex))) via *current-annex*, and it still counts toward
+  ;; the tapscript validation weight budget. WITNESS itself must not be
+  ;; modified — Core pops from a span view over an untouched witness.stack
+  ;; (interpreter.cpp:1946-1968, span.h:73-81).
+  (let* ((last-item (car (last witness)))
+         (annex (when (and (> (length witness) 1)
+                           (plusp (length last-item))
+                           (= (aref last-item 0) #x50))
+                  last-item))
+         (stack (if annex (butlast witness) witness))
+         (*current-annex* annex))
     ;; Key path: single stack element. Script path: 2+ elements.
-    (let ((*current-annex* annex))
-      (if (= (length witness) 1)
-          (validate-taproot-key-path witness output-pubkey32 amount)
-          (validate-taproot-script-path witness output-pubkey32 amount)))))
+    (if (= (length stack) 1)
+        (validate-taproot-key-path stack output-pubkey32 amount)
+        (validate-taproot-script-path stack output-pubkey32 amount witness))))
 
 (defun valid-taproot-sighash-type-p (sighash-type)
   "Check if SIGHASH-TYPE is a valid Schnorr/Taproot sighash byte. Mirrors
