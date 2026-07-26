@@ -1357,19 +1357,22 @@ the P2P path (Core ProcessValidTx -> MempoolAcceptedTx,
 txdownloadman_impl.cpp:323-333): forget it as an orphan, relay it, and run
 the de-orphan cascade over the children waiting on it. PEER is the source,
 excluded from relay."
-  (let* ((txid (bitcoin-lisp.serialization:transaction-hash tx))
-         (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))
-         (entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
+  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+        (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
     ;; It may have been in our orphanage (announced by another peer, or held
     ;; while a parent was fetched); Core's EraseTx is a no-op otherwise.
     (bitcoin-lisp.mempool:orphan-remove
      (bitcoin-lisp.mempool:mempool-orphan-pool mempool) wtxid)
-    (when (and peers entry)
-      (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry))
-            (fee (bitcoin-lisp.mempool:mempool-entry-fee entry)))
-        (relay-transaction txid peer peers
-                           :fee-rate (if (plusp vsize) (floor fee vsize) 0)
-                           :wtxid wtxid)))
+    ;; The entry carries the fee and the sigop-adjusted vsize the feefilter
+    ;; gate needs; read it from the pool rather than threading it, so the
+    ;; package path (which has no entry in hand) shares this tail.
+    (let ((entry (and peers (bitcoin-lisp.mempool:mempool-get mempool txid))))
+      (when entry
+        (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry))
+              (fee (bitcoin-lisp.mempool:mempool-entry-fee entry)))
+          (relay-transaction txid peer peers
+                             :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                             :wtxid wtxid))))
     (process-orphans txid utxo-set mempool chain-state peers
                      :recent-rejects recent-rejects)))
 
@@ -1540,11 +1543,9 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                        (%try-1p1c-package peer tx utxo-set mempool chain-state
                                           peers recent-rejects)))))
                 (when valid
-                  (multiple-value-bind (result entry)
-                      (bitcoin-lisp.mempool:accept-validated-tx
-                       mempool txid tx fee current-height
-                       :sigops sigops :replaced replaced)
-                    (declare (ignore entry))
+                  (let ((result (bitcoin-lisp.mempool:accept-validated-tx
+                                 mempool txid tx fee current-height
+                                 :sigops sigops :replaced replaced)))
                     (cond
                       ((eq result :ok)
                        ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
