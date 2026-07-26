@@ -106,6 +106,10 @@
   :description "Tests for signature operations cost validation (BIP 141)"
   :in :bitcoin-lisp-tests)
 
+(def-suite :intrablock-coins-tests
+  :description "Intra-block coin overlay: chained-spend scripts and same-block double spends"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :integration-tests
   :description "Integration tests with testnet"
   :in :bitcoin-lisp-tests)

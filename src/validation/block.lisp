@@ -597,12 +597,14 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
    testnet sync on modest hardware; bordeaux-threads imposes minimal
    overhead per spawn.")
 
-(defun validate-tx-scripts (tx tx-idx utxo-set script-flags height)
+(defun validate-tx-scripts (tx tx-idx utxo-set script-flags height &key extra-coins)
   "Validate all input scripts of a single transaction. Returns
-T on success or NIL on failure. Designed to be safe to call from
+T on success or NIL on failure. EXTRA-COINS is an optional (txid . index) ->
+utxo-entry table of coins created by earlier transactions in the same block,
+which are not in UTXO-SET yet. Designed to be safe to call from
 worker threads — binds all required specials locally."
   (let* ((tx-inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-         (spent-utxos (collect-spent-utxos tx-inputs utxo-set))
+         (spent-utxos (collect-spent-utxos tx-inputs utxo-set extra-coins))
          (bitcoin-lisp.coalton.interop:*script-flags* script-flags)
          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
            (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
@@ -610,39 +612,53 @@ worker threads — binds all required specials locally."
     (loop for input across tx-inputs
           for input-idx from 0
           for utxo = (and spent-utxos (aref spent-utxos input-idx))
-          when utxo
-            do (unless (validate-input-script tx input-idx utxo)
-                 ;; Re-run with debug to capture the preimage for the log line
-                 (let ((bitcoin-lisp.coalton.interop:*debug-bip341-sighash* t))
-                   (validate-input-script tx input-idx utxo))
-                 (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                        (wvec (bitcoin-lisp.serialization:transaction-witness tx))
-                        (witness (and wvec (aref wvec input-idx))))
-                   (bitcoin-lisp:log-warn
-                    "SCRIPT-FAILED: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D scriptpubkey=~A scriptsig=~A witness-items=~D witness=~A flags=~A"
-                    height tx-idx input-idx
-                    (bitcoin-lisp.crypto:bytes-to-hex
-                     (bitcoin-lisp.serialization:outpoint-hash prevout))
-                    (bitcoin-lisp.serialization:outpoint-index prevout)
-                    (bitcoin-lisp.crypto:bytes-to-hex
-                     (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
-                    (bitcoin-lisp.crypto:bytes-to-hex
-                     (bitcoin-lisp.serialization:tx-in-script-sig input))
-                    (length witness)
-                    (format nil "[~{~A~^,~}]"
-                            (mapcar #'bitcoin-lisp.crypto:bytes-to-hex witness))
-                    bitcoin-lisp.coalton.interop:*script-flags*))
-                 (return-from validate-tx-scripts nil))
+          do (unless utxo
+               ;; Core asserts the coin is present before verifying
+               ;; (CheckInputScripts, validation.cpp:2090). An unresolvable
+               ;; coin must fail the transaction, never skip its script:
+               ;; a skipped input is an unsigned spend.
+               (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+                 (bitcoin-lisp:log-warn
+                  "SCRIPT-MISSING-COIN: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D"
+                  height tx-idx input-idx
+                  (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.serialization:outpoint-hash prevout))
+                  (bitcoin-lisp.serialization:outpoint-index prevout)))
+               (return-from validate-tx-scripts nil))
+             (unless (validate-input-script tx input-idx utxo)
+               ;; Re-run with debug to capture the preimage for the log line
+               (let ((bitcoin-lisp.coalton.interop:*debug-bip341-sighash* t))
+                 (validate-input-script tx input-idx utxo))
+               (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                      (wvec (bitcoin-lisp.serialization:transaction-witness tx))
+                      (witness (and wvec (aref wvec input-idx))))
+                 (bitcoin-lisp:log-warn
+                  "SCRIPT-FAILED: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D scriptpubkey=~A scriptsig=~A witness-items=~D witness=~A flags=~A"
+                  height tx-idx input-idx
+                  (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.serialization:outpoint-hash prevout))
+                  (bitcoin-lisp.serialization:outpoint-index prevout)
+                  (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
+                  (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.serialization:tx-in-script-sig input))
+                  (length witness)
+                  (format nil "[~{~A~^,~}]"
+                          (mapcar #'bitcoin-lisp.crypto:bytes-to-hex witness))
+                  bitcoin-lisp.coalton.interop:*script-flags*))
+               (return-from validate-tx-scripts nil))
           finally (return t))))
 
-(defun validate-block-scripts-parallel (txs script-flags utxo-set height)
+(defun validate-block-scripts-parallel (txs script-flags utxo-set height &key extra-coins)
   "Validate all non-coinbase tx scripts in TXS across N worker threads.
 Returns T on success or NIL on the first script failure.
 
 Bitcoin Core uses CCheckQueue with a thread pool to do the same — every
 sig check is independent across inputs and txs, so this parallelizes
 cleanly. The shared sig-cache uses SBCL :synchronized hash-tables for
-safe concurrent access."
+safe concurrent access. EXTRA-COINS (the block's intra-block coin overlay)
+is read-only for the whole of this call and must already be complete when
+it is reached — the workers only ever GETHASH it."
   (let* ((non-coinbase (rest txs))
          (n-txs (length non-coinbase))
          (n-workers (min +parallel-validation-workers+ n-txs))
@@ -669,7 +685,8 @@ safe concurrent access."
                                        ;; original (rest transactions).
                                        (tx-idx (1+ i)))
                                    (unless (validate-tx-scripts tx tx-idx utxo-set
-                                                                script-flags height)
+                                                                script-flags height
+                                                                :extra-coins extra-coins)
                                      (bt:with-lock-held (failure-lock)
                                        (setf (car failure-flag) t))
                                      (return))))))
@@ -679,12 +696,16 @@ safe concurrent access."
       (bt:join-thread th))
     (not (car failure-flag))))
 
-(defun validate-block-scripts (block utxo-set &key (height 0))
+(defun validate-block-scripts (block utxo-set &key (height 0) extra-coins)
   "Validate all non-coinbase transaction scripts in BLOCK via Coalton interop.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
 Uses validate-input-script for each input (shared with transaction validation).
 Blocks matching BIP 16 exception hashes skip all script validation.
-HEIGHT is used to determine which script verification flags to enable."
+HEIGHT is used to determine which script verification flags to enable.
+EXTRA-COINS is the block's intra-block coin overlay — the outputs created by
+its own earlier transactions, which the confirmed UTXO set does not hold.
+Core has already applied them to its coins view by the time it script-checks
+a chained spend (UpdateCoins, validation.cpp:2597)."
   ;; Check for BIP 16 exception block - skip ALL script validation
   (when (block-is-bip16-exception-p block)
     (return-from validate-block-scripts (values t nil)))
@@ -708,7 +729,8 @@ HEIGHT is used to determine which script verification flags to enable."
     (if (and bitcoin-lisp:*parallel-block-validation*
              (>= (length (rest transactions)) +parallel-validation-min-txs+)
              (> +parallel-validation-workers+ 1))
-        (if (validate-block-scripts-parallel transactions script-flags utxo-set height)
+        (if (validate-block-scripts-parallel transactions script-flags utxo-set height
+                                             :extra-coins extra-coins)
             (values t nil)
             (values nil :script-failed))
         ;; Sequential fallback (kept verbatim from the pre-Phase-3 path).
@@ -716,7 +738,8 @@ HEIGHT is used to determine which script verification flags to enable."
           (loop for tx in (rest transactions)
                 for tx-idx from 1
                 do (unless (validate-tx-scripts tx tx-idx utxo-set
-                                                script-flags height)
+                                                script-flags height
+                                                :extra-coins extra-coins)
                      (return-from validate-block-scripts
                        (values nil :script-failed))))
           (values t nil)))))
@@ -1235,6 +1258,14 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
     (let* ((total-fees (wrap-satoshi 0))
            (total-sigops-cost 0)
            (pending-utxos (make-hash-table :test 'equalp))
+           ;; Outpoints an earlier transaction of this block already consumed.
+           ;; Core spends them out of its per-block coins view (UpdateCoins,
+           ;; validation.cpp:1996-2008), so HaveInputs then fails for a second
+           ;; spender; our view is read-only for the whole block, so the
+           ;; consumed set is tracked alongside the created one. Coin data
+           ;; stays in PENDING-UTXOS after the spend — sigop counting and
+           ;; script validation still need the spender's own prevouts.
+           (spent-outpoints (make-hash-table :test 'equalp))
            ;; Gate P2SH/witness sigop counting on the block's active flags,
            ;; exactly as Bitcoin Core passes GetBlockScriptFlags into
            ;; GetTransactionSigOpCost. Same source of truth as script validation.
@@ -1272,7 +1303,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
         (loop for tx in (rest transactions)
               do (multiple-value-bind (valid error fee)
                      (validate-transaction-contextual tx utxo-set current-height
-                                                      :pending-utxos pending-utxos)
+                                                      :pending-utxos pending-utxos
+                                                      :spent-outpoints spent-outpoints)
                    (unless valid
                      (return-from validate-block (values nil error nil)))
                    ;; fee is now a Satoshi type, use typed addition
@@ -1285,7 +1317,17 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                  (when (> total-sigops-cost +max-block-sigops-cost+)
                    (return-from validate-block
                      (values nil :too-many-sigops nil)))
-                 ;; Add this transaction's outputs to pending for subsequent txs
+                 ;; Core's UpdateCoins order (validation.cpp:1996-2008): mark
+                 ;; this transaction's inputs spent, THEN add its outputs. Only
+                 ;; non-coinbase transactions reach here, so the coinbase's null
+                 ;; prevout is never marked (Core's `if (!tx.IsCoinBase())`).
+                 (bitcoin-lisp.serialization:dovector
+                     (input (bitcoin-lisp.serialization:transaction-inputs tx))
+                   (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+                     (setf (gethash (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
+                                          (bitcoin-lisp.serialization:outpoint-index prevout))
+                                    spent-outpoints)
+                           t)))
                  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
                    (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
                          for idx from 0
@@ -1320,7 +1362,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
       ;; Skip during IBD for blocks below the last checkpoint (performance optimization)
       (unless skip-scripts
         (multiple-value-bind (valid error)
-            (validate-block-scripts block utxo-set :height current-height)
+            (validate-block-scripts block utxo-set :height current-height
+                                                   :extra-coins pending-utxos)
           (unless valid
             (return-from validate-block (values nil error nil)))))
 
