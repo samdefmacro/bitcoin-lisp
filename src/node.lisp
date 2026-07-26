@@ -337,6 +337,63 @@ testnet4 (its genesis coinbase differs; Core kernel/chainparams.cpp:367-379)."
   (bitcoin-lisp.serialization:bitcoin-block-header
    (bitcoin-lisp.storage:make-genesis-block network)))
 
+;;;; Process entropy
+
+(defconstant +random-seed-bytes+ 32
+  "Bytes of OS entropy folded into the process CL:*RANDOM-STATE* seed.
+Matches the 256-bit seed Core's FastRandomContext takes from GetRandHash().")
+
+(defvar *random-state-seed* nil
+  "The integer seed most recently installed into CL:*RANDOM-STATE* by
+SEED-GLOBAL-RANDOM-STATE, NIL while the process is still running on SBCL's
+build-time state. Recorded so startup (and a test) can tell 'seeded' from
+'never seeded' — the two are indistinguishable by looking at draws.")
+
+(defun %os-entropy-seed ()
+  "+RANDOM-SEED-BYTES+ bytes from the OS CSPRNG as a positive integer.
+IRONCLAD:*PRNG* is the OS PRNG (getrandom(2) / /dev/urandom), so two processes
+started a microsecond apart get unrelated seeds. Falls back to a clock-derived
+mix only if the OS source is unreachable: much weaker, but still not the
+build-time constant, which is the property that matters here."
+  (handler-case
+      (ironclad:octets-to-integer (ironclad:random-data +random-seed-bytes+))
+    (error (e)
+      (log-warn "OS entropy source unavailable (~A); seeding the RNG from the clock" e)
+      ;; SBCL's (make-random-state t) mixes sub-second time, so two starts in
+      ;; the same second still diverge; the wall clock widens the seed.
+      (logxor (random (expt 2 62) (make-random-state t))
+              (ash (get-universal-time) 32)))))
+
+(defun seed-global-random-state ()
+  "Replace the process-global CL:*RANDOM-STATE* with one seeded from OS
+entropy; return the seed.
+
+SBCL's *random-state* is part of the saved core: it is IDENTICAL in every fresh
+image (verified on 2.6.5 — `(random 1000000)` is 113500 on the first draw of
+every run), because SBCL seeds it at build time rather than from the OS. A node
+that never re-seeds therefore replays one fixed sequence on every start, and
+every draw whose entire value is unpredictability becomes a stable fingerprint:
+addr-relay Poisson timers and the initial-broadcast jitter
+(networking/protocol.lisp), addrman's new/tried selection and its GetAddr
+shuffle (networking/addrman.lisp), the sendtxrcncl salt and ping nonces
+(networking/peer.lisp), the VERSION nonce (serialization/messages.lisp). Core
+draws all of these from OS-seeded contexts — FastRandomContext (net.cpp:3728,
+random.h:394) and PeerManagerImpl::m_rng (net_processing.cpp:2009), which is
+deterministic only under the test-only `deterministic_rng` option.
+
+Assigns the GLOBAL value deliberately: SBCL threads read the global binding of
+*random-state* (they do not inherit the starter thread's dynamic bindings), and
+the peers that draw the jitter above run on their own threads. Tests that need
+a reproducible stream bind *random-state* around their own code — the
+assignment then lands on that binding and leaves the global alone."
+  (let ((seed (%os-entropy-seed)))
+    (setf *random-state* (sb-ext:seed-random-state seed)
+          *random-state-seed* seed)
+    ;; Never log the seed itself: it predicts every subsequent draw. (The
+    ;; message stays source-neutral — the fallback above logs its own warning.)
+    (log-debug "Seeded *random-state* with a ~D-byte seed" +random-seed-bytes+)
+    seed))
+
 ;;;; Startup Sequence
 
 (defun init-node (data-directory &key (network :testnet3) (log-level :info))
@@ -346,6 +403,12 @@ For testnet, data stays at the base directory (backward compatible)."
   ;; Validate network parameter
   (unless (member network '(:testnet3 :testnet4 :signet :regtest :mainnet))
     (error "Invalid network: ~A. Must be :testnet3, :testnet4, :signet, :regtest, or :mainnet." network))
+
+  ;; Re-seed the process RNG here, at the head of the only startup path
+  ;; (start-node calls init-node before it builds the address book, opens the
+  ;; listener or dials a peer), so nothing draws from SBCL's build-time
+  ;; sequence. See SEED-GLOBAL-RANDOM-STATE for what depends on this.
+  (seed-global-random-state)
 
   ;; Set global network variable
   (setf *network* network)
@@ -961,6 +1024,135 @@ before crash-recovery resolution (a torn snapshot flush joins
                        base-height)
              snap)))))))
 
+;;;; Shutdown coordination (Core's StartShutdown / WaitForShutdown split)
+;;;;
+;;;; Every internal stop path — the `stop` RPC, -stopatheight, the low-disk
+;;;; abort, a snapshot that fails background validation — runs on a NON-main
+;;;; thread, while the supervisor's watchdog runs on the main thread and exits
+;;;; the process shortly after it sees the node stop running. Calling stop-node
+;;;; from those threads is therefore a race with the process exit: stop-node
+;;;; clears node-running FIRST and does the chainstate flush, mempool.dat,
+;;;; peers.dat, banlist and wallet best-block markers AFTER, and sb-ext:exit
+;;;; unwinds other threads without waiting for them. At an idle tip the whole
+;;;; sequence takes about as long as one watchdog tick (a coin flip); mid-block,
+;;;; or with a large dirty coins cache, the kill is certain.
+;;;;
+;;;; Core has exactly this split: StartShutdown() only sets a token
+;;;; (shutdown/shutdown.cpp), the main thread's WaitForShutdown() returns, and
+;;;; Shutdown() then runs the entire teardown on the MAIN thread
+;;;; (bitcoind.cpp:180-193). We mirror it: internal paths call
+;;;; request-node-shutdown, run-node-watchdog (the main thread) runs stop-node
+;;;; itself and only exits once *shutdown-complete* is set — stop-node's final
+;;;; act.
+
+(defconstant +node-exit-clean+ 0
+  "Process exit code for a deliberate, completed stop (`stop` RPC, SIGTERM,
+-stopatheight). The supervisor must NOT respawn on this.")
+
+(defconstant +node-exit-error+ 1
+  "Process exit code for a deterministic failure (bad config, unrecoverable
+chainstate, disk space): respawning immediately just spins on it.")
+
+(defconstant +node-exit-watchdog+ 7
+  "Process exit code when the node stopped running without being asked to
+(fatal snapshot, crashed sync thread): the supervisor should respawn.")
+
+(defvar *shutdown-request* nil
+  "NIL, or the pending shutdown request as (REASON . EXIT-CODE). Written
+exactly once per run by request-node-shutdown, via CAS rather than a lock so
+it is safe to call from a signal handler (a lock could deadlock against the
+thread the signal interrupted). One cell, so a reader never sees a reason
+without its exit code.")
+
+(defvar *shutdown-complete* nil
+  "Set by stop-node as its FINAL act, after the chainstate flush, mempool.dat,
+peers.dat, banlist and wallet markers are on disk. The watchdog waits for this
+before exiting the process; a concurrent stop-node caller waits on it too.")
+
+(defvar *stop-node-in-progress* nil
+  "CAS latch: T while one thread is inside stop-node's teardown. stop-node is
+otherwise not concurrent-safe — two overlapping runs would both drive
+%flush-chainstate through the same fixed chainstate.dat.tmp path and
+double-close the same LevelDB handles.")
+
+(defvar *shutdown-watchdog-running* nil
+  "T while run-node-watchdog polls on the main thread. Read from other threads,
+so it is SETF on the global (a LET binding would be invisible to them).")
+
+(defun request-node-shutdown (reason &key (exit-code +node-exit-clean+))
+  "Ask the node to shut down; the MAIN thread does the actual work (Core
+StartShutdown). REASON is logged; EXIT-CODE is what the supervisor will see
+(+node-exit-clean+ / -error+ / -watchdog+). Returns T if this call registered
+the request, NIL if a shutdown was already pending (first caller wins).
+
+Without a main-thread watchdog — a REPL or embedded use of start-node — nobody
+would ever run stop-node, so this falls back to the historical behaviour of
+running it on a throwaway thread. That is safe there precisely because nothing
+is about to exit the process out from under it."
+  (let* ((reason (or reason "shutdown requested"))
+         (registered (null (sb-ext:cas (symbol-value '*shutdown-request*)
+                                       nil (cons reason exit-code)))))
+    (when registered
+      (log-info "Shutdown requested: ~A (exit code ~D)" reason exit-code)
+      (unless *shutdown-watchdog-running*
+        (bt:make-thread (lambda () (ignore-errors (stop-node)))
+                        :name "node-shutdown")))
+    registered))
+
+(defun node-shutdown-requested-p ()
+  "The reason a shutdown was requested, or NIL (Core ShutdownRequested)."
+  (car *shutdown-request*))
+
+(defun wait-for-shutdown-complete (&key (timeout 900))
+  "Block until stop-node's *shutdown-complete* latch is set, or TIMEOUT
+seconds pass. Returns T iff the shutdown completed. The default outlasts
+stop-node's own 600s sync-thread join."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* timeout internal-time-units-per-second))))
+    (loop until *shutdown-complete*
+          while (< (get-internal-real-time) deadline)
+          do (sleep 0.05))
+    (and *shutdown-complete* t)))
+
+(defun %pending-shutdown-exit-code ()
+  "The exit code the supervisor should see, or NIL while the node should keep
+running. A node that stopped running without a request was not asked to stop
+(fatal snapshot, dead sync thread) — that is the respawn case."
+  (cond ((cdr *shutdown-request*))
+        ((or (null *node*) (not (node-running *node*))) +node-exit-watchdog+)
+        (t nil)))
+
+(defun run-node-watchdog (&key (poll-seconds 1) (exit t))
+  "Main-thread shutdown watchdog, the last form the supervisor launcher
+evaluates (scripts/run-node.sh). Blocks until a shutdown is requested or the
+node stops running, runs stop-node ON THIS THREAD — so the whole
+flush/mempool.dat/peers.dat/banlist/wallet sequence completes before anything
+exits — and then exits with a code the supervisor discriminates on:
+
+  0  deliberate, completed stop (`stop` RPC, SIGTERM, -stopatheight): stay down
+  1  deterministic failure (config, disk): back off, do not spin
+  7  the node died unasked, or crashed: respawn
+
+With EXIT NIL it returns the code instead of exiting (tests)."
+  ;; SETF, not LET: the internal stop paths run on other threads and read the
+  ;; GLOBAL value to decide whether anyone will run stop-node for them.
+  (setf *shutdown-watchdog-running* t)
+  (unwind-protect
+       (loop
+         (let ((code (%pending-shutdown-exit-code)))
+           (when code
+             (log-info "Shutdown watchdog: ~A — stopping node (exit code ~D)"
+                       (or (node-shutdown-requested-p) "node is no longer running")
+                       code)
+             (ignore-errors (stop-node))
+             (unless *shutdown-complete*
+               (log-warn "Shutdown did not complete cleanly; exiting anyway"))
+             (if exit
+                 (sb-ext:exit :code code :timeout 5)
+                 (return code))))
+         (sleep poll-seconds))
+    (setf *shutdown-watchdog-running* nil)))
+
 ;;;; --- Assumeutxo P5: background-validation completion + promotion --------
 ;;;;
 ;;;; When the historical (validated-from-genesis) chainstate finishes
@@ -987,12 +1179,16 @@ from-snapshot-blockhash), regardless of its assumeutxo status, or NIL."
 GetNotifications().fatalError): log the error and request node shutdown. The
 invalid snapshot chainstate dir was already renamed aside for forensics; on
 the next restart the node resumes normal IBD from the validated chain. Runs
-on the sync thread, so it only flips node-running (letting the loops wind
-themselves down) rather than joining threads via stop-node."
+on the sync thread, so it flips node-running (letting the loops wind
+themselves down) and REQUESTS the shutdown rather than joining threads via
+stop-node itself — the main thread runs the teardown, and the restart-worthy
+exit code tells the supervisor to respawn."
   (log-error "[snapshot] !!! ~A" message)
   (log-error "[snapshot] the node will shut down and stop using any state built on the snapshot")
   (when *node*
-    (setf (node-running *node*) nil)))
+    (setf (node-running *node*) nil)
+    (request-node-shutdown "assumeutxo snapshot failed background validation"
+                           :exit-code +node-exit-watchdog+)))
 
 (defvar *snapshot-fatal-hook* '%default-snapshot-fatal
   "Funcalled with a message string when an assumeutxo snapshot fails
@@ -1212,26 +1408,125 @@ post-promotion index rebind."
                   (log-info "Block filter index: height ~D (~,1F%)" h pct)))))
         (log-info "Block filter index build complete: ~D block~:P indexed" n)))))
 
+;;; coinstatsindex rewind (Core BaseIndex::Rewind, index/base.cpp:239/290)
+;;;
+;;; coinstats records are keyed by HEIGHT with no block hash, there is no
+;;; disconnect hook, and index writes reach the OS immediately while the
+;;; chainstate tip only becomes durable at a flush (600s / N blocks / cache
+;;; size — and a reorg does not trigger one). So a process kill inside that
+;;; window leaves records holding an ABANDONED chain's state at heights at or
+;;; below the tip that startup restores. The repair loop this replaces blessed
+;;; any record it found at height <= tip and overwrote the stored meta hash,
+;;; destroying the one piece of evidence that could have detected the
+;;; divergence; every later query then served abandoned-chain numbers labelled
+;;; with the active chain's hash. Core defends this with a per-record block
+;;; hash it re-checks in RevertBlock; we recover the same guarantee at startup.
+
+(defconstant +coinstatsindex-max-rewind+ 1000
+  "How far back the coinstats rewind will verify records by recomputation
+before giving up and rebuilding from genesis. Far deeper than any plausible
+reorg; the cheap header-index walk is tried first and has no such bound.")
+
+(defun %coinstatsindex-fork-height (cs best-hash)
+  "The height of the last block common to the active chain and the branch
+BEST-HASH sits on (Core walks pprev in Rewind / FindForkInGlobalIndex). NIL
+when the header index does not know BEST-HASH — headers are only persisted at
+flush time, so the crash that produces a stale marker can also lose the branch
+it names — or when the two chains do not actually meet."
+  (let* ((stale (bitcoin-lisp.storage:get-block-index-entry cs best-hash))
+         (tip (and stale (bitcoin-lisp.storage:get-block-index-entry
+                          cs (bitcoin-lisp.storage:best-block-hash cs))))
+         (fork (and tip (bitcoin-lisp.validation:find-fork-point stale tip))))
+    ;; find-fork-point returns wherever its first walk stopped if the chains
+    ;; never meet (a broken prev-entry link), so confirm the answer really is
+    ;; on the active chain rather than trusting a fail-open result.
+    (when (and fork (bitcoin-lisp.storage:entry-on-active-chain-p cs fork))
+      (bitcoin-lisp.storage:block-index-entry-height fork))))
+
+(defun %coinstatsindex-verified-height (node from)
+  "The highest height at or below FROM whose stored record provably belongs to
+the ACTIVE chain, found by recomputing it from its stored parent and the active
+block at that height (see coinstatsindex-record-matches-block-p). This is the
+fallback for when the header index cannot resolve the fork point, and it is
+what keeps an ordinary unclean shutdown — index a few blocks ahead of the last
+flushed tip, same chain — from costing a rebuild from genesis: the record at
+the restored tip verifies on the first try. NIL if nothing verifies within
++coinstatsindex-max-rewind+."
+  (let ((csi (node-coinstatsindex node))
+        (cs (node-validated-chainstate node))
+        (store (node-block-store node)))
+    (loop for h from from downto (max 0 (- from +coinstatsindex-max-rewind+))
+          do (when (zerop h)
+               ;; Genesis is on every chain; its record is synthesized, not
+               ;; folded from a parent, so presence is the whole check.
+               (return (and (bitcoin-lisp.storage:coinstatsindex-get-stats csi 0) 0)))
+             (let* ((entry (bitcoin-lisp.storage:get-block-at-height cs h))
+                    (hash (and entry (bitcoin-lisp.storage:block-index-entry-hash entry)))
+                    (block (and hash (bitcoin-lisp.storage:get-block store hash))))
+               (when (and block
+                          (bitcoin-lisp.storage:coinstatsindex-record-matches-block-p
+                           csi block hash h
+                           (bitcoin-lisp.validation:get-undo-data hash)
+                           (bitcoin-lisp.validation:calculate-block-subsidy h)))
+                 (return h))))))
+
+(defun %rewind-coinstatsindex (node)
+  "Make the coinstats index's best marker name a block on the ACTIVE chain
+before anything backfills on top of it, moving it back to the last common
+ancestor when it does not (Core BaseIndex::Rewind). Records above the new best
+are then rewritten by the backfill.
+
+Returns NIL when the index was already consistent — the common case, and it
+costs one hash comparison: a rewind that always rebuilt would be a severe
+performance regression. Otherwise returns the height rewound to, or -1 when no
+trustworthy record could be identified and the index must be rebuilt."
+  (let* ((csi (node-coinstatsindex node))
+         (cs (node-validated-chainstate node))
+         (tip (bitcoin-lisp.storage:current-height cs)))
+    (multiple-value-bind (best-height best-hash)
+        (bitcoin-lisp.storage:coinstatsindex-best csi)
+      (when (minusp best-height)
+        (return-from %rewind-coinstatsindex nil))
+      (let ((active (and (<= best-height tip)
+                         (bitcoin-lisp.storage:get-block-at-height cs best-height))))
+        (when (and active best-hash
+                   (equalp (bitcoin-lisp.storage:block-index-entry-hash active) best-hash))
+          (return-from %rewind-coinstatsindex nil)))
+      (log-warn "Coinstats index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
+                best-height
+                (if best-hash (bitcoin-lisp.crypto:bytes-to-hex best-hash) "no hash")
+                tip)
+      (let* ((fork (and best-hash (%coinstatsindex-fork-height cs best-hash)))
+             (target (or (and fork
+                              (<= fork tip)
+                              (bitcoin-lisp.storage:coinstatsindex-get-stats csi fork)
+                              fork)
+                         (%coinstatsindex-verified-height node (min best-height tip))))
+             (entry (and target (bitcoin-lisp.storage:get-block-at-height cs target))))
+        (cond
+          (entry
+           (log-warn "Coinstats index rewound to height ~D (~A records above it will be rebuilt)"
+                     target (- tip target))
+           (bitcoin-lisp.storage:coinstatsindex-set-best
+            csi target (bitcoin-lisp.storage:block-index-entry-hash entry))
+           target)
+          (t
+           (log-warn "Coinstats index: no record below height ~D could be tied to the active chain; rebuilding from genesis"
+                     (min best-height tip))
+           (bitcoin-lisp.storage:coinstatsindex-clear-best csi)
+           -1))))))
+
 (defun %catch-up-coinstatsindex (node)
   "Catch the coinstats index up to the node's validated chainstate tip. Its
 running MuHash must be contiguous from genesis, so a pruned node (missing
 early undo data) can only build it if its stored history reaches genesis —
-otherwise the backfill stops at the first gap. Repairs a best marker left
-above the tip, then backfills. Shared by startup and the post-promotion index
-rebind."
+otherwise the backfill stops at the first gap. Rewinds a best marker that is
+not on the active chain (including one left above the tip) before backfilling.
+Shared by startup and the post-promotion index rebind."
   (let* ((csi (node-coinstatsindex node))
          (cs (node-validated-chainstate node))
          (tip (bitcoin-lisp.storage:current-height cs)))
-    (when (> (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
-      (log-warn "Coinstats index best above tip (~D > ~D); repairing"
-                (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
-      (loop for h from tip downto 0
-            when (bitcoin-lisp.storage:coinstatsindex-get-stats csi h)
-              do (bitcoin-lisp.storage:coinstatsindex-set-best
-                  csi h (bitcoin-lisp.storage:block-index-entry-hash
-                         (bitcoin-lisp.storage:get-block-at-height cs h)))
-                 (return)
-            finally (bitcoin-lisp.storage:coinstatsindex-clear-best csi)))
+    (%rewind-coinstatsindex node)
     (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
       (log-info "Building coinstats index to height ~D..." tip)
       (let ((n (bitcoin-lisp.storage:build-coinstatsindex
@@ -1261,7 +1556,7 @@ index is enabled."
 ;;; -stopatheight / disk-space / periodic peers.dat dump support
 
 (defvar *stop-at-height-triggered* nil
-  "Once-only latch for -stopatheight so the shutdown thread spawns once.")
+  "Once-only latch for -stopatheight so the shutdown request is made once.")
 
 (defvar *disk-space-abort-triggered* nil
   "Once-only latch for the low-disk-space abort at flush points.")
@@ -1277,8 +1572,10 @@ minutes, net.cpp:63, scheduled at net.cpp:3560).")
   "Request a node shutdown once HEIGHT reaches -stopatheight (Core
 KernelNotifications::blockTip, node/kernel_notifications.cpp:61-66). Called
 from connect-block on every ACTIVE-chainstate tip advance; a background
-(targeted) chainstate never triggers it. Shutdown runs on its own thread —
-stop-node joins the sync thread, which is usually the caller here."
+(targeted) chainstate never triggers it. Only REQUESTS the shutdown: the main
+thread runs stop-node (which joins the sync thread — usually the caller here),
+and the clean exit code stops the supervisor from respawning straight back
+into the same trigger."
   (when (and (plusp *stop-at-height*)
              (>= height *stop-at-height*)
              (not *stop-at-height-triggered*)
@@ -1286,8 +1583,8 @@ stop-node joins the sync thread, which is usually the caller here."
              (node-running *node*))
     (setf *stop-at-height-triggered* t)
     (log-info "Reached stopatheight=~D — requesting shutdown" *stop-at-height*)
-    (bt:make-thread (lambda () (ignore-errors (stop-node)))
-                    :name "stopatheight-shutdown")
+    (request-node-shutdown (format nil "-stopatheight=~D reached" *stop-at-height*)
+                           :exit-code +node-exit-clean+)
     t))
 
 (defun check-disk-space (directory &optional (additional-bytes 0))
@@ -1315,12 +1612,13 @@ node into shutdown."
 (defun %abort-on-low-disk-space (label)
   "Log + request shutdown once when free disk space is below the floor
 (Core FlushStateToDisk's CheckDiskSpace failure -> FatalError \"Disk space
-is too low!\", validation.cpp:2775/2808)."
+is too low!\", validation.cpp:2775/2808). Exits non-clean: respawning into a
+full disk just reproduces the abort, so the supervisor backs off instead."
   (log-error "~A flush: Disk space is too low!" label)
   (unless *disk-space-abort-triggered*
     (setf *disk-space-abort-triggered* t)
-    (bt:make-thread (lambda () (ignore-errors (stop-node)))
-                    :name "disk-space-shutdown")))
+    (request-node-shutdown "disk space is too low"
+                           :exit-code +node-exit-error+)))
 
 (defun maybe-dump-peer-addresses (node)
   "Dump the address book to peers.dat when the 15-minute cadence elapses
@@ -1502,6 +1800,12 @@ Returns the node instance."
   ;; -stopatheight: re-arm the once-only shutdown trigger for this run.
   (setf *stop-at-height-triggered* nil
         *disk-space-abort-triggered* nil)
+  ;; Re-arm the shutdown coordination latches: a previous run in the same
+  ;; image (tests, an in-REPL restart) leaves them set, and a pre-set
+  ;; *shutdown-request* would make the watchdog stop this run immediately.
+  (setf *shutdown-request* nil
+        *shutdown-complete* nil
+        *stop-node-in-progress* nil)
   ;; Periodic peers.dat dump baseline (first dump 15 min from now).
   (setf *last-peers-dump-time* (get-universal-time))
   (setf *current-log-level* log-level)
@@ -1991,6 +2295,21 @@ Returns the node instance."
                                           (bitcoin-lisp.networking:maybe-advertise-local-address
                                            (node-peers *node*)
                                            (node-chain-state *node*))
+                                          ;; BIP133 feefilter refresh (Core
+                                          ;; MaybeSendFeefilter on the message
+                                          ;; loop): per-peer ~10min Poisson
+                                          ;; schedule inside, so this is a
+                                          ;; cheap no-op most ticks. Runs on
+                                          ;; the sync thread, which is why
+                                          ;; its RNG use is safe.
+                                          (let ((cs (node-chain-state *node*))
+                                                (mp (node-mempool *node*))
+                                                (now (bitcoin-lisp.serialization:get-unix-time)))
+                                            (dolist (p (node-peers *node*))
+                                              (when (eq (bitcoin-lisp.networking:peer-state p) :ready)
+                                                (ignore-errors
+                                                 (bitcoin-lisp.networking:maybe-send-feefilter
+                                                  p mp cs now)))))
                                           ;; New headers announced: start the
                                           ;; next sync cycle now to fetch the
                                           ;; block instead of waiting out the
@@ -2647,19 +2966,30 @@ hook (Core removeUnchecked, txmempool.cpp:269-275)."
           (lambda (&rest _)
             (declare (ignore _))
             (format *error-output* "~&[shutdown] caught signal — saving state~%")
-            (ignore-errors (stop-node))
-            ;; Per-block script-check worker threads (bt:make-thread :name
-            ;; "script-check-N" in validate-block.lisp) are non-daemon and
-            ;; can outlive stop-node if validation was in progress when the
-            ;; sync thread was destroyed. Without a timeout, sb-ext:exit
-            ;; blocks forever waiting for them (incident 2026-05-11: node
-            ;; logged "Node stopped" but SBCL process hung 6+ minutes,
-            ;; eventually needed SIGKILL). Give 5 seconds for any in-flight
-            ;; worker to finish naturally, then force-exit. Bitcoin Core's
-            ;; CCheckQueue (checkqueue.h:206-225) has an explicit stop flag
-            ;; + condvar to join workers; we use a coarser timeout because
-            ;; our workers are ephemeral per-block, not a persistent pool.
-            (sb-ext:exit :code 0 :timeout 5))))
+            ;; Under the supervisor (a main-thread watchdog is polling), only
+            ;; REQUEST the stop. The kernel delivers the signal to whichever
+            ;; thread it likes, and running the teardown here would race the
+            ;; watchdog's exit exactly like the other internal stop paths did —
+            ;; SIGTERM only survived that race by delivery luck. The watchdog
+            ;; runs stop-node and exits 0 itself.
+            (if *shutdown-watchdog-running*
+                (request-node-shutdown "SIGTERM/SIGINT" :exit-code +node-exit-clean+)
+                ;; No watchdog (REPL / embedded): nobody else would stop the
+                ;; node, so do it here and exit as before.
+                (progn
+                  (ignore-errors (stop-node))
+                  ;; Per-block script-check worker threads (bt:make-thread :name
+                  ;; "script-check-N" in validate-block.lisp) are non-daemon and
+                  ;; can outlive stop-node if validation was in progress when the
+                  ;; sync thread was destroyed. Without a timeout, sb-ext:exit
+                  ;; blocks forever waiting for them (incident 2026-05-11: node
+                  ;; logged "Node stopped" but SBCL process hung 6+ minutes,
+                  ;; eventually needed SIGKILL). Give 5 seconds for any in-flight
+                  ;; worker to finish naturally, then force-exit. Bitcoin Core's
+                  ;; CCheckQueue (checkqueue.h:206-225) has an explicit stop flag
+                  ;; + condvar to join workers; we use a coarser timeout because
+                  ;; our workers are ephemeral per-block, not a persistent pool.
+                  (sb-ext:exit :code 0 :timeout 5))))))
     (sb-sys:enable-interrupt sb-unix:sigterm handler)
     (sb-sys:enable-interrupt sb-unix:sigint handler))
   ;; SIGUSR1 toggles sb-sprof profiling. First USR1: start sampling. Second
@@ -2726,10 +3056,33 @@ Phase 1."
     (bitcoin-lisp.storage:close-chainstate-coins-view cs)))
 
 (defun stop-node ()
-  "Stop the running Bitcoin node."
+  "Stop the running Bitcoin node: the full teardown, ending with the
+*shutdown-complete* latch. Returns T when this call performed the teardown.
+
+Concurrency: the FIRST caller owns the shutdown. A second, overlapping call
+does not run the teardown again — two runs would drive %flush-chainstate
+through the same fixed chainstate.dat.tmp path (storage/utxo.lisp) and
+double-close the same LevelDB handles — it waits for the owner to finish and
+returns NIL. Prefer request-node-shutdown from anything that is not the main
+thread; see the shutdown-coordination section above."
   (unless *node*
     (return-from stop-node nil))
+  ;; CAS rather than a lock: reachable from the SIGTERM handler, which runs in
+  ;; whichever thread the signal interrupted.
+  (unless (null (sb-ext:cas (symbol-value '*stop-node-in-progress*) nil t))
+    (log-info "Shutdown already in progress on another thread; waiting for it")
+    (wait-for-shutdown-complete)
+    (return-from stop-node nil))
+  (unwind-protect
+       (%stop-node)
+    ;; The latch is stop-node's FINAL act: the watchdog (and any concurrent
+    ;; caller) waits on it, so it must be set strictly after the flush,
+    ;; mempool.dat, peers.dat, banlist and wallet writes below — never before.
+    (setf *stop-node-in-progress* nil
+          *shutdown-complete* t)))
 
+(defun %stop-node ()
+  "stop-node's teardown proper; run by exactly one thread (see stop-node)."
   (log-info "Stopping node...")
 
   ;; Persist reconnection anchors while peers are still connected (before the
@@ -3009,10 +3362,10 @@ candidates."
                   (length *pending-anchor-addresses*))))))
 
 (defun %reachable-seed-addresses (addresses)
-  "Keep only the seed-derived ADDRESSES (strings) whose network -onlynet still
-permits dialing.
+  "Keep only the seed-derived ADDRESSES (strings) we may actually dial.
 
-Seed lists — DNS-seed results and the hardcoded fixed seeds — are clearnet by
+An address LITERAL survives when -onlynet still permits its network. Seed
+lists — DNS-seed results and the hardcoded fixed seeds — are clearnet by
 construction, so under -onlynet=onion (or cjdns-only) dialing them is a direct
 deanonymizing clearnet TCP connection. Core never hits this because seeds go
 into addrman and every dial candidate is filtered by g_reachable_nets at
@@ -3020,14 +3373,39 @@ selection time (ThreadOpenConnections); we build the dial list directly, so the
 filter has to happen here. The addrman branch above is already filtered by
 select-dialable-address, and anchors by load-anchors.
 
+A candidate parse-network-address cannot classify is a HOSTNAME, and survives
+only when a SOCKS5 proxy is configured AND clearnet is reachable. Under -proxy
+discover-peers deliberately returns the seed hostnames UNRESOLVED (protocol.lisp)
+— resolving them locally would leak a plaintext DNS query outside the tunnel —
+and make-tcp-connection hands each one to the proxy inside the SOCKS5 CONNECT
+(ATYP DOMAINNAME, socks5.lisp) for the proxy to resolve. That mirrors Core's
+'if (HaveNameProxy()) AddAddrFetch(seed)' (net.cpp:2356-2357): a proxied seed
+stays dialable BY NAME. Dropping those unconditionally (this filter's behaviour
+as first written, PR #306) left a proxied node with a fresh datadir zero dial
+candidates on mainnet/signet/testnet3 — they have hostname DNS seeds and no
+fixed-seed list, so it could not bootstrap at all.
+
+The clearnet conjunct keeps the -onlynet privacy guarantee closed HERE, not
+merely upstream: a DNS seed answers with A/AAAA records, so a hostname
+candidate is a clearnet candidate however it gets resolved. It cannot cost a
+dial in any configuration apply-config-globals can produce, since an -onlynet
+excluding IPv4 and IPv6 already soft-sets -dnsseed=0 (config.lisp, Core
+init.cpp:835-844) so no hostname ever reaches this function, and with no proxy
+discover-peers emits IP literals only.
+
 Applies to SEED candidates only: manual -addnode/-connect targets are
-deliberately exempt from -onlynet, matching Core. An address whose network
-cannot be determined is dropped rather than dialed — under an active -onlynet
-restriction, an unclassifiable candidate is exactly what must not leak."
-  (remove-if-not (lambda (addr)
-                   (let ((net (bitcoin-lisp.networking:parse-network-address addr)))
-                     (and net (bitcoin-lisp.networking:reachable-network-p net))))
-                 addresses))
+deliberately exempt from -onlynet, matching Core."
+  (let ((name-proxy-p
+          (and bitcoin-lisp.networking:*proxy*
+               (or (bitcoin-lisp.networking:reachable-network-p :ipv4)
+                   (bitcoin-lisp.networking:reachable-network-p :ipv6))
+               t)))
+    (remove-if-not (lambda (addr)
+                     (let ((net (bitcoin-lisp.networking:parse-network-address addr)))
+                       (if net
+                           (bitcoin-lisp.networking:reachable-network-p net)
+                           name-proxy-p)))
+                   addresses)))
 
 (defun %record-outbound-result (address-book addr port peer success)
   "Record an outbound dial outcome for ADDR:PORT in ADDRESS-BOOK, adding the
@@ -3386,6 +3764,17 @@ node-peers stays single-writer. No-op when networking is disabled."
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
 
+(defun %mark-manual-peer (peer)
+  "Tag PEER as operator-pinned (-addnode / addnode onetry), i.e. Core's
+ConnectionType::MANUAL. Manual peers are exempt from every AUTOMATIC eviction:
+without this they are indistinguishable from ordinary :outbound-full-relay
+peers, and connect-added-nodes redials them on each ~30s maintenance tick, so
+any automatic disconnect would loop forever against a peer the operator chose.
+Returns PEER (NIL passes through when the dial failed)."
+  (when peer
+    (setf (bitcoin-lisp.networking:peer-manual peer) t))
+  peer)
+
 (defun connect-added-nodes (node)
   "Service addnode requests on the sync thread: drain one-shot \"onetry\" dials,
 then keep every \"add\" peer connected. Honors network-active."
@@ -3397,12 +3786,12 @@ then keep every \"add\" peer connected. Honors network-active."
       (dolist (spec onetry)
         (multiple-value-bind (host port) (parse-node-endpoint node spec)
           (unless (peer-connected-to-host-p node host)
-            (establish-outbound-peer node host port)))))
+            (%mark-manual-peer (establish-outbound-peer node host port))))))
     ;; Maintain persistent added-node connections.
     (dolist (spec (node-added-nodes node))
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
         (unless (peer-connected-to-host-p node host)
-          (establish-outbound-peer node host port))))))
+          (%mark-manual-peer (establish-outbound-peer node host port)))))))
 
 (defconstant +target-block-relay-peers+ 2
   "Dedicated block-relay-only outbound slots (Bitcoin Core opens 2). They carry
@@ -3484,11 +3873,35 @@ into 'tried'."
         (when ip
           (do-feeler-connection node ip (or port (network-port (node-network node)))))))))
 
+(defvar *last-chain-sync-check* 0
+  "Unix time of the last chain-sync eviction sweep. Node-scoped, NOT local to
+run-ibd: run-ibd is re-entered on every outer sync cycle, so a loop-local
+timestamp would reset each pass and the cadence would be meaningless.")
+
+(defconstant +extra-peer-check-interval-seconds+ 45
+  "Core EXTRA_PEER_CHECK_INTERVAL — cadence of the chain-sync sweep.")
+
+(defun consider-outbound-evictions (node)
+  "Chain-sync eviction sweep (Core ConsiderEviction, run once per SendMessages
+pass). Driven from here rather than from run-ibd's block-download loop, which
+does not run at tip — exactly where eclipse resistance matters."
+  (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+    (when (>= (- now *last-chain-sync-check*) +extra-peer-check-interval-seconds+)
+      (setf *last-chain-sync-check* now)
+      (let ((chain-state (node-current-chainstate node)))
+        (when chain-state
+          (dolist (peer (node-peers node))
+            (ignore-errors
+             (bitcoin-lisp.networking:consider-chain-sync-eviction
+              peer chain-state now))))))))
+
 (defun maintain-peers (node)
   "Run periodic peer maintenance: health checks, reconnection, dedicated
-block-relay-only slots, and an occasional feeler probe."
+block-relay-only slots, an occasional feeler probe, and the chain-sync
+eviction sweep."
   (check-peers-health node)
   (connect-added-nodes node)
+  (consider-outbound-evictions node)
   (replace-disconnected-peers node)
   (maintain-block-relay-peers node)
   (maybe-do-feeler node))

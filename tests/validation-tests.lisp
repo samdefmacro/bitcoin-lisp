@@ -375,24 +375,42 @@ We verify MTP computation directly to confirm the check works."
       ;; Must not fail on MTP check (may fail on PoW, that's fine)
       (is (not (eq :time-too-old error))))))
 
-(test mtp-no-ancestors-passes
-  "Block with no ancestors should not get :time-too-old (MTP=0)."
+(test mtp-unknown-parent-is-a-rejection
+  "CONSENSUS (GA8 S1-7): a parent that is not in the block index yields NO
+median-time-past, and that is a rejection — not time zero. The previous literal
+0 made Core's (block.GetBlockTime() <= pindexPrev->GetMedianTimePast()) rule
+vacuously false for every header whose parent had not been indexed yet.
+This test replaces mtp-no-ancestors-passes, which asserted the fail-open."
   (let* ((state (bitcoin-lisp.storage:init-chain-state "/tmp/btc-mtp-test3/"))
-         (prev-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
-         (header (bitcoin-lisp.serialization:make-block-header
-                  :version 1
-                  :prev-block prev-hash
-                  :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
-                                              :initial-element 0)
-                  :timestamp 1  ; Any positive timestamp > MTP of 0
-                  :bits #x1d00ffff
-                  :nonce 0)))
-    (multiple-value-bind (valid error)
-        (bitcoin-lisp.validation:validate-block-header
-         header state (+ 1 10000) :prev-hash prev-hash)
-      (declare (ignore valid))
-      ;; Must not fail on MTP check (may fail on PoW, that's fine)
-      (is (not (eq :time-too-old error))))))
+         (unknown (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (is (null (bitcoin-lisp.validation:compute-median-time-past state unknown)))
+    (is (null (bitcoin-lisp.validation:compute-median-time-past-from-entry nil)))
+    (is-true (bitcoin-lisp.validation:header-time-too-old-p
+              (bitcoin-lisp.serialization:make-block-header
+               :version 1 :prev-block unknown :merkle-root unknown
+               :timestamp 1 :bits #x1d00ffff :nonce 0)
+              nil))))
+
+(test mtp-from-entry-matches-hash-lookup
+  "compute-median-time-past-from-entry is the same walk as the hash-keyed
+wrapper for a chain that IS indexed (Core CBlockIndex::GetMedianTimePast,
+chain.h:233-246), including a partial window shorter than 11 blocks."
+  (let* ((state (bitcoin-lisp.storage:init-chain-state "/tmp/btc-mtp-test4/"))
+         (timestamps (loop for i from 200 to 214 collect i))
+         (tip-hash (build-chain-with-timestamps state timestamps))
+         (tip-entry (bitcoin-lisp.storage:get-block-index-entry state tip-hash)))
+    ;; Full 11-block window over the last 11 timestamps (204..214), median 209.
+    (is (= 209 (bitcoin-lisp.validation:compute-median-time-past state tip-hash)))
+    (is (= 209 (bitcoin-lisp.validation:compute-median-time-past-from-entry tip-entry)))
+    ;; Partial window: the height-2 entry has only 3 timestamps behind it
+    ;; (200 201 202), and Core's index arithmetic picks 201.
+    (let ((third (let ((e tip-entry))
+                   (dotimes (i 12 e)
+                     (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e))))))
+      (is (= 2 (bitcoin-lisp.storage:block-index-entry-height third)))
+      (is (= 201 (bitcoin-lisp.validation:compute-median-time-past-from-entry third)))
+      (is (= 201 (bitcoin-lisp.validation:compute-median-time-past
+                  state (bitcoin-lisp.storage:block-index-entry-hash third)))))))
 
 ;;;; Merkle Root Tests
 

@@ -97,25 +97,31 @@ values at or above are Unix timestamps.")
 (defconstant +median-time-span+ 11
   "Number of previous blocks used to compute median-time-past.")
 
+(defun compute-median-time-past-from-entry (entry)
+  "Median-time-past of ENTRY: the median of its own timestamp and up to its 10
+ancestors', walking the PREV-ENTRY chain — Bitcoin Core
+CBlockIndex::GetMedianTimePast (chain.h:233-246). Returns NIL when ENTRY is NIL.
+The entry chain is the only walk that can see a parent which is not (yet) in the
+block index, such as a header staged earlier in the same batch."
+  (when entry
+    (let ((timestamps '())
+          (e entry))
+      (dotimes (i +median-time-span+)
+        (unless e (return))
+        (push (bitcoin-lisp.serialization:block-header-timestamp
+               (bitcoin-lisp.storage:block-index-entry-header e))
+              timestamps)
+        (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+      (nth (floor (length timestamps) 2) (sort timestamps #'<)))))
+
 (defun compute-median-time-past (chain-state prev-hash)
   "Compute the median-time-past for the block following PREV-HASH.
-Returns the median of up to 11 previous block timestamps."
-  (let ((timestamps '())
-        (hash prev-hash))
-    (dotimes (i +median-time-span+)
-      (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
-        (unless entry (return))
-        (push (bitcoin-lisp.serialization:block-header-timestamp
-               (bitcoin-lisp.storage:block-index-entry-header entry))
-              timestamps)
-        (let ((prev (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
-          (if prev
-              (setf hash (bitcoin-lisp.storage:block-index-entry-hash prev))
-              (return)))))
-    (if (null timestamps)
-        0
-        (let ((sorted (sort timestamps #'<)))
-          (nth (floor (length sorted) 2) sorted)))))
+Returns NIL when PREV-HASH is not in the block index: absence is not a time, and
+a numeric fallback silently satisfies a consensus comparison such as
+(<= timestamp mtp). Callers on a consensus path must reject on NIL; informational
+callers substitute their own default."
+  (compute-median-time-past-from-entry
+   (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)))
 
 ;;;; Transaction finality check (IsFinalTx)
 
@@ -176,11 +182,8 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
                        (utxo-prev-height (max 0 (1- utxo-height)))
                        (utxo-prev-entry (bitcoin-lisp.storage:get-block-at-height
                                          chain-state utxo-prev-height))
-                       (utxo-mtp (if utxo-prev-entry
-                                     (compute-median-time-past
-                                      chain-state
-                                      (bitcoin-lisp.storage:block-index-entry-hash
-                                       utxo-prev-entry))
+                       (utxo-mtp (or (compute-median-time-past-from-entry
+                                      utxo-prev-entry)
                                      0)))
                   (when (< (- mtp utxo-mtp) required-time)
                     (return-from check-sequence-locks nil)))
@@ -515,6 +518,16 @@ Bitcoin Core ContextualCheckBlockHeader (validation.cpp:4129-4136)."
               (bitcoin-lisp.storage:block-index-entry-header prev-entry))
              +max-timewarp+))))
 
+(defun header-time-too-old-p (header prev-entry)
+  "T if HEADER's timestamp is at or before PREV-ENTRY's median-time-past —
+Bitcoin Core ContextualCheckBlockHeader's time-too-old rule (validation.cpp:4124).
+An ancestry that yields no median (a NIL PREV-ENTRY) counts as a violation: the
+rule cannot be evaluated, and answering with a neutral time would satisfy the
+comparison for every header."
+  (let ((mtp (compute-median-time-past-from-entry prev-entry)))
+    (or (null mtp)
+        (<= (bitcoin-lisp.serialization:block-header-timestamp header) mtp))))
+
 (defun validate-block-header (header chain-state current-time
                                &key prev-hash height prev-entry skip-pow)
   "Validate a block header.
@@ -536,12 +549,16 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
       (return-from validate-block-header
         (values nil :time-too-new)))
 
-    ;; Check timestamp > median-time-past of previous 11 blocks
-    (when (and chain-state prev-hash)
-      (let ((mtp (compute-median-time-past chain-state prev-hash)))
-        (when (<= timestamp mtp)
-          (return-from validate-block-header
-            (values nil :time-too-old)))))
+    ;; Check timestamp > median-time-past of previous 11 blocks. PREV-ENTRY is
+    ;; preferred over the hash: a hash lookup cannot see a parent that is not in
+    ;; the index.
+    (when (or prev-entry (and chain-state prev-hash))
+      (when (header-time-too-old-p
+             header (or prev-entry
+                        (bitcoin-lisp.storage:get-block-index-entry
+                         chain-state prev-hash)))
+        (return-from validate-block-header
+          (values nil :time-too-old))))
 
     ;; BIP 94 timewarp-attack mitigation (see bip94-timewarp-violation-p).
     (when (bip94-timewarp-violation-p header height prev-entry)
@@ -597,12 +614,14 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
    testnet sync on modest hardware; bordeaux-threads imposes minimal
    overhead per spawn.")
 
-(defun validate-tx-scripts (tx tx-idx utxo-set script-flags height)
+(defun validate-tx-scripts (tx tx-idx utxo-set script-flags height &key extra-coins)
   "Validate all input scripts of a single transaction. Returns
-T on success or NIL on failure. Designed to be safe to call from
+T on success or NIL on failure. EXTRA-COINS is an optional (txid . index) ->
+utxo-entry table of coins created by earlier transactions in the same block,
+which are not in UTXO-SET yet. Designed to be safe to call from
 worker threads — binds all required specials locally."
   (let* ((tx-inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-         (spent-utxos (collect-spent-utxos tx-inputs utxo-set))
+         (spent-utxos (collect-spent-utxos tx-inputs utxo-set extra-coins))
          (bitcoin-lisp.coalton.interop:*script-flags* script-flags)
          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
            (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
@@ -610,39 +629,53 @@ worker threads — binds all required specials locally."
     (loop for input across tx-inputs
           for input-idx from 0
           for utxo = (and spent-utxos (aref spent-utxos input-idx))
-          when utxo
-            do (unless (validate-input-script tx input-idx utxo)
-                 ;; Re-run with debug to capture the preimage for the log line
-                 (let ((bitcoin-lisp.coalton.interop:*debug-bip341-sighash* t))
-                   (validate-input-script tx input-idx utxo))
-                 (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                        (wvec (bitcoin-lisp.serialization:transaction-witness tx))
-                        (witness (and wvec (aref wvec input-idx))))
-                   (bitcoin-lisp:log-warn
-                    "SCRIPT-FAILED: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D scriptpubkey=~A scriptsig=~A witness-items=~D witness=~A flags=~A"
-                    height tx-idx input-idx
-                    (bitcoin-lisp.crypto:bytes-to-hex
-                     (bitcoin-lisp.serialization:outpoint-hash prevout))
-                    (bitcoin-lisp.serialization:outpoint-index prevout)
-                    (bitcoin-lisp.crypto:bytes-to-hex
-                     (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
-                    (bitcoin-lisp.crypto:bytes-to-hex
-                     (bitcoin-lisp.serialization:tx-in-script-sig input))
-                    (length witness)
-                    (format nil "[~{~A~^,~}]"
-                            (mapcar #'bitcoin-lisp.crypto:bytes-to-hex witness))
-                    bitcoin-lisp.coalton.interop:*script-flags*))
-                 (return-from validate-tx-scripts nil))
+          do (unless utxo
+               ;; Core asserts the coin is present before verifying
+               ;; (CheckInputScripts, validation.cpp:2090). An unresolvable
+               ;; coin must fail the transaction, never skip its script:
+               ;; a skipped input is an unsigned spend.
+               (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+                 (bitcoin-lisp:log-warn
+                  "SCRIPT-MISSING-COIN: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D"
+                  height tx-idx input-idx
+                  (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.serialization:outpoint-hash prevout))
+                  (bitcoin-lisp.serialization:outpoint-index prevout)))
+               (return-from validate-tx-scripts nil))
+             (unless (validate-input-script tx input-idx utxo)
+               ;; Re-run with debug to capture the preimage for the log line
+               (let ((bitcoin-lisp.coalton.interop:*debug-bip341-sighash* t))
+                 (validate-input-script tx input-idx utxo))
+               (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+                      (wvec (bitcoin-lisp.serialization:transaction-witness tx))
+                      (witness (and wvec (aref wvec input-idx))))
+                 (bitcoin-lisp:log-warn
+                  "SCRIPT-FAILED: height=~D tx-idx=~D input-idx=~D prev-txid=~A:~D scriptpubkey=~A scriptsig=~A witness-items=~D witness=~A flags=~A"
+                  height tx-idx input-idx
+                  (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.serialization:outpoint-hash prevout))
+                  (bitcoin-lisp.serialization:outpoint-index prevout)
+                  (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.storage:utxo-entry-script-pubkey utxo))
+                  (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.serialization:tx-in-script-sig input))
+                  (length witness)
+                  (format nil "[~{~A~^,~}]"
+                          (mapcar #'bitcoin-lisp.crypto:bytes-to-hex witness))
+                  bitcoin-lisp.coalton.interop:*script-flags*))
+               (return-from validate-tx-scripts nil))
           finally (return t))))
 
-(defun validate-block-scripts-parallel (txs script-flags utxo-set height)
+(defun validate-block-scripts-parallel (txs script-flags utxo-set height &key extra-coins)
   "Validate all non-coinbase tx scripts in TXS across N worker threads.
 Returns T on success or NIL on the first script failure.
 
 Bitcoin Core uses CCheckQueue with a thread pool to do the same — every
 sig check is independent across inputs and txs, so this parallelizes
 cleanly. The shared sig-cache uses SBCL :synchronized hash-tables for
-safe concurrent access."
+safe concurrent access. EXTRA-COINS (the block's intra-block coin overlay)
+is read-only for the whole of this call and must already be complete when
+it is reached — the workers only ever GETHASH it."
   (let* ((non-coinbase (rest txs))
          (n-txs (length non-coinbase))
          (n-workers (min +parallel-validation-workers+ n-txs))
@@ -669,7 +702,8 @@ safe concurrent access."
                                        ;; original (rest transactions).
                                        (tx-idx (1+ i)))
                                    (unless (validate-tx-scripts tx tx-idx utxo-set
-                                                                script-flags height)
+                                                                script-flags height
+                                                                :extra-coins extra-coins)
                                      (bt:with-lock-held (failure-lock)
                                        (setf (car failure-flag) t))
                                      (return))))))
@@ -679,12 +713,16 @@ safe concurrent access."
       (bt:join-thread th))
     (not (car failure-flag))))
 
-(defun validate-block-scripts (block utxo-set &key (height 0))
+(defun validate-block-scripts (block utxo-set &key (height 0) extra-coins)
   "Validate all non-coinbase transaction scripts in BLOCK via Coalton interop.
 Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure.
 Uses validate-input-script for each input (shared with transaction validation).
 Blocks matching BIP 16 exception hashes skip all script validation.
-HEIGHT is used to determine which script verification flags to enable."
+HEIGHT is used to determine which script verification flags to enable.
+EXTRA-COINS is the block's intra-block coin overlay — the outputs created by
+its own earlier transactions, which the confirmed UTXO set does not hold.
+Core has already applied them to its coins view by the time it script-checks
+a chained spend (UpdateCoins, validation.cpp:2597)."
   ;; Check for BIP 16 exception block - skip ALL script validation
   (when (block-is-bip16-exception-p block)
     (return-from validate-block-scripts (values t nil)))
@@ -708,7 +746,8 @@ HEIGHT is used to determine which script verification flags to enable."
     (if (and bitcoin-lisp:*parallel-block-validation*
              (>= (length (rest transactions)) +parallel-validation-min-txs+)
              (> +parallel-validation-workers+ 1))
-        (if (validate-block-scripts-parallel transactions script-flags utxo-set height)
+        (if (validate-block-scripts-parallel transactions script-flags utxo-set height
+                                             :extra-coins extra-coins)
             (values t nil)
             (values nil :script-failed))
         ;; Sequential fallback (kept verbatim from the pre-Phase-3 path).
@@ -716,7 +755,8 @@ HEIGHT is used to determine which script verification flags to enable."
           (loop for tx in (rest transactions)
                 for tx-idx from 1
                 do (unless (validate-tx-scripts tx tx-idx utxo-set
-                                                script-flags height)
+                                                script-flags height
+                                                :extra-coins extra-coins)
                      (return-from validate-block-scripts
                        (values nil :script-failed))))
           (values t nil)))))
@@ -1003,6 +1043,53 @@ Tracks indices and allocates only once at the end."
     (when (and last-start last-end)
       (subseq script last-start last-end))))
 
+(defun p2sh-sigop-subscript (script-sig)
+  "The subscript Bitcoin Core counts the sigops of when SCRIPT-SIG spends a P2SH
+output, or NIL when Core counts none.
+
+CScript::GetSigOpCount(const CScript&) (script.cpp:183-205) walks SCRIPT-SIG with
+GetScriptOp and returns zero on a truncated push or on any opcode above OP_16.
+That bail-out condition is exactly CScript::IsPushOnly (script.cpp:266-281), so a
+non-NIL result doubles as the push-only gate the P2SH-wrapped-witness branch
+needs (interpreter.cpp:2152-2163).
+
+GetScriptOp clears its data buffer for every opcode and refills it only for
+opcode <= OP_PUSHDATA4 (script.cpp:313-359), so OP_1NEGATE, OP_RESERVED and
+OP_1..OP_16 leave an EMPTY subscript behind instead of the preceding push.
+
+Deliberately separate from EXTRACT-LAST-PUSH, which is the policy/standardness
+redeem-script extractor and has different semantics."
+  (let ((len (length script-sig))
+        (i 0)
+        (start 0)
+        (end 0))
+    (loop while (< i len)
+          do (let ((opcode (aref script-sig i)))
+               (cond
+                 ((<= opcode +op-pushdata4+)
+                  (let* ((width (cond ((< opcode +op-pushdata1+) 0)
+                                      ((= opcode +op-pushdata1+) 1)
+                                      ((= opcode +op-pushdata2+) 2)
+                                      (t 4)))
+                         (data (+ i 1 width)))
+                    (when (> data len)
+                      (return-from p2sh-sigop-subscript nil))
+                    (let ((size (if (zerop width)
+                                    opcode
+                                    (loop for k from 0 below width
+                                          sum (ash (aref script-sig (+ i 1 k)) (* 8 k))))))
+                      (when (> (+ data size) len)
+                        (return-from p2sh-sigop-subscript nil))
+                      (setf start data
+                            end (+ data size)
+                            i end))))
+                 ((> opcode +op-16+)
+                  (return-from p2sh-sigop-subscript nil))
+                 (t
+                  (setf start 0 end 0)
+                  (incf i)))))
+    (subseq script-sig start end)))
+
 (defun count-legacy-sigops (tx)
   "Count legacy (inaccurate) sigops across all scriptSigs and scriptPubKeys of TX."
   (let ((count 0))
@@ -1051,9 +1138,11 @@ GET-SPENT-SCRIPT takes (txid index) and returns the spent scriptPubKey."
                     (let ((witness (get-input-witness tx input-idx)))
                       (incf witness-count (count-witness-sigops-for-input
                                            script-pubkey witness))))
-                   ;; P2SH input
+                   ;; P2SH input. A NIL subscript is Core's "not push-only",
+                   ;; which zeroes the P2SH sigops AND gates the wrapped-witness
+                   ;; branch (CountWitnessSigOps requires IsPushOnly).
                    ((script-is-p2sh-p script-pubkey)
-                    (let ((redeem-script (extract-last-push
+                    (let ((redeem-script (p2sh-sigop-subscript
                                           (bitcoin-lisp.serialization:tx-in-script-sig input))))
                       (when redeem-script
                         ;; P2SH sigops from redeemScript
@@ -1235,6 +1324,14 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
     (let* ((total-fees (wrap-satoshi 0))
            (total-sigops-cost 0)
            (pending-utxos (make-hash-table :test 'equalp))
+           ;; Outpoints an earlier transaction of this block already consumed.
+           ;; Core spends them out of its per-block coins view (UpdateCoins,
+           ;; validation.cpp:1996-2008), so HaveInputs then fails for a second
+           ;; spender; our view is read-only for the whole block, so the
+           ;; consumed set is tracked alongside the created one. Coin data
+           ;; stays in PENDING-UTXOS after the spend — sigop counting and
+           ;; script validation still need the spender's own prevouts.
+           (spent-outpoints (make-hash-table :test 'equalp))
            ;; Gate P2SH/witness sigop counting on the block's active flags,
            ;; exactly as Bitcoin Core passes GetBlockScriptFlags into
            ;; GetTransactionSigOpCost. Same source of truth as script validation.
@@ -1272,7 +1369,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
         (loop for tx in (rest transactions)
               do (multiple-value-bind (valid error fee)
                      (validate-transaction-contextual tx utxo-set current-height
-                                                      :pending-utxos pending-utxos)
+                                                      :pending-utxos pending-utxos
+                                                      :spent-outpoints spent-outpoints)
                    (unless valid
                      (return-from validate-block (values nil error nil)))
                    ;; fee is now a Satoshi type, use typed addition
@@ -1285,7 +1383,17 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
                  (when (> total-sigops-cost +max-block-sigops-cost+)
                    (return-from validate-block
                      (values nil :too-many-sigops nil)))
-                 ;; Add this transaction's outputs to pending for subsequent txs
+                 ;; Core's UpdateCoins order (validation.cpp:1996-2008): mark
+                 ;; this transaction's inputs spent, THEN add its outputs. Only
+                 ;; non-coinbase transactions reach here, so the coinbase's null
+                 ;; prevout is never marked (Core's `if (!tx.IsCoinBase())`).
+                 (bitcoin-lisp.serialization:dovector
+                     (input (bitcoin-lisp.serialization:transaction-inputs tx))
+                   (let ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input)))
+                     (setf (gethash (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
+                                          (bitcoin-lisp.serialization:outpoint-index prevout))
+                                    spent-outpoints)
+                           t)))
                  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
                    (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
                          for idx from 0
@@ -1298,7 +1406,7 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
 
       ;; Transaction finality check (IsFinalTx) and BIP 68 sequence locks
       (let* ((prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
-             (mtp (compute-median-time-past chain-state prev-hash))
+             (mtp (or (compute-median-time-past chain-state prev-hash) 0))
              (csv-height (get-csv-activation-height bitcoin-lisp:*network*))
              (csv-active (>= current-height csv-height))
              ;; For IsFinalTx: use MTP after BIP 113 activation, block timestamp before
@@ -1320,7 +1428,8 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
       ;; Skip during IBD for blocks below the last checkpoint (performance optimization)
       (unless skip-scripts
         (multiple-value-bind (valid error)
-            (validate-block-scripts block utxo-set :height current-height)
+            (validate-block-scripts block utxo-set :height current-height
+                                                   :extra-coins pending-utxos)
           (unless valid
             (return-from validate-block (values nil error nil)))))
 
@@ -1597,6 +1706,12 @@ store-undo-data (the connect path, which does the height bookkeeping) caches."
 ;;;;    newest block's txs keyed by txid and wtxid, so a getdata for a
 ;;;;    just-confirmed tx is still served even though it left the mempool
 ;;;;    (FindTxForGetData's second source, net_processing.cpp:2507-2514).
+;;;;
+;;;;  - The RECONSIDERABLE rejects filter (Core
+;;;;    m_lazy_recent_rejects_reconsiderable, txdownloadman_impl.h:83-95):
+;;;;    the second of Core's two reject filters, kept here for the same
+;;;;    reason — it is reset on every active tip change, and that reset
+;;;;    happens in this file.
 
 (defvar *recent-confirmed-txs* (bitcoin-lisp:make-rejects-filter 48000)
   "Bounded rolling set of recently-confirmed txids/wtxids (Core
@@ -1622,6 +1737,42 @@ txid AND wtxid — to their transactions, or NIL before any block connects
 BlockDisconnected: a reorg may return confirmed txs to circulation, and the
 filter would otherwise block their relay) and at node start."
   (bitcoin-lisp:clear-recent-rejects *recent-confirmed-txs*))
+
+;;;; The reconsiderable rejects filter (Core's SECOND rejects filter)
+
+(defvar *recent-rejects-reconsiderable* (bitcoin-lisp:make-rejects-filter 50000)
+  "Bounded rolling set of wtxids — and 1p1c package hashes — whose last
+failure was TX_RECONSIDERABLE: a policy failure a DIFFERENT package could
+still overcome. Core keeps this as a filter SEPARATE from the main rejects
+filter (m_lazy_recent_rejects_reconsiderable, txdownloadman_impl.cpp:
+454-466) precisely so those transactions are not black-holed: an entry here
+means \"do not download or submit this by ITSELF again\", not \"never accept
+this\" — it may still ride in as part of a package.
+
+Core routes both fee-floor failures here (CheckFeeRate, validation.cpp:
+703-711), the RBF fee/diagram failures (:1010, :1028) and \"mempool full\"
+(:1401). Everything else keeps going to the main filter.
+
+Node-global, like *RECENT-CONFIRMED-TXS* above: the validation layer loads
+before networking, and the active-tip-change reset lives in this file.")
+
+(defun reconsiderable-reject-p (hash)
+  "T if HASH (a wtxid, or a 1p1c package hash) failed reconsiderably and so
+must not be submitted on its own again (Core
+RecentRejectsReconsiderableFilter().contains)."
+  (and (bitcoin-lisp:recent-reject-p *recent-rejects-reconsiderable* hash) t))
+
+(defun add-reconsiderable-reject (hash)
+  "Record HASH as a reconsiderable failure (Core
+RecentRejectsReconsiderableFilter().insert)."
+  (bitcoin-lisp:add-recent-reject *recent-rejects-reconsiderable* hash))
+
+(defun clear-reconsiderable-rejects ()
+  "Empty the reconsiderable rejects filter. Core resets it beside the main
+rejects filter on every active tip change (ActiveTipChange,
+txdownloadman_impl.cpp:91-95): a new block changes both the fee floor and
+which parents exist, so every cached fee failure is stale."
+  (bitcoin-lisp:clear-recent-rejects *recent-rejects-reconsiderable*))
 
 (defun note-block-connected (block)
   "Record BLOCK as the new most-recent block: rebuild the getdata-servable
@@ -1768,8 +1919,9 @@ Handles chain reorganizations when a competing chain has more work."
            ;; inputs) can become valid at the next block (ActiveTipChange,
            ;; net_processing.cpp:2045-2059 -> txdownloadman_impl.cpp:92-96
            ;; RecentRejectsFilter().reset()). Previously only the reorg path
-           ;; cleared it.
+           ;; cleared it. ActiveTipChange resets BOTH filters.
            (bitcoin-lisp:clear-recent-rejects recent-rejects)
+           (clear-reconsiderable-rejects)
            (bitcoin-lisp:maybe-periodic-flush chain-state)
            ;; Automatic block pruning after connecting a new block; each
            ;; pruned block's undo file goes with it.
@@ -1890,7 +2042,7 @@ have silently revoked. HEIGHT is the NEW tip height. Returns the number of
 transactions removed."
   (let* ((eval-height (1+ height))
          (tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-         (mtp (compute-median-time-past chain-state tip-hash))
+         (mtp (or (compute-median-time-past chain-state tip-hash) 0))
          (csv-active (>= eval-height
                          (get-csv-activation-height bitcoin-lisp:*network*)))
          ;; BIP113: same clock the acceptance path uses (transaction.lisp).
@@ -2302,13 +2454,22 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
               ;; competing-fork block stored via the :weaker-chain path had its
               ;; body (scripts / merkle / coinbase value / finality / seqlocks)
               ;; UNvalidated — connecting it blindly was the consensus hole.
+              ;; Re-run the ONE header rule an already-persisted index entry may
+              ;; predate, since :skip-header t below will not. It must stay
+              ;; exactly this rule: a fork body re-read from the store carries no
+              ;; cached hash, so re-running PoW here would spuriously fail (see
+              ;; VALIDATE-BLOCK's SKIP-HEADER docstring).
               (multiple-value-bind (valid error)
-                  (validate-block block chain-state utxo-set height now
-                                  :skip-scripts skip-scripts
-                                  ;; Header (PoW/difficulty/MTP/timewarp) was
-                                  ;; validated at index admission — Core's
-                                  ;; ConnectBlock doesn't re-check it.
-                                  :skip-header t)
+                  (if (header-time-too-old-p
+                       (bitcoin-lisp.serialization:bitcoin-block-header block)
+                       (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
+                      (values nil :time-too-old)
+                      (validate-block block chain-state utxo-set height now
+                                      :skip-scripts skip-scripts
+                                      ;; Header (PoW/difficulty/MTP/timewarp) was
+                                      ;; validated at index admission — Core's
+                                      ;; ConnectBlock doesn't re-check it.
+                                      :skip-header t))
                 (unless valid
                   (bitcoin-lisp:log-error
                    "REORG ABORTED at height ~D: fork block failed validation (~A). Rolling back to original chain."
@@ -2397,8 +2558,9 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
           ;; upserts above; stale-branch-only txs keep resolving through the
           ;; still-stored stale block (removing them here used to leave re-mined
           ;; txs UNINDEXED, since the old txindex-add skipped existing txids).
-          ;; Reorg may change tx validity — clear the rejects cache.
+          ;; Reorg may change tx validity — clear both rejects caches.
           (bitcoin-lisp:clear-recent-rejects recent-rejects)
+          (clear-reconsiderable-rejects)
           ;; Re-add disconnected-block txs (best-effort, against the new tip),
           ;; parents before children. Txs re-confirmed or invalidated by the
           ;; new chain are dropped by re-validation.
