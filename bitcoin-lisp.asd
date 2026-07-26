@@ -246,6 +246,9 @@
                              ;; Wallet P4: coin selection, spending RPCs,
                              ;; wallet signing, rebroadcast
                              (:file "wallet-spend-tests")
+                             ;; Process RNG seeding (*random-state* must not
+                             ;; replay SBCL's build-time stream on every start)
+                             (:file "entropy-tests")
                              ;; Wave 10: RPC boolean/error-code parity, HTTP
                              ;; layer, BIP64 getutxos, config wires, arg
                              ;; handling, banlist persistence
