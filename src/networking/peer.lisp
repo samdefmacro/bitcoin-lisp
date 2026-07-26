@@ -35,6 +35,27 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (connection nil :type (or null connection))
   (state :disconnected :type peer-state)
   (version nil)  ; Received version message
+  ;; Chain-sync timeout state (Core CNodeState::ChainSyncTimeoutState,
+  ;; net_processing.cpp:490-501). All times are UNIX SECONDS — the codebase
+  ;; also carries get-universal-time and internal-real-time clocks, and mixing
+  ;; them here would be a ~2.2e9-second error.
+  (chain-sync-timeout 0 :type integer)        ; 0 = unarmed
+  (chain-sync-work-header nil)                ; tip hash we benchmarked against
+  (chain-sync-sent-getheaders nil)
+  (chain-sync-protect nil)
+  ;; BIP133 feefilter state (Core Peer::m_fee_filter_sent /
+  ;; m_next_send_feefilter). FEE-FILTER-SENT is the last value we put on the
+  ;; wire (NIL = none yet); NEXT-SEND-FEEFILTER is a unix time, 0 = due now.
+  (fee-filter-sent nil)
+  (next-send-feefilter 0 :type integer)
+  ;; Operator-pinned connection (-addnode / addnode onetry). Core types these
+  ;; ConnectionType::MANUAL and exempts them from every automatic eviction; we
+  ;; carry the fact as a flag because our -addnode peers are otherwise typed
+  ;; :outbound-full-relay and would be indistinguishable.
+  (manual nil)
+  ;; OUR nonce for this one connection, sent in the VERSION we push (Core
+  ;; CNode::nLocalHostNonce, net.h:994). Per-connection, never node-wide.
+  (local-nonce 0 :type (unsigned-byte 64))
   (services 0 :type (unsigned-byte 64))
   (start-height 0 :type (signed-byte 32))
   (user-agent "" :type string)
@@ -317,6 +338,99 @@ Returns NIL if the host is banned or discouraged (never dial either)."
         (init-peer-rate-limiters peer)
         peer))))
 
+(defun peer-live-p (peer)
+  "T while PEER is still a connection we could actually use — our stand-in for
+Core's `!pfrom.fDisconnect`.
+
+Core marks a node it has decided to retire with fDisconnect and then refuses
+to give it anything more; the socket handler reaps it on the next pass and
+FinalizeNode runs. We have no fDisconnect flag: our retirement paths set the
+state instead — DISCONNECT-PEER and RECORD-MISBEHAVIOR to :disconnected,
+BAN-PEER to :banned — so those two states are our \"already retired\".
+
+Anything that hands a retired peer a RESOURCE must consult this first: the
+peer will never be retired a second time, so whatever it was granted is never
+given back. (REPLACE-DISCONNECTED-PEERS reaps :disconnected peers straight out
+of NODE-PEERS and never reaps :banned ones at all — neither reap runs a
+release, because by then the retirement that set the state already did.)"
+  (not (member (peer-state peer) '(:disconnected :banned))))
+
+;;; --- Chain-sync protection slots (Core
+;;; m_outbound_peers_with_protect_from_disconnect) ---
+;;;
+;;; Lives here, next to DISCONNECT-PEER, rather than in ibd.lisp beside
+;;; CONSIDER-CHAIN-SYNC-EVICTION: the counter is peer-LIFECYCLE state, and
+;;; every path that retires a peer has to hand the slot back. ibd.lisp loads
+;;; after this file, so a release call there would be a forward reference and
+;;; the previous placement left the counter with no production releaser at all
+;;; — it only ever incremented, so after one round of outbound churn every
+;;; slot was permanently spent and no peer could earn protection again.
+
+(defconstant +max-outbound-peers-to-protect+ 4
+  "Core MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.")
+
+(defvar *protected-outbound-count* 0
+  "How many outbound peers currently hold chain-sync protection.")
+
+(defvar *outbound-protection-lock* (bt:make-lock "outbound-protection")
+  "Guards *PROTECTED-OUTBOUND-COUNT* and the per-peer flag together. Core keeps
+the counter under cs_main; we grant from the sync thread but release from the
+sync, listener, and RPC threads, so a check-then-increment without a lock can
+lose a release and re-create the leak this lock exists to prevent.")
+
+(defun maybe-protect-outbound-peer (peer)
+  "Grant chain-sync protection to an outbound FULL-RELAY peer that delivered a
+chain at least as good as our tip (Core net_processing.cpp:2946-2956), up to
+MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.
+
+Block-relay peers are deliberately NOT protected — Core keeps them always
+subject to the bad/lagging chain logic.
+
+A peer that has ALREADY been retired is refused (PEER-LIVE-P = Core's
+`!pfrom.fDisconnect` on :2951). Without that clause the grant is a permanent
+slot leak: the retirement that would hand the slot back has already happened,
+so the increment is never undone and after four of them no peer can ever earn
+protection again. Core needs the guard because the sub-minchainwork drop
+(:2926-2944) sets fDisconnect a few lines ABOVE this grant on the same peer in
+the same pass, and both conditions are satisfied at once by the common IBD
+case of a peer whose best-known beats our low tip but misses the work floor."
+  (bt:with-lock-held (*outbound-protection-lock*)
+    (when (and (not (peer-chain-sync-protect peer))
+               (peer-live-p peer)
+               (not (peer-inbound peer))
+               (not (peer-manual peer))
+               (eq (peer-conn-type peer) :outbound-full-relay)
+               (< *protected-outbound-count* +max-outbound-peers-to-protect+))
+      (setf (peer-chain-sync-protect peer) t)
+      (incf *protected-outbound-count*)
+      t)))
+
+(defun release-outbound-protection (peer)
+  "Give back PEER's protection slot. Core's FinalizeNode
+(net_processing.cpp:1717-1718) does
+`m_outbound_peers_with_protect_from_disconnect -= state->m_chain_sync.m_protect`
+and then asserts the counter never went negative; FinalizeNode runs for every
+node removal whatever the reason, so every one of our retirement paths
+(DISCONNECT-PEER, RECORD-MISBEHAVIOR, BAN-PEER) calls this.
+
+The per-peer flag is the single source of truth, which makes a repeated release
+a no-op: without that, a peer retired twice (disconnected and then reaped, or
+misbehaving and then disconnected) would decrement twice and let us hand out
+more than MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT slots. Returns T iff a
+slot was actually returned."
+  (bt:with-lock-held (*outbound-protection-lock*)
+    (when (peer-chain-sync-protect peer)
+      (setf (peer-chain-sync-protect peer) nil)
+      ;; Core's assert(m_outbound_peers_with_protect_from_disconnect >= 0). The
+      ;; flag makes the else branch unreachable; if it ever runs the accounting
+      ;; is broken, so say so loudly and refuse to go negative rather than let a
+      ;; negative counter silently uncap protection.
+      (if (plusp *protected-outbound-count*)
+          (decf *protected-outbound-count*)
+          (bitcoin-lisp:log-warn
+           "Outbound protection counter underflow releasing peer ~A" (peer-address peer)))
+      t)))
+
 (defvar *peer-disconnect-hook* nil
   "When non-NIL, a function of one argument (the peer) called from
 DISCONNECT-PEER after the connection is torn down. protocol.lisp registers
@@ -329,6 +443,10 @@ a later-loaded file, so a direct call would be a forward reference.")
     (close-connection (peer-connection peer)))
   (setf (peer-state peer) :disconnected)
   (setf (peer-connection peer) nil)
+  ;; Hand back any chain-sync protection slot (Core FinalizeNode). Done before
+  ;; the hooks below, which are wrapped in IGNORE-ERRORS and must not be able
+  ;; to skip it.
+  (release-outbound-protection peer)
   ;; Drop any in-progress low-work headers sync with this peer (Core
   ;; FinalizeNode resets Peer state; the buffers die with the struct).
   (setf (peer-headers-sync peer) nil)
@@ -449,6 +567,23 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
                           (%account-message (peer-recv-per-msg peer) nil
                                             command payload-len)
                           (values command payload))))))))))))))
+
+(defun peer-outbound-or-block-relay-p (peer)
+  "T for the connection types that are candidates for AUTOMATIC disconnection
+on chain-quality grounds — Core CNode::IsOutboundOrBlockRelayConn
+(net.h:771-785): OUTBOUND_FULL_RELAY and BLOCK_RELAY only.
+
+Two halves matter equally. It must INCLUDE :block-relay, which the word
+\"outbound\" does not obviously cover in our vocabulary. And it must EXCLUDE
+manual (-addnode) peers: ours are typed :outbound-full-relay, and
+connect-added-nodes redials every missing added node on the ~30s maintenance
+tick, so a plain not-inbound test would produce a
+connect -> getheaders -> disconnect -> reconnect loop every 30 seconds against
+a peer the operator explicitly pinned. Feelers and inbound are excluded too."
+  (and (not (peer-inbound peer))
+       (not (peer-manual peer))
+       (member (peer-conn-type peer) '(:outbound-full-relay :block-relay))
+       t))
 
 ;;; Handshake
 
@@ -668,6 +803,65 @@ self-advertisement happens via addr/addrv2 push, not the version message."
         (bitcoin-lisp.serialization:make-empty-net-addr
          :services (peer-services peer)))))
 
+;;; --- Self-connection detection (Core CheckIncomingNonce) ---
+;;;
+;;; A node that dials its own advertised address completes the handshake
+;;; against itself: the connection answers ping/pong forever, is never evicted,
+;;; permanently burns an outbound slot and pollutes addrman and getpeerinfo.
+;;; The only signal is the VERSION nonce — if a nonce we just sent comes back
+;;; at us, the far end is us.
+
+(defvar *outbound-nonce-lock* (bt:make-lock "outbound-nonces"))
+
+(defvar *outbound-nonces* (make-hash-table :test 'eql)
+  "Nonces of outbound connections whose handshake is still in flight, i.e.
+whose VERACK has not been received. Core matches only against nodes with
+!fSuccessfullyConnected (net.cpp:353-370); registering for exactly the
+handshake window is the same test. Entries MUST be released on handshake
+failure too, or the registry leaks and stays armed forever.")
+
+(defun %fresh-local-nonce ()
+  "A fresh 64-bit VERSION nonce for ONE connection.
+
+Core gives every CNode its own nonce (net.cpp:515-516 outbound, :1824-1825
+inbound) rather than reusing a node-wide value, and that matters beyond
+tidiness: the nonce travels in cleartext in the first message of every
+connection, so a stable one would be a permanent unique fingerprint linking
+our clearnet, Tor and I2P identities and every reconnect. Core keeps the real
+per-connection nonce even on privacy-hardened private-broadcast connections
+where it blanks every other field (net_processing.cpp:1557-1564).
+
+Uses ironclad's CSPRNG: SBCL's *random-state* is neither thread-safe nor
+unpredictable, and handshakes run on several threads at once."
+  (let ((bytes (ironclad:random-data 8)))
+    (loop for i from 0 below 8
+          for shift from 0 by 8
+          sum (ash (aref bytes i) shift))))
+
+(defun %register-outbound-nonce (nonce)
+  (bt:with-lock-held (*outbound-nonce-lock*)
+    (setf (gethash nonce *outbound-nonces*) t)))
+
+(defun %release-outbound-nonce (nonce)
+  (bt:with-lock-held (*outbound-nonce-lock*)
+    (remhash nonce *outbound-nonces*)))
+
+(defun self-connection-nonce-p (nonce)
+  "T when NONCE belongs to an outbound handshake of ours still in flight —
+i.e. the peer that sent it is us (Core CheckIncomingNonce)."
+  (bt:with-lock-held (*outbound-nonce-lock*)
+    (and (gethash nonce *outbound-nonces*) t)))
+
+(defun %detected-self-connection-p (peer)
+  "T when the VERSION already stored on PEER carries one of our own in-flight
+outbound nonces. Only meaningful on the INBOUND side: an inbound peer's nonce
+is never registered, so this cannot false-positive on a normal peer unless it
+guesses a 64-bit CSPRNG value."
+  (let ((version (peer-version peer)))
+    (and version
+         (self-connection-nonce-p
+          (bitcoin-lisp.serialization::version-message-nonce version)))))
+
 (defun %send-version-and-capabilities (peer)
   "Send our version message followed by the post-version capability messages
 (wtxidrelay BIP339, sendaddrv2 BIP155 — both must come after VERSION and before
@@ -690,6 +884,9 @@ tx relay on those)."
                            :addr-recv (%version-addr-recv peer)
                            :start-height start-height
                            :timestamp (bitcoin-lisp.serialization:get-unix-time)
+                           ;; This connection's own nonce, so a peer that is
+                           ;; really us can be recognised when it echoes back.
+                           :nonce (peer-local-nonce peer)
                            ;; Core my_tx_relay = !RejectIncomingTxs(pnode)
                            ;; (net_processing.cpp:1573,5686-5693): false on
                            ;; block-relay/feeler connections AND in blocksonly
@@ -784,16 +981,24 @@ When TRY-V2 (default: whenever the v2 transport is enabled and supported), the
 BIP324 encrypted transport is established first, reconnecting as v1 if the peer
 turns out not to speak it. Returns T on success."
   (setf (peer-state peer) :handshaking
-        (peer-conn-type peer) conn-type)
-  (and (or (not try-v2)
-           (%v2-try-outbound peer))
-       (%send-version-and-capabilities peer)
-       (%receive-and-store-version peer)
-       ;; BIP330 offer goes after their VERSION (it is gated on their fRelay)
-       ;; and before our VERACK (Core net_processing.cpp:3728-3744).
-       (%maybe-send-sendtxrcncl peer)
-       (send-message peer (bitcoin-lisp.serialization:make-verack-message))
-       (%await-verack peer)))
+        (peer-conn-type peer) conn-type
+        (peer-local-nonce peer) (%fresh-local-nonce))
+  ;; Arm self-connection detection for exactly the handshake window (Core
+  ;; matches only against !fSuccessfullyConnected nodes). unwind-protect so a
+  ;; FAILED handshake releases the nonce too — otherwise the registry leaks
+  ;; and stays armed against an unrelated future peer forever.
+  (%register-outbound-nonce (peer-local-nonce peer))
+  (unwind-protect
+       (and (or (not try-v2)
+                (%v2-try-outbound peer))
+            (%send-version-and-capabilities peer)
+            (%receive-and-store-version peer)
+            ;; BIP330 offer goes after their VERSION (it is gated on their fRelay)
+            ;; and before our VERACK (Core net_processing.cpp:3728-3744).
+            (%maybe-send-sendtxrcncl peer)
+            (send-message peer (bitcoin-lisp.serialization:make-verack-message))
+            (%await-verack peer))
+    (%release-outbound-nonce (peer-local-nonce peer))))
 
 (defun perform-inbound-handshake (peer &key (timeout 15))
   "Inbound version handshake (the peer dialed us, so it sends VERSION first):
@@ -812,14 +1017,28 @@ stall. Returns T on success."
                                     (peer-address peer)))
             ((eq detected :v1))         ; sniffed bytes pushed back; proceed v1
             (t (return-from perform-inbound-handshake nil)))))
+  (setf (peer-local-nonce peer) (%fresh-local-nonce))
   (and (%receive-and-store-version peer :timeout timeout)
-       (%send-version-and-capabilities peer)
-       ;; BIP330 offer: their VERSION is already in hand on the inbound path;
-       ;; ordering matches Core (wtxidrelay → sendaddrv2 → sendtxrcncl →
-       ;; verack, net_processing.cpp:3715-3744).
-       (%maybe-send-sendtxrcncl peer)
-       (send-message peer (bitcoin-lisp.serialization:make-verack-message))
-       (%await-verack peer :timeout timeout)))
+       ;; SELF-CONNECTION: their VERSION carries a nonce we are still using for
+       ;; an outbound handshake, so the far end is us. Refuse BEFORE replying
+       ;; and before any local-address/addrman bookkeeping — Core's check at
+       ;; net_processing.cpp:3649 precedes both SeenLocal (:3658) and
+       ;; PushNodeVersion (:3664). The disconnect is SILENT: no ban, no
+       ;; discouragement, no misbehaviour score. Scoring it would be actively
+       ;; harmful, since the address being punished is our own.
+       (cond ((%detected-self-connection-p peer)
+              (bitcoin-lisp:log-info "Peer ~A: connected to self, disconnecting"
+                                     (peer-address peer))
+              nil)
+             (t
+              (and (%send-version-and-capabilities peer)
+                   ;; BIP330 offer: their VERSION is already in hand on the
+                   ;; inbound path; ordering matches Core (wtxidrelay →
+                   ;; sendaddrv2 → sendtxrcncl → verack,
+                   ;; net_processing.cpp:3715-3744).
+                   (%maybe-send-sendtxrcncl peer)
+                   (send-message peer (bitcoin-lisp.serialization:make-verack-message))
+                   (%await-verack peer :timeout timeout))))))
 
 (defun make-inbound-peer (connection address &key inbound-onion)
   "Build a peer for an accepted inbound CONNECTION from ADDRESS (state :connected,
@@ -835,20 +1054,124 @@ on the local onion-service listener (Tor forwarding), whose true network is
     (init-peer-rate-limiters peer)
     peer))
 
+;;; --- BIP133 feefilter (Core MaybeSendFeefilter + FeeFilterRounder) ---
+;;;
+;;; We used to send ONE hardcoded 1000 sat/kvB filter at handshake and never
+;;; revisit it, while our actual floor defaults to 100 and rises dynamically.
+;;; BIP133-honouring peers therefore withheld the whole 0.1-1.0 sat/vB band we
+;;; would happily have accepted — degrading mempool completeness, fee
+;;; estimation and compact-block reconstruction — while during IBD they kept
+;;; flooding us with txs we discard, and when the pool filled they kept
+;;; streaming txs already doomed by the rolling minimum.
+
+(defconstant +feefilter-version+ 70013
+  "Minimum common protocol version for feefilter (Core FEEFILTER_VERSION).")
+
+(defconstant +avg-feefilter-broadcast-interval+ 600
+  "Mean seconds between feefilter refreshes (Core's 10min, drawn from an
+exponential so refreshes do not align across peers).")
+
+(defconstant +max-feefilter-change-delay+ 300
+  "Cap on how long a SUBSTANTIALLY changed filter waits (Core's 5min).")
+
+(defparameter *fee-filter-buckets*
+  (let ((set (list 0))
+        ;; max(1, DEFAULT_MIN_RELAY_TX_FEE/2) where Core's compile-time
+        ;; DEFAULT_MIN_RELAY_TX_FEE is 100 — NOT the configured
+        ;; -minrelaytxfee. Configuring the relay floor must not move the
+        ;; buckets, or our quantization would become a fingerprint.
+        (boundary 50.0d0))
+    (loop while (<= boundary 1d7)
+          do (push boundary set)
+             (setf boundary (* boundary 1.1d0)))
+    (coerce (sort set #'<) 'vector))
+  "Ascending bucket boundaries {0} U {50 * 1.1^k <= 1e7} (Core MakeFeeSet).
+Built by repeated multiplication, like Core, so the values match bit for bit
+rather than being recomputed as 50*1.1^k.")
+
+(defun %exponential-interval (mean-seconds)
+  "Seconds until the next event of a Poisson process with MEAN-SECONDS (Core
+rand_exp_duration). Returns SECONDS, matching the unix-time clock the
+feefilter timers use — protocol.lisp's %next-exp-interval-ticks returns
+internal-real-time TICKS and must not be mixed with them."
+  (max 1 (round (* mean-seconds (- (log (- 1.0d0 (random 1.0d0))))))))
+
+(defun fee-filter-round (fee)
+  "Quantize FEE (sat/kvB) to a bucket, Core FeeFilterRounder::round.
+
+Takes the ceiling bucket 1/3 of the time and the one below it 2/3 of the time.
+The draw is PER CALL, not a per-session skew: modelling it as a session
+constant would make our successive broadcasts correlated in a way Core's are
+not, which is itself a fingerprint. A fee above the top bucket clamps to the
+top bucket — which is why Core's IBD sentinel goes on the wire as the top
+bucket and never as MAX_MONEY."
+  (let* ((buckets *fee-filter-buckets*)
+         (n (length buckets))
+         (idx (or (position-if (lambda (b) (>= b fee)) buckets) n)))
+    ;; Core: --it when past the end, or when not at the beginning and the
+    ;; 1-in-3 draw does not land.
+    (when (or (= idx n)
+              (and (> idx 0) (/= 0 (random 3))))
+      (decf idx))
+    (values (floor (aref buckets (max 0 idx))))))
+
+(defun %feefilter-max-value ()
+  "What Core puts on the wire during IBD: round(MAX_MONEY), which clamps to the
+top bucket (net_processing.cpp:5645). Deterministic — the clamp branch never
+consults the RNG."
+  (values (floor (aref *fee-filter-buckets* (1- (length *fee-filter-buckets*))))))
+
+(defun maybe-send-feefilter (peer mempool chain-state now)
+  "Core MaybeSendFeefilter (net_processing.cpp:5628-5669), driven from the
+periodic tick rather than once at handshake."
+  (when (and mempool
+             (not (ignore-incoming-txs-p))
+             ;; Core gates on the COMMON version; we never negotiate below our
+             ;; own, so the peer's advertised version is the common one.
+             (let ((v (peer-version peer)))
+               (and v (>= (bitcoin-lisp.serialization:version-message-version v)
+                          +feefilter-version+)))
+             (not (eq (peer-conn-type peer) :block-relay)))
+    (let ((current (if (initial-block-download-p chain-state)
+                       ;; Tx invs are discarded during IBD, so ask for none.
+                       most-positive-fixnum
+                       (bitcoin-lisp.mempool:mempool-decayed-rolling-min-fee-rate
+                        mempool now))))
+      ;; Leaving IBD must force a resend, or peers keep withholding txs for up
+      ;; to another 10 minutes.
+      (unless (initial-block-download-p chain-state)
+        (when (eql (peer-fee-filter-sent peer) (%feefilter-max-value))
+          (setf (peer-next-send-feefilter peer) 0)))
+      (cond
+        ((> now (peer-next-send-feefilter peer))
+         (let ((to-send (max (fee-filter-round current)
+                             (bitcoin-lisp.mempool:mempool-min-fee-rate mempool))))
+           (unless (eql to-send (peer-fee-filter-sent peer))
+             (send-message peer (bitcoin-lisp.serialization:make-feefilter-message to-send))
+             (setf (peer-fee-filter-sent peer) to-send))
+           ;; Advanced UNCONDITIONALLY, even when nothing was sent — otherwise
+           ;; the tick re-evaluates every second forever.
+           (setf (peer-next-send-feefilter peer)
+                 (+ now (%exponential-interval +avg-feefilter-broadcast-interval+)))))
+        ;; Substantially changed and the scheduled broadcast is far off: pull it
+        ;; forward. This branch only RESCHEDULES; it never sends.
+        ((and (peer-fee-filter-sent peer)
+              (< (+ now +max-feefilter-change-delay+) (peer-next-send-feefilter peer))
+              (or (< current (floor (* 3 (peer-fee-filter-sent peer)) 4))
+                  (> current (floor (* 4 (peer-fee-filter-sent peer)) 3))))
+         (setf (peer-next-send-feefilter peer)
+               (+ now (random (1+ +max-feefilter-change-delay+)))))))))
+
 (defun send-post-handshake-messages (peer)
   "Send feature negotiation messages after handshake completes."
   ;; BIP 130: Request header announcements
   (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message))
-  ;; BIP 133: Announce our minimum relay fee rate (1000 sat/kB = 1 sat/byte).
-  ;; Core MaybeSendFeefilter (net_processing.cpp:5628-5637) skips it in
-  ;; blocksonly mode (ignore_incoming_txs — -blocksonly, or our
-  ;; relay-disabled mainnet default) and on outbound block-relay-only
-  ;; connections, which never announce txs to us regardless. Note Core does
-  ;; NOT gate feefilter on the peer's own fRelay — an fRelay=0 peer still
-  ;; receives it (harmlessly).
-  (when (and (not (ignore-incoming-txs-p))
-             (not (eq (peer-conn-type peer) :block-relay)))
-    (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000)))
+  ;; BIP133 feefilter is NOT sent here. It is driven entirely by
+  ;; maybe-send-feefilter on the periodic tick, which sends the first filter
+  ;; within a second of the handshake. Sending from the handshake site as well
+  ;; would run the IBD check and the RNG on the inbound-listener thread, and
+  ;; would emit a filter for a connection that may still fail — for the sake of
+  ;; under a second of latency.
   ;; Address relay is set up for every outbound connection except
   ;; block-relay-only ones (Core SetupAddressRelay from the VERSION handler,
   ;; net_processing.cpp:3754+5697-5711); inbound peers enable it on their
@@ -1078,11 +1401,17 @@ logged. Returns T."
     (close-connection (peer-connection peer))
     (setf (peer-connection peer) nil))
   (setf (peer-state peer) :disconnected)
+  ;; This retires the peer without going through DISCONNECT-PEER, so it owes
+  ;; the protection slot back itself (Core FinalizeNode runs for every removal,
+  ;; misbehaviour included).
+  (release-outbound-protection peer)
   t)
 
 (defun ban-peer (peer)
   "Ban a peer. Sets state to :banned and records ban expiry."
   (setf (peer-state peer) :banned)
+  ;; Another retirement path that bypasses DISCONNECT-PEER (Core FinalizeNode).
+  (release-outbound-protection peer)
   (let ((address (peer-address peer)))
     (when (and address (plusp (length address)))
       (bt:with-lock-held (*ban-lock*)

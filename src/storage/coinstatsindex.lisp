@@ -299,11 +299,40 @@ the caller should stop/backfill)."
       (let ((stats (apply-block-to-coinstats
                     (if parent (%copy-coinstats parent) (make-coinstats))
                     block block-hash height spent-utxos subsidy)))
-        (leveldb-put (coinstatsindex-db csi) (%csi-stat-key height)
-                     (%csi-encode-stat stats))
-        (leveldb-put (coinstatsindex-db csi) *csi-meta-key*
-                     (%csi-encode-meta height block-hash))
+        ;; Record and best marker in ONE batch (Core BaseIndex::Commit writes
+        ;; CustomCommit's entries and the best-block locator in a single
+        ;; CDBBatch, index/base.cpp:270-288). As two separate puts, a kill
+        ;; between them left the marker naming a height whose record was not
+        ;; written, or a record no marker vouched for.
+        (let ((batch (leveldb-make-writebatch)))
+          (unwind-protect
+               (progn
+                 (leveldb-writebatch-put batch (%csi-stat-key height)
+                                         (%csi-encode-stat stats))
+                 (leveldb-writebatch-put batch *csi-meta-key*
+                                         (%csi-encode-meta height block-hash))
+                 (leveldb-write (coinstatsindex-db csi) batch))
+            (leveldb-destroy-writebatch batch)))
         stats))))
+
+(defun coinstatsindex-record-matches-block-p (csi block block-hash height
+                                              spent-utxos subsidy)
+  "T iff the stored record at HEIGHT is exactly what folding BLOCK into the
+stored record at HEIGHT-1 produces — that is, the record at HEIGHT was written
+for THIS block and not for a competing branch's block at the same height.
+
+Records are keyed by height alone, with no block hash. Core keys each record by
+pair<uint256, DBVal> and compares the stored hash against the expected one in
+RevertBlock (index/coinstatsindex.cpp:337-348); recomputing is the equivalent
+evidence, since a 3072-bit MuHash fraction plus eleven tallies cannot coincide
+by accident. NIL if either record is missing (nothing to compare against)."
+  (let ((stored (coinstatsindex-get-stats csi height))
+        (parent (and (plusp height) (coinstatsindex-get-stats csi (1- height)))))
+    (when (and stored parent)
+      (let ((computed (apply-block-to-coinstats
+                       (%copy-coinstats parent)
+                       block block-hash height spent-utxos subsidy)))
+        (equalp (%csi-encode-stat computed) (%csi-encode-stat stored))))))
 
 ;;; --- backfill over stored blocks ---
 

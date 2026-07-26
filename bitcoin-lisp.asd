@@ -143,6 +143,8 @@
                              (:file "mempool-shadow-tests")
                              ;; Package relay tests (submitpackage)
                              (:file "package-tests")
+                             ;; Opportunistic 1p1c package relay over P2P
+                             (:file "package-relay-tests")
                              ;; Mining / regtest tests
                              (:file "mining-tests")
                              ;; Deserializer robustness / fuzz tests
@@ -246,9 +248,15 @@
                              ;; Wallet P4: coin selection, spending RPCs,
                              ;; wallet signing, rebroadcast
                              (:file "wallet-spend-tests")
+                             ;; Process RNG seeding (*random-state* must not
+                             ;; replay SBCL's build-time stream on every start)
+                             (:file "entropy-tests")
                              ;; Wave 10: RPC boolean/error-code parity, HTTP
                              ;; layer, BIP64 getutxos, config wires, arg
                              ;; handling, banlist persistence
-                             (:file "wave10-tests"))))
+                             (:file "wave10-tests")
+                             ;; GA8 W1-A: intra-block coin overlay (chained-spend
+                             ;; script validation + same-block double spends)
+                             (:file "intrablock-coins-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))

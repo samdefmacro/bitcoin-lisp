@@ -328,7 +328,8 @@ is in play (the supervisor path); config parsing of -uacomment re-derives
                                         (user-agent *user-agent*)
                                         (start-height 0)
                                         (relay t)
-                                        addr-recv)
+                                        addr-recv
+                                        nonce)
   "Create a serialized version message. ADDR-RECV (\"addr_you\"), when given,
 is a net-addr carrying the peer's own address; the default is the all-zero
 empty address. addr_from is ALWAYS the all-zero empty address — that is
@@ -342,7 +343,11 @@ divergence from Core's empty CService.)"
               :timestamp timestamp
               :addr-recv (or addr-recv (make-empty-net-addr :services services))
               :addr-from (make-empty-net-addr :services services)
-              :nonce (random (expt 2 64))
+              ;; Caller-supplied per-connection nonce (Core CNode's
+              ;; nLocalHostNonce). The default keeps standalone/test callers
+              ;; working; the live handshake always passes the peer's own
+              ;; nonce so self-connections can be detected.
+              :nonce (or nonce (random (expt 2 64)))
               :user-agent user-agent
               :start-height start-height
               :relay relay)))

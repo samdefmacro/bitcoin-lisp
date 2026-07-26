@@ -267,114 +267,67 @@ supplied-but-false :webui; nothing is supplied when the flags are absent."
     (is (null (member :webui-open plist)))))
 
 ;;; --- End-to-end over a real acceptor ---
-
-(defun %http-raw-request (port lines &optional body)
-  "Send an HTTP request (header LINES + optional BODY, CRLF framing) to
-127.0.0.1:PORT and return the whole response as a string."
-  (let ((request
-          (with-output-to-string (s)
-            (dolist (line lines)
-              (write-string line s)
-              (write-char #\Return s)
-              (write-char #\Linefeed s))
-            (write-char #\Return s)
-            (write-char #\Linefeed s)
-            (when body (write-string body s)))))
-    (usocket:with-client-socket (socket stream "127.0.0.1" port
-                                 :element-type '(unsigned-byte 8) :timeout 15)
-      (write-sequence (flexi-streams:string-to-octets request :external-format :utf-8)
-                      stream)
-      (force-output stream)
-      (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
-                                 :adjustable t :fill-pointer 0)))
-        (loop for b = (read-byte stream nil nil)
-              while b do (vector-push-extend b bytes))
-        (flexi-streams:octets-to-string
-         (coerce bytes '(vector (unsigned-byte 8))) :external-format :utf-8)))))
-
-(defun %http-status (response)
-  "The status code of an \"HTTP/1.1 NNN ...\" response string."
-  (parse-integer response :start 9 :junk-allowed t))
-
-(defun %http-post-rpc (port json &key origin auth)
-  "POST JSON to / on 127.0.0.1:PORT, optionally with Origin and Basic AUTH."
-  (%http-raw-request
-   port
-   (append (list "POST / HTTP/1.1"
-                 (format nil "Host: 127.0.0.1:~D" port))
-           (when origin (list (format nil "Origin: ~A" origin)))
-           (when auth
-             (list (format nil "Authorization: Basic ~A"
-                           (cl-base64:string-to-base64-string auth))))
-           (list "Content-Type: application/json"
-                 (format nil "Content-Length: ~D" (length json))
-                 "Connection: close"))
-   json))
-
-(defun %http-get (port path)
-  (%http-raw-request
-   port
-   (list (format nil "GET ~A HTTP/1.1" path)
-         (format nil "Host: 127.0.0.1:~D" port)
-         "Connection: close")))
+;;;
+;;; The raw HTTP client helpers (%http-get, %http-post-rpc, %http-status) live
+;;; in rpc-tests.lisp, which loads first.
 
 (test ui-server-end-to-end
   "Live acceptor: /ui/ serves html, traversal 404s, Origin mismatch is 403
-before auth, Origin-absent and same-origin POSTs pass, batch works with
-cookie credentials."
+before auth, Origin-absent and same-origin POSTs pass with the cookie
+credential, batch works with it too."
   (bitcoin-lisp.rpc:stop-rpc-server)
-  (let* ((port 19981)
-         (dir (ensure-directories-exist
-               (merge-pathnames (format nil "ui-e2e-~D/" (get-universal-time))
-                                (uiop:temporary-directory))))
-         (node (make-test-node)))
-    (setf (bitcoin-lisp::node-data-directory node) dir)
-    (unwind-protect
-         (progn
-           (is (not (null (bitcoin-lisp.rpc:start-rpc-server
-                           node :port port :ui-enabled t))))
-           ;; /ui/ -> 200 text/html with the shell
-           (let ((r (%http-get port "/ui/")))
-             (is (= 200 (%http-status r)))
-             (is (search "content-type: text/html" (string-downcase r)))
-             (is (search "<title>" r)))
-           ;; asset with its own content type
-           (let ((r (%http-get port "/ui/js/rpc.js")))
-             (is (= 200 (%http-status r)))
-             (is (search "content-type: text/javascript" (string-downcase r))))
-           ;; traversal is rejected, repo sources are not reachable
-           (let ((r (%http-get port "/ui/../src/rpc/server.lisp")))
-             (is (= 404 (%http-status r)))
-             (is (not (search "(in-package" r))))
-           ;; cross-origin POST -> 403 (before auth; no WWW-Authenticate)
-           (let ((r (%http-post-rpc
-                     port "{\"method\":\"getblockcount\",\"id\":1}"
-                     :origin "http://evil.example")))
-             (is (= 403 (%http-status r))))
-           ;; Origin absent (curl / bitcoin-cli style) -> works
-           (let ((r (%http-post-rpc port "{\"method\":\"getblockcount\",\"id\":1}")))
-             (is (= 200 (%http-status r)))
-             (is (search "\"result\"" r)))
-           ;; same-origin POST -> works
-           (let ((r (%http-post-rpc
-                     port "{\"method\":\"getblockcount\",\"id\":1}"
-                     :origin (format nil "http://127.0.0.1:~D" port))))
-             (is (= 200 (%http-status r))))
-           ;; batch with the generated cookie credential (the UI login path)
-           (let* ((cookie-path (merge-pathnames ".cookie" dir))
-                  (cookie (alexandria:read-file-into-string cookie-path))
-                  (r (%http-post-rpc
-                      port
-                      "[{\"method\":\"getblockcount\",\"id\":1},{\"method\":\"uptime\",\"id\":2}]"
-                      :auth cookie)))
-             (is (= 200 (%http-status r)))
-             (let* ((json-start (position #\[ r))
-                    (parsed (yason:parse (subseq r json-start))))
-               (is (= 2 (length parsed)))
-               (is (every (lambda (resp) (nth-value 1 (gethash "result" resp)))
-                          parsed)))))
-      (bitcoin-lisp.rpc:stop-rpc-server)
-      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+  (with-rpc-test-datadir (dir)
+    (let ((port 19981)
+          (node (make-test-node))
+          (cookie nil))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server
+                             node :port port :ui-enabled t))))
+             (setf cookie (alexandria:read-file-into-string
+                           (merge-pathnames ".cookie" dir)))
+             ;; /ui/ -> 200 text/html with the shell
+             (let ((r (%http-get port "/ui/")))
+               (is (= 200 (%http-status r)))
+               (is (search "content-type: text/html" (string-downcase r)))
+               (is (search "<title>" r)))
+             ;; asset with its own content type
+             (let ((r (%http-get port "/ui/js/rpc.js")))
+               (is (= 200 (%http-status r)))
+               (is (search "content-type: text/javascript" (string-downcase r))))
+             ;; traversal is rejected, repo sources are not reachable
+             (let ((r (%http-get port "/ui/../src/rpc/server.lisp")))
+               (is (= 404 (%http-status r)))
+               (is (not (search "(in-package" r))))
+             ;; cross-origin POST -> 403 (before auth; no WWW-Authenticate)
+             (let ((r (%http-post-rpc
+                       port "{\"method\":\"getblockcount\",\"id\":1}"
+                       :origin "http://evil.example" :auth cookie)))
+               (is (= 403 (%http-status r))))
+             ;; Origin absent (curl / bitcoin-cli style) -> works
+             (let ((r (%http-post-rpc port "{\"method\":\"getblockcount\",\"id\":1}"
+                                      :auth cookie)))
+               (is (= 200 (%http-status r)))
+               (is (search "\"result\"" r)))
+             ;; same-origin POST -> works
+             (let ((r (%http-post-rpc
+                       port "{\"method\":\"getblockcount\",\"id\":1}"
+                       :origin (format nil "http://127.0.0.1:~D" port)
+                       :auth cookie)))
+               (is (= 200 (%http-status r))))
+             ;; batch with the generated cookie credential (the UI login path)
+             (let ((r (%http-post-rpc
+                       port
+                       "[{\"method\":\"getblockcount\",\"id\":1},{\"method\":\"uptime\",\"id\":2}]"
+                       :auth cookie)))
+               (is (= 200 (%http-status r)))
+               (let* ((json-start (position #\[ r))
+                      (parsed (yason:parse (subseq r json-start))))
+                 (is (= 2 (length parsed)))
+                 (is (every (lambda (resp) (nth-value 1 (gethash "result" resp)))
+                            parsed)))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
 
 (test ui-server-auth-still-enforced
   "With rpcuser/rpcpassword configured, wrong Basic credentials 401 and
@@ -404,14 +357,16 @@ correct ones pass — the Origin check must not weaken auth."
   "With the UI flag off, no /ui/ dispatcher exists — a GET lands on the
 RPC prefix dispatcher and is refused (405), never served."
   (bitcoin-lisp.rpc:stop-rpc-server)
-  (let ((port 19983)
-        (node (make-test-node)))
-    (unwind-protect
-         (progn
-           (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
-           (is (null bitcoin-lisp.rpc::*ui-dispatcher*))
-           (let ((r (%http-get port "/ui/")))
-             (is (member (%http-status r) '(404 405))
-                 "GET /ui/ with UI off must not serve (got ~A)" (%http-status r))
-             (is (not (search "<title>" r)))))
-      (bitcoin-lisp.rpc:stop-rpc-server))))
+  (with-rpc-test-datadir (dir)
+    (let ((port 19983)
+          (node (make-test-node)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             (is (null bitcoin-lisp.rpc::*ui-dispatcher*))
+             (let ((r (%http-get port "/ui/")))
+               (is (member (%http-status r) '(404 405))
+                   "GET /ui/ with UI off must not serve (got ~A)" (%http-status r))
+               (is (not (search "<title>" r)))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))

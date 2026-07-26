@@ -672,14 +672,26 @@ Drives the TXID_RELAY_DELAY on txid-based announcements."
                              (peer-wtxid-relay p)))
             peers))
 
-(defun %already-have-tx-p (hash wtxidp mempool recent-rejects)
+(defun %already-have-tx-p (hash wtxidp mempool recent-rejects
+                           &optional include-reconsiderable)
   "Core AlreadyHaveTx (txdownloadman_impl.cpp:126-148): the orphanage (HASH
 cast to a wtxid — never a real txid lookup, witness malleation makes txid
 matches unreliable; for non-segwit txs txid == wtxid so the cast still finds
 them), the recent-confirmed filter, recent rejects, and the mempool by the id
-the announcement implies."
+the announcement implies.
+
+INCLUDE-RECONSIDERABLE is Core's parameter of the same name (declared at
+:125, consulted at :142). Core passes TRUE at exactly one site,
+AddTxAnnouncement (:199); every other caller passes false (:180, :274, :395,
+:527). Set it where the question is \"is there any point requesting this?\" —
+a tx that failed reconsiderably must not be re-downloaded to be submitted
+alone. Leave it NIL where the question is \"can this still be resolved?\" —
+notably when filtering an orphan's missing parents, since a low-feerate
+parent is exactly what the orphan may be able to fee-bump (:393-395)."
   (or (bitcoin-lisp.mempool:orphan-have
        (bitcoin-lisp.mempool:mempool-orphan-pool mempool) hash)
+      (and include-reconsiderable
+           (bitcoin-lisp.validation:reconsiderable-reject-p hash))
       (bitcoin-lisp.validation:recently-confirmed-p hash)
       (bitcoin-lisp:recent-reject-p recent-rejects hash)
       (if wtxidp
@@ -781,7 +793,10 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
                           hash))
                     (%maybe-add-orphan-resolution-candidate
                      peer hash mempool utxo-set recent-rejects num-wtxid-peers))
-                   ((%already-have-tx-p hash wtxidp mempool recent-rejects)
+                   ;; include-reconsiderable: a tx whose last failure was
+                   ;; reconsiderable must not be requested to be submitted
+                   ;; alone again (Core AddTxAnnouncement, :199).
+                   ((%already-have-tx-p hash wtxidp mempool recent-rejects t)
                     nil)
                    ;; Records PEER as an announcer AND the id type of the
                    ;; announcement (wtxid vs txid), so a timed-out request
@@ -927,32 +942,75 @@ never received the branch's blocks."
                        :context-free-only t)
                     (if valid (progn (%connect) (values t nil)) (values nil error))))))))))
 
+(defun %block-newly-connected-p (chain-state hash tip-before)
+  "T when accepting the block HASH actually ADVANCED the active chain onto it.
+TIP-BEFORE is BEST-BLOCK-HASH sampled before ACCEPT-DOWNLOADED-BLOCK ran.
+
+This is the BlockChecked gate. Core reaches
+MaybeSetPeerAsAnnouncingHeaderAndIDs only from BlockChecked's `state.IsValid()'
+arm (net_processing.cpp:2214-2223), and the only emit site that can produce a
+VALID state is ConnectTip (validation.cpp:3070): ProcessNewBlock's other emit
+(:4455) is the AcceptBlock-failure path, and a block we already have
+short-circuits inside AcceptBlock long before ConnectTip. So a block Core never
+connects promotes nobody, and a REPLAY of a block we already hold promotes
+nobody either.
+
+ACCEPT-DOWNLOADED-BLOCK's `valid' value cannot express that on its own: it is T
+for a block merely STORED on a side branch (the :context-free-only arm above)
+and T again for a block we already hold — including a replay of our own tip,
+for which `(equalp (best-block-hash cs) hash)' alone is TRIVIALLY TRUE, since
+the tip already is that block. Hence TIP-BEFORE: the tip must have MOVED, and
+it must have moved onto this very block. Without it any inbound peer that sent
+sendcmpct could echo our own tip back and buy a high-bandwidth slot for free,
+repeatedly, choosing which honest peer the cap-of-3 eviction demotes.
+
+Conservative in exactly one direction, deliberately: if accepting HASH also
+reconnects already-stored descendants, the tip lands above it and we do not
+promote where Core would. Failing closed costs a little bandwidth; failing open
+sells an HB slot."
+  (and (not (equalp tip-before hash))
+       (equalp (bitcoin-lisp.storage:best-block-hash chain-state) hash)))
+
 (defun handle-block (peer payload chain-state utxo-set block-store
                      &optional mempool fee-estimator &key recent-rejects peers)
   "Handle a block message. When PEERS is supplied and the block becomes the new
 active tip, announce it onward (BIP 130 headers / inv), so the node propagates
-blocks instead of being a sink."
+blocks instead of being a sink. A peer that delivers a block that CONNECTS
+earns consideration for high-bandwidth compact-block announcements — Core
+drives that off mapBlockSource (net_processing.cpp:2202, 2218-2223), which is
+filled for plain block messages exactly as it is for reconstructed compact
+ones, so promotion must not be a compact-block-only privilege."
   (let ((block (bitcoin-lisp.serialization:parse-block-payload payload)))
     (when block
-      (with-node-lock
-        (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
-               (hash (bitcoin-lisp.serialization:block-header-hash header)))
-          (multiple-value-bind (valid error)
-              (accept-downloaded-block block chain-state utxo-set block-store
-                                       :mempool mempool
-                                       :fee-estimator fee-estimator
-                                       :recent-rejects recent-rejects)
-            (if valid
-                ;; Announce onward only if this block is now the active tip
-                ;; (accept may have stored a side block or reorged).
-                (when (and peers
-                           (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
-                                   hash))
-                  (relay-block header peer peers))
-                (progn
-                  (bitcoin-lisp:log-warn "Block ~A rejected: ~A"
-                                         (bitcoin-lisp.crypto:bytes-to-hex hash) error)
-                  (record-misbehavior peer "invalid block")))))))))
+      (let ((connected
+              (with-node-lock
+                (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+                       (hash (bitcoin-lisp.serialization:block-header-hash header))
+                       (tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
+                  (multiple-value-bind (valid error)
+                      (accept-downloaded-block block chain-state utxo-set block-store
+                                               :mempool mempool
+                                               :fee-estimator fee-estimator
+                                               :recent-rejects recent-rejects)
+                    (cond
+                      (valid
+                       ;; Announce onward only if this block is now the active
+                       ;; tip (accept may have stored a side block or reorged).
+                       (when (and peers
+                                  (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                                          hash))
+                         (relay-block header peer peers))
+                       ;; Promotion needs strictly more than acceptance: the
+                       ;; block must have CONNECTED (see %block-newly-connected-p).
+                       (%block-newly-connected-p chain-state hash tip-before))
+                      (t
+                       (bitcoin-lisp:log-warn "Block ~A rejected: ~A"
+                                              (bitcoin-lisp.crypto:bytes-to-hex hash) error)
+                       (record-misbehavior peer "invalid block")
+                       nil)))))))
+        ;; Outside the node lock: promotion writes sendcmpct to up to two peers.
+        (when connected
+          (maybe-promote-block-deliverer peer chain-state))))))
 
 ;;; Address handling
 
@@ -1011,39 +1069,101 @@ source is marked as knowing it too). Returns the number of peers sent to."
                  (incf sent)))
     sent))
 
-(defun peer-source-group (peer)
-  "Net-group key of PEER's own address, for addrman source bucketing (Core
-AddrMan::Add's source argument) — network-typed, so onion/i2p/cjdns peers
-get their proper source groups. NIL for hostname peers (addnode by name)."
-  (multiple-value-bind (net bytes) (parse-network-address (peer-address peer))
-    (when net (net-group-key bytes net))))
+(defun peer-source-address (peer)
+  "PEER's own address as (VALUES net ip-bytes net-group-key) — addrman's
+`source` argument (Core AddrMan::Add). The group keys new-bucket placement so
+one source cannot dominate our address set; the address itself identifies a
+self-announcement, which Core exempts from the gossip time penalty
+(addrman.cpp:559-563). Network-typed, so onion/i2p/cjdns peers get their
+proper source groups. All NIL for a hostname peer (addnode by name) or no
+peer at all."
+  (when peer
+    (multiple-value-bind (net bytes) (parse-network-address (peer-address peer))
+      (when net (values net bytes (net-group-key bytes net))))))
 
-(defun %ingest-gossiped-address (net-addr timestamp address-book source-group now)
+;;; Gossiped-address timestamp handling (Core's ADDR handler,
+;;; net_processing.cpp:4087-4114). Age is NOT an admission rule: Core stores
+;;; whatever it is told and lets addrman drop stale entries at SELECTION time
+;;; (ADDRMAN_HORIZON, 30 days — addr-info-terrible-p here). Core's own DNS-seed
+;;; path deliberately mints entries aged 3-7 days (net.cpp:2375), so any
+;;; storage-side freshness window would throw away exactly the addresses a
+;;; getaddr response exists to deliver.
+
+(defconstant +addr-time-init+ 100000000
+  "CAddress::TIME_INIT (protocol.h): a gossiped timestamp at or below this
+(1973-03-03) is not a real observation, it is an unset field.")
+
+(defconstant +addr-absurd-time-replacement-seconds+ (* 5 24 60 60)
+  "How far in the past an absurd gossiped timestamp is rewritten to — 5 days
+(net_processing.cpp:4092). Old enough not to be relayed onward or preferred by
+selection, young enough to stay inside the 30-day addrman horizon.")
+
+(defconstant +addr-gossip-time-penalty-seconds+ (* 2 60 60)
+  "Time penalty applied when STORING a gossiped address (Core's
+/*time_penalty=*/2h at net_processing.cpp:4114): hearsay about a peer is
+weaker evidence of liveness than having connected to it ourselves.")
+
+(defun may-have-useful-address-db-p (services)
+  "Core's storage service filter for gossiped addresses
+(net_processing.cpp:4087, MayHaveUsefulAddressDB): a peer advertising neither
+NODE_NETWORK nor NODE_NETWORK_LIMITED is not worth remembering. Core writes it
+as `!MayHaveUsefulAddressDB(s) && !HasAllDesirableServiceFlags(s)`, but the
+second test cannot rescue an address the first rejects — the desirable set
+always contains NODE_NETWORK or NODE_NETWORK_LIMITED
+(GetDesirableServiceFlags, net_processing.cpp:1759-1768) — so the pair reduces
+to this one bit test."
+  (logtest services (logior bitcoin-lisp.serialization:+node-network+
+                            bitcoin-lisp.serialization:+node-network-limited+)))
+
+(defun %ingest-gossiped-address (net-addr timestamp address-book source-group now
+                                 &optional source-net source-ip)
   "Shared addr/addrv2 ingestion for one gossiped NET-ADDR (Core's per-address
 loop in the ADDR handler, net_processing.cpp:4056-4098) learned from a peer
-with net-group key SOURCE-GROUP. Stores it in ADDRESS-BOOK only when its
-network is REACHABLE (-onlynet; Core \"Do not store addresses outside our
-network\"), but fresh (10-min) ROUTABLE addresses are relay candidates
-regardless — an unreachable-net address still relays, just to 1 peer instead
-of 2 (Core RelayAddress fReachable). Returns (VALUES stored relay-entry):
-STORED is 1/0 for the caller's log count, RELAY-ENTRY a
-(peer-address . max-targets) cons when the address should be gossiped onward."
+with net-group key SOURCE-GROUP and own address SOURCE-NET/SOURCE-IP. Stores
+it in ADDRESS-BOOK only when its network is REACHABLE (-onlynet; Core \"Do not
+store addresses outside our network\"), but fresh (10-min) ROUTABLE addresses
+are relay candidates regardless — an unreachable-net address still relays,
+just to 1 peer instead of 2 (Core RelayAddress fReachable).
+
+Age gates RELAY only, never storage. An absurd timestamp (unset, or more than
+10 minutes ahead of us) is rewritten to now - 5 days and stored anyway
+(net_processing.cpp:4090-4092) rather than dropped; the stored copy carries
+the 2h gossip penalty, waived for a peer announcing itself. Addresses whose
+services bits promise no useful address DB are skipped entirely — neither
+stored nor relayed, as in Core.
+
+Returns (VALUES stored relay-entry): STORED is 1/0 for the caller's log count,
+RELAY-ENTRY a (peer-address . max-targets) cons when the address should be
+gossiped onward."
   (unless (and address-book timestamp
-               (<= (abs (- now timestamp)) (* 3 3600)))
+               (may-have-useful-address-db-p
+                (bitcoin-lisp.serialization:net-addr-services net-addr)))
     (return-from %ingest-gossiped-address (values 0 nil)))
-  (let* ((pa (make-peer-address
+  (let* ((time (if (or (<= timestamp +addr-time-init+)
+                       (> timestamp (+ now 600)))
+                   (max 0 (- now +addr-absurd-time-replacement-seconds+))
+                   timestamp))
+         (pa (make-peer-address
               :net (bitcoin-lisp.serialization:net-addr-net net-addr)
               :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
               :port (bitcoin-lisp.serialization:net-addr-port net-addr)
               :services (bitcoin-lisp.serialization:net-addr-services net-addr)
-              :last-seen timestamp))
+              :last-seen time))
          (network (peer-address-network pa))
-         (reachable (reachable-network-p network)))
+         (reachable (reachable-network-p network))
+         ;; Core: "Do not set a penalty for a source's self-announcement"
+         ;; (addrman.cpp:559-563; the comparison is CNetAddr, so port-blind).
+         (penalty (if (and source-net (eq source-net network)
+                           (equalp source-ip (peer-address-ip pa)))
+                      0
+                      +addr-gossip-time-penalty-seconds+)))
     (when reachable
-      (address-book-add address-book pa source-group))
+      (address-book-add address-book pa source-group penalty))
     (values (if reachable 1 0)
-            ;; Core relays only fresh (10-min) routable addrs.
-            (when (and (> timestamp (- now 600))
+            ;; Core relays only fresh (10-min) routable addrs — on the
+            ;; rewritten timestamp, so a "flying DeLorean" address cannot buy
+            ;; itself relay by claiming a future time.
+            (when (and (> time (- now 600))
                        (address-routable-p (peer-address-ip pa) network))
               (cons pa (if reachable 2 1))))))
 
@@ -1075,53 +1195,56 @@ attacker cannot choose which addresses survive the limit (Core std::shuffle).
 Fresh routable addresses from small (<=10) UNSOLICITED announcements relay
 onward; a non-full message marks our outstanding getaddr answered. Returns
 the number stored."
-  (let* ((now (bitcoin-lisp.serialization:get-unix-time))
-         (source-group (when peer (peer-source-group peer)))
-         ;; Read before the end-of-message reset below, like Core (the reset
-         ;; runs after the loop): a getaddr response never relays onward.
-         (unsolicited (not (and peer (peer-getaddr-requested peer))))
-         (added 0)
-         (num-proc 0)
-         (num-rate-limit 0)
-         (relay-candidates '()))
-    (when peer
-      (%refill-addr-token-bucket peer))
-    (dolist (entry (alexandria:shuffle (copy-list entries)))
-      (cond
-        ((and peer (< (peer-addr-token-bucket peer) 1.0d0))
-         (incf num-rate-limit))
-        (t
-         (when peer
-           (decf (peer-addr-token-bucket peer) 1.0d0)
-           (incf num-proc))
-         (multiple-value-bind (stored relay)
-             (%ingest-gossiped-address (car entry) (cdr entry)
-                                       address-book source-group now)
-           (incf added stored)
-           (when relay (push relay relay-candidates))))))
-    (when peer
-      (incf (peer-addr-processed peer) num-proc)
-      (incf (peer-addr-rate-limited peer) num-rate-limit)
-      (when (plusp num-rate-limit)
-        (bitcoin-lisp:log-cat "net" "addr from peer ~A: ~D processed, ~D rate-limited"
-                              (peer-address peer) num-proc num-rate-limit))
-      ;; A non-full message answers our getaddr (Core: "if (vAddr.size() <
-      ;; 1000) peer.m_getaddr_sent = false", net_processing.cpp:4116).
-      (when (< announced-count bitcoin-lisp.serialization:+max-addr-count+)
-        (setf (peer-getaddr-requested peer) nil)))
-    (when (and peers unsolicited (<= announced-count 10))
-      (loop for (pa . max-targets) in relay-candidates
-            do (relay-address pa peer peers :now now :max-targets max-targets)))
-    added))
+  (multiple-value-bind (source-net source-ip source-group)
+      (peer-source-address peer)
+    (let* ((now (bitcoin-lisp.serialization:get-unix-time))
+           ;; Read before the end-of-message reset below, like Core (the reset
+           ;; runs after the loop): a getaddr response never relays onward.
+           (unsolicited (not (and peer (peer-getaddr-requested peer))))
+           (added 0)
+           (num-proc 0)
+           (num-rate-limit 0)
+           (relay-candidates '()))
+      (when peer
+        (%refill-addr-token-bucket peer))
+      (dolist (entry (alexandria:shuffle (copy-list entries)))
+        (cond
+          ((and peer (< (peer-addr-token-bucket peer) 1.0d0))
+           (incf num-rate-limit))
+          (t
+           (when peer
+             (decf (peer-addr-token-bucket peer) 1.0d0)
+             (incf num-proc))
+           (multiple-value-bind (stored relay)
+               (%ingest-gossiped-address (car entry) (cdr entry)
+                                         address-book source-group now
+                                         source-net source-ip)
+             (incf added stored)
+             (when relay (push relay relay-candidates))))))
+      (when peer
+        (incf (peer-addr-processed peer) num-proc)
+        (incf (peer-addr-rate-limited peer) num-rate-limit)
+        (when (plusp num-rate-limit)
+          (bitcoin-lisp:log-cat "net" "addr from peer ~A: ~D processed, ~D rate-limited"
+                                (peer-address peer) num-proc num-rate-limit))
+        ;; A non-full message answers our getaddr (Core: "if (vAddr.size() <
+        ;; 1000) peer.m_getaddr_sent = false", net_processing.cpp:4116).
+        (when (< announced-count bitcoin-lisp.serialization:+max-addr-count+)
+          (setf (peer-getaddr-requested peer) nil)))
+      (when (and peers unsolicited (<= announced-count 10))
+        (loop for (pa . max-targets) in relay-candidates
+              do (relay-address pa peer peers :now now :max-targets max-targets)))
+      added)))
 
 (defun handle-addr (peer payload &optional address-book peers)
-  "Handle an addr message. When ADDRESS-BOOK is provided, add plausible
-addresses (timestamp within last 3 hours) on reachable networks to the address
-book, keyed to the gossiping PEER as their source (addrman source-group
-spreading), subject to the per-address token bucket (see
-%process-gossiped-addresses). Ignored entirely from a block-relay-only peer
-(Core SetupAddressRelay, net_processing.cpp:4041); more than 1000 announced
-addresses is misbehavior (net_processing.cpp:4046-4050)."
+  "Handle an addr message. When ADDRESS-BOOK is provided, add the addresses on
+reachable networks to the address book regardless of age (absurd timestamps are
+rewritten, not dropped — see %ingest-gossiped-address), keyed to the gossiping
+PEER as their source (addrman source-group spreading), subject to the
+per-address token bucket (see %process-gossiped-addresses). Ignored entirely
+from a block-relay-only peer (Core SetupAddressRelay,
+net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
+(net_processing.cpp:4046-4050)."
   (when (and peer (eq (peer-conn-type peer) :block-relay))
     (bitcoin-lisp:log-cat "net" "ignoring addr message from block-relay-only peer ~A"
                           (peer-address peer))
@@ -1152,10 +1275,11 @@ addresses is misbehavior (net_processing.cpp:4046-4050)."
 
 (defun handle-addrv2 (peer payload &optional address-book peers)
   "Handle an addrv2 message (BIP 155). When ADDRESS-BOOK is provided, add
-addresses of any representable network (IPv4/IPv6/TORv3/I2P/CJDNS) with
-plausible timestamps (within 3 hours) to the address book — non-IP networks
-only when reachable (-onlynet + proxy/flag gates), subject to the per-address
-token bucket (see %process-gossiped-addresses). Unknown network ids were
+addresses of any representable network (IPv4/IPv6/TORv3/I2P/CJDNS) to the
+address book regardless of age (absurd timestamps are rewritten, not dropped —
+see %ingest-gossiped-address) — non-IP networks only when reachable (-onlynet
++ proxy/flag gates), subject to the per-address token bucket (see
+%process-gossiped-addresses). Unknown network ids were
 already skipped by the codec; a count above 1000 fails parsing (Core
 Misbehaving path — the caller disconnects). Ignored entirely from a
 block-relay-only peer (Core SetupAddressRelay)."
@@ -1181,6 +1305,63 @@ block-relay-only peer (Core SetupAddressRelay)."
       added)))
 
 ;;; Transaction handling
+
+(defparameter +reconsiderable-tx-failures+
+  '(:insufficient-fee :replacement-failed :mempool-full)
+  "The rejection reasons Bitcoin Core classifies TX_RECONSIDERABLE — \"fails
+some policy, but might be acceptable if submitted in a (different) package\"
+(consensus/validation.h:48). Core's four sites: both fee-floor failures in
+CheckFeeRate (validation.cpp:703-711), the RBF anti-DoS fee check (:1010)
+and the RBF diagram check (:1028) — our :replacement-failed — and \"mempool
+full\", i.e. a tx that self-evicted on the post-add trim (:1399-1402).
+
+NOT reconsiderable, and so still cached in the MAIN filter: :too-large-cluster
+(Core TX_MEMPOOL_POLICY, validation.cpp:1020-1022) — a cluster-limit failure
+is not a fee problem and a package cannot fix it.")
+
+(defun %reconsiderable-failure-p (reason)
+  "T if REASON is one Core would mark TX_RECONSIDERABLE."
+  (and (member reason +reconsiderable-tx-failures+) t))
+
+(defun %cache-tx-rejection (tx reason recent-rejects)
+  "Core MempoolRejectedTx's caching rules, for the first_time_failure=false
+callers this node has (txdownloadman_impl.cpp:350-484):
+
+  - :missing-input is cached NOWHERE (:361-364). Core's TX_MISSING_INPUTS
+    branch does orphan INTAKE, and only when first_time_failure is true;
+    at first_time_failure=false — which is what every caller here is — the
+    whole branch is a no-op. A missing input is not a verdict on the
+    transaction: the parent may still arrive, or the pair may still be
+    submitted as a package. Caching it in the main filter would black-hole
+    the CHILD of a CPFP pair, which is the mirror of the bug the
+    reconsiderable filter exists to fix. This arm matters because a
+    package member can REACH here carrying :missing-input: a package-LEVEL
+    failure (TRUC topology, package RBF, cluster limits, ephemeral dust, or
+    the quit-early path) leaves the child's nonfinal phase-1 result
+    untouched, and Core deliberately carries that nonfinal
+    TX_MISSING_INPUTS into results_final (validation.cpp:1759-1763) so that
+    ProcessPackageResult can see it and do nothing with it.
+  - RECONSIDERABLE failures go to the SEPARATE reconsiderable filter, keyed
+    by wtxid (:454-459). They must not enter the main filter: an entry there
+    is permanent until the next block, and would black-hole the transaction
+    — the parent of a CPFP package would never be accepted, mined or
+    relayed, no matter how much fee its child brings.
+  - :witness-stripped is cached NOWHERE (:438-439): wtxid == txid for such a
+    tx, so caching would poison the TXID of the real, witnessed transaction.
+  - Everything else is cached in the main filter under the WTXID only —
+    the witness is malleable (Core issue #8279) — plus the TXID for
+    :nonstandard-inputs, a failure that depends only on the txid (:471-484)."
+  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+        (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+    (cond
+      ((eq reason :missing-input) nil)
+      ((eq reason :witness-stripped) nil)
+      ((%reconsiderable-failure-p reason)
+       (bitcoin-lisp.validation:add-reconsiderable-reject wtxid))
+      (t
+       (bitcoin-lisp:add-recent-reject recent-rejects wtxid)
+       (when (and (eq reason :nonstandard-inputs) (not (equalp wtxid txid)))
+         (bitcoin-lisp:add-recent-reject recent-rejects txid))))))
 
 (defun process-orphans (accepted-txid utxo-set mempool chain-state peers
                         &key recent-rejects)
@@ -1218,20 +1399,12 @@ by TXID, so the cascade work list carries txids."
                          (push otxid work))))   ; cascade to this tx's dependents
                     ((eq error :missing-input) nil)   ; still missing another parent
                     (t (bitcoin-lisp.mempool:orphan-remove pool owtxid)  ; now invalid
-                       (when recent-rejects
-                         ;; Same insertion rules as handle-tx — Core routes
-                         ;; orphan re-validation failures through the same
-                         ;; MempoolRejectedTx (txdownloadman_impl.cpp:438-484):
-                         ;; wtxid-keyed (witness malleability — Core issue
-                         ;; #8279), nothing at all for a witness-stripped
-                         ;; failure (wtxid == txid there — caching would poison
-                         ;; the real tx's txid), plus the txid for
-                         ;; :nonstandard-inputs (txid-only failure).
-                         (unless (eq error :witness-stripped)
-                           (bitcoin-lisp:add-recent-reject recent-rejects owtxid)
-                           (when (and (eq error :nonstandard-inputs)
-                                      (not (equalp owtxid otxid)))
-                             (bitcoin-lisp:add-recent-reject recent-rejects otxid)))))))))))))))
+                       ;; Same insertion rules as handle-tx — Core routes
+                       ;; orphan re-validation failures through the same
+                       ;; MempoolRejectedTx. This is Core's
+                       ;; first_time_failure=false path, so no 1p1c retry is
+                       ;; attempted here (net_processing.cpp:3207-3211).
+                       (%cache-tx-rejection otx error recent-rejects))))))))))))
 
 (defun missing-parent-txids (tx utxo-set mempool)
   "Deduplicated txids of TX's inputs found in neither the UTXO set nor the
@@ -1292,6 +1465,143 @@ over like any other (Core routes them through the same m_txrequest)."
       (send-message peer (bitcoin-lisp.serialization:make-getdata-message invs)))
     (or invs t)))
 
+;;; --- Opportunistic 1-parent-1-child package relay ---
+;;;
+;;; The reason the reconsiderable filter exists. A CPFP package (an LN
+;;; commitment transaction paying no fee of its own, plus the child that
+;;; fee-bumps it) arrives as two separate `tx` messages, and neither can be
+;;; accepted alone: the parent is under the fee floor, the child has a
+;;; missing input. Core pairs them up opportunistically — the parent's
+;;; reconsiderable failure triggers a search of the orphanage for a child
+;;; that spends it, and the two are submitted together through the ordinary
+;;; package-validation path (net_processing.cpp:4523-4527, :4543-4547).
+
+(defun %after-mempool-accept (tx peer peers utxo-set mempool chain-state
+                              recent-rejects)
+  "The shared tail for a transaction that has just entered the mempool from
+the P2P path (Core ProcessValidTx -> MempoolAcceptedTx,
+txdownloadman_impl.cpp:323-333): forget it as an orphan, relay it, and run
+the de-orphan cascade over the children waiting on it. PEER is the source,
+excluded from relay."
+  (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+        (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+    ;; It may have been in our orphanage (announced by another peer, or held
+    ;; while a parent was fetched); Core's EraseTx is a no-op otherwise.
+    (bitcoin-lisp.mempool:orphan-remove
+     (bitcoin-lisp.mempool:mempool-orphan-pool mempool) wtxid)
+    ;; The entry carries the fee and the sigop-adjusted vsize the feefilter
+    ;; gate needs; read it from the pool rather than threading it, so the
+    ;; package path (which has no entry in hand) shares this tail.
+    (let ((entry (and peers (bitcoin-lisp.mempool:mempool-get mempool txid))))
+      (when entry
+        (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry))
+              (fee (bitcoin-lisp.mempool:mempool-entry-fee entry)))
+          (relay-transaction txid peer peers
+                             :fee-rate (if (plusp vsize) (floor fee vsize) 0)
+                             :wtxid wtxid))))
+    (process-orphans txid utxo-set mempool chain-state peers
+                     :recent-rejects recent-rejects)))
+
+(defun %find-1p1c-package (peer parent-tx mempool recent-rejects)
+  "Core Find1P1CPackage (txdownloadman_impl.cpp:297-321): the newest orphan
+announced BY PEER that spends PARENT-TX and whose pairing with it is not
+already known to fail — the package hash in the reconsiderable filter, or
+the child's TXID in the main rejects filter. Returns the child transaction,
+or NIL when there is no eligible candidate."
+  (let ((pool (bitcoin-lisp.mempool:mempool-orphan-pool mempool)))
+    (dolist (child (bitcoin-lisp.mempool:orphan-children-from-peer
+                    pool parent-tx peer))
+      (unless (or (bitcoin-lisp.validation:reconsiderable-reject-p
+                   (bitcoin-lisp.validation:package-hash (list parent-tx child)))
+                  (bitcoin-lisp:recent-reject-p
+                   recent-rejects
+                   (bitcoin-lisp.serialization:transaction-hash child)))
+        (return child)))))
+
+(defun %try-1p1c-package (peer parent-tx utxo-set mempool chain-state peers
+                          recent-rejects)
+  "PARENT-TX failed on its own for a reconsiderable reason: look for a child
+of it in the orphanage and submit the pair as a package (Core's
+ProcessNewPackage + ProcessPackageResult, net_processing.cpp:3170-3220).
+Returns T if a package was submitted.
+
+Result handling mirrors ProcessPackageResult exactly: a package-level
+failure is remembered by package hash so the same combination is not
+re-validated on every re-announcement; members are walked CHILD FIRST, so
+an in-package descendant leaves the orphanage before the parent's de-orphan
+cascade could pick it up again; an accepted member takes the ordinary
+accept tail; and a member that failed is cached under Core's
+first_time_failure=false rules — no orphan intake, no further 1p1c.
+
+Note the CHILD of a package that failed a PACKAGE-LEVEL check still carries
+its nonfinal phase-1 :missing-input result, which under those rules is
+cached NOWHERE and does not even leave the orphanage. Caching it would
+black-hole an honest CPFP child after a single lost package attempt."
+  (let ((child (%find-1p1c-package peer parent-tx mempool recent-rejects)))
+    (when child
+      (let ((package (list parent-tx child)))
+        (multiple-value-bind (msg results)
+            (bitcoin-lisp.validation:validate-package-for-mempool
+             package utxo-set mempool chain-state)
+          (bitcoin-lisp:log-cat "mempool" "1p1c package evaluation: ~A" msg)
+          (unless (eq msg :success)
+            (bitcoin-lisp.validation:add-reconsiderable-reject
+             (bitcoin-lisp.validation:package-hash package)))
+          ;; RESULTS is in package order; walk it backwards.
+          (loop for tx in (reverse package)
+                for res in (reverse results)
+                do (let ((err (bitcoin-lisp.validation:package-tx-result-error res)))
+                     (case (bitcoin-lisp.validation:package-tx-result-status res)
+                       (:valid
+                        (%after-mempool-accept tx peer peers utxo-set mempool
+                                               chain-state recent-rejects))
+                       ;; Core routes INVALID and DIFFERENT_WITNESS through the
+                       ;; same ProcessInvalidTx (net_processing.cpp:3204-3212).
+                       ;; A DIFFERENT_WITNESS result carries a
+                       ;; default-constructed (TX_RESULT_UNSET) state
+                       ;; (validation.h:228-229), so MempoolRejectedTx's final
+                       ;; else caches its wtxid in the main filter — which is
+                       ;; what %CACHE-TX-REJECTION does for a NIL reason.
+                       ((:invalid :different-witness)
+                        ;; :missing-input is cached nowhere and does NOT leave
+                        ;; the orphanage: a package-LEVEL failure leaves the
+                        ;; child's nonfinal phase-1 result untouched, and Core
+                        ;; deliberately does nothing with it here
+                        ;; (txdownloadman_impl.cpp:361-364, :489-492).
+                        (%cache-tx-rejection tx err recent-rejects)
+                        (unless (eq err :missing-input)
+                          (bitcoin-lisp.mempool:orphan-remove
+                           (bitcoin-lisp.mempool:mempool-orphan-pool mempool)
+                           (bitcoin-lisp.serialization:transaction-wtxid tx))))
+                       ;; :not-validated — a context-free package check
+                       ;; (well-formedness, child-with-parents) failed before
+                       ;; any member was processed. Core's ProcessNewPackage
+                       ;; returns no per-tx results at all in that case and
+                       ;; ProcessPackageResult's `it_result != end()` guard
+                       ;; skips them, so nothing is cached: deliberate.
+                       (otherwise nil))))
+          t)))))
+
+(defun %orphan-parents-rejected-p (parent-txids recent-rejects)
+  "Core's fRejectedParents scan (txdownloadman_impl.cpp:371-396): T when an
+orphan with these MISSING PARENT-TXIDS must not be kept at all.
+
+A parent in the MAIN rejects filter is fatal — no witness and no package can
+make this child acceptable. A parent in the RECONSIDERABLE filter is NOT: it
+may be precisely the low-feerate parent this child exists to fee-bump. Core
+tolerates exactly ONE such parent, because it only submits 1-parent-1-child
+packages, so a second one could never be rescued.
+
+PARENT-TXIDS are already the parents missing from both the UTXO set and the
+mempool, which subsumes Core's `!m_opts.m_mempool.exists(parent_txid)` guard."
+  (let ((reconsiderable 0))
+    (dolist (ptxid parent-txids nil)
+      (cond ((bitcoin-lisp:recent-reject-p recent-rejects ptxid)
+             (return t))
+            ((bitcoin-lisp.validation:reconsiderable-reject-p ptxid)
+             (when (> (incf reconsiderable) 1)
+               (return t)))))))
+
 (defun handle-tx (peer payload utxo-set mempool chain-state peers
                   &key recent-rejects)
   "Handle a tx message. Validate, add to mempool, and relay.
@@ -1333,6 +1643,16 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                         (bitcoin-lisp.validation:recently-confirmed-p wtxid)
                         (bitcoin-lisp.validation:recently-confirmed-p txid))
                 (return-from handle-tx nil))
+              ;; Already known to fail RECONSIDERABLY (too-low feerate, RBF
+              ;; economics, mempool full): do not submit it alone again — but
+              ;; it may succeed paired with a child we are already holding as
+              ;; an orphan, which is how a CPFP package whose two halves
+              ;; arrive separately gets assembled (Core ReceivedTx's second
+              ;; branch, txdownloadman_impl.cpp:544-551).
+              (when (bitcoin-lisp.validation:reconsiderable-reject-p wtxid)
+                (%try-1p1c-package peer tx utxo-set mempool chain-state peers
+                                   recent-rejects)
+                (return-from handle-tx nil))
               ;; Validate for mempool
               (multiple-value-bind (valid error fee replaced sigops)
                   (bitcoin-lisp.validation:validate-transaction-for-mempool
@@ -1342,18 +1662,15 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                     ;; Missing inputs => hold as an orphan (not a real reject);
                     ;; a later parent will trigger re-evaluation. Request the
                     ;; missing parents from this peer so they arrive sooner.
-                    ;; UNLESS a missing parent was itself recently rejected:
-                    ;; then this tx can never be accepted regardless of what
-                    ;; parent data arrives, so reject it outright — under BOTH
-                    ;; ids, exactly like Core's "not keeping orphan with
-                    ;; rejected parents" (txdownloadman_impl.cpp:422-436;
+                    ;; UNLESS the parents make the orphan hopeless
+                    ;; (%orphan-parents-rejected-p): then reject it outright —
+                    ;; under BOTH ids, exactly like Core's "not keeping orphan
+                    ;; with rejected parents" (txdownloadman_impl.cpp:422-436;
                     ;; the txid too, so non-wtxidrelay peers can't make us
                     ;; re-download it).
                     ((eq error :missing-input)
                      (let ((parents (missing-parent-txids tx utxo-set mempool)))
-                       (if (some (lambda (ptxid)
-                                   (bitcoin-lisp:recent-reject-p recent-rejects ptxid))
-                                 parents)
+                       (if (%orphan-parents-rejected-p parents recent-rejects)
                            (progn
                              (bitcoin-lisp:add-recent-reject recent-rejects txid)
                              (bitcoin-lisp:add-recent-reject recent-rejects wtxid))
@@ -1363,59 +1680,51 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                              (request-orphan-parents
                               peer parents (count-wtxid-relay-peers peers))))))
                     (t
-                     ;; Add to recent rejects so we don't re-request it. A loose
-                     ;; transaction that fails validation is NOT misbehavior:
-                     ;; Bitcoin Core removed tx-relay punishment (PR #26294),
-                     ;; since tx validity is subjective (our mempool/chain state)
-                     ;; and an honest peer shouldn't be discouraged for relaying
-                     ;; a tx we happen to reject. Consensus-invalid txs are only
-                     ;; punished when they arrive inside a block.
-                     ;;
-                     ;; Keyed by WTXID, never the txid of a witness tx: the
-                     ;; witness can be malleated, so the same txid with a
-                     ;; different witness could still be valid (Core issue
-                     ;; #8279; txdownloadman_impl.cpp MempoolRejectedTx). For
-                     ;; no-witness txs wtxid == txid, so those are covered.
-                     ;;
-                     ;; :witness-stripped is never cached AT ALL (Core
-                     ;; TX_WITNESS_STRIPPED, txdownloadman_impl.cpp:438-439):
-                     ;; the tx arrived without its witness, so wtxid == txid
-                     ;; here — caching it would poison the TXID of the real,
-                     ;; witnessed tx and block its relay permanently.
-                     ;;
-                     ;; :nonstandard-inputs additionally caches the TXID for a
-                     ;; witness tx (Core TX_INPUTS_NOT_STANDARD,
-                     ;; txdownloadman_impl.cpp:471-484): that failure depends
-                     ;; only on the txid (the scriptPubKeys being spent), so no
-                     ;; witness can fix it and the txid entry stops re-fetching
-                     ;; via the orphan parent-request path.
-                     (unless (eq error :witness-stripped)
-                       (bitcoin-lisp:add-recent-reject recent-rejects wtxid)
-                       (when (and (eq error :nonstandard-inputs)
-                                  (not (equalp wtxid txid)))
-                         (bitcoin-lisp:add-recent-reject recent-rejects txid))))))
+                     ;; Cache the failure so we don't re-request it (see
+                     ;; %cache-tx-rejection for which filter and which ids).
+                     ;; A loose transaction that fails validation is NOT
+                     ;; misbehavior: Bitcoin Core removed tx-relay punishment
+                     ;; (PR #26294), since tx validity is subjective (our
+                     ;; mempool/chain state) and an honest peer shouldn't be
+                     ;; discouraged for relaying a tx we happen to reject.
+                     ;; Consensus-invalid txs are only punished inside a block.
+                     (%cache-tx-rejection tx error recent-rejects)
+                     ;; A FIRST-TIME reconsiderable failure is where Core looks
+                     ;; for a child in the orphanage and retries the pair as a
+                     ;; package (txdownloadman_impl.cpp:460-465).
+                     (when (%reconsiderable-failure-p error)
+                       (%try-1p1c-package peer tx utxo-set mempool chain-state
+                                          peers recent-rejects)))))
                 (when valid
-                  (multiple-value-bind (result entry)
-                      (bitcoin-lisp.mempool:accept-validated-tx
-                       mempool txid tx fee current-height
-                       :sigops sigops :replaced replaced)
-                    (when (eq result :ok)
-                      ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
-                      ;; stamped only on mempool ACCEPTANCE,
-                      ;; net_processing.cpp:4540).
-                      (setf (peer-last-tx-time peer)
-                            (bitcoin-lisp.serialization:get-unix-time))
-                      ;; Relay to other peers
-                      (when peers
-                        (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
-                          (relay-transaction txid peer peers
-                                             :fee-rate (if (plusp vsize)
-                                                           (floor fee vsize)
-                                                           0)
-                                             :wtxid (bitcoin-lisp.serialization:transaction-wtxid tx))))
-                      ;; De-orphan: this tx may unblock waiting children.
-                      (process-orphans txid utxo-set mempool chain-state peers
-                                       :recent-rejects recent-rejects)))))))))
+                  (let ((result (bitcoin-lisp.mempool:accept-validated-tx
+                                 mempool txid tx fee current-height
+                                 :sigops sigops :replaced replaced)))
+                    (cond
+                      ((eq result :ok)
+                       ;; getpeerinfo "last_transaction" (Core m_last_tx_time,
+                       ;; stamped only on mempool ACCEPTANCE,
+                       ;; net_processing.cpp:4540).
+                       (setf (peer-last-tx-time peer)
+                             (bitcoin-lisp.serialization:get-unix-time))
+                       ;; Relay, de-orphan, cascade.
+                       (%after-mempool-accept tx peer peers utxo-set mempool
+                                              chain-state recent-rejects))
+                      ;; The tx passed validation but the mempool refused it.
+                      ;; Core reports these through the same MempoolRejectedTx
+                      ;; path as any other failure, so they are cached like
+                      ;; one: :mempool-full is reconsiderable — the tx
+                      ;; self-evicted on the trim and a package could still
+                      ;; carry it (validation.cpp:1399-1402) — while
+                      ;; :too-large-cluster and :conflict go to the main
+                      ;; filter. Uncached, every re-announcement was
+                      ;; re-downloaded and fully re-validated.
+                      ((eq result :duplicate) nil)   ; we already have it
+                      (t
+                       (%cache-tx-rejection tx result recent-rejects)
+                       (when (%reconsiderable-failure-p result)
+                         (%try-1p1c-package peer tx utxo-set mempool
+                                            chain-state peers
+                                            recent-rejects)))))))))))
     (error (c)
       (declare (ignore c))
       nil)))
@@ -1781,6 +2090,66 @@ net_processing.cpp:1117-1136). Returns NIL when nothing remains to announce."
                      (list (peer-address->net-addr pa) (peer-address-last-seen pa)))
                    compatible))))))
 
+;;; --- getaddr response cache (Core CConnman::m_addr_response_caches) ---
+;;;
+;;; Answering every getaddr with a FRESH ~23% sample of addrman lets an
+;;; attacker reconnect repeatedly and harvest many independent samples: enough
+;;; to reconstruct much of our address table and to watch timestamps churn.
+;;; Core answers every requestor arriving on the same network with the SAME
+;;; snapshot for 21-27h, which is exactly what makes reconnecting pointless
+;;; (net.h:1621-1640, net.cpp:3694-3730).
+
+(defconstant +addr-response-cache-base-seconds+ (* 21 60 60)
+  "Base lifetime of a cached getaddr response (Core's 21 hours).")
+
+(defconstant +addr-response-cache-jitter-seconds+ (* 6 60 60)
+  "Random extra lifetime on top of the base (Core's rand(6h)), so the refresh
+instant is not predictable.")
+
+(defvar *addr-response-caches* (make-hash-table :test 'eq)
+  "Requestor network keyword -> (ADDRS . EXPIRY-UNIX). Core keys by
+(network, local listening socket) — H(RANDOMIZER_ID_NETWORKKEY, netclass,
+bind addr, bind port), net.cpp:1832-1836. We key by network ALONE. That is a
+deliberate simplification, not byte parity: our two listeners (clearnet and
+onion, node.lisp) already map to distinct network keywords through
+peer-connected-through-network, so the multi-bind case Core's key exists to
+separate is covered. Two binds on the SAME network would share a cache here.")
+
+(defun clear-addr-response-caches ()
+  "Drop every cached getaddr response (tests; also a reset point if the
+address book is rebuilt)."
+  (clrhash *addr-response-caches*))
+
+(defun %sample-addr-response (book)
+  "Take a fresh addrman sample for the cache, filtered as Core's
+GetAddressesUnsafe filters it (net.cpp:3686-3690): banned AND discouraged
+addresses are dropped HERE, at fill time."
+  (remove-if (lambda (pa)
+               (let ((s (peer-address-string pa)))
+                 (or (peer-discouraged-p s)
+                     (peer-banned-p s))))
+             (address-book-get-addr book :max +addrman-getaddr-max+
+                                         :pct +addrman-getaddr-pct+)))
+
+(defun cached-getaddr-response (book network now)
+  "The cached response for a requestor on NETWORK, refilling if absent or
+expired.
+
+The ban/discourage filter runs only when the cache is FILLED, never on a hit —
+Core returns m_addrs_response_cache verbatim (net.cpp:3729). Re-filtering per
+hit would make responses differ between requestors inside one window whenever a
+ban landed mid-window, which is precisely the fingerprinting signal the cache
+exists to erase. The visible consequence is that we keep gossiping an address
+for up to 27h after banning it; that is Core-identical and intended."
+  (let ((entry (gethash network *addr-response-caches*)))
+    (if (and entry (< now (cdr entry)))
+        (car entry)
+        (let ((addrs (%sample-addr-response book)))
+          (setf (gethash network *addr-response-caches*)
+                (cons addrs (+ now +addr-response-cache-base-seconds+
+                               (random (1+ +addr-response-cache-jitter-seconds+)))))
+          addrs))))
+
 (defun handle-getaddr (peer &optional address-book)
   "Serve a peer's getaddr: reply once per connection, and only to inbound peers,
 with up to +max-addr-count+ known addresses from ADDRESS-BOOK (defaulting to the
@@ -1800,12 +2169,14 @@ elicit more than one reply regardless of whether we had addresses to send."
                     (let ((node bitcoin-lisp::*node*))
                       (and node (bitcoin-lisp::node-address-book node))))))
       (when book
-        ;; Don't gossip discouraged addresses (Bitcoin Core skips them in relay).
-        (let* ((addrs (remove-if
-                       (lambda (pa)
-                         (peer-discouraged-p (peer-address-string pa)))
-                       (address-book-get-addr book :max +addrman-getaddr-max+
-                                                   :pct +addrman-getaddr-pct+)))
+        ;; Served from the per-network cache: every requestor arriving on this
+        ;; network sees the SAME snapshot for 21-27h, so reconnecting harvests
+        ;; nothing new. Banned/discouraged addresses were filtered when the
+        ;; cache was filled.
+        (let* ((addrs (cached-getaddr-response
+                       book
+                       (peer-connected-through-network peer)
+                       (bitcoin-lisp.serialization:get-unix-time)))
                ;; NIL when the peer is v1-only and every address was non-IP.
                (msg (and addrs (build-addr-response peer addrs))))
           (when msg
@@ -2254,22 +2625,132 @@ from a v1 compact block fails BIP141 validation (bad-witness-nonce-size). We
 therefore never announce or accept v1; non-v2 peers fall back to full
 MSG_WITNESS_BLOCK downloads.")
 
+(defvar *hb-announcing-peers* '()
+  "Peers we have asked to announce blocks in high-bandwidth compact form,
+OLDEST FIRST (Core lNodesAnnouncingHeaderAndIDs). BIP152 caps this at 3;
+promotion is earned by delivering a new best block, never granted at
+handshake.")
+
+(defconstant +max-hb-announcing-peers+ 3
+  "BIP152: only 3 peers are asked to announce with compact encodings.")
+
 (defun send-compact-block-negotiation (peer)
-  "Advertise compact block support to PEER. We announce only version 2 (witness),
-matching Bitcoin Core — a v1 (non-witness) compact block would strip the coinbase
-witness nonce. Requests high-bandwidth mode when not in IBD (peer may then send us
-unsolicited compact blocks for faster relay) — but never in blocksonly mode:
-our mempool won't contain the transactions needed to reconstruct a compact
-block (Core MaybeSetPeerAsAnnouncingHeaderAndIDs, net_processing.cpp:1275-1280)."
-  (let ((high-bw (and (not (ignore-incoming-txs-p))
-                      (not (or (eq (ibd-state) :syncing-blocks)
-                               (eq (ibd-state) :syncing-headers))))))
-    ;; getpeerinfo bip152_hb_to (Core m_bip152_highbandwidth_to): whether WE
-    ;; selected the peer as a high-bandwidth compact-block peer.
-    (when high-bw
-      (setf (peer-compact-block-high-bandwidth-to peer) t))
-    (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
-                        high-bw +compact-blocks-version+))))
+  "Advertise compact block support to PEER. We announce only version 2
+(witness), matching Bitcoin Core — a v1 (non-witness) compact block would strip
+the coinbase witness nonce.
+
+The initial sendcmpct is LOW-BANDWIDTH, as Core's is. High bandwidth is not a
+capability handshake, it is a scarce selection: BIP152 allows only 3 peers, and
+Core grants it only to a peer that has just delivered a new best block
+(MaybeSetPeerAsAnnouncingHeaderAndIDs). Asking every compact-capable peer for
+HB — what we used to do — makes every one of them push an unsolicited
+cmpctblock for every block instead of about three, and misreports
+getpeerinfo's bip152_hb_to."
+  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
+                      nil +compact-blocks-version+)))
+
+(defun %set-peer-hb (peer high-bandwidth)
+  (setf (peer-compact-block-high-bandwidth-to peer) high-bandwidth)
+  (send-message peer (bitcoin-lisp.serialization:make-sendcmpct-message
+                      high-bandwidth +compact-blocks-version+)))
+
+(defun %hb-peer-live-p (peer)
+  "T while PEER is still a peer we could actually ask to announce blocks.
+
+Core reaches its HB list entries by NodeId — GetPeerRef (net_processing.cpp:1296)
+and ForNode (:1310) — so an entry whose peer has gone away simply resolves to
+nothing: it counts as NEITHER inbound nor outbound in the census (:1297), can
+never be the protected front (:1303-1305), and a promotion targeting a gone
+node mutates nothing at all (ForNode returns without running the lambda). We
+hold the peer STRUCT rather than an id, so nothing resolves to nothing for us
+and we have to ask the struct: :disconnected / :banned is our \"gone\"."
+  (not (member (peer-state peer) '(:disconnected :banned))))
+
+(defun maybe-set-peer-announcing-hb (peer)
+  "Promote PEER to high-bandwidth compact-block announcements after it
+delivered a new best block (Core MaybeSetPeerAsAnnouncingHeaderAndIDs,
+net_processing.cpp:1273-1330).
+
+Four subtleties, each of which Core spells out:
+  - A peer ALREADY in the list is only moved to the back; no sendcmpct is
+    re-sent. Re-announcing on every block would be a visible protocol anomaly.
+  - Never in blocksonly mode: our mempool would not hold the transactions
+    needed to reconstruct the block anyway.
+  - INBOUND-PROTECTION SWAP. When the peer being promoted is inbound, the list
+    is already full, and exactly ONE entry is outbound sitting at the front,
+    Core swaps the first two so the outbound HB peer is not the one evicted.
+    Without it a flood of inbound peers evicts every outbound HB peer in turn —
+    an eclipse/partition weakening, and the same class of ordering mistake as
+    trimming the wrong end of the reorg disconnect pool.
+  - DEAD ENTRIES ARE NOT PEERS. Core's list holds NodeIds, so a disconnected
+    entry is inert everywhere it is read. Ours holds live struct references, so
+    a corpse would keep counting as outbound and could trigger the protection
+    swap in ITS favour — evicting a live inbound HB peer to defend a peer that
+    is never going to announce anything again. Sweeping them here (the list's
+    only reader) restores Core's semantics AND reclaims the slot, which Core
+    itself cannot do because it never revisits the list on disconnect."
+  (when (and (not (ignore-incoming-txs-p))
+             ;; Core's m_provides_cmpctblocks gate: only a peer that signalled
+             ;; compact-block support is eligible.
+             (plusp (peer-compact-block-version peer))
+             ;; Core's ForNode(nodeid) lookup: a gone peer is never found, so
+             ;; nothing is evicted and nothing is added on its behalf.
+             (%hb-peer-live-p peer))
+    (setf *hb-announcing-peers*
+          (remove-if-not #'%hb-peer-live-p *hb-announcing-peers*))
+    ;; Already selected: move to the back (most recently useful), send nothing.
+    (if (member peer *hb-announcing-peers*)
+        (setf *hb-announcing-peers*
+              (append (remove peer *hb-announcing-peers*) (list peer)))
+        (let ((outbound-count (count-if-not #'peer-inbound *hb-announcing-peers*)))
+          ;; Inbound-protection swap.
+          (when (and (peer-inbound peer)
+                     (>= (length *hb-announcing-peers*) +max-hb-announcing-peers+)
+                     (= outbound-count 1)
+                     (first *hb-announcing-peers*)
+                     (not (peer-inbound (first *hb-announcing-peers*))))
+            (rotatef (nth 0 *hb-announcing-peers*) (nth 1 *hb-announcing-peers*)))
+          ;; Over the cap: demote the OLDEST (front) back to low bandwidth.
+          (when (>= (length *hb-announcing-peers*) +max-hb-announcing-peers+)
+            (let ((evicted (first *hb-announcing-peers*)))
+              (setf *hb-announcing-peers* (rest *hb-announcing-peers*))
+              (ignore-errors (%set-peer-hb evicted nil))))
+          (%set-peer-hb peer t)
+          (setf *hb-announcing-peers*
+                (append *hb-announcing-peers* (list peer)))))))
+
+(defun maybe-promote-block-deliverer (peer chain-state)
+  "Consider promoting PEER to HB after it delivered a block (Core BlockChecked,
+net_processing.cpp:2207-2223).
+
+CALL THIS ONLY ONCE THE BLOCK HAS CONNECTED — validating is not enough. Core's
+BlockChecked splits on the validation result: an INVALID block goes to
+MaybePunishNodeForBlock (:2207), and only the `state.IsValid()` arm reaches
+MaybeSetPeerAsAnnouncingHeaderAndIDs (:2218-2223). Promoting before validation
+lets a peer that delivers a reconstructible-but-invalid compact block buy an HB
+slot and, through the cap-of-3 eviction, demote an honest one — an
+attacker-chosen swap for the price of one bad block.
+
+And a VALID state can only ever come from ConnectTip (validation.cpp:3070);
+ProcessNewBlock's other BlockChecked emit (:4455) is the AcceptBlock-failure
+path, and a block we already hold short-circuits inside AcceptBlock and never
+reaches ConnectTip. So the transports must gate on the block having ADVANCED
+THE TIP (%block-newly-connected-p), not on ACCEPT-DOWNLOADED-BLOCK's `valid',
+which is also T for a side-branch store and for a replay of our own tip — the
+free-HB-slot echo. The transport itself does not matter: Core drives this off
+mapBlockSource, which is filled for full blocks as well as compact ones, so
+every delivery path must reach here after (and only after) it connects.
+
+Core's gate is state.IsValid() AND !IsInitialBlockDownload() AND
+mapBlocksInFlight.count(hash) == mapBlocksInFlight.size() — that last clause
+being its proxy for \"this delivery was not part of a batch download\". We gate
+on connection and not-IBD only. DOCUMENTED DIVERGENCE: we may therefore promote
+somewhat more eagerly than Core mid-download. The blast radius is bounded — the
+cap of 3, the move-to-back on re-selection, and the inbound-protection swap all
+still apply — but it is a real difference and is left as a follow-up rather
+than silently approximated away."
+  (unless (initial-block-download-p chain-state)
+    (maybe-set-peer-announcing-hb peer)))
 
 (defun handle-sendcmpct (peer payload)
   "Handle a sendcmpct message from a peer. We support only compact block version 2;
@@ -2604,6 +3085,19 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
         (unless (equalp pending-hash block-hash)
           (setf (peer-pending-compact-block peer) nil))))
 
+    ;; NOTE: a dedup guard used to sit here testing
+    ;; (eq (block-index-entry-status entry) :connected). :CONNECTED is not in
+    ;; the status enum (storage/chain.lisp:17 — :unknown / :header-valid /
+    ;; :valid / :invalid), so it could never fire and was deleted: a guard that
+    ;; cannot fire is worse than none, because it reads as protection that is
+    ;; not there. Core's real dedup is
+    ;; `pindex->nChainWork <= tip->nChainWork || pindex->nTx != 0'
+    ;; (net_processing.cpp, CMPCTBLOCK handler), which also wants the
+    ;; unknown-parent getheaders answer next to it; both belong to the wave-4
+    ;; compact-block item in docs/gap-analysis-8-plan.md. What the missing
+    ;; dedup must NOT be relied on for is HB selection — that is gated below on
+    ;; the block actually connecting, not on it being new to us.
+
     ;; Attempt reconstruction
     (multiple-value-bind (block missing-indexes partial-transactions)
         (reconstruct-compact-block compact-block mempool use-wtxid)
@@ -2618,18 +3112,27 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
          (bitcoin-lisp:log-debug "Compact block reconstructed successfully")
          ;; Process like a normal block (fork-aware: a reconstructed block on a
          ;; side branch is stored and reorged, not tip-validated).
-         (with-node-lock
-           (multiple-value-bind (valid error)
-               (accept-downloaded-block block chain-state utxo-set block-store
-                                        :mempool mempool
-                                        :fee-estimator fee-estimator
-                                        :recent-rejects recent-rejects)
-             (unless valid
-               ;; Core BlockChecked -> MaybePunishNodeForBlock with
-               ;; via_compact_block=true (net_processing.cpp:4778 / :2211):
-               ;; per reason, not per message type.
-               (handle-compact-block-failure peer block-hash error
-                                             "reconstructed compact block invalid")))))
+         (let ((connected
+                 (with-node-lock
+                   (let ((tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
+                     (multiple-value-bind (valid error)
+                         (accept-downloaded-block block chain-state utxo-set block-store
+                                                  :mempool mempool
+                                                  :fee-estimator fee-estimator
+                                                  :recent-rejects recent-rejects)
+                       (unless valid
+                         (handle-compact-block-failure peer block-hash error
+                                                       "reconstructed compact block invalid"))
+                       (and valid
+                            (%block-newly-connected-p chain-state block-hash
+                                                      tip-before)))))))
+           ;; Earned HB promotion — only once the block CONNECTED, never on
+           ;; acceptance alone (Core BlockChecked's valid state comes from
+           ;; ConnectTip; an invalid block goes to MaybePunishNodeForBlock, and
+           ;; a block we already have never reaches ConnectTip at all). Outside
+           ;; the node lock: promotion writes sendcmpct to up to two sockets.
+           (when connected
+             (maybe-promote-block-deliverer peer chain-state))))
 
         ;; Structurally malformed message — Core READ_STATUS_INVALID ->
         ;; Misbehaving (net_processing.cpp:4679-4683). This is the one
@@ -2720,20 +3223,25 @@ punished outright (:3487-3491)."
           (increment-compact-block-success)
           ;; Block delivery from this peer (getpeerinfo "last_block").
           (record-block-received-from-peer peer)
-          (with-node-lock
-            (multiple-value-bind (valid error)
-                (accept-downloaded-block block chain-state utxo-set block-store
-                                         :mempool mempool
-                                         :fee-estimator fee-estimator
-                                         :recent-rejects recent-rejects)
-              (unless valid
-                ;; Same per-reason mapping as HANDLE-CMPCTBLOCK (mapBlockSource
-                ;; /*punish=*/false at net_processing.cpp:3516 -> :2211 ->
-                ;; via_compact_block=true). The header itself was already
-                ;; gated when the cmpctblock arrived, so in practice only the
-                ;; BLOCK_CONSENSUS / BLOCK_MUTATED class reaches here.
-                (handle-compact-block-failure peer block-hash error
-                                              "completed compact block invalid")))))))))
+          (let ((connected
+                  (with-node-lock
+                    (let ((tip-before (bitcoin-lisp.storage:best-block-hash chain-state)))
+                      (multiple-value-bind (valid error)
+                          (accept-downloaded-block block chain-state utxo-set block-store
+                                                   :mempool mempool
+                                                   :fee-estimator fee-estimator
+                                                   :recent-rejects recent-rejects)
+                        (unless valid
+                          (handle-compact-block-failure peer block-hash error
+                                                        "completed compact block invalid"))
+                        (and valid
+                             (%block-newly-connected-p chain-state block-hash
+                                                       tip-before)))))))
+            ;; HB promotion only once the completed block CONNECTED (Core
+            ;; BlockChecked's valid state is emitted from ConnectTip), never on
+            ;; delivery or bare acceptance.
+            (when connected
+              (maybe-promote-block-deliverer peer chain-state))))))))
 
 (defun request-full-block (peer block-hash)
   "Request a full block (fallback from compact block)."

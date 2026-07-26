@@ -432,9 +432,25 @@ The decay half-life is divided by 4 (2) while the pool's dynamic usage sits
 below 1/4 (1/2) of the memory cap — a near-empty pool forgets fee spikes
 faster (txmempool.cpp:836-840) — and a rolling minimum that decays below
 half the incremental relay fee resets to zero (txmempool.cpp:845-848)."
+  (max (mempool-min-fee-rate mempool)
+       (mempool-decayed-rolling-min-fee-rate mempool now)))
+
+(defun mempool-decayed-rolling-min-fee-rate (mempool
+                                             &optional (now (bitcoin-lisp.serialization:get-unix-time)))
+  "The DECAYED rolling minimum ALONE, in sat/kvB, or 0 when there is none.
+
+This is exactly Core's CTxMemPool::GetMinFee, which does NOT fold in
+-minrelaytxfee — callers that need the relay floor apply it themselves
+(MEMPOOL-EFFECTIVE-MIN-FEE-RATE does). BIP133 needs the unfolded value: Core
+rounds GetMinFee and only then takes the max with the relay floor, so feeding
+it the already-floored number would round 100 up into the next bucket a third
+of the time and put 107 on the wire where Core puts a flat 100.
+
+A rolling minimum that decays below half the incremental relay fee resets to
+zero (txmempool.cpp:845-848)."
   (let ((rolling (mempool-rolling-min-fee-rate mempool)))
     (if (<= rolling 0)
-        (mempool-min-fee-rate mempool)
+        0
         (let* ((age (max 0 (- now (mempool-rolling-min-fee-time mempool))))
                (usage (mempool-dynamic-usage mempool))
                (limit (mempool-max-size mempool))
@@ -446,8 +462,8 @@ half the incremental relay fee resets to zero (txmempool.cpp:845-848)."
                (decayed (floor (* rolling (expt 0.5d0 (/ age halflife))))))
           (cond ((< decayed (floor +incremental-relay-fee-rate+ 2))
                  (setf (mempool-rolling-min-fee-rate mempool) 0)
-                 (mempool-min-fee-rate mempool))
-                (t (max (mempool-min-fee-rate mempool) decayed)))))))
+                 0)
+                (t decayed))))))
 
 ;;;; Shadow txgraph checks (cluster mempool P3, kept through the P4-P6 flips)
 ;;;;
