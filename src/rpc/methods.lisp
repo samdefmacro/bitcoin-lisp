@@ -297,13 +297,9 @@ the index."
        ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
        ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
        ("nTx" . ,ntx))
-     ;; Same rule as getblockheader: blockToJSON delegates the header fields to
-     ;; blockheaderToJSON, so genesis omits previousblockhash here too. With no
-     ;; index entry we cannot tell, and every non-indexed block has a parent.
-     (if entry
-         (%previousblockhash-field entry header)
-         `(("previousblockhash"
-            . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header)))))
+     ;; Same rule as getblockheader: blockToJSON delegates its header fields to
+     ;; blockheaderToJSON, so genesis omits previousblockhash here too.
+     (%previousblockhash-field entry header)
      `(("tx" . ,(if include-tx-details
                     (mapcar (lambda (tx) (tx-to-json tx network)) txs)
                     (mapcar #'tx-to-txid txs)))))))
@@ -435,19 +431,18 @@ is supplied and the script is addressable) address."
            (bitcoin-lisp.serialization:serialize
             (bitcoin-lisp.storage:block-index-entry-header entry)))))))
 
-(defun %genesis-entry-p (entry)
-  "T when ENTRY has no parent block — Core's `blockindex.pprev == nullptr`.
-Tested on the height rather than on our prev-entry back-link: height 0 is
-exactly the no-parent case, and unlike the back-link it stays correct for an
-entry that was loaded without one (an assumeutxo base, a synthetic fixture)."
-  (zerop (bitcoin-lisp.storage:block-index-entry-height entry)))
-
 (defun %previousblockhash-field (entry header)
   "Core blockheaderToJSON (rpc/blockchain.cpp:177-178) pushes previousblockhash
 only `if (blockindex.pprev)`, so genesis OMITS the key rather than reporting 64
 zeros. A client walking a chain backwards terminates on the missing key; given
-the all-zero hash it instead asks for a block nobody has and gets an error."
-  (unless (%genesis-entry-p entry)
+the all-zero hash it instead asks for a block nobody has and gets an error.
+
+The no-parent test is ENTRY's height, not our prev-entry back-link: height 0 is
+exactly Core's pprev == nullptr, and unlike the back-link it stays correct for
+an entry loaded without one (an assumeutxo base, a synthetic fixture). A NIL
+ENTRY — a block we hold but have not indexed — always gets the key, since only
+genesis lacks a parent and genesis is always indexed."
+  (unless (and entry (zerop (bitcoin-lisp.storage:block-index-entry-height entry)))
     `(("previousblockhash"
        . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header))))))
 
@@ -455,7 +450,9 @@ the all-zero hash it instead asks for a block nobody has and gets an error."
   "Convert block index entry to header JSON (Bitcoin Core getblockheader): the
 shared chain-context fields plus the header's own version/merkleroot/time/nonce,
 nTx, and previousblockhash when the block has a parent. BLOCK-STORE, when given,
-lets nTx be backfilled for an index entry that predates the tx-count field."
+lets nTx be backfilled for an index entry that predates the tx-count field —
+one block-store read per such entry, after which %entry-tx-count caches the
+count on the entry."
   (let ((header (bitcoin-lisp.storage:block-index-entry-header entry)))
     (append
      `(("hash" . ,hash-str))
@@ -1969,11 +1966,12 @@ CBlockIndex::m_chain_tx_count), or NIL when any block's count is unknown
     ;; The walk fell off a prev-entry link before reaching genesis.
     nil))
 
-(defun %parse-hash-or-height-entry (chain-state param)
+(defun %parse-hash-or-height-entry (chain-state param &optional (param-name "hash_or_height"))
   "Resolve PARAM — a non-negative block height or a block-hash hex string —
 to a block-index entry (Core ParseHashOrHeight, rpc/blockchain.cpp:126-152):
 heights resolve on the ACTIVE chain and must not exceed the tip; hashes
-resolve through the shared block index."
+resolve through the shared block index. PARAM-NAME names the parameter in the
+type-error message."
   (cond
     ((integerp param)
      (when (minusp param)
@@ -1994,7 +1992,8 @@ resolve through the shared block index."
                            :message "Block not found")))
     (t
      (error 'rpc-error :code +rpc-invalid-parameter+
-                       :message "rollback must be a block height or a block hash"))))
+                       :message (format nil "~A must be a block height or a block hash"
+                                        param-name)))))
 
 (defun %dump-rollback-target-entry (node chain-state tip-entry type options)
   "The block-index entry dumptxoutset should dump at (Core rpc/
@@ -2012,7 +2011,7 @@ else — including an omitted type — is refused."
        (unless (or (string= type "") (string= type "rollback"))
          (error 'rpc-error :code +rpc-invalid-parameter+
                            :message (format nil "Invalid snapshot type \"~A\" specified with rollback option" type)))
-       (%parse-hash-or-height-entry chain-state rollback-param))
+       (%parse-hash-or-height-entry chain-state rollback-param "rollback"))
       ((string= type "rollback")
        (let ((heights (mapcar #'bitcoin-lisp:assumeutxo-data-height
                               (bitcoin-lisp:network-assumeutxo-data
@@ -2020,7 +2019,7 @@ else — including an omitted type — is refused."
          (unless heights
            (error 'rpc-error :code +rpc-misc-error+
                              :message "No assumeutxo snapshot heights are available for this network"))
-         (%parse-hash-or-height-entry chain-state (reduce #'max heights))))
+         (%parse-hash-or-height-entry chain-state (reduce #'max heights) "rollback")))
       ((string= type "latest") tip-entry)
       (t
        (error 'rpc-error :code +rpc-invalid-parameter+
@@ -4590,19 +4589,6 @@ at the 10th/25th/50th/75th/90th percentile WEIGHT unit. SCORES is a list of
           (loop for i from next below 5 do (setf (nth i result) last-feerate)))))
     result))
 
-(defun %getblockstats-block-hash (chain-state hash-or-height)
-  "Resolve getblockstats' first parameter (Core ParseHashOrHeight)."
-  (cond
-    ((integerp hash-or-height)
-     (let ((entry (bitcoin-lisp.storage:get-block-at-height chain-state hash-or-height)))
-       (unless entry
-         (error 'rpc-error :code +rpc-invalid-parameter+
-                           :message "Block height out of range"))
-       (bitcoin-lisp.storage:block-index-entry-hash entry)))
-    ((valid-hex-hash-p hash-or-height) (parse-hex-hash hash-or-height))
-    (t (error 'rpc-error :code +rpc-invalid-parameter+
-                         :message "Invalid hash_or_height parameter"))))
-
 (defun %select-block-stats (all-stats stats-filter)
   "Core's stats selection (rpc/blockchain.cpp:2181-2189): no selection returns
 everything; an unknown name is RPC_INVALID_PARAMETER (-8) rather than being
@@ -4641,13 +4627,16 @@ is unavailable (pruned) is an error rather than a silently wrong answer."
       (unless block-store
         (error 'rpc-error :code +rpc-misc-error+
                           :message "Block data not available"))
-      (let* ((block-hash (%getblockstats-block-hash chain-state hash-or-height))
+      ;; Core resolves through ParseHashOrHeight, so the block must be in the
+      ;; index — the old height-0 fallback for an unindexed block reported a
+      ;; wrong subsidy and mediantime instead of erroring.
+      (let* ((entry (%parse-hash-or-height-entry chain-state hash-or-height))
+             (block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
              (block (bitcoin-lisp.storage:get-block block-store block-hash)))
         (unless block
           (error 'rpc-error :code +rpc-invalid-address-or-key+
                             :message "Block not found"))
-        (let* ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
-               (height (if entry (bitcoin-lisp.storage:block-index-entry-height entry) 0))
+        (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
                (header (bitcoin-lisp.serialization:bitcoin-block-header block))
                (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
                (ntx (length txs))
