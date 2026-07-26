@@ -2295,6 +2295,21 @@ Returns the node instance."
                                           (bitcoin-lisp.networking:maybe-advertise-local-address
                                            (node-peers *node*)
                                            (node-chain-state *node*))
+                                          ;; BIP133 feefilter refresh (Core
+                                          ;; MaybeSendFeefilter on the message
+                                          ;; loop): per-peer ~10min Poisson
+                                          ;; schedule inside, so this is a
+                                          ;; cheap no-op most ticks. Runs on
+                                          ;; the sync thread, which is why
+                                          ;; its RNG use is safe.
+                                          (let ((cs (node-chain-state *node*))
+                                                (mp (node-mempool *node*))
+                                                (now (bitcoin-lisp.serialization:get-unix-time)))
+                                            (dolist (p (node-peers *node*))
+                                              (when (eq (bitcoin-lisp.networking:peer-state p) :ready)
+                                                (ignore-errors
+                                                 (bitcoin-lisp.networking:maybe-send-feefilter
+                                                  p mp cs now)))))
                                           ;; New headers announced: start the
                                           ;; next sync cycle now to fetch the
                                           ;; block instead of waiting out the
