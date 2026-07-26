@@ -1178,6 +1178,7 @@
    #:peer-user-agent
    #:peer-ping-latency
    #:peer-inbound
+   #:maybe-set-peer-announcing-hb
    #:maybe-send-feefilter
    #:fee-filter-round
    #:peer-manual
