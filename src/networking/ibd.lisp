@@ -776,13 +776,14 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
                 (values (nreverse valid-headers)
                         "Timestamp too far in the future")))
 
-            ;; Validate timestamp > median-time-past
-            (let ((mtp (bitcoin-lisp.validation:compute-median-time-past
-                        chain-state header-prev-hash)))
-              (when (<= (bitcoin-lisp.serialization:block-header-timestamp header) mtp)
-                (return-from validate-header-chain
-                  (values (nreverse valid-headers)
-                          "Timestamp at or before median-time-past"))))
+            ;; Validate timestamp > median-time-past. PARENT, not
+            ;; HEADER-PREV-HASH: a mid-batch parent is a staging entry that is
+            ;; not in the index yet, so a hash lookup would find nothing and the
+            ;; comparison would pass for every header after the first.
+            (when (bitcoin-lisp.validation:header-time-too-old-p header parent)
+              (return-from validate-header-chain
+                (values (nreverse valid-headers)
+                        "Timestamp at or before median-time-past")))
 
             ;; Calculate new height and validate checkpoint
             (let* ((parent-height (if (eq parent prev-entry)
