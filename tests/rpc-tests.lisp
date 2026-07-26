@@ -335,7 +335,20 @@ when the block is on the active chain and rejects a root-mismatched proof."
                ;; Corrupt the proof's last hex nibble -> root/parse mismatch -> error.
                (signals bitcoin-lisp.rpc::rpc-error
                  (bitcoin-lisp.rpc::rpc-verifytxoutproof
-                  node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))))
+                  node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))
+               ;; Same proof once its block is off the active chain: Core
+               ;; returns an empty VARR, which must render [] and not null.
+               ;; (Control: the (equal (list target) verified) assertion above
+               ;; is the same proof while the block IS on the active chain.)
+               (let ((sibling (make-32-byte-hash 200)))
+                 (bitcoin-lisp.storage:add-block-index-entry
+                  chain-state (bitcoin-lisp.storage:make-block-index-entry
+                               :hash sibling :height 0 :header header
+                               :chain-work 2 :status :valid))
+                 (bitcoin-lisp.storage:update-chain-tip chain-state sibling 0)
+                 (is (string= "[]" (%encode-rpc-result
+                                    (bitcoin-lisp.rpc::rpc-verifytxoutproof
+                                     node (list proof))))))))
         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 
 ;;; dumptxoutset / loadtxoutset (Core snapshot v2 format) tests live in
@@ -643,12 +656,97 @@ out-of-range or boolean verbosity like Core (ParseVerbosity allow_bool=false)."
     (is (equalp raw (bitcoin-lisp.crypto:hex-to-bytes
                      (cdr (assoc "hex" o :test #'string=))))))
   (let ((node (make-test-node)))
-    (is (null (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
-    (is (null (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2))))
+    ;; An empty orphanage is Core's empty VARR. This used to assert
+    ;; (null ...), i.e. the bug: NIL encodes as JSON null, not [].
+    (is (equalp #() (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
+    (is (equalp #() (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2))))
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getorphantxs node (list 3)))
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getorphantxs node (list t)))))
+
+;;; --- Empty collections render [] / {} , never null ---
+
+(defun %encode-rpc-result (result)
+  "The exact JSON text RESULT renders to, through the same normalizer and
+encoder the RPC server uses (rpc-result->json, then yason). Asserting on the
+Lisp value alone would not catch this bug: NIL is a perfectly good empty list
+in CL and only becomes wrong at the encoder."
+  (with-output-to-string (s)
+    (yason:encode (bitcoin-lisp.rpc::rpc-result->json result) s)))
+
+(test rpc-empty-collections-encode-as-array-or-object
+  "Core builds every collection as a UniValue VARR/VOBJ, so an EMPTY one
+renders [] (or {}), never null. Our encoder maps CL NIL to JSON null, so each
+producing site coerces with json-array / json-object. Verified live before the
+fix: listbanned and getaddednodeinfo answered result:null."
+  (bitcoin-lisp.networking:clear-ban-list)
+  (let* ((node (make-test-node))
+         (mempool (bitcoin-lisp::node-mempool node)))
+    ;; The premise: a bare NIL really does encode as null. Without this the
+    ;; assertions below could pass for the wrong reason.
+    (is (string= "null" (%encode-rpc-result nil)))
+    ;; Arrays (Core VARR).
+    (dolist (site (list (cons "getpeerinfo" (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+                        (cons "listbanned" (bitcoin-lisp.rpc::rpc-listbanned node nil))
+                        (cons "getorphantxs" (bitcoin-lisp.rpc::rpc-getorphantxs node nil))
+                        (cons "getnodeaddresses"
+                              (bitcoin-lisp.rpc::rpc-getnodeaddresses node (list 0)))
+                        (cons "getaddednodeinfo"
+                              (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil))
+                        (cons "getrawmempool"
+                              (bitcoin-lisp.rpc::rpc-getrawmempool node nil))
+                        (cons "getmempoolancestors"
+                              (bitcoin-lisp.rpc::%mempool-set->result
+                               mempool (make-hash-table :test 'equalp) nil))
+                        (cons "getnetworkinfo.localaddresses"
+                              (cdr (assoc "localaddresses"
+                                          (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
+                                          :test #'string=)))
+                        (cons "scantxoutset.unspents"
+                              (cdr (assoc "unspents"
+                                          (bitcoin-lisp.rpc::rpc-scantxoutset
+                                           node (list "start" (list "raw(51)")))
+                                          :test #'string=)))))
+      (is (string= "[]" (%encode-rpc-result (cdr site)))
+          "~A must render [] when empty, got ~A"
+          (car site) (%encode-rpc-result (cdr site))))
+    ;; Objects (Core VOBJ): getrawmempool's VERBOSE form is a txid-keyed
+    ;; object, so its empty case is {} and NOT [].
+    (dolist (site (list (cons "getrawmempool verbose"
+                              (bitcoin-lisp.rpc::rpc-getrawmempool node (list t)))
+                        (cons "getmempooldescendants verbose"
+                              (bitcoin-lisp.rpc::%mempool-set->result
+                               mempool (make-hash-table :test 'equalp) t))))
+      (is (string= "{}" (%encode-rpc-result (cdr site)))
+          "~A must render {} when empty, got ~A"
+          (car site) (%encode-rpc-result (cdr site))))
+    ;; A node with no mempool at all takes getrawmempool's other early branch,
+    ;; which must still pick the shape by verbosity.
+    (setf (bitcoin-lisp::node-mempool node) nil)
+    (is (string= "[]" (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getrawmempool node nil))))
+    (is (string= "{}" (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getrawmempool node (list t))))))
+  ;; CONTROL 1 — populated collections keep their existing shape: an array of
+  ;; JSON objects, not a vector of unencodable dotted pairs.
+  (let ((node (make-test-node)))
+    (setf (bitcoin-lisp::node-peers node)
+          (list (bitcoin-lisp::make-peer :address "1.2.3.4:48333" :user-agent "/t/")))
+    (bitcoin-lisp.rpc::rpc-addnode node (list "192.0.2.10:48333" "add"))
+    (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "add"))
+    (let ((peers (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)))
+          (bans (%encode-rpc-result (bitcoin-lisp.rpc::rpc-listbanned node nil)))
+          (added (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil))))
+      (is (eql 0 (search "[{" peers)))
+      (is (eql 0 (search "[{" bans)))
+      (is (search "\"address\":\"1.2.3.4\"" bans))
+      (is (eql 0 (search "[{" added)))
+      ;; ... and a populated row's own empty nested array is [] too.
+      (is (search "\"addresses\":[]" added)))
+    (bitcoin-lisp.networking:clear-ban-list))
+  ;; CONTROL 2 — NIL must still mean null where Core returns null. This is why
+  ;; the fix is per-site and not a global normalizer in rpc-result->json.
+  (is (string= "null" (%encode-rpc-result
+                       (bitcoin-lisp.rpc::rpc-scantxoutset (make-test-node) (list "status"))))))
 
 ;;; --- UTXO Query Method Tests (4.3) ---
 
@@ -758,11 +856,11 @@ default, json-false under -blocksonly."
     (is (integerp (cdr (assoc "usage" result :test #'string=))))))
 
 (test rpc-getrawmempool-non-verbose
-  "Test getrawmempool non-verbose returns list"
+  "getrawmempool non-verbose returns a JSON array of txids — [] for a new
+node, not null (it used to assert only LISTP, which NIL satisfies)."
   (let* ((node (make-test-node))
          (result (bitcoin-lisp.rpc::rpc-getrawmempool node '(nil))))
-    ;; Should return a list (empty for new node)
-    (is (listp result))))
+    (is (equalp #() result))))
 
 (test rpc-getrawmempool-verbose
   "getrawmempool verbose returns a per-tx detail alist (txid -> fields) that the
@@ -771,8 +869,11 @@ RPC layer normalizes into a JSON object."
          (mempool (bitcoin-lisp::node-mempool node))
          (tx (make-mempool-test-tx :input-id 200))
          (txid (bitcoin-lisp.serialization:transaction-hash tx)))
-    ;; Empty mempool -> empty.
-    (is (null (bitcoin-lisp.rpc::rpc-getrawmempool node '(t))))
+    ;; Empty mempool -> Core's empty VOBJ, i.e. an empty JSON object, not
+    ;; null (this used to assert (null ...), the bug).
+    (let ((empty (bitcoin-lisp.rpc::rpc-getrawmempool node '(t))))
+      (is (hash-table-p empty))
+      (is (zerop (hash-table-count empty))))
     ;; Populate and check the entry + a couple of fields.
     (bitcoin-lisp.mempool:mempool-add
      mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))
@@ -1077,6 +1178,163 @@ a hardcoded 1."
                 node (list (bitcoin-lisp.rpc::hash-to-hex (%entry-hash entries 5))))))
         (is (= 1 (cdr (assoc "confirmations" r :test #'string=))))
         (is (null (assoc "nextblockhash" r :test #'string=)))))))
+
+;;; --- getblockheader nTx / previousblockhash, getblock coinbase_tx ---
+
+(defun %hdrfields-tx (tag &key witness)
+  "A coinbase-shaped transaction, distinct per TAG (its 3-byte scriptSig)."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-32-byte-hash 0) :index #xffffffff)
+                    :script-sig (make-array 3 :element-type '(unsigned-byte 8)
+                                              :initial-element tag)
+                    :sequence #xfffffffe))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 5000 :script-pubkey (make-array 4 :element-type '(unsigned-byte 8)
+                                                              :initial-element #x6a)))
+   :witness (when witness (vector (list witness)))
+   :lock-time 7))
+
+(defun %hdrfields-block (txs prev-hash time)
+  "A block over TXS with a real merkle root and PREV-HASH."
+  (let* ((root (bitcoin-lisp.validation:compute-merkle-root
+                (mapcar #'bitcoin-lisp.serialization:transaction-hash txs)))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1 :prev-block prev-hash :merkle-root root
+                  :timestamp time :bits #x207fffff :nonce 0)))
+    (bitcoin-lisp.serialization:make-bitcoin-block :header header :transactions txs)))
+
+(defmacro %with-hdrfields-chain ((node store g a b) &body body)
+  "Bind NODE to a test node whose block store holds a 1-tx block G at height 0
+and a 2-tx block A at height 1, plus a header-only entry B at height 2 (the
+active tip). G, A and B are bound to (block . hash) conses."
+  (let ((dir (gensym "DIR")))
+    `(let* ((,node (make-test-node))
+            (,dir (ensure-directories-exist
+                   (merge-pathnames (format nil "hdrfields-~D/" (get-internal-real-time))
+                                    (uiop:temporary-directory))))
+            (,store (bitcoin-lisp.storage:init-block-store ,dir)))
+       (setf (bitcoin-lisp::node-block-store ,node) ,store)
+       (unwind-protect
+            (let* ((gb (%hdrfields-block (list (%hdrfields-tx 1)) (make-32-byte-hash 0) 1700000000))
+                   (gh (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header gb)))
+                   (ab (%hdrfields-block (list (%hdrfields-tx 2) (%hdrfields-tx 3)) gh 1700000600))
+                   (ah (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header ab)))
+                   (bb (%hdrfields-block (list (%hdrfields-tx 4)) ah 1700001200))
+                   (bh (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header bb)))
+                   (,g (cons gb gh)) (,a (cons ab ah)) (,b (cons bb bh))
+                   (cs (bitcoin-lisp::node-chain-state ,node)))
+              (declare (ignorable ,g ,a ,b))
+              (setf (bitcoin-lisp.storage::chain-state-genesis-hash cs) gh)
+              ;; B is header-only on purpose: its body is never stored.
+              (bitcoin-lisp.storage:store-block ,store gb)
+              (bitcoin-lisp.storage:store-block ,store ab)
+              (let* ((ge (bitcoin-lisp.storage:make-block-index-entry
+                          :hash gh :height 0 :chain-work 1 :status :valid
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header gb)))
+                     (ae (bitcoin-lisp.storage:make-block-index-entry
+                          :hash ah :height 1 :chain-work 2 :status :valid :prev-entry ge
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header ab)))
+                     (be (bitcoin-lisp.storage:make-block-index-entry
+                          :hash bh :height 2 :chain-work 3 :status :valid :prev-entry ae
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header bb))))
+                (bitcoin-lisp.storage:add-block-index-entry cs ge)
+                (bitcoin-lisp.storage:add-block-index-entry cs ae)
+                (bitcoin-lisp.storage:add-block-index-entry cs be)
+                (bitcoin-lisp.storage:update-chain-tip cs bh 2))
+              ,@body)
+         (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
+
+(test rpc-getblockheader-ntx-and-genesis-previousblockhash
+  "getblockheader emits nTx (Core blockheaderToJSON, rpc/blockchain.cpp:175) and
+OMITS previousblockhash for genesis (`if (blockindex.pprev)`, :177-178) rather
+than reporting 64 zeros — a client walking the chain backwards terminates on the
+missing key; given the all-zero hash it asks for a block nobody has and errors."
+  (%with-hdrfields-chain (node store g a b)
+    (flet ((hdr (hash)
+             (bitcoin-lisp.rpc::rpc-getblockheader
+              node (list (bitcoin-lisp.rpc::hash-to-hex hash)))))
+      (let ((gj (hdr (cdr g))) (aj (hdr (cdr a))) (bj (hdr (cdr b))))
+        ;; nTx is always present. Genesis carries its coinbase; A's index entry
+        ;; predates the tx-count field and is backfilled from the block store;
+        ;; B is header-only, so 0 — Core's nTx is 0 until the body arrives.
+        (is (= 1 (cdr (assoc "nTx" gj :test #'string=))))
+        (is (= 2 (cdr (assoc "nTx" aj :test #'string=))))
+        (is (= 0 (cdr (assoc "nTx" bj :test #'string=))))
+        ;; Genesis omits previousblockhash entirely...
+        (is (null (assoc "previousblockhash" gj :test #'string=)))
+        (is (not (search "previousblockhash" (%encode-rpc-result gj))))
+        ;; ...CONTROL: every other header still carries it, naming the real
+        ;; parent (so the omission is genesis-specific, not a blanket drop).
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr g))
+                     (cdr (assoc "previousblockhash" aj :test #'string=))))
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr a))
+                     (cdr (assoc "previousblockhash" bj :test #'string=))))
+        ;; The fields survive the encoder.
+        (is (search "\"nTx\":2" (%encode-rpc-result aj)))))))
+
+(test rpc-getblock-coinbase-tx-and-genesis-previousblockhash
+  "getblock emits coinbase_tx (Core blockToJSON:211 -> coinbaseTxToJSON:185-200):
+version, locktime, the coinbase input's sequence and scriptSig hex, plus the
+single witness item only when the coinbase carries one. blockToJSON delegates
+its header fields to blockheaderToJSON, so genesis omits previousblockhash here
+too."
+  (%with-hdrfields-chain (node store g a b)
+    (flet ((blk (hash &optional (verbosity 1))
+             (bitcoin-lisp.rpc::rpc-getblock
+              node (list (bitcoin-lisp.rpc::hash-to-hex hash) verbosity))))
+      (let* ((gj (blk (cdr g)))
+             (cb (cdr (assoc "coinbase_tx" gj :test #'string=))))
+        (is (not (null cb)) "getblock must emit coinbase_tx")
+        (when cb
+          (is (= 2 (cdr (assoc "version" cb :test #'string=))))
+          (is (= 7 (cdr (assoc "locktime" cb :test #'string=))))
+          (is (= #xfffffffe (cdr (assoc "sequence" cb :test #'string=))))
+          (is (string= "010101" (cdr (assoc "coinbase" cb :test #'string=))))
+          ;; CONTROL: a witness-less coinbase omits the witness key entirely
+          ;; (Core pushes it only for a non-empty stack).
+          (is (null (assoc "witness" cb :test #'string=))))
+        ;; Genesis omits previousblockhash here as well...
+        (is (null (assoc "previousblockhash" gj :test #'string=)))
+        ;; ...CONTROL: a non-genesis block still reports it.
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr g))
+                     (cdr (assoc "previousblockhash" (blk (cdr a)) :test #'string=))))
+        ;; Verbosity 2 (full tx detail) carries coinbase_tx too; verbosity 0 is
+        ;; untouched raw hex.
+        (is (assoc "coinbase_tx" (blk (cdr a) 2) :test #'string=))
+        (is (stringp (blk (cdr a) 0)))))))
+
+(test rpc-getblock-coinbase-tx-witness
+  "A coinbase with a witness stack reports it as coinbase_tx.witness (the BIP141
+reserved value), matching Core's `if (!witness_stack.empty())`."
+  (let* ((node (make-test-node))
+         (dir (ensure-directories-exist
+               (merge-pathnames (format nil "cbwitness-~D/" (get-internal-real-time))
+                                (uiop:temporary-directory))))
+         (store (bitcoin-lisp.storage:init-block-store dir)))
+    (setf (bitcoin-lisp::node-block-store node) store)
+    (unwind-protect
+         (let* ((reserved (make-32-byte-hash 0))
+                (blk (%hdrfields-block (list (%hdrfields-tx 8 :witness reserved))
+                                       (make-32-byte-hash 0) 1700000000))
+                (hash (bitcoin-lisp.serialization:block-header-hash
+                       (bitcoin-lisp.serialization:bitcoin-block-header blk))))
+           (bitcoin-lisp.storage:store-block store blk)
+           (let ((cb (cdr (assoc "coinbase_tx"
+                                 (bitcoin-lisp.rpc::rpc-getblock
+                                  node (list (bitcoin-lisp.rpc::hash-to-hex hash) 1))
+                                 :test #'string=))))
+             (is (not (null cb)))
+             (when cb
+               (is (string= (bitcoin-lisp.crypto:bytes-to-hex reserved)
+                            (cdr (assoc "witness" cb :test #'string=))))
+               (is (string= "080808" (cdr (assoc "coinbase" cb :test #'string=)))))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
 
 ;;; --- Authentication Tests (7.4) ---
 
@@ -1484,6 +1742,212 @@ the value."
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getblockstats node
         '("0000000000000000000000000000000000000000000000000000000000000001")))))
+
+;;; getblockstats against an exact fixture: coinbase + one witness tx.
+
+(defparameter *gbs-p2pkh*
+  (concatenate '(vector (unsigned-byte 8))
+               #(#x76 #xa9 #x14) (make-array 20 :element-type '(unsigned-byte 8)
+                                               :initial-element #x33)
+               #(#x88 #xac))
+  "A 25-byte P2PKH scriptPubKey (spendable).")
+
+(defparameter *gbs-opreturn*
+  (coerce #(#x6a #x01 #x02) '(vector (unsigned-byte 8)))
+  "A 3-byte OP_RETURN scriptPubKey (provably unspendable).")
+
+(defun %gbs-coinbase ()
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-32-byte-hash 0) :index #xffffffff)
+                    :script-sig (coerce #(#x01 #x64) '(vector (unsigned-byte 8)))
+                    :sequence #xffffffff))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 5000030000 :script-pubkey *gbs-p2pkh*))
+   :lock-time 0))
+
+(defun %gbs-spender (prev-txid)
+  "A segwit transaction spending PREV-TXID:0 (100000 sat) into 40000 + 30000,
+so its fee is exactly 30000 sat. Its second output is unspendable."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash prev-txid :index 0)
+                    :script-sig (make-array 0 :element-type '(unsigned-byte 8))
+                    :sequence #xfffffffd))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 40000 :script-pubkey *gbs-p2pkh*)
+                    (bitcoin-lisp.serialization:make-tx-out
+                     :value 30000 :script-pubkey *gbs-opreturn*))
+   :witness (vector (list (make-array 72 :element-type '(unsigned-byte 8) :initial-element 9)
+                          (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2)))
+   :lock-time 0))
+
+(defmacro %with-gbs-block ((node hash-hex spender &key (with-undo t) (coinbase-only nil))
+                           &body body)
+  "Store a height-100 block (coinbase + one 30000-sat-fee segwit spend, unless
+COINBASE-ONLY) with its undo data, and bind NODE / HASH-HEX / SPENDER."
+  (let ((dir (gensym "DIR")) (store (gensym "STORE")) (hash (gensym "HASH"))
+        (prev (gensym "PREV")))
+    `(let* ((,node (make-test-node))
+            (,dir (ensure-directories-exist
+                   (merge-pathnames (format nil "gbs-~D/" (get-internal-real-time))
+                                    (uiop:temporary-directory))))
+            (,store (bitcoin-lisp.storage:init-block-store ,dir))
+            (,prev (make-32-byte-hash 77))
+            (,spender (%gbs-spender ,prev))
+            (%gbs-txs (if ,coinbase-only
+                          (list (%gbs-coinbase))
+                          (list (%gbs-coinbase) ,spender)))
+            (%gbs-blk (%hdrfields-block %gbs-txs (make-32-byte-hash 5) 1700000000))
+            (,hash (bitcoin-lisp.serialization:block-header-hash
+                    (bitcoin-lisp.serialization:bitcoin-block-header %gbs-blk)))
+            (,hash-hex (bitcoin-lisp.rpc::hash-to-hex ,hash)))
+       (declare (ignorable ,spender))
+       (setf (bitcoin-lisp::node-block-store ,node) ,store)
+       (unwind-protect
+            (progn
+              (bitcoin-lisp.storage:store-block ,store %gbs-blk)
+              (bitcoin-lisp.storage:add-block-index-entry
+               (bitcoin-lisp::node-chain-state ,node)
+               (bitcoin-lisp.storage:make-block-index-entry
+                :hash ,hash :height 100 :chain-work 1 :status :valid
+                :header (bitcoin-lisp.serialization:bitcoin-block-header %gbs-blk)))
+              (when ,with-undo
+                (setf (gethash ,hash bitcoin-lisp.validation::*block-undo-data*)
+                      (list (list ,prev 0
+                                  (bitcoin-lisp.storage:make-utxo-entry
+                                   :value 100000 :script-pubkey *gbs-p2pkh*
+                                   :height 50 :coinbase nil)))))
+              ,@body)
+         (remhash ,hash bitcoin-lisp.validation::*block-undo-data*)
+         (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
+
+(test rpc-getblockstats-excludes-coinbase-and-uses-witness-tx-sizes
+  "getblockstats accumulates per-transaction, AFTER Core's
+`if (tx->IsCoinBase()) continue;` (rpc/blockchain.cpp:2075-2077), using the
+witness-inclusive ComputeTotalSize (:2085) — so total_size, total_out and
+total_weight exclude the coinbase and carry no block header or tx-count varint,
+and avgtxsize divides by vtx.size()-1 (:2143). We previously used
+(length (serialize block)) — the LEGACY whole-block form — over ntx, and
+summed the coinbase's outputs into total_out."
+  (%with-gbs-block (node hex spender)
+    (let* ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))
+           (stat (lambda (k) (cdr (assoc k r :test #'string=))))
+           (wire (length (bitcoin-lisp.serialization:transaction-wire-bytes spender)))
+           (stripped (length (bitcoin-lisp.serialization:serialize-transaction spender)))
+           (weight (bitcoin-lisp.serialization:transaction-weight spender))
+           (whole-block (length (bitcoin-lisp.serialization:serialize
+                                 (bitcoin-lisp.storage:get-block
+                                  (bitcoin-lisp::node-block-store node)
+                                  (bitcoin-lisp.rpc::parse-hex-hash hex))))))
+      ;; --- sizes ---
+      (is (= wire (funcall stat "total_size")))
+      ;; ...which is witness-INCLUSIVE (the stripped form is strictly smaller)
+      ;; and is NOT the whole-block quantity we used to report.
+      (is (> wire stripped))
+      (is (/= whole-block (funcall stat "total_size")))
+      (is (= weight (funcall stat "total_weight")))
+      ;; avgtxsize divides by the NON-coinbase count (1 here), not by ntx (2).
+      (is (= wire (funcall stat "avgtxsize")))
+      (is (/= (round whole-block 2) (funcall stat "avgtxsize")))
+      (is (= wire (funcall stat "maxtxsize")))
+      (is (= wire (funcall stat "mintxsize")))
+      (is (= wire (funcall stat "mediantxsize")))
+      ;; --- amounts ---
+      ;; 40000 + 30000; the 5000030000-sat coinbase output is NOT counted.
+      (is (= 70000 (funcall stat "total_out")))
+      (is (= 2 (funcall stat "txs")))
+      (is (= 1 (funcall stat "ins")))
+      ;; CONTROL: "outs" IS counted before the coinbase continue (Core :2054),
+      ;; so it still includes the coinbase's output — do not "fix" it.
+      (is (= 3 (funcall stat "outs")))
+      ;; --- fees, from undo data ---
+      (is (= 30000 (funcall stat "totalfee")))
+      (is (= 30000 (funcall stat "avgfee")))
+      (is (= 30000 (funcall stat "maxfee")))
+      (is (= 30000 (funcall stat "minfee")))
+      (is (= 30000 (funcall stat "medianfee")))
+      (let ((feerate (truncate (* 30000 4) weight)))
+        (is (plusp feerate))
+        (is (= feerate (funcall stat "avgfeerate")))
+        (is (= feerate (funcall stat "maxfeerate")))
+        (is (= feerate (funcall stat "minfeerate")))
+        (is (equal (list feerate feerate feerate feerate feerate)
+                   (funcall stat "feerate_percentiles"))))
+      ;; --- segwit + utxo-set deltas ---
+      (is (= 1 (funcall stat "swtxs")))
+      (is (= wire (funcall stat "swtotal_size")))
+      (is (= weight (funcall stat "swtotal_weight")))
+      ;; 3 outputs created, 1 spent.
+      (is (= 2 (funcall stat "utxo_increase")))
+      ;; The OP_RETURN output never enters the UTXO set: 2 created, 1 spent.
+      (is (= 1 (funcall stat "utxo_increase_actual")))
+      ;; Sizes: a 25-byte spk costs 8+1+25+41 = 75, the 3-byte OP_RETURN
+      ;; 8+1+3+41 = 53; one 75-byte prevout is removed.
+      (is (= (- (+ 75 75 53) 75) (funcall stat "utxo_size_inc")))
+      (is (= (- (+ 75 75) 75) (funcall stat "utxo_size_inc_actual")))
+      ;; --- chain context ---
+      (is (= 100 (funcall stat "height")))
+      (is (= 1700000000 (funcall stat "time")))
+      (is (= 1700000000 (funcall stat "mediantime")))
+      (is (string= hex (funcall stat "blockhash")))
+      (is (= (bitcoin-lisp.validation:calculate-block-subsidy 100)
+             (funcall stat "subsidy")))
+      ;; Core's full key set is 31 keys.
+      (is (= 31 (length r))))))
+
+(test rpc-getblockstats-coinbase-only-block
+  "CONTROL for the coinbase exclusion at the boundary: a block with nothing but
+a coinbase has zero total_size / total_out / total_weight / fees and a zero
+average (Core divides by vtx.size()-1 only `if (block.vtx.size() > 1)`), while
+its output is still counted in outs."
+  (%with-gbs-block (node hex spender :with-undo nil :coinbase-only t)
+    (let* ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))
+           (stat (lambda (k) (cdr (assoc k r :test #'string=)))))
+      (is (= 1 (funcall stat "txs")))
+      (is (= 1 (funcall stat "outs")))
+      (is (= 0 (funcall stat "ins")))
+      (is (= 0 (funcall stat "total_size")))
+      (is (= 0 (funcall stat "total_out")))
+      (is (= 0 (funcall stat "total_weight")))
+      (is (= 0 (funcall stat "avgtxsize")))
+      (is (= 0 (funcall stat "avgfee")))
+      (is (= 0 (funcall stat "totalfee")))
+      (is (= 0 (funcall stat "minfee")))
+      (is (= 0 (funcall stat "mintxsize")))
+      (is (equal (list 0 0 0 0 0) (funcall stat "feerate_percentiles"))))))
+
+(test rpc-getblockstats-unknown-stat-errors
+  "An unknown statistic name is Core's RPC_INVALID_PARAMETER (-8) 'Invalid
+selected statistic' (rpc/blockchain.cpp:2183-2186); we used to drop it
+silently, so a typo read as 'that statistic is unavailable for this block'."
+  (%with-gbs-block (node hex spender)
+    (let ((code (handler-case
+                    (progn (bitcoin-lisp.rpc::rpc-getblockstats
+                            node (list hex (list "totalfee" "bogus")))
+                           :no-error)
+                  (bitcoin-lisp.rpc::rpc-error (e) (bitcoin-lisp.rpc::rpc-error-code e)))))
+      (is (eql -8 code)))
+    ;; CONTROL: a known name still selects exactly that key.
+    (let ((r (bitcoin-lisp.rpc::rpc-getblockstats node (list hex (list "totalfee")))))
+      (is (= 1 (length r)))
+      (is (= 30000 (cdr (assoc "totalfee" r :test #'string=)))))
+    ;; A non-array stats argument is Core's type error.
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node (list hex "totalfee")))))
+
+(test rpc-getblockstats-requires-undo-data
+  "The fee statistics come from undo data, and Core's GetUndoChecked
+(rpc/blockchain.cpp:2016, :718-735) runs unconditionally — so a spending block
+whose undo data is missing is an error, never a silently wrong fee total.
+CONTROL: the identical block WITH its undo data answers (previous test)."
+  (%with-gbs-block (node hex spender :with-undo nil)
+    (signals bitcoin-lisp.rpc::rpc-error
+      (bitcoin-lisp.rpc::rpc-getblockstats node (list hex)))))
 
 (test rpc-calculate-block-subsidy
   "Test block subsidy calculation"
@@ -2750,8 +3214,9 @@ all_networks aggregate; counts stay consistent with the address book."
           (is (= 1 (length addrs)))
           (is (string= "1.2.3.4" (cdr (assoc "address" (first addrs) :test #'string=))))
           (is (string= "outbound" (cdr (assoc "connected" (first addrs) :test #'string=)))))
-        ;; unconnected node has no address entries
-        (is (null (cdr (assoc "addresses" b :test #'string=))))))
+        ;; unconnected node has no address entries — Core's empty VARR, so
+        ;; [] rather than null (this used to assert (null ...), the bug).
+        (is (equalp #() (cdr (assoc "addresses" b :test #'string=))))))
     ;; filtering for a never-added node errors
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getaddednodeinfo node '("10.0.0.1")))))
@@ -2995,6 +3460,79 @@ mining order (parent's first)."
                              (cdr (assoc "chunkfee" (first chunks) :test #'string=))))))
       (is (= 100 (round (* 100000000
                            (cdr (assoc "chunkfee" (second chunks) :test #'string=)))))))))
+
+;;; --- /rest/headers active-chain membership ---
+
+(defmacro %with-rest-count ((count) &body body)
+  "Run BODY with hunchentoot's `count` query parameter stubbed to COUNT.
+The REST handlers read it through hunchentoot:get-parameter, which needs a
+live *request*; swapping the fdefinition is the smallest seam that lets the
+real handler run unmodified."
+  (let ((orig (gensym "ORIG")))
+    `(let ((,orig (fdefinition 'hunchentoot:get-parameter)))
+       (unwind-protect
+            (progn (setf (fdefinition 'hunchentoot:get-parameter)
+                         (lambda (name &optional request)
+                           (declare (ignore request))
+                           (when (string= name "count") ,count)))
+                   ,@body)
+         (setf (fdefinition 'hunchentoot:get-parameter) ,orig)))))
+
+(test rest-headers-refuses-fork-start-and-stays-contiguous
+  "/rest/headers walks forward by ABSOLUTE HEIGHT via get-block-at-height,
+which descends from the ACTIVE tip — so a start header on a FORK used to be
+spliced onto the active chain's successors and the reply was not a chain at
+all (headers[1].previousblockhash did not name headers[0]). Core's loop is
+`while (pindex && active_chain.Contains(pindex))` with active_chain.Next
+(rest.cpp:227-232), so a fork start yields an EMPTY result and contiguity is
+structural."
+  (multiple-value-bind (cs entries) (%make-served-chain 2) ; heights 0,1,2
+    (let* ((node (make-test-node))
+           (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+           (genesis (first entries))
+           (genesis-hex (bitcoin-lisp.rpc::hash-to-hex
+                         (bitcoin-lisp.storage:block-index-entry-hash genesis)))
+           ;; A competing block at height 1, off the active chain.
+           (fork-header (bitcoin-lisp.serialization:make-block-header
+                         :version 1
+                         :prev-block (bitcoin-lisp.storage:block-index-entry-hash genesis)
+                         :merkle-root (make-32-byte-hash 99)
+                         :timestamp 1700000500 :bits #x1d00ffff :nonce 4242))
+           (fork-hash (bitcoin-lisp.serialization:block-header-hash fork-header))
+           (fork-hex (bitcoin-lisp.rpc::hash-to-hex fork-hash)))
+      (setf (bitcoin-lisp::node-chain-state node) cs)
+      (bitcoin-lisp.storage:add-block-index-entry
+       cs (bitcoin-lisp.storage:make-block-index-entry
+           :hash fork-hash :height 1 :header fork-header
+           :prev-entry genesis :chain-work 2 :status :valid))
+      ;; The fork block really is known to the index but not on the active
+      ;; chain — otherwise the assertions below would pass for the wrong reason.
+      (is-true (bitcoin-lisp.storage:get-block-index-entry cs fork-hash))
+      (is-false (bitcoin-lisp.storage:entry-on-active-chain-p
+                 cs (bitcoin-lisp.storage:get-block-index-entry cs fork-hash)))
+      (flet ((rest-get (hex ext)
+               (bitcoin-lisp.rpc::rest-handle
+                node (format nil "/rest/headers/~A.~A" hex ext))))
+        (%with-rest-count ("3")
+          ;; Fork start: empty, in every representation. Before the fix this
+          ;; was [fork@1, active@2] — two headers that are not a chain.
+          (is (string= "[]" (rest-get fork-hex "json")))
+          (is (= 200 (hunchentoot:return-code*)))
+          (is (string= (format nil "~%") (rest-get fork-hex "hex")))
+          (is (zerop (length (rest-get fork-hex "bin"))))
+          ;; CONTROL: an active-chain start still returns COUNT headers...
+          (let* ((body (rest-get genesis-hex "json"))
+                 (parsed (let ((yason:*parse-json-arrays-as-vectors* t))
+                           (yason:parse body))))
+            (is (= 3 (length parsed)))
+            ;; ...and they form a real chain.
+            (loop for i from 1 below (length parsed)
+                  do (is (string= (gethash "hash" (aref parsed (1- i)))
+                                  (gethash "previousblockhash" (aref parsed i)))
+                         "header ~D does not follow header ~D" i (1- i))))
+          ;; 3 headers * 80 bytes, plus the trailing newline .hex adds.
+          (is (= (1+ (* 3 160)) (length (rest-get genesis-hex "hex"))))
+          (is (= (* 3 80) (length (rest-get genesis-hex "bin")))))))))
 
 ;;; --- /rest/health liveness decision (item #6) ---
 
