@@ -460,14 +460,14 @@ status with no scan running returns null; abort with no scan is a no-op."
 
 (test json-rpc-response-success
   "Test successful response format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-response 42 "test-id")))
+  (let ((response (bitcoin-lisp.rpc::make-rpc-response 42 "test-id" :v2)))
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (= (gethash "result" response) 42))
     (is (string= (gethash "id" response) "test-id"))))
 
 (test json-rpc-response-error
   "Test error response format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" "test-id")))
+  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" "test-id" :v2)))
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (string= (gethash "id" response) "test-id"))
     (let ((error-obj (gethash "error" response)))
@@ -552,7 +552,7 @@ status with no scan running returns null; abort with no scan is a no-op."
     (is (= 8 (length (cdr (assoc "bits" result :test #'string=)))))
     ;; encodes cleanly through yason (warnings is an empty JSON array, etc.)
     (is (stringp (with-output-to-string (s)
-                   (yason:encode (bitcoin-lisp.rpc::make-rpc-response result "id") s))))))
+                   (yason:encode (bitcoin-lisp.rpc::make-rpc-response result "id" :v2) s))))))
 
 (test rpc-getblockcount
   "Test getblockcount returns integer"
@@ -704,7 +704,7 @@ used to emit it verbatim, which yason cannot encode."
       (is (integerp (cdr (assoc "version" entry :test #'string=))))
       (is (= (cdr (assoc "version" entry :test #'string=)) 70016))
       ;; full result must serialize without error
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-getnetworkinfo
@@ -783,7 +783,7 @@ RPC layer normalizes into a JSON object."
       (is (assoc "vsize" entry :test #'string=))
       (is (= 1 (cdr (assoc "ancestorcount" entry :test #'string=))))
       ;; serializes cleanly through the RPC response normalizer
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-sendrawtransaction-invalid
@@ -1164,7 +1164,7 @@ a hardcoded 1."
 
 (test rpc-error-response-format
   "Test error response matches Bitcoin Core format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" 123)))
+  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" 123 :v2)))
     ;; Must have jsonrpc, error, and id fields
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (gethash "error" response))
@@ -1550,7 +1550,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
                           (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
                           (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)
                           (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)))
-      (let* ((response (bitcoin-lisp.rpc::make-rpc-response result "id"))
+      (let* ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2))
              (json (with-output-to-string (s) (yason:encode response s)))
              (parsed (yason:parse json)))
         (is (hash-table-p parsed))
@@ -1595,7 +1595,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       ;; B is a side branch one block off the active chain.
       (is (= (cdr (assoc "branchlen" fork :test #'string=)) 1))
       ;; full result serializes cleanly.
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response tips "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response tips "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-testmempoolaccept-missing-input
@@ -2082,7 +2082,7 @@ NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
     (is (integerp (cdr (assoc "connections_in" r :test #'string=))))
     (is (integerp (cdr (assoc "connections_out" r :test #'string=))))
     (is (assoc "warnings" r :test #'string=))
-    (let ((resp (bitcoin-lisp.rpc::make-rpc-response r "id")))
+    (let ((resp (bitcoin-lisp.rpc::make-rpc-response r "id" :v2)))
       (finishes (with-output-to-string (s) (yason:encode resp s))))))
 
 (test rpc-getpeerinfo-fields
@@ -2207,7 +2207,7 @@ through yason."
       (is (null (assoc "addrbind" e :test #'string=)))
       (is (null (assoc "mapped_as" e :test #'string=)))
       ;; full row encodes through yason.
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response rows "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response rows "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-getpeerinfo-synced-headers-from-best-known
@@ -3030,3 +3030,225 @@ and a never-advanced tip reads as a large seconds-since-tip."
       ;; seconds-since-tip is well past the staleness threshold.
       (is (integerp seconds))
       (is (>= seconds bitcoin-lisp::*health-max-tip-staleness-seconds*)))))
+
+;;;; ---------------------------------------------------------------------
+;;;; JSON-RPC reply shape by request version (GA8 wave 6, item 1)
+;;;;
+;;;; Core JSONRPCReplyObj (rpc/request.cpp:51-68) shapes the reply from the
+;;;; request's version: "jsonrpc" is emitted for 2.0 only; a legacy 1.x reply
+;;;; carries BOTH "result" and "error" with one of them null; "id" is omitted
+;;;; when the request carried no id member (request.cpp:207-211).
+;;;; We used to answer every request with the 2.0 shape, which makes
+;;;; python-bitcoinrpc's AuthServiceProxy (`if response['error'] is not None:`)
+;;;; raise KeyError: 'error' on every successful call.
+;;;; ---------------------------------------------------------------------
+
+(defparameter *jsonrpc-shape-method* "ga8shapeecho"
+  "Name of the throwaway RPC method the reply-shape tests dispatch.")
+
+(defun call-with-jsonrpc-shape-method (thunk)
+  "Register an always-succeeding dispatch target, run THUNK, then remove it so
+the global method registry (which the /ui help test enumerates) is unchanged."
+  (bitcoin-lisp.rpc::register-rpc-method
+   *jsonrpc-shape-method*
+   (lambda (node params) (declare (ignore node params)) 42))
+  (unwind-protect (funcall thunk)
+    (remhash *jsonrpc-shape-method* bitcoin-lisp.rpc::*rpc-methods*)))
+
+(defmacro with-jsonrpc-shape-method (&body body)
+  `(call-with-jsonrpc-shape-method (lambda () ,@body)))
+
+(defun jsonrpc-shape-key-present-p (object key)
+  "True when the parsed JSON OBJECT carries KEY at all — which is a different
+question from its value being null, and is exactly the difference that breaks
+python-bitcoinrpc."
+  (and (hash-table-p object) (nth-value 1 (gethash key object))))
+
+(defun jsonrpc-shape-reply (body)
+  "Drive BODY through the production path (parse-json-rpc-request ->
+handle-single-request -> yason:encode) and return (values parsed-reply
+json-text). Returns (values :no-reply nil) for a 2.0 notification, which
+rpc-handler answers with HTTP 204 and no body."
+  (multiple-value-bind (kind method params id version id-present)
+      (bitcoin-lisp.rpc::parse-json-rpc-request body)
+    (unless (eq kind :single)
+      (error "jsonrpc-shape-reply: expected a single request, got ~S" kind))
+    (if (and (eq version :v2) (not id-present))
+        (values :no-reply nil)
+        (let* ((response (bitcoin-lisp.rpc::handle-single-request
+                          nil method params id version :id-present id-present))
+               (json (with-output-to-string (s) (yason:encode response s))))
+          (values (yason:parse json) json)))))
+
+(defun jsonrpc-shape-body (version-member method id-member)
+  "A request body: VERSION-MEMBER and ID-MEMBER are the literal JSON members
+to splice in (\"\" for absent)."
+  (format nil "{~@[~A,~]\"method\":\"~A\",\"params\":[]~@[,~A~]}"
+          version-member method id-member))
+
+(test jsonrpc-v1-success-reply-has-both-result-and-null-error
+  "A jsonrpc:\"1.0\" request — and one with no jsonrpc member at all, which
+Core also classifies V1_LEGACY (request.cpp:212-227) — gets the legacy reply
+shape: NO \"jsonrpc\" key, both \"result\" and \"error\" present with the error
+null, and the id echoed. The last assertion is python-bitcoinrpc's:
+response[\"error\"] must EXIST and be null on success."
+  (with-jsonrpc-shape-method
+    (dolist (version-member (list "\"jsonrpc\":\"1.0\"" nil))
+      (multiple-value-bind (reply json)
+          (jsonrpc-shape-reply (jsonrpc-shape-body version-member
+                                                   *jsonrpc-shape-method*
+                                                   "\"id\":7"))
+        (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+        (when (hash-table-p reply)
+          (is-false (jsonrpc-shape-key-present-p reply "jsonrpc")
+                    "1.x reply must not carry a \"jsonrpc\" key: ~A" json)
+          (is-true (jsonrpc-shape-key-present-p reply "result"))
+          (is (eql 42 (gethash "result" reply)))
+          ;; python-bitcoinrpc: `if response['error'] is not None:`
+          (is-true (jsonrpc-shape-key-present-p reply "error")
+                   "1.x success reply must carry a null \"error\": ~A" json)
+          (is-false (gethash "error" reply))
+          (is-true (search "\"error\":null" json)
+                   "\"error\" must serialize as JSON null: ~A" json)
+          (is-true (jsonrpc-shape-key-present-p reply "id"))
+          (is (eql 7 (gethash "id" reply))))))))
+
+(test jsonrpc-v1-error-reply-has-both-null-result-and-error
+  "A 1.x error reply carries a null \"result\" beside the error object and no
+\"jsonrpc\" key (Core rpc/request.cpp:60-64)."
+  (with-jsonrpc-shape-method
+    (dolist (version-member (list "\"jsonrpc\":\"1.0\"" nil))
+      (multiple-value-bind (reply json)
+          (jsonrpc-shape-reply (jsonrpc-shape-body version-member
+                                                   "ga8shapenosuchmethod"
+                                                   "\"id\":7"))
+        (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+        (when (hash-table-p reply)
+          (is-false (jsonrpc-shape-key-present-p reply "jsonrpc")
+                    "1.x reply must not carry a \"jsonrpc\" key: ~A" json)
+          (is-true (jsonrpc-shape-key-present-p reply "result")
+                   "1.x error reply must carry a null \"result\": ~A" json)
+          (is-false (gethash "result" reply))
+          (is-true (search "\"result\":null" json))
+          (let ((err (gethash "error" reply)))
+            (is (hash-table-p err) "expected an error object, got ~S" err)
+            (when (hash-table-p err)
+              (is (eql bitcoin-lisp.rpc::+rpc-method-not-found+
+                       (gethash "code" err)))
+              (is (equal "Method not found" (gethash "message" err)))))
+          (is (eql 7 (gethash "id" reply))))))))
+
+(test jsonrpc-v1-omits-id-when-request-had-none
+  "Core omits \"id\" entirely when the request carried no id member
+(rpc/request.cpp:66 with id = std::nullopt, :207-211). A 1.x request without an
+id is NOT a notification — it still gets a reply, just without the key."
+  (with-jsonrpc-shape-method
+    (dolist (version-member (list "\"jsonrpc\":\"1.0\"" nil))
+      ;; Success and error both.
+      (dolist (method (list *jsonrpc-shape-method* "ga8shapenosuchmethod"))
+        (multiple-value-bind (reply json)
+            (jsonrpc-shape-reply (jsonrpc-shape-body version-member method nil))
+          (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+          (when (hash-table-p reply)
+            (is-false (jsonrpc-shape-key-present-p reply "id")
+                      "no id member in the request => no \"id\" key: ~A" json)
+            (is-true (jsonrpc-shape-key-present-p reply "result"))
+            (is-true (jsonrpc-shape-key-present-p reply "error")))))
+      ;; id:null is a different thing from an absent id: the key comes back.
+      (multiple-value-bind (reply json)
+          (jsonrpc-shape-reply (jsonrpc-shape-body version-member
+                                                   *jsonrpc-shape-method*
+                                                   "\"id\":null"))
+        (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+        (when (hash-table-p reply)
+          (is-true (jsonrpc-shape-key-present-p reply "id")
+                   "id:null must echo back as \"id\":null: ~A" json)
+          (is-false (gethash "id" reply)))))))
+
+(test jsonrpc-v2-reply-shape-is-unchanged
+  "Control: a 2.0 request must still get the strict 2.0 shape — \"jsonrpc\"
+present, and only ONE of result/error (Core rpc/request.cpp:55-64). This is
+what proves the 1.x fix did not simply flip every reply to the legacy shape."
+  (with-jsonrpc-shape-method
+    ;; Success.
+    (multiple-value-bind (reply json)
+        (jsonrpc-shape-reply (jsonrpc-shape-body "\"jsonrpc\":\"2.0\""
+                                                 *jsonrpc-shape-method*
+                                                 "\"id\":7"))
+      (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+      (when (hash-table-p reply)
+        (is (equal "2.0" (gethash "jsonrpc" reply)))
+        (is (eql 42 (gethash "result" reply)))
+        (is-false (jsonrpc-shape-key-present-p reply "error")
+                  "2.0 success reply must omit \"error\": ~A" json)
+        (is (eql 7 (gethash "id" reply)))))
+    ;; Error.
+    (multiple-value-bind (reply json)
+        (jsonrpc-shape-reply (jsonrpc-shape-body "\"jsonrpc\":\"2.0\""
+                                                 "ga8shapenosuchmethod"
+                                                 "\"id\":7"))
+      (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+      (when (hash-table-p reply)
+        (is (equal "2.0" (gethash "jsonrpc" reply)))
+        (is-false (jsonrpc-shape-key-present-p reply "result")
+                  "2.0 error reply must omit \"result\": ~A" json)
+        (is-true (hash-table-p (gethash "error" reply)))
+        (is (eql 7 (gethash "id" reply)))))
+    ;; A 2.0 notification (no id member) is executed but gets no reply at all
+    ;; (Core httprpc.cpp:167-171 answers HTTP 204).
+    (is (eq :no-reply
+            (jsonrpc-shape-reply (jsonrpc-shape-body "\"jsonrpc\":\"2.0\""
+                                                     *jsonrpc-shape-method*
+                                                     nil))))))
+
+(test jsonrpc-batch-reply-shape-is-per-member
+  "Core re-parses every batch member on its own (httprpc.cpp:194-206), so the
+reply shape is per member: a 1.x member gets result+error and no \"jsonrpc\",
+a 2.0 member gets the strict shape, a 2.0 notification contributes no reply at
+all (:207-209), and a 1.x member without an id gets a reply with no \"id\"."
+  (with-jsonrpc-shape-method
+    (multiple-value-bind (kind requests)
+        (bitcoin-lisp.rpc::parse-json-rpc-request
+         (format nil "[{\"jsonrpc\":\"1.0\",\"method\":\"~A\",\"id\":1},~
+                       {\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"id\":2},~
+                       {\"jsonrpc\":\"2.0\",\"method\":\"~A\"},~
+                       {\"method\":\"~A\"}]"
+                 *jsonrpc-shape-method* *jsonrpc-shape-method*
+                 *jsonrpc-shape-method* *jsonrpc-shape-method*))
+      (is (eq :batch kind))
+      (let ((replies (bitcoin-lisp.rpc::handle-batch-request nil requests)))
+        (is (= 3 (length replies))
+            "the 2.0 notification must contribute no reply; got ~S replies"
+            (length replies))
+        (when (= 3 (length replies))
+          (destructuring-bind (v1 v2 v1-no-id) replies
+            (is-false (jsonrpc-shape-key-present-p v1 "jsonrpc"))
+            (is-true (jsonrpc-shape-key-present-p v1 "error"))
+            (is-false (gethash "error" v1))
+            (is (eql 1 (gethash "id" v1)))
+            (is (equal "2.0" (gethash "jsonrpc" v2)))
+            (is-false (jsonrpc-shape-key-present-p v2 "error"))
+            (is (eql 2 (gethash "id" v2)))
+            (is-false (jsonrpc-shape-key-present-p v1-no-id "jsonrpc"))
+            (is-true (jsonrpc-shape-key-present-p v1-no-id "error"))
+            (is-false (jsonrpc-shape-key-present-p v1-no-id "id")
+                      "a 1.x batch member with no id must get no \"id\" key")))))))
+
+(test jsonrpc-pre-dispatch-errors-use-the-legacy-shape
+  "Failures raised before a version is known — parse errors, invalid requests,
+and the HTTP-level refusals rpc-json-error builds — take Core's default
+V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59, request.h:55,63), so they
+carry result+error and no \"jsonrpc\"."
+  (let* ((response (bitcoin-lisp.rpc::make-rpc-error-response
+                    bitcoin-lisp.rpc::+rpc-parse-error+ "Parse error" nil :v1))
+         (json (with-output-to-string (s) (yason:encode response s)))
+         (reply (yason:parse json)))
+    (is-false (jsonrpc-shape-key-present-p reply "jsonrpc") "~A" json)
+    (is-true (jsonrpc-shape-key-present-p reply "result") "~A" json)
+    (is-false (gethash "result" reply))
+    (is-true (jsonrpc-shape-key-present-p reply "id") "~A" json)
+    (is-false (gethash "id" reply))
+    (let ((err (gethash "error" reply)))
+      (is (hash-table-p err))
+      (when (hash-table-p err)
+        (is (eql bitcoin-lisp.rpc::+rpc-parse-error+ (gethash "code" err)))))))

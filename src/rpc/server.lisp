@@ -256,6 +256,13 @@ normalized as nested values."
       (mapcar (lambda (v) (%normalize-json-value v t)) params)
       (%normalize-json-value params nil)))
 
+(defun request-json-version (request)
+  "The JSON-RPC version of one parsed request object REQUEST (a hash-table):
+:V2 only for the exact marker jsonrpc:\"2.0\", else :V1 — an absent member,
+\"1.0\" or \"1.1\" all mean legacy 1.x, which is Core's V1_LEGACY default
+(JSONRPCRequest::parse, rpc/request.cpp:212-227)."
+  (if (equal (gethash "jsonrpc" request) "2.0") :v2 :v1))
+
 (defun parse-json-rpc-request (body)
   "Parse JSON-RPC request body. Returns (values :single method params id
 version id-present-p) or (values :batch requests). VERSION is :v2 when the
@@ -275,7 +282,7 @@ top-level positional false survives as the +json-false+ sentinel."
           ((hash-table-p json)
            (let ((method (gethash "method" json))
                  (params (gethash "params" json))
-                 (version (if (equal (gethash "jsonrpc" json) "2.0") :v2 :v1)))
+                 (version (request-json-version json)))
              ;; Accept any/absent "jsonrpc" version: bitcoin-cli sends 1.0 (or
              ;; omits it) on older builds and 2.0 on newer; Core doesn't
              ;; validate it. Rejecting non-2.0 made stock bitcoin-cli unusable.
@@ -327,60 +334,98 @@ pairs — so without this every object-returning RPC errors out."
      (mapcar #'rpc-result->json x))
     (t x)))
 
-(defun make-rpc-response (result id)
-  "Create a successful JSON-RPC response."
-  (let ((response (make-hash-table :test 'equal)))
-    (setf (gethash "jsonrpc" response) "2.0")
-    (setf (gethash "result" response) (rpc-result->json result))
-    (setf (gethash "id" response) id)
+(defun %make-rpc-reply (result error-obj id version id-present)
+  "Assemble a JSON-RPC reply the way Core's JSONRPCReplyObj does
+(rpc/request.cpp:51-68) — the one place that knows how a reply's shape depends
+on the request's VERSION (:v1 or :v2):
+- the \"jsonrpc\" key is emitted for :V2 ONLY (:55);
+- a legacy 1.x reply carries BOTH \"result\" and \"error\", one of them null
+  (:57-64). python-bitcoinrpc's AuthServiceProxy does
+  `if response['error'] is not None:` and so raises KeyError: 'error' on every
+  successful call against a reply that omits it. NIL encodes as JSON null;
+- \"id\" is omitted entirely when the request carried no id member (:66,
+  id = std::nullopt at request.cpp:207-211) — that is ID-PRESENT NIL.
+ERROR-OBJ NIL means success. Anything other than :V2 is treated as legacy 1.x,
+matching Core's V1_LEGACY default for a request with no \"jsonrpc\" member."
+  (let ((response (make-hash-table :test 'equal))
+        (v2 (eq version :v2)))
+    (when v2
+      (setf (gethash "jsonrpc" response) "2.0"))
+    (cond ((null error-obj)
+           (setf (gethash "result" response) result)
+           (unless v2
+             (setf (gethash "error" response) nil)))
+          (t
+           (unless v2
+             (setf (gethash "result" response) nil))
+           (setf (gethash "error" response) error-obj)))
+    (when id-present
+      (setf (gethash "id" response) id))
     response))
 
-(defun make-rpc-error-response (code message id &optional data)
-  "Create an error JSON-RPC response."
-  (let ((response (make-hash-table :test 'equal))
-        (error-obj (make-hash-table :test 'equal)))
+(defun make-rpc-response (result id version &key (id-present t))
+  "Create a successful JSON-RPC response for a request of VERSION (:v1 or :v2);
+see %MAKE-RPC-REPLY for the version-dependent shape."
+  (%make-rpc-reply (rpc-result->json result) nil id version id-present))
+
+(defun make-rpc-error-response (code message id version &key data (id-present t))
+  "Create an error JSON-RPC response for a request of VERSION (:v1 or :v2);
+see %MAKE-RPC-REPLY for the version-dependent shape."
+  (let ((error-obj (make-hash-table :test 'equal)))
     (setf (gethash "code" error-obj) code)
     (setf (gethash "message" error-obj) message)
     (when data
       (setf (gethash "data" error-obj) (rpc-result->json data)))
-    (setf (gethash "jsonrpc" response) "2.0")
-    (setf (gethash "error" response) error-obj)
-    (setf (gethash "id" response) id)
-    response))
+    (%make-rpc-reply nil error-obj id version id-present)))
 
-(defun handle-single-request (node method params id)
-  "Handle a single RPC request."
+(defun handle-single-request (node method params id version &key (id-present t))
+  "Handle a single RPC request. VERSION and ID-PRESENT come from the parsed
+request and shape the reply (see MAKE-RPC-RESPONSE)."
   (handler-case
       (let ((result (dispatch-rpc-method node method params)))
-        (make-rpc-response result id))
+        (make-rpc-response result id version :id-present id-present))
     (rpc-error (e)
       (make-rpc-error-response (rpc-error-code e)
                                (rpc-error-message e)
-                               id
-                               (rpc-error-data e)))
+                               id version
+                               :data (rpc-error-data e)
+                               :id-present id-present))
     (error (e)
       (bitcoin-lisp::node-log :error "RPC internal error: ~A" e)
       (make-rpc-error-response +rpc-internal-error+
                                (format nil "Internal error: ~A" e)
-                               id))))
+                               id version
+                               :id-present id-present))))
 
 (defun handle-batch-request (node requests)
-  "Handle a batch of RPC requests."
-  (mapcar (lambda (req)
-            (if (hash-table-p req)
-                (let ((method (gethash "method" req))
-                      (params (%normalize-rpc-params
-                               (or (gethash "params" req) '())))
-                      (id (gethash "id" req)))
-                  (if (stringp method)
-                      (handle-single-request node method params id)
-                      (make-rpc-error-response +rpc-invalid-request+
-                                               "Missing or invalid method"
-                                               id)))
-                (make-rpc-error-response +rpc-invalid-request+
+  "Handle a batch of RPC requests, returning the list of replies to send.
+Core re-parses every batch member on its own (httprpc.cpp:194-206), so version
+and id-presence are PER MEMBER; a 2.0 notification (no id member) is executed
+but contributes no reply at all (:207-209)."
+  (let ((responses '()))
+    (dolist (req requests (nreverse responses))
+      (if (hash-table-p req)
+          (let ((method (gethash "method" req))
+                (params (%normalize-rpc-params
+                         (or (gethash "params" req) '())))
+                (version (request-json-version req)))
+            (multiple-value-bind (id id-present) (gethash "id" req)
+              (let ((response
+                      (if (stringp method)
+                          (handle-single-request node method params id version
+                                                 :id-present id-present)
+                          (make-rpc-error-response +rpc-invalid-request+
+                                                   "Missing or invalid method"
+                                                   id version
+                                                   :id-present id-present))))
+                (unless (and (eq version :v2) (not id-present))
+                  (push response responses)))))
+          ;; A non-object member has no version of its own; Core's default is
+          ;; V1_LEGACY with a null id.
+          (push (make-rpc-error-response +rpc-invalid-request+
                                          "Invalid request format"
-                                         nil)))
-          requests))
+                                         nil :v1)
+                responses)))))
 
 ;;; --- HTTP Server ---
 
@@ -497,11 +542,14 @@ clients (bitcoin-cli, curl) send no Origin at all and always pass."
       t))
 
 (defun rpc-json-error (http-status code message)
-  "Return a JSON-RPC error response string with the given HTTP status."
+  "Return a JSON-RPC error response string with the given HTTP status.
+These are pre-dispatch HTTP-level refusals (origin, rate limit, body size), so
+no request version has been parsed: Core's JSONRPCRequest starts out
+V1_LEGACY with a null id (request.h:55,63), which is the shape used here."
   (setf (hunchentoot:return-code*) http-status)
   (setf (hunchentoot:content-type*) "application/json")
   (with-output-to-string (s)
-    (yason:encode (make-rpc-error-response code message nil) s)))
+    (yason:encode (make-rpc-error-response code message nil :v1) s)))
 
 (defun rpc-error-http-status (code)
   "HTTP status for a JSON-RPC 1.x error response (Core JSONErrorReply,
@@ -514,7 +562,9 @@ error in the body (httprpc.cpp:160-164)."
 
 (defun rpc-response-http-status (response version)
   "The HTTP status to send with a single JSON-RPC RESPONSE hash-table:
-200 for success or any :V2 request; the Core 1.x mapping otherwise."
+200 for success or any :V2 request; the Core 1.x mapping otherwise.
+A :V1 success carries an \"error\" key whose value is null, so the test below
+must stay a value test (NIL = success), not a key-presence test."
   (let ((err (gethash "error" response)))
     (if (or (null err) (eq version :v2))
         hunchentoot:+http-ok+
@@ -577,7 +627,8 @@ error in the body (httprpc.cpp:160-164)."
             (case request-type
               (:single
                (let ((response (handle-single-request *rpc-node* method-or-batch
-                                                      params id)))
+                                                      params id version
+                                                      :id-present id-present)))
                  ;; A JSON-RPC 2.0 notification (no id member) answers 204
                  ;; with no body after executing (Core httprpc.cpp:169);
                  ;; otherwise the 1.x error->status mapping applies
@@ -592,20 +643,31 @@ error in the body (httprpc.cpp:160-164)."
                     (with-output-to-string (s)
                       (yason:encode response s))))))
               (:batch
-               ;; Batches always answer HTTP 200 (Core httprpc.cpp:196-206).
-               (let ((response (handle-batch-request *rpc-node* method-or-batch)))
-                 (with-output-to-string (s)
-                   (yason:encode response s))))))
+               ;; Batches always answer HTTP 200 (Core httprpc.cpp:196-206),
+               ;; except a non-empty all-notification batch, which answers 204
+               ;; with no body (:220). An EMPTY batch keeps answering [] for
+               ;; backwards compatibility (:211-219) — note NIL encodes as JSON
+               ;; null, so the empty array must be spelled #().
+               (let ((responses (handle-batch-request *rpc-node* method-or-batch)))
+                 (cond
+                   ((and (null responses) method-or-batch)
+                    (setf (hunchentoot:return-code*) hunchentoot:+http-no-content+)
+                    "")
+                   (t
+                    (with-output-to-string (s)
+                      (yason:encode (or responses #()) s))))))))
         (rpc-error (e)
           ;; Body-level failures (parse error -32700, invalid request -32600)
-          ;; have no version context; Core treats them as 1.x and maps the
-          ;; status accordingly (parse error -> 500, invalid request -> 400).
+          ;; have no version context; Core treats them as 1.x — both for the
+          ;; status mapping (parse error -> 500, invalid request -> 400) and
+          ;; for the reply shape, since JSONErrorReply passes the still-default
+          ;; V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59).
           (setf (hunchentoot:return-code*)
                 (rpc-error-http-status (rpc-error-code e)))
           (with-output-to-string (s)
             (yason:encode (make-rpc-error-response (rpc-error-code e)
                                                    (rpc-error-message e)
-                                                   nil)
+                                                   nil :v1)
                           s)))
         (error (e)
           (bitcoin-lisp::node-log :error "RPC handler error: ~A" e)
@@ -613,7 +675,7 @@ error in the body (httprpc.cpp:160-164)."
           (with-output-to-string (s)
             (yason:encode (make-rpc-error-response +rpc-internal-error+
                                                    "Internal error"
-                                                   nil)
+                                                   nil :v1)
                           s)))))))
 
 (defun rpc-dispatch-handler ()
