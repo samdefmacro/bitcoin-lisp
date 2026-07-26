@@ -3271,7 +3271,35 @@ carry result+error and no \"jsonrpc\"."
 ;;;; pre-filled — exactly what hunchentoot's own get-post-data leaves there
 ;;;; (hunchentoot request.lisp:150-183) — drives the real function with no
 ;;;; socket, acceptor or server.
+;;;;
+;;;; Authentication is mandatory and is checked BEFORE the body is parsed or
+;;;; dispatched (Core HTTPReq_JSONRPC, httprpc.cpp:112-133), so these requests
+;;;; carry a real HTTP Basic credential, exactly as bitcoin-cli does: the
+;;;; helpers bind *rpc-user*/*rpc-password* for the duration of the call and
+;;;; send the matching header. None of the shapes below can be reached without
+;;;; one — see the 401 assertion in the pre-dispatch test, which is what fails
+;;;; if that credential ever stops being load-bearing.
 ;;;; ---------------------------------------------------------------------
+
+(defparameter *jsonrpc-handler-rpc-user* "ga8shapeuser"
+  "The RPC user the handler tests authorize as (bound over *rpc-user* for the
+duration of one jsonrpc-handler-reply call).")
+
+(defparameter *jsonrpc-handler-rpc-password* "ga8shapepass"
+  "The RPC password the handler tests authorize with (bound over
+*rpc-password* for the duration of one jsonrpc-handler-reply call).")
+
+(defun jsonrpc-handler-credential ()
+  "The \"user:pass\" credential the handler tests send as HTTP Basic."
+  (concatenate 'string *jsonrpc-handler-rpc-user* ":"
+               *jsonrpc-handler-rpc-password*))
+
+(defun jsonrpc-handler-basic-auth (credential)
+  "CREDENTIAL (\"user:pass\") as an HTTP Basic Authorization header value:
+the scheme name, a space, then the base64 of the pair — what Core's
+RPCAuthorized decodes (httprpc.cpp:84-101). Spelled out here so this section
+builds on its own; it is the one line of HTTP a handler test needs."
+  (concatenate 'string "Basic " (cl-base64:string-to-base64-string credential)))
 
 (defparameter *jsonrpc-handler-dotted-method* "ga8shapedotted"
   "A method whose result (an improper list) has no JSON encoding, so
@@ -3296,8 +3324,13 @@ remove them so the global method registry is unchanged."
   `(call-with-jsonrpc-handler-methods (lambda () ,@body)))
 
 (defun jsonrpc-handler-request (body &key (content-type "application/json")
-                                       (uri "/") (headers '()) content-length)
+                                       (uri "/") (headers '()) content-length
+                                       (auth (jsonrpc-handler-credential)))
   "A synthetic hunchentoot POST request carrying BODY.
+AUTH is a \"user:pass\" credential sent as an HTTP Basic Authorization header;
+it defaults to the pair jsonrpc-handler-reply installs, so the request is
+authorized. NIL sends no Authorization header at all (a 401), and any other
+string exercises a wrong credential.
 CONTENT-LENGTH overrides the Content-Length header (to exercise the
 oversized-body refusal without allocating 32 MiB). hunchentoot:*acceptor*
 must be bound while the request is built: initialize-instance :after consults
@@ -3312,9 +3345,19 @@ it through session-verify."
                                         (cons :content-length
                                               (or content-length
                                                   (princ-to-string (length octets))))
-                                        headers)
+                                        (append
+                                         (when auth
+                                           (list (cons :authorization
+                                                       (jsonrpc-handler-basic-auth
+                                                        auth))))
+                                         headers))
                                  :method :post
                                  :uri uri
+                                 ;; The refused-credential path logs the peer
+                                 ;; address; the slot has no initform, so a
+                                 ;; request built without one would signal
+                                 ;; UNBOUND-SLOT instead of answering 401.
+                                 :remote-addr "127.0.0.1"
                                  :server-protocol :http/1.1
                                  :content-stream nil)))
     (setf (slot-value request 'hunchentoot::raw-post-data) octets)
@@ -3322,12 +3365,17 @@ it through session-verify."
 
 (defun jsonrpc-handler-reply (body &rest request-args)
   "POST BODY to the production entry point RPC-HANDLER; return
- (values http-status response-body content-type). RATE-LIMITER, when given as
+ (values http-status response-body content-type). The RPC credential is
+installed for the duration of the call and sent with the request, so the
+handler authorizes it and reaches the paths under test; :AUTH overrides what
+the client presents (see jsonrpc-handler-request). RATE-LIMITER, when given as
 :rate-limiter, replaces the global limiter for this one call."
   (let* ((rate-limiter (getf request-args :rate-limiter))
          (request-args (loop for (k v) on request-args by #'cddr
                              unless (eq k :rate-limiter)
                                append (list k v)))
+         (bitcoin-lisp.rpc::*rpc-user* *jsonrpc-handler-rpc-user*)
+         (bitcoin-lisp.rpc::*rpc-password* *jsonrpc-handler-rpc-password*)
          (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
          (hunchentoot:*request* (apply #'jsonrpc-handler-request body request-args))
          (bitcoin-lisp.rpc::*rpc-node* nil)
@@ -3443,7 +3491,10 @@ null, so the empty array has to be spelled #(). Batch replies are per member."
 refusal, rate limit, oversized body, parse error, invalid request, and the
 outermost internal-error clause — carries Core's default V1_LEGACY/null-id
 shape and the 1.x status mapping. These are the paths a broken client hits
-most, so the bytes are pinned here rather than only in the builder."
+most, so the bytes are pinned here rather than only in the builder.
+The two credential cases also pin the ORDER of the guards (origin -> auth ->
+rate limit -> size -> content-type -> dispatch): each assertion below only
+reaches the refusal it is named for because the ones ahead of it passed."
   (with-jsonrpc-handler-methods
     ;; Malformed JSON -> -32700, HTTP 500.
     (jsonrpc-handler-check
@@ -3466,13 +3517,25 @@ most, so the bytes are pinned here rather than only in the builder."
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 400
      (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Request body too large")
      :content-length (princ-to-string (1+ bitcoin-lisp:+max-rpc-body-size+)))
-    ;; Cross-origin browser POST -> 403, refused before auth.
+    ;; A credential that does not match -> 401 with an empty body, decided
+    ;; before the body is even looked at. This assertion is also what keeps
+    ;; every other check in this section honest: they reach the paths they name
+    ;; only because jsonrpc-handler-reply presents a real credential, and this
+    ;; is the check that fails first if that credential ever stops mattering.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 401 ""
+     :auth (concatenate 'string *jsonrpc-handler-rpc-user* ":wrong"))
+    ;; Cross-origin browser POST -> 403, refused BEFORE auth: sent with no
+    ;; credential at all, so a handler that authenticated first would answer
+    ;; 401 here and this check would fail.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 403
      (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+
                                 "Origin does not match Host")
+     :auth nil
      :headers (list (cons :origin "http://evil.example")))
-    ;; Rate limited -> 429 (an exhausted bucket: rate 0, burst 0).
+    ;; Rate limited -> 429 (an exhausted bucket: rate 0, burst 0), reached with
+    ;; a valid credential: the limiter sits behind auth.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 429
      (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Rate limit exceeded")
