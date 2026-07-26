@@ -469,9 +469,22 @@ Edit the existing PR branches; these are corrections to unmerged work.
   index *before* reconstruction; if absent, send `getheaders` and return
   (`net_processing.cpp:4571-4577`). On validation failure at
   `protocol.lisp:2449-2451` and `:2524-2526`, fall back to `request-full-block`
-  instead of `record-misbehavior`, keeping punishment only for structurally
-  malformed messages (Core exempts compact blocks via `via_compact_block`,
-  `:1920-1926`). While here, delete the dead dedup guard at `:2424-2427` — it
+  instead of `record-misbehavior` — **per failure reason, not for every failure.**
+  (Corrected 2026-07-26: an earlier revision said "keeping punishment only for
+  structurally malformed messages". That is too coarse; it was implemented
+  literally and produced a *demonstrated* DoS regression where a peer replays
+  invalid-PoW compact blocks indefinitely on one connection, each costing a full
+  `build-shortid-map` SipHash pass over every mempool entry. Measured: `origin/main`
+  discourages and disconnects on message #1; the over-broad fix left the peer
+  `:READY` and merely sent a getdata.) Core's `via_compact_block` exemption covers
+  only `BLOCK_CONSENSUS`, `BLOCK_MUTATED` and conditionally `BLOCK_CACHED_INVALID`
+  (`net_processing.cpp:1920-1926`) — two of seven switch arms.
+  `BLOCK_INVALID_HEADER`, `BLOCK_INVALID_PREV` and `BLOCK_MISSING_PREV` call
+  `Misbehaving` **unconditionally** (`:1936-1945`), and Core reaches them on this
+  exact path: `ProcessNewBlockHeaders({{cmpctblock.header}}, ...)` at `:4589` calls
+  `MaybePunishNodeForBlock(..., via_compact_block=true, "invalid header via
+  cmpctblock")` at `:4591`. Map our failure reasons onto Core's arms individually.
+  While here, delete the dead dedup guard at `:2424-2427` — it
   tests `:connected`, which is not in the status enum (`storage/chain.lisp:17`).
 
 ---
