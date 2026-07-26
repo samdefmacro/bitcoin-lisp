@@ -335,7 +335,20 @@ when the block is on the active chain and rejects a root-mismatched proof."
                ;; Corrupt the proof's last hex nibble -> root/parse mismatch -> error.
                (signals bitcoin-lisp.rpc::rpc-error
                  (bitcoin-lisp.rpc::rpc-verifytxoutproof
-                  node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))))
+                  node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))
+               ;; Same proof once its block is off the active chain: Core
+               ;; returns an empty VARR, which must render [] and not null.
+               ;; (Control: the (equal (list target) verified) assertion above
+               ;; is the same proof while the block IS on the active chain.)
+               (let ((sibling (make-32-byte-hash 200)))
+                 (bitcoin-lisp.storage:add-block-index-entry
+                  chain-state (bitcoin-lisp.storage:make-block-index-entry
+                               :hash sibling :height 0 :header header
+                               :chain-work 2 :status :valid))
+                 (bitcoin-lisp.storage:update-chain-tip chain-state sibling 0)
+                 (is (string= "[]" (%encode-rpc-result
+                                    (bitcoin-lisp.rpc::rpc-verifytxoutproof
+                                     node (list proof))))))))
         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 
 ;;; dumptxoutset / loadtxoutset (Core snapshot v2 format) tests live in
@@ -643,12 +656,97 @@ out-of-range or boolean verbosity like Core (ParseVerbosity allow_bool=false)."
     (is (equalp raw (bitcoin-lisp.crypto:hex-to-bytes
                      (cdr (assoc "hex" o :test #'string=))))))
   (let ((node (make-test-node)))
-    (is (null (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
-    (is (null (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2))))
+    ;; An empty orphanage is Core's empty VARR. This used to assert
+    ;; (null ...), i.e. the bug: NIL encodes as JSON null, not [].
+    (is (equalp #() (bitcoin-lisp.rpc::rpc-getorphantxs node nil)))
+    (is (equalp #() (bitcoin-lisp.rpc::rpc-getorphantxs node (list 2))))
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getorphantxs node (list 3)))
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getorphantxs node (list t)))))
+
+;;; --- Empty collections render [] / {} , never null ---
+
+(defun %encode-rpc-result (result)
+  "The exact JSON text RESULT renders to, through the same normalizer and
+encoder the RPC server uses (rpc-result->json, then yason). Asserting on the
+Lisp value alone would not catch this bug: NIL is a perfectly good empty list
+in CL and only becomes wrong at the encoder."
+  (with-output-to-string (s)
+    (yason:encode (bitcoin-lisp.rpc::rpc-result->json result) s)))
+
+(test rpc-empty-collections-encode-as-array-or-object
+  "Core builds every collection as a UniValue VARR/VOBJ, so an EMPTY one
+renders [] (or {}), never null. Our encoder maps CL NIL to JSON null, so each
+producing site coerces with json-array / json-object. Verified live before the
+fix: listbanned and getaddednodeinfo answered result:null."
+  (bitcoin-lisp.networking:clear-ban-list)
+  (let* ((node (make-test-node))
+         (mempool (bitcoin-lisp::node-mempool node)))
+    ;; The premise: a bare NIL really does encode as null. Without this the
+    ;; assertions below could pass for the wrong reason.
+    (is (string= "null" (%encode-rpc-result nil)))
+    ;; Arrays (Core VARR).
+    (dolist (site (list (cons "getpeerinfo" (bitcoin-lisp.rpc::rpc-getpeerinfo node nil))
+                        (cons "listbanned" (bitcoin-lisp.rpc::rpc-listbanned node nil))
+                        (cons "getorphantxs" (bitcoin-lisp.rpc::rpc-getorphantxs node nil))
+                        (cons "getnodeaddresses"
+                              (bitcoin-lisp.rpc::rpc-getnodeaddresses node (list 0)))
+                        (cons "getaddednodeinfo"
+                              (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil))
+                        (cons "getrawmempool"
+                              (bitcoin-lisp.rpc::rpc-getrawmempool node nil))
+                        (cons "getmempoolancestors"
+                              (bitcoin-lisp.rpc::%mempool-set->result
+                               mempool (make-hash-table :test 'equalp) nil))
+                        (cons "getnetworkinfo.localaddresses"
+                              (cdr (assoc "localaddresses"
+                                          (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
+                                          :test #'string=)))
+                        (cons "scantxoutset.unspents"
+                              (cdr (assoc "unspents"
+                                          (bitcoin-lisp.rpc::rpc-scantxoutset
+                                           node (list "start" (list "raw(51)")))
+                                          :test #'string=)))))
+      (is (string= "[]" (%encode-rpc-result (cdr site)))
+          "~A must render [] when empty, got ~A"
+          (car site) (%encode-rpc-result (cdr site))))
+    ;; Objects (Core VOBJ): getrawmempool's VERBOSE form is a txid-keyed
+    ;; object, so its empty case is {} and NOT [].
+    (dolist (site (list (cons "getrawmempool verbose"
+                              (bitcoin-lisp.rpc::rpc-getrawmempool node (list t)))
+                        (cons "getmempooldescendants verbose"
+                              (bitcoin-lisp.rpc::%mempool-set->result
+                               mempool (make-hash-table :test 'equalp) t))))
+      (is (string= "{}" (%encode-rpc-result (cdr site)))
+          "~A must render {} when empty, got ~A"
+          (car site) (%encode-rpc-result (cdr site))))
+    ;; A node with no mempool at all takes getrawmempool's other early branch,
+    ;; which must still pick the shape by verbosity.
+    (setf (bitcoin-lisp::node-mempool node) nil)
+    (is (string= "[]" (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getrawmempool node nil))))
+    (is (string= "{}" (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getrawmempool node (list t))))))
+  ;; CONTROL 1 — populated collections keep their existing shape: an array of
+  ;; JSON objects, not a vector of unencodable dotted pairs.
+  (let ((node (make-test-node)))
+    (setf (bitcoin-lisp::node-peers node)
+          (list (bitcoin-lisp::make-peer :address "1.2.3.4:48333" :user-agent "/t/")))
+    (bitcoin-lisp.rpc::rpc-addnode node (list "192.0.2.10:48333" "add"))
+    (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "add"))
+    (let ((peers (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)))
+          (bans (%encode-rpc-result (bitcoin-lisp.rpc::rpc-listbanned node nil)))
+          (added (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getaddednodeinfo node nil))))
+      (is (eql 0 (search "[{" peers)))
+      (is (eql 0 (search "[{" bans)))
+      (is (search "\"address\":\"1.2.3.4\"" bans))
+      (is (eql 0 (search "[{" added)))
+      ;; ... and a populated row's own empty nested array is [] too.
+      (is (search "\"addresses\":[]" added)))
+    (bitcoin-lisp.networking:clear-ban-list))
+  ;; CONTROL 2 — NIL must still mean null where Core returns null. This is why
+  ;; the fix is per-site and not a global normalizer in rpc-result->json.
+  (is (string= "null" (%encode-rpc-result
+                       (bitcoin-lisp.rpc::rpc-scantxoutset (make-test-node) (list "status"))))))
 
 ;;; --- UTXO Query Method Tests (4.3) ---
 
@@ -758,11 +856,11 @@ default, json-false under -blocksonly."
     (is (integerp (cdr (assoc "usage" result :test #'string=))))))
 
 (test rpc-getrawmempool-non-verbose
-  "Test getrawmempool non-verbose returns list"
+  "getrawmempool non-verbose returns a JSON array of txids — [] for a new
+node, not null (it used to assert only LISTP, which NIL satisfies)."
   (let* ((node (make-test-node))
          (result (bitcoin-lisp.rpc::rpc-getrawmempool node '(nil))))
-    ;; Should return a list (empty for new node)
-    (is (listp result))))
+    (is (equalp #() result))))
 
 (test rpc-getrawmempool-verbose
   "getrawmempool verbose returns a per-tx detail alist (txid -> fields) that the
@@ -771,8 +869,11 @@ RPC layer normalizes into a JSON object."
          (mempool (bitcoin-lisp::node-mempool node))
          (tx (make-mempool-test-tx :input-id 200))
          (txid (bitcoin-lisp.serialization:transaction-hash tx)))
-    ;; Empty mempool -> empty.
-    (is (null (bitcoin-lisp.rpc::rpc-getrawmempool node '(t))))
+    ;; Empty mempool -> Core's empty VOBJ, i.e. an empty JSON object, not
+    ;; null (this used to assert (null ...), the bug).
+    (let ((empty (bitcoin-lisp.rpc::rpc-getrawmempool node '(t))))
+      (is (hash-table-p empty))
+      (is (zerop (hash-table-count empty))))
     ;; Populate and check the entry + a couple of fields.
     (bitcoin-lisp.mempool:mempool-add
      mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 1000 0))
@@ -2750,8 +2851,9 @@ all_networks aggregate; counts stay consistent with the address book."
           (is (= 1 (length addrs)))
           (is (string= "1.2.3.4" (cdr (assoc "address" (first addrs) :test #'string=))))
           (is (string= "outbound" (cdr (assoc "connected" (first addrs) :test #'string=)))))
-        ;; unconnected node has no address entries
-        (is (null (cdr (assoc "addresses" b :test #'string=))))))
+        ;; unconnected node has no address entries — Core's empty VARR, so
+        ;; [] rather than null (this used to assert (null ...), the bug).
+        (is (equalp #() (cdr (assoc "addresses" b :test #'string=))))))
     ;; filtering for a never-added node errors
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-getaddednodeinfo node '("10.0.0.1")))))
