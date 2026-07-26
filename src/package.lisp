@@ -629,6 +629,7 @@
    #:coinstatsindex-best
    #:coinstatsindex-get-stats
    #:coinstatsindex-add-block
+   #:coinstatsindex-record-matches-block-p
    #:coinstatsindex-seed-genesis
    #:coinstatsindex-set-best
    #:coinstatsindex-clear-best

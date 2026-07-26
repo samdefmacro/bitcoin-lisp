@@ -4368,6 +4368,14 @@ that block's deltas. Only the muhash hash_type is index-backed."
                         (unless entry
                           (error 'rpc-error :code +rpc-invalid-address-or-key+
                                             :message "Block not found"))
+                        ;; The header index resolves STALE-BRANCH hashes too,
+                        ;; and the index holds only active-chain statistics —
+                        ;; serving the active chain's numbers under a
+                        ;; stale-branch hash would be a silently wrong answer.
+                        (unless (bitcoin-lisp.storage:entry-on-active-chain-p
+                                 chain-state entry)
+                          (error 'rpc-error :code +rpc-invalid-parameter+
+                                            :message "Block is not on the active chain; the coinstatsindex holds active-chain statistics only"))
                         (bitcoin-lisp.storage:block-index-entry-height entry)))
                      (t (error 'rpc-error :code +rpc-invalid-parameter+
                                           :message "hash_or_height must be a height or block hash"))))
@@ -4375,7 +4383,10 @@ that block's deltas. Only the muhash hash_type is index-backed."
            (prev (and (plusp height)
                       (bitcoin-lisp.storage:coinstatsindex-get-stats csi (1- height))))
            (entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
-      (unless stats
+      ;; Records above the best marker are not vouched for: a rewind moves the
+      ;; marker down and leaves the abandoned branch's records in place until
+      ;; the backfill overwrites them.
+      (unless (and stats (<= height (bitcoin-lisp.storage:coinstatsindex-height csi)))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message "Height not in coinstatsindex (out of range or below the indexed horizon)"))
       (flet ((g (fn s) (if s (funcall fn s) 0)))
