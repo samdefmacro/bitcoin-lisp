@@ -3873,11 +3873,35 @@ into 'tried'."
         (when ip
           (do-feeler-connection node ip (or port (network-port (node-network node)))))))))
 
+(defvar *last-chain-sync-check* 0
+  "Unix time of the last chain-sync eviction sweep. Node-scoped, NOT local to
+run-ibd: run-ibd is re-entered on every outer sync cycle, so a loop-local
+timestamp would reset each pass and the cadence would be meaningless.")
+
+(defconstant +extra-peer-check-interval-seconds+ 45
+  "Core EXTRA_PEER_CHECK_INTERVAL — cadence of the chain-sync sweep.")
+
+(defun consider-outbound-evictions (node)
+  "Chain-sync eviction sweep (Core ConsiderEviction, run once per SendMessages
+pass). Driven from here rather than from run-ibd's block-download loop, which
+does not run at tip — exactly where eclipse resistance matters."
+  (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+    (when (>= (- now *last-chain-sync-check*) +extra-peer-check-interval-seconds+)
+      (setf *last-chain-sync-check* now)
+      (let ((chain-state (node-current-chainstate node)))
+        (when chain-state
+          (dolist (peer (node-peers node))
+            (ignore-errors
+             (bitcoin-lisp.networking:consider-chain-sync-eviction
+              peer chain-state now))))))))
+
 (defun maintain-peers (node)
   "Run periodic peer maintenance: health checks, reconnection, dedicated
-block-relay-only slots, and an occasional feeler probe."
+block-relay-only slots, an occasional feeler probe, and the chain-sync
+eviction sweep."
   (check-peers-health node)
   (connect-added-nodes node)
+  (consider-outbound-evictions node)
   (replace-disconnected-peers node)
   (maintain-block-relay-peers node)
   (maybe-do-feeler node))

@@ -1178,6 +1178,10 @@
    #:peer-user-agent
    #:peer-ping-latency
    #:peer-inbound
+   #:peer-live-p
+   #:release-outbound-protection
+   #:maybe-protect-outbound-peer
+   #:consider-chain-sync-eviction
    #:maybe-set-peer-announcing-hb
    #:maybe-send-feefilter
    #:fee-filter-round
