@@ -526,3 +526,154 @@ occupying a slot we need for syncing."
         (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
                    p state nil)
                   "outside IBD the peer must be kept")))))
+
+;;;; ============================================================
+;;;; GA8 W3: the low-work drop must fire only where Core evaluates it
+;;;;
+;;;; Core reaches the disconnect solely through
+;;;; UpdatePeerStateForReceivedHeaders (net_processing.cpp:2926-2944), which
+;;;; ProcessHeadersMessage calls only on the STORED path (:3113). It returns
+;;;; early — never judging the peer — for an empty message (:2969-2981), for an
+;;;; unconnecting BIP130 announcement (:3029-3040) and for a batch swallowed by
+;;;; TryLowWorkHeadersSync (:3065-3074). Conversely a batch of headers we
+;;;; already have sets already_validated_work (:3049-3054), BYPASSES
+;;;; TryLowWorkHeadersSync and DOES reach the disconnect — Core's own comment at
+;;;; :2786-2790 spells that interaction out.
+;;;; ============================================================
+
+(defmacro %w3-with-regtest (&body body)
+  "Regtest network + regtest PoW limit + the IBD latch forced ON, so these
+assertions cannot be made vacuous by whatever an earlier test left in the
+globals."
+  `(let ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp.storage:*pow-limit-target*
+           bitcoin-lisp.storage:+regtest-pow-limit-target+)
+         (bitcoin-lisp.networking::*cached-is-ibd* t))
+     ,@body))
+
+(defun %w3-stored-header (dir)
+  "A regtest chain-state (genesis chain-work 1) with one real header H1 stored
+off genesis via the production ingest path at a zero work floor. Returns
+(values state genesis-hash h1 h1-hash). H1's chain-work is tiny (regtest block
+proof), so raising the floor afterwards makes it sub-minchainwork."
+  (multiple-value-bind (state genesis-hash) (%regtest-chain-state dir)
+    (let* ((bitcoin-lisp:*minimum-chain-work-override* 0)
+           (h1 (%pow-header genesis-hash))
+           (h1-hash (bitcoin-lisp.serialization:block-header-hash h1)))
+      (bitcoin-lisp.networking::ingest-headers-from-peer
+       (%g718-peer) (list h1) state)
+      (values state genesis-hash h1 h1-hash))))
+
+(test w3-unconnecting-announcement-does-not-disconnect-outbound
+  "GA8 W3 (S2), the regression. Early mainnet IBD, our chain still below
+nMinimumChainWork: outbound peer B's best-known block is a low-work header (the
+pprev priming sweep set it). A new block is mined and B sends a 1-header BIP130
+announcement whose parent we lack. Core runs HandleUnconnectingHeaders and
+RETURNS (net_processing.cpp:3029-3040). We ran the drop after EVERY branch of
+ingest-headers-from-peer, and the unconnecting branch only stages
+hash-last-unknown — best-known stays at its stale sub-floor value — so the
+check fired with a non-full batch and dropped B. Every announcing outbound peer
+could be churned this way during the most eclipse-sensitive phase."
+  (%w3-with-regtest
+    (multiple-value-bind (state genesis-hash)
+        (%regtest-chain-state "test-w3-unconn-nodrop/")
+      (let* ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+             ;; Genesis carries chain-work 1, three orders below the floor.
+             (p (%g718-peer :best-hash genesis-hash))
+             (orphan-prev (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element 77))
+             (announced (%pow-header orphan-prev)))
+        (is-true (bitcoin-lisp.networking:initial-block-download-p state)
+                 "fixture must be in IBD, or the whole assertion is vacuous")
+        (is (= 0 (bitcoin-lisp.networking::ingest-headers-from-peer
+                  p (list announced) state))
+            "an unconnecting header stores nothing")
+        (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+            "a BIP130 announcement with an unknown parent must NOT drop the peer")))))
+
+(test w3-empty-headers-message-does-not-disconnect-outbound
+  "An empty headers message is Core's nCount==0 early return
+(net_processing.cpp:2969-2981) — the peer is never judged. We judged it, so a
+peer answering \"I have nothing more\" during IBD was dropped on the spot."
+  (%w3-with-regtest
+    (multiple-value-bind (state genesis-hash)
+        (%regtest-chain-state "test-w3-empty-nodrop/")
+      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+            (p (%g718-peer :best-hash genesis-hash)))
+        (is (= 0 (bitcoin-lisp.networking::ingest-headers-from-peer p nil state)))
+        (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+            "an empty headers message must NOT drop the peer")))))
+
+(test w3-low-work-diverted-batch-does-not-disconnect-outbound
+  "A connecting batch whose claimed work is below the anti-DoS threshold is
+swallowed by TryLowWorkHeadersSync, which returns true and makes
+ProcessHeadersMessage return (net_processing.cpp:3065-3074, :2800-2807) — no
+peer-state update, no disconnect. Nothing was stored, so there is no
+pindexLast to judge the peer on."
+  (%w3-with-regtest
+    (multiple-value-bind (state genesis-hash)
+        (%regtest-chain-state "test-w3-lowwork-nodrop/")
+      (let* ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+             (p (%g718-peer :best-hash genesis-hash))
+             (h1 (%pow-header genesis-hash))
+             (h1-hash (bitcoin-lisp.serialization:block-header-hash h1)))
+        (is (= 0 (bitcoin-lisp.networking::ingest-headers-from-peer
+                  p (list h1) state)))
+        (is (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash))
+            "the low-work header must not enter the index")
+        (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+            "an ignored low-work batch must NOT drop the peer")))))
+
+(test w3-low-work-outbound-still-dropped-on-stored-batch
+  "The control: the feature must still fire where Core fires it. A batch we
+already hold sets already_validated_work (net_processing.cpp:3046-3054),
+bypasses TryLowWorkHeadersSync and reaches
+UpdatePeerStateForReceivedHeaders — so the outbound peer whose whole chain sits
+below the floor IS dropped. Deleting the check outright would redden this."
+  (%w3-with-regtest
+    (multiple-value-bind (state genesis-hash h1 h1-hash)
+        (%w3-stored-header "test-w3-stored-drop/")
+      (declare (ignore genesis-hash))
+      (is (not (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash)))
+          "fixture must have stored H1, or the already-known branch is not taken")
+      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+            (p (%g718-peer)))
+        (is (= 0 (bitcoin-lisp.networking::ingest-headers-from-peer
+                  p (list h1) state))
+            "an already-known header adds nothing to the index")
+        (is (equalp h1-hash (bitcoin-lisp.networking::peer-best-known-block-hash p))
+            "the stored path must have refreshed availability first")
+        (is (eq :disconnected (bitcoin-lisp.networking:peer-state p))
+            "a stored non-full batch leaving best-known below the floor must drop")))))
+
+(test w3-solicited-phase1-path-drops-low-work-outbound
+  "GA8 W3 (S3), the other half: handle-header-batch — the solicited Phase-1
+path — never applied the drop at all, and %maybe-divert-to-presync had no
+known-ancestor skip, so the CLASSIC case never fired: an outbound peer pinned
+on a low-work fork answers our getheaders with a short batch of headers we
+already hold. Core sets already_validated_work for exactly that shape
+(net_processing.cpp:3046-3054, and the comment at :2786-2790), skipping
+TryLowWorkHeadersSync and reaching the disconnect."
+  (%w3-with-regtest
+    (multiple-value-bind (state genesis-hash h1 h1-hash)
+        (%w3-stored-header "test-w3-phase1-drop/")
+      (declare (ignore genesis-hash h1-hash))
+      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000))
+        (let* ((p (%g718-peer))
+               (added 0)
+               (done (bitcoin-lisp.networking::handle-header-batch
+                      p state (list h1) nil (lambda (n) (incf added n)))))
+          (is-true done "a non-full batch ends header sync with this peer")
+          (is (= 0 added) "an already-known batch adds nothing")
+          (is (eq :disconnected (bitcoin-lisp.networking:peer-state p))
+              "the solicited path must drop a sub-minchainwork outbound peer"))
+        ;; Same batch declared FULL: may_have_more_headers, so the peer is kept
+        ;; (Core's !may_have_more_headers guard) — but sync still ends, because
+        ;; nothing entered the index and our locator is built from our own
+        ;; header tip, so re-asking would fetch this very batch again.
+        (let ((p (%g718-peer)))
+          (is-true (bitcoin-lisp.networking::handle-header-batch
+                    p state (list h1) t (lambda (n) (declare (ignore n))))
+                   "an all-known batch ends sync even when the message was full")
+          (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+              "a full batch must not drop the peer"))))))
