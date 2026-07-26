@@ -2726,11 +2726,19 @@ getdifficulty)."
       0))
 
 (defun rpc-stop (node params)
-  "Request a graceful node shutdown (Bitcoin Core stop). stop-node also stops the
-RPC server serving this request, so defer it to a short-lived thread and let
-this response flush first."
+  "Request a graceful node shutdown (Bitcoin Core stop, rpc/node.cpp: the RPC
+only calls StartShutdown()). It must not run stop-node on this thread: the
+teardown stops the RPC server serving this very request, and — the reason the
+request/perform split exists — a stop driven from any non-main thread races
+the supervisor's watchdog, which exits the process while the chainstate flush,
+mempool.dat, peers.dat and wallet markers are still being written. So register
+the request and let the main thread do the work; the short sleep only lets
+this response flush before the RPC server goes away."
   (declare (ignore node params))
-  (bt:make-thread (lambda () (sleep 0.3) (ignore-errors (bitcoin-lisp::stop-node)))
+  (bt:make-thread (lambda ()
+                    (sleep 0.3)
+                    (ignore-errors
+                     (bitcoin-lisp::request-node-shutdown "RPC stop")))
                   :name "rpc-stop")
   "Bitcoin-lisp server stopping")
 
