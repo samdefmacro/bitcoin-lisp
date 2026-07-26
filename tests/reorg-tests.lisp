@@ -2532,3 +2532,104 @@ the fork. It marks NOTHING :invalid; the competing fork stays recoverable."
          (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status a2-entry)))
          (is (= 2 (bitcoin-lisp.storage:current-height chain-state)))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+;;;; Median-time-past on the reorg path (GA8 S1-7)
+
+(defconstant +mtp-reorg-genesis-time+ 1231006505
+  "Timestamp of the genesis header %make-activate-block-fixture installs.")
+
+(test perform-reorg-refuses-mtp-violating-fork-block
+  "CONSENSUS (GA8 S1-7): perform-reorg connects fork blocks with :skip-header t,
+mirroring Core's ConnectBlock, which deliberately does not re-run
+ContextualCheckBlockHeader. A fork block already in the index whose timestamp is
+at or before its parent's median-time-past was therefore applied to the UTXO set
+unchecked. PHASE B re-runs that ONE header rule (never PoW/difficulty — a fork
+body re-read from the store carries no cached hash) and refuses.
+Control: the same block through validate-block WITHOUT :skip-header is
+:time-too-old, so the fixture genuinely violates the rule."
+  (%with-mainnet-network
+   (multiple-value-bind (cs utxo store genesis-hash)
+       (%make-activate-block-fixture "mtp-fork")
+     ;; Active chain A: A1 is the tip at height 1.
+     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
+     (let* ((a1-hash (bitcoin-lisp.storage:best-block-hash cs))
+            (a1-entry (bitcoin-lisp.storage:get-block-index-entry cs a1-hash))
+            (genesis-entry (bitcoin-lisp.storage:get-block-index-entry cs genesis-hash))
+            (b-hashes (make-test-chain-hashes #xB0 3))
+            (b1-hash (first b-hashes))
+            (b2-hash (second b-hashes))
+            (b3-hash (third b-hashes))
+            (b1-block (make-reorg-test-block genesis-hash b1-hash 1))
+            ;; MTP(B1) = median{genesis, B1} = B1's own time (Core takes the
+            ;; upper element of an even window), so B2 timestamped exactly there
+            ;; is the boundary case of Core's `<=` rejection.
+            (b2-block (make-reorg-test-block
+                       b1-hash b2-hash 2
+                       :timestamp (+ +mtp-reorg-genesis-time+ 600)))
+            (b3-block (make-reorg-test-block b2-hash b3-hash 3)))
+       (dolist (b (list b1-block b2-block b3-block))
+         (bitcoin-lisp.storage:store-block store b))
+       (let* ((b1-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b1-hash :height 1 :prev-entry genesis-entry
+                         :chain-work 100 :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b1-block)))
+              (b2-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b2-hash :height 2 :prev-entry b1-entry
+                         :chain-work 200 :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b2-block)))
+              (b3-entry (bitcoin-lisp.storage:make-block-index-entry
+                         :hash b3-hash :height 3 :prev-entry b2-entry
+                         :chain-work 300 :status :header-valid
+                         :header (bitcoin-lisp.serialization:bitcoin-block-header b3-block))))
+         (dolist (e (list b1-entry b2-entry b3-entry))
+           (bitcoin-lisp.storage:add-block-index-entry cs e))
+         ;; Control: the full header check rejects B2 outright.
+         (multiple-value-bind (valid error)
+             (bitcoin-lisp.validation:validate-block
+              b2-block cs utxo 2 (bitcoin-lisp.serialization:get-unix-time))
+           (is (null valid))
+           (is (eq :time-too-old error)))
+         ;; The reorg must refuse rather than connect B2 mid-fork.
+         (multiple-value-bind (ok detail)
+             (bitcoin-lisp.validation:perform-reorg cs store utxo a1-entry b3-entry)
+           (is (null ok))
+           (is (eq :time-too-old detail)))
+         ;; Rolled back to chain A, with nothing poisoned: a header-rule verdict
+         ;; is not on the deterministic-invalid allowlist.
+         (is (equalp a1-hash (bitcoin-lisp.storage:best-block-hash cs)))
+         (is (= 1 (bitcoin-lisp.storage:current-height cs)))
+         (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status a1-entry)))
+         (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status b1-entry)))
+         (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status b2-entry))))
+       (clrhash bitcoin-lisp.validation::*block-undo-data*)))))
+
+(test reconsider-block-refuses-mtp-violating-target
+  "GA8 S1-7, the case with no descendant: reconsider-block hands its target
+straight to perform-reorg, so an MTP-violating block can be the reorg TIP.
+The reorg must refuse and reconsiderblock report :reorg-failed."
+  (%with-mainnet-network
+   (multiple-value-bind (cs utxo store genesis-hash)
+       (%make-activate-block-fixture "mtp-reconsider")
+     (%build-and-connect cs store utxo genesis-hash (make-test-chain-hashes #xA0 1))
+     (let* ((a1-hash (bitcoin-lisp.storage:best-block-hash cs))
+            (a1-entry (bitcoin-lisp.storage:get-block-index-entry cs a1-hash))
+            (genesis-entry (bitcoin-lisp.storage:get-block-index-entry cs genesis-hash))
+            (b1-hash (first (make-test-chain-hashes #xB0 1)))
+            ;; MTP(genesis) is the genesis timestamp itself.
+            (b1-block (make-reorg-test-block genesis-hash b1-hash 1
+                                             :timestamp +mtp-reorg-genesis-time+))
+            (b1-entry (bitcoin-lisp.storage:make-block-index-entry
+                       :hash b1-hash :height 1 :prev-entry genesis-entry
+                       :chain-work (1+ (bitcoin-lisp.storage:block-index-entry-chain-work
+                                        a1-entry))
+                       :status :invalid
+                       :header (bitcoin-lisp.serialization:bitcoin-block-header b1-block))))
+       (bitcoin-lisp.storage:store-block store b1-block)
+       (bitcoin-lisp.storage:add-block-index-entry cs b1-entry)
+       (multiple-value-bind (ok reason)
+           (bitcoin-lisp.validation:reconsider-block cs store utxo b1-hash)
+         (is (null ok))
+         (is (eq :reorg-failed reason)))
+       (is (equalp a1-hash (bitcoin-lisp.storage:best-block-hash cs)))
+       (is (= 1 (bitcoin-lisp.storage:current-height cs)))
+       (clrhash bitcoin-lisp.validation::*block-undo-data*)))))

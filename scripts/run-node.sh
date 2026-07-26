@@ -6,17 +6,30 @@
 # test server, so the load-bearing launch logic lives in the repo (and a
 # `pgrep -f`/kill accident can't lose it — 2026-07-22 deploy incident).
 #
-# It runs the node under a restart loop: SBCL is (re)launched, and when it
-# exits (graceful SIGTERM shutdown -> code 0, or the in-image watchdog -> code
-# 7, or a crash), the loop waits briefly and respawns. Normal shutdown is a
-# SIGTERM to the sbcl PID, which start-node traps -> stop-node (3-phase flush)
-# -> exit; send SIGTERM to THIS script's process group to stop for good.
+# It runs the node under a restart loop: SBCL is (re)launched, and the loop
+# DISCRIMINATES ON THE EXIT CODE (bitcoin-lisp:run-node-watchdog chooses it):
+#
+#   0  a deliberate, COMPLETED stop (`stop` RPC, SIGTERM, -stopatheight).
+#      Stop for good — respawning would undo what the operator just asked for,
+#      and with -stopatheight it re-arms the trigger and oscillates.
+#   1  a deterministic failure (bad config, unrecoverable chainstate, disk
+#      space): bounded backoff, then give up. An unconditional 10s respawn
+#      spins on such an error forever.
+#   7  the in-image watchdog saw the node stop running unasked, or SBCL
+#      crashed / was killed: respawn.
+#
+# Normal shutdown is a SIGTERM to the sbcl PID: start-node traps it and asks
+# the MAIN thread (run-node-watchdog) to run stop-node, so the 3-phase
+# chainstate flush, mempool.dat, peers.dat, banlist and wallet best-block
+# markers all complete BEFORE the process exits. Send SIGTERM to THIS script's
+# process group to stop for good.
 #
 # Usage:
 #   scripts/run-node.sh <network>          # network: testnet4 | mainnet | regtest
 #
 # Override any default via environment, e.g.:
 #   BL_DATA_ROOT=/srv/btc BL_SBCL=/opt/sbcl/bin/sbcl scripts/run-node.sh testnet4
+#   BL_MAX_FAST_FAILURES=5 BL_HEALTHY_RUN_SECONDS=300   # exit-1 backoff policy
 #
 set -euo pipefail
 
@@ -81,15 +94,57 @@ echo "[$NETWORK-supervisor]       this script auto-clears it on a git-rev change
 echo "[$NETWORK-supervisor]       you edit without committing, clear manually:"
 echo "[$NETWORK-supervisor]       rm -rf $BL_FASL_CACHE"
 
+# Consecutive deterministic (exit 1) failures, and how long a run must last to
+# count as healthy — a node that ran for a while and then died did not fail
+# deterministically at startup, so its streak resets.
+BL_MAX_FAST_FAILURES="${BL_MAX_FAST_FAILURES:-5}"
+BL_HEALTHY_RUN_SECONDS="${BL_HEALTHY_RUN_SECONDS:-300}"
+fail_streak=0
+
 while true; do
+  run_start=$SECONDS
+  # No `|| true`: it swallowed the status and made the logged exit code always
+  # 0, which is exactly the discrimination this loop needs. set +e instead, so
+  # `set -e` cannot kill the supervisor on a non-zero child exit either.
+  set +e
   "$BL_SBCL" --dynamic-space-size "$HEAP" --disable-debugger --non-interactive \
     --eval '(asdf:load-system :bitcoin-lisp)' \
     --eval "(bitcoin-lisp.serialization::stamp-build-git-rev \"$GITREV\")" \
     --eval "(setf bitcoin-lisp:*network* :$NETWORK)" \
     --eval "(bitcoin-lisp:start-node :data-directory \"$DATA_DIR\" :network :$NETWORK :rpc-port $RPC_PORT $START_OPTS :log-file \"$LOG\")" \
-    --eval '(loop (sleep 10) (unless (ignore-errors (bitcoin-lisp::node-running bitcoin-lisp::*node*)) (sb-ext:exit :code 7)))' \
-    || true
+    --eval '(bitcoin-lisp:run-node-watchdog)'
   code=$?
-  echo "[$NETWORK-supervisor] sbcl exited ($code) at $(date); restarting in 10s"
-  sleep 10
+  set -e
+  elapsed=$(( SECONDS - run_start ))
+
+  case "$code" in
+    0)
+      echo "[$NETWORK-supervisor] node stopped cleanly (exit 0) after ${elapsed}s at $(date); not restarting"
+      exit 0
+      ;;
+    1)
+      # Deterministic failure. A long run first means this was a runtime
+      # crash, not a start-up error that will simply repeat.
+      if [ "$elapsed" -ge "$BL_HEALTHY_RUN_SECONDS" ]; then
+        fail_streak=0
+      fi
+      fail_streak=$(( fail_streak + 1 ))
+      if [ "$fail_streak" -gt "$BL_MAX_FAST_FAILURES" ]; then
+        echo "[$NETWORK-supervisor] exit 1 after ${elapsed}s at $(date); $fail_streak consecutive fast failures — giving up (fix the config/chainstate/disk, then restart)"
+        exit 1
+      fi
+      backoff=$(( 10 * (1 << (fail_streak - 1)) ))
+      if [ "$backoff" -gt 300 ]; then
+        backoff=300
+      fi
+      echo "[$NETWORK-supervisor] exit 1 after ${elapsed}s at $(date); deterministic failure ${fail_streak}/${BL_MAX_FAST_FAILURES} — retrying in ${backoff}s"
+      sleep "$backoff"
+      ;;
+    *)
+      # 7 (watchdog: the node stopped running unasked) or a signal/crash code.
+      fail_streak=0
+      echo "[$NETWORK-supervisor] sbcl exited ($code) after ${elapsed}s at $(date); restarting in 10s"
+      sleep 10
+      ;;
+  esac
 done

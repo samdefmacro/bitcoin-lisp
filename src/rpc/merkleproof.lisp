@@ -230,8 +230,10 @@ strings, or an empty list if the block isn't in the active chain."
             (unless (equalp root header-root)
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Merkle root mismatch — proof does not match its header"))
+            ;; Core pushes a VARR either way, so both arms render [] rather
+            ;; than null when empty.
             (if (and entry
                      (bitcoin-lisp.storage:entry-on-active-chain-p chain-state entry))
-                (mapcar #'hash-to-hex matched)
+                (json-array (mapcar #'hash-to-hex matched))
                 ;; Block unknown or not on the active chain: Core returns [].
-                '())))))))
+                (json-array nil))))))))

@@ -99,10 +99,14 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
 ;;;; Contextual validation (requires chain state)
 
 (defun validate-transaction-contextual (tx utxo-set current-height
-                                        &key is-coinbase pending-utxos)
+                                        &key is-coinbase pending-utxos spent-outpoints)
   "Validate a transaction in the context of the current UTXO set.
 PENDING-UTXOS is an optional hash table of (txid . index) -> utxo-entry
 for outputs created by earlier transactions in the same block.
+SPENT-OUTPOINTS is an optional set of (txid . index) keys already consumed by
+an earlier transaction in the same block; such a prevout counts as ABSENT and
+falls into :missing-input — Core has spent the coin out of its view, so
+HaveInputs fails with bad-txns-inputs-missingorspent (tx_verify.cpp:167-169).
 Returns (VALUES T NIL FEE) on success, (VALUES NIL ERROR-KEYWORD NIL) on failure.
 FEE is returned as a Satoshi type."
   (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
@@ -116,21 +120,24 @@ FEE is returned as a Satoshi type."
         (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
                (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
                (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
-               (utxo (or (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)
-                         ;; Check intra-block pending UTXOs
-                         (when pending-utxos
-                           (gethash (cons prev-txid prev-index) pending-utxos)))))
+               (key (cons prev-txid prev-index))
+               (spent-in-block (and spent-outpoints (gethash key spent-outpoints)))
+               (utxo (unless spent-in-block
+                       (or (bitcoin-lisp.storage:get-utxo utxo-set prev-txid prev-index)
+                           ;; Check intra-block pending UTXOs
+                           (when pending-utxos
+                             (gethash key pending-utxos))))))
 
           ;; Input must reference an existing UTXO
           (unless utxo
             (bitcoin-lisp:log-warn
-             "MISSING-INPUT: height=~D prev-txid=~A:~D in-pending=~A pending-size=~D"
+             "MISSING-INPUT: height=~D prev-txid=~A:~D in-pending=~A spent-in-block=~A pending-size=~D"
              current-height
              (bitcoin-lisp.crypto:bytes-to-hex prev-txid)
              prev-index
              (and pending-utxos
-                  (if (gethash (cons prev-txid prev-index) pending-utxos)
-                      "yes" "no"))
+                  (if (gethash key pending-utxos) "yes" "no"))
+             (if spent-in-block "yes" "no")
              (if pending-utxos (hash-table-count pending-utxos) -1))
             (return-from validate-transaction-contextual
               (values nil :missing-input nil)))
@@ -841,7 +848,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
     (when chain-state
       (let* ((eval-height (1+ current-height))
              (tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
-             (mtp (compute-median-time-past chain-state tip-hash))
+             (mtp (or (compute-median-time-past chain-state tip-hash) 0))
              (csv-active (>= eval-height
                              (get-csv-activation-height bitcoin-lisp:*network*)))
              ;; BIP113: locktime compares against MTP once CSV is active
@@ -1117,7 +1124,9 @@ supplied, overrides the height-derived flags with an explicit comma-separated
 flag string (the mempool's PolicyScriptChecks pass runs the constant
 +standard-script-verify-flags+ set this way).
 EXTRA-COINS supplies spent outputs not in the confirmed UTXO set (chained
-mempool spends).
+mempool spends). An input whose coin cannot be resolved fails the transaction:
+Core asserts the coin is present before verifying (CheckInputScripts,
+validation.cpp:2090), so a missing coin must never mean \"no script to check\".
 Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
   (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
          (spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
@@ -1126,11 +1135,8 @@ Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
            (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
          (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
-    (loop for input across inputs
-          for input-idx from 0
-          for utxo = (and spent-utxos (aref spent-utxos input-idx))
-          when utxo
-            do (unless (validate-input-script tx input-idx utxo)
-                 (return-from validate-transaction-scripts
-                   (values nil input-idx))))
+    (dotimes (input-idx (length inputs))
+      (let ((utxo (and spent-utxos (aref spent-utxos input-idx))))
+        (unless (and utxo (validate-input-script tx input-idx utxo))
+          (return-from validate-transaction-scripts (values nil input-idx)))))
     (values t nil)))
