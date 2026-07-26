@@ -1011,39 +1011,101 @@ source is marked as knowing it too). Returns the number of peers sent to."
                  (incf sent)))
     sent))
 
-(defun peer-source-group (peer)
-  "Net-group key of PEER's own address, for addrman source bucketing (Core
-AddrMan::Add's source argument) — network-typed, so onion/i2p/cjdns peers
-get their proper source groups. NIL for hostname peers (addnode by name)."
-  (multiple-value-bind (net bytes) (parse-network-address (peer-address peer))
-    (when net (net-group-key bytes net))))
+(defun peer-source-address (peer)
+  "PEER's own address as (VALUES net ip-bytes net-group-key) — addrman's
+`source` argument (Core AddrMan::Add). The group keys new-bucket placement so
+one source cannot dominate our address set; the address itself identifies a
+self-announcement, which Core exempts from the gossip time penalty
+(addrman.cpp:559-563). Network-typed, so onion/i2p/cjdns peers get their
+proper source groups. All NIL for a hostname peer (addnode by name) or no
+peer at all."
+  (when peer
+    (multiple-value-bind (net bytes) (parse-network-address (peer-address peer))
+      (when net (values net bytes (net-group-key bytes net))))))
 
-(defun %ingest-gossiped-address (net-addr timestamp address-book source-group now)
+;;; Gossiped-address timestamp handling (Core's ADDR handler,
+;;; net_processing.cpp:4087-4114). Age is NOT an admission rule: Core stores
+;;; whatever it is told and lets addrman drop stale entries at SELECTION time
+;;; (ADDRMAN_HORIZON, 30 days — addr-info-terrible-p here). Core's own DNS-seed
+;;; path deliberately mints entries aged 3-7 days (net.cpp:2375), so any
+;;; storage-side freshness window would throw away exactly the addresses a
+;;; getaddr response exists to deliver.
+
+(defconstant +addr-time-init+ 100000000
+  "CAddress::TIME_INIT (protocol.h): a gossiped timestamp at or below this
+(1973-03-03) is not a real observation, it is an unset field.")
+
+(defconstant +addr-absurd-time-replacement-seconds+ (* 5 24 60 60)
+  "How far in the past an absurd gossiped timestamp is rewritten to — 5 days
+(net_processing.cpp:4092). Old enough not to be relayed onward or preferred by
+selection, young enough to stay inside the 30-day addrman horizon.")
+
+(defconstant +addr-gossip-time-penalty-seconds+ (* 2 60 60)
+  "Time penalty applied when STORING a gossiped address (Core's
+/*time_penalty=*/2h at net_processing.cpp:4114): hearsay about a peer is
+weaker evidence of liveness than having connected to it ourselves.")
+
+(defun may-have-useful-address-db-p (services)
+  "Core's storage service filter for gossiped addresses
+(net_processing.cpp:4087, MayHaveUsefulAddressDB): a peer advertising neither
+NODE_NETWORK nor NODE_NETWORK_LIMITED is not worth remembering. Core writes it
+as `!MayHaveUsefulAddressDB(s) && !HasAllDesirableServiceFlags(s)`, but the
+second test cannot rescue an address the first rejects — the desirable set
+always contains NODE_NETWORK or NODE_NETWORK_LIMITED
+(GetDesirableServiceFlags, net_processing.cpp:1759-1768) — so the pair reduces
+to this one bit test."
+  (logtest services (logior bitcoin-lisp.serialization:+node-network+
+                            bitcoin-lisp.serialization:+node-network-limited+)))
+
+(defun %ingest-gossiped-address (net-addr timestamp address-book source-group now
+                                 &optional source-net source-ip)
   "Shared addr/addrv2 ingestion for one gossiped NET-ADDR (Core's per-address
 loop in the ADDR handler, net_processing.cpp:4056-4098) learned from a peer
-with net-group key SOURCE-GROUP. Stores it in ADDRESS-BOOK only when its
-network is REACHABLE (-onlynet; Core \"Do not store addresses outside our
-network\"), but fresh (10-min) ROUTABLE addresses are relay candidates
-regardless — an unreachable-net address still relays, just to 1 peer instead
-of 2 (Core RelayAddress fReachable). Returns (VALUES stored relay-entry):
-STORED is 1/0 for the caller's log count, RELAY-ENTRY a
-(peer-address . max-targets) cons when the address should be gossiped onward."
+with net-group key SOURCE-GROUP and own address SOURCE-NET/SOURCE-IP. Stores
+it in ADDRESS-BOOK only when its network is REACHABLE (-onlynet; Core \"Do not
+store addresses outside our network\"), but fresh (10-min) ROUTABLE addresses
+are relay candidates regardless — an unreachable-net address still relays,
+just to 1 peer instead of 2 (Core RelayAddress fReachable).
+
+Age gates RELAY only, never storage. An absurd timestamp (unset, or more than
+10 minutes ahead of us) is rewritten to now - 5 days and stored anyway
+(net_processing.cpp:4090-4092) rather than dropped; the stored copy carries
+the 2h gossip penalty, waived for a peer announcing itself. Addresses whose
+services bits promise no useful address DB are skipped entirely — neither
+stored nor relayed, as in Core.
+
+Returns (VALUES stored relay-entry): STORED is 1/0 for the caller's log count,
+RELAY-ENTRY a (peer-address . max-targets) cons when the address should be
+gossiped onward."
   (unless (and address-book timestamp
-               (<= (abs (- now timestamp)) (* 3 3600)))
+               (may-have-useful-address-db-p
+                (bitcoin-lisp.serialization:net-addr-services net-addr)))
     (return-from %ingest-gossiped-address (values 0 nil)))
-  (let* ((pa (make-peer-address
+  (let* ((time (if (or (<= timestamp +addr-time-init+)
+                       (> timestamp (+ now 600)))
+                   (max 0 (- now +addr-absurd-time-replacement-seconds+))
+                   timestamp))
+         (pa (make-peer-address
               :net (bitcoin-lisp.serialization:net-addr-net net-addr)
               :ip (bitcoin-lisp.serialization:net-addr-ip net-addr)
               :port (bitcoin-lisp.serialization:net-addr-port net-addr)
               :services (bitcoin-lisp.serialization:net-addr-services net-addr)
-              :last-seen timestamp))
+              :last-seen time))
          (network (peer-address-network pa))
-         (reachable (reachable-network-p network)))
+         (reachable (reachable-network-p network))
+         ;; Core: "Do not set a penalty for a source's self-announcement"
+         ;; (addrman.cpp:559-563; the comparison is CNetAddr, so port-blind).
+         (penalty (if (and source-net (eq source-net network)
+                           (equalp source-ip (peer-address-ip pa)))
+                      0
+                      +addr-gossip-time-penalty-seconds+)))
     (when reachable
-      (address-book-add address-book pa source-group))
+      (address-book-add address-book pa source-group penalty))
     (values (if reachable 1 0)
-            ;; Core relays only fresh (10-min) routable addrs.
-            (when (and (> timestamp (- now 600))
+            ;; Core relays only fresh (10-min) routable addrs — on the
+            ;; rewritten timestamp, so a "flying DeLorean" address cannot buy
+            ;; itself relay by claiming a future time.
+            (when (and (> time (- now 600))
                        (address-routable-p (peer-address-ip pa) network))
               (cons pa (if reachable 2 1))))))
 
@@ -1075,53 +1137,56 @@ attacker cannot choose which addresses survive the limit (Core std::shuffle).
 Fresh routable addresses from small (<=10) UNSOLICITED announcements relay
 onward; a non-full message marks our outstanding getaddr answered. Returns
 the number stored."
-  (let* ((now (bitcoin-lisp.serialization:get-unix-time))
-         (source-group (when peer (peer-source-group peer)))
-         ;; Read before the end-of-message reset below, like Core (the reset
-         ;; runs after the loop): a getaddr response never relays onward.
-         (unsolicited (not (and peer (peer-getaddr-requested peer))))
-         (added 0)
-         (num-proc 0)
-         (num-rate-limit 0)
-         (relay-candidates '()))
-    (when peer
-      (%refill-addr-token-bucket peer))
-    (dolist (entry (alexandria:shuffle (copy-list entries)))
-      (cond
-        ((and peer (< (peer-addr-token-bucket peer) 1.0d0))
-         (incf num-rate-limit))
-        (t
-         (when peer
-           (decf (peer-addr-token-bucket peer) 1.0d0)
-           (incf num-proc))
-         (multiple-value-bind (stored relay)
-             (%ingest-gossiped-address (car entry) (cdr entry)
-                                       address-book source-group now)
-           (incf added stored)
-           (when relay (push relay relay-candidates))))))
-    (when peer
-      (incf (peer-addr-processed peer) num-proc)
-      (incf (peer-addr-rate-limited peer) num-rate-limit)
-      (when (plusp num-rate-limit)
-        (bitcoin-lisp:log-cat "net" "addr from peer ~A: ~D processed, ~D rate-limited"
-                              (peer-address peer) num-proc num-rate-limit))
-      ;; A non-full message answers our getaddr (Core: "if (vAddr.size() <
-      ;; 1000) peer.m_getaddr_sent = false", net_processing.cpp:4116).
-      (when (< announced-count bitcoin-lisp.serialization:+max-addr-count+)
-        (setf (peer-getaddr-requested peer) nil)))
-    (when (and peers unsolicited (<= announced-count 10))
-      (loop for (pa . max-targets) in relay-candidates
-            do (relay-address pa peer peers :now now :max-targets max-targets)))
-    added))
+  (multiple-value-bind (source-net source-ip source-group)
+      (peer-source-address peer)
+    (let* ((now (bitcoin-lisp.serialization:get-unix-time))
+           ;; Read before the end-of-message reset below, like Core (the reset
+           ;; runs after the loop): a getaddr response never relays onward.
+           (unsolicited (not (and peer (peer-getaddr-requested peer))))
+           (added 0)
+           (num-proc 0)
+           (num-rate-limit 0)
+           (relay-candidates '()))
+      (when peer
+        (%refill-addr-token-bucket peer))
+      (dolist (entry (alexandria:shuffle (copy-list entries)))
+        (cond
+          ((and peer (< (peer-addr-token-bucket peer) 1.0d0))
+           (incf num-rate-limit))
+          (t
+           (when peer
+             (decf (peer-addr-token-bucket peer) 1.0d0)
+             (incf num-proc))
+           (multiple-value-bind (stored relay)
+               (%ingest-gossiped-address (car entry) (cdr entry)
+                                         address-book source-group now
+                                         source-net source-ip)
+             (incf added stored)
+             (when relay (push relay relay-candidates))))))
+      (when peer
+        (incf (peer-addr-processed peer) num-proc)
+        (incf (peer-addr-rate-limited peer) num-rate-limit)
+        (when (plusp num-rate-limit)
+          (bitcoin-lisp:log-cat "net" "addr from peer ~A: ~D processed, ~D rate-limited"
+                                (peer-address peer) num-proc num-rate-limit))
+        ;; A non-full message answers our getaddr (Core: "if (vAddr.size() <
+        ;; 1000) peer.m_getaddr_sent = false", net_processing.cpp:4116).
+        (when (< announced-count bitcoin-lisp.serialization:+max-addr-count+)
+          (setf (peer-getaddr-requested peer) nil)))
+      (when (and peers unsolicited (<= announced-count 10))
+        (loop for (pa . max-targets) in relay-candidates
+              do (relay-address pa peer peers :now now :max-targets max-targets)))
+      added)))
 
 (defun handle-addr (peer payload &optional address-book peers)
-  "Handle an addr message. When ADDRESS-BOOK is provided, add plausible
-addresses (timestamp within last 3 hours) on reachable networks to the address
-book, keyed to the gossiping PEER as their source (addrman source-group
-spreading), subject to the per-address token bucket (see
-%process-gossiped-addresses). Ignored entirely from a block-relay-only peer
-(Core SetupAddressRelay, net_processing.cpp:4041); more than 1000 announced
-addresses is misbehavior (net_processing.cpp:4046-4050)."
+  "Handle an addr message. When ADDRESS-BOOK is provided, add the addresses on
+reachable networks to the address book regardless of age (absurd timestamps are
+rewritten, not dropped — see %ingest-gossiped-address), keyed to the gossiping
+PEER as their source (addrman source-group spreading), subject to the
+per-address token bucket (see %process-gossiped-addresses). Ignored entirely
+from a block-relay-only peer (Core SetupAddressRelay,
+net_processing.cpp:4041); more than 1000 announced addresses is misbehavior
+(net_processing.cpp:4046-4050)."
   (when (and peer (eq (peer-conn-type peer) :block-relay))
     (bitcoin-lisp:log-cat "net" "ignoring addr message from block-relay-only peer ~A"
                           (peer-address peer))
@@ -1152,10 +1217,11 @@ addresses is misbehavior (net_processing.cpp:4046-4050)."
 
 (defun handle-addrv2 (peer payload &optional address-book peers)
   "Handle an addrv2 message (BIP 155). When ADDRESS-BOOK is provided, add
-addresses of any representable network (IPv4/IPv6/TORv3/I2P/CJDNS) with
-plausible timestamps (within 3 hours) to the address book — non-IP networks
-only when reachable (-onlynet + proxy/flag gates), subject to the per-address
-token bucket (see %process-gossiped-addresses). Unknown network ids were
+addresses of any representable network (IPv4/IPv6/TORv3/I2P/CJDNS) to the
+address book regardless of age (absurd timestamps are rewritten, not dropped —
+see %ingest-gossiped-address) — non-IP networks only when reachable (-onlynet
++ proxy/flag gates), subject to the per-address token bucket (see
+%process-gossiped-addresses). Unknown network ids were
 already skipped by the codec; a count above 1000 fails parsing (Core
 Misbehaving path — the caller disconnects). Ignored entirely from a
 block-relay-only peer (Core SetupAddressRelay)."
