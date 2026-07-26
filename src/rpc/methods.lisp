@@ -2803,11 +2803,19 @@ getdifficulty)."
       0))
 
 (defun rpc-stop (node params)
-  "Request a graceful node shutdown (Bitcoin Core stop). stop-node also stops the
-RPC server serving this request, so defer it to a short-lived thread and let
-this response flush first."
+  "Request a graceful node shutdown (Bitcoin Core stop, rpc/node.cpp: the RPC
+only calls StartShutdown()). It must not run stop-node on this thread: the
+teardown stops the RPC server serving this very request, and — the reason the
+request/perform split exists — a stop driven from any non-main thread races
+the supervisor's watchdog, which exits the process while the chainstate flush,
+mempool.dat, peers.dat and wallet markers are still being written. So register
+the request and let the main thread do the work; the short sleep only lets
+this response flush before the RPC server goes away."
   (declare (ignore node params))
-  (bt:make-thread (lambda () (sleep 0.3) (ignore-errors (bitcoin-lisp::stop-node)))
+  (bt:make-thread (lambda ()
+                    (sleep 0.3)
+                    (ignore-errors
+                     (bitcoin-lisp::request-node-shutdown "RPC stop")))
                   :name "rpc-stop")
   "Bitcoin-lisp server stopping")
 
@@ -4437,6 +4445,14 @@ that block's deltas. Only the muhash hash_type is index-backed."
                         (unless entry
                           (error 'rpc-error :code +rpc-invalid-address-or-key+
                                             :message "Block not found"))
+                        ;; The header index resolves STALE-BRANCH hashes too,
+                        ;; and the index holds only active-chain statistics —
+                        ;; serving the active chain's numbers under a
+                        ;; stale-branch hash would be a silently wrong answer.
+                        (unless (bitcoin-lisp.storage:entry-on-active-chain-p
+                                 chain-state entry)
+                          (error 'rpc-error :code +rpc-invalid-parameter+
+                                            :message "Block is not on the active chain; the coinstatsindex holds active-chain statistics only"))
                         (bitcoin-lisp.storage:block-index-entry-height entry)))
                      (t (error 'rpc-error :code +rpc-invalid-parameter+
                                           :message "hash_or_height must be a height or block hash"))))
@@ -4444,7 +4460,10 @@ that block's deltas. Only the muhash hash_type is index-backed."
            (prev (and (plusp height)
                       (bitcoin-lisp.storage:coinstatsindex-get-stats csi (1- height))))
            (entry (bitcoin-lisp.storage:get-block-at-height chain-state height)))
-      (unless stats
+      ;; Records above the best marker are not vouched for: a rewind moves the
+      ;; marker down and leaves the abandoned branch's records in place until
+      ;; the backfill overwrites them.
+      (unless (and stats (<= height (bitcoin-lisp.storage:coinstatsindex-height csi)))
         (error 'rpc-error :code +rpc-invalid-parameter+
                           :message "Height not in coinstatsindex (out of range or below the indexed horizon)"))
       (flet ((g (fn s) (if s (funcall fn s) 0)))

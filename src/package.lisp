@@ -629,6 +629,7 @@
    #:coinstatsindex-best
    #:coinstatsindex-get-stats
    #:coinstatsindex-add-block
+   #:coinstatsindex-record-matches-block-p
    #:coinstatsindex-seed-genesis
    #:coinstatsindex-set-best
    #:coinstatsindex-clear-best
@@ -1461,6 +1462,13 @@
    #:start-node
    #:start-node-from-args
    #:stop-node
+   ;; Shutdown coordination (internal paths request; the main thread performs)
+   #:request-node-shutdown
+   #:node-shutdown-requested-p
+   #:run-node-watchdog
+   #:+node-exit-clean+
+   #:+node-exit-error+
+   #:+node-exit-watchdog+
    #:node-status
    #:node-fee-estimator
    #:node-recent-rejects
