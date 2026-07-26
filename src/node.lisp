@@ -3386,6 +3386,17 @@ node-peers stays single-writer. No-op when networking is disabled."
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
 
+(defun %mark-manual-peer (peer)
+  "Tag PEER as operator-pinned (-addnode / addnode onetry), i.e. Core's
+ConnectionType::MANUAL. Manual peers are exempt from every AUTOMATIC eviction:
+without this they are indistinguishable from ordinary :outbound-full-relay
+peers, and connect-added-nodes redials them on each ~30s maintenance tick, so
+any automatic disconnect would loop forever against a peer the operator chose.
+Returns PEER (NIL passes through when the dial failed)."
+  (when peer
+    (setf (bitcoin-lisp.networking:peer-manual peer) t))
+  peer)
+
 (defun connect-added-nodes (node)
   "Service addnode requests on the sync thread: drain one-shot \"onetry\" dials,
 then keep every \"add\" peer connected. Honors network-active."
@@ -3397,12 +3408,12 @@ then keep every \"add\" peer connected. Honors network-active."
       (dolist (spec onetry)
         (multiple-value-bind (host port) (parse-node-endpoint node spec)
           (unless (peer-connected-to-host-p node host)
-            (establish-outbound-peer node host port)))))
+            (%mark-manual-peer (establish-outbound-peer node host port))))))
     ;; Maintain persistent added-node connections.
     (dolist (spec (node-added-nodes node))
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
         (unless (peer-connected-to-host-p node host)
-          (establish-outbound-peer node host port))))))
+          (%mark-manual-peer (establish-outbound-peer node host port)))))))
 
 (defconstant +target-block-relay-peers+ 2
   "Dedicated block-relay-only outbound slots (Bitcoin Core opens 2). They carry

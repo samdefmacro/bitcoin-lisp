@@ -35,6 +35,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (connection nil :type (or null connection))
   (state :disconnected :type peer-state)
   (version nil)  ; Received version message
+  ;; Operator-pinned connection (-addnode / addnode onetry). Core types these
+  ;; ConnectionType::MANUAL and exempts them from every automatic eviction; we
+  ;; carry the fact as a flag because our -addnode peers are otherwise typed
+  ;; :outbound-full-relay and would be indistinguishable.
+  (manual nil)
   (services 0 :type (unsigned-byte 64))
   (start-height 0 :type (signed-byte 32))
   (user-agent "" :type string)
@@ -449,6 +454,23 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
                           (%account-message (peer-recv-per-msg peer) nil
                                             command payload-len)
                           (values command payload))))))))))))))
+
+(defun peer-outbound-or-block-relay-p (peer)
+  "T for the connection types that are candidates for AUTOMATIC disconnection
+on chain-quality grounds — Core CNode::IsOutboundOrBlockRelayConn
+(net.h:771-785): OUTBOUND_FULL_RELAY and BLOCK_RELAY only.
+
+Two halves matter equally. It must INCLUDE :block-relay, which the word
+\"outbound\" does not obviously cover in our vocabulary. And it must EXCLUDE
+manual (-addnode) peers: ours are typed :outbound-full-relay, and
+connect-added-nodes redials every missing added node on the ~30s maintenance
+tick, so a plain not-inbound test would produce a
+connect -> getheaders -> disconnect -> reconnect loop every 30 seconds against
+a peer the operator explicitly pinned. Feelers and inbound are excluded too."
+  (and (not (peer-inbound peer))
+       (not (peer-manual peer))
+       (member (peer-conn-type peer) '(:outbound-full-relay :block-relay))
+       t))
 
 ;;; Handshake
 
