@@ -2475,7 +2475,11 @@ its availability with no block transfer. It recorded nothing."
             :hash hash :height 5 :chain-work 100 :status :header-valid))
     (is (null (bitcoin-lisp.networking::peer-best-known-block-hash peer))
         "precondition: peer has no recorded best block")
+    ;; FULL-BATCH t: Core's may_have_more_headers. The sibling half of
+    ;; UpdatePeerStateForReceivedHeaders — the IBD sub-minchainwork outbound
+    ;; drop — is skipped for a full batch, keeping this test on availability
+    ;; alone (that drop has its own tests in ECLIPSE-DOS-TESTS).
     (bitcoin-lisp.networking::%store-validated-headers
-     peer state (list hdr) (lambda (n) (declare (ignore n))) "test")
+     peer state (list hdr) t (lambda (n) (declare (ignore n))) "test")
     (is (equalp hash (bitcoin-lisp.networking::peer-best-known-block-hash peer))
         "an all-already-known batch must still record the peer's best block")))

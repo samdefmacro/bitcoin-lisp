@@ -2271,7 +2271,9 @@ Every clause here is load-bearing:
     excludes manual peers and inbound.
   - SILENT: no misbehaviour score, no discouragement. The peer is not
     malicious, just useless to us right now.
-Returns T when the peer was dropped."
+Call site is load-bearing too: %store-validated-headers, i.e. only the shapes
+on which Core reaches UpdatePeerStateForReceivedHeaders. Returns T when the
+peer was dropped."
   (when (and (initial-block-download-p chain-state)
              (not full-batch)
              (peer-outbound-or-block-relay-p peer)
@@ -2286,10 +2288,21 @@ Returns T when the peer was dropped."
         (disconnect-peer peer)
         t))))
 
-(defun %store-validated-headers (peer chain-state headers count-fn label)
+(defun %store-validated-headers (peer chain-state headers full-batch count-fn label)
   "Contextually validate HEADERS (validate-header-chain) and add the valid
-prefix to the block index, bumping the running count via COUNT-FN and updating
-per-peer availability. Shared by the normal and redownload store paths.
+prefix to the block index, bumping the running count via COUNT-FN, then run
+Core's UpdatePeerStateForReceivedHeaders (net_processing.cpp:2909-2944) over
+PEER: refresh per-peer availability from pindexLast and apply the IBD
+sub-minchainwork outbound drop. Shared by the normal and redownload store
+paths — i.e. exactly the shapes on which Core reaches
+UpdatePeerStateForReceivedHeaders (:3113).
+
+FULL-BATCH is Core's may_have_more_headers: the length of the RECEIVED
+message, NOT of the batch stored here. They differ on the REDOWNLOAD path,
+where a full 2000-header message releases a shorter run of buffered headers
+for storage; Core passes `nCount == m_opts.max_headers_result` from the
+received message there too.
+
 Holds the node lock: process-headers mutates the block index the RPC
 threads read/write under the same lock."
   (with-node-lock
@@ -2323,10 +2336,39 @@ threads read/write under the same lock."
         (when (and peer pindex-last)
           (update-block-availability
            peer chain-state
-           (bitcoin-lisp.serialization:block-header-hash pindex-last))))
+           (bitcoin-lisp.serialization:block-header-hash pindex-last))
+          ;; Core does the IBD chain-quality drop HERE, immediately after
+          ;; UpdateBlockAvailability and nowhere else: ProcessHeadersMessage
+          ;; returns early for an empty message (:2969-2981), for an
+          ;; unconnecting BIP130 announcement (:3029-3040) and for a batch
+          ;; diverted into a low-work presync (:3065-3074), so none of those
+          ;; shapes is ever judged. Judging them dropped honest outbound peers
+          ;; during early IBD — a 1-header announcement whose parent we lack
+          ;; only stages hash-last-unknown, leaving best-known at its stale
+          ;; sub-minchainwork value, and the check then fired on it.
+          (maybe-disconnect-low-work-outbound peer chain-state full-batch)))
       (when (> added 0)
         (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added))
       added))))
+
+(defun %batch-already-known-p (chain-state headers)
+  "T when every header in HEADERS is already in the block index — tested on the
+LAST one only, since headers are admitted parent-first, so last-known implies
+all-known.
+
+Such a batch costs no new index memory, so both header paths skip the anti-DoS
+work gate for it and take the store path instead: a near-no-op that still
+refreshes per-peer availability and applies the IBD sub-minchainwork outbound
+drop. Core's already_validated_work (IsAncestorOfBestHeaderOrTip,
+net_processing.cpp:3046-3054) does the same, bypassing TryLowWorkHeadersSync —
+and its comment at :2786-2790 relies on this interaction. Noted divergence: we
+test plain index membership without Core's ancestor-of-best refinement, which
+guards fingerprinting rather than memory."
+  (and headers
+       (bitcoin-lisp.storage:get-block-index-entry
+        chain-state
+        (bitcoin-lisp.serialization:block-header-hash (car (last headers))))
+       t))
 
 (defun %clear-peer-headers-sync (peer &key finalize)
   "Drop PEER's low-work sync state (Core peer.m_headers_sync.reset()),
@@ -2349,7 +2391,8 @@ NIL the sync is over (complete or aborted) and the slot is cleared."
         (multiple-value-bind (ok request-more ready)
             (hss-process-next-headers hss headers full-batch)
           (when ready
-            (%store-validated-headers peer chain-state ready count-fn "Redownload"))
+            (%store-validated-headers peer chain-state ready full-batch
+                                      count-fn "Redownload"))
           (cond ((and ok request-more) t)
                 (t
                  (bitcoin-lisp:log-info "Low-work headers sync ~A with ~A (presync height ~D)"
@@ -2404,9 +2447,12 @@ low-work sync state (peer-headers-sync — Core Peer::m_headers_sync; shared
 with the generic path, ingest-headers-from-peer). Returns DONE: whether
 header sync from this peer is finished.
 
-Three cases:
+Four cases:
   - a low-work sync is already running: drive it, storing any headers it
     releases during REDOWNLOAD, and end when it finalizes;
+  - the batch is already entirely in our index: skip the anti-DoS gate, take
+    the store path (Core already_validated_work) and end sync — the peer has
+    taught us nothing, so our locator cannot advance;
   - no sync, but this batch connects and claims sub-threshold work: start a
     presync when it is a full batch (store nothing yet), or ignore it
     entirely when not (anti-DoS — Core TryLowWorkHeadersSync);
@@ -2422,13 +2468,30 @@ Three cases:
     ((peer-headers-sync peer)
      (not (%drive-headers-sync peer chain-state headers full-batch count-fn)))
 
+    ;; Batch we already hold (%batch-already-known-p): store path, no work
+    ;; gate. Without this branch the classic case never fired — an outbound
+    ;; peer pinned on a low-work fork, answering our getheaders with a short
+    ;; batch we already have, was swallowed by :ignore and never judged.
+    ;;
+    ;; DONE is T even for a full batch, where Core would fetch more: Core asks
+    ;; again from GetLocator(pindexLast), which advances into the peer's chain,
+    ;; while this loop re-asks from our own header tip. Nothing was added to
+    ;; the index here, so that locator is byte-identical next time round and
+    ;; the peer would resend the same batch until the 100-request cap — a free
+    ;; 100 round-trips for a peer feeding us a fork we already hold.
+    ((%batch-already-known-p chain-state headers)
+     (%store-validated-headers peer chain-state headers full-batch
+                               count-fn "Received")
+     t)
+
     ;; No sync yet: divert into presync, ignore, or store.
     (t
      (ecase (%maybe-divert-to-presync peer chain-state headers full-batch)
        (:presync nil)
        (:ignore t)
        (:store
-        (%store-validated-headers peer chain-state headers count-fn "Received")
+        (%store-validated-headers peer chain-state headers full-batch
+                                  count-fn "Received")
         (< (length headers)
            bitcoin-lisp.serialization:+max-headers-count+))))))
 
@@ -2451,8 +2514,7 @@ of headers added to the index."
                          (= (length headers)
                             bitcoin-lisp.serialization:+max-headers-count+)))
         (count-fn (or count-fn (lambda (n) (declare (ignore n))))))
-    (prog1
-        (cond
+    (cond
       ;; Empty message: cannot be an announcement; a peer mid-low-work-sync
       ;; suddenly has nothing for us — drop the sync (Core nCount==0 branch).
       ((null headers)
@@ -2486,18 +2548,12 @@ of headers added to the index."
           (bitcoin-lisp.serialization:block-header-hash (car (last headers)))))
        0)
 
-      ;; Batch already entirely known (headers are stored parent-first, so
-      ;; last-known implies all-known): no new index memory, skip the
-      ;; anti-DoS work gate and take the normal path — a near-no-op that
-      ;; still refreshes per-peer availability. Core's last_received_header
-      ;; / IsAncestorOfBestHeaderOrTip skip (net_processing.cpp:3046-3054);
-      ;; we skip on plain index membership without the ancestor-of-best
-      ;; refinement (that part guards fingerprinting, not memory — noted
-      ;; divergence).
-      ((bitcoin-lisp.storage:get-block-index-entry
-        chain-state
-        (bitcoin-lisp.serialization:block-header-hash (car (last headers))))
-       (%store-validated-headers peer chain-state headers count-fn "Received"))
+      ;; Batch we already hold: store path, no work gate — see
+      ;; %batch-already-known-p (Core's last_received_header /
+      ;; IsAncestorOfBestHeaderOrTip skip, net_processing.cpp:3046-3054).
+      ((%batch-already-known-p chain-state headers)
+       (%store-validated-headers peer chain-state headers full-batch
+                                 count-fn "Received"))
 
       ;; Connecting batch with new headers: anti-DoS work gate, then store.
       (t
@@ -2508,15 +2564,8 @@ of headers added to the index."
           0)
          (:ignore 0)
          (:store
-          (%store-validated-headers peer chain-state headers count-fn "Received")))))
-      ;; Runs after EVERY processed headers message, matching Core, which
-      ;; applies this at the end of ProcessHeadersMessage rather than only when
-      ;; a header sync ends. This generic path is where it fires live: on the
-      ;; solicited Phase-1 path a batch either fails the anti-DoS gate and is
-      ;; ignored with no state update, or passes it and is therefore already at
-      ;; or above minimum-chain-work.
-      (when peer
-        (maybe-disconnect-low-work-outbound peer chain-state full-batch)))))
+          (%store-validated-headers peer chain-state headers full-batch
+                                    count-fn "Received")))))))
 
 (defun sync-headers (peer chain-state &key recent-rejects ctx utxo-set
                                            block-store fee-estimator)
