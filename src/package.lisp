@@ -1167,6 +1167,8 @@
    #:peer-user-agent
    #:peer-ping-latency
    #:peer-inbound
+   #:peer-manual
+   #:peer-outbound-or-block-relay-p
    #:peer-conn-type
    #:peer-relays-txs-p
    #:peer-tx-relay-p

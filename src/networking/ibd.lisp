@@ -2247,6 +2247,45 @@ isolated per peer so one dead socket cannot abort the sweep."
             peer
             (bitcoin-lisp.serialization:make-getheaders-message locator))))))))
 
+(defun maybe-disconnect-low-work-outbound (peer chain-state full-batch)
+  "Core's IBD chain-quality drop (net_processing.cpp:2926-2944): during IBD, a
+peer that has no more headers to give us and whose best-known chain has less
+than minimum-chain-work cannot help us sync, so an automatic outbound slot it
+occupies is wasted — a step toward IBD eclipse. We refused to DOWNLOAD from
+such a peer but never disconnected it, so the slot stayed pinned.
+
+Every clause here is load-bearing:
+  - IBD only. Past IBD the rule does not apply.
+  - FULL-BATCH is Core's may_have_more_headers, computed from the RECEIVED
+    message length (a full 2000-header batch means more may follow). Only a
+    NON-full batch proves we have seen the peer's tip.
+  - The peer must actually have announced something: a NIL best-known block is
+    never judged (Core :2930).
+  - The work compared is the peer's best-known over the WHOLE connection
+    (monotone via update-block-availability), not this batch's work.
+  - STRICTLY less than minimum-chain-work; equal work is kept.
+  - Compared against MINIMUM-CHAIN-WORK, not our tip: we do not start block
+    download until the header chain clears that floor anyway, so a peer past
+    our tip but under the floor is still useless (Core's own note).
+  - Automatic outbound slots only (peer-outbound-or-block-relay-p), which
+    excludes manual peers and inbound.
+  - SILENT: no misbehaviour score, no discouragement. The peer is not
+    malicious, just useless to us right now.
+Returns T when the peer was dropped."
+  (when (and (initial-block-download-p chain-state)
+             (not full-batch)
+             (peer-outbound-or-block-relay-p peer)
+             (peer-best-known-block-hash peer))
+    (let* ((entry (bitcoin-lisp.storage:get-block-index-entry
+                   chain-state (peer-best-known-block-hash peer)))
+           (work (and entry (bitcoin-lisp.storage:block-index-entry-chain-work entry)))
+           (floor-work (bitcoin-lisp:minimum-chain-work bitcoin-lisp:*network*)))
+      (when (and work (< work floor-work))
+        (bitcoin-lisp:log-info "Peer ~A: headers chain has insufficient work (~A < ~A), disconnecting outbound peer"
+                               (peer-address peer) work floor-work)
+        (disconnect-peer peer)
+        t))))
+
 (defun %store-validated-headers (peer chain-state headers count-fn label)
   "Contextually validate HEADERS (validate-header-chain) and add the valid
 prefix to the block index, bumping the running count via COUNT-FN and updating
@@ -2412,7 +2451,8 @@ of headers added to the index."
                          (= (length headers)
                             bitcoin-lisp.serialization:+max-headers-count+)))
         (count-fn (or count-fn (lambda (n) (declare (ignore n))))))
-    (cond
+    (prog1
+        (cond
       ;; Empty message: cannot be an announcement; a peer mid-low-work-sync
       ;; suddenly has nothing for us — drop the sync (Core nCount==0 branch).
       ((null headers)
@@ -2468,7 +2508,15 @@ of headers added to the index."
           0)
          (:ignore 0)
          (:store
-          (%store-validated-headers peer chain-state headers count-fn "Received")))))))
+          (%store-validated-headers peer chain-state headers count-fn "Received")))))
+      ;; Runs after EVERY processed headers message, matching Core, which
+      ;; applies this at the end of ProcessHeadersMessage rather than only when
+      ;; a header sync ends. This generic path is where it fires live: on the
+      ;; solicited Phase-1 path a batch either fails the anti-DoS gate and is
+      ;; ignored with no state update, or passes it and is therefore already at
+      ;; or above minimum-chain-work.
+      (when peer
+        (maybe-disconnect-low-work-outbound peer chain-state full-batch)))))
 
 (defun sync-headers (peer chain-state &key recent-rejects ctx utxo-set
                                            block-store fee-estimator)

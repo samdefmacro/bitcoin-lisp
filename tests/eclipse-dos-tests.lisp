@@ -418,3 +418,111 @@ getheaders and stages availability, committing nothing."
           (is (= 0 added))
           (is (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash))
               "an unconnecting header must not enter the index"))))))
+
+;;;; ============================================================
+;;;; G7-18: drop outbound peers on sub-minchainwork chains during IBD
+;;;; ============================================================
+
+(defun %g718-state-with-work (work)
+  "A chain-state holding one header entry with WORK chain-work, and a peer
+whose best-known block is that entry."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 21)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash hash :height 1 :chain-work work :status :header-valid))
+    (values state hash)))
+
+(defun %g718-peer (&key (conn-type :outbound-full-relay) inbound manual best-hash)
+  (let ((p (bitcoin-lisp.networking:make-peer :inbound inbound)))
+    (setf (bitcoin-lisp.networking:peer-conn-type p) conn-type
+          (bitcoin-lisp.networking:peer-manual p) manual
+          (bitcoin-lisp.networking:peer-state p) :ready)
+    (when best-hash
+      (setf (bitcoin-lisp.networking::peer-best-known-block-hash p) best-hash))
+    p))
+
+(test g7-18-outbound-or-block-relay-predicate
+  "Core IsOutboundOrBlockRelayConn (net.h:771-785). Both halves matter: it must
+INCLUDE :block-relay, and it must EXCLUDE manual (-addnode) peers — ours are
+typed :outbound-full-relay, and connect-added-nodes redials them every ~30s, so
+a plain not-inbound test would loop connect/disconnect against a peer the
+operator pinned."
+  (is-true (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+            (%g718-peer :conn-type :outbound-full-relay)))
+  (is-true (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+            (%g718-peer :conn-type :block-relay))
+           ":block-relay must be included")
+  (is-false (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+             (%g718-peer :conn-type :outbound-full-relay :manual t))
+            "manual -addnode peers must be excluded")
+  (is-false (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+             (%g718-peer :conn-type :feeler)))
+  (is-false (bitcoin-lisp.networking:peer-outbound-or-block-relay-p
+             (%g718-peer :inbound t))))
+
+(test g7-18-low-work-outbound-disconnected-in-ibd
+  "G7-18: we refused to DOWNLOAD from a sub-minchainwork peer but never
+disconnected it, so a toy-chain peer could pin an outbound slot for the whole
+of IBD — a step toward IBD eclipse."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp:*minimum-chain-work-override* 1000))
+    (multiple-value-bind (state hash) (%g718-state-with-work 10)
+      ;; Low work + non-full batch + outbound + IBD => dropped.
+      (let ((p (%g718-peer :best-hash hash)))
+        (is-true (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+                  p state nil))
+        (is (eq :disconnected (bitcoin-lisp.networking:peer-state p))))
+      ;; A FULL batch means more headers may follow — we have not seen their
+      ;; tip yet, so we must not judge them.
+      (let ((p (%g718-peer :best-hash hash)))
+        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+                   p state t)
+                  "a full batch must not trigger the drop"))
+      ;; Manual and inbound peers are exempt.
+      (let ((p (%g718-peer :best-hash hash :manual t)))
+        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+                   p state nil)
+                  "manual peers must never be auto-dropped"))
+      (let ((p (%g718-peer :best-hash hash :inbound t)))
+        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+                   p state nil)))
+      ;; A peer that never announced anything is never judged (Core :2930).
+      (let ((p (%g718-peer)))
+        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+                   p state nil)
+                  "a peer with no best-known block must not be judged")))))
+
+(test g7-18-minimum-chain-work-comparison-is-strict
+  "The comparison is STRICTLY less than minimum-chain-work: a peer whose chain
+exactly meets the floor is kept. (The obvious version of this test — pointing a
+FRESH peer at a raised floor — asserts nothing, because a fresh peer has no
+best-known block and is skipped for that reason rather than the work one.)"
+  (let ((bitcoin-lisp:*network* :regtest))
+    ;; Work exactly equal to the floor: kept.
+    (multiple-value-bind (state hash) (%g718-state-with-work 1000)
+      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+            (p (%g718-peer :best-hash hash)))
+        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+                   p state nil)
+                  "equal work must be kept, not dropped")
+        (is (eq :ready (bitcoin-lisp.networking:peer-state p)))))
+    ;; One unit below the floor: dropped.
+    (multiple-value-bind (state hash) (%g718-state-with-work 999)
+      (let ((bitcoin-lisp:*minimum-chain-work-override* 1000)
+            (p (%g718-peer :best-hash hash)))
+        (is-true (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+                  p state nil))))))
+
+(test g7-18-not-applied-outside-ibd
+  "Past IBD the rule does not apply — a peer on a short chain is no longer
+occupying a slot we need for syncing."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp:*minimum-chain-work-override* 1000))
+    (multiple-value-bind (state hash) (%g718-state-with-work 10)
+      ;; Force the IBD latch off for this check.
+      (let ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+            (p (%g718-peer :best-hash hash)))
+        (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
+                   p state nil)
+                  "outside IBD the peer must be kept")))))
