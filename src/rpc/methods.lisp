@@ -638,6 +638,13 @@ Divergences: startingheight is always present (Core hides it behind
 per-peer last-common-block cursor — -1 is Core's \"unknown\" value);
 last_block stamps every block received (Core stamps only NEW blocks)."
   (declare (ignore params))
+  ;; Core builds a UniValue VARR, so a node with no peers answers [] — a bare
+  ;; NIL list would encode as null.
+  (json-array (%peerinfo-rows node)))
+
+(defun %peerinfo-rows (node)
+  "One getpeerinfo row (a field alist) per connected peer — the body of Core's
+getpeerinfo loop, rpc/net.cpp:107-227."
   (let ((peers (rpc-get-peers node))
         (chain-state (rpc-get-chain-state node))
         (now (get-internal-real-time)))
@@ -810,7 +817,9 @@ last_block stamps every block received (Core stamps only NEW blocks)."
                       ("reachable" . t))))
       ("relayfee" . ,relayfee)
       ("incrementalfee" . ,incfee)
-      ("localaddresses" . ())
+      ;; We record no local addresses, so this is Core's empty VARR — [], not
+      ;; null (a bare NIL encodes as null).
+      ("localaddresses" . #())
       ("warnings" . #()))))
 
 (defun rpc-getconnectioncount (node params)
@@ -876,7 +885,8 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
                      (t (%orphan-tx-json tx from t)))
                    result)))
          (bitcoin-lisp.mempool::orphan-pool-by-wtxid pool))))
-    (nreverse result)))
+    ;; Core returns a UniValue VARR: an empty orphanage is [], not null.
+    (json-array (nreverse result))))
 
 (defun rpc-getmempoolinfo (node params)
   "Return mempool statistics."
@@ -942,14 +952,17 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
     ;; add/evict/reorg mutations (Core getrawmempool takes pool.cs).
     (with-node-lock (node)
      (cond
-      ((null mempool) (if verbose '() '()))
+      ;; Empty (or absent) mempool: Core still answers with a collection of
+      ;; the right shape — a VOBJ ({}) when verbose, a VARR ([]) otherwise.
+      ;; A bare NIL would encode as null.
+      ((null mempool) (if verbose (json-object nil) (json-array nil)))
       ((not verbose)
        (let ((ids '()))
          (bitcoin-lisp.mempool:mempool-for-each
           mempool (lambda (txid entry)
                     (declare (ignore entry))
                     (push (hash-to-hex txid) ids)))
-         (nreverse ids)))
+         (json-array (nreverse ids))))
       (t
        ;; Verbose: an alist (txid -> field-alist); the RPC normalizer turns it
        ;; into nested JSON objects.
@@ -959,7 +972,7 @@ detail objects, 2 the detail objects plus each transaction's raw hex."
           (lambda (txid entry)
             (push (cons (hash-to-hex txid) (%mempool-entry-fields mempool txid entry))
                   result)))
-         result))))))
+         (json-object result)))))))
 
 (defun %mempool-entry-fields (mempool txid entry)
   "The verbose field alist for one mempool ENTRY (TXID) — vsize/weight/time/
@@ -1047,7 +1060,8 @@ entry), erroring if malformed or not in the mempool."
 
 (defun %mempool-set->result (mempool txid-set verbose)
   "Format a hash-set of mempool txids as either an array of (big-endian) txid hex
-strings or, when VERBOSE, an alist of txid-hex -> entry fields."
+strings or, when VERBOSE, an alist of txid-hex -> entry fields. An empty set is
+Core's empty VARR/VOBJ ([] / {}), never null."
   (let ((result '()))
     (maphash (lambda (txid v) (declare (ignore v))
                (let ((entry (bitcoin-lisp.mempool:mempool-get mempool txid)))
@@ -1057,7 +1071,7 @@ strings or, when VERBOSE, an alist of txid-hex -> entry fields."
                              (hash-to-hex txid))
                          result))))
              txid-set)
-    result))
+    (if verbose (json-object result) (json-array result))))
 
 (defun rpc-getmempoolancestors (node params)
   "Return the in-mempool ancestors of TXID (Bitcoin Core getmempoolancestors).
@@ -1443,14 +1457,16 @@ getnodeaddresses). PARAMS: ([count]) — max addresses (default 1; 0 = all)."
          ;; count=0 => all known addresses; count>0 => up to that many.
          (limited (and book (bitcoin-lisp.networking:address-book-get-addr
                              book :max (max count 0) :pct 100))))
-    (mapcar
-     (lambda (pa)
-       `(("time" . ,(bitcoin-lisp.networking:peer-address-last-seen pa))
-         ("services" . ,(bitcoin-lisp.networking:peer-address-services pa))
-         ("address" . ,(bitcoin-lisp.networking:peer-address-string pa))
-         ("port" . ,(bitcoin-lisp.networking:peer-address-port pa))
-         ("network" . ,(or (%addrman-network-name pa) "unroutable"))))
-     limited)))
+    ;; Core pushes a VARR: an empty address book is [], not null.
+    (json-array
+     (mapcar
+      (lambda (pa)
+        `(("time" . ,(bitcoin-lisp.networking:peer-address-last-seen pa))
+          ("services" . ,(bitcoin-lisp.networking:peer-address-services pa))
+          ("address" . ,(bitcoin-lisp.networking:peer-address-string pa))
+          ("port" . ,(bitcoin-lisp.networking:peer-address-port pa))
+          ("network" . ,(or (%addrman-network-name pa) "unroutable"))))
+      limited))))
 
 (defun %addrman-network-name (pa)
   "Network bucket name (Bitcoin Core GetNetworkName) for a peer-address PA, or
@@ -1540,21 +1556,26 @@ was never added). Returns an array of {addednode, connected, addresses}."
           (error 'rpc-error :code +rpc-client-node-not-added+
                             :message "Error: Node has not been added."))
         (setf added (list filter)))
-      (mapcar
-       (lambda (spec)
-         (let* ((host (bitcoin-lisp::parse-node-endpoint node spec))
-                (peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-                        (find host (bitcoin-lisp::node-peers node)
-                              :key #'bitcoin-lisp.networking:peer-address :test #'string=))))
-           `(("addednode" . ,spec)
-             ("connected" . ,(json-bool peer))
-             ;; List (not vector): rpc-result->json recurses into lists to
-             ;; normalize the nested address object; NIL renders as the empty set.
-             ("addresses" . ,(when peer
-                               (list `(("address" . ,(bitcoin-lisp.networking:peer-address peer))
-                                       ("connected" . ,(if (bitcoin-lisp.networking::peer-inbound peer)
-                                                           "inbound" "outbound")))))))))
-       added))))
+      ;; Core pushes a VARR: no added nodes is [], not null.
+      (json-array
+       (mapcar
+        (lambda (spec)
+          (let* ((host (bitcoin-lisp::parse-node-endpoint node spec))
+                 (peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                         (find host (bitcoin-lisp::node-peers node)
+                               :key #'bitcoin-lisp.networking:peer-address :test #'string=))))
+            `(("addednode" . ,spec)
+              ("connected" . ,(json-bool peer))
+              ;; A list (not a vector) when populated, so rpc-result->json
+              ;; recurses into it and normalizes the nested address object;
+              ;; json-array renders the disconnected case as [], not null.
+              ("addresses"
+               . ,(json-array
+                   (when peer
+                     (list `(("address" . ,(bitcoin-lisp.networking:peer-address peer))
+                             ("connected" . ,(if (bitcoin-lisp.networking::peer-inbound peer)
+                                                 "inbound" "outbound"))))))))))
+        added)))))
 
 (defun %set-network-active (node state)
   "Flip the node's network-active flag (Core CConnman::SetNetworkActive).
@@ -1708,11 +1729,13 @@ subnet syntax is rejected as invalid. Returns null."
 (defun rpc-listbanned (node params)
   "List active manual bans (Bitcoin Core listbanned)."
   (declare (ignore node params))
-  (mapcar (lambda (ban)
-            `(("address" . ,(car ban))
-              ("banned_until" . ,(- (cdr ban)
-                                    bitcoin-lisp.serialization:+universal-unix-epoch-offset+))))
-          (bitcoin-lisp.networking:list-bans)))
+  ;; Core pushes a VARR: no bans is [], not null.
+  (json-array
+   (mapcar (lambda (ban)
+             `(("address" . ,(car ban))
+               ("banned_until" . ,(- (cdr ban)
+                                     bitcoin-lisp.serialization:+universal-unix-epoch-offset+))))
+           (bitcoin-lisp.networking:list-bans))))
 
 (defun rpc-clearbanned (node params)
   "Clear all manual bans (Bitcoin Core clearbanned). Returns null."
@@ -2602,7 +2625,8 @@ mirroring Core."
                     ("txouts" . ,count)
                     ("height" . ,tip-height)
                     ("bestblock" . ,(if best-hash (hash-to-hex best-hash) ""))
-                    ("unspents" . ,(nreverse unspents))
+                    ;; Core pushes a VARR: no matches is [], not null.
+                    ("unspents" . ,(json-array (nreverse unspents)))
                     ("total_amount" . ,(/ total-amount 100000000.0d0)))))
            (%release-txoutset-scan))))
       (t
