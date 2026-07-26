@@ -707,3 +707,108 @@ protocol rule."
       (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
           "record-misbehavior must give the slot back")
       (is-false (bitcoin-lisp.networking::peer-chain-sync-protect peer)))))
+
+(test g7-08-retired-peers-are-never-granted-protection
+  "Core guards the grant with `!pfrom.fDisconnect` (net_processing.cpp:2951):
+a peer it has already decided to retire must never be handed a protection
+slot. Ours is PEER-LIVE-P.
+
+This is the leak from the other end. A retirement releases the slot, but it
+only ever happens ONCE — replace-disconnected-peers reaps :disconnected peers
+straight out of node-peers with no release, and never reaps :banned peers at
+all — so a slot granted AFTER the retirement is never given back. Four of them
+exhaust every slot for the life of the process and no peer can be protected
+again, which is precisely the state P2 exists to prevent."
+  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+    ;; Control: an identical, still-live peer IS granted.
+    (let ((live (%g708-peer)))
+      (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer live)
+               "a live outbound full-relay peer must still be granted")
+      (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)))
+    ;; Retired through the real DISCONNECT-PEER.
+    (let ((dead (%g708-peer)))
+      (bitcoin-lisp.networking:disconnect-peer dead)
+      (is (eq :disconnected (bitcoin-lisp.networking:peer-state dead))
+          "precondition: the peer really is retired")
+      (is-false (bitcoin-lisp.networking:peer-live-p dead))
+      (is-false (bitcoin-lisp.networking:maybe-protect-outbound-peer dead)
+                "a :disconnected peer must never be granted a slot")
+      (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)
+          "a refused grant must leave the counter untouched")
+      (is-false (bitcoin-lisp.networking::peer-chain-sync-protect dead)
+                "and must not set the per-peer flag"))
+    ;; Retired through the real BAN-PEER. Worse than :disconnected: nothing
+    ;; ever reaps a banned peer, so a slot granted here is lost outright.
+    (let ((banned (%g708-peer :address "198.51.100.78")))
+      (unwind-protect
+           (progn
+             (bitcoin-lisp.networking:ban-peer banned)
+             (is (eq :banned (bitcoin-lisp.networking:peer-state banned))
+                 "precondition: the peer really is banned")
+             (is-false (bitcoin-lisp.networking:peer-live-p banned))
+             (is-false (bitcoin-lisp.networking:maybe-protect-outbound-peer banned)
+                       "a :banned peer must never be granted a slot")
+             (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)
+                 "a refused grant must leave the counter untouched")
+             (is-false (bitcoin-lisp.networking::peer-chain-sync-protect banned)))
+        ;; ban-peer writes the process-global ban list; put it back.
+        (bitcoin-lisp.networking:unban-address "198.51.100.78")))))
+
+(test g7-08-headers-from-a-retired-peer-do-not-grant-protection
+  "The same refusal through the PRODUCTION path — ingest-headers-from-peer ->
+%store-validated-headers, which is where the grant actually fires. Asserting
+it on the bare predicate is not enough: the hazard is an ordering one.
+
+Core runs the sub-minchainwork drop (net_processing.cpp:2926-2944)
+immediately BEFORE the grant (:2946-2956), in the same function, on the same
+peer — which is exactly why the grant carries !fDisconnect. Move our low-work
+drop to the matching position and the sequence becomes drop -> disconnect-peer
+-> release (counter--), then a re-grant on the corpse (counter++, forever).
+During IBD the two conditions overlap in the common case: a peer whose
+best-known beats our low tip but misses the work floor is both droppable and
+protectable.
+
+The header batch is byte-identical in all three runs and every run stores it,
+so the only thing that differs is the peer's liveness."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp.storage:*pow-limit-target*
+          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+    (flet ((ingest (dir peer)
+             ;; A fresh genesis-only regtest index, one valid header off it.
+             ;; Its chain-work lands above the tip's, so the grant condition
+             ;; (best-known >= tip) holds for whichever peer delivers it.
+             (multiple-value-bind (state genesis-hash) (%regtest-chain-state dir)
+               (let ((bitcoin-lisp::*minimum-chain-work-override* 0))
+                 (bitcoin-lisp.networking::ingest-headers-from-peer
+                  peer (list (%pow-header genesis-hash)) state)))))
+      ;; Control: a live peer earns protection from this batch.
+      (let ((bitcoin-lisp.networking::*protected-outbound-count* 0)
+            (peer (%g708-peer)))
+        (is (= 1 (ingest "test-g708-live/" peer))
+            "control: the batch must actually be stored")
+        (is-true (bitcoin-lisp.networking::peer-chain-sync-protect peer)
+                 "a live peer delivering a chain at least as good as our tip is protected")
+        (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)))
+      ;; Same batch, peer already retired by disconnect-peer.
+      (let ((bitcoin-lisp.networking::*protected-outbound-count* 0)
+            (peer (%g708-peer)))
+        (bitcoin-lisp.networking:disconnect-peer peer)
+        (is (= 1 (ingest "test-g708-dead/" peer))
+            "the batch is still processed — the peer is what changed")
+        (is-false (bitcoin-lisp.networking::peer-chain-sync-protect peer)
+                  "a retired peer must not be protected by the headers path")
+        (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
+            "and the counter must not move"))
+      ;; Same batch, peer already banned.
+      (let ((bitcoin-lisp.networking::*protected-outbound-count* 0)
+            (peer (%g708-peer :address "198.51.100.79")))
+        (unwind-protect
+             (progn
+               (bitcoin-lisp.networking:ban-peer peer)
+               (is (= 1 (ingest "test-g708-banned/" peer))
+                   "the batch is still processed — the peer is what changed")
+               (is-false (bitcoin-lisp.networking::peer-chain-sync-protect peer)
+                         "a banned peer must not be protected by the headers path")
+               (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
+                   "and the counter must not move"))
+          (bitcoin-lisp.networking:unban-address "198.51.100.79"))))))

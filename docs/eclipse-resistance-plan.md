@@ -131,6 +131,28 @@ weaken this feature, it inverts it: during IBD any caught-up peer trivially
 satisfies `best-known >= tip`, so all 4 slots are spent within minutes of
 startup and, once those peers churn out, no peer can ever be protected again.
 
+The grant carries Core's `!pfrom.fDisconnect` guard (net_processing.cpp:2951) as
+`peer-live-p` — a peer already in `:disconnected` or `:banned` is refused. This
+is the same leak from the other end: a retirement releases the slot, but it only
+happens once (`replace-disconnected-peers` reaps `:disconnected` peers out of
+`node-peers` with no release of its own, and never reaps `:banned` peers at
+all), so a grant made *after* the retirement is never given back. Core needs the
+guard because the sub-minchainwork drop (`:2926-2944`) sets `fDisconnect` a few
+lines above the grant, on the same peer, in the same pass — and during IBD the
+two conditions overlap in the common case of a peer whose best-known beats our
+low tip but misses the work floor. G7-18's drop belongs in that same position
+(`UpdatePeerStateForReceivedHeaders`), so the guard must be in place before it
+moves there, independent of merge order.
+
+With that guard, no slot can be stranded. A grant requires a live peer;
+`:disconnected` / `:banned` are set at exactly three places (`disconnect-peer`,
+`record-misbehavior`, `ban-peer`), each of which releases immediately and
+unconditionally in the same function, ahead of any error-prone work; and every
+`node-peers` removal (`node.lisp:427`, `:479`, `:2805`, `:3242`, `:3266`) either
+calls `disconnect-peer` itself or reaps a peer already in `:disconnected`, i.e.
+one that has already released. Membership in `node-peers` is not what the
+accounting depends on.
+
 ### P3 — stale tip and extra outbound
 
 `CheckForStaleTipAndEvictPeers` on a 45s cadence in `maintain-peers`:
