@@ -406,28 +406,21 @@ one. Uses the same 9-input/2-output vector tx at an out-of-range index."
   "OP_PUSHDATA2 pushing N filler bytes."
   (tap-bytes #x4d (ldb (byte 8 0) n) (ldb (byte 8 8) n) (tap-filler n)))
 
-(defun tapscript-leaf-witness (leaf-script &key inputs annex)
-  "Build (values witness output-pubkey32) for a script-path spend of LEAF-SCRIPT
-as the single leaf (version 0xc0) of a taproot output, with INPUTS as the initial
-witness stack and an optional ANNEX as the final witness element."
+(defun tapscript-leaf-spend (leaf-script &key inputs annex)
+  "Validate a script-path spend of LEAF-SCRIPT as the single leaf (version 0xc0)
+of a taproot output, with INPUTS as the initial witness stack and an optional
+ANNEX as the final witness element. Returns (values ok err)."
   (let* ((internal (bitcoin-lisp.crypto:derive-xonly-pubkey
                     (make-array 32 :element-type '(unsigned-byte 8)
                                    :initial-element #x03)))
          (leaf-hash (bitcoin-lisp.crypto:tap-leaf-hash #xc0 leaf-script)))
     (multiple-value-bind (output-key parity)
         (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey internal leaf-hash)
-      (values (append inputs
-                      (list leaf-script
-                            (tap-bytes (logior #xc0 parity) internal))
-                      (and annex (list annex)))
-              output-key))))
-
-(defun tapscript-leaf-spend (leaf-script &key inputs annex (amount 100000))
-  "Validate the script-path spend built by TAPSCRIPT-LEAF-WITNESS.
-Returns (values ok err)."
-  (multiple-value-bind (witness output-key)
-      (tapscript-leaf-witness leaf-script :inputs inputs :annex annex)
-    (bitcoin-lisp.coalton.interop:validate-taproot witness output-key amount)))
+      (bitcoin-lisp.coalton.interop:validate-taproot
+       (append inputs
+               (list leaf-script (tap-bytes (logior #xc0 parity) internal))
+               (and annex (list annex)))
+       output-key 100000))))
 
 (test ga8-s1-3-tapscript-keeps-the-520-byte-push-cap
   "S1-3: a push over 520 bytes inside a tapscript is SCRIPT_ERR_PUSH_SIZE. BIP 342
@@ -491,3 +484,60 @@ OP_SUCCESS opcode — which is what pins the new checks after the scan."
     (is (eq t (tapscript-leaf-spend
                (tap-bytes op-success)
                :inputs (make-list 1001 :initial-element (tap-filler 1)))))))
+
+;;;; ============================================================
+;;;; GA8 annex in the tapscript validation-weight budget (S1-4)
+;;;; ============================================================
+
+(defun tapscript-weight-probe-script (k)
+  "A leaf script costing exactly K tapscript sigops and nothing else. Each
+CHECKSIG pairs a non-empty (invalid) signature with a 33-byte upgradable public
+key: Core charges VALIDATION_WEIGHT_PER_SIGOP_PASSED for any non-empty signature
+and the upgradable-pubkey branch leaves success true, so an exhausted budget is
+the only way such a spend can fail."
+  (tap-bytes #x0a (tap-filler 10)                              ; <sig>
+             #x21 (tap-filler 33)                              ; <pubkey>
+             (loop repeat k append (list #x6e #xac #x75))      ; OP_2DUP CHECKSIG DROP
+             #x6d #x51))                                       ; OP_2DROP OP_1
+
+(defun tapscript-annex (n)
+  "An N-byte annex: a final witness element carrying the 0x50 prefix (BIP 341)."
+  (tap-bytes #x50 (tap-filler (1- n))))
+
+(defun captured-initial-tapscript-weight (leaf-script &key annex)
+  "The initial *TAPSCRIPT-VALIDATION-WEIGHT-LEFT* that VALIDATE-TAPROOT computes
+for this spend, read out of the production path by stubbing RUN-TAPSCRIPT.
+Returns :NEVER-CALLED if the spend never reached tapscript execution."
+  (let ((captured :never-called)
+        (original (fdefinition 'bitcoin-lisp.coalton.interop::run-tapscript)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bitcoin-lisp.coalton.interop::run-tapscript)
+                 (lambda (&rest ignored)
+                   (declare (ignore ignored))
+                   (setf captured
+                         bitcoin-lisp.coalton.interop::*tapscript-validation-weight-left*)
+                   (values t nil)))
+           (tapscript-leaf-spend leaf-script :annex annex))
+      (setf (fdefinition 'bitcoin-lisp.coalton.interop::run-tapscript) original))
+    captured))
+
+(test ga8-s1-4-annex-counts-toward-the-validation-weight-budget
+  "S1-4: the BIP 342 budget is GetSerializeSize(witness.stack) +
+VALIDATION_WEIGHT_OFFSET (interpreter.cpp:1979), computed over the witness as it
+arrived — Core's annex, control-block and script pops are SpanPopBack on a view
+(span.h:73-81) and never shrink witness.stack. We computed it after stripping the
+annex, leaving the budget short by CompactSize(len) + len and rejecting spends
+Core accepts. No existing test covers budget initialisation: the tests above bind
+*tapscript-validation-weight-left* directly."
+  (let* ((script (tapscript-weight-probe-script 3))   ; 3 sigops = 150 weight
+         (annex (tapscript-annex 8)))
+    ;; Byte-exact budgets: 3 sigops fit only once the 8-byte annex is counted.
+    (is (= 142 (captured-initial-tapscript-weight script)))
+    (is (= 151 (captured-initial-tapscript-weight script :annex annex)))
+    ;; The same spends through the real interpreter.
+    (is (null (tapscript-leaf-spend script)))
+    (is (eq t (tapscript-leaf-spend script :annex annex)))
+    ;; Control: one sigop cheaper fits without any annex, so the rejection above
+    ;; is the budget and not the script mechanics.
+    (is (eq t (tapscript-leaf-spend (tapscript-weight-probe-script 2))))))
