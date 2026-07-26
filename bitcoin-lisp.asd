@@ -249,6 +249,9 @@
                              ;; Wave 10: RPC boolean/error-code parity, HTTP
                              ;; layer, BIP64 getutxos, config wires, arg
                              ;; handling, banlist persistence
-                             (:file "wave10-tests"))))
+                             (:file "wave10-tests")
+                             ;; GA8 W1-A: intra-block coin overlay (chained-spend
+                             ;; script validation + same-block double spends)
+                             (:file "intrablock-coins-tests"))))
   :perform (test-op (op c)
                     (symbol-call :fiveam :run! :bitcoin-lisp-tests)))
