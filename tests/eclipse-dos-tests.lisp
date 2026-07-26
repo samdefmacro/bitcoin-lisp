@@ -546,8 +546,9 @@ claim as its best-known."
     (bitcoin-lisp.storage:update-chain-tip state tip-hash 100)
     (values state tip-hash low-hash)))
 
-(defun %g708-peer (&key (conn-type :outbound-full-relay) inbound manual best-hash protect)
-  (let ((p (bitcoin-lisp.networking:make-peer :inbound inbound :address "test")))
+(defun %g708-peer (&key (conn-type :outbound-full-relay) inbound manual best-hash protect
+                        (address "test"))
+  (let ((p (bitcoin-lisp.networking:make-peer :inbound inbound :address address)))
     (setf (bitcoin-lisp.networking:peer-conn-type p) conn-type
           (bitcoin-lisp.networking:peer-manual p) manual
           (bitcoin-lisp.networking:peer-state p) :ready
@@ -637,3 +638,72 @@ outbound FULL-RELAY peers; block-relay peers are deliberately never protected."
       (is (null (bitcoin-lisp.networking:maybe-protect-outbound-peer
                  (%g708-peer :conn-type :block-relay)))
           "block-relay peers must stay subject to the eviction logic"))))
+
+(test g7-08-outbound-churn-does-not-exhaust-the-protection-slots
+  "The PRODUCTION wiring: DISCONNECT-PEER itself must return the slot (Core
+FinalizeNode, net_processing.cpp:1717-1718). Calling RELEASE-OUTBOUND-PROTECTION
+by hand proves nothing about that — with no production releaser the counter only
+ever increments, so the first 4 outbound full-relay peers claim every slot within
+minutes of startup (during IBD a caught-up peer trivially satisfies best-known >=
+tip) and, once they churn out, NO later peer can ever be protected. That inverts
+P2 into a guarantee that every outbound peer is evictable."
+  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+    (let ((peers (loop repeat 4 collect (%g708-peer))))
+      (dolist (p peers)
+        (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer p)))
+      (is (= 4 bitcoin-lisp.networking::*protected-outbound-count*))
+      ;; All slots spent: a fifth peer cannot be protected yet.
+      (is-false (bitcoin-lisp.networking:maybe-protect-outbound-peer (%g708-peer))
+                "the cap must hold while all 4 slots are occupied")
+      ;; Normal churn: every peer retires through the real disconnect path.
+      (dolist (p peers) (bitcoin-lisp.networking:disconnect-peer p))
+      (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
+          "disconnect-peer must give every slot back")
+      (is (= 0 (count-if #'bitcoin-lisp.networking::peer-chain-sync-protect peers))
+          "no retired peer may still claim protection")
+      ;; The point of the whole exercise: peers dialed after the churn can still
+      ;; earn protection.
+      (let ((fresh (loop repeat 4 collect (%g708-peer))))
+        (dolist (p fresh)
+          (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer p)
+                   "a post-churn peer must still be able to earn protection"))
+        (is (= 4 bitcoin-lisp.networking::*protected-outbound-count*))))))
+
+(test g7-08-repeated-release-decrements-exactly-once
+  "A peer can be retired by more than one path (disconnected, then reaped; or
+misbehaving, then disconnected). The per-peer flag is the source of truth, so
+only the first release decrements — a double decrement would let us hand out
+more than the 4 slots Core allows, which is the same uncapped state the leak
+produced, only from the other direction."
+  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+    (let ((a (%g708-peer))
+          (b (%g708-peer)))
+      (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer a))
+      (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer b))
+      (is (= 2 bitcoin-lisp.networking::*protected-outbound-count*))
+      ;; Retire A three times over, two of them through the production path.
+      (bitcoin-lisp.networking:disconnect-peer a)
+      (bitcoin-lisp.networking:disconnect-peer a)
+      (bitcoin-lisp.networking:release-outbound-protection a)
+      ;; B still holds its slot: the count is 1, not 0 and not negative.
+      (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*)
+          "releasing one peer repeatedly must decrement exactly once")
+      (is-true (bitcoin-lisp.networking::peer-chain-sync-protect b)
+               "the other peer must keep its protection"))))
+
+(test g7-08-misbehavior-releases-the-protection-slot
+  "RECORD-MISBEHAVIOR retires a peer without going through DISCONNECT-PEER (it
+closes the connection and sets :disconnected itself), so it owes the slot back
+too — Core's FinalizeNode runs for every removal whatever the reason. Leaving
+this path out would leak a slot on every protected outbound peer that trips a
+protocol rule."
+  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+    ;; A dedicated address: record-misbehavior writes to the global discourage
+    ;; filter, and "test" is shared with the other helpers here.
+    (let ((peer (%g708-peer :address "198.51.100.77")))
+      (is-true (bitcoin-lisp.networking:maybe-protect-outbound-peer peer))
+      (is (= 1 bitcoin-lisp.networking::*protected-outbound-count*))
+      (bitcoin-lisp.networking:record-misbehavior peer "g7-08 slot release")
+      (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
+          "record-misbehavior must give the slot back")
+      (is-false (bitcoin-lisp.networking::peer-chain-sync-protect peer)))))

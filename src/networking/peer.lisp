@@ -330,6 +330,72 @@ Returns NIL if the host is banned or discouraged (never dial either)."
         (init-peer-rate-limiters peer)
         peer))))
 
+;;; --- Chain-sync protection slots (Core
+;;; m_outbound_peers_with_protect_from_disconnect) ---
+;;;
+;;; Lives here, next to DISCONNECT-PEER, rather than in ibd.lisp beside
+;;; CONSIDER-CHAIN-SYNC-EVICTION: the counter is peer-LIFECYCLE state, and
+;;; every path that retires a peer has to hand the slot back. ibd.lisp loads
+;;; after this file, so a release call there would be a forward reference and
+;;; the previous placement left the counter with no production releaser at all
+;;; — it only ever incremented, so after one round of outbound churn every
+;;; slot was permanently spent and no peer could earn protection again.
+
+(defconstant +max-outbound-peers-to-protect+ 4
+  "Core MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.")
+
+(defvar *protected-outbound-count* 0
+  "How many outbound peers currently hold chain-sync protection.")
+
+(defvar *outbound-protection-lock* (bt:make-lock "outbound-protection")
+  "Guards *PROTECTED-OUTBOUND-COUNT* and the per-peer flag together. Core keeps
+the counter under cs_main; we grant from the sync thread but release from the
+sync, listener, and RPC threads, so a check-then-increment without a lock can
+lose a release and re-create the leak this lock exists to prevent.")
+
+(defun maybe-protect-outbound-peer (peer)
+  "Grant chain-sync protection to an outbound FULL-RELAY peer that delivered a
+chain at least as good as our tip (Core net_processing.cpp:2946-2956), up to
+MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.
+
+Block-relay peers are deliberately NOT protected — Core keeps them always
+subject to the bad/lagging chain logic."
+  (bt:with-lock-held (*outbound-protection-lock*)
+    (when (and (not (peer-chain-sync-protect peer))
+               (not (peer-inbound peer))
+               (not (peer-manual peer))
+               (eq (peer-conn-type peer) :outbound-full-relay)
+               (< *protected-outbound-count* +max-outbound-peers-to-protect+))
+      (setf (peer-chain-sync-protect peer) t)
+      (incf *protected-outbound-count*)
+      t)))
+
+(defun release-outbound-protection (peer)
+  "Give back PEER's protection slot. Core's FinalizeNode
+(net_processing.cpp:1717-1718) does
+`m_outbound_peers_with_protect_from_disconnect -= state->m_chain_sync.m_protect`
+and then asserts the counter never went negative; FinalizeNode runs for every
+node removal whatever the reason, so every one of our retirement paths
+(DISCONNECT-PEER, RECORD-MISBEHAVIOR, BAN-PEER) calls this.
+
+The per-peer flag is the single source of truth, which makes a repeated release
+a no-op: without that, a peer retired twice (disconnected and then reaped, or
+misbehaving and then disconnected) would decrement twice and let us hand out
+more than MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT slots. Returns T iff a
+slot was actually returned."
+  (bt:with-lock-held (*outbound-protection-lock*)
+    (when (peer-chain-sync-protect peer)
+      (setf (peer-chain-sync-protect peer) nil)
+      ;; Core's assert(m_outbound_peers_with_protect_from_disconnect >= 0). The
+      ;; flag makes the else branch unreachable; if it ever runs the accounting
+      ;; is broken, so say so loudly and refuse to go negative rather than let a
+      ;; negative counter silently uncap protection.
+      (if (plusp *protected-outbound-count*)
+          (decf *protected-outbound-count*)
+          (bitcoin-lisp:log-warn
+           "Outbound protection counter underflow releasing peer ~A" (peer-address peer)))
+      t)))
+
 (defvar *peer-disconnect-hook* nil
   "When non-NIL, a function of one argument (the peer) called from
 DISCONNECT-PEER after the connection is torn down. protocol.lisp registers
@@ -342,6 +408,10 @@ a later-loaded file, so a direct call would be a forward reference.")
     (close-connection (peer-connection peer)))
   (setf (peer-state peer) :disconnected)
   (setf (peer-connection peer) nil)
+  ;; Hand back any chain-sync protection slot (Core FinalizeNode). Done before
+  ;; the hooks below, which are wrapped in IGNORE-ERRORS and must not be able
+  ;; to skip it.
+  (release-outbound-protection peer)
   ;; Drop any in-progress low-work headers sync with this peer (Core
   ;; FinalizeNode resets Peer state; the buffers die with the struct).
   (setf (peer-headers-sync peer) nil)
@@ -1108,11 +1178,17 @@ logged. Returns T."
     (close-connection (peer-connection peer))
     (setf (peer-connection peer) nil))
   (setf (peer-state peer) :disconnected)
+  ;; This retires the peer without going through DISCONNECT-PEER, so it owes
+  ;; the protection slot back itself (Core FinalizeNode runs for every removal,
+  ;; misbehaviour included).
+  (release-outbound-protection peer)
   t)
 
 (defun ban-peer (peer)
   "Ban a peer. Sets state to :banned and records ban expiry."
   (setf (peer-state peer) :banned)
+  ;; Another retirement path that bypasses DISCONNECT-PEER (Core FinalizeNode).
+  (release-outbound-protection peer)
   (let ((address (peer-address peer)))
     (when (and address (plusp (length address)))
       (bt:with-lock-held (*ban-lock*)
