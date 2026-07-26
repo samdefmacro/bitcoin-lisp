@@ -1167,6 +1167,9 @@
    #:peer-user-agent
    #:peer-ping-latency
    #:peer-inbound
+   #:release-outbound-protection
+   #:maybe-protect-outbound-peer
+   #:consider-chain-sync-eviction
    #:peer-manual
    #:peer-outbound-or-block-relay-p
    #:peer-conn-type

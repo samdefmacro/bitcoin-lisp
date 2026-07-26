@@ -2247,6 +2247,115 @@ isolated per peer so one dead socket cannot abort the sweep."
             peer
             (bitcoin-lisp.serialization:make-getheaders-message locator))))))))
 
+;;; --- Outbound chain-sync eviction (Core ConsiderEviction) ---
+;;;
+;;; An adversary, or simply a stuck set of peers, that fills our outbound slots
+;;; with live-but-SILENT peers can pin us on a stale tip indefinitely: they
+;;; answer pings, so nothing else evicts them. Core gives each such peer a
+;;; 20-minute budget to produce a chain at least as good as our tip, probes
+;;; once with a getheaders, and then drops it.
+
+(defconstant +chain-sync-timeout-seconds+ 1200
+  "Core CHAIN_SYNC_TIMEOUT (20min): how long an outbound peer may sit below
+our tip's work before we probe it.")
+
+(defconstant +headers-response-time-seconds+ 120
+  "Core HEADERS_RESPONSE_TIME (2min): the grace period after the probing
+getheaders. Total budget before a disconnect is 20min + 2min.")
+
+(defconstant +max-outbound-peers-to-protect+ 4
+  "Core MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.")
+
+(defvar *protected-outbound-count* 0
+  "How many outbound peers currently hold chain-sync protection.")
+
+(defun consider-chain-sync-eviction (peer chain-state now)
+  "Port of Core ConsiderEviction (net_processing.cpp:5292-5350). Returns
+:cleared, :armed, :probed, :disconnected, or NIL when the peer is not a
+candidate.
+
+Runs from maintain-peers, NOT from run-ibd's download loop: that loop does not
+run at tip, which is precisely where eclipse resistance matters.
+
+Silent throughout — no misbehaviour score, no discouragement. A peer on a worse
+chain is useless to us, not malicious."
+  (when (and (not (peer-chain-sync-protect peer))
+             (peer-outbound-or-block-relay-p peer)
+             (eq (peer-state peer) :ready))
+    (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+           (tip (and tip-hash (bitcoin-lisp.storage:get-block-index-entry
+                               chain-state tip-hash)))
+           (tip-work (and tip (bitcoin-lisp.storage:block-index-entry-chain-work tip)))
+           (best (and (peer-best-known-block-hash peer)
+                      (bitcoin-lisp.storage:get-block-index-entry
+                       chain-state (peer-best-known-block-hash peer))))
+           (best-work (and best (bitcoin-lisp.storage:block-index-entry-chain-work best))))
+      (cond
+        ;; A: the peer is at least as good as our tip — nothing to answer for.
+        ((and best-work tip-work (>= best-work tip-work))
+         (setf (peer-chain-sync-timeout peer) 0
+               (peer-chain-sync-work-header peer) nil
+               (peer-chain-sync-sent-getheaders peer) nil)
+         :cleared)
+        ;; B: arm, or RE-arm because the peer caught the benchmark we set last
+        ;; time while our tip has since advanced past it.
+        ((or (zerop (peer-chain-sync-timeout peer))
+             (let ((bench (and (peer-chain-sync-work-header peer)
+                               (bitcoin-lisp.storage:get-block-index-entry
+                                chain-state (peer-chain-sync-work-header peer)))))
+               (and bench best-work
+                    (>= best-work
+                        (bitcoin-lisp.storage:block-index-entry-chain-work bench)))))
+         (setf (peer-chain-sync-timeout peer) (+ now +chain-sync-timeout-seconds+)
+               (peer-chain-sync-work-header peer) tip-hash
+               (peer-chain-sync-sent-getheaders peer) nil)
+         :armed)
+        ;; C: armed and expired.
+        ((and (plusp (peer-chain-sync-timeout peer))
+              (> now (peer-chain-sync-timeout peer)))
+         (cond
+           ((peer-chain-sync-sent-getheaders peer)
+            (bitcoin-lisp:log-info "Peer ~A: outbound peer has old chain, disconnecting"
+                                   (peer-address peer))
+            (disconnect-peer peer)
+            :disconnected)
+           (t
+            ;; Probe once before dropping: ask from the parent of the benchmark
+            ;; so a peer that simply missed an announcement can answer.
+            (let* ((bench (and (peer-chain-sync-work-header peer)
+                               (bitcoin-lisp.storage:get-block-index-entry
+                                chain-state (peer-chain-sync-work-header peer))))
+                   (parent (and bench (bitcoin-lisp.storage:block-index-entry-prev-entry bench))))
+              (ignore-errors
+               (send-message peer (bitcoin-lisp.serialization:make-getheaders-message
+                                   (%locator-from-entry (or parent bench) chain-state)))))
+            (setf (peer-chain-sync-sent-getheaders peer) t
+                  (peer-chain-sync-timeout peer) (+ now +headers-response-time-seconds+))
+            :probed)))))))
+
+(defun maybe-protect-outbound-peer (peer)
+  "Grant chain-sync protection to an outbound FULL-RELAY peer that delivered a
+chain at least as good as our tip (Core net_processing.cpp:2946-2956), up to
+MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.
+
+Block-relay peers are deliberately NOT protected — Core keeps them always
+subject to the bad/lagging chain logic."
+  (when (and (not (peer-chain-sync-protect peer))
+             (not (peer-inbound peer))
+             (not (peer-manual peer))
+             (eq (peer-conn-type peer) :outbound-full-relay)
+             (< *protected-outbound-count* +max-outbound-peers-to-protect+))
+    (setf (peer-chain-sync-protect peer) t)
+    (incf *protected-outbound-count*)
+    t))
+
+(defun release-outbound-protection (peer)
+  "Give back a protection slot on disconnect. Core asserts the counter never
+goes negative; we clamp and keep the flag as the single source of truth."
+  (when (peer-chain-sync-protect peer)
+    (setf (peer-chain-sync-protect peer) nil)
+    (setf *protected-outbound-count* (max 0 (1- *protected-outbound-count*)))))
+
 (defun maybe-disconnect-low-work-outbound (peer chain-state full-batch)
   "Core's IBD chain-quality drop (net_processing.cpp:2926-2944): during IBD, a
 peer that has no more headers to give us and whose best-known chain has less
@@ -2323,7 +2432,20 @@ threads read/write under the same lock."
         (when (and peer pindex-last)
           (update-block-availability
            peer chain-state
-           (bitcoin-lisp.serialization:block-header-hash pindex-last))))
+           (bitcoin-lisp.serialization:block-header-hash pindex-last))
+          ;; Core net_processing.cpp:2946-2956: an outbound full-relay peer
+          ;; that delivers a chain at least as good as our tip earns
+          ;; protection from the chain-sync eviction logic.
+          (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+                 (tip (and tip-hash (bitcoin-lisp.storage:get-block-index-entry
+                                     chain-state tip-hash)))
+                 (best (and (peer-best-known-block-hash peer)
+                            (bitcoin-lisp.storage:get-block-index-entry
+                             chain-state (peer-best-known-block-hash peer)))))
+            (when (and tip best
+                       (>= (bitcoin-lisp.storage:block-index-entry-chain-work best)
+                           (bitcoin-lisp.storage:block-index-entry-chain-work tip)))
+              (maybe-protect-outbound-peer peer)))))
       (when (> added 0)
         (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added))
       added))))
