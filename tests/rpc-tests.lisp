@@ -2083,6 +2083,131 @@ the credential readable node-wide even with auth enforced."
                (is (null (probe-file (merge-pathnames ".cookie.tmp" dir))))))
         (bitcoin-lisp.rpc:stop-rpc-server)))))
 
+(defun %file-mode (path)
+  "The permission bits of PATH."
+  (logand #o777 (sb-posix:stat-mode (sb-posix:stat (namestring path)))))
+
+(test rpc-cookie-owner-only-under-a-permissive-umask
+  "0600 has to come from open(2), not from a chmod afterwards. Core gets it
+from a process-wide umask 0077 (common/system.cpp:92-93) so the cookie is
+owner-only from creation (GenerateAuthCookie, request.cpp:99-146); we set no
+process umask, so the mode must be passed to open. The live host runs umask
+002 — its .cookie files were 0664 — which is what this test reproduces."
+  (with-rpc-test-datadir (dir)
+    (let ((old-umask (sb-posix:umask #o002)))
+      (unwind-protect
+           (progn
+             ;; Premise check: without this the 0600 assertion below would pass
+             ;; on a strict ambient umask no matter what the cookie code does.
+             (let ((control (merge-pathnames "umask-control" dir)))
+               (with-open-file (s control :direction :output :if-does-not-exist :create)
+                 (write-string "x" s))
+               (is (= #o664 (%file-mode control))
+                   "test premise: under umask 002 an ordinary file is 0664, got ~O"
+                   (%file-mode control)))
+             (multiple-value-bind (path secret)
+                 (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+               (is (not (null path)))
+               (is (= #o600 (%file-mode path))
+                   "the cookie must be 0600 whatever the umask, got ~O" (%file-mode path))
+               (is (search secret (alexandria:read-file-into-string path)))
+               (is (null (probe-file (merge-pathnames ".cookie.tmp" dir))))))
+        (sb-posix:umask old-umask)))))
+
+(test rpc-cookie-never-written-into-a-file-we-did-not-create
+  "The secret must only ever be written into a file this process exclusively
+created. Chmod-after-write cannot deliver that: POSIX checks permissions at
+open(2) only, so a descriptor opened while .cookie.tmp still carries the
+umask's mode stays valid across the chmod and the rename, and inotify on the
+data directory makes that window deterministic on every node start. Both halves
+below are the same defect — WITH-OPEN-FILE :if-exists :supersede opens the
+EXISTING inode with O_TRUNC, and follows a symlink to do it."
+  (with-rpc-test-datadir (dir)
+    (let ((tmp (merge-pathnames ".cookie.tmp" dir)))
+      ;; (a) a planted regular file whose descriptor the attacker still holds
+      (with-open-file (s tmp :direction :output :if-does-not-exist :create)
+        (write-string "" s))
+      (sb-posix:chmod (namestring tmp) #o666)
+      (with-open-file (spy tmp :direction :input)
+        (multiple-value-bind (path secret) (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+          (is (not (null path)))
+          (is (not (null secret)))
+          (let ((seen (progn (file-position spy 0) (or (read-line spy nil nil) ""))))
+            (is (not (search secret seen))
+                "the secret was written into a pre-existing inode the attacker ~
+still holds open: ~S" seen))))
+      (when (probe-file (merge-pathnames ".cookie" dir))
+        (delete-file (merge-pathnames ".cookie" dir)))
+      ;; (b) a planted symlink: written through, and then RENAME moves the
+      ;; resolved target over .cookie
+      (let ((target (merge-pathnames "attacker-target" dir)))
+        (with-open-file (s target :direction :output :if-does-not-exist :create)
+          (write-string "" s))
+        (handler-case (sb-posix:unlink (namestring tmp)) (error () nil))
+        (sb-posix:symlink (namestring target) (namestring tmp))
+        (multiple-value-bind (path secret) (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+          (is (not (null path)))
+          ;; NB: keep this out of a 3-element (and a b) inside IS — FiveAM
+          ;; treats any 3-element form as (predicate expected actual) and
+          ;; evaluates both arguments, so the short-circuit is lost and a
+          ;; renamed-away target errors instead of failing.
+          (let ((leaked (if (probe-file target)
+                            (search secret (alexandria:read-file-into-string target))
+                            :target-renamed-over-cookie)))
+            (is (null leaked)
+                "the secret leaked through a planted .cookie.tmp symlink (~S)" leaked))
+          ;; and the cookie that did get installed is still usable and 0600
+          (is (search secret (alexandria:read-file-into-string path)))
+          (is (= #o600 (%file-mode path))))))))
+
+(test rpc-failed-start-does-not-clobber-a-live-cookie
+  "A start that cannot bind must leave .cookie alone. Core binds first —
+AppInitServers runs InitHTTPServer before StartHTTPRPC ->
+InitRPCAuthentication -> GenerateAuthCookie (init.cpp:748-761) — so a port
+conflict aborts before any credential is touched. Writing the cookie first
+means a second process started on a running node's data directory (which has
+happened here: restart-node.sh's pkill marker missed the live supervisor)
+overwrites .cookie with a secret matching nothing and then exits. The healthy
+node keeps serving with the old secret, so every client that re-reads the file
+gets 401 from a node that is perfectly fine, and nothing logs anything."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let* ((port 19993)
+           (node (make-test-node))
+           (cookie-file (merge-pathnames ".cookie" dir)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             ;; the healthy node: bound, cookie written, credential live
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             (let ((live-cookie (alexandria:read-file-into-string cookie-file))
+                   (live-user bitcoin-lisp.rpc::*rpc-user*)
+                   (live-pass bitcoin-lisp.rpc::*rpc-password*)
+                   (live-dispatch hunchentoot:*dispatch-table*))
+               (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
+               ;; the second process: same data directory, same port. The
+               ;; "already running" guard is per-process, so unbind it to reach
+               ;; the code a second process would run.
+               (let ((bitcoin-lisp.rpc::*rpc-server* nil))
+                 (is (null (bitcoin-lisp.rpc:start-rpc-server node :port port))
+                     "the second start must fail: the port is taken"))
+               ;; nothing about the running node changed
+               (let ((on-disk (and (probe-file cookie-file)
+                                   (alexandria:read-file-into-string cookie-file))))
+                 (is (equal live-cookie on-disk)
+                     "the failed start rewrote or removed .cookie under a live node")
+                 (is (equal live-user bitcoin-lisp.rpc::*rpc-user*))
+                 (is (equal live-pass bitcoin-lisp.rpc::*rpc-password*))
+                 (is (eq live-dispatch hunchentoot:*dispatch-table*)
+                     "the failed start leaked a dispatcher into hunchentoot:*dispatch-table*")
+                 (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
+                 ;; and a client reading .cookie off disk still gets in
+                 (let ((r (%http-post-rpc port "{\"method\":\"getblockcount\",\"id\":1}"
+                                          :auth (or on-disk "__cookie__:gone"))))
+                   (is (= 200 (%http-status r))
+                       "a client re-reading .cookie was locked out of a live node")))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
+
 (test rpc-requires-credentials-end-to-end
   "Live acceptor through rpc-handler: no Authorization header answers 401 with
 a WWW-Authenticate challenge, a wrong credential answers 401, and the generated
@@ -2134,6 +2259,29 @@ a listener that 401s everything."
          (progn
            (is (null (bitcoin-lisp.rpc:start-rpc-server node :port 19997)))
            (is (null bitcoin-lisp.rpc:*rpc-server*)))
+      (bitcoin-lisp.rpc:stop-rpc-server))))
+
+(test rpc-aborted-start-releases-the-listening-socket
+  "Binding before the credential means a start can now abort with a socket
+already open, so the abort path has to give the port back — otherwise one
+failed start would cost RPC until the process restarts. (Regression guard for
+the reorder, not a test of the pre-existing bug: the old order never reached a
+bind before giving up.)"
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (let ((port 19992)
+        (no-datadir-node (make-test-node)))
+    (is (null (bitcoin-lisp::node-data-directory no-datadir-node))
+        "fixture must have nowhere to write a cookie, or this test is vacuous")
+    (unwind-protect
+         (progn
+           ;; binds, then finds it has no credential to install, then aborts
+           (is (null (bitcoin-lisp.rpc:start-rpc-server no-datadir-node :port port)))
+           (is (null bitcoin-lisp.rpc:*rpc-server*))
+           (with-rpc-test-datadir (dir)
+             (let ((node (make-test-node)))
+               (setf (bitcoin-lisp::node-data-directory node) dir)
+               (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port)))
+                   "the aborted start leaked its listening socket"))))
       (bitcoin-lisp.rpc:stop-rpc-server))))
 
 (test rpc-bind-non-loopback-refused

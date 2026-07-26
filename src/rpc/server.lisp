@@ -404,21 +404,64 @@ pairs — so without this every object-returning RPC errors out."
 (Core's g_generated_cookie / DeleteAuthCookie, request.cpp:167-177). NIL when
 the credential came from -rpcuser/-rpcpassword instead.")
 
+(defun %write-cookie-file (namestring contents)
+  "Create NAMESTRING owner-only and write CONTENTS into it. The file must not
+exist and must not be a symlink, and it is 0600 from creation — never for one
+instant a mode the process umask chose.
+
+Core gets this from a process-wide umask 0077 (common/system.cpp:92-93), so its
+cookie is 0600 at open(2) and fs::permissions is only ever called for an
+explicit -rpccookieperms (request.cpp:99-146). We do not set a process umask, so
+the mode has to come from open(2) itself: creating the file under the ambient
+umask and chmod-ing afterwards leaves the secret world-readable while it is
+being written (the live host runs umask 002 — its cookies were 0664), and POSIX
+checks permissions only at open, so an fd opened in that window stays valid
+across the chmod and the rename.
+
+O_EXCL also means the secret is never written into a file we did not create:
+:if-exists :supersede opens the EXISTING inode with O_TRUNC (verified on SBCL
+2.6.5), so a planted .cookie.tmp — or a hard link to one — receives the secret,
+and O_NOFOLLOW additionally refuses a planted symlink, which would otherwise be
+written through and then renamed target-and-all over .cookie."
+  (let ((fd (sb-posix:open namestring
+                           (logior sb-posix:o-wronly sb-posix:o-creat
+                                   sb-posix:o-excl sb-posix:o-nofollow)
+                           #o600))
+        (stream nil))
+    (unwind-protect
+         (progn
+           ;; open(2) applies mode & ~umask, so the file is never MORE
+           ;; permissive than 0600; fchmod on our own fd (no path, no race)
+           ;; pins it to exactly 0600 even under a umask that strips owner bits.
+           (sb-posix:fchmod fd #o600)
+           (setf stream (sb-sys:make-fd-stream fd :output t :external-format :utf-8
+                                                  :name "rpc-cookie"))
+           (write-string contents stream)
+           (finish-output stream))
+      ;; CLOSE on an fd-stream closes the fd, so close exactly one of them.
+      (if stream (close stream) (sb-posix:close fd)))))
+
 (defun generate-rpc-cookie (data-directory)
   "Write <data-directory>/.cookie as \"__cookie__:<random>\" and return
 (values path secret), or NIL on failure. The file is the RPC credential, so it
-is made owner-only before it becomes reachable under its final name — Core
+is created owner-only and is never reachable under any other name — Core
 creates it under umask 0077 (request.cpp:99-146)."
   (handler-case
       (let* ((secret (ironclad:byte-array-to-hex-string (ironclad:random-data 32)))
              (path (merge-pathnames ".cookie" data-directory))
              (tmp (merge-pathnames ".cookie.tmp" data-directory)))
         (ensure-directories-exist path)
-        (with-open-file (s tmp :direction :output :if-exists :supersede
-                               :if-does-not-exist :create)
-          (format s "~A:~A" +rpc-cookie-user+ secret))
-        (sb-posix:chmod (namestring (truename tmp)) #o600)
-        (sb-posix:rename (namestring (truename tmp)) (namestring path))
+        ;; A .cookie.tmp left behind by a crash would make the exclusive create
+        ;; below fail on every later start; unlink drops the name (and a
+        ;; symlink itself, never its target). Losing the race to a file planted
+        ;; between the unlink and the open just fails the open, which aborts
+        ;; cookie generation instead of writing the secret somewhere chosen.
+        (handler-case (sb-posix:unlink (namestring tmp)) (error () nil))
+        (%write-cookie-file (namestring tmp)
+                            (format nil "~A:~A" +rpc-cookie-user+ secret))
+        ;; Rename the file we exclusively created — not (truename tmp), which
+        ;; would resolve a symlink and move its target over .cookie.
+        (sb-posix:rename (namestring tmp) (namestring path))
         (values path secret))
     (error (e)
       (bitcoin-lisp::node-log :warn "Could not write RPC cookie: ~A" e)
@@ -679,6 +722,31 @@ port stays on 127.0.0.1 rather than accepting connections from anywhere"
          (or bind "<any>"))
         "127.0.0.1")))
 
+(defun %install-rpc-credential (node user password)
+  "Install the single credential check-auth authorizes against and return T, or
+log and return NIL when there is none. Exactly one credential reaches the
+handler, as in Core's InitRPCAuthentication (httprpc.cpp:240-288): the cookie
+pair unless -rpcuser/-rpcpassword is configured.
+
+Callers must have bound the listening socket first — this writes .cookie, and
+.cookie is the live credential of whatever node owns the data directory."
+  (if (and user password)
+      (progn
+        (setf *rpc-user* user *rpc-password* password *rpc-cookie-path* nil)
+        t)
+      (multiple-value-bind (path secret)
+          (let ((data-directory (and node (bitcoin-lisp::node-data-directory node))))
+            (if data-directory (generate-rpc-cookie data-directory) (values nil nil)))
+        (cond (path
+               (setf *rpc-user* +rpc-cookie-user+ *rpc-password* secret
+                     *rpc-cookie-path* path)
+               t)
+              (t
+               (bitcoin-lisp::node-log
+                :error "RPC server not started: no -rpcuser/-rpcpassword and the ~
+.cookie file could not be written, so no request could be authorized")
+               nil)))))
+
 (defun start-rpc-server (node &key port (bind "127.0.0.1")
                                    user password
                                    rest-enabled
@@ -700,74 +768,111 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
       (return-from start-rpc-server nil))
     (setf bind (%rpc-bind-address bind))
 
-    ;; Install the credential the handler authorizes against. Exactly one
-    ;; reaches it, as in Core's InitRPCAuthentication (httprpc.cpp:262-288):
-    ;; the cookie is the credential unless rpcuser/rpcpassword is configured.
-    (if (and user password)
-        (setf *rpc-user* user *rpc-password* password *rpc-cookie-path* nil)
-        (multiple-value-bind (path secret)
-            (let ((data-directory (and node (bitcoin-lisp::node-data-directory node))))
-              (if data-directory (generate-rpc-cookie data-directory) (values nil nil)))
-          (unless path
-            (bitcoin-lisp::node-log
-             :error "RPC server not started: no -rpcuser/-rpcpassword and the ~
-.cookie file could not be written, so no request could be authorized")
-            (return-from start-rpc-server nil))
-          (setf *rpc-user* +rpc-cookie-user+ *rpc-password* secret
-                *rpc-cookie-path* path)))
+    ;; Bind the listening socket BEFORE touching any credential, the order Core
+    ;; uses: AppInitServers calls InitHTTPServer (which binds) and only then
+    ;; StartHTTPRPC -> InitRPCAuthentication -> GenerateAuthCookie
+    ;; (init.cpp:748-761), so a port conflict aborts before .cookie is written.
+    ;;
+    ;; Generating the cookie first is not a cosmetic difference: a second
+    ;; process started on a running node's data directory would overwrite
+    ;; .cookie with a secret matching nothing, then fail to bind and exit. The
+    ;; healthy node keeps serving with the old secret it holds in memory, so
+    ;; bitcoin-cli, the /ui/ SPA and every monitoring script that re-reads the
+    ;; file get 401 from a node that is perfectly fine — and the surviving
+    ;; process logs nothing, because nothing happened to it. (This has already
+    ;; happened here: restart-node.sh's pkill marker did not match the live
+    ;; supervisor and left two processes on one data directory.)
+    ;;
+    ;; Installing the credential after the bind is safe: until *rpc-user* is
+    ;; set check-auth returns NIL for every header, and the dispatchers are
+    ;; pushed last, so nothing can reach the handler at all in that window.
+    (let ((acceptor nil)
+          (listening nil)
+          (credential-installed nil)
+          (pushed '()))
+      (flet ((abort-start ()
+               ;; Undo only what THIS attempt did. A failure before the
+               ;; credential was installed must leave *rpc-user*, *rpc-password*
+               ;; and *rpc-cookie-path* alone: in a second process they are NIL,
+               ;; and in this one they may belong to a server already running.
+               (dolist (d pushed)
+                 (setf hunchentoot:*dispatch-table*
+                       (remove d hunchentoot:*dispatch-table*)))
+               (when pushed
+                 (setf *rpc-dispatcher* nil *rest-dispatcher* nil
+                       *ui-dispatcher* nil *ui-enabled* nil *ui-directory* nil))
+               (when listening
+                 (handler-case (hunchentoot:stop acceptor) (error () nil)))
+               (when credential-installed
+                 (delete-rpc-cookie)
+                 (setf *rpc-user* nil *rpc-password* nil *rpc-cookie-path* nil))
+               nil))
+        (handler-case
+            (progn
+              (setf acceptor (make-instance 'hunchentoot:easy-acceptor
+                                            :port port
+                                            :address bind))
+              (hunchentoot:start acceptor)
+              (setf listening t)
 
-    ;; Register methods
-    (register-all-methods)
+              ;; Bound. Now install the one credential the handler authorizes
+              ;; against (Core InitRPCAuthentication, httprpc.cpp:240-288).
+              (unless (%install-rpc-credential node user password)
+                (return-from start-rpc-server (abort-start)))
+              (setf credential-installed t)
 
-    ;; Initialize RPC rate limiter
-    (init-rpc-rate-limiter)
+              ;; Register methods
+              (register-all-methods)
 
-    ;; Set globals for handler
-    (setf *rpc-node* node)
+              ;; Initialize RPC rate limiter
+              (init-rpc-rate-limiter)
 
-    ;; Create and start server
-    (handler-case
-        (let ((acceptor (make-instance 'hunchentoot:easy-acceptor
-                                       :port port
-                                       :address bind)))
-          ;; Create and save dispatcher for cleanup
-          (let ((dispatcher (hunchentoot:create-prefix-dispatcher "/" 'rpc-dispatch-handler)))
-            (setf *rpc-dispatcher* dispatcher)
-            (push dispatcher hunchentoot:*dispatch-table*))
-          ;; REST GET surface under /rest/ — pushed AFTER the "/" dispatcher
-          ;; so it sits at the front of the list and matches first. Only when
-          ;; -rest is given (Core StartREST gate, init.cpp:758).
-          (when rest-enabled
-            (bitcoin-lisp::node-log :info "REST interface enabled at /rest/")
-            (let ((rest-dispatcher (hunchentoot:create-prefix-dispatcher
-                                    "/rest/" 'rest-dispatch-handler)))
-              (setf *rest-dispatcher* rest-dispatcher)
-              (push rest-dispatcher hunchentoot:*dispatch-table*)))
-          ;; Web UI static assets under /ui/ (gui-plan P0). Registered only
-          ;; when enabled — a disabled UI leaves no handler at all.
-          (setf *ui-enabled* (and ui-enabled t)
-                *ui-directory* (and ui-directory
-                                    (uiop:ensure-directory-pathname ui-directory)))
-          (when *ui-enabled*
-            (let ((dir (ui-directory)))
-              (if (and dir (probe-file dir))
-                  (bitcoin-lisp::node-log :info "Web UI enabled at /ui/ (serving ~A)" dir)
-                  (bitcoin-lisp::node-log
-                   :warn "Web UI enabled but asset directory ~A is missing — /ui/ will 404" dir)))
-            (let ((ui-dispatcher (make-ui-dispatcher)))
-              (setf *ui-dispatcher* ui-dispatcher)
-              (push ui-dispatcher hunchentoot:*dispatch-table*)))
+              ;; Set globals for handler
+              (setf *rpc-node* node)
 
-          (hunchentoot:start acceptor)
-          (setf *rpc-server* acceptor)
-          (bitcoin-lisp::node-log :info "RPC server started on ~A:~A" bind port)
-          acceptor)
-      (usocket:address-in-use-error ()
-        (bitcoin-lisp::node-log :error "RPC port ~A already in use, continuing without RPC" port)
-        nil)
-      (error (e)
-        (bitcoin-lisp::node-log :error "Failed to start RPC server: ~A" e)
-        nil))))
+              ;; Dispatchers go in LAST: pushing them into the global
+              ;; hunchentoot:*dispatch-table* is the step that makes requests
+              ;; reachable, and a failed start must not leak them (it used to
+              ;; leave *rpc-dispatcher* in the table when the bind threw).
+              (let ((dispatcher (hunchentoot:create-prefix-dispatcher "/" 'rpc-dispatch-handler)))
+                (setf *rpc-dispatcher* dispatcher)
+                (push dispatcher pushed)
+                (push dispatcher hunchentoot:*dispatch-table*))
+              ;; REST GET surface under /rest/ — pushed AFTER the "/" dispatcher
+              ;; so it sits at the front of the list and matches first. Only when
+              ;; -rest is given (Core StartREST gate, init.cpp:758).
+              (when rest-enabled
+                (bitcoin-lisp::node-log :info "REST interface enabled at /rest/")
+                (let ((rest-dispatcher (hunchentoot:create-prefix-dispatcher
+                                        "/rest/" 'rest-dispatch-handler)))
+                  (setf *rest-dispatcher* rest-dispatcher)
+                  (push rest-dispatcher pushed)
+                  (push rest-dispatcher hunchentoot:*dispatch-table*)))
+              ;; Web UI static assets under /ui/ (gui-plan P0). Registered only
+              ;; when enabled — a disabled UI leaves no handler at all.
+              (setf *ui-enabled* (and ui-enabled t)
+                    *ui-directory* (and ui-directory
+                                        (uiop:ensure-directory-pathname ui-directory)))
+              (when *ui-enabled*
+                (let ((dir (ui-directory)))
+                  (if (and dir (probe-file dir))
+                      (bitcoin-lisp::node-log :info "Web UI enabled at /ui/ (serving ~A)" dir)
+                      (bitcoin-lisp::node-log
+                       :warn "Web UI enabled but asset directory ~A is missing — /ui/ will 404" dir)))
+                (let ((ui-dispatcher (make-ui-dispatcher)))
+                  (setf *ui-dispatcher* ui-dispatcher)
+                  (push ui-dispatcher pushed)
+                  (push ui-dispatcher hunchentoot:*dispatch-table*)))
+
+              (setf *rpc-server* acceptor)
+              (bitcoin-lisp::node-log :info "RPC server started on ~A:~A" bind port)
+              acceptor)
+          (usocket:address-in-use-error ()
+            (bitcoin-lisp::node-log :error "RPC port ~A already in use, continuing without RPC" port)
+            (abort-start))
+          (error (e)
+            (bitcoin-lisp::node-log :error "Failed to start RPC server: ~A" e)
+            (abort-start)))))))
 
 (defun stop-rpc-server ()
   "Stop the RPC server."
