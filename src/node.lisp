@@ -961,6 +961,135 @@ before crash-recovery resolution (a torn snapshot flush joins
                        base-height)
              snap)))))))
 
+;;;; Shutdown coordination (Core's StartShutdown / WaitForShutdown split)
+;;;;
+;;;; Every internal stop path — the `stop` RPC, -stopatheight, the low-disk
+;;;; abort, a snapshot that fails background validation — runs on a NON-main
+;;;; thread, while the supervisor's watchdog runs on the main thread and exits
+;;;; the process shortly after it sees the node stop running. Calling stop-node
+;;;; from those threads is therefore a race with the process exit: stop-node
+;;;; clears node-running FIRST and does the chainstate flush, mempool.dat,
+;;;; peers.dat, banlist and wallet best-block markers AFTER, and sb-ext:exit
+;;;; unwinds other threads without waiting for them. At an idle tip the whole
+;;;; sequence takes about as long as one watchdog tick (a coin flip); mid-block,
+;;;; or with a large dirty coins cache, the kill is certain.
+;;;;
+;;;; Core has exactly this split: StartShutdown() only sets a token
+;;;; (shutdown/shutdown.cpp), the main thread's WaitForShutdown() returns, and
+;;;; Shutdown() then runs the entire teardown on the MAIN thread
+;;;; (bitcoind.cpp:180-193). We mirror it: internal paths call
+;;;; request-node-shutdown, run-node-watchdog (the main thread) runs stop-node
+;;;; itself and only exits once *shutdown-complete* is set — stop-node's final
+;;;; act.
+
+(defconstant +node-exit-clean+ 0
+  "Process exit code for a deliberate, completed stop (`stop` RPC, SIGTERM,
+-stopatheight). The supervisor must NOT respawn on this.")
+
+(defconstant +node-exit-error+ 1
+  "Process exit code for a deterministic failure (bad config, unrecoverable
+chainstate, disk space): respawning immediately just spins on it.")
+
+(defconstant +node-exit-watchdog+ 7
+  "Process exit code when the node stopped running without being asked to
+(fatal snapshot, crashed sync thread): the supervisor should respawn.")
+
+(defvar *shutdown-request* nil
+  "NIL, or the pending shutdown request as (REASON . EXIT-CODE). Written
+exactly once per run by request-node-shutdown, via CAS rather than a lock so
+it is safe to call from a signal handler (a lock could deadlock against the
+thread the signal interrupted). One cell, so a reader never sees a reason
+without its exit code.")
+
+(defvar *shutdown-complete* nil
+  "Set by stop-node as its FINAL act, after the chainstate flush, mempool.dat,
+peers.dat, banlist and wallet markers are on disk. The watchdog waits for this
+before exiting the process; a concurrent stop-node caller waits on it too.")
+
+(defvar *stop-node-in-progress* nil
+  "CAS latch: T while one thread is inside stop-node's teardown. stop-node is
+otherwise not concurrent-safe — two overlapping runs would both drive
+%flush-chainstate through the same fixed chainstate.dat.tmp path and
+double-close the same LevelDB handles.")
+
+(defvar *shutdown-watchdog-running* nil
+  "T while run-node-watchdog polls on the main thread. Read from other threads,
+so it is SETF on the global (a LET binding would be invisible to them).")
+
+(defun request-node-shutdown (reason &key (exit-code +node-exit-clean+))
+  "Ask the node to shut down; the MAIN thread does the actual work (Core
+StartShutdown). REASON is logged; EXIT-CODE is what the supervisor will see
+(+node-exit-clean+ / -error+ / -watchdog+). Returns T if this call registered
+the request, NIL if a shutdown was already pending (first caller wins).
+
+Without a main-thread watchdog — a REPL or embedded use of start-node — nobody
+would ever run stop-node, so this falls back to the historical behaviour of
+running it on a throwaway thread. That is safe there precisely because nothing
+is about to exit the process out from under it."
+  (let* ((reason (or reason "shutdown requested"))
+         (registered (null (sb-ext:cas (symbol-value '*shutdown-request*)
+                                       nil (cons reason exit-code)))))
+    (when registered
+      (log-info "Shutdown requested: ~A (exit code ~D)" reason exit-code)
+      (unless *shutdown-watchdog-running*
+        (bt:make-thread (lambda () (ignore-errors (stop-node)))
+                        :name "node-shutdown")))
+    registered))
+
+(defun node-shutdown-requested-p ()
+  "The reason a shutdown was requested, or NIL (Core ShutdownRequested)."
+  (car *shutdown-request*))
+
+(defun wait-for-shutdown-complete (&key (timeout 900))
+  "Block until stop-node's *shutdown-complete* latch is set, or TIMEOUT
+seconds pass. Returns T iff the shutdown completed. The default outlasts
+stop-node's own 600s sync-thread join."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* timeout internal-time-units-per-second))))
+    (loop until *shutdown-complete*
+          while (< (get-internal-real-time) deadline)
+          do (sleep 0.05))
+    (and *shutdown-complete* t)))
+
+(defun %pending-shutdown-exit-code ()
+  "The exit code the supervisor should see, or NIL while the node should keep
+running. A node that stopped running without a request was not asked to stop
+(fatal snapshot, dead sync thread) — that is the respawn case."
+  (cond ((cdr *shutdown-request*))
+        ((or (null *node*) (not (node-running *node*))) +node-exit-watchdog+)
+        (t nil)))
+
+(defun run-node-watchdog (&key (poll-seconds 1) (exit t))
+  "Main-thread shutdown watchdog, the last form the supervisor launcher
+evaluates (scripts/run-node.sh). Blocks until a shutdown is requested or the
+node stops running, runs stop-node ON THIS THREAD — so the whole
+flush/mempool.dat/peers.dat/banlist/wallet sequence completes before anything
+exits — and then exits with a code the supervisor discriminates on:
+
+  0  deliberate, completed stop (`stop` RPC, SIGTERM, -stopatheight): stay down
+  1  deterministic failure (config, disk): back off, do not spin
+  7  the node died unasked, or crashed: respawn
+
+With EXIT NIL it returns the code instead of exiting (tests)."
+  ;; SETF, not LET: the internal stop paths run on other threads and read the
+  ;; GLOBAL value to decide whether anyone will run stop-node for them.
+  (setf *shutdown-watchdog-running* t)
+  (unwind-protect
+       (loop
+         (let ((code (%pending-shutdown-exit-code)))
+           (when code
+             (log-info "Shutdown watchdog: ~A — stopping node (exit code ~D)"
+                       (or (node-shutdown-requested-p) "node is no longer running")
+                       code)
+             (ignore-errors (stop-node))
+             (unless *shutdown-complete*
+               (log-warn "Shutdown did not complete cleanly; exiting anyway"))
+             (if exit
+                 (sb-ext:exit :code code :timeout 5)
+                 (return code))))
+         (sleep poll-seconds))
+    (setf *shutdown-watchdog-running* nil)))
+
 ;;;; --- Assumeutxo P5: background-validation completion + promotion --------
 ;;;;
 ;;;; When the historical (validated-from-genesis) chainstate finishes
@@ -987,12 +1116,16 @@ from-snapshot-blockhash), regardless of its assumeutxo status, or NIL."
 GetNotifications().fatalError): log the error and request node shutdown. The
 invalid snapshot chainstate dir was already renamed aside for forensics; on
 the next restart the node resumes normal IBD from the validated chain. Runs
-on the sync thread, so it only flips node-running (letting the loops wind
-themselves down) rather than joining threads via stop-node."
+on the sync thread, so it flips node-running (letting the loops wind
+themselves down) and REQUESTS the shutdown rather than joining threads via
+stop-node itself — the main thread runs the teardown, and the restart-worthy
+exit code tells the supervisor to respawn."
   (log-error "[snapshot] !!! ~A" message)
   (log-error "[snapshot] the node will shut down and stop using any state built on the snapshot")
   (when *node*
-    (setf (node-running *node*) nil)))
+    (setf (node-running *node*) nil)
+    (request-node-shutdown "assumeutxo snapshot failed background validation"
+                           :exit-code +node-exit-watchdog+)))
 
 (defvar *snapshot-fatal-hook* '%default-snapshot-fatal
   "Funcalled with a message string when an assumeutxo snapshot fails
@@ -1261,7 +1394,7 @@ index is enabled."
 ;;; -stopatheight / disk-space / periodic peers.dat dump support
 
 (defvar *stop-at-height-triggered* nil
-  "Once-only latch for -stopatheight so the shutdown thread spawns once.")
+  "Once-only latch for -stopatheight so the shutdown request is made once.")
 
 (defvar *disk-space-abort-triggered* nil
   "Once-only latch for the low-disk-space abort at flush points.")
@@ -1277,8 +1410,10 @@ minutes, net.cpp:63, scheduled at net.cpp:3560).")
   "Request a node shutdown once HEIGHT reaches -stopatheight (Core
 KernelNotifications::blockTip, node/kernel_notifications.cpp:61-66). Called
 from connect-block on every ACTIVE-chainstate tip advance; a background
-(targeted) chainstate never triggers it. Shutdown runs on its own thread —
-stop-node joins the sync thread, which is usually the caller here."
+(targeted) chainstate never triggers it. Only REQUESTS the shutdown: the main
+thread runs stop-node (which joins the sync thread — usually the caller here),
+and the clean exit code stops the supervisor from respawning straight back
+into the same trigger."
   (when (and (plusp *stop-at-height*)
              (>= height *stop-at-height*)
              (not *stop-at-height-triggered*)
@@ -1286,8 +1421,8 @@ stop-node joins the sync thread, which is usually the caller here."
              (node-running *node*))
     (setf *stop-at-height-triggered* t)
     (log-info "Reached stopatheight=~D — requesting shutdown" *stop-at-height*)
-    (bt:make-thread (lambda () (ignore-errors (stop-node)))
-                    :name "stopatheight-shutdown")
+    (request-node-shutdown (format nil "-stopatheight=~D reached" *stop-at-height*)
+                           :exit-code +node-exit-clean+)
     t))
 
 (defun check-disk-space (directory &optional (additional-bytes 0))
@@ -1315,12 +1450,13 @@ node into shutdown."
 (defun %abort-on-low-disk-space (label)
   "Log + request shutdown once when free disk space is below the floor
 (Core FlushStateToDisk's CheckDiskSpace failure -> FatalError \"Disk space
-is too low!\", validation.cpp:2775/2808)."
+is too low!\", validation.cpp:2775/2808). Exits non-clean: respawning into a
+full disk just reproduces the abort, so the supervisor backs off instead."
   (log-error "~A flush: Disk space is too low!" label)
   (unless *disk-space-abort-triggered*
     (setf *disk-space-abort-triggered* t)
-    (bt:make-thread (lambda () (ignore-errors (stop-node)))
-                    :name "disk-space-shutdown")))
+    (request-node-shutdown "disk space is too low"
+                           :exit-code +node-exit-error+)))
 
 (defun maybe-dump-peer-addresses (node)
   "Dump the address book to peers.dat when the 15-minute cadence elapses
@@ -1502,6 +1638,12 @@ Returns the node instance."
   ;; -stopatheight: re-arm the once-only shutdown trigger for this run.
   (setf *stop-at-height-triggered* nil
         *disk-space-abort-triggered* nil)
+  ;; Re-arm the shutdown coordination latches: a previous run in the same
+  ;; image (tests, an in-REPL restart) leaves them set, and a pre-set
+  ;; *shutdown-request* would make the watchdog stop this run immediately.
+  (setf *shutdown-request* nil
+        *shutdown-complete* nil
+        *stop-node-in-progress* nil)
   ;; Periodic peers.dat dump baseline (first dump 15 min from now).
   (setf *last-peers-dump-time* (get-universal-time))
   (setf *current-log-level* log-level)
@@ -2647,19 +2789,30 @@ hook (Core removeUnchecked, txmempool.cpp:269-275)."
           (lambda (&rest _)
             (declare (ignore _))
             (format *error-output* "~&[shutdown] caught signal — saving state~%")
-            (ignore-errors (stop-node))
-            ;; Per-block script-check worker threads (bt:make-thread :name
-            ;; "script-check-N" in validate-block.lisp) are non-daemon and
-            ;; can outlive stop-node if validation was in progress when the
-            ;; sync thread was destroyed. Without a timeout, sb-ext:exit
-            ;; blocks forever waiting for them (incident 2026-05-11: node
-            ;; logged "Node stopped" but SBCL process hung 6+ minutes,
-            ;; eventually needed SIGKILL). Give 5 seconds for any in-flight
-            ;; worker to finish naturally, then force-exit. Bitcoin Core's
-            ;; CCheckQueue (checkqueue.h:206-225) has an explicit stop flag
-            ;; + condvar to join workers; we use a coarser timeout because
-            ;; our workers are ephemeral per-block, not a persistent pool.
-            (sb-ext:exit :code 0 :timeout 5))))
+            ;; Under the supervisor (a main-thread watchdog is polling), only
+            ;; REQUEST the stop. The kernel delivers the signal to whichever
+            ;; thread it likes, and running the teardown here would race the
+            ;; watchdog's exit exactly like the other internal stop paths did —
+            ;; SIGTERM only survived that race by delivery luck. The watchdog
+            ;; runs stop-node and exits 0 itself.
+            (if *shutdown-watchdog-running*
+                (request-node-shutdown "SIGTERM/SIGINT" :exit-code +node-exit-clean+)
+                ;; No watchdog (REPL / embedded): nobody else would stop the
+                ;; node, so do it here and exit as before.
+                (progn
+                  (ignore-errors (stop-node))
+                  ;; Per-block script-check worker threads (bt:make-thread :name
+                  ;; "script-check-N" in validate-block.lisp) are non-daemon and
+                  ;; can outlive stop-node if validation was in progress when the
+                  ;; sync thread was destroyed. Without a timeout, sb-ext:exit
+                  ;; blocks forever waiting for them (incident 2026-05-11: node
+                  ;; logged "Node stopped" but SBCL process hung 6+ minutes,
+                  ;; eventually needed SIGKILL). Give 5 seconds for any in-flight
+                  ;; worker to finish naturally, then force-exit. Bitcoin Core's
+                  ;; CCheckQueue (checkqueue.h:206-225) has an explicit stop flag
+                  ;; + condvar to join workers; we use a coarser timeout because
+                  ;; our workers are ephemeral per-block, not a persistent pool.
+                  (sb-ext:exit :code 0 :timeout 5))))))
     (sb-sys:enable-interrupt sb-unix:sigterm handler)
     (sb-sys:enable-interrupt sb-unix:sigint handler))
   ;; SIGUSR1 toggles sb-sprof profiling. First USR1: start sampling. Second
@@ -2726,10 +2879,33 @@ Phase 1."
     (bitcoin-lisp.storage:close-chainstate-coins-view cs)))
 
 (defun stop-node ()
-  "Stop the running Bitcoin node."
+  "Stop the running Bitcoin node: the full teardown, ending with the
+*shutdown-complete* latch. Returns T when this call performed the teardown.
+
+Concurrency: the FIRST caller owns the shutdown. A second, overlapping call
+does not run the teardown again — two runs would drive %flush-chainstate
+through the same fixed chainstate.dat.tmp path (storage/utxo.lisp) and
+double-close the same LevelDB handles — it waits for the owner to finish and
+returns NIL. Prefer request-node-shutdown from anything that is not the main
+thread; see the shutdown-coordination section above."
   (unless *node*
     (return-from stop-node nil))
+  ;; CAS rather than a lock: reachable from the SIGTERM handler, which runs in
+  ;; whichever thread the signal interrupted.
+  (unless (null (sb-ext:cas (symbol-value '*stop-node-in-progress*) nil t))
+    (log-info "Shutdown already in progress on another thread; waiting for it")
+    (wait-for-shutdown-complete)
+    (return-from stop-node nil))
+  (unwind-protect
+       (%stop-node)
+    ;; The latch is stop-node's FINAL act: the watchdog (and any concurrent
+    ;; caller) waits on it, so it must be set strictly after the flush,
+    ;; mempool.dat, peers.dat, banlist and wallet writes below — never before.
+    (setf *stop-node-in-progress* nil
+          *shutdown-complete* t)))
 
+(defun %stop-node ()
+  "stop-node's teardown proper; run by exactly one thread (see stop-node)."
   (log-info "Stopping node...")
 
   ;; Persist reconnection anchors while peers are still connected (before the

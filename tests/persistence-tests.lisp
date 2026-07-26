@@ -1123,3 +1123,152 @@ own tips afterwards with their coins durable."
            (is (eq t (%shutdown-fixture-coin-durable-p base "" 1)))
            (is (eq t (%shutdown-fixture-coin-durable-p base "_snapshot" 5))))
       (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
+
+;;;; Shutdown coordination: the internal stop paths only REQUEST a shutdown,
+;;;; and the main thread performs it (GA8 wave 5).
+;;;;
+;;;; The supervisor (scripts/run-node.sh) runs a main-thread watchdog that exits
+;;;; the process shortly after the node stops running. stop-node clears
+;;;; node-running FIRST and writes the chainstate flush, mempool.dat, peers.dat,
+;;;; banlist and wallet markers AFTER, so any stop driven from a non-main thread
+;;;; (the `stop` RPC, -stopatheight, the low-disk abort) raced that exit and was
+;;;; routinely cut short. Core has the same split: the RPC calls StartShutdown(),
+;;;; and Shutdown() runs on the main thread (bitcoind.cpp:180-193).
+
+(defun %shutdown-test-node (base)
+  "A minimal running node over BASE with the state stop-node persists: one
+chainstate with a dirty coin, a mempool, an address book, a data directory."
+  (let ((node (bitcoin-lisp::make-node :network :regtest)))
+    (setf (bitcoin-lisp::node-data-directory node) base
+          (bitcoin-lisp::node-chainstates node)
+          (list (%shutdown-fixture-chainstate base "" 3))
+          (bitcoin-lisp::node-mempool node) (bitcoin-lisp.mempool:make-mempool)
+          (bitcoin-lisp::node-address-book node)
+          (bitcoin-lisp.networking:make-address-book)
+          (bitcoin-lisp::node-running node) t)
+    node))
+
+(defmacro %with-shutdown-node ((node-var base-var) &body body)
+  "Run BODY with NODE-VAR installed as the GLOBAL bitcoin-lisp::*node* (other
+threads read the global, so a LET binding would be invisible to them), and
+every global stop-node mutates restored afterwards."
+  `(let* ((,base-var (ensure-directories-exist
+                      (merge-pathnames (format nil "test-shutdown-req-~D/"
+                                               (get-internal-real-time))
+                                       (uiop:temporary-directory))))
+          (,node-var (%shutdown-test-node ,base-var))
+          (saved-node bitcoin-lisp::*node*)
+          (saved-banlist bitcoin-lisp.networking:*banlist-path*))
+     (setf bitcoin-lisp::*node* ,node-var
+           bitcoin-lisp::*shutdown-request* nil
+           bitcoin-lisp::*shutdown-complete* nil
+           bitcoin-lisp::*stop-node-in-progress* nil)
+     (unwind-protect (progn ,@body)
+       (setf bitcoin-lisp::*node* saved-node
+             bitcoin-lisp.networking:*banlist-path* saved-banlist
+             bitcoin-lisp::*shutdown-request* nil
+             bitcoin-lisp::*shutdown-complete* nil
+             bitcoin-lisp::*stop-node-in-progress* nil
+             bitcoin-lisp::*shutdown-watchdog-running* nil)
+       (bitcoin-lisp.networking:reset-ibd-stop)
+       (uiop:delete-directory-tree ,base-var :validate t :if-does-not-exist :ignore))))
+
+(test shutdown-request-completes-teardown-before-exit
+  "An internal stop request (driven through the real `stop` RPC entry point)
+must not stop the node on its own thread: it registers the request, and the
+main-thread watchdog runs the WHOLE teardown before the process would exit.
+Asserted by ordering, not by stop-node merely returning — every persistence
+step must observe the *shutdown-complete* latch still clear, and the watchdog
+must report the clean exit code (0), not the respawn code (7) it returns when
+the node died out from under it."
+  (%with-shutdown-node (node base)
+    (let ((steps '())
+          (real-flush (fdefinition 'bitcoin-lisp::%shutdown-flush-chainstates))
+          (real-mempool (fdefinition 'bitcoin-lisp.mempool:save-mempool-file))
+          (real-peers (fdefinition 'bitcoin-lisp.networking:save-address-book)))
+      (flet ((note (step) (push (cons step bitcoin-lisp::*shutdown-complete*) steps)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'bitcoin-lisp::%shutdown-flush-chainstates)
+                     (lambda (&rest args) (note :flush) (apply real-flush args))
+                     (fdefinition 'bitcoin-lisp.mempool:save-mempool-file)
+                     (lambda (&rest args) (note :mempool) (apply real-mempool args))
+                     (fdefinition 'bitcoin-lisp.networking:save-address-book)
+                     (lambda (&rest args) (note :peers) (apply real-peers args)))
+               ;; The shipped RPC entry point, not a re-implementation of it.
+               (bitcoin-lisp.rpc::rpc-stop node nil)
+               (let ((code (bitcoin-lisp::run-node-watchdog :poll-seconds 0.05
+                                                            :exit nil)))
+                 (is (= bitcoin-lisp::+node-exit-clean+ code)
+                     "watchdog exit code (0 = deliberate stop, 7 = died unasked)")))
+          (setf (fdefinition 'bitcoin-lisp::%shutdown-flush-chainstates) real-flush
+                (fdefinition 'bitcoin-lisp.mempool:save-mempool-file) real-mempool
+                (fdefinition 'bitcoin-lisp.networking:save-address-book) real-peers)))
+      (let ((order (reverse steps)))
+        ;; Every persistence step ran, in stop-node's order...
+        (is (equal '(:flush :mempool :peers) (mapcar #'car order)) "steps: ~S" order)
+        ;; ...and each ran BEFORE the latch the watchdog exits on was set.
+        (is (every (lambda (s) (null (cdr s))) order)
+            "a persistence step ran at or after *shutdown-complete*: ~S" order))
+      ;; The latch is set only once the teardown is done, and the node is down.
+      (is (eq t bitcoin-lisp::*shutdown-complete*))
+      (is (null bitcoin-lisp::*node*))
+      ;; The chainstate was committed clean by that teardown.
+      (let ((reload (bitcoin-lisp.storage:make-chain-state :base-path base)))
+        (is (eq t (bitcoin-lisp.storage:load-state reload)))
+        (is (= 3 (bitcoin-lisp.storage:current-height reload)))))))
+
+(test shutdown-request-is-once-only
+  "request-node-shutdown is a once-only latch: the first caller's reason and
+exit code win, so a second path (say the disk abort after an RPC stop) cannot
+turn a clean stop into a respawn."
+  (%with-shutdown-node (node base)
+    (is-true node)
+    (is-true base)
+    ;; Pretend the main-thread watchdog is polling, so the request does NOT
+    ;; fall back to running stop-node on a thread of its own.
+    (setf bitcoin-lisp::*shutdown-watchdog-running* t)
+    (is (eq t (bitcoin-lisp::request-node-shutdown "first")))
+    (is (null (bitcoin-lisp::request-node-shutdown
+               "second" :exit-code bitcoin-lisp::+node-exit-error+)))
+    (is (string= "first" (bitcoin-lisp::node-shutdown-requested-p)))
+    (is (= bitcoin-lisp::+node-exit-clean+
+           (bitcoin-lisp::%pending-shutdown-exit-code)))))
+
+(test stop-node-is-idempotent-under-concurrent-calls
+  "stop-node is not re-entrant across threads: two overlapping runs would drive
+%flush-chainstate through the same fixed chainstate.dat.tmp path and
+double-close the same LevelDB handles. The second, overlapping call must not
+run the teardown again — it waits for the owner and returns NIL."
+  (%with-shutdown-node (node base)
+    (is-true node)
+    (let ((flushes 0)
+          (real-flush (fdefinition 'bitcoin-lisp::%shutdown-flush-chainstates))
+          (results '())
+          (lock (bt:make-lock "shutdown-test")))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'bitcoin-lisp::%shutdown-flush-chainstates)
+                   (lambda (&rest args)
+                     (bt:with-lock-held (lock) (incf flushes))
+                     ;; Widen the overlap so the second caller lands inside it.
+                     (sleep 0.3)
+                     (apply real-flush args)))
+             (let ((threads (loop repeat 2
+                                  collect (bt:make-thread
+                                           (lambda ()
+                                             (let ((r (bitcoin-lisp::stop-node)))
+                                               (bt:with-lock-held (lock)
+                                                 (push r results))))))))
+               (dolist (th threads) (bt:join-thread th))))
+        (setf (fdefinition 'bitcoin-lisp::%shutdown-flush-chainstates) real-flush))
+      ;; The teardown ran exactly once...
+      (is (= 1 flushes) "%shutdown-flush-chainstates ran ~D time(s)" flushes)
+      ;; ...one caller owned it, the other observed the completed shutdown.
+      (is (= 2 (length results)))
+      (is (= 1 (count t results)) "stop-node return values: ~S" results)
+      (is (eq t bitcoin-lisp::*shutdown-complete*))
+      ;; And the single teardown still committed the chainstate cleanly.
+      (let ((reload (bitcoin-lisp.storage:make-chain-state :base-path base)))
+        (is (eq t (bitcoin-lisp.storage:load-state reload)))
+        (is (= 3 (bitcoin-lisp.storage:current-height reload)))))))
