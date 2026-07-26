@@ -371,28 +371,49 @@ passes roughly half of all nonces, so a fixed nonce would flake ~50% of runs on
   (flexi-streams:with-output-to-sequence (s)
     (bitcoin-lisp.serialization:write-compact-block s compact-block)))
 
-(defun %cbp-state-with-parent (parent-hash parent-timestamp)
+(defun %cbp-state-with-parent (parent-hash parent-timestamp &key (status :valid))
   "A chain-state holding only PARENT-HASH at height 0, with a real header (the
 MTP walk and the difficulty check both dereference it). BEST-BLOCK-HASH stays
 NIL so ACCEPT-DOWNLOADED-BLOCK takes its side-branch path, which is the one
-that consults the parent index entry."
+that consults the parent index entry. STATUS :INVALID makes the parent a block
+we rejected — Core's BLOCK_INVALID_PREV."
   (let ((state (bitcoin-lisp.storage:make-chain-state)))
     (bitcoin-lisp.storage:add-block-index-entry
      state (bitcoin-lisp.storage:make-block-index-entry
-            :hash parent-hash :height 0 :chain-work 1 :status :valid
+            :hash parent-hash :height 0 :chain-work 1 :status status
             :header (%cbp-header (%cbp-hash 0) parent-timestamp)))
     state))
 
-(defun %cbp-one-tx-compact-block (prev-hash prefilled-index tx)
-  "A compact block on PREV-HASH carrying exactly one prefilled transaction and
-no short IDs, so tx-count is 1. PREFILLED-INDEX 0 reconstructs; anything else
-is out of bounds and is Core's READ_STATUS_INVALID."
+(defun %cbp-one-tx-compact-block-with-header (header prefilled-index tx)
+  "A compact block carrying HEADER, exactly one prefilled transaction and no
+short IDs, so tx-count is 1. PREFILLED-INDEX 0 reconstructs; anything else is
+out of bounds and is Core's READ_STATUS_INVALID."
   (bitcoin-lisp.serialization:make-compact-block
-   :header (%cbp-grind (%cbp-header prev-hash 1296688700))
+   :header header
    :nonce 7
    :short-ids '()
    :prefilled-txs (list (bitcoin-lisp.serialization:make-prefilled-tx
                          :index prefilled-index :transaction tx))))
+
+(defun %cbp-one-tx-compact-block (prev-hash prefilled-index tx)
+  "As above, on a mined regtest header extending PREV-HASH."
+  (%cbp-one-tx-compact-block-with-header
+   (%cbp-grind (%cbp-header prev-hash 1296688700)) prefilled-index tx))
+
+(defun %cbp-count-shortid-passes (thunk)
+  "Call THUNK with BUILD-SHORTID-MAP counted; return (VALUES result count).
+BUILD-SHORTID-MAP SipHashes EVERY mempool entry under a key derived from the
+announced header, so it is the per-message cost an unpunished attacker buys.
+The real definition still runs, so nothing downstream is disturbed."
+  (let ((calls 0)
+        (real (fdefinition 'bitcoin-lisp.networking::build-shortid-map)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'bitcoin-lisp.networking::build-shortid-map)
+                 (lambda (&rest args) (incf calls) (apply real args)))
+           (let ((result (funcall thunk)))
+             (values result calls)))
+      (setf (fdefinition 'bitcoin-lisp.networking::build-shortid-map) real))))
 
 (test cmpctblock-unknown-parent-asks-for-headers-and-never-punishes
   "GA8 W4 (the finding). A cmpctblock whose PARENT is not in the block index
@@ -618,3 +639,252 @@ not mutation evidence."
      (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
               "the BLOCK path must keep punishing :ORPHAN-BLOCK (Core parity)")
      (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))))))
+
+;;;; ====================================================================
+;;;; Per-reason punishment on the compact path (GA8 W4, review finding on #326)
+;;;;
+;;;; Core's MaybePunishNodeForBlock is a SWITCH, and via_compact_block exempts
+;;;; three of its seven arms (net_processing.cpp:1908-1950): BLOCK_CONSENSUS,
+;;;; BLOCK_MUTATED and — conditionally — BLOCK_CACHED_INVALID. BLOCK_INVALID_
+;;;; HEADER, BLOCK_INVALID_PREV and BLOCK_MISSING_PREV call Misbehaving
+;;;; unconditionally (:1936-1945), and the compact path reaches them: the
+;;;; cmpctblock handler runs the announced header through ProcessNewBlockHeaders
+;;;; (:4589) and punishes the result with via_compact_block=true (:4591).
+;;;;
+;;;; The first cut of this PR replaced punishment with a getdata for EVERY
+;;;; non-valid verdict. Measured regression, same input as the tests below:
+;;;;   origin/main    -> sent=NIL          discouraged=T   state=:DISCONNECTED
+;;;;   over-broad fix -> sent=("getdata")  discouraged=NIL state=:READY
+;;;; Nothing downstream scores a compact block, so that peer replays forever on
+;;;; one connection, each message costing a full BUILD-SHORTID-MAP pass.
+;;;; ====================================================================
+
+(defun %cbp-bad-pow-header (prev-hash)
+  "The reviewer's probe header verbatim: regtest chain, bits #x1d00ffff. That
+target is far BELOW the regtest pow limit, so DERIVE-TARGET accepts the bits and
+the hash then misses the target with overwhelming probability — Core's high-hash,
+BLOCK_INVALID_HEADER (validation.cpp:3864). Each test asserts the miss."
+  (let ((h (%cbp-header prev-hash 1296688700)))
+    (setf (bitcoin-lisp.serialization:block-header-bits h) #x1d00ffff
+          (bitcoin-lisp.serialization:block-header-cached-hash h) nil)
+    h))
+
+(test cmpctblock-invalid-header-punishes-and-never-hashes-the-mempool
+  "GA8 W4 blocker. A cmpctblock whose HEADER fails proof of work, announced on a
+parent we DO have, must discourage and disconnect its sender — through the
+compact path, exactly as Core does at net_processing.cpp:4589-4591 — and must
+not earn a getdata.
+
+Also pins the DoS property the over-broad fix created: five such messages on ONE
+connection must cost ZERO BUILD-SHORTID-MAP passes. That pass SipHashes every
+mempool entry under a key derived from the attacker's own header+nonce, so it
+must happen only after the header is known good. The valid-header control at the
+end proves the counter is wired to something real (it goes to exactly 1)."
+  (%with-regtest
+   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+          (bitcoin-lisp.networking::*compact-block-success-count* 0)
+          (bitcoin-lisp.networking::*compact-block-failure-count* 0)
+          (addr "203.0.113.48")
+          (peer (%cbp-peer addr))
+          (parent (%cbp-hash #xA4))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (mempool (bitcoin-lisp.mempool:make-mempool))
+          (hdr (%cbp-bad-pow-header parent))
+          (cb (%cbp-one-tx-compact-block-with-header hdr 0 (make-simple-tx #x41)))
+          (payload (%cbp-payload cb)))
+     (is-false (bitcoin-lisp.validation:check-proof-of-work hdr)
+               "fixture must actually fail PoW or this test asserts nothing")
+     (multiple-value-bind (sent passes)
+         (%cbp-count-shortid-passes
+          (lambda ()
+            (%cbp-capture-sends
+             (lambda ()
+               (dotimes (i 5)
+                 (bitcoin-lisp.networking::handle-cmpctblock
+                  peer payload state utxo nil mempool))))))
+       (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+                "an invalid-PoW cmpctblock header must discourage its sender (Core BLOCK_INVALID_HEADER)")
+       (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+       (is (null sent)
+           "an invalid header must not earn a getdata or a getheaders, sent: ~S" sent)
+       (is (zerop passes)
+           "5 replays hashed the mempool ~D times; an invalid header must be rejected before BUILD-SHORTID-MAP"
+           passes)
+       (is (zerop bitcoin-lisp.networking::*compact-block-success-count*)
+           "no reconstruction may be attempted for a header we reject"))
+     ;; Control: the counter seam is real. A well-formed header on the same
+     ;; parent DOES reach reconstruction, hashing the mempool exactly once.
+     (let ((ok-peer (%cbp-peer "203.0.113.49"))
+           (ok-cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x42))))
+       (multiple-value-bind (sent passes)
+           (%cbp-count-shortid-passes
+            (lambda ()
+              (%cbp-capture-sends
+               (lambda ()
+                 (bitcoin-lisp.networking::handle-cmpctblock
+                  ok-peer (%cbp-payload ok-cb) state utxo nil mempool)))))
+         (is (= 1 passes)
+             "control: a valid header must still reach BUILD-SHORTID-MAP, passes: ~D" passes)
+         (is (equal '("getdata") sent)
+             "control: a consensus-invalid reconstruction is still refetched, sent: ~S" sent)
+         (is-false (bitcoin-lisp.networking:peer-discouraged-p "203.0.113.49")
+                   "control: the honest-peer exemption must survive this fix"))))))
+
+(test cmpctblock-stale-timestamp-header-punishes
+  "GA8 W4. :BAD-PROOF-OF-WORK is not the only BLOCK_INVALID_HEADER arm, and a
+fix that special-cased PoW would be a different bug. A timestamp at or below the
+median-time-past is Core's time-too-old (validation.cpp:4125): same arm, same
+unconditional Misbehaving. The header's PoW is mined, so nothing pre-empts it."
+  (%with-regtest
+   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+          (addr "203.0.113.50")
+          (peer (%cbp-peer addr))
+          (parent (%cbp-hash #xA5))
+          ;; The parent's timestamp is the whole MTP window here, so a header
+          ;; timestamped 1296688500 is <= MTP.
+          (state (%cbp-state-with-parent parent 1296688600))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (hdr (%cbp-grind (%cbp-header parent 1296688500)))
+          (cb (%cbp-one-tx-compact-block-with-header hdr 0 (make-simple-tx #x43))))
+     (is-true (bitcoin-lisp.validation:check-proof-of-work hdr)
+              "fixture must pass PoW or it would test the wrong arm")
+     (multiple-value-bind (sent passes)
+         (%cbp-count-shortid-passes
+          (lambda ()
+            (%cbp-capture-sends
+             (lambda ()
+               (bitcoin-lisp.networking::handle-cmpctblock
+                peer (%cbp-payload cb) state utxo nil
+                (bitcoin-lisp.mempool:make-mempool))))))
+       (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+                "a time-too-old cmpctblock header must discourage its sender")
+       (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+       (is (null sent) "sent: ~S" sent)
+       (is (zerop passes) "passes: ~D" passes)))))
+
+(test cmpctblock-header-on-invalid-parent-punishes
+  "GA8 W4. BLOCK_INVALID_PREV: a header building on a block we already rejected
+is Core's bad-prevblk (validation.cpp:4251-4255), the arm right beside
+BLOCK_INVALID_HEADER and equally exempt from the via_compact_block amnesty."
+  (%with-regtest
+   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+          (addr "203.0.113.51")
+          (peer (%cbp-peer addr))
+          (parent (%cbp-hash #xA6))
+          (state (%cbp-state-with-parent parent 1296688600 :status :invalid))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x44))))
+     (multiple-value-bind (sent passes)
+         (%cbp-count-shortid-passes
+          (lambda ()
+            (%cbp-capture-sends
+             (lambda ()
+               (bitcoin-lisp.networking::handle-cmpctblock
+                peer (%cbp-payload cb) state utxo nil
+                (bitcoin-lisp.mempool:make-mempool))))))
+       (is-true (bitcoin-lisp.networking:peer-discouraged-p addr)
+                "a cmpctblock extending a known-invalid block must discourage its sender")
+       (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer)))
+       (is (null sent) "sent: ~S" sent)
+       (is (zerop passes) "passes: ~D" passes)))))
+
+(test cmpctblock-future-timestamp-header-is-neither-punished-nor-refetched
+  "GA8 W4 control in the OTHER direction: restoring header punishment must not
+punish every header-level verdict. A timestamp too far ahead is BLOCK_TIME_FUTURE
+(validation.cpp:4141), whose MaybePunishNodeForBlock arm is a bare break
+(net_processing.cpp:1946-1947) — no discouragement. Nor may it be refetched: a
+getdata would deliver the same block on the BLOCK path, where HANDLE-BLOCK
+punishes unconditionally, converting Core's no-op into an exile one message
+later."
+  (%with-regtest
+   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+          (addr "203.0.113.52")
+          (peer (%cbp-peer addr))
+          (parent (%cbp-hash #xA7))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          ;; +3h: past Core's MAX_FUTURE_BLOCK_TIME of 2h.
+          (hdr (%cbp-grind (%cbp-header parent (+ (bitcoin-lisp.serialization:get-unix-time)
+                                                  10800))))
+          (cb (%cbp-one-tx-compact-block-with-header hdr 0 (make-simple-tx #x45))))
+     (is-true (bitcoin-lisp.validation:check-proof-of-work hdr)
+              "fixture must pass PoW or it would test the wrong arm")
+     (multiple-value-bind (sent passes)
+         (%cbp-count-shortid-passes
+          (lambda ()
+            (%cbp-capture-sends
+             (lambda ()
+               (bitcoin-lisp.networking::handle-cmpctblock
+                peer (%cbp-payload cb) state utxo nil
+                (bitcoin-lisp.mempool:make-mempool))))))
+       (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+                 "BLOCK_TIME_FUTURE must not discourage (our clock, not their fault)")
+       (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))
+       (is (null sent)
+           "a future-timestamped block must not be refetched either, sent: ~S" sent)
+       (is (zerop passes) "passes: ~D" passes)))))
+
+(test cmpctblock-known-invalid-block-is-dropped-without-punishment
+  "GA8 W4. BLOCK_CACHED_INVALID: a compact block for a hash we already marked
+invalid. Core exempts it whenever via_compact_block is true
+(net_processing.cpp:1926-1935), so no discouragement — and no refetch, since
+re-downloading a block we have already rejected is a self-inflicted DoS. Checked
+before the parent lookup, mirroring AcceptBlockHeader (validation.cpp:4229-4237)."
+  (%with-regtest
+   (let* ((bitcoin-lisp.networking::*cached-is-ibd* nil)
+          (addr "203.0.113.53")
+          (peer (%cbp-peer addr))
+          (parent (%cbp-hash #xA8))
+          (state (%cbp-state-with-parent parent 1296688600))
+          (utxo (bitcoin-lisp.storage:make-utxo-set))
+          (cb (%cbp-one-tx-compact-block parent 0 (make-simple-tx #x46)))
+          (block-hash (bitcoin-lisp.serialization:block-header-hash
+                       (bitcoin-lisp.serialization:compact-block-header cb))))
+     (bitcoin-lisp.storage:add-block-index-entry
+      state (bitcoin-lisp.storage:make-block-index-entry
+             :hash block-hash :height 1 :chain-work 2 :status :invalid
+             :header (bitcoin-lisp.serialization:compact-block-header cb)))
+     (multiple-value-bind (sent passes)
+         (%cbp-count-shortid-passes
+          (lambda ()
+            (%cbp-capture-sends
+             (lambda ()
+               (bitcoin-lisp.networking::handle-cmpctblock
+                peer (%cbp-payload cb) state utxo nil
+                (bitcoin-lisp.mempool:make-mempool))))))
+       (is-false (bitcoin-lisp.networking:peer-discouraged-p addr)
+                 "BLOCK_CACHED_INVALID is exempt for compact-block senders")
+       (is (eq :ready (bitcoin-lisp.networking:peer-state peer)))
+       (is (null sent)
+           "a block we already rejected must not be re-requested, sent: ~S" sent)
+       (is (zerop passes) "passes: ~D" passes)))))
+
+(test compact-block-failure-action-matches-core-arms
+  "GA8 W4. The mapping table itself, arm by arm against MaybePunishNodeForBlock
+with via_compact_block=true (net_processing.cpp:1908-1950). Both handlers are
+thin wrappers over this, so a wrong entry here is either an unpunished attack or
+an exiled honest peer."
+  (flet ((action (reason) (bitcoin-lisp.networking::compact-block-failure-action reason)))
+    ;; BLOCK_INVALID_HEADER (validation.cpp:3864/4121/4125/4134/4148).
+    (dolist (reason '(:bad-proof-of-work :bad-difficulty :time-too-old
+                      :time-timewarp-attack :bad-version))
+      (is (eq :punish (action reason))
+          "~S is BLOCK_INVALID_HEADER and must punish, got ~S" reason (action reason)))
+    ;; BLOCK_INVALID_PREV (validation.cpp:4254).
+    (is (eq :punish (action :bad-prevblk)))
+    ;; BLOCK_TIME_FUTURE (:4141) and BLOCK_CACHED_INVALID (:4232): break, no punish.
+    (is (eq :ignore (action :time-too-new)))
+    (is (eq :ignore (action :duplicate-invalid)))
+    ;; BLOCK_CONSENSUS / BLOCK_MUTATED — the exempted class the GA8 finding was
+    ;; about. :ORPHAN-BLOCK rides here too: Core punishes BLOCK_MISSING_PREV but
+    ;; cannot reach that arm from a compact block, and it was one of the two
+    ;; false positives that exiled honest peers.
+    (dolist (reason '(:orphan-block :bad-merkle-root :bad-txns-duplicate
+                      :first-tx-not-coinbase :bad-signet-solution :script-failed
+                      :bad-witness-merkle-match :block-too-heavy))
+      (is (eq :refetch (action reason))
+          "~S is BLOCK_CONSENSUS/BLOCK_MUTATED and must not punish, got ~S"
+          reason (action reason)))
+    ;; A verdict nobody has classified must fail safe, never toward punishment.
+    (is (eq :refetch (action :some-future-validation-keyword)))))
