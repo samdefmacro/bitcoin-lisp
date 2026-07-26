@@ -351,6 +351,16 @@ txid check."
 ;;;; validator (which records / replays undo lists) doesn't have to
 ;;;; change when the wire-in PR swaps storage backends.
 
+(defun log-missing-block-spend (height txid index)
+  "Report an input of a connecting block that spent nothing. Core asserts this
+cannot happen (UpdateCoins, validation.cpp:2004): every input of a validated
+block spends a coin the view still holds. Reaching it means the block was
+validated against a stale or double-spent view, and the undo data is now short
+an entry — disconnecting the block would leave the UTXO set wrong."
+  (bitcoin-lisp:log-error
+   "COIN-SPEND-MISSING: block-apply at height ~D found no coin for ~A:~D"
+   height (bitcoin-lisp.crypto:bytes-to-hex txid) index))
+
 (defun coin-view-apply-block (cache block height)
   "Spend a block's inputs and add its outputs in CACHE. Returns the
 undo list — (txid index entry) for every spent UTXO, in apply order."
@@ -366,8 +376,9 @@ undo list — (txid index entry) for every spent UTXO, in apply order."
                           (prev-txid (bitcoin-lisp.serialization:outpoint-hash prevout))
                           (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
                           (entry (coin-view-spend cache prev-txid prev-index)))
-                     (when entry
-                       (push (list prev-txid prev-index entry) spent)))))
+                     (if entry
+                         (push (list prev-txid prev-index entry) spent)
+                         (log-missing-block-spend height prev-txid prev-index)))))
                (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
                      for out-idx from 0
                      for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey output)
@@ -531,8 +542,9 @@ data — (txid index entry) for each spent UTXO, in apply order."
                              (prev-index (bitcoin-lisp.serialization:outpoint-index prevout))
                              (key (make-utxo-key prev-txid prev-index))
                              (entry (gethash key (utxo-set-entries view))))
-                        (when entry
-                          (push (list prev-txid prev-index entry) spent))
+                        (if entry
+                            (push (list prev-txid prev-index entry) spent)
+                            (log-missing-block-spend height prev-txid prev-index))
                         (remhash key (utxo-set-entries view))
                         (setf (utxo-set-dirty view) t))))
                   (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)

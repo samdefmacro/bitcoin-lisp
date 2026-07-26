@@ -77,9 +77,12 @@ bordeaux-threads) via `~/.sbclrc`.
 ## Running the nodes
 
 Nodes run under a **crash-recovery supervisor** (a `bash` respawn loop) on the
-2.6.5 SBCL, resuming from chainstate in ~60 s on any exit. The single in-repo
+2.6.5 SBCL, resuming from chainstate in ~60 s after a crash. The single in-repo
 launcher `scripts/run-node.sh` versions the previously ad-hoc inline supervisors
-so the load-bearing launch logic is under source control:
+so the load-bearing launch logic is under source control. It respawns by exit
+code — `0` (a deliberate stop that finished its flush) stays down, `1` (a
+deterministic failure) backs off and eventually gives up, `7` or a crash
+respawns:
 
 ```sh
 scripts/run-node.sh testnet4      # or: mainnet | regtest
