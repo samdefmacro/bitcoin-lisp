@@ -256,6 +256,13 @@ normalized as nested values."
       (mapcar (lambda (v) (%normalize-json-value v t)) params)
       (%normalize-json-value params nil)))
 
+(defun request-json-version (request)
+  "The JSON-RPC version of one parsed request object REQUEST (a hash-table):
+:V2 only for the exact marker jsonrpc:\"2.0\", else :V1 — an absent member,
+\"1.0\" or \"1.1\" all mean legacy 1.x, which is Core's V1_LEGACY default
+(JSONRPCRequest::parse, rpc/request.cpp:212-227)."
+  (if (equal (gethash "jsonrpc" request) "2.0") :v2 :v1))
+
 (defun parse-json-rpc-request (body)
   "Parse JSON-RPC request body. Returns (values :single method params id
 version id-present-p) or (values :batch requests). VERSION is :v2 when the
@@ -275,7 +282,7 @@ top-level positional false survives as the +json-false+ sentinel."
           ((hash-table-p json)
            (let ((method (gethash "method" json))
                  (params (gethash "params" json))
-                 (version (if (equal (gethash "jsonrpc" json) "2.0") :v2 :v1)))
+                 (version (request-json-version json)))
              ;; Accept any/absent "jsonrpc" version: bitcoin-cli sends 1.0 (or
              ;; omits it) on older builds and 2.0 on newer; Core doesn't
              ;; validate it. Rejecting non-2.0 made stock bitcoin-cli unusable.
@@ -327,60 +334,98 @@ pairs — so without this every object-returning RPC errors out."
      (mapcar #'rpc-result->json x))
     (t x)))
 
-(defun make-rpc-response (result id)
-  "Create a successful JSON-RPC response."
-  (let ((response (make-hash-table :test 'equal)))
-    (setf (gethash "jsonrpc" response) "2.0")
-    (setf (gethash "result" response) (rpc-result->json result))
-    (setf (gethash "id" response) id)
+(defun %make-rpc-reply (result error-obj id version id-present)
+  "Assemble a JSON-RPC reply the way Core's JSONRPCReplyObj does
+(rpc/request.cpp:51-68) — the one place that knows how a reply's shape depends
+on the request's VERSION (:v1 or :v2):
+- the \"jsonrpc\" key is emitted for :V2 ONLY (:55);
+- a legacy 1.x reply carries BOTH \"result\" and \"error\", one of them null
+  (:57-64). python-bitcoinrpc's AuthServiceProxy does
+  `if response['error'] is not None:` and so raises KeyError: 'error' on every
+  successful call against a reply that omits it. NIL encodes as JSON null;
+- \"id\" is omitted entirely when the request carried no id member (:66,
+  id = std::nullopt at request.cpp:207-211) — that is ID-PRESENT NIL.
+ERROR-OBJ NIL means success. Anything other than :V2 is treated as legacy 1.x,
+matching Core's V1_LEGACY default for a request with no \"jsonrpc\" member."
+  (let ((response (make-hash-table :test 'equal))
+        (v2 (eq version :v2)))
+    (when v2
+      (setf (gethash "jsonrpc" response) "2.0"))
+    (cond ((null error-obj)
+           (setf (gethash "result" response) result)
+           (unless v2
+             (setf (gethash "error" response) nil)))
+          (t
+           (unless v2
+             (setf (gethash "result" response) nil))
+           (setf (gethash "error" response) error-obj)))
+    (when id-present
+      (setf (gethash "id" response) id))
     response))
 
-(defun make-rpc-error-response (code message id &optional data)
-  "Create an error JSON-RPC response."
-  (let ((response (make-hash-table :test 'equal))
-        (error-obj (make-hash-table :test 'equal)))
+(defun make-rpc-response (result id version &key (id-present t))
+  "Create a successful JSON-RPC response for a request of VERSION (:v1 or :v2);
+see %MAKE-RPC-REPLY for the version-dependent shape."
+  (%make-rpc-reply (rpc-result->json result) nil id version id-present))
+
+(defun make-rpc-error-response (code message id version &key data (id-present t))
+  "Create an error JSON-RPC response for a request of VERSION (:v1 or :v2);
+see %MAKE-RPC-REPLY for the version-dependent shape."
+  (let ((error-obj (make-hash-table :test 'equal)))
     (setf (gethash "code" error-obj) code)
     (setf (gethash "message" error-obj) message)
     (when data
       (setf (gethash "data" error-obj) (rpc-result->json data)))
-    (setf (gethash "jsonrpc" response) "2.0")
-    (setf (gethash "error" response) error-obj)
-    (setf (gethash "id" response) id)
-    response))
+    (%make-rpc-reply nil error-obj id version id-present)))
 
-(defun handle-single-request (node method params id)
-  "Handle a single RPC request."
+(defun handle-single-request (node method params id version &key (id-present t))
+  "Handle a single RPC request. VERSION and ID-PRESENT come from the parsed
+request and shape the reply (see MAKE-RPC-RESPONSE)."
   (handler-case
       (let ((result (dispatch-rpc-method node method params)))
-        (make-rpc-response result id))
+        (make-rpc-response result id version :id-present id-present))
     (rpc-error (e)
       (make-rpc-error-response (rpc-error-code e)
                                (rpc-error-message e)
-                               id
-                               (rpc-error-data e)))
+                               id version
+                               :data (rpc-error-data e)
+                               :id-present id-present))
     (error (e)
       (bitcoin-lisp::node-log :error "RPC internal error: ~A" e)
       (make-rpc-error-response +rpc-internal-error+
                                (format nil "Internal error: ~A" e)
-                               id))))
+                               id version
+                               :id-present id-present))))
 
 (defun handle-batch-request (node requests)
-  "Handle a batch of RPC requests."
-  (mapcar (lambda (req)
-            (if (hash-table-p req)
-                (let ((method (gethash "method" req))
-                      (params (%normalize-rpc-params
-                               (or (gethash "params" req) '())))
-                      (id (gethash "id" req)))
-                  (if (stringp method)
-                      (handle-single-request node method params id)
-                      (make-rpc-error-response +rpc-invalid-request+
-                                               "Missing or invalid method"
-                                               id)))
-                (make-rpc-error-response +rpc-invalid-request+
+  "Handle a batch of RPC requests, returning the list of replies to send.
+Core re-parses every batch member on its own (httprpc.cpp:194-206), so version
+and id-presence are PER MEMBER; a 2.0 notification (no id member) is executed
+but contributes no reply at all (:207-209)."
+  (let ((responses '()))
+    (dolist (req requests (nreverse responses))
+      (if (hash-table-p req)
+          (let ((method (gethash "method" req))
+                (params (%normalize-rpc-params
+                         (or (gethash "params" req) '())))
+                (version (request-json-version req)))
+            (multiple-value-bind (id id-present) (gethash "id" req)
+              (let ((response
+                      (if (stringp method)
+                          (handle-single-request node method params id version
+                                                 :id-present id-present)
+                          (make-rpc-error-response +rpc-invalid-request+
+                                                   "Missing or invalid method"
+                                                   id version
+                                                   :id-present id-present))))
+                (unless (and (eq version :v2) (not id-present))
+                  (push response responses)))))
+          ;; A non-object member has no version of its own; Core's default is
+          ;; V1_LEGACY with a null id.
+          (push (make-rpc-error-response +rpc-invalid-request+
                                          "Invalid request format"
-                                         nil)))
-          requests))
+                                         nil :v1)
+                responses)))))
 
 ;;; --- HTTP Server ---
 
@@ -399,46 +444,102 @@ pairs — so without this every object-returning RPC errors out."
 (defparameter +rpc-cookie-user+ "__cookie__"
   "Username in the .cookie file (Bitcoin Core convention).")
 
-(defvar *rpc-cookie-secret* nil
-  "Random secret written to .cookie when no rpcuser/password is configured, so
-stock bitcoin-cli (which always sends credentials) can authenticate.")
+(defvar *rpc-cookie-path* nil
+  "Path of the .cookie file this process generated, so shutdown can remove it
+(Core's g_generated_cookie / DeleteAuthCookie, request.cpp:167-177). NIL when
+the credential came from -rpcuser/-rpcpassword instead.")
+
+(defun %write-cookie-file (namestring contents)
+  "Create NAMESTRING owner-only and write CONTENTS into it. The file must not
+exist and must not be a symlink, and it is 0600 from creation — never for one
+instant a mode the process umask chose.
+
+Core gets this from a process-wide umask 0077 (common/system.cpp:92-93), so its
+cookie is 0600 at open(2) and fs::permissions is only ever called for an
+explicit -rpccookieperms (request.cpp:99-146). We do not set a process umask, so
+the mode has to come from open(2) itself: creating the file under the ambient
+umask and chmod-ing afterwards leaves the secret world-readable while it is
+being written (the live host runs umask 002 — its cookies were 0664), and POSIX
+checks permissions only at open, so an fd opened in that window stays valid
+across the chmod and the rename.
+
+O_EXCL also means the secret is never written into a file we did not create:
+:if-exists :supersede opens the EXISTING inode with O_TRUNC (verified on SBCL
+2.6.5), so a planted .cookie.tmp — or a hard link to one — receives the secret,
+and O_NOFOLLOW additionally refuses a planted symlink, which would otherwise be
+written through and then renamed target-and-all over .cookie."
+  (let ((fd (sb-posix:open namestring
+                           (logior sb-posix:o-wronly sb-posix:o-creat
+                                   sb-posix:o-excl sb-posix:o-nofollow)
+                           #o600))
+        (stream nil))
+    (unwind-protect
+         (progn
+           ;; open(2) applies mode & ~umask, so the file is never MORE
+           ;; permissive than 0600; fchmod on our own fd (no path, no race)
+           ;; pins it to exactly 0600 even under a umask that strips owner bits.
+           (sb-posix:fchmod fd #o600)
+           (setf stream (sb-sys:make-fd-stream fd :output t :external-format :utf-8
+                                                  :name "rpc-cookie"))
+           (write-string contents stream)
+           (finish-output stream))
+      ;; CLOSE on an fd-stream closes the fd, so close exactly one of them.
+      (if stream (close stream) (sb-posix:close fd)))))
 
 (defun generate-rpc-cookie (data-directory)
-  "Write <data-directory>/.cookie as \"__cookie__:<random>\" and remember the
-secret. Mirrors Bitcoin Core's cookie auth for clients that need credentials."
+  "Write <data-directory>/.cookie as \"__cookie__:<random>\" and return
+(values path secret), or NIL on failure. The file is the RPC credential, so it
+is created owner-only and is never reachable under any other name — Core
+creates it under umask 0077 (request.cpp:99-146)."
   (handler-case
       (let* ((secret (ironclad:byte-array-to-hex-string (ironclad:random-data 32)))
-             (path (merge-pathnames ".cookie" data-directory)))
-        (setf *rpc-cookie-secret* secret)
+             (path (merge-pathnames ".cookie" data-directory))
+             (tmp (merge-pathnames ".cookie.tmp" data-directory)))
         (ensure-directories-exist path)
-        (with-open-file (s path :direction :output :if-exists :supersede
-                                :if-does-not-exist :create)
-          (format s "~A:~A" +rpc-cookie-user+ secret))
-        path)
+        ;; A .cookie.tmp left behind by a crash would make the exclusive create
+        ;; below fail on every later start; unlink drops the name (and a
+        ;; symlink itself, never its target). Losing the race to a file planted
+        ;; between the unlink and the open just fails the open, which aborts
+        ;; cookie generation instead of writing the secret somewhere chosen.
+        (handler-case (sb-posix:unlink (namestring tmp)) (error () nil))
+        (%write-cookie-file (namestring tmp)
+                            (format nil "~A:~A" +rpc-cookie-user+ secret))
+        ;; Rename the file we exclusively created — not (truename tmp), which
+        ;; would resolve a symlink and move its target over .cookie.
+        (sb-posix:rename (namestring tmp) (namestring path))
+        (values path secret))
     (error (e)
       (bitcoin-lisp::node-log :warn "Could not write RPC cookie: ~A" e)
       nil)))
 
-(defun %basic-auth-matches-p (auth-header)
-  "T if the HTTP Basic AUTH-HEADER matches the configured user/password or the
-generated cookie credential."
-  (and (stringp auth-header)
-       (> (length auth-header) 6)
-       (string-equal (subseq auth-header 0 6) "Basic ")
-       (handler-case
-           (let* ((decoded (flexi-streams:octets-to-string
-                            (cl-base64:base64-string-to-usb8-array
-                             (subseq auth-header 6))))
-                  (colon-pos (position #\: decoded)))
-             (when colon-pos
-               (let ((user (subseq decoded 0 colon-pos))
-                     (pass (subseq decoded (1+ colon-pos))))
-                 (or (and *rpc-user* *rpc-password*
-                          (string= user *rpc-user*) (string= pass *rpc-password*))
-                     (and *rpc-cookie-secret*
-                          (string= user +rpc-cookie-user+)
-                          (string= pass *rpc-cookie-secret*))))))
-         (error () nil))))
+(defun delete-rpc-cookie ()
+  "Remove the .cookie file this process generated (Core DeleteAuthCookie,
+request.cpp:167-177). A cookie we did not write is left alone."
+  (when *rpc-cookie-path*
+    (handler-case
+        (when (probe-file *rpc-cookie-path*)
+          (delete-file *rpc-cookie-path*))
+      (error (e)
+        (bitcoin-lisp::node-log :warn "Could not remove RPC cookie ~A: ~A"
+                                *rpc-cookie-path* e)))
+    (setf *rpc-cookie-path* nil)))
+
+(defun %timing-resistant-equal (a b)
+  "STRING= over A and B in time that does not depend on how many characters
+matched (Core TimingResistantEqual, util/strencodings.h:203-210) — a plain
+comparison of an attacker-supplied credential leaks its correct prefix."
+  (declare (type string a b))
+  (let ((la (length a))
+        (lb (length b)))
+    (if (zerop lb)
+        (zerop la)
+        (let ((accumulator (logxor la lb)))
+          (dotimes (i la)
+            (setf accumulator
+                  (logior accumulator
+                          (logxor (char-code (char a i))
+                                  (char-code (char b (mod i lb)))))))
+          (zerop accumulator)))))
 
 (defvar *rpc-dispatcher* nil
   "The RPC dispatcher function (for cleanup on stop).")
@@ -483,25 +584,39 @@ clients (bitcoin-cli, curl) send no Origin at all and always pass."
              (string-equal (subseq origin (+ scheme-end 3))
                            (string-trim '(#\Space #\Tab) host))))))
 
-(defun check-auth (request)
-  "Authorize an RPC request.
-- With rpcuser/password configured, require a matching HTTP Basic credential
-  (or the cookie). This also fixes a prior bug where a *mismatched* credential
-  fell through and was accepted.
-- With nothing configured, allow open local RPC (our nodes bind 127.0.0.1) — a
-  .cookie is still written so stock bitcoin-cli, which always sends
-  credentials, authenticates; existing unauthenticated local clients keep
-  working."
-  (if (and *rpc-user* *rpc-password*)
-      (%basic-auth-matches-p (hunchentoot:header-in :authorization request))
-      t))
+(defun check-auth (auth-header)
+  "T when AUTH-HEADER — the request's Authorization header, NIL when it carried
+none — is an HTTP Basic credential matching the RPC user and password. Those
+are the -rpcuser/-rpcpassword pair when configured and the generated .cookie
+pair otherwise, so every request needs a credential: Core answers 401 for an
+absent header and for a non-matching one alike (HTTPReq_JSONRPC,
+httprpc.cpp:112-133). The cookie file is the local access boundary."
+  (and (stringp auth-header)
+       *rpc-user* *rpc-password*
+       (> (length auth-header) 6)
+       (string-equal (subseq auth-header 0 6) "Basic ")
+       (handler-case
+           (let* ((decoded (flexi-streams:octets-to-string
+                            (cl-base64:base64-string-to-usb8-array
+                             (string-trim '(#\Space #\Tab)
+                                          (subseq auth-header 6)))))
+                  (colon-pos (position #\: decoded)))
+             (when colon-pos
+               (and (%timing-resistant-equal (subseq decoded 0 colon-pos)
+                                             *rpc-user*)
+                    (%timing-resistant-equal (subseq decoded (1+ colon-pos))
+                                             *rpc-password*))))
+         (error () nil))))
 
 (defun rpc-json-error (http-status code message)
-  "Return a JSON-RPC error response string with the given HTTP status."
+  "Return a JSON-RPC error response string with the given HTTP status.
+These are pre-dispatch HTTP-level refusals (origin, rate limit, body size), so
+no request version has been parsed: Core's JSONRPCRequest starts out
+V1_LEGACY with a null id (request.h:55,63), which is the shape used here."
   (setf (hunchentoot:return-code*) http-status)
   (setf (hunchentoot:content-type*) "application/json")
   (with-output-to-string (s)
-    (yason:encode (make-rpc-error-response code message nil) s)))
+    (yason:encode (make-rpc-error-response code message nil :v1) s)))
 
 (defun rpc-error-http-status (code)
   "HTTP status for a JSON-RPC 1.x error response (Core JSONErrorReply,
@@ -514,7 +629,9 @@ error in the body (httprpc.cpp:160-164)."
 
 (defun rpc-response-http-status (response version)
   "The HTTP status to send with a single JSON-RPC RESPONSE hash-table:
-200 for success or any :V2 request; the Core 1.x mapping otherwise."
+200 for success or any :V2 request; the Core 1.x mapping otherwise.
+A :V1 success carries an \"error\" key whose value is null, so the test below
+must stay a value test (NIL = success), not a key-presence test."
   (let ((err (gethash "error" response)))
     (if (or (null err) (eq version :v2))
         hunchentoot:+http-ok+
@@ -531,10 +648,18 @@ error in the body (httprpc.cpp:160-164)."
                         "Origin does not match Host")))
 
     ;; Check authentication
-    (unless (check-auth request)
-      (setf (hunchentoot:return-code*) hunchentoot:+http-authorization-required+)
-      (setf (hunchentoot:header-out :www-authenticate) "Basic realm=\"bitcoin-lisp\"")
-      (return-from rpc-handler ""))
+    (let ((auth-header (hunchentoot:header-in :authorization request)))
+      (unless (check-auth auth-header)
+        ;; Core deters brute-forcing with a 250ms pause, but only once a
+        ;; credential has actually been offered: a request with no
+        ;; Authorization header is answered immediately (httprpc.cpp:112-133).
+        (when auth-header
+          (bitcoin-lisp::node-log :warn "RPC incorrect password attempt from ~A"
+                                  (hunchentoot:remote-addr request))
+          (sleep 0.25))
+        (setf (hunchentoot:return-code*) hunchentoot:+http-authorization-required+)
+        (setf (hunchentoot:header-out :www-authenticate) "Basic realm=\"bitcoin-lisp\"")
+        (return-from rpc-handler "")))
 
     ;; Check rate limit
     (unless (rpc-rate-limit-check)
@@ -577,7 +702,8 @@ error in the body (httprpc.cpp:160-164)."
             (case request-type
               (:single
                (let ((response (handle-single-request *rpc-node* method-or-batch
-                                                      params id)))
+                                                      params id version
+                                                      :id-present id-present)))
                  ;; A JSON-RPC 2.0 notification (no id member) answers 204
                  ;; with no body after executing (Core httprpc.cpp:169);
                  ;; otherwise the 1.x error->status mapping applies
@@ -592,20 +718,31 @@ error in the body (httprpc.cpp:160-164)."
                     (with-output-to-string (s)
                       (yason:encode response s))))))
               (:batch
-               ;; Batches always answer HTTP 200 (Core httprpc.cpp:196-206).
-               (let ((response (handle-batch-request *rpc-node* method-or-batch)))
-                 (with-output-to-string (s)
-                   (yason:encode response s))))))
+               ;; Batches always answer HTTP 200 (Core httprpc.cpp:196-206),
+               ;; except a non-empty all-notification batch, which answers 204
+               ;; with no body (:220). An EMPTY batch keeps answering [] for
+               ;; backwards compatibility (:211-219) — note NIL encodes as JSON
+               ;; null, so the empty array must be spelled #().
+               (let ((responses (handle-batch-request *rpc-node* method-or-batch)))
+                 (cond
+                   ((and (null responses) method-or-batch)
+                    (setf (hunchentoot:return-code*) hunchentoot:+http-no-content+)
+                    "")
+                   (t
+                    (with-output-to-string (s)
+                      (yason:encode (or responses #()) s))))))))
         (rpc-error (e)
           ;; Body-level failures (parse error -32700, invalid request -32600)
-          ;; have no version context; Core treats them as 1.x and maps the
-          ;; status accordingly (parse error -> 500, invalid request -> 400).
+          ;; have no version context; Core treats them as 1.x — both for the
+          ;; status mapping (parse error -> 500, invalid request -> 400) and
+          ;; for the reply shape, since JSONErrorReply passes the still-default
+          ;; V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59).
           (setf (hunchentoot:return-code*)
                 (rpc-error-http-status (rpc-error-code e)))
           (with-output-to-string (s)
             (yason:encode (make-rpc-error-response (rpc-error-code e)
                                                    (rpc-error-message e)
-                                                   nil)
+                                                   nil :v1)
                           s)))
         (error (e)
           (bitcoin-lisp::node-log :error "RPC handler error: ~A" e)
@@ -613,7 +750,7 @@ error in the body (httprpc.cpp:160-164)."
           (with-output-to-string (s)
             (yason:encode (make-rpc-error-response +rpc-internal-error+
                                                    "Internal error"
-                                                   nil)
+                                                   nil :v1)
                           s)))))))
 
 (defun rpc-dispatch-handler ()
@@ -624,12 +761,64 @@ error in the body (httprpc.cpp:160-164)."
         (setf (hunchentoot:return-code*) hunchentoot:+http-method-not-allowed+)
         "")))
 
+(defun rpc-bind-loopback-p (address)
+  "T when ADDRESS names a loopback interface. NIL and \"\" mean bind-any and
+are not loopback."
+  (and (stringp address)
+       (let ((a (string-trim '(#\Space #\Tab #\[ #\]) address)))
+         (or (string-equal a "localhost")
+             (string= a "::1")
+             (and (> (length a) 4) (string= (subseq a 0 4) "127."))))))
+
+(defun %rpc-bind-address (bind)
+  "The address the RPC acceptor may bind to. Core ignores -rpcbind unless
+-rpcallowip is also given, falling back to loopback rather than letting one
+flag expose the RPC port (HTTPBindAddresses, httpserver.cpp:316-327). We have
+no -rpcallowip, so every non-loopback bind is refused the same way."
+  (if (rpc-bind-loopback-p bind)
+      bind
+      (progn
+        (bitcoin-lisp::node-log
+         :warn "-rpcbind=~A ignored: this node has no -rpcallowip, so the RPC ~
+port stays on 127.0.0.1 rather than accepting connections from anywhere"
+         (or bind "<any>"))
+        "127.0.0.1")))
+
+(defun %install-rpc-credential (node user password)
+  "Install the single credential check-auth authorizes against and return T, or
+log and return NIL when there is none. Exactly one credential reaches the
+handler, as in Core's InitRPCAuthentication (httprpc.cpp:240-288): the cookie
+pair unless -rpcuser/-rpcpassword is configured.
+
+Callers must have bound the listening socket first — this writes .cookie, and
+.cookie is the live credential of whatever node owns the data directory."
+  (if (and user password)
+      (progn
+        (setf *rpc-user* user *rpc-password* password *rpc-cookie-path* nil)
+        t)
+      (multiple-value-bind (path secret)
+          (let ((data-directory (and node (bitcoin-lisp::node-data-directory node))))
+            (if data-directory (generate-rpc-cookie data-directory) (values nil nil)))
+        (cond (path
+               (setf *rpc-user* +rpc-cookie-user+ *rpc-password* secret
+                     *rpc-cookie-path* path)
+               t)
+              (t
+               (bitcoin-lisp::node-log
+                :error "RPC server not started: no -rpcuser/-rpcpassword and the ~
+.cookie file could not be written, so no request could be authorized")
+               nil)))))
+
 (defun start-rpc-server (node &key port (bind "127.0.0.1")
                                    user password
                                    rest-enabled
                                    ui-enabled ui-directory)
   "Start the RPC server.
 PORT defaults to 18332 for testnet, 8332 for mainnet.
+Every request must carry a credential: the USER/PASSWORD pair when configured,
+otherwise the .cookie file generated in the node's data directory. Without
+either the server does not start, as Core aborts startup when
+InitRPCAuthentication fails (httprpc.cpp:300-302).
 REST-ENABLED registers the Core-style /rest/ GET surface; like Core, the
 REST interface is OFF unless -rest is given (DEFAULT_REST_ENABLE = false,
 init.cpp:153,758 — previously we registered it unconditionally).
@@ -639,68 +828,113 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
     (when *rpc-server*
       (bitcoin-lisp::node-log :warn "RPC server already running")
       (return-from start-rpc-server nil))
+    (setf bind (%rpc-bind-address bind))
 
-    ;; Register methods
-    (register-all-methods)
+    ;; Bind the listening socket BEFORE touching any credential, the order Core
+    ;; uses: AppInitServers calls InitHTTPServer (which binds) and only then
+    ;; StartHTTPRPC -> InitRPCAuthentication -> GenerateAuthCookie
+    ;; (init.cpp:748-761), so a port conflict aborts before .cookie is written.
+    ;;
+    ;; Generating the cookie first is not a cosmetic difference: a second
+    ;; process started on a running node's data directory would overwrite
+    ;; .cookie with a secret matching nothing, then fail to bind and exit. The
+    ;; healthy node keeps serving with the old secret it holds in memory, so
+    ;; bitcoin-cli, the /ui/ SPA and every monitoring script that re-reads the
+    ;; file get 401 from a node that is perfectly fine — and the surviving
+    ;; process logs nothing, because nothing happened to it. (This has already
+    ;; happened here: restart-node.sh's pkill marker did not match the live
+    ;; supervisor and left two processes on one data directory.)
+    ;;
+    ;; Installing the credential after the bind is safe: until *rpc-user* is
+    ;; set check-auth returns NIL for every header, and the dispatchers are
+    ;; pushed last, so nothing can reach the handler at all in that window.
+    (let ((acceptor nil)
+          (listening nil)
+          (credential-installed nil)
+          (pushed '()))
+      (flet ((abort-start ()
+               ;; Undo only what THIS attempt did. A failure before the
+               ;; credential was installed must leave *rpc-user*, *rpc-password*
+               ;; and *rpc-cookie-path* alone: in a second process they are NIL,
+               ;; and in this one they may belong to a server already running.
+               (dolist (d pushed)
+                 (setf hunchentoot:*dispatch-table*
+                       (remove d hunchentoot:*dispatch-table*)))
+               (when pushed
+                 (setf *rpc-dispatcher* nil *rest-dispatcher* nil
+                       *ui-dispatcher* nil *ui-enabled* nil *ui-directory* nil))
+               (when listening
+                 (handler-case (hunchentoot:stop acceptor) (error () nil)))
+               (when credential-installed
+                 (delete-rpc-cookie)
+                 (setf *rpc-user* nil *rpc-password* nil *rpc-cookie-path* nil))
+               nil))
+        (handler-case
+            (progn
+              (setf acceptor (make-instance 'hunchentoot:easy-acceptor
+                                            :port port
+                                            :address bind))
+              (hunchentoot:start acceptor)
+              (setf listening t)
 
-    ;; Initialize RPC rate limiter
-    (init-rpc-rate-limiter)
+              ;; Bound. Now install the one credential the handler authorizes
+              ;; against (Core InitRPCAuthentication, httprpc.cpp:240-288).
+              (unless (%install-rpc-credential node user password)
+                (return-from start-rpc-server (abort-start)))
+              (setf credential-installed t)
 
-    ;; Set globals for handler
-    (setf *rpc-node* node)
-    (setf *rpc-user* user)
-    (setf *rpc-password* password)
-    ;; When no user/password is configured, write a .cookie so stock bitcoin-cli
-    ;; can authenticate (Bitcoin Core behavior). With a configured password,
-    ;; clients use that and no cookie is written.
-    (setf *rpc-cookie-secret* nil)
-    (unless (and user password)
-      (when (and node (bitcoin-lisp::node-data-directory node))
-        (generate-rpc-cookie (bitcoin-lisp::node-data-directory node))))
+              ;; Register methods
+              (register-all-methods)
 
-    ;; Create and start server
-    (handler-case
-        (let ((acceptor (make-instance 'hunchentoot:easy-acceptor
-                                       :port port
-                                       :address bind)))
-          ;; Create and save dispatcher for cleanup
-          (let ((dispatcher (hunchentoot:create-prefix-dispatcher "/" 'rpc-dispatch-handler)))
-            (setf *rpc-dispatcher* dispatcher)
-            (push dispatcher hunchentoot:*dispatch-table*))
-          ;; REST GET surface under /rest/ — pushed AFTER the "/" dispatcher
-          ;; so it sits at the front of the list and matches first. Only when
-          ;; -rest is given (Core StartREST gate, init.cpp:758).
-          (when rest-enabled
-            (bitcoin-lisp::node-log :info "REST interface enabled at /rest/")
-            (let ((rest-dispatcher (hunchentoot:create-prefix-dispatcher
-                                    "/rest/" 'rest-dispatch-handler)))
-              (setf *rest-dispatcher* rest-dispatcher)
-              (push rest-dispatcher hunchentoot:*dispatch-table*)))
-          ;; Web UI static assets under /ui/ (gui-plan P0). Registered only
-          ;; when enabled — a disabled UI leaves no handler at all.
-          (setf *ui-enabled* (and ui-enabled t)
-                *ui-directory* (and ui-directory
-                                    (uiop:ensure-directory-pathname ui-directory)))
-          (when *ui-enabled*
-            (let ((dir (ui-directory)))
-              (if (and dir (probe-file dir))
-                  (bitcoin-lisp::node-log :info "Web UI enabled at /ui/ (serving ~A)" dir)
-                  (bitcoin-lisp::node-log
-                   :warn "Web UI enabled but asset directory ~A is missing — /ui/ will 404" dir)))
-            (let ((ui-dispatcher (make-ui-dispatcher)))
-              (setf *ui-dispatcher* ui-dispatcher)
-              (push ui-dispatcher hunchentoot:*dispatch-table*)))
+              ;; Initialize RPC rate limiter
+              (init-rpc-rate-limiter)
 
-          (hunchentoot:start acceptor)
-          (setf *rpc-server* acceptor)
-          (bitcoin-lisp::node-log :info "RPC server started on ~A:~A" bind port)
-          acceptor)
-      (usocket:address-in-use-error ()
-        (bitcoin-lisp::node-log :error "RPC port ~A already in use, continuing without RPC" port)
-        nil)
-      (error (e)
-        (bitcoin-lisp::node-log :error "Failed to start RPC server: ~A" e)
-        nil))))
+              ;; Set globals for handler
+              (setf *rpc-node* node)
+
+              ;; Dispatchers go in LAST: pushing them into the global
+              ;; hunchentoot:*dispatch-table* is the step that makes requests
+              ;; reachable, and a failed start must not leak them (it used to
+              ;; leave *rpc-dispatcher* in the table when the bind threw).
+              (let ((dispatcher (hunchentoot:create-prefix-dispatcher "/" 'rpc-dispatch-handler)))
+                (setf *rpc-dispatcher* dispatcher)
+                (push dispatcher pushed)
+                (push dispatcher hunchentoot:*dispatch-table*))
+              ;; REST GET surface under /rest/ — pushed AFTER the "/" dispatcher
+              ;; so it sits at the front of the list and matches first. Only when
+              ;; -rest is given (Core StartREST gate, init.cpp:758).
+              (when rest-enabled
+                (bitcoin-lisp::node-log :info "REST interface enabled at /rest/")
+                (let ((rest-dispatcher (hunchentoot:create-prefix-dispatcher
+                                        "/rest/" 'rest-dispatch-handler)))
+                  (setf *rest-dispatcher* rest-dispatcher)
+                  (push rest-dispatcher pushed)
+                  (push rest-dispatcher hunchentoot:*dispatch-table*)))
+              ;; Web UI static assets under /ui/ (gui-plan P0). Registered only
+              ;; when enabled — a disabled UI leaves no handler at all.
+              (setf *ui-enabled* (and ui-enabled t)
+                    *ui-directory* (and ui-directory
+                                        (uiop:ensure-directory-pathname ui-directory)))
+              (when *ui-enabled*
+                (let ((dir (ui-directory)))
+                  (if (and dir (probe-file dir))
+                      (bitcoin-lisp::node-log :info "Web UI enabled at /ui/ (serving ~A)" dir)
+                      (bitcoin-lisp::node-log
+                       :warn "Web UI enabled but asset directory ~A is missing — /ui/ will 404" dir)))
+                (let ((ui-dispatcher (make-ui-dispatcher)))
+                  (setf *ui-dispatcher* ui-dispatcher)
+                  (push ui-dispatcher pushed)
+                  (push ui-dispatcher hunchentoot:*dispatch-table*)))
+
+              (setf *rpc-server* acceptor)
+              (bitcoin-lisp::node-log :info "RPC server started on ~A:~A" bind port)
+              acceptor)
+          (usocket:address-in-use-error ()
+            (bitcoin-lisp::node-log :error "RPC port ~A already in use, continuing without RPC" port)
+            (abort-start))
+          (error (e)
+            (bitcoin-lisp::node-log :error "Failed to start RPC server: ~A" e)
+            (abort-start)))))))
 
 (defun stop-rpc-server ()
   "Stop the RPC server."
@@ -721,6 +955,7 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
     (when *ui-dispatcher*
       (setf hunchentoot:*dispatch-table*
             (remove *ui-dispatcher* hunchentoot:*dispatch-table*)))
+    (delete-rpc-cookie)
     (setf *rpc-server* nil)
     (setf *rpc-node* nil)
     (setf *rpc-user* nil)

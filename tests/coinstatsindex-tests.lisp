@@ -186,3 +186,237 @@ the full MuHash numerator/denominator fraction."
       (is (equalp (bitcoin-lisp.crypto:muhash-finalize mu)
                   (bitcoin-lisp.crypto:muhash-finalize
                    (bitcoin-lisp.storage:coinstats-muhash decoded)))))))
+
+;;;; Rewind on a divergent index (GA8 wave 5, Core BaseIndex::Rewind).
+;;;;
+;;;; Records are keyed by HEIGHT with no block hash and there is no disconnect
+;;;; hook, while index writes reach the OS immediately and the chainstate tip
+;;;; only becomes durable at a flush (a reorg does not trigger one). A process
+;;;; kill in that window leaves records holding an ABANDONED chain's state at
+;;;; heights at or below the tip that startup restores; the repair loop this
+;;;; replaced blessed them by existence and overwrote the stored meta hash —
+;;;; the one piece of evidence that could have detected the divergence.
+
+(defun %csi-fixture (tag blocks)
+  "(values node csi cs tip) — a regtest node with BLOCKS mined blocks and a
+coinstats index built over them, installed on the node. Call inside
+%with-regtest."
+  (let* ((node (%regtest-node-fixture tag))
+         (idxbase (merge-pathnames (format nil "test-csi-rw-~A/" tag)
+                                   (uiop:temporary-directory))))
+    (let ((bitcoin-lisp::*node* node))
+      (bitcoin-lisp.rpc::rpc-generatetodescriptor node (list blocks "raw(51)")))
+    (let* ((cs (bitcoin-lisp::node-chain-state node))
+           (csi (bitcoin-lisp.storage:init-coinstatsindex idxbase :enabled t)))
+      (bitcoin-lisp.storage:build-coinstatsindex
+       csi cs (bitcoin-lisp::node-block-store node)
+       #'bitcoin-lisp.validation:get-undo-data
+       #'bitcoin-lisp.validation:calculate-block-subsidy)
+      (setf (bitcoin-lisp::node-coinstatsindex node) csi)
+      (values node csi cs (bitcoin-lisp.storage:current-height cs)))))
+
+(defmacro %csi-counting-calls ((count-var fname) &body body)
+  "Run BODY with calls to FNAME counted in COUNT-VAR (the real function still
+runs), restoring FNAME afterwards. Lets a test assert which of two rewind
+paths did the work — and that the counter can move at all."
+  (let ((real (gensym "REAL")))
+    `(let ((,count-var 0)
+           (,real (fdefinition ,fname)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition ,fname)
+                    (lambda (&rest args) (incf ,count-var) (apply ,real args)))
+              ,@body)
+         (setf (fdefinition ,fname) ,real)))))
+
+(defun %csi-raw-record (csi height)
+  "The stored record at HEIGHT as raw bytes (NIL if absent)."
+  (bitcoin-lisp.storage::leveldb-get
+   (bitcoin-lisp.storage:coinstatsindex-db csi)
+   (bitcoin-lisp.storage::%csi-stat-key height)))
+
+(defun %csi-put-raw-record (csi height bytes)
+  (bitcoin-lisp.storage::leveldb-put
+   (bitcoin-lisp.storage:coinstatsindex-db csi)
+   (bitcoin-lisp.storage::%csi-stat-key height) bytes))
+
+(defun %csi-fake-branch (cs from-height to-height seed)
+  "Add synthetic block-index entries for a competing branch over
+FROM-HEIGHT+1..TO-HEIGHT, forking off the active chain at FROM-HEIGHT.
+Returns the branch tip's hash. Models a reorg whose headers the node still
+knows (they were persisted by an earlier flush)."
+  (let ((prev (bitcoin-lisp.storage:get-block-at-height cs from-height))
+        (tip-hash nil))
+    (loop for h from (1+ from-height) to to-height
+          for hash = (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element (+ seed h))
+          do (let ((entry (bitcoin-lisp.storage:make-block-index-entry
+                           :hash hash :height h :chain-work 1 :status :valid
+                           :prev-entry prev
+                           :header (bitcoin-lisp.storage:block-index-entry-header
+                                    (bitcoin-lisp.storage:get-block-at-height cs h)))))
+               (bitcoin-lisp.storage:add-block-index-entry cs entry)
+               (setf prev entry tip-hash hash)))
+    tip-hash))
+
+(defun %csi-divergent-state (csi fork-height tip branch-hash)
+  "Make the index look like it followed an abandoned branch above FORK-HEIGHT:
+records at FORK-HEIGHT+1..TIP replaced by a lower height's record, and the best
+marker naming BRANCH-HASH at TIP. Returns the correct records (an alist of
+height -> bytes) so the test can assert they are rebuilt."
+  (let ((correct (loop for h from (1+ fork-height) to tip
+                       collect (cons h (%csi-raw-record csi h))))
+        (wrong (%csi-raw-record csi (1- fork-height))))
+    (loop for h from (1+ fork-height) to tip
+          do (%csi-put-raw-record csi h wrong))
+    (bitcoin-lisp.storage:coinstatsindex-set-best csi tip branch-hash)
+    correct))
+
+(test coinstatsindex-rewinds-to-fork-point-when-branch-is-known
+  "A best marker naming a block that is NOT the active chain's block at that
+height must be rewound to the last common ancestor and the records above it
+rebuilt — not blessed in place with the active chain's hash written over the
+evidence. Here the abandoned branch's headers are still in the header index,
+so the fork point comes from the cheap ancestor walk (Core's pprev walk in
+BaseIndex::Rewind)."
+  (%with-regtest
+   (multiple-value-bind (node csi cs tip)
+       (%csi-fixture (format nil "csirw~D" (get-internal-real-time)) 6)
+     (let* ((fork (- tip 2))
+            (branch (%csi-fake-branch cs fork tip 200))
+            (correct (%csi-divergent-state csi fork tip branch)))
+       ;; Precondition: the index now serves the wrong records.
+       (is (not (equalp (cdr (assoc tip correct)) (%csi-raw-record csi tip))))
+       ;; Drive the shipped startup entry point: it must rewind and rebuild
+       ;; every record above the fork, exactly.
+       (bitcoin-lisp::%catch-up-coinstatsindex node)
+       (is (= tip (bitcoin-lisp.storage:coinstatsindex-height csi)))
+       (dolist (entry correct)
+         (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
+             "record at height ~D was not rebuilt" (car entry)))
+       ;; The best marker names the ACTIVE chain's tip again.
+       (multiple-value-bind (h hash) (bitcoin-lisp.storage:coinstatsindex-best csi)
+         (is (= tip h))
+         (is (equalp (bitcoin-lisp.storage:block-index-entry-hash
+                      (bitcoin-lisp.storage:get-block-at-height cs tip))
+                     hash)))
+       ;; Re-diverge to observe the rewind itself: it lands on the fork point,
+       ;; and gets there from the header index alone — no record recomputed, so
+       ;; this path is measured separately from the fallback in the next test.
+       (%csi-divergent-state csi fork tip branch)
+       (%csi-counting-calls
+           (verifications 'bitcoin-lisp.storage:coinstatsindex-record-matches-block-p)
+         (is (eql fork (bitcoin-lisp::%rewind-coinstatsindex node)))
+         (is (= 0 verifications)
+             "the header-index ancestor walk did not resolve the fork (~D recomputations)"
+             verifications))
+       (is (= fork (bitcoin-lisp.storage:coinstatsindex-height csi)))
+       (bitcoin-lisp.storage:close-coinstatsindex csi)))))
+
+(test coinstatsindex-rewinds-when-branch-headers-are-lost
+  "Same divergence, but the abandoned branch's headers are NOT in the header
+index — the realistic case, since headers are only persisted at flush time, so
+the crash that strands the marker also loses the branch it names. The rewind
+must still find the fork point, by recomputing each record from its stored
+parent and the active block at that height."
+  (%with-regtest
+   (multiple-value-bind (node csi cs tip)
+       (%csi-fixture (format nil "csirwu~D" (get-internal-real-time)) 6)
+     (let* ((fork (- tip 2))
+            (unknown (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element #xE7))
+            (correct (%csi-divergent-state csi fork tip unknown)))
+       (is (null (bitcoin-lisp.storage:get-block-index-entry cs unknown)))
+       ;; The shipped entry point rewinds and rebuilds, as above.
+       (bitcoin-lisp::%catch-up-coinstatsindex node)
+       (is (= tip (bitcoin-lisp.storage:coinstatsindex-height csi)))
+       (dolist (entry correct)
+         (is (equalp (cdr entry) (%csi-raw-record csi (car entry)))
+             "record at height ~D was not rebuilt" (car entry)))
+       ;; Re-diverge to observe the rewind itself: it lands on the fork point,
+       ;; and gets there by recomputation — one per height from the tip down to
+       ;; the fork, the path the header-index walk cannot cover here.
+       (%csi-divergent-state csi fork tip unknown)
+       (%csi-counting-calls
+           (verifications 'bitcoin-lisp.storage:coinstatsindex-record-matches-block-p)
+         (is (eql fork (bitcoin-lisp::%rewind-coinstatsindex node)))
+         (is (= 3 verifications)
+             "expected one recomputation per height from the tip down to the fork, got ~D"
+             verifications))
+       (bitcoin-lisp.storage:close-coinstatsindex csi)))))
+
+(test coinstatsindex-consistent-index-is-not-rebuilt
+  "Control: a consistent index must NOT rewind and must NOT re-index a single
+block — a fix that always rebuilt would be a severe performance regression
+(hours on a real chain). The same counter proves it can see work happening,
+by re-running against a divergent index."
+  (%with-regtest
+   (multiple-value-bind (node csi cs tip)
+       (%csi-fixture (format nil "csictl~D" (get-internal-real-time)) 5)
+     (%csi-counting-calls (adds 'bitcoin-lisp.storage:coinstatsindex-add-block)
+       ;; Consistent: no rewind, no work at all.
+       (is (null (bitcoin-lisp::%rewind-coinstatsindex node)))
+       (bitcoin-lisp::%catch-up-coinstatsindex node)
+       (is (= 0 adds) "a consistent index re-indexed ~D block(s)" adds)
+       (is (= tip (bitcoin-lisp.storage:coinstatsindex-height csi)))
+       ;; Positive control: the counter does move when there IS work.
+       (let ((fork (- tip 2)))
+         (%csi-divergent-state csi fork tip (%csi-fake-branch cs fork tip 100))
+         (bitcoin-lisp::%catch-up-coinstatsindex node)
+         (is (= 2 adds) "divergent index re-indexed ~D block(s)" adds)))
+     (bitcoin-lisp.storage:close-coinstatsindex csi))))
+
+(test coinstatsindex-ahead-of-tip-rewinds-to-tip
+  "The ordinary unclean-shutdown shape: index writes are durable immediately,
+the chainstate tip only at a flush, so after a kill the marker sits above the
+restored tip on the SAME chain. That must cost one verification and a marker
+move to the tip — not a rebuild from genesis."
+  (%with-regtest
+   (multiple-value-bind (node csi cs tip)
+       (%csi-fixture (format nil "csiahd~D" (get-internal-real-time)) 5)
+     (let ((tip-record (%csi-raw-record csi tip)))
+       ;; Two blocks' worth of records above the restored tip, marker on a
+       ;; block the (stale) header index never saw.
+       (%csi-put-raw-record csi (+ tip 1) tip-record)
+       (%csi-put-raw-record csi (+ tip 2) tip-record)
+       (bitcoin-lisp.storage:coinstatsindex-set-best
+        csi (+ tip 2) (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element #xC3))
+       (%csi-counting-calls (adds 'bitcoin-lisp.storage:coinstatsindex-add-block)
+         (is (eql tip (bitcoin-lisp::%rewind-coinstatsindex node)))
+         (bitcoin-lisp::%catch-up-coinstatsindex node)
+         (is (= 0 adds) "an index merely ahead of the tip re-indexed ~D block(s)" adds))
+       ;; Marker back on the active tip, its record untouched.
+       (multiple-value-bind (h hash) (bitcoin-lisp.storage:coinstatsindex-best csi)
+         (is (= tip h))
+         (is (equalp (bitcoin-lisp.storage:block-index-entry-hash
+                      (bitcoin-lisp.storage:get-block-at-height cs tip))
+                     hash)))
+       (is (equalp tip-record (%csi-raw-record csi tip)))
+       (bitcoin-lisp.storage:close-coinstatsindex csi)))))
+
+(test coinstatsindex-rpc-refuses-stale-branch-hash
+  "gettxoutsetinfo resolves a block hash to a height through the header index,
+which also resolves STALE-BRANCH hashes — and the index holds active-chain
+statistics only. Asking by a stale-branch hash must error rather than serve the
+active chain's numbers under that hash. Control: the active-chain hash at the
+same height still works."
+  (%with-regtest
+   (multiple-value-bind (node csi cs tip)
+       (%csi-fixture (format nil "csirpc2~D" (get-internal-real-time)) 4)
+     (let* ((stale (%csi-fake-branch cs (1- tip) tip 150))
+            (active (bitcoin-lisp.storage:block-index-entry-hash
+                     (bitcoin-lisp.storage:get-block-at-height cs tip))))
+       (signals bitcoin-lisp.rpc::rpc-error
+         (bitcoin-lisp.rpc::rpc-gettxoutsetinfo
+          node (list "muhash" (bitcoin-lisp.rpc::hash-to-hex stale))))
+       (let ((res (bitcoin-lisp.rpc::rpc-gettxoutsetinfo
+                   node (list "muhash" (bitcoin-lisp.rpc::hash-to-hex active)))))
+         (is (= tip (cdr (assoc "height" res :test #'string=)))))
+       ;; A height above the best marker is not vouched for either.
+       (bitcoin-lisp.storage:coinstatsindex-set-best
+        csi (1- tip) (bitcoin-lisp.storage:block-index-entry-hash
+                      (bitcoin-lisp.storage:get-block-at-height cs (1- tip))))
+       (signals bitcoin-lisp.rpc::rpc-error
+         (bitcoin-lisp.rpc::rpc-gettxoutsetinfo node (list "muhash" tip)))
+       (bitcoin-lisp.storage:close-coinstatsindex csi)))))

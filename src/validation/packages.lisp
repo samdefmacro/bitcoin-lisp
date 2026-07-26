@@ -37,6 +37,35 @@
 (defconstant +max-package-weight+ 404000
   "Maximum total weight of a package (Core MAX_PACKAGE_WEIGHT).")
 
+;;;; Package identity
+
+(defun %wtxid-lessp (a b)
+  "Ascending uint256 order over two 32-byte hashes — Core compares them with
+reverse iterators (policy/packages.cpp:158-161), i.e. from the LAST byte
+backwards, since a uint256 is stored little-endian."
+  (loop for i from 31 downto 0
+        do (let ((x (aref a i)) (y (aref b i)))
+             (cond ((< x y) (return t))
+                   ((> x y) (return nil))))
+        finally (return nil)))
+
+(defun package-hash (package)
+  "Core GetPackageHash (policy/packages.cpp:151-170): SHA256 over PACKAGE's
+wtxids concatenated in ascending uint256 order. The identity of a package as
+a COMBINATION — order-independent — so a combination already known to fail
+can be remembered in the reconsiderable-rejects filter and skipped instead of
+re-validated on every re-announcement (MempoolRejectedPackage /
+Find1P1CPackage, txdownloadman_impl.cpp:302-320, 500-502)."
+  (let* ((wtxids (sort (mapcar #'bitcoin-lisp.serialization:transaction-wtxid
+                               package)
+                       #'%wtxid-lessp))
+         (buf (make-array (* 32 (length wtxids))
+                          :element-type '(unsigned-byte 8))))
+    (loop for w in wtxids
+          for off from 0 by 32
+          do (replace buf w :start1 off))
+    (bitcoin-lisp.crypto:sha256 buf)))
+
 ;;;; Per-transaction result of package validation
 
 (defstruct package-tx-result

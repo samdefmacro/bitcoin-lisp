@@ -52,4 +52,8 @@
 
    ;; JSON boolean helpers (Core booleans are true/false, never null)
    #:+json-false+
-   #:json-bool))
+   #:json-bool
+
+   ;; Empty-collection helpers (Core renders [] / {}, never null)
+   #:json-array
+   #:json-object))

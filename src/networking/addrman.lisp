@@ -346,12 +346,22 @@ incumbent back to a new bucket."
 the 16-byte form), or NIL (Core Find)."
   (ab-find book ip port net))
 
-(defun address-book-add (book pa &optional source-group)
+(defun address-book-add (book pa &optional source-group (time-penalty 0))
   "Add address PA (a peer-address carrying net/ip/port/services/last-seen)
 learned from a peer whose net-group key is SOURCE-GROUP (a net-group-key
 result over the gossiping peer's typed address — any network, now that
 onion/cjdns peers can be dial sources; defaults to the added address's own
 group), placing it in a NEW bucket per Bitcoin Core AddrMan AddSingle.
+
+TIME-PENALTY (seconds, default none) ages the timestamp we record, exactly as
+Core's AddrMan::Add time_penalty argument does (addrman.cpp:596): a third
+party telling us about an address is weaker evidence of liveness than our own
+observation, so gossiped addresses are stored 2h in the past
+(net_processing.cpp:4114) while our own dial outcomes are not. A
+self-announcement is exempt (addrman.cpp:559-563) — that is the caller's call,
+since only it knows the source address. The stored timestamp never moves
+backwards and never goes negative.
+
 Returns T if newly inserted into a new bucket."
   (let ((ip (peer-address-ip pa))
         (net (peer-address-network pa)))
@@ -359,7 +369,7 @@ Returns T if newly inserted into a new bucket."
       (return-from address-book-add nil))
     (let* ((port (peer-address-port pa))
            (services (peer-address-services pa))
-           (time (peer-address-last-seen pa))
+           (time (max 0 (- (peer-address-last-seen pa) time-penalty)))
            (source-group (or source-group (net-group-key ip net)))
            (existing (ab-find book ip port net))
            (info nil))
