@@ -496,3 +496,158 @@ were mined catches up from its stored locator on load."
               ;; cb@1 (generate) + tx1 (receive) + 3 immature coinbases.
               (let ((entries (bitcoin-lisp.rpc::rpc-listtransactions node '("*" 20))))
                 (is (= 5 (length entries)))))))))))
+
+;;;; ============================================================
+;;;; G7-38: fast wallet rescan via the BIP158 filter index
+;;;; ============================================================
+
+(defun %wc-build-filter-index (node)
+  "Populate a BASIC block-filter index over the whole active chain, as the
+connect hook does live. Returns the index."
+  (let* ((dir (merge-pathnames (format nil "wc-bfi-~D-~D/"
+                                       (get-universal-time)
+                                       (incf *wallet-chain-counter*))
+                               (uiop:temporary-directory)))
+         (bfi (bitcoin-lisp.storage:init-blockfilterindex dir))
+         (state (bitcoin-lisp::node-chain-state node))
+         (store (bitcoin-lisp::node-block-store node)))
+    (loop for h from 0 to (bitcoin-lisp.storage:current-height state)
+          for entry = (bitcoin-lisp.storage:get-block-at-height state h)
+          when entry
+            do (let* ((hash (bitcoin-lisp.storage:block-index-entry-hash entry))
+                      (blk (bitcoin-lisp.storage:get-block store hash)))
+                 (when blk
+                   ;; Coinbase-only blocks spend nothing, so an empty
+                   ;; spent-utxo set is the correct input here.
+                   (bitcoin-lisp.storage:blockfilterindex-add-block
+                    bfi blk hash h '()))))
+    (setf (bitcoin-lisp::node-blockfilterindex node) bfi)
+    bfi))
+
+(defun %wc-total-end-range (wallet)
+  "Sum of every spkm's GetEndRange — grows only when scripts are actually
+cached, so a test asserting growth cannot be satisfied by a no-op top-up."
+  (let ((total 0))
+    (loop for spkm being the hash-values of (bitcoin-lisp.rpc::wallet-spkms wallet)
+          do (incf total (bitcoin-lisp.rpc::%spkm-end-range spkm)))
+    total))
+
+(test g7-38-fast-rescan-matches-slow-rescan
+  "G7-38: with the BIP158 index available, non-matching blocks are skipped
+without being read. The results must be IDENTICAL to the slow path — same
+status, same last-scanned height/hash — and last-scanned must advance THROUGH
+skipped blocks (Core wallet.cpp:1907-1908). Skipping that advance would make
+rescanblockchain report the last MATCHING block as stop_height and make
+wallet-attach-chain persist a stale best block."
+  (%with-regtest
+    (let* ((node (%wc-fixture "g738"))
+           (wname "g738w"))
+      (unwind-protect
+           (progn
+             (bitcoin-lisp.rpc::rpc-createwallet node (list wname))
+             (let ((wallet (%wc-wallet node wname)))
+               ;; Blocks that have nothing to do with this wallet.
+               (%wc-mine node 6 (%wc-optrue-address))
+               (let ((tip (bitcoin-lisp.storage:current-height
+                           (bitcoin-lisp::node-chain-state node))))
+                 ;; SLOW path first: no filter index on the node.
+                 (setf (bitcoin-lisp::node-blockfilterindex node) nil)
+                 (multiple-value-bind (s-status s-height s-hash s-skipped)
+                     (bitcoin-lisp.rpc::scan-for-wallet-transactions
+                      node wallet
+                      (bitcoin-lisp.storage:block-index-entry-hash
+                       (bitcoin-lisp.storage:get-block-at-height
+                        (bitcoin-lisp::node-chain-state node) 0))
+                      0)
+                   (is (eq :success s-status))
+                   (is (= tip s-height) "slow path must reach the tip")
+                   (is (= 0 s-skipped) "no index => nothing skipped")
+                   ;; FAST path: same scan, filters available.
+                   (%wc-build-filter-index node)
+                   (multiple-value-bind (f-status f-height f-hash f-skipped)
+                       (bitcoin-lisp.rpc::scan-for-wallet-transactions
+                        node wallet
+                        (bitcoin-lisp.storage:block-index-entry-hash
+                         (bitcoin-lisp.storage:get-block-at-height
+                          (bitcoin-lisp::node-chain-state node) 0))
+                        0)
+                     (is (plusp f-skipped)
+                         "the fast path must actually skip blocks, else this test is vacuous")
+                     (is (eq s-status f-status) "status must be identical")
+                     (is (= s-height f-height)
+                         "last-scanned height must be identical — skipped blocks still advance it")
+                     (is (equalp s-hash f-hash)
+                         "last-scanned hash must be identical"))))))
+        (ignore-errors
+         (bitcoin-lisp.rpc:close-wallet-manager
+          (bitcoin-lisp::node-wallet-manager node)))))))
+
+(test g7-38-missing-filter-falls-back-per-block
+  "G7-38: a block with NO stored filter must be inspected, not skipped (Core
+blockFilterMatchesAny -> nullopt, node/interfaces.cpp:583-584). The fallback is
+PER BLOCK; there is deliberately no whole-scan guard on the index sync height,
+because our index can contain holes below its best marker."
+  (%with-regtest
+    (let* ((node (%wc-fixture "g738b"))
+           (wname "g738bw"))
+      (unwind-protect
+           (progn
+             (bitcoin-lisp.rpc::rpc-createwallet node (list wname))
+             (let ((wallet (%wc-wallet node wname)))
+               (%wc-mine node 3 (%wc-optrue-address))
+               (let ((bfi (%wc-build-filter-index node))
+                     (state (bitcoin-lisp::node-chain-state node)))
+                 ;; A height that IS indexed => a real verdict.
+                 (let ((h1 (bitcoin-lisp.storage:block-index-entry-hash
+                            (bitcoin-lisp.storage:get-block-at-height state 1))))
+                   (is (member (bitcoin-lisp.rpc::%rescan-filter-matches-block
+                                bfi (bitcoin-lisp.rpc::%make-wallet-rescan-filter wallet) h1)
+                               '(:match :no-match))))
+                 ;; A hash with no stored filter => :unknown, so the caller reads it.
+                 (is (eq :unknown
+                         (bitcoin-lisp.rpc::%rescan-filter-matches-block
+                          bfi (bitcoin-lisp.rpc::%make-wallet-rescan-filter wallet)
+                          (make-array 32 :element-type '(unsigned-byte 8)
+                                         :initial-element 99)))))))
+        (ignore-errors
+         (bitcoin-lisp.rpc:close-wallet-manager
+          (bitcoin-lisp::node-wallet-manager node)))))))
+
+(test g7-38-filter-set-is-the-ismine-set-and-grows-with-topup
+  "G7-38: the query set must be exactly the wallet's IsMine script set, and
+UpdateIfNeeded must fold in scripts created by a mid-rescan TopUp — polling
+GetEndRange = max-cached-index + 1 (Core scriptpubkeyman.cpp:1518-1521), NOT
+range-end and NOT next-index."
+  (%with-regtest
+    (let* ((node (%wc-fixture "g738c" :keypool 3))
+           (wname "g738cw"))
+      (unwind-protect
+           (progn
+             (bitcoin-lisp.rpc::rpc-createwallet node (list wname))
+             (let* ((wallet (%wc-wallet node wname))
+                    (rf (bitcoin-lisp.rpc::%make-wallet-rescan-filter wallet))
+                    (initial (length (bitcoin-lisp.rpc::rescan-filter-scripts rf))))
+               (is (plusp initial) "a funded-capable wallet has scripts")
+               ;; Every script in the set must be IsMine, and every IsMine
+               ;; script must be in the set.
+               (let ((ismine-count 0))
+                 (loop for spkm being the hash-values
+                         of (bitcoin-lisp.rpc::wallet-spkms wallet)
+                       do (incf ismine-count
+                                (hash-table-count
+                                 (bitcoin-lisp.rpc::desc-spkm-script-map spkm))))
+                 (is (= ismine-count initial)
+                     "filter set size must equal the IsMine script count"))
+               ;; Force real expansion: hand out enough addresses that the
+               ;; keypool tops up and max-cached-index grows. A top-up that
+               ;; does not grow max-cached-index would make this vacuous.
+               (let ((before (%wc-total-end-range wallet)))
+                 (dotimes (i 8) (bitcoin-lisp.rpc::rpc-getnewaddress node '()))
+                 (is (> (%wc-total-end-range wallet) before)
+                     "precondition: handing out addresses must grow max-cached-index"))
+               (bitcoin-lisp.rpc::%rescan-filter-update-if-needed wallet rf)
+               (is (> (length (bitcoin-lisp.rpc::rescan-filter-scripts rf)) initial)
+                   "UpdateIfNeeded must fold in the newly cached scripts")))
+        (ignore-errors
+         (bitcoin-lisp.rpc:close-wallet-manager
+          (bitcoin-lisp::node-wallet-manager node)))))))

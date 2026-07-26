@@ -2444,3 +2444,38 @@ get notfound). Runs over a loopback socket pair."
                   (bitcoin-lisp.networking:disconnect-peer server-peer))
                 (bitcoin-lisp.networking:disconnect-peer client))))
         (bitcoin-lisp.networking:close-listener srv)))))
+
+(test store-validated-headers-updates-availability-for-known-batch
+  "PREREQUISITE FIX (GA7 wave-4 prep). Core updates per-peer availability from
+pindexLast — the last header of the RECEIVED batch that is in the index,
+INCLUDING headers we already had, because AcceptBlockHeader returns the
+existing entry for a known header.
+
+validate-header-chain drops already-known headers from VALID entirely
+(ibd.lisp: the `(return-from continue)` on index membership), so
+%store-validated-headers used to read (car (last valid)) = NIL for a batch we
+already hold and update NO availability at all. A peer that only ever announces
+headers we already have — the normal case for a peer at our tip, and for every
+BIP130 announcement of a block we just got from someone else — stayed pinned at
+its handshake-time best block forever.
+
+That silently disabled the pprev-locator priming sweep: build-header-locator-pprev
+exists so a caught-up peer answers with our own best header and thereby records
+its availability with no block transfer. It recorded nothing."
+  (let* ((zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%make-peer-with-state :ready))
+         (hdr (bitcoin-lisp.serialization:make-block-header
+               :version 1 :prev-block zeros :merkle-root zeros
+               :timestamp 1000 :bits #x207fffff :nonce 0))
+         (hash (bitcoin-lisp.serialization:block-header-hash hdr)))
+    ;; The header is ALREADY in the index, with positive chain work.
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash hash :height 5 :chain-work 100 :status :header-valid))
+    (is (null (bitcoin-lisp.networking::peer-best-known-block-hash peer))
+        "precondition: peer has no recorded best block")
+    (bitcoin-lisp.networking::%store-validated-headers
+     peer state (list hdr) (lambda (n) (declare (ignore n))) "test")
+    (is (equalp hash (bitcoin-lisp.networking::peer-best-known-block-hash peer))
+        "an all-already-known batch must still record the peer's best block")))
