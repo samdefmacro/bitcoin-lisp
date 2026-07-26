@@ -2259,13 +2259,32 @@ threads read/write under the same lock."
       (bitcoin-lisp:log-warn "Header validation error: ~A" error))
     (let ((added (process-headers valid chain-state)))
       (funcall count-fn added)
-      (let ((last (car (last valid))))
+      ;; Core's pindexLast (net_processing.cpp ProcessHeadersMessage): the last
+      ;; header of the RECEIVED batch that is in the block index afterwards —
+      ;; INCLUDING headers we already had, because AcceptBlockHeader returns
+      ;; the existing index entry for a known header.
+      ;;
+      ;; We cannot use (car (last VALID)): validate-header-chain drops
+      ;; already-known headers from VALID entirely, so a batch we already hold
+      ;; left VALID empty and updated NO availability. A peer that only ever
+      ;; announces headers we already have — the normal case for a peer at the
+      ;; same tip, and for every BIP130 announcement of a block we just got
+      ;; from someone else — stayed pinned at its handshake-time best block
+      ;; forever. Everything keyed off peer-best-known-block-hash (block
+      ;; download selection, and the work comparisons the eclipse-resistance
+      ;; work depends on) was reading that stale value.
+      (let ((pindex-last nil))
+        (map nil (lambda (h)
+                   (when (bitcoin-lisp.storage:get-block-index-entry
+                          chain-state (bitcoin-lisp.serialization:block-header-hash h))
+                     (setf pindex-last h)))
+             headers)
         ;; PEER may be NIL on degenerate/test callers (handle-headers with no
         ;; peer) — availability is per-peer, so skip it then.
-        (when (and peer last)
+        (when (and peer pindex-last)
           (update-block-availability
            peer chain-state
-           (bitcoin-lisp.serialization:block-header-hash last))))
+           (bitcoin-lisp.serialization:block-header-hash pindex-last))))
       (when (> added 0)
         (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added))
       added))))
