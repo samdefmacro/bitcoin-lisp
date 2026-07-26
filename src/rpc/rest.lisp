@@ -141,7 +141,7 @@ the active chain — Core's /rest/headers/<hash>?count=<n>."
         :json (%rest-json (mapcar (lambda (e)
                                     (block-header-entry-to-json
                                      e (hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash e))
-                                     chain-state))
+                                     chain-state (rpc-get-block-store node)))
                                   entries))
         :hex/bin (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
                    (dolist (e entries)

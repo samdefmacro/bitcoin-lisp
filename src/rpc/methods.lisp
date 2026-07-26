@@ -284,15 +284,45 @@ the index."
      `(("strippedsize" . ,stripped)
        ("size" . ,size)
        ("weight" . ,(bitcoin-lisp.validation:calculate-block-weight txs))
+       ;; Core blockToJSON:211 pushes coinbase_tx at every verbosity it is
+       ;; reached at (blockToJSON is only called for verbosity >= 1). Core
+       ;; CHECK_NONFATALs the coinbase's existence; we simply omit the key for
+       ;; a degenerate block rather than error out of an informational RPC.
+       ,@(let ((coinbase (first txs)))
+           (when (and coinbase
+                      (plusp (length (bitcoin-lisp.serialization:transaction-inputs coinbase))))
+             `(("coinbase_tx" . ,(%coinbase-tx-json coinbase)))))
        ("version" . ,(bitcoin-lisp.serialization:block-header-version header))
        ("merkleroot" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-merkle-root header)))
        ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
        ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
-       ("nTx" . ,ntx)
-       ("previousblockhash" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header)))
-       ("tx" . ,(if include-tx-details
+       ("nTx" . ,ntx))
+     ;; Same rule as getblockheader: blockToJSON delegates the header fields to
+     ;; blockheaderToJSON, so genesis omits previousblockhash here too. With no
+     ;; index entry we cannot tell, and every non-indexed block has a parent.
+     (if entry
+         (%previousblockhash-field entry header)
+         `(("previousblockhash"
+            . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header)))))
+     `(("tx" . ,(if include-tx-details
                     (mapcar (lambda (tx) (tx-to-json tx network)) txs)
                     (mapcar #'tx-to-txid txs)))))))
+
+(defun %coinbase-tx-json (coinbase-tx)
+  "Coinbase metadata object (Bitcoin Core coinbaseTxToJSON,
+rpc/blockchain.cpp:185-200): version, locktime, the input's sequence and
+scriptSig hex, and — only when the coinbase carries one — the single witness
+stack item (the segwit reserved value, BIP141)."
+  (let* ((vin0 (aref (bitcoin-lisp.serialization:transaction-inputs coinbase-tx) 0))
+         (witness (%tx-input-witness coinbase-tx 0)))
+    (append
+     `(("version" . ,(bitcoin-lisp.serialization:transaction-version coinbase-tx))
+       ("locktime" . ,(bitcoin-lisp.serialization:transaction-lock-time coinbase-tx))
+       ("sequence" . ,(bitcoin-lisp.serialization:tx-in-sequence vin0))
+       ("coinbase" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                       (bitcoin-lisp.serialization:tx-in-script-sig vin0))))
+     (when (and witness (plusp (length witness)))
+       `(("witness" . ,(bitcoin-lisp.crypto:bytes-to-hex (elt witness 0))))))))
 
 (defun tx-to-txid (tx)
   "Get transaction ID as hex string."
@@ -396,7 +426,8 @@ is supplied and the script is addressable) address."
         (error 'rpc-error :code +rpc-invalid-address-or-key+
                           :message "Block not found"))
       (if verbose
-          (block-header-entry-to-json entry hash-str chain-state)
+          (block-header-entry-to-json entry hash-str chain-state
+                                      (rpc-get-block-store node))
           ;; Non-verbose: serialize the header straight from the index entry
           ;; (Core serializes pblockindex->GetBlockHeader() — no block-store
           ;; read, so header-only/pruned entries work too).
@@ -404,9 +435,27 @@ is supplied and the script is addressable) address."
            (bitcoin-lisp.serialization:serialize
             (bitcoin-lisp.storage:block-index-entry-header entry)))))))
 
-(defun block-header-entry-to-json (entry hash-str chain-state)
+(defun %genesis-entry-p (entry)
+  "T when ENTRY has no parent block — Core's `blockindex.pprev == nullptr`.
+Tested on the height rather than on our prev-entry back-link: height 0 is
+exactly the no-parent case, and unlike the back-link it stays correct for an
+entry that was loaded without one (an assumeutxo base, a synthetic fixture)."
+  (zerop (bitcoin-lisp.storage:block-index-entry-height entry)))
+
+(defun %previousblockhash-field (entry header)
+  "Core blockheaderToJSON (rpc/blockchain.cpp:177-178) pushes previousblockhash
+only `if (blockindex.pprev)`, so genesis OMITS the key rather than reporting 64
+zeros. A client walking a chain backwards terminates on the missing key; given
+the all-zero hash it instead asks for a block nobody has and gets an error."
+  (unless (%genesis-entry-p entry)
+    `(("previousblockhash"
+       . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header))))))
+
+(defun block-header-entry-to-json (entry hash-str chain-state &optional block-store)
   "Convert block index entry to header JSON (Bitcoin Core getblockheader): the
-shared chain-context fields plus the header's own version/merkleroot/time/nonce."
+shared chain-context fields plus the header's own version/merkleroot/time/nonce,
+nTx, and previousblockhash when the block has a parent. BLOCK-STORE, when given,
+lets nTx be backfilled for an index entry that predates the tx-count field."
   (let ((header (bitcoin-lisp.storage:block-index-entry-header entry)))
     (append
      `(("hash" . ,hash-str))
@@ -415,7 +464,11 @@ shared chain-context fields plus the header's own version/merkleroot/time/nonce.
        ("merkleroot" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-merkle-root header)))
        ("time" . ,(bitcoin-lisp.serialization:block-header-timestamp header))
        ("nonce" . ,(bitcoin-lisp.serialization:block-header-nonce header))
-       ("previousblockhash" . ,(hash-to-hex (bitcoin-lisp.serialization:block-header-prev-block header)))))))
+       ;; Core blockheaderToJSON:175 pushes nTx unconditionally. It is 0 for a
+       ;; header whose body we have never stored, matching Core's nTx, which
+       ;; stays 0 until ReceivedBlockTransactions.
+       ("nTx" . ,(or (%entry-tx-count entry block-store) 0)))
+     (%previousblockhash-field entry header))))
 
 (defun chaintip-status (entry on-active best-hash hash block-store)
   "Bitcoin Core getchaintips status for a tip ENTRY."

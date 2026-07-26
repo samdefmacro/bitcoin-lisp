@@ -1179,6 +1179,163 @@ a hardcoded 1."
         (is (= 1 (cdr (assoc "confirmations" r :test #'string=))))
         (is (null (assoc "nextblockhash" r :test #'string=)))))))
 
+;;; --- getblockheader nTx / previousblockhash, getblock coinbase_tx ---
+
+(defun %hdrfields-tx (tag &key witness)
+  "A coinbase-shaped transaction, distinct per TAG (its 3-byte scriptSig)."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-32-byte-hash 0) :index #xffffffff)
+                    :script-sig (make-array 3 :element-type '(unsigned-byte 8)
+                                              :initial-element tag)
+                    :sequence #xfffffffe))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value 5000 :script-pubkey (make-array 4 :element-type '(unsigned-byte 8)
+                                                              :initial-element #x6a)))
+   :witness (when witness (vector (list witness)))
+   :lock-time 7))
+
+(defun %hdrfields-block (txs prev-hash time)
+  "A block over TXS with a real merkle root and PREV-HASH."
+  (let* ((root (bitcoin-lisp.validation:compute-merkle-root
+                (mapcar #'bitcoin-lisp.serialization:transaction-hash txs)))
+         (header (bitcoin-lisp.serialization:make-block-header
+                  :version 1 :prev-block prev-hash :merkle-root root
+                  :timestamp time :bits #x207fffff :nonce 0)))
+    (bitcoin-lisp.serialization:make-bitcoin-block :header header :transactions txs)))
+
+(defmacro %with-hdrfields-chain ((node store g a b) &body body)
+  "Bind NODE to a test node whose block store holds a 1-tx block G at height 0
+and a 2-tx block A at height 1, plus a header-only entry B at height 2 (the
+active tip). G, A and B are bound to (block . hash) conses."
+  (let ((dir (gensym "DIR")))
+    `(let* ((,node (make-test-node))
+            (,dir (ensure-directories-exist
+                   (merge-pathnames (format nil "hdrfields-~D/" (get-internal-real-time))
+                                    (uiop:temporary-directory))))
+            (,store (bitcoin-lisp.storage:init-block-store ,dir)))
+       (setf (bitcoin-lisp::node-block-store ,node) ,store)
+       (unwind-protect
+            (let* ((gb (%hdrfields-block (list (%hdrfields-tx 1)) (make-32-byte-hash 0) 1700000000))
+                   (gh (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header gb)))
+                   (ab (%hdrfields-block (list (%hdrfields-tx 2) (%hdrfields-tx 3)) gh 1700000600))
+                   (ah (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header ab)))
+                   (bb (%hdrfields-block (list (%hdrfields-tx 4)) ah 1700001200))
+                   (bh (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header bb)))
+                   (,g (cons gb gh)) (,a (cons ab ah)) (,b (cons bb bh))
+                   (cs (bitcoin-lisp::node-chain-state ,node)))
+              (declare (ignorable ,g ,a ,b))
+              (setf (bitcoin-lisp.storage::chain-state-genesis-hash cs) gh)
+              ;; B is header-only on purpose: its body is never stored.
+              (bitcoin-lisp.storage:store-block ,store gb)
+              (bitcoin-lisp.storage:store-block ,store ab)
+              (let* ((ge (bitcoin-lisp.storage:make-block-index-entry
+                          :hash gh :height 0 :chain-work 1 :status :valid
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header gb)))
+                     (ae (bitcoin-lisp.storage:make-block-index-entry
+                          :hash ah :height 1 :chain-work 2 :status :valid :prev-entry ge
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header ab)))
+                     (be (bitcoin-lisp.storage:make-block-index-entry
+                          :hash bh :height 2 :chain-work 3 :status :valid :prev-entry ae
+                          :header (bitcoin-lisp.serialization:bitcoin-block-header bb))))
+                (bitcoin-lisp.storage:add-block-index-entry cs ge)
+                (bitcoin-lisp.storage:add-block-index-entry cs ae)
+                (bitcoin-lisp.storage:add-block-index-entry cs be)
+                (bitcoin-lisp.storage:update-chain-tip cs bh 2))
+              ,@body)
+         (uiop:delete-directory-tree ,dir :validate t :if-does-not-exist :ignore)))))
+
+(test rpc-getblockheader-ntx-and-genesis-previousblockhash
+  "getblockheader emits nTx (Core blockheaderToJSON, rpc/blockchain.cpp:175) and
+OMITS previousblockhash for genesis (`if (blockindex.pprev)`, :177-178) rather
+than reporting 64 zeros — a client walking the chain backwards terminates on the
+missing key; given the all-zero hash it asks for a block nobody has and errors."
+  (%with-hdrfields-chain (node store g a b)
+    (flet ((hdr (hash)
+             (bitcoin-lisp.rpc::rpc-getblockheader
+              node (list (bitcoin-lisp.rpc::hash-to-hex hash)))))
+      (let ((gj (hdr (cdr g))) (aj (hdr (cdr a))) (bj (hdr (cdr b))))
+        ;; nTx is always present. Genesis carries its coinbase; A's index entry
+        ;; predates the tx-count field and is backfilled from the block store;
+        ;; B is header-only, so 0 — Core's nTx is 0 until the body arrives.
+        (is (= 1 (cdr (assoc "nTx" gj :test #'string=))))
+        (is (= 2 (cdr (assoc "nTx" aj :test #'string=))))
+        (is (= 0 (cdr (assoc "nTx" bj :test #'string=))))
+        ;; Genesis omits previousblockhash entirely...
+        (is (null (assoc "previousblockhash" gj :test #'string=)))
+        (is (not (search "previousblockhash" (%encode-rpc-result gj))))
+        ;; ...CONTROL: every other header still carries it, naming the real
+        ;; parent (so the omission is genesis-specific, not a blanket drop).
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr g))
+                     (cdr (assoc "previousblockhash" aj :test #'string=))))
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr a))
+                     (cdr (assoc "previousblockhash" bj :test #'string=))))
+        ;; The fields survive the encoder.
+        (is (search "\"nTx\":2" (%encode-rpc-result aj)))))))
+
+(test rpc-getblock-coinbase-tx-and-genesis-previousblockhash
+  "getblock emits coinbase_tx (Core blockToJSON:211 -> coinbaseTxToJSON:185-200):
+version, locktime, the coinbase input's sequence and scriptSig hex, plus the
+single witness item only when the coinbase carries one. blockToJSON delegates
+its header fields to blockheaderToJSON, so genesis omits previousblockhash here
+too."
+  (%with-hdrfields-chain (node store g a b)
+    (flet ((blk (hash &optional (verbosity 1))
+             (bitcoin-lisp.rpc::rpc-getblock
+              node (list (bitcoin-lisp.rpc::hash-to-hex hash) verbosity))))
+      (let* ((gj (blk (cdr g)))
+             (cb (cdr (assoc "coinbase_tx" gj :test #'string=))))
+        (is (not (null cb)) "getblock must emit coinbase_tx")
+        (when cb
+          (is (= 2 (cdr (assoc "version" cb :test #'string=))))
+          (is (= 7 (cdr (assoc "locktime" cb :test #'string=))))
+          (is (= #xfffffffe (cdr (assoc "sequence" cb :test #'string=))))
+          (is (string= "010101" (cdr (assoc "coinbase" cb :test #'string=))))
+          ;; CONTROL: a witness-less coinbase omits the witness key entirely
+          ;; (Core pushes it only for a non-empty stack).
+          (is (null (assoc "witness" cb :test #'string=))))
+        ;; Genesis omits previousblockhash here as well...
+        (is (null (assoc "previousblockhash" gj :test #'string=)))
+        ;; ...CONTROL: a non-genesis block still reports it.
+        (is (string= (bitcoin-lisp.rpc::hash-to-hex (cdr g))
+                     (cdr (assoc "previousblockhash" (blk (cdr a)) :test #'string=))))
+        ;; Verbosity 2 (full tx detail) carries coinbase_tx too; verbosity 0 is
+        ;; untouched raw hex.
+        (is (assoc "coinbase_tx" (blk (cdr a) 2) :test #'string=))
+        (is (stringp (blk (cdr a) 0)))))))
+
+(test rpc-getblock-coinbase-tx-witness
+  "A coinbase with a witness stack reports it as coinbase_tx.witness (the BIP141
+reserved value), matching Core's `if (!witness_stack.empty())`."
+  (let* ((node (make-test-node))
+         (dir (ensure-directories-exist
+               (merge-pathnames (format nil "cbwitness-~D/" (get-internal-real-time))
+                                (uiop:temporary-directory))))
+         (store (bitcoin-lisp.storage:init-block-store dir)))
+    (setf (bitcoin-lisp::node-block-store node) store)
+    (unwind-protect
+         (let* ((reserved (make-32-byte-hash 0))
+                (blk (%hdrfields-block (list (%hdrfields-tx 8 :witness reserved))
+                                       (make-32-byte-hash 0) 1700000000))
+                (hash (bitcoin-lisp.serialization:block-header-hash
+                       (bitcoin-lisp.serialization:bitcoin-block-header blk))))
+           (bitcoin-lisp.storage:store-block store blk)
+           (let ((cb (cdr (assoc "coinbase_tx"
+                                 (bitcoin-lisp.rpc::rpc-getblock
+                                  node (list (bitcoin-lisp.rpc::hash-to-hex hash) 1))
+                                 :test #'string=))))
+             (is (not (null cb)))
+             (when cb
+               (is (string= (bitcoin-lisp.crypto:bytes-to-hex reserved)
+                            (cdr (assoc "witness" cb :test #'string=))))
+               (is (string= "080808" (cdr (assoc "coinbase" cb :test #'string=)))))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
 ;;; --- Authentication Tests (7.4) ---
 
 (test rpc-auth-check-no-credentials
