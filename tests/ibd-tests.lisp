@@ -902,6 +902,138 @@ refuses at admission."
             (is (null valid) "version<2 at/after BIP34 height must be rejected")
             (is (and error (search "version" error)) "reason should be the bad version")))))))
 
+;;;; Median-time-past across a header batch (GA8 S1-7)
+
+(defconstant +mtp-batch-genesis-time+ 1296688600
+  "Timestamp of the synthetic genesis header the MTP-batch fixtures chain from.")
+
+(defmacro %with-mtp-regtest (&body body)
+  "Regtest network plus the regtest PoW limit, so #x207fffff is a valid target
+and ground headers reach the contextual checks."
+  `(let ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp.storage:*pow-limit-target*
+           bitcoin-lisp.storage:+regtest-pow-limit-target+))
+     ,@body))
+
+(defun %mtp-batch-fixture (suffix)
+  "(values chain-state genesis-hash) — a regtest chain-state whose genesis index
+entry carries a header timestamped +mtp-batch-genesis-time+."
+  (let* ((state (bitcoin-lisp.storage:init-chain-state
+                 (ensure-directories-exist
+                  (merge-pathnames (format nil "test-mtp-batch-~A/" suffix)
+                                   (uiop:temporary-directory)))))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash state)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash genesis-hash :height 0 :chain-work 1 :status :valid
+            :header (bitcoin-lisp.serialization:make-block-header
+                     :version 4 :prev-block zeros :merkle-root zeros
+                     :timestamp +mtp-batch-genesis-time+ :bits #x207fffff :nonce 0
+                     :cached-hash genesis-hash)))
+    (values state genesis-hash)))
+
+(defun %mtp-header (prev-hash timestamp &key (version 4) (bits #x207fffff) (grind t))
+  "A header for the MTP-batch fixtures. GRIND searches nonces for one that clears
+the regtest pow-limit target, so the header reaches the contextual checks."
+  (let ((hdr (bitcoin-lisp.serialization:make-block-header
+              :version version :prev-block prev-hash
+              :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                          :initial-element 0)
+              :timestamp timestamp :bits bits :nonce 0)))
+    (when grind
+      (loop for nonce from 0 below 5000
+            do (setf (bitcoin-lisp.serialization:block-header-nonce hdr) nonce
+                     (bitcoin-lisp.serialization:block-header-cached-hash hdr) nil)
+            until (bitcoin-lisp.validation:check-proof-of-work hdr)))
+    hdr))
+
+(test validate-header-chain-mtp-uses-in-batch-parent
+  "CONSENSUS (GA8 S1-7): the timestamp>median-time-past rule must be evaluated
+against the parent ENTRY threaded through the batch, not a block-index lookup of
+the parent HASH. A header whose parent is only staged in this batch found nothing
+in the index and was compared against a neutral 0, so Core's
+ContextualCheckBlockHeader time-too-old rule (validation.cpp:4124,
+pindexPrev->GetMedianTimePast()) was vacuously satisfied for every header after
+the first in a batch.
+Control: the same two headers delivered as SEPARATE batches — the second is
+rejected once its parent is indexed — proving the fixture really violates MTP."
+  (%with-mtp-regtest
+   (multiple-value-bind (state genesis-hash) (%mtp-batch-fixture "inbatch")
+     (let* ((h1 (%mtp-header genesis-hash (+ +mtp-batch-genesis-time+ 1000)))
+            (h1-hash (bitcoin-lisp.serialization:block-header-hash h1))
+            ;; MTP(H1) = median{genesis, H1}; Core takes the upper element of an
+            ;; even window, so it is H1's own time and anything at or below it
+            ;; violates the rule.
+            (h2 (%mtp-header h1-hash (+ +mtp-batch-genesis-time+ 500))))
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.networking::validate-header-chain (list h1 h2) state)
+         (is (= 1 (length valid)) "only the first header may be admitted")
+         (is (equalp h1 (first valid)))
+         (is (and error (search "median-time-past" error))))
+       ;; Control, part 1: H1 on its own is a valid batch.
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.networking::validate-header-chain (list h1) state)
+         (is (= 1 (length valid)))
+         (is (null error)))
+       ;; Control, part 2: with H1 indexed, the hash lookup finds a median and
+       ;; H2 is rejected — the behaviour a second batch always had.
+       (bitcoin-lisp.networking::process-headers (list h1) state)
+       (is (not (null (bitcoin-lisp.storage:get-block-index-entry state h1-hash)))
+           "H1 must be indexed for the control to mean anything")
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.networking::validate-header-chain (list h2) state)
+         (is (null valid))
+         (is (and error (search "median-time-past" error))))))))
+
+(test validate-header-chain-accepts-valid-mtp-batch
+  "No false positives: a batch whose every header is strictly after its parent's
+median-time-past is admitted whole."
+  (%with-mtp-regtest
+   (multiple-value-bind (state genesis-hash) (%mtp-batch-fixture "valid")
+     (let* ((h1 (%mtp-header genesis-hash (+ +mtp-batch-genesis-time+ 1000)))
+            (h2 (%mtp-header (bitcoin-lisp.serialization:block-header-hash h1)
+                             (+ +mtp-batch-genesis-time+ 2000)))
+            (h3 (%mtp-header (bitcoin-lisp.serialization:block-header-hash h2)
+                             (+ +mtp-batch-genesis-time+ 3000))))
+       (multiple-value-bind (valid error)
+           (bitcoin-lisp.networking::validate-header-chain (list h1 h2 h3) state)
+         (is (null error))
+         (is (= 3 (length valid))))))))
+
+(test validate-header-chain-contextual-rules-reject-at-batch-position-2
+  "Regression guard for the verified scope of GA8 S1-7: MTP was the ONLY
+contextual rule that consulted the index by hash. Proof-of-work, the future-time
+bound, difficulty and the softfork version minimums all consume the threaded
+parent entry and already reject a violating header at batch position 2, so none
+of them needed the same fix."
+  (%with-mtp-regtest
+   (multiple-value-bind (state genesis-hash) (%mtp-batch-fixture "position2")
+     (let* ((h1 (%mtp-header genesis-hash (+ +mtp-batch-genesis-time+ 1000)))
+            (h1-hash (bitcoin-lisp.serialization:block-header-hash h1))
+            (good-time (+ +mtp-batch-genesis-time+ 2000)))
+       (dolist (case (list
+                      ;; Target below the regtest pow limit that a nonce sweep
+                      ;; will not reach: PoW fails.
+                      (list "proof-of-work"
+                            (%mtp-header h1-hash good-time :bits #x1d00ffff :grind nil))
+                      (list "future"
+                            (%mtp-header h1-hash (+ (bitcoin-lisp.serialization:get-unix-time)
+                                                    7201)))
+                      ;; Regtest never retargets, so a child must inherit its
+                      ;; parent's bits exactly.
+                      (list "difficulty"
+                            (%mtp-header h1-hash good-time :bits #x207ffffe))
+                      ;; Regtest activates BIP34 at height 1.
+                      (list "version"
+                            (%mtp-header h1-hash good-time :version 1))))
+         (destructuring-bind (reason h2) case
+           (multiple-value-bind (valid error)
+               (bitcoin-lisp.networking::validate-header-chain (list h1 h2) state)
+             (is (= 1 (length valid)) "~A: header 2 must not be admitted" reason)
+             (is (and error (search reason error))
+                 "~A: rejection reason should name it, got ~A" reason error))))))))
+
 (test validate-block-skip-scripts
   "Test that validate-block with :skip-scripts t skips script validation."
   ;; Create a minimal block with an invalid script that would normally fail.
@@ -2475,7 +2607,153 @@ its availability with no block transfer. It recorded nothing."
             :hash hash :height 5 :chain-work 100 :status :header-valid))
     (is (null (bitcoin-lisp.networking::peer-best-known-block-hash peer))
         "precondition: peer has no recorded best block")
+    ;; FULL-BATCH t: Core's may_have_more_headers. The sibling half of
+    ;; UpdatePeerStateForReceivedHeaders — the IBD sub-minchainwork outbound
+    ;; drop — is skipped for a full batch, keeping this test on availability
+    ;; alone (that drop has its own tests in ECLIPSE-DOS-TESTS).
     (bitcoin-lisp.networking::%store-validated-headers
-     peer state (list hdr) (lambda (n) (declare (ignore n))) "test")
+     peer state (list hdr) t (lambda (n) (declare (ignore n))) "test")
     (is (equalp hash (bitcoin-lisp.networking::peer-best-known-block-hash peer))
         "an all-already-known batch must still record the peer's best block")))
+
+;;;; ============================================================
+;;;; G7-15: BIP133 feefilter (Core MaybeSendFeefilter + FeeFilterRounder)
+;;;; ============================================================
+
+(defun %g715-peer (&key (version bitcoin-lisp.serialization:+protocol-version+)
+                        (conn-type :outbound-full-relay))
+  "A :ready peer that has completed a version handshake at VERSION, with a
+capturing transport so sends can be observed without sockets."
+  (let ((p (bitcoin-lisp.networking::make-peer :address "test")))
+    (setf (bitcoin-lisp.networking::peer-state p) :ready
+          (bitcoin-lisp.networking::peer-conn-type p) conn-type
+          (bitcoin-lisp.networking::peer-version p)
+          (flexi-streams:with-input-from-sequence
+              (s (bitcoin-lisp.serialization:make-version-message-bytes :version version))
+            (bitcoin-lisp.serialization:read-version-message s)))
+    p))
+
+(defmacro %g715-capturing ((sent) &body body)
+  "Run BODY capturing every feefilter value sent, into the list SENT."
+  `(let ((,sent '()))
+     (let ((real (fdefinition 'bitcoin-lisp.networking::send-message)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'bitcoin-lisp.networking::send-message)
+                    (lambda (peer msg)
+                      (declare (ignore peer))
+                      (when (string= "feefilter"
+                                     (flexi-streams:with-input-from-sequence (s msg)
+                                       (bitcoin-lisp.serialization:message-header-command
+                                        (bitcoin-lisp.serialization:read-message-header s))))
+                        (push (bitcoin-lisp.serialization:parse-feefilter-payload
+                               (subseq msg 24))
+                              ,sent))))
+              ,@body)
+         (setf (fdefinition 'bitcoin-lisp.networking::send-message) real)))
+     (setf ,sent (nreverse ,sent))))
+
+(test g7-15-fee-filter-buckets-match-core
+  "Buckets are {0} U {50 * 1.1^k <= 1e7}, built by repeated MULTIPLICATION as
+Core does (MakeFeeSet) — so the third boundary is 55.00000000000001, not 55.0.
+The base is Core's compile-time DEFAULT_MIN_RELAY_TX_FEE/2 = 50, NOT the
+configured -minrelaytxfee: configuring the relay floor must not move the
+buckets, or our quantization would become a fingerprint."
+  (let ((b bitcoin-lisp.networking::*fee-filter-buckets*))
+    (is (= 0 (aref b 0)))
+    (is (= 50.0d0 (aref b 1)))
+    (is (= (* 50.0d0 1.1d0) (aref b 2))
+        "built by repeated multiplication, not recomputed as 50*1.1^k")
+    (is (<= (aref b (1- (length b))) 1d7))
+    ;; The IBD sentinel goes on the wire as the TOP BUCKET, never MAX_MONEY.
+    (is (= 9936506 (bitcoin-lisp.networking::%feefilter-max-value)))))
+
+(test g7-15-rounding-clamps-and-quantizes
+  "round() clamps anything above the top bucket to the top bucket, never
+returns a non-bucket value, and is never above the requested fee's bucket."
+  (dotimes (i 200)
+    (declare (ignore i))
+    (let ((r (bitcoin-lisp.networking::fee-filter-round 1000)))
+      (is (find (float r 1d0) bitcoin-lisp.networking::*fee-filter-buckets*
+                :test (lambda (x b) (= x (floor b))))
+          "every rounded value must be an actual bucket")))
+  (is (= (bitcoin-lisp.networking::%feefilter-max-value)
+         (bitcoin-lisp.networking::fee-filter-round most-positive-fixnum))
+      "above the top bucket must clamp deterministically"))
+
+(test g7-15-ibd-sends-top-bucket-then-resends-on-exit
+  "During IBD we ask peers for no txs at all (they would be discarded), by
+sending round(MAX_MONEY) = the top bucket. Leaving IBD must FORCE a resend —
+without that, peers keep withholding txs from us for up to another 10 minutes."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%g715-peer)))
+    ;; --- in IBD ---
+    (%g715-capturing (sent)
+      (let ((bitcoin-lisp.networking::*cached-is-ibd* t))
+        (bitcoin-lisp.networking:maybe-send-feefilter peer mempool state 1000))
+      (is (equal (list (bitcoin-lisp.networking::%feefilter-max-value)) sent)
+          "IBD must put the top bucket on the wire, not MAX_MONEY"))
+    (is (> (bitcoin-lisp.networking::peer-next-send-feefilter peer) 1000)
+        "the next-send time must be advanced")
+    ;; --- out of IBD: forced resend regardless of the schedule ---
+    (%g715-capturing (sent)
+      (let ((bitcoin-lisp.networking::*cached-is-ibd* nil))
+        (bitcoin-lisp.networking:maybe-send-feefilter peer mempool state 1001))
+      (is (= 1 (length sent))
+          "leaving IBD must force an immediate resend")
+      (is (/= (bitcoin-lisp.networking::%feefilter-max-value) (first sent))
+          "the resent value must be the real filter, not the IBD sentinel"))))
+
+(test g7-15-next-send-advances-even-when-value-unchanged
+  "Core advances m_next_send_feefilter UNCONDITIONALLY inside the due branch,
+even when the value is unchanged and nothing is sent. Omitting that turns the
+tick into a per-second re-evaluation of every peer."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp.networking::*cached-is-ibd* nil)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (peer (%g715-peer)))
+    (%g715-capturing (sent)
+      (bitcoin-lisp.networking:maybe-send-feefilter peer mempool state 1000)
+      (is (= 1 (length sent)) "first call sends"))
+    (let ((scheduled (bitcoin-lisp.networking::peer-next-send-feefilter peer)))
+      (is (> scheduled 1000))
+      ;; Due again, same value: nothing sent, but the timer still moves.
+      (%g715-capturing (sent)
+        (bitcoin-lisp.networking:maybe-send-feefilter
+         peer mempool state (1+ scheduled))
+        (is (null sent) "an unchanged value must not be resent"))
+      (is (> (bitcoin-lisp.networking::peer-next-send-feefilter peer) scheduled)
+          "the timer must advance even when nothing was sent"))))
+
+(test g7-15-gates-version-and-block-relay
+  "Core skips feefilter for peers below FEEFILTER_VERSION (70013) and for
+outbound block-relay-only peers, which never announce txs to us anyway."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp.networking::*cached-is-ibd* nil)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (state (bitcoin-lisp.storage:make-chain-state)))
+    (%g715-capturing (sent)
+      (bitcoin-lisp.networking:maybe-send-feefilter
+       (%g715-peer :version 70012) mempool state 1000)
+      (is (null sent) "a pre-70013 peer must not receive feefilter"))
+    (%g715-capturing (sent)
+      (bitcoin-lisp.networking:maybe-send-feefilter
+       (%g715-peer :conn-type :block-relay) mempool state 1000)
+      (is (null sent) "block-relay-only peers must not receive feefilter"))
+    (%g715-capturing (sent)
+      (bitcoin-lisp.networking:maybe-send-feefilter
+       (%g715-peer) mempool state 1000)
+      (is (= 1 (length sent)) "a normal peer must receive one"))))
+
+(test g7-15-rolling-min-excludes-relay-floor
+  "Core rounds CTxMemPool::GetMinFee, which EXCLUDES -minrelaytxfee; the max()
+with the floor is applied AFTER rounding. Feeding the already-floored value to
+round() would emit 107 a third of the time where Core emits a flat 100."
+  (let ((mempool (bitcoin-lisp.mempool:make-mempool)))
+    (is (= 0 (bitcoin-lisp.mempool:mempool-decayed-rolling-min-fee-rate mempool))
+        "an idle pool has NO rolling minimum, independent of the relay floor")
+    (is (plusp (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
+        "the effective rate still folds the floor in")))
