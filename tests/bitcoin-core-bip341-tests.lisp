@@ -379,3 +379,115 @@ one. Uses the same 9-input/2-output vector tx at an out-of-range index."
           (bitcoin-lisp.coalton.interop::validate-taproot-key-path (list sig) pk 0)
         (is (null ok))
         (is (eq :sig-hashtype err))))))
+
+;;;; ============================================================
+;;;; GA8 tapscript resource limits (S1-3)
+;;;;
+;;;; BIP 342 lifts MAX_SCRIPT_SIZE and MAX_OPS_PER_SCRIPT but keeps the
+;;;; 520-byte element cap and the 1000-item stack cap. Core proves it
+;;;; structurally: the push-size check (interpreter.cpp:447-448) sits between
+;;;; the two sigversion-gated checks and is itself ungated, and
+;;;; ExecuteWitnessScript re-applies both to the initial witness stack
+;;;; (:1854-1861) — but only after the OP_SUCCESS scan (:1837), which
+;;;; overrides them.
+;;;; ============================================================
+
+(defun tap-bytes (&rest parts)
+  "Concatenate integers and byte sequences into one (unsigned-byte 8) vector."
+  (coerce (loop for part in parts
+                append (if (integerp part) (list part) (coerce part 'list)))
+          '(vector (unsigned-byte 8))))
+
+(defun tap-filler (n)
+  "N filler bytes."
+  (make-array n :element-type '(unsigned-byte 8) :initial-element #x42))
+
+(defun tap-pushdata2 (n)
+  "OP_PUSHDATA2 pushing N filler bytes."
+  (tap-bytes #x4d (ldb (byte 8 0) n) (ldb (byte 8 8) n) (tap-filler n)))
+
+(defun tapscript-leaf-witness (leaf-script &key inputs annex)
+  "Build (values witness output-pubkey32) for a script-path spend of LEAF-SCRIPT
+as the single leaf (version 0xc0) of a taproot output, with INPUTS as the initial
+witness stack and an optional ANNEX as the final witness element."
+  (let* ((internal (bitcoin-lisp.crypto:derive-xonly-pubkey
+                    (make-array 32 :element-type '(unsigned-byte 8)
+                                   :initial-element #x03)))
+         (leaf-hash (bitcoin-lisp.crypto:tap-leaf-hash #xc0 leaf-script)))
+    (multiple-value-bind (output-key parity)
+        (bitcoin-lisp.coalton.interop:compute-tweaked-pubkey internal leaf-hash)
+      (values (append inputs
+                      (list leaf-script
+                            (tap-bytes (logior #xc0 parity) internal))
+                      (and annex (list annex)))
+              output-key))))
+
+(defun tapscript-leaf-spend (leaf-script &key inputs annex (amount 100000))
+  "Validate the script-path spend built by TAPSCRIPT-LEAF-WITNESS.
+Returns (values ok err)."
+  (multiple-value-bind (witness output-key)
+      (tapscript-leaf-witness leaf-script :inputs inputs :annex annex)
+    (bitcoin-lisp.coalton.interop:validate-taproot witness output-key amount)))
+
+(test ga8-s1-3-tapscript-keeps-the-520-byte-push-cap
+  "S1-3: a push over 520 bytes inside a tapscript is SCRIPT_ERR_PUSH_SIZE. BIP 342
+removes MAX_SCRIPT_SIZE and MAX_OPS_PER_SCRIPT, not MAX_SCRIPT_ELEMENT_SIZE — the
+pre-fix code gated all three on TAPSCRIPT and accepted the oversize push."
+  ;; OP_PUSHDATA2 <n> OP_DROP OP_1, both sides of the boundary.
+  (is (eq t (tapscript-leaf-spend (tap-bytes (tap-pushdata2 520) #x75 #x51))))
+  (is (null (tapscript-leaf-spend (tap-bytes (tap-pushdata2 521) #x75 #x51))))
+  (is (null (tapscript-leaf-spend (tap-bytes (tap-pushdata2 600) #x75 #x51))))
+  ;; Control: the same scripts under witness v0, where the cap was never gated.
+  (flet ((p2wsh (script)
+           (bitcoin-lisp.coalton.interop:validate-p2wsh
+            (list script) (bitcoin-lisp.crypto:sha256 script) 100000)))
+    (is (eq t (p2wsh (tap-bytes (tap-pushdata2 520) #x75 #x51))))
+    (is (null (p2wsh (tap-bytes (tap-pushdata2 521) #x75 #x51))))))
+
+(test ga8-s1-3-tapscript-initial-stack-element-size
+  "S1-3: an initial witness element over 520 bytes is SCRIPT_ERR_PUSH_SIZE
+(ExecuteWitnessScript, interpreter.cpp:1858-1861) — the tapscript twin of the
+check the v0 path already had. Script is OP_DROP OP_1: OP_SIZE-based variants
+fail cleanstack first and would assert nothing."
+  (flet ((drop-one (n)
+           (tapscript-leaf-spend (tap-bytes #x75 #x51)
+                                 :inputs (list (tap-filler n)))))
+    (is (eq t (drop-one 520)))
+    (multiple-value-bind (ok err) (drop-one 521)
+      (is (null ok))
+      (is (eq :push-size err)))
+    (multiple-value-bind (ok err) (drop-one 600)
+      (is (null ok))
+      (is (eq :push-size err)))))
+
+(test ga8-s1-3-tapscript-initial-stack-count
+  "S1-3: more than MAX_STACK_SIZE initial witness elements is
+SCRIPT_ERR_STACK_SIZE (interpreter.cpp:1855). The comparison is strictly
+greater-than, so 1000 elements still spend."
+  (flet ((drop-all (n)
+           (tapscript-leaf-spend
+            (tap-bytes (make-array n :element-type '(unsigned-byte 8)
+                                     :initial-element #x75)
+                       #x51)
+            :inputs (make-list n :initial-element (tap-filler 1)))))
+    (is (eq t (drop-all 1000)))
+    (multiple-value-bind (ok err) (drop-all 1001)
+      (is (null ok))
+      (is (eq :stack-size err)))))
+
+(test ga8-s1-3-op-success-overrides-the-tapscript-limits
+  "S1-3 placement: OP_SUCCESSx processing overrides everything, including the
+stack element size limits (interpreter.cpp:1836-1837). Every violation the three
+tests above reject is therefore accepted once the leaf script carries an
+OP_SUCCESS opcode — which is what pins the new checks after the scan."
+  (let ((op-success #xbb))              ; OP_SUCCESS187 (BIP 342)
+    ;; Oversize push inside the script.
+    (is (eq t (tapscript-leaf-spend
+               (tap-bytes (tap-pushdata2 600) #x75 op-success))))
+    ;; Oversize initial witness element.
+    (is (eq t (tapscript-leaf-spend (tap-bytes #x75 op-success)
+                                    :inputs (list (tap-filler 600)))))
+    ;; Too many initial witness elements.
+    (is (eq t (tapscript-leaf-spend
+               (tap-bytes op-success)
+               :inputs (make-list 1001 :initial-element (tap-filler 1)))))))

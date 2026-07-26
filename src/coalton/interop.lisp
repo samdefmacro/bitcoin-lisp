@@ -199,6 +199,13 @@
 (defconstant +coinbase-maturity+ 100
   "Number of blocks before coinbase outputs can be spent.")
 
+(defconstant +max-script-element-size+ 520
+  "Maximum size in bytes of a stack element (Core MAX_SCRIPT_ELEMENT_SIZE,
+script.h:28). BIP 342 does not lift it for tapscript.")
+
+(defconstant +max-stack-size+ 1000
+  "Maximum number of stack items (Core MAX_STACK_SIZE, script.h:43).")
+
 ;;; Satoshi operations
 ;;; Coalton functions are directly callable from CL
 
@@ -2726,7 +2733,7 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
 
     ;; Check witness item sizes (max 520 bytes per BIP 141)
     (dolist (item (butlast witness))
-      (when (> (length item) 520)
+      (when (> (length item) +max-script-element-size+)
         (return-from validate-p2wsh (values nil :push-size))))
 
     ;; Execute the witness script with remaining witness items as initial stack
@@ -2987,7 +2994,17 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
                 (when (scan-for-op-success script)
                   (return-from validate-taproot-script-path (values t nil)))
 
-                ;; 2. Initialize validation weight budget (BIP 342) AND
+                ;; 2. Initial witness stack limits. ExecuteWitnessScript
+                ;; (interpreter.cpp:1854-1861) applies them in this order, and
+                ;; only after the OP_SUCCESS scan above — which overrides both
+                ;; (interpreter.cpp:1837).
+                (when (> (length script-inputs) +max-stack-size+)
+                  (return-from validate-taproot-script-path (values nil :stack-size)))
+                (dolist (item script-inputs)
+                  (when (> (length item) +max-script-element-size+)
+                    (return-from validate-taproot-script-path (values nil :push-size))))
+
+                ;; 3. Initialize validation weight budget (BIP 342) AND
                 ;; execute the Tapscript inside a dynamic let-binding for
                 ;; *tapscript-validation-weight-left*. The earlier code
                 ;; used setf on the global (no rebind) and relied on
@@ -2997,7 +3014,7 @@ mirror Bitcoin Core's per-sig FindAndDelete loop
                 (let ((*tapscript-validation-weight-left*
                         (+ (compute-witness-serialization-size witness)
                            +validation-weight-offset+)))
-                  ;; 3. Execute the Tapscript with witness inputs as stack
+                  ;; 4. Execute the Tapscript with witness inputs as stack
                   (run-tapscript script script-inputs leaf-hash amount internal-pubkey)))
               ;; Unknown leaf version - anyone can spend if DISCOURAGE flag not set
               (if (flag-enabled-p "DISCOURAGE_UPGRADABLE_TAPROOT_VERSION")
