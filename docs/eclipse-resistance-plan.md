@@ -119,6 +119,18 @@ on disconnect, asserting it never goes negative. **Block-relay peers are
 deliberately *not* protected** — they are always subject to the bad/lagging
 chain logic.
 
+The decrement is the load-bearing half: Core does it in `FinalizeNode`
+(net_processing.cpp:1717-1718), which runs for *every* node removal whatever the
+reason. So the counter, the grant and the release all live in `peer.lisp`
+alongside the retirement paths — `disconnect-peer`, `record-misbehavior` and
+`ban-peer` each call `release-outbound-protection` — rather than in `ibd.lisp`
+next to the eviction logic, which loads later and could not call back into
+`disconnect-peer`. The per-peer flag is the source of truth so a peer retired by
+two paths decrements only once. A counter that only increments does not merely
+weaken this feature, it inverts it: during IBD any caught-up peer trivially
+satisfies `best-known >= tip`, so all 4 slots are spent within minutes of
+startup and, once those peers churn out, no peer can ever be protected again.
+
 ### P3 — stale tip and extra outbound
 
 `CheckForStaleTipAndEvictPeers` on a 45s cadence in `maintain-peers`:

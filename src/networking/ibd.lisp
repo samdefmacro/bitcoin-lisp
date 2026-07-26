@@ -2263,11 +2263,10 @@ our tip's work before we probe it.")
   "Core HEADERS_RESPONSE_TIME (2min): the grace period after the probing
 getheaders. Total budget before a disconnect is 20min + 2min.")
 
-(defconstant +max-outbound-peers-to-protect+ 4
-  "Core MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.")
-
-(defvar *protected-outbound-count* 0
-  "How many outbound peers currently hold chain-sync protection.")
+;;; The protection half (maybe-protect-outbound-peer / release-outbound-protection
+;;; and their counter) lives in peer.lisp: the slot must be released from
+;;; disconnect-peer, record-misbehavior and ban-peer (Core FinalizeNode), and
+;;; peer.lisp loads before this file.
 
 (defun consider-chain-sync-eviction (peer chain-state now)
   "Port of Core ConsiderEviction (net_processing.cpp:5292-5350). Returns
@@ -2332,29 +2331,6 @@ chain is useless to us, not malicious."
             (setf (peer-chain-sync-sent-getheaders peer) t
                   (peer-chain-sync-timeout peer) (+ now +headers-response-time-seconds+))
             :probed)))))))
-
-(defun maybe-protect-outbound-peer (peer)
-  "Grant chain-sync protection to an outbound FULL-RELAY peer that delivered a
-chain at least as good as our tip (Core net_processing.cpp:2946-2956), up to
-MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.
-
-Block-relay peers are deliberately NOT protected — Core keeps them always
-subject to the bad/lagging chain logic."
-  (when (and (not (peer-chain-sync-protect peer))
-             (not (peer-inbound peer))
-             (not (peer-manual peer))
-             (eq (peer-conn-type peer) :outbound-full-relay)
-             (< *protected-outbound-count* +max-outbound-peers-to-protect+))
-    (setf (peer-chain-sync-protect peer) t)
-    (incf *protected-outbound-count*)
-    t))
-
-(defun release-outbound-protection (peer)
-  "Give back a protection slot on disconnect. Core asserts the counter never
-goes negative; we clamp and keep the flag as the single source of truth."
-  (when (peer-chain-sync-protect peer)
-    (setf (peer-chain-sync-protect peer) nil)
-    (setf *protected-outbound-count* (max 0 (1- *protected-outbound-count*)))))
 
 (defun maybe-disconnect-low-work-outbound (peer chain-state full-batch)
   "Core's IBD chain-quality drop (net_processing.cpp:2926-2944): during IBD, a
