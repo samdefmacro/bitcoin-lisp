@@ -1339,6 +1339,90 @@ CBlockIndex::GetBlockTimeMax). O(height); failure-path only."
              (setf entry (bitcoin-lisp.storage:block-index-entry-prev-entry entry)))
     time-max))
 
+;;; --- Fast rescan via the BIP158 filter index (Core FastWalletRescanFilter) ---
+;;;
+;;; Core wallet.cpp:308-361. Skipping a block on a filter miss is sound because
+;;; a BIP158 basic filter contains the scriptPubKeys of the block's outputs AND
+;;; of every prevout it spends, while our wallet only ever recognises a tx via a
+;;; script in some spkm's script-map (spkm-is-mine, wallet.lisp:398-401). So a
+;;; block that pays us or spends from us necessarily names one of our scripts in
+;;; its filter.
+
+(defstruct (rescan-filter (:constructor %make-rescan-filter))
+  "Query-element set for the fast rescan (Core FastWalletRescanFilter)."
+  ;; GCS query elements: every script in the wallet's IsMine set.
+  (scripts '() :type list)
+  ;; Dedup across spkms (Core's ElementSet).
+  (seen (make-hash-table :test 'equalp) :type hash-table)
+  ;; spkm id -> the GetEndRange() we last folded in, for UpdateIfNeeded.
+  (last-ends (make-hash-table :test 'equalp) :type hash-table))
+
+(defun %spkm-end-range (spkm)
+  "Core DescriptorScriptPubKeyMan::GetEndRange (scriptpubkeyman.cpp:1518-1521)
+= m_max_cached_index + 1. NOT range-end and NOT next-index: only cached
+scripts are in the IsMine map, so only they can be in the query set."
+  (1+ (desc-spkm-max-cached-index spkm)))
+
+(defun %rescan-filter-add-spkm (rf spkm min-index)
+  "Fold SPKM's cached scripts at range index >= MIN-INDEX into RF (Core
+AddScriptPubKeys + GetScriptPubKeys(minimum_index), scriptpubkeyman.cpp:1506)."
+  (maphash (lambda (script index)
+             (when (and (>= index min-index)
+                        (not (gethash script (rescan-filter-seen rf))))
+               (setf (gethash script (rescan-filter-seen rf)) t)
+               (push script (rescan-filter-scripts rf))))
+           (desc-spkm-script-map spkm)))
+
+(defun %make-wallet-rescan-filter (wallet)
+  "Build the query set from every spkm's IsMine script map (Core's ctor,
+wallet.cpp:311-323). Ranged descriptors also record their end-range so
+UpdateIfNeeded can fold in scripts a mid-rescan TopUp creates."
+  (let ((rf (%make-rescan-filter)))
+    (with-wallet-lock (wallet)
+      (loop for spkm being the hash-values of (wallet-spkms wallet)
+            do (%rescan-filter-add-spkm rf spkm 0)
+               ;; Core guards this on IsHDEnabled() == descriptor IsRange()
+               ;; (scriptpubkeyman.cpp:1162-1166): a non-ranged descriptor can
+               ;; never grow, so it needs no re-poll.
+               (when (out-desc-ranged-p (desc-spkm-desc spkm))
+                 (setf (gethash (desc-spkm-id spkm) (rescan-filter-last-ends rf))
+                       (%spkm-end-range spkm)))))
+    rf))
+
+(defun %rescan-filter-update-if-needed (wallet rf)
+  "Core UpdateIfNeeded (wallet.cpp:325-337): re-poll each ranged spkm's
+end-range and fold in anything cached since. Called at the TOP of every block
+iteration, so a TopUp triggered by block N-1 is in the set when block N is
+matched."
+  (with-wallet-lock (wallet)
+    (loop for spkm being the hash-values of (wallet-spkms wallet)
+          do (let ((previous (gethash (desc-spkm-id spkm) (rescan-filter-last-ends rf))))
+               (when previous
+                 (let ((current (%spkm-end-range spkm)))
+                   (when (> current previous)
+                     (%rescan-filter-add-spkm rf spkm previous)
+                     (setf (gethash (desc-spkm-id spkm) (rescan-filter-last-ends rf))
+                           current))))))))
+
+(defun %rescan-filter-matches-block (bfi rf block-hash)
+  "Match RF's script set against BLOCK-HASH's stored BASIC filter.
+Returns :match, :no-match, or :unknown when no filter is stored for that block.
+
+:unknown is the per-block fail-safe (Core blockFilterMatchesAny returning
+nullopt, node/interfaces.cpp:583-584): the caller inspects the block. There is
+deliberately NO whole-scan guard on the index's sync height — Core has none,
+our index can legitimately contain holes below its best marker, and 'no filter
+=> read the block' is already the safe direction."
+  (let ((filter (bitcoin-lisp.storage:blockfilterindex-get-filter bfi block-hash)))
+    (if (null filter)
+        :unknown
+        (multiple-value-bind (k0 k1)
+            (bitcoin-lisp.storage:block-filter-siphash-keys block-hash)
+          (if (bitcoin-lisp.storage:gcs-filter-match-any
+               filter k0 k1 (rescan-filter-scripts rf))
+              :match
+              :no-match)))))
+
 (defun scan-for-wallet-transactions (node wallet start-hash start-height
                                      &key max-height (update t) save-progress)
   "Port of CWallet::ScanForWalletTransactions. Scans the active chain from
@@ -1351,14 +1435,35 @@ node-lock hold (no reorg can interleave mid-segment; the segment start is
 re-verified on the active chain after every release — Core's per-block
 still-active check). The caller must hold the rescan reservation.
 
-Returns (values status last-scanned-height last-scanned-hash), STATUS one of
-:success / :failure (a block was unreadable or the chain moved away) /
-:user-abort."
+When the BIP158 filter index is available, blocks whose stored basic filter
+does not match any of the wallet's scripts are SKIPPED without being read or
+deserialized (Core's fast variant, wallet.cpp:1868-1914) — the difference
+between hours and minutes on a birthday import. Results are identical; a block
+with no stored filter is read as before.
+
+Returns (values status last-scanned-height last-scanned-hash skipped-count),
+STATUS one of :success / :failure (a block was unreadable or the chain moved
+away) / :user-abort."
   (let ((status :success)
         (last-scanned-height nil)
         (last-scanned-hash nil)
         (height start-height)
-        (block-hash start-hash))
+        (block-hash start-hash)
+        ;; Gate ONLY on the index existing and being enabled, exactly as Core
+        ;; gates on hasBlockFilterIndex (wallet.cpp:1869). Never on its sync
+        ;; height: the per-block :unknown fallback already covers a lagging or
+        ;; gappy index, and a whole-scan guard would disable the fast path
+        ;; whenever the index trails the tip by even one block.
+        (bfi (let ((b (rpc-get-blockfilterindex node)))
+               (and b (bitcoin-lisp.storage:blockfilterindex-enabled b) b)))
+        (rf nil)
+        (skipped 0))
+    (when bfi (setf rf (%make-wallet-rescan-filter wallet)))
+    (bitcoin-lisp:log-info "Wallet ~A: rescan started from height ~D (~A)"
+                           (wallet-name wallet) start-height
+                           (if rf
+                               "fast variant using block filters"
+                               "slow variant inspecting all blocks"))
     (block scan
       (loop
         (when (wallet-abort-rescan wallet)
@@ -1393,25 +1498,48 @@ Returns (values status last-scanned-height last-scanned-hash), STATUS one of
                              (return))
                            (let* ((ehash (bitcoin-lisp.storage:block-index-entry-hash e))
                                   (eheight (bitcoin-lisp.storage:block-index-entry-height e))
-                                  (blk (bitcoin-lisp.storage:get-block store ehash)))
-                             (if (null blk)
-                                 ;; Unreadable block: record failure, keep
-                                 ;; scanning (Core's could-not-scan branch).
-                                 (setf status :failure)
-                                 (let ((block-time
-                                         (bitcoin-lisp.serialization:block-header-timestamp
-                                          (bitcoin-lisp.serialization:bitcoin-block-header blk))))
-                                   (with-wallet-lock (wallet)
-                                     (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions blk)
-                                           for index from 0
-                                           do (wallet-sync-transaction
-                                               wallet tx
-                                               (list :confirmed ehash eheight index)
-                                               :update update
-                                               :rescanning t
-                                               :block-time block-time)))
-                                   (setf last-scanned-hash ehash
-                                         last-scanned-height eheight)))
+                                  ;; Core wallet.cpp:1901-1902: refresh the set
+                                  ;; BEFORE matching this block, so a TopUp that
+                                  ;; block N-1 triggered is present for block N.
+                                  (verdict (when rf
+                                             (%rescan-filter-update-if-needed wallet rf)
+                                             (%rescan-filter-matches-block bfi rf ehash)))
+                                  ;; Only read the block if we might need it.
+                                  (blk (unless (eq verdict :no-match)
+                                         (bitcoin-lisp.storage:get-block store ehash))))
+                             (cond
+                               ((eq verdict :no-match)
+                                ;; Filter proves no script of ours appears in
+                                ;; this block. Skip the read entirely — but
+                                ;; STILL advance last-scanned (Core
+                                ;; wallet.cpp:1907-1908). Omitting that would
+                                ;; make rpc-rescanblockchain report the last
+                                ;; MATCHING block as stop_height and make
+                                ;; wallet-attach-chain persist a stale best
+                                ;; block, corrupting confirmation depth and
+                                ;; re-scanning the tail on every restart.
+                                (incf skipped)
+                                (setf last-scanned-hash ehash
+                                      last-scanned-height eheight))
+                               ((null blk)
+                                ;; Unreadable block: record failure, keep
+                                ;; scanning (Core's could-not-scan branch).
+                                (setf status :failure))
+                               (t
+                                (let ((block-time
+                                        (bitcoin-lisp.serialization:block-header-timestamp
+                                         (bitcoin-lisp.serialization:bitcoin-block-header blk))))
+                                  (with-wallet-lock (wallet)
+                                    (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions blk)
+                                          for index from 0
+                                          do (wallet-sync-transaction
+                                              wallet tx
+                                              (list :confirmed ehash eheight index)
+                                              :update update
+                                              :rescanning t
+                                              :block-time block-time)))
+                                  (setf last-scanned-hash ehash
+                                        last-scanned-height eheight))))
                              (let ((target (or max-height tip-height)))
                                (setf (wallet-scan-progress wallet)
                                      (if (> target start-height)
@@ -1451,7 +1579,13 @@ Returns (values status last-scanned-height last-scanned-hash), STATUS one of
                 wallet mempool
                 (bitcoin-lisp.mempool:mempool-entry-transaction entry))))))))
     (setf (wallet-scan-progress wallet) 1.0)
-    (values status last-scanned-height last-scanned-hash)))
+    (when rf
+      (bitcoin-lisp:log-info "Wallet ~A: fast rescan skipped ~D block~:P via block filters"
+                             (wallet-name wallet) skipped))
+    ;; SKIPPED is a 4th value so tests (and operators) can confirm the fast
+    ;; path actually fired rather than inferring it; all existing callers
+    ;; destructure at most three values.
+    (values status last-scanned-height last-scanned-hash skipped)))
 
 (defun wallet-rescan-from-time (node wallet start-time &key (update t))
   "Core CWallet::RescanFromTime: scan from the first block that could
