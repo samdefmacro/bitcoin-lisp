@@ -56,9 +56,9 @@ matching Bitcoin Core's uint256::GetHex."
                    ("difficulty" . ,(%difficulty-from-bits bits))
                    ("time" . ,(if tip-header
                                   (bitcoin-lisp.serialization:block-header-timestamp tip-header) 0))
-                   ("mediantime" . ,(if best-hash
-                                        (bitcoin-lisp.validation:compute-median-time-past
-                                         chain-state best-hash)
+                   ("mediantime" . ,(or (and best-hash
+                                             (bitcoin-lisp.validation:compute-median-time-past
+                                              chain-state best-hash))
                                         0))
                    ("verificationprogress" . ,(if syncing 0.0 1.0))
                    ("initialblockdownload" . ,(json-bool syncing))
@@ -250,8 +250,9 @@ not the tip -- nextblockhash."
                          (format nil "~8,'0x"
                                  (logand (bitcoin-lisp.serialization:block-header-version header)
                                          #xffffffff))))
-       ("mediantime" . ,(bitcoin-lisp.validation:compute-median-time-past
-                         chain-state (bitcoin-lisp.storage:block-index-entry-hash entry)))
+       ("mediantime" . ,(or (bitcoin-lisp.validation:compute-median-time-past-from-entry
+                             entry)
+                            0))
        ("bits" . ,(string-downcase (format nil "~8,'0x" bits)))
        ("target" . ,(string-downcase
                      (format nil "~64,'0x" (bitcoin-lisp.storage:bits-to-target bits))))
@@ -2688,12 +2689,12 @@ omitted when a block in range is unreadable (mirrors Core's unknown nChainTx)."
                   ("window_final_block_height" . ,final-height)
                   ("window_block_count" . ,blockcount))))
           (when (and (plusp blockcount) past)
-            (let ((interval (- (bitcoin-lisp.validation:compute-median-time-past
-                                chain-state
-                                (bitcoin-lisp.storage:block-index-entry-hash final))
-                               (bitcoin-lisp.validation:compute-median-time-past
-                                chain-state
-                                (bitcoin-lisp.storage:block-index-entry-hash past)))))
+            (let ((interval (- (or (bitcoin-lisp.validation:compute-median-time-past-from-entry
+                                    final)
+                                   0)
+                               (or (bitcoin-lisp.validation:compute-median-time-past-from-entry
+                                    past)
+                                   0))))
               (setf result (append result `(("window_interval" . ,interval))))
               (when window-known
                 (setf result (append result `(("window_tx_count" . ,window-tx))))

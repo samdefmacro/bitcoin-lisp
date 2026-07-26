@@ -622,7 +622,9 @@ header; these synthetic fixtures must too."
    :timestamp 1231006505 :bits #x1d00ffff :nonce 0
    :cached-hash genesis-hash))
 
-(defun make-reorg-test-block (prev-hash block-hash height &key (value 5000000000))
+(defun make-reorg-test-block (prev-hash block-hash height
+                              &key (value 5000000000)
+                                   (timestamp (+ 1231006505 (* height 600))))
   "Create a minimal test block for reorg tests.
 
 The coinbase's script-sig is derived from BLOCK-HASH so each block's
@@ -661,7 +663,7 @@ script-sig makes the serialization deterministic per block."
                   :version 1
                   :prev-block prev-hash
                   :merkle-root merkle-root
-                  :timestamp (+ 1231006505 (* height 600))
+                  :timestamp timestamp
                   :bits #x1d00ffff
                   :nonce 0
                   :cached-hash block-hash)))
