@@ -8,6 +8,75 @@
 
 (in-suite rpc-tests)
 
+;;; --- Shared fixtures: temp data directory + raw HTTP client ---
+;;;
+;;; The HTTP helpers also serve ui-tests.lisp, which loads after this file.
+
+(defmacro with-rpc-test-datadir ((var) &body body)
+  "Run BODY with VAR bound to a fresh temporary data directory, removed after.
+Every start-rpc-server call needs one: the .cookie written there is the
+credential when no rpcuser/rpcpassword is configured."
+  `(let ((,var (ensure-directories-exist
+                (merge-pathnames (format nil "bl-rpc-test-~D-~D/"
+                                         (get-universal-time) (random 1000000))
+                                 (uiop:temporary-directory)))))
+     (unwind-protect (progn ,@body)
+       (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
+
+(defun %basic-auth-header (credential)
+  "An HTTP Basic Authorization header value carrying CREDENTIAL (\"user:pass\")."
+  (concatenate 'string "Basic " (cl-base64:string-to-base64-string credential)))
+
+(defun %http-raw-request (port lines &optional body)
+  "Send an HTTP request (header LINES + optional BODY, CRLF framing) to
+127.0.0.1:PORT and return the whole response as a string."
+  (let ((request
+          (with-output-to-string (s)
+            (dolist (line lines)
+              (write-string line s)
+              (write-char #\Return s)
+              (write-char #\Linefeed s))
+            (write-char #\Return s)
+            (write-char #\Linefeed s)
+            (when body (write-string body s)))))
+    (usocket:with-client-socket (socket stream "127.0.0.1" port
+                                 :element-type '(unsigned-byte 8) :timeout 15)
+      (write-sequence (flexi-streams:string-to-octets request :external-format :utf-8)
+                      stream)
+      (force-output stream)
+      (let ((bytes (make-array 0 :element-type '(unsigned-byte 8)
+                                 :adjustable t :fill-pointer 0)))
+        (loop for b = (read-byte stream nil nil)
+              while b do (vector-push-extend b bytes))
+        (flexi-streams:octets-to-string
+         (coerce bytes '(vector (unsigned-byte 8))) :external-format :utf-8)))))
+
+(defun %http-status (response)
+  "The status code of an \"HTTP/1.1 NNN ...\" response string."
+  (parse-integer response :start 9 :junk-allowed t))
+
+(defun %http-post-rpc (port json &key origin auth auth-header)
+  "POST JSON to / on 127.0.0.1:PORT. AUTH is a \"user:pass\" credential sent as
+HTTP Basic; AUTH-HEADER sends a literal Authorization value instead."
+  (%http-raw-request
+   port
+   (append (list "POST / HTTP/1.1"
+                 (format nil "Host: 127.0.0.1:~D" port))
+           (when origin (list (format nil "Origin: ~A" origin)))
+           (let ((header (or auth-header (and auth (%basic-auth-header auth)))))
+             (when header (list (format nil "Authorization: ~A" header))))
+           (list "Content-Type: application/json"
+                 (format nil "Content-Length: ~D" (length json))
+                 "Connection: close"))
+   json))
+
+(defun %http-get (port path)
+  (%http-raw-request
+   port
+   (list (format nil "GET ~A HTTP/1.1" path)
+         (format nil "Host: 127.0.0.1:~D" port)
+         "Connection: close")))
+
 ;;; --- JSON-RPC Parsing Tests ---
 
 (test json-rpc-parse-valid-request
@@ -516,13 +585,15 @@ status with no scan running returns null; abort with no scan is a no-op."
   (is (null bitcoin-lisp.rpc:*rpc-server*))
 
   ;; Start on an unusual port to avoid conflicts
-  (let ((node (make-test-node)))
-    (bitcoin-lisp.rpc:start-rpc-server node :port 19999)
-    (is (not (null bitcoin-lisp.rpc:*rpc-server*)))
+  (with-rpc-test-datadir (dir)
+    (let ((node (make-test-node)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (bitcoin-lisp.rpc:start-rpc-server node :port 19999)
+      (is (not (null bitcoin-lisp.rpc:*rpc-server*)))
 
-    ;; Stop server
-    (bitcoin-lisp.rpc:stop-rpc-server)
-    (is (null bitcoin-lisp.rpc:*rpc-server*))))
+      ;; Stop server
+      (bitcoin-lisp.rpc:stop-rpc-server)
+      (is (null bitcoin-lisp.rpc:*rpc-server*)))))
 
 ;;; --- Helper to create initialized test node ---
 
@@ -1339,22 +1410,66 @@ reserved value), matching Core's `if (!witness_stack.empty())`."
 ;;; --- Authentication Tests (7.4) ---
 
 (test rpc-auth-check-no-credentials
-  "Test auth check passes when no credentials configured"
-  ;; When no user/password is set, auth should pass
-  (let ((bitcoin-lisp.rpc::*rpc-user* nil)
-        (bitcoin-lisp.rpc::*rpc-password* nil))
-    (is (bitcoin-lisp.rpc::check-auth nil))))
-
-(test rpc-auth-header-parsing
-  "Test Basic auth header parsing"
-  ;; Create a mock request with Authorization header
-  ;; Base64 of "testuser:testpass" is "dGVzdHVzZXI6dGVzdHBhc3M="
+  "A request carrying no Authorization header is never authorized, in every
+credential state startup can produce. Core answers 401 for an absent header
+before looking at any configuration (HTTPReq_JSONRPC, httprpc.cpp:112-117);
+this test used to assert the opposite for the default deployment, which left
+the whole RPC surface — loaded wallet included — open to any local process."
+  ;; default startup: the .cookie pair is the credential
+  (let ((bitcoin-lisp.rpc::*rpc-user* bitcoin-lisp.rpc::+rpc-cookie-user+)
+        (bitcoin-lisp.rpc::*rpc-password* "deadbeef"))
+    (is (not (bitcoin-lisp.rpc::check-auth nil)))
+    (is (not (bitcoin-lisp.rpc::check-auth ""))))
+  ;; -rpcuser/-rpcpassword startup
   (let ((bitcoin-lisp.rpc::*rpc-user* "testuser")
         (bitcoin-lisp.rpc::*rpc-password* "testpass"))
-    ;; We can't easily mock hunchentoot request, but we can test the logic
-    ;; by checking that auth is required when credentials are set
-    (is (not (null bitcoin-lisp.rpc::*rpc-user*)))
-    (is (not (null bitcoin-lisp.rpc::*rpc-password*)))))
+    (is (not (bitcoin-lisp.rpc::check-auth nil))))
+  ;; no credential installed at all: nothing authorizes, not even an empty one
+  (let ((bitcoin-lisp.rpc::*rpc-user* nil)
+        (bitcoin-lisp.rpc::*rpc-password* nil))
+    (is (not (bitcoin-lisp.rpc::check-auth nil)))
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header ":"))))))
+
+(test rpc-auth-header-parsing
+  "check-auth parses the HTTP Basic header the way Core's RPCAuthorized does
+(httprpc.cpp:84-101): \"Basic \" prefix, base64, split on the FIRST colon, so a
+password may contain colons. Anything malformed is rejected, never accepted."
+  (let ((bitcoin-lisp.rpc::*rpc-user* "testuser")
+        (bitcoin-lisp.rpc::*rpc-password* "testpass"))
+    ;; base64 of "testuser:testpass"
+    (is (bitcoin-lisp.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpass")))
+    ;; scheme name is case-insensitive, surrounding space is trimmed (Core
+    ;; TrimStringView)
+    (is (bitcoin-lisp.rpc::check-auth "basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    (is (bitcoin-lisp.rpc::check-auth "Basic  dGVzdHVzZXI6dGVzdHBhc3M= "))
+    ;; malformed shapes
+    (is (not (bitcoin-lisp.rpc::check-auth "dGVzdHVzZXI6dGVzdHBhc3M=")))
+    (is (not (bitcoin-lisp.rpc::check-auth "Bearer dGVzdHVzZXI6dGVzdHBhc3M=")))
+    (is (not (bitcoin-lisp.rpc::check-auth "Basic ")))
+    (is (not (bitcoin-lisp.rpc::check-auth "Basic not-base64!!")))
+    ;; no colon in the decoded credential
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testusertestpass"))))
+    ;; near misses
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpas"))))
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpassX"))))
+    (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "TESTUSER:testpass")))))
+  ;; the split is on the first colon, so the password keeps the rest
+  (let ((bitcoin-lisp.rpc::*rpc-user* "u")
+        (bitcoin-lisp.rpc::*rpc-password* "a:b:c"))
+    (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:a:b:c")))))
+
+(test rpc-timing-resistant-equal
+  "%timing-resistant-equal decides exactly what STRING= decides (Core
+TimingResistantEqual, util/strencodings.h:203-210) — a comparator that is
+constant-time but wrong would hand out access."
+  (let ((cases '("" "a" "ab" "deadbeef" "deadbee" "deadbeef0"
+                 "DEADBEEF" "d" "xxxxxxxx")))
+    (dolist (a cases)
+      (dolist (b cases)
+        (is (eq (and (string= a b) t)
+                (and (bitcoin-lisp.rpc::%timing-resistant-equal a b) t))
+            "~S vs ~S" a b)))))
 
 ;;; --- Concurrent Access Tests (2.7) ---
 
@@ -2374,17 +2489,277 @@ bitcoin-cli sends those; rejecting non-2.0 made it unusable."
     (is (string= "uptime" method))))
 
 (test rpc-basic-auth-and-cookie
-  "%basic-auth-matches-p accepts the configured user:pass and the cookie
-credential, and rejects a wrong password (fixing the prior mismatch bypass)."
-  (let ((bitcoin-lisp.rpc::*rpc-user* "u")
-        (bitcoin-lisp.rpc::*rpc-password* "p")
-        (bitcoin-lisp.rpc::*rpc-cookie-secret* "deadbeef"))
-    (flet ((basic (s) (concatenate 'string "Basic "
-                                   (cl-base64:string-to-base64-string s))))
-      (is (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "u:p")))
-      (is (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "__cookie__:deadbeef")))
-      (is (not (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "u:wrong"))))
-      (is (not (bitcoin-lisp.rpc::%basic-auth-matches-p (basic "__cookie__:bad")))))))
+  "check-auth against the two credential states start-rpc-server can actually
+produce. Startup installs exactly one credential, as Core's
+InitRPCAuthentication pushes exactly one entry into g_rpcauth
+(httprpc.cpp:262-288): the .cookie pair when no rpcuser/rpcpassword is given,
+that pair otherwise. Binding user, password AND cookie secret at once — what
+this test used to do — describes no reachable configuration."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let ((node (make-test-node))
+          (cookie-file (merge-pathnames ".cookie" dir)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             ;; (a) no rpcuser/rpcpassword: the cookie is the credential
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port 19994))))
+             (is (string= bitcoin-lisp.rpc::+rpc-cookie-user+
+                          bitcoin-lisp.rpc::*rpc-user*))
+             (let ((cookie (alexandria:read-file-into-string cookie-file)))
+               (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header cookie)))
+               (is (not (bitcoin-lisp.rpc::check-auth
+                         (%basic-auth-header "__cookie__:bad"))))
+               (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:p")))))
+             ;; shutdown removes the cookie it generated (Core DeleteAuthCookie)
+             (bitcoin-lisp.rpc:stop-rpc-server)
+             (is (null (probe-file cookie-file)))
+             ;; (b) rpcuser/rpcpassword: that pair is the credential, no cookie
+             ;; is written, and the cookie user is not a way in
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server
+                             node :port 19994 :user "u" :password "p"))))
+             (is (null (probe-file cookie-file)))
+             (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:p")))
+             (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:wrong"))))
+             (is (not (bitcoin-lisp.rpc::check-auth
+                       (%basic-auth-header "__cookie__:p")))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
+
+(test rpc-cookie-file-is-owner-only
+  "The generated .cookie is the RPC credential, so no other local user may read
+it: Core creates it under umask 0077 (GenerateAuthCookie, request.cpp:99-146).
+Ours was 0664 on the live testnet4 and mainnet datadirs, which would have left
+the credential readable node-wide even with auth enforced."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let ((node (make-test-node)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port 19995))))
+             (let ((path (merge-pathnames ".cookie" dir)))
+               (is (not (null (probe-file path))))
+               (is (= #o600
+                      (logand #o777
+                              (sb-posix:stat-mode
+                               (sb-posix:stat (namestring (truename path)))))))
+               ;; the file is renamed into place, never left half-written
+               (is (null (probe-file (merge-pathnames ".cookie.tmp" dir))))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
+
+(defun %file-mode (path)
+  "The permission bits of PATH."
+  (logand #o777 (sb-posix:stat-mode (sb-posix:stat (namestring path)))))
+
+(test rpc-cookie-owner-only-under-a-permissive-umask
+  "0600 has to come from open(2), not from a chmod afterwards. Core gets it
+from a process-wide umask 0077 (common/system.cpp:92-93) so the cookie is
+owner-only from creation (GenerateAuthCookie, request.cpp:99-146); we set no
+process umask, so the mode must be passed to open. The live host runs umask
+002 — its .cookie files were 0664 — which is what this test reproduces."
+  (with-rpc-test-datadir (dir)
+    (let ((old-umask (sb-posix:umask #o002)))
+      (unwind-protect
+           (progn
+             ;; Premise check: without this the 0600 assertion below would pass
+             ;; on a strict ambient umask no matter what the cookie code does.
+             (let ((control (merge-pathnames "umask-control" dir)))
+               (with-open-file (s control :direction :output :if-does-not-exist :create)
+                 (write-string "x" s))
+               (is (= #o664 (%file-mode control))
+                   "test premise: under umask 002 an ordinary file is 0664, got ~O"
+                   (%file-mode control)))
+             (multiple-value-bind (path secret)
+                 (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+               (is (not (null path)))
+               (is (= #o600 (%file-mode path))
+                   "the cookie must be 0600 whatever the umask, got ~O" (%file-mode path))
+               (is (search secret (alexandria:read-file-into-string path)))
+               (is (null (probe-file (merge-pathnames ".cookie.tmp" dir))))))
+        (sb-posix:umask old-umask)))))
+
+(test rpc-cookie-never-written-into-a-file-we-did-not-create
+  "The secret must only ever be written into a file this process exclusively
+created. Chmod-after-write cannot deliver that: POSIX checks permissions at
+open(2) only, so a descriptor opened while .cookie.tmp still carries the
+umask's mode stays valid across the chmod and the rename, and inotify on the
+data directory makes that window deterministic on every node start. Both halves
+below are the same defect — WITH-OPEN-FILE :if-exists :supersede opens the
+EXISTING inode with O_TRUNC, and follows a symlink to do it."
+  (with-rpc-test-datadir (dir)
+    (let ((tmp (merge-pathnames ".cookie.tmp" dir)))
+      ;; (a) a planted regular file whose descriptor the attacker still holds
+      (with-open-file (s tmp :direction :output :if-does-not-exist :create)
+        (write-string "" s))
+      (sb-posix:chmod (namestring tmp) #o666)
+      (with-open-file (spy tmp :direction :input)
+        (multiple-value-bind (path secret) (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+          (is (not (null path)))
+          (is (not (null secret)))
+          (let ((seen (progn (file-position spy 0) (or (read-line spy nil nil) ""))))
+            (is (not (search secret seen))
+                "the secret was written into a pre-existing inode the attacker ~
+still holds open: ~S" seen))))
+      (when (probe-file (merge-pathnames ".cookie" dir))
+        (delete-file (merge-pathnames ".cookie" dir)))
+      ;; (b) a planted symlink: written through, and then RENAME moves the
+      ;; resolved target over .cookie
+      (let ((target (merge-pathnames "attacker-target" dir)))
+        (with-open-file (s target :direction :output :if-does-not-exist :create)
+          (write-string "" s))
+        (handler-case (sb-posix:unlink (namestring tmp)) (error () nil))
+        (sb-posix:symlink (namestring target) (namestring tmp))
+        (multiple-value-bind (path secret) (bitcoin-lisp.rpc::generate-rpc-cookie dir)
+          (is (not (null path)))
+          ;; NB: keep this out of a 3-element (and a b) inside IS — FiveAM
+          ;; treats any 3-element form as (predicate expected actual) and
+          ;; evaluates both arguments, so the short-circuit is lost and a
+          ;; renamed-away target errors instead of failing.
+          (let ((leaked (if (probe-file target)
+                            (search secret (alexandria:read-file-into-string target))
+                            :target-renamed-over-cookie)))
+            (is (null leaked)
+                "the secret leaked through a planted .cookie.tmp symlink (~S)" leaked))
+          ;; and the cookie that did get installed is still usable and 0600
+          (is (search secret (alexandria:read-file-into-string path)))
+          (is (= #o600 (%file-mode path))))))))
+
+(test rpc-failed-start-does-not-clobber-a-live-cookie
+  "A start that cannot bind must leave .cookie alone. Core binds first —
+AppInitServers runs InitHTTPServer before StartHTTPRPC ->
+InitRPCAuthentication -> GenerateAuthCookie (init.cpp:748-761) — so a port
+conflict aborts before any credential is touched. Writing the cookie first
+means a second process started on a running node's data directory (which has
+happened here: restart-node.sh's pkill marker missed the live supervisor)
+overwrites .cookie with a secret matching nothing and then exits. The healthy
+node keeps serving with the old secret, so every client that re-reads the file
+gets 401 from a node that is perfectly fine, and nothing logs anything."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let* ((port 19993)
+           (node (make-test-node))
+           (cookie-file (merge-pathnames ".cookie" dir)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             ;; the healthy node: bound, cookie written, credential live
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             (let ((live-cookie (alexandria:read-file-into-string cookie-file))
+                   (live-user bitcoin-lisp.rpc::*rpc-user*)
+                   (live-pass bitcoin-lisp.rpc::*rpc-password*)
+                   (live-dispatch hunchentoot:*dispatch-table*))
+               (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
+               ;; the second process: same data directory, same port. The
+               ;; "already running" guard is per-process, so unbind it to reach
+               ;; the code a second process would run.
+               (let ((bitcoin-lisp.rpc::*rpc-server* nil))
+                 (is (null (bitcoin-lisp.rpc:start-rpc-server node :port port))
+                     "the second start must fail: the port is taken"))
+               ;; nothing about the running node changed
+               (let ((on-disk (and (probe-file cookie-file)
+                                   (alexandria:read-file-into-string cookie-file))))
+                 (is (equal live-cookie on-disk)
+                     "the failed start rewrote or removed .cookie under a live node")
+                 (is (equal live-user bitcoin-lisp.rpc::*rpc-user*))
+                 (is (equal live-pass bitcoin-lisp.rpc::*rpc-password*))
+                 (is (eq live-dispatch hunchentoot:*dispatch-table*)
+                     "the failed start leaked a dispatcher into hunchentoot:*dispatch-table*")
+                 (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
+                 ;; and a client reading .cookie off disk still gets in
+                 (let ((r (%http-post-rpc port "{\"method\":\"getblockcount\",\"id\":1}"
+                                          :auth (or on-disk "__cookie__:gone"))))
+                   (is (= 200 (%http-status r))
+                       "a client re-reading .cookie was locked out of a live node")))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
+
+(test rpc-requires-credentials-end-to-end
+  "Live acceptor through rpc-handler: no Authorization header answers 401 with
+a WWW-Authenticate challenge, a wrong credential answers 401, and the generated
+cookie answers 200 (Core HTTPReq_JSONRPC, httprpc.cpp:112-133). Proven live
+against the running testnet4 node before this fix: an unauthenticated
+getblockcount returned 200, and so did a wrong Basic credential."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let ((port 19996)
+          (node (make-test-node))
+          (body "{\"method\":\"getblockcount\",\"id\":1}"))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             ;; no credential at all
+             (let ((r (%http-post-rpc port body)))
+               (is (= 401 (%http-status r)))
+               (is (search "www-authenticate: basic" (string-downcase r)))
+               (is (not (search "\"result\"" r))))
+             ;; wrong credential
+             (let ((r (%http-post-rpc port body :auth "__cookie__:wrong")))
+               (is (= 401 (%http-status r)))
+               (is (not (search "\"result\"" r))))
+             ;; malformed credentials: wrong scheme, and Basic with no colon
+             (let ((r (%http-post-rpc port body :auth-header "Bearer deadbeef")))
+               (is (= 401 (%http-status r))))
+             (let ((r (%http-post-rpc port body :auth "no-colon-here")))
+               (is (= 401 (%http-status r))))
+             ;; the cookie file the node wrote
+             (let ((r (%http-post-rpc
+                       port body
+                       :auth (alexandria:read-file-into-string
+                              (merge-pathnames ".cookie" dir)))))
+               (is (= 200 (%http-status r)))
+               (is (search "\"result\"" r))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
+
+(test rpc-start-refuses-without-any-credential
+  "With no rpcuser/rpcpassword and nowhere to write a .cookie there is no way
+to authorize a request, so the server does not start — Core aborts startup when
+InitRPCAuthentication fails (httprpc.cpp:300-302). Starting anyway would leave
+a listener that 401s everything."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (let ((node (make-test-node)))
+    (is (null (bitcoin-lisp::node-data-directory node))
+        "fixture must have nowhere to write a cookie, or this test is vacuous")
+    (unwind-protect
+         (progn
+           (is (null (bitcoin-lisp.rpc:start-rpc-server node :port 19997)))
+           (is (null bitcoin-lisp.rpc:*rpc-server*)))
+      (bitcoin-lisp.rpc:stop-rpc-server))))
+
+(test rpc-aborted-start-releases-the-listening-socket
+  "Binding before the credential means a start can now abort with a socket
+already open, so the abort path has to give the port back — otherwise one
+failed start would cost RPC until the process restarts. (Regression guard for
+the reorder, not a test of the pre-existing bug: the old order never reached a
+bind before giving up.)"
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (let ((port 19992)
+        (no-datadir-node (make-test-node)))
+    (is (null (bitcoin-lisp::node-data-directory no-datadir-node))
+        "fixture must have nowhere to write a cookie, or this test is vacuous")
+    (unwind-protect
+         (progn
+           ;; binds, then finds it has no credential to install, then aborts
+           (is (null (bitcoin-lisp.rpc:start-rpc-server no-datadir-node :port port)))
+           (is (null bitcoin-lisp.rpc:*rpc-server*))
+           (with-rpc-test-datadir (dir)
+             (let ((node (make-test-node)))
+               (setf (bitcoin-lisp::node-data-directory node) dir)
+               (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port)))
+                   "the aborted start leaked its listening socket"))))
+      (bitcoin-lisp.rpc:stop-rpc-server))))
+
+(test rpc-bind-non-loopback-refused
+  "-rpcbind to a non-loopback address falls back to loopback. Core ignores
+-rpcbind unless -rpcallowip is also given (HTTPBindAddresses,
+httpserver.cpp:316-327); we have no -rpcallowip, so a single flag would
+otherwise put the whole RPC surface on the public internet."
+  (dolist (loopback '("127.0.0.1" "127.0.0.2" "::1" "[::1]" "localhost"))
+    (is (string= loopback (bitcoin-lisp.rpc::%rpc-bind-address loopback))
+        "~S is loopback and must be kept" loopback))
+  (dolist (exposed '("0.0.0.0" "" "192.168.1.5" "::" "1.2.3.4" "127acme.example"))
+    (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address exposed))
+        "~S is not loopback and must fall back" exposed))
+  (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address nil))))
 
 ;;;; tx JSON field completeness (T3c)
 

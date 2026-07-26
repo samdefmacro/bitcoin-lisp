@@ -196,8 +196,14 @@ $('login-form').addEventListener('submit', async (ev) => {
     }
   }
 
+  if (!rpc.setCredentials(user, pass)) {
+    err.textContent = 'The node requires a credential: paste its .cookie file '
+      + '(in the data directory) or sign in with your -rpcuser / -rpcpassword.';
+    err.hidden = false;
+    return;
+  }
+
   btn.disabled = true;
-  rpc.setCredentials(user, pass);
   try {
     await rpc.call('getblockcount'); // cheap auth probe
     $('login-pass').value = '';
