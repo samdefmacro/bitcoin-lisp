@@ -1700,11 +1700,27 @@ handler. Shared by the block-download drain and the at-tip reap pass."
                                        (gethash hash (ibd-context-pending-blocks ctx))))))
            (mark-block-received hash)
            (record-block-received-from-peer peer)
-           (process-received-block block route-cs route-view block-store
-                                   :fee-estimator fee-estimator
-                                   :recent-rejects recent-rejects
-                                   :wire-size (length payload)
-                                   :requested (and requested t))))))
+           (let ((connected
+                   (process-received-block block route-cs route-view block-store
+                                           :fee-estimator fee-estimator
+                                           :recent-rejects recent-rejects
+                                           :wire-size (length payload)
+                                           :requested (and requested t))))
+             ;; Earned BIP152 high-bandwidth promotion. Core's BlockChecked
+             ;; drives this off mapBlockSource (net_processing.cpp:2202,
+             ;; 2218-2223), which is filled for FULL blocks as well as
+             ;; reconstructed compact ones — a node whose peers all fail
+             ;; compact reconstruction still keeps 3 HB peers. It fires only
+             ;; on the state.IsValid() arm, so we gate on the block having
+             ;; actually validated and connected (process-received-block
+             ;; returns T only from the tip+1 activate-block success path,
+             ;; which is also the closest analogue of Core's "no other blocks
+             ;; in flight" best-block proxy). maybe-promote-block-deliverer
+             ;; applies the not-IBD gate itself, against the ACTIVE chainstate
+             ;; (route-cs may be the assumeutxo background one, whose tip says
+             ;; nothing about whether the node is still in IBD).
+             (when connected
+               (maybe-promote-block-deliverer peer chain-state)))))))
 
     ((string= command "headers")
      (let ((headers (bitcoin-lisp.serialization:parse-headers-payload payload)))
