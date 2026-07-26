@@ -313,13 +313,52 @@ deterministic startup failures exit 1 into an unconditional 10-second respawn
 loop. This manufactures, in normal operation, exactly the process-kill the
 coinstatsindex bug needs.
 
-Also confirmed at S2 by reading, unverified by execution: a torn trailing entry
-in `txindex.dat` permanently desyncs its offset map; a corrupt `chainstate.dat`
-starts silently at height 0 over a populated coins DB, after which the first
-spending block fails `:missing-input`, which is on the deterministic-poison
-allowlist — so the node marks its own genuine best chain invalid; and the
-600-second `destroy-thread` at shutdown can land mid-reorg, after which the
-unconditional flush persists a half-disconnected UTXO set as clean.
+Three further storage findings were reported from code reading alone and later
+put through a dedicated confirmation pass (2026-07-26). **All three survived, but
+two had their stated mechanism or severity corrected — one substantially — so the
+original text is superseded by what follows.**
+
+**Torn `txindex.dat` tail — confirmed, downgraded to S3, trigger refuted.** A
+misaligned tail really does desync the offset map permanently: with a 40-byte
+partial entry, reload counts it as a full entry and inserts a phantom txid, the
+next appended entry's lookup dies with `END-OF-FILE`, and a restart makes it
+permanent. A sub-32-byte tail is *worse* than reported — it returns the txid
+bytes as the block hash and a garbage position, silently. But the claimed trigger
+is wrong: a process kill *cannot* produce a torn tail, because the per-entry
+`force-output` flushes all 68 bytes in one `write(2)` (measured: a 32-byte write
+without `force-output` never reaches disk at all). It needs power loss, a kernel
+panic, `ENOSPC`, or external truncation. Severity is capped because `-txindex` is
+opt-in and off by default, it is mutually exclusive with pruning, and only
+`getrawtransaction` and the merkle-proof RPC read it — no consensus path does.
+One aggravating fact the original missed: `build-tx-index`, the only
+repair-shaped routine, has **no production call site**, so nothing ever detects
+or repairs the misalignment.
+
+**Corrupt `chainstate.dat` — confirmed, but the mechanism was wrong and the
+severity is network-dependent.** The silent half is exact: a one-bit flip and a
+missing file are byte-for-byte indistinguishable (`load-state` returns NIL for
+both, and the caller logs nothing), and a file truncated to 40 bytes is accepted
+outright by the CRC-less legacy fallback. The cascade is real too — but it is
+**not** `:missing-input`. That was refuted structurally: `perform-reorg` replays
+forward from the fork point, so `apply-block-to-utxo-set` re-creates every coin
+before any later block spends it, and a spend inside the replayed range can never
+miss. The actual trigger is the **BIP30 duplicate-txid check**, which fires when a
+replayed block re-creates a txid whose output is still unspent at the real height.
+Measured on mainnet parameters: the node marks its own chain invalid and ends with
+**no best-valid-tip at all** — a bricked index. But BIP30 enforcement is gated on
+the BIP34 activation height, and testnet4, signet and regtest activate BIP34 at
+height 1, so the whole live testnet4 range is exempt and the replay **self-heals**
+(measured: 0 invalid, tip advanced). So this is **S1 on mainnet, S3 everywhere
+this project actually runs**.
+
+**600-second `destroy-thread` mid-reorg — confirmed.** SBCL's `destroy-thread`
+does interrupt unprotected code mid-loop and unwind, while `without-interrupts`
+defers it to completion, so the asymmetry the finding rests on is real:
+`connect-block`'s tip-extension path and `%flush-chainstate` are wrapped,
+`perform-reorg`'s disconnect phase is not. Downgraded to S3 for the stated
+shutdown trigger (it needs a reorg overrunning 600s) but raised to **S2 for the
+underlying defect**, which the confirmation pass found is reachable without any
+shutdown at all.
 
 **RPC contracts**, all five empirically settled. In descending order of real-client
 breakage: JSON-RPC 1.x replies always carry `"jsonrpc":"2.0"` and never the
