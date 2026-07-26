@@ -35,6 +35,14 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (connection nil :type (or null connection))
   (state :disconnected :type peer-state)
   (version nil)  ; Received version message
+  ;; Chain-sync timeout state (Core CNodeState::ChainSyncTimeoutState,
+  ;; net_processing.cpp:490-501). All times are UNIX SECONDS — the codebase
+  ;; also carries get-universal-time and internal-real-time clocks, and mixing
+  ;; them here would be a ~2.2e9-second error.
+  (chain-sync-timeout 0 :type integer)        ; 0 = unarmed
+  (chain-sync-work-header nil)                ; tip hash we benchmarked against
+  (chain-sync-sent-getheaders nil)
+  (chain-sync-protect nil)
   ;; Operator-pinned connection (-addnode / addnode onetry). Core types these
   ;; ConnectionType::MANUAL and exempts them from every automatic eviction; we
   ;; carry the fact as a flag because our -addnode peers are otherwise typed

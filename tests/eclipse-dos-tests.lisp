@@ -526,3 +526,114 @@ occupying a slot we need for syncing."
         (is-false (bitcoin-lisp.networking::maybe-disconnect-low-work-outbound
                    p state nil)
                   "outside IBD the peer must be kept")))))
+
+;;;; ============================================================
+;;;; G7-08 P1/P2: outbound chain-sync eviction + protection
+;;;; ============================================================
+
+(defun %g708-chain (tip-work)
+  "A chain-state whose tip has TIP-WORK, plus a lower-work entry a peer can
+claim as its best-known."
+  (let* ((state (bitcoin-lisp.storage:make-chain-state))
+         (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8))
+         (low-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash tip-hash :height 100 :chain-work tip-work :status :valid))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state (bitcoin-lisp.storage:make-block-index-entry
+            :hash low-hash :height 50 :chain-work (floor tip-work 2) :status :valid))
+    (bitcoin-lisp.storage:update-chain-tip state tip-hash 100)
+    (values state tip-hash low-hash)))
+
+(defun %g708-peer (&key (conn-type :outbound-full-relay) inbound manual best-hash protect)
+  (let ((p (bitcoin-lisp.networking:make-peer :inbound inbound :address "test")))
+    (setf (bitcoin-lisp.networking:peer-conn-type p) conn-type
+          (bitcoin-lisp.networking:peer-manual p) manual
+          (bitcoin-lisp.networking:peer-state p) :ready
+          (bitcoin-lisp.networking::peer-chain-sync-protect p) protect)
+    (when best-hash
+      (setf (bitcoin-lisp.networking::peer-best-known-block-hash p) best-hash))
+    p))
+
+(test g7-08-chain-sync-arms-probes-then-disconnects
+  "G7-08 P1 (Core ConsiderEviction): a live-but-SILENT outbound peer sitting
+below our tip's work is given a 20-minute budget, then probed once with a
+getheaders, then dropped after a further 2 minutes. Such peers answer pings, so
+nothing else evicts them — an adversary filling our outbound slots with them
+pins us on a stale tip indefinitely."
+  (multiple-value-bind (state tip-hash low-hash) (%g708-chain 1000)
+    (declare (ignore tip-hash))
+    (let ((peer (%g708-peer :best-hash low-hash))
+          (sent 0))
+      (let ((real (fdefinition 'bitcoin-lisp.networking::send-message)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'bitcoin-lisp.networking::send-message)
+                     (lambda (p m) (declare (ignore p m)) (incf sent)))
+               ;; First sweep arms the timer.
+               (is (eq :armed (bitcoin-lisp.networking:consider-chain-sync-eviction
+                               peer state 1000)))
+               (is (= 0 sent) "arming must not send anything")
+               ;; Before the deadline: nothing happens (still armed, no re-arm).
+               (is (null (bitcoin-lisp.networking:consider-chain-sync-eviction
+                          peer state 1500)))
+               ;; Past 20 minutes: probe with a getheaders, do NOT disconnect.
+               (is (eq :probed (bitcoin-lisp.networking:consider-chain-sync-eviction
+                                peer state (+ 1000 1201))))
+               (is (= 1 sent) "the probe must send exactly one getheaders")
+               (is (eq :ready (bitcoin-lisp.networking:peer-state peer))
+                   "the probe must not disconnect")
+               ;; A further 2 minutes with no improvement: drop it.
+               (is (eq :disconnected (bitcoin-lisp.networking:consider-chain-sync-eviction
+                                      peer state (+ 1000 1201 121))))
+               (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))))
+          (setf (fdefinition 'bitcoin-lisp.networking::send-message) real))))))
+
+(test g7-08-good-chain-clears-the-timer
+  "A peer whose best-known work reaches our tip clears its timer entirely — it
+has answered for itself."
+  (multiple-value-bind (state tip-hash) (%g708-chain 1000)
+    (let ((peer (%g708-peer :best-hash tip-hash)))
+      (setf (bitcoin-lisp.networking::peer-chain-sync-timeout peer) 500)
+      (is (eq :cleared (bitcoin-lisp.networking:consider-chain-sync-eviction
+                        peer state 1000)))
+      (is (zerop (bitcoin-lisp.networking::peer-chain-sync-timeout peer))))))
+
+(test g7-08-exempt-peers-are-never-evicted
+  "Manual, inbound and protected peers are outside the eviction logic. Manual
+matters most: connect-added-nodes redials them every ~30s, so evicting one
+would loop forever against a peer the operator pinned."
+  (multiple-value-bind (state tip-hash low-hash) (%g708-chain 1000)
+    (declare (ignore tip-hash))
+    (dolist (peer (list (%g708-peer :best-hash low-hash :manual t)
+                        (%g708-peer :best-hash low-hash :inbound t)
+                        (%g708-peer :best-hash low-hash :protect t)
+                        (%g708-peer :best-hash low-hash :conn-type :feeler)))
+      (is (null (bitcoin-lisp.networking:consider-chain-sync-eviction
+                 peer state 1000))
+          "exempt peers must not even be armed"))
+    ;; A block-relay peer IS a candidate (Core keeps them subject to the logic).
+    (is (eq :armed (bitcoin-lisp.networking:consider-chain-sync-eviction
+                    (%g708-peer :best-hash low-hash :conn-type :block-relay)
+                    state 1000)))))
+
+(test g7-08-protection-is-capped-at-four-and-released
+  "Core protects at most MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT (4)
+outbound FULL-RELAY peers; block-relay peers are deliberately never protected."
+  (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+    (let ((peers (loop repeat 6 collect (%g708-peer))))
+      (dolist (p peers) (bitcoin-lisp.networking:maybe-protect-outbound-peer p))
+      (is (= 4 (count-if #'bitcoin-lisp.networking::peer-chain-sync-protect peers))
+          "at most 4 peers may hold protection")
+      (is (= 4 bitcoin-lisp.networking::*protected-outbound-count*))
+      ;; Releasing frees a slot for another peer.
+      (bitcoin-lisp.networking:release-outbound-protection (first peers))
+      (is (= 3 bitcoin-lisp.networking::*protected-outbound-count*))
+      (is (bitcoin-lisp.networking:maybe-protect-outbound-peer (%g708-peer))
+          "a freed slot must be reusable"))
+    ;; Block-relay peers are not eligible.
+    (let ((bitcoin-lisp.networking::*protected-outbound-count* 0))
+      (is (null (bitcoin-lisp.networking:maybe-protect-outbound-peer
+                 (%g708-peer :conn-type :block-relay)))
+          "block-relay peers must stay subject to the eviction logic"))))
