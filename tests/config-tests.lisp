@@ -346,12 +346,15 @@ silent override — the user asked for two incompatible things."
   "G7-03 (dial side): seed lists are clearnet by construction, so under an
 -onlynet that forbids clearnet they must not become dial candidates. Core
 never hits this because seeds enter addrman and every candidate is filtered by
-g_reachable_nets at selection time; we build the dial list directly."
+g_reachable_nets at selection time; we build the dial list directly.
+No proxy is configured throughout: this is the direct-dial half of the
+filter, where discover-peers only ever produces IP literals."
   (let* ((clearnet '("203.0.113.7" "2001:db8::1"))
          ;; Literal rather than netaddress-tests' +onion-str-1+: that file may
          ;; load after this one, which would make the reference a
          ;; compile-time undefined-variable warning.
-         (onion '("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion")))
+         (onion '("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"))
+         (bitcoin-lisp.networking:*proxy* nil))
     ;; Default reachable set: clearnet seeds pass through untouched.
     (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6)))
       (is (equal clearnet (bitcoin-lisp::%reachable-seed-addresses clearnet))))
@@ -363,9 +366,80 @@ g_reachable_nets at selection time; we build the dial list directly."
     (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4)))
       (is (equal '("203.0.113.7")
                  (bitcoin-lisp::%reachable-seed-addresses clearnet))))
-    ;; An address whose network cannot be determined is dropped, not dialed:
-    ;; under an active restriction an unclassifiable candidate is exactly what
-    ;; must not leak.
+    ;; With NO proxy an address whose network cannot be determined is dropped,
+    ;; not dialed: nothing can resolve it inside a tunnel, and under an active
+    ;; restriction an unclassifiable candidate is exactly what must not leak.
     (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6)))
       (is (null (bitcoin-lisp::%reachable-seed-addresses
                  '("seed.example.invalid" "not an address")))))))
+
+;;; --- GA8: proxied DNS seeding (bootstrap regression from #306) --------------
+
+(test reachable-seed-addresses-proxy-hostnames
+  "Under -proxy the seed list is deliberately the seed HOSTNAMES, left
+unresolved so the SOCKS5 proxy resolves them inside the tunnel (ATYP
+DOMAINNAME) — Core's `if (HaveNameProxy()) AddAddrFetch(seed)`
+(net.cpp:2356-2357), where a proxied seed stays dialable BY NAME. Dropping
+every candidate parse-network-address cannot classify (#306) therefore
+discarded every DNS seed of a proxied node."
+  (let ((seeds (bitcoin-lisp::network-dns-seeds :mainnet)))
+    ;; The affected matrix, asserted rather than assumed: mainnet DNS seeds are
+    ;; hostnames — exactly the shape the old predicate discarded — and mainnet
+    ;; has no fixed-seed list to fall back on (testnet4 alone has one).
+    (is-true seeds)
+    (is-true (notany #'bitcoin-lisp.networking:parse-network-address seeds))
+    (is-true (every #'bitcoin-lisp.networking:parse-network-address
+                    bitcoin-lisp.networking:*testnet4-fixed-seeds*))
+    ;; -proxy with no -onlynet: discover-peers returns the hostnames verbatim
+    ;; (no DNS is performed on this branch, so the test does no network I/O)
+    ;; and every one must survive the filter.
+    (%with-net-config-globals
+      (bitcoin-lisp::apply-config-globals
+       (bitcoin-lisp::parse-cli-args '("-proxy=127.0.0.1:9050")))
+      (let ((dns (bitcoin-lisp.networking:discover-peers seeds)))
+        (is (equal seeds dns))
+        (is (equal seeds (bitcoin-lisp::%reachable-seed-addresses dns))))
+      ;; The literal branch is untouched by the proxy: still -onlynet-filtered.
+      (is (equal '("203.0.113.7")
+                 (bitcoin-lisp::%reachable-seed-addresses '("203.0.113.7"))))
+      (let ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4)))
+        (is (null (bitcoin-lisp::%reachable-seed-addresses '("2001:db8::1"))))))
+    ;; -proxy together with a clearnet-containing -onlynet: seeding stays on
+    ;; (soft-set does not fire) and the hostnames stay dialable.
+    (%with-net-config-globals
+      (bitcoin-lisp::apply-config-globals
+       (bitcoin-lisp::parse-cli-args '("-onlynet=onion" "-onlynet=ipv6"
+                                       "-proxy=127.0.0.1:9050")))
+      (is-true bitcoin-lisp::*dns-seed-enabled*)
+      (is (equal seeds (bitcoin-lisp::%reachable-seed-addresses seeds))))))
+
+(test reachable-seed-addresses-onion-only-no-clearnet-dial
+  "G7-03 control for the change above: -onlynet=onion still yields no clearnet
+dial candidate, in BOTH layers. Layer 1 — the DNS query never happens, because
+an -onlynet excluding IPv4/IPv6 soft-sets -dnsseed=0 (Core init.cpp:835-844).
+Layer 2 — even if a hostname reached the filter, it is a clearnet candidate
+however the proxy resolves it (a DNS seed answers with A/AAAA records), so it
+is dropped along with every clearnet literal."
+  (let ((onion '("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"))
+        (seeds (bitcoin-lisp::network-dns-seeds :mainnet)))
+    (%with-net-config-globals
+      (bitcoin-lisp::apply-config-globals
+       (bitcoin-lisp::parse-cli-args '("-onlynet=onion" "-proxy=127.0.0.1:9050")))
+      (is (equal '(:torv3) bitcoin-lisp.networking:*reachable-networks*))
+      ;; Layer 1.
+      (is-false bitcoin-lisp::*dns-seed-enabled*)
+      ;; Layer 2: hostnames, clearnet literals and the fixed-seed list alike.
+      (is (null (bitcoin-lisp::%reachable-seed-addresses seeds)))
+      (is (null (bitcoin-lisp::%reachable-seed-addresses
+                 '("203.0.113.7" "2001:db8::1"))))
+      (is (null (bitcoin-lisp::%reachable-seed-addresses
+                 bitcoin-lisp.networking:*testnet4-fixed-seeds*)))
+      ;; An onion literal is of course still dialable.
+      (is (equal onion (bitcoin-lisp::%reachable-seed-addresses onion))))
+    ;; cjdns-only is equally clearnet-free with a proxy configured.
+    (%with-net-config-globals
+      (bitcoin-lisp::apply-config-globals
+       (bitcoin-lisp::parse-cli-args '("-onlynet=cjdns" "-cjdnsreachable=1"
+                                       "-proxy=127.0.0.1:9050")))
+      (is-false bitcoin-lisp::*dns-seed-enabled*)
+      (is (null (bitcoin-lisp::%reachable-seed-addresses seeds))))))
