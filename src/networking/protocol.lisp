@@ -2421,50 +2421,181 @@ fault — and Core answers it with a plain full-block getdata (:4683-4694)."
 
 ;;; Compact block message handling
 
+;;; Core's MaybePunishNodeForBlock (net_processing.cpp:1908-1950) is PER
+;;; REASON, never all-or-nothing: via_compact_block exempts three of its seven
+;;; arms and no more. Every compact-block outcome is routed through it — the
+;;; announced header at :4589-4593, and both ProcessNewBlock results, whose
+;;; mapBlockSource entries carry /*punish=*/false (:4778 cmpctblock, :3516
+;;; blocktxn) which :2211 inverts into via_compact_block=true. So the exemption
+;;; is a filter on the VERDICT, not an amnesty for the message type. The two
+;;; lists below are that switch, arm by arm, over the verdicts our
+;;; VALIDATE-BLOCK / VALIDATE-BLOCK-HEADER actually return.
+
+(defparameter +compact-block-punished-reasons+
+  '(:bad-proof-of-work :bad-difficulty :bad-version :time-too-old
+    :time-timewarp-attack :bad-prevblk)
+  "Validation verdicts Core punishes even when via_compact_block is true.
+
+The first five are BLOCK_INVALID_HEADER: high-hash (validation.cpp:3864),
+bad-diffbits (:4121), time-too-old (:4125), time-timewarp-attack (:4134),
+bad-version (:4148). :BAD-PREVBLK is BLOCK_INVALID_PREV (:4254). Both arms call
+Misbehaving unconditionally (net_processing.cpp:1936-1940). No honest peer
+relays a header that fails PoW, difficulty, MTP, the BIP94 timewarp rule or the
+softfork version floor, so there is no false-positive risk here — and leaving
+the class unpunished is not merely a parity gap but a DoS: nothing downstream
+scores a compact block, so one connection can replay an invalid-PoW cmpctblock
+without limit, each replay costing a full BUILD-SHORTID-MAP SipHash pass over
+every mempool entry under an attacker-chosen key.
+
+BLOCK_MISSING_PREV (our :ORPHAN-BLOCK) is deliberately absent. Core punishes
+that arm too (:1942-1944) but structurally cannot reach it from a compact
+block: the cmpctblock handler returns at the parent lookup with a getheaders
+(:4571-4577), and by blocktxn time the header is already in the index.
+HANDLE-CMPCTBLOCK's parent guard is that same foreclosure, so an :ORPHAN-BLOCK
+that survives it means our own index lost an entry — the honest-peer case the
+GA8 finding was about.")
+
+(defparameter +compact-block-ignored-reasons+
+  '(:time-too-new :duplicate-invalid)
+  "Verdicts that end a compact block with neither punishment NOR a refetch.
+
+:TIME-TOO-NEW is BLOCK_TIME_FUTURE (validation.cpp:4141), whose arm is a bare
+break (net_processing.cpp:1946-1947): the block is not ours to accept yet, and
+refetching it in full would route an honest peer straight into HANDLE-BLOCK,
+which does punish. :DUPLICATE-INVALID is BLOCK_CACHED_INVALID (:4232 /
+net_processing.cpp:1926-1935), exempted for every compact-block sender;
+re-downloading a block we already marked invalid would be self-inflicted DoS.")
+
+(defun compact-block-failure-action (reason)
+  "Which MaybePunishNodeForBlock arm REASON lands on with via_compact_block
+true: :PUNISH, :IGNORE, or :REFETCH.
+
+:REFETCH is the BLOCK_CONSENSUS / BLOCK_MUTATED default (net_processing.cpp:
+1920-1926) — the one class BIP152 makes an honest peer's fault to have, since a
+relaying peer may have validated only the header and a reconstruction that
+substituted one of OUR mempool transactions can yield a block the sender never
+sent. Core answers that shape one layer down with a plain getdata (:4683-4694);
+if the block really is bad, the full copy arrives on the BLOCK message path,
+where via_compact_block is false and HANDLE-BLOCK punishes. An unrecognised
+verdict defaults to :REFETCH: a new validation keyword must never start
+discouraging peers just by existing."
+  (cond ((member reason +compact-block-punished-reasons+) :punish)
+        ((member reason +compact-block-ignored-reasons+) :ignore)
+        (t :refetch)))
+
+(defun handle-compact-block-failure (peer block-hash reason context)
+  "Dispose of a failed compact block from PEER per COMPACT-BLOCK-FAILURE-ACTION.
+Exactly one compact-block failure is counted on every branch (:REFETCH counts
+its own inside REQUEST-FULL-BLOCK). Returns the action taken."
+  (let ((action (compact-block-failure-action reason)))
+    (bitcoin-lisp:log-warn "~A ~A: ~(~A~) — ~(~A~)"
+                           context (bitcoin-lisp.crypto:bytes-to-hex block-hash)
+                           reason action)
+    (ecase action
+      (:punish (increment-compact-block-failure)
+               (record-misbehavior peer (format nil "~A (~(~A~))" context reason)))
+      (:ignore (increment-compact-block-failure))
+      (:refetch (request-full-block peer block-hash)))
+    action))
+
+(defun compact-block-header-verdict (chain-state header block-hash prev-hash)
+  "Core's ProcessNewBlockHeaders({{cmpctblock.header}}) step, run BEFORE any
+reconstruction (net_processing.cpp:4571-4593). Returns (VALUES VERDICT REASON):
+
+  :NO-PARENT — parent absent from the index; the caller answers with getheaders
+  :ACCEPT    — the header is admissible, go on and reconstruct
+  :REJECT    — REASON says what HANDLE-COMPACT-BLOCK-FAILURE must do with it
+
+Order mirrors AcceptBlockHeader (validation.cpp:4226-4259): a header we already
+hold short-circuits (BLOCK_CACHED_INVALID when we marked it invalid, otherwise
+accepted without re-checking), then CheckBlockHeader's PoW, then the parent's
+own validity, then ContextualCheckBlockHeader. Doing this before the mempool is
+touched is what makes an invalid header cheap for us and expensive for nobody:
+BUILD-SHORTID-MAP hashes the whole mempool under a key derived from the
+attacker's header, so it must not run for a header we are going to reject.
+
+Pure reads of the block index — the caller holds the node lock across it and
+does the IO (getheaders / getdata / disconnect) outside."
+  (let ((known (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
+        (prev-entry (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)))
+    (cond
+      ;; Already-known header. Core returns true early for it, except when we
+      ;; marked it invalid: BLOCK_CACHED_INVALID (validation.cpp:4229-4237).
+      ((and known (eq (bitcoin-lisp.storage:block-index-entry-status known) :invalid))
+       (values :reject :duplicate-invalid))
+      (known (values :accept nil))
+      ;; Parent not in the index: the announcement outran our header chain.
+      ;; The ORDINARY case, not an attack — high-bandwidth compact relay beats
+      ;; headers announcements by design, so falling one block behind while a
+      ;; getblocktxn round-trip is in flight is enough. Core asks for deeper
+      ;; headers and returns before anything can be DoS-scored (:4571-4577);
+      ;; reconstructing instead would hand ACCEPT-DOWNLOADED-BLOCK a block whose
+      ;; parent entry is missing, i.e. :ORPHAN-BLOCK, and permanently exile our
+      ;; fastest honest block-relay peer.
+      ((null prev-entry) (values :no-parent nil))
+      ;; Building on a block we rejected: BLOCK_INVALID_PREV (validation.cpp:
+      ;; 4251-4255), punished regardless of via_compact_block.
+      ((eq (bitcoin-lisp.storage:block-index-entry-status prev-entry) :invalid)
+       (values :reject :bad-prevblk))
+      (t
+       ;; CheckBlockHeader + ContextualCheckBlockHeader at the header's own
+       ;; branch height — PoW, MTP, BIP94 timewarp, softfork version floor and
+       ;; the difficulty bits. Identical to the header battery VALIDATE-BLOCK
+       ;; runs later, so this rejects nothing we would have accepted; it only
+       ;; moves the verdict ahead of the mempool pass and makes it punishable.
+       (multiple-value-bind (valid reason)
+           (bitcoin-lisp.validation:validate-block-header
+            header chain-state (bitcoin-lisp.serialization:get-unix-time)
+            :prev-hash prev-hash
+            :height (1+ (bitcoin-lisp.storage:block-index-entry-height prev-entry))
+            :prev-entry prev-entry)
+         (if valid (values :accept nil) (values :reject reason)))))))
+
 (defun handle-cmpctblock (peer payload chain-state utxo-set block-store mempool
                           &optional fee-estimator &key recent-rejects)
-  "Handle a cmpctblock message. Attempt reconstruction from mempool.
+  "Handle a cmpctblock message: validate the announced header, then attempt
+reconstruction from the mempool.
 
-Punishment here is reserved for STRUCTURALLY malformed messages. A compact
-block that merely fails validation must never discourage its sender: BIP152
-lets a peer relay a compact block having validated only the header, so Core
-records the source with via_compact_block=true (mapBlockSource ... /*punish=*/
-false, net_processing.cpp:4778, inverted at :2211) and MaybePunishNodeForBlock
-then skips BLOCK_CONSENSUS / BLOCK_MUTATED entirely (:1920-1926). We fall back
-to a full-block getdata instead — which is exactly what Core does one layer
-down for the same shape, since a reconstruction that produced a mutated block
-is READ_STATUS_FAILED -> getdata (blockencodings.cpp FillBlock, net_processing
-.cpp:4683-4694). If the block really is invalid, the full copy arrives on the
-BLOCK path, where via_compact_block is false and HANDLE-BLOCK does punish."
+Punishment follows Core's MaybePunishNodeForBlock arm by arm (see
+COMPACT-BLOCK-FAILURE-ACTION). An INVALID HEADER — bad PoW, bad difficulty
+bits, a timestamp at or below MTP, a BIP94 timewarp violation, a version below
+the softfork floor — still discourages its sender through the compact path,
+exactly as Core does at net_processing.cpp:4589-4593, and does so BEFORE the
+mempool is hashed. What no longer punishes is the class BIP152 makes honest:
+a peer may relay a compact block having validated only the header, and
+reconstruction can substitute our own mempool transactions, so a
+consensus-invalid result earns a full-block getdata instead. A structurally
+malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
   (let* ((compact-block (bitcoin-lisp.serialization:parse-cmpctblock-payload payload))
          (header (bitcoin-lisp.serialization:compact-block-header compact-block))
          (block-hash (bitcoin-lisp.serialization:block-header-hash header))
          (prev-hash (bitcoin-lisp.serialization:block-header-prev-block header))
          (use-wtxid (= (peer-compact-block-version peer) 2)))
 
-    ;; Parent not in the index: the announcement outran our header chain. This
-    ;; is the ORDINARY case, not an attack — high-bandwidth compact relay beats
-    ;; headers announcements by design, so falling one block behind while a
-    ;; getblocktxn round-trip is in flight is enough. Core asks for deeper
-    ;; headers and returns before it can DoS-score anything
-    ;; (net_processing.cpp:4571-4577); reconstructing here instead would hand
-    ;; ACCEPT-DOWNLOADED-BLOCK a block whose parent entry is missing, i.e.
-    ;; :ORPHAN-BLOCK, and permanently exile our fastest honest block-relay peer.
-    ;; Checked BEFORE the stale-pending clear below, so an announcement we are
-    ;; about to ignore cannot also destroy an in-flight reconstruction of the
-    ;; block we are actually missing (Core keeps per-block in-flight state, so
-    ;; it has no such cross-talk).
-    (unless (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)
-      (bitcoin-lisp:log-cat "net"
-                            "cmpctblock ~A: parent ~A not in index — getheaders to ~A"
-                            (bitcoin-lisp.crypto:bytes-to-hex block-hash)
-                            (bitcoin-lisp.crypto:bytes-to-hex prev-hash)
-                            (peer-address peer))
-      ;; Core gates the getheaders on !IsInitialBlockDownload(): during IBD the
-      ;; header sync owns the locator and an extra request is noise.
-      (unless (initial-block-download-p chain-state)
-        (request-headers-for-ibd peer chain-state))
-      (return-from handle-cmpctblock nil))
+    ;; Header gate, ahead of everything else — including the stale-pending
+    ;; clear below, so an announcement we are about to drop cannot destroy an
+    ;; in-flight reconstruction of the block we are actually missing (Core
+    ;; keeps per-block in-flight state, so it has no such cross-talk).
+    (multiple-value-bind (verdict reason)
+        (with-node-lock
+          (compact-block-header-verdict chain-state header block-hash prev-hash))
+      (ecase verdict
+        (:accept nil)
+        (:no-parent
+         (bitcoin-lisp:log-cat "net"
+                               "cmpctblock ~A: parent ~A not in index — getheaders to ~A"
+                               (bitcoin-lisp.crypto:bytes-to-hex block-hash)
+                               (bitcoin-lisp.crypto:bytes-to-hex prev-hash)
+                               (peer-address peer))
+         ;; Core gates the getheaders on !IsInitialBlockDownload(): during IBD
+         ;; the header sync owns the locator and an extra request is noise.
+         (unless (initial-block-download-p chain-state)
+           (request-headers-for-ibd peer chain-state))
+         (return-from handle-cmpctblock nil))
+        (:reject
+         (handle-compact-block-failure peer block-hash reason
+                                       "invalid header via cmpctblock")
+         (return-from handle-cmpctblock nil))))
 
     ;; Clear any old pending reconstruction for different block
     (when (peer-pending-compact-block peer)
@@ -2494,9 +2625,11 @@ BLOCK path, where via_compact_block is false and HANDLE-BLOCK does punish."
                                         :fee-estimator fee-estimator
                                         :recent-rejects recent-rejects)
              (unless valid
-               (bitcoin-lisp:log-warn "Reconstructed block ~A invalid: ~A — refetching in full"
-                                      (bitcoin-lisp.crypto:bytes-to-hex block-hash) error)
-               (request-full-block peer block-hash)))))
+               ;; Core BlockChecked -> MaybePunishNodeForBlock with
+               ;; via_compact_block=true (net_processing.cpp:4778 / :2211):
+               ;; per reason, not per message type.
+               (handle-compact-block-failure peer block-hash error
+                                             "reconstructed compact block invalid")))))
 
         ;; Structurally malformed message — Core READ_STATUS_INVALID ->
         ;; Misbehaving (net_processing.cpp:4679-4683). This is the one
@@ -2532,11 +2665,15 @@ BLOCK path, where via_compact_block is false and HANDLE-BLOCK does punish."
                         &optional fee-estimator &key recent-rejects)
   "Handle a blocktxn message. Complete pending block reconstruction.
 
-Same punishment rule as HANDLE-CMPCTBLOCK: a completed reconstruction that
-fails validation is a compact-block delivery (mapBlockSource ... /*punish=*/
-false, net_processing.cpp:3516), so it gets a full-block refetch and no
-discouragement. Only a blocktxn that does not answer the getblocktxn we sent —
-Core's READ_STATUS_INVALID from FillBlock — is punished (:3487-3491)."
+Same per-reason punishment rule as HANDLE-CMPCTBLOCK: the completed block is a
+compact-block delivery (mapBlockSource ... /*punish=*/false,
+net_processing.cpp:3516, inverted at :2211), so its verdict goes through
+COMPACT-BLOCK-FAILURE-ACTION — the BLOCK_CONSENSUS / BLOCK_MUTATED class earns
+a full-block refetch and no discouragement, while the header-invalid class
+would still punish (it cannot normally arrive here: HANDLE-CMPCTBLOCK gated the
+same header before sending the getblocktxn). A blocktxn that does not answer
+the getblocktxn we sent — Core's READ_STATUS_INVALID from FillBlock — is
+punished outright (:3487-3491)."
   (let ((response (bitcoin-lisp.serialization:parse-blocktxn-payload payload))
         (pending (peer-pending-compact-block peer)))
 
@@ -2590,9 +2727,13 @@ Core's READ_STATUS_INVALID from FillBlock — is punished (:3487-3491)."
                                          :fee-estimator fee-estimator
                                          :recent-rejects recent-rejects)
               (unless valid
-                (bitcoin-lisp:log-warn "Completed block ~A invalid: ~A — refetching in full"
-                                       (bitcoin-lisp.crypto:bytes-to-hex block-hash) error)
-                (request-full-block peer block-hash)))))))))
+                ;; Same per-reason mapping as HANDLE-CMPCTBLOCK (mapBlockSource
+                ;; /*punish=*/false at net_processing.cpp:3516 -> :2211 ->
+                ;; via_compact_block=true). The header itself was already
+                ;; gated when the cmpctblock arrived, so in practice only the
+                ;; BLOCK_CONSENSUS / BLOCK_MUTATED class reaches here.
+                (handle-compact-block-failure peer block-hash error
+                                              "completed compact block invalid")))))))))
 
 (defun request-full-block (peer block-hash)
   "Request a full block (fallback from compact block)."
