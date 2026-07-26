@@ -2351,24 +2351,72 @@ threads read/write under the same lock."
         (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added))
       added))))
 
-(defun %batch-already-known-p (chain-state headers)
-  "T when every header in HEADERS is already in the block index — tested on the
-LAST one only, since headers are admitted parent-first, so last-known implies
+(defun %entry-ancestor-at-height (entry height)
+  "ENTRY's ancestor at HEIGHT, walking prev-entry links (Core
+CBlockIndex::GetAncestor without its skip list — this project reverted the
+skip-list walk, #71). NIL when HEIGHT is above ENTRY or the links run out."
+  (let ((e entry))
+    (loop while (and e (> (bitcoin-lisp.storage:block-index-entry-height e) height))
+          do (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+    (when (and e (= (bitcoin-lisp.storage:block-index-entry-height e) height))
+      e)))
+
+(defun %ancestor-of-best-header-or-tip-p (chain-state entry)
+  "Core PeerManagerImpl::IsAncestorOfBestHeaderOrTip (net_processing.cpp:2813-
+2823): ENTRY is m_best_header or one of its ancestors, or lies on the active
+chain. NIL for a NIL entry — and, the part that carries the weight, NIL for a
+header we hold only on a FORK.
+
+The two disjuncts are Core's; the order here is an optimisation. The
+active-chain test walks down from the block tip and costs nothing when ENTRY is
+at that tip (the at-tip announcement case), while best-header-entry rescans the
+whole index — Core maintains m_best_header incrementally, we do not."
+  (and entry
+       (or (bitcoin-lisp.storage:entry-on-active-chain-p chain-state entry)
+           (let ((best (bitcoin-lisp.storage:best-header-entry chain-state)))
+             (and best
+                  (let ((ancestor (%entry-ancestor-at-height
+                                   best
+                                   (bitcoin-lisp.storage:block-index-entry-height entry))))
+                    (and ancestor
+                         (equalp (bitcoin-lisp.storage:block-index-entry-hash ancestor)
+                                 (bitcoin-lisp.storage:block-index-entry-hash entry)))))))
+       t))
+
+(defun %batch-already-validated-work-p (chain-state headers)
+  "Core's already_validated_work (net_processing.cpp:3046-3054): the batch's
+LAST header is already in our block index AND is an ancestor of our best header
+or of the active tip. Testing the last header alone is enough for the
+membership half, since headers are admitted parent-first — last-known implies
 all-known.
 
-Such a batch costs no new index memory, so both header paths skip the anti-DoS
-work gate for it and take the store path instead: a near-no-op that still
-refreshes per-peer availability and applies the IBD sub-minchainwork outbound
-drop. Core's already_validated_work (IsAncestorOfBestHeaderOrTip,
-net_processing.cpp:3046-3054) does the same, bypassing TryLowWorkHeadersSync —
-and its comment at :2786-2790 relies on this interaction. Noted divergence: we
-test plain index membership without Core's ancestor-of-best refinement, which
-guards fingerprinting rather than memory."
+Such a batch costs no new index memory and leaks nothing that could fingerprint
+us, so both header paths skip the anti-DoS work gate for it and take the store
+path instead: a near-no-op that still refreshes per-peer availability and
+applies the IBD sub-minchainwork outbound drop (Core
+UpdatePeerStateForReceivedHeaders). Core's comment at :2786-2790 relies on
+exactly this interaction.
+
+Core's ancestor condition is load-bearing and NOT an optional refinement.
+Testing plain index membership — as this did before the GA8 W3 review —
+also captures headers we hold on a FORK, which Core deliberately leaves to
+TryLowWorkHeadersSync (:2769-2800). Swallowing those here ends header sync
+with a fork peer while our own locator, built from our header tip rather than
+from the batch, reproduces the same request for ever: a fork we already hold
+>= 2000 headers of (aborted presync, peer rotation, restart mid-fork) could
+never be synced, and the BIP130 announcement path cannot rescue it either.
+Excluded here, such a batch falls through to %maybe-divert-to-presync exactly
+as in Core, and the presync's own locator advances into the peer's chain.
+
+Membership is tested first because it is O(1) and false for every ordinary new
+batch; the ancestor test behind it is O(index size), same as the header locator
+this path builds anyway."
   (and headers
-       (bitcoin-lisp.storage:get-block-index-entry
+       (%ancestor-of-best-header-or-tip-p
         chain-state
-        (bitcoin-lisp.serialization:block-header-hash (car (last headers))))
-       t))
+        (bitcoin-lisp.storage:get-block-index-entry
+         chain-state
+         (bitcoin-lisp.serialization:block-header-hash (car (last headers)))))))
 
 (defun %clear-peer-headers-sync (peer &key finalize)
   "Drop PEER's low-work sync state (Core peer.m_headers_sync.reset()),
@@ -2450,9 +2498,11 @@ header sync from this peer is finished.
 Four cases:
   - a low-work sync is already running: drive it, storing any headers it
     releases during REDOWNLOAD, and end when it finalizes;
-  - the batch is already entirely in our index: skip the anti-DoS gate, take
-    the store path (Core already_validated_work) and end sync — the peer has
-    taught us nothing, so our locator cannot advance;
+  - the batch already sits on our own best-header/active chain: skip the
+    anti-DoS gate, take the store path (Core already_validated_work) and end
+    sync — the peer has taught us nothing, so our locator cannot advance;
+    a batch we hold only on a FORK is NOT this case (see
+    %batch-already-validated-work-p) and falls through to the gate below;
   - no sync, but this batch connects and claims sub-threshold work: start a
     presync when it is a full batch (store nothing yet), or ignore it
     entirely when not (anti-DoS — Core TryLowWorkHeadersSync);
@@ -2468,18 +2518,23 @@ Four cases:
     ((peer-headers-sync peer)
      (not (%drive-headers-sync peer chain-state headers full-batch count-fn)))
 
-    ;; Batch we already hold (%batch-already-known-p): store path, no work
-    ;; gate. Without this branch the classic case never fired — an outbound
-    ;; peer pinned on a low-work fork, answering our getheaders with a short
-    ;; batch we already have, was swallowed by :ignore and never judged.
+    ;; Batch already on OUR OWN best-header/active chain
+    ;; (%batch-already-validated-work-p = Core already_validated_work): store
+    ;; path, no work gate. Without this branch the classic case never fired —
+    ;; an outbound peer pinned on a low-work chain, answering our getheaders
+    ;; with a short batch we already have, was swallowed by :ignore and never
+    ;; judged.
     ;;
-    ;; DONE is T even for a full batch, where Core would fetch more: Core asks
-    ;; again from GetLocator(pindexLast), which advances into the peer's chain,
-    ;; while this loop re-asks from our own header tip. Nothing was added to
-    ;; the index here, so that locator is byte-identical next time round and
-    ;; the peer would resend the same batch until the 100-request cap — a free
-    ;; 100 round-trips for a peer feeding us a fork we already hold.
-    ((%batch-already-known-p chain-state headers)
+    ;; DONE is T even for a full batch, where Core asks again from
+    ;; GetLocator(pindexLast). Nothing entered the index, and this loop re-asks
+    ;; from our own header tip, so that locator is byte-identical next time
+    ;; round and the peer would resend the same batch until the 100-request cap
+    ;; — free round-trips for a peer replaying our own chain at us. Ending here
+    ;; cannot strand anything precisely because the batch is on our chain: a
+    ;; batch we hold only on a FORK is excluded from this branch and goes to
+    ;; the presync gate below, whose locator does advance into the peer's
+    ;; chain.
+    ((%batch-already-validated-work-p chain-state headers)
      (%store-validated-headers peer chain-state headers full-batch
                                count-fn "Received")
      t)
@@ -2548,10 +2603,12 @@ of headers added to the index."
           (bitcoin-lisp.serialization:block-header-hash (car (last headers)))))
        0)
 
-      ;; Batch we already hold: store path, no work gate — see
-      ;; %batch-already-known-p (Core's last_received_header /
-      ;; IsAncestorOfBestHeaderOrTip skip, net_processing.cpp:3046-3054).
-      ((%batch-already-known-p chain-state headers)
+      ;; Batch already on our own best-header/active chain: store path, no
+      ;; work gate — see %batch-already-validated-work-p (Core's
+      ;; last_received_header / IsAncestorOfBestHeaderOrTip skip,
+      ;; net_processing.cpp:3046-3054). A batch we hold only on a fork is not
+      ;; this case and falls through to the gate below, as in Core.
+      ((%batch-already-validated-work-p chain-state headers)
        (%store-validated-headers peer chain-state headers full-batch
                                  count-fn "Received"))
 
