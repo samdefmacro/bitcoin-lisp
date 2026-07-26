@@ -35,6 +35,11 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (connection nil :type (or null connection))
   (state :disconnected :type peer-state)
   (version nil)  ; Received version message
+  ;; BIP133 feefilter state (Core Peer::m_fee_filter_sent /
+  ;; m_next_send_feefilter). FEE-FILTER-SENT is the last value we put on the
+  ;; wire (NIL = none yet); NEXT-SEND-FEEFILTER is a unix time, 0 = due now.
+  (fee-filter-sent nil)
+  (next-send-feefilter 0 :type integer)
   ;; Operator-pinned connection (-addnode / addnode onetry). Core types these
   ;; ConnectionType::MANUAL and exempts them from every automatic eviction; we
   ;; carry the fact as a flag because our -addnode peers are otherwise typed
@@ -944,20 +949,124 @@ on the local onion-service listener (Tor forwarding), whose true network is
     (init-peer-rate-limiters peer)
     peer))
 
+;;; --- BIP133 feefilter (Core MaybeSendFeefilter + FeeFilterRounder) ---
+;;;
+;;; We used to send ONE hardcoded 1000 sat/kvB filter at handshake and never
+;;; revisit it, while our actual floor defaults to 100 and rises dynamically.
+;;; BIP133-honouring peers therefore withheld the whole 0.1-1.0 sat/vB band we
+;;; would happily have accepted — degrading mempool completeness, fee
+;;; estimation and compact-block reconstruction — while during IBD they kept
+;;; flooding us with txs we discard, and when the pool filled they kept
+;;; streaming txs already doomed by the rolling minimum.
+
+(defconstant +feefilter-version+ 70013
+  "Minimum common protocol version for feefilter (Core FEEFILTER_VERSION).")
+
+(defconstant +avg-feefilter-broadcast-interval+ 600
+  "Mean seconds between feefilter refreshes (Core's 10min, drawn from an
+exponential so refreshes do not align across peers).")
+
+(defconstant +max-feefilter-change-delay+ 300
+  "Cap on how long a SUBSTANTIALLY changed filter waits (Core's 5min).")
+
+(defparameter *fee-filter-buckets*
+  (let ((set (list 0))
+        ;; max(1, DEFAULT_MIN_RELAY_TX_FEE/2) where Core's compile-time
+        ;; DEFAULT_MIN_RELAY_TX_FEE is 100 — NOT the configured
+        ;; -minrelaytxfee. Configuring the relay floor must not move the
+        ;; buckets, or our quantization would become a fingerprint.
+        (boundary 50.0d0))
+    (loop while (<= boundary 1d7)
+          do (push boundary set)
+             (setf boundary (* boundary 1.1d0)))
+    (coerce (sort set #'<) 'vector))
+  "Ascending bucket boundaries {0} U {50 * 1.1^k <= 1e7} (Core MakeFeeSet).
+Built by repeated multiplication, like Core, so the values match bit for bit
+rather than being recomputed as 50*1.1^k.")
+
+(defun %exponential-interval (mean-seconds)
+  "Seconds until the next event of a Poisson process with MEAN-SECONDS (Core
+rand_exp_duration). Returns SECONDS, matching the unix-time clock the
+feefilter timers use — protocol.lisp's %next-exp-interval-ticks returns
+internal-real-time TICKS and must not be mixed with them."
+  (max 1 (round (* mean-seconds (- (log (- 1.0d0 (random 1.0d0))))))))
+
+(defun fee-filter-round (fee)
+  "Quantize FEE (sat/kvB) to a bucket, Core FeeFilterRounder::round.
+
+Takes the ceiling bucket 1/3 of the time and the one below it 2/3 of the time.
+The draw is PER CALL, not a per-session skew: modelling it as a session
+constant would make our successive broadcasts correlated in a way Core's are
+not, which is itself a fingerprint. A fee above the top bucket clamps to the
+top bucket — which is why Core's IBD sentinel goes on the wire as the top
+bucket and never as MAX_MONEY."
+  (let* ((buckets *fee-filter-buckets*)
+         (n (length buckets))
+         (idx (or (position-if (lambda (b) (>= b fee)) buckets) n)))
+    ;; Core: --it when past the end, or when not at the beginning and the
+    ;; 1-in-3 draw does not land.
+    (when (or (= idx n)
+              (and (> idx 0) (/= 0 (random 3))))
+      (decf idx))
+    (values (floor (aref buckets (max 0 idx))))))
+
+(defun %feefilter-max-value ()
+  "What Core puts on the wire during IBD: round(MAX_MONEY), which clamps to the
+top bucket (net_processing.cpp:5645). Deterministic — the clamp branch never
+consults the RNG."
+  (values (floor (aref *fee-filter-buckets* (1- (length *fee-filter-buckets*))))))
+
+(defun maybe-send-feefilter (peer mempool chain-state now)
+  "Core MaybeSendFeefilter (net_processing.cpp:5628-5669), driven from the
+periodic tick rather than once at handshake."
+  (when (and mempool
+             (not (ignore-incoming-txs-p))
+             ;; Core gates on the COMMON version; we never negotiate below our
+             ;; own, so the peer's advertised version is the common one.
+             (let ((v (peer-version peer)))
+               (and v (>= (bitcoin-lisp.serialization:version-message-version v)
+                          +feefilter-version+)))
+             (not (eq (peer-conn-type peer) :block-relay)))
+    (let ((current (if (initial-block-download-p chain-state)
+                       ;; Tx invs are discarded during IBD, so ask for none.
+                       most-positive-fixnum
+                       (bitcoin-lisp.mempool:mempool-decayed-rolling-min-fee-rate
+                        mempool now))))
+      ;; Leaving IBD must force a resend, or peers keep withholding txs for up
+      ;; to another 10 minutes.
+      (unless (initial-block-download-p chain-state)
+        (when (eql (peer-fee-filter-sent peer) (%feefilter-max-value))
+          (setf (peer-next-send-feefilter peer) 0)))
+      (cond
+        ((> now (peer-next-send-feefilter peer))
+         (let ((to-send (max (fee-filter-round current)
+                             (bitcoin-lisp.mempool:mempool-min-fee-rate mempool))))
+           (unless (eql to-send (peer-fee-filter-sent peer))
+             (send-message peer (bitcoin-lisp.serialization:make-feefilter-message to-send))
+             (setf (peer-fee-filter-sent peer) to-send))
+           ;; Advanced UNCONDITIONALLY, even when nothing was sent — otherwise
+           ;; the tick re-evaluates every second forever.
+           (setf (peer-next-send-feefilter peer)
+                 (+ now (%exponential-interval +avg-feefilter-broadcast-interval+)))))
+        ;; Substantially changed and the scheduled broadcast is far off: pull it
+        ;; forward. This branch only RESCHEDULES; it never sends.
+        ((and (peer-fee-filter-sent peer)
+              (< (+ now +max-feefilter-change-delay+) (peer-next-send-feefilter peer))
+              (or (< current (floor (* 3 (peer-fee-filter-sent peer)) 4))
+                  (> current (floor (* 4 (peer-fee-filter-sent peer)) 3))))
+         (setf (peer-next-send-feefilter peer)
+               (+ now (random (1+ +max-feefilter-change-delay+)))))))))
+
 (defun send-post-handshake-messages (peer)
   "Send feature negotiation messages after handshake completes."
   ;; BIP 130: Request header announcements
   (send-message peer (bitcoin-lisp.serialization:make-sendheaders-message))
-  ;; BIP 133: Announce our minimum relay fee rate (1000 sat/kB = 1 sat/byte).
-  ;; Core MaybeSendFeefilter (net_processing.cpp:5628-5637) skips it in
-  ;; blocksonly mode (ignore_incoming_txs — -blocksonly, or our
-  ;; relay-disabled mainnet default) and on outbound block-relay-only
-  ;; connections, which never announce txs to us regardless. Note Core does
-  ;; NOT gate feefilter on the peer's own fRelay — an fRelay=0 peer still
-  ;; receives it (harmlessly).
-  (when (and (not (ignore-incoming-txs-p))
-             (not (eq (peer-conn-type peer) :block-relay)))
-    (send-message peer (bitcoin-lisp.serialization:make-feefilter-message 1000)))
+  ;; BIP133 feefilter is NOT sent here. It is driven entirely by
+  ;; maybe-send-feefilter on the periodic tick, which sends the first filter
+  ;; within a second of the handshake. Sending from the handshake site as well
+  ;; would run the IBD check and the RNG on the inbound-listener thread, and
+  ;; would emit a filter for a connection that may still fail — for the sake of
+  ;; under a second of latency.
   ;; Address relay is set up for every outbound connection except
   ;; block-relay-only ones (Core SetupAddressRelay from the VERSION handler,
   ;; net_processing.cpp:3754+5697-5711); inbound peers enable it on their
