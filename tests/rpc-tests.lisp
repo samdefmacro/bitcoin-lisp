@@ -473,14 +473,14 @@ status with no scan running returns null; abort with no scan is a no-op."
 
 (test json-rpc-response-success
   "Test successful response format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-response 42 "test-id")))
+  (let ((response (bitcoin-lisp.rpc::make-rpc-response 42 "test-id" :v2)))
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (= (gethash "result" response) 42))
     (is (string= (gethash "id" response) "test-id"))))
 
 (test json-rpc-response-error
   "Test error response format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" "test-id")))
+  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" "test-id" :v2)))
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (string= (gethash "id" response) "test-id"))
     (let ((error-obj (gethash "error" response)))
@@ -565,7 +565,7 @@ status with no scan running returns null; abort with no scan is a no-op."
     (is (= 8 (length (cdr (assoc "bits" result :test #'string=)))))
     ;; encodes cleanly through yason (warnings is an empty JSON array, etc.)
     (is (stringp (with-output-to-string (s)
-                   (yason:encode (bitcoin-lisp.rpc::make-rpc-response result "id") s))))))
+                   (yason:encode (bitcoin-lisp.rpc::make-rpc-response result "id" :v2) s))))))
 
 (test rpc-getblockcount
   "Test getblockcount returns integer"
@@ -802,7 +802,7 @@ used to emit it verbatim, which yason cannot encode."
       (is (integerp (cdr (assoc "version" entry :test #'string=))))
       (is (= (cdr (assoc "version" entry :test #'string=)) 70016))
       ;; full result must serialize without error
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-getnetworkinfo
@@ -884,7 +884,7 @@ RPC layer normalizes into a JSON object."
       (is (assoc "vsize" entry :test #'string=))
       (is (= 1 (cdr (assoc "ancestorcount" entry :test #'string=))))
       ;; serializes cleanly through the RPC response normalizer
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-sendrawtransaction-invalid
@@ -1422,7 +1422,7 @@ reserved value), matching Core's `if (!witness_stack.empty())`."
 
 (test rpc-error-response-format
   "Test error response matches Bitcoin Core format"
-  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" 123)))
+  (let ((response (bitcoin-lisp.rpc::make-rpc-error-response -32601 "Method not found" 123 :v2)))
     ;; Must have jsonrpc, error, and id fields
     (is (string= (gethash "jsonrpc" response) "2.0"))
     (is (gethash "error" response))
@@ -2014,7 +2014,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
                           (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)
                           (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)
                           (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)))
-      (let* ((response (bitcoin-lisp.rpc::make-rpc-response result "id"))
+      (let* ((response (bitcoin-lisp.rpc::make-rpc-response result "id" :v2))
              (json (with-output-to-string (s) (yason:encode response s)))
              (parsed (yason:parse json)))
         (is (hash-table-p parsed))
@@ -2059,7 +2059,7 @@ them as arrays and choked on the dotted pairs, so every object RPC errored."
       ;; B is a side branch one block off the active chain.
       (is (= (cdr (assoc "branchlen" fork :test #'string=)) 1))
       ;; full result serializes cleanly.
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response tips "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response tips "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-testmempoolaccept-missing-input
@@ -2546,7 +2546,7 @@ NODE_NETWORK on a full node (init.cpp:863,1946), so both names appear."
     (is (integerp (cdr (assoc "connections_in" r :test #'string=))))
     (is (integerp (cdr (assoc "connections_out" r :test #'string=))))
     (is (assoc "warnings" r :test #'string=))
-    (let ((resp (bitcoin-lisp.rpc::make-rpc-response r "id")))
+    (let ((resp (bitcoin-lisp.rpc::make-rpc-response r "id" :v2)))
       (finishes (with-output-to-string (s) (yason:encode resp s))))))
 
 (test rpc-getpeerinfo-fields
@@ -2671,7 +2671,7 @@ through yason."
       (is (null (assoc "addrbind" e :test #'string=)))
       (is (null (assoc "mapped_as" e :test #'string=)))
       ;; full row encodes through yason.
-      (let ((response (bitcoin-lisp.rpc::make-rpc-response rows "id")))
+      (let ((response (bitcoin-lisp.rpc::make-rpc-response rows "id" :v2)))
         (finishes (with-output-to-string (s) (yason:encode response s)))))))
 
 (test rpc-getpeerinfo-synced-headers-from-best-known
@@ -3568,3 +3568,530 @@ and a never-advanced tip reads as a large seconds-since-tip."
       ;; seconds-since-tip is well past the staleness threshold.
       (is (integerp seconds))
       (is (>= seconds bitcoin-lisp::*health-max-tip-staleness-seconds*)))))
+
+;;;; ---------------------------------------------------------------------
+;;;; JSON-RPC reply shape by request version (GA8 wave 6, item 1)
+;;;;
+;;;; Core JSONRPCReplyObj (rpc/request.cpp:51-68) shapes the reply from the
+;;;; request's version: "jsonrpc" is emitted for 2.0 only; a legacy 1.x reply
+;;;; carries BOTH "result" and "error" with one of them null; "id" is omitted
+;;;; when the request carried no id member (request.cpp:207-211).
+;;;; We used to answer every request with the 2.0 shape, which makes
+;;;; python-bitcoinrpc's AuthServiceProxy (`if response['error'] is not None:`)
+;;;; raise KeyError: 'error' on every successful call.
+;;;; ---------------------------------------------------------------------
+
+(defparameter *jsonrpc-shape-method* "ga8shapeecho"
+  "Name of the throwaway RPC method the reply-shape tests dispatch.")
+
+(defun call-with-jsonrpc-shape-method (thunk)
+  "Register an always-succeeding dispatch target, run THUNK, then remove it so
+the global method registry (which the /ui help test enumerates) is unchanged."
+  (bitcoin-lisp.rpc::register-rpc-method
+   *jsonrpc-shape-method*
+   (lambda (node params) (declare (ignore node params)) 42))
+  (unwind-protect (funcall thunk)
+    (remhash *jsonrpc-shape-method* bitcoin-lisp.rpc::*rpc-methods*)))
+
+(defmacro with-jsonrpc-shape-method (&body body)
+  `(call-with-jsonrpc-shape-method (lambda () ,@body)))
+
+(defun jsonrpc-shape-key-present-p (object key)
+  "True when the parsed JSON OBJECT carries KEY at all — which is a different
+question from its value being null, and is exactly the difference that breaks
+python-bitcoinrpc."
+  (and (hash-table-p object) (nth-value 1 (gethash key object))))
+
+(defun jsonrpc-shape-reply (body)
+  "Drive BODY through the production path (parse-json-rpc-request ->
+handle-single-request -> yason:encode) and return (values parsed-reply
+json-text). Returns (values :no-reply nil) for a 2.0 notification, which
+rpc-handler answers with HTTP 204 and no body."
+  (multiple-value-bind (kind method params id version id-present)
+      (bitcoin-lisp.rpc::parse-json-rpc-request body)
+    (unless (eq kind :single)
+      (error "jsonrpc-shape-reply: expected a single request, got ~S" kind))
+    (if (and (eq version :v2) (not id-present))
+        (values :no-reply nil)
+        (let* ((response (bitcoin-lisp.rpc::handle-single-request
+                          nil method params id version :id-present id-present))
+               (json (with-output-to-string (s) (yason:encode response s))))
+          (values (yason:parse json) json)))))
+
+(defun jsonrpc-shape-body (version-member method id-member)
+  "A request body: VERSION-MEMBER and ID-MEMBER are the literal JSON members
+to splice in (\"\" for absent)."
+  (format nil "{~@[~A,~]\"method\":\"~A\",\"params\":[]~@[,~A~]}"
+          version-member method id-member))
+
+(test jsonrpc-v1-success-reply-has-both-result-and-null-error
+  "A jsonrpc:\"1.0\" request — and one with no jsonrpc member at all, which
+Core also classifies V1_LEGACY (request.cpp:212-227) — gets the legacy reply
+shape: NO \"jsonrpc\" key, both \"result\" and \"error\" present with the error
+null, and the id echoed. The last assertion is python-bitcoinrpc's:
+response[\"error\"] must EXIST and be null on success."
+  (with-jsonrpc-shape-method
+    (dolist (version-member (list "\"jsonrpc\":\"1.0\"" nil))
+      (multiple-value-bind (reply json)
+          (jsonrpc-shape-reply (jsonrpc-shape-body version-member
+                                                   *jsonrpc-shape-method*
+                                                   "\"id\":7"))
+        (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+        (when (hash-table-p reply)
+          (is-false (jsonrpc-shape-key-present-p reply "jsonrpc")
+                    "1.x reply must not carry a \"jsonrpc\" key: ~A" json)
+          (is-true (jsonrpc-shape-key-present-p reply "result"))
+          (is (eql 42 (gethash "result" reply)))
+          ;; python-bitcoinrpc: `if response['error'] is not None:`
+          (is-true (jsonrpc-shape-key-present-p reply "error")
+                   "1.x success reply must carry a null \"error\": ~A" json)
+          (is-false (gethash "error" reply))
+          (is-true (search "\"error\":null" json)
+                   "\"error\" must serialize as JSON null: ~A" json)
+          (is-true (jsonrpc-shape-key-present-p reply "id"))
+          (is (eql 7 (gethash "id" reply))))))))
+
+(test jsonrpc-v1-error-reply-has-both-null-result-and-error
+  "A 1.x error reply carries a null \"result\" beside the error object and no
+\"jsonrpc\" key (Core rpc/request.cpp:60-64)."
+  (with-jsonrpc-shape-method
+    (dolist (version-member (list "\"jsonrpc\":\"1.0\"" nil))
+      (multiple-value-bind (reply json)
+          (jsonrpc-shape-reply (jsonrpc-shape-body version-member
+                                                   "ga8shapenosuchmethod"
+                                                   "\"id\":7"))
+        (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+        (when (hash-table-p reply)
+          (is-false (jsonrpc-shape-key-present-p reply "jsonrpc")
+                    "1.x reply must not carry a \"jsonrpc\" key: ~A" json)
+          (is-true (jsonrpc-shape-key-present-p reply "result")
+                   "1.x error reply must carry a null \"result\": ~A" json)
+          (is-false (gethash "result" reply))
+          (is-true (search "\"result\":null" json))
+          (let ((err (gethash "error" reply)))
+            (is (hash-table-p err) "expected an error object, got ~S" err)
+            (when (hash-table-p err)
+              (is (eql bitcoin-lisp.rpc::+rpc-method-not-found+
+                       (gethash "code" err)))
+              (is (equal "Method not found" (gethash "message" err)))))
+          (is (eql 7 (gethash "id" reply))))))))
+
+(test jsonrpc-v1-omits-id-when-request-had-none
+  "Core omits \"id\" entirely when the request carried no id member
+(rpc/request.cpp:66 with id = std::nullopt, :207-211). A 1.x request without an
+id is NOT a notification — it still gets a reply, just without the key."
+  (with-jsonrpc-shape-method
+    (dolist (version-member (list "\"jsonrpc\":\"1.0\"" nil))
+      ;; Success and error both.
+      (dolist (method (list *jsonrpc-shape-method* "ga8shapenosuchmethod"))
+        (multiple-value-bind (reply json)
+            (jsonrpc-shape-reply (jsonrpc-shape-body version-member method nil))
+          (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+          (when (hash-table-p reply)
+            (is-false (jsonrpc-shape-key-present-p reply "id")
+                      "no id member in the request => no \"id\" key: ~A" json)
+            (is-true (jsonrpc-shape-key-present-p reply "result"))
+            (is-true (jsonrpc-shape-key-present-p reply "error")))))
+      ;; id:null is a different thing from an absent id: the key comes back.
+      (multiple-value-bind (reply json)
+          (jsonrpc-shape-reply (jsonrpc-shape-body version-member
+                                                   *jsonrpc-shape-method*
+                                                   "\"id\":null"))
+        (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+        (when (hash-table-p reply)
+          (is-true (jsonrpc-shape-key-present-p reply "id")
+                   "id:null must echo back as \"id\":null: ~A" json)
+          (is-false (gethash "id" reply)))))))
+
+(test jsonrpc-v2-reply-shape-is-unchanged
+  "Control: a 2.0 request must still get the strict 2.0 shape — \"jsonrpc\"
+present, and only ONE of result/error (Core rpc/request.cpp:55-64). This is
+what proves the 1.x fix did not simply flip every reply to the legacy shape."
+  (with-jsonrpc-shape-method
+    ;; Success.
+    (multiple-value-bind (reply json)
+        (jsonrpc-shape-reply (jsonrpc-shape-body "\"jsonrpc\":\"2.0\""
+                                                 *jsonrpc-shape-method*
+                                                 "\"id\":7"))
+      (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+      (when (hash-table-p reply)
+        (is (equal "2.0" (gethash "jsonrpc" reply)))
+        (is (eql 42 (gethash "result" reply)))
+        (is-false (jsonrpc-shape-key-present-p reply "error")
+                  "2.0 success reply must omit \"error\": ~A" json)
+        (is (eql 7 (gethash "id" reply)))))
+    ;; Error.
+    (multiple-value-bind (reply json)
+        (jsonrpc-shape-reply (jsonrpc-shape-body "\"jsonrpc\":\"2.0\""
+                                                 "ga8shapenosuchmethod"
+                                                 "\"id\":7"))
+      (is (hash-table-p reply) "expected a reply object, got ~S" reply)
+      (when (hash-table-p reply)
+        (is (equal "2.0" (gethash "jsonrpc" reply)))
+        (is-false (jsonrpc-shape-key-present-p reply "result")
+                  "2.0 error reply must omit \"result\": ~A" json)
+        (is-true (hash-table-p (gethash "error" reply)))
+        (is (eql 7 (gethash "id" reply)))))
+    ;; A 2.0 notification (no id member) is executed but gets no reply at all
+    ;; (Core httprpc.cpp:167-171 answers HTTP 204).
+    (is (eq :no-reply
+            (jsonrpc-shape-reply (jsonrpc-shape-body "\"jsonrpc\":\"2.0\""
+                                                     *jsonrpc-shape-method*
+                                                     nil))))))
+
+(test jsonrpc-batch-reply-shape-is-per-member
+  "Core re-parses every batch member on its own (httprpc.cpp:194-206), so the
+reply shape is per member: a 1.x member gets result+error and no \"jsonrpc\",
+a 2.0 member gets the strict shape, a 2.0 notification contributes no reply at
+all (:207-209), and a 1.x member without an id gets a reply with no \"id\"."
+  (with-jsonrpc-shape-method
+    (multiple-value-bind (kind requests)
+        (bitcoin-lisp.rpc::parse-json-rpc-request
+         (format nil "[{\"jsonrpc\":\"1.0\",\"method\":\"~A\",\"id\":1},~
+                       {\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"id\":2},~
+                       {\"jsonrpc\":\"2.0\",\"method\":\"~A\"},~
+                       {\"method\":\"~A\"}]"
+                 *jsonrpc-shape-method* *jsonrpc-shape-method*
+                 *jsonrpc-shape-method* *jsonrpc-shape-method*))
+      (is (eq :batch kind))
+      (let ((replies (bitcoin-lisp.rpc::handle-batch-request nil requests)))
+        (is (= 3 (length replies))
+            "the 2.0 notification must contribute no reply; got ~S replies"
+            (length replies))
+        (when (= 3 (length replies))
+          (destructuring-bind (v1 v2 v1-no-id) replies
+            (is-false (jsonrpc-shape-key-present-p v1 "jsonrpc"))
+            (is-true (jsonrpc-shape-key-present-p v1 "error"))
+            (is-false (gethash "error" v1))
+            (is (eql 1 (gethash "id" v1)))
+            (is (equal "2.0" (gethash "jsonrpc" v2)))
+            (is-false (jsonrpc-shape-key-present-p v2 "error"))
+            (is (eql 2 (gethash "id" v2)))
+            (is-false (jsonrpc-shape-key-present-p v1-no-id "jsonrpc"))
+            (is-true (jsonrpc-shape-key-present-p v1-no-id "error"))
+            (is-false (jsonrpc-shape-key-present-p v1-no-id "id")
+                      "a 1.x batch member with no id must get no \"id\" key")))))))
+
+(test jsonrpc-pre-dispatch-errors-use-the-legacy-shape
+  "Failures raised before a version is known — parse errors, invalid requests,
+and the HTTP-level refusals rpc-json-error builds — take Core's default
+V1_LEGACY/null-id JSONRPCRequest (httprpc.cpp:41-59, request.h:55,63), so they
+carry result+error and no \"jsonrpc\"."
+  (let* ((response (bitcoin-lisp.rpc::make-rpc-error-response
+                    bitcoin-lisp.rpc::+rpc-parse-error+ "Parse error" nil :v1))
+         (json (with-output-to-string (s) (yason:encode response s)))
+         (reply (yason:parse json)))
+    (is-false (jsonrpc-shape-key-present-p reply "jsonrpc") "~A" json)
+    (is-true (jsonrpc-shape-key-present-p reply "result") "~A" json)
+    (is-false (gethash "result" reply))
+    (is-true (jsonrpc-shape-key-present-p reply "id") "~A" json)
+    (is-false (gethash "id" reply))
+    (let ((err (gethash "error" reply)))
+      (is (hash-table-p err))
+      (when (hash-table-p err)
+        (is (eql bitcoin-lisp.rpc::+rpc-parse-error+ (gethash "code" err)))))))
+
+;;;; ---------------------------------------------------------------------
+;;;; The same rules, asserted at the HTTP HANDLER — the call site the bug
+;;;; actually lived at.
+;;;;
+;;;; The tests above drive parse-json-rpc-request -> handle-single-request by
+;;;; hand, which proves the reply BUILDERS but says nothing about the wiring:
+;;;; the original defect was precisely that rpc-handler parsed the version and
+;;;; never passed it on. So these tests call RPC-HANDLER itself (and
+;;;; RPC-JSON-ERROR, the pre-dispatch refusal path) and assert the ENCODED
+;;;; RESPONSE BODY plus the HTTP status, byte for byte — a Lisp-value
+;;;; assertion cannot see a serialization regression, and this whole bug class
+;;;; is serialization.
+;;;;
+;;;; rpc-handler only ever reads headers-in, script-name and raw-post-data off
+;;;; hunchentoot:*request*, so a synthetic request with its raw-post-data slot
+;;;; pre-filled — exactly what hunchentoot's own get-post-data leaves there
+;;;; (hunchentoot request.lisp:150-183) — drives the real function with no
+;;;; socket, acceptor or server.
+;;;;
+;;;; Authentication is mandatory and is checked BEFORE the body is parsed or
+;;;; dispatched (Core HTTPReq_JSONRPC, httprpc.cpp:112-133), so these requests
+;;;; carry a real HTTP Basic credential, exactly as bitcoin-cli does: the
+;;;; helpers bind *rpc-user*/*rpc-password* for the duration of the call and
+;;;; send the matching header. None of the shapes below can be reached without
+;;;; one — see the 401 assertion in the pre-dispatch test, which is what fails
+;;;; if that credential ever stops being load-bearing.
+;;;; ---------------------------------------------------------------------
+
+(defparameter *jsonrpc-handler-rpc-user* "ga8shapeuser"
+  "The RPC user the handler tests authorize as (bound over *rpc-user* for the
+duration of one jsonrpc-handler-reply call).")
+
+(defparameter *jsonrpc-handler-rpc-password* "ga8shapepass"
+  "The RPC password the handler tests authorize with (bound over
+*rpc-password* for the duration of one jsonrpc-handler-reply call).")
+
+(defun jsonrpc-handler-credential ()
+  "The \"user:pass\" credential the handler tests send as HTTP Basic."
+  (concatenate 'string *jsonrpc-handler-rpc-user* ":"
+               *jsonrpc-handler-rpc-password*))
+
+(defun jsonrpc-handler-basic-auth (credential)
+  "CREDENTIAL (\"user:pass\") as an HTTP Basic Authorization header value:
+the scheme name, a space, then the base64 of the pair — what Core's
+RPCAuthorized decodes (httprpc.cpp:84-101). Spelled out here so this section
+builds on its own; it is the one line of HTTP a handler test needs."
+  (concatenate 'string "Basic " (cl-base64:string-to-base64-string credential)))
+
+(defparameter *jsonrpc-handler-dotted-method* "ga8shapedotted"
+  "A method whose result (an improper list) has no JSON encoding, so
+yason:encode signals inside rpc-handler — the only way to reach its
+outermost internal-error clause, since handle-single-request catches
+everything a method itself signals.")
+
+(defun call-with-jsonrpc-handler-methods (thunk)
+  "Register the handler tests' throwaway dispatch targets, run THUNK, then
+remove them so the global method registry is unchanged."
+  (bitcoin-lisp.rpc::register-rpc-method
+   *jsonrpc-shape-method*
+   (lambda (node params) (declare (ignore node params)) 42))
+  (bitcoin-lisp.rpc::register-rpc-method
+   *jsonrpc-handler-dotted-method*
+   (lambda (node params) (declare (ignore node params)) (cons 1 2)))
+  (unwind-protect (funcall thunk)
+    (remhash *jsonrpc-shape-method* bitcoin-lisp.rpc::*rpc-methods*)
+    (remhash *jsonrpc-handler-dotted-method* bitcoin-lisp.rpc::*rpc-methods*)))
+
+(defmacro with-jsonrpc-handler-methods (&body body)
+  `(call-with-jsonrpc-handler-methods (lambda () ,@body)))
+
+(defun jsonrpc-handler-request (body &key (content-type "application/json")
+                                       (uri "/") (headers '()) content-length
+                                       (auth (jsonrpc-handler-credential)))
+  "A synthetic hunchentoot POST request carrying BODY.
+AUTH is a \"user:pass\" credential sent as an HTTP Basic Authorization header;
+it defaults to the pair jsonrpc-handler-reply installs, so the request is
+authorized. NIL sends no Authorization header at all (a 401), and any other
+string exercises a wrong credential.
+CONTENT-LENGTH overrides the Content-Length header (to exercise the
+oversized-body refusal without allocating 32 MiB). hunchentoot:*acceptor*
+must be bound while the request is built: initialize-instance :after consults
+it through session-verify."
+  (let* ((octets (flexi-streams:string-to-octets body :external-format :utf-8))
+         (hunchentoot:*acceptor* nil)
+         (request (make-instance 'hunchentoot:request
+                                 :acceptor nil
+                                 :headers-in
+                                 (list* (cons :content-type content-type)
+                                        (cons :host "127.0.0.1:18332")
+                                        (cons :content-length
+                                              (or content-length
+                                                  (princ-to-string (length octets))))
+                                        (append
+                                         (when auth
+                                           (list (cons :authorization
+                                                       (jsonrpc-handler-basic-auth
+                                                        auth))))
+                                         headers))
+                                 :method :post
+                                 :uri uri
+                                 ;; The refused-credential path logs the peer
+                                 ;; address; the slot has no initform, so a
+                                 ;; request built without one would signal
+                                 ;; UNBOUND-SLOT instead of answering 401.
+                                 :remote-addr "127.0.0.1"
+                                 :server-protocol :http/1.1
+                                 :content-stream nil)))
+    (setf (slot-value request 'hunchentoot::raw-post-data) octets)
+    request))
+
+(defun jsonrpc-handler-reply (body &rest request-args)
+  "POST BODY to the production entry point RPC-HANDLER; return
+ (values http-status response-body content-type). The RPC credential is
+installed for the duration of the call and sent with the request, so the
+handler authorizes it and reaches the paths under test; :AUTH overrides what
+the client presents (see jsonrpc-handler-request). RATE-LIMITER, when given as
+:rate-limiter, replaces the global limiter for this one call."
+  (let* ((rate-limiter (getf request-args :rate-limiter))
+         (request-args (loop for (k v) on request-args by #'cddr
+                             unless (eq k :rate-limiter)
+                               append (list k v)))
+         (bitcoin-lisp.rpc::*rpc-user* *jsonrpc-handler-rpc-user*)
+         (bitcoin-lisp.rpc::*rpc-password* *jsonrpc-handler-rpc-password*)
+         (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+         (hunchentoot:*request* (apply #'jsonrpc-handler-request body request-args))
+         (bitcoin-lisp.rpc::*rpc-node* nil)
+         (bitcoin-lisp.rpc::*rpc-rate-limiter* rate-limiter))
+    ;; A fresh reply starts at 200; reset explicitly so a request-construction
+    ;; hiccup could not pre-seed the status the assertions read back.
+    (setf (hunchentoot:return-code*) hunchentoot:+http-ok+)
+    (let ((out (bitcoin-lisp.rpc::rpc-handler)))
+      (values (hunchentoot:return-code*) out (hunchentoot:content-type*)))))
+
+(defun jsonrpc-handler-check (body expected-status expected-json &rest request-args)
+  "Assert that POSTing BODY to rpc-handler answers EXPECTED-STATUS with
+EXPECTED-JSON as the exact response body."
+  (multiple-value-bind (status json)
+      (apply #'jsonrpc-handler-reply body request-args)
+    (is (eql expected-status status)
+        "~A~%  status: expected ~S, got ~S (body ~S)"
+        body expected-status status json)
+    (is (string= expected-json json)
+        "~A~%  body: expected ~S~%        got      ~S"
+        body expected-json json)))
+
+(defun jsonrpc-legacy-error-json (code message)
+  "The exact legacy-1.x error body Core's JSONErrorReply sends for a failure
+raised before any version is known: null result, the error object, null id
+(httprpc.cpp:41-59 over the default V1_LEGACY/VNULL-id JSONRPCRequest,
+request.h:55,63)."
+  (format nil "{\"result\":null,\"error\":{\"code\":~D,\"message\":\"~A\"},\"id\":null}"
+          code message))
+
+(test jsonrpc-handler-threads-request-version-into-the-reply
+  "rpc-handler must hand handle-single-request the version and id-presence it
+just parsed. Asserted on the wire bytes: a 1.x request (explicit \"1.0\" or no
+jsonrpc member, both V1_LEGACY per request.cpp:212-227) gets result+error with
+one null and no \"jsonrpc\" key, while a 2.0 request keeps the strict 2.0
+shape. Hardcoding either argument at the call site — which IS the bug this
+wave repairs — changes these bytes."
+  (with-jsonrpc-handler-methods
+    (let ((echo *jsonrpc-shape-method*))
+      ;; --- 1.x success: both keys, error null, id echoed, no "jsonrpc". ---
+      (dolist (version-member '("\"jsonrpc\":\"1.0\"," ""))
+        (jsonrpc-handler-check
+         (format nil "{~A\"method\":\"~A\",\"params\":[],\"id\":7}" version-member echo)
+         200 "{\"result\":42,\"error\":null,\"id\":7}")
+        ;; --- 1.x, no id member: still answered, but with no "id" key. A 1.x
+        ;; request is never a notification (Core IsNotification, request.h:67).
+        (jsonrpc-handler-check
+         (format nil "{~A\"method\":\"~A\",\"params\":[]}" version-member echo)
+         200 "{\"result\":42,\"error\":null}")
+        ;; --- 1.x error: null result beside the error, and the 1.x status
+        ;; mapping (-32601 -> 404, httprpc.cpp:41-59).
+        (jsonrpc-handler-check
+         (format nil "{~A\"method\":\"ga8shapenosuchmethod\",\"id\":7}" version-member)
+         404
+         (format nil "{\"result\":null,\"error\":{\"code\":~D,\"message\":\"Method not found\"},\"id\":7}"
+                 bitcoin-lisp.rpc::+rpc-method-not-found+)))
+      ;; --- 2.0 control: unchanged, and always HTTP 200 even for an error. ---
+      (jsonrpc-handler-check
+       (format nil "{\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"params\":[],\"id\":7}" echo)
+       200 "{\"jsonrpc\":\"2.0\",\"result\":42,\"id\":7}")
+      (jsonrpc-handler-check
+       "{\"jsonrpc\":\"2.0\",\"method\":\"ga8shapenosuchmethod\",\"id\":7}"
+       200
+       (format nil "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":~D,\"message\":\"Method not found\"},\"id\":7}"
+               bitcoin-lisp.rpc::+rpc-method-not-found+))
+      ;; --- The reply is the same on a /wallet/<name> endpoint. ---
+      (jsonrpc-handler-check
+       (format nil "{\"method\":\"~A\",\"id\":7}" echo)
+       200 "{\"result\":42,\"error\":null,\"id\":7}"
+       :uri "/wallet/w1"))))
+
+(test jsonrpc-handler-notification-and-batch-http-shapes
+  "The handler's own HTTP-level decisions: a 2.0 notification and a non-empty
+all-notification batch answer 204 with no body (Core httprpc.cpp:167-171,220),
+while an EMPTY batch answers 200 with [] (:211-219) — NIL would encode as JSON
+null, so the empty array has to be spelled #(). Batch replies are per member."
+  (with-jsonrpc-handler-methods
+    (let ((echo *jsonrpc-shape-method*))
+      ;; 2.0 notification: executed, no reply, 204.
+      (jsonrpc-handler-check
+       (format nil "{\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"params\":[]}" echo)
+       204 "")
+      ;; Non-empty all-notification batch: 204, no body.
+      (jsonrpc-handler-check
+       (format nil "[{\"jsonrpc\":\"2.0\",\"method\":\"~A\"},~
+                     {\"jsonrpc\":\"2.0\",\"method\":\"~A\"}]" echo echo)
+       204 "")
+      ;; Empty batch: 200 with a JSON array, NOT null.
+      (jsonrpc-handler-check "[]" 200 "[]")
+      ;; Mixed batch: 1.x member, 2.0 member, dropped 2.0 notification, and a
+      ;; 1.x member with no id (reply present, "id" key absent).
+      (jsonrpc-handler-check
+       (format nil "[{\"jsonrpc\":\"1.0\",\"method\":\"~A\",\"id\":1},~
+                     {\"jsonrpc\":\"2.0\",\"method\":\"~A\",\"id\":2},~
+                     {\"jsonrpc\":\"2.0\",\"method\":\"~A\"},~
+                     {\"method\":\"~A\"}]"
+               echo echo echo echo)
+       200
+       (concatenate 'string
+                    "[{\"result\":42,\"error\":null,\"id\":1},"
+                    "{\"jsonrpc\":\"2.0\",\"result\":42,\"id\":2},"
+                    "{\"result\":42,\"error\":null}]"))
+      ;; A non-object member has no version of its own: Core's fresh request is
+      ;; V1_LEGACY with a null id, and the batch still answers 200.
+      (jsonrpc-handler-check
+       "[7]" 200
+       (format nil "[~A]"
+               (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-invalid-request+
+                                          "Invalid request format"))))))
+
+(test jsonrpc-handler-pre-dispatch-errors-use-the-legacy-shape
+  "Every reply rpc-handler sends before (or instead of) dispatching — origin
+refusal, rate limit, oversized body, parse error, invalid request, and the
+outermost internal-error clause — carries Core's default V1_LEGACY/null-id
+shape and the 1.x status mapping. These are the paths a broken client hits
+most, so the bytes are pinned here rather than only in the builder.
+The two credential cases also pin the ORDER of the guards (origin -> auth ->
+rate limit -> size -> content-type -> dispatch): each assertion below only
+reaches the refusal it is named for because the ones ahead of it passed."
+  (with-jsonrpc-handler-methods
+    ;; Malformed JSON -> -32700, HTTP 500.
+    (jsonrpc-handler-check
+     "not valid json" 500
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-parse-error+ "Parse error"))
+    ;; Missing method -> -32600, HTTP 400. Note the request says 2.0 and still
+    ;; gets the legacy shape: pre-dispatch failures carry no version (the
+    ;; documented deviation from Core, which has already recorded V2 here).
+    (jsonrpc-handler-check
+     "{\"jsonrpc\":\"2.0\",\"id\":1}" 400
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-invalid-request+
+                                "Missing or invalid method"))
+    ;; A result yason cannot encode reaches the handler's outermost clause.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-handler-dotted-method*)
+     500
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-internal-error+ "Internal error"))
+    ;; Oversized body (Content-Length over the 32 MiB cap) -> 400.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 400
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Request body too large")
+     :content-length (princ-to-string (1+ bitcoin-lisp:+max-rpc-body-size+)))
+    ;; A credential that does not match -> 401 with an empty body, decided
+    ;; before the body is even looked at. This assertion is also what keeps
+    ;; every other check in this section honest: they reach the paths they name
+    ;; only because jsonrpc-handler-reply presents a real credential, and this
+    ;; is the check that fails first if that credential ever stops mattering.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 401 ""
+     :auth (concatenate 'string *jsonrpc-handler-rpc-user* ":wrong"))
+    ;; Cross-origin browser POST -> 403, refused BEFORE auth: sent with no
+    ;; credential at all, so a handler that authenticated first would answer
+    ;; 401 here and this check would fail.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 403
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+
+                                "Origin does not match Host")
+     :auth nil
+     :headers (list (cons :origin "http://evil.example")))
+    ;; Rate limited -> 429 (an exhausted bucket: rate 0, burst 0), reached with
+    ;; a valid credential: the limiter sits behind auth.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 429
+     (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Rate limit exceeded")
+     :rate-limiter (bitcoin-lisp:make-rate-limiter 0 0))
+    ;; Wrong Content-Type is refused with an empty body (Core answers 415 too).
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 415 ""
+     :content-type "application/xml")))
+
+(test rpc-json-error-emits-the-legacy-shape
+  "rpc-json-error is the single builder behind those HTTP-level refusals: it
+sets the status and application/json, and its body is the V1_LEGACY shape."
+  (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+    (let ((json (bitcoin-lisp.rpc::rpc-json-error
+                 429 bitcoin-lisp.rpc::+rpc-misc-error+ "Rate limit exceeded")))
+      (is (eql 429 (hunchentoot:return-code*)))
+      (is (equal "application/json" (hunchentoot:content-type*)))
+      (is (string= (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+
+                                              "Rate limit exceeded")
+                   json)
+          "rpc-json-error body: ~S" json))))
