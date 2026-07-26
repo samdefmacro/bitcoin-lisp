@@ -137,6 +137,28 @@ step 3 to the mempool."
         ;; (Core MempoolAcceptedTx -> EraseTx).
         (is-false (%pr-orphan-p mempool child))))))
 
+(test ln-cpfp-pair-accepted-when-the-child-arrives-first
+  "The other arrival order, and the one Core optimises for: the child is
+already an orphan when the parent arrives for the FIRST time, so the
+parent's very first fee failure forms the package (Core's
+ProcessInvalidTx -> Find1P1CPackage on first_time_failure,
+txdownloadman_impl.cpp:460-465). No re-announcement is needed."
+  (multiple-value-bind (utxo mempool state funding) (%pkg-fixture)
+    (let* ((parent (%pkg-tx funding 0 (- 100000000 5)))
+           (pid (bitcoin-lisp.serialization:transaction-hash parent))
+           (child (%pkg-tx pid 0 (- 100000000 5 50000)))
+           (cid (bitcoin-lisp.serialization:transaction-hash child))
+           (peer (%pr-peer)))
+      (%with-fresh-rejects (rejects)
+        (bitcoin-lisp.networking::handle-tx
+         peer (%pr-payload child) utxo mempool state nil :recent-rejects rejects)
+        (is-true (%pr-orphan-p mempool child))
+        (bitcoin-lisp.networking::handle-tx
+         peer (%pr-payload parent) utxo mempool state nil :recent-rejects rejects)
+        (is-true (bitcoin-lisp.mempool:mempool-has mempool pid))
+        (is-true (bitcoin-lisp.mempool:mempool-has mempool cid))
+        (is-false (%pr-orphan-p mempool child))))))
+
 (test reconsiderable-parent-alone-is-still-rejected
   "The control for the test above: with NO child in the orphanage, a
 re-arriving low-fee parent is still not accepted. The fee floor is intact —
