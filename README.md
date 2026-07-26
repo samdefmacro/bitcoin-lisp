@@ -169,8 +169,9 @@ the `-testnet`/`-testnet4`/`-signet`/`-regtest` flags; `-datadir`, `-conf`;
 
 Production nodes do **not** run under systemd. They run under a small bash
 respawn supervisor, [`scripts/run-node.sh`](scripts/run-node.sh), which
-relaunches SBCL on any exit (graceful shutdown, in-image watchdog, or crash)
-and stamps the deployed git rev into the advertised subversion:
+relaunches SBCL by exit code — 0 (a completed, deliberate stop) stays down,
+1 (a deterministic failure) backs off, 7/crash respawns — and stamps the
+deployed git rev into the advertised subversion:
 
 ```bash
 scripts/run-node.sh testnet4      # or: mainnet | regtest
