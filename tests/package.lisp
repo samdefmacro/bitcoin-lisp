@@ -38,6 +38,11 @@
   :description "Tests for package relay (submitpackage)"
   :in :bitcoin-lisp-tests)
 
+(def-suite :package-relay-tests
+  :description "Opportunistic 1p1c package relay over P2P + the reconsiderable
+rejects filter"
+  :in :bitcoin-lisp-tests)
+
 (def-suite :mining-tests
   :description "Tests for regtest support and mining RPCs"
   :in :bitcoin-lisp-tests)
