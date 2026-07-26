@@ -303,3 +303,111 @@ already know it -- and marks the source + targets in their known-addrs sets."
                          full)))
       ;; third time: everyone knows it -> nothing sent
       (is (= 0 (bitcoin-lisp.networking::relay-address pa source peers))))))
+
+;;;; ============================================================
+;;;; G7-20: per-network getaddr response cache
+;;;; ============================================================
+
+(defun %g720-book (n)
+  "An address book seeded with N routable addresses spread across /16s, with
+RECENT last-seen stamps — addrman excludes 'terrible' (stale) entries from
+GetAddr, so a fixed 2023 timestamp yields an empty sample.
+
+NB the book may hold FEWER than N — addrman buckets collide by design — so
+these tests never assert an exact count (a standing rule in this project)."
+  (let ((book (bitcoin-lisp.networking:make-address-book))
+        (now (bitcoin-lisp.serialization:get-unix-time)))
+    (dotimes (i n)
+      (bitcoin-lisp.networking:address-book-add
+       book (bitcoin-lisp.networking:make-peer-address
+             :ip (bitcoin-lisp.networking::ipv4-to-mapped-ipv6
+                  203 (mod i 250) (floor i 250) 7)
+             :port (+ 18333 i) :services 1 :last-seen now)))
+    book))
+
+(test g7-20-getaddr-response-is-cached-per-network
+  "G7-20: re-sampling addrman on every getaddr let an attacker reconnect
+repeatedly and harvest many independent samples — enough to reconstruct the
+table and watch timestamps churn. Core answers every requestor on one network
+with the SAME snapshot for 21-27h (net.cpp:3694-3730), which is what makes
+reconnecting pointless."
+  (bitcoin-lisp.networking::clear-addr-response-caches)
+  (let* ((book (%g720-book 200))
+         (now 1700000000))
+    (let ((r1 (bitcoin-lisp.networking::cached-getaddr-response book :ipv4 now))
+          (r2 (bitcoin-lisp.networking::cached-getaddr-response book :ipv4 (+ now 60)))
+          (r3 (bitcoin-lisp.networking::cached-getaddr-response
+               book :ipv4 (+ now (* 3 60 60)))))
+      (is (eq r1 r2) "a second requestor inside the window gets the SAME snapshot")
+      (is (eq r1 r3) "still the same snapshot hours later"))
+    ;; A different requestor network gets its own snapshot and its own expiry.
+    (let ((v4 (bitcoin-lisp.networking::cached-getaddr-response book :ipv4 now))
+          (onion (bitcoin-lisp.networking::cached-getaddr-response book :torv3 now)))
+      (is (not (eq v4 onion))
+          "networks must not share a cache entry"))
+    (is (= 2 (hash-table-count bitcoin-lisp.networking::*addr-response-caches*)))))
+
+(test g7-20-cache-expires-between-21h-and-27h
+  "Expiry is 21h + rand(6h) (Core's m_cache_entry_expiration), so the refresh
+instant is not predictable and cannot itself be used as a clock signal."
+  (bitcoin-lisp.networking::clear-addr-response-caches)
+  (let ((book (%g720-book 60))
+        (now 1700000000))
+    (let ((first (bitcoin-lisp.networking::cached-getaddr-response book :ipv4 now)))
+      ;; Just under the minimum lifetime: still the same object.
+      (is (eq first (bitcoin-lisp.networking::cached-getaddr-response
+                     book :ipv4 (+ now (* 21 60 60) -60))))
+      ;; Past the maximum lifetime: refilled.
+      (let ((refreshed (bitcoin-lisp.networking::cached-getaddr-response
+                        book :ipv4 (+ now (* 27 60 60) 60))))
+        (is (not (eq first refreshed)) "must refill after the maximum lifetime")))
+    ;; The stored expiry must sit inside [21h, 27h].
+    (bitcoin-lisp.networking::clear-addr-response-caches)
+    (bitcoin-lisp.networking::cached-getaddr-response book :ipv4 now)
+    (let ((expiry (cdr (gethash :ipv4 bitcoin-lisp.networking::*addr-response-caches*))))
+      (is (>= expiry (+ now (* 21 60 60))))
+      (is (<= expiry (+ now (* 27 60 60)))))))
+
+(test g7-20-ban-filter-runs-at-fill-time-only
+  "Core filters banned/discouraged inside GetAddressesUnsafe (net.cpp:3686-3690),
+which runs ONLY on a cache miss; a hit returns the cached list verbatim
+(net.cpp:3729). Re-filtering per hit would make responses differ between
+requestors inside one window whenever a ban landed mid-window — exactly the
+fingerprinting signal the cache exists to erase. The visible consequence is
+that a banned address keeps being gossiped for up to 27h. That is
+Core-identical and intended, so it is asserted here rather than 'fixed'."
+  (bitcoin-lisp.networking::clear-addr-response-caches)
+  (bitcoin-lisp.networking::clear-discouraged)
+  (let* ((book (%g720-book 40))
+         (now 1700000000)
+         (filled (bitcoin-lisp.networking::cached-getaddr-response book :ipv4 now)))
+    (is (plusp (length filled)) "precondition: the cache filled with something")
+    ;; Discourage an address that IS in the cached snapshot.
+    (let ((victim (bitcoin-lisp.networking:peer-address-string (first filled))))
+      (bitcoin-lisp.networking:discourage-peer victim)
+      (let ((hit (bitcoin-lisp.networking::cached-getaddr-response book :ipv4 (+ now 60))))
+        (is (eq filled hit)
+            "a cache HIT must be returned verbatim, not re-filtered"))
+      ;; ...but a refill after expiry drops it.
+      (let ((refilled (bitcoin-lisp.networking::cached-getaddr-response
+                       book :ipv4 (+ now (* 28 60 60)))))
+        (is (notany (lambda (pa)
+                      (string= victim (bitcoin-lisp.networking:peer-address-string pa)))
+                    refilled)
+            "a refill must apply the ban/discourage filter"))
+      (bitcoin-lisp.networking::clear-discouraged))))
+
+(test g7-20-getnodeaddresses-stays-uncached
+  "Core's rpc/net.cpp:956 deliberately calls the UNCACHED GetAddressesUnsafe:
+the operator asking their own node must see live addrman state, not a snapshot
+frozen for a day. Guard against 'helpfully' routing it through the cache."
+  (let ((src (with-open-file (s (merge-pathnames "src/rpc/methods.lisp"
+                                                 (asdf:system-source-directory :bitcoin-lisp)))
+               (let ((text (make-string (file-length s))))
+                 (subseq text 0 (read-sequence text s))))))
+    (let ((start (search "defun rpc-getnodeaddresses" src)))
+      (is (integerp start) "rpc-getnodeaddresses must exist")
+      (when start
+        (let ((body (subseq src start (min (length src) (+ start 2000)))))
+          (is (null (search "cached-getaddr-response" body))
+              "getnodeaddresses must not use the getaddr cache"))))))
