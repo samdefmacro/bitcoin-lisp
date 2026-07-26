@@ -259,10 +259,36 @@ but treat it as a behaviour change with a blast radius, not a typo:
    malformed `Authorization` header ⇒ NIL. `rpc-handler:535-537` already emits
    `401` + `WWW-Authenticate` when `check-auth` returns NIL
    (`httprpc.cpp:112-117`), so no handler change is needed.
-3. **Cookie file permissions**: `chmod` to 0600 after writing (`sb-posix:chmod`),
-   matching Core's umask 0077 (`request.cpp:109-111`, `-rpccookieperms=owner`).
-   It is currently 0664 on both the testnet4 and mainnet datadirs. Enforcing auth
-   without this restores nothing.
+3. **Cookie file permissions — the file must be 0600 *from creation*, not
+   chmod-ed afterwards.** (Corrected 2026-07-26: an earlier revision of this plan
+   said "chmod to 0600 after writing", which review showed is defeatable and is
+   the wrong instruction.) `with-open-file` creates the temp file `#o666 & ~umask`,
+   and the live host runs umask 002 — which is exactly why its cookies are 0664 —
+   so the file exists world-readable *while the secret is written into it*. POSIX
+   checks permissions only at `open(2)`, so any local user who opens it at
+   creation keeps a valid fd across both the chmod and the rename. Watching the
+   datadir makes that deterministic across a restart. Create it atomically
+   instead: `sb-posix:open` with `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW` and mode
+   `#o600`, or set `sb-posix:umask #o077` around the write and restore it in an
+   `unwind-protect`. `O_EXCL|O_NOFOLLOW` also closes a second hole:
+   `:if-exists :supersede` plus `(truename tmp)` would follow an attacker-planted
+   `.cookie.tmp` symlink and then rename the *resolved target* over `.cookie`.
+   Core needs none of this because it sets a process-wide umask 0077
+   (`common/system.cpp`), so `request.cpp:109-123` is 0600 from creation and
+   `fs::permissions` is only called for an explicit `-rpccookieperms`.
+3b. **Generate the cookie only after the acceptor binds.** Core's order is
+   `InitHTTPServer` (binds the sockets) → `StartHTTPRPC` →
+   `InitRPCAuthentication` → `GenerateAuthCookie`, so a port conflict aborts
+   before any cookie is touched. Writing it first means a second process started
+   on a live datadir — which has happened here, when `restart-node.sh`'s pkill
+   marker failed to match the running supervisor — overwrites `.cookie` with a
+   secret matching nothing, fails to bind, and exits, while the healthy node
+   keeps serving the old secret in memory. Every client that re-reads the cookie
+   then gets 401 from a node that is perfectly fine, and the surviving process
+   logs nothing. Harmless before this task (nothing checked the credential);
+   after it, one accidental double-start locks every client out of a live,
+   wallet-loaded node. Install the credential after `hunchentoot:start` succeeds
+   — safe, because the dispatcher is fail-closed while `*rpc-user*` is still NIL.
 4. **Constant-time comparison** in `%basic-auth-matches-p` (`server.lisp:437,440`
    use `string=`; Core uses `TimingResistantEqual`, `httprpc.cpp:67,76`), and
    `(sleep 0.25)` before returning 401 on a *wrong* credential — not on a missing
