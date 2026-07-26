@@ -1345,26 +1345,125 @@ post-promotion index rebind."
                   (log-info "Block filter index: height ~D (~,1F%)" h pct)))))
         (log-info "Block filter index build complete: ~D block~:P indexed" n)))))
 
+;;; coinstatsindex rewind (Core BaseIndex::Rewind, index/base.cpp:239/290)
+;;;
+;;; coinstats records are keyed by HEIGHT with no block hash, there is no
+;;; disconnect hook, and index writes reach the OS immediately while the
+;;; chainstate tip only becomes durable at a flush (600s / N blocks / cache
+;;; size — and a reorg does not trigger one). So a process kill inside that
+;;; window leaves records holding an ABANDONED chain's state at heights at or
+;;; below the tip that startup restores. The repair loop this replaces blessed
+;;; any record it found at height <= tip and overwrote the stored meta hash,
+;;; destroying the one piece of evidence that could have detected the
+;;; divergence; every later query then served abandoned-chain numbers labelled
+;;; with the active chain's hash. Core defends this with a per-record block
+;;; hash it re-checks in RevertBlock; we recover the same guarantee at startup.
+
+(defconstant +coinstatsindex-max-rewind+ 1000
+  "How far back the coinstats rewind will verify records by recomputation
+before giving up and rebuilding from genesis. Far deeper than any plausible
+reorg; the cheap header-index walk is tried first and has no such bound.")
+
+(defun %coinstatsindex-fork-height (cs best-hash)
+  "The height of the last block common to the active chain and the branch
+BEST-HASH sits on (Core walks pprev in Rewind / FindForkInGlobalIndex). NIL
+when the header index does not know BEST-HASH — headers are only persisted at
+flush time, so the crash that produces a stale marker can also lose the branch
+it names — or when the two chains do not actually meet."
+  (let* ((stale (bitcoin-lisp.storage:get-block-index-entry cs best-hash))
+         (tip (and stale (bitcoin-lisp.storage:get-block-index-entry
+                          cs (bitcoin-lisp.storage:best-block-hash cs))))
+         (fork (and tip (bitcoin-lisp.validation:find-fork-point stale tip))))
+    ;; find-fork-point returns wherever its first walk stopped if the chains
+    ;; never meet (a broken prev-entry link), so confirm the answer really is
+    ;; on the active chain rather than trusting a fail-open result.
+    (when (and fork (bitcoin-lisp.storage:entry-on-active-chain-p cs fork))
+      (bitcoin-lisp.storage:block-index-entry-height fork))))
+
+(defun %coinstatsindex-verified-height (node from)
+  "The highest height at or below FROM whose stored record provably belongs to
+the ACTIVE chain, found by recomputing it from its stored parent and the active
+block at that height (see coinstatsindex-record-matches-block-p). This is the
+fallback for when the header index cannot resolve the fork point, and it is
+what keeps an ordinary unclean shutdown — index a few blocks ahead of the last
+flushed tip, same chain — from costing a rebuild from genesis: the record at
+the restored tip verifies on the first try. NIL if nothing verifies within
++coinstatsindex-max-rewind+."
+  (let ((csi (node-coinstatsindex node))
+        (cs (node-validated-chainstate node))
+        (store (node-block-store node)))
+    (loop for h from from downto (max 0 (- from +coinstatsindex-max-rewind+))
+          do (when (zerop h)
+               ;; Genesis is on every chain; its record is synthesized, not
+               ;; folded from a parent, so presence is the whole check.
+               (return (and (bitcoin-lisp.storage:coinstatsindex-get-stats csi 0) 0)))
+             (let* ((entry (bitcoin-lisp.storage:get-block-at-height cs h))
+                    (hash (and entry (bitcoin-lisp.storage:block-index-entry-hash entry)))
+                    (block (and hash (bitcoin-lisp.storage:get-block store hash))))
+               (when (and block
+                          (bitcoin-lisp.storage:coinstatsindex-record-matches-block-p
+                           csi block hash h
+                           (bitcoin-lisp.validation:get-undo-data hash)
+                           (bitcoin-lisp.validation:calculate-block-subsidy h)))
+                 (return h))))))
+
+(defun %rewind-coinstatsindex (node)
+  "Make the coinstats index's best marker name a block on the ACTIVE chain
+before anything backfills on top of it, moving it back to the last common
+ancestor when it does not (Core BaseIndex::Rewind). Records above the new best
+are then rewritten by the backfill.
+
+Returns NIL when the index was already consistent — the common case, and it
+costs one hash comparison: a rewind that always rebuilt would be a severe
+performance regression. Otherwise returns the height rewound to, or -1 when no
+trustworthy record could be identified and the index must be rebuilt."
+  (let* ((csi (node-coinstatsindex node))
+         (cs (node-validated-chainstate node))
+         (tip (bitcoin-lisp.storage:current-height cs)))
+    (multiple-value-bind (best-height best-hash)
+        (bitcoin-lisp.storage:coinstatsindex-best csi)
+      (when (minusp best-height)
+        (return-from %rewind-coinstatsindex nil))
+      (let ((active (and (<= best-height tip)
+                         (bitcoin-lisp.storage:get-block-at-height cs best-height))))
+        (when (and active best-hash
+                   (equalp (bitcoin-lisp.storage:block-index-entry-hash active) best-hash))
+          (return-from %rewind-coinstatsindex nil)))
+      (log-warn "Coinstats index best (height ~D, ~A) is not on the active chain (tip ~D); rewinding"
+                best-height
+                (if best-hash (bitcoin-lisp.crypto:bytes-to-hex best-hash) "no hash")
+                tip)
+      (let* ((fork (and best-hash (%coinstatsindex-fork-height cs best-hash)))
+             (target (or (and fork
+                              (<= fork tip)
+                              (bitcoin-lisp.storage:coinstatsindex-get-stats csi fork)
+                              fork)
+                         (%coinstatsindex-verified-height node (min best-height tip))))
+             (entry (and target (bitcoin-lisp.storage:get-block-at-height cs target))))
+        (cond
+          (entry
+           (log-warn "Coinstats index rewound to height ~D (~A records above it will be rebuilt)"
+                     target (- tip target))
+           (bitcoin-lisp.storage:coinstatsindex-set-best
+            csi target (bitcoin-lisp.storage:block-index-entry-hash entry))
+           target)
+          (t
+           (log-warn "Coinstats index: no record below height ~D could be tied to the active chain; rebuilding from genesis"
+                     (min best-height tip))
+           (bitcoin-lisp.storage:coinstatsindex-clear-best csi)
+           -1))))))
+
 (defun %catch-up-coinstatsindex (node)
   "Catch the coinstats index up to the node's validated chainstate tip. Its
 running MuHash must be contiguous from genesis, so a pruned node (missing
 early undo data) can only build it if its stored history reaches genesis —
-otherwise the backfill stops at the first gap. Repairs a best marker left
-above the tip, then backfills. Shared by startup and the post-promotion index
-rebind."
+otherwise the backfill stops at the first gap. Rewinds a best marker that is
+not on the active chain (including one left above the tip) before backfilling.
+Shared by startup and the post-promotion index rebind."
   (let* ((csi (node-coinstatsindex node))
          (cs (node-validated-chainstate node))
          (tip (bitcoin-lisp.storage:current-height cs)))
-    (when (> (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
-      (log-warn "Coinstats index best above tip (~D > ~D); repairing"
-                (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
-      (loop for h from tip downto 0
-            when (bitcoin-lisp.storage:coinstatsindex-get-stats csi h)
-              do (bitcoin-lisp.storage:coinstatsindex-set-best
-                  csi h (bitcoin-lisp.storage:block-index-entry-hash
-                         (bitcoin-lisp.storage:get-block-at-height cs h)))
-                 (return)
-            finally (bitcoin-lisp.storage:coinstatsindex-clear-best csi)))
+    (%rewind-coinstatsindex node)
     (when (< (bitcoin-lisp.storage:coinstatsindex-height csi) tip)
       (log-info "Building coinstats index to height ~D..." tip)
       (let ((n (bitcoin-lisp.storage:build-coinstatsindex
