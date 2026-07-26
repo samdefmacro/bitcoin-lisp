@@ -118,7 +118,21 @@ response. Caller has already validated EXT is one of those."
 
 (defun %rest-headers (node body ext)
   "Up to COUNT headers starting at BODY (a block hash), walking forward on
-the active chain — Core's /rest/headers/<hash>?count=<n>."
+the active chain — Core's /rest/headers/<hash>?count=<n> (rest.cpp:225-233).
+
+The start block must itself be ON the active chain: Core's loop is
+`while (pindex && active_chain.Contains(pindex)) { ...; pindex =
+active_chain.Next(pindex); }`, so a fork header yields an EMPTY result and
+the returned chain is contiguous by construction. We walk forward by
+ABSOLUTE HEIGHT via get-block-at-height, which descends from the ACTIVE tip,
+so without that gate a fork header at height H was spliced onto the ACTIVE
+chain's H+1, H+2, ... and headers[1].previousblockhash did not match
+headers[0].hash. Once the start is on the active chain every successor is
+too, which is what makes the single check sufficient.
+
+Divergence kept deliberately: Core answers 200 with an empty array for a
+hash it does not know at all (LookupBlockIndex returns nullptr); we keep the
+404 an existing client may rely on."
   (unless (valid-hex-hash-p body)
     (return-from %rest-headers (%rest-error 400 "Invalid block hash")))
   (let* ((count (let ((q (hunchentoot:get-parameter "count")))
@@ -132,17 +146,19 @@ the active chain — Core's /rest/headers/<hash>?count=<n>."
       (return-from %rest-headers (%rest-error 404 "Block not found")))
     ;; Walk forward via active-chain successors by height.
     (let ((entries
-            (loop with h = (bitcoin-lisp.storage:block-index-entry-height start)
-                  for i from 0 below count
-                  for e = start then (bitcoin-lisp.storage:get-block-at-height
-                                      chain-state (+ h i))
-                  while e collect e)))
+            (when (bitcoin-lisp.storage:entry-on-active-chain-p chain-state start)
+              (loop with h = (bitcoin-lisp.storage:block-index-entry-height start)
+                    for i from 0 below count
+                    for e = start then (bitcoin-lisp.storage:get-block-at-height
+                                        chain-state (+ h i))
+                    while e collect e))))
       (%rest-by-ext ext
-        :json (%rest-json (mapcar (lambda (e)
-                                    (block-header-entry-to-json
-                                     e (hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash e))
-                                     chain-state))
-                                  entries))
+        :json (%rest-json (json-array
+                           (mapcar (lambda (e)
+                                     (block-header-entry-to-json
+                                      e (hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash e))
+                                      chain-state (rpc-get-block-store node)))
+                                   entries)))
         :hex/bin (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
                    (dolist (e entries)
                      (bitcoin-lisp.serialization:bb-write-bytes

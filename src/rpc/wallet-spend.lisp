@@ -191,9 +191,9 @@ filters (cluster limits are enforced by the mempool itself).")
         ((<= n #xFFFFFFFF) 5)
         (t 9)))
 
-(defun %txout-serialize-size (script)
-  "GetSerializeSize(CTxOut): 8-byte value + compact-size + script."
-  (+ 8 (%compact-size-size (length script)) (length script)))
+;; %txout-serialize-size — GetSerializeSize(CTxOut) — lives in methods.lisp,
+;; which is compiled first. It used to be defined here as well, identically;
+;; two same-named defuns in one package meant the later file silently won.
 
 (defun %dust-threshold-at-rate (script rate-sat-kvb)
   "Core GetDustThreshold(txout, feerate) at an arbitrary feerate (the
