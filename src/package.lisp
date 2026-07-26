@@ -887,6 +887,7 @@
    #:orphan-have
    #:orphan-have-from-peer
    #:orphan-announcers
+   #:orphan-children-from-peer
    #:orphans-depending-on
    #:orphan-erase-for-peer
    #:orphan-erase-for-block
@@ -955,8 +956,9 @@
    #:validate-transaction-contextual
    #:validate-transaction-scripts
    #:validate-transaction-for-mempool
-   ;; Package relay (submitpackage)
+   ;; Package relay (submitpackage + opportunistic 1p1c)
    #:validate-package-for-mempool
+   #:package-hash
    #:package-truc-checks
    #:package-well-formed
    #:package-child-with-parents-tree-p
@@ -1007,6 +1009,11 @@
    #:most-recent-block-tx
    #:note-block-connected
    #:reset-recent-confirmed
+   ;; The reconsiderable rejects filter (Core's second rejects filter)
+   #:*recent-rejects-reconsiderable*
+   #:reconsiderable-reject-p
+   #:add-reconsiderable-reject
+   #:clear-reconsiderable-rejects
    #:perform-reorg
    #:get-undo-data
    #:invalidate-block

@@ -143,6 +143,8 @@
                              (:file "mempool-shadow-tests")
                              ;; Package relay tests (submitpackage)
                              (:file "package-tests")
+                             ;; Opportunistic 1p1c package relay over P2P
+                             (:file "package-relay-tests")
                              ;; Mining / regtest tests
                              (:file "mining-tests")
                              ;; Deserializer robustness / fuzz tests

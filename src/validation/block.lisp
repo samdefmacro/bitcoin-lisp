@@ -1597,6 +1597,12 @@ store-undo-data (the connect path, which does the height bookkeeping) caches."
 ;;;;    newest block's txs keyed by txid and wtxid, so a getdata for a
 ;;;;    just-confirmed tx is still served even though it left the mempool
 ;;;;    (FindTxForGetData's second source, net_processing.cpp:2507-2514).
+;;;;
+;;;;  - The RECONSIDERABLE rejects filter (Core
+;;;;    m_lazy_recent_rejects_reconsiderable, txdownloadman_impl.h:83-95):
+;;;;    the second of Core's two reject filters, kept here for the same
+;;;;    reason — it is reset on every active tip change, and that reset
+;;;;    happens in this file.
 
 (defvar *recent-confirmed-txs* (bitcoin-lisp:make-rejects-filter 48000)
   "Bounded rolling set of recently-confirmed txids/wtxids (Core
@@ -1622,6 +1628,42 @@ txid AND wtxid — to their transactions, or NIL before any block connects
 BlockDisconnected: a reorg may return confirmed txs to circulation, and the
 filter would otherwise block their relay) and at node start."
   (bitcoin-lisp:clear-recent-rejects *recent-confirmed-txs*))
+
+;;;; The reconsiderable rejects filter (Core's SECOND rejects filter)
+
+(defvar *recent-rejects-reconsiderable* (bitcoin-lisp:make-rejects-filter 50000)
+  "Bounded rolling set of wtxids — and 1p1c package hashes — whose last
+failure was TX_RECONSIDERABLE: a policy failure a DIFFERENT package could
+still overcome. Core keeps this as a filter SEPARATE from the main rejects
+filter (m_lazy_recent_rejects_reconsiderable, txdownloadman_impl.cpp:
+454-466) precisely so those transactions are not black-holed: an entry here
+means \"do not download or submit this by ITSELF again\", not \"never accept
+this\" — it may still ride in as part of a package.
+
+Core routes both fee-floor failures here (CheckFeeRate, validation.cpp:
+703-711), the RBF fee/diagram failures (:1010, :1028) and \"mempool full\"
+(:1401). Everything else keeps going to the main filter.
+
+Node-global, like *RECENT-CONFIRMED-TXS* above: the validation layer loads
+before networking, and the active-tip-change reset lives in this file.")
+
+(defun reconsiderable-reject-p (hash)
+  "T if HASH (a wtxid, or a 1p1c package hash) failed reconsiderably and so
+must not be submitted on its own again (Core
+RecentRejectsReconsiderableFilter().contains)."
+  (and (bitcoin-lisp:recent-reject-p *recent-rejects-reconsiderable* hash) t))
+
+(defun add-reconsiderable-reject (hash)
+  "Record HASH as a reconsiderable failure (Core
+RecentRejectsReconsiderableFilter().insert)."
+  (bitcoin-lisp:add-recent-reject *recent-rejects-reconsiderable* hash))
+
+(defun clear-reconsiderable-rejects ()
+  "Empty the reconsiderable rejects filter. Core resets it beside the main
+rejects filter on every active tip change (ActiveTipChange,
+txdownloadman_impl.cpp:91-95): a new block changes both the fee floor and
+which parents exist, so every cached fee failure is stale."
+  (bitcoin-lisp:clear-recent-rejects *recent-rejects-reconsiderable*))
 
 (defun note-block-connected (block)
   "Record BLOCK as the new most-recent block: rebuild the getdata-servable
@@ -1768,8 +1810,9 @@ Handles chain reorganizations when a competing chain has more work."
            ;; inputs) can become valid at the next block (ActiveTipChange,
            ;; net_processing.cpp:2045-2059 -> txdownloadman_impl.cpp:92-96
            ;; RecentRejectsFilter().reset()). Previously only the reorg path
-           ;; cleared it.
+           ;; cleared it. ActiveTipChange resets BOTH filters.
            (bitcoin-lisp:clear-recent-rejects recent-rejects)
+           (clear-reconsiderable-rejects)
            (bitcoin-lisp:maybe-periodic-flush chain-state)
            ;; Automatic block pruning after connecting a new block; each
            ;; pruned block's undo file goes with it.
@@ -2397,8 +2440,9 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
           ;; upserts above; stale-branch-only txs keep resolving through the
           ;; still-stored stale block (removing them here used to leave re-mined
           ;; txs UNINDEXED, since the old txindex-add skipped existing txids).
-          ;; Reorg may change tx validity — clear the rejects cache.
+          ;; Reorg may change tx validity — clear both rejects caches.
           (bitcoin-lisp:clear-recent-rejects recent-rejects)
+          (clear-reconsiderable-rejects)
           ;; Re-add disconnected-block txs (best-effort, against the new tip),
           ;; parents before children. Txs re-confirmed or invalidated by the
           ;; new chain are dropped by re-validation.
