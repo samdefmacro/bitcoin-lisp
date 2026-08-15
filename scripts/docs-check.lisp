@@ -1,8 +1,7 @@
-;;;; scripts/docs-check.lisp — verify PAX documentation transcripts
-;;;; (cl-agent-repl template: replace the EDIT-ME markers).
+;;;; scripts/docs-check.lisp — verify PAX documentation transcripts.
 ;;;;
-;;;; Usage: sbcl --non-interactive --load scripts/docs-check.lisp
-;;;;        (or: scripts/dev.sh docs-check)
+;;;; Usage: scripts/dev.sh docs-check   (cold container via docker-sbcl.sh)
+;;;;        sbcl --non-interactive --load scripts/docs-check.lisp
 ;;;;
 ;;;; Two gates, both required:
 ;;;;   GREEN: every section in *CHECKED-SECTIONS* must document cleanly —
@@ -17,21 +16,25 @@
 
 (require :asdf)
 
-(let ((quicklisp-setup (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
-  (unless (probe-file quicklisp-setup)
-    (error "Quicklisp setup file not found at ~A" quicklisp-setup))
-  (load quicklisp-setup))
+;; In the project container /root/.sbclrc has already loaded /opt/quicklisp;
+;; bootstrap Quicklisp only when it is genuinely absent (e.g. --script runs,
+;; which skip the userinit file).
+(unless (find-package "QL")
+  (let ((quicklisp-setup (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
+    (unless (probe-file quicklisp-setup)
+      (error "Quicklisp setup file not found at ~A" quicklisp-setup))
+    (load quicklisp-setup)))
 
 (let ((here (uiop:ensure-directory-pathname (uiop:getcwd))))
   (pushnew here asdf:*central-registry* :test #'equal))
 
 (funcall (find-symbol "QUICKLOAD" "QL") '("mgl-pax/full") :silent t)
-(asdf:load-system "EDIT-ME-project-system")
+(asdf:load-system "bitcoin-lisp")
 ;; Load docs files directly (purely additive — no ASDF system required):
-(load (merge-pathnames "docs/EDIT-ME-manual.lisp" (uiop:getcwd)))
+(load (merge-pathnames "docs/manual.lisp" (uiop:getcwd)))
 
 (defparameter *checked-sections*
-  '(EDIT-ME-docs-package:@EDIT-ME-manual))
+  '(bitcoin-lisp.docs:@bitcoin-lisp-manual))
 
 (defun section-documents-cleanly-p (section-name)
   (handler-case
@@ -48,7 +51,7 @@
     (if (section-documents-cleanly-p section)
         (format t "~&;; GREEN ok: ~A~%" section)
         (setf ok nil)))
-  (let ((selftest (find-symbol "@DOCS-CHECK-SELFTEST" "EDIT-ME-DOCS-PACKAGE")))
+  (let ((selftest (find-symbol "@DOCS-CHECK-SELFTEST" "BITCOIN-LISP.DOCS")))
     (if (section-documents-cleanly-p selftest)
         (progn
           (format t "~&;; RED SELF-TEST FAILED: the broken section passed — ~

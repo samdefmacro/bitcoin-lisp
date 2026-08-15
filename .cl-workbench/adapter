@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# Thin Common Lisp Workbench adapter for bitcoin-lisp. Application Lisp is
+# launched only inside the pinned project container (bitcoin-lisp-sbcl:2.6.5);
+# the warm-image lifecycle lives in scripts/dev.sh and cold verification in
+# scripts/docker-test.sh. This adapter only routes and validates argv.
+set -euo pipefail
+
+: "${CL_WORKBENCH_PROJECT_ROOT:?}"
+: "${CL_WORKBENCH_CONFIG:?}"
+: "${CL_WORKBENCH_ROOT:?}"
+: "${CL_WORKBENCH_VERSION:?}"
+: "${CL_WORKBENCH_EXECUTION_PROFILE:?}"
+
+DEV="$CL_WORKBENCH_PROJECT_ROOT/scripts/dev.sh"
+DESCRIPTOR="$CL_WORKBENCH_PROJECT_ROOT/.cl-workbench/state/repl.json"
+
+[ "$PWD" = "$CL_WORKBENCH_PROJECT_ROOT" ] || {
+  echo "ERROR: Workbench adapter must run from the project root" >&2
+  exit 2
+}
+[ "$CL_WORKBENCH_EXECUTION_PROFILE" = container-required ] || {
+  echo "ERROR: bitcoin-lisp requires execution.profile=container-required" >&2
+  exit 2
+}
+
+write_descriptor() {
+  local state_dir temporary session_id port
+  state_dir="$(dirname "$DESCRIPTOR")"
+  session_id="$($DEV identity session-id)"
+  port="$($DEV identity port)"
+  temporary="$DESCRIPTOR.tmp.$$"
+  umask 077
+  mkdir -p "$state_dir"
+  printf '%s\n' \
+    '{' \
+    '  "schema_version": 1,' \
+    '  "transport": "swank",' \
+    '  "host": "127.0.0.1",' \
+    "  \"port\": $port," \
+    '  "package": "COMMON-LISP-USER",' \
+    "  \"session_id\": \"$session_id\"" \
+    '}' >"$temporary"
+  mv "$temporary" "$DESCRIPTOR"
+}
+
+run_eval() {
+  [ "$#" -ge 1 ] || { echo "ERROR: repl eval requires FORM" >&2; return 2; }
+  : "${CL_WORKBENCH_REPL_CLIENT:?}"
+  : "${CL_WORKBENCH_REPL_HOST:?}"
+  : "${CL_WORKBENCH_REPL_PORT:?}"
+  : "${CL_WORKBENCH_REPL_PACKAGE:?}"
+  [ "$CL_WORKBENCH_REPL_HOST" = 127.0.0.1 ] || {
+    echo "ERROR: container-private REPL host must be 127.0.0.1" >&2
+    return 2
+  }
+  [ "$CL_WORKBENCH_REPL_PORT" = "$($DEV identity port)" ] || {
+    echo "ERROR: REPL descriptor port does not match the owned container" >&2
+    return 2
+  }
+  DEV_SWANK_PACKAGE="$CL_WORKBENCH_REPL_PACKAGE" \
+    exec "$DEV" adapter-eval "$CL_WORKBENCH_REPL_CLIENT" "$@"
+}
+
+validate_selector() {
+  case "$1" in
+    *[!A-Za-z0-9._:+-]*|'')
+      echo "ERROR: unsafe bitcoin-lisp test selector: $1" >&2
+      return 2
+      ;;
+  esac
+}
+
+suite_form() { # $1 fiveam suite designator, already validated
+  printf '(let ((r (fiveam:run %s)))
+  (fiveam:explain! r)
+  (unless (fiveam:results-status r) (error "suite %s failed")))' "$1" "$1"
+}
+
+run_test() {
+  : "${CL_WORKBENCH_REPL_CLIENT:?}"
+  case "$#" in
+    0)
+      DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-3600}" \
+        exec "$DEV" adapter-eval "$CL_WORKBENCH_REPL_CLIENT" \
+          "$(suite_form :bitcoin-lisp-tests)"
+      ;;
+    1)
+      validate_selector "$1" || return 2
+      DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-600}" \
+        exec "$DEV" adapter-eval "$CL_WORKBENCH_REPL_CLIENT" \
+          "$(suite_form "$1")"
+      ;;
+    *)
+      echo "ERROR: bitcoin-lisp accepts at most one test selector" >&2
+      return 2
+      ;;
+  esac
+}
+
+# cold-unit: the verification of record (scripts/docker-test.sh, full
+# :bitcoin-lisp-tests battery in a fresh container). Reports check_count
+# through the Workbench one-shot result file and refuses a green run that
+# performed zero checks (a zero-selection pass is not a pass).
+run_cold_unit() {
+  [ "$#" -eq 0 ] || {
+    echo "ERROR: cold-unit accepts no arguments" >&2
+    return 2
+  }
+  local tmp rc=0 count=""
+  tmp="$(mktemp -t bitcoin-lisp-cold-unit)"
+  "$CL_WORKBENCH_PROJECT_ROOT/scripts/docker-test.sh" 2>&1 | tee "$tmp" || rc=$?
+  count="$(grep -Eo 'Did [0-9]+ checks' "$tmp" | tail -1 | grep -Eo '[0-9]+' || true)"
+  rm -f "$tmp"
+  if [ "$rc" -eq 0 ] && { [ -z "$count" ] || [ "$count" -eq 0 ]; }; then
+    echo "ERROR: cold-unit reported success but no checks were counted" >&2
+    return 1
+  fi
+  if [ -n "${CL_WORKBENCH_VALIDATION_RESULT:-}" ] && [ -n "$count" ]; then
+    printf '{"schema_version":1,"check_count":%s,"retry_count":0}\n' "$count" \
+      > "$CL_WORKBENCH_VALIDATION_RESULT"
+  fi
+  return "$rc"
+}
+
+run_validation() {
+  [ "$#" -ge 1 ] || { echo "ERROR: validation run requires PROFILE" >&2; return 2; }
+  local profile="$1"
+  shift
+  case "$profile" in
+    warm-unit)
+      [ "$#" -eq 1 ] || {
+        echo "ERROR: warm-unit requires exactly one fiveam suite selector" >&2
+        return 2
+      }
+      validate_selector "$1" || return 2
+      exec "$DEV" test "$1"
+      ;;
+    cold-unit) run_cold_unit "$@" ;;
+    cold-docs)
+      [ "$#" -eq 0 ] || {
+        echo "ERROR: cold-docs accepts no arguments" >&2
+        return 2
+      }
+      exec "$DEV" docs-check
+      ;;
+    *)
+      echo "ERROR: unknown bitcoin-lisp validation profile: $profile" >&2
+      return 2
+      ;;
+  esac
+}
+
+case "${1:-}" in
+  doctor)
+    [ "$#" -eq 1 ] || exit 2
+    [ -x "$DEV" ] || { echo "ERROR: scripts/dev.sh is not executable" >&2; exit 1; }
+    [ -f "$CL_WORKBENCH_ROOT/tools/repl/agent-eval.lisp" ] || {
+      echo "ERROR: canonical Workbench eval client is unavailable" >&2
+      exit 1
+    }
+    exec "$DEV" doctor
+    ;;
+  repl)
+    [ "$#" -ge 2 ] || exit 2
+    action="$2"
+    shift 2
+    case "$action" in
+      start)
+        [ "$#" -eq 0 ] || exit 2
+        "$DEV" start
+        write_descriptor
+        ;;
+      stop)
+        [ "$#" -eq 0 ] || exit 2
+        "$DEV" stop
+        rm -f "$DESCRIPTOR"
+        ;;
+      status)
+        [ "$#" -eq 0 ] || exit 2
+        exec "$DEV" status
+        ;;
+      eval) run_eval "$@" ;;
+      *) echo "ERROR: unknown REPL adapter operation: $action" >&2; exit 2 ;;
+    esac
+    ;;
+  test)
+    shift
+    run_test "$@"
+    ;;
+  docs)
+    [ "$#" -eq 2 ] && [ "$2" = verify ] || exit 2
+    exec "$DEV" docs-check
+    ;;
+  validation)
+    [ "$#" -ge 2 ] && [ "$2" = run ] || exit 2
+    shift 2
+    run_validation "$@"
+    ;;
+  *)
+    echo "ERROR: unsupported Workbench adapter operation: ${1:-<missing>}" >&2
+    exit 2
+    ;;
+esac
