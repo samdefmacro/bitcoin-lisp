@@ -73,7 +73,8 @@ validate_selector() {
 suite_form() { # $1 fiveam suite designator, already validated
   printf '(let ((r (fiveam:run %s)))
   (fiveam:explain! r)
-  (unless (fiveam:results-status r) (error "suite %s failed")))' "$1" "$1"
+  (unless r (error "suite %s selected no tests"))
+  (unless (fiveam:results-status r) (error "suite %s failed")))' "$1" "$1" "$1"
 }
 
 run_test() {
@@ -97,22 +98,17 @@ run_test() {
   esac
 }
 
-# cold-unit: the verification of record (scripts/docker-test.sh, full
-# :bitcoin-lisp-tests battery in a fresh container). Reports check_count
-# through the Workbench one-shot result file and refuses a green run that
-# performed zero checks (a zero-selection pass is not a pass).
-run_cold_unit() {
-  [ "$#" -eq 0 ] || {
-    echo "ERROR: cold-unit accepts no arguments" >&2
-    return 2
-  }
+# Run a validation gate command, mirror its output, and report the fiveam
+# check counter through the Workbench one-shot result file. Refuses a green
+# run that performed zero checks — a zero-selection pass is not a pass.
+run_counted_gate() { # $@ = gate command
   local tmp rc=0 count=""
-  tmp="$(mktemp -t bitcoin-lisp-cold-unit)"
-  "$CL_WORKBENCH_PROJECT_ROOT/scripts/docker-test.sh" 2>&1 | tee "$tmp" || rc=$?
+  tmp="$(mktemp -t bitcoin-lisp-gate)"
+  "$@" 2>&1 | tee "$tmp" || rc=$?
   count="$(grep -Eo 'Did [0-9]+ checks' "$tmp" | tail -1 | grep -Eo '[0-9]+' || true)"
   rm -f "$tmp"
   if [ "$rc" -eq 0 ] && { [ -z "$count" ] || [ "$count" -eq 0 ]; }; then
-    echo "ERROR: cold-unit reported success but no checks were counted" >&2
+    echo "ERROR: gate reported success but no checks were counted" >&2
     return 1
   fi
   if [ -n "${CL_WORKBENCH_VALIDATION_RESULT:-}" ] && [ -n "$count" ]; then
@@ -133,9 +129,15 @@ run_validation() {
         return 2
       }
       validate_selector "$1" || return 2
-      exec "$DEV" test "$1"
+      run_counted_gate "$DEV" test "$1"
       ;;
-    cold-unit) run_cold_unit "$@" ;;
+    cold-unit)
+      [ "$#" -eq 0 ] || {
+        echo "ERROR: cold-unit accepts no arguments" >&2
+        return 2
+      }
+      run_counted_gate "$CL_WORKBENCH_PROJECT_ROOT/scripts/docker-test.sh"
+      ;;
     cold-docs)
       [ "$#" -eq 0 ] || {
         echo "ERROR: cold-docs accepts no arguments" >&2

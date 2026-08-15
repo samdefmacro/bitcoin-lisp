@@ -13,4 +13,7 @@ exec "$(dirname "$0")/docker-sbcl.sh" --dynamic-space-size 4096 --non-interactiv
   --eval '(asdf:load-system "bitcoin-lisp/tests")' \
   --eval "(let ((r (fiveam:run $SUITE)))
             (fiveam:explain! r)
+            (when (null r)
+              (format t \"~&suite $SUITE selected no tests~%\")
+              (sb-ext:exit :code 1))
             (unless (fiveam:results-status r) (sb-ext:exit :code 1)))"
