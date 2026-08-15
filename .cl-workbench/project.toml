@@ -1,0 +1,39 @@
+schema_version = 1
+
+[project]
+id = "bitcoin-lisp"
+managed = true
+
+[workbench]
+required_capabilities = [
+  "check.parens.v1",
+  "doctor.strict.v1",
+  "docs.verify.v1",
+  "feedback.collect.v1",
+  "feedback.record.v1",
+  "project.adapter.v1",
+  "project.config.v1",
+  "repl.eval.container.v1",
+  "repl.lifecycle.v1",
+  "runtime.container.v1",
+  "test.v1",
+  "validation.run.v1",
+]
+
+[adapter]
+path = ".cl-workbench/adapter"
+capabilities = [
+  "doctor.v1",
+  "docs.verify.v1",
+  "repl.eval.container.v1",
+  "repl.lifecycle.v1",
+  "test.v1",
+  "validation.run.v1",
+]
+
+[execution]
+profile = "container-required"
+
+[feedback]
+enabled = true
+allow_payload = false
