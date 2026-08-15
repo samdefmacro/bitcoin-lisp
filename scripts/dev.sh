@@ -345,6 +345,7 @@ test_one() {
   DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-600}" \
     eval_form "(let ((r (fiveam:run $1)))
   (fiveam:explain! r)
+  (unless r (error \"suite $1 selected no tests\"))
   (unless (fiveam:results-status r) (error \"suite $1 failed\")))"
 }
 
@@ -352,6 +353,7 @@ test_all() {
   DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-3600}" \
     eval_form '(let ((r (fiveam:run :bitcoin-lisp-tests)))
   (fiveam:explain! r)
+  (unless r (error "suite :bitcoin-lisp-tests selected no tests"))
   (unless (fiveam:results-status r) (error "bitcoin-lisp-tests failed")))'
 }
 
