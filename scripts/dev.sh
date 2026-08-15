@@ -1,163 +1,320 @@
 #!/usr/bin/env bash
-# dev.sh — warm-image development helper (cl-agent-repl).
-# Fill the PROJECT ADAPTER block; everything below it is generic.
+# dev.sh — warm-image development helper (Common Lisp Workbench managed).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME_DIR="$ROOT/.dev-runtime/swank-dev"
-PIDFILE="$RUNTIME_DIR/swank.pid"
-LOGFILE="$RUNTIME_DIR/swank.log"
-METRICS_LOG="$RUNTIME_DIR/eval-metrics.log"
+PORT="${DEV_SWANK_PORT:-4007}"   # Swank port INSIDE the container; never published
+DOCKER=docker
+IMAGE="bitcoin-lisp-sbcl:2.6.5"  # pinned project image (docker/Dockerfile)
 
-### BEGIN PROJECT ADAPTER ####################################################
-# bitcoin-lisp: ALL Lisp execution goes through the project container
-# (bitcoin-lisp-sbcl:2.6.5, see scripts/docker-sbcl.sh). The warm image runs
-# IN the container; only the Swank port is published, to the host's
-# 127.0.0.1. Dedicated FASL volume (-devimage): the shared bitcoin-lisp-fasl
-# volume must never be mounted by two concurrently running containers
-# (silent FASL corruption).
-PORT="${DEV_SWANK_PORT:-4007}"
-HOST="127.0.0.1"
-
-start_image() {
-  exec docker run --rm -i --sig-proxy=true \
-    --name "bitcoin-lisp-devimage-${PORT}" \
-    -v "$ROOT:/workspace" \
-    -v bitcoin-lisp-fasl-devimage:/fasl-cache \
-    -p "127.0.0.1:${PORT}:${PORT}" \
-    -w /workspace \
-    -e DEV_SWANK_PORT="$PORT" \
-    bitcoin-lisp-sbcl:2.6.5 \
-    sbcl --dynamic-space-size 4096 --noinform \
-      --load scripts/dev-swank-server.lisp
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    echo "ERROR: sha256sum or shasum is required for runtime identity" >&2
+    return 1
+  fi
 }
 
-# fiveam: NAME is a raw suite designator, e.g. `dev.sh test :script-tests`;
-# test-all runs the whole :bitcoin-lisp-tests suite (26k+ checks).
-test_one() {
-  DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-600}" \
-    eval_form "(let ((r (fiveam:run $1)))
-  (fiveam:explain! r)
-  (unless (fiveam:results-status r) (error \"suite $1 failed\")))"
-}
-test_all() {
-  DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-3600}" \
-    eval_form '(let ((r (fiveam:run :bitcoin-lisp-tests)))
-  (fiveam:explain! r)
-  (unless (fiveam:results-status r) (error "bitcoin-lisp-tests failed")))'
-}
-### END PROJECT ADAPTER ######################################################
+CHECKOUT_ID="$(printf '%s' "$ROOT" | sha256_stdin)"
+CHECKOUT_SHORT="${CHECKOUT_ID:0:12}"
+SESSION_ID="bitcoin-lisp-$CHECKOUT_SHORT"
+CONTAINER="${BITCOIN_LISP_DEV_CONTAINER:-bitcoin-lisp-dev-$CHECKOUT_SHORT}"
+FASL_VOLUME="bitcoin-lisp-fasl-dev-$CHECKOUT_SHORT"
+PROJECT_LABEL="io.common-lisp-workbench.project"
+CHECKOUT_LABEL="io.common-lisp-workbench.checkout"
+MANAGED_LABEL="io.common-lisp-workbench.managed"
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/dev.sh COMMAND [ARGS]
 
-Commands:
-  start | stop | status      Manage the warm Swank dev image
-  eval FORM                  Evaluate FORM in the warm image (~0.1s)
-  test NAME                  Run one test in the warm image
-  test-all                   Run the full suite in the warm image
-  docs-check                 Verify PAX documentation transcripts
-  help                       Show this help
+Persistent Swank development helper for bitcoin-lisp. The warm image runs
+INSIDE the pinned project container (bitcoin-lisp-sbcl:2.6.5): SBCL never
+runs on the host. The container runs scripts/dev-swank-server.lisp
+(bitcoin-lisp/tests loaded, Swank listening in-container) as its main
+process; every eval is a `docker exec` of the Common Lisp Workbench
+hardened eval client, so the Swank port is never published to the host.
+Container, session, and FASL volume identities are checkout-specific, so
+two checkouts never collide or share a writable FASL cache.
 
+Commands:
+  start              Start the warm dev container (tests loaded, Swank up)
+  stop               Remove the dev container (the FASL volume persists)
+  status             Show whether the dev container is running
+  doctor             Verify the Docker boundary and required project assets
+  identity FIELD     Print checkout-id|session-id|container|image|port|fasl-volume
+  eval FORM          Evaluate FORM in the warm image (via cl-workbench)
+  test NAME          Run one fiveam suite (raw designator, e.g. :script-tests)
+  test-all           Run the full :bitcoin-lisp-tests suite (long)
+  docs-check         Verify PAX documentation transcripts in a cold container
+  logs               Show the dev container's output
+  help               Show this help
+
+Environment:
+  DEV_SWANK_PORT             Swank port INSIDE the container, default 4007
+  BITCOIN_LISP_DEV_CONTAINER Container name, default is checkout-specific; an
+                             override is accepted only when its ownership
+                             labels match this physical checkout
+  DEV_EVAL_TIMEOUT           Eval timeout seconds, default 20 (test: 600,
+                             test-all: 3600); on timeout the form is
+                             interrupted and the image survives
+  DEV_EVAL_MAX_OUTPUT        Output cap in chars, default 10000
 Eval exit codes: 0 ok, 1 lisp error, 2 connection error, 3 timed out
-(interrupted, image survived), 4 hard hang (restart the image). Every eval
-is logged to .dev-runtime/swank-dev/eval-metrics.log.
-Env: DEV_EVAL_TIMEOUT (20), DEV_EVAL_MAX_OUTPUT (10000).
+(interrupted, image survived), 4 hard hang (restart the image). NOTE: heavy
+FFI calls (libsecp256k1, LevelDB) cannot be interrupted mid-call — a long
+foreign call may show rc=4 although the image recovers when it returns.
+Common Lisp Workbench records payload-free operation outcomes under
+.cl-workbench/state; raw forms are not appended to any project log.
+
+Cold verification of record stays with scripts/docker-test.sh (full
+:bitcoin-lisp-tests battery in a fresh container).
 USAGE
 }
 
-is_pid_running() {
-  [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+container_exists() {
+  "$DOCKER" container inspect "$CONTAINER" >/dev/null 2>&1
 }
 
-port_listener() {
-  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true
+container_owned() {
+  local actual_project actual_checkout actual_managed
+  container_exists || return 1
+  actual_project="$("$DOCKER" inspect \
+    --format '{{ index .Config.Labels "io.common-lisp-workbench.project" }}' \
+    "$CONTAINER")"
+  actual_checkout="$("$DOCKER" inspect \
+    --format '{{ index .Config.Labels "io.common-lisp-workbench.checkout" }}' \
+    "$CONTAINER")"
+  actual_managed="$("$DOCKER" inspect \
+    --format '{{ index .Config.Labels "io.common-lisp-workbench.managed" }}' \
+    "$CONTAINER")"
+  [ "$actual_project" = "bitcoin-lisp" ] && \
+    [ "$actual_checkout" = "$CHECKOUT_ID" ] && \
+    [ "$actual_managed" = "true" ]
 }
 
-wait_for_port() {
-  local i
-  for i in {1..120}; do
-    if port_listener | grep -q ":${PORT}"; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
+require_owned_container() {
+  if ! container_owned; then
+    echo "ERROR: refusing foreign or unlabeled container: $CONTAINER" >&2
+    echo "       expected checkout ownership: $CHECKOUT_ID" >&2
+    return 2
+  fi
+}
+
+container_state() { # prints running|stopped|absent
+  local state
+  if ! container_exists; then
+    echo absent
+    return 0
+  fi
+  require_owned_container || return $?
+  state="$("$DOCKER" inspect --format '{{.State.Status}}' "$CONTAINER")"
+  case "$state" in
+    running) echo running ;;
+    "") echo absent ;;
+    *) echo stopped ;;
+  esac
+}
+
+# `docker image inspect NAME` fails to resolve short names on some
+# containerd-store daemons even when the image exists; `image ls -q` resolves
+# them correctly, so presence checks must use it.
+image_present() {
+  [ -n "$("$DOCKER" image ls -q "$IMAGE")" ]
+}
+
+ensure_image() {
+  if ! image_present; then
+    echo "Image $IMAGE not found — building (one-time, ~20-30 min)..." >&2
+    "$DOCKER" build -f "$ROOT/docker/Dockerfile" -t "$IMAGE" "$ROOT"
+  fi
+}
+
+volume_exists() {
+  "$DOCKER" volume inspect "$FASL_VOLUME" >/dev/null 2>&1
+}
+
+volume_owned() {
+  local actual_project actual_checkout
+  volume_exists || return 1
+  actual_project="$("$DOCKER" volume inspect --format \
+    '{{ index .Labels "io.common-lisp-workbench.project" }}' "$FASL_VOLUME")"
+  actual_checkout="$("$DOCKER" volume inspect --format \
+    '{{ index .Labels "io.common-lisp-workbench.checkout" }}' "$FASL_VOLUME")"
+  [ "$actual_project" = "bitcoin-lisp" ] && [ "$actual_checkout" = "$CHECKOUT_ID" ]
+}
+
+ensure_volume() {
+  if volume_exists; then
+    volume_owned || {
+      echo "ERROR: refusing foreign FASL volume: $FASL_VOLUME" >&2
+      return 2
+    }
+  else
+    "$DOCKER" volume create \
+      --label "$PROJECT_LABEL=bitcoin-lisp" \
+      --label "$CHECKOUT_LABEL=$CHECKOUT_ID" \
+      --label "$MANAGED_LABEL=true" \
+      "$FASL_VOLUME" >/dev/null
+  fi
 }
 
 start_server() {
-  mkdir -p "$RUNTIME_DIR"
-  if is_pid_running; then
-    echo "Dev image already running: pid $(cat "$PIDFILE")"
-    return 0
-  fi
-  if port_listener | grep -q ":${PORT}"; then
-    echo "Port ${PORT} already has a listener; reusing it."
-    return 0
-  fi
-  : > "$LOGFILE"
-  (
-    cd "$ROOT"
-    start_image >>"$LOGFILE" 2>&1
-  ) &
-  echo $! > "$PIDFILE"
-  if ! wait_for_port; then
-    echo "Timed out waiting for Swank on port ${PORT}" >&2
-    echo "Log: $LOGFILE" >&2
-    return 1
-  fi
-  # A listening port is NOT readiness: with docker-published ports the
-  # docker-proxy listens on the host immediately, long before in-container
-  # Swank answers. Probe with a real eval until it succeeds.
-  local i
-  for i in {1..120}; do
-    if (cd "$ROOT" && DEV_SWANK_HOST="$HOST" DEV_SWANK_PORT="$PORT" DEV_EVAL_TIMEOUT=5 \
-        sbcl --script scripts/dev-swank-eval.lisp '(+ 0 0)' >/dev/null 2>&1); then
-      echo "Started dev image on ${HOST}:${PORT} (pid $(cat "$PIDFILE"))"
-      echo "Log: $LOGFILE"
+  local state
+  state="$(container_state)" || return $?
+  case "$state" in
+    running)
+      echo "Dev container already running: $CONTAINER"
+      return 0
+      ;;
+    stopped)
+      echo "Removing exited container $CONTAINER"
+      require_owned_container
+      "$DOCKER" rm -f "$CONTAINER" >/dev/null
+      ;;
+  esac
+  ensure_image
+  ensure_volume
+  "$DOCKER" run --detach --init --name "$CONTAINER" \
+    --label "$PROJECT_LABEL=bitcoin-lisp" \
+    --label "$CHECKOUT_LABEL=$CHECKOUT_ID" \
+    --label "$MANAGED_LABEL=true" \
+    --volume "$ROOT:/workspace" \
+    --volume "$FASL_VOLUME:/fasl-cache" \
+    --workdir /workspace \
+    --env DEV_SWANK_PORT="$PORT" \
+    "$IMAGE" \
+    sbcl --dynamic-space-size 4096 --noinform \
+      --load scripts/dev-swank-server.lisp >/dev/null
+
+  # Cold FASL volume: the Coalton build takes minutes; cap the wait at 15 min.
+  local i state2
+  for i in {1..900}; do
+    if "$DOCKER" logs "$CONTAINER" 2>&1 | grep -q "Swank dev image ready"; then
+      echo "Started bitcoin-lisp dev container $CONTAINER (Swank on :$PORT inside)"
       return 0
     fi
-    sleep 5
+    state2="$(container_state)" || return $?
+    if [[ "$state2" != running ]]; then
+      echo "Dev container exited during startup:" >&2
+      "$DOCKER" logs "$CONTAINER" 2>&1 | tail -40 >&2
+      return 1
+    fi
+    sleep 1
   done
-  echo "Port ${PORT} is listening but Swank never answered a probe eval" >&2
-  echo "Log: $LOGFILE" >&2
+  echo "Timed out waiting for Swank in $CONTAINER" >&2
+  "$DOCKER" logs "$CONTAINER" 2>&1 | tail -40 >&2
   return 1
 }
 
 stop_server() {
-  if is_pid_running; then
-    local pid
-    pid="$(cat "$PIDFILE")"
-    kill "$pid" 2>/dev/null || true
-    rm -f "$PIDFILE"
-    echo "Stopped dev image pid $pid"
+  local state
+  state="$(container_state)" || return $?
+  if [[ "$state" == absent ]]; then
+    echo "No dev container is running."
   else
-    rm -f "$PIDFILE"
-    echo "No helper-managed dev image is running."
+    require_owned_container
+    "$DOCKER" rm -f "$CONTAINER" >/dev/null
+    echo "Removed dev container $CONTAINER"
   fi
 }
 
 status_server() {
-  if is_pid_running; then
-    echo "Helper-managed process: running pid $(cat "$PIDFILE")"
+  local state
+  state="$(container_state)" || return $?
+  echo "Dev container $CONTAINER: $state"
+  if image_present; then
+    echo "Dev image $IMAGE: present"
   else
-    echo "Helper-managed process: not running"
+    echo "Dev image $IMAGE: absent (start builds it)"
   fi
-  if port_listener | grep -q ":${PORT}"; then
-    echo "Port ${PORT}: listening"
+  if volume_exists; then
+    if volume_owned; then
+      echo "FASL volume $FASL_VOLUME: present (ownership verified)"
+    else
+      echo "FASL volume $FASL_VOLUME: PRESENT BUT FOREIGN" >&2
+      return 2
+    fi
   else
-    echo "Port ${PORT}: not listening"
+    echo "FASL volume $FASL_VOLUME: absent (start creates it)"
+  fi
+  echo "Checkout identity: $CHECKOUT_ID"
+  if [ "$state" = running ]; then
+    local published
+    published="$("$DOCKER" port "$CONTAINER")"
+    if [ -z "$published" ]; then
+      echo "Container boundary: no host ports published"
+    else
+      echo "ERROR: dev container publishes a host port:" >&2
+      echo "$published" >&2
+      return 1
+    fi
   fi
 }
 
-log_metrics() { # $1 rc, $2 start_epoch, $3 form
-  local snip
-  snip=$(printf '%s' "$3" | tr '\n' ' ' | cut -c1-80)
-  mkdir -p "$RUNTIME_DIR"
-  printf '%s rc=%s dur_s=%s form=%s\n' \
-    "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" "$(( $(date +%s) - $2 ))" "$snip" \
-    >> "$METRICS_LOG" 2>/dev/null || true
+doctor() {
+  command -v "$DOCKER" >/dev/null 2>&1 || {
+    echo "ERROR: Docker CLI is unavailable; host interpreter fallback is forbidden" >&2
+    return 1
+  }
+  "$DOCKER" version >/dev/null 2>&1 || {
+    echo "ERROR: Docker daemon is unavailable; host interpreter fallback is forbidden" >&2
+    return 1
+  }
+  [ -e "$ROOT/refs/coalton" ] || {
+    echo "ERROR: refs/coalton missing — run scripts/setup-coalton.sh first" >&2
+    return 1
+  }
+  [ -f "$ROOT/scripts/dev-swank-server.lisp" ] || {
+    echo "ERROR: scripts/dev-swank-server.lisp is missing" >&2
+    return 1
+  }
+  status_server
+}
+
+require_running() {
+  local state
+  state="$(container_state)" || return $?
+  if [[ "$state" != running ]]; then
+    echo "Dev container $CONTAINER is not running; run: scripts/dev.sh start" >&2
+    return 2
+  fi
+}
+
+identity_field() {
+  [ "$#" -eq 1 ] || return 2
+  case "$1" in
+    checkout-id) printf '%s\n' "$CHECKOUT_ID" ;;
+    session-id) printf '%s\n' "$SESSION_ID" ;;
+    container) printf '%s\n' "$CONTAINER" ;;
+    image) printf '%s\n' "$IMAGE" ;;
+    port) printf '%s\n' "$PORT" ;;
+    fasl-volume) printf '%s\n' "$FASL_VOLUME" ;;
+    *) echo "ERROR: unknown identity field: $1" >&2; return 2 ;;
+  esac
+}
+
+# Workbench adapter-only path. The canonical client is streamed over stdin;
+# it is never copied into this project or persisted in the container.
+exec_workbench_eval_client() {
+  [ "$#" -ge 2 ] || {
+    echo "ERROR: adapter-eval requires CLIENT and FORM" >&2
+    return 2
+  }
+  local client="$1"
+  shift
+  [ -f "$client" ] || { echo "ERROR: canonical eval client is unavailable" >&2; return 2; }
+  require_running || return $?
+  local args=(--interactive --workdir /workspace
+              --env DEV_SWANK_HOST=127.0.0.1
+              --env DEV_SWANK_PORT="$PORT")
+  [[ -n "${DEV_EVAL_TIMEOUT:-}" ]] && args+=(--env DEV_EVAL_TIMEOUT="$DEV_EVAL_TIMEOUT")
+  [[ -n "${DEV_EVAL_MAX_OUTPUT:-}" ]] && args+=(--env DEV_EVAL_MAX_OUTPUT="$DEV_EVAL_MAX_OUTPUT")
+  [[ -n "${DEV_SWANK_PACKAGE:-}" ]] && args+=(--env DEV_SWANK_PACKAGE="$DEV_SWANK_PACKAGE")
+  "$DOCKER" exec "${args[@]}" "$CONTAINER" \
+    sbcl --script /dev/stdin "$@" <"$client"
 }
 
 eval_form() {
@@ -165,16 +322,50 @@ eval_form() {
     echo "eval requires a Lisp FORM argument" >&2
     return 2
   fi
-  local start rc=0
-  start=$(date +%s)
-  (cd "$ROOT" && DEV_SWANK_HOST="$HOST" DEV_SWANK_PORT="$PORT" \
-    sbcl --script scripts/dev-swank-eval.lisp "$@") || rc=$?
-  log_metrics "$rc" "$start" "$*"
-  return $rc
+  local workbench="${CL_WORKBENCH_BIN:-cl-workbench}"
+  if [[ "$workbench" = */* ]]; then
+    [ -x "$workbench" ] || {
+      echo "ERROR: Common Lisp Workbench CLI is not executable: $workbench" >&2
+      return 2
+    }
+  elif ! command -v "$workbench" >/dev/null 2>&1; then
+    echo "ERROR: cl-workbench is unavailable; host Lisp fallback is forbidden" >&2
+    return 2
+  fi
+  "$workbench" repl eval "$@"
+}
+
+# fiveam: NAME is a raw suite designator, e.g. `dev.sh test :script-tests`;
+# test-all runs the whole :bitcoin-lisp-tests suite (26k+ checks).
+test_one() {
+  if [[ $# -ne 1 ]]; then
+    echo "test requires one fiveam suite designator, e.g. :script-tests" >&2
+    return 2
+  fi
+  DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-600}" \
+    eval_form "(let ((r (fiveam:run $1)))
+  (fiveam:explain! r)
+  (unless r (error \"suite $1 selected no tests\"))
+  (unless (fiveam:results-status r) (error \"suite $1 failed\")))"
+}
+
+test_all() {
+  DEV_EVAL_TIMEOUT="${DEV_EVAL_TIMEOUT:-3600}" \
+    eval_form '(let ((r (fiveam:run :bitcoin-lisp-tests)))
+  (fiveam:explain! r)
+  (unless r (error "suite :bitcoin-lisp-tests selected no tests"))
+  (unless (fiveam:results-status r) (error "bitcoin-lisp-tests failed")))'
 }
 
 docs_check() {
-  (cd "$ROOT" && sbcl --non-interactive --load scripts/docs-check.lisp)
+  ensure_image
+  exec "$ROOT/scripts/docker-sbcl.sh" --dynamic-space-size 4096 \
+    --non-interactive --load scripts/docs-check.lisp
+}
+
+show_logs() {
+  require_owned_container
+  "$DOCKER" logs "$CONTAINER" "$@"
 }
 
 cmd="${1:-help}"
@@ -183,10 +374,14 @@ case "$cmd" in
   start) start_server ;;
   stop) stop_server ;;
   status) status_server ;;
+  doctor) doctor ;;
+  identity) identity_field "$@" ;;
+  adapter-eval) exec_workbench_eval_client "$@" ;;
   eval) eval_form "$@" ;;
   test) test_one "$@" ;;
   test-all) test_all ;;
   docs-check) docs_check ;;
+  logs) show_logs "$@" ;;
   help|-h|--help) usage ;;
   *) echo "Unknown command: $cmd" >&2; usage >&2; exit 2 ;;
 esac

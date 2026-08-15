@@ -57,3 +57,6 @@ tests/quick-debug-test.lisp
 
 # Agent dev-runtime (cl-agent-repl)
 .dev-runtime/
+
+# Common Lisp Workbench runtime state (descriptors, event spool)
+/.cl-workbench/state/

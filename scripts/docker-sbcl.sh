@@ -21,7 +21,9 @@ if [ ! -e "$REPO/refs/coalton" ]; then
   exit 1
 fi
 
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+# `docker image inspect NAME` fails to resolve short names on some
+# containerd-store daemons even when the image exists; `image ls -q` does.
+if [ -z "$(docker image ls -q "$IMAGE")" ]; then
   echo "Image $IMAGE not found — building (one-time, ~20-30 min)..." >&2
   docker build -f "$REPO/docker/Dockerfile" -t "$IMAGE" "$REPO"
 fi
