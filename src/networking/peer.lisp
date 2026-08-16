@@ -551,7 +551,7 @@ RECEIVE-MESSAGE-BLOCKING instead."
       ;; the byte reader cannot see — which is why the parsed header is parked
       ;; on the CONNECTION between passes. Magic and size are validated in the
       ;; branch that parses, so a resumed pass goes straight to its payload.
-      (let ((header (connection-recv-header conn)))
+      (let ((header (connection-recv-framing conn)))
         (unless header
           (let ((bytes (receive-bytes-resumable conn 24)))
             (when (eq bytes :incomplete)
@@ -579,7 +579,7 @@ RECEIVE-MESSAGE-BLOCKING instead."
               (return-from receive-message nil))
             ;; Park it: the payload read below may span several more passes and
             ;; the framing must survive them.
-            (setf (connection-recv-header conn) header)))
+            (setf (connection-recv-framing conn) header)))
         (let ((payload-len (bitcoin-lisp.serialization:message-header-payload-length header)))
                 ;; Read payload
                 (let ((payload (if (zerop payload-len)
@@ -591,7 +591,7 @@ RECEIVE-MESSAGE-BLOCKING instead."
                                      r))))
                   ;; Whole message in hand (or failed): the framing state is
                   ;; consumed either way.
-                  (setf (connection-recv-header conn) nil)
+                  (setf (connection-recv-framing conn) nil)
                   (unless (or (zerop payload-len) payload)
                     ;; Header consumed, payload never completed: the peer is now
                     ;; permanently out of frame with us. Nothing here means the
