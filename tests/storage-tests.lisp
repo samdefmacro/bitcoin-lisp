@@ -1752,3 +1752,57 @@ shutdown flush, say — would move coins while leaving the pointer behind."
                (is (equalp tip (bitcoin-lisp.storage::cvc-best-block reopened))
                    "the reopened cache adopts what is on disk")))
         (bitcoin-lisp.storage:close-coins-view-db base)))))
+
+(test reconcile-moves-the-tip-record-to-where-the-coins-are
+  "chainstate.dat must follow the coins, not the other way round.
+
+The coins DB's pointer moves with the coins themselves, so when the two records
+disagree the pointer is the fact and the tip record is the stale copy — and a
+UTXO set cannot be reconstructed from a tip record, while the tip record is one
+hash we can rewrite. This is the recovery that makes an interrupted reorg
+survivable: the coins stop at a block boundary, the pointer names it, and
+startup moves the record there so normal sync re-validates the gap.
+
+It runs unconditionally, unlike the older in-transition recovery, because the
+case that motivated it leaves no marker at all — an interrupted reorg whose
+cache is afterwards flushed cleanly."
+  (let* ((base (ensure-directories-exist
+                (merge-pathnames (format nil "bl-reconcile-~D/" (random 1000000))
+                                 (uiop:temporary-directory))))
+         (chain-state (bitcoin-lisp.storage:init-chain-state base))
+         (db (bitcoin-lisp.storage:open-coins-view-db
+              (ensure-directories-exist (merge-pathnames "chainstate/" base))))
+         (cache (bitcoin-lisp.storage:make-coins-view-cache db))
+         (node (bitcoin-lisp::make-node))
+         (coins-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xC0))
+         (tip-hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xF1)))
+    (unwind-protect
+         (progn
+           (setf (bitcoin-lisp::node-chain-state node) chain-state
+                 (bitcoin-lisp.storage:chain-state-coins-view chain-state) cache)
+           ;; The chain believes it is at height 200; the coins are at 150.
+           (dolist (pair (list (cons coins-hash 150) (cons tip-hash 200)))
+             (bitcoin-lisp.storage:add-block-index-entry
+              chain-state (bitcoin-lisp.storage:make-block-index-entry
+                           :hash (car pair) :height (cdr pair)
+                           :chain-work 0 :status :valid)))
+           (bitcoin-lisp.storage:update-chain-tip chain-state tip-hash 200)
+           ;; Control: with no pointer recorded there is nothing to reconcile.
+           (is (eq :unrecorded (bitcoin-lisp::reconcile-coins-db-best-block node)))
+           (is (= 200 (bitcoin-lisp.storage:current-height chain-state))
+               "and the tip is left alone")
+           ;; Now record where the coins actually are.
+           (bitcoin-lisp.storage:coins-view-cache-flush cache :best-block coins-hash)
+           (is (eq :reconciled (bitcoin-lisp::reconcile-coins-db-best-block node)))
+           (is (= 150 (bitcoin-lisp.storage:current-height chain-state))
+               "the tip record follows the coins")
+           (is (equalp coins-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+           ;; Idempotent: a second pass now agrees.
+           (is (eq :match (bitcoin-lisp::reconcile-coins-db-best-block node)))
+           ;; A pointer naming a block we cannot place is not silently accepted.
+           (bitcoin-lisp.storage:coins-view-cache-flush
+            cache :best-block (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element #xEE))
+           (is (eq :unresolvable (bitcoin-lisp::reconcile-coins-db-best-block node))
+               "an unplaceable UTXO set is reported, not guessed at"))
+      (bitcoin-lisp.storage:close-coins-view-db db))))
