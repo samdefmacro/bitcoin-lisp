@@ -84,6 +84,12 @@ in-flight socket reads.")
   "Return T if node shutdown has been requested (see *ibd-stop-requested*)."
   *ibd-stop-requested*)
 
+;;; Hand this flag DOWN to the layers that must stop cooperatively but cannot
+;;; see networking — perform-reorg polls it between blocks. Core does the same
+;;; with util::SignalInterrupt, which ChainstateManager holds by reference
+;;; (validation.h:1034); validation never calls up to ask.
+(setf bitcoin-lisp:*interrupt-check* #'ibd-stop-requested-p)
+
 (defun join-thread-or-destroy (thread &key (timeout 5) deadline)
   "Wait for THREAD to exit, destroying it if it is still alive after TIMEOUT
 seconds (or past DEADLINE, an internal-real-time absolute cutoff — pass one
