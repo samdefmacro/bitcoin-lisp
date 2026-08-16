@@ -1548,3 +1548,45 @@ LE-u32 key order diverges from numeric), and interleaved insertion order."
           "transition counting agrees with collecting")
       ;; control: the assertion must be able to fail
       (is (/= (1+ oracle) (bitcoin-lisp.storage:utxo-set-distinct-txids utxo-set))))))
+
+(test load-state-distinguishes-corruption-from-absence
+  "A present-but-unreadable chainstate.dat must NOT look like a first run.
+Both returned NIL before, and the caller acted on NIL by silently starting from
+genesis — replaying blocks whose coins are already in the UTXO set, which on
+mainnet trips the BIP30 duplicate-txid check and leaves the node with no
+best-valid-tip at all. The legacy pre-CRC format has no integrity check, so it
+can only be trusted by exact size; any other size is corruption, not an older
+version."
+  (let* ((dir (merge-pathnames (format nil "bl-loadstate-~D/" (random 1000000))
+                               #P"/tmp/"))
+         (state (bitcoin-lisp.storage:make-chain-state :base-path dir))
+         (path (bitcoin-lisp.storage::state-file-path state)))
+    (ensure-directories-exist dir)
+    (unwind-protect
+         (flet ((write-bytes (n)
+                  (with-open-file (s path :direction :output
+                                          :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede
+                                          :if-does-not-exist :create)
+                    (dotimes (i n) (write-byte (mod i 256) s)))))
+           ;; Control: absence is a legitimate first run, and must stay NIL.
+           (when (probe-file path) (delete-file path))
+           (is (null (bitcoin-lisp.storage:load-state state))
+               "no file at all is a first run, not corruption")
+           ;; A size no version recognizes: corruption.
+           (write-bytes 41)
+           (is (eq :corrupt (bitcoin-lisp.storage:load-state state))
+               "a 41-byte file matches no format and must report corruption")
+           (write-bytes 7)
+           (is (eq :corrupt (bitcoin-lisp.storage:load-state state)))
+           ;; A v3-sized file whose CRC cannot verify: corruption, not absence.
+           (write-bytes 45)
+           (is (eq :corrupt (bitcoin-lisp.storage:load-state state))
+               "a v3-sized file with a bad CRC must report corruption")
+           ;; Control: a legitimately-sized legacy file still loads, so the
+           ;; check above rejects by integrity rather than rejecting everything.
+           (write-bytes 40)
+           (is (eq t (bitcoin-lisp.storage:load-state state))
+               "a valid legacy-format file still loads"))
+      (when (probe-file path) (ignore-errors (delete-file path)))
+      (ignore-errors (uiop:delete-empty-directory dir)))))
