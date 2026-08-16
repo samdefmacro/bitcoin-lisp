@@ -821,3 +821,53 @@ fails if only the stall bound is present."
       (usocket:socket-close client)
       (usocket:socket-close server)
       (usocket:socket-close listener))))
+
+(test receive-message-survives-the-live-freeze-attack
+  "The production path, end to end: a peer sends a well-formed 24-byte header
+announcing a large payload, delivers a few bytes, and goes silent. This is
+exactly what froze a live node for five days. receive-message must give up
+within the caller's budget and drop the peer.
+
+Trap worth remembering: announcing MORE than +MAX-MESSAGE-PAYLOAD+ makes this
+test vacuous — the oversize guard rejects the header before the payload read is
+ever reached, and the test passes in 9 ms without exercising the fix at all.
+Announce just under the limit."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (attacker (usocket:socket-connect "127.0.0.1" port
+                                           :element-type '(unsigned-byte 8)))
+         (victim-socket (usocket:socket-accept listener
+                                               :element-type '(unsigned-byte 8)))
+         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+                                                        :connected t))
+         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready))
+         (announced (1- bitcoin-lisp:+max-message-payload+))
+         (header (bitcoin-lisp.serialization::make-message-header
+                  :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+                  :command "block"
+                  :payload-length announced
+                  :checksum (make-array 4 :element-type '(unsigned-byte 8)))))
+    (unwind-protect
+         (progn
+           (let ((header-bytes
+                   (flexi-streams:with-output-to-sequence (s)
+                     (bitcoin-lisp.serialization::write-message-header s header))))
+             (write-sequence header-bytes (usocket:socket-stream attacker))
+             (write-sequence (make-array 3 :element-type '(unsigned-byte 8))
+                             (usocket:socket-stream attacker))
+             (force-output (usocket:socket-stream attacker)))
+           (sleep 0.3)
+           (multiple-value-bind (finished result)
+               (%run-bounded (lambda ()
+                               (bitcoin-lisp.networking:receive-message
+                                peer :timeout 1))
+                             :limit 30)
+             (is-true finished
+                      "the node must not be frozen by one silent peer")
+             (is (null result) "no message is produced")
+             (is-false (bitcoin-lisp.networking::connection-connected conn)
+                       "and the peer is dropped")))
+      (usocket:socket-close attacker)
+      (usocket:socket-close victim-socket)
+      (usocket:socket-close listener))))
