@@ -2561,9 +2561,13 @@ get notfound). Runs over a loopback socket pair."
                      (list server-peer) state
                      (bitcoin-lisp.storage:make-utxo-set) nil
                      :mempool mempool)
-                    ;; The client receives a tx message...
+                    ;; The client receives a tx message. Blocking variant: the
+                    ;; plain reader is resumable and would answer :incomplete if
+                    ;; the payload had not fully landed yet, making this timing-
+                    ;; dependent.
                     (multiple-value-bind (command payload)
-                        (bitcoin-lisp.networking:receive-message client :timeout 5)
+                        (bitcoin-lisp.networking::receive-message-blocking
+                         client :timeout 5)
                       (is (equal "tx" command))
                       (when payload
                         (is (equalp txid

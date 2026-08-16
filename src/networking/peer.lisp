@@ -522,8 +522,17 @@ failure."
           (send-bytes conn message-bytes)))))
 
 (defun receive-message (peer &key (timeout 30))
-  "Receive a message from a peer.
-Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
+  "Take the next complete message from PEER without waiting for one.
+
+Returns (VALUES COMMAND PAYLOAD) when a whole message is in hand, or
+(VALUES NIL :INCOMPLETE) when part of one has arrived and the rest has not —
+the caller should move on and come back. (VALUES NIL NIL) is a failure, and the
+connection has already been dropped where that matters.
+
+Partial reads live on the connection (Core CNode::vRecvMsg), so a peer trickling
+a 4 MiB block costs its own turn in the pump and nothing else. Callers that
+genuinely cannot proceed without an answer — the handshakes — want
+RECEIVE-MESSAGE-BLOCKING instead."
   (when (and (peer-connection peer)
              (connection-connected (peer-connection peer)))
     (let ((conn (peer-connection peer)))
@@ -536,38 +545,53 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
               (%account-message (peer-recv-per-msg peer) t command
                                 (length payload)))
             (values command payload))))
-      ;; Read header (24 bytes).
+      ;; Parse the 24-byte header, unless a previous pass already did.
       ;;
-      ;; A message is TWO reads, and that makes the framing state a per-MESSAGE
-      ;; property that receive-bytes cannot see. Once these 24 bytes are
-      ;; consumed we are committed: if anything afterwards fails, the stream can
-      ;; no longer be trusted to sit on a message boundary, and a later read
-      ;; would parse payload bytes as a header — forever, since every pass would
-      ;; eat 24 more bytes of garbage. So every failure below MUST drop the
-      ;; connection. (Before reads were bounded this could not arise: the old
-      ;; blocking read made a timeout between header and payload impossible.)
-      (let ((header-bytes (receive-bytes conn 24 :timeout timeout)))
-        (when header-bytes
-          (flexi-streams:with-input-from-sequence (stream header-bytes)
-            (let ((header (bitcoin-lisp.serialization:read-message-header stream)))
-              ;; Verify magic
-              (unless (equalp (bitcoin-lisp.serialization:message-header-magic header)
-                              bitcoin-lisp.serialization:*network-magic*)
-                (bitcoin-lisp:log-warn "Bad message magic from peer ~A, disconnecting"
-                                       (peer-address peer))
-                (disconnect-peer peer)
-                (return-from receive-message nil))
-              ;; Validate payload size before allocating/reading
-              (let ((payload-len (bitcoin-lisp.serialization:message-header-payload-length header)))
-                (when (> payload-len bitcoin-lisp:+max-message-payload+)
-                  (bitcoin-lisp:log-warn "Oversized message from peer ~A: ~D bytes (max ~D), disconnecting"
-                                         (peer-address peer) payload-len bitcoin-lisp:+max-message-payload+)
-                  (disconnect-peer peer)
-                  (return-from receive-message nil))
+      ;; A message is TWO reads, and that makes framing a per-MESSAGE property
+      ;; the byte reader cannot see — which is why the parsed header is parked
+      ;; on the CONNECTION between passes. Magic and size are validated in the
+      ;; branch that parses, so a resumed pass goes straight to its payload.
+      (let ((header (connection-recv-header conn)))
+        (unless header
+          (let ((bytes (receive-bytes-resumable conn 24)))
+            (when (eq bytes :incomplete)
+              (return-from receive-message (values nil :incomplete)))
+            (unless bytes
+              (return-from receive-message nil))
+            (setf header (flexi-streams:with-input-from-sequence (stream bytes)
+                           (bitcoin-lisp.serialization:read-message-header stream)))
+            ;; Nothing is parked yet, so these two rejections leave no framing
+            ;; state behind — but the 24 bytes ARE consumed, so both must drop
+            ;; the connection (see %abandon-receive for why).
+            (unless (equalp (bitcoin-lisp.serialization:message-header-magic header)
+                            bitcoin-lisp.serialization:*network-magic*)
+              (bitcoin-lisp:log-warn "Bad message magic from peer ~A, disconnecting"
+                                     (peer-address peer))
+              (disconnect-peer peer)
+              (return-from receive-message nil))
+            (when (> (bitcoin-lisp.serialization:message-header-payload-length header)
+                     bitcoin-lisp:+max-message-payload+)
+              (bitcoin-lisp:log-warn "Oversized message from peer ~A: ~D bytes (max ~D), disconnecting"
+                                     (peer-address peer)
+                                     (bitcoin-lisp.serialization:message-header-payload-length header)
+                                     bitcoin-lisp:+max-message-payload+)
+              (disconnect-peer peer)
+              (return-from receive-message nil))
+            ;; Park it: the payload read below may span several more passes and
+            ;; the framing must survive them.
+            (setf (connection-recv-header conn) header)))
+        (let ((payload-len (bitcoin-lisp.serialization:message-header-payload-length header)))
                 ;; Read payload
                 (let ((payload (if (zerop payload-len)
                                    #()
-                                   (receive-bytes conn payload-len :timeout timeout))))
+                                   (let ((r (receive-bytes-resumable conn payload-len)))
+                                     (when (eq r :incomplete)
+                                       (return-from receive-message
+                                         (values nil :incomplete)))
+                                     r))))
+                  ;; Whole message in hand (or failed): the framing state is
+                  ;; consumed either way.
+                  (setf (connection-recv-header conn) nil)
                   (unless (or (zerop payload-len) payload)
                     ;; Header consumed, payload never completed: the peer is now
                     ;; permanently out of frame with us. Nothing here means the
@@ -603,7 +627,51 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
                     (let ((command (bitcoin-lisp.serialization:message-header-command header)))
                       (%account-message (peer-recv-per-msg peer) nil
                                         command payload-len)
-                      (values command payload))))))))))))
+                      (values command payload)))))))))
+
+(defun receive-message-blocking (peer &key (timeout 30))
+  "WAIT for the next complete message from PEER; (VALUES COMMAND PAYLOAD), or
+NIL if none arrives within the budget.
+
+For the conversations that cannot proceed without an answer: the version/verack
+handshake, and the header-sync exchange, which is a request/response dialogue
+with one chosen peer rather than a pass over all of them. Everything that pumps
+MANY peers must use RECEIVE-MESSAGE — waiting here is precisely what let one
+slow peer stall the rest.
+
+⚠️ The residual is REAL and node-wide, not peer-local. Header sync runs on the
+SAME thread as the pump (sync-blockchain -> sync-headers-with-failover, and the
+pump only runs after it returns), so while this waits on its chosen peer NO peer
+is drained. Its bound is loose too: sync-headers' attempt counter only advances
+on a silent peer, so one that keeps sending anything else runs 30 attempts x 5s
+per request, up to max-requests. Making header sync a per-peer state machine over
+the shared pump — Core has no header-sync loop at all, it is ordinary message
+handling — is what removes this, and it is the next step, not this one."
+  (let ((deadline (+ (get-internal-real-time)
+                     (* timeout internal-time-units-per-second))))
+    (loop
+      (multiple-value-bind (command payload) (receive-message peer :timeout timeout)
+        (when command
+          (return (values command payload)))
+        ;; A hard failure (bad magic, oversized, EOF) has already dropped the
+        ;; peer; only :incomplete is worth waiting on.
+        (unless (eq payload :incomplete)
+          (return nil)))
+      ;; Re-read the connection each pass: a dispatch elsewhere can NIL it.
+      (let ((conn (peer-connection peer)))
+        (when (or *ibd-stop-requested*
+                  (> (get-internal-real-time) deadline)
+                  (null conn)
+                  (not (connection-connected conn)))
+          ;; End the read we abandoned rather than leaving an allocated
+          ;; accumulator behind: %receive-gave-up drops the peer if part of a
+          ;; message was consumed (it is out of frame either way) and simply
+          ;; clears the state if not. Returning bare NIL used to strand a
+          ;; zero-filled buffer that the pump then reported as a stalled peer.
+          (return (when conn (%receive-gave-up conn))))
+        ;; Nothing readable this instant: wait a short window. The deadline
+        ;; above ends the wait; the reader itself applies no clock.
+        (data-available-p conn :timeout 0.2)))))
 
 (defun peer-outbound-or-block-relay-p (peer)
   "T for the connection types that are candidates for AUTOMATIC disconnection
@@ -944,7 +1012,8 @@ tx relay on those)."
 (defun %receive-and-store-version (peer &key (timeout 30))
   "Receive the peer's version message and record its services/height/user-agent.
 Returns T on success, NIL if the first message wasn't a version."
-  (multiple-value-bind (command payload) (receive-message peer :timeout timeout)
+  (multiple-value-bind (command payload)
+      (receive-message-blocking peer :timeout timeout)
     (when (and command (string= command "version"))
       (flexi-streams:with-input-from-sequence (stream payload)
         (let ((version-msg (bitcoin-lisp.serialization:read-version-message stream)))
@@ -969,7 +1038,8 @@ sendaddrv2/sendheaders/sendtxrcncl), tracking the peer's advertised
 capabilities. Sets the peer :ready and returns T on VERACK; NIL otherwise
 (including a sendtxrcncl protocol violation, which disconnects)."
   (loop repeat 10
-        do (multiple-value-bind (command payload) (receive-message peer :timeout timeout)
+        do (multiple-value-bind (command payload)
+               (receive-message-blocking peer :timeout timeout)
              (unless command (return nil))
              (cond
                ((string= command "verack")
