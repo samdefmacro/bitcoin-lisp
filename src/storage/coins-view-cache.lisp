@@ -210,10 +210,17 @@ erased."
         (cvc-mem-bytes cache) 0)
   (coins-view-db-erase-all-coins (cvc-base cache)))
 
-(defun coins-view-cache-flush (cache &key sync)
+(defun coins-view-cache-flush (cache &key sync best-block)
   "Commit all dirty entries to the base view in a single atomic batch
 then clear the cache. SYNC=T forces fsync. Returns the number of
-entries written (puts + erases)."
+entries written (puts + erases).
+
+BEST-BLOCK, when supplied, is the block hash this UTXO state corresponds to and
+is staged in the SAME batch as the coin changes, so the two commit or fail
+together (Core's CCoinsViewDB::BatchWrite, txdb.cpp:100-159). Callers that do
+not know their tip may omit it; the pointer then keeps its previous value
+rather than going stale-but-plausible, which is why it is optional rather than
+defaulted to something invented here."
   (declare (type coins-view-cache cache))
   (let ((count 0))
     (with-coins-view-batch (batch (cvc-base cache) :sync sync)
@@ -223,7 +230,9 @@ entries written (puts + erases)."
                        (coins-view-batch-put batch key (ce-entry ce))
                        (coins-view-batch-erase batch key))
                    (incf count)))
-               (cvc-entries cache)))
+               (cvc-entries cache))
+      (when best-block
+        (coins-view-batch-set-best-block batch best-block)))
     (clrhash (cvc-entries cache))
     (setf (cvc-dirty-count cache) 0
           (cvc-fresh-count cache) 0
@@ -642,7 +651,15 @@ on-disk 36-byte key order — same raw order %utxo-set-iterate produces.
 utxo-set-iterate layers Core's numeric-vout cursor order on top."
   (coins-view-cache-flush cache)
   (with-leveldb-iterator (iter (cvdb-db (cvc-base cache)))
-    (leveldb-iter-seek-to-first iter)
+    ;; SEEK to the coin prefix rather than seeking to the first key. The loop
+    ;; below stops at the first non-'C' key, which is only a correct scan if
+    ;; every other prefix sorts AFTER 'C' — an assumption this code used to
+    ;; state and that the best-block key ('B', matching Core's DB_BEST_BLOCK)
+    ;; broke: it became the first key in the database, so the scan terminated
+    ;; immediately and the whole UTXO set iterated as EMPTY. Seeking makes the
+    ;; scan independent of where any metadata prefix sorts.
+    (leveldb-iter-seek iter (make-array 1 :element-type '(unsigned-byte 8)
+                                          :initial-element +db-prefix-coin+))
     (let ((txid-buf (make-array 32 :element-type '(unsigned-byte 8))))
       (loop
         (unless (leveldb-iter-valid-p iter) (return))
