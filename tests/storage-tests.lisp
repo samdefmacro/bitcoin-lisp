@@ -1474,3 +1474,77 @@ regression would silently force a from-genesis resync on deploy."
              (is (= 42 (bitcoin-lisp.storage:block-index-entry-chain-work entry)))
              (is (= 0 (bitcoin-lisp.storage:block-index-entry-tx-count entry)))))
       (uiop:delete-directory-tree tmp-dir :validate t :if-does-not-exist :ignore))))
+
+(test compute-utxo-set-hash-streams-instead-of-buffering
+  "hash_serialized_3 must be computed incrementally. Buffering the whole set
+and hashing it at the end needs memory proportional to the UTXO set: measured
+at ~1.1 GB on testnet4's 14.2M coins, which killed a live node — the final
+buffer doubling asked for 1,156,098,560 bytes with 632 MB left in a 6 GB heap
+and the fail-fast debugger hook turned that into process exit. Mainnet's set is
+an order of magnitude larger.
+
+This pins the streamed digest against the buffer-then-hash construction it
+replaced, so the consensus-visible value cannot drift while the memory profile
+changes. The final control must FAIL to prove the comparison has teeth."
+  (flet ((buffered (elements)
+           ;; the original construction, kept here only as the oracle
+           (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
+             (dolist (e elements)
+               (bitcoin-lisp.serialization:bb-write-bytes buf e))
+             (bitcoin-lisp.crypto:hash256
+              (bitcoin-lisp.serialization:bb-finish buf))))
+         (streamed (elements)
+           (let ((digest (ironclad:make-digest :sha256)))
+             (dolist (e elements) (ironclad:update-digest digest e))
+             (bitcoin-lisp.crypto:sha256 (ironclad:produce-digest digest)))))
+    (let ((state (sb-ext:seed-random-state 20260816)))
+      ;; empty set
+      (is (equalp (buffered nil) (streamed nil)))
+      ;; randomized multi-element sets, including sizes that straddle the
+      ;; digest's internal 64-byte block boundary
+      (dotimes (trial 25)
+        (let ((elements (loop repeat (1+ (random 20 state))
+                              collect (let* ((n (1+ (random 130 state)))
+                                             (v (make-array n :element-type '(unsigned-byte 8))))
+                                        (dotimes (i n)
+                                          (setf (aref v i) (random 256 state)))
+                                        v))))
+          (is (equalp (buffered elements) (streamed elements)))))
+      ;; control: the comparison must be able to fail
+      (let ((a (list (make-array 3 :element-type '(unsigned-byte 8) :initial-element 1)))
+            (b (list (make-array 3 :element-type '(unsigned-byte 8) :initial-element 2))))
+        (is (not (equalp (streamed a) (streamed b)))
+            "different coin sets must hash differently")))))
+
+(test utxo-set-distinct-txids-counts-groups-without-collecting
+  "Counting distinct txids must not hold every txid in memory — that was the
+second unbounded accumulator on the gettxoutsetinfo path. Transition counting
+is exact only because UTXO-SET-ITERATE delivers coins grouped per txid, so this
+pins the count against a set-based oracle on data that would expose a grouping
+assumption if it were wrong: multiple vouts per txid, vouts above 255 (where
+LE-u32 key order diverges from numeric), and interleaved insertion order."
+  (let ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+        (txids (loop for i below 8
+                     collect (let ((v (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 0)))
+                               (setf (aref v 0) i)
+                               ;; vary a later byte too so lex order is not just index order
+                               (setf (aref v 31) (- 255 i))
+                               v))))
+    ;; Insert in an order deliberately unlike the iteration order.
+    (dolist (vout '(300 1 0 256 2))
+      (dolist (txid (reverse txids))
+        (bitcoin-lisp.storage:add-utxo
+         utxo-set txid vout (+ 1000 vout)
+         (make-array 1 :element-type '(unsigned-byte 8)) 1)))
+    (let ((oracle (let ((seen (make-hash-table :test 'equalp)))
+                    (bitcoin-lisp.storage:utxo-set-iterate
+                     utxo-set (lambda (txid vout entry)
+                                (declare (ignore vout entry))
+                                (setf (gethash txid seen) t)))
+                    (hash-table-count seen))))
+      (is (= (length txids) oracle) "the oracle sees every txid")
+      (is (= oracle (bitcoin-lisp.storage:utxo-set-distinct-txids utxo-set))
+          "transition counting agrees with collecting")
+      ;; control: the assertion must be able to fail
+      (is (/= (1+ oracle) (bitcoin-lisp.storage:utxo-set-distinct-txids utxo-set))))))
