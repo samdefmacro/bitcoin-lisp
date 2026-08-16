@@ -553,3 +553,222 @@ node-lock) run concurrently without crashing or deadlocking."
       (bt:join-thread writer)
       (bt:join-thread reader)
       (is-true t))))
+
+;;;; ============================================================
+;;;; Live-wedge regressions (2026-08-16)
+;;;;
+;;;; Three defects that between them froze both production nodes. All were
+;;;; found on live processes, so each test reproduces the observed condition
+;;;; and carries a control that must fail without the fix.
+;;;; ============================================================
+
+(defun %silent-peer-connection (announced-bytes delivered-bytes)
+  "A loopback peer that delivers DELIVERED-BYTES and then goes silent forever,
+while the reader is about to ask for ANNOUNCED-BYTES. Returns
+(VALUES connection client-socket server-socket listener)."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (client (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (server (usocket:socket-accept listener :element-type '(unsigned-byte 8))))
+    (declare (ignore announced-bytes))
+    (write-sequence (make-array delivered-bytes :element-type '(unsigned-byte 8)
+                                                :initial-element 7)
+                    (usocket:socket-stream client))
+    (force-output (usocket:socket-stream client))
+    (sleep 0.2)
+    (values (bitcoin-lisp.networking::make-connection :socket server :connected t)
+            client server listener)))
+
+(defun %run-bounded (thunk &key (limit 8))
+  "Run THUNK in a thread. Returns (VALUES finished-p result). A thunk still
+running at LIMIT seconds is destroyed and reported as unfinished."
+  (let* ((done (bt:make-semaphore))
+         (result nil)
+         (thread (bt:make-thread (lambda ()
+                                   (setf result (ignore-errors (funcall thunk)))
+                                   (bt:signal-semaphore done)))))
+    (let ((finished (bt:wait-on-semaphore done :timeout limit)))
+      (unless finished (bt:destroy-thread thread))
+      (values (and finished t) result))))
+
+(test receive-bytes-bounds-a-peer-that-stalls-mid-message
+  "A peer that announces a large payload, sends a few bytes and then goes
+silent must not pin the reader. Before the fix this hung forever in poll():
+READ-SEQUENCE fills the whole buffer or blocks, while WAIT-FOR-INPUT only
+promises one readable byte. Because the message pump is serial, one such peer
+froze a live node's entire network layer for five days."
+  (multiple-value-bind (conn client server listener)
+      (%silent-peer-connection 1000 3)
+    (unwind-protect
+         (multiple-value-bind (finished result)
+             (%run-bounded (lambda ()
+                             (bitcoin-lisp.networking::receive-bytes
+                              conn 1000 :timeout 2))
+                           :limit 8)
+           (is-true finished
+                    "receive-bytes must return, not block past its timeout")
+           (is (null result) "a stalled read reports failure")
+           ;; The aborted read consumed an unknown number of bytes, so the
+           ;; stream can never be resynchronized: the connection must be dead.
+           (is-false (bitcoin-lisp.networking::connection-connected conn)))
+      (usocket:socket-close client)
+      (usocket:socket-close server)
+      (usocket:socket-close listener))))
+
+(test receive-bytes-control-unbounded-read-still-hangs
+  "Control for the test above: the pre-fix shape (WAIT-FOR-INPUT then a bare
+READ-SEQUENCE) must still be running when the observation window closes. If
+this ever 'passes' quickly, the test above has stopped proving anything."
+  (multiple-value-bind (conn client server listener)
+      (%silent-peer-connection 1000 3)
+    (unwind-protect
+         (multiple-value-bind (finished result)
+             (%run-bounded
+              (lambda ()
+                (let ((buffer (make-array 1000 :element-type '(unsigned-byte 8))))
+                  (usocket:wait-for-input
+                   (bitcoin-lisp.networking::connection-socket conn)
+                   :timeout 2 :ready-only t)
+                  (read-sequence buffer
+                                 (bitcoin-lisp.networking::connection-stream conn))))
+              :limit 4)
+           (declare (ignore result))
+           (is-false finished
+                     "an unbounded read must still be blocked — otherwise the
+regression test above is vacuous"))
+      (usocket:socket-close client)
+      (usocket:socket-close server)
+      (usocket:socket-close listener))))
+
+(test sync-blockchain-survives-peers-that-never-handshake
+  "Peers exist but none reached :READY (all mid-handshake). FIND-BEST-PEER
+returns NIL and the old code handed that to the PEER-START-HEIGHT accessor,
+whose type error unwound the whole sync iteration — including the message pump
+that is the only thing which ever advances a handshake. A live node logged that
+error every five seconds for nineteen days."
+  (let ((node (bitcoin-lisp::make-node)))
+    (setf (bitcoin-lisp::node-peers node)
+          (list (bitcoin-lisp.networking:make-peer :state :connecting)
+                (bitcoin-lisp.networking:make-peer :state :handshaking)))
+    ;; Control: the precondition the bug needs must actually hold here.
+    (is (null (bitcoin-lisp::find-best-peer node))
+        "no peer is :READY, so this exercises the NIL path")
+    (is (= 0 (bitcoin-lisp::sync-blockchain node))
+        "the cycle is skipped cleanly instead of signalling a type error")))
+
+(test inbound-admission-counts-the-pending-handoff-queue
+  "Accepted peers wait in PENDING-INBOUND-PEERS until the sync thread merges
+them. Admission used to count only merged peers, so a stalled sync thread let
+the queue — and its file descriptors — grow without bound: the live wedge left
+751 sockets rotting in CLOSE-WAIT. Admission must count the backlog too."
+  (let ((node (bitcoin-lisp::make-node)))
+    ;; Control: an empty backlog admits.
+    (is-true (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.7"))
+    (setf (bitcoin-lisp::node-pending-inbound-peers node)
+          (loop repeat bitcoin-lisp::+max-inbound-peers+
+                collect (bitcoin-lisp.networking:make-peer :inbound t)))
+    (multiple-value-bind (allowed reason)
+        (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.7")
+      (is-false allowed "a full hand-off queue must stop admitting")
+      (is (eq :backlog reason)))))
+
+(test receive-bytes-tolerates-a-slow-but-progressing-peer
+  "TIMEOUT bounds stalling, not total transfer time. A peer that keeps
+delivering — here in slow dribbles that together outlast the timeout — must
+still complete its message. A total-time cap would look like a fix for the
+stall bug while quietly breaking block download over slow links, so this is the
+counterweight to the test above."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (client (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
+         (conn (bitcoin-lisp.networking::make-connection :socket server :connected t))
+         (total 600)
+         (sender (bt:make-thread
+                  (lambda ()
+                    ;; 6 dribbles, 0.4s apart: 2.4s total, well past the 1s
+                    ;; timeout, but never 1s without progress.
+                    (dotimes (i 6)
+                      (write-sequence
+                       (make-array (/ total 6) :element-type '(unsigned-byte 8)
+                                               :initial-element 9)
+                       (usocket:socket-stream client))
+                      (force-output (usocket:socket-stream client))
+                      (sleep 0.4))))))
+    (unwind-protect
+         (multiple-value-bind (finished result)
+             (%run-bounded (lambda ()
+                             (bitcoin-lisp.networking::receive-bytes
+                              conn total :timeout 1))
+                           :limit 15)
+           (is-true finished "the read must terminate")
+           (is (and result (= total (length result)))
+               "a peer that keeps making progress delivers its whole message")
+           (is-true (bitcoin-lisp.networking::connection-connected conn)
+                    "and keeps its connection"))
+      (ignore-errors (bt:join-thread sender))
+      (usocket:socket-close client)
+      (usocket:socket-close server)
+      (usocket:socket-close listener))))
+
+(test receive-bytes-idle-poll-does-not-disconnect
+  "The pump polls peers with a short timeout; a peer that is simply idle must
+survive it. Only a read that already consumed part of a message may kill the
+connection (the stream cannot be resynchronized after that) — getting this
+backwards would disconnect every quiet peer on every poll."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (client (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
+         (conn (bitcoin-lisp.networking::make-connection :socket server :connected t)))
+    (unwind-protect
+         (progn
+           ;; Nothing sent at all: a pure idle poll.
+           (is (null (bitcoin-lisp.networking::receive-bytes conn 24 :timeout 1)))
+           (is-true (bitcoin-lisp.networking::connection-connected conn)
+                    "an idle peer keeps its connection"))
+      (usocket:socket-close client)
+      (usocket:socket-close server)
+      (usocket:socket-close listener))))
+
+(test socks5-recv-bounds-a-proxy-that-stalls-mid-reply
+  "%SOCKS5-RECV was written to mirror RECEIVE-BYTES and inherited its defect:
+a proxy that answers partially and then goes quiet blocked inside READ-SEQUENCE
+forever, so the deadline the function computes could never be consulted again.
+An outbound connection attempt through a hostile or broken proxy must fail,
+not hang."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (client (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (proxy-side (usocket:socket-accept listener :element-type '(unsigned-byte 8))))
+    (unwind-protect
+         (progn
+           ;; The "proxy" sends one byte of a two-byte reply, then nothing.
+           (write-byte 5 (usocket:socket-stream proxy-side))
+           (force-output (usocket:socket-stream proxy-side))
+           (sleep 0.2)
+           (multiple-value-bind (finished result)
+               (%run-bounded
+                (lambda ()
+                  (handler-case
+                      (bitcoin-lisp.networking::%socks5-recv
+                       client 2
+                       (+ (get-internal-real-time)
+                          (* 1 internal-time-units-per-second))
+                       :test)
+                    (error () :failed-cleanly)))
+                :limit 8)
+             (is-true finished "the proxy read must terminate, not hang")
+             (is (eq :failed-cleanly result)
+                 "a stalled proxy reply is reported as an error")))
+      (usocket:socket-close client)
+      (usocket:socket-close proxy-side)
+      (usocket:socket-close listener))))
