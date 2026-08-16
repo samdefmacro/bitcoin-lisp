@@ -176,6 +176,10 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; solicited Phase-1 sync (sync-headers) and the generic announcement path
   ;; (ingest-headers-from-peer) — so they can never run two syncs at once.
   (headers-sync nil)
+  ;; Universal-time of our last getheaders to this peer, 0 = never (Core
+  ;; Peer::m_last_getheaders_timestamp). Throttles our own requests; cleared
+  ;; when a connecting headers message arrives, so the answer re-arms it.
+  (last-getheaders-time 0 :type integer)
   ;; Compact block support (BIP 152)
   (compact-block-version 0 :type (unsigned-byte 64))  ; 0=not supported, 1 or 2
   (compact-block-high-bandwidth nil :type boolean)    ; Peer selected US as high-bandwidth (Core m_bip152_highbandwidth_from)
