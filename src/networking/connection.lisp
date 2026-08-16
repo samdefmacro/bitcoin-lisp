@@ -57,7 +57,24 @@ pending — the pings themselves buffer up).")
   ;; Bytes sniffed ahead of the stream (inbound v1-vs-v2 detection reads 16
   ;; bytes before knowing which transport owns them); receive-bytes serves
   ;; these before touching the socket.
-  (pushback nil :type (or null (simple-array (unsigned-byte 8) (*)))))
+  (pushback nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  ;; --- Resumable receive state (Core CNode::vRecvMsg + Transport::ReceivedBytes)
+  ;; A message is read across as many pump passes as it takes: whatever has
+  ;; arrived is accumulated HERE and the reader returns :INCOMPLETE instead of
+  ;; waiting, so no peer can hold the shared pump while its message trickles in.
+  ;; RECV-BUFFER is the partially-filled vector for the read in progress and its
+  ;; length is that read's byte count; NIL means no read is in progress.
+  (recv-buffer nil :type (or null (simple-array (unsigned-byte 8) (*))))
+  (recv-filled 0 :type fixnum)
+  ;; When a byte last actually arrived for the read in progress. The only time
+  ;; the reader itself records: what counts as too long depends on who is
+  ;; waiting, so the budgets live with them (receive-bytes for a blocking call,
+  ;; connection-receive-expired-p for the pump).
+  (recv-last-progress 0 :type integer)
+  ;; The v1 message header, once its 24 bytes are in and parsed: the payload read
+  ;; that follows may itself span passes, so the framing state has to outlive the
+  ;; call that produced it.
+  (recv-header nil))
 
 ;;; Node-wide cumulative byte counters (survive individual connection
 ;;; lifetimes), for getnettotals. Bumped on every send/receive. Plain incf —
@@ -238,10 +255,15 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
       (error () nil)))
   (setf (connection-connected conn) nil)
   (setf (connection-socket conn) nil)
-  ;; Free any buffered unsent bytes.
+  ;; Free any buffered unsent bytes, and the partially-received message — the
+  ;; latter can be up to +max-message-payload+, so a closed connection still
+  ;; referenced anywhere would pin 4 MB.
   (setf (connection-send-queue-in conn) nil
         (connection-send-queue-out conn) nil
-        (connection-send-queue-bytes conn) 0))
+        (connection-send-queue-bytes conn) 0
+        (connection-recv-buffer conn) nil
+        (connection-recv-filled conn) 0
+        (connection-recv-header conn) nil))
 
 (defun connection-stream (conn)
   "Get the stream for a connection."
@@ -420,7 +442,7 @@ nothing was available, which at EOF is how the caller learns the peer closed
 nothing-yet-arrived are the same answer here — the caller distinguishes them by
 having been told the socket was readable).
 
-This is the whole reason RECEIVE-BYTES cannot use READ-SEQUENCE: READ-SEQUENCE
+This is the whole reason the readers cannot use READ-SEQUENCE: READ-SEQUENCE
 fills its whole range or hits EOF, and a socket stream that runs dry mid-range
 waits internally with no deadline of its own. LISTEN answers the only question
 that keeps the reader safe — is there a byte I can take without waiting — so
@@ -451,129 +473,231 @@ COUNT/+MIN-RECEIVE-BYTES-PER-SECOND+ and makes the attacker pay real bandwidth
 for every second of it.
 
 The rate is a straight trade against honest slow links, because a peer below it
-is dropped mid-message. 128 kbit/s is chosen to stay under plausible onion
-throughput — this node treats Tor as a first-class transport — at the cost of a
-looser bound (~4 minutes for a maximum-size message, and the attacker must send
-its whole 4,000,000 bytes to buy that). Core makes no such trade: it never
-drops a slow-but-progressing peer, because it never blocks on one. Closing that
-gap needs the resumable reader described on RECEIVE-BYTES, not a higher rate
-here — raising this constant buys a tighter DoS bound by disconnecting honest
-peers, which is the wrong side of the trade.")
+is dropped mid-read. 128 kbit/s is chosen to stay under plausible onion
+throughput — this node treats Tor as a first-class transport.
+
+Scope narrowed once the reader became resumable: this now bounds only the
+BLOCKING reads (RECEIVE-BYTES — the handshakes), where the node really is
+waiting. The pump no longer waits on anyone, so it applies
++RECEIVE-STALL-TIMEOUT-SECONDS+ instead and needs no rate floor at all — which
+is Core's position, reached the way Core reaches it: by never blocking on a
+peer rather than by picking a kinder number.")
+
+(defconstant +receive-stall-timeout-seconds+ 300
+  "How long a peer may deliver NOTHING toward a message it has already begun
+before the pump reaps it (CONNECTION-RECEIVE-EXPIRED-P).
+
+Generous on purpose, and the resumable reader is what makes that affordable.
+While the reader blocked, a stalled peer held the whole pump, so the bound had
+to be tight (a stall window plus a minimum byte rate) and every second of
+slack was a second of node-wide freeze. Now a stalled peer costs one connection
+slot and its partial buffer (=< +MAX-MESSAGE-PAYLOAD+) and nothing else, so the
+bound only has to stop the slot leaking — Core's shape, an inactivity timeout
+(20 minutes there) rather than a delivery-rate requirement.
+
+It must also stay well ABOVE the longest pump cycle. The budget is measured
+from the last byte that ARRIVED, and during IBD one cycle can be minutes of
+block validation across peers; a threshold near the cycle time would reap
+healthy peers whose remaining bytes are already sitting in our own receive
+buffer, unread. That failure mode is why this is not the pump's :timeout.")
+
+(defun %end-receive (conn)
+  "Clear the read in progress. The connection is untouched — callers decide
+whether it survives (see %ABANDON-RECEIVE)."
+  (setf (connection-recv-buffer conn) nil
+        (connection-recv-filled conn) 0
+        (connection-recv-header conn) nil)
+  nil)
+
+(defun %abandon-receive (conn)
+  "Drop the read in progress and the connection with it.
+
+THE framing rule, stated once here: bytes already consumed are gone, so the
+stream can never be resynchronised — a later read would parse payload bytes as
+a header, and every pass after that would eat 24 more bytes of garbage,
+forever. Any failure that has eaten part of a message, plus every EOF and I/O
+error (where the peer is gone anyway), must come here."
+  (%end-receive conn)
+  (setf (connection-connected conn) nil)
+  nil)
+
+(defun connection-receive-in-progress-p (conn)
+  "T once part of a message has been CONSUMED and the rest has not arrived.
+
+Deliberately not 'a buffer is allocated': a read that took nothing leaves the
+stream on a message boundary, so it is an ordinary idle poll, not a peer to
+reap or a framing hazard. Both the reap check and the give-up rule need exactly
+this distinction, so they share it."
+  (and (or (plusp (connection-recv-filled conn))
+           (connection-recv-header conn))
+       t))
+
+(defun %receive-gave-up (conn)
+  "End a read that ran out of its caller's budget: drop the connection if part
+of the message was consumed (see %ABANDON-RECEIVE), otherwise just clear the
+state — timing out having taken NOTHING is the ordinary idle poll, and getting
+that backwards would disconnect every quiet peer."
+  (if (connection-receive-in-progress-p conn)
+      (%abandon-receive conn)
+      (%end-receive conn)))
+
+(defun connection-receive-expired-p (conn)
+  "T when a peer began a message and has delivered nothing toward it for
++RECEIVE-STALL-TIMEOUT-SECONDS+.
+
+The pump must check this: a peer that sends a header and then goes silent
+produces no readable data, so the drain would skip it every cycle and the
+half-read message would sit there for the life of the connection. Check it
+AFTER draining, never before — bytes waiting in our own receive buffer mean the
+peer is not stalled at all, however long we took to get back to it."
+  (and (connection-receive-in-progress-p conn)
+       (> (- (get-internal-real-time) (connection-recv-last-progress conn))
+          (* +receive-stall-timeout-seconds+ internal-time-units-per-second))))
+
+(defun receive-bytes-resumable (conn count)
+  "Take whatever of COUNT bytes has arrived, WITHOUT waiting for the rest.
+
+Returns the completed byte vector, :INCOMPLETE if more passes are needed, or
+NIL on EOF / I/O error (the connection is dropped in that case).
+
+This is Core's model: `Transport::ReceivedBytes` folds in whatever the socket
+handed over and completed messages fall out; nothing ever blocks on a peer
+(net.cpp SocketHandlerConnected -> CNode::ReceiveMsgBytes). Partial data lives
+on the CONNECTION, so a 4 MiB block arriving in fragments costs this peer's turn
+in the pump and nothing more.
+
+Note what this does NOT do: time. It applies no deadline of its own, because the
+right budget depends on who is waiting — the blocking wrapper bounds one call's
+wait, the pump bounds peer silence (CONNECTION-RECEIVE-EXPIRED-P). Enforcing a
+per-read deadline here charged peers for OUR scheduling delay, which reaped
+healthy peers whenever a pump cycle ran long."
+  (handler-case
+      (let ((socket (connection-socket conn))
+            (stream (connection-stream conn))
+            (now (get-internal-real-time)))
+        (unless socket
+          (return-from receive-bytes-resumable nil))
+        ;; Start of a read: allocate the accumulator. A count that disagrees
+        ;; with a read already in progress is a framing bug in the caller, not
+        ;; a peer fault — refuse rather than mix two reads.
+        (unless (connection-recv-buffer conn)
+          (setf (connection-recv-buffer conn)
+                (make-array count :element-type '(unsigned-byte 8))
+                (connection-recv-filled conn) 0
+                (connection-recv-last-progress conn) now))
+        (let ((buffer (connection-recv-buffer conn))
+              (filled (connection-recv-filled conn)))
+          (when (/= (length buffer) count)
+            (bitcoin-lisp:log-error
+             "Receive state mismatch: ~D bytes in progress, asked for ~D — dropping connection"
+             (length buffer) count)
+            (return-from receive-bytes-resumable (%abandon-receive conn)))
+          ;; Serve sniffed-ahead bytes (inbound v1/v2 detection) first.
+          (let ((pushback (connection-pushback conn)))
+            (when pushback
+              (let ((n (min (- count filled) (length pushback))))
+                (replace buffer pushback :start1 filled :end2 n)
+                (incf filled n)
+                (setf (connection-pushback conn)
+                      (when (< n (length pushback)) (subseq pushback n))))))
+          ;; Take what the socket already holds. Never waits: drain-available-bytes
+          ;; is bounded by LISTEN, and we do not call wait-for-input at all.
+          (when (< filled count)
+            (let ((n (drain-available-bytes stream buffer filled count)))
+              (when (= n filled)
+                ;; Nothing taken. EOF is the only reading of "readable, yet
+                ;; empty" — but only after a SECOND drain comes back empty too:
+                ;; LISTEN and the select below are separate syscalls, and a
+                ;; segment landing between them would otherwise read as a
+                ;; hangup and silently kill a healthy peer.
+                (when (and (data-available-p conn)
+                           (= (drain-available-bytes stream buffer filled count)
+                              filled))
+                  (return-from receive-bytes-resumable (%abandon-receive conn))))
+              (when (> n filled)
+                (setf (connection-recv-last-progress conn) now))
+              (setf filled n)))
+          (setf (connection-recv-filled conn) filled)
+          (cond
+            ((= filled count)
+             (incf (connection-bytes-received conn) count)
+             (incf *total-bytes-received* count)
+             ;; Read finished: clear the accumulator so the next one starts
+             ;; clean. RECV-HEADER belongs to the caller's framing and is
+             ;; cleared there, so %END-RECEIVE is not what we want here.
+             (setf (connection-last-activity conn) (get-universal-time)
+                   (connection-last-recv-time conn) (get-universal-time)
+                   (connection-recv-buffer conn) nil
+                   (connection-recv-filled conn) 0)
+             buffer)
+            (t :incomplete))))
+    ;; A dead socket surfaces as any of several conditions, so the net is wide —
+    ;; but a wide net also swallows OUR bugs as "the peer went away". A type
+    ;; error in this function once looked exactly like every peer hanging up at
+    ;; once; say so instead of hiding it.
+    (error (c)
+      (unless (typep c '(or stream-error usocket:socket-condition end-of-file))
+        (bitcoin-lisp:log-warn "Receive failed on ~A:~D with a non-I/O error: ~A"
+                               (connection-host conn) (connection-port conn) c))
+      (%abandon-receive conn))))
 
 (defun receive-bytes (conn count &key (timeout 30))
-  "Receive exactly COUNT bytes from the connection.
-Returns a byte vector or NIL on failure/timeout.
+  "Receive exactly COUNT bytes, WAITING for them. Returns a byte vector, or NIL
+on failure/timeout.
 
-Two bounds apply, and a peer must satisfy both. TIMEOUT bounds STALLING: it is
-measured from the last byte that actually arrived, so a slow-but-progressing
-peer can keep delivering (Core's inactivity-timeout shape) while a peer that
-stops mid-message is dropped. +MIN-RECEIVE-BYTES-PER-SECOND+ additionally
-bounds the TOTAL, because a stall bound by itself is renewable by dribbling.
+The blocking face of RECEIVE-BYTES-RESUMABLE, for the conversations that are
+inherently synchronous — the version/verack handshake and the BIP324 handshake,
+where nothing else can proceed until the peer answers. The shared message pump
+must NOT use this: that is what let one peer's trickling message stall every
+other peer (the 2026-08-11 freeze), and the resumable entry point exists to
+remove exactly that.
 
-Residual limitation, unchanged by these bounds: this reader is synchronous, so
-one peer still owns the shared message pump for the duration of its message.
-Core avoids that entirely by accumulating partial messages per connection
-(CNode::vRecvMsg) and never blocking on any peer. Making our reader resumable
-the same way is the real fix; these bounds only make the worst case finite."
-  (handler-case
-      (let ((socket (connection-socket conn)))
-        (when socket
-          (let* ((stream (connection-stream conn))
-                 (buffer (make-array count :element-type '(unsigned-byte 8)))
-                 (total-read 0)
-                 (last-progress (get-internal-real-time))
-                 ;; Whole-message budget: one stall window for latency and
-                 ;; scheduling, PLUS the time the message's own size deserves at
-                 ;; the floor rate (see +MIN-RECEIVE-BYTES-PER-SECOND+). Both
-                 ;; terms are needed — size alone gives a 24-byte header a
-                 ;; sub-millisecond budget, and TIMEOUT alone gives a 4 MiB
-                 ;; block the same budget as that header.
-                 (hard-deadline (+ (get-internal-real-time)
-                                   (* (+ timeout
-                                         (/ count +min-receive-bytes-per-second+))
-                                      internal-time-units-per-second))))
-            ;; Serve sniffed-ahead bytes (inbound v1/v2 detection) first.
-            (let ((pushback (connection-pushback conn)))
-              (when pushback
-                (let ((n (min count (length pushback))))
-                  (replace buffer pushback :end2 n)
-                  (setf total-read n
-                        (connection-pushback conn)
-                        (when (< n (length pushback)) (subseq pushback n))))))
-            ;; Read until we have all bytes or timeout
-            (loop while (< total-read count)
-                  ;; Bail promptly on shutdown: a blocked peer read (message wait
-                  ;; or handshake) must not pin the sync thread for the full
-                  ;; :timeout while stop-node waits to join it. Checked each
-                  ;; iteration (wait-for-input below is capped at 5s chunks), so
-                  ;; abort latency is <=5s instead of up to :timeout.
-                  do (when *ibd-stop-requested*
-                       ;; Same framing rule as the timeout path below: bytes
-                       ;; already consumed are dropped on the floor, so a
-                       ;; partially-read message leaves the stream unusable.
-                       (when (plusp total-read)
-                         (setf (connection-connected conn) nil))
-                       (return-from receive-bytes nil))
-                     (let ((time-left
-                             (min
-                              ;; stall bound: since the last byte that arrived
-                              (- timeout
-                                 (/ (- (get-internal-real-time) last-progress)
-                                    internal-time-units-per-second))
-                              ;; total bound: dribbling must not renew forever
-                              (/ (- hard-deadline (get-internal-real-time))
-                                 internal-time-units-per-second))))
-                       (when (<= time-left 0)
-                         ;; Out of budget. If we already consumed part of a
-                         ;; message those bytes are gone and the caller is told
-                         ;; "failed", so the stream can never be resynchronized:
-                         ;; a later read would parse payload bytes as a header.
-                         ;; Kill the connection in that case only — a timeout
-                         ;; with NOTHING consumed is the ordinary idle poll and
-                         ;; must leave the peer alone.
-                         (when (plusp total-read)
-                           (setf (connection-connected conn) nil))
-                         (return-from receive-bytes nil))
-                       ;; Wait for data, but only up to a 5s sub-window at a
-                       ;; time. A not-ready result is NOT treated as failure:
-                       ;; another thread's foreign call (secp256k1) can trigger
-                       ;; a GC safepoint whose signal interrupts the underlying
-                       ;; select() with EINTR, which usocket surfaces as
-                       ;; not-ready. We simply re-wait until the real deadline;
-                       ;; genuine silence is caught by the time-left check above.
-                       (when (usocket:wait-for-input socket
-                                                     :timeout (max 0.1 (min time-left 5.0))
-                                                     :ready-only t)
-                         ;; Socket claims to be ready — take only what is
-                         ;; actually there. READ-SEQUENCE would instead insist on
-                         ;; the FULL remaining message: wait-for-input promises
-                         ;; just one readable byte, so a peer that announces a
-                         ;; 4 MiB payload and then goes quiet used to pin this
-                         ;; thread in poll() FOREVER — and the message pump is
-                         ;; serial, so that was the whole node's networking.
-                         ;; Proven live: a node sat frozen for 5 days with 751
-                         ;; sockets rotting in CLOSE-WAIT and not one error
-                         ;; logged.
-                         (let ((n (drain-available-bytes stream buffer
-                                                         total-read count)))
-                           (when (= n total-read)
-                             ;; Readable but nothing to take: EOF, i.e. the peer
-                             ;; closed. (The old code reached the same
-                             ;; conclusion from read-sequence making no
-                             ;; progress.)
-                             (setf (connection-connected conn) nil)
-                             (return-from receive-bytes nil))
-                           (setf total-read n
-                                 last-progress (get-internal-real-time))))))
-            (when (= total-read count)
-              (incf (connection-bytes-received conn) count)
-              (incf *total-bytes-received* count)
-              (setf (connection-last-activity conn) (get-universal-time)
-                    (connection-last-recv-time conn) (get-universal-time))
-              buffer))))
-    (error ()
-      (setf (connection-connected conn) nil)
-      nil)))
+Framing semantics are the resumable reader's; the BUDGET is this function's,
+because it is the one doing the waiting. Both bounds a peer must satisfy live
+here: TIMEOUT is the stall window since the last byte that actually arrived, and
++MIN-RECEIVE-BYTES-PER-SECOND+ additionally bounds the whole call, since a stall
+window alone is renewable by dribbling one byte per window. The pump does not
+use these — a peer that stalls it costs nothing now, so it applies the far more
+generous +RECEIVE-STALL-TIMEOUT-SECONDS+ instead."
+  (let ((socket (connection-socket conn))
+        (deadline (+ (get-internal-real-time)
+                     ;; One stall window for latency and scheduling, PLUS the
+                     ;; time this read's size deserves at the floor rate. Both
+                     ;; terms are needed: size alone gives a 24-byte header a
+                     ;; sub-millisecond budget, TIMEOUT alone gives a 4 MiB
+                     ;; block the same budget as that header.
+                     (round (* (+ timeout (/ count +min-receive-bytes-per-second+))
+                               internal-time-units-per-second)))))
+    (unless socket
+      (return-from receive-bytes nil))
+    (loop
+      (let ((result (receive-bytes-resumable conn count)))
+        (unless (eq result :incomplete)
+          ;; Completed, or failed and already abandoned.
+          (return result)))
+      (when (or
+             ;; Bail promptly on shutdown: a blocked handshake read must not pin
+             ;; the sync thread for the full budget while stop-node waits to
+             ;; join it. Checked every sub-window, so abort latency is ~0.5s.
+             *ibd-stop-requested*
+             ;; Another thread (a send failure on the RPC ping path) may have
+             ;; declared this connection dead. Without this the loop spins at
+             ;; 100% CPU: wait-for-input returns ready on a dead socket, the
+             ;; drain yields nothing, and data-available-p — which itself tests
+             ;; connection-connected — can no longer see the EOF.
+             (not (connection-connected conn))
+             ;; Whole-call bound, then the stall window since the last byte.
+             (> (get-internal-real-time) deadline)
+             (> (- (get-internal-real-time) (connection-recv-last-progress conn))
+                (* timeout internal-time-units-per-second)))
+        (return (%receive-gave-up conn)))
+      ;; Wait in sub-windows. A not-ready result is NOT failure: another
+      ;; thread's foreign call (secp256k1) can trigger a GC safepoint whose
+      ;; signal interrupts the underlying select() with EINTR, which usocket
+      ;; surfaces as not-ready. Re-wait; the budget above ends genuine silence.
+      (handler-case
+          (usocket:wait-for-input socket :timeout 0.5 :ready-only t)
+        (error () (return (%receive-gave-up conn)))))))
 
 (defun data-available-p (conn &key (timeout 0))
   "Check if data is available to read on the connection."

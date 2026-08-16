@@ -2575,7 +2575,7 @@ Downloads headers and blocks up to MAX-BLOCKS."
   (let ((blocks-received 0))
     (loop while (< blocks-received max-blocks)
           do (multiple-value-bind (command payload)
-                 (receive-message peer :timeout 60)
+                 (receive-message-blocking peer :timeout 60)
                (unless command
                  (return-from sync-with-peer blocks-received))
                (handle-message peer command payload
