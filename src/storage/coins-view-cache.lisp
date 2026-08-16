@@ -53,7 +53,16 @@
   ;; CCoinsViewCache::cachedCoinsUsage. Maintained incrementally at every entry
   ;; mutation and reset on flush; drives the node's size-based flush so the cache
   ;; stays bounded (Core dbcache). See cache-entry-mem-bytes.
-  (mem-bytes 0 :type fixnum))
+  (mem-bytes 0 :type fixnum)
+  ;; The block this cached UTXO state corresponds to — Core's
+  ;; CCoinsViewCache::hashBlock, moved by SetBestBlock inside ConnectBlock and
+  ;; DisconnectBlock (validation.cpp:2651, :2242). Tracking it HERE rather than
+  ;; reading the chain's tip at flush time is the whole point: during a reorg's
+  ;; disconnect phase the chain tip still names the old tip while these coins
+  ;; are being rewound, so a flush that asked the chain would stamp a hash the
+  ;; coins no longer match. NIL until the first block-level mutation or a load
+  ;; from disk.
+  (best-block nil :type (or null (simple-array (unsigned-byte 8) (32)))))
 
 (defconstant +coins-cache-entry-overhead-bytes+ 200
   "Fixed per-entry memory estimate for a cached coin (SBCL hash bucket +
@@ -79,6 +88,18 @@ Coin::DynamicMemoryUsage = DynamicUsage(scriptPubKey)). NIL (spent) is 0."
 the cache's lifecycle (e.g. the node) use this to close the LevelDB
 on shutdown."
   (cvc-base cache))
+
+(defun coins-view-cache-load-best-block (cache)
+  "Adopt the base DB's recorded best block as this cache's starting pointer.
+
+Call once after opening. Without it a freshly-opened cache reports NIL until
+the first block-level mutation, so a flush in between (a shutdown flush, say)
+would leave the stored pointer untouched while the coins moved. Returns the
+hash, or NIL for a database written before the pointer existed."
+  (declare (type coins-view-cache cache))
+  (let ((recorded (coins-view-db-best-block (cvc-base cache))))
+    (when recorded
+      (setf (cvc-best-block cache) (copy-seq recorded)))))
 
 (defun coins-view-cache-compact (cache)
   "Full-compact the LevelDB backing CACHE (leveldb-compact over the whole
@@ -210,17 +231,19 @@ erased."
         (cvc-mem-bytes cache) 0)
   (coins-view-db-erase-all-coins (cvc-base cache)))
 
-(defun coins-view-cache-flush (cache &key sync best-block)
+(defun coins-view-cache-flush (cache &key sync (best-block (cvc-best-block cache)))
   "Commit all dirty entries to the base view in a single atomic batch
 then clear the cache. SYNC=T forces fsync. Returns the number of
 entries written (puts + erases).
 
-BEST-BLOCK, when supplied, is the block hash this UTXO state corresponds to and
-is staged in the SAME batch as the coin changes, so the two commit or fail
-together (Core's CCoinsViewDB::BatchWrite, txdb.cpp:100-159). Callers that do
-not know their tip may omit it; the pointer then keeps its previous value
-rather than going stale-but-plausible, which is why it is optional rather than
-defaulted to something invented here."
+BEST-BLOCK is the block hash this UTXO state corresponds to and is staged in
+the SAME batch as the coin changes, so the two commit or fail together (Core's
+CCoinsViewDB::BatchWrite, txdb.cpp:100-159). It defaults to the cache's OWN
+pointer, which block application and disconnection maintain — deliberately not
+to the chain's current tip, which disagrees with these coins for the whole of a
+reorg's disconnect phase and would stamp a hash the coins no longer match. A
+cache that has seen no block-level mutation has NIL and the stored pointer is
+left untouched rather than invented."
   (declare (type coins-view-cache cache))
   (let ((count 0))
     (with-coins-view-batch (batch (cvc-base cache) :sync sync)
@@ -572,7 +595,14 @@ data — (txid index entry) for each spent UTXO, in apply order."
                              (setf (utxo-set-dirty view) t)))))
        (nreverse spent)))
     (coins-view-cache
-     (coin-view-apply-block view block height))))
+     (multiple-value-prog1
+         (coin-view-apply-block view block height)
+       ;; These coins now correspond to THIS block — Core's ConnectBlock ends
+       ;; with SetBestBlock(pindex->GetBlockHash()) (validation.cpp:2651). The
+       ;; header caches its hash, so this costs nothing on the hot path.
+       (setf (cvc-best-block view)
+             (copy-seq (bitcoin-lisp.serialization:block-header-hash
+                        (bitcoin-lisp.serialization:bitcoin-block-header block))))))))
 
 (defun utxo-count (view)
   "Polymorphic UTXO count. For utxo-set, exact. For coins-view-cache,
@@ -613,7 +643,16 @@ production store, so the size trigger never fires for it."
                do (remhash (make-utxo-key txid out-idx)
                            (utxo-set-entries view))))))
     (coins-view-cache
-     (coin-view-disconnect-block view block previous-utxos))))
+     (coin-view-disconnect-block view block previous-utxos)
+     ;; These coins now correspond to the PARENT block — Core's
+     ;; DisconnectBlock ends with SetBestBlock(pindex->pprev->GetBlockHash())
+     ;; (validation.cpp:2242), and hashPrevBlock is that same hash. Moving the
+     ;; pointer here, with the coins, is what keeps a flush honest partway
+     ;; through a reorg's disconnect phase, when the chain's tip still names the
+     ;; block we are rewinding away from.
+     (setf (cvc-best-block view)
+           (copy-seq (bitcoin-lisp.serialization:block-header-prev-block
+                      (bitcoin-lisp.serialization:bitcoin-block-header block)))))))
 
 ;;;; Polymorphic iteration + full-set statistics.
 ;;;;

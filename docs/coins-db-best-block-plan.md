@@ -73,8 +73,24 @@ Aligning removes the second artifact instead of policing it.
 | Phase | Change | Status |
 |---|---|---|
 | **P1** | Coins DB records its own best block, written **in the same batch** as the coin puts/erases; read back on open; startup compares it against `chainstate.dat` and reports a mismatch loudly | **DONE** |
-| **P2** | `DB_HEAD_BLOCKS` equivalent + a `ReplayBlocks` equivalent: roll the coins DB backward/forward to the intended tip on startup instead of trusting or refusing | not started |
-| **P3** | `SetBestBlock` per block in both connect and disconnect paths so the pair moves together, and cooperative shutdown (interrupt flag checked between blocks) replacing the `destroy-thread` fallback | not started |
+| **P2** | `SetBestBlock` per block in both the connect and disconnect paths, so the pointer moves WITH the coins; the flush stamps the cache's own pointer rather than the chain's tip | **DONE** |
+| **P3** | Startup reconciliation when the pointer and `chainstate.dat` disagree (roll the coins forward/backward, Core's `ReplayBlocks`), and cooperative shutdown (interrupt flag checked between blocks) retiring the `destroy-thread` fallback | not started |
+
+Phase order was corrected while implementing: per-block `SetBestBlock` had to
+come FIRST. Without it the flush stamps whatever the caller believes the tip is,
+which for the whole of a reorg's disconnect phase is the block being rewound
+away from — so the pointer records a falsehood, and the P1 startup check
+compares two copies of the same wrong answer and reports agreement. Only once
+the pointer is honest does reconciling it with `chainstate.dat` mean anything.
+
+**We do NOT need Core's `DB_HEAD_BLOCKS`.** That marker exists because
+`CCoinsViewDB::BatchWrite` splits a large flush across several `WriteBatch`
+commits (`batch_write_bytes`), leaving a window where neither the old nor the
+new tip describes the database. Our `coins-view-cache-flush` commits exactly
+one atomic `WriteBatch`, so that window does not exist. The one multi-batch
+writer we do have is the assumeutxo snapshot loader, which writes into a
+separate `chainstate_snapshot/` directory and validates the set hash before
+promotion — an interrupted load is discarded rather than mistaken for state.
 
 P1 is additive and safe on its own: a new key nothing yet depends on, plus a
 diagnostic. P2 is what makes an interrupted flush recoverable. P3 is what closes
