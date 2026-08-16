@@ -740,7 +740,14 @@ UTXO set, then with :in-transition nil after to complete the commit."
   :inconsistent  — chainstate has the in-transition flag set; the previous
                    flush was interrupted between Phase 1 and Phase 3.
                    Caller must abort and require re-sync.
-  NIL            — no chainstate exists or the file failed CRC verification.
+  :corrupt       — the file EXISTS but no format validated (failed CRC, or a
+                   size no version recognizes). Distinct from NIL on purpose:
+                   the UTXO set on disk belongs to a tip we can no longer
+                   identify, so the caller must refuse to run. Treating this
+                   as NIL meant replaying from genesis over a populated UTXO
+                   set, which on mainnet trips the BIP30 duplicate-txid check
+                   and leaves the node with no best-valid-tip at all.
+  NIL            — no chainstate file exists (a legitimate first run).
 
 v3 (45 bytes): payload(41) + CRC(4)
 v2 (44 bytes): payload(40) + CRC(4) — pre-flag fallback
@@ -779,23 +786,26 @@ v1 (36/40 bytes): no CRC — legacy fallback"
             (setf (chain-state-pruned-height state)
                   (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
           (return-from load-state t))))
-    ;; Legacy fallback: pre-CRC format (36 or 40 bytes total).
+    ;; Legacy fallback: pre-CRC format (36 or 40 bytes total). This format
+    ;; carries no integrity check at all, so it can only be trusted by size;
+    ;; anything else is corruption, not an older version.
     (with-open-file (stream path :direction :input :element-type '(unsigned-byte 8))
       (let ((file-size (file-length stream)))
-        (when (or (= file-size 36) (= file-size 40))
-          (let ((hash (make-array 32 :element-type '(unsigned-byte 8))))
-            (read-sequence hash stream)
-            (setf (chain-state-best-block-hash state) hash))
+        (unless (or (= file-size 36) (= file-size 40))
+          (return-from load-state :corrupt))
+        (let ((hash (make-array 32 :element-type '(unsigned-byte 8))))
+          (read-sequence hash stream)
+          (setf (chain-state-best-block-hash state) hash))
+        (let ((b0 (read-byte stream)) (b1 (read-byte stream))
+              (b2 (read-byte stream)) (b3 (read-byte stream)))
+          (setf (chain-state-best-height state)
+                (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
+        (when (= file-size 40)
           (let ((b0 (read-byte stream)) (b1 (read-byte stream))
                 (b2 (read-byte stream)) (b3 (read-byte stream)))
-            (setf (chain-state-best-height state)
-                  (logior b0 (ash b1 8) (ash b2 16) (ash b3 24))))
-          (when (= file-size 40)
-            (let ((b0 (read-byte stream)) (b1 (read-byte stream))
-                  (b2 (read-byte stream)) (b3 (read-byte stream)))
-              (setf (chain-state-pruned-height state)
-                    (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))))
-          t)))))
+            (setf (chain-state-pruned-height state)
+                  (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))))
+        t))))
 
 ;;; Header Index Persistence
 
