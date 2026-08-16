@@ -272,13 +272,14 @@ otherwise reject the synthetic make-reorg-test-block blocks)."
 ;; direct-connect-block path (older tests) and the activate-block / full
 ;; validate-block path (these tests) without per-test duplication.
 
-(defun %make-activate-block-fixture (suffix)
+(defun %make-activate-block-fixture (suffix &optional view)
   "Returns (values chain-state utxo-set block-store genesis-hash). The
 genesis index entry has a dummy header so validate-block's MTP walk
-doesn't trip on a NIL header."
+doesn't trip on a NIL header. VIEW overrides the default in-memory
+utxo-set (pass a coins-view-cache to exercise the LevelDB surface)."
   (let* ((base-path (%use-activate-block-test-base-path suffix))
          (chain-state (bitcoin-lisp.storage:init-chain-state base-path))
-         (utxo-set (bitcoin-lisp.storage:make-utxo-set))
+         (utxo-set (or view (bitcoin-lisp.storage:make-utxo-set)))
          (block-store (bitcoin-lisp.storage:init-block-store base-path))
          (genesis-hash (bitcoin-lisp.storage:best-block-hash chain-state))
          (genesis-header
@@ -2632,4 +2633,185 @@ The reorg must refuse and reconsiderblock report :reorg-failed."
          (is (eq :reorg-failed reason)))
        (is (equalp a1-hash (bitcoin-lisp.storage:best-block-hash cs)))
        (is (= 1 (bitcoin-lisp.storage:current-height cs)))
+       (clrhash bitcoin-lisp.validation::*block-undo-data*)))))
+
+;;;; Cooperative stop inside a reorg (coins-DB alignment plan, phase 3b)
+;;;;
+;;;; Core checks m_chainman.m_interrupt BETWEEN ActivateBestChainStep calls
+;;;; (validation.cpp:3514) and never force-terminates its validation thread.
+;;;; perform-reorg now does the same: on a stop request it TRUNCATES at the next
+;;;; block boundary — where the coins, the coins-DB best-block pointer and the
+;;;; chain tip can all be left naming one block — instead of running to
+;;;; completion (shutdown waits out a deep reorg, then destroy-threads it) or
+;;;; rolling back (minutes of work that is itself interruptible).
+;;;;
+;;;; The tests interrupt by binding bitcoin-lisp:*interrupt-check* — the same seam
+;;;; the networking layer installs the real stop flag into — and choose WHERE it
+;;;; fires with a predicate over observable state (UTXO count / coins pointer /
+;;;; tip) rather than a call counter, so an extra or missing check cannot silently
+;;;; move the assertion.
+
+(defun %p3b-reorg-fixture (suffix &optional view)
+  "Active chain genesis -> A1 -> A2 -> A3 applied to VIEW, plus a competing fork
+genesis -> B1 -> B2 -> B3 that is stored and indexed but NOT applied (equal work
+per block, so connect-block leaves it inactive). VIEW defaults to a plain
+utxo-set; pass a coins-view-cache to exercise the best-block pointer.
+Returns (values chain-state view block-store a-entries b-entries)."
+  (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+      (%make-activate-block-fixture suffix view)
+    (values chain-state utxo-set block-store
+            (mapcar #'cdr (%build-and-connect chain-state block-store utxo-set
+                                              genesis-hash
+                                              (make-test-chain-hashes #xA0 3)))
+            (mapcar #'cdr (%build-and-connect chain-state block-store utxo-set
+                                              genesis-hash
+                                              (make-test-chain-hashes #xB0 3))))))
+
+(defun %p3b-coinbase-in-utxo-set-p (view block-store entry)
+  "T if ENTRY's block contributed its coinbase output to VIEW — i.e. that block
+is currently CONNECTED. Reads the block back from the store so the txid is the
+post-round-trip one the UTXO set is actually keyed by."
+  (let ((block (bitcoin-lisp.storage:get-block
+                block-store (bitcoin-lisp.storage:block-index-entry-hash entry))))
+    (and block
+         (bitcoin-lisp.storage:utxo-exists-p
+          view
+          (bitcoin-lisp.serialization:transaction-hash
+           (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+          0))))
+
+(test interrupt-check-is-wired-to-the-node-stop-flag
+  "The seam must actually be INSTALLED. perform-reorg polls
+bitcoin-lisp:interrupt-requested-p, and every truncation test below binds its own
+predicate into *interrupt-check* — so if connection.lisp ever stopped installing
+the real stop flag, reorgs would silently become uninterruptible again and every
+other test here would stay green."
+  (is (null (bitcoin-lisp:interrupt-requested-p))
+      "no stop requested: the installed predicate must say so")
+  (let ((bitcoin-lisp.networking::*ibd-stop-requested* t))
+    (is (bitcoin-lisp:interrupt-requested-p)
+        "the node-wide stop flag must reach the validation layer")))
+
+(test reorg-completes-when-no-stop-is-requested
+  "CONTROL for the two truncation tests below: the same fixture and the same
+perform-reorg call, with no stop request, must run the whole reorg — otherwise
+those tests could pass on a reorg that never worked at all."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store a-entries b-entries)
+       (%p3b-reorg-fixture "p3b-control")
+     (is (eq t (bitcoin-lisp.validation:perform-reorg
+                chain-state block-store utxo-set
+                (third a-entries) (third b-entries) :skip-scripts t)))
+     (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+     (is (equalp (bitcoin-lisp.storage:block-index-entry-hash (third b-entries))
+                 (bitcoin-lisp.storage:best-block-hash chain-state)))
+     ;; Chain A's three coinbases out, chain B's three in.
+     (is (= 3 (bitcoin-lisp.storage:utxo-count utxo-set)))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test reorg-stop-truncates-the-disconnect-at-a-block-boundary
+  "A stop request during PHASE A must stop the disconnect on a block boundary and
+leave the chain tip on the block the COINS reached — not on the old tip, which is
+the state the whole phase is otherwise free to contradict. Before this, PHASE A
+rewound the UTXO set for its entire duration without touching the tip, so a
+shutdown (or the 600s destroy-thread fallback) landed mid-phase and persisted a
+UTXO set that did not match the recorded tip."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store a-entries b-entries)
+       (%p3b-reorg-fixture "p3b-disconnect")
+     (let* ((a1 (first a-entries))
+            ;; Fires at the top of the A1 iteration: A3 and A2 are already
+            ;; disconnected (3 coinbases -> 1), A1's are still there.
+            (bitcoin-lisp:*interrupt-check*
+              (lambda () (= 1 (bitcoin-lisp.storage:utxo-count utxo-set)))))
+       (multiple-value-bind (ok detail)
+           (bitcoin-lisp.validation:perform-reorg
+            chain-state block-store utxo-set
+            (third a-entries) (third b-entries) :skip-scripts t)
+         (is (null ok))
+         (is (eq :interrupted detail)))
+       ;; Tip follows the coins: both are at A1.
+       (is (= 1 (bitcoin-lisp.storage:current-height chain-state)))
+       (is (equalp (bitcoin-lisp.storage:block-index-entry-hash a1)
+                   (bitcoin-lisp.storage:best-block-hash chain-state)))
+       (is (= 1 (bitcoin-lisp.storage:utxo-count utxo-set)))
+       ;; The two disconnected blocks were downgraded; A1, still connected,
+       ;; was not. (No claim about the B entries' status: connect-block stamps
+       ;; a stored competing-fork block :valid, so status says nothing here —
+       ;; the UTXO count above is what proves the fork never connected.)
+       (is (zerop (count :valid (rest a-entries)
+                         :key #'bitcoin-lisp.storage:block-index-entry-status)))
+       (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status a1)))
+       (is (not (%p3b-coinbase-in-utxo-set-p utxo-set block-store (first b-entries)))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test reorg-stop-truncates-the-connect-without-rolling-back
+  "A stop request during PHASE B must stop after the last fully connected fork
+block and leave the chain there. It must NOT run %rollback-partial-reorg: that is
+minutes of interruptible work whose only purpose is to reach a consistent chain,
+and a block boundary in PHASE B already IS one (the tip advances per connected
+block). The next start simply reorgs the rest of the way."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store a-entries b-entries)
+       (%p3b-reorg-fixture "p3b-connect")
+     (let* ((b2-hash (bitcoin-lisp.storage:block-index-entry-hash (second b-entries)))
+            ;; Fires at the top of the B3 iteration: B1 and B2 are connected and
+            ;; the tip has advanced to B2. The tip never equals B2 during PHASE A
+            ;; (it is the old tip A3 throughout, then the fork point), so this
+            ;; cannot fire early.
+            (bitcoin-lisp:*interrupt-check*
+              (lambda ()
+                (equalp b2-hash (bitcoin-lisp.storage:best-block-hash chain-state)))))
+       (multiple-value-bind (ok detail)
+           (bitcoin-lisp.validation:perform-reorg
+            chain-state block-store utxo-set
+            (third a-entries) (third b-entries) :skip-scripts t)
+         (is (null ok))
+         (is (eq :interrupted detail)))
+       ;; Parked on B2 — the fork's blocks that DID connect stay connected.
+       (is (= 2 (bitcoin-lisp.storage:current-height chain-state)))
+       (is (equalp b2-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+       (is (= 2 (bitcoin-lisp.storage:utxo-count utxo-set)))
+       ;; The rollback would have put us back on A3 with A's coinbases restored.
+       (is (not (equalp (bitcoin-lisp.storage:block-index-entry-hash (third a-entries))
+                        (bitcoin-lisp.storage:best-block-hash chain-state))))
+       ;; B2 connected, B3 did not — the truncation is exactly one block deep.
+       (is (%p3b-coinbase-in-utxo-set-p utxo-set block-store (second b-entries)))
+       (is (not (%p3b-coinbase-in-utxo-set-p utxo-set block-store (third b-entries)))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test reorg-stop-leaves-the-coins-pointer-and-the-tip-naming-one-block
+  "The whole point of truncating on a boundary: the coins-DB best-block pointer
+(phase 2) and the in-memory chain tip must name the SAME block afterwards, so the
+shutdown flush persists a consistent pair and startup reconciliation (phase 3a)
+has nothing to repair. Run against a real coins-view-cache, where the pointer
+actually exists."
+  (%with-mainnet-network
+   (bitcoin-lisp.storage:with-coins-view-db
+       (base (ensure-directories-exist
+              (merge-pathnames "coins/"
+                               (%use-activate-block-test-base-path "p3b-pointer"))))
+     (let ((cache (bitcoin-lisp.storage:make-coins-view-cache base)))
+       (multiple-value-bind (chain-state view block-store a-entries b-entries)
+           (%p3b-reorg-fixture "p3b-pointer" cache)
+         (let* ((a1-hash (bitcoin-lisp.storage:block-index-entry-hash (first a-entries)))
+                ;; Fires once the coins have been rewound to A1 — expressed over
+                ;; the pointer itself, which is the thing under test.
+                (bitcoin-lisp:*interrupt-check*
+                  (lambda ()
+                    (equalp a1-hash (bitcoin-lisp.storage::cvc-best-block view)))))
+           ;; Control: before the reorg the pointer names the old tip A3.
+           (is (equalp (bitcoin-lisp.storage:block-index-entry-hash (third a-entries))
+                       (bitcoin-lisp.storage::cvc-best-block view)))
+           (multiple-value-bind (ok detail)
+               (bitcoin-lisp.validation:perform-reorg
+                chain-state block-store view
+                (third a-entries) (third b-entries) :skip-scripts t)
+             (is (null ok))
+             (is (eq :interrupted detail)))
+           (is (equalp a1-hash (bitcoin-lisp.storage::cvc-best-block view)))
+           (is (equalp (bitcoin-lisp.storage::cvc-best-block view)
+                       (bitcoin-lisp.storage:best-block-hash chain-state))
+               "the coins pointer and the chain tip must name one block")
+           (is (= 1 (bitcoin-lisp.storage:current-height chain-state)))))
        (clrhash bitcoin-lisp.validation::*block-undo-data*)))))

@@ -3110,6 +3110,10 @@ candidate activated."
              ;; absent, so there is no expensive loop.
              (queue-missing-fork-blocks missing-blocks)
              nil)
+            ((eq error :interrupted)
+             ;; Stopping/pausing — says nothing about the candidate. Keep it in
+             ;; the set, don't reject it, don't retry now.
+             nil)
             ((member error '(:weaker-chain :reorg-refused :unknown-parent :corrupt-undo))
              ;; NOT a validation verdict on the CANDIDATE: the tip advanced under
              ;; us (raced :weaker-chain), the reorg is structurally impossible
@@ -3207,7 +3211,10 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                   ;; the incoming block's — note it as a candidate (the retry
                   ;; below re-attempts once the undo is re-derived) rather than
                   ;; blaming the innocent block.
-                  ((member error '(:weaker-chain :corrupt-undo))
+                  ;; :interrupted is a stop request truncating the reorg, not a
+                  ;; verdict on this block either — note the candidate so the
+                  ;; reorg is re-attempted once the node resumes.
+                  ((member error '(:weaker-chain :corrupt-undo :interrupted))
                    (note-reorg-candidate entry chain-state))
                   ;; Outweighs but intermediate bodies missing: re-queue the
                   ;; hole (cursors rewound) and note for retry.
@@ -3304,6 +3311,12 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                  (retry-best-reorg-candidate chain-state block-store utxo-set
                                              :fee-estimator fee-estimator
                                              :recent-rejects recent-rejects)
+                 nil)
+                ;; Stop request, not a verdict on this block: handle-validation-
+                ;; failure would burn its re-download budget for a shutdown it had
+                ;; nothing to do with. No immediate retry — the flag is still set.
+                ((eq error :interrupted)
+                 (note-reorg-candidate entry chain-state)
                  nil)
                 (t
                  ;; handle-validation-failure logs (throttled by retry count) and
@@ -3490,6 +3503,11 @@ the tip is ready to connect."
                ;; Re-queue missing fork blocks; don't tight-loop on
                ;; this queued block.
                (queue-missing-fork-blocks missing-blocks)
+               (return drained))
+              ((eq error :interrupted)
+               ;; Stop requested mid-reorg: stop draining, blame nothing. This
+               ;; block was popped from the RAM queue but persisted, so
+               ;; %next-disk-block-for-drain picks it up again after restart.
                (return drained))
               (t
                ;; handle-validation-failure logs (throttled) + manages the bounded
