@@ -118,11 +118,15 @@ Mirrors Bitcoin Core net.cpp:1794."
   "Put USOCKET-SOCKET's fd in non-blocking mode (Core makes every peer socket
 non-blocking, SetSocketNonBlocking / CreateSock). This is what lets the send
 path (%try-send-now) write only what the kernel will accept instead of
-pinning the shared sync thread on one peer's stalled TCP window. Reads are
-unaffected: SBCL fd-streams wait internally on EAGAIN, so receive-bytes'
-wait-for-input + read-sequence behave exactly as on a blocking fd (verified
-empirically). If the fcntl fails the socket stays blocking and sends degrade
-to the pre-existing blocking behavior."
+pinning the shared sync thread on one peer's stalled TCP window. If the fcntl
+fails the socket stays blocking and sends degrade to the pre-existing blocking
+behavior.
+
+It does NOT make reads safe, and this docstring used to claim otherwise —
+\"SBCL fd-streams wait internally on EAGAIN, so wait-for-input + read-sequence
+behave exactly as on a blocking fd\" was true, and was exactly the hazard: that
+internal wait has no deadline, so one silent peer could pin the reader forever.
+Bounded reading is RECEIVE-BYTES' own job, via DRAIN-AVAILABLE-BYTES."
   #+sbcl
   (let ((underlying (usocket:socket usocket-socket)))
     (when (typep underlying 'sb-bsd-sockets:socket)
@@ -404,17 +408,86 @@ dead, or send-paused with the buffer over +max-send-buffer-bytes+."
       (setf (connection-connected conn) nil)
       nil)))
 
+(defun drain-available-bytes (stream buffer start end)
+  "Copy every byte STREAM can supply right now into BUFFER[START..END), without
+ever blocking. Returns the new fill pointer; a return equal to START means
+nothing was available, which at EOF is how the caller learns the peer closed
+(LISTEN reports false at EOF rather than signalling, so EOF and
+nothing-yet-arrived are the same answer here — the caller distinguishes them by
+having been told the socket was readable).
+
+This is the whole reason RECEIVE-BYTES cannot use READ-SEQUENCE: READ-SEQUENCE
+fills its whole range or hits EOF, and a socket stream that runs dry mid-range
+waits internally with no deadline of its own. LISTEN answers the only question
+that keeps the reader safe — is there a byte I can take without waiting — so
+draining byte-by-byte is bounded by construction. It is also fast: measured at
+~95 MB/s on the project container, i.e. ~40 ms for a maximum-size block, which
+is noise next to that block's script validation."
+  (loop while (and (< start end) (listen stream))
+        do (let ((byte (read-byte stream nil nil)))
+             ;; LISTEN said a byte was there; NIL would mean it vanished, which
+             ;; cannot happen on a stream we alone read. Stop rather than store
+             ;; a bogus value.
+             (unless byte
+               (return-from drain-available-bytes start))
+             (setf (aref buffer start) byte)
+             (incf start)))
+  start)
+
+(defconstant +min-receive-bytes-per-second+ 16384
+  "Slowest average delivery RECEIVE-BYTES will sit through for one message.
+
+A stall timeout alone is not enough. It is measured from the last byte that
+arrived, so ANY progress renews it: a peer dribbling one byte just inside every
+window keeps the budget alive forever at a cost of ~1 B/s. With the pump's
+one-second timeout that turns a maximum-size message into roughly 43 DAYS of
+holding the serial pump — an infinite hang traded for a slow-loris, which is no
+fix at all. Requiring an average rate as well bounds the hold to
+COUNT/+MIN-RECEIVE-BYTES-PER-SECOND+ and makes the attacker pay real bandwidth
+for every second of it.
+
+The rate is a straight trade against honest slow links, because a peer below it
+is dropped mid-message. 128 kbit/s is chosen to stay under plausible onion
+throughput — this node treats Tor as a first-class transport — at the cost of a
+looser bound (~4 minutes for a maximum-size message, and the attacker must send
+its whole 4,000,000 bytes to buy that). Core makes no such trade: it never
+drops a slow-but-progressing peer, because it never blocks on one. Closing that
+gap needs the resumable reader described on RECEIVE-BYTES, not a higher rate
+here — raising this constant buys a tighter DoS bound by disconnecting honest
+peers, which is the wrong side of the trade.")
+
 (defun receive-bytes (conn count &key (timeout 30))
   "Receive exactly COUNT bytes from the connection.
-Returns a byte vector or NIL on failure/timeout."
+Returns a byte vector or NIL on failure/timeout.
+
+Two bounds apply, and a peer must satisfy both. TIMEOUT bounds STALLING: it is
+measured from the last byte that actually arrived, so a slow-but-progressing
+peer can keep delivering (Core's inactivity-timeout shape) while a peer that
+stops mid-message is dropped. +MIN-RECEIVE-BYTES-PER-SECOND+ additionally
+bounds the TOTAL, because a stall bound by itself is renewable by dribbling.
+
+Residual limitation, unchanged by these bounds: this reader is synchronous, so
+one peer still owns the shared message pump for the duration of its message.
+Core avoids that entirely by accumulating partial messages per connection
+(CNode::vRecvMsg) and never blocking on any peer. Making our reader resumable
+the same way is the real fix; these bounds only make the worst case finite."
   (handler-case
       (let ((socket (connection-socket conn)))
         (when socket
           (let* ((stream (connection-stream conn))
                  (buffer (make-array count :element-type '(unsigned-byte 8)))
                  (total-read 0)
-                 (deadline (+ (get-internal-real-time)
-                              (* timeout internal-time-units-per-second))))
+                 (last-progress (get-internal-real-time))
+                 ;; Whole-message budget: one stall window for latency and
+                 ;; scheduling, PLUS the time the message's own size deserves at
+                 ;; the floor rate (see +MIN-RECEIVE-BYTES-PER-SECOND+). Both
+                 ;; terms are needed — size alone gives a 24-byte header a
+                 ;; sub-millisecond budget, and TIMEOUT alone gives a 4 MiB
+                 ;; block the same budget as that header.
+                 (hard-deadline (+ (get-internal-real-time)
+                                   (* (+ timeout
+                                         (/ count +min-receive-bytes-per-second+))
+                                      internal-time-units-per-second))))
             ;; Serve sniffed-ahead bytes (inbound v1/v2 detection) first.
             (let ((pushback (connection-pushback conn)))
               (when pushback
@@ -431,10 +504,31 @@ Returns a byte vector or NIL on failure/timeout."
                   ;; iteration (wait-for-input below is capped at 5s chunks), so
                   ;; abort latency is <=5s instead of up to :timeout.
                   do (when *ibd-stop-requested*
+                       ;; Same framing rule as the timeout path below: bytes
+                       ;; already consumed are dropped on the floor, so a
+                       ;; partially-read message leaves the stream unusable.
+                       (when (plusp total-read)
+                         (setf (connection-connected conn) nil))
                        (return-from receive-bytes nil))
-                     (let ((time-left (/ (- deadline (get-internal-real-time))
-                                         internal-time-units-per-second)))
+                     (let ((time-left
+                             (min
+                              ;; stall bound: since the last byte that arrived
+                              (- timeout
+                                 (/ (- (get-internal-real-time) last-progress)
+                                    internal-time-units-per-second))
+                              ;; total bound: dribbling must not renew forever
+                              (/ (- hard-deadline (get-internal-real-time))
+                                 internal-time-units-per-second))))
                        (when (<= time-left 0)
+                         ;; Out of budget. If we already consumed part of a
+                         ;; message those bytes are gone and the caller is told
+                         ;; "failed", so the stream can never be resynchronized:
+                         ;; a later read would parse payload bytes as a header.
+                         ;; Kill the connection in that case only — a timeout
+                         ;; with NOTHING consumed is the ordinary idle poll and
+                         ;; must leave the peer alone.
+                         (when (plusp total-read)
+                           (setf (connection-connected conn) nil))
                          (return-from receive-bytes nil))
                        ;; Wait for data, but only up to a 5s sub-window at a
                        ;; time. A not-ready result is NOT treated as failure:
@@ -446,13 +540,27 @@ Returns a byte vector or NIL on failure/timeout."
                        (when (usocket:wait-for-input socket
                                                      :timeout (max 0.1 (min time-left 5.0))
                                                      :ready-only t)
-                         ;; Socket claims to be ready - read what we can
-                         (let ((n (read-sequence buffer stream :start total-read)))
+                         ;; Socket claims to be ready — take only what is
+                         ;; actually there. READ-SEQUENCE would instead insist on
+                         ;; the FULL remaining message: wait-for-input promises
+                         ;; just one readable byte, so a peer that announces a
+                         ;; 4 MiB payload and then goes quiet used to pin this
+                         ;; thread in poll() FOREVER — and the message pump is
+                         ;; serial, so that was the whole node's networking.
+                         ;; Proven live: a node sat frozen for 5 days with 751
+                         ;; sockets rotting in CLOSE-WAIT and not one error
+                         ;; logged.
+                         (let ((n (drain-available-bytes stream buffer
+                                                         total-read count)))
                            (when (= n total-read)
-                             ;; No progress despite socket being ready - connection closed/error
+                             ;; Readable but nothing to take: EOF, i.e. the peer
+                             ;; closed. (The old code reached the same
+                             ;; conclusion from read-sequence making no
+                             ;; progress.)
                              (setf (connection-connected conn) nil)
                              (return-from receive-bytes nil))
-                           (setf total-read n)))))
+                           (setf total-read n
+                                 last-progress (get-internal-real-time))))))
             (when (= total-read count)
               (incf (connection-bytes-received conn) count)
               (incf *total-bytes-received* count)
