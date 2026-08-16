@@ -756,8 +756,36 @@ missing or corrupt."
         (let ((mempool (node-mempool node))
               (utxo-set (node-utxo-set node))
               (chain-state (node-chain-state node))
-              (accepted 0) (failed 0) (unbroadcast-count 0))
+              (accepted 0) (failed 0) (unbroadcast-count 0)
+              (total (length entries))
+              (tried 0)
+              (next-tenth 0))
+          ;; Announce the size and report every 10% (Core mempool_persist.cpp:77-86).
+          ;; Every entry is re-validated in full, so a large dump is minutes of
+          ;; CPU — and this used to log nothing at all until it finished: an
+          ;; 83 MB testnet4 mempool.dat took ~45 minutes of silence on the
+          ;; 2026-08-16 deploy, indistinguishable from a wedge.
+          (when (plusp total)
+            (log-info "Loading ~D mempool transaction~:P from ~A..." total path))
           (dolist (rec entries)
+            ;; Cooperative stop between transactions (Core checks m_interrupt per
+            ;; tx, mempool_persist.cpp:122). Abandoning applies NEITHER the
+            ;; residual deltas NOR the unbroadcast set — Core returns before
+            ;; both, and half-restoring would leave prioritisation for
+            ;; transactions that never came back. What was already accepted stays
+            ;; in the pool and is dumped at shutdown, so the next start resumes
+            ;; from a smaller file.
+            (when (bitcoin-lisp:interrupt-requested-p)
+              (log-warn "Mempool import abandoned on a stop request after ~D of ~D transaction~:P (~D accepted, ~D failed); the remainder stays in ~A"
+                        tried total accepted failed path)
+              (return-from load-mempool-from-disk (values accepted failed 0)))
+            (let* ((pct (floor (* 100 tried) total))
+                   (tenth (floor pct 10)))
+              (when (> tenth next-tenth)
+                (setf next-tenth tenth)
+                (log-info "Progress loading mempool transactions: ~D% (tried ~D, ~D remaining)"
+                          pct tried (- total tried))))
+            (incf tried)
             (destructuring-bind (tx entry-time delta) rec
               (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
                     (height (bitcoin-lisp.storage:current-height chain-state)))
@@ -1132,6 +1160,12 @@ chainstate, disk space): respawning immediately just spins on it.")
   "Process exit code when the node stopped running without being asked to
 (fatal snapshot, crashed sync thread): the supervisor should respawn.")
 
+(defvar *node-starting* nil
+  "T while start-node is still building the node. The SIGTERM handler is
+installed at the START of start-node (Core AppInitBasicSetup), so a stop can
+arrive while there is no node to tear down and no watchdog yet — in that window
+the handler only registers the request; see install-shutdown-handler.")
+
 (defvar *shutdown-request* nil
   "NIL, or the pending shutdown request as (REASON . EXIT-CODE). Written
 exactly once per run by request-node-shutdown, via CAS rather than a lock so
@@ -1177,6 +1211,16 @@ is about to exit the process out from under it."
 (defun node-shutdown-requested-p ()
   "The reason a shutdown was requested, or NIL (Core ShutdownRequested)."
   (car *shutdown-request*))
+
+(defun %node-interrupt-requested-p ()
+  "The node-wide stop predicate installed into bitcoin-lisp:*interrupt-check*
+(config.lisp), which states the contract. Two flags mean stop and this is the
+only file that sees both: *shutdown-request* is set FIRST (the SIGTERM handler
+just registers it), *ibd-stop-requested* later by stop-node."
+  (or (bitcoin-lisp.networking:ibd-stop-requested-p)
+      (node-shutdown-requested-p)))
+
+(setf *interrupt-check* '%node-interrupt-requested-p)
 
 (defun wait-for-shutdown-complete (&key (timeout 900))
   "Block until stop-node's *shutdown-complete* latch is set, or TIMEOUT
@@ -1880,7 +1924,18 @@ Returns the node instance."
   ;; *shutdown-request* would make the watchdog stop this run immediately.
   (setf *shutdown-request* nil
         *shutdown-complete* nil
-        *stop-node-in-progress* nil)
+        *stop-node-in-progress* nil
+        *node-starting* t)
+  ;; Trap SIGTERM/SIGINT HERE, before any of the long startup work — not at the
+  ;; end of this function. Core does the same: registerSignalHandler runs in
+  ;; AppInitBasicSetup (init.cpp:902), a thousand lines before LoadMempool
+  ;; (init.cpp:2047). Installed last, every slow startup step ran with SIGTERM
+  ;; at its DEFAULT disposition, so a stop during the mempool import, an index
+  ;; backfill (hours) or a wallet rescan killed the process outright instead of
+  ;; being recorded. Now it registers the request, the loops that poll
+  ;; interrupt-requested-p give up at their next boundary, and the watchdog
+  ;; services it once this function returns.
+  (install-shutdown-handler)
   ;; Periodic peers.dat dump baseline (first dump 15 min from now).
   (setf *last-peers-dump-time* (get-universal-time))
   (setf *current-log-level* log-level)
@@ -2480,7 +2535,10 @@ Returns the node instance."
          net bytes (listen-port network)
          bitcoin-lisp.networking:+local-manual+))))
 
-  (install-shutdown-handler)
+  ;; Startup is over: a stop arriving from here on has a fully-built node to
+  ;; tear down, so the handler's no-watchdog fallback may run stop-node inline
+  ;; again (REPL / embedded use).
+  (setf *node-starting* nil)
   (log-info "Node started successfully")
   *node*)
 
@@ -3070,6 +3128,35 @@ hook (Core removeUnchecked, txmempool.cpp:269-275)."
           (error (e)
             (log-error "Wallet processing of mempool tx removal FAILED: ~A" e)))))))
 
+(defun %handle-stop-signal ()
+  "What SIGTERM/SIGINT does. Returns T when it only REGISTERED the stop for
+someone else to service; otherwise it runs the teardown and does not return.
+
+Register-only in two states: under the supervisor (a main-thread watchdog is
+polling — the kernel delivers the signal to whichever thread it likes, and
+running the teardown here would race the watchdog's exit), and while start-node
+is still building (there is no node to tear down yet, and stop-node would race
+the construction it is meant to undo). Either way the loops that poll
+interrupt-requested-p give up at their next boundary."
+  (cond
+    ((or *shutdown-watchdog-running* *node-starting*)
+     (request-node-shutdown "SIGTERM/SIGINT" :exit-code +node-exit-clean+)
+     t)
+    (t
+     ;; No watchdog (REPL / embedded), node fully started: nobody else would
+     ;; stop it, so do it here and exit.
+     (ignore-errors (stop-node))
+     ;; Per-block script-check worker threads (bt:make-thread :name
+     ;; "script-check-N" in validate-block.lisp) are non-daemon and can outlive
+     ;; stop-node if validation was in progress when the sync thread was
+     ;; destroyed. Without a timeout, sb-ext:exit blocks forever waiting for them
+     ;; (incident 2026-05-11: node logged "Node stopped" but SBCL hung 6+
+     ;; minutes, eventually needed SIGKILL). Give 5 seconds, then force-exit.
+     ;; Core's CCheckQueue (checkqueue.h:206-225) has an explicit stop flag +
+     ;; condvar to join workers; ours are ephemeral per-block, not a pool.
+     #+sbcl (sb-ext:exit :code 0 :timeout 5)
+     nil)))
+
 (defun install-shutdown-handler ()
   "Trap SIGTERM and SIGINT so kill <pid> / Ctrl-C calls stop-node and persists
    chain state and UTXO set before exit. Without this, SIGKILL is the only way
@@ -3079,34 +3166,10 @@ hook (Core removeUnchecked, txmempool.cpp:269-275)."
    heap-exhausted) logs a stack and exits non-zero rather than dropping into
    LDB on a tty no one is reading."
   #+sbcl
-  (let ((handler
-          (lambda (&rest _)
-            (declare (ignore _))
-            (format *error-output* "~&[shutdown] caught signal — saving state~%")
-            ;; Under the supervisor (a main-thread watchdog is polling), only
-            ;; REQUEST the stop. The kernel delivers the signal to whichever
-            ;; thread it likes, and running the teardown here would race the
-            ;; watchdog's exit exactly like the other internal stop paths did —
-            ;; SIGTERM only survived that race by delivery luck. The watchdog
-            ;; runs stop-node and exits 0 itself.
-            (if *shutdown-watchdog-running*
-                (request-node-shutdown "SIGTERM/SIGINT" :exit-code +node-exit-clean+)
-                ;; No watchdog (REPL / embedded): nobody else would stop the
-                ;; node, so do it here and exit as before.
-                (progn
-                  (ignore-errors (stop-node))
-                  ;; Per-block script-check worker threads (bt:make-thread :name
-                  ;; "script-check-N" in validate-block.lisp) are non-daemon and
-                  ;; can outlive stop-node if validation was in progress when the
-                  ;; sync thread was destroyed. Without a timeout, sb-ext:exit
-                  ;; blocks forever waiting for them (incident 2026-05-11: node
-                  ;; logged "Node stopped" but SBCL process hung 6+ minutes,
-                  ;; eventually needed SIGKILL). Give 5 seconds for any in-flight
-                  ;; worker to finish naturally, then force-exit. Bitcoin Core's
-                  ;; CCheckQueue (checkqueue.h:206-225) has an explicit stop flag
-                  ;; + condvar to join workers; we use a coarser timeout because
-                  ;; our workers are ephemeral per-block, not a persistent pool.
-                  (sb-ext:exit :code 0 :timeout 5))))))
+  (let ((handler (lambda (&rest _)
+                   (declare (ignore _))
+                   (format *error-output* "~&[shutdown] caught signal — saving state~%")
+                   (%handle-stop-signal))))
     (sb-sys:enable-interrupt sb-unix:sigterm handler)
     (sb-sys:enable-interrupt sb-unix:sigint handler))
   ;; SIGUSR1 toggles sb-sprof profiling. First USR1: start sampling. Second
@@ -3201,6 +3264,11 @@ thread; see the shutdown-coordination section above."
 (defun %stop-node ()
   "stop-node's teardown proper; run by exactly one thread (see stop-node)."
   (log-info "Stopping node...")
+  ;; Whatever start-node got to, it is not building any more. Clearing here (not
+  ;; only on start-node's success path) keeps a failed start from leaving the
+  ;; latch set, which would make a later REPL Ctrl-C register a request nobody
+  ;; services.
+  (setf *node-starting* nil)
 
   ;; Persist reconnection anchors while peers are still connected (before the
   ;; teardown below disconnects them).

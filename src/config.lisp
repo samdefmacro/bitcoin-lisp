@@ -6,26 +6,32 @@
 ;;; across multiple subsystems. Loaded early so that storage, validation,
 ;;; and networking modules can reference these symbols at compile time.
 
-;;;; Interrupt signalling
+;;;; Interrupt signalling — THE contract statement for the cooperative-stop
+;;;; seam. Other files point here rather than restating it.
 ;;;;
-;;;; The one thing every long-running validation loop needs to know: has the
-;;;; node been asked to stop? Core keeps that below validation — util::
-;;;; SignalInterrupt, handed to ChainstateManager by reference (validation.h:1034)
-;;;; — and validation never calls up into networking to ask. This variable is the
-;;;; same seam. The networking layer installs the real predicate when it loads
-;;;; (connection.lisp, over *ibd-stop-requested*); it stays (CONSTANTLY NIL) in an
-;;;; image that never starts a node, and tests bind it to interrupt a loop at a
-;;;; chosen point.
+;;;; The one thing every long-running loop needs to know: has the node been
+;;;; asked to stop? Core keeps that BELOW validation — util::SignalInterrupt,
+;;;; handed to ChainstateManager by reference (validation.h:1034) — so
+;;;; validation never calls up into networking to ask. This variable is the same
+;;;; seam, and it lives in the earliest-loaded file for the same reason.
 
 (defvar *interrupt-check* (constantly nil)
-  "Predicate of no arguments: T once the node has been asked to stop. Polled by
-long-running loops that must give up cooperatively — currently perform-reorg,
-between blocks. Installed by the networking layer at load time; NIL-returning by
-default so lower layers never depend upward.")
+  "Predicate of no arguments: T once the node has been asked to stop.
+
+Installed once, by node.lisp (%node-interrupt-requested-p) — the only file that
+sees both flags that mean stop: *shutdown-request*, set the moment SIGTERM
+arrives, and networking's *ibd-stop-requested*, set later by stop-node and also
+by call-with-sync-paused for the assumeutxo pause, after which the node keeps
+RUNNING. Consumers that must distinguish those two meanings have to say so
+(perform-reorg does, in its phase-3b section comment).
+
+Stays (CONSTANTLY NIL) in an image that never starts a node, so lower layers
+never depend upward; tests bind it to interrupt a loop at a chosen point.")
 
 (defun interrupt-requested-p ()
-  "T when the node has been asked to stop (shutdown, or the sync pause that
-precedes assumeutxo snapshot activation). See *interrupt-check*."
+  "T when the node has been asked to stop. Polled at loop boundaries by work
+that must give up cooperatively — perform-reorg between blocks,
+load-mempool-from-disk between transactions. See *interrupt-check*."
   (funcall *interrupt-check*))
 
 ;;;; Block Pruning Configuration

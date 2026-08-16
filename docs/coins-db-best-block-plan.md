@@ -90,8 +90,9 @@ at the top of each PHASE A and PHASE B block, and on a stop request TRUNCATES th
 reorg there instead of finishing it or rolling it back.
 
 The predicate is a seam in `config.lisp`, `*interrupt-check*`, defaulting to
-`(constantly nil)`; `connection.lisp` installs `ibd-stop-requested-p` into it at
-load time. Validation must not call up into networking to ask whether to stop, and
+`(constantly nil)`; `node.lisp` installs the real one at load time (it is the
+only file that sees both flags meaning "stop"). Validation must not call up into
+networking to ask whether to stop, and
 Core doesn't: `util::SignalInterrupt` lives below validation and is handed to
 `ChainstateManager` by reference (`validation.h:1034`). Tests bind the same
 variable, so they drive the production path rather than a test-only hook.
