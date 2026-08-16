@@ -2265,10 +2265,10 @@ includes ENTRY itself."
 ;;;; interruptible work, while a truncated reorg is simply a shorter (or
 ;;;; partially advanced) valid chain that the next sync pass re-activates.
 ;;;;
-;;;; The predicate is bitcoin-lisp:interrupt-requested-p (config.lisp), which the
-;;;; networking layer backs with the node-wide stop flag — set BOTH by shutdown
-;;;; and by call-with-sync-paused (assumeutxo snapshot activation, after which the
-;;;; node keeps RUNNING). Covering the pause too is only safe because the
+;;;; The predicate is bitcoin-lisp:interrupt-requested-p (config.lisp states the
+;;;; contract). It is true for BOTH meanings the node has for "stop": a real
+;;;; shutdown, and call-with-sync-paused (assumeutxo snapshot activation, after
+;;;; which the node keeps RUNNING). Covering the pause too is only safe because the
 ;;;; truncation moves the IN-MEMORY tip to the coins' block as well: checking a
 ;;;; flag without moving the tip would merely relocate the inconsistency from disk
 ;;;; into memory, where no startup check ever looks.

@@ -1174,6 +1174,121 @@ rpc/mempool.cpp:1047)."
                          (bitcoin-lisp.rpc::rpc-getmempoolinfo node nil)
                          :test #'string=))))))
 
+(defun %mempool-node (&optional (funding-outputs 1))
+  "A test node on a fresh %pkg-fixture whose UTXO set holds FUNDING-OUTPUTS
+confirmed spendable coins (vouts 0..n-1 of the fixture's funding txid), so a
+saved mempool can be reloaded against it. Use (bitcoin-lisp::node-mempool node)
+for the pool."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (declare (ignore mempool))
+    (loop for i from 1 below funding-outputs
+          do (bitcoin-lisp.storage:add-utxo utxo-set funding-txid i 100000000
+                                            (%p2sh-optrue-spk) 1 :coinbase nil))
+    (values (%broadcast-test-node utxo-set mempool chain-state
+                                  (bitcoin-lisp.networking:make-peer :state :ready))
+            funding-txid)))
+
+(defun %write-mempool-file (path)
+  "Write a mempool.dat holding three INDEPENDENT txs (so reload order cannot
+matter), one of them unbroadcast. Returns the list of txids."
+  (multiple-value-bind (node funding-txid) (%mempool-node 3)
+    (let ((mempool (bitcoin-lisp::node-mempool node))
+          (txids '()))
+      (dotimes (i 3)
+        (let* ((tx (%pkg-tx funding-txid i (- 100000000 10000)))
+               (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+          (bitcoin-lisp.mempool:mempool-add
+           mempool txid (bitcoin-lisp.mempool:make-entry-from-tx tx 10000 200))
+          (push txid txids)))
+      (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool (first txids))
+      (bitcoin-lisp.mempool:save-mempool-file mempool path)
+      txids)))
+
+(test mempool-import-abandons-the-load-on-a-stop-request
+  "The mempool import re-validates every saved tx through the full acceptance
+path, so a large mempool.dat is minutes of CPU — and it runs inside start-node,
+BEFORE run-node-watchdog exists, so a SIGTERM arriving during it cannot be
+serviced until it finishes. Core checks m_interrupt after every tx and abandons
+the load (mempool_persist.cpp:122); so do we, via the same interrupt seam
+perform-reorg uses. An abandoned load must apply NEITHER the residual deltas nor
+the unbroadcast set (Core returns before both), or prioritisation would be
+restored for transactions that never came back."
+  (let ((path (merge-pathnames (format nil "bl-mempool-abort-~D.dat" (get-universal-time))
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (let ((txids (%write-mempool-file path)))
+           ;; Interrupted: fires once the first tx is in, so exactly one loads.
+           (let* ((node (%mempool-node 3))
+                  (mempool (bitcoin-lisp::node-mempool node))
+                  (bitcoin-lisp:*interrupt-check*
+                    (lambda () (plusp (bitcoin-lisp.mempool:mempool-count mempool)))))
+             (multiple-value-bind (accepted failed residual)
+                 (bitcoin-lisp::load-mempool-from-disk node path)
+               (declare (ignore failed))
+               (is (= 1 accepted) "the load stops at the first boundary after the flag")
+               (is (= 0 residual)))
+             (is (= 1 (bitcoin-lisp.mempool:mempool-count mempool)))
+             (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))
+                 "an abandoned load restores no unbroadcast set"))
+           ;; CONTROL: the same file, uninterrupted, loads completely — without
+           ;; this the assertions above would also pass on a file that never
+           ;; had three loadable txs in it.
+           (let* ((node (%mempool-node 3))
+                  (mempool (bitcoin-lisp::node-mempool node)))
+             (is (= 3 (bitcoin-lisp::load-mempool-from-disk node path)))
+             (is (= 3 (bitcoin-lisp.mempool:mempool-count mempool)))
+             (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+             (dolist (txid txids)
+               (is-true (bitcoin-lisp.mempool:mempool-has mempool txid)))))
+      (ignore-errors (delete-file path)))))
+
+(test stop-signal-during-startup-only-registers-the-request
+  "The SIGTERM handler now goes in at the START of start-node (Core does it in
+AppInitBasicSetup, a thousand lines before LoadMempool) — installed last, every
+slow startup step ran with SIGTERM at its DEFAULT disposition, so a stop during
+the mempool import, an index backfill or a wallet rescan killed the process
+outright. Arriving mid-startup it must only REGISTER: there is no built node to
+tear down, and running stop-node there would race the construction it undoes.
+Registering is also what lets the polling loops abandon their work."
+  (let ((bitcoin-lisp::*node-starting* t)
+        (bitcoin-lisp::*shutdown-watchdog-running* nil)
+        (bitcoin-lisp::*shutdown-request* nil))
+    (is-true (bitcoin-lisp::%handle-stop-signal)
+             "mid-startup: register only, never tear down")
+    (is (equal "SIGTERM/SIGINT" (bitcoin-lisp::node-shutdown-requested-p)))
+    ;; …and that registration is exactly what the cooperative loops poll.
+    (is-true (bitcoin-lisp:interrupt-requested-p)))
+  ;; The other branch — neither latch set, so the handler tears down inline —
+  ;; is deliberately not exercised: it ends in sb-ext:exit and would take the
+  ;; test image with it.
+  (let ((bitcoin-lisp::*node-starting* t)
+        (bitcoin-lisp::*shutdown-watchdog-running* nil)
+        (bitcoin-lisp::*shutdown-request* nil))
+    ;; The startup latch alone is enough; the test above must not be passing
+    ;; only because some other run left the watchdog latch set.
+    (is-true (bitcoin-lisp::%handle-stop-signal))))
+
+(test mempool-import-reports-its-size-and-progress
+  "The import used to log nothing between 'Loaded N fee stats entries' and its
+final summary: an 83 MB testnet4 mempool.dat took ~45 minutes of apparent
+silence on the 2026-08-16 deploy, indistinguishable from a wedge. Core announces
+the total and reports every 10% (mempool_persist.cpp:77-86)."
+  (let ((path (merge-pathnames (format nil "bl-mempool-progress-~D.dat" (get-universal-time))
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (%write-mempool-file path)
+           (let* ((node (%mempool-node 3))
+                  (logged (with-output-to-string (out)
+                            (let ((bitcoin-lisp:*log-stream* out))
+                              (bitcoin-lisp::load-mempool-from-disk node path)))))
+             (is (search "Loading 3 mempool transactions" logged)
+                 "the size is announced before the work starts")
+             (is (search "Progress loading mempool transactions" logged)
+                 "progress is reported while the work runs")
+             (is (search "Imported mempool" logged))))
+      (ignore-errors (delete-file path)))))
+
 (test rpc-importmempool-unbroadcast-option
   "The saved unbroadcast set is restored by the startup load
 (load-mempool-from-disk defaults apply-unbroadcast on, Core
@@ -1195,34 +1310,25 @@ rpc/mempool.cpp:1115-1116)."
                (bitcoin-lisp.mempool:mempool-add-unbroadcast mempool txid)
                (bitcoin-lisp.mempool:save-mempool-file mempool path)))
            ;; importmempool default: entries load, unbroadcast NOT applied.
-           (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
-             (declare (ignore funding-txid))
-             (let ((node (%broadcast-test-node
-                          utxo-set mempool chain-state
-                          (bitcoin-lisp.networking:make-peer :state :ready))))
-               (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path)))
-               (is-true (bitcoin-lisp.mempool:mempool-has mempool txid))
-               (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))))
+           (let* ((node (%mempool-node))
+                  (mempool (bitcoin-lisp::node-mempool node)))
+             (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path)))
+             (is-true (bitcoin-lisp.mempool:mempool-has mempool txid))
+             (is (= 0 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool))))
            ;; importmempool with apply_unbroadcast_set=true restores the set.
-           (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
-             (declare (ignore funding-txid))
-             (let ((node (%broadcast-test-node
-                          utxo-set mempool chain-state
-                          (bitcoin-lisp.networking:make-peer :state :ready)))
-                   (opts (make-hash-table :test 'equal)))
-               (setf (gethash "apply_unbroadcast_set" opts) t)
-               (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path) opts))
-               (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
-               (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool)))))
+           (let* ((node (%mempool-node))
+                  (mempool (bitcoin-lisp::node-mempool node))
+                  (opts (make-hash-table :test 'equal)))
+             (setf (gethash "apply_unbroadcast_set" opts) t)
+             (bitcoin-lisp.rpc::rpc-importmempool node (list (namestring path) opts))
+             (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+             (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool))))
            ;; Startup path (load-mempool-from-disk) applies it by default.
-           (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
-             (declare (ignore funding-txid))
-             (let ((node (%broadcast-test-node
-                          utxo-set mempool chain-state
-                          (bitcoin-lisp.networking:make-peer :state :ready))))
-               (bitcoin-lisp::load-mempool-from-disk node path)
-               (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
-               (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool))))))
+           (let* ((node (%mempool-node))
+                  (mempool (bitcoin-lisp::node-mempool node)))
+             (bitcoin-lisp::load-mempool-from-disk node path)
+             (is (= 1 (bitcoin-lisp.mempool:mempool-unbroadcast-count mempool)))
+             (is-true (gethash txid (bitcoin-lisp.mempool:mempool-unbroadcast mempool)))))
       (ignore-errors (delete-file path)))))
 
 (test rpc-getblockheader-confirmations
