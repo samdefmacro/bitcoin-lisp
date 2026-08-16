@@ -44,7 +44,13 @@ points through `.cl-workbench/adapter`.
 Discipline: ground before writing (`dev.sh eval '(describe ...)'`, apropos);
 develop in small evals; after editing, reload (`dev.sh eval '(asdf:load-system
 "bitcoin-lisp")'`) and re-run the touched suite; defstruct/Coalton layout
-changes require an image restart. Consensus-critical work still finishes with
+changes require an image restart. **Changing a `defconstant`'s VALUE needs a
+forced rebuild too** (`:force t`, or clear the FASL volume): the symbol updates
+but already-compiled callers keep the folded old value, so the warm image runs
+new code against the old constant and tests can pass against a value that is no
+longer in the source. Observed 2026-08-16 while retuning a rate limit — the
+symbol read 16384 while the caller still behaved as 32768. The cold battery is
+unaffected (it compiles fresh) and stays the verification of record. Consensus-critical work still finishes with
 scripts/docker-test.sh (= `cl-workbench validation run cold-unit`) — the warm
 image is a dev convenience, not the verification of record. A suite designator
 that selects zero tests fails (rc 1); it can never pass silently.

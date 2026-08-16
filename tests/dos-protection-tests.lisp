@@ -924,6 +924,50 @@ caller's timeout is enough — so receive-message must drop the connection."
       (usocket:socket-close victim-socket)
       (usocket:socket-close listener))))
 
+(test receive-message-keeps-a-peer-after-a-bad-checksum
+  "Core's explicit choice: \"Message deserialization failed. Drop the message but
+don't disconnect the peer.\" (net.cpp:678-683, reached for a wrong checksum at
+net.cpp:819-825). A full message was consumed, so unlike every other failure in
+receive-message the framing is intact and there is nothing to resynchronize.
+Disconnecting here would also turn any bug in our own payload handling into
+node-wide peer churn. Bad magic is the opposite case and is covered below."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (sender (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (victim-socket (usocket:socket-accept listener
+                                               :element-type '(unsigned-byte 8)))
+         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+                                                        :connected t))
+         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready))
+         (payload (make-array 8 :element-type '(unsigned-byte 8)
+                                :initial-element 1))
+         (header (bitcoin-lisp.serialization::make-message-header
+                  :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+                  :command "ping"
+                  :payload-length (length payload)
+                  ;; deliberately wrong
+                  :checksum (make-array 4 :element-type '(unsigned-byte 8)
+                                          :initial-element 99))))
+    (unwind-protect
+         (progn
+           (let ((header-bytes
+                   (flexi-streams:with-output-to-sequence (s)
+                     (bitcoin-lisp.serialization::write-message-header s header))))
+             (write-sequence header-bytes (usocket:socket-stream sender))
+             (write-sequence payload (usocket:socket-stream sender))
+             (force-output (usocket:socket-stream sender)))
+           (sleep 0.2)
+           (is (null (bitcoin-lisp.networking:receive-message peer :timeout 1))
+               "the corrupt message is dropped")
+           (is-true (bitcoin-lisp.networking::connection-connected conn)
+                    "but the peer survives, as in Core")
+           (is (eq :ready (bitcoin-lisp.networking:peer-state peer))))
+      (usocket:socket-close sender)
+      (usocket:socket-close victim-socket)
+      (usocket:socket-close listener))))
+
 (test receive-message-drops-a-peer-on-bad-magic
   "Bad magic means 24 bytes were consumed at an unknown offset, so the stream
 cannot be trusted to sit on a message boundary. Returning NIL without
