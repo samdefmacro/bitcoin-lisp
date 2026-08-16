@@ -139,10 +139,17 @@ of Core's InterruptibleRecv under g_socks5_recv_timeout (netbase.cpp:319-350)."
                (when (usocket:wait-for-input socket
                                              :timeout (max 0.1 (min time-left 5.0))
                                              :ready-only t)
-                 (let ((n (handler-case (read-sequence buffer stream :start total)
+                 ;; Take only what is available. This mirrored receive-bytes
+                 ;; closely enough to inherit its defect: READ-SEQUENCE demands
+                 ;; the whole remaining reply and waits inside the stream with
+                 ;; no deadline, so a proxy that answers partially and then goes
+                 ;; quiet pinned this thread forever — DEADLINE above could
+                 ;; never be consulted again. Same fix, same reason.
+                 (let ((n (handler-case (drain-available-bytes stream buffer
+                                                               total count)
                             (error (e)
                               (socks5-fail phase "read error: ~A" e)))))
-                   (when (= n total)
+                   (when (or (null n) (= n total))
                      ;; Ready but no progress: proxy closed the connection.
                      (socks5-fail phase "disconnected by proxy"))
                    (setf total n)))))

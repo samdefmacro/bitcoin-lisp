@@ -536,7 +536,16 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
               (%account-message (peer-recv-per-msg peer) t command
                                 (length payload)))
             (values command payload))))
-      ;; Read header (24 bytes)
+      ;; Read header (24 bytes).
+      ;;
+      ;; A message is TWO reads, and that makes the framing state a per-MESSAGE
+      ;; property that receive-bytes cannot see. Once these 24 bytes are
+      ;; consumed we are committed: if anything afterwards fails, the stream can
+      ;; no longer be trusted to sit on a message boundary, and a later read
+      ;; would parse payload bytes as a header — forever, since every pass would
+      ;; eat 24 more bytes of garbage. So every failure below MUST drop the
+      ;; connection. (Before reads were bounded this could not arise: the old
+      ;; blocking read made a timeout between header and payload impossible.)
       (let ((header-bytes (receive-bytes conn 24 :timeout timeout)))
         (when header-bytes
           (flexi-streams:with-input-from-sequence (stream header-bytes)
@@ -544,6 +553,9 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
               ;; Verify magic
               (unless (equalp (bitcoin-lisp.serialization:message-header-magic header)
                               bitcoin-lisp.serialization:*network-magic*)
+                (bitcoin-lisp:log-warn "Bad message magic from peer ~A, disconnecting"
+                                       (peer-address peer))
+                (disconnect-peer peer)
                 (return-from receive-message nil))
               ;; Validate payload size before allocating/reading
               (let ((payload-len (bitcoin-lisp.serialization:message-header-payload-length header)))
@@ -556,17 +568,42 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
                 (let ((payload (if (zerop payload-len)
                                    #()
                                    (receive-bytes conn payload-len :timeout timeout))))
-                  (when (or (zerop payload-len) payload)
-                    ;; Verify checksum
-                    (let ((computed-checksum
-                            (bitcoin-lisp.serialization:compute-checksum
-                             (if (zerop payload-len) #() payload))))
-                      (when (equalp (subseq computed-checksum 0 4)
+                  (unless (or (zerop payload-len) payload)
+                    ;; Header consumed, payload never completed: the peer is now
+                    ;; permanently out of frame with us. Nothing here means the
+                    ;; peer is malicious — a payload lagging its header past the
+                    ;; caller's timeout is enough — but the connection is
+                    ;; unusable either way, so drop it and let peer maintenance
+                    ;; dial a replacement.
+                    (bitcoin-lisp:log-warn "Incomplete ~A message from peer ~A, disconnecting"
+                                           (bitcoin-lisp.serialization:message-header-command header)
+                                           (peer-address peer))
+                    (disconnect-peer peer)
+                    (return-from receive-message nil))
+                  ;; Verify checksum
+                  (let ((computed-checksum
+                          (bitcoin-lisp.serialization:compute-checksum
+                           (if (zerop payload-len) #() payload))))
+                    (unless (equalp (subseq computed-checksum 0 4)
                                     (bitcoin-lisp.serialization:message-header-checksum header))
-                        (let ((command (bitcoin-lisp.serialization:message-header-command header)))
-                          (%account-message (peer-recv-per-msg peer) nil
-                                            command payload-len)
-                          (values command payload))))))))))))))
+                      ;; Drop the MESSAGE, keep the peer — Core's explicit choice
+                      ;; ("Message deserialization failed. Drop the message but
+                      ;; don't disconnect the peer.", net.cpp:678-683, reached
+                      ;; for a wrong checksum at net.cpp:819-825). A full message
+                      ;; was consumed here, so unlike every other failure in this
+                      ;; function the framing is intact and there is nothing to
+                      ;; resynchronize. Disconnecting would also turn any bug in
+                      ;; our own payload handling into node-wide peer churn.
+                      ;; Bad MAGIC is the opposite case and does disconnect
+                      ;; above, matching net.cpp:752-755.
+                      (bitcoin-lisp:log-warn "Bad checksum on ~A from peer ~A, dropping message"
+                                             (bitcoin-lisp.serialization:message-header-command header)
+                                             (peer-address peer))
+                      (return-from receive-message nil))
+                    (let ((command (bitcoin-lisp.serialization:message-header-command header)))
+                      (%account-message (peer-recv-per-msg peer) nil
+                                        command payload-len)
+                      (values command payload))))))))))))
 
 (defun peer-outbound-or-block-relay-p (peer)
   "T for the connection types that are candidates for AUTOMATIC disconnection

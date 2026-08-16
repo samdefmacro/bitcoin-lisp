@@ -547,11 +547,25 @@ AttemptToEvictConnection. Returns T if a peer was evicted."
   "Admission check for a freshly-accepted inbound connection from HOST,
 before any handshake work (Core CConnman::CreateNodeFromAcceptedSocket,
 net.cpp:1801-1813): a banned address is always dropped; a discouraged
-address is dropped only when the inbound slots are (almost) full. Returns T,
-or (VALUES NIL REASON) when the connection must be dropped."
+address is dropped only when the inbound slots are (almost) full; and no
+connection is admitted while the hand-off queue is already full. Returns T,
+or (VALUES NIL REASON) when the connection must be dropped.
+
+The backlog arm matters because +MAX-INBOUND-PEERS+ is otherwise enforced only
+at MERGE time, by the sync thread. Accepted peers hold a socket while they wait
+in PENDING-INBOUND-PEERS, so anything that stalls that thread turns every new
+connection into a leaked descriptor — the live wedge of 2026-08-16 accumulated
+751 sockets in CLOSE-WAIT this way. Counting the queue bounds the damage at
+twice the inbound cap no matter what the rest of the node is doing."
+  ;; Ban check first and lock-free: a connect flood is exactly when the listener
+  ;; must not contend with the sync thread and RPC readers for the node lock.
   (cond
     ((bitcoin-lisp.networking:peer-banned-p host)
      (values nil :banned))
+    ((>= (bt:with-recursive-lock-held ((node-lock node))
+           (length (node-pending-inbound-peers node)))
+         +max-inbound-peers+)
+     (values nil :backlog))
     ((and (bitcoin-lisp.networking:peer-discouraged-p host)
           (>= (1+ (bt:with-recursive-lock-held ((node-lock node))
                     (count-inbound-peers node)))
@@ -3919,27 +3933,43 @@ phase exits quickly when there's nothing new to fetch."
     (log-warn "No peers connected, cannot sync")
     (return-from sync-blockchain 0))
 
-  ;; IBD drives the current chainstate (its tip and coins view). When an
-  ;; assumeutxo background sync is active, the historical chainstate rides
-  ;; along as a second download cursor inside the same IBD pass: run-ibd
-  ;; queues its [historical-tip .. snapshot-base] range and routes received
-  ;; blocks to whichever chainstate owns their height.
-  (let ((chainstate (node-current-chainstate node))
-        (peer-height (bitcoin-lisp.networking:peer-start-height (find-best-peer node))))
-    (log-debug "Sync cycle: local height ~D, peer-start height ~D"
-               (bitcoin-lisp.storage:current-height chainstate)
-               peer-height)
-    (bitcoin-lisp.networking::start-ibd
-     (node-peers node)
-     chainstate
-     (bitcoin-lisp.storage:chain-state-coins-view chainstate)
-     (node-block-store node)
-     peer-height
-     :historical-chainstate (node-historical-chainstate node)
-     :fee-estimator (node-fee-estimator node)
-     :recent-rejects (node-recent-rejects node)
-     :mempool (node-mempool node)
-     :address-book (node-address-book node))))
+  ;; A non-empty peer list is NOT enough. Peers enter NODE-PEERS only after a
+  ;; successful handshake, but they stay in the list once they go
+  ;; :DISCONNECTED — reaping is REPLACE-DISCONNECTED-PEERS' job, reached via
+  ;; MAINTAIN-PEERS, which the sync loop runs AFTER this function. So a list of
+  ;; nothing but dead peers is reachable, and FIND-BEST-PEER (which only counts
+  ;; :READY) returns NIL for it. Handing that NIL to the PEER-START-HEIGHT
+  ;; accessor is a type error that unwinds the whole sync iteration, so
+  ;; maintain-peers never runs, so the dead peers are never reaped or redialed,
+  ;; so the next iteration fails identically: the failure feeds itself. Proven
+  ;; live — a node logged this type error every 5 seconds for 19 days, 333k
+  ;; times, holding 8 peers it would never replace.
+  (let ((best-peer (find-best-peer node)))
+    (unless best-peer
+      (log-warn "No peer has completed its handshake yet; skipping this sync cycle")
+      (return-from sync-blockchain 0))
+
+    ;; IBD drives the current chainstate (its tip and coins view). When an
+    ;; assumeutxo background sync is active, the historical chainstate rides
+    ;; along as a second download cursor inside the same IBD pass: run-ibd
+    ;; queues its [historical-tip .. snapshot-base] range and routes received
+    ;; blocks to whichever chainstate owns their height.
+    (let ((chainstate (node-current-chainstate node))
+          (peer-height (bitcoin-lisp.networking:peer-start-height best-peer)))
+      (log-debug "Sync cycle: local height ~D, peer-start height ~D"
+                 (bitcoin-lisp.storage:current-height chainstate)
+                 peer-height)
+      (bitcoin-lisp.networking::start-ibd
+       (node-peers node)
+       chainstate
+       (bitcoin-lisp.storage:chain-state-coins-view chainstate)
+       (node-block-store node)
+       peer-height
+       :historical-chainstate (node-historical-chainstate node)
+       :fee-estimator (node-fee-estimator node)
+       :recent-rejects (node-recent-rejects node)
+       :mempool (node-mempool node)
+       :address-book (node-address-book node)))))
 
 
 (defun find-best-peer (node)
