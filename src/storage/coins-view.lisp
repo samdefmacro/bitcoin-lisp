@@ -28,6 +28,21 @@
 marker. coins-view-migration.lisp writes this as its last step so an
 interrupted migration is detectable on the next startup.")
 
+(defconstant +db-prefix-best-block+ #x42        ; 'B' — Core's DB_BEST_BLOCK
+  "1-byte prefix for the block hash this UTXO set corresponds to.
+
+Core keeps this INSIDE the coins database and writes it in the same batch as
+the coin changes (CCoinsViewDB::BatchWrite, txdb.cpp:100-159), so the UTXO
+state and the block it belongs to are one object that cannot disagree. We have
+historically kept the tip in a separate chainstate.dat, which can and does
+disagree — that divergence is the root of the reorg-interrupt hazard and of the
+BIP30 replay brick. See docs/coins-db-best-block-plan.md; this key is phase 1.")
+
+(defun encode-best-block-key ()
+  "The single key under which the coins DB stores its own best block."
+  (make-array 1 :element-type '(unsigned-byte 8)
+                :initial-element +db-prefix-best-block+))
+
 ;; Future prefixes for DB_BEST_BLOCK ('B') and DB_HEAD_BLOCKS ('H')
 ;; will land here when those move into the same LevelDB.
 
@@ -168,6 +183,25 @@ coins-view-db-write-batch for multi-op atomicity."
 (defun coins-view-db-erase (view utxo-key)
   (declare (type coins-view-db view) (type utxo-key utxo-key))
   (leveldb-delete (cvdb-db view) (encode-coin-key utxo-key)))
+
+(defun coins-view-db-best-block (view)
+  "The block hash this UTXO set corresponds to, or NIL if never recorded.
+
+Core's CCoinsView::GetBestBlock. NIL means the database predates this key —
+every write path now sets it, so NIL only ever appears on a chainstate written
+by an older build, not on one that has been flushed since."
+  (declare (type coins-view-db view))
+  (leveldb-get (cvdb-db view) (encode-best-block-key)))
+
+(defun coins-view-batch-set-best-block (batch block-hash)
+  "Stage the coins DB's best-block pointer in BATCH.
+
+Staging it in the SAME batch as the coin puts and erases is the whole point:
+the UTXO changes and the block they belong to then commit or fail together, so
+the pair can never be observed or persisted in disagreement (Core does this in
+CCoinsViewDB::BatchWrite, txdb.cpp:100-159)."
+  (declare (type (simple-array (unsigned-byte 8) (32)) block-hash))
+  (leveldb-writebatch-put batch (encode-best-block-key) block-hash))
 
 (defun coins-view-db-has-p (view utxo-key)
   "Mirrors CCoinsViewDB::HaveCoin (txdb.cpp:81)."

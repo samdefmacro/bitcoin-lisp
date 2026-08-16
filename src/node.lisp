@@ -573,6 +573,37 @@ twice the inbound cap no matter what the rest of the node is doing."
      (values nil :discouraged))
     (t t)))
 
+(defun report-coins-db-best-block-mismatch (node)
+  "Log whether the coins DB's own best-block agrees with chainstate.dat.
+
+Returns :match, :mismatch, :unrecorded (a chainstate written before the coins DB
+carried the pointer — expected once per upgrade, then never again) or NIL when
+there is nothing to compare. Diagnostic only: acting on a mismatch needs the
+roll-forward/backward recovery in phase 2 of docs/coins-db-best-block-plan.md,
+and guessing which of the two records is right would be worse than reporting."
+  (let* ((chainstate (node-chain-state node))
+         (view (and chainstate
+                    (bitcoin-lisp.storage:chain-state-coins-view chainstate))))
+    (unless (typep view 'bitcoin-lisp.storage:coins-view-cache)
+      (return-from report-coins-db-best-block-mismatch nil))
+    (let ((recorded (bitcoin-lisp.storage:coins-view-db-best-block
+                     (bitcoin-lisp.storage:coins-view-cache-base view)))
+          (tip (bitcoin-lisp.storage:best-block-hash chainstate)))
+      (cond
+        ((null recorded)
+         (log-info "Coins DB has no best-block pointer yet; it will be written on the next flush")
+         :unrecorded)
+        ((and tip (equalp recorded tip))
+         :match)
+        (t
+         (log-warn "Coins DB best-block ~A does not match chainstate.dat tip ~A"
+                   (bitcoin-lisp.crypto:bytes-to-hex
+                    (bitcoin-lisp.crypto:reverse-bytes recorded))
+                   (and tip (bitcoin-lisp.crypto:bytes-to-hex
+                             (bitcoin-lisp.crypto:reverse-bytes tip))))
+         (log-warn "The UTXO set and the recorded tip disagree; a reorg or flush was interrupted")
+         :mismatch)))))
+
 (defun run-inbound-listener (node &key (socket (node-listener-socket node)) onion)
   "Accept inbound connections on SOCKET, handshake each, and hand the ready
 peer to the sync thread via pending-inbound-peers. Runs until the node stops.
@@ -2059,6 +2090,18 @@ Returns the node instance."
   ;; Load reconnection anchors (tried first, before DNS seeds — anti-eclipse).
   (load-anchors *node*)
 
+  ;; Cross-check the coins DB's own best-block against chainstate.dat.
+  ;;
+  ;; These are two independent records of one fact, and every corruption story
+  ;; in this area is really a story about them disagreeing: an interrupted reorg
+  ;; rewinds coins while chainstate.dat still names the old tip, and a lost
+  ;; chainstate.dat sends us replaying over a populated UTXO set. Core has no
+  ;; such pair — the pointer lives inside the coins DB and is written in the
+  ;; same batch as the coins (CCoinsViewDB::BatchWrite). Until we finish that
+  ;; alignment (docs/coins-db-best-block-plan.md), at least make a disagreement
+  ;; VISIBLE at startup instead of letting it surface later as a bricked index.
+  (report-coins-db-best-block-mismatch *node*)
+
   ;; Initialize transaction index (optional)
   (when txindex
     (log-info "Initializing transaction index...")
@@ -2664,7 +2707,18 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
             ;; un-durable while chainstate.dat says they are committed. (Was
             ;; :sync nil — atomic but not durable; the shutdown flush already
             ;; syncs, the periodic one now matches it.)
-            (bitcoin-lisp.storage:coins-view-cache-flush view :sync t)))
+            ;; Stamp the coins DB with the tip these coins belong to, inside the
+            ;; same batch. chainstate.dat (written in Phase 3) is a SECOND record
+            ;; of the same fact and the two can disagree — that divergence is
+            ;; what turns an interrupted reorg or a bad sector into a chain-index
+            ;; brick. Core keeps the pointer inside the coins DB for exactly this
+            ;; reason (CCoinsViewDB::BatchWrite). Phase 1 of
+            ;; docs/coins-db-best-block-plan.md: record it and report
+            ;; disagreement; later phases make it the source of truth.
+            (bitcoin-lisp.storage:coins-view-cache-flush
+             view :sync t
+             :best-block (and chainstate
+                              (bitcoin-lisp.storage:best-block-hash chainstate)))))
         ;; Phase 3: commit by re-saving chainstate without the marker.
         (when chainstate
           (bitcoin-lisp.storage:save-state chainstate :in-transition nil))
