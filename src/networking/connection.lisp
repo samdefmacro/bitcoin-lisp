@@ -429,23 +429,53 @@ is noise next to that block's script validation."
              (incf start)))
   start)
 
+(defconstant +min-receive-bytes-per-second+ 32768
+  "Slowest average delivery RECEIVE-BYTES will sit through for one message.
+
+A stall timeout alone is not enough. It is measured from the last byte that
+arrived, so ANY progress renews it: a peer dribbling one byte just inside every
+window keeps the budget alive forever at a cost of ~1 B/s. With the pump's
+one-second timeout that turns a 4 MiB message into roughly 43 DAYS of holding
+the serial pump — an infinite hang traded for a slow-loris, which is no fix at
+all. Requiring an average rate as well bounds the hold to
+COUNT/+MIN-RECEIVE-BYTES-PER-SECOND+ — about 2 minutes for a maximum-size
+message — and makes the attacker pay real bandwidth for every second of it.
+
+256 kbit/s is forgiving enough for genuinely slow honest links while making the
+attack uneconomic.")
+
 (defun receive-bytes (conn count &key (timeout 30))
   "Receive exactly COUNT bytes from the connection.
 Returns a byte vector or NIL on failure/timeout.
 
-TIMEOUT bounds STALLING, not total transfer time: it is measured from the last
-byte that actually arrived, so a slow-but-progressing peer can deliver a large
-block for as long as it keeps making progress, while a peer that stops mid
-message is dropped after TIMEOUT. This is Core's inactivity-timeout shape, and
-it is the only bound that both admits honest slow links and refuses to let one
-silent peer pin the serial message pump forever."
+Two bounds apply, and a peer must satisfy both. TIMEOUT bounds STALLING: it is
+measured from the last byte that actually arrived, so a slow-but-progressing
+peer can keep delivering (Core's inactivity-timeout shape) while a peer that
+stops mid-message is dropped. +MIN-RECEIVE-BYTES-PER-SECOND+ additionally
+bounds the TOTAL, because a stall bound by itself is renewable by dribbling.
+
+Residual limitation, unchanged by these bounds: this reader is synchronous, so
+one peer still owns the shared message pump for the duration of its message.
+Core avoids that entirely by accumulating partial messages per connection
+(CNode::vRecvMsg) and never blocking on any peer. Making our reader resumable
+the same way is the real fix; these bounds only make the worst case finite."
   (handler-case
       (let ((socket (connection-socket conn)))
         (when socket
           (let* ((stream (connection-stream conn))
                  (buffer (make-array count :element-type '(unsigned-byte 8)))
                  (total-read 0)
-                 (last-progress (get-internal-real-time)))
+                 (last-progress (get-internal-real-time))
+                 ;; Whole-message budget: one stall window for latency and
+                 ;; scheduling, PLUS the time the message's own size deserves at
+                 ;; the floor rate (see +MIN-RECEIVE-BYTES-PER-SECOND+). Both
+                 ;; terms are needed — size alone gives a 24-byte header a
+                 ;; sub-millisecond budget, and TIMEOUT alone gives a 4 MiB
+                 ;; block the same budget as that header.
+                 (hard-deadline (+ (get-internal-real-time)
+                                   (* (+ timeout
+                                         (/ count +min-receive-bytes-per-second+))
+                                      internal-time-units-per-second))))
             ;; Serve sniffed-ahead bytes (inbound v1/v2 detection) first.
             (let ((pushback (connection-pushback conn)))
               (when pushback
@@ -463,9 +493,15 @@ silent peer pin the serial message pump forever."
                   ;; abort latency is <=5s instead of up to :timeout.
                   do (when *ibd-stop-requested*
                        (return-from receive-bytes nil))
-                     (let ((time-left (- timeout
-                                         (/ (- (get-internal-real-time) last-progress)
-                                            internal-time-units-per-second))))
+                     (let ((time-left
+                             (min
+                              ;; stall bound: since the last byte that arrived
+                              (- timeout
+                                 (/ (- (get-internal-real-time) last-progress)
+                                    internal-time-units-per-second))
+                              ;; total bound: dribbling must not renew forever
+                              (/ (- hard-deadline (get-internal-real-time))
+                                 internal-time-units-per-second))))
                        (when (<= time-left 0)
                          ;; Out of budget. If we already consumed part of a
                          ;; message those bytes are gone and the caller is told
