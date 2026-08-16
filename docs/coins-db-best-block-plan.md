@@ -74,7 +74,42 @@ Aligning removes the second artifact instead of policing it.
 |---|---|---|
 | **P1** | Coins DB records its own best block, written **in the same batch** as the coin puts/erases; read back on open; startup compares it against `chainstate.dat` and reports a mismatch loudly | **DONE** |
 | **P2** | `SetBestBlock` per block in both the connect and disconnect paths, so the pointer moves WITH the coins; the flush stamps the cache's own pointer rather than the chain's tip | **DONE** |
-| **P3** | Startup reconciliation when the pointer and `chainstate.dat` disagree (roll the coins forward/backward, Core's `ReplayBlocks`), and cooperative shutdown (interrupt flag checked between blocks) retiring the `destroy-thread` fallback | not started |
+| **P3a** | Startup reconciliation when the pointer and `chainstate.dat` disagree | **DONE** |
+| **P3b** | Cooperative shutdown: a stop check between blocks in `perform-reorg`, retiring the `destroy-thread` fallback | not started — see the design note below |
+
+P3a needed no roll at all. Core's `ReplayBlocks` exists because `DB_HEAD_BLOCKS`
+gives it a RANGE and it must move the coins to one end of it; our pointer is
+exact, so the cheap record moves to the expensive one and normal sync
+re-validates the gap. An unplaceable pointer (naming a block with no index
+entry) is reported and refused rather than guessed at.
+
+### P3b design note — the decision that must be made deliberately
+
+The obvious implementation is to check `*ibd-stop-requested*` between blocks in
+`perform-reorg`'s PHASE A and PHASE B and return without rolling back. With P2
+and P3a that is safe **for shutdown**: the coins stop on a block boundary, the
+pointer names it, and the next startup reconciles.
+
+But `*ibd-stop-requested*` is **not shutdown-specific** — `call-with-sync-paused`
+(`node.lisp:882`, assumeutxo snapshot activation) sets it too, and the node keeps
+RUNNING afterwards. Aborting a reorg on that path would leave the in-memory
+chainstate naming the old tip while the coins sit at an intermediate block: the
+same inconsistency, moved from disk into memory, where startup reconciliation
+never sees it.
+
+So P3b must do one of:
+- **(i)** check a shutdown-specific flag only, leaving pause-driven interruption
+  as it is today; or
+- **(ii)** on abort, also move the IN-MEMORY tip to the coins' block (the same
+  rule P3a applies on disk), so memory and coins agree immediately and the
+  following flush persists a consistent pair.
+
+(ii) is the more complete answer and reuses the rule already established, but it
+touches reorg control flow — including what the caller does with the
+`(values nil reason)` it gets back, and whether `%rollback-partial-reorg` should
+be skipped (it should: the coins are already at a clean boundary and rolling
+back during a shutdown is work that can itself be interrupted). Decide this
+deliberately rather than by reflex.
 
 Phase order was corrected while implementing: per-block `SetBestBlock` had to
 come FIRST. Without it the flush stamps whatever the caller believes the tip is,
