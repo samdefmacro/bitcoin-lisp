@@ -651,7 +651,15 @@ on-disk 36-byte key order — same raw order %utxo-set-iterate produces.
 utxo-set-iterate layers Core's numeric-vout cursor order on top."
   (coins-view-cache-flush cache)
   (with-leveldb-iterator (iter (cvdb-db (cvc-base cache)))
-    (leveldb-iter-seek-to-first iter)
+    ;; SEEK to the coin prefix rather than seeking to the first key. The loop
+    ;; below stops at the first non-'C' key, which is only a correct scan if
+    ;; every other prefix sorts AFTER 'C' — an assumption this code used to
+    ;; state and that the best-block key ('B', matching Core's DB_BEST_BLOCK)
+    ;; broke: it became the first key in the database, so the scan terminated
+    ;; immediately and the whole UTXO set iterated as EMPTY. Seeking makes the
+    ;; scan independent of where any metadata prefix sorts.
+    (leveldb-iter-seek iter (make-array 1 :element-type '(unsigned-byte 8)
+                                          :initial-element +db-prefix-coin+))
     (let ((txid-buf (make-array 32 :element-type '(unsigned-byte 8))))
       (loop
         (unless (leveldb-iter-valid-p iter) (return))
