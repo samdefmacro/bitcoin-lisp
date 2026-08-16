@@ -1866,7 +1866,22 @@ Returns the node instance."
       ((t)
        (log-info "Loaded existing chain state: height ~D"
                  (bitcoin-lisp.storage:current-height (node-chain-state *node*))))
-      ((nil) nil)))
+      ((:corrupt)
+       ;; The file exists but no format validated, so we cannot say which tip
+       ;; the on-disk UTXO set belongs to. Continuing would silently start from
+       ;; genesis and replay blocks whose coins are already present, which on
+       ;; mainnet trips the BIP30 duplicate-txid check and ends with NO
+       ;; best-valid-tip at all — a bricked index that looks like a consensus
+       ;; failure. Refuse instead: an operator can reindex or restore, and a
+       ;; deterministic startup failure is what the supervisor backs off on
+       ;; rather than respawning into the same wall.
+       (log-error "chainstate.dat is present but unreadable (failed integrity check).")
+       (log-error "Refusing to start: replaying over the existing UTXO set would corrupt the chain index.")
+       (log-error "Recover by restoring a backup of chainstate.dat, or reindex from the block files.")
+       (error "Corrupt chainstate.dat at ~A" (node-data-directory *node*)))
+      ;; NIL means no chainstate file at all — a legitimate first run.
+      ((nil)
+       (log-info "No chain state on disk; starting from genesis"))))
 
   ;; Initialize block store
   (log-info "Initializing block storage...")
