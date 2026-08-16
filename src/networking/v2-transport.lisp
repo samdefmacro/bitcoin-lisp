@@ -117,52 +117,113 @@ success."
                    (v2-transport-cipher transport) contents aad ignore)))
       (and (send-bytes conn packet) t))))
 
-(defun %v2-recv-packet (conn transport deadline)
-  "Read and decrypt one v2 packet, skipping decoys, bounded by DEADLINE. The
-transport's pending RECV-AAD (the peer's garbage) is consumed by the first
-successfully-decrypted packet, decoy or not. Returns (values contents ignore)
-for the first non-decoy packet, or NIL on timeout, oversize, or
-authentication failure. Any protocol violation, or any read failure AFTER the
-length descriptor has advanced the receive cipher, marks the connection dead:
-the cipher stream is then unrecoverable, so the connection must not linger as
-a zombie (Core CloseConnection)."
-  (loop
-    (let ((len3 (%v2-read conn bitcoin-lisp.crypto:+bip324-length-len+ deadline)))
-      (unless len3 (return nil))
-      (let ((len (bitcoin-lisp.crypto:bip324-cipher-decrypt-length
-                  (v2-transport-cipher transport) len3)))
-        (when (> len +v2-max-contents-len+)
-          (bitcoin-lisp:log-warn "V2 transport: packet too large (~D bytes) from ~A, disconnecting"
-                                 len (connection-host conn))
-          (setf (connection-connected conn) nil)
-          (return nil))
-        (let ((rest (%v2-read conn (+ len bitcoin-lisp.crypto:+bip324-header-len+
-                                      bitcoin-lisp.crypto:+poly1305-taglen+)
-                              deadline)))
-          ;; The length cipher already advanced; a partial/timed-out body read
-          ;; leaves the stream and cipher desynced -- fatal.
-          (unless rest
+(defconstant +v2-max-recv-bytes-per-call+ 65536
+  "Ceiling on the bytes one %V2-RECV-PACKET call will consume before yielding.
+
+Without it, decoy-skipping is an unbounded loop: the loop only ends on a
+NON-decoy packet, and a peer streaming minimum-size decoys (20 bytes: length +
+header + tag, empty contents, IGNORE set) keeps our socket non-empty forever, so
+one peer owns the shared pump for as long as it cares to send — with the
+per-cycle message cap powerless, because this all happens inside ONE
+receive-message call. Decrypting costs us more per byte than sending costs the
+peer, so a modest sender stays ahead.
+
+Core bounds the same thing structurally: at most 0x10000 bytes per node per
+socket-handler pass (net.cpp:2171-2183), with V2Transport::ReceivedBytes
+consuming only that span. Past the budget we answer :INCOMPLETE — no data is
+lost and the framing state is clean between packets, so the next pass resumes
+exactly here after every other peer has had its turn.")
+
+(defun %v2-recv-packet (conn transport)
+  "Take the next decrypted v2 packet WITHOUT waiting, skipping decoys.
+
+Returns the first non-decoy packet's contents, :INCOMPLETE if more passes are
+needed (part of a packet has arrived, or this call hit its work budget), or NIL
+on oversize / authentication failure / EOF. The transport's pending RECV-AAD (the peer's
+garbage) is consumed by the first successfully-decrypted packet, decoy or not.
+
+Resumable for the same reason the v1 reader is (Core makes it a property of the
+Transport interface, not of one wire format): the shared pump must not wait on
+any peer, and a v2 packet body can be 4 MB.
+
+The framing is unforgiving in a way v1's is not. Decrypting the 3-byte length
+descriptor ADVANCES the receive cipher and cannot be repeated, so once it is
+consumed the body must be completed or the connection is dead — the cipher
+stream is unrecoverable (Core CloseConnection). That is exactly why the expected
+body length is parked on the CONNECTION between passes rather than recomputed."
+  (let ((consumed 0))
+   (loop
+    ;; Stage 1: the length descriptor, unless an earlier pass already took it.
+    (unless (connection-recv-framing conn)
+      (let ((len3 (receive-bytes-resumable
+                   conn bitcoin-lisp.crypto:+bip324-length-len+)))
+        (when (eq len3 :incomplete) (return :incomplete))
+        (unless len3 (return nil))
+        (let ((len (bitcoin-lisp.crypto:bip324-cipher-decrypt-length
+                    (v2-transport-cipher transport) len3)))
+          (when (> len +v2-max-contents-len+)
+            (bitcoin-lisp:log-warn "V2 transport: packet too large (~D bytes) from ~A, disconnecting"
+                                   len (connection-host conn))
             (setf (connection-connected conn) nil)
             (return nil))
-          (multiple-value-bind (contents ignore)
-              (bitcoin-lisp.crypto:bip324-cipher-decrypt
-               (v2-transport-cipher transport) rest
-               (or (v2-transport-recv-aad transport) *v2-empty-bytes*))
-            (unless contents
-              (bitcoin-lisp:log-warn "V2 transport: packet auth failure from ~A, disconnecting"
-                                     (connection-host conn))
-              (setf (connection-connected conn) nil)
-              (return nil))
-            ;; AAD (the peer's garbage) is authenticated by the first packet.
-            (setf (v2-transport-recv-aad transport) nil)
-            (unless ignore
-              (return (values contents nil)))))))))
+          ;; The cipher has advanced: from here the packet must complete or the
+          ;; connection dies.
+          (setf (connection-recv-framing conn)
+                (+ len bitcoin-lisp.crypto:+bip324-header-len+
+                   bitcoin-lisp.crypto:+poly1305-taglen+)))))
+    ;; Stage 2: the body, which may take as many passes as it takes.
+    (let ((rest (receive-bytes-resumable conn (connection-recv-framing conn))))
+      (when (eq rest :incomplete) (return :incomplete))
+      (setf (connection-recv-framing conn) nil)
+      ;; A body read that failed leaves the stream and cipher desynced — fatal.
+      ;; (receive-bytes-resumable has already dropped the connection; say so
+      ;; explicitly since the cipher, not just the framing, is unrecoverable.)
+      (unless rest
+        (setf (connection-connected conn) nil)
+        (return nil))
+      (multiple-value-bind (contents ignore)
+          (bitcoin-lisp.crypto:bip324-cipher-decrypt
+           (v2-transport-cipher transport) rest
+           (or (v2-transport-recv-aad transport) *v2-empty-bytes*))
+        (unless contents
+          (bitcoin-lisp:log-warn "V2 transport: packet auth failure from ~A, disconnecting"
+                                 (connection-host conn))
+          (setf (connection-connected conn) nil)
+          (return nil))
+        ;; AAD (the peer's garbage) is authenticated by the first packet.
+        (setf (v2-transport-recv-aad transport) nil)
+        (unless ignore
+          (return contents))
+        ;; A decoy. Loop for the real packet — but yield first if this call has
+        ;; already done a pump's worth of work (see the budget constant).
+        (incf consumed (+ bitcoin-lisp.crypto:+bip324-length-len+ (length rest)))
+        (when (> consumed +v2-max-recv-bytes-per-call+)
+          (return :incomplete)))))))
 
-(defun v2-send-message (conn transport message-bytes)
-  "Send a v1-FRAMED message over the v2 transport: strip the v1 envelope the
-message builders produce (magic, 12-byte command, length, checksum) and remap
-to BIP324 contents (short ID byte, or 0x00 + the 12 type bytes verbatim,
-followed by the payload). Returns T on success."
+(defun %v2-recv-packet-blocking (conn transport deadline)
+  "WAIT for the next v2 packet, bounded by DEADLINE. For the handshake's version
+packet, which nothing can proceed without. The pump must not use this — see
+%V2-RECV-PACKET."
+  (loop
+    (let ((result (%v2-recv-packet conn transport)))
+      (unless (eq result :incomplete)
+        (return result)))
+    (when (or *ibd-stop-requested*
+              (not (connection-connected conn))
+              (>= (get-internal-real-time) deadline))
+      ;; %receive-gave-up owns this rule: it drops the connection when any of
+      ;; the packet was consumed — for v2 that means the cipher has advanced
+      ;; past a length we can never re-read — and clears the accumulator either
+      ;; way. Hand-rolling it here stranded the body buffer (up to 4 MB) and
+      ;; missed a give-up partway through the length descriptor.
+      (return (%receive-gave-up conn)))
+    (data-available-p conn :timeout 0.2)))
+
+(defun %v2-contents-for-message (message-bytes)
+  "BIP324 packet contents for a v1-FRAMED message: strip the v1 envelope the
+message builders produce (magic, 12-byte command, length, checksum) and remap to
+a short ID byte, or 0x00 + the 12 type bytes verbatim, followed by the payload.
+The inverse of %V2-DECODE-MESSAGE."
   (let* ((command (bitcoin-lisp.serialization:bytes-to-command
                    (subseq message-bytes 4 16)))
          (payload-len (- (length message-bytes) 24))
@@ -174,29 +235,52 @@ followed by the payload). Returns T on success."
         (setf (aref contents 0) short-id)
         (replace contents message-bytes :start1 1 :start2 4 :end2 16))
     (replace contents message-bytes :start1 (if short-id 1 13) :start2 24)
-    (%v2-send-packet conn transport contents *v2-empty-bytes* nil)))
+    contents))
 
-(defun v2-receive-message (conn transport &key (timeout 30))
-  "Receive one application message over the v2 transport. Returns
-(values command payload) like the v1 receive path, or NIL on failure
-(including an invalid message type encoding, which Core also rejects)."
-  (multiple-value-bind (contents ignore)
-      (%v2-recv-packet conn transport (%v2-deadline timeout))
-    (declare (ignore ignore))
-    (when (and contents (plusp (length contents)))
-      (let ((first-byte (aref contents 0)))
-        (cond ((and (plusp first-byte) (< first-byte (length *v2-message-ids*)))
-               (values (aref *v2-message-ids* first-byte) (subseq contents 1)))
-              ((and (zerop first-byte) (>= (length contents) 13))
-               ;; Long form: 12 bytes, ASCII up to the first NUL, NULs after.
-               (let* ((type-end (or (position 0 contents :start 1 :end 13) 13))
-                      (command (map 'string #'code-char
-                                    (subseq contents 1 type-end))))
-                 (when (and (loop for i from 1 below type-end
-                                  always (<= 32 (aref contents i) 127))
-                            (loop for i from type-end below 13
-                                  always (zerop (aref contents i))))
-                   (values command (subseq contents 13))))))))))
+(defun v2-send-message (conn transport message-bytes)
+  "Send a v1-FRAMED message over the v2 transport. Returns T on success."
+  (%v2-send-packet conn transport (%v2-contents-for-message message-bytes)
+                   *v2-empty-bytes* nil))
+
+(defun %v2-decode-message (contents)
+  "Map BIP324 packet CONTENTS to (values command payload): a short-ID first
+byte, or 0x00 followed by the 12 type bytes verbatim. NIL for an invalid type
+encoding, which Core also rejects."
+  (when (and contents (plusp (length contents)))
+    (let ((first-byte (aref contents 0)))
+      (cond ((and (plusp first-byte) (< first-byte (length *v2-message-ids*)))
+             (values (aref *v2-message-ids* first-byte) (subseq contents 1)))
+            ((and (zerop first-byte) (>= (length contents) 13))
+             ;; Long form: 12 bytes, ASCII up to the first NUL, NULs after.
+             (let* ((type-end (or (position 0 contents :start 1 :end 13) 13))
+                    (command (map 'string #'code-char
+                                  (subseq contents 1 type-end))))
+               (when (and (loop for i from 1 below type-end
+                                always (<= 32 (aref contents i) 127))
+                          (loop for i from type-end below 13
+                                always (zerop (aref contents i))))
+                 (values command (subseq contents 13)))))))))
+
+(defun v2-receive-message (conn transport &key timeout)
+  "Take one application message off the v2 transport WITHOUT waiting. Returns
+(values command payload), (VALUES NIL :INCOMPLETE) while a packet is still
+arriving, or NIL on failure.
+
+TIMEOUT is accepted and ignored: this path applies no clock, exactly as the v1
+one does not. Whoever waits owns the budget — receive-bytes for a blocking
+call, the pump's stall reap otherwise."
+  (declare (ignore timeout))
+  (let ((result (%v2-recv-packet conn transport)))
+    (if (eq result :incomplete)
+        (values nil :incomplete)
+        (%v2-decode-message result))))
+
+(defun v2-receive-message-blocking (conn transport &key (timeout 30))
+  "WAIT for one application message over the v2 transport. The blocking twin of
+V2-RECEIVE-MESSAGE, for synchronous exchanges (and tests); the pump uses the
+resumable one."
+  (%v2-decode-message
+   (%v2-recv-packet-blocking conn transport (%v2-deadline timeout))))
 
 ;;; --- Handshake ---
 
@@ -256,7 +340,7 @@ Returns the ready v2-transport or NIL."
                                           :recv-aad their-garbage)))
         ;; Their first non-decoy packet is version negotiation; contents are
         ;; ignored (empty today; extensions may add to it).
-        (when (%v2-recv-packet conn transport deadline)
+        (when (%v2-recv-packet-blocking conn transport deadline)
           transport)))))
 
 (defun v2-handshake-outbound (conn &key (timeout 30))
