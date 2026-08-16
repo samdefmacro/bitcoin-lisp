@@ -557,19 +557,21 @@ in PENDING-INBOUND-PEERS, so anything that stalls that thread turns every new
 connection into a leaked descriptor — the live wedge of 2026-08-16 accumulated
 751 sockets in CLOSE-WAIT this way. Counting the queue bounds the damage at
 twice the inbound cap no matter what the rest of the node is doing."
-  (multiple-value-bind (inbound pending)
-      (bt:with-recursive-lock-held ((node-lock node))
-        (values (count-inbound-peers node)
-                (length (node-pending-inbound-peers node))))
-    (cond
-      ((bitcoin-lisp.networking:peer-banned-p host)
-       (values nil :banned))
-      ((>= pending +max-inbound-peers+)
-       (values nil :backlog))
-      ((and (bitcoin-lisp.networking:peer-discouraged-p host)
-            (>= (1+ inbound) +max-inbound-peers+))
-       (values nil :discouraged))
-      (t t))))
+  ;; Ban check first and lock-free: a connect flood is exactly when the listener
+  ;; must not contend with the sync thread and RPC readers for the node lock.
+  (cond
+    ((bitcoin-lisp.networking:peer-banned-p host)
+     (values nil :banned))
+    ((>= (bt:with-recursive-lock-held ((node-lock node))
+           (length (node-pending-inbound-peers node)))
+         +max-inbound-peers+)
+     (values nil :backlog))
+    ((and (bitcoin-lisp.networking:peer-discouraged-p host)
+          (>= (1+ (bt:with-recursive-lock-held ((node-lock node))
+                    (count-inbound-peers node)))
+              +max-inbound-peers+))
+     (values nil :discouraged))
+    (t t)))
 
 (defun run-inbound-listener (node &key (socket (node-listener-socket node)) onion)
   "Accept inbound connections on SOCKET, handshake each, and hand the ready
@@ -3931,15 +3933,17 @@ phase exits quickly when there's nothing new to fetch."
     (log-warn "No peers connected, cannot sync")
     (return-from sync-blockchain 0))
 
-  ;; A non-empty peer list is NOT enough: every entry can still be
-  ;; mid-handshake, and find-best-peer only considers :READY peers. Passing its
-  ;; NIL to the peer-start-height accessor is a type error that unwinds the
-  ;; whole sync iteration — INCLUDING the message pump below, which is the only
-  ;; thing that ever advances a handshake to :READY. That makes the failure
-  ;; self-sustaining: once the last :READY peer goes away while stale entries
-  ;; remain, the node can never recover on its own. Proven live: a node spent
-  ;; 19 days logging this type error every 5 seconds, 333k times, while its
-  ;; 8 peers sat forever unhandshaked.
+  ;; A non-empty peer list is NOT enough. Peers enter NODE-PEERS only after a
+  ;; successful handshake, but they stay in the list once they go
+  ;; :DISCONNECTED — reaping is REPLACE-DISCONNECTED-PEERS' job, reached via
+  ;; MAINTAIN-PEERS, which the sync loop runs AFTER this function. So a list of
+  ;; nothing but dead peers is reachable, and FIND-BEST-PEER (which only counts
+  ;; :READY) returns NIL for it. Handing that NIL to the PEER-START-HEIGHT
+  ;; accessor is a type error that unwinds the whole sync iteration, so
+  ;; maintain-peers never runs, so the dead peers are never reaped or redialed,
+  ;; so the next iteration fails identically: the failure feeds itself. Proven
+  ;; live — a node logged this type error every 5 seconds for 19 days, 333k
+  ;; times, holding 8 peers it would never replace.
   (let ((best-peer (find-best-peer node)))
     (unless best-peer
       (log-warn "No peer has completed its handshake yet; skipping this sync cycle")

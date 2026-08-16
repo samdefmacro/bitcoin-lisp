@@ -410,7 +410,11 @@ dead, or send-paused with the buffer over +max-send-buffer-bytes+."
 
 (defun drain-available-bytes (stream buffer start end)
   "Copy every byte STREAM can supply right now into BUFFER[START..END), without
-ever blocking. Returns the new fill pointer, or NIL if the peer closed.
+ever blocking. Returns the new fill pointer; a return equal to START means
+nothing was available, which at EOF is how the caller learns the peer closed
+(LISTEN reports false at EOF rather than signalling, so EOF and
+nothing-yet-arrived are the same answer here — the caller distinguishes them by
+having been told the socket was readable).
 
 This is the whole reason RECEIVE-BYTES cannot use READ-SEQUENCE: READ-SEQUENCE
 fills its whole range or hits EOF, and a socket stream that runs dry mid-range
@@ -419,30 +423,38 @@ that keeps the reader safe — is there a byte I can take without waiting — so
 draining byte-by-byte is bounded by construction. It is also fast: measured at
 ~95 MB/s on the project container, i.e. ~40 ms for a maximum-size block, which
 is noise next to that block's script validation."
-  (loop while (< start end)
-        do (unless (listen stream)
-             (return-from drain-available-bytes start))
-           (let ((byte (read-byte stream nil nil)))
+  (loop while (and (< start end) (listen stream))
+        do (let ((byte (read-byte stream nil nil)))
+             ;; LISTEN said a byte was there; NIL would mean it vanished, which
+             ;; cannot happen on a stream we alone read. Stop rather than store
+             ;; a bogus value.
              (unless byte
-               (return-from drain-available-bytes nil))
+               (return-from drain-available-bytes start))
              (setf (aref buffer start) byte)
              (incf start)))
   start)
 
-(defconstant +min-receive-bytes-per-second+ 32768
+(defconstant +min-receive-bytes-per-second+ 16384
   "Slowest average delivery RECEIVE-BYTES will sit through for one message.
 
 A stall timeout alone is not enough. It is measured from the last byte that
 arrived, so ANY progress renews it: a peer dribbling one byte just inside every
 window keeps the budget alive forever at a cost of ~1 B/s. With the pump's
-one-second timeout that turns a 4 MiB message into roughly 43 DAYS of holding
-the serial pump — an infinite hang traded for a slow-loris, which is no fix at
-all. Requiring an average rate as well bounds the hold to
-COUNT/+MIN-RECEIVE-BYTES-PER-SECOND+ — about 2 minutes for a maximum-size
-message — and makes the attacker pay real bandwidth for every second of it.
+one-second timeout that turns a maximum-size message into roughly 43 DAYS of
+holding the serial pump — an infinite hang traded for a slow-loris, which is no
+fix at all. Requiring an average rate as well bounds the hold to
+COUNT/+MIN-RECEIVE-BYTES-PER-SECOND+ and makes the attacker pay real bandwidth
+for every second of it.
 
-256 kbit/s is forgiving enough for genuinely slow honest links while making the
-attack uneconomic.")
+The rate is a straight trade against honest slow links, because a peer below it
+is dropped mid-message. 128 kbit/s is chosen to stay under plausible onion
+throughput — this node treats Tor as a first-class transport — at the cost of a
+looser bound (~4 minutes for a maximum-size message, and the attacker must send
+its whole 4,000,000 bytes to buy that). Core makes no such trade: it never
+drops a slow-but-progressing peer, because it never blocks on one. Closing that
+gap needs the resumable reader described on RECEIVE-BYTES, not a higher rate
+here — raising this constant buys a tighter DoS bound by disconnecting honest
+peers, which is the wrong side of the trade.")
 
 (defun receive-bytes (conn count &key (timeout 30))
   "Receive exactly COUNT bytes from the connection.
@@ -492,6 +504,11 @@ the same way is the real fix; these bounds only make the worst case finite."
                   ;; iteration (wait-for-input below is capped at 5s chunks), so
                   ;; abort latency is <=5s instead of up to :timeout.
                   do (when *ibd-stop-requested*
+                       ;; Same framing rule as the timeout path below: bytes
+                       ;; already consumed are dropped on the floor, so a
+                       ;; partially-read message leaves the stream unusable.
+                       (when (plusp total-read)
+                         (setf (connection-connected conn) nil))
                        (return-from receive-bytes nil))
                      (let ((time-left
                              (min
@@ -535,9 +552,11 @@ the same way is the real fix; these bounds only make the worst case finite."
                          ;; logged.
                          (let ((n (drain-available-bytes stream buffer
                                                          total-read count)))
-                           (when (or (null n) (= n total-read))
-                             ;; Closed, or ready-but-empty: either way this
-                             ;; connection is finished.
+                           (when (= n total-read)
+                             ;; Readable but nothing to take: EOF, i.e. the peer
+                             ;; closed. (The old code reached the same
+                             ;; conclusion from read-sequence making no
+                             ;; progress.)
                              (setf (connection-connected conn) nil)
                              (return-from receive-bytes nil))
                            (setf total-read n
