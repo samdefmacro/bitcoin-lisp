@@ -780,12 +780,21 @@ std::map<uint32_t, Coin>, coinstats.cpp:118-141) is guaranteed by
 utxo-set-iterate's cursor contract.
 
 Returns the 32-byte digest in internal byte order (hash-to-hex reverses
-for display, matching Core's uint256::GetHex)."
-  (let ((buf (bitcoin-lisp.serialization:make-byte-buf)))
+for display, matching Core's uint256::GetHex).
+
+Hashes INCREMENTALLY. Accumulating the whole set into one buffer and hashing
+it at the end needs memory proportional to the UTXO set — measured at ~1.1 GB
+on testnet4's 14.2M coins, which killed a live node outright: the buffer's
+final doubling asked for 1,156,098,560 bytes with 632 MB left in a 6 GB heap,
+and the fail-fast debugger hook turned the heap exhaustion into process exit.
+Mainnet's set is an order of magnitude larger, so this could never have worked
+there. Core streams it the same way (ApplyHash, coinstats.cpp:88-146). Memory
+is now flat in the size of one coin's preimage."
+  (let ((digest (ironclad:make-digest :sha256)))
     (utxo-set-iterate
      view
      (lambda (txid vout entry)
-       (bitcoin-lisp.serialization:bb-write-bytes
-        buf (coin-muhash-element* txid vout entry))))
-    (bitcoin-lisp.crypto:hash256
-     (bitcoin-lisp.serialization:bb-finish buf))))
+       (ironclad:update-digest digest (coin-muhash-element* txid vout entry))))
+    ;; hash_serialized_3 is a DOUBLE SHA-256: finalize the streamed inner pass,
+    ;; then hash that 32-byte digest again.
+    (bitcoin-lisp.crypto:sha256 (ironclad:produce-digest digest))))
