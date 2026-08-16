@@ -573,19 +573,33 @@ twice the inbound cap no matter what the rest of the node is doing."
      (values nil :discouraged))
     (t t)))
 
-(defun report-coins-db-best-block-mismatch (node)
-  "Log whether the coins DB's own best-block agrees with chainstate.dat.
+(defun reconcile-coins-db-best-block (node)
+  "Make chainstate.dat agree with where the coins actually are.
 
-Returns :match, :mismatch, :unrecorded (a chainstate written before the coins DB
-carried the pointer — expected once per upgrade, then never again) or NIL when
-there is nothing to compare. Diagnostic only: acting on a mismatch needs the
-roll-forward/backward recovery in phase 2 of docs/coins-db-best-block-plan.md,
-and guessing which of the two records is right would be worse than reporting."
+Returns :match, :reconciled, :unresolvable, :unrecorded (a chainstate written
+before the coins DB carried the pointer) or NIL when there is nothing to
+compare.
+
+The coins DB records the block its UTXO state corresponds to, moved with the
+coins themselves, so a disagreement with chainstate.dat is not ambiguous: the
+pointer is the fact and the tip record is the stale copy. THE COINS WIN. That
+direction is not a preference — a UTXO set cannot be reconstructed from the tip
+record, while the tip record is one hash we can rewrite, and the same choice is
+what the older in-transition recovery already makes by probing.
+
+Core reaches the same end differently: DB_HEAD_BLOCKS gives it a RANGE, so
+ReplayBlocks must roll the coins to one end of it (validation.cpp:4812-4889).
+Our pointer is exact, so there is nothing to roll — we move the cheap record to
+the expensive one and let normal sync re-validate the gap.
+
+Unresolvable means the coins name a block we have no index entry for, which no
+amount of local reasoning can fix; the caller should treat that as fatal rather
+than proceed on a tip we cannot place."
   (let* ((chainstate (node-chain-state node))
          (view (and chainstate
                     (bitcoin-lisp.storage:chain-state-coins-view chainstate))))
     (unless (typep view 'bitcoin-lisp.storage:coins-view-cache)
-      (return-from report-coins-db-best-block-mismatch nil))
+      (return-from reconcile-coins-db-best-block nil))
     (let ((recorded (bitcoin-lisp.storage:coins-view-db-best-block
                      (bitcoin-lisp.storage:coins-view-cache-base view)))
           (tip (bitcoin-lisp.storage:best-block-hash chainstate)))
@@ -596,13 +610,29 @@ and guessing which of the two records is right would be worse than reporting."
         ((and tip (equalp recorded tip))
          :match)
         (t
-         (log-warn "Coins DB best-block ~A does not match chainstate.dat tip ~A"
-                   (bitcoin-lisp.crypto:bytes-to-hex
-                    (bitcoin-lisp.crypto:reverse-bytes recorded))
-                   (and tip (bitcoin-lisp.crypto:bytes-to-hex
-                             (bitcoin-lisp.crypto:reverse-bytes tip))))
-         (log-warn "The UTXO set and the recorded tip disagree; a reorg or flush was interrupted")
-         :mismatch)))))
+         (let ((entry (bitcoin-lisp.storage:get-block-index-entry chainstate recorded)))
+           (cond
+             ((null entry)
+              (log-error "Coins DB best-block ~A is not in the block index; cannot place the UTXO set"
+                         (bitcoin-lisp.crypto:bytes-to-hex
+                          (bitcoin-lisp.crypto:reverse-bytes recorded)))
+              :unresolvable)
+             (t
+              (let ((coins-height (bitcoin-lisp.storage:block-index-entry-height entry))
+                    (tip-height (bitcoin-lisp.storage:current-height chainstate)))
+                (log-warn "UTXO set is at height ~D (~A) but chainstate.dat records tip height ~D; a reorg or flush was interrupted"
+                          coins-height
+                          (bitcoin-lisp.crypto:bytes-to-hex
+                           (bitcoin-lisp.crypto:reverse-bytes recorded))
+                          tip-height)
+                (setf (bitcoin-lisp.storage::chain-state-best-block-hash chainstate)
+                      (copy-seq recorded)
+                      (bitcoin-lisp.storage::chain-state-best-height chainstate)
+                      coins-height)
+                (bitcoin-lisp.storage:save-state chainstate :in-transition nil)
+                (log-warn "Recovered: chainstate.dat moved to the UTXO set's own block; sync will re-validate the gap")
+                :reconciled)))))))))
+
 
 (defun run-inbound-listener (node &key (socket (node-listener-socket node)) onion)
   "Accept inbound connections on SOCKET, handshake each, and hand the ready
@@ -2095,17 +2125,19 @@ Returns the node instance."
   ;; Load reconnection anchors (tried first, before DNS seeds — anti-eclipse).
   (load-anchors *node*)
 
-  ;; Cross-check the coins DB's own best-block against chainstate.dat.
+  ;; Reconcile chainstate.dat with where the coins actually are.
   ;;
-  ;; These are two independent records of one fact, and every corruption story
-  ;; in this area is really a story about them disagreeing: an interrupted reorg
-  ;; rewinds coins while chainstate.dat still names the old tip, and a lost
-  ;; chainstate.dat sends us replaying over a populated UTXO set. Core has no
-  ;; such pair — the pointer lives inside the coins DB and is written in the
-  ;; same batch as the coins (CCoinsViewDB::BatchWrite). Until we finish that
-  ;; alignment (docs/coins-db-best-block-plan.md), at least make a disagreement
-  ;; VISIBLE at startup instead of letting it surface later as a bricked index.
-  (report-coins-db-best-block-mismatch *node*)
+  ;; These are two records of one fact and every corruption story here is them
+  ;; disagreeing: an interrupted reorg rewinds coins while chainstate.dat still
+  ;; names the old tip. The coins DB's pointer moves WITH the coins, so it is
+  ;; the fact and the tip record is the stale copy — move the record, then let
+  ;; normal sync re-validate the gap. This runs unconditionally, unlike the
+  ;; older in-transition recovery, because the case that motivated it leaves no
+  ;; marker at all: an interrupted reorg whose cache is then flushed cleanly.
+  (when (eq :unresolvable (reconcile-coins-db-best-block *node*))
+    (log-error "Refusing to start: the UTXO set names a block this node cannot place.")
+    (log-error "Recover by reindexing from the block files, or restore a backup.")
+    (error "Unplaceable UTXO set in ~A" (node-data-directory *node*)))
 
   ;; Initialize transaction index (optional)
   (when txindex
