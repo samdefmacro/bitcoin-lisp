@@ -57,7 +57,7 @@ must be skipped, and a 0-length payload."
                             (bitcoin-lisp.networking::v2-send-message
                              client transport (%v2t-frame "inv" (%bc-hex "00")))
                             (multiple-value-bind (cmd payload)
-                                (bitcoin-lisp.networking::v2-receive-message
+                                (bitcoin-lisp.networking::v2-receive-message-blocking
                                  client transport :timeout 10)
                               (setf client-result (list cmd payload)))))
                       (error (e) (setf client-result e))))
@@ -67,7 +67,7 @@ must be skipped, and a 0-length payload."
             (when (bitcoin-lisp.networking::v2-transport-p transport)
               ;; Receive the client's short-ID message.
               (multiple-value-bind (cmd payload)
-                  (bitcoin-lisp.networking::v2-receive-message server transport
+                  (bitcoin-lisp.networking::v2-receive-message-blocking server transport
                                                                :timeout 10)
                 (is (equal "inv" cmd))
                 (is (equalp (%bc-hex "00") payload)))
@@ -111,7 +111,7 @@ oversize length descriptor."
             ;; heavy; instead assert the healthy receive works, then a
             ;; hand-corrupted length triggers oversize.
             (multiple-value-bind (cmd payload)
-                (bitcoin-lisp.networking::v2-receive-message server server-transport
+                (bitcoin-lisp.networking::v2-receive-message-blocking server server-transport
                                                              :timeout 10)
               (declare (ignore payload))
               (is-true cmd))
@@ -120,7 +120,7 @@ oversize length descriptor."
             ;; assert the connection dies, since the exact decrypted length is
             ;; cipher-dependent; feed 3 bytes then let the read fail.
             (bitcoin-lisp.networking:send-bytes client (%bc-hex "ffffff"))
-            (bitcoin-lisp.networking::v2-receive-message server server-transport
+            (bitcoin-lisp.networking::v2-receive-message-blocking server server-transport
                                                          :timeout 2)
             (is-false (bitcoin-lisp.networking:connection-connected server)))))))
 
@@ -164,3 +164,137 @@ and pushed back so the v1 path reads them unchanged."
         (is (eq :fallback-v1
                 (bitcoin-lisp.networking::v2-handshake-outbound client
                                                                 :timeout 2))))))
+
+(test v2-receive-resumes-a-packet-split-across-passes
+  "The property this transport was missing. BIP324 framing is a 3-byte length
+descriptor and then a body of up to ~4 MB, and the body read used to BLOCK — so
+a v2 peer delivering its packet slowly held the shared message pump for minutes:
+the same shape as the 2026-08-11 freeze the v1 reader was fixed for. Both live
+nodes run -v2transport and dial v2 first, so until this path was resumable the
+fix did not hold where it mattered.
+
+Also pins what makes v2 framing stricter than v1: decrypting the length
+descriptor ADVANCES the receive cipher and can never be repeated, so the body
+length it yielded has to survive the gap between passes."
+  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+      (skip "libsecp256k1 lacks the ellswift module")
+      (%with-loopback-pair (client server)
+        (let* ((client-transport nil)
+               (thread (bt:make-thread
+                        (lambda ()
+                          (handler-case
+                              (setf client-transport
+                                    (bitcoin-lisp.networking::v2-handshake-outbound
+                                     client :timeout 10))
+                            (error (e) (setf client-transport e))))
+                        :name "v2-split-initiator")))
+          (let ((server-transport
+                  (bitcoin-lisp.networking::v2-detect-inbound server :timeout 10)))
+            (bt:join-thread thread)
+            (is-true (bitcoin-lisp.networking::v2-transport-p server-transport))
+            (is-true (bitcoin-lisp.networking::v2-transport-p client-transport))
+            (when (and (bitcoin-lisp.networking::v2-transport-p server-transport)
+                       (bitcoin-lisp.networking::v2-transport-p client-transport))
+              ;; Nothing sent yet: the reader must say so at once, not wait.
+              (let ((start (get-internal-real-time)))
+                (multiple-value-bind (command detail)
+                    (bitcoin-lisp.networking::v2-receive-message
+                     server server-transport :timeout 30)
+                  (is (null command))
+                  (is (eq :incomplete detail)
+                      "a quiet v2 peer yields :incomplete, never a wait"))
+                (is (< (/ (- (get-internal-real-time) start)
+                          internal-time-units-per-second)
+                       1)
+                    "and consumes none of the caller's budget"))
+              ;; Encrypt one real packet, then deliver it in two pieces.
+              (let* ((framed (%v2t-frame "inv" (%bc-hex "00")))
+                     (contents (bitcoin-lisp.networking::%v2-contents-for-message
+                                framed))
+                     (packet (bt:with-lock-held
+                                 ((bitcoin-lisp.networking::v2-transport-send-lock
+                                   client-transport))
+                               (bitcoin-lisp.crypto:bip324-cipher-encrypt
+                                (bitcoin-lisp.networking::v2-transport-cipher
+                                 client-transport)
+                                contents bitcoin-lisp.networking::*v2-empty-bytes* nil))))
+                ;; Piece 1: the length descriptor only. Decrypting it advances
+                ;; the receive cipher — the point of no return.
+                (bitcoin-lisp.networking::send-bytes
+                 client (subseq packet 0 bitcoin-lisp.crypto:+bip324-length-len+))
+                (sleep 0.2)
+                (multiple-value-bind (command detail)
+                    (bitcoin-lisp.networking::v2-receive-message
+                     server server-transport :timeout 30)
+                  (is (null command))
+                  (is (eq :incomplete detail) "the body has not arrived yet"))
+                (is-true (bitcoin-lisp.networking::connection-recv-framing server)
+                         "the decrypted body length is parked for the next pass")
+                (is-true (bitcoin-lisp.networking::connection-connected server)
+                         "and a mid-packet peer is not dropped")
+                ;; Piece 2: the body.
+                (bitcoin-lisp.networking::send-bytes
+                 client (subseq packet bitcoin-lisp.crypto:+bip324-length-len+))
+                (sleep 0.2)
+                (multiple-value-bind (command payload)
+                    (bitcoin-lisp.networking::v2-receive-message
+                     server server-transport :timeout 30)
+                  (is (equal "inv" command)
+                      "the packet completes from the parked framing state")
+                  (is (equalp (%bc-hex "00") payload)))
+                (is-false (bitcoin-lisp.networking::connection-recv-framing server)
+                          "and the framing state is consumed with it"))))))))
+
+(test v2-decoy-flood-yields-the-pump
+  "A v2 peer streaming decoys must not own the pump. The decoy-skip loop only
+ends on a NON-decoy packet, so a peer sending minimum-size decoys (20 bytes:
+length + header + tag, empty contents, IGNORE set) keeps our socket non-empty
+and the loop spinning — inside ONE receive-message call, where the per-cycle
+message cap cannot reach it. Decrypting costs us more per byte than sending
+costs the peer, so it stays ahead indefinitely: the 2026-08-11 freeze shape on
+the path both live nodes prefer.
+
++v2-max-recv-bytes-per-call+ bounds the work per call the way Core bounds bytes
+per socket-handler pass; past it the reader yields :INCOMPLETE and the next pass
+resumes, after every other peer has had a turn."
+  (if (not (bitcoin-lisp.crypto:ellswift-available-p))
+      (skip "libsecp256k1 lacks the ellswift module")
+      (%with-loopback-pair (client server)
+        (let* ((client-transport nil)
+               (thread (bt:make-thread
+                        (lambda ()
+                          (handler-case
+                              (setf client-transport
+                                    (bitcoin-lisp.networking::v2-handshake-outbound
+                                     client :timeout 10))
+                            (error (e) (setf client-transport e))))
+                        :name "v2-decoy-initiator")))
+          (let ((server-transport
+                  (bitcoin-lisp.networking::v2-detect-inbound server :timeout 10)))
+            (bt:join-thread thread)
+            (when (and (bitcoin-lisp.networking::v2-transport-p server-transport)
+                       (bitcoin-lisp.networking::v2-transport-p client-transport))
+              ;; Enough empty decoys to exceed the per-call budget several times
+              ;; over (20 bytes each), and no real message behind them.
+              (let ((decoys (ceiling (* 4 bitcoin-lisp.networking::+v2-max-recv-bytes-per-call+)
+                                     20)))
+                (dotimes (i decoys)
+                  (bitcoin-lisp.networking::%v2-send-packet
+                   client client-transport (%bc-buf 0)
+                   bitcoin-lisp.networking::*v2-empty-bytes* t)))
+              (sleep 0.3)
+              (let ((start (get-internal-real-time)))
+                (multiple-value-bind (command detail)
+                    (bitcoin-lisp.networking::v2-receive-message
+                     server server-transport)
+                  (is (null command) "decoys carry no message")
+                  (is (eq :incomplete detail)
+                      "the reader yields instead of skipping decoys forever"))
+                ;; The budget is what ends the call; without it this never
+                ;; returns while the peer keeps sending.
+                (is (< (/ (- (get-internal-real-time) start)
+                          internal-time-units-per-second)
+                       5)
+                    "and it yields promptly"))
+              (is-true (bitcoin-lisp.networking::connection-connected server)
+                       "sending decoys is legal — the peer keeps its connection")))))))

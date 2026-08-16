@@ -1073,7 +1073,7 @@ payload and left the connection ALIVE and permanently out of frame."
                (bitcoin-lisp.networking:receive-message peer :timeout 30)
              (is (null command))
              (is (eq :incomplete detail)))
-           (is-true (bitcoin-lisp.networking::connection-recv-header conn)
+           (is-true (bitcoin-lisp.networking::connection-recv-framing conn)
                     "the parsed header survives the gap")
            (is-true (bitcoin-lisp.networking::connection-connected conn)
                     "and the peer is not dropped for being mid-message")
@@ -1086,7 +1086,7 @@ payload and left the connection ALIVE and permanently out of frame."
              (is (equal "ping" command)
                  "the message completes from the parked framing state")
              (is (equalp payload received)))
-           (is-false (bitcoin-lisp.networking::connection-recv-header conn)
+           (is-false (bitcoin-lisp.networking::connection-recv-framing conn)
                      "and the framing state is consumed with it"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
@@ -1161,6 +1161,59 @@ forever."
            (is (null (bitcoin-lisp.networking:receive-message peer :timeout 1)))
            (is-false (bitcoin-lisp.networking::connection-connected conn)
                      "a peer talking a foreign protocol is dropped"))
+      (usocket:socket-close sender)
+      (usocket:socket-close victim-socket)
+      (usocket:socket-close listener))))
+
+(test receive-does-not-reserve-megabytes-for-bytes-not-sent
+  "A message announces its own size, and that is the peer's word, not a fact.
+Allocating it up front let a peer turn a few bytes into megabytes of our memory,
+held for as long as the stall budget allows — 3 bytes of BIP324 length
+descriptor reserving 4 MB for 5 minutes, times every inbound slot. The blocking
+reader's byte-rate floor used to cut that short in seconds; the resumable reader
+has no rate floor on purpose (charging peers for our own latency is what reaped
+healthy peers), so the bound must be on the ALLOCATION.
+
+Core's rule and Core's number: MAX_RESERVE_AHEAD = 256 KiB above what the peer
+has actually sent (net.cpp:1323-1324)."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (sender (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (victim-socket (usocket:socket-accept listener
+                                               :element-type '(unsigned-byte 8)))
+         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+                                                        :connected t))
+         (announced (1- bitcoin-lisp:+max-message-payload+)))
+    (unwind-protect
+         (progn
+           ;; One byte delivered against a ~4 MB announcement.
+           (write-byte 42 (usocket:socket-stream sender))
+           (force-output (usocket:socket-stream sender))
+           (sleep 0.2)
+           (is (eq :incomplete
+                   (bitcoin-lisp.networking::receive-bytes-resumable conn announced))
+               "the read is in progress, not complete")
+           (is (= 1 (bitcoin-lisp.networking::connection-recv-filled conn)))
+           (is (<= (length (bitcoin-lisp.networking::connection-recv-buffer conn))
+                   bitcoin-lisp.networking::+recv-reserve-ahead+)
+               "one delivered byte must not reserve the whole announced size")
+           (is (< (length (bitcoin-lisp.networking::connection-recv-buffer conn))
+                  announced)
+               "control: the announcement really is far larger than the reserve")
+           ;; An honest peer that keeps delivering gets the room it earns.
+           (write-sequence (make-array (* 300 1024) :element-type '(unsigned-byte 8))
+                           (usocket:socket-stream sender))
+           (force-output (usocket:socket-stream sender))
+           (sleep 0.4)
+           (bitcoin-lisp.networking::receive-bytes-resumable conn announced)
+           (bitcoin-lisp.networking::receive-bytes-resumable conn announced)
+           (is (> (bitcoin-lisp.networking::connection-recv-filled conn)
+                  bitcoin-lisp.networking::+recv-reserve-ahead+)
+               "the buffer grows as the peer earns it")
+           (is-true (bitcoin-lisp.networking::connection-connected conn)
+                    "and a progressing peer is not dropped"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
       (usocket:socket-close listener))))

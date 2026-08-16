@@ -71,10 +71,13 @@ pending — the pings themselves buffer up).")
   ;; waiting, so the budgets live with them (receive-bytes for a blocking call,
   ;; connection-receive-expired-p for the pump).
   (recv-last-progress 0 :type integer)
-  ;; The v1 message header, once its 24 bytes are in and parsed: the payload read
-  ;; that follows may itself span passes, so the framing state has to outlive the
-  ;; call that produced it.
-  (recv-header nil))
+  ;; Framing state for the message half-read, once its fixed-size prefix is in
+  ;; and decoded: the variable-length read that follows may itself span passes,
+  ;; so it has to outlive the call that produced it. v1 parks the parsed
+  ;; message-header here; v2 parks the byte count its (already length-decrypted,
+  ;; so unrepeatable) packet body needs. Transport-agnostic on purpose — the
+  ;; reap predicate below must see "a message was begun" for either one.
+  (recv-framing nil))
 
 ;;; Node-wide cumulative byte counters (survive individual connection
 ;;; lifetimes), for getnettotals. Bumped on every send/receive. Plain incf —
@@ -263,7 +266,7 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
         (connection-send-queue-bytes conn) 0
         (connection-recv-buffer conn) nil
         (connection-recv-filled conn) 0
-        (connection-recv-header conn) nil))
+        (connection-recv-framing conn) nil))
 
 (defun connection-stream (conn)
   "Get the stream for a connection."
@@ -501,12 +504,30 @@ block validation across peers; a threshold near the cycle time would reap
 healthy peers whose remaining bytes are already sitting in our own receive
 buffer, unread. That failure mode is why this is not the pump's :timeout.")
 
+(defconstant +recv-reserve-ahead+ (* 256 1024)
+  "How far ahead of the bytes a peer has ACTUALLY delivered the receive
+accumulator may be allocated.
+
+A message announces its own size, so allocating it up front lets a peer turn a
+few bytes into megabytes of our memory held for as long as the stall budget
+allows: 3 bytes of BIP324 length descriptor reserved 4 MB for 5 minutes, times
+every inbound slot. The blocking reader's byte-rate floor used to cut that short
+in seconds; the resumable reader deliberately has no rate floor (charging peers
+for our own latency is what reaped healthy peers), so the bound has to be on the
+ALLOCATION instead.
+
+Core's number and Core's reasoning: MAX_RESERVE_AHEAD = 256 KiB, so \"attackers
+that want to cause us to waste allocated memory are limited to MAX_RESERVE_AHEAD
+above the largest allowed message contents size, and to MAX_RESERVE_AHEAD more
+than they've actually sent us\" (net.cpp:1323-1324, 1345-1356). The buffer then
+doubles as the peer earns it, so an honest large message costs O(log) copies.")
+
 (defun %end-receive (conn)
   "Clear the read in progress. The connection is untouched — callers decide
 whether it survives (see %ABANDON-RECEIVE)."
   (setf (connection-recv-buffer conn) nil
         (connection-recv-filled conn) 0
-        (connection-recv-header conn) nil)
+        (connection-recv-framing conn) nil)
   nil)
 
 (defun %abandon-receive (conn)
@@ -529,7 +550,7 @@ stream on a message boundary, so it is an ordinary idle poll, not a peer to
 reap or a framing hazard. Both the reap check and the give-up rule need exactly
 this distinction, so they share it."
   (and (or (plusp (connection-recv-filled conn))
-           (connection-recv-header conn))
+           (connection-recv-framing conn))
        t))
 
 (defun %receive-gave-up (conn)
@@ -577,21 +598,33 @@ healthy peers whenever a pump cycle ran long."
             (now (get-internal-real-time)))
         (unless socket
           (return-from receive-bytes-resumable nil))
-        ;; Start of a read: allocate the accumulator. A count that disagrees
-        ;; with a read already in progress is a framing bug in the caller, not
-        ;; a peer fault — refuse rather than mix two reads.
+        ;; Start of a read: allocate the accumulator, but only RESERVE-AHEAD of
+        ;; it (see +recv-reserve-ahead+) — the announced size is the peer's
+        ;; word, not a fact.
         (unless (connection-recv-buffer conn)
           (setf (connection-recv-buffer conn)
-                (make-array count :element-type '(unsigned-byte 8))
+                (make-array (min count +recv-reserve-ahead+)
+                            :element-type '(unsigned-byte 8))
                 (connection-recv-filled conn) 0
                 (connection-recv-last-progress conn) now))
         (let ((buffer (connection-recv-buffer conn))
               (filled (connection-recv-filled conn)))
-          (when (/= (length buffer) count)
+          ;; More bytes in hand than the caller now says it wants means two reads
+          ;; got mixed — a framing bug here, not a peer fault.
+          (when (> filled count)
             (bitcoin-lisp:log-error
              "Receive state mismatch: ~D bytes in progress, asked for ~D — dropping connection"
-             (length buffer) count)
+             filled count)
             (return-from receive-bytes-resumable (%abandon-receive conn)))
+          ;; Grow toward COUNT as the peer earns it.
+          (when (and (= filled (length buffer)) (< filled count))
+            (let ((bigger (make-array (min count
+                                           (max (* 2 (length buffer))
+                                                (+ filled +recv-reserve-ahead+)))
+                                      :element-type '(unsigned-byte 8))))
+              (replace bigger buffer :end2 filled)
+              (setf buffer bigger
+                    (connection-recv-buffer conn) bigger)))
           ;; Serve sniffed-ahead bytes (inbound v1/v2 detection) first.
           (let ((pushback (connection-pushback conn)))
             (when pushback
@@ -600,10 +633,12 @@ healthy peers whenever a pump cycle ran long."
                 (incf filled n)
                 (setf (connection-pushback conn)
                       (when (< n (length pushback)) (subseq pushback n))))))
-          ;; Take what the socket already holds. Never waits: drain-available-bytes
-          ;; is bounded by LISTEN, and we do not call wait-for-input at all.
+          ;; Take what the socket already holds, up to what is allocated — the
+          ;; next pass grows the buffer and takes more. Never waits:
+          ;; drain-available-bytes is bounded by LISTEN, and we never call
+          ;; wait-for-input here.
           (when (< filled count)
-            (let ((n (drain-available-bytes stream buffer filled count)))
+            (let ((n (drain-available-bytes stream buffer filled (length buffer))))
               (when (= n filled)
                 ;; Nothing taken. EOF is the only reading of "readable, yet
                 ;; empty" — but only after a SECOND drain comes back empty too:
@@ -611,7 +646,8 @@ healthy peers whenever a pump cycle ran long."
                 ;; segment landing between them would otherwise read as a
                 ;; hangup and silently kill a healthy peer.
                 (when (and (data-available-p conn)
-                           (= (drain-available-bytes stream buffer filled count)
+                           (= (drain-available-bytes stream buffer filled
+                                                     (length buffer))
                               filled))
                   (return-from receive-bytes-resumable (%abandon-receive conn))))
               (when (> n filled)
