@@ -2646,7 +2646,7 @@ The reorg must refuse and reconsiderblock report :reorg-failed."
 ;;;; rolling back (minutes of work that is itself interruptible).
 ;;;;
 ;;;; The tests interrupt by binding bitcoin-lisp:*interrupt-check* — the same seam
-;;;; the networking layer installs the real stop flag into — and choose WHERE it
+;;;; node.lisp installs the real stop predicate into — and choose WHERE it
 ;;;; fires with a predicate over observable state (UTXO count / coins pointer /
 ;;;; tip) rather than a call counter, so an extra or missing check cannot silently
 ;;;; move the assertion.
@@ -2683,14 +2683,21 @@ post-round-trip one the UTXO set is actually keyed by."
 (test interrupt-check-is-wired-to-the-node-stop-flag
   "The seam must actually be INSTALLED. perform-reorg polls
 bitcoin-lisp:interrupt-requested-p, and every truncation test below binds its own
-predicate into *interrupt-check* — so if connection.lisp ever stopped installing
-the real stop flag, reorgs would silently become uninterruptible again and every
-other test here would stay green."
+predicate into *interrupt-check* — so if node.lisp ever stopped installing the
+real one, reorgs would silently become uninterruptible again and every other test
+here would stay green."
   (is (null (bitcoin-lisp:interrupt-requested-p))
       "no stop requested: the installed predicate must say so")
   (let ((bitcoin-lisp.networking::*ibd-stop-requested* t))
     (is (bitcoin-lisp:interrupt-requested-p)
-        "the node-wide stop flag must reach the validation layer")))
+        "the node-wide stop flag must reach the validation layer"))
+  ;; Both flags, because they are set at different moments: the SIGTERM handler
+  ;; registers the REQUEST (Core ShutdownRequested) and only stop-node later
+  ;; sets the IBD flag. A loop that runs before stop-node — the mempool import
+  ;; inside start-node — sees only the first.
+  (let ((bitcoin-lisp::*shutdown-request* (cons "test" 0)))
+    (is (bitcoin-lisp:interrupt-requested-p)
+        "a REQUESTED shutdown must reach it too, before stop-node runs")))
 
 (test reorg-completes-when-no-stop-is-requested
   "CONTROL for the two truncation tests below: the same fixture and the same
