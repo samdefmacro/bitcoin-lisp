@@ -1,6 +1,6 @@
 # Aligning chainstate consistency with Bitcoin Core
 
-Date: 2026-08-16. Status: **P1 implemented; P2–P3 specified, not implemented.**
+Date: 2026-08-16. Status: **P1–P3b implemented.**
 
 Written after reading Core rather than reasoning from our own structure. Two
 GA8 findings and one live incident all turned out to be symptoms of a single
@@ -75,7 +75,7 @@ Aligning removes the second artifact instead of policing it.
 | **P1** | Coins DB records its own best block, written **in the same batch** as the coin puts/erases; read back on open; startup compares it against `chainstate.dat` and reports a mismatch loudly | **DONE** |
 | **P2** | `SetBestBlock` per block in both the connect and disconnect paths, so the pointer moves WITH the coins; the flush stamps the cache's own pointer rather than the chain's tip | **DONE** |
 | **P3a** | Startup reconciliation when the pointer and `chainstate.dat` disagree | **DONE** |
-| **P3b** | Cooperative shutdown: a stop check between blocks in `perform-reorg`, retiring the `destroy-thread` fallback | not started — see the design note below |
+| **P3b** | Cooperative shutdown: a stop check between blocks in `perform-reorg`, retiring the `destroy-thread` fallback | **DONE** — option (ii), see below |
 
 P3a needed no roll at all. Core's `ReplayBlocks` exists because `DB_HEAD_BLOCKS`
 gives it a RANGE and it must move the coins to one end of it; our pointer is
@@ -83,33 +83,69 @@ exact, so the cheap record moves to the expensive one and normal sync
 re-validates the gap. An unplaceable pointer (naming a block with no index
 entry) is reported and refused rather than guessed at.
 
-### P3b design note — the decision that must be made deliberately
+### P3b as built — option (ii), truncate rather than roll back
 
-The obvious implementation is to check `*ibd-stop-requested*` between blocks in
-`perform-reorg`'s PHASE A and PHASE B and return without rolling back. With P2
-and P3a that is safe **for shutdown**: the coins stop on a block boundary, the
-pointer names it, and the next startup reconciles.
+Implemented as **(ii)**: `perform-reorg` polls `bitcoin-lisp:interrupt-requested-p`
+at the top of each PHASE A and PHASE B block, and on a stop request TRUNCATES the
+reorg there instead of finishing it or rolling it back.
 
-But `*ibd-stop-requested*` is **not shutdown-specific** — `call-with-sync-paused`
-(`node.lisp:882`, assumeutxo snapshot activation) sets it too, and the node keeps
-RUNNING afterwards. Aborting a reorg on that path would leave the in-memory
-chainstate naming the old tip while the coins sit at an intermediate block: the
-same inconsistency, moved from disk into memory, where startup reconciliation
-never sees it.
+The predicate is a seam in `config.lisp`, `*interrupt-check*`, defaulting to
+`(constantly nil)`; `connection.lisp` installs `ibd-stop-requested-p` into it at
+load time. Validation must not call up into networking to ask whether to stop, and
+Core doesn't: `util::SignalInterrupt` lives below validation and is handed to
+`ChainstateManager` by reference (`validation.h:1034`). Tests bind the same
+variable, so they drive the production path rather than a test-only hook.
 
-So P3b must do one of:
-- **(i)** check a shutdown-specific flag only, leaving pause-driven interruption
-  as it is today; or
-- **(ii)** on abort, also move the IN-MEMORY tip to the coins' block (the same
-  rule P3a applies on disk), so memory and coins agree immediately and the
-  following flush persists a consistent pair.
+- **PHASE A** stops before disconnecting the next block. At that point the coins
+  — and the pointer that moves with them (P2) — are exactly that block's state,
+  so the tip update that normally lands on the fork point lands on *that block*
+  instead. Memory, coins and the pointer then name one block, which is the whole
+  reason (ii) is safe on the non-shutdown pause path too.
+- **PHASE B** stops before connecting the next block, where the tip has already
+  advanced per connected block, so nothing needs fixing up. `%rollback-partial-
+  reorg` is deliberately SKIPPED: it is minutes of interruptible work whose only
+  purpose is to reach a consistent chain, and a block boundary already is one.
+  The chain is simply left on a shorter or partially-advanced fork; the next sync
+  pass re-activates the best chain.
+- The deferred side effects (PHASE C: index writes, mempool re-add, wallet and
+  tx-relay notifications) are committed for **exactly the blocks that moved**,
+  and the mempool re-add re-validates against the height actually reached rather
+  than the intended new tip.
+- The return is `(values nil :interrupted)` — added to the transient-control-
+  keyword registry in `block.lisp`'s classification comment. Every caller treats
+  it as transient and never as a verdict on the fork: `retry-best-reorg-candidate`
+  neither rejects nor drops the candidate, `process-received-block` notes it as a
+  reorg candidate instead of routing it to `handle-validation-failure` (which
+  would burn the innocent block through its re-download budget), the drain loop
+  just stops draining, `invalidate`/`reconsider`/`preciousblock` surface
+  `:interrupted` rather than reporting `:reorg-failed`, and the post-reorg revert
+  logs a truncation instead of "failed to revert".
+- The `destroy-thread` fallback in `stop-node` stays, with its 600s deadline
+  unchanged: what it now has to cover is one block's validation plus the bounded
+  (≤ `+max-disconnected-tx-pool-bytes+`) mempool re-add, not a whole deep reorg.
+  Shortening it would only make the destroy path more likely, which is the
+  opposite of the goal — and with P1–P3a even that path leaves a recoverable disk
+  state. The re-add is deliberately NOT skipped on the interrupt path: on the
+  snapshot-pause path the node keeps running, and dropping those transactions
+  would be a real loss rather than deferred work.
 
-(ii) is the more complete answer and reuses the rule already established, but it
-touches reorg control flow — including what the caller does with the
-`(values nil reason)` it gets back, and whether `%rollback-partial-reorg` should
-be skipped (it should: the coins are already at a clean boundary and rolling
-back during a shutdown is work that can itself be interrupted). Decide this
-deliberately rather than by reflex.
+Tests: `tests/reorg-tests.lisp` — truncation in each phase, a full-reorg control
+on the same fixture, and a coins-view-cache test asserting the pointer and the
+tip name one block afterwards. Mutation-checked: neutering the stop predicate
+fails all three interrupt tests and nothing else.
+
+### Why the obvious P3b was the wrong one
+
+The obvious implementation — check the stop flag between blocks and return —
+is safe **for shutdown** (the coins stop on a boundary, the pointer names it, the
+next startup reconciles) but not for the other setter of that flag.
+`call-with-sync-paused` (`node.lisp`, assumeutxo snapshot activation) sets it too
+and the node keeps RUNNING afterwards. Stopping without moving the in-memory tip
+would leave the chainstate naming the old tip while the coins sit at an
+intermediate block: the same inconsistency, relocated from disk into memory, where
+startup reconciliation never looks. That is why the truncation moves the tip too —
+option (ii) above — rather than checking a shutdown-only flag and leaving the
+pause path as it was.
 
 Phase order was corrected while implementing: per-block `SetBestBlock` had to
 come FIRST. Without it the flush stamps whatever the caller believes the tip is,
@@ -140,8 +176,9 @@ source of truth.
 - Do NOT make the reorg uninterruptible as a shortcut. It was considered and
   rejected: this node has lived through multi-hundred-block testnet4 reorgs, and
   deferring shutdown across one is a worse failure than the one being fixed.
-- P3's cooperative shutdown must check the flag between blocks, matching Core's
-  placement, and the existing 600s `destroy-thread` fallback should become
-  unreachable rather than merely rarer.
+- P3's cooperative shutdown checks the flag between blocks, matching Core's
+  placement. The 600s `destroy-thread` fallback is now reached only if a single
+  block's validation (plus the bounded mempool re-add) outlasts it — rare rather
+  than strictly unreachable, and no longer corrupting when it does fire.
 - Keep PR #334's `:corrupt` refusal after P2 lands: it covers a chainstate file
   that is unreadable for reasons a replay cannot fix.

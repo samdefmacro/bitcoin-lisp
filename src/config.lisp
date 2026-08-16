@@ -6,6 +6,28 @@
 ;;; across multiple subsystems. Loaded early so that storage, validation,
 ;;; and networking modules can reference these symbols at compile time.
 
+;;;; Interrupt signalling
+;;;;
+;;;; The one thing every long-running validation loop needs to know: has the
+;;;; node been asked to stop? Core keeps that below validation — util::
+;;;; SignalInterrupt, handed to ChainstateManager by reference (validation.h:1034)
+;;;; — and validation never calls up into networking to ask. This variable is the
+;;;; same seam. The networking layer installs the real predicate when it loads
+;;;; (connection.lisp, over *ibd-stop-requested*); it stays (CONSTANTLY NIL) in an
+;;;; image that never starts a node, and tests bind it to interrupt a loop at a
+;;;; chosen point.
+
+(defvar *interrupt-check* (constantly nil)
+  "Predicate of no arguments: T once the node has been asked to stop. Polled by
+long-running loops that must give up cooperatively — currently perform-reorg,
+between blocks. Installed by the networking layer at load time; NIL-returning by
+default so lower layers never depend upward.")
+
+(defun interrupt-requested-p ()
+  "T when the node has been asked to stop (shutdown, or the sync pause that
+precedes assumeutxo snapshot activation). See *interrupt-check*."
+  (funcall *interrupt-check*))
+
 ;;;; Block Pruning Configuration
 
 (defconstant +min-blocks-to-keep+ 288

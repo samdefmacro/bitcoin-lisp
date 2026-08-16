@@ -1504,6 +1504,10 @@
    #:stop-file-logging
    #:maybe-periodic-flush
    #:maybe-stop-at-height
+   ;; Cooperative-stop seam (config.lisp): the networking layer installs the
+   ;; predicate, lower layers poll it — never the other way round.
+   #:*interrupt-check*
+   #:interrupt-requested-p
    #:listen-port
    #:index-block-filter
    #:index-block-coinstats
