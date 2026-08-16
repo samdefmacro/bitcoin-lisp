@@ -3254,7 +3254,10 @@ thread; see the shutdown-coordination section above."
                        ;; validation finishes and connect-block updates UTXO set
                        ;; + chain tip atomically, so destroy-thread fallback
                        ;; (which can corrupt mid-update state) is virtually
-                       ;; never needed.
+                       ;; never needed. A reorg no longer holds the thread to its
+                       ;; end either — perform-reorg truncates on a block boundary
+                       ;; (plan phase 3b). Deliberately NOT shortened: a tighter
+                       ;; deadline would only make the destroy path more likely.
                        (* 600 internal-time-units-per-second))))
       (loop while (and (bt:thread-alive-p (node-sync-thread *node*))
                        (< (get-internal-real-time) deadline))

@@ -2208,7 +2208,9 @@ perform-reorg's success phase, so there is nothing to undo here."
 ;;;;     of poisoned — redundant work, never a wedge (== pre-item behavior).
 ;;;;   * The control keywords the reorg machinery itself returns
 ;;;;     (:corrupt-undo, :reorg-refused, :weaker-chain, :unknown-parent,
-;;;;     :reorg-failed, :block-missing, :block-not-found) — all transient.
+;;;;     :reorg-failed, :block-missing, :block-not-found, :interrupted) — all
+;;;;     transient. :interrupted in particular is a statement about THIS NODE
+;;;;     (it is stopping, phase 3b) and never about the block.
 
 (defparameter *deterministic-invalid-block-errors*
   '(:duplicate-txid       ; BIP30: block re-creates a still-unspent txid
@@ -2247,6 +2249,30 @@ includes ENTRY itself."
   (dolist (e (block-index-descendants chain-state entry))
     (setf (bitcoin-lisp.storage:block-index-entry-status e) :invalid)))
 
+;;;; Cooperative shutdown inside a reorg (plan phase 3b).
+;;;;
+;;;; Core checks m_chainman.m_interrupt BETWEEN ActivateBestChainStep calls
+;;;; (validation.cpp:3514), never inside a block, and never force-terminates its
+;;;; validation thread. Ours had no such check, so a stop request arriving during
+;;;; a deep reorg was answered only by stop-node's 600s deadline and its
+;;;; bt:destroy-thread fallback — an interrupt at an arbitrary instruction.
+;;;;
+;;;; What makes stopping between blocks SAFE is phase 2: the coins carry their
+;;;; own best-block pointer, moved by every apply/disconnect. So on a block
+;;;; boundary the coins, their pointer, and (once the tip update below runs) the
+;;;; in-memory chain tip all name the same block. We therefore TRUNCATE the reorg
+;;;; there rather than rolling it back: rolling back is itself minutes of
+;;;; interruptible work, while a truncated reorg is simply a shorter (or
+;;;; partially advanced) valid chain that the next sync pass re-activates.
+;;;;
+;;;; The predicate is bitcoin-lisp:interrupt-requested-p (config.lisp), which the
+;;;; networking layer backs with the node-wide stop flag — set BOTH by shutdown
+;;;; and by call-with-sync-paused (assumeutxo snapshot activation, after which the
+;;;; node keeps RUNNING). Covering the pause too is only safe because the
+;;;; truncation moves the IN-MEMORY tip to the coins' block as well: checking a
+;;;; flag without moving the tip would merely relocate the inconsistency from disk
+;;;; into memory, where no startup check ever looks.
+
 (defun perform-reorg (chain-state block-store utxo-set old-tip-entry new-tip-entry
                       &key tx-index fee-estimator recent-rejects mempool skip-scripts)
   "Perform a chain reorganization from OLD-TIP to NEW-TIP.
@@ -2269,7 +2295,13 @@ Clears RECENT-REJECTS if provided (reorg may change transaction validity).
 When MEMPOOL is provided, removes connected blocks' txs from it and re-adds the
 disconnected blocks' txs (best-effort, re-validated against the new tip).
 Side effects (tx-index / fee-estimator / mempool / recent-rejects) are applied
-only after the whole fork validates, so a rolled-back reorg leaves them untouched."
+only after the whole fork validates, so a rolled-back reorg leaves them untouched.
+
+A stop request (shutdown / sync pause) TRUNCATES the reorg at the next block
+boundary and returns (VALUES NIL :INTERRUPTED): the chain is left on whatever
+block the coins reached — never rolled back, never half-applied — and the side
+effects below are committed for exactly the blocks that moved. See the section
+comment above."
   (let ((fork-entry (find-fork-point old-tip-entry new-tip-entry)))
     (unless fork-entry
       (return-from perform-reorg nil))
@@ -2304,7 +2336,14 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
             (disconnected-dropped 0)
             ;; (block . height) per disconnected block, oldest-first (same
             ;; push order), for the PHASE C wallet notifications.
-            (disconnected-blocks '()))
+            (disconnected-blocks '())
+            ;; Cooperative-stop state (phase 3b). STOP-ENTRY is the PHASE A
+            ;; entry the disconnect stopped BEFORE — i.e. the block the coins
+            ;; are left at, and therefore where the tip must land. INTERRUPTED
+            ;; covers both phases and turns the return value into
+            ;; (VALUES NIL :INTERRUPTED).
+            (stop-entry nil)
+            (interrupted nil))
 
         ;; Self-heal stored witness-stripped forward blocks. A fork block stored
         ;; via the deferred-validation (:weaker-chain) path before the v2-only
@@ -2386,6 +2425,14 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
         ;; recent-rejects) are deferred to PHASE C so a rolled-back reorg
         ;; leaves them untouched.
         (dolist (entry to-disconnect)
+          ;; Cooperative stop (see the phase-3b section comment above). At the TOP
+          ;; of this iteration the coins are exactly ENTRY's state, so the tip
+          ;; update below lands on ENTRY instead of the fork point, and nothing
+          ;; needs undoing.
+          (when (bitcoin-lisp:interrupt-requested-p)
+            (setf stop-entry entry
+                  interrupted t)
+            (return))
           (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
                  (block (bitcoin-lisp.storage:get-block block-store block-hash)))
             (when block
@@ -2433,10 +2480,16 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
         ;; Tip is now logically at the fork point. Set it so each fork block's
         ;; validate-block sees the fork's active chain for sequence-lock / MTP
         ;; lookups (get-block-at-height walks back from the tip).
-        (bitcoin-lisp.storage:update-chain-tip
-         chain-state
-         (bitcoin-lisp.storage:block-index-entry-hash fork-entry)
-         fork-height)
+        ;;
+        ;; If a stop request truncated the disconnect, land on STOP-ENTRY
+        ;; instead: that is the block the coins stopped at, so this is what
+        ;; makes the in-memory tip agree with them (and with the pointer the
+        ;; next flush persists) before we return.
+        (let ((landing (or stop-entry fork-entry)))
+          (bitcoin-lisp.storage:update-chain-tip
+           chain-state
+           (bitcoin-lisp.storage:block-index-entry-hash landing)
+           (bitcoin-lisp.storage:block-index-entry-height landing)))
 
         ;; PHASE B — validate + connect the fork, fork-to-tip, with rollback.
         ;; collect-chain-entries returns tip-first, so reverse to oldest-first:
@@ -2445,7 +2498,15 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
         ;; fork-side block.
         (let ((connected '())          ; (entry block height spent-utxos), newest-first
               (now (bitcoin-lisp.serialization:get-unix-time)))
-          (dolist (entry (reverse to-connect))
+          ;; A stop request already handled in PHASE A leaves nothing to connect:
+          ;; the chain is parked on STOP-ENTRY and must not move further.
+          (dolist (entry (if interrupted '() (reverse to-connect)))
+            ;; Cooperative stop, as in PHASE A. Here the tip already advanced per
+            ;; connected block (below), so this boundary needs no fixing up — and
+            ;; no rollback (see the section comment).
+            (when (bitcoin-lisp:interrupt-requested-p)
+              (setf interrupted t)
+              (return))
             (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
                    (block (bitcoin-lisp.storage:get-block block-store block-hash))
                    (height (bitcoin-lisp.storage:block-index-entry-height entry)))
@@ -2568,13 +2629,29 @@ only after the whole fork validates, so a rolled-back reorg leaves them untouche
             (bitcoin-lisp:log-warn "REORG: disconnect pool over ~D bytes — dropped ~D transaction~:P nearest the old tip; they will not be re-added to the mempool"
                                    +max-disconnected-tx-pool-bytes+
                                    disconnected-dropped))
-          (readd-disconnected-txs-to-mempool
-           mempool (loop for entry in disconnected-block-txs append (car entry))
-           utxo-set new-height chain-state)
+          ;; Re-validate against the height the chain ACTUALLY reached: equal to
+          ;; NEW-HEIGHT on the normal path, and the truncation point when a stop
+          ;; request cut the reorg short.
+          (let ((reached (bitcoin-lisp.storage:current-height chain-state)))
+            (readd-disconnected-txs-to-mempool
+             mempool (loop for entry in disconnected-block-txs append (car entry))
+             utxo-set reached chain-state)
 
-          (bitcoin-lisp:log-info "REORG complete: disconnected ~D, connected ~D blocks"
-                                 (length to-disconnect) (length to-connect))
-          t)))))
+            (cond
+              (interrupted
+               ;; Not a failure: the blocks that moved are committed above, the
+               ;; chain sits on a block boundary where coins, pointer and tip
+               ;; agree, and the next sync pass re-attempts the rest. Callers must
+               ;; treat :INTERRUPTED as transient — never as a verdict on the fork.
+               (bitcoin-lisp:log-warn
+                "REORG INTERRUPTED by a stop request after disconnecting ~D of ~D and connecting ~D of ~D; chain left at height ~D"
+                (length disconnected-blocks) (length to-disconnect)
+                (length connected) (length to-connect) reached)
+               (values nil :interrupted))
+              (t
+               (bitcoin-lisp:log-info "REORG complete: disconnected ~D, connected ~D blocks"
+                                      (length to-disconnect) (length to-connect))
+               t))))))))
 
 ;;;; Chain-control helpers (invalidateblock / reconsiderblock)
 ;;;;
@@ -2640,10 +2717,15 @@ chain back to BLOCK-HASH's parent if the active chain contained it. Returns
          ;; ancestry :invalid would leave status flags disagreeing with the UTXO
          ;; set. (perform-reorg returns NIL on refusal.)
          (when (and tip parent (block-descends-from-p tip entry))
-           (unless (perform-reorg chain-state block-store utxo-set tip parent
-                                  :tx-index tx-index :fee-estimator fee-estimator
-                                  :recent-rejects recent-rejects :mempool mempool)
-             (return-from invalidate-block (values nil :reorg-failed))))
+           (multiple-value-bind (ok detail)
+               (perform-reorg chain-state block-store utxo-set tip parent
+                              :tx-index tx-index :fee-estimator fee-estimator
+                              :recent-rejects recent-rejects :mempool mempool)
+             ;; Surface :interrupted as itself — the node is stopping, the reorg
+             ;; did not fail — so the RPC reports why nothing was invalidated.
+             (unless ok
+               (return-from invalidate-block
+                 (values nil (if (eq detail :interrupted) :interrupted :reorg-failed))))))
          (dolist (e (block-index-descendants chain-state entry))
            (setf (bitcoin-lisp.storage:block-index-entry-status e) :invalid))
          (values t nil))))))
@@ -2673,10 +2755,13 @@ reorganize to the best valid chain if it now outweighs the active tip. Returns
               ;; back (returning NIL) if one of its blocks is invalid — in which
               ;; case the chain correctly stays on TIP. Surface that rather than
               ;; reporting success for a switch that didn't happen.
-              (unless (perform-reorg chain-state block-store utxo-set tip target
-                                     :tx-index tx-index :fee-estimator fee-estimator
-                                     :recent-rejects recent-rejects :mempool mempool)
-                (return-from reconsider-block (values nil :reorg-failed)))))
+              (multiple-value-bind (ok detail)
+                  (perform-reorg chain-state block-store utxo-set tip target
+                                 :tx-index tx-index :fee-estimator fee-estimator
+                                 :recent-rejects recent-rejects :mempool mempool)
+                (unless ok
+                  (return-from reconsider-block
+                    (values nil (if (eq detail :interrupted) :interrupted :reorg-failed)))))))
           (values t nil)))))
 
 (defun precious-block (chain-state block-store utxo-set block-hash
@@ -2705,11 +2790,13 @@ where the block is already the tip or weaker), (values nil reason) on failure."
            ((not (bitcoin-lisp.storage:block-exists-p block-store block-hash))
             (values nil :block-missing))
            (t
-            (if (perform-reorg chain-state block-store utxo-set tip entry
+            (multiple-value-bind (ok detail)
+                (perform-reorg chain-state block-store utxo-set tip entry
                                :tx-index tx-index :fee-estimator fee-estimator
                                :recent-rejects recent-rejects :mempool mempool)
-                (values t nil)
-                (values nil :reorg-failed)))))))))
+              (cond (ok (values t nil))
+                    ((eq detail :interrupted) (values nil :interrupted))
+                    (t (values nil :reorg-failed)))))))))))
 
 ;;;; Activate block — validate + connect with reorg awareness.
 ;;;;
@@ -2905,15 +2992,26 @@ can neither wedge on an equal-work sibling nor advance past the base."
                                             chain-state
                                             (bitcoin-lisp.storage:best-block-hash
                                              chain-state))))
-                             (unless (perform-reorg chain-state block-store utxo-set
-                                                    fork-tip current-best-entry
-                                                    :tx-index tx-index
-                                                    :fee-estimator fee-estimator
-                                                    :recent-rejects recent-rejects
-                                                    :mempool mempool
-                                                    :skip-scripts skip-scripts)
-                               (bitcoin-lisp:log-error
-                                "Failed to revert to original chain after rejecting post-reorg block")))
+                             (multiple-value-bind (reverted revert-detail)
+                                 (perform-reorg chain-state block-store utxo-set
+                                                fork-tip current-best-entry
+                                                :tx-index tx-index
+                                                :fee-estimator fee-estimator
+                                                :recent-rejects recent-rejects
+                                                :mempool mempool
+                                                :skip-scripts skip-scripts)
+                               (cond
+                                 (reverted)
+                                 ;; A stop request truncated the revert. Not a
+                                 ;; failure — the chain is on a consistent
+                                 ;; boundary — so don't log it as one.
+                                 ((eq revert-detail :interrupted)
+                                  (bitcoin-lisp:log-warn
+                                   "Revert to original chain truncated by a stop request; chain left at height ~D"
+                                   (bitcoin-lisp.storage:current-height chain-state)))
+                                 (t
+                                  (bitcoin-lisp:log-error
+                                   "Failed to revert to original chain after rejecting post-reorg block")))))
                            (values nil error)))))))))
 
            ;; Case 3: weaker / equal chain — store the block, don't
