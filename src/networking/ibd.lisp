@@ -1840,7 +1840,25 @@ disconnects it so replace-disconnected-peers can refill the slot."
         (bitcoin-lisp:log-warn
          "Peer ~A sent a malformed message during drain — disconnecting: ~A"
          (peer-address peer) c)
-        (handler-case (disconnect-peer peer) (error () nil)))))
+        (handler-case (disconnect-peer peer) (error () nil))))
+    ;; Reap a message the peer began and then abandoned. The reader no longer
+    ;; waits for the rest of one, so a peer that sends a header and goes silent
+    ;; produces nothing readable: the drain above skips it every cycle and the
+    ;; half-read message would otherwise sit there for the life of the
+    ;; connection.
+    ;;
+    ;; AFTER the drain, never before. The budget is measured from the last byte
+    ;; that ARRIVED, so checking first would judge a peer stalled on the
+    ;; strength of how long WE took to come back to it — and during IBD a cycle
+    ;; is minutes of block validation, with the peer's remaining bytes already
+    ;; sitting unread in our own receive buffer. Core likewise drains before it
+    ;; consults inactivity (SocketHandlerConnected).
+    (when (and (peer-connection peer)
+               (connection-receive-expired-p (peer-connection peer)))
+      (bitcoin-lisp:log-warn
+       "Peer ~A began a message and delivered nothing for ~Ds — disconnecting"
+       (peer-address peer) +receive-stall-timeout-seconds+)
+      (handler-case (disconnect-peer peer) (error () nil))))
   (handle-peer-fin peer))
 
 (defun pump-peer-messages (peers chain-state utxo-set block-store
@@ -2764,7 +2782,7 @@ window: ProcessMessages always runs with the full node state."
     ;; First, drain any pending messages from peer (sendcmpct, sendheaders, etc.)
     (loop repeat 10
           do (multiple-value-bind (command payload)
-                 (receive-message peer :timeout 1)
+                 (receive-message-blocking peer :timeout 1)
                (when command
                  (bitcoin-lisp:log-cat "net" "Pre-sync: received ~A" command)
                  (handler-case
@@ -2806,7 +2824,7 @@ window: ProcessMessages always runs with the full node state."
                  (loop while (and (not got-headers) (< attempts 30)
                                   (not *ibd-stop-requested*))
                        do (multiple-value-bind (command payload)
-                              (receive-message peer :timeout 5)
+                              (receive-message-blocking peer :timeout 5)
                             (incf attempts)
                             (cond
                               ((null command)

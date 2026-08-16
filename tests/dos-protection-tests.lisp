@@ -825,11 +825,18 @@ fails if only the stall bound is present."
       (usocket:socket-close server)
       (usocket:socket-close listener))))
 
-(test receive-message-survives-the-live-freeze-attack
+(test receive-message-never-waits-for-a-trickling-peer
   "The production path, end to end: a peer sends a well-formed 24-byte header
 announcing a large payload, delivers a few bytes, and goes silent. This is
-exactly what froze a live node for five days. receive-message must give up
-within the caller's budget and drop the peer.
+exactly what froze a live node for five days.
+
+The reader is now RESUMABLE (Core CNode::vRecvMsg), so the bar is higher than
+'gives up within the caller\'s budget': it must not spend the budget at all. It
+takes what has arrived, parks it on the connection, and says :INCOMPLETE — the
+peer keeps its partial message and the pump moves on. Dropping the peer is then
+the pump\'s job, once the budget lapses (connection-receive-expired-p), because a
+peer that has gone silent produces nothing readable and would otherwise never be
+looked at again.
 
 Trap worth remembering: announcing MORE than +MAX-MESSAGE-PAYLOAD+ makes this
 test vacuous — the oversize guard rejects the header before the payload read is
@@ -861,31 +868,179 @@ Announce just under the limit."
                              (usocket:socket-stream attacker))
              (force-output (usocket:socket-stream attacker)))
            (sleep 0.3)
-           (multiple-value-bind (finished result)
-               (%run-bounded (lambda ()
-                               (bitcoin-lisp.networking:receive-message
-                                peer :timeout 1))
-                             :limit 30)
-             (is-true finished
-                      "the node must not be frozen by one silent peer")
-             (is (null result) "no message is produced")
-             (is-false (bitcoin-lisp.networking::connection-connected conn)
-                       "and the peer is dropped")))
+           (let ((start (get-internal-real-time)))
+             (multiple-value-bind (command detail)
+                 (bitcoin-lisp.networking:receive-message peer :timeout 5)
+               (let ((elapsed (/ (- (get-internal-real-time) start)
+                                 internal-time-units-per-second)))
+                 (is (null command) "no message is produced")
+                 (is (eq :incomplete detail)
+                     "the partial message is kept, not failed")
+                 ;; The whole point: it returned without consuming its budget.
+                 ;; The old reader sat here for the full stall window.
+                 (is (< elapsed 1)
+                     "the reader must return at once, not wait out the budget"))))
+           (is-true (bitcoin-lisp.networking::connection-connected conn)
+                    "an incomplete message is not yet a reason to disconnect")
+           (is (= 3 (bitcoin-lisp.networking::connection-recv-filled conn))
+               "the bytes that did arrive are retained for the next pass")
+           ;; Now the pump\'s half: a peer that has delivered nothing toward
+           ;; its message for +receive-stall-timeout-seconds+ is reaped.
+           ;; Backdate the last-progress stamp rather than sleeping for minutes.
+           (setf (bitcoin-lisp.networking::connection-recv-last-progress conn)
+                 (- (get-internal-real-time)
+                    (* (1+ bitcoin-lisp.networking::+receive-stall-timeout-seconds+)
+                       internal-time-units-per-second)))
+           (is-true (bitcoin-lisp.networking::connection-receive-expired-p conn)
+                    "an abandoned message eventually expires")
+           (bitcoin-lisp.networking::drain-and-reap-peer peer nil nil nil nil)
+           (is-false (bitcoin-lisp.networking::connection-connected conn)
+                     "and the pump drops the peer")
+           (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))
+               "peer state reflects the disconnect, so maintenance replaces it"))
       (usocket:socket-close attacker)
       (usocket:socket-close victim-socket)
       (usocket:socket-close listener))))
 
-(test receive-message-drops-a-peer-whose-payload-lags-its-header
-  "A message is TWO reads, so framing is a per-MESSAGE property that
-receive-bytes cannot see. If the header read succeeds and the payload read then
-times out having consumed NOTHING, the per-call rule ('only kill if this call
-consumed bytes') leaves the connection alive with 24 header bytes already
-eaten — permanently out of frame, and every later pass eats 24 more bytes as a
-bogus header. Bounding the reads is what made this reachable at all: the old
-blocking read could not be interrupted between header and payload.
+(test one-trickling-peer-does-not-stall-another
+  "THE regression this refactor exists for. Two peers: one announces a large
+payload and delivers almost none of it, the other sends a complete message. A
+pass over both must deliver the second peer\'s message — and quickly.
 
-Nothing here requires a malicious peer — a payload lagging its header past the
-caller's timeout is enough — so receive-message must drop the connection."
+With the old synchronous reader the first peer owned the shared pump for its
+whole budget (timeout + size/+MIN-RECEIVE-BYTES-PER-SECOND+, minutes for a large
+message) before the second was even looked at. That serial pump is what turned
+one silent peer into a node-wide freeze; bounding the wait made the freeze
+finite, and this makes it nonexistent."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (slow-sender (usocket:socket-connect "127.0.0.1" port
+                                              :element-type '(unsigned-byte 8)))
+         (slow-socket (usocket:socket-accept listener
+                                             :element-type '(unsigned-byte 8)))
+         (fast-sender (usocket:socket-connect "127.0.0.1" port
+                                              :element-type '(unsigned-byte 8)))
+         (fast-socket (usocket:socket-accept listener
+                                             :element-type '(unsigned-byte 8)))
+         (slow-conn (bitcoin-lisp.networking::make-connection :socket slow-socket
+                                                             :connected t))
+         (fast-conn (bitcoin-lisp.networking::make-connection :socket fast-socket
+                                                             :connected t))
+         (slow-peer (bitcoin-lisp.networking:make-peer :connection slow-conn
+                                                      :state :ready))
+         (fast-peer (bitcoin-lisp.networking:make-peer :connection fast-conn
+                                                      :state :ready)))
+    (unwind-protect
+         (progn
+           ;; Slow peer: header for a big payload, then 3 bytes and silence.
+           (let* ((header (bitcoin-lisp.serialization::make-message-header
+                           :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+                           :command "block"
+                           :payload-length (1- bitcoin-lisp:+max-message-payload+)
+                           :checksum (make-array 4 :element-type '(unsigned-byte 8))))
+                  (header-bytes (flexi-streams:with-output-to-sequence (s)
+                                  (bitcoin-lisp.serialization::write-message-header
+                                   s header))))
+             (write-sequence header-bytes (usocket:socket-stream slow-sender))
+             (write-sequence (make-array 3 :element-type '(unsigned-byte 8))
+                             (usocket:socket-stream slow-sender))
+             (force-output (usocket:socket-stream slow-sender)))
+           ;; Fast peer: one complete, well-formed message.
+           (write-sequence (bitcoin-lisp.serialization:make-ping-message 12345)
+                           (usocket:socket-stream fast-sender))
+           (force-output (usocket:socket-stream fast-sender))
+           (sleep 0.3)
+           (let ((start (get-internal-real-time)))
+             ;; One pass over both peers, slow one first — the worst order.
+             (multiple-value-bind (slow-command slow-detail)
+                 (bitcoin-lisp.networking:receive-message slow-peer :timeout 30)
+               (is (null slow-command))
+               (is (eq :incomplete slow-detail)))
+             (multiple-value-bind (fast-command payload)
+                 (bitcoin-lisp.networking:receive-message fast-peer :timeout 30)
+               (declare (ignore payload))
+               (is (equal "ping" fast-command)
+                   "the second peer is served despite the first being mid-message"))
+             (is (< (/ (- (get-internal-real-time) start)
+                       internal-time-units-per-second)
+                    1)
+                 "and the pass costs no waiting at all")))
+      (usocket:socket-close slow-sender)
+      (usocket:socket-close slow-socket)
+      (usocket:socket-close fast-sender)
+      (usocket:socket-close fast-socket)
+      (usocket:socket-close listener))))
+
+(test a-slow-pump-cycle-does-not-reap-peers-mid-message
+  "The reap budget must measure the PEER\'s silence, never our own latency.
+
+An earlier draft of the resumable reader anchored a per-message deadline at the
+first byte and checked it BEFORE draining. During IBD one pump cycle is minutes
+of block validation across peers, so every peer that happened to be mid-message
+— a 24-byte header straddling two TCP segments is routine, not adversarial —
+came back expired and was disconnected as \"stalled\", while its remaining bytes
+sat unread in our own receive buffer. Two properties keep that from returning:
+the budget runs from the last byte that ARRIVED, and the pump drains before it
+consults expiry."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (sender (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (victim-socket (usocket:socket-accept listener
+                                               :element-type '(unsigned-byte 8)))
+         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+                                                        :connected t))
+         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready))
+         (payload (make-array 100 :element-type '(unsigned-byte 8)
+                                  :initial-element 7))
+         (header (bitcoin-lisp.serialization::make-message-header
+                  :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+                  :command "ping"
+                  :payload-length (length payload)
+                  :checksum (subseq (bitcoin-lisp.serialization:compute-checksum
+                                     payload)
+                                    0 4))))
+    (unwind-protect
+         (progn
+           ;; Peer sends its header and, a moment later, the payload — it is
+           ;; never silent for long.
+           (let ((header-bytes
+                   (flexi-streams:with-output-to-sequence (s)
+                     (bitcoin-lisp.serialization::write-message-header s header))))
+             (write-sequence header-bytes (usocket:socket-stream sender))
+             (force-output (usocket:socket-stream sender)))
+           (sleep 0.2)
+           (multiple-value-bind (command detail)
+               (bitcoin-lisp.networking:receive-message peer :timeout 5)
+             (is (null command))
+             (is (eq :incomplete detail)))
+           ;; The payload arrives while we are busy elsewhere.
+           (write-sequence payload (usocket:socket-stream sender))
+           (force-output (usocket:socket-stream sender))
+           ;; Simulate a long pump cycle: far longer than the pump\'s own
+           ;; :timeout 5, which the old per-message deadline was built from.
+           (sleep 1.2)
+           (is-false (bitcoin-lisp.networking::connection-receive-expired-p conn)
+                     "a peer whose bytes are already here is not stalled")
+           ;; And the drain — not a disconnect — is what happens next.
+           (bitcoin-lisp.networking::drain-and-reap-peer peer nil nil nil nil)
+           (is-true (bitcoin-lisp.networking::connection-connected conn)
+                    "a busy pump must not cost a healthy peer its connection"))
+      (usocket:socket-close sender)
+      (usocket:socket-close victim-socket)
+      (usocket:socket-close listener))))
+
+(test receive-message-keeps-its-framing-across-passes
+  "A message is TWO reads, so framing is a per-MESSAGE property the byte reader
+cannot see. With a resumable reader the header may be parsed one pass and the
+payload completed several passes later, so the parsed header is parked on the
+CONNECTION — if it were dropped, the next pass would read payload bytes as a
+header and every later pass would eat 24 more bytes of garbage, forever.
+
+The old failure mode this replaces: the reader gave up between header and
+payload and left the connection ALIVE and permanently out of frame."
   (let* ((listener (usocket:socket-listen "127.0.0.1" 0
                                           :element-type '(unsigned-byte 8)))
          (port (usocket:get-local-port listener))
@@ -907,19 +1062,32 @@ caller's timeout is enough — so receive-message must drop the connection."
                                     0 4))))
     (unwind-protect
          (progn
-           ;; Header now; payload only after the reader's 1s budget has lapsed.
+           ;; Pass 1: header only.
            (let ((header-bytes
                    (flexi-streams:with-output-to-sequence (s)
                      (bitcoin-lisp.serialization::write-message-header s header))))
              (write-sequence header-bytes (usocket:socket-stream sender))
              (force-output (usocket:socket-stream sender)))
            (sleep 0.2)
-           (is (null (bitcoin-lisp.networking:receive-message peer :timeout 1))
-               "the incomplete message yields nothing")
-           (is-false (bitcoin-lisp.networking::connection-connected conn)
-                     "and the peer is dropped rather than left out of frame")
-           (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))
-               "peer state reflects the disconnect, so maintenance replaces it"))
+           (multiple-value-bind (command detail)
+               (bitcoin-lisp.networking:receive-message peer :timeout 30)
+             (is (null command))
+             (is (eq :incomplete detail)))
+           (is-true (bitcoin-lisp.networking::connection-recv-header conn)
+                    "the parsed header survives the gap")
+           (is-true (bitcoin-lisp.networking::connection-connected conn)
+                    "and the peer is not dropped for being mid-message")
+           ;; Pass 2: the payload arrives, and the message completes normally.
+           (write-sequence payload (usocket:socket-stream sender))
+           (force-output (usocket:socket-stream sender))
+           (sleep 0.2)
+           (multiple-value-bind (command received)
+               (bitcoin-lisp.networking:receive-message peer :timeout 30)
+             (is (equal "ping" command)
+                 "the message completes from the parked framing state")
+             (is (equalp payload received)))
+           (is-false (bitcoin-lisp.networking::connection-recv-header conn)
+                     "and the framing state is consumed with it"))
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
       (usocket:socket-close listener))))
