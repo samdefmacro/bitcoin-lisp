@@ -1631,3 +1631,49 @@ see docs/coins-db-best-block-plan.md."
                                              :initial-element 3)
                               (bitcoin-lisp.storage:coins-view-db-best-block base)))))
         (bitcoin-lisp.storage:close-coins-view-db base)))))
+
+(test utxo-iteration-survives-metadata-keys-that-sort-before-coins
+  "The coin scan must be independent of where other key prefixes sort.
+
+It used to seek to the first key and stop at the first non-'C' key, which is
+only a correct scan while every other prefix sorts AFTER 'C'. Adding the
+best-block key ('B', matching Core's DB_BEST_BLOCK) put a key BEFORE the coins,
+so the scan terminated immediately and the entire UTXO set iterated as EMPTY —
+silently. Nothing signalled: the set hash became the hash of no coins, the
+total amount became zero, and assumeutxo validation failed with a hash mismatch
+rather than anything naming the real cause.
+
+The control is the point of this test: iterating must yield the same coins with
+the metadata key present as without it."
+  (let ((db-path (ensure-directories-exist
+                  (merge-pathnames (format nil "bl-iterprefix-~D/" (random 1000000))
+                                   (uiop:temporary-directory)))))
+    (let* ((base (bitcoin-lisp.storage:open-coins-view-db db-path))
+           (cache (bitcoin-lisp.storage:make-coins-view-cache base))
+           (tip (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+           (script (make-array 1 :element-type '(unsigned-byte 8))))
+      (unwind-protect
+           (flet ((count-coins ()
+                    (let ((n 0))
+                      (bitcoin-lisp.storage:utxo-set-iterate
+                       cache (lambda (txid vout entry)
+                               (declare (ignore txid vout entry))
+                               (incf n)))
+                      n)))
+             (dotimes (i 5)
+               (let ((txid (make-array 32 :element-type '(unsigned-byte 8)
+                                          :initial-element (+ 10 i))))
+                 (bitcoin-lisp.storage:coin-view-add cache txid 0 (* 1000 (1+ i)) script 1)))
+             ;; Baseline: no metadata key yet.
+             (bitcoin-lisp.storage:coins-view-cache-flush cache)
+             (let ((without-metadata (count-coins)))
+               (is (= 5 without-metadata) "all coins iterate before any metadata key exists")
+               ;; Now write a key that sorts BEFORE the coin prefix.
+               (bitcoin-lisp.storage:coins-view-cache-flush cache :best-block tip)
+               (is (equalp tip (bitcoin-lisp.storage:coins-view-db-best-block base))
+                   "the metadata key really is present")
+               (is (= without-metadata (count-coins))
+                   "a key sorting before the coins must not truncate the scan")
+               (is (plusp (bitcoin-lisp.storage:utxo-set-total-amount cache))
+                   "and derived totals stay non-zero")))
+        (bitcoin-lisp.storage:close-coins-view-db base)))))
