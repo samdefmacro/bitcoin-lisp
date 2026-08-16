@@ -675,11 +675,12 @@ the queue — and its file descriptors — grow without bound: the live wedge le
       (is (eq :backlog reason)))))
 
 (test receive-bytes-tolerates-a-slow-but-progressing-peer
-  "TIMEOUT bounds stalling, not total transfer time. A peer that keeps
-delivering — here in slow dribbles that together outlast the timeout — must
-still complete its message. A total-time cap would look like a fix for the
-stall bug while quietly breaking block download over slow links, so this is the
-counterweight to the test above."
+  "TIMEOUT bounds stalling, not total transfer time. A 1 MiB message arriving
+in chunks over several seconds — far longer than the caller's one-second
+timeout, but always progressing and comfortably above the rate floor — must
+complete. A total-time cap would look like a fix for the stall bug while
+quietly breaking block download, so this is the counterweight to the tests
+above."
   (let* ((listener (usocket:socket-listen "127.0.0.1" 0
                                           :element-type '(unsigned-byte 8)))
          (port (usocket:get-local-port listener))
@@ -687,24 +688,30 @@ counterweight to the test above."
                                          :element-type '(unsigned-byte 8)))
          (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
          (conn (bitcoin-lisp.networking::make-connection :socket server :connected t))
-         (total 600)
+         (chunk (* 100 1024))
+         (chunks 10)
+         (total (* chunk chunks))
          (sender (bt:make-thread
                   (lambda ()
-                    ;; 6 dribbles, 0.4s apart: 2.4s total, well past the 1s
-                    ;; timeout, but never 1s without progress.
-                    (dotimes (i 6)
-                      (write-sequence
-                       (make-array (/ total 6) :element-type '(unsigned-byte 8)
+                    ;; ~340 KiB/s overall: well above the floor, and no gap
+                    ;; anywhere near the one-second stall bound, but the whole
+                    ;; transfer takes about three seconds.
+                    (dotimes (i chunks)
+                      (handler-case
+                          (progn
+                            (write-sequence
+                             (make-array chunk :element-type '(unsigned-byte 8)
                                                :initial-element 9)
-                       (usocket:socket-stream client))
-                      (force-output (usocket:socket-stream client))
-                      (sleep 0.4))))))
+                             (usocket:socket-stream client))
+                            (force-output (usocket:socket-stream client)))
+                        (error () (return)))
+                      (sleep 0.3))))))
     (unwind-protect
          (multiple-value-bind (finished result)
              (%run-bounded (lambda ()
                              (bitcoin-lisp.networking::receive-bytes
                               conn total :timeout 1))
-                           :limit 15)
+                           :limit 30)
            (is-true finished "the read must terminate")
            (is (and result (= total (length result)))
                "a peer that keeps making progress delivers its whole message")
@@ -771,4 +778,46 @@ not hang."
                  "a stalled proxy reply is reported as an error")))
       (usocket:socket-close client)
       (usocket:socket-close proxy-side)
+      (usocket:socket-close listener))))
+
+(test receive-bytes-refuses-a-dribbling-slow-loris
+  "A stall timeout alone is renewable: any progress resets it, so a peer that
+sends one byte just inside every window holds the serial pump forever at ~1 B/s
+— an infinite hang traded for a slow-loris. The whole-message budget
+(+MIN-RECEIVE-BYTES-PER-SECOND+) is what makes the hold finite, so this test
+fails if only the stall bound is present."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (client (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (server (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
+         (conn (bitcoin-lisp.networking::make-connection :socket server :connected t))
+         (stop nil)
+         ;; Ask for more than the rate floor allows within the stall window, so
+         ;; the two bounds are distinguishable: 200 KiB at 32 KiB/s = ~6.4s.
+         (wanted (* 200 1024))
+         (dribbler (bt:make-thread
+                    (lambda ()
+                      ;; One byte every 0.3s: never a full second of silence,
+                      ;; so the stall bound alone would never fire.
+                      (loop until stop
+                            do (handler-case
+                                   (progn
+                                     (write-byte 1 (usocket:socket-stream client))
+                                     (force-output (usocket:socket-stream client)))
+                                 (error () (return)))
+                               (sleep 0.3))))))
+    (unwind-protect
+         (multiple-value-bind (finished result)
+             (%run-bounded (lambda ()
+                             (bitcoin-lisp.networking::receive-bytes
+                              conn wanted :timeout 1))
+                           :limit 30)
+           (is-true finished "a dribbling peer must not hold the reader open")
+           (is (null result) "and delivers no message"))
+      (setf stop t)
+      (ignore-errors (bt:join-thread dribbler))
+      (usocket:socket-close client)
+      (usocket:socket-close server)
       (usocket:socket-close listener))))
