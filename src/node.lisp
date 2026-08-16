@@ -1949,6 +1949,11 @@ Returns the node instance."
     (let ((view (bitcoin-lisp.storage:open-coins-view-db chainstate-path)))
       (setf (bitcoin-lisp.storage:chain-state-coins-view primary)
             (bitcoin-lisp.storage:make-coins-view-cache view))
+      ;; Adopt the stored pointer so a flush before the first block-level
+      ;; mutation re-stamps what is already true rather than leaving the coins
+      ;; and the pointer to drift apart.
+      (bitcoin-lisp.storage:coins-view-cache-load-best-block
+       (bitcoin-lisp.storage:chain-state-coins-view primary))
       (log-info "UTXO cache opened (base: ~A)" chainstate-path)))
 
   ;; Load persisted header index if available
@@ -2707,18 +2712,15 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
             ;; un-durable while chainstate.dat says they are committed. (Was
             ;; :sync nil — atomic but not durable; the shutdown flush already
             ;; syncs, the periodic one now matches it.)
-            ;; Stamp the coins DB with the tip these coins belong to, inside the
-            ;; same batch. chainstate.dat (written in Phase 3) is a SECOND record
-            ;; of the same fact and the two can disagree — that divergence is
-            ;; what turns an interrupted reorg or a bad sector into a chain-index
-            ;; brick. Core keeps the pointer inside the coins DB for exactly this
-            ;; reason (CCoinsViewDB::BatchWrite). Phase 1 of
-            ;; docs/coins-db-best-block-plan.md: record it and report
-            ;; disagreement; later phases make it the source of truth.
-            (bitcoin-lisp.storage:coins-view-cache-flush
-             view :sync t
-             :best-block (and chainstate
-                              (bitcoin-lisp.storage:best-block-hash chainstate)))))
+            ;; The coins DB is stamped with the block THESE COINS correspond to,
+            ;; inside the same batch. The cache tracks that itself (moved by
+            ;; block apply/disconnect, as Core does in Connect/DisconnectBlock),
+            ;; so we deliberately do NOT pass the chain's tip here: during a
+            ;; reorg's disconnect phase the tip still names the block being
+            ;; rewound away from, and stamping it would record a hash the coins
+            ;; no longer match. chainstate.dat (Phase 3 below) remains a second
+            ;; record of the tip; startup compares the two.
+            (bitcoin-lisp.storage:coins-view-cache-flush view :sync t)))
         ;; Phase 3: commit by re-saving chainstate without the marker.
         (when chainstate
           (bitcoin-lisp.storage:save-state chainstate :in-transition nil))

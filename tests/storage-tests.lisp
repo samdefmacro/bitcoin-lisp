@@ -1677,3 +1677,78 @@ the metadata key present as without it."
                (is (plusp (bitcoin-lisp.storage:utxo-set-total-amount cache))
                    "and derived totals stay non-zero")))
         (bitcoin-lisp.storage:close-coins-view-db base)))))
+
+(test coins-cache-best-block-moves-with-the-blocks-not-the-chain-tip
+  "The coins view must track which block its state corresponds to and move that
+pointer WITH the coins — Core does it inside ConnectBlock and DisconnectBlock
+(validation.cpp:2651, :2242).
+
+This is what makes the stored pointer honest. Reading the chain's tip at flush
+time instead would stamp the wrong hash for the whole of a reorg's disconnect
+phase, where the tip still names the block being rewound away from while these
+coins have already moved back — and the startup consistency check would then
+compare two copies of the same wrong answer and report agreement."
+  (let ((db-path (ensure-directories-exist
+                  (merge-pathnames (format nil "bl-bbtrack-~D/" (random 1000000))
+                                   (uiop:temporary-directory)))))
+    (let* ((base (bitcoin-lisp.storage:open-coins-view-db db-path))
+           (cache (bitcoin-lisp.storage:make-coins-view-cache base))
+           (parent (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA))
+           (this-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xBB))
+           (coinbase (bitcoin-lisp.tests::%make-coinbase-tx
+                      (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
+                      5000
+                      (make-array 1 :element-type '(unsigned-byte 8))))
+           (block (bitcoin-lisp.serialization:make-bitcoin-block
+                   :header (bitcoin-lisp.serialization:make-block-header
+                            :version 1 :prev-block parent
+                            :merkle-root (make-array 32 :element-type '(unsigned-byte 8))
+                            :timestamp 0 :bits 0 :nonce 0
+                            :cached-hash this-block)
+                   :transactions (list coinbase))))
+      (unwind-protect
+           (progn
+             ;; Control: nothing tracked before any block is applied.
+             (is (null (bitcoin-lisp.storage::cvc-best-block cache))
+                 "a fresh cache tracks no block")
+             ;; Connect: the pointer becomes THIS block.
+             (let ((spent (bitcoin-lisp.storage:apply-block-to-utxo-set cache block 1)))
+               (declare (ignore spent))
+               (is (equalp this-block (bitcoin-lisp.storage::cvc-best-block cache))
+                   "applying a block moves the pointer to that block"))
+             ;; A flush with no explicit hash stamps what the cache tracks.
+             (bitcoin-lisp.storage:coins-view-cache-flush cache)
+             (is (equalp this-block (bitcoin-lisp.storage:coins-view-db-best-block base))
+                 "the flush stamps the cache's own pointer, unasked")
+             ;; Disconnect: the pointer becomes the PARENT, which is the case the
+             ;; chain tip would get wrong.
+             (bitcoin-lisp.storage:disconnect-block-from-utxo-set cache block '())
+             (is (equalp parent (bitcoin-lisp.storage::cvc-best-block cache))
+                 "disconnecting moves the pointer back to the parent")
+             (bitcoin-lisp.storage:coins-view-cache-flush cache)
+             (is (equalp parent (bitcoin-lisp.storage:coins-view-db-best-block base))
+                 "and a flush mid-rewind records the parent, not the old tip")
+             ;; Control: the two hashes must be distinguishable, or the
+             ;; assertions above could pass on any value.
+             (is (not (equalp parent this-block))))
+        (bitcoin-lisp.storage:close-coins-view-db base)))))
+
+(test coins-cache-adopts-the-stored-best-block-on-open
+  "A freshly-opened cache must adopt the pointer already on disk. Otherwise it
+reports NIL until the first block-level mutation, and a flush in between — a
+shutdown flush, say — would move coins while leaving the pointer behind."
+  (let ((db-path (ensure-directories-exist
+                  (merge-pathnames (format nil "bl-bbadopt-~D/" (random 1000000))
+                                   (uiop:temporary-directory)))))
+    (let* ((base (bitcoin-lisp.storage:open-coins-view-db db-path))
+           (tip (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xCC)))
+      (unwind-protect
+           (let ((writer (bitcoin-lisp.storage:make-coins-view-cache base)))
+             (bitcoin-lisp.storage:coins-view-cache-flush writer :best-block tip)
+             (let ((reopened (bitcoin-lisp.storage:make-coins-view-cache base)))
+               ;; Control: without adopting, a fresh cache knows nothing.
+               (is (null (bitcoin-lisp.storage::cvc-best-block reopened)))
+               (bitcoin-lisp.storage:coins-view-cache-load-best-block reopened)
+               (is (equalp tip (bitcoin-lisp.storage::cvc-best-block reopened))
+                   "the reopened cache adopts what is on disk")))
+        (bitcoin-lisp.storage:close-coins-view-db base)))))
