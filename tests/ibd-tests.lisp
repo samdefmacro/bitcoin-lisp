@@ -2761,3 +2761,182 @@ round() would emit 107 a third of the time where Core emits a flat 100."
         "an idle pool has NO rolling minimum, independent of the relay floor")
     (is (plusp (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool))
         "the effective rate still folds the floor in")))
+
+;;;; Header sync over the shared pump (Core has no header-sync loop: headers are
+;;;; ordinary messages, and ProcessHeadersMessage asks for the next batch itself).
+
+(defun %hdr-sync-chain-state (suffix)
+  "A regtest chain-state holding only genesis, for header-ingestion tests."
+  (let* ((state (bitcoin-lisp.storage:init-chain-state
+                 (merge-pathnames (format nil "test-hdrpump-~A/" suffix)
+                                  (uiop:temporary-directory))))
+         (genesis-hash (bitcoin-lisp.storage:best-block-hash state))
+         (zeros (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     state
+     (bitcoin-lisp.storage:make-block-index-entry
+      :hash genesis-hash :height 0 :chain-work 1 :status :valid
+      :header (bitcoin-lisp.serialization:make-block-header
+               :version 1 :prev-block zeros :merkle-root zeros
+               :timestamp 1296688600 :bits #x207fffff :nonce 0
+               :cached-hash genesis-hash)))
+    state))
+
+(test headers-ingest-asks-for-more-on-a-full-batch
+  "Core's ProcessHeadersMessage tail (net_processing.cpp:3105-3111): a
+maximum-size headers message means the peer may have more, so ask again. Ours
+did not, which is the whole reason a dedicated BLOCKING header-sync loop
+existed — and that loop ran on the pump's own thread, so it stalled every other
+peer while its chosen one answered.
+
+The follow-up must be skipped while a low-work sync owns the conversation
+(Core's !have_headers_sync): that path sends its own, from the sync's locator,
+and a second getheaders would desynchronise it."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (state (%hdr-sync-chain-state "more"))
+         (sent 0)
+         (peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    ;; Count getheaders without a socket: send-message on a peer with no
+    ;; connection returns NIL, so stub the throttled sender instead.
+    (let ((real (symbol-function 'bitcoin-lisp.networking::%maybe-send-getheaders))
+          (entry (bitcoin-lisp.storage:get-block-index-entry
+                  state (bitcoin-lisp.storage:best-block-hash state))))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'bitcoin-lisp.networking::%maybe-send-getheaders)
+                   (lambda (p loc) (declare (ignore p loc)) (incf sent) t))
+             ;; Not a full batch: nothing more to ask for.
+             (bitcoin-lisp.networking::%maybe-request-more-headers peer state entry nil)
+             (is (= 0 sent) "a short batch ends the conversation")
+             ;; Full batch: ask again — and from THIS batch's last header, which
+             ;; is the whole termination argument (see the docstring).
+             (bitcoin-lisp.networking::%maybe-request-more-headers peer state entry t)
+             (is (= 1 sent) "a maximum-size batch means ask for the next")
+             ;; No pindexLast (nothing of the batch is in our index) — there is
+             ;; no advancing locator to ask from, so stay quiet rather than
+             ;; re-ask from our own tip and loop.
+             (setf (bitcoin-lisp.networking::peer-last-getheaders-time peer) 0)
+             (bitcoin-lisp.networking::%maybe-request-more-headers peer state nil t)
+             (is (= 1 sent) "no pindexLast means no advancing locator")
+             ;; Full batch while a low-work sync owns this peer: that driver
+             ;; sends its own follow-up, so this one must stay quiet.
+             (setf (bitcoin-lisp.networking::peer-headers-sync peer) :in-progress
+                   (bitcoin-lisp.networking::peer-last-getheaders-time peer) 0)
+             (bitcoin-lisp.networking::%maybe-request-more-headers peer state entry t)
+             (is (= 1 sent) "a low-work sync owns its own follow-up"))
+        (setf (symbol-function 'bitcoin-lisp.networking::%maybe-send-getheaders) real)))))
+
+(test headers-ingest-counts-an-answer-even-with-nothing-new
+  "Header sync rotates on 'this peer never answered', which is NOT 'this peer
+had nothing new'. A peer at our own tip answers a getheaders with a batch we
+already hold; counting only NEW headers would score it exactly like a peer that
+went silent, and the failover would rotate away from every healthy peer the
+moment we caught up."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (state (%hdr-sync-chain-state "answered"))
+         (peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    (is (= 0 (bitcoin-lisp.networking::%peer-headers-bytes peer)))
+    ;; The counter is the transport's own per-command byte tally, so record an
+    ;; empty headers message the way the reader would.
+    (bitcoin-lisp.networking::%account-message
+     (bitcoin-lisp.networking::peer-recv-per-msg peer) nil "headers" 1)
+    (is (plusp (bitcoin-lisp.networking::%peer-headers-bytes peer))
+        "an empty answer is still an answer")))
+
+(test per-cycle-byte-budget-ends-a-peers-turn
+  "A message COUNT is not a fairness bound: 32 messages can be 32 blocks, and a
+peer that keeps its socket full holds the drain for as long as it can feed it.
+Core bounds BYTES per node per socket-handler pass (net.cpp:2171-2183).
+
+Driven, not asserted about constants: queue well past the budget in small
+messages and check the drain leaves some behind for the next pass."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (state (bitcoin-lisp.storage:make-chain-state))
+         (listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener)))
+    (unwind-protect
+         (let* ((client (usocket:socket-connect "127.0.0.1" port
+                                                :element-type '(unsigned-byte 8)))
+                (server (usocket:socket-accept listener
+                                               :element-type '(unsigned-byte 8)))
+                (peer (bitcoin-lisp.networking:make-peer
+                       :state :ready
+                       :connection (bitcoin-lisp.networking::make-connection
+                                    :socket server :connected t)))
+                (ctx (bitcoin-lisp.networking::make-ibd-context))
+                ;; "ping" carries an 8-byte nonce: 32 bytes on the wire, so a
+                ;; few thousand comfortably exceed the 64 KB budget.
+                (msg (bitcoin-lisp.serialization:make-ping-message 7))
+                (queued 4000))
+           (setf (bitcoin-lisp.networking::ibd-context-peers ctx) (list peer))
+           (dotimes (i queued)
+             (write-sequence msg (usocket:socket-stream client)))
+           (force-output (usocket:socket-stream client))
+           (sleep 0.3)
+           (bitcoin-lisp.networking::drain-and-reap-peer
+            peer state (bitcoin-lisp.storage:make-utxo-set) nil ctx)
+           (let ((took (bitcoin-lisp.networking::connection-bytes-received
+                        (bitcoin-lisp.networking::peer-connection peer))))
+             (is (plusp took) "the drain served this peer")
+             (is (< took (* (length msg) queued))
+                 "but yielded before draining everything it had"))
+           (usocket:socket-close client))
+      (usocket:socket-close listener))))
+
+(test header-sync-waiting-does-not-starve-other-peers
+  "THE reason this changed. sync-headers used to wait for its chosen peer in
+receive-message-blocking — up to 30 x 5s per batch — on the sync thread, which
+is the pump's own thread. For that whole time no other peer was drained, no
+block was processed and no expired read was reaped: one peer's latency was the
+whole node's.
+
+The wait is now a pump pass. Here the chosen peer says nothing at all while a
+second peer sends a headers message; that second peer must still be served."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (state (%hdr-sync-chain-state "starve"))
+         (listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener)))
+    (unwind-protect
+         (let* ((quiet-client (usocket:socket-connect "127.0.0.1" port
+                                                      :element-type '(unsigned-byte 8)))
+                (quiet-server (usocket:socket-accept listener
+                                                     :element-type '(unsigned-byte 8)))
+                (talker-client (usocket:socket-connect "127.0.0.1" port
+                                                       :element-type '(unsigned-byte 8)))
+                (talker-server (usocket:socket-accept listener
+                                                      :element-type '(unsigned-byte 8)))
+                (quiet (bitcoin-lisp.networking:make-peer
+                        :state :ready
+                        :connection (bitcoin-lisp.networking::make-connection
+                                     :socket quiet-server :connected t)))
+                (talker (bitcoin-lisp.networking:make-peer
+                         :state :ready
+                         :connection (bitcoin-lisp.networking::make-connection
+                                      :socket talker-server :connected t)))
+                (ctx (bitcoin-lisp.networking::make-ibd-context)))
+           (setf (bitcoin-lisp.networking::ibd-context-peers ctx) (list quiet talker))
+           ;; The talker answers with an empty headers message — the smallest
+           ;; well-formed one, and exactly what a peer at our tip sends.
+           (write-sequence (bitcoin-lisp.serialization:serialize-message
+                            "headers" (make-array 1 :element-type '(unsigned-byte 8)
+                                                    :initial-element 0))
+                           (usocket:socket-stream talker-client))
+           (force-output (usocket:socket-stream talker-client))
+           (sleep 0.2)
+           ;; Short idle window so the test does not sit out the real one.
+           (let ((bitcoin-lisp.networking::+header-sync-idle-passes+ 3))
+             (multiple-value-bind (received stalled)
+                 (bitcoin-lisp.networking::sync-headers
+                  quiet state :ctx ctx
+                  :utxo-set (bitcoin-lisp.storage:make-utxo-set))
+               (declare (ignore received))
+               (is-true stalled "the chosen peer never answered, so rotate")))
+           (is (plusp (bitcoin-lisp.networking::%peer-headers-bytes talker))
+               "the OTHER peer was served while header sync waited")
+           (is (= 0 (bitcoin-lisp.networking::%peer-headers-bytes quiet))
+               "control: the chosen peer really did stay silent")
+           (usocket:socket-close quiet-client)
+           (usocket:socket-close talker-client))
+      (usocket:socket-close listener))))
