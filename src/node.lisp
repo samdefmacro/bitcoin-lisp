@@ -547,17 +547,29 @@ AttemptToEvictConnection. Returns T if a peer was evicted."
   "Admission check for a freshly-accepted inbound connection from HOST,
 before any handshake work (Core CConnman::CreateNodeFromAcceptedSocket,
 net.cpp:1801-1813): a banned address is always dropped; a discouraged
-address is dropped only when the inbound slots are (almost) full. Returns T,
-or (VALUES NIL REASON) when the connection must be dropped."
-  (cond
-    ((bitcoin-lisp.networking:peer-banned-p host)
-     (values nil :banned))
-    ((and (bitcoin-lisp.networking:peer-discouraged-p host)
-          (>= (1+ (bt:with-recursive-lock-held ((node-lock node))
-                    (count-inbound-peers node)))
-              +max-inbound-peers+))
-     (values nil :discouraged))
-    (t t)))
+address is dropped only when the inbound slots are (almost) full; and no
+connection is admitted while the hand-off queue is already full. Returns T,
+or (VALUES NIL REASON) when the connection must be dropped.
+
+The backlog arm matters because +MAX-INBOUND-PEERS+ is otherwise enforced only
+at MERGE time, by the sync thread. Accepted peers hold a socket while they wait
+in PENDING-INBOUND-PEERS, so anything that stalls that thread turns every new
+connection into a leaked descriptor — the live wedge of 2026-08-16 accumulated
+751 sockets in CLOSE-WAIT this way. Counting the queue bounds the damage at
+twice the inbound cap no matter what the rest of the node is doing."
+  (multiple-value-bind (inbound pending)
+      (bt:with-recursive-lock-held ((node-lock node))
+        (values (count-inbound-peers node)
+                (length (node-pending-inbound-peers node))))
+    (cond
+      ((bitcoin-lisp.networking:peer-banned-p host)
+       (values nil :banned))
+      ((>= pending +max-inbound-peers+)
+       (values nil :backlog))
+      ((and (bitcoin-lisp.networking:peer-discouraged-p host)
+            (>= (1+ inbound) +max-inbound-peers+))
+       (values nil :discouraged))
+      (t t))))
 
 (defun run-inbound-listener (node &key (socket (node-listener-socket node)) onion)
   "Accept inbound connections on SOCKET, handshake each, and hand the ready
@@ -3919,27 +3931,41 @@ phase exits quickly when there's nothing new to fetch."
     (log-warn "No peers connected, cannot sync")
     (return-from sync-blockchain 0))
 
-  ;; IBD drives the current chainstate (its tip and coins view). When an
-  ;; assumeutxo background sync is active, the historical chainstate rides
-  ;; along as a second download cursor inside the same IBD pass: run-ibd
-  ;; queues its [historical-tip .. snapshot-base] range and routes received
-  ;; blocks to whichever chainstate owns their height.
-  (let ((chainstate (node-current-chainstate node))
-        (peer-height (bitcoin-lisp.networking:peer-start-height (find-best-peer node))))
-    (log-debug "Sync cycle: local height ~D, peer-start height ~D"
-               (bitcoin-lisp.storage:current-height chainstate)
-               peer-height)
-    (bitcoin-lisp.networking::start-ibd
-     (node-peers node)
-     chainstate
-     (bitcoin-lisp.storage:chain-state-coins-view chainstate)
-     (node-block-store node)
-     peer-height
-     :historical-chainstate (node-historical-chainstate node)
-     :fee-estimator (node-fee-estimator node)
-     :recent-rejects (node-recent-rejects node)
-     :mempool (node-mempool node)
-     :address-book (node-address-book node))))
+  ;; A non-empty peer list is NOT enough: every entry can still be
+  ;; mid-handshake, and find-best-peer only considers :READY peers. Passing its
+  ;; NIL to the peer-start-height accessor is a type error that unwinds the
+  ;; whole sync iteration — INCLUDING the message pump below, which is the only
+  ;; thing that ever advances a handshake to :READY. That makes the failure
+  ;; self-sustaining: once the last :READY peer goes away while stale entries
+  ;; remain, the node can never recover on its own. Proven live: a node spent
+  ;; 19 days logging this type error every 5 seconds, 333k times, while its
+  ;; 8 peers sat forever unhandshaked.
+  (let ((best-peer (find-best-peer node)))
+    (unless best-peer
+      (log-warn "No peer has completed its handshake yet; skipping this sync cycle")
+      (return-from sync-blockchain 0))
+
+    ;; IBD drives the current chainstate (its tip and coins view). When an
+    ;; assumeutxo background sync is active, the historical chainstate rides
+    ;; along as a second download cursor inside the same IBD pass: run-ibd
+    ;; queues its [historical-tip .. snapshot-base] range and routes received
+    ;; blocks to whichever chainstate owns their height.
+    (let ((chainstate (node-current-chainstate node))
+          (peer-height (bitcoin-lisp.networking:peer-start-height best-peer)))
+      (log-debug "Sync cycle: local height ~D, peer-start height ~D"
+                 (bitcoin-lisp.storage:current-height chainstate)
+                 peer-height)
+      (bitcoin-lisp.networking::start-ibd
+       (node-peers node)
+       chainstate
+       (bitcoin-lisp.storage:chain-state-coins-view chainstate)
+       (node-block-store node)
+       peer-height
+       :historical-chainstate (node-historical-chainstate node)
+       :fee-estimator (node-fee-estimator node)
+       :recent-rejects (node-recent-rejects node)
+       :mempool (node-mempool node)
+       :address-book (node-address-book node)))))
 
 
 (defun find-best-peer (node)
