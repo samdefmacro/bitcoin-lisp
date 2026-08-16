@@ -75,7 +75,13 @@ through the v2 packet layer."
   (max 0 (/ (- deadline (get-internal-real-time)) internal-time-units-per-second)))
 
 (defun %v2-read (conn count deadline)
-  "receive-bytes bounded by the shared handshake DEADLINE."
+  "receive-bytes bounded by the shared handshake DEADLINE.
+
+Approximately: receive-bytes treats its :timeout as a stall bound and adds a
+size allowance on top, so a read may overshoot DEADLINE by
+COUNT/+MIN-RECEIVE-BYTES-PER-SECOND+. Handshake reads are tens of bytes, so the
+overshoot here is under a millisecond; do not reuse this helper for bulk reads
+expecting a hard deadline."
   (receive-bytes conn count :timeout (%v2-remaining deadline)))
 
 ;;; --- key material ---

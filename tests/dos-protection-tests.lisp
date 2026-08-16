@@ -642,16 +642,19 @@ regression test above is vacuous"))
       (usocket:socket-close server)
       (usocket:socket-close listener))))
 
-(test sync-blockchain-survives-peers-that-never-handshake
-  "Peers exist but none reached :READY (all mid-handshake). FIND-BEST-PEER
-returns NIL and the old code handed that to the PEER-START-HEIGHT accessor,
-whose type error unwound the whole sync iteration — including the message pump
-that is the only thing which ever advances a handshake. A live node logged that
-error every five seconds for nineteen days."
+(test sync-blockchain-survives-a-peer-list-of-only-dead-peers
+  "Peers enter NODE-PEERS only after a successful handshake, but they stay
+there once they go :DISCONNECTED — reaping happens in MAINTAIN-PEERS, which the
+sync loop runs AFTER sync-blockchain. So a list of nothing but dead peers is
+reachable, FIND-BEST-PEER returns NIL for it, and the old code handed that NIL
+to the PEER-START-HEIGHT accessor. The resulting type error unwound the sync
+iteration, so maintain-peers never ran, so the dead peers were never reaped or
+redialed — the failure fed itself. A live node logged it every five seconds for
+nineteen days."
   (let ((node (bitcoin-lisp::make-node)))
     (setf (bitcoin-lisp::node-peers node)
-          (list (bitcoin-lisp.networking:make-peer :state :connecting)
-                (bitcoin-lisp.networking:make-peer :state :handshaking)))
+          (list (bitcoin-lisp.networking:make-peer :state :disconnected)
+                (bitcoin-lisp.networking:make-peer :state :disconnected)))
     ;; Control: the precondition the bug needs must actually hold here.
     (is (null (bitcoin-lisp::find-best-peer node))
         "no peer is :READY, so this exercises the NIL path")
@@ -869,5 +872,83 @@ Announce just under the limit."
              (is-false (bitcoin-lisp.networking::connection-connected conn)
                        "and the peer is dropped")))
       (usocket:socket-close attacker)
+      (usocket:socket-close victim-socket)
+      (usocket:socket-close listener))))
+
+(test receive-message-drops-a-peer-whose-payload-lags-its-header
+  "A message is TWO reads, so framing is a per-MESSAGE property that
+receive-bytes cannot see. If the header read succeeds and the payload read then
+times out having consumed NOTHING, the per-call rule ('only kill if this call
+consumed bytes') leaves the connection alive with 24 header bytes already
+eaten — permanently out of frame, and every later pass eats 24 more bytes as a
+bogus header. Bounding the reads is what made this reachable at all: the old
+blocking read could not be interrupted between header and payload.
+
+Nothing here requires a malicious peer — a payload lagging its header past the
+caller's timeout is enough — so receive-message must drop the connection."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (sender (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (victim-socket (usocket:socket-accept listener
+                                               :element-type '(unsigned-byte 8)))
+         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+                                                        :connected t))
+         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready))
+         (payload (make-array 100 :element-type '(unsigned-byte 8)
+                                  :initial-element 3))
+         (header (bitcoin-lisp.serialization::make-message-header
+                  :magic (copy-seq bitcoin-lisp.serialization:*network-magic*)
+                  :command "ping"
+                  :payload-length (length payload)
+                  :checksum (subseq (bitcoin-lisp.serialization:compute-checksum
+                                     payload)
+                                    0 4))))
+    (unwind-protect
+         (progn
+           ;; Header now; payload only after the reader's 1s budget has lapsed.
+           (let ((header-bytes
+                   (flexi-streams:with-output-to-sequence (s)
+                     (bitcoin-lisp.serialization::write-message-header s header))))
+             (write-sequence header-bytes (usocket:socket-stream sender))
+             (force-output (usocket:socket-stream sender)))
+           (sleep 0.2)
+           (is (null (bitcoin-lisp.networking:receive-message peer :timeout 1))
+               "the incomplete message yields nothing")
+           (is-false (bitcoin-lisp.networking::connection-connected conn)
+                     "and the peer is dropped rather than left out of frame")
+           (is (eq :disconnected (bitcoin-lisp.networking:peer-state peer))
+               "peer state reflects the disconnect, so maintenance replaces it"))
+      (usocket:socket-close sender)
+      (usocket:socket-close victim-socket)
+      (usocket:socket-close listener))))
+
+(test receive-message-drops-a-peer-on-bad-magic
+  "Bad magic means 24 bytes were consumed at an unknown offset, so the stream
+cannot be trusted to sit on a message boundary. Returning NIL without
+disconnecting left the peer :READY and eating 24 bytes of garbage per pass
+forever."
+  (let* ((listener (usocket:socket-listen "127.0.0.1" 0
+                                          :element-type '(unsigned-byte 8)))
+         (port (usocket:get-local-port listener))
+         (sender (usocket:socket-connect "127.0.0.1" port
+                                         :element-type '(unsigned-byte 8)))
+         (victim-socket (usocket:socket-accept listener
+                                               :element-type '(unsigned-byte 8)))
+         (conn (bitcoin-lisp.networking::make-connection :socket victim-socket
+                                                        :connected t))
+         (peer (bitcoin-lisp.networking:make-peer :connection conn :state :ready)))
+    (unwind-protect
+         (progn
+           (write-sequence (make-array 24 :element-type '(unsigned-byte 8)
+                                          :initial-element 255)
+                           (usocket:socket-stream sender))
+           (force-output (usocket:socket-stream sender))
+           (sleep 0.2)
+           (is (null (bitcoin-lisp.networking:receive-message peer :timeout 1)))
+           (is-false (bitcoin-lisp.networking::connection-connected conn)
+                     "a peer talking a foreign protocol is dropped"))
+      (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
       (usocket:socket-close listener))))
