@@ -1590,3 +1590,44 @@ version."
                "a valid legacy-format file still loads"))
       (when (probe-file path) (ignore-errors (delete-file path)))
       (ignore-errors (uiop:delete-empty-directory dir)))))
+
+(test coins-db-records-its-own-best-block-in-the-flush-batch
+  "The coins DB must carry the block hash its UTXO state belongs to, written in
+the SAME batch as the coin changes. Keeping that fact only in chainstate.dat
+lets two independent records disagree, which is what turns an interrupted reorg
+or a bad sector into a bricked chain index. Core keeps the pointer inside the
+coins DB for exactly this reason (CCoinsViewDB::BatchWrite, txdb.cpp:100-159);
+see docs/coins-db-best-block-plan.md."
+  (let ((db-path (ensure-directories-exist
+                  (merge-pathnames (format nil "bl-bestblock-~D/" (random 1000000))
+                                   (uiop:temporary-directory)))))
+    (let* ((base (bitcoin-lisp.storage:open-coins-view-db db-path))
+           (cache (bitcoin-lisp.storage:make-coins-view-cache base))
+           (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+           (tip (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+      (unwind-protect
+           (progn
+             ;; Control: nothing recorded before the first flush that supplies it.
+             (is (null (bitcoin-lisp.storage:coins-view-db-best-block base))
+                 "a fresh coins DB has no best-block pointer")
+             (bitcoin-lisp.storage:coin-view-add
+              cache txid 0 5000 (make-array 1 :element-type '(unsigned-byte 8)) 1)
+             ;; A flush WITHOUT a tip must not invent one.
+             (bitcoin-lisp.storage:coins-view-cache-flush cache)
+             (is (null (bitcoin-lisp.storage:coins-view-db-best-block base))
+                 "a flush that does not know its tip leaves the pointer alone")
+             ;; A flush WITH a tip records it alongside the coins.
+             (bitcoin-lisp.storage:coin-view-add
+              cache txid 1 6000 (make-array 1 :element-type '(unsigned-byte 8)) 1)
+             (bitcoin-lisp.storage:coins-view-cache-flush cache :best-block tip)
+             (is (equalp tip (bitcoin-lisp.storage:coins-view-db-best-block base))
+                 "the tip is durable in the coins DB")
+             ;; and the coins from that same batch are there too — the point is
+             ;; that they commit together, so both halves must be observable.
+             (is (not (null (bitcoin-lisp.storage:coin-view-get cache txid 1)))
+                 "the coins written in that batch are present")
+             ;; control: a different hash must not compare equal
+             (is (not (equalp (make-array 32 :element-type '(unsigned-byte 8)
+                                             :initial-element 3)
+                              (bitcoin-lisp.storage:coins-view-db-best-block base)))))
+        (bitcoin-lisp.storage:close-coins-view-db base)))))
