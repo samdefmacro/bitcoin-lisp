@@ -586,14 +586,19 @@ Returns (VALUES COMMAND PAYLOAD) on success, NIL on failure/timeout."
                            (if (zerop payload-len) #() payload))))
                     (unless (equalp (subseq computed-checksum 0 4)
                                     (bitcoin-lisp.serialization:message-header-checksum header))
-                      ;; A full message was consumed, so framing is intact, but a
-                      ;; checksum mismatch is a protocol violation and Core drops
-                      ;; the peer for it rather than silently ignoring the
-                      ;; message.
-                      (bitcoin-lisp:log-warn "Bad checksum on ~A from peer ~A, disconnecting"
+                      ;; Drop the MESSAGE, keep the peer — Core's explicit choice
+                      ;; ("Message deserialization failed. Drop the message but
+                      ;; don't disconnect the peer.", net.cpp:678-683, reached
+                      ;; for a wrong checksum at net.cpp:819-825). A full message
+                      ;; was consumed here, so unlike every other failure in this
+                      ;; function the framing is intact and there is nothing to
+                      ;; resynchronize. Disconnecting would also turn any bug in
+                      ;; our own payload handling into node-wide peer churn.
+                      ;; Bad MAGIC is the opposite case and does disconnect
+                      ;; above, matching net.cpp:752-755.
+                      (bitcoin-lisp:log-warn "Bad checksum on ~A from peer ~A, dropping message"
                                              (bitcoin-lisp.serialization:message-header-command header)
                                              (peer-address peer))
-                      (disconnect-peer peer)
                       (return-from receive-message nil))
                     (let ((command (bitcoin-lisp.serialization:message-header-command header)))
                       (%account-message (peer-recv-per-msg peer) nil
