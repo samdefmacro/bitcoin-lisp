@@ -36,6 +36,19 @@
    validation took a few seconds, then the stalling-peer check would evict
    peers for OUR slowness. Drain in batches to keep buffers shallow.")
 
+(defparameter +max-recv-bytes-per-peer-per-cycle+ 65536
+  "Bytes one peer may hand us in a single drain before we move to the next.
+
+A message count alone is not a fairness bound: 32 messages can be 32 blocks,
+and a peer that keeps its socket full holds the drain for as long as it can
+feed it. Core's bound is on BYTES, not messages — at most 0x10000 per node per
+socket-handler pass (net.cpp:2171-2183) — so a peer with a lot to say costs one
+turn, not the pass.
+
+Checked BETWEEN messages, so it never truncates one: a single 4 MB block still
+arrives whole (the reader is resumable, and stopping mid-message would only
+defer the same bytes), it just ends that peer's turn afterwards.")
+
 (defparameter +max-block-queue-bytes+ (* 256 1024 1024)
   "Byte cap (wire size) for the out-of-order block-queue. The 1024-COUNT
 cap alone was sized for testnet4's small blocks: with the tip stuck at
@@ -1788,23 +1801,25 @@ error escaped run-ibd and killed the sync thread — incident 2026-05-09).
 Draining a peer whose remote has FIN'd eventually hits a zero-progress
 read, which flips connection-connected to NIL; handle-peer-fin then
 disconnects it so replace-disconnected-peers can refill the slot."
-  (when (and (eq (peer-state peer) :ready)
-             ;; A prior in-loop disconnect (rate-limit, oversized payload)
-             ;; NILs peer-connection; guard so connection-socket below
-             ;; doesn't raise TYPE-ERROR (which the handler-case below does
-             ;; not catch) and kill the sync thread.
-             (peer-connection peer)
-             ;; Only drain a connection still believed live. If a previous
-             ;; read already flipped connection-connected to NIL (and may
-             ;; have NILed the socket), skip straight to handle-peer-fin —
-             ;; no point waiting for input on a dead/closed socket.
-             (connection-connected (peer-connection peer)))
+  ;; Read the connection ONCE. An RPC-thread disconnect (disconnectnode, setban)
+  ;; between two reads of the slot would hand (connection-connected NIL) a NIL —
+  ;; a TYPE-ERROR outside the handler-case below, which aborts the whole sync
+  ;; cycle. Latent before; header sync now runs this several times a second.
+  (let ((conn (peer-connection peer)))
+   (when (and (eq (peer-state peer) :ready)
+              conn
+              ;; Only drain a connection still believed live. If a previous
+              ;; read already flipped connection-connected to NIL (and may
+              ;; have NILed the socket), skip straight to handle-peer-fin —
+              ;; no point waiting for input on a dead/closed socket.
+              (connection-connected conn))
     (handler-case
         ;; Drain only as long as the socket actually has data ready
         ;; (usocket:wait-for-input :timeout 0 is non-blocking). This lets us
         ;; pull all queued messages in the batch without ever timing out
         ;; mid-payload, then exit immediately when nothing is left to read.
-        (loop repeat +max-messages-per-peer-per-cycle+
+        (let ((byte-budget-start (connection-bytes-received conn)))
+         (loop repeat +max-messages-per-peer-per-cycle+
               ;; Stop check per message, not just per outer-loop pass: a
               ;; full drain is up to 32 messages x block validation each
               ;; (~0.1-2s), so without this a TERM waits out the whole
@@ -1815,7 +1830,13 @@ disconnects it so replace-disconnected-peers can refill the slot."
               ;; the connection or flipping connection-connected — both of
               ;; which data-available-p folds in (non-blocking, :timeout 0).
               while (and (peer-connection peer)
-                         (data-available-p (peer-connection peer)))
+                         (data-available-p (peer-connection peer))
+                         ;; Byte fairness, checked between messages: a peer
+                         ;; with plenty to say costs one turn, not the pass
+                         ;; (see +max-recv-bytes-per-peer-per-cycle+).
+                         (< (- (connection-bytes-received (peer-connection peer))
+                               byte-budget-start)
+                            +max-recv-bytes-per-peer-per-cycle+))
               for (command payload) = (multiple-value-list
                                        (receive-message peer :timeout 5))
               while command
@@ -1826,7 +1847,7 @@ disconnects it so replace-disconnected-peers can refill the slot."
               do (safely-dispatch-peer-message peer command payload chain-state
                                                utxo-set block-store ctx
                                                :fee-estimator fee-estimator
-                                               :recent-rejects recent-rejects))
+                                               :recent-rejects recent-rejects)))
       ((or stream-error usocket:socket-condition end-of-file) (c)
         (bitcoin-lisp:log-warn
          "Peer ~A I/O error during message drain — disconnecting: ~A"
@@ -1859,11 +1880,11 @@ disconnects it so replace-disconnected-peers can refill the slot."
        "Peer ~A began a message and delivered nothing for ~Ds — disconnecting"
        (peer-address peer) +receive-stall-timeout-seconds+)
       (handler-case (disconnect-peer peer) (error () nil))))
-  (handle-peer-fin peer))
+  (handle-peer-fin peer)))
 
 (defun pump-peer-messages (peers chain-state utxo-set block-store
                            &key mempool address-book fee-estimator
-                                recent-rejects)
+                                recent-rejects ctx)
   "Drain every peer's currently-readable messages once, with the FULL node
 context — the steady-state receive pump. Called ~1x/second from the sync
 thread's between-cycles wait: without it the node had a ~30s window per
@@ -1873,7 +1894,7 @@ unanswered until the next sync cycle (Core has no such window: each peer's
 ProcessMessages/SendMessages runs continuously). Returns the pump's
 ibd-context so the caller can inspect counters (e.g. headers-received > 0
 means a new block was announced and a sync cycle should start now)."
-  (let ((ctx (make-ibd)))
+  (let ((ctx (or ctx (make-ibd))))
     (setf (ibd-context-mempool ctx) mempool
           (ibd-context-peers ctx) peers
           (ibd-context-address-book ctx) address-book)
@@ -2429,7 +2450,10 @@ threads read/write under the same lock."
    (multiple-value-bind (valid error) (validate-header-chain headers chain-state)
     (when error
       (bitcoin-lisp:log-warn "Header validation error: ~A" error))
-    (let ((added (process-headers valid chain-state)))
+    (let ((added (process-headers valid chain-state))
+          ;; Core's pindexLast as an index ENTRY, set below — the follow-up
+          ;; getheaders is built from it, never from our own header tip.
+          (last-entry nil))
       (funcall count-fn added)
       ;; Core's pindexLast (net_processing.cpp ProcessHeadersMessage): the last
       ;; header of the RECEIVED batch that is in the block index afterwards —
@@ -2453,6 +2477,11 @@ threads read/write under the same lock."
              headers)
         ;; PEER may be NIL on degenerate/test callers (handle-headers with no
         ;; peer) — availability is per-peer, so skip it then.
+        (setf last-entry
+              (and pindex-last
+                   (bitcoin-lisp.storage:get-block-index-entry
+                    chain-state
+                    (bitcoin-lisp.serialization:block-header-hash pindex-last))))
         (when (and peer pindex-last)
           (update-block-availability
            peer chain-state
@@ -2482,7 +2511,10 @@ threads read/write under the same lock."
               (maybe-protect-outbound-peer peer)))))
       (when (> added 0)
         (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added))
-      added))))
+      ;; Second value: Core's pindexLast as an index ENTRY. The follow-up
+      ;; getheaders must be built from it, not from our own header tip — see
+      ;; %maybe-request-more-headers.
+      (values added last-entry)))))
 
 (defun %entry-ancestor-at-height (entry height)
   "ENTRY's ancestor at HEIGHT, walking prev-entry links (Core
@@ -2683,6 +2715,43 @@ Four cases:
         (< (length headers)
            bitcoin-lisp.serialization:+max-headers-count+))))))
 
+(defconstant +headers-response-time-seconds+ 120
+  "Minimum gap between getheaders messages to one peer (Core
+HEADERS_RESPONSE_TIME, net_processing.cpp:100). Every getheaders goes through
+%MAYBE-SEND-GETHEADERS so no peer behaviour can turn our own requests into a
+flood — most sharply for 1-header unconnecting announcements, where each one
+would otherwise buy an index-wide locator walk and a ~1 KB request from us.")
+
+(defun %maybe-send-getheaders (peer locator)
+  "Send a getheaders built from LOCATOR unless one went to PEER recently (Core
+MaybeSendGetHeaders, net_processing.cpp:2825-2837). Returns T if sent."
+  (let ((now (get-universal-time)))
+    (when (> (- now (peer-last-getheaders-time peer))
+             +headers-response-time-seconds+)
+      (setf (peer-last-getheaders-time peer) now)
+      (send-message peer (bitcoin-lisp.serialization:make-getheaders-message locator))
+      t)))
+
+(defun %maybe-request-more-headers (peer chain-state last-entry full-batch)
+  "Core ProcessHeadersMessage's tail (net_processing.cpp:3105-3111): a
+maximum-size headers message means the peer may have more, so ask again — from
+GetLocator(pindexLast), the last header of the batch we just received.
+
+THE LOCATOR SOURCE IS THE TERMINATION ARGUMENT, and getting it wrong is a
+non-terminating loop with an ordinary lagging peer. Our exponential locator has
+gaps wider than a batch, so a peer a few thousand blocks behind answers a
+getheaders built from OUR header tip with 2000 headers we already hold. Nothing
+enters the index, our header tip does not move, the next locator is
+byte-identical, and the peer replays the same batch forever — hundreds of KB and
+an index-wide walk per round, and with header sync waiting on that peer, the
+sync thread never returns. Built from pindexLast the locator advances into the
+peer's chain every round whether or not anything was stored.
+
+Skipped while a low-work sync owns the conversation (Core's !have_headers_sync):
+that path sends its own follow-up from the sync's locator."
+  (when (and peer full-batch last-entry (null (peer-headers-sync peer)))
+    (%maybe-send-getheaders peer (%locator-from-entry last-entry chain-state))))
+
 (defun ingest-headers-from-peer (peer headers chain-state &key count-fn)
   "Generic-path headers ingestion — BIP130 sendheaders announcements,
 unsolicited batches, and the at-tip/block-download message drains
@@ -2702,6 +2771,15 @@ of headers added to the index."
                          (= (length headers)
                             bitcoin-lisp.serialization:+max-headers-count+)))
         (count-fn (or count-fn (lambda (n) (declare (ignore n))))))
+    ;; A CONNECTING headers message is the answer to any getheaders we had
+    ;; outstanding, so re-arm the throttle (Core net_processing.cpp:3040-3043 —
+    ;; deliberately NOT for unconnecting batches, which are announcements and
+    ;; must not buy an unthrottled request from us).
+    (when (and peer headers
+               (bitcoin-lisp.storage:get-block-index-entry
+                chain-state
+                (bitcoin-lisp.serialization:block-header-prev-block (first headers))))
+      (setf (peer-last-getheaders-time peer) 0))
     (cond
       ;; Empty message: cannot be an announcement; a peer mid-low-work-sync
       ;; suddenly has nothing for us — drop the sync (Core nCount==0 branch).
@@ -2742,8 +2820,11 @@ of headers added to the index."
       ;; net_processing.cpp:3046-3054). A batch we hold only on a fork is not
       ;; this case and falls through to the gate below, as in Core.
       ((%batch-already-validated-work-p chain-state headers)
-       (%store-validated-headers peer chain-state headers full-batch
-                                 count-fn "Received"))
+       (multiple-value-bind (added last-entry)
+           (%store-validated-headers peer chain-state headers full-batch
+                                     count-fn "Received")
+         (%maybe-request-more-headers peer chain-state last-entry full-batch)
+         added))
 
       ;; Connecting batch with new headers: anti-DoS work gate, then store.
       (t
@@ -2754,116 +2835,104 @@ of headers added to the index."
           0)
          (:ignore 0)
          (:store
-          (%store-validated-headers peer chain-state headers full-batch
-                                    count-fn "Received")))))))
+          (multiple-value-bind (added last-entry)
+              (%store-validated-headers peer chain-state headers full-batch
+                                        count-fn "Received")
+            (%maybe-request-more-headers peer chain-state last-entry full-batch)
+            added)))))))
+
+(defparameter +header-sync-silent-passes+ 50
+  "Pump passes with NO headers message from the chosen peer before header sync
+calls it silent and the caller rotates (~10s at the pass sleep below).")
+
+(defparameter +header-sync-quiet-passes+ 5
+  "Pump passes after the peer's LAST answer before header sync returns. Short on
+purpose: once a peer has answered, the conversation continues through the pump
+whether or not this function is still watching (ingest sends the follow-up
+getheaders itself), so there is nothing to wait for — and at the tip, where the
+first answer is also the last, waiting out the silent budget would burn ~10s of
+every sync cycle for nothing.")
+
+(defparameter +header-sync-deadline-seconds+ 60
+  "Absolute cap on one sync-headers call, whatever the peer does. The idle
+counters alone are not a bound: a peer that emits one headers message every few
+seconds — even 1-header announcements — resets them forever, and this runs on
+the sync thread, so it would pin block download, peer maintenance and the pump
+behind one peer indefinitely. That is the frozen-tip failure class this
+subsystem has produced twice.")
+
+(defun %peer-headers-bytes (peer)
+  "Wire bytes of headers messages received from PEER — the existing per-command
+counter (Core mapRecvBytesPerMsgType). Strictly increasing per headers message,
+including empty ones, so a CHANGE is exactly 'this peer answered'. That is the
+signal header-sync rotation needs, and it is NOT 'this peer had something new':
+a peer at our own tip answers with a batch we already hold, and scoring that as
+silence would rotate away from every healthy peer the moment we caught up."
+  (gethash "headers" (peer-recv-per-msg peer) 0))
 
 (defun sync-headers (peer chain-state &key recent-rejects ctx utxo-set
                                            block-store fee-estimator)
-  "Download all headers from PEER. Returns (values received-count stalled-p);
-STALLED-P is true when the peer went silent (a getheaders went unanswered),
-the signal run-ibd uses to rotate to another header-sync peer.
+  "Kick header sync with PEER, WITHOUT owning the message pump. Returns
+(values received-count stalled-p); STALLED-P is true when the peer never
+answered, the signal sync-headers-with-failover uses to rotate.
 
-CTX (the ibd-context) plus UTXO-SET/BLOCK-STORE/FEE-ESTIMATOR give the
-interleaved-message drains below the full node context. They used to pass
-NIL for everything but chain-state/recent-rejects, so any message a peer
-sent during header sync hit handle-message with no mempool or block-store:
-a getdata for a tx WE had announced was answered notfound — advertising txs
-and then failing to serve them, which also broke the unbroadcast-set
-propagation signal (its removal fires on getdata serve). Core has no such
-window: ProcessMessages always runs with the full node state."
-  (let ((received-count 0)
-        (done nil)
-        (timed-out nil)
-        (requests-sent 0)
-        (max-requests 100)
-        (mempool (and ctx (ibd-context-mempool ctx)))
-        (peers (and ctx (ibd-context-peers ctx)))
-        (address-book (and ctx (ibd-context-address-book ctx))))
-    ;; First, drain any pending messages from peer (sendcmpct, sendheaders, etc.)
-    (loop repeat 10
-          do (multiple-value-bind (command payload)
-                 (receive-message-blocking peer :timeout 1)
-               (when command
-                 (bitcoin-lisp:log-cat "net" "Pre-sync: received ~A" command)
-                 (handler-case
-                     (handle-message peer command payload chain-state
-                                     utxo-set block-store
-                                     :mempool mempool
-                                     :peers peers
-                                     :address-book address-book
-                                     :fee-estimator fee-estimator
-                                     :recent-rejects recent-rejects)
-                   (error () nil)))
-               (unless command (return))))
+This used to be a blocking request/response loop: send getheaders, then sit in
+receive-message-blocking on this one peer for up to 30 x 5s per batch. It runs
+on the sync thread — the same thread as the pump — so for that whole time NO
+other peer was drained, no block was processed, and no expired read was reaped.
+One peer's latency was the whole node's.
 
-    (loop until (or done *ibd-stop-requested*)
-          do (progn
-               ;; Request headers from our index normally, or via the low-work
-               ;; sync's own locator while a presync/redownload is running with
-               ;; this peer (its headers aren't in the index yet). The sync
-               ;; state lives on the peer (Core Peer::m_headers_sync), so one
-               ;; started by the generic announcement path resumes here.
-               (let ((hss (peer-headers-sync peer)))
-                 (if hss
-                     (send-message peer (bitcoin-lisp.serialization:make-getheaders-message
-                                         (hss-locator-hashes hss)))
-                     (request-headers-for-ibd peer chain-state)))
-               (incf requests-sent)
-               ;; The request cap guards the normal path. A low-work sync
-               ;; downloads the chain twice and so needs many more round-trips;
-               ;; it is instead bounded by its own max-commitments and by the
-               ;; peer-stall detection below.
-               (when (and (null (peer-headers-sync peer))
-                          (> requests-sent max-requests))
-                 (bitcoin-lisp:log-warn "Header sync: hit max requests (~D)" max-requests)
-                 (return))
-
-               ;; Wait for headers response, handling other messages
-               (let ((got-headers nil)
-                     (attempts 0))
-                 (loop while (and (not got-headers) (< attempts 30)
-                                  (not *ibd-stop-requested*))
-                       do (multiple-value-bind (command payload)
-                              (receive-message-blocking peer :timeout 5)
-                            (incf attempts)
-                            (cond
-                              ((null command)
-                               (when (> attempts 10)
-                                 (bitcoin-lisp:log-warn "Timeout waiting for headers")
-                                 (setf done t)
-                                 (setf got-headers t)
-                                 (setf timed-out t)))
-
-                              ((string= command "headers")
-                               (setf got-headers t)
-                               (handler-case
-                                   (let* ((headers (bitcoin-lisp.serialization:parse-headers-payload payload))
-                                          (full-batch (and headers
-                                                           (= (length headers)
-                                                              bitcoin-lisp.serialization:+max-headers-count+))))
-                                     (setf done
-                                           (handle-header-batch peer chain-state headers full-batch
-                                                                (lambda (n) (incf received-count n)))))
-                                 (error (e)
-                                   (bitcoin-lisp:log-error "Error parsing headers: ~A" e)
-                                   (setf done t))))
-
-                              (t
-                               ;; Handle other messages (ping, sendcmpct, etc.)
-                               ;; with the full node context — see docstring.
-                               (bitcoin-lisp:log-cat "net" "Header sync: received ~A" command)
-                               (handler-case
-                                   (handle-message peer command payload chain-state
-                                                   utxo-set block-store
-                                                   :mempool mempool
-                                                   :peers peers
-                                                   :address-book address-book
-                                                   :fee-estimator fee-estimator
-                                                   :recent-rejects recent-rejects)
-                                 (error () nil)))))))))
-
-    (bitcoin-lisp:log-info "Header sync complete: ~D headers received" received-count)
-    (values received-count timed-out)))
+Now the wait IS a pump pass, and the sync itself continues through the ordinary
+message path (ingest-headers-from-peer sends its own follow-up getheaders), so
+this function only has to kick it off and report whether the peer is worth
+keeping. Core has no header-sync loop at all for the same reason."
+  (let* ((start-received (if ctx (ibd-context-headers-received ctx) 0))
+         (answered-before (%peer-headers-bytes peer))
+         (last-answer answered-before)
+         (idle 0)
+         (deadline (+ (get-universal-time) +header-sync-deadline-seconds+)))
+    ;; Kick: one getheaders, throttled like every other. Use the low-work sync's
+    ;; own locator when one is in progress (its headers are not in the index).
+    (let ((hss (peer-headers-sync peer)))
+      (if hss
+          (send-message peer (bitcoin-lisp.serialization:make-getheaders-message
+                              (hss-locator-hashes hss)))
+          (%maybe-send-getheaders peer (build-header-locator chain-state))))
+    (loop
+      (when (or *ibd-stop-requested*
+                (not (eq (peer-state peer) :ready))
+                (null (peer-connection peer))
+                (> (get-universal-time) deadline))
+        (return))
+      ;; The wait: one pass over EVERY peer, with the live context — nobody is
+      ;; starved while we wait. Sends queued by the dispatch (getheaders,
+      ;; getdata, pong) are flushed in the same pass, or a partially-written
+      ;; request would sit until the next send to that peer and read as a stall.
+      (pump-peer-messages (or (and ctx (ibd-context-peers ctx)) (list peer))
+                          chain-state utxo-set block-store
+                          :ctx ctx
+                          :mempool (and ctx (ibd-context-mempool ctx))
+                          :address-book (and ctx (ibd-context-address-book ctx))
+                          :fee-estimator fee-estimator
+                          :recent-rejects recent-rejects)
+      (let ((answer (%peer-headers-bytes peer)))
+        (if (/= answer last-answer)
+            (setf last-answer answer
+                  idle 0)
+            (incf idle)))
+      (when (>= idle (if (= last-answer answered-before)
+                         +header-sync-silent-passes+
+                         +header-sync-quiet-passes+))
+        (return))
+      (sleep 0.2))
+    (let ((received (- (if ctx (ibd-context-headers-received ctx) 0) start-received))
+          (never-answered (= last-answer answered-before)))
+      ;; RECEIVED is the ctx-wide count, so it includes headers other peers
+      ;; delivered during the pass — informational only; the caller reads the
+      ;; stall flag.
+      (bitcoin-lisp:log-info "Header sync kicked ~A: ~D headers ingested~:[~; (no answer)~]"
+                             (peer-address peer) received never-answered)
+      (values received never-answered))))
 
 (defun sync-headers-with-failover (peers chain-state ctx
                                    &key recent-rejects (sync-fn #'sync-headers)
