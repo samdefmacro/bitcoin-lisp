@@ -704,13 +704,26 @@ in gettxoutsetinfo)."
     total))
 
 (defun utxo-set-distinct-txids (view)
-  "Count distinct transaction IDs with at least one unspent output."
-  (let ((txids (make-hash-table :test 'equalp)))
+  "Count distinct transaction IDs with at least one unspent output.
+
+Counts group transitions rather than collecting the txids. The set version
+held every distinct txid in a hash table — tens of millions of 32-byte keys on
+a real chain, on the same gettxoutsetinfo path whose set-hash buffering already
+proved fatal (see COMPUTE-UTXO-SET-HASH). This is exact, not an estimate:
+UTXO-SET-ITERATE delivers coins grouped per txid, because both backends walk
+the 36-byte 'C'+txid+vout key in lex order, which places every vout of a txid
+contiguously. Memory is now one txid."
+  (let ((count 0)
+        (previous nil))
     (utxo-set-iterate view
                       (lambda (txid vout entry)
                         (declare (ignore vout entry))
-                        (setf (gethash txid txids) t)))
-    (hash-table-count txids)))
+                        (unless (and previous (equalp txid previous))
+                          (incf count)
+                          ;; the iterator hands out a fresh copy per coin, but
+                          ;; retain our own so this cannot depend on that
+                          (setf previous (copy-seq txid)))))
+    count))
 
 (defun %compact-size-bytes (n)
   "The compactsize encoding of N as a byte list (1/3/5/9 bytes)."

@@ -1515,3 +1515,36 @@ changes. The final control must FAIL to prove the comparison has teeth."
             (b (list (make-array 3 :element-type '(unsigned-byte 8) :initial-element 2))))
         (is (not (equalp (streamed a) (streamed b)))
             "different coin sets must hash differently")))))
+
+(test utxo-set-distinct-txids-counts-groups-without-collecting
+  "Counting distinct txids must not hold every txid in memory — that was the
+second unbounded accumulator on the gettxoutsetinfo path. Transition counting
+is exact only because UTXO-SET-ITERATE delivers coins grouped per txid, so this
+pins the count against a set-based oracle on data that would expose a grouping
+assumption if it were wrong: multiple vouts per txid, vouts above 255 (where
+LE-u32 key order diverges from numeric), and interleaved insertion order."
+  (let ((utxo-set (bitcoin-lisp.storage:make-utxo-set))
+        (txids (loop for i below 8
+                     collect (let ((v (make-array 32 :element-type '(unsigned-byte 8)
+                                                     :initial-element 0)))
+                               (setf (aref v 0) i)
+                               ;; vary a later byte too so lex order is not just index order
+                               (setf (aref v 31) (- 255 i))
+                               v))))
+    ;; Insert in an order deliberately unlike the iteration order.
+    (dolist (vout '(300 1 0 256 2))
+      (dolist (txid (reverse txids))
+        (bitcoin-lisp.storage:add-utxo
+         utxo-set txid vout (+ 1000 vout)
+         (make-array 1 :element-type '(unsigned-byte 8)) 1)))
+    (let ((oracle (let ((seen (make-hash-table :test 'equalp)))
+                    (bitcoin-lisp.storage:utxo-set-iterate
+                     utxo-set (lambda (txid vout entry)
+                                (declare (ignore vout entry))
+                                (setf (gethash txid seen) t)))
+                    (hash-table-count seen))))
+      (is (= (length txids) oracle) "the oracle sees every txid")
+      (is (= oracle (bitcoin-lisp.storage:utxo-set-distinct-txids utxo-set))
+          "transition counting agrees with collecting")
+      ;; control: the assertion must be able to fail
+      (is (/= (1+ oracle) (bitcoin-lisp.storage:utxo-set-distinct-txids utxo-set))))))
