@@ -120,10 +120,12 @@ at netbase.cpp:265-284."
 
 (defun %socks5-recv (socket count deadline phase)
   "Read exactly COUNT bytes from SOCKET's stream, signaling SOCKS5-ERROR if
-DEADLINE (internal-time units) passes first. The wait-for-input loop mirrors
-receive-bytes (connection.lisp): ≤5s sub-windows, tolerant of spurious
+DEADLINE (internal-time units) passes first. Same shape as RECEIVE-BYTES
+(connection.lisp): short wait-for-input sub-windows, tolerant of spurious
 not-ready wakeups (EINTR under concurrent FFI), shutdown-aware. Plays the role
-of Core's InterruptibleRecv under g_socks5_recv_timeout (netbase.cpp:319-350)."
+of Core's InterruptibleRecv under g_socks5_recv_timeout (netbase.cpp:319-350).
+A proxy handshake has nobody else to serve, so blocking here is correct — the
+resumable reader exists for the many-peers pump, not for this."
   (let ((stream (usocket:socket-stream socket))
         (buffer (make-array count :element-type '(unsigned-byte 8)))
         (total 0))
