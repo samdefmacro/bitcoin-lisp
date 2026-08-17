@@ -53,6 +53,13 @@ import {
   fmtInt, fmtBtc, fmtAge, fmtPct, fmtDuration, fmtTimestamp, fmtFeeRate,
   shortHash, shortId,
 } from './format.js';
+import {
+  encryptionState, isEncrypted, STATE_UI, unlockCountdown,
+  UNLOCK_TIMEOUTS, DEFAULT_UNLOCK_TIMEOUT, validatePassphrasePair,
+  validateTimeout, validateCreate, PASSPHRASE_HINT, ENCRYPT_WARNING,
+  ENCRYPT_BACKUP_WARNING, unlockParams, createParams, withUnlocked,
+  UnlockCancelled, forgetPassphrase,
+} from './wallet-crypt.js';
 
 // --- pure helpers (exported for tests) --------------------------------
 
@@ -276,6 +283,7 @@ const TABS = [
   ['receive', 'Receive'],
   ['history', 'History'],
   ['addresses', 'Address book'],
+  ['security', 'Security'],
 ];
 
 const state = {
@@ -296,6 +304,7 @@ const state = {
   bookRows: [],         // [{ address, label, purpose, info? }]
   receive: null,        // { address, label, type, uri, info? }
   send: freshSend(),    // send-tab compose model
+  secPanelOnClose: null,  // fired when the Security panel closes (see promptUnlock)
   refreshing: false,
 };
 
@@ -398,6 +407,9 @@ function copyable(full, display = full) {
 function rpcErrorMessage(e) {
   if (e instanceof rpc.RpcError) return `${e.message} (RPC error ${e.code})`;
   if (e instanceof rpc.AuthError) return `Session ended: ${e.message}`;
+  // A dismissed unlock prompt is a user choice, not a failure to reach the
+  // node — it carries its own sentence and needs no "Could not reach" frame.
+  if (e instanceof UnlockCancelled) return e.message;
   return `Could not reach the node: ${e.message}`;
 }
 
@@ -712,14 +724,461 @@ function buildSkeleton(container) {
   bookWrap.appendChild(bookTable);
   refs.bookCard.append(bookForm, refs.bookError, bookWrap);
 
+  buildSecurityCard(refs);
+
   state.refs = refs;
   container.replaceChildren(head, refs.disabledCard, refs.emptyCard,
     refs.balancesCard, refs.infoCard, refs.sendCard, refs.receiveCard,
-    refs.historyCard, refs.bookCard);
+    refs.historyCard, refs.bookCard, refs.securityCard);
   renderRecipients();
   renderTabStrip();
   applyMask();
   renderVisibility();
+}
+
+// --- security: lifecycle + encryption (gui-plan P6d) ---------------------
+//
+// Qt puts these on menus with a status-bar lock icon (bitcoingui.cpp); a tab
+// strip has no menu bar, so they live on their own tab with the lock state as
+// a chip. One inline panel is open at a time — see wallet-crypt.js for why
+// these are panels rather than modal dialogs.
+
+function passphraseInput(ariaLabel, placeholder = 'passphrase') {
+  const input = el('input');
+  input.type = 'password';
+  input.placeholder = placeholder;
+  input.spellcheck = false;
+  input.setAttribute('aria-label', ariaLabel);
+  return input;
+}
+
+// Core's toggleShowPassword (askpassphrasedialog.cpp): one control flips
+// every field in the panel, so a user checking a long passphrase does not
+// have to reveal them one at a time.
+function showPassphraseToggle(inputs) {
+  const btn = el('button', 'btn btn-quiet', 'show');
+  btn.type = 'button';
+  btn.setAttribute('aria-label', 'Show passphrase');
+  btn.setAttribute('aria-pressed', 'false');
+  btn.addEventListener('click', () => {
+    const reveal = btn.getAttribute('aria-pressed') !== 'true';
+    for (const i of inputs) i.type = reveal ? 'text' : 'password';
+    btn.textContent = reveal ? 'hide' : 'show';
+    btn.setAttribute('aria-pressed', String(reveal));
+  });
+  return btn;
+}
+
+function buildSecurityCard(refs) {
+  refs.securityCard = el('section', 'card card-full');
+  refs.securityCard.setAttribute('aria-label', 'Security');
+  refs.securityCard.appendChild(el('h2', 'card-title', 'Security'));
+
+  refs.secStatus = el('div', 'sec-status');
+  refs.secActions = el('div', 'sec-actions');
+  refs.secPanel = el('div', 'sec-panel');
+  refs.secPanel.hidden = true;
+  refs.secError = el('p', 'error-text');
+  refs.secError.hidden = true;
+  refs.secNote = el('p', 'muted');
+  refs.secNote.hidden = true;
+
+  refs.securityCard.append(refs.secStatus, refs.secActions, refs.secPanel,
+    refs.secError, refs.secNote);
+}
+
+function secMessage(text, isError) {
+  const { refs } = state;
+  refs.secError.hidden = !isError;
+  refs.secNote.hidden = isError || !text;
+  if (isError) refs.secError.textContent = text;
+  else if (text) refs.secNote.textContent = text;
+}
+
+// Closing fires the pending on-close callback exactly once — that is how
+// promptUnlock learns it was cancelled, rather than polling for it.
+function closeSecPanel() {
+  const onClose = state.secPanelOnClose;
+  state.secPanelOnClose = null;
+  state.refs.secPanel.hidden = true;
+  state.refs.secPanel.replaceChildren();
+  if (onClose) onClose();
+}
+
+// Build one inline form. FIELDS are [label, input] rows; SUBMIT runs on
+// confirm and returns a status string, or throws to surface an RPC error.
+function secForm({ title, warning, fields, submitLabel, onSubmit, danger }) {
+  const form = el('form', danger ? 'sec-form danger' : 'sec-form');
+  form.setAttribute('aria-label', title);
+  form.appendChild(el('h3', 'send-subtitle', title));
+  if (warning) form.appendChild(el('p', 'warn-text', warning));
+  for (const [label, input] of fields) {
+    const row = el('label', 'sec-row');
+    row.appendChild(el('span', 'sec-row-label', label));
+    row.appendChild(input);
+    form.appendChild(row);
+  }
+  const buttons = el('div', 'send-actions');
+  const submit = el('button', danger ? 'btn btn-danger' : 'btn', submitLabel);
+  submit.type = 'submit';
+  const cancel = el('button', 'btn btn-quiet', 'cancel');
+  cancel.type = 'button';
+  cancel.addEventListener('click', () => { closeSecPanel(); secMessage('', false); });
+  buttons.append(submit, cancel);
+  form.appendChild(buttons);
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    submit.disabled = true;
+    const label = submit.textContent;
+    submit.textContent = 'working…';
+    secMessage('', false);
+    try {
+      const note = await onSubmit();
+      if (note !== false) {
+        closeSecPanel();
+        if (note) secMessage(note, false);
+      }
+    } catch (e) {
+      secMessage(rpcErrorMessage(e), true);
+    } finally {
+      submit.disabled = false;
+      submit.textContent = label;
+    }
+  });
+  return form;
+}
+
+function openSecPanel(node, onClose = null) {
+  const { refs } = state;
+  closeSecPanel();               // settles any prompt the previous panel owed
+  state.secPanelOnClose = onClose;
+  refs.secPanel.replaceChildren(node);
+  refs.secPanel.hidden = false;
+}
+
+// --- security actions ---------------------------------------------------
+
+function encryptPanel() {
+  const pass = passphraseInput('New passphrase');
+  const confirm = passphraseInput('Confirm new passphrase');
+  return secForm({
+    title: 'Encrypt wallet',
+    // Core says this twice, before and after; the seed-rotation half is what
+    // makes a stale backup dangerous rather than merely out of date.
+    warning: `${ENCRYPT_WARNING} ${ENCRYPT_BACKUP_WARNING} ${PASSPHRASE_HINT}`,
+    danger: true,
+    fields: [
+      ['Passphrase', pass],
+      ['Confirm', confirm],
+      ['', showPassphraseToggle([pass, confirm])],
+    ],
+    submitLabel: 'encrypt wallet',
+    onSubmit: async () => {
+      const bad = validatePassphrasePair(pass.value, confirm.value);
+      if (bad) { secMessage(bad, true); return false; }
+      const note = await rpc.call('encryptwallet', [pass.value], endpoint());
+      forgetPassphrase(pass, confirm);
+      // The seed rotated: every address the page is holding is from the old
+      // one. Reload rather than patching state.
+      await refresh();
+      return typeof note === 'string' ? note : 'Wallet encrypted.';
+    },
+  });
+}
+
+function unlockPanel(onDone) {
+  const pass = passphraseInput('Passphrase');
+  const timeout = el('select');
+  timeout.setAttribute('aria-label', 'Unlock for');
+  for (const [secs, label] of UNLOCK_TIMEOUTS) {
+    const opt = el('option', '', label);
+    opt.value = String(secs);
+    timeout.appendChild(opt);
+  }
+  timeout.value = String(DEFAULT_UNLOCK_TIMEOUT);
+  return secForm({
+    title: 'Unlock wallet',
+    warning: 'The wallet relocks automatically when the time is up.',
+    fields: [
+      ['Passphrase', pass],
+      ['Unlock for', timeout],
+      ['', showPassphraseToggle([pass])],
+    ],
+    submitLabel: 'unlock',
+    onSubmit: async () => {
+      if (!pass.value) { secMessage('Enter a passphrase.', true); return false; }
+      const badTimeout = validateTimeout(timeout.value);
+      if (badTimeout) { secMessage(badTimeout, true); return false; }
+      await rpc.call('walletpassphrase',
+        unlockParams(pass.value, timeout.value), endpoint());
+      forgetPassphrase(pass);
+      await refreshWalletInfo();
+      renderSecurity();
+      if (onDone) onDone(true);
+      return 'Wallet unlocked.';
+    },
+  });
+}
+
+function changePanel() {
+  const oldPass = passphraseInput('Current passphrase');
+  const pass = passphraseInput('New passphrase');
+  const confirm = passphraseInput('Confirm new passphrase');
+  return secForm({
+    title: 'Change passphrase',
+    warning: PASSPHRASE_HINT,
+    fields: [
+      ['Current', oldPass],
+      ['New', pass],
+      ['Confirm', confirm],
+      ['', showPassphraseToggle([oldPass, pass, confirm])],
+    ],
+    submitLabel: 'change passphrase',
+    onSubmit: async () => {
+      const bad = validatePassphrasePair(pass.value, confirm.value);
+      if (bad) { secMessage(bad, true); return false; }
+      await rpc.call('walletpassphrasechange', [oldPass.value, pass.value], endpoint());
+      forgetPassphrase(oldPass, pass, confirm);
+      await refreshWalletInfo();
+      renderSecurity();
+      return 'Passphrase changed.';
+    },
+  });
+}
+
+function backupPanel() {
+  const dest = el('input');
+  dest.placeholder = '/path/on/the/node/wallet-backup.dump';
+  dest.spellcheck = false;
+  dest.setAttribute('aria-label', 'Backup destination path');
+  return secForm({
+    title: 'Back up wallet',
+    // The path is resolved by the NODE, not the browser — easy to get wrong
+    // when the UI is reached through a tunnel.
+    warning: 'The path is on the machine running the node, not this computer. '
+      + 'An encrypted wallet backs up while locked; the backup holds only '
+      + 'ciphertext.',
+    fields: [['Destination', dest]],
+    submitLabel: 'back up',
+    onSubmit: async () => {
+      if (!dest.value) { secMessage('Enter a destination path.', true); return false; }
+      await rpc.call('backupwallet', [dest.value], endpoint());
+      return `Wallet backed up to ${dest.value}.`;
+    },
+  });
+}
+
+function restorePanel() {
+  const name = el('input');
+  name.placeholder = 'new wallet name';
+  name.spellcheck = false;
+  name.setAttribute('aria-label', 'Restored wallet name');
+  const file = el('input');
+  file.placeholder = '/path/on/the/node/wallet-backup.dump';
+  file.spellcheck = false;
+  file.setAttribute('aria-label', 'Backup file path');
+  return secForm({
+    title: 'Restore wallet from backup',
+    warning: 'The backup file is read on the machine running the node. '
+      + 'Restoring never overwrites an existing wallet.',
+    fields: [['Wallet name', name], ['Backup file', file]],
+    submitLabel: 'restore',
+    onSubmit: async () => {
+      if (!name.value || !file.value) {
+        secMessage('Enter a wallet name and a backup file path.', true);
+        return false;
+      }
+      const res = await rpc.call('restorewallet', [name.value, file.value]);
+      const warnings = (res && res.warnings) || [];
+      await selectWallet(name.value);
+      return warnings.length
+        ? `Restored ${name.value}. ${warnings.join(' ')}`
+        : `Restored ${name.value}.`;
+    },
+  });
+}
+
+function createPanel() {
+  const name = el('input');
+  name.placeholder = 'wallet name';
+  name.spellcheck = false;
+  name.setAttribute('aria-label', 'New wallet name');
+  const pass = passphraseInput('New wallet passphrase (optional)',
+    'passphrase (optional)');
+  const confirm = passphraseInput('Confirm new wallet passphrase',
+    'confirm passphrase');
+  const watchOnly = el('input');
+  watchOnly.type = 'checkbox';
+  watchOnly.setAttribute('aria-label', 'Watch-only (disable private keys)');
+  const blank = el('input');
+  blank.type = 'checkbox';
+  blank.setAttribute('aria-label', 'Blank (no keys or descriptors)');
+  return secForm({
+    title: 'Create wallet',
+    warning: 'A passphrase encrypts the new wallet from the start, so no '
+      + 'unencrypted key material is ever written to disk. ' + PASSPHRASE_HINT,
+    fields: [
+      ['Name', name],
+      ['Passphrase', pass],
+      ['Confirm', confirm],
+      ['', showPassphraseToggle([pass, confirm])],
+      ['Watch-only', watchOnly],
+      ['Blank', blank],
+    ],
+    submitLabel: 'create wallet',
+    onSubmit: async () => {
+      // One model for both the check and the call, so they cannot drift.
+      const form = {
+        name: name.value,
+        disablePrivateKeys: watchOnly.checked,
+        blank: blank.checked,
+        passphrase: pass.value,
+        confirm: confirm.value,
+      };
+      const bad = validateCreate(form);
+      if (bad) { secMessage(bad, true); return false; }
+      const res = await rpc.call('createwallet', createParams(form));
+      forgetPassphrase(pass, confirm);
+      const warnings = (res && res.warnings) || [];
+      await selectWallet(name.value);
+      return warnings.length
+        ? `Created ${name.value}. ${warnings.join(' ')}`
+        : `Created ${name.value}.`;
+    },
+  });
+}
+
+async function lockNow() {
+  try {
+    await rpc.call('walletlock', [], endpoint());
+    await refreshWalletInfo();
+    renderSecurity();
+    secMessage('Wallet locked.', false);
+  } catch (e) {
+    secMessage(rpcErrorMessage(e), true);
+  }
+}
+
+async function unloadCurrent() {
+  const name = state.selected;
+  try {
+    await rpc.call('unloadwallet', [name]);
+    sessionStorage.removeItem(WALLET_KEY);
+    state.selected = null;
+    closeSecPanel();
+    await refresh();
+    secMessage(`Unloaded ${name}.`, false);
+  } catch (e) {
+    secMessage(rpcErrorMessage(e), true);
+  }
+}
+
+function secButton(label, onClick) {
+  const btn = el('button', 'btn', label);
+  btn.type = 'button';
+  btn.addEventListener('click', onClick);
+  return btn;
+}
+
+function renderSecurity() {
+  const { refs } = state;
+  if (!haveWallet()) return;
+  const info = state.walletinfo;
+  const st = encryptionState(info);
+
+  const { label: stLabel, variant } = STATE_UI[st];
+  const chip = pill(stLabel, variant);
+  chip.setAttribute('aria-label', `Encryption state: ${stLabel}`);
+  const bits = [chip];
+  if (st === 'unlocked') {
+    const left = unlockCountdown(info);
+    if (left) bits.push(el('span', 'muted mono sec-countdown', `relocks in ${left}`));
+  }
+  if (st === 'no-keys') {
+    bits.push(el('span', 'muted',
+      'watch-only wallets hold no private keys, so there is nothing to encrypt'));
+  }
+  refs.secStatus.replaceChildren(...bits);
+
+  // Rebuild the action row only when the state it acts on changed, so an
+  // armed confirm is never reset by the background poll — the same guard
+  // peers.js uses on its network toggle. Without it the 3s refresh replaces
+  // the armed "unload" button before its 4s window elapses, so the confirm
+  // click lands on a fresh, disarmed button and silently does nothing.
+  const stamp = `${st}|${state.selected}`;
+  if (refs.secActionsFor === stamp) return;
+  refs.secActionsFor = stamp;
+
+  const actions = [];
+  if (st === 'unencrypted') {
+    actions.push(secButton('encrypt wallet…',
+      () => openSecPanel(encryptPanel())));
+  }
+  if (st === 'locked') {
+    actions.push(secButton('unlock…', () => openSecPanel(unlockPanel())));
+  }
+  if (st === 'unlocked') {
+    actions.push(secButton('lock now', lockNow));
+  }
+  if (isEncrypted(st)) {
+    actions.push(secButton('change passphrase…',
+      () => openSecPanel(changePanel())));
+  }
+  actions.push(secButton('back up…', () => openSecPanel(backupPanel())));
+  actions.push(secButton('restore…', () => openSecPanel(restorePanel())));
+  actions.push(secButton('create wallet…', () => openSecPanel(createPanel())));
+  actions.push(armedButton(`unload ${state.selected}`, 'confirm unload',
+    unloadCurrent, 'btn btn-quiet'));
+  refs.secActions.replaceChildren(...actions);
+}
+
+// Core's WalletModel::requestUnlock, wired to the Security tab's unlock
+// panel: raise it, and resolve once the wallet is no longer locked.
+function promptUnlock() {
+  return new Promise((resolve) => {
+    // Qt raises a modal over whatever view you were on and returns you to it.
+    // We move to the Security tab (that is where the panel lives), so we owe
+    // the caller the trip back — otherwise a send leaves the user stranded
+    // here with a compose form they cannot see.
+    const cameFrom = state.tab;
+    let unlocked = false;
+    show(state.container, 'security');
+    // Resolve from the panel CLOSING, which is the event that actually
+    // happens — on submit, on cancel, and if anything else replaces the
+    // panel. closeSecPanel clears the callback before firing it, so this
+    // settles exactly once and needs no guard.
+    openSecPanel(unlockPanel(() => { unlocked = true; }), () => {
+      if (cameFrom !== 'security') show(state.container, cameFrom);
+      resolve(unlocked);
+    });
+    secMessage('This wallet is locked — unlock it to sign.', false);
+  });
+}
+
+const unlockDeps = {
+  // Re-read rather than trusting whatever the page is holding: only the
+  // Overview and Security tabs refresh getwalletinfo, so a spend composed on
+  // the Send tab would otherwise decide the lock state from a stale — or
+  // entirely absent — object and skip the gate.
+  state: async () => { await refreshWalletInfo(); return state.walletinfo; },
+  prompt: promptUnlock,
+  lock: async () => {
+    try { await rpc.call('walletlock', [], endpoint()); } catch { /* best effort */ }
+    await refreshWalletInfo();
+    renderSecurity();
+  },
+};
+
+// THE seam for anything that needs the wallet's private keys. Exported
+// because it is not send-specific: every node RPC behind
+// wallet-ensure-unlocked (src/rpc/wallet.lisp) belongs behind this —
+// signrawtransactionwithwallet, walletprocesspsbt, bumpfee, signmessage,
+// importdescriptors, keypoolrefill, listdescriptors(true). gui-plan 6c adds
+// the PSBT panel and bumpfee; they call this rather than re-deriving a
+// prompt, so a locked wallet can never reach them as a raw -13.
+// Throws UnlockCancelled when the user dismisses the prompt.
+export function withWalletUnlocked(fn) {
+  return withUnlocked(unlockDeps, fn);
 }
 
 // --- visibility & chrome -------------------------------------------------
@@ -746,6 +1205,7 @@ function renderVisibility() {
   show(refs.receiveCard, 'receive');
   show(refs.historyCard, 'history');
   show(refs.bookCard, 'addresses');
+  show(refs.securityCard, 'security');
 }
 
 function renderTabStrip() {
@@ -808,6 +1268,12 @@ export async function refresh() {
         if (state.bookRows.length === 0) await refreshBook();
         // Otherwise the book only refreshes on demand — a 3s rebuild would
         // clobber an inline label edit in progress.
+      } else if (state.tab === 'security') {
+        // getwalletinfo carries both fields the encryption state is derived
+        // from; re-read it every poll so the countdown ticks and a relock
+        // (sweeper or timeout) shows up without a manual reload.
+        await refreshWalletInfo();
+        renderSecurity();
       }
       renderVisibility(); // watch-only pill state may have just arrived
     }
@@ -881,6 +1347,20 @@ async function refreshWalletList() {
 }
 
 // --- overview -------------------------------------------------------------
+
+// Just getwalletinfo — what the Security tab's state derivation needs. A
+// failure here leaves the previous object in place rather than blanking the
+// tab: encryptionState(undefined) is 'unknown', which would hide every
+// control including the unlock button.
+async function refreshWalletInfo() {
+  const { refs } = state;
+  try {
+    state.walletinfo = await rpc.call('getwalletinfo', [], endpoint());
+    refs.secError.hidden = true;
+  } catch (e) {
+    secMessage(rpcErrorMessage(e), true);
+  }
+}
 
 async function refreshOverview() {
   const { refs } = state;
@@ -1182,7 +1662,12 @@ async function onConfirmSend(btn) {
       rbf: send.rbf,
       subtractFee: send.sffo,
     });
-    const result = await rpc.call(method, params, endpoint());
+    // Core's UnlockContext (walletmodel.cpp:428): prompt BEFORE signing when
+    // the wallet is locked, and relock afterwards if it was locked to begin
+    // with — rather than letting the node answer -13 and leaving the wallet
+    // open once the user retries. Cancelling leaves the compose form intact.
+    const result = await withWalletUnlocked(
+      () => rpc.call(method, params, endpoint()));
     send.result = {
       txid: sendResultTxid(result),
       feeReason: (result && result.fee_reason) || null,

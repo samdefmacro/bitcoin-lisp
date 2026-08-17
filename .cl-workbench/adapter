@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Thin Common Lisp Workbench adapter for bitcoin-lisp. Application Lisp is
-# launched only inside the pinned project container (bitcoin-lisp-sbcl:2.6.5);
+# launched only inside the pinned project container (bitcoin-lisp-sbcl:2.6.5-2);
 # the warm-image lifecycle lives in scripts/dev.sh and cold verification in
 # scripts/docker-test.sh. This adapter only routes and validates argv.
 set -euo pipefail

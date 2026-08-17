@@ -1,7 +1,7 @@
 // GUI P6a wallet-screen tests (docs/gui-plan.md P6a). Run from the repo
 // root:
 //
-//   node --test tests/ui/
+//   scripts/dev.sh ui-test
 //
 // Zero dependencies: a minimal DOM shim plus a stubbed global fetch drive
 // the REAL ui/js modules — wallet.js renders against fixture wallet-RPC
@@ -909,4 +909,470 @@ test('resetWallet drops the view; show() rebuilds from scratch', async () => {
   assert.equal(byAria(fresh, 'Balances').hidden, false);
   // the stored selection survives the rebuild (sessionStorage, like creds)
   assert.match(byAria(fresh, 'Balances').textContent, /1\.50000000 BTC/);
+});
+
+// --- security tab: lifecycle + encryption (gui-plan P6d) -------------------
+//
+// Ported from Core's Qt dialogs (gui-plan §5.1). These assert the two things
+// that make the port worth doing: the state derivation takes BOTH
+// getwalletinfo fields with NoKeys dominating, and signing borrows an unlock
+// rather than leaving the wallet open (Core's UnlockContext).
+
+const crypt = await import('../../ui/js/wallet-crypt.js');
+
+// Encrypted-wallet variants of the fixture. `private_keys_enabled` is true
+// here — the default WALLETINFO is watch-only, which is precisely the case
+// that must show NO encryption controls.
+const ENC_INFO = (unlockedUntil) => ({
+  ...WALLETINFO,
+  walletname: 'cold',
+  private_keys_enabled: true,
+  ...(unlockedUntil === undefined ? {} : { unlocked_until: unlockedUntil }),
+});
+
+async function securityTab(info) {
+  fixtures.getwalletinfo = () => info;
+  // Pin the selection: earlier tests — and the restore/create cases below —
+  // move it, while every assertion here is on the /wallet/<name> endpoint.
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  await wallet.show(container, 'security');
+  await wallet.refresh();
+  return byAria(container, 'Security');
+}
+
+function buttonByText(card, text) {
+  return card.find((n) => n.tagName === 'BUTTON' && n.textContent === text);
+}
+
+test('encryptionState: four Core states, NoKeys dominates', () => {
+  // walletmodel.h:67-73 — the order is load-bearing.
+  assert.equal(crypt.encryptionState(undefined), 'unknown');
+  assert.equal(crypt.encryptionState({ private_keys_enabled: true }), 'unencrypted');
+  assert.equal(crypt.encryptionState(
+    { private_keys_enabled: true, unlocked_until: 0 }), 'locked');
+  assert.equal(crypt.encryptionState(
+    { private_keys_enabled: true, unlocked_until: 1786955402 }), 'unlocked');
+  // watch-only wins even when the wallet somehow carries encryption keys —
+  // Core hits this with wallets that old bugs left "encrypted" but inert.
+  assert.equal(crypt.encryptionState(
+    { private_keys_enabled: false, unlocked_until: 0 }), 'no-keys');
+  // "unencrypted" is the ABSENCE of the key, never 0 (0 means locked).
+  assert.equal(crypt.encryptionState({ private_keys_enabled: true }), 'unencrypted');
+  assert.equal(crypt.isEncrypted('locked'), true);
+  assert.equal(crypt.isEncrypted('unlocked'), true);
+  assert.equal(crypt.isEncrypted('unencrypted'), false);
+  assert.equal(crypt.isEncrypted('no-keys'), false);
+});
+
+test('unlockCountdown: floors at zero, never negative', () => {
+  const nowMs = 1_000_000_000_000;
+  const now = Math.floor(nowMs / 1000);
+  assert.equal(crypt.unlockSecondsLeft({ unlocked_until: now + 90 }, nowMs), 90);
+  assert.equal(crypt.unlockCountdown({ unlocked_until: now + 90 }, nowMs), '1m 30s');
+  assert.equal(crypt.unlockCountdown({ unlocked_until: now + 45 }, nowMs), '45s');
+  assert.equal(crypt.unlockCountdown({ unlocked_until: now + 7200 }, nowMs), '2h 00m');
+  // an elapsed deadline is 0, not a negative countdown
+  assert.equal(crypt.unlockSecondsLeft({ unlocked_until: now - 10 }, nowMs), 0);
+  assert.equal(crypt.unlockCountdown({ unlocked_until: 0 }, nowMs), '');
+});
+
+test('passphrase validation: Core\'s exact mismatch string, frontend-only', () => {
+  assert.equal(crypt.validatePassphrasePair('a', 'a'), null);
+  assert.equal(crypt.validatePassphrasePair('', ''), 'Enter a passphrase.');
+  assert.equal(crypt.validatePassphrasePair('a', 'b'),
+    'The supplied passphrases do not match.');
+  assert.equal(crypt.validateTimeout('60'), null);
+  assert.equal(crypt.validateTimeout('-1'), 'Timeout cannot be negative.');
+  assert.equal(crypt.validateTimeout('soon'), 'Timeout must be an integer.');
+});
+
+test('createParams: empty passphrase is null, not the empty string', () => {
+  // An empty string is a DIFFERENT request to the node (it warns "wallet will
+  // not be encrypted"); sending it by accident would be a silent behaviour
+  // change, so the builder must distinguish them.
+  assert.deepEqual(crypt.createParams({ name: 'w' }), ['w', false, false, null, false]);
+  assert.deepEqual(crypt.createParams({ name: 'w', passphrase: 'p' }),
+    ['w', false, false, 'p', false]);
+  assert.deepEqual(
+    crypt.createParams({ name: 'w', disablePrivateKeys: true, blank: true }),
+    ['w', true, true, null, false]);
+  // the node refuses this combination with -4; the form says so first
+  assert.match(crypt.validateCreate(
+    { name: 'w', disablePrivateKeys: true, passphrase: 'p', confirm: 'p' }),
+  /private keys are disabled/);
+  assert.match(crypt.validateCreate({ name: '../evil' }), /Invalid wallet name/);
+  assert.equal(crypt.validateCreate({ name: 'ok' }), null);
+});
+
+test('withUnlocked: borrows the unlock and hands it back', async () => {
+  // Core's UnlockContext (walletmodel.cpp:428-446).
+  const calls = [];
+  const mk = (stateSeq, promptResult = true) => {
+    let i = 0;
+    return {
+      state: () => stateSeq[Math.min(i, stateSeq.length - 1)],
+      prompt: async () => { calls.push('prompt'); i++; return promptResult; },
+      lock: async () => { calls.push('lock'); },
+    };
+  };
+  const locked = { private_keys_enabled: true, unlocked_until: 0 };
+  const unlocked = { private_keys_enabled: true, unlocked_until: 99 };
+
+  // unencrypted: runs straight through, and must NOT lock afterwards
+  calls.length = 0;
+  assert.equal(await crypt.withUnlocked(mk([{ private_keys_enabled: true }]),
+    async () => 'ran'), 'ran');
+  assert.deepEqual(calls, []);
+
+  // watch-only: same — relocking a watch-only wallet is Core's documented bug case
+  calls.length = 0;
+  assert.equal(await crypt.withUnlocked(mk([{ private_keys_enabled: false }]),
+    async () => 'ran'), 'ran');
+  assert.deepEqual(calls, []);
+
+  // already unlocked: runs, and does NOT relock (it was not locked to begin with)
+  calls.length = 0;
+  assert.equal(await crypt.withUnlocked(mk([unlocked]), async () => 'ran'), 'ran');
+  assert.deepEqual(calls, []);
+
+  // locked: prompts, runs, then relocks — the whole point
+  calls.length = 0;
+  assert.equal(await crypt.withUnlocked(mk([locked, unlocked]),
+    async () => { calls.push('run'); return 'ran'; }), 'ran');
+  assert.deepEqual(calls, ['prompt', 'run', 'lock']);
+
+  // cancelled: THROWS rather than returning a sentinel a caller could mistake
+  // for a result, never runs fn, and does not relock a wallet it never unlocked
+  calls.length = 0;
+  await assert.rejects(
+    () => crypt.withUnlocked(mk([locked, locked], false),
+      async () => { calls.push('run'); }),
+    (e) => e instanceof crypt.UnlockCancelled);
+  assert.deepEqual(calls, ['prompt']);
+
+  // relocks even when the operation throws
+  calls.length = 0;
+  await assert.rejects(() => crypt.withUnlocked(mk([locked, unlocked]),
+    async () => { throw new Error('boom'); }));
+  assert.deepEqual(calls, ['prompt', 'lock']);
+});
+
+test('security tab: watch-only offers no encryption controls', async () => {
+  const card = await securityTab({ ...WALLETINFO, private_keys_enabled: false });
+  assert.equal(card.hidden, false);
+  assert.match(card.textContent, /watch-only/);
+  for (const label of ['encrypt wallet…', 'unlock…', 'lock now', 'change passphrase…']) {
+    assert.equal(buttonByText(card, label), null,
+      `watch-only must not offer "${label}"`);
+  }
+  // backup still applies to a watch-only wallet
+  assert.ok(buttonByText(card, 'back up…'));
+});
+
+test('security tab: unencrypted offers encrypt, not unlock', async () => {
+  const card = await securityTab(ENC_INFO(undefined));
+  assert.match(card.textContent, /not encrypted/);
+  assert.ok(buttonByText(card, 'encrypt wallet…'));
+  assert.equal(buttonByText(card, 'unlock…'), null);
+  assert.equal(buttonByText(card, 'change passphrase…'), null);
+});
+
+test('security tab: locked offers unlock + change, not lock', async () => {
+  const card = await securityTab(ENC_INFO(0));
+  assert.match(card.textContent, /locked/);
+  assert.ok(buttonByText(card, 'unlock…'));
+  assert.ok(buttonByText(card, 'change passphrase…'));
+  assert.equal(buttonByText(card, 'lock now'), null);
+  assert.equal(buttonByText(card, 'encrypt wallet…'), null);
+});
+
+test('security tab: unlocked shows the countdown and offers lock', async () => {
+  const until = Math.floor(Date.now() / 1000) + 300;
+  const card = await securityTab(ENC_INFO(until));
+  assert.match(card.textContent, /unlocked/);
+  assert.match(card.textContent, /relocks in/);
+  assert.ok(buttonByText(card, 'lock now'));
+  assert.equal(buttonByText(card, 'unlock…'), null);
+});
+
+test('encryptwallet: exact POST, and the mismatch never reaches the node', async () => {
+  const card = await securityTab(ENC_INFO(undefined));
+  await buttonByText(card, 'encrypt wallet…').dispatch('click');
+  const pass = byAria(container, 'New passphrase');
+  const confirm = byAria(container, 'Confirm new passphrase');
+  const form = byAria(container, 'Encrypt wallet');
+
+  // Core warns about BOTH losing the passphrase and the stale backup.
+  assert.match(form.textContent, /LOSE ALL OF YOUR BITCOINS/);
+  assert.match(form.textContent, /new HD seed/);
+
+  // mismatch: refused client-side, zero RPCs
+  pass.value = 'hunter2';
+  confirm.value = 'hunter3';
+  rpcLog.length = 0;
+  await form.dispatch('submit');
+  assert.ok(!rpcLog.some((c) => c.method === 'encryptwallet'));
+  assert.match(byAria(container, 'Security').textContent,
+    /The supplied passphrases do not match\./);
+
+  // matching: exact POST on the wallet endpoint
+  confirm.value = 'hunter2';
+  fixtures.encryptwallet = () => 'wallet encrypted; The keypool has been flushed'
+    + ' and a new HD seed was generated. You need to make a new backup with the'
+    + ' backupwallet RPC.';
+  fixtures.getwalletinfo = () => ENC_INFO(0); // the node comes back LOCKED
+  rpcLog.length = 0;
+  await form.dispatch('submit');
+  assert.deepEqual(rpcLog.find((c) => c.method === 'encryptwallet'),
+    { url: '/wallet/cold', method: 'encryptwallet', params: ['hunter2'] });
+  // the instruction string is surfaced, not swallowed
+  assert.match(byAria(container, 'Security').textContent, /make a new backup/);
+  // and the passphrase fields were dropped
+  assert.equal(pass.value, '');
+});
+
+test('walletpassphrase: exact POST including the timeout', async () => {
+  const card = await securityTab(ENC_INFO(0));
+  await buttonByText(card, 'unlock…').dispatch('click');
+  const pass = byAria(container, 'Passphrase');
+  const timeout = byAria(container, 'Unlock for');
+  assert.equal(timeout.value, String(crypt.DEFAULT_UNLOCK_TIMEOUT));
+  pass.value = 'hunter2';
+  timeout.value = '900';
+  fixtures.walletpassphrase = () => null;
+  fixtures.getwalletinfo = () => ENC_INFO(Math.floor(Date.now() / 1000) + 900);
+  rpcLog.length = 0;
+  await byAria(container, 'Unlock wallet').dispatch('submit');
+  assert.deepEqual(rpcLog.find((c) => c.method === 'walletpassphrase'),
+    { url: '/wallet/cold', method: 'walletpassphrase', params: ['hunter2', 900] });
+  assert.equal(pass.value, '');
+});
+
+test('walletpassphrase: a -14 from the node surfaces verbatim', async () => {
+  const card = await securityTab(ENC_INFO(0));
+  await buttonByText(card, 'unlock…').dispatch('click');
+  byAria(container, 'Passphrase').value = 'wrong';
+  fixtures.walletpassphrase = () => {
+    throw { code: -14, message: 'Error: The wallet passphrase entered was incorrect.' };
+  };
+  await byAria(container, 'Unlock wallet').dispatch('submit');
+  const text = byAria(container, 'Security').textContent;
+  assert.match(text, /The wallet passphrase entered was incorrect/);
+  assert.match(text, /RPC error -14/);
+  // the panel stays open so the user can retry without re-navigating
+  assert.ok(byAria(container, 'Unlock wallet'));
+});
+
+test('walletpassphrasechange + walletlock: exact POSTs', async () => {
+  const card = await securityTab(ENC_INFO(0));
+  await buttonByText(card, 'change passphrase…').dispatch('click');
+  byAria(container, 'Current passphrase').value = 'old';
+  byAria(container, 'New passphrase').value = 'new';
+  byAria(container, 'Confirm new passphrase').value = 'new';
+  fixtures.walletpassphrasechange = () => null;
+  rpcLog.length = 0;
+  await byAria(container, 'Change passphrase').dispatch('submit');
+  assert.deepEqual(rpcLog.find((c) => c.method === 'walletpassphrasechange'),
+    { url: '/wallet/cold', method: 'walletpassphrasechange', params: ['old', 'new'] });
+
+  const unlockedCard = await securityTab(
+    ENC_INFO(Math.floor(Date.now() / 1000) + 300));
+  fixtures.walletlock = () => null;
+  fixtures.getwalletinfo = () => ENC_INFO(0);
+  rpcLog.length = 0;
+  await buttonByText(unlockedCard, 'lock now').dispatch('click');
+  assert.deepEqual(rpcLog.find((c) => c.method === 'walletlock'),
+    { url: '/wallet/cold', method: 'walletlock', params: [] });
+});
+
+test('backupwallet / restorewallet: node-side paths, correct endpoints', async () => {
+  const card = await securityTab(ENC_INFO(0));
+  await buttonByText(card, 'back up…').dispatch('click');
+  const form = byAria(container, 'Back up wallet');
+  // the path is on the node, which is easy to get wrong through a tunnel
+  assert.match(form.textContent, /machine running the node/);
+  byAria(container, 'Backup destination path').value = '/data/backup.dump';
+  fixtures.backupwallet = () => null;
+  rpcLog.length = 0;
+  await form.dispatch('submit');
+  assert.deepEqual(rpcLog.find((c) => c.method === 'backupwallet'),
+    { url: '/wallet/cold', method: 'backupwallet', params: ['/data/backup.dump'] });
+
+  const card2 = await securityTab(ENC_INFO(0));
+  await buttonByText(card2, 'restore…').dispatch('click');
+  byAria(container, 'Restored wallet name').value = 'restored';
+  byAria(container, 'Backup file path').value = '/data/backup.dump';
+  fixtures.restorewallet = (params) => ({ name: params[0], warnings: [] });
+  fixtures.listwallets = () => ['cold', 'hot', 'restored'];
+  rpcLog.length = 0;
+  await byAria(container, 'Restore wallet from backup').dispatch('submit');
+  // restorewallet is NODE-level: it rides the base endpoint, not /wallet/<name>
+  assert.deepEqual(rpcLog.find((c) => c.method === 'restorewallet'),
+    { url: '/', method: 'restorewallet',
+      params: ['restored', '/data/backup.dump'] });
+});
+
+test('createwallet: positional params on the base endpoint', async () => {
+  fixtures.listwallets = () => ['cold', 'hot'];
+  const card = await securityTab(ENC_INFO(0));
+  await buttonByText(card, 'create wallet…').dispatch('click');
+  const form = byAria(container, 'Create wallet');
+  byAria(container, 'New wallet name').value = 'fresh';
+  byAria(container, 'New wallet passphrase (optional)').value = 'pw';
+  byAria(container, 'Confirm new wallet passphrase').value = 'pw';
+  fixtures.createwallet = (params) => ({ name: params[0], warnings: [] });
+  fixtures.listwallets = () => ['cold', 'hot', 'fresh'];
+  rpcLog.length = 0;
+  await form.dispatch('submit');
+  assert.deepEqual(rpcLog.find((c) => c.method === 'createwallet'),
+    { url: '/', method: 'createwallet',
+      params: ['fresh', false, false, 'pw', false] });
+});
+
+test('createwallet: watch-only + passphrase is refused before any RPC', async () => {
+  fixtures.listwallets = () => ['cold', 'hot'];
+  const card = await securityTab(ENC_INFO(0));
+  await buttonByText(card, 'create wallet…').dispatch('click');
+  byAria(container, 'New wallet name').value = 'nope';
+  byAria(container, 'New wallet passphrase (optional)').value = 'pw';
+  byAria(container, 'Confirm new wallet passphrase').value = 'pw';
+  byAria(container, 'Watch-only (disable private keys)').checked = true;
+  rpcLog.length = 0;
+  await byAria(container, 'Create wallet').dispatch('submit');
+  assert.ok(!rpcLog.some((c) => c.method === 'createwallet'));
+  assert.match(byAria(container, 'Security').textContent, /private keys are disabled/);
+});
+
+test('show-passphrase toggle flips every field in the panel at once', async () => {
+  const card = await securityTab(ENC_INFO(undefined));
+  await buttonByText(card, 'encrypt wallet…').dispatch('click');
+  const pass = byAria(container, 'New passphrase');
+  const confirm = byAria(container, 'Confirm new passphrase');
+  assert.equal(pass.type, 'password');
+  const toggle = byAria(container, 'Show passphrase');
+  await toggle.dispatch('click');
+  assert.equal(pass.type, 'text');
+  assert.equal(confirm.type, 'text');
+  await toggle.dispatch('click');
+  assert.equal(pass.type, 'password');
+  assert.equal(confirm.type, 'password');
+});
+
+test('send on a LOCKED wallet: prompts, signs, then relocks', async () => {
+  // The whole reason UnlockContext is ported rather than a retry-on--13 loop.
+  // Compose a spend while locked: the page must raise the unlock panel, send
+  // only after the unlock lands, and put the wallet BACK to locked afterwards.
+  fixtures.listwallets = () => ['cold', 'hot'];
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  let locked = true;
+  fixtures.getwalletinfo = () => ENC_INFO(locked ? 0 : Math.floor(Date.now() / 1000) + 300);
+  fixtures.walletpassphrase = () => { locked = false; return null; };
+  fixtures.walletlock = () => { locked = true; return null; };
+
+  await wallet.show(container, 'send');
+  await wallet.refresh();
+  byAria(container, 'Recipient 1 address').value = RECIP_A;
+  byAria(container, 'Recipient 1 amount (BTC)').value = '0.5';
+  const sendCard = byAria(container, 'Send');
+  await sendCard.find((n) => n.tagName === 'FORM').dispatch('submit');
+  rpcLog.length = 0;
+
+  // Kick off the confirm; it parks on the unlock prompt rather than sending.
+  const confirm = buttonByText(sendCard, 'confirm and send');
+  const sending = confirm.dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.ok(!rpcLog.some((c) => c.method === 'sendtoaddress'),
+    'must not sign while the wallet is locked');
+  const unlockForm = byAria(container, 'Unlock wallet');
+  assert.ok(unlockForm, 'the unlock panel must be raised');
+
+  byAria(container, 'Passphrase').value = 'hunter2';
+  await unlockForm.dispatch('submit');
+  await sending;
+
+  const order = rpcLog.filter((c) =>
+    ['walletpassphrase', 'sendtoaddress', 'walletlock'].includes(c.method))
+    .map((c) => c.method);
+  assert.deepEqual(order, ['walletpassphrase', 'sendtoaddress', 'walletlock'],
+    'unlock -> sign -> relock, in that order');
+  assert.equal(locked, true, 'the wallet must be locked again afterwards');
+});
+
+test('send on an UNLOCKED wallet does not relock it afterwards', async () => {
+  // The context relocks IFF it was locked to begin with (Core: relock =
+  // was_locked). A wallet the user unlocked for a session must stay unlocked.
+  fixtures.listwallets = () => ['cold', 'hot'];
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  fixtures.getwalletinfo = () => ENC_INFO(Math.floor(Date.now() / 1000) + 300);
+  await wallet.show(container, 'send');
+  await wallet.refresh();
+  byAria(container, 'Recipient 1 address').value = RECIP_A;
+  byAria(container, 'Recipient 1 amount (BTC)').value = '0.5';
+  const sendCard = byAria(container, 'Send');
+  await sendCard.find((n) => n.tagName === 'FORM').dispatch('submit');
+  rpcLog.length = 0;
+  await buttonByText(sendCard, 'confirm and send').dispatch('click');
+  assert.ok(rpcLog.some((c) => c.method === 'sendtoaddress'));
+  assert.ok(!rpcLog.some((c) => c.method === 'walletlock'),
+    'an already-unlocked wallet must not be relocked by the send');
+});
+
+test('unlock prompt returns you to the tab you came from', async () => {
+  // Qt raises a modal over the current view and returns to it; we move to
+  // the Security tab to show the panel, so the trip back is owed.
+  fixtures.listwallets = () => ['cold', 'hot'];
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  let locked = true;
+  fixtures.getwalletinfo = () => ENC_INFO(locked ? 0 : Math.floor(Date.now() / 1000) + 300);
+  fixtures.walletpassphrase = () => { locked = false; return null; };
+  fixtures.walletlock = () => { locked = true; return null; };
+
+  await wallet.show(container, 'send');
+  await wallet.refresh();
+  byAria(container, 'Recipient 1 address').value = RECIP_A;
+  byAria(container, 'Recipient 1 amount (BTC)').value = '0.5';
+  const sendCard = byAria(container, 'Send');
+  await sendCard.find((n) => n.tagName === 'FORM').dispatch('submit');
+  const sending = buttonByText(sendCard, 'confirm and send').dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  // parked on Security while the prompt is up
+  assert.equal(byAria(container, 'Security').hidden, false);
+  byAria(container, 'Passphrase').value = 'hunter2';
+  await byAria(container, 'Unlock wallet').dispatch('submit');
+  await sending;
+  // ...and back on Send, with the broadcast result visible there
+  assert.equal(byAria(container, 'Send').hidden, false);
+  assert.equal(byAria(container, 'Security').hidden, true);
+});
+
+test('cancelling the unlock prompt aborts the send and says so', async () => {
+  // The cancel path throws UnlockCancelled rather than returning a sentinel a
+  // caller could mistake for a result; the send's existing catch renders it.
+  fixtures.listwallets = () => ['cold', 'hot'];
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  fixtures.getwalletinfo = () => ENC_INFO(0); // stays locked
+  await wallet.show(container, 'send');
+  await wallet.refresh();
+  byAria(container, 'Recipient 1 address').value = RECIP_A;
+  byAria(container, 'Recipient 1 amount (BTC)').value = '0.5';
+  const sendCard = byAria(container, 'Send');
+  await sendCard.find((n) => n.tagName === 'FORM').dispatch('submit');
+  rpcLog.length = 0;
+  const sending = buttonByText(sendCard, 'confirm and send').dispatch('click');
+  await new Promise((r) => setTimeout(r, 0));
+  // dismiss the prompt
+  await buttonByText(byAria(container, 'Security'), 'cancel').dispatch('click');
+  await sending;
+  assert.ok(!rpcLog.some((c) => c.method === 'sendtoaddress'),
+    'a cancelled unlock must not send');
+  assert.ok(!rpcLog.some((c) => c.method === 'walletlock'),
+    'nothing was unlocked, so nothing should be relocked');
+  // back on Send, with the cancellation explained rather than a raw -13
+  assert.equal(byAria(container, 'Send').hidden, false);
+  assert.match(byAria(container, 'Send').textContent, /Cancelled — the wallet is locked/);
 });

@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${DEV_SWANK_PORT:-4007}"   # Swank port INSIDE the container; never published
 DOCKER=docker
-IMAGE="bitcoin-lisp-sbcl:2.6.5"  # pinned project image (docker/Dockerfile)
+IMAGE="bitcoin-lisp-sbcl:2.6.5-2"  # pinned project image (docker/Dockerfile)
 
 sha256_stdin() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -32,7 +32,7 @@ usage() {
 Usage: scripts/dev.sh COMMAND [ARGS]
 
 Persistent Swank development helper for bitcoin-lisp. The warm image runs
-INSIDE the pinned project container (bitcoin-lisp-sbcl:2.6.5): SBCL never
+INSIDE the pinned project container (bitcoin-lisp-sbcl:2.6.5-2): SBCL never
 runs on the host. The container runs scripts/dev-swank-server.lisp
 (bitcoin-lisp/tests loaded, Swank listening in-container) as its main
 process; every eval is a `docker exec` of the Common Lisp Workbench
@@ -50,6 +50,7 @@ Commands:
   test NAME          Run one fiveam suite (raw designator, e.g. :script-tests)
   test-all           Run the full :bitcoin-lisp-tests suite (long)
   docs-check         Verify PAX documentation transcripts in a cold container
+  ui-test [PATH...]  Run the web UI node harness (default tests/ui/)
   logs               Show the dev container's output
   help               Show this help
 
@@ -363,6 +364,23 @@ docs_check() {
     --non-interactive --load scripts/docs-check.lisp
 }
 
+# Web UI harness (tests/ui/*.test.mjs): zero-dependency node tests that drive
+# the real ui/js modules through a DOM shim. Runs in the SAME pinned image as
+# every other suite — node is in the image for exactly this reason
+# (docker/Dockerfile). A cold one-shot container, not the warm image: these
+# tests touch no Lisp, so there is nothing to keep warm.
+ui_test() {
+  ensure_image
+  local targets=("$@")
+  [ ${#targets[@]} -eq 0 ] && targets=(tests/ui/)
+  exec "$DOCKER" run --rm -i \
+    -v "$ROOT:/workspace:ro" -w /workspace \
+    --label "$PROJECT_LABEL=bitcoin-lisp" \
+    --label "$CHECKOUT_LABEL=$CHECKOUT_SHORT" \
+    --label "agent=$SESSION_ID" \
+    --entrypoint node "$IMAGE" --test "${targets[@]}"
+}
+
 show_logs() {
   require_owned_container
   "$DOCKER" logs "$CONTAINER" "$@"
@@ -381,6 +399,7 @@ case "$cmd" in
   test) test_one "$@" ;;
   test-all) test_all ;;
   docs-check) docs_check ;;
+  ui-test) ui_test "$@" ;;
   logs) show_logs "$@" ;;
   help|-h|--help) usage ;;
   *) echo "Unknown command: $cmd" >&2; usage >&2; exit 2 ;;
