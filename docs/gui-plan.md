@@ -107,10 +107,89 @@ Wallet threat model (applies once P6 + wallet-plan land):
 | **P3** | **DONE (PR #286)** **Peers & network ops**: sortable peer table + detail drawer, ban list w/ setban/unban/disconnect, network-active toggle — the write actions of Qt's Peers tab | zero-dep node harness (tests/ui/peers.test.mjs: DOM shim + stubbed fetch drive the real modules — rendering, sorting, action→RPC params) + Lisp serving/wiring tests; manual against testnet4 node post-merge | S-M |
 | **P4** | **DONE (PR #289)** **RPC console**: method autocomplete from `help`, JSON or space-separated params, history, result pretty-print; (wallet selector dropdown arrives with P6) | zero-dep node harness (tests/ui/console.test.mjs: arg parsing, autocomplete, history, result/error rendering, exact RPC POSTs) + Lisp serving/wiring tests; manual against testnet4 node post-merge | S |
 | **P5** | *(optional)* **Push channel**: SSE endpoint streaming tip/mempool/peer-count events (hunchentoot chunked stream fed by a small node-side event ring), UI falls back to polling | soak: leave dashboard open through several blocks; kill/restore tunnel | S-M |
-| **P6** | **Wallet screens**, sub-phased to track wallet-plan: **6a DONE (PR #292)** overview+receive+history+address book (needs wallet P1-P3; wallet selector over /wallet/<name>, client-side QR encoder vector-tested byte-exact, mask-values toggle, disabled/empty states); **6b** send + fee UI (wallet P4); **6c** PSBT panel + bumpfee (wallet P5); **6d** lifecycle/encryption dialogs (wallet P1/P6) | 6a: zero-dep node harness (tests/ui/wallet.test.mjs + qr.test.mjs vs machine-generated reference vectors) + Lisp serving/wiring tests; regtest wallet driven end-to-end from the browser; testnet4 send round-trip at 6b | M-L total |
+| **P6** | **Wallet screens**, sub-phased to track wallet-plan: **6a DONE (PR #292)** overview+receive+history+address book (needs wallet P1-P3; wallet selector over /wallet/<name>, client-side QR encoder vector-tested byte-exact, mask-values toggle, disabled/empty states); **6b DONE (PR #301)** send + fee UI (wallet P4); **6c** PSBT panel + bumpfee (wallet P5 — unblocked); **6d** lifecycle/encryption dialogs (wallet P1/P6 — unblocked, see §5.1) | 6a: zero-dep node harness (tests/ui/wallet.test.mjs + qr.test.mjs vs machine-generated reference vectors) + Lisp serving/wiring tests; regtest wallet driven end-to-end from the browser; testnet4 send round-trip at 6b | M-L total |
 
 P1-P5 have **zero dependency on the wallet plan** — ship them now in any order after P0
 (P2 is the most useful day-to-day; P5 can be dropped if polling feels fine).
+
+### 5.1 6d — the Bitcoin Core cross-reference
+
+Wallet P6 shipped (PR #343), so 6d is unblocked. Core's Qt GUI already contains this
+exact dialog set; port its *logic*, not its widgets. Anchors at `refs/bitcoin` d3056bc:
+
+| Core (`src/qt/`) | 6d piece |
+|---|---|
+| `askpassphrasedialog.{h,cpp}` | one dialog, four modes: `Encrypt` / `Unlock` / `ChangePass` / `UnlockMigration` |
+| `walletmodel.{h,cpp}` | `EncryptionStatus` + `UnlockContext` + `setWalletLocked` / `changePassphrase` |
+| `createwalletdialog.{h,cpp}` | new-wallet dialog incl. the passphrase field |
+| `walletcontroller.{h,cpp}` | Create / Open / Unload lifecycle activities |
+| `walletframe.cpp`, `bitcoingui.cpp` | menu actions, status-bar lock icon |
+
+**1. `EncryptionStatus` is derivable from `getwalletinfo` alone — but it takes TWO fields.**
+Core's four states (`walletmodel.h:67-73`) are annotated with the very predicates wallet P6
+implements:
+
+```
+NoKeys,       // wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)
+Unencrypted,  // !wallet->HasEncryptionKeys()
+Locked,       // wallet->HasEncryptionKeys() && wallet->IsLocked()
+Unlocked      // wallet->HasEncryptionKeys() && !wallet->IsLocked()
+```
+
+Mapping onto our RPC:
+
+| Core state | derive from `getwalletinfo` |
+|---|---|
+| `NoKeys` | `private_keys_enabled == false` — **check this FIRST** |
+| `Unencrypted` | `unlocked_until` key **absent** |
+| `Locked` | `unlocked_until == 0` |
+| `Unlocked` | `unlocked_until > 0` |
+
+No new RPC needed. Two things to get right: `NoKeys` dominates (a watch-only wallet must
+show no encrypt/unlock controls at all, whatever the other fields say), and the
+`Unencrypted` case is the *absence* of the key, not `0` — which is why P6 omits the field
+entirely rather than reporting `0`, since `0` already means "encrypted but locked".
+
+**2. Port `UnlockContext`, not a retry-on-`-13` loop.** The obvious browser design —
+catch `-13`, prompt, retry — is *reactive* and leaves the wallet unlocked afterwards.
+Core is proactive and self-restoring (`walletmodel.cpp:428-446`):
+
+```cpp
+bool was_locked = getEncryptionStatus() == Locked;
+if (was_locked) Q_EMIT requireUnlock();          // UI raises the dialog
+bool valid = getEncryptionStatus() != Locked;    // still locked ⇒ cancelled/wrong
+return UnlockContext(this, valid, /*relock=*/was_locked);
+```
+
+Every signing path opens with `ctx(requestUnlock()); if (!ctx.isValid()) return false;`,
+and the destructor **relocks iff the wallet was locked when the operation began** — borrow
+the unlock, hand it back. Our equivalent is a `withUnlocked(fn)` wrapper: prompt if
+locked → run → `walletlock` in a `finally` when it started locked. Prevents the "unlocked
+for 10 minutes to send one payment, then forgot" failure that a retry loop invites.
+
+Edge case worth copying: `privateKeysDisabled()` returns a valid, non-relocking context
+(`walletmodel.cpp:434-436`) because old Core bugs produced watch-only wallets that carry
+encryption keys which do nothing. Our `encryptwallet` refuses watch-only with `-16` so we
+never mint one, but a wallet imported from Core can be in that state.
+
+**3. Reusable strings** (`askpassphrasedialog.cpp:42-195`), several of which our RPC layer
+already matches:
+
+- `Warning: If you encrypt your wallet and lose your passphrase, you will <b>LOSE ALL OF YOUR BITCOINS</b>!`
+- `IMPORTANT: Any previous backups you have made of your wallet file should be replaced with the newly generated, encrypted wallet file…` — the GUI twin of our `encryptwallet` return string.
+- passphrase-strength hint: `ten or more random characters, or eight or more words`
+- `The supplied passphrases do not match.` — **frontend-only** (the two-field confirm); there is no RPC for it and there should not be.
+- the null-character passphrase explanation, matching our `-14` long form.
+
+Also worth copying: caps-lock detection (`fCapsLock`), `secureClearPassFields`, and the
+show-password toggle.
+
+**⚠️ The one thing that does NOT transfer.** Qt is an in-process GUI: the passphrase lives
+in a `SecureString` and never leaves the process. Ours crosses HTTP to the RPC, and
+JavaScript cannot truly scrub a string — `secureClearPassFields` has no faithful analogue.
+Copying the dialogs must not imply copying the security posture: the loopback/SSH-tunnel
+constraint in §4 is what actually bounds the risk, and 6d should say so in the UI rather
+than let a Core-shaped dialog imply Core-grade handling.
 
 ## 6. Effort & risk
 
