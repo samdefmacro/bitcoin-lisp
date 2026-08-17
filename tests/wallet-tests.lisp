@@ -541,10 +541,19 @@ behave like Core, including the exact error codes."
               (lambda () (bitcoin-lisp.rpc::rpc-createwallet
                           node (list "legacy0" nil nil nil nil
                                      bitcoin-lisp.rpc:+json-false+))))))
+      ;; A passphrase now creates a born-encrypted wallet (wallet P6). It is
+      ;; refused only with private keys disabled, where there would be
+      ;; nothing for it to protect.
+      (is (null (%rpc-error-code
+                 (lambda () (bitcoin-lisp.rpc::rpc-createwallet
+                             node '("enc0" nil nil "hunter2"))))))
+      (is (bitcoin-lisp.rpc::wallet-has-encryption-keys-p
+           (gethash "enc0" (bitcoin-lisp.rpc::wallet-manager-wallets
+                            (%node-manager node)))))
       (is (= bitcoin-lisp.rpc::+rpc-wallet-error+
-             (%rpc-error-code    ; passphrase -> encryption is P6
+             (%rpc-error-code
               (lambda () (bitcoin-lisp.rpc::rpc-createwallet
-                          node '("enc0" nil nil "hunter2"))))))
+                          node '("enc1" t nil "hunter2"))))))
       (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
              (%rpc-error-code
               (lambda () (bitcoin-lisp.rpc::rpc-createwallet node '("")))))))))
