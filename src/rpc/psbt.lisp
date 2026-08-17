@@ -1097,6 +1097,7 @@ Returns {psbt, complete, hex?}."
           (when (and sign (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
             (error 'rpc-error :code +rpc-wallet-error+
                               :message "Error: Private keys are disabled for this wallet"))
+          (when sign (wallet-ensure-unlocked wallet))
           (%psbt-fill-wallet-utxos psbt wallet)
           (let ((coins (%psbt-coins-map psbt wallet nil)))
             (when bip32derivs
@@ -1479,6 +1480,9 @@ estimate_mode) onto CC. Coin control already defaults to RBF-signaling."
                    (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
           (error 'rpc-error :code +rpc-wallet-error+
                             :message "bumpfee is not available with wallets that have private keys disabled. Use psbtbumpfee instead."))
+        ;; Core gates BOTH bumpfee and psbtbumpfee: building the
+        ;; replacement needs the keypool and, for bumpfee, the signature.
+        (wallet-ensure-unlocked wallet)
         (let ((txid (parse-hex-hash txid-hex))
               (cc (make-wcc)))
           (setf (wcc-signal-bip125-rbf cc) t)   ; Core: default true, RBF replacement

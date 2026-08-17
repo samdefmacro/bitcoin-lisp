@@ -133,12 +133,44 @@ engines (descriptors v2, DB/keystore, tx tracking, coin selection):
 | **P3** | **DONE (PR #290)** **Balances & coins**: receive.cpp accounting port (credit/debit/fee, trusted rules, immature, change heuristic), address book + labels; RPCs: getbalance(s), listunspent, lockunspent/listlockunspent, getaddressinfo, setlabel/getaddressesbylabel/listlabels, abandontransaction | port Core functional expectations (wallet_balance.py, wallet_abandonconflict.py scenarios) on regtest | M |
 | **P4** | **DONE (PR #293)** **Spending** (funds-critical): coin selection (BnB/Knapsack/SRD + waste + eligibility cascade; CoinGrinder deferred), CreateTransactionInternal port (change target/dust/discard, anti-fee-sniping, RBF-default sequences, exact fee loop, weight/maxtxfee caps), wallet signing via P0 providers + pre-broadcast script verification; RPCs: sendtoaddress, sendmany, send, sendall, fundrawtransaction, signrawtransactionwithwallet; rebroadcast timer (12-36h) via Wave 8B unbroadcast machinery | port coinselector_tests waste/BnB vectors; regtest end-to-end spends incl. SFFO, dust-change, locktime/sequence field checks vs Core-built txs; testnet4 live spend = first post-merge soak (deploys from main checkout only) | L (the meat, pt. 2) |
 | **P5** | **PSBT bridge + fee bump**: sign→PSBT (partial_sig/tap_key_sig insertion), FillPSBT port; RPCs: walletprocesspsbt, walletcreatefundedpsbt, descriptorprocesspsbt (node-level — feasible now with P0, was on the "infeasible" list), bumpfee/psbtbumpfee (feebumper port) | Core rpc_psbt.json signer vectors (we already pass the no-wallet ones); regtest RBF bump chains | M |
-| **P6** | **Encryption + backup + message signing**: crypter port (AES-256-CBC, 25k-round SHA512 KDF, IV=sha256d(pubkey)), encryptwallet/walletpassphrase(+timeout relock)/walletpassphrasechange/walletlock, backupwallet/restorewallet, signmessage | unit: encrypt→lock→unlock→sign roundtrip; restore backup into fresh node, balances identical; keys never logged | M |
+| **P6** | **DONE** **Encryption + backup + message signing**: crypter port (AES-256-CBC, 25k-round SHA512 KDF, IV=sha256d(pubkey)), encryptwallet/walletpassphrase(+timeout relock)/walletpassphrasechange/walletlock, backupwallet/restorewallet, signmessage | unit: encrypt→lock→unlock→sign roundtrip; restore backup into fresh node, balances identical; keys never logged | M |
 | **P7** | **Polish/parity**: avoid_reuse flag, getreceivedbyaddress/label, listreceivedby*, listaddressgroupings, keypoolrefill, simulaterawtransaction, getwalletinfo field completeness; **Sparrow Wallet connected as external client** as an RPC-fidelity acceptance test | Sparrow connects, sees balances/history, composes+signs+broadcasts via our node | S-M |
 
 **Watch-only MVP = P0-P3** (import Core descriptors, track funds, full history/balances — already
 useful on the server nodes with zero key-loss risk). **Spending MVP = P0-P4.** P5-P7 reach
 Core parity minus the explicit out-of-scopes.
+
+### P6 as built — decisions that diverge from Core
+
+- **PKCS#7 is ours, not ironclad's.** ironclad's `:pkcs7` mode accepts a final pad byte of 0
+  (Core rejects it), signals `TYPE-ERROR` rather than `invalid-padding` when the pad byte
+  exceeds the block size, and its condition report embeds the decrypted final block. We drive
+  ironclad's CBC with no padding mode and pad/unpad ourselves, byte-exact with `aes.cpp`.
+- **A wrong passphrase is refused cryptographically even on a blank encrypted wallet.** Core's
+  `CheckDecryptionKey` returns "pass" when there are no keys to check, so any passphrase opens
+  such a wallet; we require the master key itself to decrypt first, which closes that.
+- **The KDF iteration count is clamped** at 20M. Core has no ceiling, and the calibration bakes
+  whatever this machine measured into the wallet file permanently — a run on a loaded host would
+  otherwise make every later unlock take seconds.
+- **`backupwallet` writes a checksummed logical dump, not a file copy.** Core copies one SQLite
+  file; our wallet is a LevelDB directory, and copying a live one can silently produce a database
+  that opens cleanly with records missing. The dump is taken under the wallet lock through one
+  ordered iterator, carries its network as a cross-network guard, and `restorewallet` verifies it
+  completely before creating anything.
+- **Wallet names are validated on restore.** Core's `restorewallet` does no containment check at
+  all (`"../evil"` escapes the wallets directory); we reuse `%valid-wallet-name-p`.
+- **The relock is authoritative on read, not on a timer.** Every access to the master key goes
+  through `wallet-unlocked-key`, which enforces the deadline; the sweeper thread only provides
+  liveness, so losing it can never leave a key usable past its timeout. Firing uses the monotonic
+  clock so a backward NTP step cannot extend an unlock window.
+- **`assert(false)` is replaced by an atomic batch.** Core aborts the process if encryption fails
+  half way. We encrypt and verify every key in memory first, then write the master key, every
+  ciphertext record, and every plaintext deletion in one LevelDB batch, and only then mutate
+  memory — so a half-encrypted wallet is unreachable rather than fatal.
+- **Best-effort slack:** a LevelDB delete is a tombstone, so `encryptwallet` compacts afterwards
+  but cannot guarantee the old plaintext bytes are gone — which is why the RPC's return string
+  tells the user to take a fresh backup. `createwallet` with a passphrase avoids the problem
+  entirely: it is born encrypted and never writes a plaintext key record at all.
 
 ## 6. Effort & risk
 
