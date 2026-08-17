@@ -166,11 +166,12 @@ type, the shell wires in the wallet view + nav link, every RPC method the
 page calls is a registered dispatcher method, and the /wallet/<name>
 endpoint parsing the page's endpoint-aware rpc.js relies on resolves names.
 (The page's selector/overview/receive/history/address-book behavior, and the
-P6d lifecycle/encryption panels, are covered by the zero-dependency node
+P6c PSBT panel and P6d lifecycle/encryption panels, are covered by the node
 harness in tests/ui/wallet.test.mjs; the QR encoder is checked byte-exactly
 against reference vectors in tests/ui/qr.test.mjs — run both with
 scripts/dev.sh ui-test.)"
-  (dolist (path '("/ui/js/wallet.js" "/ui/js/qr.js" "/ui/js/wallet-crypt.js"))
+  (dolist (path '("/ui/js/wallet.js" "/ui/js/qr.js" "/ui/js/wallet-crypt.js"
+                  "/ui/js/wallet-psbt.js"))
     (with-ui-reply ()
       (let ((body (bitcoin-lisp.rpc::ui-handle path)))
         (is (= 200 (hunchentoot:return-code*)) "~S must be served" path)
@@ -192,7 +193,11 @@ scripts/dev.sh ui-test.)"
                     "createwallet" "unloadwallet"
                     "encryptwallet" "walletpassphrase"
                     "walletpassphrasechange" "walletlock"
-                    "backupwallet" "restorewallet"))
+                    "backupwallet" "restorewallet"
+                    ;; P6c PSBT panel + fee bump
+                    "decodepsbt" "analyzepsbt" "walletprocesspsbt"
+                    "finalizepsbt" "sendrawtransaction"
+                    "bumpfee" "psbtbumpfee"))
     (is (not (null (gethash method bitcoin-lisp.rpc::*rpc-methods*)))
         "RPC method ~S (called by the wallet page) must be registered" method))
   ;; The page pins every wallet RPC to /wallet/<name>; the URI parsing it
