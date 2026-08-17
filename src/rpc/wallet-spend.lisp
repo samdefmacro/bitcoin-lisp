@@ -1791,7 +1791,7 @@ wrong-key signature)."
             (when (and spkm (spkm-have-private-keys-p spkm))
               (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
                 (declare (ignore scripts))
-                (let ((provider (spkm-privkey-provider spkm)))
+                (let ((provider (spkm-privkey-provider wallet spkm)))
                   (loop for (key . pubkey) in pairs
                         for priv = (%desc-key-priv-at key pos provider)
                         do (when priv
@@ -3031,6 +3031,9 @@ snapshot, so no lock-order inversion is possible; see with-wallet-lock)."
         (when (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+)
           (error 'rpc-error :code +rpc-wallet-error+
                             :message "Error: Private keys are disabled for this wallet"))
+        ;; Checked inside the lock that also spans creation and signing, so
+        ;; a relock cannot land between the check and the signature.
+        (wallet-ensure-unlocked wallet)
         (%create-transaction node wallet (wrng-shuffle (%rng) recipients)
                              nil cc t))
     (declare (ignore change-pos))
@@ -3567,6 +3570,7 @@ signrawtransactionwithwallet). PARAMS: (hexstring prevtxs sighashtype)."
                           :message "TX decode failed. Make sure the tx has at least one input."))
       (with-node-lock (node)
         (with-wallet-lock (wallet)
+          (wallet-ensure-unlocked wallet)
           (multiple-value-bind (sighash-byte sighash-default-p)
               (%wallet-sighash-byte (third params))
             (let ((coins (%wallet-input-coins node wallet tx)))

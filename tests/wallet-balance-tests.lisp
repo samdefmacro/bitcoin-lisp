@@ -38,7 +38,8 @@
             do (let* ((key (first (bitcoin-lisp.rpc::out-desc-ordered-keys
                                    (bitcoin-lisp.rpc::desc-spkm-desc spkm))))
                       (k (bitcoin-lisp.rpc::%desc-key-root-xprv
-                          key (bitcoin-lisp.rpc::spkm-privkey-provider spkm))))
+                          key (bitcoin-lisp.rpc::spkm-privkey-provider
+                               wallet spkm))))
                  (dolist (entry (bitcoin-lisp.rpc::desc-key-path key))
                    (setf k (bitcoin-lisp.crypto:bip32-derive-child k entry)))
                  (when (eq (bitcoin-lisp.rpc::desc-key-derive key) :unhardened)

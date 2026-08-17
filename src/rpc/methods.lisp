@@ -3887,7 +3887,7 @@ holds the wallet lock."
     (when (and spkm (spkm-have-private-keys-p spkm))
       (multiple-value-bind (scripts pairs) (%spkm-expansion-pairs spkm pos)
         (declare (ignore scripts))
-        (let ((provider (spkm-privkey-provider spkm)))
+        (let ((provider (spkm-privkey-provider wallet spkm)))
           (loop for (key . pubkey) in pairs
                 for priv = (%desc-key-priv-at key pos provider)
                 when (and priv
@@ -3931,6 +3931,7 @@ PRIVATE_KEY_NOT_AVAILABLE)."
       ;; wallet.lisp macro not yet defined when this file compiles, so use its
       ;; expansion directly (a bare bt:with-recursive-lock-held).
       (let ((wif (bt:with-recursive-lock-held ((wallet-lock wallet))
+                   (wallet-ensure-unlocked wallet)
                    (%wallet-signmessage-wif wallet script keyid))))
         (unless wif
           ;; SigningResult::PRIVATE_KEY_NOT_AVAILABLE -> RPC_WALLET_ERROR.

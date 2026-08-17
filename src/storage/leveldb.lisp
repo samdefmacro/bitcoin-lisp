@@ -351,6 +351,19 @@ the end or before the start."
 (defun leveldb-iter-seek-to-first (iter) (%leveldb-iter-seek-to-first iter))
 (defun leveldb-iter-next (iter) (%leveldb-iter-next iter))
 
+(defun leveldb-iter-check-error (iter)
+  "Signal if ITER stopped because of an I/O or corruption error rather than
+because it reached the end.
+
+An iterator that hits a bad block simply goes invalid, so a plain
+`loop while (leveldb-iter-valid-p ...)` cannot tell a complete scan from a
+truncated one. Any caller whose result is only meaningful if it saw EVERY
+record — a backup, a balance rollup, a UTXO sweep — must call this after the
+loop, or it will silently report a partial view of the database as the
+whole thing."
+  (with-errptr (err)
+    (%leveldb-iter-get-error iter err)))
+
 (defun leveldb-iter-seek (iter key)
   "Position ITER at the first key ≥ KEY (a byte vector)."
   (declare (type (simple-array (unsigned-byte 8) (*)) key))

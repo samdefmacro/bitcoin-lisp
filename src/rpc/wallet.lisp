@@ -27,6 +27,10 @@
 (defconstant +rpc-wallet-insufficient-funds+ -6)
 (defconstant +rpc-wallet-invalid-label-name+ -11)
 (defconstant +rpc-wallet-keypool-ran-out+ -12)
+(defconstant +rpc-wallet-unlock-needed+ -13)
+(defconstant +rpc-wallet-passphrase-incorrect+ -14)
+(defconstant +rpc-wallet-wrong-enc-state+ -15)
+(defconstant +rpc-wallet-encryption-failed+ -16)
 (defconstant +rpc-wallet-not-found+ -18)
 (defconstant +rpc-wallet-not-specified+ -19)
 (defconstant +rpc-wallet-already-loaded+ -35)
@@ -130,7 +134,13 @@ map, and the descriptor's private keys."
   (pubkey-map (make-hash-table :test 'equalp) :type hash-table)
   (max-cached-index -1 :type (signed-byte 32))
   ;; keyid (hash160 of pubkey) -> (priv32 . compressed-p) (Core m_map_keys)
-  (keys (make-hash-table :test 'equalp) :type hash-table))
+  (keys (make-hash-table :test 'equalp) :type hash-table)
+  ;; keyid -> (pubkey . ciphertext) once the wallet is encrypted (Core
+  ;; m_map_crypted_keys). The pubkey has to be stored alongside: it is both
+  ;; the IV source (sha256d of it) and the integrity check on decryption.
+  ;; An encrypted wallet has KEYS empty and CRYPTED-KEYS populated; the two
+  ;; are never both non-empty (wallet P6).
+  (crypted-keys (make-hash-table :test 'equalp) :type hash-table))
 
 (defstruct wallet
   "A loaded wallet (Core CWallet: P1 keystore + P2 chain tracking)."
@@ -164,7 +174,27 @@ map, and the descriptor's private keys."
   (loaded-locator '() :type list)    ; bestblock locator hashes read at load
   (scanning-since nil)               ; unix time a rescan started, or NIL (reserver)
   (scan-progress 0.0)
-  (abort-rescan nil))
+  (abort-rescan nil)
+  ;; --- Encryption (wallet P6) ---
+  ;; A wallet is encrypted iff it holds at least one master key; no wallet
+  ;; flag records it (Core HasEncryptionKeys = !mapMasterKeys.empty()).
+  (master-keys (make-hash-table :test 'eql) :type hash-table)  ; nID -> wallet-master-key
+  (master-key-max-id 0 :type (unsigned-byte 32))               ; Core nMasterKeyMaxID; first id is 1
+  ;; Core vMasterKey: the decrypted 32-byte keying material while unlocked,
+  ;; NIL while locked. Never persisted, never logged. Read it ONLY through
+  ;; WALLET-UNLOCKED-KEY, which applies the relock deadline.
+  (encryption-key nil)
+  (relock-time 0 :type integer)      ; Core nRelockTime: unix time, reported as unlocked_until
+  ;; The same deadline on the monotonic clock, which is what actually fires.
+  ;; Wall-clock firing would let a backward NTP step extend an unlock window.
+  (relock-deadline 0 :type integer)
+  ;; Core m_unlock_mutex: serializes walletpassphrase on one wallet so two
+  ;; concurrent unlocks cannot interleave their KDF and their timer arming.
+  (unlock-lock (bt:make-lock "wallet-unlock"))
+  ;; Core m_scanning_with_passphrase: set while a rescan holds an unlocked
+  ;; wallet across lock drops, which suspends the relock (and refuses the
+  ;; lock/passphrase-change RPCs) until it finishes.
+  (scanning-with-passphrase nil))
 
 (defmacro with-wallet-lock ((wallet) &body body)
   "Execute BODY holding WALLET's recursive cs_wallet-equivalent lock.
@@ -195,7 +225,11 @@ through it (Core WalletContext)."
   ;; holds node -> wallet locks can never invert against the
   ;; manager -> wallet order of load/unload/shutdown (wallet P4).
   (wallet-snapshot '() :type list)
-  (lock (bt:make-recursive-lock "wallet-manager")))
+  (lock (bt:make-recursive-lock "wallet-manager"))
+  ;; The passphrase-timeout sweeper (wallet P6), started on the first
+  ;; successful unlock and stopped by close-wallet-manager.
+  (relock-thread nil)
+  (relock-running nil))
 
 (defun %refresh-wallet-snapshot (manager)
   "Rebuild the lock-free wallet snapshot; caller holds the manager lock.
@@ -211,6 +245,51 @@ the list is dependency-ordered loads."
 
 (defun wallet-flag-set-p (wallet flag)
   (logtest (wallet-flags wallet) flag))
+
+;;; --- Encryption state (wallet P6; the crypto itself is wallet-crypt.lisp) ---
+
+(defun wallet-has-encryption-keys-p (wallet)
+  "Core HasEncryptionKeys: T when the wallet is encrypted. Presence of a
+master key is the ONLY marker — no wallet flag records encryption."
+  (plusp (hash-table-count (wallet-master-keys wallet))))
+
+(defun %wallet-clear-encryption-key (wallet)
+  "Drop the decrypted master key and disarm the relock. Zero the vector
+before releasing it so the secret does not linger in whatever heap block
+the GC hands out next."
+  (let ((key (wallet-encryption-key wallet)))
+    (when key (fill key 0)))
+  (setf (wallet-encryption-key wallet) nil
+        (wallet-relock-time wallet) 0
+        (wallet-relock-deadline wallet) 0)
+  t)
+
+(defun wallet-unlocked-key (wallet)
+  "The live 32-byte master key, or NIL when the wallet is locked (or not
+encrypted). THE single accessor of the key material: it enforces the relock
+deadline on every read, so no code path can use a key past its timeout even
+if the sweeper thread is gone.
+
+CALL UNDER THE WALLET LOCK. Despite reading like a predicate, this MUTATES
+— an expired deadline relocks inline, writing three slots — so it races the
+sweeper thread if called unsynchronized. WALLET-IS-LOCKED-P inherits the
+same requirement.
+
+A rescan holding the wallet unlocked across its own lock drops suspends the
+deadline — relocking mid-rescan would silently fail the keypool top-ups it
+depends on."
+  (let ((key (wallet-encryption-key wallet)))
+    (when key
+      (if (and (plusp (wallet-relock-deadline wallet))
+               (>= (get-internal-real-time) (wallet-relock-deadline wallet))
+               (not (wallet-scanning-with-passphrase wallet)))
+          (progn (%wallet-clear-encryption-key wallet) nil)
+          key))))
+
+(defun wallet-is-locked-p (wallet)
+  "Core IsLocked: an unencrypted wallet is never locked."
+  (and (wallet-has-encryption-keys-p wallet)
+       (null (wallet-unlocked-key wallet))))
 
 (defun wallet-manager-has-wallets-p (manager)
   "T when at least one wallet is loaded. Lock-free fast-path gate for the
@@ -238,31 +317,81 @@ Core's create-at-arbitrary-path form."
 
 ;;; --- SPKM key management ---
 
-(defun spkm-privkey-provider (spkm)
+(defun spkm-privkey-provider (wallet spkm)
   "keyid -> 32-byte secret lookup over the SPKM's key map (the SigningProvider
-Core threads into descriptor expansion)."
-  (let ((keys (desc-spkm-keys spkm)))
+Core threads into descriptor expansion).
+
+On an encrypted wallet the secret is decrypted per lookup from the master key
+and re-verified against its stored pubkey. A locked wallet therefore yields
+NIL for every keyid — never a default or garbage key, which is what Core's
+GetKeys does when it discards DecryptKey's return value
+(scriptpubkeyman.cpp:946-958)."
+  (let ((keys (desc-spkm-keys spkm))
+        (crypted (desc-spkm-crypted-keys spkm)))
     (lambda (keyid)
-      (car (gethash keyid keys)))))
+      (or (car (gethash keyid keys))
+          (let ((master (wallet-unlocked-key wallet))
+                (entry (gethash keyid crypted)))
+            (when (and master entry)
+              (decrypt-key master (car entry) (cdr entry))))))))
 
 (defun spkm-have-private-keys-p (spkm)
-  (plusp (hash-table-count (desc-spkm-keys spkm))))
+  "Core HavePrivateKeys. TRUE on a locked encrypted wallet — the keys exist,
+they are merely unreadable right now. Reporting NIL here would make
+SPKM-CAN-GET-ADDRESSES refuse to issue addresses from the cached keypool of
+a locked wallet, which Core allows."
+  (or (plusp (hash-table-count (desc-spkm-keys spkm)))
+      (plusp (hash-table-count (desc-spkm-crypted-keys spkm)))))
 
 (defun spkm-add-key (wallet spkm priv32 pubkey compressed-p &key batch)
-  "Add a descriptor private key and persist its walletdescriptorkey record
-(Core AddDescriptorKeyWithDB, scriptpubkeyman.cpp:1103-1133). No-op when the
-key is already present."
+  "Add a descriptor private key and persist its record (Core
+AddDescriptorKeyWithDB, scriptpubkeyman.cpp:1103-1133). No-op when the key is
+already present. Returns T, or NIL when an encrypted wallet cannot store the
+key (locked, or the encryption round-trip failed).
+
+On an encrypted wallet this writes walletdescriptorckey and never the
+plaintext walletdescriptorkey — the decision is per WALLET, not per SPKM, so
+a fresh SPKM created after encryption is born encrypted."
   (let ((keyid (bitcoin-lisp.crypto:hash160 pubkey)))
-    (unless (gethash keyid (desc-spkm-keys spkm))
-      (setf (gethash keyid (desc-spkm-keys spkm)) (cons priv32 compressed-p))
-      (let ((key (wdb-key-descriptor-key +wdb-key-walletdescriptorkey+
-                                         (desc-spkm-id spkm) pubkey))
-            (value (wdb-descriptor-key-value
-                    pubkey (privkey-to-der priv32 compressed-p))))
-        (if batch
-            (bitcoin-lisp.storage:leveldb-writebatch-put batch key value)
-            (bitcoin-lisp.storage:leveldb-put (wallet-db wallet) key value
-                                              :sync t)))))
+    (when (or (gethash keyid (desc-spkm-keys spkm))
+              (gethash keyid (desc-spkm-crypted-keys spkm)))
+      (return-from spkm-add-key t))
+    (cond
+      ((wallet-has-encryption-keys-p wallet)
+       (let ((master (wallet-unlocked-key wallet)))
+         (unless master
+           (return-from spkm-add-key nil))
+         (let ((ciphertext (encrypt-secret master priv32 pubkey)))
+           ;; Prove the key can be read back before it becomes the only
+           ;; copy: an unverified write here silently destroys funds.
+           (unless (equalp priv32 (decrypt-key master pubkey ciphertext))
+             (return-from spkm-add-key nil))
+           (let ((ckey (wdb-key-descriptor-key +wdb-key-walletdescriptorckey+
+                                               (desc-spkm-id spkm) pubkey))
+                 (plain-key (wdb-key-descriptor-key +wdb-key-walletdescriptorkey+
+                                                    (desc-spkm-id spkm) pubkey))
+                 (value (wdb-vector-value ciphertext)))
+             (if batch
+                 (progn
+                   (bitcoin-lisp.storage:leveldb-writebatch-put batch ckey value)
+                   (bitcoin-lisp.storage:leveldb-writebatch-delete batch plain-key))
+                 (bitcoin-lisp.storage:with-leveldb-writebatch (own)
+                   (bitcoin-lisp.storage:leveldb-writebatch-put own ckey value)
+                   (bitcoin-lisp.storage:leveldb-writebatch-delete own plain-key)
+                   (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) own
+                                                       :sync t))))
+           (setf (gethash keyid (desc-spkm-crypted-keys spkm))
+                 (cons pubkey ciphertext)))))
+      (t
+       (setf (gethash keyid (desc-spkm-keys spkm)) (cons priv32 compressed-p))
+       (let ((key (wdb-key-descriptor-key +wdb-key-walletdescriptorkey+
+                                          (desc-spkm-id spkm) pubkey))
+             (value (wdb-descriptor-key-value
+                     pubkey (privkey-to-der priv32 compressed-p))))
+         (if batch
+             (bitcoin-lisp.storage:leveldb-writebatch-put batch key value)
+             (bitcoin-lisp.storage:leveldb-put (wallet-db wallet) key value
+                                               :sync t))))))
   t)
 
 ;;; --- SPKM persistence helpers ---
@@ -334,7 +463,7 @@ pubkey map."
             (desc-spkm-range-end spkm) 1
             (desc-spkm-range-start spkm) 0))
     (let ((provider (and (spkm-have-private-keys-p spkm)
-                         (spkm-privkey-provider spkm))))
+                         (spkm-privkey-provider wallet spkm))))
       (loop for i from (1+ (desc-spkm-max-cached-index spkm)) below new-range-end
             do (multiple-value-bind (scripts pubkeys)
                    (out-desc-expand-from-cache (desc-spkm-desc spkm) i
@@ -346,6 +475,15 @@ pubkey map."
                            (out-desc-expand-with-provider
                             (desc-spkm-desc spkm) i provider temp-cache))
                        (descriptor-derivation-error ()
+                         ;; Core logs this too (scriptpubkeyman.cpp:1091):
+                         ;; both callers discard our NIL, so a genuine
+                         ;; failure would otherwise be invisible. The
+                         ;; ordinary cause is a locked encrypted wallet
+                         ;; whose descriptor needs a private key to expand.
+                         (bitcoin-lisp:log-warn
+                          "Topping up keypool for descriptor ~A failed at index ~D~@[ (wallet is locked)~]"
+                          (desc-spkm-desc-string spkm) i
+                          (wallet-is-locked-p wallet))
                          (return-from %spkm-top-up-into nil)))
                      ;; Merge and persist only the genuinely new cache items.
                      (%spkm-write-cache-diff
@@ -598,10 +736,24 @@ wallet.cpp:3594-3602)."
             ;; Store the master private key for this descriptor, then the
             ;; descriptor + keypool via TopUp (SetupDescriptorGeneration,
             ;; scriptpubkeyman.cpp:1136-1161).
-            (spkm-add-key wallet spkm master-priv master-pub t :batch batch)
+            (unless (spkm-add-key wallet spkm master-priv master-pub t
+                                  :batch batch)
+              (error "wallet setup: writing descriptor master private key failed for ~A"
+                     desc-str))
             (unless (spkm-top-up wallet spkm 0 batch)
               (error "wallet setup: keypool top-up failed for ~A" desc-str))
             (wallet-add-active-spkm wallet spkm type internal :batch batch))))
+      ;; A wallet that has just generated descriptors is no longer blank
+      ;; (Core SetupDescriptorGeneration -> UnsetBlankWalletFlag,
+      ;; scriptpubkeyman.cpp:1158). This matters for born-encrypted wallets,
+      ;; which are deliberately created blank so the seed can be derived
+      ;; after the master key exists.
+      (when (wallet-flag-set-p wallet +wallet-flag-blank-wallet+)
+        (setf (wallet-flags wallet)
+              (logandc2 (wallet-flags wallet) +wallet-flag-blank-wallet+))
+        (bitcoin-lisp.storage:leveldb-writebatch-put
+         batch (wdb-key-simple +wdb-key-flags+)
+         (wdb-uint64-value (wallet-flags wallet))))
       (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))
     (wallet-maybe-update-birth-time wallet now)))
 
@@ -644,11 +796,19 @@ away, in which case the load-time catch-up rescans from genesis (safe)."
 ;;; --- Wallet creation (Core CreateWallet, wallet.cpp:377-470 + CWallet::CreateNew) ---
 
 (defun create-wallet (manager name &key disable-private-keys blank avoid-reuse
+                                        passphrase
                                         last-block-hash (last-block-height 0))
   "Create, persist, and register a new descriptor wallet. Returns the wallet.
 Flags follow createwallet: DESCRIPTORS and LAST_HARDENED_XPUB_CACHED always
 set (wallet.cpp:3097-3099); the 8 default SPKMs are generated unless the
-wallet is blank or has private keys disabled."
+wallet is blank or has private keys disabled.
+
+With PASSPHRASE the wallet is born encrypted, following Core's ordering
+(wallet.cpp:394-456): create BLANK, encrypt, unlock, then generate the
+descriptors. Deriving the seed only after encryption is the whole point —
+a plaintext walletdescriptorkey record never reaches the disk at all, so
+there is nothing for a later compaction to have to scrub. The wallet is
+left LOCKED."
   (unless (%valid-wallet-name-p name)
     (error 'rpc-error :code +rpc-invalid-parameter+
                       :message (if (and (stringp name) (zerop (length name)))
@@ -661,10 +821,16 @@ wallet is blank or has private keys disabled."
         (error 'rpc-error :code +rpc-wallet-already-exists+
                           :message (format nil "Failed to create database path '~A'. Database already exists."
                                            (namestring path))))
-      (let* ((flags (logior +wallet-flag-descriptors+
+      (let* ((encrypt-p (and (stringp passphrase) (plusp (length passphrase))))
+             ;; A born-encrypted wallet is created blank so the seed can be
+             ;; generated after the master key exists; the caller's own
+             ;; BLANK request is remembered separately, because it decides
+             ;; whether we then generate descriptors at all.
+             (blank-flag (or blank encrypt-p))
+             (flags (logior +wallet-flag-descriptors+
                             +wallet-flag-last-hardened-xpub-cached+
                             (if disable-private-keys +wallet-flag-disable-private-keys+ 0)
-                            (if blank +wallet-flag-blank-wallet+ 0)
+                            (if blank-flag +wallet-flag-blank-wallet+ 0)
                             (if avoid-reuse +wallet-flag-avoid-reuse+ 0)))
              (db (wallet-db-open path :create t))
              (wallet (make-wallet :name name :path path :db db
@@ -680,9 +846,23 @@ wallet is blank or has private keys disabled."
                                                 (wdb-int32-value +wallet-client-version+))
               (bitcoin-lisp.storage:leveldb-put db (wdb-key-simple +wdb-key-flags+)
                                                 (wdb-uint64-value flags) :sync t)
-              (unless (or disable-private-keys blank)
+              (unless (or disable-private-keys blank-flag)
                 (wallet-setup-descriptor-spkms wallet (generate-wallet-master-key
                                                        (wallet-network wallet))))
+              (when encrypt-p
+                (unless (encrypt-wallet wallet passphrase)
+                  (error 'rpc-error :code +rpc-wallet-encryption-failed+
+                                    :message "Error: Wallet created but failed to encrypt."))
+                ;; Blank was only forced to defer the seed; when the caller
+                ;; did not ask for a blank wallet, derive it now, under the
+                ;; freshly minted master key.
+                (unless blank
+                  (unless (unlock-wallet wallet passphrase)
+                    (error 'rpc-error :code +rpc-wallet-encryption-failed+
+                                      :message "Error: Wallet was encrypted but could not be unlocked"))
+                  (wallet-setup-descriptor-spkms wallet (generate-wallet-master-key
+                                                         (wallet-network wallet)))
+                  (lock-wallet wallet)))
               (wallet-write-best-block wallet))
           (error (e)
             ;; Creation failed mid-way: close the DB so the directory is not
@@ -736,10 +916,19 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                                    :message "Wallet descriptor record id mismatch"))
                (setf (gethash (desc-spkm-id spkm) (wallet-spkms wallet)) spkm))))
           ((equal type +wdb-key-mkey+)
-           ;; Encrypted wallets need the P6 crypter; refuse rather than
-           ;; misbehave.
-           (error 'rpc-error :code +rpc-wallet-error+
-                             :message "Wallet is encrypted; encrypted wallets are not supported until wallet P6"))
+           (let ((id (wdb-parse-mkey-fields fields)))
+             (when (gethash id (wallet-master-keys wallet))
+               (error 'rpc-error :code +rpc-wallet-error+
+                                 :message (format nil "Error reading wallet database: duplicate CMasterKey id ~D" id)))
+             (multiple-value-bind (crypted salt method iterations other)
+                 (wdb-parse-mkey-value (cdr rec))
+               (setf (gethash id (wallet-master-keys wallet))
+                     (make-wallet-master-key :crypted-key crypted :salt salt
+                                             :derivation-method method
+                                             :derive-iterations iterations
+                                             :other-params other))
+               (setf (wallet-master-key-max-id wallet)
+                     (max (wallet-master-key-max-id wallet) id)))))
           ((equal type +wdb-key-orderposnext+)
            (setf (wallet-orderposnext wallet) (wdb-parse-int64-value (cdr rec))))
           ((equal type +wdb-key-bestblock-nomerkle+)
@@ -795,9 +984,23 @@ resolves stored confirmed/conflicted block heights (CWalletTx::updateState)."
                                   (desc-spkm-keys spkm))
                          (cons priv (= (length pubkey) 33)))))))
           ((equal type +wdb-key-walletdescriptorckey+)
-           ;; Encrypted descriptor keys arrive with wallet P6.
-           (error 'rpc-error :code +rpc-wallet-error+
-                             :message "Wallet is encrypted; encrypted wallets are not supported until wallet P6"))
+           ;; The mirror of the plaintext branch above. Nothing is
+           ;; decrypted here — there is no passphrase at load time — so
+           ;; corruption of the ciphertext surfaces at the first unlock,
+           ;; via CHECK-DECRYPTION-KEY.
+           (let* ((id (subseq fields 0 32))
+                  (pubkey (subseq fields 33))   ; skip compactsize byte
+                  (spkm (gethash id (wallet-spkms wallet))))
+             (cond
+               ((null spkm)
+                (push "Found a descriptor key for an unknown descriptor" warnings))
+               ((not (member (length pubkey) '(33 65)))
+                (error 'rpc-error :code +rpc-wallet-error+
+                                  :message "Error reading wallet database: descriptor encrypted key CPubKey corrupt"))
+               (t
+                (setf (gethash (bitcoin-lisp.crypto:hash160 pubkey)
+                               (desc-spkm-crypted-keys spkm))
+                      (cons pubkey (wdb-parse-vector-value (cdr rec))))))))
           ((equal type +wdb-key-walletdescriptorcache+)
            (let* ((id (subseq fields 0 32))
                   (cache (or (gethash id caches)
@@ -917,7 +1120,10 @@ shutdown path — which flags the scan to abort and proceeds."
     (with-wallet-lock (wallet)
       (wallet-write-best-block wallet)
       (bitcoin-lisp.storage:leveldb-close (wallet-db wallet))
-      (setf (wallet-db wallet) nil))
+      (setf (wallet-db wallet) nil)
+      ;; Every unload path funnels through here, so this is the one place
+      ;; that has to scrub the decrypted master key.
+      (%wallet-clear-encryption-key wallet))
     (remhash (wallet-name wallet) (wallet-manager-wallets manager))
     (setf (wallet-manager-wallet-order manager)
           (remove (wallet-name wallet) (wallet-manager-wallet-order manager)
@@ -1063,6 +1269,11 @@ chainstate is up."
 
 (defun close-wallet-manager (manager)
   "Unload every loaded wallet (shutdown path)."
+  ;; Stop the relock sweeper BEFORE the unload loop: it takes wallet locks,
+  ;; and a thread still sweeping while wallets are being closed would race
+  ;; the DB handles. Stopping it first also keeps shutdown from waiting on a
+  ;; thread that is blocked on a lock the unload loop holds.
+  (stop-relock-sweeper manager)
   (bt:with-recursive-lock-held ((wallet-manager-lock manager))
     (dolist (name (copy-list (wallet-manager-wallet-order manager)))
       (let ((wallet (gethash name (wallet-manager-wallets manager))))
@@ -1107,6 +1318,20 @@ sole loaded wallet; errors match Core's."
                                    :message "No wallet is loaded. Load a wallet using loadwallet or create a new one with createwallet. (Note: A default wallet is no longer automatically created)"))
               (t (error 'rpc-error :code +rpc-wallet-not-specified+
                                    :message "Multiple wallets are loaded. Please select which wallet to use by requesting the RPC through the /wallet/<walletname> URI path."))))))))
+
+(defun wallet-ensure-unlocked (wallet)
+  "Signal RPC_WALLET_UNLOCK_NEEDED when WALLET is encrypted and locked
+(Core EnsureWalletIsUnlocked, wallet/rpc/util.cpp:88-93).
+
+A PREDICATE over an already-resolved wallet: it acquires no lock. Call it
+from inside an existing WITH-WALLET-LOCK body — a resolve-and-lock variant
+would take the wallet lock outside the node lock, inverting the
+node -> manager -> wallet order documented on WITH-WALLET-LOCK. Checking
+inside the caller's hold also closes the check-then-use race Core has: the
+relock cannot land between this test and the signing that follows it."
+  (when (wallet-is-locked-p wallet)
+    (error 'rpc-error :code +rpc-wallet-unlock-needed+
+                      :message "Error: Please enter the wallet passphrase with walletpassphrase first.")))
 
 (defun %wallet-current-tip (node)
   "(values hash height) of the active chainstate tip, under the node-lock.
@@ -1156,8 +1381,8 @@ back to wall-clock time when there is no tip."
 (defun rpc-createwallet (node params)
   "Create and load a new wallet (Bitcoin Core createwallet). PARAMS:
  (wallet_name disable_private_keys blank passphrase avoid_reuse descriptors
-  load_on_startup external_signer). Only descriptor wallets can be created;
-passphrases are rejected until encryption lands (wallet P6)."
+  load_on_startup external_signer). Only descriptor wallets can be created.
+A non-empty PASSPHRASE creates the wallet already encrypted and locked."
   (let ((manager (node-wallet-manager-checked node))
         (name (first params))
         (warnings '()))
@@ -1174,12 +1399,16 @@ passphrases are rejected until encryption lands (wallet P6)."
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "Compiled without external signing support (required for external signing)"))
     (let ((passphrase (nth 3 params)))
-      (cond ((and (stringp passphrase) (plusp (length passphrase)))
-             (error 'rpc-error :code +rpc-wallet-error+
-                               :message "Wallet encryption is not yet supported (planned for wallet P6); create the wallet without a passphrase."))
-            ((and (stringp passphrase) (zerop (length passphrase)))
-             (push "Empty string given as passphrase, wallet will not be encrypted."
-                   warnings))))
+      (when (and passphrase (not (stringp passphrase)))
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "passphrase must be a string"))
+      (when (and (stringp passphrase) (zerop (length passphrase)))
+        (push "Empty string given as passphrase, wallet will not be encrypted."
+              warnings))
+      (when (and (stringp passphrase) (plusp (length passphrase))
+                 (%positional-bool (nth 1 params)))
+        (error 'rpc-error :code +rpc-wallet-error+
+                          :message "Passphrase provided but private keys are disabled. A passphrase is only used to encrypt private keys, so cannot be used for wallets with private keys disabled.")))
     (multiple-value-bind (tip-hash tip-height) (%wallet-current-tip node)
       (let ((wallet (create-wallet manager name
                                    :disable-private-keys (%positional-bool
@@ -1187,6 +1416,10 @@ passphrases are rejected until encryption lands (wallet P6)."
                                    :blank (%positional-bool (nth 2 params))
                                    :avoid-reuse (%positional-bool
                                                  (nth 4 params))
+                                   :passphrase (let ((p (nth 3 params)))
+                                                 (when (and (stringp p)
+                                                            (plusp (length p)))
+                                                   p))
                                    :last-block-hash tip-hash
                                    :last-block-height tip-height))
             (action (%load-on-startup-action (nth 6 params))))
@@ -1355,6 +1588,14 @@ backend (leveldb, where Core says sqlite)."
           ("txcount" . ,(hash-table-count (wallet-map-wallet wallet)))
           ("keypoolsize" . ,external-count)
           ("keypoolsize_hd_internal" . ,(- total-count external-count))
+          ;; Only encrypted wallets carry the field at all (Core
+          ;; rpc/wallet.cpp:93-98): absent = never encrypted, 0 = locked,
+          ;; otherwise the unix time the relock is scheduled for. Reading it
+          ;; after WALLET-IS-LOCKED-P above means an elapsed deadline has
+          ;; already been folded down to 0.
+          ,@(when (wallet-has-encryption-keys-p wallet)
+              `(("unlocked_until" . ,(progn (wallet-unlocked-key wallet)
+                                            (wallet-relock-time wallet)))))
           ;; Core booleans are true/false, never null (wave-10 cleanup);
           ;; "scanning" is Core's false-or-progress-object — the progress
           ;; object during a rescan, false otherwise.
@@ -1438,7 +1679,7 @@ getrawchangeaddress). PARAMS: (address_type)."
   "The listdescriptors string for SPKM: the private form (master keys, never
 derived children) or the normalized public form, checksummed
 (Core GetDescriptorString, scriptpubkeyman.cpp:1523)."
-  (let ((provider (spkm-privkey-provider spkm)))
+  (let ((provider (spkm-privkey-provider wallet spkm)))
     (multiple-value-bind (body ok)
         (if private
             (out-desc-string-private (desc-spkm-desc spkm)
@@ -1470,6 +1711,10 @@ PARAMS: (private)."
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "Can't get private descriptor string for watch-only wallets"))
     (with-wallet-lock (wallet)
+      ;; Without this a locked wallet would silently emit the PUBLIC
+      ;; descriptor strings under private=true — a wrong answer, not an
+      ;; error, because the provider simply yields no keys.
+      (when private (wallet-ensure-unlocked wallet))
       (let ((entries '()))
         (loop for spkm being the hash-values of (wallet-spkms wallet)
               do (multiple-value-bind (active internal)
@@ -1521,7 +1766,23 @@ PARAMS: (private)."
                               next-index keys label internal)
   "Store (or update) a descriptor as an SPKM: register, add keys, TopUp,
 write address-book entries for non-ranged external descriptors, persist
-(Core CWallet::AddWalletDescriptor, wallet.cpp:3756-3813). Returns the SPKM."
+(Core CWallet::AddWalletDescriptor, wallet.cpp:3756-3813). Returns the SPKM.
+
+DESC is re-parsed from its canonical PUBLIC string before it is stored, so
+the SPKM never holds private key material. KEYS already carries whatever
+private keys the descriptor arrived with, and they belong in the keystore
+(encrypted, when the wallet is encrypted) — not in the descriptor object.
+
+This is what makes locking real for imported descriptors: our parsed
+descriptors retain an embedded xprv, and %desc-key-root-xprv prefers it over
+the SigningProvider (descriptors.lisp:868), so an SPKM built straight from
+`wpkh(tprv.../0h/*)` could keep signing while the wallet was locked — until
+the next reload, which rebuilds it from the public string and behaves
+differently. Core never has this problem: its descriptor objects hold only
+pubkey providers. Now in-session state matches post-reload state."
+  (setf desc (parse-descriptor (descriptor-add-checksum (out-desc-string desc))
+                               (wallet-network wallet)
+                               :require-checksum t))
   (let* ((id (descriptor-id desc))
          (existing (gethash id (wallet-spkms wallet)))
          (spkm existing))
@@ -1553,7 +1814,9 @@ write address-book entries for non-ranged external descriptors, persist
               (gethash id (wallet-spkms wallet)) spkm))
     (dolist (key keys)
       (destructuring-bind (pubkey priv compressed) key
-        (spkm-add-key wallet spkm priv pubkey compressed)))
+        (unless (spkm-add-key wallet spkm priv pubkey compressed)
+          (error 'rpc-error :code +rpc-wallet-error+
+                            :message "Error: writing descriptor private key failed"))))
     (unless (spkm-top-up wallet spkm)
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "Could not top up scriptPubKeys"))
@@ -1704,9 +1967,19 @@ rescan-failed error."
     (unless (and (listp requests) requests)
       (error 'rpc-error :code +rpc-type-error+
                         :message "requests must be a non-empty array"))
+    (with-wallet-lock (wallet)
+      (wallet-ensure-unlocked wallet))
     (unless (wallet-reserve-rescan wallet)
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "Wallet is currently rescanning. Abort existing rescan or wait."))
+    ;; The import holds the wallet unlocked across the rescan's own lock
+    ;; drops, so suspend the relock for its duration (Core
+    ;; m_scanning_with_passphrase) — otherwise a timeout landing mid-scan
+    ;; turns into a silent keypool top-up failure. Under the wallet lock:
+    ;; wallet-is-locked-p can relock as a side effect, so it is a mutator.
+    (with-wallet-lock (wallet)
+      (setf (wallet-scanning-with-passphrase wallet)
+            (not (wallet-is-locked-p wallet))))
     (unwind-protect
         ;; Tip time + MTP read under the node-lock BEFORE the wallet lock
         ;; (lock order): `now` = tip MTP, and the lowest-timestamp
@@ -1766,4 +2039,5 @@ rescan-failed error."
                                                   timestamp
                                                   (- scanned-time +wallet-timestamp-window+ 1)
                                                   +wallet-timestamp-window+))))))))))))
+      (setf (wallet-scanning-with-passphrase wallet) nil)
       (wallet-release-rescan wallet))))

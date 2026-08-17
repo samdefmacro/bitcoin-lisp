@@ -18,6 +18,15 @@
    #:+tag-tap-branch+
    #:+tag-tap-tweak+
    #:+tag-tap-sighash+
+   ;; Wallet crypter (wallet P6): SHA-512 passphrase KDF + AES-256-CBC.
+   ;; PKCS7-PAD/PKCS7-UNPAD stay internal -- they are only meaningful as
+   ;; part of the two AES entry points below.
+   #:crypter-derive-key
+   #:aes-256-cbc-encrypt
+   #:aes-256-cbc-decrypt
+   #:+wallet-crypto-key-size+
+   #:+wallet-crypto-salt-size+
+   #:+wallet-crypto-iv-size+
    ;; SipHash (BIP 152)
    #:siphash-2-4
    #:compute-siphash-key
@@ -569,6 +578,7 @@
    #:with-leveldb-writebatch
    #:with-leveldb-iterator
    #:leveldb-iter-valid-p
+   #:leveldb-iter-check-error
    #:leveldb-iter-seek-to-first
    #:leveldb-iter-seek
    #:leveldb-iter-next

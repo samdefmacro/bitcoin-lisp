@@ -39,6 +39,7 @@
                                (:file "interop")))
                  (:module "crypto"
                   :components ((:file "hash")
+                               (:file "crypter")
                                (:file "chacha20")
                                (:file "muhash")
                                (:file "secp256k1")
@@ -98,6 +99,7 @@
                                (:file "methods")
                                (:file "wallet-store")
                                (:file "wallet")
+                               (:file "wallet-crypt")
                                (:file "wallet-tx")
                                (:file "wallet-coins")
                                (:file "wallet-spend")
@@ -248,6 +250,9 @@
                              ;; Wallet P4: coin selection, spending RPCs,
                              ;; wallet signing, rebroadcast
                              (:file "wallet-spend-tests")
+                             ;; Wallet P6: crypter KATs, encryption lifecycle,
+                             ;; locked-wallet gating, relock timer, backup
+                             (:file "wallet-encryption-tests")
                              ;; Process RNG seeding (*random-state* must not
                              ;; replay SBCL's build-time stream on every start)
                              (:file "entropy-tests")

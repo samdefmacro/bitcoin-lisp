@@ -2013,9 +2013,19 @@ rescanblockchain). PARAMS: (start_height stop_height)."
     (when (and stop-height (not (integerp stop-height)))
       (error 'rpc-error :code +rpc-type-error+
                         :message "stop_height must be an integer"))
+    (with-wallet-lock (wallet)
+      (wallet-ensure-unlocked wallet))
     (unless (wallet-reserve-rescan wallet)
       (error 'rpc-error :code +rpc-wallet-error+
                         :message "Wallet is currently rescanning. Abort existing rescan or wait."))
+    ;; The scan drops and retakes the wallet lock between segments, so
+    ;; suspend the relock for its duration (Core m_scanning_with_passphrase):
+    ;; a timeout landing mid-scan would silently break its keypool top-ups.
+    ;; Under the wallet lock: wallet-is-locked-p can relock as a side effect
+    ;; (the lazy deadline check writes three slots), so it is a mutator.
+    (with-wallet-lock (wallet)
+      (setf (wallet-scanning-with-passphrase wallet)
+            (not (wallet-is-locked-p wallet))))
     (unwind-protect
          (let (start-hash)
            (with-node-lock (node)
@@ -2059,6 +2069,7 @@ rescanblockchain). PARAMS: (start_height stop_height)."
                (:user-abort
                 (error 'rpc-error :code +rpc-misc-error+
                                   :message "Rescan aborted.")))))
+      (setf (wallet-scanning-with-passphrase wallet) nil)
       (wallet-release-rescan wallet))))
 
 (defun rpc-abortrescan (node params)

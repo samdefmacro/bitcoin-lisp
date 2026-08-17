@@ -224,7 +224,14 @@
   (register-rpc-method "walletprocesspsbt" #'rpc-walletprocesspsbt)
   (register-rpc-method "walletcreatefundedpsbt" #'rpc-walletcreatefundedpsbt)
   (register-rpc-method "bumpfee" #'rpc-bumpfee)
-  (register-rpc-method "psbtbumpfee" #'rpc-psbtbumpfee))
+  (register-rpc-method "psbtbumpfee" #'rpc-psbtbumpfee)
+  ;; Wallet encryption + backup (wallet P6)
+  (register-rpc-method "encryptwallet" #'rpc-encryptwallet)
+  (register-rpc-method "walletpassphrase" #'rpc-walletpassphrase)
+  (register-rpc-method "walletpassphrasechange" #'rpc-walletpassphrasechange)
+  (register-rpc-method "walletlock" #'rpc-walletlock)
+  (register-rpc-method "backupwallet" #'rpc-backupwallet)
+  (register-rpc-method "restorewallet" #'rpc-restorewallet))
 
 ;;; --- JSON-RPC Request/Response Handling ---
 
