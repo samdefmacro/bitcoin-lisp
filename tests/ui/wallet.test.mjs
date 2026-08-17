@@ -284,6 +284,8 @@ async function confirmClick(btn) {
   await btn.dispatch('click');
 }
 
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
 function byAria(container, label) {
   return container.find((n) => n.getAttribute('aria-label') === label);
 }
@@ -1282,7 +1284,7 @@ test('send on a LOCKED wallet: prompts, signs, then relocks', async () => {
   // Kick off the confirm; it parks on the unlock prompt rather than sending.
   const confirm = buttonByText(sendCard, 'confirm and send');
   const sending = confirm.dispatch('click');
-  await new Promise((r) => setTimeout(r, 0));
+  await tick();
   assert.ok(!rpcLog.some((c) => c.method === 'sendtoaddress'),
     'must not sign while the wallet is locked');
   const unlockForm = byAria(container, 'Unlock wallet');
@@ -1338,7 +1340,7 @@ test('unlock prompt returns you to the tab you came from', async () => {
   const sendCard = byAria(container, 'Send');
   await sendCard.find((n) => n.tagName === 'FORM').dispatch('submit');
   const sending = buttonByText(sendCard, 'confirm and send').dispatch('click');
-  await new Promise((r) => setTimeout(r, 0));
+  await tick();
   // parked on Security while the prompt is up
   assert.equal(byAria(container, 'Security').hidden, false);
   byAria(container, 'Passphrase').value = 'hunter2';
@@ -1364,7 +1366,7 @@ test('cancelling the unlock prompt aborts the send and says so', async () => {
   await sendCard.find((n) => n.tagName === 'FORM').dispatch('submit');
   rpcLog.length = 0;
   const sending = buttonByText(sendCard, 'confirm and send').dispatch('click');
-  await new Promise((r) => setTimeout(r, 0));
+  await tick();
   // dismiss the prompt
   await buttonByText(byAria(container, 'Security'), 'cancel').dispatch('click');
   await sending;
@@ -1375,4 +1377,518 @@ test('cancelling the unlock prompt aborts the send and says so', async () => {
   // back on Send, with the cancellation explained rather than a raw -13
   assert.equal(byAria(container, 'Send').hidden, false);
   assert.match(byAria(container, 'Send').textContent, /Cancelled — the wallet is locked/);
+});
+
+// --- PSBT panel + fee bump (gui-plan P6c) ---------------------------------
+//
+// Ported from Core's psbtoperationsdialog; the pure half asserts the status
+// state machine and the button rules verbatim, the wired half asserts the
+// exact RPCs and that signing goes through the same unlock gate as any other
+// signing path.
+
+const psbtlib = await import('../../ui/js/wallet-psbt.js');
+
+const PSBT_B64 = 'cHNidP8BAHUCAAAAASaBcTce3/KF6Tet7qSze3gADAVmy7OtZGQXE8pCFxv2AAAAAAD+////';
+const PSBT_SIGNED = `${PSBT_B64}AQ==`;
+const PSBT_IN_ADDR = 'tb1qalpha';
+const PSBT_OUT_ADDR = 'tb1qelsewhere';   // in ADDRINFO, ismine:false
+
+const DECODED = {
+  tx: {
+    vin: [{ txid: 'ab'.repeat(32), vout: 0 }],
+    vout: [
+      { value: 0.4, scriptPubKey: { address: PSBT_OUT_ADDR, hex: '0014751e' } },
+      { value: 0.0999, scriptPubKey: { address: 'tb1qalpha', hex: '0014aaaa' } },
+    ],
+  },
+  inputs: [{ witness_utxo: { amount: 0.5, scriptPubKey: { address: PSBT_IN_ADDR } } }],
+  outputs: [{}, {}],
+};
+
+const ANALYSIS_NEEDS_SIG = {
+  inputs: [{ has_utxo: true, is_final: false, next: 'signer' }],
+  fee: 0.0001,
+  next: 'signer',
+};
+const ANALYSIS_COMPLETE = {
+  inputs: [{ has_utxo: true, is_final: true, next: 'finalizer' }],
+  fee: 0.0001,
+  next: 'finalizer',
+};
+
+async function psbtTab(analysis, { walletinfo = ENC_INFO(undefined), complete } = {}) {
+  fixtures.listwallets = () => ['cold', 'hot'];
+  fixtures.getwalletinfo = () => walletinfo;
+  fixtures.decodepsbt = () => DECODED;
+  fixtures.analyzepsbt = () => analysis;
+  // Core fills the PSBT before analysing it; the fill is a no-op here.
+  fixtures.walletprocesspsbt = (params) => ({ psbt: params[0], complete: false });
+  // Completeness is probed with finalizepsbt, not inferred from the role.
+  fixtures.finalizepsbt = () => ({
+    complete: complete ?? (analysis === ANALYSIS_COMPLETE),
+  });
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  await wallet.show(container, 'psbt');
+  await wallet.refresh();
+  byAria(container, 'Base64 PSBT').value = PSBT_B64;
+  await byAria(container, 'PSBT').find((n) => n.tagName === 'FORM').dispatch('submit');
+  return byAria(container, 'PSBT');
+}
+
+test('psbtStatus: Core\'s state machine, including the signer sub-cases', () => {
+  const ok = { hasWallet: true, privateKeysDisabled: false, couldSign: 1 };
+  // psbtoperationsdialog.cpp:262-296, verbatim strings.
+  assert.deepEqual(psbtlib.psbtStatus({ next: 'updater' }, ok),
+    { text: 'Transaction is missing some information about inputs.', level: 'warn' });
+  assert.deepEqual(psbtlib.psbtStatus({ next: 'finalizer' }, ok),
+    { text: 'Transaction is fully signed and ready for broadcast.', level: 'info' });
+  assert.deepEqual(psbtlib.psbtStatus({ next: 'extractor' }, ok),
+    { text: 'Transaction is fully signed and ready for broadcast.', level: 'info' });
+  assert.deepEqual(psbtlib.psbtStatus({ next: 'creator' }, ok),
+    { text: 'Transaction status is unknown.', level: 'err' });
+
+  // the signer sub-cases are the useful part: "needs signatures" reads very
+  // differently once you know THIS wallet can never supply them
+  assert.deepEqual(psbtlib.psbtStatus({ next: 'signer' }, ok),
+    { text: 'Transaction still needs signature(s).', level: 'info' });
+  assert.match(psbtlib.psbtStatus({ next: 'signer' },
+    { ...ok, hasWallet: false }).text, /But no wallet is loaded/);
+  assert.match(psbtlib.psbtStatus({ next: 'signer' },
+    { ...ok, privateKeysDisabled: true }).text, /cannot sign transactions/);
+  assert.match(psbtlib.psbtStatus({ next: 'signer' },
+    { ...ok, couldSign: 0 }).text, /does not have the right keys/);
+  // all three degrade INFO -> WARN
+  for (const over of [{ hasWallet: false }, { privateKeysDisabled: true }, { couldSign: 0 }]) {
+    assert.equal(psbtlib.psbtStatus({ next: 'signer' }, { ...ok, ...over }).level, 'warn');
+  }
+});
+
+test('signEnabled/broadcastEnabled: Core\'s exact conditions', () => {
+  const base = { complete: false, hasWallet: true, privateKeysDisabled: false, couldSign: 1 };
+  assert.equal(psbtlib.signEnabled(base), true);
+  // psbtoperationsdialog.cpp:69 — every conjunct matters
+  assert.equal(psbtlib.signEnabled({ ...base, complete: true }), false);
+  assert.equal(psbtlib.signEnabled({ ...base, privateKeysDisabled: true }), false);
+  assert.equal(psbtlib.signEnabled({ ...base, couldSign: 0 }), false);
+  assert.equal(psbtlib.signEnabled({ ...base, hasWallet: false }), false);
+  // :74 — broadcast is gated on completeness alone, so a watch-only wallet
+  // can still broadcast a PSBT someone else finished
+  assert.equal(psbtlib.broadcastEnabled(true), true);
+  assert.equal(psbtlib.broadcastEnabled(false), false);
+  assert.equal(psbtlib.psbtComplete({ next: 'finalizer' }), true);
+  assert.equal(psbtlib.psbtComplete({ next: 'extractor' }), true);
+  assert.equal(psbtlib.psbtComplete({ next: 'signer' }), false);
+});
+
+test('feeLine: a missing fee is "unable to calculate", not zero', () => {
+  // analyzepsbt omits `fee` when an input amount is unknown — Core prints a
+  // sentence there rather than showing a fee of 0, which would be a lie.
+  assert.match(psbtlib.feeLine({ next: 'signer' }),
+    /Unable to calculate transaction fee/);
+  assert.match(psbtlib.feeLine({ fee: 0.0001 }), /Pays transaction fee/);
+  // an explicit zero fee is a real value and must render as one
+  assert.match(psbtlib.feeLine({ fee: 0 }), /Pays transaction fee/);
+  assert.equal(psbtlib.psbtFee({ next: 'signer' }), null);
+  assert.equal(psbtlib.psbtFee({ fee: 0 }), 0);
+});
+
+test('psbtOutputs / psbtInputAddresses / unsignedInputCount', () => {
+  const outs = psbtlib.psbtOutputs(DECODED, { [PSBT_OUT_ADDR]: false, tb1qalpha: true });
+  assert.equal(outs.length, 2);
+  assert.equal(outs[0].address, PSBT_OUT_ADDR);
+  assert.equal(outs[0].mine, false);
+  assert.equal(outs[1].mine, true);         // change back to us
+  // witness_utxo path
+  assert.deepEqual(psbtlib.psbtInputAddresses(DECODED), [PSBT_IN_ADDR]);
+  // non_witness_utxo path resolves through the spent vout index
+  assert.deepEqual(psbtlib.psbtInputAddresses({
+    tx: { vin: [{ vout: 1 }] },
+    inputs: [{ non_witness_utxo: { vout: [
+      { scriptPubKey: { address: 'wrong' } },
+      { scriptPubKey: { address: 'right' } }] } }],
+  }), ['right']);
+  // an input we cannot resolve is null, never guessed
+  assert.deepEqual(psbtlib.psbtInputAddresses({ tx: { vin: [{}] }, inputs: [{}] }), [null]);
+  assert.equal(psbtlib.unsignedInputCount(ANALYSIS_NEEDS_SIG), 1);
+  assert.equal(psbtlib.unsignedInputCount(ANALYSIS_COMPLETE), 0);
+});
+
+test('normalizePsbt: catches a paste that is not a PSBT before a round trip', () => {
+  assert.deepEqual(psbtlib.normalizePsbt(`  ${PSBT_B64}\n`), { psbt: PSBT_B64 });
+  assert.match(psbtlib.normalizePsbt('').error, /Paste a base64 PSBT/);
+  // a raw hex transaction is the classic wrong paste
+  assert.match(psbtlib.normalizePsbt('0200000001ab').error, /should start with "cHNidP"/);
+});
+
+test('bumpEligible: only our unconfirmed, replaceable, unabandoned sends', () => {
+  const ok = {
+    confirmations: 0,
+    'bip125-replaceable': 'yes',
+    details: [{ category: 'send', abandoned: false }],
+  };
+  assert.equal(psbtlib.bumpEligible(ok), true);
+  assert.equal(psbtlib.bumpEligible({ ...ok, confirmations: 1 }), false);
+  assert.equal(psbtlib.bumpEligible({ ...ok, 'bip125-replaceable': 'no' }), false);
+  // "unknown" means the node could not decide — we must not offer it
+  assert.equal(psbtlib.bumpEligible({ ...ok, 'bip125-replaceable': 'unknown' }), false);
+  assert.equal(psbtlib.bumpEligible(
+    { ...ok, details: [{ category: 'receive' }] }), false);
+  assert.equal(psbtlib.bumpEligible(
+    { ...ok, details: [{ category: 'send', abandoned: true }] }), false);
+  // a watch-only wallet cannot sign the replacement, so it takes the PSBT path
+  assert.equal(psbtlib.bumpMethod(false), 'bumpfee');
+  assert.equal(psbtlib.bumpMethod(true), 'psbtbumpfee');
+  assert.deepEqual(psbtlib.bumpParams('ab'), ['ab']);
+  assert.deepEqual(psbtlib.bumpParams('ab', '12'), ['ab', { fee_rate: 12 }]);
+});
+
+test('PSBT tab: loads, decodes+analyzes on the wallet endpoint, renders Core\'s lines', async () => {
+  rpcLog.length = 0;
+  const card = await psbtTab(ANALYSIS_NEEDS_SIG);
+  // Core's openWithPSBT fills first (fillPSBT sign=false), then analyses.
+  const fill = rpcLog.find((c) => c.method === 'walletprocesspsbt');
+  assert.equal(fill.params[1], false, 'the pre-analysis fill must not sign');
+  for (const m of ['decodepsbt', 'analyzepsbt', 'finalizepsbt']) {
+    assert.equal(rpcLog.find((c) => c.method === m).url, '/wallet/cold',
+      `${m} must ride the wallet endpoint`);
+  }
+  assert.deepEqual(rpcLog.find((c) => c.method === 'decodepsbt').params, [PSBT_B64]);
+  assert.match(card.textContent, /Transaction still needs signature\(s\)\./);
+  assert.match(card.textContent, /Sends/);
+  assert.match(card.textContent, /Pays transaction fee/);
+  assert.match(card.textContent, /1 unsigned input\./);
+  // change back to us is flagged, the recipient is not
+  assert.match(card.textContent, /own address/);
+  // signable => Sign offered, not yet complete => no broadcast
+  assert.ok(buttonByText(card, 'sign'));
+  assert.equal(buttonByText(card, 'broadcast'), null);
+});
+
+test('PSBT tab: a bad paste never reaches the node', async () => {
+  fixtures.listwallets = () => ['cold', 'hot'];
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  await wallet.show(container, 'psbt');
+  await wallet.refresh();
+  byAria(container, 'Base64 PSBT').value = '0200000001deadbeef';
+  rpcLog.length = 0;
+  await byAria(container, 'PSBT').find((n) => n.tagName === 'FORM').dispatch('submit');
+  assert.ok(!rpcLog.some((c) => c.method === 'decodepsbt'));
+  assert.match(byAria(container, 'PSBT').textContent, /should start with "cHNidP"/);
+});
+
+test('PSBT tab: watch-only cannot sign, but can still broadcast a complete PSBT', async () => {
+  // private keys disabled + already complete
+  const card = await psbtTab(ANALYSIS_COMPLETE,
+    { walletinfo: { ...WALLETINFO, private_keys_enabled: false } });
+  assert.equal(buttonByText(card, 'sign'), null);
+  assert.ok(buttonByText(card, 'broadcast'));
+  assert.match(card.textContent, /fully signed and ready for broadcast/);
+});
+
+test('PSBT sign: goes through the unlock gate, then reloads the result', async () => {
+  let locked = true;
+  const card = await psbtTab(ANALYSIS_NEEDS_SIG, { walletinfo: ENC_INFO(0) });
+  fixtures.getwalletinfo = () => ENC_INFO(locked ? 0 : Math.floor(Date.now() / 1000) + 300);
+  fixtures.walletpassphrase = () => { locked = false; return null; };
+  fixtures.walletlock = () => { locked = true; return null; };
+  fixtures.walletprocesspsbt = (params) => (params[1]
+    ? { psbt: PSBT_SIGNED, complete: true }      // the real signing call
+    : { psbt: params[0], complete: false });     // the pre-analysis fill
+  fixtures.analyzepsbt = () => ANALYSIS_COMPLETE;
+  fixtures.finalizepsbt = () => ({ complete: true });
+  rpcLog.length = 0;
+
+  const signing = buttonByText(card, 'sign').dispatch('click');
+  await tick();
+  assert.ok(!rpcLog.some((c) => c.method === 'walletprocesspsbt'),
+    'must not sign while the wallet is locked');
+  byAria(container, 'Passphrase').value = 'hunter2';
+  await byAria(container, 'Unlock wallet').dispatch('submit');
+  await signing;
+
+  const order = rpcLog.filter((c) =>
+    c.method === 'walletpassphrase' || c.method === 'walletlock'
+      || (c.method === 'walletprocesspsbt' && c.params[1] === true))
+    .map((c) => c.method);
+  assert.deepEqual(order, ['walletpassphrase', 'walletprocesspsbt', 'walletlock'],
+    'unlock -> sign -> relock, like every other signing path');
+  assert.deepEqual(
+    rpcLog.find((c) => c.method === 'walletprocesspsbt' && c.params[1] === true).params,
+    [PSBT_B64, true]);
+  // the signed PSBT replaced the input and was re-analyzed
+  assert.equal(byAria(container, 'Base64 PSBT').value, PSBT_SIGNED);
+  assert.match(byAria(container, 'PSBT').textContent, /now complete/);
+});
+
+test('PSBT broadcast: finalize then sendrawtransaction, armed', async () => {
+  const card = await psbtTab(ANALYSIS_COMPLETE);
+  const txid = '9f'.repeat(32);
+  fixtures.finalizepsbt = (params) => (params[1]
+    ? { complete: true, hex: '0200dead' }   // extract=true: the broadcast path
+    : { complete: true });                  // extract=false: the load probe
+  fixtures.sendrawtransaction = () => txid;
+  rpcLog.length = 0;
+  const btn = buttonByText(card, 'broadcast');
+  await btn.dispatch('click');                 // arms only
+  assert.ok(!rpcLog.some((c) => c.method === 'sendrawtransaction'));
+  await btn.dispatch('click');                 // acts
+  assert.deepEqual(
+    rpcLog.find((c) => c.method === 'finalizepsbt' && c.params[1] === true).params,
+    [PSBT_B64, true]);
+  // sendrawtransaction is a NODE method: base endpoint
+  assert.equal(rpcLog.find((c) => c.method === 'sendrawtransaction').url, '/');
+  assert.match(byAria(container, 'PSBT').textContent, /Transaction broadcast/);
+});
+
+test('PSBT broadcast refuses an incomplete finalize instead of sending', async () => {
+  const card = await psbtTab(ANALYSIS_COMPLETE);
+  // the load probe said complete, but the extracting finalize disagrees
+  fixtures.finalizepsbt = (params) => (params[1] ? { complete: false } : { complete: true });
+  rpcLog.length = 0;
+  await confirmClick(buttonByText(card, 'broadcast'));
+  assert.ok(!rpcLog.some((c) => c.method === 'sendrawtransaction'),
+    'a finalize that did not complete must not be broadcast');
+  assert.match(byAria(container, 'PSBT').textContent, /could not be finalized/);
+});
+
+test('fee bump: offered only on eligible rows, posts through the unlock gate', async () => {
+  // The control lives in the expanded history row, which is where the
+  // gettransaction fields the eligibility test needs already are.
+  fixtures.listwallets = () => ['cold', 'hot'];
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  const BUMPABLE = 'b0'.repeat(32);
+  fixtures.getwalletinfo = () => ENC_INFO(undefined);   // unencrypted: no prompt
+  fixtures.listtransactions = () => ([{
+    category: 'send', amount: -0.5, fee: -0.00001, address: RECIP_A, vout: 0,
+    confirmations: 0, txid: BUMPABLE, time: NOW - 60, abandoned: false,
+  }]);
+  fixtures.gettransaction = () => ({
+    amount: -0.5, fee: -0.00001, confirmations: 0, txid: BUMPABLE,
+    walletconflicts: [], mempoolconflicts: [], time: NOW - 60,
+    timereceived: NOW - 60, 'bip125-replaceable': 'yes',
+    details: [{ category: 'send', amount: -0.5, abandoned: false }],
+  });
+  await wallet.show(container, 'history');
+  await wallet.refresh();
+  // expand the row to load its detail
+  const row = byAria(container, 'Transaction history')
+    .findAll((n) => n.tagName === 'TR').find((r) => r.textContent.includes('0.5'));
+  await row.dispatch('click');
+  await tick();
+
+  const bump = byAria(container, `Bump fee for ${BUMPABLE}`);
+  assert.ok(bump, 'an unconfirmed replaceable send must offer a bump');
+  byAria(container, 'Bump fee rate (sat/vB)').value = '25';
+  const REPLACEMENT = 'cc'.repeat(32);
+  fixtures.psbtbumpfee = () => ({ psbt: PSBT_B64, origfee: 0.00001, fee: 0.00002, errors: [] });
+  fixtures.bumpfee = () => ({ txid: REPLACEMENT, origfee: 0.00001, fee: 0.00002, errors: [] });
+  rpcLog.length = 0;
+
+  // Core never broadcasts a bump without showing the numbers: preview first,
+  // built with psbtbumpfee, which does NOT broadcast.
+  await buttonByText(bump, 'preview fee bump').dispatch('click');
+  await tick();
+  assert.ok(rpcLog.some((c) => c.method === 'psbtbumpfee'), 'preview must build it');
+  assert.ok(!rpcLog.some((c) => c.method === 'bumpfee'),
+    'previewing must not broadcast');
+  const shown = byAria(container, `Bump fee for ${BUMPABLE}`).textContent;
+  assert.match(shown, /current fee/);
+  assert.match(shown, /new fee/);
+  assert.match(shown, /increase/);
+  assert.match(shown, /Nothing has been broadcast yet/);
+
+  // only then can it be broadcast, and only behind the armed confirm
+  rpcLog.length = 0;
+  const go = buttonByText(byAria(container, `Bump fee for ${BUMPABLE}`),
+    'broadcast replacement');
+  await go.dispatch('click');                  // arms
+  assert.ok(!rpcLog.some((c) => c.method === 'bumpfee'));
+  await go.dispatch('click');                  // acts
+  assert.deepEqual(rpcLog.find((c) => c.method === 'bumpfee'),
+    { url: '/wallet/cold', method: 'bumpfee',
+      params: [BUMPABLE, { fee_rate: 25 }] });
+});
+
+test('fee bump: a watch-only wallet previews and routes to the PSBT tab', async () => {
+  // The method is decided at PREVIEW time, after refreshing walletinfo —
+  // deciding it when the row was built would read a null walletinfo on a
+  // direct load of History and hand a watch-only wallet `bumpfee`, which the
+  // node refuses outright.
+  fixtures.listwallets = () => ['cold', 'hot'];
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  const WO = 'd0'.repeat(32);
+  fixtures.getwalletinfo = () => ({ ...WALLETINFO, private_keys_enabled: false });
+  fixtures.listtransactions = () => ([{
+    category: 'send', amount: -0.5, address: RECIP_A, vout: 0,
+    confirmations: 0, txid: WO, time: NOW - 60, abandoned: false,
+  }]);
+  fixtures.gettransaction = () => ({
+    amount: -0.5, confirmations: 0, txid: WO,
+    walletconflicts: [], mempoolconflicts: [], time: NOW - 60,
+    timereceived: NOW - 60, 'bip125-replaceable': 'yes',
+    details: [{ category: 'send', amount: -0.5, abandoned: false }],
+  });
+  fixtures.psbtbumpfee = () => ({ psbt: PSBT_B64, origfee: 0.00001, fee: 0.00002, errors: [] });
+  fixtures.decodepsbt = () => DECODED;
+  fixtures.analyzepsbt = () => ANALYSIS_NEEDS_SIG;
+  fixtures.walletprocesspsbt = (params) => ({ psbt: params[0], complete: false });
+  fixtures.finalizepsbt = () => ({ complete: false });
+  await wallet.show(container, 'history');
+  await wallet.refresh();
+  const row = byAria(container, 'Transaction history')
+    .findAll((n) => n.tagName === 'TR').find((r) => r.textContent.includes('0.5'));
+  await row.dispatch('click');
+  await tick();
+  rpcLog.length = 0;
+  await buttonByText(byAria(container, `Bump fee for ${WO}`),
+    'preview fee bump').dispatch('click');
+  await tick();
+  assert.ok(rpcLog.some((c) => c.method === 'psbtbumpfee'));
+  assert.ok(!rpcLog.some((c) => c.method === 'bumpfee'),
+    'a watch-only wallet must never be handed bumpfee');
+  const bumpBox = byAria(container, `Bump fee for ${WO}`);
+  assert.match(bumpBox.textContent, /cannot sign/);
+  // and the replacement goes to the PSBT tab to be signed elsewhere
+  await buttonByText(bumpBox, 'open in PSBT tab').dispatch('click');
+  await tick();
+  assert.equal(byAria(container, 'PSBT').hidden, false);
+});
+
+test('fee bump: a confirmed transaction offers no bump at all', async () => {
+  fixtures.listwallets = () => ['cold', 'hot'];
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  const CONFIRMED = 'c0'.repeat(32);
+  fixtures.getwalletinfo = () => ENC_INFO(undefined);
+  fixtures.listtransactions = () => ([{
+    category: 'send', amount: -0.25, address: RECIP_A, vout: 0,
+    confirmations: 6, txid: CONFIRMED, time: NOW - 600, abandoned: false,
+  }]);
+  fixtures.gettransaction = () => ({
+    amount: -0.25, confirmations: 6, txid: CONFIRMED,
+    walletconflicts: [], mempoolconflicts: [], time: NOW - 600,
+    timereceived: NOW - 600, 'bip125-replaceable': 'yes',
+    details: [{ category: 'send', amount: -0.25, abandoned: false }],
+  });
+  await wallet.show(container, 'history');
+  await wallet.refresh();
+  const row = byAria(container, 'Transaction history')
+    .findAll((n) => n.tagName === 'TR').find((r) => r.textContent.includes('0.25'));
+  await row.dispatch('click');
+  await tick();
+  assert.equal(byAria(container, `Bump fee for ${CONFIRMED}`), null,
+    'a confirmed transaction cannot be replaced');
+});
+
+test('PSBT: a partially-signed multisig is NOT reported as complete', async () => {
+  // Our analyzepsbt calls an input `finalizer` as soon as it carries ANY
+  // partial signature, unlike Core's role which means fully signed. Deriving
+  // completeness from the role would tell a 2-of-2 co-signer their half-signed
+  // PSBT is "fully signed and ready for broadcast", hide the Sign button
+  // (signEnabled requires !complete), and then fail to broadcast — a dead end
+  // on the most ordinary multi-party flow there is. finalizepsbt decides.
+  const card = await psbtTab(
+    { inputs: [{ has_utxo: true, is_final: false, next: 'finalizer' }],
+      fee: 0.0001, next: 'finalizer' },
+    { complete: false });                       // finalizepsbt disagrees
+  assert.ok(buttonByText(card, 'sign'), 'the second signer must be able to sign');
+  assert.equal(buttonByText(card, 'broadcast'), null,
+    'an unfinalizable PSBT must not offer broadcast');
+  assert.doesNotMatch(card.textContent, /fully signed and ready for broadcast/);
+});
+
+test('PSBT: an empty createpsbt handoff is filled before it is judged', async () => {
+  // createpsbt emits no UTXO fields at all. Core fills the PSBT with our
+  // UTXOs before analysing; without that the raw paste analyses as `updater`
+  // ("missing information about inputs") with nothing signable — a dead end,
+  // even though the node would fill and sign it on request.
+  fixtures.listwallets = () => ['cold', 'hot'];
+  fixtures.getwalletinfo = () => ENC_INFO(undefined);
+  sessionStorage.setItem(wallet.WALLET_KEY, 'cold');
+  wallet.resetWallet();
+  // the fill turns the bare PSBT into one whose inputs we own
+  fixtures.walletprocesspsbt = (params) => ({ psbt: `${params[0]}FILLED`, complete: false });
+  fixtures.decodepsbt = (params) => (params[0].endsWith('FILLED')
+    ? DECODED                                   // has witness_utxo now
+    : { tx: DECODED.tx, inputs: [{}], outputs: [] });
+  fixtures.analyzepsbt = (params) => (params[0].endsWith('FILLED')
+    ? ANALYSIS_NEEDS_SIG
+    : { inputs: [{ has_utxo: false, is_final: false, next: 'updater' }], next: 'updater' });
+  fixtures.finalizepsbt = () => ({ complete: false });
+  await wallet.show(container, 'psbt');
+  await wallet.refresh();
+  byAria(container, 'Base64 PSBT').value = PSBT_B64;
+  await byAria(container, 'PSBT').find((n) => n.tagName === 'FORM').dispatch('submit');
+  const card = byAria(container, 'PSBT');
+  assert.doesNotMatch(card.textContent, /missing some information/);
+  assert.ok(buttonByText(card, 'sign'), 'the filled PSBT is signable');
+});
+
+test('PSBT: clear then reload the same PSBT keeps the buttons', async () => {
+  // The action row is stamped so the 3s poll cannot disarm the armed
+  // broadcast confirm; clearing must reset that stamp, or reloading the SAME
+  // PSBT matches it and the panel renders with no buttons at all.
+  const card = await psbtTab(ANALYSIS_COMPLETE);
+  assert.ok(buttonByText(card, 'broadcast'));
+  await buttonByText(card, 'clear').dispatch('click');
+  assert.equal(buttonByText(card, 'broadcast'), null);
+  byAria(container, 'Base64 PSBT').value = PSBT_B64;
+  await card.find((n) => n.tagName === 'FORM').dispatch('submit');
+  assert.ok(buttonByText(byAria(container, 'PSBT'), 'broadcast'),
+    'reloading the same PSBT must render its actions again');
+});
+
+test('PSBT: switching wallets drops the loaded PSBT', async () => {
+  // state.psbt holds per-wallet derived data — couldSign, the own-address
+  // flags, the sign/broadcast decision. Carrying it across a wallet switch
+  // would offer Sign on a watch-only wallet and post to the wrong endpoint.
+  await psbtTab(ANALYSIS_NEEDS_SIG);
+  assert.ok(byAria(container, 'PSBT').textContent.includes('Sends'));
+  const selector = byAria(container, 'Active wallet');
+  selector.value = 'hot';
+  await selector.dispatch('change');
+  assert.doesNotMatch(byAria(container, 'PSBT').textContent, /Sends/);
+});
+
+test('fee bump: an already-bumped transaction offers no bump', async () => {
+  // The original stays unconfirmed and replaceable-looking in the history,
+  // so without the replaced_by_txid check the row keeps offering a bump the
+  // node can only refuse.
+  assert.equal(psbtlib.bumpEligible({
+    confirmations: 0,
+    'bip125-replaceable': 'yes',
+    replaced_by_txid: 'ee'.repeat(32),
+    details: [{ category: 'send', abandoned: false }],
+  }), false);
+});
+
+test('countSignable: skips final inputs and unresolvable prevouts', () => {
+  const infos = { mine: { ismine: true, solvable: true },
+    theirs: { ismine: false, solvable: false } };
+  const analysis = { inputs: [{ is_final: true }, { is_final: false }] };
+  // input 0 is ours but already final -> nothing to add; input 1 is not ours
+  assert.equal(psbtlib.countSignable(analysis, ['mine', 'theirs'], infos), 0);
+  assert.equal(psbtlib.countSignable(
+    { inputs: [{ is_final: false }] }, ['mine'], infos), 1);
+  // an unresolvable prevout is never counted
+  assert.equal(psbtlib.countSignable({ inputs: [{ is_final: false }] }, [null], infos), 0);
+});
+
+test('psbtStatus: an unfinalizable "finalizer" still reads as needing signatures', () => {
+  const ok = { hasWallet: true, privateKeysDisabled: false, couldSign: 1 };
+  // role alone (Core's meaning, and our node's when it is right)
+  assert.match(psbtlib.psbtStatus({ next: 'finalizer' }, ok).text,
+    /fully signed and ready for broadcast/);
+  // ...but when finalizepsbt says otherwise, the role is not believed
+  assert.match(psbtlib.psbtStatus({ next: 'finalizer' }, { ...ok, complete: false }).text,
+    /still needs signature/);
+  assert.match(psbtlib.psbtStatus({ next: 'extractor' }, { ...ok, complete: false }).text,
+    /still needs signature/);
+  // a confirmed-complete PSBT is unaffected
+  assert.match(psbtlib.psbtStatus({ next: 'finalizer' }, { ...ok, complete: true }).text,
+    /fully signed/);
 });
