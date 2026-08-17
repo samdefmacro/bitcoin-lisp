@@ -19,10 +19,15 @@ export class RpcError extends Error {
 }
 
 // Auth-level failure (HTTP 401/403): the session should return to login.
+// STATUS is carried because 401 and 403 need different advice — a rejected
+// credential is the user's to fix, an Origin mismatch is not, and telling
+// someone their password is wrong when the real problem is the URL they
+// opened sends them to re-check the one thing that was already right.
 export class AuthError extends Error {
-  constructor(message) {
+  constructor(message, status) {
     super(message);
     this.name = 'AuthError';
+    this.status = status;
   }
 }
 
@@ -58,8 +63,8 @@ async function post(payload, endpoint) {
     headers,
     body: JSON.stringify(payload),
   });
-  if (res.status === 401) throw new AuthError('credentials rejected by the node');
-  if (res.status === 403) throw new AuthError('request rejected (origin mismatch)');
+  if (res.status === 401) throw new AuthError('credentials rejected by the node', 401);
+  if (res.status === 403) throw new AuthError('request rejected (origin mismatch)', 403);
   if (!res.ok) throw new Error(`node returned HTTP ${res.status}`);
   return res.json();
 }

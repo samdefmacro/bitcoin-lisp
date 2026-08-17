@@ -921,6 +921,7 @@ test('resetWallet drops the view; show() rebuilds from scratch', async () => {
 // rather than leaving the wallet open (Core's UnlockContext).
 
 const crypt = await import('../../ui/js/wallet-crypt.js');
+const rpcmod = await import('../../ui/js/rpc.js');
 
 // Encrypted-wallet variants of the fixture. `private_keys_enabled` is true
 // here — the default WALLETINFO is watch-only, which is precisely the case
@@ -1891,4 +1892,23 @@ test('psbtStatus: an unfinalizable "finalizer" still reads as needing signatures
   // a confirmed-complete PSBT is unaffected
   assert.match(psbtlib.psbtStatus({ next: 'finalizer' }, { ...ok, complete: true }).text,
     /fully signed/);
+});
+
+// --- transport: 401 and 403 are different problems ------------------------
+
+test('rpc: AuthError carries the status, so 403 is not reported as a bad password', async () => {
+  // The Origin check rejects with 403 BEFORE auth (src/rpc/server.lisp:651).
+  // Reporting that as "credentials rejected" sends the reader to re-check the
+  // one thing that was already right — the credential.
+  const realFetch = globalThis.fetch;
+  try {
+    for (const status of [401, 403]) {
+      globalThis.fetch = async () => ({ status, ok: false, json: async () => ({}) });
+      const e = await rpcmod.call('getblockcount').then(() => null, (err) => err);
+      assert.ok(e instanceof rpcmod.AuthError, `${status} must be an AuthError`);
+      assert.equal(e.status, status, 'the status must survive for the caller');
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
