@@ -1,6 +1,6 @@
 // GUI P3 peers-page tests (docs/gui-plan.md P3). Run from the repo root:
 //
-//   node --test tests/ui/
+//   scripts/dev.sh ui-test
 //
 // Zero dependencies: a minimal DOM shim plus a stubbed global fetch drive
 // the REAL ui/js modules — peers.js renders against fixture getpeerinfo/

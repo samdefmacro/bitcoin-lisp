@@ -23,7 +23,7 @@ This is a Common Lisp Workbench managed project (`.cl-workbench/project.toml`,
 execution profile container-required). Run `cl-workbench doctor --strict` from
 the project root once per substantive session before the first build, eval, or
 test. SBCL never runs on the host: every entry point below runs inside the
-pinned project container (bitcoin-lisp-sbcl:2.6.5), and the warm image's Swank
+pinned project container (bitcoin-lisp-sbcl:2.6.5-2), and the warm image's Swank
 port stays private to the container (evals are a docker exec of the Workbench
 client; no host port is published). Container, session, and FASL-volume
 identities are checkout-specific, so parallel checkouts never collide.
@@ -34,6 +34,7 @@ scripts/dev.sh eval '(+ 1 2)'   # ~0.1s per eval
 scripts/dev.sh test :bitcoin-core-script-tests   # one fiveam suite (raw designator)
 scripts/dev.sh test-all         # full :bitcoin-lisp-tests (29k+ checks; long)
 scripts/dev.sh docs-check       # PAX transcripts (docs/manual.lisp), cold container
+scripts/dev.sh ui-test          # web UI node harness (tests/ui/), cold container
 scripts/dev.sh stop
 ```
 

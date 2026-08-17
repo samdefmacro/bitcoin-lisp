@@ -1,6 +1,6 @@
 // GUI P6a QR-encoder tests (docs/gui-plan.md P6a). Run from the repo root:
 //
-//   node --test tests/ui/
+//   scripts/dev.sh ui-test
 //
 // Zero dependencies: the REAL ui/js/qr.js is compared byte-for-byte against
 // machine-generated vectors (tests/ui/qr-vectors.json) from the python

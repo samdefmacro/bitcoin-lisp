@@ -1,6 +1,6 @@
 // GUI P4 console-page tests (docs/gui-plan.md P4). Run from the repo root:
 //
-//   node --test tests/ui/
+//   scripts/dev.sh ui-test
 //
 // Zero dependencies: a minimal DOM shim plus a stubbed global fetch drive
 // the REAL ui/js modules — console.js parses Qt-style command lines,
