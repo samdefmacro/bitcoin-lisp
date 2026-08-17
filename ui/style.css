@@ -523,15 +523,18 @@ details.console-json pre { max-height: 340px; }
 }
 
 .console-params { margin-top: 0.55rem; }
-.console-json-area {
+/* The PSBT textarea is the same control as the console's, so it shares the
+   skin — including the placeholder colour and focus treatment that a
+   separate copy silently missed. */
+.console-json-area, .psbt-input {
   width: 100%; min-height: 74px; resize: vertical;
   background: var(--bg); color: var(--ink);
   border: 1px solid var(--line); border-radius: 6px;
   padding: 0.45rem 0.6rem;
   font: 12.5px/1.5 var(--font-mono);
 }
-.console-json-area::placeholder { color: var(--muted); }
-.console-json-area:focus-visible {
+.console-json-area::placeholder, .psbt-input::placeholder { color: var(--muted); }
+.console-json-area:focus-visible, .psbt-input:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent;
 }
 .console-hint { font-size: 11.5px; margin: 0.5rem 0 0; }
@@ -739,3 +742,20 @@ tr.tx-detail-row td { background: var(--panel-2); }
 @media (prefers-reduced-motion: reduce) {
   .meter-fill { transition: none; }
 }
+
+/* --- wallet PSBT tab (gui-plan P6c) --------------------------------- */
+
+/* .psbt-input shares the console textarea's rule above. */
+/* Core's StatusLevel. The tones come from the existing .warn-text /
+   .error-text classes, composed on; INFO needs none, since body colour is
+   already --ink. */
+.psbt-status { font-size: 13px; margin: 0.6rem 0; }
+.psbt-outputs { list-style: none; padding: 0; margin: 0.4rem 0; }
+.psbt-outputs li {
+  display: flex; align-items: center; gap: 0.4rem;
+  flex-wrap: wrap;
+  padding: 0.25rem 0;
+}
+.psbt-body p { margin: 0.35rem 0; font-size: 13px; }
+.psbt-result { margin-top: 0.6rem; }
+.bump-fee { margin-top: 0.7rem; }

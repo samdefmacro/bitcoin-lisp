@@ -60,6 +60,11 @@ import {
   ENCRYPT_BACKUP_WARNING, unlockParams, createParams, withUnlocked,
   UnlockCancelled, forgetPassphrase,
 } from './wallet-crypt.js';
+import {
+  psbtStatus, signEnabled, broadcastEnabled, psbtOutputs, countSignable,
+  unsignedInputCount, feeLine, psbtInputAddresses, bumpEligible, bumpMethod,
+  bumpParams, normalizePsbt,
+} from './wallet-psbt.js';
 
 // --- pure helpers (exported for tests) --------------------------------
 
@@ -283,6 +288,7 @@ const TABS = [
   ['receive', 'Receive'],
   ['history', 'History'],
   ['addresses', 'Address book'],
+  ['psbt', 'PSBT'],
   ['security', 'Security'],
 ];
 
@@ -304,6 +310,7 @@ const state = {
   bookRows: [],         // [{ address, label, purpose, info? }]
   receive: null,        // { address, label, type, uri, info? }
   send: freshSend(),    // send-tab compose model
+  psbt: null,           // { text, decoded, analysis, couldSign, status } | null
   secPanelOnClose: null,  // fired when the Security panel closes (see promptUnlock)
   refreshing: false,
 };
@@ -340,6 +347,7 @@ export function resetWallet() {
   state.txDetails = new Map();
   state.bookRows = [];
   state.receive = null;
+  state.psbt = null;
   state.send = freshSend();
   state.refreshing = false;
 }
@@ -724,16 +732,267 @@ function buildSkeleton(container) {
   bookWrap.appendChild(bookTable);
   refs.bookCard.append(bookForm, refs.bookError, bookWrap);
 
+  buildPsbtCard(refs);
   buildSecurityCard(refs);
 
   state.refs = refs;
   container.replaceChildren(head, refs.disabledCard, refs.emptyCard,
     refs.balancesCard, refs.infoCard, refs.sendCard, refs.receiveCard,
-    refs.historyCard, refs.bookCard, refs.securityCard);
+    refs.historyCard, refs.bookCard, refs.psbtCard, refs.securityCard);
   renderRecipients();
   renderTabStrip();
   applyMask();
   renderVisibility();
+}
+
+// --- PSBT operations (gui-plan P6c) --------------------------------------
+//
+// Core's psbtoperationsdialog: paste a PSBT, see what it does, sign it if we
+// can, broadcast it once it is complete. The button rules and every status
+// string come from wallet-psbt.js, which cites the Core lines they mirror.
+
+function buildPsbtCard(refs) {
+  refs.psbtCard = el('section', 'card card-full');
+  refs.psbtCard.setAttribute('aria-label', 'PSBT');
+  refs.psbtCard.appendChild(el('h2', 'card-title', 'PSBT'));
+
+  const form = el('form');
+  refs.psbtInput = el('textarea', 'psbt-input');
+  refs.psbtInput.setAttribute('aria-label', 'Base64 PSBT');
+  refs.psbtInput.placeholder = 'cHNidP\u2026';
+  refs.psbtInput.spellcheck = false;
+  const loadBtn = el('button', 'btn', 'load PSBT');
+  loadBtn.type = 'submit';
+  const clearBtn = el('button', 'btn btn-quiet', 'clear');
+  clearBtn.type = 'button';
+  clearBtn.addEventListener('click', () => {
+    state.psbt = null;
+    refs.psbtInput.value = '';
+    renderPsbt();
+  });
+  const buttons = el('div', 'send-actions');
+  buttons.append(loadBtn, clearBtn);
+  form.append(refs.psbtInput, buttons);
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    await loadPsbt(refs.psbtInput.value);
+  });
+
+  refs.psbtError = el('p', 'error-text');
+  refs.psbtError.hidden = true;
+  refs.psbtNote = el('p', 'muted');
+  refs.psbtNote.hidden = true;
+  refs.psbtStatusLine = el('p', 'psbt-status');
+  refs.psbtStatusLine.hidden = true;
+  refs.psbtBody = el('div', 'psbt-body');
+  refs.psbtActions = el('div', 'send-actions');
+  refs.psbtResult = el('div', 'psbt-result');
+
+  refs.psbtCard.append(form, refs.psbtError, refs.psbtNote, refs.psbtStatusLine,
+    refs.psbtBody, refs.psbtActions, refs.psbtResult);
+}
+
+// Same two-branch shape as secMessage: one error node, one note node, never
+// both — so a success is not written into a third hand-rolled channel.
+function psbtMessage(text, isError) {
+  const { refs } = state;
+  refs.psbtError.hidden = !isError;
+  refs.psbtNote.hidden = isError || !text;
+  if (isError) refs.psbtError.textContent = text;
+  else if (text) refs.psbtNote.textContent = text;
+}
+
+// Load = decode + analyze + work out whether WE could sign it. Core does the
+// same three things in openWithPSBT before it renders anything.
+async function loadPsbt(text) {
+  const { refs } = state;
+  psbtMessage('', false);
+  refs.psbtResult.replaceChildren();
+  const parsed = normalizePsbt(text);
+  if (parsed.error) {
+    state.psbt = null;
+    renderPsbt();
+    psbtMessage(parsed.error, true);
+    return;
+  }
+  try {
+    // Core's openWithPSBT fills the PSBT with our UTXOs and derivations
+    // (fillPSBT sign=false) BEFORE it analyzes or renders anything. Skipping
+    // that step makes the canonical handoff a dead end: createpsbt emits no
+    // UTXO fields at all, so the raw paste analyzes as `updater` ("missing
+    // information about inputs") with nothing we could sign — even though
+    // walletprocesspsbt would fill it and sign it immediately.
+    // A wallet-less or failing fill is not fatal; fall back to the paste.
+    let filled = parsed.psbt;
+    try {
+      const pre = await rpc.call('walletprocesspsbt',
+        [parsed.psbt, false, null, true, false], endpoint());
+      if (pre && pre.psbt) filled = pre.psbt;
+    } catch { /* analyze what we were given */ }
+
+    const [decodeR, analyzeR, finalR] = await rpc.batch([
+      ['decodepsbt', [filled]],
+      ['analyzepsbt', [filled]],
+      // Completeness comes from finalizepsbt, NOT from analyzepsbt's role:
+      // our analyzepsbt calls an input `finalizer` as soon as it carries any
+      // partial signature, so a 2-of-2 signed by the co-signer first would
+      // otherwise render as "fully signed", hide Sign, and fail to broadcast.
+      ['finalizepsbt', [filled, false]],
+    ], endpoint());
+    if (decodeR.error || analyzeR.error) {
+      state.psbt = null;
+      renderPsbt();
+      psbtMessage((decodeR.error || analyzeR.error).message, true);
+      return;
+    }
+    const decoded = decodeR.result;
+    const inputAddrs = psbtInputAddresses(decoded).filter(Boolean);
+    const outputs = psbtOutputs(decoded);
+    // ONE batch for both questions: which inputs we could sign, and which
+    // outputs are ours. Two calls here would be two serial round trips per
+    // load — and signPsbt reloads, so four per signature.
+    const infos = await addressInfoMap(
+      [...new Set([...inputAddrs, ...outputs.map((o) => o.address).filter(Boolean)])]);
+    const mine = {};
+    for (const [addr, info] of Object.entries(infos)) mine[addr] = !!info.ismine;
+    state.psbt = {
+      text: filled,
+      analysis: analyzeR.result,
+      complete: !finalR.error && !!finalR.result && !!finalR.result.complete,
+      outputs: psbtOutputs(decoded, mine),
+      // F7: an input that is already final needs no signature from us, so
+      // counting it would say "we can sign" when there is nothing to add.
+      couldSign: countSignable(analyzeR.result, psbtInputAddresses(decoded), infos),
+    };
+    renderPsbt();
+  } catch (e) {
+    state.psbt = null;
+    renderPsbt();
+    psbtMessage(rpcErrorMessage(e), true);
+  }
+}
+
+// One batch; an address the node cannot describe is simply absent from the
+// map rather than guessed at.
+async function addressInfoMap(addresses) {
+  const results = await rpc.batch(
+    addresses.map((a) => ['getaddressinfo', [a]]), endpoint());
+  const out = {};
+  results.forEach((r, i) => { if (!r.error) out[addresses[i]] = r.result; });
+  return out;
+}
+
+function renderPsbt() {
+  const { refs, psbt } = state;
+  if (!psbt) {
+    refs.psbtStatusLine.hidden = true;
+    refs.psbtBody.replaceChildren();
+    refs.psbtActions.replaceChildren();
+    // Clear the stamp too: otherwise loading the SAME PSBT again matches it
+    // and the early return below leaves the action row permanently empty.
+    refs.psbtActionsFor = null;
+    return;
+  }
+  const privateKeysDisabled = encryptionState(state.walletinfo) === 'no-keys';
+  const complete = psbt.complete;
+  const status = psbtStatus(psbt.analysis, {
+    hasWallet: haveWallet(),
+    privateKeysDisabled,
+    couldSign: psbt.couldSign,
+    complete,
+  });
+
+  refs.psbtStatusLine.hidden = false;
+  refs.psbtStatusLine.textContent = status.text;
+  refs.psbtStatusLine.className = `psbt-status ${
+    { warn: 'warn-text', err: 'error-text' }[status.level] ?? ''}`.trimEnd();
+
+  // Body: one line per output, the fee, and the unsigned-input count —
+  // Core's renderTransaction, minus its alternative-unit block.
+  const list = el('ul', 'psbt-outputs');
+  for (const out of psbt.outputs) {
+    const li = el('li');
+    li.append(el('span', '', 'Sends '), amt(fmtBtc(out.value)),
+      el('span', '', ' to '),
+      out.address ? copyable(out.address, out.address)
+        : el('span', 'mono muted', out.script || '(unrecognised script)'));
+    if (out.mine) li.appendChild(pill('own address', 'pill-muted'));
+    list.appendChild(li);
+  }
+  const unsigned = unsignedInputCount(psbt.analysis);
+  refs.psbtBody.replaceChildren(list, el('p', '', feeLine(psbt.analysis)),
+    ...(unsigned > 0
+      ? [el('p', 'muted',
+        `Transaction has ${unsigned} unsigned input${unsigned === 1 ? '' : 's'}.`)]
+      : []));
+
+  // Rebuild the action row only when what it acts on changed — same guard as
+  // the Security tab and the history table. Without it the 3s poll replaces
+  // the armed `broadcast` button inside its 4s confirm window, so the second
+  // click lands on a fresh, disarmed button and silently does nothing.
+  const stamp = `${psbt.text}|${complete}|${psbt.couldSign}|${privateKeysDisabled}|${haveWallet()}`;
+  if (refs.psbtActionsFor === stamp) return;
+  refs.psbtActionsFor = stamp;
+
+  const actions = [];
+  if (signEnabled({
+    complete, hasWallet: haveWallet(), privateKeysDisabled, couldSign: psbt.couldSign,
+  })) {
+    actions.push(secButton('sign', signPsbt));
+  }
+  if (broadcastEnabled(complete)) {
+    actions.push(armedButton('broadcast', 'confirm broadcast', broadcastPsbt));
+  }
+  const copyBtn = el('button', 'btn', 'copy');
+  copyBtn.type = 'button';
+  copyBtn.addEventListener('click', () => copyToClipboard(psbt.text, copyBtn));
+  actions.push(copyBtn);
+  refs.psbtActions.replaceChildren(...actions);
+}
+
+async function signPsbt() {
+  const { refs, psbt } = state;
+  psbtMessage('', false);
+  try {
+    // Signing needs the keys: same gate as every other signing path, so a
+    // locked wallet prompts instead of the node answering -13.
+    const res = await withWalletUnlocked(() => rpc.call('walletprocesspsbt',
+      [psbt.text, true], endpoint()));
+    refs.psbtInput.value = res.psbt;
+    await loadPsbt(res.psbt);
+    psbtMessage(res.complete ? 'Signed — the transaction is now complete.'
+      : 'Signed what this wallet could; more signatures are still needed.', false);
+  } catch (e) {
+    psbtMessage(rpcErrorMessage(e), true);
+  }
+}
+
+async function broadcastPsbt() {
+  const { refs, psbt } = state;
+  psbtMessage('', false);
+  try {
+    // Core: FinalizeAndExtractPSBT, then broadcast. finalizepsbt returns the
+    // network-serialized hex once every input is final.
+    const fin = await rpc.call('finalizepsbt', [psbt.text, true], endpoint());
+    if (!fin.complete || !fin.hex) {
+      psbtMessage('The transaction could not be finalized — it is not fully signed.',
+        true);
+      return;
+    }
+    const txid = await rpc.call('sendrawtransaction', [fin.hex]);
+    refs.psbtResult.replaceChildren(
+      el('p', '', 'Transaction broadcast.'),
+      link(`#/tx/${txid}`, txid, 'xlink mono'));
+  } catch (e) {
+    psbtMessage(rpcErrorMessage(e), true);
+  }
+}
+
+// Hand a PSBT produced elsewhere (the fee bump) to the panel.
+function openPsbtInPanel(text) {
+  show(state.container, 'psbt');
+  state.refs.psbtInput.value = text;
+  return loadPsbt(text);
 }
 
 // --- security: lifecycle + encryption (gui-plan P6d) ---------------------
@@ -1205,6 +1464,7 @@ function renderVisibility() {
   show(refs.receiveCard, 'receive');
   show(refs.historyCard, 'history');
   show(refs.bookCard, 'addresses');
+  show(refs.psbtCard, 'psbt');
   show(refs.securityCard, 'security');
 }
 
@@ -1237,6 +1497,7 @@ function selectWallet(name) {
   state.txDetails = new Map();
   state.bookRows = [];
   state.receive = null;
+  state.psbt = null;
   state.send = freshSend();
   if (state.refs) {
     state.refs.histStamp = null;
@@ -1268,6 +1529,13 @@ export async function refresh() {
         if (state.bookRows.length === 0) await refreshBook();
         // Otherwise the book only refreshes on demand — a 3s rebuild would
         // clobber an inline label edit in progress.
+      } else if (state.tab === 'psbt') {
+        // The sign/broadcast rules depend on private_keys_enabled, so the
+        // panel needs walletinfo like the Security tab does. The loaded PSBT
+        // itself is NOT re-fetched: re-analyzing every 3s would clobber a
+        // paste in progress and tell the user nothing new.
+        await refreshWalletInfo();
+        renderPsbt();
       } else if (state.tab === 'security') {
         // getwalletinfo carries both fields the encryption state is derived
         // from; re-read it every poll so the countdown ticks and a relock
@@ -1897,7 +2165,96 @@ function detailNode(entry) {
     kv.appendChild(kvRow('received', fmtTimestamp(detail.timereceived)));
   }
   box.appendChild(kv);
+  // Core puts "Increase transaction fee" on the transaction list's context
+  // menu; the expanded row is our equivalent, and it is where the
+  // gettransaction fields the eligibility test needs already live.
+  if (bumpEligible(detail)) box.appendChild(bumpFeeControls(detail.txid));
   return box;
+}
+
+// PREVIEW, THEN CONFIRM — never a bare two-click broadcast.
+//
+// Core builds the replacement first (createBumpTransaction), shows Current
+// fee / Increase / New fee in a confirmation dialog, and only signs after the
+// user agrees (walletmodel.cpp:475-495). A mistyped fee rate is irreversible
+// once broadcast — 500 instead of 50 sat/vB on a 250-vB transaction is
+// 125,000 sat, bounded only by -maxtxfee — so the numbers have to be on
+// screen before any signature exists.
+//
+// psbtbumpfee is exactly Core's "build but do not broadcast" half, so it is
+// what we preview with, whatever we then execute with.
+function bumpFeeControls(txid) {
+  const wrap = el('div', 'bump-fee');
+  wrap.setAttribute('aria-label', `Bump fee for ${txid}`);
+  const rate = el('input');
+  rate.spellcheck = false;
+  rate.placeholder = 'sat/vB (blank = node default)';
+  rate.setAttribute('aria-label', 'Bump fee rate (sat/vB)');
+  const err = el('p', 'error-text');
+  err.hidden = true;
+  const preview = el('div', 'bump-preview');
+  preview.hidden = true;
+  const fail = (msg) => { err.textContent = msg; err.hidden = false; };
+
+  const doPreview = async () => {
+    err.hidden = true;
+    preview.hidden = true;
+    preview.replaceChildren();
+    try {
+      // Decided HERE, not when the row was built: only the overview/psbt/
+      // security tabs refresh walletinfo, so on a direct load of History it
+      // is still null and a watch-only wallet would be handed `bumpfee`,
+      // which the node refuses outright.
+      await refreshWalletInfo();
+      const watchOnly = encryptionState(state.walletinfo) === 'no-keys';
+      const built = await withWalletUnlocked(() => rpc.call('psbtbumpfee',
+        bumpParams(txid, rate.value), endpoint()));
+      const kv = el('dl', 'kv');
+      kv.appendChild(kvRow('current fee', amt(fmtBtc(built.origfee))));
+      kv.appendChild(kvRow('new fee', amt(fmtBtc(built.fee))));
+      kv.appendChild(kvRow('increase',
+        amt(fmtBtc((built.fee ?? 0) - (built.origfee ?? 0)))));
+      preview.appendChild(kv);
+      preview.appendChild(el('p', 'muted', watchOnly
+        ? 'This wallet cannot sign; the replacement opens in the PSBT tab.'
+        : 'Nothing has been broadcast yet.'));
+      const act = el('div', 'send-actions');
+      if (watchOnly) {
+        act.appendChild(secButton('open in PSBT tab',
+          () => openPsbtInPanel(built.psbt)));
+      } else {
+        // Execute with bumpfee, not by broadcasting the previewed PSBT, so
+        // the node records the replacement against the original
+        // (replaced_by_txid). The rebuild can differ by a few sats if the
+        // mempool moved underneath us.
+        act.appendChild(armedButton('broadcast replacement', 'confirm broadcast',
+          async () => {
+            try {
+              const res = await withWalletUnlocked(() => rpc.call('bumpfee',
+                bumpParams(txid, rate.value), endpoint()));
+              state.txDetails.delete(txid);   // the original is replaced now
+              await refresh();
+              preview.replaceChildren(el('p', '', 'Replacement broadcast.'),
+                link(`#/tx/${res.txid}`, res.txid, 'xlink mono'));
+            } catch (e) {
+              fail(rpcErrorMessage(e));
+            }
+          }));
+      }
+      preview.appendChild(act);
+      preview.hidden = false;
+    } catch (e) {
+      fail(rpcErrorMessage(e));
+    }
+  };
+
+  const row = el('div', 'receive-form');
+  const previewBtn = el('button', 'btn', 'preview fee bump');
+  previewBtn.type = 'button';
+  previewBtn.addEventListener('click', doPreview);
+  row.append(rate, previewBtn);
+  wrap.append(row, preview, err);
+  return wrap;
 }
 
 // --- address book ----------------------------------------------------
