@@ -1,6 +1,7 @@
 # Outbound eclipse resistance (GA7 G7-08) — re-spec
 
-Status: **P0 implemented; P1–P3 specified, not implemented.**
+Status: **P0/P1/P2 implemented (PRs #313, #314); P3 specified, not
+implemented.**
 
 This is a re-specification. The original automated spec for G7-08 was judged
 **unsound** by an adversarial review, with two *design-breaking* errors (§2).
@@ -78,9 +79,17 @@ cycle, so a loop-local variable resets each pass.
 | `MAX_BLOCK_RELAY_ONLY_CONNECTIONS` | 2 | net.h:73 |
 | `nPowTargetSpacing` | 600 s on **every** network | kernel/chainparams.cpp |
 
-The stale-tip threshold is `30 * 600 = 1800s` on all networks, including
-regtest — worth knowing, because it makes the stale-tip path testable without
-network-specific fixtures.
+The stale-tip threshold is `nPowTargetSpacing * 3 = 1800s` on all networks,
+including regtest — worth knowing, because it makes the stale-tip path testable
+without network-specific fixtures.
+
+**The factor is 3, not 30.** Earlier revisions of this document wrote
+`30 * 600 = 1800s` in both places it appears. The product is right and the
+factor is wrong, which is the dangerous combination: an implementer copying
+`30 *` lands on 18000s — five hours instead of thirty minutes — and a reviewer
+checking the stated result against Core sees 1800 and agrees. Core:
+`m_last_tip_update < GetTime() - nPowTargetSpacing * 3`
+(net_processing.cpp:1339).
 
 ## 5. Phases
 
@@ -155,16 +164,63 @@ accounting depends on.
 
 ### P3 — stale tip and extra outbound
 
-`CheckForStaleTipAndEvictPeers` on a 45s cadence in `maintain-peers`:
+`CheckForStaleTipAndEvictPeers` (net_processing.cpp:5460) on the 45s cadence
+already established in `maintain-peers` by P1's `consider-outbound-evictions`.
+It has three parts, and earlier revisions of this section described only the
+second — the other two are restated here because each is load-bearing.
 
-- If our tip has not advanced in `30 * 600 = 1800s` and nothing is in flight,
-  open **one** extra outbound peer.
-- Rotate the outbound peer with the oldest last-block-announcement stamp when
-  over budget, respecting `MINIMUM_CONNECT_TIME` (30s) and the network-uniqueness
-  guard (`MultipleManualOrFullOutboundConns`, net_processing.cpp:5422) so we
-  never drop our only peer on some network.
+**Prerequisite: the `last-block-announcement` stamp.** Unix seconds, on the
+peer. Core credits it at exactly two sites, both gated on
+`received_new_header && <that chain>.nChainWork > our tip work`: headers
+processing (net_processing.cpp:2922) and compact-block processing (:4624). It
+is the *announcement* that counts, not a successful reconstruct (§3).
 
-Requires a `last-block-announcement` stamp credited at announcement time (§3).
+**(a) Extra block-relay-only eviction** (:5360). Runs whenever we hold more
+block-relay peers than the target. Pick the *youngest* (highest peer id);
+if that peer gave us a block more recently than the second-youngest, evict the
+second-youngest instead. This half compares `m_last_block_time` — when a block
+was *received* — **not** the announcement stamp; they are different clocks on
+different peer sets and swapping them silently inverts the choice. The youngest
+block-relay peer is by construction the extra one opened to unstick our tip, so
+this is what closes the slot that (c) opens.
+
+**(b) Extra full-relay rotation** (:5400). Pick the outbound full-relay peer
+with the oldest `last-block-announcement`, subject to four filters, all
+required:
+
+- skip peers already marked for disconnection;
+- **skip chain-sync-protected peers** (`m_chain_sync.m_protect`, :5419) — P2
+  grants that flag precisely so rotation cannot take the peer back;
+- skip a peer that is our only OUTBOUND_FULL_RELAY-or-MANUAL connection on its
+  network (`MultipleManualOrFullOutboundConns`, :5422);
+- **ties on the stamp break toward the higher peer id** (:5423), i.e. evict the
+  *more recent* connection. Both halves of that comparison matter: a fresh peer
+  starts at stamp 0 and so ties with every other peer that has never announced,
+  and without the tie-break the choice among them is whatever order the peer
+  list happens to be in.
+
+Then, before actually disconnecting: `now - connected > MINIMUM_CONNECT_TIME`
+(30s) **and** that peer has no blocks in flight. Note Core uses strict `>` here
+and `>=` in the block-relay half (:5386); no behavioural difference at second
+resolution, but do not "harmonise" them.
+
+**(c) Stale-tip trigger** (:5471). Gated on its own **10-minute** timer
+(`STALE_CHECK_INTERVAL`) *inside* the 45s sweep — the two cadences are
+different and both real. If the tip may be stale — `last-tip-advance <
+now - nPowTargetSpacing * 3` **and** nothing in flight globally
+(`TipMayBeStale`, :1332) — allow one extra outbound connection.
+
+**The reset is not optional**: when the tip is no longer stale, Core clears the
+flag (`SetTryNewOutboundPeer(false)`, :5476). Without it the first stale
+episode raises the outbound budget permanently, and (a) then spends every sweep
+evicting a peer we just dialled.
+
+We have no "extra outbound slot" concept today — the outbound budget is fixed
+— so this is the one structurally new piece rather than a port of a loop.
+
+**Clock epoch.** `node-last-tip-advance-time` (node.lisp:225) is
+`get-universal-time`; everything else here is unix seconds. Convert at the
+comparison or repeat §3's ~2.2e9-second error.
 
 ## 6. Testing
 
