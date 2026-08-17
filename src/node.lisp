@@ -4070,9 +4070,13 @@ timestamp would reset each pass and the cadence would be meaningless.")
   "Core EXTRA_PEER_CHECK_INTERVAL — cadence of the chain-sync sweep.")
 
 (defun consider-outbound-evictions (node)
-  "Chain-sync eviction sweep (Core ConsiderEviction, run once per SendMessages
-pass). Driven from here rather than from run-ibd's block-download loop, which
-does not run at tip — exactly where eclipse resistance matters."
+  "Core's CheckForStaleTipAndEvictPeers tick (net_processing.cpp:5460), on the
+45s EXTRA_PEER_CHECK_INTERVAL cadence. Driven from here rather than from
+run-ibd's block-download loop, which does not run at tip — exactly where
+eclipse resistance matters.
+
+Two sweeps, in Core's order: the per-peer chain-sync eviction, then the
+whole-set extra-outbound eviction."
   (let ((now (bitcoin-lisp.serialization:get-unix-time)))
     (when (>= (- now *last-chain-sync-check*) +extra-peer-check-interval-seconds+)
       (setf *last-chain-sync-check* now)
@@ -4081,7 +4085,21 @@ does not run at tip — exactly where eclipse resistance matters."
           (dolist (peer (node-peers node))
             (ignore-errors
              (bitcoin-lisp.networking:consider-chain-sync-eviction
-              peer chain-state now))))))))
+              peer chain-state now)))))
+      ;; Core runs EvictExtraOutboundPeers from this same tick (:5466), and
+      ;; BEFORE the stale-tip check rather than after: the peer we are about to
+      ;; decide we need is not one we should have dropped on the way in.
+      ;;
+      ;; Unlike the chain-sync sweep this one is not per-peer — both halves
+      ;; rank the set against itself — so it takes the list once, snapshotted
+      ;; under the node lock: disconnect-peer runs inside it and mutates state
+      ;; the listener thread touches too.
+      (ignore-errors
+       (bitcoin-lisp.networking:evict-extra-outbound-peers
+        (bt:with-recursive-lock-held ((node-lock node)) (copy-list (node-peers node)))
+        now
+        (node-max-peers node)
+        +target-block-relay-peers+)))))
 
 (defun maintain-peers (node)
   "Run periodic peer maintenance: health checks, reconnection, dedicated

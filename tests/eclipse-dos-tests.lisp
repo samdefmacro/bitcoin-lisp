@@ -986,7 +986,6 @@ so the only thing that differs is the peer's liveness."
                (is (= 0 bitcoin-lisp.networking::*protected-outbound-count*)
                    "and the counter must not move"))
           (bitcoin-lisp.networking:unban-address "198.51.100.79"))))))
-=======
 ;;;; GA8 W3: the low-work drop must fire only where Core evaluates it
 ;;;;
 ;;;; Core reaches the disconnect solely through
@@ -1338,3 +1337,180 @@ peer that has nothing more to give."
             "the store path must have refreshed availability from the known ancestor")
         (is (eq :disconnected (bitcoin-lisp.networking:peer-state p))
             "a sub-minchainwork outbound peer with nothing more to give is dropped")))))
+
+;;;; ============================================================
+;;;; G7-08 P3: extra-outbound eviction (Core EvictExtraOutboundPeers)
+;;;;
+;;;; Two halves over two disjoint peer sets with two different clocks. The
+;;;; tests keep them apart on purpose: swapping the ranking keys is the
+;;;; mistake that still leaves every count correct.
+
+(defun %p3-peer (&key (conn-type :outbound-full-relay) (address "1.2.3.4")
+                      (announcement 0) (last-block 0) (connected 0)
+                      protect manual)
+  (let ((p (bitcoin-lisp.networking:make-peer :address address)))
+    (setf (bitcoin-lisp.networking:peer-conn-type p) conn-type
+          (bitcoin-lisp.networking:peer-state p) :ready
+          (bitcoin-lisp.networking:peer-manual p) manual
+          (bitcoin-lisp.networking::peer-chain-sync-protect p) protect
+          (bitcoin-lisp.networking:peer-last-block-announcement p) announcement
+          (bitcoin-lisp.networking::peer-last-block-time p) last-block
+          (bitcoin-lisp.networking::peer-connected-at p) connected)
+    p))
+
+(test g7-08-p3-full-relay-rotation-picks-the-stalest-announcer
+  "Core EvictExtraOutboundPeers' full-relay half (net_processing.cpp:5400): the
+outbound peer that least recently ANNOUNCED a block that beat our tip is the
+one rotated out. Ranking by anything else — last message, last block received,
+ping — is what an eclipsing peer can trivially keep fresh while never telling
+us about the chain."
+  (let* ((fresh (%p3-peer :address "1.0.0.1" :announcement 5000))
+         (stale (%p3-peer :address "1.0.0.2" :announcement 1000))
+         (mid   (%p3-peer :address "1.0.0.3" :announcement 3000))
+         (peers (list fresh stale mid)))
+    (is (eq stale (bitcoin-lisp.networking:select-extra-full-relay-eviction peers)))))
+
+(test g7-08-p3-rotation-never-takes-a-protected-or-manual-peer
+  "Two exemptions, both of which invert the feature if dropped.
+
+P2 grants chain-sync protection (:5419) precisely so this rotation cannot take
+the peer back; a rotation that ignores it hands the eclipse attacker the one
+peer that proved it has the good chain.
+
+MANUAL is the operator's own -addnode. Core gets that exemption free because
+MANUAL is a distinct connection type, but we type addnode peers
+:outbound-full-relay, so ours has to be explicit — the plan's §2 names
+evicting operator-pinned peers as a design-breaking regression."
+  ;; The protected/manual peers are the STALEST, so they would be chosen first
+  ;; if the filters did not fire.
+  (let* ((protected (%p3-peer :address "1.0.0.1" :announcement 1 :protect t))
+         (manual    (%p3-peer :address "1.0.0.2" :announcement 2 :manual t))
+         (ordinary  (%p3-peer :address "1.0.0.3" :announcement 9000))
+         (peers (list protected manual ordinary)))
+    (is (eq ordinary (bitcoin-lisp.networking:select-extra-full-relay-eviction peers))
+        "the only evictable peer is the ordinary one, stale or not")
+    ;; And with nothing but exempt peers, nobody is chosen at all.
+    (is (null (bitcoin-lisp.networking:select-extra-full-relay-eviction
+               (list protected manual))))))
+
+(test g7-08-p3-rotation-keeps-our-only-connection-on-a-network
+  "Core MultipleManualOrFullOutboundConns (:5422). Rotation must not sever our
+last route to a network. Without this the sweep will happily drop our only Tor
+peer because it announces less often than the IPv4 set — which is exactly the
+partition the whole subsystem exists to prevent, arrived at from the inside."
+  (let* ((onion (%p3-peer :address "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion"
+                          :announcement 1))
+         (v4a (%p3-peer :address "1.0.0.1" :announcement 8000))
+         (v4b (%p3-peer :address "1.0.0.2" :announcement 9000))
+         (peers (list onion v4a v4b)))
+    (is (eq v4a (bitcoin-lisp.networking:select-extra-full-relay-eviction peers))
+        "the sole onion peer is protected despite being the stalest by far")
+    ;; With a second onion peer the protection lifts for both of them.
+    (let* ((onion2 (%p3-peer :address "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion"
+                             :announcement 2))
+           (peers2 (list onion onion2 v4a v4b)))
+      (is (eq onion (bitcoin-lisp.networking:select-extra-full-relay-eviction peers2))
+          "two onion peers means neither is our only one, so the stalest wins"))))
+
+(test g7-08-p3-rotation-tie-breaks-toward-the-newer-connection
+  "Core :5423 breaks a tie on the stamp by taking the HIGHER peer id. This is
+not a corner case: every peer that has never announced sits at 0, so after any
+restart the entire outbound set ties and this comparison IS the policy. Higher
+id = most recently connected = least invested."
+  (let* ((older (%p3-peer :address "1.0.0.1"))   ; ids are handed out in order
+         (newer (%p3-peer :address "1.0.0.2")))
+    (is (< (bitcoin-lisp.networking::peer-id older)
+           (bitcoin-lisp.networking::peer-id newer))
+        "sanity: ids really are monotonic in connection order")
+    ;; Both at stamp 0, and the list order is deliberately reversed so a
+    ;; first-wins reduce would pick the older one.
+    (is (eq newer (bitcoin-lisp.networking:select-extra-full-relay-eviction
+                   (list older newer))))
+    (is (eq newer (bitcoin-lisp.networking:select-extra-full-relay-eviction
+                   (list newer older)))
+        "and the answer must not depend on the order of the peer list")))
+
+(test g7-08-p3-block-relay-half-ranks-by-block-received-not-announced
+  "Core's block-relay half (:5360) takes the YOUNGEST block-relay peer — by
+construction the extra one opened to unstick a stale tip — unless it has given
+us a block more recently than the second-youngest, in which case that one goes
+instead.
+
+It ranks by last block RECEIVED. Reusing the full-relay half's announcement
+stamp here would compile, pass a count-based test, and silently evict the
+wrong peer: block-relay peers are excluded from chain-sync protection because
+delivering blocks is the entire job they are kept for."
+  (let* ((oldest (%p3-peer :conn-type :block-relay :address "1.0.0.1" :last-block 900))
+         (second (%p3-peer :conn-type :block-relay :address "1.0.0.2" :last-block 100))
+         (youngest (%p3-peer :conn-type :block-relay :address "1.0.0.3" :last-block 50))
+         (peers (list oldest second youngest)))
+    (is (eq youngest (bitcoin-lisp.networking:select-extra-block-relay-eviction peers))
+        "the youngest goes when it has not out-delivered the second-youngest")
+    ;; Now make the youngest the more recent deliverer: the second-youngest goes.
+    (setf (bitcoin-lisp.networking::peer-last-block-time youngest) 500)
+    (is (eq second (bitcoin-lisp.networking:select-extra-block-relay-eviction peers))
+        "a youngest peer that is delivering earns its slot; the runner-up pays")
+    ;; The announcement stamp must have no influence here at all.
+    (setf (bitcoin-lisp.networking:peer-last-block-announcement second) 999999)
+    (is (eq second (bitcoin-lisp.networking:select-extra-block-relay-eviction peers))
+        "the announcement stamp is the OTHER half's key and must not leak in")))
+
+(test g7-08-p3-driver-gates-each-half-on-its-own-target
+  "Core gates the two halves on GetExtraBlockRelayCount and
+GetExtraFullOutboundCount separately (:5359, :5400). A combined
+outbound-vs-combined-target test would let two idle block-relay slots mask a
+full-relay set that is one over — the same conflation replace-disconnected-peers
+already documents on the dialing side."
+  (let* ((full (loop repeat 3 collect (%p3-peer :address (format nil "1.0.0.~D" (random 250))
+                                                :connected 0)))
+         (br (loop repeat 2 collect (%p3-peer :conn-type :block-relay
+                                              :address (format nil "2.0.0.~D" (random 250))
+                                              :connected 0)))
+         (peers (append full br))
+         (now 10000))
+    ;; At target on both: nothing moves.
+    (is (null (bitcoin-lisp.networking:evict-extra-outbound-peers peers now 3 2))
+        "at target, both halves must be silent")
+    ;; Full-relay one over, block-relay still at target: exactly one drop, and
+    ;; it must come from the full-relay pool.
+    (let ((dropped (bitcoin-lisp.networking:evict-extra-outbound-peers peers now 2 2)))
+      (is (= 1 (length dropped)))
+      (is (eq :outbound-full-relay
+              (bitcoin-lisp.networking:peer-conn-type (first dropped)))
+          "an over-budget full-relay set must not be paid for by a block-relay peer"))))
+
+(test g7-08-p3-driver-respects-minimum-connect-time-and-in-flight
+  "Core's two release conditions (:5386, :5438). MINIMUM_CONNECT_TIME stops the
+stale-tip path becoming a treadmill — open an extra peer, evict it before it
+has had a chance to announce anything, open another. The in-flight condition
+stops us throwing away a download in progress, which under a stale tip is the
+one thing we actually want.
+
+Note the halves use >= and > against the same constant; that asymmetry is
+Core's and is preserved deliberately."
+  (let* ((now 10000)
+         (fresh (%p3-peer :address "1.0.0.1" :connected (- now 5)))
+         (old-a (%p3-peer :address "1.0.0.2" :connected 0 :announcement 100))
+         (old-b (%p3-peer :address "1.0.0.3" :connected 0 :announcement 200))
+         (peers (list fresh old-a old-b)))
+    ;; fresh is the stalest (stamp 0) but was connected 5s ago: nobody goes,
+    ;; because the sweep drops at most one peer and fresh is the choice.
+    (is (null (bitcoin-lisp.networking:evict-extra-outbound-peers peers now 2 2))
+        "the chosen peer is too new to evict, and the sweep does not fall through
+         to the next-stalest — Core drops at most one per half per call")
+    ;; Age it past the threshold and it goes.
+    (setf (bitcoin-lisp.networking::peer-connected-at fresh) (- now 31))
+    (is (equal (list fresh) (bitcoin-lisp.networking:evict-extra-outbound-peers
+                             peers now 2 2)))
+    ;; With a block in flight from the chosen peer, it stays.
+    (let ((fresh2 (%p3-peer :address "1.0.0.4" :connected 0))
+          (ctx (bitcoin-lisp.networking::make-ibd-context)))
+      (setf (gethash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7)
+                     (bitcoin-lisp.networking::ibd-context-in-flight ctx))
+            (cons fresh2 now))
+      (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+        (is (= 1 (bitcoin-lisp.networking::count-peer-in-flight fresh2))
+            "sanity: the in-flight seam is actually connected")
+        (is (null (bitcoin-lisp.networking:evict-extra-outbound-peers
+                   (list fresh2 old-a old-b) now 2 2))
+            "a peer we are mid-download from must not be rotated out")))))

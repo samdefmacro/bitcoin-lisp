@@ -888,7 +888,6 @@ an exiled honest peer."
           reason (action reason)))
     ;; A verdict nobody has classified must fail safe, never toward punishment.
     (is (eq :refetch (action :some-future-validation-keyword)))))
-=======
 ;;;; ============================================================
 ;;;; G7-16: BIP152 high-bandwidth selection
 ;;;; ============================================================

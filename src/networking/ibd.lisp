@@ -2388,6 +2388,166 @@ chain is useless to us, not malicious."
                   (peer-chain-sync-timeout peer) (+ now +headers-response-time-seconds+))
             :probed)))))))
 
+;;;; ------------------------------------------------------------------
+;;;; Extra-outbound eviction (Core EvictExtraOutboundPeers,
+;;;; net_processing.cpp:5352-5457)
+;;;;
+;;;; Two independent halves over two disjoint peer sets, each running only
+;;;; when that set is over its own target. They are NOT variations on one
+;;;; rule: the block-relay half ranks by when a block was RECEIVED, the
+;;;; full-relay half by when one was ANNOUNCED, and the two clocks disagree
+;;;; precisely for the peer that announces promptly but loses every download
+;;;; race — the peer worth keeping.
+;;;;
+;;;; Lives here rather than in peer.lisp because the release condition needs
+;;;; the in-flight table, and not in node.lisp because that loads later still
+;;;; and is where the sweep is driven from.
+
+(defconstant +minimum-connect-time-seconds+ 30
+  "Core MINIMUM_CONNECT_TIME: how long a peer must have been connected before
+it can be evicted as extra. Without it the stale-tip path is a treadmill —
+open an extra peer, evict it on the next 45s sweep before it has had time to
+announce anything, open another.")
+
+(defun %extra-eviction-releasable-p (peer now test)
+  "Core's final guard on both halves: long enough connected, and no block in
+flight from this peer. The in-flight half matters as much as the clock —
+dropping a peer mid-download throws the bytes away and re-requests them from
+someone else, which under a stale tip is the opposite of progress.
+
+TEST is #'>= for the block-relay half (net_processing.cpp:5386) and #'> for the
+full-relay half (:5438). Core really does write them differently. At one-second
+resolution they diverge only for a peer connected exactly
+MINIMUM_CONNECT_TIME ago, but unifying them would be an unforced divergence and
+the next reader would have no way to tell it was deliberate."
+  (and (funcall test (- now (peer-connected-at peer)) +minimum-connect-time-seconds+)
+       (zerop (count-peer-in-flight peer))))
+
+(defun %peer-network (peer)
+  "PEER's network as a BIP155 keyword (:ipv4 :ipv6 :torv3 :i2p :cjdns), or NIL
+for an address we cannot classify (a hostname). NIL is its own bucket, which is
+the conservative reading: unclassifiable peers only ever protect each other."
+  (nth-value 0 (parse-network-address (peer-address peer))))
+
+(defun %multiple-full-outbound-on-network-p (peers peer)
+  "Core CConnman::MultipleManualOrFullOutboundConns (net.cpp): do we hold more
+than one OUTBOUND_FULL_RELAY-or-MANUAL connection on PEER's network? Manual
+peers count toward the total even though they are never themselves evicted —
+an operator-pinned peer is still a path to that network, which is exactly what
+this guard protects.
+
+Returns NIL — i.e. protects the peer — when it is our only one there. That is
+what stops the rotation severing our last Tor or I2P route while the IPv4 set
+looks healthy."
+  (let ((net (%peer-network peer)))
+    (> (count-if (lambda (p)
+                   (and (peer-live-p p)
+                        (eq (peer-conn-type p) :outbound-full-relay)
+                        (eq (%peer-network p) net)))
+                 peers)
+       1)))
+
+(defun select-extra-block-relay-eviction (peers)
+  "Core EvictExtraOutboundPeers' block-relay half (net_processing.cpp:5360-5397):
+of the block-relay-only peers take the YOUNGEST (highest id, since ids are
+handed out in connection order); if it has given us a block more recently than
+the second-youngest, take the second-youngest instead. Returns a peer or NIL.
+
+The youngest block-relay peer is by construction the extra one opened to
+unstick a stale tip, so this is what closes the slot the stale-tip trigger
+opens. Ranking by PEER-LAST-BLOCK-TIME — block RECEIVED — rather than by the
+announcement stamp is Core's choice and matters: block-relay peers exist to
+deliver blocks, which is also why they are excluded from chain-sync
+protection."
+  (let ((live (remove-if-not (lambda (p)
+                               (and (eq (peer-conn-type p) :block-relay)
+                                    (peer-live-p p)))
+                             peers)))
+    (when live
+      (let* ((sorted (sort (copy-list live) #'> :key #'peer-id))
+             (youngest (first sorted))
+             (next (second sorted)))
+        (if (and next (> (peer-last-block-time youngest)
+                         (peer-last-block-time next)))
+            next
+            youngest)))))
+
+(defun select-extra-full-relay-eviction (peers)
+  "Core EvictExtraOutboundPeers' full-relay half (net_processing.cpp:5400-5432):
+the outbound full-relay peer with the OLDEST last-block-announcement, ties
+broken toward the HIGHER id. Returns a peer or NIL.
+
+Four filters, each of which changes the answer:
+
+  - live peers only (Core's `!pfrom.fDisconnect');
+  - never a chain-sync-protected peer (:5419) — P2 hands out that flag
+    precisely so this rotation cannot take the peer back;
+  - never a MANUAL peer. Core gets this free because MANUAL is a separate
+    connection type from OUTBOUND_FULL_RELAY; we type -addnode peers as
+    :outbound-full-relay (see replace-disconnected-peers), so without this
+    clause the rotation would evict the operator's pinned peers — the exact
+    regression the plan's §2 forbids;
+  - never our only full-relay-or-manual connection on a network
+    (MultipleManualOrFullOutboundConns, :5422), so rotation cannot cost us our
+    last Tor or I2P path.
+
+The tie-break is not cosmetic. Every peer that has never announced sits at
+stamp 0, so during IBD and after any restart the whole outbound set ties and
+this comparison IS the policy: highest id = most recently connected = least
+invested, which is also what stops the sweep evicting a long-lived peer that
+simply has not seen a new block yet."
+  (let ((candidates
+          (remove-if-not
+           (lambda (p)
+             (and (eq (peer-conn-type p) :outbound-full-relay)
+                  (peer-live-p p)
+                  (not (peer-chain-sync-protect p))
+                  (not (peer-manual p))
+                  (%multiple-full-outbound-on-network-p peers p)))
+           peers)))
+    (when candidates
+      (reduce (lambda (worst p)
+                (let ((wa (peer-last-block-announcement worst))
+                      (pa (peer-last-block-announcement p)))
+                  (cond ((< pa wa) p)
+                        ((and (= pa wa) (> (peer-id p) (peer-id worst))) p)
+                        (t worst))))
+              candidates))))
+
+(defun evict-extra-outbound-peers (peers now full-relay-target block-relay-target)
+  "Core PeerManagerImpl::EvictExtraOutboundPeers (net_processing.cpp:5352).
+Drops at most one peer per half per call. Returns the peers actually
+disconnected, for the caller's log and for the tests.
+
+Each half is gated on ITS OWN set against ITS OWN target, exactly as Core gates
+on GetExtraBlockRelayCount / GetExtraFullOutboundCount. Comparing a combined
+outbound count against a combined target instead would let two idle block-relay
+slots mask a full-relay set that is one over, and vice versa — the same
+conflation replace-disconnected-peers already documents on the dialing side of
+the same two pools.
+
+The targets are arguments rather than reads: the full-relay one is node-scoped
+(node-max-peers, raised by one while the tip looks stale) and node.lisp loads
+after this file."
+  (let ((evicted '()))
+    (flet ((live-count (type)
+             (count-if (lambda (p) (and (peer-live-p p) (eq (peer-conn-type p) type)))
+                       peers))
+           (try (victim test label)
+             (when (and victim (%extra-eviction-releasable-p victim now test))
+               (bitcoin-lisp:log-info
+                "Disconnecting extra ~A peer ~A (last announcement ~D, connected ~Ds)"
+                label (peer-address victim)
+                (peer-last-block-announcement victim)
+                (- now (peer-connected-at victim)))
+               (disconnect-peer victim)
+               (push victim evicted))))
+      (when (> (live-count :block-relay) block-relay-target)
+        (try (select-extra-block-relay-eviction peers) #'>= "block-relay-only"))
+      (when (> (live-count :outbound-full-relay) full-relay-target)
+        (try (select-extra-full-relay-eviction peers) #'> "outbound")))
+    (nreverse evicted)))
+
 (defun maybe-disconnect-low-work-outbound (peer chain-state full-batch)
   "Core's IBD chain-quality drop (net_processing.cpp:2926-2944): during IBD, a
 peer that has no more headers to give us and whose best-known chain has less
@@ -2450,10 +2610,25 @@ threads read/write under the same lock."
    (multiple-value-bind (valid error) (validate-header-chain headers chain-state)
     (when error
       (bitcoin-lisp:log-warn "Header validation error: ~A" error))
-    (let ((added (process-headers valid chain-state))
-          ;; Core's pindexLast as an index ENTRY, set below — the follow-up
-          ;; getheaders is built from it, never from our own header tip.
-          (last-entry nil))
+    (let* (;; Core's received_new_header (net_processing.cpp:3079) is
+           ;; `last_received_header == nullptr', where last_received_header is
+           ;; the index lookup of headers.BACK() (:3052) — i.e. the LAST header
+           ;; of the RECEIVED batch was unknown to us. It has to be read before
+           ;; process-headers stores anything, which is what forces LET* here.
+           ;; The LET this replaced would have evaluated its init forms in the
+           ;; same order, but that ordering would have been load-bearing and
+           ;; invisible: swapping two bindings would make every batch look
+           ;; already-known and the stamp would silently never advance.
+           (received-new-header
+             (and headers
+                  (null (bitcoin-lisp.storage:get-block-index-entry
+                         chain-state
+                         (bitcoin-lisp.serialization:block-header-hash
+                          (car (last headers)))))))
+           (added (process-headers valid chain-state))
+           ;; Core's pindexLast as an index ENTRY, set below — the follow-up
+           ;; getheaders is built from it, never from our own header tip.
+           (last-entry nil))
       (funcall count-fn added)
       ;; Core's pindexLast (net_processing.cpp ProcessHeadersMessage): the last
       ;; header of the RECEIVED batch that is in the block index afterwards —
@@ -2508,7 +2683,21 @@ threads read/write under the same lock."
             (when (and tip best
                        (>= (bitcoin-lisp.storage:block-index-entry-chain-work best)
                            (bitcoin-lisp.storage:block-index-entry-chain-work tip)))
-              (maybe-protect-outbound-peer peer)))))
+              (maybe-protect-outbound-peer peer))
+            ;; Core net_processing.cpp:2921-2923, the statement immediately
+            ;; before the protection grant. Adjacent, but NOT the same test:
+            ;; protection takes pindexBestKnownBlock >= tip, this takes
+            ;; pindexLast STRICTLY > tip and additionally requires the batch to
+            ;; have been new. Collapsing the two — the obvious simplification,
+            ;; since here BEST and LAST-ENTRY are the same entry — would stamp
+            ;; every peer sitting at our own tip on every duplicate
+            ;; announcement, and the rotation that reads this stamp would then
+            ;; see a uniformly fresh outbound set and rotate on the tie-break
+            ;; alone, i.e. by peer id.
+            (when (and received-new-header tip last-entry
+                       (> (bitcoin-lisp.storage:block-index-entry-chain-work last-entry)
+                          (bitcoin-lisp.storage:block-index-entry-chain-work tip)))
+              (credit-block-announcement peer)))))
       (when (> added 0)
         (bitcoin-lisp:log-info "~A: ~D headers, ~D new" label (length headers) added))
       ;; Second value: Core's pindexLast as an index ENTRY. The follow-up
