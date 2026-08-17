@@ -102,7 +102,7 @@ shell wires in the explorer views + universal search box."
 in the peers view + nav link + networking-disabled banner, and every RPC
 method the page calls is a registered dispatcher method. (The page's
 rendering/sort/action behavior is covered by the zero-dependency node
-harness in tests/ui/peers.test.mjs — run: node --test tests/ui/peers.test.mjs.)"
+harness in tests/ui/peers.test.mjs — run: scripts/dev.sh ui-test.)"
   (with-ui-reply ()
     (let ((body (bitcoin-lisp.rpc::ui-handle "/ui/js/peers.js")))
       (is (= 200 (hunchentoot:return-code*)))
@@ -127,8 +127,7 @@ in the console view + nav link, and `help` — the one RPC the page's
 autocomplete depends on — is registered and emits the newline-separated
 list of registered method names the page parses. (The page's parsing/
 autocomplete/history/rendering behavior is covered by the zero-dependency
-node harness in tests/ui/console.test.mjs — run: node --test
-tests/ui/console.test.mjs.)"
+node harness in tests/ui/console.test.mjs — run: scripts/dev.sh ui-test.)"
   (with-ui-reply ()
     (let ((body (bitcoin-lisp.rpc::ui-handle "/ui/js/console.js")))
       (is (= 200 (hunchentoot:return-code*)))
@@ -162,15 +161,16 @@ tests/ui/console.test.mjs.)"
     (is (equal lines (sort (copy-list lines) #'string<)))))
 
 (test ui-handle-serves-wallet-assets
-  "The P6a wallet + QR modules are served with the JS content type, the
-shell wires in the wallet view + nav link, every RPC method the page calls
-is a registered dispatcher method, and the /wallet/<name> endpoint parsing
-the page's endpoint-aware rpc.js relies on resolves names. (The page's
-selector/overview/receive/history/address-book behavior is covered by the
-zero-dependency node harness in tests/ui/wallet.test.mjs, and the QR
-encoder byte-exactly against reference vectors in tests/ui/qr.test.mjs —
-run: node --test tests/ui/wallet.test.mjs tests/ui/qr.test.mjs.)"
-  (dolist (path '("/ui/js/wallet.js" "/ui/js/qr.js"))
+  "The wallet, QR and wallet-crypt modules are served with the JS content
+type, the shell wires in the wallet view + nav link, every RPC method the
+page calls is a registered dispatcher method, and the /wallet/<name>
+endpoint parsing the page's endpoint-aware rpc.js relies on resolves names.
+(The page's selector/overview/receive/history/address-book behavior, and the
+P6d lifecycle/encryption panels, are covered by the zero-dependency node
+harness in tests/ui/wallet.test.mjs; the QR encoder is checked byte-exactly
+against reference vectors in tests/ui/qr.test.mjs — run both with
+scripts/dev.sh ui-test.)"
+  (dolist (path '("/ui/js/wallet.js" "/ui/js/qr.js" "/ui/js/wallet-crypt.js"))
     (with-ui-reply ()
       (let ((body (bitcoin-lisp.rpc::ui-handle path)))
         (is (= 200 (hunchentoot:return-code*)) "~S must be served" path)
@@ -187,7 +187,12 @@ run: node --test tests/ui/wallet.test.mjs tests/ui/qr.test.mjs.)"
                     "getbalances" "getwalletinfo" "getblockcount"
                     "getnewaddress" "getaddressinfo"
                     "listtransactions" "gettransaction"
-                    "listlabels" "getaddressesbylabel" "setlabel"))
+                    "listlabels" "getaddressesbylabel" "setlabel"
+                    ;; P6d lifecycle + encryption panels
+                    "createwallet" "unloadwallet"
+                    "encryptwallet" "walletpassphrase"
+                    "walletpassphrasechange" "walletlock"
+                    "backupwallet" "restorewallet"))
     (is (not (null (gethash method bitcoin-lisp.rpc::*rpc-methods*)))
         "RPC method ~S (called by the wallet page) must be registered" method))
   ;; The page pins every wallet RPC to /wallet/<name>; the URI parsing it

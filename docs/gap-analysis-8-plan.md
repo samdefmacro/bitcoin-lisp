@@ -21,7 +21,7 @@ Each agent picks a slug `ga8-<task-letter>` and runs Docker directly instead:
 ```bash
 docker run --rm -i --label agent=ga8-X \
   -v "$PWD:/workspace" -v ga8-X-fasl:/fasl-cache -w /workspace \
-  bitcoin-lisp-sbcl:2.6.5 sbcl --dynamic-space-size 4096 --non-interactive \
+  bitcoin-lisp-sbcl:2.6.5-2 sbcl --dynamic-space-size 4096 --non-interactive \
   --eval '(asdf:load-system "bitcoin-lisp/tests")' \
   --eval '(let ((r (fiveam:run :bitcoin-lisp-tests)))
             (fiveam:explain! r)

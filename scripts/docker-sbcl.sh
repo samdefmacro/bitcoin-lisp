@@ -14,7 +14,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE=bitcoin-lisp-sbcl:2.6.5
+IMAGE=bitcoin-lisp-sbcl:2.6.5-2
 
 if [ ! -e "$REPO/refs/coalton" ]; then
   echo "ERROR: refs/coalton missing — run scripts/setup-coalton.sh first" >&2

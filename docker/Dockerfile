@@ -8,8 +8,17 @@
 # at run time (see scripts/docker-sbcl.sh / scripts/docker-test.sh), so image
 # rebuilds are needed only when the toolchain changes, never for code changes.
 #
+# TAG CONVENTION: <sbcl-version>-<toolchain-revision>. The SBCL version must
+# keep naming the SBCL actually inside (it matches production and is
+# load-bearing); the suffix is bumped whenever anything else in the image
+# changes. Bumping rather than rebuilding the old tag in place matters because
+# the Docker daemon is shared with other sessions: they keep working against
+# the tag they started with until they choose to rebuild.
+#   2.6.5    -> initial
+#   2.6.5-2  -> + nodejs, so the web UI test harness runs in-container too
+#
 # Build (from the repo root):
-#   docker build -f docker/Dockerfile -t bitcoin-lisp-sbcl:2.6.5 .
+#   docker build -f docker/Dockerfile -t bitcoin-lisp-sbcl:2.6.5-2 .
 
 FROM debian:trixie-slim AS build
 
@@ -69,6 +78,20 @@ RUN curl -fsSL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp 
  && sbcl --dynamic-space-size 4096 --non-interactive \
       --eval '(ql:quickload (list "ironclad" "nibbles" "cffi" "usocket" "flexi-streams" "alexandria" "bordeaux-threads" "hunchentoot" "yason" "cl-base64" "fiveam" "coalton"))' \
  && rm /tmp/quicklisp.lisp
+
+# nodejs is the web UI's TEST HARNESS ONLY (`scripts/dev.sh ui-test` runs
+# `node --test tests/ui/`). Unlike SBCL and libsecp256k1 its exact version is
+# NOT load-bearing: nothing the node ships runs on it, the harness has zero npm
+# dependencies, and it needs only `node --test` plus ESM (node >= 18; trixie
+# ships 20.x). It is here so the UI suite has the same container contract as
+# every other suite, instead of being the one that had to run on the host.
+#
+# LAST layer deliberately. Everything above it is expensive — the quicklisp
+# dist fetch and a Coalton compile under a 4 GB heap — and Docker invalidates
+# every layer after a changed one. Putting a frontend-only dependency up in
+# the first apt line would make every future bump of it re-run that.
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 CMD ["sbcl"]
