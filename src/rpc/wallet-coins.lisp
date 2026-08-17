@@ -1280,6 +1280,8 @@ keypoolrefill). PARAMS: (newsize). 0/omitted uses the wallet's keypool size."
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid parameter, expected valid size."))
     (with-wallet-lock (wallet)
+      ;; Refilling derives new keys, which a locked wallet cannot do.
+      (wallet-ensure-unlocked wallet)
       ;; 0 => TopUp's -keypool default.
       (let ((kp-size (if (integerp newsize) newsize 0))
             (spkms (%wallet-active-spkms wallet)))

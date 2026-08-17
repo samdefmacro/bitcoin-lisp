@@ -249,6 +249,10 @@ receive requests use \"rr<id>\")."
   (%wser (s) (%wser-string s +wdb-key-mkey+)
              (bitcoin-lisp.serialization:write-uint32-le s id)))
 
+(defun wdb-parse-mkey-fields (fields)
+  "The uint32 nID from an mkey record key's field bytes."
+  (%wparse (s fields) (bitcoin-lisp.serialization:read-uint32-le s)))
+
 (defun wdb-key-lockedutxo (txid n)
   (%wser (s) (%wser-string s +wdb-key-lockedutxo+)
              (bitcoin-lisp.serialization:write-bytes s txid)
@@ -366,11 +370,24 @@ written but never read).")
     (loop repeat (bitcoin-lisp.serialization:read-compact-size s)
           collect (bitcoin-lisp.serialization:read-bytes s 32))))
 
+(defstruct wallet-master-key
+  "Core CMasterKey (crypter.h:33-60): the wallet's random 32-byte keying
+material, itself encrypted under a passphrase-derived key. Every descriptor
+private key is encrypted with the plaintext master key, so changing the
+passphrase rewraps only this record and never touches the keys.
+
+Lives here beside the mkey record codec so the loader in wallet.lisp — which
+compiles first — can SETF its slots."
+  (crypted-key nil)                              ; 48-byte AES-256-CBC ciphertext
+  (salt nil)                                     ; exactly 8 bytes
+  (derivation-method 0 :type (unsigned-byte 32)) ; 0 = SHA-512; nothing else exists
+  (derive-iterations 25000 :type (unsigned-byte 32))
+  (other-params (make-array 0 :element-type '(unsigned-byte 8))))
+
 (defun wdb-mkey-value (crypted-key salt derivation-method derive-iterations
                        other-params)
   "CMasterKey (crypter.h:33-60): vchCryptedKey, vchSalt, nDerivationMethod,
-nDeriveIterations, vchOtherDerivationParameters. Defined at P1 for schema
-completeness; encryption itself is wallet P6."
+nDeriveIterations, vchOtherDerivationParameters."
   (%wser (s)
     (bitcoin-lisp.serialization:write-var-bytes s crypted-key)
     (bitcoin-lisp.serialization:write-var-bytes s salt)
@@ -408,7 +425,12 @@ completeness; encryption itself is wallet P6."
        t))
 
 (defun wallet-db-records (db)
-  "All (key . value) byte-vector pairs in DB, in key order."
+  "All (key . value) byte-vector pairs in DB, in key order.
+
+Signals rather than returning a short list if the scan stopped on an I/O or
+corruption error: a bad block only makes the iterator go invalid, which is
+indistinguishable from reaching the end. Every caller here — wallet load and
+backup — is wrong in a dangerous way if it silently sees a subset."
   (let ((out '()))
     (bitcoin-lisp.storage:with-leveldb-iterator (iter db)
       (bitcoin-lisp.storage:leveldb-iter-seek-to-first iter)
@@ -416,5 +438,6 @@ completeness; encryption itself is wallet P6."
             do (push (cons (bitcoin-lisp.storage:leveldb-iter-key iter)
                            (bitcoin-lisp.storage:leveldb-iter-value iter))
                      out)
-               (bitcoin-lisp.storage:leveldb-iter-next iter)))
+               (bitcoin-lisp.storage:leveldb-iter-next iter))
+      (bitcoin-lisp.storage:leveldb-iter-check-error iter))
     (nreverse out)))
