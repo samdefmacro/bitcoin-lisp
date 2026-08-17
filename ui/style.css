@@ -210,6 +210,18 @@ table.blocks td.col-height { font-weight: 650; }
   max-width: 1180px; margin: 0 auto;
 }
 
+/* --- the hidden attribute --------------------------------------------
+
+   The UA stylesheet's `[hidden] { display: none }` is a *user-agent* rule, so
+   ANY author rule that sets `display` beats it regardless of specificity.
+   `#login-view` carries `.login-wrap` (display:flex) and the six routed views
+   carry `.grid` (display:grid), so setting `el.hidden = true` on them did
+   nothing at all: a successful login left the full-viewport login panel on
+   screen, and every route rendered all six views stacked. Author-level and
+   !important so it wins over any class a hidable element picks up later. */
+
+[hidden] { display: none !important; }
+
 /* --- login --------------------------------------------------------- */
 
 .login-wrap {

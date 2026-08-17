@@ -22,6 +22,26 @@ function setStatus(stateName) {
   $('status-dot').dataset.state = stateName;
 }
 
+// 401 and 403 both come back as AuthError but mean opposite things to the
+// person reading the screen: one is a credential to re-paste, the other is a
+// URL to fix. The Origin check compares the browser's Origin against the Host
+// header, so a mismatch means the page was opened at an address that is not
+// how the request reaches the node — the classic case being a tunnel or proxy
+// that rewrites Host.
+function authErrorText(e) {
+  if (!(e instanceof rpc.AuthError)) return `Could not reach the node: ${e.message}`;
+  if (e.status === 403) {
+    return 'The node refused the request because the page\'s origin does not '
+      + 'match the address the request arrived on (Origin vs Host). Open the '
+      + 'UI at the same host and port the RPC is reached on — e.g. '
+      + 'http://localhost:18332/ui/ over an ssh -L tunnel. The credential was '
+      + 'not the problem.';
+  }
+  return 'The node rejected these credentials. Paste the .cookie file from the '
+    + 'node\'s data directory (it is regenerated on every restart), or use '
+    + 'your -rpcuser / -rpcpassword.';
+}
+
 function showLogin(message = '') {
   loggedIn = false;
   stopPolling();
@@ -148,7 +168,10 @@ async function poll(epoch) {
     $('conn-banner').hidden = true;
   } catch (e) {
     if (e instanceof rpc.AuthError) {
-      showLogin(`Session ended: ${e.message}. Sign in again.`);
+      // Same distinction as the login form: a 403 mid-session is an Origin
+      // problem, not an expired credential, and "sign in again" is the wrong
+      // instruction for it.
+      showLogin(authErrorText(e));
       return;
     }
     setStatus('down');
@@ -211,9 +234,7 @@ $('login-form').addEventListener('submit', async (ev) => {
     showApp();
   } catch (e) {
     rpc.clearCredentials();
-    err.textContent = e instanceof rpc.AuthError
-      ? 'The node rejected these credentials.'
-      : `Could not reach the node: ${e.message}`;
+    err.textContent = authErrorText(e);
     err.hidden = false;
   } finally {
     btn.disabled = false;
