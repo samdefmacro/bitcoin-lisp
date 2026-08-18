@@ -324,24 +324,30 @@ rule (or give them Core's reserved quota); add protection passes on last-block/l
 to `peer-min-ping-latency`; scale uptime protection to half the candidate set. The onion carve-out
 must key on `peer-inbound-onion`, not the address string — the string is the thing that collides.
 
-### S2-7. `noX=1` — the only negation spelling a bitcoin.conf can carry — is silently discarded
+### S2-7 → S3. The `noX=1` config-negation spelling is silently discarded (downgraded in review)
 
-Core splits key from value **first**, then runs `InterpretKey` on the bare key: any key starting
-`no` is stripped and marked negated regardless of a following value
-(`src/common/args.cpp:78-92`). Its config parser goes further — a line without `=` is a hard parse
-error whose message tells the operator to write `noX=1` instead (`src/common/config.cpp:64-71`), so
-**`noX=1` is the only negation spelling a config file can express**.
+**Downgraded to S3 in the GA9 review pass.** The divergence is real but the original framing was
+overstated — see the correction below.
+
+Core splits key from value **first**, then runs `InterpretKey` on the bare key
+(`src/common/args.cpp:77-91`): any key starting `no` is stripped and marked negated regardless of a
+following value, and `ReadConfigStream` (`src/common/config.cpp:97-109`) runs it on config-file keys,
+so `nolisten=1` becomes `listen=false`.
 
 `parse-cli-args` (`src/config.lisp:614-624`) tests for `=` **before** testing the `no` prefix, so
-the stripping branch is reachable only for a bare `-noX` token with no value. `nolisten=1` becomes
-the alist cell `("nolisten" . "1")`, which no lookup ever consults. `parse-bitcoin-conf` drops any
-line without `=`, so the bare form is unusable in a file either.
+the stripping branch is reachable only for a bare `-noX` token. `nolisten=1` becomes the alist cell
+`("nolisten" . "1")`, which no consumer looks up (`config-alist->start-node-plist` and
+`apply-config-globals` key on the positive name), and `known-config-option-p` (`:748-756`) tolerates
+the raw `noKEY` spelling so not even the unknown-key warning fires. So the idiomatic Core spelling
+`nolisten=1` / `nodnsseed=1` / `nowallet=1` is silently dropped and does the *opposite* of intent —
+a real fail-open bug.
 
-In bitcoin.conf, negation is therefore **entirely non-functional**: `nolisten=1` still opens the
-inbound listener; `nolistenonion=1` still starts the onion listener and torcontrol; `nodnsseed=1`
-still queries DNS seeds — the exact clearnet leak the code documents elsewhere as the reason
-`-dnsseed` is soft-set off under `-onlynet`; `nowallet=1` on a test network still loads wallets, so
-a node the operator declared key-free holds keys.
+**But it is not "the only negation a config file can express," and negation is not "entirely
+non-functional":** the positive-key form `listen=0` / `dnsseed=0` / `wallet=0` is an equally valid
+Core negation and **is** honored by our parser and consumers (`conf-parse-bool "0"` → NIL). Only the
+`noX=1` spelling breaks. With a trivial working equivalent, operator-config gating, and no
+consensus/funds/remote-attacker dimension, this is S3, not S2. The review verdict corrected both the
+severity and the claim.
 
 Completely silent: `known-config-option-p` deliberately accepts the raw `noKEY` spelling, so
 neither `check-cli-args` nor the unknown-key warning fires.
@@ -1073,7 +1079,7 @@ active-chain test used, under one lookup**, or a concurrent reorg splits the two
 The rest of `extract-partial-merkle-tree` is a faithful port of `TraverseAndExtract`, and the
 parser has no P2P caller — the surface is the RPC only.
 
-## S2-15. `getblocktemplate` discards `template_request` entirely
+## S2-15 → S3. `getblocktemplate` discards `template_request` entirely (downgraded in review)
 
 `rpc-getblocktemplate` (`src/rpc/methods.lisp:3037-3102`) opens with `(declare (ignore params))` and
 unconditionally assembles a template — while still advertising `capabilities: ["proposal"]` and
@@ -1101,7 +1107,7 @@ branch, and put the segwit gate **before** template assembly so a rule-unaware m
 template at all. If longpoll stays unimplemented, dropping `longpollid` from the reply is safer than
 advertising it.
 
-## S2-16. The web UI console stores and echoes raw command lines, including passphrases and private keys
+## S2-16 → S3. The web UI console stores raw command lines, including passphrases and private keys (downgraded in review)
 
 Core's Qt console keeps a `historyFilter` list — `walletpassphrase`, `walletpassphrasechange`,
 `encryptwallet`, `signrawtransactionwithkey`, `signmessagewithprivkey`, `createwallet`, … — annotated
@@ -1320,11 +1326,50 @@ wallet crypter's KDF and the one-directional PKCS#7 pad check match.
 
 # Final tally and sequencing
 
-**9 S1 · 17 S2 · ~40 S3**, across all twelve dimensions, none of them previously known.
+**As found: 9 S1 · 17 S2 · ~40 S3.** After the GA9 review-pass verification of every S1 and every
+S2 (see "Verification pass results" below): **9 S1 · 14 S2 · ~43 S3** — 0 findings refuted, 3 S2s
+downgraded to S3 (S2-7, S2-15, S2-16), and S1-3 upgraded from medium to verified. Every S1 and S2
+in this report has now been re-read against both trees.
 
 **All nine S1s** were re-confirmed by the orchestrator directly against both trees — eight during
 the run, and S1-3 (the one the finder rated medium) in the GA9 review pass. Every S1 heading now
 carries a **[verified]** marker.
+
+## Verification pass results (GA9 review, 2026-08-18)
+
+A refute-biased pass — the one GA8 ran and this round originally owed — re-read every S1 and every
+S2 against both trees, defaulting each to "refuted" unless the divergence reproduced from source.
+**Outcome: 0 refuted, 3 S2s downgraded to S3, 1 S1 upgraded (S1-3 medium → verified). Nothing was
+found to be non-reproducible.**
+
+All nine S1s: **verified** against both trees (eight during the run, S1-3 in this pass).
+
+The seventeen S2s:
+
+| id | verdict | note |
+|---|---|---|
+| S2-1 signet | **CONFIRMED** | both defects reproduce; verified independently by the orchestrator too. `calculate-next-work-required` clamps on the *constant* `+pow-limit-target+`, so a signet fix must change both call sites. |
+| S2-2 index eq-walk | **CONFIRMED** | reachable on the **natural** `%mark-block-subtree-invalid` path, not only the RPCs — an organically-discovered invalid block above a live tip already exposes it. Self-heals on restart. |
+| S2-3 assumevalid skip | **CONFIRMED** | correctly S2: no cheap mainnet-tip exploit, but real windows on the min-difficulty test networks and in the fresh-IBD checkpoint-fallback. |
+| S2-4 onion discourage | **CONFIRMED** | `record-misbehavior` (peer.lisp:1500) discourages at :1512 with no `IsLocal()` carve-out. |
+| S2-5 addrman Attempt | **CONFIRMED** | impact is eclipse-resistance / getaddr-pollution, not a direct DoS — state it that way. |
+| S2-6 inbound eviction | **CONFIRMED** | more precisely: retains **2 of Core's 6** protection passes and *inverts* the netgroup pass (targets the most-populous group instead of protecting keyed groups). |
+| S2-7 noX=1 negation | **→ S3** | overstated: `listen=0` is a working equivalent negation that IS honored. Only the `noX=1` spelling breaks. Operator-gated, trivial workaround. |
+| S2-8 recv accounting | **CONFIRMED** | unbounded per-peer command-keyed table; unknown command is a no-op (no rate limit, no disconnect). |
+| S2-9 inbound handshake | **CONFIRMED** | renewable 10×15s budget; `%await-verack` at peer.lisp:1039-1059 recomputes the deadline per call. |
+| S2-10 reorg no flush | **CONFIRMED** | `maybe-periodic-flush` is unreachable from `perform-reorg`; lives only in the extend-tip branch. |
+| S2-11 gettxoutsetinfo race | **CONFIRMED** | RPC thread maphash/clrhashes the live table lock-free while the sync thread mutates it under the node lock — UB plus a droppable spend. |
+| S2-12 no Uncache | **CONFIRMED** | mempool input fetch inserts confirmed prevouts into the production cache with no eviction until the next block. |
+| S2-13 txindex in-memory | **CONFIRMED** | kept S2 despite `-txindex` being opt-in/off-by-default: a hard non-self-healing OOM that renders `getrawtransaction` structurally unusable at mainnet scale. |
+| S2-14 PSBT precedence | **CONFIRMED** | full loss chain verified by the orchestrator: inverted precedence → legacy sig permitted → legacy sighash omits the amount → excess to miner. |
+| S2-15 getblocktemplate | **→ S3** | real on all three axes, but authenticated-operator + opt-in mining + no consensus/peer impact; the one loss path needs a segwit-unaware miner (extinct since 2017). Borderline. |
+| S2-16 UI console secrets | **→ S3** | real parity gap, but exposure is strictly local: same-origin per-tab store, no XSS exfil path (see the RPC dimension's cleared list), loopback-bound service. Operator's own secret in the operator's own browser. |
+| S2-17 package-RBF trunc | **CONFIRMED** | verified during the run. |
+
+**Still owed after this pass:** the ~40 S3s were not put through refute-biased verification. They
+are lower-stakes by construction (missing features, format/test gaps), but a 10th round should
+sweep them, and should apply the citation corrections the verifiers noted (a handful of file:line
+offsets of 1–2 lines, mechanisms unchanged).
 
 ## Fix order
 
@@ -1362,4 +1407,5 @@ carries a **[verified]** marker.
 - **A wrong premise in the brief is a real risk.** The BIP32 item was asserted by the orchestrator
   and was false; the finder caught it only because the brief also told it to read Core rather than
   trust the prompt. Keep that instruction, and treat brief text as a hypothesis.
-- **Still owed: an adversarial refute-biased verification pass** over every finding here.
+- **The S1/S2 verification pass is done** (see "Verification pass results"): 0 refuted, 3
+  downgraded, 1 upgraded. Still owed: the same treatment for the ~40 S3s.
