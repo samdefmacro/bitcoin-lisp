@@ -1754,3 +1754,51 @@ feature: more peers, none of them ever rotated."
         (is (= 1 (length (bitcoin-lisp.networking:evict-extra-outbound-peers
                           peers 10000 (bitcoin-lisp::node-max-peers node) 2)))
             "the extra peer must put us over the eviction target, not under it")))))
+
+;;;; GA9 S2-4 / S2-5: two addrman and discouragement parity gaps
+
+(test ga9-s2-4-local-peers-are-disconnected-but-not-discouraged
+  "Core MaybeDiscourageAndDisconnect (net_processing.cpp:5194-5201) disconnects
+a local peer for misbehaviour but does NOT discourage it, `since that would
+discourage all peers on the same local address' — and its log line names the
+inbound-onion case as what the carve-out protects.
+
+We discouraged unconditionally. Every inbound onion peer arrives through the
+local Tor daemon on the loopback listener, so its address is literally
+127.0.0.1: one misbehaving onion peer discouraged the loopback and with it
+every present and future onion peer, silently disabling onion reachability."
+  (dolist (case '(("127.0.0.1" t   "the loopback every inbound onion peer presents as")
+                  ("127.53.9.2" t  "anywhere in 127.0.0.0/8")
+                  ("0.0.0.0"   t   "Core treats 0.0.0.0/8 as local too")
+                  ("::1"       t   "IPv6 loopback")
+                  ("8.8.8.8"   nil "an ordinary public peer is still discourageable")
+                  ("192.168.1.5" nil "RFC1918 is NOT IsLocal in Core")))
+    (destructuring-bind (addr local reason) case
+      (is (eq (and (bitcoin-lisp.networking:local-address-p addr) t) (and local t))
+          "~A: ~A" addr reason))))
+
+(test ga9-s2-5-every-dial-path-records-an-addrman-attempt
+  "Core calls addrman.Attempt() on EVERY dial, in ConnectNode, immediately after
+the attempt and before the socket is examined (net.cpp:492-497). We recorded
+only from the failure branch of connect-to-peers, which runs at startup and when
+the peer count hits zero — so replace-disconnected-peers, establish-outbound-peer
+(and thus maintain-block-relay-peers) and the feeler recorded nothing.
+
+nAttempts is addrman's entire quality signal: without it selection cannot age
+out dead addresses, the feeler that exists to prove the tried table can never
+mark anything bad, and we re-dial and re-gossip corpses. Asserted structurally,
+because the alternative is standing up four live dials in a unit test."
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/node.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search "%record-dial-attempt" src) "the recorder must exist")
+    ;; One definition plus one call per dial path.
+    (is (>= (length (bitcoin-lisp.tests::%count-substring "%record-dial-attempt" src)) 4)
+        "every dial path must record: definition + 3 steady-state call sites")))
+
+(defun %count-substring (needle haystack)
+  "All start positions of NEEDLE in HAYSTACK, as a list."
+  (loop with n = (length needle)
+        for start = 0 then (1+ pos)
+        for pos = (search needle haystack :start2 start)
+        while pos collect pos))

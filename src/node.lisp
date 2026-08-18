@@ -3642,6 +3642,33 @@ deliberately exempt from -onlynet, matching Core."
                            name-proxy-p)))
                    addresses)))
 
+(defun %record-dial-attempt (node host port)
+  "Stamp an addrman dial attempt for HOST:PORT — Core CConnman::ConnectNode
+calls addrman.Attempt() on EVERY dial, immediately after the attempt and before
+the socket is examined (net.cpp:492-497).
+
+We recorded attempts from exactly one place, the failure branch of
+connect-to-peers, and that function runs only at startup and when the peer
+count hits zero. Every steady-state dial — replace-disconnected-peers,
+establish-outbound-peer (and so maintain-block-relay-peers), and the feeler —
+recorded nothing, so nAttempts stayed 0 for addresses we had tried and failed
+repeatedly. addrman's whole quality signal is that counter: without it the
+selection cannot age out dead addresses, the feeler that exists to prove the
+tried table cannot mark anything bad, and we keep re-dialing and re-gossiping
+the same corpses. That is an eclipse-resistance and getaddr-hygiene loss, not a
+crash.
+
+Good() resets the counter on a successful VERSION, so stamping every dial does
+not penalise addresses that work."
+  (let ((address-book (node-address-book node)))
+    (when address-book
+      (multiple-value-bind (net ip-bytes)
+          (bitcoin-lisp.networking:parse-network-address host)
+        (when net
+          (ignore-errors
+           (bitcoin-lisp.networking:address-book-attempt
+            address-book ip-bytes port :count-failure t :net net)))))))
+
 (defun %record-outbound-result (address-book addr port peer success)
   "Record an outbound dial outcome for ADDR:PORT in ADDRESS-BOOK, adding the
 entry if new (network-typed, so IPv6/onion/cjdns peers get addrman credit
@@ -4019,9 +4046,11 @@ Returns the number of new peers connected."
         (let ((addr (car candidate)))
           (unless (member addr used-addrs :test #'string=)
             (handler-case
-                (let ((peer (bitcoin-lisp.networking:connect-peer
-                             addr (or (cdr candidate)
-                                      (network-port (node-network node))))))
+                (let* ((dial-port (or (cdr candidate)
+                                      (network-port (node-network node))))
+                       (peer (progn
+                               (%record-dial-attempt node addr dial-port)
+                               (bitcoin-lisp.networking:connect-peer addr dial-port))))
                   (when peer
                     (setf (bitcoin-lisp.networking:peer-address peer) addr)
                     (when (bitcoin-lisp.networking:perform-handshake peer)
@@ -4084,7 +4113,8 @@ connection type. Returns the peer or NIL. MUST run on the sync thread so
 node-peers stays single-writer. No-op when networking is disabled."
   (when (node-network-active node)
     (handler-case
-        (let ((peer (bitcoin-lisp.networking:connect-peer host port)))
+        (let ((peer (progn (%record-dial-attempt node host port)
+                           (bitcoin-lisp.networking:connect-peer host port))))
           (when peer
             (setf (bitcoin-lisp.networking:peer-address peer) host)
             (if (bitcoin-lisp.networking:perform-handshake peer :conn-type conn-type)
@@ -4183,7 +4213,8 @@ the address good (promoting it new -> tried). Always disconnects afterward --
 feelers exist only to validate addrman's tried table (Core anti-eclipse), never
 to join the peer set."
   (handler-case
-      (let ((peer (bitcoin-lisp.networking:connect-peer host port)))
+      (let ((peer (progn (%record-dial-attempt node host port)
+                         (bitcoin-lisp.networking:connect-peer host port))))
         (when peer
           (setf (bitcoin-lisp.networking:peer-address peer) host)
           (when (bitcoin-lisp.networking:perform-handshake peer :conn-type :feeler)

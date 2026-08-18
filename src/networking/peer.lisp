@@ -1521,6 +1521,22 @@ node-lock), never the reverse, so it cannot deadlock against node-lock.")
   (bt:with-lock-held (*ban-lock*)
     (bitcoin-lisp:clear-recent-rejects *discouraged-peers*)))
 
+(defun local-address-p (address)
+  "T when ADDRESS is a loopback address — Core CNetAddr::IsLocal
+(netaddress.cpp:398-410): IPv4 127.0.0.0/8 or 0.0.0.0/8, or IPv6 ::1.
+
+Used to decide whether misbehaviour may be DISCOURAGED, which is an
+address-level verdict. Every inbound onion peer reaches us through the local
+Tor daemon, so they all present as 127.0.0.1: discouraging that address bans
+the loopback itself and takes every onion peer with it."
+  (and (stringp address)
+       (or (string= address "::1")
+           (let ((dot (position #\. address)))
+             (and dot
+                  (let ((first-octet (ignore-errors
+                                      (parse-integer address :end dot))))
+                    (and first-octet (or (= first-octet 127) (= first-octet 0)))))))))
+
 (defun record-misbehavior (peer &optional reason)
   "Discourage and disconnect PEER for a protocol violation. Bitcoin Core's
 misbehavior model is binary (Misbehaving -> m_should_discourage): any single
@@ -1531,7 +1547,18 @@ logged. Returns T."
   (when reason
     (bitcoin-lisp:log-cat "net" "Misbehaving peer ~A: ~A"
                           (peer-address peer) reason))
-  (discourage-peer (peer-address peer))
+  ;; Core MaybeDiscourageAndDisconnect (net_processing.cpp:5194-5201):
+  ;; disconnect a local peer for bad behaviour but do NOT discourage it,
+  ;; "since that would discourage all peers on the same local address" — and
+  ;; Core's own log line names the inbound-onion case as what this protects.
+  ;;
+  ;; We discouraged unconditionally. Every inbound onion peer arrives via the
+  ;; local Tor daemon on the loopback listener, so its address is literally
+  ;; "127.0.0.1": one misbehaving onion peer discouraged the loopback address
+  ;; and with it every present and future onion peer, silently disabling onion
+  ;; reachability. The disconnect below still happens either way.
+  (unless (local-address-p (peer-address peer))
+    (discourage-peer (peer-address peer)))
   (when (peer-connection peer)
     (close-connection (peer-connection peer))
     (setf (peer-connection peer) nil))
