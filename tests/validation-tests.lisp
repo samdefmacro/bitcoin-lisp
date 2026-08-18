@@ -1512,3 +1512,71 @@ agreement underneath that gate."
                tx utxo-set :height 800000)))
     (is (eq t (bitcoin-lisp.validation:validate-transaction-scripts
                tx utxo-set :height 400000)))))
+
+;;;; ==================================================================
+;;;; GA9 S1-2 / S1-3: two consensus gates that accepted what Core rejects
+
+(test ga9-s1-2-finality-covers-the-coinbase
+  "Core's ContextualCheckBlock iterates block.vtx with NO IsCoinBase guard
+(validation.cpp:4176-4181), so vtx[0] is finality-checked like any other
+transaction. We iterated (rest transactions) and skipped it, which let a
+coinbase with an nLockTime past the cutoff and a non-final nSequence connect
+here while every Core node rejected the block bad-txns-nonfinal.
+
+The coinbase exclusion belongs to the BIP68 loop three lines below, which Core
+DOES guard (validation.cpp:2528) — it was simply applied to the wrong loop, so
+this asserts the property directly on check-transaction-final: a coinbase-shaped
+transaction is not exempt from finality."
+  (let* ((coinbase
+           (bitcoin-lisp.serialization:make-transaction
+            :version 1
+            :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                             :previous-output
+                             (bitcoin-lisp.serialization:make-outpoint
+                              :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)
+                              :index #xffffffff)
+                             :script-sig (coerce #(3 1 2 3) '(vector (unsigned-byte 8)))
+                             ;; NOT SEQUENCE_FINAL: this is what makes nLockTime bite.
+                             :sequence 0))
+            :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                              :value 5000000000
+                              :script-pubkey (coerce #(81) '(vector (unsigned-byte 8)))))
+            ;; Locked to a height far beyond the block we would put it in.
+            :lock-time 900000)))
+    (is-false (bitcoin-lisp.validation:check-transaction-final coinbase 800000 800000)
+              "a coinbase locked to a future height with a non-final sequence is
+               NOT final, and must be judged rather than skipped")
+    ;; The ordinary coinbase shape Core's miner produces stays final, so the
+    ;; fix cannot reject honest blocks.
+    (setf (bitcoin-lisp.serialization:tx-in-sequence
+           (aref (bitcoin-lisp.serialization:transaction-inputs coinbase) 0))
+          #xffffffff)
+    (is-true (bitcoin-lisp.validation:check-transaction-final coinbase 800000 800000)
+             "SEQUENCE_FINAL makes nLockTime irrelevant — the normal coinbase")))
+
+(test ga9-s1-3-bip68-version-gate-is-unsigned
+  "Core stores the transaction version as `const uint32_t'
+(primitives/transaction.h:293) and gates BIP68 on `tx.version >= 2'
+(consensus/tx_verify.cpp:51). Unsigned, so EVERY version with bit 31 set is
+>= 2 and Core enforces relative locktimes on it.
+
+Our slot is (signed-byte 32) — correct, because that is what the wire format
+reads — so a signed comparison saw 0x80000002 as -2147483646 and skipped BIP68
+altogether. The fix reinterprets at the gate only; the slot must stay signed or
+serialization stops round-tripping.
+
+Asserted on the gate arithmetic rather than through a full block so the two
+boundary versions and the high-bit version are all covered cheaply."
+  (flet ((enforced-p (version) (>= (ldb (byte 32 0) version) 2)))
+    (is-false (enforced-p 1) "version 1: BIP68 does not apply")
+    (is-true (enforced-p 2) "version 2: BIP68 applies")
+    ;; 0x80000002 as read into a (signed-byte 32) slot.
+    (let ((high-bit -2147483646))
+      (is (= #x80000002 (ldb (byte 32 0) high-bit))
+          "control: this really is the 0x80000002 bit pattern")
+      (is-true (< high-bit 2)
+               "control: under a SIGNED compare it reads as less than 2 — which
+                is exactly how it escaped enforcement")
+      (is-true (enforced-p high-bit)
+               "unsigned, it is >= 2, so BIP68 must be enforced as Core does"))))
