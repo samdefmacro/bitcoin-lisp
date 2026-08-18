@@ -1194,7 +1194,13 @@
    #:peer-live-p
    #:release-outbound-protection
    #:maybe-protect-outbound-peer
+   #:credit-block-announcement
+   #:peer-last-block-announcement
    #:consider-chain-sync-eviction
+   #:evict-extra-outbound-peers
+   #:any-blocks-in-flight-p
+   #:select-extra-block-relay-eviction
+   #:select-extra-full-relay-eviction
    #:maybe-set-peer-announcing-hb
    #:maybe-send-feefilter
    #:fee-filter-round
