@@ -12,7 +12,7 @@ part 1 and were re-run in part 2, in batches of four — the full surface is now
 
 **These findings have NOT been through an adversarial refute-biased verification pass.** GA7 and
 GA8 both had verification change the answer repeatedly (GA8: one refuted, one upgraded, four
-downgraded, one sharpened). What this round has instead is that **nine of the ten S1s were
+downgraded, one sharpened). What this round has instead is that **eight of the nine S1s were
 re-confirmed by the orchestrator directly against both source trees**, rather than resting on a
 single agent's reading; those are marked **[verified]**.
 
@@ -1317,9 +1317,9 @@ wallet crypter's KDF and the one-directional PKCS#7 pad check match.
 
 # Final tally and sequencing
 
-**10 S1 · 17 S2 · ~40 S3**, across all twelve dimensions, none of them previously known.
+**9 S1 · 17 S2 · ~40 S3**, across all twelve dimensions, none of them previously known.
 
-Nine of the ten S1s were re-confirmed by the orchestrator directly against both trees. The
+**Eight of the nine S1s** were re-confirmed by the orchestrator directly against both trees. The
 exception is S1-3 (the BIP68 signed-version gate), which its finder rated medium confidence and
 which should get an executable control before anyone touches it.
 
