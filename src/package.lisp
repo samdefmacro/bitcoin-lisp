@@ -1211,6 +1211,7 @@
    #:fee-filter-round
    #:peer-manual
    #:peer-outbound-or-block-relay-p
+   #:local-address-p
    #:peer-conn-type
    #:peer-relays-txs-p
    #:peer-tx-relay-p
