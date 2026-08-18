@@ -1,7 +1,6 @@
 # Outbound eclipse resistance (GA7 G7-08) — re-spec
 
-Status: **P0/P1/P2 implemented (PRs #313, #314); P3 specified, not
-implemented.**
+Status: **P0-P3 implemented. G7-08 is complete.**
 
 This is a re-specification. The original automated spec for G7-08 was judged
 **unsound** by an adversarial review, with two *design-breaking* errors (§2).
@@ -162,7 +161,20 @@ calls `disconnect-peer` itself or reaps a peer already in `:disconnected`, i.e.
 one that has already released. Membership in `node-peers` is not what the
 accounting depends on.
 
-### P3 — stale tip and extra outbound
+### P3 — stale tip and extra outbound (DONE)
+
+Implemented as specified below. Two things the spec did not say, found while
+porting and worth keeping:
+
+- **The dialing budget and the eviction budget differ by one, deliberately.**
+  The extra slot raises only what ThreadOpenConnections may dial (net.cpp:2722);
+  GetExtraFullOutboundCount keeps measuring against the unraised maximum
+  (:2473), so the extra peer is immediately one too many and the rotation drops
+  the stalest. The extra slot buys a REPLACEMENT. Raising both together makes
+  the connection permanent and silences the rotation entirely.
+- **Staleness is computed as a difference inside get-universal-time**, never by
+  converting an epoch, which removes the §3 clock hazard rather than managing
+  it.
 
 `CheckForStaleTipAndEvictPeers` (net_processing.cpp:5460) on the 45s cadence
 already established in `maintain-peers` by P1's `consider-outbound-evictions`.

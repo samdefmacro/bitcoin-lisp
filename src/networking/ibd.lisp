@@ -2514,6 +2514,16 @@ simply has not seen a new block yet."
                         (t worst))))
               candidates))))
 
+(defun any-blocks-in-flight-p ()
+  "Core's `mapBlocksInFlight.empty()' test, inverted (net_processing.cpp:1339).
+GLOBAL, not per-peer: the question the stale-tip check asks is whether the node
+as a whole is making progress, and a download in flight from anyone means our
+tip is about to move on its own. Answering it per-peer would call the tip stale
+while a block was actively arriving and open an extra connection for nothing."
+  (and *ibd-context*
+       (plusp (hash-table-count (ibd-context-in-flight *ibd-context*)))
+       t))
+
 (defun evict-extra-outbound-peers (peers now full-relay-target block-relay-target)
   "Core PeerManagerImpl::EvictExtraOutboundPeers (net_processing.cpp:5352).
 Drops at most one peer per half per call. Returns the peers actually
