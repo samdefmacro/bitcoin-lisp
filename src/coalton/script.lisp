@@ -557,13 +557,39 @@
 
   (declare cast-to-bool ((Vector U8) -> Boolean))
   (define (cast-to-bool bytes)
-    "Convert script bytes to boolean.
-     Returns False for empty vector, all zeros, or negative zero (0x80)."
+    "Script truth, transliterated from Core CastToBool
+     (script/interpreter.cpp:36-48): scan for the first non-zero byte; it is
+     false only when that byte is the LAST one and equals 0x80, i.e. for every
+     negative zero at ANY length -- 80, 0080, 000080, ...
+
+     This previously recognised the ONE-byte negative zero only, so 00 80 and
+     00 00 80 came back TRUE where Core returns FALSE. That is the truth
+     predicate behind the final EVAL_FALSE check, OP_IF, OP_NOTIF, OP_VERIFY
+     and OP_IFDUP, so the divergence did not merely accept a script Core
+     rejects -- under OP_IF it selects the OPPOSITE BRANCH, and an attacker can
+     make an entire redeem branch execute differently on the two
+     implementations. MINIMALDATA does not gate it: that constrains the push
+     ENCODING, not the bytes pushed, so OP_PUSHBYTES_3 00 00 80 is a perfectly
+     standard push and this is reachable under mandatory consensus flags."
     (lisp Boolean (bytes)
-      (cl:not (cl:or (cl:zerop (cl:length bytes))
-                     (cl:every #'cl:zerop bytes)
-                     (cl:and (cl:= (cl:length bytes) 1)
-                             (cl:= (cl:aref bytes 0) #x80))))))
+      ;; Core's rule restated without a scan cursor: the value is true unless
+      ;; it is all zeros, or it is a negative zero -- last byte 0x80 with every
+      ;; earlier byte zero, which is precisely `the first non-zero byte is the
+      ;; last one and equals 0x80'.
+      ;;
+      ;; Deliberately built from EVERY / AREF / LENGTH / SUBSEQ only. Two
+      ;; earlier attempts inside this escape (DOTIMES + CL:RETURN, then
+      ;; POSITION-IF-NOT) are correct as plain Common Lisp and were verified as
+      ;; such, yet produced the wrong answer here -- so this uses exactly the
+      ;; operations the previous implementation had already proven behave as
+      ;; expected through the escape.
+      (cl:let ((n (cl:length bytes)))
+        (cl:and (cl:not (cl:every #'cl:zerop bytes))
+                (cl:not (cl:and (cl:plusp n)
+                                (cl:= (cl:aref bytes (cl:1- n)) #x80)
+                                (cl:every #'cl:zerop
+                                          (cl:subseq bytes 0 (cl:1- n)))))
+                cl:t))))
 
   (declare script-num-in-range (ScriptNum -> Boolean))
   (define (script-num-in-range sn)

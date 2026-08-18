@@ -234,7 +234,7 @@ usocket server socket, or NIL on failure (e.g. port already in use)."
 accept and wrap it in a connection. Returns the connection, or NIL on timeout or
 error. The timeout lets the accept loop poll a shutdown flag between waits."
   (handler-case
-      (when (usocket:wait-for-input server-socket :timeout timeout :ready-only t)
+      (when (socket-input-ready-p server-socket :timeout timeout)
         (let ((client (usocket:socket-accept server-socket
                                              :element-type '(unsigned-byte 8))))
           (when client
@@ -575,6 +575,54 @@ peer is not stalled at all, however long we took to get back to it."
        (> (- (get-internal-real-time) (connection-recv-last-progress conn))
           (* +receive-stall-timeout-seconds+ internal-time-units-per-second))))
 
+(defparameter *recv-backtrace-budget* 3
+  "How many non-I/O receive backtraces to log per process before falling back
+to the one-line message. Bounded because this fires once per failing peer: the
+2026-08-17 mainnet incident logged ~15k of these in 200k lines, and an
+unbounded backtrace there would have buried the log it was meant to explain.
+Three is enough — the failure repeats identically.")
+
+(defvar *recv-backtrace-remaining* nil
+  "Countdown behind *RECV-BACKTRACE-BUDGET*; NIL until the first capture.")
+
+(defvar *recv-backtrace-lock* (bt:make-lock "recv-backtrace")
+  "Guards the countdown: receive runs on the pump, the listener and the
+handshake threads at once, and a lost decrement would let the budget leak.")
+
+(defun %recv-error-diagnosable-p (c)
+  "Is C one of OUR bugs rather than the peer going away? Same discrimination
+the caller's log line makes, factored out so the capture and the message can
+never disagree about it."
+  (not (typep c '(or stream-error usocket:socket-condition end-of-file))))
+
+(defun capture-recv-backtrace (c)
+  "A backtrace for C as a string, or NIL when C is ordinary I/O or the budget
+is spent.
+
+Called from a HANDLER-BIND rather than the HANDLER-CASE below, because only
+handler-bind is GUARANTEED to run before any unwinding: the standard runs its
+handlers in the dynamic environment of the signal, while handler-case transfers
+control first and what survives is then implementation business.
+
+Measured here rather than assumed, since the obvious claim turns out to be too
+strong: on this SBCL a handler-case handler still saw the signalling frames,
+41 of them against handler-bind's 45. So handler-case is not useless — it is
+merely not guaranteed, and the four frames it drops are the innermost ones,
+which is precisely the end of the trace this function exists to capture."
+  (when (and (%recv-error-diagnosable-p c)
+             (bt:with-lock-held (*recv-backtrace-lock*)
+               (let ((left (or *recv-backtrace-remaining* *recv-backtrace-budget*)))
+                 (when (plusp left)
+                   (setf *recv-backtrace-remaining* (1- left))
+                   t))))
+    ;; Never let diagnostics take the connection down: a failure to render the
+    ;; backtrace must degrade to the plain message, not to a second error
+    ;; inside the handler for the first one.
+    (ignore-errors
+     (with-output-to-string (s)
+       #+sbcl (sb-debug:print-backtrace :stream s :count 40)
+       #-sbcl (format s "(no backtrace: not SBCL)")))))
+
 (defun receive-bytes-resumable (conn count)
   "Take whatever of COUNT bytes has arrived, WITHOUT waiting for the rest.
 
@@ -592,8 +640,10 @@ right budget depends on who is waiting — the blocking wrapper bounds one call'
 wait, the pump bounds peer silence (CONNECTION-RECEIVE-EXPIRED-P). Enforcing a
 per-read deadline here charged peers for OUR scheduling delay, which reaped
 healthy peers whenever a pump cycle ran long."
-  (handler-case
-      (let ((socket (connection-socket conn))
+  (let ((backtrace nil))
+   (handler-case
+      (handler-bind ((error (lambda (c) (setf backtrace (capture-recv-backtrace c)))))
+       (let ((socket (connection-socket conn))
             (stream (connection-stream conn))
             (now (get-internal-real-time)))
         (unless socket
@@ -666,16 +716,17 @@ healthy peers whenever a pump cycle ran long."
                    (connection-recv-buffer conn) nil
                    (connection-recv-filled conn) 0)
              buffer)
-            (t :incomplete))))
+            (t :incomplete)))))
     ;; A dead socket surfaces as any of several conditions, so the net is wide —
     ;; but a wide net also swallows OUR bugs as "the peer went away". A type
     ;; error in this function once looked exactly like every peer hanging up at
     ;; once; say so instead of hiding it.
     (error (c)
-      (unless (typep c '(or stream-error usocket:socket-condition end-of-file))
-        (bitcoin-lisp:log-warn "Receive failed on ~A:~D with a non-I/O error: ~A"
-                               (connection-host conn) (connection-port conn) c))
-      (%abandon-receive conn))))
+      (when (%recv-error-diagnosable-p c)
+        (bitcoin-lisp:log-warn
+         "Receive failed on ~A:~D with a non-I/O error: ~A~@[~%Backtrace:~%~A~]"
+         (connection-host conn) (connection-port conn) c backtrace))
+      (%abandon-receive conn)))))
 
 (defun receive-bytes (conn count &key (timeout 30))
   "Receive exactly COUNT bytes, WAITING for them. Returns a byte vector, or NIL
@@ -732,12 +783,10 @@ generous +RECEIVE-STALL-TIMEOUT-SECONDS+ instead."
       ;; signal interrupts the underlying select() with EINTR, which usocket
       ;; surfaces as not-ready. Re-wait; the budget above ends genuine silence.
       (handler-case
-          (usocket:wait-for-input socket :timeout 0.5 :ready-only t)
+          (socket-input-ready-p socket :timeout 0.5)
         (error () (return (%receive-gave-up conn)))))))
 
 (defun data-available-p (conn &key (timeout 0))
   "Check if data is available to read on the connection."
   (when (and (connection-socket conn) (connection-connected conn))
-    (usocket:wait-for-input (connection-socket conn)
-                            :timeout timeout
-                            :ready-only t)))
+    (socket-input-ready-p (connection-socket conn) :timeout timeout)))
