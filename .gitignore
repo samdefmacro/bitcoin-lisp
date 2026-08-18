@@ -30,9 +30,13 @@ quicklisp/
 build/
 bin/
 
-# Data directories
-data/
-blocks/
+# Data directories. NOTE the trailing-slash-only patterns match at ANY depth,
+# so a bare `data/' also swallowed tests/data/ and a fresh clone hard-errored on
+# the taproot vector test with FILE-DOES-NOT-EXIST. Anchor them to the repo root
+# and keep the test vectors tracked.
+/data/
+/blocks/
+!tests/data/
 
 # Editor backups
 *~
