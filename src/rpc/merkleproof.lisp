@@ -69,6 +69,13 @@ leaves (Core TraverseAndExtract + ExtractMatches validation). Returns
 ROOT is a 32-byte vector; MATCHED-TXIDS a list of 32-byte vectors."
   (when (zerop ntx)
     (return-from extract-partial-merkle-tree nil))
+  ;; Core CPartialMerkleTree::ExtractMatches (merkleblock.cpp:157-159):
+  ;; "check for excessively high numbers of transactions". The claimed count
+  ;; drives the tree shape, so an absurd value makes us build an absurd tree
+  ;; before any other bound can reject it.
+  ;; MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT = 4000000 / (4 * 60).
+  (when (> ntx (floor 4000000 (* 4 60)))
+    (return-from extract-partial-merkle-tree nil))
   ;; one bit per node and at least one node per hash, hashes <= ntx
   (let ((bits (coerce bits 'vector))
         (hashv (coerce hashes 'vector)))
@@ -230,10 +237,36 @@ strings, or an empty list if the block isn't in the active chain."
             (unless (equalp root header-root)
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Merkle root mismatch — proof does not match its header"))
-            ;; Core pushes a VARR either way, so both arms render [] rather
-            ;; than null when empty.
-            (if (and entry
-                     (bitcoin-lisp.storage:entry-on-active-chain-p chain-state entry))
+            ;; Core throws here rather than returning an empty result
+            ;; (rpc/txoutproof.cpp:160-163):
+            ;;
+            ;;   if (!pindex || !ActiveChain().Contains(pindex) || pindex->nTx == 0)
+            ;;       throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found in chain");
+            ;;
+            ;; The comment previously here asserted "Core returns []", which is
+            ;; simply not what Core does. A caller asking whether a txid is
+            ;; committed to by a block cannot distinguish "no" from "I have no
+            ;; idea what block that is" when both render as [].
+            (unless (and entry
+                         (bitcoin-lisp.storage:entry-on-active-chain-p chain-state entry)
+                         (plusp (bitcoin-lisp.storage:block-index-entry-tx-count entry)))
+              (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                :message "Block not found in chain"))
+            ;; THE proof check (rpc/txoutproof.cpp:165-170, "Check if proof is
+            ;; valid, only add results if so"): the count the proof CLAIMS must
+            ;; equal the count the block actually has.
+            ;;
+            ;; Without this the RPC could be made to prove anything about a
+            ;; real block. CPartialMerkleTree's shape is a pure function of the
+            ;; claimed nTransactions, so understating it reinterprets INTERNAL
+            ;; nodes of the real tree as leaves: for a 4-tx block with root
+            ;; H(H(t0,t1), H(t2,t3)), a proof claiming 2 transactions with
+            ;; hashes [H(t0||t1), H(t2||t3)] recomputes the header's real root
+            ;; exactly, passes every structural bound we have, and made us
+            ;; return an internal node as a "proven txid". Anyone running
+            ;; deposit, bridge or attestation logic through this RPC got a
+            ;; forged yes for the cost of one call -- no chain access, no
+            ;; hashpower.
+            (if (= ntx (bitcoin-lisp.storage:block-index-entry-tx-count entry))
                 (json-array (mapcar #'hash-to-hex matched))
-                ;; Block unknown or not on the active chain: Core returns [].
                 (json-array nil))))))))

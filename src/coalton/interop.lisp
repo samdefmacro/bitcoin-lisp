@@ -1993,13 +1993,34 @@ Used to remove the signature being verified from the scriptCode before sighash."
 
 (defun check-der-signature-format (sig-bytes)
   "Check if signature bytes are valid strict DER format per BIP66.
-   Returns T if valid, NIL if invalid."
+   Returns T if valid, NIL if invalid.
+
+   FRAME: SIG-BYTES excludes the trailing hashtype byte -- VERIFY-CHECKSIG
+   strips it before calling. Core\'s IsValidSignatureEncoding
+   (script/interpreter.cpp:108-123) takes the FULL signature INCLUDING that
+   byte, so every one of its bounds is one larger than ours. Each limit below
+   is Core\'s, shifted by exactly that one byte."
   (let ((len (length sig-bytes)))
-    ;; Minimum: 0x30 len 0x02 r-len r 0x02 s-len s (8 bytes with 1-byte R and S)
+    ;; Core: `if (sig.size() < 9) return false\' -- 9 with the hashtype byte,
+    ;; so 8 here.
     (when (< len 8)
       (return-from check-der-signature-format nil))
-    ;; Maximum: 73 bytes (0x30 + len + 0x02 + 33 + r + 0x02 + 33 + s)
-    (when (> len 73)
+    ;; Core: `if (sig.size() > 73) return false\' -- 73 INCLUDING the hashtype
+    ;; byte, so 72 here.
+    ;;
+    ;; This was 73, i.e. Core\'s number left in Core\'s frame while the
+    ;; minimum above had already been shifted to 8. The mismatch admitted
+    ;; exactly one length Core rejects: a 74-byte signature (lenR=34, lenS=33)
+    ;; satisfies every DER-integer rule, so in Core the size cap is the ONLY
+    ;; thing rejecting it, and it is a hard SCRIPT_ERR_SIG_DER. We instead
+    ;; handed it to secp256k1_ecdsa_signature_parse_der, which accepts it with
+    ;; r silently clamped to zero, giving a FALSE result rather than an error
+    ;; -- and NULLFAIL, which would have made it an error, is policy-only and
+    ;; unset during block validation. So any script where a false CHECKSIG is
+    ;; not fatal (`<sig74> OP_CHECKSIG OP_NOT\' in a P2SH redeem script is
+    ;; enough) accepted a spend Core rejects. DERSIG is mandatory on every
+    ;; current block.
+    (when (> len 72)
       (return-from check-der-signature-format nil))
     ;; Must start with SEQUENCE tag (0x30)
     (unless (= (aref sig-bytes 0) #x30)
