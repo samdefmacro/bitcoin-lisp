@@ -2822,3 +2822,83 @@ actually exists."
                "the coins pointer and the chain tip must name one block")
            (is (= 1 (bitcoin-lisp.storage:current-height chain-state)))))
        (clrhash bitcoin-lisp.validation::*block-undo-data*)))))
+
+;;;; GA9 S1-4: an invalidated entry must never be resurrected
+
+(test ga9-s1-4-invalid-block-is-not-resurrected
+  "Core never rebuilds a CBlockIndex — AddToBlockIndex is a try_emplace that
+returns the existing object (node/blockstorage.cpp:228-231) — and
+AcceptBlockHeader refuses a known-invalid block with `duplicate-invalid'
+(validation.cpp:4231-4235) and any block on an invalid parent with
+`bad-prevblk' (:4252-4255).
+
+We had none of that: connect-block constructed a FRESH entry with
+:status :valid and add-block-index-entry is a plain (setf gethash), a replace
+that erased the :invalid mark. So invalidateblock was undone by a single
+unsolicited block message — the RPC reorgs down and marks the block invalid,
+leaving the tip at its parent, so a peer replaying the block hits the
+tip-extension arm, passes validate-block (it IS consensus-valid; the
+invalidation is a manual override) and was re-created as valid. The operator's
+node silently rejoined the chain they had refused.
+
+Asserted at the acceptance gate, which is where a peer's message actually
+arrives."
+  (let* ((chain-state (bitcoin-lisp.storage:make-chain-state))
+         (genesis-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element 1))
+         (bad-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                  :initial-element 2))
+         (bad-block (make-reorg-test-block genesis-hash bad-hash 1))
+         (bad-real-hash (bitcoin-lisp.serialization:block-header-hash
+                         (bitcoin-lisp.serialization:bitcoin-block-header bad-block))))
+    ;; Genesis-ish parent, on the active chain.
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state (bitcoin-lisp.storage:make-block-index-entry
+                  :hash genesis-hash :height 0 :chain-work 1 :status :valid))
+    (bitcoin-lisp.storage:update-chain-tip chain-state genesis-hash 0)
+    ;; The operator (or the validator) has marked this block invalid.
+    (bitcoin-lisp.storage:add-block-index-entry
+     chain-state (bitcoin-lisp.storage:make-block-index-entry
+                  :hash bad-real-hash :height 1 :chain-work 2 :status :invalid))
+    (multiple-value-bind (ok err)
+        (bitcoin-lisp.networking::accept-downloaded-block
+         bad-block chain-state (bitcoin-lisp.storage:make-utxo-set) nil)
+      (is-false ok "a block already marked invalid must not be accepted")
+      (is (eq :duplicate-invalid err)
+          "and it must be refused as Core's duplicate-invalid, got ~S" err))
+    ;; The mark must still be there afterwards — the whole point.
+    (is (eq :invalid (bitcoin-lisp.storage:block-index-entry-status
+                      (bitcoin-lisp.storage:get-block-index-entry
+                       chain-state bad-real-hash)))
+        "the :invalid mark must survive the acceptance attempt")
+    ;; A child of the invalid block: Core's bad-prevblk.
+    (let* ((child-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element 3))
+           (child (make-reorg-test-block bad-real-hash child-hash 2)))
+      (multiple-value-bind (ok err)
+          (bitcoin-lisp.networking::accept-downloaded-block
+           child chain-state (bitcoin-lisp.storage:make-utxo-set) nil)
+        (is-false ok "a block building on an invalid parent must be refused")
+        (is (eq :bad-prevblk err)
+            "and refused as Core's bad-prevblk, got ~S" err)))))
+
+(test ga9-s1-5-getblocktxn-depth-limit
+  "Core serves a blocktxn only within MAX_BLOCKTXN_DEPTH (10) of the tip and
+otherwise sends the whole block, for the reason its own comment gives
+(net_processing.cpp:4380-4387): a small reply for an expensive disk read lets a
+peer trigger those reads for free, so it is made to receive the data instead.
+
+We had no depth test. Every historical block hash is public, GET-BLOCK has no
+cache, and the pump grants each peer 32 messages per pass — so ~40 wire bytes
+bought a full read and parse of up to a 4 MB block, on the same thread that
+runs validation. This asserts the arithmetic of the gate, which is the part
+that decides whether the read happens at all."
+  (flet ((within-depth-p (block-height tip-height)
+           (>= block-height (- tip-height bitcoin-lisp.networking::+max-blocktxn-depth+))))
+    (is (= 10 bitcoin-lisp.networking::+max-blocktxn-depth+)
+        "Core MAX_BLOCKTXN_DEPTH is 10")
+    (is-true (within-depth-p 1000 1000) "the tip itself is servable")
+    (is-true (within-depth-p 990 1000) "exactly 10 deep is servable")
+    (is-false (within-depth-p 989 1000) "11 deep is not — Core sends the block")
+    (is-false (within-depth-p 1 1000)
+              "and an ancient block, which is the whole attack, is refused")))

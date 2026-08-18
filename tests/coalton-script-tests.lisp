@@ -1273,3 +1273,114 @@ real signature is provided (interpreter.cpp:1161)."
     ;; without STRICTENC, no pubkey-encoding error
     (let ((bitcoin-lisp.coalton.interop:*script-flags* nil))
       (is (null (bitcoin-lisp.coalton.interop::check-pubkey-encoding bad-pk))))))
+
+;;; ============================================================
+;;; GA9 S1-6: negative zero at any length
+
+(test ga9-s1-6-cast-to-bool-multi-byte-negative-zero
+  "Core's CastToBool (script/interpreter.cpp:36-48) scans for the first
+non-zero byte and returns false when that byte is the LAST one and equals
+0x80 — so EVERY encoding of negative zero is false: 80, 0080, 000080, ...
+
+We recognised the one-byte form only, so 00 80 and 00 00 80 came back TRUE
+where Core returns FALSE. This is the truth predicate behind the final
+EVAL_FALSE check, OP_IF, OP_NOTIF, OP_VERIFY and OP_IFDUP — under OP_IF the
+two implementations take OPPOSITE BRANCHES, so an attacker can make a whole
+redeem branch diverge. MINIMALDATA does not gate it: it constrains the push
+encoding, not the bytes pushed.
+
+The tests that existed covered 0x80 and single bytes only, which is exactly
+how the multi-byte form survived. Both interpreters are asserted here, and
+asserted to AGREE, since the legacy CL copy carried the identical bug and
+fixing one alone would let them drift."
+  (let ((cases '((#()          nil "empty")
+                 (#(0)         nil "single zero")
+                 (#(0 0)       nil "all zeros")
+                 (#(#x80)      nil "one-byte negative zero")
+                 (#(0 #x80)    nil "two-byte negative zero — was TRUE for us")
+                 (#(0 0 #x80)  nil "three-byte negative zero — was TRUE for us")
+                 (#(1)         t   "one")
+                 (#(0 1)       t   "trailing one")
+                 (#(#x80 0)    t   "0x80 first but NOT last: genuinely true")
+                 (#(#x81)      t   "negative one")
+                 (#(0 0 #x81)  t   "multi-byte negative one"))))
+    (dolist (case cases)
+      (destructuring-bind (bytes expected label) case
+        ;; Coalton's `Vector U8' is a CL (VECTOR T), NOT a specialized
+        ;; (vector (unsigned-byte 8)) -- passing the specialized form is a
+        ;; type error at the boundary, and the rest of this file works only
+        ;; because #(0) literals are already (vector t). Getting this wrong
+        ;; costs an afternoon: the call fails in a way that looks like the
+        ;; function returning a wrong answer rather than rejecting its input.
+        (let ((generic (make-array (length bytes) :initial-contents (coerce bytes 'list)))
+              (specialized (coerce bytes '(vector (unsigned-byte 8)))))
+          (is (eq (and (bitcoin-lisp.coalton.script:cast-to-bool generic) t)
+                  (and expected t))
+              "coalton cast-to-bool ~A: ~S" label bytes)
+          (is (eq (and (bitcoin-lisp.validation::cast-to-bool specialized) t)
+                  (and expected t))
+              "legacy cast-to-bool ~A: ~S" label bytes))))))
+
+;;; ============================================================
+;;; GA9 S1-7: FindAndDelete matches only at opcode boundaries
+
+(test ga9-s1-7-find-and-delete-core-vectors
+  "Core's script_FindAndDelete table (test/script_tests.cpp:1520-1608), ported
+verbatim — including the truncated-push cases, which are what pin the edge
+behaviour and are exactly what a hand-rolled implementation gets wrong.
+
+Core advances with GetOp and tests for a match only where GetOp stops, so push
+PAYLOADS are stepped over wholesale. Ours was a plain byte scan deleting every
+byte-aligned occurrence, including inside push data — a chain split anyone can
+trigger. FindAndDelete runs for SigVersion::BASE, i.e. legacy and P2SH spends,
+live today: a P2SH redeemScript `4c 48 47 <B> 75 ac' contains the pattern
+0x47||B at offset 2, which is not a boundary (those are 0, 74, 75). Core hashes
+the script unchanged; we hashed something else. The attack is not circular —
+the pubkey comes from the scriptSig, so the sighash is fixed before the key is
+chosen and the attacker recovers a key that verifies under Core.
+
+Note the case Core labels 'FindAndDelete is single-pass': deletions are not
+re-scanned, so 00 00 01 01 with pattern 00 01 yields ONE match, not two."
+  (flet ((hx (s) (bitcoin-lisp.crypto:hex-to-bytes s))
+         (hex (v) (string-downcase (bitcoin-lisp.crypto:bytes-to-hex v))))
+    (dolist (case '(;; (script pattern expected-result)
+                    ("0302ff03"         "0302ff03"  "")
+                    ("0302ff030302ff03" "0302ff03"  "")
+                    ;; whole opcodes only: these two match nothing
+                    ("0302ff030302ff03" "02"        "0302ff030302ff03")
+                    ("0302ff030302ff03" "ff"        "0302ff030302ff03")
+                    ;; strips the push-three prefix, leaving push-two twice
+                    ("0302ff030302ff03" "03"        "02ff0302ff03")
+                    ;; spans opcodes -> no match ("doesn't match 'inside'")
+                    ("02feed5169"       "feed51"    "02feed5169")
+                    ("02feed5169"       "02feed51"  "69")
+                    ("516902feed5169"   "feed51"    "516902feed5169")
+                    ("516902feed5169"   "02feed51"  "516969")
+                    ;; single-pass: the deletion is not re-scanned
+                    ("00000101"         "0001"      "0001")
+                    ("000001000101"     "0001"      "0001")
+                    ;; trailing invalid push (not enough data) can be removed,
+                    ;; and when it is NOT the match the remainder is still kept
+                    ("0003feed"         "03feed"    "00")
+                    ("0003feed"         "00"        "03feed")))
+      (destructuring-bind (script pattern expected) case
+        (is (string= expected
+                     (hex (bitcoin-lisp.coalton.interop::find-and-delete
+                           (hx script) (hx pattern))))
+            "FindAndDelete(~A, ~A) should be ~S" script pattern expected)))))
+
+(test ga9-s1-7-push-payload-is-not-searched
+  "The concrete shape from the split: a P2SH redeemScript whose push payload
+contains the signature pattern. Core finds nothing because offset 2 is inside a
+push; a byte scan finds it and rewrites the scriptCode, so the two
+implementations hash different bytes and disagree about the block."
+  (let* ((b (make-array 71 :element-type '(unsigned-byte 8) :initial-element #xAB))
+         (pattern (concatenate '(vector (unsigned-byte 8))
+                               (vector #x47) b))
+         ;; 4c 48 <72 bytes> 75 ac  — OP_PUSHDATA1 72, OP_DROP, OP_CHECKSIG
+         (script (concatenate '(vector (unsigned-byte 8))
+                              (vector #x4c #x48) pattern (vector #x75 #xac))))
+    (is (= 76 (length script)) "control: the script is the shape described")
+    (is (equalp script (bitcoin-lisp.coalton.interop::find-and-delete script pattern))
+        "the pattern sits inside a push payload, so Core deletes nothing and the
+         script must come back byte-identical")))

@@ -270,7 +270,7 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "getblocktxn")
-     (handle-getblocktxn peer payload block-store)
+     (handle-getblocktxn peer payload block-store chain-state)
      t)
 
     (t nil)))  ; Unknown message
@@ -919,6 +919,26 @@ never received the branch's blocks."
                           (null (first reorg-outcome))
                           (consp (second reorg-outcome)))
                  (queue-missing-fork-blocks (second reorg-outcome))))))
+      ;; Core's two AcceptBlockHeader gates, which this path had neither of --
+      ;; it branched only on whether the parent is the tip.
+      ;;
+      ;; duplicate-invalid (validation.cpp:4231-4235): a block we already hold
+      ;; and already marked invalid is refused outright. Without it,
+      ;; invalidateblock is undone by one unsolicited block message.
+      (let ((known (bitcoin-lisp.storage:get-block-index-entry
+                    chain-state (bitcoin-lisp.serialization:block-header-hash header))))
+        (when (and known
+                   (eq (bitcoin-lisp.storage:block-index-entry-status known) :invalid))
+          (return-from accept-downloaded-block (values nil :duplicate-invalid))))
+      ;; bad-prevblk (validation.cpp:4252-4255): a block building on an invalid
+      ;; parent is refused before any work is done on it. This is what stops a
+      ;; poisoned subtree being re-offered block by block to force the whole
+      ;; doomed reorg to be attempted again -- roughly 1 MB of message buying
+      ;; an unmetered amount of our validation.
+      (let ((parent (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)))
+        (when (and parent
+                   (eq (bitcoin-lisp.storage:block-index-entry-status parent) :invalid))
+          (return-from accept-downloaded-block (values nil :bad-prevblk))))
       (if (equalp prev-hash current-best-hash)
           ;; Extends the active tip — full validation at tip+1.
           (let ((new-height (1+ (bitcoin-lisp.storage:current-height chain-state))))
@@ -1942,18 +1962,69 @@ the stop hash."
                  peer (bitcoin-lisp.serialization:make-cfcheckpt-message
                        0 stop-hash (nreverse headers)))))))))))
 
-(defun handle-getblocktxn (peer payload block-store)
+(defconstant +max-blocktxn-depth+ 10
+  "Core MAX_BLOCKTXN_DEPTH (net_processing.cpp:140). Deeper than this we refuse
+to build a blocktxn and send the whole block instead.")
+
+(defun handle-getblocktxn (peer payload block-store &optional chain-state)
   "Serve a BIP152 getblocktxn: reply with a blocktxn carrying the requested
 transactions (by index, witness-serialized) from the named block. This is the
 serve side of compact-block relay — without it a peer reconstructing one of our
 compact blocks can't fetch the txs it's missing. Skipped if we don't have the
 block on disk (the peer falls back to a full getdata). An out-of-range index is
-a malformed request: record misbehavior and don't reply."
+a malformed request: record misbehavior and don't reply.
+
+DEPTH: Core serves a blocktxn only within MAX_BLOCKTXN_DEPTH (10) of the tip
+and otherwise sends the full block, for a reason its own comment states
+(net_processing.cpp:4380-4387):
+
+  Sending a full block response instead of a small blocktxn response is
+  preferable in the case where a peer might maliciously send lots of
+  getblocktxn requests to trigger expensive disk reads, because it will
+  require the peer to actually receive all the data read from disk over
+  the network.
+
+We had no depth test. Every historical block hash is public and GET-BLOCK has
+no cache, so ~40 wire bytes bought a random-file open, a full read and a full
+parse of up to a 4 MB block for a ~250-byte reply — and the pump grants each
+peer 32 messages per pass on the same thread that runs block validation. This
+is the one serving path where reply size is decoupled from work done; getdata
+for blocks is self-limiting because the sender must push the bytes.
+
+The test must run BEFORE GET-BLOCK, or the read it exists to prevent has
+already happened. With no CHAIN-STATE we cannot judge depth, so we fall back to
+sending the whole block — never to a free deep read."
   (when block-store
     (let* ((req (bitcoin-lisp.serialization:parse-getblocktxn-payload payload))
            (block-hash (bitcoin-lisp.serialization:block-txn-request-block-hash req))
            (indexes (bitcoin-lisp.serialization:block-txn-request-indexes req))
-           (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+           (entry (and chain-state
+                       (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+           (tip-height (and chain-state (bitcoin-lisp.storage:current-height chain-state)))
+           (within-depth
+             (and entry tip-height
+                  (>= (bitcoin-lisp.storage:block-index-entry-height entry)
+                      (- tip-height +max-blocktxn-depth+)))))
+      (unless within-depth
+        ;; Core queues a full MSG_WITNESS_BLOCK on the peer\'s getdata list, so
+        ;; the block goes out through the getdata path and inherits its
+        ;; backpressure. We send it here instead, which means we must apply
+        ;; that backpressure ourselves: HANDLE-GETDATA refuses to serve another
+        ;; block once the send side is paused, and without the same guard this
+        ;; fallback would just trade a disk-read DoS for a queue one — a peer
+        ;; that never drains could still make us read and serialize 4 MB
+        ;; blocks, only now they pile up in memory.
+        ;;
+        ;; Paused means no reply at all; the peer re-requests, exactly as the
+        ;; getdata path already relies on.
+        (let ((conn (peer-connection peer)))
+          (unless (and conn (connection-send-paused-p conn))
+            (let ((block (bitcoin-lisp.storage:get-block block-store block-hash)))
+              (when block
+                (send-message peer (bitcoin-lisp.serialization:make-block-message
+                                    block :witness t))))))
+        (return-from handle-getblocktxn nil))
+      (let ((block (bitcoin-lisp.storage:get-block block-store block-hash)))
       (when block
         (let* ((txs (coerce (bitcoin-lisp.serialization:bitcoin-block-transactions block)
                             'vector))
@@ -1964,7 +2035,7 @@ a malformed request: record misbehavior and don't reply."
                              block-hash
                              (mapcar (lambda (i) (aref txs i)) indexes)
                              :witness t))
-              (record-misbehavior peer "getblocktxn with out-of-bounds tx indices")))))))
+              (record-misbehavior peer "getblocktxn with out-of-bounds tx indices"))))))))
 
 ;;; Serving headers / blocks / addresses to peers
 ;;;

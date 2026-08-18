@@ -1609,25 +1609,85 @@ bytes that appear as data rather than opcodes."
     (coerce (subseq result 0 (fill-pointer result))
             '(simple-array (unsigned-byte 8) (*)))))
 
+(defun %script-next-op (script pos)
+  "Position just past the opcode at POS and whatever push payload it carries,
+or NIL when the script is exhausted or the push is truncated — i.e. Core\'s
+CScript::GetOp returning false."
+  (let ((len (length script)))
+    (when (>= pos len)
+      (return-from %script-next-op nil))
+    (let ((opcode (aref script pos))
+          (p (1+ pos)))
+      (cond
+        ;; Direct push: the opcode IS the byte count.
+        ((< opcode #x4c) (setf p (+ p opcode)))
+        ;; OP_PUSHDATA1/2/4: a 1-, 2- or 4-byte little-endian length follows.
+        ((<= #x4c opcode #x4e)
+         (let ((size-bytes (ecase opcode (#x4c 1) (#x4d 2) (#x4e 4))))
+           (when (> (+ p size-bytes) len)
+             (return-from %script-next-op nil))   ; truncated length prefix
+           (let ((n 0))
+             (dotimes (k size-bytes)
+               (setf n (logior n (ash (aref script (+ p k)) (* 8 k)))))
+             (setf p (+ p size-bytes n)))))
+        ;; Everything else is a bare opcode.
+        (t nil))
+      (if (> p len)
+          nil                                     ; truncated push payload
+          p))))
+
 (defun find-and-delete (script pattern)
-  "Remove all occurrences of PATTERN from SCRIPT (Bitcoin Core's FindAndDelete).
-Used to remove the signature being verified from the scriptCode before sighash."
-  (if (or (zerop (length pattern)) (> (length pattern) (length script)))
-      script
-      (let ((result (make-array (length script) :element-type '(unsigned-byte 8)
-                                                :fill-pointer 0))
-            (slen (length script))
-            (plen (length pattern))
-            (i 0))
-        (loop while (< i slen)
-              do (if (and (<= (+ i plen) slen)
-                          (equalp (subseq script i (+ i plen)) pattern))
-                     (incf i plen)  ; Skip the pattern
-                     (progn
-                       (vector-push (aref script i) result)
-                       (incf i))))
-        (coerce (subseq result 0 (fill-pointer result))
-                '(simple-array (unsigned-byte 8) (*))))))
+  "Remove occurrences of PATTERN from SCRIPT at OPCODE BOUNDARIES ONLY
+(Core FindAndDelete, script/interpreter.cpp:229-256).
+
+Core advances with GetOp and tests for a match only at the positions GetOp
+stops on, so push PAYLOADS are stepped over wholesale and a pattern lying
+inside one is not a match. Its own unit test pins this
+(script_tests.cpp:1559-1564): pattern `feed51\' in script `02feed5169\' yields
+ZERO matches, commented \"doesn\'t match \'inside\' opcodes\".
+
+This was a plain byte scan that deleted every byte-aligned occurrence,
+including inside push data, and the divergence is a chain split available to
+anyone. FindAndDelete runs for SigVersion::BASE — legacy and P2SH spends, live
+today. A P2SH redeemScript `OP_PUSHDATA1 <72 bytes = 0x47||B> OP_DROP
+OP_CHECKSIG\' is `4c 48 47 <B> 75 ac\'; the pattern 0x47||B occurs at offset 2,
+which is NOT an opcode boundary (those are 0, 74, 75). Core finds nothing and
+hashes the script unchanged; we deleted 72 bytes and hashed something else.
+The attack is not circular: the pubkey comes from the scriptSig, so the sighash
+is fixed BEFORE the key is chosen, and the attacker recovers a pubkey from
+(r, s, H) for which the signature verifies under Core. Core accepts the block,
+we reject it.
+
+Faithful to Core down to the shape: the body runs once before the first GetOp
+(Core\'s do/while), and when GetOp fails on a truncated push the remainder from
+the last boundary to the end is still copied — dropping that would silently
+truncate scripts ending in a malformed push."
+  (let ((slen (length script))
+        (plen (length pattern)))
+    (if (or (zerop plen) (> plen slen))
+        script
+        (let ((result (make-array slen :element-type '(unsigned-byte 8)
+                                       :fill-pointer 0))
+              (pc 0) (pc2 0) (found 0))
+          (loop
+            ;; result += script[pc2 .. pc)
+            (loop for k from pc2 below pc do (vector-push (aref script k) result))
+            ;; Consume every back-to-back occurrence starting exactly here.
+            (loop while (and (>= (- slen pc) plen)
+                             (loop for k below plen
+                                   always (= (aref script (+ pc k)) (aref pattern k))))
+                  do (incf pc plen) (incf found))
+            (setf pc2 pc)
+            (let ((next (%script-next-op script pc)))
+              (unless next (return))
+              (setf pc next)))
+          (if (plusp found)
+              (progn
+                (loop for k from pc2 below slen do (vector-push (aref script k) result))
+                (coerce (subseq result 0 (fill-pointer result))
+                        '(simple-array (unsigned-byte 8) (*))))
+              ;; Core only replaces the script when nFound > 0.
+              script)))))
 
 (defun compute-legacy-sighash (tx input-index subscript sighash-type)
   "Compute legacy sighash from actual transaction data.
@@ -1993,13 +2053,34 @@ Used to remove the signature being verified from the scriptCode before sighash."
 
 (defun check-der-signature-format (sig-bytes)
   "Check if signature bytes are valid strict DER format per BIP66.
-   Returns T if valid, NIL if invalid."
+   Returns T if valid, NIL if invalid.
+
+   FRAME: SIG-BYTES excludes the trailing hashtype byte -- VERIFY-CHECKSIG
+   strips it before calling. Core\'s IsValidSignatureEncoding
+   (script/interpreter.cpp:108-123) takes the FULL signature INCLUDING that
+   byte, so every one of its bounds is one larger than ours. Each limit below
+   is Core\'s, shifted by exactly that one byte."
   (let ((len (length sig-bytes)))
-    ;; Minimum: 0x30 len 0x02 r-len r 0x02 s-len s (8 bytes with 1-byte R and S)
+    ;; Core: `if (sig.size() < 9) return false\' -- 9 with the hashtype byte,
+    ;; so 8 here.
     (when (< len 8)
       (return-from check-der-signature-format nil))
-    ;; Maximum: 73 bytes (0x30 + len + 0x02 + 33 + r + 0x02 + 33 + s)
-    (when (> len 73)
+    ;; Core: `if (sig.size() > 73) return false\' -- 73 INCLUDING the hashtype
+    ;; byte, so 72 here.
+    ;;
+    ;; This was 73, i.e. Core\'s number left in Core\'s frame while the
+    ;; minimum above had already been shifted to 8. The mismatch admitted
+    ;; exactly one length Core rejects: a 74-byte signature (lenR=34, lenS=33)
+    ;; satisfies every DER-integer rule, so in Core the size cap is the ONLY
+    ;; thing rejecting it, and it is a hard SCRIPT_ERR_SIG_DER. We instead
+    ;; handed it to secp256k1_ecdsa_signature_parse_der, which accepts it with
+    ;; r silently clamped to zero, giving a FALSE result rather than an error
+    ;; -- and NULLFAIL, which would have made it an error, is policy-only and
+    ;; unset during block validation. So any script where a false CHECKSIG is
+    ;; not fatal (`<sig74> OP_CHECKSIG OP_NOT\' in a P2SH redeem script is
+    ;; enough) accepted a spend Core rejects. DERSIG is mandatory on every
+    ;; current block.
+    (when (> len 72)
       (return-from check-der-signature-format nil))
     ;; Must start with SEQUENCE tag (0x30)
     (unless (= (aref sig-bytes 0) #x30)
