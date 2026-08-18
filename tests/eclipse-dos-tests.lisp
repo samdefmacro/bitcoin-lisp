@@ -1514,3 +1514,243 @@ Core's and is preserved deliberately."
         (is (null (bitcoin-lisp.networking:evict-extra-outbound-peers
                    (list fresh2 old-a old-b) now 2 2))
             "a peer we are mid-download from must not be rotated out")))))
+
+(test g7-08-p3-headers-stamp-requires-a-new-header-beating-our-tip
+  "The stamp the rotation reads, through the production path
+(ingest-headers-from-peer -> %store-validated-headers), which is where Core
+credits it (net_processing.cpp:2921-2923).
+
+Both halves of Core's condition are tested because each fails differently. Drop
+the work comparison and every peer at our own tip gets stamped constantly.
+Drop received_new_header and a peer holds its slot forever by echoing back the
+block we just told it about — announcing nothing new, yet always looking like
+our freshest source. The second is the one a green suite misses, because the
+happy path stamps correctly either way."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp.storage:*pow-limit-target*
+          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+    (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-p3-stamp/")
+      (let ((bitcoin-lisp::*minimum-chain-work-override* 0)
+            (peer (%g708-peer))
+            (header (%pow-header genesis-hash)))
+        (is (= 0 (bitcoin-lisp.networking:peer-last-block-announcement peer))
+            "a fresh peer has never announced")
+        ;; A header we did not have, on a chain beating our genesis-only tip.
+        (is (= 1 (bitcoin-lisp.networking::ingest-headers-from-peer
+                  peer (list header) state))
+            "control: the header must actually be stored")
+        (is (plusp (bitcoin-lisp.networking:peer-last-block-announcement peer))
+            "a new header beating our tip credits the announcement")
+        ;; Re-announce the SAME header. It is now in the index, so
+        ;; received_new_header is false and the stamp must not move — even
+        ;; though the work comparison still holds.
+        (setf (bitcoin-lisp.networking:peer-last-block-announcement peer) 12345)
+        (bitcoin-lisp.networking::ingest-headers-from-peer peer (list header) state)
+        (is (= 12345 (bitcoin-lisp.networking:peer-last-block-announcement peer))
+            "re-announcing a header we already hold must earn nothing")))))
+
+(test g7-08-p3-cmpctblock-credits-the-announcement-not-the-reconstruct
+  "Core's second credit site (net_processing.cpp:4623) sits in the cmpctblock
+header step, BEFORE reconstruction is attempted. Crediting the successful
+reconstruct instead — the intuitive place, since that is where we learn the
+block is real — would rank peers by whether OUR mempool happened to hold the
+transactions, and would penalise precisely the peer that reaches us first with
+a block nobody else has relayed yet.
+
+compact-block-header-verdict returns the credit decision as its third value so
+the `was it new to us' half is answered from the same locked lookup that
+decided :ACCEPT; asked afterwards it would always say `known'."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp.storage:*pow-limit-target*
+          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+    (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-p3-cmpct/")
+      (let* ((header (%pow-header genesis-hash))
+             (hash (bitcoin-lisp.serialization:block-header-hash header)))
+        (multiple-value-bind (verdict reason credits)
+            (bitcoin-lisp.networking::compact-block-header-verdict
+             state header hash genesis-hash)
+          (declare (ignore reason))
+          (is (eq :accept verdict))
+          (is-true credits "an unseen header beating our tip credits its announcer"))
+        ;; Now we hold it. Same header, same work, still accepted — but no
+        ;; longer new, so no credit.
+        (bitcoin-lisp.networking::process-headers (list header) state)
+        (multiple-value-bind (verdict reason credits)
+            (bitcoin-lisp.networking::compact-block-header-verdict
+             state header hash genesis-hash)
+          (declare (ignore reason))
+          (is (eq :accept verdict) "a header we already hold is still accepted")
+          (is-false credits "but re-announcing it earns no credit"))))))
+
+(test g7-08-p3-an-equal-work-sibling-earns-no-announcement-credit
+  "Core compares the announced chain STRICTLY against our tip
+(net_processing.cpp:2921 — `last_header.nChainWork > ...Tip()->nChainWork'),
+and this is the case that separates > from >=: a competing block at the same
+height as our tip. It is new to us, so received_new_header holds and cannot
+mask the comparison — the work test is the only thing standing between a fork
+sibling and a credit.
+
+Relaxing it to >= is invisible on the happy path and quietly re-ranks the whole
+outbound set: at a steady tip, every peer relaying the same-height competitor
+looks like a fresh announcer, so the rotation stops discriminating and falls
+through to its tie-break. This test exists because a mutation to >= survived
+the rest of this file."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp.storage:*pow-limit-target*
+          bitcoin-lisp.storage:+regtest-pow-limit-target+))
+    (multiple-value-bind (state genesis-hash) (%regtest-chain-state "test-p3-sibling/")
+      (let* ((bitcoin-lisp::*minimum-chain-work-override* 0)
+             (peer (%g708-peer))
+             ;; Our tip: one block off genesis, made the ACTIVE tip so the
+             ;; comparison has something real to sit at.
+             (mine (%pow-header genesis-hash :merkle 1))
+             (mine-hash (bitcoin-lisp.serialization:block-header-hash mine)))
+        (bitcoin-lisp.networking::process-headers (list mine) state)
+        (bitcoin-lisp.storage:update-chain-tip state mine-hash 1)
+        (let* ((tip (bitcoin-lisp.storage:get-block-index-entry state mine-hash))
+               (tip-work (bitcoin-lisp.storage:block-index-entry-chain-work tip))
+               ;; A sibling off the SAME parent: different block, same height,
+               ;; same bits — therefore exactly equal cumulative work.
+               (sibling (%pow-header genesis-hash :merkle 2))
+               (sib-hash (bitcoin-lisp.serialization:block-header-hash sibling)))
+          (is (not (equalp mine-hash sib-hash)) "sanity: it is a different block")
+          (bitcoin-lisp.networking:credit-block-announcement peer)
+          (setf (bitcoin-lisp.networking:peer-last-block-announcement peer) 12345)
+          (bitcoin-lisp.networking::ingest-headers-from-peer peer (list sibling) state)
+          (let ((sib (bitcoin-lisp.storage:get-block-index-entry state sib-hash)))
+            (is-true sib "control: the sibling must actually be stored")
+            (is (= tip-work (bitcoin-lisp.storage:block-index-entry-chain-work sib))
+                "control: the sibling really does tie our tip on work"))
+          (is (= 12345 (bitcoin-lisp.networking:peer-last-block-announcement peer))
+              "a same-work competitor is not an improvement and earns nothing")
+          ;; Control the other way: a header that genuinely extends past our tip
+          ;; DOES credit, proving the harness can reach the credit at all.
+          ;; A later timestamp is required, not cosmetic: at height 2 the
+          ;; median-time-past of {genesis, mine} is MINE's own timestamp, so
+          ;; reusing it makes the header time-too-old and it never stores —
+          ;; which looks exactly like "the credit did not fire".
+          (let ((better (%pow-header mine-hash :merkle 3 :timestamp 1296689000)))
+            (bitcoin-lisp.networking::ingest-headers-from-peer peer (list better) state)
+            (is (/= 12345 (bitcoin-lisp.networking:peer-last-block-announcement peer))
+                "a header beating our tip must still credit")))))))
+
+;;;; ------------------------------------------------------------------
+;;;; G7-08 P3: stale tip and the extra outbound slot
+
+(test g7-08-p3-tip-may-be-stale-needs-both-age-and-an-idle-pipeline
+  "Core TipMayBeStale (net_processing.cpp:1332). Two conditions, and the second
+is the one that is easy to drop: a block in flight from ANYONE means our tip is
+about to move on its own, so opening an extra connection would be paying for
+information already on the wire.
+
+The threshold is nPowTargetSpacing * 3 = 1800s — factor THREE. An earlier
+revision of the plan wrote `30 * 600', right product and wrong factor, which
+lands on five hours if copied literally and makes the check effectively dead."
+  ;; Asserted as a LITERAL, not as `(* 3 spacing)'. Every other assertion in
+  ;; this file is written in terms of the constant, so all of them would follow
+  ;; a wrong constant happily -- which is precisely how `30 * 600' could have
+  ;; shipped. 1800 seconds is thirty minutes; 18000 is five hours.
+  (is (= 1800 bitcoin-lisp::+stale-tip-age-seconds+)
+      "the stale-tip threshold is nPowTargetSpacing * 3 = 1800s, factor THREE")
+  (is (= 600 bitcoin-lisp::+pow-target-spacing-seconds+)
+      "and nPowTargetSpacing is 600s on every network Core ships")
+  (let ((node (bitcoin-lisp::make-node :network :regtest)))
+    ;; Never advanced: Core stamps the clock and reports fresh rather than
+    ;; declaring every freshly started node eclipsed.
+    (is (= 0 (bitcoin-lisp::node-last-tip-advance-time node)))
+    (is-false (bitcoin-lisp::tip-may-be-stale-p node)
+              "a node whose tip has never advanced is not yet stale")
+    (is (plusp (bitcoin-lisp::node-last-tip-advance-time node))
+        "and the clock must have been stamped, or it is stale forever after")
+    ;; Recent advance: fresh.
+    (setf (bitcoin-lisp::node-last-tip-advance-time node) (get-universal-time))
+    (is-false (bitcoin-lisp::tip-may-be-stale-p node))
+    ;; Old enough, nothing in flight: stale.
+    (setf (bitcoin-lisp::node-last-tip-advance-time node)
+          (- (get-universal-time) (1+ bitcoin-lisp::+stale-tip-age-seconds+)))
+    (is-true (bitcoin-lisp::tip-may-be-stale-p node))
+    ;; Same age, but a block is in flight: NOT stale.
+    (let ((ctx (bitcoin-lisp.networking::make-ibd-context))
+          (peer (%p3-peer)))
+      (setf (gethash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
+                     (bitcoin-lisp.networking::ibd-context-in-flight ctx))
+            (cons peer 1))
+      (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+        (is-true (bitcoin-lisp.networking:any-blocks-in-flight-p)
+                 "sanity: the in-flight seam is actually connected")
+        (is-false (bitcoin-lisp::tip-may-be-stale-p node)
+                  "a download in progress means the tip is not stuck")))
+    ;; Just under the threshold stays fresh, so the constant is exercised in
+    ;; both directions rather than only from far away.
+    (setf (bitcoin-lisp::node-last-tip-advance-time node)
+          (- (get-universal-time) (1- bitcoin-lisp::+stale-tip-age-seconds+)))
+    (is-false (bitcoin-lisp::tip-may-be-stale-p node))))
+
+(test g7-08-p3-stale-tip-grants-then-releases-the-extra-slot
+  "Core :5468-5479. The RELEASE is the half that is easy to omit and the one
+that inverts the feature: without it the first stale episode raises the dialing
+budget permanently, and the rotation — which measures against the UNRAISED
+target — then spends every sweep evicting a peer we just dialled. It would
+present as endless outbound churn with no stale tip anywhere in sight."
+  (let ((node (bitcoin-lisp::make-node :network :regtest))
+        (bitcoin-lisp::*try-new-outbound-peer* nil)
+        (bitcoin-lisp::*last-stale-tip-check* 0))
+    (setf (bitcoin-lisp::node-network-active node) t)
+    ;; Stale: the slot is granted.
+    (setf (bitcoin-lisp::node-last-tip-advance-time node)
+          (- (get-universal-time) (1+ bitcoin-lisp::+stale-tip-age-seconds+)))
+    (bitcoin-lisp::check-for-stale-tip node 1000)
+    (is-true bitcoin-lisp::*try-new-outbound-peer*)
+    ;; The tip advances. The next evaluation must hand the slot back.
+    (setf (bitcoin-lisp::node-last-tip-advance-time node) (get-universal-time))
+    (bitcoin-lisp::check-for-stale-tip node (+ 1000 bitcoin-lisp::+stale-tip-check-interval-seconds+ 1))
+    (is-false bitcoin-lisp::*try-new-outbound-peer*
+              "the extra slot must be released once the tip moves again")))
+
+(test g7-08-p3-stale-check-runs-on-its-own-ten-minute-timer
+  "Core gates the stale-tip half on STALE_CHECK_INTERVAL (10 min) INSIDE the 45s
+sweep (:5468). The two cadences are different and both real; collapsing them
+re-evaluates an 1800-second-old condition forty times before it can change."
+  (let ((node (bitcoin-lisp::make-node :network :regtest))
+        (bitcoin-lisp::*try-new-outbound-peer* nil)
+        (bitcoin-lisp::*last-stale-tip-check* 0))
+    (setf (bitcoin-lisp::node-network-active node) t
+          (bitcoin-lisp::node-last-tip-advance-time node)
+          (- (get-universal-time) (1+ bitcoin-lisp::+stale-tip-age-seconds+)))
+    (bitcoin-lisp::check-for-stale-tip node 1000)
+    (is-true bitcoin-lisp::*try-new-outbound-peer* "first evaluation grants")
+    ;; Tip is healthy again, but we are still inside the 10-minute window:
+    ;; the state must NOT be re-evaluated yet.
+    (setf (bitcoin-lisp::node-last-tip-advance-time node) (get-universal-time))
+    (bitcoin-lisp::check-for-stale-tip node 1100)
+    (is-true bitcoin-lisp::*try-new-outbound-peer*
+             "a second call inside the interval must not re-evaluate")))
+
+(test g7-08-p3-the-extra-slot-raises-dialing-but-not-eviction
+  "The asymmetry IS the mechanism (Core net.cpp:2722 vs :2473). The dialer may
+hold one peer beyond node-max-peers while the tip looks stale; the rotation
+keeps measuring against the unraised maximum, so that extra peer is
+immediately one too many and the stalest one is dropped. The result is a
+REPLACEMENT.
+
+Raise both together — the intuitive reading — and the extra connection becomes
+permanent while the rotation never fires at all, which is the opposite of the
+feature: more peers, none of them ever rotated."
+  (let ((node (bitcoin-lisp::make-node :network :regtest)))
+    (setf (bitcoin-lisp::node-max-peers node) 8)
+    (let ((bitcoin-lisp::*try-new-outbound-peer* nil))
+      (is (= 8 (bitcoin-lisp::outbound-dial-budget node))))
+    (let ((bitcoin-lisp::*try-new-outbound-peer* t))
+      (is (= 9 (bitcoin-lisp::outbound-dial-budget node))
+          "the dialing budget rises by exactly one")
+      (is (= 8 (bitcoin-lisp::node-max-peers node))
+          "and the eviction target, which is node-max-peers, does not move")
+      ;; Nine full-relay peers against the unraised target of 8 means the
+      ;; rotation fires — that is what makes it a replacement.
+      (let ((peers (loop for i from 1 to 9
+                         collect (%p3-peer :address (format nil "10.0.0.~D" i)
+                                           :announcement (* i 100)
+                                           :connected 0))))
+        (is (= 1 (length (bitcoin-lisp.networking:evict-extra-outbound-peers
+                          peers 10000 (bitcoin-lisp::node-max-peers node) 2)))
+            "the extra peer must put us over the eviction target, not under it")))))
