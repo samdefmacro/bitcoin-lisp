@@ -4,13 +4,17 @@ Date: 2026-08-18. Baseline: `main` @ `401e807`, clean tree.
 Oracle: Bitcoin Core @ `d3056bc149f605225f22b1cc83b1a2d1cea64258` — the same revision GA7 and GA8
 used, so severities and coverage are directly comparable across the three rounds.
 
-## ⚠️ SCOPE: this round is INCOMPLETE — see the table for which dimensions finished
+## Scope: all 12 dimensions complete (5 in part 1, 7 in part 2)
 
-Twelve parallel finder agents were launched, each seeded with an exclusion list covering every
-finding from GA1–GA8 so it could only report new ground. **Seven of them died mid-analysis on an
-API session limit** and returned nothing. This report therefore covers a little under half the
-intended surface, and its findings have NOT yet been through the adversarial verification pass
-that made GA7 and GA8 trustworthy.
+Twelve parallel finder agents, each seeded with an exclusion list covering every finding from
+GA1–GA8 so it could only report new ground. Seven died mid-analysis on an API session limit in
+part 1 and were re-run in part 2, in batches of four — the full surface is now covered.
+
+**These findings have NOT been through an adversarial refute-biased verification pass.** GA7 and
+GA8 both had verification change the answer repeatedly (GA8: one refuted, one upgraded, four
+downgraded, one sharpened). What this round has instead is that **nine of the ten S1s were
+re-confirmed by the orchestrator directly against both source trees**, rather than resting on a
+single agent's reading; those are marked **[verified]**.
 
 | Dimension | Status | Findings |
 |---|---|---|
@@ -25,7 +29,7 @@ that made GA7 and GA8 trustworthy.
 | storage & indexes | ✅ complete (part 2) | 4 S2, 4 S3 |
 | wallet | ✅ complete (part 2) | 1 S2, 3 S3 |
 | RPC / REST / UI | ✅ complete (part 2) | 1 S1, 2 S2, 1 S3 |
-| crypto & canonical encoding | ❌ died on session limit | — |
+| crypto & canonical encoding | ✅ complete (part 2) | 4 S3 |
 
 The seven missing dimensions include the three where the newest, least-reviewed code lives —
 the resumable v1/v2 readers (#340–#342), the coins-DB alignment series (#333–#338), and Wallet
@@ -1243,3 +1247,116 @@ well-formedness with atomic submission.
 Noted, not a finding: `mempool.dat` uses a custom CRC32 format rather than Core's obfuscated v2
 layout, so the file is not interchangeable with Bitcoin Core. The surrounding comments read as a
 deliberate design choice.
+
+## S3 (crypto & canonical encoding)
+
+**The hand-rolled lax DER parser diverges from Core's shared `lax_der_parsing.c` in both
+directions.** Core verifies every ECDSA signature through `ecdsa_signature_parse_der_lax`, which
+(a) supports **long-form** DER length bytes for R and S, and (b) on an integer longer than 32
+significant bytes sets `overflow` and overwrites the signature with all zeros so verification is
+guaranteed to fail. Ours rejects long-form lengths outright and *truncates* an over-long R/S to its
+low 32 bytes. Confined to the lax path — pre-BIP66 replay only, since our DERSIG gate uses Core's
+exact activation heights. The live tail risk is direction two: if any pre-BIP66 block used long-form
+integer lengths (OpenSSL accepted them), we would stall IBD where Core syncs through. Our own
+mainnet IBD runs have not hit it, which is weak evidence none exists.
+
+**`secp256k1_context_randomize` is never called.** Core's `ECC_Start` unconditionally seeds its
+signing context with 32 random bytes and asserts success (`key.cpp:577-583`); no `defcfun` for that
+function exists anywhere in our tree. So every scalar multiplication touching a wallet secret —
+spend signing, PSBT signing, message signing, xprv derivation, BIP324 ellswift — runs with the
+default blinding scalar, the state libsecp's own header warns against for secret-key operations.
+No remote path and no change to the signatures produced, so it is hardening rather than a defect,
+but it is funds-relevant on shared hosting and Core makes the call unconditionally.
+**Placement constraint: `secp256k1_context_randomize` mutates the context**, so it must run before
+the context is published and must never be re-invoked while parallel script-verification threads are
+inside a call on it. Periodic re-randomization would need a second, signing-only context.
+
+**`base58-decode` has no output-length bound.** Core's `DecodeBase58` takes a mandatory
+`max_ret_len` and enforces it *inside* the loop, with callers passing 21 for addresses, 34 for WIF
+and 78 for extended keys — so Core abandons a hostile string after ~25 characters. Ours accumulates
+an unbounded bignum over the whole string, then extracts bytes by repeatedly shifting it right,
+allocating a fresh near-full-width bignum per byte. That is O(n²) work and roughly `(5.86n)²/128`
+bytes of transient garbage: a 100 KB argument is ~2.7 GB of allocation. Every consumer sits behind
+RPC auth, which is why it is S3.
+
+**Core `VARINT` is always read as uint64** where Core instantiates `ReadVarInt` with `uint32_t` for
+both the `Coin` code and the compressed-script size, so records Core rejects as "size too large"
+decode here into absurd heights. Local files rather than consensus data, and an assumeutxo snapshot
+must still match a hard-coded hash, so exposure is small. The bound must be applied inside the
+accumulation loop as Core does, not as a post-hoc range test, or the two disagree on which byte
+fails.
+
+### Cleared in this dimension — including a premise in this analysis's own brief
+
+**The brief's BIP32 premise was wrong, and the finder refuted it instead of confirming it.** The
+brief asserted that Core's `CExtKey::Derive` "INCREMENTS the index and retries on an invalid child,
+and a divergence gives different addresses for the same seed, a funds-loss-on-restore event." Core
+does no such thing: `CExtKey::Derive` (`key.cpp:482-489`) and `CExtPubKey::Derive`
+(`pubkey.cpp:415-422`) return **`false`**, and every descriptor caller turns that into
+`std::nullopt`. We error and convert to `descriptor-derivation-error` — same addresses for the same
+seed. Verified directly against both functions. This is the exact failure mode this project's memory
+keeps recording, this time committed by the orchestrator writing the brief; the ground rule "READ
+CORE, never argue from memory" is what caught it.
+
+Also cleared: the libsecp256k1 CFFI boundary is clean apart from the missing randomize — output
+buffers are exactly the sizes libsecp requires, every `with-foreign-object` body unwind-protects so
+no foreign memory leaks on a non-local exit, every `with-pointer-to-vector-data` site receives a
+`(simple-array (unsigned-byte 8) (*))` (the Coalton→CL bridge coerces before crossing) so nothing
+unpinnable reaches `vector-sap`, and return codes are checked everywhere Core checks them. Low-R
+grinding is byte-exact with `CKey::Sign` including the pre-incremented 4-byte-LE counter and the
+`compact[0] < 0x80` test. ECDSA verify normalizes low-S before verifying; Schnorr matches
+`VerifySchnorr`; the taproot tweak matches `KeyPair`'s negate-then-tweak. `ReadCompactSize`
+canonicality and `MAX_SIZE` match in all three copies. SipHash-2-4 including the length byte at bit
+56 and the BIP152 key derivation; BIP340 `TaggedHash` via `secp256k1_tagged_sha256`; MuHash;
+bech32/bech32m constants, variant selection, mixed-case, 90-char and structure checks. ChaCha20,
+FSChaCha20, the AEAD and the BIP324 cipher were verified line by line including counter-carry,
+both rekey nonce positions, the seek-to-block-1-then-block-0 tag ordering, and the HKDF labels. The
+wallet crypter's KDF and the one-directional PKCS#7 pad check match.
+
+---
+
+# Final tally and sequencing
+
+**10 S1 · 17 S2 · ~40 S3**, across all twelve dimensions, none of them previously known.
+
+Nine of the ten S1s were re-confirmed by the orchestrator directly against both trees. The
+exception is S1-3 (the BIP68 signed-version gate), which its finder rated medium confidence and
+which should get an executable control before anyone touches it.
+
+## Fix order
+
+1. **S1-1 and S1-2 together** — block weight omitting the header/varint prefix, and the finality
+   loop skipping the coinbase. Both are one-line fixes in the same function, both verified, both
+   pure chain splits. Highest value per unit of effort in the round.
+2. **S1-6 `CastToBool`** — a transliteration of Core's loop, and it changes branch selection under
+   mandatory flags. Fix the legacy CL copy in the same commit so the two cannot drift.
+3. **S1-9 `verifytxoutproof`** — forged merkle proofs against real blocks; small fix, and anything
+   doing deposit or bridge confirmation against this RPC is exposed today.
+4. **S1-5 `getblocktxn` depth cap** — remote unauthenticated disk-read amplification with no rate
+   limit. The depth test must precede `get-block`.
+5. **S1-4 + S2-2 as one change** — identity-preserving `connect-block` fixes both, and S1-4 makes
+   `invalidateblock` defeasible by a single message.
+6. **S1-7 `FindAndDelete` and S1-8 the DER bound** — both consensus, both small; port Core's
+   `script_FindAndDelete` table verbatim with the former.
+7. **S1-3 BIP68 version gate** — after an executable control.
+8. **The storage cluster (S2-10, S2-11)** — the unflushed reorg is a self-inflicted OOM on the
+   deepest rollback paths; the unlocked `gettxoutsetinfo` can drop UTXO writes. Both sit on the code
+   #333–#338 just rewrote.
+9. **S2-14 PSBT UTXO precedence with S3's `FillPSBT` fix** — they are two halves of one defence.
+10. **S2-1 signet**, then the config cluster (S2-7 and its S3 siblings), then peer hygiene
+    (S2-4/5/6), then the remainder.
+
+## Method notes for GA10
+
+- **Twelve concurrent deep-reading agents exhaust the session budget.** Each burned 180–310k tokens
+  over 15–23 minutes. Run four to five per batch and persist after each batch; part 2 did this and
+  lost nothing.
+- **Seeding finders with a full exclusion list works.** Every one of the ~67 findings here is new
+  ground after eight prior rounds.
+- **Ask finders to report what they cleared.** The cleared lists in this report are as valuable as
+  the findings — they are why GA10 need not re-pay for MuHash, BIP158, the compressor, TRUC, addrman
+  bucketing, the BIP324 cipher, or the CFFI boundary.
+- **A wrong premise in the brief is a real risk.** The BIP32 item was asserted by the orchestrator
+  and was false; the finder caught it only because the brief also told it to read Core rather than
+  trust the prompt. Keep that instruction, and treat brief text as a hypothesis.
+- **Still owed: an adversarial refute-biased verification pass** over every finding here.
