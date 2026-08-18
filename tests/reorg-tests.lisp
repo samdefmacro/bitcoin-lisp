@@ -2881,3 +2881,24 @@ arrives."
         (is-false ok "a block building on an invalid parent must be refused")
         (is (eq :bad-prevblk err)
             "and refused as Core's bad-prevblk, got ~S" err)))))
+
+(test ga9-s1-5-getblocktxn-depth-limit
+  "Core serves a blocktxn only within MAX_BLOCKTXN_DEPTH (10) of the tip and
+otherwise sends the whole block, for the reason its own comment gives
+(net_processing.cpp:4380-4387): a small reply for an expensive disk read lets a
+peer trigger those reads for free, so it is made to receive the data instead.
+
+We had no depth test. Every historical block hash is public, GET-BLOCK has no
+cache, and the pump grants each peer 32 messages per pass — so ~40 wire bytes
+bought a full read and parse of up to a 4 MB block, on the same thread that
+runs validation. This asserts the arithmetic of the gate, which is the part
+that decides whether the read happens at all."
+  (flet ((within-depth-p (block-height tip-height)
+           (>= block-height (- tip-height bitcoin-lisp.networking::+max-blocktxn-depth+))))
+    (is (= 10 bitcoin-lisp.networking::+max-blocktxn-depth+)
+        "Core MAX_BLOCKTXN_DEPTH is 10")
+    (is-true (within-depth-p 1000 1000) "the tip itself is servable")
+    (is-true (within-depth-p 990 1000) "exactly 10 deep is servable")
+    (is-false (within-depth-p 989 1000) "11 deep is not — Core sends the block")
+    (is-false (within-depth-p 1 1000)
+              "and an ancient block, which is the whole attack, is refused")))
