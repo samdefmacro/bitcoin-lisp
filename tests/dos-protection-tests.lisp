@@ -1217,3 +1217,62 @@ has actually sent (net.cpp:1323-1324)."
       (usocket:socket-close sender)
       (usocket:socket-close victim-socket)
       (usocket:socket-close listener))))
+
+;;;; ------------------------------------------------------------------
+;;;; Non-I/O receive failures must be diagnosable
+;;;;
+;;;; receive-bytes-resumable catches errors with a deliberately wide net,
+;;;; because a dead socket surfaces as several condition types. A wide net also
+;;;; swallows OUR bugs as "the peer went away": mainnet spent 2026-08-17/18
+;;;; losing every connection to a TYPE-ERROR reported only as a one-line
+;;;; message, with no way to tell where it came from. These cover the backtrace
+;;;; capture that answers that question.
+
+(test recv-backtrace-only-fires-for-our-own-bugs
+  "The capture must discriminate exactly as the log line does. Peers hanging up
+is the normal case and vastly the common one; capturing a backtrace for every
+closed socket would bury the log under noise and teach the reader to ignore it."
+  (let ((bitcoin-lisp.networking::*recv-backtrace-remaining* nil)
+        (bitcoin-lisp.networking::*recv-backtrace-budget* 10))
+    (is (null (bitcoin-lisp.networking:capture-recv-backtrace
+               (make-condition 'end-of-file :stream *standard-output*)))
+        "end-of-file is a peer going away, not a bug")
+    (is-true (stringp (bitcoin-lisp.networking:capture-recv-backtrace
+                       (make-condition 'type-error :datum 3122
+                                                   :expected-type '(unsigned-byte 10))))
+             "a TYPE-ERROR is ours and must be captured")))
+
+(test recv-backtrace-is-budgeted
+  "Bounded on purpose: the failure repeats once per failing peer — ~15k times in
+200k log lines during the mainnet incident — so an unbounded backtrace would
+bury the log it exists to explain. The budget is per process, not per peer."
+  (let ((bitcoin-lisp.networking::*recv-backtrace-remaining* nil)
+        (bitcoin-lisp.networking::*recv-backtrace-budget* 2))
+    (flet ((cap () (bitcoin-lisp.networking:capture-recv-backtrace
+                    (make-condition 'type-error :datum 1 :expected-type 'string))))
+      (is-true (stringp (cap)) "1st capture allowed")
+      (is-true (stringp (cap)) "2nd capture allowed")
+      (is (null (cap)) "3rd must be refused — the budget is spent")
+      (is (null (cap)) "and it stays spent"))))
+
+(defun %recv-backtrace-canary ()
+  "Signals, purely so the test has a frame name it can look for. Top-level and
+NOT a LABELS: SBCL inlines a local function into its caller, so a local canary
+never appears in the trace and the test fails for a reason that has nothing to
+do with the capture."
+  (error "canary"))
+
+(test recv-backtrace-captures-the-signalling-frames
+  "The point of capturing from a HANDLER-BIND: the trace must name the function
+that signalled, not just the recovery path. Asserted on a distinctly-named
+frame so this cannot pass on an empty or truncated string."
+  (let ((bitcoin-lisp.networking::*recv-backtrace-remaining* nil)
+        (bitcoin-lisp.networking::*recv-backtrace-budget* 5)
+        (trace nil))
+    (ignore-errors
+     (handler-bind ((error (lambda (c)
+                             (setf trace (bitcoin-lisp.networking:capture-recv-backtrace c)))))
+       (%recv-backtrace-canary)))
+    (is-true (stringp trace) "a backtrace must have been produced")
+    (is-true (search "RECV-BACKTRACE-CANARY" trace)
+             "the signalling frame must appear in the captured trace")))
