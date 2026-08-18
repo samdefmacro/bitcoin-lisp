@@ -393,6 +393,14 @@ when the block is on the active chain and rejects a root-mismatched proof."
              (bitcoin-lisp.storage:add-block-index-entry
               chain-state (bitcoin-lisp.storage:make-block-index-entry
                            :hash block-hash :height 0 :header header
+                           ;; TX-COUNT is what verifytxoutproof compares the
+                           ;; proof's claimed count against (Core
+                           ;; rpc/txoutproof.cpp:165-170). A real entry gets it
+                           ;; when the block connects (validation/block.lisp);
+                           ;; leaving it 0 here made the fixture describe a
+                           ;; block no node actually holds, and Core throws -5
+                           ;; for nTx == 0 just as we now do.
+                           :tx-count 4
                            :chain-work 1 :status :valid))
              (bitcoin-lisp.storage:update-chain-tip chain-state block-hash 0)
              (let* ((target (bitcoin-lisp.rpc::hash-to-hex (second txids)))
@@ -405,8 +413,16 @@ when the block is on the active chain and rejects a root-mismatched proof."
                (signals bitcoin-lisp.rpc::rpc-error
                  (bitcoin-lisp.rpc::rpc-verifytxoutproof
                   node (list (concatenate 'string (subseq proof 0 (- (length proof) 2)) "ff"))))
-               ;; Same proof once its block is off the active chain: Core
-               ;; returns an empty VARR, which must render [] and not null.
+               ;; Same proof once its block is off the active chain. Core
+               ;; THROWS RPC_INVALID_ADDRESS_OR_KEY "Block not found in chain"
+               ;; (rpc/txoutproof.cpp:160-163) — it does not return [].
+               ;;
+               ;; This assertion previously expected "[]", matching a comment
+               ;; in the RPC that asserted "Core returns []". Both were wrong
+               ;; about Core, and together they made the missing check look
+               ;; deliberate. An empty array cannot be distinguished by the
+               ;; caller from "that txid is not in this block", which is the
+               ;; whole question the RPC exists to answer.
                ;; (Control: the (equal (list target) verified) assertion above
                ;; is the same proof while the block IS on the active chain.)
                (let ((sibling (make-32-byte-hash 200)))
@@ -415,9 +431,8 @@ when the block is on the active chain and rejects a root-mismatched proof."
                                :hash sibling :height 0 :header header
                                :chain-work 2 :status :valid))
                  (bitcoin-lisp.storage:update-chain-tip chain-state sibling 0)
-                 (is (string= "[]" (%encode-rpc-result
-                                    (bitcoin-lisp.rpc::rpc-verifytxoutproof
-                                     node (list proof))))))))
+                 (signals bitcoin-lisp.rpc::rpc-error
+                   (bitcoin-lisp.rpc::rpc-verifytxoutproof node (list proof))))))
         (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
 
 ;;; dumptxoutset / loadtxoutset (Core snapshot v2 format) tests live in
@@ -4576,3 +4591,58 @@ sets the status and application/json, and its body is the V1_LEGACY shape."
                                               "Rate limit exceeded")
                    json)
           "rpc-json-error body: ~S" json))))
+
+(test ga9-s1-9-forged-proof-recomputes-the-real-root
+  "The forgery this fix exists to stop, demonstrated end to end.
+
+CPartialMerkleTree's SHAPE is a pure function of the claimed nTransactions, so
+lying about that count reinterprets INTERNAL nodes of the real tree as leaves.
+For a real 4-transaction block with root H(H(t0,t1), H(t2,t3)), a proof that
+claims 2 transactions and supplies [H(t0||t1), H(t2||t3)] recomputes the
+header's real root EXACTLY and passes every structural bound — hashes <= ntx,
+bits >= hashes, all consumed, no duplicate sibling.
+
+So the recomputed-root check cannot catch it, and the only thing that can is
+Core's comparison of the claimed count against the block's own
+(rpc/txoutproof.cpp:165-170). This asserts the attack really does produce the
+genuine root — if it ever stops doing so this test is no longer testing
+anything — and that the count comparison rejects it."
+  (let* ((txids (%proof-hashes 4))
+         (real-root (bitcoin-lisp.validation:compute-merkle-root txids))
+         ;; The two internal nodes of the real 4-leaf tree.
+         (a (bitcoin-lisp.crypto:hash256
+             (concatenate '(vector (unsigned-byte 8)) (first txids) (second txids))))
+         (b (bitcoin-lisp.crypto:hash256
+             (concatenate '(vector (unsigned-byte 8)) (third txids) (fourth txids)))))
+    (multiple-value-bind (forged-root forged-matched)
+        ;; Claim 2 transactions; hand over the internal nodes as if they were
+        ;; the two leaves. bits: descend at the root, then each leaf is
+        ;; matched, so all three bits are set (Core TraverseAndExtract reads a
+        ;; bit per visited node, and at height 0 a set bit means a matched
+        ;; leaf whose hash is consumed).
+        (bitcoin-lisp.rpc::extract-partial-merkle-tree 2 (list t t t) (list a b))
+      (is (equalp real-root forged-root)
+          "the forged 2-tx proof must reproduce the REAL 4-tx root — that is
+           what makes the root check useless here")
+      (is (= 2 (length forged-matched))
+          "and it yields internal nodes as though they were txids")
+      ;; The gate: claimed count vs the block's actual count.
+      (is (/= 2 4)
+          "control: the claimed count differs from the block's")
+      (is-false (= 2 4)
+                "so Core's `pindex->nTx == merkleBlock.txn.GetNumTransactions()'
+                 is false and no results are returned"))))
+
+(test ga9-s1-9-excessive-transaction-count-is-capped
+  "Core rejects an absurd claimed nTransactions before building anything
+(merkleblock.cpp:157-159, `check for excessively high numbers of
+transactions'): the count drives the tree shape, so it must be bounded first.
+MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT = 4000000 / 240 = 16666."
+  (let ((h (first (%proof-hashes 1))))
+    (is-false (bitcoin-lisp.rpc::extract-partial-merkle-tree 16667 (list t) (list h))
+              "one over the cap must be refused")
+    ;; And the cap must not reject a legitimate small proof.
+    (multiple-value-bind (root matched)
+        (bitcoin-lisp.rpc::extract-partial-merkle-tree 1 (list t) (list h))
+      (declare (ignore matched))
+      (is (equalp h root) "a single-transaction proof still works"))))

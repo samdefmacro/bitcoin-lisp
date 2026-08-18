@@ -214,11 +214,21 @@ opcode (OP_1..OP_16) as the key count, or 20 if not present."
           result))))
 
 (defun cast-to-bool (bytes)
-  "Convert script bytes to boolean."
-  (not (or (zerop (length bytes))
-           (every #'zerop bytes)
-           (and (= (length bytes) 1)
-                (= (aref bytes 0) #x80)))))
+  "Script truth, transliterated from Core CastToBool
+(script/interpreter.cpp:36-48): scan for the first non-zero byte; false only
+when that byte is the LAST one and equals 0x80 — every negative zero at any
+length, not just the one-byte form.
+
+Kept identical to the Coalton interpreter's CAST-TO-BOOL, which is the one on
+the consensus path. Both carried the same one-byte-only test; fixing only the
+live copy would leave the two free to drift apart again, and this one is the
+reference a reader reaches for first."
+  (let ((n (length bytes)))
+    (loop for i below n
+          for b = (aref bytes i)
+          unless (zerop b)
+            do (return (not (and (= i (1- n)) (= b #x80))))
+          finally (return nil))))
 
 ;;;; Script parsing
 
