@@ -24,7 +24,7 @@ that made GA7 and GA8 trustworthy.
 | P2P protocol & transport | ✅ complete (part 2) | 1 S1, 2 S2, 1 S3 |
 | storage & indexes | ✅ complete (part 2) | 4 S2, 4 S3 |
 | wallet | ✅ complete (part 2) | 1 S2, 3 S3 |
-| RPC / REST / UI | ❌ died on session limit | — |
+| RPC / REST / UI | ✅ complete (part 2) | 1 S1, 2 S2, 1 S3 |
 | crypto & canonical encoding | ❌ died on session limit | — |
 
 The seven missing dimensions include the three where the newest, least-reviewed code lives —
@@ -1020,3 +1020,128 @@ them. PSBT parsing rejects duplicate keys, wrong key-data lengths, trailing data
 scriptSigs, **and does validate `non_witness_utxo` against the input's prevout txid**;
 `combinepsbt` merge semantics match `Merge`. No path was found by which a passphrase or key reaches
 a log or condition report.
+
+## S1-9. `verifytxoutproof` never checks the proof's tx count, so a forged proof validates against a real block **[verified]**
+
+Core gates the result on the proof's claimed transaction count matching the block's
+(`rpc/txoutproof.cpp:165-170`), under the comment *"Check if proof is valid, only add results if
+so"*, and separately **throws** `RPC_INVALID_ADDRESS_OR_KEY "Block not found in chain"` when the
+block is unknown, off the active chain, or has `nTx == 0`:
+
+```cpp
+if (!pindex || !chainman.ActiveChain().Contains(pindex) || pindex->nTx == 0) { throw ... }
+// Check if proof is valid, only add results if so
+if (pindex->nTx == merkleBlock.txn.GetNumTransactions()) { for (...) res.push_back(...); }
+```
+
+Our `rpc-verifytxoutproof` (`src/rpc/merkleproof.lisp:208-239`) binds `ntx` from
+`parse-merkle-block`, uses it **only** to derive the tree shape, and then returns the matched txids
+with **no comparison against the block's tx count**. Both read directly.
+
+`CPartialMerkleTree`'s shape is a pure function of the claimed `nTransactions`, so lying about it
+reinterprets internal nodes of the real tree as leaves. For a real 4-transaction block with root
+`R = H(H(t0,t1), H(t2,t3))`, a proof claiming `nTransactions=2` with `vHash=[A=H(t0||t1),
+B=H(t2||t3)]` and `vBits=[1,1,0]` passes every check we have — `hashes(2) <= ntx(2)`,
+`bits(3) >= hashes(2)`, all hashes consumed, bits consumed to byte padding, no duplicate-sibling
+`bad` — and the recomputed root `H(A,B)` equals the header's `R` **exactly**. We then return `A` as
+a proven txid. `A` is the double-SHA256 of a 64-byte string, and 64-byte transactions are
+constructible.
+
+Direction: **we accept what Core rejects.** Anyone whose deposit, bridge or attestation logic asks a
+bitcoin-lisp node *"is txid X committed to by this block on your best chain?"* gets a forged yes.
+The attacker needs only the victim to call `verifytxoutproof` on attacker-supplied bytes — no chain
+access, no hashpower, no wallet access.
+
+Core's excessive-`nTransactions` bound (`MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT`,
+`merkleblock.cpp:157-159`) is also absent. And our unknown-block arm returns `[]` where Core throws
+`-5` — our in-code comment asserting *"Core returns []"* is simply wrong about Core, another
+instance of the pattern this project's memory keeps recording.
+
+**Fix:** require the entry, active-chain membership and a non-zero tx count (signalling `-5`
+otherwise), and return matches only when `ntx` equals the entry's tx count — `%entry-tx-count`
+already backfills entries predating the field. Add the `nTransactions` cap beside the existing
+`(zerop ntx)` check. **Placement constraint: the count comparison must use the same index entry the
+active-chain test used, under one lookup**, or a concurrent reorg splits the two decisions.
+
+The rest of `extract-partial-merkle-tree` is a faithful port of `TraverseAndExtract`, and the
+parser has no P2P caller — the surface is the RPC only.
+
+## S2-15. `getblocktemplate` discards `template_request` entirely
+
+`rpc-getblocktemplate` (`src/rpc/methods.lisp:3037-3102`) opens with `(declare (ignore params))` and
+unconditionally assembles a template — while still advertising `capabilities: ["proposal"]` and
+emitting a `longpollid`. Core branches on that object in three consequential ways
+(`rpc/mining.cpp:714-800, 849-856`):
+
+- **The segwit rule gate is missing.** Core throws `-8 "getblocktemplate must be called with the
+  segwit rule set"` when `rules` lacks it. Without that gate, a rule-unaware miner receives a
+  template full of witness transactions plus a `default_witness_commitment` it does not know to
+  place in the coinbase — and a block mined from it is consensus-invalid. Core refuses precisely to
+  prevent a miner burning real hashpower and losing a real subsidy.
+- **`mode=proposal` is answered with a template.** BIP22 defines `null` as accepted and a string as
+  the reject reason; a pool pre-checking a candidate gets an object back, which reads as a
+  rejection, so a valid block is silently discarded rather than submitted.
+- **`longpollid` is advertised but never blocks**, so a longpoll-driven miner spins — each poll
+  running a full mempool assembly plus a `TestBlockValidity` dry run under the node lock, turning a
+  normal miner into a self-inflicted load source.
+
+The node-side connectivity/IBD guards *are* a faithful port of `mining.cpp:766-773`, so this
+function was written against that exact Core function; the params handling above it was simply not
+ported.
+
+**Fix:** parse `params[0]` before doing any work — reject an invalid `mode`, implement the proposal
+branch, and put the segwit gate **before** template assembly so a rule-unaware miner cannot get a
+template at all. If longpoll stays unimplemented, dropping `longpollid` from the reply is safer than
+advertising it.
+
+## S2-16. The web UI console stores and echoes raw command lines, including passphrases and private keys
+
+Core's Qt console keeps a `historyFilter` list — `walletpassphrase`, `walletpassphrasechange`,
+`encryptwallet`, `signrawtransactionwithkey`, `signmessagewithprivkey`, `createwallet`, … — annotated
+*"don't add private key handling cmd's to the history"* (`qt/rpcconsole.cpp:72-83`). It records the
+character range of those arguments and rewrites it to `"(…)"`, then echoes and stores **only** the
+filtered string; the unfiltered command goes to the executor and nowhere else (`:355-362, 1039-1053`).
+
+Our console does neither. `state.history.push(line)` stores the line exactly as typed, and the
+history is JSON-serialised into `sessionStorage['bitcoin-lisp.console-history']`; the same
+unredacted line is printed into the transcript. The module comment states the choice outright:
+*"no method is special-cased — this is an operator tool."*
+
+So typing `walletpassphrase "…" 60` or `signrawtransactionwithkey <hex> ["<WIF>"]` writes the
+passphrase or private key in cleartext into browser sessionStorage, surviving reloads for the tab's
+lifetime, recallable with Up at an unattended screen, readable from devtools, and captured by
+session restore. The sibling module `ui/js/wallet-crypt.js` carries an explicit SECURITY NOTE about
+passphrase hygiene, so an operator has reasonable grounds to expect the console at least matches
+Core here.
+
+**Fix:** port `historyFilter` — redact before the push, not on read-back, and key off the parsed
+method name rather than a substring match. The JSON-mode echo needs the same treatment, since there
+the params textarea holds the secret.
+
+## S3 (rpc)
+
+The Basic-auth credential is decoded with flexi-streams' **default** external format (latin-1) where
+Core compares raw bytes, so a non-ASCII `-rpcpassword` can never authenticate — the client sends
+UTF-8, which latin-1-decodes to a different character sequence than the UTF-8-decoded configured
+value. No confidentiality break (the decoding is injective, so distinct credentials stay distinct),
+purely an availability divergence. Notably **every other** flexi-streams call in the tree names its
+external format explicitly; this one call, on the auth path, is the sole omission. The generated
+`.cookie` is hex, so the default path is unaffected — which is why it can sit unnoticed until
+someone configures a password. Fix by comparing octets, matching Core.
+
+### Cleared in this dimension
+
+`%timing-resistant-equal` **is** a faithful port of Core's `TimingResistantEqual` — same zero-length
+guard, same `len(a)^len(b)` seed, same modular indexing, same accumulator — and both username and
+password go through it. So the constant-time question the brief flagged is answered: it is correct.
+Auth ordering is right: the Origin check and auth run *before* the rate limiter, the Content-Length
+check and any body read, so nothing allocates before the 401; the 250 ms brute-force delay applies
+only when an Authorization header was offered, matching Core. Cookie creation is
+`O_EXCL|O_NOFOLLOW` 0600 after the bind. `%rpc-bind-address` forces every non-loopback `-rpcbind`
+back to loopback, which is why slow-loris, unbounded worker threads and the global-rather-than-
+per-peer token bucket are all local-only and were not raised. UI path traversal is closed by a
+whitelisted-character segment check building pathnames with `make-pathname`; across all of `ui/js/`
+the only `innerHTML` is a static string, every dynamic value goes through `textContent`, and no
+`javascript:` sink exists. CSRF is covered by the Origin check plus an explicit Authorization header
+rather than ambient Basic auth. REST matches `rest.cpp` (GET-only, `-rest`-gated,
+`MAX_GETUTXOS_OUTPOINTS`, the BIP64 bitmap layout). The full `RPC_*` error-code table matches.
