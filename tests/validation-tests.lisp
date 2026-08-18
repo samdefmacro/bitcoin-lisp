@@ -1580,3 +1580,42 @@ boundary versions and the high-bit version are all covered cheaply."
                 is exactly how it escaped enforcement")
       (is-true (enforced-p high-bit)
                "unsigned, it is >= 2, so BIP68 must be enforced as Core does"))))
+
+(test ga9-s1-8-strict-der-size-bound-is-in-our-shifted-frame
+  "Core's IsValidSignatureEncoding (script/interpreter.cpp:108-123) takes the
+FULL signature INCLUDING the trailing hashtype byte and rejects size > 73. We
+are called with that byte already stripped, so our bound must be 72.
+
+It was 73 — Core's number left in Core's frame — while the minimum had already
+been shifted (< 8 against Core's < 9). That mismatch is what marks it an
+oversight, and it admitted exactly one length: a 74-byte signature.
+
+Why that matters is not obvious: such a signature satisfies every DER-integer
+rule, so in Core the size cap is the ONLY thing rejecting it, as a hard
+SCRIPT_ERR_SIG_DER. We passed it to libsecp256k1's DER parser, which accepts it
+with r silently clamped to zero, producing a FALSE CHECKSIG rather than an
+error — and NULLFAIL, which would have made it an error, is policy-only and
+unset during block validation. `<sig74> OP_CHECKSIG OP_NOT' in a P2SH redeem
+script therefore accepted a spend Core rejects, under flags mandatory on every
+current block.
+
+Both integers are encoded 00 80 01... so the leading zero is legal (the next
+byte has its high bit set) and every DER rule passes — otherwise the vector
+would be rejected for the wrong reason and prove nothing about the bound."
+  (flet ((sig (lenr lens)
+           (let ((v (make-array 0 :element-type '(unsigned-byte 8)
+                                  :adjustable t :fill-pointer 0)))
+             (flet ((p (b) (vector-push-extend b v)))
+               (p #x30) (p (+ 4 lenr lens))
+               (p #x02) (p lenr) (p 0) (p #x80) (dotimes (i (- lenr 2)) (p 1))
+               (p #x02) (p lens) (p 0) (p #x80) (dotimes (i (- lens 2)) (p 1)))
+             (coerce v '(vector (unsigned-byte 8))))))
+    (let ((too-big (sig 34 33))   ; 73 body bytes = 74 with the hashtype byte
+          (largest (sig 33 32)))  ; 71 body bytes = 72 with the hashtype byte
+      (is (= 73 (length too-big)) "control: this is the 74-byte signature")
+      (is (= 71 (length largest)) "control: this is the largest Core accepts")
+      (is-false (bitcoin-lisp.coalton.interop::check-der-signature-format too-big)
+                "74 bytes with the hashtype: Core rejects on size, so must we")
+      (is-true (bitcoin-lisp.coalton.interop::check-der-signature-format largest)
+               "72 bytes with the hashtype is legal — the fix must not
+                over-tighten and start rejecting valid signatures"))))
