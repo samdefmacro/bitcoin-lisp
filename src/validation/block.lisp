@@ -156,8 +156,19 @@ For each input with version >= 2 and sequence not disabled (bit 31 clear):
 - Height-based: input UTXO must be at least N blocks deep
 - Time-based: MTP must be >= N*512 seconds after UTXO's MTP
 Returns T if all locks satisfied, NIL if any lock not yet matured."
-  ;; BIP 68 only applies to transaction version >= 2
-  (when (< (bitcoin-lisp.serialization:transaction-version tx) 2)
+  ;; BIP 68 applies to version >= 2, compared UNSIGNED. Core stores the version
+  ;; as `const uint32_t\' (primitives/transaction.h:293) and gates on
+  ;; `tx.version >= 2\' (consensus/tx_verify.cpp:51), so every version with bit
+  ;; 31 set is >= 2 and IS enforced. We store the slot as (signed-byte 32) —
+  ;; correct, since that is what the wire format reads — so the same bytes come
+  ;; back negative and a signed compare skipped BIP68 entirely for them. Version
+  ;; 0x80000002 spending an unmatured relative locktime was accepted here and
+  ;; rejected by Core as bad-txns-nonfinal.
+  ;;
+  ;; Reinterpret at the GATE, not in the struct: the slot must stay signed so
+  ;; serialization keeps round-tripping, and every other reader of the version
+  ;; keeps the value the wire actually carries.
+  (when (< (ldb (byte 32 0) (bitcoin-lisp.serialization:transaction-version tx)) 2)
     (return-from check-sequence-locks t))
   (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx) t)
     (let ((seq (bitcoin-lisp.serialization:tx-in-sequence input)))
@@ -990,9 +1001,35 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
         (values nil :bad-coinbase-height))))
 
 (defun calculate-block-weight (transactions)
-  "Calculate total block weight as sum of all transaction weights."
-  (loop for tx in transactions
-        sum (bitcoin-lisp.serialization:transaction-weight tx)))
+  "Weight of the block whose transaction list is TRANSACTIONS (Core
+GetBlockWeight, consensus/validation.h:136-139).
+
+Core weighs the WHOLE BLOCK, not the transactions: it serializes the block with
+and without witnesses, and the block serializer emits
+`header(80) || CompactSize(vtx.size()) || txs\'. Expanding
+`3*size_nowit + size_wit\' over that shape, the prefix survives with a factor
+of four:
+
+    weight = 4 * (80 + compact-size-length(n)) + SUM(transaction-weight)
+
+This summed transaction weights ALONE, i.e. it dropped `4 * (80 + cs(n))\' —
+324 weight units for a block of fewer than 253 transactions, 332 up to 65535.
+It under-counted, so the error ran in the dangerous direction: a block whose
+true weight lands in (4000000, 4000332] passed here, connected, and advanced
+our tip while every Core node rejected it as `bad-blk-weight\'. That is a
+permanent chain split that ends only by hand.
+
+The prefix depends only on the transaction COUNT, so this needs no block object
+and every caller — the consensus check below and getblock\'s `weight\' field —
+is corrected at once. That matters for the RPC too: the number we report must
+be the number bitcoind reports for the same block.
+
+The base-size check a few lines below already added `80 + compact-size-length\'
+correctly, which is what marks this as an oversight rather than a decision."
+  (+ (* 4 (+ 80 (bitcoin-lisp.serialization:compact-size-length
+                 (length transactions))))
+     (loop for tx in transactions
+           sum (bitcoin-lisp.serialization:transaction-weight tx))))
 
 ;;;; Sigops cost calculation
 
@@ -1413,8 +1450,18 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
              (locktime-check-time (if csv-active
                                       mtp
                                       (bitcoin-lisp.serialization:block-header-timestamp header))))
-        ;; Check finality for all non-coinbase transactions
-        (loop for tx in (rest transactions)
+        ;; Finality covers EVERY transaction including the coinbase: Core's
+        ;; ContextualCheckBlock iterates block.vtx with no IsCoinBase guard
+        ;; (validation.cpp:4176-4181). This skipped vtx[0], so a coinbase with
+        ;; an nLockTime past the cutoff and a non-final nSequence connected
+        ;; here while Core rejected the block bad-txns-nonfinal.
+        ;;
+        ;; The coinbase exclusion belongs to the BIP68 loop directly below,
+        ;; which Core really does guard with `if (!tx.IsCoinBase())'
+        ;; (validation.cpp:2528) — it was applied to the wrong one of two
+        ;; adjacent loops. Keep them different; making them agree reintroduces
+        ;; one bug or the other.
+        (loop for tx in transactions
               unless (check-transaction-final tx current-height locktime-check-time)
                 do (return-from validate-block (values nil :non-final-tx nil)))
         ;; BIP 68 sequence lock enforcement (only at or above CSV activation)
