@@ -3823,6 +3823,107 @@ Inbound connections are excluded so an attacker filling our inbound slots
 cannot suppress replacement outbound dials (eclipse-attack prevention)."
   (count-if #'outbound-full-relay-peer-p peers))
 
+(defconstant +pow-target-spacing-seconds+ 600
+  "Core consensus.nPowTargetSpacing. It is 10*60 on EVERY network Core ships —
+mainnet, testnet3, testnet4, signet and regtest (kernel/chainparams.cpp:98,
+229, 336, 486, 577) — so the stale-tip threshold below needs no per-network
+case, and regtest is testable against it without a special fixture.")
+
+(defconstant +stale-tip-age-seconds+ (* 3 +pow-target-spacing-seconds+)
+  "Core TipMayBeStale's threshold: nPowTargetSpacing * 3 = 1800s
+(net_processing.cpp:1339). The factor is THREE. Earlier revisions of
+docs/eclipse-resistance-plan.md wrote it as `30 * 600 = 1800s' — right product,
+wrong factor — which lands on 18000s, five hours, if copied literally. Written
+as the multiplication rather than the number so the two can never drift apart.")
+
+(defconstant +stale-tip-check-interval-seconds+ 600
+  "Core STALE_CHECK_INTERVAL (net_processing.cpp:108). This gates the stale-tip
+half ALONE and is nested inside the 45s sweep — the two cadences are different
+and both real. Checking staleness every 45s instead would re-evaluate a
+1800s-old condition forty times before it could change.")
+
+(defvar *last-stale-tip-check* 0
+  "Unix time of the last stale-tip evaluation (Core m_stale_tip_check_time).")
+
+(defvar *try-new-outbound-peer* nil
+  "Core CConnman::m_try_another_outbound_peer. While true the dialer may open
+ONE full-relay connection beyond node-max-peers.
+
+Note what this does NOT do: it does not raise the eviction target. Core's
+GetExtraFullOutboundCount still measures against the unraised
+m_max_outbound_full_relay (net.cpp:2473), so the moment the extra peer connects
+the rotation sees one peer too many and drops the stalest. That is the whole
+mechanism — the extra slot buys a REPLACEMENT, not a bigger peer set. Raising
+both targets together, the intuitive reading, would make the extra peer
+permanent and the rotation would never fire at all.")
+
+(defun outbound-dial-budget (node)
+  "How many outbound full-relay connections the DIALER may hold: node-max-peers,
+plus one while the stale-tip extra slot is granted.
+
+Core opens that extra peer from a SEPARATE branch of ThreadOpenConnections
+(net.cpp:2722), reached only after the normal full-relay and block-relay
+targets are already satisfied — so it is exactly one connection more than we
+would otherwise dial, and only while the tip looks stuck.
+
+The eviction target is deliberately NOT this number (see
+consider-outbound-evictions): Core's GetExtraFullOutboundCount measures against
+the unraised maximum, so the extra peer is immediately one too many and the
+rotation drops the stalest. Dialing budget and eviction budget differing by one
+IS the mechanism; making them agree would turn a replacement into permanent
+growth and silence the rotation."
+  (+ (node-max-peers node) (if *try-new-outbound-peer* 1 0)))
+
+(defun tip-may-be-stale-p (node)
+  "Core PeerManagerImpl::TipMayBeStale (net_processing.cpp:1332): our tip has
+not advanced in +STALE-TIP-AGE-SECONDS+ and no block is in flight from anyone.
+
+The elapsed time is computed as a DIFFERENCE within get-universal-time, never
+by converting an epoch. node-last-tip-advance-time is universal time while
+every other timer in this subsystem is unix seconds, and the plan records a
+~2.2e9-second error from feeding one clock's value to the other. A difference
+is epoch-independent, so there is nothing here to get wrong.
+
+A node whose tip has never advanced stamps the clock and reports fresh, as
+Core does for m_last_tip_update == 0 — otherwise every node would declare
+itself eclipsed the moment it started."
+  (let ((last (node-last-tip-advance-time node)))
+    (cond ((not (plusp last))
+           (setf (node-last-tip-advance-time node) (get-universal-time))
+           nil)
+          (t (and (> (- (get-universal-time) last) +stale-tip-age-seconds+)
+                  (not (bitcoin-lisp.networking:any-blocks-in-flight-p)))))))
+
+(defun check-for-stale-tip (node now)
+  "Core's stale-tip half of CheckForStaleTipAndEvictPeers (:5468-5479), on its
+own 10-minute timer. Sets or clears the extra-outbound permission.
+
+The CLEAR is not optional and is the half that is easy to omit: without it the
+first stale episode raises the dialing budget permanently, and the rotation —
+which measures against the unraised target — then spends every 45s sweep
+evicting a peer we just dialled. The feature would present as steady outbound
+churn with no stale tip in sight.
+
+Core guards this with three conditions; we carry one. GetNetworkActive is
+node-network-active below. GetUseAddrmanOutgoing has no counterpart because we
+have no -connect option — if one is ever added, it must gate this, or a node
+pinned to a fixed peer list would start dialling addrman peers behind the
+operator's back. LoadingBlocks likewise has no counterpart; in its place the
+in-flight condition inside tip-may-be-stale-p keeps a node that is actively
+fetching from calling its own tip stale."
+  (when (> now *last-stale-tip-check*)
+    (setf *last-stale-tip-check* (+ now +stale-tip-check-interval-seconds+))
+    (cond ((and (node-network-active node)
+                (tip-may-be-stale-p node))
+           (unless *try-new-outbound-peer*
+             (log-info "Potential stale tip detected (no advance in ~Ds); \
+allowing one extra outbound peer"
+                       (- (get-universal-time) (node-last-tip-advance-time node))))
+           (setf *try-new-outbound-peer* t))
+          (*try-new-outbound-peer*
+           (log-info "Tip is advancing again; releasing the extra outbound slot")
+           (setf *try-new-outbound-peer* nil)))))
+
 (defun replace-disconnected-peers (node)
   "Replace disconnected peers to maintain target peer count.
 Returns the number of new peers connected."
@@ -3853,7 +3954,7 @@ Returns the number of new peers connected."
   ;; :outbound-full-relay in our code, so they do count here, whereas Core's
   ;; MANUAL connections are additive.)
   (let* ((active-count (count-outbound-full-relay-peers (node-peers node)))
-         (needed (- (node-max-peers node) active-count)))
+         (needed (- (outbound-dial-budget node) active-count)))
     (when (<= needed 0)
       (return-from replace-disconnected-peers 0))
 
@@ -4070,18 +4171,59 @@ timestamp would reset each pass and the cadence would be meaningless.")
   "Core EXTRA_PEER_CHECK_INTERVAL — cadence of the chain-sync sweep.")
 
 (defun consider-outbound-evictions (node)
-  "Chain-sync eviction sweep (Core ConsiderEviction, run once per SendMessages
-pass). Driven from here rather than from run-ibd's block-download loop, which
-does not run at tip — exactly where eclipse resistance matters."
+  "Core's CheckForStaleTipAndEvictPeers tick (net_processing.cpp:5460), on the
+45s EXTRA_PEER_CHECK_INTERVAL cadence. Driven from here rather than from
+run-ibd's block-download loop, which does not run at tip — exactly where
+eclipse resistance matters.
+
+Two sweeps, in Core's order: the per-peer chain-sync eviction, then the
+whole-set extra-outbound eviction."
   (let ((now (bitcoin-lisp.serialization:get-unix-time)))
     (when (>= (- now *last-chain-sync-check*) +extra-peer-check-interval-seconds+)
       (setf *last-chain-sync-check* now)
       (let ((chain-state (node-current-chainstate node)))
         (when chain-state
           (dolist (peer (node-peers node))
-            (ignore-errors
-             (bitcoin-lisp.networking:consider-chain-sync-eviction
-              peer chain-state now))))))))
+            (handler-case
+                (bitcoin-lisp.networking:consider-chain-sync-eviction
+                 peer chain-state now)
+              (error (e)
+                ;; Per-peer, so one unhappy peer cannot stop the sweep — but
+                ;; LOGGED, not swallowed. A silent error here exempts that peer
+                ;; from eviction forever, which is indistinguishable from the
+                ;; eclipse this code exists to prevent.
+                (log-warn "Chain-sync eviction failed for peer ~A: ~A"
+                          (bitcoin-lisp.networking:peer-address peer) e))))))
+      ;; Core runs EvictExtraOutboundPeers from this same tick (:5466), and
+      ;; BEFORE the stale-tip check rather than after: the peer we are about to
+      ;; decide we need is not one we should have dropped on the way in.
+      ;;
+      ;; Unlike the chain-sync sweep this one is not per-peer — both halves
+      ;; rank the set against itself — so it takes the list once, snapshotted
+      ;; under the node lock: disconnect-peer runs inside it and mutates state
+      ;; the listener thread touches too.
+      (handler-case
+          (bitcoin-lisp.networking:evict-extra-outbound-peers
+        (bt:with-recursive-lock-held ((node-lock node)) (copy-list (node-peers node)))
+        now
+        ;; Deliberately the UNRAISED target, even while the extra-outbound slot
+        ;; is granted. Core's GetExtraFullOutboundCount does the same
+        ;; (net.cpp:2473): the extra peer is supposed to put us one over so the
+        ;; rotation drops the stalest one. Passing the raised budget here would
+        ;; make the extra connection permanent and silently disable the whole
+        ;; rotation.
+        (node-max-peers node)
+        +target-block-relay-peers+)
+        ;; Whole-set, so an error takes the sweep with it — which is exactly
+        ;; why it must be visible. This feature's own history is a sweep placed
+        ;; where it never ran (see the docstring above); a bare ignore-errors
+        ;; would recreate that silently.
+        (error (e) (log-warn "Extra-outbound eviction sweep failed: ~A" e)))
+      ;; Then the stale-tip half, on its own 10-minute timer. Core's order
+      ;; (:5466 then :5468): evict first, so a peer we are about to decide we
+      ;; need is not one we just dropped on the way in.
+      (handler-case (check-for-stale-tip node now)
+        (error (e) (log-warn "Stale-tip check failed: ~A" e))))))
 
 (defun maintain-peers (node)
   "Run periodic peer maintenance: health checks, reconnection, dedicated
