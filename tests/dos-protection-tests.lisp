@@ -1276,3 +1276,54 @@ frame so this cannot pass on an empty or truncated string."
     (is-true (stringp trace) "a backtrace must have been produced")
     (is-true (search "RECV-BACKTRACE-CANARY" trace)
              "the signalling frame must appear in the captured trace")))
+
+(test socket-readiness-survives-a-descriptor-above-the-select-ceiling
+  "The mainnet outage of 2026-08-17/18, in miniature.
+
+usocket:wait-for-input goes through select(2), whose fd_set is a fixed
+1024-bit bitmap, so SBCL type-checks the descriptor as (unsigned-byte 10) and a
+socket on fd >= 1024 SIGNALS rather than being waited on. Mainnet held ~3100
+open LevelDB tables, every new socket landed above the ceiling, and the node
+lost every peer to `The value <fd+1> is not of type (UNSIGNED-BYTE 10)'.
+
+This holds 1200 descriptors open so the socket under test is allocated above
+the ceiling, then checks both halves: that the old path really does fail there
+(otherwise the test proves nothing) and that ours reports readiness correctly
+in both directions — NIL before data, T after. Asserting only the T would pass
+for a function that always returns T."
+  (let ((hogs (ignore-errors
+               (loop repeat 1200 collect (open "/dev/null" :direction :input)))))
+    (unwind-protect
+         (let* ((listener (usocket:socket-listen "127.0.0.1" 0 :reuse-address t
+                                                 :element-type '(unsigned-byte 8)))
+                (port (usocket:get-local-port listener))
+                (client (usocket:socket-connect "127.0.0.1" port
+                                                :element-type '(unsigned-byte 8)))
+                (server (usocket:socket-accept listener
+                                               :element-type '(unsigned-byte 8))))
+           (unwind-protect
+                (let ((fd (sb-bsd-sockets:socket-file-descriptor (usocket:socket server))))
+                  ;; If the environment would not give us a high descriptor
+                  ;; (a tight ulimit, say) the reproduction is not set up and
+                  ;; asserting anything about it would be theatre.
+                  (when (> fd 1023)
+                    (is (eq :failed
+                            (handler-case
+                                (progn (usocket:wait-for-input server :timeout 0
+                                                                      :ready-only t)
+                                       :ok)
+                              (type-error () :failed)))
+                        "control: the select-based path must still fail above the ceiling, ~
+                         or this test is no longer reproducing the bug")
+                    (is-false (bitcoin-lisp.networking:socket-input-ready-p server :timeout 0)
+                              "no data yet: must report NOT ready")
+                    (write-sequence (coerce '(104 105) '(vector (unsigned-byte 8)))
+                                    (usocket:socket-stream client))
+                    (force-output (usocket:socket-stream client))
+                    (sleep 0.5)
+                    (is-true (bitcoin-lisp.networking:socket-input-ready-p server :timeout 0)
+                             "data arrived: must report ready, above the ceiling")))
+             (usocket:socket-close client)
+             (usocket:socket-close server)
+             (usocket:socket-close listener)))
+      (mapc #'close hogs))))

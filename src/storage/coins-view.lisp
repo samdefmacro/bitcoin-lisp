@@ -137,13 +137,31 @@ struct alloc on the per-block hot path."
   "Open or create the coins-view LevelDB at PATH. Caller must call
 close-coins-view-db. Use with-coins-view-db for RAII-style scope.
 
-max-open-files is raised far above leveldb's 64 default: the table cache
-holds one entry per .ldb file, and once the mainnet chainstate outgrew
-64 tables every point-Get churned Table::Open/mmap/munmap — ~12% of IBD
-CPU by sb-sprof at h≈280k. 4096 keeps every table of a ~8GB chainstate
-cached (one fd + index block each; Core instead pairs 64 with a large
-block cache, which the C API we bind doesn't expose)."
-  (let ((opts (leveldb-make-options :max-open-files 4096)))
+max-open-files is leveldb's own default of 1000, which is also what Core uses
+on 64-bit Unix (dbwrapper.cpp SetMaxOpenFiles: it lowers the value to 64 only
+when sizeof(void*) < 8).
+
+It was 4096, and that cost us the mainnet node. Core's comment there spells out
+why the ceiling matters: a large count is safe on Windows `because the handles
+do not interfere with select() loops', and safe on 64-bit Unix only up to that
+amount, `because up to that amount LevelDB will use an mmap implementation that
+does not use extra file descriptors (the fds are closed after being mmap-ed)' —
+`increasing the value beyond the default is dangerous because LevelDB will fall
+back to a non-mmap implementation when the file count is too large'.
+
+That is exactly what happened on 2026-08-17/18: past the mmap threshold the
+chainstate held ~3100 REAL descriptors, every new socket was allocated above
+fd 1023, and usocket's select-based readiness check signalled
+`The value <fd+1> is not of type (UNSIGNED-BYTE 10)' on each one until the node
+sat at zero peers. The accompanying comment claimed 64 was "leveldb's default"
+and that Core "pairs 64 with a large block cache"; both are wrong, and the
+mistake is what made 4096 look like a free win.
+
+The original tuning problem was real — at 64 the table cache thrashes
+Table::Open/mmap/munmap on every point-Get, ~12% of IBD CPU by sb-sprof at
+h≈280k — but 1000 is well clear of that and stays inside the mmap regime, where
+cached tables cost address space rather than descriptors."
+  (let ((opts (leveldb-make-options :max-open-files 1000)))
     (unwind-protect
          (make-coins-view-db :db (leveldb-open path opts))
       (leveldb-destroy-options opts))))

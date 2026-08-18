@@ -234,7 +234,7 @@ usocket server socket, or NIL on failure (e.g. port already in use)."
 accept and wrap it in a connection. Returns the connection, or NIL on timeout or
 error. The timeout lets the accept loop poll a shutdown flag between waits."
   (handler-case
-      (when (usocket:wait-for-input server-socket :timeout timeout :ready-only t)
+      (when (socket-input-ready-p server-socket :timeout timeout)
         (let ((client (usocket:socket-accept server-socket
                                              :element-type '(unsigned-byte 8))))
           (when client
@@ -783,12 +783,10 @@ generous +RECEIVE-STALL-TIMEOUT-SECONDS+ instead."
       ;; signal interrupts the underlying select() with EINTR, which usocket
       ;; surfaces as not-ready. Re-wait; the budget above ends genuine silence.
       (handler-case
-          (usocket:wait-for-input socket :timeout 0.5 :ready-only t)
+          (socket-input-ready-p socket :timeout 0.5)
         (error () (return (%receive-gave-up conn)))))))
 
 (defun data-available-p (conn &key (timeout 0))
   "Check if data is available to read on the connection."
   (when (and (connection-socket conn) (connection-connected conn))
-    (usocket:wait-for-input (connection-socket conn)
-                            :timeout timeout
-                            :ready-only t)))
+    (socket-input-ready-p (connection-socket conn) :timeout timeout)))

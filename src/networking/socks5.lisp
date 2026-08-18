@@ -138,9 +138,8 @@ resumable reader exists for the many-peers pump, not for this."
                                  internal-time-units-per-second)))
                (when (<= time-left 0)
                  (socks5-fail phase "timeout waiting for proxy reply"))
-               (when (usocket:wait-for-input socket
-                                             :timeout (max 0.1 (min time-left 5.0))
-                                             :ready-only t)
+               (when (socket-input-ready-p socket
+                                           :timeout (max 0.1 (min time-left 5.0)))
                  ;; Take only what is available. This mirrored receive-bytes
                  ;; closely enough to inherit its defect: READ-SEQUENCE demands
                  ;; the whole remaining reply and waits inside the stream with
