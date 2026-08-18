@@ -81,7 +81,8 @@
                   :components ((:file "assembler")
                                (:file "builder")))
                  (:module "networking"
-                  :components ((:file "socks5")     ; before connection: make-tcp-connection tunnels through *proxy*
+                  :components ((:file "fd-wait")    ; before everything: poll-based readiness (select's fd ceiling)
+                               (:file "socks5")     ; before connection: make-tcp-connection tunnels through *proxy*
                                (:file "connection")
                                (:file "v2-transport")
                                (:file "peer")
