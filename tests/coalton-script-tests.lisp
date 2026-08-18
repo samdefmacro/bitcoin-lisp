@@ -1273,3 +1273,50 @@ real signature is provided (interpreter.cpp:1161)."
     ;; without STRICTENC, no pubkey-encoding error
     (let ((bitcoin-lisp.coalton.interop:*script-flags* nil))
       (is (null (bitcoin-lisp.coalton.interop::check-pubkey-encoding bad-pk))))))
+
+;;; ============================================================
+;;; GA9 S1-6: negative zero at any length
+
+(test ga9-s1-6-cast-to-bool-multi-byte-negative-zero
+  "Core's CastToBool (script/interpreter.cpp:36-48) scans for the first
+non-zero byte and returns false when that byte is the LAST one and equals
+0x80 — so EVERY encoding of negative zero is false: 80, 0080, 000080, ...
+
+We recognised the one-byte form only, so 00 80 and 00 00 80 came back TRUE
+where Core returns FALSE. This is the truth predicate behind the final
+EVAL_FALSE check, OP_IF, OP_NOTIF, OP_VERIFY and OP_IFDUP — under OP_IF the
+two implementations take OPPOSITE BRANCHES, so an attacker can make a whole
+redeem branch diverge. MINIMALDATA does not gate it: it constrains the push
+encoding, not the bytes pushed.
+
+The tests that existed covered 0x80 and single bytes only, which is exactly
+how the multi-byte form survived. Both interpreters are asserted here, and
+asserted to AGREE, since the legacy CL copy carried the identical bug and
+fixing one alone would let them drift."
+  (let ((cases '((#()          nil "empty")
+                 (#(0)         nil "single zero")
+                 (#(0 0)       nil "all zeros")
+                 (#(#x80)      nil "one-byte negative zero")
+                 (#(0 #x80)    nil "two-byte negative zero — was TRUE for us")
+                 (#(0 0 #x80)  nil "three-byte negative zero — was TRUE for us")
+                 (#(1)         t   "one")
+                 (#(0 1)       t   "trailing one")
+                 (#(#x80 0)    t   "0x80 first but NOT last: genuinely true")
+                 (#(#x81)      t   "negative one")
+                 (#(0 0 #x81)  t   "multi-byte negative one"))))
+    (dolist (case cases)
+      (destructuring-bind (bytes expected label) case
+        ;; Coalton's `Vector U8' is a CL (VECTOR T), NOT a specialized
+        ;; (vector (unsigned-byte 8)) -- passing the specialized form is a
+        ;; type error at the boundary, and the rest of this file works only
+        ;; because #(0) literals are already (vector t). Getting this wrong
+        ;; costs an afternoon: the call fails in a way that looks like the
+        ;; function returning a wrong answer rather than rejecting its input.
+        (let ((generic (make-array (length bytes) :initial-contents (coerce bytes 'list)))
+              (specialized (coerce bytes '(vector (unsigned-byte 8)))))
+          (is (eq (and (bitcoin-lisp.coalton.script:cast-to-bool generic) t)
+                  (and expected t))
+              "coalton cast-to-bool ~A: ~S" label bytes)
+          (is (eq (and (bitcoin-lisp.validation::cast-to-bool specialized) t)
+                  (and expected t))
+              "legacy cast-to-bool ~A: ~S" label bytes))))))
