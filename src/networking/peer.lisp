@@ -43,6 +43,15 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (chain-sync-work-header nil)                ; tip hash we benchmarked against
   (chain-sync-sent-getheaders nil)
   (chain-sync-protect nil)
+  ;; Core CNodeState::m_last_block_announcement (net_processing.cpp:504). UNIX
+  ;; SECONDS, 0 = never announced. Credited where a block is ANNOUNCED with
+  ;; more work than our tip — headers (:2922) and cmpctblock (:4624) — and
+  ;; deliberately NOT where a compact block reconstructs: a peer that keeps us
+  ;; current by announcing is doing its job whether or not our own mempool
+  ;; happened to hold the txs. Read only by the extra-outbound rotation, which
+  ;; evicts the OLDEST stamp; 0 therefore means "first in line", which is why
+  ;; that rotation needs a tie-break — every fresh peer sits at 0 together.
+  (last-block-announcement 0 :type integer)
   ;; BIP133 feefilter state (Core Peer::m_fee_filter_sent /
   ;; m_next_send_feefilter). FEE-FILTER-SENT is the last value we put on the
   ;; wire (NIL = none yet); NEXT-SEND-FEEFILTER is a unix time, 0 = due now.
@@ -369,6 +378,21 @@ release, because by then the retirement that set the state already did.)"
 ;;; the previous placement left the counter with no production releaser at all
 ;;; — it only ever incremented, so after one round of outbound churn every
 ;;; slot was permanently spent and no peer could earn protection again.
+
+(defun credit-block-announcement (peer)
+  "Stamp PEER as having just announced a block that beats our tip (Core
+net_processing.cpp:2922 for headers, :4624 for cmpctblock).
+
+Both Core sites carry the same two-part condition, and both halves are load
+bearing. The announced chain must be STRICTLY better than our tip — equalling
+it is what every peer at the same tip does all day and would keep the whole
+outbound set looking equally useful — and the announcement must have been NEW
+to us, so that relaying a block we already had earns nothing. Otherwise a peer
+could hold its slot forever by echoing back what we just told it.
+
+Unix seconds, matching the slot and the sweep that reads it."
+  (setf (peer-last-block-announcement peer)
+        (bitcoin-lisp.serialization:get-unix-time)))
 
 (defconstant +max-outbound-peers-to-protect+ 4
   "Core MAX_OUTBOUND_PEERS_TO_PROTECT_FROM_DISCONNECT.")

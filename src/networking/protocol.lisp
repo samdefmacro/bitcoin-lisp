@@ -2981,11 +2981,21 @@ its own inside REQUEST-FULL-BLOCK). Returns the action taken."
 
 (defun compact-block-header-verdict (chain-state header block-hash prev-hash)
   "Core's ProcessNewBlockHeaders({{cmpctblock.header}}) step, run BEFORE any
-reconstruction (net_processing.cpp:4571-4593). Returns (VALUES VERDICT REASON):
+reconstruction (net_processing.cpp:4571-4593). Returns
+(VALUES VERDICT REASON CREDITS-ANNOUNCEMENT):
 
   :NO-PARENT — parent absent from the index; the caller answers with getheaders
   :ACCEPT    — the header is admissible, go on and reconstruct
   :REJECT    — REASON says what HANDLE-COMPACT-BLOCK-FAILURE must do with it
+
+CREDITS-ANNOUNCEMENT is Core's
+`received_new_header && pindex->nChainWork > tip->nChainWork' (:4623): the
+announced block was unknown to us AND beats our tip. It is returned from here
+rather than recomputed by the caller because both halves are index reads, and
+this function is the one place already holding the node lock across them — and
+because the `unknown to us' half must be answered from the SAME lookup the
+:ACCEPT/:REJECT decision used. Answering it after the caller has processed the
+block would always say `known'.
 
 Order mirrors AcceptBlockHeader (validation.cpp:4226-4259): a header we already
 hold short-circuits (BLOCK_CACHED_INVALID when we marked it invalid, otherwise
@@ -3004,7 +3014,9 @@ does the IO (getheaders / getdata / disconnect) outside."
       ;; marked it invalid: BLOCK_CACHED_INVALID (validation.cpp:4229-4237).
       ((and known (eq (bitcoin-lisp.storage:block-index-entry-status known) :invalid))
        (values :reject :duplicate-invalid))
-      (known (values :accept nil))
+      ;; Already in the index: accepted, but received_new_header is false, so
+      ;; no announcement credit however much work it carries.
+      (known (values :accept nil nil))
       ;; Parent not in the index: the announcement outran our header chain.
       ;; The ORDINARY case, not an attack — high-bandwidth compact relay beats
       ;; headers announcements by design, so falling one block behind while a
@@ -3030,7 +3042,25 @@ does the IO (getheaders / getdata / disconnect) outside."
             :prev-hash prev-hash
             :height (1+ (bitcoin-lisp.storage:block-index-entry-height prev-entry))
             :prev-entry prev-entry)
-         (if valid (values :accept nil) (values :reject reason)))))))
+         (if valid
+             (values :accept nil
+                     ;; KNOWN is NIL on this branch, so received_new_header
+                     ;; holds; all that remains is the work comparison. The
+                     ;; header is not in the index yet (this function is pure
+                     ;; reads), so its work is computed the way Core computes
+                     ;; it a few lines earlier for the anti-DoS floor (:4578):
+                     ;; the parent's work plus this header's own proof.
+                     (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+                            (tip (and tip-hash
+                                      (bitcoin-lisp.storage:get-block-index-entry
+                                       chain-state tip-hash))))
+                       (and tip
+                            (> (bitcoin-lisp.storage:calculate-chain-work
+                                (bitcoin-lisp.serialization:block-header-bits header)
+                                (bitcoin-lisp.storage:block-index-entry-chain-work
+                                 prev-entry))
+                               (bitcoin-lisp.storage:block-index-entry-chain-work tip)))))
+             (values :reject reason)))))))
 
 (defun handle-cmpctblock (peer payload chain-state utxo-set block-store mempool
                           &optional fee-estimator &key recent-rejects)
@@ -3057,11 +3087,20 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
     ;; clear below, so an announcement we are about to drop cannot destroy an
     ;; in-flight reconstruction of the block we are actually missing (Core
     ;; keeps per-block in-flight state, so it has no such cross-talk).
-    (multiple-value-bind (verdict reason)
+    (multiple-value-bind (verdict reason credits-announcement)
         (with-node-lock
           (compact-block-header-verdict chain-state header block-hash prev-hash))
       (ecase verdict
-        (:accept nil)
+        (:accept
+         ;; Core net_processing.cpp:4623. The stamp is credited HERE, on the
+         ;; announcement, and not in the successful-reconstruction branch
+         ;; below: whether we could rebuild the block from our own mempool
+         ;; says something about our mempool, not about how useful this peer
+         ;; is at keeping us on the best chain. Crediting the reconstruct
+         ;; instead would penalise exactly the peer that reaches us first with
+         ;; a block nobody has seen yet.
+         (when credits-announcement
+           (credit-block-announcement peer)))
         (:no-parent
          (bitcoin-lisp:log-cat "net"
                                "cmpctblock ~A: parent ~A not in index — getheaders to ~A"
