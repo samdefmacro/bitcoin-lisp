@@ -156,8 +156,19 @@ For each input with version >= 2 and sequence not disabled (bit 31 clear):
 - Height-based: input UTXO must be at least N blocks deep
 - Time-based: MTP must be >= N*512 seconds after UTXO's MTP
 Returns T if all locks satisfied, NIL if any lock not yet matured."
-  ;; BIP 68 only applies to transaction version >= 2
-  (when (< (bitcoin-lisp.serialization:transaction-version tx) 2)
+  ;; BIP 68 applies to version >= 2, compared UNSIGNED. Core stores the version
+  ;; as `const uint32_t\' (primitives/transaction.h:293) and gates on
+  ;; `tx.version >= 2\' (consensus/tx_verify.cpp:51), so every version with bit
+  ;; 31 set is >= 2 and IS enforced. We store the slot as (signed-byte 32) —
+  ;; correct, since that is what the wire format reads — so the same bytes come
+  ;; back negative and a signed compare skipped BIP68 entirely for them. Version
+  ;; 0x80000002 spending an unmatured relative locktime was accepted here and
+  ;; rejected by Core as bad-txns-nonfinal.
+  ;;
+  ;; Reinterpret at the GATE, not in the struct: the slot must stay signed so
+  ;; serialization keeps round-tripping, and every other reader of the version
+  ;; keeps the value the wire actually carries.
+  (when (< (ldb (byte 32 0) (bitcoin-lisp.serialization:transaction-version tx)) 2)
     (return-from check-sequence-locks t))
   (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx) t)
     (let ((seq (bitcoin-lisp.serialization:tx-in-sequence input)))
@@ -990,9 +1001,35 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
         (values nil :bad-coinbase-height))))
 
 (defun calculate-block-weight (transactions)
-  "Calculate total block weight as sum of all transaction weights."
-  (loop for tx in transactions
-        sum (bitcoin-lisp.serialization:transaction-weight tx)))
+  "Weight of the block whose transaction list is TRANSACTIONS (Core
+GetBlockWeight, consensus/validation.h:136-139).
+
+Core weighs the WHOLE BLOCK, not the transactions: it serializes the block with
+and without witnesses, and the block serializer emits
+`header(80) || CompactSize(vtx.size()) || txs\'. Expanding
+`3*size_nowit + size_wit\' over that shape, the prefix survives with a factor
+of four:
+
+    weight = 4 * (80 + compact-size-length(n)) + SUM(transaction-weight)
+
+This summed transaction weights ALONE, i.e. it dropped `4 * (80 + cs(n))\' —
+324 weight units for a block of fewer than 253 transactions, 332 up to 65535.
+It under-counted, so the error ran in the dangerous direction: a block whose
+true weight lands in (4000000, 4000332] passed here, connected, and advanced
+our tip while every Core node rejected it as `bad-blk-weight\'. That is a
+permanent chain split that ends only by hand.
+
+The prefix depends only on the transaction COUNT, so this needs no block object
+and every caller — the consensus check below and getblock\'s `weight\' field —
+is corrected at once. That matters for the RPC too: the number we report must
+be the number bitcoind reports for the same block.
+
+The base-size check a few lines below already added `80 + compact-size-length\'
+correctly, which is what marks this as an oversight rather than a decision."
+  (+ (* 4 (+ 80 (bitcoin-lisp.serialization:compact-size-length
+                 (length transactions))))
+     (loop for tx in transactions
+           sum (bitcoin-lisp.serialization:transaction-weight tx))))
 
 ;;;; Sigops cost calculation
 
@@ -1413,8 +1450,18 @@ Returns (VALUES T NIL FEES) on success, (VALUES NIL ERROR-KEYWORD NIL) on failur
              (locktime-check-time (if csv-active
                                       mtp
                                       (bitcoin-lisp.serialization:block-header-timestamp header))))
-        ;; Check finality for all non-coinbase transactions
-        (loop for tx in (rest transactions)
+        ;; Finality covers EVERY transaction including the coinbase: Core's
+        ;; ContextualCheckBlock iterates block.vtx with no IsCoinBase guard
+        ;; (validation.cpp:4176-4181). This skipped vtx[0], so a coinbase with
+        ;; an nLockTime past the cutoff and a non-final nSequence connected
+        ;; here while Core rejected the block bad-txns-nonfinal.
+        ;;
+        ;; The coinbase exclusion belongs to the BIP68 loop directly below,
+        ;; which Core really does guard with `if (!tx.IsCoinBase())'
+        ;; (validation.cpp:2528) — it was applied to the wrong one of two
+        ;; adjacent loops. Keep them different; making them agree reintroduces
+        ;; one bug or the other.
+        (loop for tx in transactions
               unless (check-transaction-final tx current-height locktime-check-time)
                 do (return-from validate-block (values nil :non-final-tx nil)))
         ;; BIP 68 sequence lock enforcement (only at or above CSV activation)
@@ -1821,16 +1868,43 @@ Handles chain reorganizations when a competing chain has more work."
     ;; Store block
     (bitcoin-lisp.storage:store-block block-store block)
 
-    ;; Create index entry
-    (let ((entry (bitcoin-lisp.storage:make-block-index-entry
-                  :hash hash
-                  :height new-height
-                  :header header
-                  :prev-entry prev-entry
-                  :chain-work chain-work
-                  :status :valid
-                  :tx-count (length (bitcoin-lisp.serialization:bitcoin-block-transactions
-                                     block)))))
+    ;; Index entry. Core NEVER rebuilds a CBlockIndex: AddToBlockIndex is a
+    ;; try_emplace that returns the existing object when the hash is already
+    ;; known (node/blockstorage.cpp:228-231), and receiving the body mutates
+    ;; that object in place. We constructed a fresh entry with :status :valid
+    ;; and ADD-BLOCK-INDEX-ENTRY is a plain (setf gethash) — a REPLACE, which
+    ;; erased an existing :invalid mark.
+    ;;
+    ;; That made invalidateblock defeatable by a single unsolicited block
+    ;; message: the RPC reorgs down and marks the block :invalid, leaving the
+    ;; tip at its parent, so a peer replaying the block hits the tip-extension
+    ;; arm, passes validate-block (it IS consensus-valid — invalidateblock is a
+    ;; manual override), and landed here to be re-created as :valid. The
+    ;; operator's node silently returned to the chain they explicitly refused.
+    ;; The same erasure cleared the automatic poison on a doomed fork subtree.
+    (let* ((existing (bitcoin-lisp.storage:get-block-index-entry chain-state hash))
+           (entry (or existing
+                      (bitcoin-lisp.storage:make-block-index-entry
+                       :hash hash
+                       :height new-height
+                       :header header
+                       :prev-entry prev-entry
+                       :chain-work chain-work
+                       :status :valid
+                       :tx-count (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+                                          block))))))
+      (when existing
+        ;; Refresh what arriving BODY data supplies, in place. Status is RAISED
+        ;; only: an :invalid mark is a decision (operator or validator) and
+        ;; nothing here is entitled to overrule it.
+        (setf (bitcoin-lisp.storage:block-index-entry-height entry) new-height
+              (bitcoin-lisp.storage:block-index-entry-header entry) header
+              (bitcoin-lisp.storage:block-index-entry-prev-entry entry) prev-entry
+              (bitcoin-lisp.storage:block-index-entry-chain-work entry) chain-work
+              (bitcoin-lisp.storage:block-index-entry-tx-count entry)
+              (length (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+        (unless (eq (bitcoin-lisp.storage:block-index-entry-status entry) :invalid)
+          (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)))
       (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
 
       ;; Check if we need a reorganization. REORG-OUTCOME captures perform-reorg's
@@ -2355,6 +2429,25 @@ comment above."
         ;; for a witness-complete re-download. Only the to-connect side is checked:
         ;; to-disconnect blocks already validated when they were connected, and we
         ;; still need their bodies for the UTXO disconnect.
+        ;; Core's fFailedChain arm (FindMostWorkChain, validation.cpp:3170-3196):
+        ;; a candidate tip is refused outright when ANY block on the path to it
+        ;; carries BLOCK_FAILED_VALID. We read no status at all here, so a
+        ;; branch containing a block the operator invalidated -- or one the
+        ;; validator poisoned -- was a legitimate reorg target as long as it
+        ;; carried more work.
+        ;;
+        ;; Checked BEFORE anything is mutated, so refusing costs nothing and
+        ;; cannot leave the chainstate half-moved.
+        (let ((failed (find-if (lambda (e)
+                                 (eq (bitcoin-lisp.storage:block-index-entry-status e)
+                                     :invalid))
+                               to-connect)))
+          (when failed
+            (bitcoin-lisp:log-warn
+             "REORG refused: block at height ~D on the target branch is marked invalid"
+             (bitcoin-lisp.storage:block-index-entry-height failed))
+            (return-from perform-reorg (values nil :invalid-branch))))
+
         (dolist (entry to-connect)
           (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
                  (block (bitcoin-lisp.storage:get-block block-store block-hash)))
