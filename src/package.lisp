@@ -1199,6 +1199,7 @@
    #:consider-chain-sync-eviction
    #:evict-extra-outbound-peers
    #:any-blocks-in-flight-p
+   #:socket-input-ready-p
    #:capture-recv-backtrace
    #:*recv-backtrace-budget*
    #:select-extra-block-relay-eviction

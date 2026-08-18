@@ -271,8 +271,7 @@ terminates (tolerant superset; Tor always sends CRLF)."
                       ;; buffered or the 1s wait said ready — keeps shutdown
                       ;; latency ~1s.
                       (if (or (listen stream)
-                              (usocket:wait-for-input socket :timeout 1
-                                                             :ready-only t))
+                              (socket-input-ready-p socket :timeout 1))
                           (read-byte stream nil :eof)
                           :again)
                     (error () :eof))))
