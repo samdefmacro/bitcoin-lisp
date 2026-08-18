@@ -415,10 +415,16 @@ For testnet, data stays at the base directory (backward compatible)."
 
   ;; Network-aware PoW limit: regtest's trivial limit, the standard limit
   ;; otherwise. derive-target / check-proof-of-work reject targets above it.
+  ;; Each network's own powLimit (Core params.powLimit). Signet's is EASIER
+  ;; than mainnet's minimum (00000377ae...), so running it against the mainnet
+  ;; limit made derive-target reject every real signet nBits — including
+  ;; signet's own genesis, whose 0x1e0377ae we already record in chain.lisp.
   (setf bitcoin-lisp.storage:*pow-limit-target*
-        (if (eq network :regtest)
-            bitcoin-lisp.storage:+regtest-pow-limit-target+
-            bitcoin-lisp.storage:+pow-limit-target+))
+        (ecase network
+          (:regtest bitcoin-lisp.storage:+regtest-pow-limit-target+)
+          (:signet  bitcoin-lisp.storage:+signet-pow-limit-target+)
+          ((:mainnet :testnet3 :testnet4)
+           bitcoin-lisp.storage:+pow-limit-target+)))
 
   ;; Calculate data path - each network uses its own subdirectory
   (let* ((base-path (pathname data-directory))
@@ -2624,6 +2630,47 @@ LargeCoinsCacheThreshold (validation.h): flush once less than 10 MiB (or 10% of
 the budget, whichever is larger free margin) remains."
   (max (floor (* budget 9) 10)
        (- budget (* 10 1024 1024))))
+
+(defun maybe-critical-flush (chainstate)
+  "Flush CHAINSTATE only when its coins cache has exceeded its whole budget —
+Core's CRITICAL tier (validation.cpp:2690), the one FlushStateMode::IF_NEEDED
+acts on (:2763).
+
+This exists for the reorg loops. Core calls FlushStateToDisk(IF_NEEDED) at the
+end of BOTH DisconnectTip (validation.cpp:2966) and ConnectTip (:3093), so the
+cache is size-checked once per disconnected AND per connected block, including
+mid-reorg. We had exactly one flush call site in the whole tree — the
+tip-extension path of connect-block — so perform-reorg ran its disconnect and
+connect loops with nothing draining the cache at all. Every disconnected block
+restores its spent prevouts as dirty entries and every connected fork block
+adds its outputs; a deep rollback (dumptxoutset to an assumeutxo height, or
+invalidateblock on an old hash) walks tens of thousands of blocks in one
+uninterrupted loop. This heap has already been OOM-killed twice on this cache.
+
+CRITICAL rather than the LARGE threshold MAYBE-PERIODIC-FLUSH uses, and
+deliberately NOT that function: its count and time triggers would fire
+repeatedly inside a deep reorg and turn a rollback into a flush storm. Core
+draws the same distinction — PERIODIC acts on LARGE, IF_NEEDED only on
+CRITICAL.
+
+MUST be called where the coins-view best-block pointer already names the block
+whose coins are in the cache, i.e. AFTER the apply/disconnect call rather than
+between the mutation and the pointer move. Both COIN-VIEW-APPLY-BLOCK and
+DISCONNECT-BLOCK-FROM-UTXO-SET set that pointer as their last act, so calling
+this immediately after either is safe; anywhere else would persist a cache and
+a pointer that disagree."
+  (when *node*
+    (let ((view (and chainstate
+                     (bitcoin-lisp.storage:chain-state-coins-view chainstate))))
+      (when (and view
+                 (>= (bitcoin-lisp.storage:view-mem-bytes view)
+                     (chainstate-coins-cache-budget chainstate)))
+        (log-info "Coins cache past its budget mid-reorg; flushing")
+        (log-memory-snapshot "pre-flush-critical")
+        (%flush-chainstate chainstate)
+        (setf *blocks-since-flush* 0
+              *last-flush-universal-time* (get-universal-time))
+        t))))
 
 (defun chainstate-coins-cache-budget (chainstate)
   "CHAINSTATE's coins-cache budget in bytes: its per-chainstate allocation

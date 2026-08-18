@@ -408,8 +408,16 @@ and testnet min-difficulty exception."
          (bitcoin-lisp.storage:calculate-next-work-required
           last-retarget-time last-block-time basis-bits)))
 
-      ;; Non-boundary: mainnet just inherits previous bits
-      ((eq bitcoin-lisp:*network* :mainnet)
+      ;; Non-boundary on a chain WITHOUT min-difficulty blocks: inherit the
+      ;; previous block's bits, which is all Core does (pow.cpp:38,
+      ;; `return pindexLast->nBits'). Signet sets
+      ;; fPowAllowMinDifficultyBlocks = false exactly as mainnet does
+      ;; (kernel/chainparams.cpp:491) and so belongs here; it used to fall
+      ;; through to the NIL arm, where validate-difficulty routes NIL into the
+      ;; testnet min-difficulty branch, which tests only :testnet3/:testnet4 --
+      ;; so signet reached the terminal reject and 2015 of every 2016 blocks
+      ;; were :bad-difficulty.
+      ((member bitcoin-lisp:*network* '(:mainnet :signet))
        (bitcoin-lisp.serialization:block-header-bits
         (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
 
@@ -2532,6 +2540,13 @@ comment above."
               (let ((undo (get-undo-data block-hash)))
                 (bitcoin-lisp.storage:disconnect-block-from-utxo-set
                  utxo-set block (or undo '())))
+              ;; Core flushes IF_NEEDED at the end of DisconnectTip
+              ;; (validation.cpp:2966). Safe HERE and not a line earlier:
+              ;; disconnect-block-from-utxo-set sets the coins-view best-block
+              ;; as its last act, so the pointer already names the block whose
+              ;; coins are in the cache. Flushing between the two would persist
+              ;; a cache and a pointer that disagree.
+              (bitcoin-lisp:maybe-critical-flush chain-state)
               ;; Collect this block's non-coinbase txs (original order) for the
               ;; PHASE C mempool re-add. Pushing whole per-block lists during
               ;; the tip-first loop leaves disconnected-block-txs oldest-first.
@@ -2653,6 +2668,28 @@ comment above."
                 (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)
                 (bitcoin-lisp.storage:update-chain-tip chain-state block-hash height)
                 (push (list entry block height spent-utxos) connected))))
+          ;; NOTE: deliberately NO maybe-critical-flush in this loop, unlike
+          ;; PHASE A above, even though Core flushes IF_NEEDED at the end of
+          ;; ConnectTip too (validation.cpp:3093).
+          ;;
+          ;; Core can, because a failed ConnectTip marks the block invalid and
+          ;; the chain is disconnected properly; whatever it persisted is a real
+          ;; chain state it can move away from. We instead rewind IN MEMORY
+          ;; (%rollback-partial-reorg re-applies the original chain), so a flush
+          ;; here would leave the coins DB naming a FORK-SIDE block that we then
+          ;; reject, and a crash before the rollback is itself flushed would
+          ;; roll forward onto the branch we refused.
+          ;;
+          ;; PHASE A has no such exposure: its flushes only ever land on blocks
+          ;; between the old tip and the fork point, which are ancestors of both
+          ;; chains, so rolling forward from one is always correct. It is also
+          ;; the half that actually grows without bound -- the sharp path is a
+          ;; deep rollback (dumptxoutset to an assumeutxo height,
+          ;; invalidateblock on an old hash) disconnecting tens of thousands of
+          ;; blocks in one loop.
+          ;;
+          ;; Closing the connect side needs the rollback to become a real
+          ;; disconnect, as in Core, rather than an in-memory rewind.
 
           ;; PHASE C — commit side effects, only now the whole fork is valid
           ;; and applied. Oldest-to-newest for chain-order indexing.
@@ -2757,10 +2794,25 @@ comment above."
 
 (defun block-descends-from-p (entry ancestor-entry)
   "True if ANCESTOR-ENTRY lies on ENTRY's ancestry (ENTRY is ANCESTOR-ENTRY or a
-descendant of it)."
-  (eq ancestor-entry
-      (bitcoin-lisp.storage:entry-ancestor-at-height
-       entry (bitcoin-lisp.storage:block-index-entry-height ancestor-entry))))
+descendant of it).
+
+Compares by HASH, not by object identity. It used to use EQ, which made the
+answer depend on every entry for a block being the same object forever. That
+held only by accident: connect-block used to REPLACE the index slot with a
+freshly-built entry, so every header admitted before its body kept pointing at
+the orphaned original and this returned NIL for exactly the header-only entries
+above the connected tip — the ones invalidateblock and
+%mark-block-subtree-invalid exist to cover. It never showed in a restart-based
+test, because load-header-index rebuilds a consistent object graph by hash.
+
+connect-block no longer replaces entries (GA9 S1-4), so the cause is gone; this
+is the second half, so the invariant stops resting on identity at all. A hash
+comparison is what the block index is keyed by anyway."
+  (let ((found (bitcoin-lisp.storage:entry-ancestor-at-height
+                entry (bitcoin-lisp.storage:block-index-entry-height ancestor-entry))))
+    (and found
+         (equalp (bitcoin-lisp.storage:block-index-entry-hash found)
+                 (bitcoin-lisp.storage:block-index-entry-hash ancestor-entry)))))
 
 (defun block-index-descendants (chain-state entry)
   "All block-index entries that descend from ENTRY, including ENTRY itself."

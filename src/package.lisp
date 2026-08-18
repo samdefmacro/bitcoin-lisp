@@ -513,6 +513,8 @@
    #:+pow-limit-bits+
    #:+pow-limit-target+
    #:+regtest-pow-limit-bits+
+   #:+signet-pow-limit-bits+
+   #:+signet-pow-limit-target+
    #:+regtest-pow-limit-target+
    #:*pow-limit-target*
    #:save-state
@@ -1522,6 +1524,7 @@
    #:start-file-logging
    #:stop-file-logging
    #:maybe-periodic-flush
+   #:maybe-critical-flush
    #:maybe-stop-at-height
    ;; Cooperative-stop seam (config.lisp): the networking layer installs the
    ;; predicate, lower layers poll it — never the other way round.
