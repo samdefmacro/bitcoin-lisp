@@ -19,11 +19,11 @@ that made GA7 and GA8 trustworthy.
 | peer management & addrman | ✅ complete | 3 S2, 6 S3 |
 | mining / config / lifecycle | ✅ complete | 1 S2, 11 S3 |
 | GA7 backlog status refresh | ✅ complete | 2 status regressions |
-| script interpreter | ❌ died on session limit | — |
+| script interpreter | ✅ complete (part 2) | 3 S1, 6 S3 |
 | mempool & policy | ❌ died on session limit | — |
 | P2P protocol & transport | ✅ complete (part 2) | 1 S1, 2 S2, 1 S3 |
 | storage & indexes | ✅ complete (part 2) | 4 S2, 4 S3 |
-| wallet | ❌ died on session limit | — |
+| wallet | ✅ complete (part 2) | 1 S2, 3 S3 |
 | RPC / REST / UI | ❌ died on session limit | — |
 | crypto & canonical encoding | ❌ died on session limit | — |
 
@@ -809,3 +809,214 @@ matches, including the six special script forms with the on-curve check and `VAR
 non-final offset. Snapshot v2 layout, undo format (height and coinbase persisted, so restored coins
 keep maturity), the coinstatsindex design and rewind, and the 3-phase flush marker discipline all
 match.
+
+## S1-6. `CastToBool` treats multi-byte negative zero as TRUE; Core treats it as FALSE **[verified]**
+
+Core's `CastToBool` (`src/script/interpreter.cpp:36-48`) scans for the first non-zero byte and
+returns false when that byte is the **last** byte and equals `0x80` — so *every* encoding of
+negative zero (`80`, `0080`, `000080`, …) is false, at any length:
+
+```cpp
+if (vch[i] != 0) {
+    // Can be negative zero
+    if (i == vch.size()-1 && vch[i] == 0x80) return false;
+    return true;
+}
+```
+
+Our `cast-to-bool` (`src/coalton/script.lisp:558-566`) is
+`(not (or (zerop (length bytes)) (every #'zerop bytes) (and (= (length bytes) 1) (= (aref bytes 0) #x80))))`
+— it recognises only the **one-byte** negative zero. For `00 80` or `00 00 80`, `every #'zerop` is
+false and the length test fails, so we return **true** where Core returns **false**. Both
+implementations read directly; the divergence is exact.
+
+This is the truth predicate for `VerifyScript`'s final `EVAL_FALSE` check (via
+`stack-top-truthy-p`), `OP_IF`/`OP_NOTIF`, `OP_VERIFY` and `OP_IFDUP`.
+
+Direction: **we accept what Core rejects**, and in branch selection we take the *opposite branch*.
+Minimal case: a P2SH redeem script leaving the 3-byte item `00 00 80` on top — Core returns
+`SCRIPT_ERR_EVAL_FALSE` and rejects, we accept. The `OP_IF` variant is worse:
+`<000080> OP_IF <A> OP_ELSE <B> OP_ENDIF` executes A for us and B for Core, so an attacker can make
+an entire redeem branch diverge. Nothing gates it — MINIMALDATA restricts the *push encoding*, not
+the byte content, so `OP_PUSHBYTES_3 00 00 80` is a perfectly standard push. Reachable under
+mandatory consensus flags alone.
+
+**Fix:** transliterate Core's loop. `src/validation/script.lisp:216-221` carries the identical bug
+in the legacy CL interpreter (currently off the consensus path) and should be fixed with it so the
+two cannot drift again. Add vectors for `0080`/`000080` in `OP_IF`, `OP_VERIFY`, `OP_IFDUP` and as
+the final stack item.
+
+## S1-7. `FindAndDelete` matches at any byte offset; Core matches only at opcode boundaries
+
+Core's `FindAndDelete` (`interpreter.cpp:229-256`) advances with `script.GetOp(pc, opcode)` and only
+tests for a match at those opcode boundaries — push payloads are stepped over wholesale. Core's own
+unit test asserts this explicitly (`script_tests.cpp:1559-1564`): pattern `feed51` in script
+`02feed5169` yields **0** matches, commented *"doesn't match 'inside' opcodes"*.
+
+Our `find-and-delete` (`src/coalton/interop.lisp:1612-1631`) is a plain byte scan with no notion of
+opcode boundaries, deleting every byte-aligned occurrence including those inside push data.
+
+`FindAndDelete` runs only for `SigVersion::BASE` — legacy and P2SH spends, fully live today. The
+finder gave a non-circular construction: a P2SH redeemScript
+`OP_PUSHDATA1 <72 bytes = 0x47 || B> OP_DROP OP_CHECKSIG`, whose raw bytes are
+`4c 48 47 <B> 75 ac`. The pattern `47 || B` occurs at offset 2, which is **not** an opcode boundary
+(boundaries are 0, 74, 75). Core finds 0 matches and hashes the script unchanged → sighash H; we
+delete 72 bytes and hash `4c 48 75 ac` → H′ ≠ H. Because the pubkey comes from the scriptSig rather
+than the script, H is fixed before the pubkey is chosen — so the attacker computes H, then uses
+ECDSA public-key recovery on (r, s, H) to obtain a P for which B verifies. Core accepts; we push
+false and reject the block. A miner can split us off the chain at will.
+
+The same mismatch exists in the CHECKMULTISIG pre-strip path.
+
+**Fix:** an opcode-boundary walker mirroring Core's `do { ... } while (script.GetOp(pc, opcode))`,
+including the trailing `result.insert(result.end(), pc2, end)` for a truncated push. One fix covers
+both call sites. Port Core's `script_FindAndDelete` table verbatim — its truncated-push cases pin
+the edge behaviour.
+
+## S1-8. Strict-DER length bound is off by one — we accept a 74-byte signature Core rejects
+
+Core's `IsValidSignatureEncoding` operates on the **full** signature including the trailing hashtype
+byte and rejects `sig.size() > 73` (`interpreter.cpp:123`). Our `check-der-signature-format` is
+called with the signature **minus** the hashtype byte (`interop.lisp:2042`) but still uses the bound
+`> 73`. In that shifted frame the correct bound is 72, so we permit exactly one extra length: a
+74-byte signature. Every other rule is faithfully reproduced, so the size cap is the *only* thing
+rejecting such a signature in Core. (The minimum is already correct in the shifted frame: `< 8`
+equals Core's `< 9`.)
+
+DERSIG is mandatory on every current block. A signature
+`30 47 02 22 00 <33 bytes> 02 21 00 <32 bytes> 01` has lenR=34, lenS=33, total 74; every DER-integer
+rule passes and Core rejects it solely on size with `SCRIPT_ERR_SIG_DER`, a **hard** failure. We
+pass it to `secp256k1_ecdsa_signature_parse_der`, which returns 1 with r silently clamped to 0
+(`ecdsa_impl.h:127-138`), so we get verify=0 with status=T and fall through to *push false* rather
+than error — NULLFAIL, which would make it an error, is STANDARD-only and unset during block
+validation. So in any script where a false CHECKSIG is not fatal (`<sig74> OP_CHECKSIG OP_NOT` in a
+P2SH redeem script is minimal) we accept a spend Core rejects.
+
+**Fix:** change the bound to `> 72`, or better, pass the full signature so both bounds share Core's
+frame of reference.
+
+## S3 (script)
+
+`OP_CHECKSIG` with an empty signature short-circuits before `CheckPubKeyEncoding`, so STRICTENC and
+WITNESS_PUBKEYTYPE never fire on the paired pubkey — Core runs both checks unconditionally. Policy
+flags only, so consensus is unaffected, but we relay what Core will not. Notably **the CHECKMULTISIG
+path already gets this right**, with a comment citing the Core behaviour — the single-CHECKSIG path
+is inconsistent with its own sibling.
+
+`SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS` is declared in the standard flag set but **never consulted** —
+grep finds only flag-list literals, no consumer. So OP_SUCCESSx tapscripts are relayed as standard
+where Core refuses them, precisely because such scripts are anyone-can-spend today and may become
+invalid after a soft fork. The three sibling DISCOURAGE flags are all handled; this one is the
+outlier. The fix must stay after the OP_SUCCESS scan and before the stack limits, as the existing
+comment already documents.
+
+The single-CHECKSIG FindAndDelete pattern drops the `OP_PUSHDATA1/2` prefix for signatures over 75
+bytes, where Core deletes the canonical push encoding. Dead for current blocks (DERSIG rejects
+>73-byte signatures first) but live during IBD replay of pre-BIP66 history. `strip-sigs-from-script-code`
+encodes all three cases correctly, so the two paths disagree with each other — factor out one
+encoder.
+
+P2SH-wrapped-witness detection derives the redeem script with `extract-last-push-data` instead of
+the post-scriptSig stack top. That parser ignores `OP_0`, `OP_1NEGATE`, `OP_1..OP_16` and
+`OP_PUSHDATA4`, all of which Core's `IsPushOnly` accepts, so a scriptSig ending in one makes us
+return an earlier push and potentially fail with `:witness-malleated-p2sh` where Core proceeds.
+
+Lax DER parsing truncates an over-long R/S to 32 bytes where Core's lax parser substitutes a zero
+signature on overflow. Only reachable below BIP66 activation, so no live divergence.
+
+The script-flag parse cache is an **unsynchronized** hash table with a read-modify-write, mutated by
+every parallel script-check worker. The sibling signature cache is `:synchronized`; this one was
+missed, and `run-tapscript` manufactures a fresh flag string per execution so misses are not confined
+to the first call. Gated behind `*parallel-block-validation*`, NIL by default.
+
+### Cleared in this dimension
+
+`EvalScript`'s main loop shape (push-size check before the `fExec` gate, opcode counting gated on
+`opcode > OP_16` and on sigversion, disabled opcodes and OP_VERIF/OP_VERNOTIF rejected inside
+unexecuted branches, `vfExec` empty checks, MAX_STACK_SIZE re-checked after every opcode);
+`CheckMinimalPush` and the CScriptNum minimal-encoding rule byte-for-byte; the CScriptNum size bound
+at every consumer (4 for arithmetic/OP_PICK/OP_ROLL/OP_CHECKSIGADD, 5 for CLTV/CSV);
+`CheckLockTime`/`CheckSequence` including the unsigned cast and the `0x0040ffff` mask; all stack
+opcodes; OP_CODESEPARATOR accounting for both the legacy scriptCode and BIP342's opcode-index
+commitment; `VerifyScript`'s ordering, P2SH push-only, CLEANSTACK-vs-witness interaction and
+`WITNESS_UNEXPECTED`; `VerifyWitnessProgram` branch for branch including v0 32/20 discrimination,
+the `is_p2sh` guard on taproot, pay-to-anchor, and the P2WSH 520-byte element check; taproot
+control-block bounds, leaf mask, parity, `ComputeTaprootMerkleRoot` and the lexicographic TapBranch
+sort; `IsOpSuccess` exact ranges; `EvalChecksigTapscript`'s ordering; the BIP143 and BIP341
+preimages field by field including SIGHASH_SINGLE out-of-range for all three algorithms;
+`IsDefinedHashtypeSignature`; the CHECKMULTISIG algorithm, NULLFAIL/NULLDUMMY and the 20-key cap;
+and the MANDATORY-vs-STANDARD flag split.
+
+## S2-14. PSBT input UTXO precedence is inverted — the unauthenticated `witness_utxo` wins
+
+Core resolves an input's spent output with `non_witness_utxo` **first**, falling back to
+`witness_utxo` only if absent (`psbt.cpp:76-88` and `:419-437`); `decodepsbt` does the same, assigning
+from `witness_utxo` then **overwriting** from `non_witness_utxo` before accumulating `total_in`
+(`rawtransaction.cpp:1126-1149`). The precedence is deliberate and Core's comment says why:
+`non_witness_utxo` is authenticated — its txid is checked against the outpoint — while
+`witness_utxo` is not.
+
+Our `%psbt-input-spk` and `%psbt-input-amount` both test `witness_utxo` first, so with both fields
+present **the unauthenticated one wins** — in the coins map fed to signing, in `%psbt-finalize`, and
+in the fee reported by `decodepsbt` and `analyzepsbt`.
+
+Direction: **we use attacker-controlled data where Core uses verified data.** A counterparty hands
+us a PSBT with a truthful `non_witness_utxo` (which our parser requires, so it looks well-formed)
+plus a `witness_utxo` repeating the real scriptPubKey with an understated value. The reported fee is
+computed from the lie. And because `non_witness_utxo` *is* present, `%psbt-require-witness-sig-p` is
+false — so `walletprocesspsbt` produces a **legacy** signature for a `pkh()` input, and a legacy
+sighash does not commit to the amount, so that signature is valid over the real, much larger output.
+The operator inspects a fabricated fee, signs, and the difference goes to the miner. Our default
+wallet always creates a `pkh()` SPKM, so a legacy-funded input is reachable in a stock wallet.
+
+For witness and taproot inputs the lie instead poisons the sighash, making the signature silently
+invalid — a DoS rather than a loss — but the false fee display applies to every input type.
+
+**Fix:** test `non_witness_utxo` first in **both** functions — they are the two halves of Core's
+single `utxo` resolution and any skew yields a script/amount pair that never existed.
+`%psbt-require-witness-sig-p` already encodes the right condition and needs no change once
+precedence is fixed.
+
+## S3 (wallet)
+
+`walletprocesspsbt` does not supply the wallet's own `non_witness_utxo` when a `witness_utxo` is
+already present; Core's `FillPSBT` keys that decision on `non_witness_utxo` **alone**, commenting
+that it is "a superset of the witness_utxo". Two effects: a PSBT carrying only a `witness_utxo` for
+a wallet-owned legacy input is signable by Core and returns `complete=false` with no diagnostic from
+us; and it removes the mitigation Core has for S2-14, since attaching the authenticated previous
+transaction is exactly what neutralises a lying `witness_utxo`.
+
+A rescan **freezes the passphrase relock deadline** for its whole duration. In Core,
+`m_scanning_with_passphrase` is consulted in exactly three RPC guards and has no effect on the
+relock — the scheduled callback calls `Lock()` and zeroes `nRelockTime` regardless, and Core simply
+accepts that a mid-rescan relock makes keypool top-ups fail. Our `wallet-unlocked-key` and the
+relock sweeper both add `(not (wallet-scanning-with-passphrase wallet))` to the deadline test. So
+`walletpassphrase pw 60` followed by `rescanblockchain 0` keeps the master key live for hours, while
+`getwalletinfo` reports an `unlocked_until` **already in the past** — the status field actively
+contradicts the state. Not an escalation, but an undocumented weakening of the control
+`walletpassphrase` exists to provide.
+
+`psbtbumpfee` cannot bump a transaction with a non-wallet legacy/P2SH/P2WSH input, because we never
+derive the external input's weight from the original transaction. Core measures it with
+`GetTransactionInputWeight` plus a `SignatureWeightChecker` pass and stores it via `SetInputWeight`
+(`feebumper.cpp:208-230`) — that is how a bump sizes an input the wallet cannot solve. We set the
+preset txout but never the preset weight, so the build aborts. `psbtbumpfee` is the
+`require_mine=false` entry point, so this is exactly its reason to exist. External P2WPKH and P2TR
+are unaffected.
+
+### Cleared in this dimension
+
+The crypter is faithful to `wallet/crypter.cpp`: `BytesToKeySHA512AES` byte order, the key/IV split,
+the `rounds<1`/salt-size/`derivation_method` rejections, and AES-256-CBC with hand-rolled PKCS#7
+matching `aes.cpp` including the zero-length case. `DecryptKey`'s re-derive-and-compare is present
+and **stronger** than Core's. `encryptwallet` is atomic (ckeys, plaintext deletes and mkey in one
+batch) and rotates the seed; `createwallet passphrase` is born blank-then-encrypted so no plaintext
+key record ever hits disk. Every Core `EnsureWalletIsUnlocked` call site has a counterpart.
+Anti-fee-sniping is byte-for-byte Core, including the 1-in-10 `randrange(100)` back-off and the
+8-hour tip-age rule — so the on-chain fingerprint concern was unfounded. Coin selection's waste
+metric, `GetChange`, `min_viable_change`, `cost_of_change`, the SFFO arithmetic and the
+change-overpay adjustment all match. Descriptor checksums are required exactly where Core requires
+them. PSBT parsing rejects duplicate keys, wrong key-data lengths, trailing data and non-empty
+scriptSigs, **and does validate `non_witness_utxo` against the input's prevout txid**;
+`combinepsbt` merge semantics match `Merge`. No path was found by which a passphrase or key reaches
+a log or condition report.
