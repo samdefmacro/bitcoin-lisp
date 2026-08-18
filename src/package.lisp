@@ -1332,6 +1332,11 @@
    #:best-local-address
    #:privacy-network-p
    #:peer-inbound-onion
+   ;; Read by the inbound evictor (GA9 S2-6): Core protects by MINIMUM ping
+   ;; and by most-recent novel tx/block, all of which we already tracked.
+   #:peer-min-ping-latency
+   #:peer-last-tx-time
+   #:peer-last-block-time
    #:peer-connected-through-network
    #:peer-next-local-addr-send
    #:get-local-addr-for-peer

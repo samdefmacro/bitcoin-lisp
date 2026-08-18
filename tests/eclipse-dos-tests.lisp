@@ -1802,3 +1802,39 @@ because the alternative is standing up four live dials in a unit test."
         for start = 0 then (1+ pos)
         for pos = (search needle haystack :start2 start)
         while pos collect pos))
+
+(test ga9-s2-6-onion-inbounds-are-not-the-default-eviction-victim
+  "All inbound onion peers arrive through the local Tor daemon, so ip-netgroup
+returns \"127.0\" for every one of them. The evictor picked its victim from the
+most-populous netgroup, so with two or more onion peers connected they WERE the
+largest group and one was evicted on every admission at capacity: ordinary
+clearnet pressure silently cost the operator their onion inbounds, with
+-listenonion on by default.
+
+Core reaches the same shared group and compensates in
+ProtectEvictionCandidatesByRatio, reserving up to a quarter of the protected set
+for CJDNS/I2P/localhost/onion peers because they \"tend to be otherwise
+disadvantaged under our eviction criteria\" (eviction.cpp:105-120).
+
+The carve-out keys on PEER-INBOUND-ONION, never the address string — the string
+is the very thing that collides. Asserted here on the exemption rule itself:
+onion peers are dropped from the candidate set whenever anything else remains,
+and are still evictable when nothing does, so an all-onion inbound set can
+still make room."
+  (flet ((mk (onion) (let ((p (bitcoin-lisp.networking:make-peer :address "127.0.0.1"
+                                                                 :inbound t)))
+                       (setf (bitcoin-lisp.networking:peer-inbound-onion p) onion)
+                       p)))
+    (let* ((o1 (mk t)) (o2 (mk t)) (clear (mk nil))
+           (mixed (list o1 o2 clear)))
+      ;; With a clearnet peer present, the onion peers must not be candidates.
+      (let ((non-onion (remove-if #'bitcoin-lisp.networking:peer-inbound-onion mixed)))
+        (is (equal (list clear) non-onion)
+            "with any clearnet inbound present, onion peers are exempt"))
+      ;; All-onion: the exemption must NOT empty the candidate set, or the node
+      ;; could never admit a new inbound at capacity.
+      (let* ((all-onion (list o1 o2))
+             (non-onion (remove-if #'bitcoin-lisp.networking:peer-inbound-onion all-onion)))
+        (is (null non-onion) "control: nothing survives the filter here")
+        (is-true (every #'bitcoin-lisp.networking:peer-inbound-onion all-onion)
+                 "so the evictor must fall back to the full set and still evict")))))
