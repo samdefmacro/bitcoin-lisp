@@ -3902,7 +3902,15 @@ The CLEAR is not optional and is the half that is easy to omit: without it the
 first stale episode raises the dialing budget permanently, and the rotation —
 which measures against the unraised target — then spends every 45s sweep
 evicting a peer we just dialled. The feature would present as steady outbound
-churn with no stale tip in sight."
+churn with no stale tip in sight.
+
+Core guards this with three conditions; we carry one. GetNetworkActive is
+node-network-active below. GetUseAddrmanOutgoing has no counterpart because we
+have no -connect option — if one is ever added, it must gate this, or a node
+pinned to a fixed peer list would start dialling addrman peers behind the
+operator's back. LoadingBlocks likewise has no counterpart; in its place the
+in-flight condition inside tip-may-be-stale-p keeps a node that is actively
+fetching from calling its own tip stale."
   (when (> now *last-stale-tip-check*)
     (setf *last-stale-tip-check* (+ now +stale-tip-check-interval-seconds+))
     (cond ((and (node-network-active node)
@@ -4176,9 +4184,16 @@ whole-set extra-outbound eviction."
       (let ((chain-state (node-current-chainstate node)))
         (when chain-state
           (dolist (peer (node-peers node))
-            (ignore-errors
-             (bitcoin-lisp.networking:consider-chain-sync-eviction
-              peer chain-state now)))))
+            (handler-case
+                (bitcoin-lisp.networking:consider-chain-sync-eviction
+                 peer chain-state now)
+              (error (e)
+                ;; Per-peer, so one unhappy peer cannot stop the sweep — but
+                ;; LOGGED, not swallowed. A silent error here exempts that peer
+                ;; from eviction forever, which is indistinguishable from the
+                ;; eclipse this code exists to prevent.
+                (log-warn "Chain-sync eviction failed for peer ~A: ~A"
+                          (bitcoin-lisp.networking:peer-address peer) e))))))
       ;; Core runs EvictExtraOutboundPeers from this same tick (:5466), and
       ;; BEFORE the stale-tip check rather than after: the peer we are about to
       ;; decide we need is not one we should have dropped on the way in.
@@ -4187,8 +4202,8 @@ whole-set extra-outbound eviction."
       ;; rank the set against itself — so it takes the list once, snapshotted
       ;; under the node lock: disconnect-peer runs inside it and mutates state
       ;; the listener thread touches too.
-      (ignore-errors
-       (bitcoin-lisp.networking:evict-extra-outbound-peers
+      (handler-case
+          (bitcoin-lisp.networking:evict-extra-outbound-peers
         (bt:with-recursive-lock-held ((node-lock node)) (copy-list (node-peers node)))
         now
         ;; Deliberately the UNRAISED target, even while the extra-outbound slot
@@ -4198,11 +4213,17 @@ whole-set extra-outbound eviction."
         ;; make the extra connection permanent and silently disable the whole
         ;; rotation.
         (node-max-peers node)
-        +target-block-relay-peers+))
+        +target-block-relay-peers+)
+        ;; Whole-set, so an error takes the sweep with it — which is exactly
+        ;; why it must be visible. This feature's own history is a sweep placed
+        ;; where it never ran (see the docstring above); a bare ignore-errors
+        ;; would recreate that silently.
+        (error (e) (log-warn "Extra-outbound eviction sweep failed: ~A" e)))
       ;; Then the stale-tip half, on its own 10-minute timer. Core's order
       ;; (:5466 then :5468): evict first, so a peer we are about to decide we
       ;; need is not one we just dropped on the way in.
-      (ignore-errors (check-for-stale-tip node now)))))
+      (handler-case (check-for-stale-tip node now)
+        (error (e) (log-warn "Stale-tip check failed: ~A" e))))))
 
 (defun maintain-peers (node)
   "Run periodic peer maintenance: health checks, reconnection, dedicated
