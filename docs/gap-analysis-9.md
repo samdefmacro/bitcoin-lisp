@@ -12,9 +12,9 @@ part 1 and were re-run in part 2, in batches of four — the full surface is now
 
 **These findings have NOT been through an adversarial refute-biased verification pass.** GA7 and
 GA8 both had verification change the answer repeatedly (GA8: one refuted, one upgraded, four
-downgraded, one sharpened). What this round has instead is that **eight of the nine S1s were
-re-confirmed by the orchestrator directly against both source trees**, rather than resting on a
-single agent's reading; those are marked **[verified]**.
+downgraded, one sharpened). What this round has instead is that **all nine S1s were re-confirmed by the orchestrator directly
+against both source trees** — eight during the run and S1-3 in a follow-up review pass — rather
+than resting on a single agent's reading; each is marked **[verified]**.
 
 | Dimension | Status | Findings |
 |---|---|---|
@@ -94,7 +94,7 @@ mainnet.
 `check-transaction-final` already handles the coinbase shape. The BIP68 loop below must keep its
 `(rest transactions)`.
 
-### S1-3. BIP68's version gate reads a *signed* 32-bit version, so a high-bit version skips relative-locktime enforcement
+### S1-3. BIP68's version gate reads a *signed* 32-bit version, so a high-bit version skips relative-locktime enforcement **[verified]**
 
 Core stores the transaction version as `const uint32_t version`
 (`src/primitives/transaction.h:293`) and gates BIP68 with `tx.version >= 2`
@@ -111,15 +111,18 @@ spending an input with an unmatured relative locktime: Core rejects the containi
 and our assembler could mine it into a block the network rejects. Standardness does not save us —
 nonstandard transactions are legal in blocks.
 
-Confidence: medium (the finder's own rating). The reasoning is sound but this one deserves an
-executable control before it is fixed.
+Verified in the GA9 review pass (2026-08-18): `src/serialization/types.lisp:139` declares the slot
+`(signed-byte 32)` read with `br-read-i32-le`; Core is `const uint32_t version`
+(`primitives/transaction.h:293`) consumed as `tx.version >= 2` (`tx_verify.cpp:51`). The finder's
+original medium rating is retired — the divergence is confirmed by direct read of both trees. A
+consensus change still warrants an executable regression control before the fix lands.
 
 **Fix:** compare the unsigned reinterpretation **at the gate only**:
 `(>= (logand (transaction-version tx) #xFFFFFFFF) 2)`. Do **not** flip the struct slot to
 unsigned — `write-int32-le` round-tripping and the TRUC/standardness version comparisons
 (`transaction.lisp:179-188`) are all written against the signed value.
 
-### S1-4. An invalidated block-index entry is silently resurrected
+### S1-4. An invalidated block-index entry is silently resurrected **[verified]**
 
 Core never rebuilds a `CBlockIndex`: `AddToBlockIndex` uses `try_emplace` and returns the existing
 object (`src/node/blockstorage.cpp:228-231`); receiving the body mutates it in place
@@ -850,7 +853,7 @@ in the legacy CL interpreter (currently off the consensus path) and should be fi
 two cannot drift again. Add vectors for `0080`/`000080` in `OP_IF`, `OP_VERIFY`, `OP_IFDUP` and as
 the final stack item.
 
-## S1-7. `FindAndDelete` matches at any byte offset; Core matches only at opcode boundaries
+## S1-7. `FindAndDelete` matches at any byte offset; Core matches only at opcode boundaries **[verified]**
 
 Core's `FindAndDelete` (`interpreter.cpp:229-256`) advances with `script.GetOp(pc, opcode)` and only
 tests for a match at those opcode boundaries — push payloads are stepped over wholesale. Core's own
@@ -877,7 +880,7 @@ including the trailing `result.insert(result.end(), pc2, end)` for a truncated p
 both call sites. Port Core's `script_FindAndDelete` table verbatim — its truncated-push cases pin
 the edge behaviour.
 
-## S1-8. Strict-DER length bound is off by one — we accept a 74-byte signature Core rejects
+## S1-8. Strict-DER length bound is off by one — we accept a 74-byte signature Core rejects **[verified]**
 
 Core's `IsValidSignatureEncoding` operates on the **full** signature including the trailing hashtype
 byte and rejects `sig.size() > 73` (`interpreter.cpp:123`). Our `check-der-signature-format` is
@@ -1319,9 +1322,9 @@ wallet crypter's KDF and the one-directional PKCS#7 pad check match.
 
 **9 S1 · 17 S2 · ~40 S3**, across all twelve dimensions, none of them previously known.
 
-**Eight of the nine S1s** were re-confirmed by the orchestrator directly against both trees. The
-exception is S1-3 (the BIP68 signed-version gate), which its finder rated medium confidence and
-which should get an executable control before anyone touches it.
+**All nine S1s** were re-confirmed by the orchestrator directly against both trees — eight during
+the run, and S1-3 (the one the finder rated medium) in the GA9 review pass. Every S1 heading now
+carries a **[verified]** marker.
 
 ## Fix order
 
@@ -1338,7 +1341,7 @@ which should get an executable control before anyone touches it.
    `invalidateblock` defeasible by a single message.
 6. **S1-7 `FindAndDelete` and S1-8 the DER bound** — both consensus, both small; port Core's
    `script_FindAndDelete` table verbatim with the former.
-7. **S1-3 BIP68 version gate** — after an executable control.
+7. **S1-3 BIP68 version gate** — verified; add an executable regression control with the fix.
 8. **The storage cluster (S2-10, S2-11)** — the unflushed reorg is a self-inflicted OOM on the
    deepest rollback paths; the unlocked `gettxoutsetinfo` can drop UTXO writes. Both sit on the code
    #333–#338 just rewrote.
