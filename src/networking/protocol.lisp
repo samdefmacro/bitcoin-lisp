@@ -270,7 +270,7 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "getblocktxn")
-     (handle-getblocktxn peer payload block-store)
+     (handle-getblocktxn peer payload block-store chain-state)
      t)
 
     (t nil)))  ; Unknown message
@@ -1962,18 +1962,59 @@ the stop hash."
                  peer (bitcoin-lisp.serialization:make-cfcheckpt-message
                        0 stop-hash (nreverse headers)))))))))))
 
-(defun handle-getblocktxn (peer payload block-store)
+(defconstant +max-blocktxn-depth+ 10
+  "Core MAX_BLOCKTXN_DEPTH (net_processing.cpp:140). Deeper than this we refuse
+to build a blocktxn and send the whole block instead.")
+
+(defun handle-getblocktxn (peer payload block-store &optional chain-state)
   "Serve a BIP152 getblocktxn: reply with a blocktxn carrying the requested
 transactions (by index, witness-serialized) from the named block. This is the
 serve side of compact-block relay — without it a peer reconstructing one of our
 compact blocks can't fetch the txs it's missing. Skipped if we don't have the
 block on disk (the peer falls back to a full getdata). An out-of-range index is
-a malformed request: record misbehavior and don't reply."
+a malformed request: record misbehavior and don't reply.
+
+DEPTH: Core serves a blocktxn only within MAX_BLOCKTXN_DEPTH (10) of the tip
+and otherwise sends the full block, for a reason its own comment states
+(net_processing.cpp:4380-4387):
+
+  Sending a full block response instead of a small blocktxn response is
+  preferable in the case where a peer might maliciously send lots of
+  getblocktxn requests to trigger expensive disk reads, because it will
+  require the peer to actually receive all the data read from disk over
+  the network.
+
+We had no depth test. Every historical block hash is public and GET-BLOCK has
+no cache, so ~40 wire bytes bought a random-file open, a full read and a full
+parse of up to a 4 MB block for a ~250-byte reply — and the pump grants each
+peer 32 messages per pass on the same thread that runs block validation. This
+is the one serving path where reply size is decoupled from work done; getdata
+for blocks is self-limiting because the sender must push the bytes.
+
+The test must run BEFORE GET-BLOCK, or the read it exists to prevent has
+already happened. With no CHAIN-STATE we cannot judge depth, so we fall back to
+sending the whole block — never to a free deep read."
   (when block-store
     (let* ((req (bitcoin-lisp.serialization:parse-getblocktxn-payload payload))
            (block-hash (bitcoin-lisp.serialization:block-txn-request-block-hash req))
            (indexes (bitcoin-lisp.serialization:block-txn-request-indexes req))
-           (block (bitcoin-lisp.storage:get-block block-store block-hash)))
+           (entry (and chain-state
+                       (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash)))
+           (tip-height (and chain-state (bitcoin-lisp.storage:current-height chain-state)))
+           (within-depth
+             (and entry tip-height
+                  (>= (bitcoin-lisp.storage:block-index-entry-height entry)
+                      (- tip-height +max-blocktxn-depth+)))))
+      (unless within-depth
+        ;; Core: queue a full MSG_WITNESS_BLOCK for this peer instead. We send
+        ;; it directly, which has the same property that matters -- the peer
+        ;; pays for the bytes it made us read.
+        (let ((block (bitcoin-lisp.storage:get-block block-store block-hash)))
+          (when block
+            (send-message peer (bitcoin-lisp.serialization:make-block-message
+                                block :witness t))))
+        (return-from handle-getblocktxn nil))
+      (let ((block (bitcoin-lisp.storage:get-block block-store block-hash)))
       (when block
         (let* ((txs (coerce (bitcoin-lisp.serialization:bitcoin-block-transactions block)
                             'vector))
@@ -1984,7 +2025,7 @@ a malformed request: record misbehavior and don't reply."
                              block-hash
                              (mapcar (lambda (i) (aref txs i)) indexes)
                              :witness t))
-              (record-misbehavior peer "getblocktxn with out-of-bounds tx indices")))))))
+              (record-misbehavior peer "getblocktxn with out-of-bounds tx indices"))))))))
 
 ;;; Serving headers / blocks / addresses to peers
 ;;;
