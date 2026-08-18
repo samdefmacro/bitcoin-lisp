@@ -1868,16 +1868,43 @@ Handles chain reorganizations when a competing chain has more work."
     ;; Store block
     (bitcoin-lisp.storage:store-block block-store block)
 
-    ;; Create index entry
-    (let ((entry (bitcoin-lisp.storage:make-block-index-entry
-                  :hash hash
-                  :height new-height
-                  :header header
-                  :prev-entry prev-entry
-                  :chain-work chain-work
-                  :status :valid
-                  :tx-count (length (bitcoin-lisp.serialization:bitcoin-block-transactions
-                                     block)))))
+    ;; Index entry. Core NEVER rebuilds a CBlockIndex: AddToBlockIndex is a
+    ;; try_emplace that returns the existing object when the hash is already
+    ;; known (node/blockstorage.cpp:228-231), and receiving the body mutates
+    ;; that object in place. We constructed a fresh entry with :status :valid
+    ;; and ADD-BLOCK-INDEX-ENTRY is a plain (setf gethash) — a REPLACE, which
+    ;; erased an existing :invalid mark.
+    ;;
+    ;; That made invalidateblock defeatable by a single unsolicited block
+    ;; message: the RPC reorgs down and marks the block :invalid, leaving the
+    ;; tip at its parent, so a peer replaying the block hits the tip-extension
+    ;; arm, passes validate-block (it IS consensus-valid — invalidateblock is a
+    ;; manual override), and landed here to be re-created as :valid. The
+    ;; operator's node silently returned to the chain they explicitly refused.
+    ;; The same erasure cleared the automatic poison on a doomed fork subtree.
+    (let* ((existing (bitcoin-lisp.storage:get-block-index-entry chain-state hash))
+           (entry (or existing
+                      (bitcoin-lisp.storage:make-block-index-entry
+                       :hash hash
+                       :height new-height
+                       :header header
+                       :prev-entry prev-entry
+                       :chain-work chain-work
+                       :status :valid
+                       :tx-count (length (bitcoin-lisp.serialization:bitcoin-block-transactions
+                                          block))))))
+      (when existing
+        ;; Refresh what arriving BODY data supplies, in place. Status is RAISED
+        ;; only: an :invalid mark is a decision (operator or validator) and
+        ;; nothing here is entitled to overrule it.
+        (setf (bitcoin-lisp.storage:block-index-entry-height entry) new-height
+              (bitcoin-lisp.storage:block-index-entry-header entry) header
+              (bitcoin-lisp.storage:block-index-entry-prev-entry entry) prev-entry
+              (bitcoin-lisp.storage:block-index-entry-chain-work entry) chain-work
+              (bitcoin-lisp.storage:block-index-entry-tx-count entry)
+              (length (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+        (unless (eq (bitcoin-lisp.storage:block-index-entry-status entry) :invalid)
+          (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)))
       (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
 
       ;; Check if we need a reorganization. REORG-OUTCOME captures perform-reorg's
@@ -2402,6 +2429,25 @@ comment above."
         ;; for a witness-complete re-download. Only the to-connect side is checked:
         ;; to-disconnect blocks already validated when they were connected, and we
         ;; still need their bodies for the UTXO disconnect.
+        ;; Core's fFailedChain arm (FindMostWorkChain, validation.cpp:3170-3196):
+        ;; a candidate tip is refused outright when ANY block on the path to it
+        ;; carries BLOCK_FAILED_VALID. We read no status at all here, so a
+        ;; branch containing a block the operator invalidated -- or one the
+        ;; validator poisoned -- was a legitimate reorg target as long as it
+        ;; carried more work.
+        ;;
+        ;; Checked BEFORE anything is mutated, so refusing costs nothing and
+        ;; cannot leave the chainstate half-moved.
+        (let ((failed (find-if (lambda (e)
+                                 (eq (bitcoin-lisp.storage:block-index-entry-status e)
+                                     :invalid))
+                               to-connect)))
+          (when failed
+            (bitcoin-lisp:log-warn
+             "REORG refused: block at height ~D on the target branch is marked invalid"
+             (bitcoin-lisp.storage:block-index-entry-height failed))
+            (return-from perform-reorg (values nil :invalid-branch))))
+
         (dolist (entry to-connect)
           (let* ((block-hash (bitcoin-lisp.storage:block-index-entry-hash entry))
                  (block (bitcoin-lisp.storage:get-block block-store block-hash)))
