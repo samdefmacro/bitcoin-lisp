@@ -518,16 +518,58 @@ AttemptToEvictConnection. Returns T if a peer was evicted."
         (let* ((by-ping (stable-sort
                          (copy-list inbound) #'<
                          :key (lambda (p)
-                                (let ((l (bitcoin-lisp.networking:peer-ping-latency p)))
+                                ;; MINIMUM RTT, not the most recent one. Core
+                                ;; protects by m_min_ping_time
+                                ;; (eviction.cpp:190) deliberately: an attacker
+                                ;; can inflate a recent sample at will, but
+                                ;; cannot lower a minimum without physically
+                                ;; being closer. We sorted on the latest
+                                ;; sample while min-ping-latency sat unused
+                                ;; right beside it on the same struct.
+                                (let ((l (bitcoin-lisp.networking:peer-min-ping-latency p)))
                                   (if (plusp l) l most-positive-fixnum)))))
                (by-age (stable-sort   ; oldest (smallest connect-time) first
                         (copy-list inbound) #'<
                         :key #'bitcoin-lisp.networking:peer-connect-time))
+               ;; Core also protects the peers that have most recently given us
+               ;; something USEFUL — 4 by novel tx and 4 by novel block
+               ;; (eviction.cpp:192-199). Both timestamps are already tracked
+               ;; and already exposed through getpeerinfo; the evictor simply
+               ;; never read them, so a peer relaying us real data was no
+               ;; safer than one that had done nothing since connecting.
+               (by-tx (stable-sort (copy-list inbound) #'>
+                                   :key #'bitcoin-lisp.networking:peer-last-tx-time))
+               (by-block (stable-sort (copy-list inbound) #'>
+                                      :key #'bitcoin-lisp.networking:peer-last-block-time))
                (n (min +inbound-eviction-protect-count+ (length inbound)))
-               (protected (union (subseq by-ping 0 n) (subseq by-age 0 n)))
+               (protected (reduce (lambda (acc lst) (union acc (subseq lst 0 n)))
+                                  (list by-ping by-age by-tx by-block)
+                                  :initial-value '()))
                (candidates (remove-if (lambda (p) (member p protected)) inbound)))
           (when candidates
             (let ((groups (make-hash-table :test 'equal)))
+              ;; Onion peers are exempt from the most-populous-group rule.
+              ;;
+              ;; Every inbound onion peer arrives via the local Tor daemon, so
+              ;; ip-netgroup returns "127.0" for ALL of them: with two or more
+              ;; connected they are automatically the largest group and one was
+              ;; evicted on every admission at capacity, so ordinary clearnet
+              ;; pressure quietly cost the operator their onion inbounds --
+              ;; with -listenonion on by default. Core reaches the same shared
+              ;; group and compensates in ProtectEvictionCandidatesByRatio,
+              ;; which reserves up to a quarter of the protected set for
+              ;; CJDNS/I2P/localhost/onion peers precisely because they "tend to
+              ;; be otherwise disadvantaged under our eviction criteria"
+              ;; (eviction.cpp:105-120).
+              ;;
+              ;; Keyed on the PEER-INBOUND-ONION flag, never the address
+              ;; string: the string is the very thing that collides. Exempt
+              ;; only while something else remains to evict -- an all-onion
+              ;; inbound set must still be able to make room.
+              (let ((non-onion (remove-if #'bitcoin-lisp.networking:peer-inbound-onion
+                                          candidates)))
+                (when non-onion
+                  (setf candidates non-onion)))
               (flet ((grp (p) (or (bitcoin-lisp.networking:ip-netgroup
                                    (bitcoin-lisp.networking:peer-address p))
                                   "_")))
