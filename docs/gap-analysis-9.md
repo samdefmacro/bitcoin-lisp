@@ -4,7 +4,7 @@ Date: 2026-08-18. Baseline: `main` @ `401e807`, clean tree.
 Oracle: Bitcoin Core @ `d3056bc149f605225f22b1cc83b1a2d1cea64258` — the same revision GA7 and GA8
 used, so severities and coverage are directly comparable across the three rounds.
 
-## ⚠️ SCOPE: this round is INCOMPLETE — 5 of 12 dimensions finished
+## ⚠️ SCOPE: this round is INCOMPLETE — see the table for which dimensions finished
 
 Twelve parallel finder agents were launched, each seeded with an exclusion list covering every
 finding from GA1–GA8 so it could only report new ground. **Seven of them died mid-analysis on an
@@ -21,7 +21,7 @@ that made GA7 and GA8 trustworthy.
 | GA7 backlog status refresh | ✅ complete | 2 status regressions |
 | script interpreter | ❌ died on session limit | — |
 | mempool & policy | ❌ died on session limit | — |
-| P2P protocol & transport | ❌ died on session limit | — |
+| P2P protocol & transport | ✅ complete (part 2) | 1 S1, 2 S2, 1 S3 |
 | storage & indexes | ❌ died on session limit | — |
 | wallet | ❌ died on session limit | — |
 | RPC / REST / UI | ❌ died on session limit | — |
@@ -535,3 +535,138 @@ one upgraded, four downgraded, one sharpened), and this round has not had it.
 **Method note for next time:** twelve concurrent deep-reading agents exhausted the session budget
 about two-thirds of the way through. Run them in batches of four to five, persisting results after
 each batch, rather than all at once.
+
+---
+
+# Part 2 findings
+
+Part 1 lost seven dimensions to an API session limit. They are being re-run in batches of four.
+This section records what those re-runs found; the scope table at the top is updated as each
+lands.
+
+## S1-5. `getblocktxn` is served from any block at any depth, with no rate limit **[verified]**
+
+Core serves a `blocktxn` only from the most-recent-block cache or from a block at
+`height >= ActiveChain().Height() - MAX_BLOCKTXN_DEPTH`, where `MAX_BLOCKTXN_DEPTH` is **10**
+(`src/net_processing.cpp:140`, with a `static_assert` tying it to `MIN_BLOCKS_TO_KEEP`). For
+anything deeper it deliberately refuses to build a blocktxn and queues a full `MSG_WITNESS_BLOCK`
+getdata instead. Core's own comment names the reason (`net_processing.cpp:4380-4387`):
+
+> Sending a full block response instead of a small blocktxn response is preferable in the case
+> where a peer might maliciously send lots of getblocktxn requests to trigger expensive disk reads,
+> because it will require the peer to actually receive all the data read from disk over the network.
+
+`handle-getblocktxn` (`src/networking/protocol.lisp:1945-1966`) has **no depth test at all**. It
+calls `get-block` on whatever hash the peer names and replies with only the indexes requested. Its
+docstring shows the author considered availability ("Skipped if we don't have the block on disk")
+but not depth.
+
+`get-block` (`src/storage/blocks.lisp:91-122`) has **no cache**: every call does `probe-file`, opens
+the block's file, allocates `(file-length stream)` bytes, `read-sequence`s the whole thing, and
+fully deserializes it — verified by reading the function.
+
+And `check-peer-rate-limit` (`src/networking/peer.lisp:1655-1673`) has buckets for
+inv/tx/addr/addrv2/getdata/headers/getheaders/getblocks/getaddr; **`getblocktxn` falls through to
+`(t nil)` — no limit at all** — verified by reading the cond.
+
+Direction: **we do expensive work Core refuses to do.** All historical block hashes are public, so
+any connected peer can do this. A getblocktxn naming a random old block and one index costs the
+attacker ~40 wire bytes and costs us a random-file open, a full read and a full parse of up to a
+4 MB block, for a ~250-byte reply. The pump grants each peer 32 messages per pass
+(`+max-messages-per-peer-per-cycle+`), and the 64 KiB byte budget is irrelevant at 40 bytes per
+request — so one peer sustains 32 whole-block reads and parses per pass, on the single sync thread
+that also runs block validation, the pump and peer maintenance.
+
+Contrast `handle-getdata` for blocks, which is self-limiting: the `connection-send-paused-p` break
+and the 1 MB send cap force the attacker to actually receive the data. `getblocktxn` is the one
+path where reply size is decoupled from work done.
+
+**Fix:** look the hash up in the block index and serve a blocktxn only within 10 blocks of the tip;
+for anything deeper, fall back to the full-block getdata path as Core does. **Placement constraint:
+the depth test must run before `get-block`, or the disk read the fix exists to prevent has already
+happened.** Adding a `getblocktxn` rate-limit bucket is worth doing but is not sufficient on its
+own — Core's bound is structural, not rate-based.
+
+## S2-8. Receive byte accounting is keyed on the peer's raw command string in an unbounded table
+
+Core initialises `mapRecvBytesPerMsgType` once per `CNode` with every entry of
+`ALL_NET_MESSAGE_TYPES` plus `NET_MESSAGE_TYPE_OTHER`, and folds anything unrecognised into the
+OTHER bucket under an explicit comment: *"To prevent a memory DOS, only allow known message types"*
+(`src/net.cpp:684-691`). The map is a fixed small size for the life of the connection.
+
+`%account-message` (`src/networking/peer.lisp:493-496`) does
+`(incf (gethash command table 0) ...)` with `command` taken straight from the wire, so **every
+distinct command string a peer sends creates a permanent new entry**.
+
+An unrecognised command is otherwise a complete no-op — no rate-limit bucket, and `handle-message`
+falls through to `(t nil)` — so nothing disconnects the peer or even notices. A 24-byte message
+with a fresh random type field costs the attacker 24 bytes and costs us a hash entry plus a string
+key, never reclaimed until the peer disconnects. Bounded by the 32-messages-per-pass cap it is slow,
+but it is unbounded and ends in OOM against a peer that simply stays connected.
+
+The table is load-bearing for header-sync rotation (`%peer-headers-bytes`), so it cannot just be
+dropped. **Fix:** give `%account-message` Core's shape — a constant list of known types, everything
+else folded into one `"*other*"` key **before** the `gethash`, or the entry is already created.
+
+## S2-9. The inbound handshake runs inline on the accept thread and its timeout is renewable
+
+Core's `CreateNodeFromAcceptedSocket` (`src/net.cpp:1761-1869`) does the ban checks, constructs the
+`CNode`, calls `InitializeNode`, pushes it onto `m_nodes` and returns — **not a single blocking read
+in the accept path**; VERSION/VERACK are ordinary messages handled asynchronously.
+
+`run-inbound-listener` (`src/node.lisp:637-682`) performs the whole handshake inline on the one
+accept thread, and `%await-verack` calls `receive-message-blocking` in a `loop repeat 10` where each
+call computes a **fresh** deadline of `now + timeout` (`peer.lisp:648-650`).
+
+So the budget per connection is up to 15s in v2 detection, 15s for VERSION, then up to 10 × 15s in
+`%await-verack` — and the loop only exits early when the peer goes *silent*. A peer sending any
+complete non-verack message (a 32-byte ping suffices; no cond clause matches it, so it just loops)
+once every ~14.9s holds the accept thread for **~165–180 seconds** for ~300 bytes of traffic.
+`accept-connection` is not called during that window, so the listen backlog fills and the node
+accepts effectively no inbound peers. The listener docstring's claim that "a silent peer stalls the
+loop only briefly" is true for the silent case and false for this one.
+
+Consequence is loss of inbound connectivity and peer diversity, not loss of the node.
+
+**Fix (small):** give `perform-inbound-handshake` **one absolute deadline** for the whole handshake
+— as `v2-handshake-outbound` already does via `%v2-deadline` — and pass the remaining time into each
+step, capping a connection at ~15s. The deadline must also cover v2 detection, which today gets its
+own independent 15s. **Fix (structural, matches Core):** hand the accepted socket to a handshake
+worker or to the pump as a `:handshaking` peer so the accept loop never blocks — which is what the
+file's own "a thread pool is a future refinement" note anticipates.
+
+## S3. The v1 12-byte message type is never validated
+
+Core checks `hdr.IsMessageTypeValid()` after the checksum (`src/net.cpp:826`), requiring every byte
+up to the first NUL to be printable ASCII `[0x20,0x7E]` and all bytes after it to be zero
+(`src/protocol.cpp:26-43`); failure drops the message without disconnecting. Our `bytes-to-command`
+(`src/serialization/messages.lisp:68-71`) truncates at the first zero byte and `code-char`s the
+rest — no printability check, no all-zeros-after-NUL check.
+
+So `"inv\0" + 8 arbitrary non-zero bytes` dispatches here as an ordinary `inv` while Core discards
+it. **The v2 path already implements both checks** (`v2-transport.lisp:255-262`) — only v1, the
+default transport, is unguarded. No consensus or funds consequence, but it is a wire-format
+acceptance divergence any conformance corpus will flag, and it widens the key space of S2-8 to
+arbitrary byte values.
+
+**Fix:** mirror `protocol.cpp:26-43` and call it where Core does — **after** the checksum, on the
+drop-message-keep-peer path, not alongside the bad-magic disconnect. That requires keeping the raw
+12 bytes to the checksum point rather than converting to a string at header-parse time.
+
+### Cleared in this dimension
+
+The resumable readers survived an adversarial read: framing invariants hold across pump passes,
+`%abandon-receive` is reached on every path that consumed bytes, `recv-framing` cannot be crossed
+between v1 and v2, and `MAX_PROTOCOL_MESSAGE_LENGTH` is enforced from the parsed header before
+payload allocation. BIP324 matches `bip324.cpp` throughout — garbage bound, terminator, HKDF
+salt/labels, session-id, key wiping, the FSChaCha20 rekey nonce and the FSChaCha20Poly1305
+`{packet_counter, rekey_counter}` nonce including the `0xFFFFFFFF` rekey keystream and the
+constant-time tag compare. Every per-message count cap is present and enforced before allocation
+(`MAX_INV_SZ`, `MAX_HEADERS_RESULTS`, `MAX_ADDR_TO_SEND`, `MAX_LOCATOR_SZ`, `MAX_ADDRV2_SIZE`,
+BIP152 and BIP157 limits), and `%read-n-vector` builds via a list so a hostile count fails on
+truncation rather than pre-allocating. SOCKS5 is a faithful port of `netbase.cpp`'s `Socks5()`.
+
+**One item left explicitly unresolved:** whether the pump's `data-available-p` readiness gate can
+miss bytes already sitting in the SBCL fd-stream buffer and strand batched messages. It turns on
+whether `usocket:wait-for-input` pre-checks `(listen (socket-stream x))`, which could not be
+confirmed without reading usocket's source in the container. Worth a one-line check by whoever can.
