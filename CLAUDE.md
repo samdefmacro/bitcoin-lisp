@@ -45,13 +45,27 @@ points through `.cl-workbench/adapter`.
 Discipline: ground before writing (`dev.sh eval '(describe ...)'`, apropos);
 develop in small evals; after editing, reload (`dev.sh eval '(asdf:load-system
 "bitcoin-lisp")'`) and re-run the touched suite; defstruct/Coalton layout
-changes require an image restart. **Changing a `defconstant`'s VALUE needs a
-forced rebuild too** (`:force t`, or clear the FASL volume): the symbol updates
-but already-compiled callers keep the folded old value, so the warm image runs
-new code against the old constant and tests can pass against a value that is no
-longer in the source. Observed 2026-08-16 while retuning a rate limit — the
-symbol read 16384 while the caller still behaved as 32768. The cold battery is
-unaffected (it compiles fresh) and stays the verification of record. Consensus-critical work still finishes with
+changes require an image restart. **Changing a `defconstant`'s VALUE needs an
+image RESTART** — `:force t` is not enough. Re-evaluating the definition
+signals `SB-EXT:DEFCONSTANT-UNEQL`, a *continuable* error, and the warm image
+ends up stale whichever way that goes:
+
+- continued (interactive, or a handler that invokes CONTINUE) — the symbol
+  takes the new value while callers compiled earlier keep the OLD value folded
+  in. Observed 2026-08-16 retuning a rate limit: the symbol read 16384 while
+  the caller still behaved as 32768.
+- not continued (our batch `dev.sh eval` path) — the restart is never taken,
+  so the symbol AND its callers both keep the OLD value, while the FASL on
+  disk holds the new one. Observed 2026-08-18: after
+  `(asdf:load-system "bitcoin-lisp" :force t)` the source read `(* 3 600)` but
+  the image still reported 1800 for a constant edited to `(* 30 600)`; the
+  suite passed green against a value no longer in the source. `dev.sh stop` +
+  restart reported 18000 and the test went red.
+
+Either way a test can pass against a value that is not in the source, so
+`dev.sh stop` + `cl-workbench repl start` before trusting any result that
+depends on a changed constant. The cold battery is unaffected (it compiles
+fresh) and stays the verification of record. Consensus-critical work still finishes with
 scripts/docker-test.sh (= `cl-workbench validation run cold-unit`) — the warm
 image is a dev convenience, not the verification of record. A suite designator
 that selects zero tests fails (rc 1); it can never pass silently.
