@@ -2006,13 +2006,23 @@ sending the whole block — never to a free deep read."
                   (>= (bitcoin-lisp.storage:block-index-entry-height entry)
                       (- tip-height +max-blocktxn-depth+)))))
       (unless within-depth
-        ;; Core: queue a full MSG_WITNESS_BLOCK for this peer instead. We send
-        ;; it directly, which has the same property that matters -- the peer
-        ;; pays for the bytes it made us read.
-        (let ((block (bitcoin-lisp.storage:get-block block-store block-hash)))
-          (when block
-            (send-message peer (bitcoin-lisp.serialization:make-block-message
-                                block :witness t))))
+        ;; Core queues a full MSG_WITNESS_BLOCK on the peer\'s getdata list, so
+        ;; the block goes out through the getdata path and inherits its
+        ;; backpressure. We send it here instead, which means we must apply
+        ;; that backpressure ourselves: HANDLE-GETDATA refuses to serve another
+        ;; block once the send side is paused, and without the same guard this
+        ;; fallback would just trade a disk-read DoS for a queue one — a peer
+        ;; that never drains could still make us read and serialize 4 MB
+        ;; blocks, only now they pile up in memory.
+        ;;
+        ;; Paused means no reply at all; the peer re-requests, exactly as the
+        ;; getdata path already relies on.
+        (let ((conn (peer-connection peer)))
+          (unless (and conn (connection-send-paused-p conn))
+            (let ((block (bitcoin-lisp.storage:get-block block-store block-hash)))
+              (when block
+                (send-message peer (bitcoin-lisp.serialization:make-block-message
+                                    block :witness t))))))
         (return-from handle-getblocktxn nil))
       (let ((block (bitcoin-lisp.storage:get-block block-store block-hash)))
       (when block
