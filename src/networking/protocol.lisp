@@ -919,6 +919,26 @@ never received the branch's blocks."
                           (null (first reorg-outcome))
                           (consp (second reorg-outcome)))
                  (queue-missing-fork-blocks (second reorg-outcome))))))
+      ;; Core's two AcceptBlockHeader gates, which this path had neither of --
+      ;; it branched only on whether the parent is the tip.
+      ;;
+      ;; duplicate-invalid (validation.cpp:4231-4235): a block we already hold
+      ;; and already marked invalid is refused outright. Without it,
+      ;; invalidateblock is undone by one unsolicited block message.
+      (let ((known (bitcoin-lisp.storage:get-block-index-entry
+                    chain-state (bitcoin-lisp.serialization:block-header-hash header))))
+        (when (and known
+                   (eq (bitcoin-lisp.storage:block-index-entry-status known) :invalid))
+          (return-from accept-downloaded-block (values nil :duplicate-invalid))))
+      ;; bad-prevblk (validation.cpp:4252-4255): a block building on an invalid
+      ;; parent is refused before any work is done on it. This is what stops a
+      ;; poisoned subtree being re-offered block by block to force the whole
+      ;; doomed reorg to be attempted again -- roughly 1 MB of message buying
+      ;; an unmetered amount of our validation.
+      (let ((parent (bitcoin-lisp.storage:get-block-index-entry chain-state prev-hash)))
+        (when (and parent
+                   (eq (bitcoin-lisp.storage:block-index-entry-status parent) :invalid))
+          (return-from accept-downloaded-block (values nil :bad-prevblk))))
       (if (equalp prev-hash current-best-hash)
           ;; Extends the active tip — full validation at tip+1.
           (let ((new-height (1+ (bitcoin-lisp.storage:current-height chain-state))))
