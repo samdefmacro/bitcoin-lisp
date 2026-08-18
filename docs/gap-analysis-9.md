@@ -22,7 +22,7 @@ that made GA7 and GA8 trustworthy.
 | script interpreter | ❌ died on session limit | — |
 | mempool & policy | ❌ died on session limit | — |
 | P2P protocol & transport | ✅ complete (part 2) | 1 S1, 2 S2, 1 S3 |
-| storage & indexes | ❌ died on session limit | — |
+| storage & indexes | ✅ complete (part 2) | 4 S2, 4 S3 |
 | wallet | ❌ died on session limit | — |
 | RPC / REST / UI | ❌ died on session limit | — |
 | crypto & canonical encoding | ❌ died on session limit | — |
@@ -670,3 +670,142 @@ truncation rather than pre-allocating. SOCKS5 is a faithful port of `netbase.cpp
 miss bytes already sitting in the SBCL fd-stream buffer and strand batched messages. It turns on
 whether `usocket:wait-for-input` pre-checks `(listen (socket-stream x))`, which could not be
 confirmed without reading usocket's source in the container. Worth a one-line check by whoever can.
+
+## S2-10. A reorg never flushes the coins cache, so a deep disconnect grows it without bound
+
+Core calls `FlushStateToDisk(state, FlushStateMode::IF_NEEDED)` at the end of **both**
+`DisconnectTip` (`validation.cpp:2965-2968`) and `ConnectTip` (`:3093-3096`). `IF_NEEDED` trips on
+`CRITICAL`, so the coins cache is size-checked once per connected *and* once per disconnected
+block, **including inside a reorg**.
+
+Our only flush trigger, `maybe-periodic-flush`, has exactly one call site in the whole tree: the
+fast-forward branch of `connect-block` (`src/validation/block.lisp:1925`). `perform-reorg`'s
+phase-A disconnect loop, phase-B connect loop and phase-C tail contain **no flush and no cache-size
+check at all**. We also implement only Core's `LARGE` threshold and have no `CRITICAL` equivalent.
+
+Every disconnected block restores all its spent prevouts into the cache as dirty entries and every
+connected fork block adds its outputs, with nothing draining them. At the file's own ~200 bytes per
+entry, a 2,000-block mainnet reorg is multiple GB on a heap this project has already been OOM-killed
+on twice for this exact cache.
+
+The sharpest path is not a natural reorg: `dumptxoutset` with a rollback target calls
+`invalidate-block` → `perform-reorg`, and on mainnet a rollback to the published assumeutxo height
+disconnects tens of thousands of blocks in one uninterrupted, unflushed loop. `invalidateblock` with
+a deep hash does the same.
+
+Not a consensus divergence — a self-inflicted node kill, sitting exactly where PRs #333–#338 made
+mid-reorg flushing *safe for the first time*.
+
+**Fix:** call the size check at the bottom of both reorg loop bodies — **after** the coins mutation
+and **after** the `cvc-best-block` move, never between them. The pointer must already name the block
+whose coins are in the cache, which is the same block-boundary invariant phase 3b established for
+`*interrupt-check*`. Add a CRITICAL threshold so the mid-reorg check only fires when it must.
+
+## S2-11. `gettxoutsetinfo` flushes and clears the live coins cache from an RPC thread without the node lock
+
+Core takes `cs_main` inside `ForceFlushStateToDisk(wipe_cache=false)` — which maps to
+`CCoinsViewCache::Sync`, writing dirty entries **without clearing** — and then, still under
+`LOCK(::cs_main)`, snapshots the CoinsDB view and cursor (`rpc/blockchain.cpp:1075-1084`). The scan
+then runs over a LevelDB cursor, an immutable snapshot.
+
+We take the node lock only long enough to *read* the coins-view slot, then run the whole pass
+unlocked. `%coin-view-iterate` begins with `coins-view-cache-flush`, which MAPHASHes the live
+entries table into a writebatch and then **CLRHASHes it** and zeroes the counters
+(`coins-view-cache.lisp:249-262`). The sync thread mutates that same table under the node lock.
+
+Two silent failure modes. Entries the validation thread inserts while the RPC thread is inside
+MAPHASH may not be visited, and the following CLRHASH drops them unwritten — a dropped tombstone
+leaves a spent coin alive in LevelDB (we would accept a double-spend Core rejects); a dropped add
+loses a real UTXO. And the batch also stages `cvc-best-block`, which `apply-block-to-utxo-set` only
+moves *after* the whole block is applied — so a flush landing mid-apply commits half of block N
+under the pointer for N-1, precisely the coins/pointer disagreement #333–#338 exist to make
+impossible. Concurrent SBCL hash-table mutation during MAPHASH/CLRHASH is undefined behaviour on
+its own terms.
+
+**Fix:** follow Core — flush under the lock, create the iterator under the lock, then release and
+scan the snapshot. **Load-bearing constraint: the flush and the iterator creation must be in the
+same lock acquisition**, or coins connected in between are in neither. Add a Sync variant (write
+dirty, keep entries) so an RPC does not also throw away the warm cache mid-IBD.
+
+## S2-12. No `Uncache`: rejected transactions pull coins into the cache until the next block
+
+Core records every prevout not already cached (`coins_to_uncache`, `validation.cpp:851`) and on any
+non-VALID result calls `CoinsTip().Uncache()` on them, with the comment stating the purpose
+verbatim: *"to prevent memory DoS in case we receive a large number of invalid transactions that
+attempt to overrun the in-memory coins cache"* (`:1787-1790`). It then flushes PERIODIC, so the
+cache is size-checked once per submitted transaction.
+
+We have **no Uncache at all** — the cache exports no such operation — and our only size check is in
+`maybe-periodic-flush`, reachable solely from `connect-block`. `fetch-coin` inserts every base-view
+hit into the cache and bumps the accounting.
+
+A peer streaming transactions whose inputs reference many distinct confirmed UTXOs — each rejected
+*after* input fetch, e.g. for a bad signature — makes us retain one entry per distinct prevout with
+no eviction until the next block connects. A ~1 MB transaction can name ~24,000 outpoints, so the
+amplification is several times the bandwidth, held for a whole inter-block interval.
+
+**Fix:** collect fetched-but-not-previously-cached outpoints and drop them on rejection. Core's
+`Uncache` is `if (it != end && !it->second.IsDirty()) erase` — **the not-dirty guard is
+load-bearing**; dropping a dirty entry loses a real write.
+
+## S2-13. The txindex keeps every txid in an in-memory hash table, so `-txindex` cannot run on mainnet
+
+Core's TxIndex is a pure LevelDB index with **no in-memory map**: `ReadTxPos` is a single DB read,
+`WriteTxs` a batch write (`index/txindex.cpp:32-75`). Ours is an append-only 68-byte-record file
+**plus a full in-memory hash table** mapping every txid to its offset, rebuilt by walking the entire
+file on every startup, with each lookup re-opening the file.
+
+At roughly 80 bytes per SBCL `equalp` entry, mainnet's ~1e9 transactions is on the order of 100 GB
+of heap, and startup must stream tens of GB before serving anything. The node dies of heap
+exhaustion during backfill — a hard OOM, not a diagnosable refusal. An advertised opt-in feature
+that is unusable on the network the node claims to support.
+
+**Fix:** move it to LevelDB as the block-filter and coinstats indexes already are. That deletes the
+in-memory table, the startup replay and the per-lookup file open in one step, and gives the index
+the persisted best-block marker it currently lacks entirely. (Related: G7-05, no startup catch-up.)
+
+## S3 (storage)
+
+`loadtxoutset` never writes the snapshot chainstate's coins-DB best-block pointer — the one thing
+Core's comment calls out as *"Important that we set this"* (`validation.cpp:5884-5889`), and which
+Core even stamps with a placeholder mid-load so its `assert(!hashBlock.IsNull())` can never fire.
+Our populate path writes coins straight to LevelDB, bypassing the cache, and never sets it, so the
+newly populated DB has a full UTXO set and no `DB_BEST_BLOCK`. Narrow window, but it silently opts
+the assumeutxo chainstate out of the very invariant #333–#338 established.
+
+`gettxoutsetinfo` makes **three** independent flush-and-rescan passes (distinct txids, total amount,
+set hash) where Core computes all of it in one cursor pass, and reports the *chain* tip as
+`bestblock` where Core reports the *coins DB's own* pointer. So its hash, counts and height can
+describe different UTXO states — and `hash_serialized_3` is the assumeutxo commitment, so a
+self-inconsistent `(height, hash)` pair can be produced that no Core node will reproduce. Each pass
+also wipes the warm cache, which Core explicitly avoids via `wipe_cache=false`.
+
+Three storage LevelDB scans never call `leveldb-iter-check-error` — the project's **own** helper,
+whose docstring says any caller whose result is only meaningful if it saw every record must call it.
+A grep finds one caller, in the wallet. Worst case is `erase-all-coins`: a truncated wipe reports a
+count as if the set were emptied, and reindex then replays every block on top of the survivors,
+leaving historically-spent outputs in the UTXO set. Needs a real I/O error, so S3 — but the silence
+is the defect.
+
+`coins-view-cache-add` marks a brand-new slot FRESH even when the caller passed `:allow-overwrite`.
+Core computes `fresh` **only** inside `if (!possible_overwrite)` (`coins.cpp:94-113`), and its
+`BatchWrite` throws `std::logic_error("FRESH flag misapplied to coin that exists in parent cache")`.
+The reachable caller passes `:allow-overwrite` for *every* coinbase, so the trigger is a genuine
+BIP30 duplicate coinbase whose overwriting output is spent before the next flush — latent today
+(those outputs are unspent), but it is exactly the guard Core writes and we dropped.
+
+### Cleared in this dimension
+
+FRESH/DIRTY semantics of `coins-view-cache-spend` and of the flush's put/erase decision match
+`CCoinsViewDB::BatchWrite`; the single-level cache plus flush-and-clear discipline makes the
+disconnect-path FRESH derivation sound apart from the `:allow-overwrite` gap above. The
+`cvc-best-block` movement and same-batch commit are correct, including phase-3b truncation — the
+coins really are at the stop entry's state at the top of each disconnect iteration.
+`coin-muhash-element` is byte-for-byte `TxOutSer`; MuHash3072 matches (modulus, SHA256-then-ChaCha20
+expansion, LE load, fraction form, `Finalize` inverse). BIP158 matches throughout: element set with
+OP_RETURN and empty excluded on outputs and empty only on prevouts, dedup, P=19/M=784931,
+FastRange64, Golomb-Rice, and the header chain including the genesis anchor. The whole compressor
+matches, including the six special script forms with the on-curve check and `VARINT`'s `-1`
+non-final offset. Snapshot v2 layout, undo format (height and coinbase persisted, so restored coins
+keep maturity), the coinstatsindex design and rewind, and the 3-phase flush marker discipline all
+match.
