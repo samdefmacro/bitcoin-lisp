@@ -20,7 +20,7 @@ that made GA7 and GA8 trustworthy.
 | mining / config / lifecycle | ✅ complete | 1 S2, 11 S3 |
 | GA7 backlog status refresh | ✅ complete | 2 status regressions |
 | script interpreter | ✅ complete (part 2) | 3 S1, 6 S3 |
-| mempool & policy | ❌ died on session limit | — |
+| mempool & policy | ✅ complete (part 2) | 1 S2, 3 S3 |
 | P2P protocol & transport | ✅ complete (part 2) | 1 S1, 2 S2, 1 S3 |
 | storage & indexes | ✅ complete (part 2) | 4 S2, 4 S3 |
 | wallet | ✅ complete (part 2) | 1 S2, 3 S3 |
@@ -1145,3 +1145,101 @@ the only `innerHTML` is a static string, every dynamic value goes through `textC
 `javascript:` sink exists. CSRF is covered by the Origin check plus an explicit Authorization header
 rather than ambient Basic auth. REST matches `rest.cpp` (GET-only, `-rest`-gated,
 `MAX_GETUTXOS_OUTPOINTS`, the BIP64 bitmap layout). The full `RPC_*` error-code table matches.
+
+## S2-17. Package-RBF's feerate comparison truncates to sat/kvB, so we reject 1p1c replacements Core accepts **[verified]**
+
+Core's `PackageRBFChecks` compares two `CFeeRate` objects with `<=`. At this revision `CFeeRate`
+holds a `FeeFrac` and `operator<=>` delegates to `FeeRateCompare`, which is an **exact
+cross-multiplication** — `Mul(a.fee, b.size) <=> Mul(b.fee, a.size)` (`util/feefrac.h:156-161`) —
+with no division and no rounding.
+
+Ours reduces both sides to an integer sat/kvB first
+(`src/mempool/mempool.lisp:1236-1237`):
+
+```lisp
+(when (<= (truncate (* total-fee 1000) total-vsize)
+          (truncate (* parent-fee 1000) parent-vsize))
+```
+
+The in-code comment justifying this asserts Core's `CFeeRate` is "the C++-truncated division
+fee*1000/size". That describes the **pre-cluster-mempool** `CFeeRate` (the old `nSatoshisPerK`
+field), not this revision — the only truncated value left is `GetFeePerK()`, which the comparison
+does not use. Both sides read directly.
+
+Direction: **we reject what Core accepts.** Any 1p1c package RBF whose package feerate is strictly
+above the parent's but lands in the same truncated bucket is refused. Concrete honest-network case —
+the common LN/CPFP shape: parent 1000 vB paying 100 sat (exactly the relay floor), child 200 vB
+paying 21 sat. Core: `121*1000 = 121000 > 100*1200 = 120000` → accepted. Us:
+`truncate(121000/1200) = 100 <= truncate(100000/1000) = 100` → rejected. The bucket is one sat/kvB
+wide, so it widens with package size and always straddles a parent at a whole sat/kvB.
+
+Truncation is monotone, so the error is one-directional — we can never accept a package Core
+rejects here. But it lands on exactly the LN commitment-package fee-bump path: as a miner we forgo
+the bumped fee, as a relay we fail to forward it, and the package enters our reconsiderable-rejects
+filter.
+
+**Fix:** use the exact primitive we already ship — `feefrac>>` (`src/mempool/feefrac.lisp:64-66`) is
+already a byte-for-byte port of Core's `operator>>` and is used correctly everywhere else (the
+diagram test, chunk ordering). It is simply not used at this one call site. Fix the stale docstring
+with it.
+
+The finder checked every other sat/kvB round-trip in fee comparisons — the min-fee floor, rule 4,
+the dust threshold and the trim bump — and all match Core's `EvaluateFeeUp`/`EvaluateFeeDown`
+semantics. This is the only truncating comparison.
+
+## S3 (mempool)
+
+**BIP54's per-transaction legacy sigop relay cap is absent.** Core's `AreInputsStandard` opens with
+`CheckSigopsBIP54`, which counts, per input, the scriptSig's sigops **plus the sigops in the spent
+scriptPubKey**, rejecting above `MAX_TX_LEGACY_SIGOPS` (2500). That second term is counted by no
+other rule — Core's own `GetTransactionSigOpCost` does not include it, so the weighted cap cannot
+subsume it. We implement the standard sigop cost cap, the per-input P2SH cap and the prevout-type
+gate, but have no analogue. Spending bare 1-of-15 multisig outputs costs ~115 bytes and 15 BIP54
+sigops each, so Core rejects at ~167 inputs while we accept up to the 100 kvB limit — ~13,000
+legacy sigops where Core caps at 2,500. Harm is bounded (we relay, every Core peer drops), but once
+BIP54 activates as consensus these become permanently unminable pool entries. **This is not the
+already-recorded "d3056bc is pre-BIP54" consensus note — the policy half is present at d3056bc and
+is what we lack.**
+
+**The rolling minimum fee decays on wall-clock alone.** Core carries a second flag,
+`blockSinceLastRollingFeeBump`: `GetMinFee` returns the **undecayed** value unless a block has been
+connected since the last eviction bump, and each block also restarts the decay clock. We have only
+the timestamp, so after a trim raises the floor we start decaying immediately and keep decaying
+across a block gap. With the shortened half-lives a 30-minute gap already puts our floor ~11% below
+Core's; a stall drives it toward the reset floor while Core's stays pinned. We then admit and relay
+what every Core peer rejects, and our feefilter advertises a floor we would not have held. This is
+exactly the anti-churn hysteresis the flag exists to provide.
+
+**`CheckEphemeralSpends` runs under bypass-limits.** Core gates it on `!bypass_limits &&
+require_standard`; the `bypass_limits` half is what exempts the reorg re-add path. Our call sits
+*outside* the `(unless bypass-limits ...)` block that correctly guards the TRUC checks a few lines
+below. So after a reorg, a disconnected transaction spending an unswept-dust parent is refused, and
+the caller then cascades the removal to its in-pool children — a mempool missing
+previously-confirmed transactions that Core would have re-admitted. The sibling
+`PreCheckEphemeralTx` is correctly ungated, matching Core.
+
+### Cleared in this dimension
+
+**TRUC/v3 (BIP431) is fully implemented** — the brief's top question, answered positive.
+`single-truc-checks` is a faithful port including both inheritance directions, the 10,000/1,000 vB
+caps, the ancestor limit against the parent's own count, the `child_will_be_replaced` exemption, and
+sibling eviction with Core's exact `GetDescendantCount(parent)==2 && GetAncestorCount(sibling)==2`
+guard; `package-truc-checks` mirrors `PackageTRUCChecks` including in-package parent counting. Wired
+in Core's position with Core's `bypass_limits` gate.
+
+Also cleared: RBF end to end — rule 5 correctly redefined as ≤100 distinct **clusters** rather than
+100 transactions, rules 3/4 with `EvaluateFeeUp` ceiling semantics, the `EntriesAndTxidsDisjoint`
+check (our form is provably equivalent), the feerate-diagram improvement test, and full-RBF
+unconditional with no BIP125 signalling gate as in this revision. Ancestor/descendant counting
+includes self, matching Core, and the 64-tx/101-kvB cluster limits that replaced the 25/25 rules and
+the carve-out are correct. `TrimToSize` ordering and bump arithmetic; the entire orphanage
+(weight+latency-score DoS model, `MaxGlobalUsage`/`MaxPeerLatencyScore`, per-peer eviction,
+`EraseForBlock` exact-outpoint semantics); the rejects-filter reset rules; `IsStandardTx` arm by arm
+including the shared datacarrier budget and all defaults; `IsWitnessStandard` including annex and
+control-block handling; `GetDustThreshold`; sigop-adjusted vsize; `DynamicMemoryUsage`;
+`GetModifiedFee` and prioritisation including `ClearPrioritisation` on block; and package
+well-formedness with atomic submission.
+
+Noted, not a finding: `mempool.dat` uses a custom CRC32 format rather than Core's obfuscated v2
+layout, so the file is not interchangeable with Bitcoin Core. The surrounding comments read as a
+deliberate design choice.
