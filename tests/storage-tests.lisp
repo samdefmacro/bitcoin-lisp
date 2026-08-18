@@ -1331,9 +1331,19 @@ both views for the same seed data."
       (is (equalp (bitcoin-lisp.storage:compute-utxo-set-hash set)
                   (bitcoin-lisp.storage:compute-utxo-set-hash cache))))))
 
-(test polymorphic-iterate-cache-flushes-first
-  "Iterating a coins-view-cache flushes it as a side-effect — after
-the call, cvc-entries is empty and the data is in the base."
+(test polymorphic-iterate-cache-syncs-without-clearing
+  "Iterating a coins-view-cache SYNCS it — the dirty entries are written to the
+base, and the entries themselves are RETAINED.
+
+This asserted the opposite (cvc-entries empty afterwards), and that clearing is
+the bug. Iteration runs from RPC threads (gettxoutsetinfo, dumptxoutset) while
+the validation thread mutates the same table under the node lock: MAPHASH
+followed by CLRHASH could drop an entry inserted mid-walk WITHOUT writing it,
+and a lost tombstone leaves a spent coin alive in LevelDB — a double-spend Core
+rejects. Keeping the entries means a missed one stays dirty and is written by
+the next flush. It also stops a read-only RPC discarding the warm cache
+mid-IBD. Core's equivalent is Sync (write dirty, keep) rather than Flush
+(rpc/blockchain.cpp:1075-1084 uses ForceFlushStateToDisk with wipe_cache=false)."
   (%with-tmp-cache (cache)
     (%seed-three-coins cache)
     (is (= 3 (hash-table-count
@@ -1341,8 +1351,10 @@ the call, cvc-entries is empty and the data is in the base."
     (bitcoin-lisp.storage:utxo-set-iterate
      cache (lambda (txid vout entry)
              (declare (ignore txid vout entry))))
-    (is (zerop (hash-table-count
-                (bitcoin-lisp.storage::cvc-entries cache))))))
+    (is (= 3 (hash-table-count (bitcoin-lisp.storage::cvc-entries cache)))
+        "entries are retained, not cleared")
+    (is (zerop (bitcoin-lisp.storage::cvc-dirty-count cache))
+        "but they are no longer dirty — the sync committed them")))
 
 (test polymorphic-iterate-cache-merges-flushed-base-and-recent-adds
   "After a partial flush, the next iterate still sees everything —

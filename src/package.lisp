@@ -608,6 +608,7 @@
    #:coins-view-cache-add
    #:coins-view-cache-spend
    #:coins-view-cache-flush
+   #:coins-view-cache-sync
    #:coins-view-db-best-block
    #:coins-view-cache-load-best-block
    #:coins-view-batch-set-best-block

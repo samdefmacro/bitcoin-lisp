@@ -231,6 +231,46 @@ erased."
         (cvc-mem-bytes cache) 0)
   (coins-view-db-erase-all-coins (cvc-base cache)))
 
+(defun coins-view-cache-sync (cache &key sync (best-block (cvc-best-block cache)))
+  "Write dirty entries to the base view and KEEP them in the cache — Core's
+CCoinsViewCache::Sync, as opposed to Flush which also drops the entries.
+
+This exists because iterating the UTXO set from an RPC thread must not clear
+the live table. COINS-VIEW-CACHE-FLUSH does MAPHASH and then CLRHASH; the
+validation thread mutates that same table under the node lock, so entries
+inserted while the RPC thread was inside the MAPHASH might never be visited and
+the following CLRHASH then dropped them UNWRITTEN. A dropped tombstone leaves a
+spent coin alive in LevelDB — we would accept a double-spend Core rejects — and
+a dropped add loses a real UTXO. Keeping the entries removes that class
+entirely: an entry the MAPHASH misses simply stays dirty and is written by the
+next flush.
+
+It also stops a `gettxoutsetinfo' throwing away the warm cache mid-IBD, which
+Flush did as a side effect of answering a read-only question.
+
+CALLER CONTRACT: hold the node lock across this call AND the creation of the
+iterator that follows it. Core takes cs_main across exactly that pair
+(rpc/blockchain.cpp:1075-1084) — coins connected between the two would
+otherwise be in neither the snapshot nor the write."
+  (declare (type coins-view-cache cache))
+  (let ((count 0))
+    (with-coins-view-batch (batch (cvc-base cache) :sync sync)
+      (maphash (lambda (key ce)
+                 (when (ce-dirty ce)
+                   (if (ce-entry ce)
+                       (coins-view-batch-put batch key (ce-entry ce))
+                       (coins-view-batch-erase batch key))
+                   (incf count)))
+               (cvc-entries cache))
+      (when best-block
+        (coins-view-batch-set-best-block batch best-block)))
+    ;; Entries stay; only their dirty marks clear, so the next flush does not
+    ;; rewrite what this one already committed.
+    (maphash (lambda (key ce) (declare (ignore key)) (setf (ce-dirty ce) nil))
+             (cvc-entries cache))
+    (setf (cvc-dirty-count cache) 0)
+    count))
+
 (defun coins-view-cache-flush (cache &key sync (best-block (cvc-best-block cache)))
   "Commit all dirty entries to the base view in a single atomic batch
 then clear the cache. SYNC=T forces fsync. Returns the number of
@@ -688,7 +728,13 @@ LevelDB iterator. The iterator emits keys in lex order, which for our
 key encoding ('C' + txid + LE vout, all fixed-width) equals the
 on-disk 36-byte key order — same raw order %utxo-set-iterate produces.
 utxo-set-iterate layers Core's numeric-vout cursor order on top."
-  (coins-view-cache-flush cache)
+  ;; SYNC, not FLUSH: this runs from RPC threads (gettxoutsetinfo,
+  ;; dumptxoutset) while the validation thread mutates the same entries table
+  ;; under the node lock. Flush CLRHASHes it, so an entry inserted while we
+  ;; were inside its MAPHASH could be dropped unwritten -- a lost tombstone
+  ;; leaves a spent coin alive in LevelDB. Sync keeps the entries, so a missed
+  ;; one stays dirty and is written by the next flush.
+  (coins-view-cache-sync cache)
   (with-leveldb-iterator (iter (cvdb-db (cvc-base cache)))
     ;; SEEK to the coin prefix rather than seeking to the first key. The loop
     ;; below stops at the first non-'C' key, which is only a correct scan if
