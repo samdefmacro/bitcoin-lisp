@@ -2211,19 +2211,23 @@ a second download cursor for its [tip .. snapshot-base] range."
     ;; blocks, or after a restart — sits unactivated until some unrelated block
     ;; happens to arrive. Live on 2026-08-19: testnet4 held tip 149110 for 40+
     ;; minutes with a fully-downloaded, strictly-heavier 149120 branch on disk.
-    (multiple-value-bind (switched missing)
-        (bitcoin-lisp.validation:activate-best-chain
-         chain-state block-store utxo-set
-         :fee-estimator fee-estimator
-         :recent-rejects recent-rejects
-         :mempool mempool)
-      (when switched
-        (bitcoin-lisp:log-info "Activated best chain: tip now height ~D"
-                               (bitcoin-lisp.storage:current-height chain-state)))
-      ;; Refused for want of block bodies — re-request them, exactly as the
-      ;; arrival path does.
-      (when (consp missing)
-        (queue-missing-fork-blocks missing)))
+    ;; Skipped when a stop is pending — shutdown must return promptly rather
+    ;; than start a reorg — and when there is no block store, since then no
+    ;; candidate can have a body on disk to switch to.
+    (when (and block-store utxo-set (not (bitcoin-lisp:interrupt-requested-p)))
+      (multiple-value-bind (switched missing)
+          (bitcoin-lisp.validation:activate-best-chain
+           chain-state block-store utxo-set
+           :fee-estimator fee-estimator
+           :recent-rejects recent-rejects
+           :mempool mempool)
+        (when switched
+          (bitcoin-lisp:log-info "Activated best chain: tip now height ~D"
+                                 (bitcoin-lisp.storage:current-height chain-state)))
+        ;; Refused for want of block bodies — re-request them, exactly as the
+        ;; arrival path does.
+        (when (consp missing)
+          (queue-missing-fork-blocks missing))))
 
     ;; Done — distinguish "actually finished" from "paused due to no peers".
     ;; Either: pending+in-flight both zero (we drained), OR
