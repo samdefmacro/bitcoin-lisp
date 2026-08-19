@@ -236,16 +236,17 @@ whether it was already indexed — 149k blocks and about nine minutes on the liv
 testnet4 node."
   (let ((best (txindex-best-block txindex)))
     (if (null best)
-        0
+        (values 0 :no-marker)
         (let ((entry (get-block-index-entry chain-state best)))
           (if (null entry)
-              0
+              (values 0 :marker-not-in-index)
               (let* ((height (block-index-entry-height entry))
                      (on-chain (get-block-at-height chain-state height)))
-                (if (and on-chain
-                         (equalp (block-index-entry-hash on-chain) best))
-                    (1+ height)
-                    0)))))))
+                (cond
+                  ((null on-chain) (values 0 :height-above-tip))
+                  ((not (equalp (block-index-entry-hash on-chain) best))
+                   (values 0 :marker-off-chain))
+                  (t (values (1+ height) :resumed)))))))))
 
 (defun build-tx-index (txindex chain-state block-store
                        &key progress-callback from-genesis)
@@ -266,10 +267,21 @@ other than a clean crash — resuming cannot detect arbitrary damage below the
 marker, and neither can Core, which also resumes from its locator."
   (unless (tx-index-enabled txindex)
     (return-from build-tx-index 0))
+  (multiple-value-bind (resume-height resume-reason)
+      (if from-genesis
+          (values 0 :forced-full)
+          (%txindex-resume-height txindex chain-state))
+    ;; State the decision. Without this the log shows a scan and gives no way
+    ;; to tell a resume from a full rescan, or why -- which is exactly the
+    ;; question a nine-minute startup raises.
+    (bitcoin-lisp:log-info "Transaction index: ~(~A~), scanning from height ~D"
+                           resume-reason resume-height)
+    (%build-tx-index-from txindex chain-state block-store resume-height
+                          progress-callback)))
+
+(defun %build-tx-index-from (txindex chain-state block-store start-height
+                             progress-callback)
   (let* ((current-height (current-height chain-state))
-         (start-height (if from-genesis
-                           0
-                           (%txindex-resume-height txindex chain-state)))
          (total-indexed 0)
          (last-report-time (get-internal-real-time)))
     (loop for height from start-height to current-height
