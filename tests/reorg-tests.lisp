@@ -1172,13 +1172,20 @@ semantics and re-points entries left stale by a crash."
                           txindex chain-state block-store)))
                 (is (= entries-before
                        (bitcoin-lisp.storage:txindex-count txindex))))
-              ;; (c2) A stale mapping (e.g. crash before the reorg's index
-              ;; update) is re-pointed by the catch-up scan: force T back to
-              ;; A2, then rescan — the verified per-block check sees B2's
-              ;; last tx pointing elsewhere and re-indexes B2.
+              ;; (c2) A stale mapping is re-pointed by a FULL scan: force T
+              ;; back to A2, then rescan from genesis — the verified per-block
+              ;; check sees B2's last tx pointing elsewhere and re-indexes B2.
+              ;; :from-genesis is required now that the ordinary startup scan
+              ;; resumes from the best-indexed marker: arbitrary damage below
+              ;; that marker is not something resuming can detect (nor can
+              ;; Core's, which also resumes from its locator), so repairing it
+              ;; is an explicit request rather than a cost paid every start.
               (bitcoin-lisp.storage:txindex-add txindex t-txid (second a-hashes) 1)
+              (is (= 0 (bitcoin-lisp.storage:build-tx-index
+                        txindex chain-state block-store))
+                  "the resuming scan must do nothing when the marker is at the tip")
               (is (plusp (bitcoin-lisp.storage:build-tx-index
-                          txindex chain-state block-store)))
+                          txindex chain-state block-store :from-genesis t)))
               (let ((loc (bitcoin-lisp.storage:txindex-lookup txindex t-txid)))
                 (is (equalp (second b-hashes)
                             (bitcoin-lisp.storage:tx-location-block-hash loc)))))

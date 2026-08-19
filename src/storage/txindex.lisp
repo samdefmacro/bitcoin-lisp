@@ -247,7 +247,8 @@ testnet4 node."
                     (1+ height)
                     0)))))))
 
-(defun build-tx-index (txindex chain-state block-store &key progress-callback)
+(defun build-tx-index (txindex chain-state block-store
+                       &key progress-callback from-genesis)
   "Build the transaction index from existing blocks.
 Scans all blocks from genesis to current tip; blocks whose transactions are
 already indexed at their active-chain location are skipped (verified via the
@@ -256,11 +257,19 @@ txid-existence check would both bloat the append-only file on every restart
 under upsert semantics AND leave stale-branch locations in place after a
 reorg that happened while the index was offline).
 PROGRESS-CALLBACK, if provided, is called with (height percentage) periodically.
-Returns the number of transactions indexed."
+Returns the number of transactions indexed.
+
+By default the scan RESUMES from the recorded best-indexed block, so a startup
+costs nothing when the index is already current. FROM-GENESIS forces the full
+verify-every-block scan, which is what repairs an index damaged by something
+other than a clean crash — resuming cannot detect arbitrary damage below the
+marker, and neither can Core, which also resumes from its locator."
   (unless (tx-index-enabled txindex)
     (return-from build-tx-index 0))
   (let* ((current-height (current-height chain-state))
-         (start-height (%txindex-resume-height txindex chain-state))
+         (start-height (if from-genesis
+                           0
+                           (%txindex-resume-height txindex chain-state)))
          (total-indexed 0)
          (last-report-time (get-internal-real-time)))
     (loop for height from start-height to current-height
