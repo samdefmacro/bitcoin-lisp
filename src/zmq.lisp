@@ -76,6 +76,12 @@ start."
 (defvar *zmq-context* nil "The shared libzmq context, or NIL.")
 (defvar *zmq-publishers* '() "Active ZMQ-PUBLISHER structs.")
 
+(defvar *zmq-publisher-specs* '()
+  "What -zmqpub* asked for, as (topic address hwm), recorded by
+APPLY-CONFIG-GLOBALS and acted on by START-NODE. Keeping the parse separate
+from the socket bind means a bad address is reported while reading the config,
+not halfway through startup.")
+
 (defun %zmq-setsockopt-int (socket option value)
   (cffi:with-foreign-object (v :int)
     (setf (cffi:mem-ref v :int) value)
@@ -233,3 +239,62 @@ a node that does not use ZMQ."
                                     (error "Invalid value for -zmqpub~Ahwm=~A" topic h))
                                   n)
                                 +default-zmq-sndhwm+))))))
+
+;;;; --- Node events (Core CZMQNotificationInterface) ---
+
+(defun zmq-topic-active-p (topic)
+  "T when something is actually publishing TOPIC. Callers check this BEFORE
+serializing a block or transaction: rawblock is megabytes, and paying that on
+every connected block for a topic nobody subscribes to would be a tax on the
+whole node for an unused feature."
+  (and *zmq-publishers*
+       (find topic *zmq-publishers* :key #'zmq-publisher-topic :test #'string=)
+       t))
+
+(defun zmq-notify-transaction (tx txid)
+  "The hashtx / rawtx pair for one transaction (Core NotifyTransaction)."
+  (when (zmq-topic-active-p "hashtx")
+    (zmq-notify-hash-tx txid))
+  (when (zmq-topic-active-p "rawtx")
+    (zmq-notify-raw-tx (bitcoin-lisp.serialization:serialize-transaction tx))))
+
+(defun zmq-notify-tx-accepted (tx txid mempool-sequence)
+  "A transaction entered the mempool (Core TransactionAddedToMempool): the
+hashtx/rawtx pair, then a sequence 'A' carrying the mempool counter."
+  (when *zmq-publishers*
+    (zmq-notify-transaction tx txid)
+    (when (zmq-topic-active-p "sequence")
+      (zmq-notify-sequence txid #\A mempool-sequence))))
+
+(defun zmq-notify-tx-removed (txid mempool-sequence)
+  "A transaction left the mempool for a reason OTHER than being mined (Core
+TransactionRemovedFromMempool: \"Called for all non-block inclusion reasons\").
+A mined transaction is reported by the block notification instead."
+  (when (zmq-topic-active-p "sequence")
+    (zmq-notify-sequence txid #\R mempool-sequence)))
+
+(defun zmq-notify-block-connected (block hash)
+  "Core BlockConnected: every transaction in the block first, then the block
+itself and a sequence 'C'."
+  (when *zmq-publishers*
+    (when (or (zmq-topic-active-p "hashtx") (zmq-topic-active-p "rawtx"))
+      (loop for tx across (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+            do (zmq-notify-transaction
+                tx (bitcoin-lisp.serialization:transaction-hash tx))))
+    (when (zmq-topic-active-p "hashblock")
+      (zmq-notify-hash-block hash))
+    (when (zmq-topic-active-p "rawblock")
+      (zmq-notify-raw-block (bitcoin-lisp.serialization:serialize-witness-block block)))
+    (when (zmq-topic-active-p "sequence")
+      (zmq-notify-sequence hash #\C))))
+
+(defun zmq-notify-block-disconnected (block hash)
+  "Core BlockDisconnected: every transaction in the block, then a sequence 'D'.
+No rawblock/hashblock — those announce the tip moving FORWARD."
+  (when *zmq-publishers*
+    (when (or (zmq-topic-active-p "hashtx") (zmq-topic-active-p "rawtx"))
+      (loop for tx across (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+            do (zmq-notify-transaction
+                tx (bitcoin-lisp.serialization:transaction-hash tx))))
+    (when (zmq-topic-active-p "sequence")
+      (zmq-notify-sequence hash #\D))))

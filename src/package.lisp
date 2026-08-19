@@ -1557,6 +1557,16 @@
    #:maybe-periodic-flush
    #:maybe-critical-flush
    #:maybe-stop-at-height
+   ;; ZMQ notifications (G7-23)
+   #:zmq-notify-block-connected
+   #:zmq-notify-block-disconnected
+   #:zmq-notify-tx-accepted
+   #:zmq-notify-tx-removed
+   #:zmq-start-publishers
+   #:zmq-stop-publishers
+   #:zmq-specs-from-config
+   #:zmq-notifications-info
+   #:zmq-topic-active-p
    ;; Cooperative-stop seam (config.lisp): the networking layer installs the
    ;; predicate, lower layers poll it — never the other way round.
    #:*interrupt-check*

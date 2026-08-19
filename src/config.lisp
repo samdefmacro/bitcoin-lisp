@@ -958,6 +958,10 @@ start-node-from-args."
     ;; (Core mempool_args.cpp:57, default DEFAULT_MEMPOOL_EXPIRY_HOURS 336).
     (let ((v (lk "mempoolexpiry")))
       (when v (setf bitcoin-lisp.mempool:*mempool-expiry-hours* (conf-parse-int v))))
+    ;; -zmqpub<topic>=<address> [+ -zmqpub<topic>hwm]: recorded now, bound by
+    ;; start-node. Nothing is loaded or opened here, so a node with no ZMQ
+    ;; options never touches libzmq at all.
+    (setf *zmq-publisher-specs* (zmq-specs-from-config merged))
     ;; -maxmempool: megabytes of mempool MEMORY usage (Core mempool_args.cpp,
     ;; DEFAULT_MAX_MEMPOOL_SIZE_MB = 300). Under -blocksonly Core soft-sets it
     ;; to DEFAULT_BLOCKSONLY_MAX_MEMPOOL_SIZE_MB = 5 (init.cpp:826) -- "soft",
