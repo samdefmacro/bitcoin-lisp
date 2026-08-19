@@ -1008,6 +1008,56 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
         (values t nil)
         (values nil :bad-coinbase-height))))
 
+(defun script-checks-skippable-p (chain-state hash height)
+  "T when signature verification may be skipped for the block ENTRY names.
+
+Core's fScriptChecks is a pure function of ASSUMEVALID (validation.cpp:2342-2380)
+and CHECKPOINTS PLAY NO PART IN IT. We reduced the whole thing to
+`height <= (max last-checkpoint-height assumevalid-height)', which is wrong in
+two directions at once:
+
+ - Only a HEIGHT was compared, so any block at or below that height had its
+   signatures skipped even when it was NOT an ancestor of the assumevalid
+   block. A competing fork block qualifies. A fork must out-work the active
+   chain to connect, which is expensive at the mainnet tip but not during IBD
+   and cheap by design on the min-difficulty test networks -- and in that
+   window we accepted a fork block carrying forged scriptSigs that Core
+   verifies and rejects.
+ - When the assumevalid header is not yet in our index -- the whole first phase
+   of a fresh IBD -- the expression fell back to the CHECKPOINT height and
+   skipped every signature up to 840,000 on mainnet and 2,000,000 on testnet3,
+   where Core verifies all of them.
+
+Both holes are closed by requiring what Core requires: assumevalid must be
+configured, its header must be in the index, and this block must be an ANCESTOR
+of it. The ancestry test is by hash, per GA9 S2-2.
+
+DELIBERATELY NOT IMPLEMENTED, and the reason is a real constraint rather than
+an oversight: Core additionally requires the block to be on the best-header
+chain, the best header's work to be at or above nMinimumChainWork, and more
+than two weeks of equivalent work to sit below the best header (its
+anti-extortion margin). All three need m_best_header, which Core maintains
+incrementally and we recompute by scanning the whole index --
+BEST-HEADER-ENTRY's own docstring says it is `O(index size) ... not for
+per-block paths'. Consulting it here would put an O(index) scan in the connect
+loop. Those three conditions only ever make skipping STRICTER, so omitting them
+is a smaller skip window than Core's, never a larger one; closing them properly
+means maintaining the best header incrementally first."
+  (let* ((av (bitcoin-lisp:network-assumevalid bitcoin-lisp:*network*))
+         (av-entry (and av (bitcoin-lisp.storage:get-block-index-entry chain-state av))))
+    (and hash av-entry
+         ;; The block must BE the assumevalid chain's block at this height.
+         ;; Taking a hash and height rather than an index entry is deliberate:
+         ;; on the tip-extension path the block is validated BEFORE
+         ;; connect-block creates its entry, so an entry-based predicate would
+         ;; silently answer NIL there and quietly verify every signature -- safe,
+         ;; but it would make the assumevalid optimisation dead on the main IBD
+         ;; path rather than merely correct.
+         (let ((ancestor (bitcoin-lisp.storage:entry-ancestor-at-height av-entry height)))
+           (and ancestor
+                (equalp (bitcoin-lisp.storage:block-index-entry-hash ancestor) hash)
+                t)))))
+
 (defun calculate-block-weight (transactions)
   "Weight of the block whose transaction list is TRANSACTIONS (Core
 GetBlockWeight, consensus/validation.h:136-139).
@@ -2634,7 +2684,20 @@ comment above."
                        (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
                       (values nil :time-too-old)
                       (validate-block block chain-state utxo-set height now
-                                      :skip-scripts skip-scripts
+                                      ;; PER BLOCK, not the caller's single
+                                      ;; verdict for the whole fork. PERFORM-REORG
+                                      ;; takes SKIP-SCRIPTS as one keyword and
+                                      ;; applied it to every block it connected,
+                                      ;; which makes Core's ancestor condition
+                                      ;; unenforceable for exactly the fork
+                                      ;; blocks it exists to protect: a fork
+                                      ;; block is by construction NOT an
+                                      ;; ancestor of assumevalid. The incoming
+                                      ;; SKIP-SCRIPTS can now only ever narrow
+                                      ;; the skip, never widen it.
+                                      :skip-scripts (and skip-scripts
+                                                         (script-checks-skippable-p
+                                                          chain-state block-hash height))
                                       ;; Header (PoW/difficulty/MTP/timewarp) was
                                       ;; validated at index admission — Core's
                                       ;; ConnectBlock doesn't re-check it.

@@ -609,6 +609,8 @@
    #:coins-view-cache-spend
    #:coins-view-cache-flush
    #:coins-view-cache-sync
+   #:coins-view-cache-uncache
+   #:with-coins-to-uncache
    #:coins-view-db-best-block
    #:coins-view-cache-load-best-block
    #:coins-view-batch-set-best-block
@@ -1064,6 +1066,7 @@
    #:testnet-min-difficulty-allowed-p
    #:testnet-walk-back-bits
    ;; Block weight
+   #:script-checks-skippable-p
    #:calculate-block-weight
    #:+max-block-weight+
    ;; Sigops validation
@@ -1448,6 +1451,7 @@
    #:minimum-chain-work
    #:*minimum-chain-work-override*
    #:*assumevalid-override*
+   #:network-assumevalid
    #:*p2p-port-override*
    #:*stop-at-height*
    #:*dns-seed-enabled*
