@@ -139,7 +139,20 @@ Returns up to MAX-BLOCKS entries (or all if NIL)."
 ;;;; Persistence
 
 (defconstant +fee-stats-magic+ #x53454546)  ; "FEES" in little-endian
-(defconstant +fee-stats-version+ 1)
+(defconstant +fee-stats-version+ 2
+  "v2 appends the CBlockPolicyEstimator state after the legacy percentile
+entries. A v1 file still loads: it simply carries no estimator section, which
+is indistinguishable from a first run.")
+
+(defconstant +fee-estimates-max-file-age-seconds+ (* 60 60 60)
+  "Core MAX_FILE_AGE (block_policy_estimator.h:33): fee estimates older than 60
+hours are not read at all. They are historical data about a network whose
+activity has since moved on, and a confidently wrong estimate is spent money.")
+
+(defvar *accept-stale-fee-estimates* nil
+  "Core -acceptstalefeeestimates (DEFAULT_ACCEPT_STALE_FEE_ESTIMATES = false):
+load a fee_estimates.dat older than MAX_FILE_AGE anyway. Core allows this only
+on regtest.")
 (defvar +fee-stats-filename+ "fee_estimates.dat")
 
 (defun fee-stats-path (data-directory)
@@ -168,7 +181,15 @@ entries (20 bytes each: height, median, low, high, tx-count), CRC32 (4 bytes)."
                   (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-median-rate entry))
                   (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-low-rate entry))
                   (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-high-rate entry))
-                  (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-tx-count entry))))))
+                  (bitcoin-lisp.serialization:write-uint32-le mem (block-fee-stats-tx-count entry)))
+                ;; v2: the Core estimator's state. A node running without one
+                ;; writes a zero marker, which reads back as "no section".
+                (let ((est *block-policy-estimator*))
+                  (if est
+                      (progn
+                        (bitcoin-lisp.serialization:write-uint8 mem 1)
+                        (bpe-write-to-stream est mem))
+                      (bitcoin-lisp.serialization:write-uint8 mem 0))))))
         ;; Write data + CRC32 to file
         (with-open-file (stream path
                                 :direction :output
@@ -187,6 +208,16 @@ Returns T on success, NIL if file doesn't exist or is corrupt."
   (let ((path (fee-stats-path (fee-estimator-data-directory estimator))))
     (unless (and path (probe-file path))
       (return-from load-fee-stats nil))
+    ;; Core MAX_FILE_AGE (:33): estimates this old describe a network whose
+    ;; activity has moved on. Refusing them costs a few hours of accuracy;
+    ;; trusting them costs money on every transaction built from them.
+    (let ((age (- (get-universal-time) (file-write-date path))))
+      (when (and (> age +fee-estimates-max-file-age-seconds+)
+                 (not *accept-stale-fee-estimates*))
+        (bitcoin-lisp:log-warn
+         "Ignoring fee_estimates.dat: ~,1Fh old, over the ~Dh limit"
+         (/ age 3600.0) (floor +fee-estimates-max-file-age-seconds+ 3600))
+        (return-from load-fee-stats nil)))
     (handler-case
         (let ((file-bytes (with-open-file (stream path
                                                    :direction :input
@@ -215,7 +246,7 @@ Returns T on success, NIL if file doesn't exist or is corrupt."
               (unless (= magic +fee-stats-magic+)
                 (bitcoin-lisp:log-warn "Fee stats file has invalid magic")
                 (return-from load-fee-stats nil))
-              (unless (= version +fee-stats-version+)
+              (unless (<= 1 version +fee-stats-version+)
                 (bitcoin-lisp:log-warn "Fee stats file has unsupported version ~D" version)
                 (return-from load-fee-stats nil))
               ;; Read entries
@@ -227,6 +258,22 @@ Returns T on success, NIL if file doesn't exist or is corrupt."
                               :high-rate (bitcoin-lisp.serialization:read-uint32-le stream)
                               :tx-count (bitcoin-lisp.serialization:read-uint32-le stream))))
                   (fee-estimator-add-stats estimator entry)))
+              ;; v2: the Core estimator's state follows the legacy entries.
+              (when (>= version 2)
+                (let ((present (bitcoin-lisp.serialization:read-uint8 stream))
+                      (est *block-policy-estimator*))
+                  (cond
+                    ((zerop present)
+                     (bitcoin-lisp:log-info "Fee estimates file carries no policy-estimator state"))
+                    ((null est)
+                     (bitcoin-lisp:log-info "Fee estimates file has policy-estimator state but no estimator is installed"))
+                    ((bpe-read-into est stream)
+                     (bitcoin-lisp:log-info "Loaded fee policy estimator state (best height ~D)"
+                                            (block-policy-estimator-best-height est)))
+                    (t
+                     ;; Discarded, not partially applied. The estimator keeps
+                     ;; whatever it had and rebuilds from live observation.
+                     (bitcoin-lisp:log-warn "Fee policy estimator state rejected as corrupt; starting from live observation")))))
               (bitcoin-lisp:log-info "Loaded ~D fee stats entries" count)
               t)))
       (error (e)
