@@ -104,3 +104,90 @@ base58_tests.cpp)."
           (is (equalp bytes (bitcoin-lisp.crypto:base58-decode b58))
               "decoding ~S did not give ~S" b58 hex))))
     (is (= 21 checked) "expected Core's 21 base58 vectors, ran ~D" checked)))
+
+;;;; BIP173 / BIP350 bech32 and bech32m vectors (Core bech32_tests.cpp).
+;;;;
+;;;; These are the generic string-level vectors, not segwit addresses: they
+;;;; exercise the separator rules, the hrp character range, the case rules and
+;;;; the checksum itself. The invalid list is the point — it is where a decoder
+;;;; that merely "works on real addresses" comes apart.
+
+(defun %bech32-case-insensitive-equal (a b)
+  (string-equal a b))
+
+(test core-bech32-valid-vectors
+  "BIP173: each string decodes as BECH32 and re-encodes to itself, modulo case."
+  (dolist (str '("A12UEL5L"
+                 "a12uel5l"
+                 "an83characterlonghumanreadablepartthatcontainsthenumber1andtheexcludedcharactersbio1tt5tgs"
+                 "abcdef1qpzry9x8gf2tvdw0s3jn54khce6mua7lmqqqxw"
+                 "11qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqc8247j"
+                 "split1checkupstagehandshakeupstreamerranterredcaperred2y9e3w"
+                 "?1ezyfcl"))
+    (multiple-value-bind (hrp data variant) (bitcoin-lisp.crypto:bech32-decode str)
+      (is (eq :bech32 variant) "~S decoded as ~S, expected :bech32" str variant)
+      (when hrp
+        (is-true (%bech32-case-insensitive-equal
+                  str (bitcoin-lisp.crypto:bech32-encode hrp data :bech32))
+                 "~S did not re-encode to itself" str)))))
+
+(test core-bech32m-valid-vectors
+  "BIP350: each string decodes as BECH32M and re-encodes to itself."
+  (dolist (str '("A1LQFN3A"
+                 "a1lqfn3a"
+                 "an83characterlonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber11sg7hg6"
+                 "abcdef1l7aum6echk45nj3s0wdvt2fg8x9yrzpqzd3ryx"
+                 "11llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllludsr8"
+                 "split1checkupstagehandshakeupstreamerranterredcaperredlc445v"
+                 "?1v759aa"))
+    (multiple-value-bind (hrp data variant) (bitcoin-lisp.crypto:bech32-decode str)
+      (is (eq :bech32m variant) "~S decoded as ~S, expected :bech32m" str variant)
+      (when hrp
+        (is-true (%bech32-case-insensitive-equal
+                  str (bitcoin-lisp.crypto:bech32-encode hrp data :bech32m))
+                 "~S did not re-encode to itself" str)))))
+
+(test core-bech32-invalid-vectors
+  "BIP173/BIP350: none of these decode. Each targets one rule — an hrp
+character outside [33,126], an over-long string, a missing or misplaced
+separator, a character outside the base32 set, mixed case, or a corrupted
+checksum."
+  (let ((cases (append
+                ;; bech32 (BIP173)
+                (list (format nil " 1nwldj5")
+                      (concatenate 'string (string (code-char #x7f)) "1axkwrx")
+                      (concatenate 'string (string (code-char #x80)) "1eym55h"))
+                '("an84characterslonghumanreadablepartthatcontainsthenumber1andtheexcludedcharactersbio1569pvx"
+                  "pzry9x0s0muk"
+                  "1pzry9x0s0muk"
+                  "x1b4n0q5v"
+                  "li1dgmt3")
+                (list (concatenate 'string "de1lg7wt" (string (code-char #xff))))
+                '("A1G7SGD8"
+                  "10a06t8"
+                  "1qzzfhee"
+                  "a12UEL5L"
+                  "A12uEL5L"
+                  "abcdef1qpzrz9x8gf2tvdw0s3jn54khce6mua7lmqqqxw"
+                  "test1zg69w7y6hn0aqy352euf40x77qddq3dc")
+                ;; bech32m (BIP350)
+                (list (format nil " 1xj0phk")
+                      (concatenate 'string (string (code-char #x7f)) "1g6xzxy")
+                      (concatenate 'string (string (code-char #x80)) "1vctc34"))
+                '("an84characterslonghumanreadablepartthatcontainsthetheexcludedcharactersbioandnumber11d6pts4"
+                  "qyrz8wqd2c9m"
+                  "1qyrz8wqd2c9m"
+                  "y1b0jsk6g"
+                  "lt1igcx5c0"
+                  "in1muywd"
+                  "mm1crxm3i"
+                  "au1s5cgom"
+                  "M1VUXWEZ"
+                  "16plkw9"
+                  "1p2gdwpf"
+                  "abcdef1l7aum6echk45nj2s0wdvt2fg8x9yrzpqzd3ryx"
+                  "test1zg69v7y60n00qy352euf40x77qcusag6"))))
+    (dolist (str cases)
+      (is-false (bitcoin-lisp.crypto:bech32-decode str)
+                "~S was accepted but BIP173/BIP350 reject it" str))
+    (is (= 32 (length cases)) "expected 32 invalid vectors, had ~D" (length cases))))
