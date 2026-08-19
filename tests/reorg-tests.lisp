@@ -1013,11 +1013,15 @@ semantics and re-points entries left stale by a crash."
                   ;; resolves end-to-end (Core keeps stale block data too).
                   (is (not (null a2)))))
               ;; (c1) Catch-up scan is idempotent: nothing re-appended.
-              (let ((entries-before (bitcoin-lisp.storage::tx-index-entry-count txindex)))
+              ;; TX-INDEX-ENTRY-COUNT was an accessor on the in-memory txid
+              ;; table; the index is now LevelDB-backed (GA9 S2-13) and the
+              ;; observable equivalent is TXINDEX-COUNT. Idempotence is the
+              ;; property being tested either way.
+              (let ((entries-before (bitcoin-lisp.storage:txindex-count txindex)))
                 (is (= 0 (bitcoin-lisp.storage:build-tx-index
                           txindex chain-state block-store)))
                 (is (= entries-before
-                       (bitcoin-lisp.storage::tx-index-entry-count txindex))))
+                       (bitcoin-lisp.storage:txindex-count txindex))))
               ;; (c2) A stale mapping (e.g. crash before the reorg's index
               ;; update) is re-pointed by the catch-up scan: force T back to
               ;; A2, then rescan — the verified per-block check sees B2's

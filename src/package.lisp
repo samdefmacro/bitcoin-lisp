@@ -691,6 +691,8 @@
    #:txindex-remove
    #:txindex-contains-p
    #:txindex-count
+   #:txindex-set-best-block
+   #:txindex-best-block
    #:load-tx-index
    #:txindex-add-block
    #:txindex-remove-block
