@@ -1836,6 +1836,77 @@ a complete, correct, unreachable function is exactly the shape of this bug."
         "start-node must call build-tx-index, or -txindex indexes nothing
          historical")))
 
+(defun %txresume-chain (n)
+  "A chain-state with an N-block active chain (heights 0..N-1) linked by
+prev-entry, so GET-BLOCK-AT-HEIGHT can walk it. Returns (values state hashes)."
+  (let ((cs (bitcoin-lisp.storage:make-chain-state))
+        (hashes '())
+        (prev nil))
+    (dotimes (i n)
+      (let* ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element i))
+             (e (bitcoin-lisp.storage:make-block-index-entry
+                 :hash h :height i :chain-work (* 10 (1+ i))
+                 :status :valid :prev-entry prev)))
+        (bitcoin-lisp.storage:add-block-index-entry cs e)
+        (push h hashes)
+        (setf prev e)))
+    (setf (bitcoin-lisp.storage::chain-state-best-block-hash cs)
+          (bitcoin-lisp.storage:block-index-entry-hash prev)
+          (bitcoin-lisp.storage::chain-state-best-height cs) (1- n))
+    (values cs (nreverse hashes))))
+
+(test txindex-resume-height-skips-what-is-already-indexed
+  "The catch-up used to re-read EVERY block from disk on every start just to ask
+whether it was already indexed — 149k blocks and about nine minutes on the live
+testnet4 node. txindex-set-best-block and txindex-best-block already existed for
+exactly this and had NO callers, so nothing recorded progress."
+  (let ((dir (merge-pathnames (format nil "txidx-resume-~D/" (get-universal-time))
+                              (uiop:temporary-directory))))
+    (multiple-value-bind (cs hashes) (%txresume-chain 5)
+      (let ((txindex (bitcoin-lisp.storage:init-tx-index dir :enabled t)))
+        (unwind-protect
+             (progn
+               ;; No marker: the whole chain must be scanned.
+               (is (= 0 (bitcoin-lisp.storage::%txindex-resume-height txindex cs)))
+               ;; Marker on the active chain at height 2: resume at 3.
+               (bitcoin-lisp.storage:txindex-set-best-block txindex (third hashes))
+               (is (= 3 (bitcoin-lisp.storage::%txindex-resume-height txindex cs)))
+               ;; Marker at the tip: nothing left to scan.
+               (bitcoin-lisp.storage:txindex-set-best-block txindex (fifth hashes))
+               (is (= 5 (bitcoin-lisp.storage::%txindex-resume-height txindex cs)))
+               ;; Marker naming a block we have never heard of: full rescan.
+               (bitcoin-lisp.storage:txindex-set-best-block
+                txindex (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 99))
+               (is (= 0 (bitcoin-lisp.storage::%txindex-resume-height txindex cs))))
+          (bitcoin-lisp.storage:close-tx-index txindex))))))
+
+(test txindex-resume-refuses-a-marker-that-was-reorged-away
+  "A marker alone is not enough. A reorg while the index was offline leaves
+entries below it pointing at a branch that is no longer active; skipping those
+heights would leave the stale locations in place forever. The marker is honoured
+only when its block is STILL on the active chain at the height it claims."
+  (let ((dir (merge-pathnames (format nil "txidx-reorg-~D/" (get-universal-time))
+                              (uiop:temporary-directory))))
+    (multiple-value-bind (cs hashes) (%txresume-chain 5)
+      (let ((txindex (bitcoin-lisp.storage:init-tx-index dir :enabled t)))
+        (unwind-protect
+             (progn
+               (bitcoin-lisp.storage:txindex-set-best-block txindex (third hashes))
+               (is (= 3 (bitcoin-lisp.storage::%txindex-resume-height txindex cs)))
+               ;; A competing block at the SAME height, now indexed but off-chain:
+               ;; the height still exists, but it is not this block any more.
+               (let* ((fork-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                :initial-element 200))
+                      (fork (bitcoin-lisp.storage:make-block-index-entry
+                             :hash fork-hash :height 2 :chain-work 30
+                             :status :valid)))
+                 (bitcoin-lisp.storage:add-block-index-entry cs fork)
+                 (bitcoin-lisp.storage:txindex-set-best-block txindex fork-hash)
+                 (is (= 0 (bitcoin-lisp.storage::%txindex-resume-height txindex cs))
+                     "an off-chain marker must force a full rescan")))
+          (bitcoin-lisp.storage:close-tx-index txindex))))))
+
 (test ga9-txindex-catch-up-is-idempotent
   "The catch-up runs unconditionally at every startup, so it must write nothing
 when the index is already current — %txindex-block-indexed-p checks the block's
