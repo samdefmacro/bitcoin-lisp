@@ -536,3 +536,167 @@ or NIL when the history cannot support an answer."
                                              :conservative conservative)))
         (when (plusp per-kvb)
           (/ per-kvb 1000))))))
+
+;;;; --- Persistence (Core CBlockPolicyEstimator::Write / Read) ---
+;;;;
+;;;; The layout is ours, not Core's: this file is read by nothing but this node,
+;;;; so there is no interop requirement to pay for, and our fee_estimates.dat
+;;;; already carries a CRC32 that Core's does not. What IS copied from Core is
+;;;; the part that matters — WHICH state is durable, and the discipline on load.
+;;;;
+;;;; Everything is read into temporaries and swapped in only once every check
+;;;; has passed (Core: "so existing data structures aren't corrupted if there is
+;;;; an exception"). A half-loaded estimator would answer with confidence from
+;;;; nonsense, and fee estimates are spent money.
+;;;;
+;;;; The unconfirmed-transaction counters are deliberately NOT stored. They
+;;;; describe transactions this process was watching; after a restart the
+;;;; mempool is reloaded and re-reported, so persisting them would double-count.
+
+(defun %write-double-le (stream d)
+  "A double-float as its 8 IEEE-754 bytes, little-endian."
+  (let ((u (ldb (byte 64 0) (sb-kernel:double-float-bits (float d 1d0)))))
+    (dotimes (i 8)
+      (write-byte (ldb (byte 8 (* 8 i)) u) stream))))
+
+(defun %read-double-le (stream)
+  (let ((u 0))
+    (dotimes (i 8)
+      (setf u (logior u (ash (read-byte stream) (* 8 i)))))
+    (let ((hi (ldb (byte 32 32) u))
+          (lo (ldb (byte 32 0) u)))
+      (sb-kernel:make-double-float
+       (if (>= hi #x80000000) (- hi #x100000000) hi)
+       lo))))
+
+(defun %write-double-vector (stream v)
+  (bitcoin-lisp.serialization:write-uint32-le stream (length v))
+  (loop for x across v do (%write-double-le stream x)))
+
+(defun %read-double-vector (stream expected-length)
+  "A double vector whose length must equal EXPECTED-LENGTH, or NIL when it does
+not — every per-bucket array in the file has to agree with the bucket set."
+  (let ((n (bitcoin-lisp.serialization:read-uint32-le stream)))
+    (unless (= n expected-length)
+      (return-from %read-double-vector nil))
+    (let ((v (make-array n :element-type 'double-float)))
+      (dotimes (i n v)
+        (setf (aref v i) (%read-double-le stream))))))
+
+(defun %write-tx-confirm-stats (stream stats)
+  (%write-double-le stream (tx-confirm-stats-decay stats))
+  (bitcoin-lisp.serialization:write-uint32-le stream (tx-confirm-stats-scale stats))
+  (%write-double-vector stream (tx-confirm-stats-feerate-avg stats))
+  (%write-double-vector stream (tx-confirm-stats-txct-avg stats))
+  (let ((conf (tx-confirm-stats-conf-avg stats))
+        (fail (tx-confirm-stats-fail-avg stats)))
+    (bitcoin-lisp.serialization:write-uint32-le stream (length conf))
+    (loop for row across conf do (%write-double-vector stream row))
+    (bitcoin-lisp.serialization:write-uint32-le stream (length fail))
+    (loop for row across fail do (%write-double-vector stream row))))
+
+(defun %read-tx-confirm-stats (stream buckets)
+  "One horizon, or NIL if anything about it fails Core's sanity checks
+(TxConfirmStats::Read). The caller discards the whole file on NIL."
+  (let* ((n-buckets (length buckets))
+         (decay (%read-double-le stream))
+         (scale (bitcoin-lisp.serialization:read-uint32-le stream)))
+    ;; Core: decay must be strictly inside (0,1), scale non-zero.
+    (when (or (<= decay 0d0) (>= decay 1d0) (zerop scale))
+      (return-from %read-tx-confirm-stats nil))
+    (let ((feerate-avg (%read-double-vector stream n-buckets)))
+      (unless feerate-avg (return-from %read-tx-confirm-stats nil))
+      (let ((txct-avg (%read-double-vector stream n-buckets)))
+        (unless txct-avg (return-from %read-tx-confirm-stats nil))
+        (let ((n-periods (bitcoin-lisp.serialization:read-uint32-le stream)))
+          ;; Core: between 1 and 1008 confirms (one week) may be tracked.
+          (let ((max-confirms (* scale n-periods)))
+            (when (or (zerop max-confirms) (> max-confirms (* 6 24 7)))
+              (return-from %read-tx-confirm-stats nil)))
+          (let ((conf (make-array n-periods)))
+            (dotimes (i n-periods)
+              (let ((row (%read-double-vector stream n-buckets)))
+                (unless row (return-from %read-tx-confirm-stats nil))
+                (setf (aref conf i) row)))
+            (let ((n-fail (bitcoin-lisp.serialization:read-uint32-le stream)))
+              (unless (= n-fail n-periods)
+                (return-from %read-tx-confirm-stats nil))
+              (let ((fail (make-array n-periods)))
+                (dotimes (i n-periods)
+                  (let ((row (%read-double-vector stream n-buckets)))
+                    (unless row (return-from %read-tx-confirm-stats nil))
+                    (setf (aref fail i) row)))
+                ;; The unconfirmed counters are per-run, not persisted: a fresh
+                ;; zeroed set, sized to this bucket count.
+                (let ((stats (make-tx-confirm-stats buckets n-periods decay scale)))
+                  (setf (tx-confirm-stats-feerate-avg stats) feerate-avg
+                        (tx-confirm-stats-txct-avg stats) txct-avg
+                        (tx-confirm-stats-conf-avg stats) conf
+                        (tx-confirm-stats-fail-avg stats) fail)
+                  stats)))))))))
+
+(defun bpe-write-to-stream (est stream)
+  "Serialize EST. Mirrors Core's choice of which block range to record: the
+live one while it is the longer, otherwise the range carried over from the
+file we loaded."
+  (bitcoin-lisp.serialization:write-uint32-le stream (block-policy-estimator-best-height est))
+  (if (> (%bpe-block-span est) (floor (%bpe-historical-block-span est) 2))
+      (progn
+        (bitcoin-lisp.serialization:write-uint32-le
+         stream (block-policy-estimator-first-recorded-height est))
+        (bitcoin-lisp.serialization:write-uint32-le
+         stream (block-policy-estimator-best-height est)))
+      (progn
+        (bitcoin-lisp.serialization:write-uint32-le
+         stream (block-policy-estimator-historical-first est))
+        (bitcoin-lisp.serialization:write-uint32-le
+         stream (block-policy-estimator-historical-best est))))
+  (%write-double-vector stream (block-policy-estimator-buckets est))
+  (%write-tx-confirm-stats stream (block-policy-estimator-med est))
+  (%write-tx-confirm-stats stream (block-policy-estimator-short est))
+  (%write-tx-confirm-stats stream (block-policy-estimator-long est))
+  t)
+
+(defun bpe-read-into (est stream)
+  "Load EST from STREAM, or return NIL and leave EST untouched.
+
+Nothing is installed until every horizon has parsed and every check has passed
+— a partially applied estimator would answer confidently from nonsense."
+  (handler-case
+      (let* ((best-height (bitcoin-lisp.serialization:read-uint32-le stream))
+             (hist-first (bitcoin-lisp.serialization:read-uint32-le stream))
+             (hist-best (bitcoin-lisp.serialization:read-uint32-le stream)))
+        ;; Core: the recorded range must be ordered and must not claim to run
+        ;; past the best height the file itself reports.
+        (when (or (> hist-first hist-best) (> hist-best best-height))
+          (return-from bpe-read-into nil))
+        (let ((n-buckets (bitcoin-lisp.serialization:read-uint32-le stream)))
+          ;; Core: between 2 and 1000 feerate buckets.
+          (when (or (< n-buckets 2) (> n-buckets 1000))
+            (return-from bpe-read-into nil))
+          (let ((buckets (make-array n-buckets)))
+            (dotimes (i n-buckets)
+              (setf (aref buckets i) (%read-double-le stream)))
+            ;; A file written against a different bucket set cannot be
+            ;; reinterpreted against this one -- every per-bucket count would
+            ;; silently mean something else. Discard rather than remap.
+            (unless (equalp buckets (make-fee-buckets))
+              (return-from bpe-read-into nil))
+            (let ((med (%read-tx-confirm-stats stream buckets)))
+              (unless med (return-from bpe-read-into nil))
+              (let ((short (%read-tx-confirm-stats stream buckets)))
+                (unless short (return-from bpe-read-into nil))
+                (let ((long (%read-tx-confirm-stats stream buckets)))
+                  (unless long (return-from bpe-read-into nil))
+                  ;; Everything parsed: install as one step.
+                  (setf (block-policy-estimator-buckets est) buckets
+                        (block-policy-estimator-med est) med
+                        (block-policy-estimator-short est) short
+                        (block-policy-estimator-long est) long
+                        (block-policy-estimator-best-height est) best-height
+                        (block-policy-estimator-historical-first est) hist-first
+                        (block-policy-estimator-historical-best est) hist-best
+                        (block-policy-estimator-first-recorded-height est) 0)
+                  (clrhash (block-policy-estimator-tracked est))
+                  t))))))
+    (error () nil)))

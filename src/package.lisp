@@ -977,6 +977,9 @@
    #:bpe-note-block
    #:bpe-smart-fee-sat-per-vb
    #:bpe-estimate-smart-fee
+   #:bpe-write-to-stream
+   #:bpe-read-into
+   #:*accept-stale-fee-estimates*
    ;; Fee estimation
    #:estimate-fee-rate))
 
