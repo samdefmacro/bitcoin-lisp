@@ -16,6 +16,21 @@
   "Weight reserved for the block header, tx-count varint, and coinbase before
 filling with mempool txs (Bitcoin Core DEFAULT_BLOCK_RESERVED_WEIGHT).")
 
+(defconstant +minimum-block-reserved-weight+ 2000
+  "Bitcoin Core MINIMUM_BLOCK_RESERVED_WEIGHT (policy.h:33): reserving less
+than this cannot fit a header plus a realistic coinbase, so Core refuses to
+start rather than hand out templates that cannot be completed.")
+
+(defparameter *block-reserved-weight* +block-reserved-weight+
+  "Effective -blockreservedweight. Space held back for the header and the
+coinbase the mining client will add (Core DEFAULT_BLOCK_RESERVED_WEIGHT).")
+
+(defparameter *block-max-weight* bitcoin-lisp.validation:+max-block-weight+
+  "Effective -blockmaxweight: the weight this node fills templates up to. Core
+defaults it to MAX_BLOCK_WEIGHT (policy.h:24) and refuses anything above it.
+SELECTION ONLY -- it never relaxes the consensus limit, which
++max-block-weight+ still enforces on every block we validate.")
+
 (defconstant +coinbase-reserved-sigops+ 400
   "Sigop cost reserved for the coinbase (Bitcoin Core
 coinbase_output_max_additional_sigops).")
@@ -59,7 +74,7 @@ weight/sigops totals already include the reserved coinbase allowance."
   (mintime 0)
   (transactions '())
   (total-fees 0)
-  (total-weight +block-reserved-weight+)
+  (total-weight *block-reserved-weight*)
   (total-sigops +coinbase-reserved-sigops+)
   (coinbase-value 0)
   (witness-commitment nil)
@@ -135,7 +150,7 @@ in block (topological) order, WEIGHT/SIGOPS including the coinbase reserve."
                     (bitcoin-lisp.mempool:mempool-graph mempool)))
           (min-feerate (bitcoin-lisp.mempool:make-feefrac *block-min-tx-fee-rate* 1000))
           (selected '())
-          (weight +block-reserved-weight+)
+          (weight *block-reserved-weight*)
           (sigops +coinbase-reserved-sigops+)
           (fees 0)
           (consecutive-failures 0))
@@ -166,7 +181,7 @@ in block (topological) order, WEIGHT/SIGOPS including the coinbase reserve."
                  ;; where ours uses the exact transaction weight (see
                  ;; assemble-block-template).
                  ((and (< (+ weight chunk-weight)
-                          bitcoin-lisp.validation:+max-block-weight+)
+                          *block-max-weight*)
                        (< (+ sigops chunk-sigops)
                           bitcoin-lisp.validation:+max-block-sigops-cost+)
                        (every (lambda (e)
@@ -185,7 +200,7 @@ in block (topological) order, WEIGHT/SIGOPS including the coinbase reserve."
                   (when (and (> (incf consecutive-failures)
                                 +max-consecutive-failures+)
                              (> (+ weight +block-full-enough-weight-delta+)
-                                bitcoin-lisp.validation:+max-block-weight+))
+                                *block-max-weight*))
                     (return)))))))
         (bitcoin-lisp.mempool:block-builder-finish builder))
       (values (nreverse selected) fees weight sigops))))

@@ -738,6 +738,7 @@
   (:export
    ;; Constants
    #:+default-max-mempool-bytes+
+   #:*max-mempool-bytes*
    #:+default-min-relay-fee-rate+
    #:+fee-history-size+
    #:+min-blocks-for-estimate+
@@ -1120,7 +1121,10 @@
    #:block-template-witness-commitment
    #:block-template-default-witness-commitment-script
    ;; constants
-   #:+block-reserved-weight+))
+   #:+block-reserved-weight+
+   #:+minimum-block-reserved-weight+
+   #:*block-reserved-weight*
+   #:*block-max-weight*))
 
 (defpackage #:bitcoin-lisp.networking
   (:use #:cl)
