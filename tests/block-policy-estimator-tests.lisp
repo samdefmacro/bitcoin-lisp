@@ -140,12 +140,12 @@ decides whether the cheap ones also confirm or sit unconfirmed forever."
                (dotimes (i per-block)
                  (let ((txid (%bpe-id 1 h i)))
                    (bitcoin-lisp.mempool::bpe-process-transaction e txid h fast-feerate)
-                   (push (cons txid fast-feerate) confirmed)))
+                   (push txid confirmed)))
                (dotimes (i per-block)
                  (let ((txid (%bpe-id 2 h i)))
                    (bitcoin-lisp.mempool::bpe-process-transaction e txid h slow-feerate)
                    (when confirm-slow
-                     (push (cons txid slow-feerate) confirmed))))
+                     (push txid confirmed))))
                (bitcoin-lisp.mempool::bpe-process-block e (1+ h) confirmed)))
     e))
 
@@ -205,7 +205,7 @@ bucket forever."
     (bitcoin-lisp.mempool::bpe-process-transaction e txid 1 5000d0)
     (is (= 1 (hash-table-count
               (bitcoin-lisp.mempool::block-policy-estimator-tracked e))))
-    (bitcoin-lisp.mempool::bpe-process-block e 2 (list (cons txid 5000d0)))
+    (bitcoin-lisp.mempool::bpe-process-block e 2 (list txid))
     (is (= 0 (hash-table-count
               (bitcoin-lisp.mempool::block-policy-estimator-tracked e))))))
 
@@ -217,3 +217,83 @@ decay step would run again and silently age all history by an extra block."
       (is (= 0 (bitcoin-lisp.mempool::bpe-process-block e height '())))
       (is (= 0 (bitcoin-lisp.mempool::bpe-process-block e (1- height) '())))
       (is (= height (bitcoin-lisp.mempool::block-policy-estimator-best-height e))))))
+
+;;;; --- The reporting seam must be CONNECTED ---
+;;;;
+;;;; The estimator being correct is worth nothing if the mempool and
+;;;; connect-block never tell it anything. These drive the REAL code paths with
+;;;; a live estimator bound, and require the data to arrive.
+
+(test mempool-acceptance-reports-to-the-fee-estimator
+  "accept-validated-tx must report the entry. Without this the estimator sees
+no transactions at all and every estimate is 0 forever."
+  (let* ((bitcoin-lisp.mempool:*block-policy-estimator*
+           (bitcoin-lisp.mempool:make-block-policy-estimator))
+         (est bitcoin-lisp.mempool:*block-policy-estimator*)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 120))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+    (is (= 0 (hash-table-count
+              (bitcoin-lisp.mempool::block-policy-estimator-tracked est))))
+    (bitcoin-lisp.mempool:accept-validated-tx mempool txid tx 5000 200)
+    (is (= 1 (hash-table-count
+              (bitcoin-lisp.mempool::block-policy-estimator-tracked est)))
+        "the mempool must report acceptances to the estimator")
+    ;; It recorded the ENTRY HEIGHT, which is what a confirmation is measured
+    ;; against.
+    (is (= 200 (first (gethash txid (bitcoin-lisp.mempool::block-policy-estimator-tracked est)))))))
+
+(test mempool-eviction-reports-a-failure-but-confirmation-does-not
+  "A removal that is not a confirmation is a FAILURE at that feerate. A
+confirmation must NOT be reported from the removal path: the block hook records
+it and untracks in one step, so reporting here first would untrack it before
+the confirmation was recorded — silently discarding the data point."
+  (let* ((bitcoin-lisp.mempool:*block-policy-estimator*
+           (bitcoin-lisp.mempool:make-block-policy-estimator))
+         (est bitcoin-lisp.mempool:*block-policy-estimator*)
+         (mempool (bitcoin-lisp.mempool:make-mempool))
+         (tx (make-mempool-test-tx :input-id 121))
+         (txid (bitcoin-lisp.serialization:transaction-hash tx))
+         (tracked (bitcoin-lisp.mempool::block-policy-estimator-tracked est)))
+    ;; Evicted for size: untracked, and a failure is recorded.
+    (bitcoin-lisp.mempool:accept-validated-tx mempool txid tx 5000 200)
+    (setf (bitcoin-lisp.mempool::block-policy-estimator-best-height est) 260)
+    (let ((bitcoin-lisp.mempool::*mempool-removal-reason* :size-limit))
+      (bitcoin-lisp.mempool::mempool-remove mempool txid))
+    (is (= 0 (hash-table-count tracked)))
+    ;; Removed BY A BLOCK: the removal path leaves it alone.
+    (let ((tx2 (make-mempool-test-tx :input-id 122)))
+      (let ((txid2 (bitcoin-lisp.serialization:transaction-hash tx2)))
+        (bitcoin-lisp.mempool:accept-validated-tx mempool txid2 tx2 5000 200)
+        (is (= 1 (hash-table-count tracked)))
+        (let ((bitcoin-lisp.mempool::*mempool-removal-reason* :block))
+          (bitcoin-lisp.mempool::mempool-remove mempool txid2))
+        (is (= 1 (hash-table-count tracked))
+            "a block removal must leave the estimator's tracking to the block hook")))))
+
+(test connect-block-reports-confirmations-to-the-fee-estimator
+  "connect-block must call the block hook, and it must run while the block's
+transactions are still tracked. Drives the real connect-block."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "bpe-connect")
+     (let* ((bitcoin-lisp.mempool:*block-policy-estimator*
+              (bitcoin-lisp.mempool:make-block-policy-estimator))
+            (est bitcoin-lisp.mempool:*block-policy-estimator*)
+            (block1 (make-reorg-test-block genesis-hash
+                                           (first (make-test-chain-hashes #xC0 1)) 1))
+            (coinbase (first (bitcoin-lisp.serialization:bitcoin-block-transactions block1)))
+            (cb-txid (bitcoin-lisp.serialization:transaction-hash coinbase)))
+       ;; Pretend the coinbase was a tracked mempool transaction entered at
+       ;; height 0, so the block at height 1 is a 1-block confirmation.
+       (bitcoin-lisp.mempool::bpe-process-transaction est cb-txid 0 9000d0)
+       (is (= 1 (hash-table-count
+                 (bitcoin-lisp.mempool::block-policy-estimator-tracked est))))
+       (bitcoin-lisp.validation:connect-block block1 chain-state block-store utxo-set)
+       ;; The hook ran: best height moved and the transaction was untracked by
+       ;; the confirmation, not merely dropped.
+       (is (= 1 (bitcoin-lisp.mempool::block-policy-estimator-best-height est))
+           "connect-block must report the block to the estimator")
+       (is (= 0 (hash-table-count
+                 (bitcoin-lisp.mempool::block-policy-estimator-tracked est)))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))

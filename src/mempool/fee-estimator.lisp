@@ -292,6 +292,17 @@ Conservative mode uses higher percentiles for more reliable confirmation."
 MODE is :conservative (default) or :economical.
 Returns (values fee-rate-estimate error-message).
 Fee rate is in sat/vB."
+  ;; Core's CBlockPolicyEstimator answers first when it has the history for
+  ;; this target: it knows which feerates FAILED to confirm, which a percentile
+  ;; of what miners took cannot express. The percentile heuristic below remains
+  ;; as the fallback for a node whose estimator has not accumulated enough
+  ;; observations yet -- Core has no such fallback because it has always had
+  ;; the real estimator.
+  (let ((core-estimate (bpe-smart-fee-sat-per-vb
+                        conf-target :conservative (eq mode :conservative))))
+    (when (and core-estimate (plusp core-estimate))
+      (return-from estimate-fee-rate (values core-estimate nil))))
+
   (unless (fee-estimator-ready-p estimator)
     (return-from estimate-fee-rate
       (values 1 "Insufficient data for fee estimation")))

@@ -847,8 +847,15 @@ RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
       (mempool-remove-recursive mempool rt)))
   (let ((entry (make-entry-from-tx tx (or fee 0) height
                                    :sigops sigops :entry-time entry-time)))
-    (values (mempool-add mempool txid entry :defer-trim defer-trim)
-            entry)))
+    (let ((result (mempool-add mempool txid entry :defer-trim defer-trim)))
+      ;; Fee estimation tracks a transaction from mempool ENTRY, so it can
+      ;; later say how long that feerate waited (Core's validation interface
+      ;; delivers TransactionAddedToMempool for the same purpose). Only a tx
+      ;; that actually entered counts.
+      (when (eq result :ok)
+        (bpe-note-entry txid (mempool-entry-fee entry)
+                        (mempool-entry-vsize entry) height))
+      (values result entry))))
 
 (defvar *mempool-removal-reason* nil
   "The MemPoolRemovalReason of the removal in progress, bound by each removal
@@ -986,6 +993,15 @@ grandparents connected - disagreeing with the severed BFS links, which the
 shadow checks report as divergence."
   (let ((entry (gethash txid (mempool-entries mempool))))
     (when entry
+      ;; Fee estimation: every removal EXCEPT a confirmation is a failure at
+      ;; this transaction's feerate — the signal that pushes estimates up.
+      ;; Confirmations are deliberately NOT reported here: the block hook
+      ;; records how long each transaction waited and untracks it in the same
+      ;; step, and reporting from here first would untrack it before that,
+      ;; silently discarding the confirmation. Core splits it the same way —
+      ;; removeForBlock does not notify the estimator; processBlock does.
+      (unless (eq *mempool-removal-reason* :block)
+        (bpe-note-removal txid :in-block nil))
       ;; Remove spent outpoint entries
       (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs
                       (mempool-entry-transaction entry)))
