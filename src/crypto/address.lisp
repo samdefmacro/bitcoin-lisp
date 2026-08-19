@@ -214,6 +214,15 @@ VARIANT is :bech32 or :bech32m."
   "Decode a Bech32/Bech32m string.
 Returns (VALUES hrp data variant) or NIL if invalid.
 DATA is a list of 5-bit values (excluding checksum)."
+  ;; Every character must be printable US-ASCII: BIP173 restricts the whole
+  ;; string to [33,126] (Core bech32::Decode rejects c < 33 || c > 126). The
+  ;; data part is implicitly covered by the charset lookup below, but the HRP
+  ;; is not -- without this, a space, DEL or any high byte in the HRP sails
+  ;; through and " 1nwldj5" decodes as a valid bech32 string.
+  (when (some (lambda (c) (let ((code (char-code c)))
+                            (or (< code 33) (> code 126))))
+              str)
+    (return-from bech32-decode nil))
   ;; Check for mixed case
   (when (and (some #'lower-case-p str) (some #'upper-case-p str))
     (return-from bech32-decode nil))
