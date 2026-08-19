@@ -307,21 +307,91 @@ LEVEL can be :debug, :info, :warn, or :error."
   (setf *log-stream* nil)
   t)
 
+(defvar *log-file-path* nil
+  "Path the file log is currently open on, so SIGHUP can reopen it.")
+
+(defconstant +recent-log-history-bytes+ 10000000
+  "Core ShrinkDebugFile's RECENT_DEBUG_HISTORY_SIZE (logging.cpp): the tail
+kept when the log file is scrolled at startup.")
+
+(defun shrink-log-file (path)
+  "Core's ShrinkDebugFile (logging.cpp): when the log at PATH has grown more
+than 10% past RECENT_DEBUG_HISTORY_SIZE, restart the file holding only its last
+RECENT_DEBUG_HISTORY_SIZE bytes. Returns T if it scrolled the file.
+
+Runs BEFORE the file is opened for append, so nothing is writing to it while it
+is rewritten. Note what this does and does not solve: it bounds the log across
+restarts, not within one run — a node that stays up for weeks still grows an
+unbounded file. Core's answer to that is the SIGHUP reopen below plus an
+external logrotate, and ours is the same."
+  (handler-case
+      (let ((size (with-open-file (s path :direction :input
+                                          :element-type (quote (unsigned-byte 8))
+                                          :if-does-not-exist nil)
+                    (and s (file-length s)))))
+        (when (and size (> size (* 11 (floor +recent-log-history-bytes+ 10))))
+          (let ((tail (make-array +recent-log-history-bytes+
+                                  :element-type (quote (unsigned-byte 8)))))
+            (with-open-file (s path :direction :input
+                                    :element-type (quote (unsigned-byte 8)))
+              (file-position s (- size +recent-log-history-bytes+))
+              (let ((n (read-sequence tail s)))
+                (with-open-file (out path :direction :output
+                                          :element-type (quote (unsigned-byte 8))
+                                          :if-exists :supersede
+                                          :if-does-not-exist :create)
+                  (write-sequence tail out :end n))))
+            t)))
+    ;; A log we cannot scroll is not a reason to refuse to start.
+    (error (e)
+      (format *error-output* "WARNING: could not shrink log file ~A: ~A~%" path e)
+      nil)))
+
 (defun start-file-logging (path)
-  "Start logging to a file at PATH."
+  "Start logging to a file at PATH, scrolling it first if it has grown past
+Core's threshold."
   (when *log-file-stream*
     (close *log-file-stream*))
+  (shrink-log-file path)
+  (setf *log-file-path* path)
   (setf *log-file-stream* (open path :direction :output
                                      :if-exists :append
                                      :if-does-not-exist :create))
   (format t "Logging to file: ~A~%" path)
   path)
 
+(defun reopen-log-file ()
+  "Close and reopen the log file at its current path (Core's SIGHUP handler,
+which exists so an external logrotate can move the file and have the node
+start writing to a fresh one). Without this, the node keeps writing to the
+renamed inode and the rotated file grows forever while the new one stays
+empty."
+  (when *log-file-path*
+    (when *log-file-stream*
+      (ignore-errors (close *log-file-stream*)))
+    (setf *log-file-stream*
+          (open *log-file-path* :direction :output
+                                :if-exists :append
+                                :if-does-not-exist :create))
+    t))
+
+(defun install-sighup-log-reopen ()
+  "Wire SIGHUP to REOPEN-LOG-FILE, the way Core does for logrotate."
+  #+sbcl
+  (ignore-errors
+   (sb-sys:enable-interrupt
+    sb-unix:sighup
+    (lambda (&rest ignored)
+      (declare (ignore ignored))
+      (ignore-errors (reopen-log-file))))
+   t))
+
 (defun stop-file-logging ()
   "Stop logging to file."
   (when *log-file-stream*
     (close *log-file-stream*)
     (setf *log-file-stream* nil))
+  (setf *log-file-path* nil)
   t)
 
 ;;;; Genesis block headers
@@ -1782,6 +1852,52 @@ node into shutdown."
             (>= (* avail-kb 1024) (+ 52428800 additional-bytes))))
     (error () t)))
 
+(defvar *data-directory-lock-fd* nil
+  "Open file descriptor holding the exclusive advisory lock on the data
+directory's .lock file. Held for the lifetime of the process: closing it
+releases the lock and lets a second node open the same directory.")
+
+(defconstant +flock-ex-nb+ 6
+  "flock(2) LOCK_EX (2) | LOCK_NB (4) — take an exclusive lock, or fail
+immediately rather than waiting for the holder to exit.")
+
+(defun lock-data-directory (directory)
+  "Take Core's exclusive .lock on DIRECTORY (init.cpp:1158 -> util/fs_helpers.cpp:47).
+Signals an error if another process already holds it.
+
+Two nodes sharing a data directory destroy it: each keeps its own in-memory
+block index and UTXO cache and flushes over the other's files, so the loser is
+not the second to start but whichever flushes last. The coins LevelDB takes its
+own lock, but only over that subdirectory and only once startup gets that far —
+by which point this node has already read, and may already have rewritten,
+chainstate.dat and headerindex.dat.
+
+Advisory-only, like Core's: it stops a second bitcoin-lisp, not an unrelated
+process editing the files."
+  (let* ((path (merge-pathnames ".lock" directory))
+         (fd (handler-case
+                 (sb-posix:open (namestring path)
+                                (logior sb-posix:o-creat sb-posix:o-rdwr)
+                                #o644)
+               (error (e)
+                 (error "Cannot create the lock file at ~A: ~A" path e)))))
+    (when (minusp (cffi:foreign-funcall "flock" :int fd :int +flock-ex-nb+ :int))
+      (ignore-errors (sb-posix:close fd))
+      (log-error "Cannot obtain a lock on data directory ~A." directory)
+      (log-error "Another bitcoin-lisp node is probably already running on it.")
+      (error "Cannot obtain a lock on data directory ~A; another node is probably already running"
+             directory))
+    ;; Keep the descriptor open. UNWIND from here on must not close it.
+    (setf *data-directory-lock-fd* fd)))
+
+(defun unlock-data-directory ()
+  "Release the data-directory lock, if this process holds it. The .lock file
+itself stays behind, as Core leaves it — its presence means nothing, only the
+advisory lock on it does."
+  (when *data-directory-lock-fd*
+    (ignore-errors (sb-posix:close *data-directory-lock-fd*))
+    (setf *data-directory-lock-fd* nil)))
+
 (defun %abort-on-low-disk-space (label)
   "Log + request shutdown once when free disk space is below the floor
 (Core FlushStateToDisk's CheckDiskSpace failure -> FatalError \"Disk space
@@ -1997,6 +2113,13 @@ Returns the node instance."
   (log-info "Network: ~A" network)
   (log-info "Data directory: ~A" (node-data-directory *node*))
 
+  ;; Claim the directory before anything reads or writes it (Core locks the
+  ;; datadir and the blocks dir in AppInitMain, init.cpp:1172).
+  (lock-data-directory (node-data-directory *node*))
+
+  ;; SIGHUP reopens the log file, so an external logrotate can move it.
+  (install-sighup-log-reopen)
+
   ;; Set prune-after-height for this network
   (setf *prune-after-height* (prune-after-height network))
 
@@ -2095,12 +2218,29 @@ Returns the node instance."
        (bitcoin-lisp.storage:chain-state-coins-view primary))
       (log-info "UTXO cache opened (base: ~A)" chainstate-path)))
 
-  ;; Load persisted header index if available
-  (when (bitcoin-lisp.storage:load-header-index (node-chain-state *node*))
-    (log-info "Loaded persisted header index: ~D entries"
-              (hash-table-count
-               (bitcoin-lisp.storage::chain-state-block-index
-                (node-chain-state *node*)))))
+  ;; Load persisted header index if available.
+  (multiple-value-bind (loaded corrupt-reason)
+      (bitcoin-lisp.storage:load-header-index (node-chain-state *node*))
+    (cond
+      (loaded
+       (log-info "Loaded persisted header index: ~D entries"
+                 (hash-table-count
+                  (bitcoin-lisp.storage::chain-state-block-index
+                   (node-chain-state *node*)))))
+      ;; A file IS there but did not validate. Starting anyway would leave us
+      ;; with an EMPTY block index while chainstate.dat still names a tip: the
+      ;; node would claim a height it has no headers for, re-request the whole
+      ;; header chain, and on a pruned node could never rebuild the entries
+      ;; below the prune horizon from disk. Refuse, exactly as the corrupt
+      ;; chainstate.dat branch above does, and as Core's "Error loading block
+      ;; database" does for a CBlockTreeDB it cannot read (init.cpp).
+      (corrupt-reason
+       (log-error "headerindex.dat is present but unreadable: ~A." corrupt-reason)
+       (log-error "Refusing to start: an empty block index would contradict the stored chainstate.")
+       (log-error "Recover by restoring a backup of headerindex.dat, or reindex from the block files.")
+       (error "Corrupt headerindex.dat at ~A" (node-data-directory *node*)))
+      ;; No file at all — a legitimate first run.
+      (t nil)))
 
   ;; Ensure genesis block is in the index with a proper header
   ;; (needed for difficulty walk-back on testnet)
@@ -3520,6 +3660,10 @@ thread; see the shutdown-coordination section above."
 
   ;; Cleanup secp256k1
   (bitcoin-lisp.crypto:cleanup-secp256k1)
+
+  ;; Release the data-directory lock last: everything above may still touch
+  ;; the directory, and a successor node must not open it until they are done.
+  (unlock-data-directory)
 
   (log-info "Node stopped")
 

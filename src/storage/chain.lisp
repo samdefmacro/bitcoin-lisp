@@ -913,23 +913,37 @@ Atomic temp + fsync + rename via save-file-with-crc32-bb."
 
 (defun load-header-index (state)
   "Load the block index from a binary file with integrity verification.
-Returns T if loaded, NIL if no file exists or file is corrupted."
+
+Returns (values T NIL) on success, (values NIL NIL) when there is simply no
+file — a legitimate first run — and (values NIL REASON) when a file IS present
+but cannot be trusted, REASON being a human-readable description.
+
+The caller MUST refuse to start on that third case. Continuing with an empty
+index while chainstate.dat still names a tip leaves the node claiming a height
+it holds no headers for, which on a pruned node cannot be rebuilt from disk at
+all. Core treats a CBlockTreeDB it cannot load the same way: a fatal \"Error
+loading block database\" rather than an empty index (init.cpp)."
   (let ((path (header-index-file-path state)))
     (unless (probe-file path)
-      (return-from load-header-index nil))
-    ;; Read entire file
-    (let ((file-bytes (with-open-file (stream path
-                                              :direction :input
-                                              :element-type '(unsigned-byte 8))
-                        (let ((bytes (make-array (file-length stream)
-                                                 :element-type '(unsigned-byte 8))))
-                          (read-sequence bytes stream)
-                          bytes))))
-      ;; Detect format: new format starts with magic "HIDX"
-      (if (and (>= (length file-bytes) 4)
-               (equalp (subseq file-bytes 0 4) *header-index-magic*))
-          (load-header-index-v1 state file-bytes)
-          (load-header-index-legacy state file-bytes)))))
+      (return-from load-header-index (values nil nil)))
+    (handler-case
+        ;; Read entire file
+        (let ((file-bytes (with-open-file (stream path
+                                                  :direction :input
+                                                  :element-type '(unsigned-byte 8))
+                            (let ((bytes (make-array (file-length stream)
+                                                     :element-type '(unsigned-byte 8))))
+                              (read-sequence bytes stream)
+                              bytes))))
+          ;; Detect format: new format starts with magic "HIDX"
+          (if (and (>= (length file-bytes) 4)
+                   (equalp (subseq file-bytes 0 4) *header-index-magic*))
+              (load-header-index-v1 state file-bytes)
+              (load-header-index-legacy state file-bytes)))
+      ;; A truncated legacy file (no checksum to catch it) runs the entry
+      ;; reader off the end. That is corruption, not absence.
+      (error (e)
+        (values nil (format nil "unreadable (~A)" e))))))
 
 (defun load-header-index-legacy (state file-bytes)
   "Load header index from old format (no magic, no checksum)."
@@ -944,19 +958,20 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
   t)
 
 (defun load-header-index-v1 (state file-bytes)
-  "Load header index from v1 format with integrity checks."
+  "Load header index from v1 format with integrity checks. Returns
+(values T NIL) or (values NIL REASON), as LOAD-HEADER-INDEX documents."
   ;; Need at least magic(4) + version(4) + count(4) + crc(4) = 16
   (when (< (length file-bytes) 16)
-    (format *error-output* "WARNING: Header index file too short~%")
-    (return-from load-header-index-v1 nil))
+    (return-from load-header-index-v1
+      (values nil (format nil "file too short (~D bytes)" (length file-bytes)))))
   ;; Verify CRC32
   (let* ((data-len (- (length file-bytes) 4))
          (data-bytes (subseq file-bytes 0 data-len))
          (stored-crc (subseq file-bytes data-len))
          (computed-crc (compute-crc32 data-bytes)))
     (unless (equalp stored-crc computed-crc)
-      (format *error-output* "WARNING: Header index CRC32 mismatch - file corrupted~%")
-      (return-from load-header-index-v1 nil)))
+      (return-from load-header-index-v1
+        (values nil "CRC32 mismatch"))))
   ;; Parse data
   (flexi-streams:with-input-from-sequence (stream file-bytes)
     ;; Skip magic
@@ -966,9 +981,9 @@ Returns T if loaded, NIL if no file exists or file is corrupted."
     ;; backfilled lazily); v2 includes it.
     (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
       (unless (member version '(1 2))
-        (format *error-output* "WARNING: Header index version ~D not supported (expected <= ~D)~%"
-                version +header-index-format-version+)
-        (return-from load-header-index-v1 nil))
+        (return-from load-header-index-v1
+          (values nil (format nil "unsupported format version ~D (this build writes ~D)"
+                              version +header-index-format-version+))))
       ;; Read entries
       (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
             (entries-by-hash (make-hash-table :test 'equalp))
