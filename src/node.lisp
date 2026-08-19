@@ -2260,7 +2260,13 @@ Returns the node instance."
                                  (bitcoin-lisp.serialization:block-header-merkle-root
                                   genesis-header))))
             (setf (bitcoin-lisp.storage:block-index-entry-header genesis-entry)
-                  genesis-header)))
+                  genesis-header)
+            ;; This REPLACES a header object on an entry that already exists,
+            ;; the one mutation the packed change-detector behind the header
+            ;; index delta log cannot see (it tracks presence, not identity).
+            ;; Force a full snapshot so the corrected genesis actually lands.
+            (bitcoin-lisp.storage:save-header-index
+             (node-chain-state *node*) :force-full t)))
         ;; Create new genesis entry
         (bitcoin-lisp.storage:add-block-index-entry
          (node-chain-state *node*)
@@ -3015,7 +3021,7 @@ window where a crash must be detected at the next startup. Production leaves
 it NIL; crash-safety tests bind it to observe the on-disk marker or abort
 (via THROW) to simulate a crash at the most dangerous point.")
 
-(defun %flush-chainstate (chainstate &key (label "Periodic"))
+(defun %flush-chainstate (chainstate &key (label "Periodic") force-full-header-index)
   "Synchronously flush one CHAINSTATE (its state file, its coins view, and
 the shared header index) with 3-phase commit (mirrors Bitcoin Core's
 DB_HEAD_BLOCKS marker pattern in txdb.cpp::CCoinsViewDB::BatchWrite).
@@ -3052,7 +3058,12 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
         ;; Phase 1: mark the chainstate as in-transition.
         (when chainstate
           (bitcoin-lisp.storage:save-state chainstate :in-transition t)
-          (bitcoin-lisp.storage:save-header-index chainstate))
+          ;; A shutdown writes the FULL header index rather than a delta: it
+          ;; is the one moment we can guarantee the on-disk snapshot matches
+          ;; memory exactly, which bounds any drift the packed change-detector
+          ;; could not see (a replaced header object on an existing entry).
+          (bitcoin-lisp.storage:save-header-index
+           chainstate :force-full force-full-header-index))
         (when *flush-mid-commit-hook*
           (funcall *flush-mid-commit-hook* chainstate))
         ;; Phase 2: flush cache → LevelDB. Per-flush work is proportional
@@ -3497,7 +3508,7 @@ Phase 1."
     (log-info "Flushing chain state~@[ (~A)~]..."
               (let ((suffix (bitcoin-lisp.storage:chain-state-storage-suffix cs)))
                 (and (plusp (length suffix)) suffix)))
-    (%flush-chainstate cs :label "Shutdown")
+    (%flush-chainstate cs :label "Shutdown" :force-full-header-index t)
     (bitcoin-lisp.storage:close-chainstate-coins-view cs)))
 
 (defun stop-node ()

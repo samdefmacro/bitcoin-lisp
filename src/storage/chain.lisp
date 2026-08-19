@@ -18,7 +18,12 @@
   ;; Number of transactions in this block (Bitcoin Core nTx). 0 = unknown —
   ;; header-only entries, or an index persisted before this field existed
   ;; (backfilled lazily from the block store by getchaintxstats).
-  (tx-count 0 :type (unsigned-byte 32)))
+  (tx-count 0 :type (unsigned-byte 32))
+  ;; Packed image of the MUTABLE fields as of the last time this entry was
+  ;; written to disk; 0 = never written. Comparing it against the entry's
+  ;; current packing is what lets a flush write only what changed, instead of
+  ;; rewriting the whole index. See %ENTRY-PERSIST-KEY.
+  (persisted-key 0 :type (unsigned-byte 64)))
 
 (defstruct chain-state
   "Current blockchain state. One chain-state per chainstate role (Bitcoin
@@ -27,6 +32,14 @@ fully-validated chainstate — but the slots below already carry the
 assumeutxo identity a snapshot chainstate (a future ActivateSnapshot)
 needs, so the node can hold several in a list and select between them."
   (block-index (make-hash-table :test 'equalp) :type hash-table)
+  ;; CRC32 of the header-index SNAPSHOT the current delta log is bound to, and
+  ;; how many entries that delta holds. The CRC is the snapshot's identity: a
+  ;; delta whose recorded CRC does not match the snapshot on disk was left by a
+  ;; crash between "write snapshot" and "remove delta", and replaying it would
+  ;; roll entries BACK to older statuses. Binding by CRC makes that impossible
+  ;; without adding a field to the snapshot format.
+  (header-index-snapshot-crc nil)
+  (header-index-delta-entries 0 :type (unsigned-byte 32))
   (best-block-hash nil)
   (best-height 0 :type (unsigned-byte 32))
   (genesis-hash nil)
@@ -829,6 +842,60 @@ v1 (36/40 bytes): no CRC — legacy fallback"
 v2 appends a per-entry tx-count (4 bytes); v1 files still load (tx-count 0,
 backfilled lazily from the block store).")
 
+(defvar *header-index-delta-magic*
+  (map '(vector (unsigned-byte 8)) #'char-code "HIDD")
+  "Magic bytes identifying a header index DELTA log.")
+
+(defconstant +header-index-delta-version+ 1
+  "Format version of the header index delta log.")
+
+(defconstant +header-index-entry-bytes+ 185
+  "Serialized size of one v2 header-index entry: hash(32) + height(4) +
+header(80) + chainwork(32) + status(1) + prev-hash(32) + tx-count(4).")
+
+(defun %entry-persist-key (entry)
+  "The MUTABLE state of ENTRY packed into one 64-bit integer, or 0 for an entry
+that has never been written.
+
+This is the change detector behind the delta log, and it is deliberately
+derived from the entry's CURRENT state rather than announced by whoever mutated
+it. Marking entries dirty at each of the ~15 setf sites would be miss-prone in
+the worst direction: a missed status mark means a block marked :invalid quietly
+reverts to :valid on the next restart.
+
+hash and chain-work never change after creation. header and prev-entry are
+set-once (NIL -> object), which the two presence bits catch; the one place an
+existing header is REPLACED is the genesis fix-up at startup, which forces a
+full snapshot rather than relying on this key."
+  (logior 1
+          (ash (ecase (block-index-entry-status entry)
+                 (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3))
+               1)
+          (ash (if (block-index-entry-header entry) 1 0) 3)
+          (ash (if (block-index-entry-prev-entry entry) 1 0) 4)
+          (ash (block-index-entry-height entry) 5)
+          ;; 27 bits is ~134M transactions in one block — unreachable, and the
+          ;; clamp keeps a corrupt value from overflowing into the height bits.
+          (ash (min (block-index-entry-tx-count entry) #x7FFFFFF) 37)))
+
+(defun header-index-delta-path (state)
+  "Path to the header index delta log."
+  (merge-pathnames "headerindex.delta" (chain-state-base-path state)))
+
+(defun %file-trailing-crc (path)
+  "The last 4 bytes of PATH — for a save-file-with-crc32 file, its CRC32, which
+serves as the file's identity. NIL if unreadable."
+  (handler-case
+      (with-open-file (s path :direction :input
+                              :element-type '(unsigned-byte 8)
+                              :if-does-not-exist nil)
+        (when (and s (>= (file-length s) 4))
+          (file-position s (- (file-length s) 4))
+          (let ((b (make-array 4 :element-type '(unsigned-byte 8))))
+            (read-sequence b s)
+            b)))
+    (error () nil)))
+
 (defun header-index-file-path (state)
   "Get the path to the header index file."
   (merge-pathnames "headerindex.dat" (chain-state-base-path state)))
@@ -893,10 +960,12 @@ hash(32) + height(4) + header(80) + chainwork(32) + status(1) + prev-hash(32)
         (loop repeat 32 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))))
   (bitcoin-lisp.serialization:bb-write-u32-le bb (block-index-entry-tx-count entry)))
 
-(defun save-header-index (state)
-  "Save the block index to a binary file with integrity checks.
-Format: magic(4) + version(4) + count(4) + entries + CRC32(4).
-Atomic temp + fsync + rename via save-file-with-crc32-bb."
+(defun %write-header-index-snapshot (state)
+  "Rewrite the whole index and drop any delta log. Returns T.
+
+Format: magic(4) + version(4) + count(4) + entries + CRC32(4), written atomic
+temp + fsync + rename. Marks every entry as persisted at its current state, and
+rebinds the (now empty) delta to the NEW snapshot's CRC."
   (let ((path (header-index-file-path state)))
     (bitcoin-lisp.storage:save-file-with-crc32-bb
      path
@@ -909,7 +978,178 @@ Atomic temp + fsync + rename via save-file-with-crc32-bb."
                   (declare (ignore hash))
                   (bb-write-single-header-entry bb entry))
                 (chain-state-block-index state))))
+    ;; Remove the old delta only AFTER the new snapshot is durable. A crash in
+    ;; between leaves a delta whose recorded CRC names the PREVIOUS snapshot,
+    ;; and the loader ignores it — replaying it would roll entries back.
+    (ignore-errors (delete-file (header-index-delta-path state)))
+    (maphash (lambda (hash entry)
+               (declare (ignore hash))
+               (setf (block-index-entry-persisted-key entry)
+                     (%entry-persist-key entry)))
+             (chain-state-block-index state))
+    (setf (chain-state-header-index-snapshot-crc state) (%file-trailing-crc path)
+          (chain-state-header-index-delta-entries state) 0)
     t))
+
+(defun %changed-header-index-entries (state)
+  "Entries whose persisted packing no longer matches their current one."
+  (let ((changed '()))
+    (maphash (lambda (hash entry)
+               (declare (ignore hash))
+               (unless (= (block-index-entry-persisted-key entry)
+                          (%entry-persist-key entry))
+                 (push entry changed)))
+             (chain-state-block-index state))
+    changed))
+
+(defun %append-header-index-delta (state entries)
+  "Append one CRC-framed batch of ENTRIES to the delta log. Returns T on
+success, NIL if the log could not be written (the caller then falls back to a
+full snapshot).
+
+Frame: count(4) + count*entry(185) + CRC32(4) over that payload. The loader
+stops at the first frame that is short or fails its CRC, which is exactly what
+a crash mid-append leaves behind."
+  (let* ((path (header-index-delta-path state))
+         (crc (chain-state-header-index-snapshot-crc state))
+         (fresh (not (probe-file path))))
+    (unless crc
+      (return-from %append-header-index-delta nil))
+    (handler-case
+        (let ((bb (bitcoin-lisp.serialization:make-byte-buf)))
+          ;; A brand-new log opens with the identity of the snapshot it extends.
+          (when fresh
+            (bitcoin-lisp.serialization:bb-write-bytes bb *header-index-delta-magic*)
+            (bitcoin-lisp.serialization:bb-write-u32-le bb +header-index-delta-version+)
+            (bitcoin-lisp.serialization:bb-write-bytes bb crc))
+          (let ((payload (bitcoin-lisp.serialization:make-byte-buf)))
+            (bitcoin-lisp.serialization:bb-write-u32-le payload (length entries))
+            (dolist (e entries)
+              (bb-write-single-header-entry payload e))
+            (let ((bytes (bitcoin-lisp.serialization:bb-finish payload)))
+              (bitcoin-lisp.serialization:bb-write-bytes bb bytes)
+              (bitcoin-lisp.serialization:bb-write-bytes
+               bb (bitcoin-lisp.storage:compute-crc32 bytes))))
+          (let ((all (bitcoin-lisp.serialization:bb-finish bb)))
+            (with-open-file (out path :direction :output
+                                      :element-type '(unsigned-byte 8)
+                                      :if-exists :append
+                                      :if-does-not-exist :create)
+              (write-sequence all out)
+              (finish-output out)
+              #+sbcl (ignore-errors
+                      (sb-posix:fsync (sb-sys:fd-stream-fd out)))))
+          (dolist (e entries)
+            (setf (block-index-entry-persisted-key e) (%entry-persist-key e)))
+          (incf (chain-state-header-index-delta-entries state) (length entries))
+          t)
+      (error () nil))))
+
+(defun %header-index-compaction-due-p (state pending)
+  "T when the delta has grown enough that a full rewrite is the cheaper choice.
+Bounded by a fraction of the index so the delta can never approach the size of
+the thing it is an optimisation over."
+  (let ((count (hash-table-count (chain-state-block-index state))))
+    (>= (+ (chain-state-header-index-delta-entries state) pending)
+        (max 20000 (floor count 16)))))
+
+(defun save-header-index (state &key force-full)
+  "Persist the block index.
+
+Writes only the entries that CHANGED since the last write, as a CRC-framed
+batch appended to a delta log beside the snapshot; the snapshot itself is
+rewritten only when the delta has grown past a fraction of the index, when
+there is no usable snapshot yet, or when FORCE-FULL is given (shutdown, and
+after any mutation the packed change-detector cannot see).
+
+This is the difference between writing ~185 bytes and ~178 MB per flush: the
+whole index was previously rewritten every time, inside without-interrupts on
+the sync thread, to persist typically one new entry — about 25 GB/day on
+mainnet, measured 2026-08-19."
+  (let ((path (header-index-file-path state)))
+    (when (or force-full
+              (null (chain-state-header-index-snapshot-crc state))
+              (not (probe-file path)))
+      (return-from save-header-index (%write-header-index-snapshot state)))
+    (let ((changed (%changed-header-index-entries state)))
+      (cond
+        ((null changed) t)
+        ((%header-index-compaction-due-p state (length changed))
+         (%write-header-index-snapshot state))
+        ((%append-header-index-delta state changed) t)
+        ;; The delta could not be written — fall back rather than silently
+        ;; leaving the change unpersisted.
+        (t (%write-header-index-snapshot state))))))
+
+(defun %replay-header-index-delta (state)
+  "Apply the delta log beside the snapshot, if it belongs to THIS snapshot.
+Returns the number of entries applied.
+
+A delta whose recorded CRC does not match the snapshot on disk was orphaned by
+a crash between writing a new snapshot and removing the old log; replaying it
+would roll entries BACK to older statuses, so it is discarded instead.
+
+Replay stops at the first frame that is short or fails its CRC — the ordinary
+shape of a crash mid-append — and keeps everything before it."
+  (let ((path (header-index-delta-path state))
+        (applied 0))
+    (unless (probe-file path)
+      (return-from %replay-header-index-delta 0))
+    (handler-case
+        (let ((bytes (with-open-file (in path :direction :input
+                                              :element-type '(unsigned-byte 8))
+                       (let ((b (make-array (file-length in)
+                                            :element-type '(unsigned-byte 8))))
+                         (read-sequence b in)
+                         b)))
+              (header-len 12))
+          (if (or (< (length bytes) header-len)
+                  (not (equalp (subseq bytes 0 4) *header-index-delta-magic*))
+                  (not (equalp (subseq bytes 8 12)
+                               (or (chain-state-header-index-snapshot-crc state)
+                                   #()))))
+              ;; Not ours — a stale log from a superseded snapshot.
+              (progn (ignore-errors (delete-file path)) 0)
+              (let ((pos header-len)
+                    (index (chain-state-block-index state))
+                    (prev-all (make-hash-table :test 'equalp)))
+                (loop
+                  (when (> (+ pos 4) (length bytes)) (return))
+                  (let* ((count (logior (aref bytes pos)
+                                        (ash (aref bytes (+ pos 1)) 8)
+                                        (ash (aref bytes (+ pos 2)) 16)
+                                        (ash (aref bytes (+ pos 3)) 24)))
+                         (payload-len (+ 4 (* count +header-index-entry-bytes+)))
+                         (frame-end (+ pos payload-len 4)))
+                    ;; Truncated tail: stop, keeping every complete frame.
+                    (when (or (zerop count) (> frame-end (length bytes)))
+                      (return))
+                    (let ((payload (subseq bytes pos (+ pos payload-len)))
+                          (crc (subseq bytes (+ pos payload-len) frame-end)))
+                      (unless (equalp crc (bitcoin-lisp.storage:compute-crc32 payload))
+                        (return))
+                      (let ((batch (make-hash-table :test 'equalp))
+                            (prevs (make-hash-table :test 'equalp)))
+                        (flexi-streams:with-input-from-sequence
+                            (stream (subseq payload 4))
+                          (dotimes (i count)
+                            (read-single-header-entry stream batch prevs t)))
+                        ;; Each record REPLACES the entry of that hash, so later
+                        ;; frames win: the log is last-writer-wins.
+                        (maphash (lambda (hash e)
+                                   (setf (gethash hash index) e)
+                                   (incf applied))
+                                 batch)
+                        (maphash (lambda (hash ph)
+                                   (setf (gethash hash prev-all) ph))
+                                 prevs)))
+                    (setf pos frame-end)))
+                ;; Re-link once, after every frame is in: a replayed entry must
+                ;; point at the real parent object, not at nothing.
+                (when (plusp applied)
+                  (link-header-entries index prev-all))
+                applied)))
+      (error () applied))))
 
 (defun load-header-index (state)
   "Load the block index from a binary file with integrity verification.
@@ -936,10 +1176,24 @@ loading block database\" rather than an empty index (init.cpp)."
                               (read-sequence bytes stream)
                               bytes))))
           ;; Detect format: new format starts with magic "HIDX"
-          (if (and (>= (length file-bytes) 4)
-                   (equalp (subseq file-bytes 0 4) *header-index-magic*))
-              (load-header-index-v1 state file-bytes)
-              (load-header-index-legacy state file-bytes)))
+          (multiple-value-bind (ok reason)
+              (if (and (>= (length file-bytes) 4)
+                       (equalp (subseq file-bytes 0 4) *header-index-magic*))
+                  (load-header-index-v1 state file-bytes)
+                  (load-header-index-legacy state file-bytes))
+            (when ok
+              ;; Bind the delta to this snapshot and replay whatever of it is
+              ;; intact, then take every entry as persisted at its loaded state.
+              (setf (chain-state-header-index-snapshot-crc state)
+                    (%file-trailing-crc path)
+                    (chain-state-header-index-delta-entries state) 0)
+              (%replay-header-index-delta state)
+              (maphash (lambda (h entry)
+                         (declare (ignore h))
+                         (setf (block-index-entry-persisted-key entry)
+                               (%entry-persist-key entry)))
+                       (chain-state-block-index state)))
+            (values ok reason)))
       ;; A truncated legacy file (no checksum to catch it) runs the entry
       ;; reader off the end. That is corruption, not absence.
       (error (e)

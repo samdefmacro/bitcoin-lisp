@@ -351,6 +351,159 @@ index and UTXO cache and flush over the other's files, so the damage is not
     ;; nothing, only the advisory lock on it does.
     (is-true (probe-file (merge-pathnames ".lock" dir)))))
 
+(defun %hidx-fixture (suffix)
+  "A chain-state on a private directory with no header-index files."
+  (let* ((dir (ensure-directories-exist
+               (merge-pathnames (format nil "test-hidx-~A/" suffix)
+                                (uiop:temporary-directory))))
+         (cs (bitcoin-lisp.storage:init-chain-state dir)))
+    (dolist (f (list (bitcoin-lisp.storage::header-index-file-path cs)
+                     (bitcoin-lisp.storage::header-index-delta-path cs)))
+      (when (probe-file f) (delete-file f)))
+    (values cs dir)))
+
+(defun %hidx-add (cs i status)
+  (let ((h (make-array 32 :element-type '(unsigned-byte 8) :initial-element i)))
+    (bitcoin-lisp.storage:add-block-index-entry
+     cs (bitcoin-lisp.storage:make-block-index-entry
+         :hash h :height i :chain-work (* i 10) :status status))
+    h))
+
+(defun %hidx-size (path)
+  (and (probe-file path)
+       (with-open-file (s path :element-type '(unsigned-byte 8)) (file-length s))))
+
+(test header-index-delta-avoids-rewriting-the-snapshot
+  "A flush must write only what CHANGED. The whole index used to be rewritten
+every time — 178 MB per flush on mainnet, measured 2026-08-19, to persist about
+one 185-byte entry."
+  (multiple-value-bind (cs) (%hidx-fixture "delta")
+    (let ((h1 (%hidx-add cs 1 :valid))
+          (h2 (%hidx-add cs 2 :header-valid))
+          (snap (bitcoin-lisp.storage::header-index-file-path cs))
+          (delta (bitcoin-lisp.storage::header-index-delta-path cs)))
+      (bitcoin-lisp.storage:save-header-index cs)
+      (let ((snap-size (%hidx-size snap)))
+        (is-true (plusp snap-size))
+        (is (null (%hidx-size delta)))
+        ;; Nothing changed: no delta is written at all.
+        (bitcoin-lisp.storage:save-header-index cs)
+        (is (null (%hidx-size delta)))
+        (is (= snap-size (%hidx-size snap)))
+        ;; One status change: a delta appears, the snapshot is untouched.
+        (setf (bitcoin-lisp.storage:block-index-entry-status
+               (bitcoin-lisp.storage:get-block-index-entry cs h2))
+              :valid)
+        (bitcoin-lisp.storage:save-header-index cs)
+        (is (= snap-size (%hidx-size snap)) "the snapshot must not be rewritten")
+        ;; header(12) + count(4) + one 185-byte entry + crc(4).
+        (is (= 205 (%hidx-size delta)))
+        ;; And it reloads to the mutated state.
+        (let ((cs2 (bitcoin-lisp.storage:init-chain-state
+                    (bitcoin-lisp.storage::chain-state-base-path cs))))
+          (is-true (bitcoin-lisp.storage:load-header-index cs2))
+          (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status
+                          (bitcoin-lisp.storage:get-block-index-entry cs2 h2))))
+          (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status
+                          (bitcoin-lisp.storage:get-block-index-entry cs2 h1))))
+          (is (= 2 (hash-table-count
+                    (bitcoin-lisp.storage::chain-state-block-index cs2)))))))))
+
+(test header-index-stale-delta-is-discarded-not-replayed
+  "A delta orphaned by a crash between 'write new snapshot' and 'remove old
+delta' must be IGNORED. Replaying it would roll entries BACK to older statuses
+— strictly worse than losing them, because a block downgraded from :invalid to
+:valid undoes an operator's invalidateblock."
+  (multiple-value-bind (cs) (%hidx-fixture "stale")
+    (let ((h (%hidx-add cs 1 :header-valid))
+          (delta (bitcoin-lisp.storage::header-index-delta-path cs)))
+      (bitcoin-lisp.storage:save-header-index cs)
+      ;; Produce a delta carrying the OLD status.
+      (setf (bitcoin-lisp.storage:block-index-entry-status
+             (bitcoin-lisp.storage:get-block-index-entry cs h))
+            :valid)
+      (bitcoin-lisp.storage:save-header-index cs)
+      (is-true (plusp (%hidx-size delta)))
+      (let ((orphan (alexandria:read-file-into-byte-vector delta)))
+        ;; Now the entry becomes :invalid and a FULL snapshot is written, which
+        ;; removes the delta — then the crash puts the old one back.
+        (setf (bitcoin-lisp.storage:block-index-entry-status
+               (bitcoin-lisp.storage:get-block-index-entry cs h))
+              :invalid)
+        (bitcoin-lisp.storage:save-header-index cs :force-full t)
+        (is (null (%hidx-size delta)))
+        (alexandria:write-byte-vector-into-file orphan delta :if-exists :supersede)
+        (let ((cs2 (bitcoin-lisp.storage:init-chain-state
+                    (bitcoin-lisp.storage::chain-state-base-path cs))))
+          (is-true (bitcoin-lisp.storage:load-header-index cs2))
+          ;; :invalid survived — the stale delta did NOT resurrect :valid.
+          (is (eq :invalid (bitcoin-lisp.storage:block-index-entry-status
+                            (bitcoin-lisp.storage:get-block-index-entry cs2 h)))))))))
+
+(test header-index-torn-delta-tail-keeps-complete-frames
+  "A crash mid-append leaves a short final frame. Replay must keep every
+complete frame before it and stop there, rather than rejecting the whole log."
+  (multiple-value-bind (cs) (%hidx-fixture "torn")
+    (let ((h1 (%hidx-add cs 1 :header-valid))
+          (h2 (%hidx-add cs 2 :header-valid))
+          (delta (bitcoin-lisp.storage::header-index-delta-path cs)))
+      (bitcoin-lisp.storage:save-header-index cs)
+      ;; Frame 1: h1 becomes :valid.
+      (setf (bitcoin-lisp.storage:block-index-entry-status
+             (bitcoin-lisp.storage:get-block-index-entry cs h1)) :valid)
+      (bitcoin-lisp.storage:save-header-index cs)
+      ;; Frame 2: h2 becomes :valid — then tear it.
+      (setf (bitcoin-lisp.storage:block-index-entry-status
+             (bitcoin-lisp.storage:get-block-index-entry cs h2)) :valid)
+      (bitcoin-lisp.storage:save-header-index cs)
+      (let ((full (alexandria:read-file-into-byte-vector delta)))
+        ;; CONTROL: intact, BOTH frames apply. Without this the test below
+        ;; could pass on a log that never applied frame 2 in the first place.
+        (let ((cs0 (bitcoin-lisp.storage:init-chain-state
+                    (bitcoin-lisp.storage::chain-state-base-path cs))))
+          (is-true (bitcoin-lisp.storage:load-header-index cs0))
+          (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status
+                          (bitcoin-lisp.storage:get-block-index-entry cs0 h1))))
+          (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status
+                          (bitcoin-lisp.storage:get-block-index-entry cs0 h2)))))
+        ;; Now tear the final frame.
+        (alexandria:write-byte-vector-into-file
+         (subseq full 0 (- (length full) 60)) delta :if-exists :supersede)
+        (let ((cs2 (bitcoin-lisp.storage:init-chain-state
+                    (bitcoin-lisp.storage::chain-state-base-path cs))))
+          (is-true (bitcoin-lisp.storage:load-header-index cs2))
+          ;; Frame 1 survived...
+          (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status
+                          (bitcoin-lisp.storage:get-block-index-entry cs2 h1))))
+          ;; ...frame 2 did not, and the entry keeps its snapshot state.
+          (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status
+                                 (bitcoin-lisp.storage:get-block-index-entry cs2 h2)))))))))
+
+(test header-index-compaction-folds-the-delta-back-in
+  "Once the delta has grown past its bound, the next flush rewrites the
+snapshot and drops the log, so the delta can never approach the size of the
+thing it optimises."
+  (multiple-value-bind (cs) (%hidx-fixture "compact")
+    (let ((hashes (loop for i from 1 to 40 collect (%hidx-add cs i :header-valid)))
+          (snap (bitcoin-lisp.storage::header-index-file-path cs))
+          (delta (bitcoin-lisp.storage::header-index-delta-path cs)))
+      (bitcoin-lisp.storage:save-header-index cs)
+      (let ((snap-size (%hidx-size snap)))
+        ;; The floor is 20000 entries, so drive compaction by forcing it
+        ;; directly and separately assert the predicate's shape.
+        (is-false (bitcoin-lisp.storage::%header-index-compaction-due-p cs 1))
+        (is-true (bitcoin-lisp.storage::%header-index-compaction-due-p cs 20000))
+        ;; A forced full write folds any delta back into the snapshot.
+        (setf (bitcoin-lisp.storage:block-index-entry-status
+               (bitcoin-lisp.storage:get-block-index-entry cs (first hashes)))
+              :valid)
+        (bitcoin-lisp.storage:save-header-index cs)
+        (is-true (plusp (%hidx-size delta)))
+        (bitcoin-lisp.storage:save-header-index cs :force-full t)
+        (is (null (%hidx-size delta)))
+        (is (= snap-size (%hidx-size snap)))
+        (is (zerop (bitcoin-lisp.storage::chain-state-header-index-delta-entries cs)))))))
+
 (test header-index-absent-is-not-corruption
   "No headerindex.dat at all is a legitimate first run: NIL loaded, and NO
 reason — the caller must not confuse it with a file it cannot read, or every
