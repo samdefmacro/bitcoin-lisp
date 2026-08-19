@@ -116,3 +116,104 @@ nobody can confirm look perfect for lack of evidence."
                          (mod 7 (length (bitcoin-lisp.mempool::tx-confirm-stats-unconf-txs s))))
                    bucket)))
     (is (= 1 (aref (bitcoin-lisp.mempool::tx-confirm-stats-old-unconf-txs s) bucket)))))
+
+;;;; --- The three-horizon estimator ---
+
+(defun %bpe-id (a b c)
+  "A distinct 32-byte txid from three small integers."
+  (let ((v (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref v 0) a
+          (aref v 1) (ldb (byte 8 0) b)
+          (aref v 2) (ldb (byte 8 8) b)
+          (aref v 3) (ldb (byte 8 0) c))
+    v))
+
+(defun %bpe-simulate (&key (blocks 60) (per-block 40)
+                        (fast-feerate 20000d0) (slow-feerate 800d0)
+                        confirm-slow)
+  "Run BLOCKS blocks. Each block, PER-BLOCK transactions at FAST-FEERATE enter
+and confirm in the next block, and PER-BLOCK at SLOW-FEERATE enter. CONFIRM-SLOW
+decides whether the cheap ones also confirm or sit unconfirmed forever."
+  (let ((e (bitcoin-lisp.mempool::make-block-policy-estimator)))
+    (loop for h from 1 to blocks
+          do (let ((confirmed '()))
+               (dotimes (i per-block)
+                 (let ((txid (%bpe-id 1 h i)))
+                   (bitcoin-lisp.mempool::bpe-process-transaction e txid h fast-feerate)
+                   (push (cons txid fast-feerate) confirmed)))
+               (dotimes (i per-block)
+                 (let ((txid (%bpe-id 2 h i)))
+                   (bitcoin-lisp.mempool::bpe-process-transaction e txid h slow-feerate)
+                   (when confirm-slow
+                     (push (cons txid slow-feerate) confirmed))))
+               (bitcoin-lisp.mempool::bpe-process-block e (1+ h) confirmed)))
+    e))
+
+(test estimator-smart-fee-reports-the-confirming-feerate
+  "End to end: sixty blocks in which 20000 sat/kvB confirms next-block and 800
+never does. estimateSmartFee must report 20000 — the cheap population is
+plentiful but useless, which is exactly the case a block-percentile heuristic
+gets wrong."
+  (let ((e (%bpe-simulate)))
+    (is (= 61 (bitcoin-lisp.mempool::block-policy-estimator-best-height e)))
+    (is (= 20000 (bitcoin-lisp.mempool::bpe-estimate-smart-fee e 2)))
+    (is (= 20000 (bitcoin-lisp.mempool::bpe-estimate-smart-fee e 6)))
+    (is (= 20000 (bitcoin-lisp.mempool::bpe-estimate-smart-fee e 6 :conservative t)))
+    ;; The unconfirmed cheap transactions are still tracked, still counting
+    ;; against their bucket's success rate.
+    (is (plusp (hash-table-count
+                (bitcoin-lisp.mempool::block-policy-estimator-tracked e))))))
+
+(test estimator-smart-fee-drops-when-cheap-transactions-confirm
+  "The control for the test above: identical volumes and buckets, the only
+difference being that the cheap population CONFIRMS. The estimate must fall to
+it — otherwise the previous test would pass on an estimator that simply always
+returns the most expensive bucket."
+  (let ((e (%bpe-simulate :confirm-slow t)))
+    (is (= 800 (bitcoin-lisp.mempool::bpe-estimate-smart-fee e 6)))))
+
+(test estimator-refuses-targets-it-cannot-support
+  "Targets outside the tracked range, and a history too short to justify one,
+both return 0 rather than a fabricated number."
+  (let ((fresh (bitcoin-lisp.mempool::make-block-policy-estimator)))
+    (is (= 0 (bitcoin-lisp.mempool::bpe-estimate-smart-fee fresh 0)))
+    (is (= 0 (bitcoin-lisp.mempool::bpe-estimate-smart-fee fresh 6)))
+    ;; Beyond the longest horizon.
+    (is (= 0 (bitcoin-lisp.mempool::bpe-estimate-smart-fee fresh 100000))))
+  ;; A short run cannot justify a distant target: MaxUsableEstimate halves the
+  ;; observed block span. Ten simulated blocks record from height 2 (the first
+  ;; block that confirmed anything) to height 11, a span of 9, so targets are
+  ;; capped at 4.
+  (let ((short-run (%bpe-simulate :blocks 10)))
+    (is (= 2 (bitcoin-lisp.mempool::block-policy-estimator-first-recorded-height short-run)))
+    (is (= 11 (bitcoin-lisp.mempool::block-policy-estimator-best-height short-run)))
+    (is (= 4 (bitcoin-lisp.mempool::bpe-max-usable-estimate short-run))))
+  ;; An estimator that has seen blocks but never counted a transaction has no
+  ;; span at all — the clock starts on DATA, not on blocks.
+  (let ((empty (bitcoin-lisp.mempool::make-block-policy-estimator)))
+    (bitcoin-lisp.mempool::bpe-process-block empty 100 (list))
+    (bitcoin-lisp.mempool::bpe-process-block empty 200 (list))
+    (is (= 0 (bitcoin-lisp.mempool::block-policy-estimator-first-recorded-height empty)))
+    (is (= 0 (bitcoin-lisp.mempool::bpe-max-usable-estimate empty)))))
+
+(test estimator-a-confirmed-transaction-stops-being-tracked
+  "processBlock must untrack what it confirms; otherwise every confirmed
+transaction would go on counting as 'still in the mempool' against its own
+bucket forever."
+  (let ((e (bitcoin-lisp.mempool::make-block-policy-estimator))
+        (txid (%bpe-id 9 9 9)))
+    (bitcoin-lisp.mempool::bpe-process-transaction e txid 1 5000d0)
+    (is (= 1 (hash-table-count
+              (bitcoin-lisp.mempool::block-policy-estimator-tracked e))))
+    (bitcoin-lisp.mempool::bpe-process-block e 2 (list (cons txid 5000d0)))
+    (is (= 0 (hash-table-count
+              (bitcoin-lisp.mempool::block-policy-estimator-tracked e))))))
+
+(test estimator-ignores-a-block-it-has-already-seen
+  "A block at or below the best seen height must not be processed twice — the
+decay step would run again and silently age all history by an extra block."
+  (let ((e (%bpe-simulate :blocks 5)))
+    (let ((height (bitcoin-lisp.mempool::block-policy-estimator-best-height e)))
+      (is (= 0 (bitcoin-lisp.mempool::bpe-process-block e height '())))
+      (is (= 0 (bitcoin-lisp.mempool::bpe-process-block e (1- height) '())))
+      (is (= height (bitcoin-lisp.mempool::block-policy-estimator-best-height e))))))
