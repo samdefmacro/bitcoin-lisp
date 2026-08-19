@@ -1881,6 +1881,52 @@ exactly this and had NO callers, so nothing recorded progress."
                (is (= 0 (bitcoin-lisp.storage::%txindex-resume-height txindex cs))))
           (bitcoin-lisp.storage:close-tx-index txindex))))))
 
+(test txindex-reaches-the-network-connect-path
+  "The seam that was missing: only the RPC paths passed :tx-index to
+connect-block. The networking path -- how every block from a peer is connected
+-- did not, so on a live node the index was maintained ONLY by the startup
+catch-up: blocks from peers went unindexed until the next restart, and after a
+reorg the best-block marker named a block no longer on the chain, which is what
+the live node reported as marker-off-chain.
+
+Asserted in two halves. The first is behavioural: the node's tx-index must
+actually arrive in the ibd-context, which is the hop that was absent. The
+second is structural, for the same reason the startup-catch-up test above gives
+-- the alternative is standing up a full node with real proof-of-work in a unit
+test -- and it pins the part a future caller could silently undo: the value is
+defaulted INSIDE accept-downloaded-block, not at its call sites, so forgetting
+to pass it cannot reintroduce the bug."
+  (let ((ctx (bitcoin-lisp.networking::make-ibd))
+        (txindex (bitcoin-lisp.storage:init-tx-index
+                  (merge-pathnames (format nil "txidx-reach-~D/" (get-internal-real-time))
+                                   (uiop:temporary-directory))
+                  :enabled t)))
+    (unwind-protect
+         (progn
+           (is (null (bitcoin-lisp.networking::ibd-context-tx-index ctx))
+               "a fresh context carries no index")
+           ;; run-ibd with no peers does nothing but thread its arguments in.
+           (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+             (bitcoin-lisp.networking::run-ibd
+              '() (bitcoin-lisp.storage:make-chain-state) nil nil :tx-index txindex))
+           (is (eq txindex (bitcoin-lisp.networking::ibd-context-tx-index ctx))
+               "run-ibd must put the node's transaction index into the context"))
+      (bitcoin-lisp.storage:close-tx-index txindex)))
+  ;; The connect path must take it from there by DEFAULT.
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/networking/protocol.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search "(tx-index (and *ibd-context*" src)
+        "accept-downloaded-block must default tx-index from the ibd-context")
+    (is (search ":tx-index tx-index" src)
+        "and pass it to connect-block"))
+  ;; And start-node must hand it to start-ibd at all.
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/node.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search ":tx-index (node-tx-index node)" src)
+        "sync-blockchain must pass the node's transaction index into IBD")))
+
 (test txindex-resume-reports-why-it-chose-a-full-rescan
   "The resume decision must be VISIBLE. A nine-minute startup that silently
 rescans from genesis gives the log no way to say whether the marker was
