@@ -2095,12 +2095,29 @@ Returns the node instance."
        (bitcoin-lisp.storage:chain-state-coins-view primary))
       (log-info "UTXO cache opened (base: ~A)" chainstate-path)))
 
-  ;; Load persisted header index if available
-  (when (bitcoin-lisp.storage:load-header-index (node-chain-state *node*))
-    (log-info "Loaded persisted header index: ~D entries"
-              (hash-table-count
-               (bitcoin-lisp.storage::chain-state-block-index
-                (node-chain-state *node*)))))
+  ;; Load persisted header index if available.
+  (multiple-value-bind (loaded corrupt-reason)
+      (bitcoin-lisp.storage:load-header-index (node-chain-state *node*))
+    (cond
+      (loaded
+       (log-info "Loaded persisted header index: ~D entries"
+                 (hash-table-count
+                  (bitcoin-lisp.storage::chain-state-block-index
+                   (node-chain-state *node*)))))
+      ;; A file IS there but did not validate. Starting anyway would leave us
+      ;; with an EMPTY block index while chainstate.dat still names a tip: the
+      ;; node would claim a height it has no headers for, re-request the whole
+      ;; header chain, and on a pruned node could never rebuild the entries
+      ;; below the prune horizon from disk. Refuse, exactly as the corrupt
+      ;; chainstate.dat branch above does, and as Core's "Error loading block
+      ;; database" does for a CBlockTreeDB it cannot read (init.cpp).
+      (corrupt-reason
+       (log-error "headerindex.dat is present but unreadable: ~A." corrupt-reason)
+       (log-error "Refusing to start: an empty block index would contradict the stored chainstate.")
+       (log-error "Recover by restoring a backup of headerindex.dat, or reindex from the block files.")
+       (error "Corrupt headerindex.dat at ~A" (node-data-directory *node*)))
+      ;; No file at all — a legitimate first run.
+      (t nil)))
 
   ;; Ensure genesis block is in the index with a proper header
   ;; (needed for difficulty walk-back on testnet)
