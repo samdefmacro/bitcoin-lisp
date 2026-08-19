@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${DEV_SWANK_PORT:-4007}"   # Swank port INSIDE the container; never published
 DOCKER=docker
-IMAGE="bitcoin-lisp-sbcl:2.6.5-2"  # pinned project image (docker/Dockerfile)
+IMAGE="bitcoin-lisp-sbcl:2.6.5-3"  # pinned project image (docker/Dockerfile)
 
 sha256_stdin() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -32,7 +32,7 @@ usage() {
 Usage: scripts/dev.sh COMMAND [ARGS]
 
 Persistent Swank development helper for bitcoin-lisp. The warm image runs
-INSIDE the pinned project container (bitcoin-lisp-sbcl:2.6.5-2): SBCL never
+INSIDE the pinned project container (bitcoin-lisp-sbcl:2.6.5-3): SBCL never
 runs on the host. The container runs scripts/dev-swank-server.lisp
 (bitcoin-lisp/tests loaded, Swank listening in-container) as its main
 process; every eval is a `docker exec` of the Common Lisp Workbench

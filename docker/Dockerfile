@@ -16,9 +16,12 @@
 # the tag they started with until they choose to rebuild.
 #   2.6.5    -> initial
 #   2.6.5-2  -> + nodejs, so the web UI test harness runs in-container too
+#   2.6.5-3  -> + libzmq (the node's ZMQ notification publishers) and
+#               python3-zmq, so those publishers can be tested against an
+#               INDEPENDENT ZeroMQ implementation rather than only themselves
 #
 # Build (from the repo root):
-#   docker build -f docker/Dockerfile -t bitcoin-lisp-sbcl:2.6.5-2 .
+#   docker build -f docker/Dockerfile -t bitcoin-lisp-sbcl:2.6.5-3 .
 
 FROM debian:trixie-slim AS build
 
@@ -51,9 +54,11 @@ FROM debian:trixie-slim
 
 # Runtime foreign libraries the node's cffi layer loads: libcrypto (hash.lisp),
 # libleveldb (leveldb.lisp; -dev for the plain .so name the FFI probes),
+# libzmq (the ZMQ notification publishers; -dev for the same reason, and the
+# node loads it LAZILY so a host without it still runs fine with ZMQ off),
 # libsecp256k1 copied from the build stage. curl/git only for quicklisp below.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3t64 libleveldb-dev zlib1g ca-certificates curl \
+    libssl3t64 libleveldb-dev libzmq3-dev zlib1g ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /opt/sbcl /opt/sbcl
@@ -91,6 +96,14 @@ RUN curl -fsSL https://beta.quicklisp.org/quicklisp.lisp -o /tmp/quicklisp.lisp 
 # every layer after a changed one. Putting a frontend-only dependency up in
 # the first apt line would make every future bump of it re-run that.
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/*
+
+# python3-zmq is a TEST DEPENDENCY, for the same reason and in the same place as
+# nodejs. It exists so the ZMQ publishers can be verified against an independent
+# ZeroMQ implementation: a Lisp publisher checked only by a Lisp subscriber would
+# prove that our code agrees with itself, which is exactly the failure mode a
+# wire protocol has. Nothing the node ships uses it.
+RUN apt-get update && apt-get install -y --no-install-recommends python3-zmq \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
