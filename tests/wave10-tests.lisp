@@ -177,6 +177,74 @@ RPC_DESERIALIZATION_ERROR (whole call — no per-tx allowed:false rows)."
                 (lambda () (bitcoin-lisp.rpc::rpc-submitpackage
                             node (list (list "nothex!" "alsonot")))))))))
 
+(test wave10-maxmempool-wire-and-blocksonly-interaction
+  "-maxmempool is megabytes of pool memory (Core DEFAULT_MAX_MEMPOOL_SIZE_MB
+300), and -blocksonly SOFT-sets it to 5 MB: a node that does not relay
+transactions has no reason to hold 300 MB of them (init.cpp:826). Soft means an
+explicit -maxmempool still wins."
+  (let ((bitcoin-lisp.mempool:*max-mempool-bytes*
+          bitcoin-lisp.mempool:+default-max-mempool-bytes+))
+    ;; Explicit value, in megabytes.
+    (bitcoin-lisp::apply-config-globals '(("maxmempool" . "50")))
+    (is (= (* 50 1000 1000) bitcoin-lisp.mempool:*max-mempool-bytes*))
+    ;; The mempool built AFTER the wire uses the new cap.
+    (is (= (* 50 1000 1000)
+           (bitcoin-lisp.mempool::mempool-max-size
+            (bitcoin-lisp.mempool:make-mempool))))
+    ;; -blocksonly alone shrinks the default.
+    (setf bitcoin-lisp.mempool:*max-mempool-bytes*
+          bitcoin-lisp.mempool:+default-max-mempool-bytes+)
+    (bitcoin-lisp::apply-config-globals '(("blocksonly" . "1")))
+    (is (= (* 5 1000 1000) bitcoin-lisp.mempool:*max-mempool-bytes*))
+    ;; ...but an explicit -maxmempool beats it, which is what "soft" means.
+    (setf bitcoin-lisp.mempool:*max-mempool-bytes*
+          bitcoin-lisp.mempool:+default-max-mempool-bytes+)
+    (bitcoin-lisp::apply-config-globals '(("blocksonly" . "1")
+                                          ("maxmempool" . "100")))
+    (is (= (* 100 1000 1000) bitcoin-lisp.mempool:*max-mempool-bytes*))
+    ;; -blocksonly=0 is not the interaction.
+    (setf bitcoin-lisp.mempool:*max-mempool-bytes*
+          bitcoin-lisp.mempool:+default-max-mempool-bytes+)
+    (bitcoin-lisp::apply-config-globals '(("blocksonly" . "0")))
+    (is (= bitcoin-lisp.mempool:+default-max-mempool-bytes+
+           bitcoin-lisp.mempool:*max-mempool-bytes*))
+    (signals error (bitcoin-lisp::apply-config-globals '(("maxmempool" . "junk"))))))
+
+(test wave10-block-weight-options-wire-and-validate
+  "-blockmaxweight/-blockreservedweight are template SELECTION budgets with
+Core's three guards (init.cpp:1079-1093): neither may exceed the consensus
+maximum, and the reserve may not fall below MINIMUM_BLOCK_RESERVED_WEIGHT."
+  (let ((bitcoin-lisp.mining:*block-max-weight*
+          bitcoin-lisp.validation:+max-block-weight+)
+        (bitcoin-lisp.mining:*block-reserved-weight*
+          bitcoin-lisp.mining:+block-reserved-weight+))
+    (bitcoin-lisp::apply-config-globals '(("blockmaxweight" . "3000000")))
+    (is (= 3000000 bitcoin-lisp.mining:*block-max-weight*))
+    (bitcoin-lisp::apply-config-globals '(("blockreservedweight" . "4000")))
+    (is (= 4000 bitcoin-lisp.mining:*block-reserved-weight*))
+    ;; A fresh template starts at the configured reserve.
+    (is (= 4000 (bitcoin-lisp.mining::block-template-total-weight
+                 (bitcoin-lisp.mining::make-block-template))))
+    ;; Above consensus: refused, both options.
+    (signals error
+      (bitcoin-lisp::apply-config-globals
+       (list (cons "blockmaxweight"
+                   (format nil "~D" (1+ bitcoin-lisp.validation:+max-block-weight+))))))
+    (signals error
+      (bitcoin-lisp::apply-config-globals
+       (list (cons "blockreservedweight"
+                   (format nil "~D" (1+ bitcoin-lisp.validation:+max-block-weight+))))))
+    ;; Below the safety floor: refused. Exactly at it: accepted.
+    (signals error
+      (bitcoin-lisp::apply-config-globals
+       (list (cons "blockreservedweight"
+                   (format nil "~D" (1- bitcoin-lisp.mining:+minimum-block-reserved-weight+))))))
+    (bitcoin-lisp::apply-config-globals
+     (list (cons "blockreservedweight"
+                 (format nil "~D" bitcoin-lisp.mining:+minimum-block-reserved-weight+))))
+    (is (= bitcoin-lisp.mining:+minimum-block-reserved-weight+
+           bitcoin-lisp.mining:*block-reserved-weight*))))
+
 (test wave10-testmempoolaccept-count-limits
   "testmempoolaccept enforces Core's 1..25 batch bound with -8."
   (let ((node (make-test-node)))

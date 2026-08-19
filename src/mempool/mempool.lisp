@@ -17,6 +17,12 @@ is compared against MEMPOOL-DYNAMIC-USAGE, Core's DynamicMemoryUsage()
 malloc-model — roughly 3x the transactions' wire size — not serialized
 bytes.")
 
+(defparameter *max-mempool-bytes* +default-max-mempool-bytes+
+  "Effective -maxmempool in BYTES. Core's -maxmempool is in megabytes and is
+soft-set to DEFAULT_BLOCKSONLY_MAX_MEMPOOL_SIZE_MB (5) under -blocksonly, since
+a node that does not relay transactions has no reason to hold 300 MB of them
+(init.cpp:826). Read by MAKE-MEMPOOL.")
+
 (defparameter +incremental-relay-fee-rate+ 100
   "Incremental relay fee in satoshis per kvB (Bitcoin Core
 DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB = 0.1 sat/vB): BIP125 rule 4
@@ -350,8 +356,10 @@ txid rides in each handle's DATA slot (set by MEMPOOL-ADD)."
   ;; container overheads on top; see MEMPOOL-DYNAMIC-USAGE.
   (total-usage 0 :type integer)
   ;; Maximum allowed MEMORY usage in bytes (Core -maxmempool * 1'000'000),
-  ;; compared against MEMPOOL-DYNAMIC-USAGE.
-  (max-size +default-max-mempool-bytes+ :type integer)
+  ;; compared against MEMPOOL-DYNAMIC-USAGE. The default form reads
+  ;; *MAX-MEMPOOL-BYTES* at MAKE-MEMPOOL time, so -maxmempool applies to the
+  ;; pool the node builds at startup without threading the value through.
+  (max-size *max-mempool-bytes* :type integer)
   ;; Minimum relay fee rate (sat/kvB, Core CFeeRate::GetFeePerK units).
   ;; The default form reads *min-relay-fee-rate* at MAKE-MEMPOOL time, so
   ;; -minrelaytxfee (applied before the node's mempool is built) takes effect.
