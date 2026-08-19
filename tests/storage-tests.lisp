@@ -1881,6 +1881,41 @@ exactly this and had NO callers, so nothing recorded progress."
                (is (= 0 (bitcoin-lisp.storage::%txindex-resume-height txindex cs))))
           (bitcoin-lisp.storage:close-tx-index txindex))))))
 
+(test txindex-is-updated-by-blocks-arriving-from-the-network
+  "The seam that was missing: only the RPC paths passed :tx-index to
+connect-block, so on a live node the index was maintained ONLY by the startup
+catch-up. Every block arriving from a peer went unindexed until the next
+restart, and a reorg left the best-block marker naming a block no longer on the
+chain -- which is what the live node reported as marker-off-chain.
+
+Drives the real network acceptance path."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "txidx-network")
+     (let* ((dir (merge-pathnames (format nil "txidx-net-~D/" (get-internal-real-time))
+                                  (uiop:temporary-directory)))
+            (txindex (bitcoin-lisp.storage:init-tx-index dir :enabled t))
+            (ctx (bitcoin-lisp.networking::make-ibd)))
+       (unwind-protect
+            (let* ((hash (first (make-test-chain-hashes #xE0 1)))
+                   (block1 (make-reorg-test-block genesis-hash hash 1))
+                   (coinbase (first (bitcoin-lisp.serialization:bitcoin-block-transactions block1)))
+                   (cb-txid (bitcoin-lisp.serialization:transaction-hash coinbase)))
+              (setf (bitcoin-lisp.networking::ibd-context-tx-index ctx) txindex)
+              (is (null (bitcoin-lisp.storage:txindex-lookup txindex cb-txid))
+                  "not indexed before the block arrives")
+              (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+                (bitcoin-lisp.networking::accept-downloaded-block
+                 block1 chain-state utxo-set block-store))
+              (is (= 1 (bitcoin-lisp.storage:current-height chain-state)))
+              (is-true (bitcoin-lisp.storage:txindex-lookup txindex cb-txid)
+                       "a block accepted from the network must reach the transaction index")
+              ;; ...and the best-block marker moved with it, so the next start
+              ;; resumes instead of rescanning from genesis.
+              (is (equalp hash (bitcoin-lisp.storage:txindex-best-block txindex))))
+         (bitcoin-lisp.storage:close-tx-index txindex)))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
 (test txindex-resume-reports-why-it-chose-a-full-rescan
   "The resume decision must be VISIBLE. A nine-minute startup that silently
 rescans from genesis gives the log no way to say whether the marker was
