@@ -51,7 +51,12 @@ case "$NETWORK" in
   testnet4)
     HEAP=6144; RPC_PORT=18332
     DATA_DIR="$BL_DATA_ROOT/leveldb-test/"; LOG="$BL_LOG_ROOT/leveldb-test.log"
-    START_OPTS=':blockfilterindex t :v2transport t :coinstatsindex t' ;;
+    # -txindex on testnet4 only: start-node refuses prune+txindex together
+    # (pruned blocks cannot be looked up), and mainnet runs pruned. Enabled to
+    # exercise the LevelDB txindex from GA9 S2-13 against a real chain -- the
+    # previous in-memory implementation could not run at mainnet scale at all,
+    # so this path has never had production exposure.
+    START_OPTS=':blockfilterindex t :v2transport t :coinstatsindex t :txindex t' ;;
   mainnet)
     HEAP=5120; RPC_PORT=8332
     DATA_DIR="$BL_DATA_ROOT/mainnet-prune/"; LOG="$BL_LOG_ROOT/mainnet.log"
