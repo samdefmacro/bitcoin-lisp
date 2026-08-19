@@ -114,6 +114,38 @@ reindex-chainstate wipe. No-op if the base DB is already closed."
 ;;;; cache entry — Core does the same).
 
 (declaim (inline fetch-coin))
+(defvar *coins-to-uncache* nil
+  "When bound to a cons cell, FETCH-COIN pushes onto its CAR every key it pulls
+in from the base view that was not already cached — Core's coins_to_uncache
+(validation.cpp:851). WITH-COINS-TO-UNCACHE binds it; nothing else should.
+
+A cons cell rather than a bare list so the callee can push without the binding
+form having to be a place.")
+
+(defmacro with-coins-to-uncache ((cache) &body body)
+  "Run BODY recording every coin FETCH-COIN pulls in from the base, and drop
+those coins again if BODY returns NIL as its first value.
+
+This is Core's shape: PreChecks records coins_to_uncache, and any non-VALID
+result uncaches them, `to prevent memory DoS in case we receive a large number
+of invalid transactions that attempt to overrun the in-memory coins cache'
+(validation.cpp:1787-1790).
+
+Only coins the cache did not already hold are recorded, and
+COINS-VIEW-CACHE-UNCACHE additionally refuses to drop a dirty entry, so nothing
+this can touch is an unwritten change."
+  (let ((box (gensym "BOX")) (c (gensym "CACHE")) (ok (gensym "OK"))
+        (rest (gensym "REST")))
+    `(let* ((,c ,cache)
+            (,box (cons '() nil)))
+       (multiple-value-bind (,ok &rest ,rest)
+           (let ((*coins-to-uncache* ,box)) ,@body)
+         (unless ,ok
+           (when (typep ,c 'coins-view-cache)
+             (dolist (key (car ,box))
+               (coins-view-cache-uncache ,c key))))
+         (values-list (cons ,ok ,rest))))))
+
 (defun fetch-coin (cache key)
   "Return the cache-entry for KEY, populating from base if needed.
 Returns NIL only when both cache and base have nothing under KEY."
@@ -125,7 +157,39 @@ Returns NIL only when both cache and base have nothing under KEY."
       (let ((ce (make-cache-entry :entry from-base :dirty nil :fresh nil)))
         (setf (gethash key (cvc-entries cache)) ce)
         (incf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce))
+        ;; Record it as evictable: it entered the cache only to answer a read.
+        (when *coins-to-uncache*
+          (push key (car *coins-to-uncache*)))
         ce))))
+
+(defun coins-view-cache-uncache (cache key)
+  "Drop KEY from the cache if it is present and NOT dirty — Core
+CCoinsViewCache::Uncache (coins.cpp:310-322). Returns T if an entry was
+dropped.
+
+The not-dirty guard is load bearing: a dirty entry is an unwritten change, and
+erasing it loses a real add or a real spend. Only entries pulled in from the
+base purely to answer a read are eligible.
+
+Exists so a rejected transaction does not leave its inputs resident. Core
+records every prevout not already cached (coins_to_uncache, validation.cpp:851)
+and uncaches them on any non-VALID result, with the reason stated verbatim:
+`to prevent memory DoS in case we receive a large number of invalid
+transactions that attempt to overrun the in-memory coins cache\' (:1787-1790).
+
+We had no uncache at all, and our only size check lives in
+maybe-periodic-flush, reachable solely from connect-block — so a peer streaming
+transactions that fail AFTER input fetch (a bad signature is enough) made us
+retain one entry per distinct prevout with no eviction until the next block. A
+~1 MB transaction can name ~24,000 outpoints, so the amplification is several
+times the bandwidth and is held for a whole inter-block interval."
+  (declare (type coins-view-cache cache) (type utxo-key key))
+  (multiple-value-bind (ce present-p) (gethash key (cvc-entries cache))
+    (when (and present-p ce (not (ce-dirty ce)))
+      (decf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce))
+      (when (ce-fresh ce) (decf (cvc-fresh-count cache)))
+      (remhash key (cvc-entries cache))
+      t)))
 
 ;;;; Public reads.
 

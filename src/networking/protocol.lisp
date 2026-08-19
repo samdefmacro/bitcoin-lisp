@@ -1400,8 +1400,10 @@ by TXID, so the cascade work list carries txids."
               (let ((otxid (bitcoin-lisp.serialization:transaction-hash otx))
                     (current-height (bitcoin-lisp.storage:current-height chain-state)))
                 (multiple-value-bind (valid error fee replaced sigops)
-                    (bitcoin-lisp.validation:validate-transaction-for-mempool
-                     otx utxo-set mempool current-height :chain-state chain-state)
+                    ;; Uncache on rejection (Core validation.cpp:1787-1790).
+                    (bitcoin-lisp.storage:with-coins-to-uncache (utxo-set)
+                      (bitcoin-lisp.validation:validate-transaction-for-mempool
+                       otx utxo-set mempool current-height :chain-state chain-state))
                   (cond
                     (valid
                      (multiple-value-bind (result entry)
@@ -1673,10 +1675,17 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
                 (%try-1p1c-package peer tx utxo-set mempool chain-state peers
                                    recent-rejects)
                 (return-from handle-tx nil))
-              ;; Validate for mempool
+              ;; Validate for mempool. THE hot path for this fix: a peer
+              ;; streaming transactions that fail after input fetch -- a bad
+              ;; signature suffices -- otherwise leaves one cache entry per
+              ;; distinct prevout, with no eviction until the next block. A
+              ;; ~1 MB transaction can name ~24,000 outpoints, so the
+              ;; amplification is several times the bandwidth and is held for
+              ;; a whole inter-block interval (Core validation.cpp:1787-1790).
               (multiple-value-bind (valid error fee replaced sigops)
-                  (bitcoin-lisp.validation:validate-transaction-for-mempool
-                   tx utxo-set mempool current-height :chain-state chain-state)
+                  (bitcoin-lisp.storage:with-coins-to-uncache (utxo-set)
+                    (bitcoin-lisp.validation:validate-transaction-for-mempool
+                     tx utxo-set mempool current-height :chain-state chain-state))
                 (unless valid
                   (cond
                     ;; Missing inputs => hold as an orphan (not a real reject);

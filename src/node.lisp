@@ -844,8 +844,14 @@ missing or corrupt."
                 ;; reload (Core LoadMempool goes through the full
                 ;; AcceptToMemoryPool, node/mempool_persist.cpp:105).
                 (multiple-value-bind (valid error fee replaced sigops)
-                    (bitcoin-lisp.validation:validate-transaction-for-mempool
-                     tx utxo-set mempool height :chain-state chain-state)
+                    ;; Core uncaches every prevout this pulled in when the
+                    ;; result is not VALID (validation.cpp:851, 1787-1790):
+                    ;; otherwise a stream of transactions that fail AFTER input
+                    ;; fetch leaves one cache entry per distinct outpoint, with
+                    ;; nothing evicting them until the next block connects.
+                    (bitcoin-lisp.storage:with-coins-to-uncache (utxo-set)
+                      (bitcoin-lisp.validation:validate-transaction-for-mempool
+                       tx utxo-set mempool height :chain-state chain-state))
                   (declare (ignore error))
                   (cond
                     (valid
