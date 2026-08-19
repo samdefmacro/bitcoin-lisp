@@ -283,3 +283,211 @@ perfect for lack of evidence."
                      (progn (setf median (/ (aref feerate-avg j) (aref txct j)))
                             (return)))))
       median)))
+
+;;;; --- The estimator: three horizons over one bucket set ---
+
+(defstruct (block-policy-estimator (:constructor %make-block-policy-estimator))
+  "Core CBlockPolicyEstimator. SHORT/MED/LONG track the same buckets with
+different decay rates and period lengths, so a near target can react quickly
+while a distant one stays stable.
+
+TRACKED maps a txid to (entry-height short-bucket med-bucket long-bucket) for
+every transaction currently in the mempool that counts toward estimates."
+  (buckets #() :type simple-vector)
+  (short nil) (med nil) (long nil)
+  (tracked (make-hash-table :test 'equalp) :type hash-table)
+  (best-height 0 :type (integer 0))
+  (first-recorded-height 0 :type (integer 0))
+  (historical-first 0 :type (integer 0))
+  (historical-best 0 :type (integer 0)))
+
+(defun make-block-policy-estimator ()
+  (let ((buckets (make-fee-buckets)))
+    (%make-block-policy-estimator
+     :buckets buckets
+     :short (make-tx-confirm-stats buckets +short-block-periods+ +short-decay+ +short-scale+)
+     :med (make-tx-confirm-stats buckets +med-block-periods+ +med-decay+ +med-scale+)
+     :long (make-tx-confirm-stats buckets +long-block-periods+ +long-decay+ +long-scale+))))
+
+(defun bpe-process-transaction (est txid height feerate)
+  "A transaction entered the mempool at HEIGHT paying FEERATE sat/kvB (Core
+processTransaction). Tracked in all three horizons until it confirms or leaves."
+  (let ((tracked (block-policy-estimator-tracked est)))
+    (unless (gethash txid tracked)
+      (setf (gethash txid tracked)
+            (list height
+                  (tx-confirm-stats-new-tx (block-policy-estimator-short est) height feerate)
+                  (tx-confirm-stats-new-tx (block-policy-estimator-med est) height feerate)
+                  (tx-confirm-stats-new-tx (block-policy-estimator-long est) height feerate))))
+    t))
+
+(defun bpe-remove-tx (est txid in-block)
+  "A tracked transaction left the mempool (Core removeTx). IN-BLOCK means it
+confirmed; otherwise it was evicted or replaced, which is recorded as a failure
+at its feerate. Returns T if the transaction was tracked."
+  (let* ((tracked (block-policy-estimator-tracked est))
+         (entry (gethash txid tracked)))
+    (when entry
+      (destructuring-bind (height short-b med-b long-b) entry
+        (let ((best (block-policy-estimator-best-height est)))
+          (tx-confirm-stats-remove-tx (block-policy-estimator-short est)
+                                      height best short-b in-block)
+          (tx-confirm-stats-remove-tx (block-policy-estimator-med est)
+                                      height best med-b in-block)
+          (tx-confirm-stats-remove-tx (block-policy-estimator-long est)
+                                      height best long-b in-block)))
+      (remhash txid tracked)
+      t)))
+
+(defun bpe-process-block (est height confirmed)
+  "A block at HEIGHT confirmed CONFIRMED, a list of (txid . feerate) for the
+transactions this node had tracked (Core processBlock).
+
+Order matters and mirrors Core: roll the circular buffer and decay FIRST, so
+this block's own data is not immediately decayed, then record each confirmation
+against the number of blocks it waited."
+  (when (<= height (block-policy-estimator-best-height est))
+    (return-from bpe-process-block 0))
+  (setf (block-policy-estimator-best-height est) height)
+  (dolist (stats (list (block-policy-estimator-short est)
+                       (block-policy-estimator-med est)
+                       (block-policy-estimator-long est)))
+    (tx-confirm-stats-clear-current stats height)
+    (tx-confirm-stats-update-moving-averages stats))
+  (let ((counted 0))
+    (dolist (cell confirmed)
+      (let* ((txid (car cell))
+             (feerate (cdr cell))
+             (entry (gethash txid (block-policy-estimator-tracked est))))
+        (when entry
+          (let ((blocks-to-confirm (- height (first entry))))
+            ;; removeTx first, so the transaction stops counting as unconfirmed
+            ;; before its confirmation is recorded.
+            (bpe-remove-tx est txid t)
+            (when (plusp blocks-to-confirm)
+              (incf counted)
+              (tx-confirm-stats-record (block-policy-estimator-short est)
+                                       blocks-to-confirm feerate)
+              (tx-confirm-stats-record (block-policy-estimator-med est)
+                                       blocks-to-confirm feerate)
+              (tx-confirm-stats-record (block-policy-estimator-long est)
+                                       blocks-to-confirm feerate))))))
+    ;; Only a block that actually CONTRIBUTED data starts the clock (Core
+    ;; :704 requires countedTxs > 0). Starting it on an empty block would
+    ;; inflate the observed block span and let MaxUsableEstimate answer targets
+    ;; the history cannot support.
+    (when (and (zerop (block-policy-estimator-first-recorded-height est))
+               (plusp counted))
+      (setf (block-policy-estimator-first-recorded-height est) height))
+    counted))
+
+(defun %bpe-block-span (est)
+  (let ((first (block-policy-estimator-first-recorded-height est)))
+    (if (zerop first) 0 (- (block-policy-estimator-best-height est) first))))
+
+(defun %bpe-historical-block-span (est)
+  (let ((first (block-policy-estimator-historical-first est))
+        (best (block-policy-estimator-historical-best est)))
+    (cond ((or (zerop first) (zerop best)) 0)
+          ((> (- (block-policy-estimator-best-height est) best)
+              +oldest-estimate-history+)
+           0)
+          (t (- best first)))))
+
+(defun bpe-max-usable-estimate (est)
+  "The furthest target this much history can justify (Core MaxUsableEstimate).
+Halved because an estimate needs enough potential FAILURES to be meaningful, not
+just enough confirmations."
+  (min (tx-confirm-stats-max-confirms (block-policy-estimator-long est))
+       (floor (max (%bpe-block-span est) (%bpe-historical-block-span est)) 2)))
+
+(defun %bpe-combined-fee (est conf-target success-threshold check-shorter)
+  "Core estimateCombinedFee: answer from the SHORTEST horizon that tracks
+CONF-TARGET, and when CHECK-SHORTER is set let a shorter horizon's maximum
+target lower the answer — that is what keeps estimates monotonic in the target."
+  (let ((short (block-policy-estimator-short est))
+        (med (block-policy-estimator-med est))
+        (long (block-policy-estimator-long est))
+        (height (block-policy-estimator-best-height est))
+        (estimate -1d0))
+    (when (and (>= conf-target 1)
+               (<= conf-target (tx-confirm-stats-max-confirms long)))
+      (setf estimate
+            (cond
+              ((<= conf-target (tx-confirm-stats-max-confirms short))
+               (tx-confirm-stats-estimate-median short conf-target
+                                                 +sufficient-txs-short+
+                                                 success-threshold height))
+              ((<= conf-target (tx-confirm-stats-max-confirms med))
+               (tx-confirm-stats-estimate-median med conf-target
+                                                 +sufficient-feetxs+
+                                                 success-threshold height))
+              (t
+               (tx-confirm-stats-estimate-median long conf-target
+                                                 +sufficient-feetxs+
+                                                 success-threshold height))))
+      (when check-shorter
+        (when (> conf-target (tx-confirm-stats-max-confirms med))
+          (let ((med-max (tx-confirm-stats-estimate-median
+                          med (tx-confirm-stats-max-confirms med)
+                          +sufficient-feetxs+ success-threshold height)))
+            (when (and (plusp med-max) (or (= estimate -1d0) (< med-max estimate)))
+              (setf estimate med-max))))
+        (when (> conf-target (tx-confirm-stats-max-confirms short))
+          (let ((short-max (tx-confirm-stats-estimate-median
+                            short (tx-confirm-stats-max-confirms short)
+                            +sufficient-txs-short+ success-threshold height)))
+            (when (and (plusp short-max) (or (= estimate -1d0) (< short-max estimate)))
+              (setf estimate short-max))))))
+    estimate))
+
+(defun %bpe-conservative-fee (est double-target)
+  "Core estimateConservativeFee: require DOUBLE_SUCCESS_PCT at twice the target
+on the LONGER horizons too, so a short-term dip cannot pull the answer down."
+  (let ((short (block-policy-estimator-short est))
+        (med (block-policy-estimator-med est))
+        (long (block-policy-estimator-long est))
+        (height (block-policy-estimator-best-height est))
+        (estimate -1d0))
+    (when (<= double-target (tx-confirm-stats-max-confirms short))
+      (setf estimate (tx-confirm-stats-estimate-median
+                      med double-target +sufficient-feetxs+
+                      +double-success-pct+ height)))
+    (when (<= double-target (tx-confirm-stats-max-confirms med))
+      (let ((long-estimate (tx-confirm-stats-estimate-median
+                            long double-target +sufficient-feetxs+
+                            +double-success-pct+ height)))
+        (when (> long-estimate estimate)
+          (setf estimate long-estimate))))
+    estimate))
+
+(defun bpe-estimate-smart-fee (est conf-target &key conservative)
+  "Core estimateSmartFee: the MAX of three sub-estimates — 60% success at half
+the target, 85% at the target, 95% at twice it — each taken from the shortest
+horizon that tracks it. Returns satoshis per kvB, or 0 when history cannot
+support an answer.
+
+Taking the max is what makes the estimate monotonic in the target and keeps a
+single quiet stretch from collapsing it."
+  (let ((long (block-policy-estimator-long est)))
+    (when (or (<= conf-target 0)
+              (> conf-target (tx-confirm-stats-max-confirms long)))
+      (return-from bpe-estimate-smart-fee 0))
+    ;; A 1-block target cannot be estimated: there is no shorter horizon to
+    ;; cross-check it against (Core does the same substitution).
+    (when (= conf-target 1) (setf conf-target 2))
+    (let ((max-usable (bpe-max-usable-estimate est)))
+      (when (> conf-target max-usable) (setf conf-target max-usable)))
+    (when (<= conf-target 1)
+      (return-from bpe-estimate-smart-fee 0))
+    (let ((median (%bpe-combined-fee est (floor conf-target 2) +half-success-pct+ t)))
+      (let ((actual (%bpe-combined-fee est conf-target +success-pct+ t)))
+        (when (> actual median) (setf median actual)))
+      (let ((double-est (%bpe-combined-fee est (* 2 conf-target)
+                                           +double-success-pct+
+                                           (not conservative))))
+        (when (> double-est median) (setf median double-est)))
+      (when (or conservative (= median -1d0))
+        (let ((cons-est (%bpe-conservative-fee est (* 2 conf-target))))
+          (when (> cons-est median) (setf median cons-est))))
+      (if (minusp median) 0 (round median)))))
