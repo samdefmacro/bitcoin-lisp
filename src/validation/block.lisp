@@ -2007,9 +2007,12 @@ Handles chain reorganizations when a competing chain has more work."
                  (when stats
                    (bitcoin-lisp.mempool:fee-estimator-add-stats fee-estimator stats)
                    (bitcoin-lisp.mempool:maybe-flush-fee-stats fee-estimator)))))
-           ;; Update transaction index if enabled
+           ;; Update transaction index if enabled, and move its best-block
+           ;; marker with the tip so the next startup resumes here instead of
+           ;; re-reading every block from genesis.
            (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
-             (bitcoin-lisp.storage:txindex-add-block tx-index block hash))
+             (bitcoin-lisp.storage:txindex-add-block tx-index block hash)
+             (bitcoin-lisp.storage:txindex-set-best-block tx-index hash))
            (bitcoin-lisp.storage:update-chain-tip chain-state hash new-height)
            ;; Remove now-confirmed (and conflicting) txs from the mempool,
            ;; inside the same critical section as the tip update.
@@ -2786,7 +2789,8 @@ comment above."
               ;; connect path / index entries key by.
               (let ((hash (bitcoin-lisp.storage:block-index-entry-hash entry)))
                 (when (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
-                  (bitcoin-lisp.storage:txindex-add-block tx-index block hash))
+                  (bitcoin-lisp.storage:txindex-add-block tx-index block hash)
+                  (bitcoin-lisp.storage:txindex-set-best-block tx-index hash))
                 ;; BIP158: index the reconnected block's basic filter (oldest-to-
                 ;; newest here, so its header chains off the already-indexed parent).
                 (bitcoin-lisp:index-block-filter chain-state block hash height spent-utxos)

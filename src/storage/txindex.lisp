@@ -220,6 +220,33 @@ re-index it at its active-chain location."
                      (bitcoin-lisp.serialization:transaction-hash last-tx))))
            (and loc (equalp (tx-location-block-hash loc) block-hash))))))
 
+(defun %txindex-resume-height (txindex chain-state)
+  "Height to resume the catch-up scan from: one past the recorded best-indexed
+block, but only when that block is STILL on the active chain at the height it
+claims. Otherwise 0, a full rescan.
+
+The marker alone is not enough. A reorg while the index was offline can leave
+entries below it pointing at a branch that is no longer the active chain, and
+skipping those heights would leave the stale locations in place forever. The
+on-chain check is what makes the shortcut safe: if the recorded block is still
+where it says it is, everything below it was indexed against this same chain.
+
+Without this the scan re-read EVERY block from disk on every start just to ask
+whether it was already indexed — 149k blocks and about nine minutes on the live
+testnet4 node."
+  (let ((best (txindex-best-block txindex)))
+    (if (null best)
+        0
+        (let ((entry (get-block-index-entry chain-state best)))
+          (if (null entry)
+              0
+              (let* ((height (block-index-entry-height entry))
+                     (on-chain (get-block-at-height chain-state height)))
+                (if (and on-chain
+                         (equalp (block-index-entry-hash on-chain) best))
+                    (1+ height)
+                    0)))))))
+
 (defun build-tx-index (txindex chain-state block-store &key progress-callback)
   "Build the transaction index from existing blocks.
 Scans all blocks from genesis to current tip; blocks whose transactions are
@@ -233,9 +260,10 @@ Returns the number of transactions indexed."
   (unless (tx-index-enabled txindex)
     (return-from build-tx-index 0))
   (let* ((current-height (current-height chain-state))
+         (start-height (%txindex-resume-height txindex chain-state))
          (total-indexed 0)
          (last-report-time (get-internal-real-time)))
-    (loop for height from 0 to current-height
+    (loop for height from start-height to current-height
           do (let ((entry (get-block-at-height chain-state height)))
                (when entry
                  (let* ((block-hash (block-index-entry-hash entry))
@@ -255,4 +283,9 @@ Returns the number of transactions indexed."
     ;; Final progress report
     (when progress-callback
       (funcall progress-callback current-height 100.0))
+    ;; Record where we got to, so the next start resumes instead of re-reading
+    ;; every block from genesis.
+    (let ((tip (get-block-at-height chain-state current-height)))
+      (when tip
+        (txindex-set-best-block txindex (block-index-entry-hash tip))))
     total-indexed))
