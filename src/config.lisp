@@ -758,7 +758,15 @@ specially in config-alist->start-node-plist.")
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
     ;; repeatable start-node option collected outside the spec scan
-    "addnode")
+    "addnode"
+    ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, not the spec
+    ;; scan, since each topic contributes two options and they produce a list
+    ;; of publishers rather than a start-node keyword.
+    "zmqpubhashblock" "zmqpubhashblockhwm"
+    "zmqpubhashtx" "zmqpubhashtxhwm"
+    "zmqpubrawblock" "zmqpubrawblockhwm"
+    "zmqpubrawtx" "zmqpubrawtxhwm"
+    "zmqpubsequence" "zmqpubsequencehwm")
   "Config option names recognized OUTSIDE *cli-option-spec* (network flags,
 entry-point specials, and the process-global options apply-config-globals
 consumes). check-cli-args unions this with the spec to reject unknown

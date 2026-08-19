@@ -121,6 +121,7 @@
   (register-rpc-method "getmemoryinfo" #'rpc-getmemoryinfo)
   (register-rpc-method "getnetworkhashps" #'rpc-getnetworkhashps)
   (register-rpc-method "logging" #'rpc-logging)
+  (register-rpc-method "getzmqnotifications" #'rpc-getzmqnotifications)
   ;; Peer / address methods
   (register-rpc-method "getnodeaddresses" #'rpc-getnodeaddresses)
   (register-rpc-method "getaddrmaninfo" #'rpc-getaddrmaninfo)

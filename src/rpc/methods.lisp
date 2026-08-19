@@ -3038,6 +3038,20 @@ ACTIVE-HEIGHT."
     ("active" . ,(json-bool (>= tip-height active-height)))
     ("height" . ,active-height)))
 
+(defun rpc-getzmqnotifications (node params)
+  "Active ZMQ notification publishers (Bitcoin Core getzmqnotifications):
+an array of {type, address, hwm}. Empty when ZMQ is not configured, which is
+also the case on a node whose host has no libzmq -- the library is loaded only
+when a -zmqpub* option asks for it."
+  (declare (ignore node params))
+  (json-array
+   (mapcar (lambda (entry)
+             (destructuring-bind (type address hwm) entry
+               `(("type" . ,type)
+                 ("address" . ,address)
+                 ("hwm" . ,hwm))))
+           (bitcoin-lisp::zmq-notifications-info))))
+
 (defun rpc-getdeploymentinfo (node params)
   "Report soft-fork deployment status at the tip (Bitcoin Core getdeploymentinfo).
 Reports the buried deployments (bip34/bip66/bip65/csv/segwit/taproot) using this
