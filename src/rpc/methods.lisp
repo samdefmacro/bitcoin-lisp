@@ -1236,6 +1236,53 @@ array of {txid, vout, spendingtxid?}."
               ,@(when spender `(("spendingtxid" . ,(hash-to-hex spender))))))))
       outpoints))))
 
+;;;; Raw-transaction safety rails (Core node/transaction.h:28-34)
+;;;;
+;;;; sendrawtransaction, testmempoolaccept and submitpackage each carry two
+;;;; fat-finger rails that apply BEFORE a transaction can reach the mempool or
+;;;; the wire: maxfeerate caps the absolute fee, and maxburnamount caps the
+;;;; value an output may commit to a script that can never spend it. Both are
+;;;; ON by default -- a caller switches the fee rail off by passing
+;;;; maxfeerate=0, and raises the burn rail explicitly.
+
+(defconstant +default-max-raw-tx-fee-rate+ 10000000
+  "Core node::DEFAULT_MAX_RAW_TX_FEE_RATE (node/transaction.h:28) = COIN/10
+satoshis per kvB.")
+
+(defun %parse-max-fee-rate (params index)
+  "Core ParseFeeRate (rpc/util.cpp:110-115) for the optional positional
+maxfeerate at INDEX: a BTC/kvB amount defaulting to
+DEFAULT_MAX_RAW_TX_FEE_RATE, which must stay strictly under 1 BTC/kvB.
+Returns satoshis per kvB, where 0 means the caller disabled the rail."
+  (let ((v (and (> (length params) index) (nth index params))))
+    (if (null v)
+        +default-max-raw-tx-fee-rate+
+        (let ((sat (%amount-from-value v)))
+          (when (>= sat 100000000)
+            (error 'rpc-error :code +rpc-invalid-parameter+
+                              :message "Fee rates larger than or equal to 1BTC/kvB are not accepted"))
+          sat))))
+
+(defun %parse-max-burn-amount (params index)
+  "Core's maxburnamount at INDEX (rpc/mempool.cpp:92), a BTC amount defaulting
+to DEFAULT_MAX_BURN_AMOUNT (0) -- no burn is tolerated unless asked for."
+  (let ((v (and (> (length params) index) (nth index params))))
+    (if (null v) 0 (%amount-from-value v))))
+
+(defun %check-max-burn (tx max-burn)
+  "Signal Core's MAX_BURN_EXCEEDED when an output of TX commits more than
+MAX-BURN satoshis to a script that can never spend it -- provably unspendable,
+or one that does not even parse (rpc/mempool.cpp:99-103). Core runs this on the
+DECODED transaction before any validation, so a burning transaction never
+reaches the mempool."
+  (loop for out across (bitcoin-lisp.serialization:transaction-outputs tx)
+        for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey out)
+        when (and (or (bitcoin-lisp.storage:script-unspendable-p spk)
+                      (not (bitcoin-lisp.storage:script-has-valid-ops-p spk)))
+                  (> (bitcoin-lisp.serialization:tx-out-value out) max-burn))
+          do (error 'rpc-error :code +rpc-verify-error+
+                               :message "Unspendable output exceeds maximum configured by user (maxburnamount)")))
+
 (defun rpc-testmempoolaccept (node params)
   "Dry-run mempool acceptance for one or more raw transactions (hex). Returns an
 array of {txid, wtxid, allowed, reject-reason?, vsize, fees{base}} without adding
@@ -1271,28 +1318,49 @@ anything to the mempool. Each tx is checked independently against current state
       ;; requires cs_main even for test_accept).
       (with-node-lock (node)
         (let ((height (bitcoin-lisp.storage:current-height chain-state))
+              (max-fee-rate (%parse-max-fee-rate params 1))
+              ;; Core stops filling in results after the first tx that breaches
+              ;; the rail: a descendant's verdict is meaningless once an
+              ;; ancestor would not be submitted (rpc/mempool.cpp:352-355,381).
+              (exit-early nil)
               (results '()))
           (dolist (tx decoded (nreverse results))
             (push
-             (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-               (multiple-value-bind (valid error fee replaced sigops)
-                   (bitcoin-lisp.validation:validate-transaction-for-mempool
-                    tx utxo-set mempool height :chain-state chain-state)
-                 (declare (ignore replaced))
-                 (if valid
-                     `(("txid" . ,(hash-to-hex txid))
-                       ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
-                       ("allowed" . t)
-                       ;; Core reports ws.m_vsize here — the sigop-adjusted
-                       ;; size, not the raw BIP141 vsize (rpc/mempool.cpp:375).
-                       ("vsize" . ,(bitcoin-lisp.mempool:sigop-adjusted-vsize
-                                    (bitcoin-lisp.serialization:transaction-weight tx)
-                                    sigops))
-                       ("fees" . (("base" . ,(/ (or fee 0) 100000000.0d0)))))
-                     `(("txid" . ,(hash-to-hex txid))
-                       ("wtxid" . ,(hash-to-hex (bitcoin-lisp.serialization:transaction-wtxid tx)))
-                       ("allowed" . ,+json-false+)
-                       ("reject-reason" . ,(string-downcase (symbol-name error)))))))
+             (let ((txid (bitcoin-lisp.serialization:transaction-hash tx))
+                   (wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+               (if exit-early
+                   ;; Validation unfinished: txid and wtxid only, no verdict.
+                   `(("txid" . ,(hash-to-hex txid))
+                     ("wtxid" . ,(hash-to-hex wtxid)))
+                   (multiple-value-bind (valid error fee replaced sigops)
+                       (bitcoin-lisp.validation:validate-transaction-for-mempool
+                        tx utxo-set mempool height :chain-state chain-state)
+                     (declare (ignore replaced))
+                     (if valid
+                         ;; Core reports ws.m_vsize here — the sigop-adjusted
+                         ;; size, not the raw BIP141 vsize (rpc/mempool.cpp:375)
+                         ;; — and caps the fee against that same vsize (:376).
+                         (let* ((vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
+                                        (bitcoin-lisp.serialization:transaction-weight tx)
+                                        sigops))
+                                (max-fee (%feerate-fee max-fee-rate vsize)))
+                           (cond
+                             ((and (plusp max-fee) (> (or fee 0) max-fee))
+                              (setf exit-early t)
+                              `(("txid" . ,(hash-to-hex txid))
+                                ("wtxid" . ,(hash-to-hex wtxid))
+                                ("allowed" . ,+json-false+)
+                                ("reject-reason" . "max-fee-exceeded")))
+                             (t
+                              `(("txid" . ,(hash-to-hex txid))
+                                ("wtxid" . ,(hash-to-hex wtxid))
+                                ("allowed" . t)
+                                ("vsize" . ,vsize)
+                                ("fees" . (("base" . ,(/ (or fee 0) 100000000.0d0))))))))
+                         `(("txid" . ,(hash-to-hex txid))
+                           ("wtxid" . ,(hash-to-hex wtxid))
+                           ("allowed" . ,+json-false+)
+                           ("reject-reason" . ,(string-downcase (symbol-name error))))))))
              results)))))))
 
 (defun rpc-sendrawtransaction (node params)
@@ -1302,7 +1370,10 @@ relay-capable peer (Core sendrawtransaction -> BroadcastTransaction,
 node/transaction.cpp:100-135: AddUnbroadcastTx + InitiateTxBroadcastToAll). A
 tx already in the mempool is not resubmitted but IS re-announced, so the RPC
 doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
-  (let ((hex-str (first params)))
+  (let ((hex-str (first params))
+        ;; Core parses maxburnamount BEFORE decoding the hex (rpc/mempool.cpp:92),
+        ;; so a malformed rail is reported ahead of a malformed transaction.
+        (max-burn (%parse-max-burn-amount params 2)))
     (unless (and (stringp hex-str) (> (length hex-str) 0))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid transaction hex"))
@@ -1311,6 +1382,7 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
                (tx (flexi-streams:with-input-from-sequence (stream tx-bytes)
                      (bitcoin-lisp.serialization:read-transaction stream)))
                (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+          (%check-max-burn tx max-burn)
           ;; Node lock across validate -> accept -> unbroadcast -> announce:
           ;; the whole sequence mutates state the sync thread owns (Core
           ;; BroadcastTransaction runs under cs_main + pool.cs,
@@ -1321,7 +1393,14 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
            (let* ((utxo-set (rpc-get-utxo-set node))
                   (mempool (rpc-get-mempool node))
                   (chain-state (rpc-get-chain-state node))
-                  (current-height (bitcoin-lisp.storage:current-height chain-state)))
+                  (current-height (bitcoin-lisp.storage:current-height chain-state))
+                  ;; ParseFeeRate comes after the burn loop in Core (:107).
+                  ;; The cap is taken on the PLAIN BIP141 vsize here
+                  ;; (GetVirtualTransactionSize, :109) -- not the
+                  ;; sigop-adjusted vsize testmempoolaccept reports.
+                  (max-fee (%feerate-fee
+                            (%parse-max-fee-rate params 1)
+                            (bitcoin-lisp.serialization:transaction-vsize tx))))
             ;; Validate transaction for mempool
             (multiple-value-bind (valid error fee replaced sigops)
                 (bitcoin-lisp.validation:validate-transaction-for-mempool
@@ -1337,6 +1416,16 @@ doubles as a manual rebroadcast (node/transaction.cpp:63-72)."
               (unless valid
                 (error 'rpc-error :code +rpc-transaction-rejected+
                                   :message (format nil "Transaction rejected: ~A" error)))
+              ;; Core runs ATMP with test_accept FIRST and only submits for real
+              ;; once the fee is under the rail (node/transaction.cpp:74-84), so
+              ;; an over-paying transaction never enters the mempool and is
+              ;; never announced. Our VALIDATE-TRANSACTION-FOR-MEMPOOL is
+              ;; already the test-accept half: it computes FEE without
+              ;; mutating the pool, and ACCEPT-VALIDATED-TX below is the
+              ;; submission. A zero rate disables the rail (check_max_fee).
+              (when (and (plusp max-fee) (> fee max-fee))
+                (error 'rpc-error :code +rpc-verify-error+
+                                  :message "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"))
               (let ((add-result (bitcoin-lisp.mempool:accept-validated-tx
                                  mempool txid tx fee current-height
                                  :sigops sigops :replaced replaced)))
@@ -1396,8 +1485,9 @@ per-wtxid object. Status drives which fields are present."
 to the mempool. PARAMS: (package-hex-array [maxfeerate] [maxburnamount]). The
 array is topologically sorted with the child last. Mirrors Bitcoin Core's
 submitpackage: returns {package_msg, tx-results{wtxid -> {...}},
-replaced-transactions}. The maxfeerate/maxburnamount safety rails are accepted
-for API compatibility but not enforced (matching sendrawtransaction here)."
+replaced-transactions}. maxfeerate caps each member's modified feerate and
+aborts the whole package on the first breach; maxburnamount caps the value any
+member may send to a script that can never spend it."
   (let ((hexes (first params))
         (utxo-set (rpc-get-utxo-set node))
         (mempool (rpc-get-mempool node))
@@ -1423,7 +1513,16 @@ for API compatibility but not enforced (matching sendrawtransaction here)."
               (error ()
                 ;; Core: RPC_DESERIALIZATION_ERROR (-22), rpc/mempool.cpp:333.
                 (error 'rpc-error :code +rpc-deserialization-error+
-                                  :message "TX decode failed")))))
+                                  :message "TX decode failed"))))
+            ;; A maxfeerate of 0 disables the rail entirely (Core turns the
+            ;; CFeeRate into nullopt, rpc/mempool.cpp:1358-1362).
+            (client-maxfeerate (let ((r (%parse-max-fee-rate params 1)))
+                                 (and (plusp r) r)))
+            (max-burn (%parse-max-burn-amount params 2)))
+      ;; Every member is burn-checked before any validation runs
+      ;; (rpc/mempool.cpp:1374-1380).
+      (dolist (tx package)
+        (%check-max-burn tx max-burn))
       ;; Node lock across validate-package -> mempool submission ->
       ;; broadcast: package acceptance mutates the mempool tx-by-tx and
       ;; must not interleave with the sync thread (Core AcceptPackage runs
@@ -1432,7 +1531,8 @@ for API compatibility but not enforced (matching sendrawtransaction here)."
           (with-node-lock (node)
             (multiple-value-prog1
                 (bitcoin-lisp.validation:validate-package-for-mempool
-                 package utxo-set mempool chain-state)
+                 package utxo-set mempool chain-state
+                 :client-maxfeerate client-maxfeerate)
               ;; Broadcast every package member that made it into (or already
               ;; was in) the mempool — Core submitpackage runs
               ;; BroadcastTransaction on each such tx (rpc/mempool.cpp:
