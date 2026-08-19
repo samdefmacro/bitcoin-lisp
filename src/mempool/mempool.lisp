@@ -854,7 +854,11 @@ RESULT is mempool-add's keyword. DEFER-TRIM is threaded to MEMPOOL-ADD
       ;; that actually entered counts.
       (when (eq result :ok)
         (bpe-note-entry txid (mempool-entry-fee entry)
-                        (mempool-entry-vsize entry) height))
+                        (mempool-entry-vsize entry) height)
+        ;; ZMQ TransactionAddedToMempool: hashtx/rawtx, then a sequence 'A'
+        ;; carrying the sequence THIS entry was stamped with -- a subscriber
+        ;; uses it to order acceptances against removals.
+        (bitcoin-lisp:zmq-notify-tx-accepted tx txid (mempool-entry-sequence entry)))
       (values result entry))))
 
 (defvar *mempool-removal-reason* nil
@@ -1001,7 +1005,13 @@ shadow checks report as divergence."
       ;; silently discarding the confirmation. Core splits it the same way —
       ;; removeForBlock does not notify the estimator; processBlock does.
       (unless (eq *mempool-removal-reason* :block)
-        (bpe-note-removal txid :in-block nil))
+        (bpe-note-removal txid :in-block nil)
+        ;; ZMQ TransactionRemovedFromMempool is likewise "called for all
+        ;; non-block inclusion reasons" (zmqnotificationinterface.cpp:172): a
+        ;; mined transaction is announced by the block notification, and
+        ;; reporting it here too would show subscribers a removal that never
+        ;; happened.
+        (bitcoin-lisp:zmq-notify-tx-removed txid (mempool-entry-sequence entry)))
       ;; Remove spent outpoint entries
       (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs
                       (mempool-entry-transaction entry)))
