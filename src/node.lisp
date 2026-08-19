@@ -4613,6 +4613,10 @@ phase exits quickly when there's nothing new to fetch."
        :fee-estimator (node-fee-estimator node)
        :recent-rejects (node-recent-rejects node)
        :mempool (node-mempool node)
+       ;; Without this the transaction index is maintained ONLY by the
+       ;; startup catch-up: blocks arriving from the network go unindexed
+       ;; until the next restart. The runtime hooks existed and got NIL.
+       :tx-index (node-tx-index node)
        :address-book (node-address-book node)))))
 
 

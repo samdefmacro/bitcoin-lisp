@@ -876,7 +876,9 @@ committed to the index from announcements."
 ;;; Block handling
 
 (defun accept-downloaded-block (block chain-state utxo-set block-store
-                                &key mempool fee-estimator recent-rejects)
+                                &key mempool fee-estimator recent-rejects
+                                     (tx-index (and *ibd-context*
+                                                    (ibd-context-tx-index *ibd-context*))))
   "Validate and connect a freshly-downloaded block (full, reconstructed, or
 completed compact), handling the fork case correctly. Must be called under the
 node lock. Returns (values valid error).
@@ -903,7 +905,13 @@ never received the branch's blocks."
                   block chain-state block-store utxo-set
                   :fee-estimator fee-estimator
                   :recent-rejects recent-rejects
-                  :mempool mempool)
+                  :mempool mempool
+                  ;; Without this the transaction index is updated ONLY by the
+                  ;; startup catch-up: every block arriving from the network
+                  ;; goes unindexed until the next restart, and a reorg leaves
+                  ;; the index's best-block marker naming a block that is no
+                  ;; longer on the chain.
+                  :tx-index tx-index)
                (declare (ignore entry))
                ;; If CONNECT-BLOCK triggered a reorg that was REFUSED because
                ;; fork blocks are missing from the store, re-download them.

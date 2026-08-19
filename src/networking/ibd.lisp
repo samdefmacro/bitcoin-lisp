@@ -210,6 +210,12 @@ thread mutates it."
   ;; re-add reorg-disconnected ones. Threaded in once at run-ibd entry rather
   ;; than through every networking function.
   (mempool nil)
+  ;; Node transaction index, threaded the same way and for the same reason.
+  ;; Without it the connect path runs with TX-INDEX nil, so -txindex is updated
+  ;; ONLY by the startup catch-up: every block arriving from the network goes
+  ;; unindexed until the next restart, and a reorg leaves the index's
+  ;; best-block marker pointing at a block that is no longer on the chain.
+  (tx-index nil)
   ;; Live peer list and address book for the generic message path
   ;; (handle-message :peers / :address-book). Without these, tx
   ;; ingestion/serving, tx-inv getdata, compact-block relay, and addr
@@ -1878,7 +1884,7 @@ disconnects it so replace-disconnected-peers can refill the slot."
 
 (defun pump-peer-messages (peers chain-state utxo-set block-store
                            &key mempool address-book fee-estimator
-                                recent-rejects ctx)
+                                recent-rejects ctx tx-index)
   "Drain every peer's currently-readable messages once, with the FULL node
 context — the steady-state receive pump. Called ~1x/second from the sync
 thread's between-cycles wait: without it the node had a ~30s window per
@@ -1890,6 +1896,7 @@ ibd-context so the caller can inspect counters (e.g. headers-received > 0
 means a new block was announced and a sync cycle should start now)."
   (let ((ctx (or ctx (make-ibd))))
     (setf (ibd-context-mempool ctx) mempool
+          (ibd-context-tx-index ctx) tx-index
           (ibd-context-peers ctx) peers
           (ibd-context-address-book ctx) address-book)
     ;; process-received-block and the block-activation path read the ambient
@@ -1904,7 +1911,7 @@ means a new block was announced and a sync cycle should start now)."
 
 (defun start-ibd (peers chain-state utxo-set block-store target-height
                    &key fee-estimator recent-rejects mempool address-book
-                     historical-chainstate)
+                     historical-chainstate tx-index)
   "Start Initial Block Download.
 Returns the number of blocks downloaded. HISTORICAL-CHAINSTATE, when
 non-NIL, is the assumeutxo background-validation chainstate — run-ibd adds
@@ -1921,12 +1928,13 @@ a second download cursor for its [tip .. snapshot-base] range."
                 :recent-rejects recent-rejects
                 :mempool mempool
                 :address-book address-book
+                :tx-index tx-index
                 :historical-chainstate historical-chainstate)
     (setf *ibd-context* nil)))
 
 (defun run-ibd (peers chain-state utxo-set block-store
                 &key fee-estimator recent-rejects mempool address-book
-                  historical-chainstate)
+                  historical-chainstate tx-index)
   "Main IBD loop."
   (let ((ctx *ibd-context*)
         (start-height (bitcoin-lisp.storage:current-height chain-state)))
@@ -1936,6 +1944,7 @@ a second download cursor for its [tip .. snapshot-base] range."
     ;; generic fallthrough so tx relay and addr gossip actually run live.
     (when ctx
       (setf (ibd-context-mempool ctx) mempool
+            (ibd-context-tx-index ctx) tx-index
             (ibd-context-peers ctx) peers
             (ibd-context-address-book ctx) address-book))
 
