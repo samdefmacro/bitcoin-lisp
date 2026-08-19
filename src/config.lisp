@@ -752,8 +752,9 @@ specially in config-alist->start-node-plist.")
     "datacarrier" "datacarriersize" "permitbaremultisig"
     "limitclustercount" "limitclustersize" "signetchallenge"
     "proxy" "onion" "proxyrandomize" "onlynet" "cjdnsreachable"
-    "assumevalid" "minimumchainwork" "mempoolexpiry" "minrelaytxfee"
-    "blockmintxfee" "maxtxfee" "fallbackfee" "bantime" "uacomment"
+    "assumevalid" "minimumchainwork" "mempoolexpiry" "maxmempool" "minrelaytxfee"
+    "blockmintxfee" "blockmaxweight" "blockreservedweight"
+    "maxtxfee" "fallbackfee" "bantime" "uacomment"
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
     ;; repeatable start-node option collected outside the spec scan
@@ -888,7 +889,8 @@ options -proxy/-onion/-proxyrandomize (networking's *proxy*/*onion-proxy*),
 the network-reachability options -onlynet (repeatable)/-cjdnsreachable
 (networking's *reachable-networks*/*cjdns-reachable*), plus the Wave-10
 wires: -assumevalid/-minimumchainwork (consensus overrides), -mempoolexpiry,
--minrelaytxfee, -blockmintxfee, -bantime, -uacomment (repeatable),
+-maxmempool, -minrelaytxfee, -blockmintxfee, -blockmaxweight,
+-blockreservedweight, -bantime, -uacomment (repeatable),
 -dnsseed/-fixedseeds, -stopatheight, -port, and -externalip (repeatable).
 CLI-over-file precedence is already applied in MERGED. Called at startup by
 start-node-from-args."
@@ -948,6 +950,18 @@ start-node-from-args."
     ;; (Core mempool_args.cpp:57, default DEFAULT_MEMPOOL_EXPIRY_HOURS 336).
     (let ((v (lk "mempoolexpiry")))
       (when v (setf bitcoin-lisp.mempool:*mempool-expiry-hours* (conf-parse-int v))))
+    ;; -maxmempool: megabytes of mempool MEMORY usage (Core mempool_args.cpp,
+    ;; DEFAULT_MAX_MEMPOOL_SIZE_MB = 300). Under -blocksonly Core soft-sets it
+    ;; to DEFAULT_BLOCKSONLY_MAX_MEMPOOL_SIZE_MB = 5 (init.cpp:826) -- "soft",
+    ;; so an explicit -maxmempool still wins. Read by make-mempool.
+    (let ((v (lk "maxmempool")))
+      (cond
+        (v (let ((mb (conf-parse-int v)))
+             (when (minusp mb)
+               (error "Invalid value for -maxmempool=~A" v))
+             (setf bitcoin-lisp.mempool:*max-mempool-bytes* (* mb 1000 1000))))
+        ((let ((b (lk "blocksonly"))) (and b (conf-parse-bool b)))
+         (setf bitcoin-lisp.mempool:*max-mempool-bytes* (* 5 1000 1000)))))
     ;; -minrelaytxfee: BTC/kvB (Core ParseMoney, mempool_args.cpp:69-81).
     ;; Read at MAKE-MEMPOOL time like the cluster limits.
     (let ((v (lk "minrelaytxfee")))
@@ -964,6 +978,29 @@ start-node-from-args."
           (unless sats
             (error "Invalid amount for -blockmintxfee=~A" v))
           (setf bitcoin-lisp.mining:*block-min-tx-fee-rate* sats))))
+    ;; -blockmaxweight / -blockreservedweight: block-template SELECTION budgets
+    ;; (Core init.cpp:1079-1093). Neither relaxes consensus -- a block we build
+    ;; is still validated against +max-block-weight+ like any other -- so the
+    ;; only checks are Core's: never above the consensus maximum, and never
+    ;; reserve less than MINIMUM_BLOCK_RESERVED_WEIGHT, which could not fit a
+    ;; header plus a realistic coinbase.
+    (let ((v (lk "blockmaxweight")))
+      (when v
+        (let ((w (conf-parse-int v)))
+          (when (> w bitcoin-lisp.validation:+max-block-weight+)
+            (error "Specified -blockmaxweight (~D) exceeds consensus maximum block weight (~D)"
+                   w bitcoin-lisp.validation:+max-block-weight+))
+          (setf bitcoin-lisp.mining:*block-max-weight* w))))
+    (let ((v (lk "blockreservedweight")))
+      (when v
+        (let ((w (conf-parse-int v)))
+          (when (> w bitcoin-lisp.validation:+max-block-weight+)
+            (error "Specified -blockreservedweight (~D) exceeds consensus maximum block weight (~D)"
+                   w bitcoin-lisp.validation:+max-block-weight+))
+          (when (< w bitcoin-lisp.mining:+minimum-block-reserved-weight+)
+            (error "Specified -blockreservedweight (~D) is lower than minimum safety value of (~D)"
+                   w bitcoin-lisp.mining:+minimum-block-reserved-weight+))
+          (setf bitcoin-lisp.mining:*block-reserved-weight* w))))
     ;; -maxtxfee: BTC, absolute cap on any wallet tx fee (Core init: BTC via
     ;; ParseMoney, default DEFAULT_TRANSACTION_MAXFEE = 0.1 BTC).
     (let ((v (lk "maxtxfee")))
