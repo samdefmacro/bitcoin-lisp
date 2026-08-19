@@ -29,6 +29,7 @@
                 ((:file "package")
                  (:file "logging")
                  (:file "config")
+                 (:file "zmq")
                  (:module "coalton"
                   :components ((:file "package")
                                (:file "types")
@@ -208,6 +209,7 @@
                              (:file "bitcoin-core-bip341-tests")
                              (:file "bitcoin-core-key-io-tests")
                              (:file "block-policy-estimator-tests")
+                             (:file "zmq-tests")
                              ;; BIP 158 compact block filter tests
                              (:file "blockfilter-tests")
                              ;; BIP 174 PSBT tests
