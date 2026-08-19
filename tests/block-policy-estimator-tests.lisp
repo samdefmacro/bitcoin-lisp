@@ -297,3 +297,174 @@ transactions are still tracked. Drives the real connect-block."
        (is (= 0 (hash-table-count
                  (bitcoin-lisp.mempool::block-policy-estimator-tracked est)))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+;;;; --- Persistence ---
+
+(defun %bpe-populated (&key (blocks 40))
+  (%bpe-simulate :blocks blocks))
+
+(defun %bpe-bytes (est)
+  (flexi-streams:with-output-to-sequence (mem)
+    (bitcoin-lisp.mempool::bpe-write-to-stream est mem)))
+
+(defun %bpe-load-bytes (est bytes)
+  (flexi-streams:with-input-from-sequence (in bytes)
+    (bitcoin-lisp.mempool::bpe-read-into est in)))
+
+(test estimator-survives-a-save-load-round-trip
+  "Without persistence the estimator answers 0 for hours after every restart,
+because MaxUsableEstimate has to re-accumulate a block span. The restored
+estimator must give the same answer as the one that was saved."
+  (let* ((original (%bpe-populated))
+         (bytes (%bpe-bytes original))
+         (restored (bitcoin-lisp.mempool::make-block-policy-estimator)))
+    (is-true (%bpe-load-bytes restored bytes))
+    (is (= (bitcoin-lisp.mempool::bpe-estimate-smart-fee original 6)
+           (bitcoin-lisp.mempool::bpe-estimate-smart-fee restored 6)))
+    (is (plusp (bitcoin-lisp.mempool::bpe-estimate-smart-fee restored 6))
+        "the round trip must preserve an ANSWER, not agree on zero")
+    (is (= (bitcoin-lisp.mempool::block-policy-estimator-best-height original)
+           (bitcoin-lisp.mempool::block-policy-estimator-best-height restored)))
+    ;; The unconfirmed tracking is per-run and deliberately not stored: the
+    ;; mempool is reloaded and re-reported after a restart, so persisting it
+    ;; would double-count.
+    (is (= 0 (hash-table-count
+              (bitcoin-lisp.mempool::block-policy-estimator-tracked restored))))))
+
+(test estimator-discards-a-corrupt-file-rather-than-half-loading-it
+  "The load discipline that matters: nothing is installed until every horizon
+has parsed and every check has passed. A partially applied estimator would
+answer confidently from nonsense, and fee estimates are spent money."
+  (let* ((bytes (%bpe-bytes (%bpe-populated)))
+         (truncated (subseq bytes 0 (floor (length bytes) 2)))
+         (victim (%bpe-simulate :blocks 40 :fast-feerate 7000d0))
+         (before (bitcoin-lisp.mempool::bpe-estimate-smart-fee victim 6)))
+    (is (plusp before))
+    ;; A truncated file is rejected...
+    (is (null (%bpe-load-bytes victim truncated)))
+    ;; ...and the estimator is exactly as it was.
+    (is (= before (bitcoin-lisp.mempool::bpe-estimate-smart-fee victim 6))
+        "a rejected file must leave the existing estimator untouched")
+    ;; Garbage in the middle is rejected too.
+    (let ((mangled (copy-seq bytes)))
+      (loop for i from 40 below 200 do (setf (aref mangled i) #xFF))
+      (is (null (%bpe-load-bytes victim mangled)))
+      (is (= before (bitcoin-lisp.mempool::bpe-estimate-smart-fee victim 6))))))
+
+(test estimator-rejects-a-file-written-for-a-different-bucket-set
+  "Per-bucket counts only mean anything against the bucket set they were
+recorded in. A file whose buckets differ must be DISCARDED, never remapped —
+silently reinterpreting them would make every count mean something else."
+  (let* ((bytes (%bpe-bytes (%bpe-populated)))
+         (est (bitcoin-lisp.mempool::make-block-policy-estimator)))
+    ;; The bucket vector starts after best-height + the two range words (12
+    ;; bytes) and a 4-byte count; corrupt its first entry.
+    (let ((mangled (copy-seq bytes)))
+      (setf (aref mangled 16) (logxor (aref mangled 16) #x0F))
+      (is (null (%bpe-load-bytes est mangled))))))
+
+(test estimator-rejects-an-impossible-decay-or-scale
+  "Core's TxConfirmStats::Read sanity checks: decay strictly inside (0,1) and a
+non-zero scale. Both are load-bearing — a decay of 1 never forgets and a decay
+of 0 forgets everything, and EstimateMedianVal divides by (1 - decay)."
+  (let* ((est (%bpe-populated))
+         (bytes (%bpe-bytes est))
+         (target (bitcoin-lisp.mempool::make-block-policy-estimator))
+         ;; The first horizon's decay sits right after the bucket vector.
+         (offset (+ 4 4 4 4 (* 8 (length (bitcoin-lisp.mempool::make-fee-buckets))))))
+    ;; decay = 1.0 exactly -> rejected
+    (let ((mangled (copy-seq bytes)))
+      (let ((one (flexi-streams:with-output-to-sequence (m)
+                   (bitcoin-lisp.mempool::%write-double-le m 1d0))))
+        (replace mangled one :start1 offset))
+      (is (null (%bpe-load-bytes target mangled))))
+    ;; decay = 0.0 -> rejected
+    (let ((mangled (copy-seq bytes)))
+      (let ((zero (flexi-streams:with-output-to-sequence (m)
+                    (bitcoin-lisp.mempool::%write-double-le m 0d0))))
+        (replace mangled zero :start1 offset))
+      (is (null (%bpe-load-bytes target mangled))))
+    ;; scale = 0 -> rejected
+    (let ((mangled (copy-seq bytes)))
+      (fill mangled 0 :start (+ offset 8) :end (+ offset 12))
+      (is (null (%bpe-load-bytes target mangled))))))
+
+;;;; --- The fee_estimates.dat file: the seam, and the staleness rule ---
+
+(defconstant +unix-epoch-universal+ 2208988800
+  "Universal time at the Unix epoch, for backdating a file with utime(2).")
+
+(defun %backdate-file (path seconds)
+  (let ((when (- (get-universal-time) +unix-epoch-universal+ seconds)))
+    (sb-posix:utime (namestring path) when when)))
+
+(defun %fee-stats-fixture (name)
+  (let ((dir (ensure-directories-exist
+              (merge-pathnames (format nil "test-feeest-~A/" name)
+                               (uiop:temporary-directory)))))
+    (let ((p (merge-pathnames "fee_estimates.dat" dir)))
+      (when (probe-file p) (delete-file p)))
+    dir))
+
+(test fee-estimates-file-carries-the-policy-estimator
+  "The seam: save-fee-stats and load-fee-stats must actually carry the Core
+estimator's state. Writing a perfect serializer that the file path never calls
+would leave every restart back at zero — and the estimator would look fine in
+its own unit tests."
+  (let* ((dir (%fee-stats-fixture "seam"))
+         (legacy (bitcoin-lisp.mempool:make-fee-estimator :data-directory dir)))
+    (let ((bitcoin-lisp.mempool:*block-policy-estimator* (%bpe-populated)))
+      (let ((expected (bitcoin-lisp.mempool::bpe-estimate-smart-fee
+                       bitcoin-lisp.mempool:*block-policy-estimator* 6)))
+        (is (plusp expected))
+        (bitcoin-lisp.mempool:save-fee-stats legacy)
+        ;; A fresh process: new estimator, new legacy history.
+        (let ((bitcoin-lisp.mempool:*block-policy-estimator*
+                (bitcoin-lisp.mempool::make-block-policy-estimator))
+              (legacy2 (bitcoin-lisp.mempool:make-fee-estimator :data-directory dir)))
+          (is (= 0 (bitcoin-lisp.mempool::bpe-estimate-smart-fee
+                    bitcoin-lisp.mempool:*block-policy-estimator* 6))
+              "a fresh estimator answers 0 before loading")
+          (is-true (bitcoin-lisp.mempool:load-fee-stats legacy2))
+          (is (= expected (bitcoin-lisp.mempool::bpe-estimate-smart-fee
+                           bitcoin-lisp.mempool:*block-policy-estimator* 6))
+              "load-fee-stats must restore the policy estimator, not just the legacy history"))))))
+
+(test fee-estimates-file-past-max-age-is-ignored
+  "Core MAX_FILE_AGE (60 hours): estimates that old describe a network whose
+activity has moved on. Refusing them costs a few hours of accuracy; trusting
+them costs money on every transaction built from them."
+  (let* ((dir (%fee-stats-fixture "stale"))
+         (path (merge-pathnames "fee_estimates.dat" dir))
+         (legacy (bitcoin-lisp.mempool:make-fee-estimator :data-directory dir)))
+    (let ((bitcoin-lisp.mempool:*block-policy-estimator* (%bpe-populated)))
+      (bitcoin-lisp.mempool:save-fee-stats legacy))
+    (is-true (probe-file path))
+    ;; Fresh file: read.
+    (let ((bitcoin-lisp.mempool:*block-policy-estimator*
+            (bitcoin-lisp.mempool::make-block-policy-estimator)))
+      (is-true (bitcoin-lisp.mempool:load-fee-stats
+                (bitcoin-lisp.mempool:make-fee-estimator :data-directory dir))))
+    ;; 61 hours old: refused outright, before anything is parsed.
+    (%backdate-file path (* 61 60 60))
+    (let ((bitcoin-lisp.mempool:*block-policy-estimator*
+            (bitcoin-lisp.mempool::make-block-policy-estimator)))
+      (is (null (bitcoin-lisp.mempool:load-fee-stats
+                 (bitcoin-lisp.mempool:make-fee-estimator :data-directory dir))))
+      (is (= 0 (bitcoin-lisp.mempool::bpe-estimate-smart-fee
+                bitcoin-lisp.mempool:*block-policy-estimator* 6))))
+    ;; 59 hours old: still inside the window.
+    (%backdate-file path (* 59 60 60))
+    (let ((bitcoin-lisp.mempool:*block-policy-estimator*
+            (bitcoin-lisp.mempool::make-block-policy-estimator)))
+      (is-true (bitcoin-lisp.mempool:load-fee-stats
+                (bitcoin-lisp.mempool:make-fee-estimator :data-directory dir))))
+    ;; -acceptstalefeeestimates overrides it, as Core allows on regtest.
+    (%backdate-file path (* 61 60 60))
+    (let ((bitcoin-lisp.mempool:*block-policy-estimator*
+            (bitcoin-lisp.mempool::make-block-policy-estimator))
+          (bitcoin-lisp.mempool:*accept-stale-fee-estimates* t))
+      (is-true (bitcoin-lisp.mempool:load-fee-stats
+                (bitcoin-lisp.mempool:make-fee-estimator :data-directory dir)))
+      (is (plusp (bitcoin-lisp.mempool::bpe-estimate-smart-fee
+                  bitcoin-lisp.mempool:*block-policy-estimator* 6))))))
