@@ -2007,6 +2007,15 @@ Handles chain reorganizations when a competing chain has more work."
                  (when stats
                    (bitcoin-lisp.mempool:fee-estimator-add-stats fee-estimator stats)
                    (bitcoin-lisp.mempool:maybe-flush-fee-stats fee-estimator)))))
+           ;; Core's fee estimator learns from this block: for every
+           ;; transaction it was tracking, how many blocks that feerate waited
+           ;; (processBlock). Untracked txids are ignored, so the whole block
+           ;; goes in. Runs BEFORE the mempool drops the block's transactions,
+           ;; while they are still tracked.
+           (bitcoin-lisp.mempool:bpe-note-block
+            new-height
+            (map 'list #'bitcoin-lisp.serialization:transaction-hash
+                 (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
            ;; Update transaction index if enabled, and move its best-block
            ;; marker with the tip so the next startup resumes here instead of
            ;; re-reading every block from genesis.

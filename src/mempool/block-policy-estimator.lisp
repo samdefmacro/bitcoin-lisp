@@ -315,7 +315,7 @@ processTransaction). Tracked in all three horizons until it confirms or leaves."
   (let ((tracked (block-policy-estimator-tracked est)))
     (unless (gethash txid tracked)
       (setf (gethash txid tracked)
-            (list height
+            (list height feerate
                   (tx-confirm-stats-new-tx (block-policy-estimator-short est) height feerate)
                   (tx-confirm-stats-new-tx (block-policy-estimator-med est) height feerate)
                   (tx-confirm-stats-new-tx (block-policy-estimator-long est) height feerate))))
@@ -328,8 +328,9 @@ at its feerate. Returns T if the transaction was tracked."
   (let* ((tracked (block-policy-estimator-tracked est))
          (entry (gethash txid tracked)))
     (when entry
-      (destructuring-bind (height short-b med-b long-b) entry
-        (let ((best (block-policy-estimator-best-height est)))
+      (destructuring-bind (height feerate short-b med-b long-b) entry
+        (declare (ignore feerate))
+       (let ((best (block-policy-estimator-best-height est)))
           (tx-confirm-stats-remove-tx (block-policy-estimator-short est)
                                       height best short-b in-block)
           (tx-confirm-stats-remove-tx (block-policy-estimator-med est)
@@ -340,8 +341,10 @@ at its feerate. Returns T if the transaction was tracked."
       t)))
 
 (defun bpe-process-block (est height confirmed)
-  "A block at HEIGHT confirmed CONFIRMED, a list of (txid . feerate) for the
-transactions this node had tracked (Core processBlock).
+  "A block at HEIGHT confirmed the transactions named by CONFIRMED, a list of
+txids (Core processBlock). Untracked txids are ignored, so the caller can pass
+every txid in the block; the feerate comes from what was recorded at entry,
+which is the only feerate the estimate may use.
 
 Order matters and mirrors Core: roll the circular buffer and decay FIRST, so
 this block's own data is not immediately decayed, then record each confirmation
@@ -355,12 +358,11 @@ against the number of blocks it waited."
     (tx-confirm-stats-clear-current stats height)
     (tx-confirm-stats-update-moving-averages stats))
   (let ((counted 0))
-    (dolist (cell confirmed)
-      (let* ((txid (car cell))
-             (feerate (cdr cell))
-             (entry (gethash txid (block-policy-estimator-tracked est))))
+    (dolist (txid confirmed)
+      (let ((entry (gethash txid (block-policy-estimator-tracked est))))
         (when entry
-          (let ((blocks-to-confirm (- height (first entry))))
+          (let ((blocks-to-confirm (- height (first entry)))
+                (feerate (second entry)))
             ;; removeTx first, so the transaction stops counting as unconfirmed
             ;; before its confirmation is recorded.
             (bpe-remove-tx est txid t)
@@ -491,3 +493,46 @@ single quiet stretch from collapsing it."
         (let ((cons-est (%bpe-conservative-fee est (* 2 conf-target))))
           (when (> cons-est median) (setf median cons-est))))
       (if (minusp median) 0 (round median)))))
+
+;;;; --- The node-wide instance and its reporting seam ---
+;;;;
+;;;; Core routes these three events through the validation interface. We use a
+;;;; special variable for the same reason: the mempool and connect-block should
+;;;; report what happened without holding a reference to the estimator, and a
+;;;; node that has no estimator (tests, tools) should cost nothing.
+
+(defvar *block-policy-estimator* nil
+  "The node's CBlockPolicyEstimator, installed at startup. NIL disables
+collection entirely.")
+
+(defun bpe-note-entry (txid fee vsize height)
+  "A transaction entered the mempool. FEE in satoshis, VSIZE in vbytes — the
+same pair Core's CFeeRate(fee, size) takes, converted to satoshis per kvB."
+  (let ((est *block-policy-estimator*))
+    (when (and est (plusp vsize))
+      (bpe-process-transaction est txid height
+                               (/ (* (float fee 1d0) 1000d0) (float vsize 1d0))))))
+
+(defun bpe-note-removal (txid &key in-block)
+  "A transaction left the mempool. IN-BLOCK means it confirmed; anything else
+counts as a failure at its feerate, which is the signal that raises estimates."
+  (let ((est *block-policy-estimator*))
+    (when est
+      (bpe-remove-tx est txid in-block))))
+
+(defun bpe-note-block (height txids)
+  "A block at HEIGHT confirmed TXIDS. Untracked ones are ignored, so callers may
+pass every txid in the block."
+  (let ((est *block-policy-estimator*))
+    (when est
+      (bpe-process-block est height txids))))
+
+(defun bpe-smart-fee-sat-per-vb (conf-target &key conservative)
+  "estimateSmartFee in satoshis per VBYTE — the unit ESTIMATE-FEE-RATE reports —
+or NIL when the history cannot support an answer."
+  (let ((est *block-policy-estimator*))
+    (when est
+      (let ((per-kvb (bpe-estimate-smart-fee est conf-target
+                                             :conservative conservative)))
+        (when (plusp per-kvb)
+          (/ per-kvb 1000))))))

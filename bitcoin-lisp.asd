@@ -76,8 +76,8 @@
                                (:file "txgraph")
                                (:file "orphan")
                                (:file "mempool")
-                               (:file "fee-estimator")
-                               (:file "block-policy-estimator")))
+                               (:file "block-policy-estimator")
+                               (:file "fee-estimator")))
                  (:module "mining"
                   :components ((:file "assembler")
                                (:file "builder")))
