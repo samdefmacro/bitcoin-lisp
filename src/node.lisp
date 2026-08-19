@@ -2254,6 +2254,36 @@ Returns the node instance."
     (setf (node-tx-index *node*)
           (bitcoin-lisp.storage:init-tx-index (node-data-directory *node*)
                                                :enabled t))
+    ;; CATCH UP to the tip. Without this, -txindex indexed only blocks
+    ;; connected AFTER startup: BUILD-TX-INDEX existed, was complete, was
+    ;; idempotent -- and had no caller anywhere in the tree. Enabling the flag
+    ;; on a synced node therefore produced an index of 0 entries and
+    ;; getrawtransaction answered -5 "No such mempool or blockchain
+    ;; transaction" for every historical txid, which is the entire purpose of
+    ;; the option. Observed on testnet4 2026-08-19 immediately after enabling
+    ;; it, at height 149088.
+    ;;
+    ;; Safe to run unconditionally: the scan skips blocks already indexed at
+    ;; their active-chain location (%txindex-block-indexed-p checks the block's
+    ;; LAST transaction, so it also re-points entries left stale by a reorg
+    ;; that happened while the index was offline), so a caught-up node pays one
+    ;; pass over the block index and writes nothing.
+    ;;
+    ;; Synchronous, unlike Core's background BaseIndex thread. Acceptable
+    ;; because pruning and txindex are mutually exclusive here, so the only
+    ;; chains this can run over are ones we hold in full; a background thread
+    ;; is the better shape and is left for the same change that gives the index
+    ;; its own catch-up worker.
+    (let ((chainstate (node-current-chainstate *node*))
+          (store (node-block-store *node*)))
+      (when (and chainstate store)
+        (let ((added (bitcoin-lisp.storage:build-tx-index
+                      (node-tx-index *node*) chainstate store
+                      :progress-callback
+                      (lambda (height pct)
+                        (log-info "Transaction index: height ~D (~,1F%)" height pct)))))
+          (when (plusp added)
+            (log-info "Transaction index catch-up added ~D transactions" added)))))
     (log-info "Transaction index loaded: ~D entries"
               (bitcoin-lisp.storage:txindex-count (node-tx-index *node*))))
 

@@ -1818,3 +1818,54 @@ cache is afterwards flushed cleanly."
            (is (eq :unresolvable (bitcoin-lisp::reconcile-coins-db-best-block node))
                "an unplaceable UTXO set is reported, not guessed at"))
       (bitcoin-lisp.storage:close-coins-view-db db))))
+
+(test ga9-txindex-startup-catch-up-is-wired
+  "BUILD-TX-INDEX existed, was complete and was idempotent — and had NO CALLER
+anywhere in the tree. So -txindex indexed only blocks connected AFTER startup:
+enabling it on a synced node produced an index of 0 entries and
+getrawtransaction answered -5 for every historical txid, which is the entire
+purpose of the option. Observed live on testnet4 at height 149088.
+
+Asserted structurally because the alternative is standing up a full node in a
+unit test. The property that matters is that start-node actually calls it —
+a complete, correct, unreachable function is exactly the shape of this bug."
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/node.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search "build-tx-index" src)
+        "start-node must call build-tx-index, or -txindex indexes nothing
+         historical")))
+
+(test ga9-txindex-catch-up-is-idempotent
+  "The catch-up runs unconditionally at every startup, so it must write nothing
+when the index is already current — %txindex-block-indexed-p checks the block's
+LAST transaction, which also re-points entries left stale by a reorg that
+happened while the index was offline."
+  (let* ((dir (merge-pathnames (format nil "txidx-idem-~D/" (get-universal-time))
+                               (uiop:temporary-directory)))
+         (txindex (bitcoin-lisp.storage:init-tx-index dir :enabled t)))
+    (unwind-protect
+         (progn
+           (is (= 0 (bitcoin-lisp.storage:txindex-count txindex))
+               "a fresh index is empty")
+           ;; A LevelDB-backed index answers lookups without any in-memory map.
+           (let ((txid (make-array 32 :element-type '(unsigned-byte 8)
+                                      :initial-element 3))
+                 (bh (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element 4)))
+             (bitcoin-lisp.storage:txindex-add txindex txid bh 7)
+             (let ((loc (bitcoin-lisp.storage:txindex-lookup txindex txid)))
+               (is-true loc "the entry must be readable straight from the DB")
+               (is (= 7 (bitcoin-lisp.storage:tx-location-tx-position loc)))
+               (is (equalp bh (bitcoin-lisp.storage:tx-location-block-hash loc))))
+             ;; Upsert: a re-mined transaction re-points rather than duplicating.
+             (let ((bh2 (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 5)))
+               (bitcoin-lisp.storage:txindex-add txindex txid bh2 1)
+               (is (= 1 (bitcoin-lisp.storage:txindex-count txindex))
+                   "upsert must not create a second entry")
+               (is (equalp bh2 (bitcoin-lisp.storage:tx-location-block-hash
+                                (bitcoin-lisp.storage:txindex-lookup txindex txid)))
+                   "and the location must be the NEW block"))))
+      (bitcoin-lisp.storage:close-tx-index txindex)
+      (ignore-errors (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore)))))
