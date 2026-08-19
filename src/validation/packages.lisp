@@ -219,6 +219,21 @@ AcceptPackage (validation.cpp:1728)."
            mempool txid tx fee height :entry-time now :sigops sigops
            :replaced rset :defer-trim t)))
 
+(defun %finalize-package-results (package results reason)
+  "The per-tx result list for an aborted package: whatever RESULTS already
+holds for the members processed so far, and a :not-validated placeholder
+carrying REASON for the members Core never got to (its early return leaves
+them absent from m_tx_results)."
+  (mapcar (lambda (tx)
+            (let ((wtxid (bitcoin-lisp.serialization:transaction-wtxid tx)))
+              (or (gethash wtxid results)
+                  (make-package-tx-result
+                   :txid (bitcoin-lisp.serialization:transaction-hash tx)
+                   :wtxid wtxid
+                   :status :not-validated
+                   :error reason))))
+          package))
+
 (defun %results-not-validated (package reason)
   "A not-validated result for every tx in PACKAGE — used when a context-free
 package check fails before any tx is processed."
@@ -529,7 +544,8 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
                   (setf failure (or failure add-result))))))
         (or failure :success)))))
 
-(defun validate-package-for-mempool (package utxo-set mempool chain-state)
+(defun validate-package-for-mempool (package utxo-set mempool chain-state
+                                    &key client-maxfeerate)
   "Validate and submit a transaction PACKAGE (a topologically-sorted list of
 transactions, the last being the child) to the mempool. Mirrors Bitcoin Core's
 ProcessNewPackage -> AcceptPackage: context-free well-formedness + child-with-
@@ -546,6 +562,13 @@ mutates the mempool only after every check has passed
 (%ACCEPT-PACKAGE-SUBSET).
 
 Returns (values msg results replaced):
+CLIENT-MAXFEERATE is submitpackage's caller-supplied cap in satoshis per kvB
+(Core AcceptPackage's m_client_maxfeerate). NIL disables it, which is what a
+maxfeerate of 0 means. A member whose modified feerate exceeds it aborts the
+WHOLE package immediately, leaving later members unvalidated
+(validation.cpp:1365-1368,1453-1462) — members already accepted stay in the
+mempool, exactly as in Core's early return.
+
   MSG       — :success, or a package-/tx-level failure reason keyword
   RESULTS   — a list of PACKAGE-TX-RESULT, one per package tx, in package order
   REPLACED  — list of txids (byte vectors) evicted by RBF during acceptance."
@@ -596,9 +619,28 @@ Returns (values msg results replaced):
             (t
              ;; CHAIN-STATE keeps the finality/BIP68 checks on (Core PreChecks
              ;; runs them for every package member, validation.cpp:819,886-889).
-             (multiple-value-bind (valid err fee rset sigops)
+             (multiple-value-bind (valid err fee rset sigops modified-fee)
                  (validate-transaction-for-mempool tx utxo-set mempool height
                                                    :chain-state chain-state)
+               ;; The caller's feerate cap is checked in PreChecks, i.e. BEFORE
+               ;; submission, and aborts the whole package on the first breach
+               ;; (validation.cpp:1365-1368). Compare exactly, by
+               ;; cross-multiplication: modified-fee/vsize > rate/1000. Core
+               ;; compares CFeeRate(m_modified_fees, m_vsize), so the
+               ;; prioritised fee against the sigop-adjusted size.
+               (when (and valid client-maxfeerate)
+                 (let ((vsize (bitcoin-lisp.mempool:sigop-adjusted-vsize
+                               (bitcoin-lisp.serialization:transaction-weight tx)
+                               sigops)))
+                   (when (> (* (or modified-fee fee) 1000)
+                            (* client-maxfeerate vsize))
+                     (%mark-result-invalid res :max-feerate-exceeded)
+                     (return-from validate-package-for-mempool
+                       (values :transaction-failed
+                               (%finalize-package-results package results
+                                                          :max-feerate-exceeded)
+                               (loop for k being the hash-keys of replaced
+                                     collect k))))))
                (cond
                  (valid
                   (let ((add-result (%accept-into-mempool tx txid fee sigops

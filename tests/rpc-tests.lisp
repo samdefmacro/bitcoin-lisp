@@ -1066,6 +1066,176 @@ validation.cpp:2117) through testmempoolaccept."
         (is (string= "mempool-script-verify-flag-failed"
                      (cdr (assoc "reject-reason" r :test #'string=))))))))
 
+
+;;; --- Raw-transaction safety rails (Core node/transaction.h:28-34) ---
+;;;
+;;; maxfeerate and maxburnamount are the two fat-finger rails on the raw-tx
+;;; RPCs. Both are ON by default. The rails must fire BEFORE submission: a
+;;; transaction that trips one must never reach the mempool and must never be
+;;; announced, which is what makes them a safety rail rather than a report.
+
+(defun %rails-error (thunk)
+  "(values code message) of the rpc-error THUNK signals, or NIL if it returns."
+  (handler-case (progn (funcall thunk) nil)
+    (bitcoin-lisp.rpc::rpc-error (e)
+      (values (bitcoin-lisp.rpc::rpc-error-code e)
+              (bitcoin-lisp.rpc::rpc-error-message e)))))
+
+(defun %burn-tx (funding-txid value)
+  "A P2SH(OP_TRUE) spend paying VALUE to a provably-unspendable OP_RETURN."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 2
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash funding-txid :index 0)
+                    :script-sig (%p2sh-optrue-scriptsig)
+                    :sequence #xffffffff))
+   :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                     :value value
+                     :script-pubkey (make-array 2 :element-type '(unsigned-byte 8)
+                                                  :initial-contents '(#x6a #x51))))
+   :lock-time 0))
+
+(test rpc-sendrawtransaction-maxfeerate-rail
+  "An absurd fee is refused with Core's MAX_FEE_EXCEEDED (-25) and the tx
+neither enters the mempool nor gets announced — Core runs ATMP with
+test_accept first and only submits once the fee is under the rail
+(node/transaction.cpp:74-84). maxfeerate=0 switches the rail off."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (let* ((peer (bitcoin-lisp.networking:make-peer :state :ready))
+           (node (%broadcast-test-node utxo-set mempool chain-state peer))
+           ;; 1 BTC in, 0.01 BTC out: a 0.99 BTC fee on 85 vbytes, far over the
+           ;; 0.1 BTC/kvB default (85 vbytes buys a 0.0085 BTC cap).
+           (tx (%pkg-tx funding-txid 0 1000000))
+           (hex (bitcoin-lisp.crypto:bytes-to-hex
+                 (bitcoin-lisp.serialization:serialize-transaction tx))))
+      (multiple-value-bind (code msg)
+          (%rails-error (lambda ()
+                          (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))))
+        (is (= -25 code))
+        (is-true (search "Fee exceeds maximum" msg)))
+      ;; The control that matters: the rail ran BEFORE submission.
+      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))
+      (is (null (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+      ;; Disabled explicitly -> the very same tx is accepted and announced.
+      (is (string= (bitcoin-lisp.rpc::hash-to-hex
+                    (bitcoin-lisp.serialization:transaction-hash tx))
+                   (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex 0))))
+      (is (= 1 (bitcoin-lisp.mempool:mempool-count mempool)))
+      (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer)))))))
+
+(test rpc-sendrawtransaction-maxfeerate-rejects-one-btc
+  "ParseFeeRate refuses a rate at or above 1 BTC/kvB with -8
+(rpc/util.cpp:110-115)."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (let* ((node (%broadcast-test-node utxo-set mempool chain-state
+                                       (bitcoin-lisp.networking:make-peer :state :ready)))
+           (hex (bitcoin-lisp.crypto:bytes-to-hex
+                 (bitcoin-lisp.serialization:serialize-transaction
+                  (%pkg-tx funding-txid 0 99990000)))))
+      (is (= -8 (%rails-error
+                 (lambda () (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex 1))))))
+      ;; Just under the bound is fine.
+      (is (null (%rails-error
+                 (lambda ()
+                   (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex 0.99d0)))))))))
+
+(test rpc-sendrawtransaction-maxburnamount-rail
+  "Value sent to a provably-unspendable output is refused with Core's
+MAX_BURN_EXCEEDED (-25), and the default cap is 0 (rpc/mempool.cpp:92-103)."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (let* ((node (%broadcast-test-node utxo-set mempool chain-state
+                                       (bitcoin-lisp.networking:make-peer :state :ready)))
+           (tx (%burn-tx funding-txid 99900000))
+           (hex (bitcoin-lisp.crypto:bytes-to-hex
+                 (bitcoin-lisp.serialization:serialize-transaction tx))))
+      (multiple-value-bind (code msg)
+          (%rails-error (lambda ()
+                          (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex))))
+        (is (= -25 code))
+        (is-true (search "maxburnamount" msg)))
+      ;; Raising the cap clears THIS rail: the tx now gets as far as ordinary
+      ;; policy, which rejects it for its size instead (-26). Proves the burn
+      ;; check was the only thing stopping it, and that it ran first.
+      (multiple-value-bind (code msg)
+          (%rails-error (lambda ()
+                          (bitcoin-lisp.rpc::rpc-sendrawtransaction node (list hex nil 1))))
+        (is (= -26 code))
+        (is-false (search "maxburnamount" msg)))
+      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool))))))
+
+(test rpc-testmempoolaccept-max-fee-exceeded
+  "Over the rail, testmempoolaccept reports allowed=false with reject-reason
+\"max-fee-exceeded\" and then stops filling in verdicts: every later member
+carries txid and wtxid only, because a descendant's verdict is meaningless
+once an ancestor would not be submitted (rpc/mempool.cpp:352-355,381)."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (let* ((node (%broadcast-test-node utxo-set mempool chain-state
+                                       (bitcoin-lisp.networking:make-peer :state :ready)))
+           (parent (%pkg-tx funding-txid 0 1000000))
+           (child (%pkg-tx (bitcoin-lisp.serialization:transaction-hash parent) 0 900000))
+           (ph (bitcoin-lisp.crypto:bytes-to-hex
+                (bitcoin-lisp.serialization:serialize-transaction parent)))
+           (ch (bitcoin-lisp.crypto:bytes-to-hex
+                (bitcoin-lisp.serialization:serialize-transaction child)))
+           (r (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list ph ch)))))
+      (is (eq 'yason:false (cdr (assoc "allowed" (first r) :test #'string=))))
+      (is (string= "max-fee-exceeded"
+                   (cdr (assoc "reject-reason" (first r) :test #'string=))))
+      ;; Unfinished: no verdict at all on the child.
+      (is (equal '("txid" "wtxid") (mapcar #'car (second r))))
+      ;; Rail off -> the parent is allowed again.
+      (let ((off (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list (list ph) 0))))
+        (is (eq t (cdr (assoc "allowed" (first off) :test #'string=)))))
+      ;; Still a dry run either way.
+      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool))))))
+
+(test package-client-maxfeerate-aborts-package
+  "A member over submitpackage's maxfeerate aborts the WHOLE package before
+submission: that member is invalid with :max-feerate-exceeded, later members
+are :not-validated, and nothing enters the mempool (validation.cpp:1365-1368)."
+  (multiple-value-bind (utxo-set mempool chain-state funding-txid) (%pkg-fixture)
+    (let* ((parent (%pkg-tx funding-txid 0 1000000))
+           (child (%pkg-tx (bitcoin-lisp.serialization:transaction-hash parent) 0 900000)))
+      (multiple-value-bind (msg results)
+          (bitcoin-lisp.validation:validate-package-for-mempool
+           (list parent child) utxo-set mempool chain-state
+           :client-maxfeerate 10000000)
+        (is (eq :transaction-failed msg))
+        (is (eq :invalid (bitcoin-lisp.validation:package-tx-result-status
+                          (%result-for results parent))))
+        (is (eq :max-feerate-exceeded (bitcoin-lisp.validation:package-tx-result-error
+                                       (%result-for results parent))))
+        (is (eq :not-validated (bitcoin-lisp.validation:package-tx-result-status
+                                (%result-for results child)))))
+      (is (= 0 (bitcoin-lisp.mempool:mempool-count mempool)))
+      ;; NIL cap (what maxfeerate=0 becomes) leaves the package alone.
+      (multiple-value-bind (msg2) (bitcoin-lisp.validation:validate-package-for-mempool
+                                   (list parent child) utxo-set mempool chain-state)
+        (is (eq :success msg2)))
+      (is (= 2 (bitcoin-lisp.mempool:mempool-count mempool))))))
+
+(test script-has-valid-ops-p-matches-core
+  "CScript::HasValidOps: a truncated push, an over-long push, and an undefined
+opcode above MAX_OPCODE all make a script unparseable (script.cpp)."
+  (flet ((spk (&rest bytes)
+           (make-array (length bytes) :element-type '(unsigned-byte 8)
+                                      :initial-contents bytes)))
+    ;; OP_RETURN OP_1, and a well-formed 2-byte push: both parse.
+    (is-true (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x6a #x51)))
+    (is-true (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x02 #xaa #xbb)))
+    (is-true (bitcoin-lisp.storage:script-has-valid-ops-p (spk)))
+    ;; Direct push running off the end.
+    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x05 #xaa)))
+    ;; OP_PUSHDATA1 with a truncated length byte, then a truncated payload.
+    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x4c)))
+    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x4c #x03 #xaa)))
+    ;; OP_PUSHDATA2 declaring 521 bytes: over MAX_SCRIPT_ELEMENT_SIZE.
+    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #x4d #x09 #x02)))
+    ;; 0xba is the first byte above MAX_OPCODE (OP_NOP10 = 0xb9).
+    (is-true (bitcoin-lisp.storage:script-has-valid-ops-p (spk #xb9)))
+    (is-false (bitcoin-lisp.storage:script-has-valid-ops-p (spk #xba)))))
+
 ;;; --- Wave 9D: RPC/mempool locking discipline ---
 
 (test rpc-mempool-mutators-hold-node-lock

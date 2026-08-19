@@ -26,6 +26,51 @@ application here does the same."
   (or (and (plusp (length script)) (= (aref script 0) #x6a))
       (> (length script) +max-script-size+)))
 
+(defconstant +max-opcode+ #xb9
+  "Bitcoin Core MAX_OPCODE (script.h:216) = OP_NOP10. Byte values above it are
+undefined opcodes.")
+
+(defconstant +max-script-element-size+ 520
+  "Bitcoin Core MAX_SCRIPT_ELEMENT_SIZE (script.h:28).")
+
+(defun script-has-valid-ops-p (script)
+  "T if SCRIPT parses cleanly (Bitcoin Core CScript::HasValidOps, script.cpp):
+every opcode decodes, none is above MAX_OPCODE, and no push carries more than
+MAX_SCRIPT_ELEMENT_SIZE bytes. A truncated push makes GetOp fail, so the script
+is invalid.
+
+Core pairs this with SCRIPT-UNSPENDABLE-P in exactly one place — the
+maxburnamount rail on the raw-transaction RPCs (rpc/mempool.cpp:100) — where
+`unspendable OR unparseable` is the definition of an output whose value is
+burned rather than merely hard to spend."
+  (declare (type (simple-array (unsigned-byte 8) (*)) script))
+  (let ((len (length script))
+        (pos 0))
+    (loop
+      (when (>= pos len) (return t))
+      (let ((opcode (aref script pos)))
+        (incf pos)
+        (cond
+          ;; Direct push: the opcode IS the byte count, so at most 75 — never
+          ;; over MAX_SCRIPT_ELEMENT_SIZE, but it can still run off the end.
+          ((< opcode #x4c)
+           (when (> (+ pos opcode) len) (return nil))
+           (incf pos opcode))
+          ;; OP_PUSHDATA1/2/4: a 1-, 2- or 4-byte little-endian length follows.
+          ((<= #x4c opcode #x4e)
+           (let ((size-bytes (ecase opcode (#x4c 1) (#x4d 2) (#x4e 4))))
+             (when (> (+ pos size-bytes) len) (return nil))   ; truncated length
+             (let ((n 0))
+               (dotimes (k size-bytes)
+                 (setf n (logior n (ash (aref script (+ pos k)) (* 8 k)))))
+               (incf pos size-bytes)
+               (when (or (> n +max-script-element-size+)
+                         (> (+ pos n) len))                   ; truncated payload
+                 (return nil))
+               (incf pos n))))
+          ;; Non-push byte: valid only up to MAX_OPCODE.
+          ((> opcode +max-opcode+) (return nil)))))))
+
 ;;; UTXO-KEY — the per-output identity used as the hash-table key.
 ;;;
 ;;; Pack the 32-byte txid as four (unsigned-byte 64) words (LE-interpreted)
