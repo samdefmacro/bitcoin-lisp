@@ -2357,6 +2357,12 @@ Returns the node instance."
   ;; Load persisted fee stats
   (bitcoin-lisp.mempool:load-fee-stats (node-fee-estimator *node*))
 
+  ;; Core's CBlockPolicyEstimator, which learns from how long each feerate
+  ;; actually waited rather than from a percentile of what miners took. The
+  ;; mempool and connect-block report into it through this one binding.
+  (setf bitcoin-lisp.mempool:*block-policy-estimator*
+        (bitcoin-lisp.mempool:make-block-policy-estimator))
+
   ;; Reload the persisted mempool through normal acceptance (Core LoadMempool)
   (load-mempool-from-disk *node*)
 

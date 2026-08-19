@@ -969,6 +969,14 @@
    #:save-fee-stats
    #:load-fee-stats
    #:maybe-flush-fee-stats
+   ;; Core CBlockPolicyEstimator (G7-21)
+   #:*block-policy-estimator*
+   #:make-block-policy-estimator
+   #:bpe-note-entry
+   #:bpe-note-removal
+   #:bpe-note-block
+   #:bpe-smart-fee-sat-per-vb
+   #:bpe-estimate-smart-fee
    ;; Fee estimation
    #:estimate-fee-rate))
 

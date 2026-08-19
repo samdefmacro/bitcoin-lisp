@@ -76,6 +76,7 @@
                                (:file "txgraph")
                                (:file "orphan")
                                (:file "mempool")
+                               (:file "block-policy-estimator")
                                (:file "fee-estimator")))
                  (:module "mining"
                   :components ((:file "assembler")
@@ -206,6 +207,7 @@
                              ;; Bitcoin Core BIP 341 taproot test vectors
                              (:file "bitcoin-core-bip341-tests")
                              (:file "bitcoin-core-key-io-tests")
+                             (:file "block-policy-estimator-tests")
                              ;; BIP 158 compact block filter tests
                              (:file "blockfilter-tests")
                              ;; BIP 174 PSBT tests
