@@ -2203,6 +2203,28 @@ a second download cursor for its [tip .. snapshot-base] range."
                            :fee-estimator fee-estimator
                            :recent-rejects recent-rejects))
 
+    ;; Activate the best chain we can actually reach, whether or not a block
+    ;; arrived this pass (Core ActivateBestChain runs from ProcessNewBlock AND
+    ;; from startup, not only on arrival). Without this the ONLY reorg trigger
+    ;; is connect-block, so a heavier chain whose bodies are already on disk —
+    ;; the normal outcome after a refused reorg re-downloads its missing
+    ;; blocks, or after a restart — sits unactivated until some unrelated block
+    ;; happens to arrive. Live on 2026-08-19: testnet4 held tip 149110 for 40+
+    ;; minutes with a fully-downloaded, strictly-heavier 149120 branch on disk.
+    (multiple-value-bind (switched missing)
+        (bitcoin-lisp.validation:activate-best-chain
+         chain-state block-store utxo-set
+         :fee-estimator fee-estimator
+         :recent-rejects recent-rejects
+         :mempool mempool)
+      (when switched
+        (bitcoin-lisp:log-info "Activated best chain: tip now height ~D"
+                               (bitcoin-lisp.storage:current-height chain-state)))
+      ;; Refused for want of block bodies — re-request them, exactly as the
+      ;; arrival path does.
+      (when (consp missing)
+        (queue-missing-fork-blocks missing)))
+
     ;; Done — distinguish "actually finished" from "paused due to no peers".
     ;; Either: pending+in-flight both zero (we drained), OR
     ;; current-height ≥ header-tip-height (we caught up; any leftover

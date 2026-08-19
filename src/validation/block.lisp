@@ -2885,23 +2885,82 @@ comparison is what the block index is keyed by anyway."
              (bitcoin-lisp.storage::chain-state-block-index chain-state))
     result))
 
-(defun best-valid-tip (chain-state block-store)
-  "The highest-chain-work block-index entry that is not :invalid AND whose block
-is present in BLOCK-STORE — the target the active chain can actually reorg to.
-The block-presence filter excludes header-only entries (status :header-valid with
-no downloaded block), which on a live node routinely outrank everything; without
-it best-valid-tip would name an unreachable header and the reorg would no-op."
-  (let ((best nil))
+(defun best-valid-tip (chain-state block-store &optional (min-work 0))
+  "The highest-chain-work block-index entry that is not :invalid, carries MORE
+than MIN-WORK, AND whose block is present in BLOCK-STORE — the target the active
+chain can actually reorg to. The block-presence filter excludes header-only
+entries (status :header-valid with no downloaded block), which on a live node
+routinely outrank everything; without it best-valid-tip would name an
+unreachable header and the reorg would no-op.
+
+Test order matters for cost, not just correctness. BLOCK-EXISTS-P is a
+filesystem probe, so testing it per entry is ~1M syscalls on a mainnet-sized
+index — which is why this was previously only affordable from the
+reconsiderblock RPC. Chain-work is an in-memory integer compare, so it goes
+first, and MIN-WORK (the caller's current tip work) prunes the probe down to
+the handful of entries that could actually beat the tip. On a synced node that
+is zero probes."
+  (let ((best nil)
+        (best-work min-work))
     (maphash (lambda (h e) (declare (ignore h))
-               (when (and (not (eq (bitcoin-lisp.storage:block-index-entry-status e) :invalid))
-                          (bitcoin-lisp.storage:block-exists-p
-                           block-store (bitcoin-lisp.storage:block-index-entry-hash e))
-                          (or (null best)
-                              (> (bitcoin-lisp.storage:block-index-entry-chain-work e)
-                                 (bitcoin-lisp.storage:block-index-entry-chain-work best))))
-                 (setf best e)))
+               (let ((w (bitcoin-lisp.storage:block-index-entry-chain-work e)))
+                 (when (and (> w best-work)
+                            (not (eq (bitcoin-lisp.storage:block-index-entry-status e) :invalid))
+                            (bitcoin-lisp.storage:block-exists-p
+                             block-store (bitcoin-lisp.storage:block-index-entry-hash e)))
+                   (setf best e
+                         best-work w))))
              (bitcoin-lisp.storage::chain-state-block-index chain-state))
     best))
+
+(defun activate-best-chain (chain-state block-store utxo-set
+                            &key tx-index fee-estimator recent-rejects mempool)
+  "Reorganize onto the most-work fully-downloaded valid chain when it beats the
+active tip. Returns (values switched-p missing-blocks), where MISSING-BLOCKS is
+perform-reorg's re-queue list if a switch was refused for want of block bodies.
+
+Bitcoin Core's ActivateBestChain (validation.cpp): it loops FindMostWorkChain
+until the tip IS the most-work candidate, and it runs from ProcessNewBlock AND
+from startup — not only on the arrival of a block.
+
+We previously reorganized ONLY from CONNECT-BLOCK, i.e. only when a block
+arrived whose chain-work beat the tip. A heavier chain whose blocks are ALREADY
+on disk therefore sat unactivated indefinitely, because nothing re-evaluated
+it: the arrival that would have triggered the switch had already happened and
+been refused (missing bodies at the time), or happened before a restart.
+
+Observed live 2026-08-19: testnet4 sat on tip 149110 for 40+ minutes while a
+fully-downloaded 149120 branch with strictly more work lay on disk, and mainnet
+showed five stale-tip episodes in a day that cleared only when some new block
+happened to arrive and re-trigger the path.
+
+The loop terminates: each successful switch moves the tip TO the maximum-work
+candidate, so the next pass finds nothing above it. The iteration cap is a
+backstop against a candidate that reorgs away and reappears."
+  (let ((switched nil)
+        (missing '()))
+    (dotimes (i 4)
+      (let* ((tip (bitcoin-lisp.storage:get-block-index-entry
+                   chain-state (bitcoin-lisp.storage:best-block-hash chain-state)))
+             (tip-work (if tip
+                           (bitcoin-lisp.storage:block-index-entry-chain-work tip)
+                           0))
+             (target (best-valid-tip chain-state block-store tip-work)))
+        (when (or (null tip) (null target))
+          (return))
+        (multiple-value-bind (ok detail)
+            (perform-reorg chain-state block-store utxo-set tip target
+                           :tx-index tx-index :fee-estimator fee-estimator
+                           :recent-rejects recent-rejects :mempool mempool)
+          (cond
+            (ok (setf switched t))
+            (t
+             ;; :interrupted means the node is stopping — not a refusal to
+             ;; re-queue against.
+             (unless (eq detail :interrupted)
+               (setf missing detail))
+             (return))))))
+    (values switched missing)))
 
 (defun invalidate-block (chain-state block-store utxo-set block-hash
                          &key tx-index fee-estimator recent-rejects mempool)
