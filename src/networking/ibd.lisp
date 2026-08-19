@@ -678,23 +678,10 @@ Uses the current network from bitcoin-lisp:*network*."
         0)))
 
 (defun default-assumevalid ()
-  "The current network's defaultAssumeValid block hash in WIRE byte order (the
-form block-index keys use), or NIL when assumevalid is disabled. This is a
-recent known-good block shipped with the release; signature checks are skipped
-for its ancestors during IBD (Bitcoin Core consensus.defaultAssumeValid). Values
-mirror Core exactly (stored here as the display hash, reversed to wire order like
-get-checkpoint-hash). bitcoin-lisp:*assumevalid-override* (when not :UNSET) takes
-precedence — a wire-order hash to force, or NIL to disable."
-  (if (not (eq bitcoin-lisp:*assumevalid-override* :unset))
-      bitcoin-lisp:*assumevalid-override*
-      (let ((display (ecase bitcoin-lisp:*network*
-                       (:mainnet  "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac")
-                       (:testnet3 "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4")
-                       (:testnet4 "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a")
-                       (:signet   "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329")
-                       (:regtest  nil))))
-        (when display
-          (reverse (bitcoin-lisp.crypto:hex-to-bytes display))))))
+  "The current network's defaultAssumeValid hash in wire order, or NIL.
+The table itself now lives in config.lisp as NETWORK-ASSUMEVALID, because the
+validation layer must consult it per block and loads before this file."
+  (bitcoin-lisp:network-assumevalid bitcoin-lisp:*network*))
 
 (defun assumevalid-skip-height (chain-state)
   "Height of the hardcoded assumevalid block when its header is already in our
@@ -711,13 +698,20 @@ so a block carrying it pins a known-good ancestor chain. Mirrors Bitcoin Core's
               -1)))))
 
 (defun script-skip-height (chain-state)
-  "Highest block height for which signature validation may be skipped during IBD:
-the greater of the last checkpoint height and the assumevalid block's height.
-Blocks at or below this height still get FULL structural / PoW / amount / sequence
-validation — only signature checks are skipped, exactly as Bitcoin Core does for
-ancestors of the last checkpoint and -assumevalid."
-  (max (last-checkpoint-height)
-       (assumevalid-skip-height chain-state)))
+  "Highest height at which a signature skip is even CONSIDERED: the assumevalid
+block's height, or -1 when its header is not in our index.
+
+This is a cheap pre-filter only. The decision itself is
+BITCOIN-LISP.VALIDATION:SCRIPT-CHECKS-SKIPPABLE-P, which additionally requires
+the block to be an ANCESTOR of the assumevalid block — Core's fScriptChecks
+(validation.cpp:2342-2380) is a per-block predicate, not a height comparison.
+
+The checkpoint term is GONE. Checkpoints play no part in Core's fScriptChecks,
+and including them meant that whenever the assumevalid header was not yet in
+our index — the entire first phase of a fresh IBD — we skipped every signature
+up to 840,000 on mainnet and 2,000,000 on testnet3, where Core verifies all of
+them."
+  (assumevalid-skip-height chain-state))
 
 (defun validate-checkpoint (hash height)
   "Validate that HASH at HEIGHT matches any applicable checkpoint.
@@ -3367,7 +3361,11 @@ candidate activated."
               (bitcoin-lisp.validation:activate-block
                blk chain-state block-store utxo-set
                :current-time (bitcoin-lisp.serialization:get-unix-time)
-               :skip-scripts (<= height (script-skip-height chain-state))
+               :skip-scripts (bitcoin-lisp.validation:script-checks-skippable-p
+                              chain-state
+                              (bitcoin-lisp.serialization:block-header-hash
+                               (bitcoin-lisp.serialization:bitcoin-block-header blk))
+                              height)
                :fee-estimator fee-estimator
                :recent-rejects recent-rejects
                :mempool mempool))
@@ -3476,7 +3474,11 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                   (with-node-lock
                     (bitcoin-lisp.validation:activate-block
                      block chain-state block-store utxo-set
-                     :skip-scripts (<= height (script-skip-height chain-state))
+                     :skip-scripts (bitcoin-lisp.validation:script-checks-skippable-p
+                                 chain-state
+                                 (bitcoin-lisp.serialization:block-header-hash
+                                  (bitcoin-lisp.serialization:bitcoin-block-header block))
+                                 height)
                      :fee-estimator fee-estimator
                      :recent-rejects recent-rejects
                      :mempool mempool))
@@ -3544,7 +3546,14 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                  height)
                 nil)
           (let ((current-time (bitcoin-lisp.serialization:get-unix-time))
-                (skip-scripts (<= height (script-skip-height chain-state))))
+                ;; Core's fScriptChecks is a PER-BLOCK predicate, not a height
+                ;; comparison: the block must be an ancestor of the assumevalid
+                ;; block (validation.cpp:2342-2380).
+                (skip-scripts (bitcoin-lisp.validation:script-checks-skippable-p
+                               chain-state
+                               (bitcoin-lisp.serialization:block-header-hash
+                                (bitcoin-lisp.serialization:bitcoin-block-header block))
+                               height)))
             (multiple-value-bind (activated error missing-blocks)
                 ;; Node lock per block connect (drain-block-queue then
                 ;; re-takes it per drained block, so RPC threads interleave
@@ -3764,7 +3773,11 @@ the tip is ready to connect."
         ;; tip-extend, pre-reorg+activate, or store-only based on the
         ;; incoming block's parent vs. our current tip.
         (let* ((current-time (bitcoin-lisp.serialization:get-unix-time))
-               (skip-scripts (<= next-height skip-height)))
+               (skip-scripts (bitcoin-lisp.validation:script-checks-skippable-p
+                              chain-state
+                              (bitcoin-lisp.serialization:block-header-hash
+                               (bitcoin-lisp.serialization:bitcoin-block-header block))
+                              next-height)))
           (multiple-value-bind (activated error missing-blocks)
               ;; Node lock per connect, released between loop iterations so
               ;; RPC threads aren't starved across a long drain cascade.

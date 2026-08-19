@@ -191,24 +191,57 @@ PARAMS: (hexstring [permitsigdata] [iswitness]). Mirrors Core converttopsbt."
        (bitcoin-lisp.serialization:br-read-witness-stack
         (bitcoin-lisp.serialization:make-byte-reader-from value))))
 
+(defun %psbt-input-prevout (map tx-in)
+  "The TX-OUT this input spends, resolved from MAP's utxo fields, or NIL.
+%PSBT-INPUT-SPK and %PSBT-INPUT-AMOUNT are the two halves of this one
+resolution and must never disagree: any skew yields a script/amount pair that
+never existed together on chain.
+Core resolves the spent output from NON_WITNESS_UTXO FIRST and falls back to
+WITNESS_UTXO only when it is absent (psbt.cpp:76-88), and decodepsbt does the
+same -- assigning from witness_utxo then OVERWRITING from non_witness_utxo
+before accumulating total_in (rawtransaction.cpp:1126-1149). The order is
+deliberate: non_witness_utxo is AUTHENTICATED, because its txid is checked
+against the outpoint, while witness_utxo is just a bare TxOut the sender
+asserts.
+
+We tested witness_utxo first, so with both present the UNAUTHENTICATED one won
+-- in the coins map fed to signing, in %psbt-finalize, and in the fee reported
+by decodepsbt and analyzepsbt. A counterparty could supply a truthful
+non_witness_utxo (which our parser requires, so the PSBT looks well formed)
+plus a witness_utxo repeating the real scriptPubKey with an UNDERSTATED value.
+Because non_witness_utxo IS present, %psbt-require-witness-sig-p is false, so a
+pkh() input gets a LEGACY signature -- and a legacy sighash does not commit to
+the amount, so that signature is valid over the real, larger output. The
+operator reviews a fabricated fee, signs, and the difference goes to the miner.
+The stock wallet always creates a pkh() SPKM, so this is reachable by default.
+
+The txid check is what makes the preference meaningful, so it is enforced here
+rather than assumed."
+  (let* ((nwu (bitcoin-lisp.serialization:psbt-map-find
+               map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))
+         (prevout (bitcoin-lisp.serialization:tx-in-previous-output tx-in))
+         (vout (bitcoin-lisp.serialization:outpoint-index prevout)))
+    (or
+     ;; Authenticated: the full previous transaction, whose txid must match
+     ;; the outpoint (Core psbt.cpp:80-83 returns false when it does not).
+     (when nwu
+       (let ((prev (bitcoin-lisp.serialization:br-read-transaction
+                    (bitcoin-lisp.serialization:make-byte-reader-from nwu))))
+         (when (and (equalp (bitcoin-lisp.serialization:transaction-hash prev)
+                            (bitcoin-lisp.serialization:outpoint-hash prevout))
+                    (< vout (length (bitcoin-lisp.serialization:transaction-outputs prev))))
+           (aref (bitcoin-lisp.serialization:transaction-outputs prev) vout))))
+     ;; Fallback only: an unauthenticated bare TxOut.
+     (let ((wu (bitcoin-lisp.serialization:psbt-map-find
+                map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)))
+       (when wu
+         (bitcoin-lisp.serialization:br-read-tx-out
+          (bitcoin-lisp.serialization:make-byte-reader-from wu)))))))
+
 (defun %psbt-input-amount (map tx-in)
   "The satoshi amount of the output spent by TX-IN, from MAP's utxo fields, or NIL."
-  (let ((wu (bitcoin-lisp.serialization:psbt-map-find
-             map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)))
-    (if wu
-        (bitcoin-lisp.serialization:tx-out-value
-         (bitcoin-lisp.serialization:br-read-tx-out
-          (bitcoin-lisp.serialization:make-byte-reader-from wu)))
-        (let ((nwu (bitcoin-lisp.serialization:psbt-map-find
-                    map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+)))
-          (when nwu
-            (let ((prev (bitcoin-lisp.serialization:br-read-transaction
-                         (bitcoin-lisp.serialization:make-byte-reader-from nwu)))
-                  (vout (bitcoin-lisp.serialization:outpoint-index
-                         (bitcoin-lisp.serialization:tx-in-previous-output tx-in))))
-              (when (< vout (length (bitcoin-lisp.serialization:transaction-outputs prev)))
-                (bitcoin-lisp.serialization:tx-out-value
-                 (aref (bitcoin-lisp.serialization:transaction-outputs prev) vout)))))))))
+  (let ((out (%psbt-input-prevout map tx-in)))
+    (when out (bitcoin-lisp.serialization:tx-out-value out))))
 
 (defun %psbt-input-json (map network)
   (let ((fields '()))
@@ -505,23 +538,11 @@ lists and vsize estimation are not computed (no script solving here)."
   (apply #'concatenate '(simple-array (unsigned-byte 8) (*)) arrays))
 
 (defun %psbt-input-spk (map tx-in)
-  "The scriptPubKey of the output spent by TX-IN, from MAP's utxo fields, or NIL."
-  (let ((wu (bitcoin-lisp.serialization:psbt-map-find
-             map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)))
-    (if wu
-        (bitcoin-lisp.serialization:tx-out-script-pubkey
-         (bitcoin-lisp.serialization:br-read-tx-out
-          (bitcoin-lisp.serialization:make-byte-reader-from wu)))
-        (let ((nwu (bitcoin-lisp.serialization:psbt-map-find
-                    map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+)))
-          (when nwu
-            (let ((prev (bitcoin-lisp.serialization:br-read-transaction
-                         (bitcoin-lisp.serialization:make-byte-reader-from nwu)))
-                  (vout (bitcoin-lisp.serialization:outpoint-index
-                         (bitcoin-lisp.serialization:tx-in-previous-output tx-in))))
-              (when (< vout (length (bitcoin-lisp.serialization:transaction-outputs prev)))
-                (bitcoin-lisp.serialization:tx-out-script-pubkey
-                 (aref (bitcoin-lisp.serialization:transaction-outputs prev) vout)))))))))
+  "The scriptPubKey of the output spent by TX-IN, from MAP's utxo fields, or NIL.
+Shares %PSBT-INPUT-PREVOUT with %PSBT-INPUT-AMOUNT so the script and the amount
+can never come from different sources."
+  (let ((out (%psbt-input-prevout map tx-in)))
+    (when out (bitcoin-lisp.serialization:tx-out-script-pubkey out))))
 
 (defun %psbt-sig-for (map pubkey)
   (cdr (assoc pubkey (bitcoin-lisp.serialization:psbt-map-collect

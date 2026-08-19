@@ -514,10 +514,44 @@ type verbatim, plus the payload), and the 16-byte Poly1305 tag."
          payload-len)
       (+ 24 payload-len)))
 
+(defparameter +known-message-commands+
+  '("addr" "addrv2" "block" "blocktxn" "cfcheckpt" "cfheaders" "cfilter"
+    "cmpctblock" "feefilter" "filteradd" "filterclear" "filterload" "getaddr"
+    "getblocks" "getblocktxn" "getcfcheckpt" "getcfheaders" "getcfilters"
+    "getdata" "getheaders" "headers" "inv" "mempool" "merkleblock" "notfound"
+    "ping" "pong" "reject" "sendaddrv2" "sendcmpct" "sendheaders"
+    "sendtxrcncl" "tx" "verack" "version" "wtxidrelay")
+  "Message types that get their own byte-accounting bucket — Core's
+ALL_NET_MESSAGE_TYPES. Anything else is folded into +other-message-command+.")
+
+(defparameter +other-message-command+ "*other*"
+  "Core NET_MESSAGE_TYPE_OTHER: the single bucket every unrecognised command
+shares.")
+
 (defun %account-message (table v2-p command payload-len)
   "Accumulate one message's wire bytes into TABLE (a per-peer command ->
-bytes counter map, Core mapSend/RecvBytesPerMsgType)."
-  (incf (gethash command table 0) (%message-wire-size v2-p command payload-len)))
+bytes counter map, Core mapSend/RecvBytesPerMsgType).
+
+The command is normalised to a KNOWN type or to the shared other-bucket
+BEFORE the gethash. Core initialises its map once per CNode with every known
+type plus NET_MESSAGE_TYPE_OTHER and folds anything unrecognised into that
+bucket, under the comment `To prevent a memory DOS, only allow known message
+types' (net.cpp:684-691) -- the map is a fixed small size for the life of the
+connection.
+
+We used the raw wire command as the key, so every distinct command string a
+peer sent created a permanent new entry. An unrecognised command is otherwise a
+complete no-op here -- no rate-limit bucket, and handle-message falls through
+to (t nil) -- so nothing disconnected the peer or even noticed. A 24-byte
+message with a fresh random type field cost the attacker 24 bytes and cost us a
+hash entry plus a string key, never reclaimed while the peer stayed connected.
+
+Normalising BEFORE the lookup is the whole point: doing it after would have
+already created the entry."
+  (let ((key (if (member command +known-message-commands+ :test #'string=)
+                 command
+                 +other-message-command+)))
+    (incf (gethash key table 0) (%message-wire-size v2-p command payload-len))))
 
 (defun snapshot-per-msg-table (table)
   "Fresh copy of a per-message byte-counter TABLE for safe cross-thread
@@ -1064,10 +1098,29 @@ Returns T on success, NIL if the first message wasn't a version."
   "Read messages until VERACK arrives (tolerating interleaved wtxidrelay/
 sendaddrv2/sendheaders/sendtxrcncl), tracking the peer's advertised
 capabilities. Sets the peer :ready and returns T on VERACK; NIL otherwise
-(including a sendtxrcncl protocol violation, which disconnects)."
-  (loop repeat 10
-        do (multiple-value-bind (command payload)
-               (receive-message-blocking peer :timeout timeout)
+(including a sendtxrcncl protocol violation, which disconnects).
+
+TIMEOUT is an ABSOLUTE budget for the whole wait, not per read. It used to be
+per read inside `loop repeat 10', so the real budget was 10x TIMEOUT and the
+loop exited early only when the peer went SILENT. A peer sending any complete
+non-verack message — a 32-byte ping is enough, since no clause below matches it
+— once every timeout-minus-epsilon renewed the deadline indefinitely up to the
+repeat count, holding the single accept thread for minutes on a few hundred
+bytes. accept-connection does not run in that window, so the listen backlog
+fills and the node stops taking inbound peers at all.
+
+Core never has this exposure: CreateNodeFromAcceptedSocket does no blocking
+read whatsoever (net.cpp:1761-1869) — VERSION and VERACK are ordinary
+asynchronous messages. Moving our handshake off the accept thread is the
+structural fix; this bounds the damage in the meantime."
+  (let* ((units internal-time-units-per-second)
+         (deadline (+ (get-internal-real-time) (round (* timeout units)))))
+    (flet ((remaining ()
+             (/ (max 0 (- deadline (get-internal-real-time))) units)))
+      (loop repeat 10
+        do (when (<= (remaining) 0) (return nil))
+           (multiple-value-bind (command payload)
+               (receive-message-blocking peer :timeout (remaining))
              (unless command (return nil))
              (cond
                ((string= command "verack")
@@ -1080,7 +1133,7 @@ capabilities. Sets the peer :ready and returns T on VERACK; NIL otherwise
                ((string= command "sendtxrcncl")
                 (unless (%handle-handshake-sendtxrcncl peer payload)
                   (return nil)))))
-        finally (return nil)))
+        finally (return nil)))))
 
 (defun %v2-try-outbound (peer)
   "Attempt the BIP324 v2 handshake on PEER's fresh outbound connection.
@@ -1521,6 +1574,29 @@ node-lock), never the reverse, so it cannot deadlock against node-lock.")
   (bt:with-lock-held (*ban-lock*)
     (bitcoin-lisp:clear-recent-rejects *discouraged-peers*)))
 
+(defun loopback-address-p (address)
+  "T when ADDRESS is a loopback address — Core CNetAddr::IsLocal
+(netaddress.cpp:398-410): IPv4 127.0.0.0/8 or 0.0.0.0/8, or IPv6 ::1.
+
+NOT named local-address-p: that symbol is already the struct predicate of the
+LOCAL-ADDRESS defstruct in netaddress.lisp, which loads AFTER this file and so
+silently clobbered a function of that name. The warm image happened to keep
+mine and the cold build took the struct predicate, which answers NIL for every
+string -- so the carve-out below quietly did nothing in exactly the build that
+matters.
+
+Used to decide whether misbehaviour may be DISCOURAGED, which is an
+address-level verdict. Every inbound onion peer reaches us through the local
+Tor daemon, so they all present as 127.0.0.1: discouraging that address bans
+the loopback itself and takes every onion peer with it."
+  (and (stringp address)
+       (or (string= address "::1")
+           (let ((dot (position #\. address)))
+             (and dot
+                  (let ((first-octet (ignore-errors
+                                      (parse-integer address :end dot))))
+                    (and first-octet (or (= first-octet 127) (= first-octet 0)))))))))
+
 (defun record-misbehavior (peer &optional reason)
   "Discourage and disconnect PEER for a protocol violation. Bitcoin Core's
 misbehavior model is binary (Misbehaving -> m_should_discourage): any single
@@ -1531,7 +1607,18 @@ logged. Returns T."
   (when reason
     (bitcoin-lisp:log-cat "net" "Misbehaving peer ~A: ~A"
                           (peer-address peer) reason))
-  (discourage-peer (peer-address peer))
+  ;; Core MaybeDiscourageAndDisconnect (net_processing.cpp:5194-5201):
+  ;; disconnect a local peer for bad behaviour but do NOT discourage it,
+  ;; "since that would discourage all peers on the same local address" — and
+  ;; Core's own log line names the inbound-onion case as what this protects.
+  ;;
+  ;; We discouraged unconditionally. Every inbound onion peer arrives via the
+  ;; local Tor daemon on the loopback listener, so its address is literally
+  ;; "127.0.0.1": one misbehaving onion peer discouraged the loopback address
+  ;; and with it every present and future onion peer, silently disabling onion
+  ;; reachability. The disconnect below still happens either way.
+  (unless (loopback-address-p (peer-address peer))
+    (discourage-peer (peer-address peer)))
   (when (peer-connection peer)
     (close-connection (peer-connection peer))
     (setf (peer-connection peer) nil))

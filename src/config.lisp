@@ -231,6 +231,25 @@ IBD was network/disk-bound (sig checks were never the top profile frames), so
 the speed cost is small. Set T to re-enable parallel validation on a low-volume
 chain where the speedup matters and the scale stays safe.")
 
+(defun network-assumevalid (network)
+  "NETWORK's defaultAssumeValid block hash in WIRE byte order, or NIL when
+assumevalid is disabled. *ASSUMEVALID-OVERRIDE* takes precedence when set.
+
+Lives here rather than in the networking layer because the VALIDATION layer is
+what has to consult it -- Core's fScriptChecks is a pure function of assumevalid
+(validation.cpp:2342-2380) and is evaluated per block during connect, and
+src/networking/ibd.lisp loads after src/validation/."
+  (if (not (eq *assumevalid-override* :unset))
+      *assumevalid-override*
+      (let ((display (ecase network
+                       (:mainnet  "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac")
+                       (:testnet3 "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4")
+                       (:testnet4 "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a")
+                       (:signet   "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329")
+                       (:regtest  nil))))
+        (when display
+          (reverse (bitcoin-lisp.crypto:hex-to-bytes display))))))
+
 (defun minimum-chain-work (network)
   "Return NETWORK's nMinimumChainWork — the anti-DoS work floor below which a
 header chain is refused admission to the block index (Bitcoin Core

@@ -114,6 +114,45 @@ reindex-chainstate wipe. No-op if the base DB is already closed."
 ;;;; cache entry — Core does the same).
 
 (declaim (inline fetch-coin))
+(defvar *coins-to-uncache* nil
+  "When bound to a cons cell, FETCH-COIN pushes onto its CAR every key it pulls
+in from the base view that was not already cached — Core's coins_to_uncache
+(validation.cpp:851). WITH-COINS-TO-UNCACHE binds it; nothing else should.
+
+A cons cell rather than a bare list so the callee can push without the binding
+form having to be a place.")
+
+(defmacro with-coins-to-uncache ((cache) &body body)
+  "Run BODY recording every coin FETCH-COIN pulls in from the base, and drop
+those coins again if BODY returns NIL as its first value.
+
+This is Core's shape: PreChecks records coins_to_uncache, and any non-VALID
+result uncaches them, `to prevent memory DoS in case we receive a large number
+of invalid transactions that attempt to overrun the in-memory coins cache'
+(validation.cpp:1787-1790).
+
+Only coins the cache did not already hold are recorded, and
+COINS-VIEW-CACHE-UNCACHE additionally refuses to drop a dirty entry, so nothing
+this can touch is an unwritten change."
+  (let ((box (gensym "BOX")) (c (gensym "CACHE")) (vals (gensym "VALS")))
+    ;; MULTIPLE-VALUE-LIST, not MULTIPLE-VALUE-BIND with a &rest: that lambda
+    ;; list has no &rest, so `(multiple-value-bind (ok &rest rest) ...)' binds
+    ;; three ordinary variables -- one of them literally named &REST -- to the
+    ;; first three values and DROPS the others. The wrapped
+    ;; validate-transaction-for-mempool returns seven, so every caller
+    ;; destructuring (valid error fee replaced sigops) silently got the wrong
+    ;; ones. Preserving an arbitrary number of values is the whole contract of
+    ;; a wrapper like this.
+    `(let* ((,c ,cache)
+            (,box (cons '() nil))
+            (,vals (multiple-value-list
+                    (let ((*coins-to-uncache* ,box)) ,@body))))
+       (unless (first ,vals)
+         (when (typep ,c 'coins-view-cache)
+           (dolist (key (car ,box))
+             (coins-view-cache-uncache ,c key))))
+       (values-list ,vals))))
+
 (defun fetch-coin (cache key)
   "Return the cache-entry for KEY, populating from base if needed.
 Returns NIL only when both cache and base have nothing under KEY."
@@ -125,7 +164,39 @@ Returns NIL only when both cache and base have nothing under KEY."
       (let ((ce (make-cache-entry :entry from-base :dirty nil :fresh nil)))
         (setf (gethash key (cvc-entries cache)) ce)
         (incf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce))
+        ;; Record it as evictable: it entered the cache only to answer a read.
+        (when *coins-to-uncache*
+          (push key (car *coins-to-uncache*)))
         ce))))
+
+(defun coins-view-cache-uncache (cache key)
+  "Drop KEY from the cache if it is present and NOT dirty — Core
+CCoinsViewCache::Uncache (coins.cpp:310-322). Returns T if an entry was
+dropped.
+
+The not-dirty guard is load bearing: a dirty entry is an unwritten change, and
+erasing it loses a real add or a real spend. Only entries pulled in from the
+base purely to answer a read are eligible.
+
+Exists so a rejected transaction does not leave its inputs resident. Core
+records every prevout not already cached (coins_to_uncache, validation.cpp:851)
+and uncaches them on any non-VALID result, with the reason stated verbatim:
+`to prevent memory DoS in case we receive a large number of invalid
+transactions that attempt to overrun the in-memory coins cache\' (:1787-1790).
+
+We had no uncache at all, and our only size check lives in
+maybe-periodic-flush, reachable solely from connect-block — so a peer streaming
+transactions that fail AFTER input fetch (a bad signature is enough) made us
+retain one entry per distinct prevout with no eviction until the next block. A
+~1 MB transaction can name ~24,000 outpoints, so the amplification is several
+times the bandwidth and is held for a whole inter-block interval."
+  (declare (type coins-view-cache cache) (type utxo-key key))
+  (multiple-value-bind (ce present-p) (gethash key (cvc-entries cache))
+    (when (and present-p ce (not (ce-dirty ce)))
+      (decf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce))
+      (when (ce-fresh ce) (decf (cvc-fresh-count cache)))
+      (remhash key (cvc-entries cache))
+      t)))
 
 ;;;; Public reads.
 
@@ -230,6 +301,46 @@ erased."
         (cvc-fresh-count cache) 0
         (cvc-mem-bytes cache) 0)
   (coins-view-db-erase-all-coins (cvc-base cache)))
+
+(defun coins-view-cache-sync (cache &key sync (best-block (cvc-best-block cache)))
+  "Write dirty entries to the base view and KEEP them in the cache — Core's
+CCoinsViewCache::Sync, as opposed to Flush which also drops the entries.
+
+This exists because iterating the UTXO set from an RPC thread must not clear
+the live table. COINS-VIEW-CACHE-FLUSH does MAPHASH and then CLRHASH; the
+validation thread mutates that same table under the node lock, so entries
+inserted while the RPC thread was inside the MAPHASH might never be visited and
+the following CLRHASH then dropped them UNWRITTEN. A dropped tombstone leaves a
+spent coin alive in LevelDB — we would accept a double-spend Core rejects — and
+a dropped add loses a real UTXO. Keeping the entries removes that class
+entirely: an entry the MAPHASH misses simply stays dirty and is written by the
+next flush.
+
+It also stops a `gettxoutsetinfo' throwing away the warm cache mid-IBD, which
+Flush did as a side effect of answering a read-only question.
+
+CALLER CONTRACT: hold the node lock across this call AND the creation of the
+iterator that follows it. Core takes cs_main across exactly that pair
+(rpc/blockchain.cpp:1075-1084) — coins connected between the two would
+otherwise be in neither the snapshot nor the write."
+  (declare (type coins-view-cache cache))
+  (let ((count 0))
+    (with-coins-view-batch (batch (cvc-base cache) :sync sync)
+      (maphash (lambda (key ce)
+                 (when (ce-dirty ce)
+                   (if (ce-entry ce)
+                       (coins-view-batch-put batch key (ce-entry ce))
+                       (coins-view-batch-erase batch key))
+                   (incf count)))
+               (cvc-entries cache))
+      (when best-block
+        (coins-view-batch-set-best-block batch best-block)))
+    ;; Entries stay; only their dirty marks clear, so the next flush does not
+    ;; rewrite what this one already committed.
+    (maphash (lambda (key ce) (declare (ignore key)) (setf (ce-dirty ce) nil))
+             (cvc-entries cache))
+    (setf (cvc-dirty-count cache) 0)
+    count))
 
 (defun coins-view-cache-flush (cache &key sync (best-block (cvc-best-block cache)))
   "Commit all dirty entries to the base view in a single atomic batch
@@ -688,7 +799,13 @@ LevelDB iterator. The iterator emits keys in lex order, which for our
 key encoding ('C' + txid + LE vout, all fixed-width) equals the
 on-disk 36-byte key order — same raw order %utxo-set-iterate produces.
 utxo-set-iterate layers Core's numeric-vout cursor order on top."
-  (coins-view-cache-flush cache)
+  ;; SYNC, not FLUSH: this runs from RPC threads (gettxoutsetinfo,
+  ;; dumptxoutset) while the validation thread mutates the same entries table
+  ;; under the node lock. Flush CLRHASHes it, so an entry inserted while we
+  ;; were inside its MAPHASH could be dropped unwritten -- a lost tombstone
+  ;; leaves a spent coin alive in LevelDB. Sync keeps the entries, so a missed
+  ;; one stays dirty and is written by the next flush.
+  (coins-view-cache-sync cache)
   (with-leveldb-iterator (iter (cvdb-db (cvc-base cache)))
     ;; SEEK to the coin prefix rather than seeking to the first key. The loop
     ;; below stops at the first non-'C' key, which is only a correct scan if

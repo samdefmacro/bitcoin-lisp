@@ -1230,11 +1230,25 @@ transactions (validation.cpp:1113-1121)."
     (unless (%rbf-pays-for-rbf-p (%rbf-replaced-fees mempool replaced)
                                  total-fee total-vsize)
       (return-from check-package-rbf-rules (values nil :insufficient-fee nil)))
-    ;; Package feerate must strictly exceed the parent feerate. Core compares
-    ;; CFeeRate objects, whose sat/kvB value is the C++-truncated division
-    ;; fee*1000/size (validation.cpp:1104-1111).
-    (when (<= (truncate (* total-fee 1000) total-vsize)
-              (truncate (* parent-fee 1000) parent-vsize))
+    ;; Package feerate must strictly exceed the parent feerate, compared
+    ;; EXACTLY. Core's PackageRBFChecks compares CFeeRate objects, and at this
+    ;; revision CFeeRate holds a FeeFrac whose operator<=> delegates to
+    ;; FeeRateCompare -- a cross-multiplication with no division and no
+    ;; rounding: Mul(a.fee, b.size) <=> Mul(b.fee, a.size)
+    ;; (util/feefrac.h:156-161).
+    ;;
+    ;; This truncated both sides to integer sat/kvB first, and the comment
+    ;; justifying that described the PRE-cluster-mempool CFeeRate (the old
+    ;; nSatoshisPerK field). The only truncated value left in Core is
+    ;; GetFeePerK(), which this comparison does not use.
+    ;;
+    ;; The cost was rejecting what Core accepts, on an ordinary shape: the
+    ;; common LN/CPFP case of a 1000 vB parent paying 100 sat (exactly the
+    ;; relay floor) with a 200 vB child paying 21 sat lands in the same
+    ;; truncated bucket, so we refused a package Core admits
+    ;; (121*1000 > 100*1200).
+    (when (<= (* total-fee parent-vsize)
+              (* parent-fee total-vsize))
       (return-from check-package-rbf-rules
         (values nil :package-feerate-not-above-parent nil)))
     ;; Economic test: stage the removal of the replaced set and the addition
