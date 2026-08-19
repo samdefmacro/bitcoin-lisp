@@ -456,9 +456,19 @@ complete frame before it and stop there, rather than rejecting the whole log."
       (setf (bitcoin-lisp.storage:block-index-entry-status
              (bitcoin-lisp.storage:get-block-index-entry cs h2)) :valid)
       (bitcoin-lisp.storage:save-header-index cs)
-      (let* ((full (alexandria:read-file-into-byte-vector delta))
-             (torn (subseq full 0 (- (length full) 60))))
-        (alexandria:write-byte-vector-into-file torn delta :if-exists :supersede)
+      (let ((full (alexandria:read-file-into-byte-vector delta)))
+        ;; CONTROL: intact, BOTH frames apply. Without this the test below
+        ;; could pass on a log that never applied frame 2 in the first place.
+        (let ((cs0 (bitcoin-lisp.storage:init-chain-state
+                    (bitcoin-lisp.storage::chain-state-base-path cs))))
+          (is-true (bitcoin-lisp.storage:load-header-index cs0))
+          (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status
+                          (bitcoin-lisp.storage:get-block-index-entry cs0 h1))))
+          (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status
+                          (bitcoin-lisp.storage:get-block-index-entry cs0 h2)))))
+        ;; Now tear the final frame.
+        (alexandria:write-byte-vector-into-file
+         (subseq full 0 (- (length full) 60)) delta :if-exists :supersede)
         (let ((cs2 (bitcoin-lisp.storage:init-chain-state
                     (bitcoin-lisp.storage::chain-state-base-path cs))))
           (is-true (bitcoin-lisp.storage:load-header-index cs2))
