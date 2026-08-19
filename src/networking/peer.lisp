@@ -1574,9 +1574,16 @@ node-lock), never the reverse, so it cannot deadlock against node-lock.")
   (bt:with-lock-held (*ban-lock*)
     (bitcoin-lisp:clear-recent-rejects *discouraged-peers*)))
 
-(defun local-address-p (address)
+(defun loopback-address-p (address)
   "T when ADDRESS is a loopback address — Core CNetAddr::IsLocal
 (netaddress.cpp:398-410): IPv4 127.0.0.0/8 or 0.0.0.0/8, or IPv6 ::1.
+
+NOT named local-address-p: that symbol is already the struct predicate of the
+LOCAL-ADDRESS defstruct in netaddress.lisp, which loads AFTER this file and so
+silently clobbered a function of that name. The warm image happened to keep
+mine and the cold build took the struct predicate, which answers NIL for every
+string -- so the carve-out below quietly did nothing in exactly the build that
+matters.
 
 Used to decide whether misbehaviour may be DISCOURAGED, which is an
 address-level verdict. Every inbound onion peer reaches us through the local
@@ -1610,7 +1617,7 @@ logged. Returns T."
   ;; "127.0.0.1": one misbehaving onion peer discouraged the loopback address
   ;; and with it every present and future onion peer, silently disabling onion
   ;; reachability. The disconnect below still happens either way.
-  (unless (local-address-p (peer-address peer))
+  (unless (loopback-address-p (peer-address peer))
     (discourage-peer (peer-address peer)))
   (when (peer-connection peer)
     (close-connection (peer-connection peer))

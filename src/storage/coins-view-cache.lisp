@@ -134,17 +134,24 @@ of invalid transactions that attempt to overrun the in-memory coins cache'
 Only coins the cache did not already hold are recorded, and
 COINS-VIEW-CACHE-UNCACHE additionally refuses to drop a dirty entry, so nothing
 this can touch is an unwritten change."
-  (let ((box (gensym "BOX")) (c (gensym "CACHE")) (ok (gensym "OK"))
-        (rest (gensym "REST")))
+  (let ((box (gensym "BOX")) (c (gensym "CACHE")) (vals (gensym "VALS")))
+    ;; MULTIPLE-VALUE-LIST, not MULTIPLE-VALUE-BIND with a &rest: that lambda
+    ;; list has no &rest, so `(multiple-value-bind (ok &rest rest) ...)' binds
+    ;; three ordinary variables -- one of them literally named &REST -- to the
+    ;; first three values and DROPS the others. The wrapped
+    ;; validate-transaction-for-mempool returns seven, so every caller
+    ;; destructuring (valid error fee replaced sigops) silently got the wrong
+    ;; ones. Preserving an arbitrary number of values is the whole contract of
+    ;; a wrapper like this.
     `(let* ((,c ,cache)
-            (,box (cons '() nil)))
-       (multiple-value-bind (,ok &rest ,rest)
-           (let ((*coins-to-uncache* ,box)) ,@body)
-         (unless ,ok
-           (when (typep ,c 'coins-view-cache)
-             (dolist (key (car ,box))
-               (coins-view-cache-uncache ,c key))))
-         (values-list (cons ,ok ,rest))))))
+            (,box (cons '() nil))
+            (,vals (multiple-value-list
+                    (let ((*coins-to-uncache* ,box)) ,@body))))
+       (unless (first ,vals)
+         (when (typep ,c 'coins-view-cache)
+           (dolist (key (car ,box))
+             (coins-view-cache-uncache ,c key))))
+       (values-list ,vals))))
 
 (defun fetch-coin (cache key)
   "Return the cache-entry for KEY, populating from base if needed.
