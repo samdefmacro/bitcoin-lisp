@@ -1881,6 +1881,41 @@ exactly this and had NO callers, so nothing recorded progress."
                (is (= 0 (bitcoin-lisp.storage::%txindex-resume-height txindex cs))))
           (bitcoin-lisp.storage:close-tx-index txindex))))))
 
+(test txindex-resume-reports-why-it-chose-a-full-rescan
+  "The resume decision must be VISIBLE. A nine-minute startup that silently
+rescans from genesis gives the log no way to say whether the marker was
+missing, unknown, or off-chain -- which is the first question anyone asks."
+  (let ((dir (merge-pathnames (format nil "txidx-why-~D/" (get-universal-time))
+                              (uiop:temporary-directory))))
+    (multiple-value-bind (cs hashes) (%txresume-chain 5)
+      (let ((txindex (bitcoin-lisp.storage:init-tx-index dir :enabled t)))
+        (unwind-protect
+             (progn
+               (is (eq :no-marker
+                       (nth-value 1 (bitcoin-lisp.storage::%txindex-resume-height
+                                     txindex cs))))
+               (bitcoin-lisp.storage:txindex-set-best-block
+                txindex (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 99))
+               (is (eq :marker-not-in-index
+                       (nth-value 1 (bitcoin-lisp.storage::%txindex-resume-height
+                                     txindex cs))))
+               (bitcoin-lisp.storage:txindex-set-best-block txindex (third hashes))
+               (is (eq :resumed
+                       (nth-value 1 (bitcoin-lisp.storage::%txindex-resume-height
+                                     txindex cs))))
+               ;; A block at a height the chain holds, but not THIS block.
+               (let* ((fork-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                :initial-element 201))
+                      (fork (bitcoin-lisp.storage:make-block-index-entry
+                             :hash fork-hash :height 2 :chain-work 30 :status :valid)))
+                 (bitcoin-lisp.storage:add-block-index-entry cs fork)
+                 (bitcoin-lisp.storage:txindex-set-best-block txindex fork-hash)
+                 (is (eq :marker-off-chain
+                         (nth-value 1 (bitcoin-lisp.storage::%txindex-resume-height
+                                       txindex cs))))))
+          (bitcoin-lisp.storage:close-tx-index txindex))))))
+
 (test txindex-resume-refuses-a-marker-that-was-reorged-away
   "A marker alone is not enough. A reorg while the index was offline leaves
 entries below it pointing at a branch that is no longer active; skipping those
