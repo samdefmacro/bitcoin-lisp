@@ -279,12 +279,59 @@
       (with-open-file (s path :direction :output :if-exists :supersede
                               :element-type '(unsigned-byte 8))
         (write-sequence file-bytes s)))
-    ;; Loading should fail
+    ;; Loading should fail — AND say why. The reason is what makes startup
+    ;; refuse rather than continue with an empty index; detecting the
+    ;; corruption without reporting it is what let the node start anyway.
     (let ((state2 (bitcoin-lisp.storage:init-chain-state base-path)))
-      (is (null (bitcoin-lisp.storage:load-header-index state2))))
+      (multiple-value-bind (loaded reason)
+          (bitcoin-lisp.storage:load-header-index state2)
+        (is (null loaded))
+        (is-true (stringp reason))
+        (is-true (search "CRC32" reason))))
     ;; Cleanup
     (let ((path (merge-pathnames "headerindex.dat" base-path)))
       (when (probe-file path) (delete-file path)))))
+
+(test header-index-absent-is-not-corruption
+  "No headerindex.dat at all is a legitimate first run: NIL loaded, and NO
+reason — the caller must not confuse it with a file it cannot read, or every
+fresh node would refuse to start."
+  (let* ((base-path (ensure-directories-exist
+                     (merge-pathnames "test-absent-headers/"
+                                      (uiop:temporary-directory))))
+         (path (merge-pathnames "headerindex.dat" base-path)))
+    (when (probe-file path) (delete-file path))
+    (let ((state (bitcoin-lisp.storage:init-chain-state base-path)))
+      (multiple-value-bind (loaded reason)
+          (bitcoin-lisp.storage:load-header-index state)
+        (is (null loaded))
+        (is (null reason))))))
+
+(test header-index-corruption-modes-all-report-a-reason
+  "Every way headerindex.dat can be untrustworthy reports a reason: a
+truncated file, an unsupported format version, and a file too short to hold
+even a header. Each must be distinguishable from absence."
+  (let* ((base-path (ensure-directories-exist
+                     (merge-pathnames "test-corrupt-modes/"
+                                      (uiop:temporary-directory))))
+         (path (merge-pathnames "headerindex.dat" base-path)))
+    (flet ((reason-for (bytes)
+             (with-open-file (s path :direction :output :if-exists :supersede
+                                     :if-does-not-exist :create
+                                     :element-type '(unsigned-byte 8))
+               (write-sequence (coerce bytes '(vector (unsigned-byte 8))) s))
+             (nth-value 1 (bitcoin-lisp.storage:load-header-index
+                           (bitcoin-lisp.storage:init-chain-state base-path)))))
+      ;; Magic present, but the file cannot even hold magic+version+count+crc.
+      (is-true (search "too short" (reason-for '(#x48 #x49 #x44 #x58 1 0 0 0))))
+      ;; Magic + a version this build does not know, padded past the length
+      ;; floor so the version check is what rejects it.
+      (let ((r (reason-for (append '(#x48 #x49 #x44 #x58 #xFF 0 0 0)
+                                   (make-list 12 :initial-element 0)))))
+        (is-true (stringp r)))
+      ;; No magic => legacy path, and a stub too short to parse as entries.
+      (is-true (stringp (reason-for '(1 0 0 0 9 9 9 9)))))
+    (when (probe-file path) (delete-file path))))
 
 ;;;; Peer Health Monitoring Tests
 
