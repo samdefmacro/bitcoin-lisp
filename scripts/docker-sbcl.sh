@@ -22,7 +22,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-IMAGE=bitcoin-lisp-sbcl:2.6.5-2
+IMAGE=bitcoin-lisp-sbcl:2.6.5-3
 
 sha256_stdin() {
   if command -v sha256sum >/dev/null 2>&1; then
