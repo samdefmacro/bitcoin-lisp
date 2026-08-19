@@ -1774,7 +1774,7 @@ every present and future onion peer, silently disabling onion reachability."
                   ("8.8.8.8"   nil "an ordinary public peer is still discourageable")
                   ("192.168.1.5" nil "RFC1918 is NOT IsLocal in Core")))
     (destructuring-bind (addr local reason) case
-      (is (eq (and (bitcoin-lisp.networking:local-address-p addr) t) (and local t))
+      (is (eq (and (bitcoin-lisp.networking:loopback-address-p addr) t) (and local t))
           "~A: ~A" addr reason))))
 
 (test ga9-s2-5-every-dial-path-records-an-addrman-attempt
