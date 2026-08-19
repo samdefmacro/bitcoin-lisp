@@ -415,10 +415,16 @@ For testnet, data stays at the base directory (backward compatible)."
 
   ;; Network-aware PoW limit: regtest's trivial limit, the standard limit
   ;; otherwise. derive-target / check-proof-of-work reject targets above it.
+  ;; Each network's own powLimit (Core params.powLimit). Signet's is EASIER
+  ;; than mainnet's minimum (00000377ae...), so running it against the mainnet
+  ;; limit made derive-target reject every real signet nBits — including
+  ;; signet's own genesis, whose 0x1e0377ae we already record in chain.lisp.
   (setf bitcoin-lisp.storage:*pow-limit-target*
-        (if (eq network :regtest)
-            bitcoin-lisp.storage:+regtest-pow-limit-target+
-            bitcoin-lisp.storage:+pow-limit-target+))
+        (ecase network
+          (:regtest bitcoin-lisp.storage:+regtest-pow-limit-target+)
+          (:signet  bitcoin-lisp.storage:+signet-pow-limit-target+)
+          ((:mainnet :testnet3 :testnet4)
+           bitcoin-lisp.storage:+pow-limit-target+)))
 
   ;; Calculate data path - each network uses its own subdirectory
   (let* ((base-path (pathname data-directory))
@@ -512,16 +518,58 @@ AttemptToEvictConnection. Returns T if a peer was evicted."
         (let* ((by-ping (stable-sort
                          (copy-list inbound) #'<
                          :key (lambda (p)
-                                (let ((l (bitcoin-lisp.networking:peer-ping-latency p)))
+                                ;; MINIMUM RTT, not the most recent one. Core
+                                ;; protects by m_min_ping_time
+                                ;; (eviction.cpp:190) deliberately: an attacker
+                                ;; can inflate a recent sample at will, but
+                                ;; cannot lower a minimum without physically
+                                ;; being closer. We sorted on the latest
+                                ;; sample while min-ping-latency sat unused
+                                ;; right beside it on the same struct.
+                                (let ((l (bitcoin-lisp.networking:peer-min-ping-latency p)))
                                   (if (plusp l) l most-positive-fixnum)))))
                (by-age (stable-sort   ; oldest (smallest connect-time) first
                         (copy-list inbound) #'<
                         :key #'bitcoin-lisp.networking:peer-connect-time))
+               ;; Core also protects the peers that have most recently given us
+               ;; something USEFUL — 4 by novel tx and 4 by novel block
+               ;; (eviction.cpp:192-199). Both timestamps are already tracked
+               ;; and already exposed through getpeerinfo; the evictor simply
+               ;; never read them, so a peer relaying us real data was no
+               ;; safer than one that had done nothing since connecting.
+               (by-tx (stable-sort (copy-list inbound) #'>
+                                   :key #'bitcoin-lisp.networking:peer-last-tx-time))
+               (by-block (stable-sort (copy-list inbound) #'>
+                                      :key #'bitcoin-lisp.networking:peer-last-block-time))
                (n (min +inbound-eviction-protect-count+ (length inbound)))
-               (protected (union (subseq by-ping 0 n) (subseq by-age 0 n)))
+               (protected (reduce (lambda (acc lst) (union acc (subseq lst 0 n)))
+                                  (list by-ping by-age by-tx by-block)
+                                  :initial-value '()))
                (candidates (remove-if (lambda (p) (member p protected)) inbound)))
           (when candidates
             (let ((groups (make-hash-table :test 'equal)))
+              ;; Onion peers are exempt from the most-populous-group rule.
+              ;;
+              ;; Every inbound onion peer arrives via the local Tor daemon, so
+              ;; ip-netgroup returns "127.0" for ALL of them: with two or more
+              ;; connected they are automatically the largest group and one was
+              ;; evicted on every admission at capacity, so ordinary clearnet
+              ;; pressure quietly cost the operator their onion inbounds --
+              ;; with -listenonion on by default. Core reaches the same shared
+              ;; group and compensates in ProtectEvictionCandidatesByRatio,
+              ;; which reserves up to a quarter of the protected set for
+              ;; CJDNS/I2P/localhost/onion peers precisely because they "tend to
+              ;; be otherwise disadvantaged under our eviction criteria"
+              ;; (eviction.cpp:105-120).
+              ;;
+              ;; Keyed on the PEER-INBOUND-ONION flag, never the address
+              ;; string: the string is the very thing that collides. Exempt
+              ;; only while something else remains to evict -- an all-onion
+              ;; inbound set must still be able to make room.
+              (let ((non-onion (remove-if #'bitcoin-lisp.networking:peer-inbound-onion
+                                          candidates)))
+                (when non-onion
+                  (setf candidates non-onion)))
               (flet ((grp (p) (or (bitcoin-lisp.networking:ip-netgroup
                                    (bitcoin-lisp.networking:peer-address p))
                                   "_")))
@@ -796,8 +844,14 @@ missing or corrupt."
                 ;; reload (Core LoadMempool goes through the full
                 ;; AcceptToMemoryPool, node/mempool_persist.cpp:105).
                 (multiple-value-bind (valid error fee replaced sigops)
-                    (bitcoin-lisp.validation:validate-transaction-for-mempool
-                     tx utxo-set mempool height :chain-state chain-state)
+                    ;; Core uncaches every prevout this pulled in when the
+                    ;; result is not VALID (validation.cpp:851, 1787-1790):
+                    ;; otherwise a stream of transactions that fail AFTER input
+                    ;; fetch leaves one cache entry per distinct outpoint, with
+                    ;; nothing evicting them until the next block connects.
+                    (bitcoin-lisp.storage:with-coins-to-uncache (utxo-set)
+                      (bitcoin-lisp.validation:validate-transaction-for-mempool
+                       tx utxo-set mempool height :chain-state chain-state))
                   (declare (ignore error))
                   (cond
                     (valid
@@ -2625,6 +2679,47 @@ the budget, whichever is larger free margin) remains."
   (max (floor (* budget 9) 10)
        (- budget (* 10 1024 1024))))
 
+(defun maybe-critical-flush (chainstate)
+  "Flush CHAINSTATE only when its coins cache has exceeded its whole budget —
+Core's CRITICAL tier (validation.cpp:2690), the one FlushStateMode::IF_NEEDED
+acts on (:2763).
+
+This exists for the reorg loops. Core calls FlushStateToDisk(IF_NEEDED) at the
+end of BOTH DisconnectTip (validation.cpp:2966) and ConnectTip (:3093), so the
+cache is size-checked once per disconnected AND per connected block, including
+mid-reorg. We had exactly one flush call site in the whole tree — the
+tip-extension path of connect-block — so perform-reorg ran its disconnect and
+connect loops with nothing draining the cache at all. Every disconnected block
+restores its spent prevouts as dirty entries and every connected fork block
+adds its outputs; a deep rollback (dumptxoutset to an assumeutxo height, or
+invalidateblock on an old hash) walks tens of thousands of blocks in one
+uninterrupted loop. This heap has already been OOM-killed twice on this cache.
+
+CRITICAL rather than the LARGE threshold MAYBE-PERIODIC-FLUSH uses, and
+deliberately NOT that function: its count and time triggers would fire
+repeatedly inside a deep reorg and turn a rollback into a flush storm. Core
+draws the same distinction — PERIODIC acts on LARGE, IF_NEEDED only on
+CRITICAL.
+
+MUST be called where the coins-view best-block pointer already names the block
+whose coins are in the cache, i.e. AFTER the apply/disconnect call rather than
+between the mutation and the pointer move. Both COIN-VIEW-APPLY-BLOCK and
+DISCONNECT-BLOCK-FROM-UTXO-SET set that pointer as their last act, so calling
+this immediately after either is safe; anywhere else would persist a cache and
+a pointer that disagree."
+  (when *node*
+    (let ((view (and chainstate
+                     (bitcoin-lisp.storage:chain-state-coins-view chainstate))))
+      (when (and view
+                 (>= (bitcoin-lisp.storage:view-mem-bytes view)
+                     (chainstate-coins-cache-budget chainstate)))
+        (log-info "Coins cache past its budget mid-reorg; flushing")
+        (log-memory-snapshot "pre-flush-critical")
+        (%flush-chainstate chainstate)
+        (setf *blocks-since-flush* 0
+              *last-flush-universal-time* (get-universal-time))
+        t))))
+
 (defun chainstate-coins-cache-budget (chainstate)
   "CHAINSTATE's coins-cache budget in bytes: its per-chainstate allocation
 when maybe-rebalance-caches has split the global budget (assumeutxo dual
@@ -3595,6 +3690,33 @@ deliberately exempt from -onlynet, matching Core."
                            name-proxy-p)))
                    addresses)))
 
+(defun %record-dial-attempt (node host port)
+  "Stamp an addrman dial attempt for HOST:PORT — Core CConnman::ConnectNode
+calls addrman.Attempt() on EVERY dial, immediately after the attempt and before
+the socket is examined (net.cpp:492-497).
+
+We recorded attempts from exactly one place, the failure branch of
+connect-to-peers, and that function runs only at startup and when the peer
+count hits zero. Every steady-state dial — replace-disconnected-peers,
+establish-outbound-peer (and so maintain-block-relay-peers), and the feeler —
+recorded nothing, so nAttempts stayed 0 for addresses we had tried and failed
+repeatedly. addrman's whole quality signal is that counter: without it the
+selection cannot age out dead addresses, the feeler that exists to prove the
+tried table cannot mark anything bad, and we keep re-dialing and re-gossiping
+the same corpses. That is an eclipse-resistance and getaddr-hygiene loss, not a
+crash.
+
+Good() resets the counter on a successful VERSION, so stamping every dial does
+not penalise addresses that work."
+  (let ((address-book (node-address-book node)))
+    (when address-book
+      (multiple-value-bind (net ip-bytes)
+          (bitcoin-lisp.networking:parse-network-address host)
+        (when net
+          (ignore-errors
+           (bitcoin-lisp.networking:address-book-attempt
+            address-book ip-bytes port :count-failure t :net net)))))))
+
 (defun %record-outbound-result (address-book addr port peer success)
   "Record an outbound dial outcome for ADDR:PORT in ADDRESS-BOOK, adding the
 entry if new (network-typed, so IPv6/onion/cjdns peers get addrman credit
@@ -3972,9 +4094,11 @@ Returns the number of new peers connected."
         (let ((addr (car candidate)))
           (unless (member addr used-addrs :test #'string=)
             (handler-case
-                (let ((peer (bitcoin-lisp.networking:connect-peer
-                             addr (or (cdr candidate)
-                                      (network-port (node-network node))))))
+                (let* ((dial-port (or (cdr candidate)
+                                      (network-port (node-network node))))
+                       (peer (progn
+                               (%record-dial-attempt node addr dial-port)
+                               (bitcoin-lisp.networking:connect-peer addr dial-port))))
                   (when peer
                     (setf (bitcoin-lisp.networking:peer-address peer) addr)
                     (when (bitcoin-lisp.networking:perform-handshake peer)
@@ -4037,7 +4161,8 @@ connection type. Returns the peer or NIL. MUST run on the sync thread so
 node-peers stays single-writer. No-op when networking is disabled."
   (when (node-network-active node)
     (handler-case
-        (let ((peer (bitcoin-lisp.networking:connect-peer host port)))
+        (let ((peer (progn (%record-dial-attempt node host port)
+                           (bitcoin-lisp.networking:connect-peer host port))))
           (when peer
             (setf (bitcoin-lisp.networking:peer-address peer) host)
             (if (bitcoin-lisp.networking:perform-handshake peer :conn-type conn-type)
@@ -4136,7 +4261,8 @@ the address good (promoting it new -> tried). Always disconnects afterward --
 feelers exist only to validate addrman's tried table (Core anti-eclipse), never
 to join the peer set."
   (handler-case
-      (let ((peer (bitcoin-lisp.networking:connect-peer host port)))
+      (let ((peer (progn (%record-dial-attempt node host port)
+                         (bitcoin-lisp.networking:connect-peer host port))))
         (when peer
           (setf (bitcoin-lisp.networking:peer-address peer) host)
           (when (bitcoin-lisp.networking:perform-handshake peer :conn-type :feeler)

@@ -432,6 +432,12 @@ NETWORK defaults to bitcoin-lisp:*network* if not specified."
   "Minimum difficulty (maximum target) in compact bits format.
 Same for mainnet and testnet.")
 
+(defconstant +signet-pow-limit-bits+ #x1e0377ae
+  "Core signet powLimit, 00000377ae00...00 (kernel/chainparams.cpp:490). Signet
+is EASIER than mainnet's minimum, so a signet nBits derives a target ABOVE the
+mainnet limit — which is why running signet against the mainnet clamp rejected
+even signet's own genesis.")
+
 (defconstant +regtest-pow-limit-bits+ #x207fffff
   "Regtest minimum difficulty (Bitcoin Core CRegTestParams powLimit). Trivial:
 the target is ~2^255, so a single hash usually satisfies it — blocks are
@@ -454,6 +460,9 @@ nWord >>= 8*(3-nSize)); real difficulty values always have exponent > 3."
 
 (defvar +pow-limit-target+ (bits-to-target +pow-limit-bits+)
   "The full 256-bit PoW limit target (precomputed from +pow-limit-bits+).")
+
+(defvar +signet-pow-limit-target+ (bits-to-target +signet-pow-limit-bits+)
+  "The full 256-bit signet PoW limit target.")
 
 (defvar +regtest-pow-limit-target+ (bits-to-target +regtest-pow-limit-bits+)
   "The full 256-bit regtest PoW limit target.")
@@ -527,8 +536,11 @@ off-by-one (2015 intervals, not 2016)."
          ;; new_target = old_target * actual_timespan / target_timespan
          (old-target (bits-to-target prev-bits))
          (new-target (floor (* old-target actual-timespan) +pow-target-timespan+))
-         ;; Cap at PoW limit (precomputed)
-         (new-target (min new-target +pow-limit-target+)))
+         ;; Cap at the PoW limit of the network we are on. This clamped to the
+         ;; MAINNET constant regardless of network, so a signet retarget was
+         ;; capped at a limit harder than signet's own — Core clamps to
+         ;; params.powLimit (pow.cpp CalculateNextWorkRequired).
+         (new-target (min new-target *pow-limit-target*)))
     (target-to-bits new-target)))
 
 ;;; State persistence

@@ -513,6 +513,8 @@
    #:+pow-limit-bits+
    #:+pow-limit-target+
    #:+regtest-pow-limit-bits+
+   #:+signet-pow-limit-bits+
+   #:+signet-pow-limit-target+
    #:+regtest-pow-limit-target+
    #:*pow-limit-target*
    #:save-state
@@ -606,6 +608,9 @@
    #:coins-view-cache-add
    #:coins-view-cache-spend
    #:coins-view-cache-flush
+   #:coins-view-cache-sync
+   #:coins-view-cache-uncache
+   #:with-coins-to-uncache
    #:coins-view-db-best-block
    #:coins-view-cache-load-best-block
    #:coins-view-batch-set-best-block
@@ -686,6 +691,8 @@
    #:txindex-remove
    #:txindex-contains-p
    #:txindex-count
+   #:txindex-set-best-block
+   #:txindex-best-block
    #:load-tx-index
    #:txindex-add-block
    #:txindex-remove-block
@@ -1061,6 +1068,7 @@
    #:testnet-min-difficulty-allowed-p
    #:testnet-walk-back-bits
    ;; Block weight
+   #:script-checks-skippable-p
    #:calculate-block-weight
    #:+max-block-weight+
    ;; Sigops validation
@@ -1209,6 +1217,7 @@
    #:fee-filter-round
    #:peer-manual
    #:peer-outbound-or-block-relay-p
+   #:loopback-address-p
    #:peer-conn-type
    #:peer-relays-txs-p
    #:peer-tx-relay-p
@@ -1329,6 +1338,11 @@
    #:best-local-address
    #:privacy-network-p
    #:peer-inbound-onion
+   ;; Read by the inbound evictor (GA9 S2-6): Core protects by MINIMUM ping
+   ;; and by most-recent novel tx/block, all of which we already tracked.
+   #:peer-min-ping-latency
+   #:peer-last-tx-time
+   #:peer-last-block-time
    #:peer-connected-through-network
    #:peer-next-local-addr-send
    #:get-local-addr-for-peer
@@ -1439,6 +1453,7 @@
    #:minimum-chain-work
    #:*minimum-chain-work-override*
    #:*assumevalid-override*
+   #:network-assumevalid
    #:*p2p-port-override*
    #:*stop-at-height*
    #:*dns-seed-enabled*
@@ -1522,6 +1537,7 @@
    #:start-file-logging
    #:stop-file-logging
    #:maybe-periodic-flush
+   #:maybe-critical-flush
    #:maybe-stop-at-height
    ;; Cooperative-stop seam (config.lisp): the networking layer installs the
    ;; predicate, lower layers poll it — never the other way round.

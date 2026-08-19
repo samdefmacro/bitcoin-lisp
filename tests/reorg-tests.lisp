@@ -1013,11 +1013,15 @@ semantics and re-points entries left stale by a crash."
                   ;; resolves end-to-end (Core keeps stale block data too).
                   (is (not (null a2)))))
               ;; (c1) Catch-up scan is idempotent: nothing re-appended.
-              (let ((entries-before (bitcoin-lisp.storage::tx-index-entry-count txindex)))
+              ;; TX-INDEX-ENTRY-COUNT was an accessor on the in-memory txid
+              ;; table; the index is now LevelDB-backed (GA9 S2-13) and the
+              ;; observable equivalent is TXINDEX-COUNT. Idempotence is the
+              ;; property being tested either way.
+              (let ((entries-before (bitcoin-lisp.storage:txindex-count txindex)))
                 (is (= 0 (bitcoin-lisp.storage:build-tx-index
                           txindex chain-state block-store)))
                 (is (= entries-before
-                       (bitcoin-lisp.storage::tx-index-entry-count txindex))))
+                       (bitcoin-lisp.storage:txindex-count txindex))))
               ;; (c2) A stale mapping (e.g. crash before the reorg's index
               ;; update) is re-pointed by the catch-up scan: force T back to
               ;; A2, then rescan — the verified per-block check sees B2's
@@ -2902,3 +2906,35 @@ that decides whether the read happens at all."
     (is-false (within-depth-p 989 1000) "11 deep is not — Core sends the block")
     (is-false (within-depth-p 1 1000)
               "and an ancient block, which is the whole attack, is refused")))
+
+(test ga9-s2-10-reorg-flushes-the-coins-cache
+  "Core calls FlushStateToDisk(IF_NEEDED) at the end of BOTH DisconnectTip
+(validation.cpp:2966) and ConnectTip (:3093), so the coins cache is size-checked
+once per disconnected and per connected block, including mid-reorg. We had
+exactly ONE flush call site in the whole tree — the tip-extension path of
+connect-block — so perform-reorg's loops ran with nothing draining the cache.
+
+The sharp path is a deep rollback: dumptxoutset to an assumeutxo height, or
+invalidateblock on an old hash, disconnects tens of thousands of blocks in one
+uninterrupted loop, each restoring its spent prevouts as dirty entries. This
+heap has been OOM-killed twice on this cache.
+
+IF_NEEDED acts on Core's CRITICAL tier (cacheSize > total budget,
+validation.cpp:2690/2763), NOT the LARGE tier that periodic flushes use — so
+this must not reuse maybe-periodic-flush, whose count and time triggers would
+turn a deep rollback into a flush storm."
+  (is (fboundp 'bitcoin-lisp:maybe-critical-flush)
+      "the mid-reorg check must exist")
+  ;; With no node bound it must be inert rather than erroring: perform-reorg
+  ;; runs in unit tests with no *node*.
+  (let ((bitcoin-lisp::*node* nil))
+    (is-false (bitcoin-lisp:maybe-critical-flush nil)
+              "no node: inert, not an error"))
+  ;; And the reorg's disconnect loop must actually call it — the whole finding
+  ;; was that the function existed but was unreachable from perform-reorg.
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/validation/block.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search "maybe-critical-flush" src)
+        "perform-reorg must reference the check; a flush function nothing calls
+         is exactly the bug this fixes")))

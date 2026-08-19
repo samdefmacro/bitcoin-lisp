@@ -16,155 +16,156 @@
   (tx-position 0 :type (unsigned-byte 32)))
 
 (defstruct tx-index
-  "Transaction index state."
+  "Transaction index state — a LevelDB index, as Core's TxIndex is.
+
+Core's TxIndex holds only a DB (index/txindex.h:32): ReadTxPos is one DB read
+and WriteTxs one batch write (index/txindex.cpp:32-75). Ours used to be an
+append-only 68-byte-record FILE plus a FULL IN-MEMORY HASH TABLE of every txid,
+rebuilt by walking the entire file on startup, with each lookup re-opening the
+file.
+
+At roughly 80 bytes per SBCL equalp entry, mainnet's ~1e9 transactions is on
+the order of 100 GB of heap, and startup had to stream tens of GB before
+serving anything — so -txindex died of heap exhaustion during backfill on the
+network the node claims to support. A hard OOM, not a diagnosable refusal.
+
+Moving to LevelDB deletes the in-memory table, the startup replay and the
+per-lookup file open together, and gives the index the persisted best-block
+marker it never had."
   (base-path nil :type (or null pathname))
-  (index (make-hash-table :test 'equalp) :type hash-table)  ; txid -> file-offset
-  (file-stream nil)  ; Open file stream for appending
-  (entry-count 0 :type (unsigned-byte 64))
+  (db nil)
   (enabled nil :type boolean))
 
-(defconstant +txindex-entry-size+ 68
-  "Size of each txindex entry in bytes: 32 (txid) + 32 (block-hash) + 4 (position).")
+(defconstant +txindex-record-size+ 36
+  "Value size: 32 (block-hash) + 4 (tx position, little-endian).")
 
-(defun txindex-file-path (base-path)
-  "Get the txindex file path from base data directory."
-  (merge-pathnames "txindex.dat" (pathname base-path)))
+(defparameter +txindex-key-prefix+ 116
+  "ASCII #\t — the per-transaction key prefix, keeping txid keys clear of the
+metadata key below.")
+
+(defparameter *txindex-meta-key*
+  (make-array 1 :element-type '(unsigned-byte 8) :initial-element 66)
+  "ASCII #\B: the best-block marker (Core's BaseIndex locator). A single byte,
+distinct from the 33-byte transaction keys, so it can never collide.")
+
+(defun txindex-db-path (base-path)
+  "Directory of the txindex LevelDB."
+  (merge-pathnames "txindex/" (pathname base-path)))
+
+(defun %txindex-key (txid)
+  "DB key for TXID: the prefix byte followed by the 32-byte hash."
+  (let ((key (make-array 33 :element-type '(unsigned-byte 8))))
+    (setf (aref key 0) +txindex-key-prefix+)
+    (replace key txid :start1 1)
+    key))
+
+(defun %txindex-encode (block-hash tx-position)
+  (let ((v (make-array +txindex-record-size+ :element-type '(unsigned-byte 8))))
+    (replace v block-hash)
+    (setf (aref v 32) (logand tx-position #xFF)
+          (aref v 33) (logand (ash tx-position -8) #xFF)
+          (aref v 34) (logand (ash tx-position -16) #xFF)
+          (aref v 35) (logand (ash tx-position -24) #xFF))
+    v))
 
 (defun init-tx-index (base-path &key (enabled t))
   "Initialize a transaction index at BASE-PATH.
-If ENABLED is nil, creates a disabled index that ignores add operations."
-  (let ((txindex (make-tx-index
-                  :base-path (pathname base-path)
-                  :enabled enabled)))
+If ENABLED is nil, creates a disabled index that ignores add operations.
+No startup replay: the DB is the index."
+  (let ((txindex (make-tx-index :base-path (pathname base-path) :enabled enabled)))
     (when enabled
-      (load-tx-index txindex))
+      (let ((path (txindex-db-path base-path)))
+        (ensure-directories-exist path)
+        (setf (tx-index-db txindex) (leveldb-open path))))
     txindex))
 
 (defun close-tx-index (txindex)
-  "Close the txindex file stream."
-  (when (tx-index-file-stream txindex)
-    (close (tx-index-file-stream txindex))
-    (setf (tx-index-file-stream txindex) nil)))
-
-(defun ensure-txindex-stream (txindex)
-  "Ensure the txindex file stream is open for appending."
-  (unless (tx-index-file-stream txindex)
-    (let ((path (txindex-file-path (tx-index-base-path txindex))))
-      (ensure-directories-exist path)
-      (setf (tx-index-file-stream txindex)
-            (open path
-                  :direction :output
-                  :if-exists :append
-                  :if-does-not-exist :create
-                  :element-type '(unsigned-byte 8))))))
+  "Close the txindex database."
+  (when (tx-index-db txindex)
+    (leveldb-close (tx-index-db txindex))
+    (setf (tx-index-db txindex) nil)))
 
 (defun txindex-add (txindex txid block-hash tx-position)
-  "Add or UPDATE a transaction's location in the index (upsert).
-TXID is a 32-byte transaction hash.
-BLOCK-HASH is the 32-byte hash of the containing block.
-TX-POSITION is the transaction's position in the block (0 = coinbase).
-Core's txindex only processes block connects, and a connect OVERWRITES any
-existing entry for the txid (index/txindex.cpp CustomAppend batch-writes
-unconditionally); nothing is ever erased on disconnect (index/base.h:136
-CustomRemove defaults to a no-op and txindex does not override it). The
-upsert is what re-points a transaction that was disconnected by a reorg and
-re-mined in the new chain. An early return on an existing txid here used to
-leave such transactions pointing at the stale branch — or, combined with the
-old disconnect-time removal, entirely unindexed. The file stays append-only:
-the in-memory map takes the new offset, and LOAD-TX-INDEX's sequential replay
-is last-entry-wins, so restarts resolve to the newest location too.
-Returns T on success, NIL if index is disabled."
-  (unless (tx-index-enabled txindex)
+  "Add or UPDATE a transaction's location (upsert).
+
+Core's txindex only processes block connects and a connect OVERWRITES any
+existing entry (CustomAppend batch-writes unconditionally); nothing is erased
+on disconnect (index/base.h:136 CustomRemove is a no-op and txindex does not
+override it). The upsert is what re-points a transaction disconnected by a
+reorg and re-mined on the new chain — a plain LevelDB put is that upsert."
+  (unless (and (tx-index-enabled txindex) (tx-index-db txindex))
     (return-from txindex-add nil))
-  ;; Calculate file offset for this entry
-  (let ((offset (* (tx-index-entry-count txindex) +txindex-entry-size+)))
-    ;; Write to file
-    (ensure-txindex-stream txindex)
-    (let ((stream (tx-index-file-stream txindex)))
-      ;; Write txid (32 bytes)
-      (write-sequence txid stream)
-      ;; Write block-hash (32 bytes)
-      (write-sequence block-hash stream)
-      ;; Write tx-position (4 bytes, little-endian)
-      (write-byte (logand tx-position #xFF) stream)
-      (write-byte (logand (ash tx-position -8) #xFF) stream)
-      (write-byte (logand (ash tx-position -16) #xFF) stream)
-      (write-byte (logand (ash tx-position -24) #xFF) stream)
-      ;; Flush to ensure durability
-      (force-output stream))
-    ;; Update in-memory index
-    (setf (gethash (copy-seq txid) (tx-index-index txindex)) offset)
-    (incf (tx-index-entry-count txindex)))
+  (leveldb-put (tx-index-db txindex)
+               (%txindex-key txid)
+               (%txindex-encode block-hash tx-position))
   t)
 
 (defun txindex-lookup (txindex txid)
-  "Look up a transaction in the index.
-Returns a TX-LOCATION struct if found, NIL otherwise."
-  (unless (tx-index-enabled txindex)
+  "Look up a transaction. Returns a TX-LOCATION, or NIL. One DB read."
+  (unless (and (tx-index-enabled txindex) (tx-index-db txindex))
     (return-from txindex-lookup nil))
-  (let ((offset (gethash txid (tx-index-index txindex))))
-    (unless offset
-      (return-from txindex-lookup nil))
-    ;; Read entry from file
-    (let ((path (txindex-file-path (tx-index-base-path txindex))))
-      (with-open-file (stream path
-                              :direction :input
-                              :element-type '(unsigned-byte 8))
-        (file-position stream (+ offset 32))  ; Skip txid, read block-hash
-        (let ((block-hash (make-array 32 :element-type '(unsigned-byte 8))))
-          (read-sequence block-hash stream)
-          ;; Read tx-position (4 bytes, little-endian)
-          (let ((pos (logior (read-byte stream)
-                             (ash (read-byte stream) 8)
-                             (ash (read-byte stream) 16)
-                             (ash (read-byte stream) 24))))
-            (make-tx-location :block-hash block-hash
-                              :tx-position pos)))))))
+  (let ((v (leveldb-get (tx-index-db txindex) (%txindex-key txid))))
+    (when (and v (>= (length v) +txindex-record-size+))
+      (make-tx-location
+       :block-hash (subseq v 0 32)
+       :tx-position (logior (aref v 32)
+                            (ash (aref v 33) 8)
+                            (ash (aref v 34) 16)
+                            (ash (aref v 35) 24))))))
 
 (defun txindex-remove (txindex txid)
-  "Remove a transaction from the in-memory index.
-Note: This does not remove the entry from the file (append-only).
-The entry is simply unmarked in memory.
-Returns T if removed, NIL if not found."
-  (unless (tx-index-enabled txindex)
+  "Delete a transaction's entry. Returns T if the index is live.
+Core never removes on disconnect; this exists for callers that manage the
+index explicitly."
+  (unless (and (tx-index-enabled txindex) (tx-index-db txindex))
     (return-from txindex-remove nil))
-  (remhash txid (tx-index-index txindex)))
+  (leveldb-delete (tx-index-db txindex) (%txindex-key txid))
+  t)
 
 (defun txindex-contains-p (txindex txid)
-  "Check if a transaction is in the index."
+  "Check if a transaction is indexed."
   (and (tx-index-enabled txindex)
-       (not (null (gethash txid (tx-index-index txindex))))))
+       (tx-index-db txindex)
+       (not (null (leveldb-get (tx-index-db txindex) (%txindex-key txid))))
+       t))
+
+(defun txindex-set-best-block (txindex block-hash)
+  "Record the block this index is caught up to (Core BaseIndex's locator).
+The file-based index had no such marker at all, so nothing could tell whether
+it was current."
+  (when (and (tx-index-enabled txindex) (tx-index-db txindex))
+    (leveldb-put (tx-index-db txindex) *txindex-meta-key* block-hash)
+    t))
+
+(defun txindex-best-block (txindex)
+  "The block hash this index is caught up to, or NIL."
+  (when (and (tx-index-enabled txindex) (tx-index-db txindex))
+    (leveldb-get (tx-index-db txindex) *txindex-meta-key*)))
 
 (defun txindex-count (txindex)
-  "Return the number of indexed transactions."
-  (hash-table-count (tx-index-index txindex)))
+  "Number of indexed transactions, by DB scan.
+
+O(n) and deliberately so: LevelDB has no cheap count, and the only caller is a
+diagnostic RPC field. The predecessor answered in O(1) from an in-memory table
+whose existence was the bug."
+  (unless (and (tx-index-enabled txindex) (tx-index-db txindex))
+    (return-from txindex-count 0))
+  (let ((n 0))
+    (with-leveldb-iterator (iter (tx-index-db txindex))
+      (leveldb-iter-seek iter (make-array 1 :element-type '(unsigned-byte 8)
+                                            :initial-element +txindex-key-prefix+))
+      (loop while (leveldb-iter-valid-p iter)
+            for key = (leveldb-iter-key iter)
+            while (and key (plusp (length key))
+                       (= (aref key 0) +txindex-key-prefix+))
+            do (incf n) (leveldb-iter-next iter)))
+    n))
 
 (defun load-tx-index (txindex)
-  "Load the transaction index from disk.
-Rebuilds the in-memory hash table from the file.
-Returns T if loaded, NIL if no file exists."
-  (let ((path (txindex-file-path (tx-index-base-path txindex))))
-    (unless (probe-file path)
-      (return-from load-tx-index nil))
-    ;; Clear existing index
-    (clrhash (tx-index-index txindex))
-    (setf (tx-index-entry-count txindex) 0)
-    ;; Read file and rebuild index
-    (with-open-file (stream path
-                            :direction :input
-                            :element-type '(unsigned-byte 8))
-      (let ((file-size (file-length stream)))
-        (loop for offset from 0 below file-size by +txindex-entry-size+
-              do (let ((txid (make-array 32 :element-type '(unsigned-byte 8))))
-                   (let ((bytes-read (read-sequence txid stream)))
-                     (when (< bytes-read 32)
-                       (return)))  ; Incomplete entry, stop
-                   ;; Skip block-hash and position (we only need txid for index)
-                   (file-position stream (+ offset +txindex-entry-size+))
-                   ;; Add to in-memory index
-                   (setf (gethash txid (tx-index-index txindex)) offset)
-                   (incf (tx-index-entry-count txindex))))))
-    t))
+  "Retained for compatibility; the DB needs no replay.
+The file-based index rebuilt a full in-memory map by streaming the whole file
+on every startup. Returns T when the index is live."
+  (and (tx-index-enabled txindex) (tx-index-db txindex) t))
 
 (defun txindex-add-block (txindex block block-hash)
   "Index all transactions in a block.

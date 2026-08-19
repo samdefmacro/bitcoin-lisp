@@ -408,8 +408,16 @@ and testnet min-difficulty exception."
          (bitcoin-lisp.storage:calculate-next-work-required
           last-retarget-time last-block-time basis-bits)))
 
-      ;; Non-boundary: mainnet just inherits previous bits
-      ((eq bitcoin-lisp:*network* :mainnet)
+      ;; Non-boundary on a chain WITHOUT min-difficulty blocks: inherit the
+      ;; previous block's bits, which is all Core does (pow.cpp:38,
+      ;; `return pindexLast->nBits'). Signet sets
+      ;; fPowAllowMinDifficultyBlocks = false exactly as mainnet does
+      ;; (kernel/chainparams.cpp:491) and so belongs here; it used to fall
+      ;; through to the NIL arm, where validate-difficulty routes NIL into the
+      ;; testnet min-difficulty branch, which tests only :testnet3/:testnet4 --
+      ;; so signet reached the terminal reject and 2015 of every 2016 blocks
+      ;; were :bad-difficulty.
+      ((member bitcoin-lisp:*network* '(:mainnet :signet))
        (bitcoin-lisp.serialization:block-header-bits
         (bitcoin-lisp.storage:block-index-entry-header prev-entry)))
 
@@ -999,6 +1007,56 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
                    always (= (aref script-sig i) (aref expect i))))
         (values t nil)
         (values nil :bad-coinbase-height))))
+
+(defun script-checks-skippable-p (chain-state hash height)
+  "T when signature verification may be skipped for the block ENTRY names.
+
+Core's fScriptChecks is a pure function of ASSUMEVALID (validation.cpp:2342-2380)
+and CHECKPOINTS PLAY NO PART IN IT. We reduced the whole thing to
+`height <= (max last-checkpoint-height assumevalid-height)', which is wrong in
+two directions at once:
+
+ - Only a HEIGHT was compared, so any block at or below that height had its
+   signatures skipped even when it was NOT an ancestor of the assumevalid
+   block. A competing fork block qualifies. A fork must out-work the active
+   chain to connect, which is expensive at the mainnet tip but not during IBD
+   and cheap by design on the min-difficulty test networks -- and in that
+   window we accepted a fork block carrying forged scriptSigs that Core
+   verifies and rejects.
+ - When the assumevalid header is not yet in our index -- the whole first phase
+   of a fresh IBD -- the expression fell back to the CHECKPOINT height and
+   skipped every signature up to 840,000 on mainnet and 2,000,000 on testnet3,
+   where Core verifies all of them.
+
+Both holes are closed by requiring what Core requires: assumevalid must be
+configured, its header must be in the index, and this block must be an ANCESTOR
+of it. The ancestry test is by hash, per GA9 S2-2.
+
+DELIBERATELY NOT IMPLEMENTED, and the reason is a real constraint rather than
+an oversight: Core additionally requires the block to be on the best-header
+chain, the best header's work to be at or above nMinimumChainWork, and more
+than two weeks of equivalent work to sit below the best header (its
+anti-extortion margin). All three need m_best_header, which Core maintains
+incrementally and we recompute by scanning the whole index --
+BEST-HEADER-ENTRY's own docstring says it is `O(index size) ... not for
+per-block paths'. Consulting it here would put an O(index) scan in the connect
+loop. Those three conditions only ever make skipping STRICTER, so omitting them
+is a smaller skip window than Core's, never a larger one; closing them properly
+means maintaining the best header incrementally first."
+  (let* ((av (bitcoin-lisp:network-assumevalid bitcoin-lisp:*network*))
+         (av-entry (and av (bitcoin-lisp.storage:get-block-index-entry chain-state av))))
+    (and hash av-entry
+         ;; The block must BE the assumevalid chain's block at this height.
+         ;; Taking a hash and height rather than an index entry is deliberate:
+         ;; on the tip-extension path the block is validated BEFORE
+         ;; connect-block creates its entry, so an entry-based predicate would
+         ;; silently answer NIL there and quietly verify every signature -- safe,
+         ;; but it would make the assumevalid optimisation dead on the main IBD
+         ;; path rather than merely correct.
+         (let ((ancestor (bitcoin-lisp.storage:entry-ancestor-at-height av-entry height)))
+           (and ancestor
+                (equalp (bitcoin-lisp.storage:block-index-entry-hash ancestor) hash)
+                t)))))
 
 (defun calculate-block-weight (transactions)
   "Weight of the block whose transaction list is TRANSACTIONS (Core
@@ -2532,6 +2590,13 @@ comment above."
               (let ((undo (get-undo-data block-hash)))
                 (bitcoin-lisp.storage:disconnect-block-from-utxo-set
                  utxo-set block (or undo '())))
+              ;; Core flushes IF_NEEDED at the end of DisconnectTip
+              ;; (validation.cpp:2966). Safe HERE and not a line earlier:
+              ;; disconnect-block-from-utxo-set sets the coins-view best-block
+              ;; as its last act, so the pointer already names the block whose
+              ;; coins are in the cache. Flushing between the two would persist
+              ;; a cache and a pointer that disagree.
+              (bitcoin-lisp:maybe-critical-flush chain-state)
               ;; Collect this block's non-coinbase txs (original order) for the
               ;; PHASE C mempool re-add. Pushing whole per-block lists during
               ;; the tip-first loop leaves disconnected-block-txs oldest-first.
@@ -2619,7 +2684,20 @@ comment above."
                        (bitcoin-lisp.storage:block-index-entry-prev-entry entry))
                       (values nil :time-too-old)
                       (validate-block block chain-state utxo-set height now
-                                      :skip-scripts skip-scripts
+                                      ;; PER BLOCK, not the caller's single
+                                      ;; verdict for the whole fork. PERFORM-REORG
+                                      ;; takes SKIP-SCRIPTS as one keyword and
+                                      ;; applied it to every block it connected,
+                                      ;; which makes Core's ancestor condition
+                                      ;; unenforceable for exactly the fork
+                                      ;; blocks it exists to protect: a fork
+                                      ;; block is by construction NOT an
+                                      ;; ancestor of assumevalid. The incoming
+                                      ;; SKIP-SCRIPTS can now only ever narrow
+                                      ;; the skip, never widen it.
+                                      :skip-scripts (and skip-scripts
+                                                         (script-checks-skippable-p
+                                                          chain-state block-hash height))
                                       ;; Header (PoW/difficulty/MTP/timewarp) was
                                       ;; validated at index admission — Core's
                                       ;; ConnectBlock doesn't re-check it.
@@ -2653,6 +2731,28 @@ comment above."
                 (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)
                 (bitcoin-lisp.storage:update-chain-tip chain-state block-hash height)
                 (push (list entry block height spent-utxos) connected))))
+          ;; NOTE: deliberately NO maybe-critical-flush in this loop, unlike
+          ;; PHASE A above, even though Core flushes IF_NEEDED at the end of
+          ;; ConnectTip too (validation.cpp:3093).
+          ;;
+          ;; Core can, because a failed ConnectTip marks the block invalid and
+          ;; the chain is disconnected properly; whatever it persisted is a real
+          ;; chain state it can move away from. We instead rewind IN MEMORY
+          ;; (%rollback-partial-reorg re-applies the original chain), so a flush
+          ;; here would leave the coins DB naming a FORK-SIDE block that we then
+          ;; reject, and a crash before the rollback is itself flushed would
+          ;; roll forward onto the branch we refused.
+          ;;
+          ;; PHASE A has no such exposure: its flushes only ever land on blocks
+          ;; between the old tip and the fork point, which are ancestors of both
+          ;; chains, so rolling forward from one is always correct. It is also
+          ;; the half that actually grows without bound -- the sharp path is a
+          ;; deep rollback (dumptxoutset to an assumeutxo height,
+          ;; invalidateblock on an old hash) disconnecting tens of thousands of
+          ;; blocks in one loop.
+          ;;
+          ;; Closing the connect side needs the rollback to become a real
+          ;; disconnect, as in Core, rather than an in-memory rewind.
 
           ;; PHASE C — commit side effects, only now the whole fork is valid
           ;; and applied. Oldest-to-newest for chain-order indexing.
@@ -2757,10 +2857,25 @@ comment above."
 
 (defun block-descends-from-p (entry ancestor-entry)
   "True if ANCESTOR-ENTRY lies on ENTRY's ancestry (ENTRY is ANCESTOR-ENTRY or a
-descendant of it)."
-  (eq ancestor-entry
-      (bitcoin-lisp.storage:entry-ancestor-at-height
-       entry (bitcoin-lisp.storage:block-index-entry-height ancestor-entry))))
+descendant of it).
+
+Compares by HASH, not by object identity. It used to use EQ, which made the
+answer depend on every entry for a block being the same object forever. That
+held only by accident: connect-block used to REPLACE the index slot with a
+freshly-built entry, so every header admitted before its body kept pointing at
+the orphaned original and this returned NIL for exactly the header-only entries
+above the connected tip — the ones invalidateblock and
+%mark-block-subtree-invalid exist to cover. It never showed in a restart-based
+test, because load-header-index rebuilds a consistent object graph by hash.
+
+connect-block no longer replaces entries (GA9 S1-4), so the cause is gone; this
+is the second half, so the invariant stops resting on identity at all. A hash
+comparison is what the block index is keyed by anyway."
+  (let ((found (bitcoin-lisp.storage:entry-ancestor-at-height
+                entry (bitcoin-lisp.storage:block-index-entry-height ancestor-entry))))
+    (and found
+         (equalp (bitcoin-lisp.storage:block-index-entry-hash found)
+                 (bitcoin-lisp.storage:block-index-entry-hash ancestor-entry)))))
 
 (defun block-index-descendants (chain-state entry)
   "All block-index entries that descend from ENTRY, including ENTRY itself."

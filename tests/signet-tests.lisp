@@ -140,3 +140,67 @@ parse/clear, and the legacy sighash all lining up."
                  (bad-block (%sig-block bad-cb)))
             (is-false (bitcoin-lisp.validation:check-signet-block-solution
                        bad-block challenge +sig-dummy-genesis+))))))))
+
+;;;; ==================================================================
+;;;; GA9 S2-1: signet could not follow its own chain
+;;;;
+;;;; Two independent defects, both "we reject what Core accepts", together
+;;;; meaning the node could not advance past height 1 on signet. This file
+;;;; previously covered only the BIP325 solution port and never ran a signet
+;;;; header through difficulty or PoW validation at all, which is how a whole
+;;;; network stayed broken while looking tested.
+
+(test ga9-s2-1-signet-pow-limit-accepts-signet-nbits
+  "Core's signet powLimit is 00000377ae...00 (kernel/chainparams.cpp:490),
+which is EASIER than mainnet's minimum. *pow-limit-target* was raised only for
+regtest, so signet ran against the MAINNET limit and derive-target rejected
+every real signet nBits — including signet's own genesis 0x1e0377ae, a value
+this tree already records in chain.lisp."
+  (is (string= "00000377ae000000000000000000000000000000000000000000000000000000"
+               (string-downcase
+                (format nil "~64,'0x" bitcoin-lisp.storage:+signet-pow-limit-target+)))
+      "the constant must be Core's powLimit byte for byte")
+  (let ((bitcoin-lisp.storage:*pow-limit-target*
+          bitcoin-lisp.storage:+signet-pow-limit-target+))
+    (is-true (bitcoin-lisp.storage:derive-target #x1e0377ae)
+             "signet's genesis nBits must derive a target under signet's limit"))
+  ;; The control that makes this test mean something: the SAME nBits is
+  ;; rejected under the mainnet limit, which is what the node used to do.
+  (let ((bitcoin-lisp.storage:*pow-limit-target*
+          bitcoin-lisp.storage:+pow-limit-target+))
+    (is-false (bitcoin-lisp.storage:derive-target #x1e0377ae)
+              "control: under the mainnet limit it is rejected — the bug")))
+
+(test ga9-s2-1-signet-inherits-bits-at-a-non-boundary
+  "Signet sets fPowAllowMinDifficultyBlocks = false (chainparams.cpp:491), so
+Core's GetNextWorkRequired simply returns pindexLast->nBits at a non-boundary
+height (pow.cpp:38) — exactly as for mainnet.
+
+get-expected-bits had an arm for :mainnet and then fell through to NIL;
+validate-difficulty routes a NIL expectation into the testnet min-difficulty
+branch, which tests only :testnet3/:testnet4, so signet reached the terminal
+reject and 2015 of every 2016 blocks failed :bad-difficulty."
+  (let* ((bits #x1e0377ae)
+         (prev-header (bitcoin-lisp.serialization:make-block-header
+                       :version 4
+                       :prev-block (make-array 32 :element-type '(unsigned-byte 8)
+                                                  :initial-element 0)
+                       :merkle-root (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)
+                       :timestamp 1600000000 :bits bits :nonce 0))
+         (prev-entry (bitcoin-lisp.storage:make-block-index-entry
+                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                           :initial-element 7)
+                      :height 100 :header prev-header :chain-work 1 :status :valid)))
+    (let ((bitcoin-lisp:*network* :signet))
+      (is (= bits (bitcoin-lisp.validation::get-expected-bits 101 prev-entry))
+          "signet must inherit the previous block's bits at a non-boundary"))
+    ;; Unchanged for the networks that DO allow min-difficulty blocks: they
+    ;; must still get NIL so validate-difficulty takes the timestamp branch.
+    (dolist (net '(:testnet3 :testnet4))
+      (let ((bitcoin-lisp:*network* net))
+        (is-false (bitcoin-lisp.validation::get-expected-bits 101 prev-entry)
+                  "~A must still defer to the min-difficulty branch" net)))
+    ;; And mainnet keeps inheriting, as before.
+    (let ((bitcoin-lisp:*network* :mainnet))
+      (is (= bits (bitcoin-lisp.validation::get-expected-bits 101 prev-entry))))))
