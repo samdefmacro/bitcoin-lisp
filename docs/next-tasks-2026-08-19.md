@@ -43,7 +43,20 @@ G7-38, G7-39, G7-40, G7-41, G7-42, G7-43, G7-44 (partial), G7-46, G7-47, G7-48,
 G7-50, G7-51, G7-52, G7-53, G7-55, G7-56, G7-57, G7-58, G7-59, G7-60 (partial),
 G7-61, G7-62..69 (8 test-vector corpora).
 
-## 1. The executable list (this session, in order)
+## 1. The executable list — status
+
+Done and merged this session: **G7-09** (#357), **G7-06 / G7-29 / G7-30 /
+G7-31 / G7-57** (#358), **G7-25 / G7-63 / G7-64** (#359). G7-63 found and fixed
+a real defect: `bech32-decode` never enforced BIP173's `[33,126]` character
+range, so a space or high byte in the HRP decoded fine.
+
+**G7-61 is designed but not implemented** — see
+`docs/header-index-write-amplification.md`. Measured at 178 MB rewritten every
+10 minutes on mainnet; the fix is a storage-format change whose variants each
+trade something, so it wants its own change window rather than riding along
+with six other startup changes.
+
+## 1a. The original list (this session, in order)
 
 1. **G7-09 — enforce `maxfeerate` / `maxburnamount`.** `rpc-sendrawtransaction`
    reads only `(first params)`; `rpc-submitpackage`'s own docstring says the
