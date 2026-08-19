@@ -460,6 +460,7 @@
    #:utxo-entry
    #:make-utxo-entry
    #:script-unspendable-p
+   #:script-has-valid-ops-p
    #:+max-script-size+
    #:any-utxo-for-txid-p
    #:utxo-entry-value
