@@ -2016,6 +2016,9 @@ Handles chain reorganizations when a competing chain has more work."
             new-height
             (map 'list #'bitcoin-lisp.serialization:transaction-hash
                  (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
+           ;; ZMQ BlockConnected: each transaction, then the block and a
+           ;; sequence 'C' (zmqnotificationinterface.cpp:180).
+           (bitcoin-lisp:zmq-notify-block-connected block hash)
            ;; Update transaction index if enabled, and move its best-block
            ;; marker with the tip so the next startup resumes here instead of
            ;; re-reading every block from genesis.
@@ -2783,7 +2786,14 @@ comment above."
           ;; is oldest-first (PHASE A push order); reverse restores tip-first.
           (dolist (pair (reverse disconnected-blocks))
             (bitcoin-lisp:wallet-notify-block-disconnected
-             chain-state (car pair) (cdr pair)))
+             chain-state (car pair) (cdr pair))
+            ;; ZMQ BlockDisconnected: the block's transactions, then a
+            ;; sequence 'D'. No hashblock/rawblock -- those announce the tip
+            ;; moving FORWARD, and a subscriber that saw one for a block now
+            ;; being undone learns that from the 'D' instead.
+            (bitcoin-lisp:zmq-notify-block-disconnected
+             (car pair) (bitcoin-lisp.serialization:block-header-hash
+                         (bitcoin-lisp.serialization:bitcoin-block-header (car pair)))))
           (dolist (item (reverse connected))
             (destructuring-bind (entry block height spent-utxos) item
               (when fee-estimator

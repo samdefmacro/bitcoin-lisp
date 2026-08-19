@@ -169,3 +169,140 @@ prefix on the type."
                (is (= 42 (cdr (assoc "hwm" entry :test #'string=)))))))
       (bitcoin-lisp::zmq-stop-publishers)
       (ignore-errors (delete-file path)))))
+
+;;;; --- The hooks must be CONNECTED ---
+;;;;
+;;;; Publishers that work are worth nothing if nothing in the node calls them.
+;;;; These drive the REAL paths -- accept-validated-tx, mempool-remove,
+;;;; connect-block, the reorg disconnect -- with a live publisher bound and an
+;;;; independent subscriber reading, and require the message to arrive.
+
+(defun %zmq-open-subscriber (address topic count)
+  (uiop:launch-program
+   (list "python3" (%zmq-subscriber-script) address topic (princ-to-string count))
+   :output :stream :error-output :stream))
+
+(defun %zmq-drain (sub &optional (limit 50))
+  (let ((lines '()))
+    (loop repeat limit
+          while (listen (uiop:process-info-output sub))
+          do (push (read-line (uiop:process-info-output sub) nil nil) lines))
+    (nreverse (remove nil lines))))
+
+(defun %zmq-await-attached (sub warmup-thunk)
+  "Publish WARMUP-THUNK until the subscriber proves it is attached. A PUB
+socket silently drops everything sent before a subscriber finishes connecting,
+so without this the tests below would be coin flips rather than tests."
+  (sleep 0.5)
+  (loop repeat 60
+        do (funcall warmup-thunk)
+           (sleep 0.05)
+           (let ((lines (%zmq-drain sub)))
+             (when lines (return t)))))
+
+(defmacro %with-zmq-hook-test ((address topic sub &key (count 40)) &body body)
+  "Bind one publisher on TOPIC, attach an independent subscriber, and run BODY."
+  (let ((path (gensym "PATH")))
+    `(multiple-value-bind (,address ,path) (%zmq-test-address ,topic)
+       (unwind-protect
+            (progn
+              (bitcoin-lisp::zmq-start-publishers (list (list ,topic ,address 1000)))
+              (let ((,sub (%zmq-open-subscriber ,address ,topic ,count)))
+                (unwind-protect (progn ,@body)
+                  (ignore-errors (uiop:terminate-process ,sub))
+                  (ignore-errors (uiop:wait-process ,sub)))))
+         (bitcoin-lisp::zmq-stop-publishers)
+         (ignore-errors (delete-file ,path))))))
+
+(test zmq-mempool-acceptance-is-wired-to-the-publisher
+  "accept-validated-tx must publish. Without this the node runs with ZMQ
+'enabled' and a subscriber that never hears a thing."
+  (%with-zmq-hook-test (address "sequence" sub)
+    (let ((mempool (bitcoin-lisp.mempool:make-mempool))
+          (warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)))
+      (is-true (%zmq-await-attached
+                sub (lambda () (bitcoin-lisp::zmq-notify-sequence warm #\C))))
+      ;; The real path.
+      (let* ((tx (make-mempool-test-tx :input-id 150))
+             (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+        (bitcoin-lisp.mempool:accept-validated-tx mempool txid tx 5000 300)
+        (sleep 0.5)
+        (let* ((lines (%zmq-drain sub))
+               (wanted (string-downcase
+                        (bitcoin-lisp.crypto:bytes-to-hex (reverse (copy-seq txid))))))
+          (is-true
+           (some (lambda (l)
+                   (let ((body (third (uiop:split-string l :separator " "))))
+                     (and body
+                          (>= (length body) 64)
+                          (string= wanted (subseq body 0 64))
+                          ;; label A: a mempool acceptance
+                          (string= "41" (subseq body 64 66)))))
+                 lines)
+           "accept-validated-tx must publish a sequence 'A' for the accepted tx"))))))
+
+(test zmq-mempool-removal-is-wired-but-a-mined-tx-is-not-reported-twice
+  "A non-block removal publishes sequence 'R'. A removal BY A BLOCK must not:
+the block notification announces those, and reporting here as well would show
+subscribers a removal that never happened (Core :172, \"called for all
+non-block inclusion reasons\")."
+  (%with-zmq-hook-test (address "sequence" sub)
+    (let ((mempool (bitcoin-lisp.mempool:make-mempool))
+          (warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+      (is-true (%zmq-await-attached
+                sub (lambda () (bitcoin-lisp::zmq-notify-sequence warm #\C))))
+      (flet ((removal-labels-for (tx reason)
+               (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+                 (bitcoin-lisp.mempool:accept-validated-tx mempool txid tx 5000 300)
+                 (sleep 0.3)
+                 (%zmq-drain sub)               ; discard the acceptance
+                 (let ((bitcoin-lisp.mempool::*mempool-removal-reason* reason))
+                   (bitcoin-lisp.mempool::mempool-remove mempool txid))
+                 (sleep 0.5)
+                 (let ((wanted (string-downcase
+                                (bitcoin-lisp.crypto:bytes-to-hex (reverse (copy-seq txid))))))
+                   (loop for l in (%zmq-drain sub)
+                         for body = (third (uiop:split-string l :separator " "))
+                         when (and body (>= (length body) 66)
+                                   (string= wanted (subseq body 0 64)))
+                           collect (subseq body 64 66))))))
+        ;; Evicted: an 'R' (0x52) is published.
+        (is (member "52" (removal-labels-for (make-mempool-test-tx :input-id 151) :size-limit)
+                    :test #'string=)
+            "a non-block removal must publish sequence 'R'")
+        ;; Mined: nothing.
+        (is (null (removal-labels-for (make-mempool-test-tx :input-id 152) :block))
+            "a removal by a block must NOT publish a removal")))))
+
+(test zmq-connect-block-is-wired-to-the-publisher
+  "connect-block must publish hashblock. Drives the real validation path."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "zmq-connect")
+     (%with-zmq-hook-test (address "hashblock" sub)
+       (let ((warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)))
+         (is-true (%zmq-await-attached
+                   sub (lambda () (bitcoin-lisp::zmq-notify-hash-block warm))))
+         (let* ((hash (first (make-test-chain-hashes #xD0 1)))
+                (block1 (make-reorg-test-block genesis-hash hash 1)))
+           (bitcoin-lisp.validation:connect-block block1 chain-state block-store utxo-set)
+           (sleep 0.5)
+           (let ((wanted (string-downcase
+                          (bitcoin-lisp.crypto:bytes-to-hex (reverse (copy-seq hash))))))
+             (is-true (some (lambda (l)
+                              (string= wanted (third (uiop:split-string l :separator " "))))
+                            (%zmq-drain sub))
+                      "connect-block must publish the connected block's hash")))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test zmq-publisher-specs-reach-the-node-from-config
+  "apply-config-globals must record what -zmqpub* asked for, or start-node has
+nothing to bind and the option is silently inert."
+  (let ((bitcoin-lisp::*zmq-publisher-specs* '()))
+    (bitcoin-lisp::apply-config-globals '())
+    (is (null bitcoin-lisp::*zmq-publisher-specs*)
+        "no -zmqpub option means no publishers, and libzmq stays unloaded")
+    (bitcoin-lisp::apply-config-globals
+     '(("zmqpubhashblock" . "tcp://127.0.0.1:28332") ("zmqpubhashblockhwm" . "7")))
+    (is (equal '(("hashblock" "tcp://127.0.0.1:28332" 7))
+               bitcoin-lisp::*zmq-publisher-specs*))))

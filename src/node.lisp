@@ -2120,6 +2120,12 @@ Returns the node instance."
   ;; SIGHUP reopens the log file, so an external logrotate can move it.
   (install-sighup-log-reopen)
 
+  ;; ZMQ notification publishers, if -zmqpub* asked for any. libzmq is loaded
+  ;; only at this point and only when there is something to bind, so a host
+  ;; without the library runs fine with ZMQ off.
+  (when *zmq-publisher-specs*
+    (zmq-start-publishers *zmq-publisher-specs*))
+
   ;; Set prune-after-height for this network
   (setf *prune-after-height* (prune-after-height network))
 
@@ -3677,6 +3683,11 @@ thread; see the shutdown-coordination section above."
 
   ;; Cleanup secp256k1
   (bitcoin-lisp.crypto:cleanup-secp256k1)
+
+  ;; Close the ZMQ publishers before the directory lock: a subscriber should
+  ;; see the node go away, not hold a socket to a process that has released
+  ;; everything else.
+  (zmq-stop-publishers)
 
   ;; Release the data-directory lock last: everything above may still touch
   ;; the directory, and a successor node must not open it until they are done.
