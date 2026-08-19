@@ -822,6 +822,55 @@ fully-downloaded 149120 branch with strictly more work lay on disk."
              (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
 
+(defun %stage-heavier-downloaded-fork (chain-state block-store genesis-hash)
+  "Put a 3-block fork on disk with strictly more work than the current tip, as
+index entries only (status :header-valid, bodies stored) — the exact on-disk
+shape left behind when a refused reorg\'s missing bodies finish downloading.
+Returns the fork tip hash."
+  (let* ((tip-work (bitcoin-lisp.storage:block-index-entry-chain-work
+                    (bitcoin-lisp.storage:get-block-index-entry
+                     chain-state (bitcoin-lisp.storage:best-block-hash chain-state))))
+         (genesis-entry (bitcoin-lisp.storage:get-block-index-entry chain-state genesis-hash))
+         (bh (make-test-chain-hashes #xB0 3))
+         (blocks (list (make-reorg-test-block genesis-hash (first bh) 1)
+                       (make-reorg-test-block (first bh) (second bh) 2)
+                       (make-reorg-test-block (second bh) (third bh) 3)))
+         (prev genesis-entry))
+    (dolist (b blocks) (bitcoin-lisp.storage:store-block block-store b))
+    (loop for b in blocks
+          for hash in bh
+          for height from 1
+          do (let ((e (bitcoin-lisp.storage:make-block-index-entry
+                       :hash hash :height height :prev-entry prev
+                       :chain-work (+ tip-work height) :status :header-valid
+                       :header (bitcoin-lisp.serialization:bitcoin-block-header b))))
+               (bitcoin-lisp.storage:add-block-index-entry chain-state e)
+               (setf prev e)))
+    (third bh)))
+
+(test run-ibd-actually-calls-activate-best-chain
+  "The seam must be CONNECTED, not merely correct. activate-best-chain being
+right is worthless if nothing invokes it — which is precisely the defect being
+fixed here, where best-valid-tip was correct and reachable only from the
+reconsiderblock RPC. Drive the real run-ibd (no peers, so nothing else can
+move the tip) and require that the heavier downloaded fork gets activated."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "run-ibd-wiring")
+     (%build-and-connect chain-state block-store utxo-set genesis-hash
+                         (make-test-chain-hashes #xA0 2))
+     (let ((fork-tip (%stage-heavier-downloaded-fork
+                      chain-state block-store genesis-hash)))
+       (is (= 2 (bitcoin-lisp.storage:current-height chain-state)))
+       ;; No peers: run-ibd downloads nothing, so any tip change can only come
+       ;; from the activation pass.
+       (let ((bitcoin-lisp.networking::*ibd-context*
+               (bitcoin-lisp.networking::make-ibd-context)))
+         (bitcoin-lisp.networking::run-ibd nil chain-state utxo-set block-store))
+       (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+       (is (equalp fork-tip (bitcoin-lisp.storage:best-block-hash chain-state))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
 (test best-valid-tip-min-work-floor-prunes-the-search
   "best-valid-tip's MIN-WORK floor is what makes it affordable on the sync
 path: BLOCK-EXISTS-P is a filesystem probe per entry, so the chain-work compare
