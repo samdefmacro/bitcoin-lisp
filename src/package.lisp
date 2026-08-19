@@ -1039,6 +1039,8 @@
    #:add-reconsiderable-reject
    #:clear-reconsiderable-rejects
    #:perform-reorg
+   #:activate-best-chain
+   #:best-valid-tip
    #:get-undo-data
    #:invalidate-block
    #:reconsider-block
