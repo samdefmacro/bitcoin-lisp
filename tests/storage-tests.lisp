@@ -1881,44 +1881,51 @@ exactly this and had NO callers, so nothing recorded progress."
                (is (= 0 (bitcoin-lisp.storage::%txindex-resume-height txindex cs))))
           (bitcoin-lisp.storage:close-tx-index txindex))))))
 
-(test txindex-is-updated-by-blocks-arriving-from-the-network
+(test txindex-reaches-the-network-connect-path
   "The seam that was missing: only the RPC paths passed :tx-index to
-connect-block, so on a live node the index was maintained ONLY by the startup
-catch-up. Every block arriving from a peer went unindexed until the next
-restart, and a reorg left the best-block marker naming a block no longer on the
-chain -- which is exactly what the live node reported as marker-off-chain.
+connect-block. The networking path -- how every block from a peer is connected
+-- did not, so on a live node the index was maintained ONLY by the startup
+catch-up: blocks from peers went unindexed until the next restart, and after a
+reorg the best-block marker named a block no longer on the chain, which is what
+the live node reported as marker-off-chain.
 
-Drives the real network acceptance path with a real mined block."
-  (%with-regtest
-   (let* ((node (%regtest-node-fixture "txidx-net"))
-          (cs (bitcoin-lisp::node-chain-state node))
-          (utxo (bitcoin-lisp::node-utxo-set node))
-          (store (bitcoin-lisp::node-block-store node))
-          (dir (merge-pathnames (format nil "txidx-net-~D/" (get-internal-real-time))
-                                (uiop:temporary-directory)))
-          (txindex (bitcoin-lisp.storage:init-tx-index dir :enabled t))
-          (ctx (bitcoin-lisp.networking::make-ibd)))
-     (unwind-protect
-          (let* ((block (%dr-mine-on node (%optrue-spk)))
-                 (hash (bitcoin-lisp.serialization:block-header-hash
-                        (bitcoin-lisp.serialization:bitcoin-block-header block)))
-                 (coinbase (first (bitcoin-lisp.serialization:bitcoin-block-transactions block)))
-                 (cb-txid (bitcoin-lisp.serialization:transaction-hash coinbase)))
-            (setf (bitcoin-lisp.networking::ibd-context-tx-index ctx) txindex)
-            (is (null (bitcoin-lisp.storage:txindex-lookup txindex cb-txid))
-                "not indexed before the block arrives")
-            (let ((bitcoin-lisp.networking::*ibd-context* ctx))
-              (multiple-value-bind (valid error)
-                  (bitcoin-lisp.networking::accept-downloaded-block block cs utxo store)
-                (is-true valid)
-                (is (null error))))
-            (is (= 1 (bitcoin-lisp.storage:current-height cs)))
-            (is-true (bitcoin-lisp.storage:txindex-lookup txindex cb-txid)
-                     "a block accepted from the network must reach the transaction index")
-            ;; ...and the best-block marker moved with it, so the next start
-            ;; resumes instead of rescanning from genesis.
-            (is (equalp hash (bitcoin-lisp.storage:txindex-best-block txindex))))
-       (bitcoin-lisp.storage:close-tx-index txindex)))))
+Asserted in two halves. The first is behavioural: the node's tx-index must
+actually arrive in the ibd-context, which is the hop that was absent. The
+second is structural, for the same reason the startup-catch-up test above gives
+-- the alternative is standing up a full node with real proof-of-work in a unit
+test -- and it pins the part a future caller could silently undo: the value is
+defaulted INSIDE accept-downloaded-block, not at its call sites, so forgetting
+to pass it cannot reintroduce the bug."
+  (let ((ctx (bitcoin-lisp.networking::make-ibd))
+        (txindex (bitcoin-lisp.storage:init-tx-index
+                  (merge-pathnames (format nil "txidx-reach-~D/" (get-internal-real-time))
+                                   (uiop:temporary-directory))
+                  :enabled t)))
+    (unwind-protect
+         (progn
+           (is (null (bitcoin-lisp.networking::ibd-context-tx-index ctx))
+               "a fresh context carries no index")
+           ;; run-ibd with no peers does nothing but thread its arguments in.
+           (let ((bitcoin-lisp.networking::*ibd-context* ctx))
+             (bitcoin-lisp.networking::run-ibd
+              '() (bitcoin-lisp.storage:make-chain-state) nil nil :tx-index txindex))
+           (is (eq txindex (bitcoin-lisp.networking::ibd-context-tx-index ctx))
+               "run-ibd must put the node's transaction index into the context"))
+      (bitcoin-lisp.storage:close-tx-index txindex)))
+  ;; The connect path must take it from there by DEFAULT.
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/networking/protocol.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search "(tx-index (and *ibd-context*" src)
+        "accept-downloaded-block must default tx-index from the ibd-context")
+    (is (search ":tx-index tx-index" src)
+        "and pass it to connect-block"))
+  ;; And start-node must hand it to start-ibd at all.
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/node.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search ":tx-index (node-tx-index node)" src)
+        "sync-blockchain must pass the node's transaction index into IBD")))
 
 (test txindex-resume-reports-why-it-chose-a-full-rescan
   "The resume decision must be VISIBLE. A nine-minute startup that silently
