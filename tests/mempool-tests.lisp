@@ -852,6 +852,160 @@ standard (TRUC/BIP431 enforced) -- see +max-standard-tx-version+."
       ;; v3 is no longer rejected on the version check (TRUC governs its topology)
       (is-false (rejected-p 3)))))
 
+(defun %eph-tx (&key (input-id 1) (input-index 0) outputs)
+  "A transaction spending (INPUT-ID, INPUT-INDEX) and paying OUTPUTS."
+  (bitcoin-lisp.serialization:make-transaction
+   :version 1
+   :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                    :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                      :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                           :initial-element input-id)
+                                      :index input-index)
+                    :script-sig (make-array 10 :element-type '(unsigned-byte 8)
+                                               :initial-element 0)
+                    :sequence #xFFFFFFFF))
+   :outputs (coerce outputs 'vector)
+   :lock-time 0))
+
+(defun %eph-spend (parent-tx indices)
+  "A transaction spending PARENT-TX's outputs at INDICES."
+  (let ((txid (bitcoin-lisp.serialization:transaction-hash parent-tx)))
+    (bitcoin-lisp.serialization:make-transaction
+     :version 1
+     :inputs (map 'vector
+                  (lambda (i)
+                    (bitcoin-lisp.serialization:make-tx-in
+                     :previous-output (bitcoin-lisp.serialization:make-outpoint
+                                       :hash txid :index i)
+                     :script-sig (make-array 10 :element-type '(unsigned-byte 8)
+                                                :initial-element 0)
+                     :sequence #xFFFFFFFF))
+                  indices)
+     :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                       :value 10000
+                       :script-pubkey (bitcoin-lisp.serialization:tx-out-script-pubkey
+                                       (elt (bitcoin-lisp.serialization:transaction-outputs
+                                             parent-tx) 0))))
+     :lock-time 0)))
+
+(test mempool-ephemeral-dust-requires-zero-fee
+  "Core PreCheckEphemeralTx (ephemeral_policy.cpp:23, called from
+validation.cpp once fees are known): a transaction carrying dust must pay
+NOTHING, so there is never an incentive to mine it alone. Dust is only safe
+while it can travel and be swept as a package.
+
+mempool-rejects-dust-output's docstring has pointed at this test by name since
+the rule was written; the test did not exist."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (base (make-mempool-test-tx :input-id 95))
+         (in (elt (bitcoin-lisp.serialization:transaction-inputs base) 0))
+         (prevout (bitcoin-lisp.serialization:tx-in-previous-output in))
+         (spk (bitcoin-lisp.serialization:tx-out-script-pubkey
+               (elt (bitcoin-lisp.serialization:transaction-outputs base) 0)))
+         (funding 100000))
+    (bitcoin-lisp.storage:add-utxo
+     utxo (bitcoin-lisp.serialization:outpoint-hash prevout)
+     (bitcoin-lisp.serialization:outpoint-index prevout)
+     funding spk 1 :coinbase nil)
+    (flet ((tx-paying (total)
+             ;; One dust output (1 sat) plus a normal one, summing to TOTAL.
+             (bitcoin-lisp.serialization:make-transaction
+              :version 1
+              :inputs (vector in)
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value (- total 1) :script-pubkey spk)
+                               (bitcoin-lisp.serialization:make-tx-out
+                                :value 1 :script-pubkey spk))
+              :lock-time 0)))
+      ;; Paying a fee (outputs < input) WITH dust: refused.
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           (tx-paying (- funding 5000)) utxo mempool 100)
+        (is (null valid))
+        (is (eq :dust err) "a dust-carrying tx that pays a fee must be refused"))
+      ;; Zero fee (outputs == input) WITH dust: the dust gate does NOT fire.
+      ;; It may still fail a later policy check, which is fine — the property
+      ;; under test is that :dust is no longer the reason.
+      (multiple-value-bind (valid err)
+          (bitcoin-lisp.validation:validate-transaction-for-mempool
+           (tx-paying funding) utxo mempool 100)
+        (declare (ignore valid))
+        (is (not (eq :dust err))
+            "a 0-fee tx may carry ephemeral dust")))))
+
+(test check-ephemeral-spends-requires-the-child-to-sweep-all-dust
+  "Core CheckEphemeralSpends (ephemeral_policy.cpp:33). Dust is tolerated ONLY
+because it is ephemeral — created and destroyed inside one package, never left
+in the UTXO set. A child that spends a dust-carrying parent without also
+spending the dust would strand it, so the whole exemption rests on this check.
+
+The function existed and was wired into both the single-tx and package paths;
+nothing tested it."
+  (let* ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey
+               (elt (bitcoin-lisp.serialization:transaction-outputs
+                     (make-mempool-test-tx :input-id 90)) 0)))
+         (parent (%eph-tx :input-id 90
+                          :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                          :value 50000 :script-pubkey spk)
+                                         ;; 1 sat, far below the 546-ish threshold
+                                         (bitcoin-lisp.serialization:make-tx-out
+                                          :value 1 :script-pubkey spk)))))
+    ;; Sanity: output 1 really is dust, output 0 is not.
+    (is (equal '(1) (bitcoin-lisp.validation::transaction-dust-indices parent)))
+    ;; A child that sweeps BOTH outputs is fine.
+    (multiple-value-bind (ok offender)
+        (bitcoin-lisp.validation::check-ephemeral-spends
+         (list parent (%eph-spend parent '(0 1))) nil)
+      (is-true ok)
+      (is (null offender)))
+    ;; A child that takes only the non-dust output STRANDS the dust.
+    (multiple-value-bind (ok offender)
+        (bitcoin-lisp.validation::check-ephemeral-spends
+         (list parent (%eph-spend parent '(0))) nil)
+      (is (null ok))
+      (is (equalp (bitcoin-lisp.serialization:transaction-hash
+                   (%eph-spend parent '(0)))
+                  offender)))
+    ;; A child that spends ONLY the dust is also fine — the dust is gone.
+    (multiple-value-bind (ok)
+        (bitcoin-lisp.validation::check-ephemeral-spends
+         (list parent (%eph-spend parent '(1))) nil)
+      (is-true ok))
+    ;; A parent with no dust imposes nothing on its child.
+    (let ((clean (%eph-tx :input-id 91
+                          :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                          :value 50000 :script-pubkey spk)
+                                         (bitcoin-lisp.serialization:make-tx-out
+                                          :value 60000 :script-pubkey spk)))))
+      (is-true (bitcoin-lisp.validation::check-ephemeral-spends
+                (list clean (%eph-spend clean '(0))) nil)))))
+
+(test check-ephemeral-spends-sees-mempool-parents-too
+  "A parent already IN the mempool imposes the same sweep requirement as one
+inside the package — that is the single-tx path, where the child arrives alone
+and its dust-carrying parent is already accepted."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (spk (bitcoin-lisp.serialization:tx-out-script-pubkey
+               (elt (bitcoin-lisp.serialization:transaction-outputs
+                     (make-mempool-test-tx :input-id 92)) 0)))
+         (parent (%eph-tx :input-id 92
+                          :outputs (list (bitcoin-lisp.serialization:make-tx-out
+                                          :value 50000 :script-pubkey spk)
+                                         (bitcoin-lisp.serialization:make-tx-out
+                                          :value 1 :script-pubkey spk))))
+         (ptxid (bitcoin-lisp.serialization:transaction-hash parent)))
+    (bitcoin-lisp.mempool:accept-validated-tx mempool ptxid parent 0 100)
+    ;; The child alone: the parent is found in the MEMPOOL, and its dust must
+    ;; still be swept.
+    (multiple-value-bind (ok offender)
+        (bitcoin-lisp.validation::check-ephemeral-spends
+         (list (%eph-spend parent '(0))) mempool)
+      (is (null ok))
+      (is-true offender))
+    (is-true (bitcoin-lisp.validation::check-ephemeral-spends
+              (list (%eph-spend parent '(0 1))) mempool))))
+
 (test mempool-rejects-dust-output
   "EPHEMERAL DUST (Core policy.cpp:157-161): MAX_DUST_OUTPUTS_PER_TX is 1, so a
 SECOND dust output is rejected outright. A single dust output is no longer
