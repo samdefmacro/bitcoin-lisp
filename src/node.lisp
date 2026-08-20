@@ -260,7 +260,7 @@ Kept free of node state so it is directly unit-testable."
 LEVEL can be :debug, :info, :warn, or :error."
   (let ((entries '())
         (min-level (log-level-value level)))
-    (bt:with-recursive-lock-held (*log-lock*)
+    (bt:with-lock-held (*log-lock*)
       (let ((start (if (< *log-buffer-count* +log-buffer-size+)
                        0
                        *log-buffer-index*)))
@@ -290,7 +290,7 @@ LEVEL can be :debug, :info, :warn, or :error."
 
 (defun clear-logs ()
   "Clear the log buffer."
-  (bt:with-recursive-lock-held (*log-lock*)
+  (bt:with-lock-held (*log-lock*)
     (dotimes (i +log-buffer-size+)
       (setf (aref *log-buffer* i) nil))
     (setf *log-buffer-index* 0)
@@ -1297,6 +1297,77 @@ it is safe to call from a signal handler (a lock could deadlock against the
 thread the signal interrupted). One cell, so a reader never sees a reason
 without its exit code.")
 
+;;;; The shutdown token pipe (Core util::SignalInterrupt, util/signalinterrupt.cpp)
+;;;;
+;;;; Core's whole SIGTERM handler is `(*g_shutdown)()`, and that call is an
+;;;; atomic exchange on a flag plus, only if it won, one write() of a single
+;;;; byte to a pipe. The comment above it states the rule this file now follows:
+;;;; "This must be reentrant and safe for calling in a signal handler, so using
+;;;; a condition variable is not safe."
+;;;;
+;;;; Ours used to do considerably more from inside the handler — format to
+;;;; *error-output*, log-info (taking the log mutex), and on the REPL path
+;;;; bt:make-thread and the entire stop-node teardown. That is why *LOG-LOCK*
+;;;; had to be recursive: a signal delivered to a thread already inside an emit
+;;;; would otherwise deadlock on its own lock. With the handler reduced to
+;;;; Core's two operations, none of that is reachable and the lock is a plain
+;;;; one again, as Core's StdMutex is.
+;;;;
+;;;; write(2) on a pipe is async-signal-safe (POSIX.1 async-signal-safe list);
+;;;; a mutex acquisition is not. The byte's only job is to WAKE a servicer —
+;;;; the flag is what carries the request.
+
+(defvar *shutdown-servicer-thread* nil
+  "The thread blocked in %RUN-SHUTDOWN-SERVICER, or NIL. Its existence is what
+lets REQUEST-NODE-SHUTDOWN stop spawning a thread per request.")
+
+(defvar *shutdown-pipe-read* nil "Read end of the shutdown token pipe, or NIL.")
+(defvar *shutdown-pipe-write* nil "Write end of the shutdown token pipe, or NIL.")
+
+(defvar *shutdown-token-buffer*
+  (make-array 1 :element-type '(unsigned-byte 8) :initial-element (char-code #\x))
+  "Preallocated one-byte buffer for the token write. Allocated ONCE, at load
+time: a signal handler must not cons, and Core's TokenWrite writes a stack
+byte for the same reason.")
+
+(defvar *signal-shutdown-request* (cons "SIGTERM/SIGINT" +node-exit-clean+)
+  "Preallocated (REASON . EXIT-CODE) cell the signal handler CASes into
+*SHUTDOWN-REQUEST*. Building the cons inside the handler would allocate, and an
+allocation can land in the middle of the GC the signal interrupted.")
+
+(defun %open-shutdown-pipe ()
+  "Create the token pipe if it does not exist yet. Idempotent."
+  #+sbcl
+  (unless *shutdown-pipe-write*
+    (multiple-value-bind (r w) (sb-posix:pipe)
+      (setf *shutdown-pipe-read* r
+            *shutdown-pipe-write* w)))
+  *shutdown-pipe-write*)
+
+(defun %write-shutdown-token ()
+  "Write the single wake-up byte. Async-signal-safe: no allocation, no lock,
+no stream. Core SignalInterrupt::operator()'s TokenWrite."
+  #+sbcl
+  (let ((fd *shutdown-pipe-write*))
+    (when fd
+      ;; The return value is intentionally ignored, for the reason Core gives
+      ;; in HandleSIGTERM: there is no better way to handle a failure here.
+      (ignore-errors
+       (sb-sys:with-pinned-objects (*shutdown-token-buffer*)
+         (sb-posix:write fd (sb-sys:vector-sap *shutdown-token-buffer*) 1)))))
+  nil)
+
+(defun %await-shutdown-token ()
+  "Block until a token arrives. Core SignalInterrupt::wait()."
+  #+sbcl
+  (let ((fd *shutdown-pipe-read*)
+        (buf (make-array 1 :element-type '(unsigned-byte 8))))
+    (when fd
+      (sb-sys:with-pinned-objects (buf)
+        (loop until (eql 1 (ignore-errors
+                            (sb-posix:read fd (sb-sys:vector-sap buf) 1)))))))
+  t)
+
 (defvar *shutdown-complete* nil
   "Set by stop-node as its FINAL act, after the chainstate flush, mempool.dat,
 peers.dat, banlist and wallet markers are on disk. The watchdog waits for this
@@ -1327,9 +1398,19 @@ is about to exit the process out from under it."
                                        nil (cons reason exit-code)))))
     (when registered
       (log-info "Shutdown requested: ~A (exit code ~D)" reason exit-code)
-      (unless *shutdown-watchdog-running*
-        (bt:make-thread (lambda () (ignore-errors (stop-node)))
-                        :name "node-shutdown")))
+      ;; Wake the servicer the same way the signal handler does. This is not a
+      ;; signal context, so the logging above is fine — but the SERVICING still
+      ;; goes through one path, so a `stop` RPC and a SIGTERM tear the node down
+      ;; identically instead of by two different mechanisms.
+      (cond
+        ((and *shutdown-servicer-thread*
+              (bt:thread-alive-p *shutdown-servicer-thread*))
+         (%write-shutdown-token))
+        ((not *shutdown-watchdog-running*)
+         ;; No servicer (a test, or an embedded caller that never installed the
+         ;; handler) and no watchdog: nobody else would ever run stop-node.
+         (bt:make-thread (lambda () (ignore-errors (stop-node)))
+                         :name "node-shutdown"))))
     registered))
 
 (defun node-shutdown-requested-p ()
@@ -1390,6 +1471,14 @@ With EXIT NIL it returns the code instead of exiting (tests)."
              (ignore-errors (stop-node))
              (unless *shutdown-complete*
                (log-warn "Shutdown did not complete cleanly; exiting anyway"))
+             ;; Release the servicer before exiting. It is a real thread blocked
+             ;; in read(2), and SB-EXT:EXIT joins threads — a servicer that
+             ;; never woke would hold the process for the full 5s timeout on
+             ;; every shutdown. It always has a token when a request came
+             ;; through request-node-shutdown or the signal handler, but NOT on
+             ;; the exit-7 path (the node stopped running unasked, so nobody
+             ;; ever asked), which is exactly the path that must not hang.
+             (%write-shutdown-token)
              (if exit
                  (sb-ext:exit :code code :timeout 5)
                  (return code))))
@@ -3464,33 +3553,56 @@ hook (Core removeUnchecked, txmempool.cpp:269-275)."
             (log-error "Wallet processing of mempool tx removal FAILED: ~A" e)))))))
 
 (defun %handle-stop-signal ()
-  "What SIGTERM/SIGINT does. Returns T when it only REGISTERED the stop for
-someone else to service; otherwise it runs the teardown and does not return.
+  "What SIGTERM/SIGINT does, and ALL it does: set the flag, wake the servicer.
+Core HandleSIGTERM (init.cpp:425-431) is one call with the same two effects,
+and its comment says the return value is deliberately ignored because a signal
+handler has no better way to report a failure.
 
-Register-only in two states: under the supervisor (a main-thread watchdog is
-polling — the kernel delivers the signal to whichever thread it likes, and
-running the teardown here would race the watchdog's exit), and while start-node
-is still building (there is no node to tear down yet, and stop-node would race
-the construction it is meant to undo). Either way the loops that poll
-interrupt-requested-p give up at their next boundary."
-  (cond
-    ((or *shutdown-watchdog-running* *node-starting*)
-     (request-node-shutdown "SIGTERM/SIGINT" :exit-code +node-exit-clean+)
-     t)
-    (t
-     ;; No watchdog (REPL / embedded), node fully started: nobody else would
-     ;; stop it, so do it here and exit.
-     (ignore-errors (stop-node))
-     ;; Per-block script-check worker threads (bt:make-thread :name
-     ;; "script-check-N" in validate-block.lisp) are non-daemon and can outlive
-     ;; stop-node if validation was in progress when the sync thread was
-     ;; destroyed. Without a timeout, sb-ext:exit blocks forever waiting for them
-     ;; (incident 2026-05-11: node logged "Node stopped" but SBCL hung 6+
-     ;; minutes, eventually needed SIGKILL). Give 5 seconds, then force-exit.
-     ;; Core's CCheckQueue (checkqueue.h:206-225) has an explicit stop flag +
-     ;; condvar to join workers; ours are ephemeral per-block, not a pool.
-     #+sbcl (sb-ext:exit :code 0 :timeout 5)
-     nil)))
+Nothing here allocates, takes a lock, touches a stream or starts a thread. It
+used to do all four — see the commentary on the token pipe above for what that
+cost. Whoever services the request does the work: the main-thread watchdog when
+one is running (Core's WaitForShutdown), else the servicer thread."
+  (unless (sb-ext:cas (symbol-value '*shutdown-request*)
+                      nil *signal-shutdown-request*)
+    ;; First writer wins; only the winner writes the token, exactly as Core
+    ;; guards TokenWrite with m_flag.exchange(true).
+    (%write-shutdown-token))
+  t)
+
+(defun %run-shutdown-servicer ()
+  "Block on the token pipe and service whatever shutdown request wakes us.
+Core's WaitForShutdown, moved off the signal path.
+
+When a main-thread watchdog is running it owns the teardown, so this only has
+to not interfere: the watchdog's poll sees the same flag. Otherwise — a REPL or
+embedded start-node — nobody else would ever run stop-node, so this thread does
+it, which is where the old signal handler ran it from."
+  (%await-shutdown-token)
+  (let ((reason (node-shutdown-requested-p)))
+    (when reason
+      ;; Logging is safe HERE: an ordinary thread, not a signal context.
+      (log-info "Shutdown requested: ~A" reason))
+    (unless *shutdown-watchdog-running*
+      (ignore-errors (stop-node))
+      ;; Per-block script-check worker threads (bt:make-thread :name
+      ;; "script-check-N" in validate-block.lisp) are non-daemon and can outlive
+      ;; stop-node if validation was in progress when the sync thread was
+      ;; destroyed. Without a timeout, sb-ext:exit blocks forever waiting for them
+      ;; (incident 2026-05-11: node logged "Node stopped" but SBCL hung 6+
+      ;; minutes, eventually needed SIGKILL). Give 5 seconds, then force-exit.
+      ;; Core's CCheckQueue (checkqueue.h:206-225) has an explicit stop flag +
+      ;; condvar to join workers; ours are ephemeral per-block, not a pool.
+      #+sbcl (sb-ext:exit :code (or (cdr *shutdown-request*) +node-exit-clean+)
+                          :timeout 5))))
+
+(defun %ensure-shutdown-servicer ()
+  "Start the servicer once. Idempotent."
+  (%open-shutdown-pipe)
+  (unless (and *shutdown-servicer-thread*
+               (bt:thread-alive-p *shutdown-servicer-thread*))
+    (setf *shutdown-servicer-thread*
+          (bt:make-thread #'%run-shutdown-servicer :name "shutdown-servicer")))
+  *shutdown-servicer-thread*)
 
 (defun install-shutdown-handler ()
   "Trap SIGTERM and SIGINT so kill <pid> / Ctrl-C calls stop-node and persists
@@ -3501,12 +3613,19 @@ interrupt-requested-p give up at their next boundary."
    heap-exhausted) logs a stack and exits non-zero rather than dropping into
    LDB on a tty no one is reading."
   #+sbcl
-  (let ((handler (lambda (&rest _)
-                   (declare (ignore _))
-                   (format *error-output* "~&[shutdown] caught signal — saving state~%")
-                   (%handle-stop-signal))))
-    (sb-sys:enable-interrupt sb-unix:sigterm handler)
-    (sb-sys:enable-interrupt sb-unix:sigint handler))
+  (progn
+    ;; The servicer (and its pipe) must exist BEFORE the handler can fire:
+    ;; a token written to a pipe nobody opened is a lost wake-up.
+    (%ensure-shutdown-servicer)
+    (let ((handler (lambda (&rest _)
+                     (declare (ignore _))
+                     ;; No banner line here any more. `format` to a shared
+                     ;; stream from a signal handler is exactly the class of
+                     ;; call Core's handler exists to avoid, and the servicer
+                     ;; logs the same fact one line later from a normal thread.
+                     (%handle-stop-signal))))
+      (sb-sys:enable-interrupt sb-unix:sigterm handler)
+      (sb-sys:enable-interrupt sb-unix:sigint handler)))
   ;; SIGUSR1 toggles sb-sprof profiling. First USR1: start sampling. Second
   ;; USR1: stop, write graph + flat report to /data/bitcoin-lisp/logs/profile.txt.
   ;; Use to identify the hot path during live validation: kill -USR1 <pid> to
