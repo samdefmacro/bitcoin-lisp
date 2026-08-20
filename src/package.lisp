@@ -461,6 +461,7 @@
    #:block-file-info-height-last
    #:block-store-file-info
    #:rebuild-block-file-info
+   #:reindex-block-index
    #:prune-flat-block-file
    #:store-block
    #:get-block

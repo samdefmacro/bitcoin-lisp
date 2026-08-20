@@ -603,3 +603,158 @@ require the file to be gone."
            (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
            (is (= 3 (bitcoin-lisp.storage::chain-state-pruned-height cs))
                "the prune horizon advances to the file's last height")))))))
+
+;;; --- Rebuilding the index from the files (P5) ---------------------------------
+
+(defun %ff-chain-block (prev-hash seed height)
+  "A block whose header genuinely links to PREV-HASH, so a rebuilt index can
+follow the chain. The reorg fixture's cached-hash label is cleared for the same
+reason as elsewhere: reindexing recovers identity from BYTES."
+  (let ((b (make-reorg-test-block
+            prev-hash
+            (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
+            height)))
+    (setf (bitcoin-lisp.serialization::block-header-cached-hash
+           (bitcoin-lisp.serialization:bitcoin-block-header b))
+          nil)
+    b))
+
+(test the-block-index-can-be-rebuilt-from-the-block-files
+  "The capability the flat files were worth having for. Delete the whole header
+index, keep the blocks, and the chain comes back — which turns a lost index
+from a full resync into local work."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+            (store (bitcoin-lisp.storage:init-block-store dir))
+            (cs (bitcoin-lisp.storage:init-chain-state dir))
+            (genesis (bitcoin-lisp.storage:best-block-hash cs))
+            (hashes '()))
+       (bitcoin-lisp.storage:add-block-index-entry
+        cs (bitcoin-lisp.storage:make-block-index-entry
+            :hash genesis :height 0 :chain-work 1 :status :valid))
+       ;; A five-block chain, each linking to the last.
+       (let ((prev genesis))
+         (loop for h from 1 to 5
+               do (let* ((b (%ff-chain-block prev (+ 210 h) h))
+                         (hash (bitcoin-lisp.storage:store-block store b :height h)))
+                    (push hash hashes)
+                    (setf prev hash))))
+       (setf hashes (nreverse hashes))
+       ;; Now lose the index entirely — only genesis survives, as it would on a
+       ;; fresh start.
+       (let* ((store2 (bitcoin-lisp.storage:init-block-store dir))
+              (cs2 (bitcoin-lisp.storage:init-chain-state dir)))
+         (bitcoin-lisp.storage:add-block-index-entry
+          cs2 (bitcoin-lisp.storage:make-block-index-entry
+               :hash genesis :height 0 :chain-work 1 :status :valid))
+         (is (= 1 (hash-table-count
+                   (bitcoin-lisp.storage::chain-state-block-index cs2)))
+             "starting from an index that knows only genesis")
+         (multiple-value-bind (added orphans)
+             (bitcoin-lisp.storage:reindex-block-index store2 cs2)
+           (is (= 5 added) "every stored block must come back")
+           (is (= 0 orphans)))
+         ;; And the tree is linked, with heights and work derived from it.
+         (loop for hash in hashes
+               for h from 1
+               do (let ((e (bitcoin-lisp.storage:get-block-index-entry cs2 hash)))
+                    (is-true e "block at height ~D was not rebuilt" h)
+                    (when e
+                      (is (= h (bitcoin-lisp.storage:block-index-entry-height e)))
+                      (is-true (bitcoin-lisp.storage:block-index-entry-header e))
+                      (is-true (bitcoin-lisp.storage:block-index-entry-prev-entry e))
+                      ;; Not re-validated, so the entry claims only its header.
+                      (is (eq :header-valid
+                              (bitcoin-lisp.storage:block-index-entry-status e)))
+                      (is (> (bitcoin-lisp.storage:block-index-entry-chain-work e) 0))))))))))
+
+(test reindexing-does-not-care-what-order-the-blocks-were-stored-in
+  "Blocks are stored in the order they ARRIVED, so a block's parent can be
+later in the file. Core parks such records by their parent's hash and drains
+them once it lands; without that, reindexing a node that saw a block out of
+order would silently lose the rest of the chain behind it."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+            (store (bitcoin-lisp.storage:init-block-store dir))
+            (cs (bitcoin-lisp.storage:init-chain-state dir))
+            (genesis (bitcoin-lisp.storage:best-block-hash cs))
+            (blocks '()))
+       (bitcoin-lisp.storage:add-block-index-entry
+        cs (bitcoin-lisp.storage:make-block-index-entry
+            :hash genesis :height 0 :chain-work 1 :status :valid))
+       ;; Build the chain in memory first, then store it BACKWARDS.
+       (let ((prev genesis))
+         (loop for h from 1 to 5
+               do (let ((b (%ff-chain-block prev (+ 220 h) h)))
+                    (push (cons b h) blocks)
+                    (setf prev (bitcoin-lisp.serialization:block-header-hash
+                                (bitcoin-lisp.serialization:bitcoin-block-header b))))))
+       ;; BLOCKS is already newest-first: store the child before the parent.
+       (dolist (pair blocks)
+         (bitcoin-lisp.storage:store-block store (car pair) :height (cdr pair)))
+       (let ((store2 (bitcoin-lisp.storage:init-block-store dir))
+             (cs2 (bitcoin-lisp.storage:init-chain-state dir)))
+         (bitcoin-lisp.storage:add-block-index-entry
+          cs2 (bitcoin-lisp.storage:make-block-index-entry
+               :hash genesis :height 0 :chain-work 1 :status :valid))
+         (multiple-value-bind (added orphans)
+             (bitcoin-lisp.storage:reindex-block-index store2 cs2)
+           (is (= 5 added) "reverse storage order must still rebuild the whole chain")
+           (is (= 0 orphans))))))))
+
+(test a-record-whose-parent-is-gone-is-reported-not-treated-as-corruption
+  "On a pruned node the chain below the horizon is deleted, so records with no
+reachable parent are EXPECTED. Reporting the count lets an operator tell that
+apart from a genuinely broken file; refusing would make reindex useless on
+exactly the nodes that most need it."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+            (store (bitcoin-lisp.storage:init-block-store dir))
+            (cs (bitcoin-lisp.storage:init-chain-state dir))
+            (genesis (bitcoin-lisp.storage:best-block-hash cs)))
+       (bitcoin-lisp.storage:add-block-index-entry
+        cs (bitcoin-lisp.storage:make-block-index-entry
+            :hash genesis :height 0 :chain-work 1 :status :valid))
+       ;; A block whose parent is a hash nothing in the store produces.
+       (bitcoin-lisp.storage:store-block
+        store (%ff-chain-block (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element #xEE)
+                               230 1)
+        :height 1)
+       (let ((store2 (bitcoin-lisp.storage:init-block-store dir))
+             (cs2 (bitcoin-lisp.storage:init-chain-state dir)))
+         (bitcoin-lisp.storage:add-block-index-entry
+          cs2 (bitcoin-lisp.storage:make-block-index-entry
+               :hash genesis :height 0 :chain-work 1 :status :valid))
+         (multiple-value-bind (added orphans)
+             (bitcoin-lisp.storage:reindex-block-index store2 cs2)
+           (is (= 0 added))
+           (is (= 1 orphans) "the unreachable record is counted, not an error")))))))
+
+(test reindexing-is-additive-and-idempotent
+  "It never discards what is already known: a node that threw away a good index
+to rebuild it would be strictly worse off if the files turned out to be
+incomplete. Running it twice adds nothing the second time."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+            (store (bitcoin-lisp.storage:init-block-store dir))
+            (cs (bitcoin-lisp.storage:init-chain-state dir))
+            (genesis (bitcoin-lisp.storage:best-block-hash cs)))
+       (bitcoin-lisp.storage:add-block-index-entry
+        cs (bitcoin-lisp.storage:make-block-index-entry
+            :hash genesis :height 0 :chain-work 1 :status :valid))
+       (let ((prev genesis))
+         (loop for h from 1 to 3
+               do (let ((b (%ff-chain-block prev (+ 240 h) h)))
+                    (bitcoin-lisp.storage:store-block store b :height h)
+                    (setf prev (bitcoin-lisp.serialization:block-header-hash
+                                (bitcoin-lisp.serialization:bitcoin-block-header b))))))
+       ;; The index already holds everything, having been built as we stored.
+       (is (= 3 (bitcoin-lisp.storage:reindex-block-index store cs))
+           "the first rebuild fills an index that only knew genesis")
+       (is (= 0 (bitcoin-lisp.storage:reindex-block-index store cs))
+           "and a second pass adds nothing")))))
