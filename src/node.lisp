@@ -1935,6 +1935,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (log-level :info)
                         (log-file nil)
                         (log-rate-limit t)
+                        (flat-block-files nil)
                         (console-log t)
                         (max-peers 8)
                         (sync t)
@@ -2116,6 +2117,9 @@ Returns the node instance."
         *log-rate-window-start* (get-universal-time)
         *log-suppressions-active* nil)
   (clrhash *log-rate-locations*)
+  ;; Transitional; see *FLAT-BLOCK-FILES*. Set before the block store is
+  ;; opened, since the store decides then whether to create an xor.dat.
+  (setf bitcoin-lisp.storage:*flat-block-files* (and flat-block-files t))
   (log-info "Bitcoin-Lisp Node v0.1.0")
   (log-info "Network: ~A" network)
   (log-info "Data directory: ~A" (node-data-directory *node*))

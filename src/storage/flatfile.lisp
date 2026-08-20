@@ -105,7 +105,12 @@ directory already holds data, the all-zero (inactive) key is returned."
            (when (read-byte s nil nil)
              (error "xor.dat must be exactly ~D bytes" +obfuscation-key-size+)))
          key))
-      ((and create (null (directory (merge-pathnames "*.dat" dir))))
+      ;; "Fresh" means no FLAT data yet, which is what the key applies to.
+      ;; Legacy per-block .blk files in the same directory are read without the
+      ;; obfuscation layer, so their presence neither needs nor forbids a key —
+      ;; but an existing blk?????.dat written without one must never acquire
+      ;; one, or every record already in it becomes unreadable.
+      ((and create (null (directory (merge-pathnames "blk*.dat" dir))))
        (ensure-directories-exist dir)
        (let ((key (make-obfuscation-key)))
          (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
