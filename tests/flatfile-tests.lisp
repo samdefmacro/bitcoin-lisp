@@ -275,3 +275,155 @@ file offset, write it, read it back, de-obfuscate, and get the payload."
           (multiple-value-bind (start length)
               (bitcoin-lisp.storage:find-next-record plain magic :start (length r1))
             (is (equalp second-payload (subseq plain start (+ start length))))))))))
+
+;;; --- The block store on top of it -------------------------------------------
+
+(defun %ff-test-block (seed)
+  "A small but real block, so the store's own serializer and deserializer are
+what round-trips.
+
+The reorg fixture stamps a LABEL into the header's cached hash rather than the
+real one, which is fine for tests that only compare labels — but a flat file
+holds bytes, and the startup scan recovers a block's identity by hashing the 80
+header bytes it finds. So clear the label and let the real hash stand, which is
+what production data always has."
+  (let ((block (make-reorg-test-block
+                (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
+                (make-array 32 :element-type '(unsigned-byte 8) :initial-element (1+ seed))
+                1)))
+    (setf (bitcoin-lisp.serialization::block-header-cached-hash
+           (bitcoin-lisp.serialization:bitcoin-block-header block))
+          nil)
+    block))
+
+(defmacro %with-flat-store ((store dir &key (flat t)) &body body)
+  `(%with-flat-dir (,dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* ,flat)
+            (,store (bitcoin-lisp.storage:init-block-store ,dir)))
+       ,@body)))
+
+(test flat-store-round-trips-a-block-through-a-blk-file
+  "Written into blk00000.dat, obfuscated, and read back — through the ordinary
+STORE-BLOCK / GET-BLOCK API, which does not change."
+  (%with-mainnet-network
+   (%with-flat-store (store dir)
+     (let* ((block (%ff-test-block 40))
+            (hash (bitcoin-lisp.storage:store-block store block)))
+       (is (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+       (is-true (bitcoin-lisp.storage:block-exists-p store hash))
+       (let ((back (bitcoin-lisp.storage:get-block store hash)))
+         (is-true back)
+         (is (equalp hash (bitcoin-lisp.serialization:block-header-hash
+                           (bitcoin-lisp.serialization:bitcoin-block-header back)))))
+       ;; And the position reported is Core's: past the 8-byte header.
+       (multiple-value-bind (h pos) (bitcoin-lisp.storage:store-block store (%ff-test-block 50))
+         (declare (ignore h))
+         (is (typep pos 'bitcoin-lisp.storage::flat-file-pos))
+         (is (plusp (bitcoin-lisp.storage:flat-file-pos-pos pos))))))))
+
+(test flat-store-survives-a-restart-by-scanning-its-files
+  "A blk file is self-describing: reopening the store rebuilds the hash ->
+position map by walking the records, so nothing outside the file is needed to
+find a block again. This is most of what a full -reindex does."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let ((hashes '()))
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (store (bitcoin-lisp.storage:init-block-store dir)))
+         (dolist (seed '(60 70 80))
+           (push (bitcoin-lisp.storage:store-block store (%ff-test-block seed)) hashes)))
+       ;; A fresh store over the same directory.
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (store2 (bitcoin-lisp.storage:init-block-store dir)))
+         (dolist (h hashes)
+           (is-true (bitcoin-lisp.storage:block-exists-p store2 h))
+           (is-true (bitcoin-lisp.storage:get-block store2 h)))
+         ;; The cursor resumed at the end, so the next block appends rather
+         ;; than overwriting the last one.
+         (let ((extra (bitcoin-lisp.storage:store-block store2 (%ff-test-block 90))))
+           (is-true (bitcoin-lisp.storage:get-block store2 extra))
+           (dolist (h hashes)
+             (is-true (bitcoin-lisp.storage:get-block store2 h)
+                      "an append must not have landed on top of an existing record"))))))))
+
+(test the-store-reads-both-forms-at-once
+  "Dual read, which is what makes the transition survivable: blocks written
+before the flat files stay readable after the switch, and blocks written after
+it stay readable if the flag is turned back off."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let (legacy-hash flat-hash)
+       ;; One block the old way.
+       (let* ((bitcoin-lisp.storage:*flat-block-files* nil)
+              (store (bitcoin-lisp.storage:init-block-store dir)))
+         (setf legacy-hash (bitcoin-lisp.storage:store-block store (%ff-test-block 100))))
+       ;; One the new way, same directory.
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (store (bitcoin-lisp.storage:init-block-store dir)))
+         (setf flat-hash (bitcoin-lisp.storage:store-block store (%ff-test-block 110)))
+         (is-true (bitcoin-lisp.storage:get-block store legacy-hash)
+                  "the pre-existing per-block file must still be readable"))
+       ;; Flag off again: both still resolve.
+       (let* ((bitcoin-lisp.storage:*flat-block-files* nil)
+              (store (bitcoin-lisp.storage:init-block-store dir)))
+         (is-true (bitcoin-lisp.storage:get-block store legacy-hash))
+         (is-true (bitcoin-lisp.storage:get-block store flat-hash)
+                  "a flat record must stay readable with the flag off"))))))
+
+(test a-blocksdir-with-flat-records-never-acquires-a-key
+  "A key is created only when there is no FLAT data yet. Legacy per-block files
+are read without the obfuscation layer, so they neither need nor forbid one —
+but an existing blk?????.dat written without a key must never acquire one, or
+every record already in it becomes unreadable."
+  (%with-mainnet-network
+   ;; Fresh: obfuscated, and the magic is not visible on disk.
+   (%with-flat-store (store dir)
+     (bitcoin-lisp.storage:store-block store (%ff-test-block 120))
+     (let ((raw (%ff-read-file (merge-pathnames "blocks/blk00000.dat" dir))))
+       (is (not (equalp (bitcoin-lisp:network-magic :mainnet) (subseq raw 0 4)))
+           "a fresh blocksdir writes obfuscated records")))
+   ;; Flat records written with no key: a later start must not create one.
+   (%with-flat-dir (dir)
+     (let (first-hash)
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (store (bitcoin-lisp.storage:init-block-store dir)))
+         ;; Force the unobfuscated case the way an older node would have left
+         ;; it: no xor.dat, so the key is inactive.
+         (setf (bitcoin-lisp.storage::block-store-xor-key store)
+               (bitcoin-lisp.storage:zero-obfuscation-key))
+         (ignore-errors (delete-file (merge-pathnames "blocks/xor.dat" dir)))
+         (setf first-hash (bitcoin-lisp.storage:store-block store (%ff-test-block 130)))
+         (let ((raw (%ff-read-file (merge-pathnames "blocks/blk00000.dat" dir))))
+           (is (equalp (bitcoin-lisp:network-magic :mainnet) (subseq raw 0 4)))))
+       ;; Reopening must NOT generate a key, or the record above is lost.
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (store (bitcoin-lisp.storage:init-block-store dir)))
+         (is-false (probe-file (merge-pathnames "blocks/xor.dat" dir)))
+         (is-true (bitcoin-lisp.storage:get-block store first-hash)
+                  "the unobfuscated record must still be readable"))))
+   ;; Legacy per-block files do not block a key: they are read without the
+   ;; obfuscation layer, so new flat records can still be obfuscated.
+   (%with-flat-dir (dir)
+     (let (legacy)
+       (let* ((bitcoin-lisp.storage:*flat-block-files* nil)
+              (store (bitcoin-lisp.storage:init-block-store dir)))
+         (setf legacy (bitcoin-lisp.storage:store-block store (%ff-test-block 135))))
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (store (bitcoin-lisp.storage:init-block-store dir))
+              (flat (bitcoin-lisp.storage:store-block store (%ff-test-block 140))))
+         (is (probe-file (merge-pathnames "blocks/xor.dat" dir)))
+         (is-true (bitcoin-lisp.storage:get-block store legacy))
+         (is-true (bitcoin-lisp.storage:get-block store flat)))))))
+
+(test pruning-refuses-a-flat-stored-block-rather-than-failing-quietly
+  "Per-block pruning cannot cut a record out of a flat file — that is P3. The
+refusal has to be visible: returning NIL is how the caller says `already gone',
+so a silent NIL would let a pruned node stop reclaiming space without a word.
+This is also why the flag is off by default."
+  (%with-mainnet-network
+   (%with-flat-store (store dir)
+     (declare (ignorable dir))
+     (let ((hash (bitcoin-lisp.storage:store-block store (%ff-test-block 150))))
+       (is-false (bitcoin-lisp.storage:prune-block store hash))
+       (is-true (bitcoin-lisp.storage:get-block store hash)
+                "and the block is still there, not half-removed")))))
