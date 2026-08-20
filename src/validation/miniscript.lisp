@@ -360,8 +360,18 @@ a list of those."
       (mapc #'emit parts))
     (coerce out '(simple-array (unsigned-byte 8) (*)))))
 
-(defun ms-node-script (node &optional verify)
+(defun %ms-identity-key (key)
+  "The default key converter: keys are already 33-byte compressed pubkeys."
+  key)
+
+(defun ms-node-script (node &optional verify (key-fn #'%ms-identity-key))
   "The script NODE compiles to (Core Node::ToScript).
+
+KEY-FN is Core's ToPKBytes converter (miniscript.h's Key template parameter
+plus its context object). It exists because a miniscript inside a DESCRIPTOR
+holds key EXPRESSIONS — an xpub with an origin and a range — not bytes, and the
+same node compiles to a different script at every range index. Keeping the
+conversion a parameter is what lets one parsed node serve a whole range.
 
 VERIFY is Core's flag for the -VERIFY conversion: `v:' on a sub-expression
 whose type lacks the 'x' property is free, because the sub's final opcode has a
@@ -369,14 +379,15 @@ whose type lacks the 'x' property is free, because the sub's final opcode has a
 has to travel INTO the sub for that, which is why it is a parameter here and
 not something applied afterwards."
   (let ((subs (ms-node-subs node)))
-    (flet ((sub (i &optional v) (ms-node-script (nth i subs) v)))
+    (flet ((sub (i &optional v) (ms-node-script (nth i subs) v key-fn))
+           (pk (k) (funcall key-fn k)))
       (ecase (ms-node-fragment node)
         (:just-0 (%ms-cat +op-0+))
         (:just-1 (%ms-cat +op-1+))
-        (:pk-k (%ms-cat (%ms-push-data (first (ms-node-keys node)))))
+        (:pk-k (%ms-cat (%ms-push-data (pk (first (ms-node-keys node))))))
         (:pk-h (%ms-cat +op-dup+ +op-hash160+
                         (%ms-push-data (bitcoin-lisp.crypto:hash160
-                                        (first (ms-node-keys node))))
+                                        (pk (first (ms-node-keys node)))))
                         +op-equalverify+))
         (:older (%ms-cat (%ms-push-number (ms-node-k node)) +ms-op-checksequenceverify+))
         (:after (%ms-cat (%ms-push-number (ms-node-k node)) +ms-op-checklocktimeverify+))
@@ -404,7 +415,8 @@ not something applied afterwards."
         (:or-i (%ms-cat +op-if+ (sub 0) +op-else+ (sub 1) +op-endif+))
         (:andor (%ms-cat (sub 0) +op-notif+ (sub 2) +op-else+ (sub 1) +op-endif+))
         (:multi (%ms-cat (%ms-push-number (ms-node-k node))
-                         (mapcar #'%ms-push-data (ms-node-keys node))
+                         (mapcar (lambda (k) (%ms-push-data (pk k)))
+                                 (ms-node-keys node))
                          (%ms-push-number (length (ms-node-keys node)))
                          (if verify +op-checkmultisigverify+ +op-checkmultisig+)))
         (:thresh (%ms-cat (sub 0)
@@ -432,8 +444,14 @@ is how every rule violation surfaces — there is no separate error channel."
                                      (length data) (length subs) (length keys)))))
          (node (%make-ms-node :fragment fragment :subs subs :keys keys
                               :k k :data data :node-type type)))
+    ;; The script size is only computable when the keys are already bytes; a
+    ;; descriptor's key expressions have no size until they are derived, and a
+    ;; node built from them reports 0 rather than guessing.
     (setf (ms-node-script-size node)
-          (if (zerop type) 0 (length (ms-node-script node))))
+          (if (or (zerop type)
+                  (notevery (lambda (k) (typep k 'sequence)) keys))
+              0
+              (handler-case (length (ms-node-script node)) (error () 0))))
     node))
 
 (defun ms-node-valid-p (node)
@@ -512,11 +530,17 @@ but a node whose type is zero."))
       (%ms-fail "~A must be a number, got ~S" what string))
     n))
 
+(defvar *ms-key-parser* nil
+  "When bound, the function used to turn a key argument's text into whatever a
+node should hold. NIL means raw 33-byte compressed hex, which is what Core's
+test vectors use. The descriptor layer binds it so a miniscript can hold key
+EXPRESSIONS -- xpubs with origins and ranges -- instead.")
+
 (defun %ms-parse-key (string)
-  "A public key, as 33-byte compressed hex. Descriptor key expressions
-(xpubs, origins, ranges) are resolved by the descriptor layer before a
-miniscript ever sees them, so only raw keys arrive here."
-  (%ms-parse-hex string 33 "public key"))
+  "A public key argument, via *MS-KEY-PARSER* or as raw compressed hex."
+  (if *ms-key-parser*
+      (funcall *ms-key-parser* string)
+      (%ms-parse-hex string 33 "public key")))
 
 (defun %ms-apply-wrappers (wrappers node)
   "Apply WRAPPERS right to left: `vc:X' is v(c(X)), not c(v(X))."

@@ -407,7 +407,11 @@ optional caches); keep the two derivation paths in sync."
   (threshold nil)     ; integer for multi/sortedmulti
   (sub nil)           ; out-desc for sh/wsh
   (script nil)        ; script bytes for raw/addr
-  (address nil))      ; address string for addr
+  (address nil)       ; address string for addr
+  ;; The parsed MS-NODE for :miniscript. Its keys are desc-keys, so one node
+  ;; serves the whole range: the script is generated per index by handing the
+  ;; generator a converter that derives at that index.
+  (node nil))
 
 (defun %parse-multi-keys (inner ctx network name)
   "Parse \"k,KEY,KEY,...\" for multi/sortedmulti. Returns (values threshold keys)."
@@ -550,11 +554,44 @@ optional caches); keep the two derivation paths in sync."
         (return-from %parse-descriptor-body
           (make-out-desc :kind :raw
                          :script (bitcoin-lisp.crypto:hex-to-bytes inner))))
-      ;; Fallthrough (Core would try miniscript here; we don't support it)
+      ;; Fallthrough. Inside wsh() Core tries miniscript here, which is what
+      ;; makes policy descriptors -- timelocked recovery, decaying multisig --
+      ;; expressible at all (Core descriptor.cpp ParseScript).
       (case ctx
+        (:wsh (return-from %parse-descriptor-body
+                (%parse-miniscript-descriptor expr network)))
         (:sh (%desc-error "A function is needed within P2SH"))
-        (:wsh (%desc-error "A function is needed within P2WSH"))
         (t (%desc-error "'~A' is not a valid descriptor function" expr))))))
+
+(defun %parse-miniscript-descriptor (expr network)
+  "Parse EXPR as a miniscript whose key arguments are descriptor key
+expressions. Returns an :miniscript out-desc.
+
+Only inside wsh(): miniscript's type rules and its resource limits are stated
+for a specific script context, and P2WSH is the one this implements. Core
+refuses it elsewhere for the same reason."
+  (let* ((keys '())
+         (node (handler-case
+                   (let ((bitcoin-lisp.validation::*ms-key-parser*
+                           (lambda (text)
+                             (let ((key (%with-desc-error-prefix
+                                         "miniscript: "
+                                         (lambda () (%parse-desc-key text :wsh network)))))
+                               (push key keys)
+                               key))))
+                     (bitcoin-lisp.validation::ms-parse expr))
+                 ;; Not a miniscript expression at all -- a bare pubkey, say.
+                 ;; Core only reports a miniscript error when the expression
+                 ;; PARSED and then failed its rules (descriptor.cpp:2600);
+                 ;; an unparseable one falls through to the generic message,
+                 ;; which is far more useful for the common typo.
+                 (bitcoin-lisp.validation::miniscript-parse-error ()
+                   (%desc-error "A function is needed within P2WSH")))))
+    (unless (bitcoin-lisp.validation::ms-node-valid-p node)
+      (%desc-error "Miniscript expression is not valid: '~A'" expr))
+    (unless (bitcoin-lisp.validation::ms-node-valid-top-level-p node)
+      (%desc-error "Miniscript expression is not valid at top level: '~A'" expr))
+    (make-out-desc :kind :miniscript :node node :keys (nreverse keys))))
 
 (defun parse-descriptor (string network &key require-checksum)
   "Parse descriptor STRING (Core's Parse). Returns (values out-desc
@@ -720,7 +757,12 @@ resolving each key expression's pubkey via (KEYFN desc-key)."
        (list (%script-p2tr output-key))))
     (:rawtr
      (list (%script-p2tr (%key-xonly-bytes
-                          (funcall keyfn (first (out-desc-keys desc)))))))))
+                          (funcall keyfn (first (out-desc-keys desc)))))))
+    (:miniscript
+     ;; One parsed node, a different script per range index: the converter is
+     ;; what turns each key expression into the pubkey for THIS position.
+     (list (bitcoin-lisp.validation::ms-node-script
+            (out-desc-node desc) nil keyfn)))))
 
 (defun %out-desc-expand-uncached (desc pos)
   "Expand DESC at range position POS into its scriptPubKey list (Core Expand)."
