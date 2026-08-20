@@ -737,6 +737,7 @@ signet|regtest, else returns DEFAULT."
     ("loglevel"          :log-level          :loglevel)
     ("logratelimit"      :log-rate-limit     :bool)
     ("flatblockfiles"    :flat-block-files   :bool)
+    ("reindex"           :reindex            :bool)
     ("port"              :port               :int)
     ("networkactive"     :network-active     :bool)
     ("rest"              :rest               :bool)
