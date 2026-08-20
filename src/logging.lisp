@@ -30,18 +30,19 @@
 (defvar *log-buffer-count* 0
   "Number of entries in log buffer.")
 
-(defvar *log-lock* (bt:make-recursive-lock "log-lock")
+(defvar *log-lock* (bt:make-lock "log-lock")
   "Guards the WHOLE emit — ring buffer, console stream and file stream — not
 just the buffer it used to be named for. Core holds one mutex
 (BCLog::Logger::m_cs) across all of LogPrintStr for exactly this reason: with
 only the buffer locked, lines from the ~8 threads that log interleave mid-line
 in the very file the node's wedges are diagnosed from.
 
-RECURSIVE, where Core's is a plain StdMutex: our SIGTERM/SIGINT handler logs,
-while Core's reduces to an atomic flag plus a one-byte self-pipe write and says
-so explicitly (init.cpp:417-421). Until the handler is that small, a signal
-delivered to a thread already inside an emit must not deadlock on its own
-lock.")
+PLAIN, as Core's StdMutex is. It was recursive for one release because our
+SIGTERM/SIGINT handler logged, so a signal delivered to a thread already inside
+an emit would deadlock on its own lock. The handler is now what Core's is — an
+atomic flag plus a one-byte self-pipe write, nothing else (node.lisp
+%HANDLE-STOP-SIGNAL) — so no emit can re-enter another, and a recursive lock
+would only hide a future one.")
 
 (defun log-level-value (level)
   "Get numeric value for log LEVEL."
@@ -88,7 +89,7 @@ for the message returned nothing usable."
 
 (defun add-to-log-buffer (entry)
   "Add a log entry to the ring buffer."
-  (bt:with-recursive-lock-held (*log-lock*)
+  (bt:with-lock-held (*log-lock*)
     (%add-to-log-buffer-locked entry)))
 
 (defun %add-to-log-buffer-locked (entry)
@@ -222,7 +223,7 @@ suppressed by the limiter."
 
 (defun %log-emit (level format-string args &optional (ratelimit t))
   "Format and write a log ENTRY unconditionally (buffer + console + file)."
-  (bt:with-recursive-lock-held (*log-lock*)
+  (bt:with-lock-held (*log-lock*)
     (%log-emit-locked level format-string args ratelimit)))
 
 (defun node-log (level format-string &rest args)
