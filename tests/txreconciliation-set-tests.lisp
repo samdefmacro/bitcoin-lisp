@@ -135,3 +135,120 @@ point — and deterministic, so a retry does not reveal a fresh sample."
                                  wtxid salt 8 nil))))
     (is (and (member t answers) (member nil answers))
         "the same transaction must not be fanned out to all peers or none")))
+
+;;; --- The sketch exchange (P4) ------------------------------------------------
+
+(test bip330-messages-round-trip
+  "The four messages a round is made of. Their formats are BIP-330's, but the
+q scale is a choice — Core has no reqrecon at all — so it is pinned here as
+well as named in the source."
+  ;; reqrecon
+  (multiple-value-bind (size q)
+      (bitcoin-lisp.serialization:parse-reqrecon-payload
+       (subseq (bitcoin-lisp.serialization:make-reqrecon-message 1234 0.25d0) 24))
+    (is (= 1234 size))
+    (is (= 1/4 q) "q must survive the fixed-point round trip exactly"))
+  ;; A q of zero and a q at the top of the range.
+  (multiple-value-bind (size q)
+      (bitcoin-lisp.serialization:parse-reqrecon-payload
+       (subseq (bitcoin-lisp.serialization:make-reqrecon-message 0 0d0) 24))
+    (is (= 0 size))
+    (is (= 0 q)))
+  ;; sketch: the bytes and nothing else, so the capacity is implied by length.
+  (let ((bytes (make-array 12 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (is (equalp bytes (bitcoin-lisp.serialization:parse-sketch-payload
+                       (subseq (bitcoin-lisp.serialization:make-sketch-message bytes) 24)))))
+  ;; reqsketchext carries nothing.
+  (is (= 24 (length (bitcoin-lisp.serialization:make-reqsketchext-message))))
+  ;; reconcildiff, both ways.
+  (multiple-value-bind (ok ids)
+      (bitcoin-lisp.serialization:parse-reconcildiff-payload
+       (subseq (bitcoin-lisp.serialization:make-reconcildiff-message
+                t '(#xDEADBEEF 1 #xFFFFFFFF)) 24))
+    (is-true ok)
+    (is (equal '(#xDEADBEEF 1 #xFFFFFFFF) ids)))
+  (multiple-value-bind (ok ids)
+      (bitcoin-lisp.serialization:parse-reconcildiff-payload
+       (subseq (bitcoin-lisp.serialization:make-reconcildiff-message nil '()) 24))
+    (is-false ok)
+    (is (null ids) "a failed round asks for nothing and both sides flood")))
+
+(test a-round-splits-the-difference-into-mine-and-yours
+  "A symmetric difference says an element is on exactly ONE side, not which.
+So after decoding, the initiator has to sort the recovered IDs into the ones it
+already holds — which it must ANNOUNCE — and the ones it does not, which it
+must ASK for. Getting that backwards would have each side request what it
+already has and announce nothing."
+  (let* ((k0 5) (k1 6)
+         (mine (bitcoin-lisp.networking::make-recon-set))
+         (theirs (bitcoin-lisp.networking::make-recon-set))
+         (shared (loop for i from 0 below 4 collect (%rc-wtxid i)))
+         (only-mine (loop for i from 30 below 33 collect (%rc-wtxid i)))
+         (only-theirs (loop for i from 60 below 62 collect (%rc-wtxid i))))
+    (dolist (w (append shared only-mine))
+      (bitcoin-lisp.networking::recon-set-add mine k0 k1 w))
+    (dolist (w (append shared only-theirs))
+      (bitcoin-lisp.networking::recon-set-add theirs k0 k1 w))
+    (let* ((capacity (bitcoin-lisp.networking::recon-estimate-capacity
+                      (bitcoin-lisp.networking::recon-set-size mine)
+                      (bitcoin-lisp.networking::recon-set-size theirs)
+                      0.5d0))
+           (round (bitcoin-lisp.networking::make-recon-round
+                   :local-ids (bitcoin-lisp.networking::recon-set-short-ids mine)))
+           (their-sketch (bitcoin-lisp.networking::recon-build-sketch
+                          (bitcoin-lisp.networking::recon-set-short-ids theirs)
+                          capacity)))
+      (multiple-value-bind (ids ok)
+          (bitcoin-lisp.networking::recon-round-decode round their-sketch)
+        (is-true ok)
+        (let ((ask (bitcoin-lisp.networking::recon-round-missing-ids round ids))
+              (tell (bitcoin-lisp.networking::recon-round-ours-to-announce round ids)))
+          (is (= (length only-theirs) (length ask))
+              "ask for exactly what only they have")
+          (is (= (length only-mine) (length tell))
+              "announce exactly what only we have")
+          ;; And the two halves partition the difference, with no overlap.
+          (is (null (intersection ask tell)))
+          (is (= (length ids) (+ (length ask) (length tell))))
+          ;; Every id we ask for resolves in THEIR set, and none in ours.
+          (dolist (id ask)
+            (is-true (bitcoin-lisp.networking::recon-set-wtxid theirs id))
+            (is-false (bitcoin-lisp.networking::recon-set-wtxid mine id))))))))
+
+(test a-decoded-round-is-a-claim-that-the-protocol-must-check
+  "The uncomfortable property, stated plainly rather than assumed away.
+
+A merged sketch whose difference exceeds the capacity does NOT reliably fail to
+decode: it decodes to whatever set of that size reproduces it, which is usually
+not the real difference. So a successful decode is a CLAIM, and BIP-330 treats
+it as one — the initiator asks for the short IDs it believes it is missing, the
+peer announces what it can, and anything still absent is picked up by the next
+round or by fanout. Nothing is lost, but nothing here is a guarantee either.
+
+Asserted so the property stays documented in something that runs, and so a
+future change that starts trusting the decode has to delete this test first."
+  (let* ((truth (loop for i from 1 to 20 collect (* i 7919)))
+         (round (bitcoin-lisp.networking::make-recon-round :local-ids truth))
+         ;; A capacity far below the real difference.
+         (their-sketch (bitcoin-lisp.networking::recon-build-sketch
+                        '(#xAAAAAAAA #xBBBBBBBB) 2)))
+    (multiple-value-bind (ids ok)
+        (bitcoin-lisp.networking::recon-round-decode round their-sketch)
+      (when ok
+        ;; If it decoded at all, the answer reproduces the merged sketch...
+        (is (= 2 (length ids)))
+        ;; ...and is nonetheless NOT the real difference, which is the point.
+        (is (not (subsetp ids truth))
+            "an over-capacity decode is consistent, not correct")))
+    ;; Sized correctly, the same machinery gets it right — so the failure above
+    ;; is about capacity, not about the decoder.
+    (let* ((theirs '(#xAAAAAAAA #xBBBBBBBB))
+           (capacity (+ (length truth) (length theirs)))
+           (round2 (bitcoin-lisp.networking::make-recon-round :local-ids truth))
+           (sketch (bitcoin-lisp.networking::recon-build-sketch theirs capacity)))
+      (multiple-value-bind (ids ok)
+          (bitcoin-lisp.networking::recon-round-decode round2 sketch)
+        (is-true ok)
+        (is (= (+ (length truth) (length theirs)) (length ids)))
+        (is (equal (sort (copy-list theirs) #'<)
+                   (sort (bitcoin-lisp.networking::recon-round-missing-ids round2 ids) #'<)))))))
