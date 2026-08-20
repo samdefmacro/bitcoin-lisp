@@ -465,13 +465,45 @@ Oversized bodies get HTTP 400, like libevent's enforcement.")
 ;;;; start-node-from-args (node.lisp). The parsers here are pure string
 ;;;; functions so they can be unit-tested without launching a node.
 
+(defun locale-independent-atoi (value)
+  "Core LocaleIndependentAtoi (util/strencodings.h:118-143), the integer
+interpretation the config system is built on.
+
+Emulates C-locale atoi: trim, allow one leading `+` (but `+-` is 0), then take
+the LONGEST INTEGER PREFIX. No digits at all is 0 — which is the whole reason
+this function has to exist here rather than being approximated, because
+`atoi(\"true\")` is 0 and therefore `true` is FALSE to Bitcoin Core."
+  (let* ((s (string-trim '(#\Space #\Tab #\Return #\Newline #\Page) value))
+         (start 0)
+         (len (length s)))
+    (when (and (< start len) (char= (char s start) #\+))
+      (when (and (< (1+ start) len) (char= (char s (1+ start)) #\-))
+        (return-from locale-independent-atoi 0))
+      (incf start))
+    (let ((sign 1))
+      (when (and (< start len) (member (char s start) '(#\+ #\-)))
+        (when (char= (char s start) #\-) (setf sign -1))
+        (incf start))
+      (let ((end start))
+        (loop while (and (< end len) (digit-char-p (char s end))) do (incf end))
+        (if (= end start)
+            0
+            (* sign (parse-integer s :start start :end end)))))))
+
 (defun conf-parse-bool (value)
-  "Interpret a config VALUE string as a boolean. \"1\"/\"true\"/\"yes\"/\"on\"
-and the empty string (a bare -flag) are true; \"0\"/\"false\"/\"no\"/\"off\"
-are false; anything else is true (matching Core's lenient -flag semantics)."
-  (let ((v (string-downcase (string-trim '(#\Space #\Tab) value))))
-    (cond ((member v '("0" "false" "no" "off") :test #'string=) nil)
-          (t t))))
+  "Interpret a config VALUE as a boolean, exactly as Core's InterpretBool
+ (common/args.cpp:57-62): the empty string (a bare -flag) is true, otherwise
+`LocaleIndependentAtoi(value) != 0`.
+
+This is deliberately NOT the lenient reading it looks like it should be. We
+used to accept \"true\"/\"yes\"/\"on\" as true and treat any unrecognized value as
+true; Core parses those to 0 and calls them FALSE. So the same bitcoin.conf
+saying `server=true` opened a listener on our node and left it closed on
+Core's — a silent, opposite-direction divergence on a security-relevant flag."
+  (let ((v (string-trim '(#\Space #\Tab) value)))
+    (if (string= v "")
+        t
+        (/= 0 (locale-independent-atoi v)))))
 
 (defun conf-parse-int (value)
   "Parse a config VALUE as an integer, or signal an error."
@@ -653,44 +685,137 @@ check-cli-args rejects them up front."
                 (setf (gethash key seen) t)
                 (push cell kept))))))))
 
-(defun parse-bitcoin-conf (text &optional network)
-  "Parse bitcoin.conf TEXT into an alist of (lower-case-key . value-string).
-Blank lines and #-comments are skipped. A [section] header scopes the keys that
-follow to a network; only keys in the global area (before any section) or in the
-section matching NETWORK are returned. When NETWORK is NIL, section headers are
-ignored and every key is returned."
-  (let ((out nil)
+(define-condition config-parse-error (error)
+  ((message :initarg :message :reader config-parse-error-message))
+  (:report (lambda (c stream) (write-string (config-parse-error-message c) stream)))
+  (:documentation
+   "A bitcoin.conf line Core refuses to parse. Core returns false from
+GetConfigOptions with an `error` string and the node does not start; a config
+this malformed silently half-applying is how an operator ends up running
+settings they did not write."))
+
+(defun %conf-strip-comment (line)
+  "Cut LINE at its first #, as Core does (config.cpp:41-44). Returns
+ (values text used-hash-p).
+
+Core strips a # ANYWHERE in the line, not only at the start. We stripped only
+whole-line comments, so `datadir=/srv/btc  # mainnet` produced a datadir whose
+literal name contained the comment — and, since a missing datadir was created
+rather than refused, a silent resync from genesis into a junk directory."
+  (let ((pos (position #\# line)))
+    (if pos
+        (values (subseq line 0 pos) t)
+        (values line nil))))
+
+(defun parse-bitcoin-conf-sections (text &optional network)
+  "Parse bitcoin.conf TEXT into (values section-entries global-entries), each an
+in-order alist of (lower-case-key . value-string).
+
+GLOBAL-ENTRIES are the keys before any [section]; SECTION-ENTRIES are the keys
+in the [section] matching NETWORK (all sections when NETWORK is NIL). Core keeps
+the same split — it prefixes section keys and stores them under
+`ro_config[section][name]` (config.cpp:48-65) — because the two are consulted in
+a definite order, not merged blindly. See PARSE-BITCOIN-CONF.
+
+Signals CONFIG-PARSE-ERROR on the three lines Core refuses:
+a leading `-`, a non-empty line with no `=`, and `#` inside an rpcpassword."
+  (let ((sections nil)
+        (globals nil)
+        (in-section nil)
         (active t)
-        (want (and network (conf-section-name network))))
+        (want (and network (conf-section-name network)))
+        (linenr 0))
     (with-input-from-string (in text)
       (loop for raw = (read-line in nil nil)
             while raw
-            do (let ((line (string-trim '(#\Space #\Tab #\Return) raw)))
-                 (cond
-                   ((zerop (length line)))                          ; blank
-                   ((char= (char line 0) #\#))                      ; comment
-                   ((and (char= (char line 0) #\[)
-                         (char= (char line (1- (length line))) #\]))
-                    (let ((sec (string-downcase
-                                (string-trim '(#\Space)
-                                             (subseq line 1 (1- (length line)))))))
-                      (setf active (or (null want) (string= sec want)))))
-                   (active
-                    (let ((eq-pos (position #\= line)))
-                      (when eq-pos
-                        (push (cons (string-downcase
-                                     (string-trim '(#\Space #\Tab) (subseq line 0 eq-pos)))
-                                    (string-trim '(#\Space #\Tab) (subseq line (1+ eq-pos))))
-                              out))))))))
-    (nreverse out)))
+            do (incf linenr)
+               (multiple-value-bind (body used-hash) (%conf-strip-comment raw)
+                 (let ((line (string-trim '(#\Space #\Tab #\Return) body)))
+                   (cond
+                     ((zerop (length line)))
+                     ((and (char= (char line 0) #\[)
+                           (char= (char line (1- (length line))) #\]))
+                      (let ((sec (string-downcase
+                                  (string-trim '(#\Space)
+                                               (subseq line 1 (1- (length line)))))))
+                        (setf in-section t
+                              active (or (null want) (string= sec want)))))
+                     ((char= (char line 0) #\-)
+                      (error 'config-parse-error
+                             :message (format nil "parse error on line ~D: ~A, options in ~
+                                                   configuration file must be specified ~
+                                                   without leading -" linenr line)))
+                     (t
+                      (let ((eq-pos (position #\= line)))
+                        (unless eq-pos
+                          (error 'config-parse-error
+                                 :message
+                                 (format nil "parse error on line ~D: ~A~@[~A~]" linenr line
+                                         (when (and (>= (length line) 2)
+                                                    (string= "no" (subseq line 0 2)))
+                                           (format nil ", if you intended to specify a ~
+                                                        negated option, use ~A=1 instead"
+                                                   line)))))
+                        (let ((key (string-downcase
+                                    (string-trim '(#\Space #\Tab) (subseq line 0 eq-pos))))
+                              (value (string-trim '(#\Space #\Tab) (subseq line (1+ eq-pos)))))
+                          (when (and used-hash (search "rpcpassword" key))
+                            (error 'config-parse-error
+                                   :message
+                                   (format nil "parse error on line ~D, using # in ~
+                                                rpcpassword can be ambiguous and should ~
+                                                be avoided" linenr)))
+                          (when active
+                            (if in-section
+                                (push (cons key value) sections)
+                                (push (cons key value) globals)))))))))))
+    (values (nreverse sections) (nreverse globals))))
+
+(defun parse-bitcoin-conf (text &optional network)
+  "Parse bitcoin.conf TEXT into a single in-order alist, ordered so that ASSOC
+gives Core's precedence: the [network] section BEFORE the global area.
+
+That order is the fix for a silent inversion. Core resolves a setting as
+`forced > command line > rw settings > config network section > config default
+section` (settings.cpp:36), so a `[main] rpcport=8888` beats a global
+`rpcport=7777`. We returned keys in file order and let the first ASSOC win,
+which made the GLOBAL value beat the section — the reverse of Core, on every
+key an operator bothered to scope."
+  (multiple-value-bind (sections globals) (parse-bitcoin-conf-sections text network)
+    (append sections globals)))
+
+(defun conf-global-entries (text)
+  "The global-area entries only. Core reads the chain selectors with
+`section=\"\"` (args.cpp:825-829, get_chain_type=true): the network cannot be
+chosen from inside a network section, because the section cannot be scoped
+until the network is known.
+
+This is what lets a network selected INSIDE bitcoin.conf still scope its own
+section. We used to resolve the network from the CLI alone and then parse the
+file against it, so `testnet4=1` in the file left us scoping to the DEFAULT
+network's section and silently dropping the whole [testnet4] block."
+  (nth-value 1 (parse-bitcoin-conf-sections text nil)))
 
 (defun resolve-network-from-config (alist &optional (default :testnet3))
   "Determine the network from a merged config ALIST. Honors -regtest/-signet/
--testnet4/-testnet flags (in Core's precedence) and -chain=main|test|testnet4|
-signet|regtest, else returns DEFAULT."
+-testnet4/-testnet flags and -chain=main|test|testnet4|signet|regtest.
+
+More than one selector is an ERROR, as it is in Core (args.cpp:839-841,
+\"Invalid combination of -regtest, -signet, -testnet, -testnet4 and -chain. Can
+use at most one.\"). We used to resolve a conflict by a silent priority order,
+so `-chain=regtest` on the command line plus a stale `testnet=1` left in
+bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
   (flet ((flag (k) (let ((c (assoc k alist :test #'string=)))
                      (and c (conf-parse-bool (cdr c)))))
          (val (k) (let ((c (assoc k alist :test #'string=))) (and c (cdr c)))))
+    (let ((selectors (count t (list (flag "regtest") (flag "signet")
+                                    (flag "testnet4") (flag "testnet")
+                                    (and (val "chain") t)))))
+      (when (> selectors 1)
+        (error 'config-parse-error
+               :message (format nil "Invalid combination of -regtest, -signet, ~
+                                     -testnet, -testnet4 and -chain. Can use at ~
+                                     most one."))))
     (cond
       ((flag "regtest") :regtest)
       ((flag "signet") :signet)
@@ -750,6 +875,7 @@ specially in config-alist->start-node-plist.")
 (defparameter *known-config-options*
   '(;; network selection + entry-point specials
     "regtest" "signet" "testnet4" "testnet" "chain" "server" "debug" "conf"
+    "includeconf"
     "datadir"
     ;; apply-config-globals options
     "datacarrier" "datacarriersize" "permitbaremultisig"
@@ -1153,15 +1279,36 @@ start-node-from-args."
                (error "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6")))))))
 
 (defun args->start-node-plist (args &optional conf-text)
+  ;; CONF-TEXT is the main bitcoin.conf, or a LIST of texts when -includeconf
+  ;; pulled in more (main file first). See the docstring below.
   "Pure assembly of a start-node keyword plist from Bitcoin Core-style CLI ARGS
- (a list of strings) and optional CONF-TEXT (the contents of a bitcoin.conf).
-CLI arguments override the file. The network is resolved from the CLI first, so
-the config file's [network] section can be scoped, then finalized from the
-merge. Returns (VALUES plist merged-alist network); start-node-from-args
-(node.lisp) wraps this with the file I/O, apply-config-globals, and launch."
+ (a list of strings) and CONF-TEXT — one bitcoin.conf's contents, or a LIST of
+them (main file first) when -includeconf pulled in more.
+
+Precedence is Core's (settings.cpp:36): command line, then the [network]
+section of any config file, then the global area of any config file.
+Returns (VALUES plist merged-alist network); start-node-from-args (node.lisp)
+wraps this with the file I/O, apply-config-globals, and launch."
   (let* ((cli (parse-cli-args args))
-         (cli-network (resolve-network-from-config cli))
-         (conf (when conf-text (parse-bitcoin-conf conf-text cli-network)))
-         (merged (append cli conf))                 ; CLI first => wins on assoc
-         (network (resolve-network-from-config merged)))
+         ;; The network is resolved from the CLI plus the config file's GLOBAL
+         ;; area — never from inside a section, which is Core's rule (it reads
+         ;; the chain selectors with section="", args.cpp:825-829). Resolving it
+         ;; from the CLI alone, as this used to, meant a `testnet4=1` written in
+         ;; bitcoin.conf left us scoping the file to the DEFAULT network's
+         ;; section and silently dropping the whole [testnet4] block.
+         (texts (cond ((null conf-text) nil)
+                      ((listp conf-text) conf-text)
+                      (t (list conf-text))))
+         (globals (loop for text in texts append (conf-global-entries text)))
+         (network (resolve-network-from-config (append cli globals)))
+         ;; Sections from EVERY file outrank globals from every file, because
+         ;; Core accumulates them all into one ro_config[section][name] map and
+         ;; then consults section before "" — the file boundary is not part of
+         ;; the precedence, only the section is.
+         (conf (append (loop for text in texts
+                             append (parse-bitcoin-conf-sections text network))
+                       globals))
+         ;; CLI > [network] section > global area (Core settings.cpp:36), which
+         ;; PARSE-BITCOIN-CONF has already ordered; first ASSOC wins.
+         (merged (append cli conf)))
     (values (config-alist->start-node-plist merged network) merged network)))
