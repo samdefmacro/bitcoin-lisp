@@ -176,6 +176,7 @@
   (register-rpc-method "getblockstats" #'rpc-getblockstats)
   ;; Pruning
   (register-rpc-method "pruneblockchain" #'rpc-pruneblockchain)
+  (register-rpc-method "migrateblocks" #'rpc-migrateblocks)
   ;; Wallet (wallet P1; handlers reject with method-not-found when the node
   ;; runs without wallet support, matching a no-wallet Core build)
   (register-rpc-method "createwallet" #'rpc-createwallet)
