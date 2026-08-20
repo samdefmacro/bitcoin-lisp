@@ -1923,8 +1923,9 @@ Handles chain reorganizations when a competing chain has more work."
                       (bitcoin-lisp.serialization:block-header-bits header)
                       prev-work)))
 
-    ;; Store block
-    (bitcoin-lisp.storage:store-block block-store block)
+    ;; Store block. The height travels with it so the file it lands in can
+    ;; be pruned later: a flat block file prunes whole, which needs its range.
+    (bitcoin-lisp.storage:store-block block-store block :height new-height)
 
     ;; Index entry. Core NEVER rebuilds a CBlockIndex: AddToBlockIndex is a
     ;; try_emplace that returns the existing object when the hash is already
@@ -3156,7 +3157,11 @@ can neither wedge on an equal-work sibling nor advance past the base."
         (unless (and entry
                      (bitcoin-lisp.storage:entry-target-ancestor-p chain-state entry))
           (unless (block-witness-stripped-p block)
-            (bitcoin-lisp.storage:store-block block-store block))
+            (bitcoin-lisp.storage:store-block
+             block-store block
+             ;; NIL when the header is not indexed yet, which leaves the file
+             ;; unprunable rather than guessing a range.
+             :height (and entry (bitcoin-lisp.storage:block-index-entry-height entry))))
           (return-from activate-block (values nil :weaker-chain)))))
     (cond
       ;; Case 1: extends current tip — normal path.
@@ -3313,5 +3318,11 @@ can neither wedge on an equal-work sibling nor advance past the base."
            ;; the target-filter guard above (block.lisp ~2428).
            (t
             (unless (block-witness-stripped-p block)
-              (bitcoin-lisp.storage:store-block block-store block))
+              (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                            chain-state
+                            (bitcoin-lisp.serialization:block-header-hash header))))
+                (bitcoin-lisp.storage:store-block
+                 block-store block
+                 :height (and entry
+                              (bitcoin-lisp.storage:block-index-entry-height entry)))))
             (values nil :weaker-chain))))))))

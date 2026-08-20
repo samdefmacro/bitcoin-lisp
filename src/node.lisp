@@ -2259,6 +2259,17 @@ Returns the node instance."
       ;; No file at all — a legitimate first run.
       (t nil)))
 
+  ;; Per-file accounting for the flat block files, recovered by joining the
+  ;; store's hash -> position map with the header index's hash -> height. It
+  ;; has to happen HERE: the store is opened before the header index is loaded,
+  ;; so neither half knows enough on its own, and without it no flat file can
+  ;; ever be shown to lie inside the prunable window.
+  (when (node-block-store *node*)
+    (let ((files (bitcoin-lisp.storage:rebuild-block-file-info
+                  (node-block-store *node*) (node-chain-state *node*))))
+      (when (plusp files)
+        (log-info "Block file accounting: ~D flat block file~:P" files))))
+
   ;; Ensure genesis block is in the index with a proper header
   ;; (needed for difficulty walk-back on testnet)
   (let* ((genesis-hash (bitcoin-lisp.storage:network-genesis-hash network))
