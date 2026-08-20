@@ -921,6 +921,71 @@ and VERACK."
                    (write-uint64-le stream salt))))
     (serialize-message "sendtxrcncl" payload)))
 
+(defconstant +recon-q-precision+ 32768
+  "Fixed-point denominator for the q parameter of reqrecon.
+
+BIP-330 sends q as a 16-bit integer; this is the scale it is read at. Chosen
+rather than ported: Core has no reqrecon at all, so there is no implementation
+to match. Anything that ever talks to another node must agree on this number,
+which is why it is a named constant and not a literal.")
+
+(defun make-reqrecon-message (set-size q)
+  "BIP-330 reqrecon: uint32 SET-SIZE + uint16 Q, both LE.
+
+The initiator tells the responder how many transactions it is holding for this
+link, and how much of the smaller set it guesses the two sides do not share.
+Those two numbers are all the responder needs to size a sketch."
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-uint32-le stream set-size)
+                   (write-uint16-le stream
+                                    (min #xFFFF
+                                         (round (* q +recon-q-precision+)))))))
+    (serialize-message "reqrecon" payload)))
+
+(defun parse-reqrecon-payload (payload)
+  "Returns (VALUES set-size q), q as a rational in [0, 2)."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (let ((set-size (read-uint32-le stream))
+          (q-raw (read-uint16-le stream)))
+      (values set-size (/ q-raw +recon-q-precision+)))))
+
+(defun make-sketch-message (sketch-bytes)
+  "BIP-330 sketch: the serialized sketch, and nothing else. Its length divided
+by the field size is the capacity, so no count is sent."
+  (serialize-message "sketch" sketch-bytes))
+
+(defun parse-sketch-payload (payload)
+  (copy-seq payload))
+
+(defun make-reqsketchext-message ()
+  "BIP-330 reqsketchext: empty. The initiator failed to decode and is asking
+for the SECOND HALF of a double-capacity sketch — only the half it does not
+have, since sketches extend rather than being resent."
+  (serialize-message "reqsketchext" (make-array 0 :element-type '(unsigned-byte 8))))
+
+(defun make-reconcildiff-message (success short-ids)
+  "BIP-330 reconcildiff: uint8 SUCCESS + a vector of uint32 short IDs.
+
+SUCCESS says whether the initiator decoded the difference. When it did,
+SHORT-IDS are the ones it is missing and wants announced. When it did not, the
+list is empty and both sides fall back to announcing their whole sets — the
+flood fallback, which is why a failed reconciliation costs bandwidth but never
+transactions."
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-byte (if success 1 0) stream)
+                   (write-compact-size stream (length short-ids))
+                   (dolist (id short-ids)
+                     (write-uint32-le stream id)))))
+    (serialize-message "reconcildiff" payload)))
+
+(defun parse-reconcildiff-payload (payload)
+  "Returns (VALUES success-p short-ids)."
+  (flexi-streams:with-input-from-sequence (stream payload)
+    (let* ((success (plusp (read-byte stream)))
+           (count (read-compact-size stream))
+           (ids (loop repeat count collect (read-uint32-le stream))))
+      (values success ids))))
+
 (defun parse-sendtxrcncl-payload (payload)
   "Parse a sendtxrcncl message payload (BIP 330).
 Returns (VALUES version salt)."

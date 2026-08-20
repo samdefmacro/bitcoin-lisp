@@ -130,3 +130,63 @@ every retry, and unpredictable to anyone who does not know the salt."
                        (float inbound-count 1d0))
                     1d0))
         (< draw +recon-inbound-fanout-fraction+))))
+
+;;;; --- Reconciliation rounds (Erlay P4) -----------------------------------
+;;;;
+;;;; One round, in messages:
+;;;;
+;;;;   initiator -> reqrecon(set_size, q)
+;;;;   responder -> sketch(their sketch at the estimated capacity)
+;;;;   initiator: merge, decode
+;;;;     decoded -> reconcildiff(success=1, ids it is missing)
+;;;;     failed  -> reqsketchext, responder sends the extension, decode again
+;;;;                still failed -> reconcildiff(success=0) and both sides
+;;;;                announce their whole sets
+;;;;
+;;;; ⚠️ Still beyond Core: none of these messages exists there.
+
+(defstruct recon-round
+  "The initiator's state for one reconciliation round."
+  (peer nil)
+  ;; The frozen short IDs this round is about.
+  (local-ids '() :type list)
+  ;; The capacity the responder used, needed to size the extension.
+  (capacity 0 :type (integer 0))
+  ;; The responder's sketch, kept so an extension can be appended to it rather
+  ;; than the whole thing resent.
+  (their-sketch nil)
+  (extended nil :type boolean)
+  (state :requested :type keyword))
+
+(defun recon-round-decode (round their-sketch)
+  "Merge the responder's sketch with our own and try to decode.
+
+Returns (values short-ids ok-p). A NIL id list with OK-P false is the ordinary
+`difference was bigger than the sketch' outcome, which the caller answers with
+an extension rather than a failure."
+  (let* ((capacity (length their-sketch))
+         (mine (recon-build-sketch (recon-round-local-ids round) capacity))
+         (merged (ms-sketch-merge mine their-sketch))
+         (decoded (ms-decode merged)))
+    (setf (recon-round-their-sketch round) their-sketch
+          (recon-round-capacity round) capacity)
+    (if decoded
+        (values decoded t)
+        (values nil nil))))
+
+(defun recon-round-missing-ids (round decoded-ids)
+  "Of the differing short IDs, the ones WE do not have — the set to ask for.
+
+The rest are ours to announce, since a symmetric difference says only that an
+element is on exactly one side, not which."
+  (let ((ours (make-hash-table :test 'eql)))
+    (dolist (id (recon-round-local-ids round))
+      (setf (gethash id ours) t))
+    (remove-if (lambda (id) (gethash id ours)) decoded-ids)))
+
+(defun recon-round-ours-to-announce (round decoded-ids)
+  "The differing short IDs that ARE ours, which the peer is missing."
+  (let ((ours (make-hash-table :test 'eql)))
+    (dolist (id (recon-round-local-ids round))
+      (setf (gethash id ours) t))
+    (remove-if-not (lambda (id) (gethash id ours)) decoded-ids)))
