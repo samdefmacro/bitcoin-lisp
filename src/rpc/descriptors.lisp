@@ -637,7 +637,13 @@ by StringType, descriptor.cpp:909)."
              (mapcar keyfn (out-desc-keys desc))))
     ((:sh :wsh)
      (format nil "~(~A~)(~A)" (out-desc-kind desc)
-             (%out-desc-string-walk (out-desc-sub desc) keyfn)))))
+             (%out-desc-string-walk (out-desc-sub desc) keyfn)))
+    ;; The miniscript renders itself, with each key expression rendered by the
+    ;; same KEYFN the rest of the walk uses — so a policy descriptor's public,
+    ;; private and normalized forms differ in exactly the way every other
+    ;; descriptor's do.
+    (:miniscript
+     (bitcoin-lisp.validation::ms-node-to-string (out-desc-node desc) keyfn))))
 
 (defun out-desc-string (desc &optional (style :public))
   "The canonical public descriptor body (no checksum): private keys replaced
