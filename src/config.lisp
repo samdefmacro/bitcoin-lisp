@@ -735,6 +735,7 @@ signet|regtest, else returns DEFAULT."
     ("wallet"            :wallet             :bool)
     ("logfile"           :log-file           :string)
     ("loglevel"          :log-level          :loglevel)
+    ("logratelimit"      :log-rate-limit     :bool)
     ("port"              :port               :int)
     ("networkactive"     :network-active     :bool)
     ("rest"              :rest               :bool)

@@ -233,6 +233,7 @@
                              (:file "eclipse-dos-tests")
                              ;; bitcoin.conf + CLI argument parsing
                              (:file "config-tests")
+                             (:file "logging-tests")
                              ;; SOCKS5 outbound proxy (-proxy) client
                              (:file "socks5-tests")
                              ;; Tor control client + onion service + self-advertisement
