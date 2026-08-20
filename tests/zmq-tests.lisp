@@ -295,6 +295,38 @@ non-block inclusion reasons\")."
                       "connect-block must publish the connected block's hash")))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
 
+(test zmq-connect-block-publishes-each-transaction-in-the-block
+  "The per-transaction half of BlockConnected, which the hashblock test above
+cannot reach: with neither hashtx nor rawtx subscribed, zmq-notify-block-
+connected skips the loop over the block's transactions entirely. That loop read
+BITCOIN-BLOCK-TRANSACTIONS -- a LIST (types.lisp:534) -- with LOOP ... ACROSS,
+so the first block published with hashtx enabled would have signalled a type
+error instead of notifying. The compiler said so on every clean build; nothing
+executed it."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "zmq-blocktx")
+     (%with-zmq-hook-test (address "hashtx" sub)
+       (let ((warm (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+         (is-true (%zmq-await-attached
+                   sub (lambda () (bitcoin-lisp::zmq-notify-hash-tx warm))))
+         (let* ((hash (first (make-test-chain-hashes #xD4 1)))
+                (block1 (make-reorg-test-block genesis-hash hash 1))
+                (coinbase (first (bitcoin-lisp.serialization:bitcoin-block-transactions
+                                  block1)))
+                (txid (bitcoin-lisp.serialization:transaction-hash coinbase)))
+           (bitcoin-lisp.validation:connect-block block1 chain-state block-store utxo-set)
+           (sleep 0.5)
+           (let ((wanted (string-downcase
+                          (bitcoin-lisp.crypto:bytes-to-hex (reverse (copy-seq txid))))))
+             (is-true (some (lambda (l)
+                              (let ((body (third (uiop:split-string l :separator " "))))
+                                (and body (string= wanted (subseq body 0 (min 64 (length body)))))))
+                            (%zmq-drain sub))
+                      "connect-block must publish the txid of every transaction
+                       in the connected block")))))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
 (test zmq-publisher-specs-reach-the-node-from-config
   "apply-config-globals must record what -zmqpub* asked for, or start-node has
 nothing to bind and the option is silently inert."
