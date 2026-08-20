@@ -445,6 +445,7 @@
    #:block-store
    #:make-block-store
    #:init-block-store
+   #:*flat-block-files*
    #:store-block
    #:get-block
    #:block-exists-p

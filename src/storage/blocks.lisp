@@ -11,10 +11,33 @@
 (defvar *blocks-directory* nil
   "Directory for block files.")
 
+(defvar *flat-block-files* nil
+  "Write new blocks into Core's numbered blk?????.dat files instead of one file
+per block.
+
+Transitional, and default OFF, for one reason: pruning is still per-block
+deletion, and a flat file cannot have a block cut out of the middle of it. A
+pruned node — which is what our mainnet node is — would silently stop reclaiming
+space the moment its new blocks went into flat files. File-granular pruning is
+P3 of docs/block-file-format-plan.md; this flag goes away with P4's migration.
+
+READING is not gated: a store always reads whichever form each block is in, so
+turning the flag on and off again leaves every block reachable.")
+
 (defstruct block-store
   "Block storage manager."
   (base-path nil :type (or null pathname))
+  ;; hash -> where the block is: a PATHNAME for a legacy per-block file, or a
+  ;; FLAT-FILE-POS for a record inside a blk?????.dat. Both forms coexist for
+  ;; the whole life of a store that has ever held either.
   (index (make-hash-table :test 'equalp) :type hash-table)
+  ;; The blk sequence and where the next record goes. Core keeps the same pair
+  ;; as m_blockfile_cursors (blockstorage.h:151-175).
+  (blk-seq nil)
+  (cursor-file 0 :type (unsigned-byte 32))
+  (cursor-pos 0 :type (unsigned-byte 32))
+  ;; The blocksdir obfuscation key, read or created once at init.
+  (xor-key nil)
   ;; Running total of all .blk file sizes, maintained by store-block and
   ;; prune-block and initialized by the init-block-store scan. Pruning
   ;; consults this after EVERY connected block (validation/block.lisp), so
@@ -51,10 +74,85 @@ Uses stat on SBCL — one syscall, no file open."
         (file-length s))
     (error () nil)))
 
+(defun block-network-magic ()
+  "The 4-byte network magic that prefixes every stored record, which is the
+same value the P2P message header uses (Core MessageStart)."
+  (bitcoin-lisp:network-magic bitcoin-lisp:*network*))
+
+(defun %blk-seq (store)
+  "The blk file sequence, created on demand."
+  (or (block-store-blk-seq store)
+      (setf (block-store-blk-seq store)
+            (make-flat-file-seq (ensure-directories store) "blk"
+                                +blockfile-chunk-size+))))
+
+(defun %store-block-flat (store data)
+  "Append a block's serialized DATA to the current blk file and return its
+FLAT-FILE-POS. The position points PAST the 8-byte header, at the payload,
+which is what Core records as nDataPos."
+  (let* ((seq (%blk-seq store))
+         (record (flat-record-bytes (block-network-magic) data))
+         (need (length record)))
+    ;; Roll over rather than exceed Core's maximum file size, finalizing the
+    ;; file we are leaving so its preallocated tail is truncated away.
+    (when (and (plusp (block-store-cursor-pos store))
+               (> (+ (block-store-cursor-pos store) need) +max-blockfile-size+))
+      (flat-file-flush seq
+                       (make-flat-file-pos (block-store-cursor-file store)
+                                           (block-store-cursor-pos store))
+                       :finalize t)
+      (incf (block-store-cursor-file store))
+      (setf (block-store-cursor-pos store) 0))
+    (let* ((file (block-store-cursor-file store))
+           (start (block-store-cursor-pos store))
+           (pos (make-flat-file-pos file start)))
+      (flat-file-allocate seq pos need)
+      ;; Obfuscated at the record's real file offset: the key alignment of
+      ;; every byte depends on where it lands, not on where the buffer starts.
+      (let ((on-disk (obfuscate! (copy-seq record) (block-store-xor-key store)
+                                 :key-offset start)))
+        (with-open-file (out (flat-file-name seq pos)
+                             :direction :io :element-type '(unsigned-byte 8)
+                             :if-exists :overwrite :if-does-not-exist :create)
+          (file-position out start)
+          (write-sequence on-disk out)
+          (finish-output out)
+          ;; Same durability rule as the per-block path: connect-block stores
+          ;; the block before the chainstate flush that references it.
+          #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd out)))))
+      (setf (block-store-cursor-pos store) (+ start need))
+      (make-flat-file-pos file (+ start +storage-header-bytes+)))))
+
+(defun %read-block-flat (store pos)
+  "Read and deserialize the block whose payload starts at POS. Returns NIL if
+the record is missing, mis-framed, or unreadable."
+  (let* ((seq (%blk-seq store))
+         (path (flat-file-name seq pos))
+         (record-start (- (flat-file-pos-pos pos) +storage-header-bytes+)))
+    (when (probe-file path)
+      (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+        (when (<= (+ record-start +storage-header-bytes+) (file-length in))
+          (file-position in record-start)
+          (let ((header (make-array +storage-header-bytes+
+                                    :element-type '(unsigned-byte 8))))
+            (read-sequence header in)
+            (obfuscate! header (block-store-xor-key store) :key-offset record-start)
+            (multiple-value-bind (magic length) (parse-flat-record-header header)
+              (when (and (equalp magic (block-network-magic))
+                         (<= (+ (flat-file-pos-pos pos) length) (file-length in)))
+                (let ((payload (make-array length :element-type '(unsigned-byte 8))))
+                  (read-sequence payload in)
+                  (obfuscate! payload (block-store-xor-key store)
+                              :key-offset (flat-file-pos-pos pos))
+                  (flexi-streams:with-input-from-sequence (bs payload)
+                    (bitcoin-lisp.serialization:read-bitcoin-block bs)))))))))))
+
 (defun store-block (store block)
   "Store a block in the block store.
 BLOCK should be a bitcoin-block structure.
-Returns the block hash."
+Returns (values hash location), where LOCATION is a FLAT-FILE-POS when the
+block went into a blk?????.dat and a PATHNAME when it went into a per-block
+file (see *FLAT-BLOCK-FILES*)."
   (ensure-directories store)
   (let* ((hash (bitcoin-lisp.serialization:block-header-hash
                 (bitcoin-lisp.serialization:bitcoin-block-header block)))
@@ -69,24 +167,40 @@ Returns the block hash."
          (data (bitcoin-lisp.serialization:serialize-witness-block block))
          ;; If we're overwriting an already-stored block, its old size is
          ;; in total-bytes and must be replaced, not added to.
-         (old-size (when (gethash hash (block-store-index store))
-                     (file-size-bytes path))))
-    ;; Write block to file and fsync it: connect-block stores the block before
-    ;; the periodic chainstate flush, so the block must be durable before the
-    ;; chainstate can reference it — otherwise a power loss can leave the
-    ;; chainstate (or its coinbase-probe recovery) pointing at a block file
-    ;; that never reached the platter.
-    (with-open-file (stream path
-                            :direction :output
-                            :if-exists :supersede
-                            :element-type '(unsigned-byte 8))
-      (write-sequence data stream)
-      (finish-output stream)
-      #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd stream))))
-    ;; Update index and running storage total
-    (setf (gethash hash (block-store-index store)) path)
-    (incf (block-store-total-bytes store) (- (length data) (or old-size 0)))
-    hash))
+         ;; Re-storing a block that is already here replaces its contribution
+         ;; to the running total rather than adding to it. For a flat record
+         ;; that is the payload plus its header; for a legacy file, the file.
+         (old-size (let ((existing (gethash hash (block-store-index store))))
+                     (typecase existing
+                       (null nil)
+                       (flat-file-pos (+ (length data) +storage-header-bytes+))
+                       (t (file-size-bytes path))))))
+    (cond
+      (*flat-block-files*
+       (let ((pos (%store-block-flat store data)))
+         (setf (gethash hash (block-store-index store)) pos)
+         ;; The record's overhead counts toward the storage total, as it does
+         ;; in Core's per-file accounting.
+         (incf (block-store-total-bytes store)
+               (- (+ (length data) +storage-header-bytes+) (or old-size 0)))
+         (values hash pos)))
+      (t
+       ;; Write block to file and fsync it: connect-block stores the block before
+       ;; the periodic chainstate flush, so the block must be durable before the
+       ;; chainstate can reference it — otherwise a power loss can leave the
+       ;; chainstate (or its coinbase-probe recovery) pointing at a block file
+       ;; that never reached the platter.
+       (with-open-file (stream path
+                               :direction :output
+                               :if-exists :supersede
+                               :element-type '(unsigned-byte 8))
+         (write-sequence data stream)
+         (finish-output stream)
+         #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd stream))))
+       ;; Update index and running storage total
+       (setf (gethash hash (block-store-index store)) path)
+       (incf (block-store-total-bytes store) (- (length data) (or old-size 0)))
+       (values hash path)))))
 
 (defun get-block (store hash)
   "Retrieve a block by its hash.
@@ -104,6 +218,16 @@ so the block is never re-requested (silent permanent stall); deleting the file
 makes probe + index agree so the normal download path re-fetches it and
 store-block (:if-exists :supersede) overwrites. Every caller already treats NIL
 as absent, so none relies on the raise."
+  (let ((located (gethash hash (block-store-index store))))
+    (when (flat-file-pos-p located)
+      (return-from get-block
+        (handler-case (%read-block-flat store located)
+          (error (e)
+            (bitcoin-lisp:log-warn
+             "CORRUPT BLOCK record for ~A (~A) — dropping from the index"
+             (bitcoin-lisp.crypto:bytes-to-hex hash) e)
+            (remhash hash (block-store-index store))
+            nil)))))
   (let ((path (block-file-path store hash)))
     (when (probe-file path)
       (handler-case
@@ -123,13 +247,72 @@ as absent, so none relies on the raise."
           nil)))))
 
 (defun block-exists-p (store hash)
-  "Check if a block with HASH exists in storage."
-  (probe-file (block-file-path store hash)))
+  "Check if a block with HASH exists in storage, in either form."
+  (let ((located (gethash hash (block-store-index store))))
+    (if (flat-file-pos-p located)
+        t
+        (probe-file (block-file-path store hash)))))
+
+(defun %scan-flat-block-files (store)
+  "Rebuild the hash -> position map by walking every blk?????.dat, and leave the
+cursor at the end of the last one. Returns the bytes accounted for.
+
+This is most of what a full -reindex does, and it is cheap: each record is
+found by hopping over the previous one's length, and identifying a block needs
+only its 80-byte header, never a full deserialization. Walking a file stops at
+the first header that is not a record — which is exactly what the preallocated
+zero tail of the file currently being appended to looks like."
+  (let ((seq (%blk-seq store))
+        (key (block-store-xor-key store))
+        (magic (block-network-magic))
+        (bytes 0)
+        (last-file 0)
+        (last-pos 0))
+    (loop for file from 0
+          for path = (flat-file-name seq (make-flat-file-pos file 0))
+          while (probe-file path)
+          do (with-open-file (in path :direction :input
+                                      :element-type '(unsigned-byte 8))
+               (let ((size (file-length in))
+                     (offset 0)
+                     (header (make-array +storage-header-bytes+
+                                         :element-type '(unsigned-byte 8)))
+                     (hdr80 (make-array 80 :element-type '(unsigned-byte 8))))
+                 (loop
+                   (when (> (+ offset +storage-header-bytes+) size) (return))
+                   (file-position in offset)
+                   (read-sequence header in)
+                   (obfuscate! header key :key-offset offset)
+                   (multiple-value-bind (found length) (parse-flat-record-header header)
+                     (unless (and (equalp found magic)
+                                  (plusp length)
+                                  (>= length 80)
+                                  (<= (+ offset +storage-header-bytes+ length) size))
+                       (return))
+                     (read-sequence hdr80 in)
+                     (obfuscate! hdr80 key
+                                 :key-offset (+ offset +storage-header-bytes+))
+                     (let ((hash (bitcoin-lisp.crypto:hash256 hdr80)))
+                       (setf (gethash hash (block-store-index store))
+                             (make-flat-file-pos file (+ offset +storage-header-bytes+))))
+                     (incf bytes (+ +storage-header-bytes+ length))
+                     (setf offset (+ offset +storage-header-bytes+ length)
+                           last-file file
+                           last-pos offset)))))
+          finally (setf (block-store-cursor-file store) last-file
+                        (block-store-cursor-pos store) last-pos))
+    bytes))
 
 (defun init-block-store (base-path)
   "Initialize a block store at BASE-PATH."
   (let ((store (make-block-store :base-path (pathname base-path))))
     (ensure-directories store)
+    ;; The obfuscation key is read before anything is scanned: without it every
+    ;; record header would look like garbage and the scan would find nothing.
+    ;; A key is only CREATED for a directory with no block data in it.
+    (setf (block-store-xor-key store)
+          (read-or-create-xor-key (merge-pathnames "blocks/" base-path)
+                                  :create *flat-block-files*))
     ;; Scan for existing blocks (the only full-directory scan — from here
     ;; on, total-bytes is maintained incrementally)
     (let ((blocks-dir (merge-pathnames "blocks/" base-path))
@@ -140,6 +323,9 @@ as absent, so none relies on the raise."
                  (hash (bitcoin-lisp.crypto:hex-to-bytes name)))
             (setf (gethash hash (block-store-index store)) file)
             (incf total-bytes (or (file-size-bytes file) 0)))))
+      ;; Then the flat files. Both forms are indexed, which is what makes the
+      ;; store readable across the transition in either direction.
+      (incf total-bytes (%scan-flat-block-files store))
       (setf (block-store-total-bytes store) total-bytes))
     store))
 
@@ -148,6 +334,16 @@ as absent, so none relies on the raise."
 (defun prune-block (store hash)
   "Delete a block file from disk by HASH.
 Returns the size in bytes of the deleted file, or NIL if the file didn't exist."
+  ;; A block inside a blk?????.dat cannot be removed on its own — Core prunes
+  ;; whole files, which is P3 of the block-file-format plan. Refuse loudly
+  ;; rather than returning NIL, which the caller reads as "already gone" and
+  ;; would let a pruned node stop reclaiming space in silence.
+  (when (flat-file-pos-p (gethash hash (block-store-index store)))
+    (bitcoin-lisp:log-warn
+     "Cannot prune ~A: it is inside a flat block file, which prunes per FILE ~
+      (block-file-format P3). Pruning is why *FLAT-BLOCK-FILES* is off by default."
+     (bitcoin-lisp.crypto:bytes-to-hex hash))
+    (return-from prune-block nil))
   (let* ((path (block-file-path store hash))
          ;; One stat serves both the existence check and the size — NIL
          ;; means the file isn't there.
