@@ -278,7 +278,8 @@ A mined transaction is reported by the block notification instead."
 itself and a sequence 'C'."
   (when *zmq-publishers*
     (when (or (zmq-topic-active-p "hashtx") (zmq-topic-active-p "rawtx"))
-      (loop for tx across (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+      ;; BITCOIN-BLOCK-TRANSACTIONS is a LIST (types.lisp:534), not a vector.
+      (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
             do (zmq-notify-transaction
                 tx (bitcoin-lisp.serialization:transaction-hash tx))))
     (when (zmq-topic-active-p "hashblock")
@@ -293,7 +294,8 @@ itself and a sequence 'C'."
 No rawblock/hashblock — those announce the tip moving FORWARD."
   (when *zmq-publishers*
     (when (or (zmq-topic-active-p "hashtx") (zmq-topic-active-p "rawtx"))
-      (loop for tx across (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+      ;; BITCOIN-BLOCK-TRANSACTIONS is a LIST (types.lisp:534), not a vector.
+      (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
             do (zmq-notify-transaction
                 tx (bitcoin-lisp.serialization:transaction-hash tx))))
     (when (zmq-topic-active-p "sequence")
