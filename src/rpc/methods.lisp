@@ -4930,6 +4930,42 @@ Returns the height of the last pruned block."
       ;; Note: getblockchaininfo.pruneheight returns (1+ this) = first UNpruned block.
       (bitcoin-lisp.storage:chain-state-pruned-height chain-state)))))
 
+(defun rpc-migrateblocks (node params)
+  "Convert legacy per-block files into flat blk?????.dat files.
+PARAMS: [nblocks]  (default 1000)
+
+No Bitcoin Core counterpart: Core has only ever had the flat format, so it has
+never needed a migration. Ours is a deliberately incremental, resumable job --
+it converts a budget of blocks in ascending height order and returns where to
+resume, so an operator can convert a live node in slices and watch it between
+them. Run it again until \"remaining\" is 0.
+
+The node lock is held for the whole call, so the budget is not a formality:
+converting means reading and rewriting every block, and a large nblocks stalls
+block connection for as long as that takes. Prefer several small calls."
+  (let ((nblocks (or (first params) 1000))
+        (start (or (second params) 0)))
+    (unless (and (integerp nblocks) (plusp nblocks))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "nblocks must be a positive integer"))
+    (unless (and (integerp start) (>= start 0))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "start_height must be a non-negative integer"))
+    ;; The node lock for the same reason pruneblockchain takes it: this rewrites
+    ;; the block store and its index under the sync thread's feet.
+    (with-node-lock (node)
+      (let ((store (rpc-get-block-store node))
+            (chain-state (rpc-get-chain-state node)))
+        (multiple-value-bind (migrated next remaining)
+            (bitcoin-lisp.storage:migrate-blocks-to-flat-files
+             store chain-state :max-blocks nblocks :start-height start)
+          (bitcoin-lisp::node-log
+           :info "RPC migrateblocks: converted ~D block~:P; resume at height ~D; ~D legacy file~:P left"
+           migrated next remaining)
+          `(("migrated" . ,migrated)
+            ("next_height" . ,next)
+            ("remaining" . ,remaining)))))))
+
 ;;; --- BIP157/158 block filter RPCs ---
 
 (defun rpc-getblockfilter (node params)

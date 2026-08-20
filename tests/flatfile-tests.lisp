@@ -758,3 +758,303 @@ incomplete. Running it twice adds nothing the second time."
            "the first rebuild fills an index that only knew genesis")
        (is (= 0 (bitcoin-lisp.storage:reindex-block-index store cs))
            "and a second pass adds nothing")))))
+
+;;; --- Migrating legacy per-block files into flat files (P4) --------------------
+
+(defun %ff-migration-chain (dir n &key (seed-base 250))
+  "Store an N-block active chain as LEGACY per-block files and return the chain
+state, the store, and the hashes in height order."
+  (let* ((bitcoin-lisp.storage:*flat-block-files* nil)
+         (store (bitcoin-lisp.storage:init-block-store dir))
+         (cs (bitcoin-lisp.storage:init-chain-state dir))
+         (genesis (bitcoin-lisp.storage:best-block-hash cs))
+         (prev-entry (bitcoin-lisp.storage:make-block-index-entry
+                      :hash genesis :height 0 :chain-work 1 :status :valid))
+         (hashes '()))
+    (bitcoin-lisp.storage:add-block-index-entry cs prev-entry)
+    (let ((prev genesis))
+      (loop for h from 1 to n
+            do (let* ((b (%ff-chain-block prev (+ seed-base h) h))
+                      (hash (bitcoin-lisp.storage:store-block store b :height h))
+                      (entry (bitcoin-lisp.storage:make-block-index-entry
+                              :hash hash :height h :chain-work (1+ h)
+                              :status :valid :prev-entry prev-entry)))
+                 (bitcoin-lisp.storage:add-block-index-entry cs entry)
+                 (push hash hashes)
+                 (setf prev hash prev-entry entry))))
+    (bitcoin-lisp.storage:update-chain-tip
+     cs (bitcoin-lisp.storage:block-index-entry-hash prev-entry) n)
+    (values cs store (nreverse hashes))))
+
+(test migration-converts-legacy-blocks-and-keeps-them-readable
+  "The whole point: after migrating, every block still comes back byte-identical
+and the per-block files are gone. Reading the blocks back is the assertion that
+matters — a migration that updated the index but wrote nothing usable would
+pass any count-based check."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 5)
+       ;; Capture the blocks as the legacy store serves them.
+       (let ((before (mapcar (lambda (h)
+                               (bitcoin-lisp.serialization:serialize-witness-block
+                                (bitcoin-lisp.storage:get-block store h)))
+                             hashes)))
+         (is (= 5 (bitcoin-lisp.storage:count-legacy-blocks store)))
+         (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+         (multiple-value-bind (migrated next remaining)
+             (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs)
+           (is (= 5 migrated))
+           (is (= 6 next) "resumes above the tip once everything is converted")
+           (is (= 0 remaining)))
+         (is (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+         ;; Every per-block file is gone...
+         (dolist (h hashes)
+           (is-false (probe-file (bitcoin-lisp.storage::block-file-path store h))
+                     "a per-block file survived the migration"))
+         ;; ...and every block reads back identically, through the flat path.
+         (loop for h in hashes
+               for original in before
+               do (let ((got (bitcoin-lisp.storage:get-block store h)))
+                    (is-true got "block ~A is gone after migration"
+                             (bitcoin-lisp.crypto:bytes-to-hex h))
+                    (when got
+                      (is (equalp original
+                                  (bitcoin-lisp.serialization:serialize-witness-block got)))))))))))
+
+(test migration-survives-a-restart-that-loses-the-in-memory-index
+  "The converted blocks have to be findable by a process that never saw the
+migration — otherwise the migration is only true of the running image, and the
+next restart loses the chain."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 4 :seed-base 60)
+       (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs)
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (store2 (bitcoin-lisp.storage:init-block-store dir)))
+         (is (= 0 (bitcoin-lisp.storage:count-legacy-blocks store2)))
+         (dolist (h hashes)
+           (is-true (bitcoin-lisp.storage:get-block store2 h)
+                    "a migrated block is not findable after a restart")))))))
+
+(test migration-honors-its-budget-and-resumes-where-it-stopped
+  "An operator converting a live node needs to stop after a slice and continue
+later. The resume height is the contract; if it were wrong the next call would
+either redo work or skip blocks."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 6 :seed-base 70)
+       (declare (ignore hashes))
+       (multiple-value-bind (migrated next remaining)
+           (bitcoin-lisp.storage:migrate-blocks-to-flat-files
+            store cs :max-blocks 2)
+         (is (= 2 migrated))
+         (is (= 3 next) "two blocks converted means heights 1 and 2 are done")
+         (is (= 4 remaining)))
+       (multiple-value-bind (migrated next remaining)
+           (bitcoin-lisp.storage:migrate-blocks-to-flat-files
+            store cs :max-blocks 2 :start-height 3)
+         (is (= 2 migrated))
+         (is (= 5 next))
+         (is (= 2 remaining)))
+       (multiple-value-bind (migrated next remaining)
+           (bitcoin-lisp.storage:migrate-blocks-to-flat-files
+            store cs :max-blocks 100 :start-height 5)
+         (is (= 2 migrated))
+         (is (= 0 remaining)))))))
+
+(test migration-is-idempotent
+  "Re-running must be free, not destructive. A resumable job that converts
+already-converted blocks would rewrite the whole chain on every retry."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store) (%ff-migration-chain dir 3 :seed-base 80)
+       (is (= 3 (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs)))
+       (let ((size (bitcoin-lisp.storage::file-size-bytes
+                    (merge-pathnames "blocks/blk00000.dat" dir))))
+         (is (= 0 (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs))
+             "a second pass converts nothing")
+         (is (= size (bitcoin-lisp.storage::file-size-bytes
+                      (merge-pathnames "blocks/blk00000.dat" dir)))
+             "and writes nothing"))))))
+
+(test migration-in-height-order-leaves-the-file-prunable
+  "The reason the walk is ordered at all. A flat file is prunable only when its
+whole height range is below the horizon; converting in arrival order would give
+file 0 a range spanning the chain, and a pruned node would quietly stop
+reclaiming space. Assert the range, not the order."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store) (%ff-migration-chain dir 5 :seed-base 90)
+       (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs)
+       (let ((info (gethash 0 (bitcoin-lisp.storage:block-store-file-info store))))
+         (is-true info "the migrated file has no height bookkeeping at all")
+         (when info
+           (is (= 1 (bitcoin-lisp.storage:block-file-info-height-first info)))
+           (is (= 5 (bitcoin-lisp.storage:block-file-info-height-last info)))))
+       ;; And it is genuinely selectable for pruning below a horizon above it.
+       (is (equal '(0) (bitcoin-lisp.storage::%prunable-flat-files store 0 100)))))))
+
+(test migration-does-not-touch-blocks-off-the-active-chain
+  "Side-chain blocks have no height in a flat file's range, and converting them
+would poison that range. They stay per-block, and dual read keeps them served."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 3 :seed-base 100)
+       ;; A block that is in the store but not on the active chain.
+       (let* ((bitcoin-lisp.storage:*flat-block-files* nil)
+              (side (bitcoin-lisp.storage:store-block
+                     store (%ff-chain-block (first hashes) 199 2) :height 2)))
+         (multiple-value-bind (migrated next remaining)
+             (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs)
+           (declare (ignore next))
+           (is (= 3 migrated))
+           (is (= 1 remaining) "the side-chain block is still a per-block file"))
+         (is-true (probe-file (bitcoin-lisp.storage::block-file-path store side)))
+         (is-true (bitcoin-lisp.storage:get-block store side)
+                  "and it is still readable"))))))
+
+(test migration-keeps-the-storage-total-honest
+  "The running byte total drives automatic pruning. STORE-BLOCK already replaces
+the legacy file's contribution when it writes the flat record, so decrementing
+again at the unlink — the obvious thing to write — would drive the total toward
+zero and disable pruning on a node that has just been migrated."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store) (%ff-migration-chain dir 4 :seed-base 110)
+       (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs)
+       (let ((on-disk (bitcoin-lisp.storage::file-size-bytes
+                       (merge-pathnames "blocks/blk00000.dat" dir)))
+             (accounted (bitcoin-lisp.storage:block-store-total-bytes store)))
+         (is (plusp accounted) "the total must not have been driven to zero")
+         ;; The file is preallocated in 16 MiB chunks, so on-disk >= accounted;
+         ;; what matters is that the accounted total matches the RECORDS.
+         (is (<= accounted on-disk))
+         (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+                (fresh (bitcoin-lisp.storage:init-block-store dir)))
+           (is (= accounted (bitcoin-lisp.storage:block-store-total-bytes fresh))
+               "a fresh scan of the same files must agree with the running total")))))))
+
+(test a-block-that-fails-to-read-back-stops-the-migration-with-its-file-intact
+  "The one failure this must handle without losing data. If the flat record
+cannot be read back, the per-block file is the only surviving copy — so it is
+kept, and the walk stops rather than converting more blocks through a path just
+shown not to work."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 4 :seed-base 120)
+       (let* ((victim (second hashes))
+              (real #'bitcoin-lisp.storage:get-block)
+              (seen 0))
+         ;; Fail the READ-BACK of height 2 only: the first call for a hash is
+         ;; the migrator loading the legacy block, the second is the verify.
+         (let ((calls (make-hash-table :test 'equalp)))
+           (handler-bind ()
+             (let ((wrapper (lambda (s h)
+                              (let ((n (incf (gethash h calls 0))))
+                                (if (and (equalp h victim) (= n 2))
+                                    (progn (incf seen) nil)
+                                    (funcall real s h))))))
+               (unwind-protect
+                    (progn
+                      (setf (fdefinition 'bitcoin-lisp.storage:get-block) wrapper)
+                      (multiple-value-bind (migrated next remaining)
+                          (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs)
+                        (is (= 1 migrated) "only height 1 converted before the failure")
+                        (is (= 2 next) "and the retry resumes at the block that failed")
+                        ;; Three still legacy: the victim plus the two above it.
+                        ;; The victim counts only because the index was put back
+                        ;; -- STORE-BLOCK had already repointed it at the flat
+                        ;; record, and leaving it there would have made dual
+                        ;; read serve the copy that just failed.
+                        (is (= 3 remaining))))
+                 (setf (fdefinition 'bitcoin-lisp.storage:get-block) real)))))
+         (is (= 1 seen) "the injected failure must actually have fired")
+         ;; The victim's per-block file is still there, and still readable.
+         (is-true (probe-file (bitcoin-lisp.storage::block-file-path store victim)))
+         (is-true (funcall real store victim)))))))
+
+(test the-migration-is-reachable-as-an-rpc
+  "The seam. A migration nothing can invoke is the same bug this project has now
+found seven times — correct code with no caller. The operator's only handle on a
+live node is the RPC, so assert it is registered and validates its arguments."
+  (bitcoin-lisp.rpc::register-all-methods)
+  (is-true (gethash "migrateblocks" bitcoin-lisp.rpc::*rpc-methods*)
+           "migrateblocks is not registered, so nothing can start a migration")
+  (let ((handler (gethash "migrateblocks" bitcoin-lisp.rpc::*rpc-methods*)))
+    ;; Bad arguments are rejected before any node state is touched, so NIL for
+    ;; the node is enough to prove the guard runs first.
+    (signals bitcoin-lisp.rpc::rpc-error (funcall handler nil '(0)))
+    (signals bitcoin-lisp.rpc::rpc-error (funcall handler nil '(10 -1)))))
+
+(test a-crash-between-the-flat-write-and-the-unlink-is-swept-on-the-next-pass
+  "The crash window. INIT-BLOCK-STORE indexes per-block files first and flat
+records second, so after a crash in that window the flat record wins the index
+and the per-block file becomes an orphan nothing reads — but its bytes still
+count toward the pruning total, so a pruned node prunes earlier than it should.
+Re-running the migration must sweep it."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 3 :seed-base 130)
+       (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs)
+       ;; Recreate exactly what the crash leaves behind: the flat record is
+       ;; there and indexed, and the per-block file is back on disk.
+       (let* ((victim (second hashes))
+              (orphan (bitcoin-lisp.storage::block-file-path store victim)))
+         (with-open-file (out orphan :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+           (write-sequence (bitcoin-lisp.serialization:serialize-witness-block
+                            (bitcoin-lisp.storage:get-block store victim))
+                           out))
+         ;; A restart double-counts it, which is the harm.
+         (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+                (store2 (bitcoin-lisp.storage:init-block-store dir))
+                (inflated (bitcoin-lisp.storage:block-store-total-bytes store2)))
+           (is (= 0 (bitcoin-lisp.storage:count-legacy-blocks store2))
+               "the flat record wins the index, so nothing looks unmigrated")
+           (multiple-value-bind (migrated) 
+               (bitcoin-lisp.storage:migrate-blocks-to-flat-files store2 cs)
+             (is (= 0 migrated) "there is nothing left to convert"))
+           (is-false (probe-file orphan) "the orphaned per-block file was not swept")
+           (is (< (bitcoin-lisp.storage:block-store-total-bytes store2) inflated)
+               "and its bytes stopped counting toward the pruning total")
+           (is-true (bitcoin-lisp.storage:get-block store2 victim)
+                    "sweeping the orphan must not cost the block")))))))
+
+(test which-copy-wins-a-duplicate-is-decided-by-which-one-reads
+  "The other half of the crash window. If the flat record is the corrupt one,
+sweeping the per-block file because the index names the flat copy would delete
+the only readable copy of the block. The index goes back onto the file that
+reads, which also lets the migration retry it."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (multiple-value-bind (cs store hashes) (%ff-migration-chain dir 3 :seed-base 140)
+       (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs)
+       (let* ((victim (second hashes))
+              (legacy (bitcoin-lisp.storage::block-file-path store victim))
+              (body (bitcoin-lisp.serialization:serialize-witness-block
+                     (bitcoin-lisp.storage:get-block store victim)))
+              (real #'bitcoin-lisp.storage:get-block))
+         ;; Put the per-block file back, as the crash would leave it.
+         (with-open-file (out legacy :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede)
+           (write-sequence body out))
+         ;; And make the flat copy unreadable for this hash only.
+         (let ((wrapper (lambda (s h)
+                          (if (equalp h victim)
+                              (if (bitcoin-lisp.storage::flat-file-pos-p
+                                   (gethash h (bitcoin-lisp.storage::block-store-index s)))
+                                  nil
+                                  (funcall real s h))
+                              (funcall real s h)))))
+           (unwind-protect
+                (progn
+                  (setf (fdefinition 'bitcoin-lisp.storage:get-block) wrapper)
+                  (bitcoin-lisp.storage:migrate-blocks-to-flat-files store cs))
+             (setf (fdefinition 'bitcoin-lisp.storage:get-block) real)))
+         (is-true (probe-file legacy)
+                  "the readable per-block copy must not have been swept")
+         (is (= 1 (bitcoin-lisp.storage:count-legacy-blocks store))
+             "and the index must point back at it, so the migration can retry")
+         (is-true (funcall real store victim)))))))
