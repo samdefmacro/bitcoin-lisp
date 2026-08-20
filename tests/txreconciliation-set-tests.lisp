@@ -252,3 +252,149 @@ future change that starts trusting the decode has to delete this test first."
         (is (= (+ (length truth) (length theirs)) (length ids)))
         (is (equal (sort (copy-list theirs) #'<)
                    (sort (bitcoin-lisp.networking::recon-round-missing-ids round2 ids) #'<)))))))
+
+;;; --- Wiring into the live relay path ------------------------------------------
+
+(defmacro %with-relay-network (&body body)
+  "relay-transaction is a no-op unless relay is enabled for the network, which
+on mainnet it is not. These tests are about the reconciliation branch inside
+it, so they run on a network where relay is on."
+  `(let ((bitcoin-lisp:*network* :testnet4)) ,@body))
+
+(defun %rc-peer (&key registered (inbound nil) (k0 11) (k1 22) (we-initiate t))
+  (let ((p (bitcoin-lisp.networking:make-peer :address "10.0.0.1" :inbound nil :state :ready)))
+    ;; PEER-TX-RELAY-P is derived, not a slot: it reads the connection type and
+    ;; the peer's version fRelay. A default peer is neither block-relay nor
+    ;; feeler and has no stored version, which counts as relaying — Core's
+    ;; pre-70001 default — so nothing needs setting for it.
+    (setf (bitcoin-lisp.networking::peer-state p) :ready
+          (bitcoin-lisp.networking::peer-inbound p) inbound
+          (bitcoin-lisp.networking::peer-recon-registered p) registered
+          (bitcoin-lisp.networking::peer-recon-we-initiate p) we-initiate)
+    (when registered
+      (setf (bitcoin-lisp.networking::peer-recon-k0 p) k0
+            (bitcoin-lisp.networking::peer-recon-k1 p) k1))
+    p))
+
+(test relay-is-untouched-when-reconciliation-is-off
+  "The property that makes this safe to ship: with -txreconciliation off no
+peer is ever registered, so every transaction takes the ordinary announcement
+path and nothing is held back. This is the test that would catch a diversion
+leaking into the default configuration."
+  (%with-relay-network
+    (let ((peer (%rc-peer :registered nil))
+          (txid (%rc-wtxid 1))
+          (wtxid (%rc-wtxid 2)))
+      (bitcoin-lisp.networking::relay-transaction txid nil (list peer)
+                                                  :wtxid wtxid :fee-rate 1)
+      (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer)))
+          "an unregistered peer must be announced to, not reconciled with")
+      (is-false (bitcoin-lisp.networking::peer-recon-set peer)
+                "and no reconciliation set is even created"))))
+
+(test a-registered-peer-holds-transactions-for-reconciliation
+  "With the handshake done, most transactions go into the set instead of the
+announcement queue — and the ones that do not are the fanout draw, which is
+what keeps the first announcement from revealing the origin."
+  (%with-relay-network
+    ;; Eight reconciling peers, so the one outbound fanout destination is a
+    ;; 1-in-8 draw. With a SINGLE peer everything is announced instead — one
+    ;; destination out of one peer is that peer — which is correct, and is its
+    ;; own test below.
+    (let* ((peer (%rc-peer :registered t))
+           (peers (cons peer (loop repeat 7 collect (%rc-peer :registered t))))
+           (held 0) (announced 0))
+      (dotimes (i 60)
+        (let ((wtxid (%rc-wtxid i)))
+          (setf (bitcoin-lisp.networking::peer-tx-inv-queue peer) '())
+          (bitcoin-lisp.networking::relay-transaction
+           wtxid nil peers :wtxid wtxid :fee-rate 1)
+          (if (bitcoin-lisp.networking::peer-tx-inv-queue peer)
+              (incf announced)
+              (incf held))))
+      (is (plusp held) "reconciliation must actually hold transactions back")
+      (is (plusp announced) "and fanout must still let some through immediately")
+      (is (> held announced)
+          "holding is the common case; fanout is the minority (~D held, ~D fanned out)"
+          held announced)
+      (is (= held (bitcoin-lisp.networking::recon-set-size
+                   (bitcoin-lisp.networking::%peer-recon-set peer)))
+          "everything held is in the set, once each"))))
+
+(test a-lone-reconciling-peer-is-simply-announced-to
+  "One outbound fanout destination out of ONE reconciling peer is that peer, so
+everything is announced. Holding transactions back to reconcile with nobody
+else would only delay them, which is the opposite of the point."
+  (%with-relay-network
+   (let ((peer (%rc-peer :registered t)))
+     (dotimes (i 10)
+       (let ((wtxid (%rc-wtxid i)))
+         (bitcoin-lisp.networking::relay-transaction
+          wtxid nil (list peer) :wtxid wtxid :fee-rate 1)))
+     (is (= 10 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer))))
+     (is-false (bitcoin-lisp.networking::peer-recon-set peer)))))
+
+(test a-transaction-without-a-wtxid-is-never-held-back
+  "Short IDs are computed from the wtxid. Without one there is nothing to put
+in a sketch, so the transaction must take the ordinary path rather than
+vanishing into a set that can never describe it."
+  (%with-relay-network
+    (let ((peer (%rc-peer :registered t))
+          (txid (%rc-wtxid 3)))
+      (bitcoin-lisp.networking::relay-transaction txid nil (list peer)
+                                                  :wtxid nil :fee-rate 1)
+      (is (= 1 (length (bitcoin-lisp.networking::peer-tx-inv-queue peer)))))))
+
+(test only-the-dialling-side-opens-a-round
+  "Both ends opening rounds against each other at once would waste a sketch
+every time. BIP-330 gives the initiator role to the outbound peer, which is
+what the handshake recorded."
+  (let ((out (%rc-peer :registered t :we-initiate t))
+        (in (%rc-peer :registered t :we-initiate nil :inbound t))
+        (now 100000))
+    (dolist (p (list out in))
+      (bitcoin-lisp.networking::recon-set-add
+       (bitcoin-lisp.networking::%peer-recon-set p) 11 22 (%rc-wtxid 9)))
+    (is-true (bitcoin-lisp.networking::recon-should-start-round-p out now))
+    (is-false (bitcoin-lisp.networking::recon-should-start-round-p in now))))
+
+(test rounds-are-spaced-and-not-doubled-up
+  "One round per peer at a time, and not more often than the interval — a node
+that reconciled continuously would announce in a pattern that reveals how many
+peers it has."
+  (let ((peer (%rc-peer :registered t))
+        (now 100000))
+    (bitcoin-lisp.networking::recon-set-add
+     (bitcoin-lisp.networking::%peer-recon-set peer) 11 22 (%rc-wtxid 4))
+    (is-true (bitcoin-lisp.networking::recon-should-start-round-p peer now))
+    (is-true (bitcoin-lisp.networking::recon-start-round peer now))
+    ;; A round is in flight: not again.
+    (is-false (bitcoin-lisp.networking::recon-should-start-round-p peer (+ now 100)))
+    ;; Even once it clears, the interval still applies.
+    (setf (bitcoin-lisp.networking::peer-recon-round peer) nil)
+    (is-false (bitcoin-lisp.networking::recon-should-start-round-p peer now))
+    (is-true (bitcoin-lisp.networking::recon-should-start-round-p
+              peer (+ now bitcoin-lisp.networking::+recon-round-interval-seconds+)))))
+
+(test an-empty-set-does-not-open-a-round
+  "Nothing to reconcile means no reqrecon: a sketch of an empty set is pure
+overhead, and Erlay exists to remove overhead."
+  (let ((peer (%rc-peer :registered t)))
+    (is-false (bitcoin-lisp.networking::recon-start-round peer 100000))
+    (is-false (bitcoin-lisp.networking::peer-recon-round peer))))
+
+(test abandoning-a-round-announces-everything-rather-than-losing-it
+  "The flood fallback. A reconciliation that cannot decode costs bandwidth —
+never transactions — so everything in the frozen snapshot goes out the ordinary
+way and leaves the set."
+  (let* ((peer (%rc-peer :registered t))
+         (set (bitcoin-lisp.networking::%peer-recon-set peer))
+         (wtxids (loop for i from 40 below 45 collect (%rc-wtxid i))))
+    (dolist (w wtxids) (bitcoin-lisp.networking::recon-set-add set 11 22 w))
+    (bitcoin-lisp.networking::recon-start-round peer 100000)
+    (let ((flooded (bitcoin-lisp.networking::recon-abandon-round peer)))
+      (is (= (length wtxids) (length flooded))
+          "every held transaction must be announced after a failed round")
+      (is (= 0 (bitcoin-lisp.networking::recon-set-size set))
+          "and leave the set, so it is not announced twice")
+      (is-false (bitcoin-lisp.networking::peer-recon-round peer)))))
