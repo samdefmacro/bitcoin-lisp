@@ -90,6 +90,7 @@
                                (:file "builder")))
                  (:module "networking"
                   :components ((:file "fd-wait")    ; before everything: poll-based readiness (select's fd ceiling)
+                               (:file "minisketch")
                                (:file "socks5")     ; before connection: make-tcp-connection tunnels through *proxy*
                                (:file "connection")
                                (:file "v2-transport")
@@ -249,6 +250,7 @@
                              (:file "compressor-tests")
                              (:file "block-undo-tests")
                              (:file "miniscript-tests")
+                             (:file "minisketch-tests")
                              (:file "flatfile-tests")
                              ;; Assumeutxo snapshot format (dumptxoutset/loadtxoutset)
                              (:file "snapshot-tests")
