@@ -1909,29 +1909,118 @@ constant-time but wrong would hand out access."
 
 ;;; estimatesmartfee tests
 
-(test rpc-estimatesmartfee-valid
-  "Test estimatesmartfee with valid conf_target"
+(defmacro %with-stubbed-fee-estimate ((&key (rate 10) (error-msg nil)
+                                            (returned-target nil)
+                                            (mode-out nil))
+                                      &body body)
+  "Run BODY with the fee estimator answering RATE sat/vB (or ERROR-MSG), and
+with MODE-OUT — a symbol naming a place — receiving the mode the RPC passed."
+  `(let ((real-ready (fdefinition 'bitcoin-lisp.mempool:fee-estimator-ready-p))
+         (real-est (fdefinition 'bitcoin-lisp.mempool:estimate-fee-rate))
+         ;; A test node has no estimator, and the RPC's first gate is its
+         ;; presence — without one the stub below is never reached and every
+         ;; assertion silently measures the no-estimate path instead.
+         (real-getter (fdefinition 'bitcoin-lisp:node-fee-estimator)))
+     (unwind-protect
+          (progn
+            (setf (fdefinition 'bitcoin-lisp:node-fee-estimator)
+                  (lambda (&rest args) (declare (ignore args)) :stub-estimator))
+            (setf (fdefinition 'bitcoin-lisp.mempool:fee-estimator-ready-p)
+                  (lambda (&rest args) (declare (ignore args)) t))
+            (setf (fdefinition 'bitcoin-lisp.mempool:estimate-fee-rate)
+                  (lambda (estimator conf-target &key mode)
+                    (declare (ignore estimator))
+                    ,@(when mode-out `((setf ,mode-out mode)))
+                    (values ,rate ,error-msg (or ,returned-target conf-target))))
+            ,@body)
+       (setf (fdefinition 'bitcoin-lisp.mempool:fee-estimator-ready-p) real-ready
+             (fdefinition 'bitcoin-lisp.mempool:estimate-fee-rate) real-est
+             (fdefinition 'bitcoin-lisp:node-fee-estimator) real-getter))))
+
+(test estimatesmartfee-omits-feerate-when-there-is-no-estimate
+  "Core returns ONLY errors and blocks when the estimator has nothing
+(rpc/fees.cpp:87-90) — the \"feerate\" key is documented as \"only present if
+no errors were encountered\". We returned a fabricated 0.00001 BTC/kvB (1
+sat/vB) fallback, so a wallet reading \"feerate\" got a made-up number instead
+of noticing there was no estimate, and built a transaction at 1 sat/vB that
+would not confirm."
   (let* ((node (make-test-node))
-         ;; Mark node as not syncing
          (bitcoin-lisp::*syncing* nil)
          (result (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6))))
-    (is (assoc "feerate" result :test #'string=))
-    (is (assoc "blocks" result :test #'string=))
-    (is (= (cdr (assoc "blocks" result :test #'string=)) 6))
-    (is (> (cdr (assoc "feerate" result :test #'string=)) 0))))
+    (is-false (assoc "feerate" result :test #'string=)
+              "a fabricated feerate is reported where Core reports none")
+    (is-true (assoc "errors" result :test #'string=))
+    (is (= 6 (cdr (assoc "blocks" result :test #'string=))))))
 
-(test rpc-estimatesmartfee-invalid-target
-  "Test estimatesmartfee with invalid conf_target returns error"
+(test estimatesmartfee-defaults-to-economical-as-core-does
+  "Core's estimate_mode default is \"economical\" (RPCArg::Default, fees.cpp:42).
+Ours defaulted to conservative, which returns a HIGHER number — so every caller
+that did not name a mode was quietly told to overpay."
+  (let ((node (make-test-node))
+        (bitcoin-lisp::*syncing* nil)
+        (seen nil))
+    (%with-stubbed-fee-estimate (:rate 10 :mode-out seen)
+      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6))
+      (is (eq :economical seen) "default mode was ~S" seen)
+      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6 "conservative"))
+      (is (eq :conservative seen))
+      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6 "economical"))
+      (is (eq :economical seen))
+      ;; Core's FeeModeMap has three names; "unset" means the default.
+      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6 "unset"))
+      (is (eq :economical seen)))))
+
+(test estimatesmartfee-clamps-up-to-the-nodes-own-floors
+  "Core: max(estimate, mempool rolling minimum, min relay fee)
+(fees.cpp:82-85). Unclamped — as ours was — a node whose mempool minimum has
+risen recommends a fee BELOW its own acceptance threshold: it rejects the very
+transaction it just priced."
+  (let ((node (make-test-node))
+        (bitcoin-lisp::*syncing* nil))
+    (%with-stubbed-fee-estimate (:rate 10)   ; 10 sat/vB = 10000 sat/kvB
+      ;; Floor below the estimate: the estimate stands.
+      (let ((result (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6))))
+        (is (= (/ 10000 100000000.0d0)
+               (cdr (assoc "feerate" result :test #'string=)))))
+      ;; Floor above the estimate: the floor wins.
+      (let ((mempool (bitcoin-lisp.rpc::rpc-get-mempool node)))
+        (when mempool
+          (setf (bitcoin-lisp.mempool::mempool-min-fee-rate mempool) 50000)
+          (let ((result (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6))))
+            (is (= (/ 50000 100000000.0d0)
+                   (cdr (assoc "feerate" result :test #'string=)))
+                "the answer was below the node's own acceptance floor")))))))
+
+(test estimatesmartfee-reports-the-target-the-answer-is-actually-for
+  "Core reports feeCalc.returnedTarget as \"blocks\" (fees.cpp:91), not the
+requested target: the estimator substitutes 2 for a 1-block target and clamps
+to what its history can justify. Echoing the request tells a caller the answer
+covers a horizon it does not."
+  (let ((node (make-test-node))
+        (bitcoin-lisp::*syncing* nil))
+    (%with-stubbed-fee-estimate (:rate 10 :returned-target 100)
+      (let ((result (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(1008))))
+        (is (= 100 (cdr (assoc "blocks" result :test #'string=)))
+            "blocks echoed the request instead of the estimator's answer")))))
+
+(test estimatesmartfee-target-is-bounded-by-what-the-estimator-tracks
+  "Core bounds conf_target by HighestTargetTracked(LONG_HALFLIFE), not by a
+fixed constant (ParseConfirmTarget, rpc/util.cpp:369-377), and its message
+names the range."
   (let ((node (make-test-node)))
-    ;; Zero
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(0)))
-    ;; Negative
     (signals bitcoin-lisp.rpc::rpc-error
       (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(-1)))
-    ;; Too high
     (signals bitcoin-lisp.rpc::rpc-error
-      (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(2000)))))
+      (bitcoin-lisp.rpc::rpc-estimatesmartfee node
+                                              (list (1+ (bitcoin-lisp.mempool:highest-target-tracked)))))
+    ;; And an unknown mode names the three Core accepts.
+    (handler-case (bitcoin-lisp.rpc::rpc-estimatesmartfee node '(6 "cheap"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (search "unset" (bitcoin-lisp.rpc::rpc-error-message e))
+            "the invalid-mode message should list Core's three modes: ~A"
+            (bitcoin-lisp.rpc::rpc-error-message e))))))
 
 ;;; validateaddress tests
 

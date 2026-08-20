@@ -3662,43 +3662,71 @@ and NO time fields; an unknown block gets blockhash only."
 (defun rpc-estimatesmartfee (node params)
   "Estimate fee rate for confirmation in conf_target blocks.
 PARAMS: [conf_target, estimate_mode]
-- conf_target: Number of blocks (1-1008)
-- estimate_mode: Optional, 'economical' or 'conservative' (default)
-Returns: { feerate: BTC/kvB, blocks: number, errors?: [strings] }"
+Returns: { feerate?: BTC/kvB, blocks: number, errors?: [strings] }
+
+Bitcoin Core rpc/fees.cpp:32-95. Four parts of that contract were wrong here,
+all of them silently:
+
+  - The DEFAULT MODE is \"economical\" (RPCArg::Default{\"economical\"}), not
+    conservative. Defaulting to conservative returns a higher number, so every
+    caller that did not name a mode was quietly told to overpay.
+  - On no estimate Core omits \"feerate\" ENTIRELY and returns only the error.
+    We returned a fabricated 0.00001 BTC/kvB (1 sat/vB) fallback, so a wallet
+    reading \"feerate\" got a made-up number rather than noticing there was no
+    estimate — and built a transaction that would not confirm.
+  - Core CLAMPS the answer up to the node's own floors:
+    max(estimate, mempool rolling minimum, min relay fee). Unclamped, a node
+    whose mempool minimum has risen recommends a fee BELOW its own acceptance
+    threshold — it rejects the transaction it just priced.
+  - \"blocks\" is feeCalc.returnedTarget, the target the answer is actually
+    for, not the one requested. The estimator substitutes 2 for a 1-block
+    target and clamps to what its history can justify."
   (let* ((conf-target (first params))
          (mode-str (second params))
          (mode (cond
-                 ((null mode-str) :conservative)
+                 ((null mode-str) :economical)
+                 ((string-equal mode-str "unset") :economical)
                  ((string-equal mode-str "economical") :economical)
                  ((string-equal mode-str "conservative") :conservative)
                  (t (error 'rpc-error :code +rpc-invalid-parameter+
-                                      :message "Invalid estimate_mode (must be 'economical' or 'conservative')")))))
-    (unless (and (integerp conf-target) (>= conf-target 1) (<= conf-target 1008))
-      (error 'rpc-error :code +rpc-invalid-parameter+
-                        :message "Invalid conf_target (must be 1-1008)"))
-    ;; Check if still syncing
+                                      :message "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"")))))
+    ;; Core bounds conf_target by the estimator's highest tracked target rather
+    ;; than a fixed constant (ParseConfirmTarget with
+    ;; HighestTargetTracked(LONG_HALFLIFE), rpc/util.cpp:369-377).
+    (let ((max-target (bitcoin-lisp.mempool:highest-target-tracked)))
+      (unless (and (integerp conf-target) (>= conf-target 1)
+                   (<= conf-target max-target))
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "Invalid conf_target, must be between ~D and ~D"
+                                           1 max-target))))
+    ;; Still syncing: no feerate key, as in every other no-estimate case.
     (when (rpc-is-syncing node)
       (return-from rpc-estimatesmartfee
         `(("blocks" . ,conf-target)
           ("errors" . #("Insufficient data (node still syncing)")))))
-    ;; Get fee estimate
-    (let ((fee-estimator (bitcoin-lisp:node-fee-estimator node)))
-      (if (and fee-estimator (bitcoin-lisp.mempool:fee-estimator-ready-p fee-estimator))
-          ;; Use fee estimator
-          (multiple-value-bind (rate-sat-vb error-msg)
-              (bitcoin-lisp.mempool:estimate-fee-rate fee-estimator conf-target :mode mode)
-            ;; Convert sat/vB to BTC/kvB: sat/vB * 1000 / 100000000
-            (let ((rate-btc-kvb (/ (* rate-sat-vb 1000) 100000000.0d0)))
-              (if error-msg
-                  `(("feerate" . ,rate-btc-kvb)
-                    ("blocks" . ,conf-target)
-                    ("errors" . ,(vector error-msg)))
-                  `(("feerate" . ,rate-btc-kvb)
-                    ("blocks" . ,conf-target)))))
-          ;; Not enough data - return fallback
-          `(("feerate" . 0.00001)  ; 1 sat/vB fallback
-            ("blocks" . ,conf-target)
-            ("errors" . #("Insufficient data for reliable fee estimation")))))))
+    (let ((fee-estimator (bitcoin-lisp:node-fee-estimator node))
+          (mempool (rpc-get-mempool node)))
+      (multiple-value-bind (rate-sat-vb error-msg returned-target)
+          (if (and fee-estimator
+                   (bitcoin-lisp.mempool:fee-estimator-ready-p fee-estimator))
+              (bitcoin-lisp.mempool:estimate-fee-rate fee-estimator conf-target
+                                                      :mode mode)
+              (values 0 "Insufficient data or no feerate found" conf-target))
+        (let ((blocks (or returned-target conf-target)))
+          (if (or error-msg (null rate-sat-vb) (zerop rate-sat-vb))
+              ;; Core's failure branch: errors, blocks, and NO feerate.
+              `(("blocks" . ,blocks)
+                ("errors" . ,(vector (or error-msg
+                                         "Insufficient data or no feerate found"))))
+              ;; Clamp to the node's own floors before reporting.
+              (let* ((rate-sat-kvb (* rate-sat-vb 1000))
+                     (floor-sat-kvb
+                       (if mempool
+                           (bitcoin-lisp.mempool:mempool-effective-min-fee-rate mempool)
+                           0))
+                     (clamped (max rate-sat-kvb floor-sat-kvb)))
+                `(("feerate" . ,(/ clamped 100000000.0d0))
+                  ("blocks" . ,blocks)))))))))
 
 ;;; --- createmultisig (Bitcoin Core rpc/output_script.cpp) ---
 

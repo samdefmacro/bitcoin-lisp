@@ -337,22 +337,24 @@ Conservative mode uses higher percentiles for more reliable confirmation."
 (defun estimate-fee-rate (estimator conf-target &key (mode :conservative))
   "Estimate the fee rate needed for confirmation within CONF-TARGET blocks.
 MODE is :conservative (default) or :economical.
-Returns (values fee-rate-estimate error-message).
-Fee rate is in sat/vB."
+Returns (values fee-rate-estimate error-message returned-target).
+Fee rate is in sat/vB; RETURNED-TARGET is the target the answer is actually for
+(Core feeCalc.returnedTarget), which the estimator may have raised or lowered."
   ;; Core's CBlockPolicyEstimator answers first when it has the history for
   ;; this target: it knows which feerates FAILED to confirm, which a percentile
   ;; of what miners took cannot express. The percentile heuristic below remains
   ;; as the fallback for a node whose estimator has not accumulated enough
   ;; observations yet -- Core has no such fallback because it has always had
   ;; the real estimator.
-  (let ((core-estimate (bpe-smart-fee-sat-per-vb
-                        conf-target :conservative (eq mode :conservative))))
+  (multiple-value-bind (core-estimate returned-target)
+      (bpe-smart-fee-sat-per-vb conf-target :conservative (eq mode :conservative))
     (when (and core-estimate (plusp core-estimate))
-      (return-from estimate-fee-rate (values core-estimate nil))))
+      (return-from estimate-fee-rate
+        (values core-estimate nil (or returned-target conf-target)))))
 
   (unless (fee-estimator-ready-p estimator)
     (return-from estimate-fee-rate
-      (values 1 "Insufficient data for fee estimation")))
+      (values 1 "Insufficient data for fee estimation" conf-target)))
 
   (let* ((blocks-to-analyze (get-blocks-to-analyze conf-target))
          (history (fee-estimator-get-history estimator blocks-to-analyze))
@@ -360,9 +362,9 @@ Fee rate is in sat/vB."
 
     (when (< (length history) (fee-estimator-min-blocks estimator))
       (return-from estimate-fee-rate
-        (values 1 "Insufficient data for fee estimation")))
+        (values 1 "Insufficient data for fee estimation" conf-target)))
 
     ;; Collect all median rates from history
     (let* ((rates (sort (mapcar #'block-fee-stats-median-rate history) #'<))
            (estimate (fee-rate-percentile rates percentile)))
-      (values (or estimate 1) nil))))
+      (values (or estimate 1) nil conf-target))))
