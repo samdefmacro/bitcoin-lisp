@@ -152,20 +152,55 @@ invalid-child case (IL >= n or zero key) — the caller should try the next inde
          (checksum (subseq (hash256 payload) 0 4)))
     (base58-encode (concatenate '(vector (unsigned-byte 8)) payload checksum))))
 
+(defun %xpub-version-p (v) (or (= v +xpub-mainnet+) (= v +xpub-testnet+)))
+
 (defun bip32-parse (str)
-  "Parse a Base58Check xprv/xpub STR into an ext-key, or NIL if malformed / bad
-checksum."
+  "Parse a Base58Check xprv/xpub STR into an ext-key, or NIL if it is not a
+valid extended key.
+
+This used to check the checksum and nothing else, which meant it accepted 15 of
+the 16 keys in BIP32's own test vector 5 (Core bip32_tests.cpp:104-122) — every
+one of them except the deliberately corrupted checksum. A permissive extended-key
+parser is not a cosmetic problem: it accepts keys that derive to something other
+than what whoever wrote them intended, and a wallet imported from one produces
+addresses nobody can spend.
+
+Every rejection below corresponds to one of those vectors:
+
+  - an unknown version prefix (neither xprv/tprv nor xpub/tpub);
+  - a private key whose 33 bytes do not begin with the required 0x00 pad, or
+    whose scalar is 0 or >= the group order (not a valid secret);
+  - a public key that is not a valid compressed point — which covers the 0x04
+    and 0x01 prefixes and the on-curve check, so an x that has no y is refused
+    rather than carried around as 33 opaque bytes;
+  - depth 0 with a non-zero parent fingerprint, or with a non-zero child index.
+    A master key has no parent and is nobody's child; claiming otherwise makes
+    the fingerprint chain a lie."
   (let ((bytes (base58-decode str)))
     (when (and bytes (= (length bytes) 82)
                (equalp (subseq bytes 78 82) (subseq (hash256 (subseq bytes 0 78)) 0 4)))
-      (let ((version (%be->int (subseq bytes 0 4))))
-        (make-ext-key :version version
-                      :depth (aref bytes 4)
-                      :parent-fingerprint (%be->int (subseq bytes 5 9))
-                      :child-number (%be->int (subseq bytes 9 13))
-                      :chain-code (subseq bytes 13 45)
-                      :key (subseq bytes 45 78)
-                      :privatep (%xprv-version-p version))))))
+      (let* ((version (%be->int (subseq bytes 0 4)))
+             (privatep (%xprv-version-p version))
+             (depth (aref bytes 4))
+             (fingerprint (%be->int (subseq bytes 5 9)))
+             (child (%be->int (subseq bytes 9 13)))
+             (key (subseq bytes 45 78)))
+        (when (and (or privatep (%xpub-version-p version))
+                   (if privatep
+                       (and (zerop (aref key 0))
+                            (let ((d (%be->int (subseq key 1 33))))
+                              (and (plusp d) (< d +secp256k1-order+))))
+                       (and (bitcoin-lisp.crypto::parse-public-key key) t))
+                   ;; A master key has no parent and no index.
+                   (or (plusp depth)
+                       (and (zerop fingerprint) (zerop child))))
+          (make-ext-key :version version
+                        :depth depth
+                        :parent-fingerprint fingerprint
+                        :child-number child
+                        :chain-code (subseq bytes 13 45)
+                        :key key
+                        :privatep privatep))))))
 
 ;;; --- paths ---
 
