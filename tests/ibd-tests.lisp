@@ -3082,3 +3082,168 @@ passes it."
         "the message dispatch no longer passes chain-state to handle-getdata")
     (is (null (search "(declare (ignore chain-state))" src))
         "handle-getdata ignores chain-state again, which disables every guard")))
+
+;;;; --- Parking an unfetchable fork instead of retrying it forever (N4) -------
+
+(test a-fork-with-a-missing-body-is-parked-not-re-probed-every-pass
+  "Measured on testnet4 over 12.7 days: 205 \"REORG REFUSED: N blocks missing
+from store\" lines across ~40 heights, 11 of them at a single height, for fork
+bodies no peer would serve. The candidate stayed in the set and was re-probed
+on every activation pass forever.
+
+Core's answer is not a timer. FindMostWorkChain erases such a branch from
+setBlockIndexCandidates and inserts it into m_blocks_unlinked keyed by the
+block it is waiting for — \"so that if the block arrives in the future we can
+try adding to setBlockIndexCandidates again\" (validation.cpp:3184-3190). The
+retry is not the problem; the retry with no event to wait for is."
+  (let ((bitcoin-lisp.networking::*ibd-context*
+          (bitcoin-lisp.networking::make-ibd-context)))
+    (let ((candidate (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+          (missing (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+          (set (bitcoin-lisp.networking::ibd-context-reorg-candidates
+                bitcoin-lisp.networking::*ibd-context*))
+          (parked (bitcoin-lisp.networking::ibd-context-unlinked-reorg-candidates
+                   bitcoin-lisp.networking::*ibd-context*)))
+      (setf (gethash candidate set) t)
+      (bitcoin-lisp.networking::%park-unlinked-reorg-candidate candidate missing)
+      ;; It stays a CANDIDATE — several paths read that set to mean "recoverable,
+      ;; not rejected", and dropping it there broke the deep-reorg livelock
+      ;; regression test. What stops is the repeated branch WALK.
+      (is-true (gethash candidate set))
+      (is (equal (list candidate) (gethash missing parked))
+          "it is not parked under the block it is waiting for")
+      (is-true (bitcoin-lisp.networking::%reorg-candidate-parked-p
+                candidate (bitcoin-lisp.storage:init-block-store
+                           (uiop:temporary-directory)))
+               "a parked candidate is not being skipped by the scan")
+      ;; Parking twice does not duplicate it.
+      (bitcoin-lisp.networking::%park-unlinked-reorg-candidate candidate missing)
+      (is (= 1 (length (gethash missing parked)))))))
+
+(test the-arrival-of-the-missing-body-re-arms-the-parked-fork
+  "The event that makes parking safe. If the body never arrives the branch
+costs nothing; if it does, the branch must come back — otherwise this trades an
+unbounded retry for a reorg that never happens, which is strictly worse."
+  (let ((bitcoin-lisp.networking::*ibd-context*
+          (bitcoin-lisp.networking::make-ibd-context)))
+    (multiple-value-bind (cs tip) (%gd-chain-state 10)
+      ;; A candidate entry with MORE work than the tip, so note-reorg-candidate
+      ;; will accept it back.
+      (let* ((cand (%gd-entry :height 11
+                              :work (+ (bitcoin-lisp.storage:block-index-entry-chain-work tip)
+                                       (expt 2 32))))
+             (cand-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 77))
+             (missing (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element 88)))
+        (setf (bitcoin-lisp.storage:block-index-entry-hash cand) cand-hash)
+        (bitcoin-lisp.storage:add-block-index-entry cs cand)
+        (bitcoin-lisp.networking::%park-unlinked-reorg-candidate cand-hash missing)
+        ;; An unrelated block arriving changes nothing.
+        (is (= 0 (bitcoin-lisp.networking::%rearm-unlinked-reorg-candidates
+                  (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3)
+                  cs)))
+        (is-true (gethash cand-hash
+                          (bitcoin-lisp.networking::ibd-context-parked-reorg-candidates
+                           bitcoin-lisp.networking::*ibd-context*)))
+        ;; The awaited block arriving un-parks it.
+        (is (= 1 (bitcoin-lisp.networking::%rearm-unlinked-reorg-candidates missing cs)))
+        (is-false (gethash cand-hash
+                           (bitcoin-lisp.networking::ibd-context-parked-reorg-candidates
+                            bitcoin-lisp.networking::*ibd-context*))
+                  "the parked fork is still being skipped after its body landed")
+        (is-true (gethash cand-hash
+                          (bitcoin-lisp.networking::ibd-context-reorg-candidates
+                           bitcoin-lisp.networking::*ibd-context*)))
+        ;; The parked entry is consumed, not left to fire again.
+        (is-false (gethash missing
+                           (bitcoin-lisp.networking::ibd-context-unlinked-reorg-candidates
+                            bitcoin-lisp.networking::*ibd-context*)))))))
+
+(test re-arming-re-applies-the-tests-that-admit-a-candidate
+  "Re-arming goes through NOTE-REORG-CANDIDATE rather than writing to the set
+directly, so a branch that went stale or was rejected while it waited does not
+come back. Putting it back unconditionally would resurrect exactly the
+candidates the rejected set exists to keep out."
+  (let ((bitcoin-lisp.networking::*ibd-context*
+          (bitcoin-lisp.networking::make-ibd-context)))
+    (multiple-value-bind (cs tip) (%gd-chain-state 10)
+      (let* ((stale (%gd-entry :height 11
+                               ;; LESS work than the tip: no longer a reorg target.
+                               :work (- (bitcoin-lisp.storage:block-index-entry-chain-work tip)
+                                        1000)))
+             (stale-hash (make-array 32 :element-type '(unsigned-byte 8)
+                                       :initial-element 66))
+             (missing (make-array 32 :element-type '(unsigned-byte 8)
+                                     :initial-element 99)))
+        (setf (bitcoin-lisp.storage:block-index-entry-hash stale) stale-hash)
+        (bitcoin-lisp.storage:add-block-index-entry cs stale)
+        (bitcoin-lisp.networking::%park-unlinked-reorg-candidate stale-hash missing)
+        (bitcoin-lisp.networking::%rearm-unlinked-reorg-candidates missing cs)
+        (is-false (gethash stale-hash
+                           (bitcoin-lisp.networking::ibd-context-reorg-candidates
+                            bitcoin-lisp.networking::*ibd-context*))
+                  "a branch that went stale while parked came back as a candidate")))))
+
+(test a-body-that-arrived-by-another-route-un-parks-the-branch-anyway
+  "The parked marker names a block, and the scan RE-CHECKS whether that block is
+here rather than trusting the marker. A body can appear through a path that does
+not drain the map — a reindex, an operator restoring a file — and a candidate
+parked against a block that has since arrived would otherwise never be probed
+again: an unbounded retry traded for a reorg that never happens, which is worse
+than the bug this fixes."
+  ;; A private directory built here rather than with flatfile-tests' fixture:
+  ;; that file compiles AFTER this one, so its macro is not defined yet and the
+  ;; call reads as a function call. It passed in a warm image that happened to
+  ;; have it loaded, and the cold battery caught it.
+  (let ((dir (ensure-directories-exist
+              (merge-pathnames (format nil "bl-unpark-~D/" (get-internal-real-time))
+                               (uiop:temporary-directory)))))
+    (unwind-protect
+         (let* ((bitcoin-lisp.networking::*ibd-context*
+                  (bitcoin-lisp.networking::make-ibd-context))
+                (store (bitcoin-lisp.storage:init-block-store dir))
+                (cand (make-array 32 :element-type '(unsigned-byte 8) :initial-element 5))
+                (blk (make-reorg-test-block
+                      (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+                      (make-array 32 :element-type '(unsigned-byte 8) :initial-element 210)
+                      1))
+                (missing (bitcoin-lisp.serialization:block-header-hash
+                          (bitcoin-lisp.serialization:bitcoin-block-header blk))))
+           (bitcoin-lisp.networking::%park-unlinked-reorg-candidate cand missing)
+           (is-true (bitcoin-lisp.networking::%reorg-candidate-parked-p cand store)
+                    "parked while the awaited body is genuinely absent")
+           ;; The body appears without anyone draining the map.
+           (bitcoin-lisp.storage:store-block store blk :height 1)
+           (is-false (bitcoin-lisp.networking::%reorg-candidate-parked-p cand store)
+                     "the branch is still skipped even though its body is here"))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
+(test the-parked-map-is-bounded-like-every-other-candidate-map
+  "A pathological header topology must not be able to grow this without limit —
+the same reason the candidate and rejected sets are capped."
+  (let ((bitcoin-lisp.networking::*ibd-context*
+          (bitcoin-lisp.networking::make-ibd-context)))
+    (let ((parked (bitcoin-lisp.networking::ibd-context-unlinked-reorg-candidates
+                   bitcoin-lisp.networking::*ibd-context*)))
+      (loop for i from 0 below (+ bitcoin-lisp.networking::+reorg-candidates-cap+ 50)
+            do (let ((missing (make-array 32 :element-type '(unsigned-byte 8))))
+                 (setf (aref missing 0) (ldb (byte 8 0) i)
+                       (aref missing 1) (ldb (byte 8 8) i)
+                       (aref missing 2) (ldb (byte 8 16) i))
+                 (bitcoin-lisp.networking::%park-unlinked-reorg-candidate
+                  (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1)
+                  missing)))
+      (is (<= (hash-table-count parked)
+              bitcoin-lisp.networking::+reorg-candidates-cap+)
+          "the parked map grew past its cap (~D entries)"
+          (hash-table-count parked)))))
+
+(test the-body-persist-path-drains-the-parked-map
+  "The seam, and the one this project keeps getting wrong: parking is only safe
+if something actually re-arms. Assert the persist path calls the drain."
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/networking/ibd.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search "(%rearm-unlinked-reorg-candidates hash chain-state)" src)
+        "no caller drains the parked map, so a parked fork never comes back")))
