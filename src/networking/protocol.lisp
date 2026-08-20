@@ -241,6 +241,22 @@ Returns T if message was handled, NIL otherwise."
        (disconnect-peer peer))
      t)
 
+    ;; BIP-330 reconciliation. Every one of these is ignored unless the peer
+    ;; completed the sendtxrcncl handshake, which needs -txreconciliation on
+    ;; both sides — so with the flag off they are inert rather than errors.
+    ((string= command "reqrecon")
+     (when (peer-recon-registered peer) (%handle-reqrecon peer payload))
+     t)
+    ((string= command "sketch")
+     (when (peer-recon-registered peer) (%handle-sketch peer payload))
+     t)
+    ((string= command "reqsketchext")
+     (when (peer-recon-registered peer) (%handle-reqsketchext peer))
+     t)
+    ((string= command "reconcildiff")
+     (when (peer-recon-registered peer) (%handle-reconcildiff peer payload))
+     t)
+
     ((string= command "sendheaders")
      ;; BIP 130: Peer prefers header announcements over inv
      (setf (peer-prefers-headers peer) t)
@@ -2431,14 +2447,132 @@ reach here anyway — their senders are disconnected)."
                  ;; Skip if already announced to this peer (Core checks the
                  ;; known-filter at queue time too, PushTxInventory).
                  (not (bitcoin-lisp:recent-reject-p (peer-announced-txs peer) txid)))
-        (setf (peer-tx-inv-queue peer)
-              (nconc (peer-tx-inv-queue peer)
-                     (list (list txid wtxid fee-rate-per-kb))))
-        ;; Bound the queue: drop oldest beyond the cap.
-        (let ((excess (- (length (peer-tx-inv-queue peer)) +max-tx-inv-queue+)))
-          (when (plusp excess)
-            (setf (peer-tx-inv-queue peer)
-                  (nthcdr excess (peer-tx-inv-queue peer)))))))))
+        ;; BIP-330: a peer we reconcile with gets the transaction held back in
+        ;; its reconciliation set rather than announced — unless this
+        ;; transaction is one of the few chosen for immediate fanout, which is
+        ;; what stops an adversary timing the first announcement to find the
+        ;; origin. Reconciliation is off unless -txreconciliation was set AND
+        ;; the peer completed the handshake, so this branch is dead by default.
+        (if (%recon-hold-p peer wtxid txid peers)
+            (recon-set-add (%peer-recon-set peer)
+                           (peer-recon-k0 peer) (peer-recon-k1 peer)
+                           (or wtxid txid))
+            (progn
+              (setf (peer-tx-inv-queue peer)
+                    (nconc (peer-tx-inv-queue peer)
+                           (list (list txid wtxid fee-rate-per-kb))))
+              ;; Bound the queue: drop oldest beyond the cap.
+              (let ((excess (- (length (peer-tx-inv-queue peer)) +max-tx-inv-queue+)))
+                (when (plusp excess)
+                  (setf (peer-tx-inv-queue peer)
+                        (nthcdr excess (peer-tx-inv-queue peer)))))))))))
+
+(defun %handle-reqrecon (peer payload)
+  "The peer wants to reconcile: size a sketch against what it says it holds and
+send it back."
+  (handler-case
+      (multiple-value-bind (their-size q)
+          (bitcoin-lisp.serialization:parse-reqrecon-payload payload)
+        (send-message peer (recon-respond-to-request peer their-size q)))
+    (error (e)
+      (bitcoin-lisp:log-cat "txreconciliation" "reqrecon from ~A failed: ~A"
+                            (peer-address peer) e))))
+
+(defun %handle-sketch (peer payload)
+  "The responder's sketch arrived. Merge it with ours and either announce the
+answer or ask for an extension."
+  (let ((round (peer-recon-round peer)))
+    (unless round
+      ;; A sketch we did not ask for. Ignore rather than disconnect: a round
+      ;; can time out on our side while the answer is still in flight.
+      (return-from %handle-sketch nil))
+    (handler-case
+        (let ((their-sketch (ms-sketch-deserialize
+                             (bitcoin-lisp.serialization:parse-sketch-payload payload))))
+          (multiple-value-bind (ids ok) (recon-round-decode round their-sketch)
+            (cond
+              (ok
+               (multiple-value-bind (ask announce) (recon-finish-round peer ids)
+                 (send-message peer
+                               (bitcoin-lisp.serialization:make-reconcildiff-message t ask))
+                 (%announce-wtxids peer announce)))
+              ((not (recon-round-extended round))
+               ;; One extension is allowed, then the fallback.
+               (setf (recon-round-extended round) t
+                     (recon-round-state round) :extended)
+               (send-message peer (bitcoin-lisp.serialization:make-reqsketchext-message)))
+              (t
+               (send-message peer
+                             (bitcoin-lisp.serialization:make-reconcildiff-message nil '()))
+               (%announce-wtxids peer (recon-abandon-round peer))))))
+      (error (e)
+        (bitcoin-lisp:log-cat "txreconciliation" "sketch from ~A failed: ~A"
+                              (peer-address peer) e)
+        (%announce-wtxids peer (recon-abandon-round peer))))))
+
+(defun %handle-reqsketchext (peer)
+  "The initiator could not decode and wants a bigger sketch. Send one at double
+the capacity over the same frozen snapshot — reconciling against a set that
+moved since the first sketch would describe something it never saw."
+  (let* ((set (peer-recon-set peer))
+         (ids (and set (or (recon-set-snapshot set) (recon-set-short-ids set)))))
+    (when ids
+      (send-message peer
+                    (bitcoin-lisp.serialization:make-sketch-message
+                     (ms-sketch-serialize
+                      (recon-build-sketch ids (* 2 (max 1 (length ids))))))))))
+
+(defun %handle-reconcildiff (peer payload)
+  "The initiator finished. Announce what it asked for; on a failure, announce
+the whole snapshot — the flood fallback that keeps a failed round from losing
+transactions."
+  (handler-case
+      (multiple-value-bind (ok ask)
+          (bitcoin-lisp.serialization:parse-reconcildiff-payload payload)
+        (let ((set (peer-recon-set peer)))
+          (if ok
+              (%announce-wtxids
+               peer
+               (loop for id in ask
+                     for wtxid = (and set (recon-set-wtxid set id))
+                     when wtxid
+                       collect wtxid
+                       and do (remhash id (recon-set-by-short-id set))))
+              (%announce-wtxids peer (recon-abandon-round peer)))
+          (when set (recon-set-clear-snapshot set))))
+    (error (e)
+      (bitcoin-lisp:log-cat "txreconciliation" "reconcildiff from ~A failed: ~A"
+                            (peer-address peer) e))))
+
+(defun %announce-wtxids (peer wtxids)
+  "Queue WTXIDS for ordinary announcement to PEER. Reconciliation decides WHAT
+to announce; the announcement itself is the same inv path everything else uses."
+  (dolist (wtxid wtxids)
+    (setf (peer-tx-inv-queue peer)
+          (nconc (peer-tx-inv-queue peer) (list (list wtxid wtxid 0))))))
+
+(defun %peer-recon-set (peer)
+  (or (peer-recon-set peer)
+      (setf (peer-recon-set peer) (make-recon-set))))
+
+(defun %recon-hold-p (peer wtxid txid peers)
+  "T when this transaction should wait for reconciliation with PEER rather than
+being announced now.
+
+Three conditions, all required: the peer completed the sendtxrcncl handshake
+(which needs -txreconciliation on both sides), we have a wtxid to compute its
+short ID from, and this transaction did not draw the immediate-fanout slot for
+this peer."
+  (and (peer-recon-registered peer)
+       (peer-recon-k0 peer)
+       wtxid
+       (not (recon-fanout-target-p
+             (or wtxid txid)
+             (peer-recon-k0 peer)
+             ;; The fanout budget is a share of the RECONCILING peers, so the
+             ;; count has to exclude the ones being announced to anyway.
+             (count-if #'peer-recon-registered peers)
+             (not (peer-inbound peer))))))
 
 (defun %flush-peer-tx-invs (peer mempool)
   "Drain up to +inv-broadcast-target+ queued announcements to PEER as one
