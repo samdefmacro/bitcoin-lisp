@@ -496,14 +496,10 @@ For testnet, data stays at the base directory (backward compatible)."
           ((:mainnet :testnet3 :testnet4)
            bitcoin-lisp.storage:+pow-limit-target+)))
 
-  ;; Calculate data path - each network uses its own subdirectory
+  ;; Calculate data path — each network uses its own subdirectory, and WHICH
+  ;; subdirectory is Core's (chainparamsbase.cpp:40-55). See NETWORK-DATA-PATH.
   (let* ((base-path (pathname data-directory))
-         (data-path (ecase network
-                      (:testnet3 base-path)
-                      (:testnet4 (merge-pathnames "testnet4/" base-path))
-                      (:signet (merge-pathnames "signet/" base-path))
-                      (:regtest (merge-pathnames "regtest/" base-path))
-                      (:mainnet (merge-pathnames "mainnet/" base-path)))))
+         (data-path (network-data-path base-path network)))
     ;; Ensure data directory exists
     (ensure-directories-exist (merge-pathnames "dummy" data-path))
 
@@ -2920,6 +2916,128 @@ Returns the node instance."
   (log-info "Node started successfully")
   *node*)
 
+(defun %check-datadir-option (cli)
+  "An explicitly named -datadir that does not exist is FATAL, as it is in Core
+ (CheckDataDirOption, args.cpp:789-793; the error is \"specified data directory
+... does not exist\").
+
+We created it instead. On a node that is the wrong default in both directions
+an operator hits it: a typo and an unmounted volume both present as an empty
+directory, and an empty datadir means a full re-sync from genesis — started
+silently, and on mainnet measured in days. Not naming -datadir at all is still
+fine; that is the default path, and creating THAT is the intended behaviour."
+  (let ((datadir (cdr (assoc "datadir" cli :test #'string=))))
+    (when (and datadir (plusp (length datadir)))
+      (let ((path (pathname (if (char= (char datadir (1- (length datadir))) #\/)
+                                datadir
+                                (concatenate 'string datadir "/")))))
+        (unless (probe-file path)
+          (error 'bitcoin-lisp::config-parse-error
+                 :message (format nil "specified data directory \"~A\" does not exist"
+                                  datadir)))))))
+
+(defun %read-config-includes (conf-text cli datadir)
+  "Resolve -includeconf, returning the list of config texts to merge (the main
+file first). Core ArgsManager::ReadConfigFiles, common/config.cpp:150-213.
+
+Ours was unimplemented: a split configuration loaded with everything at
+defaults after a single warning line, which on a node is indistinguishable from
+a config file that was read and understood.
+
+Core's rules, all of which apply here:
+  - the include list is read from the network section AND the global area;
+  - a relative path is relative to the base datadir (net_specific=false);
+  - a missing or unreadable include is a FATAL error, not a warning — the
+    alternative is silently running without the settings it holds;
+  - -includeconf inside an INCLUDED file is ignored with a warning, so a config
+    cannot recurse;
+  - on the command line only the negated form is accepted, and -noincludeconf
+    suppresses includes entirely."
+  (when (null conf-text)
+    (return-from %read-config-includes nil))
+  (let ((cli-include (assoc "includeconf" cli :test #'string=)))
+    (when (and cli-include (not (bitcoin-lisp::conf-parse-bool (cdr cli-include))))
+      ;; -noincludeconf
+      (return-from %read-config-includes (list conf-text)))
+    (when (and cli-include (bitcoin-lisp::conf-parse-bool (cdr cli-include)))
+      (error 'bitcoin-lisp::config-parse-error
+             :message "-includeconf cannot be used from the command line; put it ~
+                       in the configuration file")))
+  (let* ((network (bitcoin-lisp::resolve-network-from-config
+                   (append cli (bitcoin-lisp::conf-global-entries conf-text))))
+         (entries (bitcoin-lisp::parse-bitcoin-conf conf-text network))
+         (names (loop for (k . v) in entries
+                      when (and (string= k "includeconf") (plusp (length v)))
+                        collect v))
+         (base (pathname (if (and (plusp (length datadir))
+                                  (char= (char datadir (1- (length datadir))) #\/))
+                             datadir
+                             (concatenate 'string datadir "/"))))
+         (texts (list conf-text)))
+    (dolist (name names)
+      (let ((path (merge-pathnames name base)))
+        (unless (probe-file path)
+          (error 'bitcoin-lisp::config-parse-error
+                 :message (format nil "Failed to include configuration file ~A" name)))
+        (let ((text (alexandria:read-file-into-string path)))
+          ;; A recursive include is dropped with a warning, exactly as Core
+          ;; does (it re-scans for includeconf after reading and prints
+          ;; "-includeconf cannot be used from included files").
+          (dolist (inner (bitcoin-lisp::parse-bitcoin-conf text nil))
+            (when (string= (car inner) "includeconf")
+              (log-warn "-includeconf cannot be used from included files; ~
+                         ignoring -includeconf=~A" (cdr inner))))
+          (log-info "Included configuration file ~A" name)
+          (push text texts))))
+    (nreverse texts)))
+
+(defun %network-subdirectory (network)
+  "The per-network subdirectory of the datadir, as Bitcoin Core defines it
+ (CreateBaseChainParams, chainparamsbase.cpp:40-55). NIL means the datadir root.
+
+  mainnet   -> the root        testnet3 -> testnet3/
+  testnet4  -> testnet4/       signet   -> signet/       regtest -> regtest/
+
+Ours used to be the INVERSE for exactly the two that matter: mainnet in
+`mainnet/` and testnet3 at the root. Pointing our node at a Core datadir with
+the default network therefore wrote testnet3 data into Core's MAINNET
+directory, and pointing Core at ours found nothing and started a fresh sync."
+  (ecase network
+    (:mainnet nil)
+    (:testnet3 "testnet3/")
+    (:testnet4 "testnet4/")
+    (:signet "signet/")
+    (:regtest "regtest/")))
+
+(defun network-data-path (base-path network)
+  "Where NETWORK's data lives under BASE-PATH.
+
+Core's layout, with one deliberate exception: a datadir that already holds data
+in our OLD layout keeps using it. Silently adopting Core's layout on an existing
+node would present an empty datadir to a node that has one — which on mainnet
+means discarding a synced chain and starting IBD from genesis, the single most
+expensive way to be wrong here. The legacy directory is logged every start so it
+is visible rather than inherited by accident."
+  (let* ((subdir (%network-subdirectory network))
+         (core-path (if subdir (merge-pathnames subdir base-path) base-path))
+         ;; The layout this tree used before: mainnet under mainnet/, testnet3
+         ;; at the root. Every other network already agreed with Core.
+         (legacy-subdir (case network (:mainnet "mainnet/") (:testnet3 nil)))
+         (legacy-path (if legacy-subdir
+                          (merge-pathnames legacy-subdir base-path)
+                          base-path)))
+    (cond
+      ((equal core-path legacy-path) core-path)
+      ;; "Holds data" means a chainstate, not merely an existing directory —
+      ;; ensure-directories-exist creates empty ones freely.
+      ((and (not (probe-file (merge-pathnames "chainstate.dat" core-path)))
+            (probe-file (merge-pathnames "chainstate.dat" legacy-path)))
+       (log-warn "Using the legacy data layout ~A for ~A; Bitcoin Core's layout ~
+                  for this network is ~A. Move the directory to adopt it."
+                 legacy-path network core-path)
+       legacy-path)
+      (t core-path))))
+
 (defun start-node-from-args (&optional (args (rest sb-ext:*posix-argv*)))
   "Start the node from Bitcoin Core-style options: a list of CLI ARGS
  (-key=value, -key, -nokey) plus a bitcoin.conf read from the data directory.
@@ -2946,17 +3064,21 @@ file location."
                                             (char= (char datadir (1- (length datadir))) #\/))
                                        datadir
                                        (concatenate 'string datadir "/"))))))
-         (conf-text (when (probe-file conf-path)
-                      (log-info "Reading config file ~A" conf-path)
-                      (alexandria:read-file-into-string conf-path))))
-    (multiple-value-bind (plist merged) (args->start-node-plist args conf-text)
+         (conf-text (progn
+                      (%check-datadir-option cli)
+                      (when (probe-file conf-path)
+                        (log-info "Reading config file ~A" conf-path)
+                        (alexandria:read-file-into-string conf-path))))
+         (conf-texts (%read-config-includes conf-text cli datadir)))
+    (multiple-value-bind (plist merged) (args->start-node-plist args conf-texts)
       ;; Unknown CONFIG-FILE keys only warn (Core ReadConfigFiles with
       ;; ignore_invalid_keys=true, common/init.cpp:38: "Ignoring unknown
       ;; configuration value") — unlike unknown CLI options, which error.
-      (when conf-text
-        (dolist (k (unknown-config-file-keys
-                    (parse-bitcoin-conf conf-text)))
-          (log-warn "Ignoring unknown configuration value ~A" k)))
+      ;; Every file that was read, not just the main one — an unknown key in an
+      ;; included file is exactly as worth reporting.
+      (dolist (k (unknown-config-file-keys
+                  (loop for text in conf-texts append (parse-bitcoin-conf text))))
+        (log-warn "Ignoring unknown configuration value ~A" k))
       ;; Apply the process-global config specials (options with no start-node
       ;; keyword) from the same merged config, before launching.
       (apply-config-globals merged)
