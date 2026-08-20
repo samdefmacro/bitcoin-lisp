@@ -71,6 +71,7 @@
                                (:file "coinstatsindex")))
                  (:module "validation"
                   :components ((:file "script")
+                               (:file "miniscript")
                                (:file "transaction")
                                (:file "packages")
                                (:file "block")
@@ -247,6 +248,7 @@
                              ;; TxOutCompression + hash_serialized_3
                              (:file "compressor-tests")
                              (:file "block-undo-tests")
+                             (:file "miniscript-tests")
                              (:file "flatfile-tests")
                              ;; Assumeutxo snapshot format (dumptxoutset/loadtxoutset)
                              (:file "snapshot-tests")
