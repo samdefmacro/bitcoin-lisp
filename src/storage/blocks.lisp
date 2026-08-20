@@ -11,6 +11,17 @@
 (defvar *blocks-directory* nil
   "Directory for block files.")
 
+(defstruct block-file-info
+  "Per-file accounting for a blk/rev pair (Core CBlockFileInfo, kernel/blockmanager_opts
+or chain.h). HEIGHT-FIRST and HEIGHT-LAST bound what the file contains, and
+they are the whole reason a file can be pruned safely: Core deletes a file only
+when its entire range lies inside the prunable window."
+  (blocks 0 :type (integer 0))
+  (size 0 :type (integer 0))
+  (undo-size 0 :type (integer 0))
+  (height-first nil :type (or null (unsigned-byte 32)))
+  (height-last nil :type (or null (unsigned-byte 32))))
+
 (defvar *flat-block-files* nil
   "Write new blocks into Core's numbered blk?????.dat files instead of one file
 per block.
@@ -38,6 +49,11 @@ turning the flag on and off again leaves every block reachable.")
   (cursor-pos 0 :type (unsigned-byte 32))
   ;; The blocksdir obfuscation key, read or created once at init.
   (xor-key nil)
+  ;; File number -> BLOCK-FILE-INFO (Core m_blockfile_info). What makes
+  ;; file-granular pruning possible: a whole blk/rev pair can be deleted only
+  ;; when EVERY block in it is inside the prunable window, which needs the
+  ;; file's height range.
+  (file-info (make-hash-table :test 'eql) :type hash-table)
   ;; Running total of all .blk file sizes, maintained by store-block and
   ;; prune-block and initialized by the init-block-store scan. Pruning
   ;; consults this after EVERY connected block (validation/block.lisp), so
@@ -147,12 +163,36 @@ the record is missing, mis-framed, or unreadable."
                   (flexi-streams:with-input-from-sequence (bs payload)
                     (bitcoin-lisp.serialization:read-bitcoin-block bs)))))))))))
 
-(defun store-block (store block)
+(defun %store-file-info (store file)
+  (or (gethash file (block-store-file-info store))
+      (setf (gethash file (block-store-file-info store)) (make-block-file-info))))
+
+(defun %note-block-in-file (store file height bytes)
+  "Fold one stored block into FILE's accounting."
+  (let ((info (%store-file-info store file)))
+    (incf (block-file-info-blocks info))
+    (incf (block-file-info-size info) bytes)
+    ;; A file with a block of unknown height has an unknown range, and an
+    ;; unknown range can never be shown to lie inside the prunable window — so
+    ;; it is never pruned. That is the safe direction: the alternative is
+    ;; deleting a block the chain still needs.
+    (when height
+      (let ((first (block-file-info-height-first info))
+            (last (block-file-info-height-last info)))
+        (setf (block-file-info-height-first info) (if first (min first height) height)
+              (block-file-info-height-last info) (if last (max last height) height))))
+    info))
+
+(defun store-block (store block &key height)
   "Store a block in the block store.
 BLOCK should be a bitcoin-block structure.
 Returns (values hash location), where LOCATION is a FLAT-FILE-POS when the
 block went into a blk?????.dat and a PATHNAME when it went into a per-block
-file (see *FLAT-BLOCK-FILES*)."
+file (see *FLAT-BLOCK-FILES*).
+
+HEIGHT is what lets the block's file be pruned later: pruning a flat file is
+all-or-nothing, so the decision needs the file's height range. Omitting it
+stores the block correctly and makes its file unprunable."
   (ensure-directories store)
   (let* ((hash (bitcoin-lisp.serialization:block-header-hash
                 (bitcoin-lisp.serialization:bitcoin-block-header block)))
@@ -179,6 +219,8 @@ file (see *FLAT-BLOCK-FILES*)."
       (*flat-block-files*
        (let ((pos (%store-block-flat store data)))
          (setf (gethash hash (block-store-index store)) pos)
+         (%note-block-in-file store (flat-file-pos-file pos) height
+                              (+ (length data) +storage-header-bytes+))
          ;; The record's overhead counts toward the storage total, as it does
          ;; in Core's per-file accounting.
          (incf (block-store-total-bytes store)
@@ -354,6 +396,86 @@ Returns the size in bytes of the deleted file, or NIL if the file didn't exist."
       (decf (block-store-total-bytes store) size)
       size)))
 
+(defun rebuild-block-file-info (store chain-state)
+  "Recover per-file accounting by joining the store's hash -> position map with
+the header index's hash -> height. Called once at startup, after both are
+loaded.
+
+Core persists CBlockFileInfo in its block-index database; deriving it instead
+means there is no second file to fall out of step with the block files. The
+join is the only place the two halves meet: the flat files know WHERE each
+block is and the header index knows WHAT HEIGHT it is, and pruning needs both."
+  (clrhash (block-store-file-info store))
+  (maphash
+   (lambda (hash located)
+     (when (flat-file-pos-p located)
+       (let* ((entry (get-block-index-entry chain-state hash))
+              (height (and entry (block-index-entry-height entry))))
+         ;; The record's own byte count is not known without re-reading it;
+         ;; the running total is maintained elsewhere, and pruning only needs
+         ;; the height range plus a per-file byte figure, which the file's own
+         ;; size on disk supplies.
+         (%note-block-in-file store (flat-file-pos-file located) height 0))))
+   (block-store-index store))
+  ;; Take each file's byte count from the filesystem rather than summing
+  ;; records: the difference is the preallocated tail, and pruning frees the
+  ;; whole file including that tail.
+  (maphash (lambda (file info)
+             (let ((path (flat-file-name (%blk-seq store) (make-flat-file-pos file 0))))
+               (setf (block-file-info-size info) (or (file-size-bytes path) 0))))
+           (block-store-file-info store))
+  (hash-table-count (block-store-file-info store)))
+
+(defun %prunable-flat-files (store min-height max-height)
+  "File numbers whose ENTIRE height range lies within [MIN-HEIGHT, MAX-HEIGHT]
+(Core FindFilesToPrune's per-file test). A file with an unknown range, or one
+holding a single block outside the window, is not prunable — pruning a flat
+file is all or nothing."
+  (let ((files '()))
+    (maphash (lambda (file info)
+               (let ((first (block-file-info-height-first info))
+                     (last (block-file-info-height-last info)))
+                 (when (and first last
+                            (>= first min-height)
+                            (<= last max-height)
+                            (plusp (block-file-info-blocks info)))
+                   (push file files))))
+             (block-store-file-info store))
+    (sort files #'<)))
+
+(defun prune-flat-block-file (store file &key on-prune)
+  "Delete the blk/rev pair FILE and forget every block in it (Core
+PruneOneBlockFile plus the unlink). Returns the bytes freed.
+
+ON-PRUNE is called with each block's hash, so the caller can drop the matching
+undo data and clear the index entry's HAVE_DATA — Core does the second inside
+PruneOneBlockFile because its index and its files share a lock; here the
+callback keeps storage from having to reach into the chain state."
+  (let ((freed 0)
+        (hashes '()))
+    (maphash (lambda (hash located)
+               (when (and (flat-file-pos-p located)
+                          (= (flat-file-pos-file located) file))
+                 (push hash hashes)))
+             (block-store-index store))
+    (dolist (hash hashes)
+      (remhash hash (block-store-index store))
+      (when on-prune (funcall on-prune hash)))
+    (dolist (prefix '("blk" "rev"))
+      (let ((path (flat-file-name
+                   (make-flat-file-seq (ensure-directories store) prefix
+                                       +blockfile-chunk-size+)
+                   (make-flat-file-pos file 0))))
+        (let ((size (file-size-bytes path)))
+          (when size
+            (ignore-errors (delete-file path))
+            (incf freed size)))))
+    (remhash file (block-store-file-info store))
+    (decf (block-store-total-bytes store) (min freed (block-store-total-bytes store)))
+    (bitcoin-lisp:log-info "Pruned block file ~D: ~D blocks, ~D bytes"
+                           file (length hashes) freed)
+    freed))
+
 (defun block-storage-size-mib (store)
   "Total size of all block files in MiB. O(1) — reads the running counter
 maintained by store-block/prune-block (initialized by init-block-store)."
@@ -383,6 +505,22 @@ Returns the number of blocks pruned."
       (let* ((min-keep-height (max 0 (- current-height bitcoin-lisp:+min-blocks-to-keep+)))
              (start (chain-state-prune-walk-start chain-state))
              (pruned 0))
+        ;; Flat files first, whole pairs at a time (Core FindFilesToPrune).
+        ;; A blk file cannot have a block cut out of it, so the unit is the
+        ;; file and the test is that its ENTIRE height range sits inside the
+        ;; window. Legacy per-block files are handled by the walk below; a
+        ;; store mid-transition holds both.
+        (dolist (file (%prunable-flat-files store (1+ start) min-keep-height))
+          (when (<= (block-store-total-bytes store) target-bytes)
+            (return))
+          (let ((info (gethash file (block-store-file-info store))))
+            (let ((last (and info (block-file-info-height-last info)))
+                  (blocks (if info (block-file-info-blocks info) 0)))
+              (prune-flat-block-file store file :on-prune on-prune)
+              (incf pruned blocks)
+              (when last
+                (setf (chain-state-pruned-height chain-state)
+                      (max (chain-state-pruned-height chain-state) last))))))
         ;; Walk from start+1 upward, deleting blocks until the running
         ;; total (maintained by prune-block) is back under target.
         ;; One active-chain walk for the whole range — get-block-at-height
