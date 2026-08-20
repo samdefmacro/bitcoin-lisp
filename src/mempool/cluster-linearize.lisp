@@ -264,6 +264,24 @@ cluster_linearize.h:361-424)."
   (transactions 0 :type (unsigned-byte 64))
   (feerate (make-feefrac) :type feefrac))
 
+(defun setinfo-union! (a b)
+  "A |= B: union the transaction sets and add the feerates in place (Core
+SetInfo::operator|=, cluster_linearize.h:398-404). Returns A."
+  (setf (setinfo-transactions a)
+        (logior (setinfo-transactions a) (setinfo-transactions b)))
+  (incf (feefrac-fee (setinfo-feerate a)) (feefrac-fee (setinfo-feerate b)))
+  (incf (feefrac-size (setinfo-feerate a)) (feefrac-size (setinfo-feerate b)))
+  a)
+
+(defun setinfo-subtract! (a b)
+  "A -= B: remove B's transactions and feerate from A in place (Core
+SetInfo::operator-=). B must be a subset of A. Returns A."
+  (setf (setinfo-transactions a)
+        (logandc2 (setinfo-transactions a) (setinfo-transactions b)))
+  (decf (feefrac-fee (setinfo-feerate a)) (feefrac-fee (setinfo-feerate b)))
+  (decf (feefrac-size (setinfo-feerate a)) (feefrac-size (setinfo-feerate b)))
+  a)
+
 (defun chunk-linearization (g linearization)
   "The chunk feerates of LINEARIZATION as a list of feefracs (Core
 ChunkLinearization, cluster_linearize.h:448-463): each tx starts a singleton
@@ -441,9 +459,8 @@ by tx+1; index 0 is the sentinel, and 0 also serves as Core's NO_PREV_TX."
           (assert (= done n)))))
     lin))
 
-(defun linearize (g)
-  "Linearize cluster G: ancestor-set feerate seeding refined by
-POST-LINEARIZE. Returns a simple-vector of positions in a topologically
-valid order. Correct but not always optimal on non-tree DAGs; Core's SFL
-(cluster_linearize.h:1799) is the future optimal replacement."
-  (post-linearize g (ancestor-sort-linearization g)))
+;;; LINEARIZE itself lives in spanning-forest.lisp, which is compiled after
+;;; this file: it drives Core's SFL algorithm and then this file's
+;;; POST-LINEARIZE, exactly as Core's Cluster::Relinearize does
+;;; (txgraph.cpp:2170-2179). ANCESTOR-SORT-LINEARIZATION above remains as the
+;;; comparison baseline the SFL tests measure against.
