@@ -385,9 +385,13 @@ not something applied afterwards."
         (:just-0 (%ms-cat +op-0+))
         (:just-1 (%ms-cat +op-1+))
         (:pk-k (%ms-cat (%ms-push-data (pk (first (ms-node-keys node))))))
+        ;; DATA set means the 20-byte key HASH is all that is known, which is
+        ;; what inference recovers: the script only ever committed to the hash,
+        ;; so the key itself is not in it. Hashing again would be wrong.
         (:pk-h (%ms-cat +op-dup+ +op-hash160+
-                        (%ms-push-data (bitcoin-lisp.crypto:hash160
-                                        (pk (first (ms-node-keys node)))))
+                        (%ms-push-data (or (ms-node-data node)
+                                           (bitcoin-lisp.crypto:hash160
+                                            (pk (first (ms-node-keys node))))))
                         +op-equalverify+))
         (:older (%ms-cat (%ms-push-number (ms-node-k node)) +ms-op-checksequenceverify+))
         (:after (%ms-cat (%ms-push-number (ms-node-k node)) +ms-op-checklocktimeverify+))
@@ -660,6 +664,15 @@ MINISCRIPT-PARSE-ERROR when it is not well-formed at all."
 (defun %ms-identity-key-string (key)
   (if (stringp key) key (string-downcase (bitcoin-lisp.crypto:bytes-to-hex key))))
 
+(defun %ms-key-or-hash-string (node key-fn)
+  "How to name a pk_h's subject. A parsed node holds the key; an INFERRED one
+holds only the 20-byte hash the script committed to, because the key is not in
+the script. Printing the hash is what Core's inference does too — it is the
+most that can honestly be said about the script."
+  (if (ms-node-data node)
+      (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (ms-node-data node)))
+      (funcall key-fn (first (ms-node-keys node)))))
+
 (defun ms-node-to-string (node &optional (key-fn #'%ms-identity-key-string) wrapped)
   "The canonical expression text for NODE (Core Node::ToString).
 
@@ -683,8 +696,10 @@ run of wrappers needs only one colon."
         (:wrap-c (case (frag 0)
                    (:pk-k (format nil "~Apk(~A)" prefix
                                   (key (first (ms-node-keys (nth 0 subs))))))
+                   ;; An INFERRED pk_h has only the hash the script committed
+                   ;; to; there is no key in the script to print.
                    (:pk-h (format nil "~Apkh(~A)" prefix
-                                  (key (first (ms-node-keys (nth 0 subs))))))
+                                  (%ms-key-or-hash-string (nth 0 subs) key-fn)))
                    (t (concatenate 'string "c" (sub 0 t)))))
         (:wrap-d (concatenate 'string "d" (sub 0 t)))
         (:wrap-v (concatenate 'string "v" (sub 0 t)))
@@ -705,7 +720,8 @@ run of wrappers needs only one colon."
            (:just-0 (concatenate 'string prefix "0"))
            (:just-1 (concatenate 'string prefix "1"))
            (:pk-k (format nil "~Apk_k(~A)" prefix (key (first (ms-node-keys node)))))
-           (:pk-h (format nil "~Apk_h(~A)" prefix (key (first (ms-node-keys node)))))
+           (:pk-h (format nil "~Apk_h(~A)" prefix
+                          (%ms-key-or-hash-string node key-fn)))
            (:older (format nil "~Aolder(~D)" prefix (ms-node-k node)))
            (:after (format nil "~Aafter(~D)" prefix (ms-node-k node)))
            ((:sha256 :hash256 :ripemd160 :hash160)
@@ -1038,3 +1054,370 @@ it."
     (when (ms-stack-available-p satisfaction)
       (values (copy-list (ms-stack-elements satisfaction))
               (ms-stack-malleable satisfaction)))))
+
+;;;; --- Inference: script bytes back to a miniscript (Core DecodeScript) ----
+;;;;
+;;;; The decoder reads the script BACKWARDS. That is not a stylistic choice:
+;;;; miniscript's combinators put their own opcode LAST (and_b is [X][Y]
+;;;; OP_BOOLAND, or_d is [X] OP_IFDUP OP_NOTIF [Y] OP_ENDIF), so the last
+;;;; opcode is the one that says which fragment this is. Forwards, you cannot
+;;;; know what you are parsing until you have finished parsing it.
+;;;;
+;;;; It is a state machine rather than a recursive descent because the contexts
+;;;; interleave: a wrapper's operand may itself be an and_v chain, and thresh
+;;;; has to count its children. Core keeps a to-parse stack and a stack of
+;;;; constructed nodes, and this follows it context for context.
+
+(defstruct (ms-op (:constructor %make-ms-op (opcode data)))
+  "One decomposed script element: an opcode and its push payload."
+  (opcode 0 :type (unsigned-byte 8))
+  (data nil))
+
+(defconstant +ms-op-pushdata1+ 76)
+(defconstant +ms-op-pushdata2+ 77)
+(defconstant +ms-op-pushdata4+ 78)
+(defconstant +ms-op-1negate+ 79)
+(defconstant +ms-op-numequal+ #x9c)
+(defconstant +ms-op-numequalverify+ #x9d)
+
+(defun ms-decompose-script (script)
+  "Split SCRIPT into MS-OPs, REVERSED, or NIL if it is not decomposable.
+
+Three normalizations, all Core's:
+- OP_1..OP_16 become pushes of their value, so a threshold and a small push
+  read the same way.
+- Every -VERIFY opcode is split into its base plus OP_VERIFY, which is what
+  lets one `v:' rule handle both spellings.
+- A base opcode already followed by OP_VERIFY is REJECTED, because it should
+  have been written as the -VERIFY form: two encodings of one script would
+  otherwise both parse, and miniscript's whole premise is that the mapping is
+  one to one."
+  (let ((ops '())
+        (i 0)
+        (n (length script)))
+    (flet ((push-op (opcode data) (push (%make-ms-op opcode data) ops)))
+      (loop while (< i n)
+            do (let ((op (aref script i)))
+                 (incf i)
+                 (cond
+                   ;; Direct pushes.
+                   ;; The opcode is kept as the real byte, not normalized to
+                   ;; zero: OP_0 IS zero, and conflating the two makes every
+                   ;; data push look like a literal false.
+                   ((and (>= op 1) (<= op 75))
+                    (when (> (+ i op) n) (return-from ms-decompose-script nil))
+                    (push-op op (subseq script i (+ i op)))
+                    (incf i op))
+                   ((= op +ms-op-pushdata1+)
+                    (when (>= i n) (return-from ms-decompose-script nil))
+                    (let ((len (aref script i)))
+                      (incf i)
+                      (when (or (> (+ i len) n) (< len 76))
+                        ;; Non-minimal push: miniscript requires the shortest
+                        ;; encoding, so accepting this would again admit two
+                        ;; scripts for one expression.
+                        (return-from ms-decompose-script nil))
+                      (push-op +ms-op-pushdata1+ (subseq script i (+ i len)))
+                      (incf i len)))
+                   ((= op +ms-op-pushdata2+)
+                    (when (> (+ i 2) n) (return-from ms-decompose-script nil))
+                    (let ((len (logior (aref script i) (ash (aref script (1+ i)) 8))))
+                      (incf i 2)
+                      (when (or (> (+ i len) n) (< len 256))
+                        (return-from ms-decompose-script nil))
+                      (push-op +ms-op-pushdata2+ (subseq script i (+ i len)))
+                      (incf i len)))
+                   ((= op +ms-op-pushdata4+) (return-from ms-decompose-script nil))
+                   ;; OP_0 pushes nothing; OP_1..OP_16 push their value.
+                   ((= op +op-0+)
+                    (push-op op (make-array 0 :element-type '(unsigned-byte 8))))
+                   ((and (>= op +op-1+) (<= op +op-16+))
+                    (push-op op (make-array 1 :element-type '(unsigned-byte 8)
+                                              :initial-element (1+ (- op +op-1+)))))
+                   ;; -VERIFY forms split in two.
+                   ((= op +op-checksigverify+)
+                    (push-op +op-checksig+ nil) (push-op +op-verify+ nil))
+                   ((= op +op-checkmultisigverify+)
+                    (push-op +op-checkmultisig+ nil) (push-op +op-verify+ nil))
+                   ((= op +op-equalverify+)
+                    (push-op +op-equal+ nil) (push-op +op-verify+ nil))
+                   ((= op +ms-op-numequalverify+)
+                    (push-op +ms-op-numequal+ nil) (push-op +op-verify+ nil))
+                   (t
+                    ;; A base opcode written separately from a following
+                    ;; OP_VERIFY is the non-minimal spelling.
+                    (when (and (member op (list +op-checksig+ +op-checkmultisig+
+                                                +op-equal+ +ms-op-numequal+))
+                               (< i n)
+                               (= (aref script i) +op-verify+))
+                      (return-from ms-decompose-script nil))
+                    (push-op op nil))))))
+    ;; PUSH-OP already built the list in reverse.
+    (coerce ops 'vector)))
+
+(defun %ms-op-number (op)
+  "The number OP pushes, or NIL. OP_0 is 0; a push of up to 4 bytes is a
+CScriptNum."
+  (let ((data (ms-op-data op)))
+    (cond ((null data) nil)
+          ((zerop (length data)) 0)
+          ((> (length data) 4) nil)
+          (t
+           (let ((v 0))
+             (loop for i from (1- (length data)) downto 0
+                   do (setf v (logior (ash v 8) (aref data i))))
+             ;; Miniscript numbers are non-negative, so a set sign bit is not
+             ;; a number here.
+             (if (logtest (aref data (1- (length data))) #x80) nil v))))))
+
+(defun %ms-op-is (ops i opcode)
+  (and (< i (length ops)) (= (ms-op-opcode (aref ops i)) opcode)))
+
+(defun %ms-op-push-size (ops i)
+  (and (< i (length ops))
+       (ms-op-data (aref ops i))
+       (length (ms-op-data (aref ops i)))))
+
+(defun ms-from-script (script)
+  "Infer a miniscript from SCRIPT, or NIL.
+
+Returns a node that is valid at top level; anything else — a script that is not
+miniscript at all, one whose types do not check out, or one written in a
+non-minimal encoding — comes back NIL rather than as an error, because callers
+ask this question about arbitrary scripts."
+  (let ((ops (ms-decompose-script script)))
+    (when ops
+      (let ((in 0)
+            (last (length ops))
+            (to-parse (list (list :bkv-expr -1 -1)))
+            (constructed '()))
+        (macrolet ((fail () '(return-from ms-from-script nil))
+                   (emit (form) `(push ,form constructed))
+                   (want (ctx &optional (n -1) (k -1))
+                     `(push (list ,ctx ,n ,k) to-parse)))
+          (labels ((op-at (i) (and (< (+ in i) last) (aref ops (+ in i))))
+                   (opcode-at (i) (let ((o (op-at i))) (and o (ms-op-opcode o))))
+                   (num-at (i) (let ((o (op-at i))) (and o (%ms-op-number o))))
+                   (data-at (i) (let ((o (op-at i))) (and o (ms-op-data o))))
+                   (remaining () (- last in))
+                   (wrap (fragment)
+                     (when (null constructed) (fail))
+                     (setf (first constructed)
+                           (make-ms-node fragment :subs (list (first constructed)))))
+                   (combine (fragment arity)
+                     (when (< (length constructed) arity) (fail))
+                     ;; The constructed stack holds children in reverse, so
+                     ;; take them off and hand them over in source order.
+                     (let ((subs (loop repeat arity collect (pop constructed))))
+                       (push (make-ms-node fragment :subs subs) constructed))))
+            (loop while to-parse
+                  do (when (and constructed (not (ms-node-valid-p (first constructed))))
+                       ;; Bail as soon as anything fails to type: the calculus
+                       ;; has no error channel, so a zero type propagates
+                       ;; silently and would otherwise be discovered only at
+                       ;; the very end, after arbitrary work.
+                       (fail))
+                     (destructuring-bind (ctx n k) (pop to-parse)
+                       (ecase ctx
+                         (:single-bkv-expr
+                          (when (>= in last) (fail))
+                          (let ((op (opcode-at 0)))
+                            (cond
+                              ((= op +op-1+) (incf in) (emit (make-ms-node :just-1)))
+                              ((= op +op-0+) (incf in) (emit (make-ms-node :just-0)))
+                              ;; A bare 33-byte push is a key.
+                              ((eql 33 (%ms-op-push-size ops in))
+                               (let ((key (data-at 0))) (incf in)
+                                 (emit (make-ms-node :pk-k :keys (list key)))))
+                              ;; DUP HASH160 <20> EQUAL VERIFY, reversed.
+                              ((and (>= (remaining) 5)
+                                    (= op +op-verify+)
+                                    (%ms-op-is ops (+ in 1) +op-equal+)
+                                    (%ms-op-is ops (+ in 3) +op-hash160+)
+                                    (%ms-op-is ops (+ in 4) +op-dup+)
+                                    (eql 20 (%ms-op-push-size ops (+ in 2))))
+                               (let ((keyhash (data-at 2)))
+                                 (incf in 5)
+                                 ;; The script committed to a HASH, so the key
+                                 ;; itself is not recoverable. The node carries
+                                 ;; the hash in DATA — which script generation
+                                 ;; uses directly rather than hashing a key —
+                                 ;; and a satisfier looks the key up by it.
+                                 (emit (make-ms-node :pk-h :data keyhash))))
+                              ((and (>= (remaining) 2)
+                                    (= op +ms-op-checksequenceverify+)
+                                    (num-at 1))
+                               (let ((v (num-at 1)))
+                                 (incf in 2)
+                                 (unless (and (>= v 1) (<= v #x7FFFFFFF)) (fail))
+                                 (emit (make-ms-node :older :k v))))
+                              ((and (>= (remaining) 2)
+                                    (= op +ms-op-checklocktimeverify+)
+                                    (num-at 1))
+                               (let ((v (num-at 1)))
+                                 (incf in 2)
+                                 (unless (and (>= v 1) (<= v #x7FFFFFFF)) (fail))
+                                 (emit (make-ms-node :after :k v))))
+                              ;; SIZE <32> EQUAL VERIFY <hashop> <hash> EQUAL.
+                              ((and (>= (remaining) 7)
+                                    (= op +op-equal+)
+                                    (%ms-op-is ops (+ in 3) +op-verify+)
+                                    (%ms-op-is ops (+ in 4) +op-equal+)
+                                    (eql 32 (num-at 5))
+                                    (%ms-op-is ops (+ in 6) +ms-op-size+)
+                                    (let ((h (opcode-at 2)) (sz (%ms-op-push-size ops (+ in 1))))
+                                      (or (and (= h +op-sha256+) (eql sz 32))
+                                          (and (= h +op-ripemd160+) (eql sz 20))
+                                          (and (= h +op-hash256+) (eql sz 32))
+                                          (and (= h +op-hash160+) (eql sz 20)))))
+                               (let ((h (opcode-at 2)) (data (data-at 1)))
+                                 (incf in 7)
+                                 (emit (make-ms-node
+                                        (cond ((= h +op-sha256+) :sha256)
+                                              ((= h +op-ripemd160+) :ripemd160)
+                                              ((= h +op-hash256+) :hash256)
+                                              (t :hash160))
+                                        :data data))))
+                              ;; <k> <key>... <n> CHECKMULTISIG, reversed.
+                              ((and (>= (remaining) 3) (= op +op-checkmultisig+))
+                               (let ((count (num-at 1)))
+                                 (unless (and count (>= (remaining) (+ 3 count))
+                                              (>= count 1)
+                                              (<= count +ms-max-pubkeys-per-multisig+))
+                                   (fail))
+                                 (let ((keys '()))
+                                   (dotimes (j count)
+                                     (unless (eql 33 (%ms-op-push-size ops (+ in 2 j))) (fail))
+                                     (push (data-at (+ 2 j)) keys))
+                                   (let ((threshold (num-at (+ 2 count))))
+                                     (unless (and threshold (>= threshold 1)
+                                                  (<= threshold count))
+                                       (fail))
+                                     (incf in (+ 3 count))
+                                     ;; Collected while walking backwards, so
+                                     ;; PUSH already restored source order.
+                                     (emit (make-ms-node :multi :k threshold
+                                                                :keys keys))))))
+                              ;; Wrappers. SINGLE_BKV_EXPR, not BKV_EXPR: and_v
+                              ;; commutes with these, so c:and_v(X,Y) and
+                              ;; and_v(X,c:Y) compile identically and the and_v
+                              ;; is left outside.
+                              ((= op +op-checksig+)
+                               (incf in) (want :check) (want :single-bkv-expr))
+                              ((= op +op-verify+)
+                               (incf in) (want :verify) (want :single-bkv-expr))
+                              ((= op +op-0notequal+)
+                               (incf in) (want :zero-notequal) (want :single-bkv-expr))
+                              ((and (>= (remaining) 3) (= op +op-equal+) (num-at 1))
+                               (let ((threshold (num-at 1)))
+                                 (unless (>= threshold 1) (fail))
+                                 (incf in 2)
+                                 (want :thresh-w 0 threshold)))
+                              ((= op +op-endif+)
+                               (incf in) (want :endif) (want :bkv-expr))
+                              ;; and_b / or_b take SINGLE_BKV_EXPR for the same
+                              ;; commuting reason.
+                              ((= op +op-booland+)
+                               (incf in) (want :and-b) (want :single-bkv-expr) (want :w-expr))
+                              ((= op +op-boolor+)
+                               (incf in) (want :or-b) (want :single-bkv-expr) (want :w-expr))
+                              (t (fail)))))
+                         (:bkv-expr (want :maybe-and-v) (want :single-bkv-expr))
+                         (:w-expr
+                          (when (>= in last) (fail))
+                          (if (= (opcode-at 0) +op-fromaltstack+)
+                              (progn (incf in) (want :alt))
+                              (want :swap))
+                          (want :bkv-expr))
+                         (:maybe-and-v
+                          ;; None of these can END a well-formed miniscript, so
+                          ;; seeing one means there is no further and_v child.
+                          (when (and (< in last)
+                                     (not (member (opcode-at 0)
+                                                  (list +op-if+ +op-else+ +op-notif+
+                                                        +op-toaltstack+ +op-swap+))))
+                            (want :and-v) (want :bkv-expr)))
+                         (:swap
+                          (when (or (>= in last) (/= (opcode-at 0) +op-swap+)
+                                    (null constructed))
+                            (fail))
+                          (incf in) (wrap :wrap-s))
+                         (:alt
+                          (when (or (>= in last) (/= (opcode-at 0) +op-toaltstack+)
+                                    (null constructed))
+                            (fail))
+                          (incf in) (wrap :wrap-a))
+                         (:check (wrap :wrap-c))
+                         (:dup-if (wrap :wrap-d))
+                         (:verify (wrap :wrap-v))
+                         (:non-zero (wrap :wrap-j))
+                         (:zero-notequal (wrap :wrap-n))
+                         (:and-v (combine :and-v 2))
+                         (:and-b (combine :and-b 2))
+                         (:or-b (combine :or-b 2))
+                         (:or-c (combine :or-c 2))
+                         (:or-d (combine :or-d 2))
+                         (:or-i (combine :or-i 2))
+                         (:andor
+                          (when (< (length constructed) 3) (fail))
+                          (let* ((x (pop constructed))
+                                 (z (pop constructed))
+                                 (y (pop constructed)))
+                            (push (make-ms-node :andor :subs (list x y z)) constructed)))
+                         (:thresh-w
+                          (when (>= in last) (fail))
+                          (if (= (opcode-at 0) +op-add+)
+                              (progn (incf in)
+                                     (want :thresh-w (1+ n) k)
+                                     (want :w-expr))
+                              (progn (want :thresh-e (1+ n) k)
+                                     ;; Every thresh child is 'd', so none can
+                                     ;; be an and_v.
+                                     (want :single-bkv-expr))))
+                         (:thresh-e
+                          (when (or (< k 1) (> k n) (< (length constructed) n)) (fail))
+                          ;; Pop order IS source order here: reading backwards
+                          ;; means the FIRST child was constructed last, so it
+                          ;; is on top. Reversing would put the W-type children
+                          ;; where the B-type one belongs.
+                          (let ((subs (loop repeat n collect (pop constructed))))
+                            (push (make-ms-node :thresh :k k :subs subs)
+                                  constructed)))
+                         (:endif
+                          (when (>= in last) (fail))
+                          (let ((op (opcode-at 0)))
+                            (cond
+                              ((= op +op-else+)
+                               (incf in) (want :endif-else) (want :bkv-expr))
+                              ((= op +op-if+)
+                               (cond
+                                 ((and (>= (remaining) 2) (%ms-op-is ops (+ in 1) +op-dup+))
+                                  (incf in 2) (want :dup-if))
+                                 ((and (>= (remaining) 3)
+                                       (%ms-op-is ops (+ in 1) +op-0notequal+)
+                                       (%ms-op-is ops (+ in 2) +ms-op-size+))
+                                  (incf in 3) (want :non-zero))
+                                 (t (fail))))
+                              ((= op +op-notif+)
+                               (incf in) (want :endif-notif))
+                              (t (fail)))))
+                         (:endif-notif
+                          (when (>= in last) (fail))
+                          (if (= (opcode-at 0) +op-ifdup+)
+                              (progn (incf in) (want :or-d))
+                              (want :or-c))
+                          ;; Both need X to be 'd', so neither can be an and_v.
+                          (want :single-bkv-expr))
+                         (:endif-else
+                          (when (>= in last) (fail))
+                          (let ((op (opcode-at 0)))
+                            (cond
+                              ((= op +op-if+) (incf in) (combine :or-i 2))
+                              ((= op +op-notif+)
+                               (incf in) (want :andor) (want :single-bkv-expr))
+                              (t (fail))))))))
+            (unless (and (= 1 (length constructed))
+                         (= in last)
+                         (ms-node-valid-top-level-p (first constructed)))
+              (return-from ms-from-script nil))
+            (first constructed)))))))
