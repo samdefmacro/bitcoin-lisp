@@ -570,3 +570,127 @@ zero element's POSITION in the witness is exercised too."
     ;; With no preimages at all, below the threshold: no satisfaction.
     (is-false (bitcoin-lisp.validation::ms-satisfy
                node (bitcoin-lisp.validation::make-ms-satisfier)))))
+
+;;; --- Inference: script bytes back to a miniscript -----------------------------
+
+(test every-corpus-script-round-trips-through-inference
+  "Core's own round-trip check, over its own corpus: compile each expression to
+a script, infer a miniscript back out of the bytes, and require the inferred
+node to compile to the SAME script.
+
+It is a strong check because it exercises the decoder against every fragment
+and wrapper combination Core thought worth listing, and because a decoder that
+mis-parses almost always produces a different script rather than none."
+  (let ((checked 0) (bad '()))
+    (dolist (v (%ms-vectors))
+      (let ((expr (gethash "ms" v)))
+        (when (and (%ms-flag v "VALID") (not (%ms-flag v "P2WSH_INVALID")))
+          (let ((node (%ms-try-parse expr)))
+            (when (and node (bitcoin-lisp.validation::ms-node-valid-top-level-p node))
+              (incf checked)
+              (let* ((script (bitcoin-lisp.validation::ms-node-script node))
+                     (back (bitcoin-lisp.validation::ms-from-script script)))
+                (cond
+                  ((null back) (push (format nil "~A: not inferred" expr) bad))
+                  ((not (equalp script (bitcoin-lisp.validation::ms-node-script back)))
+                   (push (format nil "~A: re-compiled differently" expr) bad)))))))))
+    (is (>= checked 60) "expected ~60 inferable vectors, checked ~D" checked)
+    (is (null bad) "~{~A~^~%~}" (reverse bad))))
+
+(test inference-recovers-the-expression-not-just-the-script
+  "For everything except pkh, the inferred node prints back as the original
+expression — which is what makes inference useful for describing an unknown
+script rather than merely validating it."
+  (dolist (expr (list (format nil "and_v(v:pk(~A),older(144))" *ms-desc-key-a*)
+                      (format nil "or_d(pk(~A),and_v(v:pk(~A),older(1008)))"
+                              *ms-desc-key-a* *ms-desc-key-b*)
+                      (format nil "thresh(2,pk(~A),s:pk(~A))"
+                              *ms-desc-key-a* *ms-desc-key-b*)
+                      (format nil "or_i(pk(~A),after(500000))" *ms-desc-key-a*)
+                      ;; Written in its CANONICAL spelling: and_v(X,1) is t:X
+                      ;; and a wrapper run takes one colon, so the un-sugared
+                      ;; form would print back as tv:sha256(...) — correctly.
+                      "tv:sha256(0000000000000000000000000000000000000000000000000000000000000001)"))
+    (let* ((node (bitcoin-lisp.validation::ms-parse expr))
+           (back (bitcoin-lisp.validation::ms-from-script
+                  (bitcoin-lisp.validation::ms-node-script node))))
+      (is-true back "~A was not inferred" expr)
+      (when back
+        (is (string= expr (bitcoin-lisp.validation::ms-node-to-string back))
+            "~A came back as ~A" expr
+            (bitcoin-lisp.validation::ms-node-to-string back)))))
+  ;; Printing and re-parsing preserves the script — for everything except
+  ;; pk_h, whose inferred form names a 20-byte HASH where the grammar wants a
+  ;; key. That is not a gap to paper over: the script genuinely does not
+  ;; contain the key, so no spelling of it could round-trip. pk_h's honest
+  ;; property is the script round-trip, asserted in its own test below.
+  (dolist (expr (list (format nil "and_v(v:pk(~A),older(9))" *ms-desc-key-a*)
+                      (format nil "thresh(2,pk(~A),s:pk(~A))"
+                              *ms-desc-key-a* *ms-desc-key-b*)))
+    (let* ((script (bitcoin-lisp.validation::ms-node-script
+                    (bitcoin-lisp.validation::ms-parse expr)))
+           (back (bitcoin-lisp.validation::ms-from-script script)))
+      (is-true back)
+      (is (equalp script
+                  (bitcoin-lisp.validation::ms-node-script
+                   (bitcoin-lisp.validation::ms-parse
+                    (bitcoin-lisp.validation::ms-node-to-string back))))
+          "~A: printing and re-parsing must preserve the script" expr))))
+
+(test a-pkh-script-yields-the-hash-because-that-is-all-it-holds
+  "pkh commits to HASH160(key), not to the key. Inference can only recover the
+hash, and the node has to say so — a node that pretended the hash was a key
+would hash it again and produce a different script."
+  (let* ((expr (format nil "c:pk_h(~A)" *ms-desc-key-a*))
+         (node (bitcoin-lisp.validation::ms-parse expr))
+         (script (bitcoin-lisp.validation::ms-node-script node))
+         (back (bitcoin-lisp.validation::ms-from-script script)))
+    (is-true back)
+    (is (equalp script (bitcoin-lisp.validation::ms-node-script back))
+        "the inferred node must still compile to the same script")
+    (let ((inner (first (bitcoin-lisp.validation::ms-node-subs back))))
+      (is (eq :pk-h (bitcoin-lisp.validation::ms-node-fragment inner)))
+      (is (equalp (bitcoin-lisp.crypto:hash160
+                   (bitcoin-lisp.crypto:hex-to-bytes *ms-desc-key-a*))
+                  (bitcoin-lisp.validation::ms-node-data inner))
+          "the node carries the hash the script committed to")
+      (is (null (bitcoin-lisp.validation::ms-node-keys inner))
+          "and no key, because the script does not contain one"))))
+
+(test non-miniscript-and-non-minimal-scripts-are-refused
+  "Inference answers a question about ARBITRARY scripts, so a wrong answer is
+worse than none. Three ways to be refused."
+  ;; Not miniscript at all.
+  (is-false (bitcoin-lisp.validation::ms-from-script
+             (coerce #(#x51 #x52 #x93) '(vector (unsigned-byte 8)))))
+  ;; Truncated.
+  (is-false (bitcoin-lisp.validation::ms-from-script
+             (coerce #(#xac) '(vector (unsigned-byte 8)))))
+  ;; A non-minimal push: <1 byte> written as PUSHDATA1. Miniscript's mapping
+  ;; from expression to script is one-to-one, so a second encoding of the same
+  ;; script must not decode.
+  (let ((minimal (bitcoin-lisp.validation::ms-node-script
+                  (bitcoin-lisp.validation::ms-parse
+                   (format nil "c:pk_k(~A)" *ms-desc-key-a*)))))
+    (is-true (bitcoin-lisp.validation::ms-from-script minimal))
+    (let ((padded (concatenate '(vector (unsigned-byte 8))
+                               (vector #x4c 33)
+                               (subseq minimal 1 34)
+                               (vector #xac))))
+      (is-false (bitcoin-lisp.validation::ms-from-script padded)
+                "a PUSHDATA1-encoded 33-byte push is not the minimal form")))
+  ;; OP_CHECKSIG followed by a separate OP_VERIFY, where OP_CHECKSIGVERIFY was
+  ;; the canonical spelling.
+  (is-false (bitcoin-lisp.validation::ms-from-script
+             (concatenate '(vector (unsigned-byte 8))
+                          (vector 33)
+                          (bitcoin-lisp.crypto:hex-to-bytes *ms-desc-key-a*)
+                          (vector #xac #x69 #x51)))))
+
+(test inference-refuses-a-script-whose-types-do-not-check
+  "A script can be shaped like miniscript and still not BE miniscript: the type
+rules are what make satisfaction and non-malleability decidable, so a node that
+does not type is refused rather than returned as a best effort."
+  ;; and_b(1,1): the second argument must be W-type, and OP_1 is B.
+  (is-false (bitcoin-lisp.validation::ms-from-script
+             (coerce #(#x51 #x51 #x9a) '(vector (unsigned-byte 8))))))
