@@ -70,6 +70,27 @@ HTTP Basic; AUTH-HEADER sends a literal Authorization value instead."
                  "Connection: close"))
    json))
 
+(defun %http-post-rpc-raw-content-type (port json content-type auth)
+  "POST JSON with an arbitrary Content-Type, the way a client that is not
+bitcoin-cli sends it."
+  (%http-raw-request
+   port
+   (list "POST / HTTP/1.1"
+         (format nil "Host: 127.0.0.1:~D" port)
+         (format nil "Authorization: ~A" (%basic-auth-header auth))
+         (format nil "Content-Type: ~A" content-type)
+         (format nil "Content-Length: ~D" (length json))
+         "Connection: close")
+   json))
+
+(defun %basic-auth-header-utf8 (credential)
+  "An HTTP Basic header built from CREDENTIAL's UTF-8 BYTES, which is what a
+real client sends. CL-BASE64:STRING-TO-BASE64-STRING would take CHAR-CODE of
+each character instead — latin-1 — and so could not express this test at all."
+  (concatenate 'string "Basic "
+               (cl-base64:usb8-array-to-base64-string
+                (flexi-streams:string-to-octets credential :external-format :utf-8))))
+
 (defun %http-get (port path)
   (%http-raw-request
    port
@@ -4697,8 +4718,9 @@ outermost internal-error clause — carries Core's default V1_LEGACY/null-id
 shape and the 1.x status mapping. These are the paths a broken client hits
 most, so the bytes are pinned here rather than only in the builder.
 The two credential cases also pin the ORDER of the guards (origin -> auth ->
-rate limit -> size -> content-type -> dispatch): each assertion below only
-reaches the refusal it is named for because the ones ahead of it passed."
+rate limit -> size -> dispatch): each assertion below only reaches the refusal
+it is named for because the ones ahead of it passed. There is no longer a
+content-type guard in that chain; see the last case."
   (with-jsonrpc-handler-methods
     ;; Malformed JSON -> -32700, HTTP 500.
     (jsonrpc-handler-check
@@ -4744,9 +4766,13 @@ reaches the refusal it is named for because the ones ahead of it passed."
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 429
      (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Rate limit exceeded")
      :rate-limiter (bitcoin-lisp:make-rate-limiter 0 0))
-    ;; Wrong Content-Type is refused with an empty body (Core answers 415 too).
+    ;; An unusual Content-Type is NOT a refusal. This used to assert 415 with a
+    ;; comment claiming "Core answers 415 too" — Core's HTTPReq_JSONRPC
+    ;; (httprpc.cpp:104-165) never inspects the request Content-Type at all,
+    ;; which is what made the divergence look deliberate for as long as it did.
     (jsonrpc-handler-check
-     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 415 ""
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 200
+     "{\"result\":42,\"error\":null,\"id\":1}"
      :content-type "application/xml")))
 
 (test rpc-json-error-emits-the-legacy-shape
@@ -4816,3 +4842,101 @@ MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT = 4000000 / 240 = 16666."
         (bitcoin-lisp.rpc::extract-partial-merkle-tree 1 (list t) (list h))
       (declare (ignore matched))
       (is (equalp h root) "a single-transaction proof still works"))))
+
+;;; --- Client compatibility: Content-Type and credential bytes ---------------
+
+(test a-non-ascii-rpcpassword-can-actually-authenticate
+  "Core assigns the base64 output straight into a std::string and compares raw
+BYTES (RPCAuthorized, httprpc.cpp:84-102) — no encoding is involved on either
+side. We decoded the header with FLEXI-STREAMS:OCTETS-TO-STRING, whose default
+external format is latin-1, while the configured password came from a config
+file read as UTF-8. For any non-ASCII byte the two disagree, so a correct
+non-ASCII -rpcpassword produced 401 forever, with nothing in the log to say the
+credential had been mangled rather than mistyped."
+  (let ((bitcoin-lisp.rpc::*rpc-user* "üser")
+        (bitcoin-lisp.rpc::*rpc-password* "pässwörd"))
+    (is-true (bitcoin-lisp.rpc::check-auth
+              (%basic-auth-header-utf8 "üser:pässwörd"))
+             "a UTF-8 credential that matches the configuration was refused")
+    ;; A near miss is still refused — the fix must not have made it permissive.
+    (is-false (bitcoin-lisp.rpc::check-auth
+               (%basic-auth-header-utf8 "üser:pässwörX")))
+    ;; And the latin-1 encoding of the same characters is a DIFFERENT byte
+    ;; string, so it must not authorize.
+    (is-false (bitcoin-lisp.rpc::check-auth
+               (%basic-auth-header "üser:pässwörd")))))
+
+(test ascii-credentials-are-unchanged-by-the-byte-comparison
+  "The byte comparison must be a strict generalization: every ASCII case that
+worked before still works, and every near miss is still refused."
+  (let ((bitcoin-lisp.rpc::*rpc-user* "testuser")
+        (bitcoin-lisp.rpc::*rpc-password* "testpass"))
+    (is-true (bitcoin-lisp.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
+    ;; A password containing colons still splits on the FIRST colon.
+    (let ((bitcoin-lisp.rpc::*rpc-password* "a:b:c"))
+      (is-true (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:a:b:c"))))
+    (is-false (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpas")))
+    (is-false (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuse:testpass")))
+    ;; Length differences must not short-circuit: an empty password never matches.
+    (is-false (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:")))))
+
+(test the-rpc-server-does-not-inspect-the-request-content-type
+  "Core's HTTPReq_JSONRPC (httprpc.cpp:104-165) never looks at the request's
+Content-Type — it writes one on the RESPONSE and reads the body as JSON
+regardless. We answered 415 unless the header said application/json or
+text/plain, so a plain `curl -d ...` (which defaults to
+application/x-www-form-urlencoded) and any client that omits the header were
+refused by us and worked against Core.
+
+Driven through the live acceptor, because the whole point is what a real client
+on the wire gets back."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let ((port 19987)
+          (node (make-test-node))
+          (cookie nil))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      (unwind-protect
+           (progn
+             (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
+             (setf cookie (alexandria:read-file-into-string
+                           (merge-pathnames ".cookie" dir)))
+             (let ((json "{\"method\":\"getblockcount\",\"id\":1}"))
+               ;; What `curl -d` actually sends.
+               (let ((r (%http-post-rpc-raw-content-type
+                         port json "application/x-www-form-urlencoded" cookie)))
+                 (is (= 200 (%http-status r))
+                     "curl's default Content-Type was refused: ~A"
+                     (subseq r 0 (min 60 (length r))))
+                 (is (search "\"result\"" r)))
+               ;; No Content-Type header at all.
+               (let ((r (%http-raw-request
+                         port
+                         (list "POST / HTTP/1.1"
+                               (format nil "Host: 127.0.0.1:~D" port)
+                               (format nil "Authorization: ~A"
+                                       (%basic-auth-header cookie))
+                               (format nil "Content-Length: ~D" (length json))
+                               "Connection: close")
+                         json)))
+                 (is (= 200 (%http-status r))
+                     "a request with no Content-Type was refused"))
+               ;; The two that already worked still do.
+               (dolist (ct '("application/json" "text/plain"))
+                 (let ((r (%http-post-rpc-raw-content-type port json ct cookie)))
+                   (is (= 200 (%http-status r)) "~A stopped working" ct)))
+               ;; A body that is not JSON is a PARSE error, not a media-type
+               ;; refusal — the accurate answer, and the one Core gives.
+               (let ((r (%http-post-rpc-raw-content-type
+                         port "not json at all" "application/json" cookie)))
+                 (is (/= 415 (%http-status r)))
+                 (is (search "-32700" r)
+                     "a non-JSON body should report a parse error: ~A"
+                     (subseq r 0 (min 200 (length r))))))
+             ;; Auth is still enforced — removing the media-type gate must not
+             ;; have removed the credential gate with it.
+             (let ((r (%http-post-rpc-raw-content-type
+                       port "{\"method\":\"getblockcount\",\"id\":1}"
+                       "application/x-www-form-urlencoded" "__cookie__:wrong")))
+               (is (= 401 (%http-status r)))))
+        (bitcoin-lisp.rpc:stop-rpc-server)))))
