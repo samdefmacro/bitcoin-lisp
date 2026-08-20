@@ -413,6 +413,14 @@
    #:make-sendheaders-message
    #:make-wtxidrelay-message
    #:+txreconciliation-version+
+   #:+recon-q-precision+
+   #:make-reqrecon-message
+   #:parse-reqrecon-payload
+   #:make-sketch-message
+   #:parse-sketch-payload
+   #:make-reqsketchext-message
+   #:make-reconcildiff-message
+   #:parse-reconcildiff-payload
    #:make-sendtxrcncl-message
    #:parse-sendtxrcncl-payload
    #:parse-feefilter-payload
