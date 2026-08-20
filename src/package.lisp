@@ -493,6 +493,9 @@
    #:block-index-entry-chain-work
    #:block-index-entry-status
    #:block-index-entry-tx-count
+   #:block-index-entry-file
+   #:block-index-entry-data-pos
+   #:block-index-entry-undo-pos
    #:get-block-index-entry
    #:add-block-index-entry
    #:get-block-at-height
