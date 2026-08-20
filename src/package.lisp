@@ -462,6 +462,8 @@
    #:block-store-file-info
    #:rebuild-block-file-info
    #:reindex-block-index
+   #:migrate-blocks-to-flat-files
+   #:count-legacy-blocks
    #:prune-flat-block-file
    #:store-block
    #:get-block

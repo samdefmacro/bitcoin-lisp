@@ -66,6 +66,7 @@
                                (:file "coins-view-migration")
                                (:file "chain")
                                (:file "reindex")
+                               (:file "migrate-blocks")
                                (:file "txindex")
                                (:file "blockfilter")
                                (:file "blockfilterindex")

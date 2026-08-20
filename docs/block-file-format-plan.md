@@ -1,6 +1,11 @@
 # Core Block-File Format (blk/rev + XOR) — Implementation Plan
 
-Date: 2026-07-10. Status: **PLAN — not started. Lowest priority of the four large-gap plans.**
+Date: 2026-07-10. Status (2026-08-20): **P0-P5 BUILT.** P0 undo codec, P1 flat-file
+engine, P2 index integration + dual read, P3 file-granular pruning, P4 migration
+(`migrateblocks` RPC), P5 `reindex-block-index`. Live on testnet4 for NEW blocks
+(`:flat-block-files t`); mainnet stays off until the testnet4 soak and the migration
+have both been exercised there. P4 deliberately deviates from the plan's "one-shot
+offline converter": see below.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev). Researched via 2 agents
 (Core block/undo storage byte-level; our storage architecture).
 
@@ -97,8 +102,35 @@ and drains recursively after each accept (validation.cpp:4988-5155).
 | **P1** | Flat-file engine, standalone: FlatFileSeq (naming, chunked preallocate, truncate-finalize, fsync discipline incl. checked close), record framing (magic+len), undo checksum, XOR AutoFile layer + xor.dat lifecycle; unit tests incl. offset-mod-8 XOR and magic-hunting reader | M |
 | **P2** | Index integration: `block-index-entry` gains file/data-pos/undo-pos + have-data/have-undo bits; headerindex.dat **v3**; per-file `CBlockFileInfo`-equivalent tracking persisted (into headerindex.dat trailer or a small side file); `store-block`/`get-block`/undo rewired behind the unchanged API; **dual-read**: legacy per-block files remain readable | M-L |
 | **P3** | Pruning → file-granular (whole blk+rev pairs; keep monotone pruned-height semantics + `pruneblockchain` RPC; add a blockfilterindex prune-lock equivalent with the 10-block buffer) | M |
-| **P4** | **Migration**: one-shot offline converter (per-block files → blk/rev files + index rewrite), following the reindex-oneshot/supervised-handoff pattern used for the testnet4 de-bloat; testnet4 first, mainnet after soak. Alternative: fresh-sync-only + permanent dual-read (rejected: leaves prod on the old format forever) | M |
+| **P4** | **Migration**: `migrateblocks` RPC — an incremental, resumable, budgeted converter that runs ON the live node instead of offline. See §4.1. | M |
 | **P5** | *(optional)* Full `-reindex`: ImportBlocks scan + unknown-parent multimap + `'R'`-equivalent resume flag; `-loadblock=` | M |
+
+### 4.1 P4 as built, and why it is not the offline converter
+
+The plan called for a one-shot offline converter writing to a fresh directory. What
+shipped is an RPC that converts a budget of blocks in place on the running node, and
+the difference is deliberate:
+
+- **Dual read (P2) removed the reason for a second directory.** The rejected
+  "fresh-sync-only + permanent dual-read" alternative was rejected for leaving prod on
+  the old format forever — but dual read plus an in-place converter gets the format
+  change *without* the copy. An offline converter needs free space for a second copy of
+  the block data; the mainnet node is the pruned one, on the smaller disk.
+- **In-place is safe here because the conversion is per-block and verified.** Each
+  block is written flat, read back through the flat path, and only then is the
+  per-block file unlinked. A crash costs at most one duplicated block. If the read-back
+  fails, the index is put *back* to the per-block file and the walk stops — otherwise
+  dual read would serve the copy that just failed to read back.
+- **It is budgeted and resumable** (`migrateblocks <nblocks> [start_height]` → `{migrated,
+  next_height, remaining}`), so an operator converts a slice, watches the node, and
+  continues. An offline converter is all-or-nothing and takes the node down for its
+  duration.
+- **It walks in height order**, which the offline converter would also have had to do:
+  a flat file prunes whole, and only when its whole height range is below the horizon.
+  Converting in arrival order would leave a pruned node silently unable to reclaim space.
+
+Off-chain blocks keep their per-block files: they have no place in a height-ordered flat
+file, there are few of them, and dual read keeps them served.
 
 MVP boundary: P0-P2 (new format live for new blocks, dual-read for old). P3-P4 complete the
 transition; P5 is the recovery-capability bonus that justifies the whole exercise.
