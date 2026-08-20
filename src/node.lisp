@@ -260,7 +260,7 @@ Kept free of node state so it is directly unit-testable."
 LEVEL can be :debug, :info, :warn, or :error."
   (let ((entries '())
         (min-level (log-level-value level)))
-    (bt:with-lock-held (*log-buffer-lock*)
+    (bt:with-recursive-lock-held (*log-lock*)
       (let ((start (if (< *log-buffer-count* +log-buffer-size+)
                        0
                        *log-buffer-index*)))
@@ -290,7 +290,7 @@ LEVEL can be :debug, :info, :warn, or :error."
 
 (defun clear-logs ()
   "Clear the log buffer."
-  (bt:with-lock-held (*log-buffer-lock*)
+  (bt:with-recursive-lock-held (*log-lock*)
     (dotimes (i +log-buffer-size+)
       (setf (aref *log-buffer* i) nil))
     (setf *log-buffer-index* 0)
@@ -1934,6 +1934,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (network :testnet3)
                         (log-level :info)
                         (log-file nil)
+                        (log-rate-limit t)
                         (console-log t)
                         (max-peers 8)
                         (sync t)
@@ -2109,6 +2110,12 @@ Returns the node instance."
   ;; Periodic peers.dat dump baseline (first dump 15 min from now).
   (setf *last-peers-dump-time* (get-universal-time))
   (setf *current-log-level* log-level)
+  ;; Core DEFAULT_LOGRATELIMIT / -logratelimit (logging.h:65): on by default, so
+  ;; no single log location can fill an operator's disk.
+  (setf *log-rate-limit* (and log-rate-limit t)
+        *log-rate-window-start* (get-universal-time)
+        *log-suppressions-active* nil)
+  (clrhash *log-rate-locations*)
   (log-info "Bitcoin-Lisp Node v0.1.0")
   (log-info "Network: ~A" network)
   (log-info "Data directory: ~A" (node-data-directory *node*))
