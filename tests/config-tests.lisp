@@ -10,16 +10,39 @@
 
 ;;; --- value coercion ---------------------------------------------------------
 
-(test conf-parse-bool-values
-  "Boolean config values follow Core's lenient -flag semantics."
+(test conf-parse-bool-is-core-s-interpretbool-not-a-lenient-reading
+  "Core's InterpretBool is `LocaleIndependentAtoi(v) != 0` (args.cpp:57-62), and
+atoi(\"true\") is 0. So the word `true` is FALSE to Bitcoin Core — as are `yes`,
+`on` and every other non-numeric spelling. We accepted all of them as true and
+treated anything unrecognized as true too, which is the opposite answer on a
+config an operator could reasonably write: `server=true` opened a listener here
+and left it closed on Core.
+
+Only the empty string (a bare -flag) is true without being a number."
   (is-true  (bitcoin-lisp::conf-parse-bool "1"))
-  (is-true  (bitcoin-lisp::conf-parse-bool "true"))
-  (is-true  (bitcoin-lisp::conf-parse-bool "YES"))
   (is-true  (bitcoin-lisp::conf-parse-bool ""))       ; bare -flag
+  (is-true  (bitcoin-lisp::conf-parse-bool "42"))
+  (is-true  (bitcoin-lisp::conf-parse-bool "-1"))     ; non-zero, so true
+  (is-true  (bitcoin-lisp::conf-parse-bool "1abc"))   ; longest integer prefix
   (is-false (bitcoin-lisp::conf-parse-bool "0"))
+  (is-false (bitcoin-lisp::conf-parse-bool "true"))
+  (is-false (bitcoin-lisp::conf-parse-bool "YES"))
+  (is-false (bitcoin-lisp::conf-parse-bool "on"))
   (is-false (bitcoin-lisp::conf-parse-bool "false"))
   (is-false (bitcoin-lisp::conf-parse-bool "no"))
   (is-false (bitcoin-lisp::conf-parse-bool "off")))
+
+(test locale-independent-atoi-matches-core
+  "The integer reading the whole config system rests on (strencodings.h:118-143):
+C-locale atoi with the undefined behaviour removed."
+  (is (= 0   (bitcoin-lisp::locale-independent-atoi "true")))
+  (is (= 1   (bitcoin-lisp::locale-independent-atoi "1abc")))
+  (is (= -5  (bitcoin-lisp::locale-independent-atoi "-5")))
+  (is (= 42  (bitcoin-lisp::locale-independent-atoi "  42  ")))
+  (is (= 7   (bitcoin-lisp::locale-independent-atoi "+7")))
+  (is (= 0   (bitcoin-lisp::locale-independent-atoi "+-3")))  ; Core returns 0
+  (is (= 0   (bitcoin-lisp::locale-independent-atoi "")))
+  (is (= 0   (bitcoin-lisp::locale-independent-atoi "abc"))))
 
 (test conf-parse-int-and-loglevel
   (is (= 2000 (bitcoin-lisp::conf-parse-int "2000")))
@@ -73,6 +96,121 @@
     (let ((a (bitcoin-lisp::parse-bitcoin-conf text nil)))
       (is (string= "8888" (cfg "rpcport" a))))))
 
+(test the-network-section-outranks-the-global-area
+  "Core's precedence is `command line > config network section > config default
+section` (settings.cpp:36). We returned keys in file order and let the first
+ASSOC win, so the GLOBAL value beat the section — the reverse of Core, on every
+key an operator had bothered to scope. Scoping a value is a statement that it
+should win; getting it backwards silently ignores the more specific setting."
+  (let ((text (format nil "rpcport=7777~%[main]~%rpcport=8888~%")))
+    (is (string= "8888" (cfg "rpcport" (bitcoin-lisp::parse-bitcoin-conf text :mainnet)))))
+  ;; And a global key with no section counterpart still applies.
+  (let ((text (format nil "txindex=1~%[main]~%rpcport=8888~%")))
+    (let ((a (bitcoin-lisp::parse-bitcoin-conf text :mainnet)))
+      (is (string= "1" (cfg "txindex" a)))
+      (is (string= "8888" (cfg "rpcport" a))))))
+
+(test an-inline-hash-comment-is-stripped
+  "Core cuts the line at the first # wherever it appears (config.cpp:41-44). We
+only skipped whole-line comments, so `datadir=/srv/btc  # mainnet` yielded a
+datadir whose literal name contained the comment — and, because a missing
+datadir was created rather than refused, that was a silent resync from genesis
+into a junk directory."
+  (let ((a (bitcoin-lisp::parse-bitcoin-conf
+            (format nil "datadir=/srv/btc  # mainnet~%txindex=1 # on~%"))))
+    (is (string= "/srv/btc" (cfg "datadir" a)))
+    (is (string= "1" (cfg "txindex" a)))))
+
+(test a-hash-in-an-rpcpassword-is-refused-rather-than-guessed
+  "The one place Core will not silently strip: it cannot tell a comment from a
+password character, so it refuses the file (config.cpp:58-61). Stripping would
+silently shorten the password; keeping would silently include a comment."
+  (signals bitcoin-lisp::config-parse-error
+    (bitcoin-lisp::parse-bitcoin-conf (format nil "rpcpassword=abc#def~%"))))
+
+(test malformed-config-lines-are-refused-as-core-refuses-them
+  "Core returns false from GetConfigOptions and the node does not start
+(config.cpp:52-72). A config this malformed half-applying is how an operator
+ends up running settings they did not write."
+  ;; A leading dash: the CLI spelling, in a file.
+  (signals bitcoin-lisp::config-parse-error
+    (bitcoin-lisp::parse-bitcoin-conf (format nil "-txindex=1~%")))
+  ;; A non-empty line with no '='.
+  (signals bitcoin-lisp::config-parse-error
+    (bitcoin-lisp::parse-bitcoin-conf (format nil "txindex~%")))
+  ;; Core adds a hint for the negated spelling; assert it reaches the operator.
+  (handler-case (bitcoin-lisp::parse-bitcoin-conf (format nil "notxindex~%"))
+    (bitcoin-lisp::config-parse-error (e)
+      (is (search "notxindex=1"
+                  (bitcoin-lisp::config-parse-error-message e))
+          "the negated-option hint is missing from: ~A"
+          (bitcoin-lisp::config-parse-error-message e)))))
+
+(test a-network-selected-inside-the-config-file-still-scopes-its-own-section
+  "The network was resolved from the CLI alone and the file was then parsed
+against it. So a bitcoin.conf that selects the network itself — the normal way
+to run a node from a config file — left us scoping to the DEFAULT network's
+section and silently dropping the whole block the operator wrote.
+
+Core reads the chain selectors from the global area only (section=\"\",
+args.cpp:825-829) and then scopes, which is what this now does."
+  (let ((text (format nil "testnet4=1~%rpcport=1111~%[testnet4]~%rpcport=48332~%")))
+    (multiple-value-bind (plist merged network)
+        (bitcoin-lisp::args->start-node-plist '() text)
+      (declare (ignore plist))
+      (is (eq :testnet4 network))
+      (is (string= "48332" (cfg "rpcport" merged))
+          "the [testnet4] section was dropped, so its rpcport never applied"))))
+
+(test conflicting-chain-selectors-are-an-error-not-a-silent-priority
+  "Core throws \"Invalid combination of -regtest, -signet, -testnet, -testnet4
+and -chain. Can use at most one.\" (args.cpp:839-841). We resolved the conflict
+by a silent priority order, so `-chain=regtest` on the command line plus a stale
+`testnet=1` in bitcoin.conf started the node on PUBLIC TESTNET3 — a different
+network from either of the two the operator named."
+  (signals bitcoin-lisp::config-parse-error
+    (bitcoin-lisp::resolve-network-from-config
+     '(("chain" . "regtest") ("testnet" . "1"))))
+  (signals bitcoin-lisp::config-parse-error
+    (bitcoin-lisp::resolve-network-from-config '(("regtest" . "1") ("signet" . "1"))))
+  ;; A selector explicitly turned OFF is not a selector.
+  (is (eq :regtest (bitcoin-lisp::resolve-network-from-config
+                    '(("regtest" . "1") ("testnet" . "0")))))
+  ;; And one selector alone still works.
+  (is (eq :testnet4 (bitcoin-lisp::resolve-network-from-config '(("testnet4" . "1"))))))
+
+(test includeconf-merges-a-split-configuration
+  "-includeconf was unimplemented: a split configuration loaded with everything
+at defaults after one warning line, which on a running node is indistinguishable
+from a config file that was read and understood. Core reads the includes into
+the same settings map (config.cpp:162-199), so a section in an included file
+outranks a global in the main one."
+  (let ((main (format nil "includeconf=extra.conf~%rpcport=1111~%"))
+        (extra (format nil "txindex=1~%[main]~%rpcport=8888~%")))
+    (multiple-value-bind (plist merged network)
+        (bitcoin-lisp::args->start-node-plist '("-chain=main") (list main extra))
+      (declare (ignore plist))
+      (is (eq :mainnet network))
+      (is (string= "1" (cfg "txindex" merged))
+          "the included file's global keys did not apply")
+      (is (string= "8888" (cfg "rpcport" merged))
+          "the included file's [main] section must outrank the main file's global"))))
+
+(test each-config-file-gets-its-own-section-scope
+  "Included files are separate STREAMS in Core, so a [section] left open at the
+end of one file does not carry into the next. Concatenating the texts — the
+obvious way to implement includes — would silently attribute the second file's
+global keys to the first file's last section."
+  (let ((main (format nil "[regtest]~%rpcport=1111~%"))
+        (extra (format nil "txindex=1~%")))
+    (multiple-value-bind (plist merged)
+        (bitcoin-lisp::args->start-node-plist '("-chain=main") (list main extra))
+      (declare (ignore plist))
+      (is (string= "1" (cfg "txindex" merged))
+          "the second file's global key was swallowed by the first file's section")
+      (is (null (cfg "rpcport" merged))
+          "a [regtest] key applied while running mainnet"))))
+
 ;;; --- network resolution -----------------------------------------------------
 
 (test resolve-network-precedence
@@ -80,9 +218,8 @@
   (is (eq :mainnet (bitcoin-lisp::resolve-network-from-config '(("chain" . "main")))))
   (is (eq :testnet4 (bitcoin-lisp::resolve-network-from-config '(("testnet4" . "1")))))
   (is (eq :signet (bitcoin-lisp::resolve-network-from-config '(("signet" . "1")))))
-  ;; -regtest flag outranks -chain (Core precedence).
-  (is (eq :regtest (bitcoin-lisp::resolve-network-from-config
-                    '(("chain" . "main") ("regtest" . "1")))))
+  ;; -regtest AND -chain together is now an error, not a silent priority —
+  ;; asserted in CONFLICTING-CHAIN-SELECTORS-ARE-AN-ERROR-NOT-A-SILENT-PRIORITY.
   (signals error (bitcoin-lisp::resolve-network-from-config '(("chain" . "bogus")))))
 
 ;;; --- full plist assembly ----------------------------------------------------
@@ -443,3 +580,76 @@ is dropped along with every clearnet literal."
                                        "-proxy=127.0.0.1:9050")))
       (is-false bitcoin-lisp::*dns-seed-enabled*)
       (is (null (bitcoin-lisp::%reachable-seed-addresses seeds))))))
+
+;;; --- datadir layout and lifecycle (Core chainparamsbase.cpp, args.cpp:789) ---
+
+(defmacro %with-temp-datadir ((var) &body body)
+  `(let ((,var (ensure-directories-exist
+                (merge-pathnames (format nil "bl-datadir-~D/" (get-internal-real-time))
+                                 (uiop:temporary-directory)))))
+     (unwind-protect (progn ,@body)
+       (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
+
+(defun %touch-chainstate (dir)
+  (ensure-directories-exist dir)
+  (with-open-file (s (merge-pathnames "chainstate.dat" dir)
+                     :direction :output :if-exists :supersede)
+    (write-line "x" s))
+  dir)
+
+(test the-datadir-layout-is-core-s
+  "Core: mainnet at the datadir ROOT, testnet3 in testnet3/ (chainparamsbase.cpp
+:40-55). Ours was the inverse for exactly those two — mainnet in mainnet/ and
+testnet3 at the root — so pointing our node at a Core datadir with the default
+network wrote testnet3 data into Core's MAINNET directory, and pointing Core at
+ours found nothing and started a fresh sync. The other three already agreed."
+  (%with-temp-datadir (dir)
+    (is (equal dir (bitcoin-lisp::network-data-path dir :mainnet)))
+    (is (equal (merge-pathnames "testnet3/" dir)
+               (bitcoin-lisp::network-data-path dir :testnet3)))
+    (is (equal (merge-pathnames "testnet4/" dir)
+               (bitcoin-lisp::network-data-path dir :testnet4)))
+    (is (equal (merge-pathnames "signet/" dir)
+               (bitcoin-lisp::network-data-path dir :signet)))
+    (is (equal (merge-pathnames "regtest/" dir)
+               (bitcoin-lisp::network-data-path dir :regtest)))))
+
+(test an-existing-node-keeps-its-legacy-layout-rather-than-losing-its-chain
+  "The deliberate deviation. Adopting Core's layout unconditionally would show
+an EMPTY datadir to a node that has one — on mainnet that is a synced chain
+discarded and IBD restarted from genesis, measured in days. So a datadir that
+already holds a chainstate in the old layout keeps using it (and says so)."
+  (%with-temp-datadir (dir)
+    (%touch-chainstate (merge-pathnames "mainnet/" dir))
+    (is (equal (merge-pathnames "mainnet/" dir)
+               (bitcoin-lisp::network-data-path dir :mainnet))
+        "a synced mainnet node was pointed at an empty Core-layout directory")))
+
+(test a-fresh-datadir-gets-core-s-layout-even-if-an-empty-legacy-dir-exists
+  "The legacy check is for DATA, not for a directory: ensure-directories-exist
+creates empty ones freely, and treating an empty mainnet/ as legacy would pin
+every new node to the old layout forever."
+  (%with-temp-datadir (dir)
+    (ensure-directories-exist (merge-pathnames "mainnet/" dir))
+    (is (equal dir (bitcoin-lisp::network-data-path dir :mainnet)))))
+
+(test core-s-layout-wins-when-both-exist
+  "If the node has already been moved, the Core-layout chainstate is the live
+one and the leftover legacy directory must not pull it back."
+  (%with-temp-datadir (dir)
+    (%touch-chainstate (merge-pathnames "mainnet/" dir))
+    (%touch-chainstate dir)
+    (is (equal dir (bitcoin-lisp::network-data-path dir :mainnet)))))
+
+(test a-named-datadir-that-does-not-exist-is-fatal
+  "Core: CheckDataDirOption (args.cpp:789-793) refuses to start. We created it,
+so a typo and an unmounted volume both presented as an empty datadir — which
+means a silent full re-sync from genesis. Omitting -datadir is still fine: that
+is the default path, and creating it is the intended behaviour."
+  (signals bitcoin-lisp::config-parse-error
+    (bitcoin-lisp::%check-datadir-option '(("datadir" . "/nonexistent/bl-typo-xyz"))))
+  ;; No -datadir at all: not an error.
+  (finishes (bitcoin-lisp::%check-datadir-option '()))
+  (%with-temp-datadir (dir)
+    (finishes (bitcoin-lisp::%check-datadir-option
+               (list (cons "datadir" (namestring dir)))))))
