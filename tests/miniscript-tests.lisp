@@ -342,3 +342,231 @@ descriptor tree, and any of which would have thrown on an unknown kind."
                         (bitcoin-lisp.rpc::out-desc-string parsed))))
       (is-true (bitcoin-lisp.rpc::parse-descriptor checksummed :mainnet
                                                    :require-checksum t)))))
+
+;;; --- Satisfaction -----------------------------------------------------------
+
+(defun %ms-fake-sig (n)
+  "A 72-byte stand-in signature. These tests check WITNESS ASSEMBLY — which
+elements, in which order — not signature validity, so a marker byte is enough
+to tell one key's signature from another's."
+  (let ((s (make-array 72 :element-type '(unsigned-byte 8) :initial-element n)))
+    s))
+
+(defun %ms-satisfier (&key keys preimages older after estimating)
+  "A satisfier that can sign for KEYS (a list of hex strings) and reveal
+PREIMAGES (an alist of (kind . preimage))."
+  (bitcoin-lisp.validation::make-ms-satisfier
+   :estimating estimating
+   :sign-fn (lambda (key)
+              (let ((hex (string-downcase (bitcoin-lisp.crypto:bytes-to-hex key))))
+                (let ((pos (position hex keys :test #'string-equal)))
+                  (and pos (%ms-fake-sig (+ 1 pos))))))
+   :preimage-fn (lambda (kind hash)
+                  (declare (ignore hash))
+                  (cdr (assoc kind preimages)))
+   :check-older-fn (lambda (k) (and older (<= k older)))
+   :check-after-fn (lambda (k) (and after (<= k after)))))
+
+(defun %ms-sat (expr &rest args)
+  (bitcoin-lisp.validation::ms-satisfy
+   (bitcoin-lisp.validation::ms-parse expr)
+   (apply #'%ms-satisfier args)))
+
+(test satisfying-a-timelocked-policy-needs-both-the-key-and-the-time
+  "and_v(v:pk(K),older(144)): the witness is one signature, and it exists only
+once the relative locktime is satisfied. A branch whose timelock has not
+matured is UNSPENDABLE, not merely expensive — so it has to be unavailable
+rather than an option the size comparison might pick."
+  (let ((expr (format nil "and_v(v:pk(~A),older(144))" *ms-desc-key-a*)))
+    ;; Key and time: one signature.
+    (multiple-value-bind (stack malleable)
+        (%ms-sat expr :keys (list *ms-desc-key-a*) :older 144)
+      (is (= 1 (length stack)))
+      (is (equalp (%ms-fake-sig 1) (first stack)))
+      (is-false malleable))
+    ;; Time not yet matured: nothing.
+    (is-false (%ms-sat expr :keys (list *ms-desc-key-a*) :older 143))
+    ;; No key: nothing.
+    (is-false (%ms-sat expr :older 144))))
+
+(test satisfying-an-either-or-policy-picks-the-branch-it-can
+  "or_d(pk(A),and_v(v:pk(B),older(1008))): spend now with A, or later with B.
+Each satisfier gets the branch it holds, and the witness SHAPE differs — the
+recovery branch carries a zero to select it."
+  (let ((expr (format nil "or_d(pk(~A),and_v(v:pk(~A),older(1008)))"
+                      *ms-desc-key-a* *ms-desc-key-b*)))
+    ;; A can spend immediately: just A's signature.
+    (multiple-value-bind (stack malleable) (%ms-sat expr :keys (list *ms-desc-key-a*))
+      (is (= 1 (length stack)))
+      (is (equalp (%ms-fake-sig 1) (first stack)))
+      (is-false malleable))
+    ;; B can only spend after the delay, and must dissatisfy A's branch first.
+    (multiple-value-bind (stack malleable)
+        (%ms-sat expr :keys (list *ms-desc-key-b*) :older 1008)
+      (is (= 2 (length stack)))
+      (is (equalp (%ms-fake-sig 1) (first stack)) "B's signature")
+      (is (equalp #() (second stack)) "and an empty element dissatisfying A")
+      (is-false malleable))
+    ;; B before the delay: neither branch works.
+    (is-false (%ms-sat expr :keys (list *ms-desc-key-b*) :older 100))
+    ;; Nobody: nothing.
+    (is-false (%ms-sat expr :older 1008))))
+
+(test satisfying-a-threshold-picks-exactly-k-branches
+  "thresh(2,pk(A),s:pk(B),s:pk(C)) with all three keys must produce exactly two
+signatures and one dissatisfaction — never three. Over-completeness is
+malleable: a third party could drop one signature and still spend, so a
+satisfier that produced all three would be handing out a rewritable witness."
+  (let* ((key-c "0379be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+         (expr (format nil "thresh(2,pk(~A),s:pk(~A),s:pk(~A))"
+                       *ms-desc-key-a* *ms-desc-key-b* key-c)))
+    (multiple-value-bind (stack malleable)
+        (%ms-sat expr :keys (list *ms-desc-key-a* *ms-desc-key-b* key-c))
+      (is (= 3 (length stack)))
+      (is (= 1 (count-if (lambda (e) (zerop (length e))) stack))
+          "exactly one branch is dissatisfied")
+      (is (= 2 (count-if (lambda (e) (= 72 (length e))) stack))
+          "exactly two signatures, never three")
+      (is-false malleable))
+    ;; Only one key: below the threshold, so no satisfaction at all.
+    (is-false (%ms-sat expr :keys (list *ms-desc-key-a*)))))
+
+(test satisfying-a-hash-preimage-branch
+  "sha256(H) is satisfied by revealing the preimage, and dissatisfied by any
+wrong 32-byte value — which is why the fragment insists on a 32-byte size
+check in the script."
+  (let* ((preimage (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x42))
+         (h (bitcoin-lisp.crypto:sha256 preimage))
+         (expr (format nil "and_v(v:pk(~A),sha256(~A))"
+                       *ms-desc-key-a* (string-downcase (bitcoin-lisp.crypto:bytes-to-hex h)))))
+    (multiple-value-bind (stack malleable)
+        (%ms-sat expr :keys (list *ms-desc-key-a*)
+                      :preimages (list (cons :sha256 preimage)))
+      (is (= 2 (length stack)))
+      (is (equalp preimage (first stack)))
+      (is (equalp (%ms-fake-sig 1) (second stack)))
+      (is-false malleable))
+    ;; Without the preimage there is no spend, even holding the key.
+    (is-false (%ms-sat expr :keys (list *ms-desc-key-a*)))))
+
+(test an-unsigned-alternative-makes-a-solution-malleable
+  "The rule that looks backwards until you read it as the attacker would: when
+one option needs a signature and another does not, the satisfier takes the
+UNSIGNED one — because it is available to anybody, so a signed solution could
+always be replaced by it. or_i(pk(A),older(1)) is exactly that shape once the
+timelock has matured."
+  (let ((expr (format nil "or_i(pk(~A),older(1))" *ms-desc-key-a*)))
+    ;; With the key AND the matured timelock, the timelock branch wins: it is
+    ;; smaller and needs no signature.
+    (multiple-value-bind (stack malleable) (%ms-sat expr :keys (list *ms-desc-key-a*) :older 1)
+      (declare (ignore malleable))
+      (is-true stack)
+      (is (= 1 (length stack)))
+      (is (equalp #() (first stack)) "the OR_I selector for the second branch"))
+    ;; Before the timelock, only the signed branch exists.
+    (multiple-value-bind (stack) (%ms-sat expr :keys (list *ms-desc-key-a*) :older 0)
+      (is (= 2 (length stack)))
+      (is (equalp (%ms-fake-sig 1) (first stack))))))
+
+(test estimation-yields-a-witness-size-without-the-signatures
+  "Core's MAYBE availability: a wallet has to size a transaction before it
+signs it, so an unavailable key produces a dummy of the right length rather
+than nothing. The estimate must not be optimistic, which is why the choice
+operator prefers the LARGER of two MAYBEs."
+  (let ((expr (format nil "and_v(v:pk(~A),older(144))" *ms-desc-key-a*)))
+    ;; No keys at all, but estimating: a stack of the right shape.
+    (multiple-value-bind (stack) (%ms-sat expr :older 144 :estimating t)
+      (is-true stack)
+      (is (= 1 (length stack)))
+      (is (= 72 (length (first stack))) "a dummy signature of realistic size"))
+    ;; Not estimating, no keys: nothing at all.
+    (is-false (%ms-sat expr :older 144))))
+
+(defun %ms-p2wsh-spk (witness-script)
+  (concatenate '(vector (unsigned-byte 8))
+               (vector 0 32) (bitcoin-lisp.crypto:sha256 witness-script)))
+
+(defun %ms-verify-p2wsh (witness-script witness amount)
+  "Run the node's real script verification over a P2WSH spend whose witness is
+WITNESS plus the witness script. Exactly the shape a spending transaction has."
+  ;; A comma-separated STRING, not a list. Passing a list silently enables
+  ;; NOTHING, and then the witness path is never taken: the scriptPubKey runs
+  ;; as a bare script, leaves its 32-byte program on the stack, and every
+  ;; witness "verifies" -- including an empty one. That is how the first draft
+  ;; of this test passed while checking nothing at all.
+  (bitcoin-lisp.coalton.interop:set-script-flags "P2SH,WITNESS,CLEANSTACK,MINIMALDATA")
+  (unwind-protect
+       (bitcoin-lisp.coalton.interop:verify-script
+        (make-array 0 :element-type '(unsigned-byte 8))
+        (%ms-p2wsh-spk witness-script)
+        :witness (append witness (list witness-script))
+        :amount amount)
+    (bitcoin-lisp.coalton.interop:set-script-flags nil)))
+
+(test a-satisfied-policy-actually-verifies-as-a-p2wsh-spend
+  "The end-to-end claim, checked by the node's own script verification rather
+than by comparing witness elements to what the satisfier was expected to emit:
+parse the policy, generate the script, derive the P2WSH commitment, satisfy it,
+and spend.
+
+This is what catches a witness in the wrong ORDER, which comparing elements
+cannot — and it did: the first draft of MS-SATISFY reversed the stack, and
+every element-by-element assertion still passed."
+  (let* ((p1 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (p2 (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2))
+         (h1 (string-downcase (bitcoin-lisp.crypto:bytes-to-hex
+                               (bitcoin-lisp.crypto:sha256 p1))))
+         (h2 (string-downcase (bitcoin-lisp.crypto:bytes-to-hex
+                               (bitcoin-lisp.crypto:sha256 p2))))
+         (node (bitcoin-lisp.validation::ms-parse
+                (format nil "and_v(v:sha256(~A),sha256(~A))" h1 h2)))
+         (script (bitcoin-lisp.validation::ms-node-script node))
+         (sat (bitcoin-lisp.validation::make-ms-satisfier
+               :preimage-fn (lambda (kind hash)
+                              (declare (ignore kind))
+                              (cond ((equalp hash (bitcoin-lisp.crypto:sha256 p1)) p1)
+                                    ((equalp hash (bitcoin-lisp.crypto:sha256 p2)) p2)))))
+         (witness (bitcoin-lisp.validation::ms-satisfy node sat)))
+    (is (= 2 (length witness)))
+    (is-true (%ms-verify-p2wsh script witness 100000)
+             "the satisfaction the satisfier produced must actually spend")
+    ;; The order is load-bearing: swapping the two preimages must fail.
+    (is-false (%ms-verify-p2wsh script (reverse witness) 100000)
+              "a reversed witness must NOT verify — that is what makes the
+               forward case meaningful")
+    ;; A wrong preimage fails.
+    (is-false (%ms-verify-p2wsh
+               script
+               (list (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)
+                     (second witness))
+               100000))
+    ;; A short witness fails.
+    (is-false (%ms-verify-p2wsh script (list (first witness)) 100000))))
+
+(test a-threshold-policy-verifies-as-a-p2wsh-spend
+  "The same end-to-end check on a shape with a dissatisfied branch, so the
+zero element's POSITION in the witness is exercised too."
+  (let* ((pres (loop for i from 1 to 3
+                     collect (make-array 32 :element-type '(unsigned-byte 8)
+                                            :initial-element i)))
+         (hashes (mapcar (lambda (p) (bitcoin-lisp.crypto:sha256 p)) pres))
+         (expr (format nil "thresh(2,sha256(~A),s:sha256(~A),s:sha256(~A))"
+                       (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (first hashes)))
+                       (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (second hashes)))
+                       (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (third hashes)))))
+         (node (bitcoin-lisp.validation::ms-parse expr))
+         (script (bitcoin-lisp.validation::ms-node-script node))
+         ;; Only two of the three preimages are known, which is exactly the
+         ;; threshold — so the satisfier must dissatisfy the third.
+         (sat (bitcoin-lisp.validation::make-ms-satisfier
+               :preimage-fn (lambda (kind hash)
+                              (declare (ignore kind))
+                              (cond ((equalp hash (first hashes)) (first pres))
+                                    ((equalp hash (second hashes)) (second pres))))))
+         (witness (bitcoin-lisp.validation::ms-satisfy node sat)))
+    (is-true (bitcoin-lisp.validation::ms-node-valid-top-level-p node))
+    (is (= 3 (length witness)))
+    (is-true (%ms-verify-p2wsh script witness 100000))
+    ;; With no preimages at all, below the threshold: no satisfaction.
+    (is-false (bitcoin-lisp.validation::ms-satisfy
+               node (bitcoin-lisp.validation::make-ms-satisfier)))))

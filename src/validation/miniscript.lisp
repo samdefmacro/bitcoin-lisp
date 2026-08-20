@@ -721,3 +721,320 @@ run of wrappers needs only one colon."
                             (loop for i from 0 below (length subs) collect (sub i))))
            (t (error "cannot render miniscript fragment ~S"
                      (ms-node-fragment node)))))))))
+
+;;;; --- Satisfaction (miniscript.h:1242-1440, miniscript.cpp:298-366) -------
+;;;;
+;;;; Every node yields a PAIR: the best way to satisfy it and the best way to
+;;;; dissatisfy it, each a witness stack. Combinators build theirs from their
+;;;; children's, and the two operators below do all the choosing — which is why
+;;;; miniscript can promise a non-malleable witness rather than hoping for one.
+;;;;
+;;;; Stacks are built INNERMOST-FIRST and reversed at the end: `a + b' means
+;;;; a's elements followed by b's in Core's representation, which is the order
+;;;; the script pops them, i.e. the reverse of the witness order.
+
+(defconstant +ms-availability-no+ 0 "No such stack exists.")
+(defconstant +ms-availability-yes+ 1 "The stack exists and is fully known.")
+(defconstant +ms-availability-maybe+ 2
+  "The stack's shape is known but a key or preimage is not available yet — used
+for witness-size estimation, where dummy values stand in.")
+
+(defstruct (ms-stack (:constructor %make-ms-stack))
+  "One candidate witness stack (Core InputStack)."
+  (available +ms-availability-yes+ :type (integer 0 2))
+  ;; Whether this stack contains a signature. The satisfier must never trade a
+  ;; signed solution for an unsigned one, because an unsigned one is by
+  ;; definition available to anybody.
+  (has-sig nil :type boolean)
+  ;; Whether a third party can turn this into an equally valid other stack.
+  (malleable nil :type boolean)
+  ;; Known to be unnecessary for satisfaction; sanity checking only.
+  (non-canon nil :type boolean)
+  (size 0 :type integer)
+  (elements '() :type list))
+
+(defun ms-stack-invalid ()
+  (%make-ms-stack :available +ms-availability-no+
+                  :size most-positive-fixnum))
+
+(defun ms-stack-empty () (%make-ms-stack))
+
+(defun ms-stack-of (bytes)
+  "A one-element stack. Core counts the element plus its length byte."
+  (%make-ms-stack :size (1+ (length bytes)) :elements (list bytes)))
+
+(defun ms-stack-zero ()
+  "A single zero-length element, which the interpreter reads as 0."
+  (ms-stack-of (make-array 0 :element-type '(unsigned-byte 8))))
+
+(defun ms-stack-one ()
+  (ms-stack-of (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1)))
+
+(defun ms-stack-zero32 ()
+  "Thirty-two zero bytes: the canonical wrong preimage for a hash fragment."
+  (ms-stack-of (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)))
+
+(defun ms-stack-available-p (s) (/= (ms-stack-available s) +ms-availability-no+))
+
+(defun ms-stack-set-available (s avail)
+  "Core InputStack::SetAvailable. Marking a stack unavailable ERASES it — the
+elements, the signature flag, everything — so a later concatenation cannot
+resurrect half of it."
+  (setf (ms-stack-available s) avail)
+  (when (= avail +ms-availability-no+)
+    (setf (ms-stack-elements s) '()
+          (ms-stack-size s) most-positive-fixnum
+          (ms-stack-has-sig s) nil
+          (ms-stack-malleable s) nil
+          (ms-stack-non-canon s) nil))
+  s)
+
+(defun ms-stack+ (a b)
+  "Core operator+: concatenate two stacks. Unavailable is contagious."
+  (let ((r (%make-ms-stack
+            :available (ms-stack-available a)
+            :has-sig (or (ms-stack-has-sig a) (ms-stack-has-sig b))
+            :malleable (or (ms-stack-malleable a) (ms-stack-malleable b))
+            :non-canon (or (ms-stack-non-canon a) (ms-stack-non-canon b))
+            :size (ms-stack-size a)
+            :elements (append (ms-stack-elements a) (ms-stack-elements b)))))
+    (when (and (ms-stack-available-p a) (ms-stack-available-p b))
+      (incf (ms-stack-size r) (ms-stack-size b)))
+    (cond ((or (not (ms-stack-available-p a)) (not (ms-stack-available-p b)))
+           (ms-stack-set-available r +ms-availability-no+))
+          ((or (= (ms-stack-available a) +ms-availability-maybe+)
+               (= (ms-stack-available b) +ms-availability-maybe+))
+           (ms-stack-set-available r +ms-availability-maybe+))
+          (t r))))
+
+(defun ms-stack-or (a b)
+  "Core operator|: choose between two candidate stacks.
+
+The preference order is the heart of the malleability guarantee, and its first
+rule is the surprising one: if exactly one option carries a signature, take the
+one WITHOUT it. That looks backwards until you read it as the attacker would —
+an unsigned solution is available to anybody, so a solution that needs a
+signature can always be replaced by it, and pretending otherwise would hide the
+malleability rather than remove it."
+  (cond
+    ((not (ms-stack-available-p a)) b)
+    ((not (ms-stack-available-p b)) a)
+    ((and (not (ms-stack-has-sig a)) (ms-stack-has-sig b)) a)
+    ((and (not (ms-stack-has-sig b)) (ms-stack-has-sig a)) b)
+    (t
+     (when (and (not (ms-stack-has-sig a)) (not (ms-stack-has-sig b)))
+       ;; Neither needs a signature, so either can be swapped for the other.
+       (setf (ms-stack-malleable a) t
+             (ms-stack-malleable b) t))
+     (cond
+       ((and (ms-stack-has-sig a) (ms-stack-has-sig b)
+             (ms-stack-malleable b) (not (ms-stack-malleable a))) a)
+       ((and (ms-stack-has-sig a) (ms-stack-has-sig b)
+             (ms-stack-malleable a) (not (ms-stack-malleable b))) b)
+       ;; Otherwise the smaller of two YESes, the larger of two MAYBEs (a
+       ;; MAYBE is a size ESTIMATE, and an estimate must not be optimistic),
+       ;; and YES over MAYBE.
+       ((and (= (ms-stack-available a) +ms-availability-yes+)
+             (= (ms-stack-available b) +ms-availability-yes+))
+        (if (<= (ms-stack-size a) (ms-stack-size b)) a b))
+       ((and (= (ms-stack-available a) +ms-availability-maybe+)
+             (= (ms-stack-available b) +ms-availability-maybe+))
+        (if (>= (ms-stack-size a) (ms-stack-size b)) a b))
+       ((= (ms-stack-available a) +ms-availability-yes+) a)
+       (t b)))))
+
+(defun %ms-mark (s &key malleable non-canon with-sig)
+  (when malleable (setf (ms-stack-malleable s) t))
+  (when non-canon (setf (ms-stack-non-canon s) t))
+  (when with-sig (setf (ms-stack-has-sig s) t))
+  s)
+
+;;;; The satisfier's context: what the caller can supply.
+
+(defstruct ms-satisfier
+  "What a satisfier can produce, and what it knows about the spend (Core's Ctx).
+
+SIGN-FN is called with a key and returns its signature bytes, or NIL. The
+PREIMAGE-FN family answers the four hash fragments. CHECK-OLDER-FN and
+CHECK-AFTER-FN say whether a relative or absolute locktime is already satisfied
+by the transaction being built — a branch whose timelock has not matured is not
+merely expensive, it is unspendable, so Core makes it INVALID rather than
+letting the size comparison pick it."
+  (sign-fn nil)
+  (preimage-fn nil)
+  (check-older-fn nil)
+  (check-after-fn nil)
+  ;; When true, an unavailable key or preimage yields a MAYBE stack with dummy
+  ;; contents instead of nothing — which is how Core estimates a witness size
+  ;; before the signatures exist.
+  (estimating nil :type boolean))
+
+(defconstant +ms-dummy-sig-size+ 72
+  "Size Core assumes for a not-yet-made signature when estimating.")
+
+(defun %ms-sign (sat key)
+  "Returns (values bytes availability)."
+  (let ((sig (and (ms-satisfier-sign-fn sat)
+                  (funcall (ms-satisfier-sign-fn sat) key))))
+    (cond (sig (values sig +ms-availability-yes+))
+          ((ms-satisfier-estimating sat)
+           (values (make-array +ms-dummy-sig-size+ :element-type '(unsigned-byte 8))
+                   +ms-availability-maybe+))
+          (t (values (make-array 0 :element-type '(unsigned-byte 8))
+                     +ms-availability-no+)))))
+
+(defun %ms-preimage (sat kind hash)
+  (let ((pre (and (ms-satisfier-preimage-fn sat)
+                  (funcall (ms-satisfier-preimage-fn sat) kind hash))))
+    (cond (pre (values pre +ms-availability-yes+))
+          ((ms-satisfier-estimating sat)
+           (values (make-array 32 :element-type '(unsigned-byte 8))
+                   +ms-availability-maybe+))
+          (t (values (make-array 0 :element-type '(unsigned-byte 8))
+                     +ms-availability-no+)))))
+
+(defun %ms-sig-stack (sat key)
+  (multiple-value-bind (sig avail) (%ms-sign sat key)
+    (ms-stack-set-available (%ms-mark (ms-stack-of sig) :with-sig t) avail)))
+
+(defun %ms-preimage-stack (sat kind hash)
+  (multiple-value-bind (pre avail) (%ms-preimage sat kind hash)
+    (ms-stack-set-available (ms-stack-of pre) avail)))
+
+(defun ms-produce-input (node sat &optional (key-fn #'%ms-identity-key))
+  "Return (values satisfaction dissatisfaction) for NODE (Core ProduceInput)."
+  (let ((subs (mapcar (lambda (s)
+                        (multiple-value-list (ms-produce-input s sat key-fn)))
+                      (ms-node-subs node))))
+    (flet ((xsat () (first (first subs)))   (xnsat () (second (first subs)))
+           (ysat () (first (second subs)))  (ynsat () (second (second subs)))
+           (zsat () (first (third subs)))   (znsat () (second (third subs))))
+      (macrolet ((res (sat-form nsat-form) `(values ,sat-form ,nsat-form)))
+        (ecase (ms-node-fragment node)
+          (:just-0 (res (ms-stack-invalid) (ms-stack-empty)))
+          (:just-1 (res (ms-stack-empty) (ms-stack-invalid)))
+          (:pk-k (res (%ms-sig-stack sat (first (ms-node-keys node)))
+                      (ms-stack-zero)))
+          (:pk-h
+           ;; The key itself is on the stack under the signature, because the
+           ;; script only committed to its hash.
+           (let ((key (ms-stack-of (funcall key-fn (first (ms-node-keys node))))))
+             (res (ms-stack+ (%ms-sig-stack sat (first (ms-node-keys node))) key)
+                  (ms-stack+ (ms-stack-zero) key))))
+          (:older (res (if (and (ms-satisfier-check-older-fn sat)
+                                (funcall (ms-satisfier-check-older-fn sat) (ms-node-k node)))
+                           (ms-stack-empty)
+                           (ms-stack-invalid))
+                       (ms-stack-invalid)))
+          (:after (res (if (and (ms-satisfier-check-after-fn sat)
+                                (funcall (ms-satisfier-check-after-fn sat) (ms-node-k node)))
+                           (ms-stack-empty)
+                           (ms-stack-invalid))
+                       (ms-stack-invalid)))
+          ((:sha256 :ripemd160 :hash256 :hash160)
+           (res (%ms-preimage-stack sat (ms-node-fragment node) (ms-node-data node))
+                (ms-stack-zero32)))
+          ;; The four transparent wrappers change the script, not the witness.
+          ((:wrap-a :wrap-s :wrap-c :wrap-n) (res (xsat) (xnsat)))
+          (:wrap-d (res (ms-stack+ (xsat) (ms-stack-one)) (ms-stack-zero)))
+          (:wrap-v (res (xsat) (ms-stack-invalid)))
+          (:wrap-j
+           ;; Conservative: if the sub is dissatisfiable without a signature at
+           ;; all, assume a nonzero-top dissatisfaction also exists and call
+           ;; ours malleable. The dissatisfaction logic does not track
+           ;; nonzeroness, so this cannot be decided; Core assumes the worse.
+           (res (xsat)
+                (%ms-mark (ms-stack-zero)
+                          :malleable (and (ms-stack-available-p (xnsat))
+                                          (not (ms-stack-has-sig (xnsat)))))))
+          (:and-v (res (ms-stack+ (ysat) (xsat))
+                       (%ms-mark (ms-stack+ (ynsat) (xsat)) :non-canon t)))
+          (:and-b (res (ms-stack+ (ysat) (xsat))
+                       (ms-stack-or
+                        (ms-stack-or (ms-stack+ (ynsat) (xnsat))
+                                     (%ms-mark (ms-stack+ (ysat) (xnsat))
+                                               :malleable t :non-canon t))
+                        (%ms-mark (ms-stack+ (ynsat) (xsat))
+                                  :malleable t :non-canon t))))
+          (:or-b (res (ms-stack-or
+                       (ms-stack-or (ms-stack+ (ynsat) (xsat))
+                                    (ms-stack+ (ysat) (xnsat)))
+                       ;; Satisfying BOTH is overcomplete: an attacker can turn
+                       ;; either half into a dissatisfaction and still spend.
+                       (%ms-mark (ms-stack+ (ysat) (xsat))
+                                 :malleable t :non-canon t))
+                      (ms-stack+ (ynsat) (xnsat))))
+          (:or-c (res (ms-stack-or (xsat) (ms-stack+ (ysat) (xnsat)))
+                      (ms-stack-invalid)))
+          (:or-d (res (ms-stack-or (xsat) (ms-stack+ (ysat) (xnsat)))
+                      (ms-stack+ (ynsat) (xnsat))))
+          (:or-i (res (ms-stack-or (ms-stack+ (xsat) (ms-stack-one))
+                                   (ms-stack+ (ysat) (ms-stack-zero)))
+                      (ms-stack-or (ms-stack+ (xnsat) (ms-stack-one))
+                                   (ms-stack+ (ynsat) (ms-stack-zero)))))
+          (:andor (res (ms-stack-or (ms-stack+ (ysat) (xsat))
+                                    (ms-stack+ (zsat) (xnsat)))
+                       (ms-stack-or (%ms-mark (ms-stack+ (ynsat) (xsat)) :non-canon t)
+                                    (ms-stack+ (znsat) (xnsat)))))
+          (:multi
+           ;; Dynamic programming: SATS[j] is the best stack carrying j valid
+           ;; signatures out of the keys seen so far. SATS[0] starts as one
+           ;; zero because CHECKMULTISIG pops one element too many.
+           (let ((sats (list (ms-stack-zero))))
+             (dolist (key (ms-node-keys node))
+               (let ((sig (%ms-sig-stack sat key))
+                     (next (list (first sats))))
+                 (loop for j from 1 below (length sats)
+                       do (push (ms-stack-or (nth j sats)
+                                             (ms-stack+ (nth (1- j) sats) sig))
+                                next))
+                 (push (ms-stack+ (car (last sats)) sig) next)
+                 (setf sats (nreverse next))))
+             (let ((nsat (ms-stack-zero)))
+               (dotimes (i (ms-node-k node))
+                 (setf nsat (ms-stack+ nsat (ms-stack-zero))))
+               (res (nth (ms-node-k node) sats) nsat))))
+          (:thresh
+           ;; SATS[j] is the best stack satisfying j of the subexpressions seen
+           ;; so far, walking them in REVERSE because the witness is built
+           ;; innermost-first.
+           (let ((sats (list (ms-stack-empty))))
+             (dolist (sub (reverse subs))
+               (let ((s (first sub)) (n (second sub))
+                     (next '()))
+                 (push (ms-stack+ (first sats) n) next)
+                 (loop for j from 1 below (length sats)
+                       do (push (ms-stack-or (ms-stack+ (nth j sats) n)
+                                             (ms-stack+ (nth (1- j) sats) s))
+                                next))
+                 (push (ms-stack+ (car (last sats)) s) next)
+                 (setf sats (nreverse next))))
+             (let ((nsat (ms-stack-invalid)))
+               (loop for i from 0 below (length sats)
+                     do (unless (or (= i 0) (= i (ms-node-k node)))
+                          ;; Any count other than 0 or k is over- or
+                          ;; under-complete: available, but never the right
+                          ;; choice, since the i=0 form always exists.
+                          (%ms-mark (nth i sats) :malleable t :non-canon t))
+                        (unless (= i (ms-node-k node))
+                          (setf nsat (ms-stack-or nsat (nth i sats)))))
+               (res (nth (ms-node-k node) sats) nsat)))))))))
+
+(defun ms-satisfy (node sat &key (key-fn #'%ms-identity-key))
+  "The witness stack that satisfies NODE, or NIL.
+
+The list is in WITNESS order: element 0 is pushed first and ends up at the
+bottom, so the LAST element is what the script's first opcode pops. That is
+already the order the stacks are built in — `a + b' puts a's elements before
+b's, and a combinator's own input goes after its sub-expressions' precisely
+because it runs first and must find its input on top.
+
+Returns (values stack malleable-p). A second value of T means a third party
+could rewrite the witness into another equally valid one; a caller that cares
+about transaction identity should refuse such a solution rather than broadcast
+it."
+  (multiple-value-bind (satisfaction nsat) (ms-produce-input node sat key-fn)
+    (declare (ignore nsat))
+    (when (ms-stack-available-p satisfaction)
+      (values (copy-list (ms-stack-elements satisfaction))
+              (ms-stack-malleable satisfaction)))))
