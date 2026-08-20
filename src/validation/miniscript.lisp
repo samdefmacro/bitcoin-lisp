@@ -654,3 +654,70 @@ MINISCRIPT-PARSE-ERROR when it is not well-formed at all."
                       (%make-ms-node :fragment :multi :k 0 :node-type 0))))
                (t (%ms-fail "unknown miniscript fragment ~S" name)))))
       (%ms-apply-wrappers wrappers node))))
+
+;;;; --- Rendering (miniscript.h:890-995) ------------------------------------
+
+(defun %ms-identity-key-string (key)
+  (if (stringp key) key (string-downcase (bitcoin-lisp.crypto:bytes-to-hex key))))
+
+(defun ms-node-to-string (node &optional (key-fn #'%ms-identity-key-string) wrapped)
+  "The canonical expression text for NODE (Core Node::ToString).
+
+Re-sugars on the way out, exactly as Core does: c:pk_k(K) prints as pk(K),
+and_v(X,1) as t:X, or_i(0,X) as l:X, or_i(X,0) as u:X and andor(X,Y,0) as
+and_n(X,Y). A descriptor's canonical string feeds its checksum and its ID, so
+printing the desugared form instead would give the same policy two identities.
+
+WRAPPED is Core's flag for `my parent is a wrapper': the colon belongs to the
+wrapped node, not to the wrapper, so `a' + `:pk(K)' composes to `a:pk(K)' and a
+run of wrappers needs only one colon."
+  (let ((subs (ms-node-subs node))
+        (prefix (if wrapped ":" "")))
+    (labels ((sub (i &optional w) (ms-node-to-string (nth i subs) key-fn w))
+             (frag (i) (ms-node-fragment (nth i subs)))
+             (key (k) (funcall key-fn k)))
+      (case (ms-node-fragment node)
+        ;; Wrappers: the letter, then the sub rendered as a wrapped node.
+        (:wrap-a (concatenate 'string "a" (sub 0 t)))
+        (:wrap-s (concatenate 'string "s" (sub 0 t)))
+        (:wrap-c (case (frag 0)
+                   (:pk-k (format nil "~Apk(~A)" prefix
+                                  (key (first (ms-node-keys (nth 0 subs))))))
+                   (:pk-h (format nil "~Apkh(~A)" prefix
+                                  (key (first (ms-node-keys (nth 0 subs))))))
+                   (t (concatenate 'string "c" (sub 0 t)))))
+        (:wrap-d (concatenate 'string "d" (sub 0 t)))
+        (:wrap-v (concatenate 'string "v" (sub 0 t)))
+        (:wrap-j (concatenate 'string "j" (sub 0 t)))
+        (:wrap-n (concatenate 'string "n" (sub 0 t)))
+        (t
+         (case (ms-node-fragment node)
+           ;; Sugar that is a wrapper in the source text but a combinator here.
+           (:and-v (if (eq (frag 1) :just-1)
+                       (concatenate 'string "t" (sub 0 t))
+                       (format nil "~Aand_v(~A,~A)" prefix (sub 0) (sub 1))))
+           (:or-i (cond ((eq (frag 0) :just-0) (concatenate 'string "l" (sub 1 t)))
+                        ((eq (frag 1) :just-0) (concatenate 'string "u" (sub 0 t)))
+                        (t (format nil "~Aor_i(~A,~A)" prefix (sub 0) (sub 1)))))
+           (:andor (if (eq (frag 2) :just-0)
+                       (format nil "~Aand_n(~A,~A)" prefix (sub 0) (sub 1))
+                       (format nil "~Aandor(~A,~A,~A)" prefix (sub 0) (sub 1) (sub 2))))
+           (:just-0 (concatenate 'string prefix "0"))
+           (:just-1 (concatenate 'string prefix "1"))
+           (:pk-k (format nil "~Apk_k(~A)" prefix (key (first (ms-node-keys node)))))
+           (:pk-h (format nil "~Apk_h(~A)" prefix (key (first (ms-node-keys node)))))
+           (:older (format nil "~Aolder(~D)" prefix (ms-node-k node)))
+           (:after (format nil "~Aafter(~D)" prefix (ms-node-k node)))
+           ((:sha256 :hash256 :ripemd160 :hash160)
+            (format nil "~A~(~A~)(~A)" prefix (ms-node-fragment node)
+                    (string-downcase (bitcoin-lisp.crypto:bytes-to-hex (ms-node-data node)))))
+           (:and-b (format nil "~Aand_b(~A,~A)" prefix (sub 0) (sub 1)))
+           (:or-b (format nil "~Aor_b(~A,~A)" prefix (sub 0) (sub 1)))
+           (:or-c (format nil "~Aor_c(~A,~A)" prefix (sub 0) (sub 1)))
+           (:or-d (format nil "~Aor_d(~A,~A)" prefix (sub 0) (sub 1)))
+           (:multi (format nil "~Amulti(~D~{,~A~})" prefix (ms-node-k node)
+                           (mapcar #'key (ms-node-keys node))))
+           (:thresh (format nil "~Athresh(~D~{,~A~})" prefix (ms-node-k node)
+                            (loop for i from 0 below (length subs) collect (sub i))))
+           (t (error "cannot render miniscript fragment ~S"
+                     (ms-node-fragment node)))))))))

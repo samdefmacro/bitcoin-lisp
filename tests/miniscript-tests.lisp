@@ -279,3 +279,66 @@ point of miniscript is to know so in advance."
   (signals error (bitcoin-lisp.rpc::parse-descriptor
                   (format nil "wsh(and_v(v:pk(~A),older(0)))" *ms-desc-key-a*)
                   :mainnet)))
+
+(test miniscript-descriptors-round-trip-through-their-canonical-string
+  "A descriptor's canonical string feeds its checksum and its descriptor ID, so
+a policy that printed back as something else would have two identities — and
+getdescriptorinfo would hand out a checksum that its own parser rejects. That
+was not hypothetical: the first cut of this had no renderer at all, and
+getdescriptorinfo failed on the live node with an ECASE fallthrough."
+  (dolist (d (list (format nil "wsh(and_v(v:pk(~A),older(144)))" *ms-desc-key-a*)
+                   (format nil "wsh(or_d(pk(~A),and_v(v:pkh(~A),older(1008))))"
+                           *ms-desc-key-a* *ms-desc-key-b*)
+                   (format nil "wsh(thresh(2,pk(~A),s:pk(~A)))"
+                           *ms-desc-key-a* *ms-desc-key-b*)
+                   (format nil "wsh(or_i(pk(~A),and_v(v:pk(~A),after(500000))))"
+                           *ms-desc-key-a* *ms-desc-key-b*)))
+    (let ((parsed (bitcoin-lisp.rpc::parse-descriptor d :mainnet)))
+      (is (string= d (bitcoin-lisp.rpc::out-desc-string parsed))
+          "~A did not round-trip" d)
+      ;; And the round-tripped string parses to the same script.
+      (is (equalp (bitcoin-lisp.rpc::%out-desc-expand-uncached parsed 0)
+                  (bitcoin-lisp.rpc::%out-desc-expand-uncached
+                   (bitcoin-lisp.rpc::parse-descriptor
+                    (bitcoin-lisp.rpc::out-desc-string parsed) :mainnet)
+                   0))))))
+
+(test miniscript-rendering-re-sugars-and-collapses-wrapper-runs
+  "Core prints the sugared spelling, not the expansion — c:pk_k(K) as pk(K),
+and_v(X,1) as t:X, or_i(0,X) as l:X, or_i(X,0) as u:X, andor(X,Y,0) as
+and_n(X,Y). And a run of wrappers takes ONE colon: `t:v:pk(K)' is canonically
+`tv:pk(K)', because the colon belongs to the wrapped node rather than to each
+wrapper."
+  (flet ((canon (expr)
+           (bitcoin-lisp.validation::ms-node-to-string
+            (bitcoin-lisp.validation::ms-parse expr))))
+    (is (string= (format nil "pk(~A)" *ms-desc-key-a*)
+                 (canon (format nil "c:pk_k(~A)" *ms-desc-key-a*))))
+    (is (string= (format nil "pkh(~A)" *ms-desc-key-a*)
+                 (canon (format nil "c:pk_h(~A)" *ms-desc-key-a*))))
+    (is (string= "t:1" (canon "and_v(1,1)")))
+    (is (string= "l:older(1)" (canon "or_i(0,older(1))")))
+    (is (string= "u:older(1)" (canon "or_i(older(1),0)")))
+    (is (string= "and_n(0,1)" (canon "andor(0,1,0)")))
+    ;; The wrapper run, in both directions.
+    (is (string= (format nil "tv:pk(~A)" *ms-desc-key-a*)
+                 (canon (format nil "t:v:pk(~A)" *ms-desc-key-a*))))
+    (is (string= (format nil "tv:pk(~A)" *ms-desc-key-a*)
+                 (canon (format nil "tv:pk(~A)" *ms-desc-key-a*))))))
+
+(test getdescriptorinfo-handles-a-policy-descriptor
+  "The RPC the live node failed on. It needs the canonical string, its
+checksum, and the ranged/solvable predicates — every one of which walks the
+descriptor tree, and any of which would have thrown on an unknown kind."
+  (let* ((d (format nil "wsh(and_v(v:pk(~A),older(144)))" *ms-desc-key-a*))
+         (parsed (bitcoin-lisp.rpc::parse-descriptor d :mainnet)))
+    (is-false (bitcoin-lisp.rpc::out-desc-ranged-p parsed))
+    (is-true (bitcoin-lisp.rpc::out-desc-solvable-p parsed))
+    (is-false (bitcoin-lisp.rpc::out-desc-has-privkeys-p parsed))
+    (is (= 32 (length (bitcoin-lisp.rpc::descriptor-id parsed))))
+    ;; A checksummed string must parse back, which is what getdescriptorinfo
+    ;; hands the user to paste into importdescriptors.
+    (let ((checksummed (bitcoin-lisp.rpc::descriptor-add-checksum
+                        (bitcoin-lisp.rpc::out-desc-string parsed))))
+      (is-true (bitcoin-lisp.rpc::parse-descriptor checksummed :mainnet
+                                                   :require-checksum t)))))
