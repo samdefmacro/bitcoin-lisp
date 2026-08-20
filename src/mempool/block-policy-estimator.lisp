@@ -474,14 +474,14 @@ single quiet stretch from collapsing it."
   (let ((long (block-policy-estimator-long est)))
     (when (or (<= conf-target 0)
               (> conf-target (tx-confirm-stats-max-confirms long)))
-      (return-from bpe-estimate-smart-fee 0))
+      (return-from bpe-estimate-smart-fee (values 0 conf-target)))
     ;; A 1-block target cannot be estimated: there is no shorter horizon to
     ;; cross-check it against (Core does the same substitution).
     (when (= conf-target 1) (setf conf-target 2))
     (let ((max-usable (bpe-max-usable-estimate est)))
       (when (> conf-target max-usable) (setf conf-target max-usable)))
     (when (<= conf-target 1)
-      (return-from bpe-estimate-smart-fee 0))
+      (return-from bpe-estimate-smart-fee (values 0 conf-target)))
     (let ((median (%bpe-combined-fee est (floor conf-target 2) +half-success-pct+ t)))
       (let ((actual (%bpe-combined-fee est conf-target +success-pct+ t)))
         (when (> actual median) (setf median actual)))
@@ -492,7 +492,13 @@ single quiet stretch from collapsing it."
       (when (or conservative (= median -1d0))
         (let ((cons-est (%bpe-conservative-fee est (* 2 conf-target))))
           (when (> cons-est median) (setf median cons-est))))
-      (if (minusp median) 0 (round median)))))
+      ;; The SECOND value is Core's feeCalc.returnedTarget: the target the
+      ;; answer is actually for, after the 1->2 substitution and the clamp to
+      ;; what the history can justify. estimatesmartfee reports THIS as
+      ;; "blocks", not the number the caller asked for — a caller told
+      ;; "blocks: 1008" when the estimator could only justify 100 has been
+      ;; misinformed about what it is paying for.
+      (values (if (minusp median) 0 (round median)) conf-target))))
 
 ;;;; --- The node-wide instance and its reporting seam ---
 ;;;;
@@ -527,15 +533,28 @@ pass every txid in the block."
     (when est
       (bpe-process-block est height txids))))
 
+(defun highest-target-tracked ()
+  "The furthest conf_target estimatesmartfee will accept — Core
+HighestTargetTracked(FeeEstimateHorizon::LONG_HALFLIFE), which is the long
+horizon's max_confirms (rpc/fees.cpp:70). Bounding by a fixed 1008 instead, as
+we did, accepts targets the estimator provably cannot answer and then reports
+the fabricated fallback for them."
+  (let ((est *block-policy-estimator*))
+    (if est
+        (tx-confirm-stats-max-confirms (block-policy-estimator-long est))
+        1008)))
+
 (defun bpe-smart-fee-sat-per-vb (conf-target &key conservative)
   "estimateSmartFee in satoshis per VBYTE — the unit ESTIMATE-FEE-RATE reports —
-or NIL when the history cannot support an answer."
+or NIL when the history cannot support an answer. The second value is the
+target the answer is FOR (Core feeCalc.returnedTarget), which is not always the
+one asked for."
   (let ((est *block-policy-estimator*))
     (when est
-      (let ((per-kvb (bpe-estimate-smart-fee est conf-target
-                                             :conservative conservative)))
+      (multiple-value-bind (per-kvb returned-target)
+          (bpe-estimate-smart-fee est conf-target :conservative conservative)
         (when (plusp per-kvb)
-          (/ per-kvb 1000))))))
+          (values (/ per-kvb 1000) returned-target))))))
 
 ;;;; --- Persistence (Core CBlockPolicyEstimator::Write / Read) ---
 ;;;;

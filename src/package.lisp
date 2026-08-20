@@ -1034,7 +1034,8 @@
    #:bpe-read-into
    #:*accept-stale-fee-estimates*
    ;; Fee estimation
-   #:estimate-fee-rate))
+   #:estimate-fee-rate
+   #:highest-target-tracked))
 
 (defpackage #:bitcoin-lisp.validation
   (:use #:cl)

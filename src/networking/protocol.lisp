@@ -1782,6 +1782,74 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
       (declare (ignore c))
       nil)))
 
+(defconstant +stale-relay-age-limit+ (* 30 24 60 60)
+  "Core STALE_RELAY_AGE_LIMIT (net_processing.cpp:117): a block NOT on the
+active chain is served only while it is younger than a month. Serving an
+arbitrarily old side-chain block on request is a fingerprinting oracle — it
+tells the asker exactly which forks this node witnessed and kept.")
+
+(defconstant +node-network-limited-min-blocks+ 288
+  "Core NODE_NETWORK_LIMITED_MIN_BLOCKS (net_processing.cpp:154): a
+NODE_NETWORK_LIMITED peer promises the last 288 blocks and nothing more.")
+
+(defun %block-proof-equivalent-time (to-work from-work tip-bits)
+  "Core GetBlockProofEquivalentTime (chain.cpp:136-151): how long the work
+difference between two entries would take at the TIP's difficulty. Signed —
+negative when TO has less work than FROM.
+
+This is the half of the staleness test that a timestamp cannot forge. A header's
+nTime is attacker-influenced within the median-time-past and 2-hour windows, so
+an age test on timestamps alone can be talked out of; the work difference
+cannot be."
+  (let* ((tip-proof (max 1 (bitcoin-lisp.storage:calculate-chain-work tip-bits 0)))
+         (sign (if (> to-work from-work) 1 -1))
+         (r (abs (- to-work from-work)))
+         (spacing bitcoin-lisp::+pow-target-spacing-seconds+))
+    (* sign (floor (* r spacing) tip-proof))))
+
+(defun %block-request-allowed-p (chain-state entry best-header)
+  "Core PeerManagerImpl::BlockRequestAllowed (net_processing.cpp:1953-1960).
+
+A block on the ACTIVE chain is always servable. Anything else is servable only
+while it is recent by BOTH measures — wall-clock age and work-equivalent age —
+because an old side-chain block is a fingerprint, not a service."
+  (let* ((height (bitcoin-lisp.storage:block-index-entry-height entry))
+         (active (bitcoin-lisp.storage:get-block-at-height chain-state height)))
+    (when (and active
+               (equalp (bitcoin-lisp.storage:block-index-entry-hash active)
+                       (bitcoin-lisp.storage:block-index-entry-hash entry)))
+      (return-from %block-request-allowed-p t))
+    (let ((header (bitcoin-lisp.storage:block-index-entry-header entry))
+          (best-hdr (and best-header
+                         (bitcoin-lisp.storage:block-index-entry-header best-header))))
+      (and header best-hdr
+           ;; Core also requires BLOCK_VALID_SCRIPTS; :valid is our equivalent.
+           (eq (bitcoin-lisp.storage:block-index-entry-status entry) :valid)
+           (< (- (bitcoin-lisp.serialization:block-header-timestamp best-hdr)
+                 (bitcoin-lisp.serialization:block-header-timestamp header))
+              +stale-relay-age-limit+)
+           (< (%block-proof-equivalent-time
+               (bitcoin-lisp.storage:block-index-entry-chain-work best-header)
+               (bitcoin-lisp.storage:block-index-entry-chain-work entry)
+               (bitcoin-lisp.serialization:block-header-bits best-hdr))
+              +stale-relay-age-limit+)))))
+
+(defun %below-network-limited-threshold-p (chain-state entry)
+  "T when serving ENTRY would leak our prune height (Core
+net_processing.cpp:2385-2392).
+
+A node advertising NODE_NETWORK_LIMITED without NODE_NETWORK promises the last
+288 blocks. Answering for anything deeper tells the asker how much history this
+node actually kept — which is its prune configuration. Core's two-block buffer
+is kept: without it a race against a tip advance turns a legitimate request
+into a disconnect."
+  (let ((services (local-services)))
+    (and (plusp (logand services bitcoin-lisp.serialization:+node-network-limited+))
+         (zerop (logand services bitcoin-lisp.serialization:+node-network+))
+         (let ((tip-height (bitcoin-lisp.storage::chain-state-best-height chain-state))
+               (height (bitcoin-lisp.storage:block-index-entry-height entry)))
+           (> (- tip-height height) (+ +node-network-limited-min-blocks+ 2))))))
+
 (defconstant +max-blocks-served-per-getdata+ 500
   "Cap on full blocks served from a single getdata message. A well-behaved peer
 requests at most ~16 blocks in flight (and up to 500 after a getblocks inv); this
@@ -1795,10 +1863,19 @@ Blocks are served from BLOCK-STORE — MSG_BLOCK legacy, MSG_WITNESS_BLOCK with
 witness — so the node is a serving peer, not just a leech. A requested block we
 do not have on disk (pruned or unknown) is silently skipped, like Bitcoin Core's
 handling of unavailable blocks."
-  (declare (ignore chain-state))
   (let ((inv-vectors (bitcoin-lisp.serialization:parse-inv-payload payload))
         (blocks-served 0)
-        (not-found '()))
+        (not-found '())
+        ;; Computed at most once per getdata, and only if an off-chain block is
+        ;; actually asked for: BEST-HEADER-ENTRY is an O(index) scan and this is
+        ;; a request path. (Making it O(1) is the deferred m_best_header work.)
+        (best-header :unset))
+    (flet ((best-header ()
+             (when (eq best-header :unset)
+               (setf best-header
+                     (and chain-state
+                          (bitcoin-lisp.storage:best-header-entry chain-state))))
+             best-header))
     (dolist (inv inv-vectors)
       ;; Stop serving a send-paused peer (its outgoing buffer is over the
       ;; cap) — Core breaks out of ProcessGetData on fPauseSend
@@ -1875,20 +1952,46 @@ handling of unavailable blocks."
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
            (when (and block-store (< blocks-served +max-blocks-served-per-getdata+))
-             (let ((block (bitcoin-lisp.storage:get-block block-store hash)))
-               (when block
-                 (incf blocks-served)
-                 (send-message
-                  peer
-                  (bitcoin-lisp.serialization:make-block-message
-                   block
-                   :witness (= inv-type
-                               bitcoin-lisp.serialization:+inv-type-witness-block+))))))))))
+             (let ((entry (and chain-state
+                               (bitcoin-lisp.storage:get-block-index-entry
+                                chain-state hash))))
+               (cond
+                 ;; Unknown to the index: nothing to reason about, and Core's
+                 ;; ProcessGetBlockData returns before any serving.
+                 ((and chain-state (null entry)))
+                 ;; Anti-fingerprinting: an old block off the active chain is
+                 ;; not served at all (Core BlockRequestAllowed).
+                 ((and entry (not (%block-request-allowed-p chain-state entry
+                                                            (best-header))))
+                  (bitcoin-lisp:log-cat
+                   "net" "getdata: ignoring request from ~A for an old block ~
+                          that is not on the main chain"
+                   (peer-address peer)))
+                 ;; Prune-height leak: refuse AND disconnect, as Core does —
+                 ;; a peer left waiting for a block we will never send stalls
+                 ;; instead of re-routing the request.
+                 ((and entry (%below-network-limited-threshold-p chain-state entry))
+                  (bitcoin-lisp:log-cat
+                   "net" "getdata: block request below the NODE_NETWORK_LIMITED ~
+                          threshold from ~A; disconnecting"
+                   (peer-address peer))
+                  (disconnect-peer peer)
+                  (return))
+                 (t
+                  (let ((block (bitcoin-lisp.storage:get-block block-store hash)))
+                    (when block
+                      (incf blocks-served)
+                      (send-message
+                       peer
+                       (bitcoin-lisp.serialization:make-block-message
+                        block
+                        :witness (= inv-type
+                                    bitcoin-lisp.serialization:+inv-type-witness-block+)))))))))))))
     ;; One notfound for every unserved tx request (Core sends notfound for txs
     ;; only, never blocks).
     (when not-found
       (send-message peer (bitcoin-lisp.serialization:make-notfound-message
-                          (nreverse not-found))))))
+                          (nreverse not-found)))))))
 
 (defconstant +max-getcfilters-size+ 1000
   "Max filters per getcfilters request (Core MAX_GETCFILTERS_SIZE).")
