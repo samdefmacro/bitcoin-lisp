@@ -45,30 +45,41 @@ must be skipped, and a 0-length payload."
         (is-true server)
         ;; NB: bind client-result BEFORE spawning the thread (sequential let*),
         ;; so the closure and the assertions share the same binding.
+        ;; 60s, not 10: this drives two real sockets and an EC handshake, and
+        ;; the whole battery runs alongside compilation. At 10s it failed on
+        ;; two of four full runs and passed 3/3 in isolation — a flake in the
+        ;; verification of record, which undermines every result it reports.
+        ;; The timeout is not what the test is about, so give it room.
         (let* ((client-result nil)
                (thread
                  (bt:make-thread
                   (lambda ()
                     (handler-case
                         (let ((transport (bitcoin-lisp.networking::v2-handshake-outbound
-                                          client :timeout 10)))
-                          (when (bitcoin-lisp.networking::v2-transport-p transport)
-                            ;; short-ID message out; long-form + decoy come back.
-                            (bitcoin-lisp.networking::v2-send-message
-                             client transport (%v2t-frame "inv" (%bc-hex "00")))
-                            (multiple-value-bind (cmd payload)
-                                (bitcoin-lisp.networking::v2-receive-message-blocking
-                                 client transport :timeout 10)
-                              (setf client-result (list cmd payload)))))
-                      (error (e) (setf client-result e))))
+                                          client :timeout 60)))
+                          (if (not (bitcoin-lisp.networking::v2-transport-p transport))
+                              ;; Say WHY rather than leaving NIL behind: a
+                              ;; failed handshake and a wrong message were
+                              ;; previously indistinguishable, both surfacing
+                              ;; as "NIL is not equal to verack".
+                              (setf client-result (list :handshake-failed transport))
+                              (progn
+                                ;; short-ID message out; long-form + decoy back.
+                                (bitcoin-lisp.networking::v2-send-message
+                                 client transport (%v2t-frame "inv" (%bc-hex "00")))
+                                (multiple-value-bind (cmd payload)
+                                    (bitcoin-lisp.networking::v2-receive-message-blocking
+                                     client transport :timeout 60)
+                                  (setf client-result (list cmd payload))))))
+                      (error (e) (setf client-result (list :error e)))))
                   :name "v2-initiator")))
-          (let ((transport (bitcoin-lisp.networking::v2-detect-inbound server :timeout 10)))
+          (let ((transport (bitcoin-lisp.networking::v2-detect-inbound server :timeout 60)))
             (is-true (bitcoin-lisp.networking::v2-transport-p transport))
             (when (bitcoin-lisp.networking::v2-transport-p transport)
               ;; Receive the client's short-ID message.
               (multiple-value-bind (cmd payload)
                   (bitcoin-lisp.networking::v2-receive-message-blocking server transport
-                                                               :timeout 10)
+                                                               :timeout 60)
                 (is (equal "inv" cmd))
                 (is (equalp (%bc-hex "00") payload)))
               ;; Send a decoy the client must skip, then a long-form message
@@ -78,7 +89,8 @@ must be skipped, and a 0-length payload."
               (bitcoin-lisp.networking::v2-send-message
                server transport (%v2t-frame "verack" (%bc-buf 0)))))
           (bt:join-thread thread)
-          (is (equal "verack" (first client-result)))
+          (is (equal "verack" (first client-result))
+              "initiator result was ~S" client-result)
           (is (equalp #() (second client-result)))))))
 
 (test v2-transport-disconnects-on-bad-packet
