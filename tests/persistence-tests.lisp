@@ -87,6 +87,250 @@
 
 ;;;; Header Index Persistence Tests
 
+(defun %hi-state (name)
+  "A chain-state on a private directory."
+  (let ((dir (ensure-directories-exist
+              (merge-pathnames (format nil "test-hidx-~A-~D/" name (get-internal-real-time))
+                               (uiop:temporary-directory)))))
+    (values (bitcoin-lisp.storage:init-chain-state dir) dir)))
+
+(defun %hi-add (state hash height &key file data-pos undo-pos (status :valid))
+  (bitcoin-lisp.storage:add-block-index-entry
+   state
+   (bitcoin-lisp.storage:make-block-index-entry
+    :hash (make-array 32 :element-type '(unsigned-byte 8) :initial-element hash)
+    :height height :chain-work (* height 10) :status status
+    :file file :data-pos data-pos :undo-pos undo-pos))
+  (make-array 32 :element-type '(unsigned-byte 8) :initial-element hash))
+
+(test header-index-v3-round-trips-the-flat-file-position
+  "v3 carries where a block's body and undo record live. A NIL position must
+survive as NIL rather than becoming 0, because 0 is a real position -- the
+first record in a file -- and confusing the two would send a reader to the
+wrong offset."
+  (multiple-value-bind (state dir) (%hi-state "v3")
+    (unwind-protect
+         (let ((placed (%hi-add state #x11 1 :file 0 :data-pos 8 :undo-pos 40))
+               (body-only (%hi-add state #x22 2 :file 3 :data-pos 0))
+               (header-only (%hi-add state #x33 3)))
+           (bitcoin-lisp.storage:save-header-index state)
+           (let ((reloaded (bitcoin-lisp.storage:init-chain-state dir)))
+             (is-true (bitcoin-lisp.storage:load-header-index reloaded))
+             (let ((e (bitcoin-lisp.storage:get-block-index-entry reloaded placed)))
+               (is (= 0 (bitcoin-lisp.storage:block-index-entry-file e)))
+               (is (= 8 (bitcoin-lisp.storage:block-index-entry-data-pos e)))
+               (is (= 40 (bitcoin-lisp.storage:block-index-entry-undo-pos e))))
+             ;; Position 0 in file 3, and no undo record at all.
+             (let ((e (bitcoin-lisp.storage:get-block-index-entry reloaded body-only)))
+               (is (= 3 (bitcoin-lisp.storage:block-index-entry-file e)))
+               (is (eql 0 (bitcoin-lisp.storage:block-index-entry-data-pos e)))
+               (is (null (bitcoin-lisp.storage:block-index-entry-undo-pos e))))
+             ;; A header-only entry has no position anywhere.
+             (let ((e (bitcoin-lisp.storage:get-block-index-entry reloaded header-only)))
+               (is (null (bitcoin-lisp.storage:block-index-entry-file e)))
+               (is (null (bitcoin-lisp.storage:block-index-entry-data-pos e)))
+               (is (null (bitcoin-lisp.storage:block-index-entry-undo-pos e))))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
+(test header-index-position-changes-are-not-missed-by-the-delta-log
+  "The delta log writes only entries whose persist key changed, so a position
+appearing or disappearing has to move that key. If it does not, a block's body
+location is written once and never updated -- and after a prune the index would
+still claim the data is there."
+  (multiple-value-bind (state dir) (%hi-state "delta")
+    (unwind-protect
+         (let ((h (%hi-add state #x44 1)))
+           (bitcoin-lisp.storage:save-header-index state)
+           (let ((entry (bitcoin-lisp.storage:get-block-index-entry state h)))
+             ;; Body lands.
+             (setf (bitcoin-lisp.storage:block-index-entry-file entry) 2
+                   (bitcoin-lisp.storage:block-index-entry-data-pos entry) 1234)
+             (is (member entry (bitcoin-lisp.storage::%changed-header-index-entries state))
+                 "gaining a position must mark the entry changed")
+             (bitcoin-lisp.storage:save-header-index state)
+             (is (not (member entry (bitcoin-lisp.storage::%changed-header-index-entries state)))
+                 "and it must be clean once written")
+             ;; Undo record lands.
+             (setf (bitcoin-lisp.storage:block-index-entry-undo-pos entry) 99)
+             (is (member entry (bitcoin-lisp.storage::%changed-header-index-entries state)))
+             (bitcoin-lisp.storage:save-header-index state)
+             ;; Pruned away again.
+             (setf (bitcoin-lisp.storage:block-index-entry-data-pos entry) nil
+                   (bitcoin-lisp.storage:block-index-entry-undo-pos entry) nil)
+             (is (member entry (bitcoin-lisp.storage::%changed-header-index-entries state))
+                 "losing a position must mark the entry changed too")
+             (bitcoin-lisp.storage:save-header-index state)
+             (let ((reloaded (bitcoin-lisp.storage:init-chain-state dir)))
+               (is-true (bitcoin-lisp.storage:load-header-index reloaded))
+               (let ((e (bitcoin-lisp.storage:get-block-index-entry reloaded h)))
+                 (is (null (bitcoin-lisp.storage:block-index-entry-data-pos e)))
+                 (is (null (bitcoin-lisp.storage:block-index-entry-undo-pos e)))))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
+(test header-index-persist-key-still-tracks-everything-it-did-before
+  "Widening the key to hold the position bits meant re-packing height and
+tx-count. Re-check every field the key is supposed to notice, since a silently
+dropped one means a status or tx-count change is never written."
+  (multiple-value-bind (state dir) (%hi-state "key")
+    (unwind-protect
+         (let* ((h (%hi-add state #x55 7 :status :header-valid))
+                (entry (bitcoin-lisp.storage:get-block-index-entry state h))
+                (base (bitcoin-lisp.storage::%entry-persist-key entry)))
+           (macrolet ((changes (&body mutation)
+                        `(let ((before (bitcoin-lisp.storage::%entry-persist-key entry)))
+                           ,@mutation
+                           (is (/= before (bitcoin-lisp.storage::%entry-persist-key entry))))))
+             (changes (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid))
+             (changes (setf (bitcoin-lisp.storage:block-index-entry-status entry) :invalid))
+             (changes (setf (bitcoin-lisp.storage:block-index-entry-height entry) 8))
+             (changes (setf (bitcoin-lisp.storage:block-index-entry-tx-count entry) 3))
+             (changes (setf (bitcoin-lisp.storage:block-index-entry-data-pos entry) 0))
+             (changes (setf (bitcoin-lisp.storage:block-index-entry-undo-pos entry) 0))
+             (changes (setf (bitcoin-lisp.storage:block-index-entry-header entry)
+                            (bitcoin-lisp.serialization:make-block-header))))
+           ;; And the key stays a fixnum, which is why the flush can compute it
+           ;; for every entry on a 963k-entry index.
+           (is (typep (bitcoin-lisp.storage::%entry-persist-key entry) 'fixnum))
+           (is (plusp base)))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
+(defun %write-v2-header-index (path entries)
+  "Emit a v2 header-index file by hand: 185-byte entries, no position fields.
+This is what both live nodes carry today, so the v3 build has to load it."
+  (bitcoin-lisp.storage:save-file-with-crc32-bb
+   path
+   (lambda (bb)
+     (bitcoin-lisp.serialization:bb-write-bytes
+      bb bitcoin-lisp.storage::*header-index-magic*)
+     (bitcoin-lisp.serialization:bb-write-u32-le bb 2)
+     (bitcoin-lisp.serialization:bb-write-u32-le bb (length entries))
+     (dolist (e entries)
+       (destructuring-bind (hash height chain-work status tx-count) e
+         (bitcoin-lisp.serialization:bb-write-bytes bb hash)
+         (bitcoin-lisp.serialization:bb-write-u32-le bb height)
+         (loop repeat 80 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))
+         (bitcoin-lisp.storage::bb-write-chainwork bb chain-work)
+         (bitcoin-lisp.serialization:bb-write-u8
+          bb (ecase status (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3)))
+         (loop repeat 32 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))
+         (bitcoin-lisp.serialization:bb-write-u32-le bb tx-count))))))
+
+(test header-index-v2-files-still-load-and-upgrade-in-place
+  "Both live nodes carry a v2 headerindex.dat -- 963k entries on mainnet -- so
+the v3 build must read one, and an entry without a position must come back
+with NIL rather than 0: those blocks live in the legacy per-block files, and
+claiming they sit at offset 0 of file 0 would send every read to the wrong
+place. Then the next save must write v3 and reload cleanly."
+  (multiple-value-bind (state dir) (%hi-state "v2compat")
+    (unwind-protect
+         (let ((a (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x77))
+               (b (make-array 32 :element-type '(unsigned-byte 8) :initial-element #x88)))
+           (%write-v2-header-index
+            (bitcoin-lisp.storage::header-index-file-path state)
+            (list (list a 1 10 :valid 3)
+                  (list b 2 20 :header-valid 0)))
+           (is-true (bitcoin-lisp.storage:load-header-index state))
+           (let ((ea (bitcoin-lisp.storage:get-block-index-entry state a)))
+             (is (= 1 (bitcoin-lisp.storage:block-index-entry-height ea)))
+             (is (= 3 (bitcoin-lisp.storage:block-index-entry-tx-count ea)))
+             (is (eq :valid (bitcoin-lisp.storage:block-index-entry-status ea)))
+             (is (null (bitcoin-lisp.storage:block-index-entry-file ea))
+                 "a v2 entry has no flat-file position, and NIL is not 0")
+             (is (null (bitcoin-lisp.storage:block-index-entry-data-pos ea)))
+             (is (null (bitcoin-lisp.storage:block-index-entry-undo-pos ea))))
+           ;; A v2 load must leave the index clean, or every start would write a
+           ;; full snapshot and undo the delta-log work of #366.
+           (is (null (bitcoin-lisp.storage::%changed-header-index-entries state)))
+           ;; Now give one entry a position and save; the file becomes v3.
+           (let ((ea (bitcoin-lisp.storage:get-block-index-entry state a)))
+             (setf (bitcoin-lisp.storage:block-index-entry-file ea) 0
+                   (bitcoin-lisp.storage:block-index-entry-data-pos ea) 8))
+           (bitcoin-lisp.storage:save-header-index state :force-full t)
+           (let ((reloaded (bitcoin-lisp.storage:init-chain-state dir)))
+             (is-true (bitcoin-lisp.storage:load-header-index reloaded))
+             (let ((ea (bitcoin-lisp.storage:get-block-index-entry reloaded a))
+                   (eb (bitcoin-lisp.storage:get-block-index-entry reloaded b)))
+               (is (= 0 (bitcoin-lisp.storage:block-index-entry-file ea)))
+               (is (= 8 (bitcoin-lisp.storage:block-index-entry-data-pos ea)))
+               (is (= 3 (bitcoin-lisp.storage:block-index-entry-tx-count ea)))
+               (is (null (bitcoin-lisp.storage:block-index-entry-file eb))
+                   "the untouched entry keeps its absent position"))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
+(defun %v1-delta-bytes (crc entries)
+  "A delta log in the PREVIOUS entry layout: 185-byte entries, no position
+fields, bound to CRC."
+  (let ((bb (bitcoin-lisp.serialization:make-byte-buf))
+        (payload (bitcoin-lisp.serialization:make-byte-buf)))
+    (bitcoin-lisp.serialization:bb-write-bytes
+     bb bitcoin-lisp.storage::*header-index-delta-magic*)
+    (bitcoin-lisp.serialization:bb-write-u32-le bb 1)
+    (bitcoin-lisp.serialization:bb-write-bytes bb crc)
+    (bitcoin-lisp.serialization:bb-write-u32-le payload (length entries))
+    (dolist (e entries)
+      (destructuring-bind (hash height chain-work status tx-count) e
+        (bitcoin-lisp.serialization:bb-write-bytes payload hash)
+        (bitcoin-lisp.serialization:bb-write-u32-le payload height)
+        (loop repeat 80 do (bitcoin-lisp.serialization:bb-write-u8 payload 0))
+        (bitcoin-lisp.storage::bb-write-chainwork payload chain-work)
+        (bitcoin-lisp.serialization:bb-write-u8
+         payload (ecase status (:unknown 0) (:header-valid 1) (:valid 2) (:invalid 3)))
+        (loop repeat 32 do (bitcoin-lisp.serialization:bb-write-u8 payload 0))
+        (bitcoin-lisp.serialization:bb-write-u32-le payload tx-count)))
+    (let ((bytes (bitcoin-lisp.serialization:bb-finish payload)))
+      (bitcoin-lisp.serialization:bb-write-bytes bb bytes)
+      (bitcoin-lisp.serialization:bb-write-bytes
+       bb (bitcoin-lisp.storage:compute-crc32 bytes)))
+    (bitcoin-lisp.serialization:bb-finish bb)))
+
+(test header-index-replays-a-delta-written-in-the-previous-layout
+  "The upgrade hazard, and why it is not solved by discarding. A delta records
+whole entries, and its CRC binds it to the snapshot it extends -- so on the
+first start after an entry-layout change the OLD log is still bound to the
+snapshot still on disk and the CRC check waves it through, at the wrong width.
+
+Discarding it instead would look harmless, since a delta only holds changes
+since the last snapshot. But those are precisely the most recently updated
+statuses, so dropping the log can revert a block from :invalid back to :valid.
+So an old log is replayed at ITS width, and only an unrecognised version is
+thrown away."
+  (multiple-value-bind (state dir) (%hi-state "deltaver")
+    (unwind-protect
+         (let ((h (%hi-add state #x66 1 :status :header-valid)))
+           (bitcoin-lisp.storage:save-header-index state :force-full t)
+           ;; Hand-write a previous-layout delta marking that block :invalid,
+           ;; bound to the snapshot that is on disk right now.
+           (let ((delta (bitcoin-lisp.storage::header-index-delta-path state))
+                 (crc (bitcoin-lisp.storage::%file-trailing-crc
+                       (bitcoin-lisp.storage::header-index-file-path state))))
+             (with-open-file (out delta :direction :output
+                                        :element-type '(unsigned-byte 8)
+                                        :if-exists :supersede
+                                        :if-does-not-exist :create)
+               (write-sequence (%v1-delta-bytes crc (list (list h 1 10 :invalid 0))) out))
+             (let ((reloaded (bitcoin-lisp.storage:init-chain-state dir)))
+               (is-true (bitcoin-lisp.storage:load-header-index reloaded))
+               (let ((e (bitcoin-lisp.storage:get-block-index-entry reloaded h)))
+                 (is (eq :invalid (bitcoin-lisp.storage:block-index-entry-status e))
+                     "the old-layout delta must be replayed, not dropped")
+                 (is (null (bitcoin-lisp.storage:block-index-entry-data-pos e))
+                     "and an entry from it has no position, which is correct")))
+             ;; An unrecognised version IS discarded -- there is no width to
+             ;; frame it with, so misparsing is the only alternative.
+             (let ((bytes (alexandria:read-file-into-byte-vector delta)))
+               (setf (aref bytes 4) 99)
+               (with-open-file (out delta :direction :output
+                                          :element-type '(unsigned-byte 8)
+                                          :if-exists :supersede)
+                 (write-sequence bytes out)))
+             (let ((reloaded (bitcoin-lisp.storage:init-chain-state dir)))
+               (is-true (bitcoin-lisp.storage:load-header-index reloaded))
+               (let ((e (bitcoin-lisp.storage:get-block-index-entry reloaded h)))
+                 (is (eq :header-valid (bitcoin-lisp.storage:block-index-entry-status e))
+                     "an unknown layout falls back to the snapshot's state"))
+               (is-false (probe-file delta) "and the unreadable log is removed"))))
+      (uiop:delete-directory-tree dir :validate t :if-does-not-exist :ignore))))
+
 (test header-index-save-load-round-trip
   "Saving and loading header index should preserve entries and linkage."
   (let* ((base-path (ensure-directories-exist
@@ -376,7 +620,7 @@ index and UTXO cache and flush over the other's files, so the damage is not
 (test header-index-delta-avoids-rewriting-the-snapshot
   "A flush must write only what CHANGED. The whole index used to be rewritten
 every time — 178 MB per flush on mainnet, measured 2026-08-19, to persist about
-one 185-byte entry."
+one entry."
   (multiple-value-bind (cs) (%hidx-fixture "delta")
     (let ((h1 (%hidx-add cs 1 :valid))
           (h2 (%hidx-add cs 2 :header-valid))
@@ -396,8 +640,11 @@ one 185-byte entry."
               :valid)
         (bitcoin-lisp.storage:save-header-index cs)
         (is (= snap-size (%hidx-size snap)) "the snapshot must not be rewritten")
-        ;; header(12) + count(4) + one 185-byte entry + crc(4).
-        (is (= 205 (%hidx-size delta)))
+        ;; header(12) + count(4) + one entry + crc(4). Derived from the
+        ;; constant rather than written out, so an entry-layout change fails
+        ;; here only if the FRAMING is wrong, not merely because the entry grew.
+        (is (= (+ 12 4 bitcoin-lisp.storage::+header-index-entry-bytes+ 4)
+               (%hidx-size delta)))
         ;; And it reloads to the mutated state.
         (let ((cs2 (bitcoin-lisp.storage:init-chain-state
                     (bitcoin-lisp.storage::chain-state-base-path cs))))

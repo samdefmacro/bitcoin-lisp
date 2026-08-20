@@ -19,6 +19,16 @@
   ;; header-only entries, or an index persisted before this field existed
   ;; (backfilled lazily from the block store by getchaintxstats).
   (tx-count 0 :type (unsigned-byte 32))
+  ;; Where this block's data and undo record live in the flat files (Core
+  ;; CBlockIndex nFile / nDataPos / nUndoPos). NIL means "not here": either the
+  ;; block has no body yet, or it predates the flat files and lives in the
+  ;; legacy per-block file named by its hash, or it was pruned. Core encodes
+  ;; the same information as the HAVE_DATA / HAVE_UNDO bits of nStatus
+  ;; (chain.h:42-86); keeping the positions themselves nullable makes the two
+  ;; impossible to disagree.
+  (file nil :type (or null (signed-byte 32)))
+  (data-pos nil :type (or null (unsigned-byte 32)))
+  (undo-pos nil :type (or null (unsigned-byte 32)))
   ;; Packed image of the MUTABLE fields as of the last time this entry was
   ;; written to disk; 0 = never written. Comparing it against the entry's
   ;; current packing is what lets a flush write only what changed, instead of
@@ -837,21 +847,32 @@ v1 (36/40 bytes): no CRC — legacy fallback"
 (defvar *header-index-magic* (map '(vector (unsigned-byte 8)) #'char-code "HIDX")
   "Magic bytes identifying a header index file.")
 
-(defconstant +header-index-format-version+ 2
+(defconstant +header-index-format-version+ 3
   "Current header index persistence format version.
-v2 appends a per-entry tx-count (4 bytes); v1 files still load (tx-count 0,
-backfilled lazily from the block store).")
+v2 appends a per-entry tx-count (4 bytes); v3 appends the flat-file position
+(file, data-pos, undo-pos: 12 bytes). Older files still load — a v1 entry gets
+tx-count 0 (backfilled lazily from the block store) and a v1 or v2 entry gets
+no position, which is exactly right for a block that predates the flat files:
+it lives in the legacy per-block file named by its hash.")
 
 (defvar *header-index-delta-magic*
   (map '(vector (unsigned-byte 8)) #'char-code "HIDD")
   "Magic bytes identifying a header index DELTA log.")
 
-(defconstant +header-index-delta-version+ 1
-  "Format version of the header index delta log.")
+(defconstant +header-index-delta-version+ 2
+  "Format version of the header index delta log. Bumped with the entry layout:
+a delta records whole entries, so a log written with v2 entries cannot be
+replayed by a build that reads v3 ones. The loader refuses an older log rather
+than misparsing it -- the cost is one full snapshot on the first start after an
+upgrade, which the format change requires anyway.")
 
-(defconstant +header-index-entry-bytes+ 185
-  "Serialized size of one v2 header-index entry: hash(32) + height(4) +
-header(80) + chainwork(32) + status(1) + prev-hash(32) + tx-count(4).")
+(defconstant +header-index-entry-bytes+ 197
+  "Serialized size of one v3 header-index entry: hash(32) + height(4) +
+header(80) + chainwork(32) + status(1) + prev-hash(32) + tx-count(4) +
+file(4) + data-pos(4) + undo-pos(4).
+
+Changing this value needs an image RESTART, not a recompile: it is a
+defconstant, and a stale caller would frame the delta log at the old width.")
 
 (defun %entry-persist-key (entry)
   "The MUTABLE state of ENTRY packed into one 64-bit integer, or 0 for an entry
@@ -873,10 +894,22 @@ full snapshot rather than relying on this key."
                1)
           (ash (if (block-index-entry-header entry) 1 0) 3)
           (ash (if (block-index-entry-prev-entry entry) 1 0) 4)
-          (ash (block-index-entry-height entry) 5)
-          ;; 27 bits is ~134M transactions in one block — unreachable, and the
-          ;; clamp keeps a corrupt value from overflowing into the height bits.
-          (ash (min (block-index-entry-tx-count entry) #x7FFFFFF) 37)))
+          ;; Height and tx-count are each clamped to 27 bits — ~134M, which is
+          ;; 2500 years of blocks and more transactions than a block can hold.
+          ;; The clamps also keep a corrupt value from overflowing into a
+          ;; neighbouring field, and they keep the whole key inside a fixnum,
+          ;; which matters because a flush computes it for EVERY entry (963k on
+          ;; mainnet) to find the few that changed.
+          (ash (min (block-index-entry-height entry) #x7FFFFFF) 5)
+          (ash (min (block-index-entry-tx-count entry) #x7FFFFFF) 32)
+          ;; The flat-file position is recorded by PRESENCE, not by value.
+          ;; A position is written once, when the block's body or undo record
+          ;; lands, and cleared once, when it is pruned; it is never moved
+          ;; within a file. So the two transitions that exist are exactly the
+          ;; ones a presence bit catches, and the value itself travels in the
+          ;; entry payload that this key schedules.
+          (ash (if (block-index-entry-data-pos entry) 1 0) 59)
+          (ash (if (block-index-entry-undo-pos entry) 1 0) 60)))
 
 (defun header-index-delta-path (state)
   "Path to the header index delta log."
@@ -943,9 +976,15 @@ serves as the file's identity. NIL if unreadable."
       (loop repeat 80 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))))
 
 (defun bb-write-single-header-entry (bb entry)
-  "byte-buf variant of write-single-header-entry. Writes 185 bytes (v2):
+  "byte-buf variant of write-single-header-entry. Writes 197 bytes (v3):
 hash(32) + height(4) + header(80) + chainwork(32) + status(1) + prev-hash(32)
-+ tx-count(4)."
++ tx-count(4) + file(4) + data-pos(4) + undo-pos(4).
+
+An absent file number is -1 and an absent position is #xFFFFFFFF, which is
+Core's own null encoding for FlatFilePos (nFile = -1) extended to the two
+offsets. Neither is a reachable real value: file numbers are non-negative and
+a position that far into a file exceeds MAX_BLOCKFILE_SIZE by three orders of
+magnitude."
   (declare (optimize (speed 3) (safety 1)))
   (bitcoin-lisp.serialization:bb-write-bytes bb (block-index-entry-hash entry))
   (bitcoin-lisp.serialization:bb-write-u32-le bb (block-index-entry-height entry))
@@ -958,7 +997,12 @@ hash(32) + height(4) + header(80) + chainwork(32) + status(1) + prev-hash(32)
     (if prev-entry
         (bitcoin-lisp.serialization:bb-write-bytes bb (block-index-entry-hash prev-entry))
         (loop repeat 32 do (bitcoin-lisp.serialization:bb-write-u8 bb 0))))
-  (bitcoin-lisp.serialization:bb-write-u32-le bb (block-index-entry-tx-count entry)))
+  (bitcoin-lisp.serialization:bb-write-u32-le bb (block-index-entry-tx-count entry))
+  (bitcoin-lisp.serialization:bb-write-i32-le bb (or (block-index-entry-file entry) -1))
+  (bitcoin-lisp.serialization:bb-write-u32-le
+   bb (or (block-index-entry-data-pos entry) #xFFFFFFFF))
+  (bitcoin-lisp.serialization:bb-write-u32-le
+   bb (or (block-index-entry-undo-pos entry) #xFFFFFFFF)))
 
 (defun %write-header-index-snapshot (state)
   "Rewrite the whole index and drop any delta log. Returns T.
@@ -1081,6 +1125,20 @@ mainnet, measured 2026-08-19."
         ;; leaving the change unpersisted.
         (t (%write-header-index-snapshot state))))))
 
+(defun %delta-entry-width (version)
+  "Serialized entry width of a delta log at VERSION, or NIL if this build does
+not know that layout.
+
+Old logs are REPLAYED at their own width rather than discarded. Discarding one
+looks harmless -- it is only the changes since the last snapshot -- but those
+changes are exactly the statuses that were most recently updated, so dropping
+the log can revert a block from :invalid back to :valid. That is the failure
+%ENTRY-PERSIST-KEY's docstring warns about, arriving by a different route."
+  (case version
+    (1 185)   ; hash+height+header+chainwork+status+prev+tx-count
+    (2 197)   ; ... + file + data-pos + undo-pos
+    (t nil)))
+
 (defun %replay-header-index-delta (state)
   "Apply the delta log beside the snapshot, if it belongs to THIS snapshot.
 Returns the number of entries applied.
@@ -1105,21 +1163,40 @@ shape of a crash mid-append — and keeps everything before it."
               (header-len 12))
           (if (or (< (length bytes) header-len)
                   (not (equalp (subseq bytes 0 4) *header-index-delta-magic*))
+                  ;; A delta records WHOLE entries, so a log written against a
+                  ;; different entry layout must be framed at ITS width, not at
+                  ;; this build's. The CRC binding does not catch the difference
+                  ;; -- on the first start after an entry-format change the old
+                  ;; log is bound to the very snapshot still on disk -- so the
+                  ;; version field is the only thing that can, and an unknown
+                  ;; one is the only case that gets discarded.
+                  (null (%delta-entry-width
+                         (logior (aref bytes 4)
+                                 (ash (aref bytes 5) 8)
+                                 (ash (aref bytes 6) 16)
+                                 (ash (aref bytes 7) 24))))
                   (not (equalp (subseq bytes 8 12)
                                (or (chain-state-header-index-snapshot-crc state)
                                    #()))))
-              ;; Not ours — a stale log from a superseded snapshot.
+              ;; Not ours — a stale log from a superseded snapshot, or one
+              ;; written in an older entry layout.
               (progn (ignore-errors (delete-file path)) 0)
-              (let ((pos header-len)
-                    (index (chain-state-block-index state))
-                    (prev-all (make-hash-table :test 'equalp)))
+              (let* ((pos header-len)
+                     (index (chain-state-block-index state))
+                     (prev-all (make-hash-table :test 'equalp))
+                     (delta-version (logior (aref bytes 4)
+                                            (ash (aref bytes 5) 8)
+                                            (ash (aref bytes 6) 16)
+                                            (ash (aref bytes 7) 24)))
+                     (entry-width (%delta-entry-width delta-version))
+                     (with-position (>= delta-version 2)))
                 (loop
                   (when (> (+ pos 4) (length bytes)) (return))
                   (let* ((count (logior (aref bytes pos)
                                         (ash (aref bytes (+ pos 1)) 8)
                                         (ash (aref bytes (+ pos 2)) 16)
                                         (ash (aref bytes (+ pos 3)) 24)))
-                         (payload-len (+ 4 (* count +header-index-entry-bytes+)))
+                         (payload-len (+ 4 (* count entry-width)))
                          (frame-end (+ pos payload-len 4)))
                     ;; Truncated tail: stop, keeping every complete frame.
                     (when (or (zerop count) (> frame-end (length bytes)))
@@ -1133,7 +1210,8 @@ shape of a crash mid-append — and keeps everything before it."
                         (flexi-streams:with-input-from-sequence
                             (stream (subseq payload 4))
                           (dotimes (i count)
-                            (read-single-header-entry stream batch prevs t)))
+                            (read-single-header-entry stream batch prevs t
+                                                      with-position)))
                         ;; Each record REPLACES the entry of that hash, so later
                         ;; frames win: the log is last-writer-wins.
                         (maphash (lambda (hash e)
@@ -1234,7 +1312,7 @@ loading block database\" rather than an empty index (init.cpp)."
     ;; Check version: v1 entries lack the trailing tx-count (read as 0,
     ;; backfilled lazily); v2 includes it.
     (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
-      (unless (member version '(1 2))
+      (unless (member version '(1 2 3))
         (return-from load-header-index-v1
           (values nil (format nil "unsupported format version ~D (this build writes ~D)"
                               version +header-index-format-version+))))
@@ -1242,18 +1320,25 @@ loading block database\" rather than an empty index (init.cpp)."
       (let ((count (bitcoin-lisp.serialization:read-uint32-le stream))
             (entries-by-hash (make-hash-table :test 'equalp))
             (prev-hash-map (make-hash-table :test 'equalp))
-            (with-tx-count (>= version 2)))
+            (with-tx-count (>= version 2))
+            (with-position (>= version 3)))
         (dotimes (i count)
           (read-single-header-entry stream entries-by-hash prev-hash-map
-                                    with-tx-count))
+                                    with-tx-count with-position))
         (link-header-entries entries-by-hash prev-hash-map)
         (setf (chain-state-block-index state) entries-by-hash))))
   t)
 
 (defun read-single-header-entry (stream entries-by-hash prev-hash-map
-                                 &optional with-tx-count)
+                                 &optional with-tx-count with-position)
   "Read a single header entry from STREAM into ENTRIES-BY-HASH. WITH-TX-COUNT
-reads the trailing v2 tx-count field (v1/legacy entries default it to 0)."
+reads the trailing v2 tx-count field (v1/legacy entries default it to 0);
+WITH-POSITION reads the v3 flat-file position.
+
+An entry without a position is not an error and not a missing block: it is a
+block stored before the flat files existed, whose body lives in the legacy
+per-block file named by its hash. That is what makes the dual-read of P2
+possible, and why the position is nullable rather than defaulted."
   (let ((hash (make-array 32 :element-type '(unsigned-byte 8))))
     (read-sequence hash stream)
     (let* ((height (bitcoin-lisp.serialization:read-uint32-le stream))
@@ -1272,6 +1357,15 @@ reads the trailing v2 tx-count field (v1/legacy entries default it to 0)."
                           (flexi-streams:with-input-from-sequence (hs header-bytes)
                             (bitcoin-lisp.serialization::read-block-header hs))
                         (error () nil))))
+          (multiple-value-bind (file data-pos undo-pos)
+              (if with-position
+                  (let ((f (bitcoin-lisp.serialization:read-int32-le stream))
+                        (d (bitcoin-lisp.serialization:read-uint32-le stream))
+                        (u (bitcoin-lisp.serialization:read-uint32-le stream)))
+                    (values (unless (minusp f) f)
+                            (unless (= d #xFFFFFFFF) d)
+                            (unless (= u #xFFFFFFFF) u)))
+                  (values nil nil nil))
           (let ((entry (make-block-index-entry
                         :hash hash
                         :height height
@@ -1279,10 +1373,13 @@ reads the trailing v2 tx-count field (v1/legacy entries default it to 0)."
                         :prev-entry nil
                         :chain-work chainwork
                         :status status
-                        :tx-count tx-count)))
+                        :tx-count tx-count
+                        :file file
+                        :data-pos data-pos
+                        :undo-pos undo-pos)))
             (setf (gethash hash entries-by-hash) entry)
             (unless (every #'zerop prev-hash)
-              (setf (gethash hash prev-hash-map) (copy-seq prev-hash)))))))))
+              (setf (gethash hash prev-hash-map) (copy-seq prev-hash))))))))))
 
 (defun link-header-entries (entries-by-hash prev-hash-map)
   "Link prev-entry pointers in the block index."
