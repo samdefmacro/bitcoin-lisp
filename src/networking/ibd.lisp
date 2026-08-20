@@ -776,18 +776,30 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
             (unless (validate-header-pow header)
               (return-from validate-header-chain
                 (values (nreverse valid-headers)
-                        "Invalid proof-of-work")))
+                        (format nil "Invalid proof-of-work for header ~A"
+                                (bitcoin-lisp.crypto:bytes-to-hex hash)))))
 
             ;; Reject headers timestamped too far in the future (Core
             ;; ContextualCheckBlockHeader: block time > now + 2h). Admitting one
             ;; would pollute the index / inflate best-header chain-work with a
             ;; header Core refuses at admission.
-            (when (> (bitcoin-lisp.serialization:block-header-timestamp header)
-                     (+ (bitcoin-lisp.serialization:get-unix-time)
-                        bitcoin-lisp.validation:+max-future-block-time+))
-              (return-from validate-header-chain
-                (values (nreverse valid-headers)
-                        "Timestamp too far in the future")))
+            ;;
+            ;; Name the header and the overshoot. This fires constantly and
+            ;; benignly on testnet4, whose tip legitimately runs close to the
+            ;; +2h bound, so the interesting question is always "by how much,
+            ;; and is it the same header every time" — which the bare message
+            ;; could not answer (33,567 of 141,693 lines on the live node,
+            ;; 2026-08-20, none of them actionable).
+            (let ((overshoot (- (bitcoin-lisp.serialization:block-header-timestamp header)
+                                (+ (bitcoin-lisp.serialization:get-unix-time)
+                                   bitcoin-lisp.validation:+max-future-block-time+))))
+              (when (plusp overshoot)
+                (return-from validate-header-chain
+                  (values (nreverse valid-headers)
+                          (format nil "Timestamp too far in the future for header ~A (~Ds past the ~Ds bound)"
+                                  (bitcoin-lisp.crypto:bytes-to-hex hash)
+                                  overshoot
+                                  bitcoin-lisp.validation:+max-future-block-time+)))))
 
             ;; Validate timestamp > median-time-past. PARENT, not
             ;; HEADER-PREV-HASH: a mid-batch parent is a staging entry that is
@@ -796,7 +808,8 @@ VALID-HEADERS is a list of headers that passed validation (may be fewer than inp
             (when (bitcoin-lisp.validation:header-time-too-old-p header parent)
               (return-from validate-header-chain
                 (values (nreverse valid-headers)
-                        "Timestamp at or before median-time-past")))
+                        (format nil "Timestamp at or before median-time-past for header ~A"
+                                (bitcoin-lisp.crypto:bytes-to-hex hash)))))
 
             ;; Calculate new height and validate checkpoint
             (let* ((parent-height (if (eq parent prev-entry)
@@ -2648,7 +2661,14 @@ threads read/write under the same lock."
   (with-node-lock
    (multiple-value-bind (valid error) (validate-header-chain headers chain-state)
     (when error
-      (bitcoin-lisp:log-warn "Header validation error: ~A" error))
+      ;; Core logs every ContextualCheckBlockHeader failure at
+      ;; LogDebug(BCLog::VALIDATION) with the header hash and the state string
+      ;; (validation.cpp:4257), and punishment is a separate decision made by
+      ;; MaybePunishNodeForBlock — which explicitly does NOT punish
+      ;; BLOCK_TIME_FUTURE (net_processing.cpp:1945-1946). A WARN here inverted
+      ;; that: the one result Core singles out as nobody's fault was the single
+      ;; most common line in the node's log.
+      (bitcoin-lisp:log-cat "validation" "Header validation error: ~A" error))
     (let* (;; Core's received_new_header (net_processing.cpp:3079) is
            ;; `last_received_header == nullptr', where last_received_header is
            ;; the index lookup of headers.BACK() (:3052) — i.e. the LAST header
