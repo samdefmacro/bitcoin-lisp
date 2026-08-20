@@ -1780,3 +1780,144 @@ run the teardown again — it waits for the owner and returns NIL."
       (let ((reload (bitcoin-lisp.storage:make-chain-state :base-path base)))
         (is (eq t (bitcoin-lisp.storage:load-state reload)))
         (is (= 3 (bitcoin-lisp.storage:current-height reload)))))))
+
+;;;; --- The signal handler is Core-shaped (init.cpp:425-431, signalinterrupt.cpp) ---
+
+(test the-stop-signal-handler-does-not-log-lock-or-allocate
+  "Core's whole SIGTERM handler is an atomic flag exchange plus one byte written
+to a pipe, and the comment above it says why: 'This must be reentrant and safe
+for calling in a signal handler.' Ours used to format to *error-output*, call
+log-info (taking the log mutex), and on the REPL path start a thread and run the
+entire teardown — from inside the handler.
+
+Drive the real handler with the log path booby-trapped: if it emits, it dies."
+  (%with-shutdown-node (node base)
+    (is-true node) (is-true base)
+    (setf bitcoin-lisp::*shutdown-watchdog-running* t)
+    (bitcoin-lisp::%open-shutdown-pipe)
+    (let ((emits 0)
+          (real-emit (fdefinition 'bitcoin-lisp::%log-emit))
+          (err (make-string-output-stream)))
+      (unwind-protect
+           (let ((*error-output* err))
+             (setf (fdefinition 'bitcoin-lisp::%log-emit)
+                   (lambda (&rest args) (declare (ignore args)) (incf emits)))
+             (is (eq t (bitcoin-lisp::%handle-stop-signal))))
+        (setf (fdefinition 'bitcoin-lisp::%log-emit) real-emit))
+      (is (= 0 emits)
+          "the handler logged ~D time(s); a log emit takes *LOG-LOCK*, which is ~
+           the deadlock the recursive lock used to paper over" emits)
+      (is (string= "" (get-output-stream-string err))
+          "the handler wrote to a shared stream from a signal context"))
+    ;; It did register the request, using the PREALLOCATED cell — the identity
+    ;; check is the assertion that the handler did not cons a fresh one.
+    (is (eq bitcoin-lisp::*signal-shutdown-request* bitcoin-lisp::*shutdown-request*))
+    (is (string= "SIGTERM/SIGINT" (bitcoin-lisp::node-shutdown-requested-p)))
+    (is (= bitcoin-lisp::+node-exit-clean+
+           (bitcoin-lisp::%pending-shutdown-exit-code)))))
+
+(test the-stop-signal-handler-writes-exactly-one-wake-up-token
+  "Core guards TokenWrite behind m_flag.exchange(true) so a reentrant or
+concurrent signal cannot write twice — the pipe holds one token and one reader
+consumes it. A second signal after the first must be silent, or the servicer
+would wake again after the node is already down."
+  (%with-shutdown-node (node base)
+    (is-true node) (is-true base)
+    (setf bitcoin-lisp::*shutdown-watchdog-running* t)
+    (bitcoin-lisp::%open-shutdown-pipe)
+    ;; Drain anything left by an earlier test.
+    (let ((tokens 0)
+          (real-write (fdefinition 'bitcoin-lisp::%write-shutdown-token)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'bitcoin-lisp::%write-shutdown-token)
+                   (lambda () (incf tokens) nil))
+             (bitcoin-lisp::%handle-stop-signal)
+             (bitcoin-lisp::%handle-stop-signal)
+             (bitcoin-lisp::%handle-stop-signal))
+        (setf (fdefinition 'bitcoin-lisp::%write-shutdown-token) real-write))
+      (is (= 1 tokens)
+          "~D tokens written for three signals; only the CAS winner may write" tokens))))
+
+(test the-token-pipe-round-trips-a-wake-up
+  "The mechanism itself, end to end: a token written by the handler's path must
+wake a thread blocked in the servicer's wait. If it does not, a REPL node that
+takes a SIGTERM registers the request and then sits there forever."
+  (bitcoin-lisp::%open-shutdown-pipe)
+  (let ((woke (bt:make-semaphore :name "token-test")))
+    (let ((reader (bt:make-thread
+                   (lambda ()
+                     (bitcoin-lisp::%await-shutdown-token)
+                     (bt:signal-semaphore woke))
+                   :name "token-test-reader")))
+      (bitcoin-lisp::%write-shutdown-token)
+      (is-true (bt:wait-on-semaphore woke :timeout 10)
+               "a written token did not wake the reader")
+      (ignore-errors (bt:join-thread reader :timeout 5)))))
+
+(test the-log-lock-is-plain-now-that-nothing-re-enters-it
+  "The payoff, and a guard against silently going back. *LOG-LOCK* was made
+recursive only because the signal handler logged; Core's BCLog::Logger::m_cs is
+a plain StdMutex. A recursive lock here would hide a genuine re-entrant emit
+instead of deadlocking on it, which is how a logging bug becomes invisible."
+  (is (typep bitcoin-lisp::*log-lock* 'sb-thread:mutex))
+  ;; And no source file may take it recursively again.
+  (dolist (rel '("src/logging.lisp" "src/node.lisp"))
+    (let ((src (uiop:read-file-string
+                (merge-pathnames rel (asdf:system-source-directory :bitcoin-lisp)))))
+      (is (null (search "with-recursive-lock-held (*log-lock*)" src))
+          "~A takes *LOG-LOCK* recursively again" rel))))
+
+(test a-stop-request-and-a-signal-tear-the-node-down-through-one-path
+  "A `stop` RPC used to spawn its own thread while a SIGTERM ran the teardown
+inline — two mechanisms for one job, and only one of them was ever exercised by
+a test. Both now register and wake the same servicer, so a servicer that is
+running means neither path makes a thread of its own."
+  (%with-shutdown-node (node base)
+    (is-true node) (is-true base)
+    (bitcoin-lisp::%open-shutdown-pipe)
+    (let ((tokens 0)
+          (threads 0)
+          (real-write (fdefinition 'bitcoin-lisp::%write-shutdown-token))
+          (saved-servicer bitcoin-lisp::*shutdown-servicer-thread*))
+      (unwind-protect
+           (progn
+             ;; A live servicer: the request must wake it, not spawn anything.
+             (setf bitcoin-lisp::*shutdown-servicer-thread*
+                   (bt:make-thread (lambda () (sleep 30)) :name "fake-servicer"))
+             (setf (fdefinition 'bitcoin-lisp::%write-shutdown-token)
+                   (lambda () (incf tokens) nil))
+             (setf bitcoin-lisp::*shutdown-watchdog-running* nil)
+             (is (eq t (bitcoin-lisp::request-node-shutdown "rpc stop")))
+             (is (= 1 tokens) "the stop request did not wake the servicer")
+             (is (= 0 threads)))
+        (setf (fdefinition 'bitcoin-lisp::%write-shutdown-token) real-write)
+        (when (and bitcoin-lisp::*shutdown-servicer-thread*
+                   (bt:thread-alive-p bitcoin-lisp::*shutdown-servicer-thread*))
+          (ignore-errors (bt:destroy-thread bitcoin-lisp::*shutdown-servicer-thread*)))
+        (setf bitcoin-lisp::*shutdown-servicer-thread* saved-servicer)))))
+
+(test the-watchdog-releases-the-servicer-before-exiting
+  "The servicer is a real thread blocked in read(2), and SB-EXT:EXIT joins
+threads. On the exit-7 path — the node stopped running unasked — nobody ever
+called request-node-shutdown, so no token was ever written and the servicer
+would still be blocked when the watchdog exits: a 5-second stall on every
+crash-restart, which is the path that most needs to be fast."
+  (%with-shutdown-node (node base)
+    (is-true node) (is-true base)
+    (let ((tokens 0)
+          (real-write (fdefinition 'bitcoin-lisp::%write-shutdown-token)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'bitcoin-lisp::%write-shutdown-token)
+                   (lambda () (incf tokens) nil))
+             ;; No request at all: the watchdog stops because the node is gone.
+             (setf bitcoin-lisp::*node* nil)
+             (let ((code (bitcoin-lisp::run-node-watchdog :poll-seconds 0.05
+                                                          :exit nil)))
+               (is (= bitcoin-lisp::+node-exit-watchdog+ code)
+                   "expected the respawn code for a node that died unasked")))
+        (setf (fdefinition 'bitcoin-lisp::%write-shutdown-token) real-write))
+      (is (= 1 tokens)
+          "the watchdog exited without releasing the servicer, so the process ~
+           would wait out SB-EXT:EXIT's timeout"))))
