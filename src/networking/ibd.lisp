@@ -164,6 +164,13 @@ thread mutates it."
   ;; that stayed refused past the retry throttle — so the retry stops
   ;; re-attempting a doomed/never-completable fork every cycle. hash -> t.
   (rejected-reorg-candidates (make-block-hash-table) :type hash-table)
+  ;; Core m_blocks_unlinked: fork candidates that cannot be tried because a body
+  ;; on their branch is missing. Keyed by the hash of THAT body, so the drain on
+  ;; arrival is O(1). PARKED-REORG-CANDIDATES is the same information keyed the
+  ;; other way, so the candidate scan can skip a parked branch in O(1) instead
+  ;; of re-walking it. See %PARK-UNLINKED-REORG-CANDIDATE.
+  (unlinked-reorg-candidates (make-block-hash-table) :type hash-table)
+  (parked-reorg-candidates (make-block-hash-table) :type hash-table)
   ;; Exponential moving average of received block wire sizes. Seeds at 1MB
   ;; (safe both ways: modern blocks ~1-2MB; early-chain blocks correct it
   ;; downward within seconds). Telemetry only since the per-peer walk
@@ -3243,12 +3250,15 @@ or dead-fork peer was re-picked every cycle and pinned the tip for hours."
 
 (defun %fork-bodies-complete-p (entry tip-entry chain-state block-store)
   "T when every block on ENTRY's branch strictly above its fork point with
-TIP-ENTRY is present in the block-store. Cheap gate for the deep-reorg
-trigger: probe-file only (block-exists-p), walking UP from the fork point
-with early exit at the first gap — so while the fork is still downloading
-this costs a handful of probes, and the expensive perform-reorg machinery
-runs only once, when the last body lands. ENTRY itself is excluded: the
-trigger holds the incoming block in hand."
+TIP-ENTRY is present in the block-store. Returns (values ok-p missing-hash):
+on failure MISSING-HASH is the first absent body, which is what the branch has
+to WAIT for (Core's pindexTest — the key it parks the branch under).
+
+Cheap gate for the deep-reorg trigger: probe-file only (block-exists-p),
+walking UP from the fork point with early exit at the first gap — so while the
+fork is still downloading this costs a handful of probes, and the expensive
+perform-reorg machinery runs only once, when the last body lands. ENTRY itself
+is excluded: the trigger holds the incoming block in hand."
   (let ((fork (bitcoin-lisp.validation:find-fork-point entry tip-entry)))
     (when fork
       ;; Collect entry's parent chain down to the fork point (exclusive),
@@ -3273,7 +3283,9 @@ trigger holds the incoming block in hand."
                                     chain-state h)))
                             (and a (equalp (bitcoin-lisp.storage:block-index-entry-hash a)
                                            bh))))
-                (return nil)))))))))
+                ;; The SECOND value names the block we are waiting for — Core's
+                ;; pindexTest, the block it keys m_blocks_unlinked on.
+                (return (values nil bh))))))))))
 
 (defparameter +reorg-candidates-cap+ 4096
   "Hard cap on the reorg-candidate SET (and disk-blocks-above-tip). The
@@ -3336,6 +3348,80 @@ download walk. O(1); safe to call once per walked block per tick. Bounded by
         (clrhash rej))
       (setf (gethash hash rej) t))))
 
+(defun %park-unlinked-reorg-candidate (candidate-hash missing-hash)
+  "Mark CANDIDATE-HASH as waiting for MISSING-HASH, the body its branch needs.
+A parked candidate is skipped by the scan until that body arrives.
+
+This is Core's response to the same situation. FindMostWorkChain, on reaching a
+branch block with no data, takes the branch out of setBlockIndexCandidates and
+inserts it into m_blocks_unlinked keyed by the parent — and says why: \"so that
+if the block arrives in the future we can try adding to setBlockIndexCandidates
+again\" (validation.cpp:3184-3190).
+
+Ours SUPPRESSES THE PROBE rather than dropping the candidacy, which is the same
+idea adapted to a different structure. Core's candidate set IS its work queue,
+so erasing from it is how Core stops working on the branch; ours is a set plus a
+separate probe loop, and several paths legitimately observe the set to mean
+\"recoverable, not rejected\" — dropping the entry there broke the deep-reorg
+livelock regression test, correctly. Skipping the probe removes the same cost.
+
+The cost being removed is real. Measured on testnet4 over 12.7 days: 205 \"REORG
+REFUSED: N blocks missing from store\" lines across ~40 heights, 11 of them at a
+single height, each one a fresh walk of a branch whose answer could not have
+changed. The retry is not the problem — the retry with no event to wait for is."
+  (when *ibd-context*
+    (let ((map (ibd-context-unlinked-reorg-candidates *ibd-context*))
+          (parked (ibd-context-parked-reorg-candidates *ibd-context*)))
+      ;; Bounded like every other candidate map: a pathological header topology
+      ;; must not be able to grow this without limit.
+      (when (or (gethash missing-hash map)
+                (< (hash-table-count map) +reorg-candidates-cap+))
+        (pushnew candidate-hash (gethash missing-hash map) :test #'equalp)
+        (setf (gethash candidate-hash parked) missing-hash)))))
+
+(defun %reorg-candidate-parked-p (candidate-hash block-store)
+  "T when CANDIDATE-HASH is waiting for a body that is still not here, so
+walking its branch again cannot produce a different answer.
+
+The awaited body is re-checked rather than trusted: a body can appear through a
+path that does not drain the map (a reindex, an operator dropping a file in),
+and a candidate parked against a block that has since arrived would otherwise
+never be probed again — trading an unbounded retry for a reorg that never
+happens, which is strictly worse than the bug."
+  (when *ibd-context*
+    (let ((missing (gethash candidate-hash
+                            (ibd-context-parked-reorg-candidates *ibd-context*))))
+      (and missing
+           (not (bitcoin-lisp.storage:block-exists-p block-store missing))))))
+
+(defun %rearm-unlinked-reorg-candidates (hash chain-state)
+  "A body with HASH just landed: un-park everything that was waiting for it.
+Core drains m_blocks_unlinked on the same event (after a block is written).
+Returns how many were re-armed.
+
+NOTE-REORG-CANDIDATE re-applies the work and rejected-set tests, so a branch
+that went stale or was rejected while it waited does not come back."
+  (when *ibd-context*
+    (let* ((map (ibd-context-unlinked-reorg-candidates *ibd-context*))
+           (parked (ibd-context-parked-reorg-candidates *ibd-context*))
+           (waiting (gethash hash map))
+           (n 0))
+      (when waiting
+        (remhash hash map)
+        (dolist (candidate-hash waiting)
+          (remhash candidate-hash parked)
+          (let ((e (bitcoin-lisp.storage:get-block-index-entry chain-state
+                                                              candidate-hash)))
+            (when e
+              (note-reorg-candidate e chain-state)
+              (incf n))))
+        (when (plusp n)
+          (bitcoin-lisp:log-cat
+           "validation" "Reorg: ~D parked fork candidate~:P re-armed by the ~
+                         arrival of ~A"
+           n (bitcoin-lisp.crypto:bytes-to-hex hash))))
+      n)))
+
 (defun %best-completable-reorg-target (chain-state block-store tip-entry tip-work)
   "Highest-work candidate in the set whose fork bodies are all on disk (both
 the connect side via %fork-bodies-complete-p and — because perform-reorg is
@@ -3362,17 +3448,39 @@ completable targets are what we want and gated forks early-exit cheaply."
     ;; Highest work first; try the top few through the (two-sided) gate.
     (setf cands (sort cands #'>
                       :key #'bitcoin-lisp.storage:block-index-entry-chain-work))
+    ;; A branch still waiting on a body it has already been shown to lack is
+    ;; skipped without walking it again — see %REORG-CANDIDATE-PARKED-P.
+    (setf cands (remove-if (lambda (e)
+                             (%reorg-candidate-parked-p
+                              (bitcoin-lisp.storage:block-index-entry-hash e)
+                              block-store))
+                           cands))
     (loop for e in cands
           for i from 0 below 16
-          do (when (and (%fork-bodies-complete-p e tip-entry chain-state block-store)
-                        (%active-chain-present-to-fork-p e tip-entry chain-state
-                                                         block-store))
-               (let ((blk (bitcoin-lisp.storage:get-block
-                           block-store (bitcoin-lisp.storage:block-index-entry-hash e))))
-                 (if blk
-                     (return-from %best-completable-reorg-target (values e blk))
-                     ;; Body vanished since it was noted — prune and keep scanning.
-                     (remhash (bitcoin-lisp.storage:block-index-entry-hash e) set)))))
+          do (multiple-value-bind (complete missing)
+                 (%fork-bodies-complete-p e tip-entry chain-state block-store)
+               (cond
+                 ((and complete
+                       (%active-chain-present-to-fork-p e tip-entry chain-state
+                                                        block-store))
+                  (let ((blk (bitcoin-lisp.storage:get-block
+                              block-store
+                              (bitcoin-lisp.storage:block-index-entry-hash e))))
+                    (if blk
+                        (return-from %best-completable-reorg-target (values e blk))
+                        ;; Body vanished since it was noted — prune and keep scanning.
+                        (remhash (bitcoin-lisp.storage:block-index-entry-hash e) set))))
+                 (missing
+                  ;; A connect-side body is not here. Stop re-probing this branch
+                  ;; every pass and wait for the event that could change the
+                  ;; answer — the body arriving.
+                  (%park-unlinked-reorg-candidate
+                   (bitcoin-lisp.storage:block-index-entry-hash e) missing))
+                 ;; No MISSING means the DISCONNECT side is incomplete: local
+                 ;; corruption, not something a peer will deliver, so parking it
+                 ;; under a hash would park it under nothing. Left to the
+                 ;; existing skip.
+                 (t nil))))
     nil))
 
 (defun %active-chain-present-to-fork-p (entry tip-entry chain-state block-store)
@@ -3550,6 +3658,13 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
             (progn
               (with-node-lock
                 (bitcoin-lisp.storage:store-block block-store block :height height))
+              ;; Same event as the out-of-order path: a body landed, so any fork
+              ;; candidate parked waiting for it can be tried again. BOTH persist
+              ;; sites must drain, or a fork whose last missing body arrives
+              ;; through this one stays parked forever — which is precisely the
+              ;; deep-reorg livelock this file already has a regression test for.
+              (when *ibd-context*
+                (%rearm-unlinked-reorg-candidates hash chain-state))
               (multiple-value-bind (activated error missing-blocks)
                   (with-node-lock
                     (bitcoin-lisp.validation:activate-block
@@ -3756,6 +3871,10 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                  (with-node-lock
                    (bitcoin-lisp.storage:store-block block-store block :height height))
                  (when *ibd-context*
+                   ;; A body just landed: any fork candidate that was parked
+                   ;; waiting for THIS block can be tried again (Core drains
+                   ;; m_blocks_unlinked on the same event).
+                   (%rearm-unlinked-reorg-candidates hash chain-state)
                    (%record-disk-block-above-tip height hash)
                    (let ((queue (ibd-context-block-queue *ibd-context*)))
                      (cond
