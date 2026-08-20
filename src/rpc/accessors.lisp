@@ -19,7 +19,7 @@
 ;;;
 ;;; Lock ORDERING (deadlock freedom): the node-lock is the OUTERMOST lock.
 ;;; Code holding it may take leaf locks (per-connection send locks,
-;;; *tx-request-lock*, *ban-lock*, *log-buffer-lock*, SBCL's synchronized
+;;; *tx-request-lock*, *ban-lock*, *log-lock*, SBCL's synchronized
 ;;; sig-cache tables); no code path acquires the node-lock while holding
 ;;; any of those, so the ordering is acyclic. The lock is recursive, so a
 ;;; locked RPC body may freely call helpers that re-acquire it
