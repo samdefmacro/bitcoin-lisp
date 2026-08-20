@@ -2940,3 +2940,145 @@ second peer sends a headers message; that second peer must still be served."
            (usocket:socket-close quiet-client)
            (usocket:socket-close talker-client))
       (usocket:socket-close listener))))
+
+;;;; --- getdata block-serving guards (G7-10, Core net_processing.cpp) ---------
+
+(defun %gd-header (&key (timestamp 1700000000) (bits #x1d00ffff) (seed 1))
+  (bitcoin-lisp.serialization:make-block-header
+   :version 1
+   :prev-block (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0)
+   :merkle-root (make-array 32 :element-type '(unsigned-byte 8) :initial-element seed)
+   :timestamp timestamp
+   :bits bits
+   :nonce 0))
+
+(defun %gd-entry (&key hash height (timestamp 1700000000) (work 1000)
+                       (status :valid) (bits #x1d00ffff))
+  (bitcoin-lisp.storage:make-block-index-entry
+   :hash (or hash (make-array 32 :element-type '(unsigned-byte 8)
+                                 :initial-element (mod height 256)))
+   :height height
+   :header (%gd-header :timestamp timestamp :bits bits :seed (mod height 256))
+   :chain-work work
+   :status status))
+
+(defun %gd-chain-state (tip-height)
+  "A chain state whose active chain is TIP-HEIGHT+1 linked entries."
+  (let ((cs (bitcoin-lisp.storage:make-chain-state :base-path #p"/tmp/gd/"))
+        (prev nil))
+    (loop for h from 0 to tip-height
+          ;; Realistic per-block work (difficulty-1 is ~2^32), because the
+          ;; work-equivalent age divides by it — token values make every gap
+          ;; round to zero seconds and the check vacuous.
+          do (let ((e (%gd-entry :height h :work (* (1+ h) (expt 2 32))
+                                 :timestamp (+ 1700000000 (* h 600)))))
+               (setf (bitcoin-lisp.storage:block-index-entry-prev-entry e) prev)
+               (bitcoin-lisp.storage:add-block-index-entry cs e)
+               (setf prev e)))
+    (bitcoin-lisp.storage:update-chain-tip
+     cs (bitcoin-lisp.storage:block-index-entry-hash prev) tip-height)
+    (values cs prev)))
+
+(test an-old-off-chain-block-is-not-served-on-request
+  "Core BlockRequestAllowed (net_processing.cpp:1953-1960): a block NOT on the
+active chain is served only while it is younger than STALE_RELAY_AGE_LIMIT (30
+days) by BOTH wall-clock time and work-equivalent time. Serving an arbitrarily
+old side-chain block on request is a fingerprinting oracle — it tells the asker
+exactly which forks this node witnessed and kept. We had no such check at all."
+  (multiple-value-bind (cs tip) (%gd-chain-state 200)
+    (let ((best tip))
+      ;; On the active chain: always allowed, however old.
+      (let ((on-chain (bitcoin-lisp.storage:get-block-at-height cs 5)))
+        (is-true (bitcoin-lisp.networking::%block-request-allowed-p cs on-chain best)))
+      ;; Off-chain but recent: allowed.
+      (let ((recent (%gd-entry :height 199 :work (* 200 (expt 2 32))
+                               :timestamp (bitcoin-lisp.serialization:block-header-timestamp
+                                           (bitcoin-lisp.storage:block-index-entry-header tip)))))
+        (bitcoin-lisp.storage:add-block-index-entry cs recent)
+        (is-true (bitcoin-lisp.networking::%block-request-allowed-p cs recent best)))
+      ;; Off-chain and older than a month by wall clock: refused.
+      (let ((stale (%gd-entry :height 199 :work (* 200 (expt 2 32))
+                              :timestamp (- (bitcoin-lisp.serialization:block-header-timestamp
+                                             (bitcoin-lisp.storage:block-index-entry-header tip))
+                                            (* 31 24 60 60)))))
+        (setf (bitcoin-lisp.storage:block-index-entry-hash stale)
+              (make-array 32 :element-type '(unsigned-byte 8) :initial-element 250))
+        (bitcoin-lisp.storage:add-block-index-entry cs stale)
+        (is-false (bitcoin-lisp.networking::%block-request-allowed-p cs stale best)))
+      ;; A block that never reached full validation is refused whatever its age
+      ;; (Core requires BLOCK_VALID_SCRIPTS).
+      (let ((unvalidated (%gd-entry :height 199 :work (* 200 (expt 2 32)) :status :header-valid
+                                    :timestamp (bitcoin-lisp.serialization:block-header-timestamp
+                                                (bitcoin-lisp.storage:block-index-entry-header tip)))))
+        (setf (bitcoin-lisp.storage:block-index-entry-hash unvalidated)
+              (make-array 32 :element-type '(unsigned-byte 8) :initial-element 251))
+        (bitcoin-lisp.storage:add-block-index-entry cs unvalidated)
+        (is-false (bitcoin-lisp.networking::%block-request-allowed-p cs unvalidated best))))))
+
+(test the-work-equivalent-age-catches-what-a-forged-timestamp-would-not
+  "The second half of BlockRequestAllowed, and the reason it has two halves. A
+header's nTime is attacker-influenced within the median-time-past and 2-hour
+windows, so an age test on timestamps alone can be talked out of. The
+work-equivalent age (Core GetBlockProofEquivalentTime, chain.cpp:136-151)
+cannot be: producing the work is the cost."
+  ;; The chain must be taller than the limit expressed in blocks (30 days at a
+  ;; 10-minute target is 4,320) or no work gap inside it can exceed the limit
+  ;; and the assertion is vacuous.
+  (multiple-value-bind (cs tip) (%gd-chain-state 5000)
+    ;; A block claiming to be seconds old but carrying work from far behind:
+    ;; 4,500 blocks' worth, which at the 10-minute target is ~31 days.
+    (let ((forged (%gd-entry :height 4999
+                             :work (- (bitcoin-lisp.storage:block-index-entry-chain-work tip)
+                                      (* 4500 (expt 2 32)))
+                             :timestamp (bitcoin-lisp.serialization:block-header-timestamp
+                                         (bitcoin-lisp.storage:block-index-entry-header tip)))))
+      (setf (bitcoin-lisp.storage:block-index-entry-hash forged)
+            (make-array 32 :element-type '(unsigned-byte 8) :initial-element 252))
+      (bitcoin-lisp.storage:add-block-index-entry cs forged)
+      ;; Its timestamp passes the wall-clock half...
+      (is (< (- (bitcoin-lisp.serialization:block-header-timestamp
+                 (bitcoin-lisp.storage:block-index-entry-header tip))
+                (bitcoin-lisp.serialization:block-header-timestamp
+                 (bitcoin-lisp.storage:block-index-entry-header forged)))
+             bitcoin-lisp.networking::+stale-relay-age-limit+))
+      ;; ...and the work half refuses it anyway.
+      (is-false (bitcoin-lisp.networking::%block-request-allowed-p cs forged tip)))))
+
+(test a-network-limited-node-does-not-answer-below-its-promised-depth
+  "Core net_processing.cpp:2385-2392. A node advertising NODE_NETWORK_LIMITED
+without NODE_NETWORK promises the last 288 blocks; answering for anything
+deeper tells the asker how much history it actually kept, which is its prune
+configuration. Core's two-block buffer is kept — without it a race against a
+tip advance turns a legitimate request into a disconnect."
+  (multiple-value-bind (cs tip) (%gd-chain-state 1000)
+    (is-true tip)
+    ;; Pruning on => NODE_NETWORK is not advertised => the threshold applies.
+    (let ((bitcoin-lisp:*prune-target-mib* 550))
+      (is-true (bitcoin-lisp.networking::%below-network-limited-threshold-p
+                cs (bitcoin-lisp.storage:get-block-at-height cs 100)))
+      ;; Inside the window, including the two-block buffer.
+      (is-false (bitcoin-lisp.networking::%below-network-limited-threshold-p
+                 cs (bitcoin-lisp.storage:get-block-at-height cs 1000)))
+      (is-false (bitcoin-lisp.networking::%below-network-limited-threshold-p
+                 cs (bitcoin-lisp.storage:get-block-at-height cs (- 1000 288))))
+      (is-false (bitcoin-lisp.networking::%below-network-limited-threshold-p
+                 cs (bitcoin-lisp.storage:get-block-at-height cs (- 1000 290))))
+      (is-true (bitcoin-lisp.networking::%below-network-limited-threshold-p
+                cs (bitcoin-lisp.storage:get-block-at-height cs (- 1000 291)))))
+    ;; A full node advertises NODE_NETWORK and the threshold never applies.
+    (let ((bitcoin-lisp:*prune-target-mib* 0))
+      (is-false (bitcoin-lisp.networking::%below-network-limited-threshold-p
+                 cs (bitcoin-lisp.storage:get-block-at-height cs 1))))))
+
+(test the-getdata-handler-is-given-the-chain-state-it-needs-to-check
+  "The seam. Every guard above reads the chain state, and HANDLE-GETDATA used
+to `(declare (ignore chain-state))` — so a version of this that forgot to pass
+it would compile, run, and silently serve everything. Assert the dispatch
+passes it."
+  (let ((src (uiop:read-file-string
+              (merge-pathnames "src/networking/protocol.lisp"
+                               (asdf:system-source-directory :bitcoin-lisp)))))
+    (is (search "(handle-getdata peer payload chain-state mempool block-store)" src)
+        "the message dispatch no longer passes chain-state to handle-getdata")
+    (is (null (search "(declare (ignore chain-state))" src))
+        "handle-getdata ignores chain-state again, which disables every guard")))
