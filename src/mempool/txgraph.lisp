@@ -231,8 +231,16 @@ Available even when oversized."
 mining-order data (Core Cluster::Updated, txgraph.cpp:1072-1146, done
 eagerly in place of Relinearize/MakeAcceptable)."
   (let* ((dg (%cluster-depgraph cluster))
-         (lin (linearize dg))
          (mapping (%cluster-mapping cluster))
+         ;; Core hands Linearize a fallback order over DepGraph positions,
+         ;; built by mapping each position back to its entry and deferring to
+         ;; the graph's own comparator (txgraph.cpp:2165-2169). It decides the
+         ;; order of equal-feerate chunks and of equal-feerate transactions
+         ;; within a chunk, so it reaches the mining template.
+         (lin (linearize dg
+                         :fallback (let ((order (txgraph-fallback-order graph)))
+                                     (lambda (a b)
+                                       (funcall order (aref mapping a) (aref mapping b))))))
          (info (chunk-linearization-info dg lin))
          (chunks (make-array (length info)))
          (fallback (txgraph-fallback-order graph))
