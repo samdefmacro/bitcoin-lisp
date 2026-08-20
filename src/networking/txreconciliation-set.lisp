@@ -113,21 +113,26 @@ safety net."
 (defconstant +recon-inbound-fanout-fraction+ 0.1d0
   "Fraction of reconciling INBOUND peers that get an immediate announcement.")
 
-(defun recon-fanout-target-p (wtxid peer-salt inbound-count outbound-p)
+(defun recon-fanout-target-p (wtxid peer-salt reconciling-peer-count outbound-p)
   "Whether this transaction should be announced to this peer immediately rather
 than reconciled.
 
+RECONCILING-PEER-COUNT is how many peers are reconciling at all, which is what
+turns "one outbound destination" into a per-peer probability of 1/n. It is
+passed in because only the caller can see the peer list.
+
 Deterministic in (wtxid, peer salt), so a node does not reveal a new sample on
-every retry, and unpredictable to anyone who does not know the salt."
+every retry, and unpredictable to anyone who does not know the salt.
+
+With a single reconciling peer the outbound share is 1, so everything is
+announced — correctly: one destination out of one peer IS that peer, and
+holding transactions back to reconcile with nobody else would only delay them."
   (let* ((h (bitcoin-lisp.crypto:siphash-2-4 peer-salt 0 wtxid))
          (draw (/ (float (logand h #xFFFFFFFF) 1d0) 4294967296d0)))
     (if outbound-p
-        ;; With one outbound destination out of the reconciling outbounds, the
-        ;; per-peer probability is 1/n — but the caller knows n, not this
-        ;; function, so it passes the count in INBOUND-COUNT for both cases.
-        (< draw (if (plusp inbound-count)
-                    (/ (float +recon-outbound-fanout-destinations+ 1d0)
-                       (float inbound-count 1d0))
+        (< draw (if (plusp reconciling-peer-count)
+                    (min 1d0 (/ (float +recon-outbound-fanout-destinations+ 1d0)
+                                (float reconciling-peer-count 1d0)))
                     1d0))
         (< draw +recon-inbound-fanout-fraction+))))
 
@@ -190,3 +195,96 @@ element is on exactly one side, not which."
     (dolist (id (recon-round-local-ids round))
       (setf (gethash id ours) t))
     (remove-if-not (lambda (id) (gethash id ours)) decoded-ids)))
+
+;;;; --- Driving rounds from the peer loop ----------------------------------
+
+(defconstant +recon-round-interval-seconds+ 8
+  "How often a node opens a round with one of its reconciling outbound peers.
+
+BIP-330 spreads rounds across peers rather than running them all at once, so a
+node's announcement pattern does not reveal how many peers it has. Eight
+seconds is a starting point, not a ported constant — Core has no timer to copy.")
+
+(defconstant +recon-default-q+ 0.25d0
+  "The initiator's guess at the fraction of the smaller set the two sides do
+not share. Also unported for the same reason.")
+
+(defun recon-should-start-round-p (peer now)
+  "T when it is this peer's turn and it has nothing already in flight."
+  (and (peer-recon-registered peer)
+       (peer-recon-k0 peer)
+       ;; Only the side that DIALLED initiates, so both ends never open a round
+       ;; against each other at once (BIP-330 gives the role to the outbound
+       ;; peer, which is what recon-we-initiate records at handshake time).
+       (peer-recon-we-initiate peer)
+       (null (peer-recon-round peer))
+       (>= (- now (peer-recon-last-round peer)) +recon-round-interval-seconds+)))
+
+(defun recon-start-round (peer now)
+  "Freeze this peer's set and send reqrecon. Returns the message, or NIL when
+there is nothing to reconcile."
+  (let* ((set (peer-recon-set peer))
+         (ids (and set (recon-set-take-snapshot set))))
+    (setf (peer-recon-last-round peer) now)
+    (when ids
+      (setf (peer-recon-round peer)
+            (make-recon-round :peer peer :local-ids ids :state :requested))
+      (bitcoin-lisp.serialization:make-reqrecon-message
+       (length ids) +recon-default-q+))))
+
+(defun recon-respond-to-request (peer their-size q)
+  "The responder's half: size a sketch against what the initiator says it has,
+and send it."
+  (let* ((set (peer-recon-set peer))
+         (ids (if set (recon-set-take-snapshot set) '()))
+         (capacity (recon-estimate-capacity (length ids) their-size q)))
+    (bitcoin-lisp.serialization:make-sketch-message
+     (ms-sketch-serialize (recon-build-sketch ids capacity)))))
+
+(defun recon-finish-round (peer decoded-ids)
+  "Split the decoded difference and clear the round.
+
+Returns (values ids-to-request wtxids-to-announce). Nothing is sent here — the
+caller owns the socket — but the split has to happen while the round's frozen
+snapshot is still around."
+  (let* ((round (peer-recon-round peer))
+         (ask (recon-round-missing-ids round decoded-ids))
+         (mine (recon-round-ours-to-announce round decoded-ids))
+         (set (peer-recon-set peer)))
+    (setf (peer-recon-round peer) nil)
+    (when set (recon-set-clear-snapshot set))
+    (values ask
+            ;; Ours are announced by wtxid, so they leave the set: the peer is
+            ;; about to hear about them the ordinary way.
+            (loop for id in mine
+                  for wtxid = (and set (recon-set-wtxid set id))
+                  when wtxid
+                    collect wtxid
+                    and do (remhash id (recon-set-by-short-id set))))))
+
+(defun recon-abandon-round (peer)
+  "Give up on the round and fall back to announcing everything in the snapshot
+— BIP-330's flood fallback. A failed reconciliation costs bandwidth, never
+transactions."
+  (let* ((round (peer-recon-round peer))
+         (set (peer-recon-set peer))
+         (ids (and round (recon-round-local-ids round))))
+    (setf (peer-recon-round peer) nil)
+    (when set (recon-set-clear-snapshot set))
+    (loop for id in (or ids '())
+          for wtxid = (and set (recon-set-wtxid set id))
+          when wtxid
+            collect wtxid
+            and do (remhash id (recon-set-by-short-id set)))))
+
+(defun maybe-start-reconciliation (peer now)
+  "The timer entry point: open a round with PEER if it is due. Returns T when
+one was started.
+
+Rounds are spread across peers rather than run together, so a node's
+announcement pattern does not reveal how many peers it has."
+  (when (recon-should-start-round-p peer now)
+    (let ((msg (recon-start-round peer now)))
+      (when msg
+        (send-message peer msg)
+        t))))

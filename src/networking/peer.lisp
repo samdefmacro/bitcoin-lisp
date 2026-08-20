@@ -222,6 +222,14 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (recon-k1 nil :type (or null (unsigned-byte 64)))
   (recon-we-initiate nil :type boolean)               ; T = we dialed them (outbound)
   (recon-registered nil :type boolean)                ; sendtxrcncl exchanged both ways
+  ;; Transactions held back for reconciliation with this peer instead of being
+  ;; announced (BIP-330). Created on demand, only for a registered peer.
+  (recon-set nil)
+  ;; The in-flight reconciliation round, if this node is its initiator.
+  (recon-round nil)
+  ;; Universal time of the last round with this peer, so the timer can space
+  ;; them out.
+  (recon-last-round 0 :type integer)
   ;; DoS protection: per-peer rate limiters
   (rate-limit-inv nil)
   (rate-limit-tx nil)
@@ -829,7 +837,9 @@ disconnect needs no extra cleanup."
         (peer-recon-k0 peer) nil
         (peer-recon-k1 peer) nil
         (peer-recon-we-initiate peer) nil
-        (peer-recon-registered peer) nil))
+        (peer-recon-registered peer) nil
+        (peer-recon-set peer) nil
+        (peer-recon-round peer) nil))
 
 (defun %maybe-send-sendtxrcncl (peer)
   "Announce BIP330 reconciliation support, after the peer's VERSION and before

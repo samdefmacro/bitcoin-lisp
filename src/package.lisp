@@ -1282,6 +1282,7 @@
    #:select-extra-full-relay-eviction
    #:maybe-set-peer-announcing-hb
    #:maybe-send-feefilter
+   #:maybe-start-reconciliation
    #:fee-filter-round
    #:peer-manual
    #:peer-outbound-or-block-relay-p
