@@ -115,6 +115,45 @@ from us and work against Core. Found by having it happen during today's survey.
 
 ---
 
+## 2a. Found while deploying the fix for the above
+
+**N6. Five of the six block-activation call sites on the IBD path never passed
+the transaction index.** PR #372 fixed the *arrival* path
+(`accept-downloaded-block`); the deploy of the observability PR immediately
+rescanned the whole txindex from genesis again, and the diagnostic added in
+#371 said why: `marker-off-chain`. `activate-best-chain` and the four
+`activate-block` calls in `src/networking/ibd.lisp` all take `:tx-index` and all
+omitted it, so every block reaching the chain through the drain, retry, reorg
+and periodic-activation paths was connected with the index switched off — its
+transactions never indexed, and the best-block marker left naming a block the
+reorg had just disconnected. Fixed by reading the index from the IBD context
+through one helper rather than accepting it per-caller, plus a structural test
+that fails when a new call site omits it.
+
+**N7. Erlay P2 has no Bitcoin Core reference to port from.** Core's
+`TxReconciliationTracker` (`src/node/txreconciliation.{h,cpp}`) is **170 lines**
+with exactly four public methods — `PreRegisterPeer`, `RegisterPeer`,
+`ForgetPeer`, `IsPeerRegistered`. There is no `AddToSet`, no fanout selection,
+no timer and no sketch; the file's own comments still read *"TODO: ... Make
+private once used in the following commits."* Core ships the `sendtxrcncl`
+handshake and nothing else.
+
+Our P1 is already a complete, faithful port of exactly that surface, verified
+line by line: `NOT_FOUND` / `ALREADY_REGISTERED` / `PROTOCOL_VIOLATION`, the
+`min(theirs, ours)` version downgrade, `we_initiate = !is_peer_inbound`, the
+BIP-330 salt ordering, and the verack-time forget when wtxid relay was never
+negotiated.
+
+So P2 would be new protocol design, not a port — and it is **not shippable on
+its own**: P2 diverts transactions into per-peer reconciliation sets, and
+without P3 (minisketch) and P4 (sketch exchange) there is no mechanism that
+ever delivers them. Deploying P2 alone would degrade relay on the live nodes.
+The Erlay track is therefore P2+P3+P4 or nothing, ~6-10 PRs against a protocol
+Core has not merged, with no reference implementation to check against — which
+is the single most reliable error-catcher this project has.
+
+---
+
 ## 3. Carried-over backlog
 
 ### 3a. Deferred from the GA9 S2 wave (documented at the deferral sites in code)
