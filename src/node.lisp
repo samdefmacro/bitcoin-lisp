@@ -2737,7 +2737,15 @@ Returns the node instance."
                                               (when (eq (bitcoin-lisp.networking:peer-state p) :ready)
                                                 (ignore-errors
                                                  (bitcoin-lisp.networking:maybe-send-feefilter
-                                                  p mp cs now)))))
+                                                  p mp cs now))
+                                                ;; BIP-330: open a reconciliation
+                                                ;; round with one peer at a time.
+                                                ;; Inert unless -txreconciliation
+                                                ;; is set and the peer completed
+                                                ;; the handshake.
+                                                (ignore-errors
+                                                 (bitcoin-lisp.networking:maybe-start-reconciliation
+                                                  p now)))))
                                           ;; New headers announced: start the
                                           ;; next sync cycle now to fetch the
                                           ;; block instead of waiting out the
