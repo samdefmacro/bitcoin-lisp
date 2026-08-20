@@ -674,6 +674,11 @@
    #:save-file-with-crc32
    #:save-file-with-crc32-bb
    #:bb-write-utxo-entry-fields
+   ;; Core CBlockUndo record (undo.h)
+   #:serialize-block-undo
+   #:deserialize-block-undo
+   #:block-undo-from-spent-utxos
+   #:spent-utxos-from-block-undo
    #:load-file-with-crc32
    #:write-utxo-entry-fields
    #:read-utxo-entry-fields
