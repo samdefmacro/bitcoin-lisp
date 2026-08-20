@@ -674,6 +674,31 @@
    #:save-file-with-crc32
    #:save-file-with-crc32-bb
    #:bb-write-utxo-entry-fields
+   ;; Flat-file storage engine (flatfile.{h,cpp}, util/obfuscation.h)
+   #:+blockfile-chunk-size+
+   #:+undofile-chunk-size+
+   #:+max-blockfile-size+
+   #:+storage-header-bytes+
+   #:+undo-data-disk-overhead+
+   #:make-flat-file-pos
+   #:flat-file-pos-file
+   #:flat-file-pos-pos
+   #:flat-file-pos-null-p
+   #:obfuscate!
+   #:obfuscation-key-active-p
+   #:make-obfuscation-key
+   #:zero-obfuscation-key
+   #:read-or-create-xor-key
+   #:make-flat-file-seq
+   #:flat-file-name
+   #:with-flat-file
+   #:flat-file-allocate
+   #:flat-file-flush
+   #:flat-record-bytes
+   #:undo-record-checksum
+   #:undo-record-bytes
+   #:parse-flat-record-header
+   #:find-next-record
    ;; Core CBlockUndo record (undo.h)
    #:serialize-block-undo
    #:deserialize-block-undo

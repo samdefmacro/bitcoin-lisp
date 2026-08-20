@@ -57,6 +57,7 @@
                   :components ((:file "blocks")
                                (:file "utxo")
                                (:file "block-undo")
+                               (:file "flatfile")
                                (:file "leveldb")
                                (:file "coins-view")
                                (:file "coins-view-cache")
@@ -244,6 +245,7 @@
                              ;; TxOutCompression + hash_serialized_3
                              (:file "compressor-tests")
                              (:file "block-undo-tests")
+                             (:file "flatfile-tests")
                              ;; Assumeutxo snapshot format (dumptxoutset/loadtxoutset)
                              (:file "snapshot-tests")
                              ;; Chainstate list + selection accessors + storage suffix
