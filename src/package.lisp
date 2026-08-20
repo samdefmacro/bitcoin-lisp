@@ -446,6 +446,14 @@
    #:make-block-store
    #:init-block-store
    #:*flat-block-files*
+   #:block-file-info
+   #:block-file-info-blocks
+   #:block-file-info-size
+   #:block-file-info-height-first
+   #:block-file-info-height-last
+   #:block-store-file-info
+   #:rebuild-block-file-info
+   #:prune-flat-block-file
    #:store-block
    #:get-block
    #:block-exists-p

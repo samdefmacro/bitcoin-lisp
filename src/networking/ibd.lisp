@@ -3549,7 +3549,7 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
             ;; the RPC threads access under the same lock.
             (progn
               (with-node-lock
-                (bitcoin-lisp.storage:store-block block-store block))
+                (bitcoin-lisp.storage:store-block block-store block :height height))
               (multiple-value-bind (activated error missing-blocks)
                   (with-node-lock
                     (bitcoin-lisp.validation:activate-block
@@ -3754,7 +3754,7 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                              height)))))
                 (t
                  (with-node-lock
-                   (bitcoin-lisp.storage:store-block block-store block))
+                   (bitcoin-lisp.storage:store-block block-store block :height height))
                  (when *ibd-context*
                    (%record-disk-block-above-tip height hash)
                    (let ((queue (ibd-context-block-queue *ibd-context*)))

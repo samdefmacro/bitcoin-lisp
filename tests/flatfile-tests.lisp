@@ -427,3 +427,179 @@ This is also why the flag is off by default."
        (is-false (bitcoin-lisp.storage:prune-block store hash))
        (is-true (bitcoin-lisp.storage:get-block store hash)
                 "and the block is still there, not half-removed")))))
+
+;;; --- File-granular pruning (P3) ---------------------------------------------
+
+(test a-flat-file-is-prunable-only-when-its-whole-range-is
+  "Pruning a flat file is all or nothing, so the test is on the file's ENTIRE
+height range, not on individual blocks. A file holding one block above the
+window keeps the whole file — which is the trade the format makes, and the
+reason Core's unit is the file."
+  (%with-mainnet-network
+   (%with-flat-store (store dir)
+     (declare (ignorable dir))
+     ;; File 0 gets heights 10..12, and (pretending it rolled over) file 1
+     ;; gets 20..22 by hand.
+     (dolist (h '(10 11 12))
+       (bitcoin-lisp.storage:store-block store (%ff-test-block (+ 160 h)) :height h))
+     (let ((info (gethash 0 (bitcoin-lisp.storage:block-store-file-info store))))
+       (is (= 3 (bitcoin-lisp.storage:block-file-info-blocks info)))
+       (is (= 10 (bitcoin-lisp.storage:block-file-info-height-first info)))
+       (is (= 12 (bitcoin-lisp.storage:block-file-info-height-last info))))
+     ;; Entirely inside the window: prunable.
+     (is (equal '(0) (bitcoin-lisp.storage::%prunable-flat-files store 5 20)))
+     ;; The window ends one block too early: the file stays whole.
+     (is (null (bitcoin-lisp.storage::%prunable-flat-files store 5 11)))
+     ;; The window starts one block too late: likewise.
+     (is (null (bitcoin-lisp.storage::%prunable-flat-files store 11 20))))))
+
+(test a-block-stored-without-a-height-makes-its-file-unprunable
+  "The safe direction. A file whose range is unknown can never be SHOWN to lie
+inside the window, so it is never deleted — the alternative is dropping a block
+the chain still needs. Storing without a height still stores the block."
+  (%with-mainnet-network
+   (%with-flat-store (store dir)
+     (declare (ignorable dir))
+     (let ((hash (bitcoin-lisp.storage:store-block store (%ff-test-block 170))))
+       (is-true (bitcoin-lisp.storage:get-block store hash))
+       (let ((info (gethash 0 (bitcoin-lisp.storage:block-store-file-info store))))
+         (is (= 1 (bitcoin-lisp.storage:block-file-info-blocks info)))
+         (is (null (bitcoin-lisp.storage:block-file-info-height-first info))))
+       (is (null (bitcoin-lisp.storage::%prunable-flat-files store 0 1000000)))))))
+
+(test pruning-a-flat-file-removes-both-halves-and-forgets-its-blocks
+  "The blk and rev files go together — a pruned node cannot reorg below its
+window, so undo data there is dead weight — and every block in the file leaves
+the index, so the download path can re-request it."
+  (%with-mainnet-network
+   (%with-flat-store (store dir)
+     (let ((hashes (loop for h from 30 to 32
+                         collect (bitcoin-lisp.storage:store-block
+                                  store (%ff-test-block (+ 180 h)) :height h))))
+       ;; Give file 0 a rev half so the pair is real.
+       (with-open-file (s (merge-pathnames "blocks/rev00000.dat" dir)
+                          :direction :output :element-type '(unsigned-byte 8)
+                          :if-exists :supersede :if-does-not-exist :create)
+         (write-sequence (%ff-bytes 1 2 3 4) s))
+       (let ((seen '()))
+         (let ((freed (bitcoin-lisp.storage:prune-flat-block-file
+                       store 0 :on-prune (lambda (h) (push h seen)))))
+           (is (plusp freed))
+           (is (= 3 (length seen)) "every block in the file must be reported"))
+         (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+         (is-false (probe-file (merge-pathnames "blocks/rev00000.dat" dir))
+                   "the rev half goes with the blk half")
+         (dolist (h hashes)
+           (is-false (bitcoin-lisp.storage:block-exists-p store h))
+           (is-false (bitcoin-lisp.storage:get-block store h)))
+         (is-false (gethash 0 (bitcoin-lisp.storage:block-store-file-info store))))))))
+
+(test file-accounting-is-recovered-from-the-files-and-the-header-index
+  "Neither half knows enough alone: the flat files know WHERE each block is,
+the header index knows WHAT HEIGHT it is, and pruning needs both. Core persists
+this in its block-index database; deriving it means there is no second file to
+fall out of step."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let ((blocks '()))
+       ;; Store three blocks and record them in a chain state at known heights.
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (store (bitcoin-lisp.storage:init-block-store dir))
+              (cs (bitcoin-lisp.storage:init-chain-state dir)))
+         (loop for h from 40 to 42
+               do (let* ((b (%ff-test-block (+ 190 h)))
+                         (hash (bitcoin-lisp.storage:store-block store b :height h)))
+                    (push (cons hash h) blocks)
+                    (bitcoin-lisp.storage:add-block-index-entry
+                     cs (bitcoin-lisp.storage:make-block-index-entry
+                         :hash hash :height h :status :valid))))
+         (bitcoin-lisp.storage:save-header-index cs))
+       ;; A fresh store and chain state, as a restart would give.
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (store2 (bitcoin-lisp.storage:init-block-store dir))
+              (cs2 (bitcoin-lisp.storage:init-chain-state dir)))
+         (is-true (bitcoin-lisp.storage:load-header-index cs2))
+         ;; Before the join, the store has positions but no heights.
+         (is (null (bitcoin-lisp.storage::%prunable-flat-files store2 0 1000000)))
+         (is (= 1 (bitcoin-lisp.storage:rebuild-block-file-info store2 cs2)))
+         (let ((info (gethash 0 (bitcoin-lisp.storage:block-store-file-info store2))))
+           (is (= 40 (bitcoin-lisp.storage:block-file-info-height-first info)))
+           (is (= 42 (bitcoin-lisp.storage:block-file-info-height-last info)))
+           (is (plusp (bitcoin-lisp.storage:block-file-info-size info))))
+         (is (equal '(0) (bitcoin-lisp.storage::%prunable-flat-files store2 0 100))))))))
+
+(test every-store-block-call-passes-a-height
+  "A structural guard, for the same reason as the txindex one. A block stored
+without its height silently makes its whole FILE unprunable, and a pruned node
+that stops reclaiming space says nothing about it until the disk fills. There
+are five call sites; a sixth that forgets is how this returns."
+  (let ((sites '()))
+    (dolist (rel '("src/validation/block.lisp" "src/networking/ibd.lisp"))
+      (let ((src (uiop:read-file-string
+                  (merge-pathnames rel (asdf:system-source-directory :bitcoin-lisp)))))
+        (loop with start = 0
+              for pos = (search "bitcoin-lisp.storage:store-block" src :start2 start)
+              while pos
+              do (push (subseq src pos (min (length src) (+ pos 400))) sites)
+                 (setf start (+ pos 10)))))
+    (is (= 5 (length sites))
+        "expected 5 store-block call sites; a new one needs :height too")
+    (dolist (form sites)
+      (is (search ":height" form)
+          "a store-block call omits :height, which makes its block file
+           unprunable forever"))))
+
+(test prune-old-blocks-actually-prunes-a-flat-file
+  "The seam. %PRUNABLE-FLAT-FILES being right is worthless if the node's
+pruning entry point never calls it — which is the failure mode this project
+keeps finding. Drive the real PRUNE-OLD-BLOCKS with a target of zero and
+require the file to be gone."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+            (store (bitcoin-lisp.storage:init-block-store dir))
+            (cs (bitcoin-lisp.storage:init-chain-state dir))
+            (genesis (bitcoin-lisp.storage:best-block-hash cs))
+            (prev (bitcoin-lisp.storage:make-block-index-entry
+                   :hash genesis :height 0 :chain-work 1 :status :valid)))
+       (bitcoin-lisp.storage:add-block-index-entry cs prev)
+       ;; A chain well above +min-blocks-to-keep+, so the early heights are
+       ;; genuinely prunable.
+       (let ((tip-height (+ bitcoin-lisp:+min-blocks-to-keep+ 40)))
+         (loop for h from 1 to 3
+               do (let* ((b (%ff-test-block (+ 200 h)))
+                         (hash (bitcoin-lisp.storage:store-block store b :height h))
+                         (entry (bitcoin-lisp.storage:make-block-index-entry
+                                 :hash hash :height h :chain-work (1+ h)
+                                 :status :valid :prev-entry prev)))
+                    (bitcoin-lisp.storage:add-block-index-entry cs entry)
+                    (setf prev entry)))
+         ;; Claim a far-ahead tip so the stored blocks are below the horizon.
+         (bitcoin-lisp.storage:update-chain-tip
+          cs (bitcoin-lisp.storage:block-index-entry-hash prev) tip-height)
+         (is (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+         ;; 550 MiB is the smallest target that means AUTOMATIC pruning —
+         ;; below it, -prune is manual-only and this path returns 0 without
+         ;; looking at anything. The first draft of this test used 1 and
+         ;; "passed" its zero-pruned assertion for that reason alone.
+         (let ((bitcoin-lisp:*prune-target-mib* 550)
+               (bitcoin-lisp:*prune-after-height* 0)
+               (swept '()))
+           ;; Storage is a few kilobytes, far under the target: nothing goes.
+           (is (= 0 (bitcoin-lisp.storage:prune-old-blocks store cs)))
+           (is (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+           ;; Claim usage above the target and the file must go, whole.
+           (setf (bitcoin-lisp.storage:block-store-total-bytes store)
+                 (* 600 1024 1024))
+           (let ((pruned (bitcoin-lisp.storage:prune-old-blocks
+                          store cs :on-prune (lambda (h) (push h swept)))))
+             (is (= 3 pruned) "all three blocks in the file are pruned together")
+             ;; At least three: the legacy per-block walk runs afterwards while
+             ;; usage is still above target and re-reports the same heights.
+             ;; That is harmless — on-prune is always delete-undo-file, which
+             ;; is idempotent — and the exact per-file count is asserted
+             ;; directly in the PRUNE-FLAT-BLOCK-FILE test above.
+             (is (>= (length swept) 3) "each pruned block is reported for undo cleanup"))
+           (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+           (is (= 3 (bitcoin-lisp.storage::chain-state-pruned-height cs))
+               "the prune horizon advances to the file's last height")))))))
