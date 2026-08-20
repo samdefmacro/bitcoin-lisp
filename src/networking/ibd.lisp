@@ -459,6 +459,20 @@ Core's MSG NOTFOUND handling, which clears the peer's block request."
       (when (and entry (eq (car entry) peer))
         (remhash hash in-flight)))))
 
+(defun %context-tx-index ()
+  "The live transaction index, from the IBD context.
+
+Every activate-block / activate-best-chain call on this path takes the index as
+an argument, and each one that omitted it silently disabled the index for the
+blocks it connected: their transactions never entered it, and a reorg left the
+best-block marker naming a block that had just been disconnected, so the next
+startup rescanned from genesis. That omission has now been found three separate
+times (PR #372 on the arrival path, and five more sites here), always the same
+way — from a live log line, never from a test. Read it from the context rather
+than accepting it per-caller, so a new call site cannot reintroduce it by
+forgetting an argument."
+  (and *ibd-context* (ibd-context-tx-index *ibd-context*)))
+
 (defun queue-missing-fork-blocks (missing-blocks)
   "MISSING-BLOCKS is a list of (hash . height) cons cells, returned by
 perform-reorg when it refused due to blocks missing from the store.
@@ -2242,7 +2256,17 @@ a second download cursor for its [tip .. snapshot-base] range."
            chain-state block-store utxo-set
            :fee-estimator fee-estimator
            :recent-rejects recent-rejects
-           :mempool mempool)
+           :mempool mempool
+           ;; From the CONTEXT, never from a caller who might forget: this
+           ;; argument was missing here from the day the function landed, so
+           ;; every reorg driven by the periodic activation — which on testnet4
+           ;; is most of them — reconnected blocks with the txindex switched
+           ;; off. Their transactions never entered the index, and the
+           ;; best-block marker stayed on a block the reorg had just
+           ;; disconnected, so the next startup read `marker-off-chain' and
+           ;; rescanned from genesis. Observed live 2026-08-20, one restart
+           ;; after the arrival path was fixed for the same omission (#372).
+           :tx-index (%context-tx-index))
         (when switched
           (bitcoin-lisp:log-info "Activated best chain: tip now height ~D"
                                  (bitcoin-lisp.storage:current-height chain-state)))
@@ -3423,7 +3447,8 @@ candidate activated."
                               height)
                :fee-estimator fee-estimator
                :recent-rejects recent-rejects
-               :mempool mempool))
+               :mempool mempool
+               :tx-index (%context-tx-index)))
           (cond
             (activated
              (remhash cand-hash (ibd-context-reorg-candidates *ibd-context*))
@@ -3536,7 +3561,8 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                                  height)
                      :fee-estimator fee-estimator
                      :recent-rejects recent-rejects
-                     :mempool mempool))
+                     :mempool mempool
+                     :tx-index (%context-tx-index)))
                 (cond
                   ;; A heavier-shorter fork can win the reorg with its tip at or
                   ;; below our height (real-difficulty fork vs min-difficulty
@@ -3620,7 +3646,8 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                    :skip-scripts skip-scripts
                    :fee-estimator fee-estimator
                    :recent-rejects recent-rejects
-                   :mempool mempool))
+                   :mempool mempool
+                   :tx-index (%context-tx-index)))
               (cond
                 (activated
                  (clear-block-failure hash)
@@ -3843,7 +3870,8 @@ the tip is ready to connect."
                  :skip-scripts skip-scripts
                  :fee-estimator fee-estimator
                  :recent-rejects recent-rejects
-                 :mempool mempool))
+                 :mempool mempool
+                 :tx-index (%context-tx-index)))
             (cond
               (activated
                (note-tip-advanced chain-state)

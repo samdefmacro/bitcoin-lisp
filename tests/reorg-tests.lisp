@@ -871,6 +871,87 @@ move the tip) and require that the heavier downloaded fork gets activated."
        (is (equalp fork-tip (bitcoin-lisp.storage:best-block-hash chain-state))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
 
+(test run-ibd-activation-carries-the-txindex
+  "The seam must carry its PAYLOAD, not merely exist. The sibling test above
+proved run-ibd calls activate-best-chain; it did not prove what it hands over,
+and in fact the :tx-index argument was missing from that one call site from the
+day it landed. activate-best-chain threads :tx-index into perform-reorg
+faithfully, so the code read correctly — but its only caller passed NIL, so
+every reorg driven by the periodic activation reconnected blocks with the
+transaction index switched off: their txs never entered the index, and the
+best-block marker stayed on a block the reorg had just disconnected. The next
+startup read `marker-off-chain' and rescanned from genesis (~9 minutes),
+observed live on testnet4 on 2026-08-20 one restart after the ARRIVAL path was
+fixed for the same omission.
+
+Assert the marker, not the call: the marker is the thing that was wrong."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "run-ibd-txindex")
+     (let* ((txdir (ensure-directories-exist
+                    (merge-pathnames (format nil "test-txidx-activate-~D/"
+                                             (get-internal-real-time))
+                                     (uiop:temporary-directory))))
+            (txindex (bitcoin-lisp.storage:init-tx-index txdir)))
+       (unwind-protect
+            (progn
+              (%build-and-connect chain-state block-store utxo-set genesis-hash
+                                  (make-test-chain-hashes #xA0 2))
+              (let ((fork-tip (%stage-heavier-downloaded-fork
+                               chain-state block-store genesis-hash)))
+                ;; Marker starts behind: nothing has indexed the fork yet.
+                (is (not (equalp fork-tip
+                                 (bitcoin-lisp.storage:txindex-best-block txindex))))
+                (let ((bitcoin-lisp.networking::*ibd-context*
+                        (bitcoin-lisp.networking::make-ibd-context)))
+                  (bitcoin-lisp.networking::run-ibd
+                   nil chain-state utxo-set block-store :tx-index txindex))
+                (is (equalp fork-tip (bitcoin-lisp.storage:best-block-hash chain-state)))
+                ;; THE assertion: the reorg carried the index with it.
+                (is (equalp fork-tip
+                            (bitcoin-lisp.storage:txindex-best-block txindex)))))
+         (bitcoin-lisp.storage:close-tx-index txindex)
+         (uiop:delete-directory-tree txdir :validate t :if-does-not-exist :ignore)))
+     (clrhash bitcoin-lisp.validation::*block-undo-data*))))
+
+(test every-block-activation-on-the-ibd-path-carries-the-txindex
+  "A structural guard, because the behavioural one above can only cover the
+paths a test happens to drive. src/networking/ibd.lisp reaches the chain
+through five calls — one activate-best-chain and four activate-block — and each
+takes the transaction index as an argument. All five omitted it, so blocks that
+arrived by the drain, retry and reorg paths were connected with the index
+switched off. The failure is silent until a restart, at which point the
+best-block marker names a disconnected block and the whole index is rebuilt
+from genesis.
+
+Read the source and require that every one of those calls passes :tx-index.
+A new call site that forgets is the way this bug returns; it has already
+returned twice."
+  (let* ((src (uiop:read-file-string
+               (merge-pathnames "src/networking/ibd.lisp"
+                                (asdf:system-source-directory :bitcoin-lisp))))
+         (calls '()))
+    ;; Collect each activation call together with the argument list that
+    ;; follows it, up to the next top-level form.
+    (loop with start = 0
+          for pos = (search "bitcoin-lisp.validation:activate-" src :start2 start)
+          while pos
+          do (let* ((end (or (search "(defun " src :start2 pos) (length src)))
+                    (next (or (search "bitcoin-lisp.validation:activate-"
+                                      src :start2 (+ pos 10))
+                              end))
+                    (form (subseq src pos (min end next (+ pos 1200)))))
+               (push form calls)
+               (setf start (+ pos 10))))
+    (is (= 5 (length calls))
+        "expected 5 activation call sites in ibd.lisp; if this changed, the
+         new one needs :tx-index too")
+    (dolist (form calls)
+      (is (search ":tx-index" form)
+          "an activate-block/activate-best-chain call in ibd.lisp omits
+           :tx-index, which silently disables the transaction index for every
+           block it connects"))))
+
 (test best-valid-tip-min-work-floor-prunes-the-search
   "best-valid-tip's MIN-WORK floor is what makes it affordable on the sync
 path: BLOCK-EXISTS-P is a filesystem probe per entry, so the chain-work compare
