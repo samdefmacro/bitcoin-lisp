@@ -176,3 +176,106 @@ would otherwise read as `no properties' and the parent could type fine."
   ;; Genuinely malformed input is a parse error, which is a different thing.
   (signals bitcoin-lisp.validation::miniscript-parse-error
     (bitcoin-lisp.validation::ms-parse "nosuchfragment(1)")))
+
+;;; --- Inside a descriptor ----------------------------------------------------
+
+;;; DEFPARAMETER, not DEFCONSTANT: defconstant compares with EQL, and two
+;;; string literals with the same characters are not EQL — so reloading the
+;;; compiled file signals DEFCONSTANT-UNEQL. The warm image never sees it
+;;; (the form runs once); the cold battery does, on the second load.
+(defparameter *ms-desc-key-a*
+  "03d30199d74fb5a22d47b6e054e2f378cedacffcb89904a61d75d0dbd407143e65")
+(defparameter *ms-desc-key-b*
+  "03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556")
+
+(defun %ms-desc-spk (string &optional (pos 0))
+  (let ((d (bitcoin-lisp.rpc::parse-descriptor string :mainnet)))
+    (string-downcase
+     (bitcoin-lisp.crypto:bytes-to-hex
+      (first (bitcoin-lisp.rpc::%out-desc-expand-uncached d pos))))))
+
+(defun %ms-desc-witness-script (string &optional (pos 0))
+  (let* ((d (bitcoin-lisp.rpc::parse-descriptor string :mainnet))
+         (inner (bitcoin-lisp.rpc::out-desc-sub d)))
+    (string-downcase
+     (bitcoin-lisp.crypto:bytes-to-hex
+      (first (bitcoin-lisp.rpc::%out-desc-expand-1
+              inner pos
+              (lambda (k) (bitcoin-lisp.rpc::%desc-key-pubkey-at k pos))))))))
+
+(test wsh-accepts-a-miniscript-policy
+  "The point of G7-41: a timelocked recovery policy is expressible as a
+descriptor at all. wsh(and_v(v:pk(K),older(144))) compiles to
+  <K> OP_CHECKSIGVERIFY <144> OP_CHECKSEQUENCEVERIFY
+which is checked byte for byte here, because it exercises three things at once:
+the -VERIFY conversion (0xad, not 0xac followed by OP_VERIFY), the minimal
+CScriptNum encoding of 144 (0x9000 — two bytes, because 0x90 alone would read
+as negative), and the fragment order."
+  (let ((desc (format nil "wsh(and_v(v:pk(~A),older(144)))" *ms-desc-key-a*)))
+    (is (string= (format nil "21~Aad029000b2" (string-downcase *ms-desc-key-a*))
+                 (%ms-desc-witness-script desc)))
+    ;; And the outer script is the ordinary P2WSH commitment to it.
+    (let ((spk (%ms-desc-spk desc)))
+      (is (= 68 (length spk)))
+      (is (string= "0020" (subseq spk 0 4))))))
+
+(test wsh-miniscript-covers-the-shapes-policy-wallets-use
+  "or_d for a spend-or-recover branch, thresh for a decaying multisig, and a
+nested and_v — the shapes G7-41 names as unimportable today."
+  (dolist (expr (list
+                 ;; Either key A signs, or after a delay key B does.
+                 (format nil "or_d(pk(~A),and_v(v:pk(~A),older(1008)))"
+                         *ms-desc-key-a* *ms-desc-key-b*)
+                 ;; 2-of-2 by threshold rather than CHECKMULTISIG.
+                 (format nil "thresh(2,pk(~A),s:pk(~A))"
+                         *ms-desc-key-a* *ms-desc-key-b*)
+                 ;; An absolute-height branch.
+                 (format nil "or_i(pk(~A),and_v(v:pk(~A),after(500000)))"
+                         *ms-desc-key-a* *ms-desc-key-b*)))
+    (let ((desc (format nil "wsh(~A)" expr)))
+      (let ((spk (%ms-desc-spk desc)))
+        (is (= 68 (length spk)) "~A must expand to a P2WSH scriptPubKey" expr)
+        (is (string= "0020" (subseq spk 0 4)))))))
+
+(test wsh-miniscript-derives-a-whole-range-from-one-parsed-node
+  "The design claim behind making the key converter a parameter: a miniscript
+holds key EXPRESSIONS, so one parsed node serves every index of a ranged
+descriptor and each index gets a different script."
+  (let* ((xpub "xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y")
+         (desc (format nil "wsh(and_v(v:pk(~A/*),older(10)))" xpub))
+         (s0 (%ms-desc-spk desc 0))
+         (s1 (%ms-desc-spk desc 1))
+         (s2 (%ms-desc-spk desc 2)))
+    (is (= 68 (length s0)))
+    (is (not (string= s0 s1)) "each range index must give its own script")
+    (is (not (string= s1 s2)))
+    ;; Re-deriving the same index is stable.
+    (is (string= s0 (%ms-desc-spk desc 0)))))
+
+(test miniscript-is-refused-outside-wsh
+  "Core only accepts miniscript inside wsh(): the type rules and the resource
+limits are stated for a specific script context, and P2WSH is the one this
+implements. Accepting it at top level or inside sh() would produce scripts
+whose limits were never checked."
+  (let ((expr (format nil "and_v(v:pk(~A),older(144))" *ms-desc-key-a*)))
+    (signals error (bitcoin-lisp.rpc::parse-descriptor expr :mainnet))
+    (signals error (bitcoin-lisp.rpc::parse-descriptor
+                    (format nil "sh(~A)" expr) :mainnet))
+    ;; But sh(wsh(...)) is fine, since the miniscript is still in a wsh.
+    (is-true (bitcoin-lisp.rpc::parse-descriptor
+              (format nil "sh(wsh(~A))" expr) :mainnet))))
+
+(test a-miniscript-that-does-not-type-is-refused-by-the-descriptor
+  "An expression can be well-formed and still break the type rules. The
+descriptor layer must reject it rather than build a script from a node whose
+type is zero — that script would be unspendable or malleable, and the whole
+point of miniscript is to know so in advance."
+  ;; andor requires its first argument to be Bdu; `1' is not d.
+  (signals error (bitcoin-lisp.rpc::parse-descriptor "wsh(andor(1,1,1))" :mainnet))
+  ;; A K-type expression is not valid at top level; it needs a c: wrapper.
+  (signals error (bitcoin-lisp.rpc::parse-descriptor
+                  (format nil "wsh(pk_k(~A))" *ms-desc-key-a*) :mainnet))
+  ;; older(0) is out of range.
+  (signals error (bitcoin-lisp.rpc::parse-descriptor
+                  (format nil "wsh(and_v(v:pk(~A),older(0)))" *ms-desc-key-a*)
+                  :mainnet)))
