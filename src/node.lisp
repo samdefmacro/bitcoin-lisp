@@ -1936,6 +1936,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (log-file nil)
                         (log-rate-limit t)
                         (flat-block-files nil)
+                        (reindex nil)
                         (console-log t)
                         (max-peers 8)
                         (sync t)
@@ -2258,6 +2259,22 @@ Returns the node instance."
        (error "Corrupt headerindex.dat at ~A" (node-data-directory *node*)))
       ;; No file at all — a legitimate first run.
       (t nil)))
+
+  ;; -reindex: rebuild the block index from the block files before anything
+  ;; reads it. Runs AFTER the header index load so an intact index is simply
+  ;; extended rather than discarded — reindexing is additive, and a node that
+  ;; threw away a good index to rebuild it would be strictly worse off if the
+  ;; files turned out to be incomplete.
+  (when (and reindex (node-block-store *node*))
+    (log-info "Reindex: rebuilding the block index from the block files...")
+    (multiple-value-bind (added orphans)
+        (bitcoin-lisp.storage:reindex-block-index
+         (node-block-store *node*) (node-chain-state *node*))
+      (log-info "Reindex: added ~D block index entries~@[, ~D record~:P had no parent~]"
+                added (and (plusp orphans) orphans))
+      (when (plusp added)
+        (bitcoin-lisp.storage:save-header-index (node-chain-state *node*)
+                                                :force-full t))))
 
   ;; Per-file accounting for the flat block files, recovered by joining the
   ;; store's hash -> position map with the header index's hash -> height. It
