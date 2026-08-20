@@ -593,6 +593,29 @@ clients (bitcoin-cli, curl) send no Origin at all and always pass."
              (string-equal (subseq origin (+ scheme-end 3))
                            (string-trim '(#\Space #\Tab) host))))))
 
+(defun %credential-bytes (string)
+  "The bytes a configured credential is made of. UTF-8, because that is how the
+config file and the .cookie file were read; Core never decodes at all and
+compares the file's bytes directly, so encoding here is how we recover the same
+comparison."
+  (flexi-streams:string-to-octets string :external-format :utf-8))
+
+(defun %timing-resistant-equal-bytes (a b)
+  "TIMING-RESISTANT-EQUAL over octet vectors (Core TimingResistantEqual,
+util/strencodings.h:203-210). Byte-wise, because an HTTP Basic credential is
+bytes: decoding it to characters first is what made a non-ASCII password
+unusable."
+  (declare (type (vector (unsigned-byte 8)) a b))
+  (let ((la (length a))
+        (lb (length b)))
+    (if (zerop lb)
+        (zerop la)
+        (let ((accumulator (logxor la lb)))
+          (dotimes (i la)
+            (setf accumulator
+                  (logior accumulator (logxor (aref a i) (aref b (mod i lb))))))
+          (zerop accumulator)))))
+
 (defun check-auth (auth-header)
   "T when AUTH-HEADER — the request's Authorization header, NIL when it carried
 none — is an HTTP Basic credential matching the RPC user and password. Those
@@ -605,16 +628,27 @@ httprpc.cpp:112-133). The cookie file is the local access boundary."
        (> (length auth-header) 6)
        (string-equal (subseq auth-header 0 6) "Basic ")
        (handler-case
-           (let* ((decoded (flexi-streams:octets-to-string
-                            (cl-base64:base64-string-to-usb8-array
-                             (string-trim '(#\Space #\Tab)
-                                          (subseq auth-header 6)))))
-                  (colon-pos (position #\: decoded)))
+           ;; Compare BYTES, never decoded characters. Core assigns the base64
+           ;; output straight into a std::string and compares it against the
+           ;; configured credential as raw bytes (RPCAuthorized,
+           ;; httprpc.cpp:84-102) — no encoding is involved on either side.
+           ;;
+           ;; We decoded the header with FLEXI-STREAMS:OCTETS-TO-STRING, whose
+           ;; default external format is latin-1, while the configured password
+           ;; came from a config file read as UTF-8. For any non-ASCII byte the
+           ;; two disagree, so a non-ASCII -rpcpassword could never authenticate
+           ;; — the credential was correct and the node said 401 forever.
+           (let* ((decoded (cl-base64:base64-string-to-usb8-array
+                            (string-trim '(#\Space #\Tab)
+                                         (subseq auth-header 6))))
+                  (colon-pos (position (char-code #\:) decoded)))
              (when colon-pos
-               (and (%timing-resistant-equal (subseq decoded 0 colon-pos)
-                                             *rpc-user*)
-                    (%timing-resistant-equal (subseq decoded (1+ colon-pos))
-                                             *rpc-password*))))
+               (and (%timing-resistant-equal-bytes
+                     (subseq decoded 0 colon-pos)
+                     (%credential-bytes *rpc-user*))
+                    (%timing-resistant-equal-bytes
+                     (subseq decoded (1+ colon-pos))
+                     (%credential-bytes *rpc-password*)))))
          (error () nil))))
 
 (defun rpc-json-error (http-status code message)
@@ -686,13 +720,14 @@ must stay a value test (NIL = success), not a key-presence test."
           (rpc-json-error hunchentoot:+http-bad-request+ +rpc-misc-error+
                           "Request body too large"))))
 
-    ;; Check Content-Type
-    (let ((content-type (hunchentoot:header-in :content-type request)))
-      (unless (and content-type
-                   (or (search "application/json" content-type)
-                       (search "text/plain" content-type))) ; bitcoin-cli uses text/plain
-        (setf (hunchentoot:return-code*) hunchentoot:+http-unsupported-media-type+)
-        (return-from rpc-handler "")))
+    ;; No Content-Type check. Core's HTTPReq_JSONRPC (httprpc.cpp:104-165) never
+    ;; inspects the request's Content-Type at all — it writes one on the
+    ;; RESPONSE and reads the body as JSON regardless. We required
+    ;; application/json or text/plain and answered 415 otherwise, so a plain
+    ;; `curl -d ...` (which defaults to application/x-www-form-urlencoded) and
+    ;; any client that omits the header were refused here and worked against
+    ;; Core. A body that is not JSON already fails at the parse below with a
+    ;; -32700, which is the accurate answer; 415 blamed the header instead.
 
     ;; Process request. A /wallet/<name> endpoint routes wallet RPCs to that
     ;; wallet (Core httprpc.cpp:340 registers the same handler under
