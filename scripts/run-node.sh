@@ -56,7 +56,13 @@ case "$NETWORK" in
     # exercise the LevelDB txindex from GA9 S2-13 against a real chain -- the
     # previous in-memory implementation could not run at mainnet scale at all,
     # so this path has never had production exposure.
-    START_OPTS=':blockfilterindex t :v2transport t :coinstatsindex t :txindex t' ;;
+    # :flat-block-files on testnet4 ONLY. New blocks go into Core's numbered
+    # blk?????.dat instead of one file per block; the existing per-block files
+    # stay readable (dual read), and turning the flag back off leaves the flat
+    # records readable too, so this is reversible in both directions. Mainnet
+    # stays off until this has soaked here -- it is the pruned node, and
+    # pruning a flat file is all-or-nothing.
+    START_OPTS=':blockfilterindex t :v2transport t :coinstatsindex t :txindex t :flat-block-files t' ;;
   mainnet)
     HEAP=5120; RPC_PORT=8332
     DATA_DIR="$BL_DATA_ROOT/mainnet-prune/"; LOG="$BL_LOG_ROOT/mainnet.log"
