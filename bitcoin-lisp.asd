@@ -74,6 +74,7 @@
                  (:module "mempool"
                   :components ((:file "feefrac")
                                (:file "cluster-linearize")
+                               (:file "spanning-forest")
                                (:file "txgraph")
                                (:file "orphan")
                                (:file "mempool")
@@ -142,6 +143,7 @@
                              (:file "feefrac-tests")
                              ;; Cluster mempool: DepGraph/chunking/linearization
                              (:file "cluster-linearize-tests")
+                             (:file "spanning-forest-tests")
                              ;; Cluster mempool: txgraph engine (Core txgraph.{h,cpp})
                              (:file "txgraph-tests")
                              ;; Cluster mempool P3: shadow-mode mempool/txgraph equivalence
