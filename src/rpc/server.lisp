@@ -23,6 +23,7 @@
 (defconstant +rpc-verify-error+ -25)
 (defconstant +rpc-transaction-rejected+ -26)
 (defconstant +rpc-verify-already-in-utxo-set+ -27)
+(defconstant +rpc-in-warmup+ -28)
 (defconstant +rpc-client-node-not-connected+ -29)
 (defconstant +rpc-client-invalid-ip-or-subnet+ -30)
 (defconstant +rpc-method-deprecated+ -32)
@@ -46,8 +47,41 @@
   "Register an RPC method handler."
   (setf (gethash name *rpc-methods*) handler))
 
+(defvar *rpc-warmup-status* nil
+  "What the node is doing while it starts, or NIL once it is ready.
+
+Core's rpcWarmupStatus / fRPCInWarmup (rpc/server.cpp:35-36). Every RPC answers
+RPC_IN_WARMUP (-28) with this string until SetRPCWarmupFinished, which is what
+lets the server be REACHABLE before the node is usable — a client gets a
+specific, retryable answer instead of a refused connection.
+
+NIL by default, and START-RPC-SERVER enters warmup only when its caller asks
+(:WARMUP T, which START-NODE passes). Core's equivalent is true at static init
+because its only caller is AppInitMain; here the server is also started
+directly from tests and the REPL, where \"ready\" is the honest answer and an
+implicit warmup would be a trap.")
+
+(defun set-rpc-warmup-status (status)
+  "Report what startup is doing (Core SetRPCWarmupStatus, wired to InitMessage,
+init.cpp:1559)."
+  (setf *rpc-warmup-status* status))
+
+(defun finish-rpc-warmup ()
+  "Mark the node ready; every RPC answers normally from here (Core
+SetRPCWarmupFinished, init.cpp:2293)."
+  (setf *rpc-warmup-status* nil))
+
 (defun dispatch-rpc-method (node method params)
-  "Dispatch to the appropriate method handler."
+  "Dispatch to the appropriate method handler.
+
+Warmup is checked FIRST, before the method is even looked up — the position
+Core checks it in (CRPCTable::execute, rpc/server.cpp:484-489) — and with no
+exemptions, also as in Core. That ordering is deliberate: during warmup the
+node cannot answer anything honestly, so "still starting" is a better reply
+than "no such method" for a method that does exist."
+  (let ((warmup *rpc-warmup-status*))
+    (when warmup
+      (error 'rpc-error :code +rpc-in-warmup+ :message warmup)))
   (let ((handler (gethash method *rpc-methods*)))
     (unless handler
       ;; Core's exact message (server.cpp:499) — no method-name suffix.
@@ -1171,7 +1205,7 @@ Callers must have bound the listening socket first — this writes .cookie, and
 
 (defun start-rpc-server (node &key port (bind "127.0.0.1")
                                    (bind-supplied-p nil)
-                                   user password rpc-auth allow-ip
+                                   user password rpc-auth allow-ip warmup
                                    rest-enabled
                                    ui-enabled ui-directory)
   "Start the RPC server.
@@ -1195,6 +1229,12 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
       (bitcoin-lisp::node-log :warn "RPC server already running")
       (return-from start-rpc-server nil))
     (setf bind (%rpc-bind-address bind allow-ip bind-supplied-p))
+
+    ;; WARMUP: answer -28 to everything until FINISH-RPC-WARMUP. Set before the
+    ;; socket binds, so the very first request a client can make already gets
+    ;; the honest answer.
+    (when warmup
+      (set-rpc-warmup-status (if (stringp warmup) warmup "Loading...")))
 
     ;; Parse the ACL and the -rpcauth credentials before anything is bound or
     ;; written, so a malformed option is a clean refusal to start (Core
@@ -1354,6 +1394,10 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
     (setf *rpc-server* nil)
     (setf *rpc-node* nil)
     (setf *rpc-credentials* '())
+    ;; Warmup belongs to a RUNNING server; with none there is nothing to be
+    ;; warming up, and leaving it armed would make every later request in this
+    ;; image answer -28.
+    (setf *rpc-warmup-status* nil)
     (setf *rpc-allow-subnets* *rpc-loopback-subnets*)
     (setf *rpc-dispatcher* nil)
     (setf *rest-dispatcher* nil)

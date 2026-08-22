@@ -51,6 +51,39 @@ as one."
   (when datadir
     (namestring (uiop:ensure-directory-pathname datadir))))
 
+(defun %start-rpc-early (node rpc-port rpc-bind rpc-bind-supplied-p
+                         rpc-user rpc-password rpc-auth rpc-allow-ip
+                         rest-enabled network webui webui-supplied-p
+                         webui-path webui-open)
+  "Bring the RPC server up before the slow parts of startup.
+
+Split out of START-NODE only because it is called from the middle of it now
+rather than the end; the body is unchanged. The server is reachable from this
+point and answers -28 for every method until FINISH-RPC-WARMUP."
+  ;; Web UI default (gui-plan §2): on everywhere except mainnet, where
+  ;; enabling it is the operator's explicit choice (-webui).
+  (let* ((webui-enabled (if webui-supplied-p
+                            (and webui t)
+                            (not (eq network :mainnet))))
+         (server (bitcoin-lisp.rpc:start-rpc-server node
+                                                    :port rpc-port
+                                                    :bind rpc-bind
+                                                    :bind-supplied-p
+                                                    rpc-bind-supplied-p
+                                                    :user rpc-user
+                                                    :password rpc-password
+                                                    :rpc-auth rpc-auth
+                                                    :allow-ip rpc-allow-ip
+                                                    :rest-enabled rest-enabled
+                                                    :ui-enabled webui-enabled
+                                                    :ui-directory webui-path
+                                                    :warmup "Loading...")))
+    ;; -webuiopen: pop the local browser at the dashboard. Logged, never
+    ;; fatal (open-browser-to-ui catches everything).
+    (when (and server webui-enabled webui-open)
+      (bitcoin-lisp.rpc:open-browser-to-ui rpc-port))
+    server))
+
 (defun %resolve-log-file (log-file data-directory)
   "The path to log to, or NIL for no file log.
 
@@ -2679,7 +2712,25 @@ txindex ~D MiB, per-index ~D MiB"
   (setf bitcoin-lisp.mempool:*block-policy-estimator*
         (bitcoin-lisp.mempool:make-block-policy-estimator))
 
+  ;; The RPC server comes up HERE — before the mempool replay and the index
+  ;; catch-ups below, which is Core's order: AppInitServers (which starts the
+  ;; HTTP/RPC server) runs long before LoadMempool and the index sync
+  ;; (init.cpp:750-760 vs the import thread). Every request answers
+  ;; RPC_IN_WARMUP (-28) with the current status until start-node finishes.
+  ;;
+  ;; This is the fix for a real outage: an 83 MB mempool.dat turned a restart
+  ;; into a ~45-minute window in which the node was alive, working, and
+  ;; completely unreachable — bitcoin-cli got connection refused and the
+  ;; monitoring saw a dead node. It now gets "-28 Replaying mempool...", which
+  ;; is retryable and true.
+  (when rpc-port
+    (%start-rpc-early *node* rpc-port rpc-bind rpc-bind-supplied-p
+                      rpc-user rpc-password rpc-auth rpc-allow-ip
+                      rest-enabled network webui webui-supplied-p
+                      webui-path webui-open))
+
   ;; Reload the persisted mempool through normal acceptance (Core LoadMempool)
+  (bitcoin-lisp.rpc:set-rpc-warmup-status "Replaying mempool...")
   (load-mempool-from-disk *node*)
 
   ;; Initialize peer address book
@@ -2742,6 +2793,7 @@ txindex ~D MiB, per-index ~D MiB"
     ;; chains this can run over are ones we hold in full; a background thread
     ;; is the better shape and is left for the same change that gives the index
     ;; its own catch-up worker.
+    (bitcoin-lisp.rpc:set-rpc-warmup-status "Catching up transaction index...")
     (let ((chainstate (node-current-chainstate *node*))
           (store (node-block-store *node*)))
       (when (and chainstate store)
@@ -2767,6 +2819,7 @@ txindex ~D MiB, per-index ~D MiB"
     ;; One-time catch-up over already-stored blocks, before the sync thread
     ;; starts (single-threaded here, so no writer races). Fresh-from-genesis
     ;; nodes have nothing to do; the connect-time hook then indexes forward.
+    (bitcoin-lisp.rpc:set-rpc-warmup-status "Catching up block filter index...")
     (%catch-up-blockfilterindex *node*))
 
   ;; Initialize coinstatsindex (optional). Like the filter index, catch up over
@@ -2787,6 +2840,7 @@ txindex ~D MiB, per-index ~D MiB"
     (when reindex-chainstate
       (bitcoin-lisp.storage:coinstatsindex-clear-best (node-coinstatsindex *node*))
       (log-info "Coinstats index: rebuilding after chainstate reindex"))
+    (bitcoin-lisp.rpc:set-rpc-warmup-status "Catching up coinstats index...")
     (%catch-up-coinstatsindex *node*))
 
   ;; -forcecompactdb: once every LevelDB is open (and any reindex/backfill has
@@ -2841,29 +2895,11 @@ txindex ~D MiB, per-index ~D MiB"
 
   (setf (node-running *node*) t)
 
-  ;; Start RPC server if port specified
+  ;; The RPC server is UP by now (see %start-rpc-early above); the node is
+  ;; ready, so stop answering -28.
+  (bitcoin-lisp.rpc:finish-rpc-warmup)
   (when rpc-port
-    ;; Web UI default (gui-plan §2): on everywhere except mainnet, where
-    ;; enabling it is the operator's explicit choice (-webui).
-    (let* ((webui-enabled (if webui-supplied-p
-                              (and webui t)
-                              (not (eq network :mainnet))))
-           (server (bitcoin-lisp.rpc:start-rpc-server *node*
-                                                      :port rpc-port
-                                                      :bind rpc-bind
-                                                      :bind-supplied-p
-                                                      rpc-bind-supplied-p
-                                                      :user rpc-user
-                                                      :password rpc-password
-                                                      :rpc-auth rpc-auth
-                                                      :allow-ip rpc-allow-ip
-                                                      :rest-enabled rest-enabled
-                                                      :ui-enabled webui-enabled
-                                                      :ui-directory webui-path)))
-      ;; -webuiopen: pop the local browser at the dashboard. Logged, never
-      ;; fatal (open-browser-to-ui catches everything).
-      (when (and server webui-enabled webui-open)
-        (bitcoin-lisp.rpc:open-browser-to-ui rpc-port))))
+    (log-info "RPC server ready"))
 
   ;; Connect to peers and sync if requested (in background thread)
   ;; Reconnects and retries when peers are lost, similar to Bitcoin Core's
@@ -4139,7 +4175,9 @@ thread; see the shutdown-coordination section above."
   ;; teardown below disconnects them).
   (save-anchors *node*)
 
-  ;; Stop RPC server first
+  ;; Stop RPC server first. Warmup is the SERVER's state, cleared by
+  ;; stop-rpc-server — re-arming it here left it armed for anything else in the
+  ;; image, which in the test suite meant every later request answered -28.
   (bitcoin-lisp.rpc:stop-rpc-server)
 
   ;; Signal the node to stop. request-ibd-stop reaches the IBD inner

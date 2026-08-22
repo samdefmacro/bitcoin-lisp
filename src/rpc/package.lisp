@@ -6,6 +6,8 @@
   (:export
    ;; Server control
    #:start-rpc-server
+   #:set-rpc-warmup-status
+   #:finish-rpc-warmup
    #:stop-rpc-server
    #:*rpc-server*
    #:open-browser-to-ui
