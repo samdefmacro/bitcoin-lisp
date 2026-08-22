@@ -234,7 +234,7 @@ global keys to the first file's last section."
     (is (eq t (getf plist :txindex)))
     (is (= 2000 (getf plist :dbcache-mib)))
     (is (string= "bob" (getf plist :rpc-user)))
-    (is (= 16 (getf plist :max-peers)))
+    (is (= 16 (getf plist :max-connections)))
     (is (eq nil (getf plist :v2transport)))))
 
 (test config-forcecompactdb-flag

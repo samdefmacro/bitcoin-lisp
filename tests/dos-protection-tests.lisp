@@ -670,7 +670,7 @@ the queue — and its file descriptors — grow without bound: the live wedge le
     ;; Control: an empty backlog admits.
     (is-true (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.7"))
     (setf (bitcoin-lisp::node-pending-inbound-peers node)
-          (loop repeat bitcoin-lisp::+max-inbound-peers+
+          (loop repeat bitcoin-lisp::*max-inbound-connections*
                 collect (bitcoin-lisp.networking:make-peer :inbound t)))
     (multiple-value-bind (allowed reason)
         (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.7")

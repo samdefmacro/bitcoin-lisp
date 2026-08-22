@@ -129,8 +129,6 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   ;; *next-inbound-inv-flush*). 0 = not yet scheduled.
   (next-inv-send-time 0 :type integer)
   ;; Health monitoring
-  (consecutive-ping-failures 0 :type (unsigned-byte 8))
-  (last-health-check 0 :type integer)
   ;; Block delivery tracking
   (block-timeout-count 0 :type (unsigned-byte 8))
   (last-block-received-time 0 :type integer)  ; internal-real-time of last block from this peer
@@ -1417,15 +1415,16 @@ periodic tick rather than once at handshake."
       (when (or (zerop (peer-min-ping-latency peer))
                 (< rtt (peer-min-ping-latency peer)))
         (setf (peer-min-ping-latency peer) rtt)))
-    (setf (peer-ping-nonce peer) nil)
-    ;; Reset failure count on successful pong
-    (setf (peer-consecutive-ping-failures peer) 0)))
+    (setf (peer-ping-nonce peer) nil)))
 
 ;;; Peer Health Monitoring
 
-(defconstant +ping-interval-seconds+ 60)
-(defconstant +ping-timeout-seconds+ 30)
-(defconstant +max-ping-failures+ 3)
+(defconstant +ping-interval-seconds+ 120
+  "Core PING_INTERVAL (net_processing.cpp:122): a keepalive/latency ping is
+sent once no ping is outstanding and this long has passed.")
+(defconstant +ping-timeout-seconds+ 1200
+  "Core TIMEOUT_INTERVAL (net.h:59): a ping left unanswered this long
+disconnects the peer (MaybeSendPing, net_processing.cpp:5487-5494).")
 
 (defconstant +max-block-timeouts+ 15
   "Per-peer block-request timeout count threshold before disconnect.
@@ -1456,8 +1455,14 @@ Returns :disconnect if the peer should be disconnected, :ok otherwise."
 
 (defun check-peer-health (peer)
   "Check health of a single peer. Returns :ok, :ping-sent, or :disconnect.
-Should be called periodically (every ~60s).
-Also checks handshake timeout for peers that haven't completed handshake."
+Also checks handshake timeout for peers that haven't completed handshake.
+
+The ping half is Core's MaybeSendPing (net_processing.cpp:5487-5510): while a
+ping is outstanding, nothing is sent and the peer is disconnected once it has
+gone unanswered for +ping-timeout-seconds+; with none outstanding, a new ping
+goes out +ping-interval-seconds+ after the last one was sent. Both clocks are
+the send time of the last ping, so an outstanding ping is never overwritten
+and its age never reset."
   ;; Send-side upkeep, regardless of state: retry buffered unsent bytes
   ;; (non-blocking), and disconnect a peer whose socket has accepted nothing
   ;; for +send-stall-timeout-seconds+ while data is pending (Core
@@ -1475,26 +1480,16 @@ Also checks handshake timeout for peers that haven't completed handshake."
   (unless (eq (peer-state peer) :ready)
     (return-from check-peer-health (check-handshake-timeout peer)))
 
-  (let ((now (get-internal-real-time))
-        (interval-ticks (* +ping-interval-seconds+ internal-time-units-per-second))
-        (timeout-ticks (* +ping-timeout-seconds+ internal-time-units-per-second)))
-
-    ;; Check if a ping is outstanding and has timed out
-    (when (peer-ping-nonce peer)
-      (when (> (- now (peer-last-ping-time peer)) timeout-ticks)
-        ;; Ping timed out
-        (incf (peer-consecutive-ping-failures peer))
-        (setf (peer-ping-nonce peer) nil)
-        (when (>= (peer-consecutive-ping-failures peer) +max-ping-failures+)
-          (return-from check-peer-health :disconnect))))
-
-    ;; Send a new ping if enough time has passed
-    (when (> (- now (peer-last-health-check peer)) interval-ticks)
-      (setf (peer-last-health-check peer) now)
-      (send-ping peer)
-      (return-from check-peer-health :ping-sent))
-
-    :ok))
+  (let ((age (- (get-internal-real-time) (peer-last-ping-time peer))))
+    (cond
+      ((peer-ping-nonce peer)
+       (if (> age (* +ping-timeout-seconds+ internal-time-units-per-second))
+           :disconnect
+           :ok))
+      ((> age (* +ping-interval-seconds+ internal-time-units-per-second))
+       (send-ping peer)
+       :ping-sent)
+      (t :ok))))
 
 (defun record-block-timeout (peer)
   "Record a block request timeout for PEER.
