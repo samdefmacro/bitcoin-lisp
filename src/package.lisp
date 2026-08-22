@@ -481,6 +481,13 @@
    #:rebuild-block-file-info
    #:reindex-block-index
    #:migrate-blocks-to-flat-files
+   ;; Core datadir layout (storage/datadir.lisp)
+   #:datadir-undo-path
+   #:datadir-block-index-path
+   #:datadir-header-index-file
+   #:datadir-index-path
+   #:datadir-layout-report
+   #:migrate-datadir-layout
    #:count-legacy-blocks
    #:prune-flat-block-file
    #:store-block

@@ -49,8 +49,9 @@ metadata key below.")
 distinct from the 33-byte transaction keys, so it can never collide.")
 
 (defun txindex-db-path (base-path)
-  "Directory of the txindex LevelDB."
-  (merge-pathnames "txindex/" (pathname base-path)))
+  "Directory of the txindex LevelDB. Core's indexes/txindex/, falling back to
+the flat txindex/ this tree used before — see storage/datadir.lisp."
+  (datadir-index-path (pathname base-path) :txindex))
 
 (defun %txindex-key (txid)
   "DB key for TXID: the prefix byte followed by the 32-byte hash."

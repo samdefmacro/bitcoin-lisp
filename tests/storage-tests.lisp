@@ -4,6 +4,96 @@
 
 ;;;; Block store
 
+(test datadir-layout-prefers-core-and-falls-back-to-legacy
+  "Core doc/files.md: blocks/index/, indexes/txindex/,
+indexes/blockfilter/basic/, indexes/coinstatsindex/. This tree kept
+headerindex.dat at the network-dir root and the indexes as flat siblings.
+
+Every resolver PREFERS Core's path and falls back only when the legacy one
+actually holds data. That asymmetry is the whole safety property: adopting
+Core's layout unconditionally would present an EMPTY datadir to a node that has
+one, which on mainnet means discarding a synced chain and starting IBD from
+genesis."
+  (let ((dir (merge-pathnames (format nil "bl-datadir-~D/" (get-internal-real-time))
+                              (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           ;; A FRESH datadir is Core-shaped from the first byte — which is
+           ;; what the conformance harness needs.
+           (is (search "indexes/txindex"
+                       (namestring (bitcoin-lisp.storage:datadir-index-path dir :txindex))))
+           (is (search "blocks/index"
+                       (namestring (bitcoin-lisp.storage:datadir-header-index-file dir))))
+           (is (null (bitcoin-lisp.storage:datadir-layout-report dir)))
+           ;; An EMPTY Core-side directory must not win against a legacy one
+           ;; that holds data: ensure-directories-exist creates empty ones
+           ;; freely, so existence alone cannot be the test.
+           (ensure-directories-exist (merge-pathnames "indexes/txindex/" dir))
+           (ensure-directories-exist (merge-pathnames "txindex/" dir))
+           (with-open-file (out (merge-pathnames "txindex/CURRENT" dir)
+                                :direction :output :if-exists :supersede)
+             (write-line "x" out))
+           (multiple-value-bind (path legacy-p)
+               (bitcoin-lisp.storage:datadir-index-path dir :txindex)
+             (is-true legacy-p "an empty Core directory beat a populated legacy one")
+             (is (search "/txindex" (namestring path))))
+           ;; Legacy headerindex.dat likewise.
+           (with-open-file (out (merge-pathnames "headerindex.dat" dir)
+                                :direction :output :if-exists :supersede)
+             (write-line "x" out))
+           (multiple-value-bind (path legacy-p)
+               (bitcoin-lisp.storage:datadir-header-index-file dir)
+             (is-true legacy-p)
+             (is (equal (merge-pathnames "headerindex.dat" dir) path)))
+           ;; And the report names them, so an operator is told WHICH directory
+           ;; is keeping their node off Core's layout.
+           (let ((report (bitcoin-lisp.storage:datadir-layout-report dir)))
+             (is (member "block index" report :key #'first :test #'string=))
+             (is (member "txindex" report :key #'first :test #'string=))))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore)))))
+
+(test migrate-datadir-layout-moves-and-is-idempotent
+  "-migratedatadir moves a legacy datadir to Core's layout. Asserted through
+the FILES, and specifically that the data ARRIVES — a migration that reports
+success and moves nothing is the failure mode this project has already hit once
+(backupwallet, where RENAME-FILE merged the target with the source pathname)."
+  (let ((dir (merge-pathnames (format nil "bl-migrate-~D/" (get-internal-real-time))
+                              (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           (with-open-file (out (merge-pathnames "headerindex.dat" dir)
+                                :direction :output :if-exists :supersede)
+             (write-line "header-index-content" out))
+           (ensure-directories-exist (merge-pathnames "txindex/" dir))
+           (with-open-file (out (merge-pathnames "txindex/CURRENT" dir)
+                                :direction :output :if-exists :supersede)
+             (write-line "txindex-content" out))
+           ;; Dry run reports the moves and changes nothing.
+           (let ((planned (bitcoin-lisp.storage:migrate-datadir-layout dir :dry-run t)))
+             (is (= 2 (length planned)) "planned ~S" planned)
+             (is-true (probe-file (merge-pathnames "headerindex.dat" dir))
+                      "a dry run moved a file"))
+           (let ((moves (bitcoin-lisp.storage:migrate-datadir-layout dir)))
+             (is (= 2 (length moves))))
+           ;; The data is at Core's path, with its CONTENT, and gone from the old one.
+           (let ((moved (merge-pathnames "blocks/index/headerindex.dat" dir)))
+             (is-true (probe-file moved) "the block index did not arrive")
+             (is (equal "header-index-content"
+                        (with-open-file (in moved) (read-line in nil)))))
+           (is-false (probe-file (merge-pathnames "headerindex.dat" dir))
+                     "the legacy block index was left behind")
+           (is-true (probe-file (merge-pathnames "indexes/txindex/CURRENT" dir))
+                    "the txindex did not arrive")
+           ;; The datadir now reports as Core-shaped.
+           (is (null (bitcoin-lisp.storage:datadir-layout-report dir)))
+           ;; And running it again is a no-op rather than an error.
+           (is (null (bitcoin-lisp.storage:migrate-datadir-layout dir))))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore)))))
+
 (test get-block-treats-corrupt-file-as-absent-and-prunes
   "A truncated / corrupt block file must NOT raise out of get-block — before the
 guard, read-bitcoin-block's raise escaped the reorg/download paths to the
@@ -1474,6 +1564,10 @@ regression would silently force a from-genesis resync on deploy."
                           (write-sequence (make-array 32 :element-type '(unsigned-byte 8)
                                                          :initial-element 0) s)))
                   (bytes (coerce data '(simple-array (unsigned-byte 8) (*)))))
+             ;; The resolved path is Core's blocks/index/ on a fresh datadir,
+             ;; whose directory does not exist yet.
+             (ensure-directories-exist
+              (bitcoin-lisp.storage::header-index-file-path cs))
              (with-open-file (out (bitcoin-lisp.storage::header-index-file-path cs)
                                   :direction :output :if-exists :supersede
                                   :element-type '(unsigned-byte 8))

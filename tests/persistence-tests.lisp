@@ -378,7 +378,7 @@ thrown away."
             (is (not (null prev)))
             (is (equalp genesis-hash (bitcoin-lisp.storage:block-index-entry-hash prev)))))))
     ;; Cleanup
-    (let ((path (merge-pathnames "headerindex.dat" base-path)))
+    (let ((path (bitcoin-lisp.storage::header-index-file-path state)))
       (when (probe-file path)
         (delete-file path)))))
 
@@ -512,8 +512,10 @@ thrown away."
      (bitcoin-lisp.storage:make-block-index-entry
       :hash genesis-hash :height 0 :chain-work 0 :status :valid))
     (bitcoin-lisp.storage:save-header-index state)
-    ;; Corrupt the file
-    (let* ((path (merge-pathnames "headerindex.dat" base-path))
+    ;; Corrupt the file. Resolved, not hardcoded: SAVE-HEADER-INDEX writes to
+    ;; Core's blocks/index/ on a fresh datadir, and a test that corrupted the
+    ;; legacy path would be corrupting a file nothing reads.
+    (let* ((path (bitcoin-lisp.storage::header-index-file-path state))
            (file-bytes (with-open-file (s path :direction :input
                                                :element-type '(unsigned-byte 8))
                          (let ((b (make-array (file-length s) :element-type '(unsigned-byte 8))))
@@ -533,7 +535,7 @@ thrown away."
         (is-true (stringp reason))
         (is-true (search "CRC32" reason))))
     ;; Cleanup
-    (let ((path (merge-pathnames "headerindex.dat" base-path)))
+    (let ((path (bitcoin-lisp.storage::header-index-file-path state)))
       (when (probe-file path) (delete-file path)))))
 
 (test shrink-log-file-scrolls-only-past-the-threshold
