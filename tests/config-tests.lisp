@@ -882,3 +882,96 @@ occurrence would silently drop every override but one."
   (is-false (bitcoin-lisp::core-only-option-p "testactivationheight"))
   (is-true (bitcoin-lisp::known-config-option-p "mocktime"))
   (is-true (bitcoin-lisp::known-config-option-p "testactivationheight")))
+
+(defmacro %with-clean-log-categories (&body body)
+  "Run BODY with every logging category off, and restore them afterwards."
+  `(let ((saved (remove-if-not #'bitcoin-lisp:log-category-enabled-p
+                               bitcoin-lisp::+log-categories+)))
+     (unwind-protect
+          (progn (bitcoin-lisp:apply-log-categories
+                  nil (copy-list bitcoin-lisp::+log-categories+))
+                 ,@body)
+       (bitcoin-lisp:apply-log-categories
+        nil (copy-list bitcoin-lisp::+log-categories+))
+       (bitcoin-lisp:apply-log-categories saved nil))))
+
+(test debug-categories-are-applied-in-core-s-order
+  "-debug enables, then -debugexclude removes (Core init/common.cpp). The order
+is what lets `-debug=all -debugexclude=libevent` mean what an operator expects,
+and it is the exact pair Core's own test framework passes to every node."
+  (%with-clean-log-categories
+    (is (equal '("mempool")
+               (bitcoin-lisp:apply-log-categories '("net" "mempool") '("net"))))
+    ;; "all" and a bare -debug (empty value) enable everything.
+    (dolist (spelling '("all" "1" ""))
+      (bitcoin-lisp:apply-log-categories nil (copy-list bitcoin-lisp::+log-categories+))
+      (is (= (length bitcoin-lisp::+log-categories+)
+             (length (bitcoin-lisp:apply-log-categories (list spelling) nil)))
+          "~S did not enable every category" spelling))
+    ;; ...minus the exclusions, which are applied after.
+    (is-false (member "libevent"
+                      (bitcoin-lisp:apply-log-categories '("all") '("libevent"))
+                      :test #'string=))
+    ;; "0"/"none" turn everything off, and a later include can re-enable.
+    (is-false (bitcoin-lisp:apply-log-categories '("none") nil))
+    (is (equal '("rpc") (bitcoin-lisp:apply-log-categories '("0" "rpc") nil)))))
+
+(test unknown-debug-categories-are-refused
+  "A silently-dropped -debug=nett is an operator staring at a log that will
+never contain what they asked for. Core logs a warning; we refuse, because the
+option has no other effect to notice."
+  (%with-clean-log-categories
+    (signals error (bitcoin-lisp:apply-log-categories '("nett") nil))
+    (signals error (bitcoin-lisp:apply-log-categories nil '("nett")))
+    ;; A real category is still fine either side.
+    (finishes (bitcoin-lisp:apply-log-categories '("net") '("net")))))
+
+(test debug-option-collects-categories-and-raises-the-level
+  "-debug is REPEATABLE and carries a category. The previous read was
+CONF-PARSE-BOOL of its value — and atoi(\"net\") is 0 — so -debug=net set no
+category AND did not raise the level: it did nothing whatsoever."
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest" "-debug=net" "-debug=mempool"
+                  "-debugexclude=libevent" "-logtimemicros" "-logthreadnames")
+                nil)))
+    (is (equal '("net" "mempool") (getf plist :debug-categories)))
+    (is (equal '("libevent") (getf plist :debug-exclude)))
+    (is (eq t (getf plist :log-time-micros)))
+    (is (eq t (getf plist :log-thread-names)))
+    ;; A category's lines are emitted at debug level, so enabling one without
+    ;; raising the level would be a switch that changes nothing.
+    (is (eq :debug (getf plist :log-level))))
+  ;; A bare -debug still means "everything", as it always did. PARSE-CLI-ARGS
+  ;; normalizes a valueless flag to "1", which APPLY-LOG-CATEGORIES treats as
+  ;; all — same as Core, where -debug with no value is the "1" spelling.
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest" "-debug") nil)))
+    (is (equal '("1") (getf plist :debug-categories)))
+    (is (eq :debug (getf plist :log-level))))
+  ;; -debug=0 must NOT raise the level: that spelling turns logging off.
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest" "-debug=0") nil)))
+    (is-false (eq :debug (getf plist :log-level))))
+  ;; An explicit -loglevel wins.
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest" "-debug=net" "-loglevel=info") nil)))
+    (is (eq :info (getf plist :log-level)))))
+
+(test log-format-flags-change-the-line
+  "-logtimemicros appends a microsecond fraction and -logthreadnames inserts
+the writing thread's name, as Core does. Asserted on the formatted line rather
+than on the flags, since the flag existing is not the feature."
+  (let ((plain (let ((bitcoin-lisp::*log-time-micros* nil)
+                     (bitcoin-lisp::*log-thread-names* nil))
+                 (bitcoin-lisp::format-log-entry :info "hello ~A" '(1)))))
+    (is-true (search "INFO: hello 1" plain))
+    ;; [YYYY-MM-DD HH:MM:SS] with no fraction
+    (is-false (search "." (subseq plain 0 (1+ (position #\] plain))))))
+  (let ((micros (let ((bitcoin-lisp::*log-time-micros* t)
+                      (bitcoin-lisp::*log-thread-names* nil))
+                  (bitcoin-lisp::format-log-entry :info "hello" '()))))
+    (is-true (find #\. (subseq micros 0 (1+ (position #\] micros))))
+             "no microsecond fraction in ~S" micros))
+  (let ((named (let ((bitcoin-lisp::*log-time-micros* nil)
+                     (bitcoin-lisp::*log-thread-names* t))
+                 (bitcoin-lisp::format-log-entry :info "hello" '()))))
+    ;; A second bracketed field appears between the timestamp and the level.
+    (is (= 2 (count #\[ named)) "thread name missing from ~S" named)))

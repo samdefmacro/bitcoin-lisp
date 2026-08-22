@@ -2130,6 +2130,10 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (tor-password nil)
                         (dbcache-mib nil)
                         (mocktime nil)
+                        (debug-categories nil)
+                        (debug-exclude nil)
+                        (log-time-micros nil)
+                        (log-thread-names nil)
                         (test-activation-heights nil)
                         (v2transport nil)
                         (coinstatsindex nil)
@@ -2222,6 +2226,17 @@ Returns the node instance."
   ;; for EVERY node it starts, and what an operator looks for first.
   (let ((path (%resolve-log-file log-file data-directory)))
     (when path (start-file-logging path)))
+
+  ;; -debug=<category> / -debugexclude=<category> (Core init/common.cpp).
+  ;; Applied before init-node so startup's own category lines are subject to
+  ;; them. An unknown name signals rather than being ignored: a silently
+  ;; dropped -debug=nett is an operator staring at a log that will never
+  ;; contain what they asked for.
+  (setf *log-time-micros* (and log-time-micros t)
+        *log-thread-names* (and log-thread-names t))
+  (let ((enabled (apply-log-categories debug-categories debug-exclude)))
+    (when enabled
+      (log-info "Debug logging categories: ~{~A~^ ~}" enabled)))
 
   ;; -testactivationheight=name@height moves a buried deployment so a regtest
   ;; chain can be driven across it in a handful of blocks (Core
