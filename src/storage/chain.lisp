@@ -957,8 +957,11 @@ serves as the file's identity. NIL if unreadable."
     (error () nil)))
 
 (defun header-index-file-path (state)
-  "Get the path to the header index file."
-  (merge-pathnames "headerindex.dat" (chain-state-base-path state)))
+  "The header index file. Core keeps the block index in blocks/index/; this
+tree kept headerindex.dat at the network-dir root. DATADIR-HEADER-INDEX-FILE
+prefers Core's and falls back to the legacy one only when that is where the
+data actually is, so a running node is untouched until it is migrated."
+  (datadir-header-index-file (chain-state-base-path state)))
 
 (defun serialize-chainwork (stream value)
   "Write a big integer chain-work as 32 bytes (big-endian)."
@@ -1038,6 +1041,9 @@ Format: magic(4) + version(4) + count(4) + entries + CRC32(4), written atomic
 temp + fsync + rename. Marks every entry as persisted at its current state, and
 rebinds the (now empty) delta to the NEW snapshot's CRC."
   (let ((path (header-index-file-path state)))
+    ;; Core's blocks/index/ may not exist yet on a fresh datadir, and the
+    ;; atomic temp+rename below writes into that directory.
+    (ensure-directories-exist path)
     (bitcoin-lisp.storage:save-file-with-crc32-bb
      path
      (lambda (bb)
@@ -1138,6 +1144,7 @@ whole index was previously rewritten every time, inside without-interrupts on
 the sync thread, to persist typically one new entry — about 25 GB/day on
 mainnet, measured 2026-08-19."
   (let ((path (header-index-file-path state)))
+    (ensure-directories-exist path)
     (when (or force-full
               (null (chain-state-header-index-snapshot-crc state))
               (not (probe-file path)))

@@ -130,7 +130,9 @@ key order is height order)."
 ;;; --- open/close ---
 
 (defun coinstatsindex-path (base-path)
-  (merge-pathnames "coinstatsindex/" (pathname base-path)))
+  "Core's indexes/coinstatsindex/, falling back to the flat coinstatsindex/
+this tree used before — see storage/datadir.lisp."
+  (datadir-index-path (pathname base-path) :coinstats))
 
 (defun init-coinstatsindex (base-path &key (enabled t))
   "Open (creating if needed) the coinstatsindex under BASE-PATH."

@@ -2499,6 +2499,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (connect-nodes nil connect-nodes-supplied-p)
                         (seednode nil)
                         (asmap nil)
+                        (migrate-datadir nil)
                         (whitelist nil)
                         (whitebind nil)
                         (block-notify nil)
@@ -2712,6 +2713,31 @@ txindex ~D MiB, per-index ~D MiB"
       (error "Cannot resolve -externalip address: '~A'" spec)))
 
   ;; Initialize node
+  ;; Datadir layout (Core doc/files.md). BOTH of these must run BEFORE
+  ;; init-node, which opens the databases: nothing below coordinates with an
+  ;; open LevelDB handle, and moving a directory out from under one is how a
+  ;; datadir gets corrupted rather than migrated.
+  (when migrate-datadir
+    (let ((moves (bitcoin-lisp.storage:migrate-datadir-layout data-directory)))
+      (if moves
+          (dolist (m moves)
+            (log-info "Migrated ~A: ~A -> ~A" (first m) (second m) (third m)))
+          (log-info "-migratedatadir: nothing to move; the layout is already Core's"))))
+  ;; Datadir layout: report anything still resolving to the pre-Core location.
+  ;; Reported rather than silently tolerated — an operator whose node cannot be
+  ;; driven by Core's functional tests should be told WHICH directory is the
+  ;; reason, and `-migratedatadir` is the fix.
+  (let ((legacy (bitcoin-lisp.storage:datadir-layout-report data-directory)))
+    (when legacy
+      (log-warn "Data directory uses the pre-Core layout for: ~{~A~^, ~}. ~
+Core's functional tests address these paths by name. Run with -migratedatadir ~
+to move them (the node must be stopped)."
+                (mapcar #'first legacy))
+      (dolist (entry legacy)
+        (log-info "  ~A: using ~A (Core: ~A)"
+                  (first entry) (third entry) (second entry)))))
+
+
   (setf *node* (init-node data-directory :network network :log-level log-level))
   (setf (node-max-peers *node*) max-peers)
   ;; Core -maxconnections is the automatic TOTAL (net.h:81); MAX-PEERS stays

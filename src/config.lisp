@@ -901,6 +901,10 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ;; -asmap=<file>: ASN-based netgroup bucketing. A relative path hangs off
     ;; the datadir, as Core's does.
     ("asmap"             :asmap              :string)
+    ;; -migratedatadir: move a pre-Core datadir to Core's layout at startup,
+    ;; before any database is opened. No Core counterpart — Core has only ever
+    ;; had this layout, so it has never needed a migration.
+    ("migratedatadir"    :migrate-datadir    :bool)
     ;; -pid: a supervisor's handle on this process. -nopid parses to "0", which
     ;; PID-FILE-PATH reads as Core reads IsArgNegated.
     ("pid"               :pid-file           :string)
@@ -942,7 +946,7 @@ specially in config-alist->start-node-plist.")
     "mintxfee" "discardfee" "consolidatefeerate" "maxapsfee" "txconfirmtarget"
     "walletrbf" "spendzeroconfchange" "walletrejectlongchains"
     "keypool" "walletdir" "walletnotify"
-    "dnsseed" "fixedseeds" "forcednsseed" "acceptnonstdtxn"
+    "dnsseed" "fixedseeds" "forcednsseed" "acceptnonstdtxn" "migratedatadir"
     "whitelistrelay" "whitelistforcerelay"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan

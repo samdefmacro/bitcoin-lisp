@@ -56,7 +56,8 @@
                  (:module "storage"
                   ;; utxo first: it defines fsync-file, which flatfile uses;
                   ;; flatfile before blocks, which now stores through it.
-                  :components ((:file "utxo")
+                  :components ((:file "datadir")
+                               (:file "utxo")
                                (:file "block-undo")
                                (:file "flatfile")
                                (:file "blocks")
