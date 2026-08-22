@@ -39,6 +39,18 @@
     (:regtest 18444)
     (:mainnet 8333)))
 
+(defun %normalize-datadir (datadir)
+  "DATADIR as a string that names a DIRECTORY, whatever spelling it arrived in.
+
+Core accepts -datadir with or without a trailing separator. Here \"/tmp/x\"
+parses as a FILE pathname whose NAME is \"x\", so merging \"regtest/chainstate/\"
+onto it yields /tmp/regtest/chainstate/x — the node opens its databases
+somewhere nobody asked for, and the first symptom is a LevelDB NotFound on a
+path the operator never typed. Kept a STRING because the config layer treats it
+as one."
+  (when datadir
+    (namestring (uiop:ensure-directory-pathname datadir))))
+
 (defun %resolve-log-file (log-file data-directory)
   "The path to log to, or NIL for no file log.
 
@@ -515,7 +527,13 @@ For testnet, data stays at the base directory (backward compatible)."
 
   ;; Calculate data path — each network uses its own subdirectory, and WHICH
   ;; subdirectory is Core's (chainparamsbase.cpp:40-55). See NETWORK-DATA-PATH.
-  (let* ((base-path (pathname data-directory))
+  ;; ENSURE-DIRECTORY-PATHNAME, not PATHNAME: "/tmp/x" parses as a FILE
+  ;; pathname whose NAME is "x", so merging "regtest/chainstate/" onto it
+  ;; yields /tmp/regtest/chainstate/x — the datadir silently moves and the
+  ;; node opens its databases somewhere nobody asked for. Core accepts
+  ;; -datadir with or without a trailing separator, and every caller that
+  ;; passes one without a slash hit this.
+  (let* ((base-path (uiop:ensure-directory-pathname data-directory))
          (data-path (network-data-path base-path network)))
     ;; Ensure data directory exists
     (ensure-directories-exist (merge-pathnames "dummy" data-path))
@@ -3109,7 +3127,15 @@ file location."
   ;; Core ArgsManager::ParseParameters ("Invalid parameter -foo").
   (check-cli-args args)
   (let* ((cli (parse-cli-args args))
-         (datadir (or (cdr (assoc "datadir" cli :test #'string=)) "~/.bitcoin-lisp/"))
+         ;; Normalized to end in a separator, and kept a STRING because the
+         ;; config layer treats it as one. Core accepts -datadir with or
+         ;; without a trailing separator; without this, "/tmp/x" parses as a
+         ;; FILE pathname named "x" and every merge against it moves the
+         ;; datadir (/tmp/regtest/chainstate/x).
+         (datadir (namestring
+                   (uiop:ensure-directory-pathname
+                    (or (cdr (assoc "datadir" cli :test #'string=))
+                        "~/.bitcoin-lisp/"))))
          (conf-path (or (cdr (assoc "conf" cli :test #'string=))
                         ;; Ensure a trailing slash so DATADIR is treated as a
                         ;; directory (else merge-pathnames replaces its last
@@ -3151,7 +3177,79 @@ file location."
       ;; make sure it reaches start-node even if it wasn't in the spec scan.
       (unless (getf plist :data-directory)
         (setf (getf plist :data-directory) datadir))
+      (setf (getf plist :data-directory)
+            (%normalize-datadir (getf plist :data-directory)))
       (apply #'start-node plist))))
+
+;;;; The saved executable's entry point
+;;;;
+;;;; Core's functional test framework launches a NODE, not a Lisp: it spawns
+;;;; `$BITCOIND -datadir=... -regtest ...`, waits for the RPC to answer, and at
+;;;; every stop asserts the exit code AND that stderr is EMPTY
+;;;; (test_node.py:497-509). That shape is what NODE-MAIN provides.
+
+(defun %argv-option-name (arg)
+  "The option name in ARG (\"-foo=1\" -> \"foo\"), or NIL when ARG is not an
+option. Leading dashes and the value are stripped, as Core's ArgsManager does."
+  (when (and (stringp arg) (plusp (length arg)) (char= (char arg 0) #\-))
+    (let* ((s (string-left-trim "-" arg))
+           (eq-pos (position #\= s)))
+      (string-downcase (if eq-pos (subseq s 0 eq-pos) s)))))
+
+(defun %argv-asks-for (args names)
+  "T when any of ARGS names one of NAMES."
+  (loop for arg in args
+        for name = (%argv-option-name arg)
+        thereis (and name (member name names :test #'string=))))
+
+(defun node-main ()
+  "Toplevel of the saved executable: run a node from the command line and exit
+with the code the caller should act on.
+
+Exit codes are RUN-NODE-WATCHDOG's, which the supervisor already discriminates
+on: 0 for a deliberate completed stop, 1 for a deterministic failure, 7 for a
+node that died unasked.
+
+Nothing is written to stderr on a normal run. Core's test framework reads
+stderr back at EVERY node stop and fails the test unless it is exactly empty
+(test_node.py:502-509), so a stray warning there is not cosmetic — it breaks
+every test that stops a node. Startup FAILURES do go to stderr, which is also
+Core's behaviour and what assert_start_raises_init_error reads."
+  (sb-ext:disable-debugger)
+  (let ((args (rest sb-ext:*posix-argv*)))
+    (handler-case
+        (cond
+          ;; -version and -help print and exit 0 before anything is started,
+          ;; as they do in Core (init.cpp's HelpRequested/-version branch).
+          ((%argv-asks-for args '("version"))
+           (format t "bitcoin-lisp version ~A~%"
+                   (bitcoin-lisp.serialization:client-version-string))
+           (finish-output)
+           (sb-ext:exit :code 0))
+          ((%argv-asks-for args '("help" "h" "?"))
+           (format t "bitcoin-lisp version ~A~%~%~
+Usage: bitcoin-lisp-node [options]~%~%~
+Runs a Bitcoin full node. Options follow Bitcoin Core's spelling ~
+(-datadir, -regtest, -rpcport, ...); see docs/ for what is implemented, and ~
+note that options this node accepts but does not implement are reported at ~
+startup.~%"
+                   (bitcoin-lisp.serialization:client-version-string))
+           (finish-output)
+           (sb-ext:exit :code 0))
+          (t
+           (start-node-from-args args)
+           ;; Blocks until shutdown, runs stop-node on THIS thread so the
+           ;; flush/mempool.dat/peers.dat sequence completes, then exits.
+           (run-node-watchdog)
+           ;; run-node-watchdog exits by itself; reaching here means it was
+           ;; told not to, so report a clean stop.
+           (sb-ext:exit :code 0)))
+      (error (e)
+        ;; A startup failure is what Core prints to stderr and exits 1 for.
+        (ignore-errors
+         (format *error-output* "Error: ~A~%" e)
+         (finish-output *error-output*))
+        (sb-ext:exit :code 1 :abort t)))))
 
 (defparameter +flush-every-n-blocks+ 25000
   "Block-count flush backstop. The 600s time trigger and the 450MiB

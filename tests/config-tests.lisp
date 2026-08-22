@@ -787,3 +787,42 @@ at all without an explicit -logfile."
   (let ((plist (bitcoin-lisp::args->start-node-plist
                 '("-regtest" "-debuglogfile=/tmp/x.log") nil)))
     (is (string= "/tmp/x.log" (getf plist :log-file)))))
+
+(test datadir-without-a-trailing-separator-still-names-a-directory
+  "Core accepts -datadir with or without a trailing separator. Ours parsed
+\"/tmp/x\" as a FILE pathname whose NAME is \"x\", so merging \"regtest/chainstate/\"
+onto it produced /tmp/regtest/chainstate/x — the node opened its databases
+somewhere nobody asked for, and the first thing it reported was a LevelDB
+NotFound on a path the operator had never typed.
+
+Found by running the real binary the way the test framework runs it, which is
+what track B exists for: every launcher in this repo happened to pass a
+trailing slash."
+  (dolist (spelling '("/tmp/bl-datadir-test" "/tmp/bl-datadir-test/"))
+    (is (equal #P"/tmp/bl-datadir-test/regtest/"
+               (bitcoin-lisp::network-data-path
+                (uiop:ensure-directory-pathname spelling) :regtest))
+        "~S" spelling))
+  ;; And the normalization start-node-from-args applies to whatever the CLI,
+  ;; the config file or the default produced.
+  (is (equal "/tmp/bl-datadir-test/"
+             (bitcoin-lisp::%normalize-datadir "/tmp/bl-datadir-test")))
+  (is (equal "/tmp/bl-datadir-test/"
+             (bitcoin-lisp::%normalize-datadir "/tmp/bl-datadir-test/")))
+  (is-false (bitcoin-lisp::%normalize-datadir nil)))
+
+(test executable-argv-helpers-recognise-core-s-spellings
+  "-version and -help must be answered before anything is started, and the
+option name has to be read the way Core's ArgsManager reads it: leading dashes
+stripped, value after #\\= ignored."
+  (is (equal "datadir" (bitcoin-lisp::%argv-option-name "-datadir=/tmp/x")))
+  (is (equal "datadir" (bitcoin-lisp::%argv-option-name "--datadir=/tmp/x")))
+  (is (equal "regtest" (bitcoin-lisp::%argv-option-name "-regtest")))
+  (is-false (bitcoin-lisp::%argv-option-name "notanoption"))
+  (is-false (bitcoin-lisp::%argv-option-name ""))
+  (is-true (bitcoin-lisp::%argv-asks-for '("-regtest" "-version") '("version")))
+  (is-true (bitcoin-lisp::%argv-asks-for '("-help") '("help" "h" "?")))
+  (is-true (bitcoin-lisp::%argv-asks-for '("-?") '("help" "h" "?")))
+  (is-false (bitcoin-lisp::%argv-asks-for '("-regtest" "-datadir=/x") '("version")))
+  ;; A VALUE that looks like the option name must not trigger it.
+  (is-false (bitcoin-lisp::%argv-asks-for '("-datadir=version") '("version"))))
