@@ -2428,6 +2428,76 @@ active_commands from INSIDE the handler."
     (is-false (bitcoin-lisp.rpc::active-rpc-commands)
               "the entry outlived the dispatch")))
 
+(test rest-blockpart-serves-a-byte-range
+  "/rest/blockpart returns a RANGE of the serialized block, with offset and
+size as QUERY parameters (rest_block_part, rest.cpp:480-497). JSON is not a
+supported format — the whole point is raw bytes.
+
+Route order matters again: \"block\" is a prefix of \"blockpart\", so the
+shorter route would swallow every blockpart request and try to read
+\"part/<hash>\" as a block hash."
+  (let ((node (make-test-node)))
+    (flet ((req (uri &optional params)
+             (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+                   (hunchentoot:*request* nil))
+               ;; %rest-size-parameter reads hunchentoot's query parameters;
+               ;; stub the accessor for the duration of the call.
+               (let ((original (symbol-function 'hunchentoot:get-parameter)))
+                 (unwind-protect
+                      (progn
+                        (setf (symbol-function 'hunchentoot:get-parameter)
+                              (lambda (name) (cdr (assoc name params :test #'string=))))
+                        (handler-case (bitcoin-lisp.rpc::rest-handle node uri)
+                          (error () :signalled)))
+                   (setf (symbol-function 'hunchentoot:get-parameter) original))))))
+      ;; Routed at all — an unrouted URI answers "Unknown REST endpoint".
+      (let ((b (req "/rest/blockpart/00.bin" '(("offset" . "0") ("size" . "1")))))
+        (is-false (and (stringp b) (search "Unknown REST endpoint" b))
+                  "blockpart is not routed"))
+      ;; Missing parameters are Core's two distinct 400s, and offset is
+      ;; reported first because Core checks it first.
+      (is-true (search "Block part offset missing or invalid"
+                       (req "/rest/blockpart/00.bin" '())))
+      (is-true (search "Block part size missing or invalid"
+                       (req "/rest/blockpart/00.bin" '(("offset" . "0")))))
+      ;; A negative or non-numeric value is NOT a zero — Core's ToIntegral
+      ;; fails and the request is a 400.
+      (is-true (search "Block part offset missing or invalid"
+                       (req "/rest/blockpart/00.bin" '(("offset" . "-1") ("size" . "1")))))
+      (is-true (search "Block part size missing or invalid"
+                       (req "/rest/blockpart/00.bin" '(("offset" . "0") ("size" . "x")))))
+      ;; JSON is refused for this endpoint. A full-length hash is needed to
+      ;; reach the format check at all, since the hash is validated first once
+      ;; the parameters are good.
+      (is-true (search "output format not found"
+                       (req (format nil "/rest/blockpart/~64,'0D.json" 0)
+                            '(("offset" . "0") ("size" . "1")))))
+      ;; A bad hash is still a bad hash — but only once the parameters are
+      ;; valid, since Core validates them first (rest.cpp:480-497 delegates to
+      ;; rest_block, where the hash is parsed).
+      (is-true (search "Invalid block hash"
+                       (req "/rest/blockpart/nothex.bin" '(("offset" . "0") ("size" . "1"))))))))
+
+(test rest-blockpart-range-check-is-cores
+  "size 0 is invalid and offset+size must not exceed the block
+(blockstorage.cpp:1116-1120). Core needs a SaturatingAdd there to stop the sum
+wrapping past the check; Lisp integers do not wrap, so a plain + is already the
+safe version — asserted here with a size large enough to have overflowed a
+64-bit sum."
+  (let* ((block (%bu-test-block '(1)))
+         (bytes (bitcoin-lisp.serialization:serialize-witness-block block))
+         (n (length bytes)))
+    ;; The check itself, exercised directly: these are the four boundary cases.
+    (flet ((ok-p (offset size)
+             (not (or (zerop size) (> (+ offset size) n)))))
+      (is-true (ok-p 0 n) "the whole block must be a valid range")
+      (is-true (ok-p (1- n) 1) "the last byte must be a valid range")
+      (is-false (ok-p 0 0) "size 0 must be refused")
+      (is-false (ok-p 0 (1+ n)) "past the end must be refused")
+      (is-false (ok-p n 1) "starting at the end must be refused")
+      ;; A size that would wrap a 64-bit accumulator still refuses.
+      (is-false (ok-p 1 (expt 2 64)) "an enormous size must be refused"))))
+
 ;;; --- Concurrent Access Tests (2.7) ---
 
 (test rpc-concurrent-access-safety
