@@ -1,6 +1,6 @@
 # Cluster Mempool + Feerate-Diagram RBF — Implementation Plan
 
-Date: 2026-07-10. Status: **PLAN — not started.**
+Date: 2026-07-10. Status (2026-08-22): **P0-P10 DONE** — through "Cluster mempool P8+P9: reorg bulk re-add + package/diagram RBF reconciliation + cluster RPCs", then P10 (the SFL linearizer) in PR #376. The §6 table was never updated.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev, cluster mempool fully merged).
 Researched via 4 parallel deep-dives: Core txgraph/linearization internals, Core mempool integration,
 Core diagram-RBF policy, and our own mempool architecture.
