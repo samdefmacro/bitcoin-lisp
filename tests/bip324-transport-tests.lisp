@@ -40,6 +40,7 @@ leaves the rest queued forever and the PEER waits out its full receive timeout
 — which is what made v2-transport-loopback-handshake-and-messages fail on
 roughly one battery run in three, always as a 60-second (NIL NIL) on the
 receiving side. Nothing about the transport was wrong; the bytes had not left."
+  (declare (ignorable conn))
   (loop with deadline = (+ (get-internal-real-time)
                            (* seconds internal-time-units-per-second))
         while (plusp (bitcoin-lisp.networking::connection-send-queue-bytes conn))
@@ -75,8 +76,19 @@ must be skipped, and a 0-length payload."
                  (bt:make-thread
                   (lambda ()
                     (handler-case
-                        (let ((transport (bitcoin-lisp.networking::v2-handshake-outbound
-                                          client :timeout 60)))
+                        (let ((transport (progn
+                                           (prog1 (bitcoin-lisp.networking::v2-handshake-outbound
+                                                   client :timeout 60)
+                                             ;; The HANDSHAKE's own sends go
+                                             ;; through send-bytes too, and the
+                                             ;; first version of this fix
+                                             ;; drained only the MESSAGE sends
+                                             ;; that follow. A handshake whose
+                                             ;; last packet is half-queued
+                                             ;; leaves the peer waiting out its
+                                             ;; full timeout, which is exactly
+                                             ;; the failure that kept recurring.
+                                             (%v2t-drain client)))))
                           (if (not (bitcoin-lisp.networking::v2-transport-p transport))
                               ;; Say WHY rather than leaving NIL behind: a
                               ;; failed handshake and a wrong message were
@@ -94,7 +106,9 @@ must be skipped, and a 0-length payload."
                                   (setf client-result (list cmd payload))))))
                       (error (e) (setf client-result (list :error e)))))
                   :name "v2-initiator")))
-          (let ((transport (bitcoin-lisp.networking::v2-detect-inbound server :timeout 60)))
+          (let ((transport (prog1 (bitcoin-lisp.networking::v2-detect-inbound
+                                   server :timeout 60)
+                             (%v2t-drain server))))
             (is-true (bitcoin-lisp.networking::v2-transport-p transport))
             (when (bitcoin-lisp.networking::v2-transport-p transport)
               ;; Receive the client's short-ID message.
