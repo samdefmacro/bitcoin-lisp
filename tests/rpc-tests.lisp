@@ -1976,6 +1976,93 @@ client reach them at all."
 
 ;;; --- Test-harness control RPCs (track B P0) ---
 
+(test addconnection-opens-the-named-connection-type
+  "addconnection (Core rpc/net.cpp). The functional framework uses it to attach
+its own P2P connections of a CHOSEN type — a block-relay or feeler slot a test
+cannot ask for any other way — so the type reaching the dial is the point, not
+just that something connected."
+  (let ((bitcoin-lisp::*pending-test-connections* '()))
+    ;; Regtest only, with Core's exact text.
+    (dolist (network '(:mainnet :testnet4 :signet))
+      (let ((bitcoin-lisp:*network* network))
+        (handler-case
+            (progn (bitcoin-lisp.rpc::rpc-addconnection
+                    nil '("1.2.3.4:1" "outbound-full-relay" t))
+                   (is-true nil "addconnection was accepted on ~A" network))
+          (bitcoin-lisp.rpc::rpc-error (e)
+            (is (string= "addconnection is for regression testing (-regtest mode) only."
+                         (bitcoin-lisp.rpc::rpc-error-message e))
+                "~A" network)))))
+    (is-false bitcoin-lisp::*pending-test-connections*
+              "a refused addconnection still queued a dial")
+    (let* ((bitcoin-lisp:*network* :regtest)
+           (node (bitcoin-lisp::make-node :network :regtest)))
+      ;; Each of Core's four types maps to a peer conn-type and is queued for
+      ;; the sync thread, newest LAST (the queue is drained in request order).
+      (dolist (pair '(("outbound-full-relay" . :outbound-full-relay)
+                      ("block-relay-only"    . :block-relay)
+                      ("addr-fetch"          . :addr-fetch)
+                      ("feeler"              . :feeler)))
+        (setf bitcoin-lisp::*pending-test-connections* '())
+        (let ((result (bitcoin-lisp.rpc::rpc-addconnection
+                       node (list "1.2.3.4:1" (car pair) nil))))
+          (is (equal (car pair) (cdr (assoc "connection_type" result :test #'string=))))
+          (is (equal "1.2.3.4:1" (cdr (assoc "address" result :test #'string=))))
+          (is (equal (list (cons "1.2.3.4:1" (cdr pair)))
+                     bitcoin-lisp::*pending-test-connections*)
+              "~A did not queue its own connection type" (car pair))))
+      (setf bitcoin-lisp::*pending-test-connections* '())
+      ;; Core trims the type before matching.
+      (is (equal "outbound-full-relay"
+                 (cdr (assoc "connection_type"
+                             (bitcoin-lisp.rpc::rpc-addconnection
+                              node '("1.2.3.4:1" "  outbound-full-relay  " nil))
+                             :test #'string=))))
+      ;; MANUAL and INBOUND are not offerable — Core's AddConnection returns
+      ;; false for them, because addconnection exists for the AUTOMATIC kinds.
+      (dolist (bad '("manual" "inbound" "" "outbound" "block-relay"))
+        (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+               (%rpc-error-code
+                (lambda () (bitcoin-lisp.rpc::rpc-addconnection
+                            node (list "1.2.3.4:1" bad nil))))))))
+    ;; v2transport=true without -v2transport is refused rather than silently
+    ;; dialing v1 (Core rpc/net.cpp).
+    (let ((bitcoin-lisp:*network* :regtest)
+          (bitcoin-lisp.networking:*v2-transport-enabled* nil)
+          (node (bitcoin-lisp::make-node :network :regtest)))
+      (setf bitcoin-lisp::*pending-test-connections* '())
+      (handler-case
+          (progn (bitcoin-lisp.rpc::rpc-addconnection
+                  node '("1.2.3.4:1" "outbound-full-relay" t))
+                 (is-true nil "a v2 addconnection was accepted with v2 disabled"))
+        (bitcoin-lisp.rpc::rpc-error (e)
+          (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+                 (bitcoin-lisp.rpc::rpc-error-code e)))
+          (is (string= "Error: Adding v2transport connections requires -v2transport init flag to be set."
+                       (bitcoin-lisp.rpc::rpc-error-message e)))))
+      (is-false bitcoin-lisp::*pending-test-connections*))
+    ;; Capacity: the outbound full-relay and block-relay types are capped, the
+    ;; other two are not (Core: none for addr-fetch, since -seednode has none,
+    ;; and none for feeler, since feelers are short-lived).
+    (let* ((bitcoin-lisp:*network* :regtest)
+           (node (bitcoin-lisp::make-node :network :regtest :max-peers 0)))
+      (setf bitcoin-lisp::*pending-test-connections* '())
+      (is (= bitcoin-lisp.rpc::+rpc-client-node-capacity-reached+
+             (%rpc-error-code
+              (lambda () (bitcoin-lisp.rpc::rpc-addconnection
+                          node '("1.2.3.4:1" "outbound-full-relay" nil))))))
+      (dolist (uncapped '("addr-fetch" "feeler"))
+        (is-true (bitcoin-lisp.rpc::rpc-addconnection
+                  node (list "1.2.3.4:1" uncapped nil))
+                 "~A was capacity-limited" uncapped)))
+    (setf bitcoin-lisp::*pending-test-connections* '()))
+  ;; And the queue is actually drained where peers are dialed — a request that
+  ;; is only ever queued is exactly the shape of bug this repo keeps finding.
+  (is-true (member 'bitcoin-lisp::connect-added-nodes
+                   (mapcar #'car
+                           (sb-introspect:who-sets
+                            'bitcoin-lisp::*pending-test-connections*)))))
+
 (test setmocktime-is-regtest-only
   "Core gates setmocktime on IsMockableChain, which only regtest sets
 (chainparams.cpp:644), and raises a plain runtime_error otherwise — mapped to

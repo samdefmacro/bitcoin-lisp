@@ -1780,6 +1780,73 @@ authoritative running counts."
             (nt (if book (bitcoin-lisp.networking::address-book-n-tried book) 0)))
         (append result (list (cons "all_networks" (entry nn nt))))))))
 
+(defparameter %addconnection-types
+  '(("outbound-full-relay" . :outbound-full-relay)
+    ("block-relay-only"    . :block-relay)
+    ("addr-fetch"          . :addr-fetch)
+    ("feeler"              . :feeler))
+  "Core addconnection's connection_type strings (rpc/net.cpp) and the peer
+conn-types they name here. MANUAL and INBOUND are deliberately absent: Core's
+AddConnection returns false for them (net.cpp), because addconnection exists to
+open the AUTOMATIC connection kinds a test cannot otherwise ask for.")
+
+(defun %addconnection-capacity-left-p (node conn-type)
+  "Whether another CONN-TYPE connection fits (Core CConnman::AddConnection's
+max_connections switch, net.cpp).
+
+ADDR-FETCH and FEELER have no cap in Core — the first because -seednode has
+none either, the second because feelers are short-lived — so they always fit."
+  (case conn-type
+    (:outbound-full-relay
+     (< (bitcoin-lisp::peers-of-conn-type node :outbound-full-relay)
+        (bitcoin-lisp::node-max-peers node)))
+    (:block-relay
+     (< (bitcoin-lisp::peers-of-conn-type node :block-relay)
+        bitcoin-lisp::+target-block-relay-peers+))
+    (t t)))
+
+(defun rpc-addconnection (node params)
+  "Open one outbound connection of a named type (Core addconnection,
+rpc/net.cpp). Regtest only, and for testing only: it is how the functional
+framework attaches its own P2P connections to a node.
+
+PARAMS: (address connection_type v2transport). The dial itself is HANDED TO THE
+SYNC THREAD rather than run here — node-peers is single-writer by design, and
+Core's own AddConnection likewise returns before the connection completes. The
+capacity check runs synchronously, because that is the answer the caller needs."
+  (unless (eq bitcoin-lisp:*network* :regtest)
+    ;; Core raises a plain std::runtime_error, which JSONRPCError maps to
+    ;; RPC_MISC_ERROR with this exact text (rpc/net.cpp).
+    (error 'rpc-error :code +rpc-misc-error+
+                      :message "addconnection is for regression testing (-regtest mode) only."))
+  (let* ((address (first params))
+         (type-string (second params))
+         (v2transport (third params)))
+    (unless (and (stringp address) (plusp (length address)))
+      (error 'rpc-error :code +rpc-type-error+
+                        :message "Expected type string for address"))
+    (unless (stringp type-string)
+      (error 'rpc-error :code +rpc-type-error+
+                        :message "Expected type string for connection_type"))
+    (let* ((trimmed (string-trim '(#\Space #\Tab #\Newline #\Return) type-string))
+           (conn-type (cdr (assoc trimmed %addconnection-types :test #'string=))))
+      (unless conn-type
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "Type of connection to open (\"outbound-full-relay\", \"block-relay-only\", \"addr-fetch\" or \"feeler\")."))
+      ;; Core refuses a v2 request when the node was not started with
+      ;; -v2transport, rather than silently dialing v1 (rpc/net.cpp).
+      (when (and (%positional-bool v2transport)
+                 (not (bitcoin-lisp.networking::v2-available-p)))
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message "Error: Adding v2transport connections requires -v2transport init flag to be set."))
+      (unless (%addconnection-capacity-left-p node conn-type)
+        (error 'rpc-error :code +rpc-client-node-capacity-reached+
+                          :message "Error: Already at capacity for specified connection type."))
+      (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+        (push (cons address conn-type) bitcoin-lisp::*pending-test-connections*))
+      `(("address" . ,address)
+        ("connection_type" . ,trimmed)))))
+
 (defun rpc-addnode (node params)
   "Manage manually-added peers (Bitcoin Core addnode). PARAMS:
 (node command [v2transport]). COMMAND is \"add\" (remember the peer and keep it

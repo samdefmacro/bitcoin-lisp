@@ -65,6 +65,12 @@ dialed, and NOTHING else. Deliberately not the node's added-nodes list, because
 getaddednodeinfo reports -addnode and not -connect, exactly as Core's does —
 both are nonetheless dialed as MANUAL connections.")
 
+(defvar *pending-test-connections* '()
+  "Connections the addconnection RPC has asked for, as (address . conn-type),
+drained by the sync thread. A queue rather than a direct dial because node-peers
+is single-writer by design; Core's own AddConnection likewise returns before the
+connection completes. Regtest-only, like the RPC.")
+
 (defvar *seed-nodes* '()
   "-seednode targets (Core connOptions.vSeedNodes): peers dialed once, purely to
 collect addresses, and disconnected as soon as they deliver some. Core queues
@@ -5321,6 +5327,15 @@ then keep every \"add\" peer connected. Honors network-active."
         (multiple-value-bind (host port) (parse-node-endpoint node spec)
           (unless (peer-connected-to-host-p node host)
             (establish-outbound-peer node host port :manual t)))))
+    ;; addconnection (regtest testing RPC): one dial per request, of the
+    ;; connection TYPE the caller named — which is the whole point of the RPC,
+    ;; since a test cannot otherwise ask for a block-relay or feeler slot.
+    (let ((queued (bt:with-recursive-lock-held ((node-lock node))
+                    (prog1 (nreverse *pending-test-connections*)
+                      (setf *pending-test-connections* nil)))))
+      (dolist (request queued)
+        (multiple-value-bind (host port) (parse-node-endpoint node (car request))
+          (establish-outbound-peer node host port :conn-type (cdr request)))))
     ;; Maintain persistent added-node connections.
     (dolist (spec (node-added-nodes node))
       (multiple-value-bind (host port) (parse-node-endpoint node spec)

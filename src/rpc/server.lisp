@@ -28,6 +28,7 @@
 (defconstant +rpc-client-invalid-ip-or-subnet+ -30)
 (defconstant +rpc-method-deprecated+ -32)
 (defconstant +rpc-client-mempool-disabled+ -33)
+(defconstant +rpc-client-node-capacity-reached+ -34)
 
 ;;; --- RPC Error Condition ---
 
@@ -204,6 +205,7 @@ than "no such method" for a method that does exist."
   (register-rpc-method "getnodeaddresses" #'rpc-getnodeaddresses)
   (register-rpc-method "getaddrmaninfo" #'rpc-getaddrmaninfo)
   (register-rpc-method "addnode" #'rpc-addnode)
+  (register-rpc-method "addconnection" #'rpc-addconnection)
   (register-rpc-method "getaddednodeinfo" #'rpc-getaddednodeinfo)
   (register-rpc-method "setnetworkactive" #'rpc-setnetworkactive)
   (register-rpc-method "getblockfrompeer" #'rpc-getblockfrompeer)
@@ -352,6 +354,7 @@ normalized as nested values."
 
 (defparameter *rpc-named-arg-names*
   '(
+    ("addconnection" "address" "connection_type" "v2transport")
     ("addnode" "node" "command" "v2transport")
     ("createwallet"
       "wallet_name" "disable_private_keys" "blank" "passphrase" "avoid_reuse"
