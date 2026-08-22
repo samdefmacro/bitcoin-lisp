@@ -2018,6 +2018,58 @@ advisory lock on it does."
     (ignore-errors (sb-posix:close *data-directory-lock-fd*))
     (setf *data-directory-lock-fd* nil)))
 
+(defvar *last-block-disk-check-time* 0
+  "Universal time of the last block-write disk-space sample.")
+
+(defvar *last-block-disk-check-ok* t
+  "The verdict that sample produced.")
+
+(defconstant +block-disk-check-interval-seconds+ 30
+  "How often the block-write path re-samples free disk space.")
+
+(defun check-disk-space-for-blocks (directory)
+  "T when DIRECTORY has room for more block data, sampled at most every
++BLOCK-DISK-CHECK-INTERVAL-SECONDS+.
+
+Core calls CheckDiskSpace before EVERY block and undo write (FindBlockPos /
+FindUndoPos, blockstorage.cpp:337), which it can afford because its check is a
+statvfs call. Ours shells out to `df`, so a per-block check would fork a
+process per block during IBD. Sampling keeps the property that matters — a node
+does not keep writing blocks onto a disk that is nearly full — with a bounded
+lag of one interval.
+
+Removing the caveat means binding statvfs(3) through CFFI, which is worth doing
+and is not done here."
+  (let ((now (get-universal-time)))
+    (when (>= (- now *last-block-disk-check-time*)
+              +block-disk-check-interval-seconds+)
+      (setf *last-block-disk-check-time* now
+            *last-block-disk-check-ok* (check-disk-space directory)))
+    *last-block-disk-check-ok*))
+
+(defun %gate-block-write-on-disk-space ()
+  "Abort the node when the block directory has no room left, before a block
+write rather than after (Core FindBlockPos -> CheckDiskSpace -> FatalError,
+blockstorage.cpp:337). A no-op when there is no node or no data directory,
+which is every test that connects blocks against a bare chainstate."
+  (let ((dir (and *node* (node-data-directory *node*))))
+    (when (and dir (not (check-disk-space-for-blocks dir)))
+      (%abort-on-low-disk-space "Block write"))))
+
+(defvar *flush-failure-abort-triggered* nil
+  "Set once a flush failure has requested shutdown, so a failing flush called
+again during teardown does not re-request it.")
+
+(defun %abort-on-flush-failure (label condition)
+  "Request shutdown after a flush failure (Core AbortNode from
+FlushStateToDisk's catch, validation.cpp:2698). Exits non-clean: whatever made
+the write fail — a full disk, a revoked mount, a corrupt database — will still
+be there on respawn, so the supervisor should back off rather than spin."
+  (unless *flush-failure-abort-triggered*
+    (setf *flush-failure-abort-triggered* t)
+    (request-node-shutdown (format nil "~A flush failed: ~A" label condition)
+                           :exit-code +node-exit-error+)))
+
 (defun %abort-on-low-disk-space (label)
   "Log + request shutdown once when free disk space is below the floor
 (Core FlushStateToDisk's CheckDiskSpace failure -> FatalError \"Disk space
@@ -3558,7 +3610,17 @@ were nowhere in utxoset.dat despite chainstate showing h=70540)."
       ;; Was log-warn before — surfaced silently. Bumped to log-error so
       ;; persistence failures are obvious in the log instead of getting
       ;; lost between progress lines.
-      (log-error "~A flush FAILED: ~A" label c))))
+      (log-error "~A flush FAILED: ~A" label c)
+      ;; And now FATAL, as it is in Core: FlushStateToDisk wraps its writes in
+      ;; a try/catch whose handler is `AbortNode(state, ...)`
+      ;; (validation.cpp:2698, 2775-2777), because a node that keeps connecting
+      ;; blocks after a failed flush is advancing a chain whose coins are not
+      ;; on disk — and the loss is only discovered by the NEXT crash, as a
+      ;; chainstate ahead of its UTXO entries. That exact cascade is what
+      ;; testnet4 h=70541 was; logging it and carrying on is how it stayed
+      ;; invisible until restart.
+      (%abort-on-flush-failure label c)
+      nil)))
 
 (defun do-flush (&optional (chainstate (and *node* (node-current-chainstate *node*))))
   "Flush CHAINSTATE (default: the node's current chainstate) and run the

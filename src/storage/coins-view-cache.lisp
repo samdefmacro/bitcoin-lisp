@@ -101,6 +101,21 @@ hash, or NIL for a database written before the pointer existed."
     (when recorded
       (setf (cvc-best-block cache) (copy-seq recorded)))))
 
+(defun coins-view-best-block (view)
+  "The block VIEW's coins actually correspond to, or NIL when it does not track
+one (a test-only utxo-set, or a database written before the pointer existed).
+
+This is NOT the chain tip, and the difference is the point: partway through a
+reorg's disconnect phase the tip still names the block being rewound away from
+while the coins have already moved to its parent. Core reports coins-view state
+against `coins_view->GetBestBlock()` for exactly that reason
+(rpc/blockchain.cpp:1083) — and it matters beyond cosmetics, because
+hash_serialized_3 IS the assumeutxo commitment: a hash of one set of coins
+labelled with another block's hash commits to nothing."
+  (etypecase view
+    (utxo-set nil)
+    (coins-view-cache (cvc-best-block view))))
+
 (defun coins-view-cache-compact (cache)
   "Full-compact the LevelDB backing CACHE (leveldb-compact over the whole
 keyspace) to reclaim tombstone space after a large deletion churn such as a
@@ -241,7 +256,19 @@ purely from cache state; see the file header for the caller contract."
        ;; Overhead unchanged (same slot); adjust by the scriptPubKey delta.
        (incf (cvc-mem-bytes cache)
              (- (entry-script-bytes entry) (entry-script-bytes (ce-entry existing))))
-       (let ((fresh (and (not (ce-entry existing))      ; was spent
+       ;; FRESH is computed ONLY when overwriting is not permitted. Core
+       ;; initialises fresh=false and enters the computation inside
+       ;; `if (!possible_overwrite)` (coins.cpp:95-110); we computed it either
+       ;; way, and BOTH live callers take the overwrite path
+       ;; (:allow-overwrite is-coinbase, and :allow-overwrite t for every
+       ;; restored input on disconnect).
+       ;;
+       ;; Core's comment names the exact hazard: a coin marked FRESH and then
+       ;; spent before the flush is DROPPED from the cache, so its spentness
+       ;; never reaches the parent — and a real base row survives as unspent.
+       ;; Silent UTXO corruption, on the reorg path.
+       (let ((fresh (and (not allow-overwrite)
+                         (not (ce-entry existing))      ; was spent
                          (not (ce-dirty existing)))))   ; and already-flushed
          (setf (ce-entry existing) entry
                (ce-dirty existing) t
@@ -249,14 +276,18 @@ purely from cache state; see the file header for the caller contract."
          (incf (cvc-dirty-count cache))
          (when fresh (incf (cvc-fresh-count cache)))
          existing))
-      ;; Brand-new slot. Per caller contract, base does not have KEY,
-      ;; so the add can drop on spend without touching disk → FRESH=T.
+      ;; Brand-new slot: the add can drop on spend without touching disk, so
+      ;; FRESH — but only when the caller did NOT permit an overwrite. With
+      ;; ALLOW-OVERWRITE the base may hold this key after all, and Core keeps
+      ;; fresh=false for the same reason (coins.cpp:94-110).
       (t
-       (let ((ce (make-cache-entry :entry entry :dirty t :fresh t)))
+       (let* ((fresh (not allow-overwrite))
+              (ce (make-cache-entry :entry entry :dirty t :fresh fresh)))
          (setf (gethash key (cvc-entries cache)) ce)
-         (incf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce)))
-       (incf (cvc-dirty-count cache))
-       (incf (cvc-fresh-count cache))))))
+         (incf (cvc-mem-bytes cache) (cache-entry-mem-bytes ce))
+         (incf (cvc-dirty-count cache))
+         (when fresh (incf (cvc-fresh-count cache)))
+         ce)))))
 
 (defun coins-view-cache-spend (cache key)
   "Mark KEY as spent. Returns T if the coin was unspent before this
@@ -542,7 +573,7 @@ undo list — (txid index entry) for every spent UTXO, in apply order."
                                        :allow-overwrite is-coinbase))))
     (nreverse spent)))
 
-(defun coin-view-disconnect-block (cache block previous-utxos)
+(defun coin-view-disconnect-block (cache block previous-utxos &key height)
   "Reverse coin-view-apply-block for reorg.
 
 Order matters when a block contains intra-block dependencies — tx N
@@ -562,6 +593,17 @@ walk transactions forward to remove their outputs. The restoration
 re-adds M:0 to the cache; the forward walk then removes M:0 along
 with N:0. Net result is the same as Bitcoin Core's reverse iteration.
 
+Returns T when the disconnect was CLEAN, NIL when it was not: Core's
+DISCONNECT_OK vs DISCONNECT_UNCLEAN. Unclean means the UTXO set did not look
+the way this block says it should — an output that was already gone, one whose
+value/script/height/coinbase disagreed with the block, or an input restore that
+overwrote a coin already present. Each is logged. Core carries the same
+distinction and does not abort on it, because a reorg over a slightly-off view
+still produces the right end state; what it must not do is stay SILENT, which
+is what ours did.
+
+HEIGHT, when supplied, enables Core's height comparison on each removed output.
+
 The old forward order (remove outputs first, then restore inputs)
 silently failed for intra-block deps: M:0's removal was a no-op
 (already gone via N's spend), then M:0 got restored via N's undo data,
@@ -570,17 +612,63 @@ the same tx in a competing fork's block) would then trip the
 \"refusing to overwrite unspent coin\" guard. Observed live on
 test-bitcoin-server 2026-05-19 at h=135597."
   (declare (type coins-view-cache cache))
-  ;; Restore inputs first (from undo data).
-  (dolist (prev previous-utxos)
-    (destructuring-bind (txid index entry) prev
-      (coins-view-cache-add cache (make-utxo-key txid index) entry
-                            :allow-overwrite t)))
-  ;; Then walk transactions forward, removing their outputs.
-  (dolist (tx (bitcoin-lisp.serialization:bitcoin-block-transactions block))
-    (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
-      (loop for out-idx from 0
-            below (length (bitcoin-lisp.serialization:transaction-outputs tx))
-            do (coin-view-spend cache txid out-idx)))))
+  (let ((clean t))
+    (flet ((unclean (format &rest args)
+             (setf clean nil)
+             (bitcoin-lisp:log-warn "DisconnectBlock: ~?" format args)))
+      ;; Restore inputs first (from undo data).
+      (dolist (prev previous-utxos)
+        (destructuring-bind (txid index entry) prev
+          (let* ((key (make-utxo-key txid index))
+                 ;; Core checks HaveCoin BEFORE restoring and passes
+                 ;; possible_overwrite = !fClean — permissive about the
+                 ;; operation, loud about the observation (ApplyTxInUndo,
+                 ;; validation.cpp:2146-2170). We passed :allow-overwrite T
+                 ;; unconditionally, which turned the guard off entirely and
+                 ;; made "overwriting transaction output" invisible.
+                 (present (coins-view-cache-get cache key)))
+            (when present
+              (unclean "overwriting transaction output ~A:~D"
+                       (bitcoin-lisp.crypto:bytes-to-hex txid) index))
+            (coins-view-cache-add cache key entry :allow-overwrite (and present t)))))
+      ;; Then walk transactions forward, removing their outputs.
+      (loop for tx in (bitcoin-lisp.serialization:bitcoin-block-transactions block)
+            for tx-index from 0
+            for is-coinbase = (zerop tx-index)
+            do (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
+                 (loop for output across (bitcoin-lisp.serialization:transaction-outputs tx)
+                       for out-idx from 0
+                       for spk = (bitcoin-lisp.serialization:tx-out-script-pubkey output)
+                       ;; Unspendable outputs were never added, so their
+                       ;; absence is expected rather than a mismatch (Core
+                       ;; skips them here too, validation.cpp:2209).
+                       unless (script-unspendable-p spk)
+                         do (let ((spent (coin-view-spend cache txid out-idx)))
+                              ;; Core requires the coin to be there AND to
+                              ;; match the block's output exactly — value,
+                              ;; script, height and coinbase flag — and calls
+                              ;; any difference "transaction output mismatch"
+                              ;; (validation.cpp:2213-2219). We removed the
+                              ;; output through a function that returns NIL
+                              ;; silently, so a disconnect over a UTXO set that
+                              ;; did not match the block reported nothing and
+                              ;; corrupted quietly.
+                              (cond
+                                ((null spent)
+                                 (unclean "output ~A:~D was already absent"
+                                          (bitcoin-lisp.crypto:bytes-to-hex txid)
+                                          out-idx))
+                                ((not (and (= (utxo-entry-value spent)
+                                              (bitcoin-lisp.serialization:tx-out-value output))
+                                           (equalp (utxo-entry-script-pubkey spent) spk)
+                                           (eq (and (utxo-entry-coinbase spent) t)
+                                               is-coinbase)
+                                           (or (null height)
+                                               (= (utxo-entry-height spent) height))))
+                                 (unclean "transaction output mismatch at ~A:~D"
+                                          (bitcoin-lisp.crypto:bytes-to-hex txid)
+                                          out-idx))))))))
+    clean))
 
 ;;;; Polymorphic dispatch for the legacy UTXO API.
 ;;;;
@@ -733,7 +821,7 @@ production store, so the size trigger never fires for it."
     (utxo-set 0)
     (coins-view-cache (cvc-mem-bytes view))))
 
-(defun disconnect-block-from-utxo-set (view block previous-utxos)
+(defun disconnect-block-from-utxo-set (view block previous-utxos &key height)
   (etypecase view
     (utxo-set
      ;; Same intra-block-deps reasoning as coin-view-disconnect-block:
@@ -754,7 +842,7 @@ production store, so the size trigger never fires for it."
                do (remhash (make-utxo-key txid out-idx)
                            (utxo-set-entries view))))))
     (coins-view-cache
-     (coin-view-disconnect-block view block previous-utxos)
+     (coin-view-disconnect-block view block previous-utxos :height height)
      ;; These coins now correspond to the PARENT block — Core's
      ;; DisconnectBlock ends with SetBestBlock(pindex->pprev->GetBlockHash())
      ;; (validation.cpp:2242), and hashPrevBlock is that same hash. Moving the

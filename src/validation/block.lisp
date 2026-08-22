@@ -2227,8 +2227,15 @@ Handles chain reorganizations when a competing chain has more work."
          ;; it so the file it lands in can be pruned later (a flat block file
          ;; prunes whole, which needs its range). Where it landed is recorded
          ;; on the index entry below, once that entry exists.
-         (stored-at (nth-value 1 (bitcoin-lisp.storage:store-block
-                                  block-store block :height new-height))))
+         (stored-at (progn
+                      ;; Core checks free space before every block and undo
+                      ;; write (FindBlockPos, blockstorage.cpp:337) and treats
+                      ;; a failure as fatal. Writing blocks onto a full disk is
+                      ;; how a truncated-but-indexed .blk gets created, which
+                      ;; this node has seen.
+                      (bitcoin-lisp::%gate-block-write-on-disk-space)
+                      (nth-value 1 (bitcoin-lisp.storage:store-block
+                                    block-store block :height new-height)))))
 
     ;; Index entry. Core NEVER rebuilds a CBlockIndex: AddToBlockIndex is a
     ;; try_emplace that returns the existing object when the hash is already
@@ -2595,8 +2602,10 @@ perform-reorg's success phase, so there is nothing to undo here."
   ;;    application order). spent-utxos is the undo data apply returned.
   (dolist (item connected)
     (destructuring-bind (entry block height spent-utxos) item
-      (declare (ignore height))
-      (bitcoin-lisp.storage:disconnect-block-from-utxo-set utxo-set block spent-utxos)
+      ;; HEIGHT enables Core's per-output height comparison in the disconnect
+      ;; (validation.cpp:2213-2219); it used to be discarded here.
+      (bitcoin-lisp.storage:disconnect-block-from-utxo-set utxo-set block spent-utxos
+                                                           :height height)
       (setf (bitcoin-lisp.storage:block-index-entry-status entry) :header-valid)))
   ;; 2. Re-apply the original chain, fork-first (to-disconnect is tip-first).
   ;;    These blocks were valid when first connected; their undo data is
@@ -2911,7 +2920,8 @@ comment above."
             (when block
               (let ((undo (get-undo-data block-hash)))
                 (bitcoin-lisp.storage:disconnect-block-from-utxo-set
-                 utxo-set block (or undo '())))
+                 utxo-set block (or undo '())
+                 :height (bitcoin-lisp.storage:block-index-entry-height entry)))
               ;; Core flushes IF_NEEDED at the end of DisconnectTip
               ;; (validation.cpp:2966). Safe HERE and not a line earlier:
               ;; disconnect-block-from-utxo-set sets the coins-view best-block
