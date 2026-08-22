@@ -511,7 +511,9 @@ AcceptMultipleTransactions does (validation.cpp:1511-1516)."
       ;; validate-transaction-for-mempool only sees MEMPOOL parents; a dust
       ;; parent that is still in this package is only visible here. Read-only,
       ;; so it keeps the atomicity above.
-      (unless (check-ephemeral-spends (mapcar #'%pkg-val-tx validated) mempool)
+      (when (and *require-standard*
+                 (not (check-ephemeral-spends (mapcar #'%pkg-val-tx validated)
+                                              mempool)))
         (return-from %accept-package-subset :unspent-dust))
       ;; ---- Commit point: every check passed; mutate the mempool. ----
       ;; Evict the package-RBF replaced set once, up front — the analogue of

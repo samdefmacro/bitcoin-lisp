@@ -939,7 +939,7 @@ specially in config-alist->start-node-plist.")
     "mintxfee" "discardfee" "consolidatefeerate" "maxapsfee" "txconfirmtarget"
     "walletrbf" "spendzeroconfchange" "walletrejectlongchains"
     "keypool" "walletdir" "walletnotify"
-    "dnsseed" "fixedseeds" "forcednsseed"
+    "dnsseed" "fixedseeds" "forcednsseed" "acceptnonstdtxn"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
     "addnode" "connect" "seednode" "rpcauth" "rpcallowip" "testactivationheight"
@@ -960,7 +960,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
 
 (defparameter *core-only-config-options*
   '(
-    "acceptnonstdtxn" "addresstype" "alertnotify" "allowignoredconf" "asmap"
+    "addresstype" "alertnotify" "allowignoredconf" "asmap"
     "avoidpartialspends" "blockreconstructionextratxn"
     "blocksdir" "blockversion" "capturemessages"
     "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
@@ -1415,6 +1415,18 @@ start-node-from-args."
           (unless (and n (plusp n))
             (error "Invalid value for -bytespersigop=~A (must be a positive integer)" v))
           (setf bitcoin-lisp.mempool::+bytes-per-sigop+ n))))
+    ;; -acceptnonstdtxn: relay and mine transactions this node would otherwise
+    ;; refuse as non-standard. Core REFUSES TO START with it on a non-test
+    ;; chain (mempool_args.cpp:102-104); an error here, not a warning, because
+    ;; a mainnet node quietly relaying non-standard transactions has its
+    ;; transactions dropped by every peer and does not find out.
+    (let ((v (lk "acceptnonstdtxn")))
+      (when v
+        (let ((accept (conf-parse-bool v)))
+          (when (and accept (member *network* '(:mainnet)))
+            (error "acceptnonstdtxn is not currently supported for ~(~A~) chain"
+                   *network*))
+          (setf bitcoin-lisp.validation::*require-standard* (not accept)))))
     ;; -forcednsseed: query the DNS seeds even with a full address book. It
     ;; does NOT override -dnsseed=0, which is Core's precedence too.
     (let ((v (lk "forcednsseed")))
