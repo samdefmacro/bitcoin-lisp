@@ -661,3 +661,104 @@ Core's 'Ranged descriptor not accepted' behavior."
                 :testnet3)))
     (is (= 1 (length pairs)))
     (is (= 22 (length (car (first pairs)))))))
+
+;;;; Multipath descriptors (BIP389)
+
+(defun %mp-expand (s)
+  (handler-case (bitcoin-lisp.rpc::expand-multipath-descriptor s)
+    (bitcoin-lisp.rpc::rpc-error (e)
+      (list :error (bitcoin-lisp.rpc::rpc-error-message e)))))
+
+(test multipath-descriptors-expand-into-one-descriptor-each
+  "`wpkh(xpub/<0;1>/*)` is ONE string meaning TWO descriptors — the receive
+chain and the change chain — and it is how Sparrow, Ledger Live, BlueWallet,
+BDK and modern Core exports write a wallet. A node that cannot read it cannot
+import from any of them.
+
+Core expands the string and parses each result normally (Parse returns a
+vector, descriptor.cpp:1802-1851); expanding at the string level is what keeps
+derivation, signing, printing and checksums working on descriptors they already
+understand."
+  (is (equal '("wpkh(xpub661MyMwAqRbcF/0/*)")
+             (%mp-expand "wpkh(xpub661MyMwAqRbcF/0/*)"))
+      "a descriptor with no multipath must come back unchanged")
+  (is (equal '("wpkh([deadbeef/84h/1h/0h]xpub/0/*)"
+               "wpkh([deadbeef/84h/1h/0h]xpub/1/*)")
+             (%mp-expand "wpkh([deadbeef/84h/1h/0h]xpub/<0;1>/*)")))
+  (is (equal '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)" "wpkh(xpub/2/*)")
+             (%mp-expand "wpkh(xpub/<0;1;2>/*)")))
+  ;; The substituted text is the ORIGINAL spelling, so a hardened marker
+  ;; survives as written rather than being re-rendered.
+  (is (equal '("wpkh(xpub/0h/*)" "wpkh(xpub/1h/*)")
+             (%mp-expand "wpkh(xpub/<0h;1h>/*)")))
+  ;; The input checksum covered the multipath form, not the expansions, so it
+  ;; is dropped; each expansion gets its own when one is needed.
+  (is (equal '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)")
+             (%mp-expand "wpkh(xpub/<0;1>/*)#abcdefgh"))))
+
+(test multipath-rejects-what-core-rejects
+  "All three messages are Core's own (descriptor.cpp:1809-1831)."
+  (is (equal '(:error "Multipath key path specifiers must have at least two items")
+             (%mp-expand "wpkh(xpub/<0>/*)")))
+  (is (equal '(:error "Duplicated key path value 0 in multipath specifier")
+             (%mp-expand "wpkh(xpub/<0;0>/*)")))
+  (is (equal '(:error "Multiple multipath key path specifiers found")
+             (%mp-expand "wsh(multi(2,xpub1/<0;1>/*,xpub2/<0;1>/*))")))
+  ;; A non-numeric path value is still a path-value error.
+  (is (eq :error (first (%mp-expand "wpkh(xpub/<0;x>/*)")))))
+
+(test multipath-import-makes-the-second-path-the-change-chain
+  "With exactly two expansions Core sets desc_internal = (j == 1) — the second
+IS the change chain, whatever the request said (backup.cpp:230-231). That is
+what makes a single wallet export configure both chains in one call, and it is
+the reason a multipath import cannot carry a label (:203-206)."
+  (let* ((seen '())
+         (wallet :fake))
+    ;; Drive the multipath path directly, recording what each expansion was
+    ;; imported as. %PROCESS-DESCRIPTOR-IMPORT is stubbed: the assertion is
+    ;; about which descriptor/internal pairs it is CALLED with.
+    (flet ((fake-import (w data ts)
+             (declare (ignore w ts))
+             (push (cons (gethash "desc" data) (gethash "internal" data)) seen)
+             '(("success" . t))))
+      (let ((original (symbol-function 'bitcoin-lisp.rpc::%process-descriptor-import)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'bitcoin-lisp.rpc::%process-descriptor-import)
+                     #'fake-import)
+               (let ((data (make-hash-table :test 'equal)))
+                 (setf (gethash "desc" data) "wpkh(xpub/<0;1>/*)")
+                 (let ((result (bitcoin-lisp.rpc::%process-multipath-import
+                                wallet data 1
+                                '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)"))))
+                   (is (eq t (cdr (assoc "success" result :test #'string=)))))))
+          (setf (symbol-function 'bitcoin-lisp.rpc::%process-descriptor-import)
+                original))))
+    (setf seen (nreverse seen))
+    (is (= 2 (length seen)))
+    (is-false (cdr (first seen)) "the first expansion must be the receive chain")
+    (is-true (cdr (second seen)) "the second expansion must be the CHANGE chain")
+    ;; Each expansion carries its own checksum, since the input's covered the
+    ;; multipath form.
+    (is-true (find #\# (car (first seen))) "expansion was imported unchecksummed")
+    (is-true (find #\# (car (second seen))))))
+
+(test multipath-import-refuses-a-label
+  "Core: \"Multipath descriptors should not have a label\" (backup.cpp:203-206)."
+  (let ((data (make-hash-table :test 'equal)))
+    (setf (gethash "desc" data) "wpkh(xpub/<0;1>/*)"
+          (gethash "label" data) "mine")
+    (let ((result (bitcoin-lisp.rpc::%process-multipath-import
+                   :fake data 1 '("wpkh(xpub/0/*)" "wpkh(xpub/1/*)"))))
+      (is-false (cdr (assoc "success" result :test #'string=)))
+      (is (string= "Multipath descriptors should not have a label"
+                   (cdr (assoc "message"
+                               (cdr (assoc "error" result :test #'string=))
+                               :test #'string=))))))
+  ;; More than two paths plus `internal` is Core's other refusal (:232-234).
+  (let ((data (make-hash-table :test 'equal)))
+    (setf (gethash "desc" data) "wpkh(xpub/<0;1;2>/*)"
+          (gethash "internal" data) t)
+    (let ((result (bitcoin-lisp.rpc::%process-multipath-import
+                   :fake data 1 '("a" "b" "c"))))
+      (is-false (cdr (assoc "success" result :test #'string=))))))

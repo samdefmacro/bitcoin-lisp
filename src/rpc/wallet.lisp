@@ -1848,7 +1848,25 @@ median-time-past."
 (defun %process-descriptor-import (wallet data timestamp)
   "One importdescriptors request (Core ProcessDescriptorImport,
 backup.cpp:141-300). Returns the per-request result alist; rpc-errors are
-caught into {success: false, error: {...}}."
+caught into {success: false, error: {...}}.
+
+A MULTIPATH descriptor (BIP389, `<0;1>`) is ONE request that imports N
+descriptors. Core's rules, all of them load-bearing for a real wallet export:
+
+  - with exactly two expansions, the SECOND is the internal (change) chain
+    regardless of what `internal` said — `desc_internal = j == 1`
+    (backup.cpp:230-231). This is what makes a single Sparrow/BDK export set up
+    both chains in one call.
+  - with more than two, `internal` must not be set (:232-234).
+  - a multipath descriptor may not carry a label (:203-206)."
+  (let ((expansions (handler-case
+                        (and (hash-table-p data)
+                             (stringp (gethash "desc" data))
+                             (expand-multipath-descriptor (gethash "desc" data)))
+                      (rpc-error () nil))))
+    (when (and expansions (rest expansions))
+      (return-from %process-descriptor-import
+        (%process-multipath-import wallet data timestamp expansions))))
   (let ((warnings '()))
     (handler-case
         (progn
@@ -1955,6 +1973,39 @@ caught into {success: false, error: {...}}."
                         `(("success" . ,+json-false+)
                           ("error" . (("code" . ,(rpc-error-code e))
                                       ("message" . ,(rpc-error-message e))))))))))
+
+(defun %process-multipath-import (wallet data timestamp expansions)
+  "Import the EXPANSIONS of one multipath request and return a single result,
+as Core returns one result per REQUEST rather than per expansion."
+  (handler-case
+      (progn
+        (when (nth-value 1 (gethash "label" data))
+          (error 'rpc-error :code +rpc-invalid-parameter+
+                            :message "Multipath descriptors should not have a label"))
+        (when (and (> (length expansions) 2)
+                   (gethash "internal" data))
+          (error 'rpc-error :code +rpc-invalid-parameter+
+                            :message "Cannot have multipath descriptor with more than two paths and internal"))
+        (loop for expansion in expansions
+              for index from 0
+              do (let ((sub (make-hash-table :test 'equal)))
+                   (maphash (lambda (k v) (setf (gethash k sub) v)) data)
+                   ;; The checksum covered the multipath form, not this
+                   ;; expansion, so a fresh one is computed for each.
+                   (setf (gethash "desc" sub)
+                         (descriptor-add-checksum expansion))
+                   ;; Two expansions: the second IS the change chain, whatever
+                   ;; the request said (Core backup.cpp:230-231).
+                   (when (= (length expansions) 2)
+                     (setf (gethash "internal" sub) (= index 1)))
+                   (let ((result (%process-descriptor-import wallet sub timestamp)))
+                     (unless (eq t (cdr (assoc "success" result :test #'string=)))
+                       (return-from %process-multipath-import result)))))
+        `(("success" . t)))
+    (rpc-error (e)
+      `(("success" . nil)
+        ("error" . (("code" . ,(rpc-error-code e))
+                    ("message" . ,(rpc-error-message e))))))))
 
 (defun rpc-importdescriptors (node params)
   "Import descriptors into the wallet (Bitcoin Core importdescriptors), then
