@@ -39,6 +39,23 @@
     (:regtest 18444)
     (:mainnet 8333)))
 
+(defun %resolve-log-file (log-file data-directory)
+  "The path to log to, or NIL for no file log.
+
+LOG-FILE is -logfile: a path uses it as given, and an explicit \"0\" or \"\"
+turns file logging off the way Core's -debuglogfile=0 does. Anything else —
+including the usual case of no -logfile at all — is debug.log inside
+DATA-DIRECTORY."
+  (cond ((and (stringp log-file)
+              (or (string= log-file "0") (string= log-file "")))
+         nil)
+        ((and (stringp log-file) (plusp (length log-file))) log-file)
+        (log-file log-file)
+        (data-directory
+         (namestring (merge-pathnames "debug.log"
+                                      (uiop:ensure-directory-pathname data-directory))))
+        (t nil)))
+
 (defun listen-port (network)
   "The P2P LISTEN port: -port when given, else NETWORK's default (Core
 GetListenPort, net.cpp:138-162). Dialing peers keeps the chain default —
@@ -2126,8 +2143,13 @@ Returns the node instance."
   ;; failure mode (no node.log entries since May 2 16:32 crash).
   (when console-log
     (enable-console-logging))
-  (when log-file
-    (start-file-logging log-file))
+  ;; A node logs to <datadir>/debug.log unless told otherwise, as Core does
+  ;; (DEFAULT_DEBUGLOGFILE, "debug.log" under the datadir; -debuglogfile=0
+  ;; disables it). Before this the node wrote no file at all without an
+  ;; explicit -logfile, which is also what Core's functional framework reads
+  ;; for EVERY node it starts, and what an operator looks for first.
+  (let ((path (%resolve-log-file log-file data-directory)))
+    (when path (start-file-logging path)))
 
   ;; UTXO cache budget (Core -dbcache). Larger = fewer LevelDB disk reads.
   (when dbcache-mib
@@ -3113,6 +3135,15 @@ file location."
       (dolist (k (unknown-config-file-keys
                   (loop for text in conf-texts append (parse-bitcoin-conf text))))
         (log-warn "Ignoring unknown configuration value ~A" k))
+      ;; Options bitcoind accepts that this node does not implement. They are
+      ;; accepted so an ordinary Core command line starts us at all, but every
+      ;; one that was actually SUPPLIED is named here — an operator who passes
+      ;; -asmap or -whitelist must not be left believing it took effect.
+      (let ((ignored (supplied-core-only-options merged)))
+        (when ignored
+          (log-warn "Accepted but NOT implemented by this node, so ~
+~:[this option has~;these options have~] no effect: ~{-~A~^ ~}"
+                    (rest ignored) ignored)))
       ;; Apply the process-global config specials (options with no start-node
       ;; keyword) from the same merged config, before launching.
       (apply-config-globals merged)

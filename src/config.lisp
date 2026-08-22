@@ -631,7 +631,7 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
     (:regtest "regtest")))
 
 (defparameter *repeatable-config-options*
-  '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip")
+  '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -832,7 +832,10 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ("rpcuser"           :rpc-user           :string)
     ("rpcpassword"       :rpc-password       :string)
     ("listen"            :listen             :bool)
-    ("bind"              :listen-bind        :string)
+    ;; -bind is scanned for its LAST occurrence here (the single address we
+     ;; actually bind); every occurrence is also collected below, so a
+     ;; multi-bind command line is reported rather than silently reduced.
+     ("bind"              :listen-bind        :string)
     ("listenonion"       :listen-onion       :bool)
     ("torcontrol"        :tor-control        :string)
     ("torpassword"       :tor-password       :string)
@@ -846,7 +849,13 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ("webuipath"         :webui-path         :string)
     ("webuiopen"         :webui-open         :bool)
     ("wallet"            :wallet             :bool)
+    ;; Core's -disablewallet is the negation of our -wallet; it is inverted
+    ;; where the plist is assembled, since the spec scan has no notion of a
+    ;; flag that means the opposite of its key.
+    ("disablewallet"     :disable-wallet     :bool)
     ("logfile"           :log-file           :string)
+    ;; Core's own spelling of the same thing; -debuglogfile=0 disables it.
+    ("debuglogfile"      :log-file           :string)
     ("loglevel"          :log-level          :loglevel)
     ("logratelimit"      :log-rate-limit     :bool)
     ("flatblockfiles"    :flat-block-files   :bool)
@@ -891,6 +900,60 @@ consumes). check-cli-args unions this with the spec to reject unknown
 command-line options at startup, like Core ArgsManager::ParseParameters
 (common/args.cpp:229-238).")
 
+(defparameter *core-only-config-options*
+  '(
+    "acceptnonstdtxn" "addresstype" "alertnotify" "allowignoredconf" "asmap"
+    "avoidpartialspends" "blocknotify" "blockreconstructionextratxn"
+    "blocksdir" "blocksxor" "blockversion" "bytespersigop" "capturemessages"
+    "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
+    "checkmempool" "checkpoints" "connect" "consolidatefeerate" "daemon"
+    "daemonwait" "dbbatchsize" "debugexclude" "deprecatedrpc"
+    "discardfee" "discover" "dns" "dustrelayfee" "fastprune"
+    "forcednsseed" "help" "i2pacceptincoming" "i2psam" "incrementalrelayfee"
+    "ipcbind" "keypool" "limitancestorcount" "limitancestorsize"
+    "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
+    "loglevelalways" "logsourcelocations" "logthreadnames" "logtimemicros"
+    "logtimestamps" "maxapsfee" "maxreceivebuffer" "maxsendbuffer"
+    "maxsigcachesize" "maxtipage" "maxuploadtarget" "mintxfee" "mocktime"
+    "natpmp" "par" "peerbloomfilters" "peertimeout" "persistmempool"
+    "persistmempoolv1" "pid" "printpriority" "printtoconsole"
+    "privatebroadcast" "rpccookiefile" "rpccookieperms" "rpcdoccheck"
+    "rpcservertimeout" "rpcthreads" "rpcwhitelist" "rpcwhitelistdefault"
+    "rpcworkqueue" "seednode" "settings" "shrinkdebugfile" "shutdownnotify"
+    "signer" "signetseednode" "spendzeroconfchange" "startupnotify"
+    "stopafterblockimport" "test" "testactivationheight" "timeout"
+    "txconfirmtarget" "txospenderindex" "unsafesqlitesync" "vbparams"
+    "version" "walletbroadcast" "walletcrosschain" "walletdir"
+    "walletnotify" "walletrbf" "walletrejectlongchains" "whitebind"
+    "whitelist" "whitelistforcerelay" "whitelistrelay")
+  "Options bitcoind accepts that this node recognises but does NOT implement,
+extracted from Core's AddArg registrations (init.cpp, common/args.cpp,
+init/common.cpp, chainparamsbase.cpp, the wallet/index/zmq/rpc modules).
+
+They exist so an unknown-option HARD ERROR does not stop a node that was
+started with an ordinary Core command line — Core's functional test framework
+passes -logtimemicros, -logthreadnames, -logsourcelocations, -debugexclude and
+-loglevel to EVERY node it starts (test_node.py:68-108), and 128 more flags
+across individual tests. Rejecting those meant the framework could not launch
+us at all.
+
+Accepting is not implementing: SUPPLIED-CORE-ONLY-OPTIONS reports which of
+these an operator actually passed so startup can say so out loud. Silently
+swallowing -asmap or -whitelist would be worse than refusing them.")
+
+(defun core-only-option-p (name)
+  "T when NAME is an option bitcoind accepts and we do not implement."
+  (member (string-downcase name) *core-only-config-options* :test #'string=))
+
+(defun supplied-core-only-options (alist)
+  "The core-only options actually present in ALIST, deduplicated and in order.
+The caller warns about each, so accepting them never passes for implementing
+them."
+  (remove-duplicates
+   (loop for (k . nil) in alist
+         when (core-only-option-p k) collect (string-downcase k))
+   :test #'string= :from-end t))
+
 (defun known-config-option-p (name)
   "T if NAME (lower-case, no dashes) is a recognized config option."
   (and (or (member name *known-config-options* :test #'string=)
@@ -898,7 +961,11 @@ command-line options at startup, like Core ArgsManager::ParseParameters
            ;; -nokey negation of a known key parses to key=0 before this
            ;; check, but tolerate the raw \"noKEY\" spelling too.
            (and (> (length name) 2) (string-equal (subseq name 0 2) "no")
-                (known-config-option-p (subseq name 2))))
+                (known-config-option-p (subseq name 2)))
+           ;; Recognised-but-unimplemented Core options: accepted so an
+           ;; ordinary bitcoind command line starts this node, warned about at
+           ;; startup so nobody mistakes that for support.
+           (core-only-option-p name))
        t))
 
 (defun check-cli-args (args)
@@ -928,6 +995,54 @@ warning per key (Core LogWarning \"Ignoring unknown configuration value\")
          unless (known-config-option-p k)
            collect k)
    :test #'string= :from-end t))
+
+(defun parse-bind-option (spec)
+  "Parse one -bind value into (VALUES host port onion-p), or NIL when it is
+unparseable.
+
+Core's form is `-bind=<addr>[:<port>][=onion]` (init.cpp; test_node.py:272-276
+passes both the plain and the =onion form). The `=onion` suffix marks a
+listener reserved for incoming Tor connections rather than an address in its
+own right, so it is reported separately. PORT is NIL when the value names only
+an address, which means \"the network's default port\".
+
+An IPv6 literal must be bracketed for the port to be separable, exactly as in
+Core: `[::1]:8333` has a port, `::1` does not."
+  (when (stringp spec)
+    (let* ((onion-p nil)
+           (text spec))
+      ;; The =onion suffix first: it is not part of the address.
+      (let ((tail (search "=onion" text :from-end t)))
+        (when (and tail (= tail (- (length text) 6)))
+          (setf onion-p t text (subseq text 0 tail))))
+      (when (plusp (length text))
+        (let ((close-bracket (position #\] text :from-end t)))
+          (cond
+            ;; [v6]:port or bare [v6]
+            ((and (char= (char text 0) #\[) close-bracket)
+             (let ((host (subseq text 1 close-bracket))
+                   (rest (subseq text (1+ close-bracket))))
+               (cond ((zerop (length rest)) (values host nil onion-p))
+                     ((and (char= (char rest 0) #\:)
+                           (%parse-port (subseq rest 1)))
+                      (values host (%parse-port (subseq rest 1)) onion-p))
+                     (t nil))))
+            ;; An unbracketed value with exactly one colon is host:port; more
+            ;; than one colon is a bare IPv6 literal, never host:port.
+            (t
+             (let ((colon (position #\: text)))
+               (cond ((null colon) (values text nil onion-p))
+                     ((find #\: text :start (1+ colon)) (values text nil onion-p))
+                     (t (let ((port (%parse-port (subseq text (1+ colon)))))
+                          (when port
+                            (values (subseq text 0 colon) port onion-p)))))))))))))
+
+(defun %parse-port (string)
+  "STRING as a TCP port number, or NIL."
+  (when (and (plusp (length string))
+             (every #'digit-char-p string))
+    (let ((n (parse-integer string :junk-allowed t)))
+      (when (and n (<= 1 n 65535)) n))))
 
 (defun conf-effective-listen-flags (alist)
   "Replay Core's -proxy/-listen/-listenonion soft-set chain over a merged
@@ -983,6 +1098,36 @@ resolved network. Honors -server (enable RPC on the default port when no
                             when (string= k (car option))
                               collect v)))
           (when values (setf (getf plist (cdr option)) values))))
+      ;; -disablewallet turns the wallet OFF (Core init.cpp). Inverted into
+      ;; :wallet, and only when -wallet was not given explicitly: an operator
+      ;; who wrote both said something contradictory, and Core lets the
+      ;; explicit -wallet win by loading it anyway.
+      (let ((disable (getf plist :disable-wallet)))
+        (remf plist :disable-wallet)
+        (when (and disable (not (lookup "wallet")))
+          (setf (getf plist :wallet) nil)))
+      ;; -bind=<addr>[:<port>][=onion] (Core init.cpp; the functional framework
+      ;; passes both forms, test_node.py:272-276). The spec scan above already
+      ;; took the last plain value into :listen-bind; re-derive it here so the
+      ;; address is separated from its port, and so an =onion entry — which
+      ;; names a Tor-only listener, not an address to bind — is not mistaken
+      ;; for one.
+      (let* ((specs (loop for (k . v) in alist when (string= k "bind") collect v))
+             (parsed (loop for spec in specs
+                           collect (multiple-value-list (parse-bind-option spec))))
+             (plain (remove-if (lambda (p) (or (null (first p)) (third p))) parsed)))
+        (when (and specs (null plain))
+          ;; Every -bind was =onion or unparseable: do NOT leave the spec
+          ;; scan's raw string (which still carries ":port=onion") in the
+          ;; plist as a bind address.
+          (remf plist :listen-bind))
+        (when plain
+          (destructuring-bind (host port onion-p) (first plain)
+            (declare (ignore onion-p))
+            (setf (getf plist :listen-bind) host)
+            ;; A port on -bind overrides -port for the listener, as it does in
+            ;; Core, where the bind address carries its own port.
+            (when port (setf (getf plist :port) port)))))
       ;; -debug is a shortcut for -loglevel=debug (unless loglevel was set).
       (let ((debug (lookup "debug")))
         (when (and debug (conf-parse-bool (cdr debug)) (not (lookup "loglevel")))

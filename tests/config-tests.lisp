@@ -686,3 +686,104 @@ rpcallowip=10.0.0.0/8~%rpcallowip=::/0~%"))))
   (is-true (member "rpcauth" bitcoin-lisp::*repeatable-config-options* :test #'string=))
   (is-true (member "rpcallowip" bitcoin-lisp::*repeatable-config-options*
                    :test #'string=)))
+
+;;; --- Core command-line compatibility (track B P0) ---
+
+(test core-options-are-accepted-not-rejected
+  "Core's functional framework passes -logtimemicros, -logthreadnames,
+-logsourcelocations, -debugexclude and -loglevel to EVERY node it starts
+(test_node.py:68-108), plus 128 more flags across individual tests. An unknown
+CLI option is a HARD error here, so before this the framework could not launch
+this node at all."
+  (dolist (option '("-logtimemicros" "-logthreadnames" "-logsourcelocations"
+                    "-debugexclude=libevent" "-loglevel=trace" "-par=4"
+                    "-checkblocks=0" "-whitelist=127.0.0.1" "-asmap=x"
+                    "-maxuploadtarget=800" "-peertimeout=999"))
+    (finishes (bitcoin-lisp::check-cli-args (list "-regtest" option))
+              "~A was rejected" option))
+  ;; Accepting is not implementing: the option is reported as supplied.
+  (is (equal '("asmap" "par")
+             (bitcoin-lisp::supplied-core-only-options
+              '(("asmap" . "x") ("regtest" . "1") ("par" . "4") ("asmap" . "y")))))
+  (is-false (bitcoin-lisp::supplied-core-only-options '(("regtest" . "1"))))
+  ;; And a genuinely unknown option is still a hard error.
+  (signals error (bitcoin-lisp::check-cli-args '("-notacoreoption"))))
+
+(test disablewallet-turns-the-wallet-off
+  "Core's -disablewallet is the negation of our -wallet. 62 functional tests
+run wallet-less nodes with it."
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest" "-disablewallet") nil)))
+    (is-true (member :wallet plist) "-disablewallet did not reach :wallet")
+    (is-false (getf plist :wallet))
+    (is-false (member :disable-wallet plist) "the raw key leaked into start-node"))
+  ;; An explicit -wallet wins, as it does in Core.
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest" "-disablewallet" "-wallet=1") nil)))
+    (is-true (getf plist :wallet)))
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest") nil)))
+    (is-false (member :disable-wallet plist))))
+
+(test bind-option-parses-core-s-forms
+  "-bind=<addr>[:<port>][=onion] (test_node.py:272-276 passes both forms). An
+IPv6 literal must be bracketed for its port to be separable, exactly as in
+Core — otherwise ::1 would parse as host \"\" port 1."
+  (flet ((parsed (spec) (multiple-value-list (bitcoin-lisp::parse-bind-option spec))))
+    (is (equal '("127.0.0.1" nil nil) (parsed "127.0.0.1")))
+    (is (equal '("127.0.0.1" 18445 nil) (parsed "127.0.0.1:18445")))
+    (is (equal '("127.0.0.1" 18445 t) (parsed "127.0.0.1:18445=onion")))
+    (is (equal '("127.0.0.1" nil t) (parsed "127.0.0.1=onion")))
+    (is (equal '("::1" nil nil) (parsed "::1")))
+    (is (equal '("::1" 8333 nil) (parsed "[::1]:8333")))
+    (is (equal '("2001:db8::1" nil nil) (parsed "2001:db8::1")))
+    (is (equal '("0.0.0.0" 1 nil) (parsed "0.0.0.0:1")))
+    ;; Rejected: a port that is not one.
+    (is (equal '(nil) (parsed "127.0.0.1:0")))
+    (is (equal '(nil) (parsed "127.0.0.1:65536")))
+    (is (equal '(nil) (parsed "127.0.0.1:http")))
+    (is (equal '(nil) (parsed "")))
+    (is (equal '(nil) (parsed nil)))))
+
+(test bind-reaches-the-listener-address-and-port
+  "The parsed host and port must actually reach start-node: a -bind carrying a
+port overrides -port for the listener, as it does in Core."
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest" "-bind=127.0.0.1:18445") nil)))
+    (is (string= "127.0.0.1" (getf plist :listen-bind)))
+    (is (= 18445 (getf plist :port))))
+  ;; No port on -bind leaves -port alone.
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest" "-bind=127.0.0.1" "-port=12345") nil)))
+    (is (string= "127.0.0.1" (getf plist :listen-bind)))
+    (is (= 12345 (getf plist :port))))
+  ;; An =onion bind names a Tor-only listener, not an address to bind: the raw
+  ;; string must not survive as one, or the node would try to bind
+  ;; "127.0.0.1:18445=onion" as a hostname.
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest" "-bind=127.0.0.1:18445=onion") nil)))
+    (is-false (getf plist :listen-bind)))
+  ;; Repeatable: the first plain bind is used, and neither occurrence errors.
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest" "-bind=127.0.0.1:18445" "-bind=127.0.0.2:18446") nil)))
+    (is (string= "127.0.0.1" (getf plist :listen-bind)))
+    (is (= 18445 (getf plist :port)))))
+
+(test log-file-defaults-to-debug-log-in-the-datadir
+  "Core writes <datadir>/debug.log unless -debuglogfile says otherwise, and its
+functional framework reads that file for every node it starts. We wrote no file
+at all without an explicit -logfile."
+  (is (string= "/data/dir/debug.log"
+               (bitcoin-lisp::%resolve-log-file nil "/data/dir/")))
+  (is (string= "/data/dir/debug.log"
+               (bitcoin-lisp::%resolve-log-file nil "/data/dir")))
+  ;; An explicit path wins.
+  (is (string= "/tmp/custom.log"
+               (bitcoin-lisp::%resolve-log-file "/tmp/custom.log" "/data/dir/")))
+  ;; -debuglogfile=0 disables it, as in Core.
+  (is-false (bitcoin-lisp::%resolve-log-file "0" "/data/dir/"))
+  (is-false (bitcoin-lisp::%resolve-log-file "" "/data/dir/"))
+  ;; No datadir, no default.
+  (is-false (bitcoin-lisp::%resolve-log-file nil nil))
+  ;; -debuglogfile is Core's spelling of -logfile and reaches the same key.
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest" "-debuglogfile=/tmp/x.log") nil)))
+    (is (string= "/tmp/x.log" (getf plist :log-file)))))
