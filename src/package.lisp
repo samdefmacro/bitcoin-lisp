@@ -1079,6 +1079,8 @@
    #:validate-block-scripts
    #:find-witness-commitment
    #:validate-witness-commitment
+   #:update-uncommitted-block-structures
+   #:witness-reserved-value
    #:block-witness-stripped-p
    #:compute-witness-merkle-root
    #:check-proof-of-work

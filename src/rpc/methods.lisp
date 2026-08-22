@@ -3257,8 +3257,9 @@ only ever does under the lock (Core ProcessNewBlock takes cs_main)."
 
 (defun rpc-submitblock (node params)
   "Submit a mined block (Bitcoin Core submitblock). PARAMS: (block-hex). Returns
-JSON null on acceptance, \"duplicate\" if already known, or a BIP22 reject reason
-string. Routes through the same activate-block consensus path as network blocks."
+JSON null on acceptance, \"duplicate\" if already known, \"duplicate-invalid\"
+if already known to be invalid, \"inconclusive\" for a valid block that was
+stored without becoming the tip, or a BIP22 reject reason string. Routes through the same activate-block consensus path as network blocks."
   (let ((hex (first params)))
     (unless (and (stringp hex) (plusp (length hex)))
       ;; Core: RPC_DESERIALIZATION_ERROR (-22) "Block decode failed".
@@ -3293,11 +3294,15 @@ string. Routes through the same activate-block consensus path as network blocks.
           (let ((store (rpc-get-block-store node)))
             (when (and store (bitcoin-lisp.storage:block-exists-p store hash))
               (return-from rpc-submitblock "duplicate"))))
+        (bitcoin-lisp.validation:update-uncommitted-block-structures block chain-state)
         (multiple-value-bind (ok reason) (%activate-submitted-block node block)
           (cond
             (ok nil)                        ; accepted → JSON null (BIP22 success)
-            ;; A valid block stored on a weaker side chain is still accepted.
-            ((eq reason :weaker-chain) nil)
+            ;; A valid block stored on a side chain never reaches Core's
+            ;; submitblock_StateCatcher (BlockChecked fires only on a connect
+            ;; attempt), so Core reports it "inconclusive" (rpc/mining.cpp:
+            ;; 1091-1095): neither rejected nor the new tip.
+            ((eq reason :weaker-chain) "inconclusive")
             (t (string-downcase (symbol-name reason))))))))))
 
 (defun rpc-submitheader (node params)
