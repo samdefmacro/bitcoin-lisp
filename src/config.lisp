@@ -222,20 +222,36 @@ config.lisp compiles first — the same reason *dns-seed-enabled* is here.")
 candidate pool thin (Core -fixedseeds, DEFAULT_FIXEDSEEDS = true, net.h:97).")
 
 (defvar *parallel-block-validation* nil
-  "When NIL (default), block-script validation runs single-threaded.
+  "When NIL (default), block-script validation runs single-threaded. -par=N>1
+turns it on; -par=1 turns it off, as Core's does.
 
-The per-block worker-thread path is disabled by default after a production
-crash: at mainnet block scale the concurrent libsecp CFFI calls across the
-worker threads corrupt SBCL's global alien-type cache (SB-ALIEN::RECORD-TYPE=,
-an EQ hash-table mutated under a system lock), which then faults during an
-unrelated alien op — the sync thread's socket-connect (make-sockaddr-for) — and
-spirals into a \"maximum interrupt nesting depth exceeded\" fatal. testnet4's
-small blocks never crossed the threshold (3h+ stable), but mainnet crashed at
-tip within minutes. Serial validation removes the concurrent alien-cache writes.
+STILL DEFAULT-OFF, and the reason is worth stating precisely because ONE of the
+two known hazards has since been removed and the other has not.
+
+Removed (2026-08-22): the workers used to call COLLECT-SPENT-UTXOS themselves,
+and that read path INSERTS ON MISS into the coins-view cache — a plain,
+non-:synchronized SBCL hash table. Concurrent read-through inserts corrupt it.
+PREFETCH-BLOCK-SPENT-COINS now resolves every spent coin on the validation
+thread before any worker starts, so the workers receive pure data and never
+touch the coins view. That is Core's shape: ConnectBlock copies each spent Coin
+into its CScriptCheck before queuing it.
+
+NOT removed: the production crash this flag was turned off for was diagnosed as
+concurrent libsecp CFFI calls corrupting SBCL's global alien-type cache
+(SB-ALIEN::RECORD-TYPE=, an EQ hash-table mutated under a system lock), which
+then faulted during an unrelated alien op — the sync thread's socket-connect —
+and spiralled into \"maximum interrupt nesting depth exceeded\". testnet4's
+small blocks never crossed the threshold (3h+ stable); mainnet crashed at tip
+within minutes. Nothing here addresses that, and the two diagnoses are not the
+same bug: the coins-view race explains corruption, the alien-cache one explains
+where the fault surfaced.
+
+So: the coins-view hazard is gone, the alien-cache one is unproven either way,
+and the honest next step is a testnet4 soak followed by a mainnet one — not
+flipping this default on the strength of a fix to the other problem.
 
 IBD was network/disk-bound (sig checks were never the top profile frames), so
-the speed cost is small. Set T to re-enable parallel validation on a low-volume
-chain where the speedup matters and the scale stays safe.")
+the speed cost of leaving it off is small.")
 
 (defun network-assumevalid (network)
   "NETWORK's defaultAssumeValid block hash in WIRE byte order, or NIL when
@@ -947,6 +963,7 @@ specially in config-alist->start-node-plist.")
     "walletrbf" "spendzeroconfchange" "walletrejectlongchains"
     "keypool" "walletdir" "walletnotify"
     "dnsseed" "fixedseeds" "forcednsseed" "acceptnonstdtxn" "migratedatadir"
+    "par"
     "whitelistrelay" "whitelistforcerelay"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
@@ -982,7 +999,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "loglevelalways" "logsourcelocations"
     "logtimestamps" "maxreceivebuffer"
 
-    "natpmp" "par" "peerbloomfilters" "persistmempool"
+    "natpmp" "peerbloomfilters" "persistmempool"
     "persistmempoolv1" "printpriority"
     "privatebroadcast" "rpcdoccheck"
     "rpcwhitelist" "rpcwhitelistdefault"
@@ -1433,6 +1450,17 @@ start-node-from-args."
     (let ((v (lk "whitelistforcerelay")))
       (when v
         (setf bitcoin-lisp.networking::*whitelist-force-relay* (conf-parse-bool v))))
+    ;; -par: how many script-check worker threads. Core's semantics —
+    ;; 0 means one per core, a NEGATIVE value leaves that many cores free, and
+    ;; the result is clamped to MAX_SCRIPTCHECK_THREADS. Reading the negative
+    ;; form as an absolute value would oversubscribe the very box the operator
+    ;; asked to leave headroom on.
+    (let ((v (lk "par")))
+      (when v
+        (let ((n (bitcoin-lisp.validation::parse-par-threads (conf-parse-int v))))
+          (setf bitcoin-lisp.validation::+parallel-validation-workers+ n)
+          ;; Core: -par=1 means no extra threads at all.
+          (setf *parallel-block-validation* (> n 1)))))
     ;; -acceptnonstdtxn: relay and mine transactions this node would otherwise
     ;; refuse as non-standard. Core REFUSES TO START with it on a non-test
     ;; chain (mempool_args.cpp:102-104); an error here, not a warning, because

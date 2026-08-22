@@ -684,19 +684,84 @@ Returns (VALUES T NIL) on success, (VALUES NIL ERROR-KEYWORD) on failure."
    CCheckQueue uses a similar batching threshold.")
 
 (defparameter +parallel-validation-workers+ 4
-  "Number of worker threads for parallel block-script validation.
-   Set to ~CPU-count for best throughput. 4 is a safe default for
-   testnet sync on modest hardware; bordeaux-threads imposes minimal
-   overhead per spawn.")
+  "Number of worker threads for parallel block-script validation, settable
+with -par (Core's DEFAULT_SCRIPTCHECK_THREADS / MAX_SCRIPTCHECK_THREADS).
+A DEFPARAMETER because -par changes it; see PARSE-PAR-THREADS.")
 
-(defun validate-tx-scripts (tx tx-idx utxo-set script-flags height &key extra-coins)
+(defconstant +max-scriptcheck-threads+ 15
+  "Core MAX_SCRIPTCHECK_THREADS (validation.h).")
+
+(defun available-processor-count ()
+  "How many CPUs this node may use, for -par=0 and -par=<negative>.
+
+Read from /proc/cpuinfo, which is what the node actually runs on (a Linux
+container), falling back to 4 where that file does not exist. SBCL exports no
+portable CPU count and neither does bordeaux-threads, so the choice is this or
+a guess; a wrong guess here oversubscribes the box Core was told to leave
+headroom on."
+  (or (ignore-errors
+       (with-open-file (in #p"/proc/cpuinfo" :if-does-not-exist nil)
+         (when in
+           (let ((n 0))
+             (loop for line = (read-line in nil) while line
+                   do (when (and (>= (length line) 9)
+                                 (string= "processor" (subseq line 0 9)))
+                        (incf n)))
+             (and (plusp n) n)))))
+      4))
+
+(defun parse-par-threads (value)
+  "Core's -par semantics (init.cpp): 0 means \"as many as there are cores\",
+a NEGATIVE value means leave that many cores free, and the result is clamped to
+MAX_SCRIPTCHECK_THREADS. 1 disables the extra threads.
+
+The negative form is the one worth getting right: -par=-1 on a 4-core box means
+THREE workers, not one, and reading it as an absolute value would quietly
+oversubscribe the machine Core was told to leave headroom on."
+  (let* ((cores (available-processor-count))
+         (n (cond ((null value) +parallel-validation-workers+)
+                  ((zerop value) cores)
+                  ((minusp value) (+ cores value))
+                  (t value))))
+    (max 0 (min n +max-scriptcheck-threads+))))
+
+(defun prefetch-block-spent-coins (txs utxo-set extra-coins)
+  "Resolve every non-coinbase transaction's spent coins UP FRONT, on the
+calling thread. Returns a vector of per-transaction spent-utxo vectors, indexed
+the same way (rest TXS) is.
+
+This is Core's shape and the reason parallel validation can be safe at all:
+ConnectBlock copies each spent Coin into its CScriptCheck BEFORE queuing it
+(validation.cpp ~:2540-2560), so the workers never touch the coins view.
+
+Ours previously had each worker call COLLECT-SPENT-UTXOS itself, and that read
+path INSERTS ON MISS into the coins-view cache — a plain, non-:synchronized
+SBCL hash table. Concurrent read-through inserts corrupt it, and no amount of
+care in the script interpreter can make that safe."
+  (let* ((non-coinbase (rest txs))
+         (out (make-array (length non-coinbase))))
+    (loop for tx in non-coinbase
+          for i from 0
+          do (setf (aref out i)
+                   (collect-spent-utxos
+                    (bitcoin-lisp.serialization:transaction-inputs tx)
+                    utxo-set extra-coins)))
+    out))
+
+(defun validate-tx-scripts (tx tx-idx utxo-set script-flags height
+                            &key extra-coins spent-utxos)
   "Validate all input scripts of a single transaction. Returns
 T on success or NIL on failure. EXTRA-COINS is an optional (txid . index) ->
 utxo-entry table of coins created by earlier transactions in the same block,
-which are not in UTXO-SET yet. Designed to be safe to call from
-worker threads — binds all required specials locally."
+which are not in UTXO-SET yet.
+
+SPENT-UTXOS, when supplied, is this transaction's already-resolved coins from
+PREFETCH-BLOCK-SPENT-COINS. Passing it is what makes a worker thread safe: the
+coins view is never touched here, so its non-synchronized cache is never
+written concurrently."
   (let* ((tx-inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-         (spent-utxos (collect-spent-utxos tx-inputs utxo-set extra-coins))
+         (spent-utxos (or spent-utxos
+                          (collect-spent-utxos tx-inputs utxo-set extra-coins)))
          (bitcoin-lisp.coalton.interop:*script-flags* script-flags)
          (bitcoin-lisp.coalton.interop:*precomputed-sighash*
            (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
@@ -750,9 +815,15 @@ sig check is independent across inputs and txs, so this parallelizes
 cleanly. The shared sig-cache uses SBCL :synchronized hash-tables for
 safe concurrent access. EXTRA-COINS (the block's intra-block coin overlay)
 is read-only for the whole of this call and must already be complete when
-it is reached — the workers only ever GETHASH it."
+it is reached — the workers only ever GETHASH it.
+
+The spent coins are resolved HERE, on this thread, before any worker starts
+(Core's ConnectBlock does the same before queuing a CScriptCheck). The workers
+then receive pure data and never touch the coins view, whose cache inserts on
+read and is not synchronized."
   (let* ((non-coinbase (rest txs))
          (n-txs (length non-coinbase))
+         (prefetched (prefetch-block-spent-coins txs utxo-set extra-coins))
          (n-workers (min +parallel-validation-workers+ n-txs))
          ;; Partition tx indices round-robin across workers so each gets
          ;; a roughly even mix of light and heavy txs.
@@ -776,9 +847,11 @@ it is reached — the workers only ever GETHASH it."
                                        ;; tx-idx is 1-based to match
                                        ;; original (rest transactions).
                                        (tx-idx (1+ i)))
-                                   (unless (validate-tx-scripts tx tx-idx utxo-set
-                                                                script-flags height
-                                                                :extra-coins extra-coins)
+                                   (unless (validate-tx-scripts
+                                            tx tx-idx utxo-set
+                                            script-flags height
+                                            :extra-coins extra-coins
+                                            :spent-utxos (aref prefetched i))
                                      (bt:with-lock-held (failure-lock)
                                        (setf (car failure-flag) t))
                                      (return))))))

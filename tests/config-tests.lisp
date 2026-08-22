@@ -702,13 +702,15 @@ this node at all."
     (finishes (bitcoin-lisp::check-cli-args (list "-regtest" option))
               "~A was rejected" option))
   ;; Accepting is not implementing: the option is reported as supplied.
-  ;; -asmap used to be on this list and is now IMPLEMENTED (#456), so the
-  ;; duplicate-collapsing behaviour is asserted with an option that is still
-  ;; only accepted. That an option leaves this list as it gains an
-  ;; implementation is the point of the list.
-  (is (equal '("par")
+  ;; -asmap and -par have both since been IMPLEMENTED (#456, #462), so the
+  ;; duplicate-collapsing behaviour is asserted with one that is still only
+  ;; accepted. That an option LEAVES this list as it gains an implementation is
+  ;; the point of the list, and this assertion has now been rewritten twice for
+  ;; exactly that reason.
+  (is (equal '("natpmp")
              (bitcoin-lisp::supplied-core-only-options
-              '(("asmap" . "x") ("regtest" . "1") ("par" . "4") ("par" . "8")))))
+              '(("asmap" . "x") ("regtest" . "1")
+                ("natpmp" . "1") ("natpmp" . "0")))))
   (is-false (bitcoin-lisp::supplied-core-only-options '(("regtest" . "1"))))
   ;; And a genuinely unknown option is still a hard error.
   (signals error (bitcoin-lisp::check-cli-args '("-notacoreoption"))))

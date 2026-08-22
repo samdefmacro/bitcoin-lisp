@@ -49,6 +49,90 @@
      :outputs (vector output)
      :lock-time 0)))
 
+(test par-follows-cores-semantics
+  "Core's -par (init.cpp): 0 means one worker per core, a NEGATIVE value leaves
+that many cores free, and the result is clamped to MAX_SCRIPTCHECK_THREADS.
+
+The negative form is the one worth pinning. -par=-1 on a 4-core box means
+THREE workers, not one; reading it as an absolute value would oversubscribe the
+very machine the operator asked to leave headroom on."
+  (let ((cores (bitcoin-lisp.validation::available-processor-count)))
+    (is (plusp cores) "the processor count must be positive or -par=0 is broken")
+    (is (= (min cores 15) (bitcoin-lisp.validation::parse-par-threads 0)))
+    (is (= (min (1- cores) 15) (bitcoin-lisp.validation::parse-par-threads -1)))
+    (is (= 2 (bitcoin-lisp.validation::parse-par-threads 2)))
+    ;; Clamped to Core's maximum.
+    (is (= 15 (bitcoin-lisp.validation::parse-par-threads 99)))
+    ;; Never negative, however deep the subtraction goes.
+    (is (= 0 (bitcoin-lisp.validation::parse-par-threads (- (+ cores 5))))))
+  ;; -par reaches the worker count AND the on/off switch: Core's -par=1 means
+  ;; no extra threads at all, which is not the same as "one worker".
+  (let ((saved-n bitcoin-lisp.validation::+parallel-validation-workers+)
+        (saved-p bitcoin-lisp:*parallel-block-validation*))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-config-globals '(("par" . "3")))
+           (is (= 3 bitcoin-lisp.validation::+parallel-validation-workers+))
+           (is-true bitcoin-lisp:*parallel-block-validation*)
+           (bitcoin-lisp::apply-config-globals '(("par" . "1")))
+           (is-false bitcoin-lisp:*parallel-block-validation*
+                     "-par=1 must disable the extra threads, as Core's does"))
+      (setf bitcoin-lisp.validation::+parallel-validation-workers+ saved-n
+            bitcoin-lisp:*parallel-block-validation* saved-p)))
+  (is-true (bitcoin-lisp::known-config-option-p "par"))
+  (is-false (bitcoin-lisp::core-only-option-p "par")))
+
+(test prefetched-coins-are-what-the-workers-validate-against
+  "Core copies each spent Coin into its CScriptCheck BEFORE queuing it
+(validation.cpp ~:2540-2560), so the workers never touch the coins view. Ours
+had each worker call COLLECT-SPENT-UTXOS itself, whose read path INSERTS ON
+MISS into a non-synchronized hash table — the concurrent-corruption hazard §2.5
+identified by reading.
+
+Asserted structurally as well as behaviourally: VALIDATE-TX-SCRIPTS must USE
+the coins it is handed rather than re-resolving them, or the prefetch would be
+wasted work that fixes nothing."
+  (let* ((tx (make-mempool-test-tx :input-id 71))
+         (block-txs (list tx tx))          ; [0] stands in for the coinbase
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (coins (make-hash-table :test 'equalp))
+         (in (aref (bitcoin-lisp.serialization:transaction-inputs tx) 0))
+         (prevout (bitcoin-lisp.serialization:tx-in-previous-output in))
+         (entry (bitcoin-lisp.storage:make-utxo-entry
+                 :value 100000
+                 :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
+                 :height 1 :coinbase nil)))
+    (setf (gethash (cons (bitcoin-lisp.serialization:outpoint-hash prevout)
+                         (bitcoin-lisp.serialization:outpoint-index prevout))
+                   coins)
+          entry)
+    (let ((prefetched (bitcoin-lisp.validation::prefetch-block-spent-coins
+                       block-txs utxo coins)))
+      (is (= 1 (length prefetched))
+          "one entry per NON-coinbase transaction, indexed like (rest txs)")
+      (is (eq entry (aref (aref prefetched 0) 0))
+          "the prefetch did not resolve the spent coin"))
+    ;; And the handed-in coins are what get used: a DIFFERENT entry passed as
+    ;; :spent-utxos must be the one the validator sees.
+    (let* ((seen nil)
+           (other (bitcoin-lisp.storage:make-utxo-entry
+                   :value 42
+                   :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
+                   :height 1 :coinbase nil))
+           (real (symbol-function 'bitcoin-lisp.validation::validate-input-script)))
+      (unwind-protect
+           (progn
+             (setf (symbol-function 'bitcoin-lisp.validation::validate-input-script)
+                   (lambda (tx idx utxo) (declare (ignore tx idx))
+                     (setf seen utxo) t))
+             (bitcoin-lisp.validation::validate-tx-scripts
+              tx 1 utxo "P2SH" 100 :spent-utxos (vector other))
+             (is (eq other seen)
+                 "validate-tx-scripts ignored the coins it was handed and ~
+re-resolved them from the coins view"))
+        (setf (symbol-function 'bitcoin-lisp.validation::validate-input-script)
+              real)))))
+
 (test valid-transaction-structure
   "A valid transaction should pass structure validation."
   (let ((tx (make-test-transaction :inputs 1 :outputs 2 :value 10000000)))
