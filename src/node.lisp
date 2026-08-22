@@ -4761,6 +4761,12 @@ thread; see the shutdown-coordination section above."
   ;; Cleanup secp256k1
   (bitcoin-lisp.crypto:cleanup-secp256k1)
 
+  ;; Stop the script-check workers (Core's CCheckQueue is stopped with the
+  ;; validation interface). They hold no resources but would keep the process
+  ;; alive, and a pool left running across a restart-in-one-image would be
+  ;; sized for the previous -par.
+  (ignore-errors (bitcoin-lisp.validation:stop-script-check-pool))
+
   ;; Close the ZMQ publishers before the directory lock: a subscriber should
   ;; see the node go away, not hold a socket to a process that has released
   ;; everything else.
