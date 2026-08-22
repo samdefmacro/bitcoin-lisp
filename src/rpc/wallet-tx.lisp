@@ -1298,7 +1298,16 @@ Returns NIL when a rescan is already running."
                t))))
 
 (defun wallet-release-rescan (wallet)
-  (setf (wallet-scanning-since wallet) nil))
+  "End a rescan: drop the scan marker, clear the passphrase hold the scan put
+on the relock deadline, and apply that deadline now. Core's scheduled relock
+fires regardless of a scan (wallet/rpc/encrypt.cpp:102-110); ours suspends the
+deadline for the scan's duration so its keypool top-ups cannot fail mid-scan
+(see WALLET-UNLOCKED-KEY), and this is the one place that suspension ends."
+  (with-wallet-lock (wallet)
+    (setf (wallet-scanning-since wallet) nil
+          (wallet-scanning-with-passphrase wallet) nil)
+    ;; For effect: relocks inline when the deadline passed during the scan.
+    (wallet-unlocked-key wallet)))
 
 (defun find-first-block-with-time (chain-state min-time min-height)
   "Core CChain::FindEarliestAtLeast (via findFirstBlockWithTimeAndHeight):
@@ -2069,7 +2078,6 @@ rescanblockchain). PARAMS: (start_height stop_height)."
                (:user-abort
                 (error 'rpc-error :code +rpc-misc-error+
                                   :message "Rescan aborted.")))))
-      (setf (wallet-scanning-with-passphrase wallet) nil)
       (wallet-release-rescan wallet))))
 
 (defun rpc-abortrescan (node params)

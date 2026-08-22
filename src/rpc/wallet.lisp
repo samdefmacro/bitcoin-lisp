@@ -2039,5 +2039,4 @@ rescan-failed error."
                                                   timestamp
                                                   (- scanned-time +wallet-timestamp-window+ 1)
                                                   +wallet-timestamp-window+))))))))))))
-      (setf (wallet-scanning-with-passphrase wallet) nil)
       (wallet-release-rescan wallet))))
