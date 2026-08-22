@@ -864,6 +864,35 @@ rejected, and the no-commitment+witness case is :unexpected-witness
           (values nil :unexpected-witness))))
     (values t nil)))
 
+(defun witness-reserved-value ()
+  "A fresh copy of the BIP141 reserved witness value — the 32 zero bytes a
+coinbase's sole witness item must be when the block carries a witness
+commitment (Core's `nonce` in UpdateUncommittedBlockStructures)."
+  (make-array 32 :element-type '(unsigned-byte 8) :initial-element 0))
+
+(defun update-uncommitted-block-structures (block chain-state)
+  "Core ChainstateManager::UpdateUncommittedBlockStructures
+(validation.cpp:4017-4027): when BLOCK's coinbase carries a witness commitment
+but no witness, install the reserved value as its witness — provided the parent
+is in CHAIN-STATE's index and segwit is active at BLOCK's height, the two gates
+Core applies. submitblock runs this before validation (rpc/mining.cpp:1076-1080)
+so a miner that serializes the template's coinbase without its witness is not
+refused with bad-witness-nonce-size. Mutates the coinbase in place and drops its
+cached weight, which the witness changes (mine-block does the same for the
+header's cached hash)."
+  (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+         (prev (bitcoin-lisp.storage:get-block-index-entry
+                chain-state (bitcoin-lisp.serialization:block-header-prev-block header)))
+         (coinbase (first (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
+    (when (and prev coinbase
+               (>= (1+ (bitcoin-lisp.storage:block-index-entry-height prev))
+                   (get-segwit-activation-height bitcoin-lisp:*network*))
+               (find-witness-commitment coinbase)
+               (not (bitcoin-lisp.serialization:transaction-has-witness-p coinbase)))
+      (setf (bitcoin-lisp.serialization:transaction-witness coinbase)
+            (vector (list (witness-reserved-value)))
+            (bitcoin-lisp.serialization::transaction-cached-weight coinbase) nil))))
+
 (defun block-witness-stripped-p (block)
   "T if BLOCK carries a witness commitment in its coinbase outputs but its coinbase
 witness is NOT exactly one 32-byte item — i.e. the block arrived witness-stripped
@@ -1184,6 +1213,16 @@ redeem-script extractor and has different semantics."
                   (setf start 0 end 0)
                   (incf i)))))
     (subseq script-sig start end)))
+
+(defun spent-script-sigop-count (script-pubkey script-sig)
+  "Core CScript::GetSigOpCount(const CScript& scriptSig) (script.cpp:183-205):
+the accurate sigop count of SCRIPT-PUBKEY itself, or, when it is P2SH, of the
+redeem script SCRIPT-SIG pushes last (p2sh-sigop-subscript; zero when that
+walk bails)."
+  (if (script-is-p2sh-p script-pubkey)
+      (let ((sub (p2sh-sigop-subscript script-sig)))
+        (if sub (count-script-sigops sub :accurate t) 0))
+      (count-script-sigops script-pubkey :accurate t)))
 
 (defun count-legacy-sigops (tx)
   "Count legacy (inaccurate) sigops across all scriptSigs and scriptPubKeys of TX."

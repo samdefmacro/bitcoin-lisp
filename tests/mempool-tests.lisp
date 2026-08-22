@@ -2698,6 +2698,43 @@ nonstandard to SPEND — we relayed txs every Core peer rejects."
       ;; caught by the same gate.
       (is (not (eq :nonstandard-inputs (err-of (spend 3)))) "bare P2PK prevout"))))
 
+(test bip54-legacy-sigop-relay-cap
+  "BIP54 (Core CheckSigopsBIP54, policy.cpp:169-190; MAX_TX_LEGACY_SIGOPS
+2,500): legacy sigops counted where they execute — each scriptSig plus the
+spent scriptPubKey's count for it, the redeem script's for P2SH — may not
+exceed 2,500 per transaction. 167 P2SH inputs whose redeem script carries 15
+CHECKSIGs (the per-input P2SH maximum) total 2,505 and are refused as
+nonstandard inputs; 166 total 2,490 and pass this gate (they then fail
+script verification, which is a different error)."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (redeem (%w8d-script (make-list 15 :initial-element #xac)))   ; 15 x OP_CHECKSIG
+         (spk (%w8d-script #xa9 #x14 (bitcoin-lisp.crypto:hash160 redeem) #x87))
+         (script-sig (%w8d-script (length redeem) redeem))            ; one canonical push
+         (p2pkh (%p2pkh-spk))
+         (txid (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+    (dotimes (i 167)
+      (bitcoin-lisp.storage:add-utxo utxo txid i 100000 spk 0))
+    (flet ((spend (n)
+             (bitcoin-lisp.serialization:make-transaction
+              :version 2
+              :inputs (coerce (loop for i below n
+                                    collect (bitcoin-lisp.serialization:make-tx-in
+                                             :previous-output
+                                             (bitcoin-lisp.serialization:make-outpoint
+                                              :hash txid :index i)
+                                             :script-sig script-sig
+                                             :sequence #xFFFFFFFF))
+                              'simple-vector)
+              :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                :value 10000 :script-pubkey p2pkh))
+              :lock-time 0))
+           (err-of (tx)
+             (nth-value 1 (bitcoin-lisp.validation:validate-transaction-for-mempool
+                           tx utxo mempool 100))))
+      (is (eq :nonstandard-inputs (err-of (spend 167))) "2,505 legacy sigops")
+      (is (not (eq :nonstandard-inputs (err-of (spend 166)))) "2,490 legacy sigops"))))
+
 (test g7-14-p2a-witness-stuffing-nonstandard
   "G7-14 (Core IsWitnessStandard, policy.cpp:268-271): spending a pay-to-anchor
 output never needs witness data, so ANY witness on a P2A spend is stuffing.
