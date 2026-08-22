@@ -277,6 +277,136 @@ normalized as nested values."
 (JSONRPCRequest::parse, rpc/request.cpp:212-227)."
   (if (equal (gethash "jsonrpc" request) "2.0") :v2 :v1))
 
+(defparameter *rpc-named-arg-names*
+  '(
+    ("addnode" "node" "command" "v2transport")
+    ("createwallet"
+      "wallet_name" "disable_private_keys" "blank" "passphrase" "avoid_reuse"
+      "descriptors" "load_on_startup" "external_signer")
+    ("disconnectnode" "address" "nodeid")
+    ("generateblock" "output" "transactions" "submit")
+    ("generatetoaddress" "nblocks" "address" "maxtries")
+    ("generatetodescriptor" "num_blocks" "descriptor" "maxtries")
+    ("getbestblockhash")
+    ("getblock" "blockhash" "verbosity|verbose")
+    ("getblockchaininfo")
+    ("getblockcount")
+    ("getblockfrompeer" "blockhash" "peer_id")
+    ("getblockhash" "height")
+    ("getblockheader" "blockhash" "verbose")
+    ("getblockstats" "hash_or_height" "stats")
+    ("getchaintips")
+    ("getchaintxstats" "nblocks" "blockhash")
+    ("getconnectioncount")
+    ("getdeploymentinfo" "blockhash")
+    ("getdifficulty")
+    ("getindexinfo" "index_name")
+    ("getmempoolentry" "txid")
+    ("getmempoolinfo")
+    ("getnetworkinfo")
+    ("getpeerinfo")
+    ("getrawmempool" "verbose" "mempool_sequence")
+    ("getrawtransaction" "txid" "verbosity|verbose" "blockhash")
+    ("gettxout" "txid" "n" "include_mempool")
+    ("gettxoutproof" "txids" "blockhash")
+    ("invalidateblock" "blockhash")
+    ("preciousblock" "blockhash")
+    ("pruneblockchain" "height")
+    ("reconsiderblock" "blockhash")
+    ("sendrawtransaction" "hexstring" "maxfeerate" "maxburnamount")
+    ("setmocktime" "timestamp")
+    ("submitblock" "hexdata" "dummy")
+    ("verifytxoutproof" "proof")
+    ("waitfornewblock" "timeout" "current_tip")
+    )
+  "Positional argument names for the RPC methods that accept named parameters,
+taken from Core's RPCHelpMan declarations. A name containing #\\| lists
+aliases for one slot, exactly as Core stores it (transformNamedArguments splits
+on '|', rpc/server.cpp:396) — getblock's \"verbosity|verbose\" is the case that
+matters, since older clients send the second spelling.
+
+Core supports named parameters for EVERY method; this table covers the ones
+Core's own test framework and bitcoin-cli call, which is what track B P0 needs.
+A method absent from it answers Core's \"Unknown named parameter\" error, so the
+limitation is visible rather than silent.")
+
+
+(defun %named-arg-slot (name-spec key)
+  "T when KEY names the slot NAME-SPEC, which may list aliases separated by
+#\\| (Core splits the pattern on '|', rpc/server.cpp:396)."
+  (let ((start 0))
+    (loop
+      (let* ((bar (position #\| name-spec :start start))
+             (alias (subseq name-spec start (or bar (length name-spec)))))
+        (when (string= alias key) (return t))
+        (unless bar (return nil))
+        (setf start (1+ bar))))))
+
+(defun %named-params-to-positional (method params)
+  "PARAMS as a positional list, mapping a JSON object onto METHOD's argument
+names (Core transformNamedArguments, rpc/server.cpp:368-470). A params ARRAY is
+returned unchanged.
+
+Core's \"args\" convenience is honoured: a client may pass positional arguments
+under that key alongside named ones, and the named ones fill the slots after
+them (doc/JSON-RPC-interface.md#parameter-passing). This is what the functional
+framework's own client sends whenever a call mixes the two
+(authproxy.py:122-125).
+
+Unfilled slots before a filled one become NIL, which is how an omitted optional
+argument already reaches every handler."
+  (if (not (hash-table-p params))
+      params
+      (let ((names (cdr (assoc (string-downcase method) *rpc-named-arg-names*
+                               :test #'string=)))
+            (remaining (make-hash-table :test 'equal))
+            (positional '()))
+        (maphash (lambda (k v) (setf (gethash k remaining) v)) params)
+        ;; The positional prefix, taken out before the named slots are filled.
+        (multiple-value-bind (args args-present) (gethash "args" remaining)
+          (remhash "args" remaining)
+          (when args-present
+            (unless (rpc-proper-list-p args)
+              (error 'rpc-error :code +rpc-invalid-parameter+
+                                :message "Parameter args must be an array"))
+            (setf positional args)))
+        (let ((slots '()))
+          (loop for name-spec in names
+                for index from 0
+                do (let ((hit nil) (hit-key nil))
+                     (maphash (lambda (k v)
+                                (when (and (not hit-key) (%named-arg-slot name-spec k))
+                                  (setf hit v hit-key k)))
+                              remaining)
+                     (cond
+                       ((null hit-key) (push :absent slots))
+                       (t
+                        (remhash hit-key remaining)
+                        ;; A slot the positional prefix already filled cannot
+                        ;; also be named (Core raises on exactly this).
+                        (when (< index (length positional))
+                          (error 'rpc-error
+                                 :code +rpc-invalid-parameter+
+                                 :message
+                                 (format nil "Parameter ~A specified twice both as ~
+positional and named argument" hit-key)))
+                        (push hit slots)))))
+          ;; Anything left names no slot of this method.
+          (let ((unknown nil))
+            (maphash (lambda (k v) (declare (ignore v))
+                       (when (or (null unknown) (string< k unknown))
+                         (setf unknown k)))
+                     remaining)
+            (when unknown
+              (error 'rpc-error :code +rpc-invalid-parameter+
+                                :message (format nil "Unknown named parameter ~A" unknown))))
+          (setf slots (nreverse slots))
+          ;; Trailing absent slots are simply not passed; interior ones are NIL.
+          (let* ((last-filled (position :absent slots :test-not #'eq :from-end t))
+                 (kept (if last-filled (subseq slots 0 (1+ last-filled)) '()))
+                 (named (mapcar (lambda (s) (if (eq s :absent) nil s)) kept)))
+            (append positional (nthcdr (length positional) named)))))))
+
 (defun parse-json-rpc-request (body)
   "Parse JSON-RPC request body. Returns (values :single method params id
 version id-present-p) or (values :batch requests). VERSION is :v2 when the
@@ -304,7 +434,13 @@ top-level positional false survives as the +json-false+ sentinel."
                (error 'rpc-error :code +rpc-invalid-request+
                                  :message "Missing or invalid method"))
              (multiple-value-bind (id id-present) (gethash "id" json)
-               (values :single method (%normalize-rpc-params (or params '()))
+               (values :single method
+                       ;; Named parameters become positional here, before
+                       ;; normalization, so every handler keeps taking a plain
+                       ;; positional list (Core does the same transform in
+                       ;; ExecuteCommand, rpc/server.cpp:508).
+                       (%normalize-rpc-params
+                        (%named-params-to-positional method (or params '())))
                        id version
                        (and id-present t)))))
           (t

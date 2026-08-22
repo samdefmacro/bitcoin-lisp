@@ -2068,6 +2068,101 @@ has to EXIST, and it has to answer JSON null rather than erroring."
     (is-true (nth-value 1 (gethash method bitcoin-lisp.rpc::*rpc-methods*))
              "~A is not registered" method)))
 
+;;; --- Named parameters (track B P0) ---
+
+(defun %named-params (method &rest kv)
+  "Run METHOD's named-parameter transform over the KV plist, or return
+(:error <message>)."
+  (let ((h (make-hash-table :test 'equal)))
+    (loop for (k v) on kv by #'cddr do (setf (gethash k h) v))
+    (handler-case (bitcoin-lisp.rpc::%named-params-to-positional method h)
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (list :error (bitcoin-lisp.rpc::rpc-error-message e))))))
+
+(test named-params-map-onto-core-s-argument-names
+  "Core's own client sends named parameters for every call
+(authproxy.py:122-125), so the framework cannot drive a node that only accepts
+positional ones. The names come from Core's RPCHelpMan declarations."
+  (is (equal '(5) (%named-params "getblockhash" "height" 5)))
+  (is (equal '("aa" 1 t) (%named-params "gettxout" "txid" "aa" "n" 1
+                                                   "include_mempool" t)))
+  ;; Key order in the object is irrelevant; the ARGUMENT order decides.
+  (is (equal '("aa" 1 t) (%named-params "gettxout" "include_mempool" t
+                                                   "n" 1 "txid" "aa")))
+  ;; An omitted middle argument becomes NIL, which is how every handler
+  ;; already sees an absent optional.
+  (is (equal '("aa" nil t) (%named-params "gettxout" "txid" "aa"
+                                                     "include_mempool" t)))
+  ;; Trailing absent arguments are simply not passed.
+  (is (equal '("aa") (%named-params "gettxout" "txid" "aa")))
+  ;; A params ARRAY is untouched.
+  (is (equal '(5) (bitcoin-lisp.rpc::%named-params-to-positional
+                   "getblockhash" '(5))))
+  (is (equal '() (bitcoin-lisp.rpc::%named-params-to-positional
+                  "getblockcount" '()))))
+
+(test named-params-honour-core-s-alias-slots
+  "Core stores an argument name pattern and splits it on #\\| , so one slot can
+have two spellings (rpc/server.cpp:396). getblock is the case that matters:
+its slot is \"verbosity|verbose\", and older clients send the second."
+  (is (equal '("aa" 2) (%named-params "getblock" "blockhash" "aa" "verbosity" 2)))
+  (is (equal '("aa" 2) (%named-params "getblock" "blockhash" "aa" "verbose" 2)))
+  (is (equal '("aa" 2) (%named-params "getrawtransaction" "txid" "aa"
+                                                          "verbose" 2)))
+  ;; The alias is one slot, not two: naming both is naming the same slot twice,
+  ;; and the second must not silently land in the NEXT argument's position.
+  (let ((result (%named-params "getblock" "blockhash" "aa"
+                                          "verbosity" 2 "verbose" 3)))
+    (is (= 2 (length result)) "an alias pair filled two slots: ~S" result)))
+
+(test named-params-support-core-s-args-prefix
+  "A client may pass positional arguments under \"args\" alongside named ones;
+the named ones fill the slots after them (doc/JSON-RPC-interface.md). Core's
+own client sends exactly this whenever a call mixes the two forms."
+  (is (equal '("aa" 1) (%named-params "gettxout" "args" '("aa") "n" 1)))
+  (is (equal '("aa" 1 t) (%named-params "gettxout" "args" '("aa" 1)
+                                                   "include_mempool" t)))
+  (is (equal '("aa") (%named-params "gettxout" "args" '("aa"))))
+  ;; Naming a slot the prefix already filled is Core's error, verbatim.
+  (is (equal '(:error "Parameter txid specified twice both as positional and named argument")
+             (%named-params "gettxout" "args" '("aa" 1) "txid" "bb")))
+  (is (equal '(:error "Parameter args must be an array")
+             (%named-params "gettxout" "args" 7))))
+
+(test named-params-reject-what-they-cannot-map
+  "An unmappable name is Core's \"Unknown named parameter\" error rather than a
+silently dropped argument — which would run the method with a default the
+caller did not ask for. A method with no argument table answers the same way,
+so the gap is visible."
+  (is (equal '(:error "Unknown named parameter nope")
+             (%named-params "getblockhash" "nope" 1)))
+  (is (equal '(:error "Unknown named parameter height")
+             (%named-params "getblockcount" "height" 1)))
+  ;; A method we have not tabulated: honest refusal, not a wrong call.
+  (is (eq :error (first (%named-params "getbalance" "dummy" 1)))))
+
+(test named-arg-table-covers-what-it-claims
+  "Every method in the table must actually be registered — an entry for a
+method we do not serve is dead, and a typo'd name would silently disable named
+parameters for the method it was meant to cover."
+  (bitcoin-lisp.rpc::register-all-methods)
+  (dolist (row bitcoin-lisp.rpc::*rpc-named-arg-names*)
+    (is-true (nth-value 1 (gethash (first row) bitcoin-lisp.rpc::*rpc-methods*))
+             "~A is in the named-arg table but not registered" (first row)))
+  ;; And the arguments Core's framework leans on hardest are present.
+  (dolist (expected '(("getblockhash" "height")
+                      ("getblock" "blockhash" "verbosity|verbose")
+                      ("generatetoaddress" "nblocks" "address" "maxtries")
+                      ("submitblock" "hexdata" "dummy")
+                      ("sendrawtransaction" "hexstring" "maxfeerate" "maxburnamount")
+                      ("setmocktime" "timestamp")
+                      ("invalidateblock" "blockhash")
+                      ("reconsiderblock" "blockhash")))
+    (is (equal expected (assoc (first expected)
+                               bitcoin-lisp.rpc::*rpc-named-arg-names*
+                               :test #'string=))
+        "~A's argument names drifted" (first expected))))
+
 ;;; --- Concurrent Access Tests (2.7) ---
 
 (test rpc-concurrent-access-safety
