@@ -434,6 +434,19 @@ into a peer's last-inv-sequence whenever an inv flush to it completes; a tx is
 then servable to that peer iff its entry sequence is below the snapshot."
   (mempool-next-sequence mempool))
 
+(defun mempool-transactions-updated (mempool)
+  "Core CTxMemPool::GetTransactionsUpdated (txmempool.cpp:201-203): a counter
+bumped on every transaction that ENTERS or LEAVES the pool (:249, :305). Miners
+compare it across getblocktemplate calls to learn whether a fresh template would
+differ.
+
+DERIVED rather than stored, and exactly so: NEXT-SEQUENCE counts all-time
+admissions, and admissions minus the current population is all-time removals, so
+their sum is Core's counter with no extra state to keep in step. Monotonically
+non-decreasing, since each half only ever grows."
+  (let ((admitted (1- (mempool-next-sequence mempool))))
+    (+ admitted (- admitted (mempool-count mempool)))))
+
 (defun mempool-effective-min-fee-rate (mempool &optional (now (bitcoin-lisp.serialization:get-unix-time)))
   "Effective minimum fee rate to enter the mempool, in SAT/KVB: the relay floor,
 or the decayed rolling minimum if higher (Bitcoin Core CTxMemPool::GetMinFee,

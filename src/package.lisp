@@ -947,6 +947,7 @@
    #:mempool-entry-entry-time
    #:mempool-entry-sequence
    #:mempool-sequence
+   #:mempool-transactions-updated
    #:mempool-entry-fee-rate
    ;; Mempool entry links
    #:mempool-entry-parents

@@ -379,6 +379,158 @@ chunk feerate diagram, not boundary knapsack optimality."
           (is (= 0 (cdr (assoc "vbrequired" r :test #'string=))))
           (is (stringp (cdr (assoc "longpollid" r :test #'string=)))))))))
 
+(test gbt-longpollid-carries-the-mempool-counter
+  "Core's longpollid is <best chain hash><nTransactionsUpdatedLast>
+(rpc/mining.cpp:995). The second half MUST be the mempool counter: an id
+derived from the HEIGHT — which is what this emitted before — never changes
+while the tip stands still, so a miner longpolling on it is never woken by
+mempool churn, which is most of what a new template exists to report."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp.rpc::*gbt-cache* nil))
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (let ((node (bitcoin-lisp::make-node :network :regtest)))
+        (setf (bitcoin-lisp::node-chain-state node) cs
+              (bitcoin-lisp::node-mempool node) mp
+              (bitcoin-lisp::node-utxo-set node) (bitcoin-lisp.storage:make-utxo-set))
+        (let* ((r (bitcoin-lisp.rpc::rpc-getblocktemplate node nil))
+               (id (cdr (assoc "longpollid" r :test #'string=))))
+          (is (= (+ 64 (length (princ-to-string
+                                (bitcoin-lisp.mempool:mempool-transactions-updated mp))))
+                 (length id)))
+          (is (string= (cdr (assoc "previousblockhash" r :test #'string=))
+                       (subseq id 0 64)))
+          ;; And it round-trips through the parser the wait loop uses.
+          (multiple-value-bind (tip updated)
+              (bitcoin-lisp.rpc::%gbt-parse-longpoll-id id "ff" 999)
+            (is (string= (subseq id 0 64) tip))
+            (is (= (bitcoin-lisp.mempool:mempool-transactions-updated mp) updated)))
+          ;; A malformed id falls back to the CURRENT state, so a wait on it
+          ;; returns at the next change rather than erroring (Core's own
+          ;; fallback for a non-string id).
+          (multiple-value-bind (tip updated)
+              (bitcoin-lisp.rpc::%gbt-parse-longpoll-id "nonsense" "abcd" 7)
+            (is (string= "abcd" tip))
+            (is (= 7 updated))))))))
+
+(test mempool-transactions-updated-counts-both-directions
+  "Core bumps nTransactionsUpdated when a transaction ENTERS and when it LEAVES
+(txmempool.cpp:249, :305). A counter that only counted admissions would leave a
+template stale after an eviction or a reorg-driven removal — and an admission
+counter is exactly what this codebase already had (mempool-sequence), so the
+LEAVES half is what this test is for."
+  (multiple-value-bind (cs mp) (%mining-fixture)
+    (declare (ignore cs))
+    (let ((empty (bitcoin-lisp.mempool:mempool-transactions-updated mp))
+          (txid (%mine-add mp (make-mempool-test-tx :input-id 41) 1000)))
+      ;; An admission advances it.
+      (let ((after-add (bitcoin-lisp.mempool:mempool-transactions-updated mp)))
+        (is (> after-add empty) "an admission did not advance the counter")
+        ;; And so does the removal, rather than moving it back.
+        (bitcoin-lisp.mempool:mempool-remove mp txid)
+        (let ((after-remove (bitcoin-lisp.mempool:mempool-transactions-updated mp)))
+          (is (> after-remove after-add)
+              "a removal did not advance the counter")
+          ;; The pool is empty again, but the counter is not back where it
+          ;; started: it is a monotonic edit count, not a population size.
+          (is (= 0 (bitcoin-lisp.mempool:mempool-count mp)))
+          (is (> after-remove empty)))))))
+
+(test gbt-longpoll-waits-for-a-change
+  "Core holds a longpoll getblocktemplate open until the tip or the mempool
+moves past what the caller's longpollid describes (rpc/mining.cpp:817-836).
+Asserted through the two branches that can be checked quickly: an id already
+out of date returns at once, and a node on its way down answers rather than
+holding the socket."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp.rpc::*gbt-cache* nil))
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (let ((node (bitcoin-lisp::make-node :network :regtest)))
+        (setf (bitcoin-lisp::node-chain-state node) cs
+              (bitcoin-lisp::node-mempool node) mp
+              (bitcoin-lisp::node-utxo-set node) (bitcoin-lisp.storage:make-utxo-set)
+              (bitcoin-lisp::node-running node) t)
+        ;; An id naming a tip we are not on: there is already something new to
+        ;; say, so the wait is over before it starts.
+        (let ((start (get-internal-real-time)))
+          (bitcoin-lisp.rpc::%gbt-wait-for-change
+           node (format nil "~64,'0D0" 1))
+          (is (< (/ (- (get-internal-real-time) start)
+                    internal-time-units-per-second)
+                 5)
+              "a stale longpollid did not return promptly"))
+        ;; A current id on a node that is shutting down: Core throws
+        ;; RPC_CLIENT_NOT_CONNECTED "Shutting down" rather than blocking.
+        (setf (bitcoin-lisp::node-running node) nil)
+        (let ((id (format nil "~A~D"
+                          (bitcoin-lisp.rpc::hash-to-hex
+                           (bitcoin-lisp.storage:best-block-hash cs))
+                          (bitcoin-lisp.mempool:mempool-transactions-updated mp))))
+          (handler-case
+              (progn (bitcoin-lisp.rpc::%gbt-wait-for-change node id)
+                     (is-true nil "the wait did not end on shutdown"))
+            (bitcoin-lisp.rpc::rpc-error (e)
+              (is (= bitcoin-lisp.rpc::+rpc-client-not-connected+
+                     (bitcoin-lisp.rpc::rpc-error-code e)))
+              (is (string= "Shutting down"
+                           (bitcoin-lisp.rpc::rpc-error-message e))))))))
+    ;; And getblocktemplate reaches the wait at all — a longpollid that is
+    ;; parsed and then ignored is the failure mode this repo keeps finding.
+    (is-true (member 'bitcoin-lisp.rpc::rpc-getblocktemplate
+                     (mapcar #'car
+                             (sb-introspect:who-calls
+                              'bitcoin-lisp.rpc::%gbt-wait-for-change))))))
+
+(test gbt-reuses-a-template-for-five-seconds
+  "Core reuses the last template unless the TIP changed, or the mempool changed
+AND the template is older than five seconds (rpc/mining.cpp). The shape of that
+condition is the point: a mempool change ALONE does not invalidate the cache,
+which is what stops a busy mempool from reassembling a block on every call."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp.rpc::*gbt-cache* nil))
+    (let ((now (bitcoin-lisp.serialization:get-unix-time))
+          (node-a (bitcoin-lisp::make-node :network :regtest))
+          (node-b (bitcoin-lisp::make-node :network :regtest)))
+      ;; Same node, same tip, same counter: hit.
+      (setf bitcoin-lisp.rpc::*gbt-cache* (list* node-a "aa" 5 now '(("marker" . 1))))
+      (is (equal '(("marker" . 1))
+                 (bitcoin-lisp.rpc::%gbt-cached-result node-a "aa" 5)))
+      ;; A DIFFERENT node never hits, however well the tip and counter match.
+      ;; Core's cache is a function-local static in a one-node process; here
+      ;; the RPC layer serves whatever node it is handed, and two regtest nodes
+      ;; share a genesis tip hash — so a node-blind key hands one node the
+      ;; other's template. (Found by a suite failure, not by review: the test
+      ;; passed alone and failed after another test had primed the cache.)
+      (is-false (bitcoin-lisp.rpc::%gbt-cached-result node-b "aa" 5))
+      ;; Same tip, CHANGED counter, still fresh: hit, per Core's condition.
+      (is (equal '(("marker" . 1))
+                 (bitcoin-lisp.rpc::%gbt-cached-result node-a "aa" 9)))
+      ;; Same tip, changed counter, older than five seconds: miss.
+      (setf bitcoin-lisp.rpc::*gbt-cache*
+            (list* node-a "aa" 5 (- now bitcoin-lisp.rpc::+gbt-cache-seconds+ 1)
+                   '(("marker" . 1))))
+      (is-false (bitcoin-lisp.rpc::%gbt-cached-result node-a "aa" 9))
+      ;; But an unchanged counter keeps the old template however stale — Core
+      ;; has nothing new to put in it.
+      (is (equal '(("marker" . 1))
+                 (bitcoin-lisp.rpc::%gbt-cached-result node-a "aa" 5)))
+      ;; A changed TIP always misses, whatever the age.
+      (setf bitcoin-lisp.rpc::*gbt-cache* (list* node-a "aa" 5 now '(("marker" . 1))))
+      (is-false (bitcoin-lisp.rpc::%gbt-cached-result node-a "bb" 5))
+      ;; An empty cache never hits.
+      (setf bitcoin-lisp.rpc::*gbt-cache* nil)
+      (is-false (bitcoin-lisp.rpc::%gbt-cached-result node-a "aa" 5)))
+    ;; End to end: two calls in a row against an unchanged node return the
+    ;; SAME object, which is what proves the assembly was skipped.
+    (multiple-value-bind (cs mp) (%mining-fixture)
+      (let ((node (bitcoin-lisp::make-node :network :regtest)))
+        (setf (bitcoin-lisp::node-chain-state node) cs
+              (bitcoin-lisp::node-mempool node) mp
+              (bitcoin-lisp::node-utxo-set node) (bitcoin-lisp.storage:make-utxo-set)
+              bitcoin-lisp.rpc::*gbt-cache* nil)
+        (let ((a (bitcoin-lisp.rpc::rpc-getblocktemplate node nil))
+              (b (bitcoin-lisp.rpc::rpc-getblocktemplate node nil)))
+          (is (eq a b) "getblocktemplate reassembled an unchanged template"))))))
+
 (test rpc-getmininginfo-shape
   (let ((bitcoin-lisp:*network* :regtest))
     (multiple-value-bind (cs mp) (%mining-fixture)
