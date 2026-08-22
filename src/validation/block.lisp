@@ -1867,6 +1867,31 @@ structure, sized like Core: 48,000 entries covers ~a couple hours of blocks.")
 txid AND wtxid — to their transactions, or NIL before any block connects
 (Core m_most_recent_block_txs). Replaced wholesale on every tip advance.")
 
+(defvar *most-recent-block* nil
+  "The most recent connected block and its hash, as (hash . block), or NIL
+(Core m_most_recent_block / m_most_recent_block_hash). Held so a getdata for
+the new tip is answered without re-reading and re-parsing it from disk once
+per requesting peer.")
+
+(defvar *most-recent-cmpctblock* nil
+  "The most recent block as a ready-to-send BIP152 cmpctblock message, built on
+first request and reused (Core m_most_recent_compact_block; Core builds it
+eagerly but defers the serialization with a deferred future, and building it
+lazily gets the same result without spending the work during IBD, when nobody
+is asking). Serving N peers the same new tip therefore costs one construction,
+not N — a compact block is the cheapest BIP152 message to send and the most
+expensive to build, a SipHash per transaction.")
+
+(defun most-recent-cmpctblock (hash)
+  "A cmpctblock message for HASH when HASH is the most recent connected block,
+building and caching it on first call; NIL for any other block, which the
+caller answers from disk instead."
+  (let ((recent *most-recent-block*))
+    (when (and recent (equalp hash (car recent)))
+      (or *most-recent-cmpctblock*
+          (setf *most-recent-cmpctblock*
+                (bitcoin-lisp.serialization:make-cmpctblock-message (cdr recent)))))))
+
 (defun recently-confirmed-p (hash)
   "T if HASH (txid or wtxid) was confirmed in a recent block."
   (and (bitcoin-lisp:recent-reject-p *recent-confirmed-txs* hash) t))
@@ -1934,7 +1959,15 @@ recent-confirmed filter (Core BlockConnected, txdownloadman_impl.cpp:98-110,
         (unless (equalp wtxid txid)
           (setf (gethash wtxid map) tx)
           (bitcoin-lisp:add-recent-reject *recent-confirmed-txs* wtxid))))
-    (setf *most-recent-block-txs* map)))
+    (setf *most-recent-block-txs* map
+          ;; Keep the block itself too, and drop any compact form built for
+          ;; the block this one replaces (most-recent-cmpctblock rebuilds on
+          ;; demand). The transactions are retained by MAP either way, so the
+          ;; extra cost is one cons.
+          *most-recent-block* (cons (bitcoin-lisp.serialization:block-header-hash
+                                     (bitcoin-lisp.serialization:bitcoin-block-header block))
+                                    block)
+          *most-recent-cmpctblock* nil)))
 
 ;;;; Block connection
 
