@@ -3403,8 +3403,32 @@ does the IO (getheaders / getdata / disconnect) outside."
       ;; marked it invalid: BLOCK_CACHED_INVALID (validation.cpp:4229-4237).
       ((and known (eq (bitcoin-lisp.storage:block-index-entry-status known) :invalid))
        (values :reject :duplicate-invalid))
-      ;; Already in the index: accepted, but received_new_header is false, so
-      ;; no announcement credit however much work it carries.
+      ;; Already in the index AND nothing new to gain from it: Core's
+      ;; `pindex->nChainWork <= tip->nChainWork || pindex->nTx != 0` early
+      ;; return (net_processing.cpp CMPCTBLOCK handler). Either we know
+      ;; something better, or we have had this block's body at some point — in
+      ;; both cases our mempool is the wrong tool and reconstruction is pure
+      ;; cost. Without this gate a peer can replay one cmpctblock forever and
+      ;; make us hash the WHOLE MEMPOOL into a shortid map each time.
+      ;;
+      ;; Core also re-requests the block by plain getdata here when it had
+      ;; asked THIS peer for it. We do not track that per-peer state, and the
+      ;; block-download timeout is the single mechanism that re-routes a
+      ;; request here (see the notfound removal in PR #402), so there is
+      ;; nothing to send.
+      ((and known
+            (let ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+              (or (plusp (bitcoin-lisp.storage:block-index-entry-tx-count known))
+                  (let ((tip (and tip-hash
+                                  (bitcoin-lisp.storage:get-block-index-entry
+                                   chain-state tip-hash))))
+                    (and tip
+                         (<= (bitcoin-lisp.storage:block-index-entry-chain-work known)
+                             (bitcoin-lisp.storage:block-index-entry-chain-work tip)))))))
+       (values :already-have nil nil))
+      ;; Known, but it beats our tip and we have never had the body: worth
+      ;; reconstructing. received_new_header is false, so no announcement
+      ;; credit however much work it carries.
       (known (values :accept nil nil))
       ;; Parent not in the index: the announcement outran our header chain.
       ;; The ORDINARY case, not an attack — high-bandwidth compact relay beats
@@ -3490,6 +3514,14 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
          ;; a block nobody has seen yet.
          (when credits-announcement
            (credit-block-announcement peer)))
+        (:already-have
+         ;; Not a fault: an honest peer relays what it just accepted, and two
+         ;; of them announcing the same block is normal. Debug-level, and no
+         ;; punishment.
+         (bitcoin-lisp:log-cat
+          "net" "cmpctblock ~A from ~A: already known and no better than our tip"
+          (bitcoin-lisp.crypto:bytes-to-hex block-hash) (peer-address peer))
+         (return-from handle-cmpctblock nil))
         (:no-parent
          (bitcoin-lisp:log-cat "net"
                                "cmpctblock ~A: parent ~A not in index — getheaders to ~A"
@@ -3513,18 +3545,14 @@ malformed MESSAGE (READ_STATUS_INVALID) is punished as before."
         (unless (equalp pending-hash block-hash)
           (setf (peer-pending-compact-block peer) nil))))
 
-    ;; NOTE: a dedup guard used to sit here testing
-    ;; (eq (block-index-entry-status entry) :connected). :CONNECTED is not in
-    ;; the status enum (storage/chain.lisp:17 — :unknown / :header-valid /
-    ;; :valid / :invalid), so it could never fire and was deleted: a guard that
-    ;; cannot fire is worse than none, because it reads as protection that is
-    ;; not there. Core's real dedup is
-    ;; `pindex->nChainWork <= tip->nChainWork || pindex->nTx != 0'
-    ;; (net_processing.cpp, CMPCTBLOCK handler), which also wants the
-    ;; unknown-parent getheaders answer next to it; both belong to the wave-4
-    ;; compact-block item in docs/gap-analysis-8-plan.md. What the missing
-    ;; dedup must NOT be relied on for is HB selection — that is gated below on
-    ;; the block actually connecting, not on it being new to us.
+    ;; (Core's dedup — `pindex->nChainWork <= tip->nChainWork || pindex->nTx
+    ;; != 0` — now lives in COMPACT-BLOCK-HEADER-VERDICT's :ALREADY-HAVE arm,
+    ;; ahead of the mempool hash it exists to avoid. A guard that used to sit
+    ;; here tested (eq status :connected), which is not in the status enum
+    ;; (storage/chain.lisp:17) and so could never fire; it was deleted rather
+    ;; than left reading as protection that was not there. What the dedup must
+    ;; NOT be relied on for is HB selection — that is gated below on the block
+    ;; actually connecting, not on it being new to us.)
 
     ;; Attempt reconstruction
     (multiple-value-bind (block missing-indexes partial-transactions)
