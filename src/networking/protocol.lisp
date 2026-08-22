@@ -654,6 +654,20 @@ back for the life of the node (Core m_cached_is_ibd, validation.h:1049,
 latched by UpdateIBDStatus, validation.cpp:3314-3322). Re-set to T by
 reset-ibd-stop at node start.")
 
+(defun near-tip-p (chain-state)
+  "Core's near-tip test for accepting NODE_NETWORK_LIMITED peers as automatic
+outbounds: ApproximateBestBlockDepth() < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
+(net_processing.cpp:1342-1345, 1759-1768), i.e. the tip's timestamp is within
+144 block intervals of now. Unlike initial-block-download-p this does not latch
+and has no chain-work term, so a tip gone stale for a day reverts to demanding
+full NODE_NETWORK peers, as Core does."
+  (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (tip (and tip-hash (bitcoin-lisp.storage:get-block-index-entry chain-state tip-hash))))
+    (and tip
+         (> (bitcoin-lisp.serialization:block-header-timestamp
+             (bitcoin-lisp.storage:block-index-entry-header tip))
+            (- (bitcoin-lisp.serialization:get-unix-time) (* 144 600))))))
+
 (defun initial-block-download-p (chain-state)
   "Return T while the node is in initial block download.
 Latches to (and then always returns) NIL once the active tip exists,
@@ -2880,43 +2894,6 @@ Core relays blocks normally under it."
     (send-message peer
                   (bitcoin-lisp.serialization:make-getheaders-message locator))))
 
-(defun request-blocks (peer block-hashes)
-  "Request specific blocks from a peer using MSG_WITNESS_BLOCK
-so peers include witness data in the response."
-  (let ((inv-vectors (mapcar (lambda (hash)
-                               (bitcoin-lisp.serialization:make-inv-vector
-                                :type bitcoin-lisp.serialization:+inv-type-witness-block+
-                                :hash hash))
-                             block-hashes)))
-    (send-message peer
-                  (bitcoin-lisp.serialization:make-getdata-message inv-vectors))))
-
-;;; Main sync loop
-
-(defun sync-with-peer (peer chain-state utxo-set block-store
-                       &key (max-blocks 500) fee-estimator recent-rejects)
-  "Synchronize blockchain with a peer.
-Downloads headers and blocks up to MAX-BLOCKS."
-  (unless (eq (peer-state peer) :ready)
-    (return-from sync-with-peer nil))
-
-  ;; Request headers
-  (request-headers peer chain-state)
-
-  (let ((blocks-received 0))
-    (loop while (< blocks-received max-blocks)
-          do (multiple-value-bind (command payload)
-                 (receive-message-blocking peer :timeout 60)
-               (unless command
-                 (return-from sync-with-peer blocks-received))
-               (handle-message peer command payload
-                               chain-state utxo-set block-store
-                               :fee-estimator fee-estimator
-                               :recent-rejects recent-rejects)
-               (when (string= command "block")
-                 (incf blocks-received))))
-    blocks-received))
-
 ;;;; ============================================================
 ;;;; Compact Block Relay (BIP 152)
 ;;;; ============================================================
@@ -3097,15 +3074,6 @@ v1 compact block would deliver a witness-stripped coinbase."
         (setf (peer-compact-block-high-bandwidth peer) t)))
     (bitcoin-lisp:log-debug "Peer ~A sendcmpct v~D (high-bw: ~A)"
                             (peer-address peer) version high-bandwidth)))
-
-;;; IBD check
-
-(defun should-use-compact-blocks-p (peer)
-  "Return T if we should request compact blocks from PEER.
-   Returns NIL during IBD or if peer doesn't support compact blocks."
-  (and (> (peer-compact-block-version peer) 0)  ; Peer supports CB
-       (not (eq (ibd-state) :syncing-blocks))   ; Not downloading blocks in IBD
-       (not (eq (ibd-state) :syncing-headers)))) ; Not syncing headers
 
 ;;; Short ID map building
 

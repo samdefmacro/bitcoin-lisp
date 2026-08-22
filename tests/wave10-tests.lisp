@@ -663,9 +663,14 @@ hex digits, left-padded; junk/overlong -> NIL."
     (is (= 2 (length bitcoin-lisp.networking:*external-ips*)))))
 
 (test wave10-format-subversion
-  "FormatSubVersion parity (Core clientversion.cpp:67-72) + sanitizer."
-  (is (string= "/bitcoin-lisp:0.1.0/" (bitcoin-lisp:format-subversion '())))
-  (is (string= "/bitcoin-lisp:0.1.0(a; b)/" (bitcoin-lisp:format-subversion '("a" "b"))))
+  "FormatSubVersion parity (Core clientversion.cpp:67-72) + sanitizer; the
+user agent is built from the one client version constant."
+  (is (string= "/bitcoin-lisp:0.1.0/" (bitcoin-lisp.serialization:format-user-agent '())))
+  (is (string= "/bitcoin-lisp:0.1.0(a; b)/"
+               (bitcoin-lisp.serialization:format-user-agent '("a" "b"))))
+  ;; Unstamped build: the build-rev composition is the plain user agent.
+  (is (string= "/bitcoin-lisp:0.1.0(a; b)/"
+               (bitcoin-lisp.serialization:subversion-with-build-rev '("a" "b"))))
   (is-true (bitcoin-lisp:ua-comment-safe-p "Safe comment .,;-_?@ 123"))
   (is-false (bitcoin-lisp:ua-comment-safe-p "bad(char)")))
 

@@ -228,13 +228,15 @@ global keys to the first file's last section."
   "A merged alist becomes typed start-node keyword arguments."
   (let ((plist (bitcoin-lisp::config-alist->start-node-plist
                 '(("txindex" . "1") ("dbcache" . "2000") ("rpcuser" . "bob")
-                  ("maxconnections" . "16") ("v2transport" . "0"))
+                  ("maxconnections" . "16") ("v2transport" . "0")
+                  ("acceptstalefeeestimates" . "1"))
                 :mainnet)))
     (is (eq :mainnet (getf plist :network)))
     (is (eq t (getf plist :txindex)))
     (is (= 2000 (getf plist :dbcache-mib)))
     (is (string= "bob" (getf plist :rpc-user)))
     (is (= 16 (getf plist :max-connections)))
+    (is (eq t (getf plist :accept-stale-fee-estimates)))
     (is (eq nil (getf plist :v2transport)))))
 
 (test config-forcecompactdb-flag

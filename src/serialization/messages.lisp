@@ -198,7 +198,7 @@ the unavoidable-case fallback."
   (addr-recv (make-net-addr) :type net-addr)
   (addr-from (make-net-addr) :type net-addr)
   (nonce 0 :type (unsigned-byte 64))
-  (user-agent "/bitcoin-lisp:0.1.0/" :type string)
+  (user-agent (format-user-agent nil) :type string)
   (start-height 0 :type (signed-byte 32))
   (relay t :type boolean))
 
@@ -284,10 +284,34 @@ the unavoidable-case fallback."
       (write-message-header stream header)
       (write-bytes stream payload-bytes))))
 
-(defvar *user-agent* "/bitcoin-lisp:0.1.0/"
+(defconstant +client-version-major+ 0)
+(defconstant +client-version-minor+ 1)
+(defconstant +client-version-build+ 0)
+
+(defconstant +client-version+ (+ (* 10000 +client-version-major+)
+                                 (* 100 +client-version-minor+)
+                                 +client-version-build+)
+  "This node's version as Core's CLIENT_VERSION integer
+(clientversion.h:26-29: 10000*major + 100*minor + build). The single source of
+the version number: getnetworkinfo.version, the BIP14 user agent and the
+wallet's creation-version record all derive from it.")
+
+(defun client-version-string ()
+  "The dotted client version, e.g. \"0.1.0\"."
+  (format nil "~D.~D.~D" +client-version-major+ +client-version-minor+
+          +client-version-build+))
+
+(defun format-user-agent (comments)
+  "BIP14 subversion \"/bitcoin-lisp:<version>(c1; c2)/\" (Core FormatSubVersion,
+clientversion.cpp:67-72), with no parenthesised block when COMMENTS is empty."
+  (if comments
+      (format nil "/bitcoin-lisp:~A(~{~A~^; ~})/" (client-version-string) comments)
+      (format nil "/bitcoin-lisp:~A/" (client-version-string))))
+
+(defvar *user-agent* (format-user-agent nil)
   "The BIP14 subversion string this node advertises (Core strSubVersion,
 init.cpp:1683 FormatSubVersion). -uacomment appends sanitized comments:
-\"/bitcoin-lisp:0.1.0(comment1; comment2)/\".")
+\"/bitcoin-lisp:<version>(comment1; comment2)/\".")
 
 (defparameter *build-git-rev* "unknown"
   "Short git revision of the running build. The launcher (scripts/run-node.sh)
@@ -306,6 +330,13 @@ and cannot overflow the +max-subversion-length+ cap."
   (unless (string= *build-git-rev* "unknown")
     (concatenate 'string "g" *build-git-rev*)))
 
+(defun subversion-with-build-rev (comments)
+  "The BIP14 subversion for COMMENTS with the stamped build rev, when there is
+one, prepended as its leading \"g<rev>\" comment — the one place that rule lives
+(stamp-build-git-rev and -uacomment parsing both use it)."
+  (let ((git (subversion-git-comment)))
+    (format-user-agent (if git (cons git comments) comments))))
+
 (defun stamp-build-git-rev (rev)
   "Record REV as the running build's git revision and fold it into *user-agent*
 as a leading BIP14 comment (\"/bitcoin-lisp:0.1.0(g<rev>)/\"). The launcher
@@ -315,12 +346,7 @@ is in play (the supervisor path); config parsing of -uacomment re-derives
 *user-agent* via FORMAT-SUBVERSION, which also folds in the stamped rev."
   (when (and rev (plusp (length rev)) (not (string= rev "unknown")))
     (setf *build-git-rev* rev))
-  (let ((comment (subversion-git-comment)))
-    (setf *user-agent*
-          (if comment
-              (format nil "/bitcoin-lisp:0.1.0(~A)/" comment)
-              "/bitcoin-lisp:0.1.0/")))
-  *user-agent*)
+  (setf *user-agent* (subversion-with-build-rev nil)))
 
 (defun make-version-message-bytes (&key (version +protocol-version+)
                                         (services +node-network+)

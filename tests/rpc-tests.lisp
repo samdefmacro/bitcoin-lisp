@@ -918,6 +918,13 @@ used to emit it verbatim, which yason cannot encode."
          (result (bitcoin-lisp.rpc::rpc-getnetworkinfo node nil)))
     ;; Check required fields exist
     (is (assoc "version" result :test #'string=))
+    ;; One client version: Core's CLIENT_VERSION integer form of OUR version
+    ;; (clientversion.h:26-29), not a hard-coded literal.
+    (is (= bitcoin-lisp.serialization:+client-version+
+           (cdr (assoc "version" result :test #'string=))))
+    (is (= 100 bitcoin-lisp.serialization:+client-version+))
+    (is (search (bitcoin-lisp.serialization:client-version-string)
+                (cdr (assoc "subversion" result :test #'string=))))
     (is (assoc "subversion" result :test #'string=))
     (is (assoc "protocolversion" result :test #'string=))
     (is (assoc "connections" result :test #'string=))

@@ -65,9 +65,9 @@
 (defconstant +default-keypool-size+ 1000
   "Core scriptpubkeyman.h:63 DEFAULT_KEYPOOL_SIZE.")
 
-(defconstant +wallet-client-version+ 309900
-  "Written to the 'version' record on wallet creation (Core writes
-CLIENT_VERSION; 30.99.0 at d3056bc).")
+(defconstant +wallet-client-version+ bitcoin-lisp.serialization:+client-version+
+  "Written to the 'version' record on wallet creation: the creating client's
+version, as Core writes its CLIENT_VERSION.")
 
 (defconstant +wallet-legacy-version+ 169900
   "getwalletinfo's deprecated walletversion field: Core reports the latest
