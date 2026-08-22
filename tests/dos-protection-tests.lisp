@@ -379,7 +379,12 @@ restores them (in order) for priority reconnection. Inbound peers excluded."
           (dp (bitcoin-lisp::network-port (bitcoin-lisp::node-network node))))
       (bitcoin-lisp::load-anchors node)
       (is (equal (list (cons "1.2.3.4" dp) (cons "5.6.7.8" dp))
-                 bitcoin-lisp::*pending-anchor-addresses*)))))
+                 bitcoin-lisp::*pending-anchor-addresses*))
+      ;; Core ReadAnchors removes the file unconditionally (addrdb.cpp:244):
+      ;; anchors are one-shot, so a crash loop cannot re-dial the same two
+      ;; peers on every start.
+      (is-false (probe-file (bitcoin-lisp::anchors-dat-path
+                             (bitcoin-lisp::node-data-directory node)))))))
 
 (test anchors-v1-file-migrates-on-load
   "A pre-P1 anchors.dat (magic ANC1, bare IP strings, no port) still loads:
@@ -457,6 +462,9 @@ a dial target iff a Tor proxy is configured."
             (copy-list bitcoin-lisp.networking:+bip155-networks+)))
       (bitcoin-lisp::load-anchors node)
       (is (equal '(("9.9.9.9" . 4567)) bitcoin-lisp::*pending-anchor-addresses*)))
+    ;; load-anchors consumes the file (Core ReadAnchors), so re-save before
+    ;; the second load.
+    (bitcoin-lisp::save-anchor-entries path entries)
     ;; With a Tor proxy the onion anchor becomes a dial candidate too —
     ;; formatted .onion string + stored port (the P2 anchors redial path).
     (let ((bitcoin-lisp::*pending-anchor-addresses* nil)

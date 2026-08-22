@@ -24,6 +24,10 @@
 (defconstant +addrman-replacement-seconds+ (* 4 60 60))      ; 4 hours
 (defconstant +addrman-set-tried-collision-size+ 10)
 (defconstant +addrman-test-window-seconds+ (* 40 60))        ; 40 minutes
+(defconstant +addrman-replacement-min-seconds+ 60
+  "Core ResolveCollisions gives an incumbent at least this long after a
+connection attempt to succeed before the challenger replaces it
+(addrman.cpp:944-950).")
 (defconstant +addrman-getaddr-max+ 1000)
 (defconstant +addrman-getaddr-pct+ 23)
 (defconstant +addrman-select-max-iterations+ 50000
@@ -97,6 +101,10 @@ consistency matters (the key is a per-node secret), not byte-compat with Core."
               (ash (aref h 4) 32) (ash (aref h 5) 40) (ash (aref h 6) 48)
               (ash (aref h 7) 56)))))
 
+(defun %ipv6-prefix-p (ip bytes)
+  "T when IP starts with BYTES (Core's HasPrefix over its fixed prefix arrays)."
+  (loop for b in bytes for i from 0 always (= (aref ip i) b)))
+
 (defun ipv6-linked-ipv4-group (ip)
   "The two high bytes of the IPv4 address carried inside a tunneled/translated
 IPv6 address (Core HasLinkedIPv4/GetLinkedIPv4, netaddress.cpp:652-673), or
@@ -104,8 +112,7 @@ NIL: RFC6052 (64:ff9b::/96) and RFC6145 (::ffff:0:0:0/96) carry it in the
 last 4 bytes, RFC3964 (2002::/16, 6to4) in bytes 2-5, and RFC4380 (2001::/32,
 Teredo) bit-flipped in the last 4 bytes. IPv4-mapped addresses are :ipv4 in
 our representation and never reach this."
-  (flet ((prefix-p (bytes)
-           (loop for b in bytes for i from 0 always (= (aref ip i) b))))
+  (flet ((prefix-p (bytes) (%ipv6-prefix-p ip bytes)))
     (cond ((or (prefix-p '(#x00 #x64 #xFF #x9B #x00 #x00      ; RFC6052
                            #x00 #x00 #x00 #x00 #x00 #x00))
                (prefix-p '(#x00 #x00 #x00 #x00 #x00 #x00      ; RFC6145
@@ -155,19 +162,34 @@ IPv4/IPv6 from the 16-byte mapped form."
         (:cjdns (group 5 (aref ip 0) (logior (aref ip 1) #x0F)))
         (t (group 0))))))
 
+(defun %ipv6-unroutable-p (ip)
+  "Core's IPv6 exclusions in IsRoutable/IsValid (netaddress.cpp:341-391,
+398-412, 462-465): ::1 (IsLocal), RFC4862 link-local (fe80::/64 as Core
+matches it), RFC4193 (fc00::/7, CJDNS's carve-out — must arrive tagged
+NET_CJDNS), RFC3849 documentation (2001:db8::/32), RFC4843 ORCHID
+(2001:10::/28) and RFC7343 ORCHIDv2 (2001:20::/28)."
+  (or (and (= (aref ip 15) 1) (loop for i below 15 always (zerop (aref ip i))))
+      (%ipv6-prefix-p ip '(#xFE #x80 0 0 0 0 0 0))
+      (member (aref ip 0) '(#xFC #xFD))
+      (%ipv6-prefix-p ip '(#x20 #x01 #x0D #xB8))
+      (and (%ipv6-prefix-p ip '(#x20 #x01 #x00))
+           (member (logand (aref ip 3) #xF0) '(#x10 #x20)))))
+
 (defun address-routable-p (ip &optional net)
-  "Minimal IsRoutable, per network: correct byte length, non-zero, CJDNS
-carries the 0xFC prefix, and plain IPv6 in fc00::/7 (RFC4193, CJDNS's
-carve-out) is NOT routable — Core drops such gossip unless it arrives
-properly tagged NET_CJDNS. IPv4 private ranges are still accepted (long-
-standing deliberate divergence for private/regtest setups)."
+  "Core IsRoutable (netaddress.cpp:462-465), per network: correct byte length,
+non-zero, CJDNS carries the 0xFC prefix, and no IPv6 special-purpose range
+(%ipv6-unroutable-p).
+
+Deliberate divergence: IPv4 private (RFC1918) and documentation (RFC5737)
+ranges stay routable here — Core rejects both — for private/regtest setups
+and the fixtures in tests/ that depend on them."
   (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
     (and net
          (= (length ip) (network-address-length net))
          (notevery #'zerop ip)
          (case net
            (:cjdns (= (aref ip 0) #xFC))
-           (:ipv6 (not (member (aref ip 0) '(#xFC #xFD))))
+           (:ipv6 (not (%ipv6-unroutable-p ip)))
            (t t)))))
 
 (defun peer-address-key (pa)
@@ -535,9 +557,41 @@ count cap; PCT >= 100 = no percentage cap (used by getnodeaddresses count=0)."
                    (push pa result)))))
     (nreverse result)))
 
+(defun select-tried-collision (book)
+  "The INCUMBENT of a randomly chosen queued tried-table collision — the entry
+a feeler should test before it is evicted (Core SelectTriedCollision_,
+addrman.cpp:975-1000) — or NIL when nothing is queued.
+
+This is the half that makes resolve-tried-collisions a test-before-evict:
+without it no incumbent is ever probed, so the only branch that can fire for
+a typical entry is the 40-minute \"unable to test\" fallback, and any
+challenger evicts any incumbent we simply have not dialed lately. Feeling out
+the incumbent instead lets its own success (address-book-good -> drop the
+challenger) or failure (attempted, no success -> replace) decide."
+  (let ((ids (address-book-tried-collisions book)))
+    (when ids
+      (let* ((id (nth (random (length ids)) ids))
+             (pa (gethash id (address-book-info book))))
+        (cond
+          ((null pa)                              ; stale id: forget it
+           (setf (address-book-tried-collisions book) (remove id ids))
+           nil)
+          (t
+           (let* ((tb (tried-bucket book pa))
+                  (tp (bucket-position book pa nil tb))
+                  (old-id (aref (address-book-tried-table book) (bucket-slot tb tp))))
+             (when (/= old-id -1)
+               (gethash old-id (address-book-info book))))))))))
+
 (defun resolve-tried-collisions (book &optional (now (ab-now)))
-  "Resolve queued tried-table collisions (Core ResolveCollisions): promote the
-challenger when the incumbent looks dead or the test window has elapsed."
+  "Resolve queued tried-table collisions (Core ResolveCollisions,
+addrman.cpp:930-960): the incumbent's own evidence decides. Healthy (connected
+within +addrman-replacement-seconds+) drops the challenger; attempted and
+failed within that window promotes the challenger once the incumbent has had
++addrman-replacement-min-seconds+ to answer; and a collision that has gone
+unresolved for +addrman-test-window-seconds+ promotes anyway, because we
+evidently cannot test the incumbent. select-tried-collision is what produces
+the attempt the second branch reads."
   (let ((remaining '()))
     (dolist (id (address-book-tried-collisions book))
       (let ((pa (gethash id (address-book-info book))))
@@ -554,9 +608,18 @@ challenger when the incumbent looks dead or the test window has elapsed."
                    (cond
                      ((and old (< (- now (peer-address-last-success old))
                                   +addrman-replacement-seconds+)))  ; incumbent healthy -> drop
-                     ((> (- now (peer-address-last-attempt pa))
+                     ;; Attempted (by the feeler) and did NOT succeed, or the
+                     ;; healthy branch would have caught it: replace once the
+                     ;; incumbent has had its 60 s to answer.
+                     ((and old (< (- now (peer-address-last-attempt old))
+                                  +addrman-replacement-seconds+))
+                      (if (> (- now (peer-address-last-attempt old))
+                             +addrman-replacement-min-seconds+)
+                          (ab-make-tried book pa)
+                          (push id remaining)))
+                     ((> (- now (peer-address-last-success pa))
                          +addrman-test-window-seconds+)
-                      (ab-make-tried book pa))                      ; waited long enough -> force
+                      (ab-make-tried book pa))                      ; untestable -> force
                      (t (push id remaining)))))))))) ; keep waiting
     (setf (address-book-tried-collisions book) remaining)))
 
