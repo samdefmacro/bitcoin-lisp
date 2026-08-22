@@ -5023,7 +5023,13 @@ block connection for as long as that takes. Prefer several small calls."
             (chain-state (rpc-get-chain-state node)))
         (multiple-value-bind (migrated next remaining)
             (bitcoin-lisp.storage:migrate-blocks-to-flat-files
-             store chain-state :max-blocks nblocks :start-height start)
+             store chain-state :max-blocks nblocks :start-height start
+             ;; Each block's undo data follows it into the matching rev file.
+             ;; Storage cannot do this itself: the undo format lives above it.
+             :on-migrated
+             (lambda (entry)
+               (bitcoin-lisp.validation:migrate-undo-to-flat
+                (bitcoin-lisp.storage:block-index-entry-hash entry))))
           (bitcoin-lisp::node-log
            :info "RPC migrateblocks: converted ~D block~:P; resume at height ~D; ~D legacy file~:P left"
            migrated next remaining)

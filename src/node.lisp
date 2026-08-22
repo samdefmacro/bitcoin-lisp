@@ -2467,7 +2467,13 @@ Returns the node instance."
 
   ;; Initialize undo data persistence
   (let ((undo-path (merge-pathnames "undo/" (node-data-directory *node*))))
-    (bitcoin-lisp.validation:initialize-undo-storage undo-path)
+    ;; The store and chain state are what enable Core's rev-file undo format:
+    ;; a rev record is addressed only by the block index entry that points at
+    ;; it, and reading one needs the block to name its coins.
+    (bitcoin-lisp.validation:initialize-undo-storage
+     undo-path
+     :block-store (node-block-store *node*)
+     :chain-state (node-chain-state *node*))
     (log-info "Undo data directory: ~A" undo-path))
 
   ;; Catch-up sweep: drop undo files at/below the pruned horizon. They

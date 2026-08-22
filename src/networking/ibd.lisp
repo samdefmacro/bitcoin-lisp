@@ -3621,7 +3621,10 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
             ;; the RPC threads access under the same lock.
             (progn
               (with-node-lock
-                (bitcoin-lisp.storage:store-block block-store block :height height))
+                (bitcoin-lisp.storage:note-block-position
+                 chain-state hash
+                 (nth-value 1 (bitcoin-lisp.storage:store-block
+                               block-store block :height height))))
               ;; Same event as the out-of-order path: a body landed, so any fork
               ;; candidate parked waiting for it can be tried again. BOTH persist
               ;; sites must drain, or a fork whose last missing body arrives
@@ -3833,7 +3836,10 @@ lifts the AcceptBlock anti-DoS gate on the out-of-order persist path."
                              height)))))
                 (t
                  (with-node-lock
-                   (bitcoin-lisp.storage:store-block block-store block :height height))
+                   (bitcoin-lisp.storage:note-block-position
+                    chain-state hash
+                    (nth-value 1 (bitcoin-lisp.storage:store-block
+                                  block-store block :height height))))
                  (when *ibd-context*
                    ;; A body just landed: any fork candidate that was parked
                    ;; waiting for THIS block can be tried again (Core drains

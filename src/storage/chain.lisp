@@ -408,6 +408,33 @@ NETWORK defaults to bitcoin-lisp:*network* if not specified."
      :best-block-hash (or genesis-hash (network-genesis-hash net))
      :best-height 0)))
 
+(defun %record-block-position (entry located)
+  "Copy LOCATED's file and offset onto ENTRY, and return ENTRY. NIL entry or a
+non-flat LOCATED is a no-op — a legacy per-block file leaves the fields NIL,
+which is exactly what NIL means here."
+  (when (and entry (flat-file-pos-p located))
+    (setf (block-index-entry-file entry) (flat-file-pos-file located)
+          (block-index-entry-data-pos entry) (flat-file-pos-pos located)))
+  entry)
+
+(defun note-block-position (chain-state hash located)
+  "Record on HASH's index entry where its body landed, and return the entry.
+
+LOCATED is STORE-BLOCK's second value: a FLAT-FILE-POS for a record inside a
+blk?????.dat, a PATHNAME for a legacy per-block file. Core does the same copy in
+ReceivedBlockTransactions, moving SaveBlockToDisk's FlatFilePos into nFile and
+nDataPos and setting the HAVE_DATA bit.
+
+These fields are what make Core's rev-file undo format usable at all: an undo
+record is written into the file its block occupies and is addressed by nothing
+but nUndoPos on this entry. A legacy per-block file leaves them NIL, which is
+exactly what NIL means here — not in a flat file, so no rev file to pair with.
+
+No entry yet is not an error: the caller that adds the entry afterwards notes
+the position once it exists."
+  (%record-block-position (and chain-state (get-block-index-entry chain-state hash))
+                          located))
+
 (defun get-block-index-entry (state hash)
   "Get the block index entry for HASH."
   (gethash hash (chain-state-block-index state)))
