@@ -753,6 +753,95 @@ reuse standard-output-script-p — and a P2SH redeem script may carry at most
               (return-from are-inputs-standard-p nil)))))))
   t)
 
+(defvar *require-standard*
+  t
+  "Core's CTxMemPool::Options::require_standard (-acceptnonstdtxn, default
+true; mempool_args.cpp:101). NIL relays and mines transactions this node would
+otherwise refuse as non-standard.
+
+ONE flag gating ONE set of checks, as Core has it: %IS-STANDARD-TX, the input
+and witness standardness tests, and the three ephemeral-dust checks. It does
+NOT gate consensus, and it does not gate the 64-byte minimum size (Core keeps
+that outside, validation.cpp:813-815 — CVE-2017-12842 applies to every node).
+
+Core REFUSES to start with -acceptnonstdtxn on a non-test chain
+(mempool_args.cpp:102-104), and so do we: relaying non-standard transactions on
+mainnet is a way to get your transactions dropped by every peer, not a feature.")
+
+(defun %is-standard-tx (tx)
+  "Core IsStandardTx (policy.cpp:113-172), as ONE function so -acceptnonstdtxn
+can be ONE gate.
+
+Returns (values T NIL) or (values NIL reason-keyword). Everything Core puts
+inside IsStandardTx is here and nothing else: version, weight, scriptSig size
+and push-only-ness, output script standardness with the shared -datacarriersize
+budget, bare multisig, and the dust-output count.
+
+What is deliberately NOT here is the MIN_STANDARD_TX_NONWITNESS_SIZE check.
+Core keeps it OUTSIDE IsStandardTx and outside the require_standard branch
+(validation.cpp:813-815) because it mitigates CVE-2017-12842 — a 64-byte
+transaction is refused even on a node told to relay non-standard ones."
+  ;; Policy: standard transaction version
+  (let ((version (bitcoin-lisp.serialization:transaction-version tx)))
+    (unless (<= +min-standard-tx-version+ version +max-standard-tx-version+)
+      (return-from %is-standard-tx
+        (values nil :version-non-standard))))
+
+  ;; Policy: max standard transaction weight (Bitcoin Core's only size limit;
+  ;; the old serialized-size cap was removed upstream).
+  (when (> (bitcoin-lisp.serialization:transaction-weight tx) +max-standard-tx-weight+)
+    (return-from %is-standard-tx
+      (values nil :tx-weight-too-large)))
+
+  ;; Policy: scriptSig must be push-only and within the size limit
+  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input)))
+      (when (> (length script-sig) +max-standard-scriptsig-size+)
+        (return-from %is-standard-tx
+          (values nil :scriptsig-too-large)))
+      (unless (scriptsig-push-only-p script-sig)
+        (return-from %is-standard-tx
+          (values nil :scriptsig-not-pushonly)))))
+
+  ;; Policy: all outputs must be standard script types (dust is handled
+  ;; separately below — see EPHEMERAL DUST).
+  ;; OP_RETURN outputs share ONE -datacarriersize byte budget across the
+  ;; whole transaction: each NULL_DATA output's raw scriptPubKey size is
+  ;; drawn from it and an output that would overdraw is rejected
+  ;; "datacarrier" (Core IsStandardTx, policy.cpp:136-150 — since the 2025
+  ;; relaxation there is no per-output cap and no output-count cap, only
+  ;; this shared budget). -datacarrier=0 zeroes the budget, so any OP_RETURN
+  ;; output fails with the same reason (Core mempool_args.cpp:95-98:
+  ;; max_datacarrier_bytes = nullopt -> value_or(0)).
+  (let ((datacarrier-bytes-left (if bitcoin-lisp:*accept-datacarrier*
+                                    bitcoin-lisp:*max-datacarrier-bytes*
+                                    0)))
+    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
+      (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
+        (unless (standard-output-script-p spk)
+          (return-from %is-standard-tx
+            (values nil :non-standard-output)))
+        (when (null-data-script-p spk)
+          (when (> (length spk) datacarrier-bytes-left)
+            (return-from %is-standard-tx
+              (values nil :datacarrier)))
+          (decf datacarrier-bytes-left (length spk))))))
+
+  ;; EPHEMERAL DUST (Core policy.cpp:157-161 + policy/ephemeral_policy.cpp).
+  ;; Dust is no longer rejected on sight. Core permits up to
+  ;; MAX_DUST_OUTPUTS_PER_TX (=1) dust output, on the condition that the
+  ;; carrying transaction pays NO fee at all — so it is never worth mining
+  ;; alone — and that whatever spends it also sweeps the dust (checked by
+  ;; check-ephemeral-spends once the package/mempool context is known).
+  ;; Rejecting the first dust output, as we used to, refuses a 0-fee TRUC
+  ;; parent carrying a P2A anchor: the modern LN 1P1C package that every Core
+  ;; peer relays.
+  (let ((dust-count (transaction-dust-output-count tx)))
+    (when (> dust-count +max-dust-outputs-per-tx+)
+      (return-from %is-standard-tx
+        (values nil :dust))))
+  (values t nil))
+
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
                                          &key package-coins skip-fee-check chain-state
                                               bypass-limits skip-rbf-check
@@ -818,18 +907,6 @@ decide (Core PreChecks, validation.cpp:950-970)."
       (return-from validate-transaction-for-mempool
         (values nil error nil))))
 
-  ;; Policy: standard transaction version
-  (let ((version (bitcoin-lisp.serialization:transaction-version tx)))
-    (unless (<= +min-standard-tx-version+ version +max-standard-tx-version+)
-      (return-from validate-transaction-for-mempool
-        (values nil :version-non-standard nil))))
-
-  ;; Policy: max standard transaction weight (Bitcoin Core's only size limit;
-  ;; the old serialized-size cap was removed upstream).
-  (when (> (bitcoin-lisp.serialization:transaction-weight tx) +max-standard-tx-weight+)
-    (return-from validate-transaction-for-mempool
-      (values nil :tx-weight-too-large nil)))
-
   ;; Policy: minimum non-witness size (Bitcoin Core MIN_STANDARD_TX_NONWITNESS_SIZE).
   ;; serialize-transaction emits the legacy (non-witness) encoding, so its length
   ;; is the stripped size — rejecting 64-byte txs (CVE-2017-12842).
@@ -838,53 +915,14 @@ decide (Core PreChecks, validation.cpp:950-970)."
     (return-from validate-transaction-for-mempool
       (values nil :tx-size-small nil)))
 
-  ;; Policy: scriptSig must be push-only and within the size limit
-  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-    (let ((script-sig (bitcoin-lisp.serialization:tx-in-script-sig input)))
-      (when (> (length script-sig) +max-standard-scriptsig-size+)
-        (return-from validate-transaction-for-mempool
-          (values nil :scriptsig-too-large nil)))
-      (unless (scriptsig-push-only-p script-sig)
-        (return-from validate-transaction-for-mempool
-          (values nil :scriptsig-not-pushonly nil)))))
 
-  ;; Policy: all outputs must be standard script types (dust is handled
-  ;; separately below — see EPHEMERAL DUST).
-  ;; OP_RETURN outputs share ONE -datacarriersize byte budget across the
-  ;; whole transaction: each NULL_DATA output's raw scriptPubKey size is
-  ;; drawn from it and an output that would overdraw is rejected
-  ;; "datacarrier" (Core IsStandardTx, policy.cpp:136-150 — since the 2025
-  ;; relaxation there is no per-output cap and no output-count cap, only
-  ;; this shared budget). -datacarrier=0 zeroes the budget, so any OP_RETURN
-  ;; output fails with the same reason (Core mempool_args.cpp:95-98:
-  ;; max_datacarrier_bytes = nullopt -> value_or(0)).
-  (let ((datacarrier-bytes-left (if bitcoin-lisp:*accept-datacarrier*
-                                    bitcoin-lisp:*max-datacarrier-bytes*
-                                    0)))
-    (bitcoin-lisp.serialization:dovector (output (bitcoin-lisp.serialization:transaction-outputs tx))
-      (let ((spk (bitcoin-lisp.serialization:tx-out-script-pubkey output)))
-        (unless (standard-output-script-p spk)
-          (return-from validate-transaction-for-mempool
-            (values nil :non-standard-output nil)))
-        (when (null-data-script-p spk)
-          (when (> (length spk) datacarrier-bytes-left)
-            (return-from validate-transaction-for-mempool
-              (values nil :datacarrier nil)))
-          (decf datacarrier-bytes-left (length spk))))))
-
-  ;; EPHEMERAL DUST (Core policy.cpp:157-161 + policy/ephemeral_policy.cpp).
-  ;; Dust is no longer rejected on sight. Core permits up to
-  ;; MAX_DUST_OUTPUTS_PER_TX (=1) dust output, on the condition that the
-  ;; carrying transaction pays NO fee at all — so it is never worth mining
-  ;; alone — and that whatever spends it also sweeps the dust (checked by
-  ;; check-ephemeral-spends once the package/mempool context is known).
-  ;; Rejecting the first dust output, as we used to, refuses a 0-fee TRUC
-  ;; parent carrying a P2A anchor: the modern LN 1P1C package that every Core
-  ;; peer relays.
-  (let ((dust-count (transaction-dust-output-count tx)))
-    (when (> dust-count +max-dust-outputs-per-tx+)
-      (return-from validate-transaction-for-mempool
-        (values nil :dust nil))))
+  ;; Policy: the standardness battery, behind Core's single require_standard
+  ;; flag (-acceptnonstdtxn, validation.cpp:808). Everything it covers lives in
+  ;; %IS-STANDARD-TX; the check above it does not, because Core's does not.
+  (when *require-standard*
+    (multiple-value-bind (ok reason) (%is-standard-tx tx)
+      (unless ok
+        (return-from validate-transaction-for-mempool (values nil reason nil)))))
 
   ;; Check for duplicate in mempool
   (let ((txid (bitcoin-lisp.serialization:transaction-hash tx)))
@@ -946,7 +984,8 @@ decide (Core PreChecks, validation.cpp:950-970)."
               ;; the TX_NOT_STANDARD cost cap below because this failure
               ;; depends only on the txid (spent scriptPubKeys + scriptSig) —
               ;; the P2P reject cache may key it by txid too.
-              (unless (are-inputs-standard-p tx #'spent-script)
+              (when (and *require-standard*
+                         (not (are-inputs-standard-p tx #'spent-script)))
                 (return-from validate-transaction-for-mempool
                   (values nil :nonstandard-inputs nil)))
               ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
@@ -958,6 +997,7 @@ decide (Core PreChecks, validation.cpp:950-970)."
                 ;; script limits, no annex). Needs the spent scriptPubKeys,
                 ;; hence inside this flet.
                 (when (and (bitcoin-lisp.serialization:transaction-has-witness-p tx)
+                           *require-standard*
                            (not (is-witness-standard-p tx #'spent-script)))
                   (return-from validate-transaction-for-mempool
                     (values nil :bad-witness-nonstandard nil)))
@@ -1005,7 +1045,8 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; carrying dust must pay NOTHING, on base fee AND modified fee, so
           ;; there is never an incentive to mine it on its own: the dust is only
           ;; safe while it can travel and be swept as a package.
-          (when (and (or (/= fee-value 0) (/= modified-fee-value 0))
+          (when (and *require-standard*
+                     (or (/= fee-value 0) (/= modified-fee-value 0))
                      (plusp (transaction-dust-output-count tx)))
             (return-from validate-transaction-for-mempool
               (values nil :dust nil)))
@@ -1014,7 +1055,10 @@ decide (Core PreChecks, validation.cpp:950-970)."
           ;; validation.cpp:1372, with package={ptx}). Only MEMPOOL parents are
           ;; visible from here; a parent still inside an unsubmitted package is
           ;; covered by the package-level call in validate-package-for-mempool.
-          (unless (check-ephemeral-spends (list tx) mempool)
+          ;; Core gates this one on require_standard AND !bypass_limits
+          ;; (validation.cpp:1370) — both, not either.
+          (when (and *require-standard* (not bypass-limits)
+                     (not (check-ephemeral-spends (list tx) mempool)))
             (return-from validate-transaction-for-mempool
               (values nil :missing-ephemeral-spends nil)))
 

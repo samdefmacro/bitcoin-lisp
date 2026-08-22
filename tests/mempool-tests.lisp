@@ -565,6 +565,107 @@ without bound (the old hash-table leaked per-peer memory forever)."
     (setf (aref script 1) #x20)   ; push 32 bytes
     (is (bitcoin-lisp.validation::standard-output-script-p script))))
 
+(test acceptnonstdtxn-is-one-gate-over-corecs-set
+  "-acceptnonstdtxn (Core mempool_args.cpp:101 -> require_standard). Core gates
+a SPECIFIC set behind one flag; ours were inline checks interleaved with
+non-policy ones, which is why this option sat on the accepted-but-unimplemented
+list until the set could be separated.
+
+Two halves matter equally. With the flag off, a non-standard transaction is
+accepted as far as its non-standardness goes. And the checks Core keeps OUTSIDE
+require_standard must STILL fire — a flag that turned off more than Core's is
+worse than one that does nothing, because it silently relaxes consensus-adjacent
+rules the operator never asked about."
+  (let* ((mempool (bitcoin-lisp.mempool:make-mempool))
+         (utxo (bitcoin-lisp.storage:make-utxo-set))
+         (base (make-mempool-test-tx :input-id 81)))
+    (flet ((reason (tx)
+             (nth-value 1 (bitcoin-lisp.validation:validate-transaction-for-mempool
+                           tx utxo mempool 100)))
+           (retyped (ver)
+             (bitcoin-lisp.serialization:make-transaction
+              :version ver
+              :inputs (bitcoin-lisp.serialization:transaction-inputs base)
+              :outputs (bitcoin-lisp.serialization:transaction-outputs base)
+              :lock-time 0)))
+      ;; Control: with the flag ON (the default) a bad version is refused.
+      (let ((bitcoin-lisp.validation::*require-standard* t))
+        (is (eq :version-non-standard (reason (retyped 4)))))
+      ;; With the flag OFF it gets past standardness entirely and fails on the
+      ;; empty UTXO set instead — i.e. on a CONSENSUS ground, not a policy one.
+      (let ((bitcoin-lisp.validation::*require-standard* nil))
+        (is (eq :missing-input (reason (retyped 4))))
+        ;; A non-standard OUTPUT script likewise stops being a reason.
+        (let* ((weird (make-array 10 :element-type '(unsigned-byte 8)
+                                     :initial-element #xFF))
+               (tx (bitcoin-lisp.serialization:make-transaction
+                    :version 2
+                    :inputs (bitcoin-lisp.serialization:transaction-inputs base)
+                    :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                      :value 100000 :script-pubkey weird))
+                    :lock-time 0)))
+          (is (eq :missing-input (reason tx))))
+        ;; But the 64-byte minimum still fires: Core keeps
+        ;; MIN_STANDARD_TX_NONWITNESS_SIZE outside require_standard
+        ;; (validation.cpp:813-815) because it mitigates CVE-2017-12842, and a
+        ;; flag that switched it off would be strictly more permissive than
+        ;; Core's.
+        (let* ((in (aref (bitcoin-lisp.serialization:transaction-inputs base) 0))
+               (tiny (bitcoin-lisp.serialization:make-transaction
+                      :version 2
+                      :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                       :previous-output
+                                       (bitcoin-lisp.serialization:tx-in-previous-output in)
+                                       :script-sig (make-array 0 :element-type
+                                                                 '(unsigned-byte 8))
+                                       :sequence #xffffffff))
+                      :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                                        :value 100000
+                                        :script-pubkey
+                                        (make-array 0 :element-type
+                                                      '(unsigned-byte 8))))
+                      :lock-time 0)))
+          ;; Assert the premise, or this test silently stops testing anything.
+          (is (< (length (bitcoin-lisp.serialization:serialize-transaction tiny))
+                 bitcoin-lisp.validation::+min-standard-tx-nonwitness-size+))
+          (is (eq :tx-size-small (reason tiny))))
+        ;; And a coinbase is still refused — consensus, never policy.
+        (is (eq :coinbase-not-allowed
+                (reason (bitcoin-lisp.serialization:make-transaction
+                         :version 2
+                         :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                                          :previous-output
+                                          (bitcoin-lisp.serialization:make-outpoint
+                                           :hash (make-array 32 :element-type
+                                                                '(unsigned-byte 8)
+                                                             :initial-element 0)
+                                           :index #xffffffff)
+                                          :script-sig (make-array 2 :element-type
+                                                                    '(unsigned-byte 8)
+                                                                 :initial-element 0)
+                                          :sequence #xffffffff))
+                         :outputs (bitcoin-lisp.serialization:transaction-outputs base)
+                         :lock-time 0)))))))
+  ;; Core REFUSES TO START with -acceptnonstdtxn on a non-test chain
+  ;; (mempool_args.cpp:102-104). An error, not a warning: a mainnet node quietly
+  ;; relaying non-standard transactions has them dropped by every peer and never
+  ;; finds out.
+  (let ((saved bitcoin-lisp.validation::*require-standard*))
+    (unwind-protect
+         (progn
+           (let ((bitcoin-lisp:*network* :mainnet))
+             (signals error
+               (bitcoin-lisp::apply-config-globals '(("acceptnonstdtxn" . "1"))))
+             ;; =0 on mainnet is fine — it asks for the default.
+             (bitcoin-lisp::apply-config-globals '(("acceptnonstdtxn" . "0")))
+             (is-true bitcoin-lisp.validation::*require-standard*))
+           (let ((bitcoin-lisp:*network* :regtest))
+             (bitcoin-lisp::apply-config-globals '(("acceptnonstdtxn" . "1")))
+             (is-false bitcoin-lisp.validation::*require-standard*)))
+      (setf bitcoin-lisp.validation::*require-standard* saved)))
+  (is-true (bitcoin-lisp::known-config-option-p "acceptnonstdtxn"))
+  (is-false (bitcoin-lisp::core-only-option-p "acceptnonstdtxn")))
+
 (test non-standard-output-script
   "Arbitrary scripts are non-standard."
   (let ((script (make-array 10 :element-type '(unsigned-byte 8) :initial-element #xFF)))
