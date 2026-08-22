@@ -300,16 +300,17 @@ to need."
               (bitcoin-lisp.coalton.interop::make-sig-cache-key #x45 sighash sig pubkey)
               (bitcoin-lisp.coalton.interop::make-sig-cache-key #x53 sighash sig pubkey))))))
 
-(test sig-cache-still-keys-on-script-flags
-  "Core does NOT key on script flags, because it validates the flag-dependent
-signature ENCODING before consulting the cache. Ours does the opposite —
-cached-verify-ecdsa passes :strict and :low-s into the verify, which runs only
-on a MISS — so the flags in the key are what stops a signature cached under lax
-flags from being reported valid under strict ones.
+(test sig-cache-key-carries-no-script-flags
+  "Core keys on sighash|pubkey|sig with NO script flags (ComputeEntryECDSA,
+sigcache.cpp:39-43). Ours used to include them, because the flag-dependent
+encoding checks ran INSIDE the cached verify — so the flags in the key were the
+only thing stopping a signature cached under lax flags from being reported
+valid under strict ones.
 
-This test pins that dependency so the flags cannot be dropped as a
-\"key-format cleanup\" without hoisting the encoding checks first. Doing one
-without the other is a consensus bug."
+The checks are now hoisted above the lookup (CHECK-SIGNATURE-ENCODING in
+CACHED-VERIFY-ECDSA), which is what makes the flag-free key correct. This
+asserts the key format; SIG-CACHE-RESPECTS-FLAGS-VIA-HOISTED-ENCODING-CHECKS
+asserts the property the key format now depends on. Neither is safe alone."
   (let* ((sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4))
          (pubkey (make-array 33 :element-type '(unsigned-byte 8) :initial-element 5))
          (sig (make-array 71 :element-type '(unsigned-byte 8) :initial-element 6))
@@ -317,6 +318,43 @@ without the other is a consensus bug."
                 (bitcoin-lisp.coalton.interop::make-sig-cache-key #x45 sighash sig pubkey)))
          (strict (let ((bitcoin-lisp.coalton.interop::*script-flags* "DERSIG,LOW_S"))
                    (bitcoin-lisp.coalton.interop::make-sig-cache-key #x45 sighash sig pubkey))))
-    (is (not (equalp lax strict))
-        "the same signature keys identically under different script flags — a \
-signature accepted under lax flags would be served from cache under strict ones")))
+    (is (equalp lax strict)
+        "the cache key still varies with the script flags")))
+
+(test sig-cache-respects-flags-via-hoisted-encoding-checks
+  "The consensus property the flag-free key rests on: a signature accepted
+under LAX flags and cached must NOT be reported valid under STRICT ones.
+
+Driven end to end through CACHED-VERIFY-ECDSA with a REAL signature, in the
+order that matters — lax first, so the cache is primed, then strict. A test
+that ran strict first would pass against a broken cache."
+  (let* ((privkey (make-array 32 :element-type '(unsigned-byte 8) :initial-element 7))
+         (pubkey (bitcoin-lisp.crypto:derive-public-key privkey))
+         (sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+         (der (bitcoin-lisp.crypto:sign-ecdsa privkey sighash)))
+    (bitcoin-lisp.coalton.interop::clear-signature-cache)
+    ;; A well-formed signature verifies and caches under either flag set.
+    (is-true (bitcoin-lisp.coalton.interop::cached-verify-ecdsa sighash der pubkey))
+    (is-true (bitcoin-lisp.coalton.interop::cached-verify-ecdsa
+              sighash der pubkey :strict t :low-s t))
+    ;; Now the case the key format used to protect: a signature that is fine
+    ;; laxly and NOT fine strictly. A trailing byte makes it invalid DER while
+    ;; leaving the lax parse intact.
+    (let ((padded (concatenate '(simple-array (unsigned-byte 8) (*)) der #(0))))
+      (bitcoin-lisp.coalton.interop::clear-signature-cache)
+      ;; Lax: accepted, and now in the cache.
+      (is-true (bitcoin-lisp.coalton.interop::cached-verify-ecdsa sighash padded pubkey)
+               "the lax case must succeed or this test asserts nothing")
+      ;; Strict: must be refused, cache hit or not.
+      (multiple-value-bind (result status)
+          (bitcoin-lisp.coalton.interop::cached-verify-ecdsa
+           sighash padded pubkey :strict t)
+        (is-false result
+                  "a signature cached under lax flags was served under strict ones")
+        (is-false status "a strict DER failure must report parse-failed")))
+    ;; And the low-S half, which has the same shape: high-S is valid laxly and
+    ;; refused under LOW_S. Core's CheckSignatureEncoding decides both.
+    (multiple-value-bind (ok status)
+        (bitcoin-lisp.crypto:check-signature-encoding der :strict t :low-s t)
+      (is-true ok "the fixture signature is already low-S")
+      (is-true status))))
