@@ -127,7 +127,12 @@
 (defsystem "bitcoin-lisp/tests"
   :depends-on ("bitcoin-lisp"
                "fiveam"
-               "yason")
+               "yason"
+               ;; structural-tests reads SB-INTROSPECT:WHO-CALLS at COMPILE
+               ;; time, so the package must exist before the file is compiled;
+               ;; the warm image has it only because Swank pulls it in, and the
+               ;; cold battery loads no Swank.
+               (:require "sb-introspect"))
   :components ((:module "tests"
                 :components ((:file "package")
                              (:file "crypto-tests")
@@ -191,6 +196,7 @@
                              (:file "addrman-tests")
                              ;; Compact block relay tests (BIP 152)
                              (:file "compact-block-tests")
+                             (:file "structural-tests")
                              ;; ADDRv2 tests (BIP 155)
                              (:file "addrv2-tests")
                              ;; Network-typed address codecs (onion/i2p/base32) + reachability
