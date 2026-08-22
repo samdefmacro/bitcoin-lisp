@@ -2803,7 +2803,7 @@ slots are (almost) full."
     (is-true (bitcoin-lisp::inbound-connection-allowed-p node "198.51.100.77"))
     ;; Discouraged at inbound capacity: dropped.
     (setf (bitcoin-lisp::node-peers node)
-          (loop for i from 1 to bitcoin-lisp::+max-inbound-peers+
+          (loop for i from 1 to bitcoin-lisp::*max-inbound-connections*
                 collect (bitcoin-lisp::make-peer
                          :address (format nil "10.~D.1.1" i) :inbound t)))
     (multiple-value-bind (ok reason)

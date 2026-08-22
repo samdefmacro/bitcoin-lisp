@@ -1346,11 +1346,9 @@
    #:record-block-timeout
    #:record-block-received-from-peer
    #:consider-peer-eviction
-   #:peer-consecutive-ping-failures
    #:peer-block-timeout-count
    #:peer-last-block-received-time
    #:peer-address
-   #:+max-ping-failures+
    #:+max-block-timeouts+
    ;; Peer database (peer-address struct shares symbol with peer accessor above)
    #:make-peer-address
