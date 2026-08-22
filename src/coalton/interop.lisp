@@ -546,25 +546,54 @@ re-verification and entries are added only after successful verifies
 (defvar *signature-cache-enabled* t
   "When T, cache signature verification results.")
 
+(defvar *sig-cache-salt*
+  (ironclad:random-data 32)
+  "A random 32-byte salt mixed into every signature-cache key, regenerated per
+process (Core's SignatureCache nonce, sigcache.cpp:25-32).
+
+Without it the key is plain SHA256 over public data, so anyone can compute the
+key for any (sighash, pubkey, signature) triple offline. That is what makes a
+cache attackable: an adversary who knows the keys can choose transactions whose
+entries collide in the table's buckets, or whose insertion order evicts the
+entries a validating node is about to need. Core salts for exactly this reason,
+and the salt costs one hash prefix.")
+
 (defun make-sig-cache-key (type-byte sighash pubkey sig)
   "Compute cache key over fixed-layout fields with length prefixes so variable-
    length pubkey/sig cannot produce key collisions across different splits.
+
+Salted with *SIG-CACHE-SALT* so the key cannot be computed offline; see there.
+
+NOTE ON *SCRIPT-FLAGS*: Core does NOT key on script flags (ComputeEntryECDSA,
+sigcache.cpp:39-43) because it validates the flag-dependent signature ENCODING
+before consulting the cache (CheckSignatureEncoding runs in
+CheckECDSASignature, ahead of the caching VerifyECDSASignature). Ours does the
+opposite — CACHED-VERIFY-ECDSA passes :strict and :low-s into the verify, which
+happens only on a MISS — so the flags in this key are what keeps a signature
+cached under lax flags from being reported valid under strict ones.
+
+Dropping the flags to match Core is therefore NOT a key-format change: it
+requires hoisting those encoding checks above the cache lookup first. Doing one
+without the other is a consensus bug.
 
 Hot path on stress blocks (called per signature verification). Builds
 the preimage directly into a pre-sized simple-array using buf-set-*
 helpers, ~10x faster than flexi-streams write-byte-per-byte CLOS
 dispatch."
-  (let* ((flags-len (if *script-flags* (length *script-flags*) 0))
+  (let* ((salt *sig-cache-salt*)
+         (salt-len (length salt))
+         (flags-len (if *script-flags* (length *script-flags*) 0))
          (sighash-len (length sighash))
          (pubkey-len (length pubkey))
          (sig-len (length sig))
-         ;; type(1) + flags-len(2) + flags(N) + sighash(M) + pk-len(1) +
-         ;; pk(K) + sig-len(2) + sig(L)
-         (total (+ 1 2 flags-len sighash-len 1 pubkey-len 2 sig-len))
+         ;; salt(32) + type(1) + flags-len(2) + flags(N) + sighash(M) +
+         ;; pk-len(1) + pk(K) + sig-len(2) + sig(L)
+         (total (+ salt-len 1 2 flags-len sighash-len 1 pubkey-len 2 sig-len))
          (buf (make-array total :element-type '(unsigned-byte 8)))
          (pos 0))
     (declare (type (simple-array (unsigned-byte 8) (*)) buf)
              (type fixnum pos total))
+    (setf pos (buf-set-bytes buf pos salt))
     (setf pos (buf-set-u8 buf pos type-byte))
     (setf pos (buf-set-u16-le buf pos flags-len))
     (when *script-flags*
