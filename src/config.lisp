@@ -451,8 +451,14 @@ evhttp_set_max_body_size(MAX_SIZE) (httpserver.cpp:410, serialize.h:32).
 The previous 1 MiB cap rejected submitblock for a normal mainnet block.
 Oversized bodies get HTTP 400, like libevent's enforcement.")
 
-(defconstant +handshake-timeout-seconds+ 30
-  "Maximum seconds to complete version handshake.")
+(defparameter +handshake-timeout-seconds+ 60
+  "Maximum seconds a peer has to complete the version handshake, settable with
+-peertimeout (Core DEFAULT_PEER_CONNECT_TIMEOUT, net.h:87).
+
+Was 30 with no stated source. Core allows 60, so a peer on a slow link that
+Core would keep, we dropped — and re-dialling it costs more than waiting. A
+DEFPARAMETER because Core exposes the knob; the +NAME+ spelling is kept because
+every caller reads it as a constant.")
 
 (defvar *recent-rejects-max-size* 50000
   "Maximum entries in the recent transaction rejects filter.")
@@ -893,6 +899,7 @@ specially in config-alist->start-node-plist.")
     "maxtxfee" "fallbackfee" "bantime" "uacomment"
     "dustrelayfee" "incrementalrelayfee" "bytespersigop"
     "maxtipage" "maxsigcachesize" "fastprune" "blocksxor"
+    "peertimeout" "maxsendbuffer"
     "rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
@@ -926,9 +933,9 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "ipcbind" "keypool" "limitancestorcount" "limitancestorsize"
     "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
     "loglevelalways" "logsourcelocations"
-    "logtimestamps" "maxapsfee" "maxreceivebuffer" "maxsendbuffer"
+    "logtimestamps" "maxapsfee" "maxreceivebuffer"
     "maxuploadtarget" "mintxfee"
-    "natpmp" "par" "peerbloomfilters" "peertimeout" "persistmempool"
+    "natpmp" "par" "peerbloomfilters" "persistmempool"
     "persistmempoolv1" "pid" "printpriority" "printtoconsole"
     "privatebroadcast" "rpcdoccheck"
     "rpcwhitelist" "rpcwhitelistdefault"
@@ -1352,6 +1359,23 @@ start-node-from-args."
           (unless (and n (plusp n))
             (error "Invalid value for -bytespersigop=~A (must be a positive integer)" v))
           (setf bitcoin-lisp.mempool::+bytes-per-sigop+ n))))
+    ;; -peertimeout: seconds a peer has to complete the version handshake
+    ;; (Core DEFAULT_PEER_CONNECT_TIMEOUT, net.h:87).
+    (let ((v (lk "peertimeout")))
+      (when v
+        (let ((n (conf-parse-int v)))
+          (unless (and n (plusp n))
+            (error "Invalid value for -peertimeout=~A (must be a positive integer)" v))
+          (setf +handshake-timeout-seconds+ n))))
+    ;; -maxsendbuffer: per-connection cap on buffered unsent bytes. Core's
+    ;; value is in KILOBYTES and it multiplies by 1000, not 1024
+    ;; (init.cpp:2105, DEFAULT_MAXSENDBUFFER = 1000 -> 1,000,000 bytes).
+    (let ((v (lk "maxsendbuffer")))
+      (when v
+        (let ((n (conf-parse-int v)))
+          (unless (and n (plusp n))
+            (error "Invalid value for -maxsendbuffer=~A (must be a positive integer)" v))
+          (setf bitcoin-lisp.networking::+max-send-buffer-bytes+ (* n 1000)))))
     ;; -maxtipage: how old the tip may be before the node still calls itself in
     ;; IBD (Core DEFAULT_MAX_TIP_AGE, kernel/chainstatemanager_opts.h:24).
     (let ((v (lk "maxtipage")))
