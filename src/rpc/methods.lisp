@@ -3477,11 +3477,93 @@ point of the mode (check_pow=false, :750)."
         (values (gethash "mode" req) (gethash "data" req))
         (values nil nil))))
 
+(defconstant +gbt-cache-seconds+ 5
+  "How long a getblocktemplate result is reused when only the MEMPOOL has
+changed (Core rpc/mining.cpp: `GetTime() - time_start > 5`). A changed tip
+always rebuilds, whatever the age.")
+
+(defconstant +gbt-longpoll-first-wait-seconds+ 60
+  "Core's first longpoll interval before it rechecks the mempool counter
+(rpc/mining.cpp `checktxtime{std::chrono::minutes(1)}`).")
+
+(defconstant +gbt-longpoll-later-wait-seconds+ 10
+  "Core's interval after the first (`checktxtime = std::chrono::seconds(10)`).")
+
+(defvar *gbt-cache* nil
+  "The last getblocktemplate answer, as (node tip-hash txs-updated built-at
+. result), or NIL. A global for the same reason Core's is a function-local
+`static`: it is one node's most recent template, and rebuilding it per call is
+the cost the cache exists to avoid.
+
+The NODE is part of the key, which Core's cannot be — it has exactly one. Here
+the RPC layer serves whatever node it is handed, and two regtest nodes share a
+genesis tip hash, so a node-blind key hands one node the other's template.")
+
+(defvar *gbt-cache-lock* (bt:make-lock "gbt-cache")
+  "Guards *gbt-cache*: two miners polling concurrently must not interleave a
+read of one field with a write of another.")
+
+(defun %gbt-longpoll-id (params)
+  "The longpollid the caller passed in the template request, or NIL."
+  (let ((request (first params)))
+    (when (hash-table-p request)
+      (let ((v (gethash "longpollid" request)))
+        (and (stringp v) v)))))
+
+(defun %gbt-parse-longpoll-id (id tip-hex txs-updated)
+  "Split a longpollid into (values watched-tip-hex watched-txs-updated).
+
+Core's format is <64 hex chars of the best chain><nTransactionsUpdatedLast>
+(rpc/mining.cpp:803-809). Anything else is treated as the CURRENT state, which
+makes the wait return as soon as either changes — Core's own fallback for a
+non-string id, kept here for a malformed one too, because the alternative is
+erroring on an id a miner may legitimately have never seen a format for."
+  (if (and (stringp id) (>= (length id) 64)
+           (every (lambda (c) (digit-char-p c 16)) (subseq id 0 64))
+           (every #'digit-char-p (subseq id 64))
+           (plusp (length (subseq id 64))))
+      (values (string-downcase (subseq id 0 64))
+              (parse-integer id :start 64))
+      (values tip-hex txs-updated)))
+
+(defun %gbt-wait-for-change (node id)
+  "Block until the tip or the mempool has moved past what ID describes (Core
+rpc/mining.cpp:817-836).
+
+Holds NO lock while waiting — Core takes a REVERSE_LOCK around the same loop —
+and gives up after Core's first interval plus a few of its later ones, so a
+miner polling a node that never changes still gets an answer rather than a
+socket timeout."
+  (let* ((tip-hex (hash-to-hex (bitcoin-lisp.storage:best-block-hash
+                                (rpc-get-chain-state node))))
+         (updated (bitcoin-lisp.mempool:mempool-transactions-updated
+                   (rpc-get-mempool node))))
+    (multiple-value-bind (watched-tip watched-updated)
+        (%gbt-parse-longpoll-id id tip-hex updated)
+      (let ((deadline (+ (get-universal-time)
+                         +gbt-longpoll-first-wait-seconds+
+                         (* 3 +gbt-longpoll-later-wait-seconds+))))
+        (loop
+          (let ((now-tip (hash-to-hex (bitcoin-lisp.storage:best-block-hash
+                                       (rpc-get-chain-state node))))
+                (now-updated (bitcoin-lisp.mempool:mempool-transactions-updated
+                              (rpc-get-mempool node))))
+            (when (or (not (string= now-tip watched-tip))
+                      (/= now-updated watched-updated))
+              (return)))
+          ;; A node on its way down answers rather than holding the socket.
+          (unless (bitcoin-lisp::node-running node)
+            (error 'rpc-error :code +rpc-client-not-connected+
+                              :message "Shutting down"))
+          (when (>= (get-universal-time) deadline)
+            (return))
+          (sleep 0.25))))))
+
 (defun rpc-getblocktemplate (node params)
   "Return a block template assembled from the mempool (Bitcoin Core
-getblocktemplate). The optional template-request object's mode="proposal" is
-supported (validate a submitted template without mining it); longpoll is not.
-Fields mirror Core.
+getblocktemplate). The optional template-request object's mode=\"proposal\"
+(validate a submitted template without mining it) and longpollid (block until a
+fresh template would differ) are both supported. Fields mirror Core.
 The template is assembled as a full block around a dummy OP_TRUE coinbase (Core's
 scriptDummy) and dry-run through TestBlockValidity (Core CreateNewBlock,
 node/miner.cpp:227-231) — an invalid template errors here instead of reaching a
@@ -3491,6 +3573,11 @@ miner."
   (multiple-value-bind (mode data) (%gbt-request-mode params)
     (when (and (stringp mode) (string= mode "proposal"))
       (return-from rpc-getblocktemplate (%gbt-proposal node data))))
+  ;; longpoll: wait BEFORE the connectivity checks and the assembly, as Core
+  ;; does — the caller is asking us to hold the request open until there is
+  ;; something new to say.
+  (let ((id (%gbt-longpoll-id params)))
+    (when id (%gbt-wait-for-change node id)))
   ;; Core rpc/mining.cpp:767-772: on a non-test chain (mainnet only — all
   ;; test networks have m_is_test_chain), refuse while unconnected (-9,
   ;; RPC_CLIENT_NOT_CONNECTED) or in initial block download (-10,
@@ -3504,7 +3591,46 @@ miner."
                         :message "Bitcoin is in initial sync and waiting for blocks...")))
   (let* ((chain-state (rpc-get-chain-state node))
          (mempool (rpc-get-mempool node))
-         ;; Node lock around the whole assembly: the chunk walk locks
+         (tip-hex (hash-to-hex (bitcoin-lisp.storage:best-block-hash chain-state)))
+         (txs-updated (bitcoin-lisp.mempool:mempool-transactions-updated mempool))
+         (cached (%gbt-cached-result node tip-hex txs-updated)))
+    (when cached (return-from rpc-getblocktemplate cached))
+    (%gbt-build-and-cache node chain-state mempool tip-hex txs-updated)))
+
+(defun %gbt-cached-result (node tip-hex txs-updated)
+  "The cached template when it is still good, else NIL (Core rpc/mining.cpp's
+`if (!pindexPrev || pindexPrev->GetBlockHash() != tip || (txsUpdated != last &&
+GetTime() - time_start > 5))`).
+
+Note the shape of Core's condition: a mempool change alone does NOT invalidate
+the cache — it invalidates it only once the template is also older than five
+seconds. That is what keeps a busy mainnet mempool from making every
+getblocktemplate call reassemble a block."
+  (bt:with-lock-held (*gbt-cache-lock*)
+    (let ((cache *gbt-cache*))
+      (when cache
+        (destructuring-bind (cached-node cached-tip cached-updated built-at . result) cache
+          (when (and (eq cached-node node)
+                     (string= cached-tip tip-hex)
+                     (or (= cached-updated txs-updated)
+                         (<= (- (bitcoin-lisp.serialization:get-unix-time) built-at)
+                             +gbt-cache-seconds+)))
+            result))))))
+
+(defun %gbt-build-and-cache (node chain-state mempool tip-hex txs-updated)
+  "Assemble a fresh template and cache it under the state it was built from."
+  (let ((result (%gbt-assemble node chain-state mempool tip-hex txs-updated)))
+    (bt:with-lock-held (*gbt-cache-lock*)
+      (setf *gbt-cache* (list* node tip-hex txs-updated
+                               (bitcoin-lisp.serialization:get-unix-time)
+                               result)))
+    result))
+
+(defun %gbt-assemble (node chain-state mempool tip-hex txs-updated)
+  "Build one getblocktemplate result. Split out of RPC-GETBLOCKTEMPLATE so the
+cache above wraps exactly the expensive part and nothing else."
+  (declare (ignorable tip-hex))
+  (let* (;; Node lock around the whole assembly: the chunk walk locks
          ;; internally (assembler %with-mempool-lock), but the template's
          ;; height/prev/finality context and its TestBlockValidity dry run
          ;; must see the SAME tip the transactions were selected against
@@ -3543,11 +3669,13 @@ miner."
       ("rules" . ,(%gbt-rules (bitcoin-lisp.mining:block-template-height template)))
       ("vbavailable" . ,(make-hash-table :test 'equal))
       ("vbrequired" . 0)
-      ;; longpoll id: miners poll with this; we don't block on it, but emit a
-      ;; tip-derived id so longpoll-aware miners are satisfied.
+      ;; longpoll id: <best chain hash><nTransactionsUpdatedLast> (Core
+      ;; rpc/mining.cpp:995). The second half MUST be the mempool counter, not
+      ;; the height: a miner longpolling on a height-derived id would never be
+      ;; woken by mempool churn, which is most of what a new template is for.
       ("longpollid" . ,(format nil "~A~D"
                                (hash-to-hex (bitcoin-lisp.mining:block-template-prev-hash template))
-                               (bitcoin-lisp.mining:block-template-height template))))))
+                               txs-updated)))))
 
 (defun rpc-getmininginfo (node params)
   "Return mining-related state (Bitcoin Core getmininginfo)."
