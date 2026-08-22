@@ -3341,15 +3341,75 @@ template outright."
       (push "taproot" rules))
     (nreverse rules)))
 
+(defun %gbt-proposal (node data)
+  "Validate a submitted block template (Core getblocktemplate mode=\"proposal\",
+rpc/mining.cpp:729-751).
+
+Returns JSON null for a template the node would accept, or a BIP22 reject
+reason string. A block the index already knows never reaches validation: Core
+answers \"duplicate\" when it is fully valid, \"duplicate-invalid\" when it is
+known bad, and \"duplicate-inconclusive\" otherwise (:741-747).
+
+PoW is NOT checked — a proposal is an unmined template, which is the entire
+point of the mode (check_pow=false, :750)."
+  (unless (stringp data)
+    (error 'rpc-error :code +rpc-type-error+
+                      :message "Missing data String key for proposal"))
+  (let ((block (handler-case
+                   (let ((bytes (bitcoin-lisp.crypto:hex-to-bytes data)))
+                     (flexi-streams:with-input-from-sequence (s bytes)
+                       (bitcoin-lisp.serialization:read-bitcoin-block s)))
+                 (error ()
+                   (error 'rpc-error :code +rpc-deserialization-error+
+                                     :message "Block decode failed")))))
+    (with-node-lock (node)
+      (let* ((chain-state (rpc-get-chain-state node))
+             (hash (bitcoin-lisp.serialization:block-header-hash
+                    (bitcoin-lisp.serialization:bitcoin-block-header block)))
+             (entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+        (when entry
+          (return-from %gbt-proposal
+            (case (bitcoin-lisp.storage:block-index-entry-status entry)
+              (:valid "duplicate")
+              (:invalid "duplicate-invalid")
+              (t "duplicate-inconclusive"))))
+        ;; Core requires a proposal to build on the CURRENT tip; TestBlockValidity
+        ;; asserts it, so check first and answer BIP22's reason rather than
+        ;; signalling out of the RPC.
+        (unless (equalp (bitcoin-lisp.serialization:block-header-prev-block
+                         (bitcoin-lisp.serialization:bitcoin-block-header block))
+                        (bitcoin-lisp.storage:best-block-hash chain-state))
+          (return-from %gbt-proposal "inconclusive-not-best-prevblk"))
+        (multiple-value-bind (ok reason)
+            (handler-case
+                (bitcoin-lisp.validation:test-block-validity
+                 block chain-state (rpc-get-utxo-set node))
+              (error () (values nil :rejected)))
+          (if ok
+              :null
+              (string-downcase (symbol-name (or reason :rejected)))))))))
+
+(defun %gbt-request-mode (params)
+  "(VALUES mode data) from getblocktemplate's optional template-request object."
+  (let ((req (first params)))
+    (if (hash-table-p req)
+        (values (gethash "mode" req) (gethash "data" req))
+        (values nil nil))))
+
 (defun rpc-getblocktemplate (node params)
   "Return a block template assembled from the mempool (Bitcoin Core
-getblocktemplate). The optional template-request object is accepted but only its
-implicit default mode is supported (no longpoll / proposal). Fields mirror Core.
+getblocktemplate). The optional template-request object's mode="proposal" is
+supported (validate a submitted template without mining it); longpoll is not.
+Fields mirror Core.
 The template is assembled as a full block around a dummy OP_TRUE coinbase (Core's
 scriptDummy) and dry-run through TestBlockValidity (Core CreateNewBlock,
 node/miner.cpp:227-231) — an invalid template errors here instead of reaching a
 miner."
-  (declare (ignore params))
+  ;; mode="proposal" answers before anything is assembled: it is a VALIDATION
+  ;; request, not a request for work (rpc/mining.cpp:729-751).
+  (multiple-value-bind (mode data) (%gbt-request-mode params)
+    (when (and (stringp mode) (string= mode "proposal"))
+      (return-from rpc-getblocktemplate (%gbt-proposal node data))))
   ;; Core rpc/mining.cpp:767-772: on a non-test chain (mainnet only — all
   ;; test networks have m_is_test_chain), refuse while unconnected (-9,
   ;; RPC_CLIENT_NOT_CONNECTED) or in initial block download (-10,
