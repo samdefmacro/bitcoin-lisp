@@ -59,6 +59,29 @@ as one."
 ;;;; wallet can reach it for -walletnotify; what lives here is the set of hooks
 ;;;; the NODE fires.
 
+(defvar *connect-nodes* '()
+  "-connect targets (Core m_specified_outgoing): peer specs to dial and keep
+dialed, and NOTHING else. Deliberately not the node's added-nodes list, because
+getaddednodeinfo reports -addnode and not -connect, exactly as Core's does —
+both are nonetheless dialed as MANUAL connections.")
+
+(defvar *use-addrman-outgoing* t
+  "Core's CConnman m_use_addrman_outgoing (net.h:1095). NIL once -connect was
+given in any form. A global rather than a node slot for the same reason
+*dns-seed-enabled* and *block-notify-command* are: it is start-up configuration
+that never varies within a run.")
+
+(defun addrman-outgoing-enabled-p ()
+  "Whether this node may open outbound connections of its own choosing (Core
+CConnman::GetUseAddrmanOutgoing, net.h:1168).
+
+NIL once -connect was given in ANY form: with -connect=<addr> Core's
+ThreadOpenConnections takes the specified-addresses branch and never reaches
+the addrman code at all, and with -connect=0 the thread is not started
+(net.cpp:3540) — so no feeler, no block-relay slot, no replacement dial. Only
+the MANUAL connections (-connect and -addnode) remain."
+  *use-addrman-outgoing*)
+
 (defvar *block-notify-command* nil
   "Shell command to run when the best block changes; %s is replaced by the
 block hash (Core -blocknotify, init.cpp:498).")
@@ -2325,6 +2348,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (dbcache-mib nil)
                         (mocktime nil)
                         (pid-file nil)
+                        (connect-nodes nil connect-nodes-supplied-p)
                         (block-notify nil)
                         (startup-notify nil)
                         (shutdown-notify nil)
@@ -2563,6 +2587,22 @@ txindex ~D MiB, per-index ~D MiB"
   (when addnode
     (setf (node-added-nodes *node*) (copy-list addnode))
     (log-info "Manually-added peers (-addnode): ~{~A~^, ~}" addnode))
+  ;; -connect: dial ONLY these, and stop choosing peers from the address book
+  ;; (Core init.cpp:2214-2225). The single value "0" — which is also what
+  ;; -noconnect parses to — means no outbound connections at all; Core tests
+  ;; for exactly that shape, so -connect=0 -connect=1.2.3.4 leaves BOTH as
+  ;; targets rather than being read as a disable.
+  (setf *use-addrman-outgoing* t *connect-nodes* '())
+  (when connect-nodes-supplied-p
+    (setf *use-addrman-outgoing* nil)
+    (let ((targets (if (equal connect-nodes '("0")) '() (copy-list connect-nodes))))
+      (setf *connect-nodes* targets)
+      (if targets
+          (log-info "Connecting only to -connect peers: ~{~A~^, ~}" targets)
+          (log-info "Outbound connections disabled (-connect=0)"))
+      (when (and targets (node-added-nodes *node*))
+        ;; Core logs the same precedence note for -seednode.
+        (log-info "-addnode peers are dialed alongside -connect"))))
   ;; -stopatheight: re-arm the once-only shutdown trigger for this run.
   (setf *stop-at-height-triggered* nil
         *disk-space-abort-triggered* nil)
@@ -4777,6 +4817,13 @@ Returns the number of peers connected."
   ;; setnetworkactive off: make no outbound connections.
   (unless (node-network-active node)
     (return-from connect-to-peers 0))
+  ;; -connect: the only outbound peers are the specified ones, dialed by
+  ;; connect-specified-nodes. Returning 0 here rather than dialing them makes
+  ;; the two paths one path — the startup dial and the maintenance dial cannot
+  ;; disagree about which targets are current.
+  (unless (addrman-outgoing-enabled-p)
+    (connect-specified-nodes node)
+    (return-from connect-to-peers (length (node-peers node))))
   (let ((address-book (node-address-book node))
         (addresses '()))
     ;; Warm start: select peers from the addrman (new/tried buckets,
@@ -5074,6 +5121,11 @@ Returns the number of new peers connected."
   ;; setnetworkactive off: don't dial replacements.
   (unless (node-network-active node)
     (return-from replace-disconnected-peers 0))
+  ;; -connect: this node picks no peers of its own. The reap above still runs —
+  ;; a dead -connect peer must leave the list so connect-specified-nodes redials
+  ;; it — but nothing here chooses a replacement from the address book.
+  (unless (addrman-outgoing-enabled-p)
+    (return-from replace-disconnected-peers 0))
   ;; Count ONLY outbound full-relay peers toward the outbound target — never
   ;; inbound, never block-relay/feeler. Core's ThreadOpenConnections counts
   ;; nOutboundFullRelay via IsFullOutboundConn() (net.cpp:2648-2657,2718) and
@@ -5208,6 +5260,16 @@ node-peers stays single-writer. No-op when networking is disabled."
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
 
+(defun connect-specified-nodes (node)
+  "Keep every -connect target connected (Core ThreadOpenConnections' first
+branch, net.cpp: MANUAL connections dialed in a loop for as long as the node
+runs). Distinct from connect-added-nodes only in which list it walks."
+  (when (node-network-active node)
+    (dolist (spec *connect-nodes*)
+      (multiple-value-bind (host port) (parse-node-endpoint node spec)
+        (unless (peer-connected-to-host-p node host)
+          (establish-outbound-peer node host port :manual t))))))
+
 (defun connect-added-nodes (node)
   "Service addnode requests on the sync thread: drain one-shot \"onetry\" dials,
 then keep every \"add\" peer connected. Honors network-active."
@@ -5276,7 +5338,8 @@ needs a Tor proxy, cjdns needs -cjdnsreachable, i2p never)."
 (defun maintain-block-relay-peers (node)
   "Ensure up to +target-block-relay-peers+ block-relay-only outbound peers.
 Each carries blocks/headers only (relay=0), never tx relay."
-  (when (and (node-network-active node) (node-address-book node))
+  (when (and (node-network-active node) (node-address-book node)
+             (addrman-outgoing-enabled-p))
     (loop while (< (peers-of-conn-type node :block-relay) +target-block-relay-peers+)
           do (multiple-value-bind (ip port) (%addrman-pick-unconnected node)
                (unless (and ip (establish-outbound-peer
@@ -5317,6 +5380,7 @@ probe: mark it good, which resolves the collision in its favour, and spend the
 feeler on the new table instead."
   (let ((now (get-universal-time)))
     (when (and (node-network-active node) (node-address-book node)
+               (addrman-outgoing-enabled-p)
                (>= (- now *last-feeler-time*) +feeler-interval-seconds+))
       (setf *last-feeler-time* now)
       (let* ((book (node-address-book node))
@@ -5407,6 +5471,7 @@ block-relay-only slots, an occasional feeler probe, and the chain-sync
 eviction sweep."
   (check-peers-health node)
   (connect-added-nodes node)
+  (connect-specified-nodes node)
   ;; Core resolves tried-table collisions once per ThreadOpenConnections
   ;; iteration (net.cpp:2768), not only at startup — otherwise, once the
   ;; collision set is full, address-book-good stops recording successes.

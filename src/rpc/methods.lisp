@@ -2021,13 +2021,20 @@ subnet syntax is rejected as invalid. Returns null."
   `(("totalbytesrecv" . ,bitcoin-lisp.networking:*total-bytes-received*)
     ("totalbytessent" . ,bitcoin-lisp.networking:*total-bytes-sent*)
     ("timemillis" . ,(* (bitcoin-lisp.serialization:get-unix-time) 1000))
-    ;; No upload limit is enforced; report the disabled-target shape Core uses.
-    ("uploadtarget" . (("timeframe" . 86400)
-                       ("target" . 0)
-                       ("target_reached" . ,+json-false+)
-                       ("serve_historical_blocks" . t)
-                       ("bytes_left_in_cycle" . 0)
-                       ("time_left_in_cycle" . 0)))))
+    ;; -maxuploadtarget (Core rpc/net.cpp:598-608). With no target set every
+    ;; field reads as Core's disabled shape, because Core's own accessors
+    ;; short-circuit on nMaxOutboundLimit == 0.
+    ("uploadtarget"
+     . (("timeframe" . ,bitcoin-lisp.networking::+max-upload-timeframe-seconds+)
+        ("target" . ,bitcoin-lisp.networking::*max-upload-target*)
+        ("target_reached"
+         . ,(json-bool (bitcoin-lisp.networking::outbound-target-reached-p nil)))
+        ("serve_historical_blocks"
+         . ,(json-bool (not (bitcoin-lisp.networking::outbound-target-reached-p t))))
+        ("bytes_left_in_cycle"
+         . ,(bitcoin-lisp.networking::outbound-target-bytes-left))
+        ("time_left_in_cycle"
+         . ,(bitcoin-lisp.networking::max-outbound-time-left-in-cycle))))))
 
 ;;; --- Chain verification (Bitcoin Core verifychain) ---
 

@@ -1239,6 +1239,177 @@ option this repo keeps finding."
   (is (eq :absent (getf (bitcoin-lisp::args->start-node-plist '("-regtest"))
                         :console-log :absent))))
 
+(test connect-disables-every-self-chosen-outbound-connection
+  "-connect (Core init.cpp:777-784, 2214-2225; net.cpp:3540). The functional
+test framework writes connect=0 into EVERY node's bitcoin.conf by default
+(test_framework/util.py:581), so a node that parses -connect and then dials
+addrman anyway is a node that cannot be tested against Core's suite at all.
+
+Asserted through the DIALING paths, not the variable: each of the four is the
+one Core's ThreadOpenConnections would have taken."
+  (let ((saved-addrman bitcoin-lisp::*use-addrman-outgoing*)
+        (saved-connect bitcoin-lisp::*connect-nodes*))
+    (unwind-protect
+         (let ((node (bitcoin-lisp::make-node :network :testnet3)))
+           (setf (bitcoin-lisp::node-network-active node) t
+                 (bitcoin-lisp::node-address-book node)
+                 (bitcoin-lisp.networking:make-address-book))
+           ;; Without -connect the node chooses its own peers.
+           (setf bitcoin-lisp::*use-addrman-outgoing* t)
+           (is-true (bitcoin-lisp::addrman-outgoing-enabled-p))
+           ;; With it, every self-chosen path declines. replace-disconnected-peers
+           ;; returning 0 is the load-bearing one: it is what would otherwise
+           ;; refill the outbound set from the address book every cycle.
+           (setf bitcoin-lisp::*use-addrman-outgoing* nil
+                 bitcoin-lisp::*connect-nodes* '())
+           (is-false (bitcoin-lisp::addrman-outgoing-enabled-p))
+           (is (= 0 (bitcoin-lisp::replace-disconnected-peers node)))
+           (is (= 0 (bitcoin-lisp::connect-to-peers node 8 :timeout 1)))
+           ;; No block-relay slot is opened and no feeler is spent; both would
+           ;; otherwise pick an address themselves.
+           (bitcoin-lisp::maintain-block-relay-peers node)
+           (bitcoin-lisp::maybe-do-feeler node)
+           (is (= 0 (length (bitcoin-lisp::node-peers node)))))
+      (setf bitcoin-lisp::*use-addrman-outgoing* saved-addrman
+            bitcoin-lisp::*connect-nodes* saved-connect)))
+  ;; The calls above return 0 for an empty address book too, so assert
+  ;; STRUCTURALLY that every self-chosen dialing path consults the gate. This is
+  ;; the check that goes red if a fifth path is added later without one, which
+  ;; is exactly how the whole option quietly stops working.
+  (dolist (caller '(bitcoin-lisp::replace-disconnected-peers
+                    bitcoin-lisp::connect-to-peers
+                    bitcoin-lisp::maintain-block-relay-peers
+                    bitcoin-lisp::maybe-do-feeler))
+    (is-true (member caller (mapcar #'car (sb-introspect:who-calls
+                                          'bitcoin-lisp::addrman-outgoing-enabled-p)))
+             "~A does not consult addrman-outgoing-enabled-p" caller))
+  ;; And that the -connect targets are actually dialed by the maintenance loop.
+  (is-true (member 'bitcoin-lisp::maintain-peers
+                   (mapcar #'car (sb-introspect:who-calls
+                                  'bitcoin-lisp::connect-specified-nodes))))
+  ;; Every occurrence reaches the plist (Core reads -connect with GetArgs), and
+  ;; -noconnect is the single "0" Core tests for.
+  (let ((p (bitcoin-lisp::args->start-node-plist
+            '("-regtest" "-connect=1.2.3.4" "-connect=5.6.7.8:1234") nil)))
+    (is (equal '("1.2.3.4" "5.6.7.8:1234") (getf p :connect-nodes)))
+    ;; Parameter interaction: -listen soft-set to 0.
+    (is-false (getf p :listen)))
+  (is (equal '("0") (getf (bitcoin-lisp::args->start-node-plist '("-noconnect") nil)
+                          :connect-nodes)))
+  (is (equal '("0") (getf (bitcoin-lisp::args->start-node-plist '("-connect=0") nil)
+                          :connect-nodes)))
+  ;; Soft, not forced: an explicit -listen=1 still wins, which is the whole
+  ;; difference between Core's SoftSetBoolArg and a plain assignment.
+  (is-true (getf (bitcoin-lisp::args->start-node-plist
+                  '("-connect=1.2.3.4" "-listen=1") nil)
+                 :listen))
+  ;; -maxconnections=0 takes the same interaction (Core's condition is one
+  ;; disjunction covering both).
+  (is-false (getf (bitcoin-lisp::args->start-node-plist '("-maxconnections=0") nil)
+                  :listen))
+  ;; And the -dnsseed half, which lives in apply-config-globals because that is
+  ;; what owns *dns-seed-enabled*.
+  (let ((saved bitcoin-lisp:*dns-seed-enabled*))
+    (unwind-protect
+         (progn
+           (setf bitcoin-lisp:*dns-seed-enabled* t)
+           (bitcoin-lisp::apply-config-globals '(("connect" . "1.2.3.4")))
+           (is-false bitcoin-lisp:*dns-seed-enabled*)
+           (setf bitcoin-lisp:*dns-seed-enabled* t)
+           (bitcoin-lisp::apply-config-globals '(("maxconnections" . "0")))
+           (is-false bitcoin-lisp:*dns-seed-enabled*)
+           ;; Explicit -dnsseed=1 wins over the interaction.
+           (bitcoin-lisp::apply-config-globals
+            '(("connect" . "1.2.3.4") ("dnsseed" . "1")))
+           (is-true bitcoin-lisp:*dns-seed-enabled*))
+      (setf bitcoin-lisp:*dns-seed-enabled* saved)))
+  (is-true (bitcoin-lisp::known-config-option-p "connect"))
+  (is-false (bitcoin-lisp::core-only-option-p "connect"))
+  (is-true (member "connect" bitcoin-lisp::*repeatable-config-options*
+                   :test #'string=)))
+
+(test maxuploadtarget-limits-what-the-node-serves
+  "-maxuploadtarget (Core net.cpp:3877-3941, net_processing.cpp:2376-2383).
+
+Core parses it with ParseByteUnits defaulting to M, so a bare number is
+MEBIbytes. Reading it as bytes — the obvious mistake — would make every
+ordinary command line set a target of a few hundred bytes, i.e. permanently
+over budget from the first message."
+  ;; ParseByteUnits: lowercase 1000-base, uppercase 1024-base, default M.
+  (is (= (* 100 1024 1024) (bitcoin-lisp::conf-parse-byte-units "100")))
+  ;; Core's ByteUnit::NOOP, where a bare number really is a byte count.
+  (is (= 100 (bitcoin-lisp::conf-parse-byte-units "100" #\B)))
+  (is (= (* 5 1000) (bitcoin-lisp::conf-parse-byte-units "5k")))
+  (is (= (* 5 1024) (bitcoin-lisp::conf-parse-byte-units "5K")))
+  (is (= (* 2 (expt 1000 3)) (bitcoin-lisp::conf-parse-byte-units "2g")))
+  (is (= (* 2 (expt 1024 4)) (bitcoin-lisp::conf-parse-byte-units "2T")))
+  (dolist (bad '("" "M" "1x" "-1" "1.5G" "one"))
+    (signals error (bitcoin-lisp::conf-parse-byte-units bad)))
+  (let ((saved-target bitcoin-lisp.networking::*max-upload-target*)
+        (saved-start bitcoin-lisp.networking::*max-outbound-cycle-start*)
+        (saved-bytes bitcoin-lisp.networking::*max-outbound-bytes-in-cycle*))
+    (unwind-protect
+         (progn
+           ;; No target: every accessor reads as Core's disabled shape, and
+           ;; nothing is ever "reached".
+           (setf bitcoin-lisp.networking::*max-upload-target* 0
+                 bitcoin-lisp.networking::*max-outbound-bytes-in-cycle* (* 999 1024 1024))
+           (is-false (bitcoin-lisp.networking::outbound-target-reached-p nil))
+           (is-false (bitcoin-lisp.networking::outbound-target-reached-p t))
+           (is (= 0 (bitcoin-lisp.networking::outbound-target-bytes-left)))
+           (is (= 0 (bitcoin-lisp.networking::max-outbound-time-left-in-cycle)))
+           ;; A target reached by the hard limit.
+           (bitcoin-lisp::apply-config-globals '(("maxuploadtarget" . "10")))
+           (is (= (* 10 1024 1024) bitcoin-lisp.networking::*max-upload-target*))
+           (setf bitcoin-lisp.networking::*max-outbound-cycle-start*
+                 (bitcoin-lisp.serialization:get-unix-time)
+                 bitcoin-lisp.networking::*max-outbound-bytes-in-cycle* 0)
+           (is-false (bitcoin-lisp.networking::outbound-target-reached-p nil))
+           (is (= (* 10 1024 1024)
+                  (bitcoin-lisp.networking::outbound-target-bytes-left)))
+           (setf bitcoin-lisp.networking::*max-outbound-bytes-in-cycle*
+                 (* 10 1024 1024))
+           (is-true (bitcoin-lisp.networking::outbound-target-reached-p nil))
+           (is (= 0 (bitcoin-lisp.networking::outbound-target-bytes-left)))
+           ;; The historical-serving limit trips FIRST and, for a target this
+           ;; small, is already tripped at zero bytes sent: a full cycle's
+           ;; buffer (one block per 10 minutes) exceeds 10 MiB outright, which
+           ;; is Core's `buffer >= nMaxOutboundLimit` branch.
+           (setf bitcoin-lisp.networking::*max-outbound-bytes-in-cycle* 0)
+           (is-true (bitcoin-lisp.networking::outbound-target-reached-p t))
+           ;; With a target large enough for the buffer, historical serving is
+           ;; allowed again while the hard limit is far away.
+           (bitcoin-lisp::apply-config-globals '(("maxuploadtarget" . "10T")))
+           (is-false (bitcoin-lisp.networking::outbound-target-reached-p t))
+           ;; The cycle counter rolls after 24h rather than accumulating
+           ;; forever — a target that could only ever be reached once is not a
+           ;; rolling budget.
+           (setf bitcoin-lisp.networking::*max-outbound-bytes-in-cycle* 12345
+                 bitcoin-lisp.networking::*max-outbound-cycle-start*
+                 (- (bitcoin-lisp.serialization:get-unix-time) 86401))
+           (bitcoin-lisp.networking::%record-outbound-cycle-bytes 7)
+           (is (= 7 bitcoin-lisp.networking::*max-outbound-bytes-in-cycle*))
+           ;; And accumulates within one cycle.
+           (bitcoin-lisp.networking::%record-outbound-cycle-bytes 3)
+           (is (= 10 bitcoin-lisp.networking::*max-outbound-bytes-in-cycle*)))
+      (setf bitcoin-lisp.networking::*max-upload-target* saved-target
+            bitcoin-lisp.networking::*max-outbound-cycle-start* saved-start
+            bitcoin-lisp.networking::*max-outbound-bytes-in-cycle* saved-bytes)))
+  ;; Every byte the node sends is counted, not just the ones a caller
+  ;; remembers to count: the accounting hangs off the single send-progress
+  ;; site, so this asserts the wiring rather than the arithmetic.
+  (is-true (member 'bitcoin-lisp.networking::%record-send-progress
+                   (mapcar #'car
+                           (sb-introspect:who-calls
+                            'bitcoin-lisp.networking::%record-outbound-cycle-bytes))))
+  ;; And the historical-block gate is consulted where blocks are served.
+  (is-true (member 'bitcoin-lisp.networking::handle-getdata
+                   (mapcar #'car
+                           (sb-introspect:who-calls
+                            'bitcoin-lisp.networking::outbound-target-reached-p))))
+  (is-true (bitcoin-lisp::known-config-option-p "maxuploadtarget"))
+  (is-false (bitcoin-lisp::core-only-option-p "maxuploadtarget")))
+
 (test p2p-config-knobs-take-effect
   "Track D's P2P group, the two options that map onto existing constants."
   (let ((saved (list bitcoin-lisp:+handshake-timeout-seconds+

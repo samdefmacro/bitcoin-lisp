@@ -88,6 +88,72 @@ pending — the pings themselves buffer up).")
 (defvar *total-bytes-received* 0
   "Total bytes read from all peer sockets since startup.")
 
+;;; -maxuploadtarget (Core nMaxOutboundLimit, net.h:1084 and net.cpp:3877-3941)
+;;;
+;;; A rolling 24-hour outbound budget. It never throttles the socket: it makes
+;;; the node stop SERVING the two expensive things Core stops serving — a
+;;; historical block and a whole-mempool dump — and disconnect the asker.
+
+(defconstant +max-upload-timeframe-seconds+ 86400
+  "The -maxuploadtarget cycle, 1 day (Core MAX_UPLOAD_TIMEFRAME, net.cpp:84).")
+
+(defconstant +max-block-serialized-bytes+ 4000000
+  "Core MAX_BLOCK_SERIALIZED_SIZE, the per-10-minute buffer the historical
+serving limit reserves so a node under target can still relay every new block.")
+
+(defvar *max-upload-target* 0
+  "Outbound byte budget per 24h, 0 = unlimited (Core -maxuploadtarget).")
+
+(defvar *max-outbound-cycle-start* 0
+  "Unix time the current 24h cycle began, 0 before the first byte is sent.")
+
+(defvar *max-outbound-bytes-in-cycle* 0
+  "Bytes sent so far in the current cycle (Core
+nMaxOutboundTotalBytesSentInCycle).")
+
+(defun %record-outbound-cycle-bytes (n)
+  "Account N sent bytes against the -maxuploadtarget cycle, rolling the cycle
+when it has expired (Core CConnman::RecordBytesSent, net.cpp:3855-3872).
+
+Counts unconditionally, even with no target set, so that turning a target on
+does not start from a cycle that pretends nothing has been sent."
+  (let ((now (bitcoin-lisp.serialization:get-unix-time)))
+    (when (or (zerop *max-outbound-cycle-start*)
+              (< (+ *max-outbound-cycle-start* +max-upload-timeframe-seconds+) now))
+      (setf *max-outbound-cycle-start* now
+            *max-outbound-bytes-in-cycle* 0))
+    (incf *max-outbound-bytes-in-cycle* n)))
+
+(defun max-outbound-time-left-in-cycle ()
+  "Seconds left in the current cycle, 0 with no target (Core
+GetMaxOutboundTimeLeftInCycle_)."
+  (cond ((zerop *max-upload-target*) 0)
+        ((zerop *max-outbound-cycle-start*) +max-upload-timeframe-seconds+)
+        (t (max 0 (- (+ *max-outbound-cycle-start* +max-upload-timeframe-seconds+)
+                     (bitcoin-lisp.serialization:get-unix-time))))))
+
+(defun outbound-target-bytes-left ()
+  "Bytes still available this cycle, 0 with no target (Core
+GetOutboundTargetBytesLeft)."
+  (if (zerop *max-upload-target*)
+      0
+      (max 0 (- *max-upload-target* *max-outbound-bytes-in-cycle*))))
+
+(defun outbound-target-reached-p (&optional historical-block-serving-limit)
+  "Whether the -maxuploadtarget budget is spent (Core OutboundTargetReached,
+net.cpp:3911-3930).
+
+HISTORICAL-BLOCK-SERVING-LIMIT reserves a buffer large enough to relay every
+block once for the rest of the cycle, so serving OLD blocks stops well before
+the hard limit and a node that is still following the tip can keep relaying it."
+  (cond ((zerop *max-upload-target*) nil)
+        (historical-block-serving-limit
+         (let ((buffer (* (floor (max-outbound-time-left-in-cycle) 600)
+                          +max-block-serialized-bytes+)))
+           (or (>= buffer *max-upload-target*)
+               (>= *max-outbound-bytes-in-cycle* (- *max-upload-target* buffer)))))
+        (t (>= *max-outbound-bytes-in-cycle* *max-upload-target*))))
+
 ;;; Shutdown coordination. Set by stop-node (via request-ibd-stop) when the
 ;;; process is shutting down. It lives in this first-loaded networking file so
 ;;; the low-level socket read (receive-bytes) can poll it: without that, a TERM
@@ -332,6 +398,7 @@ full write through the stream."
   "Account N bytes the kernel just accepted (Core m_last_send / nSendBytes)."
   (incf (connection-bytes-sent conn) n)
   (incf *total-bytes-sent* n)
+  (%record-outbound-cycle-bytes n)
   (setf (connection-last-activity conn) (get-universal-time)
         (connection-last-send-time conn) (get-universal-time)
         (connection-last-send-progress conn) (get-internal-real-time)))

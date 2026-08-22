@@ -616,6 +616,29 @@ is all digits after a single colon, so a bare IPv6 address is host-only
              (values (subseq v 0 colon) (parse-integer v :start (1+ colon)))
              (values v +default-proxy-port+)))))))
 
+(defun conf-parse-byte-units (value &optional (default-unit #\M))
+  "Core ParseByteUnits (common/args.cpp): a byte count with an optional
+[k|K|m|M|g|G|t|T] suffix, LOWERCASE being 1000-base and UPPERCASE 1024-base.
+DEFAULT-UNIT applies when there is no suffix — M for -maxuploadtarget, which is
+why a bare 100 there means 100 MiB and not 100 bytes. Pass #\B for Core's
+ByteUnit::NOOP, where a bare number is a byte count."
+  (let* ((v (string-trim '(#\Space #\Tab) value))
+         (last (and (plusp (length v)) (char v (1- (length v)))))
+         (suffixed (and last (find last "kKmMgGtT")))
+         (unit (if suffixed last default-unit))
+         (digits (if suffixed (subseq v 0 (1- (length v))) v))
+         (multiplier (ecase unit
+                       ;; Core's ByteUnit::NOOP, the default for every option
+                       ;; other than -maxuploadtarget.
+                       (#\B 1)
+                       (#\k 1000) (#\K 1024)
+                       (#\m (expt 1000 2)) (#\M (expt 1024 2))
+                       (#\g (expt 1000 3)) (#\G (expt 1024 3))
+                       (#\t (expt 1000 4)) (#\T (expt 1024 4)))))
+    (unless (and (plusp (length digits)) (every #'digit-char-p digits))
+      (error "Unable to parse byte amount: '~A'" value))
+    (* (parse-integer digits) multiplier)))
+
 (defun conf-parse-network-name (value)
   "Map an -onlynet VALUE to a network keyword (Core ParseNetwork,
 netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
@@ -639,7 +662,7 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
 (defparameter *repeatable-config-options*
   '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind"
     "testactivationheight" "debug" "debugexclude" "shutdownnotify"
-    "startupnotify")
+    "startupnotify" "connect")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -905,7 +928,7 @@ specially in config-alist->start-node-plist.")
     "maxtxfee" "fallbackfee" "bantime" "uacomment"
     "dustrelayfee" "incrementalrelayfee" "bytespersigop"
     "maxtipage" "maxsigcachesize" "fastprune" "blocksxor"
-    "peertimeout" "maxsendbuffer"
+    "peertimeout" "maxsendbuffer" "maxuploadtarget"
     "rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"
     "mintxfee" "discardfee" "consolidatefeerate" "maxapsfee" "txconfirmtarget"
     "walletrbf" "spendzeroconfchange" "walletrejectlongchains"
@@ -913,7 +936,7 @@ specially in config-alist->start-node-plist.")
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
-    "addnode" "rpcauth" "rpcallowip" "testactivationheight"
+    "addnode" "connect" "rpcauth" "rpcallowip" "testactivationheight"
     "debugexclude" "shutdownnotify" "startupnotify"
     ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, not the spec
     ;; scan, since each topic contributes two options and they produce a list
@@ -935,7 +958,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "avoidpartialspends" "blockreconstructionextratxn"
     "blocksdir" "blockversion" "capturemessages"
     "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
-    "checkmempool" "checkpoints" "connect" "daemon"
+    "checkmempool" "checkpoints" "daemon"
     "daemonwait" "dbbatchsize" "deprecatedrpc"
     "discover" "dns"
     "forcednsseed" "help" "i2pacceptincoming" "i2psam"
@@ -943,7 +966,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
     "loglevelalways" "logsourcelocations"
     "logtimestamps" "maxreceivebuffer"
-    "maxuploadtarget"
+
     "natpmp" "par" "peerbloomfilters" "persistmempool"
     "persistmempoolv1" "printpriority"
     "privatebroadcast" "rpcdoccheck"
@@ -1129,7 +1152,10 @@ resolved network. Honors -server (enable RPC on the default port when no
                         ;; Core reads both with GetArgs, so every occurrence
                         ;; runs (init.cpp:257-265 joins them all).
                         ("shutdownnotify" . :shutdown-notify)
-                        ("startupnotify"  . :startup-notify)))
+                        ("startupnotify"  . :startup-notify)
+                        ;; -connect: Core reads it with GetArgs and dials every
+                        ;; one as a MANUAL connection (net.cpp ThreadOpenConnections).
+                        ("connect"        . :connect-nodes)))
         (let ((values (loop for (k . v) in alist
                             when (string= k (car option))
                               collect v)))
@@ -1164,6 +1190,18 @@ resolved network. Honors -server (enable RPC on the default port when no
             ;; A port on -bind overrides -port for the listener, as it does in
             ;; Core, where the bind address carries its own port.
             (when port (setf (getf plist :port) port)))))
+      ;; -connect (any form, including -connect=0 / -noconnect) SOFT-SETS
+      ;; -dnsseed=0 and -listen=0 (Core init.cpp:777-784): "when only connecting
+      ;; to trusted nodes, do not seed via DNS, or listen by default". Soft, so
+      ;; an explicit -dnsseed=1 / -listen=1 still wins — which is what makes
+      ;; this a parameter INTERACTION rather than an override. Core applies the
+      ;; same interaction for -maxconnections<=0.
+      ;; (The -dnsseed half is applied in APPLY-CONFIG-GLOBALS, which owns
+      ;; *dns-seed-enabled*; only -listen reaches START-NODE through the plist.)
+      (when (or (lookup "connect")
+                (let ((m (getf plist :max-connections))) (and m (<= m 0))))
+        (unless (lookup "listen")
+          (setf (getf plist :listen) nil)))
       ;; -debug also raises the log level, because a category's lines are
       ;; emitted at debug level: enabling a category without raising the level
       ;; turns on a switch that changes nothing. An explicit -loglevel wins.
@@ -1368,6 +1406,13 @@ start-node-from-args."
           (unless (and n (plusp n))
             (error "Invalid value for -bytespersigop=~A (must be a positive integer)" v))
           (setf bitcoin-lisp.mempool::+bytes-per-sigop+ n))))
+    ;; -maxuploadtarget: the 24h outbound budget. Core parses it with
+    ;; ParseByteUnits defaulting to M, so a bare number is MEBIbytes — reading
+    ;; it as bytes would silence the option on every ordinary command line.
+    (let ((v (lk "maxuploadtarget")))
+      (when v
+        (setf bitcoin-lisp.networking::*max-upload-target*
+              (conf-parse-byte-units v))))
     ;; -peertimeout: seconds a peer has to complete the version handshake
     ;; (Core DEFAULT_PEER_CONNECT_TIMEOUT, net.h:87).
     (let ((v (lk "peertimeout")))
@@ -1442,7 +1487,15 @@ start-node-from-args."
           (setf bitcoin-lisp.serialization:*user-agent* subversion))))
     ;; -dnsseed / -fixedseeds: peer-discovery source gates (Core net.h:96-97).
     (let ((v (lk "dnsseed")))
-      (when v (setf *dns-seed-enabled* (conf-parse-bool v))))
+      (cond (v (setf *dns-seed-enabled* (conf-parse-bool v)))
+            ;; The other half of the -connect interaction above: with only
+            ;; trusted nodes to dial (or connections disabled outright) there is
+            ;; nothing for a DNS seed to feed. Soft — an explicit -dnsseed=1 is
+            ;; the branch above and still wins.
+            ((or (lk "connect")
+                 (let ((m (lk "maxconnections")))
+                   (and m (<= (conf-parse-int m) 0))))
+             (setf *dns-seed-enabled* nil))))
     (let ((v (lk "fixedseeds")))
       (when v (setf *fixed-seeds-enabled* (conf-parse-bool v))))
     ;; -stopatheight: shut down once the tip reaches this height (Core
