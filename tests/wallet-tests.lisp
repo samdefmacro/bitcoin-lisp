@@ -1213,6 +1213,62 @@ second call with sign=true (default) completes it."
         (is (eq t (%aval "complete" signed)))
         (is (stringp (%aval "hex" signed)))))))
 
+(test pp-walletprocesspsbt-attaches-non-witness-utxo
+  "Core FillPSBT (wallet.cpp:2201-2212) attaches the full previous transaction
+whenever an input lacks non_witness_utxo — a witness_utxo already present does
+not suppress it, because a hardware signer needs the full transaction to
+authenticate a segwit v0 input's amount. Before the fix an imported PSBT that
+carried only witness_utxo was never upgraded, so Trezor/Ledger/Coldcard refused
+to cosign it. The v0 inputs here also pin RemoveUnnecessaryTransactions
+(psbt.cpp:514-549): with a segwit-v0 input present nothing may be dropped."
+  (%with-pp-node (node "pp-nwutxo")
+    (%pp-fund-wallet node)
+    (let* ((bitcoin-lisp.rpc::*wallet-rng* (bitcoin-lisp.rpc::make-wrng 17))
+           (dest (%pp-optrue-address))
+           (b64 (%aval "psbt" (bitcoin-lisp.rpc::rpc-walletcreatefundedpsbt
+                               node (list '() (list (%ht dest 1)) 0 (%ht "fee_rate" 5)))))
+           (psbt (bitcoin-lisp.serialization:decode-psbt b64)))
+      ;; Strip every non_witness_utxo, as an external creator that only
+      ;; supplied witness_utxo would have left it.
+      (loop for m across (bitcoin-lisp.serialization:psbt-inputs psbt)
+            do (is-true (bitcoin-lisp.serialization:psbt-map-find
+                         m bitcoin-lisp.serialization:+psbt-in-witness-utxo+))
+               (bitcoin-lisp.serialization:psbt-map-remove-type
+                m bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))
+      (let* ((stripped (bitcoin-lisp.serialization:encode-psbt psbt))
+             (filled (bitcoin-lisp.rpc::rpc-walletprocesspsbt
+                      node (list stripped bitcoin-lisp.rpc:+json-false+ nil nil
+                                 bitcoin-lisp.rpc:+json-false+)))
+             (out (bitcoin-lisp.serialization:decode-psbt (%aval "psbt" filled))))
+        (loop for m across (bitcoin-lisp.serialization:psbt-inputs out)
+              do (is-true (bitcoin-lisp.serialization:psbt-map-find
+                           m bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+)
+                          "non_witness_utxo attached from the wallet"))
+        ;; And the attached copy is the AUTHENTICATED one: with a lying
+        ;; witness_utxo present, the amount the signer sees comes from the
+        ;; wallet's own previous transaction, not the counterparty's TxOut
+        ;; (GA9 S2-14's fee-spoofing path, now closed from both sides).
+        (loop for m across (bitcoin-lisp.serialization:psbt-inputs out)
+              for in across (bitcoin-lisp.serialization:transaction-inputs
+                             (bitcoin-lisp.serialization:psbt-tx out))
+              do (let ((real (bitcoin-lisp.serialization:tx-out-value
+                              (bitcoin-lisp.rpc::%psbt-input-prevout m in))))
+                   (is (plusp real))
+                   ;; Overwrite witness_utxo with a 1-sat lie; the resolved
+                   ;; prevout must not move.
+                   (bitcoin-lisp.serialization:psbt-map-set
+                    m bitcoin-lisp.serialization:+psbt-in-witness-utxo+
+                    (make-array 0 :element-type '(unsigned-byte 8))
+                    (flexi-streams:with-output-to-sequence (s)
+                      (bitcoin-lisp.serialization::write-tx-out
+                       s (bitcoin-lisp.serialization:make-tx-out
+                          :value 1 :script-pubkey
+                          (bitcoin-lisp.serialization:tx-out-script-pubkey
+                           (bitcoin-lisp.rpc::%psbt-input-prevout m in))))))
+                   (is (= real (bitcoin-lisp.serialization:tx-out-value
+                                (bitcoin-lisp.rpc::%psbt-input-prevout m in)))
+                       "authenticated non_witness_utxo still wins")))))))
+
 (test pp-bumpfee-rbf-chain
   "bumpfee rebuilds a higher-feerate replacement re-spending ALL original inputs,
 signs + broadcasts it (RBF-evicting the original), records replaced_by_txid, and
