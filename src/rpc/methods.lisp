@@ -591,7 +591,12 @@ accepted but ignored."
                                  (%mempool-view-coin mempool txid-bytes vout)))))))
       (if entry
           (let* ((chain-state (rpc-get-chain-state node))
-                 (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+                 ;; The COINS VIEW's own best block, not the chain tip: they
+                 ;; differ partway through a reorg's disconnect phase, and Core
+                 ;; reports the view's (rpc/blockchain.cpp:1083). Falls back to
+                 ;; the tip for a view that tracks no pointer.
+                 (best-hash (or (bitcoin-lisp.storage:coins-view-best-block utxo-set)
+                                (bitcoin-lisp.storage:best-block-hash chain-state)))
                  (height (bitcoin-lisp.storage:current-height chain-state))
                  (utxo-height (bitcoin-lisp.storage:utxo-entry-height entry))
                  (spk (bitcoin-lisp.storage:utxo-entry-script-pubkey entry))
@@ -2456,6 +2461,17 @@ function of (format-string &rest args) that must signal."
                (funcall fail "Bad snapshot content hash: expected ~A, got ~A"
                         (hash-to-hex want) (hash-to-hex got))))
            ;; Verified: finalize and adopt.
+           ;;
+           ;; Stamp the coins DB with the block these coins ARE, in the coins
+           ;; DB itself. Core does this with coins_cache.SetBestBlock(
+           ;; base_blockhash) plus a FORCE_FLUSH (validation.cpp:5889, :5963).
+           ;; Without it the snapshot chainstate sits outside the invariant the
+           ;; coins-DB work established — that the best-block pointer travels
+           ;; in the same batch as the coins — so a crash after adoption leaves
+           ;; a populated database claiming no block at all, and the startup
+           ;; comparison of the two records has nothing to compare.
+           (setf (bitcoin-lisp.storage::cvc-best-block view) (copy-seq base-hash))
+           (bitcoin-lisp.storage:coins-view-cache-flush view :sync t)
            (bitcoin-lisp.storage:update-chain-tip snap base-hash base-height)
            (bitcoin-lisp.storage:write-snapshot-base-blockhash snap)
            (bitcoin-lisp.storage:save-state snap)
@@ -4777,7 +4793,13 @@ coinstatsindex (Core's use_index path)."
       (return-from rpc-gettxoutsetinfo
         (%gettxoutsetinfo-from-index node hash-type hash-or-height)))
     (let* ((height (bitcoin-lisp.storage:current-height chain-state))
-           (best-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+           ;; The COINS VIEW's own best block, as Core reports
+           ;; (rpc/blockchain.cpp:1083). hash_serialized_3 IS the assumeutxo
+           ;; commitment, so hashing one set of coins and labelling it with a
+           ;; different block's hash commits to nothing — and the two genuinely
+           ;; differ partway through a reorg's disconnect phase.
+           (best-hash (or (bitcoin-lisp.storage:coins-view-best-block utxo-set)
+                          (bitcoin-lisp.storage:best-block-hash chain-state)))
            (txout-count (bitcoin-lisp.storage:utxo-count utxo-set))
            (tx-count (bitcoin-lisp.storage:utxo-set-distinct-txids utxo-set))
            (total-satoshis (bitcoin-lisp.storage:utxo-set-total-amount utxo-set))
