@@ -1058,3 +1058,48 @@ reads, which also lets the migration retry it."
          (is (= 1 (bitcoin-lisp.storage:count-legacy-blocks store))
              "and the index must point back at it, so the migration can retry")
          (is-true (funcall real store victim)))))))
+
+(test pruneblockchain-prunes-a-flat-file
+  "The MANUAL prune entry point had the same seam the automatic one has a test
+for, and failed it: every block went to PRUNE-BLOCK, which refuses for a flat
+record and returns NIL, so pruneblockchain reported success and freed nothing.
+Core's FindFilesToPruneManual selects whole FILES whose last height is at or
+below the target (node/blockstorage.cpp:292-319).
+
+This is what blocked rolling the flat format out to the pruned mainnet node:
+its operator would have had a -prune node that silently stopped reclaiming."
+  (%with-mainnet-network
+   (%with-flat-dir (dir)
+     (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+            (store (bitcoin-lisp.storage:init-block-store dir))
+            (cs (bitcoin-lisp.storage:init-chain-state dir))
+            (genesis (bitcoin-lisp.storage:best-block-hash cs))
+            (prev (bitcoin-lisp.storage:make-block-index-entry
+                   :hash genesis :height 0 :chain-work 1 :status :valid)))
+       (bitcoin-lisp.storage:add-block-index-entry cs prev)
+       (let ((tip-height (+ bitcoin-lisp:+min-blocks-to-keep+ 40)))
+         (loop for h from 1 to 3
+               do (let* ((b (%ff-test-block (+ 210 h)))
+                         (hash (bitcoin-lisp.storage:store-block store b :height h))
+                         (entry (bitcoin-lisp.storage:make-block-index-entry
+                                 :hash hash :height h :chain-work (1+ h)
+                                 :status :valid :prev-entry prev)))
+                    (bitcoin-lisp.storage:add-block-index-entry cs entry)
+                    (setf prev entry)))
+         (bitcoin-lisp.storage:update-chain-tip
+          cs (bitcoin-lisp.storage:block-index-entry-hash prev) tip-height)
+         (is (probe-file (merge-pathnames "blocks/blk00000.dat" dir)))
+         ;; Manual pruning works at any -prune target, unlike the automatic
+         ;; path which is off below 550 MiB.
+         (let ((bitcoin-lisp:*prune-target-mib* 1)
+               (bitcoin-lisp:*prune-after-height* 0)
+               (swept '()))
+           (let ((pruned (bitcoin-lisp.storage:prune-blocks-to-height
+                          store cs 3 :on-prune (lambda (h) (push h swept)))))
+             (is (= 3 pruned) "the file's three blocks were not pruned"))
+           (is-false (probe-file (merge-pathnames "blocks/blk00000.dat" dir))
+                     "pruneblockchain left the flat file on disk")
+           (is (>= (length swept) 3)
+               "each pruned block must be reported so its undo data goes too")
+           (is (= 3 (bitcoin-lisp.storage::chain-state-pruned-height cs))
+               "the prune horizon did not advance to the file's last height")))))))
