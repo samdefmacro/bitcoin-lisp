@@ -269,7 +269,7 @@ already know it -- and marks the source + targets in their known-addrs sets."
   (let* ((source (bitcoin-lisp.networking:make-peer :state :ready :address "9.9.9.9:8333"))
          (full (loop for i below 4
                      collect (bitcoin-lisp.networking:make-peer
-                              :state :ready
+                              :state :ready :addr-relay-enabled t
                               :address (format nil "1.1.1.~D:8333" i))))
          (br (bitcoin-lisp.networking:make-peer :state :ready :conn-type :block-relay))
          (peers (append (list source br) full))
@@ -411,3 +411,41 @@ frozen for a day. Guard against 'helpfully' routing it through the cache."
         (let ((body (subseq src start (min (length src) (+ start 2000)))))
           (is (null (search "cached-getaddr-response" body))
               "getnodeaddresses must not use the getaddr cache"))))))
+
+(test relay-address-skips-peers-without-addr-relay
+  "Core RelayAddress (net_processing.cpp:2311) gossips only to peers with
+address relay set up: an inbound peer that never sent addr/getaddr — so
+SetupAddressRelay never ran for it — receives nothing, even though it relays
+transactions."
+  (let* ((source (bitcoin-lisp.networking:make-peer :state :ready :address "9.9.9.9:8333"))
+         (with (bitcoin-lisp.networking:make-peer :state :ready :addr-relay-enabled t
+                                                   :address "1.1.1.1:8333"))
+         (without (bitcoin-lisp.networking:make-peer :state :ready
+                                                      :address "1.1.1.2:8333"))
+         (pa (%make-test-peer-address 8 0 0 0 8333))
+         (key (bitcoin-lisp.networking::%addr-gossip-key pa)))
+    (is (= 1 (bitcoin-lisp.networking::relay-address pa source (list source with without))))
+    (is-true (bitcoin-lisp:recent-reject-p
+              (bitcoin-lisp.networking:peer-known-addrs with) key))
+    (is-false (bitcoin-lisp:recent-reject-p
+               (bitcoin-lisp.networking:peer-known-addrs without) key))))
+
+(test feefilter-above-max-money-is-ignored
+  "Core applies a feefilter only when MoneyRange(newFeeFilter)
+(net_processing.cpp:5126); a rate above MAX_MONEY is ignored rather than
+stored, where it would silently suppress every announcement to the peer."
+  (let ((peer (bitcoin-lisp.networking:make-peer :state :ready :address "1.1.1.3:8333"))
+        (ok (%message-payload (bitcoin-lisp.serialization:make-feefilter-message 1000)))
+        (absurd (%message-payload (bitcoin-lisp.serialization:make-feefilter-message
+                                   (1+ bitcoin-lisp.validation:+max-money+)))))
+    (bitcoin-lisp.networking::handle-message peer "feefilter" ok nil nil nil)
+    (is (= 1000 (bitcoin-lisp.networking:peer-feefilter-rate peer)))
+    (bitcoin-lisp.networking::handle-message peer "feefilter" absurd nil nil nil)
+    (is (= 1000 (bitcoin-lisp.networking:peer-feefilter-rate peer)))))
+
+(test automatic-inbound-capacity-follows-core
+  "Core CConnman::Init (net.h:1110-1113): -maxconnections is the automatic
+total; inbound = total - (full-relay + block-relay-only + feeler), floored at 0."
+  (is (= 114 (bitcoin-lisp::automatic-inbound-capacity 125 8)))
+  (is (= 5 (bitcoin-lisp::automatic-inbound-capacity 16 8)))
+  (is (= 0 (bitcoin-lisp::automatic-inbound-capacity 8 8))))

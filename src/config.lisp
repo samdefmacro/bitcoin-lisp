@@ -838,7 +838,7 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ("coinstatsindex"    :coinstatsindex     :bool)
     ("prune"             :prune              :int)
     ("dbcache"           :dbcache-mib        :int)
-    ("maxconnections"    :max-peers          :int)
+    ("maxconnections"    :max-connections    :int)
     ("rpcport"           :rpc-port           :int)
     ("rpcbind"           :rpc-bind           :string)
     ("rpcuser"           :rpc-user           :string)

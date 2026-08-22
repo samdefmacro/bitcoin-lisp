@@ -66,9 +66,9 @@ Core's -port only moves the listening/advertised side."
 (defvar *mainnet-relay-enabled* nil
   "Whether transaction relay is enabled on mainnet. Default NIL for safety.")
 
-(defconstant +max-inbound-peers+ 64
-  "Maximum number of inbound peers to keep (Bitcoin Core allows 125 by default;
-we cap lower). Excess inbound connections are disconnected at merge time.")
+(defvar *max-inbound-connections* 114
+  "Inbound connections we keep (excess are disconnected at merge time). Set by
+start-node via automatic-inbound-capacity; the default is Core's 125 - 11.")
 
 ;;;; Node State
 
@@ -520,7 +520,7 @@ For testnet, data stays at the base directory (backward compatible)."
 
 (defun merge-inbound-peers (node)
   "Move handshaked inbound peers from the lock-guarded hand-off list into the
-node's peer list (capped at +max-inbound-peers+; excess are disconnected). Called
+node's peer list (capped at *max-inbound-connections*; excess are disconnected). Called
 by the sync thread, so PEERS stays single-writer."
   (let ((pending (bt:with-recursive-lock-held ((node-lock node))
                    (prog1 (node-pending-inbound-peers node)
@@ -531,7 +531,7 @@ by the sync thread, so PEERS stays single-writer."
     (dolist (peer pending)
       (bt:with-recursive-lock-held ((node-lock node))
         (cond
-          ((< (count-inbound-peers node) +max-inbound-peers+)
+          ((< (count-inbound-peers node) *max-inbound-connections*)
            (push peer (node-peers node)))
           ;; At capacity: a discouraged existing inbound peer is preferred for
           ;; eviction (Bitcoin Core), so make room for the newcomer if we can.
@@ -665,7 +665,7 @@ address is dropped only when the inbound slots are (almost) full; and no
 connection is admitted while the hand-off queue is already full. Returns T,
 or (VALUES NIL REASON) when the connection must be dropped.
 
-The backlog arm matters because +MAX-INBOUND-PEERS+ is otherwise enforced only
+The backlog arm matters because *MAX-INBOUND-CONNECTIONS* is otherwise enforced only
 at MERGE time, by the sync thread. Accepted peers hold a socket while they wait
 in PENDING-INBOUND-PEERS, so anything that stalls that thread turns every new
 connection into a leaked descriptor — the live wedge of 2026-08-16 accumulated
@@ -678,12 +678,12 @@ twice the inbound cap no matter what the rest of the node is doing."
      (values nil :banned))
     ((>= (bt:with-recursive-lock-held ((node-lock node))
            (length (node-pending-inbound-peers node)))
-         +max-inbound-peers+)
+         *max-inbound-connections*)
      (values nil :backlog))
     ((and (bitcoin-lisp.networking:peer-discouraged-p host)
           (>= (1+ (bt:with-recursive-lock-held ((node-lock node))
                     (count-inbound-peers node)))
-              +max-inbound-peers+))
+              *max-inbound-connections*))
      (values nil :discouraged))
     (t t)))
 
@@ -2024,6 +2024,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (reindex nil)
                         (console-log t)
                         (max-peers 8)
+                        (max-connections 125)
                         (sync t)
                         (txindex nil)
                         (blockfilterindex nil)
@@ -2060,7 +2061,10 @@ NETWORK: :testnet3 or :mainnet
 LOG-LEVEL: :debug, :info, :warn, or :error
 LOG-FILE: If non-nil, also append node logs to this path (in addition to console)
 CONSOLE-LOG: If T (default), mirror logs to *standard-output* / REPL
-MAX-PEERS: Maximum number of peer connections
+MAX-PEERS: outbound full-relay connections (Core's 8)
+MAX-CONNECTIONS: Core -maxconnections, the automatic connection total (default
+  125); inbound capacity is what remains after MAX-PEERS, the block-relay-only
+  and the feeler slots
 SYNC: If T, start syncing immediately
 TXINDEX: If T, enable transaction index for getrawtransaction lookups
 BLOCKFILTERINDEX: If T, enable the BIP158 basic block filter index (getblockfilter,
@@ -2158,6 +2162,9 @@ Returns the node instance."
   ;; Initialize node
   (setf *node* (init-node data-directory :network network :log-level log-level))
   (setf (node-max-peers *node*) max-peers)
+  ;; Core -maxconnections is the automatic TOTAL (net.h:81); MAX-PEERS stays
+  ;; the outbound full-relay count and the remainder is inbound capacity.
+  (setf *max-inbound-connections* (automatic-inbound-capacity max-connections max-peers))
   ;; -blocksonly: reject transactions from network peers (Core
   ;; ignore_incoming_txs). Always assigned so a fresh start-node never
   ;; inherits a stale value from a previous run.
@@ -4556,7 +4563,7 @@ Returns the number of new peers connected."
   ;; free for an attacker to make, so letting them satisfy the outbound
   ;; target is an eclipse primitive — 8 attacker inbounds previously
   ;; suppressed dialing any honest outbound replacement here. The inbound
-  ;; population has its own separate cap (+max-inbound-peers+, enforced at
+  ;; population has its own separate cap (*max-inbound-connections*, enforced at
   ;; merge time in merge-inbound-peers). Block-relay-only peers are a
   ;; separate additive pool maintained by maintain-block-relay-peers (Core
   ;; keeps m_max_outbound_block_relay distinct from
@@ -4701,6 +4708,18 @@ then keep every \"add\" peer connected. Honors network-active."
   "Dedicated block-relay-only outbound slots (Bitcoin Core opens 2). They carry
 blocks/headers but no tx relay -- anti-partition insurance and the source of
 reconnection anchors.")
+
+(defun automatic-inbound-capacity (max-connections max-outbound-full-relay)
+  "Core CConnman::Init (net.h:1110-1113): inbound capacity is the automatic
+connection total less the automatic outbound slots — MAX-OUTBOUND-FULL-RELAY,
+the block-relay-only slots (clamped to what remains, as Core clamps them) and
+one feeler — never negative. MAX-OUTBOUND-FULL-RELAY is our :max-peers, which
+is this node's m_max_outbound_full_relay and is deliberately NOT clamped to
+Core's min(8, total): it is an operator knob here (run-node.sh sets 16)."
+  (let* ((block-relay (max 0 (min +target-block-relay-peers+
+                                  (- max-connections max-outbound-full-relay))))
+         (feeler 1))
+    (max 0 (- max-connections max-outbound-full-relay block-relay feeler))))
 
 (defconstant +feeler-interval-seconds+ 120
   "Minimum spacing between feeler probes (Core FEELER_INTERVAL averages ~2 min).")

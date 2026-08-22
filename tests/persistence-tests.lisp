@@ -794,30 +794,30 @@ even a header. Each must be distinguishable from absence."
 
 ;;;; Peer Health Monitoring Tests
 
-(test peer-health-consecutive-failures
-  "Peer should be disconnected after 3 consecutive ping failures."
-  (let ((peer (bitcoin-lisp.networking:make-peer)))
-    (setf (bitcoin-lisp.networking:peer-state peer) :ready)
-    ;; Simulate 3 ping failures
-    (is (= 0 (bitcoin-lisp.networking:peer-consecutive-ping-failures peer)))
-    (setf (bitcoin-lisp.networking:peer-consecutive-ping-failures peer) 2)
-    ;; One more failure means disconnect
-    (incf (bitcoin-lisp.networking:peer-consecutive-ping-failures peer))
-    (is (>= (bitcoin-lisp.networking:peer-consecutive-ping-failures peer)
-            bitcoin-lisp.networking:+max-ping-failures+))))
-
-(test peer-pong-resets-failures
-  "Receiving a pong should reset the failure counter."
-  (let ((peer (bitcoin-lisp.networking:make-peer)))
-    (setf (bitcoin-lisp.networking:peer-state peer) :ready)
-    (setf (bitcoin-lisp.networking:peer-consecutive-ping-failures peer) 2)
-    ;; Set up a matching ping/pong
-    (setf (bitcoin-lisp.networking::peer-ping-nonce peer) 12345)
-    (setf (bitcoin-lisp.networking::peer-last-ping-time peer) (get-internal-real-time))
-    ;; Handle matching pong
-    (bitcoin-lisp.networking::handle-pong peer 12345)
-    ;; Failures should be reset
-    (is (= 0 (bitcoin-lisp.networking:peer-consecutive-ping-failures peer)))))
+(test peer-health-ping-follows-core
+  "Core MaybeSendPing (net_processing.cpp:5487-5510): pings every PING_INTERVAL
+(2 min) while none is outstanding; an outstanding ping is never replaced, and
+one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
+  (is (= 120 bitcoin-lisp.networking::+ping-interval-seconds+))
+  (is (= 1200 bitcoin-lisp.networking::+ping-timeout-seconds+))
+  (flet ((peer-with-ping (age-seconds &key (nonce 7))
+           (let ((peer (bitcoin-lisp.networking:make-peer :state :ready)))
+             (setf (bitcoin-lisp.networking::peer-ping-nonce peer) nonce
+                   (bitcoin-lisp.networking::peer-last-ping-time peer)
+                   (- (get-internal-real-time)
+                      (* age-seconds internal-time-units-per-second)))
+             peer)))
+    ;; Outstanding for 100 s: left alone — no new ping, no disconnect.
+    (let ((peer (peer-with-ping 100)))
+      (is (eq :ok (bitcoin-lisp.networking:check-peer-health peer)))
+      (is (= 7 (bitcoin-lisp.networking::peer-ping-nonce peer))))
+    ;; Outstanding for 1201 s: disconnect on the first timeout, no retry count.
+    (is (eq :disconnect (bitcoin-lisp.networking:check-peer-health
+                         (peer-with-ping 1201))))
+    ;; A pong clears the outstanding ping.
+    (let ((peer (peer-with-ping 1)))
+      (bitcoin-lisp.networking::handle-pong peer 7)
+      (is (null (bitcoin-lisp.networking::peer-ping-nonce peer))))))
 
 ;;;; Misbehavior Tests (binary model — Bitcoin Core PRs #25325 / #26294)
 
