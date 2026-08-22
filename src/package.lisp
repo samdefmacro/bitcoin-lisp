@@ -1114,6 +1114,7 @@
    #:validate-block-header
    #:validate-block
    #:test-block-validity
+   #:stop-script-check-pool
    #:validate-block-scripts
    #:find-witness-commitment
    #:validate-witness-commitment

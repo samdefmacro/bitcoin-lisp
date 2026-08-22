@@ -49,6 +49,59 @@
      :outputs (vector output)
      :lock-time 0)))
 
+(test script-check-pool-is-persistent-and-reusable
+  "Core keeps ONE CCheckQueue for the life of the process (checkqueue.h) and
+hands it batches; ours spawned a fresh thread per worker PER BLOCK. At one
+block per ten minutes that is invisible; during IBD it is a thread creation per
+block.
+
+The properties that matter are reuse and RECOVERY: a batch that fails must not
+poison the next one, and a worker that errors must count as a failure rather
+than leaving the master waiting forever on a TODO that never reaches zero."
+  (let ((pool (bitcoin-lisp.validation::ensure-script-check-pool 4)))
+    (is-true pool)
+    ;; The SAME pool comes back, threads and all — that is what "persistent"
+    ;; means and what the per-block spawn was not.
+    (is (eq pool (bitcoin-lisp.validation::ensure-script-check-pool 4)))
+    (is (= 4 (length (bitcoin-lisp.validation::script-check-pool-threads pool))))
+    (is-true (bitcoin-lisp.validation::run-script-checks
+              pool (loop repeat 50 collect (lambda () t))))
+    ;; One failure among many fails the batch.
+    (is-false (bitcoin-lisp.validation::run-script-checks
+               pool (append (loop repeat 20 collect (lambda () t))
+                            (list (lambda () nil))
+                            (loop repeat 20 collect (lambda () t)))))
+    ;; And the pool is usable again immediately: a failed batch that left
+    ;; `failed` set would make every later block fail script validation.
+    (is-true (bitcoin-lisp.validation::run-script-checks
+              pool (loop repeat 30 collect (lambda () t))))
+    ;; An empty batch is trivially true rather than a wait on TODO=0 that
+    ;; nothing will ever signal.
+    (is-true (bitcoin-lisp.validation::run-script-checks pool nil))
+    ;; A worker that ERRORS counts as a failure. Without the handler the
+    ;; thread would die mid-item, TODO would never reach zero, and the master
+    ;; would wait forever — a hung node, not a rejected block.
+    (is-false (bitcoin-lisp.validation::run-script-checks
+               pool (list (lambda () (error "deliberate")))))
+    (is-true (bitcoin-lisp.validation::run-script-checks
+              pool (loop repeat 10 collect (lambda () t)))
+             "the pool did not recover from a worker error")
+    ;; Every item runs exactly once — the master participates in the same
+    ;; queue as the workers, so double-execution is a live possibility.
+    (let* ((n 200)
+           (counter (list 0))
+           (lock (bt:make-lock "count")))
+      (is-true (bitcoin-lisp.validation::run-script-checks
+                pool (loop repeat n
+                           collect (lambda ()
+                                     (bt:with-lock-held (lock)
+                                       (incf (first counter)))
+                                     t))))
+      (is (= n (first counter))
+          "~D items ran ~D times" n (first counter)))
+    (bitcoin-lisp.validation:stop-script-check-pool)
+    (is-false bitcoin-lisp.validation::*script-check-pool*)))
+
 (test par-follows-cores-semantics
   "Core's -par (init.cpp): 0 means one worker per core, a NEGATIVE value leaves
 that many cores free, and the result is clamped to MAX_SCRIPTCHECK_THREADS.

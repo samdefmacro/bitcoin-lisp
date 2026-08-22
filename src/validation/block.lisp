@@ -806,6 +806,143 @@ written concurrently."
                (return-from validate-tx-scripts nil))
           finally (return t))))
 
+
+;;;; Persistent script-check worker pool (Core CCheckQueue, checkqueue.h)
+;;;;
+;;;; Core keeps ONE pool for the life of the process and hands it batches;
+;;;; ours used to spawn +parallel-validation-workers+ fresh threads PER BLOCK.
+;;;; At one block per ten minutes that is invisible, but during IBD it is a
+;;;; thread creation per block, and thread creation in SBCL is not cheap.
+;;;;
+;;;; The unit of work here is a whole TRANSACTION rather than Core's individual
+;;;; CScriptCheck. That is a deliberate simplification: our validator is
+;;;; per-transaction, and a finer unit would mean restructuring the interpreter
+;;;; entry point for a granularity gain that only matters for blocks with a few
+;;;; enormous transactions.
+
+(defstruct (script-check-pool (:constructor %make-script-check-pool))
+  "A persistent set of worker threads processing transaction-validation items."
+  (lock (bt:make-lock "script-check-pool"))
+  (work-cv (bt:make-condition-variable))
+  (done-cv (bt:make-condition-variable))
+  (queue '() :type list)
+  ;; Items neither finished nor abandoned — queued OR in a worker's hands. The
+  ;; master waits for this to reach zero, so counting only the QUEUE would let
+  ;; it return while a worker was still verifying.
+  (todo 0 :type fixnum)
+  (failed nil)
+  (threads '() :type list)
+  (stop nil))
+
+(defvar *script-check-pool* nil
+  "The process-wide pool, created on first use. NIL when parallel validation
+has never run, which is the default.")
+
+(defvar *script-check-pool-lock* (bt:make-lock "script-check-pool-init")
+  "Guards creation of *SCRIPT-CHECK-POOL* so two threads cannot each build one.")
+
+(defun %wake-all-workers (pool)
+  "Wake every worker. This bordeaux-threads exports CONDITION-NOTIFY but NOT
+CONDITION-BROADCAST, so \"all\" is one notify per thread; a single notify would
+wake one worker and leave the rest asleep on a full queue."
+  (dotimes (i (max 1 (length (script-check-pool-threads pool))))
+    (bt:condition-notify (script-check-pool-work-cv pool))))
+
+(defun %script-check-worker (pool)
+  "One worker's loop: take an item, run it, account for it. Never signals out —
+a worker that died would leave TODO permanently above zero and hang the master
+on the next block."
+  (loop
+    (let ((item nil))
+      (bt:with-lock-held ((script-check-pool-lock pool))
+        (loop until (or (script-check-pool-stop pool)
+                        (script-check-pool-queue pool))
+              do (bt:condition-wait (script-check-pool-work-cv pool)
+                                    (script-check-pool-lock pool)))
+        (when (script-check-pool-stop pool)
+          (return))
+        (setf item (pop (script-check-pool-queue pool))))
+      (let ((ok (handler-case
+                    ;; Once the batch has failed there is nothing to learn from
+                    ;; the rest of it; drain without working so the master is
+                    ;; not kept waiting on doomed verifications.
+                    (if (script-check-pool-failed pool)
+                        t
+                        (funcall item))
+                  (error (e)
+                    (bitcoin-lisp:log-error "script-check worker: ~A" e)
+                    nil))))
+        (bt:with-lock-held ((script-check-pool-lock pool))
+          (unless ok (setf (script-check-pool-failed pool) t))
+          (when (zerop (decf (script-check-pool-todo pool)))
+            (bt:condition-notify (script-check-pool-done-cv pool))))))))
+
+(defun ensure-script-check-pool (n-workers)
+  "The process-wide pool, creating it with N-WORKERS threads on first use.
+
+Created lazily rather than at startup: parallel validation is default-off, and
+a node that never enables it should not carry idle threads."
+  (bt:with-lock-held (*script-check-pool-lock*)
+    (or *script-check-pool*
+        (let ((pool (%make-script-check-pool)))
+          (setf (script-check-pool-threads pool)
+                (loop for i below n-workers
+                      collect (bt:make-thread
+                               (lambda () (%script-check-worker pool))
+                               :name (format nil "script-check-~D" i))))
+          (setf *script-check-pool* pool)))))
+
+(defun stop-script-check-pool ()
+  "Stop the workers and drop the pool (node shutdown)."
+  (bt:with-lock-held (*script-check-pool-lock*)
+    (let ((pool *script-check-pool*))
+      (when pool
+        (bt:with-lock-held ((script-check-pool-lock pool))
+          (setf (script-check-pool-stop pool) t)
+          (%wake-all-workers pool))
+        (dolist (th (script-check-pool-threads pool))
+          (ignore-errors (bt:join-thread th)))
+        (setf *script-check-pool* nil)
+        t))))
+
+(defun run-script-checks (pool items)
+  "Run ITEMS (a list of thunks) on POOL and return T when every one succeeded.
+
+The CALLER participates, as Core's master thread does (checkqueue.h's fMaster):
+it takes work from the same queue rather than blocking immediately, so a
+single-worker pool still uses two cores and the master is never idle while work
+remains.
+
+One batch at a time — the caller holds the validation thread, and there is only
+ever one block being connected."
+  (let ((n (length items)))
+    (when (zerop n) (return-from run-script-checks t))
+    (bt:with-lock-held ((script-check-pool-lock pool))
+      (setf (script-check-pool-queue pool) items
+            (script-check-pool-todo pool) n
+            (script-check-pool-failed pool) nil)
+      (%wake-all-workers pool))
+    ;; Master participation.
+    (loop
+      (let ((item nil))
+        (bt:with-lock-held ((script-check-pool-lock pool))
+          (setf item (pop (script-check-pool-queue pool))))
+        (unless item (return))
+        (let ((ok (handler-case (if (script-check-pool-failed pool) t (funcall item))
+                    (error (e)
+                      (bitcoin-lisp:log-error "script-check master: ~A" e)
+                      nil))))
+          (bt:with-lock-held ((script-check-pool-lock pool))
+            (unless ok (setf (script-check-pool-failed pool) t))
+            (when (zerop (decf (script-check-pool-todo pool)))
+              (bt:condition-notify (script-check-pool-done-cv pool)))))))
+    ;; Wait for whatever the workers still hold.
+    (bt:with-lock-held ((script-check-pool-lock pool))
+      (loop until (zerop (script-check-pool-todo pool))
+            do (bt:condition-wait (script-check-pool-done-cv pool)
+                                  (script-check-pool-lock pool)))
+      (not (script-check-pool-failed pool)))))
+
 (defun validate-block-scripts-parallel (txs script-flags utxo-set height &key extra-coins)
   "Validate all non-coinbase tx scripts in TXS across N worker threads.
 Returns T on success or NIL on the first script failure.
@@ -822,44 +959,19 @@ The spent coins are resolved HERE, on this thread, before any worker starts
 then receive pure data and never touch the coins view, whose cache inserts on
 read and is not synchronized."
   (let* ((non-coinbase (rest txs))
-         (n-txs (length non-coinbase))
          (prefetched (prefetch-block-spent-coins txs utxo-set extra-coins))
-         (n-workers (min +parallel-validation-workers+ n-txs))
-         ;; Partition tx indices round-robin across workers so each gets
-         ;; a roughly even mix of light and heavy txs.
-         (tx-vec (coerce non-coinbase 'vector))
-         (failure-flag (cons nil nil))   ; mutable shared cell
-         (failure-lock (bt:make-lock "block-script-failure"))
-         (threads '()))
-    ;; Spawn workers via LOOP, which fresh-binds the iteration variable
-    ;; each iteration. SBCL's dotimes shares one binding across iterations
-    ;; (verified empirically), so closures captured inside dotimes all
-    ;; see the FINAL value — every worker thread would loop the same
-    ;; index range and fail to partition work. Replacing dotimes with
-    ;; loop fixes the partitioning so each thread gets distinct txs.
-    (loop for worker-id below n-workers
-          do (push (bt:make-thread
-                    (let ((wid worker-id))   ; defensive freeze
-                      (lambda ()
-                        (loop for i from wid below n-txs by n-workers
-                              do (when (car failure-flag) (return))
-                                 (let ((tx (aref tx-vec i))
-                                       ;; tx-idx is 1-based to match
-                                       ;; original (rest transactions).
-                                       (tx-idx (1+ i)))
-                                   (unless (validate-tx-scripts
-                                            tx tx-idx utxo-set
-                                            script-flags height
-                                            :extra-coins extra-coins
-                                            :spent-utxos (aref prefetched i))
-                                     (bt:with-lock-held (failure-lock)
-                                       (setf (car failure-flag) t))
-                                     (return))))))
-                    :name (format nil "script-check-~D" worker-id))
-                   threads))
-    (dolist (th threads)
-      (bt:join-thread th))
-    (not (car failure-flag))))
+         (pool (ensure-script-check-pool +parallel-validation-workers+))
+         ;; One item per transaction. Each closes over data that is already
+         ;; resolved, so nothing here reaches the coins view.
+         (items (loop for tx in non-coinbase
+                      for i from 0
+                      collect (let ((tx tx) (i i))
+                                (lambda ()
+                                  (validate-tx-scripts
+                                   tx (1+ i) utxo-set script-flags height
+                                   :extra-coins extra-coins
+                                   :spent-utxos (aref prefetched i)))))))
+    (run-script-checks pool items)))
 
 (defun validate-block-scripts (block utxo-set &key (height 0) extra-coins)
   "Validate all non-coinbase transaction scripts in BLOCK via Coalton interop.
