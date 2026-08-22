@@ -827,17 +827,37 @@ wallet's known sub-scripts. Inputs with no UTXO are absent."
                        (list spk amount redeem witness)))))
     coins))
 
+(defun %psbt-input-signed-p (map)
+  "Core PSBTInputSigned (psbt.h): the input already carries a final scriptSig
+or final scriptWitness, so a filler has nothing left to add."
+  (or (bitcoin-lisp.serialization:psbt-map-find
+       map bitcoin-lisp.serialization:+psbt-in-final-scriptsig+)
+      (bitcoin-lisp.serialization:psbt-map-find
+       map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+)))
+
 (defun %psbt-fill-wallet-utxos (psbt wallet)
-  "For inputs with no UTXO field, add non_witness_utxo from the wallet's full
-previous transaction — Core FillPSBT (the non_witness_utxo is a superset; the
-signer switches to the smaller witness_utxo when that is safe)."
+  "For inputs without a non_witness_utxo, add it from the wallet's full
+previous transaction — Core FillPSBT (wallet.cpp:2201-2212). A witness_utxo
+already present does NOT suppress it: the full transaction is what a hardware
+signer needs to authenticate the amount of a segwit v0 input, and it is the
+2020 fee-spoofing defence, since witness_utxo's amount is unauthenticated.
+Already-signed inputs are skipped, as Core skips them (wallet.cpp:2192-2194).
+
+Core drops these again afterwards where they are provably redundant
+(RemoveUnnecessaryTransactions, psbt.cpp:514-549: every input segwit v1+ and
+no ANYONECANPAY). We deliberately do NOT: that rule keys on the PSBT's
+recorded sighash type, which Core writes for every input with a resolvable
+UTXO but we write only where a signature succeeded — so on `sign=false`, or
+for an input we hold no key for, the ANYONECANPAY guard could not fire and
+the drop would destroy data Core keeps. Our PSBTs are therefore larger than
+Core's for the taproot-only case; that is the safe direction. Settling the
+sighash where Core settles it is the prerequisite for porting the drop."
   (let ((tx (bitcoin-lisp.serialization:psbt-tx psbt))
         (empty (make-array 0 :element-type '(unsigned-byte 8))))
     (loop for map across (bitcoin-lisp.serialization:psbt-inputs psbt)
           for in across (bitcoin-lisp.serialization:transaction-inputs tx)
           for op = (bitcoin-lisp.serialization:tx-in-previous-output in)
-          do (unless (or (bitcoin-lisp.serialization:psbt-map-find
-                          map bitcoin-lisp.serialization:+psbt-in-witness-utxo+)
+          do (unless (or (%psbt-input-signed-p map)
                          (bitcoin-lisp.serialization:psbt-map-find
                           map bitcoin-lisp.serialization:+psbt-in-non-witness-utxo+))
                (let ((wtx (wallet-get-wallet-tx
