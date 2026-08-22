@@ -161,10 +161,15 @@ The original tuning problem was real — at 64 the table cache thrashes
 Table::Open/mmap/munmap on every point-Get, ~12% of IBD CPU by sb-sprof at
 h≈280k — but 1000 is well clear of that and stays inside the mmap regime, where
 cached tables cost address space rather than descriptors."
-  (let ((opts (leveldb-make-options :max-open-files 1000)))
-    (unwind-protect
-         (make-coins-view-db :db (leveldb-open path opts))
-      (leveldb-destroy-options opts))))
+  (make-coins-view-db
+   :db (leveldb-open-tuned
+        path
+        ;; Core gives the coins DB its own share of -dbcache and a bloom
+        ;; filter; we gave it neither, so every negative coin lookup — most of
+        ;; them during IBD, since an input's coin is checked before it is
+        ;; found — read a data block per level off disk.
+        :cache-bytes (if *cache-sizes* (cache-sizes-coins-db *cache-sizes*) 0)
+        :max-open-files 1000)))
 
 (defun close-coins-view-db (view)
   (when (cvdb-db view)

@@ -40,7 +40,11 @@ A disabled index ignores writes and reads and holds no DB handle."
     (when enabled
       (let ((path (blockfilterindex-path base-path)))
         (ensure-directories-exist path)
-        (setf (blockfilterindex-db bfi) (leveldb-open path))))
+        (setf (blockfilterindex-db bfi)
+              (leveldb-open-tuned
+               path :cache-bytes (if *cache-sizes*
+                                     (cache-sizes-filter-index *cache-sizes*)
+                                     0)))))
     bfi))
 
 (defun close-blockfilterindex (bfi)
@@ -184,7 +188,11 @@ genesis indexing existed) and must be rebuilt from scratch."
       (close-blockfilterindex bfi)
       (leveldb-destroy-db path)
       (ensure-directories-exist path)
-      (setf (blockfilterindex-db bfi) (leveldb-open path)))
+      (setf (blockfilterindex-db bfi)
+            (leveldb-open-tuned
+             path :cache-bytes (if *cache-sizes*
+                                   (cache-sizes-filter-index *cache-sizes*)
+                                   0))))
     t))
 
 (defun blockfilterindex-ensure-genesis-anchor (bfi chain-state)

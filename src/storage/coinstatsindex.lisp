@@ -138,7 +138,13 @@ key order is height order)."
     (when enabled
       (let ((path (coinstatsindex-path base-path)))
         (ensure-directories-exist path)
-        (setf (coinstatsindex-db csi) (leveldb-open path))))
+        ;; coinstats shares the filter index's per-index share: Core
+        ;; divides one budget across n_indexes (node/caches.cpp:66-70).
+        (setf (coinstatsindex-db csi)
+              (leveldb-open-tuned
+               path :cache-bytes (if *cache-sizes*
+                                     (cache-sizes-filter-index *cache-sizes*)
+                                     0)))))
     csi))
 
 (defun close-coinstatsindex (csi)
