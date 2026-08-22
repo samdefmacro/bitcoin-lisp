@@ -263,9 +263,12 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "feefilter")
-     ;; BIP 133: Peer's minimum fee rate for tx relay
+     ;; BIP 133: the peer's minimum fee rate for tx relay. Core applies it
+     ;; only when MoneyRange (net_processing.cpp:5126); a rate above
+     ;; MAX_MONEY would otherwise silently suppress all relay to this peer.
      (let ((rate (bitcoin-lisp.serialization:parse-feefilter-payload payload)))
-       (setf (peer-feefilter-rate peer) rate))
+       (when (<= rate bitcoin-lisp.validation:+max-money+)
+         (setf (peer-feefilter-rate peer) rate)))
      t)
 
     ;; Compact block messages (BIP 152)
@@ -1085,7 +1088,11 @@ source is marked as knowing it too). Returns the number of peers sent to."
              (loop for p in peers
                    when (and (eq (peer-state p) :ready)
                              (not (eq p source-peer))
-                             (peer-relays-txs-p p)
+                             ;; Core RelayAddress: only peers with address
+                             ;; relay set up (net_processing.cpp:2311) — an
+                             ;; inbound peer that never sent addr/getaddr
+                             ;; receives no gossip.
+                             (peer-addr-relay-enabled p)
                              (or (peer-wants-addrv2 p)
                                  (bitcoin-lisp.serialization:v1-compatible-network-p
                                   network)))
@@ -2469,7 +2476,9 @@ loop. Returns the number of peers announced to."
         (sent 0))
     (dolist (peer peers sent)
       (when (and (eq (peer-state peer) :ready)
-                 (peer-relays-txs-p peer)
+                 ;; Core MaybeSendAddr self-advertises only on addr-relay
+                 ;; peers (net_processing.cpp:5533).
+                 (peer-addr-relay-enabled peer)
                  (<= (peer-next-local-addr-send peer) now))
         (when (%announce-local-address peer)
           (incf sent))
