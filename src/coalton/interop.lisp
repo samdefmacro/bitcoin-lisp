@@ -58,6 +58,7 @@
    #:flag-enabled-p
    ;; Signature verification
    #:verify-script
+   #:p2sh-redeem-script
    #:verify-checksig
    #:verify-checksig-for-script
    #:last-checksig-had-strictenc-error-p
@@ -658,6 +659,23 @@ promoted into the current one."
           (bitcoin-lisp:log-warn "run-scripts-with-p2sh ScriptErr: ~A" err)
           (values nil :error)))))
 
+(defun p2sh-redeem-script (script-sig)
+  "The redeem script of a P2SH spend: the element SCRIPT-SIG leaves on TOP OF
+THE STACK when evaluated alone. That is what Core's VerifyScript reads —
+`pubKeySerialized = stack.back()` after `swap(stack, stackCopy)`
+(interpreter.cpp:2058-2060) — and what validate-p2sh-with-tx pops before
+hashing. It is NOT the last push in the scriptSig's bytes: OP_0 and
+OP_1..OP_16 push too, so `<push program> OP_0` leaves an EMPTY element on top
+and is an ordinary P2SH spend, not a witness program.
+
+Evaluates SCRIPT-SIG alone (push-only under P2SH, so no tx context is
+needed) and returns the top element as a byte vector, or NIL when the
+evaluation fails or leaves the stack empty — which the caller reads as
+\"not a witness program\"."
+  (multiple-value-bind (ok stack) (run-script script-sig)
+    (when (and ok (consp stack))
+      (coalton-vector-to-cl-array (car stack)))))
+
 (defun verify-script (script-sig script-pubkey &key witness amount)
   "Verify a script following Bitcoin Core's VerifyScript flow exactly.
 SCRIPT-SIG and SCRIPT-PUBKEY are byte arrays.
@@ -720,18 +738,19 @@ Returns (values success error-keyword)."
               (unless wok
                 (return-from verify-script (values nil werr))))))
 
-        ;; Step 6: P2SH-wrapped witness handling
+        ;; Step 6: P2SH-wrapped witness handling (interpreter.cpp:2050-2092)
         (when (and (flag-enabled-p "WITNESS") p2sh-enabled (not had-witness))
-          (let ((redeem-script (extract-last-push-data script-sig)))
+          ;; Core reads the redeem script off the stack top (see
+          ;; p2sh-redeem-script), never off the scriptSig bytes.
+          (let ((redeem-script (p2sh-redeem-script script-sig)))
             (when (and redeem-script (is-witness-program-p redeem-script))
               (setf had-witness t)
               ;; BIP141 (consensus — WITNESS is a MANDATORY flag): the scriptSig
               ;; must be EXACTLY a single canonical push of the witness program.
               ;; P2SH only requires push-ONLY (which permits extra leading
-              ;; pushes), and extract-last-push-data ignores anything before the
-              ;; final push — so we must compare the whole scriptSig to the
-              ;; canonical push ourselves, or third-party malleability slips
-              ;; through. Core interpreter.cpp returns WITNESS_MALLEATED_P2SH:
+              ;; pushes) — so we must compare the whole scriptSig to the
+              ;; canonical push, or third-party malleability slips through.
+              ;; Core interpreter.cpp returns WITNESS_MALLEATED_P2SH:
               ;;   if (scriptSig != CScript() << redeemScript) -> reject
               ;; A witness program is always <76 bytes, so its canonical push is
               ;; [len][program] (no OP_PUSHDATA*); a non-minimal or multi-push
@@ -768,33 +787,6 @@ Returns (values success error-keyword)."
 
         ;; Success
         (values t nil)))))
-
-(defun extract-last-push-data (script)
-  "Extract the data from the last push operation in a script.
-Used to get the redeem script from a P2SH scriptSig."
-  (let ((len (length script)) (pos 0) (last-push nil))
-    (loop while (< pos len)
-          do (let ((op (aref script pos)))
-               (cond
-                 ((and (>= op 1) (<= op 75))
-                  (let ((end (min len (+ pos 1 op))))
-                    (setf last-push (subseq script (1+ pos) end))
-                    (setf pos end)))
-                 ((= op 76) ;; OP_PUSHDATA1
-                  (when (< (1+ pos) len)
-                    (let* ((data-len (aref script (1+ pos)))
-                           (end (min len (+ pos 2 data-len))))
-                      (setf last-push (subseq script (+ pos 2) end))
-                      (setf pos end))))
-                 ((= op 77) ;; OP_PUSHDATA2
-                  (when (< (+ pos 2) len)
-                    (let* ((data-len (+ (aref script (1+ pos))
-                                        (ash (aref script (+ pos 2)) 8)))
-                           (end (min len (+ pos 3 data-len))))
-                      (setf last-push (subseq script (+ pos 3) end))
-                      (setf pos end))))
-                 (t (incf pos)))))
-    last-push))
 
 (defun is-p2sh-script-p (script-bytes)
   "Check if script matches P2SH pattern."
