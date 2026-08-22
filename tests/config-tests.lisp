@@ -826,3 +826,59 @@ stripped, value after #\\= ignored."
   (is-false (bitcoin-lisp::%argv-asks-for '("-regtest" "-datadir=/x") '("version")))
   ;; A VALUE that looks like the option name must not trigger it.
   (is-false (bitcoin-lisp::%argv-asks-for '("-datadir=version") '("version"))))
+
+(test testactivationheight-moves-buried-deployments
+  "-testactivationheight=name@height lets a regtest chain be driven across a
+buried deployment in a handful of blocks (Core chainparams.cpp:49-67). Without
+it a test that wants pre-BIP66 behaviour cannot reach it at all on a chain that
+activates at height 1 — which is why the plan counts this among the options
+gating ~70 of Core's tests."
+  (unwind-protect
+       (progn
+         (bitcoin-lisp.validation:apply-test-activation-heights
+          '("csv@5" "segwit@7" "dersig@9" "cltv@11" "bip34@13"))
+         (is (= 5 (bitcoin-lisp.validation:get-csv-activation-height :regtest)))
+         (is (= 7 (bitcoin-lisp.validation:get-segwit-activation-height :regtest)))
+         (is (= 9 (bitcoin-lisp.validation:get-bip66-activation-height :regtest)))
+         (is (= 11 (bitcoin-lisp.validation:get-bip65-activation-height :regtest)))
+         (is (= 13 (bitcoin-lisp.validation:get-bip34-activation-height :regtest)))
+         ;; An untouched deployment keeps its chain default.
+         (bitcoin-lisp.validation:apply-test-activation-heights '("csv@5"))
+         (is (= 5 (bitcoin-lisp.validation:get-csv-activation-height :regtest)))
+         (is (= 0 (bitcoin-lisp.validation:get-segwit-activation-height :regtest))))
+    (bitcoin-lisp.validation:apply-test-activation-heights nil))
+  ;; Cleared again, the defaults are back — an override must not outlive its run.
+  (is (= 0 (bitcoin-lisp.validation:get-segwit-activation-height :regtest))))
+
+(test testactivationheight-rejects-what-core-rejects
+  "Core raises on a missing '@', a height that is not a non-negative integer,
+and a name that is not a buried deployment (chainparams.cpp:51-66). Silently
+ignoring a typo'd name is the worst outcome: the test then runs against the
+very height it was trying to move, and passes for the wrong reason."
+  (flet ((parsed (spec)
+           (multiple-value-list
+            (bitcoin-lisp.validation:parse-test-activation-height spec))))
+    (is (equal '("csv" 5) (parsed "csv@5")))
+    (is (equal '("segwit" 0) (parsed "segwit@0")))
+    (dolist (bad '("csv" "csv@" "csv@-1" "csv@abc" "@5" "nosuch@5"
+                   "CSV@5" "csv@5@6" "" nil))
+      (is (equal '(nil) (parsed bad)) "accepted ~S" bad)))
+  (dolist (bad '(("csv") ("nosuch@5") ("csv@-1")))
+    (signals error (bitcoin-lisp.validation:apply-test-activation-heights bad)))
+  (bitcoin-lisp.validation:apply-test-activation-heights nil))
+
+(test testactivationheight-and-mocktime-are-repeatable-options
+  "-testactivationheight is a LIST option: Core reads it with GetArgs and moves
+one deployment per occurrence (chainparams.cpp:49). Collapsing to the last
+occurrence would silently drop every override but one."
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest" "-testactivationheight=csv@5"
+                  "-testactivationheight=segwit@7" "-mocktime=1700000000")
+                nil)))
+    (is (equal '("csv@5" "segwit@7") (getf plist :test-activation-heights)))
+    (is (= 1700000000 (getf plist :mocktime))))
+  ;; Both are known options now, so neither is reported as accepted-and-ignored.
+  (is-false (bitcoin-lisp::core-only-option-p "mocktime"))
+  (is-false (bitcoin-lisp::core-only-option-p "testactivationheight"))
+  (is-true (bitcoin-lisp::known-config-option-p "mocktime"))
+  (is-true (bitcoin-lisp::known-config-option-p "testactivationheight")))

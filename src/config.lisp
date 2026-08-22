@@ -631,7 +631,8 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
     (:regtest "regtest")))
 
 (defparameter *repeatable-config-options*
-  '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind")
+  '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind"
+    "testactivationheight")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -826,6 +827,9 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ("coinstatsindex"    :coinstatsindex     :bool)
     ("prune"             :prune              :int)
     ("dbcache"           :dbcache-mib        :int)
+    ;; Core's -mocktime: the startup form of the setmocktime RPC, for tests
+    ;; that need a fixed clock before the first RPC can be made.
+    ("mocktime"          :mocktime           :int)
     ("maxconnections"    :max-connections    :int)
     ("rpcport"           :rpc-port           :int)
     ("rpcbind"           :rpc-bind           :string)
@@ -885,7 +889,7 @@ specially in config-alist->start-node-plist.")
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
-    "addnode" "rpcauth" "rpcallowip"
+    "addnode" "rpcauth" "rpcallowip" "testactivationheight"
     ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, not the spec
     ;; scan, since each topic contributes two options and they produce a list
     ;; of publishers rather than a start-node keyword.
@@ -914,14 +918,14 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
     "loglevelalways" "logsourcelocations" "logthreadnames" "logtimemicros"
     "logtimestamps" "maxapsfee" "maxreceivebuffer" "maxsendbuffer"
-    "maxsigcachesize" "maxtipage" "maxuploadtarget" "mintxfee" "mocktime"
+    "maxsigcachesize" "maxtipage" "maxuploadtarget" "mintxfee"
     "natpmp" "par" "peerbloomfilters" "peertimeout" "persistmempool"
     "persistmempoolv1" "pid" "printpriority" "printtoconsole"
     "privatebroadcast" "rpccookiefile" "rpccookieperms" "rpcdoccheck"
     "rpcservertimeout" "rpcthreads" "rpcwhitelist" "rpcwhitelistdefault"
     "rpcworkqueue" "seednode" "settings" "shrinkdebugfile" "shutdownnotify"
     "signer" "signetseednode" "spendzeroconfchange" "startupnotify"
-    "stopafterblockimport" "test" "testactivationheight" "timeout"
+    "stopafterblockimport" "test" "timeout"
     "txconfirmtarget" "txospenderindex" "unsafesqlitesync" "vbparams"
     "version" "walletbroadcast" "walletcrosschain" "walletdir"
     "walletnotify" "walletrbf" "walletrejectlongchains" "whitebind"
@@ -1093,7 +1097,8 @@ resolved network. Honors -server (enable RPC on the default port when no
       ;; httpserver.cpp:153). Each is validated where it is used, not here.
       (dolist (option '(("addnode"    . :addnode)
                         ("rpcauth"    . :rpc-auth)
-                        ("rpcallowip" . :rpc-allow-ip)))
+                        ("rpcallowip" . :rpc-allow-ip)
+                        ("testactivationheight" . :test-activation-heights)))
         (let ((values (loop for (k . v) in alist
                             when (string= k (car option))
                               collect v)))

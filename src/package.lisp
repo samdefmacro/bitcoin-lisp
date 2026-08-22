@@ -1136,6 +1136,9 @@
    #:precious-block
    #:decode-coinbase-height
    #:get-bip34-activation-height
+   #:apply-test-activation-heights
+   #:parse-test-activation-height
+   #:*test-activation-heights*
    #:get-bip66-activation-height
    #:get-bip65-activation-height
    #:get-csv-activation-height
