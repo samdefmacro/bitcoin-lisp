@@ -371,6 +371,7 @@
    #:write-hash256
    ;; Compact block (BIP 152)
    #:compact-block
+   #:make-cmpctblock-message
    #:make-compact-block
    #:compact-block-header
    #:compact-block-nonce
@@ -1102,6 +1103,7 @@
    ;; most-recent-block tx map)
    #:recently-confirmed-p
    #:most-recent-block-tx
+   #:most-recent-cmpctblock
    #:note-block-connected
    #:reset-recent-confirmed
    ;; The reconsiderable rejects filter (Core's second rejects filter)

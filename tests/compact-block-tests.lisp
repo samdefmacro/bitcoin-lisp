@@ -1129,6 +1129,82 @@ through the cap-of-3 eviction could demote an honest HB peer at will."
           (is-true (bitcoin-lisp.networking::peer-compact-block-high-bandwidth-to
                     peer))))))))
 
+(test cmpctblock-message-round-trips-through-our-own-parser
+  "make-cmpctblock-message emits a BIP152 HeaderAndShortIDs our own reader
+accepts: the header survives, the nonce is the one we chose, the coinbase is
+prefilled at index 0 (a peer's mempool can never hold it) and every other
+transaction is represented by a short id. Short-id derivation itself is covered
+by the receive-side tests and the SipHash vectors."
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "cb-msg"))
+          (block (%g716-mine-on node (%p2sh-optrue-spk)))
+          (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+          (msg (bitcoin-lisp.serialization:make-cmpctblock-message block :nonce 42))
+          (cb (bitcoin-lisp.serialization:parse-cmpctblock-payload (subseq msg 24))))
+     (is (equalp (bitcoin-lisp.serialization:block-header-hash
+                  (bitcoin-lisp.serialization:bitcoin-block-header block))
+                 (bitcoin-lisp.serialization:block-header-hash
+                  (bitcoin-lisp.serialization:compact-block-header cb))))
+     (is (= 42 (bitcoin-lisp.serialization:compact-block-nonce cb)))
+     (let* ((prefilled (bitcoin-lisp.serialization:compact-block-prefilled-txs cb))
+            (coinbase (and prefilled
+                           (bitcoin-lisp.serialization:prefilled-tx-transaction
+                            (first prefilled)))))
+       (is (= 1 (length prefilled)))
+       (is (= 0 (bitcoin-lisp.serialization:prefilled-tx-index (first prefilled))))
+       ;; WTXID, not txid: BIP152 v2 prefills TX_WITH_WITNESS
+       ;; (blockencodings.h:80) and the coinbase's witness is the BIP141
+       ;; reserved value. A txid comparison passes even when the emitter drops
+       ;; the witness — which it did until this change, leaving every
+       ;; reconstruction to fail bad-witness-nonce-size.
+       (is-true (bitcoin-lisp.serialization:transaction-has-witness-p coinbase)
+                "the prefilled coinbase keeps its witness")
+       (is (equalp (bitcoin-lisp.serialization:transaction-wtxid (first txs))
+                   (bitcoin-lisp.serialization:transaction-wtxid coinbase))))
+     (is (= (1- (length txs))
+            (length (bitcoin-lisp.serialization:compact-block-short-ids cb)))))))
+
+(test getdata-serves-cmpctblock-near-tip-and-a-full-block-deeper
+  "We send sendcmpct to every peer, so a Core peer records us as providing
+compact blocks and asks for MSG_CMPCT_BLOCK (net_processing.cpp:2891-2896).
+handle-getdata served only MSG_BLOCK/MSG_WITNESS_BLOCK, so that request fell
+through and the peer waited out its whole block timeout. Now the same path and
+the same guards answer it, with Core's depth rule: within MAX_CMPCTBLOCK_DEPTH
+of the tip a cmpctblock, deeper the full witness block, because a peer asking
+for old blocks has no mempool that could reconstruct one (:2463-2476)."
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "cb-getdata"))
+          (cs (bitcoin-lisp::node-chain-state node))
+          (store (bitcoin-lisp::node-block-store node))
+          ;; Seven blocks, so the first sits deeper than the depth rule allows.
+          (hashes (bitcoin-lisp.rpc::%generate-to-script-pubkey
+                   node (%p2sh-optrue-spk) 7 1000000))
+          (deep-hash (bitcoin-lisp.rpc::parse-hex-hash (first hashes))))
+     (progn
+       (is (= 7 (bitcoin-lisp.storage:current-height cs)))
+       (let ((peer (%cbp-peer "198.51.100.30"))
+             (tip (bitcoin-lisp.storage:best-block-hash cs)))
+         (flet ((serve (hash type)
+                  (%cbp-capture-sends
+                   (lambda ()
+                     (bitcoin-lisp.networking::handle-getdata
+                      peer (subseq (bitcoin-lisp.serialization:make-getdata-message
+                                    (list (bitcoin-lisp.serialization:make-inv-vector
+                                           :type type :hash hash)))
+                                   24)
+                      cs nil store)))))
+           (is (equal '("cmpctblock")
+                      (serve tip bitcoin-lisp.serialization:+inv-type-cmpct-block+))
+               "MSG_CMPCT_BLOCK at the tip is answered compactly")
+           (is (equal '("block")
+                      (serve deep-hash bitcoin-lisp.serialization:+inv-type-cmpct-block+))
+               "deeper than MAX_CMPCTBLOCK_DEPTH falls back to the full block")
+           ;; The ordinary block requests are unchanged.
+           (is (equal '("block")
+                      (serve tip bitcoin-lisp.serialization:+inv-type-witness-block+)))
+           (is (equal '("block")
+                      (serve tip bitcoin-lisp.serialization:+inv-type-block+)))))))))
+
 (test g7-16-blocktxn-completion-promotes-only-after-the-block-validates
   "The OTHER compact path — a reconstruction completed by blocktxn — carried the
 same defect and needs its own coverage: a dropped hunk there would disable the

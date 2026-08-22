@@ -1874,6 +1874,40 @@ requests at most ~16 blocks in flight (and up to 500 after a getblocks inv); thi
 bounds the disk-read/serialize/send work a single message can demand, since a
 getdata can carry up to MAX_INV_SZ (50000) entries.")
 
+(defconstant +max-cmpctblock-depth+ 5
+  "Core MAX_CMPCTBLOCK_DEPTH (net_processing.cpp:138): a MSG_CMPCT_BLOCK
+request for a block deeper than this below the tip is answered with the full
+block instead. A peer asking for old blocks is almost certainly unable to
+reconstruct one — its mempool holds nothing that old — so building the compact
+form would waste the work on both ends.")
+
+(defun %can-direct-fetch-p (chain-state)
+  "Core CanDirectFetch (net_processing.cpp:1347): our tip is younger than 20
+block intervals. The depth rule below is expressed relative to OUR tip, so it
+only means \"a recent block\" while this holds — on a node in IBD or catching
+up, five blocks below a stale tip can be years old, which is exactly the case
+Core refuses to build a compact block for."
+  (let* ((tip-hash (bitcoin-lisp.storage:best-block-hash chain-state))
+         (tip (and tip-hash (bitcoin-lisp.storage:get-block-index-entry
+                             chain-state tip-hash))))
+    (and tip
+         (> (bitcoin-lisp.serialization:block-header-timestamp
+             (bitcoin-lisp.storage:block-index-entry-header tip))
+            (- (bitcoin-lisp.serialization:get-unix-time)
+               (* 20 bitcoin-lisp::+pow-target-spacing-seconds+))))))
+
+(defun %serve-compact-p (chain-state entry)
+  "T when a MSG_CMPCT_BLOCK request for ENTRY should be answered compactly:
+our tip is recent AND ENTRY is within +max-cmpctblock-depth+ of it (Core
+net_processing.cpp:2468). A peer asking for anything older is almost certainly
+unable to reconstruct it — its mempool holds nothing that old — so the compact
+form would waste the construction on both ends."
+  (and entry
+       (%can-direct-fetch-p chain-state)
+       (>= (bitcoin-lisp.storage:block-index-entry-height entry)
+           (- (bitcoin-lisp.storage:current-height chain-state)
+              +max-cmpctblock-depth+))))
+
 (defun handle-getdata (peer payload chain-state &optional mempool block-store)
   "Handle a getdata message. Respond with requested transactions or blocks.
 Does not respond to transaction requests when relay is disabled (mainnet default).
@@ -1966,9 +2000,12 @@ handling of unavailable blocks."
                    ;; Core accumulates vNotFound for txs it can't serve so the
                    ;; requester re-routes immediately instead of timing out.
                    (push inv not-found)))))))
-          ;; Block request - serve the full block from disk (witness-aware).
+          ;; Block request — served from disk (witness-aware). MSG_CMPCT_BLOCK
+          ;; takes the same path and the same guards, as Core's
+          ;; ProcessGetBlockData does, and differs only in what is sent.
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-block+)
-               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+))
+               (= inv-type bitcoin-lisp.serialization:+inv-type-witness-block+)
+               (= inv-type bitcoin-lisp.serialization:+inv-type-cmpct-block+))
            (when (and block-store (< blocks-served +max-blocks-served-per-getdata+))
              (let ((entry (and chain-state
                                (bitcoin-lisp.storage:get-block-index-entry
@@ -1996,15 +2033,27 @@ handling of unavailable blocks."
                   (disconnect-peer peer)
                   (return))
                  (t
-                  (let ((block (bitcoin-lisp.storage:get-block block-store hash)))
+                  (let ((block (bitcoin-lisp.storage:get-block block-store hash))
+                        ;; Only the legacy MSG_BLOCK is witness-stripped;
+                        ;; MSG_WITNESS_BLOCK and the full-block fallback for
+                        ;; MSG_CMPCT_BLOCK both carry witnesses (Core
+                        ;; ProcessGetBlockData, TX_WITH_WITNESS).
+                        (witnessed (/= inv-type
+                                       bitcoin-lisp.serialization:+inv-type-block+)))
                     (when block
                       (incf blocks-served)
                       (send-message
                        peer
-                       (bitcoin-lisp.serialization:make-block-message
-                        block
-                        :witness (= inv-type
-                                    bitcoin-lisp.serialization:+inv-type-witness-block+)))))))))))))
+                       (if (and (= inv-type
+                                   bitcoin-lisp.serialization:+inv-type-cmpct-block+)
+                                (%serve-compact-p chain-state entry))
+                           ;; Cached when this is the tip we just connected —
+                           ;; N peers asking for the same new block cost one
+                           ;; construction (Core m_most_recent_compact_block).
+                           (or (bitcoin-lisp.validation:most-recent-cmpctblock hash)
+                               (bitcoin-lisp.serialization:make-cmpctblock-message block))
+                           (bitcoin-lisp.serialization:make-block-message
+                            block :witness witnessed)))))))))))))
     ;; One notfound for every unserved tx request (Core sends notfound for txs
     ;; only, never blocks).
     (when not-found

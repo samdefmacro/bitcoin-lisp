@@ -649,8 +649,47 @@ reads instead of flexi-streams' Gray-stream input dispatch."
         (let ((abs-index (prefilled-tx-index ptx)))
           ;; Write differential index
           (write-compact-size stream (- abs-index last-index 1))
-          (write-transaction stream (prefilled-tx-transaction ptx))
+          ;; WITNESS serialization: BIP152 v2 prefilled transactions are
+          ;; TX_WITH_WITNESS (Core PrefilledTransaction, blockencodings.h:80),
+          ;; and the one transaction we ever prefill is the coinbase, whose
+          ;; witness carries the BIP141 reserved value. Emitting it stripped
+          ;; makes every reconstruction fail bad-witness-nonce-size — the
+          ;; witness-stripped-block wedge this project has already hit once.
+          ;; (read-transaction auto-detects the BIP144 marker, so the reading
+          ;; side needed no change.)
+          (write-witness-transaction stream (prefilled-tx-transaction ptx))
           (setf last-index abs-index))))))
+
+(defun build-compact-block (block &key (nonce (random (expt 2 64))))
+  "BLOCK as a BIP152 HeaderAndShortIDs (Core CBlockHeaderAndShortTxIDs,
+blockencodings.cpp:17-38): the header, a nonce, the coinbase prefilled at index
+0, and a 6-byte short ID for every other transaction, keyed by SipHash-2-4 over
+the header bytes and the nonce. Version 2, so the ids are over WTXIDs (BIP152
++ BIP141) — which is the only version we negotiate."
+  (let* ((header (bitcoin-block-header block))
+         (txs (bitcoin-block-transactions block))
+         ;; The same writer the RECEIVE path keys off (protocol.lisp's
+         ;; reconstruct-compact-block), so the two sides cannot derive
+         ;; different SipHash keys for the same header.
+         (header-bytes (serialize-block-header header)))
+    (multiple-value-bind (k0 k1)
+        (bitcoin-lisp.crypto:compute-siphash-key header-bytes nonce)
+      (make-compact-block
+       :header header
+       :nonce nonce
+       :short-ids (loop for tx in (rest txs)
+                        collect (bitcoin-lisp.crypto:compute-short-txid
+                                 k0 k1 (transaction-wtxid tx)))
+       ;; Core prefills the coinbase only: a peer's mempool never holds it, so
+       ;; without it every reconstruction would need a getblocktxn round trip.
+       :prefilled-txs (list (make-prefilled-tx :index 0 :transaction (first txs)))))))
+
+(defun make-cmpctblock-message (block &key (nonce (random (expt 2 64))))
+  "A cmpctblock message carrying BLOCK as a BIP152 compact block."
+  (let ((payload (flexi-streams:with-output-to-sequence (stream)
+                   (write-compact-block stream
+                                        (build-compact-block block :nonce nonce)))))
+    (serialize-message "cmpctblock" payload)))
 
 ;;; Parse cmpctblock payload
 (defun parse-cmpctblock-payload (payload)
