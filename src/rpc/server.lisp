@@ -657,23 +657,73 @@ O_EXCL also means the secret is never written into a file we did not create:
 2.6.5), so a planted .cookie.tmp — or a hard link to one — receives the secret,
 and O_NOFOLLOW additionally refuses a planted symlink, which would otherwise be
 written through and then renamed target-and-all over .cookie."
-  (let ((fd (sb-posix:open namestring
-                           (logior sb-posix:o-wronly sb-posix:o-creat
-                                   sb-posix:o-excl sb-posix:o-nofollow)
-                           #o600))
-        (stream nil))
+  (let* ((mode (%cookie-file-mode))
+         (fd (sb-posix:open namestring
+                            (logior sb-posix:o-wronly sb-posix:o-creat
+                                    sb-posix:o-excl sb-posix:o-nofollow)
+                            mode))
+         (stream nil))
     (unwind-protect
          (progn
            ;; open(2) applies mode & ~umask, so the file is never MORE
-           ;; permissive than 0600; fchmod on our own fd (no path, no race)
-           ;; pins it to exactly 0600 even under a umask that strips owner bits.
-           (sb-posix:fchmod fd #o600)
+           ;; permissive than MODE; fchmod on our own fd (no path, no race)
+           ;; pins it to exactly MODE even under a umask that strips bits the
+           ;; operator asked for with -rpccookieperms.
+           (sb-posix:fchmod fd mode)
            (setf stream (sb-sys:make-fd-stream fd :output t :external-format :utf-8
                                                   :name "rpc-cookie"))
            (write-string contents stream)
            (finish-output stream))
       ;; CLOSE on an fd-stream closes the fd, so close exactly one of them.
       (if stream (close stream) (sb-posix:close fd)))))
+
+(defvar *rpc-threads* nil
+  "Maximum concurrent RPC handler threads, or NIL for hunchentoot's default
+(Core -rpcthreads, DEFAULT_HTTP_THREADS = 16). Core services requests from a
+fixed pool; hunchentoot is thread-per-connection, so this caps the pool rather
+than sizing it — the observable behaviour, a bound on concurrent work, is the
+same.")
+
+(defvar *rpc-server-timeout* nil
+  "Seconds an idle RPC connection is held before it is closed, or NIL for
+hunchentoot's default (Core -rpcservertimeout, DEFAULT_HTTP_SERVER_TIMEOUT).")
+
+(defvar *rpc-cookie-file* nil
+  "Where the .cookie goes, or NIL for <datadir>/.cookie (Core -rpccookiefile,
+init.cpp:710). A relative path is taken relative to the data directory, as Core
+prefixes it with the net-specific datadir.")
+
+(defvar *rpc-cookie-perms* :owner
+  "Who may read the .cookie: :OWNER (0600), :GROUP (0640) or :ALL (0644).
+Core's -rpccookieperms (init.cpp:711), whose default is owner via umask 0077.
+
+Loosening this is a real decision, not a formatting one — the cookie IS the RPC
+credential — so the mode is passed explicitly to the create rather than left to
+the ambient umask. See %WRITE-COOKIE-FILE for why that distinction matters.")
+
+(defun %cookie-file-mode ()
+  "The octal mode *RPC-COOKIE-PERMS* names."
+  (ecase *rpc-cookie-perms*
+    (:owner #o600)
+    (:group #o640)
+    (:all   #o644)))
+
+(defun parse-rpc-cookie-perms (value)
+  "Parse a -rpccookieperms value, or NIL when it names no known audience."
+  (when (stringp value)
+    (cond ((string-equal value "owner") :owner)
+          ((string-equal value "group") :group)
+          ((string-equal value "all") :all))))
+
+(defun rpc-cookie-path (data-directory)
+  "Where the cookie goes for DATA-DIRECTORY, honouring -rpccookiefile."
+  (cond ((null *rpc-cookie-file*) (merge-pathnames ".cookie" data-directory))
+        ;; An absolute path is used as given; a relative one hangs off the data
+        ;; directory, which is what Core means by "prefixed by a net-specific
+        ;; datadir location".
+        ((uiop:absolute-pathname-p *rpc-cookie-file*)
+         (pathname *rpc-cookie-file*))
+        (t (merge-pathnames *rpc-cookie-file* data-directory))))
 
 (defun generate-rpc-cookie (data-directory)
   "Write <data-directory>/.cookie as \"__cookie__:<random>\" and return
@@ -682,8 +732,8 @@ is created owner-only and is never reachable under any other name — Core
 creates it under umask 0077 (request.cpp:99-146)."
   (handler-case
       (let* ((secret (ironclad:byte-array-to-hex-string (ironclad:random-data 32)))
-             (path (merge-pathnames ".cookie" data-directory))
-             (tmp (merge-pathnames ".cookie.tmp" data-directory)))
+             (path (rpc-cookie-path data-directory))
+             (tmp (make-pathname :type "tmp" :defaults path)))
         (ensure-directories-exist path)
         ;; A .cookie.tmp left behind by a crash would make the exclusive create
         ;; below fail on every later start; unlink drops the name (and a
@@ -1289,24 +1339,33 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
                nil))
         (handler-case
             (progn
-              (setf acceptor (make-instance 'rpc-acceptor
-                                            :port port
-                                            :address bind
-                                            ;; NOTHING to stderr. Hunchentoot
-                                            ;; defaults both logs there, so a
-                                            ;; node running normally dribbled
-                                            ;; an Apache-style access line per
-                                            ;; RPC call onto stderr — which
-                                            ;; Core's test framework reads back
-                                            ;; at EVERY node stop and requires
-                                            ;; to be empty (test_node.py:502-509),
-                                            ;; so it would have failed every
-                                            ;; test that stops a node. Core logs
-                                            ;; HTTP requests only under
-                                            ;; -debug=http, i.e. not at all by
-                                            ;; default.
-                                            :access-log-destination nil
-                                            :message-log-destination nil))
+              (setf acceptor
+                    (apply #'make-instance 'rpc-acceptor
+                           :port port
+                           :address bind
+                           ;; -rpcthreads caps concurrent handler threads. The
+                           ;; initarg is passed only when configured, so
+                           ;; hunchentoot's own default stands otherwise.
+                           (append
+                            (when *rpc-threads*
+                              (list :taskmaster
+                                    (make-instance
+                                     'hunchentoot:one-thread-per-connection-taskmaster
+                                     :max-thread-count *rpc-threads*)))
+                            ;; NOTHING to stderr. Hunchentoot defaults both
+                            ;; logs there, so a node running normally dribbled
+                            ;; an Apache-style access line per RPC call onto
+                            ;; stderr — which Core's test framework reads back
+                            ;; at EVERY node stop and requires to be empty
+                            ;; (test_node.py:502-509), so it would have failed
+                            ;; every test that stops a node. Core logs HTTP
+                            ;; requests only under -debug=http.
+                            (list :access-log-destination nil
+                                  :message-log-destination nil))))
+              ;; -rpcservertimeout: hunchentoot reads this special when it
+              ;; accepts, so binding it globally is what reaches the sockets.
+              (when *rpc-server-timeout*
+                (setf hunchentoot:*default-connection-timeout* *rpc-server-timeout*))
               (hunchentoot:start acceptor)
               (setf listening t)
 

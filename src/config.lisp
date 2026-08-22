@@ -890,6 +890,7 @@ specially in config-alist->start-node-plist.")
     "maxtxfee" "fallbackfee" "bantime" "uacomment"
     "dustrelayfee" "incrementalrelayfee" "bytespersigop"
     "maxtipage" "maxsigcachesize" "fastprune" "blocksxor"
+    "rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
@@ -926,8 +927,8 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "maxuploadtarget" "mintxfee"
     "natpmp" "par" "peerbloomfilters" "peertimeout" "persistmempool"
     "persistmempoolv1" "pid" "printpriority" "printtoconsole"
-    "privatebroadcast" "rpccookiefile" "rpccookieperms" "rpcdoccheck"
-    "rpcservertimeout" "rpcthreads" "rpcwhitelist" "rpcwhitelistdefault"
+    "privatebroadcast" "rpcdoccheck"
+    "rpcwhitelist" "rpcwhitelistdefault"
     "rpcworkqueue" "seednode" "settings" "shrinkdebugfile" "shutdownnotify"
     "signer" "signetseednode" "spendzeroconfchange" "startupnotify"
     "stopafterblockimport" "test" "timeout"

@@ -51,6 +51,45 @@ as one."
   (when datadir
     (namestring (uiop:ensure-directory-pathname datadir))))
 
+(defun apply-rpc-config-globals (alist)
+  "Apply the process-global RPC options from a merged config ALIST.
+
+Separate from APPLY-CONFIG-GLOBALS purely because of load order: config.lisp
+compiles BEFORE src/rpc/package.lisp, so a package-qualified reference to
+BITCOIN-LISP.RPC there is a READ error, not a link error. Called from
+START-NODE-FROM-ARGS immediately after its sibling."
+  (flet ((lk (k) (let ((c (assoc k alist :test #'string=))) (and c (cdr c)))))
+    ;; -rpccookiefile: where the auth cookie goes (Core init.cpp:710). A
+    ;; relative path hangs off the data directory.
+    (let ((v (lk "rpccookiefile")))
+      (when v (setf bitcoin-lisp.rpc:*rpc-cookie-file* v)))
+    ;; -rpccookieperms=owner|group|all (Core init.cpp:711). Loosening who may
+    ;; read the cookie is loosening who may drive the RPC, so an unrecognised
+    ;; audience is an error rather than a silent fall back to the default.
+    (let ((v (lk "rpccookieperms")))
+      (when v
+        (let ((perms (bitcoin-lisp.rpc:parse-rpc-cookie-perms v)))
+          (unless perms
+            (error "Invalid -rpccookieperms=~A (must be owner, group or all)" v))
+          (setf bitcoin-lisp.rpc:*rpc-cookie-perms* perms))))
+    ;; -rpcthreads: cap on concurrent RPC handler threads (Core
+    ;; DEFAULT_HTTP_THREADS = 16).
+    (let ((v (lk "rpcthreads")))
+      (when v
+        (let ((n (conf-parse-int v)))
+          (unless (and n (plusp n))
+            (error "Invalid value for -rpcthreads=~A (must be a positive integer)" v))
+          (setf bitcoin-lisp.rpc:*rpc-threads* n))))
+    ;; -rpcservertimeout: seconds an idle RPC connection is held (Core
+    ;; DEFAULT_HTTP_SERVER_TIMEOUT). 0 means no timeout, as in Core.
+    (let ((v (lk "rpcservertimeout")))
+      (when v
+        (let ((n (conf-parse-int v)))
+          (unless (and n (>= n 0))
+            (error "Invalid value for -rpcservertimeout=~A (must be a non-negative integer)" v))
+          (setf bitcoin-lisp.rpc:*rpc-server-timeout* (if (zerop n) nil n)))))
+    alist))
+
 (defun %start-rpc-early (node rpc-port rpc-bind rpc-bind-supplied-p
                          rpc-user rpc-password rpc-auth rpc-allow-ip
                          rest-enabled network webui webui-supplied-p
@@ -3325,6 +3364,9 @@ file location."
       ;; Apply the process-global config specials (options with no start-node
       ;; keyword) from the same merged config, before launching.
       (apply-config-globals merged)
+      ;; The RPC half, which config.lisp cannot express (see
+      ;; APPLY-RPC-CONFIG-GLOBALS).
+      (apply-rpc-config-globals merged)
       ;; datadir only comes from the CLI/default (locating the conf needs it), so
       ;; make sure it reaches start-node even if it wasn't in the spec scan.
       (unless (getf plist :data-directory)
