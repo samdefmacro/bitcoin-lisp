@@ -1976,6 +1976,110 @@ client reach them at all."
 
 ;;; --- Test-harness control RPCs (track B P0) ---
 
+(defun %parse-core-client-cpp ()
+  "Parse Core's vRPCConvertParams out of refs/bitcoin/src/rpc/client.cpp, the
+same way rpc_help.py's process_mapping does.
+
+Returns (values json-rows string-rows), each a list of (method position name).
+Parsing Core's source directly, rather than checking in a copy, is what makes
+this a real oracle: the day Core adds an argument, this test notices."
+  (let ((path (merge-pathnames "refs/bitcoin/src/rpc/client.cpp"
+                               (asdf:system-source-directory :bitcoin-lisp)))
+        (json '()) (strings '()) (in-rpcs nil))
+    (with-open-file (in path :if-does-not-exist nil)
+      (unless in (return-from %parse-core-client-cpp (values nil nil)))
+      (loop for line = (read-line in nil) while line
+            do (cond
+                 ((not in-rpcs)
+                  (when (search "static const CRPCConvertParam vRPCConvertParams[] =" line)
+                    (setf in-rpcs t)))
+                 ((and (>= (length line) 2) (string= "};" (subseq line 0 2)))
+                  (setf in-rpcs nil))
+                 ((and (find #\{ line) (find #\" line))
+                  ;; { "method", N, "argname" [, ParamFormat::X] },
+                  (let* ((q1 (position #\" line))
+                         (q2 (and q1 (position #\" line :start (1+ q1))))
+                         (comma (and q2 (position #\, line :start (1+ q2))))
+                         (q3 (and comma (position #\" line :start comma)))
+                         (q4 (and q3 (position #\" line :start (1+ q3)))))
+                    (when q4
+                      (let* ((method (subseq line (1+ q1) q2))
+                             (num-str (string-trim " ," (subseq line (1+ comma)
+                                                                (or (position #\, line :start (1+ comma))
+                                                                    (length line)))))
+                             (position-n (ignore-errors (parse-integer num-str)))
+                             (name (subseq line (1+ q3) q4))
+                             (row (list method position-n name)))
+                        (when position-n
+                          (if (search "ParamFormat::STRING" line)
+                              (push row strings)
+                              (push row json))))))))))
+    (values (nreverse json) (nreverse strings))))
+
+(test rpc-arg-conversions-match-core
+  "Core's rpc_help.py asserts that a node's dump_all_command_conversions table
+equals src/rpc/client.cpp's vRPCConvertParams. This runs the SAME comparison
+here, in every battery, against Core's actual file — so the two cannot drift
+between functional-test runs.
+
+The comparison is restricted to methods this node implements, and that
+restriction is measured rather than assumed: the second half reports exactly
+which of Core's methods are missing, which is the real remaining distance to
+rpc_help.py passing."
+  (multiple-value-bind (core-json core-strings) (%parse-core-client-cpp)
+    (if (null core-json)
+        (skip "refs/bitcoin not present")
+        (let* ((dump (bitcoin-lisp.rpc::%dump-all-command-conversions))
+               (ours (loop for row across dump
+                           collect (list (aref row 0) (aref row 1) (aref row 2)
+                                         (eq t (aref row 3)))))
+               (our-methods (let ((h (make-hash-table :test 'equal)))
+                              (maphash (lambda (k v) (declare (ignore v))
+                                         (setf (gethash k h) t))
+                                       bitcoin-lisp.rpc::*rpc-methods*)
+                              h))
+               ;; Core's rows, restricted to what we serve.
+               (want-json (remove-if-not (lambda (r) (gethash (first r) our-methods))
+                                         core-json))
+               (want-strings (remove-if-not (lambda (r) (gethash (first r) our-methods))
+                                            core-strings))
+               (got-json (loop for r in ours unless (fourth r)
+                               collect (subseq r 0 3)))
+               (got-strings (loop for r in ours when (fourth r)
+                                  collect (subseq r 0 3))))
+          (flet ((sorted (rows)
+                   (sort (copy-list rows)
+                         (lambda (a b)
+                           (or (string< (first a) (first b))
+                               (and (string= (first a) (first b))
+                                    (or (< (second a) (second b))
+                                        (and (= (second a) (second b))
+                                             (string< (third a) (third b))))))))))
+            (let ((missing (set-difference (sorted want-json) (sorted got-json)
+                                           :test #'equal))
+                  (extra (set-difference (sorted got-json) (sorted want-json)
+                                         :test #'equal)))
+              (is (null missing) "arguments Core converts and we do not: ~S" missing)
+              (is (null extra) "arguments we convert and Core does not: ~S" extra))
+            (let ((missing (set-difference (sorted want-strings) (sorted got-strings)
+                                           :test #'equal)))
+              (is (null missing)
+                  "string arguments Core lists and we do not: ~S" missing))))))
+  ;; And the measured distance to rpc_help.py: which of Core's methods we lack.
+  ;; Named individually, because "22 missing" is not actionable and this is.
+  (multiple-value-bind (core-json core-strings) (%parse-core-client-cpp)
+    (when core-json
+      (let* ((core-methods (remove-duplicates
+                            (mapcar #'first (append core-json core-strings))
+                            :test #'string=))
+             (missing (remove-if (lambda (m) (gethash m bitcoin-lisp.rpc::*rpc-methods*))
+                                 core-methods)))
+        ;; Not an assertion of zero — these are tracked, and the list moving is
+        ;; what matters. It IS an assertion that the list has not GROWN.
+        (is (<= (length missing) 7)
+            "Core methods with typed arguments that this node does not serve ~
+grew to ~D: ~S" (length missing) (sort missing #'string<))))))
+
 (test addconnection-opens-the-named-connection-type
   "addconnection (Core rpc/net.cpp). The functional framework uses it to attach
 its own P2P connections of a CHOSEN type — a block-relay or feeler slot a test
