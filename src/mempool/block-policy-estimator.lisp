@@ -245,7 +245,13 @@ perfect for lack of evidence."
          (cur-near max-bucket) (cur-far max-bucket)
          (best-near max-bucket) (best-far max-bucket)
          (found-answer nil)
-         (new-range t))
+         (new-range t)
+         ;; Core's EstimationResult bookkeeping (block_policy_estimator.cpp:
+         ;; 276-277, 300-340). Reported by estimaterawfee, which is the only
+         ;; way an operator can see WHY an estimate came out where it did.
+         (passing t)
+         (pass-bucket nil)
+         (fail-bucket nil))
     (when (or (< period-target 1) (> period-target (length conf-avg)))
       (return-from tx-confirm-stats-estimate-median -1d0))
     (loop for bucket from max-bucket downto 0
@@ -262,11 +268,36 @@ perfect for lack of evidence."
              (when (>= partial-num (/ sufficient-tx-val (- 1d0 decay)))
                (setf partial-num 0d0)
                (let ((cur-pct (/ n-conf (+ total-num fail-num extra-num))))
-                 (when (>= cur-pct success-break-point)
-                   (setf found-answer t
-                         n-conf 0d0 total-num 0d0 fail-num 0d0 extra-num 0
-                         best-near cur-near best-far cur-far
-                         new-range t)))))
+                 (cond
+                   ((< cur-pct success-break-point)
+                    ;; Record the FIRST failing range only (Core's `passing`
+                    ;; latch): later ranges are worse and would overwrite the
+                    ;; boundary the operator needs to see.
+                    (when passing
+                      (let ((lo (min cur-near cur-far))
+                            (hi (max cur-near cur-far)))
+                        (setf fail-bucket
+                              (list :start (if (plusp lo) (aref buckets (1- lo)) 0)
+                                    :end (aref buckets hi)
+                                    :within-target n-conf
+                                    :total-confirmed total-num
+                                    :in-mempool extra-num
+                                    :left-mempool fail-num)
+                              passing nil))))
+                   (t
+                    ;; Passing again clears any recorded failure, as Core does.
+                    (setf fail-bucket nil
+                          passing t
+                          found-answer t)
+                    (setf pass-bucket
+                          (list :start 0 :end 0   ; filled from the winning range below
+                                :within-target n-conf
+                                :total-confirmed total-num
+                                :in-mempool extra-num
+                                :left-mempool fail-num))
+                    (setf n-conf 0d0 total-num 0d0 fail-num 0d0 extra-num 0
+                          best-near cur-near best-far cur-far
+                          new-range t))))))
     ;; The winning range's transaction-weighted average feerate: find the bucket
     ;; holding the median transaction and report ITS average, which is as close
     ;; to a median as a bucketed history can get.
@@ -281,8 +312,17 @@ perfect for lack of evidence."
               do (if (< (aref txct j) tx-sum)
                      (decf tx-sum (aref txct j))
                      (progn (setf median (/ (aref feerate-avg j) (aref txct j)))
-                            (return)))))
-      median)))
+                            (return))))
+        ;; The winning range's boundaries (Core :367-368), known only now.
+        (when pass-bucket
+          (setf (getf pass-bucket :start)
+                (if (plusp min-bucket) (aref buckets (1- min-bucket)) 0)
+                (getf pass-bucket :end) (aref buckets max-b))))
+      ;; Second value: Core's EstimationResult, for estimaterawfee. Callers
+      ;; that only want the median ignore it, which is every caller but one.
+      (values median
+              (list :pass pass-bucket :fail fail-bucket
+                    :decay decay :scale scale)))))
 
 ;;;; --- The estimator: three horizons over one bucket set ---
 
@@ -532,6 +572,41 @@ pass every txid in the block."
   (let ((est *block-policy-estimator*))
     (when est
       (bpe-process-block est height txids))))
+
+(defun bpe-estimate-raw-fee (conf-target threshold horizon)
+  "Core CBlockPolicyEstimator::estimateRawFee: the feerate for one HORIZON at
+one success THRESHOLD, plus the pass/fail buckets that produced it.
+
+Returns (values sat-per-kvb result), or (values nil nil) when the horizon does
+not track CONF-TARGET. Unlike estimateSmartFee this asks ONE horizon at ONE
+threshold and reports the raw answer, which is exactly what makes it a
+debugging tool: it shows the evidence rather than the max of three estimates."
+  (let ((est *block-policy-estimator*))
+    (when est
+      (let* ((stats (ecase horizon
+                      (:short (block-policy-estimator-short est))
+                      (:medium (block-policy-estimator-med est))
+                      (:long (block-policy-estimator-long est))))
+             (sufficient (if (eq horizon :short)
+                             +sufficient-txs-short+
+                             +sufficient-feetxs+)))
+        (when (and (>= conf-target 1)
+                   (<= conf-target (tx-confirm-stats-max-confirms stats)))
+          (multiple-value-bind (median result)
+              (tx-confirm-stats-estimate-median
+               stats conf-target sufficient threshold
+               (block-policy-estimator-best-height est))
+            (values (if (minusp median) 0 median) result)))))))
+
+(defun horizon-max-confirms (horizon)
+  "The furthest target HORIZON tracks (Core HighestTargetTracked)."
+  (let ((est *block-policy-estimator*))
+    (when est
+      (tx-confirm-stats-max-confirms
+       (ecase horizon
+         (:short (block-policy-estimator-short est))
+         (:medium (block-policy-estimator-med est))
+         (:long (block-policy-estimator-long est)))))))
 
 (defun highest-target-tracked ()
   "The furthest conf_target estimatesmartfee will accept — Core

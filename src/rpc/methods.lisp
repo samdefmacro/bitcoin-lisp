@@ -3254,6 +3254,65 @@ shutdown, so a node reporting none hangs that test forever."
                            (namestring bitcoin-lisp::*log-file-path*))
                       ""))))
 
+(defun %raw-fee-bucket-json (bucket)
+  "One EstimatorBucket as Core renders it (rpc/fees.cpp): the range endpoints
+rounded to whole sat/kvB and the four counters to two decimals."
+  (flet ((r2 (x) (/ (fround (* (float (or x 0) 1d0) 100d0)) 100d0)))
+    `(("startrange" . ,(round (or (getf bucket :start) 0)))
+      ("endrange" . ,(round (or (getf bucket :end) 0)))
+      ("withintarget" . ,(r2 (getf bucket :within-target)))
+      ("totalconfirmed" . ,(r2 (getf bucket :total-confirmed)))
+      ("inmempool" . ,(r2 (getf bucket :in-mempool)))
+      ("leftmempool" . ,(r2 (getf bucket :left-mempool))))))
+
+(defun rpc-estimaterawfee (node params)
+  "The raw per-horizon fee estimates and the buckets behind them (Core
+estimaterawfee, rpc/fees.cpp:97-190). PARAMS: (conf_target [threshold]).
+
+Unlike estimatesmartfee this asks ONE horizon at ONE success threshold and
+reports the evidence rather than the max of three estimates — which is what
+makes it a debugging tool and why Core documents it as such. A horizon that
+does not track CONF-TARGET is OMITTED, not reported as zero: absence and \"no
+answer\" mean different things to whoever is reading this."
+  (declare (ignore node))
+  (let ((conf-target (first params))
+        (threshold (if (null (second params)) 0.95d0 (second params))))
+    (unless (integerp conf-target)
+      (error 'rpc-error :code +rpc-type-error+
+                        :message "Expected type number for conf_target"))
+    (let ((max-target (or (bitcoin-lisp.mempool:highest-target-tracked) 1008)))
+      (unless (<= 1 conf-target max-target)
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "Invalid conf_target, must be between 1 and ~D"
+                                           max-target))))
+    (unless (realp threshold)
+      (error 'rpc-error :code +rpc-type-error+
+                        :message "Expected type number for threshold"))
+    (let ((threshold (float threshold 1d0)))
+      (unless (<= 0 threshold 1)
+        (error 'rpc-error :code +rpc-invalid-parameter+ :message "Invalid threshold"))
+      (let ((result '()))
+        (dolist (horizon '((:short . "short") (:medium . "medium") (:long . "long")))
+          (let ((max-confirms (bitcoin-lisp.mempool:horizon-max-confirms (car horizon))))
+            (when (and max-confirms (<= conf-target max-confirms))
+              (multiple-value-bind (rate buckets)
+                  (bitcoin-lisp.mempool:bpe-estimate-raw-fee
+                   conf-target threshold (car horizon))
+                (when rate
+                  (push
+                   (cons (cdr horizon)
+                         `(("feerate" . ,(/ (float rate 1d0) 100000000d0))
+                           ,@(let ((pass (getf buckets :pass)))
+                               (when pass `(("pass" . ,(%raw-fee-bucket-json pass)))))
+                           ,@(let ((fail (getf buckets :fail)))
+                               (when fail `(("fail" . ,(%raw-fee-bucket-json fail)))))
+                           ,@(when (zerop rate)
+                               ;; Core reports why there is no answer rather
+                               ;; than an empty object.
+                               `(("errors" . #("Insufficient data or no feerate found"))))))
+                   result))))))
+        (or (nreverse result) (make-hash-table :test 'equal))))))
+
 (defun rpc-addpeeraddress (node params)
   "Add an address to the address manager (Core addpeeraddress, rpc/net.cpp).
 For testing only: it is how a functional test seeds addrman without a peer.

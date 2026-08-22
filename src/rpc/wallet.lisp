@@ -778,6 +778,118 @@ wallet.cpp:3594-3602)."
       (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))
     (wallet-maybe-update-birth-time wallet now)))
 
+(defun %create-one-descriptor-spkm (wallet xpub-string master-priv master-pub
+                                    type internal batch now)
+  "Create, key, top up and activate ONE descriptor SPKM. Returns the SPKM, or
+NIL when the wallet already has this exact descriptor.
+
+Factored out of WALLET-SETUP-DESCRIPTOR-SPKMS so createwalletdescriptor builds
+its descriptor by exactly the path wallet creation does — a second
+implementation would be a second set of derivation-path bugs."
+  (let* ((desc-str (generate-wallet-descriptor-string
+                    xpub-string type internal (wallet-network wallet)))
+         (desc (parse-descriptor desc-str (wallet-network wallet)))
+         (id (descriptor-id desc)))
+    (when (gethash id (wallet-spkms wallet))
+      (return-from %create-one-descriptor-spkm nil))
+    (let ((spkm (%make-spkm-from-descriptor desc now 0 0 0)))
+      (setf (gethash id (wallet-spkms wallet)) spkm)
+      (unless (spkm-add-key wallet spkm master-priv master-pub t :batch batch)
+        (error "writing descriptor master private key failed for ~A" desc-str))
+      (unless (spkm-top-up wallet spkm 0 batch)
+        (error "keypool top-up failed for ~A" desc-str))
+      (wallet-add-active-spkm wallet spkm type internal :batch batch)
+      spkm)))
+
+(defun %wallet-single-active-root-xprv (wallet)
+  "The one HD root every active descriptor uses, or an error naming the
+ambiguity (Core createwalletdescriptor's GetActiveHDPubKeys check).
+
+Core refuses when the wallet has more than one active root rather than picking:
+generating a descriptor from the wrong seed produces addresses the operator
+cannot recover from their backup of the other one."
+  (let ((roots '()))
+    (dolist (table (list (wallet-external-spkms wallet)
+                         (wallet-internal-spkms wallet)))
+      (loop for spkm being the hash-values of table
+            do (dolist (key (out-desc-ordered-keys (desc-spkm-desc spkm)))
+                 (let ((xprv (%desc-key-root-xprv
+                              key (spkm-privkey-provider wallet spkm))))
+                   (when xprv
+                     (pushnew (bitcoin-lisp.crypto:bip32-serialize xprv) roots
+                              :test #'string=))))))
+    (cond
+      ((null roots)
+       (error 'rpc-error :code +rpc-invalid-address-or-key+
+                         :message "Unable to determine which HD key to use from active descriptors. Please specify with 'hdkey'"))
+      ((cdr roots)
+       (error 'rpc-error :code +rpc-invalid-address-or-key+
+                         :message "Unable to determine which HD key to use from active descriptors. Please specify with 'hdkey'"))
+      (t (bitcoin-lisp.crypto:bip32-parse (first roots))))))
+
+(defun rpc-createwalletdescriptor (node params)
+  "Create the wallet's descriptor for an address type it does not yet have
+ (Core createwalletdescriptor, wallet/rpc/wallet.cpp:745-836).
+
+PARAMS: (type [{internal, hdkey}]). With no INTERNAL given, BOTH the external
+and internal descriptors are made, which is Core's default and the reason the
+result is an array."
+  (let* ((wallet (wallet-for-request node))
+         (type-string (first params))
+         (options (second params)))
+    (unless (stringp type-string)
+      (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for type"))
+    (let ((type (cdr (assoc type-string
+                            '(("legacy" . :legacy)
+                              ("p2sh-segwit" . :p2sh-segwit)
+                              ("bech32" . :bech32)
+                              ("bech32m" . :bech32m))
+                            :test #'string=))))
+      (unless type
+        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                          :message (format nil "Unknown address type '~A'" type-string)))
+      (let* ((internal-given (and (hash-table-p options)
+                                  (nth-value 1 (gethash "internal" options))))
+             (internals (if internal-given
+                            (list (%positional-bool (gethash "internal" options)))
+                            '(nil t)))
+             (hdkey (and (hash-table-p options) (gethash "hdkey" options))))
+        (with-wallet-lock (wallet)
+          (wallet-ensure-unlocked wallet)
+          (let* ((root (if hdkey
+                           (or (ignore-errors (bitcoin-lisp.crypto:bip32-parse hdkey))
+                               (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                                 :message "Unable to parse HD key. Please provide a valid xpub"))
+                           (%wallet-single-active-root-xprv wallet)))
+                 (xprv (if (bitcoin-lisp.crypto:ext-key-privatep root)
+                           root
+                           ;; An xpub was given: we must hold its private half,
+                           ;; or the descriptor would be watch-only in a wallet
+                           ;; that claims to control it.
+                           (error 'rpc-error :code +rpc-invalid-address-or-key+
+                                             :message (format nil "Private key for ~A is not known"
+                                                              (bitcoin-lisp.crypto:bip32-serialize root)))))
+                 (xpub-string (bitcoin-lisp.crypto:bip32-serialize
+                               (bitcoin-lisp.crypto:bip32-neuter xprv)))
+                 (master-priv (subseq (bitcoin-lisp.crypto:ext-key-key xprv) 1 33))
+                 (master-pub (bitcoin-lisp.crypto:ext-key-public-bytes xprv))
+                 (now (bitcoin-lisp.serialization:get-unix-time))
+                 (made '()))
+            (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
+              (dolist (internal internals)
+                (let ((spkm (%create-one-descriptor-spkm
+                             wallet xpub-string master-priv master-pub
+                             type internal batch now)))
+                  (when spkm (push spkm made))))
+              (unless made
+                ;; Nothing written; the batch is dropped unapplied.
+                (error 'rpc-error :code +rpc-wallet-error+
+                                  :message "Descriptor already exists"))
+              (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))
+            `(("descs" . ,(mapcar (lambda (spkm)
+                                    (%spkm-descriptor-string wallet spkm nil))
+                                  (nreverse made))))))))))
+
 (defun generate-wallet-master-key (network)
   "A fresh random HD master key (Core SetupOwnDescriptorScriptPubKeyMans:
 GenerateRandomKey -> CExtKey::SetSeed over the 32 secret bytes)."
