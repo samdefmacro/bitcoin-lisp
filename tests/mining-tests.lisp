@@ -921,3 +921,61 @@ block not extending the tip (Core validation.cpp:4506-4509)."
          (bitcoin-lisp.validation:test-block-validity block cs utxo)
        (is-false ok)
        (is (eq :inconclusive-not-best-prevblk err))))))
+(defun %gbt-block-on-parent (prev-hash)
+  "A syntactically valid block whose parent is PREV-HASH."
+  (bitcoin-lisp.serialization:make-bitcoin-block
+   :header (bitcoin-lisp.serialization:make-block-header :prev-block prev-hash)
+   :transactions
+   (list (bitcoin-lisp.serialization:make-transaction
+          :version 1
+          :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                           :previous-output
+                           (bitcoin-lisp.serialization:make-outpoint
+                            :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                 :initial-element 0)
+                            :index #xFFFFFFFF)
+                           :script-sig (coerce #(1 2) '(simple-array (unsigned-byte 8) (*)))
+                           :sequence #xFFFFFFFF))
+          :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                            :value 5000000000
+                            :script-pubkey (coerce #(#x51)
+                                                   '(simple-array (unsigned-byte 8) (*)))))
+          :lock-time 0))))
+
+(test gbt-proposal-validates-a-template-without-mining-it
+  "getblocktemplate advertised \"proposal\" in its capabilities while not
+implementing it — a node claiming a capability it does not have. mode=proposal
+is a VALIDATION request, not a request for work: it answers before any template
+is assembled (rpc/mining.cpp:729-751), and it does NOT check proof of work,
+because a proposal is by definition unmined."
+  (%with-regtest
+   (let ((node (%regtest-node-fixture (format nil "gbtp~D" (get-internal-real-time)))))
+    (flet ((propose (data)
+             (let ((req (make-hash-table :test 'equal)))
+               (setf (gethash "mode" req) "proposal")
+               (when data (setf (gethash "data" req) data))
+               (handler-case (bitcoin-lisp.rpc::rpc-getblocktemplate node (list req))
+                 (bitcoin-lisp.rpc::rpc-error (e)
+                   (list :error (bitcoin-lisp.rpc::rpc-error-code e)
+                         (bitcoin-lisp.rpc::rpc-error-message e)))))))
+      ;; A template this node just produced must validate as a proposal —
+      ;; anything else means getblocktemplate is handing miners work the node
+      ;; would itself reject.
+      (let* ((tmpl (bitcoin-lisp.rpc::rpc-getblocktemplate node nil))
+             (prev (cdr (assoc "previousblockhash" tmpl :test #'string=))))
+        (is-true prev "the template has no previousblockhash"))
+      ;; Missing data is Core's type error, not a crash.
+      (is (equal '(:error -3 "Missing data String key for proposal") (propose nil)))
+      ;; Undecodable data is Core's deserialization error.
+      (is (equal '(:error -22 "Block decode failed") (propose "zzzz")))
+      (is (equal '(:error -22 "Block decode failed") (propose "00")))
+      ;; A well-formed block that does not build on the tip is refused with a
+      ;; BIP22 reason rather than signalling out of the RPC — TestBlockValidity
+      ;; requires the tip as parent.
+      (let* ((stray (%gbt-block-on-parent
+                     (make-array 32 :element-type '(unsigned-byte 8)
+                                    :initial-element #x42)))
+             (hex (bitcoin-lisp.crypto:bytes-to-hex
+                   (bitcoin-lisp.serialization:serialize-witness-block stray))))
+        (is (equal "inconclusive-not-best-prevblk" (propose hex))))))))
+
