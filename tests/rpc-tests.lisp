@@ -2229,6 +2229,73 @@ in stop-node, and every subsequent request in the image answered -28."
     (is-true t))
   (is-false bitcoin-lisp.rpc::*rpc-warmup-status*))
 
+(test rest-routes-cover-core-s-endpoint-table
+  "Core registers fifteen /rest/ prefixes (rest.cpp:1143-1158). A route that is
+absent answers \"Unknown REST endpoint\", which is indistinguishable from a
+typo — so this asserts the routes we claim actually ROUTE, by requiring an
+answer that is not the unknown-endpoint 404."
+  (let ((node (make-test-node)))
+    (flet ((routed-p (uri)
+             (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+               (let ((body (handler-case (bitcoin-lisp.rpc::rest-handle node uri)
+                             (error () :signalled))))
+                 (not (and (stringp body)
+                           (search "Unknown REST endpoint" body)))))))
+      ;; Newly added in this change.
+      (dolist (uri '("/rest/deploymentinfo.json"
+                     "/rest/deploymentinfo/00.json"
+                     "/rest/blockfilter/basic/00.json"
+                     "/rest/blockfilterheaders/basic/00.json"
+                     "/rest/spenttxouts/00.json"))
+        (is-true (routed-p uri) "~A is not routed" uri))
+      ;; Already present, asserted so a future reshuffle cannot drop them.
+      (dolist (uri '("/rest/chaininfo.json" "/rest/tx/00.json"
+                     "/rest/block/00.json" "/rest/block/notxdetails/00.json"
+                     "/rest/headers/00.json" "/rest/mempool/info.json"
+                     "/rest/getutxos/00-0.json" "/rest/blockhashbyheight/0.json"))
+        (is-true (routed-p uri) "~A is not routed" uri))
+      ;; And something Core does not register still 404s as unknown.
+      (is-false (routed-p "/rest/nosuchthing.json")))))
+
+(test rest-blockfilterheaders-precedes-blockfilter
+  "\"blockfilter/\" is a PREFIX of \"blockfilterheaders/\", so the longer route
+must be tested first — otherwise every blockfilterheaders request is answered
+by the blockfilter handler, which then reads the filter type as
+\"headers\" and fails with a confusing error instead of serving headers."
+  (let ((node (make-test-node))
+        (hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+    ;; A blockfilterheaders URI must not reach the blockfilter handler's
+    ;; \"expected /rest/blockfilter/<filtertype>/<blockhash>\" complaint.
+    (let ((body (handler-case
+                    (bitcoin-lisp.rpc::rest-handle
+                     node "/rest/blockfilterheaders/basic/notahash.json")
+                  (error () ""))))
+      (is-false (search "Expected /rest/blockfilter/" body)
+                "blockfilterheaders was routed to the blockfilter handler"))))
+
+(test rest-new-endpoints-validate-their-input
+  "Each new endpoint refuses a malformed request with a 400 rather than
+serving something wrong or signalling out of the handler."
+  (let ((node (make-test-node)))
+    (flet ((body-of (uri)
+             (let ((hunchentoot:*reply* (make-instance 'hunchentoot:reply)))
+               (handler-case (bitcoin-lisp.rpc::rest-handle node uri)
+                 (error () :signalled)))))
+      ;; A bad hash is a 400, not a crash.
+      (dolist (uri '("/rest/spenttxouts/nothex.json"
+                     "/rest/blockfilter/basic/nothex.json"))
+        (let ((b (body-of uri)))
+          (is-true (and (stringp b) (search "Invalid block hash" b))
+                   "~A did not refuse a bad hash: ~S" uri b)))
+      ;; blockfilter without a filter type is a URI-format error.
+      (let ((b (body-of "/rest/blockfilter/00.json")))
+        (is-true (and (stringp b) (search "Invalid URI format" b))
+                 "a filter-type-less blockfilter URI was accepted: ~S" b))
+      ;; deploymentinfo is JSON-only, as in Core.
+      (let ((b (body-of "/rest/deploymentinfo.hex")))
+        (is-true (and (stringp b) (search "output format not found" b))
+                 "deploymentinfo served a non-JSON format: ~S" b)))))
+
 ;;; --- Concurrent Access Tests (2.7) ---
 
 (test rpc-concurrent-access-safety

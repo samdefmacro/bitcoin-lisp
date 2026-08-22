@@ -338,6 +338,151 @@ responsive (and correctly reports 503) even when the node is wedged."
 
 ;;; --- Router ---
 
+(defun %rest-deploymentinfo (node body ext)
+  "/rest/deploymentinfo[/<blockhash>] — JSON only, as in Core
+(rest_deploymentinfo, rest.cpp). The hash is optional: without one Core reports
+against the tip."
+  (if (string= ext "json")
+      (handler-case
+          (%rest-json (rpc-getdeploymentinfo
+                       node (if (plusp (length body)) (list body) nil)))
+        (rpc-error (e) (%rest-error 404 (rpc-error-message e))))
+      (%rest-format-not-found "json")))
+
+(defun %rest-blockfilter (node body ext)
+  "/rest/blockfilter/<filtertype>/<blockhash> — the BIP158 filter for a block
+(rest_block_filter, rest.cpp). Core's URI carries the filter type FIRST."
+  (let* ((slash (position #\/ body))
+         (filtertype (and slash (subseq body 0 slash)))
+         (hash (and slash (subseq body (1+ slash)))))
+    (cond
+      ((null slash)
+       (%rest-error 400 "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>."))
+      ((not (valid-hex-hash-p hash)) (%rest-error 400 "Invalid block hash"))
+      (t
+       (handler-case
+           (let ((result (rpc-getblockfilter node (list hash filtertype))))
+             (%rest-by-ext ext
+               :json (%rest-json result)
+               ;; The hex/bin forms carry the FILTER itself, not the wrapper
+               ;; object — Core serializes the filter (rest.cpp).
+               :hex/bin (%rest-hex-or-bin
+                         ext (cdr (assoc "filter" result :test #'string=)))))
+         (rpc-error (e) (%rest-error 404 (rpc-error-message e))))))))
+
+(defun %rest-blockfilterheaders (node body ext)
+  "/rest/blockfilterheaders/<filtertype>/<blockhash>?count=<n>, and Core's
+deprecated /<filtertype>/<count>/<blockhash> form (rest_filter_header,
+rest.cpp).
+
+Walks forward on the active chain from BLOCKHASH exactly as %REST-HEADERS
+does, and for the same reason: a start that is not itself on the active chain
+would otherwise be spliced onto the active chain's successors and return a
+sequence that never existed."
+  (let* ((parts (uiop:split-string body :separator "/"))
+         (filtertype (first parts))
+         ;; Three parts is Core's deprecated <filtertype>/<count>/<blockhash>;
+         ;; two is the current <filtertype>/<blockhash> with ?count=.
+         (deprecated (= (length parts) 3))
+         (hash (if deprecated (third parts) (second parts)))
+         (count (if deprecated
+                    (parse-integer (second parts) :junk-allowed t)
+                    (let ((q (hunchentoot:get-parameter "count")))
+                      (or (and q (parse-integer q :junk-allowed t)) 5)))))
+    (cond
+      ((not (member (length parts) '(2 3)))
+       (%rest-error 400 "Invalid URI format. Expected /rest/blockfilterheaders/<filtertype>/<blockhash>."))
+      ((not (valid-hex-hash-p hash)) (%rest-error 400 "Invalid block hash"))
+      ((or (null count) (< count 1) (> count +rest-max-headers+))
+       (%rest-error 400 "Invalid count"))
+      (t
+       (let* ((chain-state (rpc-get-chain-state node))
+              (start (bitcoin-lisp.storage:get-block-index-entry
+                      chain-state (parse-hex-hash hash))))
+         (cond
+           ((null start) (%rest-error 404 "Block not found"))
+           (t
+            (handler-case
+                (let* ((entries
+                         (when (bitcoin-lisp.storage:entry-on-active-chain-p
+                                chain-state start)
+                           (loop with h = (bitcoin-lisp.storage:block-index-entry-height start)
+                                 for i from 0 below count
+                                 for e = start then (bitcoin-lisp.storage:get-block-at-height
+                                                     chain-state (+ h i))
+                                 while e collect e)))
+                       (headers
+                         (mapcar
+                          (lambda (e)
+                            (let ((result (rpc-getblockfilter
+                                           node
+                                           (list (bitcoin-lisp.crypto:bytes-to-hex
+                                                  (bitcoin-lisp.storage:block-index-entry-hash e))
+                                                 filtertype))))
+                              (cdr (assoc "header" result :test #'string=))))
+                          entries)))
+                  (%rest-by-ext ext
+                    :json (%rest-json (json-array headers))
+                    ;; Core concatenates the raw 32-byte headers.
+                    :hex/bin (%rest-hex-or-bin
+                              ext (apply #'concatenate 'string headers))))
+              (rpc-error (e) (%rest-error 404 (rpc-error-message e)))))))))))
+
+(defun %rest-spenttxouts (node body ext)
+  "/rest/spenttxouts/<blockhash> — the block's CBlockUndo, i.e. the coins its
+inputs spent (rest_spent_txouts, rest.cpp).
+
+The bin/hex forms are Core's CBlockUndo serialization, which is the same codec
+the rev files use; the JSON form is one array per non-coinbase transaction, in
+input order, as BlockUndoToJSON produces."
+  (unless (valid-hex-hash-p body)
+    (return-from %rest-spenttxouts (%rest-error 400 "Invalid block hash")))
+  (let* ((hash (parse-hex-hash body))
+         (store (and hash (rpc-get-block-store node)))
+         (block (and store (bitcoin-lisp.storage:get-block store hash))))
+    (cond
+      ((null block) (%rest-error 404 (format nil "~A not found" body)))
+      (t
+       (let ((undo (bitcoin-lisp.validation:get-undo-data hash)))
+         (handler-case
+             (let ((tx-undos (bitcoin-lisp.storage:block-undo-from-spent-utxos
+                              block (or undo '()))))
+               (%rest-by-ext ext
+                 :json (%rest-json (json-array (%block-undo-json tx-undos node)))
+                 :hex/bin (%rest-hex-or-bin
+                           ext (bitcoin-lisp.crypto:bytes-to-hex
+                                (bitcoin-lisp.storage:serialize-block-undo tx-undos)))))
+           (error ()
+             ;; block-undo-from-spent-utxos refuses undo data that does not
+             ;; account for exactly this block's inputs, which is what a pruned
+             ;; or missing record looks like.
+             (%rest-error 404 (format nil "~A undo not available" body)))))))))
+
+(defun %block-undo-json (tx-undos node)
+  "TX-UNDOS as Core's BlockUndoToJSON: one array per non-coinbase transaction,
+each a list of the coins that transaction's inputs spent."
+  (let ((network (rpc-get-network node)))
+    (mapcar
+     (lambda (tx-undo)
+       (json-array
+        (mapcar
+         (lambda (entry)
+           (let ((spk (bitcoin-lisp.storage:utxo-entry-script-pubkey entry)))
+             `(("value" . ,(/ (bitcoin-lisp.storage:utxo-entry-value entry)
+                              100000000.0d0))
+               ;; Core's ScriptToUniv with include_hex and
+               ;; include_address, which is the shape OUTPUT-TO-JSON already
+               ;; builds for a tx-out.
+               ("scriptPubKey"
+                . ,(let ((addr (and network (%script->address spk network))))
+                     (append
+                      `(("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
+                        ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+                        ("type" . ,(%script-type spk)))
+                      (when addr `(("address" . ,addr)))))))))
+         tx-undo)))
+     tx-undos)))
+
 (defun rest-handle (node uri)
   "Route a /rest/... URI (script-name, query already stripped by Hunchentoot)
 to its handler. Returns the response body; sets status/content-type."
@@ -369,6 +514,25 @@ to its handler. Returns the response body; sets status/content-type."
         ((alexandria:starts-with-subseq "getutxos/" rest)
          (multiple-value-bind (b e) (%rest-split-ext (after "getutxos/"))
            (%rest-getutxos node b e)))
+        ;; deploymentinfo takes an OPTIONAL hash, so both the bare and the
+        ;; slashed forms route here (Core registers both, rest.cpp:1154-1155).
+        ((alexandria:starts-with-subseq "deploymentinfo/" rest)
+         (multiple-value-bind (b e) (%rest-split-ext (after "deploymentinfo/"))
+           (%rest-deploymentinfo node b e)))
+        ((alexandria:starts-with-subseq "deploymentinfo" rest)
+         (multiple-value-bind (b e) (%rest-split-ext rest)
+           (declare (ignore b))
+           (%rest-deploymentinfo node "" e)))
+        ;; blockfilterheaders must precede blockfilter, which is a prefix of it.
+        ((alexandria:starts-with-subseq "blockfilterheaders/" rest)
+         (multiple-value-bind (b e) (%rest-split-ext (after "blockfilterheaders/"))
+           (%rest-blockfilterheaders node b e)))
+        ((alexandria:starts-with-subseq "blockfilter/" rest)
+         (multiple-value-bind (b e) (%rest-split-ext (after "blockfilter/"))
+           (%rest-blockfilter node b e)))
+        ((alexandria:starts-with-subseq "spenttxouts/" rest)
+         (multiple-value-bind (b e) (%rest-split-ext (after "spenttxouts/"))
+           (%rest-spenttxouts node b e)))
         ;; Unauthenticated liveness probe (bitcoin-lisp extension, not Core):
         ;; /rest/health or /rest/health.json.
         ((or (string= rest "health") (string= rest "health.json"))
