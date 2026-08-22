@@ -161,6 +161,41 @@ START-NODE-FROM-ARGS immediately after its sibling."
           (unless (and n (>= n 0))
             (error "Invalid value for -rpcservertimeout=~A (must be a non-negative integer)" v))
           (setf bitcoin-lisp.rpc:*rpc-server-timeout* (if (zerop n) nil n)))))
+    ;; --- Wallet knobs over paths that already exist (track D's Wallet group).
+    ;; Every one of these has a special with Core's name and default already;
+    ;; what was missing was the option that sets it.
+    ;;
+    ;; They live here rather than in APPLY-CONFIG-GLOBALS for the same load-order
+    ;; reason the RPC ones do: these specials are in BITCOIN-LISP.RPC, whose
+    ;; package config.lisp compiles before.
+    (macrolet ((fee-knob (option place)
+                 ;; Core's fee options are BTC/kvB on the command line and
+                 ;; satoshis internally, as -maxtxfee and -fallbackfee already
+                 ;; are in apply-config-globals.
+                 `(let ((v (lk ,option)))
+                    (when v
+                      (let ((sats (conf-parse-money v)))
+                        (unless sats
+                          (error "Invalid amount for -~A=~A" ,option v))
+                        (setf ,place sats)))))
+               (int-knob (option place &key (min 0))
+                 `(let ((v (lk ,option)))
+                    (when v
+                      (let ((n (conf-parse-int v)))
+                        (unless (and n (>= n ,min))
+                          (error "Invalid value for -~A=~A" ,option v))
+                        (setf ,place n)))))
+               (bool-knob (option place)
+                 `(let ((v (lk ,option)))
+                    (when v (setf ,place (conf-parse-bool v))))))
+      (fee-knob "mintxfee" bitcoin-lisp.rpc::*wallet-min-tx-fee*)
+      (fee-knob "discardfee" bitcoin-lisp.rpc::*wallet-discard-rate*)
+      (fee-knob "consolidatefeerate" bitcoin-lisp.rpc::*wallet-consolidate-feerate*)
+      (fee-knob "maxapsfee" bitcoin-lisp.rpc::*wallet-max-aps-fee*)
+      (int-knob "txconfirmtarget" bitcoin-lisp.rpc::*wallet-confirm-target* :min 1)
+      (bool-knob "walletrbf" bitcoin-lisp.rpc::*wallet-signal-rbf*)
+      (bool-knob "spendzeroconfchange" bitcoin-lisp.rpc::*wallet-spend-zero-conf-change*)
+      (bool-knob "walletrejectlongchains" bitcoin-lisp.rpc::*wallet-reject-long-chains*))
     alist))
 
 (defun %start-rpc-early (node rpc-port rpc-bind rpc-bind-supplied-p
