@@ -220,3 +220,296 @@ a regression in the compressor shows up here too."
          (ours (+ 4 4 4                       ; magic + version + count
                   (* (length spent) (+ 32 4 8 4 1 4 1)))))
     (is (< core-bytes ours))))
+
+;;;; P6: undo data in rev?????.dat
+;;;;
+;;;; The tests above prove the CODEC. These prove the WIRING: that the codec is
+;;;; what actually reaches the disk, that the legacy format still reads, and
+;;;; that a restart does not overwrite live undo data.
+
+(defmacro %with-undo-store ((store chain-state dir) &body body)
+  "A temp data directory with a flat-file block store, a chain state, and the
+undo specials bound to them."
+  `(let* ((,dir (merge-pathnames
+                 (format nil "bl-undo-~D/" (get-internal-real-time))
+                 (uiop:temporary-directory)))
+          (bitcoin-lisp.storage:*flat-block-files* t))
+     (unwind-protect
+          (progn
+            (ensure-directories-exist ,dir)
+            (let* ((,store (bitcoin-lisp.storage:init-block-store ,dir))
+                   (,chain-state (bitcoin-lisp.storage:make-chain-state))
+                   (bitcoin-lisp.validation::*undo-block-store* ,store)
+                   (bitcoin-lisp.validation::*undo-chain-state* ,chain-state)
+                   (bitcoin-lisp.validation::*undo-base-path*
+                     (merge-pathnames "undo/" ,dir)))
+              ;; Declared here so a body that uses only some of the three need
+              ;; not open with a DECLARE of its own — spliced in below, it would
+              ;; not be at the head of a binding form.
+              (declare (ignorable ,store ,chain-state))
+              (ensure-directories-exist bitcoin-lisp.validation::*undo-base-path*)
+              ,@body))
+       (ignore-errors (uiop:delete-directory-tree ,dir :validate t
+                                                      :if-does-not-exist :ignore)))))
+
+(defun %undo-store-block (store chain-state block height)
+  "Store BLOCK flat, add its index entry, and record nFile/nDataPos — the state
+save-undo-data-to-disk needs before it can write a rev record."
+  (let ((hash (bitcoin-lisp.serialization:block-header-hash
+               (bitcoin-lisp.serialization:bitcoin-block-header block))))
+    (let ((located (nth-value 1 (bitcoin-lisp.storage:store-block
+                                 store block :height height))))
+      (bitcoin-lisp.storage:add-block-index-entry
+       chain-state
+       (bitcoin-lisp.storage:make-block-index-entry
+        :hash hash :height height
+        :header (bitcoin-lisp.serialization:bitcoin-block-header block)
+        :status :valid))
+      (bitcoin-lisp.storage:note-block-position chain-state hash located)
+      hash)))
+
+(test undo-round-trips-through-a-rev-file
+  "The connect path writes Core's CBlockUndo into the rev file paired with the
+block's blk file, and the disconnect path reads the same triples back.
+
+This is the wiring the codec was written for: before it, save-undo-data-to-disk
+wrote (txid, index, entry) triples into one file per block, and the codec had
+no caller at all."
+  (%with-undo-store (store chain-state dir)
+    (let* ((block (%bu-test-block '(2 1 3)))
+           (spent (%bu-spent-for block))
+           (hash (%undo-store-block store chain-state block 7)))
+      (let ((pos (bitcoin-lisp.validation::save-undo-data-to-disk
+                  hash spent :block block)))
+        (is-true pos "the undo record did not go to a rev file")
+        ;; nUndoPos is recorded on the index entry, which is the ONLY thing
+        ;; that can find the record again.
+        (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+          (is-true (bitcoin-lisp.storage:block-index-entry-undo-pos entry))
+          (is (eql (bitcoin-lisp.storage:block-index-entry-file entry)
+                   (bitcoin-lisp.storage:flat-file-pos-file pos))
+              "the undo record must live in the block's own file number"))
+        ;; No legacy file was written.
+        (is-false (probe-file (bitcoin-lisp.validation::undo-file-path hash))
+                  "a rev record was written AND a legacy file"))
+      (let ((back (bitcoin-lisp.validation::load-undo-data-from-disk hash)))
+        (is (= (length spent) (length back)))
+        (is-true (bitcoin-lisp.validation::%undo-lists-equal-p spent back)
+                 "the triples did not survive the rev-file round trip")))))
+
+(test undo-falls-back-to-the-legacy-file-and-still-reads-it
+  "Two fallbacks, both of which a live store depends on. Without a block the
+Core format cannot be written at all (it has no outpoints, so grouping needs
+the block); and a block that is not in a flat file has no rev file to pair
+with, since an undo record must go in its block's file number."
+  (%with-undo-store (store chain-state dir)
+    (let* ((block (%bu-test-block '(1 2)))
+           (spent (%bu-spent-for block))
+           (hash (%undo-store-block store chain-state block 3)))
+      ;; No block supplied: legacy format, and it reads back.
+      (is-false (bitcoin-lisp.validation::save-undo-data-to-disk hash spent)
+                "wrote a rev record with no block to group by")
+      (is-true (probe-file (bitcoin-lisp.validation::undo-file-path hash)))
+      (is-true (bitcoin-lisp.validation::%undo-lists-equal-p
+                spent (bitcoin-lisp.validation::load-undo-data-from-disk hash)))
+      ;; Flat files off: legacy, even with the block in hand.
+      (let ((bitcoin-lisp.storage:*flat-block-files* nil))
+        (is-false (bitcoin-lisp.validation::save-undo-data-to-disk
+                   hash spent :block block)
+                  "wrote a rev record with the flat files off")))))
+
+(test undo-dual-read-prefers-the-rev-record
+  "A store that has ever had the flat files on holds both forms, and the
+migration writes the rev record BEFORE deleting the legacy file. Preferring the
+rev record is what makes a half-migrated store read the copy that is certainly
+complete — and what makes a failed migration recoverable by clearing nUndoPos."
+  (%with-undo-store (store chain-state dir)
+    (let* ((block (%bu-test-block '(2)))
+           (spent (%bu-spent-for block))
+           (hash (%undo-store-block store chain-state block 5)))
+      ;; Both forms on disk, with DIFFERENT contents so the answer identifies
+      ;; which one was read.
+      (bitcoin-lisp.validation::save-undo-data-to-disk hash spent)
+      (is-true (probe-file (bitcoin-lisp.validation::undo-file-path hash)))
+      (let ((altered (mapcar (lambda (triple)
+                               (destructuring-bind (txid index entry) triple
+                                 (list txid index
+                                       (%bu-entry :value 424242
+                                                  :height (bitcoin-lisp.storage:utxo-entry-height entry)))))
+                             spent)))
+        (bitcoin-lisp.validation::save-undo-data-to-disk hash altered :block block)
+        (let ((back (bitcoin-lisp.validation::load-undo-data-from-disk hash)))
+          (is-true (bitcoin-lisp.validation::%undo-lists-equal-p altered back)
+                   "the legacy file was read even though a rev record existed")))
+      ;; Clearing nUndoPos falls back to the legacy file, which is exactly how
+      ;; a failed migration keeps serving the trustworthy copy.
+      (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+        (setf (bitcoin-lisp.storage:block-index-entry-undo-pos entry) nil))
+      (is-true (bitcoin-lisp.validation::%undo-lists-equal-p
+                spent (bitcoin-lisp.validation::load-undo-data-from-disk hash))))))
+
+(test undo-record-checksum-is-verified
+  "Core checksums every undo record with SHA256d(prev block hash || payload)
+and treats a mismatch as a failed read (UndoReadFromDisk,
+blockstorage.cpp:1075-1096). The prev hash is not stored in the record, so the
+checksum also binds the record to the block that claims it."
+  (%with-undo-store (store chain-state dir)
+    (let* ((payload (coerce #(1 2 3 4 5) '(simple-array (unsigned-byte 8) (*))))
+           (prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+           (other (make-array 32 :element-type '(unsigned-byte 8) :initial-element 8))
+           (pos (bitcoin-lisp.storage:store-undo-flat store 0 prev payload)))
+      (is (equalp payload (bitcoin-lisp.storage:read-undo-flat store pos prev)))
+      (is-false (bitcoin-lisp.storage:read-undo-flat store pos other)
+                "a record read with the wrong prev hash passed its checksum")
+      ;; A position that is not a record at all reads as absent, not as an error.
+      (is-false (bitcoin-lisp.storage:read-undo-flat
+                 store (bitcoin-lisp.storage:make-flat-file-pos 0 4000) prev)))))
+
+(test undo-append-cursor-survives-a-restart
+  "A rev record carries no block hash, so nothing can rebuild the hash->record
+map by scanning — but the APPEND CURSOR still has to be recovered, or the first
+undo record written after a restart lands on top of the records already there.
+Core persists nUndoSize per file; we re-derive it by walking the framing."
+  (%with-undo-store (store chain-state dir)
+    (let* ((prev (make-array 32 :element-type '(unsigned-byte 8) :initial-element 3))
+           (a (coerce #(10 11 12) '(simple-array (unsigned-byte 8) (*))))
+           (b (coerce #(20 21 22 23 24) '(simple-array (unsigned-byte 8) (*))))
+           (pos-a (bitcoin-lisp.storage:store-undo-flat store 0 prev a)))
+      ;; Reopen the store, as a restart would.
+      (let ((reopened (bitcoin-lisp.storage:init-block-store dir)))
+        (let ((pos-b (bitcoin-lisp.storage:store-undo-flat reopened 0 prev b)))
+          (is (> (bitcoin-lisp.storage:flat-file-pos-pos pos-b)
+                 (bitcoin-lisp.storage:flat-file-pos-pos pos-a))
+              "the second record was written at or before the first")
+          ;; Both records are intact — the point of recovering the cursor.
+          (is (equalp a (bitcoin-lisp.storage:read-undo-flat reopened pos-a prev))
+              "the restart overwrote the record already in the file")
+          (is (equalp b (bitcoin-lisp.storage:read-undo-flat reopened pos-b prev))))))))
+
+(test undo-migrates-out-of-a-legacy-file
+  "migrateblocks moves a block's undo data into the matching rev file, and only
+deletes the legacy file once the rev record has been read back and compared —
+the same safety rule the block migration follows, because until then the legacy
+file is the only copy."
+  (%with-undo-store (store chain-state dir)
+    (let* ((block (%bu-test-block '(3 1)))
+           (spent (%bu-spent-for block))
+           (hash (%undo-store-block store chain-state block 11)))
+      (bitcoin-lisp.validation::save-undo-data-to-disk hash spent)
+      (is-true (probe-file (bitcoin-lisp.validation::undo-file-path hash)))
+      (is (eq :migrated (bitcoin-lisp.validation:migrate-undo-to-flat hash)))
+      (is-false (probe-file (bitcoin-lisp.validation::undo-file-path hash))
+                "the legacy undo file survived a successful migration")
+      (is-true (bitcoin-lisp.validation::%undo-lists-equal-p
+                spent (bitcoin-lisp.validation::load-undo-data-from-disk hash)))
+      ;; Nothing to migrate is not a failure.
+      (is (eq :skipped (bitcoin-lisp.validation:migrate-undo-to-flat hash))))))
+
+(test undo-append-cursor-survives-the-real-startup-sequence
+  "The live node runs init-block-store AND THEN rebuild-block-file-info, which
+opens with a clrhash of the per-file table. Recovering the rev cursors in
+init-block-store alone is therefore not enough — and the first version of this
+work did exactly that.
+
+What went wrong is worth stating precisely, because a green suite hid it: with
+UNDO-SIZE back at 0, the next undo record written to a file allocated from
+offset 0, and flat-file-allocate PREALLOCATES A WHOLE CHUNK OF ZEROS — one MiB
+straight over the records already there. Every block whose nUndoPos fell in
+that MiB then failed its checksum, get-undo-data returned NIL, and perform-reorg
+refused permanently. Once per restart, per rev file."
+  (%with-undo-store (store chain-state dir)
+    (let* ((block (%bu-test-block '(2 2)))
+           (spent (%bu-spent-for block))
+           (hash (%undo-store-block store chain-state block 4)))
+      (is-true (bitcoin-lisp.validation::save-undo-data-to-disk
+                hash spent :block block))
+      (let ((entry (bitcoin-lisp.storage:get-block-index-entry chain-state hash)))
+        ;; Restart, exactly as the node does it.
+        (let ((reopened (bitcoin-lisp.storage:init-block-store dir)))
+          (bitcoin-lisp.storage:rebuild-block-file-info reopened chain-state)
+          (let ((bitcoin-lisp.validation::*undo-block-store* reopened))
+            ;; The cursor must be past the existing record.
+            (let* ((prev (make-array 32 :element-type '(unsigned-byte 8)
+                                        :initial-element 7))
+                   (pos (bitcoin-lisp.storage:store-undo-flat
+                         reopened
+                         (bitcoin-lisp.storage:block-index-entry-file entry)
+                         prev (coerce #(1 2 3) '(simple-array (unsigned-byte 8) (*))))))
+              (is (> (bitcoin-lisp.storage:flat-file-pos-pos pos)
+                     (bitcoin-lisp.storage:block-index-entry-undo-pos entry))
+                  "the post-restart write landed on top of the existing record"))
+            ;; And the original record still reads, which is the real assertion.
+            (is-true (bitcoin-lisp.validation::%undo-lists-equal-p
+                      spent (bitcoin-lisp.validation::load-undo-data-from-disk hash))
+                     "the restart destroyed undo data that was already on disk")))))))
+
+(test undo-is-written-once-per-block
+  "Core writes undo data only when the block has none: `if (block.GetUndoPos()
+.IsNull())` (blockstorage.cpp:970). Without that guard a block disconnected and
+reconnected by a reorg appends a second full record every time — and nUndoPos
+changes VALUE while its presence is unchanged, which the header index's delta
+log keys on, so the persisted offset silently stays a generation behind."
+  (%with-undo-store (store chain-state dir)
+    (let* ((block (%bu-test-block '(1 1)))
+           (spent (%bu-spent-for block))
+           (hash (%undo-store-block store chain-state block 6))
+           (first-pos (bitcoin-lisp.validation::save-undo-data-to-disk
+                       hash spent :block block))
+           (bytes-after-first (bitcoin-lisp.storage:block-storage-size-mib store)))
+      (let ((second-pos (bitcoin-lisp.validation::save-undo-data-to-disk
+                         hash spent :block block)))
+        (is (= (bitcoin-lisp.storage:flat-file-pos-pos first-pos)
+               (bitcoin-lisp.storage:flat-file-pos-pos second-pos))
+            "a second connect appended a duplicate undo record"))
+      (is (= bytes-after-first (bitcoin-lisp.storage:block-storage-size-mib store))
+          "the skipped write still grew the storage total")
+      (is-true (bitcoin-lisp.validation::%undo-lists-equal-p
+                spent (bitcoin-lisp.validation::load-undo-data-from-disk hash))))))
+
+(test undo-migration-verifies-against-the-legacy-copy
+  "The read-back check must compare the rev record against the LEGACY file, so
+it has to read the legacy file specifically. Reading through the dual-read path
+returns the rev record once nUndoPos is set — the check would then compare that
+record against itself, pass for that reason alone, and delete a legacy file
+nothing had verified."
+  (%with-undo-store (store chain-state dir)
+    (let* ((block (%bu-test-block '(2)))
+           (spent (%bu-spent-for block))
+           (hash (%undo-store-block store chain-state block 9)))
+      ;; Both forms present, with DIFFERENT contents: legacy is the truth.
+      (bitcoin-lisp.validation::save-undo-data-to-disk hash spent)
+      (let ((wrong (mapcar (lambda (triple)
+                             (destructuring-bind (txid index entry) triple
+                               (declare (ignore entry))
+                               (list txid index (%bu-entry :value 1 :height 1))))
+                           spent)))
+        (bitcoin-lisp.validation::save-undo-data-to-disk hash wrong :block block))
+      ;; The rev record now disagrees with the legacy file. Migration must
+      ;; notice and keep the legacy copy.
+      (is-false (eq :migrated (bitcoin-lisp.validation:migrate-undo-to-flat hash))
+                "migration accepted a rev record that disagrees with the legacy file")
+      (is-true (probe-file (bitcoin-lisp.validation::undo-file-path hash))
+               "migration deleted an unverified legacy undo file")
+      ;; And with nUndoPos cleared by the failure, the legacy copy is served.
+      (is-true (bitcoin-lisp.validation::%undo-lists-equal-p
+                spent (bitcoin-lisp.validation::load-undo-data-from-disk hash))))))
+
+(test undo-bytes-count-toward-the-storage-total
+  "Core's CalculateCurrentUsage sums nSize + nUndoSize (blockstorage.cpp:793-802)
+and prunes on that figure. Ours must too: prune-flat-block-file frees the
+blk/rev PAIR and decrements by both, so a write path that never added the rev
+bytes walks the running total down at every prune until it decides it is
+already under target and stops pruning — silently, while the disk fills."
+  (%with-undo-store (store chain-state dir)
+    (let* ((block (%bu-test-block '(3)))
+           (spent (%bu-spent-for block))
+           (hash (%undo-store-block store chain-state block 2))
+           (before (bitcoin-lisp.storage:block-store-total-bytes store)))
+      (bitcoin-lisp.validation::save-undo-data-to-disk hash spent :block block)
+      (is (> (bitcoin-lisp.storage:block-store-total-bytes store) before)
+          "the undo record did not count toward the storage total")
+      ;; A restart re-derives the same figure rather than a different one.
+      (let ((reopened (bitcoin-lisp.storage:init-block-store dir)))
+        (is (= (bitcoin-lisp.storage:block-store-total-bytes store)
+               (bitcoin-lisp.storage:block-store-total-bytes reopened))
+            "the live total and the re-derived total disagree")))))

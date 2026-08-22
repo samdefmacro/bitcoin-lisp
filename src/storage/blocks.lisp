@@ -47,6 +47,10 @@ turning the flag on and off again leaves every block reachable.")
   (blk-seq nil)
   (cursor-file 0 :type (unsigned-byte 32))
   (cursor-pos 0 :type (unsigned-byte 32))
+  ;; The rev sequence. It needs no cursor pair: an undo record goes into the
+  ;; file its block went into, at that file's own UNDO-SIZE offset, so the
+  ;; per-file accounting IS the cursor (Core CBlockFileInfo::nUndoSize).
+  (rev-seq nil)
   ;; The blocksdir obfuscation key, read or created once at init.
   (xor-key nil)
   ;; File number -> BLOCK-FILE-INFO (Core m_blockfile_info). What makes
@@ -125,17 +129,19 @@ which is what Core records as nDataPos."
       (flat-file-allocate seq pos need)
       ;; Obfuscated at the record's real file offset: the key alignment of
       ;; every byte depends on where it lands, not on where the buffer starts.
-      (let ((on-disk (obfuscate! (copy-seq record) (block-store-xor-key store)
-                                 :key-offset start)))
-        (with-open-file (out (flat-file-name seq pos)
-                             :direction :io :element-type '(unsigned-byte 8)
-                             :if-exists :overwrite :if-does-not-exist :create)
-          (file-position out start)
-          (write-sequence on-disk out)
-          (finish-output out)
-          ;; Same durability rule as the per-block path: connect-block stores
-          ;; the block before the chainstate flush that references it.
-          #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd out)))))
+      ;; RECORD is freshly built by FLAT-RECORD-BYTES and read by nobody after
+      ;; the write, so it is obfuscated in place — a copy is a second full
+      ;; block-sized allocation on the IBD hot path.
+      (obfuscate! record (block-store-xor-key store) :key-offset start)
+      (with-open-file (out (flat-file-name seq pos)
+                           :direction :io :element-type '(unsigned-byte 8)
+                           :if-exists :overwrite :if-does-not-exist :create)
+        (file-position out start)
+        (write-sequence record out)
+        (finish-output out)
+        ;; Same durability rule as the per-block path: connect-block stores
+        ;; the block before the chainstate flush that references it.
+        #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd out))))
       (setf (block-store-cursor-pos store) (+ start need))
       (make-flat-file-pos file (+ start +storage-header-bytes+)))))
 
@@ -182,6 +188,166 @@ the record is missing, mis-framed, or unreadable."
         (setf (block-file-info-height-first info) (if first (min first height) height)
               (block-file-info-height-last info) (if last (max last height) height))))
     info))
+
+(defun %rev-seq (store)
+  "The rev file sequence, created on demand."
+  (or (block-store-rev-seq store)
+      (setf (block-store-rev-seq store)
+            (make-flat-file-seq (ensure-directories store) "rev"
+                                +undofile-chunk-size+))))
+
+(defun block-flat-file-number (store hash)
+  "The blk file number HASH's body is in, or NIL when it is not in a flat file.
+
+Read from the store's own hash -> position map, which is the ONE place that is
+always current. A block index entry's nFile can be stale — a block stored twice
+(the fork path stores it, then activation stores it again) leaves the entry
+naming the first record while the store points at the second — and an undo
+record written into the wrong file number is deleted by pruning while its block
+survives."
+  (let ((located (gethash hash (block-store-index store))))
+    (and (flat-file-pos-p located) (flat-file-pos-file located))))
+
+(defun store-undo-flat (store file prev-block-hash undo-bytes)
+  "Append a serialized CBlockUndo to rev<FILE>.dat and return its
+FLAT-FILE-POS, whose POS points PAST the 8-byte header at the payload — which
+is what Core records as nUndoPos.
+
+FILE is the BLOCK's own file number, not a cursor of our choosing: Core's
+FindUndoPos allocates in _pos.nFile, the file the block itself went into
+(blockstorage.cpp:996-1026). That pairing is what makes pruning correct, since
+prune-flat-block-file deletes blk<N>.dat and rev<N>.dat together — an undo
+record in some other file would be deleted while its block was still needed, or
+survive its block forever.
+
+The append offset is the file's own UNDO-SIZE (Core CBlockFileInfo::nUndoSize),
+so undo records pack independently of how full the blk file is."
+  (let* ((seq (%rev-seq store))
+         (record (undo-record-bytes (block-network-magic) prev-block-hash undo-bytes))
+         (info (%store-file-info store file))
+         (start (block-file-info-undo-size info))
+         (pos (make-flat-file-pos file start)))
+    (flat-file-allocate seq pos (length record))
+    ;; Obfuscated at the record's real file offset, like a block record: the
+    ;; key alignment of every byte depends on where it lands. Core applies the
+    ;; blocksdir XOR key to rev files exactly as it does to blk files.
+    (obfuscate! record (block-store-xor-key store) :key-offset start)
+    (with-open-file (out (flat-file-name seq pos)
+                         :direction :io :element-type '(unsigned-byte 8)
+                         :if-exists :overwrite :if-does-not-exist :create)
+      (file-position out start)
+      (write-sequence record out)
+      (finish-output out)
+      ;; Undo data must be durable before the chainstate that depends on it,
+      ;; the same rule the block path follows.
+      #+sbcl (ignore-errors (sb-posix:fsync (sb-sys:fd-stream-fd out))))
+    (setf (block-file-info-undo-size info) (+ start (length record)))
+    ;; Undo bytes count toward the storage total, as they do in Core
+    ;; (CalculateCurrentUsage sums nSize + nUndoSize, blockstorage.cpp:793-802).
+    ;; Without this the live path never adds what prune-flat-block-file later
+    ;; subtracts, so every pruned file walked the total DOWN by its rev file's
+    ;; size until pruning decided it was already under target and stopped.
+    (incf (block-store-total-bytes store) (length record))
+    (make-flat-file-pos file (+ start +storage-header-bytes+))))
+
+(defun read-undo-flat (store pos prev-block-hash)
+  "The serialized CBlockUndo payload whose record header sits 8 bytes before
+POS, or NIL when the record is missing, mis-framed, or fails its checksum.
+
+Core verifies SHA256d(prev block hash || payload) on every undo read
+(UndoReadFromDisk, blockstorage.cpp:1075-1096) and treats a mismatch as a
+failed read, not a corrupt-database abort — so this returns NIL and lets the
+caller fall back or re-derive."
+  (let* ((seq (%rev-seq store))
+         (path (flat-file-name seq pos))
+         (key (block-store-xor-key store))
+         (payload-start (flat-file-pos-pos pos))
+         (record-start (- payload-start +storage-header-bytes+)))
+    ;; A position inside the header cannot name a record. Core guards the same
+    ;; case and names its two sources — pruning, and a default-constructed
+    ;; position (UndoReadFromDisk, blockstorage.cpp:1084-1090) — both of which
+    ;; reach here as a stale or zero nUndoPos out of the persisted index.
+    (when (and (>= record-start 0) (probe-file path))
+      (with-open-file (in path :direction :input :element-type '(unsigned-byte 8))
+        (let ((size (file-length in)))
+          (when (<= payload-start size)
+            (file-position in record-start)
+            (let ((header (make-array +storage-header-bytes+
+                                      :element-type '(unsigned-byte 8))))
+              (read-sequence header in)
+              (obfuscate! header key :key-offset record-start)
+              (multiple-value-bind (magic length) (parse-flat-record-header header)
+                (when (and (equalp magic (block-network-magic))
+                           (plusp length)
+                           ;; the payload AND the checksum that follows it
+                           (<= (+ payload-start length
+                                  (- +undo-data-disk-overhead+ +storage-header-bytes+))
+                               size))
+                  (let ((payload (make-array length :element-type '(unsigned-byte 8)))
+                        (checksum (make-array 32 :element-type '(unsigned-byte 8))))
+                    (read-sequence payload in)
+                    (obfuscate! payload key :key-offset payload-start)
+                    (read-sequence checksum in)
+                    (obfuscate! checksum key :key-offset (+ payload-start length))
+                    (when (equalp checksum
+                                  (undo-record-checksum prev-block-hash payload))
+                      payload)))))))))))
+
+(defun %existing-rev-file-numbers (store)
+  "The file numbers that actually have a rev?????.dat, ascending."
+  (sort (loop for path in (directory
+                           (merge-pathnames "rev*.dat" (ensure-directories store)))
+              for name = (pathname-name path)
+              for number = (and (> (length name) 3)
+                                (parse-integer name :start 3 :junk-allowed t))
+              when number collect number)
+        #'<))
+
+(defun %scan-flat-undo-files (store)
+  "Set every rev file's append cursor (BLOCK-FILE-INFO UNDO-SIZE) by walking its
+records. Returns the bytes accounted for.
+
+Unlike the blk scan this rebuilds no hash index, because it cannot: an undo
+record carries no block hash, and the only thing naming it is the block index's
+persisted nUndoPos. Core keeps the same split — rev files are pure payload and
+CBlockIndex owns the addressing. All this recovers is where the next record may
+safely go, so a restart does not overwrite live undo data."
+  (let ((seq (%rev-seq store))
+        (key (block-store-xor-key store))
+        (magic (block-network-magic))
+        (bytes 0))
+    ;; Enumerated, not counted from 0 until one is missing: rev numbering has
+    ;; holes. Pruning deletes the lowest-numbered files first, and a blk file
+    ;; holding only never-connected side-chain blocks never gets a rev sibling
+    ;; at all. Stopping at the first gap would leave every file above it with
+    ;; an UNDO-SIZE of 0, and the next undo record written there would
+    ;; preallocate a chunk of zeros over the records already in it.
+    (dolist (file (%existing-rev-file-numbers store))
+      (let ((path (flat-file-name seq (make-flat-file-pos file 0))))
+          (with-open-file (in path :direction :input
+                                      :element-type '(unsigned-byte 8))
+               (let ((size (file-length in))
+                     (offset 0)
+                     (header (make-array +storage-header-bytes+
+                                         :element-type '(unsigned-byte 8))))
+                 (loop
+                   (when (> (+ offset +storage-header-bytes+) size) (return))
+                   (file-position in offset)
+                   (read-sequence header in)
+                   (obfuscate! header key :key-offset offset)
+                   (multiple-value-bind (found length) (parse-flat-record-header header)
+                     ;; Stop at the first thing that is not a record — which is
+                     ;; what the preallocated zero tail looks like.
+                     (unless (and (equalp found magic)
+                                  (plusp length)
+                                  (<= (+ offset length +undo-data-disk-overhead+) size))
+                       (return))
+                     (let ((consumed (+ length +undo-data-disk-overhead+)))
+                       (incf bytes consumed)
+                       (incf offset consumed))))
+                 (setf (block-file-info-undo-size (%store-file-info store file))
+                       offset)))))
+    bytes))
 
 (defun store-block (store block &key height)
   "Store a block in the block store.
@@ -368,6 +534,10 @@ zero tail of the file currently being appended to looks like."
       ;; Then the flat files. Both forms are indexed, which is what makes the
       ;; store readable across the transition in either direction.
       (incf total-bytes (%scan-flat-block-files store))
+      ;; And the rev files, which only restore each file's append cursor —
+      ;; without this a restart would write the next undo record over the
+      ;; records already in the file.
+      (incf total-bytes (%scan-flat-undo-files store))
       (setf (block-store-total-bytes store) total-bytes))
     store))
 
@@ -424,6 +594,13 @@ block is and the header index knows WHAT HEIGHT it is, and pruning needs both."
              (let ((path (flat-file-name (%blk-seq store) (make-flat-file-pos file 0))))
                (setf (block-file-info-size info) (or (file-size-bytes path) 0))))
            (block-store-file-info store))
+  ;; The clrhash above dropped every UNDO-SIZE, which is the rev files' append
+  ;; cursor and is derived from a different source than everything else here.
+  ;; Re-derive it, so this function is the single point at which the table is
+  ;; fully populated: leaving it at 0 made the next undo record written to a
+  ;; file preallocate a chunk of zeros over the records already in it, and the
+  ;; blocks in that chunk became permanently undisconnectable.
+  (%scan-flat-undo-files store)
   (hash-table-count (block-store-file-info store)))
 
 (defun %prunable-flat-files (store min-height max-height)
@@ -461,11 +638,8 @@ callback keeps storage from having to reach into the chain state."
     (dolist (hash hashes)
       (remhash hash (block-store-index store))
       (when on-prune (funcall on-prune hash)))
-    (dolist (prefix '("blk" "rev"))
-      (let ((path (flat-file-name
-                   (make-flat-file-seq (ensure-directories store) prefix
-                                       +blockfile-chunk-size+)
-                   (make-flat-file-pos file 0))))
+    (dolist (seq (list (%blk-seq store) (%rev-seq store)))
+      (let ((path (flat-file-name seq (make-flat-file-pos file 0))))
         (let ((size (file-size-bytes path)))
           (when size
             (ignore-errors (delete-file path))

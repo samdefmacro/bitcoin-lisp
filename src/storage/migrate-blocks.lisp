@@ -118,6 +118,12 @@ the caller must treat as a reason to stop, not to continue."
                                  (bitcoin-lisp.serialization:bitcoin-block-header check))))
                    (when (probe-file legacy-path)
                      (ignore-errors (delete-file legacy-path)))
+                   ;; nFile/nDataPos, now that the block really is in a flat
+                   ;; file. Without this the entry still reads as "not in a
+                   ;; flat file" and its undo data could never be migrated,
+                   ;; because a rev record has to know its block's file number.
+                   (%record-block-position
+                    entry (gethash hash (block-store-index store)))
                    :migrated)
                   (t
                    ;; Keeping the per-block file is not enough on its own:
@@ -138,7 +144,8 @@ the caller must treat as a reason to stop, not to continue."
                    nil)))))))))))
 
 (defun migrate-blocks-to-flat-files (store chain-state &key (max-blocks 1000)
-                                                           (start-height 0))
+                                                           (start-height 0)
+                                                           on-migrated)
   "Convert up to MAX-BLOCKS legacy per-block files into flat records, walking the
 active chain upward from START-HEIGHT.
 
@@ -148,7 +155,14 @@ Call it until REMAINING is 0.
 
 Only blocks on the ACTIVE chain are converted. Side-chain blocks keep their
 per-block files: they have no place in a height-ordered flat file, they are a
-handful of blocks, and dual read keeps them served."
+handful of blocks, and dual read keeps them served.
+
+ON-MIGRATED, when given, is called with each entry AFTER its block reached a
+flat file and its nFile/nDataPos were recorded. That is the point — and the
+first point — at which the block's undo data can be moved into the matching rev
+file, which is work this layer cannot do itself: the undo format lives above
+storage. Same shape as PRUNE-FLAT-BLOCK-FILE's ON-PRUNE, and for the same
+reason."
   (let ((tip-height (chain-state-best-height chain-state))
         (migrated 0)
         (next start-height))
@@ -166,7 +180,18 @@ handful of blocks, and dual read keeps them served."
         (setf next (1+ (block-index-entry-height entry)))
         (let ((result (%migrate-one-block store entry)))
           (cond
-            ((eq result :migrated) (incf migrated))
+            ((eq result :migrated)
+             (incf migrated)
+             (when on-migrated
+               ;; Never let undo migration fail the block migration: the block
+               ;; is already safely in its flat file, and undo data that stays
+               ;; in a legacy file is still read by the dual-read path.
+               (handler-case (funcall on-migrated entry)
+                 (error (e)
+                   (bitcoin-lisp:log-warn
+                    "Migration: undo data for height ~D was not moved (~A); the ~
+legacy undo file is kept and still read"
+                    (block-index-entry-height entry) e)))))
             ((eq result :skipped))
             (t ;; read-back failure: stop, and report the height that failed as
                ;; the resume point so a retry starts exactly there.

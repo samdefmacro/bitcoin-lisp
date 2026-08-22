@@ -1666,6 +1666,18 @@ halving interval — 210,000 blocks on mainnet/testnet/signet, 150 on regtest
 (defvar *undo-base-path* nil
   "Base directory for undo data files. Set during node startup.")
 
+(defvar *undo-block-store* nil
+  "The block store whose rev files hold undo data, or NIL for legacy-only
+storage. Set during node startup beside *UNDO-BASE-PATH*.
+
+Held as a special rather than passed down because an undo record is addressed
+by nothing but the block index entry that points at it, so every read path —
+reorg disconnect, getdescriptoractivity, the block-filter backfill — needs the
+store and the index even though all any of them has is a block hash.")
+
+(defvar *undo-chain-state* nil
+  "The chain state whose block index carries nUndoPos. See *UNDO-BLOCK-STORE*.")
+
 (defconstant +max-undo-cache+ 100
   "Maximum number of blocks to keep in the in-memory undo cache.")
 
@@ -1678,10 +1690,15 @@ halving interval — 210,000 blocks on mainnet/testnet/signet, 150 on regtest
 (defconstant +undo-format-version+ 1
   "Current undo data file format version.")
 
-(defun initialize-undo-storage (base-path)
-  "Initialize undo data persistence with BASE-PATH as the storage directory."
+(defun initialize-undo-storage (base-path &key block-store chain-state)
+  "Initialize undo data persistence with BASE-PATH as the legacy per-block
+directory. BLOCK-STORE and CHAIN-STATE enable Core's rev-file format: without
+them every read and write uses the legacy files, which is also what a store
+with *FLAT-BLOCK-FILES* off does."
   (ensure-directories-exist base-path)
-  (setf *undo-base-path* base-path))
+  (setf *undo-base-path* base-path
+        *undo-block-store* block-store
+        *undo-chain-state* chain-state))
 
 (defun undo-file-path (block-hash)
   "Return the path for an undo data file given BLOCK-HASH."
@@ -1692,9 +1709,24 @@ halving interval — 210,000 blocks on mainnet/testnet/signet, 150 on regtest
      *undo-base-path*)))
 
 (defun delete-undo-file (block-hash)
-  "Delete BLOCK-HASH's undo file if present. Pruned blocks can never be
-disconnected (no block data to reorg through), so their undo data is
-dead weight — Core deletes rev files together with blk files."
+  "Forget BLOCK-HASH's undo data: delete its legacy per-block file if present,
+and clear the flat-file positions its index entry still carries. Pruned blocks
+can never be disconnected (no block data to reorg through), so their undo data
+is dead weight — Core deletes rev files together with blk files.
+
+Clearing the positions is what PruneOneBlockFile does too
+(blockstorage.cpp:264-270: nStatus loses HAVE_DATA and HAVE_UNDO, and nFile /
+nDataPos / nUndoPos all go to zero). Leaving a stale nUndoPos behind persists a
+lie into the header index and makes every later query for this block read a
+rev file that is gone."
+  (let ((entry (and *undo-chain-state*
+                    (bitcoin-lisp.storage:get-block-index-entry
+                     *undo-chain-state* block-hash))))
+    (when entry
+      (setf (bitcoin-lisp.storage:block-index-entry-file entry) nil
+            (bitcoin-lisp.storage:block-index-entry-data-pos entry) nil
+            (bitcoin-lisp.storage:block-index-entry-undo-pos entry) nil)))
+  (remhash block-hash *block-undo-data*)
   (let ((path (undo-file-path block-hash)))
     (when (and path (probe-file path))
       (ignore-errors (delete-file path))
@@ -1734,11 +1766,26 @@ deleted."
             (incf deleted)))))
     deleted))
 
-(defun save-undo-data-to-disk (block-hash spent-utxos)
-  "Serialize spent-utxos to an undo file using atomic temp+rename with CRC32.
+(defun %undo-flat-file-number (block-hash)
+  "The rev file number BLOCK-HASH's undo record belongs in, or NIL when there
+is none: the flat files are off, the store and index are not wired, or the
+block is not in a flat file (so there is no rev file to pair with).
+
+The number comes from the STORE, not from the index entry's nFile — see
+BLOCK-FLAT-FILE-NUMBER. The entry is still where nUndoPos is recorded, because
+a rev record carries no block hash and nothing else can find it again."
+  (when (and bitcoin-lisp.storage:*flat-block-files*
+             *undo-block-store* *undo-chain-state*)
+    (bitcoin-lisp.storage:block-flat-file-number *undo-block-store* block-hash)))
+
+(defun %save-undo-legacy (block-hash spent-utxos)
+  "Write SPENT-UTXOS as the legacy one-file-per-block format: a flat list of
+(txid, index, entry) triples. Self-describing, so it needs no block. Always
+returns NIL, which is what marks it as the non-flat branch.
+
 Byte-buf writer: this runs once per connected block, and the previous
-flexi-streams path's Gray-stream dispatch was ~8% of mainnet-IBD CPU at
-h≈280k (sb-sprof) once blocks carried 500+ spent inputs each."
+flexi-streams path's Gray-stream dispatch was ~8% of mainnet-IBD CPU at h~280k
+(sb-sprof) once blocks carried 500+ spent inputs each."
   (let ((path (undo-file-path block-hash)))
     (when path
       (bitcoin-lisp.storage:save-file-with-crc32-bb
@@ -1751,10 +1798,104 @@ h≈280k (sb-sprof) once blocks carried 500+ spent inputs each."
            (destructuring-bind (txid index utxo) entry
              (bitcoin-lisp.serialization:bb-write-bytes bb txid)
              (bitcoin-lisp.serialization:bb-write-u32-le bb index)
-             (bitcoin-lisp.storage:bb-write-utxo-entry-fields bb utxo))))))))
+             (bitcoin-lisp.storage:bb-write-utxo-entry-fields bb utxo)))))))
+  nil)
 
-(defun load-undo-data-from-disk (block-hash)
-  "Load and verify undo data from disk. Returns list of (txid index utxo-entry) or NIL."
+(defun save-undo-data-to-disk (block-hash spent-utxos &key block)
+  "Persist SPENT-UTXOS for BLOCK-HASH and return the FLAT-FILE-POS it was
+written to, or NIL when it went to a legacy per-block file.
+
+With *FLAT-BLOCK-FILES* on and BLOCK available, this writes Core's CBlockUndo
+into the rev file paired with the block's blk file (blockstorage.cpp:996-1026).
+Otherwise it writes the legacy format, which needs no block."
+  (or (and block (%save-undo-flat block block-hash spent-utxos))
+      (%save-undo-legacy block-hash spent-utxos)))
+
+(defun %save-undo-flat (block block-hash spent-utxos)
+  "Write SPENT-UTXOS as Core's CBlockUndo into the rev file paired with BLOCK's
+blk file, returning the FLAT-FILE-POS, or NIL when that is not possible.
+
+NIL means \"use the legacy format\". A conversion failure is NIL too, and
+deliberately: BLOCK-UNDO-FROM-SPENT-UTXOS signals when the triples do not
+account for exactly the block's inputs, and Core's format cannot represent that
+(position is the only thing naming a coin). Falling back to the self-describing
+legacy format keeps the block disconnectable instead of losing its undo data to
+a format mismatch."
+  (let ((file (%undo-flat-file-number block-hash)))
+    (when file
+      (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                    *undo-chain-state* block-hash)))
+        (when entry
+          ;; Undo data is written ONCE per block. Core skips the write outright
+          ;; when the block already has a record (`if (block.GetUndoPos()
+          ;; .IsNull())`, blockstorage.cpp:970) — without this a block
+          ;; disconnected and reconnected by a reorg appends a second full
+          ;; record every time, and nUndoPos changes VALUE while its presence
+          ;; bit does not, which the header index's delta log does not notice
+          ;; (chain.lisp %entry-persist-key) — so the persisted offset would
+          ;; silently stay a generation behind.
+          (if (bitcoin-lisp.storage:block-index-entry-undo-pos entry)
+              (bitcoin-lisp.storage:make-flat-file-pos
+               file (bitcoin-lisp.storage:block-index-entry-undo-pos entry))
+              (handler-case
+                  (let* ((tx-undos (bitcoin-lisp.storage:block-undo-from-spent-utxos
+                                    block spent-utxos))
+                         (bytes (bitcoin-lisp.storage:serialize-block-undo tx-undos))
+                         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block
+                                     (bitcoin-lisp.serialization:bitcoin-block-header block)))
+                         (pos (bitcoin-lisp.storage:store-undo-flat
+                               *undo-block-store* file prev-hash bytes)))
+                    (setf (bitcoin-lisp.storage:block-index-entry-undo-pos entry)
+                          (bitcoin-lisp.storage:flat-file-pos-pos pos))
+                    pos)
+                (error (e)
+                  (bitcoin-lisp:log-warn
+                   "Undo data for ~A could not be written in Core's format (~A) — ~
+falling back to the legacy per-block file"
+                   (bitcoin-lisp.crypto:bytes-to-hex block-hash) e)
+                  nil))))))))
+
+(defun %load-undo-flat (block-hash &key block)
+  "Read BLOCK-HASH's undo record out of its rev file and rebuild the
+(txid index entry) triples, or NIL when there is no flat record for it.
+
+BLOCK is fetched when not supplied: Core's CBlockUndo stores NO outpoints, so
+the only thing naming each coin is its position — transaction i+1 of the block,
+input j (undo.h; validation.cpp:2187, 2224). Callers that already hold the
+block should pass it; a full-chain index backfill otherwise reads every block
+twice."
+  (let ((file (%undo-flat-file-number block-hash)))
+    (when file
+      (let* ((entry (bitcoin-lisp.storage:get-block-index-entry
+                     *undo-chain-state* block-hash))
+             (undo-pos (and entry
+                            (bitcoin-lisp.storage:block-index-entry-undo-pos entry))))
+        (when undo-pos
+          (handler-case
+              (let ((block (or block
+                               (bitcoin-lisp.storage:get-block
+                                *undo-block-store* block-hash))))
+                (when block
+                  (let* ((pos (bitcoin-lisp.storage:make-flat-file-pos file undo-pos))
+                         (prev-hash (bitcoin-lisp.serialization:block-header-prev-block
+                                     (bitcoin-lisp.serialization:bitcoin-block-header block)))
+                         (bytes (bitcoin-lisp.storage:read-undo-flat
+                                 *undo-block-store* pos prev-hash)))
+                    (when bytes
+                      (bitcoin-lisp.storage:spent-utxos-from-block-undo
+                       block
+                       (bitcoin-lisp.storage:deserialize-block-undo bytes))))))
+            (error (e)
+              (bitcoin-lisp:log-warn "Failed to load flat undo record for ~A: ~A"
+                                     (bitcoin-lisp.crypto:bytes-to-hex block-hash) e)
+              nil)))))))
+
+(defun %load-undo-legacy (block-hash)
+  "Read BLOCK-HASH's legacy one-file-per-block undo file, or NIL.
+
+Separate from LOAD-UNDO-DATA-FROM-DISK because the migration needs to read the
+legacy copy SPECIFICALLY — reading through the dual-read path would hand it the
+rev record it just wrote and let it verify that record against itself."
   (let ((path (undo-file-path block-hash)))
     (when path
       (let ((data (bitcoin-lisp.storage:load-file-with-crc32 path 16)))
@@ -1764,10 +1905,10 @@ h≈280k (sb-sprof) once blocks carried 500+ spent inputs each."
                 (let ((magic (make-array 4 :element-type '(unsigned-byte 8))))
                   (read-sequence magic stream)
                   (unless (equalp magic *undo-magic*)
-                    (return-from load-undo-data-from-disk nil)))
+                    (return-from %load-undo-legacy nil)))
                 (let ((version (bitcoin-lisp.serialization:read-uint32-le stream)))
                   (unless (= version +undo-format-version+)
-                    (return-from load-undo-data-from-disk nil)))
+                    (return-from %load-undo-legacy nil)))
                 (let* ((count (bitcoin-lisp.serialization:read-uint32-le stream))
                        (entries '()))
                   (dotimes (i count)
@@ -1781,6 +1922,89 @@ h≈280k (sb-sprof) once blocks carried 500+ spent inputs each."
             (error (c)
               (bitcoin-lisp:log-warn "Failed to load undo data: ~A" c)
               nil)))))))
+
+(defun load-undo-data-from-disk (block-hash &key block)
+  "Load and verify undo data from disk. Returns a list of (txid index utxo-entry)
+or NIL.
+
+Dual read, and the flat record is tried FIRST: a store that has ever had the
+flat files on holds both forms at once, and the migration writes the flat
+record before deleting the legacy file, so preferring the flat one keeps a
+half-migrated store reading the copy that is certainly complete."
+  (or (%load-undo-flat block-hash :block block)
+      (%load-undo-legacy block-hash)))
+
+(defun migrate-undo-to-flat (block-hash)
+  "Move BLOCK-HASH's legacy per-block undo file into the rev file paired with
+its block, returning :MIGRATED, :SKIPPED, or NIL on failure.
+
+Called from the migrateblocks RPC once a block has reached a flat file, which
+is the earliest moment this is possible: a rev record must go into its block's
+file number, so the block has to be there first.
+
+The legacy file is deleted only after the flat record has been read back and
+compared, the same safety rule the block migration follows — the legacy file is
+the only copy until then. A failure keeps it, and dual read keeps serving it."
+  (let ((path (undo-file-path block-hash)))
+    (cond
+      ((not (and path (probe-file path))) :skipped)
+      ((null *undo-block-store*) :skipped)
+      (t
+       ;; The migration converts a store whose -flatblockfiles flag may well be
+       ;; OFF: %migrate-one-block forces the same binding for the block itself,
+       ;; and without it here every undo record would silently stay legacy
+       ;; while migrateblocks reported success.
+       (let* ((bitcoin-lisp.storage:*flat-block-files* t)
+              (block (bitcoin-lisp.storage:get-block *undo-block-store* block-hash))
+              ;; The LEGACY reader specifically. Going through
+              ;; load-undo-data-from-disk would return the rev record once one
+              ;; exists, and the read-back check below would then be comparing
+              ;; that record against itself — deleting a legacy file nothing
+              ;; had verified.
+              (legacy (%load-undo-legacy block-hash)))
+         (cond
+           ((null block) :skipped)
+           ;; An undo file that is present but holds nothing is either a block
+           ;; with no spends or a corrupt file; either way there is nothing to
+           ;; convert and Core's format would represent them identically.
+           ((null legacy) :skipped)
+           ;; A block already carrying nUndoPos has nothing to migrate: the
+           ;; write is skipped (Core's IsNull guard) and the legacy file is
+           ;; redundant, so drop it once the rev record verifies below.
+           ((null (%save-undo-flat block block-hash legacy)) nil)
+           (t
+            (let ((check (%load-undo-flat block-hash)))
+              (cond
+                ((%undo-lists-equal-p legacy check)
+                 (ignore-errors (delete-file path))
+                 :migrated)
+                (t
+                 ;; Leave nUndoPos pointing at the flat record anyway: it was
+                 ;; written and read back wrong, so the legacy file is the
+                 ;; trustworthy copy and must keep being preferred. Clearing
+                 ;; the pointer is what makes that happen, since the read path
+                 ;; tries the flat record first.
+                 (let ((entry (bitcoin-lisp.storage:get-block-index-entry
+                               *undo-chain-state* block-hash)))
+                   (when entry
+                     (setf (bitcoin-lisp.storage:block-index-entry-undo-pos entry) nil)))
+                 (bitcoin-lisp:log-error
+                  "Migration: undo data for ~A did not read back from its rev ~
+file; the legacy undo file is kept"
+                  (bitcoin-lisp.crypto:bytes-to-hex block-hash))
+                 nil))))))))))
+
+(defun %undo-lists-equal-p (a b)
+  "T when two (txid index utxo-entry) lists describe the same spent coins.
+The read-back check for MIGRATE-UNDO-TO-FLAT.
+
+EQUALP is the comparison: it descends structures slot-wise and vectors
+element-wise, which over a UTXO-ENTRY of integers, a boolean and an octet
+vector is exactly field equality. The length test is not redundant — EVERY
+stops at the shorter list, so without it a truncated read would compare equal."
+  (and (listp a) (listp b)
+       (= (length a) (length b))
+       (every #'equalp a b)))
 
 (defun evict-undo-cache ()
   "Evict the oldest half of cache entries by height (they remain on disk)."
@@ -1811,9 +2035,14 @@ the one place the condition is visible before a bad undo file hits disk."
 absent from the UTXO view (double-apply?)"
      (bitcoin-lisp.crypto:bytes-to-hex block-hash) height)))
 
-(defun store-undo-data (block-hash spent-utxos height)
-  "Store undo data for a block to disk and in-memory cache."
-  (save-undo-data-to-disk block-hash spent-utxos)
+(defun store-undo-data (block-hash spent-utxos height &key block)
+  "Store undo data for a block to disk and in-memory cache.
+
+BLOCK is what allows Core's rev-file format to be used at all: CBlockUndo has
+no outpoints, so writing it needs the block to group the spent coins by
+transaction and reading it needs the block to name them again. Without BLOCK
+the legacy self-describing format is written."
+  (save-undo-data-to-disk block-hash spent-utxos :block block)
   (setf (gethash block-hash *block-undo-data*) spent-utxos)
   (setf (gethash block-hash *undo-cache-heights*) height)
   (when (> (hash-table-count *block-undo-data*) +max-undo-cache+)
@@ -1993,11 +2222,13 @@ Handles chain reorganizations when a competing chain has more work."
                         0))
          (chain-work (bitcoin-lisp.storage:calculate-chain-work
                       (bitcoin-lisp.serialization:block-header-bits header)
-                      prev-work)))
-
-    ;; Store block. The height travels with it so the file it lands in can
-    ;; be pruned later: a flat block file prunes whole, which needs its range.
-    (bitcoin-lisp.storage:store-block block-store block :height new-height)
+                      prev-work))
+         ;; Store the block here, in the binding list: the height travels with
+         ;; it so the file it lands in can be pruned later (a flat block file
+         ;; prunes whole, which needs its range). Where it landed is recorded
+         ;; on the index entry below, once that entry exists.
+         (stored-at (nth-value 1 (bitcoin-lisp.storage:store-block
+                                  block-store block :height new-height))))
 
     ;; Index entry. Core NEVER rebuilds a CBlockIndex: AddToBlockIndex is a
     ;; try_emplace that returns the existing object when the hash is already
@@ -2037,6 +2268,9 @@ Handles chain reorganizations when a competing chain has more work."
         (unless (eq (bitcoin-lisp.storage:block-index-entry-status entry) :invalid)
           (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)))
       (bitcoin-lisp.storage:add-block-index-entry chain-state entry)
+      ;; nFile/nDataPos, now that the entry is in the index (Core
+      ;; ReceivedBlockTransactions).
+      (bitcoin-lisp.storage::%record-block-position entry stored-at)
 
       ;; Check if we need a reorganization. REORG-OUTCOME captures perform-reorg's
       ;; result so callers can act on a refused reorg: NIL for a tip extension or
@@ -2066,7 +2300,7 @@ Handles chain reorganizations when a competing chain has more work."
            (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                utxo-set block new-height)))
              (%warn-if-undo-empty block hash new-height spent-utxos)
-             (store-undo-data hash spent-utxos new-height)
+             (store-undo-data hash spent-utxos new-height :block block)
              ;; BIP158: add this block's basic filter to the block filter index
              ;; (no-op unless the index is enabled; never signals).
              (bitcoin-lisp:index-block-filter chain-state block hash new-height spent-utxos)
@@ -2815,7 +3049,7 @@ comment above."
               (let ((spent-utxos (bitcoin-lisp.storage:apply-block-to-utxo-set
                                   utxo-set block height)))
                 (%warn-if-undo-empty block block-hash height spent-utxos)
-                (store-undo-data block-hash spent-utxos height)
+                (store-undo-data block-hash spent-utxos height :block block)
                 (setf (bitcoin-lisp.storage:block-index-entry-status entry) :valid)
                 (bitcoin-lisp.storage:update-chain-tip chain-state block-hash height)
                 (push (list entry block height spent-utxos) connected))))
@@ -3229,11 +3463,15 @@ can neither wedge on an equal-work sibling nor advance past the base."
         (unless (and entry
                      (bitcoin-lisp.storage:entry-target-ancestor-p chain-state entry))
           (unless (block-witness-stripped-p block)
-            (bitcoin-lisp.storage:store-block
-             block-store block
-             ;; NIL when the header is not indexed yet, which leaves the file
-             ;; unprunable rather than guessing a range.
-             :height (and entry (bitcoin-lisp.storage:block-index-entry-height entry))))
+            (bitcoin-lisp.storage::%record-block-position
+             entry
+             (nth-value 1 (bitcoin-lisp.storage:store-block
+                           block-store block
+                           ;; NIL when the header is not indexed yet, which
+                           ;; leaves the file unprunable rather than guessing.
+                           :height (and entry
+                                        (bitcoin-lisp.storage:block-index-entry-height
+                                         entry))))))
           (return-from activate-block (values nil :weaker-chain)))))
     (cond
       ;; Case 1: extends current tip — normal path.
@@ -3393,8 +3631,11 @@ can neither wedge on an equal-work sibling nor advance past the base."
               (let ((entry (bitcoin-lisp.storage:get-block-index-entry
                             chain-state
                             (bitcoin-lisp.serialization:block-header-hash header))))
-                (bitcoin-lisp.storage:store-block
-                 block-store block
-                 :height (and entry
-                              (bitcoin-lisp.storage:block-index-entry-height entry)))))
+                (bitcoin-lisp.storage::%record-block-position
+                 entry
+                 (nth-value 1 (bitcoin-lisp.storage:store-block
+                               block-store block
+                               :height (and entry
+                                            (bitcoin-lisp.storage:block-index-entry-height
+                                             entry)))))))
             (values nil :weaker-chain))))))))

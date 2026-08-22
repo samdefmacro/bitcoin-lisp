@@ -460,6 +460,9 @@
    #:make-block-store
    #:init-block-store
    #:*flat-block-files*
+   #:block-flat-file-number
+   #:store-undo-flat
+   #:read-undo-flat
    #:block-file-info
    #:block-file-info-blocks
    #:block-file-info-size
@@ -522,6 +525,8 @@
    #:block-index-entry-file
    #:block-index-entry-data-pos
    #:block-index-entry-undo-pos
+   #:note-block-position
+   #:%record-block-position
    #:get-block-index-entry
    #:add-block-index-entry
    #:get-block-at-height
@@ -1128,6 +1133,7 @@
    #:+max-timewarp+
    #:get-taproot-activation-height
    #:initialize-undo-storage
+   #:migrate-undo-to-flat
    #:delete-undo-file
    #:prune-stale-undo-files
    ;; Locktime validation

@@ -65,7 +65,13 @@ parent lands, so file order does not matter."
       (dolist (record records)
         (multiple-value-bind (header hash) (%reindex-header-of-record store (cdr record))
           (when (and header hash)
-            (push (list hash header)
+            ;; The record's position travels with the header: the entry built
+            ;; below is the only thing that will ever carry nFile/nDataPos, and
+            ;; without them a reindexed datadir writes undo data in the legacy
+            ;; format forever. Core drives the same field from its reindex path
+            ;; (UpdateBlockInfo, blockstorage.cpp:923-940, called from
+            ;; AcceptBlock's reindex branch, validation.cpp:4402-4403).
+            (push (list hash header (cdr record))
                   (gethash (bitcoin-lisp.serialization:block-header-prev-block header)
                            pending))))))
     ;; Drain from every parent already in the index, adding children and then
@@ -83,7 +89,7 @@ parent lands, so file order does not matter."
                  (remhash parent-hash pending)
                  (when parent
                    (dolist (child children)
-                     (destructuring-bind (hash header) child
+                     (destructuring-bind (hash header located) child
                        (unless (get-block-index-entry chain-state hash)
                          (let ((entry (make-block-index-entry
                                        :hash hash
@@ -100,6 +106,7 @@ parent lands, so file order does not matter."
                                        ;; chainstate rebuild is what promotes
                                        ;; blocks to :valid by re-applying them.
                                        :status :header-valid)))
+                           (%record-block-position entry located)
                            (add-block-index-entry chain-state entry)
                            (incf added)))
                        (when (gethash hash pending) (push hash queue)))))))
