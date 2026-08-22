@@ -4129,13 +4129,22 @@ anchors.dat in the network-typed v2 format (net + address + port)."
   "Read anchors.dat into *pending-anchor-addresses* — (host . port) dial
 candidates, dialed at the STORED port (migrated v1 entries carry port NIL and
 fall back to the network default) — so the next connect attempts them first.
-Missing/corrupt file is ignored; a v1-era file migrates (see
-parse-anchor-entries) and the next save rewrites it as v2. Only networks that
+Reading CONSUMES the file, as Core's ReadAnchors does (addrdb.cpp:234-246):
+anchors are one-shot, so a crash loop cannot re-dial the same two block-relay
+peers on every start and pin an already-eclipsed node to them. The next clean
+shutdown rewrites it. Missing/corrupt file is ignored; a v1-era file migrates
+(see parse-anchor-entries) and the next save rewrites it as v2. Only networks that
 are dialable under the current config (dialable-network-p: onion needs a Tor
 proxy, cjdns needs -cjdnsreachable) and reachable (-onlynet) become dial
 candidates."
-  (let ((bytes (bitcoin-lisp.storage:load-file-with-crc32
-                (anchors-dat-path (node-data-directory node)) 6)))
+  (let* ((path (anchors-dat-path (node-data-directory node)))
+         (bytes (bitcoin-lisp.storage:load-file-with-crc32 path 6)))
+    ;; Unconditionally, parse failure included (Core ReadAnchors). A failure
+    ;; here leaves the anchors in place, which silently restores the pinning
+    ;; this prevents — so say so rather than swallowing it.
+    (handler-case (delete-file path)
+      (file-error () )
+      (error (c) (log-debug "Could not consume ~A: ~A" path c)))
     (when bytes
       (setf *pending-anchor-addresses*
             (loop for (net addr-bytes port) in (parse-anchor-entries bytes)
@@ -4585,9 +4594,16 @@ Returns the number of new peers connected."
       (return-from replace-disconnected-peers 0))
 
     ;; Get addresses already in use
-    (let ((used-addrs (mapcar #'bitcoin-lisp.networking:peer-address
-                              (node-peers node)))
-          (connected 0))
+    (let* ((used-addrs (mapcar #'bitcoin-lisp.networking:peer-address
+                               (node-peers node)))
+           (used-groups (remove nil (mapcar #'bitcoin-lisp.networking:ip-netgroup
+                                            used-addrs)))
+           (connected 0))
+      ;; Core ThreadOpenConnections skips a candidate whose /16 netgroup
+      ;; already holds an outbound peer (setConnected, net.cpp:2651, 2685,
+      ;; 2826). connect-to-peers spreads the INITIAL set, but replacements
+      ;; had no netgroup test at all, so hours of churn could concentrate the
+      ;; outbound set in one group — half of an eclipse's preconditions.
       (dolist (candidate (node-known-addresses node))
         ;; Stop attempting new connect+handshake cycles the moment shutdown is
         ;; requested — each one can otherwise block (connect timeout + handshake
@@ -4596,7 +4612,9 @@ Returns the number of new peers connected."
                   (bitcoin-lisp.networking:ibd-stop-requested-p))
           (return))
         (let ((addr (car candidate)))
-          (unless (member addr used-addrs :test #'string=)
+          (unless (or (member addr used-addrs :test #'string=)
+                      (let ((g (bitcoin-lisp.networking:ip-netgroup addr)))
+                        (and g (member g used-groups :test #'equal))))
             (handler-case
                 (let* ((dial-port (or (cdr candidate)
                                       (network-port (node-network node))))
@@ -4789,15 +4807,34 @@ to join the peer set."
       (log-debug "Feeler to ~A:~D failed: ~A" host port c))))
 
 (defun maybe-do-feeler (node)
-  "Rate-limited: probe one addrman 'new' address with a feeler to validate it
-into 'tried'."
+  "Rate-limited feeler probe. Core ThreadOpenConnections (net.cpp:2796-2812)
+spends the feeler on a tried-table COLLISION first — testing the incumbent
+before resolve-tried-collisions may evict it — and only otherwise validates a
+'new' address into 'tried'. An incumbent we are already connected to needs no
+probe: mark it good, which resolves the collision in its favour, and spend the
+feeler on the new table instead."
   (let ((now (get-universal-time)))
     (when (and (node-network-active node) (node-address-book node)
                (>= (- now *last-feeler-time*) +feeler-interval-seconds+))
       (setf *last-feeler-time* now)
-      (multiple-value-bind (ip port) (%addrman-pick-unconnected node :new-only t)
-        (when ip
-          (do-feeler-connection node ip (or port (network-port (node-network node)))))))))
+      (let* ((book (node-address-book node))
+             (incumbent (bitcoin-lisp.networking:select-tried-collision book))
+             (host (and incumbent
+                        (bitcoin-lisp.networking:peer-address-string incumbent))))
+        (when (and host (peer-connected-to-host-p node host))
+          (bitcoin-lisp.networking:address-book-good
+           book (bitcoin-lisp.networking:peer-address-ip incumbent)
+           (bitcoin-lisp.networking:peer-address-port incumbent)
+           (bitcoin-lisp.serialization:get-unix-time)
+           (bitcoin-lisp.networking:peer-address-network incumbent))
+          (setf host nil))
+        (multiple-value-bind (ip port)
+            (if host
+                (values host (let ((p (bitcoin-lisp.networking:peer-address-port incumbent)))
+                               (and (plusp p) p)))
+                (%addrman-pick-unconnected node :new-only t))
+          (when ip
+            (do-feeler-connection node ip (or port (network-port (node-network node))))))))))
 
 (defvar *last-chain-sync-check* 0
   "Unix time of the last chain-sync eviction sweep. Node-scoped, NOT local to
@@ -4868,6 +4905,11 @@ block-relay-only slots, an occasional feeler probe, and the chain-sync
 eviction sweep."
   (check-peers-health node)
   (connect-added-nodes node)
+  ;; Core resolves tried-table collisions once per ThreadOpenConnections
+  ;; iteration (net.cpp:2768), not only at startup — otherwise, once the
+  ;; collision set is full, address-book-good stops recording successes.
+  (let ((book (node-address-book node)))
+    (when book (bitcoin-lisp.networking:resolve-tried-collisions book)))
   (consider-outbound-evictions node)
   (replace-disconnected-peers node)
   (maintain-block-relay-peers node)

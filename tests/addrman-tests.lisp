@@ -220,6 +220,82 @@ TORv3 pubkey that happens to equal an I2P hash can never collide in the map."
       (is (not (null pa)))
       (is-true (bitcoin-lisp.networking:peer-address-in-tried pa)))))
 
+(defun %am-force-collision (book &key (limit 6000))
+  "Add + Good addresses until a tried-table collision queues. Returns the
+challenger's peer-address, or NIL if none collided within LIMIT."
+  (loop for i from 1 to limit
+        do (let ((pa (%pa (ldb (byte 8 16) i) (ldb (byte 8 8) i)
+                          (ldb (byte 8 0) i) 7)))
+             (bitcoin-lisp.networking:address-book-add book pa)
+             (bitcoin-lisp.networking:address-book-good
+              book (bitcoin-lisp.networking:peer-address-ip pa) 8333 (%now) :ipv4)
+             (let ((ids (bitcoin-lisp.networking::address-book-tried-collisions book)))
+               (when ids
+                 (return (gethash (first ids)
+                                  (bitcoin-lisp.networking::address-book-info book))))))))
+
+(test tried-collision-tests-the-incumbent-before-evicting
+  "Core's test-before-evict (addrman.cpp:930-960, 975-1000). A queued tried
+collision is resolved by the INCUMBENT's own evidence, and select-tried-collision
+is what hands that incumbent to the feeler: without it the only branch that can
+fire is the 40-minute fallback, so any challenger evicts any entry we merely
+have not dialed lately."
+  (let* ((book (bitcoin-lisp.networking:make-address-book))
+         (challenger (%am-force-collision book)))
+    (is-true challenger "a tried collision was queued")
+    ;; select-tried-collision hands back the INCUMBENT holding the slot.
+    (let ((incumbent (bitcoin-lisp.networking:select-tried-collision book)))
+      (is-true incumbent)
+      (is-true (bitcoin-lisp.networking::peer-address-in-tried incumbent))
+      (is (not (eq incumbent challenger)))
+      ;; (a) Incumbent connected recently -> challenger dropped, slot kept.
+      (setf (bitcoin-lisp.networking::peer-address-last-success incumbent) (%now))
+      (bitcoin-lisp.networking:resolve-tried-collisions book)
+      (is (null (bitcoin-lisp.networking::address-book-tried-collisions book)))
+      (is-true (bitcoin-lisp.networking::peer-address-in-tried incumbent))
+      (is-false (bitcoin-lisp.networking::peer-address-in-tried challenger)))))
+
+(test tried-collision-replaces-an-incumbent-that-failed-its-probe
+  "The branch select-tried-collision exists to feed (addrman.cpp:941-950): the
+feeler attempted the incumbent, it did not succeed, and it has had its 60 s —
+so the challenger takes the slot. Before this branch existed the only exit was
+the blind 40-minute timer."
+  (let* ((book (bitcoin-lisp.networking:make-address-book))
+         (challenger (%am-force-collision book)))
+    (is-true challenger)
+    (let ((incumbent (bitcoin-lisp.networking:select-tried-collision book))
+          (now (%now)))
+      (is-true incumbent)
+      ;; Probed 2 minutes ago and never answered; last success is stale.
+      (setf (bitcoin-lisp.networking::peer-address-last-success incumbent)
+            (- now (* 5 60 60))
+            (bitcoin-lisp.networking::peer-address-last-attempt incumbent)
+            (- now 120))
+      (bitcoin-lisp.networking:resolve-tried-collisions book)
+      (is (null (bitcoin-lisp.networking::address-book-tried-collisions book)))
+      (is-true (bitcoin-lisp.networking::peer-address-in-tried challenger)
+               "challenger promoted after the incumbent failed its probe"))))
+
+(test tried-collision-waits-out-a-fresh-probe
+  "An incumbent probed seconds ago keeps its slot: Core gives it 60 s to answer
+before the challenger may replace it (addrman.cpp:946)."
+  (let* ((book (bitcoin-lisp.networking:make-address-book))
+         (challenger (%am-force-collision book)))
+    (is-true challenger)
+    (let ((incumbent (bitcoin-lisp.networking:select-tried-collision book))
+          (now (%now)))
+      (is-true incumbent)
+      (setf (bitcoin-lisp.networking::peer-address-last-success incumbent)
+            (- now (* 5 60 60))
+            (bitcoin-lisp.networking::peer-address-last-attempt incumbent)
+            (- now 5)
+            ;; Not yet old enough for the untestable fallback either.
+            (bitcoin-lisp.networking::peer-address-last-success challenger) now)
+      (bitcoin-lisp.networking:resolve-tried-collisions book)
+      (is-true (bitcoin-lisp.networking::address-book-tried-collisions book)
+               "collision still queued while the probe is in flight")
+      (is-false (bitcoin-lisp.networking::peer-address-in-tried challenger)))))
+
 (test peers-dat-v4-roundtrip-all-nets
   "Save/load the v4 network-typed format: IPv4, IPv6, TORv3 (tried), I2P and
 CJDNS records all survive with their networks, bytes, ports and stats."
@@ -234,7 +310,9 @@ CJDNS records all survive with their networks, bytes, ports and stats."
            (bitcoin-lisp.networking:address-book-add book (%pa 1 2 3 4 :services 9))
            (bitcoin-lisp.networking:address-book-add
             book (bitcoin-lisp.networking:make-peer-address
-                  :ip (%ipv6 #x20 #x01 #x0d #xb8 0 0 0 0 0 0 0 0 0 0 0 1)
+                  ;; Global unicast: 2001:db8::/32 is documentation space,
+                  ;; which address-routable-p now refuses as Core does.
+                  :ip (%ipv6 #x26 #x06 #x47 #x00 0 0 0 0 0 0 0 0 0 0 0 1)
                   :port 8333 :services 1 :last-seen (%now)))
            (bitcoin-lisp.networking:address-book-add book (%pa-net :torv3 onion))
            (bitcoin-lisp.networking:address-book-add book (%pa-net :i2p i2p :port 0))
