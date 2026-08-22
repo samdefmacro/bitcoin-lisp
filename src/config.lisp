@@ -632,7 +632,8 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
 
 (defparameter *repeatable-config-options*
   '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind"
-    "testactivationheight" "debug" "debugexclude")
+    "testactivationheight" "debug" "debugexclude" "shutdownnotify"
+    "startupnotify")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -831,6 +832,8 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ;; that need a fixed clock before the first RPC can be made.
     ("mocktime"          :mocktime           :int)
     ("logtimemicros"     :log-time-micros    :bool)
+    ;; -blocknotify: one command, %s replaced by the new best block's hash.
+    ("blocknotify"       :block-notify       :string)
     ("logthreadnames"    :log-thread-names   :bool)
     ("maxconnections"    :max-connections    :int)
     ("rpcport"           :rpc-port           :int)
@@ -895,7 +898,7 @@ specially in config-alist->start-node-plist.")
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
     "addnode" "rpcauth" "rpcallowip" "testactivationheight"
-    "debugexclude"
+    "debugexclude" "shutdownnotify" "startupnotify"
     ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, not the spec
     ;; scan, since each topic contributes two options and they produce a list
     ;; of publishers rather than a start-node keyword.
@@ -913,7 +916,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
 (defparameter *core-only-config-options*
   '(
     "acceptnonstdtxn" "addresstype" "alertnotify" "allowignoredconf" "asmap"
-    "avoidpartialspends" "blocknotify" "blockreconstructionextratxn"
+    "avoidpartialspends" "blockreconstructionextratxn"
     "blocksdir" "blockversion" "capturemessages"
     "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
     "checkmempool" "checkpoints" "connect" "consolidatefeerate" "daemon"
@@ -929,8 +932,8 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "persistmempoolv1" "pid" "printpriority" "printtoconsole"
     "privatebroadcast" "rpcdoccheck"
     "rpcwhitelist" "rpcwhitelistdefault"
-    "rpcworkqueue" "seednode" "settings" "shrinkdebugfile" "shutdownnotify"
-    "signer" "signetseednode" "spendzeroconfchange" "startupnotify"
+    "rpcworkqueue" "seednode" "settings" "shrinkdebugfile"
+    "signer" "signetseednode" "spendzeroconfchange"
     "stopafterblockimport" "test" "timeout"
     "txconfirmtarget" "txospenderindex" "unsafesqlitesync" "vbparams"
     "version" "walletbroadcast" "walletcrosschain" "walletdir"
@@ -1106,7 +1109,11 @@ resolved network. Honors -server (enable RPC on the default port when no
                         ("rpcallowip" . :rpc-allow-ip)
                         ("testactivationheight" . :test-activation-heights)
                         ("debug"        . :debug-categories)
-                        ("debugexclude" . :debug-exclude)))
+                        ("debugexclude" . :debug-exclude)
+                        ;; Core reads both with GetArgs, so every occurrence
+                        ;; runs (init.cpp:257-265 joins them all).
+                        ("shutdownnotify" . :shutdown-notify)
+                        ("startupnotify"  . :startup-notify)))
         (let ((values (loop for (k . v) in alist
                             when (string= k (car option))
                               collect v)))

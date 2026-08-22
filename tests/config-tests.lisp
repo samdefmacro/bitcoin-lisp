@@ -1113,3 +1113,66 @@ there is a READ error, not a link error."
   (dolist (name '("rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"))
     (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
     (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
+
+(test notify-commands-substitute-only-hex
+  "Core replaces %s in a notify command with the block hash and runs the result
+through the shell (init.cpp:2014-2017). The COMMAND is the operator's own, so
+the shell is the feature — but the SUBSTITUTED VALUE is not necessarily, and a
+value containing `;` or a backtick would be shell injection through a config
+option that looks inert. Everything we substitute is a hash, so requiring hex
+costs nothing and closes the route."
+  (is (equal "echo deadbeef"
+             (bitcoin-lisp::%notify-substitute "echo %s" "deadbeef")))
+  ;; Every occurrence, as ReplaceAll does.
+  (is (equal "a beef b beef c"
+             (bitcoin-lisp::%notify-substitute "a %s b %s c" "beef")))
+  ;; A command with no %s is passed through untouched.
+  (is (equal "touch /tmp/x"
+             (bitcoin-lisp::%notify-substitute "touch /tmp/x" "beef")))
+  ;; A lone trailing % is literal, not a truncated directive.
+  (is (equal "echo 100%"
+             (bitcoin-lisp::%notify-substitute "echo 100%" "beef")))
+  (dolist (bad '("dead; rm -rf /" "`id`" "$(id)" "dead beef" "" "zznothex"))
+    (signals error (bitcoin-lisp::%notify-substitute "echo %s" bad))))
+
+(test notify-commands-reach-the-plist
+  "-shutdownnotify is repeatable — Core reads it with GetArgs and joins EVERY
+one (init.cpp:257-265) — while -blocknotify is a single command."
+  (let ((p (bitcoin-lisp::args->start-node-plist
+            '("-regtest" "-blocknotify=echo %s" "-startupnotify=touch /tmp/a"
+              "-shutdownnotify=touch /tmp/b" "-shutdownnotify=touch /tmp/c")
+            nil)))
+    (is (equal "echo %s" (getf p :block-notify)))
+    (is (equal '("touch /tmp/a") (getf p :startup-notify)))
+    (is (equal '("touch /tmp/b" "touch /tmp/c") (getf p :shutdown-notify))))
+  (dolist (name '("blocknotify" "startupnotify" "shutdownnotify"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
+
+(test notify-commands-actually-run
+  "A hook that is stored and never executed is the failure this repo keeps
+finding, so this runs a real command and looks for its effect. -shutdownnotify
+is WAITED for (Core joins), which is what makes the file observable
+immediately; -blocknotify is detached, so it is polled for."
+  (let* ((dir (merge-pathnames (format nil "bl-notify-~D/" (get-internal-real-time))
+                               (uiop:temporary-directory)))
+         (marker (merge-pathnames "ran" dir)))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           ;; Waited: the file must exist the moment the call returns.
+           (bitcoin-lisp::run-notify-command
+            (format nil "touch ~A" (namestring marker)) :wait t)
+           (is-true (probe-file marker) "a waited notify command did not run")
+           ;; And the hash substitution reaches the command line.
+           (let ((hashed (merge-pathnames "deadbeef" dir)))
+             (bitcoin-lisp::run-notify-command
+              (format nil "touch ~A%s" (namestring dir)) :value "deadbeef" :wait t)
+             (is-true (probe-file hashed)
+                      "%s was not substituted into the executed command")))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore))))
+  ;; A failing hook is logged, never signalled: it must not fail whatever
+  ;; triggered it.
+  (is-true (bitcoin-lisp::run-notify-command "exit 1" :wait t))
+  (is-false (bitcoin-lisp::run-notify-command "echo %s" :value "not hex")))

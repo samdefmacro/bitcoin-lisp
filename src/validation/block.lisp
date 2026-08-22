@@ -2390,6 +2390,9 @@ Handles chain reorganizations when a competing chain has more work."
            ;; ZMQ BlockConnected: each transaction, then the block and a
            ;; sequence 'C' (zmqnotificationinterface.cpp:180).
            (bitcoin-lisp:zmq-notify-block-connected block hash)
+           ;; -blocknotify, detached so an operator hook can never stall block
+           ;; connection (Core "thread runs free", init.cpp:2017).
+           (bitcoin-lisp:notify-block-tip hash)
            ;; Update transaction index if enabled, and move its best-block
            ;; marker with the tip so the next startup resumes here instead of
            ;; re-reading every block from genesis.
