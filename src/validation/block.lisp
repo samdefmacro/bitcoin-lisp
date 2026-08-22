@@ -205,26 +205,81 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
 
 ;;;; Script verification flags
 
+;;;; -testactivationheight (Core chainparams.cpp:49-67)
+;;;;
+;;;; Moves a BURIED deployment's activation height so a regtest chain can be
+;;;; driven across it in a handful of blocks instead of thousands. Core's
+;;;; functional suite leans on it heavily — a test that wants pre-BIP66
+;;;; behaviour cannot otherwise reach it on a chain that activates at height 1.
+
+(defvar *test-activation-heights* (make-hash-table :test 'equal)
+  "Deployment name -> overridden activation height, from -testactivationheight.
+Empty unless the option was given. Core stores the same overrides in
+options.activation_heights and applies them when building chainparams.")
+
+(defparameter +buried-deployment-names+
+  '("segwit" "bip34" "dersig" "cltv" "csv")
+  "The deployments -testactivationheight can move, spelled as Core spells them
+(GetBuriedDeployment, deploymentinfo.cpp:41-54). `dersig` is BIP66 and `cltv`
+is BIP65 — the option takes the deployment's name, not the BIP number.")
+
+(defun parse-test-activation-height (spec)
+  "Parse one -testactivationheight value, `name@height`, into (VALUES name
+height), or NIL when malformed. Core raises on a missing '@', a height that is
+not a non-negative integer, and a name that is not a buried deployment
+(chainparams.cpp:49-67)."
+  (when (stringp spec)
+    (let ((at (position #\@ spec)))
+      (when at
+        (let ((name (subseq spec 0 at))
+              (value (subseq spec (1+ at))))
+          (when (and (member name +buried-deployment-names+ :test #'string=)
+                     (plusp (length value))
+                     (every #'digit-char-p value))
+            (let ((height (parse-integer value :junk-allowed t)))
+              (when (and height (>= height 0))
+                (values name height)))))))))
+
+(defun apply-test-activation-heights (specs)
+  "Install the -testactivationheight overrides in SPECS. Signals on a malformed
+entry, as Core does — a typo'd deployment name that was silently ignored would
+leave the test running against the height it was trying to move."
+  (clrhash *test-activation-heights*)
+  (dolist (spec specs)
+    (multiple-value-bind (name height) (parse-test-activation-height spec)
+      (unless name
+        (error "Invalid -testactivationheight=~A. Expected name@height, where ~
+name is one of ~{~A~^, ~} and height is a non-negative integer."
+               spec +buried-deployment-names+))
+      (setf (gethash name *test-activation-heights*) height))))
+
+(defun %activation-height (name default)
+  "DEFAULT unless -testactivationheight moved NAME."
+  (or (gethash name *test-activation-heights*) default))
+
 (defun get-bip66-activation-height (network)
   "Return the BIP 66 (DERSIG) activation height for NETWORK."
-  (ecase network
+  (%activation-height "dersig"
+   (ecase network
     (:testnet3 +bip66-activation-height-testnet3+)
     ((:testnet4 :signet :regtest) 1)
-    (:mainnet +bip66-activation-height-mainnet+)))
+    (:mainnet +bip66-activation-height-mainnet+))))
 
 (defun get-bip65-activation-height (network)
   "Return the BIP 65 (CLTV) activation height for NETWORK."
-  (ecase network
+  (%activation-height "cltv"
+   (ecase network
     (:testnet3 +bip65-activation-height-testnet3+)
     ((:testnet4 :signet :regtest) 1)
-    (:mainnet +bip65-activation-height-mainnet+)))
+    (:mainnet +bip65-activation-height-mainnet+))))
 
 (defun get-csv-activation-height (network)
   "Return the BIP 68/112/113 (CSV) activation height for NETWORK."
-  (ecase network
+  (%activation-height "csv"
+   (ecase network
     (:testnet3 +csv-activation-height-testnet3+)
     ((:testnet4 :signet :regtest) 1)
-    (:mainnet +csv-activation-height-mainnet+)))
+    (:mainnet +csv-activation-height-mainnet+))))
 
 (defun get-taproot-activation-height (network)
   "Return the BIP 341 (Taproot) activation height for NETWORK."
@@ -237,12 +292,13 @@ Returns T if all locks satisfied, NIL if any lock not yet matured."
 
 (defun get-segwit-activation-height (network)
   "Return the BIP 141 (SegWit) activation height for NETWORK."
-  (ecase network
+  (%activation-height "segwit"
+   (ecase network
     (:testnet3 +segwit-activation-height-testnet3+)
     ((:testnet4 :signet) 1)
     ;; Regtest activates SegWit from genesis (Core SegwitHeight = 0).
     (:regtest 0)
-    (:mainnet +segwit-activation-height-mainnet+)))
+    (:mainnet +segwit-activation-height-mainnet+))))
 
 ;;; Policy vs Consensus Flag Separation
 ;;;
@@ -925,10 +981,11 @@ witness is not covered by the header/merkle root), so callers must treat this as
 
 (defun get-bip34-activation-height (network)
   "Return the BIP 34 activation height for NETWORK."
-  (ecase network
-    (:testnet3 +bip34-activation-height-testnet3+)
-    ((:testnet4 :signet :regtest) 1)
-    (:mainnet +bip34-activation-height-mainnet+)))
+  (%activation-height "bip34"
+   (ecase network
+     (:testnet3 +bip34-activation-height-testnet3+)
+     ((:testnet4 :signet :regtest) 1)
+     (:mainnet +bip34-activation-height-mainnet+))))
 
 (defconstant +bip34-implies-bip30-limit+ 1983702
   "BIP 30 is re-enforced unconditionally at this height and above: past

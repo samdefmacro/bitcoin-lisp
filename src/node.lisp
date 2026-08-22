@@ -2129,6 +2129,8 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (tor-control nil)
                         (tor-password nil)
                         (dbcache-mib nil)
+                        (mocktime nil)
+                        (test-activation-heights nil)
                         (v2transport nil)
                         (coinstatsindex nil)
                         (reindex-chainstate nil)
@@ -2220,6 +2222,30 @@ Returns the node instance."
   ;; for EVERY node it starts, and what an operator looks for first.
   (let ((path (%resolve-log-file log-file data-directory)))
     (when path (start-file-logging path)))
+
+  ;; -testactivationheight=name@height moves a buried deployment so a regtest
+  ;; chain can be driven across it in a handful of blocks (Core
+  ;; chainparams.cpp:49-67). Applied before anything validates a block. A
+  ;; malformed entry signals, as Core raises: a typo'd deployment name that was
+  ;; silently ignored would leave the test running against the very height it
+  ;; was trying to move.
+  (bitcoin-lisp.validation:apply-test-activation-heights test-activation-heights)
+  (when test-activation-heights
+    (unless (eq network :regtest)
+      (error "-testactivationheight is for regression testing (-regtest mode) only"))
+    (log-warn "Activation heights overridden by -testactivationheight: ~{~A~^ ~}"
+              test-activation-heights))
+
+  ;; -mocktime: the startup form of setmocktime, for tests that need a fixed
+  ;; clock before the first RPC can be made. Same regtest gate the RPC has.
+  (when mocktime
+    (unless (eq network :regtest)
+      (error "-mocktime is for regression testing (-regtest mode) only"))
+    (unless (and (integerp mocktime) (<= 0 mocktime))
+      (error "Invalid -mocktime: ~A. Must be a non-negative integer." mocktime))
+    (setf bitcoin-lisp.serialization:*mock-time*
+          (if (zerop mocktime) nil mocktime))
+    (log-info "Mock time set to ~D" mocktime))
 
   ;; -dbcache, split across the coins cache AND every database's block cache
   ;; the way Core splits it (CalculateCacheSizes, node/caches.cpp:57-72, then
