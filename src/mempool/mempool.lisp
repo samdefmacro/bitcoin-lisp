@@ -120,10 +120,12 @@ time, like the cluster limits.")
   ;; must explicitly remove it. NIL until the entry is added.
   (graph-handle nil :type (or null tx-handle)))
 
-(defconstant +bytes-per-sigop+ 20
+(defparameter +bytes-per-sigop+ 20
   "Equivalent bytes charged per weighted sigop in the sigop-adjusted
-transaction size (Bitcoin Core DEFAULT_BYTES_PER_SIGOP, policy.h:49; the
--bytespersigop knob is not exposed).")
+transaction size (Bitcoin Core DEFAULT_BYTES_PER_SIGOP, policy.h:49), settable
+with -bytespersigop.
+
+A DEFPARAMETER, not a DEFCONSTANT: this is relay POLICY, not consensus.")
 
 (defun sigop-adjusted-vsize (weight sigops)
   "The sigop-adjusted virtual size: ceil(max(WEIGHT, SIGOPS * 20) / 4) —
