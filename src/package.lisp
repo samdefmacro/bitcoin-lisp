@@ -1618,6 +1618,8 @@
    #:node-shutdown-requested-p
    #:run-node-watchdog
    #:node-main
+   #:notify-block-tip
+   #:run-notify-command
    #:+node-exit-clean+
    #:+node-exit-error+
    #:+node-exit-watchdog+

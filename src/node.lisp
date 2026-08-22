@@ -51,6 +51,79 @@ as one."
   (when datadir
     (namestring (uiop:ensure-directory-pathname datadir))))
 
+;;;; -blocknotify / -startupnotify / -shutdownnotify (Core init.cpp:255-266,
+;;;; 2009-2019)
+;;;;
+;;;; An operator hook: run a shell command when something happens. Core runs it
+;;;; through the system shell, and so do we — the command comes from the
+;;;; operator's own configuration, so the shell is the feature rather than a
+;;;; hazard. What must NOT reach the shell unexamined is the SUBSTITUTED value.
+
+(defvar *block-notify-command* nil
+  "Shell command to run when the best block changes; %s is replaced by the
+block hash (Core -blocknotify, init.cpp:498).")
+
+(defvar *shutdown-notify-commands* '()
+  "Shell commands to run at shutdown, in order (Core -shutdownnotify). Core
+JOINS these — shutdown waits for them — because a detached command racing
+process exit is a command that may not run at all (init.cpp:257-265).")
+
+(defun %notify-substitute (command value)
+  "COMMAND with %s replaced by VALUE (Core ReplaceAll, init.cpp:2014).
+
+VALUE is refused unless it is plain hex. Everything we substitute IS a hash, so
+this costs nothing and closes the shell-injection route that a substituted
+value would otherwise open — the command is the operator's, the value is not
+necessarily."
+  (unless (and (stringp value)
+               (plusp (length value))
+               (every (lambda (c) (digit-char-p c 16)) value))
+    (error "Refusing to substitute a non-hex value into a notify command"))
+  (let ((out (make-string-output-stream))
+        (i 0)
+        (n (length command)))
+    (loop while (< i n)
+          do (if (and (< (1+ i) n)
+                      (char= (char command i) #\%)
+                      (char= (char command (1+ i)) #\s))
+                 (progn (write-string value out) (incf i 2))
+                 (progn (write-char (char command i) out) (incf i))))
+    (get-output-stream-string out)))
+
+(defun run-notify-command (command &key value (wait nil))
+  "Run COMMAND through the shell, substituting VALUE for %s when given.
+
+WAIT NIL detaches, as Core does for -blocknotify (\"thread runs free\",
+init.cpp:2017) — a hook must never be able to stall block connection. WAIT T is
+for -shutdownnotify, which Core joins.
+
+Never signals: a failing hook is the operator's problem to see in the log, not
+a reason to fail whatever triggered it."
+  (handler-case
+      (let ((full (if value (%notify-substitute command value) command)))
+        (if wait
+            (uiop:run-program (list "/bin/sh" "-c" full)
+                              :ignore-error-status t
+                              :output nil :error-output nil)
+            (uiop:launch-program (list "/bin/sh" "-c" full)
+                                 :output nil :error-output nil))
+        t)
+    (error (e)
+      (log-warn "notify command failed: ~A" e)
+      nil)))
+
+(defun notify-block-tip (hash)
+  "Run -blocknotify for a new best block, if configured."
+  (when *block-notify-command*
+    (run-notify-command *block-notify-command*
+                        :value (bitcoin-lisp.crypto:bytes-to-hex hash))))
+
+(defun run-shutdown-notify ()
+  "Run every -shutdownnotify command and WAIT for it (Core joins them,
+init.cpp:263-265): a detached command racing process exit may not run at all."
+  (dolist (command *shutdown-notify-commands*)
+    (run-notify-command command :wait t)))
+
 (defun apply-rpc-config-globals (alist)
   "Apply the process-global RPC options from a merged config ALIST.
 
@@ -2202,6 +2275,9 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (tor-password nil)
                         (dbcache-mib nil)
                         (mocktime nil)
+                        (block-notify nil)
+                        (startup-notify nil)
+                        (shutdown-notify nil)
                         (debug-categories nil)
                         (debug-exclude nil)
                         (log-time-micros nil)
@@ -2298,6 +2374,11 @@ Returns the node instance."
   ;; for EVERY node it starts, and what an operator looks for first.
   (let ((path (%resolve-log-file log-file data-directory)))
     (when path (start-file-logging path)))
+
+  ;; Operator hooks (Core -blocknotify / -shutdownnotify). Set before anything
+  ;; can fire them.
+  (setf *block-notify-command* block-notify
+        *shutdown-notify-commands* shutdown-notify)
 
   ;; -debug=<category> / -debugexclude=<category> (Core init/common.cpp).
   ;; Applied before init-node so startup's own category lines are subject to
@@ -2939,6 +3020,10 @@ txindex ~D MiB, per-index ~D MiB"
   (bitcoin-lisp.rpc:finish-rpc-warmup)
   (when rpc-port
     (log-info "RPC server ready"))
+
+  ;; -startupnotify, once the node is actually up (Core init.cpp:529).
+  (dolist (command startup-notify)
+    (run-notify-command command))
 
   ;; Connect to peers and sync if requested (in background thread)
   ;; Reconnects and retries when peers are lost, similar to Bitcoin Core's
@@ -4216,6 +4301,11 @@ thread; see the shutdown-coordination section above."
   ;; Persist reconnection anchors while peers are still connected (before the
   ;; teardown below disconnects them).
   (save-anchors *node*)
+
+  ;; -shutdownnotify runs FIRST and is WAITED for (Core ShutdownNotify,
+  ;; init.cpp:255-266): a hook that fires after the process is gone, or races
+  ;; it, is a hook that may not run at all.
+  (run-shutdown-notify)
 
   ;; Stop RPC server first. Warmup is the SERVER's state, cleared by
   ;; stop-rpc-server — re-arming it here left it armed for anything else in the
