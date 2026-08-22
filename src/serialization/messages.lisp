@@ -177,9 +177,27 @@ the unavoidable-case fallback."
 (defconstant +universal-unix-epoch-offset+ 2208988800
   "Seconds between the CL universal-time epoch (1900) and the Unix epoch (1970).")
 
-(defun get-unix-time ()
-  "Get current Unix timestamp."
+(defvar *mock-time* nil
+  "When non-NIL, the Unix timestamp GET-UNIX-TIME reports instead of the system
+clock. Core's g_mock_time (util/time.cpp), set by the regtest-only setmocktime
+RPC: the functional test framework drives time forward explicitly rather than
+sleeping, so almost every non-clean test depends on it.
+
+NIL means the system clock, which is also what setmocktime 0 restores.")
+
+(defun get-real-unix-time ()
+  "The system clock's Unix timestamp, never mocked.
+
+For the few things that must keep measuring real elapsed time while a test
+drives the mock clock — uptime is the one Core is explicit about, since
+GetUptime uses SteadyClock rather than the mockable GetTime
+(common/system.cpp:134)."
   (- (get-universal-time) +universal-unix-epoch-offset+))
+
+(defun get-unix-time ()
+  "Current Unix timestamp, or the mocked one when setmocktime is in effect
+(Core GetTime, util/time.cpp)."
+  (or *mock-time* (get-real-unix-time)))
 
 ;;;; Version message
 

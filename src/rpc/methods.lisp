@@ -659,6 +659,29 @@ network, or \"not_publicly_routable\" when it isn't a routable literal."
          (:i2p "i2p") (:cjdns "cjdns")))
       (t "not_publicly_routable"))))
 
+(defun %peer-addrbind (peer)
+  "The local end of this peer's socket, \"ip:port\", or NIL when it cannot be
+read (Core addrBind, CNode::addrBind, set from the accepted/connected socket).
+
+Every P2P functional test reads this field: the framework matches a connection
+it opened against the node's getpeerinfo row by comparing addrbind to the
+address it dialled. Taken from the socket rather than from configuration —
+with -bind=0.0.0.0 the configured address names no interface, and the bind
+address of an OUTBOUND connection is whichever local address the kernel chose."
+  (let* ((connection (bitcoin-lisp.networking::peer-connection peer))
+         (socket (and connection (bitcoin-lisp.networking::connection-socket connection))))
+    (when socket
+      (ignore-errors
+       (let ((address (usocket:get-local-address socket))
+             (port (usocket:get-local-port socket)))
+         (when (and address port)
+           (let ((text (usocket:host-to-hostname address)))
+             ;; A v6 literal is bracketed before the port, as Core's
+             ;; CService::ToStringAddrPort does.
+             (if (find #\: text)
+                 (format nil "[~A]:~D" text port)
+                 (format nil "~A:~D" text port)))))))))
+
 (defun %peer-addrlocal (peer)
   "Our address as the peer reported it in its version message's addr_recv
 (Core addrLocal, set from the version addrMe for outbound peers when
@@ -683,7 +706,7 @@ field is optional in Core and omitted when unknown."
 (defun rpc-getpeerinfo (node params)
   "Return information about connected peers (Bitcoin Core getpeerinfo),
 emitting every Core field we can populate honestly. Deliberate omissions:
-addrbind (local socket address not recorded), mapped_as (no -asmap support).
+mapped_as (no -asmap support).
 Divergences: startingheight is always present (Core hides it behind
 -deprecatedrpc=startingheight); synced_blocks is always -1 (we track no
 per-peer last-common-block cursor — -1 is Core's \"unknown\" value);
@@ -734,6 +757,8 @@ getpeerinfo loop, rpc/net.cpp:107-227."
            ("addr" . ,(bitcoin-lisp::peer-address peer))
            ,@(let ((addrlocal (%peer-addrlocal peer)))
                (when addrlocal `(("addrlocal" . ,addrlocal))))
+           ,@(let ((addrbind (%peer-addrbind peer)))
+               (when addrbind `(("addrbind" . ,addrbind))))
            ("network" . ,(%peer-network-name peer))
            ;; Core reports services as a 16-hex-digit string, not a number.
            ("services" . ,(string-downcase (format nil "~16,'0X" services)))
@@ -2899,7 +2924,12 @@ getdifficulty)."
   "Seconds the node has been running (Bitcoin Core uptime)."
   (declare (ignore node params))
   (if bitcoin-lisp::*node-start-time*
-      (max 0 (- (bitcoin-lisp.serialization:get-unix-time) bitcoin-lisp::*node-start-time*))
+      ;; Real clock on BOTH sides. Core's uptime is SteadyClock::now() minus a
+      ;; steady startup stamp (common/system.cpp:134), so setmocktime does not
+      ;; move it; reading the mockable clock here would make uptime jump — or
+      ;; clamp to 0 — the moment a test set the clock backwards.
+      (max 0 (- (bitcoin-lisp.serialization:get-real-unix-time)
+                bitcoin-lisp::*node-start-time*))
       0))
 
 (defun rpc-stop (node params)
@@ -2940,6 +2970,52 @@ chain-work and time spanned (Bitcoin Core getnetworkhashps)."
                               (bitcoin-lisp.serialization:block-header-timestamp
                                (bitcoin-lisp.storage:block-index-entry-header start)))))
                 (if (<= dtime 0) 0 (round dwork dtime))))))))
+
+;;; --- Test-harness control methods (Core rpc/node.cpp) ---
+
+(defconstant +max-mock-time+ 9223372036
+  "The largest timestamp setmocktime accepts: Core's max_time is
+Ticks<seconds>(nanoseconds::max()), i.e. (2^63-1) nanoseconds expressed in
+whole seconds (rpc/node.cpp:64).")
+
+(defun rpc-setmocktime (node params)
+  "Set the clock GET-UNIX-TIME reports (Bitcoin Core setmocktime,
+rpc/node.cpp:38-80). Regtest only, and 0 restores the system clock.
+
+This is what lets the functional test framework drive time forward instead of
+sleeping; almost every non-clean test depends on it."
+  (declare (ignore node))
+  (unless (eq bitcoin-lisp:*network* :regtest)
+    ;; Core raises a plain std::runtime_error here, which JSONRPCError maps to
+    ;; RPC_MISC_ERROR with this exact text (rpc/node.cpp:52-54).
+    (error 'rpc-error :code +rpc-misc-error+
+                      :message "setmocktime is for regression testing (-regtest mode) only"))
+  (let ((timestamp (first params)))
+    (unless (integerp timestamp)
+      (error 'rpc-error :code +rpc-type-error+
+                        :message "JSON value of type string is not of expected type number"))
+    (unless (<= 0 timestamp +max-mock-time+)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "Mocktime must be in the range [0, ~D], not ~D."
+                                         +max-mock-time+ timestamp)))
+    ;; Core's SetMockTime(0) means "stop mocking" — GetTime falls back to the
+    ;; system clock when g_mock_time is zero — so 0 is NIL here, not epoch.
+    (setf bitcoin-lisp.serialization:*mock-time*
+          (if (zerop timestamp) nil timestamp))
+    :null))
+
+(defun rpc-syncwithvalidationinterfacequeue (node params)
+  "Wait for the validation interface queue to drain (Bitcoin Core
+syncwithvalidationinterfacequeue, rpc/node.cpp).
+
+A no-op here, and correctly so: Core needs it because its validation callbacks
+run on a background scheduler thread, so a test that just submitted a block can
+race the notifications. We dispatch notifications inline on the thread that
+connected the block, so by the time any RPC can be serviced the queue Core is
+waiting on has no counterpart left to drain. The method still has to EXIST —
+the framework calls it after generate* in many tests."
+  (declare (ignore node params))
+  :null)
 
 (defun rpc-getmemoryinfo (node params)
   "Report process memory use (Bitcoin Core getmemoryinfo). Reports the SBCL heap

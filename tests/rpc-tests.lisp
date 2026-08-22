@@ -1974,6 +1974,100 @@ client reach them at all."
           (is-false (acl-refusal-p body)
                     "loopback must reach routing with no -rpcallowip at all"))))))
 
+;;; --- Test-harness control RPCs (track B P0) ---
+
+(test setmocktime-is-regtest-only
+  "Core gates setmocktime on IsMockableChain, which only regtest sets
+(chainparams.cpp:644), and raises a plain runtime_error otherwise — mapped to
+RPC_MISC_ERROR with this exact text (rpc/node.cpp:52-54). The text is what the
+functional framework and operators actually see, so it is asserted verbatim."
+  (dolist (network '(:mainnet :testnet4 :signet))
+    (let ((bitcoin-lisp:*network* network)
+          (bitcoin-lisp.serialization:*mock-time* nil))
+      (handler-case
+          (progn (bitcoin-lisp.rpc::rpc-setmocktime nil '(1000))
+                 (is-true nil "setmocktime was accepted on ~A" network))
+        (bitcoin-lisp.rpc::rpc-error (e)
+          (is (string= "setmocktime is for regression testing (-regtest mode) only"
+                       (bitcoin-lisp.rpc::rpc-error-message e))
+              "~A" network)))
+      (is-false bitcoin-lisp.serialization:*mock-time*
+                "the refused call still moved the clock on ~A" network))))
+
+(test setmocktime-sets-and-clears-the-clock
+  "0 means \"stop mocking\", not \"the epoch\": Core's GetTime falls back to the
+system clock when g_mock_time is zero. Reading 0 as a literal timestamp would
+freeze every node that ran setmocktime 0 at 1970."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp.serialization:*mock-time* nil))
+    (bitcoin-lisp.rpc::rpc-setmocktime nil '(1700000000))
+    (is (eql 1700000000 bitcoin-lisp.serialization:*mock-time*))
+    (is (eql 1700000000 (bitcoin-lisp.serialization:get-unix-time)))
+    ;; and the real clock is still real
+    (is (> (bitcoin-lisp.serialization:get-real-unix-time) 1700000000))
+    (bitcoin-lisp.rpc::rpc-setmocktime nil '(0))
+    (is-false bitcoin-lisp.serialization:*mock-time*)
+    (is (= (bitcoin-lisp.serialization:get-unix-time)
+           (bitcoin-lisp.serialization:get-real-unix-time)))))
+
+(test setmocktime-range-and-type-are-corecs
+  "Core rejects a negative or over-large timestamp with an exact message built
+from max_time = Ticks<seconds>(nanoseconds::max()) (rpc/node.cpp:63-69)."
+  (let ((bitcoin-lisp:*network* :regtest)
+        (bitcoin-lisp.serialization:*mock-time* nil))
+    (dolist (bad (list -1 (1+ bitcoin-lisp.rpc::+max-mock-time+)))
+      (handler-case
+          (progn (bitcoin-lisp.rpc::rpc-setmocktime nil (list bad))
+                 (is-true nil "accepted out-of-range ~D" bad))
+        (bitcoin-lisp.rpc::rpc-error (e)
+          (is (string= (format nil "Mocktime must be in the range [0, ~D], not ~D."
+                               bitcoin-lisp.rpc::+max-mock-time+ bad)
+                       (bitcoin-lisp.rpc::rpc-error-message e))
+              "~D" bad))))
+    ;; the boundary itself is accepted
+    (bitcoin-lisp.rpc::rpc-setmocktime nil (list bitcoin-lisp.rpc::+max-mock-time+))
+    (is (eql bitcoin-lisp.rpc::+max-mock-time+ bitcoin-lisp.serialization:*mock-time*))
+    ;; a non-integer is a type error, not a range error
+    (signals bitcoin-lisp.rpc::rpc-error (bitcoin-lisp.rpc::rpc-setmocktime nil '("now")))
+    (setf bitcoin-lisp.serialization:*mock-time* nil)))
+
+(test uptime-does-not-follow-the-mock-clock
+  "Core's uptime is SteadyClock::now() minus a steady startup stamp
+(common/system.cpp:134), so setmocktime does not move it. Ours read the
+MOCKABLE clock, which meant a test setting the clock backwards — the ordinary
+case, since the framework picks a fixed timestamp — made uptime clamp to 0, and
+one setting it forward made the node claim years of uptime. rpc_uptime.py is a
+first-wave target, so this had to be right before the harness could use it."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (bitcoin-lisp.serialization:*mock-time* nil)
+         (bitcoin-lisp::*node-start-time*
+           (- (bitcoin-lisp.serialization:get-real-unix-time) 42))
+         (before (bitcoin-lisp.rpc::rpc-uptime nil nil)))
+    (is (<= 42 before 44))
+    ;; A mock clock far in the past must not clamp uptime to zero...
+    (bitcoin-lisp.rpc::rpc-setmocktime nil '(1000))
+    (is (<= 42 (bitcoin-lisp.rpc::rpc-uptime nil nil) 44)
+        "uptime followed the mock clock backwards")
+    ;; ...and one far in the future must not inflate it.
+    (bitcoin-lisp.rpc::rpc-setmocktime nil (list (+ 100000000
+                                                    (bitcoin-lisp.serialization:get-real-unix-time))))
+    (is (<= 42 (bitcoin-lisp.rpc::rpc-uptime nil nil) 44)
+        "uptime followed the mock clock forwards")
+    (setf bitcoin-lisp.serialization:*mock-time* nil)))
+
+(test syncwithvalidationinterfacequeue-exists-and-answers-null
+  "The framework calls it after generate* in many tests. It is a no-op here —
+our validation notifications dispatch inline on the connecting thread — but it
+has to EXIST, and it has to answer JSON null rather than erroring."
+  (is (eq :null (bitcoin-lisp.rpc::rpc-syncwithvalidationinterfacequeue nil nil)))
+  ;; The dispatch table is populated by start-rpc-server, not at load time, so
+  ;; build it here — the point of the assertion is that register-all-methods
+  ;; names these two, which is what makes them reachable over JSON-RPC at all.
+  (bitcoin-lisp.rpc::register-all-methods)
+  (dolist (method '("syncwithvalidationinterfacequeue" "setmocktime"))
+    (is-true (nth-value 1 (gethash method bitcoin-lisp.rpc::*rpc-methods*))
+             "~A is not registered" method)))
+
 ;;; --- Concurrent Access Tests (2.7) ---
 
 (test rpc-concurrent-access-safety
