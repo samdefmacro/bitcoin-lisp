@@ -827,99 +827,235 @@ new inbound connection can take its slot. NIL if none are discouraged."
         (bitcoin-lisp.networking:disconnect-peer victim)
         t))))
 
-(defparameter +inbound-eviction-protect-count+ 4
-  "Per protection dimension (lowest ping, longest connected), how many inbound
-peers to shield from eviction — the spirit of Bitcoin Core's
-AttemptToEvictConnection protected set.")
+(defconstant +evict-protect-netgroup+ 4
+  "Core SelectNodeToEvict: 4 peers protected by keyed netgroup
+(eviction.cpp:186-188). Deterministic but unpredictable — an attacker cannot
+tell which netgroups will be protected without the node's key.")
+(defconstant +evict-protect-min-ping+ 8
+  "8 peers with the lowest MINIMUM ping (:189-191). Was 4 here.")
+(defconstant +evict-protect-tx+ 4
+  "4 peers that most recently gave us a novel mempool transaction (:192-194).")
+(defconstant +evict-protect-block-relay-only+ 8
+  "8 NON-tx-relay peers that gave us novel blocks (:195-197). Missing here
+entirely, which meant a block-relay-only peer doing exactly the job it exists
+for was no safer than an idle one.")
+(defconstant +evict-protect-block+ 4
+  "4 peers that most recently gave us a novel block (:199-201).")
+
+(defun %evict-erase-last-k (candidates comparator k &optional filter)
+  "Core EraseLastKElements: sort CANDIDATES by COMPARATOR and REMOVE the last K
+that satisfy FILTER — \"remove\" meaning protect, since this list is the
+eviction pool. Returns the remaining candidates.
+
+The comparator orders WORST-first, so the last K are the best K by that
+measure. FILTER restricts the pass to a subset (Core's block-relay-only pass is
+the only one that uses it) without letting the excluded peers consume slots."
+  (let* ((eligible (if filter (remove-if-not filter candidates) candidates))
+         (sorted (stable-sort (copy-list eligible) comparator))
+         (n (min k (length sorted)))
+         (protected (subseq sorted (- (length sorted) n))))
+    (remove-if (lambda (p) (member p protected)) candidates)))
+
+(defun %evict-keyed-netgroup (peer)
+  "A per-node-secret keying of the peer's netgroup (Core nKeyedNetGroup). The
+SECRET is what makes the netgroup protection unpredictable: without it an
+attacker knows which groups sort first and can arrange to be outside them."
+  (let ((group (or (bitcoin-lisp.networking:ip-netgroup
+                    (bitcoin-lisp.networking:peer-address peer))
+                   "_")))
+    (sxhash (cons *eviction-netgroup-secret* group))))
+
+(defvar *eviction-netgroup-secret* (random most-positive-fixnum)
+  "Per-process secret behind %EVICT-KEYED-NETGROUP; Core derives its equivalent
+from the node's own random key.")
+
+(defun %evict-disadvantaged-network (peer)
+  "Which of Core's four disadvantaged networks PEER belongs to, or NIL
+(eviction.cpp:118-119): CJDNS, I2P, localhost, onion. These \"tend to be
+otherwise disadvantaged under our eviction criteria\" — they are higher-latency,
+so they lose the ping pass, and inbound onion peers all share the loopback
+netgroup, so they lose the netgroup pass too."
+  (cond ((bitcoin-lisp.networking:peer-inbound-onion peer) :onion)
+        (t (multiple-value-bind (net bytes)
+               (bitcoin-lisp.networking:parse-network-address
+                (bitcoin-lisp.networking:peer-address peer))
+             (declare (ignore bytes))
+             (case net
+               (:cjdns :cjdns)
+               (:i2p :i2p)
+               (:torv3 :onion)
+               (t (when (bitcoin-lisp.networking:loopback-address-p
+                         (bitcoin-lisp.networking:peer-address peer))
+                    :local)))))))
+
+(defun %evict-protect-by-ratio (candidates)
+  "Core ProtectEvictionCandidatesByRatio (eviction.cpp:104-176).
+
+Protects the half of the remaining candidates connected longest, and reserves
+up to half of THAT (a quarter of the candidates) for the four disadvantaged
+networks — giving the network with the FEWEST candidates first claim on unused
+slots, so a single onion peer is not crowded out by a dozen I2P ones.
+
+This replaces an ad-hoc onion exemption that predated it here. The exemption
+worked for the case it was written for — every inbound onion peer shares the
+loopback netgroup, so two of them were automatically the largest group and one
+was evicted on every admission — but it protected onion peers absolutely rather
+than proportionally, so an all-onion inbound set could not make room at all."
+  (let* ((initial (length candidates))
+         (total-protect (floor initial 2))
+         (max-by-network (floor total-protect 2))
+         (num-protected 0)
+         (remaining candidates)
+         ;; Counts per network, fewest first: Core sorts ascending so the
+         ;; scarcest network gets first claim on slots the others leave.
+         (networks (list :cjdns :i2p :local :onion))
+         (counts (mapcar (lambda (net)
+                           (cons net (count net candidates
+                                            :key #'%evict-disadvantaged-network)))
+                         networks)))
+    (setf counts (stable-sort counts #'< :key #'cdr))
+    (loop while (< num-protected max-by-network)
+          do (let ((live (count-if #'plusp counts :key #'cdr)))
+               (when (zerop live) (return))
+               (let* ((left (- max-by-network num-protected))
+                      (per-network (max 1 (floor left live)))
+                      (protected-any nil))
+                 (dolist (entry counts)
+                   (when (plusp (cdr entry))
+                     (let* ((net (car entry))
+                            (before (length remaining))
+                            (after (%evict-erase-last-k
+                                    remaining
+                                    (lambda (a b)
+                                      (< (bitcoin-lisp.networking:peer-connect-time a)
+                                         (bitcoin-lisp.networking:peer-connect-time b)))
+                                    per-network
+                                    (lambda (p) (eq net (%evict-disadvantaged-network p))))))
+                       (setf remaining after)
+                       (let ((delta (- before (length remaining))))
+                         (when (plusp delta)
+                           (setf protected-any t)
+                           (incf num-protected delta)
+                           (decf (cdr entry) delta)
+                           (when (>= num-protected max-by-network) (return)))))))
+                 (unless protected-any (return)))))
+    ;; Whatever is left of the half goes to the longest-connected.
+    (%evict-erase-last-k remaining
+                         (lambda (a b)
+                           (> (bitcoin-lisp.networking:peer-connect-time a)
+                              (bitcoin-lisp.networking:peer-connect-time b)))
+                         (max 0 (- total-protect num-protected)))))
+
+(defun select-inbound-peer-to-evict (inbound)
+  "Core SelectNodeToEvict (eviction.cpp:178-240), pass for pass. Returns the
+peer to evict, or NIL when every candidate is protected.
+
+The order is load-bearing and is Core's: noban, then the five \"has done
+something useful\" passes with Core's own k values, then the ratio reserve,
+then prefer-evict, then the most-populous netgroup, youngest first.
+
+Ours previously ran four passes at k=4 apiece with no netgroup pass, no
+block-relay-only pass, no noban protection, and an onion exemption standing in
+for the ratio reserve."
+  (let ((candidates inbound))
+    ;; ProtectNoBanConnections (eviction.cpp:181). Only possible since net
+    ;; permissions landed; a noban peer is never evicted for any reason.
+    (setf candidates
+          (remove-if (lambda (p)
+                       (bitcoin-lisp.networking:peer-has-permission-p
+                        p bitcoin-lisp.networking:+perm-noban+))
+                     candidates))
+    ;; ProtectOutboundConnections is implicit: INBOUND is inbound-only.
+    (setf candidates (%evict-erase-last-k candidates
+                                          (lambda (a b)
+                                            (< (%evict-keyed-netgroup a)
+                                               (%evict-keyed-netgroup b)))
+                                          +evict-protect-netgroup+))
+    ;; Lowest MINIMUM ping, not the latest sample: an attacker can inflate a
+    ;; recent sample at will but cannot lower a minimum without being closer.
+    (setf candidates (%evict-erase-last-k
+                      candidates
+                      (lambda (a b)
+                        (flet ((ping (p)
+                                 (let ((l (bitcoin-lisp.networking:peer-min-ping-latency p)))
+                                   (if (plusp l) l most-positive-fixnum))))
+                          (> (ping a) (ping b))))
+                      +evict-protect-min-ping+))
+    (setf candidates (%evict-erase-last-k
+                      candidates
+                      (lambda (a b)
+                        (< (bitcoin-lisp.networking:peer-last-tx-time a)
+                           (bitcoin-lisp.networking:peer-last-tx-time b)))
+                      +evict-protect-tx+))
+    ;; Block-relay-only peers that have given us blocks: Core filters this pass
+    ;; to non-tx-relay peers so the slots cannot be taken by ordinary peers
+    ;; that happen to have relayed a block.
+    (setf candidates (%evict-erase-last-k
+                      candidates
+                      (lambda (a b)
+                        (< (bitcoin-lisp.networking:peer-last-block-time a)
+                           (bitcoin-lisp.networking:peer-last-block-time b)))
+                      +evict-protect-block-relay-only+
+                      (lambda (p)
+                        (not (bitcoin-lisp.networking:peer-relays-txs-p p)))))
+    (setf candidates (%evict-erase-last-k
+                      candidates
+                      (lambda (a b)
+                        (< (bitcoin-lisp.networking:peer-last-block-time a)
+                           (bitcoin-lisp.networking:peer-last-block-time b)))
+                      +evict-protect-block+))
+    (setf candidates (%evict-protect-by-ratio candidates))
+    (when (null candidates)
+      (return-from select-inbound-peer-to-evict nil))
+    ;; Peers preferred for eviction, if any, are considered alone — but only
+    ;; AFTER the passes above, since a peer that is genuinely the best by other
+    ;; criteria should survive regardless (Core's own comment, :215-217).
+    ;; Core's prefer_evict is set for a discouraged peer, which is exactly what
+    ;; EVICT-DISCOURAGED-INBOUND already drops first; reaching here means none
+    ;; was found, so this arm normally finds none either. It stays because the
+    ;; two paths can disagree: a peer discouraged BETWEEN the two calls is
+    ;; still preferred here.
+    (let ((preferred (remove-if-not
+                      (lambda (p)
+                        (bitcoin-lisp.networking:peer-discouraged-p
+                         (bitcoin-lisp.networking:peer-address p)))
+                      candidates)))
+      (when preferred (setf candidates preferred)))
+    ;; Finally: the netgroup with the most connections, youngest member first.
+    (let ((groups (make-hash-table :test 'equal)))
+      (flet ((grp (p) (or (bitcoin-lisp.networking:ip-netgroup
+                           (bitcoin-lisp.networking:peer-address p))
+                          "_")))
+        (dolist (p candidates) (incf (gethash (grp p) groups 0)))
+        (first (stable-sort
+                (copy-list candidates)
+                (lambda (a b)
+                  (let ((ga (gethash (grp a) groups 0))
+                        (gb (gethash (grp b) groups 0)))
+                    (if (/= ga gb)
+                        (> ga gb)
+                        (> (bitcoin-lisp.networking:peer-connect-time a)
+                           (bitcoin-lisp.networking:peer-connect-time b)))))))))))
 
 (defun evict-least-valuable-inbound (node)
   "At inbound capacity with no discouraged peer to drop, evict the least
 valuable inbound peer so a new connection can take the slot — stopping an
-attacker from filling inbound slots with cheap, sticky connections (the current
-behavior was to always drop the newcomer, which never churns toward better
-peers). Protects the most valuable inbound peers along two dimensions (lowest
-ping latency, longest connected); among the unprotected rest, evicts from the
-most-represented /16 netgroup, youngest first. Mirrors the intent of Core's
-AttemptToEvictConnection. Returns T if a peer was evicted."
+attacker from filling inbound slots with cheap, sticky connections. Returns T
+if a peer was evicted.
+
+The selection is SELECT-INBOUND-PEER-TO-EVICT, which is Core's
+AttemptToEvictConnection pass for pass."
   (bt:with-recursive-lock-held ((node-lock node))
     (let ((inbound (remove-if-not #'bitcoin-lisp.networking:peer-inbound
                                   (node-peers node))))
       (when (cdr inbound)               ; need >1 so something stays protected
-        (let* ((by-ping (stable-sort
-                         (copy-list inbound) #'<
-                         :key (lambda (p)
-                                ;; MINIMUM RTT, not the most recent one. Core
-                                ;; protects by m_min_ping_time
-                                ;; (eviction.cpp:190) deliberately: an attacker
-                                ;; can inflate a recent sample at will, but
-                                ;; cannot lower a minimum without physically
-                                ;; being closer. We sorted on the latest
-                                ;; sample while min-ping-latency sat unused
-                                ;; right beside it on the same struct.
-                                (let ((l (bitcoin-lisp.networking:peer-min-ping-latency p)))
-                                  (if (plusp l) l most-positive-fixnum)))))
-               (by-age (stable-sort   ; oldest (smallest connect-time) first
-                        (copy-list inbound) #'<
-                        :key #'bitcoin-lisp.networking:peer-connect-time))
-               ;; Core also protects the peers that have most recently given us
-               ;; something USEFUL — 4 by novel tx and 4 by novel block
-               ;; (eviction.cpp:192-199). Both timestamps are already tracked
-               ;; and already exposed through getpeerinfo; the evictor simply
-               ;; never read them, so a peer relaying us real data was no
-               ;; safer than one that had done nothing since connecting.
-               (by-tx (stable-sort (copy-list inbound) #'>
-                                   :key #'bitcoin-lisp.networking:peer-last-tx-time))
-               (by-block (stable-sort (copy-list inbound) #'>
-                                      :key #'bitcoin-lisp.networking:peer-last-block-time))
-               (n (min +inbound-eviction-protect-count+ (length inbound)))
-               (protected (reduce (lambda (acc lst) (union acc (subseq lst 0 n)))
-                                  (list by-ping by-age by-tx by-block)
-                                  :initial-value '()))
-               (candidates (remove-if (lambda (p) (member p protected)) inbound)))
-          (when candidates
-            (let ((groups (make-hash-table :test 'equal)))
-              ;; Onion peers are exempt from the most-populous-group rule.
-              ;;
-              ;; Every inbound onion peer arrives via the local Tor daemon, so
-              ;; ip-netgroup returns "127.0" for ALL of them: with two or more
-              ;; connected they are automatically the largest group and one was
-              ;; evicted on every admission at capacity, so ordinary clearnet
-              ;; pressure quietly cost the operator their onion inbounds --
-              ;; with -listenonion on by default. Core reaches the same shared
-              ;; group and compensates in ProtectEvictionCandidatesByRatio,
-              ;; which reserves up to a quarter of the protected set for
-              ;; CJDNS/I2P/localhost/onion peers precisely because they "tend to
-              ;; be otherwise disadvantaged under our eviction criteria"
-              ;; (eviction.cpp:105-120).
-              ;;
-              ;; Keyed on the PEER-INBOUND-ONION flag, never the address
-              ;; string: the string is the very thing that collides. Exempt
-              ;; only while something else remains to evict -- an all-onion
-              ;; inbound set must still be able to make room.
-              (let ((non-onion (remove-if #'bitcoin-lisp.networking:peer-inbound-onion
-                                          candidates)))
-                (when non-onion
-                  (setf candidates non-onion)))
-              (flet ((grp (p) (or (bitcoin-lisp.networking:ip-netgroup
-                                   (bitcoin-lisp.networking:peer-address p))
-                                  "_")))
-                (dolist (p candidates) (incf (gethash (grp p) groups 0)))
-                (let ((victim (first (stable-sort
-                                      candidates
-                                      (lambda (a b)
-                                        (let ((ga (gethash (grp a) groups 0))
-                                              (gb (gethash (grp b) groups 0)))
-                                          (if (/= ga gb)
-                                              (> ga gb)  ; most-populous netgroup first
-                                              ;; then youngest (largest connect-time)
-                                              (> (bitcoin-lisp.networking:peer-connect-time a)
-                                                 (bitcoin-lisp.networking:peer-connect-time b)))))))))
-                  (when victim
-                    (log-info "Evicting least-valuable inbound peer ~A to admit a new connection"
-                              (bitcoin-lisp.networking:peer-address victim))
-                    (setf (node-peers node) (remove victim (node-peers node)))
-                    (bitcoin-lisp.networking:disconnect-peer victim)
-                    t))))))))))
+        (let ((victim (select-inbound-peer-to-evict inbound)))
+          (when victim
+            (log-info "Evicting least-valuable inbound peer ~A to admit a new connection"
+                      (bitcoin-lisp.networking:peer-address victim))
+            (setf (node-peers node) (remove victim (node-peers node)))
+            (bitcoin-lisp.networking:disconnect-peer victim)
+            t))))))
 
 (defun inbound-connection-allowed-p (node host)
   "Admission check for a freshly-accepted inbound connection from HOST,
