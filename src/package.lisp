@@ -949,6 +949,8 @@
    #:mempool-entry-sequence
    #:mempool-sequence
    #:mempool-transactions-updated
+   #:bpe-estimate-raw-fee
+   #:horizon-max-confirms
    #:mempool-entry-fee-rate
    ;; Mempool entry links
    #:mempool-entry-parents

@@ -2076,9 +2076,46 @@ rpc_help.py passing."
                                  core-methods)))
         ;; Not an assertion of zero — these are tracked, and the list moving is
         ;; what matters. It IS an assertion that the list has not GROWN.
-        (is (<= (length missing) 5)
+        (is (<= (length missing) 3)
             "Core methods with typed arguments that this node does not serve ~
 grew to ~D: ~S" (length missing) (sort missing #'string<))))))
+
+(test estimaterawfee-reports-the-evidence-not-just-a-number
+  "Core estimaterawfee (rpc/fees.cpp:97-190). Unlike estimatesmartfee it asks
+ONE horizon at ONE success threshold and reports the pass/fail buckets behind
+the answer — that is what makes it a debugging tool rather than a second fee
+API, and reporting a bare feerate would defeat the point.
+
+A horizon that does not track the requested target is OMITTED rather than
+reported as zero: absence and \"no answer\" mean different things to whoever is
+reading the output."
+  (let ((bitcoin-lisp.mempool:*block-policy-estimator*
+          (bitcoin-lisp.mempool:make-block-policy-estimator)))
+    ;; A fresh estimator has no history, so every horizon that TRACKS the
+    ;; target still answers — with a zero rate and Core's errors array.
+    (let ((r (bitcoin-lisp.rpc::rpc-estimaterawfee nil '(2))))
+      (is (consp r) "no horizon answered for a target every horizon tracks")
+      (let ((short (cdr (assoc "short" r :test #'string=))))
+        (is-true short "the short horizon did not answer for conf_target 2")
+        (is (assoc "feerate" short :test #'string=))
+        (is-true (assoc "errors" short :test #'string=)
+                 "an estimator with no history must say so")))
+    ;; A target only the long horizon tracks omits the shorter ones entirely.
+    (let* ((long-max (bitcoin-lisp.mempool:horizon-max-confirms :long))
+           (short-max (bitcoin-lisp.mempool:horizon-max-confirms :short))
+           (r (bitcoin-lisp.rpc::rpc-estimaterawfee
+               nil (list (min long-max (1+ short-max))))))
+      (is-false (assoc "short" r :test #'string=)
+                "the short horizon answered for a target it does not track"))
+    ;; Range and type checks.
+    (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+           (%rpc-error-code (lambda () (bitcoin-lisp.rpc::rpc-estimaterawfee nil '(0))))))
+    (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+           (%rpc-error-code (lambda () (bitcoin-lisp.rpc::rpc-estimaterawfee nil '(2 1.5))))))
+    (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+           (%rpc-error-code (lambda () (bitcoin-lisp.rpc::rpc-estimaterawfee nil '(2 -0.1))))))
+    (is (= bitcoin-lisp.rpc::+rpc-type-error+
+           (%rpc-error-code (lambda () (bitcoin-lisp.rpc::rpc-estimaterawfee nil '("2"))))))))
 
 (test addconnection-opens-the-named-connection-type
   "addconnection (Core rpc/net.cpp). The functional framework uses it to attach

@@ -960,6 +960,58 @@ silently resuming address reuse."
                      (bitcoin-lisp.rpc::wdb-key-simple bitcoin-lisp.rpc::+wdb-key-flags+))))
         (is-true stored "the flag word was never written")))))
 
+(test createwalletdescriptor-adds-only-what-is-missing
+  "Core createwalletdescriptor (wallet/rpc/wallet.cpp:745-836). A fresh wallet
+already has all four address types on both sides, so the interesting case is
+the one Core makes an ERROR: asking for a descriptor that exists must not
+silently succeed, or an operator would believe they had added something.
+
+The descriptor is built through the SAME path wallet creation uses, so the
+derivation paths cannot drift between the two."
+  (with-wallet-test-node (node :keypool 4)
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
+      (bitcoin-lisp.rpc::rpc-createwallet node '("cwd")))
+    (let* ((bitcoin-lisp.rpc::*rpc-wallet-name* "cwd")
+           (manager (%node-manager node))
+           (wallet (gethash "cwd" (bitcoin-lisp.rpc::wallet-manager-wallets manager))))
+      ;; Everything already exists on a freshly created wallet.
+      (is (= bitcoin-lisp.rpc::+rpc-wallet-error+
+             (%rpc-error-code
+              (lambda () (bitcoin-lisp.rpc::rpc-createwalletdescriptor node '("bech32m"))))))
+      ;; An unknown address type is refused by name.
+      (is (= bitcoin-lisp.rpc::+rpc-invalid-address-or-key+
+             (%rpc-error-code
+              (lambda () (bitcoin-lisp.rpc::rpc-createwalletdescriptor node '("nosuchtype"))))))
+      ;; Now remove one side and re-create it: the real path.
+      (let* ((removed (gethash :bech32m (bitcoin-lisp.rpc::wallet-internal-spkms wallet)))
+             (id (and removed (bitcoin-lisp.rpc::desc-spkm-id removed))))
+        (is-true removed "fixture: the wallet should have an internal bech32m spkm")
+        (remhash :bech32m (bitcoin-lisp.rpc::wallet-internal-spkms wallet))
+        (remhash id (bitcoin-lisp.rpc::wallet-spkms wallet))
+        (let* ((opts (let ((h (make-hash-table :test 'equal)))
+                       (setf (gethash "internal" h) t) h))
+               (r (bitcoin-lisp.rpc::rpc-createwalletdescriptor
+                   node (list "bech32m" opts)))
+               (descs (cdr (assoc "descs" r :test #'string=))))
+          (is (= 1 (length descs)) "expected exactly one descriptor, got ~S" descs)
+          ;; It is the CHANGE descriptor (/1/*), not the external one — the
+          ;; internal option is what decides, and getting it backwards would
+          ;; silently make change addresses the wallet hands out publicly.
+          (is (search "/1/*" (first descs))
+              "internal=true produced ~S, which is not a change descriptor"
+              (first descs))
+          (is-true (gethash :bech32m (bitcoin-lisp.rpc::wallet-internal-spkms wallet))
+                   "the new descriptor was not activated")))
+      ;; A malformed hdkey is refused rather than silently falling back to the
+      ;; wallet's own root — which would create a descriptor for a key the
+      ;; caller did not ask for.
+      (let ((opts (let ((h (make-hash-table :test 'equal)))
+                    (setf (gethash "hdkey" h) "not-an-xpub") h)))
+        (is (= bitcoin-lisp.rpc::+rpc-invalid-address-or-key+
+               (%rpc-error-code
+                (lambda () (bitcoin-lisp.rpc::rpc-createwalletdescriptor
+                            node (list "bech32" opts))))))))))
+
 (test gethdkeys-groups-descriptors-under-their-root-key
   "Core gethdkeys. The grouping is the point: two descriptors derived from one
 HD root must appear as ONE entry with two descriptors, not two entries — that
