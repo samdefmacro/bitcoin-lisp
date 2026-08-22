@@ -630,7 +630,8 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
     (:signet "signet")
     (:regtest "regtest")))
 
-(defparameter *repeatable-config-options* '("onlynet" "addnode" "uacomment" "externalip")
+(defparameter *repeatable-config-options*
+  '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -874,8 +875,8 @@ specially in config-alist->start-node-plist.")
     "maxtxfee" "fallbackfee" "bantime" "uacomment"
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
-    ;; repeatable start-node option collected outside the spec scan
-    "addnode"
+    ;; repeatable start-node options collected outside the spec scan
+    "addnode" "rpcauth" "rpcallowip"
     ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, not the spec
     ;; scan, since each topic contributes two options and they produce a list
     ;; of publishers rather than a start-node keyword.
@@ -970,12 +971,18 @@ resolved network. Honors -server (enable RPC on the default port when no
       (let ((port (getf plist :port)))
         (when (and port (not (<= 1 port 65535)))
           (error "Invalid port specified in -port: '~A'" port)))
-      ;; -addnode is repeatable (Core GetArgs -> m_added_node_params,
-      ;; init.cpp:2107): collect every occurrence, CLI and config file.
-      (let ((adds (loop for (k . v) in alist
-                        when (string= k "addnode")
-                          collect v)))
-        (when adds (setf (getf plist :addnode) adds)))
+      ;; Repeatable options whose value is just the string: keep every
+      ;; occurrence, CLI and config file, the way Core's GetArgs does for
+      ;; -addnode (m_added_node_params, init.cpp:2107), -rpcauth (g_rpcauth,
+      ;; httprpc.cpp:289) and -rpcallowip (rpc_allow_subnets,
+      ;; httpserver.cpp:153). Each is validated where it is used, not here.
+      (dolist (option '(("addnode"    . :addnode)
+                        ("rpcauth"    . :rpc-auth)
+                        ("rpcallowip" . :rpc-allow-ip)))
+        (let ((values (loop for (k . v) in alist
+                            when (string= k (car option))
+                              collect v)))
+          (when values (setf (getf plist (cdr option)) values))))
       ;; -debug is a shortcut for -loglevel=debug (unless loglevel was set).
       (let ((debug (lookup "debug")))
         (when (and debug (conf-parse-bool (cdr debug)) (not (lookup "loglevel")))

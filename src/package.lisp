@@ -35,6 +35,7 @@
    #:uint64-to-bytes-le
    ;; Utilities
    #:bytes-to-hex
+   #:hmac-sha256
    #:hex-to-bytes
    #:reverse-bytes
    ;; BIP324 cipher suite: forward-secure wrappers + HKDF only. The bare
@@ -1437,6 +1438,9 @@
    #:parse-i2p-address
    #:network-address-to-string
    #:parse-network-address
+   #:parse-subnet
+   #:subnet-match-p
+   #:address-in-subnets-p
    ;; ADDRv2 support (BIP 155)
    #:peer-wants-addrv2
    #:peer-prefers-headers

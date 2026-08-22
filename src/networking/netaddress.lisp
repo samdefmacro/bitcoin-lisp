@@ -310,6 +310,94 @@ retagged :cjdns when CJDNS is reachable, this being a string-ingress point
     (when ip
       (values (maybe-flip-ipv6-to-cjdns (ip-network ip) ip) ip))))
 
+;;;; Subnets (Core CSubNet, netaddress.h:519)
+;;;
+;;; A network tag plus a masked network address, matched bytewise under a
+;;; netmask. The netmask is kept as bytes rather than a prefix length because
+;;; Core stores it that way and its dotted-quad form need not be contiguous.
+
+(defstruct (subnet (:constructor %make-subnet (network address netmask)))
+  "A range of addresses: Core's CSubNet (netaddress.h:519-560)."
+  (network nil :type symbol)
+  (address nil :type (simple-array (unsigned-byte 8) (*)))
+  (netmask nil :type (simple-array (unsigned-byte 8) (*))))
+
+(defun %prefix-netmask (bits)
+  "A 16-byte netmask whose first BITS bits are ones."
+  (let ((mask (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (dotimes (i 16 mask)
+      (let ((remaining (- bits (* 8 i))))
+        (setf (aref mask i)
+              (cond ((>= remaining 8) #xff)
+                    ((<= remaining 0) 0)
+                    (t (logand #xff (ash #xff (- 8 remaining))))))))))
+
+(defun parse-subnet (string)
+  "Parse STRING as a subnet, or NIL when it names none. Core accepts a bare
+address, a network/CIDR and (for IPv4) a network/netmask, and masks the network
+at construction so 1.2.3.4/24 names 1.2.3.0/24 (LookupSubNet, netbase.cpp:743-772;
+CSubNet::CSubNet, netaddress.cpp).
+
+IPv4 is held in its 16-byte mapped form, so an IPv4 /N covers 96+N bits: the
+::ffff: prefix is part of the network, which is what keeps 0.0.0.0/0 an
+IPv4-only wildcard the way Core's per-network Match does.
+
+Only the three 16-byte networks are subnettable. Core's CSubNet compares
+:torv3/:i2p/:cjdns by exact equality instead of by mask, and no caller here
+needs that."
+  (when (stringp string)
+    (let* ((slash (position #\/ string))
+           (host (if slash (subseq string 0 slash) string))
+           (suffix (and slash (subseq string (1+ slash)))))
+      (multiple-value-bind (network address) (parse-network-address host)
+        ;; Only the 16-byte networks are subnettable; a .onion or .b32.i2p host
+        ;; parses fine and is 32 bytes, so test the length rather than the tag.
+        (when (and address (= 16 (length address)))
+          (let* ((offset (if (eq network :ipv4) 96 0))
+                 (netmask
+                   (cond ((null suffix) (%prefix-netmask 128))
+                         ((and (plusp (length suffix))
+                               (every #'digit-char-p suffix))
+                          (let ((bits (parse-integer suffix)))
+                            (when (<= 0 bits (- 128 offset))
+                              (%prefix-netmask (+ offset bits)))))
+                         ;; A dotted-quad netmask masks the IPv4 octets only;
+                         ;; the mapped prefix is forced to ones so the network
+                         ;; tag still has to match.
+                         ((eq network :ipv4)
+                          (multiple-value-bind (mask-network mask-bytes)
+                              (parse-network-address suffix)
+                            (when (eq mask-network :ipv4)
+                              (let ((m (copy-seq mask-bytes)))
+                                (fill m #xff :end 12)
+                                m)))))))
+            (when netmask
+              (let ((masked (copy-seq address)))
+                (dotimes (i 16)
+                  (setf (aref masked i) (logand (aref masked i) (aref netmask i))))
+                (%make-subnet network masked netmask)))))))))
+
+(defun subnet-match-p (subnet network address)
+  "T when the NETWORK/ADDRESS pair falls inside SUBNET. Core compares the
+network tag before the netmask, so a v4 subnet never matches a v6 address and
+::/0 is not a wildcard over IPv4 (CSubNet::Match, netaddress.cpp)."
+  (and (eq (subnet-network subnet) network)
+       (let ((mask (subnet-netmask subnet))
+             (masked (subnet-address subnet)))
+         (loop for i below 16
+               always (= (logand (aref address i) (aref mask i)) (aref masked i))))))
+
+(defun address-in-subnets-p (string subnets)
+  "T when the address STRING parses and falls inside any of SUBNETS. An address
+that does not parse is refused, never defaulted in (Core ClientAllowed rejects
+!IsValid, httpserver.cpp:139-140)."
+  (when (and (stringp string) (plusp (length string)))
+    (multiple-value-bind (network address) (parse-network-address string)
+      (and address
+           (= 16 (length address))
+           (loop for subnet in subnets
+                   thereis (subnet-match-p subnet network address))))))
+
 (defun peer-address-string (pa)
   "Human-readable address string for a peer-address record PA."
   (network-address-to-string (peer-address-network pa) (peer-address-ip pa)))

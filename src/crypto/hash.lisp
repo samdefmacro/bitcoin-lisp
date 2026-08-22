@@ -207,6 +207,16 @@ Returns a 20-byte vector."
 
 ;;; Utility functions
 
+(defun hmac-sha256 (key &rest data)
+  "HMAC-SHA256 of the concatenated DATA octet vectors, keyed by KEY. 32 bytes.
+The one HMAC-SHA256 in the tree: HKDF (BIP324), Tor SAFECOOKIE and -rpcauth all
+key it differently but construct it identically."
+  (let ((mac (ironclad:make-hmac
+              (coerce key '(simple-array (unsigned-byte 8) (*))) :sha256)))
+    (dolist (d data (ironclad:hmac-digest mac))
+      (ironclad:update-hmac
+       mac (coerce d '(simple-array (unsigned-byte 8) (*)))))))
+
 (defun bytes-to-hex (bytes)
   "Convert a byte vector to a lowercase hexadecimal string."
   (ironclad:byte-array-to-hex-string bytes))

@@ -2031,9 +2031,11 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (blockfilterindex nil)
                         (prune nil)
                         (rpc-port nil)
-                        (rpc-bind "127.0.0.1")
+                        (rpc-bind "127.0.0.1" rpc-bind-supplied-p)
                         (rpc-user nil)
                         (rpc-password nil)
+                        (rpc-auth nil)
+                        (rpc-allow-ip nil)
                         (listen t)
                         (listen-bind "0.0.0.0")
                         (listen-onion t)
@@ -2075,6 +2077,11 @@ RPC-PORT: Port for RPC server (nil = no RPC, default 18332 testnet / 8332 mainne
 RPC-BIND: Address to bind RPC server (default 127.0.0.1)
 RPC-USER: RPC authentication username (nil = no auth)
 RPC-PASSWORD: RPC authentication password
+RPC-AUTH: list of -rpcauth specs (USERNAME:SALT$HMAC), extra credentials
+  accepted alongside the RPC-USER/RPC-PASSWORD or .cookie pair
+RPC-ALLOW-IP: list of -rpcallowip specs allowed to reach the RPC port;
+  loopback is always allowed, and a non-loopback RPC-BIND is honoured only
+  when this is non-empty
 LISTEN-ONION: If T (default, like Core -listenonion) and LISTEN is on,
   connect to the local Tor control port, create a v3 onion service forwarding
   to a loopback listener on port+1, and advertise the .onion address
@@ -2679,8 +2686,12 @@ Returns the node instance."
            (server (bitcoin-lisp.rpc:start-rpc-server *node*
                                                       :port rpc-port
                                                       :bind rpc-bind
+                                                      :bind-supplied-p
+                                                      rpc-bind-supplied-p
                                                       :user rpc-user
                                                       :password rpc-password
+                                                      :rpc-auth rpc-auth
+                                                      :allow-ip rpc-allow-ip
                                                       :rest-enabled rest-enabled
                                                       :ui-enabled webui-enabled
                                                       :ui-directory webui-path)))

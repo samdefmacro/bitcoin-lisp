@@ -655,3 +655,34 @@ is the default path, and creating it is the intended behaviour."
   (%with-temp-datadir (dir)
     (finishes (bitcoin-lisp::%check-datadir-option
                (list (cons "datadir" (namestring dir)))))))
+
+(test config-rpcauth-and-rpcallowip-are-repeatable
+  "-rpcauth and -rpcallowip are list options: every occurrence counts, from the
+command line and from bitcoin.conf alike (Core GetArgs -> g_rpcauth,
+httprpc.cpp:289; rpc_allow_subnets, httpserver.cpp:153). Collapsing them to the
+last occurrence — what every non-repeatable option does here — would silently
+drop all but one credential and all but one allowed subnet."
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest"
+                  "-rpcauth=alice:aaaa$1111" "-rpcauth=bob:bbbb$2222"
+                  "-rpcallowip=10.0.0.0/8" "-rpcallowip=192.168.1.5")
+                nil)))
+    (is (equal '("alice:aaaa$1111" "bob:bbbb$2222") (getf plist :rpc-auth)))
+    (is (equal '("10.0.0.0/8" "192.168.1.5") (getf plist :rpc-allow-ip))))
+  ;; from the config file, where the same key repeats on separate lines
+  (let ((plist (bitcoin-lisp::args->start-node-plist
+                '("-regtest")
+                (format nil "rpcauth=alice:aaaa$1111~%rpcauth=bob:bbbb$2222~%~
+rpcallowip=10.0.0.0/8~%rpcallowip=::/0~%"))))
+    (is (equal '("alice:aaaa$1111" "bob:bbbb$2222") (getf plist :rpc-auth)))
+    (is (equal '("10.0.0.0/8" "::/0") (getf plist :rpc-allow-ip))))
+  ;; absent means absent, not an empty list that looks configured
+  (let ((plist (bitcoin-lisp::args->start-node-plist '("-regtest") nil)))
+    (is-false (member :rpc-auth plist))
+    (is-false (member :rpc-allow-ip plist)))
+  ;; and both are known options, so neither trips the unknown-option check
+  (is-true (member "rpcauth" bitcoin-lisp::*known-config-options* :test #'string=))
+  (is-true (member "rpcallowip" bitcoin-lisp::*known-config-options* :test #'string=))
+  (is-true (member "rpcauth" bitcoin-lisp::*repeatable-config-options* :test #'string=))
+  (is-true (member "rpcallowip" bitcoin-lisp::*repeatable-config-options*
+                   :test #'string=)))

@@ -391,15 +391,9 @@ Advances the packet counter regardless, mirroring Core."
 ;;; HKDF-SHA256 with 32-byte output (RFC 5869; Core's CHKDF_HMAC_SHA256_L32)
 ;;; ============================================================
 
-(defun %hmac-sha256 (key data &optional data2)
-  (let ((mac (ironclad:make-hmac key :sha256)))
-    (ironclad:update-hmac mac data)
-    (when data2 (ironclad:update-hmac mac data2))
-    (ironclad:hmac-digest mac)))
-
 (defun hkdf-sha256-extract (salt ikm)
   "RFC 5869 extract: PRK = HMAC-SHA256(SALT, IKM)."
-  (%hmac-sha256 salt ikm))
+  (hmac-sha256 salt ikm))
 
 (defparameter *hkdf-one*
   (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1)
@@ -409,8 +403,8 @@ only) output block.")
 (defun hkdf-sha256-expand32 (prk info)
   "RFC 5869 expand with L=32: OKM = HMAC-SHA256(PRK, INFO || 0x01). INFO is a
 byte vector, or a string (BIP324's \"initiator_L\"-style labels)."
-  (%hmac-sha256 prk
-                (if (stringp info)
-                    (flexi-streams:string-to-octets info :external-format :ascii)
-                    info)
-                *hkdf-one*))
+  (hmac-sha256 prk
+               (if (stringp info)
+                   (flexi-streams:string-to-octets info :external-format :ascii)
+                   info)
+               *hkdf-one*))
