@@ -111,6 +111,11 @@
   ;; Node / chain info methods
   (register-rpc-method "getdifficulty" #'rpc-getdifficulty)
   (register-rpc-method "uptime" #'rpc-uptime)
+  ;; Test-harness control (Core rpc/node.cpp). setmocktime refuses outside
+  ;; regtest; syncwithvalidationinterfacequeue is a no-op we must still answer.
+  (register-rpc-method "setmocktime" #'rpc-setmocktime)
+  (register-rpc-method "syncwithvalidationinterfacequeue"
+                       #'rpc-syncwithvalidationinterfacequeue)
   (register-rpc-method "getindexinfo" #'rpc-getindexinfo)
   (register-rpc-method "getdeploymentinfo" #'rpc-getdeploymentinfo)
   (register-rpc-method "getchainstates" #'rpc-getchainstates)

@@ -356,6 +356,8 @@
    #:+psbt-out-tap-internal-key+ #:+psbt-out-proprietary+
    #:coinbase-input-p
    #:get-unix-time
+   #:get-real-unix-time
+   #:*mock-time*
    #:+universal-unix-epoch-offset+
    #:read-net-addr
    #:write-net-addr

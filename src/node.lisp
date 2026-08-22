@@ -2116,7 +2116,10 @@ Returns the node instance."
     (log-warn "Node already running, stopping first")
     (stop-node))
 
-  (setf *node-start-time* (bitcoin-lisp.serialization:get-unix-time))
+  ;; Real time, not the mockable clock: uptime must keep measuring real elapsed
+  ;; seconds while a functional test drives setmocktime, exactly as Core's
+  ;; GetUptime uses SteadyClock rather than GetTime (common/system.cpp:134).
+  (setf *node-start-time* (bitcoin-lisp.serialization:get-real-unix-time))
 
   ;; Wire up logging BEFORE init-node so its log-info calls go somewhere.
   ;; Without these, the node runs silently — the May 5 restart had this
