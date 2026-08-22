@@ -593,6 +593,65 @@ refuses it elsewhere for the same reason."
       (%desc-error "Miniscript expression is not valid at top level: '~A'" expr))
     (make-out-desc :kind :miniscript :node node :keys (nreverse keys))))
 
+;;; --- Multipath descriptors, BIP389 (Core descriptor.cpp:1802-1851) ---
+;;;
+;;; `wpkh(xpub.../<0;1>/*)` is ONE string that means TWO descriptors — the
+;;; receive chain and the change chain — and it is how Sparrow, Ledger Live,
+;;; BlueWallet, BDK and modern Core exports write a wallet. A node that cannot
+;;; read it cannot import from any of them.
+;;;
+;;; Core expands the string into N descriptors and parses each normally
+;;; (Parse() returns a vector). Expanding here rather than threading N paths
+;;; through the key structures keeps every downstream consumer — derivation,
+;;; signing, printing, checksums — working on exactly the descriptors it
+;;; already understands.
+
+(defun %multipath-substitutes (elem)
+  "The values inside a `<a;b;...>` path element, validated as Core validates
+them (descriptor.cpp:1813-1833). Signals with Core's messages."
+  (let* ((inner (subseq elem 1 (1- (length elem))))
+         (parts (uiop:split-string inner :separator ";")))
+    (when (< (length parts) 2)
+      (%desc-error "Multipath key path specifiers must have at least two items"))
+    (let ((seen '())
+          (box (list nil)))
+      (dolist (part parts (nreverse seen))
+        ;; Parse for VALIDATION only — the substituted string keeps the
+        ;; original spelling, so a hardened marker survives as written.
+        (let ((num (%parse-key-path-num part box)))
+          (when (member num seen :key #'car)
+            (%desc-error "Duplicated key path value ~D in multipath specifier"
+                         (logand num #x7FFFFFFF)))
+          (push (cons num part) seen))))))
+
+(defun expand-multipath-descriptor (string)
+  "STRING expanded into the descriptors it denotes: a list of one for an
+ordinary descriptor, or of N for a multipath one (Core Parse, which returns a
+vector of descriptors, descriptor.cpp:1802-1851).
+
+Any checksum is dropped, because it covered the multipath form and not the
+expansions; each result is unchecksummed and the caller adds one if it needs to.
+
+Core allows at most ONE multipath specifier per descriptor and requires at
+least two, distinct, values — all three of those errors are its own text."
+  (let* ((hash (position #\# string))
+         (body (if hash (subseq string 0 hash) string))
+         (start (position #\< body)))
+    (if (null start)
+        (list string)
+        (let ((end (position #\> body :start start)))
+          (unless end
+            (%desc-error "Key path value '~A' specifies multipath in a section where multipath is not allowed"
+                         (subseq body start)))
+          (when (position #\< body :start (1+ end))
+            (%desc-error "Multiple multipath key path specifiers found"))
+          (let ((prefix (subseq body 0 start))
+                (suffix (subseq body (1+ end)))
+                (elem (subseq body start (1+ end))))
+            (mapcar (lambda (sub)
+                      (concatenate 'string prefix (cdr sub) suffix))
+                    (%multipath-substitutes elem)))))))
+
 (defun parse-descriptor (string network &key require-checksum)
   "Parse descriptor STRING (Core's Parse). Returns (values out-desc
 input-checksum) where INPUT-CHECKSUM is the checksum computed over the input
