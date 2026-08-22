@@ -1214,14 +1214,40 @@ Core asserts the coin is present before verifying (CheckInputScripts,
 validation.cpp:2090), so a missing coin must never mean \"no script to check\".
 Returns (VALUES T NIL) on success, (VALUES NIL INPUT-INDEX) on failure."
   (let* ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
-         (spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
-         (bitcoin-lisp.coalton.interop:*script-flags*
-           (or flags (compute-script-flags-for-height height)))
-         (bitcoin-lisp.coalton.interop:*precomputed-sighash*
-           (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
-         (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
-    (dotimes (input-idx (length inputs))
-      (let ((utxo (and spent-utxos (aref spent-utxos input-idx))))
-        (unless (and utxo (validate-input-script tx input-idx utxo))
-          (return-from validate-transaction-scripts (values nil input-idx)))))
-    (values t nil)))
+         (effective-flags (or flags (compute-script-flags-for-height height)))
+         ;; Script-execution cache (Core CheckInputScripts,
+         ;; validation.cpp:2075-2081): a transaction whose inputs ALL verified
+         ;; under this exact flag set needs none of them re-run. The mempool
+         ;; verifies on acceptance and the confirming block verifies again, so
+         ;; this turns the second pass into ONE lookup for the whole
+         ;; transaction rather than one per signature.
+         ;;
+         ;; Keyed on the WTXID: the witness is where the signatures live, so a
+         ;; malleated copy must not hit.
+         (cache-key
+           (when (and bitcoin-lisp.coalton.interop::*script-execution-cache-enabled*
+                      ;; Core returns true for a coinbase before touching the
+                      ;; cache (validation.cpp:2064); it has no input scripts.
+                      (not (and (= 1 (length inputs))
+                                (bitcoin-lisp.serialization:coinbase-input-p
+                                 (aref inputs 0)))))
+             (bitcoin-lisp.coalton.interop::make-script-execution-cache-key
+              (bitcoin-lisp.serialization:transaction-wtxid tx)
+              effective-flags))))
+    (when (and cache-key
+               (bitcoin-lisp.coalton.interop::script-execution-cached-p cache-key))
+      (return-from validate-transaction-scripts (values t nil)))
+    (let* ((spent-utxos (collect-spent-utxos inputs utxo-set extra-coins))
+           (bitcoin-lisp.coalton.interop:*script-flags* effective-flags)
+           (bitcoin-lisp.coalton.interop:*precomputed-sighash*
+             (bitcoin-lisp.coalton.interop:init-precomputed-sighash tx spent-utxos))
+           (bitcoin-lisp.coalton.interop:*current-spent-utxos* spent-utxos))
+      (dotimes (input-idx (length inputs))
+        (let ((utxo (and spent-utxos (aref spent-utxos input-idx))))
+          (unless (and utxo (validate-input-script tx input-idx utxo))
+            (return-from validate-transaction-scripts (values nil input-idx)))))
+      ;; Stored only after EVERY input succeeded — a partial success must never
+      ;; short-circuit a later pass.
+      (when cache-key
+        (bitcoin-lisp.coalton.interop::script-execution-cache-store cache-key))
+      (values t nil))))

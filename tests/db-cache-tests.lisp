@@ -300,6 +300,117 @@ to need."
               (bitcoin-lisp.coalton.interop::make-sig-cache-key #x45 sighash sig pubkey)
               (bitcoin-lisp.coalton.interop::make-sig-cache-key #x53 sighash sig pubkey))))))
 
+(test script-execution-cache-keys-on-wtxid-and-flags
+  "Core CheckInputScripts hashes the WTXID and the flags word into its salted
+hasher (validation.cpp:2077) and short-circuits every input script on a hit.
+
+Both halves of the key matter. The WTXID, not the txid, because the witness is
+where the signatures live — keying on the txid would let a malleated copy hit
+an entry earned by the original. And the FLAGS, unlike the signature cache,
+because the entry means \"these scripts SUCCEEDED under these rules\" and the
+rules change at soft-fork heights."
+  (let ((wtxid-a (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+        (wtxid-b (make-array 32 :element-type '(unsigned-byte 8) :initial-element 2)))
+    (flet ((key (wtxid flags)
+             (bitcoin-lisp.coalton.interop::make-script-execution-cache-key
+              wtxid flags)))
+      (is (equalp (key wtxid-a "P2SH") (key wtxid-a "P2SH")))
+      (is (not (equalp (key wtxid-a "P2SH") (key wtxid-b "P2SH")))
+          "two transactions share a script-execution cache entry")
+      (is (not (equalp (key wtxid-a "P2SH") (key wtxid-a "P2SH,TAPROOT")))
+          "the same transaction keys identically under different script flags")
+      ;; The flag string is length-prefixed, so a split cannot collide: "AB"+""
+      ;; and "A"+"B" must not produce the same key.
+      (is (not (equalp (key wtxid-a "AB") (key wtxid-a "A"))))
+      ;; Salted, so the key is not computable offline.
+      (let ((before (key wtxid-a "P2SH")))
+        (let ((bitcoin-lisp.coalton.interop::*sig-cache-salt*
+                (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9)))
+          (is (not (equalp before (key wtxid-a "P2SH")))))))))
+
+(test script-execution-cache-short-circuits-a-second-pass
+  "The point of the cache: a transaction verified once is not re-verified.
+Asserted by counting INPUT script executions, because \"it returned T again\"
+is equally true of a cache that never fires.
+
+The flag sensitivity is asserted the same way, and is the half that matters
+for correctness: a different flag set must re-run the scripts, or a
+transaction that passed under pre-fork rules would be waved through after the
+fork."
+  (let ((tx (make-mempool-test-tx :input-id 55))
+        (runs 0)
+        (real (symbol-function 'bitcoin-lisp.validation::validate-input-script)))
+    (unwind-protect
+         (progn
+           (setf (symbol-function 'bitcoin-lisp.validation::validate-input-script)
+                 (lambda (&rest args) (declare (ignore args)) (incf runs) t))
+           (bitcoin-lisp.coalton.interop::clear-script-execution-cache)
+           (let ((utxo (bitcoin-lisp.storage:make-utxo-set))
+                 (coins (make-hash-table :test 'equalp)))
+             ;; A resolvable coin for the single input, so the walk reaches
+             ;; validate-input-script at all.
+             (let ((in (aref (bitcoin-lisp.serialization:transaction-inputs tx) 0)))
+               (setf (gethash (cons (bitcoin-lisp.serialization:outpoint-hash
+                                     (bitcoin-lisp.serialization:tx-in-previous-output in))
+                                    (bitcoin-lisp.serialization:outpoint-index
+                                     (bitcoin-lisp.serialization:tx-in-previous-output in)))
+                              coins)
+                     (bitcoin-lisp.storage:make-utxo-entry
+                      :value 100000
+                      :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
+                      :height 1 :coinbase nil)))
+             (flet ((check (flags)
+                      (bitcoin-lisp.validation:validate-transaction-scripts
+                       tx utxo :extra-coins coins :flags flags)))
+               (is-true (check "P2SH"))
+               (is (= 1 runs) "the first pass must actually run the input")
+               ;; Second pass, same flags: served from cache.
+               (is-true (check "P2SH"))
+               (is (= 1 runs)
+                   "a second pass re-ran ~D input script(s)" (- runs 1))
+               ;; Different flags: must re-run.
+               (is-true (check "P2SH,TAPROOT"))
+               (is (= 2 runs)
+                   "a different flag set was served from cache")
+               ;; And that result is cached under ITS flags.
+               (is-true (check "P2SH,TAPROOT"))
+               (is (= 2 runs)))))
+      (setf (symbol-function 'bitcoin-lisp.validation::validate-input-script) real)
+      (bitcoin-lisp.coalton.interop::clear-script-execution-cache))))
+
+(test script-execution-cache-never-stores-a-partial-success
+  "A transaction whose SECOND input fails must leave no entry — otherwise the
+next pass short-circuits on the first input's success and accepts it."
+  (let ((tx (make-mempool-test-tx :input-id 56))
+        (real (symbol-function 'bitcoin-lisp.validation::validate-input-script)))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp.coalton.interop::clear-script-execution-cache)
+           (setf (symbol-function 'bitcoin-lisp.validation::validate-input-script)
+                 (lambda (&rest args) (declare (ignore args)) nil))
+           (let ((utxo (bitcoin-lisp.storage:make-utxo-set))
+                 (coins (make-hash-table :test 'equalp)))
+             (let ((in (aref (bitcoin-lisp.serialization:transaction-inputs tx) 0)))
+               (setf (gethash (cons (bitcoin-lisp.serialization:outpoint-hash
+                                     (bitcoin-lisp.serialization:tx-in-previous-output in))
+                                    (bitcoin-lisp.serialization:outpoint-index
+                                     (bitcoin-lisp.serialization:tx-in-previous-output in)))
+                              coins)
+                     (bitcoin-lisp.storage:make-utxo-entry
+                      :value 100000
+                      :script-pubkey (make-array 0 :element-type '(unsigned-byte 8))
+                      :height 1 :coinbase nil)))
+             (is-false (bitcoin-lisp.validation:validate-transaction-scripts
+                        tx utxo :extra-coins coins :flags "P2SH"))
+             ;; Nothing cached, so a later pass still runs the scripts — and
+             ;; still fails.
+             (is-false (bitcoin-lisp.coalton.interop::script-execution-cached-p
+                        (bitcoin-lisp.coalton.interop::make-script-execution-cache-key
+                         (bitcoin-lisp.serialization:transaction-wtxid tx) "P2SH"))
+                       "a failed validation left a cache entry")))
+      (setf (symbol-function 'bitcoin-lisp.validation::validate-input-script) real)
+      (bitcoin-lisp.coalton.interop::clear-script-execution-cache))))
+
 (test sig-cache-key-carries-no-script-flags
   "Core keys on sighash|pubkey|sig with NO script flags (ComputeEntryECDSA,
 sigcache.cpp:39-43). Ours used to include them, because the flag-dependent

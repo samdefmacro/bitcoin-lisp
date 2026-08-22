@@ -653,6 +653,76 @@ carry no script flags; see the note there."
         (sig-cache-store cache-key))
       result)))
 
+
+;;; Script-execution cache (Core ValidationCache::m_script_execution_cache,
+;;; validation.cpp:2075-2081, 2127)
+;;;
+;;; One level above the signature cache: a transaction whose inputs ALL
+;;; verified under a given flag set need not have any of them re-run. The
+;;; mempool verifies a transaction on acceptance and the block that confirms
+;;; it verifies it again, so this turns the second pass into one hash lookup
+;;; for the whole transaction rather than one per signature.
+;;;
+;;; Keyed on the WTXID, not the txid: the witness is where the signatures live,
+;;; so a malleated copy must not hit. And keyed WITH the script flags, unlike
+;;; the signature cache — the whole point of the entry is "these scripts
+;;; SUCCEEDED under these rules", and the rules change at soft-fork heights.
+
+(defparameter +script-execution-cache-max-entries+ 65536
+  "Per-generation cap, rotated exactly as the signature cache is.")
+
+(defvar *script-execution-cache* (%make-sig-cache-table)
+  "Current generation of the script-execution cache. Key = SHA256(salt|wtxid|
+flags), value = T.")
+
+(defvar *script-execution-cache-prev* (%make-sig-cache-table)
+  "Previous generation; see *signature-cache-prev* for the rotation scheme.")
+
+(defvar *script-execution-cache-enabled* t
+  "When T, cache whole-transaction script-validation results.")
+
+(defun make-script-execution-cache-key (wtxid flags)
+  "SHA256(salt | wtxid | flags) — Core hashes the wtxid and the flags word into
+its salted hasher (validation.cpp:2077).
+
+Salted with the same per-process salt as the signature cache, for the same
+reason: an unsalted key is computable offline, which is what makes a cache
+attackable by collision or eviction ordering."
+  (let* ((salt *sig-cache-salt*)
+         (flag-bytes (if flags
+                         (map '(simple-array (unsigned-byte 8) (*)) #'char-code flags)
+                         (make-array 0 :element-type '(unsigned-byte 8))))
+         (total (+ (length salt) (length wtxid) 2 (length flag-bytes)))
+         (buf (make-array total :element-type '(unsigned-byte 8)))
+         (pos 0))
+    (declare (type (simple-array (unsigned-byte 8) (*)) buf)
+             (type fixnum pos total))
+    (setf pos (buf-set-bytes buf pos salt))
+    (setf pos (buf-set-bytes buf pos wtxid))
+    ;; Length-prefixed, so a flag string cannot run into the (fixed-length)
+    ;; fields before it and produce a collision across different splits.
+    (setf pos (buf-set-u16-le buf pos (length flag-bytes)))
+    (setf pos (buf-set-bytes buf pos flag-bytes))
+    (bitcoin-lisp.crypto:sha256 buf)))
+
+(defun script-execution-cached-p (key)
+  "T when KEY is cached in either generation; prev-generation hits are promoted."
+  (or (gethash key *script-execution-cache*)
+      (when (gethash key *script-execution-cache-prev*)
+        (setf (gethash key *script-execution-cache*) t))))
+
+(defun script-execution-cache-store (key)
+  (when (>= (hash-table-count *script-execution-cache*)
+            +script-execution-cache-max-entries+)
+    (setf *script-execution-cache-prev* *script-execution-cache*
+          *script-execution-cache* (%make-sig-cache-table)))
+  (setf (gethash key *script-execution-cache*) t))
+
+(defun clear-script-execution-cache ()
+  "Clear both generations of the script-execution cache."
+  (clrhash *script-execution-cache*)
+  (clrhash *script-execution-cache-prev*))
+
 (defun clear-signature-cache ()
   "Clear both generations of the signature verification cache."
   (clrhash *signature-cache*)
