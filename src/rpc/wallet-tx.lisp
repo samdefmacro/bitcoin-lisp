@@ -811,7 +811,29 @@ where Core asserts the existing mapValue is what it keeps."
     ;; Break debit/credit balance caches (wallet.cpp:1117).
     (wtx-mark-dirty wtx)
     (wallet-refresh-txos wallet wtx)
+    (%run-wallet-notify wallet wtx)
     wtx))
+
+(defun %run-wallet-notify (wallet wtx)
+  "Fire -walletnotify for WTX (Core wallet.cpp:1125-1150).
+
+Unconditional, exactly as Core's is: the hook sits OUTSIDE the
+inserted-or-updated branch, so a transaction re-seen in the same state still
+notifies. %s is the txid, %w the wallet name, and %b/%h the confirming block or
+the literal \"unconfirmed\"/-1."
+  (let ((command *wallet-notify-command*))
+    (when command
+      (multiple-value-bind (block-hash height)
+          (if (eq (wallet-tx-state wtx) :confirmed)
+              (values (hash-to-hex (wallet-tx-block-hash wtx))
+                      (princ-to-string (wallet-tx-block-height wtx)))
+              (values "unconfirmed" "-1"))
+        (bitcoin-lisp:run-notify-command
+         command
+         :substitutions (list (cons #\s (hash-to-hex (wallet-tx-txid wtx)))
+                              (cons #\w (wallet-name wallet))
+                              (cons #\b block-hash)
+                              (cons #\h height)))))))
 
 ;;; --- Keypool advance on observed use (scriptpubkeyman.cpp:1066) ---
 

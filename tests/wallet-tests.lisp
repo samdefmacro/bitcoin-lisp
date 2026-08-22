@@ -905,6 +905,69 @@ wallet does not own -4 (Core wallet/rpc/signmessage.cpp error codes)."
                 (lambda () (bitcoin-lisp.rpc::rpc-signmessage
                             node (list foreign message))))))))))
 
+(test walletnotify-runs-on-every-add-to-wallet
+  "-walletnotify (Core wallet.cpp:1125-1150). Asserted through the FILE the
+hook creates, and specifically on a RE-ADD of the same transaction in the same
+state: Core's hook sits OUTSIDE the inserted-or-updated branch, so a wallet tx
+seen again still notifies, and a test that only added once would pass against a
+hook wired inside the branch."
+  (let ((dir (merge-pathnames (format nil "bl-wn-~D/" (get-internal-real-time))
+                              (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           (with-wallet-test-node (node :keypool 4)
+             (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
+               (bitcoin-lisp.rpc::rpc-createwallet node '("notif")))
+             (let* ((manager (%node-manager node))
+                    (wallet (gethash "notif"
+                                     (bitcoin-lisp.rpc::wallet-manager-wallets
+                                      manager)))
+                    (bitcoin-lisp.rpc::*rpc-wallet-name* "notif")
+                    (bitcoin-lisp.rpc::*wallet-notify-command*
+                      ;; %w and %h prove the placeholders beyond %s reach the
+                      ;; command line; %b would be the block hash, which is
+                      ;; the file name below.
+                      (format nil "touch ~A%w-%h-%b" (namestring dir))))
+               (setf (bitcoin-lisp.rpc::wallet-last-block-height wallet) 100)
+               (let* ((addr (bitcoin-lisp.rpc::rpc-getnewaddress
+                             node '("" "legacy")))
+                      (script (%address-script addr :testnet4))
+                      ;; The confirming block hash %wt-add-confirmed-tx uses.
+                      (expected (merge-pathnames
+                                 (format nil "notif-100-~A"
+                                         (bitcoin-lisp.rpc::hash-to-hex
+                                          (make-array 32 :element-type
+                                                         '(unsigned-byte 8)
+                                                      :initial-element 9)))
+                                 dir)))
+                 (%wt-add-confirmed-tx wallet (list (cons (%wt-dummy-txid 1) 0))
+                                       (list (cons script 500000)))
+                 ;; Detached, as Core's is ("thread runs free") — poll.
+                 (loop repeat 100
+                       until (probe-file expected)
+                       do (sleep 0.05))
+                 (is-true (probe-file expected)
+                          "-walletnotify did not run for a new wallet tx")
+                 (ignore-errors (delete-file expected))
+                 ;; Re-add the SAME tx in the SAME state: nothing is inserted
+                 ;; or updated, and Core notifies anyway.
+                 (%wt-add-confirmed-tx wallet (list (cons (%wt-dummy-txid 1) 0))
+                                       (list (cons script 500000)))
+                 (loop repeat 100
+                       until (probe-file expected)
+                       do (sleep 0.05))
+                 (is-true (probe-file expected)
+                          "-walletnotify did not run for a re-added wallet tx")))))
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore))))
+  ;; A command with an unsafe wallet name can never be built, because a wallet
+  ;; name outside [A-Za-z0-9._-] cannot exist in the first place.
+  (is-false (bitcoin-lisp.rpc::%valid-wallet-name-p "a;rm -rf /"))
+  (dolist (name '("walletnotify"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
+
 (test wallet-received-by-rpcs
   "getreceivedbyaddress/bylabel and listreceivedbyaddress/bylabel tally owned
 outputs over mapWallet; unknown address -> -4, garbage -> -5, unknown label

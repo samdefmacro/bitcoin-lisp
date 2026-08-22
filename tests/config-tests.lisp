@@ -1114,26 +1114,39 @@ there is a READ error, not a link error."
     (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
     (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
 
-(test notify-commands-substitute-only-hex
-  "Core replaces %s in a notify command with the block hash and runs the result
-through the shell (init.cpp:2014-2017). The COMMAND is the operator's own, so
-the shell is the feature — but the SUBSTITUTED VALUE is not necessarily, and a
-value containing `;` or a backtick would be shell injection through a config
-option that looks inert. Everything we substitute is a hash, so requiring hex
-costs nothing and closes the route."
-  (is (equal "echo deadbeef"
-             (bitcoin-lisp::%notify-substitute "echo %s" "deadbeef")))
-  ;; Every occurrence, as ReplaceAll does.
-  (is (equal "a beef b beef c"
-             (bitcoin-lisp::%notify-substitute "a %s b %s c" "beef")))
-  ;; A command with no %s is passed through untouched.
-  (is (equal "touch /tmp/x"
-             (bitcoin-lisp::%notify-substitute "touch /tmp/x" "beef")))
-  ;; A lone trailing % is literal, not a truncated directive.
-  (is (equal "echo 100%"
-             (bitcoin-lisp::%notify-substitute "echo 100%" "beef")))
-  (dolist (bad '("dead; rm -rf /" "`id`" "$(id)" "dead beef" "" "zznothex"))
-    (signals error (bitcoin-lisp::%notify-substitute "echo %s" bad))))
+(test notify-commands-substitute-only-shell-safe-values
+  "Core replaces %s (and, for -walletnotify, %w/%b/%h) in a notify command and
+runs the result through the shell (init.cpp:2014-2017, wallet.cpp:1125-1150).
+The COMMAND is the operator's own, so the shell is the feature — but the
+SUBSTITUTED VALUE is not necessarily, and a value containing `;` or a backtick
+would be shell injection through a config option that looks inert. Every value
+we substitute is a hash, a decimal height, the literal \"unconfirmed\", or a
+wallet name (%VALID-WALLET-NAME-P already holds those to [A-Za-z0-9._-]), so
+refusing anything outside that set costs nothing and closes the route. Core
+instead shell-escapes %w and substitutes the rest raw."
+  (flet ((sub (command &rest pairs)
+           (bitcoin-lisp::%notify-substitute command pairs)))
+    (is (equal "echo deadbeef" (sub "echo %s" (cons #\s "deadbeef"))))
+    ;; Every occurrence, as ReplaceAll does.
+    (is (equal "a beef b beef c" (sub "a %s b %s c" (cons #\s "beef"))))
+    ;; A command with no %s is passed through untouched.
+    (is (equal "touch /tmp/x" (sub "touch /tmp/x" (cons #\s "beef"))))
+    ;; A lone trailing % is literal, not a truncated directive.
+    (is (equal "echo 100%" (sub "echo 100%" (cons #\s "beef"))))
+    ;; -walletnotify's four placeholders, including the unconfirmed forms.
+    (is (equal "n beef mine unconfirmed -1"
+               (sub "n %s %w %b %h"
+                    (cons #\s "beef") (cons #\w "mine")
+                    (cons #\b "unconfirmed") (cons #\h "-1"))))
+    ;; An unlisted placeholder is left alone rather than eaten.
+    (is (equal "%b" (sub "%b" (cons #\s "beef"))))
+    ;; A value can never introduce a placeholder of its own: % is outside the
+    ;; safe set, so the substitution is refused before the single pass that
+    ;; would not have rescanned it anyway.
+    (signals error (sub "x %s" (cons #\s "%w") (cons #\w "boom")))
+    (dolist (bad '("dead; rm -rf /" "`id`" "$(id)" "dead beef" "" "a/b" "*" nil))
+      (signals error (sub "echo %s" (cons #\s bad)))
+      (signals error (sub "echo %w" (cons #\w bad))))))
 
 (test notify-commands-reach-the-plist
   "-shutdownnotify is repeatable — Core reads it with GetArgs and joins EVERY
@@ -1176,6 +1189,55 @@ immediately; -blocknotify is detached, so it is polled for."
   ;; triggered it.
   (is-true (bitcoin-lisp::run-notify-command "exit 1" :wait t))
   (is-false (bitcoin-lisp::run-notify-command "echo %s" :value "not hex")))
+
+(test pid-file-is-written-and-removed
+  "-pid (Core CreatePidFile/RemovePidFile, init.cpp:178-208). Asserted through
+the FILE: a pid file that is computed and never written is exactly the kind of
+option this repo keeps finding."
+  (let ((dir (merge-pathnames (format nil "bl-pid-~D/" (get-internal-real-time))
+                              (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (ensure-directories-exist dir)
+           ;; A relative -pid hangs off the datadir; the default name applies
+           ;; when -pid is absent; an absolute path wins outright.
+           (is (equal (merge-pathnames "node.pid" dir)
+                      (bitcoin-lisp::pid-file-path "node.pid" dir)))
+           (is (equal (merge-pathnames "bitcoin-lisp.pid" dir)
+                      (bitcoin-lisp::pid-file-path nil dir)))
+           (is (equal #p"/var/run/x.pid"
+                      (bitcoin-lisp::pid-file-path "/var/run/x.pid" dir)))
+           ;; -nopid parses to "0", which Core reads as IsArgNegated.
+           (is-false (bitcoin-lisp::pid-file-path "0" dir))
+           (let ((path (bitcoin-lisp::write-pid-file "node.pid" dir)))
+             (is-true (probe-file path) "no pid file was written")
+             (is (= (sb-posix:getpid)
+                    (with-open-file (in path) (read in))))
+             ;; Removal is by the path we recorded, and only for a file we
+             ;; created — a second removal is a no-op, not a warning storm.
+             (bitcoin-lisp::remove-pid-file)
+             (is-false (probe-file path) "the pid file outlived shutdown")
+             (is-false bitcoin-lisp::*pid-file-path*)
+             (bitcoin-lisp::remove-pid-file))
+           ;; A negated -pid writes nothing at all.
+           (is-false (bitcoin-lisp::write-pid-file "0" dir))
+           ;; An unwritable path is fatal, as Core's InitError is: an operator
+           ;; who asked for a pid file and silently did not get one has a
+           ;; supervisor that will never find this process.
+           (signals error
+             (bitcoin-lisp::write-pid-file "no-such-dir/deeper/x.pid" dir)))
+      (setf bitcoin-lisp::*pid-file-path* nil)
+      (ignore-errors (uiop:delete-directory-tree dir :validate t
+                                                    :if-does-not-exist :ignore))))
+  (dolist (name '("pid" "printtoconsole"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name))
+  ;; -printtoconsole reaches the plist as :console-log, and is ABSENT when not
+  ;; given so START-NODE's default (on, since we never daemonize) applies.
+  (is-false (getf (bitcoin-lisp::args->start-node-plist '("-printtoconsole=0"))
+                  :console-log))
+  (is (eq :absent (getf (bitcoin-lisp::args->start-node-plist '("-regtest"))
+                        :console-log :absent))))
 
 (test p2p-config-knobs-take-effect
   "Track D's P2P group, the two options that map onto existing constants."
@@ -1252,5 +1314,42 @@ Fee options are BTC/kvB on the command line and satoshis internally, matching
   (dolist (name '("mintxfee" "discardfee" "consolidatefeerate" "maxapsfee"
                   "txconfirmtarget" "walletrbf" "spendzeroconfchange"
                   "walletrejectlongchains"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
+
+(test rpc-config-keypool-and-walletdir
+  "-keypool and -walletdir (Core init.cpp). Both are asserted through their
+EFFECT — a freshly made wallet manager's keypool size, and the directory
+WALLETS-DIRECTORY hands back — rather than through the variable, because the
+keypool size is read as a struct slot DEFAULT and a test on the variable alone
+would pass even if no struct ever consulted it."
+  (let ((saved-keypool bitcoin-lisp.rpc::+default-keypool-size+)
+        (saved-dir bitcoin-lisp.rpc::*wallet-directory*))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-rpc-config-globals '(("keypool" . "37")))
+           (is (= 37 (bitcoin-lisp.rpc::wallet-manager-keypool-size
+                      (bitcoin-lisp.rpc::make-wallet-manager
+                       :data-directory #p"/tmp/kp/"))))
+           ;; Relative -walletdir hangs off the data directory, absolute wins
+           ;; outright, and NIL restores <datadir>/wallets/.
+           (let ((manager (bitcoin-lisp.rpc::make-wallet-manager
+                           :data-directory #p"/tmp/dd/")))
+             (setf bitcoin-lisp.rpc::*wallet-directory* nil)
+             (is (equal #p"/tmp/dd/wallets/"
+                        (bitcoin-lisp.rpc::wallets-directory manager)))
+             (bitcoin-lisp::apply-rpc-config-globals '(("walletdir" . "purses")))
+             (is (equal #p"/tmp/dd/purses/"
+                        (bitcoin-lisp.rpc::wallets-directory manager)))
+             (bitcoin-lisp::apply-rpc-config-globals
+              '(("walletdir" . "/srv/keys")))
+             (is (equal #p"/srv/keys/"
+                        (bitcoin-lisp.rpc::wallets-directory manager)))))
+      (setf bitcoin-lisp.rpc::+default-keypool-size+ saved-keypool
+            bitcoin-lisp.rpc::*wallet-directory* saved-dir)))
+  ;; Core rejects -keypool=0; so do we, rather than making an unusable wallet.
+  (dolist (bad '((("keypool" . "0")) (("keypool" . "-1")) (("keypool" . "x"))))
+    (signals error (bitcoin-lisp::apply-rpc-config-globals bad)))
+  (dolist (name '("keypool" "walletdir"))
     (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
     (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
