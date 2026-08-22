@@ -439,6 +439,17 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
      ;; reserved witness value present (so it serializes as a segwit tx)
      (is-true (bitcoin-lisp.serialization:transaction-has-witness-p cb)))))
 
+(test build-coinbase-transaction-bip54-fields
+  ;; Core node/miner.cpp:171,196: the template coinbase uses
+  ;; nSequence = MAX_SEQUENCE_NONFINAL and nLockTime = height - 1, so the
+  ;; coinbase commits to its height a second way (BIP54's coinbase rule).
+  (%with-regtest
+   (let* ((cb (bitcoin-lisp.mining:build-coinbase-transaction
+               42 5000000000 :script-pubkey (%p2sh-optrue-spk)))
+          (in0 (elt (bitcoin-lisp.serialization:transaction-inputs cb) 0)))
+     (is (= #xfffffffe (bitcoin-lisp.serialization:tx-in-sequence in0)))
+     (is (= 41 (bitcoin-lisp.serialization:transaction-lock-time cb))))))
+
 (test mine-block-satisfies-pow
   (%with-regtest
    (let ((node (%regtest-node-fixture "mine")))
@@ -468,6 +479,53 @@ block-store / utxo-set, ready for activate-block. Call inside %with-regtest."
                  (bitcoin-lisp::node-chain-state node))))
        ;; resubmit the same block → duplicate
        (is (string= "duplicate" (bitcoin-lisp.rpc::rpc-submitblock node (list hex))))))))
+
+(test submitblock-fills-missing-witness-nonce
+  ;; Core UpdateUncommittedBlockStructures (validation.cpp:4017-4027), run by
+  ;; submitblock before validation: a coinbase that carries the witness
+  ;; commitment but no witness gets the 32-zero nonce installed. A miner that
+  ;; serializes the template's coinbase witnessless is therefore accepted;
+  ;; before the fix we refused the block as bad-witness-nonce-size.
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "submit-nonce"))
+          (block (bitcoin-lisp.mining:assemble-full-block
+                  (bitcoin-lisp::node-chain-state node)
+                  (bitcoin-lisp::node-mempool node)
+                  :coinbase-script-pubkey (%p2sh-optrue-spk)))
+          (cb (first (bitcoin-lisp.serialization:bitcoin-block-transactions block))))
+     (bitcoin-lisp.mining:mine-block block)
+     (is-true (bitcoin-lisp.validation:find-witness-commitment cb))
+     (setf (bitcoin-lisp.serialization:transaction-witness cb) nil)
+     (is-false (bitcoin-lisp.serialization:transaction-has-witness-p cb))
+     (let ((hex (bitcoin-lisp.crypto:bytes-to-hex
+                 (bitcoin-lisp.serialization:serialize-witness-block block))))
+       (is (null (bitcoin-lisp.rpc::rpc-submitblock node (list hex))))
+       (is (= 1 (bitcoin-lisp.storage:current-height
+                 (bitcoin-lisp::node-chain-state node))))))))
+
+(test submitblock-side-chain-block-is-inconclusive
+  ;; Two valid blocks on the genesis tip. The first becomes the tip (null);
+  ;; the second is stored on a side chain and never connected, which Core's
+  ;; submitblock_StateCatcher never sees → "inconclusive" (rpc/mining.cpp:
+  ;; 1091-1095), not null and not a reject reason.
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "submit-side"))
+          (cs (bitcoin-lisp::node-chain-state node))
+          (mp (bitcoin-lisp::node-mempool node))
+          (a (bitcoin-lisp.mining:assemble-full-block
+              cs mp :coinbase-script-pubkey (%p2sh-optrue-spk)))
+          (b (bitcoin-lisp.mining:assemble-full-block
+              cs mp :coinbase-script-pubkey
+              (coerce '(#x51) '(vector (unsigned-byte 8))))))
+     (bitcoin-lisp.mining:mine-block a)
+     (bitcoin-lisp.mining:mine-block b)
+     (flet ((hex (blk) (bitcoin-lisp.crypto:bytes-to-hex
+                        (bitcoin-lisp.serialization:serialize-witness-block blk))))
+       (is (null (bitcoin-lisp.rpc::rpc-submitblock node (list (hex a)))))
+       (is (string= "inconclusive"
+                    (bitcoin-lisp.rpc::rpc-submitblock node (list (hex b)))))
+       (is (= 1 (bitcoin-lisp.storage:current-height cs)))))))
+
 
 (test submitblock-header-only-entry-proceeds
   ;; Standard pool flow: submitheader, then submitblock. The header-only index
