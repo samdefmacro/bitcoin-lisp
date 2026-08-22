@@ -6,6 +6,11 @@
   (:export
    ;; Server control
    #:start-rpc-server
+   #:*rpc-threads*
+   #:*rpc-server-timeout*
+   #:*rpc-cookie-file*
+   #:*rpc-cookie-perms*
+   #:parse-rpc-cookie-perms
    #:set-rpc-warmup-status
    #:finish-rpc-warmup
    #:stop-rpc-server

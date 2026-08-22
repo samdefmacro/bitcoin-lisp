@@ -1060,3 +1060,56 @@ constants. Each asserts the EFFECT, not the assignment."
   (dolist (name '("maxtipage" "maxsigcachesize" "fastprune" "blocksxor"))
     (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
     (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
+
+(test rpc-http-config-knobs-take-effect
+  "Track D's RPC/HTTP group. Applied by APPLY-RPC-CONFIG-GLOBALS rather than
+its sibling for a load-order reason worth knowing: config.lisp compiles BEFORE
+src/rpc/package.lisp, so a package-qualified reference to BITCOIN-LISP.RPC
+there is a READ error, not a link error."
+  (let ((saved (list bitcoin-lisp.rpc:*rpc-cookie-file*
+                     bitcoin-lisp.rpc:*rpc-cookie-perms*
+                     bitcoin-lisp.rpc:*rpc-threads*
+                     bitcoin-lisp.rpc:*rpc-server-timeout*)))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-rpc-config-globals
+            '(("rpccookiefile" . "/tmp/x.cookie") ("rpccookieperms" . "group")
+              ("rpcthreads" . "8") ("rpcservertimeout" . "45")))
+           (is (equal "/tmp/x.cookie" bitcoin-lisp.rpc:*rpc-cookie-file*))
+           (is (eq :group bitcoin-lisp.rpc:*rpc-cookie-perms*))
+           (is (= 8 bitcoin-lisp.rpc:*rpc-threads*))
+           (is (= 45 bitcoin-lisp.rpc:*rpc-server-timeout*))
+           ;; The perms name reaches an actual MODE — 0640 for group.
+           (is (= #o640 (bitcoin-lisp.rpc::%cookie-file-mode)))
+           ;; An absolute -rpccookiefile is used as given...
+           (is (equal "/tmp/x.cookie"
+                      (namestring (bitcoin-lisp.rpc::rpc-cookie-path "/data/dir/"))))
+           ;; ...and a relative one hangs off the data directory, which is what
+           ;; Core means by "prefixed by a net-specific datadir location".
+           (setf bitcoin-lisp.rpc:*rpc-cookie-file* "sub/my.cookie")
+           (is (equal "/data/dir/sub/my.cookie"
+                      (namestring (bitcoin-lisp.rpc::rpc-cookie-path "/data/dir/"))))
+           ;; Unset, it is the datadir's .cookie.
+           (setf bitcoin-lisp.rpc:*rpc-cookie-file* nil)
+           (is (equal "/data/dir/.cookie"
+                      (namestring (bitcoin-lisp.rpc::rpc-cookie-path "/data/dir/"))))
+           ;; 0 means no timeout, as in Core.
+           (bitcoin-lisp::apply-rpc-config-globals '(("rpcservertimeout" . "0")))
+           (is-false bitcoin-lisp.rpc:*rpc-server-timeout*))
+      (setf bitcoin-lisp.rpc:*rpc-cookie-file* (first saved)
+            bitcoin-lisp.rpc:*rpc-cookie-perms* (second saved)
+            bitcoin-lisp.rpc:*rpc-threads* (third saved)
+            bitcoin-lisp.rpc:*rpc-server-timeout* (fourth saved))))
+  ;; Every audience maps to the mode Core documents.
+  (is (eq :owner (bitcoin-lisp.rpc:parse-rpc-cookie-perms "owner")))
+  (is (eq :group (bitcoin-lisp.rpc:parse-rpc-cookie-perms "GROUP")))
+  (is (eq :all (bitcoin-lisp.rpc:parse-rpc-cookie-perms "all")))
+  (is-false (bitcoin-lisp.rpc:parse-rpc-cookie-perms "everyone"))
+  ;; Loosening who may read the cookie is loosening who may drive the RPC, so
+  ;; an unrecognised audience is an error rather than a silent default.
+  (dolist (bad '((("rpccookieperms" . "everyone")) (("rpcthreads" . "0"))
+                 (("rpcservertimeout" . "-1"))))
+    (signals error (bitcoin-lisp::apply-rpc-config-globals bad)))
+  (dolist (name '("rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
