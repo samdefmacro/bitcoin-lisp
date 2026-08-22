@@ -2364,6 +2364,70 @@ coin that never existed."
     (is-false (assoc "prevout" vin0 :test #'string=)
               "a coinbase input was given a prevout")))
 
+(test getrpcinfo-reports-in-flight-commands
+  "active_commands was always empty. That is not merely incomplete: it is how a
+client learns a long-running call is still running, and Core's own
+feature_shutdown.py waits for TWO concurrent commands before attempting a
+shutdown — so a node reporting none hangs that test forever."
+  (let ((bitcoin-lisp.rpc::*active-rpc-commands* '()))
+    (is-false (bitcoin-lisp.rpc::active-rpc-commands) "idle must report nothing")
+    ;; Two concurrent calls to the SAME method are two indistinguishable
+    ;; entries. Removing by value would drop whichever came first and leave the
+    ;; other listed forever, so removal is by IDENTITY.
+    (bitcoin-lisp.rpc::with-active-rpc-command ("getblockcount")
+      (is (= 1 (length (bitcoin-lisp.rpc::active-rpc-commands))))
+      (bitcoin-lisp.rpc::with-active-rpc-command ("getblockcount")
+        (is (= 2 (length (bitcoin-lisp.rpc::active-rpc-commands)))))
+      (is (= 1 (length (bitcoin-lisp.rpc::active-rpc-commands)))
+          "an identical concurrent command was removed twice"))
+    (is-false (bitcoin-lisp.rpc::active-rpc-commands))
+    ;; A command that SIGNALS must still be removed, or one failing call leaks
+    ;; an entry that never goes away.
+    (ignore-errors
+     (bitcoin-lisp.rpc::with-active-rpc-command ("boom") (error "x")))
+    (is-false (bitcoin-lisp.rpc::active-rpc-commands)
+              "a signalling command leaked its entry")
+    ;; Duration is MICROSECONDS, as Core reports it.
+    (bitcoin-lisp.rpc::with-active-rpc-command ("slow")
+      (let ((d (cdr (first (bitcoin-lisp.rpc::active-rpc-commands)))))
+        (is-true (integerp d))
+        (is-true (>= d 0))))))
+
+(test getrpcinfo-shape-is-core-s
+  "Each entry is {method, duration}; logpath is the debug.log the node is
+actually writing."
+  (let ((bitcoin-lisp.rpc::*active-rpc-commands* '())
+        (bitcoin-lisp::*log-file-path* #P"/tmp/bl-test/debug.log"))
+    (bitcoin-lisp.rpc::with-active-rpc-command ("getblockcount")
+      (let* ((info (bitcoin-lisp.rpc::rpc-getrpcinfo nil nil))
+             (cmds (cdr (assoc "active_commands" info :test #'string=)))
+             (one (elt cmds 0)))
+        (is (= 1 (length cmds)))
+        (is (equal "getblockcount" (cdr (assoc "method" one :test #'string=))))
+        (is-true (integerp (cdr (assoc "duration" one :test #'string=))))
+        (is (equal "/tmp/bl-test/debug.log"
+                   (cdr (assoc "logpath" info :test #'string=))))))))
+
+(test dispatch-registers-the-running-command
+  "The tracking has to be at the DISPATCH choke point, not bolted onto
+individual handlers — otherwise it reports only the methods someone remembered
+to annotate. This drives the real dispatcher and looks for the command in
+active_commands from INSIDE the handler."
+  (let ((bitcoin-lisp.rpc::*active-rpc-commands* '())
+        (bitcoin-lisp.rpc::*rpc-warmup-status* nil)
+        (seen nil))
+    (let ((bitcoin-lisp.rpc::*rpc-methods* (make-hash-table :test 'equal)))
+      (setf (gethash "peekself" bitcoin-lisp.rpc::*rpc-methods*)
+            (lambda (node params)
+              (declare (ignore node params))
+              (setf seen (bitcoin-lisp.rpc::active-rpc-commands))
+              42))
+      (is (= 42 (bitcoin-lisp.rpc::dispatch-rpc-method nil "peekself" '()))))
+    (is (equal '("peekself") (mapcar #'car seen))
+        "the running command was not visible from inside its own handler")
+    (is-false (bitcoin-lisp.rpc::active-rpc-commands)
+              "the entry outlived the dispatch")))
+
 ;;; --- Concurrent Access Tests (2.7) ---
 
 (test rpc-concurrent-access-safety
