@@ -225,6 +225,23 @@ prevout object per input (Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT)."
                         (rpc-get-network node)
                         :prevouts (>= verbosity 3)))))))
 
+(defun %tx-spent-coins-in-block (block tx)
+  "The coins TX's inputs spent, from BLOCK's undo data, or NIL when unavailable.
+
+NIL for a coinbase: Core returns early for one (rawtransaction.cpp:354), and
+the undo list has no entry for it — indexing it anyway would hand the coinbase
+the FIRST real transaction's coins."
+  (unless (let ((ins (bitcoin-lisp.serialization:transaction-inputs tx)))
+            (and (plusp (length ins))
+                 (bitcoin-lisp.serialization:coinbase-input-p (aref ins 0))))
+    (let ((undos (%block-tx-undos block))
+          (txid (bitcoin-lisp.serialization:transaction-hash tx)))
+      (when undos
+        (loop for candidate in (rest (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+              for i from 0
+              when (equalp txid (bitcoin-lisp.serialization:transaction-hash candidate))
+                return (nth i undos))))))
+
 (defun %block-tx-undos (block)
   "BLOCK's undo data grouped per non-coinbase transaction, or NIL when it is not
 available. Never signals: a pruned or missing undo record means the fee and
@@ -3759,8 +3776,9 @@ and {hash} is returned; otherwise {hash, hex}."
 (defun rpc-getrawtransaction (node params)
   "Get raw transaction data by txid (Bitcoin Core getrawtransaction).
 Verbosity <= 0 (or false, the default) returns the wire-serialized (witness-
-complete) tx hex — Core's EncodeHexTx; >= 1 (or true) the decoded object
-(Core's verbosity-2 fee/prevout fields are not supported and fold into 1).
+complete) tx hex — Core's EncodeHexTx; 1 (or true) the decoded object; 2 adds
+the fee and each input's prevout for a CONFIRMED transaction
+(rawtransaction.cpp:346-371).
 Searches mempool first, then blockhash hint, then txindex (if enabled)."
   (let ((txid-str (first params))
         (blockhash-hint (third params)))
@@ -3770,7 +3788,12 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
     (when (and blockhash-hint (not (valid-hex-hash-p blockhash-hint)))
       (error 'rpc-error :code +rpc-invalid-parameter+
                         :message "Invalid blockhash"))
-    (let* ((verbose (plusp (%parse-verbosity params 1 0 :allow-bool t)))
+    (let* ((verbosity (%parse-verbosity params 1 0 :allow-bool t))
+           (verbose (plusp verbosity))
+           ;; Core's verbosity 2 adds fee + prevout for a CONFIRMED transaction
+           ;; (rawtransaction.cpp:346-371); a mempool transaction has no undo
+           ;; data, so it stays at the verbosity-1 shape there.
+           (prevouts (>= verbosity 2))
            (txid-bytes (parse-hex-hash txid-str))
            (mempool (rpc-get-mempool node))
            (mempool-entry (when mempool
@@ -3797,7 +3820,8 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
                       ;; With an explicit blockhash, Core adds in_active_chain.
                       (let* ((cs (rpc-get-chain-state node))
                              (entry (bitcoin-lisp.storage:get-block-index-entry cs block-hash-bytes)))
-                        (append (tx-to-json-confirmed found-tx node block-hash-bytes)
+                        (append (tx-to-json-confirmed found-tx node block-hash-bytes
+                                                      :block block :prevouts prevouts)
                                 `(("in_active_chain"
                                    . ,(json-bool
                                        (and entry (%block-on-active-chain-p entry cs)))))))
@@ -3817,7 +3841,8 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
                     (when found-tx
                       (return-from rpc-getrawtransaction
                         (if verbose
-                            (tx-to-json-confirmed found-tx node block-hash)
+                            (tx-to-json-confirmed found-tx node block-hash
+                                                  :block block :prevouts prevouts)
                             (bitcoin-lisp.crypto:bytes-to-hex
                              (bitcoin-lisp.serialization:transaction-wire-bytes found-tx))))))))))))
 
@@ -3836,7 +3861,7 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
                (equalp txid (bitcoin-lisp.serialization:transaction-hash tx)))
              txs)))
 
-(defun tx-to-json-confirmed (tx node block-hash)
+(defun tx-to-json-confirmed (tx node block-hash &key block prevouts)
   "Convert a confirmed transaction to JSON with block context, per Core's
 TxToJSON (rpc/rawtransaction.cpp:58-86): blockhash is always present; when
 the block index knows the block AND it is on the active chain, add
@@ -3845,7 +3870,13 @@ pointing into a reorged-away branch — Core keeps those) gets confirmations 0
 and NO time fields; an unknown block gets blockhash only."
   (let* ((chain-state (rpc-get-chain-state node))
          (block-entry (bitcoin-lisp.storage:get-block-index-entry chain-state block-hash))
-         (base-json (tx-to-json tx (rpc-get-network node))))
+         ;; verbosity 2 (Core rawtransaction.cpp:351-370): find THIS
+         ;; transaction's coins in the block's undo data. The undo list has one
+         ;; entry per NON-coinbase transaction, so the index is one less than
+         ;; the transaction's position — and a coinbase has none at all.
+         (coins (and prevouts block (%tx-spent-coins-in-block block tx)))
+         (base-json (tx-to-json tx (rpc-get-network node)
+                                :spent-coins coins :prevouts (and coins t))))
     (append base-json
             `(("blockhash" . ,(hash-to-hex block-hash)))
             (cond ((null block-entry) '())

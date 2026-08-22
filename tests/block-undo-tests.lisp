@@ -513,3 +513,41 @@ already under target and stops pruning — silently, while the disk fills."
         (is (= (bitcoin-lisp.storage:block-store-total-bytes store)
                (bitcoin-lisp.storage:block-store-total-bytes reopened))
             "the live total and the re-derived total disagree")))))
+
+(test tx-spent-coins-in-block-indexes-past-the-coinbase
+  "The undo list has one entry per NON-coinbase transaction, so a transaction's
+coins are at (position - 1) in it. Indexing by the transaction's own position
+would hand every transaction the PREVIOUS one's coins — and the coinbase, which
+has no entry at all, the first real transaction's.
+
+Core returns early for a coinbase for exactly this reason
+(rawtransaction.cpp:354) and subtracts one for the rest (:369)."
+  (let* ((block (%bu-test-block '(1 2)))          ; coinbase + 2 spenders
+         (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
+         (spent (%bu-spent-for block)))
+    ;; Prime the undo data the way a connected block would have.
+    (let ((bitcoin-lisp.validation::*block-undo-data*
+            (make-hash-table :test 'equalp)))
+      (setf (gethash (bitcoin-lisp.serialization:block-header-hash
+                      (bitcoin-lisp.serialization:bitcoin-block-header block))
+                     bitcoin-lisp.validation::*block-undo-data*)
+            spent)
+      ;; The coinbase gets nothing.
+      (is-false (bitcoin-lisp.rpc::%tx-spent-coins-in-block block (first txs))
+                "the coinbase was given coins it never spent")
+      ;; Transaction 1 spends one input, transaction 2 spends two.
+      (is (= 1 (length (bitcoin-lisp.rpc::%tx-spent-coins-in-block
+                        block (second txs)))))
+      (is (= 2 (length (bitcoin-lisp.rpc::%tx-spent-coins-in-block
+                        block (third txs)))))
+      ;; And they are the RIGHT coins. SPENT is in apply order across the whole
+      ;; block: entry 1 is transaction 1's only input, entries 2 and 3 are
+      ;; transaction 2's two. Off-by-one here is the bug the indexing exists to
+      ;; avoid, so compare the coins themselves rather than just the count.
+      (let ((all (mapcar #'third spent)))
+        (is (equalp (list (second all) (third all))
+                    (bitcoin-lisp.rpc::%tx-spent-coins-in-block block (third txs)))
+            "transaction 2 was given the wrong coins")
+        (is (equalp (list (first all))
+                    (bitcoin-lisp.rpc::%tx-spent-coins-in-block block (second txs)))
+            "transaction 1 was given the wrong coins")))))
