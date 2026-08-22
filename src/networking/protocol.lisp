@@ -840,23 +840,20 @@ single MaybeSendGetHeaders after the inv vector is fully scanned)."
 
 (defun handle-notfound (peer payload)
   "Handle a notfound message: the peer is telling us it lacks one or
-more items we requested via getdata. For block items, record the
-disclaim so the IBD scheduler stops asking this peer for the block and
-releases it from in-flight for immediate retry elsewhere (see
-note-block-not-available). Without this we burn the full block-request
-timeout on every peer that lacks a stale-fork block before giving up.
-For tx items, complete the peer's announcement in the tx-request tracker
-so the request fails over to another announcer instead of burning the
-60s expiry (Core ReceivedNotFound -> m_txrequest.ReceivedResponse,
-txdownloadman_impl.cpp:287-293). Mirrors Bitcoin Core's MSG NOTFOUND
-handling (net_processing.cpp)."
+more items we requested via getdata. For tx items, complete the peer's
+announcement in the tx-request tracker so the request fails over to
+another announcer instead of burning the 60s expiry (Core
+ReceivedNotFound -> m_txrequest.ReceivedResponse,
+txdownloadman_impl.cpp:287-293). Block items are ignored, as Core's
+NOTFOUND arm ignores them (net_processing.cpp, tx invs only): no Core
+peer — and no bitcoin-lisp peer, see handle-getdata — ever sends a
+notfound for a block, and a peer that cannot serve one it announced is
+handled by the block-download timeout like any other stalled request."
   (let ((tx-completed nil))
     (dolist (inv (bitcoin-lisp.serialization:parse-inv-payload payload))
       (let ((inv-type (bitcoin-lisp.serialization:inv-vector-type inv))
             (hash (bitcoin-lisp.serialization:inv-vector-hash inv)))
         (cond
-          ((block-inv-type-p inv-type)
-           (note-block-not-available peer hash))
           ((or (= inv-type bitcoin-lisp.serialization:+inv-type-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-witness-tx+)
                (= inv-type bitcoin-lisp.serialization:+inv-type-wtx+))

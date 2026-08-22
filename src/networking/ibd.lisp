@@ -91,7 +91,7 @@ below could spin the loop forever and starve peer maintenance.")
 (declaim (inline block-hash-key-hash))
 (defun block-hash-key-hash (k)
   "Custom :hash-function for the IBD block-hash-keyed tables (pending,
-in-flight, request-timeouts, block-disclaims). Keys are 32-byte SHA256d
+in-flight, request-timeouts). Keys are 32-byte SHA256d
 block hashes (already uniformly random), so read the first 8 bytes as a
 fixnum-masked uint64 instead of equalp's full 32-byte data-vector-hash.
 :test stays 'equalp for exact collision resolution. Mirrors utxo-key-hash;
@@ -184,13 +184,6 @@ thread mutates it."
   ;; (it's likely a competing-fork block that peers won't serve).
   ;; hash -> integer.
   (request-timeouts (make-block-hash-table) :type hash-table)
-  ;; Peers that answered `notfound` for a pending block. hash -> list of
-  ;; peers. The scheduler won't re-request a block from a peer that has
-  ;; disclaimed it, and drops the block once every ready peer has. Scoped
-  ;; to the block's pending lifecycle: cleared when the block is received,
-  ;; re-queued (a fresh download attempt), or dropped — so a peer is never
-  ;; permanently excluded from a block it may later receive.
-  (block-disclaims (make-block-hash-table) :type hash-table)
   ;; Configuration
   (max-in-flight 16 :type (unsigned-byte 8))
   (request-timeout 60 :type (unsigned-byte 16))  ; seconds
@@ -417,22 +410,12 @@ snapshot is unvalidated). Memoized per best-known hash on the IBD context."
                       (clrhash cache))
                     (setf (gethash bk cache) result))))))))))
 
-(defun peer-disclaimed-block-p (peer hash)
-  "T if PEER has answered `notfound` for block HASH in the current
-download attempt (see ibd-context-block-disclaims)."
-  (and *ibd-context*
-       (member peer (gethash hash (ibd-context-block-disclaims *ibd-context*))
-               :test #'eq)
-       t))
-
 (defun drop-pending-block (hash)
-  "Remove HASH from the pending queue and all per-hash bookkeeping
-(timeout counters, notfound disclaims). Used both when a block has
-timed out too many times and when every peer has disclaimed it."
+  "Remove HASH from the pending queue and its timeout counter, once a
+request for it has timed out too many times."
   (when *ibd-context*
     (remhash hash (ibd-context-pending-blocks *ibd-context*))
-    (remhash hash (ibd-context-request-timeouts *ibd-context*))
-    (remhash hash (ibd-context-block-disclaims *ibd-context*))))
+    (remhash hash (ibd-context-request-timeouts *ibd-context*))))
 
 (defun peer-inflight-block-hashes (peer)
   "Block hashes currently requested from PEER and not yet received — the
@@ -450,21 +433,6 @@ so RPC threads can read while the sync thread mutates."
           #+sbcl (sb-ext:with-locked-hash-table (in-flight) (scan))
           #-sbcl (scan))))
     result))
-
-(defun note-block-not-available (peer hash)
-  "Record that PEER answered `notfound` for block HASH and release the
-block from in-flight (if this peer held it) so it can be re-requested
-from a different peer immediately, rather than waiting out the full
-request timeout. The scheduler skips disclaiming peers and drops the
-block entirely once all peers have disclaimed it. Mirrors Bitcoin
-Core's MSG NOTFOUND handling, which clears the peer's block request."
-  (when *ibd-context*
-    (pushnew peer (gethash hash (ibd-context-block-disclaims *ibd-context*))
-             :test #'eq)
-    (let* ((in-flight (ibd-context-in-flight *ibd-context*))
-           (entry (gethash hash in-flight)))
-      (when (and entry (eq (car entry) peer))
-        (remhash hash in-flight)))))
 
 (defun %context-tx-index ()
   "The live transaction index, from the IBD context.
@@ -502,11 +470,8 @@ block forever (the deferred-reorg loop bug, project_per_peer_block_tracking.md).
         ;; Only queue if not already pending or in-flight.
         (unless (or (gethash hash pending) (gethash hash in-flight))
           (setf (gethash hash pending) height)
-          ;; Reset timeout counter and notfound disclaims so this is a
-          ;; fresh download attempt — peers that disclaimed it on a prior
-          ;; attempt may have received it since.
+          ;; Reset the timeout counter so this is a fresh download attempt.
           (remhash hash timeouts)
-          (remhash hash (ibd-context-block-disclaims *ibd-context*))
           (incf queued))))
     ;; Rewind cursors at/above the lowest missing block so the per-peer walk
     ;; revisits the hole. Setting to NIL is safe and self-limiting: the next
@@ -1288,10 +1253,9 @@ in-flight entry so report-ibd-progress can surface p50/p95."
           (push (list now (peer-address peer) latency-ms)
                 (ibd-context-delivery-samples *ibd-context*)))))
     (remhash hash (ibd-context-in-flight *ibd-context*))
-    ;; Clear the per-hash timeout counter and any notfound disclaims so a
-    ;; future re-request of this hash (e.g. on a reorg) starts fresh.
-    (remhash hash (ibd-context-request-timeouts *ibd-context*))
-    (remhash hash (ibd-context-block-disclaims *ibd-context*))))
+    ;; Clear the per-hash timeout counter so a future re-request of this
+    ;; hash (e.g. on a reorg) starts fresh.
+    (remhash hash (ibd-context-request-timeouts *ibd-context*))))
 
 (defun compute-block-download-timeout (num-downloading-peers)
   "Compute block download timeout in seconds based on number of peers.
