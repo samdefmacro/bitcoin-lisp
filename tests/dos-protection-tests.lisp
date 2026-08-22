@@ -487,36 +487,148 @@ a dial target iff a Tor proxy is configured."
       (bitcoin-lisp::load-anchors node)
       (is (null bitcoin-lisp::*pending-anchor-addresses*)))))
 
-(test evict-least-valuable-inbound-protects-best
-  "evict-least-valuable-inbound shields the most valuable inbound peers (lowest
-ping, longest connected) and evicts an unprotected one — the youngest in the
-most-represented netgroup — so inbound slots churn toward better peers instead
-of an attacker's cheap, sticky connections holding them."
-  (let ((node (bitcoin-lisp::make-node)))
-    ;; A-D: low ping + old (protected on both dimensions). E,F: high ping +
-    ;; young, same /16 netgroup (the eviction candidates).
-    (let ((a (%inbound-peer "1.1.1.1" 10 100))
-          (b (%inbound-peer "2.2.2.2" 20 200))
-          (c (%inbound-peer "3.3.3.3" 30 300))
-          (d (%inbound-peer "4.4.4.4" 40 400))
-          (e (%inbound-peer "10.0.0.1" 1000 5000))
-          (f (%inbound-peer "10.0.0.2" 2000 6000)))   ; youngest candidate
-      (setf (bitcoin-lisp::node-peers node) (list a b c d e f))
-      (is (eq t (bitcoin-lisp::evict-least-valuable-inbound node)))
-      ;; F (youngest in the populous netgroup) evicted; everyone else kept.
-      (let ((remaining (bitcoin-lisp::node-peers node)))
-        (is (not (member f remaining)))
-        (is (member e remaining))
-        (dolist (p (list a b c d)) (is (member p remaining)))))))
+(defun %evict-peer (addr &key (ping 1000) (connect-time 5000)
+                              (min-ping nil) (tx-time 0) (block-time 0)
+                              (relay t))
+  "An inbound peer for the eviction tests. MIN-PING defaults to PING, since
+Core protects on the MINIMUM and that is what the selector reads."
+  (let ((p (bitcoin-lisp.networking:make-peer
+            :address addr :inbound t :state :ready
+            :ping-latency ping :connect-time connect-time)))
+    (setf (bitcoin-lisp.networking::peer-min-ping-latency p) (or min-ping ping)
+          (bitcoin-lisp.networking::peer-last-tx-time p) tx-time
+          (bitcoin-lisp.networking::peer-last-block-time p) block-time)
+    ;; peer-relays-txs-p is derived from the conn type; :block-relay is the
+    ;; shape Core's non-tx-relay pass filters on.
+    (unless relay
+      (setf (bitcoin-lisp.networking:peer-conn-type p) :block-relay))
+    p))
 
-(test evict-least-valuable-inbound-noop-when-all-protected
-  "With too few inbound peers (all protected), nothing is evicted."
+(defun %evict-filler (n &key (first-octet 10))
+  "N interchangeable inbound peers, all in one /16, all unremarkable — the
+population Core's protections are sized against. Without enough of these every
+pass protects everybody and nothing is ever evicted, which is Core's behaviour
+too and is what the old 6-peer version of this test was accidentally asserting."
+  (loop for i below n
+        collect (%evict-peer (format nil "~D.0.~D.~D" first-octet
+                                     (floor i 256) (mod i 256))
+                             :ping (+ 5000 i)
+                             :connect-time (+ 100000 i)
+                             ;; Non-zero and DISTINCT. With every key equal,
+                             ;; each pass protects an arbitrary k by tie-break
+                             ;; alone — which is true of Core too, and would
+                             ;; make this fixture assert nothing about the
+                             ;; pass it is meant to exercise.
+                             :tx-time (+ 200000 i)
+                             :block-time (+ 300000 i))))
+
+(test eviction-runs-cores-passes-with-cores-k-values
+  "Core SelectNodeToEvict (eviction.cpp:178-240). The k values are Core's:
+netgroup 4, min-ping 8, tx 4, block-relay-only 8, block 4. Ours used to run
+four passes at k=4 with no netgroup and no block-relay-only pass at all.
+
+Note what the real k values imply: with 8 peers protected on ping alone,
+eviction does not fire on a small inbound set — Core does not evict from one
+either. The old version of this test used SIX peers and asserted an eviction,
+which only passed because our k was half Core's."
+  (let ((node (bitcoin-lisp::make-node)))
+    ;; 40 filler peers plus one obvious victim: newest, in the most populous
+    ;; netgroup, having done nothing.
+    (let* ((filler (%evict-filler 40))
+           (victim (%evict-peer "10.0.9.9" :ping 9999 :connect-time 999999)))
+      ;; The victim goes FIRST. Every filler peer shares its /16, so all 41
+      ;; have the same keyed netgroup and that pass sees all-equal keys — with
+      ;; a stable sort the LAST four in input order are then protected by
+      ;; tie-break alone. Core has the same property (CompareNetGroupKeyed
+      ;; compares only the key, and equal keys fall to std::sort's unspecified
+      ;; order), so this is the fixture's problem to avoid, not the code's.
+      (setf (bitcoin-lisp::node-peers node) (cons victim filler))
+      (is (eq t (bitcoin-lisp::evict-least-valuable-inbound node)))
+      (is (not (member victim (bitcoin-lisp::node-peers node)))
+          "the newest peer in the most populous netgroup survived")))
+  ;; A small inbound set is left alone entirely, because every pass protects
+  ;; more peers than exist.
   (let ((node (bitcoin-lisp::make-node)))
     (setf (bitcoin-lisp::node-peers node)
-          (list (%inbound-peer "1.1.1.1" 10 100)
-                (%inbound-peer "2.2.2.2" 20 200)))
+          (list (%evict-peer "1.1.1.1" :ping 10 :connect-time 100)
+                (%evict-peer "2.2.2.2" :ping 20 :connect-time 200)))
     (is (null (bitcoin-lisp::evict-least-valuable-inbound node)))
     (is (= 2 (length (bitcoin-lisp::node-peers node))))))
+
+(test eviction-protects-noban-peers-absolutely
+  "Core ProtectNoBanConnections runs FIRST and unconditionally
+(eviction.cpp:181). Only possible since net permissions landed; before that a
+peer the operator explicitly trusted was as evictable as any other."
+  ;; The whitelist bound directly rather than through eclipse-dos-tests'
+  ;; %WITH-WHITELIST: this file compiles first, so that macro does not exist
+  ;; yet here.
+  (let ((bitcoin-lisp.networking::*whitelist-entries*
+          (list (bitcoin-lisp.networking:parse-whitelist-entry
+                 "noban@192.168.0.0/16"))))
+    (let* ((node (bitcoin-lisp::make-node))
+           ;; The noban peer is the WORST candidate on every measure: newest,
+           ;; slowest, and in the most populous netgroup.
+           (protected (%evict-peer "192.168.0.1" :ping 99999 :connect-time 9999999))
+           (filler (%evict-filler 40)))
+      ;; First, for the tie-break reason in the test above — the point here is
+      ;; that noban protects it even when nothing else would.
+      (setf (bitcoin-lisp::node-peers node) (cons protected filler))
+      (bitcoin-lisp::evict-least-valuable-inbound node)
+      (is (member protected (bitcoin-lisp::node-peers node))
+          "a noban peer was evicted despite being the worst candidate"))))
+
+(test eviction-protects-block-relay-only-peers-that-deliver-blocks
+  "Core protects up to 8 NON-tx-relay peers that have given us novel blocks
+(eviction.cpp:195-197), a pass this node did not have. Without it a
+block-relay-only peer doing exactly the job it exists for was no safer than an
+idle one — and block-relay-only links are the anti-partition insurance."
+  (let* ((node (bitcoin-lisp::make-node))
+         ;; Worst on every OTHER measure, but a block-relay-only peer that has
+         ;; delivered a block.
+         (br (%evict-peer "10.0.9.9" :ping 99999 :connect-time 9999999
+                                     :block-time 999999 :relay nil))
+         (filler (%evict-filler 40)))
+    (setf (bitcoin-lisp::node-peers node) (cons br filler))
+    (bitcoin-lisp::evict-least-valuable-inbound node)
+    (is (member br (bitcoin-lisp::node-peers node))
+        "a block-relay-only peer that delivered a block was evicted")))
+
+(test eviction-reserves-slots-for-disadvantaged-networks
+  "Core ProtectEvictionCandidatesByRatio (eviction.cpp:104-176) reserves up to
+a quarter of the candidates for CJDNS/I2P/localhost/onion peers, because they
+\"tend to be otherwise disadvantaged under our eviction criteria\".
+
+That is not a nicety here: every inbound ONION peer arrives via the local Tor
+daemon, so they all share the loopback netgroup and are automatically the most
+populous group. This node previously exempted onion peers absolutely, which
+fixed the symptom but meant an all-onion inbound set could never make room."
+  (let* ((node (bitcoin-lisp::make-node))
+         (onions (loop for i below 4
+                       collect (let ((p (%evict-peer (format nil "127.0.0.~D" (1+ i))
+                                                     :ping 99999
+                                                     :connect-time (+ 9000000 i))))
+                                 (setf (bitcoin-lisp.networking::peer-inbound-onion p) t)
+                                 p)))
+         (filler (%evict-filler 40)))
+    (setf (bitcoin-lisp::node-peers node) (append onions filler))
+    ;; Repeated admissions must not strip the onion peers out.
+    (dotimes (i 5) (bitcoin-lisp::evict-least-valuable-inbound node))
+    (let ((left (count-if #'bitcoin-lisp.networking:peer-inbound-onion
+                          (bitcoin-lisp::node-peers node))))
+      (is (plusp left)
+          "five evictions removed every onion peer; the ratio reserve did not fire"))
+    ;; But an ALL-onion set can still make room — the reserve is proportional,
+    ;; not absolute, which the old exemption was not.
+    (let ((only-onion (bitcoin-lisp::make-node)))
+      (setf (bitcoin-lisp::node-peers only-onion)
+            (loop for i below 40
+                  collect (let ((p (%evict-peer (format nil "127.0.1.~D" i)
+                                                :ping (+ 1000 i)
+                                                :connect-time (+ 100000 i))))
+                            (setf (bitcoin-lisp.networking::peer-inbound-onion p) t)
+                            p)))
+      (is (eq t (bitcoin-lisp::evict-least-valuable-inbound only-onion))
+          "an all-onion inbound set could not evict anything"))))
 
 (test ban-lock-concurrent-stress
   "Many threads hammering the discourage/ban globals do not crash or corrupt
