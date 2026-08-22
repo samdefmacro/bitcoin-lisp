@@ -202,6 +202,14 @@ MAX_STANDARD_SCRIPTSIG_SIZE) — fits a 15-of-15 P2SH redeem.")
 mistakenly 80,000 — the full BLOCK budget — letting a single standard tx
 carry 5x the sigop density Core relays.")
 
+(defconstant +max-tx-legacy-sigops+ 2500
+  "BIP54's per-transaction cap on legacy (non-witness) sigops, counted where
+they would execute: every scriptSig's accurate count plus the spent
+scriptPubKey's GetSigOpCount(scriptSig) — the redeem script's for P2SH (Core
+MAX_TX_LEGACY_SIGOPS, policy.h:45; CheckSigopsBIP54, policy.cpp:169-190). A
+relay rule in this Core ref; the consensus rule it anticipates would make such
+a transaction unminable, so relaying it is a disservice to the sender.")
+
 (defconstant +max-standard-p2sh-sigops+ 15
   "Maximum sigops in a standard P2SH redeemScript (Bitcoin Core MAX_P2SH_SIGOPS).")
 
@@ -689,6 +697,57 @@ such locks mature while the parent was still unconfirmed."
               (t
                (return-from mempool-extra-coins (values nil nil))))))))))
 
+(defun check-sigops-bip54-p (tx get-spent-script)
+  "Core CheckSigopsBIP54 (policy.cpp:169-190): T when TX's legacy sigops,
+counted where they would execute — each scriptSig's accurate count plus the
+spent scriptPubKey's count for that scriptSig — stay within
++max-tx-legacy-sigops+. GET-SPENT-SCRIPT takes (txid index) and returns the
+spent scriptPubKey or NIL. Fails as soon as the running total passes the cap,
+as Core does."
+  (let ((legacy 0))
+    (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
+      (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+             (script-sig (bitcoin-lisp.serialization:tx-in-script-sig input))
+             (spk (funcall get-spent-script
+                           (bitcoin-lisp.serialization:outpoint-hash prevout)
+                           (bitcoin-lisp.serialization:outpoint-index prevout))))
+        (incf legacy (count-script-sigops script-sig :accurate t))
+        (when spk
+          (incf legacy (spent-script-sigop-count spk script-sig)))
+        (when (> legacy +max-tx-legacy-sigops+)
+          (return-from check-sigops-bip54-p nil))))
+    t))
+
+(defun are-inputs-standard-p (tx get-spent-script)
+  "Core AreInputsStandard (policy.cpp:212-250): the BIP54 legacy-sigop cap
+first (:219), then for EVERY spent scriptPubKey refuse the two types that may
+not be spent under policy — NONSTANDARD keeps unknown/irregular scripts
+reserved as upgrade hooks and blocks DoS via expensive scripts; WITNESS_UNKNOWN
+stops us relaying spends of future segwit versions we cannot validate. Both are
+standard as OUTPUTS and only nonstandard to SPEND, which is why this cannot
+reuse standard-output-script-p — and a P2SH redeem script may carry at most
++max-standard-p2sh-sigops+ sigops (:224-232). GET-SPENT-SCRIPT takes
+(txid index) and returns the spent scriptPubKey or NIL."
+  (unless (check-sigops-bip54-p tx get-spent-script)
+    (return-from are-inputs-standard-p nil))
+  (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
+    (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
+           (spk (funcall get-spent-script
+                         (bitcoin-lisp.serialization:outpoint-hash prevout)
+                         (bitcoin-lisp.serialization:outpoint-index prevout))))
+      (when spk
+        (case (classify-output-script spk)
+          ((:nonstandard :witness-unknown)
+           (return-from are-inputs-standard-p nil)))
+        (when (script-is-p2sh-p spk)
+          (let ((redeem (extract-last-push
+                         (bitcoin-lisp.serialization:tx-in-script-sig input))))
+            (when (and redeem
+                       (> (count-script-sigops redeem :accurate t)
+                          +max-standard-p2sh-sigops+))
+              (return-from are-inputs-standard-p nil)))))))
+  t)
+
 (defun validate-transaction-for-mempool (tx utxo-set mempool current-height
                                          &key package-coins skip-fee-check chain-state
                                               bypass-limits skip-rbf-check
@@ -875,44 +934,21 @@ decide (Core PreChecks, validation.cpp:950-970)."
                      (let ((u (or (bitcoin-lisp.storage:get-utxo utxo-set txid index)
                                   (gethash (cons txid index) extra-coins))))
                        (when u (bitcoin-lisp.storage:utxo-entry-script-pubkey u)))))
+              ;; Core AreInputsStandard → TX_INPUTS_NOT_STANDARD
+              ;; "bad-txns-nonstandard-inputs", checked BEFORE the total
+              ;; sigop-cost cap as in PreChecks (validation.cpp), so a tx
+              ;; failing both reports the reason Core reports. Distinct from
+              ;; the TX_NOT_STANDARD cost cap below because this failure
+              ;; depends only on the txid (spent scriptPubKeys + scriptSig) —
+              ;; the P2P reject cache may key it by txid too.
+              (unless (are-inputs-standard-p tx #'spent-script)
+                (return-from validate-transaction-for-mempool
+                  (values nil :nonstandard-inputs nil)))
               ;; Total weighted sigop cost <= MAX_STANDARD_TX_SIGOPS_COST.
               (let ((cost (count-transaction-sigops-cost tx #'spent-script)))
                 (when (> cost +max-standard-tx-sigops-cost+)
                   (return-from validate-transaction-for-mempool
                     (values nil :too-many-sigops nil)))
-                ;; Per-input P2SH redeemScript sigops <= MAX_P2SH_SIGOPS.
-                (bitcoin-lisp.serialization:dovector (input (bitcoin-lisp.serialization:transaction-inputs tx))
-                  (let* ((prevout (bitcoin-lisp.serialization:tx-in-previous-output input))
-                         (spk (spent-script (bitcoin-lisp.serialization:outpoint-hash prevout)
-                                            (bitcoin-lisp.serialization:outpoint-index prevout))))
-                    ;; Core AreInputsStandard (policy.cpp:224-232): classify
-                    ;; EVERY spent scriptPubKey and refuse the two types that
-                    ;; may not be spent under policy. NONSTANDARD keeps
-                    ;; unknown/irregular scripts reserved as upgrade hooks and
-                    ;; blocks DoS via expensive scripts; WITNESS_UNKNOWN stops
-                    ;; us relaying spends of future segwit versions we cannot
-                    ;; validate. Both are standard as OUTPUTS and only
-                    ;; nonstandard to SPEND, which is why this cannot reuse
-                    ;; standard-output-script-p.
-                    (when spk
-                      (case (classify-output-script spk)
-                        ((:nonstandard :witness-unknown)
-                         (return-from validate-transaction-for-mempool
-                           (values nil :nonstandard-inputs nil)))))
-                    (when (and spk (script-is-p2sh-p spk))
-                      (let ((redeem (extract-last-push
-                                     (bitcoin-lisp.serialization:tx-in-script-sig input))))
-                        (when (and redeem
-                                   (> (count-script-sigops redeem :accurate t)
-                                      +max-standard-p2sh-sigops+))
-                          ;; Core AreInputsStandard (policy.cpp) →
-                          ;; TX_INPUTS_NOT_STANDARD "bad-txns-nonstandard-
-                          ;; inputs": distinct from the TX_NOT_STANDARD total
-                          ;; sigop-cost cap above, because this failure depends
-                          ;; only on the txid (spent scriptPubKeys + scriptSig)
-                          ;; — the P2P reject cache may key it by txid too.
-                          (return-from validate-transaction-for-mempool
-                            (values nil :nonstandard-inputs nil)))))))
                 ;; Policy: witness must be standard (P2WSH/Taproot stack &
                 ;; script limits, no annex). Needs the spent scriptPubKeys,
                 ;; hence inside this flet.

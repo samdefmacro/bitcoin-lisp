@@ -27,7 +27,10 @@ carrying it is appended and the coinbase gets the BIP141 reserved witness value
               :previous-output (bitcoin-lisp.serialization:make-outpoint
                                 :hash (%zeros32) :index #xffffffff)
               :script-sig script-sig
-              :sequence #xffffffff))
+              ;; Core node/miner.cpp:171: MAX_SEQUENCE_NONFINAL, so the
+              ;; coinbase's nLockTime (below) is enforced — BIP54's coinbase
+              ;; rule, which Core's templates already satisfy.
+              :sequence #xfffffffe))
          (outputs (list (bitcoin-lisp.serialization:make-tx-out
                          :value value
                          :script-pubkey (or script-pubkey
@@ -42,8 +45,11 @@ carrying it is appended and the coinbase gets the BIP141 reserved witness value
      :inputs (vector in)
      :outputs (coerce outputs 'simple-vector)
      ;; BIP141 reserved witness value (one 32-byte zero item).
-     :witness (when witness-commitment-script (vector (list (%zeros32))))
-     :lock-time 0)))
+     :witness (when witness-commitment-script
+                (vector (list (bitcoin-lisp.validation:witness-reserved-value))))
+     ;; Core node/miner.cpp:196: the coinbase commits to its height a second
+     ;; way, nLockTime = height - 1 (BIP54), final because of the sequence.
+     :lock-time (1- height))))
 
 (defun assemble-full-block (chain-state mempool &key coinbase-script-pubkey block-time
                                                      utxo-set)
