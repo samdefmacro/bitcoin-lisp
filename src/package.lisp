@@ -1379,6 +1379,7 @@
    #:select-dialable-address
    #:address-book-get-addr
    #:resolve-tried-collisions
+   #:select-tried-collision
    #:addr-info-terrible-p
    #:net-group-key
    #:make-address-key
