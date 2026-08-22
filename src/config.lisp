@@ -668,7 +668,7 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
 (defparameter *repeatable-config-options*
   '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind"
     "testactivationheight" "debug" "debugexclude" "shutdownnotify"
-    "startupnotify" "connect" "seednode")
+    "startupnotify" "connect" "seednode" "whitelist" "whitebind")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -940,9 +940,11 @@ specially in config-alist->start-node-plist.")
     "walletrbf" "spendzeroconfchange" "walletrejectlongchains"
     "keypool" "walletdir" "walletnotify"
     "dnsseed" "fixedseeds" "forcednsseed" "acceptnonstdtxn"
+    "whitelistrelay" "whitelistforcerelay"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
-    "addnode" "connect" "seednode" "rpcauth" "rpcallowip" "testactivationheight"
+    "addnode" "connect" "seednode" "whitelist" "whitebind"
+    "rpcauth" "rpcallowip" "testactivationheight"
     "debugexclude" "shutdownnotify" "startupnotify"
     ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, not the spec
     ;; scan, since each topic contributes two options and they produce a list
@@ -982,8 +984,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "stopafterblockimport" "test" "timeout"
     "txospenderindex" "unsafesqlitesync" "vbparams"
     "version" "walletbroadcast" "walletcrosschain"
-    "whitebind"
-    "whitelist" "whitelistforcerelay" "whitelistrelay")
+    )
   "Options bitcoind accepts that this node recognises but does NOT implement,
 extracted from Core's AddArg registrations (init.cpp, common/args.cpp,
 init/common.cpp, chainparamsbase.cpp, the wallet/index/zmq/rpc modules).
@@ -1164,7 +1165,11 @@ resolved network. Honors -server (enable RPC on the default port when no
                         ("connect"        . :connect-nodes)
                         ;; -seednode: Core reads it with GetArgs into
                         ;; connOptions.vSeedNodes (init.cpp:2212).
-                        ("seednode"       . :seednode)))
+                        ("seednode"       . :seednode)
+                        ;; -whitelist / -whitebind: Core reads both with
+                        ;; GetArgs (init.cpp), so every occurrence counts.
+                        ("whitelist"      . :whitelist)
+                        ("whitebind"      . :whitebind)))
         (let ((values (loop for (k . v) in alist
                             when (string= k (car option))
                               collect v)))
@@ -1415,6 +1420,12 @@ start-node-from-args."
           (unless (and n (plusp n))
             (error "Invalid value for -bytespersigop=~A (must be a positive integer)" v))
           (setf bitcoin-lisp.mempool::+bytes-per-sigop+ n))))
+    ;; -whitelistrelay / -whitelistforcerelay (Core net_permissions.h:20-22).
+    (let ((v (lk "whitelistrelay")))
+      (when v (setf bitcoin-lisp.networking::*whitelist-relay* (conf-parse-bool v))))
+    (let ((v (lk "whitelistforcerelay")))
+      (when v
+        (setf bitcoin-lisp.networking::*whitelist-force-relay* (conf-parse-bool v))))
     ;; -acceptnonstdtxn: relay and mine transactions this node would otherwise
     ;; refuse as non-standard. Core REFUSES TO START with it on a non-test
     ;; chain (mempool_args.cpp:102-104); an error here, not a warning, because

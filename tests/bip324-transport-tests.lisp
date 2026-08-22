@@ -30,6 +30,26 @@ it, and run BODY with both connection structs bound. Closes everything after."
                   (bitcoin-lisp.networking:close-connection ,server-conn))))
          (bitcoin-lisp.networking::close-listener ,listener)))))
 
+(defun %v2t-drain (conn &key (seconds 10))
+  "Push CONN's queued unsent bytes onto the wire, or give up after SECONDS.
+
+SEND-BYTES never blocks: whatever the kernel does not take immediately is
+queued and retried by a later send or by a housekeeping flush pass. A live node
+has that pump; a test does not. So a send whose bytes are only partly accepted
+leaves the rest queued forever and the PEER waits out its full receive timeout
+— which is what made v2-transport-loopback-handshake-and-messages fail on
+roughly one battery run in three, always as a 60-second (NIL NIL) on the
+receiving side. Nothing about the transport was wrong; the bytes had not left."
+  (loop with deadline = (+ (get-internal-real-time)
+                           (* seconds internal-time-units-per-second))
+        while (plusp (bitcoin-lisp.networking::connection-send-queue-bytes conn))
+        do (unless (bitcoin-lisp.networking:flush-send-buffer conn)
+             (return))
+           (when (> (get-internal-real-time) deadline)
+             (return))
+           (sleep 0.01))
+  conn)
+
 (defun %v2t-frame (command payload)
   "A v1-framed message, as every message builder in the codebase produces."
   (bitcoin-lisp.serialization:serialize-message command payload))
@@ -67,6 +87,7 @@ must be skipped, and a 0-length payload."
                                 ;; short-ID message out; long-form + decoy back.
                                 (bitcoin-lisp.networking::v2-send-message
                                  client transport (%v2t-frame "inv" (%bc-hex "00")))
+                                (%v2t-drain client)
                                 (multiple-value-bind (cmd payload)
                                     (bitcoin-lisp.networking::v2-receive-message-blocking
                                      client transport :timeout 60)
@@ -87,7 +108,10 @@ must be skipped, and a 0-length payload."
               (bitcoin-lisp.networking::%v2-send-packet
                server transport (%bc-hex "deadbeef") (%bc-buf 0) t)
               (bitcoin-lisp.networking::v2-send-message
-               server transport (%v2t-frame "verack" (%bc-buf 0)))))
+               server transport (%v2t-frame "verack" (%bc-buf 0)))
+              ;; Make sure both packets actually reached the wire before we
+              ;; join the initiator thread; see %v2t-drain.
+              (%v2t-drain server)))
           (bt:join-thread thread)
           (is (equal "verack" (first client-result))
               "initiator result was ~S" client-result)
@@ -117,6 +141,7 @@ oversize length descriptor."
              client (bitcoin-lisp.crypto:bip324-cipher-encrypt
                      (bitcoin-lisp.networking::v2-transport-cipher client-transport)
                      (%bc-hex "07") (%bc-buf 0) nil))
+            (%v2t-drain client)
             ;; Corrupt the wire by having the server decrypt a tampered copy:
             ;; simplest is to feed it a packet whose ciphertext we flip. Read
             ;; it raw, flip a body byte, and re-inject via a fresh pair is
@@ -132,6 +157,7 @@ oversize length descriptor."
             ;; assert the connection dies, since the exact decrypted length is
             ;; cipher-dependent; feed 3 bytes then let the read fail.
             (bitcoin-lisp.networking:send-bytes client (%bc-hex "ffffff"))
+            (%v2t-drain client)
             (bitcoin-lisp.networking::v2-receive-message-blocking server server-transport
                                                          :timeout 2)
             (is-false (bitcoin-lisp.networking:connection-connected server)))))))
@@ -144,6 +170,7 @@ and pushed back so the v1 path reads them unchanged."
       (%with-loopback-pair (client server)
         (let ((version-msg (%v2t-frame "version" (%bc-hex "00010203"))))
           (bitcoin-lisp.networking:send-bytes client version-msg)
+          (%v2t-drain client)
           (is (eq :v1 (bitcoin-lisp.networking::v2-detect-inbound server :timeout 5)))
           ;; The sniffed 16 bytes plus the rest must reassemble the message.
           (let ((got (bitcoin-lisp.networking:receive-bytes
@@ -163,6 +190,7 @@ and pushed back so the v1 path reads them unchanged."
                 for i from 4
                 do (setf (aref bytes i) (char-code c)))
           (bitcoin-lisp.networking:send-bytes client bytes)
+          (%v2t-drain client)
           (is-false (bitcoin-lisp.networking::v2-detect-inbound server :timeout 5))))))
 
 (test v2-transport-outbound-fallback-on-silence
@@ -234,6 +262,7 @@ length it yielded has to survive the gap between passes."
                 ;; the receive cipher — the point of no return.
                 (bitcoin-lisp.networking::send-bytes
                  client (subseq packet 0 bitcoin-lisp.crypto:+bip324-length-len+))
+                (%v2t-drain client)
                 (sleep 0.2)
                 (multiple-value-bind (command detail)
                     (bitcoin-lisp.networking::v2-receive-message
@@ -247,6 +276,7 @@ length it yielded has to survive the gap between passes."
                 ;; Piece 2: the body.
                 (bitcoin-lisp.networking::send-bytes
                  client (subseq packet bitcoin-lisp.crypto:+bip324-length-len+))
+                (%v2t-drain client)
                 (sleep 0.2)
                 (multiple-value-bind (command payload)
                     (bitcoin-lisp.networking::v2-receive-message
@@ -293,7 +323,8 @@ resumes, after every other peer has had a turn."
                 (dotimes (i decoys)
                   (bitcoin-lisp.networking::%v2-send-packet
                    client client-transport (%bc-buf 0)
-                   bitcoin-lisp.networking::*v2-empty-bytes* t)))
+                   bitcoin-lisp.networking::*v2-empty-bytes* t))
+                (%v2t-drain client))
               (sleep 0.3)
               (let ((start (get-internal-real-time)))
                 (multiple-value-bind (command detail)

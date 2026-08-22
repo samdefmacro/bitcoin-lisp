@@ -1328,6 +1328,37 @@ one Core's ThreadOpenConnections would have taken."
   (is-true (member "connect" bitcoin-lisp::*repeatable-config-options*
                    :test #'string=)))
 
+(test whitelist-and-whitebind-reach-the-node
+  "-whitelist / -whitebind (Core init.cpp + net_permissions.cpp). Both are
+repeatable — Core reads them with GetArgs — and a malformed spec is FATAL, as
+Core's is: a typo'd range grants nothing and the operator never finds out."
+  (let ((p (bitcoin-lisp::args->start-node-plist
+            '("-regtest" "-whitelist=noban@10.0.0.0/8"
+              "-whitelist=relay,mempool@192.168.0.0/16"
+              "-whitebind=noban@127.0.0.1:1234")
+            nil)))
+    (is (equal '("noban@10.0.0.0/8" "relay,mempool@192.168.0.0/16")
+               (getf p :whitelist)))
+    (is (equal '("noban@127.0.0.1:1234") (getf p :whitebind))))
+  (dolist (name '("whitelist" "whitebind" "whitelistrelay" "whitelistforcerelay"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name))
+  (dolist (name '("whitelist" "whitebind"))
+    (is-true (member name bitcoin-lisp::*repeatable-config-options* :test #'string=)
+             "~A is not repeatable" name))
+  (let ((saved-relay bitcoin-lisp.networking::*whitelist-relay*)
+        (saved-force bitcoin-lisp.networking::*whitelist-force-relay*))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-config-globals
+            '(("whitelistrelay" . "0") ("whitelistforcerelay" . "1")))
+           ;; -whitelistrelay defaults TRUE and -whitelistforcerelay FALSE, so
+           ;; only these values prove the wiring.
+           (is-false bitcoin-lisp.networking::*whitelist-relay*)
+           (is-true bitcoin-lisp.networking::*whitelist-force-relay*))
+      (setf bitcoin-lisp.networking::*whitelist-relay* saved-relay
+            bitcoin-lisp.networking::*whitelist-force-relay* saved-force))))
+
 (test seednode-and-forcednsseed
   "-seednode (Core connOptions.vSeedNodes, init.cpp:2212) and -forcednsseed
 (DEFAULT_FORCEDNSSEED, net.h:97).

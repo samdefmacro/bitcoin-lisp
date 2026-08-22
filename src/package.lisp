@@ -1465,6 +1465,20 @@
    #:network-address-to-string
    #:parse-network-address
    #:parse-subnet
+   ;; Net permissions (-whitelist / -whitebind)
+   #:parse-permission-flags
+   #:parse-whitelist-entry
+   #:permission-flag-names
+   #:peer-permission-flags
+   #:peer-has-permission-p
+   #:+perm-bloom-filter+
+   #:+perm-relay+
+   #:+perm-force-relay+
+   #:+perm-noban+
+   #:+perm-mempool+
+   #:+perm-download+
+   #:+perm-addr+
+   #:+perm-all+
    #:subnet-match-p
    #:address-in-subnets-p
    ;; ADDRv2 support (BIP 155)
