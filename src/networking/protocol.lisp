@@ -643,9 +643,13 @@ for a tx with no other ready announcer. Returns the number re-requested."
 
 ;;; Initial-block-download status (Core ChainstateManager::IsInitialBlockDownload)
 
-(defconstant +max-tip-age-seconds+ (* 24 60 60)
+(defparameter +max-tip-age-seconds+ (* 24 60 60)
   "Consider the node still in IBD while the active tip is older than
-this. Core DEFAULT_MAX_TIP_AGE (kernel/chainstatemanager_opts.h:24).")
+this. Core DEFAULT_MAX_TIP_AGE (kernel/chainstatemanager_opts.h:24), settable
+with -maxtipage.
+
+A DEFPARAMETER because Core exposes the knob; the +NAME+ spelling is kept
+because every caller reads it as a constant.")
 
 (defvar *cached-is-ibd* t
   "Latched IBD status: starts true; initial-block-download-p latches it

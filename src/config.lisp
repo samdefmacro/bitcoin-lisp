@@ -889,6 +889,7 @@ specially in config-alist->start-node-plist.")
     "blockmintxfee" "blockmaxweight" "blockreservedweight"
     "maxtxfee" "fallbackfee" "bantime" "uacomment"
     "dustrelayfee" "incrementalrelayfee" "bytespersigop"
+    "maxtipage" "maxsigcachesize" "fastprune" "blocksxor"
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
@@ -912,17 +913,17 @@ command-line options at startup, like Core ArgsManager::ParseParameters
   '(
     "acceptnonstdtxn" "addresstype" "alertnotify" "allowignoredconf" "asmap"
     "avoidpartialspends" "blocknotify" "blockreconstructionextratxn"
-    "blocksdir" "blocksxor" "blockversion" "capturemessages"
+    "blocksdir" "blockversion" "capturemessages"
     "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
     "checkmempool" "checkpoints" "connect" "consolidatefeerate" "daemon"
     "daemonwait" "dbbatchsize" "deprecatedrpc"
-    "discardfee" "discover" "dns" "fastprune"
+    "discardfee" "discover" "dns"
     "forcednsseed" "help" "i2pacceptincoming" "i2psam"
     "ipcbind" "keypool" "limitancestorcount" "limitancestorsize"
     "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
     "loglevelalways" "logsourcelocations"
     "logtimestamps" "maxapsfee" "maxreceivebuffer" "maxsendbuffer"
-    "maxsigcachesize" "maxtipage" "maxuploadtarget" "mintxfee"
+    "maxuploadtarget" "mintxfee"
     "natpmp" "par" "peerbloomfilters" "peertimeout" "persistmempool"
     "persistmempoolv1" "pid" "printpriority" "printtoconsole"
     "privatebroadcast" "rpccookiefile" "rpccookieperms" "rpcdoccheck"
@@ -1343,6 +1344,42 @@ start-node-from-args."
           (unless (and n (plusp n))
             (error "Invalid value for -bytespersigop=~A (must be a positive integer)" v))
           (setf bitcoin-lisp.mempool::+bytes-per-sigop+ n))))
+    ;; -maxtipage: how old the tip may be before the node still calls itself in
+    ;; IBD (Core DEFAULT_MAX_TIP_AGE, kernel/chainstatemanager_opts.h:24).
+    (let ((v (lk "maxtipage")))
+      (when v
+        (let ((n (conf-parse-int v)))
+          (unless (and n (>= n 0))
+            (error "Invalid value for -maxtipage=~A (must be a non-negative integer)" v))
+          (setf bitcoin-lisp.networking::+max-tip-age-seconds+ n))))
+    ;; -maxsigcachesize: MiB of signature cache (Core's knob is bytes split
+    ;; across two caches; ours is one, counted in ENTRIES). A cache entry is a
+    ;; 32-byte key, which is what Core's CuckooCache element is too, so the
+    ;; conversion is bytes/32 — the real heap cost is higher because a Lisp
+    ;; hash table is not a cuckoo table, and the option is a bound on entries
+    ;; rather than a promise about memory.
+    (let ((v (lk "maxsigcachesize")))
+      (when v
+        (let ((n (conf-parse-int v)))
+          (unless (and n (plusp n))
+            (error "Invalid value for -maxsigcachesize=~A (must be a positive integer)" v))
+          ;; Resolved at RUNTIME: this file compiles before the Coalton
+          ;; module, so the package does not exist at read time and a
+          ;; package-qualified symbol here is a READ error.
+          (let ((sym (find-symbol "+SIGNATURE-CACHE-MAX-ENTRIES+"
+                                  "BITCOIN-LISP.COALTON.INTEROP")))
+            (unless sym
+              (error "-maxsigcachesize: the signature cache is unavailable"))
+            (setf (symbol-value sym) (max 1 (floor (* n 1024 1024) 32)))))))
+    ;; -fastprune: tiny block files so a pruning test can produce many of them
+    ;; without mining a real chain (Core blockstorage.cpp:857-862). Test-only.
+    (let ((v (lk "fastprune")))
+      (when v
+        (setf bitcoin-lisp.storage:*fast-prune* (conf-parse-bool v))))
+    ;; -blocksxor: obfuscate blocksdir contents (Core DEFAULT_XOR_BLOCKSDIR).
+    (let ((v (lk "blocksxor")))
+      (when v
+        (setf bitcoin-lisp.storage:*blocks-xor* (conf-parse-bool v))))
     ;; -bantime: default setban duration in seconds (Core banman.h:19
     ;; DEFAULT_MISBEHAVING_BANTIME = 86400, applied when setban gets no time).
     (let ((v (lk "bantime")))

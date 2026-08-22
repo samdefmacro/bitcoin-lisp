@@ -116,7 +116,8 @@ which is what Core records as nDataPos."
     ;; Roll over rather than exceed Core's maximum file size, finalizing the
     ;; file we are leaving so its preallocated tail is truncated away.
     (when (and (plusp (block-store-cursor-pos store))
-               (> (+ (block-store-cursor-pos store) need) +max-blockfile-size+))
+               (> (+ (block-store-cursor-pos store) need)
+                  (max-blockfile-size need)))
       (flat-file-flush seq
                        (make-flat-file-pos (block-store-cursor-file store)
                                            (block-store-cursor-pos store))
@@ -519,8 +520,16 @@ zero tail of the file currently being appended to looks like."
     ;; record header would look like garbage and the scan would find nothing.
     ;; A key is only CREATED for a directory with no block data in it.
     (setf (block-store-xor-key store)
-          (read-or-create-xor-key (merge-pathnames "blocks/" base-path)
-                                  :create *flat-block-files*))
+          ;; -blocksxor=0 keeps the obfuscation key all-zero, which is how
+          ;; Core disables it (kernel/blockmanager_opts.h:18,26). Reading an
+          ;; EXISTING key is unconditional: a directory already written with a
+          ;; key must keep being read with it, whatever the flag now says.
+          (if *blocks-xor*
+              (read-or-create-xor-key (merge-pathnames "blocks/" base-path)
+                                      :create *flat-block-files*)
+              (or (read-or-create-xor-key (merge-pathnames "blocks/" base-path)
+                                          :create nil)
+                  (zero-obfuscation-key))))
     ;; Scan for existing blocks (the only full-directory scan — from here
     ;; on, total-bytes is maintained incrementally)
     (let ((blocks-dir (merge-pathnames "blocks/" base-path))
