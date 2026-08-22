@@ -2296,6 +2296,74 @@ serving something wrong or signalling out of the handler."
         (is-true (and (stringp b) (search "output format not found" b))
                  "deploymentinfo served a non-JSON format: ~S" b)))))
 
+(test tx-to-json-gates-fee-and-prevout-separately
+  "Core reads the block's undo data at verbosity 2 AND 3, and pushes `fee`
+whenever it has the coins — but the `prevout` OBJECT only at verbosity 3
+(TxToUniv, core_io.cpp:455-525; blockToJSON reads undo for both). The two are
+gated by different conditions in Core, so folding them together would give a
+verbosity-2 caller prevout objects Core does not send."
+  (let* ((tx (make-mempool-test-tx :input-id 77))
+         (coins (list (bitcoin-lisp.storage:make-utxo-entry
+                       :value 5000
+                       :script-pubkey (coerce #(#x51) '(simple-array (unsigned-byte 8) (*)))
+                       :height 12 :coinbase nil))))
+    ;; No coins: neither field, exactly as before this change.
+    (let ((j (bitcoin-lisp.rpc::tx-to-json tx :regtest)))
+      (is-false (assoc "fee" j :test #'string=))
+      (is-false (assoc "prevout" (first (cdr (assoc "vin" j :test #'string=)))
+                       :test #'string=)))
+    ;; Verbosity 2: fee, no prevout.
+    (let* ((j (bitcoin-lisp.rpc::tx-to-json tx :regtest :spent-coins coins))
+           (vin0 (first (cdr (assoc "vin" j :test #'string=)))))
+      (is-true (assoc "fee" j :test #'string=) "verbosity 2 must report the fee")
+      (is-false (assoc "prevout" vin0 :test #'string=)
+                "verbosity 2 must NOT carry prevout objects"))
+    ;; Verbosity 3: both, and the prevout carries Core's four fields.
+    (let* ((j (bitcoin-lisp.rpc::tx-to-json tx :regtest :spent-coins coins :prevouts t))
+           (vin0 (first (cdr (assoc "vin" j :test #'string=))))
+           (p (cdr (assoc "prevout" vin0 :test #'string=))))
+      (is-true (assoc "fee" j :test #'string=))
+      (is-true p "verbosity 3 must carry a prevout object")
+      (is (eql 12 (cdr (assoc "height" p :test #'string=))))
+      (is (= (/ 5000 100000000.0d0) (cdr (assoc "value" p :test #'string=))))
+      (is-true (assoc "generated" p :test #'string=))
+      (is-true (assoc "scriptPubKey" p :test #'string=))
+      ;; The fee is inputs minus outputs, from the coins.
+      (let ((out-total (loop for o across (bitcoin-lisp.serialization:transaction-outputs tx)
+                             sum (bitcoin-lisp.serialization:tx-out-value o))))
+        (is (= (/ (- 5000 out-total) 100000000.0d0)
+               (cdr (assoc "fee" j :test #'string=))))))))
+
+(test coinbase-inputs-never-get-a-prevout
+  "A coinbase spends nothing, so Core's loop skips it (`if (have_undo)` sits
+inside the non-coinbase branch's sibling and vprevout has one entry per
+NON-coinbase transaction). Handing a coinbase input a prevout would invent a
+coin that never existed."
+  (let* ((coinbase
+           (bitcoin-lisp.serialization:make-transaction
+            :version 1
+            :inputs (vector (bitcoin-lisp.serialization:make-tx-in
+                             :previous-output
+                             (bitcoin-lisp.serialization:make-outpoint
+                              :hash (make-array 32 :element-type '(unsigned-byte 8)
+                                                   :initial-element 0)
+                              :index #xFFFFFFFF)
+                             :script-sig (coerce #(1 2) '(simple-array (unsigned-byte 8) (*)))
+                             :sequence #xFFFFFFFF))
+            :outputs (vector (bitcoin-lisp.serialization:make-tx-out
+                              :value 5000000000
+                              :script-pubkey (coerce #(#x51)
+                                                     '(simple-array (unsigned-byte 8) (*)))))
+            :lock-time 0))
+         (coins (list (bitcoin-lisp.storage:make-utxo-entry
+                       :value 1 :script-pubkey (coerce #(#x51) '(simple-array (unsigned-byte 8) (*)))
+                       :height 1 :coinbase t)))
+         (j (bitcoin-lisp.rpc::tx-to-json coinbase :regtest :spent-coins coins :prevouts t))
+         (vin0 (first (cdr (assoc "vin" j :test #'string=)))))
+    (is-true (assoc "coinbase" vin0 :test #'string=) "not a coinbase input")
+    (is-false (assoc "prevout" vin0 :test #'string=)
+              "a coinbase input was given a prevout")))
+
 ;;; --- Concurrent Access Tests (2.7) ---
 
 (test rpc-concurrent-access-safety
