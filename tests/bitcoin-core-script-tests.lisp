@@ -398,9 +398,9 @@
 
               ;; Handle P2SH-wrapped witness programs
               (when (and witness-enabled is-p2sh-script witness-stack)
-                ;; For P2SH-witness, scriptSig must be a single push of the witness program
-                ;; The pushed data becomes the witness program to validate
-                (let* ((redeem-script (extract-p2sh-redeem-script sig-bytes)))
+                ;; The redeem script is the stack top the scriptSig leaves —
+                ;; the same derivation production uses (p2sh-redeem-script).
+                (let ((redeem-script (bitcoin-lisp.coalton.interop:p2sh-redeem-script sig-bytes)))
                   (when (and redeem-script
                              (bitcoin-lisp.coalton.interop:is-witness-program-p redeem-script))
                     ;; Validate the wrapped witness program (is-p2sh = T:
@@ -432,41 +432,6 @@
           (setf bitcoin-lisp.coalton.interop:*witness-input-amount* 0)))
     (error (e)
       (values nil e))))
-
-(defun extract-p2sh-redeem-script (script-sig)
-  "Extract the redeem script from a P2SH scriptSig.
-   For P2SH-P2WPKH/P2SH-P2WSH, this is the last push which should be the witness program."
-  (let ((len (length script-sig)))
-    (when (> len 0)
-      ;; Find the last push data
-      (let ((pos 0)
-            (last-push nil))
-        (loop while (< pos len)
-              do (let ((op (aref script-sig pos)))
-                   (cond
-                     ;; Direct push 1-75 bytes
-                     ((and (>= op 1) (<= op #x4b))
-                      (let ((data-len op))
-                        (when (> (+ pos 1 data-len) len)
-                          (return))
-                        (setf last-push (subseq script-sig (1+ pos) (+ pos 1 data-len)))
-                        (incf pos (1+ data-len))))
-                     ;; OP_PUSHDATA1
-                     ((= op #x4c)
-                      (when (>= (1+ pos) len) (return))
-                      (let ((data-len (aref script-sig (1+ pos))))
-                        (when (> (+ pos 2 data-len) len) (return))
-                        (setf last-push (subseq script-sig (+ pos 2) (+ pos 2 data-len)))
-                        (incf pos (+ 2 data-len))))
-                     ;; OP_0 through OP_16
-                     ((or (zerop op) (and (>= op #x51) (<= op #x60)))
-                      (incf pos))
-                     ;; OP_1NEGATE
-                     ((= op #x4f)
-                      (incf pos))
-                     ;; Other opcodes (should not appear in P2SH scriptSig)
-                     (t (incf pos)))))
-        last-push))))
 
 ;;; ============================================================
 ;;; Test Suite
@@ -626,9 +591,9 @@ was accepted where Core rejects it."
 requires the scriptSig to be EXACTLY a single canonical push of the witness
 program. An extra leading push (third-party malleability) must be rejected even
 though P2SH push-only accepts it — Core returns WITNESS_MALLEATED_P2SH. Before
-the fix, extract-last-push-data ignored the leading junk and the spend was
-accepted. Uses P2SH(P2WSH(OP_TRUE)) so the canonical case validates with a
-trivial witness (no signature needed)."
+the fix the redeem script was taken from the scriptSig bytes, the leading junk
+was ignored, and the spend was accepted. Uses P2SH(P2WSH(OP_TRUE)) so the
+canonical case validates with a trivial witness (no signature needed)."
   (let* ((witness-script (make-array 1 :element-type '(unsigned-byte 8)
                                        :initial-element #x51)) ; OP_TRUE
          (wsh (bitcoin-lisp.crypto:sha256 witness-script))     ; 32-byte program
@@ -653,3 +618,42 @@ trivial witness (no signature needed)."
              (declare (ignore err))
              (is (eq ok t) "canonical single-push P2SH-witness spend must verify")))
       (bitcoin-lisp.coalton.interop:set-script-flags nil))))
+
+(test p2sh-witness-redeem-script-is-stack-top
+  "CONSENSUS (interpreter.cpp:2058-2060): the P2SH redeem script is the element
+the scriptSig leaves on TOP OF THE STACK — not the last push in its bytes. OP_0
+pushes an empty element, so `<push program> OP_0` spending P2SH(hash160(''))
+has an EMPTY redeem script: to Core it is an ordinary P2SH spend, accepted with
+no witness. Before the fix a byte-level walk skipped OP_0, took the witness
+program as the redeem script, and rejected the spend as WITNESS_MALLEATED_P2SH
+— a block containing it split us from Core."
+  (flet ((p2sh (redeem)
+           (%w8d-script #xa9 #x14 (bitcoin-lisp.crypto:hash160 redeem) #x87)))
+    (let* ((wp (%w8d-script #x00 #x14 (make-list 20 :initial-element #xab))) ; v0 program
+           (empty (%w8d-script))
+           (push-wp (%w8d-script #x16 wp))
+           (push-wp-then-op0 (%w8d-script push-wp #x00)))
+      (bitcoin-lisp.coalton.interop:set-script-flags "P2SH,WITNESS")
+      (unwind-protect
+           (progn
+             ;; The divergent case. Core: stack top is the empty element,
+             ;; pubKey2 is the empty script, not a witness program -> ACCEPT.
+             (multiple-value-bind (ok err)
+                 (bitcoin-lisp.coalton.interop:verify-script
+                  push-wp-then-op0 (p2sh empty) :witness nil :amount 0)
+               (is (eq ok t)
+                   "<push program> OP_0 is a plain P2SH spend of hash160(''), got ~A"
+                   err))
+             (is (equalp empty (bitcoin-lisp.coalton.interop:p2sh-redeem-script
+                                push-wp-then-op0))
+                 "trailing OP_0 leaves an empty element on top")
+             ;; Positive control: with the program genuinely on top, the
+             ;; witness path still fires — an empty witness must FAIL. For a
+             ;; 20-byte v0 program Core's VerifyWitnessProgram reports MISMATCH
+             ;; (stack.size() != 2), reserving WITNESS_EMPTY for P2WSH.
+             (multiple-value-bind (ok err)
+                 (bitcoin-lisp.coalton.interop:verify-script
+                  push-wp (p2sh wp) :witness nil :amount 0)
+               (is (null ok))
+               (is (eq err :witness-program-mismatch) "got ~A" err)))
+        (bitcoin-lisp.coalton.interop:set-script-flags nil)))))
