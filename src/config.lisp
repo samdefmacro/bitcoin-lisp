@@ -574,19 +574,6 @@ character makes -uacomment an init error, matching Core."
            (or (alphanumericp c) (find c " .,;-_?@")))
          comment))
 
-(defun format-subversion (comments)
-  "BIP14 subversion string with COMMENTS (Core FormatSubVersion,
-clientversion.cpp:67-72): \"/bitcoin-lisp:0.1.0(c1; c2)/\", no parens block
-when COMMENTS is empty. When the running build's short git rev has been stamped
-(bitcoin-lisp.serialization:*build-git-rev*), it is prepended as a leading
-\"g<rev>\" comment so the advertised subversion identifies the deployed build;
-unstamped, output is byte-identical to plain Core parity."
-  (let* ((git (bitcoin-lisp.serialization::subversion-git-comment))
-         (all (if git (cons git comments) comments)))
-    (if all
-        (format nil "/bitcoin-lisp:0.1.0(~{~A~^; ~})/" all)
-        "/bitcoin-lisp:0.1.0/")))
-
 (defconstant +default-proxy-port+ 9050
   "Default SOCKS5 proxy port when -proxy/-onion gives no :port (Tor's SOCKS
 port; Bitcoin Core init.cpp:1721 Lookup(..., 9050, ...)).")
@@ -867,6 +854,7 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ("networkactive"     :network-active     :bool)
     ("rest"              :rest               :bool)
     ("blocksonly"        :blocksonly         :bool)
+    ("acceptstalefeeestimates" :accept-stale-fee-estimates :bool)
     ("sync"              :sync               :bool))
   "Maps a Bitcoin Core-style option name to a start-node keyword and its value
 type. Network selection (-chain/-testnet/...) and -server/-debug are handled
@@ -1172,7 +1160,7 @@ start-node-from-args."
         (unless (ua-comment-safe-p cmt)
           (error "User Agent comment (~A) contains unsafe characters." cmt)))
       (when comments
-        (let ((subversion (format-subversion comments)))
+        (let ((subversion (bitcoin-lisp.serialization:subversion-with-build-rev comments)))
           (when (> (length subversion) +max-subversion-length+)
             (error "Total length of network version string (~D) exceeds maximum length (~D). Reduce the number or size of uacomments."
                    (length subversion) +max-subversion-length+))
