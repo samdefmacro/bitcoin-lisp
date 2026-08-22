@@ -2169,12 +2169,35 @@ Returns the node instance."
   (let ((path (%resolve-log-file log-file data-directory)))
     (when path (start-file-logging path)))
 
-  ;; UTXO cache budget (Core -dbcache). Larger = fewer LevelDB disk reads.
+  ;; -dbcache, split across the coins cache AND every database's block cache
+  ;; the way Core splits it (CalculateCacheSizes, node/caches.cpp:57-72, then
+  ;; kernel::CacheSizes). We used to spend the whole budget on the in-memory
+  ;; coins cache and give the LevelDBs nothing, so -dbcache=4000 bought a large
+  ;; cache sitting on top of databases still reading a block per level for
+  ;; every miss. Computed BEFORE init-node, which is what opens them.
   (when dbcache-mib
     (unless (and (integerp dbcache-mib) (>= dbcache-mib 4))
-      (error "Invalid dbcache-mib: ~A. Must be an integer >= 4." dbcache-mib))
-    (setf *coins-cache-budget-bytes* (* dbcache-mib 1024 1024))
-    (log-info "UTXO coins-cache budget: ~D MiB" dbcache-mib))
+      (error "Invalid dbcache-mib: ~A. Must be an integer >= 4." dbcache-mib)))
+  (let* ((total (if dbcache-mib
+                    (* dbcache-mib 1024 1024)
+                    bitcoin-lisp.storage::+default-db-cache-bytes+))
+         (sizes (bitcoin-lisp.storage:calculate-cache-sizes
+                 total
+                 :tx-index txindex
+                 ;; The filter and coinstats indexes share one per-index share,
+                 ;; as Core divides its filter budget by n_indexes.
+                 :filter-index-count (+ (if blockfilterindex 1 0)
+                                        (if coinstatsindex 1 0)))))
+    (setf bitcoin-lisp.storage::*cache-sizes* sizes
+          *coins-cache-budget-bytes*
+          (bitcoin-lisp.storage:cache-sizes-coins sizes))
+    (log-info "Cache budget ~D MiB: coins ~D MiB, coins-db ~D MiB, ~
+txindex ~D MiB, per-index ~D MiB"
+              (floor total 1048576)
+              (floor (bitcoin-lisp.storage:cache-sizes-coins sizes) 1048576)
+              (floor (bitcoin-lisp.storage:cache-sizes-coins-db sizes) 1048576)
+              (floor (bitcoin-lisp.storage:cache-sizes-tx-index sizes) 1048576)
+              (floor (bitcoin-lisp.storage:cache-sizes-filter-index sizes) 1048576)))
 
   ;; Validate the pruning configuration BEFORE assigning the global — a
   ;; config-validation error must not leave *prune-target-mib* set (a failed

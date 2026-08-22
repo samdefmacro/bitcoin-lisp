@@ -76,7 +76,11 @@ No startup replay: the DB is the index."
     (when enabled
       (let ((path (txindex-db-path base-path)))
         (ensure-directories-exist path)
-        (setf (tx-index-db txindex) (leveldb-open path))))
+        (setf (tx-index-db txindex)
+              (leveldb-open-tuned
+               path :cache-bytes (if *cache-sizes*
+                                     (cache-sizes-tx-index *cache-sizes*)
+                                     0)))))
     txindex))
 
 (defun close-tx-index (txindex)

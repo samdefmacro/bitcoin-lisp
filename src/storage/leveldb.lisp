@@ -69,6 +69,30 @@
 (cffi:defcfun ("leveldb_options_set_max_open_files"
                %leveldb-options-set-max-open-files) :void
   (options :pointer) (n :int))
+(cffi:defcfun ("leveldb_cache_create_lru" %leveldb-cache-create-lru) :pointer
+  (capacity :unsigned-long))
+
+(cffi:defcfun ("leveldb_cache_destroy" %leveldb-cache-destroy) :void
+  (cache :pointer))
+
+(cffi:defcfun ("leveldb_options_set_cache" %leveldb-options-set-cache) :void
+  (options :pointer) (cache :pointer))
+
+(cffi:defcfun ("leveldb_filterpolicy_create_bloom"
+               %leveldb-filterpolicy-create-bloom) :pointer
+  (bits-per-key :int))
+
+(cffi:defcfun ("leveldb_filterpolicy_destroy" %leveldb-filterpolicy-destroy) :void
+  (policy :pointer))
+
+(cffi:defcfun ("leveldb_options_set_filter_policy"
+               %leveldb-options-set-filter-policy) :void
+  (options :pointer) (policy :pointer))
+
+(cffi:defcfun ("leveldb_options_set_max_file_size"
+               %leveldb-options-set-max-file-size) :void
+  (options :pointer) (size :unsigned-long))
+
 (cffi:defcfun ("leveldb_options_set_paranoid_checks"
                %leveldb-options-set-paranoid-checks) :void
   (options :pointer) (flag :uint8))
@@ -201,8 +225,168 @@ internally with defaults."
            (%leveldb-open opts (namestring path) errptr))
       (when own-options (leveldb-destroy-options opts)))))
 
+;;;; -dbcache, split the way Core splits it (node/caches.cpp, kernel/caches.h)
+;;;;
+;;;; One budget covers the coins cache AND every LevelDB's block cache. We
+;;;; spent the whole of it on the in-memory coins cache and gave the databases
+;;;; nothing, so -dbcache=4000 bought a large coins cache sitting on top of
+;;;; databases still reading a block per level for every miss.
+
+(defconstant +min-db-cache-bytes+ (* 4 1024 1024)
+  "Core MIN_DB_CACHE (node/caches.h:16).")
+
+(defconstant +default-db-cache-bytes+ (* 450 1024 1024)
+  "Core DEFAULT_KERNEL_CACHE (kernel/caches.h). Core raises this to 1 GiB on a
+64-bit machine with >= 4 GiB of RAM; we do not detect RAM, so the conservative
+value is the default and -dbcache is how an operator asks for more.")
+
+(defconstant +max-tx-index-cache-bytes+ (* 1024 1024 1024)
+  "Core MAX_TX_INDEX_CACHE (node/caches.cpp:23).")
+
+(defconstant +max-filter-index-cache-bytes+ (* 1024 1024 1024)
+  "Core MAX_FILTER_INDEX_CACHE (node/caches.cpp:25).")
+
+(defconstant +max-coins-db-cache-bytes+ (* 8 1024 1024)
+  "Core MAX_COINS_DB_CACHE (kernel/caches.h).")
+
+(defconstant +max-block-db-cache-bytes+ (* 2 1024 1024)
+  "Core MAX_BLOCK_DB_CACHE (kernel/caches.h).")
+
+(defvar *cache-sizes* nil
+  "The CACHE-SIZES this node is running with, or NIL before startup computes
+them. Read by the database openers rather than threaded through them: the coins
+view, the txindex, the filter index and the coinstats index are constructed
+from three different layers, and each needs only its own share.")
+
+(defstruct cache-sizes
+  "How one -dbcache budget is divided (Core CacheSizes + kernel::CacheSizes).
+Every field is bytes."
+  (tx-index 0 :type (integer 0))
+  (filter-index 0 :type (integer 0))
+  (block-tree-db 0 :type (integer 0))
+  (coins-db 0 :type (integer 0))
+  (coins 0 :type (integer 0)))
+
+(defun calculate-cache-sizes (total-bytes &key tx-index (filter-index-count 0))
+  "Divide TOTAL-BYTES the way Core does (CalculateCacheSizes,
+node/caches.cpp:57-72, then kernel::CacheSizes).
+
+The order is Core's and it matters: each index takes at most an eighth of what
+is LEFT, so the caps compound rather than applying to the original total, and
+whatever survives all of them becomes the coins cache."
+  (let* ((total (max +min-db-cache-bytes+ total-bytes))
+         (tx (if tx-index
+                 (min (floor total 8) +max-tx-index-cache-bytes+)
+                 0)))
+    (decf total tx)
+    (let ((filter 0))
+      (when (plusp filter-index-count)
+        (let ((budget (min (floor total 8) +max-filter-index-cache-bytes+)))
+          (setf filter (floor budget filter-index-count))
+          (decf total (* filter filter-index-count))))
+      (let ((block-tree (min (floor total 8) +max-block-db-cache-bytes+)))
+        (decf total block-tree)
+        (let ((coins-db (min (floor total 2) +max-coins-db-cache-bytes+)))
+          (decf total coins-db)
+          (make-cache-sizes :tx-index tx
+                            :filter-index filter
+                            :block-tree-db block-tree
+                            :coins-db coins-db
+                            :coins total))))))
+
+;;;; Tuned opens: block cache + bloom filter
+;;;;
+;;;; Core gives every LevelDB an LRU block cache of nCacheSize/2 and a
+;;;; 10-bit-per-key bloom filter (GetOptions, dbwrapper.cpp:139-155). We gave
+;;;; ours neither, so a NEGATIVE point lookup — which is most of them during
+;;;; IBD, since every input's coin is checked before it is found — read one
+;;;; data block per SST level from disk, and every repeated read went to the OS
+;;;; page cache at best. A bloom filter answers "not here" without touching the
+;;;; block at all.
+;;;;
+;;;; The cache and the filter policy must OUTLIVE the database: leveldb_open
+;;;; retains the pointers the options carry. Destroying the options right after
+;;;; open is fine (leveldb copies them); destroying the cache is a use-after-
+;;;; free on the next read. Hence the registry — LEVELDB-CLOSE frees what
+;;;; LEVELDB-OPEN-TUNED allocated, and nothing else has to remember.
+
+(defconstant +leveldb-bloom-bits-per-key+ 10
+  "Core's NewBloomFilterPolicy(10) (dbwrapper.cpp:143).")
+
+(defconstant +leveldb-max-file-size+ (* 32 1024 1024)
+  "Core's DBWRAPPER_MAX_FILE_SIZE: bigger SSTs mean fewer of them, so fewer
+open files and fewer levels to search (dbwrapper.cpp:152).")
+
+(defvar *leveldb-owned-resources* (make-hash-table :test 'equal)
+  "DB pointer -> (cache . filter-policy) allocated for it by
+LEVELDB-OPEN-TUNED, so LEVELDB-CLOSE can free them in the right order.")
+
+(defvar *leveldb-owned-resources-lock* (bt:make-lock "leveldb-owned")
+  "Guards *LEVELDB-OWNED-RESOURCES*: indexes are opened and closed from the
+startup thread and from RPC threads.")
+
+(defun leveldb-open-tuned (path &key (cache-bytes 0)
+                                     (bloom-bits +leveldb-bloom-bits-per-key+)
+                                     (max-open-files 1000)
+                                     write-buffer-size)
+  "Open the LevelDB at PATH with Core's tuning and return its handle.
+
+CACHE-BYTES is the total budget for this database; Core spends half of it on
+the block cache and a quarter on the write buffer (dbwrapper.cpp:141-142), so
+that split is applied here rather than asked of the caller. A CACHE-BYTES of 0
+means no explicit block cache, which is leveldb's small built-in default.
+
+BLOOM-BITS 0 disables the filter. MAX-OPEN-FILES defaults to Core's 64-bit
+value; see OPEN-COINS-VIEW-DB for why exceeding it cost this project its
+mainnet node."
+  (ensure-libleveldb-loaded)
+  (let ((cache (when (plusp cache-bytes)
+                 (%leveldb-cache-create-lru (floor cache-bytes 2))))
+        (filter (when (plusp bloom-bits)
+                  (%leveldb-filterpolicy-create-bloom bloom-bits)))
+        (opts nil)
+        (db nil))
+    (unwind-protect
+         (progn
+           (setf opts (leveldb-make-options
+                       :max-open-files max-open-files
+                       :write-buffer-size (or write-buffer-size
+                                              (if (plusp cache-bytes)
+                                                  (max (floor cache-bytes 4)
+                                                       (* 1024 1024))
+                                                  (* 4 1024 1024)))))
+           (when cache (%leveldb-options-set-cache opts cache))
+           (when filter (%leveldb-options-set-filter-policy opts filter))
+           (%leveldb-options-set-max-file-size opts +leveldb-max-file-size+)
+           (setf db (with-errptr (errptr)
+                      (%leveldb-open opts (namestring path) errptr)))
+           (when (or cache filter)
+             (bt:with-lock-held (*leveldb-owned-resources-lock*)
+               (setf (gethash (cffi:pointer-address db) *leveldb-owned-resources*)
+                     (cons cache filter))))
+           db)
+      (when opts (leveldb-destroy-options opts))
+      ;; The open failed (or unwound): free what the DB never took on.
+      (unless db
+        (when cache (%leveldb-cache-destroy cache))
+        (when filter (%leveldb-filterpolicy-destroy filter))))))
+
 (defun leveldb-close (db)
-  (%leveldb-close db))
+  "Close DB and free the block cache and filter policy opened with it.
+
+Order matters and is the reason this is not just leveldb_close: the cache and
+the filter policy are still referenced by the open database, so they can only
+be destroyed after it is closed — and they MUST be destroyed, or every index
+reopen (a reindex, a restart of the filter backfill) leaks its whole cache."
+  (let ((owned (bt:with-lock-held (*leveldb-owned-resources-lock*)
+                 (let* ((key (cffi:pointer-address db))
+                        (entry (gethash key *leveldb-owned-resources*)))
+                   (remhash key *leveldb-owned-resources*)
+                   entry))))
+    (%leveldb-close db)
+    (when owned
+      (when (car owned) (%leveldb-cache-destroy (car owned)))
+      (when (cdr owned) (%leveldb-filterpolicy-destroy (cdr owned))))))
 
 (defmacro with-leveldb ((var path &optional options) &body body)
   `(let ((,var (leveldb-open ,path ,options)))

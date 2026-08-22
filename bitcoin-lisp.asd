@@ -196,7 +196,8 @@
                              (:file "addrman-tests")
                              ;; Compact block relay tests (BIP 152)
                              (:file "compact-block-tests")
-                             (:file "structural-tests")
+                             (:file "db-cache-tests")
+                               (:file "structural-tests")
                              ;; ADDRv2 tests (BIP 155)
                              (:file "addrv2-tests")
                              ;; Network-typed address codecs (onion/i2p/base32) + reachability

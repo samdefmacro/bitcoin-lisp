@@ -601,6 +601,13 @@
    #:leveldb-make-options
    #:leveldb-destroy-options
    #:leveldb-open
+   #:leveldb-open-tuned
+   #:calculate-cache-sizes
+   #:cache-sizes-tx-index
+   #:cache-sizes-filter-index
+   #:cache-sizes-block-tree-db
+   #:cache-sizes-coins-db
+   #:cache-sizes-coins
    #:leveldb-close
    #:leveldb-destroy-db
    #:with-leveldb
