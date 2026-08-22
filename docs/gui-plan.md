@@ -1,6 +1,6 @@
 # GUI — Implementation Plan (web UI served by the node)
 
-Date: 2026-07-15. Status: **PLAN — not started.**
+Date: 2026-07-15. Status (2026-08-22): **P0-P4 and P6a-d DONE** (PRs #282-#301; see §5); P5 (SSE push) not built.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (`src/qt/` feature inventory).
 Researched via 2 agents (bitcoin-qt screens/architecture; CL GUI toolkit landscape with
 web-verified maintenance status). Companion plan: `docs/wallet-plan.md` (P6 here gates on it).

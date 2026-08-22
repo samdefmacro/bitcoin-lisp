@@ -1,6 +1,6 @@
 # G7-23 — ZMQ notifications
 
-**Status: blocked on an infrastructure decision, not on design.** This records
+**Status (2026-08-22): DONE** — libzmq was added to the toolchain image (2.6.5-3) and the publishers shipped in PRs #368-#370; the text below records the decision as it stood. This records
 what the work is, the two ways to do it, and what each costs, because both
 require a change outside the source tree that is the maintainer's call.
 

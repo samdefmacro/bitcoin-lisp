@@ -1,6 +1,6 @@
 # Erlay / BIP330 Transaction Reconciliation — Implementation Plan
 
-Date: 2026-07-10. Status: **PLAN — not started.**
+Date: 2026-07-10. Status (2026-08-22): **P0-P4 DONE** — P0 live-loop wiring (#242/#243), P1 handshake, P2-P4 (PRs #387-#390) behind default-off `-txreconciliation`; minisketch interop with Core's C library is UNVERIFIED (no Core reference exists beyond the handshake). See §6.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev). Researched via 2 agents
 (Core Erlay/BIP330 + minisketch; our networking layer).
 

@@ -1,6 +1,6 @@
 # Real Assumeutxo — Implementation Plan
 
-Date: 2026-07-10. Status: **PLAN — not started.**
+Date: 2026-07-10. Status (2026-08-22): **P0-P6 DONE** (commits "Assumeutxo P5: background-validation completion + promotion" and "Assumeutxo P6: pruned-node snapshots, dumptxoutset rollback, cache rebalancing"; §4 marks P6 only). Open: `loadtxoutset` does not write the snapshot coins-DB best-block pointer (docs/next-wave-2026-08-22.md §2.8).
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev). Researched via 2 deep-dive agents
 (Core assumeutxo end-to-end; our chainstate/storage architecture).
 
