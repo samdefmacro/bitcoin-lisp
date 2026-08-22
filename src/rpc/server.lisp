@@ -444,11 +444,13 @@ but contributes no reply at all (:207-209)."
 (defvar *rpc-node* nil
   "The node instance for RPC handlers.")
 
-(defvar *rpc-user* nil
-  "RPC authentication username (nil = no configured user/password auth).")
-
-(defvar *rpc-password* nil
-  "RPC authentication password.")
+(defvar *rpc-credentials* '()
+  "Every credential the RPC server authorizes against, each an RPC-CREDENTIAL:
+Core's g_rpcauth (httprpc.cpp:36). The cookie-or-rpcuser pair and the -rpcauth
+entries live in this ONE list, as they do in Core — the plaintext pair is
+salted and hashed at install time (InitRPCAuthentication, httprpc.cpp:275-287)
+and the password itself is then discarded rather than held in a global for the
+node's lifetime.")
 
 (defparameter +rpc-cookie-user+ "__cookie__"
   "Username in the .cookie file (Bitcoin Core convention).")
@@ -616,15 +618,92 @@ unusable."
                   (logior accumulator (logxor (aref a i) (aref b (mod i lb))))))
           (zerop accumulator)))))
 
+(defstruct (rpc-credential
+            (:constructor %make-rpc-credential (user salt hash user-bytes salt-bytes)))
+  "One RPC credential: a username and the salted HMAC-SHA256 of its password,
+never the password. Core's g_rpcauth element (httprpc.cpp:36).
+
+USER-BYTES and SALT-BYTES are the UTF-8 encodings of USER and SALT, precomputed
+because both are fixed at startup and every authentication attempt would
+otherwise re-encode them once per credential."
+  (user nil :type string)
+  (salt nil :type string)
+  (hash nil :type string)
+  (user-bytes nil :type (vector (unsigned-byte 8)))
+  (salt-bytes nil :type (vector (unsigned-byte 8))))
+
+(defun make-rpc-credential (user salt hash)
+  "An RPC-CREDENTIAL for USER whose password hashes to HASH under SALT."
+  (%make-rpc-credential user salt hash
+                        (%credential-bytes user) (%credential-bytes salt)))
+
+(defun parse-rpcauth-entry (spec)
+  "Parse one -rpcauth SPEC of the form USER:SALT$HMAC into an RPC-CREDENTIAL, or
+NIL when malformed. Core splits SPEC on #\: demanding exactly two fields, then
+splits the second on #\$ demanding exactly two more (InitRPCAuthentication,
+httprpc.cpp:289-300) — so neither a username with a colon nor a salt with a
+dollar sign is expressible, and both are rejected rather than truncated."
+  (when (stringp spec)
+    (let ((colon (position #\: spec)))
+      (when (and colon (not (find #\: spec :start (1+ colon))))
+        (let* ((rest (subseq spec (1+ colon)))
+               (dollar (position #\$ rest)))
+          (when (and dollar (not (find #\$ rest :start (1+ dollar))))
+            (make-rpc-credential (subseq spec 0 colon)
+                                 (subseq rest 0 dollar)
+                                 (subseq rest (1+ dollar)))))))))
+
+(defun %rpcauth-hmac-hex (salt-bytes password-bytes)
+  "Lowercase hex of HMAC-SHA256 keyed by SALT-BYTES over PASSWORD-BYTES — the
+digest an offered password is reduced to before comparison (CheckUserAuthorized,
+httprpc.cpp:70-76). The salt keys the MAC as its own characters, not as the
+bytes its hex spells."
+  (bitcoin-lisp.crypto:bytes-to-hex
+   (bitcoin-lisp.crypto:hmac-sha256 salt-bytes password-bytes)))
+
+(defun %credential-authorizes-p (credential user-bytes password-bytes)
+  "T when CREDENTIAL accepts USER-BYTES/PASSWORD-BYTES. Core compares the
+username timing-resistantly and hashes the offered password with that entry's
+salt only once the username matched (CheckUserAuthorized, httprpc.cpp:63-82)."
+  (and (%timing-resistant-equal-bytes user-bytes
+                                      (rpc-credential-user-bytes credential))
+       (%timing-resistant-equal
+        (%rpcauth-hmac-hex (rpc-credential-salt-bytes credential) password-bytes)
+        (rpc-credential-hash credential))))
+
+(defparameter *rpc-loopback-subnets*
+  (list (bitcoin-lisp.networking:parse-subnet "127.0.0.0/8")
+        (bitcoin-lisp.networking:parse-subnet "::1"))
+  "The subnets the RPC ACL always contains. Core seeds rpc_allow_subnets with
+127.0.0.0/8 and ::1 before reading any -rpcallowip and offers no way to remove
+them (InitHTTPAllowList, httpserver.cpp:150-152), so they are the floor of the
+ACL rather than something a configuration step has to remember to add.")
+
+(defvar *rpc-allow-subnets* *rpc-loopback-subnets*
+  "The RPC address ACL: Core's rpc_allow_subnets (httpserver.cpp:71). The
+loopback floor is the initial value, so a request reaching the acceptor before
+-rpcallowip is installed behaves like a node configured without it — not like
+one that refuses even localhost.")
+
+(defun rpc-client-allowed-p (address)
+  "T when ADDRESS, the remote address of an HTTP request, is inside the RPC ACL
+(Core ClientAllowed, httpserver.cpp:137-146)."
+  (bitcoin-lisp.networking:address-in-subnets-p address *rpc-allow-subnets*))
+
 (defun check-auth (auth-header)
-  "T when AUTH-HEADER — the request's Authorization header, NIL when it carried
-none — is an HTTP Basic credential matching the RPC user and password. Those
-are the -rpcuser/-rpcpassword pair when configured and the generated .cookie
-pair otherwise, so every request needs a credential: Core answers 401 for an
-absent header and for a non-matching one alike (HTTPReq_JSONRPC,
-httprpc.cpp:112-133). The cookie file is the local access boundary."
+  "The username AUTH-HEADER authenticates as, or NIL. AUTH-HEADER is the
+request's Authorization header (NIL when it carried none); it authorizes when it
+is an HTTP Basic credential matching any installed RPC credential — the
+cookie-or-rpcuser pair and every -rpcauth entry alike, all of them salted
+hashes in one list, as in Core's g_rpcauth (InitRPCAuthentication,
+httprpc.cpp:275-300; CheckUserAuthorized, httprpc.cpp:63-82).
+
+Every request needs a credential: Core answers 401 for an absent header and for
+a non-matching one alike (HTTPReq_JSONRPC, httprpc.cpp:112-133). The username
+is returned rather than just T because Core threads it out of RPCAuthorized
+(httprpc.cpp:84) for -rpcwhitelist to key on."
   (and (stringp auth-header)
-       *rpc-user* *rpc-password*
+       *rpc-credentials*
        (> (length auth-header) 6)
        (string-equal (subseq auth-header 0 6) "Basic ")
        (handler-case
@@ -643,12 +722,11 @@ httprpc.cpp:112-133). The cookie file is the local access boundary."
                                          (subseq auth-header 6))))
                   (colon-pos (position (char-code #\:) decoded)))
              (when colon-pos
-               (and (%timing-resistant-equal-bytes
-                     (subseq decoded 0 colon-pos)
-                     (%credential-bytes *rpc-user*))
-                    (%timing-resistant-equal-bytes
-                     (subseq decoded (1+ colon-pos))
-                     (%credential-bytes *rpc-password*)))))
+               (let ((user (subseq decoded 0 colon-pos))
+                     (password (subseq decoded (1+ colon-pos))))
+                 (loop for credential in *rpc-credentials*
+                       when (%credential-authorizes-p credential user password)
+                         return (rpc-credential-user credential)))))
          (error () nil))))
 
 (defun rpc-json-error (http-status code message)
@@ -683,6 +761,11 @@ must stay a value test (NIL = success), not a key-presence test."
 (defun rpc-handler ()
   "Handle incoming RPC requests."
   (let ((request hunchentoot:*request*))
+    ;; The address ACL is NOT here: it gates the whole acceptor
+    ;; (acceptor-dispatch-request on rpc-acceptor), so it also covers /rest/ and
+    ;; /ui/, exactly as Core's check in http_request_cb precedes the path-handler
+    ;; lookup (httpserver.cpp:216-222 vs :235-250).
+
     ;; Reject cross-origin browser POSTs BEFORE auth (rpc-origin-allowed-p).
     (unless (rpc-origin-allowed-p (hunchentoot:header-in :origin request)
                                   (hunchentoot:header-in :host request))
@@ -797,6 +880,29 @@ must stay a value test (NIL = success), not a key-presence test."
                                                    nil :v1)
                           s)))))))
 
+(defclass rpc-acceptor (hunchentoot:easy-acceptor)
+  ()
+  (:documentation
+   "The RPC acceptor, whose only difference from EASY-ACCEPTOR is that it
+enforces the -rpcallowip address ACL for EVERY request before any routing
+happens.
+
+The gate belongs here rather than in RPC-HANDLER because this one acceptor
+serves three surfaces — the JSON-RPC \"/\" handler, the REST interface and the
+web UI — and only the first goes through RPC-HANDLER. Core is arranged the same
+way: ClientAllowed runs in http_request_cb (httpserver.cpp:216-222) ahead of the
+pathHandlers lookup (:235-250), so /rest/ (rest.cpp:1160-1164) inherits the ACL
+without doing anything itself. Putting the check in one handler would leave
+/rest/ and /ui/ reachable from any address the moment -rpcbind is honoured."))
+
+(defmethod hunchentoot:acceptor-dispatch-request ((acceptor rpc-acceptor) request)
+  (if (rpc-client-allowed-p (hunchentoot:remote-addr request))
+      (call-next-method)
+      ;; Core answers a bare 403 and reveals nothing else — not the method it
+      ;; would have refused, not whether a handler exists at this path.
+      (rpc-json-error hunchentoot:+http-forbidden+ +rpc-misc-error+
+                      "Client network is not allowed RPC access")))
+
 (defun rpc-dispatch-handler ()
   "Dispatch handler for hunchentoot. Only handles POST requests."
   (if (eq (hunchentoot:request-method*) :post)
@@ -814,47 +920,114 @@ are not loopback."
              (string= a "::1")
              (and (> (length a) 4) (string= (subseq a 0 4) "127."))))))
 
-(defun %rpc-bind-address (bind)
-  "The address the RPC acceptor may bind to. Core ignores -rpcbind unless
--rpcallowip is also given, falling back to loopback rather than letting one
-flag expose the RPC port (HTTPBindAddresses, httpserver.cpp:316-327). We have
-no -rpcallowip, so every non-loopback bind is refused the same way."
-  (if (rpc-bind-loopback-p bind)
-      bind
-      (progn
-        (bitcoin-lisp::node-log
-         :warn "-rpcbind=~A ignored: this node has no -rpcallowip, so the RPC ~
-port stays on 127.0.0.1 rather than accepting connections from anywhere"
-         (or bind "<any>"))
-        "127.0.0.1")))
+(defun %rpc-bind-address (bind allow-ip &optional bind-supplied-p)
+  "The address the RPC acceptor may bind to. Core requires -rpcbind and
+-rpcallowip to be given TOGETHER and ignores both otherwise, rather than
+letting one flag expose the RPC port; it warns about whichever one was supplied
+alone (HTTPBindAddresses, httpserver.cpp:316-327).
 
-(defun %install-rpc-credential (node user password)
-  "Install the single credential check-auth authorizes against and return T, or
-log and return NIL when there is none. Exactly one credential reaches the
-handler, as in Core's InitRPCAuthentication (httprpc.cpp:240-288): the cookie
-pair unless -rpcuser/-rpcpassword is configured.
+Core binds BOTH ::1 and 127.0.0.1 in the loopback default (httpserver.cpp:321-322)
+where we bind one address; that is why the ACL's ::1 floor cannot match on a
+default configuration here."
+  (cond ((rpc-bind-loopback-p bind)
+         ;; Core's warning here is about -rpcallowip given with no -rpcbind at
+         ;; all; an explicit -rpcbind=127.0.0.1 alongside -rpcallowip takes its
+         ;; else branch and warns about nothing. BIND-SUPPLIED-P is what keeps
+         ;; the two apart, since BIND arrives already defaulted to 127.0.0.1.
+         (when (and allow-ip (not bind-supplied-p))
+           (bitcoin-lisp::node-log
+            :warn "Option -rpcallowip was specified without -rpcbind; this ~
+doesn't usually make sense, as the RPC port stays on ~A" bind))
+         bind)
+        (allow-ip bind)
+        (t
+         (bitcoin-lisp::node-log
+          :warn "-rpcbind=~A ignored because -rpcallowip was not specified, ~
+refusing to allow everyone to connect; the RPC port stays on 127.0.0.1"
+          (or bind "<any>"))
+         "127.0.0.1")))
+
+(defun %parse-rpc-acl (allow-ip)
+  "The RPC ACL for the -rpcallowip specs in ALLOW-IP, or NIL after logging when
+one is unparseable. Core seeds the list with 127.0.0.0/8 and ::1 before
+appending any -rpcallowip, and aborts startup on the first entry it cannot
+parse (InitHTTPAllowList, httpserver.cpp:148-165) — so a successful result is
+never empty, and NIL is unambiguously the failure.
+
+Parsing is separated from installing so a later startup failure cannot leave a
+half-configured ACL behind — the same reason the credential is installed only
+after the socket is bound."
+  (let ((subnets '()))
+    (dolist (spec allow-ip)
+      (let ((subnet (bitcoin-lisp.networking:parse-subnet spec)))
+        (unless subnet
+          (bitcoin-lisp::node-log
+           :error "RPC server not started: invalid -rpcallowip subnet ~S. Valid ~
+values are a single IP (1.2.3.4), a network/netmask (1.2.3.4/255.255.255.0), a ~
+network/CIDR (1.2.3.4/24), all ipv4 (0.0.0.0/0), or all ipv6 (::/0)"
+           spec)
+          (return-from %parse-rpc-acl nil))
+        (push subnet subnets)))
+    (append *rpc-loopback-subnets* (nreverse subnets))))
+
+(defun %parse-rpcauth-credentials (rpc-auth)
+  "The RPC-CREDENTIALs for the -rpcauth specs in RPC-AUTH, or :INVALID after
+logging when one is malformed. Core logs a warning and returns false from
+InitRPCAuthentication, which fails StartHTTPRPC (httprpc.cpp:300-301,334-335)
+and aborts AppInitServers (init.cpp:756) — a bad -rpcauth stops the node on
+both sides.
+
+An empty RPC-AUTH is legitimately an empty list, hence the :INVALID sentinel
+rather than NIL. The spec is never logged: it names a user and carries the
+password's HMAC."
+  (loop for spec in rpc-auth
+        for credential = (parse-rpcauth-entry spec)
+        unless credential
+          do (bitcoin-lisp::node-log
+              :error "RPC server not started: invalid -rpcauth argument. ~
+Expected USERNAME:SALT$HMAC as produced by share/rpcauth/rpcauth.py")
+             (return :invalid)
+        collect credential))
+
+(defun hash-rpc-credential (user password)
+  "An RPC-CREDENTIAL for USER/PASSWORD under a fresh random salt. Core hashes
+every plaintext credential this way before storing it, with a random 16-byte
+hex salt, and keeps the password nowhere else (InitRPCAuthentication,
+httprpc.cpp:275-287)."
+  (let ((salt (bitcoin-lisp.crypto:bytes-to-hex (ironclad:random-data 16))))
+    (make-rpc-credential
+     user salt
+     (%rpcauth-hmac-hex (%credential-bytes salt) (%credential-bytes password)))))
+
+(defun %install-rpc-credential (node user password rpcauth-credentials)
+  "Install every credential check-auth authorizes against and return T, or log
+and return NIL when the node would have none at all. As in Core's
+InitRPCAuthentication (httprpc.cpp:275-300): the -rpcuser/-rpcpassword pair —
+or the .cookie pair when that is absent — is salted, hashed and pushed onto the
+same list the -rpcauth entries go on.
 
 Callers must have bound the listening socket first — this writes .cookie, and
 .cookie is the live credential of whatever node owns the data directory."
-  (if (and user password)
-      (progn
-        (setf *rpc-user* user *rpc-password* password *rpc-cookie-path* nil)
-        t)
-      (multiple-value-bind (path secret)
-          (let ((data-directory (and node (bitcoin-lisp::node-data-directory node))))
-            (if data-directory (generate-rpc-cookie data-directory) (values nil nil)))
-        (cond (path
-               (setf *rpc-user* +rpc-cookie-user+ *rpc-password* secret
-                     *rpc-cookie-path* path)
-               t)
-              (t
-               (bitcoin-lisp::node-log
-                :error "RPC server not started: no -rpcuser/-rpcpassword and the ~
+  (flet ((install (pair cookie-path)
+           (setf *rpc-credentials* (append pair rpcauth-credentials)
+                 *rpc-cookie-path* cookie-path)
+           t))
+    (if (and user password)
+        (install (list (hash-rpc-credential user password)) nil)
+        (multiple-value-bind (path secret)
+            (let ((data-directory (and node (bitcoin-lisp::node-data-directory node))))
+              (if data-directory (generate-rpc-cookie data-directory) (values nil nil)))
+          (cond (path
+                 (install (list (hash-rpc-credential +rpc-cookie-user+ secret)) path))
+                (t
+                 (bitcoin-lisp::node-log
+                  :error "RPC server not started: no -rpcuser/-rpcpassword and the ~
 .cookie file could not be written, so no request could be authorized")
-               nil)))))
+                 nil))))))
 
 (defun start-rpc-server (node &key port (bind "127.0.0.1")
-                                   user password
+                                   (bind-supplied-p nil)
+                                   user password rpc-auth allow-ip
                                    rest-enabled
                                    ui-enabled ui-directory)
   "Start the RPC server.
@@ -862,17 +1035,32 @@ PORT defaults to 18332 for testnet, 8332 for mainnet.
 Every request must carry a credential: the USER/PASSWORD pair when configured,
 otherwise the .cookie file generated in the node's data directory. Without
 either the server does not start, as Core aborts startup when
-InitRPCAuthentication fails (httprpc.cpp:300-302).
+InitRPCAuthentication fails (httprpc.cpp:300-302). RPC-AUTH holds -rpcauth
+specs, additional USERNAME:SALT$HMAC credentials accepted alongside that pair.
+ALLOW-IP holds -rpcallowip specs; loopback is always allowed, and a
+non-loopback BIND is honoured only when ALLOW-IP is non-empty.
 REST-ENABLED registers the Core-style /rest/ GET surface; like Core, the
 REST interface is OFF unless -rest is given (DEFAULT_REST_ENABLE = false,
 init.cpp:153,758 — previously we registered it unconditionally).
 UI-ENABLED registers the /ui/ web UI dispatcher (gui-plan P0); UI-DIRECTORY
 overrides the asset directory (default: the repo's ui/, see ui.lisp)."
-  (let ((port (or port (bitcoin-lisp:network-rpc-port bitcoin-lisp:*network*))))
+  (let ((port (or port (bitcoin-lisp:network-rpc-port bitcoin-lisp:*network*)))
+        (acl nil)
+        (rpcauth-credentials nil))
     (when *rpc-server*
       (bitcoin-lisp::node-log :warn "RPC server already running")
       (return-from start-rpc-server nil))
-    (setf bind (%rpc-bind-address bind))
+    (setf bind (%rpc-bind-address bind allow-ip bind-supplied-p))
+
+    ;; Parse the ACL and the -rpcauth credentials before anything is bound or
+    ;; written, so a malformed option is a clean refusal to start (Core
+    ;; validates -rpcallowip in InitHTTPServer and -rpcauth in
+    ;; InitRPCAuthentication, both of which abort AppInitServers).
+    (setf acl (%parse-rpc-acl allow-ip))
+    (unless acl (return-from start-rpc-server nil))
+    (setf rpcauth-credentials (%parse-rpcauth-credentials rpc-auth))
+    (when (eq rpcauth-credentials :invalid)
+      (return-from start-rpc-server nil))
 
     ;; Bind the listening socket BEFORE touching any credential, the order Core
     ;; uses: AppInitServers calls InitHTTPServer (which binds) and only then
@@ -889,17 +1077,18 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
     ;; happened here: restart-node.sh's pkill marker did not match the live
     ;; supervisor and left two processes on one data directory.)
     ;;
-    ;; Installing the credential after the bind is safe: until *rpc-user* is
-    ;; set check-auth returns NIL for every header, and the dispatchers are
-    ;; pushed last, so nothing can reach the handler at all in that window.
+    ;; Installing the credential after the bind is safe: until
+    ;; *rpc-credentials* is set check-auth returns NIL for every header, and the
+    ;; dispatchers are pushed last, so nothing can reach the handler at all in
+    ;; that window.
     (let ((acceptor nil)
           (listening nil)
           (credential-installed nil)
           (pushed '()))
       (flet ((abort-start ()
                ;; Undo only what THIS attempt did. A failure before the
-               ;; credential was installed must leave *rpc-user*, *rpc-password*
-               ;; and *rpc-cookie-path* alone: in a second process they are NIL,
+               ;; credential was installed must leave *rpc-credentials* and
+               ;; *rpc-cookie-path* alone: in a second process they are empty,
                ;; and in this one they may belong to a server already running.
                (dolist (d pushed)
                  (setf hunchentoot:*dispatch-table*
@@ -911,11 +1100,12 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
                  (handler-case (hunchentoot:stop acceptor) (error () nil)))
                (when credential-installed
                  (delete-rpc-cookie)
-                 (setf *rpc-user* nil *rpc-password* nil *rpc-cookie-path* nil))
+                 (setf *rpc-credentials* '() *rpc-cookie-path* nil
+                       *rpc-allow-subnets* *rpc-loopback-subnets*))
                nil))
         (handler-case
             (progn
-              (setf acceptor (make-instance 'hunchentoot:easy-acceptor
+              (setf acceptor (make-instance 'rpc-acceptor
                                             :port port
                                             :address bind))
               (hunchentoot:start acceptor)
@@ -923,9 +1113,11 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
 
               ;; Bound. Now install the one credential the handler authorizes
               ;; against (Core InitRPCAuthentication, httprpc.cpp:240-288).
-              (unless (%install-rpc-credential node user password)
+              (unless (%install-rpc-credential node user password
+                                               rpcauth-credentials)
                 (return-from start-rpc-server (abort-start)))
-              (setf credential-installed t)
+              (setf credential-installed t
+                    *rpc-allow-subnets* acl)
 
               ;; Register methods
               (register-all-methods)
@@ -1002,8 +1194,8 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
     (delete-rpc-cookie)
     (setf *rpc-server* nil)
     (setf *rpc-node* nil)
-    (setf *rpc-user* nil)
-    (setf *rpc-password* nil)
+    (setf *rpc-credentials* '())
+    (setf *rpc-allow-subnets* *rpc-loopback-subnets*)
     (setf *rpc-dispatcher* nil)
     (setf *rest-dispatcher* nil)
     (setf *ui-dispatcher* nil)

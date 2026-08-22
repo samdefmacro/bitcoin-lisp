@@ -1728,6 +1728,13 @@ reserved value), matching Core's `if (!witness_stack.empty())`."
 
 ;;; --- Authentication Tests (7.4) ---
 
+(defun %plaintext-credentials (user password)
+  "The *rpc-credentials* value a node configured with USER/PASSWORD installs:
+one salted-and-hashed entry, as Core's InitRPCAuthentication pushes onto
+g_rpcauth (httprpc.cpp:275-287). Tests bind this rather than a plaintext pair
+because the plaintext pair is not what the server keeps."
+  (list (bitcoin-lisp.rpc::hash-rpc-credential user password)))
+
 (test rpc-auth-check-no-credentials
   "A request carrying no Authorization header is never authorized, in every
 credential state startup can produce. Core answers 401 for an absent header
@@ -1735,17 +1742,15 @@ before looking at any configuration (HTTPReq_JSONRPC, httprpc.cpp:112-117);
 this test used to assert the opposite for the default deployment, which left
 the whole RPC surface — loaded wallet included — open to any local process."
   ;; default startup: the .cookie pair is the credential
-  (let ((bitcoin-lisp.rpc::*rpc-user* bitcoin-lisp.rpc::+rpc-cookie-user+)
-        (bitcoin-lisp.rpc::*rpc-password* "deadbeef"))
+  (let ((bitcoin-lisp.rpc::*rpc-credentials*
+          (%plaintext-credentials bitcoin-lisp.rpc::+rpc-cookie-user+ "deadbeef")))
     (is (not (bitcoin-lisp.rpc::check-auth nil)))
     (is (not (bitcoin-lisp.rpc::check-auth ""))))
   ;; -rpcuser/-rpcpassword startup
-  (let ((bitcoin-lisp.rpc::*rpc-user* "testuser")
-        (bitcoin-lisp.rpc::*rpc-password* "testpass"))
+  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
     (is (not (bitcoin-lisp.rpc::check-auth nil))))
   ;; no credential installed at all: nothing authorizes, not even an empty one
-  (let ((bitcoin-lisp.rpc::*rpc-user* nil)
-        (bitcoin-lisp.rpc::*rpc-password* nil))
+  (let ((bitcoin-lisp.rpc::*rpc-credentials* '()))
     (is (not (bitcoin-lisp.rpc::check-auth nil)))
     (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header ":"))))))
 
@@ -1753,8 +1758,7 @@ the whole RPC surface — loaded wallet included — open to any local process."
   "check-auth parses the HTTP Basic header the way Core's RPCAuthorized does
 (httprpc.cpp:84-101): \"Basic \" prefix, base64, split on the FIRST colon, so a
 password may contain colons. Anything malformed is rejected, never accepted."
-  (let ((bitcoin-lisp.rpc::*rpc-user* "testuser")
-        (bitcoin-lisp.rpc::*rpc-password* "testpass"))
+  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
     ;; base64 of "testuser:testpass"
     (is (bitcoin-lisp.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
     (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpass")))
@@ -1774,8 +1778,7 @@ password may contain colons. Anything malformed is rejected, never accepted."
     (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpassX"))))
     (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "TESTUSER:testpass")))))
   ;; the split is on the first colon, so the password keeps the rest
-  (let ((bitcoin-lisp.rpc::*rpc-user* "u")
-        (bitcoin-lisp.rpc::*rpc-password* "a:b:c"))
+  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "u" "a:b:c")))
     (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "u:a:b:c")))))
 
 (test rpc-timing-resistant-equal
@@ -1789,6 +1792,187 @@ constant-time but wrong would hand out access."
         (is (eq (and (string= a b) t)
                 (and (bitcoin-lisp.rpc::%timing-resistant-equal a b) t))
             "~S vs ~S" a b)))))
+
+;;; --- -rpcauth / -rpcallowip (7.4b) ---
+
+(test rpc-auth-rpcauth-parsing
+  "-rpcauth is USERNAME:SALT$HMAC and nothing else. Core splits on #\\: demanding
+exactly two fields and splits the second on #\\$ demanding exactly two more
+(InitRPCAuthentication, httprpc.cpp:289-300), so a spec with an extra separator
+is rejected rather than silently truncated into a credential nobody can use."
+  (flet ((fields (spec)
+           (let ((c (bitcoin-lisp.rpc::parse-rpcauth-entry spec)))
+             (and c (list (bitcoin-lisp.rpc::rpc-credential-user c)
+                          (bitcoin-lisp.rpc::rpc-credential-salt c)
+                          (bitcoin-lisp.rpc::rpc-credential-hash c))))))
+    (is (equal '("alice" "deadbeef" "cafe") (fields "alice:deadbeef$cafe")))
+    ;; an empty user, salt or hash is still well-formed to Core's splitter
+    (is (equal '("" "s" "h") (fields ":s$h"))))
+  (dolist (bad '("alice:nohash" "alice" "" "a:b:c$d" "alice:a$b$c" "alice$s:h"))
+    (is (not (bitcoin-lisp.rpc::parse-rpcauth-entry bad)) "accepted ~S" bad))
+  (is (not (bitcoin-lisp.rpc::parse-rpcauth-entry nil))))
+
+(test rpc-auth-rpcauth-hmac-vector
+  "The digest matches share/rpcauth/rpcauth.py, which is what generates the
+config line: HMAC-SHA256 keyed by the salt's own CHARACTERS (not its hex value)
+over the UTF-8 password, lowercase hex (rpcauth.py:20-22). Keying the decoded
+salt instead would produce a hash no operator-generated line ever matches."
+  (flet ((hmac (salt password)
+           (bitcoin-lisp.rpc::%rpcauth-hmac-hex (bitcoin-lisp.rpc::%credential-bytes salt)
+                                (bitcoin-lisp.rpc::%credential-bytes password))))
+    (is (string= "5d253745d78b945827c12a708d3267f495f3eabb5a3f755f5ccd8c5831f350e7"
+                 (hmac "a1b2c3d4" "swordfish")))
+    ;; non-ASCII password: UTF-8, the encoding %credential-bytes fixed for the
+    ;; single -rpcpassword pair
+    (is (string= "64fcc7fa10ddc69293b2a0814beb51b8cd3b48cea70ad3b49c2f36f13d66237f"
+                 (hmac "a1b2c3d4" (coerce '(#\p #\LATIN_SMALL_LETTER_A_WITH_DIAERESIS
+                                            #\s #\s #\w
+                                            #\LATIN_SMALL_LETTER_O_WITH_DIAERESIS
+                                            #\r #\d)
+                                          'string))))))
+
+(test rpc-auth-rpcauth-authorizes
+  "A -rpcauth credential authorizes a request, and only the right one does.
+Core checks the single -rpcuser/cookie pair first and falls through to the
+g_rpcauth set (RPCAuthorized, httprpc.cpp:84-102), so both must work — and
+must keep working when the other is absent."
+  (let ((entry (bitcoin-lisp.rpc::make-rpc-credential
+                "alice" "a1b2c3d4"
+                "5d253745d78b945827c12a708d3267f495f3eabb5a3f755f5ccd8c5831f350e7")))
+    ;; alongside the cookie pair
+    (let ((bitcoin-lisp.rpc::*rpc-credentials*
+            (append (%plaintext-credentials bitcoin-lisp.rpc::+rpc-cookie-user+ "deadbeef")
+                    (list entry))))
+      (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:swordfish")))
+      (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "__cookie__:deadbeef")))
+      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:swordfisH"))))
+      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "Alice:swordfish"))))
+      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:")))))
+    ;; -rpcauth as the ONLY credential: Core allows -rpcauth without -rpcuser
+    (let ((bitcoin-lisp.rpc::*rpc-credentials* (list entry)))
+      (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:swordfish")))
+      (is (not (bitcoin-lisp.rpc::check-auth nil)))
+      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:wrong")))))
+    ;; and no entries means no fallback path opens up
+    (let ((bitcoin-lisp.rpc::*rpc-credentials* '()))
+      (is (not (bitcoin-lisp.rpc::check-auth (%basic-auth-header "alice:swordfish")))))))
+
+(test rpc-allowip-acl-matching
+  "The RPC ACL matches the way Core's CSubNet does: only within the same
+network, bytewise under the netmask (netaddress.cpp CSubNet::Match), over a list
+that always starts with 127.0.0.0/8 and ::1 (InitHTTPAllowList,
+httpserver.cpp:148-165)."
+  (flet ((acl (&rest specs)
+           (let ((subnets (bitcoin-lisp.rpc::%parse-rpc-acl specs)))
+             (is-true subnets "rejected ~S" specs)
+             subnets)))
+    ;; loopback is allowed with no -rpcallowip at all, and nothing else is
+    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl)))
+      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "127.0.0.1"))
+      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "127.9.9.9"))
+      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "::1"))
+      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "192.168.1.5")))
+      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "::2")))
+      ;; an address we cannot parse is refused, never defaulted in
+      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "example.com")))
+      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "")))
+      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p nil))))
+    ;; CIDR, dotted-quad netmask and a bare address are the three accepted forms
+    (dolist (spec '("192.168.1.0/24" "192.168.1.0/255.255.255.0" "192.168.1.77/24"))
+      (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl spec)))
+        (is (bitcoin-lisp.rpc::rpc-client-allowed-p "192.168.1.5") "~A" spec)
+        (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "192.168.2.5")) "~A" spec)
+        (is (bitcoin-lisp.rpc::rpc-client-allowed-p "127.0.0.1") "~A" spec)))
+    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl "10.0.0.7")))
+      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "10.0.0.7"))
+      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "10.0.0.8"))))
+    ;; the two wildcards are per-network, which is the whole point of Core
+    ;; comparing m_net before the netmask: 0.0.0.0/0 does not open IPv6
+    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl "0.0.0.0/0")))
+      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "8.8.8.8"))
+      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "2001:db8::1"))))
+    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl "::/0")))
+      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "2001:db8::1"))
+      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "8.8.8.8"))))
+    (let ((bitcoin-lisp.rpc::*rpc-allow-subnets* (acl "2001:db8::/32")))
+      (is (bitcoin-lisp.rpc::rpc-client-allowed-p "2001:db8:1::9"))
+      (is (not (bitcoin-lisp.rpc::rpc-client-allowed-p "2001:dead::9"))))))
+
+(test rpc-allowip-rejects-bad-specs
+  "An unparseable -rpcallowip stops the RPC server rather than being dropped:
+Core returns false from InitHTTPAllowList, which fails InitHTTPServer and aborts
+startup (httpserver.cpp:155-160). Dropping it would leave an operator believing
+a subnet is allowed when it is not."
+  (dolist (bad '("1.2.3.4/33" "::1/129" "example.com" "1.2.3.4/abc" "1.2.3.4/"
+                 "" "1.2.3.4/255.255.255.0/8" "::1/255.255.255.0"))
+    (is (not (bitcoin-lisp.networking:parse-subnet bad)) "accepted ~S" bad)
+    (is-false (bitcoin-lisp.rpc::%parse-rpc-acl (list bad)) "%parse-rpc-acl accepted ~S" bad))
+  ;; a good list still parses, on top of the loopback floor
+  (is-true (bitcoin-lisp.rpc::%parse-rpc-acl '("10.0.0.0/8" "::/0"))))
+
+(test rpc-acl-gates-every-surface-not-just-jsonrpc
+  "The ACL runs in the ACCEPTOR, so it covers /rest/ and /ui/ as well as \"/\".
+Core checks ClientAllowed in http_request_cb (httpserver.cpp:216-222) BEFORE the
+pathHandlers lookup (:235-250), which is why /rest/ (rest.cpp:1160-1164) needs
+no check of its own.
+
+This is the test that would have caught the ACL living inside rpc-handler: with
+it there, a blocked client got 403 on \"/\" while GET /rest/mempool/contents.json
+and the whole /ui/ SPA answered normally — and -rpcbind is what makes a remote
+client reach them at all."
+  (let ((acceptor (make-instance 'bitcoin-lisp.rpc::rpc-acceptor :port 0))
+        (bitcoin-lisp.rpc::*rpc-allow-subnets*
+          (bitcoin-lisp.rpc::%parse-rpc-acl '("10.0.0.0/8"))))
+    (flet ((acl-refusal-p (body)
+             ;; A helper, not an inline (and (stringp body) (search ...)): the
+             ;; `is` macro evaluates the argument forms of a compound predicate
+             ;; eagerly, so the stringp guard would not protect the search.
+             (and (stringp body)
+                  (search "not allowed RPC access" body)
+                  t))
+           (dispatch (uri remote-addr)
+             (let* ((hunchentoot:*acceptor* nil)
+                    (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
+                    (request (make-instance 'hunchentoot:request
+                                            :acceptor nil
+                                            :headers-in (list (cons :host "127.0.0.1:18332"))
+                                            :method :get
+                                            :uri uri
+                                            :remote-addr remote-addr
+                                            :server-protocol :http/1.1
+                                            :content-stream nil))
+                    (hunchentoot:*request* request))
+               (setf (hunchentoot:return-code*) hunchentoot:+http-ok+)
+               (let ((body (handler-case
+                               (hunchentoot:acceptor-dispatch-request acceptor request)
+                             ;; hunchentoot signals its own 404 when no
+                             ;; dispatcher matches; that is "got past the ACL".
+                             (error () :past-the-acl))))
+                 (values (hunchentoot:return-code*) body)))))
+      (dolist (uri '("/" "/rest/mempool/contents.json" "/rest/chaininfo.json" "/ui/"))
+        ;; outside the ACL: 403 on every surface, and the body says only that
+        (dolist (blocked '("198.51.100.5" "2001:db8::1"))
+          (multiple-value-bind (status body) (dispatch uri blocked)
+            (is-true (eql hunchentoot:+http-forbidden+ status)
+                     "~A from ~A must be refused by the ACL, got ~S" uri blocked status)
+            (is-true (acl-refusal-p body)
+                     "~A from ~A leaked a non-ACL response: ~S" uri blocked body)))
+        ;; inside the ACL — the -rpcallowip entry and the loopback floor alike —
+        ;; the request reaches routing, whatever routing then says
+        (dolist (allowed '("10.1.2.3" "127.0.0.2"))
+          (multiple-value-bind (status body) (dispatch uri allowed)
+            (declare (ignore status))
+            (is-false (acl-refusal-p body)
+                      "~A from ~A was refused by the ACL and should not have been"
+                      uri allowed))))
+      ;; 127.0.0.2 above is admitted by the floor, not by 10.0.0.0/8 — so it
+      ;; must still get through with no -rpcallowip configured at all
+      (let ((bitcoin-lisp.rpc::*rpc-allow-subnets*
+              (bitcoin-lisp.rpc::%parse-rpc-acl '())))
+        (multiple-value-bind (status body) (dispatch "/rest/chaininfo.json" "127.0.0.2")
+          (declare (ignore status))
+          (is-false (acl-refusal-p body)
+                    "loopback must reach routing with no -rpcallowip at all"))))))
 
 ;;; --- Concurrent Access Tests (2.7) ---
 
@@ -2913,7 +3097,8 @@ this test used to do — describes no reachable configuration."
              ;; (a) no rpcuser/rpcpassword: the cookie is the credential
              (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port 19994))))
              (is (string= bitcoin-lisp.rpc::+rpc-cookie-user+
-                          bitcoin-lisp.rpc::*rpc-user*))
+                          (bitcoin-lisp.rpc::rpc-credential-user
+                           (first bitcoin-lisp.rpc::*rpc-credentials*))))
              (let ((cookie (alexandria:read-file-into-string cookie-file)))
                (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header cookie)))
                (is (not (bitcoin-lisp.rpc::check-auth
@@ -3053,8 +3238,7 @@ gets 401 from a node that is perfectly fine, and nothing logs anything."
              ;; the healthy node: bound, cookie written, credential live
              (is (not (null (bitcoin-lisp.rpc:start-rpc-server node :port port))))
              (let ((live-cookie (alexandria:read-file-into-string cookie-file))
-                   (live-user bitcoin-lisp.rpc::*rpc-user*)
-                   (live-pass bitcoin-lisp.rpc::*rpc-password*)
+                   (live-credentials bitcoin-lisp.rpc::*rpc-credentials*)
                    (live-dispatch hunchentoot:*dispatch-table*))
                (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
                ;; the second process: same data directory, same port. The
@@ -3068,8 +3252,8 @@ gets 401 from a node that is perfectly fine, and nothing logs anything."
                                    (alexandria:read-file-into-string cookie-file))))
                  (is (equal live-cookie on-disk)
                      "the failed start rewrote or removed .cookie under a live node")
-                 (is (equal live-user bitcoin-lisp.rpc::*rpc-user*))
-                 (is (equal live-pass bitcoin-lisp.rpc::*rpc-password*))
+                 (is (eq live-credentials bitcoin-lisp.rpc::*rpc-credentials*)
+                     "the failed start replaced the live node's credentials")
                  (is (eq live-dispatch hunchentoot:*dispatch-table*)
                      "the failed start leaked a dispatcher into hunchentoot:*dispatch-table*")
                  (is (bitcoin-lisp.rpc::check-auth (%basic-auth-header live-cookie)))
@@ -3157,17 +3341,24 @@ bind before giving up.)"
       (bitcoin-lisp.rpc:stop-rpc-server))))
 
 (test rpc-bind-non-loopback-refused
-  "-rpcbind to a non-loopback address falls back to loopback. Core ignores
--rpcbind unless -rpcallowip is also given (HTTPBindAddresses,
-httpserver.cpp:316-327); we have no -rpcallowip, so a single flag would
-otherwise put the whole RPC surface on the public internet."
+  "-rpcbind is honoured only together with -rpcallowip; either flag alone falls
+back to loopback (HTTPBindAddresses, httpserver.cpp:316-327). Without that gate
+a single -rpcbind would put the whole RPC surface on the public internet."
+  ;; loopback binds are kept whatever -rpcallowip says
   (dolist (loopback '("127.0.0.1" "127.0.0.2" "::1" "[::1]" "localhost"))
-    (is (string= loopback (bitcoin-lisp.rpc::%rpc-bind-address loopback))
-        "~S is loopback and must be kept" loopback))
+    (dolist (allow-ip '(nil ("10.0.0.0/8")))
+      (is (string= loopback (bitcoin-lisp.rpc::%rpc-bind-address loopback allow-ip))
+          "~S is loopback and must be kept (allow-ip ~S)" loopback allow-ip)))
+  ;; a non-loopback bind with no -rpcallowip falls back
   (dolist (exposed '("0.0.0.0" "" "192.168.1.5" "::" "1.2.3.4" "127acme.example"))
-    (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address exposed))
+    (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address exposed nil))
         "~S is not loopback and must fall back" exposed))
-  (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address nil))))
+  (is (string= "127.0.0.1" (bitcoin-lisp.rpc::%rpc-bind-address nil nil)))
+  ;; with -rpcallowip the operator's address is used as given
+  (is (string= "10.0.0.5"
+               (bitcoin-lisp.rpc::%rpc-bind-address "10.0.0.5" '("10.0.0.0/8"))))
+  (is (string= "0.0.0.0"
+               (bitcoin-lisp.rpc::%rpc-bind-address "0.0.0.0" '("0.0.0.0/0")))))
 
 ;;;; tx JSON field completeness (T3c)
 
@@ -4596,19 +4787,19 @@ carry result+error and no \"jsonrpc\"."
 ;;;; Authentication is mandatory and is checked BEFORE the body is parsed or
 ;;;; dispatched (Core HTTPReq_JSONRPC, httprpc.cpp:112-133), so these requests
 ;;;; carry a real HTTP Basic credential, exactly as bitcoin-cli does: the
-;;;; helpers bind *rpc-user*/*rpc-password* for the duration of the call and
+;;;; helpers bind *rpc-credentials* for the duration of the call and
 ;;;; send the matching header. None of the shapes below can be reached without
 ;;;; one — see the 401 assertion in the pre-dispatch test, which is what fails
 ;;;; if that credential ever stops being load-bearing.
 ;;;; ---------------------------------------------------------------------
 
 (defparameter *jsonrpc-handler-rpc-user* "ga8shapeuser"
-  "The RPC user the handler tests authorize as (bound over *rpc-user* for the
+  "The RPC user the handler tests authorize as (installed into *rpc-credentials* for the
 duration of one jsonrpc-handler-reply call).")
 
 (defparameter *jsonrpc-handler-rpc-password* "ga8shapepass"
   "The RPC password the handler tests authorize with (bound over
-*rpc-password* for the duration of one jsonrpc-handler-reply call).")
+*rpc-credentials* for the duration of one jsonrpc-handler-reply call).")
 
 (defun jsonrpc-handler-credential ()
   "The \"user:pass\" credential the handler tests send as HTTP Basic."
@@ -4695,8 +4886,9 @@ the client presents (see jsonrpc-handler-request). RATE-LIMITER, when given as
          (request-args (loop for (k v) on request-args by #'cddr
                              unless (eq k :rate-limiter)
                                append (list k v)))
-         (bitcoin-lisp.rpc::*rpc-user* *jsonrpc-handler-rpc-user*)
-         (bitcoin-lisp.rpc::*rpc-password* *jsonrpc-handler-rpc-password*)
+         (bitcoin-lisp.rpc::*rpc-credentials*
+           (%plaintext-credentials *jsonrpc-handler-rpc-user*
+                                   *jsonrpc-handler-rpc-password*))
          (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
          (hunchentoot:*request* (apply #'jsonrpc-handler-request body request-args))
          (bitcoin-lisp.rpc::*rpc-node* nil)
@@ -4949,8 +5141,7 @@ external format is latin-1, while the configured password came from a config
 file read as UTF-8. For any non-ASCII byte the two disagree, so a correct
 non-ASCII -rpcpassword produced 401 forever, with nothing in the log to say the
 credential had been mangled rather than mistyped."
-  (let ((bitcoin-lisp.rpc::*rpc-user* "üser")
-        (bitcoin-lisp.rpc::*rpc-password* "pässwörd"))
+  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "üser" "pässwörd")))
     (is-true (bitcoin-lisp.rpc::check-auth
               (%basic-auth-header-utf8 "üser:pässwörd"))
              "a UTF-8 credential that matches the configuration was refused")
@@ -4965,11 +5156,10 @@ credential had been mangled rather than mistyped."
 (test ascii-credentials-are-unchanged-by-the-byte-comparison
   "The byte comparison must be a strict generalization: every ASCII case that
 worked before still works, and every near miss is still refused."
-  (let ((bitcoin-lisp.rpc::*rpc-user* "testuser")
-        (bitcoin-lisp.rpc::*rpc-password* "testpass"))
+  (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "testpass")))
     (is-true (bitcoin-lisp.rpc::check-auth "Basic dGVzdHVzZXI6dGVzdHBhc3M="))
     ;; A password containing colons still splits on the FIRST colon.
-    (let ((bitcoin-lisp.rpc::*rpc-password* "a:b:c"))
+    (let ((bitcoin-lisp.rpc::*rpc-credentials* (%plaintext-credentials "testuser" "a:b:c")))
       (is-true (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:a:b:c"))))
     (is-false (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuser:testpas")))
     (is-false (bitcoin-lisp.rpc::check-auth (%basic-auth-header "testuse:testpass")))

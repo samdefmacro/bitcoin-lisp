@@ -192,11 +192,8 @@ line ending inside a key) — Core's empty-map error convention."
 (defun compute-safecookie-response (key-string cookie client-nonce server-nonce)
   "HMAC-SHA256 with KEY-STRING (one of the two Tor SAFECOOKIE key strings)
 over COOKIE || CLIENT-NONCE || SERVER-NONCE (Core ComputeResponse)."
-  (let ((mac (ironclad:make-hmac (%string-bytes key-string) :sha256)))
-    (ironclad:update-hmac mac (coerce cookie '(simple-array (unsigned-byte 8) (*))))
-    (ironclad:update-hmac mac (coerce client-nonce '(simple-array (unsigned-byte 8) (*))))
-    (ironclad:update-hmac mac (coerce server-nonce '(simple-array (unsigned-byte 8) (*))))
-    (ironclad:hmac-digest mac)))
+  (bitcoin-lisp.crypto:hmac-sha256 (%string-bytes key-string)
+                                   cookie client-nonce server-nonce))
 
 ;;;; Controller state
 
