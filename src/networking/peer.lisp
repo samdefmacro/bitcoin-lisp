@@ -1079,17 +1079,42 @@ tx relay on those)."
       (send-message peer (bitcoin-lisp.serialization:make-sendaddrv2-message))
       t)))
 
-(defun %receive-and-store-version (peer &key (timeout 30))
+(defconstant +min-peer-proto-version+ 31800
+  "Core MIN_PEER_PROTO_VERSION (protocol_version.h:18): a peer announcing an
+older protocol is disconnected at VERSION (net_processing.cpp:3623-3627).")
+
+(defun desirable-service-flags (services near-tip)
+  "Core GetDesirableServiceFlags (net_processing.cpp:1759-1768): the services
+an automatic outbound peer must offer — NODE_NETWORK|NODE_WITNESS, or
+NODE_NETWORK_LIMITED|NODE_WITNESS from a limited peer once we are NEAR-TIP
+(Core: best-block depth under NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS)."
+  (if (and near-tip
+           (logtest services bitcoin-lisp.serialization:+node-network-limited+))
+      (logior bitcoin-lisp.serialization:+node-network-limited+
+              bitcoin-lisp.serialization:+node-witness+)
+      (logior bitcoin-lisp.serialization:+node-network+
+              bitcoin-lisp.serialization:+node-witness+)))
+
+(defun has-all-desirable-service-flags-p (services near-tip)
+  "Core HasAllDesirableServiceFlags (net_processing.cpp:1753-1756)."
+  (zerop (logandc2 (desirable-service-flags services near-tip) services)))
+
+(defun %receive-and-store-version (peer &key (timeout 30) near-tip)
   "Receive the peer's version message and record its services/height/user-agent.
-Returns T on success, NIL if the first message wasn't a version."
+Returns T on success, NIL if the first message wasn't a version — or if Core
+would disconnect on it: an automatic outbound peer lacking the desirable
+services (net_processing.cpp:3611-3619), or any peer announcing a protocol
+older than +min-peer-proto-version+ (:3623-3627). NEAR-TIP widens the
+desirable set to limited peers, as in Core."
   (multiple-value-bind (command payload)
       (receive-message-blocking peer :timeout timeout)
     (when (and command (string= command "version"))
       (flexi-streams:with-input-from-sequence (stream payload)
-        (let ((version-msg (bitcoin-lisp.serialization:read-version-message stream)))
+        (let* ((version-msg (bitcoin-lisp.serialization:read-version-message stream))
+               (services (bitcoin-lisp.serialization:version-message-services version-msg))
+               (proto (bitcoin-lisp.serialization:version-message-version version-msg)))
           (setf (peer-version peer) version-msg
-                (peer-services peer)
-                (bitcoin-lisp.serialization:version-message-services version-msg)
+                (peer-services peer) services
                 (peer-start-height peer)
                 (bitcoin-lisp.serialization:version-message-start-height version-msg)
                 (peer-user-agent peer)
@@ -1099,8 +1124,22 @@ Returns T on success, NIL if the first message wasn't a version."
                 ;; "timeoffset".
                 (peer-time-offset peer)
                 (- (bitcoin-lisp.serialization::version-message-timestamp version-msg)
-                   (bitcoin-lisp.serialization:get-unix-time)))))
-      t)))
+                   (bitcoin-lisp.serialization:get-unix-time)))
+          ;; Core's two VERSION-time disconnects (net_processing.cpp:3611-3627).
+          ;; The services gate applies to automatic outbounds only — Core
+          ;; CNode::ExpectServicesFromConn, which peer-outbound-or-block-relay-p
+          ;; already spells out (manual and feeler peers exempt).
+          (cond ((and (peer-outbound-or-block-relay-p peer)
+                      (not (has-all-desirable-service-flags-p services near-tip)))
+                 (bitcoin-lisp:log-info
+                  "Peer ~A does not offer the expected services (~8,'0x offered, ~8,'0x expected), disconnecting"
+                  (peer-address peer) services (desirable-service-flags services near-tip))
+                 nil)
+                ((< proto +min-peer-proto-version+)
+                 (bitcoin-lisp:log-info "Peer ~A using obsolete version ~D, disconnecting"
+                                        (peer-address peer) proto)
+                 nil)
+                (t t)))))))
 
 (defun %await-verack (peer &key (timeout 30))
   "Read messages until VERACK arrives (tolerating interleaved wtxidrelay/
@@ -1168,7 +1207,8 @@ version handshake may proceed (over whichever transport), NIL to give up."
       (t nil))))
 
 (defun perform-handshake (peer &key (try-v2 (v2-available-p))
-                                    (conn-type :outbound-full-relay))
+                                    (conn-type :outbound-full-relay)
+                                    near-tip)
   "Outbound version handshake (we initiate): send version+caps, receive the
 peer's version, send verack, await theirs. CONN-TYPE sets the peer's connection
 type (:outbound-full-relay, :block-relay, or :feeler) before the version is
@@ -1188,7 +1228,7 @@ turns out not to speak it. Returns T on success."
        (and (or (not try-v2)
                 (%v2-try-outbound peer))
             (%send-version-and-capabilities peer)
-            (%receive-and-store-version peer)
+            (%receive-and-store-version peer :near-tip near-tip)
             ;; BIP330 offer goes after their VERSION (it is gated on their fRelay)
             ;; and before our VERACK (Core net_processing.cpp:3728-3744).
             (%maybe-send-sendtxrcncl peer)

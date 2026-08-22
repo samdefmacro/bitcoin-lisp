@@ -2025,6 +2025,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (console-log t)
                         (max-peers 8)
                         (max-connections 125)
+                        (accept-stale-fee-estimates nil)
                         (sync t)
                         (txindex nil)
                         (blockfilterindex nil)
@@ -2165,6 +2166,12 @@ Returns the node instance."
   ;; Core -maxconnections is the automatic TOTAL (net.h:81); MAX-PEERS stays
   ;; the outbound full-relay count and the remainder is inbound capacity.
   (setf *max-inbound-connections* (automatic-inbound-capacity max-connections max-peers))
+  ;; Core -acceptstalefeeestimates is regtest-only (init.cpp:1654-1656).
+  (when accept-stale-fee-estimates
+    (unless (eq network :regtest)
+      (error "acceptstalefeeestimates is not supported on ~A chain."
+             (string-downcase (symbol-name network))))
+    (setf bitcoin-lisp.mempool:*accept-stale-fee-estimates* t))
   ;; -blocksonly: reject transactions from network peers (Core
   ;; ignore_incoming_txs). Always assigned so a fresh start-node never
   ;; inherits a stale value from a previous run.
@@ -2213,7 +2220,7 @@ Returns the node instance."
   ;; Transitional; see *FLAT-BLOCK-FILES*. Set before the block store is
   ;; opened, since the store decides then whether to create an xor.dat.
   (setf bitcoin-lisp.storage:*flat-block-files* (and flat-block-files t))
-  (log-info "Bitcoin-Lisp Node v0.1.0")
+  (log-info "Bitcoin-Lisp Node v~A" (bitcoin-lisp.serialization:client-version-string))
   (log-info "Network: ~A" network)
   (log-info "Data directory: ~A" (node-data-directory *node*))
 
@@ -4372,7 +4379,7 @@ Returns the number of peers connected."
                   (setf (bitcoin-lisp.networking:peer-address peer) addr)
                   (log-info "Connected to ~A" addr)
                   ;; Perform handshake
-                  (when (bitcoin-lisp.networking:perform-handshake peer)
+                  (when (bitcoin-lisp.networking:perform-handshake peer :near-tip (bitcoin-lisp.networking:near-tip-p (node-chain-state node)))
                     (log-info "Handshake complete with ~A (~A, height ~D)"
                               addr
                               (bitcoin-lisp.networking:peer-user-agent peer)
@@ -4598,7 +4605,7 @@ Returns the number of new peers connected."
                                (bitcoin-lisp.networking:connect-peer addr dial-port))))
                   (when peer
                     (setf (bitcoin-lisp.networking:peer-address peer) addr)
-                    (when (bitcoin-lisp.networking:perform-handshake peer)
+                    (when (bitcoin-lisp.networking:perform-handshake peer :near-tip (bitcoin-lisp.networking:near-tip-p (node-chain-state node)))
                       (log-info "Replacement peer connected: ~A" addr)
                       ;; Send feature negotiation messages
                       (bitcoin-lisp.networking:send-post-handshake-messages peer)
@@ -4651,10 +4658,14 @@ bare IPv6 address (which contains colons) is treated as host-only."
                :key #'bitcoin-lisp.networking:peer-address :test #'string=)
          t)))
 
-(defun establish-outbound-peer (node host port &key (conn-type :outbound-full-relay))
+(defun establish-outbound-peer (node host port &key (conn-type :outbound-full-relay) manual)
   "Full outbound connect + handshake to HOST:PORT, pushing the ready peer onto
 node-peers. CONN-TYPE (:outbound-full-relay or :block-relay) sets the peer's
-connection type. Returns the peer or NIL. MUST run on the sync thread so
+connection type; MANUAL tags an operator-pinned (-addnode / addnode onetry)
+peer, Core's ConnectionType::MANUAL — set BEFORE the handshake, because the
+VERSION-time services gate exempts manual peers (Core ExpectServicesFromConn)
+and connect-added-nodes redials a missing added node every ~30 s, so gating one
+would loop forever. Returns the peer or NIL. MUST run on the sync thread so
 node-peers stays single-writer. No-op when networking is disabled."
   (when (node-network-active node)
     (handler-case
@@ -4662,7 +4673,9 @@ node-peers stays single-writer. No-op when networking is disabled."
                            (bitcoin-lisp.networking:connect-peer host port))))
           (when peer
             (setf (bitcoin-lisp.networking:peer-address peer) host)
-            (if (bitcoin-lisp.networking:perform-handshake peer :conn-type conn-type)
+            (when manual (setf (bitcoin-lisp.networking:peer-manual peer) t))
+            (if (bitcoin-lisp.networking:perform-handshake peer :conn-type conn-type
+                                                        :near-tip (bitcoin-lisp.networking:near-tip-p (node-chain-state node)))
                 (progn
                   (bitcoin-lisp.networking:send-post-handshake-messages peer)
                   (bitcoin-lisp.networking:send-compact-block-negotiation peer)
@@ -4675,17 +4688,6 @@ node-peers stays single-writer. No-op when networking is disabled."
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
 
-(defun %mark-manual-peer (peer)
-  "Tag PEER as operator-pinned (-addnode / addnode onetry), i.e. Core's
-ConnectionType::MANUAL. Manual peers are exempt from every AUTOMATIC eviction:
-without this they are indistinguishable from ordinary :outbound-full-relay
-peers, and connect-added-nodes redials them on each ~30s maintenance tick, so
-any automatic disconnect would loop forever against a peer the operator chose.
-Returns PEER (NIL passes through when the dial failed)."
-  (when peer
-    (setf (bitcoin-lisp.networking:peer-manual peer) t))
-  peer)
-
 (defun connect-added-nodes (node)
   "Service addnode requests on the sync thread: drain one-shot \"onetry\" dials,
 then keep every \"add\" peer connected. Honors network-active."
@@ -4697,12 +4699,12 @@ then keep every \"add\" peer connected. Honors network-active."
       (dolist (spec onetry)
         (multiple-value-bind (host port) (parse-node-endpoint node spec)
           (unless (peer-connected-to-host-p node host)
-            (%mark-manual-peer (establish-outbound-peer node host port))))))
+            (establish-outbound-peer node host port :manual t)))))
     ;; Maintain persistent added-node connections.
     (dolist (spec (node-added-nodes node))
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
         (unless (peer-connected-to-host-p node host)
-          (%mark-manual-peer (establish-outbound-peer node host port)))))))
+          (establish-outbound-peer node host port :manual t))))))
 
 (defconstant +target-block-relay-peers+ 2
   "Dedicated block-relay-only outbound slots (Bitcoin Core opens 2). They carry

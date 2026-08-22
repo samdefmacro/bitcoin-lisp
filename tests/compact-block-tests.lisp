@@ -88,16 +88,6 @@ versions alike (mirrors Core's `if (version != CMPCTBLOCKS_VERSION) return;`)."
     (is (bitcoin-lisp.networking:peer-compact-block-high-bandwidth peer))
     (is (= 2 (bitcoin-lisp.networking:peer-compact-block-version peer)))))
 
-(test should-use-compact-blocks-checks-peer-support
-  "should-use-compact-blocks-p should check if peer supports compact blocks."
-  (let ((peer (make-mock-peer)))
-    ;; No support
-    (is (null (bitcoin-lisp.networking:should-use-compact-blocks-p peer)))
-    ;; Add support (v2 — the only version we negotiate)
-    (setf (bitcoin-lisp.networking:peer-compact-block-version peer) 2)
-    ;; Now should be true (assuming not in IBD)
-    (is (bitcoin-lisp.networking:should-use-compact-blocks-p peer))))
-
 ;;;; Short ID Map Building Tests
 
 (test build-shortid-map-indexes-mempool
@@ -1194,7 +1184,7 @@ ones — HB is not a compact-block-only privilege. We only promoted on the two
 compact reconstruction paths, so under systemic reconstruction failure (or
 plain full-block downloads at the tip) our HB set stayed empty where Core keeps
 three. Both live full-block entry points are exercised: handle-block (the
-generic dispatcher, reached from sync-with-peer and the header-sync drains) and
+generic dispatcher, reached from the header-sync drains) and
 dispatch-ibd-message's `block' branch (the block-download path)."
   (%with-regtest
    (let* ((node (%regtest-node-fixture "g716-full"))

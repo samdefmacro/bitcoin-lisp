@@ -389,7 +389,26 @@ chunk feerate diagram, not boundary knapsack optimality."
           (is (= 0 (cdr (assoc "blocks" r :test #'string=))))
           (is (string= "regtest" (cdr (assoc "chain" r :test #'string=))))
           (is (= 0 (cdr (assoc "pooledtx" r :test #'string=))))
-          (is (stringp (cdr (assoc "bits" r :test #'string=)))))))))
+          (is (stringp (cdr (assoc "bits" r :test #'string=))))
+          ;; Core rpc/mining.cpp:429-491: networkhashps, blockmintxfee and the
+          ;; "next" block's height/bits/difficulty/target.
+          (is (numberp (cdr (assoc "networkhashps" r :test #'string=))))
+          (is (numberp (cdr (assoc "blockmintxfee" r :test #'string=))))
+          (let ((next (cdr (assoc "next" r :test #'string=))))
+            (is (= 1 (cdr (assoc "height" next :test #'string=))))
+            (is (stringp (cdr (assoc "bits" next :test #'string=))))
+            (is (stringp (cdr (assoc "target" next :test #'string=))))))
+        ;; getdeploymentinfo's optional blockhash (rpc/blockchain.cpp:1494):
+        ;; report at that block (here the genesis tip); an unknown hash is
+        ;; RPC_INVALID_ADDRESS_OR_KEY.
+        (let* ((tip-hex (bitcoin-lisp.rpc::hash-to-hex
+                         (bitcoin-lisp.storage:best-block-hash cs)))
+               (d (bitcoin-lisp.rpc::rpc-getdeploymentinfo node (list tip-hex))))
+          (is (string= tip-hex (cdr (assoc "hash" d :test #'string=))))
+          (is (= 0 (cdr (assoc "height" d :test #'string=)))))
+        (signals bitcoin-lisp.rpc::rpc-error
+          (bitcoin-lisp.rpc::rpc-getdeploymentinfo
+           node (list (make-string 64 :initial-element #\f))))))))
 
 ;;;; Block construction + CPU mining + submitblock (regtest, disk-backed)
 
