@@ -1603,6 +1603,7 @@
    #:request-node-shutdown
    #:node-shutdown-requested-p
    #:run-node-watchdog
+   #:node-main
    #:+node-exit-clean+
    #:+node-exit-error+
    #:+node-exit-watchdog+

@@ -27,23 +27,18 @@
 
 (defparameter *orphan-export-baseline*
   '(
-    ;; Entry points reached from outside the image: the launcher
+    ;; Entry points reached from outside the image: the saved executable's
+    ;; toplevel (scripts/build-node-core.lisp names it), the launcher
     ;; (scripts/run-node.sh) and an operator at the REPL.
+    ;;
+    ;; run-node-watchdog and start-node-from-args left this list when NODE-MAIN
+    ;; started calling them — the sweep noticed, which is the point of it.
     "bitcoin-lisp:clear-logs"
     "bitcoin-lisp:disable-console-logging"
+    "bitcoin-lisp:node-main"
     "bitcoin-lisp:node-status"
-    "bitcoin-lisp:run-node-watchdog"
     "bitcoin-lisp:show-logs"
-    "bitcoin-lisp:start-node-from-args"
     "bitcoin-lisp:stop-file-logging"
-
-    ;; block-file-format P6: the Core CBlockUndo codec is written and tested
-    ;; but still unwired -- see docs/next-wave-2026-08-22.md track A item 2.
-    "bitcoin-lisp.storage:block-undo-from-spent-utxos"
-    "bitcoin-lisp.storage:deserialize-block-undo"
-    "bitcoin-lisp.storage:serialize-block-undo"
-    "bitcoin-lisp.storage:spent-utxos-from-block-undo"
-    "bitcoin-lisp.storage:undo-record-bytes"
 
     ;; Superseded, or written and never wired. Includes the legacy utxo-set
     ;; API that coins-view-cache replaced, REQUEST-HEADERS beside the live

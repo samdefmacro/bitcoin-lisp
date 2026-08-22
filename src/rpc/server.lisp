@@ -315,6 +315,9 @@ normalized as nested values."
     ("reconsiderblock" "blockhash")
     ("sendrawtransaction" "hexstring" "maxfeerate" "maxburnamount")
     ("setmocktime" "timestamp")
+    ;; Core's stop takes a wait (rpc/server.cpp:145); the functional
+    ;; framework's stop_node passes it by name on every node it shuts down.
+    ("stop" "wait")
     ("submitblock" "hexdata" "dummy")
     ("verifytxoutproof" "proof")
     ("waitfornewblock" "timeout" "current_tip")
@@ -1248,7 +1251,22 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
             (progn
               (setf acceptor (make-instance 'rpc-acceptor
                                             :port port
-                                            :address bind))
+                                            :address bind
+                                            ;; NOTHING to stderr. Hunchentoot
+                                            ;; defaults both logs there, so a
+                                            ;; node running normally dribbled
+                                            ;; an Apache-style access line per
+                                            ;; RPC call onto stderr — which
+                                            ;; Core's test framework reads back
+                                            ;; at EVERY node stop and requires
+                                            ;; to be empty (test_node.py:502-509),
+                                            ;; so it would have failed every
+                                            ;; test that stops a node. Core logs
+                                            ;; HTTP requests only under
+                                            ;; -debug=http, i.e. not at all by
+                                            ;; default.
+                                            :access-log-destination nil
+                                            :message-log-destination nil))
               (hunchentoot:start acceptor)
               (setf listening t)
 
