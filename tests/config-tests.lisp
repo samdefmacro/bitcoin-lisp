@@ -1015,3 +1015,48 @@ does, and are stored as satoshis."
   (dolist (name '("dustrelayfee" "incrementalrelayfee" "bytespersigop"))
     (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
     (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
+
+(test validation-resource-knobs-take-effect
+  "Track D's Validation & resources group over knobs that already existed as
+constants. Each asserts the EFFECT, not the assignment."
+  (let ((saved (list bitcoin-lisp.networking::+max-tip-age-seconds+
+                     bitcoin-lisp.coalton.interop::+signature-cache-max-entries+
+                     bitcoin-lisp.storage:*fast-prune*
+                     bitcoin-lisp.storage:*blocks-xor*)))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-config-globals
+            '(("maxtipage" . "3600") ("maxsigcachesize" . "4")
+              ("fastprune" . "1") ("blocksxor" . "0")))
+           ;; -maxtipage: how old the tip may be before the node still calls
+           ;; itself in IBD (Core DEFAULT_MAX_TIP_AGE).
+           (is (= 3600 bitcoin-lisp.networking::+max-tip-age-seconds+))
+           ;; -maxsigcachesize is MiB; a cache entry is a 32-byte key, which is
+           ;; what Core's CuckooCache element is too.
+           (is (= (floor (* 4 1024 1024) 32)
+                  bitcoin-lisp.coalton.interop::+signature-cache-max-entries+))
+           ;; -fastprune changes the ROLLOVER threshold, which is the whole
+           ;; point: 64 KiB instead of 128 MiB (blockstorage.cpp:858).
+           (is-true bitcoin-lisp.storage:*fast-prune*)
+           (is (= bitcoin-lisp.storage::+fast-prune-blockfile-size+
+                  (bitcoin-lisp.storage:max-blockfile-size 100)))
+           ;; ...and Core raises it past a record that would not otherwise fit,
+           ;; because a block that fits in NO file could never be written.
+           (is (= (1+ (* 200 1024))
+                  (bitcoin-lisp.storage:max-blockfile-size (* 200 1024))))
+           (is-false bitcoin-lisp.storage:*blocks-xor*))
+      (setf bitcoin-lisp.networking::+max-tip-age-seconds+ (first saved)
+            bitcoin-lisp.coalton.interop::+signature-cache-max-entries+ (second saved)
+            bitcoin-lisp.storage:*fast-prune* (third saved)
+            bitcoin-lisp.storage:*blocks-xor* (fourth saved))))
+  ;; Default: the full 128 MiB rollover.
+  (is (= bitcoin-lisp.storage::+max-blockfile-size+
+         (bitcoin-lisp.storage:max-blockfile-size 100)))
+  ;; Malformed values are refused.
+  (dolist (bad '((("maxtipage" . "-1")) (("maxsigcachesize" . "0"))
+                 (("maxsigcachesize" . "x"))))
+    (signals error (bitcoin-lisp::apply-config-globals bad)))
+  ;; All four are known and no longer reported as ignored.
+  (dolist (name '("maxtipage" "maxsigcachesize" "fastprune" "blocksxor"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))

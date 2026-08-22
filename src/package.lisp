@@ -462,6 +462,9 @@
    #:make-block-store
    #:init-block-store
    #:*flat-block-files*
+   #:*fast-prune*
+   #:*blocks-xor*
+   #:max-blockfile-size
    #:block-flat-file-number
    #:store-undo-flat
    #:read-undo-flat

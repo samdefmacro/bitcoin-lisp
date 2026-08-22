@@ -20,8 +20,35 @@
 (defconstant +undofile-chunk-size+ #x100000
   "Preallocation granularity for rev?????.dat (Core UNDOFILE_CHUNK_SIZE, 1 MiB).")
 
+(defvar *blocks-xor* t
+  "Obfuscate blocksdir contents with a per-datadir key (Core -blocksxor,
+DEFAULT_XOR_BLOCKSDIR = true, kernel/blockmanager_opts.h:18). Disabling it
+affects only NEW directories: an existing key is always read and used, because
+data written under one cannot be read without it.")
+
+(defvar *fast-prune* nil
+  "Core's -fastprune: use tiny block files so a pruning test can produce many
+of them without mining a real chain (blockstorage.cpp:857-862). Test-only, and
+it changes only the ROLLOVER threshold — records already written keep their
+positions.")
+
+(defconstant +fast-prune-blockfile-size+ #x10000
+  "The 64 KiB cap -fastprune substitutes for +MAX-BLOCKFILE-SIZE+
+(blockstorage.cpp:858). Core grows it further when a single block would not
+fit, which is the check MAX-BLOCKFILE-SIZE below reproduces.")
+
 (defconstant +max-blockfile-size+ #x8000000
   "A blk?????.dat is rolled over past this (Core MAX_BLOCKFILE_SIZE, 128 MiB).")
+
+(defun max-blockfile-size (record-size)
+  "The rollover threshold for a record of RECORD-SIZE bytes.
+
+Normally +MAX-BLOCKFILE-SIZE+. Under -fastprune it is 64 KiB — raised just past
+the record when a single one would not fit, because a block that cannot fit in
+ANY file could never be written at all (Core blockstorage.cpp:857-862)."
+  (if *fast-prune*
+      (max +fast-prune-blockfile-size+ (1+ record-size))
+      +max-blockfile-size+))
 
 (defconstant +storage-header-bytes+ 8
   "4-byte network magic + 4-byte LE length written before every record
