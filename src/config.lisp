@@ -632,7 +632,7 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
 
 (defparameter *repeatable-config-options*
   '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind"
-    "testactivationheight")
+    "testactivationheight" "debug" "debugexclude")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -830,6 +830,8 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ;; Core's -mocktime: the startup form of the setmocktime RPC, for tests
     ;; that need a fixed clock before the first RPC can be made.
     ("mocktime"          :mocktime           :int)
+    ("logtimemicros"     :log-time-micros    :bool)
+    ("logthreadnames"    :log-thread-names   :bool)
     ("maxconnections"    :max-connections    :int)
     ("rpcport"           :rpc-port           :int)
     ("rpcbind"           :rpc-bind           :string)
@@ -890,6 +892,7 @@ specially in config-alist->start-node-plist.")
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
     "addnode" "rpcauth" "rpcallowip" "testactivationheight"
+    "debugexclude"
     ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, not the spec
     ;; scan, since each topic contributes two options and they produce a list
     ;; of publishers rather than a start-node keyword.
@@ -911,12 +914,12 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "blocksdir" "blocksxor" "blockversion" "bytespersigop" "capturemessages"
     "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
     "checkmempool" "checkpoints" "connect" "consolidatefeerate" "daemon"
-    "daemonwait" "dbbatchsize" "debugexclude" "deprecatedrpc"
+    "daemonwait" "dbbatchsize" "deprecatedrpc"
     "discardfee" "discover" "dns" "dustrelayfee" "fastprune"
     "forcednsseed" "help" "i2pacceptincoming" "i2psam" "incrementalrelayfee"
     "ipcbind" "keypool" "limitancestorcount" "limitancestorsize"
     "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
-    "loglevelalways" "logsourcelocations" "logthreadnames" "logtimemicros"
+    "loglevelalways" "logsourcelocations"
     "logtimestamps" "maxapsfee" "maxreceivebuffer" "maxsendbuffer"
     "maxsigcachesize" "maxtipage" "maxuploadtarget" "mintxfee"
     "natpmp" "par" "peerbloomfilters" "peertimeout" "persistmempool"
@@ -1098,7 +1101,9 @@ resolved network. Honors -server (enable RPC on the default port when no
       (dolist (option '(("addnode"    . :addnode)
                         ("rpcauth"    . :rpc-auth)
                         ("rpcallowip" . :rpc-allow-ip)
-                        ("testactivationheight" . :test-activation-heights)))
+                        ("testactivationheight" . :test-activation-heights)
+                        ("debug"        . :debug-categories)
+                        ("debugexclude" . :debug-exclude)))
         (let ((values (loop for (k . v) in alist
                             when (string= k (car option))
                               collect v)))
@@ -1133,9 +1138,18 @@ resolved network. Honors -server (enable RPC on the default port when no
             ;; A port on -bind overrides -port for the listener, as it does in
             ;; Core, where the bind address carries its own port.
             (when port (setf (getf plist :port) port)))))
-      ;; -debug is a shortcut for -loglevel=debug (unless loglevel was set).
-      (let ((debug (lookup "debug")))
-        (when (and debug (conf-parse-bool (cdr debug)) (not (lookup "loglevel")))
+      ;; -debug also raises the log level, because a category's lines are
+      ;; emitted at debug level: enabling a category without raising the level
+      ;; turns on a switch that changes nothing. An explicit -loglevel wins.
+      ;;
+      ;; -debug=0/none does NOT raise it — that spelling turns everything off.
+      ;; The old read was CONF-PARSE-BOOL of the value, and atoi("net") is 0, so
+      ;; -debug=net used to do nothing at all.
+      (let ((debug (getf plist :debug-categories)))
+        (when (and debug
+                   (notevery (lambda (d) (member d '("0" "none") :test #'string=))
+                             debug)
+                   (not (lookup "loglevel")))
           (setf (getf plist :log-level) :debug)))
       ;; -server enables RPC; give it the network default port if none was set.
       (let ((server (lookup "server")))

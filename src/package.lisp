@@ -1629,6 +1629,9 @@
    #:log-debug
    #:log-cat
    #:log-category-enabled-p
+   #:apply-log-categories
+   #:*log-time-micros*
+   #:*log-thread-names*
    #:log-info
    #:log-warn
    #:log-error

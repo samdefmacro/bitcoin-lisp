@@ -78,12 +78,24 @@ diagnostic written to catch it logged `... with a non-I/O error: The' and put
 for the message returned nothing usable."
   (let ((timestamp (multiple-value-bind (sec min hour day month year)
                        (get-decoded-time)
-                     (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D"
-                             year month day hour min sec))))
+                     (if *log-time-micros*
+                         ;; Core's -logtimemicros appends .%06d. INTERNAL-REAL-TIME
+                         ;; is the only sub-second clock here; its fraction is what
+                         ;; distinguishes two lines inside one second, which is all
+                         ;; the flag is for.
+                         (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D.~6,'0D"
+                                 year month day hour min sec
+                                 (mod (round (* (get-internal-real-time)
+                                                (/ 1000000 internal-time-units-per-second)))
+                                      1000000))
+                         (format nil "~4,'0D-~2,'0D-~2,'0D ~2,'0D:~2,'0D:~2,'0D"
+                                 year month day hour min sec)))))
     (%log-escape-message
      (let ((*print-pretty* nil))
-       (format nil "[~A] ~A: ~?"
+       (format nil "[~A] ~@[[~A] ~]~A: ~?"
                timestamp
+               (when *log-thread-names*
+                 (ignore-errors (bt:thread-name (bt:current-thread))))
                (string-upcase (symbol-name level))
                format-string args)))))
 
@@ -250,7 +262,7 @@ usage\" (util/log.h:91-113)."
 (defparameter +log-categories+
   '("net" "tor" "mempool" "http" "bench" "zmq" "walletdb" "rpc" "estimatefee"
     "addrman" "selectcoins" "reindex" "cmpctblock" "rand" "prune" "proxy"
-    "mempoolrej" "libevent" "coindb" "qt" "leveldb" "validation" "ipc" "lock"
+    "mempoolrej" "libevent" "coindb" "qt" "leveldb" "validation" "i2p" "ipc" "lock"
     "blockstorage" "txreconciliation" "scan" "txpackages" "kernel" "privatebroadcast")
   "Debug logging categories, matching Bitcoin Core's LogCategories (logging.cpp).")
 
@@ -284,6 +296,33 @@ success, NIL if CATEGORY is unknown (Bitcoin Core DisableCategory)."
   (cond ((%log-category-all-p category) (clrhash *debug-categories*) t)
         ((log-category-known-p category) (remhash category *debug-categories*) t)
         (t nil)))
+
+(defvar *log-time-micros* nil
+  "Timestamp log lines to microseconds (Core -logtimemicros).")
+
+(defvar *log-thread-names* nil
+  "Prefix each log line with the writing thread's name (Core -logthreadnames).
+Core prints it as [threadname] after the timestamp.")
+
+(defun apply-log-categories (include exclude)
+  "Enable the categories in INCLUDE and then disable those in EXCLUDE, the order
+Core applies them in (-debug then -debugexclude, init/common.cpp). Signals on an
+unknown name — Core logs a warning there, but a silently-ignored -debug=nett is
+an operator staring at a log that will never contain what they asked for.
+
+"1", "all" and the empty string (a bare -debug) enable everything; "0" and
+"none" disable everything, and Core lets a later -debug re-enable after them."
+  (dolist (cat include)
+    (cond ((member cat '("" "1" "all") :test #'string=)
+           (dolist (c +log-categories+) (enable-log-category c)))
+          ((member cat '("0" "none") :test #'string=)
+           (dolist (c +log-categories+) (disable-log-category c)))
+          ((enable-log-category cat))
+          (t (error "Unknown logging category in -debug: ~A" cat))))
+  (dolist (cat exclude)
+    (unless (disable-log-category cat)
+      (error "Unknown logging category in -debugexclude: ~A" cat)))
+  (remove-if-not #'log-category-enabled-p +log-categories+))
 
 (defun node-log-category (category format-string &rest args)
   "Emit a :debug entry tagged with CATEGORY iff that category is enabled, or the
