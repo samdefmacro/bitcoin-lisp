@@ -4,7 +4,7 @@
 ;;;
 ;;; Handles low-level TCP connections to Bitcoin peers.
 
-(defconstant +max-send-buffer-bytes+ 1000000
+(defparameter +max-send-buffer-bytes+ 1000000
   "Per-connection cap on buffered unsent bytes, above which the connection is
 send-paused (Bitcoin Core CNode::fPauseSend; cap = -maxsendbuffer default,
 1000 * DEFAULT_MAXSENDBUFFER(1000) bytes, net.h:99 / init.cpp:2105). A single

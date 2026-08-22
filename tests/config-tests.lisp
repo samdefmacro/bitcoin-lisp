@@ -1176,3 +1176,29 @@ immediately; -blocknotify is detached, so it is polled for."
   ;; triggered it.
   (is-true (bitcoin-lisp::run-notify-command "exit 1" :wait t))
   (is-false (bitcoin-lisp::run-notify-command "echo %s" :value "not hex")))
+
+(test p2p-config-knobs-take-effect
+  "Track D's P2P group, the two options that map onto existing constants."
+  (let ((saved (list bitcoin-lisp:+handshake-timeout-seconds+
+                     bitcoin-lisp.networking::+max-send-buffer-bytes+)))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-config-globals
+            '(("peertimeout" . "90") ("maxsendbuffer" . "2000")))
+           (is (= 90 bitcoin-lisp:+handshake-timeout-seconds+))
+           ;; Core's -maxsendbuffer is in KILOBYTES and it multiplies by 1000,
+           ;; NOT 1024 (init.cpp:2105). Using 1024 here would silently give
+           ;; every operator a 2.4% larger buffer than they asked for.
+           (is (= 2000000 bitcoin-lisp.networking::+max-send-buffer-bytes+)))
+      (setf bitcoin-lisp:+handshake-timeout-seconds+ (first saved)
+            bitcoin-lisp.networking::+max-send-buffer-bytes+ (second saved))))
+  ;; The handshake default is Core's 60, not the 30 it used to be: a peer on a
+  ;; slow link that Core would keep, we dropped — and re-dialling costs more
+  ;; than waiting.
+  (is (= 60 bitcoin-lisp:+handshake-timeout-seconds+))
+  (dolist (bad '((("peertimeout" . "0")) (("maxsendbuffer" . "-1"))
+                 (("maxsendbuffer" . "x"))))
+    (signals error (bitcoin-lisp::apply-config-globals bad)))
+  (dolist (name '("peertimeout" "maxsendbuffer"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
