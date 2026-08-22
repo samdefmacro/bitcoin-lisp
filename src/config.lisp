@@ -869,6 +869,12 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ;; flag that means the opposite of its key.
     ("disablewallet"     :disable-wallet     :bool)
     ("logfile"           :log-file           :string)
+    ;; -pid: a supervisor's handle on this process. -nopid parses to "0", which
+    ;; PID-FILE-PATH reads as Core reads IsArgNegated.
+    ("pid"               :pid-file           :string)
+    ;; -printtoconsole: Core defaults it to (not -daemon); we never daemonize,
+    ;; so ours defaults on and this is the way to turn it off.
+    ("printtoconsole"    :console-log        :bool)
     ;; Core's own spelling of the same thing; -debuglogfile=0 disables it.
     ("debuglogfile"      :log-file           :string)
     ("loglevel"          :log-level          :loglevel)
@@ -903,6 +909,7 @@ specially in config-alist->start-node-plist.")
     "rpccookiefile" "rpccookieperms" "rpcthreads" "rpcservertimeout"
     "mintxfee" "discardfee" "consolidatefeerate" "maxapsfee" "txconfirmtarget"
     "walletrbf" "spendzeroconfchange" "walletrejectlongchains"
+    "keypool" "walletdir" "walletnotify"
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
@@ -932,21 +939,21 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "daemonwait" "dbbatchsize" "deprecatedrpc"
     "discover" "dns"
     "forcednsseed" "help" "i2pacceptincoming" "i2psam"
-    "ipcbind" "keypool" "limitancestorcount" "limitancestorsize"
+    "ipcbind" "limitancestorcount" "limitancestorsize"
     "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
     "loglevelalways" "logsourcelocations"
     "logtimestamps" "maxreceivebuffer"
     "maxuploadtarget"
     "natpmp" "par" "peerbloomfilters" "persistmempool"
-    "persistmempoolv1" "pid" "printpriority" "printtoconsole"
+    "persistmempoolv1" "printpriority"
     "privatebroadcast" "rpcdoccheck"
     "rpcwhitelist" "rpcwhitelistdefault"
     "rpcworkqueue" "seednode" "settings" "shrinkdebugfile"
     "signer" "signetseednode"
     "stopafterblockimport" "test" "timeout"
     "txospenderindex" "unsafesqlitesync" "vbparams"
-    "version" "walletbroadcast" "walletcrosschain" "walletdir"
-    "walletnotify" "whitebind"
+    "version" "walletbroadcast" "walletcrosschain"
+    "whitebind"
     "whitelist" "whitelistforcerelay" "whitelistrelay")
   "Options bitcoind accepts that this node recognises but does NOT implement,
 extracted from Core's AddArg registrations (init.cpp, common/args.cpp,

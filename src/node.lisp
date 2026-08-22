@@ -54,10 +54,10 @@ as one."
 ;;;; -blocknotify / -startupnotify / -shutdownnotify (Core init.cpp:255-266,
 ;;;; 2009-2019)
 ;;;;
-;;;; An operator hook: run a shell command when something happens. Core runs it
-;;;; through the system shell, and so do we — the command comes from the
-;;;; operator's own configuration, so the shell is the feature rather than a
-;;;; hazard. What must NOT reach the shell unexamined is the SUBSTITUTED value.
+;;;; An operator hook: run a shell command when something happens. The runner
+;;;; itself (RUN-NOTIFY-COMMAND) lives in logging.lisp, early enough that the
+;;;; wallet can reach it for -walletnotify; what lives here is the set of hooks
+;;;; the NODE fires.
 
 (defvar *block-notify-command* nil
   "Shell command to run when the best block changes; %s is replaced by the
@@ -68,55 +68,58 @@ block hash (Core -blocknotify, init.cpp:498).")
 JOINS these — shutdown waits for them — because a detached command racing
 process exit is a command that may not run at all (init.cpp:257-265).")
 
-(defun %notify-substitute (command value)
-  "COMMAND with %s replaced by VALUE (Core ReplaceAll, init.cpp:2014).
-
-VALUE is refused unless it is plain hex. Everything we substitute IS a hash, so
-this costs nothing and closes the shell-injection route that a substituted
-value would otherwise open — the command is the operator's, the value is not
-necessarily."
-  (unless (and (stringp value)
-               (plusp (length value))
-               (every (lambda (c) (digit-char-p c 16)) value))
-    (error "Refusing to substitute a non-hex value into a notify command"))
-  (let ((out (make-string-output-stream))
-        (i 0)
-        (n (length command)))
-    (loop while (< i n)
-          do (if (and (< (1+ i) n)
-                      (char= (char command i) #\%)
-                      (char= (char command (1+ i)) #\s))
-                 (progn (write-string value out) (incf i 2))
-                 (progn (write-char (char command i) out) (incf i))))
-    (get-output-stream-string out)))
-
-(defun run-notify-command (command &key value (wait nil))
-  "Run COMMAND through the shell, substituting VALUE for %s when given.
-
-WAIT NIL detaches, as Core does for -blocknotify (\"thread runs free\",
-init.cpp:2017) — a hook must never be able to stall block connection. WAIT T is
-for -shutdownnotify, which Core joins.
-
-Never signals: a failing hook is the operator's problem to see in the log, not
-a reason to fail whatever triggered it."
-  (handler-case
-      (let ((full (if value (%notify-substitute command value) command)))
-        (if wait
-            (uiop:run-program (list "/bin/sh" "-c" full)
-                              :ignore-error-status t
-                              :output nil :error-output nil)
-            (uiop:launch-program (list "/bin/sh" "-c" full)
-                                 :output nil :error-output nil))
-        t)
-    (error (e)
-      (log-warn "notify command failed: ~A" e)
-      nil)))
-
 (defun notify-block-tip (hash)
   "Run -blocknotify for a new best block, if configured."
   (when *block-notify-command*
     (run-notify-command *block-notify-command*
                         :value (bitcoin-lisp.crypto:bytes-to-hex hash))))
+
+(defvar *pid-file-path* nil
+  "The PID file this process created, or NIL. Set by WRITE-PID-FILE and cleared
+by REMOVE-PID-FILE; Core's g_generated_pid serves the same purpose — a pid file
+we did NOT create is never removed.")
+
+(defun pid-file-path (pid-arg data-directory)
+  "Where -pid points: PID-ARG, prefixed by DATA-DIRECTORY when relative (Core
+GetPidFile -> AbsPathForConfigVal, init.cpp:178-181). NIL when -pid was
+negated, which Core treats as \"write no pid file\" (init.cpp:185)."
+  (let ((arg (cond ((null pid-arg) "bitcoin-lisp.pid")
+                   ((not (stringp pid-arg)) pid-arg)
+                   ((or (string= pid-arg "0") (string= pid-arg "")) nil)
+                   (t pid-arg))))
+    (when arg
+      (if (uiop:absolute-pathname-p arg)
+          (pathname arg)
+          (merge-pathnames arg (uiop:ensure-directory-pathname
+                                (or data-directory "./")))))))
+
+(defun write-pid-file (pid-arg data-directory)
+  "Write our PID where -pid says (Core CreatePidFile, init.cpp:183-199).
+
+Core makes a write failure a fatal InitError, and so do we: an operator who
+asked for a pid file and silently did not get one has a supervisor that will
+never find this process."
+  (let ((path (pid-file-path pid-arg data-directory)))
+    (when path
+      (handler-case
+          (with-open-file (out path :direction :output
+                                    :if-exists :supersede
+                                    :if-does-not-exist :create)
+            (format out "~D~%" (sb-posix:getpid)))
+        (error (e)
+          (error "Unable to create the PID file '~A': ~A" path e)))
+      (setf *pid-file-path* path)
+      path)))
+
+(defun remove-pid-file ()
+  "Remove the pid file we created (Core RemovePidFile, init.cpp:200-208). A
+failure is a warning, never a reason to fail shutdown."
+  (let ((path *pid-file-path*))
+    (when path
+      (setf *pid-file-path* nil)
+      (handler-case (delete-file path)
+        (error (e)
+          (log-warn "Unable to remove PID file (~A): ~A" path e))))))
 
 (defun run-shutdown-notify ()
   "Run every -shutdownnotify command and WAIT for it (Core joins them,
@@ -195,7 +198,18 @@ START-NODE-FROM-ARGS immediately after its sibling."
       (int-knob "txconfirmtarget" bitcoin-lisp.rpc::*wallet-confirm-target* :min 1)
       (bool-knob "walletrbf" bitcoin-lisp.rpc::*wallet-signal-rbf*)
       (bool-knob "spendzeroconfchange" bitcoin-lisp.rpc::*wallet-spend-zero-conf-change*)
-      (bool-knob "walletrejectlongchains" bitcoin-lisp.rpc::*wallet-reject-long-chains*))
+      (bool-knob "walletrejectlongchains" bitcoin-lisp.rpc::*wallet-reject-long-chains*)
+      ;; -keypool sizes the keypool of wallets created AFTER it is set; an
+      ;; existing wallet keeps the size it was made with, as in Core, where the
+      ;; keypool size is per-wallet state.
+      (int-knob "keypool" bitcoin-lisp.rpc::+default-keypool-size+ :min 1))
+    ;; -walletdir relocates <datadir>/wallets/ (Core init.cpp). Relative paths
+    ;; hang off the data directory, as -rpccookiefile does.
+    (let ((v (lk "walletdir")))
+      (when v (setf bitcoin-lisp.rpc::*wallet-directory* v)))
+    ;; -walletnotify: an operator hook, fired from AddToWallet.
+    (let ((v (lk "walletnotify")))
+      (when v (setf bitcoin-lisp.rpc::*wallet-notify-command* v)))
     alist))
 
 (defun %start-rpc-early (node rpc-port rpc-bind rpc-bind-supplied-p
@@ -2310,6 +2324,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (tor-password nil)
                         (dbcache-mib nil)
                         (mocktime nil)
+                        (pid-file nil)
                         (block-notify nil)
                         (startup-notify nil)
                         (shutdown-notify nil)
@@ -2414,6 +2429,12 @@ Returns the node instance."
   ;; can fire them.
   (setf *block-notify-command* block-notify
         *shutdown-notify-commands* shutdown-notify)
+
+  ;; -pid: written once the log exists, so a failure is on the record, and
+  ;; before any long-running startup work, so a supervisor watching for the
+  ;; file does not have to wait out a reindex to learn our PID.
+  (let ((path (write-pid-file pid-file data-directory)))
+    (when path (log-info "PID file: ~A" path)))
 
   ;; -debug=<category> / -debugexclude=<category> (Core init/common.cpp).
   ;; Applied before init-node so startup's own category lines are subject to
@@ -4474,6 +4495,7 @@ thread; see the shutdown-coordination section above."
   ;; Release the data-directory lock last: everything above may still touch
   ;; the directory, and a successor node must not open it until they are done.
   (unlock-data-directory)
+  (remove-pid-file)
 
   (log-info "Node stopped")
 

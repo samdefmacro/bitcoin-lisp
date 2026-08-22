@@ -349,3 +349,75 @@ via the logging RPC (or the node is globally at :debug)."
 
 (defmacro log-error (format-string &rest args)
   `(node-log :error ,format-string ,@args))
+
+
+;;;; Operator notify hooks (-blocknotify / -shutdownnotify / -walletnotify)
+;;;;
+;;;; Run a shell command when something happens. Core runs it through the system
+;;;; shell (runCommand, common/run_command.cpp) and so do we: the command comes
+;;;; from the operator's own configuration, so the shell is the feature rather
+;;;; than a hazard. What must NOT reach the shell unexamined is the SUBSTITUTED
+;;;; value, which is why %NOTIFY-SUBSTITUTE validates every one.
+;;;;
+;;;; Here rather than in node.lisp because the wallet fires -walletnotify from
+;;;; AddToWallet, and rpc/wallet-tx.lisp compiles long before node.lisp.
+
+(defun %notify-safe-value-p (value)
+  "Whether VALUE may be substituted into a shell command.
+
+Restricted to [A-Za-z0-9._-], which admits every value we ever substitute — a
+hex hash, a decimal height, -1, \"unconfirmed\", and a wallet name, which
+%VALID-WALLET-NAME-P already holds to the same set — and admits no character
+with a meaning to the shell. Core instead shell-escapes %w and substitutes the
+rest raw; refusing outright is the same guarantee without the escaping."
+  (and (stringp value)
+       (plusp (length value))
+       (every (lambda (ch)
+                (or (alphanumericp ch) (member ch '(#\. #\_ #\-))))
+              value)))
+
+(defun %notify-substitute (command substitutions)
+  "COMMAND with each (CHAR . VALUE) of SUBSTITUTIONS replacing %CHAR (Core
+ReplaceAll). Signals if any VALUE is not shell-safe.
+
+Single pass, so a substituted value can never itself be rescanned for a
+placeholder: a block hash cannot smuggle in a %w."
+  (loop for (nil . value) in substitutions
+        unless (%notify-safe-value-p value)
+          do (error "Refusing to substitute ~S into a notify command" value))
+  (let ((out (make-string-output-stream))
+        (i 0)
+        (n (length command)))
+    (loop while (< i n)
+          do (let ((hit (and (< (1+ i) n)
+                             (char= (char command i) #\%)
+                             (assoc (char command (1+ i)) substitutions
+                                    :test #'char=))))
+               (if hit
+                   (progn (write-string (cdr hit) out) (incf i 2))
+                   (progn (write-char (char command i) out) (incf i)))))
+    (get-output-stream-string out)))
+
+(defun run-notify-command (command &key value substitutions (wait nil))
+  "Run COMMAND through the shell. VALUE is shorthand for a single %s
+substitution; SUBSTITUTIONS is the general (CHAR . VALUE) form.
+
+WAIT NIL detaches, as Core does for -blocknotify and -walletnotify (\"thread
+runs free\", init.cpp:2017, wallet.cpp:1149) — a hook must never be able to
+stall block connection. WAIT T is for -shutdownnotify, which Core joins.
+
+Never signals: a failing hook is the operator's problem to see in the log, not
+a reason to fail whatever triggered it."
+  (handler-case
+      (let* ((subs (append (when value (list (cons #\s value))) substitutions))
+             (full (if subs (%notify-substitute command subs) command)))
+        (if wait
+            (uiop:run-program (list "/bin/sh" "-c" full)
+                              :ignore-error-status t
+                              :output nil :error-output nil)
+            (uiop:launch-program (list "/bin/sh" "-c" full)
+                                 :output nil :error-output nil))
+        t)
+    (error (e)
+      (log-warn "notify command failed: ~A" e)
+      nil)))

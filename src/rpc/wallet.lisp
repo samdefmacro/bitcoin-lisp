@@ -62,8 +62,13 @@
     (,+wallet-flag-external-signer+ . "external_signer"))
   "Core wallet.h WALLET_FLAG_TO_STRING.")
 
-(defconstant +default-keypool-size+ 1000
-  "Core scriptpubkeyman.h:63 DEFAULT_KEYPOOL_SIZE.")
+(defparameter +default-keypool-size+ 1000
+  "Core scriptpubkeyman.h:63 DEFAULT_KEYPOOL_SIZE, settable with -keypool.
+
+A DEFPARAMETER because Core exposes the knob. Note it is read as a STRUCT SLOT
+DEFAULT, so it applies to wallets created after it is set — an already-created
+wallet keeps the size it was made with, which is also Core's behaviour (the
+keypool size is per-wallet state).")
 
 (defconstant +wallet-client-version+ bitcoin-lisp.serialization:+client-version+
   "Written to the 'version' record on wallet creation: the creating client's
@@ -297,9 +302,25 @@ per-block/per-tx chain hooks: a stale read only skips or enters the (locked)
 fan-out one event early or late."
   (plusp (hash-table-count (wallet-manager-wallets manager))))
 
+(defvar *wallet-notify-command* nil
+  "Shell command run when a wallet transaction comes in or is updated, or NIL
+(Core -walletnotify, wallet.cpp:3067). See %RUN-WALLET-NOTIFY for the
+placeholders.")
+
+(defvar *wallet-directory* nil
+  "Where wallets live, or NIL for <datadir>/wallets/ (Core -walletdir,
+init.cpp). An absolute path is used as given; a relative one hangs off the data
+directory.")
+
 (defun wallets-directory (manager)
-  (merge-pathnames "wallets/" (uiop:ensure-directory-pathname
-                               (wallet-manager-data-directory manager))))
+  (cond ((null *wallet-directory*)
+         (merge-pathnames "wallets/" (uiop:ensure-directory-pathname
+                                      (wallet-manager-data-directory manager))))
+        ((uiop:absolute-pathname-p *wallet-directory*)
+         (uiop:ensure-directory-pathname *wallet-directory*))
+        (t (merge-pathnames (uiop:ensure-directory-pathname *wallet-directory*)
+                            (uiop:ensure-directory-pathname
+                             (wallet-manager-data-directory manager))))))
 
 (defun wallet-directory (manager name)
   (merge-pathnames (concatenate 'string name "/") (wallets-directory manager)))
