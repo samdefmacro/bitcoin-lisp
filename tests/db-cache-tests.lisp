@@ -259,3 +259,64 @@ coins and labelling it with another block's hash commits to nothing."
   ;; A test-only utxo-set tracks nothing, so callers fall back to the tip.
   (is-false (bitcoin-lisp.storage:coins-view-best-block
              (bitcoin-lisp.storage:make-utxo-set))))
+
+(test sig-cache-keys-are-salted
+  "Core salts its signature-cache hasher with a random per-process nonce
+(sigcache.cpp:25-32). Unsalted, the key is plain SHA256 over public data, so
+anyone can compute the key for any (sighash, pubkey, signature) triple offline
+— and an adversary who knows the keys can choose transactions whose entries
+collide, or whose insertion order evicts the entries a validating node is about
+to need."
+  (let* ((sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 1))
+         (pubkey (make-array 33 :element-type '(unsigned-byte 8) :initial-element 2))
+         (sig (make-array 71 :element-type '(unsigned-byte 8) :initial-element 3))
+         (bitcoin-lisp.coalton.interop::*script-flags* nil)
+         (under-salt-a
+           (let ((bitcoin-lisp.coalton.interop::*sig-cache-salt*
+                   (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xAA)))
+             (bitcoin-lisp.coalton.interop::make-sig-cache-key #x45 sighash sig pubkey)))
+         (under-salt-b
+           (let ((bitcoin-lisp.coalton.interop::*sig-cache-salt*
+                   (make-array 32 :element-type '(unsigned-byte 8) :initial-element #xBB)))
+             (bitcoin-lisp.coalton.interop::make-sig-cache-key #x45 sighash sig pubkey))))
+    ;; The same triple keys differently under different salts — which is the
+    ;; whole property.
+    (is (not (equalp under-salt-a under-salt-b))
+        "the salt does not reach the key: it is computable offline")
+    ;; And the salt is 32 random bytes, not a constant someone can look up.
+    (is (= 32 (length bitcoin-lisp.coalton.interop::*sig-cache-salt*)))
+    (is (notevery (lambda (b) (= b (aref bitcoin-lisp.coalton.interop::*sig-cache-salt* 0)))
+                  bitcoin-lisp.coalton.interop::*sig-cache-salt*)
+        "the salt looks constant, not random"))
+  ;; Determinism within one salt is what makes the cache a cache at all.
+  (let ((sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 9))
+        (pubkey (make-array 33 :element-type '(unsigned-byte 8) :initial-element 8))
+        (sig (make-array 64 :element-type '(unsigned-byte 8) :initial-element 7)))
+    (is (equalp (bitcoin-lisp.coalton.interop::make-sig-cache-key #x53 sighash sig pubkey)
+                (bitcoin-lisp.coalton.interop::make-sig-cache-key #x53 sighash sig pubkey)))
+    ;; ECDSA and Schnorr are distinct domains, as Core keeps them with
+    ;; different padding.
+    (is (not (equalp
+              (bitcoin-lisp.coalton.interop::make-sig-cache-key #x45 sighash sig pubkey)
+              (bitcoin-lisp.coalton.interop::make-sig-cache-key #x53 sighash sig pubkey))))))
+
+(test sig-cache-still-keys-on-script-flags
+  "Core does NOT key on script flags, because it validates the flag-dependent
+signature ENCODING before consulting the cache. Ours does the opposite —
+cached-verify-ecdsa passes :strict and :low-s into the verify, which runs only
+on a MISS — so the flags in the key are what stops a signature cached under lax
+flags from being reported valid under strict ones.
+
+This test pins that dependency so the flags cannot be dropped as a
+\"key-format cleanup\" without hoisting the encoding checks first. Doing one
+without the other is a consensus bug."
+  (let* ((sighash (make-array 32 :element-type '(unsigned-byte 8) :initial-element 4))
+         (pubkey (make-array 33 :element-type '(unsigned-byte 8) :initial-element 5))
+         (sig (make-array 71 :element-type '(unsigned-byte 8) :initial-element 6))
+         (lax (let ((bitcoin-lisp.coalton.interop::*script-flags* nil))
+                (bitcoin-lisp.coalton.interop::make-sig-cache-key #x45 sighash sig pubkey)))
+         (strict (let ((bitcoin-lisp.coalton.interop::*script-flags* "DERSIG,LOW_S"))
+                   (bitcoin-lisp.coalton.interop::make-sig-cache-key #x45 sighash sig pubkey))))
+    (is (not (equalp lax strict))
+        "the same signature keys identically under different script flags — a \
+signature accepted under lax flags would be served from cache under strict ones")))
