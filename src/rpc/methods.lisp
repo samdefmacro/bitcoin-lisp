@@ -844,7 +844,7 @@ getpeerinfo loop, rpc/net.cpp:107-227."
                       100000000.0d0))
          ;; +incremental-relay-fee-rate+ is sat/kvB -> BTC/kvB.
          (incfee (/ bitcoin-lisp.mempool::+incremental-relay-fee-rate+ 100000000.0d0)))
-    `(("version" . 10000)
+    `(("version" . ,bitcoin-lisp.serialization:+client-version+)
       ("subversion" . ,bitcoin-lisp.serialization:*user-agent*)
       ("protocolversion" . 70016)
       ("localservices" . ,(string-downcase (format nil "~16,'0X" services)))
@@ -3053,14 +3053,26 @@ when a -zmqpub* option asks for it."
            (bitcoin-lisp::zmq-notifications-info))))
 
 (defun rpc-getdeploymentinfo (node params)
-  "Report soft-fork deployment status at the tip (Bitcoin Core getdeploymentinfo).
-Reports the buried deployments (bip34/bip66/bip65/csv/segwit/taproot) using this
-node's per-network activation heights."
-  (declare (ignore params))
+  "Report soft-fork deployment status at the tip, or at the block named by an
+optional blockhash param (Bitcoin Core getdeploymentinfo, rpc/blockchain.cpp:
+1489-1540). Reports the buried deployments (bip34/bip66/bip65/csv/segwit/
+taproot) using this node's per-network activation heights."
   (let* ((chain-state (rpc-get-chain-state node))
          (network (bitcoin-lisp::node-network node))
-         (height (bitcoin-lisp.storage:current-height chain-state))
-         (best-hash (bitcoin-lisp.storage:best-block-hash chain-state)))
+         ;; Core takes a hash only (no height form), hence the stringp guard
+         ;; in front of the shared hash-or-height parser.
+         (entry (let ((hex (first params)))
+                  (when hex
+                    (unless (stringp hex)
+                      (error 'rpc-error :code +rpc-invalid-parameter+
+                                        :message "blockhash must be hexadecimal string"))
+                    (%parse-hash-or-height-entry chain-state hex "blockhash"))))
+         (height (if entry
+                     (bitcoin-lisp.storage:block-index-entry-height entry)
+                     (bitcoin-lisp.storage:current-height chain-state)))
+         (best-hash (if entry
+                        (bitcoin-lisp.storage:block-index-entry-hash entry)
+                        (bitcoin-lisp.storage:best-block-hash chain-state))))
     `(("hash" . ,(if best-hash (hash-to-hex best-hash) ""))
       ("height" . ,height)
       ;; Script-verify flags active for a block at the tip (Core script_flags).
@@ -3230,16 +3242,36 @@ miner."
                    #x1d00ffff))
          ;; Report the last assembled template (Bitcoin Core m_last_block_*),
          ;; rather than re-assembling on every status call.
-         (template bitcoin-lisp.mining:*last-block-template*))
-    `(("blocks" . ,height)
-      ("currentblockweight" . ,(if template (bitcoin-lisp.mining:block-template-total-weight template) 0))
-      ("currentblocktx" . ,(if template (length (bitcoin-lisp.mining:block-template-transactions template)) 0))
-      ("bits" . ,(%bits-hex bits))
-      ("difficulty" . ,(%difficulty-from-bits bits))
-      ("target" . ,(%bits-to-target-hex bits))
-      ("pooledtx" . ,(if mempool (bitcoin-lisp.mempool:mempool-count mempool) 0))
-      ("chain" . ,(%chain-name (bitcoin-lisp::node-network node)))
-      ("warnings" . #())))))
+         (template bitcoin-lisp.mining:*last-block-template*)
+         (network (bitcoin-lisp::node-network node))
+         ;; Core getmininginfo "next" (rpc/mining.cpp:450-458): the block that
+         ;; would extend the tip, timed as the assembler times it — UpdateTime's
+         ;; max(GetMinimumTime, now) — so its bits match getblocktemplate's.
+         (next-bits (if tip
+                        (let* ((mtp (or (bitcoin-lisp.validation:compute-median-time-past-from-entry tip) 0))
+                               (curtime (max (bitcoin-lisp.serialization:get-unix-time)
+                                             (bitcoin-lisp.mining:next-block-mintime tip (1+ height) mtp))))
+                          (bitcoin-lisp.mining:next-block-required-bits chain-state tip curtime))
+                        bits))
+         (challenge (bitcoin-lisp.validation:signet-challenge-for-network network)))
+      `(("blocks" . ,height)
+        ("currentblockweight" . ,(if template (bitcoin-lisp.mining:block-template-total-weight template) 0))
+        ("currentblocktx" . ,(if template (length (bitcoin-lisp.mining:block-template-transactions template)) 0))
+        ("bits" . ,(%bits-hex bits))
+        ("difficulty" . ,(%difficulty-from-bits bits))
+        ("target" . ,(%bits-to-target-hex bits))
+        ("networkhashps" . ,(rpc-getnetworkhashps node nil))
+        ("pooledtx" . ,(if mempool (bitcoin-lisp.mempool:mempool-count mempool) 0))
+        ;; BTC/kvB, as Core's ValueFromAmount renders blockMinFeeRate.
+        ("blockmintxfee" . ,(/ bitcoin-lisp.mining:*block-min-tx-fee-rate* 100000000.0d0))
+        ("chain" . ,(%chain-name network))
+        ("next" . (("height" . ,(1+ height))
+                   ("bits" . ,(%bits-hex next-bits))
+                   ("difficulty" . ,(%difficulty-from-bits next-bits))
+                   ("target" . ,(%bits-to-target-hex next-bits))))
+        ,@(when challenge
+            `(("signet_challenge" . ,(bitcoin-lisp.crypto:bytes-to-hex challenge))))
+        ("warnings" . #())))))
 
 (defun %activate-submitted-block (node block)
   "Validate+activate BLOCK through the consensus path. Returns the activate-block

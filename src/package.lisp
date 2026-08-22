@@ -285,6 +285,10 @@
    #:version-message
    #:make-version-message-bytes
    #:*user-agent*
+   #:+client-version+
+   #:client-version-string
+   #:format-user-agent
+   #:subversion-with-build-rev
    #:read-version-message
    #:version-message-version
    #:version-message-services
@@ -1167,6 +1171,7 @@
   (:export
    #:assemble-block-template
    #:next-block-required-bits
+   #:next-block-mintime
    #:build-witness-commitment-script
    #:*last-block-template*
    #:*block-min-tx-fee-rate*
@@ -1329,15 +1334,13 @@
    #:handle-message
    #:ingest-headers-from-peer
    #:request-headers
-   #:request-blocks
-   #:sync-with-peer
    #:relay-transaction
    #:peer-announced-txs
    #:peer-known-addrs
    #:initial-block-download-p
+   #:near-tip-p
    ;; Compact block relay (BIP 152)
    #:send-compact-block-negotiation
-   #:should-use-compact-blocks-p
    #:check-compact-block-timeout
    #:clear-pending-compact-block
    #:compact-block-stats
@@ -1537,7 +1540,6 @@
    #:conf-parse-money
    #:conf-parse-user-hex
    #:ua-comment-safe-p
-   #:format-subversion
    #:+max-subversion-length+
    ;; Assumeutxo snapshot commitments (Core m_assumeutxo_data)
    #:assumeutxo-data

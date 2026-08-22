@@ -80,6 +80,20 @@ weight/sigops totals already include the reserved coinbase allowance."
   (witness-commitment nil)
   (default-witness-commitment-script nil))
 
+(defun next-block-mintime (tip height mtp)
+  "Core GetMinimumTime (node/miner.cpp:36-47) for the block at HEIGHT on TIP:
+MTP+1, raised at retarget heights to TIP's actual time minus MAX_TIMEWARP (the
+BIP94 floor). Shared by the template assembler and getmininginfo's \"next\"
+block so the two cannot disagree on the next block's bits."
+  (let ((mtp-floor (1+ mtp)))
+    (if (and tip
+             (zerop (mod height bitcoin-lisp.storage:+difficulty-adjustment-interval+)))
+        (max mtp-floor
+             (- (bitcoin-lisp.serialization:block-header-timestamp
+                 (bitcoin-lisp.storage:block-index-entry-header tip))
+                bitcoin-lisp.validation:+max-timewarp+))
+        mtp-floor)))
+
 (defun next-block-required-bits (chain-state prev-entry block-time)
   "The compact difficulty bits the block after PREV-ENTRY must carry, mirroring
 Bitcoin Core's GetNextWorkRequired. Reuses the consensus get-expected-bits and
@@ -237,15 +251,7 @@ the per-tx ceiling."
          ;; height % DifficultyAdjustmentInterval == 0 per network; ours uses
          ;; the fixed 2016, which matches every network except regtest
          ;; (Core: 144), where BIP94 is off and the extra floor is moot.
-         (mintime (let ((mtp-floor (1+ mtp)))
-                    (if (and tip
-                             (zerop (mod height
-                                         bitcoin-lisp.storage:+difficulty-adjustment-interval+)))
-                        (max mtp-floor
-                             (- (bitcoin-lisp.serialization:block-header-timestamp
-                                 (bitcoin-lisp.storage:block-index-entry-header tip))
-                                bitcoin-lisp.validation:+max-timewarp+))
-                        mtp-floor)))
+         (mintime (next-block-mintime tip height mtp))
          ;; Core UpdateTime (miner.cpp:49-57): nTime = max(mintime, now).
          (curtime (max now mintime))
          (bits (if tip
