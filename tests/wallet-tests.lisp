@@ -905,6 +905,97 @@ wallet does not own -4 (Core wallet/rpc/signmessage.cpp error codes)."
                 (lambda () (bitcoin-lisp.rpc::rpc-signmessage
                             node (list foreign message))))))))))
 
+(test setwalletflag-changes-only-the-mutable-flag
+  "Core setwalletflag (wallet/rpc/wallet.cpp:300-345). Only avoid_reuse is
+mutable; the rest record how the wallet was BUILT and cannot be retrofitted, so
+Core refuses them BY NAME rather than ignoring the request.
+
+The persistence half is what makes this more than a getter: a flag that lived
+only in memory would come back on the next load, which for avoid_reuse means
+silently resuming address reuse."
+  (with-wallet-test-node (node :keypool 4)
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
+      (bitcoin-lisp.rpc::rpc-createwallet node '("flags")))
+    (let* ((bitcoin-lisp.rpc::*rpc-wallet-name* "flags")
+           (manager (%node-manager node))
+           (wallet (gethash "flags" (bitcoin-lisp.rpc::wallet-manager-wallets manager))))
+      ;; Setting it on: Core's exact result shape, including the caveat.
+      (let ((r (bitcoin-lisp.rpc::rpc-setwalletflag node '("avoid_reuse"))))
+        (is (equal "avoid_reuse" (cdr (assoc "flag_name" r :test #'string=))))
+        (is (eq t (cdr (assoc "flag_state" r :test #'string=))))
+        (is (search "rescan the blockchain"
+                    (or (cdr (assoc "warnings" r :test #'string=)) ""))
+            "the avoid_reuse caveat was not reported"))
+      (is-true (bitcoin-lisp.rpc::wallet-flag-set-p
+                wallet bitcoin-lisp.rpc::+wallet-flag-avoid-reuse+))
+      ;; Setting it to the value it already holds is an error, not a no-op:
+      ;; the caller has misunderstood the state.
+      (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+             (%rpc-error-code
+              (lambda () (bitcoin-lisp.rpc::rpc-setwalletflag node '("avoid_reuse"))))))
+      ;; Off again, and no caveat this time (Core reports it only when SETTING).
+      (let ((r (bitcoin-lisp.rpc::rpc-setwalletflag
+                node (list "avoid_reuse" bitcoin-lisp.rpc::+json-false+))))
+        (is (eq bitcoin-lisp.rpc::+json-false+
+                (cdr (assoc "flag_state" r :test #'string=))))
+        (is-false (assoc "warnings" r :test #'string=)))
+      (is-false (bitcoin-lisp.rpc::wallet-flag-set-p
+                 wallet bitcoin-lisp.rpc::+wallet-flag-avoid-reuse+))
+      ;; An immutable flag is refused by name; an unknown one likewise.
+      (dolist (immutable '("blank" "descriptor_wallet" "disable_private_keys"
+                           "key_origin_metadata"))
+        (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+               (%rpc-error-code
+                (lambda () (bitcoin-lisp.rpc::rpc-setwalletflag node (list immutable)))))
+            "~A was not refused as immutable" immutable))
+      (is (= bitcoin-lisp.rpc::+rpc-invalid-parameter+
+             (%rpc-error-code
+              (lambda () (bitcoin-lisp.rpc::rpc-setwalletflag node '("no_such_flag"))))))
+      ;; And it PERSISTED: the flag word is on disk, not just in the struct.
+      (bitcoin-lisp.rpc::rpc-setwalletflag node '("avoid_reuse"))
+      (is-true (bitcoin-lisp.rpc::wallet-flag-set-p
+                wallet bitcoin-lisp.rpc::+wallet-flag-avoid-reuse+))
+      (let ((stored (bitcoin-lisp.storage:leveldb-get
+                     (bitcoin-lisp.rpc::wallet-db wallet)
+                     (bitcoin-lisp.rpc::wdb-key-simple bitcoin-lisp.rpc::+wdb-key-flags+))))
+        (is-true stored "the flag word was never written")))))
+
+(test gethdkeys-groups-descriptors-under-their-root-key
+  "Core gethdkeys. The grouping is the point: two descriptors derived from one
+HD root must appear as ONE entry with two descriptors, not two entries — that
+is what tells an operator which key their wallet actually depends on."
+  (with-wallet-test-node (node :keypool 4)
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* nil))
+      (bitcoin-lisp.rpc::rpc-createwallet node '("hd")))
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* "hd"))
+      (let ((rows (bitcoin-lisp.rpc::rpc-gethdkeys node nil)))
+        (is (plusp (length rows)) "a fresh descriptor wallet reported no HD keys")
+        ;; A freshly created wallet derives every descriptor from ONE seed, so
+        ;; there is exactly one root and every descriptor hangs off it.
+        (is (= 1 (length rows))
+            "~D roots reported for a single-seed wallet" (length rows))
+        (let* ((row (first rows))
+               (xpub (cdr (assoc "xpub" row :test #'string=)))
+               (descs (cdr (assoc "descriptors" row :test #'string=))))
+          (is (and (stringp xpub) (plusp (length xpub))))
+          (is (> (length descs) 1)
+              "only ~D descriptor(s) grouped under the root" (length descs))
+          (is (eq t (cdr (assoc "has_private" row :test #'string=))))
+          ;; No xprv unless asked for.
+          (is-false (assoc "xprv" row :test #'string=)))
+        ;; private=true yields the xprv.
+        (let* ((opts (let ((h (make-hash-table :test 'equal)))
+                       (setf (gethash "private" h) t) h))
+               (priv (first (bitcoin-lisp.rpc::rpc-gethdkeys node (list opts)))))
+          (is-true (assoc "xprv" priv :test #'string=)
+                   "private=true did not return the extended private key"))
+        ;; active_only excludes nothing here (every descriptor is active), but
+        ;; the option must at least be accepted and not change the root count.
+        (let* ((opts (let ((h (make-hash-table :test 'equal)))
+                       (setf (gethash "active_only" h) t) h))
+               (active (bitcoin-lisp.rpc::rpc-gethdkeys node (list opts))))
+          (is (= 1 (length active))))))))
+
 (test walletnotify-runs-on-every-add-to-wallet
   "-walletnotify (Core wallet.cpp:1125-1150). Asserted through the FILE the
 hook creates, and specifically on a RE-ADD of the same transaction in the same
