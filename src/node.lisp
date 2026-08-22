@@ -2362,6 +2362,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (pid-file nil)
                         (connect-nodes nil connect-nodes-supplied-p)
                         (seednode nil)
+                        (asmap nil)
                         (whitelist nil)
                         (whitebind nil)
                         (block-notify nil)
@@ -2607,6 +2608,19 @@ txindex ~D MiB, per-index ~D MiB"
   ;; -noconnect parses to — means no outbound connections at all; Core tests
   ;; for exactly that shape, so -connect=0 -connect=1.2.3.4 leaves BOTH as
   ;; targets rather than being read as a disable.
+  ;; -asmap: bucket peers by ASN instead of /16. Loaded before any peer can
+  ;; connect, and FATAL on failure as Core's is (init.cpp:1587-1600) — a node
+  ;; that silently kept /16 bucketing after being told to use an ASN map would
+  ;; have exactly the eclipse exposure the operator was closing.
+  (setf bitcoin-lisp.networking::*asmap* nil)
+  (when (and asmap (stringp asmap) (plusp (length asmap))
+             (not (string= asmap "0")))
+    (let ((path (if (uiop:absolute-pathname-p asmap)
+                    asmap
+                    (merge-pathnames asmap (uiop:ensure-directory-pathname
+                                            (or data-directory "./"))))))
+      (let ((size (bitcoin-lisp.networking:load-asmap-file path)))
+        (log-info "Using asmap file ~A (~D bytes) for peer bucketing" path size))))
   ;; -whitelist / -whitebind: permission grants by address range. Applied
   ;; before any peer can connect. A malformed spec is fatal, as Core's is
   ;; (init.cpp fails on the first entry NetWhitelistPermissions::TryParse

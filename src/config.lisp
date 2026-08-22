@@ -898,6 +898,9 @@ bitcoin.conf started the node on PUBLIC TESTNET3 without saying anything."
     ;; flag that means the opposite of its key.
     ("disablewallet"     :disable-wallet     :bool)
     ("logfile"           :log-file           :string)
+    ;; -asmap=<file>: ASN-based netgroup bucketing. A relative path hangs off
+    ;; the datadir, as Core's does.
+    ("asmap"             :asmap              :string)
     ;; -pid: a supervisor's handle on this process. -nopid parses to "0", which
     ;; PID-FILE-PATH reads as Core reads IsArgNegated.
     ("pid"               :pid-file           :string)
@@ -962,7 +965,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
 
 (defparameter *core-only-config-options*
   '(
-    "addresstype" "alertnotify" "allowignoredconf" "asmap"
+    "addresstype" "alertnotify" "allowignoredconf"
     "avoidpartialspends" "blockreconstructionextratxn"
     "blocksdir" "blockversion" "capturemessages"
     "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"

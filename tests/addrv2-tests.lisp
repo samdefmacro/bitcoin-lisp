@@ -179,6 +179,119 @@
 ;;; handle-addrv2 stores only REACHABLE networks (Core "Do not store
 ;;; addresses outside our network"): with the default reachable set
 ;;; {ipv4, ipv6}, a TorV3 entry parses but is not stored.
+(defparameter +core-asmap-test-data+
+  (concatenate
+   'string
+    "fd38d50f7d5d665357f64bba6bfc190d6078a7e68e5d3ac032edf47f8b5755f87881bfd3633d9aa7c1fa279b3"
+    "6fe26c63bbc9de44e0f04e5a382d8e1cddbe1c26653bc939d4327f287e8b4d1f8aff33176787cb0ff7cb28e3f"
+    "daef0f8f47357f801c9f7ff7a99f7f9c9f99de7f3156ae00f23eb27a303bc486aa3ccc31ec19394c2f8a53ddd"
+    "ea3cc56257f3b7e9b1f488be9c1137db823759aa4e071eef2e984aaf97b52d5f88d0f373dd190fe45e06efef1"
+    "df7278be680a73a74c76db4dd910f1d30752c57fe2bc9f079f1a1e1b036c2a69219f11c5e11980a3fa51f4f82"
+    "d36373de73b1863a8c27e36ae0e4f705be3d76ecff038a75bc0f92ba7e7f6f4080f1c47c34d095367ecf4406c"
+    "1e3bbc17ba4d6f79ea3f031b876799ac268b1e0ea9babf0f9a8e5f6c55e363c6363df46afc696d7afceaf49b6"
+    "e62df9e9dc27e70664cafe5c53df66dd0b8237678ada90e73f05ec60e6f6e96c3cbb1ea2f9dece115d5bdba10"
+    "33e53662a7d72a29477b5beb35710591d3e23e5f0379baea62ffdee535bcdf879cbf69b88d7ea37c8015381cf"
+    "63dc33d28f757a4a5e15d6a08")
+  "Core's own asmap_test_vectors data (src/test/netbase_tests.cpp:621-633): a
+randomly generated map with 128 ranges and up to 20-bit AS numbers.")
+
+(defparameter +core-asmap-expectations+
+  '(
+    ("0:1559:183:3728:224c:65a5:62e6:e991" . 961340)
+    ("d0:d493:faa0:8609:e927:8b75:293c:f5a4" . 961340)
+    ("2a0:26f:8b2c:2ee7:c7d1:3b24:4705:3f7f" . 693761)
+    ("a77:7cd4:4be5:a449:89f2:3212:78c6:ee38" . 0)
+    ("1336:1ad6:2f26:4fe3:d809:7321:6e0d:4615" . 672176)
+    ("1d56:abd0:a52f:a8d5:d5a7:a610:581d:d792" . 499880)
+    ("378e:7290:54e5:bd36:4760:971c:e9b9:570d" . 0)
+    ("406c:820b:272a:c045:b74e:fc0a:9ef2:cecc" . 248495)
+    ("46c2:ae07:9d08:2d56:d473:2bc7:57e3:20ac" . 248495)
+    ("50d2:3db6:52fa:2e7:12ec:5bc4:1bd1:49f9" . 124471)
+    ("53e1:1812:ffa:dccf:f9f2:64be:75fa:795" . 539993)
+    ("544d:eeba:3990:35d1:ad66:f9a3:576d:8617" . 374443)
+    ("6a53:40dc:8f1d:3ffa:efeb:3aa3:df88:b94b" . 435070)
+    ("87aa:d1c9:9edb:91e7:aab1:9eb9:baa0:de18" . 244121)
+    ("9f00:48fa:88e3:4b67:a6f3:e6d2:5cc1:5be2" . 862116)
+    ("c49f:9cc6:86ad:ba08:4580:315e:dbd1:8a62" . 969411)
+    ("dff5:8021:61d:b17d:406d:7888:fdac:4a20" . 969411)
+    ("e888:6791:2960:d723:bcfd:47e1:2d8c:599f" . 824019)
+    ("ffff:d499:8c4b:4941:bc81:d5b9:b51e:85a8" . 824019))
+  "Core's expected GetMappedAS for each address, verbatim from the same test.")
+
+(test asmap-matches-cores-own-test-vectors
+  "Every expectation here is copied from Core's asmap_test_vectors
+(src/test/netbase_tests.cpp:618-663), against Core's own map data.
+
+This is the test that matters for the whole option: the format is a bit-packed
+trie read LITTLE-endian within a byte for the MAP and BIG-endian for the IP,
+and getting that pair backwards decodes to plausible garbage rather than
+failing. Only vectors from Core can tell the two apart. The 0s are as
+load-bearing as the ASNs — they are addresses the map deliberately does not
+cover, and a decoder that invented an ASN for them would silently mis-bucket."
+  (let ((data (bitcoin-lisp.crypto:hex-to-bytes +core-asmap-test-data+)))
+    (is (= 413 (length data)) "the map data did not round-trip through hex")
+    (dolist (entry +core-asmap-expectations+)
+      (multiple-value-bind (net bytes)
+          (bitcoin-lisp.networking:parse-network-address (car entry))
+        (declare (ignore net))
+        (is (= (cdr entry) (bitcoin-lisp.networking:asmap-interpret data bytes))
+            "~A mapped to ~D, Core says ~D"
+            (car entry)
+            (bitcoin-lisp.networking:asmap-interpret data bytes)
+            (cdr entry))))))
+
+(test asmap-changes-the-netgroup-and-falls-back-when-unmapped
+  "The point of -asmap: two addresses in ONE AS share a bucket group, where
+prefix bucketing would have put them in different ones. An address the map does
+not cover keeps the prefix rules, as Core's GetGroup does when Interpret
+returns 0."
+  (let ((data (bitcoin-lisp.crypto:hex-to-bytes +core-asmap-test-data+)))
+    (flet ((group (host)
+             (multiple-value-bind (net bytes)
+                 (bitcoin-lisp.networking:parse-network-address host)
+               (bitcoin-lisp.networking::net-group-key bytes net))))
+      ;; Two addresses Core maps to the SAME ASN (969411) but which share no
+      ;; prefix at all.
+      (let ((a "c49f:9cc6:86ad:ba08:4580:315e:dbd1:8a62")
+            (b "dff5:8021:61d:b17d:406d:7888:fdac:4a20"))
+        (let ((bitcoin-lisp.networking::*asmap* nil))
+          (is (not (equalp (group a) (group b)))
+              "control: without a map these must be different groups"))
+        (let ((bitcoin-lisp.networking::*asmap* data))
+          (is (equalp (group a) (group b))
+              "two addresses in one AS did not share a group")))
+      ;; An address the map does not cover (Core says 0) keeps prefix
+      ;; bucketing rather than collapsing into a single "unmapped" group.
+      (let ((u1 "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38")
+            (u2 "378e:7290:54e5:bd36:4760:971c:e9b9:570d"))
+        (let ((bitcoin-lisp.networking::*asmap* data))
+          (is (not (equalp (group u1) (group u2)))
+              "unmapped addresses collapsed into one group"))))))
+
+(test asmap-file-loading-is-fatal-on-failure
+  "Core aborts startup on a missing or empty asmap file (init.cpp:1587-1600).
+Silently keeping /16 bucketing would leave exactly the eclipse exposure the
+operator was trying to close."
+  (signals error (bitcoin-lisp.networking:load-asmap-file
+                  #p"/nonexistent/asmap.dat"))
+  (let ((path (merge-pathnames (format nil "bl-empty-asmap-~D"
+                                       (get-internal-real-time))
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (with-open-file (out path :direction :output
+                                     :element-type '(unsigned-byte 8)
+                                     :if-exists :supersede))
+           (signals error (bitcoin-lisp.networking:load-asmap-file path)))
+      (ignore-errors (delete-file path))))
+  ;; And it reaches the plist as an ordinary option.
+  (is (equal "peers.map"
+             (getf (bitcoin-lisp::args->start-node-plist
+                    '("-regtest" "-asmap=peers.map") nil)
+                   :asmap)))
+  (is-true (bitcoin-lisp::known-config-option-p "asmap"))
+  (is-false (bitcoin-lisp::core-only-option-p "asmap")))
+
 (test addr-fetch-peer-disconnects-once-it-delivers-addresses
   "An addr-fetch peer (-seednode) exists only to hand over addresses and is
 disconnected as soon as it does (Core net_processing.cpp:4117-4121). Core
