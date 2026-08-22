@@ -975,3 +975,43 @@ than on the flags, since the flag existing is not the feature."
                  (bitcoin-lisp::format-log-entry :info "hello" '()))))
     ;; A second bracketed field appears between the timestamp and the level.
     (is (= 2 (count #\[ named)) "thread name missing from ~S" named)))
+
+(test relay-policy-knobs-take-effect
+  "-dustrelayfee, -incrementalrelayfee and -bytespersigop are relay POLICY, not
+consensus, and Core exposes all three. Ours were compiled-in constants, so a
+node could not be tuned at all — and two of them were DEFCONSTANTs, which in
+this image means the value is folded into every caller and cannot be changed
+even at the REPL without a restart.
+
+Fee rates arrive as BTC/kvB on the command line, as every other Core fee option
+does, and are stored as satoshis."
+  (let ((saved (list bitcoin-lisp.validation::+dust-relay-fee-rate+
+                     bitcoin-lisp.mempool::+incremental-relay-fee-rate+
+                     bitcoin-lisp.mempool::+bytes-per-sigop+)))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-config-globals
+            '(("dustrelayfee" . "0.00004")
+              ("incrementalrelayfee" . "0.00002")
+              ("bytespersigop" . "40")))
+           (is (= 4000 bitcoin-lisp.validation::+dust-relay-fee-rate+))
+           (is (= 2000 bitcoin-lisp.mempool::+incremental-relay-fee-rate+))
+           (is (= 40 bitcoin-lisp.mempool::+bytes-per-sigop+))
+           ;; And the sigop-adjusted size actually uses the new value, which is
+           ;; the point — a knob nothing reads is the failure this repo keeps
+           ;; finding.
+           (is (= (ceiling (* 3 40) 4)
+                  (bitcoin-lisp.mempool::sigop-adjusted-vsize 1 3))))
+      (setf bitcoin-lisp.validation::+dust-relay-fee-rate+ (first saved)
+            bitcoin-lisp.mempool::+incremental-relay-fee-rate+ (second saved)
+            bitcoin-lisp.mempool::+bytes-per-sigop+ (third saved))))
+  ;; Malformed values are refused, not silently ignored.
+  (dolist (bad '((("dustrelayfee" . "notanumber"))
+                 (("incrementalrelayfee" . "x"))
+                 (("bytespersigop" . "0"))
+                 (("bytespersigop" . "-1"))))
+    (signals error (bitcoin-lisp::apply-config-globals bad)))
+  ;; All three are known options and no longer reported as ignored.
+  (dolist (name '("dustrelayfee" "incrementalrelayfee" "bytespersigop"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))

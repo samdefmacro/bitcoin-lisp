@@ -888,6 +888,7 @@ specially in config-alist->start-node-plist.")
     "assumevalid" "minimumchainwork" "mempoolexpiry" "maxmempool" "minrelaytxfee"
     "blockmintxfee" "blockmaxweight" "blockreservedweight"
     "maxtxfee" "fallbackfee" "bantime" "uacomment"
+    "dustrelayfee" "incrementalrelayfee" "bytespersigop"
     "dnsseed" "fixedseeds"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
@@ -911,12 +912,12 @@ command-line options at startup, like Core ArgsManager::ParseParameters
   '(
     "acceptnonstdtxn" "addresstype" "alertnotify" "allowignoredconf" "asmap"
     "avoidpartialspends" "blocknotify" "blockreconstructionextratxn"
-    "blocksdir" "blocksxor" "blockversion" "bytespersigop" "capturemessages"
+    "blocksdir" "blocksxor" "blockversion" "capturemessages"
     "changetype" "checkaddrman" "checkblockindex" "checkblocks" "checklevel"
     "checkmempool" "checkpoints" "connect" "consolidatefeerate" "daemon"
     "daemonwait" "dbbatchsize" "deprecatedrpc"
-    "discardfee" "discover" "dns" "dustrelayfee" "fastprune"
-    "forcednsseed" "help" "i2pacceptincoming" "i2psam" "incrementalrelayfee"
+    "discardfee" "discover" "dns" "fastprune"
+    "forcednsseed" "help" "i2pacceptincoming" "i2psam"
     "ipcbind" "keypool" "limitancestorcount" "limitancestorsize"
     "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
     "loglevelalways" "logsourcelocations"
@@ -1317,6 +1318,31 @@ start-node-from-args."
           (unless sats
             (error "Invalid amount for -fallbackfee=~A" v))
           (setf *wallet-fallback-fee* sats))))
+    ;; -dustrelayfee: BTC/kvB below which an output is dust (Core
+    ;; DUST_RELAY_TX_FEE). Relay policy, not consensus, which is why the value
+    ;; it sets is a DEFPARAMETER rather than a DEFCONSTANT.
+    (let ((v (lk "dustrelayfee")))
+      (when v
+        (let ((sats (conf-parse-money v)))
+          (unless sats
+            (error "Invalid amount for -dustrelayfee=~A" v))
+          (setf bitcoin-lisp.validation::+dust-relay-fee-rate+ sats))))
+    ;; -incrementalrelayfee: BTC/kvB a replacement must beat the original by
+    ;; (Core DEFAULT_INCREMENTAL_RELAY_FEE).
+    (let ((v (lk "incrementalrelayfee")))
+      (when v
+        (let ((sats (conf-parse-money v)))
+          (unless sats
+            (error "Invalid amount for -incrementalrelayfee=~A" v))
+          (setf bitcoin-lisp.mempool::+incremental-relay-fee-rate+ sats))))
+    ;; -bytespersigop: equivalent bytes charged per weighted sigop (Core
+    ;; DEFAULT_BYTES_PER_SIGOP, policy.h:49).
+    (let ((v (lk "bytespersigop")))
+      (when v
+        (let ((n (conf-parse-int v)))
+          (unless (and n (plusp n))
+            (error "Invalid value for -bytespersigop=~A (must be a positive integer)" v))
+          (setf bitcoin-lisp.mempool::+bytes-per-sigop+ n))))
     ;; -bantime: default setban duration in seconds (Core banman.h:19
     ;; DEFAULT_MISBEHAVING_BANTIME = 86400, applied when setban gets no time).
     (let ((v (lk "bantime")))

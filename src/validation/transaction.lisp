@@ -187,10 +187,15 @@ bitcoin-lisp.mempool:single-truc-checks (at most 1 unconfirmed ancestor +
 1 descendant, TRUC_MAX_VSIZE, a 1000-vsize child cap, and v3<->non-v3 spend
 inheritance), so v3 is relayed with its anti-pinning guarantees.")
 
-(defconstant +dust-relay-fee-rate+ 3000
+(defparameter +dust-relay-fee-rate+ 3000
   "Dust relay fee rate in satoshis per kvB (Bitcoin Core DUST_RELAY_TX_FEE).
 An output is dust when spending it would cost more than 1/3 its value at
-this rate (~546 sat for P2PKH, ~294 sat for P2WPKH).")
+this rate (~546 sat for P2PKH, ~294 sat for P2WPKH).
+
+A DEFPARAMETER, not a DEFCONSTANT, because Core exposes it as -dustrelayfee:
+this is relay POLICY, not consensus, and a node may legitimately run a
+different value. The +NAME+ spelling is kept because every caller reads it as a
+constant and renaming it would touch far more than this.")
 
 (defconstant +max-standard-scriptsig-size+ 1650
   "Maximum scriptSig size for a standard input (Bitcoin Core
