@@ -1,6 +1,6 @@
 # Wallet Functionality — Implementation Plan
 
-Date: 2026-07-15. Status: **PLAN — not started.**
+Date: 2026-07-15. Status (2026-08-22): **P0-P6 DONE** (P0 #283, P2 #288, P3 #290, P4 #293 per §5; P1, P5 and P6 shipped without their rows being updated — see `git log --grep="Wallet P"`). P7 partial: the four descriptor RPCs (G7-42) and the Sparrow acceptance run remain.
 Reference: Bitcoin Core `refs/bitcoin/` @ d3056bc (v30-dev, descriptor-only wallets).
 Researched via 2 agents (Core `src/wallet/` architecture; our building-block inventory).
 Companion plan: `docs/gui-plan.md` (wallet screens there gate on phases here).

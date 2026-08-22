@@ -1,0 +1,106 @@
+# Cold battery on every push and pull request.
+#
+# Runs exactly what a developer runs locally: scripts/docker-test.sh inside
+# the pinned toolchain image (docker/Dockerfile, SBCL 2.6.5). The image is a
+# from-source SBCL bootstrap (~25 min), so it is built once per Dockerfile
+# change and reused from the GitHub Actions layer cache; a cache hit costs
+# seconds. The script's exit code is the verdict (it exits non-zero on any
+# failure and on a zero-selection suite) — but the check count is asserted
+# too, so a battery that aborts early and reports a tiny green N cannot pass.
+name: cold-battery
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: cold-battery-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cold-battery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      IMAGE: bitcoin-lisp-sbcl:2.6.5-3
+      # Core ref the test vectors are read from; keep in step with CLAUDE.md.
+      BITCOIN_CORE_REF: d3056bc149f605225f22b1cc83b1a2d1cea64258
+      MIN_CHECKS: 30000
+    steps:
+      - uses: actions/checkout@v4
+
+      # refs/coalton is git-ignored and pinned by scripts/setup-coalton.sh.
+      - name: Fetch pinned Coalton
+        run: scripts/setup-coalton.sh
+
+      # Only the vector files are needed (tests/*.lisp read
+      # refs/bitcoin/src/test/data, src/test/net_tests.cpp,
+      # src/minisketch/doc/math.md and two files under test/functional), so a
+      # sparse, blobless checkout keeps this to a few MB.
+      - name: Fetch Bitcoin Core test vectors (sparse)
+        run: |
+          git clone --filter=blob:none --sparse --no-checkout \
+            https://github.com/bitcoin/bitcoin.git refs/bitcoin
+          git -C refs/bitcoin sparse-checkout set \
+            src/test/data src/test/net_tests.cpp src/minisketch/doc \
+            test/functional/data test/functional/test_framework/crypto
+          git -C refs/bitcoin checkout "$BITCOIN_CORE_REF"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (or restore) the toolchain image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          tags: ${{ env.IMAGE }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Cold battery
+        run: |
+          set -o pipefail
+          scripts/docker-test.sh 2>&1 | tee battery.log
+          n=$(grep -oE 'Did [0-9]+ checks' battery.log | tail -1 | grep -oE '[0-9]+')
+          echo "checks: ${n:-none}"
+          test -n "$n" && test "$n" -ge "$MIN_CHECKS"
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: battery-log
+          path: battery.log
+
+  parens:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Balanced-paren check over every Lisp file; cheap, and it is the
+      # failure mode that hides a READ error behind a silent compile abort.
+      - name: Check parens
+        run: |
+          python3 - <<'PY'
+          import sys, pathlib
+          bad = []
+          for f in list(pathlib.Path('src').rglob('*.lisp')) + list(pathlib.Path('tests').rglob('*.lisp')):
+              depth = 0; s = f.read_text(errors='replace'); i = 0; in_str = False; in_cmt = False
+              while i < len(s):
+                  c = s[i]
+                  if in_cmt:
+                      if c == '\n': in_cmt = False
+                  elif in_str:
+                      if c == '\\': i += 1
+                      elif c == '"': in_str = False
+                  elif c == ';': in_cmt = True
+                  elif c == '"': in_str = True
+                  elif c == '#' and s[i+1:i+2] == '\\': i += 2
+                  elif c == '(': depth += 1
+                  elif c == ')': depth -= 1
+                  i += 1
+              if depth != 0: bad.append((str(f), depth))
+          for f, d in bad: print(f"UNBALANCED {f}: {d:+d}")
+          sys.exit(1 if bad else 0)
+          PY
