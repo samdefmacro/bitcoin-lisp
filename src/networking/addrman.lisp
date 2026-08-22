@@ -124,7 +124,7 @@ our representation and never reach this."
            (list (logxor #xFF (aref ip 12)) (logxor #xFF (aref ip 13)))))))
 
 (defun net-group-key (ip &optional net)
-  "GetGroup (no ASMap; Core netgroup.cpp:19-107): the bucket group used to
+  "GetGroup (Core netgroup.cpp:19-107): the bucket group used to
 spread addresses across buckets by network operator. IPv4 -> [1, /16];
 IPv6 -> [2, /32], except tunneled/translated IPv4 carriers (6to4, Teredo,
 RFC6052/6145) which group as the linked IPv4's /16 with Core's NET_IPV4
@@ -135,10 +135,25 @@ skipping the constant 0xFC prefix byte); unroutable -> [0] (for IPv6 that
 includes fc00::/7 arriving untagged, per address-routable-p; private IPv4
 stays grouped — our deliberate divergence). The leading byte is Core's
 Network enum value (IPV4=1 IPV6=2 ONION=3 I2P=4 CJDNS=5). NET NIL derives
-IPv4/IPv6 from the 16-byte mapped form."
+IPv4/IPv6 from the 16-byte mapped form.
+
+With an -asmap loaded, a mapped address groups by its ASN instead of its
+prefix (Core GetGroup's `if (m_asmap.size())` branch, netgroup.cpp:31-40). That
+is the whole point of the option: an AS often spans many /16s, so prefix
+bucketing lets one operator look like many groups. An address the map does not
+cover falls back to the prefix rules below, as Core's does when Interpret
+returns 0."
   (flet ((group (&rest bytes)
            (make-array (length bytes) :element-type '(unsigned-byte 8)
                                       :initial-contents bytes)))
+    (let ((asn (and *asmap* (= (length ip) 16) (asmap-asn ip))))
+      (when asn
+        ;; Core prefixes the network class byte and then the ASN, so two
+        ;; addresses in one AS share a group and nothing else does.
+        (return-from net-group-key
+          (group 1
+                 (logand #xff (ash asn -24)) (logand #xff (ash asn -16))
+                 (logand #xff (ash asn -8))  (logand #xff asn)))))
     (let ((net (or net (and (= (length ip) 16) (ip-network ip)))))
       (case net
         (:ipv4

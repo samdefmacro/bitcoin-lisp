@@ -1466,6 +1466,10 @@
    #:network-address-to-string
    #:parse-network-address
    #:parse-subnet
+   ;; -asmap
+   #:load-asmap-file
+   #:asmap-interpret
+   #:asmap-asn
    ;; Net permissions (-whitelist / -whitebind)
    #:parse-permission-flags
    #:parse-whitelist-entry

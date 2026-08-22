@@ -706,3 +706,167 @@ ToStrings). \"implicit\" is not a permission and is never listed."
       (emit +perm-download+ "download")
       (emit +perm-addr+ "addr"))
     (nreverse out)))
+
+;;;; -asmap: ASN-based netgroup bucketing (Core util/asmap.cpp)
+;;;;
+;;;; Without a map, Core (and this node) buckets IPv4 peers by /16. That is a
+;;;; crude proxy for "different operator": a single AS often spans many /16s,
+;;;; so an attacker holding one AS can present addresses that look like many
+;;;; groups. An asmap replaces the /16 with the real ASN, which is what the
+;;;; eclipse-resistance argument actually wants.
+;;;;
+;;;; The file is a bit-packed binary trie. The bits within a byte are read
+;;;; LITTLE-endian for the map and BIG-endian for the IP being looked up —
+;;;; getting that pair backwards decodes to plausible garbage rather than
+;;;; failing, so both directions are pinned by test against Core's own vectors.
+
+(defconstant +asmap-invalid+ #xFFFFFFFF
+  "Core's INVALID sentinel: a decode that ran off the end of the data.")
+
+(defvar *asmap* nil
+  "The loaded -asmap bytecode as a byte vector, or NIL for /16 bucketing.")
+
+(defun %asmap-bit-le (data bitpos)
+  "One bit of DATA at BITPOS, LITTLE-endian within the byte (Core
+ConsumeBitLE). Used for the MAP."
+  (declare (type (simple-array (unsigned-byte 8) (*)) data)
+           (type fixnum bitpos))
+  (logand 1 (ash (aref data (ash bitpos -3)) (- (logand bitpos 7)))))
+
+(defun %asmap-bit-be (data bitpos)
+  "One bit of DATA at BITPOS, BIG-endian within the byte (Core ConsumeBitBE).
+Used for the IP, to match network byte order."
+  (declare (type (simple-array (unsigned-byte 8) (*)) data)
+           (type fixnum bitpos))
+  (logand 1 (ash (aref data (ash bitpos -3)) (- (- 7 (logand bitpos 7))))))
+
+(defun %asmap-decode-bits (data bitpos minval bit-sizes)
+  "Core DecodeBits: a variable-length integer, MINVAL plus a class-encoded
+offset. Returns (values value new-bitpos), or (values +asmap-invalid+ ...) on
+EOF. Continuation bits select the class; the mantissa within a class is
+BIG-endian even though the bits come off the stream little-endian."
+  (declare (type (simple-array (unsigned-byte 8) (*)) data)
+           (type fixnum bitpos))
+  (let ((val minval)
+        (endpos (* 8 (length data)))
+        (n (length bit-sizes)))
+    (loop for i below n
+          for size = (elt bit-sizes i)
+          for last-class-p = (= i (1- n))
+          do (let ((bit (if last-class-p
+                            0
+                            (if (>= bitpos endpos)
+                                (return-from %asmap-decode-bits
+                                  (values +asmap-invalid+ bitpos))
+                                (prog1 (%asmap-bit-le data bitpos)
+                                  (incf bitpos))))))
+               (if (= bit 1)
+                   (incf val (ash 1 size))
+                   (progn
+                     (dotimes (b size)
+                       (when (>= bitpos endpos)
+                         (return-from %asmap-decode-bits
+                           (values +asmap-invalid+ bitpos)))
+                       (incf val (ash (%asmap-bit-le data bitpos) (- size 1 b)))
+                       (incf bitpos))
+                     (return-from %asmap-decode-bits (values val bitpos))))))
+    (values +asmap-invalid+ bitpos)))
+
+(defparameter +asmap-type-bit-sizes+ #(0 0 1))
+(defparameter +asmap-asn-bit-sizes+ #(15 16 17 18 19 20 21 22 23 24))
+(defparameter +asmap-match-bit-sizes+ #(1 2 3 4 5 6 7 8))
+(defparameter +asmap-jump-bit-sizes+
+  #(5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30))
+
+(defun asmap-interpret (asmap ip-bytes)
+  "Core Interpret (asmap.cpp:182-232): walk the trie for IP-BYTES and return
+its ASN, or 0 when the map does not cover it.
+
+0 is not a valid ASN, so a 0 here means \"no mapping\" and callers must fall
+back. Core asserts on a malformed map because SanityCheckAsmap ran at load
+time; we return 0 instead — a node that loaded a bad file should bucket by /16
+rather than die mid-connection."
+  (declare (type (simple-array (unsigned-byte 8) (*)) asmap ip-bytes))
+  (let ((pos 0)
+        (endpos (* 8 (length asmap)))
+        (ip-bit 0)
+        (ip-bits-end (* 8 (length ip-bytes)))
+        (default-asn 0))
+    (loop while (< pos endpos)
+          do (multiple-value-bind (opcode next)
+                 (%asmap-decode-bits asmap pos 0 +asmap-type-bit-sizes+)
+               (setf pos next)
+               (case opcode
+                 (0                              ; RETURN
+                  (multiple-value-bind (asn next2)
+                      (%asmap-decode-bits asmap pos 1 +asmap-asn-bit-sizes+)
+                    (declare (ignore next2))
+                    (return-from asmap-interpret
+                      (if (= asn +asmap-invalid+) 0 asn))))
+                 (1                              ; JUMP
+                  (multiple-value-bind (jump next2)
+                      (%asmap-decode-bits asmap pos 17 +asmap-jump-bit-sizes+)
+                    (when (= jump +asmap-invalid+) (return))
+                    (setf pos next2)
+                    (when (= ip-bit ip-bits-end) (return))
+                    (when (>= jump (- endpos pos)) (return))
+                    (let ((bit (%asmap-bit-be ip-bytes ip-bit)))
+                      (incf ip-bit)
+                      (when (= bit 1) (incf pos jump)))))
+                 (2                              ; MATCH
+                  (multiple-value-bind (match next2)
+                      (%asmap-decode-bits asmap pos 2 +asmap-match-bit-sizes+)
+                    (when (= match +asmap-invalid+) (return))
+                    (setf pos next2)
+                    (let ((matchlen (1- (integer-length match))))
+                      (when (< (- ip-bits-end ip-bit) matchlen) (return))
+                      (dotimes (b matchlen)
+                        (let ((bit (%asmap-bit-be ip-bytes ip-bit)))
+                          (incf ip-bit)
+                          (unless (= bit (logand 1 (ash match (- (- matchlen 1 b)))))
+                            (return-from asmap-interpret default-asn)))))))
+                 (3                              ; DEFAULT
+                  (multiple-value-bind (asn next2)
+                      (%asmap-decode-bits asmap pos 1 +asmap-asn-bit-sizes+)
+                    (when (= asn +asmap-invalid+) (return))
+                    (setf default-asn asn
+                          pos next2)))
+                 (t (return)))))
+    ;; Ran off the end without a RETURN. Core asserts; we report "unmapped".
+    0))
+
+(defun asmap-asn (ip-bytes)
+  "The ASN for a 16-byte address under the loaded -asmap, or NIL when no map is
+loaded or the map does not cover it.
+
+IPv4 is looked up on its 4 native bytes, not the 16-byte mapped form: Core
+builds the lookup key from CNetAddr::GetAddrBytes, which for IPv4 is 4 bytes,
+and an asmap built for 32-bit IPv4 keys would walk into nonsense given 128 bits
+of ::ffff: prefix."
+  (when (and *asmap* (= 16 (length ip-bytes)))
+    (let* ((v4 (and (loop for i below 10 always (zerop (aref ip-bytes i)))
+                    (= #xff (aref ip-bytes 10))
+                    (= #xff (aref ip-bytes 11))))
+           (key (if v4
+                    (subseq ip-bytes 12 16)
+                    ip-bytes))
+           (asn (asmap-interpret *asmap* key)))
+      (and (plusp asn) asn))))
+
+(defun load-asmap-file (path)
+  "Read an -asmap file into *ASMAP*. Returns the byte count, or signals.
+
+Core aborts startup on an unreadable or empty asmap file (init.cpp:1587-1600):
+a node that silently kept /16 bucketing after being told to use an ASN map
+would have exactly the eclipse exposure the operator was trying to close."
+  (with-open-file (in path :element-type '(unsigned-byte 8)
+                           :if-does-not-exist nil)
+    (unless in
+      (error "Could not find asmap file ~A" path))
+    (let* ((size (file-length in))
+           (buf (make-array size :element-type '(unsigned-byte 8))))
+      (when (zerop size)
+        (error "Could not parse asmap file ~A" path))
+      (read-sequence buf in)
+      (setf *asmap* buf)
+      size)))
