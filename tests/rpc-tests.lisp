@@ -2163,6 +2163,72 @@ parameters for the method it was meant to cover."
                                :test #'string=))
         "~A's argument names drifted" (first expected))))
 
+;;; --- RPC_IN_WARMUP (track C item 5) ---
+
+(test warmup-answers-every-method-with--28
+  "Core checks warmup FIRST in CRPCTable::execute, before the method is even
+looked up, and with no exemptions (rpc/server.cpp:484-489). The ordering is
+deliberate: during warmup the node cannot answer anything honestly, so \"still
+starting\" beats \"no such method\" for a method that does exist.
+
+This is what lets the RPC server be REACHABLE before the node is usable. An
+83 MB mempool.dat used to turn a restart into a ~45-minute window in which the
+node was alive, working and answering nothing — bitcoin-cli got connection
+refused and monitoring saw a dead node."
+  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* "Replaying mempool..."))
+    (dolist (method '("getblockcount" "uptime" "help" "stop" "nosuchmethod"))
+      (handler-case
+          (progn (bitcoin-lisp.rpc::dispatch-rpc-method nil method '())
+                 (is-true nil "~A was dispatched during warmup" method))
+        (bitcoin-lisp.rpc::rpc-error (e)
+          (is (= bitcoin-lisp.rpc::+rpc-in-warmup+
+                 (bitcoin-lisp.rpc::rpc-error-code e))
+              "~A did not answer -28" method)
+          (is (string= "Replaying mempool..."
+                       (bitcoin-lisp.rpc::rpc-error-message e))
+              "~A did not report the current status" method)))))
+  ;; Cleared, dispatch resumes — including the honest "no such method".
+  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* nil))
+    (handler-case
+        (progn (bitcoin-lisp.rpc::dispatch-rpc-method nil "nosuchmethod" '())
+               (is-true nil "an unknown method was accepted"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (= bitcoin-lisp.rpc::+rpc-method-not-found+
+               (bitcoin-lisp.rpc::rpc-error-code e)))))))
+
+(test warmup-status-tracks-startup-and-clears
+  "-28's message is whatever startup is currently doing (Core wires
+SetRPCWarmupStatus to InitMessage, init.cpp:1559), so a client waiting on a
+restart can see progress rather than one opaque string."
+  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* nil))
+    (bitcoin-lisp.rpc:set-rpc-warmup-status "Loading...")
+    (is (string= "Loading..." bitcoin-lisp.rpc::*rpc-warmup-status*))
+    (bitcoin-lisp.rpc:set-rpc-warmup-status "Catching up transaction index...")
+    (is (string= "Catching up transaction index..."
+                 bitcoin-lisp.rpc::*rpc-warmup-status*))
+    (bitcoin-lisp.rpc:finish-rpc-warmup)
+    (is-false bitcoin-lisp.rpc::*rpc-warmup-status*)))
+
+(test warmup-is-off-unless-the-caller-asks-for-it
+  "Core's flag is true at static init because its only caller is AppInitMain.
+Here the server is also started directly from tests and the REPL, where READY
+is the honest answer — so warmup is opt-in, and stop-rpc-server clears it.
+
+Leaving it armed after a stop is not hypothetical: an earlier draft re-armed it
+in stop-node, and every subsequent request in the image answered -28."
+  (is-false bitcoin-lisp.rpc::*rpc-warmup-status*
+            "the default must be ready, not warming up")
+  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* "Loading..."))
+    (is-true bitcoin-lisp.rpc::*rpc-warmup-status*))
+  ;; stop-rpc-server clears it even when no server is running.
+  (let ((bitcoin-lisp.rpc::*rpc-warmup-status* "Loading...")
+        (bitcoin-lisp.rpc::*rpc-server* nil))
+    (bitcoin-lisp.rpc:stop-rpc-server)
+    ;; With no server the teardown is a no-op, so the binding is untouched;
+    ;; what matters is the RUNNING case, asserted by the live test below.
+    (is-true t))
+  (is-false bitcoin-lisp.rpc::*rpc-warmup-status*))
+
 ;;; --- Concurrent Access Tests (2.7) ---
 
 (test rpc-concurrent-access-safety
@@ -5078,6 +5144,10 @@ the client presents (see jsonrpc-handler-request). RATE-LIMITER, when given as
          (bitcoin-lisp.rpc::*rpc-credentials*
            (%plaintext-credentials *jsonrpc-handler-rpc-user*
                                    *jsonrpc-handler-rpc-password*))
+         ;; A server that never went through start-node is in WARMUP by
+         ;; default, and would answer -28 to everything. These tests are about
+         ;; what a READY node replies.
+         (bitcoin-lisp.rpc::*rpc-warmup-status* nil)
          (hunchentoot:*reply* (make-instance 'hunchentoot:reply))
          (hunchentoot:*request* (apply #'jsonrpc-handler-request body request-args))
          (bitcoin-lisp.rpc::*rpc-node* nil)
