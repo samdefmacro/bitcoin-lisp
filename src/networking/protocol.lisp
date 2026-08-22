@@ -187,14 +187,26 @@ Returns T if message was handled, NIL otherwise."
      t)
 
     ((string= command "mempool")
-     ;; BIP35. Core only honors this when it advertises NODE_BLOOM or the
-     ;; peer has explicit mempool permission — otherwise it disconnects
-     ;; ("mempool request with bloom filters disabled",
-     ;; net_processing.cpp:4940-4951). We never advertise NODE_BLOOM, so
-     ;; the disconnect path is the whole behavior.
-     (bitcoin-lisp:log-cat "net" "mempool request with bloom filters disabled — disconnecting peer ~A"
-                           (peer-address peer))
-     (disconnect-peer peer)
+     ;; BIP35. Core honors this only when it advertises NODE_BLOOM or the peer
+     ;; holds the "mempool" permission; otherwise it disconnects ("mempool
+     ;; request with bloom filters disabled", net_processing.cpp:4940-4951). We
+     ;; never advertise NODE_BLOOM, so the permission is the only way in.
+     ;;
+     ;; Core also refuses a permitted request once -maxuploadtarget is spent
+     ;; (:4953), and does not disconnect a noban peer for it either.
+     (cond
+       ((not (peer-has-permission-p peer +perm-mempool+))
+        (bitcoin-lisp:log-cat
+         "net" "mempool request with bloom filters disabled — disconnecting peer ~A"
+         (peer-address peer))
+        (disconnect-peer peer))
+       ((bitcoin-lisp.networking::outbound-target-reached-p nil)
+        (bitcoin-lisp:log-cat
+         "net" "mempool request with bandwidth limit reached from ~A"
+         (peer-address peer))
+        (unless (peer-has-permission-p peer +perm-noban+)
+          (disconnect-peer peer)))
+       (t (handle-mempool-request peer mempool)))
      t)
 
     ((string= command "notfound")
@@ -1273,9 +1285,13 @@ the number stored."
            (relay-candidates '()))
       (when peer
         (%refill-addr-token-bucket peer))
+      ;; The "addr" permission lifts the rate limit entirely: such a peer may
+      ;; send us unlimited addresses (Core net_processing.cpp:4066
+      ;; `rate_limited = !pfrom.HasPermission(NetPermissionFlags::Addr)`).
+      (let ((rate-limited (and peer (not (peer-has-permission-p peer +perm-addr+)))))
       (dolist (entry (alexandria:shuffle (copy-list entries)))
         (cond
-          ((and peer (< (peer-addr-token-bucket peer) 1.0d0))
+          ((and rate-limited (< (peer-addr-token-bucket peer) 1.0d0))
            (incf num-rate-limit))
           (t
            (when peer
@@ -1286,7 +1302,7 @@ the number stored."
                                          address-book source-group now
                                          source-net source-ip)
              (incf added stored)
-             (when relay (push relay relay-candidates))))))
+             (when relay (push relay relay-candidates)))))))
       (when peer
         (incf (peer-addr-processed peer) num-proc)
         (incf (peer-addr-rate-limited peer) num-rate-limit)
@@ -1687,7 +1703,13 @@ RECENT-REJECTS is optional; when provided, recently rejected txs are cached."
   ;; mainnet default, block-relay/feeler conns) violates the protocol:
   ;; disconnect (Core RejectIncomingTxs gate in the TX handler,
   ;; net_processing.cpp:4474-4479).
-  (when (or (ignore-incoming-txs-p)
+  ;; A peer holding the "relay" permission may send us transactions even in
+  ;; -blocksonly (Core RejectIncomingTxs, net_processing.cpp:5686-5694 — the
+  ;; permission excuses the -blocksonly clause and ONLY that clause; a
+  ;; block-relay-only or feeler connection may never send txs whatever its
+  ;; permissions).
+  (when (or (and (ignore-incoming-txs-p)
+                 (not (peer-has-permission-p peer +perm-relay+)))
             (not (peer-relays-txs-p peer)))
     (bitcoin-lisp:log-cat "net" "transaction sent in violation of protocol — disconnecting peer ~A"
                           (peer-address peer))
@@ -2045,11 +2067,11 @@ handling of unavailable blocks."
                  ;; new block) is spent, and disconnect the asker — Core
                  ;; net_processing.cpp:2376-2383. Only blocks older than a week
                  ;; relative to our best header count as historical, so a peer
-                 ;; following the tip is unaffected. Core exempts peers with the
-                 ;; "download" permission; we have no permission flags yet, so
-                 ;; there is nothing to exempt.
+                 ;; following the tip is unaffected, and a peer holding the
+                 ;; "download" permission may exceed the target outright.
                  ((and entry
                        (bitcoin-lisp.networking::outbound-target-reached-p t)
+                       (not (peer-has-permission-p peer +perm-download+))
                        (let ((best (best-header)))
                          (flet ((btime (e)
                                   (let ((h (bitcoin-lisp.storage:block-index-entry-header e)))
@@ -2833,6 +2855,55 @@ BIP339: wtxidrelay peers get MSG_WTX + wtxid, others MSG_TX + txid
     (when mempool
       (setf (peer-last-inv-sequence peer)
             (bitcoin-lisp.mempool:mempool-sequence mempool)))))
+
+(defun handle-mempool-request (peer mempool)
+  "BIP35: announce the whole mempool to a peer holding the \"mempool\"
+permission (Core sets m_send_mempool and the next inv flush sends the pool,
+net_processing.cpp).
+
+Core's filters apply here as they do to an ordinary announcement: the peer's
+BIP133 feefilter, and its wtxid-relay preference for the inv type. Sent as one
+batch — Core caps an inv message at MAX_INV_SZ and so do we, which for a pool
+larger than that means the rest waits for ordinary relay, exactly as a peer
+that connected mid-flush would see it."
+  (unless (and mempool (peer-tx-relay-p peer))
+    (return-from handle-mempool-request nil))
+  (let ((invs '())
+        (count 0))
+    (bitcoin-lisp.mempool:mempool-for-each
+     mempool
+     (lambda (txid entry)
+       (when (and entry (< count bitcoin-lisp.serialization:+max-inv-count+))
+         (let ((fee-rate-per-kb
+                 (let ((vsize (bitcoin-lisp.mempool:mempool-entry-vsize entry)))
+                   (if (plusp vsize)
+                       (floor (* 1000 (bitcoin-lisp.mempool:mempool-entry-fee entry))
+                              vsize)
+                       0))))
+           (when (or (zerop (peer-feefilter-rate peer))
+                     (>= fee-rate-per-kb (peer-feefilter-rate peer)))
+             (incf count)
+             ;; Mark it announced, so the anti-probing gate in
+             ;; FindTxForGetData lets the peer fetch what we just offered.
+             (bitcoin-lisp:add-recent-reject (peer-announced-txs peer) txid)
+             (let ((wtxid (bitcoin-lisp.mempool:mempool-entry-wtxid entry)))
+               (push (if (and (peer-wtxid-relay peer) wtxid)
+                         (bitcoin-lisp.serialization:make-inv-vector
+                          :type bitcoin-lisp.serialization:+inv-type-wtx+
+                          :hash wtxid)
+                         (bitcoin-lisp.serialization:make-inv-vector
+                          :type bitcoin-lisp.serialization:+inv-type-tx+
+                          :hash txid))
+                     invs)))))))
+    (when invs
+      (handler-case
+          (send-message peer (bitcoin-lisp.serialization:make-inv-message
+                              (nreverse invs)))
+        (error () nil)))
+    ;; As in the ordinary flush: everything in the pool now was announceable.
+    (setf (peer-last-inv-sequence peer)
+          (bitcoin-lisp.mempool:mempool-sequence mempool))
+    count))
 
 (defun flush-tx-announcements (peers mempool)
   "Flush due per-peer tx announcement queues (call ~1x/second from the

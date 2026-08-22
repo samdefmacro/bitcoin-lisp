@@ -2362,6 +2362,8 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (pid-file nil)
                         (connect-nodes nil connect-nodes-supplied-p)
                         (seednode nil)
+                        (whitelist nil)
+                        (whitebind nil)
                         (block-notify nil)
                         (startup-notify nil)
                         (shutdown-notify nil)
@@ -2605,6 +2607,37 @@ txindex ~D MiB, per-index ~D MiB"
   ;; -noconnect parses to — means no outbound connections at all; Core tests
   ;; for exactly that shape, so -connect=0 -connect=1.2.3.4 leaves BOTH as
   ;; targets rather than being read as a disable.
+  ;; -whitelist / -whitebind: permission grants by address range. Applied
+  ;; before any peer can connect. A malformed spec is fatal, as Core's is
+  ;; (init.cpp fails on the first entry NetWhitelistPermissions::TryParse
+  ;; rejects): a typo'd range grants nothing and the operator never finds out.
+  (setf bitcoin-lisp.networking::*whitelist-entries* '()
+        bitcoin-lisp.networking::*whitebind-flags* 0)
+  (dolist (spec whitelist)
+    (let ((entry (bitcoin-lisp.networking:parse-whitelist-entry spec)))
+      (unless entry
+        (error "Invalid netmask, IP address or permission in -whitelist: '~A'" spec))
+      (setf bitcoin-lisp.networking::*whitelist-entries*
+            (append bitcoin-lisp.networking::*whitelist-entries* (list entry)))))
+  (dolist (spec whitebind)
+    ;; -whitebind is "perms@addr:port": the ADDRESS half is a bind target, not
+    ;; a range, and we bind one listener, so only the PERMISSIONS are kept.
+    ;; Core refuses "out" here — a listening socket has no outgoing peers.
+    (multiple-value-bind (flags direction rest)
+        (bitcoin-lisp.networking:parse-permission-flags spec)
+      (declare (ignore rest))
+      (unless flags
+        (error "Invalid permission in -whitebind: '~A'" spec))
+      (when (member direction '(:out))
+        (error "whitebind may only be used for incoming connections (\"out\" was passed)"))
+      (setf bitcoin-lisp.networking::*whitebind-flags*
+            (logior bitcoin-lisp.networking::*whitebind-flags* flags))))
+  (when (or whitelist whitebind)
+    (log-info "Net permissions configured: ~D -whitelist range(s), -whitebind ~A"
+              (length whitelist)
+              (or (bitcoin-lisp.networking:permission-flag-names
+                   bitcoin-lisp.networking::*whitebind-flags*)
+                  "none")))
   (setf *use-addrman-outgoing* t *connect-nodes* '() *seed-nodes* '())
   ;; -seednode: address sources, not peers (Core connOptions.vSeedNodes).
   (when seednode

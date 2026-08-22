@@ -563,3 +563,146 @@ record, or NIL."
                       best-reach reach
                       best-score score)))))))
     best))
+
+;;;; Net permissions (-whitelist / -whitebind)
+;;;;
+;;;; Core NetPermissionFlags (net_permissions.h:24-47). A peer whose address
+;;;; falls inside a -whitelist range, or which arrived on a -whitebind listener,
+;;;; is exempted from specific policy limits.
+;;;;
+;;;; DIVERGENCE, stated because it is load-bearing: Core attaches flags to the
+;;;; CNode at connection time, because whitebind flags belong to the LISTENING
+;;;; SOCKET a peer arrived on and Core can hold several. We bind one listener
+;;;; (-bind takes the last), so the flags a peer has are a pure function of its
+;;;; ADDRESS plus the parsed configuration, and are computed on demand rather
+;;;; than stored per peer. Anything that adds a second listener must revisit
+;;;; this — the whitebind flags would then have to travel with the connection.
+
+(defconstant +perm-bloom-filter+ (ash 1 1))
+(defconstant +perm-force-relay-only+ (ash 1 2))
+(defconstant +perm-relay+ (ash 1 3))
+(defconstant +perm-noban-only+ (ash 1 4))
+(defconstant +perm-mempool+ (ash 1 5))
+(defconstant +perm-download+ (ash 1 6))
+(defconstant +perm-addr+ (ash 1 7))
+(defconstant +perm-implicit+ (ash 1 31)
+  "Set when the operator gave a range with NO explicit permissions, so the
+implicit defaults apply (Core NetPermissionFlags::Implicit).")
+
+(defconstant +perm-force-relay+ (logior +perm-force-relay-only+ +perm-relay+)
+  "Core: \"forcerelay implies relay\" — the enumerator itself is the OR.")
+(defconstant +perm-noban+ (logior +perm-noban-only+ +perm-download+)
+  "Core: \"noban ... implies download\".")
+(defconstant +perm-all+ (logior +perm-bloom-filter+ +perm-force-relay+
+                                +perm-relay+ +perm-noban+ +perm-mempool+
+                                +perm-download+ +perm-addr+))
+
+(defparameter *permission-names*
+  `(("bloomfilter" . ,+perm-bloom-filter+)
+    ("bloom"       . ,+perm-bloom-filter+)   ; Core accepts both spellings
+    ("noban"       . ,+perm-noban+)
+    ("forcerelay"  . ,+perm-force-relay+)
+    ("relay"       . ,+perm-relay+)
+    ("mempool"     . ,+perm-mempool+)
+    ("download"    . ,+perm-download+)
+    ("addr"        . ,+perm-addr+)
+    ("all"         . ,+perm-all+))
+  "Core TryParsePermissionFlags' name table (net_permissions.cpp:50-57).")
+
+(defstruct (whitelist-entry (:constructor %make-whitelist-entry (subnet flags direction)))
+  "One -whitelist range and the permissions it grants."
+  (subnet nil)
+  (flags 0 :type (unsigned-byte 32))
+  ;; :in, :out, or :both — Core's ConnectionDirection, from the \"in\"/\"out\"
+  ;; pseudo-permissions. Defaults to :both, as Core does when neither is given.
+  (direction :both :type keyword))
+
+(defun parse-permission-flags (string)
+  "Parse Core's \"perm1,perm2@range\" prefix.
+
+Returns (values flags direction rest) — REST being the address part — or NIL
+when a permission name is unknown. With no @ at all there are no explicit
+permissions and REST is the whole string, which is Core's implicit case
+(net_permissions.cpp:26-36)."
+  (let ((at (position #\@ string)))
+    (if (null at)
+        (values +perm-implicit+ :both string)
+        (let ((flags 0)
+              (direction nil)
+              (rest (subseq string (1+ at))))
+          (dolist (name (%split-on-comma (subseq string 0 at)))
+            (cond ((string= name "in")
+                   (setf direction (if (eq direction :out) :both :in)))
+                  ((string= name "out")
+                   (setf direction (if (eq direction :in) :both :out)))
+                  (t (let ((bit (cdr (assoc name *permission-names* :test #'string=))))
+                       (unless bit (return-from parse-permission-flags nil))
+                       (setf flags (logior flags bit))))))
+          (values flags (or direction :both) rest)))))
+
+(defun %split-on-comma (string)
+  (loop with start = 0
+        for comma = (position #\, string :start start)
+        collect (subseq string start comma)
+        while comma
+        do (setf start (1+ comma))))
+
+(defun parse-whitelist-entry (spec &key (allow-out t))
+  "Parse one -whitelist (or -whitebind) SPEC into a WHITELIST-ENTRY, or NIL.
+
+ALLOW-OUT NIL is -whitebind, where Core refuses \"out\" outright: a listening
+socket has no outgoing connections to grant permissions to
+(net_permissions.cpp:60-64)."
+  (multiple-value-bind (flags direction rest) (parse-permission-flags spec)
+    (when (and flags
+               (or allow-out (not (member direction '(:out :both))))
+               ;; :both only reaches the refusal above when it came from an
+               ;; explicit \"out\"; the default :both carries no direction at all.
+               t)
+      (let ((subnet (parse-subnet rest)))
+        (when subnet (%make-whitelist-entry subnet flags direction))))))
+
+(defvar *whitelist-entries* '()
+  "Parsed -whitelist ranges, in configuration order.")
+
+(defvar *whitebind-flags* 0
+  "Permissions granted to every INBOUND peer by -whitebind. A single value
+because we bind a single listener; see the divergence note above.")
+
+(defvar *whitelist-relay* t
+  "-whitelistrelay (Core DEFAULT_WHITELISTRELAY = true): a whitelisted peer's
+transactions are relayed even in -blocksonly.")
+
+(defvar *whitelist-force-relay* nil
+  "-whitelistforcerelay (Core DEFAULT_WHITELISTFORCERELAY = false).")
+
+(defun peer-permission-flags (address inbound)
+  "The permissions a peer at ADDRESS holds (Core CNode::m_permission_flags).
+
+An entry applies when its direction covers this connection's direction, so
+\"noban@1.2.3.4/32,out\" grants nothing to an inbound peer from that range.
+-whitebind's flags apply to inbound peers only, since they describe a listening
+socket."
+  (let ((flags (if inbound *whitebind-flags* 0)))
+    (dolist (entry *whitelist-entries* flags)
+      (when (and (or (eq (whitelist-entry-direction entry) :both)
+                     (eq (whitelist-entry-direction entry)
+                         (if inbound :in :out)))
+                 (address-in-subnets-p address
+                                       (list (whitelist-entry-subnet entry))))
+        (setf flags (logior flags (whitelist-entry-flags entry)))))))
+
+(defun permission-flag-names (flags)
+  "FLAGS as Core renders them in getpeerinfo.permissions (NetPermissions::
+ToStrings). \"implicit\" is not a permission and is never listed."
+  (let ((out '()))
+    (macrolet ((emit (bit name)
+                 `(when (= ,bit (logand flags ,bit)) (push ,name out))))
+      (emit +perm-bloom-filter+ "bloomfilter")
+      (emit +perm-noban+ "noban")
+      (emit +perm-force-relay+ "forcerelay")
+      (emit +perm-relay+ "relay")
+      (emit +perm-mempool+ "mempool")
+      (emit +perm-download+ "download")
+      (emit +perm-addr+ "addr"))
+    (nreverse out)))

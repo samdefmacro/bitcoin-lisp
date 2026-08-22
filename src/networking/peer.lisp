@@ -1642,16 +1642,33 @@ the loopback itself and takes every onion peer with it."
                                       (parse-integer address :end dot))))
                     (and first-octet (or (= first-octet 127) (= first-octet 0)))))))))
 
+(defun peer-has-permission-p (peer flag)
+  "T when PEER holds FLAG (Core CNode::HasPermission). Derived from the peer's
+address and direction — see the divergence note in netaddress.lisp."
+  (let ((flags (peer-permission-flags (peer-address peer) (peer-inbound peer))))
+    (= flag (logand flags flag))))
+
 (defun record-misbehavior (peer &optional reason)
   "Discourage and disconnect PEER for a protocol violation. Bitcoin Core's
 misbehavior model is binary (Misbehaving -> m_should_discourage): any single
 call marks the peer for discouragement — there is no accumulating score. The
 address is added to the ephemeral discourage filter (never dialed, preferred
 for eviction, not gossiped) and the connection is dropped. REASON, if given, is
-logged. Returns T."
+logged. Returns T, or NIL when PEER holds the noban permission and was
+therefore left alone."
   (when reason
     (bitcoin-lisp:log-cat "net" "Misbehaving peer ~A: ~A"
                           (peer-address peer) reason))
+  ;; NoBan: neither discouraged NOR disconnected (Core
+  ;; MaybeDiscourageAndDisconnect, net_processing.cpp — a noban peer's
+  ;; m_should_discourage is cleared and the connection kept). The whole point
+  ;; of -whitelist=noban is that a peer the operator trusts survives our
+  ;; opinion of its behaviour, so stopping at "not discouraged" while still
+  ;; dropping the connection would not deliver the option.
+  (when (peer-has-permission-p peer +perm-noban+)
+    (bitcoin-lisp:log-cat "net" "Not punishing whitelisted peer ~A"
+                          (peer-address peer))
+    (return-from record-misbehavior nil))
   ;; Core MaybeDiscourageAndDisconnect (net_processing.cpp:5194-5201):
   ;; disconnect a local peer for bad behaviour but do NOT discourage it,
   ;; "since that would discourage all peers on the same local address" — and

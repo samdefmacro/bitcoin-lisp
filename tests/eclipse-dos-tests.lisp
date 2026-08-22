@@ -616,6 +616,198 @@ whose best-known block is that entry."
       (setf (bitcoin-lisp.networking::peer-best-known-block-hash p) best-hash))
     p))
 
+(defmacro %with-whitelist ((&key entries (whitebind 0)) &body body)
+  "Run BODY with exactly ENTRIES (a list of -whitelist spec strings) parsed and
+installed, and WHITEBIND as the -whitebind flags. Bound, not set: the whitelist
+is global start-up configuration, and a test that leaked it would grant
+permissions to every peer in every later test."
+  `(let ((bitcoin-lisp.networking::*whitelist-entries*
+           (mapcar (lambda (spec)
+                     (or (bitcoin-lisp.networking:parse-whitelist-entry spec)
+                         (error "test fixture: unparseable -whitelist ~S" spec)))
+                   ,entries))
+         (bitcoin-lisp.networking::*whitebind-flags* ,whitebind))
+     ,@body))
+
+(test net-permission-flags-parse-as-cores-do
+  "Core TryParsePermissionFlags (net_permissions.cpp:26-90). The two implication
+rules are the ones worth pinning, because both are written into the ENUMERATOR
+in Core rather than into the parser: forcerelay implies relay, and noban
+implies download. A parser that treated them as independent bits would grant
+less than the operator asked for, silently."
+  (flet ((flags (spec)
+           (nth-value 0 (bitcoin-lisp.networking:parse-permission-flags spec)))
+         (rest-of (spec)
+           (nth-value 2 (bitcoin-lisp.networking:parse-permission-flags spec))))
+    ;; No @: implicit permissions, and the whole string is the address.
+    (is (= bitcoin-lisp.networking::+perm-implicit+ (flags "1.2.3.4")))
+    (is (equal "1.2.3.4" (rest-of "1.2.3.4")))
+    (is (equal "1.2.3.0/24" (rest-of "noban@1.2.3.0/24")))
+    ;; forcerelay implies relay; noban implies download.
+    (let ((f (flags "forcerelay@1.2.3.4")))
+      (is (= bitcoin-lisp.networking::+perm-relay+
+             (logand f bitcoin-lisp.networking::+perm-relay+))))
+    (let ((f (flags "noban@1.2.3.4")))
+      (is (= bitcoin-lisp.networking::+perm-download+
+             (logand f bitcoin-lisp.networking::+perm-download+))))
+    ;; "all" covers every named permission.
+    (let ((f (flags "all@1.2.3.4")))
+      (dolist (bit (list bitcoin-lisp.networking::+perm-bloom-filter+
+                         bitcoin-lisp.networking::+perm-relay+
+                         bitcoin-lisp.networking::+perm-force-relay+
+                         bitcoin-lisp.networking::+perm-noban+
+                         bitcoin-lisp.networking::+perm-mempool+
+                         bitcoin-lisp.networking::+perm-download+
+                         bitcoin-lisp.networking::+perm-addr+))
+        (is (= bit (logand f bit)))))
+    ;; Core accepts both spellings of bloomfilter.
+    (is (= (flags "bloom@1.2.3.4") (flags "bloomfilter@1.2.3.4")))
+    ;; Multiple permissions, comma-separated.
+    (let ((f (flags "noban,mempool@1.2.3.4")))
+      (is (= bitcoin-lisp.networking::+perm-mempool+
+             (logand f bitcoin-lisp.networking::+perm-mempool+)))
+      (is (= bitcoin-lisp.networking::+perm-noban+
+             (logand f bitcoin-lisp.networking::+perm-noban+))))
+    ;; An unknown permission is refused outright rather than ignored.
+    (is-false (flags "nosuchperm@1.2.3.4"))
+    (is-false (bitcoin-lisp.networking:parse-whitelist-entry "nosuchperm@1.2.3.4"))
+    ;; As is an unparseable range.
+    (is-false (bitcoin-lisp.networking:parse-whitelist-entry "noban@not-an-address"))
+    ;; -whitebind refuses "out": a listening socket has no outgoing peers.
+    (is-false (bitcoin-lisp.networking:parse-whitelist-entry
+               "noban,out@1.2.3.4" :allow-out nil)))
+  ;; Rendering back, for getpeerinfo.permissions. "implicit" is not a
+  ;; permission and is never listed.
+  (is (equal '("noban" "download")
+             (bitcoin-lisp.networking:permission-flag-names
+              bitcoin-lisp.networking::+perm-noban+)))
+  (is (null (bitcoin-lisp.networking:permission-flag-names
+             bitcoin-lisp.networking::+perm-implicit+))))
+
+(test net-permissions-apply-by-address-and-direction
+  "A range grants permissions only to peers inside it, and only in the
+direction the operator named — \"noban@...,out\" grants nothing to an inbound
+peer from that range. -whitebind's flags reach inbound peers only, since they
+describe a listening socket."
+  (%with-whitelist (:entries '("noban@10.0.0.0/8"))
+    (is (= bitcoin-lisp.networking::+perm-noban+
+           (logand (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" t)
+                   bitcoin-lisp.networking::+perm-noban+)))
+    ;; Outside the range: nothing.
+    (is (= 0 (bitcoin-lisp.networking:peer-permission-flags "11.1.2.3" t)))
+    ;; An address that does not parse is refused, never defaulted in.
+    (is (= 0 (bitcoin-lisp.networking:peer-permission-flags "not-an-address" t))))
+  (%with-whitelist (:entries '("noban,out@10.0.0.0/8"))
+    (is (= 0 (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" t))
+        "an out-only grant reached an inbound peer")
+    (is (plusp (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" nil))))
+  ;; -whitebind: inbound only.
+  (%with-whitelist (:entries '() :whitebind bitcoin-lisp.networking::+perm-mempool+)
+    (is (plusp (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" t)))
+    (is (= 0 (bitcoin-lisp.networking:peer-permission-flags "10.1.2.3" nil)))))
+
+(test noban-peer-is-neither-discouraged-nor-disconnected
+  "Core clears m_should_discourage for a noban peer AND keeps the connection
+(MaybeDiscourageAndDisconnect). Stopping at \"not discouraged\" while still
+dropping the connection would not deliver the option — the point of
+-whitelist=noban is that a peer the operator trusts survives our opinion of its
+behaviour."
+  (%with-whitelist (:entries '("noban@10.0.0.0/8"))
+    (let ((p (%g718-peer :inbound t)))
+      (setf (bitcoin-lisp.networking:peer-address p) "10.1.2.3")
+      (is-false (bitcoin-lisp.networking:record-misbehavior p "test"))
+      (is (eq :ready (bitcoin-lisp.networking:peer-state p))
+          "a noban peer was disconnected for misbehaviour")
+      (is-false (bitcoin-lisp.networking:peer-discouraged-p "10.1.2.3")))
+    ;; Control: a peer OUTSIDE the range is punished exactly as before.
+    (let ((p (%g718-peer :inbound t)))
+      (setf (bitcoin-lisp.networking:peer-address p) "11.1.2.3")
+      (is-true (bitcoin-lisp.networking:record-misbehavior p "test"))
+      (is (eq :disconnected (bitcoin-lisp.networking:peer-state p)))
+      (is-true (bitcoin-lisp.networking:peer-discouraged-p "11.1.2.3")))))
+
+(test relay-permission-excuses-blocksonly-and-nothing-else
+  "Core RejectIncomingTxs (net_processing.cpp:5686-5694): the \"relay\"
+permission excuses the -blocksonly clause and ONLY that clause. A
+block-relay-only or feeler connection may never send us transactions whatever
+its permissions — a permission that also unlocked those would let an operator
+turn a link they meant to keep block-only into a tx firehose."
+  (let ((bitcoin-lisp:*blocksonly* t)
+        (bitcoin-lisp:*network* :regtest))
+    (flet ((dropped-p (address conn-type)
+             (let ((p (%g718-peer :conn-type conn-type :inbound t)))
+               (setf (bitcoin-lisp.networking:peer-address p) address)
+               (bitcoin-lisp.networking::handle-tx
+                p (make-array 0 :element-type '(unsigned-byte 8))
+                nil nil nil nil)
+               (eq :disconnected (bitcoin-lisp.networking:peer-state p)))))
+      (%with-whitelist (:entries '("relay@10.0.0.0/8"))
+        ;; Control: without the permission, -blocksonly drops the sender.
+        (is-true (dropped-p "11.1.2.3" :outbound-full-relay))
+        ;; With it, the -blocksonly clause no longer applies.
+        (is-false (dropped-p "10.1.2.3" :outbound-full-relay))
+        ;; But a block-relay-only connection is still refused.
+        (is-true (dropped-p "10.1.2.3" :block-relay))
+        (is-true (dropped-p "10.1.2.3" :feeler))))))
+
+(test addr-permission-lifts-the-rate-limit
+  "Core net_processing.cpp:4066 — `rate_limited =
+!pfrom.HasPermission(NetPermissionFlags::Addr)`. Such a peer may send us
+unlimited addresses; everyone else spends tokens."
+  (flet ((rate-limited-count (address entries)
+           (let* ((book (bitcoin-lisp.networking:make-address-book))
+                  (p (%g718-peer :inbound t))
+                  (now (bitcoin-lisp.serialization:get-unix-time))
+                  (addrs (loop for i below 40
+                               collect (cons (bitcoin-lisp.serialization:make-net-addr
+                                              :services 1
+                                              :ip (bitcoin-lisp.networking:ipv4-to-mapped-ipv6
+                                                   10 0 0 (1+ i))
+                                              :port 8333)
+                                             now))))
+             (setf (bitcoin-lisp.networking:peer-address p) address)
+             ;; An EMPTY bucket, so any processing at all proves the exemption.
+             (setf (bitcoin-lisp.networking::peer-addr-token-bucket p) 0d0)
+             (%with-whitelist (:entries entries)
+               (bitcoin-lisp.networking::%process-gossiped-addresses
+                p addrs (length addrs) book nil))
+             (bitcoin-lisp.networking::peer-addr-rate-limited p))))
+    ;; Control: an empty bucket rate-limits every address.
+    (is (= 40 (rate-limited-count "11.1.2.3" '("noban@10.0.0.0/8"))))
+    ;; With the addr permission, none of them are.
+    (is (= 0 (rate-limited-count "10.1.2.3" '("addr@10.0.0.0/8"))))))
+
+(test mempool-permission-is-what-answers-bip35
+  "Core honours a BIP35 mempool request only from a peer with the \"mempool\"
+permission, since it does not advertise NODE_BLOOM (net_processing.cpp:
+4940-4951); everyone else is disconnected. Granting the permission and then
+sending nothing would be worse than the disconnect, so this asserts the inv
+actually goes out."
+  (let ((mp (bitcoin-lisp.mempool:make-mempool)))
+    (%mine-add mp (make-mempool-test-tx :input-id 61) 10000)
+    (flet ((ask (address entries)
+             (let ((p (%g718-peer :inbound t)))
+               (setf (bitcoin-lisp.networking:peer-address p) address)
+               ;; A peer with no stored version counts as tx-relaying, which
+               ;; is what %g718-peer leaves behind.
+               (values (%cbp-capture-sends
+                        (lambda ()
+                          (%with-whitelist (:entries entries)
+                            (bitcoin-lisp.networking:handle-message
+                             p "mempool" (make-array 0 :element-type
+                                                       '(unsigned-byte 8))
+                             nil nil nil :mempool mp))))
+                       (bitcoin-lisp.networking:peer-state p)))))
+      ;; Without the permission: no inv, and the peer is dropped.
+      (multiple-value-bind (sent state) (ask "11.1.2.3" '("noban@10.0.0.0/8"))
+        (is (null sent) "an unpermitted mempool request was answered: ~S" sent)
+        (is (eq :disconnected state)))
+      ;; With it: an inv, and the peer stays.
+      (multiple-value-bind (sent state) (ask "10.1.2.3" '("mempool@10.0.0.0/8"))
+        (is (equal '("inv") sent)
+            "a permitted mempool request sent ~S instead of one inv" sent)
+        (is (eq :ready state))))))
+
 (test g7-18-outbound-or-block-relay-predicate
   "Core IsOutboundOrBlockRelayConn (net.h:771-785). Both halves matter: it must
 INCLUDE :block-relay, and it must EXCLUDE manual (-addnode) peers — ours are

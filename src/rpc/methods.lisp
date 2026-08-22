@@ -919,9 +919,14 @@ getpeerinfo loop, rpc/net.cpp:107-227."
            ;; dropped by the per-address token bucket).
            ("addr_processed" . ,(bitcoin-lisp.networking::peer-addr-processed peer))
            ("addr_rate_limited" . ,(bitcoin-lisp.networking::peer-addr-rate-limited peer))
-           ;; No NetPermissionFlags support: no peer ever has special
-           ;; permissions, so the array is honestly empty.
-           ("permissions" . #())
+           ;; The -whitelist / -whitebind permissions this peer holds (Core
+           ;; getpeerinfo "permissions", rpc/net.cpp). Was hardcoded empty.
+           ("permissions"
+            . ,(let ((names (bitcoin-lisp.networking:permission-flag-names
+                             (bitcoin-lisp.networking:peer-permission-flags
+                              (bitcoin-lisp.networking:peer-address peer)
+                              (bitcoin-lisp.networking::peer-inbound peer)))))
+                 (if names (coerce names 'vector) #())))
            ;; BIP133: the peer's advertised fee floor, sat/kvB -> BTC/kvB.
            ("minfeefilter" . ,(/ (bitcoin-lisp.networking::peer-feefilter-rate peer)
                                  100000000.0d0))
