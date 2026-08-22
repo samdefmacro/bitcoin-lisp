@@ -3159,13 +3159,20 @@ whether it is currently enabled. Errors on an unknown category."
             bitcoin-lisp::+log-categories+)))
 
 (defun rpc-getrpcinfo (node params)
-  "Report RPC server state (Bitcoin Core getrpcinfo): active commands (we don't
-track in-flight requests, so empty) and the log file path."
+  "Report RPC server state (Bitcoin Core getrpcinfo): the commands currently
+executing, with each one's running time in MICROSECONDS, and the log file path.
+
+active_commands was always empty, which is not merely incomplete: it is how a
+client learns that a long-running call is still running. Core's own
+feature_shutdown.py waits for TWO concurrent commands before attempting a
+shutdown, so a node reporting none hangs that test forever."
   (declare (ignore node params))
-  `(("active_commands" . #())
-    ("logpath" . ,(or (and bitcoin-lisp::*log-file-stream*
-                           (ignore-errors
-                            (namestring (pathname bitcoin-lisp::*log-file-stream*))))
+  `(("active_commands"
+     . ,(json-array
+         (mapcar (lambda (c) `(("method" . ,(car c)) ("duration" . ,(cdr c))))
+                 (active-rpc-commands))))
+    ("logpath" . ,(or (and bitcoin-lisp::*log-file-path*
+                           (namestring bitcoin-lisp::*log-file-path*))
                       ""))))
 
 (defun rpc-help (node params)

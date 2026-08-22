@@ -71,6 +71,43 @@ init.cpp:1559)."
 SetRPCWarmupFinished, init.cpp:2293)."
   (setf *rpc-warmup-status* nil))
 
+(defvar *active-rpc-commands* '()
+  "In-flight RPC commands, each a cons of the method name and the
+INTERNAL-REAL-TIME it started at. Core's g_rpc_server_info.active_commands,
+maintained by an RAII guard around every command execution (rpc/server.cpp).
+
+Reported by getrpcinfo, and that is not cosmetic: it is how a client knows a
+long-running call is still running — feature_shutdown.py waits for two
+concurrent commands before it will attempt a shutdown, so a node that always
+reports none hangs that test forever.")
+
+(defvar *active-rpc-commands-lock* (bt:make-lock "rpc-active")
+  "Guards *ACTIVE-RPC-COMMANDS*: RPC handlers run one thread per connection.")
+
+(defmacro with-active-rpc-command ((method) &body body)
+  "Record METHOD as in-flight for the duration of BODY.
+
+The entry is removed by IDENTITY, not by value: two concurrent calls to the
+same method are two indistinguishable entries, and removing by value would drop
+whichever came first and leave the other listed forever."
+  (let ((entry (gensym "ENTRY")))
+    `(let ((,entry (cons ,method (get-internal-real-time))))
+       (bt:with-lock-held (*active-rpc-commands-lock*)
+         (push ,entry *active-rpc-commands*))
+       (unwind-protect (progn ,@body)
+         (bt:with-lock-held (*active-rpc-commands-lock*)
+           (setf *active-rpc-commands*
+                 (delete ,entry *active-rpc-commands* :test #'eq :count 1)))))))
+
+(defun active-rpc-commands ()
+  "The in-flight commands as (method . duration-microseconds) pairs."
+  (let ((now (get-internal-real-time))
+        (per-second internal-time-units-per-second))
+    (bt:with-lock-held (*active-rpc-commands-lock*)
+      (loop for (method . started) in *active-rpc-commands*
+            collect (cons method
+                          (round (* (- now started) 1000000) per-second))))))
+
 (defun dispatch-rpc-method (node method params)
   "Dispatch to the appropriate method handler.
 
@@ -87,7 +124,9 @@ than "no such method" for a method that does exist."
       ;; Core's exact message (server.cpp:499) — no method-name suffix.
       (error 'rpc-error :code +rpc-method-not-found+
                         :message "Method not found"))
-    (funcall handler node params)))
+    ;; In-flight for as long as the handler runs, so getrpcinfo can report it.
+    (with-active-rpc-command (method)
+      (funcall handler node params))))
 
 ;;; --- Register All Methods ---
 
