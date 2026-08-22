@@ -84,6 +84,7 @@
    #:+bip324-header-len+
    ;; secp256k1 ECDSA
    #:verify-signature
+   #:check-signature-encoding
    #:parse-public-key
    #:public-key-valid-p
    #:decompress-public-key

@@ -780,6 +780,50 @@ deterministic and matches the BIP340 test vectors). Errors if PRIVKEY is invalid
 
 ;;; Signature verification (ECDSA)
 
+(defun check-signature-encoding (signature &key strict low-s)
+  "Core CheckSignatureEncoding (interpreter.cpp): the FLAG-DEPENDENT half of
+signature validation — DER strictness under SCRIPT_VERIFY_DERSIG and the low-S
+requirement under SCRIPT_VERIFY_LOW_S — decided from the signature BYTES alone,
+with no pubkey and no sighash.
+
+Returns (values T T) when the encoding is acceptable, (values NIL NIL) for a DER
+failure under STRICT, and (values NIL :HIGH-S) for a high-S signature under
+LOW-S. The second value is exactly what VERIFY-SIGNATURE would have reported, so
+callers cannot tell which of the two decided.
+
+Separated from VERIFY-SIGNATURE so it can run BEFORE the signature cache is
+consulted, which is what lets the cache key drop the script flags (Core keys on
+sighash|pubkey|sig only, sigcache.cpp:39-43). Doing one without the other is a
+consensus bug — see MAKE-SIG-CACHE-KEY.
+
+A signature that will not parse AT ALL is a verification failure rather than an
+encoding one, and is deliberately left to VERIFY-SIGNATURE: under lax flags Core
+has no encoding opinion to express."
+  (unless (or strict low-s)
+    (return-from check-signature-encoding (values t t)))
+  (ensure-secp256k1-loaded)
+  (cffi:with-foreign-objects ((sig :uint8 +secp256k1-signature-size+))
+    ;; Parse exactly as VERIFY-SIGNATURE would for these flags, so the two
+    ;; agree on what the signature IS before either judges it.
+    (let ((parsed
+            (if strict
+                (cffi:with-pointer-to-vector-data (sig-input signature)
+                  (secp256k1-ecdsa-signature-parse-der
+                   *secp256k1-context* sig sig-input (length signature)))
+                (let ((compact (normalize-signature-lax signature)))
+                  (if compact
+                      (cffi:with-pointer-to-vector-data (sig-input compact)
+                        (secp256k1-ecdsa-signature-parse-compact
+                         *secp256k1-context* sig sig-input))
+                      0)))))
+      (when (and strict (/= parsed 1))
+        (return-from check-signature-encoding (values nil nil)))
+      (when (and low-s (= parsed 1)
+                 (= 1 (secp256k1-ecdsa-signature-normalize
+                       *secp256k1-context* sig sig)))
+        (return-from check-signature-encoding (values nil :high-s)))))
+  (values t t))
+
 (defun verify-signature (message-hash signature pubkey-bytes &key strict low-s)
   "Verify an ECDSA signature.
 MESSAGE-HASH: 32-byte hash of the message
