@@ -1328,6 +1328,64 @@ one Core's ThreadOpenConnections would have taken."
   (is-true (member "connect" bitcoin-lisp::*repeatable-config-options*
                    :test #'string=)))
 
+(test seednode-and-forcednsseed
+  "-seednode (Core connOptions.vSeedNodes, init.cpp:2212) and -forcednsseed
+(DEFAULT_FORCEDNSSEED, net.h:97).
+
+A -seednode is an ADDRESS SOURCE, not a peer: Core dials it as an ADDR_FETCH
+connection and disconnects the moment it delivers more than one address. That
+disconnect is the part worth pinning — without it -seednode would silently
+become a second -addnode."
+  ;; -seednode is repeatable and reaches the plist; -forcednsseed is a flag.
+  (let ((p (bitcoin-lisp::args->start-node-plist
+            '("-regtest" "-seednode=1.2.3.4" "-seednode=5.6.7.8:1234"
+              "-forcednsseed=1")
+            nil)))
+    (is (equal '("1.2.3.4" "5.6.7.8:1234") (getf p :seednode))))
+  (is-true (member "seednode" bitcoin-lisp::*repeatable-config-options*
+                   :test #'string=))
+  (let ((saved bitcoin-lisp::*force-dns-seed*))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-config-globals '(("forcednsseed" . "1")))
+           (is-true bitcoin-lisp::*force-dns-seed*)
+           (bitcoin-lisp::apply-config-globals '(("forcednsseed" . "0")))
+           (is-false bitcoin-lisp::*force-dns-seed*))
+      (setf bitcoin-lisp::*force-dns-seed* saved)))
+  ;; The seed dial is gated on -connect exactly as Core's is by construction:
+  ;; with -connect, ThreadOpenConnections never reaches the seed queue.
+  (let ((saved-addrman bitcoin-lisp::*use-addrman-outgoing*)
+        (saved-seeds bitcoin-lisp::*seed-nodes*))
+    (unwind-protect
+         (let ((node (bitcoin-lisp::make-node :network :testnet3)))
+           (setf (bitcoin-lisp::node-network-active node) t
+                 bitcoin-lisp::*seed-nodes* '("127.0.0.1:1")
+                 bitcoin-lisp::*use-addrman-outgoing* nil)
+           (bitcoin-lisp::connect-seed-nodes node)
+           (is (= 0 (length (bitcoin-lisp::node-peers node))))
+           ;; And it is reached from startup, not merely defined.
+           (is-true (member 'bitcoin-lisp::start-node
+                            (mapcar #'car
+                                    (sb-introspect:who-calls
+                                     'bitcoin-lisp::connect-seed-nodes)))))
+      (setf bitcoin-lisp::*use-addrman-outgoing* saved-addrman
+            bitcoin-lisp::*seed-nodes* saved-seeds)))
+  ;; -forcednsseed does not override -dnsseed=0: a node told not to use DNS
+  ;; must not be made to use it by a second flag.
+  (let ((saved-force bitcoin-lisp::*force-dns-seed*)
+        (saved-dns bitcoin-lisp:*dns-seed-enabled*))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-config-globals
+            '(("forcednsseed" . "1") ("dnsseed" . "0")))
+           (is-true bitcoin-lisp::*force-dns-seed*)
+           (is-false bitcoin-lisp:*dns-seed-enabled*))
+      (setf bitcoin-lisp::*force-dns-seed* saved-force
+            bitcoin-lisp:*dns-seed-enabled* saved-dns)))
+  (dolist (name '("seednode" "forcednsseed"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
+
 (test maxuploadtarget-limits-what-the-node-serves
   "-maxuploadtarget (Core net.cpp:3877-3941, net_processing.cpp:2376-2383).
 

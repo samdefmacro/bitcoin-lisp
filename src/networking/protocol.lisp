@@ -1296,7 +1296,16 @@ the number stored."
         ;; A non-full message answers our getaddr (Core: "if (vAddr.size() <
         ;; 1000) peer.m_getaddr_sent = false", net_processing.cpp:4116).
         (when (< announced-count bitcoin-lisp.serialization:+max-addr-count+)
-          (setf (peer-getaddr-requested peer) nil)))
+          (setf (peer-getaddr-requested peer) nil))
+        ;; An addr-fetch connection (-seednode) exists ONLY to collect
+        ;; addresses: once it has delivered some, it is done (Core
+        ;; net_processing.cpp:4117-4121). Core requires MORE THAN ONE address
+        ;; so a peer that merely self-announces does not end the fetch.
+        (when (and (eq (peer-conn-type peer) :addr-fetch)
+                   (> announced-count 1))
+          (bitcoin-lisp:log-cat "net" "addrfetch connection completed, disconnecting ~A"
+                                (peer-address peer))
+          (disconnect-peer peer)))
       (when (and peers unsolicited (<= announced-count 10))
         (loop for (pa . max-targets) in relay-candidates
               do (relay-address pa peer peers :now now :max-targets max-targets)))

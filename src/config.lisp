@@ -207,6 +207,12 @@ chainparams GetDefaultPort regardless of -port.")
 -stopatheight, DEFAULT_STOPATHEIGHT = 0, node/kernel_notifications.cpp:61-66:
 the blockTip notification requests shutdown when nHeight >= m_stop_at_height).")
 
+(defvar *force-dns-seed* nil
+  "-forcednsseed (Core DEFAULT_FORCEDNSSEED = false, net.h:97): query the DNS
+seeds even when the address book already has enough candidates. Here rather
+than in node.lisp, which reads it, because APPLY-CONFIG-GLOBALS sets it and
+config.lisp compiles first — the same reason *dns-seed-enabled* is here.")
+
 (defvar *dns-seed-enabled* t
   "Query DNS seeds for peer addresses when the address book is low (Core
 -dnsseed, DEFAULT_DNSSEED = true, net.h:96).")
@@ -662,7 +668,7 @@ netbase.cpp: ipv4/ipv6/onion/i2p/cjdns; the old \"tor\" alias is gone)."
 (defparameter *repeatable-config-options*
   '("onlynet" "addnode" "uacomment" "externalip" "rpcauth" "rpcallowip" "bind"
     "testactivationheight" "debug" "debugexclude" "shutdownnotify"
-    "startupnotify" "connect")
+    "startupnotify" "connect" "seednode")
   "Option names whose every occurrence is meaningful (Core GetArgs
 list-options); all other repeated command-line options collapse to their
 LAST occurrence (Core GetArg on the command line takes span.end()[-1],
@@ -933,10 +939,10 @@ specially in config-alist->start-node-plist.")
     "mintxfee" "discardfee" "consolidatefeerate" "maxapsfee" "txconfirmtarget"
     "walletrbf" "spendzeroconfchange" "walletrejectlongchains"
     "keypool" "walletdir" "walletnotify"
-    "dnsseed" "fixedseeds"
+    "dnsseed" "fixedseeds" "forcednsseed"
     "stopatheight" "externalip"
     ;; repeatable start-node options collected outside the spec scan
-    "addnode" "connect" "rpcauth" "rpcallowip" "testactivationheight"
+    "addnode" "connect" "seednode" "rpcauth" "rpcallowip" "testactivationheight"
     "debugexclude" "shutdownnotify" "startupnotify"
     ;; -zmqpub<topic>[hwm]: collected by ZMQ-SPECS-FROM-CONFIG, not the spec
     ;; scan, since each topic contributes two options and they produce a list
@@ -961,7 +967,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "checkmempool" "checkpoints" "daemon"
     "daemonwait" "dbbatchsize" "deprecatedrpc"
     "discover" "dns"
-    "forcednsseed" "help" "i2pacceptincoming" "i2psam"
+    "help" "i2pacceptincoming" "i2psam"
     "ipcbind" "limitancestorcount" "limitancestorsize"
     "limitdescendantcount" "limitdescendantsize" "loadblock" "logips"
     "loglevelalways" "logsourcelocations"
@@ -971,7 +977,7 @@ command-line options at startup, like Core ArgsManager::ParseParameters
     "persistmempoolv1" "printpriority"
     "privatebroadcast" "rpcdoccheck"
     "rpcwhitelist" "rpcwhitelistdefault"
-    "rpcworkqueue" "seednode" "settings" "shrinkdebugfile"
+    "rpcworkqueue" "settings" "shrinkdebugfile"
     "signer" "signetseednode"
     "stopafterblockimport" "test" "timeout"
     "txospenderindex" "unsafesqlitesync" "vbparams"
@@ -1155,7 +1161,10 @@ resolved network. Honors -server (enable RPC on the default port when no
                         ("startupnotify"  . :startup-notify)
                         ;; -connect: Core reads it with GetArgs and dials every
                         ;; one as a MANUAL connection (net.cpp ThreadOpenConnections).
-                        ("connect"        . :connect-nodes)))
+                        ("connect"        . :connect-nodes)
+                        ;; -seednode: Core reads it with GetArgs into
+                        ;; connOptions.vSeedNodes (init.cpp:2212).
+                        ("seednode"       . :seednode)))
         (let ((values (loop for (k . v) in alist
                             when (string= k (car option))
                               collect v)))
@@ -1406,6 +1415,10 @@ start-node-from-args."
           (unless (and n (plusp n))
             (error "Invalid value for -bytespersigop=~A (must be a positive integer)" v))
           (setf bitcoin-lisp.mempool::+bytes-per-sigop+ n))))
+    ;; -forcednsseed: query the DNS seeds even with a full address book. It
+    ;; does NOT override -dnsseed=0, which is Core's precedence too.
+    (let ((v (lk "forcednsseed")))
+      (when v (setf *force-dns-seed* (conf-parse-bool v))))
     ;; -maxuploadtarget: the 24h outbound budget. Core parses it with
     ;; ParseByteUnits defaulting to M, so a bare number is MEBIbytes — reading
     ;; it as bytes would silence the option on every ordinary command line.
