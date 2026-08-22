@@ -362,6 +362,61 @@ getwalletinfo reports unlocked_until per Core's three states."
         (is (eql 0 (%aval "unlocked_until"
                           (bitcoin-lisp.rpc::rpc-getwalletinfo node '()))))))))
 
+(test wenc-unlocked-until-never-claims-expiry-while-the-key-is-live
+  "A rescan holding the passphrase SUSPENDS the relock (relocking mid-rescan
+silently fails the keypool top-ups the scan depends on). Core does not suspend
+— its scheduled callback fires regardless (wallet/rpc/encrypt.cpp:102-110) — so
+this is a deliberate divergence.
+
+What was NOT deliberate: getwalletinfo kept reporting the ORIGINAL
+unlocked_until, so once the deadline passed mid-scan the wallet told callers the
+unlock had expired while the master key was still decrypted and usable. A
+wallet reporting the opposite of its own state is worse than either behaviour
+on its own, and worse the longer the rescan runs."
+  (with-wallet-test-node (node)
+    (let ((bitcoin-lisp.rpc::*rpc-wallet-name* "w"))
+      (let ((wallet (%wenc-fresh-wallet node "w")))
+        (bitcoin-lisp.rpc::rpc-encryptwallet node '("hunter2"))
+        (is (null (bitcoin-lisp.rpc::rpc-walletpassphrase node '("hunter2" 600))))
+        ;; Force the deadline into the past, as a long rescan would.
+        (setf (bitcoin-lisp.rpc::wallet-relock-time wallet)
+              (- (bitcoin-lisp.serialization:get-unix-time) 60)
+              (bitcoin-lisp.rpc::wallet-relock-deadline wallet)
+              (- (get-internal-real-time)
+                 (* 60 internal-time-units-per-second)))
+        ;; Control: with NO scan holding it, the elapsed deadline relocks the
+        ;; wallet and the report folds to 0. This is the arm that already
+        ;; worked, and it must keep working.
+        (is (eql 0 (%aval "unlocked_until"
+                          (bitcoin-lisp.rpc::rpc-getwalletinfo node '()))))
+        (is (bitcoin-lisp.rpc::wallet-is-locked-p wallet))
+        ;; Now the suspended case: unlock again, expire the deadline, and mark
+        ;; the wallet as scanning with the passphrase.
+        (is (null (bitcoin-lisp.rpc::rpc-walletpassphrase node '("hunter2" 600))))
+        (setf (bitcoin-lisp.rpc::wallet-scanning-with-passphrase wallet) t
+              (bitcoin-lisp.rpc::wallet-relock-time wallet)
+              (- (bitcoin-lisp.serialization:get-unix-time) 60)
+              (bitcoin-lisp.rpc::wallet-relock-deadline wallet)
+              (- (get-internal-real-time)
+                 (* 60 internal-time-units-per-second)))
+        ;; The key really is still live — that is the premise, and without it
+        ;; this test asserts nothing.
+        (is-false (bitcoin-lisp.rpc::wallet-is-locked-p wallet)
+                  "the suspension is not holding the key; premise broken")
+        (let ((until (%aval "unlocked_until"
+                            (bitcoin-lisp.rpc::rpc-getwalletinfo node '()))))
+          (is (>= until (- (bitcoin-lisp.serialization:get-unix-time) 1))
+              "unlocked_until reported ~D, which is in the past, while the ~
+master key is still decrypted" until)
+          (is (not (eql 0 until))
+              "unlocked_until said LOCKED while the key was live"))
+        ;; And when the scan ends, the elapsed deadline applies immediately.
+        (setf (bitcoin-lisp.rpc::wallet-scanning-with-passphrase wallet) nil)
+        (is (eql 0 (%aval "unlocked_until"
+                          (bitcoin-lisp.rpc::rpc-getwalletinfo node '()))))
+        (is (bitcoin-lisp.rpc::wallet-is-locked-p wallet)
+            "the wallet stayed unlocked after the scan released the suspension")))))
+
 (test wenc-walletpassphrase-argument-validation
   "walletpassphrase's validation order and error codes (encrypt.cpp:53-70)."
   (with-wallet-test-node (node)

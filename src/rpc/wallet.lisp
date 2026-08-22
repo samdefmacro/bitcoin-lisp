@@ -291,6 +291,35 @@ depends on."
           (progn (%wallet-clear-encryption-key wallet) nil)
           key))))
 
+(defun %reported-unlocked-until (wallet)
+  "getwalletinfo's unlocked_until (Core rpc/wallet.cpp:93-98): 0 when locked,
+otherwise the unix time the relock is scheduled for.
+
+Calling WALLET-UNLOCKED-KEY first is what folds an elapsed deadline down to 0
+before it is read. The interesting case is the one that does NOT fold: a rescan
+holding the passphrase suspends the relock (see WALLET-UNLOCKED-KEY), so the
+key stays decrypted past the deadline — and reporting the original, now-PAST
+timestamp told the caller the unlock had expired while the master key was still
+usable. That is the wallet reporting the opposite of its own state.
+
+Core has no such case: its scheduled callback relocks regardless of any scan
+(wallet/rpc/encrypt.cpp:102-110). We suspend instead, because relocking
+mid-rescan silently fails the keypool top-ups the scan depends on — a
+deliberate divergence, but one the REPORT has to tell the truth about.
+
+So while the suspension is holding the key past its deadline, report the
+current time rather than the elapsed one: never a past timestamp while the key
+is live, and it advances as the scan runs, which is exactly the situation."
+  (wallet-unlocked-key wallet)                    ; for effect: may relock
+  (let ((until (wallet-relock-time wallet))
+        (now (bitcoin-lisp.serialization:get-unix-time)))
+    (if (and (plusp until)
+             (< until now)
+             (wallet-scanning-with-passphrase wallet)
+             (wallet-encryption-key wallet))
+        now
+        until)))
+
 (defun wallet-is-locked-p (wallet)
   "Core IsLocked: an unencrypted wallet is never locked."
   (and (wallet-has-encryption-keys-p wallet)
@@ -1727,8 +1756,7 @@ backend (leveldb, where Core says sqlite)."
           ;; after WALLET-IS-LOCKED-P above means an elapsed deadline has
           ;; already been folded down to 0.
           ,@(when (wallet-has-encryption-keys-p wallet)
-              `(("unlocked_until" . ,(progn (wallet-unlocked-key wallet)
-                                            (wallet-relock-time wallet)))))
+              `(("unlocked_until" . ,(%reported-unlocked-until wallet))))
           ;; Core booleans are true/false, never null (wave-10 cleanup);
           ;; "scanning" is Core's false-or-progress-object — the progress
           ;; object during a rescan, false otherwise.
