@@ -338,6 +338,58 @@ responsive (and correctly reports 503) even when the node is wedged."
 
 ;;; --- Router ---
 
+(defun %rest-blockpart (node body ext)
+  "/rest/blockpart/<blockhash>.<ext>?offset=<n>&size=<n> — a byte RANGE of the
+serialized block (rest_block_part, rest.cpp:480-497).
+
+Offset and size are QUERY parameters, not path segments, and JSON is not a
+supported format for this endpoint: the whole point is raw bytes.
+
+Core seeks into the block file and reads SIZE bytes; we take the range from the
+serialized block, which is the same bytes — a blk record's payload IS the
+witness-complete serialization. The range check is Core's (size 0 is invalid,
+and offset+size must not exceed the block; blockstorage.cpp:1116-1120), which
+matters because both numbers come from untrusted REST input. Core needs a
+SaturatingAdd there to stop the sum wrapping past the check; Lisp integers do
+not wrap, so a plain + is already the safe version."
+  ;; Offset and size are validated BEFORE the hash, which is Core's order:
+  ;; rest_block_part parses the query parameters and only then delegates to
+  ;; rest_block, which is where the hash is parsed (rest.cpp:480-497 vs :390).
+  ;; A request missing both a valid hash and a valid offset therefore reports
+  ;; the OFFSET, and a client fixing errors in the order it is told them
+  ;; converges either way — but only one order matches Core's messages.
+  (let ((offset (%rest-size-parameter "offset"))
+        (size (%rest-size-parameter "size")))
+    (cond
+      ((null offset) (%rest-error 400 "Block part offset missing or invalid"))
+      ((null size) (%rest-error 400 "Block part size missing or invalid"))
+      ((not (valid-hex-hash-p body)) (%rest-error 400 "Invalid block hash"))
+      ((string= ext "json") (%rest-format-not-found ".bin, .hex"))
+      ((not (or (string= ext "hex") (string= ext "bin")))
+       (%rest-format-not-found ".bin, .hex"))
+      (t
+       (let* ((hash (parse-hex-hash body))
+              (store (rpc-get-block-store node))
+              (block (and store (bitcoin-lisp.storage:get-block store hash))))
+         (cond
+           ((null block) (%rest-error 404 (format nil "~A not found" body)))
+           (t
+            (let ((bytes (bitcoin-lisp.serialization:serialize-witness-block block)))
+              (if (or (zerop size) (> (+ offset size) (length bytes)))
+                  (%rest-error 400 (format nil "Bad block part offset/size ~D/~D for ~A"
+                                           offset size body))
+                  (%rest-hex-or-bin
+                   ext (bitcoin-lisp.crypto:bytes-to-hex
+                        (subseq bytes offset (+ offset size)))))))))))))
+
+(defun %rest-size-parameter (name)
+  "A non-negative integer query parameter, or NIL when absent or malformed.
+Core parses these with ToIntegral<size_t>, so a negative or non-numeric value
+is not a zero — it is a 400."
+  (let ((v (hunchentoot:get-parameter name)))
+    (when (and v (plusp (length v)) (every #'digit-char-p v))
+      (parse-integer v :junk-allowed t))))
+
 (defun %rest-deploymentinfo (node body ext)
   "/rest/deploymentinfo[/<blockhash>] — JSON only, as in Core
 (rest_deploymentinfo, rest.cpp). The hash is optional: without one Core reports
@@ -495,6 +547,12 @@ to its handler. Returns the response body; sets status/content-type."
         ((alexandria:starts-with-subseq "blockhashbyheight/" rest)
          (multiple-value-bind (b e) (%rest-split-ext (after "blockhashbyheight/"))
            (%rest-blockhashbyheight node b e)))
+        ;; blockpart must precede "block/" — "block" is a prefix of it, so the
+        ;; shorter route would swallow every blockpart request and read
+        ;; "part/<hash>" as a block hash.
+        ((alexandria:starts-with-subseq "blockpart/" rest)
+         (multiple-value-bind (b e) (%rest-split-ext (after "blockpart/"))
+           (%rest-blockpart node b e)))
         ;; notxdetails must precede the bare "block/" prefix below.
         ((alexandria:starts-with-subseq "block/notxdetails/" rest)
          (multiple-value-bind (b e) (%rest-split-ext (after "block/notxdetails/"))
