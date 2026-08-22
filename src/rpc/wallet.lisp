@@ -1765,6 +1765,139 @@ PARAMS: (private)."
                    entries)
                   #())))))))
 
+(defun %gethdkeys-collect (wallet active-only private)
+  "The wallet's BIP32 root keys and the descriptors that use them (Core
+gethdkeys, wallet/rpc/addresses.cpp).
+
+Keyed by the SERIALIZED xpub, because that is the identity Core reports and
+two descriptors sharing a root must appear as one entry with two descriptors —
+which is the whole point of the RPC."
+  (let ((by-xpub (make-hash-table :test 'equal))
+        (order '()))
+    (loop for spkm being the hash-values of (wallet-spkms wallet)
+          do (multiple-value-bind (active internal) (%spkm-active-info wallet spkm)
+               (declare (ignore internal))
+               (when (or active (not active-only))
+                 (dolist (key (out-desc-ordered-keys (desc-spkm-desc spkm)))
+                   ;; Only BIP32 keys are HD keys; a raw pubkey or WIF key in a
+                   ;; descriptor has no xpub to report.
+                   ;;
+                   ;; The private root comes from %DESC-KEY-ROOT-XPRV, not from
+                   ;; the parsed key: a STORED descriptor keeps only the xpub,
+                   ;; and the secret lives in the wallet's key provider. Reading
+                   ;; desc-key-ext-privkey alone reported has_private FALSE for
+                   ;; every wallet that had been written to disk — which is
+                   ;; every real one.
+                   (let* ((xprv (%desc-key-root-xprv
+                                 key (spkm-privkey-provider wallet spkm)))
+                          (xpub-key (or (desc-key-extkey key)
+                                        (and xprv (bitcoin-lisp.crypto:bip32-neuter xprv)))))
+                     (when xpub-key
+                       (let ((xpub (bitcoin-lisp.crypto:bip32-serialize xpub-key)))
+                         (unless (gethash xpub by-xpub)
+                           (setf (gethash xpub by-xpub) (list nil nil))
+                           (push xpub order))
+                         (let ((entry (gethash xpub by-xpub)))
+                           (when xprv (setf (first entry) xprv))
+                           (push (cons spkm active) (second entry))))))))))
+    (loop for xpub in (nreverse order)
+          for entry = (gethash xpub by-xpub)
+          collect (let ((xprv (first entry))
+                        (descs (reverse (second entry))))
+                    `(("xpub" . ,xpub)
+                      ("has_private" . ,(json-bool (and xprv t)))
+                      ,@(when (and private xprv)
+                          `(("xprv" . ,(bitcoin-lisp.crypto:bip32-serialize xprv))))
+                      ("descriptors"
+                       . ,(or (mapcar (lambda (pair)
+                                        `(("desc" . ,(%spkm-descriptor-string
+                                                      wallet (car pair) nil))
+                                          ("active" . ,(json-bool (cdr pair)))))
+                                      descs)
+                              #())))))))
+
+(defun rpc-gethdkeys (node params)
+  "List the wallet's BIP32 HD keys and the descriptors that use them (Core
+gethdkeys). PARAMS: ([{active_only, private}]).
+
+private=true requires an unlocked wallet, for the same reason listdescriptors
+does: a locked wallet's provider yields no keys, so it would otherwise emit the
+PUBLIC material under a private request — a wrong answer rather than an error."
+  (let* ((wallet (wallet-for-request node))
+         (options (first params))
+         (active-only (%options-bool options "active_only"))
+         (private (%options-bool options "private")))
+    (when (and private
+               (wallet-flag-set-p wallet +wallet-flag-disable-private-keys+))
+      (error 'rpc-error :code +rpc-wallet-error+
+                        :message "Can't get private keys for wallets without private keys"))
+    (with-wallet-lock (wallet)
+      (when private (wallet-ensure-unlocked wallet))
+      (let ((rows (%gethdkeys-collect wallet active-only private)))
+        (or rows #())))))
+
+(defun %options-bool (options name)
+  "One boolean out of an OBJ_NAMED_PARAMS options object, defaulting false."
+  (and (hash-table-p options)
+       (%positional-bool (gethash name options))))
+
+(defparameter +mutable-wallet-flags+ +wallet-flag-avoid-reuse+
+  "Core wallet.h:159-160 MUTABLE_WALLET_FLAGS — the flags setwalletflag may
+change. Everything else describes how the wallet was BUILT and cannot be
+retrofitted.")
+
+(defparameter +wallet-flag-caveats+
+  `((,+wallet-flag-avoid-reuse+
+     . "You need to rescan the blockchain in order to correctly mark used destinations in the past. Until this is done, some destinations may be considered unused, even if the opposite is the case."))
+  "Core wallet/rpc/wallet.cpp:27-32 WALLET_FLAG_CAVEATS.")
+
+(defun rpc-setwalletflag (node params)
+  "Turn a mutable wallet flag on or off (Core setwalletflag). PARAMS:
+ (flag [value]), value defaulting TRUE.
+
+Only avoid_reuse is mutable; the rest record how the wallet was BUILT and
+cannot be retrofitted, so Core refuses them by name rather than silently
+ignoring the request. Setting a flag to the value it already holds is also an
+error, as Core makes it — the caller has misunderstood the state."
+  (let* ((wallet (wallet-for-request node))
+         (flag-str (first params))
+         (value (if (null (second params)) t (%positional-bool (second params)))))
+    (unless (stringp flag-str)
+      (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for flag"))
+    (let ((flag (car (find flag-str +wallet-flag-names+
+                           :key #'cdr :test #'string=))))
+      (unless flag
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "Unknown wallet flag: ~A" flag-str)))
+      (unless (logtest flag +mutable-wallet-flags+)
+        (error 'rpc-error :code +rpc-invalid-parameter+
+                          :message (format nil "Wallet flag is immutable: ~A" flag-str)))
+      (with-wallet-lock (wallet)
+        (when (eq (and (wallet-flag-set-p wallet flag) t) (and value t))
+          (error 'rpc-error :code +rpc-invalid-parameter+
+                            :message (format nil "Wallet flag is already set to ~A: ~A"
+                                             (if value "true" "false") flag-str)))
+        (setf (wallet-flags wallet)
+              (if value
+                  (logior (wallet-flags wallet) flag)
+                  (logandc2 (wallet-flags wallet) flag)))
+        (%wallet-persist-flags wallet)
+        `(("flag_name" . ,flag-str)
+          ("flag_state" . ,(json-bool value))
+          ,@(let ((caveat (and value (cdr (assoc flag +wallet-flag-caveats+)))))
+              (when caveat `(("warnings" . ,caveat)))))))))
+
+(defun %wallet-persist-flags (wallet)
+  "Write the wallet's flag word (Core WalletBatch::WriteWalletFlags). A flag
+that lived only in memory would come back on the next load, which for
+avoid_reuse means silently resuming address reuse."
+  (bitcoin-lisp.storage:with-leveldb-writebatch (batch)
+    (bitcoin-lisp.storage:leveldb-writebatch-put
+     batch (wdb-key-simple +wdb-key-flags+)
+     (wdb-uint64-value (wallet-flags wallet)))
+    (bitcoin-lisp.storage:leveldb-write (wallet-db wallet) batch :sync t))
+  t)
+
 (defun %out-desc-embedded-keys (desc)
   "The private keys carried by a parsed descriptor, as a list of
  (pubkey priv32 compressed-p) — Core Parse's FlatSigningProvider keys."

@@ -2076,7 +2076,7 @@ rpc_help.py passing."
                                  core-methods)))
         ;; Not an assertion of zero — these are tracked, and the list moving is
         ;; what matters. It IS an assertion that the list has not GROWN.
-        (is (<= (length missing) 7)
+        (is (<= (length missing) 5)
             "Core methods with typed arguments that this node does not serve ~
 grew to ~D: ~S" (length missing) (sort missing #'string<))))))
 
