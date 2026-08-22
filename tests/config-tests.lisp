@@ -1202,3 +1202,55 @@ immediately; -blocknotify is detached, so it is polled for."
   (dolist (name '("peertimeout" "maxsendbuffer"))
     (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
     (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
+
+(test wallet-config-knobs-take-effect
+  "Track D's Wallet group, which the plan calls \"mostly knobs over existing
+paths\" — and it is exactly that: every special here already existed with
+Core's name and default. What was missing was the OPTION that sets it, so a
+wallet could not be tuned at all.
+
+Fee options are BTC/kvB on the command line and satoshis internally, matching
+-maxtxfee and -fallbackfee, which apply-config-globals already handled."
+  (let ((saved (list bitcoin-lisp.rpc::*wallet-min-tx-fee*
+                     bitcoin-lisp.rpc::*wallet-discard-rate*
+                     bitcoin-lisp.rpc::*wallet-consolidate-feerate*
+                     bitcoin-lisp.rpc::*wallet-max-aps-fee*
+                     bitcoin-lisp.rpc::*wallet-confirm-target*
+                     bitcoin-lisp.rpc::*wallet-signal-rbf*
+                     bitcoin-lisp.rpc::*wallet-spend-zero-conf-change*
+                     bitcoin-lisp.rpc::*wallet-reject-long-chains*)))
+    (unwind-protect
+         (progn
+           (bitcoin-lisp::apply-rpc-config-globals
+            '(("mintxfee" . "0.00002") ("discardfee" . "0.0002")
+              ("consolidatefeerate" . "0.0003") ("maxapsfee" . "0.0001")
+              ("txconfirmtarget" . "12") ("walletrbf" . "0")
+              ("spendzeroconfchange" . "0") ("walletrejectlongchains" . "0")))
+           (is (= 2000 bitcoin-lisp.rpc::*wallet-min-tx-fee*))
+           (is (= 20000 bitcoin-lisp.rpc::*wallet-discard-rate*))
+           (is (= 30000 bitcoin-lisp.rpc::*wallet-consolidate-feerate*))
+           (is (= 10000 bitcoin-lisp.rpc::*wallet-max-aps-fee*))
+           (is (= 12 bitcoin-lisp.rpc::*wallet-confirm-target*))
+           ;; The three booleans all default TRUE, so a test that only checked
+           ;; "can be set" would pass without the option doing anything —
+           ;; setting them to 0 is what proves the wiring.
+           (is-false bitcoin-lisp.rpc::*wallet-signal-rbf*)
+           (is-false bitcoin-lisp.rpc::*wallet-spend-zero-conf-change*)
+           (is-false bitcoin-lisp.rpc::*wallet-reject-long-chains*))
+      (setf bitcoin-lisp.rpc::*wallet-min-tx-fee* (first saved)
+            bitcoin-lisp.rpc::*wallet-discard-rate* (second saved)
+            bitcoin-lisp.rpc::*wallet-consolidate-feerate* (third saved)
+            bitcoin-lisp.rpc::*wallet-max-aps-fee* (fourth saved)
+            bitcoin-lisp.rpc::*wallet-confirm-target* (fifth saved)
+            bitcoin-lisp.rpc::*wallet-signal-rbf* (sixth saved)
+            bitcoin-lisp.rpc::*wallet-spend-zero-conf-change* (seventh saved)
+            bitcoin-lisp.rpc::*wallet-reject-long-chains* (eighth saved))))
+  ;; Malformed values are refused rather than silently leaving the default.
+  (dolist (bad '((("mintxfee" . "notanumber")) (("txconfirmtarget" . "0"))
+                 (("txconfirmtarget" . "x")) (("maxapsfee" . "zz"))))
+    (signals error (bitcoin-lisp::apply-rpc-config-globals bad)))
+  (dolist (name '("mintxfee" "discardfee" "consolidatefeerate" "maxapsfee"
+                  "txconfirmtarget" "walletrbf" "spendzeroconfchange"
+                  "walletrejectlongchains"))
+    (is-true (bitcoin-lisp::known-config-option-p name) "~A unknown" name)
+    (is-false (bitcoin-lisp::core-only-option-p name) "~A still ignored" name)))
