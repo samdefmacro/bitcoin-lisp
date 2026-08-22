@@ -243,6 +243,86 @@ rather than assumed."
   (let ((out (%psbt-input-prevout map tx-in)))
     (when out (bitcoin-lisp.serialization:tx-out-value out))))
 
+(defun %psbt-taproot-input-fields (map add)
+  "Report a PSBT input's BIP371 taproot records through ADD (Core decodepsbt,
+rawtransaction.cpp:1253-1314).
+
+Everything here was already carried on the wire — the PSBT layer stores raw
+records, so a taproot PSBT round-tripped correctly before this. What was
+missing was the ability to SEE it, which is what a signer's user needs before
+tr() script-path signing means anything."
+  (let ((ks (bitcoin-lisp.serialization:psbt-map-find
+             map bitcoin-lisp.serialization:+psbt-in-tap-key-sig+)))
+    (when ks (funcall add "taproot_key_path_sig"
+                      (bitcoin-lisp.crypto:bytes-to-hex ks))))
+  ;; PSBT_IN_TAP_SCRIPT_SIG keydata is <32-byte xonly pubkey><32-byte leaf hash>.
+  (let ((sigs (bitcoin-lisp.serialization:psbt-map-collect
+               map bitcoin-lisp.serialization:+psbt-in-tap-script-sig+)))
+    (when sigs
+      (funcall add "taproot_script_path_sigs"
+               (json-array
+                (loop for (keydata . sig) in sigs
+                      when (>= (length keydata) 64)
+                        collect `(("pubkey" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                                (subseq keydata 0 32)))
+                                  ("leaf_hash" . ,(bitcoin-lisp.crypto:bytes-to-hex
+                                                   (subseq keydata 32 64)))
+                                  ("sig" . ,(bitcoin-lisp.crypto:bytes-to-hex sig))))))))
+  ;; PSBT_IN_TAP_LEAF_SCRIPT keydata is the control block; the value is
+  ;; <script><1-byte leaf version>. Core groups by (script, leaf_ver) and lists
+  ;; every control block that reaches it.
+  (let ((leaves (bitcoin-lisp.serialization:psbt-map-collect
+                 map bitcoin-lisp.serialization:+psbt-in-tap-leaf-script+)))
+    (when leaves
+      (let ((groups '()))
+        (loop for (control . value) in leaves
+              when (plusp (length value))
+                do (let* ((script (subseq value 0 (1- (length value))))
+                          (leaf-ver (aref value (1- (length value))))
+                          (key (cons (bitcoin-lisp.crypto:bytes-to-hex script) leaf-ver))
+                          (hit (assoc key groups :test #'equal)))
+                     (if hit
+                         (push (bitcoin-lisp.crypto:bytes-to-hex control) (cdr hit))
+                         (push (cons key (list (bitcoin-lisp.crypto:bytes-to-hex control)))
+                               groups))))
+        (funcall add "taproot_scripts"
+                 (json-array
+                  (loop for ((script-hex . leaf-ver) . controls) in (nreverse groups)
+                        collect `(("script" . ,script-hex)
+                                  ("leaf_ver" . ,leaf-ver)
+                                  ("control_blocks"
+                                   . ,(json-array (nreverse controls))))))))))
+  (let ((derivs (bitcoin-lisp.serialization:psbt-map-collect
+                 map bitcoin-lisp.serialization:+psbt-in-tap-bip32+)))
+    (when derivs
+      (funcall add "taproot_bip32_derivs"
+               (json-array (mapcar (lambda (d) (%psbt-tap-bip32-json (car d) (cdr d)))
+                                   derivs)))))
+  (let ((tk (bitcoin-lisp.serialization:psbt-map-find
+             map bitcoin-lisp.serialization:+psbt-in-tap-internal-key+)))
+    (when tk (funcall add "taproot_internal_key"
+                      (bitcoin-lisp.crypto:bytes-to-hex tk))))
+  (let ((mr (bitcoin-lisp.serialization:psbt-map-find
+             map bitcoin-lisp.serialization:+psbt-in-tap-merkle-root+)))
+    (when mr (funcall add "taproot_merkle_root"
+                      (bitcoin-lisp.crypto:bytes-to-hex mr)))))
+
+(defun %psbt-tap-bip32-json (xonly value)
+  "One PSBT_*_TAP_BIP32_DERIVATION record: keydata is the 32-byte x-only
+pubkey; the value is <compact-size count><32-byte leaf hash>*<4-byte
+fingerprint><path>."
+  (let* ((br (bitcoin-lisp.serialization:make-byte-reader-from value))
+         (count (bitcoin-lisp.serialization:br-read-compact-size br))
+         (leaves (loop repeat count
+                       collect (bitcoin-lisp.crypto:bytes-to-hex
+                                (bitcoin-lisp.serialization:br-read-bytes br 32))))
+         (rest (subseq value (bitcoin-lisp.serialization::br-pos br))))
+    ;; %PSBT-KEYPATH-JSON already renders pubkey/fingerprint/path; the leaf
+    ;; hashes are what BIP371 adds on top, so its output is reused rather than
+    ;; re-derived.
+    (append (%psbt-keypath-json xonly rest)
+            `(("leaf_hashes" . ,(json-array leaves))))))
+
 (defun %psbt-input-json (map network)
   (let ((fields '()))
     (flet ((add (k v) (push (cons k v) fields)))
@@ -290,9 +370,7 @@ rather than assumed."
       (let ((fw (bitcoin-lisp.serialization:psbt-map-find
                  map bitcoin-lisp.serialization:+psbt-in-final-scriptwitness+)))
         (when fw (add "final_scriptwitness" (%psbt-parse-witness-stack fw))))
-      (let ((tk (bitcoin-lisp.serialization:psbt-map-find
-                 map bitcoin-lisp.serialization:+psbt-in-tap-internal-key+)))
-        (when tk (add "taproot_internal_key" (bitcoin-lisp.crypto:bytes-to-hex tk)))))
+      (%psbt-taproot-input-fields map #'add))
     (or (nreverse fields) (make-hash-table))))
 
 (defun %psbt-output-json (map)
@@ -311,7 +389,18 @@ rather than assumed."
                (loop for (pk . v) in keypaths collect (%psbt-keypath-json pk v)))))
       (let ((tk (bitcoin-lisp.serialization:psbt-map-find
                  map bitcoin-lisp.serialization:+psbt-out-tap-internal-key+)))
-        (when tk (add "taproot_internal_key" (bitcoin-lisp.crypto:bytes-to-hex tk)))))
+        (when tk (add "taproot_internal_key" (bitcoin-lisp.crypto:bytes-to-hex tk))))
+      ;; PSBT_OUT_TAP_TREE is one opaque blob of (depth, leaf_ver, script)
+      ;; tuples; Core reports it as hex rather than expanding it.
+      (let ((tree (bitcoin-lisp.serialization:psbt-map-find
+                   map bitcoin-lisp.serialization:+psbt-out-tap-tree+)))
+        (when tree (add "taproot_tree" (bitcoin-lisp.crypto:bytes-to-hex tree))))
+      (let ((derivs (bitcoin-lisp.serialization:psbt-map-collect
+                     map bitcoin-lisp.serialization:+psbt-out-tap-bip32+)))
+        (when derivs
+          (add "taproot_bip32_derivs"
+               (json-array (mapcar (lambda (d) (%psbt-tap-bip32-json (car d) (cdr d)))
+                                   derivs))))))
     (or (nreverse fields) (make-hash-table))))
 
 (defun rpc-decodepsbt (node params)

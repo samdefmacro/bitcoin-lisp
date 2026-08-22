@@ -378,3 +378,103 @@ false honors locktime), and duplicate outputs are rejected."
       (signals bitcoin-lisp.rpc::rpc-error
         (bitcoin-lisp.rpc::rpc-createpsbt
          node (list in (list (list (cons addr 0.1)) (list (cons addr 0.2)))))))))
+
+;;;; BIP371 taproot fields in decodepsbt (rawtransaction.cpp:1253-1314)
+
+(defun %tap-bytes (n fill)
+  (make-array n :element-type '(unsigned-byte 8) :initial-element fill))
+
+(defun %tap-record (keytype keydata value)
+  (cons (concatenate '(vector (unsigned-byte 8)) (vector keytype) keydata) value))
+
+(test decodepsbt-reports-bip371-taproot-fields
+  "The PSBT layer stores raw records, so a taproot PSBT round-tripped correctly
+already — what was missing was the ability to SEE it, which is what a signer's
+user needs before tr() script-path signing means anything.
+
+Every field name and shape here is Core's (decodepsbt,
+rawtransaction.cpp:1253-1314)."
+  (let* ((xonly (%tap-bytes 32 #xAA))
+         (leaf-hash (%tap-bytes 32 #xBB))
+         (sig (%tap-bytes 64 #xCC))
+         (control (%tap-bytes 33 #xDD))
+         (script (coerce #(#x51) '(vector (unsigned-byte 8))))
+         ;; PSBT_IN_TAP_LEAF_SCRIPT's value is <script><1-byte leaf version>.
+         (leaf-value (concatenate '(vector (unsigned-byte 8)) script (vector #xc0)))
+         (map (bitcoin-lisp.serialization:make-psbt-map
+               :records
+               (list (%tap-record bitcoin-lisp.serialization:+psbt-in-tap-key-sig+
+                                  #() sig)
+                     ;; keydata is <xonly><leaf hash>
+                     (%tap-record bitcoin-lisp.serialization:+psbt-in-tap-script-sig+
+                                  (concatenate '(vector (unsigned-byte 8)) xonly leaf-hash)
+                                  sig)
+                     ;; keydata is the control block
+                     (%tap-record bitcoin-lisp.serialization:+psbt-in-tap-leaf-script+
+                                  control leaf-value)
+                     (%tap-record bitcoin-lisp.serialization:+psbt-in-tap-internal-key+
+                                  #() xonly)
+                     (%tap-record bitcoin-lisp.serialization:+psbt-in-tap-merkle-root+
+                                  #() leaf-hash)
+                     ;; <count><leaf hashes><fingerprint><path>
+                     (%tap-record bitcoin-lisp.serialization:+psbt-in-tap-bip32+
+                                  xonly
+                                  (concatenate '(vector (unsigned-byte 8))
+                                               (vector 1) leaf-hash
+                                               (vector 1 2 3 4)
+                                               (vector 0 0 0 #x80))))))
+         (json (bitcoin-lisp.rpc::%psbt-input-json map :regtest)))
+    (flet ((f (k) (cdr (assoc k json :test #'string=))))
+      (is (equal (bitcoin-lisp.crypto:bytes-to-hex sig) (f "taproot_key_path_sig")))
+      (is (equal (bitcoin-lisp.crypto:bytes-to-hex xonly) (f "taproot_internal_key")))
+      (is (equal (bitcoin-lisp.crypto:bytes-to-hex leaf-hash) (f "taproot_merkle_root")))
+      ;; script-path sigs split the keydata into pubkey + leaf hash.
+      (let ((sps (elt (f "taproot_script_path_sigs") 0)))
+        (is (equal (bitcoin-lisp.crypto:bytes-to-hex xonly)
+                   (cdr (assoc "pubkey" sps :test #'string=))))
+        (is (equal (bitcoin-lisp.crypto:bytes-to-hex leaf-hash)
+                   (cdr (assoc "leaf_hash" sps :test #'string=))))
+        (is (equal (bitcoin-lisp.crypto:bytes-to-hex sig)
+                   (cdr (assoc "sig" sps :test #'string=)))))
+      ;; taproot_scripts splits the VALUE into script + trailing leaf version,
+      ;; and lists the control block from the KEYDATA.
+      (let ((ts (elt (f "taproot_scripts") 0)))
+        (is (equal (bitcoin-lisp.crypto:bytes-to-hex script)
+                   (cdr (assoc "script" ts :test #'string=))))
+        (is (eql #xc0 (cdr (assoc "leaf_ver" ts :test #'string=))))
+        (is (equal (bitcoin-lisp.crypto:bytes-to-hex control)
+                   (elt (cdr (assoc "control_blocks" ts :test #'string=)) 0))))
+      ;; taproot_bip32_derivs carries the leaf hashes AND the ordinary
+      ;; fingerprint/path, which is what distinguishes it from bip32_derivs.
+      (let ((d (elt (f "taproot_bip32_derivs") 0)))
+        (is (equal (bitcoin-lisp.crypto:bytes-to-hex xonly)
+                   (cdr (assoc "pubkey" d :test #'string=))))
+        (is (equal "01020304" (cdr (assoc "master_fingerprint" d :test #'string=))))
+        (is (equal "m/0'" (cdr (assoc "path" d :test #'string=))))
+        (is (equal (bitcoin-lisp.crypto:bytes-to-hex leaf-hash)
+                   (elt (cdr (assoc "leaf_hashes" d :test #'string=)) 0)))))))
+
+(test decodepsbt-reports-taproot-output-fields
+  "PSBT_OUT_TAP_TREE is one opaque blob of (depth, leaf_ver, script) tuples;
+Core reports it as hex rather than expanding it, so we do the same rather than
+inventing a shape a client would not recognise."
+  (let* ((xonly (%tap-bytes 32 #x11))
+         (tree (%tap-bytes 8 #x22))
+         (map (bitcoin-lisp.serialization:make-psbt-map
+               :records
+               (list (%tap-record bitcoin-lisp.serialization:+psbt-out-tap-internal-key+
+                                  #() xonly)
+                     (%tap-record bitcoin-lisp.serialization:+psbt-out-tap-tree+
+                                  #() tree)
+                     (%tap-record bitcoin-lisp.serialization:+psbt-out-tap-bip32+
+                                  xonly
+                                  (concatenate '(vector (unsigned-byte 8))
+                                               (vector 0) (vector 9 9 9 9))))))
+         (json (bitcoin-lisp.rpc::%psbt-output-json map)))
+    (flet ((f (k) (cdr (assoc k json :test #'string=))))
+      (is (equal (bitcoin-lisp.crypto:bytes-to-hex xonly) (f "taproot_internal_key")))
+      (is (equal (bitcoin-lisp.crypto:bytes-to-hex tree) (f "taproot_tree")))
+      (let ((d (elt (f "taproot_bip32_derivs") 0)))
+        (is (equal "09090909" (cdr (assoc "master_fingerprint" d :test #'string=))))
+        ;; A zero leaf-hash count is legal: the key is used for key-path only.
+        (is (zerop (length (cdr (assoc "leaf_hashes" d :test #'string=)))))))))

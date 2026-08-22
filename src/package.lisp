@@ -352,8 +352,11 @@
    #:+psbt-in-bip32+ #:+psbt-in-final-scriptsig+ #:+psbt-in-final-scriptwitness+
    #:+psbt-in-ripemd160+ #:+psbt-in-sha256+ #:+psbt-in-hash160+ #:+psbt-in-hash256+
    #:+psbt-in-tap-key-sig+ #:+psbt-in-tap-internal-key+ #:+psbt-in-proprietary+
+   #:+psbt-in-tap-script-sig+ #:+psbt-in-tap-leaf-script+
+   #:+psbt-in-tap-bip32+ #:+psbt-in-tap-merkle-root+
    #:+psbt-out-redeem-script+ #:+psbt-out-witness-script+ #:+psbt-out-bip32+
    #:+psbt-out-tap-internal-key+ #:+psbt-out-proprietary+
+   #:+psbt-out-tap-tree+ #:+psbt-out-tap-bip32+
    #:coinbase-input-p
    #:get-unix-time
    #:get-real-unix-time

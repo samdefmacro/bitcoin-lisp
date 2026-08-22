@@ -39,7 +39,11 @@
 (defconstant +psbt-in-hash160+ #x0c)
 (defconstant +psbt-in-hash256+ #x0d)
 (defconstant +psbt-in-tap-key-sig+ #x13)
+(defconstant +psbt-in-tap-script-sig+ #x14)
+(defconstant +psbt-in-tap-leaf-script+ #x15)
+(defconstant +psbt-in-tap-bip32+ #x16)
 (defconstant +psbt-in-tap-internal-key+ #x17)
+(defconstant +psbt-in-tap-merkle-root+ #x18)
 (defconstant +psbt-in-proprietary+ #xfc)
 
 ;; Output key types.
@@ -47,6 +51,8 @@
 (defconstant +psbt-out-witness-script+ #x01)
 (defconstant +psbt-out-bip32+ #x02)
 (defconstant +psbt-out-tap-internal-key+ #x05)
+(defconstant +psbt-out-tap-tree+ #x06)
+(defconstant +psbt-out-tap-bip32+ #x07)
 (defconstant +psbt-out-proprietary+ #xfc)
 
 (defstruct psbt-map
