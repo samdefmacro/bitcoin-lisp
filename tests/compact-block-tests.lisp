@@ -1351,6 +1351,72 @@ none of the block's transactions, then feed the blocktxn carrying TXS."
      (subseq (bitcoin-lisp.serialization:make-blocktxn-message hash txs :witness t) 24)
      cs utxo store mp)))
 
+(test cmpctblock-replay-never-hashes-the-mempool
+  "Core returns EARLY from the CMPCTBLOCK handler when
+`pindex->nChainWork <= tip->nChainWork || pindex->nTx != 0` — we know something
+better, or we have had this block's body at some point. In both cases our
+mempool is the wrong tool.
+
+Without that gate a peer can replay one cmpctblock forever and make us hash the
+WHOLE MEMPOOL into a shortid map every time: an unbounded per-message cost for
+a message that costs the sender nothing. Asserted by counting the shortid-map
+builds, because \"nothing connected\" is ALSO true of the ungated path — the
+replay was already harmless to the chain and expensive to us, which is exactly
+why the hole survived this long."
+  (%with-regtest
+   (let* ((node (%regtest-node-fixture "cb-replay-cost"))
+          (cs (bitcoin-lisp::node-chain-state node))
+          (utxo (bitcoin-lisp::node-utxo-set node))
+          (store (bitcoin-lisp::node-block-store node))
+          (mp (bitcoin-lisp::node-mempool node))
+          (spk (%p2sh-optrue-spk))
+          (b1 (%g716-mine-on node spk))
+          (builds 0)
+          ;; BIND the IBD latch. INITIAL-BLOCK-DOWNLOAD-P (protocol.lisp:695)
+          ;; SETFs this global the first time it sees a recent tip past the
+          ;; work floor — which connecting b1 on regtest (floor 0) does — and
+          ;; the latch is one-way. Without a binding the write escapes this
+          ;; test and every later test in the image that needs IBD fails,
+          ;; nowhere near here. That is exactly what happened: three
+          ;; eclipse-dos-tests went red in the cold battery while this suite
+          ;; stayed green. The neighbouring g7-16 tests get the same
+          ;; protection from %g716-with-fresh-hb.
+          (bitcoin-lisp.networking::*cached-is-ibd* nil))
+    (%g716-quiet
+      ;; Count every shortid map built, whoever builds it.
+      (let ((real (symbol-function 'bitcoin-lisp.networking::build-shortid-map)))
+        (unwind-protect
+             (progn
+               (setf (symbol-function 'bitcoin-lisp.networking::build-shortid-map)
+                     (lambda (&rest args) (incf builds) (apply real args)))
+               ;; Control: the FIRST delivery is new to us, so it is
+               ;; reconstructed — the gate must not swallow real work.
+               (let ((a (%g716-delivering-peer "198.51.100.60")))
+                 (bitcoin-lisp.networking::handle-cmpctblock
+                  a (%g716-cmpctblock-payload b1) cs utxo store mp))
+               (is (= 1 (bitcoin-lisp.storage:current-height cs))
+                   "control: the first delivery of b1 connected")
+               (is (plusp builds)
+                   "control: the first delivery must actually reconstruct")
+               ;; Now replay it ten times. Core returns before any of this.
+               (let ((after-first builds)
+                     (b (%g716-delivering-peer "198.51.100.61")))
+                 (dotimes (i 10)
+                   (bitcoin-lisp.networking::handle-cmpctblock
+                    b (%g716-cmpctblock-payload b1) cs utxo store mp))
+                 (is (= after-first builds)
+                     "a replayed cmpctblock rebuilt the shortid map ~D time(s)"
+                     (- builds after-first))
+                 (is (= 1 (bitcoin-lisp.storage:current-height cs))
+                     "the replays connected nothing")
+                 ;; And the replaying peer is not punished: an honest peer
+                 ;; relaying what it just accepted is the ordinary case.
+                 (is-false (bitcoin-lisp.networking:peer-discouraged-p
+                            "198.51.100.61"))
+                 (is (eq :ready (bitcoin-lisp.networking:peer-state b)))))
+          (setf (symbol-function 'bitcoin-lisp.networking::build-shortid-map)
+                real)))))))
+
 (test g7-16-replayed-block-earns-no-hb-promotion
   "A peer that REPLAYS a block already on our chain must earn nothing, on every
 delivery path.
