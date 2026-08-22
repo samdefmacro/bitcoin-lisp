@@ -201,7 +201,22 @@ it back lowercase."
   (is-true (bitcoin-lisp.networking:address-routable-p
             (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 1 2 3 4) :ipv4))
   (is-true (bitcoin-lisp.networking:address-routable-p
-            (%na-hex "20010db8000000000000000000000001") :ipv6))
+            (%na-hex "26064700000000000000000000000001") :ipv6))
+  ;; Core IsRoutable/IsValid refusals (netaddress.cpp:398-465) we used to
+  ;; store, dial and re-gossip: ::1, link-local, documentation, ORCHID v1/v2.
+  (dolist (hex '("00000000000000000000000000000001"
+                 "fe800000000000000000000000000001"
+                 "20010db8000000000000000000000001"
+                 "20010010000000000000000000000001"
+                 "20010020000000000000000000000001"))
+    (is-false (bitcoin-lisp.networking:address-routable-p (%na-hex hex) :ipv6) hex))
+  ;; IPv4 keeps the deliberate divergence: private AND documentation ranges
+  ;; stay routable here (Core rejects both), because private/regtest setups
+  ;; and the test suite's stand-in addresses depend on it.
+  (is-true (bitcoin-lisp.networking:address-routable-p
+            (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 192 168 1 1) :ipv4))
+  (is-true (bitcoin-lisp.networking:address-routable-p
+            (bitcoin-lisp.networking:ipv4-to-mapped-ipv6 203 0 113 1) :ipv4))
   (is-true (bitcoin-lisp.networking:address-routable-p (%na-hex +onion-pubkey-1+) :torv3))
   (is-true (bitcoin-lisp.networking:address-routable-p (%na-hex +i2p-hash-1+) :i2p))
   (is-true (bitcoin-lisp.networking:address-routable-p
