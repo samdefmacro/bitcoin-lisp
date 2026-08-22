@@ -1912,6 +1912,11 @@ form would waste the construction on both ends."
            (- (bitcoin-lisp.storage:current-height chain-state)
               +max-cmpctblock-depth+))))
 
+(defconstant +historical-block-age-seconds+ (* 7 24 60 60)
+  "A block older than this (relative to our best header) is \"historical\" for
+the -maxuploadtarget serving limit (Core HISTORICAL_BLOCK_AGE,
+net_processing.cpp:120).")
+
 (defun handle-getdata (peer payload chain-state &optional mempool block-store)
   "Handle a getdata message. Respond with requested transactions or blocks.
 Does not respond to transaction requests when relay is disabled (mainnet default).
@@ -2026,6 +2031,29 @@ handling of unavailable blocks."
                    "net" "getdata: ignoring request from ~A for an old block ~
                           that is not on the main chain"
                    (peer-address peer)))
+                 ;; -maxuploadtarget: stop serving HISTORICAL blocks once the
+                 ;; 24h budget (less a buffer big enough to still relay every
+                 ;; new block) is spent, and disconnect the asker — Core
+                 ;; net_processing.cpp:2376-2383. Only blocks older than a week
+                 ;; relative to our best header count as historical, so a peer
+                 ;; following the tip is unaffected. Core exempts peers with the
+                 ;; "download" permission; we have no permission flags yet, so
+                 ;; there is nothing to exempt.
+                 ((and entry
+                       (bitcoin-lisp.networking::outbound-target-reached-p t)
+                       (let ((best (best-header)))
+                         (flet ((btime (e)
+                                  (let ((h (bitcoin-lisp.storage:block-index-entry-header e)))
+                                    (and h (bitcoin-lisp.serialization:block-header-timestamp h)))))
+                           (let ((bt (and best (btime best)))
+                                 (et (btime entry)))
+                             (and bt et
+                                  (> (- bt et) +historical-block-age-seconds+))))))
+                  (bitcoin-lisp:log-cat
+                   "net" "historical block serving limit reached, disconnecting ~A"
+                   (peer-address peer))
+                  (disconnect-peer peer)
+                  (return))
                  ;; Prune-height leak: refuse AND disconnect, as Core does —
                  ;; a peer left waiting for a block we will never send stalls
                  ;; instead of re-routing the request.
