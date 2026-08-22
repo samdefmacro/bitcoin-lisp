@@ -65,6 +65,12 @@ dialed, and NOTHING else. Deliberately not the node's added-nodes list, because
 getaddednodeinfo reports -addnode and not -connect, exactly as Core's does —
 both are nonetheless dialed as MANUAL connections.")
 
+(defvar *seed-nodes* '()
+  "-seednode targets (Core connOptions.vSeedNodes): peers dialed once, purely to
+collect addresses, and disconnected as soon as they deliver some. Core queues
+them as m_addr_fetches and opens ConnectionType::ADDR_FETCH connections; the
+disconnect lives in the addr handler, next to Core's.")
+
 (defvar *use-addrman-outgoing* t
   "Core's CConnman m_use_addrman_outgoing (net.h:1095). NIL once -connect was
 given in any form. A global rather than a node slot for the same reason
@@ -2349,6 +2355,7 @@ Called from the sync loop; also runs unconditionally at shutdown."
                         (mocktime nil)
                         (pid-file nil)
                         (connect-nodes nil connect-nodes-supplied-p)
+                        (seednode nil)
                         (block-notify nil)
                         (startup-notify nil)
                         (shutdown-notify nil)
@@ -2592,7 +2599,11 @@ txindex ~D MiB, per-index ~D MiB"
   ;; -noconnect parses to — means no outbound connections at all; Core tests
   ;; for exactly that shape, so -connect=0 -connect=1.2.3.4 leaves BOTH as
   ;; targets rather than being read as a disable.
-  (setf *use-addrman-outgoing* t *connect-nodes* '())
+  (setf *use-addrman-outgoing* t *connect-nodes* '() *seed-nodes* '())
+  ;; -seednode: address sources, not peers (Core connOptions.vSeedNodes).
+  (when seednode
+    (setf *seed-nodes* (copy-list seednode))
+    (log-info "Address seed nodes (-seednode): ~{~A~^, ~}" seednode))
   (when connect-nodes-supplied-p
     (setf *use-addrman-outgoing* nil)
     (let ((targets (if (equal connect-nodes '("0")) '() (copy-list connect-nodes))))
@@ -3148,6 +3159,14 @@ txindex ~D MiB, per-index ~D MiB"
                    ;; failure logs and defers to the loop's reconnect path
                    ;; instead of ending the thread (a dead sync thread with
                    ;; node-running still T is a socket-reading zombie).
+                   ;; -seednode first: its whole purpose is to fill the
+                   ;; address book BEFORE the dial that reads it. Guarded
+                   ;; separately so an unreachable seed never costs us the
+                   ;; startup dial.
+                   (handler-case
+                       (connect-seed-nodes *node*)
+                     (error (c)
+                       (log-error "-seednode address fetch failed: ~A" c)))
                    (handler-case
                        (connect-to-peers *node* max-peers :timeout 60 :min-peers 2)
                      (error (c)
@@ -4849,10 +4868,14 @@ Returns the number of peers connected."
         (setf addresses (nreverse picks))))
     ;; Fall back to DNS seeds if not enough candidates (-dnsseed=0 forbids
     ;; the query entirely, Core DEFAULT_DNSSEED/ThreadDNSAddressSeed).
-    (when (and (< (length addresses) 8)
-               (not *dns-seed-enabled*))
+    ;; -forcednsseed queries them regardless of how full the address book is
+    ;; (Core DEFAULT_FORCEDNSSEED, net.h:97 — "Always query for peer addresses
+    ;; via DNS lookup"); it does NOT override -dnsseed=0, which is the same
+    ;; precedence Core's ThreadDNSAddressSeed has.
+    (let ((want-dns (or *force-dns-seed* (< (length addresses) 8))))
+    (when (and want-dns (not *dns-seed-enabled*))
       (log-info "DNS seeding disabled (-dnsseed=0)"))
-    (when (and (< (length addresses) 8) *dns-seed-enabled*)
+    (when (and want-dns *dns-seed-enabled*)
       (log-info "Discovering peers from DNS seeds...")
       (let* ((dns-addrs (bitcoin-lisp.networking:discover-peers))
              (usable (%reachable-seed-addresses dns-addrs)))
@@ -4861,7 +4884,7 @@ Returns the number of peers connected."
                   (and (/= (length usable) (length dns-addrs)) (length usable)))
         (setf addresses (append addresses
                                 (mapcar (lambda (a) (cons a nil)) usable)))
-        (setf addresses (remove-duplicates addresses :key #'car :test #'string=))))
+        (setf addresses (remove-duplicates addresses :key #'car :test #'string=)))))
 
     ;; Fixed-seed fallback for testnet4: even after DNS, the candidate pool
     ;; may have only one /16 group (sprovoost.nl seed has been dark since
@@ -5259,6 +5282,22 @@ node-peers stays single-writer. No-op when networking is disabled."
       (error (c)
         (log-debug "Added-node connect to ~A:~D failed: ~A" host port c)
         nil))))
+
+(defun connect-seed-nodes (node)
+  "Dial each -seednode once as an addr-fetch peer (Core ProcessAddrFetch,
+net.cpp). The handshake already sends GETADDR for any non-block-relay outbound
+peer, so the fetch needs no extra message; the peer disconnects itself from the
+addr handler once it answers.
+
+Skipped entirely when -connect is in force, which is Core's behaviour by
+construction: ThreadOpenConnections takes the specified-addresses branch (or is
+never started) and never reaches the seed queue."
+  (when (and (node-network-active node) (addrman-outgoing-enabled-p) *seed-nodes*)
+    (dolist (spec *seed-nodes*)
+      (multiple-value-bind (host port) (parse-node-endpoint node spec)
+        (unless (peer-connected-to-host-p node host)
+          (log-info "Fetching addresses from -seednode ~A" spec)
+          (establish-outbound-peer node host port :conn-type :addr-fetch))))))
 
 (defun connect-specified-nodes (node)
   "Keep every -connect target connected (Core ThreadOpenConnections' first

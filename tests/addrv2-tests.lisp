@@ -179,6 +179,38 @@
 ;;; handle-addrv2 stores only REACHABLE networks (Core "Do not store
 ;;; addresses outside our network"): with the default reachable set
 ;;; {ipv4, ipv6}, a TorV3 entry parses but is not stored.
+(test addr-fetch-peer-disconnects-once-it-delivers-addresses
+  "An addr-fetch peer (-seednode) exists only to hand over addresses and is
+disconnected as soon as it does (Core net_processing.cpp:4117-4121). Core
+requires MORE THAN ONE address, so a peer that merely self-announces does not
+end the fetch — without that, a seed answering with its own address alone would
+be dropped before delivering anything useful."
+  (flet ((deliver (conn-type count)
+           (let* ((book (bitcoin-lisp.networking:make-address-book))
+                  (peer (bitcoin-lisp.networking:make-peer
+                         :address "10.9.9.9" :conn-type conn-type
+                         :state :ready))
+                  (now (bitcoin-lisp.serialization:get-unix-time))
+                  (entries (loop for i below count
+                                 collect (cons (bitcoin-lisp.serialization:make-net-addr
+                                                :services 1
+                                                :ip (bitcoin-lisp.networking:ipv4-to-mapped-ipv6
+                                                     10 0 0 (1+ i))
+                                                :port 8333)
+                                               now))))
+             ;; A generous token bucket, so the rate limiter is not what
+             ;; decides the outcome here.
+             (setf (bitcoin-lisp.networking::peer-addr-token-bucket peer) 100d0)
+             (bitcoin-lisp.networking::%process-gossiped-addresses
+              peer entries count book nil)
+             (bitcoin-lisp.networking:peer-state peer))))
+    (is (eq :disconnected (deliver :addr-fetch 5))
+        "an addr-fetch peer stayed connected after delivering addresses")
+    (is-false (eq :disconnected (deliver :addr-fetch 1))
+              "an addr-fetch peer was dropped on a single self-announcement")
+    ;; An ordinary outbound peer is never dropped for answering our getaddr.
+    (is-false (eq :disconnected (deliver :outbound-full-relay 5)))))
+
 (test handle-addrv2-filters-networks
   "handle-addrv2 adds IPv4/IPv6 to address book, skips unreachable TorV3."
   (let* ((bitcoin-lisp.networking:*reachable-networks* '(:ipv4 :ipv6))
