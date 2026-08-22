@@ -733,6 +733,26 @@ Returns the number of blocks pruned."
          (pruned 0))
     (when (<= effective-target start)
       (return-from prune-blocks-to-height 0))
+    ;; Flat files first, whole pairs at a time — Core's FindFilesToPruneManual
+    ;; selects FILES whose last height is at or below the manual target
+    ;; (node/blockstorage.cpp:292-319), because a blk file cannot have a block
+    ;; cut out of the middle of it.
+    ;;
+    ;; Without this, pruneblockchain was a NO-OP on a store using the flat
+    ;; format: every block went to PRUNE-BLOCK, which refuses for a flat record
+    ;; and returns NIL, so the RPC reported success and freed nothing. That is
+    ;; what blocked rolling the flat format out to the pruned mainnet node.
+    (dolist (file (%prunable-flat-files store 0 effective-target))
+      (let* ((info (gethash file (block-store-file-info store)))
+             (last (and info (block-file-info-height-last info)))
+             (blocks (if info (block-file-info-blocks info) 0)))
+        (prune-flat-block-file store file :on-prune on-prune)
+        (incf pruned blocks)
+        (when last
+          (setf (chain-state-pruned-height chain-state)
+                (max (chain-state-pruned-height chain-state) last)))))
+    ;; Then any legacy per-block files in the range; a store mid-transition
+    ;; holds both forms.
     (dolist (entry (active-chain-entries-from
                     chain-state (1+ start)
                     (- effective-target start 1)))
@@ -740,6 +760,11 @@ Returns the number of blocks pruned."
         (incf pruned))
       (when on-prune
         (funcall on-prune (block-index-entry-hash entry)))
+      ;; MAX, not a plain assignment: the flat pass above may already have
+      ;; advanced the horizon past this walk's range, and overwriting it with
+      ;; the last legacy height would move the horizon BACKWARDS — re-exposing
+      ;; heights whose files are gone.
       (setf (chain-state-pruned-height chain-state)
-            (block-index-entry-height entry)))
+            (max (chain-state-pruned-height chain-state)
+                 (block-index-entry-height entry))))
     pruned))
