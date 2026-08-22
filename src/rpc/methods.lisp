@@ -3254,18 +3254,131 @@ shutdown, so a node reporting none hangs that test forever."
                            (namestring bitcoin-lisp::*log-file-path*))
                       ""))))
 
+(defun rpc-addpeeraddress (node params)
+  "Add an address to the address manager (Core addpeeraddress, rpc/net.cpp).
+For testing only: it is how a functional test seeds addrman without a peer.
+
+PARAMS: (address port [tried]). Returns {\"success\": bool} and, when TRIED was
+asked for and refused, Core's \"error\" string alongside it — the promotion can
+legitimately fail (the tried bucket position may be occupied and queued for a
+collision test), and reporting success for that would misinform the test."
+  (let ((address (first params))
+        (port (second params))
+        (tried (%positional-bool (third params))))
+    (unless (and (stringp address) (plusp (length address)))
+      (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for address"))
+    (unless (and (integerp port) (<= 0 port 65535))
+      (error 'rpc-error :code +rpc-type-error+ :message "Expected type number for port"))
+    (multiple-value-bind (net bytes)
+        (bitcoin-lisp.networking:parse-network-address address)
+      (unless (and net bytes)
+        (error 'rpc-error :code +rpc-client-invalid-ip-or-subnet+
+                          :message "Invalid IP address"))
+      (let ((book (bitcoin-lisp::node-address-book node)))
+        (unless book
+          (error 'rpc-error :code +rpc-misc-error+ :message "Address manager unavailable"))
+        (let* ((pa (bitcoin-lisp.networking:make-peer-address
+                    :net net :ip bytes :port port
+                    ;; Core stores NODE_NETWORK|NODE_WITNESS for the address.
+                    :services (logior 1 8)
+                    :last-seen (bitcoin-lisp.serialization:get-unix-time)))
+               (added (bitcoin-lisp.networking:address-book-add book pa)))
+          (cond
+            ((not added) `(("success" . ,(json-bool nil))))
+            ((not tried) `(("success" . ,(json-bool t))))
+            ((bitcoin-lisp.networking:address-book-good
+              book bytes port (bitcoin-lisp.serialization:get-unix-time) net)
+             `(("success" . ,(json-bool t))))
+            (t `(("success" . ,(json-bool nil))
+                 ("error" . "failed-adding-to-tried")))))))))
+
+(defconstant +max-message-type-size+ 12
+  "Core CMessageHeader::MESSAGE_TYPE_SIZE.")
+
+(defun rpc-sendmsgtopeer (node params)
+  "Send a raw P2P message to a connected peer (Core sendmsgtopeer,
+rpc/net.cpp). For testing only: it lets a functional test put an arbitrary
+message on the wire without writing a P2P client.
+
+PARAMS: (peer_id msg_type msg). Returns an empty object."
+  (let ((peer-id (first params))
+        (msg-type (second params))
+        (msg-hex (third params)))
+    (unless (integerp peer-id)
+      (error 'rpc-error :code +rpc-type-error+ :message "Expected type number for peer_id"))
+    (unless (stringp msg-type)
+      (error 'rpc-error :code +rpc-type-error+ :message "Expected type string for msg_type"))
+    (when (> (length msg-type) +max-message-type-size+)
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message (format nil "Error: msg_type too long, max length is ~D"
+                                         +max-message-type-size+)))
+    (unless (and (stringp msg-hex) (evenp (length msg-hex))
+                 (every (lambda (c) (digit-char-p c 16)) msg-hex))
+      (error 'rpc-error :code +rpc-invalid-parameter+
+                        :message "Error parsing input for msg"))
+    (let ((peer (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
+                  (find peer-id (bitcoin-lisp::node-peers node)
+                        :key #'bitcoin-lisp.networking::peer-id))))
+      (unless peer
+        (error 'rpc-error :code +rpc-misc-error+
+                          :message "Error: Could not send message to peer"))
+      (handler-case
+          (bitcoin-lisp.networking:send-message
+           peer (bitcoin-lisp.serialization:serialize-message
+                 msg-type (bitcoin-lisp.crypto:hex-to-bytes msg-hex)))
+        (error ()
+          (error 'rpc-error :code +rpc-misc-error+
+                            :message "Error: Could not send message to peer")))
+      ;; Core returns an empty object; an empty hash-table serializes as {}.
+      (make-hash-table :test (quote equal)))))
+
+(defun rpc-echojson (node params)
+  "Return the arguments unchanged (Core echojson, rpc/misc.cpp). For testing
+only; it exists so a test can check the JSON round-trip of every argument type
+without depending on what any real method does with them."
+  (declare (ignore node))
+  (coerce params 'vector))
+
+(defun %dump-all-command-conversions ()
+  "Core CRPCTable::dumpArgMap / RPCHelpMan::GetArgMap (rpc/util.cpp:833-863):
+one [method, position, argument-name, is-string-type] row per argument.
+
+IS-STRING-TYPE is Core's `type == STR || type == STR_HEX`. FALSE means a
+JSON-RPC client must parse the argument before sending it; TRUE means it goes
+through as a string. Core's own rpc_help.py compares this table against
+src/rpc/client.cpp and fails the node if they disagree, which is the whole
+reason the method exists — it is undocumented and for testing only."
+  (let ((rows '()))
+    (dolist (entry *rpc-arg-conversions*)
+      (let ((method (first entry)))
+        ;; A method we no longer register must not appear: the table is
+        ;; generated from Core's list, and Core dumps what it SERVES.
+        (when (gethash method *rpc-methods*)
+          (dolist (arg (rest entry))
+            (destructuring-bind (position name . string-p) arg
+              (push (vector method position name (json-bool string-p)) rows))))))
+    (coerce (nreverse rows) 'vector)))
+
 (defun rpc-help (node params)
   "List available RPC methods, or echo the name of a known one (Bitcoin Core
-help). A full per-method help text is out of scope."
+help). A full per-method help text is out of scope.
+
+The undocumented \"dump_all_command_conversions\" argument returns the
+argument-conversion table instead (Core rpc/server.cpp:135-138); it is what
+rpc_help.py uses to check this node against Core's client.cpp."
   (declare (ignore node))
   (let ((method (first params)))
-    (if (and method (stringp method))
-        (if (gethash method *rpc-methods*)
-            method
-            (format nil "help: unknown command: ~A" method))
-        (let ((names '()))
-          (maphash (lambda (k v) (declare (ignore v)) (push k names)) *rpc-methods*)
-          (format nil "~{~A~^~%~}" (sort names #'string<))))))
+    (cond
+      ((equal method "dump_all_command_conversions")
+       (%dump-all-command-conversions))
+      ((and method (stringp method))
+       (if (gethash method *rpc-methods*)
+           method
+           (format nil "help: unknown command: ~A" method)))
+      (t
+       (let ((names '()))
+         (maphash (lambda (k v) (declare (ignore v)) (push k names)) *rpc-methods*)
+         (format nil "~{~A~^~%~}" (sort names #'string<)))))))
 
 (defun rpc-getindexinfo (node params)
   "Report the status of optional indexes (Bitcoin Core getindexinfo): txindex,
