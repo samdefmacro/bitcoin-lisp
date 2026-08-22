@@ -198,9 +198,9 @@ the bool branch). Explicit false arrives as the +json-false+ sentinel."
 
 (defun rpc-getblock (node params)
   "Return block data (Bitcoin Core getblock). Verbosity <= 0 (or false) returns
-the serialized block hex; 1 (or true) a JSON object with txids; >= 2 the object
-with full transaction details (Core's verbosity-3 prevout data is not supported
-and folds into 2)."
+the serialized block hex; 1 (or true) a JSON object with txids; 2 the object
+with full transaction details and each transaction's fee; 3 additionally the
+prevout object per input (Core TxVerbosity::SHOW_DETAILS_AND_PREVOUT)."
   (let ((hash-str (first params)))
     (unless (valid-hex-hash-p hash-str)
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -220,8 +220,22 @@ and folds into 2)."
           (bitcoin-lisp.serialization:serialize-witness-block block)))
         ((= verbosity 1) ;; JSON with txids only
          (block-to-json block hash-str nil (rpc-get-chain-state node) (rpc-get-network node)))
-        (t ;; JSON with full tx details
-         (block-to-json block hash-str t (rpc-get-chain-state node) (rpc-get-network node)))))))
+        (t ;; verbosity 2: full tx details + fee; 3 adds the prevout objects
+         (block-to-json block hash-str t (rpc-get-chain-state node)
+                        (rpc-get-network node)
+                        :prevouts (>= verbosity 3)))))))
+
+(defun %block-tx-undos (block)
+  "BLOCK's undo data grouped per non-coinbase transaction, or NIL when it is not
+available. Never signals: a pruned or missing undo record means the fee and
+prevout fields are absent, which is what Core reports for a pruned block."
+  (handler-case
+      (let* ((hash (bitcoin-lisp.serialization:block-header-hash
+                    (bitcoin-lisp.serialization:bitcoin-block-header block)))
+             (undo (bitcoin-lisp.validation:get-undo-data hash)))
+        (and undo
+             (bitcoin-lisp.storage:block-undo-from-spent-utxos block undo)))
+    (error () nil)))
 
 (defun %block-on-active-chain-p (entry chain-state)
   "T if ENTRY is the block at its height on the active chain."
@@ -263,11 +277,17 @@ not the tip -- nextblockhash."
      (when next
        `(("nextblockhash" . ,(hash-to-hex (bitcoin-lisp.storage:block-index-entry-hash next))))))))
 
-(defun block-to-json (block hash-str include-tx-details chain-state &optional network)
+(defun block-to-json (block hash-str include-tx-details chain-state
+                      &optional network &key prevouts)
   "Convert block to JSON representation. NETWORK enables output addresses in the
 full-tx-detail (verbosity 2) form. CHAIN-STATE supplies the chain-context fields
 (confirmations/height/mediantime/chainwork/nextblockhash) when the block is in
-the index."
+the index.
+
+With INCLUDE-TX-DETAILS the block's undo data is read and each transaction gets
+its FEE, as Core does at verbosity 2 AND 3 (blockToJSON reads the undo for
+both, rpc/blockchain.cpp). PREVOUTS additionally renders Core's verbosity-3
+prevout object per input."
   (let* ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
          (txs (bitcoin-lisp.serialization:bitcoin-block-transactions block))
          (ntx (length txs))
@@ -302,7 +322,18 @@ the index."
      ;; blockheaderToJSON, so genesis omits previousblockhash here too.
      (%previousblockhash-field entry header)
      `(("tx" . ,(if include-tx-details
-                    (mapcar (lambda (tx) (tx-to-json tx network)) txs)
+                    (let ((undo (and include-tx-details
+                                     (%block-tx-undos block))))
+                      (loop for tx in txs
+                            for i from 0
+                            collect (tx-to-json tx network
+                                                ;; The undo list has one entry
+                                                ;; per NON-coinbase transaction,
+                                                ;; so index i-1; the coinbase
+                                                ;; spends nothing and has no fee.
+                                                :spent-coins (and undo (plusp i)
+                                                                  (nth (1- i) undo))
+                                                :prevouts prevouts)))
                     (mapcar #'tx-to-txid txs)))))))
 
 (defun %coinbase-tx-json (coinbase-tx)
@@ -351,9 +382,18 @@ stack item (the segwit reserved value, BIP141)."
     (when (and w (< index (length w)))
       (elt w index))))
 
-(defun tx-to-json (tx &optional network)
+(defun tx-to-json (tx &optional network &key spent-coins prevouts)
   "Convert transaction to JSON. When NETWORK is supplied, output addresses are
-derived. Includes the size/weight/hex fields explorers and fee tools expect."
+derived. Includes the size/weight/hex fields explorers and fee tools expect.
+
+SPENT-COINS is this transaction's undo data — a list of UTXO-ENTRY in input
+order — which unlocks Core's two extra fields (TxToUniv, core_io.cpp:455-525):
+
+  fee       whenever the coins are known, at verbosity 2 AND 3
+  prevout   only when PREVOUTS is true, which is verbosity 3
+
+Those two are gated separately in Core, so they are gated separately here: a
+verbosity-2 caller gets the fee and no prevout objects."
   (let ((inputs (bitcoin-lisp.serialization:transaction-inputs tx))
         (outputs (bitcoin-lisp.serialization:transaction-outputs tx))
         (wire (bitcoin-lisp.serialization:transaction-wire-bytes tx)))
@@ -366,15 +406,30 @@ derived. Includes the size/weight/hex fields explorers and fee tools expect."
       ("locktime" . ,(bitcoin-lisp.serialization:transaction-lock-time tx))
       ("vin" . ,(loop for input across inputs
                       for i from 0
-                      collect (input-to-json input (%tx-input-witness tx i))))
+                      collect (input-to-json input (%tx-input-witness tx i)
+                                             :prevout (and prevouts
+                                                           (nth i spent-coins))
+                                             :network network)))
       ("vout" . ,(loop for out across outputs
                        for i from 0
                        collect (output-to-json out i network)))
+      ,@(when spent-coins
+          ;; Core computes the fee from the spent coins whenever it has them,
+          ;; independently of whether it renders the prevout objects.
+          (let ((in-total (reduce #'+ spent-coins
+                                  :key #'bitcoin-lisp.storage:utxo-entry-value
+                                  :initial-value 0))
+                (out-total (loop for o across outputs
+                                 sum (bitcoin-lisp.serialization:tx-out-value o))))
+            `(("fee" . ,(/ (- in-total out-total) 100000000.0d0)))))
       ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex wire)))))
 
-(defun input-to-json (input &optional witness-stack)
+(defun input-to-json (input &optional witness-stack &key prevout network)
   "Convert transaction input to JSON, including sequence and (when present) the
-witness stack; coinbase inputs emit a coinbase field instead of txid/vout."
+witness stack; coinbase inputs emit a coinbase field instead of txid/vout.
+
+PREVOUT is the UTXO-ENTRY this input spent; supplying it adds Core's
+verbosity-3 prevout object (core_io.cpp:478-488)."
   (let ((base
           (if (bitcoin-lisp.serialization:coinbase-input-p input)
               `(("coinbase" . ,(bitcoin-lisp.crypto:bytes-to-hex
@@ -386,6 +441,23 @@ witness stack; coinbase inputs emit a coinbase field instead of txid/vout."
                                              (bitcoin-lisp.serialization:tx-in-script-sig input)))
                                   ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex
                                              (bitcoin-lisp.serialization:tx-in-script-sig input))))))))))
+    (when (and prevout (not (bitcoin-lisp.serialization:coinbase-input-p input)))
+      (let ((spk (bitcoin-lisp.storage:utxo-entry-script-pubkey prevout)))
+        (setf base
+              (append base
+                      `(("prevout"
+                         . (("generated" . ,(json-bool
+                                             (bitcoin-lisp.storage:utxo-entry-coinbase prevout)))
+                            ("height" . ,(bitcoin-lisp.storage:utxo-entry-height prevout))
+                            ("value" . ,(/ (bitcoin-lisp.storage:utxo-entry-value prevout)
+                                           100000000.0d0))
+                            ("scriptPubKey"
+                             . ,(let ((addr (and network (%script->address spk network))))
+                                  (append
+                                   `(("asm" . ,(bitcoin-lisp.validation:disassemble-script spk))
+                                     ("hex" . ,(bitcoin-lisp.crypto:bytes-to-hex spk))
+                                     ("type" . ,(%script-type spk)))
+                                   (when addr `(("address" . ,addr)))))))))))))
     (when (and witness-stack (plusp (length witness-stack)))
       (setf base (append base
                          `(("txinwitness"
