@@ -129,8 +129,17 @@ Returns a 20-byte vector."
 ;;;
 ;;; Pre-computed tag hashes are cached for efficiency.
 
-(defvar *tagged-hash-cache* (make-hash-table :test 'equal)
-  "Cache for pre-computed SHA256(tag) values.")
+(defvar *tagged-hash-cache*
+  (make-hash-table :test 'equal #+sbcl :synchronized #+sbcl t)
+  "Cache for pre-computed SHA256(tag) values.
+
+SYNCHRONIZED for the same reason as *FLAG-SET-CACHE*: GET-TAG-HASH inserts on a
+miss, and TapSighash plus the TapLeaf/TapBranch/TapTweak hashes all go through
+it, so every parallel script-check worker verifying a taproot input hits it.
+A plain SBCL hash table taking concurrent read-through inserts corrupts.
+
+The value is deterministic per tag, so racing the STORE costs at most a
+re-hash; the table's structure is what needs the lock.")
 
 (defun get-tag-hash (tag)
   "Get or compute SHA256(tag) for a given tag string."
