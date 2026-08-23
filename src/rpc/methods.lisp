@@ -776,6 +776,32 @@ address of an OUTBOUND connection is whichever local address the kernel chose."
                  (format nil "[~A]:~D" text port)
                  (format nil "~A:~D" text port)))))))))
 
+(defun %peer-addr (peer)
+  "The peer's address as \"ip:port\" (Core CNode::addr.ToStringAddrPort(),
+which is what getpeerinfo's `addr` carries — rpc/net.cpp:130).
+
+Ours reported the host alone. The port is not decoration: the framework pairs
+the two ends of a connection by comparing one node's `addrbind` against the
+other's `addr` (rpc_net.py:116-117), and a bare host can never equal an
+\"ip:port\". More plainly, two peers behind one address are indistinguishable
+in getpeerinfo output without it, which on regtest is every peer.
+
+Read from the socket, like ADDRBIND: an outbound connection knows the port it
+dialled, and an inbound one only learns the remote's ephemeral port from the
+accepted socket."
+  (let* ((connection (bitcoin-lisp.networking::peer-connection peer))
+         (socket (and connection (bitcoin-lisp.networking::connection-socket connection)))
+         (host (bitcoin-lisp::peer-address peer))
+         (port (or (ignore-errors (and socket (usocket:get-peer-port socket)))
+                   (let ((p (and connection
+                                 (bitcoin-lisp.networking::connection-port connection))))
+                     (and p (plusp p) p)))))
+    (cond ((null port) host)
+          ;; A v6 literal is bracketed before the port, as Core's
+          ;; CService::ToStringAddrPort does.
+          ((find #\: host) (format nil "[~A]:~D" host port))
+          (t (format nil "~A:~D" host port)))))
+
 (defun %peer-addrlocal (peer)
   "Our address as the peer reported it in its version message's addr_recv
 (Core addrLocal, set from the version addrMe for outbound peers when
@@ -811,9 +837,24 @@ last_block stamps every block received (Core stamps only NEW blocks)."
   (json-array (%peerinfo-rows node)))
 
 (defun %peerinfo-rows (node)
-  "One getpeerinfo row (a field alist) per connected peer — the body of Core's
-getpeerinfo loop, rpc/net.cpp:107-227."
-  (let ((peers (rpc-get-peers node))
+  "One getpeerinfo row (a field alist) per CONNECTED peer — the body of Core's
+getpeerinfo loop, rpc/net.cpp:107-227.
+
+Peers in state :DISCONNECTED are skipped. Core has no equivalent filter because
+it has no equivalent state: DisconnectNodes() removes the node from m_nodes on
+every socket-handler pass, roughly every 50ms, so a disconnected node is simply
+not in the list getpeerinfo walks. Ours is reaped by REPLACE-DISCONNECTED-PEERS
+once per sync cycle, and a sync cycle can be half a minute — so a peer this node
+had already dropped kept being reported as connected for that long.
+
+Core's functional framework allows FIVE seconds for a disconnected peer to
+leave getpeerinfo (disconnect_nodes, test_framework.py:626), which is generous
+against 50ms and hopeless against 30s. Filtering here is not a workaround for
+the reap cadence: reporting a peer we have closed the socket on is wrong
+whatever the cadence is."
+  (let ((peers (remove-if (lambda (p)
+                            (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
+                          (rpc-get-peers node)))
         (chain-state (rpc-get-chain-state node))
         (now (get-internal-real-time)))
     (mapcar
@@ -848,7 +889,7 @@ getpeerinfo loop, rpc/net.cpp:107-227."
                               collect (bitcoin-lisp.storage:block-index-entry-height entry))
                       #'<)))
          `(("id" . ,(bitcoin-lisp.networking::peer-id peer))
-           ("addr" . ,(bitcoin-lisp::peer-address peer))
+           ("addr" . ,(%peer-addr peer))
            ,@(let ((addrlocal (%peer-addrlocal peer)))
                (when addrlocal `(("addrlocal" . ,addrlocal))))
            ,@(let ((addrbind (%peer-addrbind peer)))
@@ -1983,21 +2024,54 @@ the cross-thread send safe."
       (make-hash-table :test 'equal))))
 
 (defun rpc-disconnectnode (node params)
-  "Disconnect a connected peer by ADDRESS (Bitcoin Core disconnectnode). Returns
-null on success; errors if no connected peer has that address."
-  (let ((address (first params)))
-    (unless (stringp address)
-      (error 'rpc-error :code +rpc-invalid-parameter+ :message "address must be a string"))
+  "Disconnect a connected peer by ADDRESS or by NODEID (Bitcoin Core
+disconnectnode, rpc/net.cpp:462-486). PARAMS: (address nodeid).
+
+Core's selection rule exactly, including which combination is an error:
+address without nodeid disconnects by address; nodeid with either no address or
+an EMPTY one disconnects by id; anything else is RPC_INVALID_PARAMS with Core's
+text. The empty-string case is not a nicety — it is how Core's own help says to
+disconnect by id positionally (`disconnectnode \"\" 1`).
+
+By-id was missing, and it is the form Core's functional framework uses:
+disconnect_nodes calls `disconnectnode(nodeid=peer_id)` for every peer it wants
+gone (test_framework.py:616). With only the address form, that arrived as a
+NIL address and answered \"address must be a string\" — an error about a
+parameter the caller never sent."
+  (let* ((address (first params))
+         (nodeid (second params))
+         (have-address (and (stringp address) (plusp (length address))))
+         (have-nodeid (integerp nodeid)))
     ;; Atomic against the sync thread's node-peers mutations: hold node-lock
     ;; across the find + disconnect so we don't act on a peer mid-removal.
     (bt:with-recursive-lock-held ((bitcoin-lisp::node-lock node))
-      (let ((target (find address (bitcoin-lisp::node-peers node)
-                          :key (lambda (p) (bitcoin-lisp::peer-address p)) :test #'string=)))
+      (let ((target
+              (cond
+                ((and have-address (not have-nodeid))
+                 (find address (bitcoin-lisp::node-peers node)
+                       :key (lambda (p) (bitcoin-lisp::peer-address p))
+                       :test #'string=))
+                ((and have-nodeid (or (null address)
+                                      (and (stringp address) (zerop (length address)))))
+                 (find nodeid (bitcoin-lisp::node-peers node)
+                       :key (lambda (p) (bitcoin-lisp.networking::peer-id p))
+                       :test #'eql))
+                (t
+                 (error 'rpc-error :code +rpc-invalid-params+
+                                   :message "Only one of address and nodeid should be provided.")))))
         (unless target
           ;; Core: RPC_CLIENT_NODE_NOT_CONNECTED (-29), net.cpp:482.
           (error 'rpc-error :code +rpc-client-node-not-connected+
                             :message "Node not found in connected nodes"))
         (bitcoin-lisp.networking:disconnect-peer target)
+        ;; Reap it here rather than waiting for the next sync cycle's
+        ;; REPLACE-DISCONNECTED-PEERS. Core's DisconnectNodes() runs every
+        ;; socket-handler pass, so by the time disconnectnode returns the node
+        ;; is already out of m_nodes; ours would otherwise linger in
+        ;; node-peers for as long as a sync cycle takes. We already hold
+        ;; node-lock, which is the only thing that made this awkward before.
+        (setf (bitcoin-lisp::node-peers node)
+              (remove target (bitcoin-lisp::node-peers node)))
         nil))))
 
 ;;; --- Manual ban management (Bitcoin Core setban/listbanned/clearbanned) ---

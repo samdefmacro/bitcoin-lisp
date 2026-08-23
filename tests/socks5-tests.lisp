@@ -457,9 +457,55 @@ dial is refused."
       (setf bitcoin-lisp.networking:*proxy* old-proxy
             bitcoin-lisp.networking:*onion-proxy* old-onion))))
 
+(test proxy-is-not-used-for-unroutable-targets
+  "Core never proxies an unroutable target, and reaches that structurally:
+GetNetwork() answers NET_UNROUTABLE for anything IsRoutable() rejects
+(netaddress.cpp:496-505), and no proxy is ever registered for that
+pseudo-network, so GetProxy fails and ConnectNode dials directly
+(net.cpp:486-491).
+
+Ours sent EVERY dial through -proxy. That is not a corner case: Core's
+rpc_net.py gives every node -proxy=127.0.0.1:1, a deliberately dead proxy
+\"to make sure no actual connections to public IPs are attempted\", and then
+expects those nodes to connect to each other over loopback. A node that
+proxies loopback cannot be tested that way and cannot reach its own peers on
+any private network.
+
+Hostnames keep the proxy on purpose — Core routes name lookups through it
+precisely so the name does not leak to local DNS."
+  (let ((bitcoin-lisp.networking::*proxy*
+          (bitcoin-lisp.networking::make-proxy :host "127.0.0.1" :port 1)))
+    (dolist (direct '("127.0.0.1" "127.5.5.5" "10.0.0.1" "172.16.0.1"
+                      "192.168.1.5" "169.254.1.1" "100.64.0.1" "::1"
+                      "fe80::1"))
+      (is (null (bitcoin-lisp.networking::proxy-for-target direct))
+          "~A was dialed through the proxy" direct))
+    ;; Documentation space (203.0.113/24) stays PROXIED here, unlike in Core:
+    ;; this tree treats it as routable on purpose so fixtures can use it as a
+    ;; public stand-in. See %TARGET-UNROUTABLE-P.
+    ;; fc00::/7 stays proxied: Core's IsRFC4193() is guarded by IsIPv6(), a
+    ;; NETWORK-TAG check, so a CJDNS address on the same prefix is routable and
+    ;; an unsuffixed -proxy covers it. A bare host string carries no tag.
+    (dolist (proxied '("8.8.8.8" "1.1.1.1" "2001:db8::1" "example.com"
+                       "203.0.113.7" "fc00:1:2:3:4:5:6:7"))
+      (is (not (null (bitcoin-lisp.networking::proxy-for-target proxied)))
+          "~A skipped the proxy" proxied))
+    ;; The positive control: with no proxy configured, everything is direct,
+    ;; so a test that only asserted NIL above would pass against a broken
+    ;; classifier.
+    (let ((bitcoin-lisp.networking::*proxy* nil))
+      (is (null (bitcoin-lisp.networking::proxy-for-target "8.8.8.8"))))))
+
 (test proxy-soft-defaults-listen-off
   "-proxy soft-sets listen off (Core init.cpp:786-790), but an explicit
--listen wins, and -proxy=0 leaves listening alone."
+-listen wins, and -proxy=0 leaves listening alone.
+
+Asserted as a VALUE rather than as key presence. The soft-set chain now
+computes one definite effective -listen, the way Core's
+InitParameterInteraction does, so the plist always carries it; \"absent\"
+stopped being how the default is expressed. START-NODE's own default is T, so
+an explicit T and an absent key mean the same thing to the caller — the
+distinction the old assertion rested on was in the plist, not in behaviour."
   (let ((plist (bitcoin-lisp::config-alist->start-node-plist
                 '(("proxy" . "127.0.0.1")) :testnet4)))
     (is (null (getf plist :listen 'missing))))
@@ -468,4 +514,10 @@ dial is refused."
     (is (eq t (getf plist :listen))))
   (let ((plist (bitcoin-lisp::config-alist->start-node-plist
                 '(("proxy" . "0")) :testnet4)))
-    (is (eq 'missing (getf plist :listen 'missing)))))
+    (is (eq t (getf plist :listen 'missing))))
+  ;; -bind wins over -proxy, for the same reason it wins over -connect: Core
+  ;; applies it FIRST (init.cpp:766-771) and says "you want to listen on it
+  ;; even when -connect or -proxy is specified".
+  (let ((plist (bitcoin-lisp::config-alist->start-node-plist
+                '(("proxy" . "127.0.0.1") ("bind" . "127.0.0.1")) :testnet4)))
+    (is (eq t (getf plist :listen)))))

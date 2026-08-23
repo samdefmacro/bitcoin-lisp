@@ -308,10 +308,18 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
             (set-socket-non-blocking client)
             (let ((host (handler-case
                             (usocket:host-to-hostname (usocket:get-peer-address client))
-                          (error () "inbound"))))
+                          (error () "inbound")))
+                  ;; The remote's EPHEMERAL source port. Recorded (it used to be
+                  ;; a hardcoded 0) so an accepted peer has a real endpoint:
+                  ;; getpeerinfo's `addr` needs it, and the dial-dedup guard
+                  ;; compares full endpoints the way Core's m_addr_name does.
+                  ;; An ephemeral source port is essentially never a peer's
+                  ;; listening port, which is what keeps an inbound connection
+                  ;; from blocking an outbound dial to the same host.
+                  (port (or (ignore-errors (usocket:get-peer-port client)) 0)))
               (make-connection :socket client
                                :host host
-                               :port 0
+                               :port port
                                :connected t
                                :last-activity (bitcoin-lisp.serialization:get-node-time))))))
     (error () nil)))

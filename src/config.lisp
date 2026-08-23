@@ -1128,23 +1128,58 @@ Core: `[::1]:8333` has a port, `::1` does not."
       (when (and n (<= 1 n 65535)) n))))
 
 (defun conf-effective-listen-flags (alist)
-  "Replay Core's -proxy/-listen/-listenonion soft-set chain over a merged
-config ALIST: -proxy soft-disables -listen (init.cpp:786-790), -listen=0
-soft-disables -listenonion (init.cpp:808-809), and the explicit contradiction
--listen=0 -listenonion=1 is an init ERROR (init.cpp:1022-1024). Returns
-(VALUES listen-p listen-onion-p). The ONE encoding of this chain — both the
-start-node plist assembly and apply-config-globals' -onlynet=onion gate
-derive from it, so the two can never drift."
+  "Replay Core's -listen/-listenonion soft-set chain over a merged config
+ALIST. Returns (VALUES listen-p listen-onion-p). The ONE encoding of this
+chain — the start-node plist assembly and apply-config-globals' -onlynet=onion
+gate both derive from it, so the two can never drift.
+
+ORDER IS THE WHOLE THING. Core's SoftSetBoolArg is FIRST-WINS: it sets a value
+only if nothing has set one yet, and an explicit user value counts as already
+set. InitParameterInteraction (init.cpp:764-810) then runs the interactions in
+an order chosen so the earlier ones override the later ones:
+
+  1. -bind / -whitebind soft-set -listen=1 (:768-775). Core's comment says why
+     in as many words: \"when specifying an explicit binding address, you want
+     to listen on it even when -connect or -proxy is specified\".
+  2. -connect in any form, or -maxconnections<=0, soft-sets -dnsseed=0 and
+     -listen=0 (:777-784) — \"when only connecting to trusted nodes, do not
+     seed via DNS, or listen by default\".
+  3. -proxy soft-sets -listen=0, to protect privacy (:786-790).
+
+So -bind BEATS -connect, and this is not a corner case: Core's functional test
+framework writes both `bind=127.0.0.1` and `connect=0` into every node's config
+(test_framework/util.py), and relies on the node listening anyway so that
+connect_nodes can wire the network up with `addnode onetry`. Applying step 2
+without step 1 leaves every node deaf, every multi-node test times out in
+connect_nodes, and the node logs nothing wrong because from its own point of
+view it did what it was told.
+
+-listen=0 then soft-disables -listenonion (:808-809), and the explicit
+contradiction -listen=0 -listenonion=1 is an init ERROR (:1022-1024)."
   (flet ((lk (k) (let ((c (assoc k alist :test #'string=))) (and c (cdr c)))))
-    (let* ((proxy-p (let ((v (lk "proxy"))) (and v (conf-parse-proxy v) t)))
-           (listen-p (let ((v (lk "listen")))
-                       (if v (conf-parse-bool v) (not proxy-p))))
-           (lo (lk "listenonion"))
-           (lo-p (and lo (conf-parse-bool lo))))
-      (when (and (not listen-p) lo-p)
-        (error "Cannot set -listen=0 together with -listenonion=1"))
-      (values listen-p
-              (and listen-p (if lo lo-p t))))))
+    (let ((listen nil))                 ; NIL = nothing has set it yet
+      (flet ((soft-set (value)
+               ;; SoftSetBoolArg: first writer wins.
+               (unless listen (setf listen (list value)))))
+        ;; An explicit -listen is already set before any interaction runs.
+        (let ((explicit (lk "listen")))
+          (when explicit (soft-set (and (conf-parse-bool explicit) t))))
+        (when (or (lk "bind") (lk "whitebind"))
+          (soft-set t))
+        (when (or (assoc "connect" alist :test #'string=)
+                  (let ((m (lk "maxconnections")))
+                    (and m (let ((n (parse-integer m :junk-allowed t)))
+                             (and n (<= n 0))))))
+          (soft-set nil))
+        (when (let ((v (lk "proxy"))) (and v (conf-parse-proxy v)))
+          (soft-set nil)))
+      (let* ((listen-p (if listen (first listen) t)) ; Core DEFAULT_LISTEN
+             (lo (lk "listenonion"))
+             (lo-p (and lo (conf-parse-bool lo))))
+        (when (and (not listen-p) lo-p)
+          (error "Cannot set -listen=0 together with -listenonion=1"))
+        (values listen-p
+                (and listen-p (if lo lo-p t)))))))
 
 (defun config-alist->start-node-plist (alist network)
   "Convert a merged config ALIST (CLI over file) into a plist of start-node
@@ -1228,18 +1263,13 @@ resolved network. Honors -server (enable RPC on the default port when no
             ;; A port on -bind overrides -port for the listener, as it does in
             ;; Core, where the bind address carries its own port.
             (when port (setf (getf plist :port) port)))))
-      ;; -connect (any form, including -connect=0 / -noconnect) SOFT-SETS
-      ;; -dnsseed=0 and -listen=0 (Core init.cpp:777-784): "when only connecting
-      ;; to trusted nodes, do not seed via DNS, or listen by default". Soft, so
-      ;; an explicit -dnsseed=1 / -listen=1 still wins — which is what makes
-      ;; this a parameter INTERACTION rather than an override. Core applies the
-      ;; same interaction for -maxconnections<=0.
-      ;; (The -dnsseed half is applied in APPLY-CONFIG-GLOBALS, which owns
-      ;; *dns-seed-enabled*; only -listen reaches START-NODE through the plist.)
-      (when (or (lookup "connect")
-                (let ((m (getf plist :max-connections))) (and m (<= m 0))))
-        (unless (lookup "listen")
-          (setf (getf plist :listen) nil)))
+      ;; -listen is decided in exactly one place: CONF-EFFECTIVE-LISTEN-FLAGS,
+      ;; which replays Core's soft-set chain in Core's order (-bind beats
+      ;; -connect beats -proxy). Deciding it here as well is how the -bind case
+      ;; got lost the first time.
+      ;;
+      ;; (-connect's -dnsseed=0 half is applied in APPLY-CONFIG-GLOBALS, which
+      ;; owns *dns-seed-enabled*.)
       ;; -debug also raises the log level, because a category's lines are
       ;; emitted at debug level: enabling a category without raising the level
       ;; turns on a switch that changes nothing. An explicit -loglevel wins.
@@ -1258,21 +1288,10 @@ resolved network. Honors -server (enable RPC on the default port when no
         (when (and server (conf-parse-bool (cdr server))
                    (not (getf plist :rpc-port)))
           (setf (getf plist :rpc-port) (network-rpc-port network))))
-      ;; -proxy soft-disables listening, to protect privacy (Bitcoin Core
-      ;; init.cpp:786-790: SoftSetBoolArg("-listen", false)). Soft = only when
-      ;; the user gave no explicit -listen; same only-if-unset pattern as
-      ;; -server/-debug above. -proxy=0 (a cleared proxy) does not trigger it.
-      (let ((proxy (lookup "proxy")))
-        (when (and proxy
-                   (conf-parse-proxy (cdr proxy))
-                   (not (lookup "listen")))
-          (setf (getf plist :listen) nil)))
-      ;; -listen=0 (given, or soft-set by -proxy just above) disables the
-      ;; onion service (conf-effective-listen-flags: the shared soft-set
-      ;; chain, which also signals on -listen=0 -listenonion=1).
+      ;; The listen chain, applied once, for both flags.
       (multiple-value-bind (listen-p listen-onion-p)
           (conf-effective-listen-flags alist)
-        (declare (ignore listen-p))
+        (setf (getf plist :listen) listen-p)
         (unless listen-onion-p
           (setf (getf plist :listen-onion) nil))))
     plist))

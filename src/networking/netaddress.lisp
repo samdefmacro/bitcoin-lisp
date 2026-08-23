@@ -126,6 +126,58 @@ the (possibly new) network keyword."
       :cjdns
       network))
 
+(defun %target-unroutable-p (host)
+  "T if HOST is an IP literal Core would classify as unroutable — loopback,
+RFC1918 private, link-local, RFC6598 CGNAT, RFC2544 benchmarking, RFC5737
+documentation, or IPv6 ::1 / fe80::/10 / fc00::/7.
+
+Core reaches the same answer structurally rather than with a list: GetNetwork()
+returns NET_UNROUTABLE for any address IsRoutable() rejects
+(netaddress.cpp:496-505), and a proxy is only ever registered for a real
+network, so GetProxy(NET_UNROUTABLE, ...) always fails and the dial goes
+direct.
+
+That is not a corner case. Core's rpc_net.py starts every node with
+-proxy=127.0.0.1:1 — a deliberately dead proxy, "to make sure no actual
+connections to public IPs are attempted" — and then expects the nodes to
+connect to EACH OTHER over loopback anyway. A node that proxies its loopback
+dials cannot be tested that way, and on a private network it cannot reach its
+own peers at all.
+
+Hostnames are not covered, deliberately: Core routes name lookups through the
+proxy (its point is that the name must not leak to local DNS).
+
+Two of Core's unroutable ranges are deliberately NOT here: the documentation
+blocks (RFC5737 192.0.2/24, 198.51.100/24, 203.0.113/24) and RFC2544
+benchmarking space. This tree already treats those as ROUTABLE on purpose —
+see ADDRESS-ROUTABLE-P, whose divergence note says so — because the test
+fixtures use them as stand-ins for public addresses. Classifying them as
+unroutable HERE and routable THERE would be two definitions of the same word,
+and would silently change what every one of those fixtures is testing.
+
+fc00::/7 is not here either, and that one is Core's own doing rather than a
+divergence. Core's IsRFC4193() is guarded by IsIPv6(), which is a check on the
+address's NETWORK TAG, not its bytes — so a CJDNS address (same prefix, tagged
+NET_CJDNS) is routable and an unsuffixed -proxy covers it (init.cpp:1735).
+Telling ULA from CJDNS needs that tag, which a bare host string does not carry,
+so this stays out rather than guessing."
+  (let ((ip (bitcoin-lisp.networking::string-to-ip-bytes host)))
+    (when ip
+      (flet ((v4 () (and (ipv4-mapped-p ip) (subseq ip 12))))
+        (let ((a (v4)))
+          (cond
+            (a (let ((b0 (aref a 0)) (b1 (aref a 1)))
+                 (or (= b0 127)                                   ; loopback
+                     (= b0 0)                                     ; "this network"
+                     (= b0 10)                                    ; RFC1918
+                     (and (= b0 172) (<= 16 b1 31))               ; RFC1918
+                     (and (= b0 192) (= b1 168))                  ; RFC1918
+                     (and (= b0 169) (= b1 254))                  ; RFC3927 link-local
+                     (and (= b0 100) (<= 64 b1 127)))))            ; RFC6598 CGNAT
+            (t (or (equalp ip #(0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1)) ; ::1
+                   (and (= (aref ip 0) #xFE)
+                        (= (logand (aref ip 1) #xC0) #x80)))))))))) ; fe80::/10
+
 (defun proxy-for-target (host)
   "The SOCKS5 proxy for an outbound dial to HOST (a peer-address string or
 hostname) — Core ConnectNode's per-target-network proxy pick (net.cpp:449
@@ -146,6 +198,10 @@ GetProxy(target network), table built by init.cpp:1696-1801). Returns
              (values nil "onion peer but no Tor proxy is configured (-proxy/-onion)")))
         ((parse-i2p-address host)
          (values nil "I2P peers are not dialable (no SAM support)"))
+        ;; Unroutable targets are dialed directly, never through the proxy —
+        ;; Core's NET_UNROUTABLE has no proxy registered for it. See
+        ;; %TARGET-UNROUTABLE-P.
+        ((%target-unroutable-p host) (values nil nil))
         (t (values *proxy* nil))))
 
 ;;;; Base32 (Core util/strencodings.cpp:144-200)

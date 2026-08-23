@@ -280,21 +280,37 @@ point and answers -28 for every method until FINISH-RPC-WARMUP."
       (bitcoin-lisp.rpc:open-browser-to-ui rpc-port))
     server))
 
-(defun %resolve-log-file (log-file data-directory)
+(defun %resolve-log-file (log-file data-directory &optional network)
   "The path to log to, or NIL for no file log.
 
 LOG-FILE is -logfile: a path uses it as given, and an explicit \"0\" or \"\"
 turns file logging off the way Core's -debuglogfile=0 does. Anything else —
-including the usual case of no -logfile at all — is debug.log inside
-DATA-DIRECTORY."
+including the usual case of no -logfile at all — is debug.log in NETWORK's
+directory under DATA-DIRECTORY.
+
+The NETWORK directory, not the base one. Core resolves -debuglogfile against
+GetDataDirNet() (init.cpp, AbsPathForConfigVal), so regtest logs to
+<datadir>/regtest/debug.log and only mainnet logs to <datadir>/debug.log. Core's
+functional framework reads exactly that path — test_node.py's debug_log_path is
+`datadir / chain / \"debug.log\"` — and every assert_debug_log in the suite
+goes through it. Writing to the base directory instead does not fail: the
+framework opens a file that is not there, finds nothing in it, and reports the
+expected message as missing. That is a whole class of tests reporting a
+node-behaviour failure for a path bug.
+
+Passing no NETWORK keeps the base directory, which is what the pre-Core callers
+and the unit tests expect."
   (cond ((and (stringp log-file)
               (or (string= log-file "0") (string= log-file "")))
          nil)
         ((and (stringp log-file) (plusp (length log-file))) log-file)
         (log-file log-file)
         (data-directory
-         (namestring (merge-pathnames "debug.log"
-                                      (uiop:ensure-directory-pathname data-directory))))
+         (let ((dir (uiop:ensure-directory-pathname data-directory)))
+           (namestring (merge-pathnames "debug.log"
+                                        (if network
+                                            (network-data-path dir network)
+                                            dir)))))
         (t nil)))
 
 (defun listen-port (network)
@@ -2645,8 +2661,12 @@ Returns the node instance."
   ;; disables it). Before this the node wrote no file at all without an
   ;; explicit -logfile, which is also what Core's functional framework reads
   ;; for EVERY node it starts, and what an operator looks for first.
-  (let ((path (%resolve-log-file log-file data-directory)))
-    (when path (start-file-logging path)))
+  (let ((path (%resolve-log-file log-file data-directory network)))
+    (when path
+      ;; The network directory may not exist yet — the block store creates it
+      ;; later — and the first log line is emitted before that.
+      (ensure-directories-exist path)
+      (start-file-logging path)))
 
   ;; Operator hooks (Core -blocknotify / -shutdownnotify). Set before anything
   ;; can fire them.
@@ -5540,10 +5560,43 @@ bare IPv6 address (which contains colons) is treated as host-only."
              (values spec default-port)))))))
 
 (defun peer-connected-to-host-p (node host)
-  "T if a peer with address HOST is currently in the node's peer list."
+  "T if a peer at address HOST is currently in the node's peer list, ignoring
+ports (Core AlreadyConnectedToAddress, net.cpp:347-351).
+
+This is the guard for dials with NO destination string — the ones sourced from
+addrman — which is the only place Core applies it. A dial that names a
+destination uses PEER-CONNECTED-TO-ENDPOINT-P instead; see there for why the
+difference is not cosmetic."
   (bt:with-recursive-lock-held ((node-lock node))
     (and (find host (node-peers node)
                :key #'bitcoin-lisp.networking:peer-address :test #'string=)
+         t)))
+
+(defun peer-connected-to-endpoint-p (node host port)
+  "T if a peer at HOST:PORT is currently in the node's peer list (Core
+AlreadyConnectedToHost, net.cpp:335-339).
+
+The guard for every dial that names a destination: -addnode, `addnode onetry`,
+-connect, -seednode. Core compares the full destination against each peer's
+m_addr_name, and an INBOUND peer's name carries the ephemeral source port, so
+an inbound connection from a host never blocks an outbound dial to it. Ours has
+the same property for the same reason: an accepted connection records port 0
+while a dialed one records the port it dialed.
+
+Matching on HOST ALONE — which this used to do — is wrong wherever two peers
+can share an address, and on regtest EVERY node is 127.0.0.1. One connection to
+loopback then blocked every other, so a node could never hold more than one
+connection to the local machine: the second `connect_nodes` in any Core
+functional test found no new peer and timed out. Nothing looked wrong from
+inside the node, which had simply been asked to dial a host it was already
+talking to."
+  (bt:with-recursive-lock-held ((node-lock node))
+    (and (find-if (lambda (p)
+                    (let ((conn (bitcoin-lisp.networking::peer-connection p)))
+                      (and conn
+                           (string= host (bitcoin-lisp.networking::connection-host conn))
+                           (eql port (bitcoin-lisp.networking::connection-port conn)))))
+                  (node-peers node))
          t)))
 
 (defun establish-outbound-peer (node host port &key (conn-type :outbound-full-relay) manual)
@@ -5588,7 +5641,7 @@ never started) and never reaches the seed queue."
   (when (and (node-network-active node) (addrman-outgoing-enabled-p) *seed-nodes*)
     (dolist (spec *seed-nodes*)
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
-        (unless (peer-connected-to-host-p node host)
+        (unless (peer-connected-to-endpoint-p node host port)
           (log-info "Fetching addresses from -seednode ~A" spec)
           (establish-outbound-peer node host port :conn-type :addr-fetch))))))
 
@@ -5599,7 +5652,7 @@ runs). Distinct from connect-added-nodes only in which list it walks."
   (when (node-network-active node)
     (dolist (spec *connect-nodes*)
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
-        (unless (peer-connected-to-host-p node host)
+        (unless (peer-connected-to-endpoint-p node host port)
           (establish-outbound-peer node host port :manual t))))))
 
 (defun connect-added-nodes (node)
@@ -5612,7 +5665,7 @@ then keep every \"add\" peer connected. Honors network-active."
                       (setf (node-pending-onetry node) nil)))))
       (dolist (spec onetry)
         (multiple-value-bind (host port) (parse-node-endpoint node spec)
-          (unless (peer-connected-to-host-p node host)
+          (unless (peer-connected-to-endpoint-p node host port)
             (establish-outbound-peer node host port :manual t)))))
     ;; addconnection (regtest testing RPC): one dial per request, of the
     ;; connection TYPE the caller named — which is the whole point of the RPC,
@@ -5626,7 +5679,7 @@ then keep every \"add\" peer connected. Honors network-active."
     ;; Maintain persistent added-node connections.
     (dolist (spec (node-added-nodes node))
       (multiple-value-bind (host port) (parse-node-endpoint node spec)
-        (unless (peer-connected-to-host-p node host)
+        (unless (peer-connected-to-endpoint-p node host port)
           (establish-outbound-peer node host port :manual t))))))
 
 (defconstant +target-block-relay-peers+ 2

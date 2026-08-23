@@ -3599,7 +3599,28 @@ backstop against a candidate that reorgs away and reappears."
              ;; slowdown with height is testnet4's own busy zone around
              ;; 51,000-55,000 (the region scripts/profile-regions.sh already
              ;; singles out), not this cache.
-             (bitcoin-lisp:maybe-periodic-flush chain-state))
+             (bitcoin-lisp:maybe-periodic-flush chain-state)
+             ;; -stopatheight, for the same reason and at the same boundary.
+             ;; MAYBE-STOP-AT-HEIGHT is called from CONNECT-BLOCK's
+             ;; tip-EXTENSION arm only, so a chain activated through
+             ;; PERFORM-REORG — which is every block of an offline reindex,
+             ;; and every step of any long activation — sailed straight past
+             ;; the configured height. Measured on the reindex benchmark:
+             ;; -stopatheight=134000 ran on to 134,898, the header tip.
+             ;;
+             ;; Core checks here too: ActivateBestChain fires the blockTip
+             ;; notification after each ActivateBestChainStep
+             ;; (validation.cpp), and that notification is what
+             ;; kernel_notifications.cpp:61-66 turns into the shutdown
+             ;; request. Between steps, never inside the connect loop: the
+             ;; step has completed and is committed, and PERFORM-REORG's own
+             ;; interrupt check then unwinds the next one on a block boundary.
+             (let ((new-tip (bitcoin-lisp.storage:get-block-index-entry
+                             chain-state
+                             (bitcoin-lisp.storage:best-block-hash chain-state))))
+               (when new-tip
+                 (bitcoin-lisp:maybe-stop-at-height
+                  (bitcoin-lisp.storage:block-index-entry-height new-tip)))))
             (t
              ;; :interrupted means the node is stopping — not a refusal to
              ;; re-queue against.

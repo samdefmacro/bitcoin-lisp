@@ -837,7 +837,7 @@ fix: listbanned and getaddednodeinfo answered result:null."
   ;; JSON objects, not a vector of unencodable dotted pairs.
   (let ((node (make-test-node)))
     (setf (bitcoin-lisp::node-peers node)
-          (list (bitcoin-lisp::make-peer :address "1.2.3.4:48333" :user-agent "/t/")))
+          (list (bitcoin-lisp::make-peer :address "1.2.3.4:48333" :user-agent "/t/" :state :ready)))
     (bitcoin-lisp.rpc::rpc-addnode node (list "192.0.2.10:48333" "add"))
     (bitcoin-lisp.rpc::rpc-setban node (list "1.2.3.4" "add"))
     (let ((peers (%encode-rpc-result (bitcoin-lisp.rpc::rpc-getpeerinfo node nil)))
@@ -896,7 +896,7 @@ used to emit it verbatim, which yason cannot encode."
   (let* ((node (make-test-node))
          (vmsg (bitcoin-lisp.serialization::make-version-message
                 :version 70016 :start-height 42 :user-agent "/test/"))
-         (peer (bitcoin-lisp::make-peer :address "1.2.3.4:48333"
+         (peer (bitcoin-lisp::make-peer :address "1.2.3.4:48333" :state :ready
                                         :version vmsg
                                         :user-agent "/test/"
                                         :start-height 42)))
@@ -2016,6 +2016,243 @@ this a real oracle: the day Core adds an argument, this test notices."
                               (push row json))))))))))
     (values (nreverse json) (nreverse strings))))
 
+(test getpeerinfo-addr-carries-the-port
+  "Core's getpeerinfo `addr` is CNode::addr.ToStringAddrPort() — \"ip:port\"
+(rpc/net.cpp:130). Ours reported the host alone.
+
+The port is not decoration. Core's framework pairs the two ends of a
+connection by comparing one node's `addrbind` against the other's `addr`
+(rpc_net.py:116-117), and a bare host can never equal an \"ip:port\"; and two
+peers behind one address are indistinguishable in the output without it, which
+on regtest is every peer."
+  (let ((peer (bitcoin-lisp.networking:make-peer :address "203.0.113.4" :state :ready)))
+    ;; No connection at all: the host alone is all there is, and that must not
+    ;; become \"host:0\" or an error.
+    (is (string= "203.0.113.4" (bitcoin-lisp.rpc::%peer-addr peer)))
+    (setf (bitcoin-lisp.networking::peer-connection peer)
+          (bitcoin-lisp.networking::make-connection
+           :host "203.0.113.4" :port 8333 :connected t))
+    (is (string= "203.0.113.4:8333" (bitcoin-lisp.rpc::%peer-addr peer)))
+    ;; A v6 literal is bracketed before the port, as CService::ToStringAddrPort
+    ;; does — an unbracketed \"::1:8333\" is a different, valid v6 address.
+    (let ((v6 (bitcoin-lisp.networking:make-peer :address "::1" :state :ready)))
+      (setf (bitcoin-lisp.networking::peer-connection v6)
+            (bitcoin-lisp.networking::make-connection :host "::1" :port 8333 :connected t))
+      (is (string= "[::1]:8333" (bitcoin-lisp.rpc::%peer-addr v6))))))
+
+(test dial-dedup-compares-the-endpoint-not-just-the-host
+  "Core has two dedup guards and applies them to different dials
+(net.cpp:3020-3026). A dial with NO destination string — addrman's — is
+deduped by ADDRESS (AlreadyConnectedToAddress, :347). A dial that NAMES a
+destination — -addnode, `addnode onetry`, -connect, -seednode — is deduped by
+the full destination against each peer's m_addr_name
+(AlreadyConnectedToHost, :335).
+
+Ours used the address-only guard for both. Wherever two peers can share an
+address that is wrong, and on regtest every node is 127.0.0.1: one connection
+to loopback blocked every later dial there, so a node could never hold more
+than one connection to the local machine. Core's functional tests build every
+topology out of exactly such dials, and the second connect_nodes in a test
+simply found no new peer and timed out — with nothing wrong visible from inside
+the node, which had been asked to dial a host it was already talking to.
+
+An inbound peer must not block an outbound dial either. Core gets that from
+m_addr_name carrying the ephemeral SOURCE port; ours from an accepted
+connection recording port 0 while a dialed one records the port it dialed."
+  (let ((node (make-test-node)))
+    (flet ((peer-at (host port &key inbound)
+             (let ((p (bitcoin-lisp.networking:make-peer :address host :state :ready
+                                                         :inbound inbound)))
+               (setf (bitcoin-lisp.networking::peer-connection p)
+                     (bitcoin-lisp.networking::make-connection
+                      :host host :port port :connected t))
+               p)))
+      ;; An INBOUND peer from 127.0.0.1 (source port recorded as 0).
+      (setf (bitcoin-lisp::node-peers node) (list (peer-at "127.0.0.1" 0 :inbound t)))
+      (is-true (bitcoin-lisp::peer-connected-to-host-p node "127.0.0.1")
+               "the address-only guard should still see it")
+      (is-false (bitcoin-lisp::peer-connected-to-endpoint-p node "127.0.0.1" 11133)
+                "an inbound peer blocked an outbound dial to the same host")
+      ;; An OUTBOUND peer to a DIFFERENT port on the same host.
+      (setf (bitcoin-lisp::node-peers node) (list (peer-at "127.0.0.1" 11132)))
+      (is-false (bitcoin-lisp::peer-connected-to-endpoint-p node "127.0.0.1" 11133)
+                "a peer on another port of the same host blocked the dial")
+      ;; The same endpoint IS deduped — the guard still does its job.
+      (is-true (bitcoin-lisp::peer-connected-to-endpoint-p node "127.0.0.1" 11132))
+      ;; And the addrman guard keeps Core's address-only semantics, which is
+      ;; what makes the two functions worth having separately.
+      (is-true (bitcoin-lisp::peer-connected-to-host-p node "127.0.0.1")))))
+
+(test disconnectnode-selects-by-address-or-id-as-core-does
+  "Core's disconnectnode takes EITHER address OR nodeid, and the by-id form is
+the one its functional framework uses — disconnect_nodes calls
+`disconnectnode(nodeid=peer_id)` for every peer it wants gone
+(test_framework.py:616). Ours had only the address form, so that arrived as a
+NIL address and answered \"address must be a string\": an error about a
+parameter the caller never sent.
+
+The combination rule is Core's (rpc/net.cpp:471-479), empty string included —
+`disconnectnode \"\" 1` is how Core's own help says to disconnect by id
+positionally."
+  (let* ((node (make-test-node))
+         (peer (bitcoin-lisp.networking:make-peer :address "203.0.113.9" :state :ready)))
+    (setf (bitcoin-lisp.networking::peer-id peer) 4242)
+    (setf (bitcoin-lisp::node-peers node) (list peer))
+    ;; Both given: Core's exact refusal.
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-disconnectnode node '("203.0.113.9" 4242))
+               (is-true nil "address+nodeid was accepted"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (string= "Only one of address and nodeid should be provided."
+                     (bitcoin-lisp.rpc::rpc-error-message e)))
+        (is (= bitcoin-lisp.rpc::+rpc-invalid-params+
+               (bitcoin-lisp.rpc::rpc-error-code e)))))
+    ;; Unknown id: Core's not-connected code, not a type error.
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-disconnectnode node '(nil 999))
+               (is-true nil "an unknown nodeid was accepted"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (= bitcoin-lisp.rpc::+rpc-client-node-not-connected+
+               (bitcoin-lisp.rpc::rpc-error-code e)))))
+    ;; By id, the framework's spelling: named nodeid only.
+    (is (null (bitcoin-lisp.rpc::rpc-disconnectnode node '(nil 4242))))
+    ;; And Core's positional spelling for the same thing.
+    (setf (bitcoin-lisp::node-peers node) (list peer))
+    (is (null (bitcoin-lisp.rpc::rpc-disconnectnode node '("" 4242))))
+    ;; By address still works.
+    (setf (bitcoin-lisp::node-peers node) (list peer))
+    (is (null (bitcoin-lisp.rpc::rpc-disconnectnode node '("203.0.113.9"))))))
+
+(test rpcservertimeout-reaches-the-acceptor
+  "-rpcservertimeout is only worth having if it changes the socket. It used to
+SETF hunchentoot:*default-connection-timeout* AFTER the acceptor was made, and
+that special is read only as the read-timeout/write-timeout slot INITFORM — so
+the option reached nothing and every RPC connection kept hunchentoot's
+20-second idle timeout.
+
+Nothing complains when this is wrong: a client that reconnects never notices,
+and one that does not gets a broken pipe on a connection it thought was open.
+Core's functional framework writes rpcservertimeout=99000 into every node's
+config for exactly this reason, and with the option inert connect_nodes died on
+a broken pipe polling the second node ~50s after its previous call.
+
+Assert against the acceptor's own slot — the thing the socket actually uses —
+not against the special."
+  (bitcoin-lisp.rpc:stop-rpc-server)
+  (with-rpc-test-datadir (dir)
+    (let ((node (make-test-node)))
+      (setf (bitcoin-lisp::node-data-directory node) dir)
+      ;; Core's default, not hunchentoot's.
+      (is (= 30 bitcoin-lisp.rpc:*rpc-server-timeout*))
+      (let ((bitcoin-lisp.rpc:*rpc-server-timeout* 99000))
+        (unwind-protect
+             (progn
+               (bitcoin-lisp.rpc:start-rpc-server node :port 19998)
+               (is (= 99000 (hunchentoot:acceptor-read-timeout
+                             bitcoin-lisp.rpc:*rpc-server*)))
+               (is (= 99000 (hunchentoot:acceptor-write-timeout
+                             bitcoin-lisp.rpc:*rpc-server*))))
+          (bitcoin-lisp.rpc:stop-rpc-server)))
+      ;; The positive control: without the initargs the acceptor would carry
+      ;; hunchentoot's own default, so a test that only checked "not nil"
+      ;; would have passed against the bug.
+      (is (= 20 hunchentoot:*default-connection-timeout*)
+          "hunchentoot's default moved; the control this test relies on is gone"))))
+
+(test named-arg-names-agree-with-cores-positions
+  "The named-parameter table decides where a named argument lands in the
+positional list, so a wrong POSITION is worse than a missing name: the call
+succeeds and means something else.
+
+Cross-check it against a second, independent extract of the same facts from
+Core — client.cpp's vRPCConvertParams, which carries (method, position, name).
+
+Two checks, and the shape of each is forced by what client.cpp actually is.
+It is not \"the argument at position N is called X\": for an options-object
+argument Core lists the object AND each of its FIELDS at the same position, so
+`gethdkeys` position 0 carries both \"options\" and \"private\". Comparing
+name-for-name against that reports 76 disagreements, every one of them an
+options field, and none of them a defect. Getting that wrong once is why the
+distinction is written down here.
+
+  1. ARITY. Every position client.cpp names must exist in our table for that
+     method. This is the check that catches the failure that produced this
+     table: drop a string argument and every argument after it shifts down,
+     and the tail is exactly what client.cpp lists.
+
+  2. POSITION, for our names only. If one of OUR argument names appears in
+     client.cpp for the same method, our index must be among the positions
+     Core lists it at. Options FIELDS never appear in our table, so they are
+     never checked; a top-level argument that moved is caught. `send` carries
+     `conf_target` both as a top-level argument and as an options field, which
+     is why this is \"among\" rather than \"equals\"."
+  (multiple-value-bind (core-json core-strings) (%parse-core-client-cpp)
+    (let ((rows (append core-json core-strings)))
+      (if (null rows)
+          (skip "refs/bitcoin not present")
+          (let ((short '()) (moved '()) (checked 0))
+            ;; 1. arity
+            (dolist (row rows)
+              (destructuring-bind (method position name) row
+                (let ((entry (assoc method bitcoin-lisp.rpc::*rpc-named-arg-names*
+                                    :test #'string=)))
+                  (when entry
+                    (incf checked)
+                    (when (<= (length (rest entry)) position)
+                      (push (list method position name
+                                  (length (rest entry)))
+                            short))))))
+            ;; 2. position of our own names
+            (dolist (entry bitcoin-lisp.rpc::*rpc-named-arg-names*)
+              (let ((method (first entry)))
+                (loop for name-spec in (rest entry)
+                      for index from 0
+                      do (let ((core-positions
+                                 (loop for row in rows
+                                       when (and (string= method (first row))
+                                                 (bitcoin-lisp.rpc::%named-arg-slot
+                                                  name-spec (third row)))
+                                         collect (second row))))
+                           (when (and core-positions
+                                      (not (member index core-positions)))
+                             (push (list method name-spec index core-positions)
+                                   moved))))))
+            (is (> checked 250)
+                "only ~D rows cross-checked; the table or the parser is not being exercised"
+                checked)
+            (is (null short)
+                "~D of Core's argument positions are past the end of our table: ~S"
+                (length short) (subseq short 0 (min 8 (length short))))
+            (is (null moved)
+                "~D of our arguments sit at a position Core does not list: ~S"
+                (length moved) (subseq moved 0 (min 8 (length moved)))))))))
+
+(test named-arg-table-covers-what-the-framework-calls
+  "Every method this node registers should accept named parameters, because
+Core accepts them for every method and its test framework uses them freely —
+`stop(wait=...)` on every shutdown, `scantxoutset(action=...)` in MiniWallet's
+constructor. A registered method missing from the table answers \"Unknown
+named parameter\" and fails the caller.
+
+Methods in the table that we do not implement are fine and expected; the table
+is Core's full set."
+  (let ((missing '()))
+    (maphash (lambda (method fn)
+               (declare (ignore fn))
+               (unless (assoc method bitcoin-lisp.rpc::*rpc-named-arg-names*
+                              :test #'string=)
+                 (push method missing)))
+             bitcoin-lisp.rpc::*rpc-methods*)
+    ;; Ours-only methods (the web UI helpers and such) have no Core declaration
+    ;; to take names from; they are named here so the exemption is a list
+    ;; someone can read rather than a silent pass.
+    (let ((ours-only '("migrateblocks")))
+      (setf missing (remove-if (lambda (m) (member m ours-only :test #'string=))
+                               missing)))
+    (is (null missing)
+        "~D registered methods accept no named parameters: ~S"
+        (length missing) (sort missing #'string<))))
+
 (test rpc-arg-conversions-match-core
   "Core's rpc_help.py asserts that a node's dump_all_command_conversions table
 equals src/rpc/client.cpp's vRPCConvertParams. This runs the SAME comparison
@@ -2436,18 +2673,26 @@ so the gap is visible."
              (%named-params "getblockhash" "nope" 1)))
   (is (equal '(:error "Unknown named parameter height")
              (%named-params "getblockcount" "height" 1)))
-  ;; A method we have not tabulated: honest refusal, not a wrong call.
-  (is (eq :error (first (%named-params "getbalance" "dummy" 1)))))
+  ;; A method with no Core declaration to take names from — ours alone — still
+  ;; refuses honestly rather than calling with a default the caller did not ask
+  ;; for. (getbalance used to stand here; it is in the generated table now, so
+  ;; using it would have quietly stopped testing anything.)
+  (is (eq :error (first (%named-params "migrateblocks" "dummy" 1)))))
 
 (test named-arg-table-covers-what-it-claims
-  "Every method in the table must actually be registered — an entry for a
-method we do not serve is dead, and a typo'd name would silently disable named
-parameters for the method it was meant to cover."
+  "The table is Core's FULL set now, generated from RPCHelpMan, so it
+deliberately names methods this node does not serve — the old invariant here
+(every entry must be registered) was a property of the hand-curated
+43-method predecessor and inverted when the table became Core's.
+
+The direction that still matters is the other one, and it lives in
+NAMED-ARG-TABLE-COVERS-WHAT-THE-FRAMEWORK-CALLS: every method we DO register
+must be in the table, or it accepts no named parameters.
+
+What is left here is the spot-check: the arguments Core's framework leans on
+hardest, spelled out, so a regeneration that silently dropped or reordered them
+is caught by name rather than by count."
   (bitcoin-lisp.rpc::register-all-methods)
-  (dolist (row bitcoin-lisp.rpc::*rpc-named-arg-names*)
-    (is-true (nth-value 1 (gethash (first row) bitcoin-lisp.rpc::*rpc-methods*))
-             "~A is in the named-arg table but not registered" (first row)))
-  ;; And the arguments Core's framework leans on hardest are present.
   (dolist (expected '(("getblockhash" "height")
                       ("getblock" "blockhash" "verbosity|verbose")
                       ("generatetoaddress" "nblocks" "address" "maxtries")
@@ -4353,9 +4598,9 @@ to \"block-relay-only\" with relaytxes false. synced_headers/synced_blocks are
 -1 while unknown (Core), and pingtime is absent until a pong arrived (Core
 emits it conditionally)."
   (let* ((node (make-test-node))
-         (peer (bitcoin-lisp::make-peer :address "1.2.3.4:8333"
+         (peer (bitcoin-lisp::make-peer :address "1.2.3.4:8333" :state :ready
                                         :inbound t :start-height 99 :services #x409))
-         (br (bitcoin-lisp::make-peer :address "5.6.7.8:8333"
+         (br (bitcoin-lisp::make-peer :address "5.6.7.8:8333" :state :ready
                                       :conn-type :block-relay))
          (ct (lambda (r) (cdr (assoc "connection_type" r :test #'string=)))))
     (setf (bitcoin-lisp::node-peers node) (list peer br))
@@ -4400,7 +4645,7 @@ through yason."
                 :version 70016 :start-height 42 :user-agent "/parity/"))
          (conn (bitcoin-lisp.networking::make-connection
                 :host "203.0.113.5" :port 8333 :connected t))
-         (peer (bitcoin-lisp::make-peer :address "203.0.113.5"
+         (peer (bitcoin-lisp::make-peer :address "203.0.113.5" :state :ready
                                         :version vmsg
                                         :services #x409
                                         :connection conn)))
@@ -4477,7 +4722,7 @@ pindexBestKnownBlock -> nSyncHeight) once an announcement recorded one."
          (chain-state (bitcoin-lisp.rpc::rpc-get-chain-state node))
          (bhash (make-array 32 :element-type '(unsigned-byte 8)
                                :initial-element 33))
-         (peer (bitcoin-lisp::make-peer :address "198.51.100.9")))
+         (peer (bitcoin-lisp::make-peer :address "198.51.100.9" :state :ready)))
     (bitcoin-lisp.storage:add-block-index-entry
      chain-state (bitcoin-lisp.storage:make-block-index-entry
                   :hash bhash :height 7 :status :valid))
@@ -5874,11 +6119,25 @@ content-type guard in that chain; see the last case."
                                 "Origin does not match Host")
      :auth nil
      :headers (list (cons :origin "http://evil.example")))
-    ;; Rate limited -> 429 (an exhausted bucket: rate 0, burst 0), reached with
-    ;; a valid credential: the limiter sits behind auth.
+    ;; Rate limiting applies to the UNAUTHENTICATED side only, which is where
+    ;; the protection is actually needed and where Core is not being diverged
+    ;; from — Core has no RPC rate limit at all, because the port is
+    ;; authenticated and loopback-only.
+    ;;
+    ;; An exhausted bucket (rate 0, burst 0) with a BAD credential -> 429.
     (jsonrpc-handler-check
      (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 429
      (jsonrpc-legacy-error-json bitcoin-lisp.rpc::+rpc-misc-error+ "Rate limit exceeded")
+     :auth (concatenate 'string *jsonrpc-handler-rpc-user* ":wrong")
+     :rate-limiter (bitcoin-lisp:make-rate-limiter 0 0))
+    ;; The same exhausted bucket with a VALID credential is served. This is the
+    ;; check that would have caught the original placement: an authenticated
+    ;; admin client was throttled at 100 requests/second, which is fewer than
+    ;; one of Core's `wait_until` poll loops, so the framework answered its own
+    ;; polls with 429 and failed tests unrelated to rates.
+    (jsonrpc-handler-check
+     (format nil "{\"method\":\"~A\",\"id\":1}" *jsonrpc-shape-method*) 200
+     "{\"result\":42,\"error\":null,\"id\":1}"
      :rate-limiter (bitcoin-lisp:make-rate-limiter 0 0))
     ;; An unusual Content-Type is NOT a refusal. This used to assert 415 with a
     ;; comment claiming "Core answers 415 too" — Core's HTTPReq_JSONRPC
