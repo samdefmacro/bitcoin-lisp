@@ -2968,7 +2968,7 @@ would otherwise buy an index-wide locator walk and a ~1 KB request from us.")
 (defun %maybe-send-getheaders (peer locator)
   "Send a getheaders built from LOCATOR unless one went to PEER recently (Core
 MaybeSendGetHeaders, net_processing.cpp:2825-2837). Returns T if sent."
-  (let ((now (get-universal-time)))
+  (let ((now (bitcoin-lisp.serialization:get-node-time)))
     (when (> (- now (peer-last-getheaders-time peer))
              +headers-response-time-seconds+)
       (setf (peer-last-getheaders-time peer) now)

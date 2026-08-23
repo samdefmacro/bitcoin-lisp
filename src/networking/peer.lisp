@@ -37,8 +37,8 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (version nil)  ; Received version message
   ;; Chain-sync timeout state (Core CNodeState::ChainSyncTimeoutState,
   ;; net_processing.cpp:490-501). All times are UNIX SECONDS — the codebase
-  ;; also carries get-universal-time and internal-real-time clocks, and mixing
-  ;; them here would be a ~2.2e9-second error.
+  ;; also carries get-node-time (universal) and internal-real-time clocks, and
+  ;; mixing them here would be a ~2.2e9-second error.
   (chain-sync-timeout 0 :type integer)        ; 0 = unarmed
   (chain-sync-work-header nil)                ; tip hash we benchmarked against
   (chain-sync-sent-getheaders nil)
@@ -1700,7 +1700,7 @@ therefore left alone."
     (when (and address (plusp (length address)))
       (bt:with-lock-held (*ban-lock*)
         (setf (gethash address *banned-peers*)
-              (+ (get-universal-time) *default-ban-time-seconds*)))
+              (+ (bitcoin-lisp.serialization:get-node-time) *default-ban-time-seconds*)))
       (save-banlist)))
   (when (peer-connection peer)
     (close-connection (peer-connection peer))
@@ -1713,7 +1713,7 @@ Returns T if banned, NIL otherwise. Expired bans are cleaned up."
     (let ((expiry (gethash address *banned-peers*)))
       (cond
         ((null expiry) nil)
-        ((> (get-universal-time) expiry)
+        ((> (bitcoin-lisp.serialization:get-node-time) expiry)
          ;; Ban expired, remove it
          (remhash address *banned-peers*)
          nil)
@@ -1731,7 +1731,7 @@ SECONDS defaults to -bantime). Returns T, NIL for an empty address."
   (when (and (stringp address) (plusp (length address)))
     (bt:with-lock-held (*ban-lock*)
       (setf (gethash address *banned-peers*)
-            (+ (get-universal-time) seconds)))
+            (+ (bitcoin-lisp.serialization:get-node-time) seconds)))
     (save-banlist)
     t))
 
@@ -1746,7 +1746,7 @@ was banned, NIL otherwise."
 (defun list-bans ()
   "Return a list of (address . banned-until-universal-time) for active bans,
 pruning any that have expired (Bitcoin Core listbanned)."
-  (let ((now (get-universal-time))
+  (let ((now (bitcoin-lisp.serialization:get-node-time))
         (result '())
         (expired '()))
     (bt:with-lock-held (*ban-lock*)
@@ -1806,7 +1806,7 @@ active bans loaded; NIL when the file is absent/unreadable."
     (handler-case
         (let* ((json (with-open-file (in path) (yason:parse in)))
                (nets (and (hash-table-p json) (gethash "banned_nets" json)))
-               (now (get-universal-time))
+               (now (bitcoin-lisp.serialization:get-node-time))
                (count 0))
           (bt:with-lock-held (*ban-lock*)
             (dolist (entry nets)
