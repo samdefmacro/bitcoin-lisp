@@ -224,3 +224,123 @@ drift cannot turn this control into a false alarm."
       (is-true (gethash "tx-request-disconnected-peer" refs))
       (is-false (gethash "tx-request-disconnected" refs)
                 "a prefix of a referenced name must not count as referenced"))))
+
+
+;;;; ====================================================================
+;;;; Global hash tables and thread safety
+;;;;
+;;;; A plain SBCL hash table taking concurrent read-through inserts corrupts
+;;;; silently. #462 fixed one instance (the coins view's CVC-ENTRIES, written
+;;;; by parallel script-check workers through COLLECT-SPENT-UTXOS) by resolving
+;;;; the coins on the validation thread first. Two more survived that audit
+;;;; because they live a layer down, inside the interpreter and the crypto
+;;;; helpers rather than in the validation code that was being read.
+
+(defparameter +parallel-path-caches+
+  '(("bitcoin-lisp.coalton.interop" . "*signature-cache*")
+    ("bitcoin-lisp.coalton.interop" . "*signature-cache-prev*")
+    ("bitcoin-lisp.coalton.interop" . "*script-execution-cache*")
+    ("bitcoin-lisp.coalton.interop" . "*script-execution-cache-prev*")
+    ("bitcoin-lisp.coalton.interop" . "*flag-set-cache*")
+    ("bitcoin-lisp.crypto" . "*tagged-hash-cache*"))
+  "Global caches a parallel script-check worker reads or writes.
+
+Every one of these is reached from inside a check thunk, so with -par above 1
+they take concurrent traffic from every worker at once:
+
+  *flag-set-cache*        FLAG-ENABLED-P, from the P2SH/WITNESS/SIGPUSHONLY
+                          gates -- i.e. every script, the hottest path there is
+  *tagged-hash-cache*     GET-TAG-HASH, from TapSighash and the
+                          TapLeaf/TapBranch/TapTweak hashes -- every taproot input
+  the sig/script caches   the verification short-circuits themselves
+
+They must be :SYNCHRONIZED. Racing the VALUE is harmless in all six -- each is
+a deterministic function of its key, so a lost store costs a recompute -- but
+the table's own structure is not.")
+
+(test parallel-path-caches-are-synchronized
+  "The caches a script-check worker touches must survive concurrent inserts.
+
+Asserted on the live tables rather than by grepping for :synchronized, because
+what matters is the object the workers actually share."
+  #+sbcl
+  (dolist (entry +parallel-path-caches+)
+    (let* ((sym (find-symbol (string-upcase (cdr entry))
+                             (find-package (string-upcase (car entry)))))
+           (table (and sym (boundp sym) (symbol-value sym))))
+      (is-true (and table (hash-table-p table))
+               "~A::~A is not a bound hash table" (car entry) (cdr entry))
+      (when (and table (hash-table-p table))
+        (is-true (sb-ext:hash-table-synchronized-p table)
+                 "~A::~A is not :synchronized, and parallel workers insert into it"
+                 (car entry) (cdr entry)))))
+  #-sbcl (skip "SBCL-specific"))
+
+(defparameter +known-unsynchronized-globals+
+  '("BITCOIN-LISP.NETWORKING::*ADDR-RESPONSE-CACHES*"
+    "BITCOIN-LISP.NETWORKING::*BANNED-PEERS*"
+    "BITCOIN-LISP.NETWORKING::*BLOCK-FAILURE-COUNTS*"
+    "BITCOIN-LISP.NETWORKING::*OUTBOUND-NONCES*"
+    "BITCOIN-LISP.NETWORKING::*TX-ANNOUNCERS*"
+    "BITCOIN-LISP.NETWORKING::*TX-IN-FLIGHT*"
+    "BITCOIN-LISP.NETWORKING::*TX-PEER-ANNOUNCEMENTS*"
+    "BITCOIN-LISP.NETWORKING::*TX-PEER-IN-FLIGHT*"
+    "BITCOIN-LISP.NETWORKING::*TX-REQUEST-WTXID-P*"
+    "BITCOIN-LISP.SERIALIZATION::*ADDRV2-ADDR-SIZES*"
+    "BITCOIN-LISP.STORAGE::*LEVELDB-OWNED-RESOURCES*"
+    "BITCOIN-LISP.VALIDATION::*BLOCK-UNDO-DATA*"
+    "BITCOIN-LISP.VALIDATION::*OPCODE-NAMES*"
+    "BITCOIN-LISP.VALIDATION::*TEST-ACTIVATION-HEIGHTS*"
+    "BITCOIN-LISP.VALIDATION::*UNDO-CACHE-HEIGHTS*"
+    "BITCOIN-LISP::*DEBUG-CATEGORIES*"
+    "BITCOIN-LISP::*LOG-RATE-LOCATIONS*")
+  "Global hash tables that are NOT :synchronized, and are fine as they are.
+
+Each is either populated once at load or start-up and read-only afterwards
+(*OPCODE-NAMES*, *ADDRV2-ADDR-SIZES*, *DEBUG-CATEGORIES*,
+*TEST-ACTIVATION-HEIGHTS*), or written under an explicit lock
+(*BANNED-PEERS* under *BAN-LOCK*, *LOG-RATE-LOCATIONS* under *LOG-LOCK*), or
+touched only by the single sync/validation thread.
+
+The list is the audit. It exists so that ADDING an unsynchronized global is a
+decision someone makes on purpose rather than a default nobody looked at --
+which is exactly how the two caches above came to be raced.")
+
+(test no-new-unsynchronized-globals
+  "Pin the set of unsynchronized global hash tables.
+
+Not a rule that they must all be synchronized -- most of these are correct as
+they are, for reasons recorded next to the baseline. The point is that a NEW
+one shows up here and has to be classified, instead of quietly joining the
+worker path the way *FLAG-SET-CACHE* did."
+  #+sbcl
+  (let ((found '()))
+    (dolist (pkg '("BITCOIN-LISP.COALTON.INTEROP" "BITCOIN-LISP.CRYPTO"
+                   "BITCOIN-LISP.VALIDATION" "BITCOIN-LISP.SERIALIZATION"
+                   "BITCOIN-LISP" "BITCOIN-LISP.STORAGE" "BITCOIN-LISP.MEMPOOL"
+                   "BITCOIN-LISP.NETWORKING"))
+      (let ((package (find-package pkg)))
+        (when package
+          (do-symbols (sym package)
+            (when (and (eq (symbol-package sym) package)
+                       (boundp sym)
+                       (hash-table-p (symbol-value sym))
+                       (not (sb-ext:hash-table-synchronized-p (symbol-value sym))))
+              (pushnew (format nil "~A::~A" pkg (symbol-name sym))
+                       found :test #'equal))))))
+    (let ((new (sort (set-difference found +known-unsynchronized-globals+
+                                     :test #'equal)
+                     #'string<))
+          (gone (sort (set-difference +known-unsynchronized-globals+ found
+                                      :test #'equal)
+                      #'string<)))
+      (is (null new)
+          "~D new unsynchronized global hash table~:P — classify each, and if a ~
+parallel script-check worker can reach it, synchronize it: ~S"
+          (length new) new)
+      ;; Shrinking is good, but the baseline has to be trimmed with it or it
+      ;; stops meaning anything.
+      (is (null gone)
+          "~D baseline entr~:@P no longer unsynchronized; trim the list: ~S"
+          (length gone) gone)))
+  #-sbcl (skip "SBCL-specific"))

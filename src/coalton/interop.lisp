@@ -931,8 +931,24 @@ Returns (values success error-keyword)."
 ;;; table once.
 
 (defvar *flag-set-cache*
-  (make-hash-table :test 'equal :size 16)
-  "Hash from *script-flags* string -> hash-set of enabled flag names.")
+  (make-hash-table :test 'equal :size 16
+                   #+sbcl :synchronized #+sbcl t)
+  "Hash from *script-flags* string -> hash-set of enabled flag names.
+
+SYNCHRONIZED, because FLAG-ENABLED-P inserts on a miss and every parallel
+script-check worker calls it — the P2SH/WITNESS/SIGPUSHONLY gates run on every
+script, so this table is on the hottest path a worker has. Concurrent
+read-through inserts into a plain SBCL hash table corrupt it silently.
+
+This is the same defect #462 fixed for the coins view (COLLECT-SPENT-UTXOS
+inserting into a non-synchronized CVC-ENTRIES), missed because it lives a layer
+down in the interpreter rather than in the validation code that was audited.
+The signature and script-execution caches were already synchronized
+(%MAKE-SIG-CACHE-TABLE); these two were not.
+
+Harmless to race on the VALUE — the set computed for a given flags string is
+deterministic, so a lost store only costs a re-parse. What is not harmless is
+the table's own structure.")
 
 (defun parse-flags-to-set (flags-string)
   (let ((set (make-hash-table :test 'equal)))
