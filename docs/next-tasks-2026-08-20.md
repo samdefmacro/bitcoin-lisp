@@ -156,6 +156,19 @@ is the single most reliable error-catcher this project has.
 
 ## 3. Carried-over backlog
 
+> **SUPERSEDED 2026-08-23 — do not work from this list without checking first.**
+> A verification pass against the tree found most of it already fixed by the
+> waves that followed. The whole "Config & lifecycle" cluster below, called out
+> here as the largest and most operator-facing one, is **done**: `[network]`
+> precedence, inline `#` comments, `conf-parse-bool`, `-includeconf`,
+> conflicting chain selectors, a non-existent `-datadir`, and the datadir
+> layout. So are signal safety and logging, four of the six Peers items, and
+> all four GA8 Wave 8 S2s.
+>
+> The verified table — what is fixed, what is still open, and what a grep could
+> not settle — is in `docs/next-wave-2026-08-22.md`, section
+> "Verifying the carried-over backlog". Read that instead.
+
 ### 3a. Deferred from the GA9 S2 wave (documented at the deferral sites in code)
 
 - maintain `m_best_header` incrementally — unlocks S2-3's three omitted Core
