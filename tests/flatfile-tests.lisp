@@ -25,6 +25,37 @@
 
 ;;; --- Obfuscation ------------------------------------------------------------
 
+(test obfuscate-rejects-a-range-outside-the-vector
+  "OBFUSCATE! runs its inner loop at SAFETY 0 because it is 8% of an offline
+reindex. The range is therefore bounds-checked ONCE at entry: without that a
+caller passing a bad START/END would write past the end of the vector instead
+of getting an error, which is the only thing SAFETY 0 would have cost."
+  (let ((data (make-array 16 :element-type '(unsigned-byte 8) :initial-element 1))
+        (key (make-array 8 :element-type '(unsigned-byte 8)
+                           :initial-contents '(1 2 3 4 5 6 7 8)))
+        (inactive (make-array 8 :element-type '(unsigned-byte 8)
+                                :initial-element 0)))
+    (signals error (bitcoin-lisp.storage:obfuscate! data key :start 0 :end 17))
+    (signals error (bitcoin-lisp.storage:obfuscate! data key :start 9 :end 4))
+    (signals error (bitcoin-lisp.storage:obfuscate! data key :start -1 :end 4))
+    ;; A short key is refused rather than read past its end. It must be
+    ;; NON-ZERO: an all-zero key is inactive and short-circuits before any
+    ;; check, which is the documented no-op contract and is why the first
+    ;; version of this assertion did not fire.
+    (signals error (bitcoin-lisp.storage:obfuscate!
+                    data (make-array 4 :element-type '(unsigned-byte 8)
+                                       :initial-element 9)))
+    ;; An INACTIVE (all-zero) key is a no-op and must not signal even for a
+    ;; range that would be invalid — it never touches the vector at all.
+    (is (eq data (bitcoin-lisp.storage:obfuscate! data inactive :start 0 :end 17)))
+    ;; And the ordinary path still round-trips, at every key alignment.
+    (dotimes (offset 8)
+      (let ((copy (copy-seq data)))
+        (bitcoin-lisp.storage:obfuscate! copy key :key-offset offset)
+        (is (not (equalp copy data)) "offset ~D did not change the data" offset)
+        (bitcoin-lisp.storage:obfuscate! copy key :key-offset offset)
+        (is (equalp copy data) "offset ~D did not round-trip" offset)))))
+
 (test obfuscation-is-keyed-on-the-file-offset-mod-eight
   "plain[i] = disk[i] XOR key[(file_offset + i) mod 8]. Core reaches this
 through a table of eight pre-rotated keys and a word-at-a-time XOR; the
