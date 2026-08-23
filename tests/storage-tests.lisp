@@ -54,6 +54,26 @@ genesis."
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore)))))
 
+(test datadir-resolvers-have-callers
+  "Every resolver in storage/datadir.lisp must be REACHED by the node, not
+merely defined. #461 shipped DATADIR-UNDO-PATH with no caller — the undo site
+still hardcoded \"undo/\" — so the resolver was dead code and the option it
+implements did nothing. That was found by starting a real node and reading its
+log, not by any unit test, which is why this one exists."
+  (dolist (fn '(bitcoin-lisp.storage:datadir-undo-path
+                bitcoin-lisp.storage:datadir-header-index-file
+                bitcoin-lisp.storage:datadir-index-path
+                bitcoin-lisp.storage:datadir-layout-report))
+    (let ((callers (remove-if (lambda (c)
+                                ;; Its own file and the test package do not
+                                ;; count as production callers.
+                                (let ((name (if (consp c) (second c) c)))
+                                  (and (symbolp name)
+                                       (member (symbol-package name)
+                                               (list (find-package :bitcoin-lisp.tests))))))
+                              (mapcar #'car (sb-introspect:who-calls fn)))))
+      (is-true callers "~A has no caller outside its own file" fn))))
+
 (test migrate-datadir-layout-moves-and-is-idempotent
   "-migratedatadir moves a legacy datadir to Core's layout. Asserted through
 the FILES, and specifically that the data ARRIVES — a migration that reports
