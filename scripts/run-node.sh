@@ -30,6 +30,15 @@
 # Override any default via environment, e.g.:
 #   BL_DATA_ROOT=/srv/btc BL_SBCL=/opt/sbcl/bin/sbcl scripts/run-node.sh testnet4
 #   BL_MAX_FAST_FAILURES=5 BL_HEALTHY_RUN_SECONDS=300   # exit-1 backoff policy
+#   BL_PAR=4                                            # -par: script-check threads
+#
+# BL_PAR takes Core's -par semantics exactly (0 = one per core, NEGATIVE =
+# leave that many cores free, clamped to 15, 1 = no extra threads). It exists
+# so parallel script validation can be SOAKED on testnet4 before its default
+# changes: the flag is off by default because the production crash it was
+# turned off for was diagnosed as SBCL's alien-type cache, which the 2026-08-22
+# coins-prefetch and pool work does not address. Do not set it on mainnet until
+# testnet4 has run clean for a long stretch.
 #
 set -euo pipefail
 
@@ -122,6 +131,7 @@ while true; do
     --eval '(asdf:load-system :bitcoin-lisp)' \
     --eval "(bitcoin-lisp.serialization::stamp-build-git-rev \"$GITREV\")" \
     --eval "(setf bitcoin-lisp:*network* :$NETWORK)" \
+    ${BL_PAR:+--eval "(bitcoin-lisp::apply-config-globals (list (cons \"par\" \"$BL_PAR\")))"} \
     --eval "(bitcoin-lisp:start-node :data-directory \"$DATA_DIR\" :network :$NETWORK :rpc-port $RPC_PORT $START_OPTS :log-file \"$LOG\")" \
     --eval '(bitcoin-lisp:run-node-watchdog)'
   code=$?
