@@ -49,6 +49,59 @@
      :outputs (vector output)
      :lock-time 0)))
 
+(test activation-steps-are-bounded
+  "PERFORM-REORG's connect loop never flushes — a rollback rewinds IN MEMORY, so
+nothing lands until the whole call finishes. That makes an UNBOUNDED forward
+activation the pathological case: reindexing a real testnet4 datadir asked for
+134,922 blocks in one call and spent sixteen minutes at 97% CPU without writing
+a coin or completing a step.
+
+Core loops instead — each ActivateBestChainStep connects a bounded batch and
+returns so the caller can flush. This asserts the step selection: far targets
+are clipped to an ancestor, near ones are returned unchanged, and the clipped
+target is always ON the target's own chain so a step is real progress rather
+than a sideways move."
+  (let* ((cs (bitcoin-lisp.storage:make-chain-state))
+         (entries (make-array 3001))
+         (prev nil))
+    ;; A synthetic chain deep enough to exceed one step.
+    (dotimes (h 3001)
+      (let ((e (bitcoin-lisp.storage:make-block-index-entry
+                :hash (let ((v (make-array 32 :element-type '(unsigned-byte 8)
+                                              :initial-element 0)))
+                        (setf (aref v 0) (ldb (byte 8 0) h)
+                              (aref v 1) (ldb (byte 8 8) h))
+                        v)
+                :height h :chain-work h :status :valid :prev-entry prev)))
+        (setf (aref entries h) e prev e)
+        (bitcoin-lisp.storage:add-block-index-entry cs e)))
+    (let ((tip (aref entries 0))
+          (far (aref entries 3000)))
+      ;; Far target: clipped to exactly one step above the tip.
+      (let ((step (bitcoin-lisp.validation::%activation-step-target cs tip far)))
+        (is (= bitcoin-lisp.validation::+activation-step-blocks+
+               (bitcoin-lisp.storage:block-index-entry-height step))
+            "a far target was not clipped to one step")
+        ;; And it is genuinely an ancestor of the target, not some other entry
+        ;; at that height — a step onto a different branch would be a reorg
+        ;; away from where we are trying to go.
+        (let ((walk far))
+          (loop while (and walk (> (bitcoin-lisp.storage:block-index-entry-height walk)
+                                   (bitcoin-lisp.storage:block-index-entry-height step)))
+                do (setf walk (bitcoin-lisp.storage:block-index-entry-prev-entry walk)))
+          (is (eq walk step) "the step target is not on the target's chain")))
+      ;; Near target: returned unchanged, so a synced node pays nothing.
+      (let ((near (aref entries 10)))
+        (is (eq near (bitcoin-lisp.validation::%activation-step-target cs tip near))))
+      ;; Exactly one step away is still the identity, not an off-by-one clip.
+      (let ((exact (aref entries bitcoin-lisp.validation::+activation-step-blocks+)))
+        (is (eq exact (bitcoin-lisp.validation::%activation-step-target cs tip exact))))
+      ;; Stepping from a non-zero tip measures from THAT tip.
+      (let* ((mid (aref entries 500))
+             (step (bitcoin-lisp.validation::%activation-step-target cs mid far)))
+        (is (= (+ 500 bitcoin-lisp.validation::+activation-step-blocks+)
+               (bitcoin-lisp.storage:block-index-entry-height step)))))))
+
 (test sync-loop-activates-from-disk-with-no-peers
   "With no peers the sync loop used to log \"No peers available\" and do
 NOTHING else, so a node whose block index was complete but whose chainstate sat

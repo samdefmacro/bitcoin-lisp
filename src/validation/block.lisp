@@ -3498,6 +3498,40 @@ is zero probes."
              (bitcoin-lisp.storage::chain-state-block-index chain-state))
     best))
 
+(defconstant +activation-step-blocks+ 1000
+  "How many blocks one ACTIVATE-BEST-CHAIN step will connect at most.
+
+PERFORM-REORG's connect loop deliberately never flushes — a rollback here rewinds
+IN MEMORY, so a flush mid-connect could leave the coins DB naming a fork-side
+block we then reject (see the note in that loop). That reasoning is sound and
+stays; what it means is that ONE call must never be asked to connect an
+unbounded number of blocks, because nothing lands until it finishes.
+
+Reindexing a real testnet4 datadir asked for 134,922 blocks in a single call:
+97% CPU for sixteen minutes with no coin written and no step completed. Core
+does not do this either — ActivateBestChain LOOPS, and each
+ActivateBestChainStep connects a bounded batch and returns so the caller can
+flush.")
+
+(defun %activation-step-target (chain-state tip target)
+  "TARGET, or its ancestor at most +ACTIVATION-STEP-BLOCKS+ above TIP.
+
+Walking back from TARGET rather than forward from TIP because the index links
+child -> parent: an entry knows its prev, not its next. The result is always on
+TARGET's chain, so a step is a real move toward it and never sideways."
+  (let* ((tip-height (if tip (bitcoin-lisp.storage:block-index-entry-height tip) 0))
+         (target-height (bitcoin-lisp.storage:block-index-entry-height target))
+         (want (+ tip-height +activation-step-blocks+)))
+    (if (<= target-height want)
+        target
+        (let ((e target))
+          (loop while (and e (> (bitcoin-lisp.storage:block-index-entry-height e) want))
+                do (setf e (bitcoin-lisp.storage:block-index-entry-prev-entry e)))
+          ;; A gap in prev-entry links (a pruned or partially-reindexed index)
+          ;; leaves E nil; fall back to the full target rather than inventing a
+          ;; step, and let PERFORM-REORG report what it cannot reach.
+          (or e target)))))
+
 (defun activate-best-chain (chain-state block-store utxo-set
                             &key tx-index fee-estimator recent-rejects mempool)
   "Reorganize onto the most-work fully-downloaded valid chain when it beats the
@@ -3530,7 +3564,11 @@ backstop against a candidate that reorgs away and reappears."
              (tip-work (if tip
                            (bitcoin-lisp.storage:block-index-entry-chain-work tip)
                            0))
-             (target (best-valid-tip chain-state block-store tip-work)))
+             (best (best-valid-tip chain-state block-store tip-work))
+             ;; Bounded step, not the absolute best tip: see
+             ;; +ACTIVATION-STEP-BLOCKS+. On a synced node the best tip is
+             ;; within the step and this is the identity.
+             (target (and tip best (%activation-step-target chain-state tip best))))
         (when (or (null tip) (null target))
           (return))
         (multiple-value-bind (ok detail)
