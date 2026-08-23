@@ -49,6 +49,33 @@
      :outputs (vector output)
      :lock-time 0)))
 
+(test sync-loop-activates-from-disk-with-no-peers
+  "With no peers the sync loop used to log \"No peers available\" and do
+NOTHING else, so a node whose block index was complete but whose chainstate sat
+at genesis could never catch up offline.
+
+That is precisely the state a -reindex leaves behind, and with -connect=0 no
+peer will ever arrive to trigger the activation. Core rebuilds entirely from
+disk there — ActivateBestChain runs from startup, not only on an arriving
+block. Measured against a real Core testnet4 datadir: 134,922 blocks indexed,
+chainstate at height 0, and the node sat printing \"No peers available\" for as
+long as it was left running.
+
+The property is which CALL the no-peer branch makes, so it is asserted against
+the source: a runtime assertion would need a full chain on disk."
+  (let ((src (with-open-file (in (merge-pathnames
+                                  "src/node.lisp"
+                                  (asdf:system-source-directory :bitcoin-lisp)))
+               (let ((text (make-string (file-length in))))
+                 (subseq text 0 (read-sequence text in))))))
+    (let ((branch (search "No peers available, reconnecting" src)))
+      (is-true branch "the no-peers branch is gone; this test needs rewriting")
+      ;; The activation must come BEFORE the give-up-and-wait, or it never runs.
+      (let ((activate (search "activate-best-chain" src :end2 branch :from-end t)))
+        (is-true activate
+                 "the no-peers branch no longer activates the chain from disk")
+        (is (< activate branch))))))
+
 (test script-check-pool-is-persistent-and-reusable
   "Core keeps ONE CCheckQueue for the life of the process (checkqueue.h) and
 hands it batches; ours spawned a fresh thread per worker PER BLOCK. At one
