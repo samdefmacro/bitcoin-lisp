@@ -1051,23 +1051,54 @@ them."
            (core-only-option-p name))
        t))
 
+(define-condition cli-parse-error (error)
+  ((detail :initarg :detail :reader cli-parse-error-detail))
+  (:report (lambda (c stream)
+             ;; Core's bitcoind prints the parse failure with this prefix and
+             ;; nothing else (bitcoind.cpp: InitError(strprintf("Error parsing
+             ;; command line arguments: %s", error))), and its functional tests
+             ;; match on the prefix rather than on the detail —
+             ;; feature_help.py asserts exactly b'Error parsing command line
+             ;; arguments' on stderr for an unknown option.
+             (format stream "Error parsing command line arguments: ~A"
+                     (cli-parse-error-detail c))))
+  (:documentation "A command line Core would refuse to parse."))
+
 (defun check-cli-args (args)
   "Reject unknown command-line options and bare non-option tokens, like
 Bitcoin Core (common/args.cpp:211 \"Invalid command\", :229-238 \"Invalid
 parameter\" — unknown CLI options are a HARD error; unknown CONFIG-FILE keys
 only warn, common/config.cpp:107-115 with ignore_invalid_keys=true from
-common/init.cpp:38). Returns ARGS."
-  (dolist (arg args args)
-    (unless (stringp arg)
-      (error "Invalid command '~A'" arg))
-    (if (and (plusp (length arg)) (char= (char arg 0) #\-))
-        (let* ((s (string-left-trim "-" arg))
-               (eq-pos (position #\= s))
-               (name (string-downcase (if eq-pos (subseq s 0 eq-pos) s))))
-          (unless (or (zerop (length name))          ; bare "-"/"--"
-                      (known-config-option-p name))
-            (error "Invalid parameter ~A" arg)))
-        (error "Invalid command '~A'" arg))))
+common/init.cpp:38). Returns ARGS.
+
+Signals CLI-PARSE-ERROR, whose report carries Core's prefix. The detail texts
+are Core's own, verbatim, because they are what an operator searches for."
+  (flet ((refuse (fmt &rest args)
+           (error 'cli-parse-error :detail (apply #'format nil fmt args))))
+    (dolist (arg args args)
+      (unless (stringp arg)
+        (refuse "Invalid command '~A'" arg))
+      (if (and (plusp (length arg)) (char= (char arg 0) #\-))
+          (let* ((s (string-left-trim "-" arg))
+                 (eq-pos (position #\= s))
+                 (name (string-downcase (if eq-pos (subseq s 0 eq-pos) s))))
+            ;; -includeconf is a CONFIG-FILE directive only. Core refuses it on
+            ;; the command line outright (common/args.cpp; the text is pinned
+            ;; by argsman_tests.cpp:205-206), because honouring it there would
+            ;; let a command line pull in a file whose own -includeconf pulls
+            ;; in another, with no datadir to anchor the recursion.
+            ;; The NEGATED form stays legal: Core's check fires only on a
+            ;; non-empty value, and -noincludeconf produces an empty span
+            ;; (args.cpp:249-250) — it is how an operator suppresses includes
+            ;; entirely from the command line. Comparing the un-stripped name
+            ;; gets that right, since "noincludeconf" is not "includeconf".
+            (when (string= name "includeconf")
+              (refuse "-includeconf cannot be used from commandline; -includeconf=\"~A\""
+                      (if eq-pos (subseq s (1+ eq-pos)) "")))
+            (unless (or (zerop (length name))          ; bare "-"/"--"
+                        (known-config-option-p name))
+              (refuse "Invalid parameter ~A" arg)))
+          (refuse "Invalid command '~A'" arg)))))
 
 (defun unknown-config-file-keys (conf-alist)
   "The keys in CONF-ALIST that no option table recognizes. The caller logs a

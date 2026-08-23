@@ -1399,31 +1399,56 @@ rejected for unranged ones; combo() P2PK scripts are skipped like Core."
          (network (rpc-get-network node)))
     (unless (stringp desc-str)
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "descriptor must be a string"))
-    (multiple-value-bind (low high)
-        (if range-given (%parse-descriptor-range range) (values 0 0))
-      (let ((desc (parse-descriptor desc-str network :require-checksum t)))
+    ;; A multipath descriptor denotes SEVERAL descriptors, and Core returns one
+    ;; address array per expansion — an array of arrays (rpc_deriveaddresses.py
+    ;; :32-33). #426 built the expander for the wallet's import path;
+    ;; deriveaddresses went on refusing multipath outright, because the refusal
+    ;; lives in the key-path parser it reaches first.
+    (let ((expansions (expand-multipath-descriptor desc-str)))
+      (when (rest expansions)
+        ;; The checksum covered the MULTIPATH form, so it is validated here,
+        ;; once, and the expansions carry none — which is why they are derived
+        ;; with require-checksum NIL. Requiring one per expansion answers
+        ;; "Missing checksum" for a descriptor whose checksum was correct.
+        (%check-descriptor-checksum desc-str t)
+        (return-from rpc-deriveaddresses
+          (coerce (mapcar (lambda (one)
+                            (coerce (%derive-addresses-for one range range-given network
+                                                           :require-checksum nil)
+                                    'vector))
+                          expansions)
+                  'vector))))
+    (%derive-addresses-for desc-str range range-given network)))
+
+(defun %derive-addresses-for (desc-str range range-given network
+                              &key (require-checksum t))
+  "The single-descriptor half of DERIVEADDRESSES: DESC-STR's addresses over
+RANGE, as a list."
+  (multiple-value-bind (low high)
+      (if range-given (%parse-descriptor-range range) (values 0 0))
+    (let ((desc (parse-descriptor desc-str network :require-checksum require-checksum)))
         (when (and (not (out-desc-ranged-p desc)) range-given)
           (error 'rpc-error :code +rpc-invalid-parameter+
                             :message "Range should not be specified for an un-ranged descriptor"))
         (when (and (out-desc-ranged-p desc) (not range-given))
           (error 'rpc-error :code +rpc-invalid-parameter+
                             :message "Range must be specified for a ranged descriptor"))
-        (let ((addresses '()))
-          (loop for i from low to high
-                do (let ((scripts (handler-case (out-desc-expand desc i)
-                                    (descriptor-derivation-error ()
-                                      (error 'rpc-error
-                                             :code +rpc-invalid-address-or-key+
-                                             :message "Cannot derive script without private keys")))))
-                     (dolist (script scripts)
-                       (let ((addr (%script->address script network)))
-                         (cond (addr (push addr addresses))
-                               ;; combo() emits P2PK; Core skips it rather than
-                               ;; failing when other scripts have addresses.
-                               ((and (> (length scripts) 1) (%script-p2pk-p script)))
-                               (t (error 'rpc-error
-                                         :code +rpc-invalid-address-or-key+
-                                         :message "Descriptor does not have a corresponding address")))))))
-          (when (null addresses)
-            (error 'rpc-error :code +rpc-misc-error+ :message "Unexpected empty result"))
-          (nreverse addresses))))))
+      (let ((addresses '()))
+        (loop for i from low to high
+              do (let ((scripts (handler-case (out-desc-expand desc i)
+                                  (descriptor-derivation-error ()
+                                    (error 'rpc-error
+                                           :code +rpc-invalid-address-or-key+
+                                           :message "Cannot derive script without private keys")))))
+                   (dolist (script scripts)
+                     (let ((addr (%script->address script network)))
+                       (cond (addr (push addr addresses))
+                             ;; combo() emits P2PK; Core skips it rather than
+                             ;; failing when other scripts have addresses.
+                             ((and (> (length scripts) 1) (%script-p2pk-p script)))
+                             (t (error 'rpc-error
+                                       :code +rpc-invalid-address-or-key+
+                                       :message "Descriptor does not have a corresponding address")))))))
+        (when (null addresses)
+          (error 'rpc-error :code +rpc-misc-error+ :message "Unexpected empty result"))
+        (nreverse addresses)))))

@@ -715,6 +715,38 @@ this node at all."
   ;; And a genuinely unknown option is still a hard error.
   (signals error (bitcoin-lisp::check-cli-args '("-notacoreoption"))))
 
+(test cli-parse-errors-carry-cores-prefix
+  "Core's bitcoind reports a command line it cannot parse as
+\"Error parsing command line arguments: <detail>\" (bitcoind.cpp), and its
+tests match on the PREFIX — feature_help.py asserts exactly
+b'Error parsing command line arguments' on stderr after -fakearg, and never
+looks at the detail. Ours said \"Invalid parameter -fakearg\" with no prefix,
+so the message was right and unfindable."
+  (flet ((message (args)
+           (handler-case (progn (bitcoin-lisp:check-cli-args args) nil)
+             (bitcoin-lisp:cli-parse-error (e) (princ-to-string e)))))
+    (let ((m (message '("-fakearg"))))
+      (is-true m "an unknown option was accepted")
+      (is (eql 0 (search "Error parsing command line arguments: " m))
+          "no Core prefix: ~S" m)
+      (is (search "Invalid parameter -fakearg" m)
+          "Core's own detail text drifted: ~S" m))
+    ;; -includeconf is a config-FILE directive. Core refuses it on the command
+    ;; line outright, and pins both spellings in argsman_tests.cpp:205-206.
+    (is (equal (concatenate 'string
+                            "Error parsing command line arguments: "
+                            "-includeconf cannot be used from commandline; "
+                            "-includeconf=\"\"")
+               (message '("-includeconf")))
+        "bare -includeconf: ~S" (message '("-includeconf")))
+    (is (search "-includeconf=\"x.conf\"" (message '("-includeconf=x.conf")))
+        "valued -includeconf: ~S" (message '("-includeconf=x.conf")))
+    ;; The NEGATED form stays legal — Core's check fires only on a non-empty
+    ;; value (args.cpp:249-250), and it is how includes are suppressed from the
+    ;; command line. Refusing it would break the one CLI spelling Core allows.
+    (is (null (message '("-noincludeconf")))
+        "-noincludeconf was refused; Core accepts it")))
+
 (test disablewallet-turns-the-wallet-off
   "Core's -disablewallet is the negation of our -wallet. 62 functional tests
 run wallet-less nodes with it."
