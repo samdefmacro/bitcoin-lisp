@@ -3588,9 +3588,17 @@ backstop against a candidate that reorgs away and reappears."
              ;; Without this the coins cache grows across every step and never
              ;; drains: *blocks-since-flush* is advanced only by connect-block's
              ;; tip-extension arm, so reorg-connected blocks never trigger a
-             ;; periodic flush at all. Measured on an offline reindex, steps
-             ;; went from ~3s to ~150s per 1,000 blocks by height 57,000 — a
-             ;; 50x slowdown that is entirely this.
+             ;; periodic flush at all — an unbounded cache on any long
+             ;; activation, which is a correctness-of-resource problem whatever
+             ;; it costs in time.
+             ;;
+             ;; It is worth NOT overselling the speed effect. A/B on the same
+             ;; offline reindex: ~58,000 blocks in 25 min without it, ~56,000 in
+             ;; 20 min with it — about 12% better, not the order of magnitude a
+             ;; first reading of the per-step timings suggested. Most of the
+             ;; slowdown with height is testnet4's own busy zone around
+             ;; 51,000-55,000 (the region scripts/profile-regions.sh already
+             ;; singles out), not this cache.
              (bitcoin-lisp:maybe-periodic-flush chain-state))
             (t
              ;; :interrupted means the node is stopping — not a refusal to
