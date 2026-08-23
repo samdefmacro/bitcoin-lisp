@@ -2016,6 +2016,74 @@ this a real oracle: the day Core adds an argument, this test notices."
                               (push row json))))))))))
     (values (nreverse json) (nreverse strings))))
 
+(test deriveaddresses-expands-a-multipath-descriptor
+  "A multipath descriptor denotes SEVERAL descriptors, and Core's
+deriveaddresses returns one address array per expansion — an array of arrays
+(rpc_deriveaddresses.py:32-33).
+
+#426 built EXPAND-MULTIPATH-DESCRIPTOR for the wallet's import path, and
+deriveaddresses went on refusing multipath outright, because the refusal lives
+in the key-path parser it reaches first. Another instance of the code existing
+and the caller that needed it not using it.
+
+The checksum is validated ONCE, on the multipath form it actually covers; the
+expansions carry none by construction, so requiring one per expansion answers
+\"Missing checksum\" for a descriptor whose checksum was correct."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (node (bitcoin-lisp::make-node :network :regtest))
+         (body (concatenate 'string
+                            "wpkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZ"
+                            "mbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRv"
+                            "mDUjyEmNUWwx8UbK/1/<0;1>/*)"))
+         (desc (format nil "~A#~A" body (bitcoin-lisp.rpc::descriptor-checksum body)))
+         (result (bitcoin-lisp.rpc::rpc-deriveaddresses node (list desc (list 1 2)))))
+    ;; Core's own expected value, verbatim from the test.
+    (is (equalp #(#("bcrt1q7c8mdmdktrzs8xgpjmqw90tjn65j5a3yj04m3n"
+                    "bcrt1qs6n37uzu0v0qfzf0r0csm0dwa7prc0v5uavgy0")
+                  #("bcrt1qhku5rq7jz8ulufe2y6fkcpnlvpsta7rq4442dy"
+                    "bcrt1qpgptk2gvshyl0s9lqshsmx932l9ccsv265tvaq"))
+                result)
+        "multipath deriveaddresses: ~S" result)
+    ;; A bad checksum on the multipath form is still refused — validating once
+    ;; must not mean validating never.
+    (signals error
+      (bitcoin-lisp.rpc::rpc-deriveaddresses
+       node (list (format nil "~A#00000000" body) (list 1 2))))
+    ;; And an ordinary descriptor still returns a flat list.
+    (let* ((single (concatenate 'string
+                                "wpkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZ"
+                                "mbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRv"
+                                "mDUjyEmNUWwx8UbK/1/1/*)"))
+           (flat (bitcoin-lisp.rpc::rpc-deriveaddresses
+                  node (list (format nil "~A#~A" single
+                                     (bitcoin-lisp.rpc::descriptor-checksum single))
+                             (list 1 2)))))
+      (is (listp flat) "an ordinary descriptor must not become an array of arrays")
+      (is (= 2 (length flat))))))
+
+(test a-relative-debuglogfile-lands-in-the-network-directory
+  "Core resolves a relative -debuglogfile against the NETWORK datadir
+(AbsPathForConfigVal, net_specific=true), and an absolute one as given.
+feature_logging.py starts a node with -debuglogfile=foo.log and then looks for
+<datadir>/<chain>/foo.log.
+
+Ours took a relative path as given, so the log landed wherever the process
+happened to be started from — for a supervised service, /. #478 moved the
+DEFAULT debug.log into the network directory and stopped there; this is the
+other half of the same rule."
+  (flet ((resolve (log-file) (bitcoin-lisp::%resolve-log-file log-file "/tmp/dd/" :regtest)))
+    (is (equal "/tmp/dd/regtest/foo.log" (resolve "foo.log")))
+    (is (equal "/tmp/dd/regtest/debug.log" (resolve nil)))
+    ;; Absolute stays absolute — feature_logging's second case writes outside
+    ;; the datadir on purpose.
+    (is (equal "/var/log/foo.log" (resolve "/var/log/foo.log")))
+    ;; -debuglogfile=0 still turns file logging off entirely (Core's spelling).
+    (is (null (resolve "0")))
+    ;; No network: the base directory, which is what the pre-Core callers and
+    ;; the unit tests pass.
+    (is (equal "/tmp/dd/foo.log"
+               (bitcoin-lisp::%resolve-log-file "foo.log" "/tmp/dd/")))))
+
 (test the-sync-wait-shortens-when-we-are-behind
   "The sync loop's between-pass wait ends early on a NEW header announcement,
 which covers headers arriving DURING the wait. It did not cover the other

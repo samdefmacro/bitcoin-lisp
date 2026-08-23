@@ -1599,6 +1599,7 @@
    #:*dns-seed-enabled*
    #:*fixed-seeds-enabled*
    #:check-cli-args
+   #:cli-parse-error
    #:unknown-config-file-keys
    #:known-config-option-p
    #:conf-parse-money

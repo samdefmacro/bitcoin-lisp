@@ -300,18 +300,30 @@ node-behaviour failure for a path bug.
 
 Passing no NETWORK keeps the base directory, which is what the pre-Core callers
 and the unit tests expect."
-  (cond ((and (stringp log-file)
-              (or (string= log-file "0") (string= log-file "")))
-         nil)
-        ((and (stringp log-file) (plusp (length log-file))) log-file)
-        (log-file log-file)
-        (data-directory
-         (let ((dir (uiop:ensure-directory-pathname data-directory)))
-           (namestring (merge-pathnames "debug.log"
-                                        (if network
-                                            (network-data-path dir network)
-                                            dir)))))
-        (t nil)))
+  (flet ((net-dir ()
+           (and data-directory
+                (let ((dir (uiop:ensure-directory-pathname data-directory)))
+                  (if network (network-data-path dir network) dir)))))
+    (cond ((and (stringp log-file)
+                (or (string= log-file "0") (string= log-file "")))
+           nil)
+          ;; A RELATIVE -debuglogfile is resolved against the network
+          ;; directory, not the process working directory (Core
+          ;; AbsPathForConfigVal, net_specific=true). feature_logging.py starts
+          ;; a node with -debuglogfile=foo.log and then looks for
+          ;; <datadir>/<chain>/foo.log; taken as given it lands wherever the
+          ;; node happened to be started from, which for a service is /.
+          ((and (stringp log-file) (plusp (length log-file)))
+           (let ((path (pathname log-file))
+                 (dir (net-dir)))
+             (if (and dir (not (eq :absolute (first (pathname-directory path)))))
+                 (namestring (merge-pathnames path dir))
+                 log-file)))
+          (log-file log-file)
+          (data-directory
+           (let ((dir (net-dir)))
+             (namestring (merge-pathnames "debug.log" dir))))
+          (t nil))))
 
 (defun listen-port (network)
   "The P2P LISTEN port: -port when given, else NETWORK's default (Core
@@ -2384,10 +2396,16 @@ process editing the files."
                  (error "Cannot create the lock file at ~A: ~A" path e)))))
     (when (minusp (cffi:foreign-funcall "flock" :int fd :int +flock-ex-nb+ :int))
       (ignore-errors (sb-posix:close fd))
-      (log-error "Cannot obtain a lock on data directory ~A." directory)
-      (log-error "Another bitcoin-lisp node is probably already running on it.")
-      (error "Cannot obtain a lock on data directory ~A; another node is probably already running"
-             directory))
+      ;; Core's wording exactly (init.cpp:1165): "Cannot obtain a lock on
+      ;; directory %s. %s is probably already running." Not decoration —
+      ;; feature_filelock.py matches on that sentence, and an operator whose
+      ;; second node will not start searches for the string bitcoind prints.
+      ;; Ours said "data directory" and joined the two halves with a semicolon.
+      (let ((message (format nil "Cannot obtain a lock on directory ~A. ~A is probably already running."
+                             directory
+                             "bitcoin-lisp")))
+        (log-error "~A" message)
+        (error "~A" message)))
     ;; Keep the descriptor open. UNWIND from here on must not close it.
     (setf *data-directory-lock-fd* fd)))
 
