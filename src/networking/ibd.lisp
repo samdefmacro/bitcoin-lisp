@@ -3137,10 +3137,23 @@ keeping. Core has no header-sync loop at all for the same reason."
     ;; Kick: one getheaders, throttled like every other. Use the low-work sync's
     ;; own locator when one is in progress (its headers are not in the index).
     (let ((hss (peer-headers-sync peer)))
-      (if hss
-          (send-message peer (bitcoin-lisp.serialization:make-getheaders-message
-                              (hss-locator-hashes hss)))
-          (%maybe-send-getheaders peer (build-header-locator chain-state))))
+      (unless (if hss
+                  (send-message peer (bitcoin-lisp.serialization:make-getheaders-message
+                                      (hss-locator-hashes hss)))
+                  (%maybe-send-getheaders peer (build-header-locator chain-state)))
+        ;; Nothing was SENT — %MAYBE-SEND-GETHEADERS throttles a repeat within
+        ;; +HEADERS-RESPONSE-TIME-SECONDS+ of the last one, as Core's
+        ;; MaybeSendGetHeaders does. Waiting for a reply to a request we did not
+        ;; make burns the whole silent budget (~10s) every cycle, which is
+        ;; exactly what a node AT ITS TIP does on every pass: the previous
+        ;; cycle's getheaders is still inside the throttle window, so nothing
+        ;; goes out and nothing comes back. It logged "(no answer)" and looked
+        ;; like a quiet peer.
+        ;;
+        ;; Return NOT-STALLED: the peer did nothing wrong, we simply did not
+        ;; ask. Reporting a stall here would rotate header sync away from a
+        ;; perfectly healthy peer on a timer.
+        (return-from sync-headers (values 0 nil))))
     (loop
       (when (or *ibd-stop-requested*
                 (not (eq (peer-state peer) :ready))

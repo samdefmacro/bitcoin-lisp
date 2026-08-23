@@ -2016,6 +2016,90 @@ this a real oracle: the day Core adds an argument, this test notices."
                               (push row json))))))))))
     (values (nreverse json) (nreverse strings))))
 
+(test manual-peers-report-connection-type-manual
+  "ConnectionType::MANUAL is a first-class member of Core's enum
+(node/connection_types.cpp:13), so an addnode peer's getpeerinfo
+connection_type is \"manual\" — not \"outbound-full-relay\" with a flag
+somewhere else. rpc_net.py asserts exactly that (:125).
+
+We keep it as a flag internally on purpose: the outbound-slot budgets are
+written against the automatic types, and a manual peer occupies none of them in
+Core either. What has to agree is the report."
+  (let ((node (make-test-node))
+        (manual (bitcoin-lisp::make-peer :address "10.1.1.1" :state :ready))
+        (auto (bitcoin-lisp::make-peer :address "10.1.1.2" :state :ready
+                                       :conn-type :outbound-full-relay))
+        (inbound (bitcoin-lisp::make-peer :address "10.1.1.3" :state :ready :inbound t)))
+    (setf (bitcoin-lisp.networking:peer-manual manual) t)
+    ;; An INBOUND peer is never "manual", whatever flags it carries: Core's
+    ;; inbound connections are ConnectionType::INBOUND, full stop.
+    (setf (bitcoin-lisp.networking:peer-manual inbound) t)
+    (setf (bitcoin-lisp::node-peers node) (list manual auto inbound))
+    (let* ((rows (bitcoin-lisp.rpc::%peerinfo-rows node))
+           (types (mapcar (lambda (r) (cdr (assoc "connection_type" r :test #'string=)))
+                          rows)))
+      (is (equal '("manual" "outbound-full-relay" "inbound") types)
+          "connection_type: ~S" types))))
+
+(test submitted-blocks-are-announced-to-peers
+  "RELAY-BLOCK existed and had exactly one caller — the P2P receive path — so a
+block that ARRIVED was forwarded and a block this node MINED was not. Core
+makes no such distinction: submitblock runs ProcessNewBlock like any other
+block, and the resulting tip change drives the announcement.
+
+Nothing about the node looked wrong: it mined, validated, connected, and its
+own getblockcount advanced. The block simply never left, and a peer learned of
+it only on its next getheaders — throttled to one per two minutes per peer. So
+Core's functional tests, which allow sixty seconds for two nodes to agree on a
+tip, timed out against a node working perfectly in isolation.
+
+Two halves, because either alone would pass against the bug: that a NIL source
+peer excludes nobody (a locally mined block has no source to skip), and that
+the submitblock path actually makes the call."
+  (let ((peer (bitcoin-lisp::make-peer :address "10.9.9.9" :state :ready)))
+    ;; A ready peer with no connection: SEND-MESSAGE is a no-op on it, so the
+    ;; count is taken from the relay target list instead.
+    (is (equal (list peer)
+               (bitcoin-lisp.networking::block-relay-targets nil (list peer)))
+        "a NIL source peer must not exclude anybody — a locally mined block has no source")
+    ;; And the production call site passes NIL, rather than only the P2P one
+    ;; having a call at all. This is the half that was missing, so it is the
+    ;; half the test pins.
+    (let ((src (with-open-file (in (merge-pathnames "src/rpc/methods.lisp"
+                                                    (asdf:system-source-directory :bitcoin-lisp)))
+                 (let ((text (make-string (file-length in))))
+                   (subseq text 0 (read-sequence text in))))))
+      (is (search "relay-block header nil peers" src)
+          "the submitblock path no longer announces the block it just connected"))))
+
+(test getpeerinfo-rows-are-in-peer-id-order
+  "Core's getpeerinfo comes out in ascending peer id: m_nodes is a vector
+appended to on connect, ids are monotonic, and GetNodeStats walks it in place
+(net.cpp:3797-3807). Our node-peers is a list PUSHED to, so it came out
+newest-first — exactly reversed.
+
+Tests index this array positionally, and a reversed list does not fail loudly;
+it compares the wrong two peers and reports plausible values. rpc_net.py pairs
+the ends of a connection with `assert_equal(peer_info[0][0]['addrbind'],
+peer_info[1][0]['addr'])` and got two real addresses that simply belonged to
+different connections."
+  (let ((node (make-test-node))
+        (peers '()))
+    (dolist (addr '("10.0.0.1" "10.0.0.2" "10.0.0.3"))
+      ;; PUSH, which is how the sync thread builds the list.
+      (push (bitcoin-lisp::make-peer :address addr :state :ready) peers))
+    (setf (bitcoin-lisp::node-peers node) peers)
+    (let* ((ids (mapcar (lambda (p) (bitcoin-lisp.networking::peer-id p))
+                        (bitcoin-lisp::node-peers node)))
+           (rows (bitcoin-lisp.rpc::%peerinfo-rows node))
+           (row-ids (mapcar (lambda (r) (cdr (assoc "id" r :test #'string=))) rows)))
+      ;; The precondition: the stored list really is newest-first, so this test
+      ;; is not asserting a sort that was already trivially true.
+      (is (equal ids (reverse (sort (copy-list ids) #'<)))
+          "node-peers was not newest-first; the fixture no longer reproduces the bug")
+      (is (equal (sort (copy-list row-ids) #'<) row-ids)
+          "getpeerinfo rows are not in ascending peer id: ~S" row-ids))))
+
 (test getpeerinfo-addr-carries-the-port
   "Core's getpeerinfo `addr` is CNode::addr.ToStringAddrPort() — \"ip:port\"
 (rpc/net.cpp:130). Ours reported the host alone.

@@ -840,6 +840,16 @@ last_block stamps every block received (Core stamps only NEW blocks)."
   "One getpeerinfo row (a field alist) per CONNECTED peer — the body of Core's
 getpeerinfo loop, rpc/net.cpp:107-227.
 
+Rows come out in ASCENDING PEER ID, which is Core's order and not an
+aesthetic choice: m_nodes is a vector appended to on connect, ids are handed
+out monotonically, and GetNodeStats walks it in place (net.cpp:3797-3807). Our
+node-peers is a list PUSHED to, so it was newest-first — exactly reversed.
+
+Tests index this array positionally. rpc_net.py pairs the two ends of a
+connection with `assert_equal(peer_info[0][0]['addrbind'],
+peer_info[1][0]['addr'])` (:116), which compares the wrong two peers entirely
+if either node's list is reversed, and does so with plausible-looking values.
+
 Peers in state :DISCONNECTED are skipped. Core has no equivalent filter because
 it has no equivalent state: DisconnectNodes() removes the node from m_nodes on
 every socket-handler pass, roughly every 50ms, so a disconnected node is simply
@@ -852,9 +862,10 @@ leave getpeerinfo (disconnect_nodes, test_framework.py:626), which is generous
 against 50ms and hopeless against 30s. Filtering here is not a workaround for
 the reap cadence: reporting a peer we have closed the socket on is wrong
 whatever the cadence is."
-  (let ((peers (remove-if (lambda (p)
-                            (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
-                          (rpc-get-peers node)))
+  (let ((peers (sort (remove-if (lambda (p)
+                                  (eq (bitcoin-lisp.networking:peer-state p) :disconnected))
+                                (rpc-get-peers node))
+                     #'< :key #'bitcoin-lisp.networking::peer-id))
         (chain-state (rpc-get-chain-state node))
         (now (get-internal-real-time)))
     (mapcar
@@ -977,8 +988,17 @@ whatever the cadence is."
                                     (bitcoin-lisp.networking::peer-recv-per-msg peer)))
            ;; Core ConnectionType string (block-relay-only/feeler peers get
            ;; no tx relay -- #216).
-           ("connection_type" . ,(%connection-type-string
-                                  (bitcoin-lisp.networking:peer-conn-type peer)))
+           ;; A manual peer's TYPE is "manual" in Core — ConnectionType::MANUAL
+           ;; is a first-class member of the enum (node/connection_types.cpp:13),
+           ;; not an outbound-full-relay peer carrying a flag. We keep it as a
+           ;; flag internally because the outbound-slot budgets are written
+           ;; against the automatic types, and Core's manual peer likewise
+           ;; occupies none of them; what has to agree is the REPORT.
+           ("connection_type" . ,(if (and (bitcoin-lisp.networking:peer-manual peer)
+                                          (not (bitcoin-lisp.networking::peer-inbound peer)))
+                                     "manual"
+                                     (%connection-type-string
+                                      (bitcoin-lisp.networking:peer-conn-type peer))))
            ;; Core TransportTypeAsString: the BIP324 v2 session lives in
            ;; connection-transport (NIL = plaintext v1). Peers surface
            ;; here only after the handshake, so "detecting" never applies.
@@ -3975,18 +3995,49 @@ cache above wraps exactly the expensive part and nothing else."
         ("warnings" . #())))))
 
 (defun %activate-submitted-block (node block)
-  "Validate+activate BLOCK through the consensus path. Returns the activate-block
-(values ok reason). Holds the node lock: activation mutates the chainstate,
-UTXO set, and mempool exactly like a network block, which the sync thread
-only ever does under the lock (Core ProcessNewBlock takes cs_main)."
+  "Validate+activate BLOCK through the consensus path, then ANNOUNCE it if it
+became the tip. Returns the activate-block (values ok reason). Holds the node
+lock: activation mutates the chainstate, UTXO set, and mempool exactly like a
+network block, which the sync thread only ever does under the lock (Core
+ProcessNewBlock takes cs_main).
+
+The announcement is the part that was missing. RELAY-BLOCK existed and was
+called from exactly one place — the P2P receive path — so a block that arrived
+over the network was forwarded and a block this node MINED was not. Core makes
+no such distinction: submitblock goes through ProcessNewBlock like any other
+block, and the resulting tip change is what drives the announcement.
+
+Nothing about the node looked wrong. It mined, it validated, it connected, its
+own getblockcount advanced. The block simply never left, and a peer learned of
+it only on its next getheaders — which is throttled to one per two minutes per
+peer, so Core's functional tests, which allow sixty seconds for two nodes to
+agree on a tip, timed out on a node that was working perfectly in isolation."
   (with-node-lock (node)
-    (bitcoin-lisp.validation:activate-block
-     block
-     (rpc-get-chain-state node)
-     (rpc-get-block-store node)
-     (rpc-get-utxo-set node)
-     :mempool (rpc-get-mempool node)
-     :tx-index (rpc-get-tx-index node))))
+    (let* ((chain-state (rpc-get-chain-state node))
+           (result (multiple-value-list
+                    (bitcoin-lisp.validation:activate-block
+                     block
+                     chain-state
+                     (rpc-get-block-store node)
+                     (rpc-get-utxo-set node)
+                     :mempool (rpc-get-mempool node)
+                     :tx-index (rpc-get-tx-index node)))))
+      (when (first result)
+        (let ((header (bitcoin-lisp.serialization:bitcoin-block-header block))
+              (peers (bitcoin-lisp::node-peers node)))
+          ;; Only when it is the ACTIVE tip, which is the same condition the
+          ;; P2P path applies (protocol.lisp): a stored side block announces
+          ;; nothing.
+          (when (and peers
+                     (equalp (bitcoin-lisp.storage:best-block-hash chain-state)
+                             (bitcoin-lisp.serialization:block-header-hash header)))
+            (handler-case
+                (bitcoin-lisp.networking::relay-block header nil peers)
+              ;; A send failure must not turn an accepted block into a
+              ;; submitblock error: the block IS connected either way.
+              (error (e)
+                (bitcoin-lisp:log-warn "Announcing submitted block failed: ~A" e))))))
+      (values-list result))))
 
 (defun rpc-submitblock (node params)
   "Submit a mined block (Bitcoin Core submitblock). PARAMS: (block-hex). Returns
