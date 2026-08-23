@@ -706,14 +706,31 @@ check-cli-args rejects them up front."
                (eq-pos (position #\= s)))
           (cond
             ((zerop (length s)))                                   ; bare "-" / "--"
-            (eq-pos
-             (push (cons (string-downcase (subseq s 0 eq-pos))
-                         (subseq s (1+ eq-pos)))
-                   out))
-            ;; Bare -noKEY negates; bare -KEY asserts.
-            ((and (> (length s) 2) (string-equal (subseq s 0 2) "no"))
-             (push (cons (string-downcase (subseq s 2)) "0") out))
-            (t (push (cons (string-downcase s) "1") out))))))
+            (t
+             (let* ((raw-key (string-downcase (if eq-pos (subseq s 0 eq-pos) s)))
+                    (value (and eq-pos (subseq s (1+ eq-pos))))
+                    (negated (and (> (length raw-key) 2)
+                                  (string= "no" (subseq raw-key 0 2))))
+                    (key (if negated (subseq raw-key 2) raw-key)))
+               ;; Core's InterpretKey strips a "no" prefix unconditionally and
+               ;; InterpretValue then turns the negation into a value
+               ;; (common/args.cpp:105-126). The VALUED negated form was
+               ;; missing here: a "=" took the branch that kept the key as
+               ;; "nolisten", so -nolisten=0 set an option nothing reads
+               ;; instead of setting -listen.
+               (push (cons key
+                           (cond
+                             ((not negated) (or value "1"))
+                             ;; Double negatives like -nofoo=0 are supported
+                             ;; but warned about (args.cpp:114-118), and they
+                             ;; mean TRUE.
+                             ((and value (not (conf-parse-bool value)))
+                              (bitcoin-lisp:log-warn
+                               "Parsed potentially confusing double-negative -~A=~A"
+                               key value)
+                              "1")
+                             (t "0")))
+                     out)))))))
     ;; OUT is reversed (last arg first): keep the FIRST cell seen per
     ;; non-repeatable key = the LAST command-line occurrence, then restore
     ;; command-line order.
@@ -1087,14 +1104,33 @@ are Core's own, verbatim, because they are what an operator searches for."
             ;; by argsman_tests.cpp:205-206), because honouring it there would
             ;; let a command line pull in a file whose own -includeconf pulls
             ;; in another, with no datadir to anchor the recursion.
-            ;; The NEGATED form stays legal: Core's check fires only on a
-            ;; non-empty value, and -noincludeconf produces an empty span
-            ;; (args.cpp:249-250) — it is how an operator suppresses includes
-            ;; entirely from the command line. Comparing the un-stripped name
-            ;; gets that right, since "noincludeconf" is not "includeconf".
-            (when (string= name "includeconf")
-              (refuse "-includeconf cannot be used from commandline; -includeconf=\"~A\""
-                      (if eq-pos (subseq s (1+ eq-pos)) "")))
+            ;; -includeconf, through Core's own key/value interpretation.
+            ;;
+            ;; The refusal fires on a non-empty settings span (args.cpp:247-253)
+            ;; and reports the first value as Core's SettingsValue::write()
+            ;; renders it — a JSON string is quoted, a JSON bool is not. So the
+            ;; three refusable spellings read:
+            ;;
+            ;;   -includeconf              -> -includeconf=""      (empty string)
+            ;;   -includeconf=x.conf       -> -includeconf="x.conf"
+            ;;   -noincludeconf=0          -> -includeconf=true    (double negative)
+            ;;
+            ;; while -noincludeconf and -noincludeconf=1 CLEAR the span and are
+            ;; allowed: that is how an operator suppresses includes from the
+            ;; command line, and refusing it would break the one CLI spelling
+            ;; Core accepts. feature_includeconf.py exercises the double
+            ;; negative and the valued form, and the bare form is pinned by
+            ;; argsman_tests.cpp:205-206.
+            (let* ((negated (and (> (length name) 2) (string= "no" (subseq name 0 2))))
+                   (base (if negated (subseq name 2) name))
+                   (value (and eq-pos (subseq s (1+ eq-pos)))))
+              (when (string= base "includeconf")
+                (cond
+                  ((not negated)
+                   (refuse "-includeconf cannot be used from commandline; -includeconf=\"~A\""
+                           (or value "")))
+                  ((and value (not (conf-parse-bool value)))
+                   (refuse "-includeconf cannot be used from commandline; -includeconf=true")))))
             (unless (or (zerop (length name))          ; bare "-"/"--"
                         (known-config-option-p name))
               (refuse "Invalid parameter ~A" arg)))

@@ -741,11 +741,39 @@ so the message was right and unfindable."
         "bare -includeconf: ~S" (message '("-includeconf")))
     (is (search "-includeconf=\"x.conf\"" (message '("-includeconf=x.conf")))
         "valued -includeconf: ~S" (message '("-includeconf=x.conf")))
-    ;; The NEGATED form stays legal — Core's check fires only on a non-empty
-    ;; value (args.cpp:249-250), and it is how includes are suppressed from the
+    ;; The DOUBLE NEGATIVE means TRUE, and Core reports it as the JSON bool —
+    ;; unquoted, unlike the string cases above. feature_includeconf.py:44-45
+    ;; asserts exactly this spelling.
+    (is (search "-includeconf=true" (message '("-noincludeconf=0")))
+        "-noincludeconf=0: ~S" (message '("-noincludeconf=0")))
+    ;; The NEGATED form stays legal — a false value CLEARS the settings span
+    ;; (args.cpp:249-250), and it is how includes are suppressed from the
     ;; command line. Refusing it would break the one CLI spelling Core allows.
     (is (null (message '("-noincludeconf")))
-        "-noincludeconf was refused; Core accepts it")))
+        "-noincludeconf was refused; Core accepts it")
+    (is (null (message '("-noincludeconf=1")))
+        "-noincludeconf=1 was refused; it is the same suppression")))
+
+(test valued-negation-parses-as-core-interprets-it
+  "Core's InterpretKey strips a \"no\" prefix unconditionally and
+InterpretValue then turns the negation into a value (common/args.cpp:105-126),
+so all four spellings resolve to the same option.
+
+The VALUED negated form was missing: a \"=\" took the branch that kept the key
+as \"nolisten\", so `-nolisten=0` set an option nothing reads instead of
+setting -listen. Silent both ways — the misspelled key was accepted (a
+\"noKEY\" is a known option name) and the real one kept its default.
+
+Core supports the double negative and warns about it, which is what
+feature_config_args.py:232 looks for."
+  (flet ((one (arg) (bitcoin-lisp::parse-cli-args (list arg))))
+    (is (equal '(("listen" . "1")) (one "-listen")))
+    (is (equal '(("listen" . "1")) (one "-listen=1")))
+    (is (equal '(("listen" . "0")) (one "-nolisten")))
+    (is (equal '(("listen" . "0")) (one "-nolisten=1")))
+    ;; The double negative: -nofoo=0 is TRUE.
+    (is (equal '(("listen" . "1")) (one "-nolisten=0"))
+        "-nolisten=0 must mean -listen=1")))
 
 (test disablewallet-turns-the-wallet-off
   "Core's -disablewallet is the negation of our -wallet. 62 functional tests
