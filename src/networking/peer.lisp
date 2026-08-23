@@ -69,7 +69,12 @@ MAX_ADDR_TO_SEND = 1000): time-based refill never exceeds it, but the
   (start-height 0 :type (signed-byte 32))
   (user-agent "" :type string)
   (ping-nonce nil)
-  (last-ping-time 0 :type integer)
+  ;; NIL means no ping has ever been sent on this connection, which is DUE, not
+  ;; recent. Core encodes the same thing as m_ping_start{0us} against an
+  ;; absolute clock, so `now > m_ping_start + PING_INTERVAL` is true on a fresh
+  ;; peer (net_processing.cpp:5508). A 0 here would be an INTERNAL-REAL-TIME
+  ;; zero, which means "process start" — see CHECK-PEER-HEALTH.
+  (last-ping-time nil :type (or null integer))
   (ping-latency 0 :type integer)
   ;; Minimum ping round-trip observed on this connection, internal-time units
   ;; (Core CNode::m_min_ping_time; 0 = no pong yet). Surfaced as getpeerinfo
@@ -1520,12 +1525,31 @@ and its age never reset."
   (unless (eq (peer-state peer) :ready)
     (return-from check-peer-health (check-handshake-timeout peer)))
 
-  (let ((age (- (get-internal-real-time) (peer-last-ping-time peer))))
+  (let* ((last (peer-last-ping-time peer))
+         (age (and last (- (get-internal-real-time) last))))
     (cond
       ((peer-ping-nonce peer)
        (if (> age (* +ping-timeout-seconds+ internal-time-units-per-second))
            :disconnect
            :ok))
+      ;; Never pinged: due NOW, as Core's is.
+      ;;
+      ;; This was `(- (get-internal-real-time) 0)` against a 0 initform, and
+      ;; the two clocks do not mean the same thing. Core's m_ping_start is 0 on
+      ;; an ABSOLUTE clock, so the interval has always already elapsed. Ours was
+      ;; 0 on INTERNAL-REAL-TIME, whose zero is roughly process start — so on a
+      ;; freshly started node the first ping to any peer waited out the full
+      ;; two-minute interval measured from BOOT, not from the connection.
+      ;;
+      ;; Nothing about it looks wrong in a long-lived node, which is where it
+      ;; was never noticed: after two minutes of uptime every new peer is
+      ;; pinged at once. It shows up only in the first two minutes, which is
+      ;; exactly the window Core's functional framework runs in — connect_nodes
+      ;; waits 60s for a pong before it will hand a test its network
+      ;; (test_framework.py:596), so this alone failed every multi-node test.
+      ((null last)
+       (send-ping peer)
+       :ping-sent)
       ((> age (* +ping-interval-seconds+ internal-time-units-per-second))
        (send-ping peer)
        :ping-sent)

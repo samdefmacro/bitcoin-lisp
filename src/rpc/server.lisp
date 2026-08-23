@@ -484,61 +484,200 @@ quietly.")
 
 (defparameter *rpc-named-arg-names*
   '(
+    ("abandontransaction" "txid")
+    ("abortprivatebroadcast" "id")
+    ("abortrescan")
     ("addconnection" "address" "connection_type" "v2transport")
     ("addnode" "node" "command" "v2transport")
-    ("createwallet"
-      "wallet_name" "disable_private_keys" "blank" "passphrase" "avoid_reuse"
-      "descriptors" "load_on_startup" "external_signer")
+    ("addpeeraddress" "address" "port" "tried")
+    ("analyzepsbt" "psbt")
+    ("backupwallet" "destination")
+    ("bumpfee" "txid" "options")
+    ("clearbanned")
+    ("combinepsbt" "txs")
+    ("combinerawtransaction" "txs")
+    ("converttopsbt" "hexstring" "permitsigdata" "iswitness")
+    ("createmultisig" "nrequired" "keys" "address_type")
+    ("createpsbt" "inputs" "outputs" "locktime" "replaceable" "version")
+    ("createrawtransaction" "inputs" "outputs" "locktime" "replaceable" "version")
+    ("createwallet" "wallet_name" "disable_private_keys" "blank" "passphrase" "avoid_reuse" "descriptors" "load_on_startup" "external_signer")
+    ("createwalletdescriptor" "type" "options")
+    ("decodepsbt" "psbt")
+    ("decoderawtransaction" "hexstring" "iswitness")
+    ("decodescript" "hexstring")
+    ("deriveaddresses" "descriptor" "range")
+    ("descriptorprocesspsbt" "psbt" "descriptors" "sighashtype" "bip32derivs" "finalize")
     ("disconnectnode" "address" "nodeid")
+    ("dumptxoutset" "path" "type" "options")
+    ("echo" "arg0" "arg1" "arg2" "arg3" "arg4" "arg5" "arg6" "arg7" "arg8" "arg9")
+    ("echoipc" "arg")
+    ("echojson" "arg0" "arg1" "arg2" "arg3" "arg4" "arg5" "arg6" "arg7" "arg8" "arg9")
+    ("encryptwallet" "passphrase")
+    ("enumeratesigners")
+    ("estimaterawfee" "conf_target" "threshold")
+    ("estimatesmartfee" "conf_target" "estimate_mode")
+    ("finalizepsbt" "psbt" "extract")
+    ("fundrawtransaction" "hexstring" "options" "iswitness")
+    ("generate")
     ("generateblock" "output" "transactions" "submit")
     ("generatetoaddress" "nblocks" "address" "maxtries")
     ("generatetodescriptor" "num_blocks" "descriptor" "maxtries")
+    ("getaddednodeinfo" "node")
+    ("getaddressesbylabel" "label")
+    ("getaddressinfo" "address")
+    ("getaddrmaninfo")
+    ("getbalance" "dummy" "minconf" "include_watchonly" "avoid_reuse")
+    ("getbalances")
     ("getbestblockhash")
     ("getblock" "blockhash" "verbosity|verbose")
     ("getblockchaininfo")
     ("getblockcount")
+    ("getblockfilter" "blockhash" "filtertype")
     ("getblockfrompeer" "blockhash" "peer_id")
     ("getblockhash" "height")
     ("getblockheader" "blockhash" "verbose")
     ("getblockstats" "hash_or_height" "stats")
+    ("getblocktemplate" "template_request")
+    ("getchainstates")
     ("getchaintips")
     ("getchaintxstats" "nblocks" "blockhash")
     ("getconnectioncount")
     ("getdeploymentinfo" "blockhash")
+    ("getdescriptoractivity" "blockhashes" "scanobjects" "include_mempool")
+    ("getdescriptorinfo" "descriptor")
     ("getdifficulty")
+    ("gethdkeys" "options")
     ("getindexinfo" "index_name")
+    ("getmemoryinfo" "mode")
+    ("getmempoolancestors" "txid" "verbose")
+    ("getmempoolcluster" "txid")
+    ("getmempooldescendants" "txid" "verbose")
     ("getmempoolentry" "txid")
+    ("getmempoolfeeratediagram")
     ("getmempoolinfo")
+    ("getmininginfo")
+    ("getnettotals")
+    ("getnetworkhashps" "nblocks" "height")
     ("getnetworkinfo")
+    ("getnewaddress" "label" "address_type")
+    ("getnodeaddresses" "count" "network")
+    ("getorphantxs" "verbosity")
     ("getpeerinfo")
+    ("getprioritisedtransactions")
+    ("getprivatebroadcastinfo")
+    ("getrawaddrman")
+    ("getrawchangeaddress" "address_type")
     ("getrawmempool" "verbose" "mempool_sequence")
     ("getrawtransaction" "txid" "verbosity|verbose" "blockhash")
+    ("getreceivedbyaddress" "address" "minconf" "include_immature_coinbase")
+    ("getreceivedbylabel" "label" "minconf" "include_immature_coinbase")
+    ("getrpcinfo")
+    ("gettransaction" "txid" "include_watchonly" "verbose")
     ("gettxout" "txid" "n" "include_mempool")
     ("gettxoutproof" "txids" "blockhash")
+    ("gettxoutsetinfo" "hash_type" "hash_or_height" "use_index")
+    ("gettxspendingprevout" "outputs" "options")
+    ("getwalletinfo")
+    ("getzmqnotifications")
+    ("help" "command")
+    ("importdescriptors" "requests")
+    ("importmempool" "filepath" "options")
+    ("importprunedfunds" "rawtransaction" "txoutproof")
     ("invalidateblock" "blockhash")
+    ("joinpsbts" "txs")
+    ("keypoolrefill" "newsize")
+    ("listaddressgroupings")
+    ("listbanned")
+    ("listdescriptors" "private")
+    ("listlabels" "purpose")
+    ("listlockunspent")
+    ("listreceivedbyaddress" "minconf" "include_empty" "include_watchonly" "address_filter" "include_immature_coinbase")
+    ("listreceivedbylabel" "minconf" "include_empty" "include_watchonly" "include_immature_coinbase")
+    ("listsinceblock" "blockhash" "target_confirmations" "include_watchonly" "include_removed" "include_change" "label")
+    ("listtransactions" "label" "count" "skip" "include_watchonly")
+    ("listunspent" "minconf" "maxconf" "addresses" "include_unsafe" "query_options")
+    ("listwalletdir")
+    ("listwallets")
+    ("loadtxoutset" "path")
+    ("loadwallet" "filename" "load_on_startup")
+    ("lockunspent" "unlock" "transactions" "persistent")
+    ("logging" "include" "exclude")
+    ("migratewallet" "wallet_name" "passphrase")
+    ("mockscheduler" "delta_time")
+    ("ping")
     ("preciousblock" "blockhash")
+    ("prioritisetransaction" "txid" "dummy" "fee_delta")
     ("pruneblockchain" "height")
+    ("psbtbumpfee" "txid" "options")
     ("reconsiderblock" "blockhash")
+    ("removeprunedfunds" "txid")
+    ("rescanblockchain" "start_height" "stop_height")
+    ("restorewallet" "wallet_name" "backup_file" "load_on_startup")
+    ("savemempool")
+    ("scanblocks" "action" "scanobjects" "start_height" "stop_height" "filtertype" "options")
+    ("scantxoutset" "action" "scanobjects")
+    ("send" "outputs" "conf_target" "estimate_mode" "fee_rate" "options" "version")
+    ("sendall" "recipients" "conf_target" "estimate_mode" "fee_rate" "options")
+    ("sendmany" "dummy" "amounts" "minconf" "comment" "subtractfeefrom" "replaceable" "conf_target" "estimate_mode" "fee_rate" "verbose")
+    ("sendmsgtopeer" "peer_id" "msg_type" "msg")
     ("sendrawtransaction" "hexstring" "maxfeerate" "maxburnamount")
+    ("sendtoaddress" "address" "amount" "comment" "comment_to" "subtractfeefromamount" "replaceable" "conf_target" "estimate_mode" "avoid_reuse" "fee_rate" "verbose")
+    ("setban" "subnet" "command" "bantime" "absolute")
+    ("setlabel" "address" "label")
     ("setmocktime" "timestamp")
-    ;; Core's stop takes a wait (rpc/server.cpp:145); the functional
-    ;; framework's stop_node passes it by name on every node it shuts down.
+    ("setnetworkactive" "state")
+    ("setwalletflag" "flag" "value")
+    ("signmessage" "address" "message")
+    ("signmessagewithprivkey" "privkey" "message")
+    ("signrawtransactionwithkey" "hexstring" "privkeys" "prevtxs" "sighashtype")
+    ("signrawtransactionwithwallet" "hexstring" "prevtxs" "sighashtype")
+    ("simulaterawtransaction" "rawtxs" "options")
     ("stop" "wait")
     ("submitblock" "hexdata" "dummy")
+    ("submitheader" "hexdata")
+    ("submitpackage" "package" "maxfeerate" "maxburnamount")
+    ("syncwithvalidationinterfacequeue")
+    ("testmempoolaccept" "rawtxs" "maxfeerate")
+    ("unloadwallet" "wallet_name" "load_on_startup")
+    ("uptime")
+    ("utxoupdatepsbt" "psbt" "descriptors")
+    ("validateaddress" "address")
+    ("verifychain" "checklevel" "nblocks")
+    ("verifymessage" "address" "signature" "message")
     ("verifytxoutproof" "proof")
+    ("waitforblock" "blockhash" "timeout")
+    ("waitforblockheight" "height" "timeout")
     ("waitfornewblock" "timeout" "current_tip")
+    ("walletcreatefundedpsbt" "inputs" "outputs" "locktime" "options" "bip32derivs" "version")
+    ("walletdisplayaddress" "address")
+    ("walletlock")
+    ("walletpassphrase" "passphrase" "timeout")
+    ("walletpassphrasechange" "oldpassphrase" "newpassphrase")
+    ("walletprocesspsbt" "psbt" "sign" "sighashtype" "bip32derivs" "finalize")
     )
-  "Positional argument names for the RPC methods that accept named parameters,
-taken from Core's RPCHelpMan declarations. A name containing #\\| lists
-aliases for one slot, exactly as Core stores it (transformNamedArguments splits
-on '|', rpc/server.cpp:396) — getblock's \"verbosity|verbose\" is the case that
+  "Positional argument names for every RPC method Core declares, in declaration
+order — what transformNamedArguments (rpc/server.cpp:396) matches an incoming
+named parameter against. A name containing #\\| lists aliases for one slot,
+exactly as Core stores it; getblock's \"verbosity|verbose\" is the case that
 matters, since older clients send the second spelling.
 
-Core supports named parameters for EVERY method; this table covers the ones
-Core's own test framework and bitcoin-cli call, which is what track B P0 needs.
-A method absent from it answers Core's \"Unknown named parameter\" error, so the
-limitation is visible rather than silent.")
+GENERATED from Core's RPCHelpMan declarations by scripts/gen-rpc-arg-names.py,
+which walks src/rpc/*.cpp and src/wallet/rpc/*.cpp. Do not hand-edit: rerun the
+script against refs/bitcoin.
 
+It has to come from RPCHelpMan and not from client.cpp, which is where #458's
+type-conversion table comes from. client.cpp lists only arguments that need
+JSON CONVERSION, so it structurally omits every STRING argument. A named-parameter
+table derived from it is missing `scantxoutset action`, `setban subnet`,
+`addnode command`, and about a hundred more — and, worse, the positions of the
+arguments that ARE listed are Core's real positions, so a table built from it
+disagrees with itself about where an argument sits.
+
+The hand-curated 43-method predecessor is why this exists. MiniWallet — which a
+large share of Core's functional suite instantiates — opens with
+`scantxoutset(action=\"start\", ...)`, and `action` was not in the table, so
+the node answered \"Unknown named parameter action\" and the test died in
+setup. Found by running the suite, not by reading it.")
 
 (defun %named-arg-slot (name-spec key)
   "T when KEY names the slot NAME-SPEC, which may list aliases separated by
@@ -856,9 +995,14 @@ fixed pool; hunchentoot is thread-per-connection, so this caps the pool rather
 than sizing it — the observable behaviour, a bound on concurrent work, is the
 same.")
 
-(defvar *rpc-server-timeout* nil
-  "Seconds an idle RPC connection is held before it is closed, or NIL for
-hunchentoot's default (Core -rpcservertimeout, DEFAULT_HTTP_SERVER_TIMEOUT).")
+(defvar *rpc-server-timeout* 30
+  "Seconds an idle RPC connection is held before it is closed (Core
+-rpcservertimeout / DEFAULT_HTTP_SERVER_TIMEOUT = 30, httpserver.h:28). NIL
+means no timeout, which is what Core's -rpcservertimeout=0 asks for.
+
+Core's default is 30; hunchentoot's is 20, so leaving hunchentoot's in place
+was already off by a third. What actually mattered is that the option did not
+reach the acceptor at all — see START-RPC-SERVER.")
 
 (defvar *rpc-cookie-file* nil
   "Where the .cookie goes, or NIL for <datadir>/.cookie (Core -rpccookiefile,
@@ -1173,9 +1317,25 @@ must stay a value test (NIL = success), not a key-presence test."
         (rpc-json-error hunchentoot:+http-forbidden+ +rpc-misc-error+
                         "Origin does not match Host")))
 
-    ;; Check authentication
+    ;; Check authentication.
+    ;;
+    ;; The rate limiter lives inside the FAILURE branch, and that placement is
+    ;; the point. Core has no RPC rate limit at all: the port is authenticated
+    ;; and loopback-only by default, and a client that gets past both is a
+    ;; trusted administrator. Ours ran AFTER auth and throttled that
+    ;; administrator at 100 requests/second — which is fewer than one
+    ;; `wait_until` poll loop, so Core's functional framework answered its own
+    ;; polls with HTTP 429 and failed tests that had nothing to do with rates.
+    ;;
+    ;; What the limiter is actually for is the UNAUTHENTICATED side: bounding
+    ;; the work a stranger can make us do, and slowing credential guessing.
+    ;; That is preserved exactly, and it now composes with Core's 250ms
+    ;; brute-force pause rather than duplicating it a layer later.
     (let ((auth-header (hunchentoot:header-in :authorization request)))
       (unless (check-auth auth-header)
+        (unless (rpc-rate-limit-check)
+          (return-from rpc-handler
+            (rpc-json-error 429 +rpc-misc-error+ "Rate limit exceeded")))
         ;; Core deters brute-forcing with a 250ms pause, but only once a
         ;; credential has actually been offered: a request with no
         ;; Authorization header is answered immediately (httprpc.cpp:112-133).
@@ -1186,11 +1346,6 @@ must stay a value test (NIL = success), not a key-presence test."
         (setf (hunchentoot:return-code*) hunchentoot:+http-authorization-required+)
         (setf (hunchentoot:header-out :www-authenticate) "Basic realm=\"bitcoin-lisp\"")
         (return-from rpc-handler "")))
-
-    ;; Check rate limit
-    (unless (rpc-rate-limit-check)
-      (return-from rpc-handler
-        (rpc-json-error 429 +rpc-misc-error+ "Rate limit exceeded")))
 
     ;; Check body size limit: 32 MiB (Core evhttp_set_max_body_size(MAX_SIZE),
     ;; httpserver.cpp:410). libevent answers an oversized body with 400.
@@ -1524,6 +1679,24 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
                                     (make-instance
                                      'hunchentoot:one-thread-per-connection-taskmaster
                                      :max-thread-count *rpc-threads*)))
+                            ;; -rpcservertimeout, as INITARGS. This used to
+                            ;; SETF hunchentoot:*default-connection-timeout*
+                            ;; after the acceptor existed, and the special is
+                            ;; only ever read as the read-timeout/write-timeout
+                            ;; SLOT INITFORM — so the assignment reached
+                            ;; nothing and every RPC connection kept
+                            ;; hunchentoot's 20-second idle timeout.
+                            ;;
+                            ;; Core's functional framework writes
+                            ;; rpcservertimeout=99000 into every node's config
+                            ;; precisely so a connection survives a long wait.
+                            ;; With the option inert, connect_nodes' first
+                            ;; poll of the second node came ~50s after that
+                            ;; node's last RPC call and died on a broken pipe.
+                            ;; A dropped idle connection is invisible until a
+                            ;; client stops reconnecting.
+                            (list :read-timeout *rpc-server-timeout*
+                                  :write-timeout *rpc-server-timeout*)
                             ;; NOTHING to stderr. Hunchentoot defaults both
                             ;; logs there, so a node running normally dribbled
                             ;; an Apache-style access line per RPC call onto
@@ -1534,10 +1707,6 @@ overrides the asset directory (default: the repo's ui/, see ui.lisp)."
                             ;; requests only under -debug=http.
                             (list :access-log-destination nil
                                   :message-log-destination nil))))
-              ;; -rpcservertimeout: hunchentoot reads this special when it
-              ;; accepts, so binding it globally is what reaches the sockets.
-              (when *rpc-server-timeout*
-                (setf hunchentoot:*default-connection-timeout* *rpc-server-timeout*))
               (hunchentoot:start acceptor)
               (setf listening t)
 

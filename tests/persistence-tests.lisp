@@ -819,7 +819,35 @@ one unanswered for TIMEOUT_INTERVAL (20 min) disconnects the peer."
     ;; A pong clears the outstanding ping.
     (let ((peer (peer-with-ping 1)))
       (bitcoin-lisp.networking::handle-pong peer 7)
-      (is (null (bitcoin-lisp.networking::peer-ping-nonce peer))))))
+      (is (null (bitcoin-lisp.networking::peer-ping-nonce peer)))))
+  ;; A peer that has NEVER been pinged is due now, not in two minutes. Core
+  ;; encodes this as m_ping_start{0us} against an absolute clock, so
+  ;; `now > m_ping_start + PING_INTERVAL` holds on a fresh peer
+  ;; (net_processing.cpp:5508).
+  (let ((peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    (is (null (bitcoin-lisp.networking::peer-last-ping-time peer))
+        "a fresh peer must record NO ping, not a ping at time zero")
+    (is (eq :ping-sent (bitcoin-lisp.networking:check-peer-health peer)))
+    (is (bitcoin-lisp.networking::peer-ping-nonce peer))
+    ;; And having just pinged, it does not ping again.
+    (bitcoin-lisp.networking::handle-pong
+     peer (bitcoin-lisp.networking::peer-ping-nonce peer))
+    (is (eq :ok (bitcoin-lisp.networking:check-peer-health peer))))
+  ;; The positive control for the bug this replaced: the old code compared
+  ;; against a 0 initform on INTERNAL-REAL-TIME, whose zero is process start.
+  ;; Simulate a node less than PING-INTERVAL old by stamping the peer at
+  ;; internal time 0 — under the old rule that read as "pinged at boot, not due
+  ;; yet" and no ping went out for the node's first two minutes.
+  (let ((peer (bitcoin-lisp.networking:make-peer :state :ready)))
+    (setf (bitcoin-lisp.networking::peer-last-ping-time peer) 0)
+    (is (eq (if (> (get-internal-real-time)
+                   (* bitcoin-lisp.networking::+ping-interval-seconds+
+                      internal-time-units-per-second))
+                :ping-sent
+                :ok)
+            (bitcoin-lisp.networking:check-peer-health peer))
+        "a 0 last-ping-time must be read as a TIME, not as \"never\" — the two ~
+must stay distinguishable or the fix is indistinguishable from the bug")))
 
 ;;;; Misbehavior Tests (binary model — Bitcoin Core PRs #25325 / #26294)
 
