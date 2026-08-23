@@ -139,6 +139,8 @@ Returns T if message was handled, NIL otherwise."
     ((string= command "ping")
      (let ((nonce (flexi-streams:with-input-from-sequence (s payload)
                     (bitcoin-lisp.serialization:read-uint64-le s))))
+       (bitcoin-lisp:log-debug "ping from ~A: ~D payload bytes, nonce ~D"
+                               (peer-address peer) (length payload) nonce)
        (handle-ping peer nonce))
      t)
 

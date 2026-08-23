@@ -2084,6 +2084,52 @@ other half of the same rule."
     (is (equal "/tmp/dd/foo.log"
                (bitcoin-lisp::%resolve-log-file "foo.log" "/tmp/dd/")))))
 
+(test an-unknown-peer-height-does-not-break-the-sync-thread
+  "A peer's advertised start height is a SIGNED int32 whose \"unknown\" value
+is -1: Core's CNode::nStartingHeight initialises to -1, and Core's own
+P2PInterface test client sends -1 in every version message it builds.
+
+Two things read it as an unsigned height.
+
+START-IBD stored it in a (UNSIGNED-BYTE 32) slot, so -1 was a TYPE ERROR — on
+the sync thread, which unwinds the whole iteration before MAINTAIN-PEERS runs.
+Nothing is pumped, nothing is reaped, and the next iteration fails identically:
+one peer sending a legal value takes the sync loop down for as long as it stays
+connected. Observed as every p2p_* functional test timing out in
+sync_with_ping, because the node never answered a ping.
+
+CONSIDER-PEER-EVICTION read -1 as a height 1001 behind, so any node past height
+999 disconnected such peers on sight. Core has no height-based eviction at all;
+this rule is ours, and it has to mean what it says."
+  (let ((unknown (bitcoin-lisp.networking:make-peer :address "10.2.2.2" :state :ready
+                                                    :start-height -1))
+        (behind (bitcoin-lisp.networking:make-peer :address "10.2.2.3" :state :ready
+                                                   :start-height 5)))
+    ;; Unknown is not "behind", at any height of ours.
+    (is-false (bitcoin-lisp.networking::consider-peer-eviction unknown 100000)
+              "a peer advertising an unknown height was evicted as if it were behind")
+    ;; A peer that really is far behind still goes.
+    (is-true (bitcoin-lisp.networking::consider-peer-eviction behind 100000))
+    ;; ...and one that is only a little behind stays.
+    (is-false (bitcoin-lisp.networking::consider-peer-eviction behind 500)))
+  ;; The hazard is real: the slot is (UNSIGNED-BYTE 32), so a raw -1 signals.
+  ;; Asserted rather than assumed, because if the slot type ever widened this
+  ;; test would otherwise keep passing while testing nothing.
+  (let ((ctx (bitcoin-lisp.networking::make-ibd)))
+    (signals error
+      (setf (bitcoin-lisp.networking::ibd-context-target-height ctx) -1))
+    (finishes
+      (setf (bitcoin-lisp.networking::ibd-context-target-height ctx) 0)))
+  ;; And START-IBD clamps before it stores, so the sync thread never gets
+  ;; there. Driving START-IBD itself would need a whole node fixture; what
+  ;; matters is that the clamp is on the line that writes the slot.
+  (let ((src (with-open-file (in (merge-pathnames "src/networking/ibd.lisp"
+                                                  (asdf:system-source-directory :bitcoin-lisp)))
+               (let ((text (make-string (file-length in))))
+                 (subseq text 0 (read-sequence text in))))))
+    (is (search "(ibd-context-target-height *ibd-context*) (max 0 target-height)" src)
+        "start-ibd no longer clamps its target height")))
+
 (test the-sync-wait-shortens-when-we-are-behind
   "The sync loop's between-pass wait ends early on a NEW header announcement,
 which covers headers arriving DURING the wait. It did not cover the other

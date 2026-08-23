@@ -1947,7 +1947,23 @@ Returns the number of blocks downloaded. HISTORICAL-CHAINSTATE, when
 non-NIL, is the assumeutxo background-validation chainstate — run-ibd adds
 a second download cursor for its [tip .. snapshot-base] range."
   (setf *ibd-context* (make-ibd))
-  (setf (ibd-context-target-height *ibd-context*) target-height)
+  ;; TARGET-HEIGHT arrives as a peer's advertised start height, which is a
+  ;; SIGNED int32 on the wire and whose "unknown" value is -1 (Core's
+  ;; CNode::nStartingHeight initialises to -1, and its own P2PInterface test
+  ;; client sends -1 in every version message it constructs). The slot is
+  ;; (UNSIGNED-BYTE 32), so storing that raw is a type error — and it is raised
+  ;; on the SYNC THREAD, which unwinds the whole iteration before
+  ;; MAINTAIN-PEERS runs, so nothing is pumped, nothing is reaped, and the next
+  ;; iteration fails identically. One peer sending a legal value takes the
+  ;; node's sync loop down for as long as it stays connected.
+  ;;
+  ;; This is the same failure SHAPE the docstring of SYNC-BLOCKCHAIN records
+  ;; from a live incident — a type error on the sync thread that feeds itself,
+  ;; logged every five seconds for nineteen days. Clamped here rather than at
+  ;; the source because -1 is MEANINGFUL as a peer attribute: getpeerinfo
+  ;; reports it, and Core's is signed for exactly that reason. What must be
+  ;; non-negative is a download TARGET.
+  (setf (ibd-context-target-height *ibd-context*) (max 0 target-height))
   ;; Set adaptive timeout based on number of peers
   (setf (ibd-context-request-timeout *ibd-context*)
         (compute-block-download-timeout (length peers)))
