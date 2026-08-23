@@ -3578,11 +3578,39 @@ to move them (the node must be stopped)."
                                           (when (plusp (bitcoin-lisp.networking:ibd-context-headers-received pump))
                                             (return)))))
                               (t
-                               (log-warn "No peers available, reconnecting in 5s...")
-                               (loop repeat 5 while (node-running *node*)
-                                     do (sleep 1))
-                               (connect-to-peers *node* max-peers
-                                                 :timeout 30 :min-peers 1))))
+                               ;; No peers. Before waiting for one, connect
+                               ;; whatever is ALREADY on disk: after a -reindex
+                               ;; the whole chain can be indexed with the
+                               ;; chainstate still at genesis, and with
+                               ;; -connect=0 no peer will ever arrive to
+                               ;; trigger it. Core rebuilds entirely from disk
+                               ;; in that situation (ActivateBestChain runs
+                               ;; from startup, not only on an arriving block),
+                               ;; and an operator recovering a corrupted
+                               ;; chainstate offline is exactly who needs it.
+                               ;;
+                               ;; Cheap when there is nothing to do: it returns
+                               ;; immediately once the tip IS the most-work
+                               ;; candidate, which is the steady state.
+                               (let ((switched
+                                       (ignore-errors
+                                        (bitcoin-lisp.validation:activate-best-chain
+                                         (node-current-chainstate *node*)
+                                         (node-block-store *node*)
+                                         (bitcoin-lisp.storage:chain-state-coins-view
+                                          (node-current-chainstate *node*))
+                                         :tx-index (node-tx-index *node*)
+                                         :fee-estimator (node-fee-estimator *node*)
+                                         :mempool (node-mempool *node*)))))
+                                 (cond
+                                   (switched
+                                    (note-node-tip-progress *node*))
+                                   (t
+                                    (log-warn "No peers available, reconnecting in 5s...")
+                                    (loop repeat 5 while (node-running *node*)
+                                          do (sleep 1))
+                                    (connect-to-peers *node* max-peers
+                                                      :timeout 30 :min-peers 1)))))))
                               (error (c)
                                 ;; Transient iteration error: the backtrace was
                                 ;; already logged above (live stack). Log a
