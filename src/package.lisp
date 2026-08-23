@@ -195,6 +195,7 @@
    #:byte-reader
    #:make-byte-reader
    #:make-byte-reader-from
+   #:br-read-bitcoin-block
    #:br-data
    #:br-pos
    #:br-eof-p

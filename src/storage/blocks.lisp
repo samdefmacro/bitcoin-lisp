@@ -167,8 +167,17 @@ the record is missing, mis-framed, or unreadable."
                   (read-sequence payload in)
                   (obfuscate! payload (block-store-xor-key store)
                               :key-offset (flat-file-pos-pos pos))
-                  (flexi-streams:with-input-from-sequence (bs payload)
-                    (bitcoin-lisp.serialization:read-bitcoin-block bs)))))))))))
+                  ;; BR-READ-BITCOIN-BLOCK, not a flexi-stream: the payload is
+                  ;; already a byte vector, so wrapping it in a Gray stream
+                  ;; buys nothing and costs a generic-function dispatch per
+                  ;; read. Profiling an offline reindex put flexi-streams'
+                  ;; STREAM-READ-SEQUENCE at 6.4% of runtime with
+                  ;; CLASSOID-TYPEP and the PCL braid lambdas behind it — all
+                  ;; of it dispatch. The byte-reader existed and said "hot path
+                  ;; (per inbound block)" in its own docstring; the DISK path,
+                  ;; which reads every block during a reindex, never used it.
+                  (bitcoin-lisp.serialization:br-read-bitcoin-block
+                   (bitcoin-lisp.serialization:make-byte-reader-from payload)))))))))))
 
 (defun %store-file-info (store file)
   (or (gethash file (block-store-file-info store))
@@ -446,8 +455,10 @@ as absent, so none relies on the raise."
             (let ((data (make-array (file-length stream)
                                     :element-type '(unsigned-byte 8))))
               (read-sequence data stream)
-              (flexi-streams:with-input-from-sequence (in data)
-                (bitcoin-lisp.serialization:read-bitcoin-block in))))
+              ;; Byte-reader, not a Gray stream — see the note on the flat-file
+              ;; read above. This is the legacy per-block file path.
+              (bitcoin-lisp.serialization:br-read-bitcoin-block
+               (bitcoin-lisp.serialization:make-byte-reader-from data))))
         (error (e)
           (bitcoin-lisp:log-warn
            "CORRUPT BLOCK file for ~A (~A) — pruning for re-download"
