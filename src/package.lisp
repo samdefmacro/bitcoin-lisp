@@ -362,6 +362,7 @@
    #:coinbase-input-p
    #:get-unix-time
    #:get-real-unix-time
+   #:get-node-time
    #:*mock-time*
    #:+universal-unix-epoch-offset+
    #:read-net-addr

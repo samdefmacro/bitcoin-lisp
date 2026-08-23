@@ -386,7 +386,7 @@ start-node via automatic-inbound-capacity; the default is Core's 125 - 11.")
   ;; node-peers stays single-writer (only the sync thread pushes to it).
   (pending-onetry '() :type list)
   ;; Durable at-tip liveness signal (item #6). last-tip-advance-time is the
-  ;; wall-clock (get-universal-time) of the last observed active-chain tip
+  ;; node clock (get-node-time, so setmocktime reaches it) of the last observed active-chain tip
   ;; advance; last-tip-height is the tip height at that observation. Unlike the
   ;; ibd-context copy (nil between sync passes), these persist so the
   ;; /rest/health probe can tell a live, progressing node from a wedged one
@@ -480,7 +480,7 @@ counterpart to note-tip-advanced's ephemeral ibd-context slot."
          (h (and cs (bitcoin-lisp.storage:current-height cs))))
     (when (and (integerp h) (> h (node-last-tip-height node)))
       (setf (node-last-tip-height node) h
-            (node-last-tip-advance-time node) (get-universal-time)))))
+            (node-last-tip-advance-time node) (bitcoin-lisp.serialization:get-node-time)))))
 
 (defun health-ok-p (sync-thread-alive-p seconds-since-tip
                     &optional (threshold *health-max-tip-staleness-seconds*))
@@ -506,7 +506,7 @@ Kept free of node state so it is directly unit-testable."
                      t))
          (last (node-last-tip-advance-time node))
          (seconds (if (plusp last)
-                      (max 0 (- (get-universal-time) last))
+                      (max 0 (- (bitcoin-lisp.serialization:get-node-time) last))
                       most-positive-fixnum))
          (synced (not bitcoin-lisp.networking::*cached-is-ibd*)))
     (values (health-ok-p alive seconds) seconds synced)))
@@ -3402,7 +3402,7 @@ to move them (the node must be stopped)."
     ;; block. last-tip-height starts at the current tip so only genuine advances
     ;; bump the timestamp.
     (let ((cs (node-current-chainstate *node*)))
-      (setf (node-last-tip-advance-time *node*) (get-universal-time)
+      (setf (node-last-tip-advance-time *node*) (bitcoin-lisp.serialization:get-node-time)
             (node-last-tip-height *node*)
             (if cs (bitcoin-lisp.storage:current-height cs) 0)))
     (setf (node-sync-thread *node*)
@@ -4003,7 +4003,7 @@ a pointer that disagree."
         (log-memory-snapshot "pre-flush-critical")
         (%flush-chainstate chainstate)
         (setf *blocks-since-flush* 0
-              *last-flush-universal-time* (get-universal-time))
+              *last-flush-universal-time* (bitcoin-lisp.serialization:get-node-time))
         t))))
 
 (defun chainstate-coins-cache-budget (chainstate)
@@ -4076,8 +4076,12 @@ at +min-disk-space-for-block-files+ (550 MiB, validation.h:87)."
   "Counter incremented per connected block; reset to 0 when a flush runs.")
 
 (defvar *last-flush-universal-time* 0
-  "Wall-clock time (get-universal-time) of the last successful periodic
-   flush. Used by the time-based trigger.")
+  "Node-clock time (GET-NODE-TIME) of the last successful periodic flush. Used
+   by the time-based trigger.
+
+   Mockable on purpose: Core reads NodeClock::now() for the PERIODIC flush
+   decision (validation.cpp:2759,2765) and SteadyClock only for the durations
+   it logs (:2301,2382).")
 
 (defun log-memory-snapshot (label)
   "Log a snapshot of the major in-memory caches plus SBCL heap usage.
@@ -4232,7 +4236,7 @@ time we measure (the same pattern as Bitcoin Core's CCoinsViewCache::Flush
 returning bytes freed to the system allocator), and log memory snapshots."
   (log-memory-snapshot "pre-flush")
   (%flush-chainstate chainstate)
-  (setf *last-flush-universal-time* (get-universal-time)
+  (setf *last-flush-universal-time* (bitcoin-lisp.serialization:get-node-time)
         *blocks-since-flush* 0)
   #+sbcl (sb-ext:gc :full t)
   (log-memory-snapshot "post-flush"))
@@ -4258,9 +4262,9 @@ durable if it does flush (atomic temp+fsync+rename inside save-*)."
          (view (and cs (bitcoin-lisp.storage:chain-state-coins-view cs))))
     (incf *blocks-since-flush*)
     (when (zerop *last-flush-universal-time*)
-      (setf *last-flush-universal-time* (get-universal-time)))
+      (setf *last-flush-universal-time* (bitcoin-lisp.serialization:get-node-time)))
     (when (or (>= *blocks-since-flush* +flush-every-n-blocks+)
-              (>= (- (get-universal-time) *last-flush-universal-time*)
+              (>= (- (bitcoin-lisp.serialization:get-node-time) *last-flush-universal-time*)
                   +flush-every-n-seconds+)
               ;; Size trigger (Bitcoin Core dbcache): flush once the coins cache
               ;; reaches its memory budget, so it can't grow unbounded between the
@@ -4280,7 +4284,7 @@ durable if it does flush (atomic temp+fsync+rename inside save-*)."
       (dolist (other (node-chainstates *node*))
         (unless (eq other cs)
           (%flush-chainstate other)))
-      (setf *last-flush-universal-time* (get-universal-time)
+      (setf *last-flush-universal-time* (bitcoin-lisp.serialization:get-node-time)
             *blocks-since-flush* 0)
       #+sbcl (sb-ext:gc :full t)
       (log-memory-snapshot "post-flush"))))
@@ -5374,7 +5378,7 @@ growth and silence the rotation."
   "Core PeerManagerImpl::TipMayBeStale (net_processing.cpp:1332): our tip has
 not advanced in +STALE-TIP-AGE-SECONDS+ and no block is in flight from anyone.
 
-The elapsed time is computed as a DIFFERENCE within get-universal-time, never
+The elapsed time is computed as a DIFFERENCE within get-node-time, never
 by converting an epoch. node-last-tip-advance-time is universal time while
 every other timer in this subsystem is unix seconds, and the plan records a
 ~2.2e9-second error from feeding one clock's value to the other. A difference
@@ -5385,9 +5389,9 @@ Core does for m_last_tip_update == 0 — otherwise every node would declare
 itself eclipsed the moment it started."
   (let ((last (node-last-tip-advance-time node)))
     (cond ((not (plusp last))
-           (setf (node-last-tip-advance-time node) (get-universal-time))
+           (setf (node-last-tip-advance-time node) (bitcoin-lisp.serialization:get-node-time))
            nil)
-          (t (and (> (- (get-universal-time) last) +stale-tip-age-seconds+)
+          (t (and (> (- (bitcoin-lisp.serialization:get-node-time) last) +stale-tip-age-seconds+)
                   (not (bitcoin-lisp.networking:any-blocks-in-flight-p)))))))
 
 (defun check-for-stale-tip (node now)
@@ -5414,7 +5418,7 @@ fetching from calling its own tip stale."
            (unless *try-new-outbound-peer*
              (log-info "Potential stale tip detected (no advance in ~Ds); \
 allowing one extra outbound peer"
-                       (- (get-universal-time) (node-last-tip-advance-time node))))
+                       (- (bitcoin-lisp.serialization:get-node-time) (node-last-tip-advance-time node))))
            (setf *try-new-outbound-peer* t))
           (*try-new-outbound-peer*
            (log-info "Tip is advancing again; releasing the extra outbound slot")
@@ -5646,7 +5650,7 @@ Core's min(8, total): it is an operator knob here (run-node.sh sets 16)."
   "Minimum spacing between feeler probes (Core FEELER_INTERVAL averages ~2 min).")
 
 (defvar *last-feeler-time* 0
-  "get-universal-time of the last feeler attempt, for rate-limiting.")
+  "GET-NODE-TIME of the last feeler attempt, for rate-limiting.")
 
 (defun peers-of-conn-type (node type)
   "Count current peers whose connection type is TYPE."
@@ -5715,7 +5719,7 @@ before resolve-tried-collisions may evict it — and only otherwise validates a
 'new' address into 'tried'. An incumbent we are already connected to needs no
 probe: mark it good, which resolves the collision in its favour, and spend the
 feeler on the new table instead."
-  (let ((now (get-universal-time)))
+  (let ((now (bitcoin-lisp.serialization:get-node-time)))
     (when (and (node-network-active node) (node-address-book node)
                (addrman-outgoing-enabled-p)
                (>= (- now *last-feeler-time*) +feeler-interval-seconds+))

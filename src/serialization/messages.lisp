@@ -199,6 +199,38 @@ GetUptime uses SteadyClock rather than the mockable GetTime
 (Core GetTime, util/time.cpp)."
   (or *mock-time* (get-real-unix-time)))
 
+(defun get-node-time ()
+  "Current CL universal time, or the mocked one when setmocktime is in effect.
+
+The universal-time counterpart of GET-UNIX-TIME, and the node clock of record
+for anything that makes a decision about wall-clock time: peer inactivity, ban
+expiry, stale-tip detection, feeler cadence, the getheaders throttle, the
+periodic chainstate flush.
+
+Core splits the same way and the split is the whole point. `NodeClock`
+(util/time.h:19) returns the mock when one is set; `SteadyClock` (:27) never
+does. So `FlushStateToDisk` reads `NodeClock::now()` for the PERIODIC decision
+(validation.cpp:2759,2765) but `SteadyClock::now()` for the durations it logs
+(:2301,2382); `m_last_getheaders_timestamp` is a `NodeClock::time_point`
+(net_processing.cpp:401); and `GetUptime` deliberately uses SteadyClock.
+
+Three classes stay on the raw clock here, each for Core's own reason:
+
+- entropy seeding — a mocked clock is a PREDICTABLE seed;
+- anti-hang watchdogs (the stuck-tip halt, the no-progress yield, the disk
+  sampler) — they measure real elapsed time, and a clock jumped forward by a
+  test would fire them spuriously;
+- durations that are only logged, plus the GBT longpoll deadline, which Core
+  likewise runs off `steady_clock` (rpc/mining.cpp).
+
+The window in which this matters is exactly the functional test suite: the
+framework drives time with setmocktime rather than sleeping
+(test_framework.py:810), so a site left on the raw clock is a site no test can
+reach."
+  (if *mock-time*
+      (+ *mock-time* +universal-unix-epoch-offset+)
+      (get-universal-time)))
+
 ;;;; Version message
 
 (defconstant +protocol-version+ 70016)

@@ -2238,6 +2238,76 @@ freeze every node that ran setmocktime 0 at 1970."
     (is (= (bitcoin-lisp.serialization:get-unix-time)
            (bitcoin-lisp.serialization:get-real-unix-time)))))
 
+(test setmocktime-reaches-the-node-clock
+  "setmocktime is only worth having if the decisions it exists to control
+actually read the mocked clock. Ours mocked GET-UNIX-TIME while 49 sites read
+CL:GET-UNIVERSAL-TIME directly, so the RPC moved a clock almost nothing
+consulted — and the functional framework drives time with setmocktime instead
+of sleeping (test_framework.py:810), which makes an unreached site a site no
+Core test can exercise.
+
+GET-NODE-TIME is the universal-time counterpart, and it is what the
+wall-clock decisions now read. Ban expiry is the check here because it is the
+one a test can drive end to end: ban, jump the clock past the expiry, observe
+the ban gone — no sleeping, exactly as rpc_setban.py does it."
+  (let ((bitcoin-lisp.serialization:*mock-time* nil))
+    ;; The offset arithmetic, in both directions.
+    (is (= (bitcoin-lisp.serialization:get-node-time)
+           (+ (bitcoin-lisp.serialization:get-unix-time)
+              bitcoin-lisp.serialization:+universal-unix-epoch-offset+)))
+    (let ((bitcoin-lisp.serialization:*mock-time* 1700000000))
+      (is (= (+ 1700000000 bitcoin-lisp.serialization:+universal-unix-epoch-offset+)
+             (bitcoin-lisp.serialization:get-node-time)))))
+  ;; And the decision itself moves with it.
+  (bitcoin-lisp.networking::clear-ban-list)
+  (unwind-protect
+       (let ((bitcoin-lisp.serialization:*mock-time* 1700000000))
+         (bitcoin-lisp.networking::ban-address "203.0.113.7" 3600)
+         (is-true (bitcoin-lisp.networking::peer-banned-p "203.0.113.7")
+                  "the ban did not take under a mocked clock")
+         (is (= 1 (length (bitcoin-lisp.networking::list-bans))))
+         ;; Core's tests never sleep an hour; they move the clock.
+         (let ((bitcoin-lisp.serialization:*mock-time* (+ 1700000000 3601)))
+           (is-false (bitcoin-lisp.networking::peer-banned-p "203.0.113.7")
+                     "the ban outlived its expiry when the clock was moved past it")
+           (is (= 0 (length (bitcoin-lisp.networking::list-bans))))))
+    (bitcoin-lisp.networking::clear-ban-list)))
+
+(test the-node-clock-split-matches-cores
+  "Core splits its clocks and the split is the point: NodeClock returns the
+mock, SteadyClock never does (util/time.h:19,27), and the setmocktime RPC sets
+only g_mock_time (rpc/node.cpp:69 -> util/time.cpp:46).
+
+Guard both halves. The subsystems Core reads off NodeClock must not go back to
+the raw clock, and the three classes that must NOT be mockable must not drift
+onto the node clock:
+
+  - entropy seeding — a mocked clock is a predictable seed;
+  - the anti-hang watchdogs — they measure real elapsed time, and a clock a
+    test jumped forward would fire them spuriously;
+  - the fee-estimates file age — Core compares against
+    fs::file_time_type::clock::now() (block_policy_estimator.cpp:1078-1083),
+    the FILESYSTEM clock, and mixing a mocked now with a real mtime computes
+    a nonsense age."
+  (flet ((src (relative)
+           (with-open-file (in (merge-pathnames relative
+                                                (asdf:system-source-directory :bitcoin-lisp)))
+             (let ((text (make-string (file-length in))))
+               (subseq text 0 (read-sequence text in))))))
+    ;; Mockable: nothing in the ban/connection-activity path reads the raw clock.
+    (dolist (file '("src/networking/peer.lisp" "src/networking/connection.lisp"))
+      (is (not (search "(get-universal-time)" (src file)))
+          "~A went back to the raw clock" file))
+    ;; Not mockable: these three keep it.
+    (is (search "(get-universal-time)" (src "src/mempool/fee-estimator.lisp"))
+        "the fee-estimates file age moved onto the mocked clock; its mtime did not")
+    (let ((node (src "src/node.lisp")))
+      (is (search "(ash (get-universal-time) 32)" node)
+          "RNG seeding moved onto the mocked clock, making the seed predictable"))
+    (let ((ibd (src "src/networking/ibd.lisp")))
+      (is (search "(get-universal-time)" ibd)
+          "the IBD anti-hang watchdogs moved onto the mocked clock"))))
+
 (test setmocktime-range-and-type-are-corecs
   "Core rejects a negative or over-large timestamp with an exact message built
 from max_time = Ticks<seconds>(nanoseconds::max()) (rpc/node.cpp:63-69)."

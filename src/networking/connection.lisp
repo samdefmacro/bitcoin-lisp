@@ -272,7 +272,7 @@ the right proxy transparently."
                          :host host
                          :port port
                          :connected t
-                         :last-activity (get-universal-time)))
+                         :last-activity (bitcoin-lisp.serialization:get-node-time)))
       (usocket:socket-error (e)
         (declare (ignore e))
         nil)
@@ -313,7 +313,7 @@ error. The timeout lets the accept loop poll a shutdown flag between waits."
                                :host host
                                :port 0
                                :connected t
-                               :last-activity (get-universal-time))))))
+                               :last-activity (bitcoin-lisp.serialization:get-node-time))))))
     (error () nil)))
 
 (defun close-connection (conn)
@@ -399,8 +399,8 @@ full write through the stream."
   (incf (connection-bytes-sent conn) n)
   (incf *total-bytes-sent* n)
   (%record-outbound-cycle-bytes n)
-  (setf (connection-last-activity conn) (get-universal-time)
-        (connection-last-send-time conn) (get-universal-time)
+  (setf (connection-last-activity conn) (bitcoin-lisp.serialization:get-node-time)
+        (connection-last-send-time conn) (bitcoin-lisp.serialization:get-node-time)
         (connection-last-send-progress conn) (get-internal-real-time)))
 
 (defun %flush-send-queue-locked (conn)
@@ -778,8 +778,8 @@ healthy peers whenever a pump cycle ran long."
              ;; Read finished: clear the accumulator so the next one starts
              ;; clean. RECV-HEADER belongs to the caller's framing and is
              ;; cleared there, so %END-RECEIVE is not what we want here.
-             (setf (connection-last-activity conn) (get-universal-time)
-                   (connection-last-recv-time conn) (get-universal-time)
+             (setf (connection-last-activity conn) (bitcoin-lisp.serialization:get-node-time)
+                   (connection-last-recv-time conn) (bitcoin-lisp.serialization:get-node-time)
                    (connection-recv-buffer conn) nil
                    (connection-recv-filled conn) 0)
              buffer)
