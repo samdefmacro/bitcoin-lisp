@@ -2332,6 +2332,22 @@ from connect-block on every ACTIVE-chainstate tip advance; a background
 thread runs stop-node (which joins the sync thread — usually the caller here),
 and the clean exit code stops the supervisor from respawning straight back
 into the same trigger."
+  ;; Under -debug=net, say WHICH guard declined when the height has been
+  ;; reached. #478 wired this into the activation-step loop and a benchmark
+  ;; reindex then ran straight past -stopatheight=134000 to 134898. The seam is
+  ;; connected — ACTIVATION-STEPS-REPORT-THE-NEW-TIP-TO-STOPATHEIGHT proves
+  ;; activate-best-chain calls this with the height it reached — so the refusal
+  ;; is one of the guards below, and nothing on the outside can tell which.
+  (when (and (plusp *stop-at-height*)
+             (>= height *stop-at-height*)
+             (or *stop-at-height-triggered*
+                 (null *node*)
+                 (not (node-running *node*))))
+    (log-debug "stopatheight ~D reached at height ~D but not acted on: ~A"
+               *stop-at-height* height
+               (cond (*stop-at-height-triggered* "already triggered")
+                     ((null *node*) "no *node*")
+                     (t "node not running"))))
   (when (and (plusp *stop-at-height*)
              (>= height *stop-at-height*)
              (not *stop-at-height-triggered*)
