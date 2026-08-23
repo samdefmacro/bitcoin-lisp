@@ -2016,6 +2016,30 @@ this a real oracle: the day Core adds an argument, this test notices."
                               (push row json))))))))))
     (values (nreverse json) (nreverse strings))))
 
+(test the-sync-wait-shortens-when-we-are-behind
+  "The sync loop's between-pass wait ends early on a NEW header announcement,
+which covers headers arriving DURING the wait. It did not cover the other
+order: headers ingested during the sync pass itself, where there is known work
+and nobody left to announce it — so the retry sat out the full 30 seconds.
+
+Measured on two regtest nodes, five blocks, one announcement: 40 seconds to
+converge, of which ~24 were this wait; 25 seconds after the change. Core's
+tests allow 60 seconds for a full sync, so that one wait alone put most
+multi-node tests on the edge.
+
+*HIGHEST-HEADER-SEEN* is what makes it answerable at all: the IBD context is
+per-pass and gone by the time the wait starts, so the header tip has to outlive
+it. Monotone, and a hint only — it shortens a wait and decides nothing about
+the chain."
+  (is (= 5 bitcoin-lisp::+behind-retry-seconds+)
+      "the bound is what keeps an unservable chain from spinning; it is not a poll interval")
+  (is (< bitcoin-lisp::+behind-retry-seconds+ 30)
+      "a bound at or above the wait itself would make the whole thing inert")
+  ;; Monotone: a lower header tip from a later pass must not lower it.
+  (let ((bitcoin-lisp.networking:*highest-header-seen* 0))
+    (setf bitcoin-lisp.networking:*highest-header-seen* 900)
+    (is (= 900 bitcoin-lisp.networking:*highest-header-seen*))))
+
 (test manual-peers-report-connection-type-manual
   "ConnectionType::MANUAL is a first-class member of Core's enum
 (node/connection_types.cpp:13), so an addnode peer's getpeerinfo

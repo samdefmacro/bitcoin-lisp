@@ -329,6 +329,14 @@ shape in net_processing.cpp:1368."
         (>= (bitcoin-lisp.storage:block-index-entry-chain-work a)
             (bitcoin-lisp.storage:block-index-entry-chain-work b)))))
 
+(defvar *highest-header-seen* 0
+  "Highest block height we have ever held a header for, across sync passes.
+
+The IBD context is created per pass, so its header-tip-height is gone by the
+time the sync loop settles into its between-pass wait — which is exactly when
+knowing whether we are BEHIND is worth something. A hint only: it shortens the
+wait, and decides nothing about the chain.")
+
 (defun process-block-availability (peer chain-state)
   "Resolve PEER's hash-last-unknown-block to a chain-state entry if we
 now have one for it. Promotes to best-known-block-hash when the staged
@@ -961,6 +969,13 @@ Returns the number of new headers added."
                      (when (and *ibd-context*
                                 (> new-work (ibd-context-best-header-work *ibd-context*)))
                        (setf (ibd-context-best-header-work *ibd-context*) new-work)))))))))))
+    ;; Highest header seen, kept OUTSIDE the IBD context too. The context is
+    ;; per-sync-pass; this survives it, so the sync loop's between-pass wait can
+    ;; tell "at the tip, nothing to do" from "behind, waiting for no reason".
+    ;; Monotone, and only ever a hint: the wait uses it to shorten itself, never
+    ;; to decide anything about the chain.
+    (when (> best-header-height *highest-header-seen*)
+      (setf *highest-header-seen* best-header-height))
     ;; Update header tip in IBD context (not the chain-state best-height)
     (when *ibd-context*
       (setf (ibd-context-header-tip-height *ibd-context*) best-header-height)
@@ -1074,6 +1089,19 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
               (<= (bitcoin-lisp.storage:block-index-entry-chain-work best-known) tip-work)
               (< (bitcoin-lisp.storage:block-index-entry-chain-work best-known)
                  (bitcoin-lisp:minimum-chain-work bitcoin-lisp:*network*)))
+      ;; Under -debug=net, say WHICH gate closed. "gate open, nothing servable"
+      ;; is the download loop's only symptom when this walk declines for every
+      ;; peer, and it names none of the reasons — so diagnosing a node that can
+      ;; see a heavier chain and does not fetch it starts from nothing.
+      (bitcoin-lisp:log-debug
+       "no-download ~A: ~A (best-known ~:[none~;h=~:*~D~], tip h=~D)"
+       (peer-address peer)
+       (cond ((null best-known) "peer availability unknown")
+             ((<= (bitcoin-lisp.storage:block-index-entry-chain-work best-known) tip-work)
+              "peer chain not heavier than our tip")
+             (t "peer chain below minimum chain work"))
+       (and best-known (bitcoin-lisp.storage:block-index-entry-height best-known))
+       (if tip-entry (bitcoin-lisp.storage:block-index-entry-height tip-entry) -1))
       (return-from find-blocks-to-download-for-peer nil))
     ;; last-common = fork point between the peer's chain and ours, unless the
     ;; cached cursor is still a >=work ancestor of the peer's best block.
@@ -1092,6 +1120,10 @@ LAST-COMMON-BLOCK-HASH cursor over blocks already on disk / on our active chain.
             (bitcoin-lisp.storage:block-index-entry-hash last-common))
       (when (equalp (bitcoin-lisp.storage:block-index-entry-hash last-common)
                     (bitcoin-lisp.storage:block-index-entry-hash best-known))
+        (bitcoin-lisp:log-debug
+         "no-download ~A: cursor is already at the peer's best block (h=~D)"
+         (peer-address peer)
+         (bitcoin-lisp.storage:block-index-entry-height best-known))
         (return-from find-blocks-to-download-for-peer nil))
       (let* ((lc-hash (bitcoin-lisp.storage:block-index-entry-hash last-common))
              (window-end (+ (bitcoin-lisp.storage:block-index-entry-height last-common)

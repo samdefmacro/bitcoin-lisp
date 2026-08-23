@@ -3493,7 +3493,8 @@ to move them (the node must be stopped)."
                                ;; Periodic peers.dat dump (Core DumpAddresses
                                ;; every 15 min); cadence-gated inside.
                                (maybe-dump-peer-addresses *node*)
-                               (loop repeat 30 while (node-running *node*)
+                               (loop for second from 1 to 30
+                                     while (node-running *node*)
                                      do (sleep 1)
                                         ;; Retry buffered unsent bytes on
                                         ;; every peer (non-blocking) — the
@@ -3596,6 +3597,35 @@ to move them (the node must be stopped)."
                                           ;; second (item #6 durable liveness).
                                           (note-node-tip-progress *node*)
                                           (when (plusp (bitcoin-lisp.networking:ibd-context-headers-received pump))
+                                            (return))
+                                          ;; BEHIND: we hold headers above our
+                                          ;; own tip, so there is known work.
+                                          ;; Sitting out the rest of the 30s
+                                          ;; poll here is pure latency — the
+                                          ;; headers arrived during the sync
+                                          ;; pass, not during this wait, so
+                                          ;; the new-headers exit above never
+                                          ;; fires and the retry waits a full
+                                          ;; cycle.
+                                          ;;
+                                          ;; Measured: two regtest nodes, five
+                                          ;; blocks, one announcement — 40
+                                          ;; seconds to converge, of which ~24
+                                          ;; were this wait. Core's tests allow
+                                          ;; 60s for a full sync, so that alone
+                                          ;; puts most multi-node tests on the
+                                          ;; edge.
+                                          ;;
+                                          ;; Bounded rather than immediate:
+                                          ;; leave only after +BEHIND-RETRY-
+                                          ;; SECONDS+ so a chain no peer can
+                                          ;; serve retries on a timer instead
+                                          ;; of spinning. That case is real —
+                                          ;; it is what the download loop's own
+                                          ;; no-progress yield exists for.
+                                          (when (and (>= second +behind-retry-seconds+)
+                                                     (> bitcoin-lisp.networking:*highest-header-seen*
+                                                        (bitcoin-lisp.storage:current-height cs)))
                                             (return)))))
                               (t
                                ;; No peers. Before waiting for one, connect
@@ -5558,6 +5588,17 @@ bare IPv6 address (which contains colons) is treated as host-only."
                   (= colon (position #\: spec)))
              (values (subseq spec 0 colon) (parse-integer spec :start (1+ colon)))
              (values spec default-port)))))))
+
+(defconstant +behind-retry-seconds+ 5
+  "Seconds the sync loop's between-pass wait runs before giving up on the rest
+of its 30-second cycle WHEN we hold headers above our own tip.
+
+Not a poll interval — the wait already ends immediately on a new header
+announcement. This covers the other order: headers that arrived during the sync
+pass itself, where there is known work and nobody left to announce it. Bounded
+rather than immediate so a chain no peer will serve retries on a timer instead
+of spinning, which is the same reason the download loop has a no-progress
+yield.")
 
 (defun peer-connected-to-host-p (node host)
   "T if a peer at address HOST is currently in the node's peer list, ignoring

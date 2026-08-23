@@ -1302,6 +1302,7 @@
    ;; Steady-state message pump (post-IBD receive loop)
    #:pump-peer-messages
    #:ibd-context-headers-received
+   #:*highest-header-seen*
    ;; Trickled tx announcement flushing
    #:flush-tx-announcements
    ;; Local-submission broadcast (unbroadcast set)
