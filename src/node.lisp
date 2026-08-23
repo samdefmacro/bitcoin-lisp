@@ -2467,6 +2467,52 @@ Called from the sync loop; also runs unconditionally at shutdown."
           (log-warn "Periodic peers.dat dump failed: ~A" e)))
       t)))
 
+(defun %ensure-genesis-index-entry (network)
+  "Put NETWORK's genesis into the block index, with a correct header (the
+difficulty walk-back on testnet needs it).
+
+Must run BEFORE -reindex. REINDEX-BLOCK-INDEX links each record to a parent
+already in the index and parks the rest, so the index needs a ROOT or the drain
+never starts: on a datadir with no existing index every record parks and
+nothing is ever added. That is exactly what happened against a real Core
+testnet4 datadir — 134,923 records read, 134,923 orphaned, 0 linked — and it
+went unnoticed because reindexing a datadir that ALREADY has an index (the only
+case ever exercised) has genesis for a root."
+  (let* ((genesis-hash (bitcoin-lisp.storage:network-genesis-hash network))
+         (genesis-entry (bitcoin-lisp.storage:get-block-index-entry
+                         (node-chain-state *node*) genesis-hash))
+         (genesis-header (make-genesis-header network)))
+    (if genesis-entry
+        ;; Fix existing entry if it has a missing or zeroed header, or a
+        ;; persisted header with the wrong merkle root (the old shared-constant
+        ;; make-genesis-header gave testnet4 mainnet's merkle root, and header
+        ;; indexes saved before the fix still carry it).
+        (let ((h (bitcoin-lisp.storage:block-index-entry-header genesis-entry)))
+          (when (or (null h)
+                    (zerop (bitcoin-lisp.serialization:block-header-bits h))
+                    (not (equalp (bitcoin-lisp.serialization:block-header-merkle-root h)
+                                 (bitcoin-lisp.serialization:block-header-merkle-root
+                                  genesis-header))))
+            (setf (bitcoin-lisp.storage:block-index-entry-header genesis-entry)
+                  genesis-header)
+            ;; This REPLACES a header object on an entry that already exists,
+            ;; the one mutation the packed change-detector behind the header
+            ;; index delta log cannot see (it tracks presence, not identity).
+            ;; Force a full snapshot so the corrected genesis actually lands.
+            (bitcoin-lisp.storage:save-header-index
+             (node-chain-state *node*) :force-full t)))
+        ;; Create new genesis entry
+        (bitcoin-lisp.storage:add-block-index-entry
+         (node-chain-state *node*)
+         (bitcoin-lisp.storage:make-block-index-entry
+          :hash genesis-hash
+          :height 0
+          :header genesis-header
+          :prev-entry nil
+          :chain-work 0
+          :status :valid
+          :tx-count 1)))))   ; genesis carries exactly its coinbase
+
 (defun start-node (&key (data-directory "~/.bitcoin-lisp/")
                         (network :testnet3)
                         (log-level :info)
@@ -3010,6 +3056,11 @@ to move them (the node must be stopped)."
       ;; No file at all — a legitimate first run.
       (t nil)))
 
+  ;; Genesis FIRST: the reindex below links each record to a parent already in
+  ;; the index, so without a root the drain never starts and every record is
+  ;; orphaned. See %ENSURE-GENESIS-INDEX-ENTRY.
+  (%ensure-genesis-index-entry network)
+
   ;; -reindex: rebuild the block index from the block files before anything
   ;; reads it. Runs AFTER the header index load so an intact index is simply
   ;; extended rather than discarded — reindexing is additive, and a node that
@@ -3037,42 +3088,7 @@ to move them (the node must be stopped)."
       (when (plusp files)
         (log-info "Block file accounting: ~D flat block file~:P" files))))
 
-  ;; Ensure genesis block is in the index with a proper header
-  ;; (needed for difficulty walk-back on testnet)
-  (let* ((genesis-hash (bitcoin-lisp.storage:network-genesis-hash network))
-         (genesis-entry (bitcoin-lisp.storage:get-block-index-entry
-                         (node-chain-state *node*) genesis-hash))
-         (genesis-header (make-genesis-header network)))
-    (if genesis-entry
-        ;; Fix existing entry if it has a missing or zeroed header, or a
-        ;; persisted header with the wrong merkle root (the old shared-constant
-        ;; make-genesis-header gave testnet4 mainnet's merkle root, and header
-        ;; indexes saved before the fix still carry it).
-        (let ((h (bitcoin-lisp.storage:block-index-entry-header genesis-entry)))
-          (when (or (null h)
-                    (zerop (bitcoin-lisp.serialization:block-header-bits h))
-                    (not (equalp (bitcoin-lisp.serialization:block-header-merkle-root h)
-                                 (bitcoin-lisp.serialization:block-header-merkle-root
-                                  genesis-header))))
-            (setf (bitcoin-lisp.storage:block-index-entry-header genesis-entry)
-                  genesis-header)
-            ;; This REPLACES a header object on an entry that already exists,
-            ;; the one mutation the packed change-detector behind the header
-            ;; index delta log cannot see (it tracks presence, not identity).
-            ;; Force a full snapshot so the corrected genesis actually lands.
-            (bitcoin-lisp.storage:save-header-index
-             (node-chain-state *node*) :force-full t)))
-        ;; Create new genesis entry
-        (bitcoin-lisp.storage:add-block-index-entry
-         (node-chain-state *node*)
-         (bitcoin-lisp.storage:make-block-index-entry
-          :hash genesis-hash
-          :height 0
-          :header genesis-header
-          :prev-entry nil
-          :chain-work 0
-          :status :valid
-          :tx-count 1))))   ; genesis carries exactly its coinbase
+
 
   ;; Snapshot chainstate startup handling (Core LoadChainstate ordering,
   ;; node/chainstate.cpp:151-238). -reindex-chainstate deletes a snapshot
