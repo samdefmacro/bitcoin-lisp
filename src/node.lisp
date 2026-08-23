@@ -2717,8 +2717,18 @@ txindex ~D MiB, per-index ~D MiB"
   ;; init-node, which opens the databases: nothing below coordinates with an
   ;; open LevelDB handle, and moving a directory out from under one is how a
   ;; datadir gets corrupted rather than migrated.
+  ;; The per-NETWORK directory, not the base one. Core's layout lives under
+  ;; testnet4/ (or the network's own subdirectory), so pointing either of these
+  ;; at the base made both of them inspect a directory that holds nothing but
+  ;; that subdirectory — the report saw a Core-shaped layout and said nothing,
+  ;; and the migration would have moved nothing. Found by starting a real node
+  ;; on a legacy testnet4 datadir and watching it log the legacy undo path with
+  ;; no warning; the unit tests missed it because their temp datadir has no
+  ;; network subdirectory, so base and network directory are the same path.
+  (let ((network-dir (network-data-path
+                      (uiop:ensure-directory-pathname data-directory) network)))
   (when migrate-datadir
-    (let ((moves (bitcoin-lisp.storage:migrate-datadir-layout data-directory)))
+    (let ((moves (bitcoin-lisp.storage:migrate-datadir-layout network-dir)))
       (if moves
           (dolist (m moves)
             (log-info "Migrated ~A: ~A -> ~A" (first m) (second m) (third m)))
@@ -2727,7 +2737,7 @@ txindex ~D MiB, per-index ~D MiB"
   ;; Reported rather than silently tolerated — an operator whose node cannot be
   ;; driven by Core's functional tests should be told WHICH directory is the
   ;; reason, and `-migratedatadir` is the fix.
-  (let ((legacy (bitcoin-lisp.storage:datadir-layout-report data-directory)))
+  (let ((legacy (bitcoin-lisp.storage:datadir-layout-report network-dir)))
     (when legacy
       (log-warn "Data directory uses the pre-Core layout for: ~{~A~^, ~}. ~
 Core's functional tests address these paths by name. Run with -migratedatadir ~
@@ -2735,7 +2745,7 @@ to move them (the node must be stopped)."
                 (mapcar #'first legacy))
       (dolist (entry legacy)
         (log-info "  ~A: using ~A (Core: ~A)"
-                  (first entry) (third entry) (second entry)))))
+                  (first entry) (third entry) (second entry))))))
 
 
   (setf *node* (init-node data-directory :network network :log-level log-level))
@@ -3100,7 +3110,13 @@ to move them (the node must be stopped)."
   (finalize-snapshot-validation-at-startup *node*)
 
   ;; Initialize undo data persistence
-  (let ((undo-path (merge-pathnames "undo/" (node-data-directory *node*))))
+  ;; DATADIR-UNDO-PATH, not a hardcoded "undo/": Core keeps undo records in
+  ;; blocks/ as revNNNNN.dat, and the resolver is what prefers that and falls
+  ;; back to the legacy sibling directory. Hardcoding it left the resolver with
+  ;; no caller at all — the shape of bug this project keeps finding, and this
+  ;; one shipped in #461 and was caught by running a real node.
+  (let ((undo-path (bitcoin-lisp.storage:datadir-undo-path
+                    (node-data-directory *node*))))
     ;; The store and chain state are what enable Core's rev-file undo format:
     ;; a rev record is addressed only by the block index entry that points at
     ;; it, and reading one needs the block to name its coins.
