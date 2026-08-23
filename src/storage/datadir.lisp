@@ -42,13 +42,6 @@ legacy directory that holds real data."
         ((%dir-has-content-p legacy-path) (values legacy-path t))
         (t (values core-path nil))))
 
-(defun datadir-undo-path (data-dir)
-  "Where per-block undo records live. Core keeps undo data in blocks/ as
-revNNNNN.dat; the legacy layout here is a sibling undo/ directory of per-block
-files. Both are read; new data goes to Core's."
-  (%resolve-datadir-path (merge-pathnames "blocks/" data-dir)
-                         (merge-pathnames "undo/" data-dir)))
-
 (defun datadir-block-index-path (data-dir)
   "Core's blocks/index/ for the block index. The legacy layout is a flat
 headerindex.dat at the network-dir root; the FILE is resolved by
@@ -102,13 +95,10 @@ the reason."
                                      (datadir-block-index-path data-dir))
                     (merge-pathnames "headerindex.dat" data-dir))
               out)))
-    (multiple-value-bind (path legacy-p) (datadir-undo-path data-dir)
-      (declare (ignore path))
-      (when legacy-p
-        (push (list "undo data"
-                    (merge-pathnames "blocks/" data-dir)
-                    (merge-pathnames "undo/" data-dir))
-              out)))
+    ;; undo/ is deliberately absent from this report. Its per-block files are a
+    ;; different FORMAT from Core's revNNNNN.dat, not a different location, so
+    ;; "which directory" is not a question with an answer here — migrateblocks
+    ;; converts them, and until it has, undo/ is exactly where they belong.
     (dolist (which '(:txindex :blockfilter :coinstats))
       (multiple-value-bind (path legacy-p) (datadir-index-path data-dir which)
         (declare (ignore path))
