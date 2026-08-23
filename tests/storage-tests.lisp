@@ -54,6 +54,45 @@ genesis."
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore)))))
 
+(test disk-block-reads-use-the-byte-reader
+  "BR-READ-BITCOIN-BLOCK's own docstring calls itself the hot path, and only
+the inbound-network path used it — the DISK path, which reads every block
+during a reindex, still wrapped its byte vector in a flexi-streams Gray stream.
+
+That is pure overhead: the bytes are already in memory, and the stream adds a
+generic-function dispatch per read. Profiling an offline reindex put
+STREAM-READ-SEQUENCE at 6.4% of runtime with CLASSOID-TYPEP and the PCL braid
+lambdas behind it.
+
+Both readers must agree exactly — this is consensus-critical parsing, so the
+test compares their OUTPUT rather than trusting that swapping them is safe."
+  (let* ((blk (bitcoin-lisp.storage:make-genesis-block :testnet4))
+         (bytes (bitcoin-lisp.serialization:serialize-witness-block blk))
+         (via-stream (flexi-streams:with-input-from-sequence (s bytes)
+                       (bitcoin-lisp.serialization:read-bitcoin-block s)))
+         (via-reader (bitcoin-lisp.serialization:br-read-bitcoin-block
+                      (bitcoin-lisp.serialization:make-byte-reader-from bytes))))
+    (is (equalp (bitcoin-lisp.serialization:block-header-hash
+                 (bitcoin-lisp.serialization:bitcoin-block-header via-stream))
+                (bitcoin-lisp.serialization:block-header-hash
+                 (bitcoin-lisp.serialization:bitcoin-block-header via-reader)))
+        "the two block readers disagree on the block hash")
+    (is (= (length (bitcoin-lisp.serialization:bitcoin-block-transactions via-stream))
+           (length (bitcoin-lisp.serialization:bitcoin-block-transactions via-reader))))
+    ;; And re-serializing the byte-reader result reproduces the input exactly,
+    ;; which is the property that matters for a block read off disk.
+    (is (equalp bytes (bitcoin-lisp.serialization:serialize-witness-block via-reader))))
+  ;; The disk read sites must actually USE it — the whole defect was an
+  ;; optimized reader with the wrong callers.
+  (let ((src (with-open-file (in (merge-pathnames
+                                  "src/storage/blocks.lisp"
+                                  (asdf:system-source-directory :bitcoin-lisp)))
+               (let ((text (make-string (file-length in))))
+                 (subseq text 0 (read-sequence text in))))))
+    (is (not (search "with-input-from-sequence" src))
+        "a disk block read went back to a flexi-stream")
+    (is (search "br-read-bitcoin-block" src))))
+
 (test reindex-needs-a-genesis-root-in-the-index
   "REINDEX-BLOCK-INDEX links each record to a parent already in the index and
 parks the rest, so the index needs a ROOT or the drain never starts.
