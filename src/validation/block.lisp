@@ -3576,7 +3576,22 @@ backstop against a candidate that reorgs away and reappears."
                            :tx-index tx-index :fee-estimator fee-estimator
                            :recent-rejects recent-rejects :mempool mempool)
           (cond
-            (ok (setf switched t))
+            (ok
+             (setf switched t)
+             ;; Flush BETWEEN steps (Core flushes PERIODIC from
+             ;; ActivateBestChain, validation.cpp:3489). Not inside
+             ;; PERFORM-REORG's connect loop — that is the flush its own note
+             ;; correctly refuses, because a rollback there rewinds in memory.
+             ;; Here the step has COMPLETED and is committed, so persisting it
+             ;; is persisting a real chain state.
+             ;;
+             ;; Without this the coins cache grows across every step and never
+             ;; drains: *blocks-since-flush* is advanced only by connect-block's
+             ;; tip-extension arm, so reorg-connected blocks never trigger a
+             ;; periodic flush at all. Measured on an offline reindex, steps
+             ;; went from ~3s to ~150s per 1,000 blocks by height 57,000 — a
+             ;; 50x slowdown that is entirely this.
+             (bitcoin-lisp:maybe-periodic-flush chain-state))
             (t
              ;; :interrupted means the node is stopping — not a refusal to
              ;; re-queue against.

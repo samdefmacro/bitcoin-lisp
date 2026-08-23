@@ -49,6 +49,34 @@
      :outputs (vector output)
      :lock-time 0)))
 
+(test activation-flushes-between-steps
+  "Core flushes PERIODIC from ActivateBestChain (validation.cpp:3489). Ours did
+not, and the coins cache therefore grew across every step and never drained:
+*blocks-since-flush* is advanced ONLY by connect-block's tip-extension arm, so
+reorg-connected blocks never triggered a periodic flush at all.
+
+Measured on an offline reindex, steps went from ~3s to ~150s per 1,000 blocks
+by height 57,000 — a 50x slowdown that is entirely this. The flush belongs
+BETWEEN steps, never inside PERFORM-REORG's connect loop, which correctly
+refuses to flush because a rollback there rewinds in memory."
+  (let ((src (with-open-file (in (merge-pathnames
+                                  "src/validation/block.lisp"
+                                  (asdf:system-source-directory :bitcoin-lisp)))
+               (let ((text (make-string (file-length in))))
+                 (subseq text 0 (read-sequence text in))))))
+    (let ((activate (search "(defun activate-best-chain" src))
+          (perform (search "(defun perform-reorg" src)))
+      (is-true activate)
+      (is-true perform)
+      ;; The flush call must be inside ACTIVATE-BEST-CHAIN.
+      (let ((flush (search "maybe-periodic-flush" src :start2 activate)))
+        (is-true flush "activate-best-chain no longer flushes between steps"))
+      ;; And PERFORM-REORG's connect loop must still NOT flush — that refusal
+      ;; is deliberate and load-bearing, so assert its note is still there.
+      (is-true (search "deliberately NO maybe-critical-flush in this loop" src)
+               "the connect loop's no-flush note is gone; if the flush was ~
+added there, a crash mid-connect can roll forward onto a rejected branch"))))
+
 (test activation-steps-are-bounded
   "PERFORM-REORG's connect loop never flushes — a rollback rewinds IN MEMORY, so
 nothing lands until the whole call finishes. That makes an UNBOUNDED forward
