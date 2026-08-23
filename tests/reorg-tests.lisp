@@ -822,6 +822,42 @@ fully-downloaded 149120 branch with strictly more work lay on disk."
              (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))))))
      (clrhash bitcoin-lisp.validation::*block-undo-data*))))
 
+(test activation-steps-report-the-new-tip-to-stopatheight
+  "-stopatheight is checked from CONNECT-BLOCK's tip-EXTENSION arm and, since
+#478, between ACTIVATION STEPS — because every block of an offline reindex is
+connected through PERFORM-REORG instead, where the extension arm never runs.
+
+#478 was verified by reading. A benchmark reindex then ran straight past
+-stopatheight=134000 to 134898, so the reading was not enough. This probes the
+SEAM: it replaces MAYBE-STOP-AT-HEIGHT with a recorder and asserts
+ACTIVATE-BEST-CHAIN calls it with the height it just activated to. Stubbing is
+what keeps the test free of the shutdown machinery — the real function would
+ask the node to stop."
+  (%with-mainnet-network
+   (multiple-value-bind (chain-state utxo-set block-store genesis-hash)
+       (%make-activate-block-fixture "stopatheight-seam")
+     (unwind-protect
+          (let ((seen '())
+                (real (symbol-function 'bitcoin-lisp:maybe-stop-at-height)))
+            (unwind-protect
+                 (progn
+                   (setf (symbol-function 'bitcoin-lisp:maybe-stop-at-height)
+                         (lambda (height) (push height seen) nil))
+                   (%stage-heavier-downloaded-fork chain-state block-store genesis-hash)
+                   (multiple-value-bind (switched missing)
+                       (bitcoin-lisp.validation:activate-best-chain
+                        chain-state block-store utxo-set)
+                     (is-true switched "the fixture did not activate; the probe proves nothing")
+                     (is (null missing)))
+                   (is (= 3 (bitcoin-lisp.storage:current-height chain-state)))
+                   ;; The seam: the height activation reached must have been
+                   ;; offered to the -stopatheight check.
+                   (is (member 3 seen)
+                       "activate-best-chain never reported its new tip to ~
+maybe-stop-at-height; heights seen: ~S" seen))
+              (setf (symbol-function 'bitcoin-lisp:maybe-stop-at-height) real)))
+       (clrhash bitcoin-lisp.validation::*block-undo-data*)))))
+
 (defun %stage-heavier-downloaded-fork (chain-state block-store genesis-hash)
   "Put a 3-block fork on disk with strictly more work than the current tip, as
 index entries only (status :header-valid, bodies stored) — the exact on-disk
