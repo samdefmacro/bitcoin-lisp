@@ -54,14 +54,42 @@ genesis."
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore)))))
 
+(test undo-storage-always-gets-the-legacy-per-block-directory
+  "INITIALIZE-UNDO-STORAGE's argument is not \"where undo lives\" — it is
+specifically the LEGACY PER-BLOCK directory. Core's revNNNNN.dat records are
+addressed through the block store and chain state instead: a rev record is
+found by the block index entry that points at it, never by scanning a
+directory.
+
+#466 briefly routed this through a resolver that preferred blocks/ whenever
+blocks/ held anything. blocks/ ALWAYS holds something — the block files — so on
+a real testnet4 node it pointed undo storage at blocks/ while 154,198 legacy
+per-block records sat in undo/, making every one of them unreachable and every
+one of those blocks undisconnectable. This pins the call site so the mistake
+cannot be repeated as a refactor."
+  (let ((form (with-output-to-string (out)
+                ;; Read the node's undo-init form back out of the source, since
+                ;; the property is about WHICH PATH the call site passes and
+                ;; there is no runtime handle on that.
+                (with-open-file (in (merge-pathnames "src/node.lisp"
+                                                     (asdf:system-source-directory :bitcoin-lisp)))
+                  (loop for line = (read-line in nil) while line
+                        do (when (search "(initialize-undo-storage" line)
+                             (write-line line out))
+                           (when (search "(let ((undo-path" line)
+                             (write-line line out)))))))
+    (is (search "\"undo/\"" form)
+        "the undo directory is no longer the literal legacy path: ~S" form)
+    (is (not (search "datadir-undo-path" form))
+        "undo storage was routed through a path resolver again: ~S" form)))
+
 (test datadir-resolvers-have-callers
   "Every resolver in storage/datadir.lisp must be REACHED by the node, not
 merely defined. #461 shipped DATADIR-UNDO-PATH with no caller — the undo site
 still hardcoded \"undo/\" — so the resolver was dead code and the option it
 implements did nothing. That was found by starting a real node and reading its
 log, not by any unit test, which is why this one exists."
-  (dolist (fn '(bitcoin-lisp.storage:datadir-undo-path
-                bitcoin-lisp.storage:datadir-header-index-file
+  (dolist (fn '(bitcoin-lisp.storage:datadir-header-index-file
                 bitcoin-lisp.storage:datadir-index-path
                 bitcoin-lisp.storage:datadir-layout-report))
     (let ((callers (remove-if (lambda (c)

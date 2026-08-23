@@ -3110,13 +3110,21 @@ to move them (the node must be stopped)."
   (finalize-snapshot-validation-at-startup *node*)
 
   ;; Initialize undo data persistence
-  ;; DATADIR-UNDO-PATH, not a hardcoded "undo/": Core keeps undo records in
-  ;; blocks/ as revNNNNN.dat, and the resolver is what prefers that and falls
-  ;; back to the legacy sibling directory. Hardcoding it left the resolver with
-  ;; no caller at all — the shape of bug this project keeps finding, and this
-  ;; one shipped in #461 and was caught by running a real node.
-  (let ((undo-path (bitcoin-lisp.storage:datadir-undo-path
-                    (node-data-directory *node*))))
+  ;; ALWAYS the legacy per-block directory. INITIALIZE-UNDO-STORAGE's argument
+  ;; is not "where undo lives" — it is specifically the legacy per-block
+  ;; directory, and Core's revNNNNN.dat records are addressed through the BLOCK
+  ;; STORE and chain state instead (a rev record is found by the block index
+  ;; entry that points at it, never by scanning a directory).
+  ;;
+  ;; #466 briefly routed this through a DATADIR-UNDO-PATH resolver that
+  ;; preferred blocks/ whenever blocks/ held anything. blocks/ ALWAYS holds
+  ;; something — the block files — so on a real testnet4 node it moved the undo
+  ;; directory to blocks/ while 154,198 legacy per-block records sat in undo/,
+  ;; making every one of them unreachable. A reorg would then have been unable
+  ;; to disconnect any of those blocks. Caught within minutes by reading the
+  ;; live node's log; the resolver was deleted rather than repaired, because
+  ;; "which directory" was never the right question here.
+  (let ((undo-path (merge-pathnames "undo/" (node-data-directory *node*))))
     ;; The store and chain state are what enable Core's rev-file undo format:
     ;; a rev record is addressed only by the block index entry that points at
     ;; it, and reading one needs the block to name its coins.
