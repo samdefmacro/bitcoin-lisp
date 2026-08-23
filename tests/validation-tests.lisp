@@ -55,10 +55,14 @@ not, and the coins cache therefore grew across every step and never drained:
 *blocks-since-flush* is advanced ONLY by connect-block's tip-extension arm, so
 reorg-connected blocks never triggered a periodic flush at all.
 
-Measured on an offline reindex, steps went from ~3s to ~150s per 1,000 blocks
-by height 57,000 — a 50x slowdown that is entirely this. The flush belongs
-BETWEEN steps, never inside PERFORM-REORG's connect loop, which correctly
-refuses to flush because a rollback there rewinds in memory."
+An unbounded cache on any long activation, which is a resource problem whatever
+it costs in time. The SPEED effect is modest and worth not overselling: A/B on
+the same offline reindex gave about 12%, not the order of magnitude the
+per-step timings first suggested — most of the slowdown with height is
+testnet4's own busy zone around 51,000-55,000.
+
+The flush belongs BETWEEN steps, never inside PERFORM-REORG's connect loop,
+which correctly refuses to flush because a rollback there rewinds in memory."
   (let ((src (with-open-file (in (merge-pathnames
                                   "src/validation/block.lisp"
                                   (asdf:system-source-directory :bitcoin-lisp)))
