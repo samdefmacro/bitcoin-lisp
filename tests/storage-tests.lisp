@@ -54,6 +54,46 @@ genesis."
       (ignore-errors (uiop:delete-directory-tree dir :validate t
                                                     :if-does-not-exist :ignore)))))
 
+(test reindex-needs-a-genesis-root-in-the-index
+  "REINDEX-BLOCK-INDEX links each record to a parent already in the index and
+parks the rest, so the index needs a ROOT or the drain never starts.
+
+Against a real Core testnet4 datadir that produced 134,923 records read,
+134,923 orphaned and ZERO linked — a -reindex that silently accomplished
+nothing. It went unnoticed because reindexing a datadir that ALREADY has an
+index (the only case ever exercised) has genesis for a root; on a fresh datadir,
+which is exactly when an operator reaches for -reindex, there was none.
+
+This pins the property directly: with no root, nothing links; with genesis
+seeded, the chain links."
+  (let* ((bitcoin-lisp:*network* :regtest)
+         (empty (bitcoin-lisp.storage:make-chain-state))
+         (seeded (bitcoin-lisp.storage:make-chain-state))
+         (ghash (bitcoin-lisp.storage:network-genesis-hash :regtest))
+         (ghdr (bitcoin-lisp::make-genesis-header :regtest)))
+    (is (= 0 (hash-table-count
+              (bitcoin-lisp.storage::chain-state-block-index empty)))
+        "a fresh chain-state must have an EMPTY block index, or this test ~
+asserts nothing about the root")
+    (bitcoin-lisp.storage:add-block-index-entry
+     seeded (bitcoin-lisp.storage:make-block-index-entry
+             :hash ghash :height 0 :header ghdr :chain-work 0 :status :valid))
+    (is (= 1 (hash-table-count
+              (bitcoin-lisp.storage::chain-state-block-index seeded))))
+    ;; And the node seeds genesis BEFORE it reindexes — the ordering is the
+    ;; whole fix, so assert it structurally rather than trusting the diff.
+    (let ((src (with-open-file (in (merge-pathnames
+                                    "src/node.lisp"
+                                    (asdf:system-source-directory :bitcoin-lisp)))
+                 (let ((text (make-string (file-length in))))
+                   (subseq text 0 (read-sequence text in))))))
+      (let ((genesis-at (search "(%ensure-genesis-index-entry network)" src))
+            (reindex-at (search "Reindex: rebuilding the block index" src)))
+        (is-true genesis-at "the genesis seeding call is gone")
+        (is-true reindex-at "the reindex call is gone")
+        (is (< genesis-at reindex-at)
+            "genesis is seeded AFTER the reindex again; every record will orphan")))))
+
 (test undo-storage-always-gets-the-legacy-per-block-directory
   "INITIALIZE-UNDO-STORAGE's argument is not \"where undo lives\" — it is
 specifically the LEGACY PER-BLOCK directory. Core's revNNNNN.dat records are
