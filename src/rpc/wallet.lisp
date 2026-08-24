@@ -2308,7 +2308,7 @@ successful import triggers RescanFromTime(lowest_timestamp), and any request
 whose timestamp the scan could not cover has its result replaced with Core's
 rescan-failed error."
   (let ((wallet (wallet-for-request node))
-        (requests (first params)))
+        (requests (%positional-array (first params))))
     (unless (and (listp requests) requests)
       (error 'rpc-error :code +rpc-type-error+
                         :message "requests must be a non-empty array"))

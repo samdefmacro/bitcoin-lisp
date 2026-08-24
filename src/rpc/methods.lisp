@@ -199,11 +199,12 @@ the bool branch). Explicit false arrives as the +json-false+ sentinel."
   "Core's uvTypeName (univalue.cpp:217-226) for VALUE as our decoder represents
 it: null, bool, object, array, string, number.
 
-NIL is reported as \"null\". It is genuinely ambiguous — our decoder gives NIL
-for both JSON null and an empty array — but a type error on an EMPTY array is
-vanishingly rare next to one on null, and guessing the other way would misname
-the common case."
-  (cond ((null value) "null")
+NIL is \"null\", and it now means that: a top-level positional `[]` arrives as
++json-empty-array+ rather than folding into NIL, so this no longer has to
+guess which of the two it is looking at. That guess is what made
+getrawtransaction(txid, []) answer nothing at all where Core answers -3."
+  (cond ((eq value +json-empty-array+) "array")
+        ((null value) "null")
         ((eq value t) "bool")
         ((eq value +json-false+) "bool")
         ((stringp value) "string")
@@ -1430,7 +1431,7 @@ weight; ours is BIP141 virtual bytes (~ Core / 4)."
   "For each {txid, vout} outpoint in the array PARAM, report the mempool
 transaction spending it, if any (Bitcoin Core gettxspendingprevout). Returns an
 array of {txid, vout, spendingtxid?}."
-  (let ((outpoints (first params))
+  (let ((outpoints (%positional-array (first params)))
         (mempool (rpc-get-mempool node)))
     (unless (and (listp outpoints) outpoints)
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -1504,12 +1505,16 @@ reaches the mempool."
 array of {txid, wtxid, allowed, reject-reason?, vsize, fees{base}} without adding
 anything to the mempool. Each tx is checked independently against current state
 (package interdependence is not modeled — that needs submitpackage)."
-  (let ((txs (first params))
+  (let ((txs (%positional-array (first params)))
+        (txs-arg (first params))
         (utxo-set (rpc-get-utxo-set node))
         (mempool (rpc-get-mempool node))
         (chain-state (rpc-get-chain-state node)))
-    (unless (listp txs)
-      (%json-type-error txs "array"))
+    ;; An empty array IS an array, and gets the count error below rather than
+    ;; the type error — which is what mempool_accept.py:100 asserts. NIL here
+    ;; now means null/omitted only, so it is a type error as Core has it.
+    (unless (%positional-array-p txs-arg)
+      (%json-type-error txs-arg "array"))
     ;; Core caps the batch at package size (rpc/mempool.cpp:322).
     (when (or (null txs) (> (length txs) bitcoin-lisp.validation:+max-package-count+))
       (error 'rpc-error :code +rpc-invalid-parameter+
@@ -1751,7 +1756,7 @@ submitpackage: returns {package_msg, tx-results{wtxid -> {...}},
 replaced-transactions}. maxfeerate caps each member's modified feerate and
 aborts the whole package on the first breach; maxburnamount caps the value any
 member may send to a script that can never spend it."
-  (let ((hexes (first params))
+  (let ((hexes (%positional-array (first params)))
         (utxo-set (rpc-get-utxo-set node))
         (mempool (rpc-get-mempool node))
         (chain-state (rpc-get-chain-state node)))
@@ -3088,8 +3093,13 @@ mirroring Core."
           (when *txoutset-scan-running*
             (setf *txoutset-scan-abort* t)))))
       ((equal action "start")
-       (let ((scanobjects (second params)))
-         (unless (and scanobjects (listp scanobjects))
+       (let ((scanobjects (%positional-array (second params))))
+         ;; An EMPTY scanobjects array is legal and means "scan for nothing":
+         ;; Core still walks the UTXO set and reports success with the chain's
+         ;; height, txouts and bestblock, which is what rpc_scantxoutset.py:62
+         ;; asserts. Only null/omitted is the missing argument. Our decoder
+         ;; used to give NIL for both, so the legal call was refused.
+         (unless (%positional-array-p (second params))
            (error 'rpc-error :code +rpc-misc-error+
                              :message "scanobjects argument is required for the start action"))
          (unless (%reserve-txoutset-scan)
@@ -3392,8 +3402,8 @@ under the \"locked\" object Core uses."
 (or \"1\") toggles every category. Returns an object mapping every category to
 whether it is currently enabled. Errors on an unknown category."
   (declare (ignore node))
-  (let ((include (first params))
-        (exclude (second params)))
+  (let ((include (%positional-array (first params)))
+        (exclude (%positional-array (second params))))
     (when (and include (not (listp include)))
       (error 'rpc-error :code +rpc-invalid-parameter+ :message "include must be an array"))
     (when (and exclude (not (listp exclude)))
@@ -4495,13 +4505,38 @@ Searches mempool first, then blockhash hint, then txindex (if enabled)."
                             (bitcoin-lisp.crypto:bytes-to-hex
                              (bitcoin-lisp.serialization:transaction-wire-bytes found-tx))))))))))))
 
-      ;; Not found
+      ;; Not found. Core selects one of FOUR messages and appends the same
+      ;; sentence to every one of them (rawtransaction.cpp:315-329), and its
+      ;; tests match on the WHOLE string: rpc_rawtransaction.py:129 asserts the
+      ;; no-txindex variant in full. Ours said "provide a blockhash" and
+      ;; stopped there — the right advice, spelled so that no caller matching
+      ;; Core's text could find it.
+      ;;
+      ;; Three of the four are here. The one left out is Core's
+      ;; "Blockchain transactions are still in the process of being indexed",
+      ;; which needs f_txindex_ready — a readiness flag distinct from
+      ;; "enabled", which this txindex does not carry. Inventing an answer for
+      ;; a state we cannot observe would be worse than answering the
+      ;; enabled-and-absent case, which is what a caught-up node is in.
       (let ((tx-index (rpc-get-tx-index node)))
-        (if (and tx-index (bitcoin-lisp.storage:tx-index-enabled tx-index))
-            (error 'rpc-error :code +rpc-invalid-address-or-key+
-                              :message "No such mempool or blockchain transaction")
-            (error 'rpc-error :code +rpc-invalid-address-or-key+
-                              :message "No such mempool transaction. Use -txindex or provide a blockhash"))))))
+        (error 'rpc-error :code +rpc-invalid-address-or-key+
+                          :message
+                          (concatenate
+                           'string
+                           (cond
+                             ;; A blockhash was given and the transaction is
+                             ;; not in that block. (Core also answers -1
+                             ;; "Block not available" when the block is known
+                             ;; but its data is not on disk; that check lives
+                             ;; in the hint branch above, which treats an
+                             ;; unreadable block as not-found.)
+                             (blockhash-hint
+                              "No such transaction found in the provided block")
+                             ((not (and tx-index
+                                        (bitcoin-lisp.storage:tx-index-enabled tx-index)))
+                              "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries")
+                             (t "No such mempool or blockchain transaction"))
+                           ". Use gettransaction for wallet transactions."))))))
 
 (defun find-tx-in-block (block txid)
   "Find a transaction in a block by txid. Returns the transaction or NIL."
@@ -4657,7 +4692,7 @@ default), \"p2sh-segwit\" (P2SH-P2WSH), or \"bech32\" (P2WSH). Returns
 bare multisig script regardless of address type. Uncompressed keys force legacy
 (with a warning if another type was requested), matching Core."
   (let ((nrequired (first params))
-        (keys (second params))
+        (keys (%positional-array (second params)))
         (address-type (or (third params) "legacy"))
         (network (rpc-get-network node)))
     (unless (integerp nrequired)
@@ -5320,8 +5355,8 @@ amounts on ALL inputs; redeemScript for P2SH; witnessScript for P2WSH). P2TR sig
 with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
   (declare (ignore node))
   (let ((hexstring (first params))
-        (wifs (second params))
-        (prevtxs (third params))
+        (wifs (%positional-array (second params)))
+        (prevtxs (%positional-array (third params)))
         (sighash-byte (%parse-sighash-type (fourth params))))
     (unless (stringp hexstring)
       (error 'rpc-error :code +rpc-deserialization-error+ :message "tx hex string required"))
@@ -5385,7 +5420,7 @@ with SIGHASH_DEFAULT (64-byte signature). Returns {hex, complete, errors?}."
 
 (defun rpc-createrawtransaction (node params)
   "Create an unsigned raw transaction."
-  (let ((inputs (first params))
+  (let ((inputs (%positional-array (first params)))
         (outputs (second params))
         (locktime (or (third params) 0))
         (network (rpc-get-network node)))
@@ -5959,10 +5994,11 @@ ACTION is \"start\", \"status\" or \"abort\". Mirrors Bitcoin Core scanblocks."
          (json-bool
           (when *scanblocks-running* (setf *scanblocks-abort* t) t))))
       ((equal action "start")
-       (let ((scanobjects (second params))
+       (let ((scanobjects (%positional-array (second params)))
              (filtertype (or (fifth params) "basic"))
              (bfi (rpc-get-blockfilterindex node)))
-         (unless (and scanobjects (listp scanobjects))
+         ;; Empty is an array, as in scantxoutset above; null/omitted is not.
+         (unless (%positional-array-p (second params))
            (error 'rpc-error :code +rpc-misc-error+
                              :message "scanobjects argument is required for the start action"))
          (unless (string-equal filtertype "basic")
@@ -6106,8 +6142,8 @@ common fields (blockhash/height, or nil for mempool). Returns a list of entries.
   "Return spend/receive activity for descriptors within the given blocks (and
 optionally the mempool). PARAMS: (blockhashes scanobjects [include_mempool]
 [options]). Mirrors Bitcoin Core getdescriptoractivity."
-  (let* ((blockhashes (first params))
-         (scanobjects (second params))
+  (let* ((blockhashes (%positional-array (first params)))
+         (scanobjects (%positional-array (second params)))
          (include-mempool (%positional-bool-or (third params) t))
          (network (rpc-get-network node))
          (chain-state (rpc-get-chain-state node))

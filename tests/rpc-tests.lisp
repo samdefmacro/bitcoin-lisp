@@ -128,6 +128,107 @@ each character instead — latin-1 — and so could not express this test at all
       (is (eq type :batch))
       (is (= (length requests) 2)))))
 
+(test json-rpc-parse-tells-an-empty-array-from-null
+  "`[]` and `null` are different arguments, and the decoder used to merge them.
+Both parsed to NIL, so no handler could tell an argument GIVEN as an empty
+array from one not given at all — and Core's argument checking splits on
+exactly that, because isNull() means \"use the default\" while an array of the
+wrong type is a type error. Arrays are parsed as vectors for this reason alone
+and turned straight back into lists, so the only value that survives
+differently is a top-level empty array: the +json-empty-array+ sentinel.
+
+The nesting rule is the one explicit false already follows — top level only."
+  (flet ((params-of (json)
+           (nth-value 2 (bitcoin-lisp.rpc::parse-json-rpc-request
+                         (format nil "{\"method\":\"m\",\"params\":~A,\"id\":1}" json)))))
+    ;; The two that used to be indistinguishable.
+    (let ((empty (second (params-of "[\"a\",[]]")))
+          (null- (second (params-of "[\"a\",null]"))))
+      (is (eq bitcoin-lisp.rpc::+json-empty-array+ empty)
+          "an empty array argument did not survive as the sentinel")
+      (is (null null-) "an explicit null argument must stay NIL")
+      (is (not (eq empty null-)) "`[]` and null are still the same value"))
+    ;; A non-empty array is an ordinary list, exactly as before.
+    (is (equal '("x" "y") (second (params-of "[\"a\",[\"x\",\"y\"]]"))))
+    ;; ⚠️ A string is a vector in CL. Mapping over one would deal every JSON
+    ;; string out as a list of characters, so the array branch must exclude
+    ;; strings — a positive control for that.
+    (is (string= "a" (first (params-of "[\"a\",[]]"))))
+    ;; Nested empty arrays keep folding to NIL: nested readers answer absence
+    ;; with present-p, so they never needed the distinction.
+    (is (null (second (first (params-of "[[\"a\",[]]]")))))
+    ;; An empty params ARRAY is "no arguments", not one empty-array argument.
+    (is (null (params-of "[]")))
+    ;; The accessors: an empty array IS an array, null is not, and both
+    ;; iterate as the empty list.
+    (is-true (bitcoin-lisp.rpc::%positional-array-p bitcoin-lisp.rpc::+json-empty-array+))
+    (is-false (bitcoin-lisp.rpc::%positional-array-p nil))
+    (is (null (bitcoin-lisp.rpc::%positional-array bitcoin-lisp.rpc::+json-empty-array+)))))
+
+(test rpc-empty-array-argument-reaches-core-behaviour
+  "What the distinction is FOR, at the two methods Core's suite checks.
+
+getrawtransaction's verbosity is a number; given `[]` Core answers -3
+\"not of expected type number\" (rpc_rawtransaction.py:136). We answered
+nothing at all, because `[]` looked like null and null means \"use the
+default\". testmempoolaccept goes the other way: `[]` is a well-typed but
+empty array, so it earns the COUNT error, not a type error
+(mempool_accept.py:100)."
+  (let ((node (make-test-node))
+        (txid "0000000000000000000000000000000000000000000000000000000000000001"))
+    ;; -3, and it names the type it actually got.
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-getrawtransaction
+                node (list txid bitcoin-lisp.rpc::+json-empty-array+))
+               (fail "an empty array verbosity raised nothing"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (= -3 (bitcoin-lisp.rpc::rpc-error-code e)))
+        (is (search "not of expected type number"
+                    (bitcoin-lisp.rpc::rpc-error-message e))
+            "message was: ~A" (bitcoin-lisp.rpc::rpc-error-message e))))
+    ;; Null still means the default verbosity, so it gets past the check and
+    ;; fails on the transaction being absent instead.
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-getrawtransaction node (list txid nil))
+               (fail "expected a lookup failure"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (/= -3 (bitcoin-lisp.rpc::rpc-error-code e))
+            "null verbosity must not be read as a type error")))
+    ;; The other direction: empty is an array, so the count error.
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-testmempoolaccept
+                node (list bitcoin-lisp.rpc::+json-empty-array+))
+               (fail "expected the count error"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (= -8 (bitcoin-lisp.rpc::rpc-error-code e)))
+        (is (search "Array must contain between"
+                    (bitcoin-lisp.rpc::rpc-error-message e)))))
+    ;; And null is not an array at all.
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-testmempoolaccept node (list nil))
+               (fail "expected a type error"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (= -3 (bitcoin-lisp.rpc::rpc-error-code e)))))))
+
+(test getrawtransaction-not-found-speaks-cores-sentence
+  "Core selects one of four not-found messages and appends the same sentence to
+each (rawtransaction.cpp:315-329); rpc_rawtransaction.py:129 matches the
+no-txindex variant in FULL. Ours stopped at \"provide a blockhash\" — the right
+advice in a spelling no caller matching Core could find."
+  (let ((node (make-test-node))
+        (txid "0000000000000000000000000000000000000000000000000000000000000009"))
+    (handler-case
+        (progn (bitcoin-lisp.rpc::rpc-getrawtransaction node (list txid))
+               (fail "expected a not-found error"))
+      (bitcoin-lisp.rpc::rpc-error (e)
+        (is (= -5 (bitcoin-lisp.rpc::rpc-error-code e)))
+        (is (string= (concatenate 'string
+                                  "No such mempool transaction. Use -txindex or provide a block "
+                                  "hash to enable blockchain transaction queries. Use "
+                                  "gettransaction for wallet transactions.")
+                     (bitcoin-lisp.rpc::rpc-error-message e))
+            "message was: ~A" (bitcoin-lisp.rpc::rpc-error-message e))))))
+
 (test json-rpc-parse-invalid-json
   "Test parsing invalid JSON returns parse error"
   (signals bitcoin-lisp.rpc::rpc-error

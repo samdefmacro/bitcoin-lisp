@@ -340,17 +340,39 @@ normalized in place; lists are rebuilt."
                     (setf (gethash key value) (%normalize-json-value v nil)))
                   value)
          value)
+        ;; Arrays are parsed as VECTORS purely so that an EMPTY one is
+        ;; distinguishable from null — `[]` and `null` are both NIL once an
+        ;; array is a list, and Core's argument checking splits on exactly
+        ;; that difference. They are turned straight back into lists here, so
+        ;; every handler and every test keeps seeing the lists it always saw;
+        ;; the ONE value that survives the round trip differently is a
+        ;; top-level empty array, which becomes the +json-empty-array+
+        ;; sentinel. Nested empty arrays fold to NIL, as explicit false does.
+        ;; NOT (VECTORP value): a string is a vector too, and mapping one
+        ;; would turn every JSON string into a list of characters.
+        ((and (vectorp value) (not (stringp value)))
+         (if (zerop (length value))
+             (if top-level +json-empty-array+ nil)
+             (map 'list (lambda (v) (%normalize-json-value v nil)) value)))
         ((and (consp value) (rpc-proper-list-p value))
          (mapcar (lambda (v) (%normalize-json-value v nil)) value))
         (t value)))
 
 (defun %normalize-rpc-params (params)
   "Normalize a request's params: positional (array) params keep explicit
-false as the +json-false+ sentinel at top level; named-params objects are
-normalized as nested values."
-  (if (and (consp params) (rpc-proper-list-p params))
-      (mapcar (lambda (v) (%normalize-json-value v t)) params)
-      (%normalize-json-value params nil)))
+false as the +json-false+ sentinel and an explicit empty array as
++json-empty-array+, both at top level only; named-params objects are
+normalized as nested values.
+
+The positional case arrives as a VECTOR from the parser and as a LIST from
+the tests and from the named-parameter transform, and both must get the
+top-level treatment — reading only one of them is how a sentinel silently
+stops being applied."
+  (cond ((and (vectorp params) (not (stringp params)))
+         (map 'list (lambda (v) (%normalize-json-value v t)) params))
+        ((and (consp params) (rpc-proper-list-p params))
+         (mapcar (lambda (v) (%normalize-json-value v t)) params))
+        (t (%normalize-json-value params nil))))
 
 (defun request-json-version (request)
   "The JSON-RPC version of one parsed request object REQUEST (a hash-table):
@@ -714,10 +736,14 @@ argument already reaches every handler."
         (multiple-value-bind (args args-present) (gethash "args" remaining)
           (remhash "args" remaining)
           (when args-present
-            (unless (rpc-proper-list-p args)
+            ;; This transform runs on RAW parse output, before normalization,
+            ;; so an array here is still a vector; a list only shows up from
+            ;; the tests. Both are arrays, and neither is a string.
+            (unless (or (and (vectorp args) (not (stringp args)))
+                        (rpc-proper-list-p args))
               (error 'rpc-error :code +rpc-invalid-parameter+
                                 :message "Parameter args must be an array"))
-            (setf positional args)))
+            (setf positional (coerce args 'list))))
         (let ((slots '()))
           (loop for name-spec in names
                 for index from 0
@@ -762,14 +788,23 @@ request carries jsonrpc:\"2.0\", else :v1 (absent/1.0/1.1 — Core JSONRPCReques
 ::parse's V1_LEGACY); ID-PRESENT-P distinguishes a V2 notification (no id
 member at all) from id:null. Signals rpc-error on malformed input.
 Booleans are parsed as symbols and normalized via %normalize-rpc-params so
-top-level positional false survives as the +json-false+ sentinel."
+top-level positional false survives as the +json-false+ sentinel; arrays are
+parsed as VECTORS for the same reason — it is the only way an empty array can
+be told from null — and %normalize-json-value turns them back into the lists
+handlers expect, leaving +json-empty-array+ where a top-level positional
+argument was `[]`."
   (handler-case
-      (let ((json (let ((yason:*parse-json-booleans-as-symbols* t))
+      (let ((json (let ((yason:*parse-json-booleans-as-symbols* t)
+                        (yason:*parse-json-arrays-as-vectors* t))
                     (yason:parse body))))
         (cond
-          ;; Batch request (array)
-          ((listp json)
-           (values :batch json))
+          ;; Batch request (array). A vector now, since that is how arrays
+          ;; arrive; the members are objects and stay hash-tables. An EMPTY
+          ;; batch is still a batch — Core answers it with the invalid-request
+          ;; error rather than treating it as a single call — so this must
+          ;; test arrayness, not emptiness.
+          ((and (vectorp json) (not (stringp json)))
+           (values :batch (coerce json 'list)))
           ;; Single request (object)
           ((hash-table-p json)
            (let ((method (gethash "method" json))

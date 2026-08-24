@@ -113,6 +113,39 @@ null/omitted because Core's isNull() checks treat only the latter as
 boolean parameters must be read through %positional-bool /
 %positional-bool-or, never by raw truthiness.")
 
+(defconstant +json-empty-array+ '%json-empty-array
+  "The empty JSON array, at TOP-LEVEL positional parameter positions.
+
+Same problem as +json-false+ and the same shape of answer. Our decoder maps
+BOTH `[]` and `null` to NIL, so a handler could not tell an argument that was
+given as an empty array from one that was not given at all — and Core's
+argument checking splits on exactly that: isNull() means \"use the default\",
+while an array of the wrong type is an RPC_TYPE_ERROR. Two of Core's
+functional tests fail on the difference alone: getrawtransaction(txid, [])
+must answer -3 \"not of expected type number\"
+(rpc_rawtransaction.py:136) and scantxoutset(\"start\", []) must scan
+nothing rather than be told its argument is missing (rpc_scantxoutset.py:62).
+
+Only TOP-LEVEL positional parameters carry the sentinel, exactly as with
+explicit false: nested empty arrays keep folding to NIL, because nested
+readers answer absence with present-p instead. IMPORTANT: the sentinel is
+TRUTHY and is NOT a list — array parameters must be read through
+%POSITIONAL-ARRAY / %POSITIONAL-ARRAY-P, never with LISTP or DOLIST
+directly.")
+
+(defun %positional-array-p (value)
+  "True if VALUE is a positional parameter that ARRIVED as a JSON array,
+empty or not. NIL is null/omitted and is not an array; the empty-array
+sentinel is."
+  (or (eq value +json-empty-array+)
+      (and (consp value) t)))
+
+(defun %positional-array (value)
+  "The elements of a positional array parameter, as a list.
+The empty-array sentinel yields NIL, so callers iterate uniformly; use
+%POSITIONAL-ARRAY-P first when the difference between `[]` and null matters."
+  (if (eq value +json-empty-array+) nil value))
+
 (defun %positional-bool (value)
   "Truth of a positional JSON boolean parameter: NIL (null or omitted) and
 the explicit-false sentinel are false; anything else is true. Mirrors

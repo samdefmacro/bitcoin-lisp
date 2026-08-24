@@ -650,7 +650,7 @@ include_unsafe query_options)."
   (let ((wallet (wallet-for-request node))
         (minconf (if (and (>= (length params) 1) (first params)) (first params) 1))
         (maxconf (if (and (>= (length params) 2) (second params)) (second params) 9999999))
-        (addresses (third params))
+        (addresses (%positional-array (third params)))
         (include-unsafe (%positional-bool-or (fourth params) t))
         (options (fifth params))
         (min-amount 0)
@@ -1305,7 +1305,7 @@ reject inputs that are missing or already spent on-chain; here the delta is
 computed from wallet-owned prevouts (GetDebit) and the in-array new_utxos,
 which yields the same balance_change without touching the chain UTXO set."
   (let ((wallet (wallet-for-request node))
-        (rawtxs (first params)))
+        (rawtxs (%positional-array (first params))))
     (unless (or (null rawtxs) (listp rawtxs))
       (error 'rpc-error :code +rpc-type-error+ :message "rawtxs must be an array"))
     (with-wallet-lock (wallet)
